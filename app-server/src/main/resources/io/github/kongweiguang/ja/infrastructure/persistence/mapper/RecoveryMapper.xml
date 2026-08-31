@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.RecoveryMapper">
+  <select id="selectRecoveryThreadIds" resultType="string">
+    SELECT DISTINCT thread_id FROM turns WHERE state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+    UNION SELECT DISTINCT thread_id FROM tools WHERE side_effect='EXTERNAL' AND state IN ('PREPARED','RUNNING')
+    ORDER BY thread_id
+  </select>
+  <update id="recoverActiveTurns">
+    UPDATE turns SET state='CANCELLED',mutation_version=mutation_version+1,updated_at=#{occurredAt},completed_at=#{occurredAt},
+      terminal_summary=CASE WHEN cancel_requested_at IS NOT NULL
+        THEN 'Cancelled before sidecar restart'
+        ELSE 'Recovered after sidecar restart' END,
+      error_code=CASE WHEN cancel_requested_at IS NOT NULL THEN 'CANCELLED' ELSE 'RUNTIME_RESTARTED' END,
+      error_message=CASE WHEN cancel_requested_at IS NOT NULL
+        THEN 'The Turn cancellation request was committed before the sidecar stopped.'
+        ELSE 'The previous sidecar stopped before the Turn reached a terminal state.' END
+    WHERE thread_id=#{threadId} AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+  </update>
+  <update id="recoverRunningTools">
+    UPDATE tools SET state='UNKNOWN',
+      presentation_json=json_set(presentation_json,'$.status','error','$.outputPreview',
+        'Ja restarted around an external side effect; its outcome cannot be confirmed.'),
+      revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND side_effect='EXTERNAL' AND state IN ('PREPARED','RUNNING')
+  </update>
+  <insert id="insertRecoveredChangeSets">
+    INSERT INTO turn_change_sets(thread_id,turn_id,workspace_id,change_set_json,artifact_id,committed_at)
+    SELECT x.thread_id,x.turn_id,t.workspace_id,
+      json_object('state','unavailable','reason','capture_failed','files',json_array(),
+        'stats',json_object('files',0,'additions',0,'deletions',0,'binaryFiles',0,'truncated',json('false'))),
+      NULL,#{occurredAt}
+    FROM turns x JOIN threads t ON t.thread_id=x.thread_id
+    WHERE x.thread_id=#{threadId} AND x.completed_at=#{occurredAt}
+      AND x.state='CANCELLED' AND x.error_code IN ('CANCELLED','RUNTIME_RESTARTED')
+      AND NOT EXISTS(SELECT 1 FROM turn_change_sets c WHERE c.turn_id=x.turn_id)
+  </insert>
+  <update id="advanceRecoveredThread">
+    UPDATE threads SET revision=revision+1,updated_at=#{occurredAt} WHERE thread_id=#{threadId}
+  </update>
+</mapper>

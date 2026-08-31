@@ -1,0 +1,22 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Keep only non-sensitive application identity while the local app-server runs
+# as a non-Web sidecar; stdout remains reserved for JA-RPC JSONL frames.
+solon.app:
+  name: ja-app-server
+  group: ja
+  http:
+    enable: false
+
+# Solon discovers the persistence composition; the launcher may override only
+# ja.database-path/ja.data-dir before startup. No retired location is scanned.
+ja:
+  persistence:
+    enabled: true
+
+# The named MyBatis factory resolves an explicit responsibility-split mapper list;
+# avoiding package scans keeps both JVM and Native Image registration deterministic.
+mybatis:
+  ja:
+    mappers: classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/SchemaMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/HistoryMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/AgentMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/CheckpointMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/InstructionScopeMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/RecoveryMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/AttachmentMapper.xml

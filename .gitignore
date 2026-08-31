@@ -1,0 +1,121 @@
+# Ja is distributed with its lockfiles, license files, source resources, and
+# Native Image metadata. Build and machine-local state must stay outside the
+# source tree so a clean checkout remains reproducible.
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Operating system and local editor state
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.swn
+
+# Node.js / Vite / pnpm outputs
+node_modules/
+.pnpm-store/
+.vite/
+dist/
+dist-ssr/
+coverage/
+*.local
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+
+# Test and runtime logs/results are reproducible outputs, not source fixtures.
+/logs/
+/.tmp/
+/.tmp-*/
+/test-results/
+/playwright-report/
+/blob-report/
+
+# Keep the package lockfile: it is an input to reproducible desktop builds.
+!pnpm-lock.yaml
+
+# Rust / Tauri build outputs
+target/
+target-*/
+.cargo/target-*/
+src-tauri/target/
+*.rlib
+*.rmeta
+*.pdb
+
+# Java / Maven / GraalVM build outputs
+app-server/target/
+app-server/build/
+app-server/native-image/
+.native-image/
+*.class
+
+# Python contract/reference validator bytecode is always disposable.
+__pycache__/
+*.py[cod]
+
+# Native desktop bundle outputs (the signed artifact manifest is tracked
+# separately when a release task creates one).
+artifacts/
+bundle/
+release/
+# @author kongweiguang
+# Keep the checked-in release evidence scripts visible; generated release outputs remain ignored.
+!scripts/release/
+!scripts/release/sbom/
+!scripts/release/sbom/*.ps1
+!scripts/release/sbom/*.md
+*.appimage
+*.dmg
+*.msi
+*.nsis.zip
+*.deb
+*.rpm
+*.exe
+
+# IDE metadata; keep the shared VS Code extension recommendations.
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Updeng/Codex/Claude machine-local state. These paths are intentionally not
+# source documentation and must not leak local plans, prompts, or credentials.
+/.agents/
+/.claude/
+/.codex/
+/.updeng/
+/AGENTS.md
+/CLAUDE.md
+
+# A previously interpolated Windows environment token may create this literal machine-cache mirror.
+# Keep it out of Git and Turn baselines without deleting the user's recoverable files.
+/%SystemDrive%/
+
+# Local configuration and credentials. Keep the template visible to users.
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+*.secret
+credentials.*
+!src-tauri/src/settings/credentials.rs
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.mobileprovision
+
+# Keep legal files and source/native metadata visible to version control.
+!LICENSE
+!app-server/src/main/resources/META-INF/native-image/
+!app-server/src/main/resources/META-INF/native-image/**
+!Cargo.lock
+/.codegraph

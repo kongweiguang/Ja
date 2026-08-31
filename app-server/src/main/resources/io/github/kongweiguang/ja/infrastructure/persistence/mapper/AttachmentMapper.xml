@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentMapper">
+  <resultMap id="blobRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentRecords$BlobRow">
+    <constructor><arg column="sha256" javaType="string"/><arg column="size_bytes" javaType="_long"/>
+      <arg column="media_kind" javaType="string"/><arg column="media_type" javaType="string"/>
+      <arg column="created_at" javaType="string"/></constructor>
+  </resultMap>
+  <resultMap id="attachmentRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentRecords$AttachmentRow">
+    <constructor><arg column="attachment_id" javaType="string"/><arg column="workspace_id" javaType="string"/>
+      <arg column="blob_sha256" javaType="string"/><arg column="content_sha256" javaType="string"/>
+      <arg column="display_name" javaType="string"/><arg column="size_bytes" javaType="_long"/>
+      <arg column="media_kind" javaType="string"/><arg column="media_type" javaType="string"/>
+      <arg column="status" javaType="string"/><arg column="created_at" javaType="string"/>
+      <arg column="expires_at" javaType="string"/><arg column="bound_turn_id" javaType="string"/></constructor>
+  </resultMap>
+  <resultMap id="titleGenerationRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentRecords$TitleGenerationRow">
+    <constructor><arg column="generation_id" javaType="string"/><arg column="thread_id" javaType="string"/>
+      <arg column="result" javaType="string"/><arg column="input_tokens" javaType="java.lang.Long"/>
+      <arg column="output_tokens" javaType="java.lang.Long"/><arg column="total_tokens" javaType="java.lang.Long"/>
+      <arg column="failure_code" javaType="string"/><arg column="completed_at" javaType="string"/></constructor>
+  </resultMap>
+  <insert id="insertBlob">
+    INSERT INTO attachment_blobs(sha256,size_bytes,media_kind,media_type,created_at)
+    VALUES(#{sha256},#{sizeBytes},#{mediaKind},#{mediaType},#{createdAt}) ON CONFLICT(sha256) DO NOTHING
+  </insert>
+  <select id="selectBlob" resultMap="blobRow">
+    SELECT sha256,size_bytes,media_kind,media_type,created_at FROM attachment_blobs WHERE sha256=#{sha256}
+  </select>
+  <insert id="insertAttachment">
+    INSERT INTO attachments(attachment_id,workspace_id,blob_sha256,content_sha256,display_name,size_bytes,
+      media_kind,media_type,status,created_at,expires_at)
+    VALUES(#{attachmentId},#{workspaceId},#{sha256},#{sha256},#{displayName},#{sizeBytes},#{mediaKind},
+      #{mediaType},'DRAFT',#{createdAt},#{expiresAt})
+  </insert>
+  <select id="selectAttachment" resultMap="attachmentRow">
+    SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ta.turn_id AS bound_turn_id
+    FROM attachments a LEFT JOIN turn_attachments ta ON ta.attachment_id=a.attachment_id
+    WHERE a.attachment_id=#{attachmentId}
+  </select>
+  <select id="selectBoundAttachment" resultMap="attachmentRow">
+    SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ta.turn_id AS bound_turn_id
+    FROM attachments a JOIN turn_attachments ta ON ta.attachment_id=a.attachment_id
+      JOIN turns t ON t.turn_id=ta.turn_id
+    WHERE a.attachment_id=#{attachmentId} AND t.thread_id=#{threadId} AND a.status='BOUND'
+  </select>
+  <update id="discardDraft">
+    UPDATE attachments SET status='DISCARDED',discarded_at=#{discardedAt},blob_sha256=NULL
+    WHERE attachment_id=#{attachmentId} AND status='DRAFT'
+  </update>
+  <update id="bindDraft">
+    UPDATE attachments SET status='BOUND',bound_at=#{boundAt}
+    WHERE attachment_id=#{attachmentId} AND workspace_id=#{workspaceId} AND status='DRAFT'
+      AND expires_at&gt;#{boundAt} AND blob_sha256 IS NOT NULL
+  </update>
+  <insert id="insertTurnAttachment">
+    INSERT INTO turn_attachments(turn_id,attachment_id,ordinal,created_at)
+    VALUES(#{turnId},#{attachmentId},#{ordinal},#{boundAt})
+  </insert>
+  <update id="expireDrafts">
+    UPDATE attachments SET status='EXPIRED',expired_at=#{expiredAt},blob_sha256=NULL
+    WHERE status='DRAFT' AND expires_at&lt;=#{expiredAt}
+  </update>
+  <select id="selectUnreferencedBlobs" resultType="string">
+    SELECT b.sha256 FROM attachment_blobs b
+    WHERE NOT EXISTS(SELECT 1 FROM attachments a WHERE a.blob_sha256=b.sha256 AND a.status IN ('DRAFT','BOUND'))
+    ORDER BY b.created_at,b.sha256 LIMIT #{limit}
+  </select>
+  <select id="selectAllBlobs" resultType="string">SELECT sha256 FROM attachment_blobs</select>
+  <delete id="deleteUnreferencedBlob">
+    DELETE FROM attachment_blobs WHERE sha256=#{sha256}
+      AND NOT EXISTS(SELECT 1 FROM attachments a WHERE a.blob_sha256=#{sha256} AND a.status IN ('DRAFT','BOUND'))
+  </delete>
+  <insert id="insertTitleGeneration">
+    INSERT INTO thread_title_generations(generation_id,thread_id,turn_id,provider_id,model_id,config_generation,claimed_at)
+    VALUES(#{generationId},#{threadId},#{turnId},#{providerId},#{modelId},#{configGeneration},#{claimedAt})
+    ON CONFLICT(thread_id) DO NOTHING
+  </insert>
+  <select id="selectTitleGeneration" resultMap="titleGenerationRow">
+    SELECT generation_id,thread_id,result,input_tokens,output_tokens,total_tokens,failure_code,completed_at
+    FROM thread_title_generations WHERE generation_id=#{generationId}
+  </select>
+  <update id="completeTitleGeneration">
+    UPDATE thread_title_generations SET result=#{result},input_tokens=#{inputTokens},output_tokens=#{outputTokens},
+      total_tokens=#{totalTokens},failure_code=#{failureCode},completed_at=#{completedAt}
+    WHERE generation_id=#{generationId} AND result IS NULL
+  </update>
+</mapper>

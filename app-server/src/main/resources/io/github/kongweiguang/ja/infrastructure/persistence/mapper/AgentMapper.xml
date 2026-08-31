@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AgentMapper">
+  <resultMap id="turnRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$TurnRow">
+    <constructor>
+      <arg column="turn_id" javaType="string"/><arg column="thread_id" javaType="string"/>
+      <arg column="state" javaType="string"/><arg column="provider_id" javaType="string"/>
+      <arg column="model_id" javaType="string"/><arg column="provider" javaType="string"/>
+      <arg column="api" javaType="string"/><arg column="upstream_model" javaType="string"/>
+      <arg column="reasoning_level" javaType="string"/><arg column="access_mode" javaType="string"/>
+      <arg column="config_generation" javaType="string"/><arg column="mutation_version" javaType="_long"/>
+      <arg column="requested_at" javaType="string"/><arg column="updated_at" javaType="string"/>
+      <arg column="completed_at" javaType="string"/><arg column="terminal_summary" javaType="string"/>
+      <arg column="error_code" javaType="string"/><arg column="error_message" javaType="string"/>
+      <arg column="cancel_requested_at" javaType="string"/><arg column="cancel_reason" javaType="string"/>
+      <arg column="cancel_expected_thread_revision" javaType="java.lang.Long"/>
+      <arg column="cancel_thread_revision" javaType="java.lang.Long"/>
+      <arg column="cancel_turn_mutation_version" javaType="java.lang.Long"/>
+      <arg column="thread_revision" javaType="java.lang.Long"/>
+      <arg column="change_set_json" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="messageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$MessageRow">
+    <constructor>
+      <arg column="message_id" javaType="string"/><arg column="turn_id" javaType="string"/>
+      <arg column="ordinal" javaType="_long"/><arg column="role" javaType="string"/>
+      <arg column="blocks_json" javaType="string"/><arg column="created_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="toolRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolRow">
+    <constructor>
+      <arg column="call_id" javaType="string"/><arg column="state" javaType="string"/>
+      <arg column="revision" javaType="_long"/><arg column="ordinal" javaType="_int"/>
+      <arg column="tool_name" javaType="string"/><arg column="side_effect" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="approvalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ApprovalRow">
+    <constructor>
+      <arg column="approval_id" javaType="string"/><arg column="decision" javaType="string"/>
+      <arg column="expires_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="pendingInputRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputRow">
+    <constructor>
+      <arg column="input_id" javaType="string"/><arg column="thread_id" javaType="string"/>
+      <arg column="turn_id" javaType="string"/><arg column="kind" javaType="string"/>
+      <arg column="text" javaType="string"/><arg column="created_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="toolArtifactRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolArtifactRow">
+    <constructor><arg column="artifact_id" javaType="string"/><arg column="content" javaType="string"/>
+      <arg column="character_length" javaType="_long"/></constructor>
+  </resultMap>
+  <select id="selectTurn" resultMap="turnRow">
+    SELECT x.turn_id,x.thread_id,x.state,x.provider_id,x.model_id,x.provider,x.api,x.upstream_model,
+      x.reasoning_level,x.access_mode,x.config_generation,x.mutation_version,x.requested_at,x.updated_at,
+      x.completed_at,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at,x.cancel_reason,
+      x.cancel_expected_thread_revision,x.cancel_thread_revision,x.cancel_turn_mutation_version,
+      NULL AS thread_revision,c.change_set_json
+    FROM turns x LEFT JOIN turn_change_sets c ON c.turn_id=x.turn_id
+    WHERE x.thread_id=#{threadId} AND x.turn_id=#{turnId}
+  </select>
+  <select id="selectTurns" resultMap="turnRow">
+    SELECT x.turn_id,x.thread_id,x.state,x.provider_id,x.model_id,x.provider,x.api,x.upstream_model,
+      x.reasoning_level,x.access_mode,x.config_generation,x.mutation_version,x.requested_at,x.updated_at,
+      x.completed_at,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at,x.cancel_reason,
+      x.cancel_expected_thread_revision,x.cancel_thread_revision,x.cancel_turn_mutation_version,
+      NULL AS thread_revision,c.change_set_json
+    FROM turns x LEFT JOIN turn_change_sets c ON c.turn_id=x.turn_id
+    WHERE x.thread_id=#{threadId} ORDER BY x.requested_at,x.turn_id
+  </select>
+  <select id="selectTurnById" resultMap="turnRow">
+    SELECT x.turn_id,x.thread_id,x.state,x.provider_id,x.model_id,x.provider,x.api,x.upstream_model,
+      x.reasoning_level,x.access_mode,x.config_generation,x.mutation_version,x.requested_at,x.updated_at,
+      x.completed_at,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at,x.cancel_reason,
+      x.cancel_expected_thread_revision,x.cancel_thread_revision,x.cancel_turn_mutation_version,
+      t.revision AS thread_revision,c.change_set_json FROM turns x JOIN threads t ON t.thread_id=x.thread_id
+      LEFT JOIN turn_change_sets c ON c.turn_id=x.turn_id
+    WHERE x.turn_id=#{turnId} AND t.deleted_at IS NULL
+  </select>
+  <insert id="insertTurn">
+    INSERT INTO turns(turn_id,thread_id,state,provider_id,model_id,provider,api,upstream_model,
+      reasoning_level,access_mode,config_generation,requested_at,updated_at)
+    VALUES(#{turnId},#{threadId},'QUEUED',#{providerId},#{modelId},#{provider},#{api},#{upstreamModel},
+      #{reasoningLevel},#{accessMode},#{configGeneration},#{occurredAt},#{occurredAt})
+  </insert>
+  <update id="claimCancellation">
+    UPDATE turns SET mutation_version=mutation_version+1,updated_at=#{occurredAt},
+      cancel_requested_at=#{occurredAt},cancel_reason=#{reason},
+      cancel_expected_thread_revision=#{expectedThreadRevision},
+      cancel_thread_revision=#{cancelThreadRevision},
+      cancel_turn_mutation_version=#{cancelTurnMutationVersion}
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId}
+      AND mutation_version=#{expectedTurnMutationVersion}
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+      AND cancel_requested_at IS NULL
+  </update>
+  <update id="compareAndSetTurn">
+    UPDATE turns SET state=#{state},mutation_version=mutation_version+1,updated_at=#{occurredAt},completed_at=#{completedAt},terminal_summary=#{summary},
+      error_code=#{errorCode},error_message=#{errorMessage}
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND mutation_version=#{expectedTurnMutationVersion}
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+      <if test="state != 'CANCELLED'">
+        AND cancel_requested_at IS NULL
+      </if>
+  </update>
+  <update id="advanceCancellationToolBatch">
+    UPDATE turns SET mutation_version=mutation_version+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId}
+      AND mutation_version=#{expectedTurnMutationVersion} AND state=#{state}
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+      AND cancel_requested_at IS NOT NULL
+  </update>
+  <select id="selectNextMessageOrdinal" resultType="long">
+    SELECT COALESCE(MAX(ordinal)+1,1) FROM messages WHERE thread_id=#{threadId}
+  </select>
+  <insert id="insertMessage">
+    INSERT INTO messages(message_id,thread_id,turn_id,ordinal,role,blocks_json,created_at)
+    VALUES(#{messageId},#{threadId},#{turnId},#{ordinal},#{role},#{blocksJson},#{occurredAt})
+  </insert>
+  <insert id="insertTimelineMessage">
+    INSERT INTO timeline_messages(item_id,thread_id,turn_id,message_kind,public_text,model_round,created_at)
+    VALUES(#{itemId},#{threadId},#{turnId},#{messageKind},#{publicText},#{modelRound},#{occurredAt})
+  </insert>
+  <select id="selectMessages" resultMap="messageRow">
+    SELECT message_id,turn_id,ordinal,role,blocks_json,created_at FROM messages
+    WHERE thread_id=#{threadId} ORDER BY ordinal
+  </select>
+  <select id="selectTool" resultMap="toolRow">
+    SELECT call_id,state,revision,ordinal,tool_name,side_effect FROM tools WHERE turn_id=#{turnId} AND call_id=#{callId}
+  </select>
+  <insert id="insertTool">
+    INSERT INTO tools(call_id,thread_id,turn_id,ordinal,tool_name,side_effect,presentation_json,state,revision,created_at,updated_at)
+    VALUES(#{callId},#{threadId},#{turnId},#{ordinal},#{toolName},#{sideEffect},#{presentationJson},'PREPARED',0,#{occurredAt},#{occurredAt})
+  </insert>
+  <update id="startTool">
+    UPDATE tools SET state='RUNNING',revision=revision+1,updated_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND call_id=#{callId} AND state='PREPARED'
+  </update>
+  <update id="finishTool">
+    UPDATE tools SET state=#{state},presentation_json=#{presentationJson},artifact_id=#{artifactId},revision=revision+1,updated_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND call_id=#{callId} AND state IN ('PREPARED','RUNNING')
+  </update>
+  <update id="updateToolPresentation">
+    UPDATE tools SET presentation_json=#{presentationJson},revision=revision+1,updated_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND call_id=#{callId} AND state IN ('PREPARED','RUNNING')
+  </update>
+  <select id="countUnfinishedTools" resultType="int">
+    SELECT COUNT(*) FROM tools WHERE turn_id=#{turnId} AND state IN ('PREPARED','RUNNING')
+  </select>
+  <update id="settleUnfinishedTools">
+    UPDATE tools SET state=#{state},
+      presentation_json=json_set(presentation_json,'$.status',#{presentationStatus},
+        '$.outputPreview',#{outputPreview}),
+      revision=revision+1,updated_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND state IN ('PREPARED','RUNNING')
+  </update>
+  <insert id="insertToolArtifact">
+    INSERT INTO tool_artifacts(artifact_id,thread_id,turn_id,call_id,content,character_length,created_at)
+    VALUES(#{artifactId},#{threadId},#{turnId},#{callId},#{content},#{characterLength},#{occurredAt})
+  </insert>
+  <select id="selectToolArtifact" resultMap="toolArtifactRow">
+    SELECT artifact_id,content,character_length FROM tool_artifacts
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND call_id=#{callId} AND artifact_id=#{artifactId}
+  </select>
+  <select id="selectApproval" resultMap="approvalRow">
+    SELECT approval_id,decision,expires_at FROM approvals WHERE turn_id=#{turnId} AND approval_id=#{approvalId}
+  </select>
+  <insert id="insertApproval">
+    INSERT INTO approvals(approval_id,thread_id,turn_id,call_id,requested_at,expires_at)
+    VALUES(#{approvalId},#{threadId},#{turnId},#{callId},#{occurredAt},#{expiresAt})
+  </insert>
+  <update id="resolveApproval">
+    UPDATE approvals SET decision=#{decision},resolved_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND approval_id=#{approvalId} AND call_id=#{callId}
+      AND decision IS NULL AND expires_at&gt;=#{occurredAt}
+  </update>
+  <insert id="insertUsage">
+    INSERT INTO usage(usage_id,thread_id,turn_id,model_round,input_tokens,output_tokens,total_tokens,created_at)
+    VALUES(#{usageId},#{threadId},#{turnId},#{modelRound},#{inputTokens},#{outputTokens},#{totalTokens},#{occurredAt})
+  </insert>
+  <select id="countUsageForTurn" resultType="int">
+    SELECT COUNT(*) FROM usage WHERE turn_id=#{turnId}
+  </select>
+  <insert id="insertPendingInput">
+    INSERT INTO pending_inputs(input_id,thread_id,turn_id,kind,text,state,created_at)
+    VALUES(#{inputId},#{threadId},#{turnId},#{kind},#{text},'PENDING',#{occurredAt})
+  </insert>
+  <select id="selectPendingInput" resultMap="pendingInputRow">
+    SELECT input_id,thread_id,turn_id,kind,text,created_at FROM pending_inputs
+    WHERE turn_id=#{turnId} AND kind=#{kind} AND state='PENDING'
+    ORDER BY created_at,input_id LIMIT 1
+  </select>
+  <update id="consumePendingInput">
+    UPDATE pending_inputs SET state='CONSUMED',consumed_at=#{occurredAt}
+    WHERE input_id=#{inputId} AND state='PENDING'
+  </update>
+  <update id="cancelPendingInputs">
+    UPDATE pending_inputs SET state='CANCELLED',consumed_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND state='PENDING'
+  </update>
+  <update id="advanceInputConsumption">
+    UPDATE turns SET mutation_version=mutation_version+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId}
+      AND mutation_version=#{expectedTurnMutationVersion}
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+      AND cancel_requested_at IS NULL
+  </update>
+</mapper>

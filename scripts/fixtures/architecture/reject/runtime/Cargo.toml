@@ -1,0 +1,3 @@
+# @author kongweiguang
+[dependencies]
+desktop-runtime = { package = "tauri", version = "2" }

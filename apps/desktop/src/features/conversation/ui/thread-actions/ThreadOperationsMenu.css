@@ -1,0 +1,84 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-thread-operations {
+  display: contents;
+}
+
+.ja-thread-operations-menu {
+  z-index: 92;
+  min-width: 11.5rem;
+  padding: 0.3rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-window-surface-muted) 97%, transparent);
+  box-shadow: var(--ja-shadow-floating);
+}
+
+.ja-thread-operations-item {
+  display: flex;
+  min-height: 2rem;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.38rem 0.52rem;
+  border-radius: 0.46rem;
+  font-size: var(--ja-text-control-size);
+  outline: none;
+  user-select: none;
+}
+
+.ja-thread-operations-item[data-highlighted] {
+  background: var(--ja-control-hover);
+}
+
+.ja-thread-operations-item[data-disabled] {
+  color: var(--ja-foreground-tertiary);
+}
+
+.ja-thread-operations-item svg {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+.ja-thread-compaction-feedback {
+  position: absolute;
+  z-index: 4;
+  top: calc(100% + 0.35rem);
+  right: 0.75rem;
+  display: flex;
+  max-width: min(30rem, calc(100vw - 2rem));
+  align-items: center;
+  gap: 0.42rem;
+  padding: 0.42rem 0.48rem 0.42rem 0.68rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground);
+  background: var(--ja-window-surface-muted);
+  box-shadow: var(--ja-shadow-floating);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-thread-compaction-feedback.is-error {
+  border-color: color-mix(in srgb, var(--ja-danger) 48%, var(--ja-border-strong));
+}
+
+.ja-thread-compaction-feedback > span {
+  min-width: 0;
+}
+
+.ja-thread-compaction-feedback > button:not(.ja-icon-button) {
+  flex: 0 0 auto;
+  border: 0;
+  color: var(--ja-accent);
+  background: transparent;
+  font: inherit;
+  font-weight: var(--ja-weight-semibold);
+  cursor: pointer;
+}
+
+.ja-thread-compaction-feedback .ja-icon-button {
+  width: 1.55rem;
+  height: 1.55rem;
+  flex: 0 0 auto;
+}

@@ -1,0 +1,264 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+/*
+ * token 层刻意使用语义命名而非组件专用命名。数值保留 Ja 的语义强调色，
+ * dark shell 采用 Codex 参考的中性 #141414/#181818 surface；feature style
+ * 只消费这些名称，使 theme 与可访问性调整能在 root 原子生效。
+ */
+:root {
+  color-scheme: light;
+  /* 拉丁字形沿用各桌面原生字体，同时显式声明 CJK fallback；否则 WebView2
+   * 在不同 Windows font-link 配置下解析小号中文会不一致。 */
+  --ja-font-ui:
+    "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", system-ui,
+    sans-serif;
+  font-family: var(--ja-font-ui);
+  font-synthesis: none;
+  font-optical-sizing: auto;
+  letter-spacing: 0;
+  --ja-font-mono:
+    "Cascadia Code", "Cascadia Mono", "SF Mono", "SFMono-Regular", Consolas, monospace;
+
+  /* Codex 平衡密度刻意使用小型字号阶梯；Caption 是有意义 UI 文案的下限，
+   * editor 与 Terminal 内容保留各自 mono 尺寸契约。 */
+  --ja-text-caption-size: 0.75rem;
+  --ja-text-control-size: 0.8125rem;
+  --ja-text-body-size: 0.875rem;
+  --ja-text-title-size: 0.9375rem;
+  --ja-text-subheading-size: 1rem;
+  --ja-text-heading-size: 1.125rem;
+  --ja-text-display-size: 1.25rem;
+  --ja-line-caption: 1.35;
+  --ja-line-control: 1.4;
+  --ja-line-body: 1.55;
+  --ja-line-heading: 1.3;
+  --ja-weight-regular: 400;
+  --ja-weight-medium: 500;
+  --ja-weight-semibold: 600;
+  --ja-weight-bold: 700;
+  --ja-control-height-compact: 2rem;
+  --ja-control-height-default: 2.25rem;
+  --ja-content-reading-width: 50rem;
+
+  --ja-background: #f2f2f4;
+  --ja-content: #fafafb;
+  --ja-surface: #fafafb;
+  --ja-surface-raised: #ffffff;
+  --ja-surface-muted: #e4e5e9;
+  --ja-control: rgb(255 255 255 / 78%);
+  --ja-control-hover: #e9e9ed;
+  --ja-control-active: #dedfe4;
+  --ja-titlebar: #f2f2f4;
+  --ja-sidebar: #f2f2f4;
+  --ja-glass: rgb(255 255 255 / 78%);
+  --ja-glass-strong: rgb(255 255 255 / 92%);
+  --ja-glass-border: rgb(28 28 30 / 10%);
+  --ja-border: rgb(28 28 30 / 10%);
+  --ja-border-strong: rgb(28 28 30 / 18%);
+  --ja-foreground: #1c1c1e;
+  --ja-foreground-muted: #5f6066;
+  --ja-foreground-tertiary: #6c6d72;
+  --ja-accent: #007aff;
+  --ja-accent-hover: #006ee6;
+  --ja-accent-soft: rgb(0 122 255 / 12%);
+  --ja-accent-foreground: #ffffff;
+  --ja-focus: #007aff;
+  --ja-success: #248a3d;
+  --ja-success-soft: rgb(36 138 61 / 12%);
+  --ja-warning: #a35d00;
+  --ja-warning-soft: rgb(163 93 0 / 11%);
+  --ja-danger: #d70015;
+  --ja-danger-soft: rgb(215 0 21 / 10%);
+
+  /* Frakio 最新 Workbench 将原生窗口 backdrop 与内容 surface 分离；
+   * 这些语义别名让 shell 复现克制的 12px inset，同时保留 Xcode light/dark token 所有权。 */
+  --ja-window-backdrop: #e6e6e6;
+  --ja-window-surface: #ffffff;
+  --ja-window-surface-muted: #f6f6f6;
+  --ja-window-border: rgb(17 24 39 / 9%);
+
+  --ja-radius-sm: 5px;
+  --ja-radius-md: 7px;
+  --ja-radius-lg: 8px;
+  --ja-radius-xl: 8px;
+  /* 选中项与主窗格需要比紧凑控件更柔和，但用独立语义避免全局组件膨胀。 */
+  --ja-radius-selection: 12px;
+  --ja-radius-pane: 16px;
+  --ja-surface-elevated: var(--ja-surface-raised);
+  --ja-shadow-sm: 0 1px 2px rgb(20 20 24 / 7%);
+  --ja-shadow-md: 0 10px 30px rgb(20 20 24 / 12%);
+  --ja-shadow-floating: 0 22px 65px rgb(16 17 20 / 20%), 0 4px 14px rgb(16 17 20 / 10%);
+  --ja-ease-native: cubic-bezier(0.16, 1, 0.3, 1);
+  --ja-duration-fast: 120ms;
+  --ja-duration-normal: 180ms;
+
+  /* canonical 语义别名使 feature CSS 不依赖具体 palette 数值。 */
+  --surface-app: var(--ja-background);
+  --surface-content: var(--ja-content);
+  --surface-primary: var(--ja-surface);
+  --surface-elevated: var(--ja-surface-raised);
+  --surface-glass: var(--ja-glass);
+  --surface-glass-strong: var(--ja-glass-strong);
+  --surface-control: var(--ja-control);
+  --surface-control-hover: var(--ja-control-hover);
+  --surface-selected: var(--ja-surface-muted);
+  --border-subtle: var(--ja-border);
+  --border-strong: var(--ja-border-strong);
+  --text-primary: var(--ja-foreground);
+  --text-secondary: var(--ja-foreground-muted);
+  --text-tertiary: var(--ja-foreground-tertiary);
+  --accent: var(--ja-accent);
+  --focus-ring: var(--ja-focus);
+  --shadow-soft: var(--ja-shadow-sm);
+  --shadow-floating: var(--ja-shadow-floating);
+  --ease-native: var(--ja-ease-native);
+}
+
+/* Xcode 是唯一支持的 palette；显式 selector 让 CSS 审计能验证所有 palette 值均为语义值。 */
+:root[data-palette="xcode"] {
+  --ja-accent: #007aff;
+  --ja-accent-hover: #006ee6;
+  --ja-accent-soft: rgb(0 122 255 / 12%);
+  --ja-focus: #007aff;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ja-background: #141414;
+  --ja-content: #181818;
+  --ja-surface: #181818;
+  --ja-surface-raised: #202020;
+  --ja-surface-muted: #2b2b2b;
+  --ja-control: #222222;
+  --ja-control-hover: #292929;
+  --ja-control-active: #303030;
+  --ja-titlebar: #141414;
+  --ja-sidebar: #141414;
+  --ja-glass: rgb(32 32 32 / 88%);
+  --ja-glass-strong: rgb(36 36 36 / 96%);
+  --ja-glass-border: rgb(255 255 255 / 8%);
+  --ja-border: rgb(255 255 255 / 8%);
+  --ja-border-strong: rgb(255 255 255 / 14%);
+  --ja-foreground: #f1f1f1;
+  --ja-foreground-muted: #a8a8a8;
+  --ja-foreground-tertiary: #919191;
+  --ja-accent: #0a84ff;
+  --ja-accent-hover: #409cff;
+  --ja-accent-soft: rgb(10 132 255 / 15%);
+  --ja-accent-foreground: #051525;
+  --ja-focus: #64d2ff;
+  --ja-success: #50c878;
+  --ja-success-soft: rgb(80 200 120 / 14%);
+  --ja-warning: #f0b45a;
+  --ja-warning-soft: rgb(240 180 90 / 13%);
+  --ja-danger: #ff6961;
+  --ja-danger-soft: rgb(255 105 97 / 13%);
+  --ja-window-backdrop: #141414;
+  --ja-window-surface: #181818;
+  --ja-window-surface-muted: #202020;
+  --ja-window-border: rgb(255 255 255 / 8%);
+  --ja-shadow-sm: 0 1px 2px rgb(0 0 0 / 24%);
+  --ja-shadow-md: 0 12px 32px rgb(0 0 0 / 34%);
+  --ja-shadow-floating: 0 24px 70px rgb(0 0 0 / 48%), 0 4px 16px rgb(0 0 0 / 32%);
+}
+
+/* host 可能在 ThemeProvider 首次 layout effect 前渲染 shell；该 fallback
+ * 在 OS 已为 dark 时避免 light 闪烁。 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --ja-background: #141414;
+    --ja-content: #181818;
+    --ja-surface: #181818;
+    --ja-surface-raised: #202020;
+    --ja-surface-muted: #2b2b2b;
+    --ja-control: #222222;
+    --ja-control-hover: #292929;
+    --ja-control-active: #303030;
+    --ja-titlebar: #141414;
+    --ja-sidebar: #141414;
+    --ja-glass: rgb(32 32 32 / 88%);
+    --ja-glass-strong: rgb(36 36 36 / 96%);
+    --ja-glass-border: rgb(255 255 255 / 8%);
+    --ja-border: rgb(255 255 255 / 8%);
+    --ja-border-strong: rgb(255 255 255 / 14%);
+    --ja-foreground: #f1f1f1;
+    --ja-foreground-muted: #a8a8a8;
+    --ja-foreground-tertiary: #919191;
+    --ja-accent: #0a84ff;
+    --ja-accent-hover: #409cff;
+    --ja-accent-soft: rgb(10 132 255 / 15%);
+    --ja-accent-foreground: #051525;
+    --ja-focus: #64d2ff;
+    --ja-success: #50c878;
+    --ja-success-soft: rgb(80 200 120 / 14%);
+    --ja-warning: #f0b45a;
+    --ja-warning-soft: rgb(240 180 90 / 13%);
+    --ja-danger: #ff6961;
+    --ja-danger-soft: rgb(255 105 97 / 13%);
+    --ja-window-backdrop: #141414;
+    --ja-window-surface: #181818;
+    --ja-window-surface-muted: #202020;
+    --ja-window-border: rgb(255 255 255 / 8%);
+    --ja-shadow-sm: 0 1px 2px rgb(0 0 0 / 24%);
+    --ja-shadow-md: 0 12px 32px rgb(0 0 0 / 34%);
+    --ja-shadow-floating: 0 24px 70px rgb(0 0 0 / 48%), 0 4px 16px rgb(0 0 0 / 32%);
+  }
+}
+
+:root[data-high-contrast="true"] {
+  --ja-border: var(--ja-foreground-muted);
+  --ja-border-strong: var(--ja-foreground);
+  --ja-focus: #005ecb;
+}
+
+:root[data-theme="dark"][data-high-contrast="true"] {
+  --ja-focus: #64d2ff;
+}
+
+/* 即使 OS 未启用 reduced-motion preference，应用设置也必须生效；
+ * class 镜像 attribute，供组件级 hook 使用。 */
+:root[data-reduce-motion="true"] *,
+:root[data-reduce-motion="true"] *::before,
+:root[data-reduce-motion="true"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  scroll-behavior: auto !important;
+  transition-duration: 0.01ms !important;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --ja-titlebar: var(--ja-surface-raised);
+    --ja-sidebar: var(--ja-background);
+    --ja-glass: var(--ja-surface-raised);
+    --ja-glass-strong: var(--ja-surface-raised);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  :root {
+    --ja-accent: Highlight;
+    --ja-accent-foreground: HighlightText;
+    --ja-border: CanvasText;
+    --ja-border-strong: CanvasText;
+    --ja-focus: Highlight;
+  }
+}

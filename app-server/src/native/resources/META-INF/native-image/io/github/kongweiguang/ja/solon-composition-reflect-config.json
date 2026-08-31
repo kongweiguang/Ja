@@ -1,0 +1,28 @@
+[
+  {
+    "name": "io.github.kongweiguang.ja.bootstrap.SolonRuntimeComposition",
+    "methods": [
+      {
+        "name": "kernelContextOrchestratorFactory",
+        "parameterTypes": [
+          "io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore",
+          "java.time.Clock",
+          "io.github.kongweiguang.ja.conversation.application.context.summary.SummaryModel$Factory"
+        ]
+      },
+      {
+        "name": "runtimeServicesFactory",
+        "parameterTypes": [
+          "io.github.kongweiguang.ja.conversation.application.service.TurnService",
+          "io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker",
+          "io.github.kongweiguang.ja.catalog.adapter.out.skills.JaSkillSources",
+          "io.github.kongweiguang.ja.bootstrap.ContextOrchestratorFactory",
+          "io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService",
+          "io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationCatalog",
+          "io.github.kongweiguang.ja.infrastructure.persistence.recovery.StartupRecoveryService",
+          "io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationTurnMcpSessionFactory"
+        ]
+      }
+    ]
+  }
+]

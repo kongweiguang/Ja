@@ -1,0 +1,664 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.noear</groupId>
+        <artifactId>solon-parent</artifactId>
+        <version>4.0.6</version>
+        <relativePath />
+    </parent>
+
+    <groupId>io.github.kongweiguang</groupId>
+    <artifactId>ja-app-server</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Ja App Server</name>
+    <description>Local app server and native Agent Kernel for the Ja desktop</description>
+    <licenses>
+        <license>
+            <name>GNU General Public License v3.0 or later</name>
+            <url>https://www.gnu.org/licenses/gpl-3.0.html</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <!-- JVM and Native Image deliberately share one Java 25 ABI and composition root. -->
+        <java.version>25</java.version>
+        <maven.compiler.release>25</maven.compiler.release>
+        <maven.compiler.source>25</maven.compiler.source>
+        <maven.compiler.target>25</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- Verification may isolate artifacts from a live desktop JAR; normal builds retain target/. -->
+        <ja.build.directory>${project.basedir}/target</ja.build.directory>
+
+        <solon.version>4.0.6</solon.version>
+        <jackson.version>2.22.2</jackson.version>
+        <jackson3.version>3.2.2</jackson3.version>
+        <tomlj.version>1.1.1</tomlj.version>
+        <kotlin.version>2.4.10</kotlin.version>
+        <flyway.version>13.4.0</flyway.version>
+        <mcp.version>2.0.1</mcp.version>
+        <networknt.version>3.0.7</networknt.version>
+        <okhttp.version>5.5.0</okhttp.version>
+        <okio.version>3.18.1</okio.version>
+        <reactor.version>3.8.7</reactor.version>
+        <mybatis.version>3.5.19</mybatis.version>
+        <slf4j.version>2.0.18</slf4j.version>
+        <logback.version>1.6.3</logback.version>
+        <sqlite.version>3.53.4.0</sqlite.version>
+        <junit.version>6.1.3</junit.version>
+        <mockwebserver.version>5.5.0</mockwebserver.version>
+        <jazzer.version>0.30.0</jazzer.version>
+        <eggg.version>1.1.5</eggg.version>
+        <archunit.version>1.5.0</archunit.version>
+        <checkstyle.version>14.0.0</checkstyle.version>
+        <pmd.version>7.26.0</pmd.version>
+        <ja.main.class>io.github.kongweiguang.ja.bootstrap.App</ja.main.class>
+
+        <maven-compiler-plugin.version>3.15.0</maven-compiler-plugin.version>
+        <maven-resources-plugin.version>3.5.0</maven-resources-plugin.version>
+        <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
+        <maven-jar-plugin.version>3.5.1</maven-jar-plugin.version>
+        <maven-antrun-plugin.version>3.2.0</maven-antrun-plugin.version>
+        <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
+        <native-maven-plugin.version>1.1.10</native-maven-plugin.version>
+        <maven-checkstyle-plugin.version>3.6.0</maven-checkstyle-plugin.version>
+        <spotbugs-maven-plugin.version>4.10.4.0</spotbugs-maven-plugin.version>
+        <maven-pmd-plugin.version>3.28.0</maven-pmd-plugin.version>
+        <maven-dependency-plugin.version>3.11.0</maven-dependency-plugin.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- One Jackson 2 line is shared by the wire/model code and the explicit MCP mapper. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- OkHttp 5 is a Kotlin library; pin the runtime line so Native/JVM see one ABI. -->
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-bom</artifactId>
+                <version>${kotlin.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Solon 4.0.6 and its YAML stack declare adjacent eggg patches; use the core-selected release. -->
+            <dependency>
+                <groupId>org.noear</groupId>
+                <artifactId>eggg</artifactId>
+                <version>${eggg.version}</version>
+            </dependency>
+            <!-- MCP SDK 仍传递声明旧验证器；运行时统一当前 ABI，并把 Schema 校验封装在 Tool Adapter。 -->
+            <dependency>
+                <groupId>com.networknt</groupId>
+                <artifactId>json-schema-validator</artifactId>
+                <version>${networknt.version}</version>
+            </dependency>
+            <!-- Flyway 13 与 NetworkNT 3 同时使用 Jackson 3；统一当前正式 ABI，避免类路径近路选择。 -->
+            <dependency>
+                <groupId>tools.jackson.core</groupId>
+                <artifactId>jackson-core</artifactId>
+                <version>${jackson3.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>tools.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson3.version}</version>
+            </dependency>
+            <!-- MCP SDK 仍声明 Reactor 3.7；由应用统一到已验证的当前正式 ABI。 -->
+            <dependency>
+                <groupId>io.projectreactor</groupId>
+                <artifactId>reactor-core</artifactId>
+                <version>${reactor.version}</version>
+            </dependency>
+            <!-- Solon 插件只负责装配，领域持久化适配器统一使用当前 MyBatis ABI。 -->
+            <dependency>
+                <groupId>org.mybatis</groupId>
+                <artifactId>mybatis</artifactId>
+                <version>${mybatis.version}</version>
+            </dependency>
+            <!-- 日志 API 与 Provider 必须成套收敛，避免 Solon 传递版本近路覆盖生产版本。 -->
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-classic</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-core</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+            <!-- OkHttp 与 MCP 都会传递 Okio；统一 JVM 实现以保证 Native/JVM 类路径一致。 -->
+            <dependency>
+                <groupId>com.squareup.okio</groupId>
+                <artifactId>okio-jvm</artifactId>
+                <version>${okio.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Solon is only the configuration, logging, and process-lifecycle shell. -->
+        <dependency>
+            <groupId>org.noear</groupId>
+            <artifactId>solon</artifactId>
+            <version>${solon.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.noear</groupId>
+            <artifactId>solon-java25</artifactId>
+            <version>${solon.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.noear</groupId>
+            <artifactId>solon-config-yaml</artifactId>
+            <version>${solon.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.noear</groupId>
+            <artifactId>solon-logging-logback-jakarta</artifactId>
+            <version>${solon.version}</version>
+        </dependency>
+        <!-- Solon owns the final MyBatis composition and transaction lifecycle;
+             Phase 1 proved this exact stack in Windows Native Image. -->
+        <dependency>
+            <groupId>org.noear</groupId>
+            <artifactId>solon-data</artifactId>
+            <version>${solon.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.noear</groupId>
+            <artifactId>mybatis-solon-plugin</artifactId>
+            <version>${solon.version}</version>
+        </dependency>
+
+        <!-- JSON is explicit at adapter boundaries; no provider SDK controls its version. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <!-- Ja App Server owns config.toml and uses the current strict TOML parser instead of
+             maintaining an incomplete hand-written grammar at the credential boundary. -->
+        <dependency>
+            <groupId>org.tomlj</groupId>
+            <artifactId>tomlj</artifactId>
+            <version>${tomlj.version}</version>
+        </dependency>
+
+        <!-- MCP 2.0.1 uses Jackson 2 explicitly; the Jackson 3 convenience facade is forbidden. -->
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-core</artifactId>
+            <version>${mcp.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-json-jackson2</artifactId>
+            <version>${mcp.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>${sqlite.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.mybatis</groupId>
+            <artifactId>mybatis</artifactId>
+            <version>${mybatis.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+            <version>${flyway.version}</version>
+        </dependency>
+
+        <!-- Provider and MCP network adapters share OkHttp ownership.  The JVM
+             artifact is explicit because the generic coordinate is metadata. -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp-jvm</artifactId>
+            <version>${okhttp.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp-sse</artifactId>
+            <version>${okhttp.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okio</groupId>
+            <artifactId>okio-jvm</artifactId>
+            <version>${okio.version}</version>
+        </dependency>
+
+        <!-- MCP 传输直接使用 Reactor 类型，固定当前正式版而不依赖 SDK 的传递版本。 -->
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-core</artifactId>
+            <version>${reactor.version}</version>
+        </dependency>
+
+        <!-- 结构化日志 API 与生产 Logback Provider 都是运行时直接边界。 -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-core</artifactId>
+            <version>${logback.version}</version>
+        </dependency>
+
+        <!-- Tool arguments use the mature 2020-12 validator verified by the
+             dependency probe; no in-house schema implementation remains final. -->
+        <dependency>
+            <groupId>com.networknt</groupId>
+            <artifactId>json-schema-validator</artifactId>
+            <version>${networknt.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>mockwebserver3</artifactId>
+            <version>${mockwebserver.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.code-intelligence</groupId>
+            <artifactId>jazzer-junit</artifactId>
+            <version>${jazzer.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <!-- Jazzer 0.30 declares JUnit 5.9; Ja runs one aligned JUnit 6.1 platform. -->
+                <exclusion>
+                    <groupId>org.junit.jupiter</groupId>
+                    <artifactId>junit-jupiter-params</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.junit.platform</groupId>
+                    <artifactId>junit-platform-launcher</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.platform</groupId>
+            <artifactId>junit-platform-launcher</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit</artifactId>
+            <version>${archunit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5-api</artifactId>
+            <version>${archunit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5-engine</artifactId>
+            <version>${archunit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <directory>${ja.build.directory}</directory>
+        <finalName>${project.artifactId}</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                    <encoding>${project.build.sourceEncoding}</encoding>
+                    <parameters>true</parameters>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+                <configuration>
+                    <useFile>false</useFile>
+                    <failIfNoTests>false</failIfNoTests>
+                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>${maven-jar-plugin.version}</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>${ja.main.class}</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.noear</groupId>
+                <artifactId>solon-maven-plugin</artifactId>
+                <version>${solon.version}</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>${maven-resources-plugin.version}</version>
+                <configuration>
+                    <encoding>${project.build.sourceEncoding}</encoding>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>${maven-enforcer-plugin.version}</version>
+                <configuration>
+                    <rules>
+                        <requireJavaVersion>
+                            <version>[25,26)</version>
+                        </requireJavaVersion>
+                        <requireReleaseDeps>
+                            <message>Ja requires release-only dependencies; snapshots and ranges are forbidden.</message>
+                            <failWhenParentIsSnapshot>true</failWhenParentIsSnapshot>
+                        </requireReleaseDeps>
+                        <dependencyConvergence />
+                        <bannedDependencies>
+                            <excludes>
+                                <exclude>io.modelcontextprotocol.sdk:mcp</exclude>
+                                <exclude>io.modelcontextprotocol.sdk:mcp-json-jackson3</exclude>
+                                <exclude>com.openai:openai-java-core</exclude>
+                                <exclude>com.openai:openai-java</exclude>
+                                <exclude>com.openai:openai-java-client-okhttp</exclude>
+                                <exclude>com.anthropic:anthropic-java-core</exclude>
+                                <exclude>com.anthropic:anthropic-java</exclude>
+                                <exclude>com.anthropic:anthropic-java-client-okhttp</exclude>
+                            </excludes>
+                            <message>Ja owns Provider wire codecs and one composition-owned OkHttp transport.</message>
+                        </bannedDependencies>
+                    </rules>
+                    <fail>true</fail>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>enforce-build-baseline</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-checkstyle-plugin</artifactId>
+                <version>${maven-checkstyle-plugin.version}</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>com.puppycrawl.tools</groupId>
+                        <artifactId>checkstyle</artifactId>
+                        <version>${checkstyle.version}</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <configLocation>${project.basedir}/config/checkstyle/checkstyle.xml</configLocation>
+                    <includeTestSourceDirectory>true</includeTestSourceDirectory>
+                    <failOnViolation>true</failOnViolation>
+                    <consoleOutput>true</consoleOutput>
+                    <cacheFile>${project.build.directory}/checkstyle-cachefile</cacheFile>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>check-java-source-policy</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>com.github.spotbugs</groupId>
+                <artifactId>spotbugs-maven-plugin</artifactId>
+                <version>${spotbugs-maven-plugin.version}</version>
+                <configuration>
+                    <effort>Max</effort>
+                    <threshold>Low</threshold>
+                    <failOnError>true</failOnError>
+                    <excludeFilterFile>${project.basedir}/config/spotbugs/exclude.xml</excludeFilterFile>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>spotbugs-gate</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-pmd-plugin</artifactId>
+                <version>${maven-pmd-plugin.version}</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>net.sourceforge.pmd</groupId>
+                        <artifactId>pmd-core</artifactId>
+                        <version>${pmd.version}</version>
+                    </dependency>
+                    <dependency>
+                        <groupId>net.sourceforge.pmd</groupId>
+                        <artifactId>pmd-java</artifactId>
+                        <version>${pmd.version}</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <targetJdk>${java.version}</targetJdk>
+                    <rulesets>
+                        <ruleset>${project.basedir}/config/pmd/ja-ruleset.xml</ruleset>
+                    </rulesets>
+                    <minimumTokens>80</minimumTokens>
+                    <failOnViolation>true</failOnViolation>
+                    <printFailingErrors>true</printFailingErrors>
+                    <excludeRoots>
+                        <excludeRoot>${project.build.directory}/generated-sources</excludeRoot>
+                        <excludeRoot>${project.build.directory}/solon-aot</excludeRoot>
+                    </excludeRoots>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>pmd-and-cpd-gate</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                            <goal>cpd-check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>${maven-dependency-plugin.version}</version>
+                <configuration>
+                    <failOnWarning>true</failOnWarning>
+                    <ignoreNonCompile>true</ignoreNonCompile>
+                    <!-- Solon 扩展与测试 Engine 通过 ServiceLoader 发现，字节码分析无法观察其入口。 -->
+                    <usedDependencies>
+                        <usedDependency>org.noear:solon-java25</usedDependency>
+                        <usedDependency>org.noear:solon-config-yaml</usedDependency>
+                        <usedDependency>org.noear:solon-logging-logback-jakarta</usedDependency>
+                        <usedDependency>org.junit.jupiter:junit-jupiter-engine</usedDependency>
+                        <usedDependency>com.tngtech.archunit:archunit-junit5-engine</usedDependency>
+                    </usedDependencies>
+                    <!-- Logback 同时是生产 Provider 和日志配置测试 API，不应被误判为仅测试依赖。 -->
+                    <ignoredNonTestScopedDependencies>
+                        <ignoredNonTestScopedDependency>ch.qos.logback:logback-classic</ignoredNonTestScopedDependency>
+                        <ignoredNonTestScopedDependency>ch.qos.logback:logback-core</ignoredNonTestScopedDependency>
+                    </ignoredNonTestScopedDependencies>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>dependency-usage-gate</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>analyze-only</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <version>${maven-resources-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>replace-solon-deprecated-native-arguments</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>copy-resources</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- Solon 4.0.6 AOT still emits two deprecated flags. Restore the
+                                         Ja-owned minimal metadata after AOT and before Native compilation. -->
+                                    <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+                                    <changeDetection>always</changeDetection>
+                                    <resources>
+                                        <resource>
+                                            <directory>${project.basedir}/src/native/resources</directory>
+                                            <filtering>false</filtering>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>${maven-antrun-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>remove-deprecated-proxy-metadata</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- Solon 4.0.6 AOT 仍生成 GraalVM 25 已废弃的 proxy-config.json。
+                                         新格式代理声明已进入统一 reachability metadata；这里只删除两个精确旧路径。 -->
+                                    <target>
+                                        <delete quiet="true"
+                                                file="${project.build.outputDirectory}/META-INF/native-image/io/github/kongweiguang/ja/bootstrap/proxy-config.json" />
+                                        <delete quiet="true"
+                                                file="${project.build.outputDirectory}/META-INF/native-image/io.github.kongweiguang/ja-app-server/proxy-config.json" />
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <configuration>
+                            <imageName>${project.artifactId}</imageName>
+                            <mainClass>${ja.main.class}</mainClass>
+                            <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                            <!-- native-image 会先解析 NATIVE_IMAGE_OPTIONS，再展开 classpath 内的
+                                 metadata properties；借此让 Ja 与第三方已审计实验元数据都在显式授权下加载。 -->
+                            <environment>
+                                <NATIVE_IMAGE_OPTIONS>-H:+UnlockExperimentalVMOptions</NATIVE_IMAGE_OPTIONS>
+                            </environment>
+                            <buildArgs>
+                                <buildArg>--no-fallback</buildArg>
+                                <buildArg>--enable-native-access=ALL-UNNAMED</buildArg>
+                                <!-- GraalVM 25 要求显式确认实验选项。依赖的 Native metadata
+                                     会在命令行参数之后解析，因此必须让确认开关覆盖完整元数据加载阶段；
+                                     Native 输出仍会逐项列出实际启用的实验选项供门禁审计。 -->
+                                <!-- Windows credential handles may outlive the creating callback while
+                                     bounded cleanup runs; Native Image must preserve shared Arena semantics. -->
+                                <buildArg>-H:+SharedArenaSupport</buildArg>
+                            </buildArgs>
+                            <metadataRepository>
+                                <enabled>true</enabled>
+                            </metadataRepository>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>build-native-image</id>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

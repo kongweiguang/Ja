@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.HistoryMapper">
+  <resultMap id="workspaceRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceRow">
+    <constructor>
+      <arg column="workspace_id" javaType="string"/><arg column="root_path" javaType="string"/>
+      <arg column="display_name" javaType="string"/><arg column="trust" javaType="string"/>
+      <arg column="revision" javaType="_long"/><arg column="updated_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="threadRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadRow">
+    <constructor>
+      <arg column="thread_id" javaType="string"/><arg column="workspace_id" javaType="string"/>
+      <arg column="title" javaType="string"/><arg column="provider_id" javaType="string"/>
+      <arg column="model_id" javaType="string"/><arg column="reasoning_level" javaType="string"/>
+      <arg column="access_mode" javaType="string"/><arg column="title_source" javaType="string"/>
+      <arg column="revision" javaType="_long"/><arg column="created_at" javaType="string"/>
+      <arg column="updated_at" javaType="string"/><arg column="archived_at" javaType="string"/>
+      <arg column="deleted_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="snapshotItemRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SnapshotItemRow">
+    <constructor>
+      <arg column="item_id" javaType="string"/><arg column="item_kind" javaType="string"/>
+      <arg column="created_at" javaType="string"/><arg column="turn_id" javaType="string"/>
+      <arg column="call_id" javaType="string"/><arg column="tool_name" javaType="string"/>
+      <arg column="tool_ordinal" javaType="java.lang.Long"/><arg column="tool_state" javaType="string"/>
+      <arg column="message_kind" javaType="string"/><arg column="public_text" javaType="string"/>
+      <arg column="model_round" javaType="java.lang.Long"/><arg column="presentation_json" javaType="string"/>
+      <arg column="approval_id" javaType="string"/><arg column="decision" javaType="string"/>
+      <arg column="expires_at" javaType="string"/>
+      <arg column="attachment_id" javaType="string"/><arg column="display_name" javaType="string"/>
+      <arg column="size_bytes" javaType="java.lang.Long"/><arg column="media_kind" javaType="string"/>
+      <arg column="media_type" javaType="string"/><arg column="attachment_state" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="contextUsageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ContextUsageRow">
+    <constructor>
+      <arg column="turn_id" javaType="string"/><arg column="model_round" javaType="_long"/>
+      <arg column="input_tokens" javaType="_long"/><arg column="output_tokens" javaType="_long"/>
+      <arg column="total_tokens" javaType="_long"/><arg column="occurred_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="changeSetArtifactRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetArtifactRow">
+    <constructor><arg column="artifact_id" javaType="string"/><arg column="content" javaType="string"/>
+      <arg column="byte_length" javaType="_long"/></constructor>
+  </resultMap>
+  <select id="selectWorkspace" resultMap="workspaceRow">
+    SELECT workspace_id,root_path,display_name,trust,revision,updated_at FROM workspaces WHERE workspace_id=#{workspaceId}
+  </select>
+  <select id="selectWorkspaceByRoot" resultMap="workspaceRow">
+    SELECT workspace_id,root_path,display_name,trust,revision,updated_at FROM workspaces WHERE root_path=#{rootPath}
+  </select>
+  <insert id="insertWorkspace">
+    INSERT INTO workspaces(workspace_id,root_path,display_name,trust,created_at,updated_at)
+    VALUES(#{workspaceId},#{rootPath},#{displayName},#{trust},#{occurredAt},#{occurredAt})
+  </insert>
+  <select id="selectWorkspacePage" resultMap="workspaceRow">
+    SELECT workspace_id,root_path,display_name,trust,revision,updated_at FROM workspaces
+    <if test="cursorTime != null">WHERE updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND workspace_id&lt;#{cursorId})</if>
+    ORDER BY updated_at DESC,workspace_id DESC LIMIT #{limit}
+  </select>
+  <update id="compareAndSetWorkspaceTrust">
+    UPDATE workspaces SET trust=#{trust},revision=revision+1,updated_at=#{occurredAt}
+    WHERE workspace_id=#{workspaceId} AND revision=#{expectedRevision}
+  </update>
+  <delete id="deleteWorkspace">
+    DELETE FROM workspaces WHERE workspace_id=#{workspaceId} AND revision=#{expectedRevision}
+      AND NOT EXISTS(SELECT 1 FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL)
+  </delete>
+  <select id="selectThread" resultMap="threadRow">
+    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
+      revision,created_at,updated_at,archived_at,deleted_at
+    FROM threads WHERE thread_id=#{threadId} AND deleted_at IS NULL
+  </select>
+  <insert id="insertThread">
+    INSERT INTO threads(thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
+      revision,created_at,updated_at)
+    VALUES(#{threadId},#{workspaceId},#{title},#{providerId},#{modelId},#{reasoningLevel},#{accessMode},
+      #{titleSource},0,#{createdAt},#{createdAt})
+  </insert>
+  <update id="compareAndSetThread">
+    UPDATE threads SET revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
+  </update>
+  <select id="allocateThreadRevision" resultType="long" affectData="true">
+    UPDATE threads SET revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND deleted_at IS NULL RETURNING revision
+  </select>
+  <update id="advanceThreadFact">
+    UPDATE threads SET revision=revision+1,updated_at=#{occurredAt} WHERE thread_id=#{threadId} AND deleted_at IS NULL
+  </update>
+  <select id="selectThreadPage" resultMap="threadRow">
+    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
+      revision,created_at,updated_at,archived_at,deleted_at
+    FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL
+    <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND thread_id&lt;#{cursorId}))</if>
+    ORDER BY updated_at DESC,thread_id DESC LIMIT #{limit}
+  </select>
+  <select id="searchThreadPage" resultMap="threadRow">
+    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
+      revision,created_at,updated_at,archived_at,deleted_at
+    FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL
+    <if test="normalizedQuery != ''">AND instr(lower(title),#{normalizedQuery})&gt;0</if>
+    <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND thread_id&lt;#{cursorId}))</if>
+    ORDER BY updated_at DESC,thread_id DESC LIMIT #{limit}
+  </select>
+  <update id="compareAndSetThreadTitle">
+    UPDATE threads SET title=#{title},title_source=#{titleSource},revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND deleted_at IS NULL
+    <choose>
+      <when test="placeholderOnly">
+        AND revision&gt;=#{expectedRevision} AND title_source='PLACEHOLDER'
+      </when>
+      <otherwise>
+        AND revision=#{expectedRevision}
+      </otherwise>
+    </choose>
+  </update>
+  <update id="compareAndSetThreadPreferences">
+    UPDATE threads SET provider_id=#{providerId},model_id=#{modelId},reasoning_level=#{reasoningLevel},
+      access_mode=#{accessMode},revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
+  </update>
+  <update id="compareAndSetThreadAdmission">
+    UPDATE threads SET provider_id=#{providerId},model_id=#{modelId},reasoning_level=#{reasoningLevel},
+      access_mode=#{accessMode},
+      <if test="provisionalTitle != null">title=#{provisionalTitle},</if>
+      revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
+    <if test="provisionalTitle != null">AND title_source='PLACEHOLDER'</if>
+  </update>
+  <update id="updateThreadLifecycle">
+    UPDATE threads
+    <choose><when test="delete == true">SET deleted_at=#{occurredAt},</when><otherwise>SET archived_at=#{occurredAt},</otherwise></choose>
+      revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
+  </update>
+  <select id="countActiveTurns" resultType="int">
+    SELECT COUNT(*) FROM turns WHERE thread_id=#{threadId} AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+  </select>
+  <select id="selectSnapshotItems" resultMap="snapshotItemRow">
+    SELECT * FROM (
+      SELECT item_id,'message' AS item_kind,created_at,turn_id,NULL AS call_id,NULL AS tool_name,
+        NULL AS tool_ordinal,NULL AS tool_state,message_kind,public_text,model_round,NULL AS presentation_json,
+        NULL AS approval_id,NULL AS decision,
+        NULL AS expires_at,NULL AS attachment_id,NULL AS display_name,NULL AS size_bytes,NULL AS media_kind,
+        NULL AS media_type,NULL AS attachment_state
+      FROM timeline_messages WHERE thread_id=#{threadId}
+      UNION ALL SELECT call_id||'_call','tool_call',created_at,turn_id,call_id,tool_name,ordinal,state,
+        NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL FROM tools WHERE thread_id=#{threadId}
+      UNION ALL SELECT a.approval_id,'approval',a.requested_at,a.turn_id,a.call_id,t.tool_name,NULL,NULL,
+        NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at,NULL,NULL,NULL,NULL,NULL,NULL
+        FROM approvals a JOIN tools t ON t.turn_id=a.turn_id AND t.call_id=a.call_id
+        WHERE a.thread_id=#{threadId}
+      UNION ALL SELECT ta.attachment_id||'_attachment','attachment',ta.created_at,ta.turn_id,
+        NULL,NULL,ta.ordinal,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,a.attachment_id,a.display_name,a.size_bytes,
+        lower(a.media_kind),a.media_type,lower(a.status)
+        FROM turn_attachments ta JOIN turns t ON t.turn_id=ta.turn_id
+          JOIN attachments a ON a.attachment_id=ta.attachment_id
+        WHERE t.thread_id=#{threadId}
+    ) items
+    <if test="cursorTime != null">WHERE created_at&gt;#{cursorTime} OR (created_at=#{cursorTime} AND item_id&gt;#{cursorId})</if>
+    ORDER BY created_at,item_id LIMIT #{limit}
+  </select>
+  <select id="selectLatestContextUsage" resultMap="contextUsageRow">
+    SELECT turn_id,model_round,input_tokens,output_tokens,total_tokens,created_at AS occurred_at
+    FROM usage WHERE thread_id=#{threadId}
+    ORDER BY created_at DESC,model_round DESC,usage_id DESC LIMIT 1
+  </select>
+  <insert id="insertChangeSet">
+    INSERT INTO turn_change_sets(thread_id,turn_id,workspace_id,change_set_json,artifact_id,committed_at)
+    SELECT #{threadId},#{turnId},#{workspaceId},#{changeSetJson},#{artifactId},#{occurredAt}
+    WHERE EXISTS(SELECT 1 FROM turns x JOIN threads t ON t.thread_id=x.thread_id
+                 WHERE x.turn_id=#{turnId} AND x.thread_id=#{threadId} AND t.workspace_id=#{workspaceId}
+                   AND x.state IN ('COMPLETED','FAILED','CANCELLED'))
+  </insert>
+  <insert id="insertChangeSetArtifact">
+    INSERT INTO change_set_artifacts(artifact_id,thread_id,turn_id,content,sha256,byte_length,created_at)
+    VALUES(#{artifactId},#{threadId},#{turnId},#{unifiedDiff},#{sha256},#{byteLength},#{occurredAt})
+  </insert>
+  <select id="selectChangeSetArtifact" resultMap="changeSetArtifactRow">
+    SELECT artifact_id,content,byte_length FROM change_set_artifacts
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND artifact_id=#{artifactId}
+  </select>
+</mapper>

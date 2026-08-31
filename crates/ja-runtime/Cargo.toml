@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+[package]
+name = "ja-runtime"
+version = "0.1.0"
+description = "Tauri-independent Ja App Server host runtime"
+authors = ["kongweiguang"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kongweiguang/ja"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tracing = "=0.1.44"
+
+# 黑盒进程与协议语料测试显式归入 integration 目录，避免 Cargo 根级自动发现
+# 掩盖测试层次，也确保目录调整不会让测试静默漏跑。
+[[test]]
+name = "int_app_server_process"
+path = "tests/integration/app_server_process.rs"
+
+[[test]]
+name = "int_golden_corpus"
+path = "tests/integration/golden_corpus.rs"
+
+# 私有进程树、可执行文件身份与 supervisor 故障测试保留 crate 内可见性，但物理归入
+# integration；这样真实文件和子进程不会与纯协议/状态机测试混为一组。
+[[test]]
+name = "int_internal"
+path = "tests/integration/internal.rs"
+
+# 白盒算法测试由单一外置入口装配；生产 `src` 不声明测试模块或测试支撑实现。
+[[test]]
+name = "unit"
+path = "tests/unit/mod.rs"

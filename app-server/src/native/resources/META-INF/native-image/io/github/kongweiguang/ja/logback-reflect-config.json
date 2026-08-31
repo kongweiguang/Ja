@@ -1,0 +1,78 @@
+[
+  {
+    "name": "ch.qos.logback.core.encoder.LayoutWrappingEncoder",
+    "methods": [
+      {
+        "name": "setCharset",
+        "parameterTypes": [
+          "java.nio.charset.Charset"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ch.qos.logback.core.UnsynchronizedAppenderBase",
+    "methods": [
+      {
+        "name": "addFilter",
+        "parameterTypes": [
+          "ch.qos.logback.core.filter.Filter"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ch.qos.logback.classic.filter.ThresholdFilter",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true,
+    "methods": [
+      {
+        "name": "setLevel",
+        "parameterTypes": [
+          "java.lang.String"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ch.qos.logback.classic.filter.LevelFilter",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true,
+    "methods": [
+      {
+        "name": "setLevel",
+        "parameterTypes": [
+          "ch.qos.logback.classic.Level"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ch.qos.logback.classic.Level",
+    "methods": [
+      {
+        "name": "valueOf",
+        "parameterTypes": [
+          "java.lang.String"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ch.qos.logback.core.filter.AbstractMatcherFilter",
+    "methods": [
+      {
+        "name": "setOnMatch",
+        "parameterTypes": [
+          "ch.qos.logback.core.spi.FilterReply"
+        ]
+      },
+      {
+        "name": "setOnMismatch",
+        "parameterTypes": [
+          "ch.qos.logback.core.spi.FilterReply"
+        ]
+      }
+    ]
+  }
+]

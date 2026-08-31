@@ -1,0 +1,166 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+/*
+ * Header 是真实拖拽面；交互区域显式退出，避免 Tauri 把点击、聚焦或双击转成窗口拖拽。
+ */
+.ja-titlebar {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  min-width: 0;
+  min-height: var(--ja-titlebar-height, 36px);
+  flex: 0 0 var(--ja-titlebar-height, 36px);
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: 10px;
+  border-block-end: 0;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-window-backdrop);
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+/* macOS traffic lights 保持原生；该内边距避开原生按钮，同时保留同一拖拽面。 */
+.ja-titlebar.is-macos {
+  padding-inline-start: max(4.75rem, calc(4.75rem + env(safe-area-inset-left, 0px)));
+}
+
+/* macOS 全屏时原生 traffic lights 会离开内容区，因此应用可回收空间且无需绘制替代控件。 */
+.ja-titlebar.is-macos.is-fullscreen {
+  padding-inline-start: 10px;
+}
+
+.ja-titlebar-leading,
+.ja-window-controls,
+.ja-titlebar-interactive,
+.ja-titlebar button {
+  -webkit-app-region: no-drag;
+}
+
+.ja-titlebar-leading {
+  display: flex;
+  height: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+}
+
+.ja-titlebar-button,
+.ja-window-control {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.ja-titlebar-button {
+  width: 28px;
+  height: 28px;
+}
+
+.ja-titlebar-button svg {
+  width: 1rem;
+  height: 1rem;
+  stroke-width: 1.8;
+}
+
+.ja-titlebar-button:hover:not(:disabled),
+.ja-window-control:hover:not(:disabled) {
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-foreground) 7%, transparent);
+}
+
+.ja-titlebar-button:active:not(:disabled),
+.ja-window-control:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.ja-titlebar-button:disabled,
+.ja-window-control:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.ja-titlebar-button:focus-visible,
+.ja-window-control:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ja-focus) 18%, transparent);
+}
+
+.ja-window-controls {
+  display: flex;
+  height: 100%;
+  align-items: center;
+  gap: 2px;
+  padding-inline: 0;
+}
+
+.ja-window-control {
+  width: 28px;
+  height: 28px;
+}
+
+.ja-window-control svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.7;
+}
+
+.ja-window-control[data-window-action="toggle-maximize"] svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ja-window-control.is-close:hover:not(:disabled) {
+  color: var(--ja-danger);
+  background: var(--ja-danger-soft);
+}
+
+/* 用户启用应用高对比度 palette 时保持自定义 chrome 可读；token 色不可用时遵循 OS forced-colors。 */
+:root[data-high-contrast="true"] .ja-titlebar {
+  border-block-end-color: var(--ja-foreground);
+}
+
+@media (forced-colors: active) {
+  .ja-titlebar {
+    border-block-end-color: CanvasText;
+    color: CanvasText;
+    background: Canvas;
+  }
+
+  .ja-titlebar button {
+    color: ButtonText;
+  }
+
+  .ja-titlebar button:hover:not(:disabled) {
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  .ja-titlebar button:focus-visible {
+    outline-color: Highlight;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-titlebar-button,
+  .ja-window-control {
+    transition: none;
+  }
+
+  .ja-titlebar-button:active:not(:disabled),
+  .ja-window-control:active:not(:disabled) {
+    transform: none;
+  }
+}

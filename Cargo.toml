@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/ja-runtime"]
+
+[profile.release]
+# 发布参数由 workspace 根统一拥有，使桌面宿主与 Ja App Server 宿主生成
+# 相同的有界、panic-abort 产物，避免 crate 局部配置在交付时产生差异。
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+opt-level = "s"
+strip = "symbols"

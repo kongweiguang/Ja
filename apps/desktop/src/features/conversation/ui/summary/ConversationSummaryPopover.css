@@ -1,0 +1,159 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-conversation-summary-popover {
+  z-index: 90;
+  width: min(19.5rem, calc(100vw - 1.5rem));
+  max-height: min(31rem, calc(100vh - 4.75rem));
+  overflow: auto;
+  padding: 0.68rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-window-surface-muted) 96%, transparent);
+  box-shadow:
+    var(--ja-shadow-floating),
+    inset 0 1px rgb(255 255 255 / 7%);
+  backdrop-filter: blur(18px) saturate(1.08);
+  transform-origin: var(--radix-popover-content-transform-origin);
+  animation: ja-conversation-summary-enter 140ms var(--ja-ease-native);
+}
+
+.ja-conversation-summary-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.15rem 0.16rem 0.48rem;
+}
+
+.ja-conversation-summary-header div {
+  min-width: 0;
+}
+.ja-conversation-summary-header p,
+.ja-conversation-summary-header h2 {
+  margin: 0;
+}
+.ja-conversation-summary-header p {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-caption);
+}
+.ja-conversation-summary-header h2 {
+  margin-top: 0.12rem;
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-bold);
+  line-height: var(--ja-line-control);
+}
+.ja-conversation-summary-header > span {
+  max-width: 7.5rem;
+  overflow: hidden;
+  padding-top: 0.14rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-conversation-summary-list {
+  display: grid;
+  gap: 0.05rem;
+  margin: 0;
+}
+.ja-conversation-summary-row {
+  display: grid;
+  min-width: 0;
+  min-height: 2rem;
+  grid-template-columns: 1.2rem 5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.38rem;
+  padding: 0.28rem 0.32rem;
+  border-radius: 0.48rem;
+}
+.ja-conversation-summary-row:hover {
+  background: color-mix(in srgb, var(--ja-control-hover) 72%, transparent);
+}
+.ja-conversation-summary-row-icon {
+  display: grid;
+  place-items: center;
+  color: var(--ja-foreground-muted);
+}
+.ja-conversation-summary-row-icon svg {
+  width: 0.88rem;
+  height: 0.88rem;
+  stroke-width: 1.8;
+}
+.ja-conversation-summary-row dt {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-caption);
+}
+.ja-conversation-summary-row dd {
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-caption);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-conversation-summary-row dd > span:not(.ja-conversation-summary-diff) {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ja-conversation-summary-diff {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.38rem;
+}
+.ja-conversation-summary-diff .is-added {
+  color: var(--ja-success);
+}
+.ja-conversation-summary-diff .is-removed {
+  color: var(--ja-danger);
+}
+
+.ja-conversation-summary-section {
+  margin-top: 0.48rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--ja-border);
+}
+.ja-conversation-summary-section h3 {
+  margin: 0 0 0.2rem;
+  padding: 0 0.32rem;
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-caption);
+}
+.ja-conversation-summary-arrow {
+  fill: var(--ja-window-surface-muted);
+}
+
+@keyframes ja-conversation-summary-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-3px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-conversation-summary-popover {
+    animation: none;
+  }
+}

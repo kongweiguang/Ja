@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.CheckpointMapper">
+  <resultMap id="checkpointRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$CheckpointRow">
+    <constructor>
+      <arg column="thread_id" javaType="string"/><arg column="checkpoint_id" javaType="string"/>
+      <arg column="source_revision" javaType="_long"/><arg column="through_ordinal" javaType="_long"/>
+      <arg column="retained_from_ordinal" javaType="_long"/><arg column="retained_split_json" javaType="string"/>
+      <arg column="summary_json" javaType="string"/><arg column="input_tokens" javaType="_int"/>
+      <arg column="envelope_fingerprint" javaType="string"/>
+      <arg column="strategy_version" javaType="string"/><arg column="usage_json" javaType="string"/>
+      <arg column="created_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <select id="selectThreadRevision" resultType="long">
+    SELECT revision FROM threads WHERE thread_id=#{threadId} AND deleted_at IS NULL
+  </select>
+  <select id="selectCheckpoint" resultMap="checkpointRow">
+    SELECT thread_id,checkpoint_id,source_revision,through_ordinal,retained_from_ordinal,retained_split_json,summary_json,
+      input_tokens,envelope_fingerprint,strategy_version,usage_json,created_at FROM context_checkpoints WHERE thread_id=#{threadId}
+    ORDER BY source_revision DESC LIMIT 1
+  </select>
+  <select id="selectCheckpointSource" resultMap="checkpointRow">
+    SELECT thread_id,checkpoint_id,source_revision,through_ordinal,retained_from_ordinal,retained_split_json,summary_json,
+      input_tokens,envelope_fingerprint,strategy_version,usage_json,created_at FROM context_checkpoints
+    WHERE thread_id=#{threadId} AND source_revision=#{sourceRevision}
+  </select>
+  <select id="countCheckpointSource" resultType="int">
+    SELECT COUNT(*) FROM context_checkpoints WHERE thread_id=#{threadId} AND source_revision=#{sourceRevision}
+  </select>
+  <select id="countCheckpoints" resultType="int">
+    SELECT COUNT(*) FROM context_checkpoints WHERE thread_id=#{threadId}
+  </select>
+  <insert id="insertCheckpoint">
+    INSERT INTO context_checkpoints(checkpoint_id,thread_id,source_revision,through_ordinal,retained_from_ordinal,retained_split_json,
+      summary_json,input_tokens,envelope_fingerprint,strategy_version,usage_json,created_at)
+    VALUES(#{checkpointId},#{threadId},#{sourceRevision},#{throughOrdinal},#{retainedFromOrdinal},#{retainedSplitJson},
+      #{summaryJson},#{estimatedTokens},#{envelopeFingerprint},#{strategyVersion},#{usageJson},#{createdAt})
+  </insert>
+</mapper>

@@ -1,0 +1,893 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+/* 文件区域刻意使用实色表面，避免代码、资源树与 Context Menu 彼此透叠而降低可读性。 */
+.ja-file-tree-host {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+  background: var(--ja-background);
+  outline: 0;
+}
+.ja-file-tree-viewport {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  background: var(--ja-background);
+}
+.ja-file-tree-viewport > [role="tree"] {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+.ja-file-tree-toolbar {
+  display: flex;
+  min-height: 2rem;
+  align-items: center;
+  gap: 0.18rem;
+  padding: 0.18rem 0.35rem;
+  border-bottom: 1px solid var(--ja-border);
+  background: var(--ja-surface);
+}
+.ja-file-tree-root {
+  min-width: 0;
+  flex: 1;
+  padding-right: 0.25rem;
+}
+.ja-file-tree-toolbar button {
+  display: grid;
+  width: 1.75rem;
+  height: 1.7rem;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+}
+.ja-file-tree-toolbar button:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-file-tree-toolbar button:focus-visible {
+  border-color: var(--ja-focus);
+  outline: 2px solid color-mix(in srgb, var(--ja-focus) 28%, transparent);
+  outline-offset: 1px;
+}
+.ja-file-tree-toolbar svg {
+  width: 0.86rem;
+  height: 0.86rem;
+}
+.ja-file-tree-inline-input,
+.ja-file-tree-create-input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--ja-focus);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.15rem 0.3rem;
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+  font: inherit;
+  outline: 0;
+}
+.ja-file-tree-create-input {
+  height: 1.55rem;
+  margin-left: 0.25rem;
+}
+.ja-file-tree-row.is-drag-target {
+  outline: 1px solid var(--ja-focus);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--ja-focus) 18%, transparent);
+}
+.ja-file-tree-row[data-kind="symlink"],
+.ja-file-tree-row[data-kind="reparse_point"],
+.ja-file-tree-row[data-kind="other"] {
+  color: var(--ja-foreground-subtle, var(--ja-foreground-muted));
+}
+.ja-file-tree-row[data-kind="symlink"] .ja-file-tree-icon,
+.ja-file-tree-row[data-kind="reparse_point"] .ja-file-tree-icon,
+.ja-file-tree-row[data-kind="other"] .ja-file-tree-icon {
+  color: var(--ja-foreground-muted);
+}
+.ja-file-tree-kind {
+  flex: 0 0 auto;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.04rem 0.28rem;
+  color: var(--ja-foreground-subtle, var(--ja-foreground-muted));
+  font-size: 0.62rem;
+  line-height: 1.2;
+}
+.ja-file-tree-context-menu {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  min-width: 10rem;
+  max-width: min(18rem, calc(100vw - 1rem));
+  max-height: calc(100vh - 1rem);
+  flex-direction: column;
+  gap: 0.1rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.25rem;
+  background: var(--ja-surface);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 34%);
+  overflow: auto;
+}
+.ja-file-tree-context-menu button {
+  display: flex;
+  min-width: 0;
+  min-height: 1.85rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.25rem;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  padding: 0.35rem 0.55rem;
+  color: var(--ja-foreground);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.ja-file-tree-context-menu button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-file-tree-context-menu button kbd {
+  flex: 0 0 auto;
+  color: var(--ja-foreground-subtle, var(--ja-foreground-muted));
+  font: inherit;
+  font-size: 0.72rem;
+}
+.ja-file-tree-context-separator {
+  height: 1px;
+  flex: 0 0 auto;
+  margin: 0.18rem 0.3rem;
+  background: var(--ja-border);
+}
+.ja-file-tree-context-menu button.is-danger {
+  color: var(--ja-danger);
+}
+.ja-file-tree-context-menu button:hover,
+.ja-file-tree-context-menu button:focus-visible {
+  background: var(--ja-surface-muted);
+  outline: 1px solid color-mix(in srgb, var(--ja-focus) 55%, transparent);
+  outline-offset: -1px;
+}
+/* Explorer、搜索与编辑器共享一个有界行，切换模式时不会改变 Shell 尺寸。 */
+.ja-files-workspace {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  color: var(--ja-foreground);
+  background: var(--ja-window-surface);
+  container-type: inline-size;
+}
+.ja-files-workspace-toolbar {
+  display: flex;
+  min-height: 2.45rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0 0.55rem;
+  background: var(--ja-surface);
+}
+.ja-files-workspace-mode {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.15rem;
+}
+.ja-files-workspace-mode button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: var(--ja-control-height-compact);
+  border: 1px solid transparent;
+  border-radius: var(--ja-radius-sm);
+  padding: 0 0.55rem;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  cursor: pointer;
+}
+.ja-files-workspace-mode button:hover,
+.ja-files-workspace-mode button.is-active {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-files-workspace-mode button:focus-visible {
+  border-color: var(--ja-focus);
+  outline: 2px solid color-mix(in srgb, var(--ja-focus) 28%, transparent);
+  outline-offset: 1px;
+}
+.ja-files-workspace-mode svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+.ja-files-workspace-count {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-recovery-gate {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: baseline;
+  gap: 0.55rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ja-warning) 52%, var(--ja-border));
+  padding: 0.42rem 0.62rem;
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-warning) 12%, var(--ja-surface));
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-recovery-gate strong {
+  flex: 0 0 auto;
+  color: var(--ja-warning-foreground, var(--ja-foreground));
+}
+.ja-files-recovery-gate span {
+  min-width: 0;
+}
+.ja-files-workspace-body {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+.ja-files-workspace-explorer {
+  display: flex;
+  min-width: 11rem;
+  width: 32%;
+  min-height: 0;
+  flex: 0 1 15rem;
+  border-right: 1px solid var(--ja-border);
+  overflow: hidden;
+}
+.ja-files-workspace-explorer[hidden] {
+  display: none;
+}
+.ja-files-workspace-search {
+  display: flex;
+  min-width: 13rem;
+  width: 34%;
+  min-height: 0;
+  flex: 0 1 18rem;
+  border-right: 1px solid var(--ja-border);
+  overflow: hidden;
+}
+.ja-files-workspace-editor {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ja-background);
+}
+.ja-files-editor-tabs {
+  display: flex;
+  min-width: 0;
+  min-height: 2.35rem;
+  flex: 0 0 auto;
+  align-items: stretch;
+  overflow: auto hidden;
+  border-bottom: 1px solid var(--ja-border);
+  background: var(--ja-surface);
+}
+.ja-files-editor-tab {
+  display: flex;
+  min-width: 5.5rem;
+  max-width: 14rem;
+  flex: 0 0 auto;
+  align-items: stretch;
+  border-right: 1px solid var(--ja-border);
+}
+.ja-files-editor-tab > [role="tab"] {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.35rem;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0 0.45rem 0 0.65rem;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  cursor: pointer;
+}
+.ja-files-editor-tab > [role="tab"]:hover,
+.ja-files-editor-tab.is-active > [role="tab"] {
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+}
+.ja-files-editor-tab.is-active > [role="tab"] {
+  border-bottom-color: var(--ja-accent);
+}
+.ja-files-editor-tab > [role="tab"]:focus-visible,
+.ja-files-editor-tab-close:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
+}
+.ja-files-editor-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-files-editor-tab-dirty {
+  width: 0.38rem;
+  height: 0.38rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ja-warning);
+}
+.ja-files-editor-tab-close {
+  display: grid;
+  width: 1.65rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+}
+.ja-files-editor-tab-close:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-files-editor-tab-close svg {
+  width: 0.78rem;
+  height: 0.78rem;
+}
+.ja-files-editor-content {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+}
+.ja-files-editor-content > .ja-code-editor {
+  min-height: 0;
+  flex: 1;
+}
+.ja-files-editor-status {
+  display: flex;
+  min-height: 1.75rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.7rem;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0 0.65rem;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-editor-status[data-status="dirty"],
+.ja-files-editor-status[data-status="saving"] {
+  color: var(--ja-warning);
+}
+.ja-files-editor-status[data-status="saveError"],
+.ja-files-editor-status[data-status="conflict"] {
+  color: var(--ja-danger);
+}
+.ja-files-conflict,
+.ja-files-save-error {
+  display: flex;
+  min-height: 2.15rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.45rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ja-danger) 55%, var(--ja-border));
+  padding: 0.25rem 0.55rem;
+  color: var(--ja-danger);
+  background: color-mix(in srgb, var(--ja-danger) 9%, var(--ja-surface));
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+/* 冲突恢复包含三个固定宽度操作，因此保留完整消息行，避免窄编辑器把警告压缩至零宽。 */
+.ja-files-conflict {
+  flex-wrap: wrap;
+  align-content: center;
+}
+.ja-files-conflict span,
+.ja-files-save-error span {
+  min-width: 0;
+  flex: 1;
+}
+.ja-files-conflict span {
+  display: block;
+  min-width: 100%;
+  flex: 1 0 100%;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.ja-files-conflict button,
+.ja-files-save-error button {
+  border: 1px solid color-mix(in srgb, var(--ja-danger) 60%, var(--ja-border));
+  border-radius: var(--ja-radius-sm);
+  padding: 0.22rem 0.42rem;
+  color: var(--ja-danger);
+  background: transparent;
+  font-size: var(--ja-text-caption-size);
+  cursor: pointer;
+}
+.ja-files-conflict button:hover,
+.ja-files-save-error button:hover {
+  background: color-mix(in srgb, var(--ja-danger) 14%, transparent);
+}
+.ja-files-conflict button:disabled,
+.ja-files-save-error button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+.ja-files-conflict-diff {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+}
+.ja-files-conflict-diff-heading {
+  display: grid;
+  min-height: var(--ja-control-height-compact);
+  grid-template-columns: 1fr 1fr auto;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0 0.5rem 0 0.7rem;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-conflict-diff-heading span:nth-child(2) {
+  border-left: 1px solid var(--ja-border);
+  padding-left: 0.65rem;
+}
+.ja-files-conflict-diff-heading button {
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.22rem 0.42rem;
+  color: var(--ja-foreground);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.ja-files-conflict-diff-heading button:hover {
+  background: var(--ja-surface-muted);
+}
+.ja-files-conflict-diff > .ja-editor-diff {
+  min-height: 0;
+  flex: 1;
+}
+.ja-files-workspace-empty {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  place-items: center;
+  padding: 1.5rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+  text-align: center;
+}
+
+.ja-files-save-as-overlay,
+.ja-files-trash-overlay {
+  position: fixed;
+  z-index: 90;
+  inset: 0;
+  background: rgb(0 0 0 / 48%);
+}
+.ja-files-save-as-dialog {
+  position: fixed;
+  z-index: 91;
+  top: 50%;
+  left: 50%;
+  width: min(30rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  padding: 0;
+  color: var(--ja-foreground);
+  background: var(--ja-surface-elevated, var(--ja-surface));
+  box-shadow: var(--ja-shadow-floating);
+}
+.ja-files-save-as-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0.8rem 0.9rem;
+}
+.ja-files-save-as-heading h2 {
+  margin: 0;
+  font-size: var(--ja-text-title-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-heading);
+}
+.ja-files-save-as-heading p {
+  margin: 0.24rem 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-save-as-heading > button {
+  display: grid;
+  width: 1.8rem;
+  height: 1.8rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+}
+.ja-files-save-as-heading > button:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-files-save-as-heading svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+.ja-files-save-as-dialog form {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.9rem;
+}
+.ja-files-save-as-dialog label {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-control);
+}
+.ja-files-save-as-dialog input {
+  width: 100%;
+  min-height: 2.05rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.3rem 0.5rem;
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+  font: var(--ja-text-control-size) / var(--ja-line-control) var(--ja-font-mono);
+  outline: 0;
+}
+.ja-files-save-as-dialog input:focus {
+  border-color: var(--ja-focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ja-focus) 24%, transparent);
+}
+.ja-files-save-as-dialog input[aria-invalid="true"] {
+  border-color: var(--ja-danger);
+}
+.ja-files-save-as-hint,
+.ja-files-save-as-error {
+  margin: 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-save-as-error {
+  color: var(--ja-danger);
+}
+.ja-files-save-as-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
+}
+.ja-files-save-as-actions button {
+  min-height: var(--ja-control-height-compact);
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-sm);
+  padding: 0 0.65rem;
+  color: var(--ja-foreground);
+  background: var(--ja-surface);
+  font-size: var(--ja-text-caption-size);
+  cursor: pointer;
+}
+.ja-files-save-as-actions button[type="submit"] {
+  border-color: var(--ja-accent);
+  color: var(--ja-accent-foreground, #fff);
+  background: var(--ja-accent);
+}
+.ja-files-save-as-actions button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+/* 破坏性确认沿用紧凑实色的 Codex 表面，同时确保风险状态始终清晰可辨。 */
+.ja-files-trash-dialog {
+  position: fixed;
+  z-index: 91;
+  top: 50%;
+  left: 50%;
+  width: min(28rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground);
+  background: var(--ja-surface-elevated, var(--ja-surface));
+  box-shadow: var(--ja-shadow-floating);
+}
+.ja-files-trash-heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.7rem;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0.85rem 0.9rem 0.8rem;
+}
+.ja-files-trash-title-icon {
+  display: grid;
+  width: 1.9rem;
+  height: 1.9rem;
+  place-items: center;
+  border-radius: 0.45rem;
+  color: var(--ja-danger);
+  background: var(--ja-danger-soft);
+}
+.ja-files-trash-title-icon svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+.ja-files-trash-title-copy {
+  min-width: 0;
+}
+.ja-files-trash-title-copy h2 {
+  margin: 0;
+  font-size: var(--ja-text-title-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-heading);
+}
+.ja-files-trash-title-copy p {
+  margin: 0.22rem 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-trash-close {
+  display: grid;
+  width: 1.8rem;
+  height: 1.8rem;
+  place-items: center;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+}
+.ja-files-trash-close:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-files-trash-close svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+.ja-files-trash-body {
+  display: grid;
+  gap: 0.7rem;
+  padding: 0.9rem;
+}
+.ja-files-trash-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.52rem 0.6rem;
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+  font: var(--ja-text-caption-size) / var(--ja-line-caption) var(--ja-font-mono);
+}
+.ja-files-trash-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.4rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-trash-progress svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+.ja-files-trash-summary {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  border-top: 1px solid var(--ja-border);
+  border-bottom: 1px solid var(--ja-border);
+}
+.ja-files-trash-summary > div {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.48rem 0.1rem;
+}
+.ja-files-trash-summary > div + div {
+  border-top: 1px solid var(--ja-border);
+}
+.ja-files-trash-summary dt {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-trash-summary dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-caption);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.ja-files-trash-error {
+  margin: 0;
+  border: 1px solid color-mix(in srgb, var(--ja-danger) 40%, var(--ja-border));
+  border-radius: var(--ja-radius-sm);
+  padding: 0.5rem 0.58rem;
+  color: var(--ja-danger);
+  background: var(--ja-danger-soft);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-files-trash-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
+  border-top: 1px solid var(--ja-border);
+  padding: 0.72rem 0.9rem;
+}
+.ja-files-trash-actions button {
+  min-height: var(--ja-control-height-compact);
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-sm);
+  padding: 0 0.68rem;
+  color: var(--ja-foreground);
+  background: var(--ja-surface);
+  font-size: var(--ja-text-caption-size);
+  cursor: pointer;
+}
+.ja-files-trash-actions button:hover:not(:disabled) {
+  background: var(--ja-surface-muted);
+}
+.ja-files-trash-actions button.is-danger {
+  border-color: var(--ja-danger);
+  color: var(--ja-accent-foreground, #fff);
+  background: var(--ja-danger);
+}
+.ja-files-trash-actions button.is-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ja-danger) 88%, #000);
+}
+.ja-files-trash-actions button:disabled,
+.ja-files-trash-close:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.ja-files-trash-actions button:focus-visible,
+.ja-files-trash-close:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 560px) {
+  .ja-files-trash-heading {
+    gap: 0.55rem;
+    padding-inline: 0.72rem;
+  }
+  .ja-files-trash-body {
+    padding-inline: 0.72rem;
+  }
+  .ja-files-trash-actions {
+    padding-inline: 0.72rem;
+  }
+  .ja-files-trash-summary > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .ja-files-trash-summary dd {
+    text-align: left;
+  }
+}
+
+@container (max-width: 680px) {
+  .ja-files-workspace-body {
+    flex-direction: column;
+  }
+  .ja-files-workspace-explorer,
+  .ja-files-workspace-search {
+    min-width: 0;
+    width: 100%;
+    max-width: none;
+    flex: 1 1 auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--ja-border);
+  }
+  /* 没有打开文档时不让空编辑器抢占纵向空间；文件树/搜索先使用全部可用高度。 */
+  .ja-files-workspace-body.is-browser-only .ja-files-workspace-explorer,
+  .ja-files-workspace-body.is-browser-only .ja-files-workspace-search {
+    flex: 1;
+    border-bottom: 0;
+  }
+  .ja-files-workspace-body.is-browser-only .ja-files-workspace-editor {
+    display: none;
+  }
+  .ja-files-workspace-editor {
+    min-height: 12rem;
+  }
+  /* 打开文档后只给编辑器保留可工作的有界高度，其余纵向空间全部归资源树/搜索。 */
+  .ja-files-workspace-body.has-open-document .ja-files-workspace-editor {
+    flex: 0 0 clamp(12rem, 32%, 17rem);
+  }
+  .ja-files-recovery-gate {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+}
+
+@media (forced-colors: active) {
+  .ja-file-tree-row.is-selected {
+    color: HighlightText;
+    background: Highlight;
+  }
+  .ja-file-tree-row.is-focused,
+  .ja-file-tree-row.is-drag-target,
+  .ja-file-tree-kind,
+  .ja-file-tree-context-menu,
+  .ja-files-recovery-gate {
+    border: 1px solid CanvasText;
+  }
+  .ja-file-tree-context-menu button:hover,
+  .ja-file-tree-context-menu button:focus-visible {
+    color: HighlightText;
+    background: Highlight;
+  }
+  .ja-files-trash-title-icon,
+  .ja-files-trash-error {
+    border: 1px solid CanvasText;
+  }
+  .ja-files-trash-actions button.is-danger {
+    color: HighlightText;
+    background: Highlight;
+  }
+}

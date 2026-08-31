@@ -1,0 +1,16 @@
+# @author kongweiguang
+
+[package]
+name = "architecture-registration-allow"
+version = "0.0.0"
+
+# fixture 独立解析，不能被仓库 workspace 的真实成员列表吸收。
+[workspace]
+
+[[test]]
+name = "registered-integration"
+path = "tests/integration/registered.rs"
+
+[[test]]
+name = "registered-unit"
+path = "tests/unit/registered_tests.rs"

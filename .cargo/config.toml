@@ -1,0 +1,6 @@
+# @author kongweiguang
+
+# Preserve the established Tauri/CI artifact location after introducing a
+# workspace; all members must share one target tree for reproducible builds.
+[build]
+target-dir = "src-tauri/target"

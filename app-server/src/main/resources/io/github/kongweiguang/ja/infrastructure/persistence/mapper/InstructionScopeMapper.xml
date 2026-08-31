@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.InstructionScopeMapper">
+  <select id="selectScopes" resultType="string">
+    SELECT relative_directory
+    FROM thread_instruction_scopes
+    WHERE thread_id = #{threadId}
+    ORDER BY (length(relative_directory) - length(replace(relative_directory, '/', ''))) ASC,
+             relative_directory ASC
+  </select>
+
+  <select id="countScope" resultType="int">
+    SELECT count(*)
+    FROM thread_instruction_scopes
+    WHERE thread_id = #{threadId} AND relative_directory = #{relativeDirectory}
+  </select>
+
+  <select id="countScopes" resultType="int">
+    SELECT count(*)
+    FROM thread_instruction_scopes
+    WHERE thread_id = #{threadId}
+  </select>
+
+  <insert id="insertScopeWithinLimit">
+    INSERT INTO thread_instruction_scopes(thread_id, relative_directory, discovered_at)
+    SELECT #{threadId}, #{relativeDirectory}, #{discoveredAt}
+    WHERE (SELECT count(*) FROM thread_instruction_scopes WHERE thread_id = #{threadId}) &lt; 256
+    ON CONFLICT(thread_id, relative_directory) DO NOTHING
+  </insert>
+</mapper>

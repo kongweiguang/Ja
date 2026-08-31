@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<FindBugsFilter>
+    <!-- 当前不建立历史 baseline；只有带中文技术原因的精确 bug pattern/class 才能加入。 -->
+
+    <!-- 这些方法负责把异步、关闭和端口失败重新抛为已分类运行时异常；“总是抛出”正是其契约。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(bootstrap\.RuntimeResourceLifecycle|catalog\.adapter\.out\.mcp\.runtime\.(McpRuntime|McpRuntimeLifecycle)|catalog\.adapter\.out\.runtime\.ConfigurationTurnRuntimeResolver|configuration\.adapter\.out\.security\.windows\.CredentialStore|conversation\.adapter\.out\.provider\.(ModelAdapterFactory|shared\.(AbstractStreamingModelAdapter|ModelTransport|RequestController)|summary\.HttpSummaryModel)|conversation\.application\.(cancellation\.DefaultCancellationCoordinator|context\.ContextCompactionLifecycle|loop\.(AgentLoop|AgentLoopPersistence|AgentToolRunner|AgentTurnExecution|DeltaTimerScheduler\$TimerHandle|TerminalCoordinator|TurnQueue)|service\.(TurnService|TurnShutdown|TurnTerminalSettlement))|conversation\.port\.out\.RuntimeLease|foundation\.concurrent\.ShutdownDeadline|transport\.rpc\.(handler\.TurnApprovalHandler|runtime\.(RpcServer|RpcSession)))"/>
+    </Match>
+
+    <!-- AbstractExecutorService 的 nullable 默认注解弱于本实现的显式 fail-fast 契约，两个 override 必须拒绝 null。 -->
+    <Match>
+        <Bug pattern="NP_PARAMETER_MUST_BE_NONNULL_BUT_MARKED_AS_NULLABLE"/>
+        <Class name="io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor"/>
+    </Match>
+
+    <!-- 下列 record 在构造时使用 List.copyOf、不可修改 Map 或递归 JSON 冻结，返回引用本身不可变。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.support\.McpServerDefinition|configuration\.adapter\.out\.generation\.ConfigGeneration\$Profile|conversation\.application\.context\.summary\.SummaryDocument|conversation\.domain\.model\.(ModelMessage|ToolCallContent)|conversation\.domain\.permission\.PermissionRequest|conversation\.domain\.tool\.ToolSpec|conversation\.port\.in\.TurnEvent\$ToolCall|conversation\.port\.out\.(AgentTool\$(Invocation|ToolResult)|McpGateway\$(McpInvocation|McpResult|McpSnapshot)|ModelPort\$(ModelRequest|ToolCallReady)|SkillCatalog\$SkillSnapshot))"/>
+    </Match>
+
+    <!-- 这些精确类型暴露的是注入端口或带租约的资源所有权，不是可复制的数据表示。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(bootstrap\.SolonRuntimeComposition|catalog\.adapter\.out\.runtime\.ConfigurationTurnRuntimeResolver\$1|configuration\.adapter\.out\.generation\.ConfigGeneration\$Lease|infrastructure\.persistence\.database\.JaDatabase|platform\.windows\.WindowsNativeProcess|transport\.rpc\.RpcServiceBindings)"/>
+    </Match>
+
+    <!-- ObjectMapper、MyBatis Mapper proxy 与 RpcSession 都是组合根、事务或连接生命周期注入的 owner；
+         跨职责子包只借用它们，不允许复制、替换或延长资源生命周期。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(configuration\.adapter\.out\.security\.windows\.CredentialStore|infrastructure\.persistence\.mapper\.PersistenceMappers|transport\.rpc\.(handler\.(ConfigurationHandler|HandshakeHandler|HealthShutdownHandler|SettingsCatalogHandler|ThreadHistoryHandler|TurnApprovalHandler|WorkspaceHandler)|runtime\.RpcSession))"/>
+    </Match>
+
+    <!-- WatchKey 及目录映射只由专用 watcher 线程修改；其它线程仅通过命令队列提交意图。 -->
+    <Match>
+        <Bug pattern="AT_UNSAFE_RESOURCE_ACCESS_IN_THREAD"/>
+        <Class name="io.github.kongweiguang.ja.configuration.adapter.out.document.ConfigurationWatcher"/>
+    </Match>
+
+    <!-- 私有校验函数由同文件嵌套 record 的 compact constructor 或匿名实现调用，SpotBugs 未归因该字节码调用。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.application\.context\.(checkpoint\.CheckpointStore|summary\.SummaryModel)|conversation\.port\.in\.(ContextCompactionEvent|TurnEvent)|conversation\.port\.out\.ConversationRepository)"/>
+    </Match>
+
+    <!-- 这些构造器只做参数校验或冻结依赖，类没有 finalizer，资源分配均由独立 owner 在构造成功后接管。 -->
+    <Match>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.transport\.BoundedMcpTransport|conversation\.adapter\.out\.provider\.shared\.AbstractStreamingModelAdapter|conversation\.adapter\.out\.tools\.(BuiltInTools\$WorkspacePathReadTool|ToolSupport))"/>
+    </Match>
+
+    <!-- 这些窄函数式端口横跨 IO、进程、FFM 或事务回调，保留 Exception 以便唯一边界统一分类和回滚。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_CLAUSE_BASIC_EXCEPTION"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.adapter\.out\.tools\.(ShellTool\$(JobControl|ProcessCloser)|ToolSupport)|infrastructure\.persistence\.transaction\.(MybatisUnitOfWork\$Work|PersistenceTransactions\$CheckedSupplier))"/>
+    </Match>
+
+    <!-- macOS/Linux 的产品 Shell 是平台固定契约，绝对路径用于禁止 PATH 劫持和备用 Shell 回退。 -->
+    <Match>
+        <Bug pattern="DMI_HARDCODED_ABSOLUTE_FILENAME"/>
+        <Class name="io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellProfile"/>
+        <Method name="detectAndPreflight"/>
+    </Match>
+
+    <!-- System 环境块参与跨平台 Prompt revision，storage marker 又按字节校验代际；两者必须固定 LF，不能使用平台 %n。 -->
+    <Match>
+        <Bug pattern="VA_FORMAT_STRING_USES_NEWLINE"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.adapter\.out\.tools\.ShellProfile|infrastructure\.persistence\.database\.StorageBaseline)"/>
+        <Method name="~(executionEnvironment|expectedMarker)"/>
+    </Match>
+
+    <!-- null 表示配置文件不存在；空数组表示文件存在但为空，两者必须在严格配置基线中保持可区分。 -->
+    <Match>
+        <Bug pattern="PZLA_PREFER_ZERO_LENGTH_ARRAYS"/>
+        <Class name="io.github.kongweiguang.ja.configuration.adapter.out.document.ConfigurationStore"/>
+    </Match>
+
+    <!-- execute 在同一方法内显式 lock/unlock，SpotBugs 把 ReentrantLock.unlock 误识别为未打开资源的 close。 -->
+    <Match>
+        <Bug pattern="CWO_CLOSED_WITHOUT_OPENED"/>
+        <Class name="io.github.kongweiguang.ja.configuration.application.ConfigurationMutationCoordinator"/>
+    </Match>
+
+    <!-- LimitedOutput 是纯内存有界缓冲区，没有文件或 Socket 资源；输入流由调用方的 try-with-resources 持有。 -->
+    <Match>
+        <Bug pattern="OS_OPEN_STREAM"/>
+        <Class name="io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter"/>
+    </Match>
+
+    <!-- 取消类别已经成为权威结果，响应流关闭是幂等尽力清理，关闭异常不得覆盖取消或超时。 -->
+    <Match>
+        <Bug pattern="DE_MIGHT_IGNORE"/>
+        <Class name="io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.RequestController"/>
+    </Match>
+</FindBugsFilter>

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<configuration>
+    <!-- The desktop host publishes ja.log-dir; standalone JVM runs retain the fixed Ja Home default. -->
+    <property name="JA_LOG_DIR" value="${ja.log-dir:-${user.home}/.ja/logs/java}"/>
+    <property name="JA_LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{48} - %msg%n"/>
+
+    <!-- stdout is reserved for JSONL; warnings and failures remain visible only on stderr. -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>${JA_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+    </appender>
+
+    <!-- A synchronous primary file keeps the last diagnostic durable if the app-server crashes abruptly. -->
+    <appender name="RUNTIME_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${JA_LOG_DIR}/app-server.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>${JA_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${JA_LOG_DIR}/archive/app-server.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>20MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+            <cleanHistoryOnStart>true</cleanHistoryOnStart>
+        </rollingPolicy>
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>INFO</level>
+        </filter>
+    </appender>
+
+    <!-- Errors are duplicated into a small dedicated stream for support and crash triage. -->
+    <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${JA_LOG_DIR}/app-server-error.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>${JA_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${JA_LOG_DIR}/archive/app-server-error.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>20MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>256MB</totalSizeCap>
+            <cleanHistoryOnStart>true</cleanHistoryOnStart>
+        </rollingPolicy>
+        <filter class="ch.qos.logback.classic.filter.LevelFilter">
+            <level>ERROR</level>
+            <onMatch>ACCEPT</onMatch>
+            <onMismatch>DENY</onMismatch>
+        </filter>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="STDERR"/>
+        <appender-ref ref="RUNTIME_FILE"/>
+        <appender-ref ref="ERROR_FILE"/>
+    </root>
+</configuration>

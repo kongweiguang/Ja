@@ -1,0 +1,3 @@
+# @author kongweiguang
+[dependencies]
+serde = "1"

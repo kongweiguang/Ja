@@ -1,0 +1,31 @@
+// @author kongweiguang
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "apps/desktop/tests/app/e2e/main.tsx",
+    "tests/contract/vitest.config.ts",
+    "scripts/e2e/kernel-loop-smoke.mjs",
+    "scripts/e2e/real-provider-smoke.mjs",
+    // Python Native sidecar smoke 以进程 fixture 路径启动该文件；删除条件是该 smoke 改用生产产物或移除。
+    "scripts/e2e/fixtures/v2-smoke-mock-sidecar.mjs",
+    "scripts/e2e/webview2-edgedriver-runner.mjs",
+    "scripts/e2e/windows-desktop-smoke.mjs",
+  ],
+  "project": [
+    "apps/desktop/src/**/*.{ts,tsx}",
+    "apps/desktop/tests/**/*.{ts,tsx}",
+    "scripts/**/*.{js,mjs,cjs,ts}",
+    "tests/contract/**/*.{ts,tsx}",
+  ],
+  "ignore": [
+    // 这些文件是架构门禁按路径读取的允许/拒绝语料，不是可导入的 TypeScript 模块；
+    // 删除条件是 check-architecture 不再读取对应 fixture 目录。
+    "scripts/fixtures/architecture/allow/**/*.{ts,tsx}",
+    "scripts/fixtures/architecture/reject/**/*.{ts,tsx}",
+  ],
+  "ignoreUnresolved": [
+    // 真窗 smoke 中的 Vite 浏览器绝对路径只在 page.evaluate 运行；删除条件是改为 Knip 可解析的静态入口。
+    "/src/api/protocol/protocol.ts",
+    "/src/features/conversation/application/timelineStore.ts",
+  ],
+}

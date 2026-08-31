@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SchemaMapper">
+  <resultMap id="walCheckpointRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WalCheckpointRow">
+    <constructor>
+      <arg column="busy" javaType="_int"/><arg column="log" javaType="_int"/>
+      <arg column="checkpointed" javaType="_int"/>
+    </constructor>
+  </resultMap>
+  <select id="selectUserTables" resultType="string">
+    SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name
+  </select>
+  <select id="checkpointWal" resultMap="walCheckpointRow">PRAGMA wal_checkpoint(TRUNCATE)</select>
+</mapper>

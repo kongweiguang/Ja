@@ -1,0 +1,7 @@
+{
+  "format": "ja-storage-baseline",
+  "generation": 1,
+  "migrationVersion": "1",
+  "migration": "V1__kernel.sql",
+  "migrationSha256": "8fff7208035d84028ba31d35c818f29372fb1ac8ff456ca8cf0fb78377586283"
+}

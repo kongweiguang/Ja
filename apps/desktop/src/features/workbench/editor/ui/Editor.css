@@ -1,0 +1,116 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-editor-viewer,
+.ja-editor-diff {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ja-background);
+  overscroll-behavior: contain;
+}
+.ja-editor-toolbar {
+  display: flex;
+  min-height: 2rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0.12rem 0.35rem;
+  border-bottom: 1px solid var(--ja-border);
+  background: var(--ja-surface);
+}
+.ja-editor-viewer__host,
+.ja-editor-diff__host {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+.ja-editor-viewer .cm-editor,
+.ja-editor-diff .cm-editor {
+  min-height: 100%;
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+  font:
+    0.75rem/1.55 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+}
+.ja-editor-viewer .cm-scroller,
+.ja-editor-diff .cm-scroller {
+  min-height: 100%;
+  padding-bottom: 1rem;
+}
+.ja-editor-viewer .cm-gutters,
+.ja-editor-diff .cm-gutters {
+  border-right: 1px solid var(--ja-border);
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface);
+}
+.ja-editor-diff .cm-mergeView {
+  min-height: 100%;
+}
+.ja-editor-diff .cm-mergeViewEditors {
+  min-height: 100%;
+}
+.ja-editor-diff .cm-mergeViewEditor {
+  min-width: 0;
+  border-right: 1px solid var(--ja-border);
+}
+.ja-editor-diff .cm-mergeViewEditor:last-child {
+  border-right: 0;
+}
+.ja-editor-diff .cm-deletedChunk {
+  background: color-mix(in srgb, var(--ja-danger) 24%, transparent);
+}
+.ja-editor-diff .cm-changedLine {
+  background: color-mix(in srgb, var(--ja-warning) 16%, transparent);
+}
+.ja-editor-diff .cm-insertedLine {
+  background: color-mix(in srgb, var(--ja-success) 20%, transparent);
+}
+
+/* 可写 Document 与只读 Viewer 使用同一实色代码表面，避免编辑状态引起布局跳变。 */
+.ja-code-editor {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ja-background);
+  overscroll-behavior: contain;
+}
+.ja-code-editor__host {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+.ja-code-editor .cm-editor {
+  min-height: 100%;
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+  font:
+    0.76rem/1.55 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+}
+.ja-code-editor .cm-scroller {
+  min-height: 100%;
+  padding-bottom: 1rem;
+}
+.ja-code-editor .cm-gutters {
+  border-right: 1px solid var(--ja-border);
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface);
+}
+.ja-code-editor .cm-focused {
+  outline: 2px solid color-mix(in srgb, var(--ja-focus) 28%, transparent);
+  outline-offset: -2px;
+}

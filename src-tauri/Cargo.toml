@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+[package]
+name = "ja"
+version = "0.1.0"
+description = "Ja desktop application"
+authors = ["kongweiguang"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kongweiguang/ja"
+readme = "../README.md"
+edition = "2024"
+rust-version = "1.89"
+
+# 其它键及定义见 https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.cargo-machete]
+# `--with-metadata` 不追踪 build.rs 的 crate 路径；tauri-build 由唯一构建入口直接调用。
+ignored = ["tauri-build"]
+
+[lib]
+# `_lib` 后缀用于保持库名称唯一，避免与二进制名称冲突；
+# 该限制主要出现在 Windows，参见 https://github.com/rust-lang/cargo/issues/8519
+name = "ja_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+# 构建工具与运行时一并固定版本，保证生成的上下文代码可复现。
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+# Ja App Server sidecar 生命周期与协议保持独立于 Tauri，使合同测试和未来非桌面宿主可复用同一 runtime crate。
+ja-runtime = { path = "../crates/ja-runtime" }
+
+# 桌面宿主固定在 Tauri 2，平台能力只通过显式 plugin 与 capability 暴露。
+# 生产环境保留 Wry 运行时，但不引入 v6 common-controls 链接；Windows 测试宿主
+# 在没有应用清单时可能只有 comctl32 v5，原生 bundle manifest 负责提供 v6 主题。
+tauri = { version = "=2.11.5", default-features = false, features = [
+    "wry",
+    "compression",
+    "dynamic-acl",
+    "tray-icon",
+    # Preview 必须是主窗口的子 WebView；第二个顶层窗口无法在窗口缩放或 Tab 切换时与检查器保持对齐。
+    "unstable",
+] }
+
+# 线协议格式与稳定的错误/身份原语供未来 IPC 适配器共享；精确版本固定保证原生宿主跨机器可复现。
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+uuid = { version = "=1.24.1", features = ["serde", "v4"] }
+url = { version = "=2.5.8", features = ["serde"] }
+sha2 = "=0.11.0"
+base64 = "=0.22.1"
+# OS 事件在工作区相对路径通知合同后合并；桌面端仍执行权威的目录树/读取对账。
+notify = "=8.2.0"
+
+# Tokio 负责有界的异步 app-server 子进程与 JSONL I/O；编解码器与协议模型保持分离。
+tokio = { version = "=1.53.1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["codec", "io-util", "rt"] }
+# PTY 所有权交给成熟跨平台实现，使终端会话在 Windows 复用 ConPTY、在 macOS 复用 Unix PTY，避免自建 FFI。
+portable-pty = { version = "=0.9.0", default-features = false }
+
+# 强制单桌面实例，但不启用超出预览发布范围且会扩大 capability 表面的 deep-link 集成。
+tauri-plugin-single-instance = { version = "=2.4.3", default-features = false }
+# 只持久化主 Workbench 几何状态；Rust 生命周期 hook 不向 WebView 暴露 window-state 命令，因此无需 capability。
+tauri-plugin-window-state = { version = "=2.4.1", default-features = false }
+# 复用 Tauri 维护的原生文件选择器；capability 只开放读取，避免意外出现保存/消息接口。
+tauri-plugin-dialog = { version = "=2.7.2", default-features = false }
+# 主 WebView 只打开经过校验的 HTTP(S) 链接；文件定位、本地路径与自定义协议不进入桌面 capability 表面。
+tauri-plugin-opener = { version = "=2.5.4", default-features = false }
+# 桌面通知由 UI 显式选择启用，capability 只开放权限检查、权限请求与通用投递。
+tauri-plugin-notification = { version = "=2.3.3", default-features = false }
+# Copy 控件只写入纯文本，不导入剪贴板读取 API，也不向 WebView 授权读取。
+tauri-plugin-clipboard-manager = { version = "=2.3.2", default-features = false }
+# plugin 仅作为固定形状的 WebView-to-tracing 桥接层；全局订阅器与文件输出仍由 Ja 持有，避免控制台转发泄漏载荷。
+tauri-plugin-log = { version = "=2.9.0", default-features = false, features = ["tracing"] }
+# Tracing 由 host 写入 stderr/文件，绝不写 stdout；stdout 专用于全双工 JSONL 协议。
+tracing = "=0.1.44"
+tracing-subscriber = "=0.3.23"
+tracing-appender = "=0.2.5"
+
+[target.'cfg(windows)'.dependencies]
+# 回收站边界复用 Tauri 锁定的 Windows STA IFileOperation 投影；直接声明可避免在破坏性 I/O 中手写 COM vtable。
+windows = { version = "=0.61.3", default-features = false, features = ["std", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+# windows 的 COM 实现宏通过匹配的 core crate 展开；仅限 Windows 与 std 作用域，不扩大桌面 capability。
+windows-core = { version = "=0.61.2", default-features = false, features = ["std"] }
+# 匹配 Tauri/Wry 锁定的投影，使 `with_webview` 无需全局 hook 或渲染器脚本注入即可注册作用域内的 WebView2 快捷键处理器。
+webview2-com = { version = "=0.38.2" }
+
+[target.'cfg(not(windows))'.dependencies]
+# Unix 使用系统回收站后备实现；Windows 回收站由 workspace 基础设施层的可失败 Shell API 负责，
+# 因此原生变更命令不初始化 COM apartment。
+trash = { version = "=5.2.6", default-features = false, features = ["coinit_multithreaded"] }
+
+[dev-dependencies]
+# MockRuntime 只在独立测试目标解析；生产依赖不携带 Tauri test feature。
+tauri = { version = "=2.11.5", default-features = false, features = ["test"] }
+# 性质测试只进入独立 test target，用随机输入验证领域 parser，不扩大生产依赖或二进制体积。
+proptest = "=1.11.0"
+
+[[test]]
+name = "int_platform_window_config"
+path = "tests/integration/platform_window_config.rs"
+
+# 白盒集成测试与纯单元测试使用独立进程：真实文件、Git、PTY 与平台状态不会污染
+# domain/application 的 fake-port 测试，同时无需扩大生产模块的 public 可见性。
+[[test]]
+name = "int_internal"
+path = "tests/integration/internal.rs"
+
+# 白盒测试从独立 crate 根重新编译生产模块；生产 `src` 不保留任何测试装配。
+[[test]]
+name = "unit"
+path = "tests/unit/mod.rs"
+
+# 完整退出会永久关闭进程级 Watcher admission，必须在独立测试进程验证，
+# 不能污染仍需构造 Watcher 状态的其他集成测试。
+[[test]]
+name = "int_app_lifecycle"
+path = "tests/integration/app_lifecycle.rs"

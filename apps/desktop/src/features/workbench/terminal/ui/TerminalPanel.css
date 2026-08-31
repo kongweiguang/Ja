@@ -1,0 +1,55 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-terminal-panel {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  border-top: 1px solid var(--ja-border);
+  padding: 0.35rem;
+  background: var(--ja-background);
+}
+.ja-terminal-panel .xterm {
+  height: 100%;
+  padding: 0.3rem;
+}
+.ja-terminal-panel .xterm-screen {
+  min-width: 0;
+}
+.ja-terminal-panel .xterm-viewport {
+  background: transparent !important;
+}
+
+.ja-terminal-search {
+  position: absolute;
+  z-index: 2;
+  top: 0.45rem;
+  right: 0.65rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem;
+  border: 1px solid var(--ja-border);
+  border-radius: 0.35rem;
+  background: var(--ja-panel, #25262a);
+  color: var(--ja-muted, #a7abb4);
+  box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 28%);
+}
+
+.ja-terminal-search input {
+  width: 12rem;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.ja-terminal-search button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}

@@ -1,0 +1,152 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+/*
+ * Approval 与发起它的 Command 保持在同一个 Turn；警示边缘提供接近 Codex 的视觉优先级，
+ * 同时避免把整个对话变成一叠过大的卡片。
+ */
+.ja-approval-card {
+  display: grid;
+  gap: 0.5rem;
+  width: min(100%, var(--ja-content-reading-width));
+  margin: 0.5rem auto 0.62rem;
+  padding: 0.62rem 0.72rem 0.68rem;
+  border: 1px solid var(--ja-border);
+  border-inline-start: 3px solid var(--ja-warning);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground);
+  background: var(--ja-surface-raised);
+  box-shadow: 0 0.35rem 1rem rgb(0 0 0 / 7%);
+}
+
+.ja-approval-card__heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0.58rem;
+  align-items: start;
+}
+
+.ja-approval-card__icon {
+  display: grid;
+  place-items: center;
+  width: 1.3rem;
+  height: 1.3rem;
+  color: var(--ja-warning);
+}
+
+.ja-approval-card__icon svg,
+.ja-approval-card__facts svg {
+  width: 0.92rem;
+  height: 0.92rem;
+}
+
+.ja-approval-card__heading h3 {
+  margin: 0;
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-control);
+}
+.ja-approval-card__heading p {
+  margin: 0.14rem 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-approval-card__risk {
+  color: var(--ja-warning);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  white-space: nowrap;
+}
+.ja-approval-risk-high,
+.ja-approval-risk-critical {
+  border-inline-start-color: var(--ja-danger);
+}
+.ja-approval-risk-high .ja-approval-card__risk,
+.ja-approval-risk-critical .ja-approval-card__risk {
+  color: var(--ja-danger);
+}
+
+.ja-approval-card__facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0;
+  margin: 0;
+  padding: 0.18rem 0;
+  border-block: 1px solid var(--ja-border);
+}
+
+.ja-approval-card__facts div {
+  display: grid;
+  grid-template-columns: 2.7rem minmax(0, 1fr);
+  gap: 0.42rem;
+  align-items: center;
+  min-width: 0;
+  min-height: 1.75rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ja-border) 68%, transparent);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-approval-card__facts div:last-child {
+  border-bottom: 0;
+}
+.ja-approval-card__facts dt {
+  color: var(--ja-foreground-muted);
+}
+.ja-approval-card__facts dd {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.28rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.ja-approval-card__facts code {
+  overflow: hidden;
+  color: var(--ja-foreground);
+  font: var(--ja-text-caption-size) / var(--ja-line-caption) var(--ja-font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-approval-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.3rem;
+}
+.ja-approval-card__result {
+  margin: 0;
+  color: var(--ja-success);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-control);
+}
+.ja-approval-card__error {
+  margin: 0;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-approval-card-expired .ja-approval-card__result,
+.ja-approval-card-disconnected .ja-approval-card__result {
+  color: var(--ja-foreground-muted);
+}
+
+@media (max-width: 640px) {
+  .ja-approval-card__heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .ja-approval-card__risk {
+    grid-column: 2;
+  }
+  .ja-approval-card__actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-approval-card,
+  .ja-approval-card * {
+    scroll-behavior: auto;
+  }
+}

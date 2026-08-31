@@ -1,0 +1,139 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-reply-file-trigger {
+  display: inline-flex;
+  height: 1.85rem;
+  align-items: center;
+  gap: 0.12rem;
+  padding: 0 0.38rem;
+  border: 1px solid transparent;
+  border-radius: 0.48rem;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.ja-reply-file-trigger:hover,
+.ja-reply-file-trigger[aria-expanded="true"] {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+.ja-reply-file-trigger:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+.ja-reply-file-trigger[aria-busy="true"] {
+  cursor: progress;
+}
+.ja-reply-file-trigger svg:first-child {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+.ja-reply-file-trigger svg:last-child {
+  width: 0.7rem;
+  height: 0.7rem;
+}
+
+.ja-reply-file-menu {
+  z-index: 50;
+  display: grid;
+  min-width: 12rem;
+  max-width: min(22rem, calc(100vw - 1rem));
+  gap: 0.16rem;
+  padding: 0.38rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  background: var(--ja-surface-elevated, var(--ja-surface));
+  box-shadow: var(--ja-shadow-floating);
+}
+
+.ja-reply-file-label {
+  overflow: hidden;
+  padding: 0.24rem 0.42rem 0.32rem;
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-reply-file-menu-item {
+  display: flex;
+  min-height: 1.9rem;
+  min-width: 0;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.28rem 0.42rem;
+  border: 0;
+  border-radius: 0.4rem;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  cursor: pointer;
+  outline: none;
+}
+
+.ja-reply-file-menu-item[data-highlighted] {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+.ja-reply-file-menu-item[data-disabled] {
+  cursor: progress;
+  opacity: 0.55;
+}
+.ja-reply-file-menu-item svg {
+  width: 0.84rem;
+  height: 0.84rem;
+  flex: 0 0 auto;
+  color: var(--ja-accent);
+}
+.ja-reply-file-menu-item span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-reply-file-subtrigger svg:last-child {
+  margin-left: auto;
+  color: var(--ja-foreground-tertiary);
+}
+.ja-reply-file-status {
+  margin: 0.26rem 0.42rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-reply-file-error {
+  display: grid;
+  gap: 0.38rem;
+  margin: 0.32rem 0.42rem 0.18rem;
+}
+.ja-reply-file-error p {
+  margin: 0;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-reply-file-retry {
+  justify-self: start;
+  padding: 0.2rem 0.42rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: 0.36rem;
+  color: var(--ja-foreground);
+  background: var(--ja-control);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  cursor: pointer;
+}
+
+.ja-reply-file-retry:hover {
+  background: var(--ja-control-hover);
+}
+.ja-reply-file-retry:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}

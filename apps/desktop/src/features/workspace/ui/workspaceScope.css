@@ -1,0 +1,95 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-workspace-scope-row {
+  display: grid;
+  width: 100%;
+  min-height: 2.12rem;
+  grid-template-columns: 1rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.52rem;
+  padding: 0 0.58rem;
+  border: 0;
+  border-radius: var(--ja-radius-selection);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition:
+    color var(--ja-duration-fast) var(--ja-ease-native),
+    background-color var(--ja-duration-fast) var(--ja-ease-native);
+}
+
+.ja-workspace-scope-row:hover:not(:disabled),
+.ja-workspace-scope-row[data-active] {
+  color: var(--ja-foreground);
+  background: var(--ja-control-active);
+}
+
+.ja-workspace-scope-row[data-active] {
+  font-weight: var(--ja-weight-semibold);
+}
+
+.ja-workspace-scope-row:disabled {
+  cursor: wait;
+  opacity: 0.48;
+}
+
+.ja-workspace-scope-row:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
+}
+
+.ja-workspace-scope-row svg {
+  width: 0.96rem;
+  height: 0.96rem;
+  color: var(--ja-accent);
+  stroke-width: 1.75;
+}
+
+.ja-workspace-scope-row > span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-workspace-scope-status {
+  width: 0.42rem;
+  height: 0.42rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ja-border-strong);
+}
+
+.ja-workspace-scope-status.is-ready {
+  background: var(--ja-success);
+}
+
+.ja-workspace-scope-status.is-busy,
+.ja-workspace-scope-status.is-warning {
+  background: var(--ja-warning);
+}
+
+.ja-workspace-scope-status.is-danger {
+  background: var(--ja-danger);
+}
+
+@media (forced-colors: active) {
+  .ja-workspace-scope-row[data-active] {
+    border: 1px solid Highlight;
+  }
+
+  .ja-workspace-scope-status {
+    border: 1px solid CanvasText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-workspace-scope-row {
+    transition: none;
+  }
+}
