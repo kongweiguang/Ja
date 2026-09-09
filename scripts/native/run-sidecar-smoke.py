@@ -1203,6 +1203,16 @@ def ready_frame(document: dict[str, Any]) -> bool:
     )
 
 
+class NativeRpcRejection(RuntimeError):
+    """RPC 失败仅保留固定操作名和机器码，不能把远端消息或数据路径带进 CI 日志。"""
+
+    def __init__(self, operation: str, error_code: Any) -> None:
+        """即使调用方绕过 schema 验证，也只接受有界且不含路径/控制字符的诊断字段。"""
+        self.operation = operation if re.fullmatch(r"[A-Za-z][A-Za-z0-9 -]{0,63}", operation) else "unknown operation"
+        self.error_code = error_code if isinstance(error_code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error_code) else "UNCLASSIFIED_RPC_ERROR"
+        super().__init__(f"native sidecar rejected {self.operation} ({self.error_code})")
+
+
 def require_success(document: dict[str, Any], operation: str) -> dict[str, Any]:
     """仅暴露 Schema 已验证的稳定 errorCode，避免错误载荷进入 Native 诊断。"""
 
@@ -1212,8 +1222,7 @@ def require_success(document: dict[str, Any], operation: str) -> dict[str, Any]:
     error = document.get("error")
     data = error.get("data") if isinstance(error, dict) else None
     error_code = data.get("errorCode") if isinstance(data, dict) else None
-    suffix = f" ({error_code})" if isinstance(error_code, str) else ""
-    raise RuntimeError(f"native sidecar rejected {operation}{suffix}")
+    raise NativeRpcRejection(operation, error_code)
 
 
 def sanitized_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2056,6 +2065,9 @@ def main() -> int:
             "failureCode": stable_failure_code(failure),
             "failureType": type(failure).__name__,
         }
+        if isinstance(failure, NativeRpcRejection):
+            report["operation"] = failure.operation
+            report["rpcErrorCode"] = failure.error_code
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

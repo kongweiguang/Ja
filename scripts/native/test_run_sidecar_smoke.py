@@ -35,6 +35,17 @@ SPEC.loader.exec_module(SMOKE)
 class NativeSmokeV1Test(unittest.TestCase):
     """Verifies exact v1 frames and the complete mock-sidecar lifecycle."""
 
+    def test_rpc_rejection_preserves_only_bounded_diagnostics(self) -> None:
+        """错误操作与机器码可定位失败，任意消息和路径不得进入脱敏异常。"""
+        with self.assertRaises(SMOKE.NativeRpcRejection) as raised:
+            SMOKE.require_success({"error": {"message": "private-content", "data": {"errorCode": "STORAGE_UNAVAILABLE"}}}, "workspace binding")
+        self.assertEqual("workspace binding", raised.exception.operation)
+        self.assertEqual("STORAGE_UNAVAILABLE", raised.exception.error_code)
+        self.assertNotIn("private-content", str(raised.exception))
+        invalid = SMOKE.NativeRpcRejection("/private/path", "secret/value")
+        self.assertEqual("unknown operation", invalid.operation)
+        self.assertEqual("UNCLASSIFIED_RPC_ERROR", invalid.error_code)
+
     def test_secret_scan_distinguishes_public_protocol_names_from_values(self) -> None:
         """公开 credential 方法名必须可观测，但带值的 API key、Bearer 与 smoke secret 仍须被拦截。"""
 
