@@ -115,9 +115,7 @@ export const DEFAULT_CONVERSATION_ARTIFACT_PORT = createConversationArtifactPort
 );
 
 /** 冻结 Review 只代理持久 artifact；运行中修改统一通过 Git 视图查看。 */
-export function createTurnReviewPort(
-  artifactPort: ConversationArtifactPort,
-): TurnReviewPort {
+export function createTurnReviewPort(artifactPort: ConversationArtifactPort): TurnReviewPort {
   return {
     readFrozen: (target, file, signal) => {
       return artifactPort.readTurnDiff(
@@ -134,9 +132,7 @@ export function createTurnReviewPort(
   };
 }
 
-export const DEFAULT_TURN_REVIEW_PORT = createTurnReviewPort(
-  DEFAULT_CONVERSATION_ARTIFACT_PORT,
-);
+export const DEFAULT_TURN_REVIEW_PORT = createTurnReviewPort(DEFAULT_CONVERSATION_ARTIFACT_PORT);
 
 /**
  * 正式 project picker 只在 composition 层绑定 Tauri dialog；取消继续返回 null，

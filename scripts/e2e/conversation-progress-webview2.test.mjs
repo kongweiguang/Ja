@@ -21,12 +21,39 @@ function validReport() {
     provider: { kind: "deterministic_loopback", externalCalls: 0, toolCalls: 2 },
     live: {
       commentaryBeforeFirstTool: true,
-      sequence: ["commentary", "tool:read", "commentary", "tool:shell", "commentary"],
+      sequence: [
+        "commentary",
+        "tool:read",
+        "commentary",
+        "commentary",
+        "tool:shell",
+        "commentary",
+      ],
       noDuplicateTools: true,
     },
-    reload: { sameThread: true, sequence: ["commentary", "tool:read", "commentary", "tool:shell", "commentary"] },
+    reload: {
+      sameThread: true,
+      sequence: [
+        "commentary",
+        "tool:read",
+        "commentary",
+        "commentary",
+        "tool:shell",
+        "commentary",
+      ],
+    },
     finalVisible: true,
   };
+}
+
+/** 等待 fixture 到达可释放阶段，确保测试不靠任意延迟并能在故障时有界失败。 */
+async function waitForFixtureStage(fixture, expectedStage) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (fixture.stages.includes(expectedStage)) return;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  throw new Error(`fixture stage ${expectedStage} was not reached before the deadline`);
 }
 
 test("CLI 默认使用 JDK25 与独立 conversation-progress Cargo target", () => {
@@ -56,7 +83,12 @@ test("loopback fixture 按 function_call_output 推进 read、shell、final 三�
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ input }),
       });
-    const first = await (await post([{ role: "user", content: [{ type: "input_text", text: "progress" }] }])).text();
+    const firstResponse = post([
+      { role: "user", content: [{ type: "input_text", text: "progress" }] },
+    ]);
+    await waitForFixtureStage(fixture, "text_read");
+    fixture.releaseFirstText();
+    const first = await (await firstResponse).text();
     assert.match(first, /response\.output_text\.delta/u);
     assert.doesNotMatch(first, /response\.reasoning_summary_text\.delta/u);
     assert.match(first, /call_progress_read/u);

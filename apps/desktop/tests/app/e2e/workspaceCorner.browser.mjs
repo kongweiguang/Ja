@@ -7,10 +7,10 @@ async function pixels(page, points) {
   const buffer = await page.screenshot();
   return page.evaluate(
     async ({ data, points }) => {
-      const image = new Image();
+      const image = new globalThis.Image();
       image.src = data;
       await image.decode();
-      const canvas = document.createElement("canvas");
+      const canvas = globalThis.document.createElement("canvas");
       canvas.width = image.width;
       canvas.height = image.height;
       const context = canvas.getContext("2d");
@@ -25,7 +25,8 @@ const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
   await page.goto(
-    process.argv[2] ?? "http://localhost:1437/tests/app/e2e/workspaceCornerBrowserFixture.html",
+    process.argv[2] ??
+      "http://localhost:1437/tests/features/navigation/ui/workspaceCornerBrowserFixture.html",
   );
   const handle = page.getByRole("separator");
   await handle.waitFor();
@@ -35,8 +36,8 @@ try {
       for (const mode of ["light", "dark"]) {
         await page.evaluate(
           ({ palette, mode }) => {
-            document.documentElement.dataset.palette = palette;
-            document.documentElement.dataset.theme = mode;
+            globalThis.document.documentElement.dataset.palette = palette;
+            globalThis.document.documentElement.dataset.theme = mode;
           },
           { palette, mode },
         );

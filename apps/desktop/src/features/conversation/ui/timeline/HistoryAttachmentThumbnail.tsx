@@ -79,8 +79,11 @@ function useVisibleThumbnailTarget(elementRef: RefObject<HTMLSpanElement | null>
     const element = elementRef.current;
     if (element === null || visible) return undefined;
     if (globalThis.IntersectionObserver === undefined) {
-      if (isInsideTimelineViewport(element)) setVisible(true);
-      return undefined;
+      // 回退探测延后到可取消的回调，避免 effect 初始化同步触发级联渲染。
+      const timeout = globalThis.setTimeout(() => {
+        if (isInsideTimelineViewport(element)) setVisible(true);
+      }, 0);
+      return () => globalThis.clearTimeout(timeout);
     }
     const observer = new IntersectionObserver(
       (entries) => {
@@ -156,7 +159,10 @@ export function HistoryAttachmentThumbnail({
     let active = true;
     let owned: OwnedThumbnailSession | undefined;
     currentImageRef.current = undefined;
-    setProjection({ status: "loading" });
+    // loading 与异步预览统一按 active 身份提交，卸载后不能再更新投影。
+    globalThis.queueMicrotask(() => {
+      if (active) setProjection({ status: "loading" });
+    });
     void port
       .open({
         attachmentId,

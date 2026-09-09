@@ -159,26 +159,6 @@ export function fileStatusLabel(status: ReviewFile["status"]): string {
   }
 }
 
-/** 把文件状态映射为紧凑标记，让高密度文件树仍易扫描。 */
-export function fileStatusMark(status: ReviewFile["status"]): string {
-  switch (status) {
-    case "added":
-      return "A";
-    case "modified":
-      return "M";
-    case "deleted":
-      return "D";
-    case "renamed":
-      return "R";
-    case "copied":
-      return "C";
-    case "conflicted":
-      return "U";
-    case "untracked":
-      return "?";
-  }
-}
-
 /** 只有完整非二进制文本才能进入 DiffViewer，避免把截断内容伪装成完整 Diff。 */
 export function canRenderTextDiff(diff: ReviewFileDiff | undefined): boolean {
   return (

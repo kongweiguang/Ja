@@ -1,9 +1,8 @@
 // @author kongweiguang
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Composer } from "@/features/conversation/ui/composer/Composer";
-import { FileTree } from "@/features/workbench/files/ui/FileTree";
-import type { ConversationContextReference } from "@/features/conversation/domain/userContent";
+import { Composer, type ConversationContextReference } from "@/features/conversation";
+import { FileTree } from "@/features/workbench/files";
 import "@/shared/styles/tokens.css";
 import "@/shared/styles/primitives.css";
 import "@/app/App.css";

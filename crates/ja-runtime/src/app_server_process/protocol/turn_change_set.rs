@@ -13,7 +13,7 @@ use std::fmt::{Display, Formatter};
 
 pub const TURN_CHANGE_SET_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PATH_CHARACTERS: usize = 4_096;
-const MAX_BASE64_CHARACTERS: usize = ((TURN_CHANGE_SET_MAX_BYTES as usize + 2) / 3) * 4;
+const MAX_BASE64_CHARACTERS: usize = (TURN_CHANGE_SET_MAX_BYTES as usize).div_ceil(3) * 4;
 
 /// 合同错误保持固定分类，防止被拒绝的路径或正文进入日志与 WebView。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +176,7 @@ fn valid_sha256(value: &str) -> bool {
 
 /// 这里只验证标准 Base64 的规范表面与理论大小；真实 padding 和解码结果由 Tauri 严格复核。
 fn valid_standard_base64_surface(value: &str) -> bool {
-    if value.len() > MAX_BASE64_CHARACTERS || value.len() % 4 != 0 {
+    if value.len() > MAX_BASE64_CHARACTERS || !value.len().is_multiple_of(4) {
         return false;
     }
     let padding = value.bytes().rev().take_while(|byte| *byte == b'=').count();

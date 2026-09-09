@@ -276,14 +276,13 @@ async function delayedRead(path: string, signal?: AbortSignal): Promise<string> 
   telemetry.maxActiveReads = Math.max(telemetry.maxActiveReads, telemetry.activeReads);
   const delayedRace = path === FIXTURE_PATHS.a && deferFirstAForRace;
   if (delayedRace) deferFirstAForRace = false;
-  const duration =
-    delayedRace
-      ? 220
-      : path === FIXTURE_PATHS.hidden
-        ? 600
-        : path === FIXTURE_PATHS.c
-          ? 20
-          : 8;
+  const duration = delayedRace
+    ? 220
+    : path === FIXTURE_PATHS.hidden
+      ? 600
+      : path === FIXTURE_PATHS.c
+        ? 20
+        : 8;
   const honorAbort = !delayedRace;
   try {
     await new Promise<void>((resolvePromise, rejectPromise) => {

@@ -58,7 +58,7 @@ fn result_surface_enforces_two_mebibyte_base64_boundary() {
         })
     };
     let exact = "A".repeat(2_796_204);
-    assert_eq!(exact.len(), ((TURN_CHANGE_SET_MAX_BYTES as usize + 2) / 3) * 4);
+    assert_eq!(exact.len(), (TURN_CHANGE_SET_MAX_BYTES as usize).div_ceil(3) * 4);
     assert!(TurnChangeSetReadResult::try_from(&base(TURN_CHANGE_SET_MAX_BYTES, exact)).is_ok());
     assert!(
         TurnChangeSetReadResult::try_from(&base(

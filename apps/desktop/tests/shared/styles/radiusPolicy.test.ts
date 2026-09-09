@@ -9,6 +9,7 @@ const DESKTOP_SOURCE = join(process.cwd(), "apps", "desktop", "src");
 const COMPOSER_STYLE = join("features", "conversation", "ui", "composer", "composer.css");
 const TASKS_STYLE = join("features", "tasks", "ui", "tasks.css");
 const TIMELINE_STYLE = join("features", "conversation", "ui", "timeline", "timeline.css");
+const NAVIGATION_STYLE = join("features", "navigation", "ui", "navigation.css");
 
 /** 递归读取生产 CSS，避免新增 Feature 绕过紧凑工作台与明确 Apple 输入器的圆角边界。 */
 function cssFiles(root: string): string[] {
@@ -80,6 +81,22 @@ function approvedUserMessageRadius(
   );
 }
 
+/** 运行态恢复详情是独立的短内容浮层；白名单绑定导航样式、选择器与精确 14px，避免放宽全局上限。 */
+function approvedNavigationPopoverRadius(
+  file: string,
+  source: string,
+  valueOffset: number,
+  pixels: number,
+): boolean {
+  if (relative(DESKTOP_SOURCE, file) !== NAVIGATION_STYLE || pixels !== 14) return false;
+  const ruleStart = source.lastIndexOf("}", valueOffset) + 1;
+  const selector = source
+    .slice(ruleStart, source.lastIndexOf("{", valueOffset))
+    .replace(/\/\*[\s\S]*?\*\//gu, "")
+    .trim();
+  return selector === ".ja-popover-content.ja-navigation-runtime-popover";
+}
+
 describe("shared desktop radius policy", () => {
   it("keeps the workbench compact while allowing explicit Apple input and message geometry", () => {
     const composerSource = readFileSync(join(DESKTOP_SOURCE, COMPOSER_STYLE), "utf8");
@@ -102,7 +119,8 @@ describe("shared desktop radius policy", () => {
           pixels > 8 &&
           !approvedPill(file, source, offset) &&
           !approvedComposerRadius(file, source, offset, pixels) &&
-          !approvedUserMessageRadius(file, source, offset, value)
+          !approvedUserMessageRadius(file, source, offset, value) &&
+          !approvedNavigationPopoverRadius(file, source, offset, pixels)
         ) {
           violations.push(`${relative(DESKTOP_SOURCE, file)}: ${value}`);
         }

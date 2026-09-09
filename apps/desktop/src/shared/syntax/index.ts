@@ -3,4 +3,4 @@
 
 export { languageExtension } from "./language";
 export { createSyntaxBudget, highlightCodeLines, semanticSyntaxRules } from "./syntaxHighlighting";
-export type { SyntaxBudget, SyntaxToken } from "./syntaxHighlighting";
+export type { SyntaxToken } from "./syntaxHighlighting";

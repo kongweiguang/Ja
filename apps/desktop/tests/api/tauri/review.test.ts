@@ -166,7 +166,12 @@ describe("TauriReviewAdapter", () => {
 
     bridge.invoke = vi.fn(async () => ({
       ...snapshot,
-      files: snapshot.files.map(({ layer: _layer, ...file }) => file),
+      files: snapshot.files.map((file) => {
+        // 主动删除必填 layer，以验证 adapter 拒绝缺字段而非仅拒绝非法值。
+        const incomplete: Partial<typeof file> = { ...file };
+        delete incomplete.layer;
+        return incomplete;
+      }),
     })) as RuntimeNativeBridge["invoke"];
     await expect(
       new TauriReviewAdapter(bridge).snapshot({ workspaceId: "ws_demo", source }),

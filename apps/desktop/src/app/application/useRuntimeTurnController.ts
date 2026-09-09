@@ -147,7 +147,8 @@ export function useRuntimeTurnController({
         if (!isTurnGateCurrent(lifecycleEpoch, generation)) {
           throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
         }
-        const { projectionAttachments: _projectionAttachments, ...turnStartInput } = input;
+        const turnStartInput = { ...input };
+        delete turnStartInput.projectionAttachments;
         return runtime.turnStart(turnStartInput);
       });
       return pending.promise

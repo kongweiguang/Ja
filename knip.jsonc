@@ -23,6 +23,15 @@
     "scripts/e2e/fixtures/runtime-refresh-mcp.mjs",
     "scripts/e2e/webview2-edgedriver-runner.mjs",
     "scripts/e2e/windows-desktop-smoke.mjs",
+    // 独立浏览器/真窗 CLI 由维护者直接运行，不由应用模块静态导入。
+    "scripts/e2e/review-redesign-browser.mjs",
+    "scripts/e2e/workbench-tab-context-webview2.mjs",
+    // Vite HTML 以 script 标签加载的验收入口；保留在图中继续检查其内部依赖。
+    "apps/desktop/tests/app/e2e/reviewPerformanceBrowserFixture.tsx",
+    "apps/desktop/tests/app/e2e/reviewRedesignBrowserFixture.tsx",
+    "apps/desktop/tests/app/e2e/smoothReviewBrowserFixture.tsx",
+    "apps/desktop/tests/app/e2e/referencePreviewBrowserFixture.tsx",
+    "apps/desktop/tests/features/navigation/ui/workspaceCornerBrowserFixture.tsx",
   ],
   "project": [
     "apps/desktop/src/**/*.{ts,tsx}",
@@ -39,6 +48,8 @@
   "ignoreUnresolved": [
     // 真窗 smoke 中的 Vite 浏览器绝对路径只在 page.evaluate 运行；删除条件是改为 Knip 可解析的静态入口。
     "/src/api/protocol/protocol.ts",
+    "/src/api/tauri/history.ts",
+    "/src/api/tauri/settings.ts",
     "/src/features/conversation/application/timelineStore.ts",
     "/src/features/conversation/domain/timelineContracts.ts",
   ],

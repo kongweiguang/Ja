@@ -12,10 +12,4 @@ export type {
 export type { ReviewSource } from "./domain/types";
 export type { ReviewNavigationState } from "./ui/ReviewFileTree";
 export { TurnReviewPanelView } from "./ui/TurnReviewPanelView";
-export type {
-  FrozenTurnReviewTarget,
-  TurnReviewFile,
-  TurnReviewFileContent,
-  TurnReviewPort,
-  TurnReviewTarget,
-} from "./domain/turnReview";
+export type { TurnReviewFileContent, TurnReviewPort, TurnReviewTarget } from "./domain/turnReview";

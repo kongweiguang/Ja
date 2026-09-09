@@ -107,7 +107,7 @@ describe("runtime projection composition adapter", () => {
         (item) => item.kind === "user_message" && item.text === "hello",
       ),
     ).toBe(true);
-    expect(state.resyncRequired["thr_fixture"]).toBeUndefined();
+    expect(state.resyncRequired["thr_fixture"]).toBe("terminal_snapshot");
     expect(state.turns["turn_fixture"]?.changeSet?.state).toBe("complete");
   });
 

@@ -246,7 +246,7 @@ async function selectAndMeasureFeedback(page, path) {
         observer.disconnect();
         resolvePromise(globalThis.performance.now() - started);
       };
-      const observer = new MutationObserver(capture);
+      const observer = new globalThis.MutationObserver(capture);
       observer.observe(button, { attributes: true, attributeFilter: ["aria-selected"] });
       button.click();
       capture();
@@ -336,7 +336,7 @@ async function verifyHiddenCleanup(page) {
       if (status !== undefined && observation.visibleAt === undefined)
         observation.visibleAt = performance.now();
     };
-    const observer = new MutationObserver(capture);
+    const observer = new globalThis.MutationObserver(capture);
     observer.observe(globalThis.document.body, { childList: true, subtree: true });
     globalThis.__JA_SMOOTH_REVIEW_LOADING_OBSERVER__ = observer;
     globalThis.__JA_SMOOTH_REVIEW_FIXTURE__?.requestPath(path);

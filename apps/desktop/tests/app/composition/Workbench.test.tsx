@@ -4,17 +4,17 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState, type ReactElement } from "react";
+import { useState, type ComponentProps, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Workbench, type WorkbenchProps } from "@/features/workbench/ui/Workbench";
-import { WorkbenchResizeHandle } from "@/features/workbench/ui/WorkbenchResizeHandle";
-import type { WorkbenchTab } from "@/features/workbench/domain/tabs";
 import {
   capabilityWorkbenchTab,
   parseTaskWorkbenchTabKey,
   sideTaskDraftWorkbenchTab,
+  Workbench,
+  WorkbenchResizeHandle,
   type WorkbenchCapability,
-} from "@/features/workbench/domain/tabs";
+  type WorkbenchTab,
+} from "@/features/workbench";
 import {
   getRightPanelSessionState,
   useRightPanelSessionStore,
@@ -22,6 +22,7 @@ import {
 } from "@/shared/preferences/uiPreferences";
 
 const WORKBENCH_SCOPE = "server-1:1:workspace-1:thread-workbench";
+type WorkbenchProps = ComponentProps<typeof Workbench>;
 
 const views: WorkbenchProps["views"] = {
   review: <div>review state</div>,

@@ -367,7 +367,14 @@ public final class ManagedAttachmentStore implements AttachmentBlobStore {
         }
     }
 
-    /** 已存在目录必须是绝对、非链接且 real path 与 normalized spelling 相同。 */
+    /**
+     * 已存在目录必须是绝对、非链接且 NOFOLLOW 与跟随后的物理身份相同。
+     *
+     * 不能把词法路径直接与 NOFOLLOW 结果比较：Windows runner 可能通过目录别名
+     * 暴露临时目录，词法拼写与真实路径不同并不等于目录是可逃逸的 reparse point。
+     * 这里仍保留最终分量的 NOFOLLOW 属性检查，并用两种 real path 的身份比较拒绝
+     * symlink、junction 和其它 reparse alias，随后只返回物理路径供 owner 继续派生子目录。
+     */
     private static Path requirePlainDirectory(Path path) {
         if (!path.isAbsolute()) throw failure(AttachmentBlobStore.Code.SOURCE_UNAVAILABLE);
         BasicFileAttributes metadata = attributes(path, AttachmentBlobStore.Code.SOURCE_UNAVAILABLE);
@@ -375,10 +382,10 @@ public final class ManagedAttachmentStore implements AttachmentBlobStore {
             throw failure(AttachmentBlobStore.Code.SOURCE_UNAVAILABLE);
         }
         try {
-            Path normalized = path.toAbsolutePath().normalize();
-            Path real = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
-            if (!normalized.equals(real)) throw failure(AttachmentBlobStore.Code.SOURCE_UNAVAILABLE);
-            return real;
+            Path noFollow = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            Path followed = path.toRealPath();
+            if (!noFollow.equals(followed)) throw failure(AttachmentBlobStore.Code.SOURCE_UNAVAILABLE);
+            return followed;
         } catch (IOException failure) {
             throw failure(AttachmentBlobStore.Code.SOURCE_UNAVAILABLE, failure);
         }
