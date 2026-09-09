@@ -21,6 +21,7 @@ from pathlib import Path
 from queue import Empty, Queue
 import re
 import signal
+import stat
 import shutil
 import subprocess
 import tempfile
@@ -95,7 +96,7 @@ SHELL_STDIN_EOF_CALL_ID = "call_shell_stdin_eof"
 SHELL_STDIN_EOF_COMMAND = (
     "$input=[Console]::In.ReadToEnd(); "
     "if ($input.Length -ne 0) { exit 9 }; Write-Output 'JA_NATIVE_STDIN_EOF'"
-)
+) if os.name == "nt" else "test -z \"$(cat)\" && printf 'JA_NATIVE_STDIN_EOF\\n'"
 
 # Keep this closure deliberately explicit.  A Native smoke report is a release gate, so adding a
 # capability without adding it here would silently turn an unverified feature into a green result.
@@ -1287,10 +1288,21 @@ def native_probe_diagnostics(documents: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def auth_acl_evidence(auth_path: Path) -> dict[str, Any]:
-    """Prove the Windows auth file is non-inherited and current-user-only without retaining ACL text."""
+    """按平台验证真实权限：Windows 检查 DACL，POSIX 检查普通文件、owner 与精确 0600。"""
 
     if os.name != "nt":
-        return {"status": "blocked", "reason": "Windows current-user-only DACL requires Windows 11"}
+        try:
+            attributes = auth_path.lstat()
+            owner_only = stat.S_ISREG(attributes.st_mode) and stat.S_IMODE(attributes.st_mode) == 0o600 \
+                and attributes.st_uid == os.getuid()
+            return {
+                "status": "passed" if owner_only else "blocked",
+                "currentUserOnly": owner_only,
+                "mode": oct(stat.S_IMODE(attributes.st_mode)),
+                "reason": None if owner_only else "POSIX auth permissions are not owner-only 0600",
+            }
+        except OSError:
+            return {"status": "blocked", "reason": "POSIX auth permissions could not be inspected"}
     if not auth_path.is_file():
         return {"status": "blocked", "reason": "auth.json was not produced by the credential lifecycle"}
     try:
@@ -1944,7 +1956,7 @@ def run_smoke(
             authAcl=acl,
         ) if configuration_replace.get("accepted") is True and credential_delete_ok \
             and acl.get("status") == "passed" else probe_blocked(
-                "Windows current-user-only auth ACL evidence was not available",
+                "platform current-user-only auth permission evidence was not available",
                 configurationReplace=configuration_replace.get("accepted") is True,
                 credentialSet=credential_set.get("configured") is True,
                 credentialDelete=credential_delete_ok,
