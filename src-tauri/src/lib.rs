@@ -134,10 +134,13 @@ use app_runtime::{
     EventEmitError, EventSink, HomeLayout, RPC_FRAME_EVENT, RuntimeHost, cleanup_on_exit,
     cleanup_on_exit_until, prepare_run_dir,
 };
+#[cfg(debug_assertions)]
 use std::ffi::OsString;
+#[cfg(debug_assertions)]
 use std::fs;
 #[cfg(debug_assertions)]
 use std::io::Write;
+#[cfg(debug_assertions)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

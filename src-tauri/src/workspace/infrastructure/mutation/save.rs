@@ -79,8 +79,7 @@ pub(super) fn evidence_matches_expected(
     evidence.policy_safe_file && evidence.revision == internal_revision(expected)
 }
 
-/// 选择未创建的同级 recovery 名；让 ReplaceFile 自己处理竞争，避免占位文件在恢复中丢失。
-#[cfg(windows)]
+/// 为 Windows 替换与跨平台 Move 选择未创建的同级恢复名，避免占位文件干扰原子提交。
 pub(super) fn absent_recovery_path(parent: &Path, prefix: &str) -> Result<PathBuf, WorkspaceError> {
     for _ in 0..8 {
         let path = parent.join(format!(".{prefix}-{}.tmp", Uuid::new_v4()));

@@ -358,7 +358,7 @@ where
     #[cfg(not(windows))]
     {
         verify()?;
-        trash::delete(path).map_err(|_| WorkspaceError::io("trash", std::io::ErrorKind::Other))
+        ::trash::delete(path).map_err(|_| WorkspaceError::io("trash", std::io::ErrorKind::Other))
     }
 }
 

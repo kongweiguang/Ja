@@ -262,6 +262,7 @@ jobs:
         with:
           workspaces: ". -> src-tauri/target"
           shared-key: ja-native-${{ matrix.platform }}-${{ matrix.arch }}
+          cache-on-failure: true
 
       - name: Verify source commit and native contract (Windows)
         if: matrix.platform == 'windows'

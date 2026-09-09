@@ -305,6 +305,7 @@ impl ProcessTree {
     fn terminate(&self, pid: u32, deadline: Instant) -> io::Result<()> {
         #[cfg(unix)]
         {
+            let _ = deadline;
             if self.prepared {
                 let mut first = None;
                 for signal in [SIGTERM, SIGKILL] {

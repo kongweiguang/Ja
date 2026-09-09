@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

@@ -9,7 +9,9 @@
 use super::error::{TerminalError, TerminalErrorCode};
 use portable_pty::Child;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 跨平台 process tree 控制边界。
 pub(crate) trait ProcessTree: Send + Sync {
