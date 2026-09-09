@@ -29,7 +29,7 @@ final class WindowsShellLaunchProbeTest {
         List<String> platform = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP",
                 "windir", "SystemDrive", "ProgramData", "ALLUSERSPROFILE", "PUBLIC", "OS",
                 "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "PSModulePath");
-        for (List<String> names : List.of(windows, platform)) {
+        for (List<String> names : List.of(runtime)) {
             Map<String, String> environment = new LinkedHashMap<>();
             for (String name : names) {
                 String value = name.equals("PSModulePath")
@@ -41,6 +41,13 @@ final class WindowsShellLaunchProbeTest {
                 probe(temp, environment, nativeLaunch);
             }
         }
+        Map<String, String> inherited = new LinkedHashMap<>();
+        System.getenv().forEach((name, value) -> {
+            if (name.matches("[A-Za-z_][A-Za-z0-9_]*")) inherited.put(name, value);
+        });
+        // 仅作为固定脚本的诊断对照，生产 Shell 白名单不采用这份环境，也不记录其值。
+        probe(temp, inherited, false);
+        probe(temp, inherited, true);
     }
 
     /** 两种启动器共用相同参数、环境、cwd 与排空策略，输出不包含环境值或用户文件。 */
@@ -66,7 +73,7 @@ final class WindowsShellLaunchProbeTest {
                 boolean exited = process.waitFor(8, TimeUnit.SECONDS);
                 if (!exited) process.destroyForcibly();
                 process.waitFor(3, TimeUnit.SECONDS);
-                System.out.println("JA_SHELL_PROBE native=" + nativeLaunch + " keys=" + environment.keySet()
+                System.out.println("JA_SHELL_PROBE native=" + nativeLaunch + " keyCount=" + environment.size()
                         + " exited=" + exited + " stdout=" + stdout.get(3, TimeUnit.SECONDS)
                         + " stderr=" + stderr.get(3, TimeUnit.SECONDS));
             } finally {
