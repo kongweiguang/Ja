@@ -10,6 +10,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 
 /** 真文件测试覆盖凭据首次写入、替换与清空，不能只验证不存在文件的首次创建。 */
 final class ConfigurationSecretReplacementTest {
@@ -24,5 +27,17 @@ final class ConfigurationSecretReplacementTest {
         try (var files = Files.list(root)) {
             assertEquals(1L, files.count());
         }
+    }
+
+    /** POSIX 硬链接允许并不允许父目录 symlink 将凭据写入外部位置。 */
+    @Test
+    @EnabledOnOs({OS.MAC, OS.LINUX})
+    void rejectsSymbolicLinkParent(@TempDir Path root) throws Exception {
+        Path canonical = root.toRealPath();
+        Path outside = Files.createDirectory(canonical.resolve("outside"));
+        Path link = Files.createSymbolicLink(canonical.resolve("alias"), outside);
+        assertThrows(java.io.IOException.class, () -> ConfigurationStore.writeAtomic(
+                link.resolve("auth.json"), "{}".getBytes(StandardCharsets.UTF_8), true));
+        assertEquals(false, Files.exists(outside.resolve("auth.json")));
     }
 }

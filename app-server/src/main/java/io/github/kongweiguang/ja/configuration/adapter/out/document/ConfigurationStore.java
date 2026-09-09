@@ -346,14 +346,16 @@ public final class ConfigurationStore {
     }
 
     /**
-     * 同时用 NOFOLLOW 属性与真实路径对比拒绝符号链接、reparse point 及其他特殊文件。
+     * 所有平台拒绝符号链接和特殊文件；Windows 另比较 NOFOLLOW 路径识别 reparse point。
+     * POSIX 的回滚硬链接仍是同一 inode，macOS real path 可返回另一个链接名，不能因名称
+     * 不同拒绝安全原子替换；祖先 symlink 由 validateExistingPath 逐分量拒绝。
      */
     private static void rejectLinkOrReparse(Path path) throws IOException {
         if (Files.isSymbolicLink(path)) throw new IOException("configuration_reparse_forbidden");
         BasicFileAttributes attributes = Files.readAttributes(
                 path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         if (attributes.isOther()
-            || !path.toRealPath(LinkOption.NOFOLLOW_LINKS).equals(path.toRealPath())) {
+            || isWindows() && !path.toRealPath(LinkOption.NOFOLLOW_LINKS).equals(path.toRealPath())) {
             throw new IOException("configuration_reparse_forbidden");
         }
     }
