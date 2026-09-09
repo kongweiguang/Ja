@@ -12,6 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: liberica
+          java-version: "25"
+          cache: maven
+      - name: Verify secret replacement on macOS JVM
+        shell: bash
+        run: mvn -B -ntp -f app-server/pom.xml -Dtest=ConfigurationSecretReplacementTest test
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ja-native-app-server-macos-x86_64
