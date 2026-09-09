@@ -98,7 +98,7 @@ public final class TurnChangeTracker {
             requireMutable();
             Objects.requireNonNull(receipt, "receipt");
             Confinement confinement = receipt.confinedWorkspaceRoot() != null
-                    && PathIdentities.normalized(receipt.confinedWorkspaceRoot()).equals(workspaceRoot)
+                    && sameWorkspaceIdentity(receipt.confinedWorkspaceRoot(), workspaceRoot)
                     ? Confinement.accepted(receipt.confinedRelativePath())
                     : confinedRelative(receipt.path());
             if (confinement.failure() != null) {
@@ -313,6 +313,19 @@ public final class TurnChangeTracker {
             return Confinement.accepted(workspaceRoot.relativize(normalized).toString().replace('\\', '/'));
         } catch (IOException failure) {
             return Confinement.failed(TurnChangeSet.IncompleteReason.CAPTURE_FAILED);
+        }
+    }
+
+    /**
+     * 收据根来自 WorkspaceBoundary 的物理路径，而 tracker 可能持有 Rust Host 传入的
+     * namespaced/8.3 词法路径；用文件身份比较这两个受信根，避免把合法别名误降级为越界，
+     * 同时不改变普通 Tool 路径的写入准入规则。
+     */
+    private static boolean sameWorkspaceIdentity(Path first, Path second) {
+        try {
+            return Files.isSameFile(first, second);
+        } catch (IOException failure) {
+            return PathIdentities.normalized(first).equals(PathIdentities.normalized(second));
         }
     }
 

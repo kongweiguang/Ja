@@ -127,7 +127,7 @@ final class WindowsJobObjectTest {
         }
     }
 
-    /** 真实挂起式启动必须能解析 PATH 中的系统 PowerShell，并在 Job 接纳后正常退出。 */
+    /** 验证 Job 接纳后的功能退出；冷启动 runner 的系统 PowerShell 可超过 5 秒，保留 20 秒硬上限。 */
     @Test
     void suspendedLauncherRunsSystemPowerShell(@TempDir Path temp) throws Exception {
         Map<String, String> environment = Map.of(
@@ -138,7 +138,7 @@ final class WindowsJobObjectTest {
                     List.of("powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Milliseconds 100"),
                     temp, environment, job);
             try {
-                assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+                assertTrue(process.waitFor(20, TimeUnit.SECONDS));
                 assertEquals(0, process.exitValue());
             } finally {
                 WindowsProcessLauncher.close(process);
@@ -149,6 +149,7 @@ final class WindowsJobObjectTest {
     /**
      * 复现桌面 Host Job -> App Server JVM -> Shell Job 的两级托管链；普通单 JVM 用例只验证
      * 最内层 Job，无法发现父 Job 策略导致的 CreateProcess/AssignProcessToJobObject 差异。
+     * 外层预算包含 JVM 与系统 PowerShell 两次冷启动，不把宿主负载当作 Job 语义失败。
      */
     @Test
     void nestedHostJobAllowsAppServerToLaunchOwnedPowerShell(@TempDir Path temp) throws Exception {
@@ -165,7 +166,7 @@ final class WindowsJobObjectTest {
             Process appServer = WindowsProcessLauncher.launch(command, temp, environment, hostJob);
             try {
                 appServer.getOutputStream().close();
-                assertTrue(appServer.waitFor(8, TimeUnit.SECONDS), "nested App Server probe must settle");
+                assertTrue(appServer.waitFor(30, TimeUnit.SECONDS), "nested App Server probe must settle");
                 String stdout = new String(appServer.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
                 String stderr = new String(appServer.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
 
@@ -440,7 +441,7 @@ final class WindowsJobObjectTest {
                             shellJob);
                     try {
                         shell.getOutputStream().close();
-                        if (!shell.waitFor(5, TimeUnit.SECONDS)) {
+                        if (!shell.waitFor(20, TimeUnit.SECONDS)) {
                             throw new IOException("nested_shell_timeout");
                         }
                         String stdout = new String(shell.getInputStream().readAllBytes(), StandardCharsets.UTF_8);

@@ -15,6 +15,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 /** 验证 NIO 文件适配器的目录真实性、通用目录和链接拒绝语义。 */
@@ -34,6 +36,20 @@ final class NioWorkspaceDirectoryAdapterTest {
         assertEquals(project.toRealPath(), verified.root());
         assertEquals(WorkspaceDirectory.Kind.PROJECT, verified.kind());
         assertFalse(adapter.isGeneralDirectory(verified.root()));
+    }
+
+    /** Windows 命名空间路径可能同时携带 8.3 别名；允许词法别名但仍返回唯一物理根。 */
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    void acceptsWindowsPathAliasForExistingProjectDirectory() throws IOException {
+        Path data = Files.createDirectory(temporaryDirectory.resolve("alias-data"));
+        Path project = Files.createDirectory(temporaryDirectory.resolve("alias-project"));
+        Path namespaced = Path.of("\\\\?\\" + project.toAbsolutePath());
+        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data);
+
+        WorkspaceDirectory verified = adapter.verifyProjectDirectory(namespaced);
+
+        assertEquals(project.toRealPath(), verified.root());
     }
 
     /** 通用目录只能由 Java 在固定 data/general-workspace 位置创建并标记。 */

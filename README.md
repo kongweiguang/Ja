@@ -132,7 +132,7 @@ Ja 会发现以下 Skill 来源：
 
 ### 1. 安装并启动
 
-从 [GitHub Releases](https://github.com/kongweiguang/ja/releases) 选择当前版本实际提供的安装包。仓库已配置 Windows NSIS（`.exe`）与 macOS DMG（`.dmg`）目标，但不要把未签名 CI 冒烟产物当作正式安装包。
+从 [GitHub Releases](https://github.com/kongweiguang/ja/releases) 选择当前版本实际提供的 Windows NSIS（`.exe`）或 macOS DMG（`.dmg`）。Ja 不使用系统代码签名证书，Windows 可能显示 SmartScreen 提示，macOS 可能要求在“隐私与安全性”中批准打开；应用更新仍验证独立的 Tauri 更新签名。普通 CI 冒烟产物不代表已发布版本，请使用 Release 中的完整产物和校验和。
 
 Ja 首次启动会在当前用户目录创建 `~/.ja`，不要求注册 Ja 账号。
 

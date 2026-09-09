@@ -1,11 +1,10 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Record hashes and unsigned status for one real Tauri bundle directory.
+"""记录真实安装包摘要，并区分无系统证书与独立的 Tauri 更新签名。
 
-This is an evidence adapter, not a release publisher.  It enumerates actual bundle files after
-Tauri finishes, records the explicit ``--no-sign`` contract, and marks notarization as not run so
-an unsigned CI smoke cannot be mistaken for a release acceptance gate.
+普通 CI smoke 不生成更新签名；发布候选必须包含更新签名产物，其密码学验证由聚合器完成。
+两条路径均不声明 Authenticode、Developer ID 或公证已通过。
 """
 
 from __future__ import annotations
@@ -93,16 +92,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--sidecar-manifest", required=True, type=Path)
-    parser.add_argument("--no-sign", action="store_true")
+    signing = parser.add_mutually_exclusive_group(required=True)
+    signing.add_argument("--no-sign", action="store_true")
+    signing.add_argument("--updater-signed", action="store_true")
     return parser.parse_args()
 
 
+def updater_signature_evidence(bundle_dir: Path, platform: str) -> dict[str, Any]:
+    """只记录实际同名更新产物与签名；验签留给持有固定公钥的发布聚合器。"""
+
+    root = bundle_dir if platform == "windows" else bundle_dir.parent / "macos"
+    suffix = "*.exe.sig" if platform == "windows" else "*.app.tar.gz.sig"
+    signatures = list(root.glob(suffix))
+    if len(signatures) != 1:
+        raise RuntimeError("expected exactly one updater signature for the target")
+    signature = signatures[0]
+    artifact = signature.with_suffix("")
+    return {
+        "status": "pending-aggregate-verification",
+        "artifact": artifact_entry(artifact),
+        "signature": artifact_entry(signature),
+    }
+
+
 def main() -> int:
-    """Enumerate actual bundles, write checksums, and preserve explicit unsigned/notarization facts."""
+    """枚举实际产物和更新签名，保持系统签名、公证与更新验签的证据边界。"""
 
     args = parse_args()
-    if not args.no_sign:
-        raise SystemExit("--no-sign is required for this non-release bundle smoke")
     if not EXTENSION_PATTERN.fullmatch(args.extension):
         raise SystemExit("bundle extension is unsafe")
     try:
@@ -116,10 +132,14 @@ def main() -> int:
         if not artifacts:
             raise RuntimeError(f"no {args.extension} bundle was produced")
         sidecar = load_sidecar_manifest(args.sidecar_manifest, args.source_commit)
+        updater = (updater_signature_evidence(args.bundle_dir, args.platform)
+                   if args.updater_signed else {"status": "not-generated"})
     except (OSError, RuntimeError) as failure:
         raise SystemExit(f"cannot collect Tauri bundle evidence: {failure}") from failure
 
-    command = f"pnpm exec tauri build --ci --no-sign --bundles {args.bundle}"
+    signing_argument = " --no-sign" if args.no_sign else ""
+    build_bundles = "app,dmg" if args.updater_signed and args.platform == "macos" else args.bundle
+    command = f"pnpm exec tauri build --ci{signing_argument} --bundles {build_bundles}"
     report = {
         "schemaVersion": 1,
         "product": "Ja",
@@ -127,11 +147,12 @@ def main() -> int:
         "target": {"platform": args.platform, "arch": args.arch, "bundle": args.bundle},
         "build": {
             "command": command,
-            "noSign": True,
+            "noSign": args.no_sign,
             "signingStatus": "unsigned",
             "notarizationStatus": "not-run",
-            "notarizationSkippedReason": "CI bundle smoke is explicitly unsigned and is not a release gate",
+            "notarizationSkippedReason": "Ja distributes without OS signing certificates",
         },
+        "updater": updater,
         "sidecar": sidecar,
         "artifacts": artifacts,
     }

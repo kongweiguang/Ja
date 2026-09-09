@@ -59,9 +59,6 @@ public final class NioWorkspaceDirectoryAdapter implements WorkspaceDirectoryPor
         try {
             Files.createDirectories(dataDirectory);
             Path physicalData = canonicalDirectory(dataDirectory);
-            if (!physicalData.equals(dataDirectory)) {
-                throw confinement("data directory identity changed");
-            }
             Files.createDirectories(generalDirectory);
             Path physicalGeneral = canonicalDirectory(generalDirectory);
             if (!physicalData.equals(physicalGeneral.getParent())) {
@@ -84,7 +81,8 @@ public final class NioWorkspaceDirectoryAdapter implements WorkspaceDirectoryPor
     }
 
     /**
-     * 验证目标是普通物理目录且跟随链接前后身份一致。
+     * 验证目标是普通物理目录且跟随链接前后身份一致；词法路径可使用 Windows
+     * 8.3、大小写或命名空间别名，因此不能与 real path 做字符串相等比较。
      */
     private static Path canonicalDirectory(Path lexical) throws IOException {
         if (Files.isSymbolicLink(lexical)) {
@@ -95,11 +93,7 @@ public final class NioWorkspaceDirectoryAdapter implements WorkspaceDirectoryPor
                     "workspace directory is unavailable");
         }
         rejectLinkOrReparse(lexical);
-        Path physical = lexical.toRealPath();
-        if (!physical.equals(lexical)) {
-            throw confinement("workspace root is linked");
-        }
-        return physical;
+        return lexical.toRealPath();
     }
 
     /**

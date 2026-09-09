@@ -93,7 +93,7 @@ final class ShellToolTest {
         assertNotNull(presentation.artifactId());
     }
 
-    /** 用无需符号链接特权的 junction 复现 JVM/原生路径策略分歧，最终候选必须能执行 Tool。 */
+    /** 用 junction 复现路径策略分歧；20 秒仅给功能探测的系统 Shell 冷启动，超时语义由独立用例验证。 */
     @Test
     void windowsAppsAliasFallsBackToExecutableShell() throws Exception {
         Path aliases = temp.resolve("aliases");
@@ -113,7 +113,7 @@ final class ShellToolTest {
         oldProbe.environment().putAll(alias.environment());
         Process acceptedByJvm = oldProbe.start();
         try {
-            assertTrue(acceptedByJvm.waitFor(5, TimeUnit.SECONDS));
+            assertTrue(acceptedByJvm.waitFor(20, TimeUnit.SECONDS));
             assertEquals(0, acceptedByJvm.exitValue());
         } finally {
             if (acceptedByJvm.isAlive()) acceptedByJvm.destroyForcibly();
@@ -132,7 +132,7 @@ final class ShellToolTest {
         assertEquals(ShellProfile.Dialect.WINDOWS_POWERSHELL, profile.dialect());
 
         AgentTool.ToolResult result = execute(profile,
-                invocation("Write-Output 'shell-preflight-execution-ok'", 5_000), CancellationToken.none());
+                invocation("Write-Output 'shell-preflight-execution-ok'", 20_000), CancellationToken.none());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome(), result.content());
         assertTrue(result.content().contains("shell-preflight-execution-ok"));
