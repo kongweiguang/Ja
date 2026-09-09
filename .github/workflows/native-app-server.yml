@@ -687,6 +687,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $env:JA_NATIVE_EVIDENCE 'release-sbom'
           $bundle = (Resolve-Path 'src-tauri/target/release/bundle/nsis').Path
+          # 无 target 的离线 metadata 覆盖全部平台依赖，先按 lock 补齐 registry 缓存。
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo SBOM dependency preparation failed' }
           pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
             -RepositoryRoot $PWD.Path `
             -OutputDirectory $output `
@@ -708,6 +711,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $env:JA_NATIVE_EVIDENCE 'release-sbom'
           $bundle = (Resolve-Path 'src-tauri/target/release/bundle/dmg').Path
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo SBOM dependency preparation failed' }
           pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
             -RepositoryRoot $PWD.Path `
             -OutputDirectory $output `
@@ -728,9 +733,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if (Test-Path -LiteralPath $env:JA_NATIVE_EVIDENCE) {
-            $matches = Get-ChildItem -LiteralPath $env:JA_NATIVE_EVIDENCE -File -Recurse |
-              Select-String -Pattern 'api[_ -]?key|bearer|sk-[a-z0-9]|github_token'
-            if ($null -ne $matches) { throw 'native evidence contains a credential marker' }
+            python -B scripts/release/check-evidence-secrets.py $env:JA_NATIVE_EVIDENCE
+            if ($LASTEXITCODE -ne 0) { throw 'native evidence contains a credential value' }
           }
 
       - name: Reject secret markers in bounded evidence (macOS)
@@ -738,9 +742,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d "$JA_NATIVE_EVIDENCE" ] && grep -Eiq 'api[_ -]?key|bearer|sk-[a-z0-9]|github_token' "$JA_NATIVE_EVIDENCE"; then
-            echo 'native evidence contains a credential marker' >&2
-            exit 1
+          if [ -d "$JA_NATIVE_EVIDENCE" ]; then
+            python3 -B scripts/release/check-evidence-secrets.py "$JA_NATIVE_EVIDENCE"
           fi
 
       - name: Publish build summary (Windows)
