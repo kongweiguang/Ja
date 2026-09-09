@@ -137,17 +137,23 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tests/contract/run.ps1
 
-      - name: Run the full JVM verification and build the Rust test fixture
+      # Jazzer 会在进程内安装全局 instrumentation；FFM/Win32 用例必须使用未插桩 JVM。
+      # 两个 fuzz 方法由紧随其后的独立 Maven/JVM 步骤执行，仍是必需门禁。
+      - name: Run JVM verification and build the Rust test fixture
         shell: pwsh
-        run: mvn.cmd -B -ntp -f app-server/pom.xml verify
+        run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=!ProviderInputFuzzTest" verify
 
       - name: Fuzz Provider Retry-After parsing
         shell: pwsh
-        run: mvn.cmd -B -ntp -f app-server/pom.xml -Djazzer.fuzz=true "-Dtest=ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget" test
+        env:
+          JAZZER_FUZZ: "1"
+        run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget" test
 
       - name: Fuzz strict Provider SSE parsing
         shell: pwsh
-        run: mvn.cmd -B -ntp -f app-server/pom.xml -Djazzer.fuzz=true "-Dtest=ProviderInputFuzzTest#strictSseReaderFailsClosedForArbitraryBytes" test
+        env:
+          JAZZER_FUZZ: "1"
+        run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=ProviderInputFuzzTest#strictSseReaderFailsClosedForArbitraryBytes" test
 
       - name: Run frontend type, lint, test, and build gates
         shell: pwsh

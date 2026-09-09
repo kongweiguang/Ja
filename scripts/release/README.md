@@ -10,6 +10,8 @@ Ja 沿用 Kerminal/GMark 的分发策略：不要求 Windows Authenticode 或 ma
 - `pull_request`、`main` 和普通手工运行：只构建 unsigned Native/NSIS/DMG smoke，不需要签名凭据，也不能作为发布证据。
 - 手工 `release=true`：使用 Tauri 更新签名构建 Windows x64 NSIS、macOS Intel/Apple Silicon DMG 和更新归档，继续执行 Native、安装 smoke 与供应链门禁，不要求系统证书。
 
+JVM 常规验证与 Jazzer fuzz 使用独立 Maven/JVM 调用：常规 `verify` 排除 `ProviderInputFuzzTest`，紧随其后的两个必需 fuzz 步骤分别执行该类的全部两个方法，防止全局插桩状态传播到后续 FFM/Win32 测试。任何一步失败均阻止原生构建。
+
 正式路径只接受 GitHub Secrets，不接受命令行参数、仓库文件或普通环境变量中的私钥：
 
 桌面更新签名：`TAURI_SIGNING_PRIVATE_KEY`，以及密钥设有密码时所需的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥必须与应用内置 updater 公钥匹配，不得为通过构建而临时替换。

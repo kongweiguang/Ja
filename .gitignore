@@ -49,6 +49,7 @@ src-tauri/target/
 app-server/target/
 app-server/build/
 app-server/native-image/
+app-server/.cifuzz-corpus/
 .native-image/
 *.class
 
