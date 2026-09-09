@@ -16,7 +16,7 @@ final class ConfigurationSecretReplacementTest {
     /** 清空最后一个凭据仍是安全原子替换，成功后不能遗留回滚链接或临时明文。 */
     @Test
     void replacesExistingSecretWithEmptyDocument(@TempDir Path root) throws Exception {
-        Path auth = root.resolve("auth.json");
+        Path auth = root.toRealPath().resolve("auth.json");
         ConfigurationStore.writeAtomic(auth, "{\"cred_fixture\":\"fixture-only\"}".getBytes(StandardCharsets.UTF_8), true);
         byte[] empty = "{}".getBytes(StandardCharsets.UTF_8);
         ConfigurationStore.writeAtomic(auth, empty, true);
