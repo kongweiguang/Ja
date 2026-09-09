@@ -9,6 +9,9 @@ import java.util.Objects;
 /** 自动、溢出恢复与手动压缩共享的 Thread 级生命周期事实。 */
 public sealed interface ContextCompactionEvent permits ContextCompactionEvent.Started,
         ContextCompactionEvent.Compacted, ContextCompactionEvent.Failed {
+    /** 首版策略标识由事件不变量唯一拥有，生产者与消费者不得各自维护版本常量。 */
+    String STRATEGY_VERSION = "ja-context-v1";
+
     /** 返回三类通知共享且不可变的关联字段。 */
     Context context();
 
@@ -37,7 +40,7 @@ public sealed interface ContextCompactionEvent permits ContextCompactionEvent.St
     record Failed(Context context, ErrorCode errorCode) implements ContextCompactionEvent {
         /** 失败允许发生在首次计量前，因此 before 可空；after 必须为空。 */
         public Failed {
-            requirePhase(Objects.requireNonNull(context, "context"), false, false);
+            requireFailurePhase(Objects.requireNonNull(context, "context"));
             Objects.requireNonNull(errorCode, "errorCode");
         }
     }
@@ -61,7 +64,7 @@ public sealed interface ContextCompactionEvent permits ContextCompactionEvent.St
                 || inputTokensAfter != null && inputTokensAfter < 0) {
                 throw new IllegalArgumentException("invalid context compaction counters");
             }
-            if (!"ja-context-v3".equals(strategyVersion)) {
+            if (!STRATEGY_VERSION.equals(strategyVersion)) {
                 throw new IllegalArgumentException("invalid context compaction strategy");
             }
         }
@@ -85,8 +88,6 @@ public sealed interface ContextCompactionEvent permits ContextCompactionEvent.St
         CONFLICT,
         /** Thread 仍有活动 Turn。 */
         THREAD_BUSY,
-        /** Provider 未返回官方 Token 计量。 */
-        TOKEN_COUNT_UNAVAILABLE,
         /** 摘要模型未产生可提交结果。 */
         SUMMARY_FAILURE,
         /** 压缩后仍无法满足上下文预算。 */
@@ -102,6 +103,16 @@ public sealed interface ContextCompactionEvent permits ContextCompactionEvent.St
         if (beforeRequired != (context.inputTokensBefore() != null)
             || afterRequired != (context.inputTokensAfter() != null)) {
             throw new IllegalArgumentException("invalid context compaction phase tokens");
+        }
+    }
+
+    /**
+     * 失败既可能发生在首次计量前，也可能发生在 started 之后；因此保留可选 before 证据，
+     * 但禁止只有 Checkpoint 提交成功后才成立的 after 计量越过失败终态。
+     */
+    private static void requireFailurePhase(Context context) {
+        if (context.inputTokensAfter() != null) {
+            throw new IllegalArgumentException("invalid context compaction failure tokens");
         }
     }
 

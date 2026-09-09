@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.conversation.application.context.summary;
 import io.github.kongweiguang.ja.conversation.application.context.ContextMessage;
 import io.github.kongweiguang.ja.conversation.application.context.ContextPolicy;
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointUsage;
+import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 
 import java.util.List;
@@ -21,6 +22,16 @@ public interface SummaryGenerator {
      * 根据淘汰前缀和既有摘要生成结构化增量；实现必须遵守取消与容量边界。
      */
     SummaryResult generate(SummaryRequest request);
+
+    /** Summary Operation 内部提交会推进 Thread revision；checkpoint 必须绑定推进后的同一快照。 */
+    default long checkpointSourceRevision(long originalRevision) {
+        return originalRevision;
+    }
+
+    /** 自动 Turn 压缩提供最终原子提交参数；手动压缩保持空值。 */
+    default Optional<CheckpointStore.TurnOperation> checkpointTurnOperation() {
+        return Optional.empty();
+    }
 
     /**
      * 将结构化摘要与本次模型用量绑定，便于同一 Checkpoint 原子保存审计证据。

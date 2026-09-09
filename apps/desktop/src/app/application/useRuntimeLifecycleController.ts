@@ -38,7 +38,8 @@ export interface RuntimeStateController {
   readonly turnAdmissionReady: boolean;
   readonly runtimeState: RuntimeStatus | undefined;
   readonly recovery: RuntimeRecoveryState | undefined;
-  readonly lastEvent: RuntimeHostEvent | undefined;
+  /** 只发布 Settings 真正消费的配置失效事件，避免流式 Turn 事件让整个应用壳重渲染。 */
+  readonly lastConfigurationEvent: RuntimeHostEvent | undefined;
   /**
    * 标题事件拥有独立投影，避免紧随其后的 Turn/流式事件在 React 批处理中覆盖唯一刷新信号。
    */
@@ -179,7 +180,7 @@ export function useRuntimeLifecycleController(
   const [turnAdmissionReady, setTurnAdmissionReady] = useState(false);
   const [runtimeState, setRuntimeState] = useState<RuntimeStatus>();
   const [recovery, setRecovery] = useState<RuntimeRecoveryState>();
-  const [lastEvent, setLastEvent] = useState<RuntimeHostEvent>();
+  const [lastConfigurationEvent, setLastConfigurationEvent] = useState<RuntimeHostEvent>();
   const [lastThreadMetadataEvent, setLastThreadMetadataEvent] =
     useState<RuntimeThreadMetadataEvent>();
 
@@ -500,14 +501,17 @@ export function useRuntimeLifecycleController(
   }, [commitStatus, enqueueOperation, isCurrentOperation, revokeTurnGate, runtime, updateBoot]);
 
   /**
-   * 将 settings query 与 lifecycle operation 串行化，并在 Ready generation 变化时拒绝。
-   * 这样无需在 frontend 创建第二个 RPC registry，也能阻止旧 MCP/Skills projection
-   * 在 sidecar reconfigure 后写入。
+   * 将目录 query 与 lifecycle operation 串行化，并在 Ready/Busy generation 变化时拒绝。
+   * Busy 期间仍需支持排队消息的 @/$，但任何重启或 reconfigure 都会让旧结果失败关闭。
    */
   const queryRuntime: RuntimeQuery = useCallback(
     <M extends RuntimeSettingsMethod>(method: M, params: RuntimeSettingsParams<M>) => {
       const generation = runtimeStateRef.current?.generation;
-      if (generation === undefined || generation <= 0 || bootRef.current.status !== "ready") {
+      if (
+        generation === undefined ||
+        generation <= 0 ||
+        (bootRef.current.status !== "ready" && bootRef.current.status !== "busy")
+      ) {
         return Promise.reject(
           new RuntimeHostError("RUNTIME_NOT_READY", "运行时尚未完成配置", true),
         );
@@ -521,7 +525,7 @@ export function useRuntimeLifecycleController(
         .then((result) => {
           if (
             runtimeStateRef.current?.generation !== generation ||
-            bootRef.current.status !== "ready"
+            (bootRef.current.status !== "ready" && bootRef.current.status !== "busy")
           ) {
             throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
           }
@@ -634,7 +638,6 @@ export function useRuntimeLifecycleController(
         ) {
           return;
         }
-        setLastEvent(event);
         updateRuntimeState(event.status);
         stateProjection(projection, event.status, event.eventId, event.occurredAt, event.reason);
         updateBoot(bootForStatus(event.status));
@@ -656,12 +659,14 @@ export function useRuntimeLifecycleController(
         return;
       }
 
-      // metadata 不能只借用 lastEvent 槽位：admission 后会立即继续发布 Turn 事件，React 可能
+      // metadata 与配置失效分别拥有窄槽位：admission 后会立即继续发布 Turn 事件，React 可能
       // 合并同一批更新；独立保留最近标题 identity 才能保证侧栏、标题栏和搜索都至少消费一次。
       if (event.kind === "timeline" && event.event.method === "thread/metadata-changed") {
         setLastThreadMetadataEvent(event.event);
       }
-      setLastEvent(event);
+      if (event.kind === "timeline" && event.event.method === "configuration/changed") {
+        setLastConfigurationEvent(event);
+      }
       if (applyTurnHostEvent(event)) {
         // completion 是外部通知；state query 必须入队，使显式 stop/start intent 始终胜过晚 completion。
         void refreshState(lifecycleEpoch).catch(() => undefined);
@@ -784,7 +789,7 @@ export function useRuntimeLifecycleController(
       turnAdmissionReady,
       runtimeState,
       recovery,
-      lastEvent,
+      lastConfigurationEvent,
       lastThreadMetadataEvent,
     },
     lifecycle: {

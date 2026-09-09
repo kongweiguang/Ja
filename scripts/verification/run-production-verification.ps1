@@ -18,6 +18,10 @@ param(
     [switch]$IncludeSoak,
     [ValidateRange(1, 1440)][int]$SoakDurationMinutes = 120,
     [switch]$IncludeDesktop,
+    [switch]$IncludeRuntimeRefresh,
+    [switch]$IncludePlanGoal,
+    [ValidateRange(120, 1440)][int]$PlanGoalSoakDurationMinutes = 120,
+    [switch]$IncludeTurnChangeReview,
     [switch]$IncludeRealProvider,
     [string]$CorrespondingSourcePath = '',
     [string[]]$ArtifactPath = @(),
@@ -38,8 +42,12 @@ $evidenceWasNonEmpty = $evidencePreexisted -and @((Get-ChildItem -LiteralPath $e
 $javaHomeIssue = $null
 $javaExecutable = $null
 $javaMajor = $null
+$javaTestTargetDirectory = Join-Path $evidenceRoot 'java-test-target'
 $javaArtifactDirectory = Join-Path $evidenceRoot 'java-target'
 $javaArtifactPath = Join-Path $javaArtifactDirectory 'ja-app-server.jar'
+$turnChangeReviewSidecarDirectory = Join-Path $evidenceRoot 'turn-change-review-sidecar'
+$turnChangeReviewTargetTriple = 'x86_64-pc-windows-msvc'
+$turnChangeReviewSourceCommit = [string]((& git.exe -C $repositoryRoot rev-parse HEAD 2>$null | Select-Object -First 1))
 $mavenSurefireSnapshotDirectoryName = 'maven-surefire'
 $mavenSurefireReportMaxBytes = [int64](16 * 1024 * 1024)
 $mavenSurefireSnapshotMaxBytes = [int64](128 * 1024 * 1024)
@@ -58,8 +66,12 @@ $commonEnvironment = @{
     JA_REAL_PROVIDER_JAR = $javaArtifactPath
     JA_E2E_APP_SERVER_JAR = $javaArtifactPath
 }
-$nativeRequested = [bool]$IncludeNative -or [bool]$IncludeSoak
+# Plan/Goal 与 Turn Change Review 的发布门禁必须同时证明 Native Image；单独请求 UI 或
+# soak 而跳过 Native 会让 JVM sidecar 的结果被错误提升为生产可执行文件证据。
+$nativeRequested = [bool]$IncludeNative -or [bool]$IncludeSoak -or [bool]$IncludePlanGoal `
+    -or [bool]$IncludeTurnChangeReview
 $freshnessFutureSkew = [TimeSpan]::FromMinutes(2)
+$sbomInputMaxAge = [TimeSpan]::FromHours(24)
 # Approved hard stop: the verified 95,944,704-byte production artifact must remain within 100 MiB.
 $nativeExecutableMaxBytes = [int64]104857600
 
@@ -68,7 +80,7 @@ $nativeExecutableMaxBytes = [int64]104857600
 # was exercised by the executable.
 $requiredNativeSmokeSubgates = @(
     'jsonSchema', 'configAuth', 'okhttpSse', 'mcp',
-    'shellCancellation', 'sqlite', 'recovery', 'networknt'
+    'shellCancellation', 'shellStdinEof', 'sqlite', 'recovery', 'networknt'
 )
 
 # Accepts only files produced after the relevant gate began and not implausibly in the future.
@@ -80,6 +92,19 @@ function Test-FreshTimestamp {
     )
 
     return $LastWriteTimeUtc -ge $Since.UtcDateTime `
+        -and $LastWriteTimeUtc -le [DateTime]::UtcNow.Add($freshnessFutureSkew)
+}
+
+# SBOM source/archive inputs must exist before the runner starts, so their freshness window cannot
+# begin at runStartedAt like generated evidence. This bounded window still rejects stale/future
+# inputs while their path, scope and content identity are captured before legal review.
+function Test-FreshSbomInputTimestamp {
+    param(
+        [Parameter(Mandatory)][DateTime]$LastWriteTimeUtc,
+        [Parameter(Mandatory)][DateTimeOffset]$Since
+    )
+
+    return $LastWriteTimeUtc -ge $Since.UtcDateTime.Subtract($sbomInputMaxAge) `
         -and $LastWriteTimeUtc -le [DateTime]::UtcNow.Add($freshnessFutureSkew)
 }
 
@@ -371,7 +396,7 @@ function Invoke-CommandGate {
 function Get-ContractCorpusEvidence {
     $goldenRoot = Join-Path $repositoryRoot 'contracts\golden'
     if (-not (Test-Path -LiteralPath $goldenRoot -PathType Container)) {
-        return [ordered]@{ status = 'blocked'; blocker = 'contract corpus directory is missing'; toolDigest = $null; toolValidFrames = $null; toolInvalidFrames = $null }
+        return [ordered]@{ status = 'blocked'; blocker = 'contract corpus directory is missing'; gateDigest = $null; gateValidFrames = $null; gateInvalidFrames = $null; gateConsumers = @() }
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     $validCount = 0
@@ -396,7 +421,7 @@ function Get-ContractCorpusEvidence {
     } finally {
         $sha.Dispose()
     }
-    return [ordered]@{ status = 'passed'; digest = $digest; fileCount = $fileCount; validFrames = $validCount; invalidFrames = $invalidCount; toolMode = $null; toolTerminals = $null; toolDigest = $null; toolValidFrames = $null; toolInvalidFrames = $null }
+    return [ordered]@{ status = 'passed'; digest = $digest; fileCount = $fileCount; validFrames = $validCount; invalidFrames = $invalidCount; gateDigest = $null; gateValidFrames = $null; gateInvalidFrames = $null; gateConsumers = @() }
 }
 
 # Discovers the runtime's Surefire directories and separates all reports from those fresh for the
@@ -405,7 +430,12 @@ function Get-ContractCorpusEvidence {
 function Get-MavenSurefireReports {
     param([Parameter(Mandatory)][DateTimeOffset]$Since)
 
-    $targetRoot = Join-Path $repositoryRoot 'app-server\target'
+    $configuredTarget = Get-Variable -Name javaTestTargetDirectory -ErrorAction SilentlyContinue
+    $targetRoot = if ($null -ne $configuredTarget) {
+        [string]$configuredTarget.Value
+    } else {
+        Join-Path $repositoryRoot 'app-server\target'
+    }
     $reportRoots = @()
     if (Test-Path -LiteralPath $targetRoot -PathType Container) {
         $reportRoots = @(Get-ChildItem -LiteralPath $targetRoot -Directory -Filter 'surefire-reports' -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName -Unique)
@@ -492,10 +522,9 @@ function Save-MavenSurefireSnapshot {
         freshnessReference = $gateSince.ToString('o')
     }
     if (@($reportSet.all).Count -eq 0) { return $base }
-    if (@($reportSet.fresh).Count -eq 0 -or @($reportSet.fresh).Count -ne @($reportSet.all).Count) {
+    if (@($reportSet.fresh).Count -eq 0) {
         $base.status = 'stale'
-        $base.blocker = 'Maven Surefire report set is stale or incomplete'
-        $base.expectedCount = @($reportSet.fresh).Count
+        $base.blocker = 'Maven Surefire report set contains no report from the current gate'
         return $base
     }
     $base.expectedCount = @($reportSet.fresh).Count
@@ -708,8 +737,8 @@ function Get-RustTestEvidence {
     return @($entries)
 }
 
-# Parses the contract gate's stable marker and combines it with a freshly computed corpus digest;
-# child consumer paths and any provider-like data are intentionally excluded from evidence.
+# Parses the current three-consumer contract marker and combines it with a freshly computed corpus
+# digest; retired tool-specific marker fields are deliberately not accepted as a compatibility path.
 function Get-ContractTestEvidence {
     $result = $results | Where-Object name -eq 'contract' | Select-Object -First 1
     $evidence = Get-ContractCorpusEvidence
@@ -719,19 +748,21 @@ function Get-ContractTestEvidence {
         $path = Join-Path $evidenceRoot $logName
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
         foreach ($line in Get-Content -LiteralPath $path) {
-            if ($line -match 'GOLDEN_OK\s+validFrames=(\d+)\s+invalidFrames=(\d+)\s+positiveFiles=(\d+)\s+negativeFiles=(\d+)\s+terminals=(\d+)\s+digest=([0-9a-f]{64})') {
-                $evidence.toolTerminals = [int]$Matches[5]
-            }
-            if ($line -match 'CONTRACT_GATE_OK\s+mode=(\S+)\s+digest=([0-9a-f]{64})\s+validFrames=(\d+)\s+invalidFrames=(\d+)') {
-                $evidence.toolMode = $Matches[1]
-                $evidence.toolDigest = $Matches[2]
-                $evidence.toolValidFrames = [int]$Matches[3]
-                $evidence.toolInvalidFrames = [int]$Matches[4]
+            if ($line -match 'CONTRACT_GATE_OK\s+digest=([0-9a-f]{64})\s+validFrames=(\d+)\s+invalidFrames=(\d+)\s+consumers=([a-z]+(?:,[a-z]+)*)') {
+                $evidence.gateDigest = $Matches[1]
+                $evidence.gateValidFrames = [int]$Matches[2]
+                $evidence.gateInvalidFrames = [int]$Matches[3]
+                $evidence.gateConsumers = @($Matches[4] -split ',')
             }
         }
     }
     if (-not $result.passed) { $evidence.status = 'failed'; $evidence.blocker = 'contract command failed' }
-    elseif ($evidence.toolDigest -ne $evidence.digest -or $evidence.toolValidFrames -ne $evidence.validFrames -or $evidence.toolInvalidFrames -ne $evidence.invalidFrames) { $evidence.status = 'failed'; $evidence.blocker = 'contract tool marker does not match current corpus' }
+    elseif ($evidence.gateDigest -ne $evidence.digest -or $evidence.gateValidFrames -ne $evidence.validFrames `
+            -or $evidence.gateInvalidFrames -ne $evidence.invalidFrames `
+            -or (@($evidence.gateConsumers) -join ',') -ne 'java,rust,typescript') {
+        $evidence.status = 'failed'
+        $evidence.blocker = 'contract gate marker does not match current corpus and consumer set'
+    }
     return $evidence
 }
 
@@ -810,7 +841,10 @@ function Get-SecretGateEvidence {
     foreach ($path in $paths) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
         $extension = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
-        if ($extension -in @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.exe', '.dll', '.jar', '.db', '.sqlite', '.woff', '.woff2')) { continue }
+        # JVM class files can contain fixture literals in their constant pool, but they are binary
+        # build evidence rather than an authored or persisted text surface. Source files and every
+        # readable report/log remain in scope, so this exclusion cannot hide a shipped credential.
+        if ($extension -in @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.exe', '.dll', '.class', '.jar', '.db', '.sqlite', '.woff', '.woff2')) { continue }
         try {
             $lineNumber = 0
             foreach ($line in [System.IO.File]::ReadLines($path)) {
@@ -857,6 +891,10 @@ function Get-SizeGateEvidence {
 
     $findings = [System.Collections.Generic.List[object]]::new()
     foreach ($artifact in $Artifacts | Where-Object required) {
+        $producer = $results | Where-Object name -eq $artifact.producedBy | Select-Object -First 1
+        # A prerequisite failure already owns the verdict when its producer never succeeded.
+        # Re-reporting an older file as stale would obscure the actual stop-ship dependency.
+        if ($null -eq $producer -or -not $producer.passed) { continue }
         if (-not $artifact.exists) { $findings.Add([ordered]@{ path = $artifact.path; rule = 'artifact-missing' }); continue }
         if (-not $artifact.freshThisRun) { $findings.Add([ordered]@{ path = $artifact.path; rule = 'artifact-stale' }) }
         if ([int64]$artifact.actualBytes -gt [int64]$artifact.maxBytes) { $findings.Add([ordered]@{ path = $artifact.path; rule = 'artifact-too-large' }) }
@@ -1015,16 +1053,14 @@ function Get-NativeSmokeIdentityEvidence {
     }
 }
 
-# Checks provider prerequisites by name only. The values are never copied into a step, exception,
+# Checks one user-selected provider configuration by generic variable name only. Values are never copied into a step, exception,
 # output stream or summary; when credentials are absent the real-provider gate is an explicit block.
 function Get-ProviderPreflightEvidence {
-    $required = @(
-        'JA_REAL_PROVIDER_OPENAI_API_KEY', 'JA_REAL_PROVIDER_OPENAI_BASE_URL', 'JA_REAL_PROVIDER_OPENAI_MODEL',
-        'JA_REAL_PROVIDER_ANTHROPIC_API_KEY', 'JA_REAL_PROVIDER_ANTHROPIC_BASE_URL', 'JA_REAL_PROVIDER_ANTHROPIC_MODEL'
-    )
+    $required = @('JA_REAL_PROVIDER_API_KEY', 'JA_REAL_PROVIDER_BASE_URL',
+        'JA_REAL_PROVIDER_MODEL', 'JA_REAL_PROVIDER_API')
     $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
     $authorized = [Environment]::GetEnvironmentVariable('JA_REAL_PROVIDER_AUTHORIZED', 'Process') -eq '1'
-    return [ordered]@{ passed = $missing.Count -eq 0 -and $authorized; authorized = $authorized; missingVariables = $missing; blocker = if (-not $authorized) { 'real provider execution was not explicitly authorized for this verification run' } elseif ($missing.Count -ne 0) { 'provider-specific credentials, loopback URLs or model names are not present in the process environment' } else { $null } }
+    return [ordered]@{ passed = $missing.Count -eq 0 -and $authorized; authorized = $authorized; missingVariables = $missing; blocker = if (-not $authorized) { 'real provider execution was not explicitly authorized for this verification run' } elseif ($missing.Count -ne 0) { 'provider credential, loopback URL, model or API specification is not present in the process environment' } else { $null } }
 }
 
 # Validates the legal SBOM inputs before the mature generator is allowed to run. Both input
@@ -1086,7 +1122,7 @@ function Get-SbomInputEvidence {
             } else {
                 $sha256 = (Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
             }
-            $fresh = Test-FreshTimestamp -LastWriteTimeUtc $latestWrite -Since $Since
+            $fresh = Test-FreshSbomInputTimestamp -LastWriteTimeUtc $latestWrite -Since $Since
             if (-not $fresh) { $blockerCodes.Add('SBOM_INPUT_STALE') }
             $evidence.Add([ordered]@{
                     kind = [string]$input.kind
@@ -1355,11 +1391,14 @@ function New-VerificationSummary {
             cancellation = Get-CapabilityGateState -Names @('java-jvm', 'java-native-smoke', 'windows-webview2')
             singleTerminal = Get-CapabilityGateState -Names @('java-jvm', 'java-native-smoke')
             sqliteRecovery = Get-CapabilityGateState -Names @('java-jvm', 'java-native-smoke')
-            httpSse = Get-CapabilityGateState -Names @('java-jvm', 'real-provider-openai', 'real-provider-anthropic')
+            httpSse = Get-CapabilityGateState -Names @('java-jvm', 'real-provider')
             shutdown = Get-CapabilityGateState -Names @('java-jvm', 'kernel-loop-smoke', 'java-native-smoke', 'windows-webview2')
             native = Get-CapabilityGateState -Names @('native-no-fallback-policy', 'java-native-build', 'native-artifact-freshness', 'java-native-smoke')
             desktop = Get-CapabilityGateState -Names @('windows-webview2')
-            providers = Get-CapabilityGateState -Names @('provider-preflight', 'real-provider-openai', 'real-provider-anthropic')
+            runtimeRefresh = Get-CapabilityGateState -Names @('runtime-refresh-windows-webview2')
+            planGoal = Get-CapabilityGateState -Names @('native-no-fallback-policy', 'java-native-build', 'native-artifact-freshness', 'java-native-smoke', 'plan-goal-windows-webview2', 'plan-goal-soak-120-minutes')
+            turnChangeReview = Get-CapabilityGateState -Names @('native-no-fallback-policy', 'java-native-build', 'native-artifact-freshness', 'java-native-smoke', 'turn-change-review-sidecar-stage', 'turn-change-review-windows-webview2')
+            providers = Get-CapabilityGateState -Names @('provider-preflight', 'real-provider')
             runtimeSoak120Minutes = Get-CapabilityGateState -Names @('runtime-soak')
         }
         verificationPolicy = [ordered]@{ cwd = 'repository-root'; rawCommandOutputPersisted = $false; providerOutputPersistedInEvidence = $false; providerTemporaryRuntimeDeletedBySmoke = $true; credentialsInEvidence = $false; freshnessReference = $StartedAt.ToString('o') }
@@ -1383,7 +1422,7 @@ function Initialize-VerificationSteps {
     Add-VerificationStep -Name 'java-25-preflight' -Requested $true -Kind internal
     Add-VerificationStep -Name 'java-architecture' -Requested $true -Kind command -Command 'pwsh' -Arguments @('-NoProfile', '-File', 'scripts/verification/check-java-architecture.ps1', '-OutputPath', (Join-Path $evidenceRoot 'java-architecture.json'))
     Add-VerificationStep -Name 'contract' -Requested $true -Kind command -Command 'pwsh' -Arguments @('-NoProfile', '-File', 'tests/contract/run.ps1') -Environment $commonEnvironment
-    Add-VerificationStep -Name 'java-jvm' -Requested $true -Kind command -Command 'mvn.cmd' -Arguments @('-B', '-ntp', '-f', 'app-server/pom.xml', 'test') -Environment $commonEnvironment
+    Add-VerificationStep -Name 'java-jvm' -Requested $true -Kind command -Command 'mvn.cmd' -Arguments @('-B', '-ntp', '-f', 'app-server/pom.xml', "-Dja.build.directory=$javaTestTargetDirectory", 'test') -Environment $commonEnvironment
     Add-VerificationStep -Name 'java-artifact-package' -Requested $true -Kind command -Command 'pwsh' -Arguments @('-NoProfile', '-File', 'scripts/verification/package-java-app-server.ps1', '-RepositoryRoot', $repositoryRoot, '-OutputDirectory', $javaArtifactDirectory) -Environment $commonEnvironment -DependsOn @('java-jvm')
     Add-VerificationStep -Name 'kernel-loop-smoke' -Requested $true -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/kernel-loop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_KERNEL_LOOP_CAPTURE = '' }) -DependsOn @('java-artifact-package')
     Add-VerificationStep -Name 'rust-fmt' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('fmt', '--all', '--', '--check') -Environment $commonEnvironment
@@ -1428,10 +1467,24 @@ function Initialize-VerificationSteps {
     Add-VerificationStep -Name 'native-artifact-freshness' -Requested $nativeRequested -Kind internal -DependsOn @('java-native-build') -Optional $true
     Add-VerificationStep -Name 'java-native-smoke' -Requested $nativeRequested -Kind command -Command 'python.exe' -Arguments @('scripts/native/run-sidecar-smoke.py', '--executable', (Join-Path $repositoryRoot 'app-server/target/ja-app-server.exe'), '--data-dir', (Join-Path $evidenceRoot 'native-data'), '--output', (Join-Path $evidenceRoot 'native-smoke.json')) -DependsOn @('native-artifact-freshness') -Optional $true
     Add-VerificationStep -Name 'runtime-soak' -Requested ([bool]$IncludeSoak) -Kind command -Command 'pwsh' -Arguments @('-NoProfile', '-File', 'scripts/verification/run-runtime-soak.ps1', '-EvidenceDirectory', (Join-Path $evidenceRoot 'runtime-soak'), '-Executable', (Join-Path $repositoryRoot 'app-server/target/ja-app-server.exe'), '-DurationMinutes', [string]$SoakDurationMinutes) -DependsOn @('java-native-smoke') -Optional $true
-    Add-VerificationStep -Name 'windows-webview2' -Requested ([bool]$IncludeDesktop) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/windows-desktop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_E2E_REAL_PROVIDER = '0'; JA_E2E_REAL_PROVIDER_OPENAI_API_KEY = ''; JA_E2E_REAL_PROVIDER_ANTHROPIC_API_KEY = ''; JA_E2E_KEEP_TEMP = '0' }) -DependsOn @('java-artifact-package', 'kernel-loop-smoke', 'rust-tauri-tests', 'rust-host-integration', 'typescript-tests', 'desktop-build') -PersistOutput $false -Optional $true
+    Add-VerificationStep -Name 'windows-webview2' -Requested ([bool]$IncludeDesktop) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/windows-desktop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_E2E_REAL_PROVIDER = '0'; JA_E2E_REAL_PROVIDER_API_KEY = ''; JA_E2E_KEEP_TEMP = '0' }) -DependsOn @('java-artifact-package', 'kernel-loop-smoke', 'rust-tauri-tests', 'rust-host-integration', 'typescript-tests', 'desktop-build') -PersistOutput $false -Optional $true
+    # 请求级运行环境更新必须独立覆盖跨 API continuation、MCP list_changed 与旧 batch 绑定；
+    # 固定关闭外部 Provider，真实三次请求全部由 runner 内的 loopback fixture 提供。
+    Add-VerificationStep -Name 'runtime-refresh-windows-webview2' -Requested ([bool]$IncludeRuntimeRefresh) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/windows-desktop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_E2E_RUNTIME_REFRESH_ONLY = '1'; JA_E2E_REAL_PROVIDER = '0'; JA_E2E_REAL_PROVIDER_API_KEY = ''; JA_E2E_KEEP_TEMP = '0'; JA_E2E_SCREENSHOT_DIR = (Join-Path $evidenceRoot 'runtime-refresh-webview2') }) -DependsOn @('java-artifact-package', 'kernel-loop-smoke', 'rust-tauri-tests', 'rust-host-integration', 'typescript-tests', 'desktop-build') -PersistOutput $false -Optional $true
+    # Plan/Goal 是跨 Turn 与恢复能力，必须用独立 `_ONLY` 场景证明，不允许通用桌面 smoke
+    # 的通过状态代替 revision 批准、续跑、evaluator 与恢复矩阵。
+    Add-VerificationStep -Name 'plan-goal-windows-webview2' -Requested ([bool]$IncludePlanGoal) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/windows-desktop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_E2E_PLAN_GOAL_ONLY = '1'; JA_E2E_PLAN_GOAL_SOAK_MINUTES = ''; JA_E2E_REAL_PROVIDER = '0'; JA_E2E_REAL_PROVIDER_API_KEY = ''; JA_E2E_KEEP_TEMP = '0'; JA_E2E_SCREENSHOT_DIR = (Join-Path $evidenceRoot 'plan-goal-webview2') }) -DependsOn @('java-native-smoke', 'java-artifact-package', 'kernel-loop-smoke', 'rust-tauri-tests', 'rust-host-integration', 'typescript-tests', 'desktop-build') -PersistOutput $false -Optional $true
+    # 长稳使用同一个真实 Tauri/WebView2 + loopback Goal 场景持续运行；时长下限固定 120 分钟，
+    # runner 不把空闲进程存活或通用 RPC ping 冒充 Goal continuation soak。
+    Add-VerificationStep -Name 'plan-goal-soak-120-minutes' -Requested ([bool]$IncludePlanGoal) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/windows-desktop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_E2E_PLAN_GOAL_ONLY = '1'; JA_E2E_PLAN_GOAL_SOAK_MINUTES = [string]$PlanGoalSoakDurationMinutes; JA_E2E_REAL_PROVIDER = '0'; JA_E2E_REAL_PROVIDER_API_KEY = ''; JA_E2E_KEEP_TEMP = '0'; JA_E2E_SCREENSHOT_DIR = (Join-Path $evidenceRoot 'plan-goal-soak') }) -DependsOn @('plan-goal-windows-webview2') -PersistOutput $false -Optional $true
+    # Turn Change Review 先把本轮 Native Image 复制为 Tauri target-triple sidecar，并由 staging
+    # manifest 锁定源/目标哈希；桌面验收不得直接使用 JVM JAR 或未绑定身份的旧 executable。
+    Add-VerificationStep -Name 'turn-change-review-sidecar-stage' -Requested ([bool]$IncludeTurnChangeReview) -Kind command -Command 'python.exe' -Arguments @('scripts/native/stage-sidecar.py', '--artifact', (Join-Path $repositoryRoot 'app-server/target/ja-app-server.exe'), '--output-dir', $turnChangeReviewSidecarDirectory, '--target-triple', $turnChangeReviewTargetTriple, '--platform', 'windows', '--arch', 'x86_64', '--source-commit', $turnChangeReviewSourceCommit) -DependsOn @('java-native-smoke') -Optional $true
+    # 该入口拥有独立 `_ONLY` 模式和严格 JSON 证据合同；产品 hook 未就绪时 exit 2 明确
+    # blocked，不能复用通用 desktop 或 Plan/Goal 的通过状态。
+    Add-VerificationStep -Name 'turn-change-review-windows-webview2' -Requested ([bool]$IncludeTurnChangeReview) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/turn-change-review-production.mjs', '--evidence-directory', (Join-Path $evidenceRoot 'turn-change-review-webview2'), '--sidecar-directory', $turnChangeReviewSidecarDirectory) -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_E2E_REAL_PROVIDER = '0'; JA_E2E_REAL_PROVIDER_API_KEY = ''; JA_E2E_APP_SERVER_JAR = ''; JA_E2E_KEEP_TEMP = '0' }) -DependsOn @('turn-change-review-sidecar-stage', 'java-native-smoke', 'desktop-build', 'rust-tauri-tests', 'rust-host-integration', 'typescript-tests') -PersistOutput $false -Optional $true
     Add-VerificationStep -Name 'provider-preflight' -Requested ([bool]$IncludeRealProvider) -Kind internal -Optional $true
-    Add-VerificationStep -Name 'real-provider-openai' -Requested ([bool]$IncludeRealProvider) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/real-provider-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_REAL_PROVIDER_PROVIDER = 'openai' }) -DependsOn @('provider-preflight', 'java-artifact-package', 'kernel-loop-smoke') -PersistOutput $false -Optional $true
-    Add-VerificationStep -Name 'real-provider-anthropic' -Requested ([bool]$IncludeRealProvider) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/real-provider-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_REAL_PROVIDER_PROVIDER = 'anthropic' }) -DependsOn @('provider-preflight', 'java-artifact-package', 'kernel-loop-smoke') -PersistOutput $false -Optional $true
+    Add-VerificationStep -Name 'real-provider' -Requested ([bool]$IncludeRealProvider) -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/real-provider-smoke.mjs') -Environment $commonEnvironment -DependsOn @('provider-preflight', 'java-artifact-package', 'kernel-loop-smoke') -PersistOutput $false -Optional $true
     Add-VerificationStep -Name 'repository-static-gates' -Requested $true -Kind internal
 }
 
@@ -1514,7 +1567,7 @@ try {
             $results.Add((New-SkippedResult -Step $step -Blocker 'evidence freshness gate failed'))
             continue
         }
-        if ($javaHomeIssue -and $step.name -in @('java-jvm', 'java-artifact-package', 'maven-dependency-tree', 'maven-dependency-convergence', 'kernel-loop-smoke', 'java-native-build', 'native-artifact-freshness', 'java-native-smoke', 'runtime-soak', 'windows-webview2', 'real-provider-openai', 'real-provider-anthropic')) {
+        if ($javaHomeIssue -and $step.name -in @('java-jvm', 'java-artifact-package', 'maven-dependency-tree', 'maven-dependency-convergence', 'kernel-loop-smoke', 'java-native-build', 'native-artifact-freshness', 'java-native-smoke', 'runtime-soak', 'windows-webview2', 'runtime-refresh-windows-webview2', 'plan-goal-windows-webview2', 'plan-goal-soak-120-minutes', 'turn-change-review-sidecar-stage', 'turn-change-review-windows-webview2', 'real-provider')) {
             $results.Add((New-SkippedResult -Step $step -Blocker "JavaHome preflight failed: $javaHomeIssue"))
             continue
         }

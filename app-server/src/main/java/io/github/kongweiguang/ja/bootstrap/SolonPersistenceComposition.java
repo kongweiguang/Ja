@@ -15,8 +15,10 @@ import io.github.kongweiguang.ja.infrastructure.persistence.recovery.StartupReco
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisCheckpointStore;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisAutomaticTitleUsageRepository;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisConversationRepository;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.MybatisTaskRepository;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInstructionScopeRepository;
+import io.github.kongweiguang.ja.goal.adapter.out.persistence.MybatisGoalRepository;
 import io.github.kongweiguang.ja.conversation.port.out.InstructionScopeRepository;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.SqlSessionFactory;
@@ -87,6 +89,39 @@ public final class SolonPersistenceComposition {
         return new MybatisAttachmentRepository(requireNamedSessions());
     }
 
+    /** Task、Conversation 与 Workspace 写声明复用同一个具名 Factory，SQLite 仍由 App Server 独占。 */
+    @Bean(value = "jaTaskRepository", typed = true)
+    public MybatisTaskRepository taskRepository(
+            @Inject(value = "ja", required = true) DataSource dataSource,
+            ObjectMapper mapper, RuntimeResourceLifecycle lifecycle) {
+        MybatisTaskRepository repository = new MybatisTaskRepository(requireNamedSessions(), mapper);
+        return AotSideEffectGuard.processing() ? repository : lifecycle.own(repository);
+    }
+
+    /**
+     * Goal 聚合复用唯一具名 SQLite Factory；Repository 内部继续拥有 CAS、幂等和不可变版本事务，
+     * 组合根只发布端口身份，避免 transport 或 extension 取得 Mapper。
+     */
+    @Bean(value = "jaGoalRepository", typed = true)
+    public MybatisGoalRepository goalRepository(
+            @Inject(value = "ja", required = true) DataSource dataSource, ObjectMapper mapper) {
+        return new MybatisGoalRepository(requireNamedSessions(), mapper);
+    }
+
+    /**
+     * JaDatabase lease 是旧 sidecar 已死亡的权威证明；只有该 owner 存在后，才在一个事务中分配
+     * 新代际并废弃全部遗留活动 claim，禁止用进程时间或 Bean 创建顺序猜测身份。
+     */
+    @Bean(value = "jaRuntimeProcessGeneration", typed = true)
+    public RuntimeProcessGeneration runtimeProcessGeneration(
+            @Inject(value = "ja", required = true) DataSource dataSource,
+            @Inject(required = false) JaDatabase database,
+            MybatisTaskRepository taskRepository, Clock clock) {
+        if (AotSideEffectGuard.processing()) return RuntimeProcessGeneration.aotPlaceholder();
+        if (database == null) throw new IllegalStateException("Ja database bean is unavailable");
+        return RuntimeProcessGeneration.allocate(taskRepository, clock.instant());
+    }
+
     /**
      * 真实运行时只使用 Host 发布的 run/data 目录并立即启动恢复 GC；AOT 元数据阶段不得访问
      * 构建主机文件系统，故只发布永远不会被调用的类型占位边界。
@@ -142,7 +177,8 @@ public final class SolonPersistenceComposition {
     @Bean(value = "jaStartupRecovery", typed = true)
     @SuppressWarnings("PMD.CloseResource")
     public StartupRecoveryService startupRecovery(
-            @Inject(value = "ja", required = true) DataSource dataSource, Clock clock) {
+            @Inject(value = "ja", required = true) DataSource dataSource, Clock clock,
+            RuntimeProcessGeneration processGeneration) {
         SqlSessionFactory sessions = requireNamedSessions();
         StartupRecoveryService recovery = new StartupRecoveryService(sessions, clock);
         if (AotSideEffectGuard.processing()) return recovery;
@@ -194,7 +230,8 @@ public final class SolonPersistenceComposition {
     }
 
     /** Native Image 元数据分析占位；真实运行时分支永不创建此对象。 */
-    private static final class AotAttachmentUseCase implements AttachmentUseCase {
+    private static final class AotAttachmentUseCase implements AttachmentUseCase,
+            io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase {
         /** AOT 不允许导入文件。 */
         @Override public AttachmentMetadata importDraft(ImportRequest request) { throw unavailable(); }
 
@@ -206,6 +243,15 @@ public final class SolonPersistenceComposition {
 
         /** AOT 不运行后台清理或访问构建主机目录。 */
         @Override public void collectGarbage() { throw unavailable(); }
+
+        /** AOT 不建立用户附件预览 session。 */
+        @Override public PreviewDescriptor openPreview(PreviewOpenRequest request) { throw unavailable(); }
+
+        /** AOT 不读取预览内容。 */
+        @Override public PreviewReadResult readPreview(PreviewReadRequest request) { throw unavailable(); }
+
+        /** AOT 不保存 session，因此关闭也拒绝进入运行时语义。 */
+        @Override public void closePreview(String previewSessionId) { throw unavailable(); }
 
         /** 统一标明占位对象只能参与元数据发现。 */
         private static UnsupportedOperationException unavailable() {

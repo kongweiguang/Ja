@@ -17,7 +17,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 
 /**
- * 向 conversation 暴露冻结 MCP Tool 目录和有界调用的出站 SPI。
+ * 向 conversation 暴露请求级 MCP Tool 目录和有界调用的出站 SPI。
  */
 public interface McpGateway extends AutoCloseable {
     /**
@@ -40,11 +40,11 @@ public interface McpGateway extends AutoCloseable {
     void close();
 
     /**
-     * MCP 会话创建时冻结的目录与修订。
+     * MCP 请求安全点解析的目录与修订；已生成 batch 继续持有该不可变值。
      */
     record McpSnapshot(String revision, List<McpTool> tools, Instant createdAt) {
         /**
-         * 冻结一次 MCP 连接看到的 Tool 集合，后续调用必须复用同一修订。
+         * 固定一次 MCP 连接看到的 Tool 集合，后续调用必须复用同一修订。
          */
         public McpSnapshot {
             revision = ContractChecks.identifier(revision, "revision");
@@ -64,6 +64,32 @@ public interface McpGateway extends AutoCloseable {
             serverId = ContractChecks.identifier(serverId, "serverId");
             remoteName = ContractChecks.identifier(remoteName, "remoteName");
             Objects.requireNonNull(spec, "spec");
+        }
+    }
+
+    /**
+     * 不含 Secret 的不可变路由证明；definitionRevision 只含私密值摘要，routeHash 覆盖完整路由语义。
+     */
+    record RouteIdentity(String localName, String serverId, String remoteName,
+                         String definitionRevision, String schemaHash, String routeHash,
+                         String catalogRevision) {
+        /** 严格拒绝缺字段的绑定，恢复路径不能把旧的同名 Tool 当作同一路由。 */
+        public RouteIdentity {
+            localName = require(localName, "localName");
+            serverId = require(serverId, "serverId");
+            remoteName = require(remoteName, "remoteName");
+            definitionRevision = require(definitionRevision, "definitionRevision");
+            schemaHash = require(schemaHash, "schemaHash");
+            routeHash = require(routeHash, "routeHash");
+            catalogRevision = require(catalogRevision, "catalogRevision");
+        }
+
+        /** 路由字段保持完整且有界，避免持久层接受部分身份或无界配置文本。 */
+        private static String require(String value, String field) {
+            if (value == null || value.isBlank() || value.length() > 4096) {
+                throw new IllegalArgumentException("invalid MCP route identity " + field);
+            }
+            return value;
         }
     }
 

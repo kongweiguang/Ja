@@ -23,9 +23,11 @@ import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroke
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.AutomaticTitleUsagePort;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.TurnCancellationListener;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
+import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ModelAdapterFactory;
 import io.github.kongweiguang.ja.catalog.adapter.out.runtime.ConfigurationTurnRuntimeResolver;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationCatalog;
@@ -41,24 +43,51 @@ import io.github.kongweiguang.ja.configuration.port.in.ConfigurationWorkspaceTru
 import io.github.kongweiguang.ja.configuration.port.out.ConfigurationRuntimePort;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
-import io.github.kongweiguang.ja.conversation.application.middleware.ApprovalMiddleware;
-import io.github.kongweiguang.ja.conversation.application.middleware.MiddlewareChain;
+import io.github.kongweiguang.ja.conversation.port.out.ToolPolicy;
+import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
 import io.github.kongweiguang.ja.conversation.application.prompt.DefaultAgentPromptSessionFactory;
 import io.github.kongweiguang.ja.conversation.instruction.AgentInstructionCatalog;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSessionFactory;
 import io.github.kongweiguang.ja.conversation.port.out.InstructionScopeRepository;
 import io.github.kongweiguang.ja.infrastructure.persistence.database.DatabaseConfig;
 import io.github.kongweiguang.ja.infrastructure.persistence.database.JaDatabase;
+import io.github.kongweiguang.ja.infrastructure.persistence.recovery.StartupRecoveryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService;
+import io.github.kongweiguang.ja.goal.adapter.out.persistence.MybatisGoalRepository;
+import io.github.kongweiguang.ja.goal.application.GoalService;
+import io.github.kongweiguang.ja.goal.application.GoalToolExecutionLedger;
+import io.github.kongweiguang.ja.goal.application.GoalStartupRecovery;
+import io.github.kongweiguang.ja.goal.application.GoalContinuationCoordinator;
+import io.github.kongweiguang.ja.goal.application.GoalContinuationSubscription;
+import io.github.kongweiguang.ja.goal.application.GoalContinuationTurnAdapter;
+import io.github.kongweiguang.ja.goal.application.GoalContinuationGate;
+import io.github.kongweiguang.ja.goal.application.GoalEventRegistry;
+import io.github.kongweiguang.ja.goal.application.GoalEvaluationDispatcher;
+import io.github.kongweiguang.ja.goal.application.PlanExecutionCoordinator;
+import io.github.kongweiguang.ja.goal.application.PlanExecutionTurnAdapter;
+import io.github.kongweiguang.ja.goal.application.GoalEvaluator;
+import io.github.kongweiguang.ja.goal.application.RuntimeGoalEvaluatorAdapter;
+import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
+import io.github.kongweiguang.ja.goal.adapter.in.tools.PlanGoalAgentCapability;
+import io.github.kongweiguang.ja.goal.port.in.GoalUseCase;
 import io.github.kongweiguang.ja.catalog.adapter.out.skills.JaSkillSources;
 import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.NioWorkspaceDirectoryAdapter;
+import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.NioWorkspacePathAdapter;
+import io.github.kongweiguang.ja.workspace.application.WorkspacePathService;
 import io.github.kongweiguang.ja.workspace.application.WorkspaceService;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.domain.WorkspacePolicy;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspaceReferenceValidator;
 import io.github.kongweiguang.ja.workspace.port.out.WorkspaceDirectoryPort;
+import io.github.kongweiguang.ja.workspace.port.out.WorkspacePathPort;
 import io.github.kongweiguang.ja.workspace.port.out.WorkspacePreparationPort;
 import io.github.kongweiguang.ja.workspace.port.out.WorkspaceTrustPort;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.MybatisTaskRepository;
+import io.github.kongweiguang.ja.task.adapter.in.tools.TaskAgentToolGateway;
+import io.github.kongweiguang.ja.task.application.TaskCoordinator;
+import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import org.noear.solon.annotation.Bean;
 import org.noear.solon.annotation.Component;
 import org.noear.solon.annotation.Destroy;
@@ -79,6 +108,7 @@ import javax.sql.DataSource;
 public final class SolonRuntimeComposition {
     private static final Logger LOGGER = LoggerFactory.getLogger(SolonRuntimeComposition.class);
     private final RuntimeResourceLifecycle lifecycle = new RuntimeResourceLifecycle();
+    private final DeferredTurnRuntimeResolver deferredRuntimeResolver = new DeferredTurnRuntimeResolver();
 
     /** 发布唯一 UTC 时钟，使持久化、Deadline、审批和上下文共享同一时间权威。 */
     @Bean(value = "jaClock", typed = true)
@@ -170,7 +200,7 @@ public final class SolonRuntimeComposition {
         return modelFactory;
     }
 
-    /** 只发布一次不可变 Skill 源读取器，每个 Turn 的快照仍保持请求级作用域。 */
+    /** 只发布一次无正文缓存的 Skill 源读取器，每个 Turn 只绑定请求级元数据目录与 locator。 */
     @Bean(value = "jaSkillSources", typed = true)
     public JaSkillSources skillSources() {
         return new JaSkillSources();
@@ -188,7 +218,7 @@ public final class SolonRuntimeComposition {
     /** 每个 Turn 由工厂创建独占 Prompt Session，禁止跨 Turn 共享激活 Skill 和 revision。 */
     @Bean(value = "jaAgentPromptSessionFactory", typed = true)
     public AgentPromptSessionFactory promptSessionFactory(AgentInstructionCatalog instructions) {
-        return new DefaultAgentPromptSessionFactory(instructions);
+        return new DefaultAgentPromptSessionFactory(instructions, List.of());
     }
 
     /**
@@ -196,15 +226,18 @@ public final class SolonRuntimeComposition {
      * 也不得伪装为某个 Turn 的工作区。
      */
     @Bean(value = "jaCatalog", typed = true)
-    public GenerationCatalog catalog(ObjectMapper mapper) {
+    public GenerationCatalog catalog(ObjectMapper mapper, JaSkillSources skills) {
+        Path agentsSkills = Path.of(System.getProperty("user.home"), ".agents", "skills");
         if (AotSideEffectGuard.processing()) {
-            return new GenerationCatalog(aotHomePath(), mapper, McpLimits.DEFAULT);
+            return new GenerationCatalog(aotHomePath(), mapper, McpLimits.DEFAULT, skills,
+                    agentsSkills, aotHomePath().resolve("skills"));
         }
-        return lifecycle.own(new GenerationCatalog(resolveHomePath(), mapper, McpLimits.DEFAULT));
+        return lifecycle.own(new GenerationCatalog(resolveHomePath(), mapper, McpLimits.DEFAULT, skills,
+                agentsSkills, resolveHomePath().resolve("skills")));
     }
 
     /**
-     * 发布不携带 cwd 的逐 Turn MCP 会话工厂；每次打开都必须绑定冻结的配置代际租约、
+     * 发布不携带 cwd 的请求级 MCP 会话工厂；每次打开都必须绑定当前配置代际租约、
      * Provider/Model 身份以及命令对应的规范工作区根目录。
      */
     @Bean(value = "jaTurnMcpSessionFactory", typed = true)
@@ -217,8 +250,9 @@ public final class SolonRuntimeComposition {
     @Bean(value = "jaCatalogUseCase", typed = true)
     public CatalogUseCase catalogUseCase(GenerationCatalog catalog,
                                          ConfigurationGenerationPort configurations,
-                                         ModelPort models) {
-        return new CatalogService(catalog, configurations, models);
+                                         ModelPort models,
+                                         WorkspaceUseCase workspaces) {
+        return new CatalogService(catalog, configurations, models, workspaces);
     }
 
     /** Shell 只影响 Tool 集；预检失败时保留可用的配置、历史与 RPC 恢复面。 */
@@ -232,11 +266,29 @@ public final class SolonRuntimeComposition {
     }
 
     /**
-     * 组合配置代际、Skill、MCP 和 Host Tool 出站适配器；TurnService 只依赖 Resolver 端口，
-     * bootstrap 不会重新解释 Provider/Model 选择、预算或 Tool 集合。
+     * 先发布 late-bound 网关以断开 Resolver -> TaskCoordinator -> TurnService -> Resolver 构造环；
+     * Task Tool 在 Coordinator 绑定前被调用会失败关闭，不提供临时 no-op 实现。
+     */
+    @Bean(value = "jaTaskAgentToolGateway", typed = true)
+    public TaskAgentToolGateway taskAgentToolGateway() {
+        return new TaskAgentToolGateway();
+    }
+
+    /**
+     * 先发布稳定的 Resolver 端口以断开 Goal Tool 与 TurnService/Workspace 的组合环；
+     * 真实请求在 Solon 完成全部 Bean 装配后才会到达，提前调用必须失败关闭。
      */
     @Bean(value = "jaTurnRuntimeResolver", typed = true)
-    public ConfigurationTurnRuntimeResolver turnRuntimeResolver(
+    public TurnRuntimeResolver deferredTurnRuntimeResolver() {
+        return deferredRuntimeResolver;
+    }
+
+    /**
+     * 组合配置代际、Skill、MCP 和 Host Tool 出站适配器；完整实现只按名发布，
+     * 所有消费者继续依赖上方的稳定端口，避免 Solon 再次通过具体类形成环。
+     */
+    @Bean(value = "jaConfigurationTurnRuntimeResolver", typed = false)
+    public ConfigurationTurnRuntimeResolver configurationTurnRuntimeResolver(
             ConfigurationGenerationPort configurations,
             JaSkillSources skills,
             ShellCapability shellCapability,
@@ -244,25 +296,37 @@ public final class SolonRuntimeComposition {
             GenerationTurnMcpSessionFactory turnMcpSessions,
             AgentPromptSessionFactory promptSessions,
             @Inject(value = "jaAttachmentUseCase", required = true)
-            io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase attachments) {
-        return new ConfigurationTurnRuntimeResolver(configurations, skills,
+            io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase attachments,
+            TaskAgentToolGateway taskTools,
+            AgentCapabilityCatalog capabilities) {
+        ConfigurationTurnRuntimeResolver resolver = new ConfigurationTurnRuntimeResolver(configurations, skills,
                 Path.of(System.getProperty("user.home"), ".agents", "skills"),
                 resolveHomePath().resolve("skills"), shellCapability, catalog, turnMcpSessions, promptSessions,
-                attachmentReader(attachments));
+                attachmentReader(attachments), capabilities, taskTools);
+        deferredRuntimeResolver.bind(resolver);
+        return resolver;
     }
 
-    /** bootstrap 只做消费者自有出站端口桥接，Tool 永远不能直接依赖附件入站用例。 */
-    private static io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader attachmentReader(
+    /**
+     * bootstrap 只做消费者自有出站端口桥接，Tool 永远不能直接依赖附件入站用例；包级可见性
+     * 仅用于组合根合同测试，避免测试反射私有实现。
+     */
+    static io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader attachmentReader(
             io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase attachments) {
         return request -> {
-            io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.ReadResult result = attachments.read(
-                    new io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.ReadRequest(
-                            request.attachmentId(), request.threadId(), request.offsetBytes(), request.maxBytes()));
-            return new io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader.ReadResult(
-                    result.metadata().attachmentId(), result.metadata().displayName(), result.metadata().sizeBytes(),
-                    result.metadata().mediaKind().name().toLowerCase(java.util.Locale.ROOT),
-                    result.metadata().mediaType(), result.offsetBytes(), result.nextOffsetBytes(),
-                    result.endOfFile(), result.encoding(), result.content());
+            try {
+                io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.ReadResult result = attachments.read(
+                        new io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.ReadRequest(
+                                request.attachmentId(), request.threadId(),
+                                request.offsetBytes(), request.maxBytes()));
+                return new io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader.ReadResult(
+                        result.metadata().attachmentId(), result.metadata().displayName(), result.metadata().sizeBytes(),
+                        result.metadata().mediaKind().name().toLowerCase(java.util.Locale.ROOT),
+                        result.metadata().mediaType(), result.offsetBytes(), result.nextOffsetBytes(),
+                        result.endOfFile(), result.encoding(), result.content());
+            } catch (io.github.kongweiguang.ja.attachment.domain.AttachmentFailure failure) {
+                throw new io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader.ReadFailure(failure);
+            }
         };
     }
 
@@ -302,20 +366,24 @@ public final class SolonRuntimeComposition {
         return new WorkspaceService(repository, directories, preparation, trust, policy, clock);
     }
 
+    /** 发布只处理相对路径元数据的 NIO 端口；正文读取继续由现有文件 Tool 独占。 */
+    @Bean(value = "jaWorkspacePathPort", typed = true)
+    public WorkspacePathPort workspacePathPort() {
+        return new NioWorkspacePathAdapter();
+    }
+
+    /** 搜索与消息引用复用同一个路径 owner，避免两套 containment 规则随时间漂移。 */
+    @Bean(value = "jaWorkspacePathService", typed = true)
+    public WorkspacePathService workspacePathService(WorkspaceUseCase workspaces, WorkspacePathPort paths) {
+        return new WorkspacePathService(workspaces, paths);
+    }
+
     /** 发布 AgentLoop 与 JA-RPC 响应共同使用的同一个审批代理，避免审批状态分叉。 */
     @Bean(value = "jaApprovalBroker", typed = true)
     public InMemoryApprovalBroker approvalBroker(Clock clock) {
         InMemoryApprovalBroker broker =
                 new InMemoryApprovalBroker(clock, 1_024, 8_192, Duration.ofMinutes(10));
         return AotSideEffectGuard.processing() ? broker : lifecycle.own(broker);
-    }
-
-    /**
-     * 静态注册唯一 Middleware 链；Shell 环境已经冻结在 Turn Runtime，Middleware 只负责审批短路。
-     */
-    @Bean(value = "jaMiddlewareChain", typed = true)
-    public MiddlewareChain middlewareChain() {
-        return new MiddlewareChain(List.of(new ApprovalMiddleware()));
     }
 
     /**
@@ -343,10 +411,118 @@ public final class SolonRuntimeComposition {
                                ConversationRepository store,
                                io.github.kongweiguang.ja.conversation.application.context.ContextOrchestratorFactory contexts,
                                JsonValueCodec argumentsCodec,
-                               MiddlewareChain middleware, Clock clock) {
+                               Clock clock,
+                               MybatisTaskRepository taskRepository,
+                               RuntimeProcessGeneration processGeneration) {
         AgentLoop loop = new AgentLoop(
-                model, approvals, store, contexts, argumentsCodec, middleware, clock);
+                model, approvals, store, contexts, argumentsCodec,
+                new NetworkntToolArgumentValidation(argumentsCodec),
+                List.<ToolPolicy>of(), List.<ExecutionObserver>of(), clock);
+        loop.bindTaskMailbox(taskRepository);
+        if (!AotSideEffectGuard.processing()) {
+            loop.bindWorkspaceWriteClaims(taskRepository, processGeneration.value());
+        }
         return AotSideEffectGuard.processing() ? loop : lifecycle.own(loop);
+    }
+
+    /** 活动 Goal 的 Tool 调用复用 AgentLoop，ledger 只记录真实执行边界与不可逆摘要。 */
+    @Bean(value = "jaGoalToolExecutionLedger", typed = true)
+    public GoalToolExecutionLedger goalToolExecutionLedger(MybatisGoalRepository goals, Clock clock,
+                                                           RuntimeProcessGeneration generation,
+                                                           AgentLoop loop, GoalService service) {
+        GoalToolExecutionLedger ledger = new GoalToolExecutionLedger(
+                goals, clock, generation.value(), service::publishCommitted);
+        if (!AotSideEffectGuard.processing()) loop.bindGoalToolExecution(ledger);
+        return ledger;
+    }
+
+    /** conversation 恢复完成后再对账 Goal ledger；AOT 分析阶段禁止触发数据库 IO。 */
+    @Bean(value = "jaGoalStartupRecovery", typed = true)
+    public GoalStartupRecovery goalStartupRecovery(MybatisGoalRepository goals, Clock clock,
+                                                   RuntimeProcessGeneration generation,
+                                                   StartupRecoveryService startupRecovery) {
+        GoalStartupRecovery recovery = new GoalStartupRecovery(goals, clock, generation.value());
+        if (!AotSideEffectGuard.processing()) recovery.recover();
+        return recovery;
+    }
+
+    /** Goal RPC 与 continuation 共用单一进程内订阅注册表，不把连接引用写入持久层。 */
+    @Bean(value = "jaGoalEventRegistry", typed = true)
+    public GoalEventRegistry goalEventRegistry() {
+        return new GoalEventRegistry();
+    }
+
+    /** 固定条带 gate 关闭控制命令与 continuation admission 的本地竞态窗口。 */
+    @Bean(value = "jaGoalContinuationGate", typed = true)
+    public GoalContinuationGate goalContinuationGate() {
+        return new GoalContinuationGate();
+    }
+
+    /** continuation adapter 只桥接既有 Turn/Workspace/Repository owner，不保存第二份运行状态。 */
+    @Bean(value = "jaGoalContinuationTurnAdapter", typed = true)
+    public GoalContinuationTurnAdapter goalContinuationTurnAdapter(
+            TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
+            MybatisGoalRepository goals, GoalService service, ObjectMapper mapper, Clock clock,
+            GoalEventRegistry events, GoalContinuationGate gate) {
+        return new GoalContinuationTurnAdapter(turns, conversations, workspaces, goals, service, mapper, clock,
+                events, gate);
+    }
+
+    /** SQLite lease 与当前 process generation 共同保证每个 Goal 只有一个自动续跑 Turn。 */
+    @Bean(value = "jaGoalContinuationCoordinator", typed = true)
+    public GoalContinuationCoordinator goalContinuationCoordinator(MybatisGoalRepository goals,
+            GoalContinuationTurnAdapter turns, Clock clock, RuntimeProcessGeneration generation,
+            GoalStartupRecovery recovery, GoalService service) {
+        GoalContinuationCoordinator coordinator = new GoalContinuationCoordinator(
+                goals, turns, clock, generation.value(), service::publishCommitted);
+        return AotSideEffectGuard.processing() ? coordinator : lifecycle.own(coordinator);
+    }
+
+    /** 内部订阅与 RPC 订阅并存；事件仅作为唤醒，资格始终重新读取 SQLite。 */
+    @Bean(value = "jaGoalContinuationSubscription", typed = true)
+    public GoalContinuationSubscription goalContinuationSubscription(GoalUseCase goals,
+            GoalContinuationCoordinator coordinator) {
+        GoalContinuationSubscription subscription = new GoalContinuationSubscription(goals, coordinator);
+        return AotSideEffectGuard.processing() ? subscription : lifecycle.own(subscription);
+    }
+
+    /** standalone Plan 使用一次性 hidden Turn adapter，不借用 Goal lease 或自动续跑资格。 */
+    @Bean(value = "jaPlanExecutionTurnAdapter", typed = true)
+    public PlanExecutionTurnAdapter planExecutionTurnAdapter(
+            TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
+            MybatisGoalRepository plans, ObjectMapper mapper, Clock clock) {
+        return new PlanExecutionTurnAdapter(turns, conversations, workspaces, plans, mapper, clock);
+    }
+
+    /** Plan execute 在 run 提交后启动一次 Turn，未完成时恢复 APPROVED 供显式重试。 */
+    @Bean(value = "jaPlanExecutionCoordinator", typed = true)
+    public PlanExecutionCoordinator planExecutionCoordinator(MybatisGoalRepository plans,
+            PlanExecutionTurnAdapter turns, Clock clock) {
+        return new PlanExecutionCoordinator(plans, turns, clock);
+    }
+
+    /** evaluator 复用当前配置模型，但强制无 Tool、无执行历史与 SINGLE_ATTEMPT。 */
+    @Bean(value = "jaRuntimeGoalEvaluatorAdapter", typed = true)
+    public RuntimeGoalEvaluatorAdapter runtimeGoalEvaluatorAdapter(ModelPort models,
+            TurnRuntimeResolver runtimes, ConversationRepository conversations,
+            WorkspaceUseCase workspaces, ObjectMapper mapper, Clock clock) {
+        return new RuntimeGoalEvaluatorAdapter(models, runtimes, conversations, workspaces, mapper, clock);
+    }
+
+    /** evaluator 结算后通过 GoalService 的同一事件映射通知观察者。 */
+    @Bean(value = "jaGoalEvaluator", typed = true)
+    public GoalEvaluator goalEvaluator(MybatisGoalRepository goals,
+            RuntimeGoalEvaluatorAdapter adapter, Clock clock, GoalService service,
+            RuntimeProcessGeneration generation) {
+        return new GoalEvaluator(goals, adapter, clock, service::publishCommitted, generation.value());
+    }
+
+    /** intent CAS 把重复 Goal 事件折叠成一次 Provider 调用。 */
+    @Bean(value = "jaGoalEvaluationDispatcher", typed = true)
+    public GoalEvaluationDispatcher goalEvaluationDispatcher(GoalService service,
+            MybatisGoalRepository goals, GoalEvaluator evaluator) {
+        GoalEvaluationDispatcher dispatcher = new GoalEvaluationDispatcher(service, goals, evaluator);
+        return AotSideEffectGuard.processing() ? dispatcher : lifecycle.own(dispatcher);
     }
 
     /** 独立于可变配置快照持有有界准入队列，确保并发上限在代际切换时保持稳定。 */
@@ -376,10 +552,60 @@ public final class SolonRuntimeComposition {
     public TurnService turnService(ConversationRepository store, AgentLoop loop, TurnQueue queue,
                                    CancellationCoordinator cancellations,
                                    TurnRuntimeResolver runtimeResolver, Clock clock,
-                                   AutomaticThreadTitleScheduler automaticTitles) {
+                                   AutomaticThreadTitleScheduler automaticTitles,
+                                   WorkspaceReferenceValidator workspaceReferences) {
         TurnService service = new TurnService(
-                store, loop, queue, cancellations, runtimeResolver, clock, automaticTitles);
+                store, loop, queue, cancellations, runtimeResolver, clock, automaticTitles, workspaceReferences);
         return AotSideEffectGuard.processing() ? service : lifecycle.ownShutdownFence(service);
+    }
+
+    /**
+     * 发布唯一 Goal 应用端口；RPC 与编译期 Extension 共用该实例，从而让 UI 命令和 Agent Tool
+     * 都经过相同的 revision、批准和幂等门，不产生旁路状态。
+     */
+    @Bean(value = "jaGoalUseCase", typed = true)
+    public GoalUseCase goalService(MybatisGoalRepository repository, ObjectMapper mapper, Clock clock,
+                                   RuntimeProcessGeneration generation, GoalEventRegistry events,
+                                   GoalContinuationGate continuations,
+                                   PlanExecutionCoordinator planExecutions) {
+        return new GoalService(repository, mapper, clock, generation.value(), events, continuations,
+                planExecutions);
+    }
+
+    /** 只适配既有 Plan/Goal 用例，能力装配不得建立另一套状态机或执行器。 */
+    @Bean(value = "jaPlanGoalAgentCapability", typed = true)
+    public PlanGoalAgentCapability planGoalAgentCapability(GoalUseCase goals, ObjectMapper mapper, Clock clock) {
+        return new PlanGoalAgentCapability(goals, mapper, clock);
+    }
+
+    /** 显式注册能力身份，逐请求绑定仍交给原 RuntimeLease，避免固定过期权限与领域状态。 */
+    @Bean(value = "jaAgentCapabilityCatalog", typed = true)
+    public AgentCapabilityCatalog agentCapabilityCatalog(
+            PlanGoalAgentCapability planGoal, TaskAgentToolGateway taskTools) {
+        return new AgentCapabilityCatalog(List.of(planGoal, taskTools));
+    }
+
+    /**
+     * Task 复用唯一 TurnService 作为普通运行与 Child reserve/submit owner；Repository 只拥有 SQLite 事实。
+     */
+    @Bean(value = "jaTaskUseCase", typed = true)
+    public TaskCoordinator taskCoordinator(MybatisTaskRepository repository, MybatisHistoryService threads,
+                                           TurnService turns, WorkspaceUseCase workspaces, Clock clock,
+                                           TaskAgentToolGateway taskTools,
+                                           StartupRecoveryService startupRecovery) {
+        TaskCoordinator coordinator = new TaskCoordinator(repository, threads, turns, turns, workspaces, clock);
+        // Solon AOT 只分析 Bean 图，此时 MyBatis environment 尚未装配，禁止通过 late binding
+        // 触发恢复查询；真实运行时仍在接收 RPC 前完成同一恢复边界。
+        turns.bindCancellationListener(AotSideEffectGuard.processing()
+                ? TurnCancellationListener.noop()
+                : coordinator);
+        taskTools.bind(coordinator);
+        if (!AotSideEffectGuard.processing()) {
+            coordinator.resumeRecoveredQueued(startupRecovery.queuedTurns().stream()
+                    .map(turn -> new TaskCoordinator.RecoveredQueuedTurn(turn.threadId(), turn.turnId()))
+                    .toList());
+        }
+        return AotSideEffectGuard.processing() ? coordinator : lifecycle.own(coordinator);
     }
 
     /** 复用完整生产上下文与 Provider 端口发布手动压缩用例，不创建第二套状态或配置 Owner。 */
@@ -430,16 +656,22 @@ public final class SolonRuntimeComposition {
     @Bean(value = "jaRuntimeServicesFactory", typed = true)
     public RuntimeServicesFactory runtimeServicesFactory(
             WorkspaceUseCase workspaces,
+            WorkspacePathSearchUseCase workspacePathSearch,
             MybatisHistoryService threads,
             TurnService turns,
             io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase compactions,
             InMemoryApprovalBroker approvals,
             CatalogUseCase catalog,
             @Inject(value = "jaAttachmentUseCase", required = true)
-            io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase attachments) {
+            io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase attachments,
+            @Inject(value = "jaAttachmentUseCase", required = true)
+            io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase attachmentPreviews,
+            TaskUseCase tasks,
+            GoalUseCase goals) {
         if (AotSideEffectGuard.processing()) return null;
         return new RuntimeServicesFactory(
-                workspaces, threads, turns, compactions, approvals, catalog, attachments, lifecycle::close);
+                workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog, attachments,
+                attachmentPreviews, tasks, goals, lifecycle::close);
     }
 
     /** 即使前序资源关闭失败也继续逆序关闭已成功创建的 Bean，以尽可能释放全部资源。 */
@@ -492,6 +724,46 @@ public final class SolonRuntimeComposition {
         Path home = dataDirectory == null ? null : dataDirectory.getParent();
         if (home == null) throw new IllegalStateException("Ja database path has no canonical home");
         return home;
+    }
+
+    /**
+     * 组合期代理只解决 Bean 构造环，不缓存、重试或重新解释任何运行时决策。
+     * 单次绑定防止局部重建把正在执行的 Turn 切换到另一个配置 Owner。
+     */
+    static final class DeferredTurnRuntimeResolver implements TurnRuntimeResolver {
+        private volatile TurnRuntimeResolver delegate;
+
+        /** 完整 Resolver 只允许在同一组合代际绑定一次。 */
+        synchronized void bind(TurnRuntimeResolver resolver) {
+            if (delegate != null) throw new IllegalStateException("turn runtime resolver was already bound");
+            delegate = java.util.Objects.requireNonNull(resolver, "resolver");
+        }
+
+        /** 解析不添加代理层缓存，保留真实 Resolver 的短租约和失败语义。 */
+        @Override
+        public io.github.kongweiguang.ja.conversation.port.out.RuntimeLease resolve(
+                io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest request) {
+            return requireDelegate().resolve(request);
+        }
+
+        /** 工作区预热必须到达同一真实 Resolver，不建立第二份 catalog 状态。 */
+        @Override
+        public void prepareWorkspace(Path workspaceRoot) {
+            requireDelegate().prepareWorkspace(workspaceRoot);
+        }
+
+        /** 默认模型投影与 Turn 解析共用委托，避免组合代际不一致。 */
+        @Override
+        public java.util.Optional<DefaultModelSelection> defaultModelSelection(Path workspaceRoot) {
+            return requireDelegate().defaultModelSelection(workspaceRoot);
+        }
+
+        /** 若 Solon 未完成绑定就发生调用，显式拒绝而不返回空能力。 */
+        private TurnRuntimeResolver requireDelegate() {
+            TurnRuntimeResolver current = delegate;
+            if (current == null) throw new IllegalStateException("turn runtime resolver is not ready");
+            return current;
+        }
     }
 
     /** 在不打开连接或访问构建主机文件系统的前提下提供 MyBatis AOT 元数据。 */

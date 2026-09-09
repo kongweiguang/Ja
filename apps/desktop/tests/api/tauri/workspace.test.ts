@@ -589,38 +589,50 @@ describe("typed workspace host adapter", () => {
   });
 
   it("accepts only the token-and-point native drop event", async () => {
-    expect(parseWorkspaceNativeDropEvent({ dropToken: "drop-token", x: 12.5, y: 48 })).toEqual({
-      dropToken: "drop-token",
+    const dropToken = "550e8400-e29b-41d4-a716-446655440000";
+    expect(
+      parseWorkspaceNativeDropEvent({
+        phase: "drop",
+        dropToken,
+        x: 12.5,
+        y: 48,
+        count: 1,
+      }),
+    ).toEqual({
+      dropToken,
       x: 12.5,
       y: 48,
     });
     for (const payload of [
-      { dropToken: "drop-token", x: 12.5 },
-      { dropToken: "drop-token", x: Number.NaN, y: 48 },
-      { dropToken: "drop-token", x: 12.5, y: 48, absolutePath: "C:\\private\\secret" },
+      { phase: "drop", dropToken, x: 12.5, count: 1 },
+      { phase: "drop", dropToken, x: Number.NaN, y: 48, count: 1 },
+      { phase: "enter", x: 12.5, y: 48, count: 1 },
+      { phase: "drop", dropToken, x: 12.5, y: 48, count: 1, absolutePath: "C:\\private\\secret" },
     ]) {
       expect(() => parseWorkspaceNativeDropEvent(payload)).toThrowError("原生拖入事件无效");
     }
   });
 
   it("subscribes to native drop without forwarding malformed or path-bearing payloads", async () => {
+    const dropToken = "550e8400-e29b-41d4-a716-446655440000";
     const listener = vi.fn();
     const unlisten = vi.fn();
     const bridge: WorkspaceNativeBridge = {
       invoke: vi.fn(async () => treeFixture) as WorkspaceNativeBridge["invoke"],
       listen: vi.fn(async (event: string, handler: (payload: unknown) => void) => {
         expect(event).toBe(JA_WORKSPACE_EVENTS.nativeDrop);
-        handler({ dropToken: "drop-token", x: 1, y: 2 });
-        handler({ dropToken: "drop-token", x: 1, y: 2, path: "C:\\private\\secret" });
+        handler({ phase: "enter", x: 1, y: 2, count: 1 });
+        handler({ phase: "drop", dropToken, x: 1, y: 2, count: 1 });
+        handler({ phase: "drop", dropToken, x: 1, y: 2, count: 1, path: "C:\\private\\secret" });
         return unlisten;
       }) as WorkspaceNativeBridge["listen"],
     };
 
-    await expect(new TauriWorkspaceHostAdapter(bridge).subscribeNativeDrop(listener)).resolves.toBe(
-      unlisten,
-    );
+    const unsubscribe = await new TauriWorkspaceHostAdapter(bridge).subscribeNativeDrop(listener);
     expect(listener).toHaveBeenCalledTimes(1);
-    expect(listener).toHaveBeenCalledWith({ dropToken: "drop-token", x: 1, y: 2 });
+    expect(listener).toHaveBeenCalledWith({ dropToken, x: 1, y: 2 });
     expect(JSON.stringify(listener.mock.calls)).not.toContain("private");
+    await unsubscribe();
+    expect(unlisten).toHaveBeenCalledOnce();
   });
 });

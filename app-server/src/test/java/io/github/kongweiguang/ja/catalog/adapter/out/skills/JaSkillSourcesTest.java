@@ -8,60 +8,89 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 验证原生 Skill 目录边界，测试夹具不得引入第三方 Agent 类型。 */
+/** 验证 Pi 式 Skill 渐进披露边界，测试夹具不得引入第三方 Agent 类型。 */
 final class JaSkillSourcesTest {
     @TempDir
     Path temporary;
 
-    /** 验证 builtin、user、workspace 的覆盖优先级，以及只暴露元数据的投影边界。 */
+    /** 发现只固定元数据和覆盖结果；同一 Catalog 后续 read 必须看到实时 SKILL.md 正文。 */
     @Test
-    void resolvesPrecedenceAndLoadsDocumentsLazily() throws Exception {
+    void keepsMetadataStableWhileReadingCurrentSkillDocument() throws Exception {
         Path user = Files.createDirectories(temporary.resolve("user"));
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        writeSkill(user, "coding", "User coding.", "user body", "notes/user.txt", "user resource");
-        writeSkill(workspace.resolve(".agents/skills"), "coding", "Workspace coding.",
-                "workspace body", "notes/workspace.txt", "workspace resource");
+        writeSkill(user, "coding", "User coding.", "user body", null, null);
+        Path workspaceSkill = writeSkill(workspace.resolve(".agents/skills"), "coding",
+                "Workspace coding.", "first workspace body", null, null);
         writeSkill(user, "review", "Review changes.", "review body", null, null);
 
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(workspace, user));
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
 
-        assertEquals(List.of("coding", "review"), snapshot.skills().stream()
+        assertEquals(List.of("coding", "review"), discovered.skills().stream()
                 .map(SkillCatalog.SkillDescriptor::name).toList());
-        SkillCatalog.SkillDescriptor coding = descriptor(snapshot, "coding");
-        assertEquals(SkillCatalog.Source.WORKSPACE, coding.source());
-        assertEquals("Workspace coding.", coding.description());
-        assertTrue(coding.revision().matches("skill_[0-9a-f]{64}"));
-        assertTrue(snapshot.revision().matches("skills_[0-9a-f]{64}"));
-        assertFalse(snapshot.revision().startsWith("skill_"));
-        assertEquals("workspace body", read(catalog, snapshot, "coding", "SKILL.md", 100).content());
-        assertEquals("workspace resource",
-                read(catalog, snapshot, "coding", "notes/workspace.txt", 100).content());
-        assertThrows(IllegalArgumentException.class,
-                () -> read(catalog, snapshot, "coding", "notes/user.txt", 100));
-        assertFalse(snapshot.skills().toString().contains("workspace body"));
+        assertEquals(SkillCatalog.Source.WORKSPACE, descriptor(discovered, "coding").source());
+        assertEquals("Workspace coding.", descriptor(discovered, "coding").description());
+        assertEquals("first workspace body",
+                read(catalog, discovered, "coding", "SKILL.md", 100).content());
+        assertFalse(discovered.skills().toString().contains("workspace body"));
 
-        Path userOnlyWorkspace = Files.createDirectories(temporary.resolve("user-only-workspace"));
-        SkillCatalog.SkillSnapshot userWins = catalog.snapshot(request(userOnlyWorkspace, user));
-        assertEquals(SkillCatalog.Source.JA_USER, descriptor(userWins, "coding").source());
-        assertEquals("user body", read(catalog, userWins, "coding", "SKILL.md", 100).content());
+        writeDocument(workspaceSkill, "coding", "Changed metadata.", "second workspace body");
+
+        assertEquals("Workspace coding.", descriptor(discovered, "coding").description());
+        assertEquals("second workspace body",
+                read(catalog, discovered, "coding", "SKILL.md", 100).content());
     }
 
-    /** 验证四级来源按高优先级到低优先级稳定展示，并让 Ja user 覆盖通用 user 包。 */
+    /** 辅助资源不在发现或首次读取时冻结，修改与新增文件都应在下一次 read 生效。 */
     @Test
-    void resolvesFourSourcesAndOrdersDescriptorsByPriorityThenName() throws Exception {
+    void readsAuxiliaryResourcesLiveFromOriginalLocator() throws Exception {
+        Path user = Files.createDirectories(temporary.resolve("user"));
+        Path workspace = Files.createDirectories(temporary.resolve("workspace"));
+        Path skill = writeSkill(user, "review", "Review.", "body", "notes/checklist.txt", "first");
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
+
+        assertEquals("first", read(catalog, discovered, "review", "notes/checklist.txt", 100).content());
+        Files.writeString(skill.resolve("notes/checklist.txt"), "second", StandardCharsets.UTF_8);
+        Files.writeString(skill.resolve("notes/new.txt"), "created later", StandardCharsets.UTF_8);
+
+        assertEquals("second", read(catalog, discovered, "review", "notes/checklist.txt", 100).content());
+        assertEquals("created later", read(catalog, discovered, "review", "notes/new.txt", 100).content());
+    }
+
+    /** 发现不得递归扫描完整包；超大辅助文件只在它实际被 read 时触发大小拒绝。 */
+    @Test
+    void discoveryDoesNotMaterializeOversizedAuxiliaryFiles() throws Exception {
+        Path user = Files.createDirectories(temporary.resolve("user"));
+        Path workspace = Files.createDirectories(temporary.resolve("workspace"));
+        Path skill = writeSkill(user, "large-assets", "Large assets.", "small body", null, null);
+        Files.writeString(skill.resolve("huge.txt"),
+                "x".repeat(JaSkillSources.MAX_FILE_BYTES + 1), StandardCharsets.UTF_8);
+
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
+
+        assertEquals(List.of("large-assets", "coding"), discovered.skills().stream()
+                .map(SkillCatalog.SkillDescriptor::name).toList());
+        assertEquals("small body", read(catalog, discovered, "large-assets", "SKILL.md", 100).content());
+        assertThrows(UncheckedIOException.class,
+                () -> read(catalog, discovered, "large-assets", "huge.txt", 100));
+    }
+
+    /** 四级来源按高优先级到低优先级稳定展示，Ja user 覆盖通用 user 同名包。 */
+    @Test
+    void resolvesFourSourcesByPriorityThenName() throws Exception {
         Path agents = Files.createDirectories(temporary.resolve("agents-skills"));
         Path ja = Files.createDirectories(temporary.resolve("ja-skills"));
         Path workspace = Files.createDirectories(temporary.resolve("project"));
@@ -74,15 +103,33 @@ final class JaSkillSourcesTest {
                 "Workspace only.", "workspace", null, null);
 
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(workspace, agents, ja, true));
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, agents, ja, true));
 
         assertEquals(List.of("workspace-only", "ja-only", "shared", "user-only", "coding"),
-                snapshot.skills().stream().map(SkillCatalog.SkillDescriptor::name).toList());
-        assertEquals(SkillCatalog.Source.JA_USER, descriptor(snapshot, "shared").source());
-        assertEquals("ja", read(catalog, snapshot, "shared", "SKILL.md", 100).content());
+                discovered.skills().stream().map(SkillCatalog.SkillDescriptor::name).toList());
+        assertEquals(SkillCatalog.Source.JA_USER, descriptor(discovered, "shared").source());
+        assertEquals("ja", read(catalog, discovered, "shared", "SKILL.md", 100).content());
     }
 
-    /** 验证项目 Skill 从 Git 根到 cwd 逐层整包覆盖，而不是只读取仓库根目录。 */
+    /** 工作区信任为 false 时完全跳过项目来源，损坏项目包也不能影响用户 Skill。 */
+    @Test
+    void skipsWorkspaceSourcesWhenWorkspaceIsUntrusted() throws Exception {
+        Path agents = temporary.resolve("absent-agents");
+        Path ja = Files.createDirectories(temporary.resolve("trusted-ja"));
+        Path workspace = Files.createDirectories(temporary.resolve("untrusted-project"));
+        Files.createDirectory(workspace.resolve(".git"));
+        writeSkill(ja, "safe", "Safe user skill.", "user", null, null);
+        Path invalid = Files.createDirectories(workspace.resolve(".agents/skills/safe"));
+        Files.writeString(invalid.resolve("SKILL.md"), "not frontmatter", StandardCharsets.UTF_8);
+
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, agents, ja, false));
+
+        assertEquals(SkillCatalog.Source.JA_USER, descriptor(discovered, "safe").source());
+        assertEquals("user", read(catalog, discovered, "safe", "SKILL.md", 100).content());
+    }
+
+    /** 项目 Skill 从 Git 根到 cwd 逐层整包覆盖，而不是只读取仓库根目录。 */
     @Test
     void resolvesWorkspaceSkillsFromGitRootToCurrentDirectory() throws Exception {
         Path agents = temporary.resolve("absent-agents");
@@ -96,146 +143,88 @@ final class JaSkillSourcesTest {
         writeSkill(child.resolve(".agents/skills"), "scoped", "Deep scope.", "deep", null, null);
 
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(child, agents, ja, true));
+        SkillCatalog.Catalog discovered = catalog.discover(request(child, agents, ja, true));
 
-        assertEquals(SkillCatalog.Source.WORKSPACE, descriptor(snapshot, "scoped").source());
-        assertEquals("deep", read(catalog, snapshot, "scoped", "SKILL.md", 100).content());
+        assertEquals(SkillCatalog.Source.WORKSPACE, descriptor(discovered, "scoped").source());
+        assertEquals("deep", read(catalog, discovered, "scoped", "SKILL.md", 100).content());
     }
 
-    /** 验证调用方冻结为不受信任时完全跳过项目来源，损坏项目包也不能被解析。 */
+    /** select 按名称缩小 locator 集，且同值伪造 Catalog 不能获得原目录的读取权限。 */
     @Test
-    void skipsWorkspaceSourcesWhenFrozenTrustIsFalse() throws Exception {
-        Path agents = temporary.resolve("absent-agents");
-        Path ja = Files.createDirectories(temporary.resolve("trusted-ja"));
-        Path workspace = Files.createDirectories(temporary.resolve("untrusted-project"));
-        Files.createDirectory(workspace.resolve(".git"));
-        writeSkill(ja, "safe", "Safe user skill.", "user", null, null);
-        Path invalid = Files.createDirectories(workspace.resolve(".agents/skills/safe"));
-        Files.writeString(invalid.resolve("SKILL.md"), "not frontmatter", StandardCharsets.UTF_8);
-
-        JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(workspace, agents, ja, false));
-
-        assertEquals(SkillCatalog.Source.JA_USER, descriptor(snapshot, "safe").source());
-        assertEquals("user", read(catalog, snapshot, "safe", "SKILL.md", 100).content());
-    }
-
-    /** 验证换行符和 Unicode 组合形式不会产生平台特有的版本号。 */
-    @Test
-    void revisionUsesNormalizedReproducibleContent() throws Exception {
+    void selectsByNameAndRejectsForgedCatalogs() throws Exception {
         Path user = Files.createDirectories(temporary.resolve("user"));
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        Path skill = writeSkill(user, "cafe", "Caf\u00e9 review.", "line one\nline two", null, null);
+        writeSkill(user, "coding", "Coding.", "coding body", null, null);
+        Path review = writeSkill(user, "review", "Review.", "first review", null, null);
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot first = catalog.snapshot(request(workspace, user));
+        SkillCatalog.Catalog complete = catalog.discover(request(workspace, user));
 
-        Files.writeString(skill.resolve("SKILL.md"),
-                "---\r\nname: cafe\r\ndescription: Cafe\u0301 review.\r\n---\r\nline one\r\nline two",
-                StandardCharsets.UTF_8);
-        SkillCatalog.SkillSnapshot second = catalog.snapshot(request(workspace, user));
-
-        assertEquals(first.revision(), second.revision());
-        assertEquals(descriptor(first, "cafe").revision(), descriptor(second, "cafe").revision());
-    }
-
-    /** 验证替换后既有快照字节保持冻结，而后续 Turn 能读取新版本。 */
-    @Test
-    void freezesRevisionAndDocumentsForTurn() throws Exception {
-        Path user = Files.createDirectories(temporary.resolve("user"));
-        Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        Path skill = writeSkill(user, "stable", "Stable skill.", "first", null, null);
-        JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot first = catalog.snapshot(request(workspace, user));
-
-        writeDocument(skill, "stable", "Stable skill.", "second");
-        SkillCatalog.SkillSnapshot second = catalog.snapshot(request(workspace, user));
-
-        assertEquals("first", read(catalog, first, "stable", "SKILL.md", 100).content());
-        assertEquals("second", read(catalog, second, "stable", "SKILL.md", 100).content());
-        assertNotEquals(first.revision(), second.revision());
-        SkillCatalog.SkillSnapshot forged = new SkillCatalog.SkillSnapshot(
-                first.revision(), first.skills(), Instant.EPOCH);
-        assertThrows(IllegalArgumentException.class,
-                () -> read(catalog, forged, "stable", "SKILL.md", 100));
-    }
-
-    /** 验证选择结果只暴露精确解析版本，读取注册表不能越过筛选边界。 */
-    @Test
-    void filtersByResolvedRevisionAndFreezesSelectedDocuments() throws Exception {
-        Path user = Files.createDirectories(temporary.resolve("user"));
-        Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        writeSkill(user, "coding", "User coding.", "user body", null, null);
-        Path selectedSkill = writeSkill(user, "review", "Review.", "first review", null, null);
-        writeSkill(workspace.resolve(".agents/skills"), "coding", "Workspace coding.",
-                "workspace body", null, null);
-        JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot complete = catalog.snapshot(request(workspace, user));
-        String reviewRevision = descriptor(complete, "review").revision();
-
-        SkillCatalog.SkillSnapshot filtered = catalog.select(complete, List.of(reviewRevision));
+        SkillCatalog.Catalog filtered = catalog.select(complete, List.of("review"));
         assertEquals(List.of("review"), filtered.skills().stream()
                 .map(SkillCatalog.SkillDescriptor::name).toList());
-        assertEquals("first review", read(catalog, filtered, "review", "SKILL.md", 100).content());
         assertThrows(IllegalArgumentException.class,
                 () -> read(catalog, filtered, "coding", "SKILL.md", 100));
-
-        writeDocument(selectedSkill, "review", "Review.", "second review");
-        assertEquals("first review", read(catalog, filtered, "review", "SKILL.md", 100).content());
-    }
-
-    /** 验证 workspace 解析覆盖后，低优先级来源中的重复版本不可再被选择。 */
-    @Test
-    void rejectsRevisionHiddenByPrecedence() throws Exception {
-        Path user = Files.createDirectories(temporary.resolve("user"));
-        Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        writeSkill(user, "coding", "User coding.", "user body", null, null);
-        JaSkillSources catalog = new JaSkillSources();
-        Path userOnlyWorkspace = Files.createDirectories(temporary.resolve("user-only-workspace"));
-        String hiddenRevision = descriptor(catalog.snapshot(request(userOnlyWorkspace, user)), "coding").revision();
-        writeSkill(workspace.resolve(".agents/skills"), "coding", "Workspace coding.",
-                "workspace body", null, null);
-
-        SkillCatalog.SkillSnapshot workspaceComplete = catalog.snapshot(request(workspace, user));
         assertThrows(IllegalArgumentException.class,
-                () -> catalog.select(workspaceComplete, List.of(hiddenRevision)));
+                () -> catalog.select(complete, List.of("missing")));
+
+        writeDocument(review, "review", "Review.", "second review");
+        assertEquals("second review", read(catalog, filtered, "review", "SKILL.md", 100).content());
+
+        SkillCatalog.Catalog forged = new SkillCatalog.Catalog(complete.skills());
+        assertThrows(IllegalArgumentException.class,
+                () -> read(catalog, forged, "review", "SKILL.md", 100));
     }
 
-    /** 验证空选择不访问任何 Skill 来源，未授权的损坏目录不能阻断 Turn。 */
+    /** 空目录与空选择都不扫描来源，并保持读取边界关闭。 */
     @Test
-    void emptySelectionProducesReadableButEmptySnapshotBoundary() throws Exception {
-        Path user = Files.writeString(temporary.resolve("user-not-directory"), "ignored",
+    void createsEmptyCatalogWithoutSourceIo() throws Exception {
+        Path invalidSource = Files.writeString(temporary.resolve("not-directory"), "ignored",
                 StandardCharsets.UTF_8);
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        Path invalid = Files.createDirectories(workspace.resolve(".agents/skills/invalid"));
-        Files.writeString(invalid.resolve("SKILL.md"),
-                "---\nname: invalid\ndescription: |\n---\nignored", StandardCharsets.UTF_8);
         JaSkillSources catalog = new JaSkillSources();
 
-        SkillCatalog.SkillSnapshot empty = catalog.emptySnapshot();
+        SkillCatalog.Catalog empty = catalog.emptyCatalog();
 
         assertTrue(empty.skills().isEmpty());
-        assertTrue(empty.revision().matches("skills_[0-9a-f]{64}"));
+        assertTrue(catalog.select(empty, List.of()).skills().isEmpty());
         assertThrows(IllegalArgumentException.class,
                 () -> read(catalog, empty, "coding", "SKILL.md", 100));
+        assertTrue(Files.isRegularFile(invalidSource));
     }
 
-    /** 验证未知、重复、空 block 及缺失必填字段不会进入可用快照。 */
+    /** 未知、重复、空 block、缺失必填字段、BOM 与非法 UTF-8 frontmatter 都不能进入目录。 */
     @Test
-    void rejectsInvalidOrUnknownFrontmatterFields() throws Exception {
+    void rejectsUnsafeOrInvalidFrontmatterDuringDiscovery() throws Exception {
         List<String> invalid = List.of(
                 "---\nname: bad\ndescription: Bad.\nunknown: 1\n---\nbody",
                 "---\nname: bad\nname: bad\ndescription: Bad.\n---\nbody",
                 "---\nname: bad\ndescription: |\n---\nbody",
                 "---\nname: bad\n---\nbody");
         for (int index = 0; index < invalid.size(); index++) {
-            Path root = Files.createDirectories(temporary.resolve("user-" + index));
+            Path root = Files.createDirectories(temporary.resolve("invalid-" + index));
             Path skill = Files.createDirectories(root.resolve("bad"));
             Files.writeString(skill.resolve("SKILL.md"), invalid.get(index), StandardCharsets.UTF_8);
-            assertSnapshotRejected(root);
+            assertDiscoveryRejected(root);
         }
+
+        Path bomRoot = Files.createDirectories(temporary.resolve("bom-user"));
+        Path bom = Files.createDirectories(bomRoot.resolve("bad")).resolve("SKILL.md");
+        byte[] valid = "---\nname: bad\ndescription: Bad.\n---\nbody".getBytes(StandardCharsets.UTF_8);
+        byte[] withBom = new byte[valid.length + 3];
+        withBom[0] = (byte) 0xEF;
+        withBom[1] = (byte) 0xBB;
+        withBom[2] = (byte) 0xBF;
+        System.arraycopy(valid, 0, withBom, 3, valid.length);
+        Files.write(bom, withBom);
+        assertDiscoveryRejected(bomRoot);
+
+        Path malformedRoot = Files.createDirectories(temporary.resolve("malformed-user"));
+        Path malformed = Files.createDirectories(malformedRoot.resolve("bad")).resolve("SKILL.md");
+        Files.write(malformed, new byte[] {(byte) 0xC3, (byte) 0x28});
+        assertDiscoveryRejected(malformedRoot);
     }
 
-    /** 验证 Agent Skills 标准可选字段可被读取，但 allowed-tools 不进入公开 descriptor。 */
+    /** 标准可选 frontmatter 可发现，但 allowed-tools 不进入公开 descriptor 或授权边界。 */
     @Test
     void acceptsStandardOptionalFrontmatterWithoutGrantingTools() throws Exception {
         Path ja = Files.createDirectories(temporary.resolve("optional-ja"));
@@ -258,177 +247,158 @@ final class JaSkillSourcesTest {
         Files.writeString(skill.resolve("SKILL.md"), document, StandardCharsets.UTF_8);
 
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(
+        SkillCatalog.Catalog discovered = catalog.discover(request(
                 Files.createDirectories(temporary.resolve("optional-workspace")), ja));
-        SkillCatalog.SkillDescriptor descriptor = descriptor(snapshot, "standard");
+        SkillCatalog.SkillDescriptor descriptor = descriptor(discovered, "standard");
 
         assertEquals("Standard skill metadata.", descriptor.description());
         assertFalse(descriptor.toString().contains("allowed-tools"));
-        assertEquals("body\n", read(catalog, snapshot, "standard", "SKILL.md", 100).content());
+        assertEquals("body\n", read(catalog, discovered, "standard", "SKILL.md", 100).content());
+    }
 
+    /** Windows checkout 的 CRLF 在 UTF-8 规范化前也必须关闭 frontmatter，避免 JVM 与 Native
+     * 只因资源复制保留平台换行而产生不同的 Skill 目录。 */
+    @Test
+    void discoversCrLfSkillDocumentsBeforeLineEndingNormalization() throws Exception {
+        Path user = Files.createDirectories(temporary.resolve("crlf-user"));
+        Path workspace = Files.createDirectories(temporary.resolve("crlf-workspace"));
+        Path skill = Files.createDirectories(user.resolve("windows-lines"));
         Files.writeString(skill.resolve("SKILL.md"),
-                document.replace("Bash(git:*) Read", "Bash(git:*) Read Write"), StandardCharsets.UTF_8);
-        SkillCatalog.SkillSnapshot refreshed = catalog.snapshot(request(
-                temporary.resolve("optional-workspace"), ja));
-        assertNotEquals(descriptor.revision(), descriptor(refreshed, "standard").revision());
+                "---\r\nname: windows-lines\r\ndescription: Windows lines.\r\n---\r\nbody\r\n",
+                StandardCharsets.UTF_8);
+
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
+
+        assertEquals("Windows lines.", descriptor(discovered, "windows-lines").description());
+        assertEquals("body\n", read(catalog, discovered, "windows-lines", "SKILL.md", 100).content());
     }
 
-    /** 验证带 BOM 或非法 UTF-8 的包被排除，但不阻断其它已解析 Skill。 */
+    /** 读取拒绝父级、别名、绝对路径与过深路径，并在 Unicode 安全边界截断。 */
     @Test
-    void rejectsBomAndMalformedUtf8() throws Exception {
-        Path bomRoot = Files.createDirectories(temporary.resolve("bom-user"));
-        Path bom = Files.createDirectories(bomRoot.resolve("bad")).resolve("SKILL.md");
-        byte[] valid = "---\nname: bad\ndescription: Bad.\n---\nbody".getBytes(StandardCharsets.UTF_8);
-        byte[] withBom = new byte[valid.length + 3];
-        withBom[0] = (byte) 0xEF;
-        withBom[1] = (byte) 0xBB;
-        withBom[2] = (byte) 0xBF;
-        System.arraycopy(valid, 0, withBom, 3, valid.length);
-        Files.write(bom, withBom);
-        assertSnapshotRejected(bomRoot);
-
-        Path malformedRoot = Files.createDirectories(temporary.resolve("malformed-user"));
-        Path malformed = Files.createDirectories(malformedRoot.resolve("bad")).resolve("SKILL.md");
-        Files.write(malformed, new byte[] {(byte) 0xC3, (byte) 0x28});
-        assertSnapshotRejected(malformedRoot);
-    }
-
-    /** 验证逻辑读取不能逃逸、别名映射或绕过已冻结的精确资源键。 */
-    @Test
-    void rejectsTraversalAndAmbiguousResourcePaths() throws Exception {
+    void rejectsEscapingOrAmbiguousResourcePaths() throws Exception {
         Path user = Files.createDirectories(temporary.resolve("user"));
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
-        writeSkill(user, "safe", "Safe skill.", "body", "notes/a.txt", "ab");
+        writeSkill(user, "safe", "Safe skill.", "body", "notes/a.txt", "A😀B");
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(workspace, user));
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
 
         assertThrows(IllegalArgumentException.class,
                 () -> new SkillCatalog.SkillReadRequest("safe", "../outside", 100));
         assertThrows(IllegalArgumentException.class,
-                () -> read(catalog, snapshot, "safe", "notes/./a.txt", 100));
+                () -> read(catalog, discovered, "safe", "notes/./a.txt", 100));
         assertThrows(IllegalArgumentException.class,
-                () -> read(catalog, snapshot, "safe", "notes//a.txt", 100));
-        assertTrue(read(catalog, snapshot, "safe", "notes/a.txt", 1).truncated());
+                () -> read(catalog, discovered, "safe", "notes//a.txt", 100));
+        assertThrows(IllegalArgumentException.class,
+                () -> read(catalog, discovered, "safe", "C:/outside.txt", 100));
+        assertThrows(IllegalArgumentException.class,
+                () -> read(catalog, discovered, "safe", "a/b/c/d/e/f/g/h/i.txt", 100));
+        SkillCatalog.SkillDocument truncated = read(catalog, discovered, "safe", "notes/a.txt", 2);
+        assertEquals("A", truncated.content());
+        assertTrue(truncated.truncated());
     }
 
-    /** 验证文件系统链接即使当前解析到来源目录内部也必须拒绝。 */
+    /** 实时读取继续失败关闭超大文件和非法 UTF-8，不因发现成功而信任后续替换内容。 */
     @Test
-    void rejectsSymbolicLinksWhenPlatformPermitsCreation() throws Exception {
+    void failsClosedOnLiveSizeAndUtf8Violations() throws Exception {
+        Path user = Files.createDirectories(temporary.resolve("user"));
+        Path workspace = Files.createDirectories(temporary.resolve("workspace"));
+        Path skill = writeSkill(user, "mutable", "Mutable.", "body", "notes/value.txt", "valid");
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
+
+        Files.writeString(skill.resolve("notes/value.txt"),
+                "x".repeat(JaSkillSources.MAX_FILE_BYTES + 1), StandardCharsets.UTF_8);
+        assertThrows(UncheckedIOException.class,
+                () -> read(catalog, discovered, "mutable", "notes/value.txt", 100));
+
+        Files.write(skill.resolve("notes/value.txt"), new byte[] {(byte) 0xC3, (byte) 0x28});
+        assertThrows(UncheckedIOException.class,
+                () -> read(catalog, discovered, "mutable", "notes/value.txt", 100));
+    }
+
+    /** 发现后新增的符号链接资源仍在 read 时拒绝，不能借实时读取逃逸来源根。 */
+    @Test
+    void rejectsSymbolicLinksAtReadTimeWhenPlatformPermitsCreation() throws Exception {
         Path user = Files.createDirectories(temporary.resolve("user"));
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
         Path skill = writeSkill(user, "linked", "Linked skill.", "body", null, null);
-        Path target = Files.writeString(skill.resolve("target.txt"), "target", StandardCharsets.UTF_8);
+        Path outside = Files.writeString(temporary.resolve("outside.txt"), "outside", StandardCharsets.UTF_8);
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
         try {
-            Files.createSymbolicLink(skill.resolve("alias.txt"), target.getFileName());
+            Files.createSymbolicLink(skill.resolve("alias.txt"), outside);
         } catch (UnsupportedOperationException | IOException | SecurityException unavailable) {
             return;
         }
-        JaSkillSources catalog = new JaSkillSources();
-        assertTrue(catalog.snapshot(request(workspace, user)).skills().stream()
-                .noneMatch(item -> "linked".equals(item.name())));
+
+        assertThrows(UncheckedIOException.class,
+                () -> read(catalog, discovered, "linked", "alias.txt", 100));
     }
 
-    /** 验证 Windows junction 属于重解析点，即使目标可读也必须拒绝。 */
+    /** Windows junction 属于重解析点，即使在发现后创建且目标可读也必须在 read 时拒绝。 */
     @Test
-    void rejectsWindowsJunctionsWhenPlatformPermitsCreation() throws Exception {
+    void rejectsWindowsJunctionsAtReadTimeWhenPlatformPermitsCreation() throws Exception {
         if (!System.getProperty("os.name", "").toLowerCase().contains("windows")) {
             return;
         }
         Path user = Files.createDirectories(temporary.resolve("user"));
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
         Path skill = writeSkill(user, "junction", "Junction skill.", "body", null, null);
-        Path target = Files.createDirectories(temporary.resolve("junction-target"));
-        Files.writeString(target.resolve("outside.txt"), "outside", StandardCharsets.UTF_8);
+        Path outside = Files.createDirectories(temporary.resolve("junction-target"));
+        Files.writeString(outside.resolve("outside.txt"), "outside", StandardCharsets.UTF_8);
+        JaSkillSources catalog = new JaSkillSources();
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
         Process process = new ProcessBuilder("cmd.exe", "/d", "/c", "mklink", "/J",
-                skill.resolve("alias").toString(), target.toString()).redirectErrorStream(true).start();
+                skill.resolve("alias").toString(), outside.toString()).redirectErrorStream(true).start();
         if (process.waitFor() != 0) {
             return;
         }
-        JaSkillSources catalog = new JaSkillSources();
-        assertTrue(catalog.snapshot(request(workspace, user)).skills().stream()
-                .noneMatch(item -> "junction".equals(item.name())));
+
+        assertThrows(UncheckedIOException.class,
+                () -> read(catalog, discovered, "junction", "alias/outside.txt", 100));
     }
 
-    /** 验证文件数、嵌套深度与保守 token 预算超限包被整体排除，不执行截断。 */
+    /** 内置 coding 只在目录公开元数据，正文仍由显式 read 按需加载而不在发现阶段冻结。 */
     @Test
-    void enforcesCountDepthAndTextBudgets() throws Exception {
-        Path countRoot = Files.createDirectories(temporary.resolve("count-user"));
-        Path counted = writeSkill(countRoot, "counted", "Counted skill.", "body", null, null);
-        for (int index = 0; index < JaSkillSources.MAX_FILES_PER_SKILL; index++) {
-            Files.writeString(counted.resolve("r" + index + ".txt"), "x", StandardCharsets.UTF_8);
-        }
-        assertSnapshotRejected(countRoot);
-
-        Path depthRoot = Files.createDirectories(temporary.resolve("depth-user"));
-        Path deep = writeSkill(depthRoot, "deep", "Deep skill.", "body", null, null);
-        Path nested = deep;
-        for (int index = 0; index < JaSkillSources.MAX_DIRECTORY_DEPTH + 1; index++) {
-            nested = Files.createDirectories(nested.resolve("d" + index));
-        }
-        Files.writeString(nested.resolve("too-deep.txt"), "x", StandardCharsets.UTF_8);
-        assertSnapshotRejected(depthRoot);
-
-        Path bytesRoot = Files.createDirectories(temporary.resolve("bytes-user"));
-        Path bytes = writeSkill(bytesRoot, "bytes", "Byte-limited skill.", "body", null, null);
-        Files.writeString(bytes.resolve("oversize.txt"),
-                "x".repeat(JaSkillSources.MAX_FILE_BYTES + 1), StandardCharsets.UTF_8);
-        assertSnapshotRejected(bytesRoot);
-
-        Path documentRoot = Files.createDirectories(temporary.resolve("document-user"));
-        Path document = Files.createDirectories(documentRoot.resolve("document"));
-        Files.writeString(document.resolve("SKILL.md"),
-                "---\nname: document\ndescription: Document size.\n---\n"
-                        + "x".repeat(JaSkillSources.MAX_SKILL_DOCUMENT_BYTES),
-                StandardCharsets.UTF_8);
-        assertSnapshotRejected(documentRoot);
-
-        Path tokenRoot = Files.createDirectories(temporary.resolve("token-user"));
-        writeSkill(tokenRoot, "large", "Large skill.",
-                "x".repeat(JaSkillSources.MAX_SKILL_TOKENS + 1), null, null);
-        assertSnapshotRejected(tokenRoot);
-    }
-
-    /** 验证显式注册可加载 classpath builtin 资源，且无需枚举目录。 */
-    @Test
-    void loadsBuiltinFromExactClasspathFixture() throws Exception {
+    void discoversBuiltinCodingSkillAndReadsItsDocumentOnDemand() throws Exception {
         Path user = temporary.resolve("absent-user");
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(workspace, user));
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
 
-        SkillCatalog.SkillDescriptor coding = descriptor(snapshot, "coding");
-        assertEquals(SkillCatalog.Source.BUNDLED, coding.source());
-        assertTrue(coding.revision().matches("skill_[0-9a-f]{64}"));
-        assertTrue(snapshot.revision().matches("skills_[0-9a-f]{64}"));
-        assertTrue(read(catalog, snapshot, "coding", "SKILL.md", 10_000).content()
+        assertEquals(List.of("coding"), discovered.skills().stream()
+                .map(SkillCatalog.SkillDescriptor::name).toList());
+        assertEquals(SkillCatalog.Source.BUNDLED, descriptor(discovered, "coding").source());
+        assertTrue(read(catalog, discovered, "coding", "SKILL.md", 2_000).content()
                 .contains("# Ja coding skill"));
     }
 
-    /** 创建冻结 Kernel API 所要求的绝对请求结构，避免测试夹具隐含路径语义。 */
-    private static SkillCatalog.SnapshotRequest request(Path workspace, Path user) {
-        return new SkillCatalog.SnapshotRequest(
+    /** 创建公开 Kernel API 所要求的绝对发现请求，避免测试夹具隐含路径语义。 */
+    private static SkillCatalog.DiscoveryRequest request(Path workspace, Path user) {
+        return new SkillCatalog.DiscoveryRequest(
                 workspace.toAbsolutePath().normalize(),
                 user.resolveSibling(user.getFileName() + "-agents-absent").toAbsolutePath().normalize(),
                 user.toAbsolutePath().normalize(), true);
     }
 
     /** 构造显式四来源请求，测试不会依赖进程 user.home 或真实 Ja home。 */
-    private static SkillCatalog.SnapshotRequest request(
+    private static SkillCatalog.DiscoveryRequest request(
             Path workspace, Path agents, Path ja, boolean trusted) {
-        return new SkillCatalog.SnapshotRequest(
+        return new SkillCatalog.DiscoveryRequest(
                 workspace.toAbsolutePath().normalize(), agents.toAbsolutePath().normalize(),
                 ja.toAbsolutePath().normalize(), trusted);
     }
 
     /** 按身份定位描述对象，避免断言依赖排序后的列表下标。 */
-    private static SkillCatalog.SkillDescriptor descriptor(SkillCatalog.SkillSnapshot snapshot, String name) {
-        return snapshot.skills().stream().filter(skill -> name.equals(skill.name())).findFirst().orElseThrow();
+    private static SkillCatalog.SkillDescriptor descriptor(SkillCatalog.Catalog catalog, String name) {
+        return catalog.skills().stream().filter(skill -> name.equals(skill.name())).findFirst().orElseThrow();
     }
 
-    /** 通过紧凑夹具调用公开延迟读取端口，保持测试贴近真实边界。 */
-    private static SkillCatalog.SkillDocument read(JaSkillSources catalog, SkillCatalog.SkillSnapshot snapshot,
+    /** 通过紧凑夹具调用公开实时读取端口，保持测试贴近真实边界。 */
+    private static SkillCatalog.SkillDocument read(JaSkillSources catalog, SkillCatalog.Catalog discovered,
             String skill, String path, int limit) {
-        return catalog.read(snapshot, new SkillCatalog.SkillReadRequest(skill, path, limit));
+        return catalog.read(discovered, new SkillCatalog.SkillReadRequest(skill, path, limit));
     }
 
     /** 仅使用当前字段写入合法包及可选嵌套资源，避免夹具携带兼容数据。 */
@@ -444,17 +414,18 @@ final class JaSkillSourcesTest {
         return skill;
     }
 
-    /** 只替换主文档，以隔离并验证快照版本行为。 */
+    /** 只替换主文档，以隔离并验证发现元数据与实时正文的不同生命周期。 */
     private static void writeDocument(Path skill, String name, String description, String body) throws Exception {
         Files.writeString(skill.resolve("SKILL.md"), "---\nname: " + name + "\ndescription: "
                 + description + "\n---\n" + body, StandardCharsets.UTF_8);
     }
 
-    /** 断言非法包不进入可用快照，同时保留同一来源中的其它合法条目。 */
-    private void assertSnapshotRejected(Path userRoot) throws Exception {
+    /** 断言非法 frontmatter 不进入可用目录，同时保留同源其它合法条目。 */
+    private void assertDiscoveryRejected(Path userRoot) throws Exception {
         Path workspace = Files.createDirectories(temporary.resolve("workspace-" + userRoot.getFileName()));
         JaSkillSources catalog = new JaSkillSources();
-        SkillCatalog.SkillSnapshot snapshot = catalog.snapshot(request(workspace, userRoot));
-        assertTrue(snapshot.skills().stream().noneMatch(item -> item.source() == SkillCatalog.Source.JA_USER));
+        SkillCatalog.Catalog discovered = catalog.discover(request(workspace, userRoot));
+        assertTrue(discovered.skills().stream()
+                .noneMatch(item -> item.source() == SkillCatalog.Source.JA_USER));
     }
 }

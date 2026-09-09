@@ -29,27 +29,86 @@ fn cancel_input_is_strict_and_bounded() {
     );
 }
 
-/// queued input 只接受绝对 Turn identity 与一个有界 text value；legacy queue control 与 NUL
-/// payload 不得进入 bridge actor。
+/// Resume 与 Cancel 共用冻结 identity/CAS 边界，但仍是独立领域意图，不能携带本地恢复状态。
 #[test]
-fn queued_input_is_strict_and_bounded() {
-    let valid = TurnQueuedInput {
+fn resume_input_is_strict_and_bounded() {
+    assert!(
+        TurnResumeInput {
+            turn_id: "turn_fixture".to_owned(),
+            expected_thread_revision: 7,
+        }
+        .validate()
+        .is_ok()
+    );
+    for input in [
+        TurnResumeInput {
+            turn_id: "turn_._fixture".to_owned(),
+            expected_thread_revision: 7,
+        },
+        TurnResumeInput {
+            turn_id: "turn_fixture".to_owned(),
+            expected_thread_revision: 9_007_199_254_740_992,
+        },
+    ] {
+        assert!(input.validate().is_err());
+    }
+}
+
+/// enqueue 只接受冻结 Turn identity 与单条队列预算；kind、排序和 NUL 不得进入 bridge actor。
+#[test]
+fn turn_input_enqueue_is_strict_and_bounded() {
+    let valid = TurnInputEnqueue {
         turn_id: "turn_fixture".to_owned(),
-        text: "guide the next model call".to_owned(),
+        content: vec![TurnContentPart::Text {
+            text: "guide the next model call".to_owned(),
+        }],
     };
     assert!(valid.validate().is_ok());
     assert!(
-        TurnQueuedInput {
+        TurnInputEnqueue {
             turn_id: "turn_fixture".to_owned(),
-            text: "".to_owned()
+            content: vec![TurnContentPart::Text { text: "".to_owned() }]
         }
         .validate()
         .is_err()
     );
     assert!(
-        TurnQueuedInput {
+        TurnInputEnqueue {
             turn_id: "turn_fixture".to_owned(),
-            text: "bad\0text".to_owned()
+            content: vec![TurnContentPart::Text { text: "bad\0text".to_owned() }]
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+/// prioritize/update/delete 共用严格 item CAS，update 还必须重新执行单条文本预算。
+#[test]
+fn turn_input_mutations_are_identity_and_revision_bounded() {
+    assert!(
+        TurnInputPrioritize {
+            turn_id: "turn_fixture".to_owned(),
+            input_id: "input_fixture".to_owned(),
+            expected_input_revision: 1,
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        TurnInputDelete {
+            turn_id: "turn_fixture".to_owned(),
+            input_id: "wrong_fixture".to_owned(),
+            expected_input_revision: 1,
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        TurnInputUpdate {
+            turn_id: "turn_fixture".to_owned(),
+            input_id: "input_fixture".to_owned(),
+            expected_input_revision: 9_007_199_254_740_992,
+            content: vec![TurnContentPart::Text { text: "updated".to_owned() }],
         }
         .validate()
         .is_err()
@@ -92,11 +151,19 @@ fn turn_content_is_strict_bounded_and_path_free() {
     let valid = TurnStartInput {
         thread_id: "thr_fixture".to_owned(),
         content: vec![
-            TurnContentPart::Text {
-                text: "hello".to_owned(),
+            TurnContentPart::WorkspaceReference {
+                workspace_id: "ws_fixture".to_owned(),
+                relative_path: "src/main.rs".to_owned(),
+                kind: "file".to_owned(),
+            },
+            TurnContentPart::SkillReference {
+                skill_id: "skill_fixture".to_owned(),
             },
             TurnContentPart::Attachment {
                 attachment_id: "att_fixture".to_owned(),
+            },
+            TurnContentPart::Text {
+                text: "hello".to_owned(),
             },
         ],
         deadline_ms: Some(86_400_000),
@@ -131,6 +198,29 @@ fn turn_content_is_strict_bounded_and_path_free() {
         .validate()
         .is_err()
     );
+}
+
+/// Frozen review 只允许 artifact 内的协议相对路径，防止单文件读取成为宿主路径探针。
+#[test]
+fn turn_change_set_read_is_bound_to_a_safe_file_path() {
+    let valid = TurnChangeSetReadInput {
+        thread_id: "thr_fixture".to_owned(),
+        turn_id: "turn_fixture".to_owned(),
+        artifact_id: "artifact_fixture".to_owned(),
+        file_path: "src/main.rs".to_owned(),
+    };
+    assert!(valid.validate().is_ok());
+
+    for invalid_path in ["", "/src/main.rs", "C:/src/main.rs", "../main.rs", "src\\main.rs"] {
+        assert!(
+            TurnChangeSetReadInput {
+                file_path: invalid_path.to_owned(),
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+    }
 }
 
 /// Import/discard 输入只承认 Rust token/hash 和 Java identity，不接受路径或超预算元数据。

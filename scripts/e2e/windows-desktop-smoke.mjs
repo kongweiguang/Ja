@@ -8,27 +8,126 @@
 
 import { execFile, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
-import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createReadStream, realpathSync } from "node:fs";
+import {
+  copyFile,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import process from "node:process";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "@playwright/test";
+import {
+  classifyContextSummaryRequest,
+  contextSummaryFixtureStream,
+  devicePixelRatioMatches,
+} from "./turn-change-review-production.mjs";
+import {
+  PLAN_GOAL_CONTRACT_VERSION,
+  collectPlanGoalAcceptanceReport,
+  validatePlanGoalAcceptanceReport,
+} from "./plan-goal-production.mjs";
+import { createPlanGoalWebView2Driver } from "./plan-goal-webview2-driver.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const desktopSmokeLockDirectory = join(tmpdir(), "ja-desktop-e2e-runner.lock");
 let java25Home;
 let java25;
+// 单进程 runner 只保留最近一次 picker 的脱敏阶段快照；后续 Preview/Workbench 失败时，
+// summary 仍能证明 picker 是否已经 start/resolved 并投影 ready，而不依赖已关闭的 WebView。
+let attachmentPickerLastEvidence;
+let attachmentClipboardLastEvidence;
+let attachmentDropLastEvidence;
 const configuredRealProviderMode = process.env.JA_E2E_REAL_PROVIDER === "1";
-const automaticTitleAcceptanceMode = process.env.JA_E2E_AUTOMATIC_TITLE === "1";
-const realProviderMode = configuredRealProviderMode || automaticTitleAcceptanceMode;
-const runDeadlineMs = 900_000;
+const operationRecoveryAcceptanceMode = process.env.JA_E2E_OPERATION_RECOVERY_ONLY === "1";
+const inputQueueAcceptanceMode = process.env.JA_E2E_INPUT_QUEUE_ONLY === "1";
+const toolLifecycleAcceptanceMode = process.env.JA_E2E_TOOL_LIFECYCLE_ONLY === "1";
+const toolFailureAcceptanceMode = process.env.JA_E2E_TOOL_FAILURE_ONLY === "1";
+const sidebarThreadAcceptanceMode = process.env.JA_E2E_SIDEBAR_THREAD_ONLY === "1";
+const composerContextAcceptanceMode = process.env.JA_E2E_COMPOSER_CONTEXT_ONLY === "1";
+const taskThreadsAcceptanceMode = process.env.JA_E2E_TASK_THREADS_ONLY === "1";
+const configuredNativeSidecarDirectory =
+  process.env.JA_E2E_NATIVE_SIDECAR_DIRECTORY?.trim() || undefined;
+const planGoalAcceptanceMode = process.env.JA_E2E_PLAN_GOAL_ONLY === "1";
+const planGoalReportPath = process.env.JA_E2E_PLAN_GOAL_REPORT?.trim() || undefined;
+const planGoalSidecarManifest = process.env.JA_E2E_PLAN_GOAL_SIDECAR_MANIFEST?.trim() || undefined;
+const planGoalSidecarExecutable =
+  process.env.JA_E2E_PLAN_GOAL_SIDECAR_EXECUTABLE?.trim() || undefined;
+const configuredPlanGoalContractVersion = Number(
+  process.env.JA_E2E_PLAN_GOAL_CONTRACT_VERSION || 0,
+);
+const turnChangeReviewAcceptanceMode = process.env.JA_E2E_TURN_CHANGE_REVIEW_ONLY === "1";
+const runtimeRefreshAcceptanceMode = process.env.JA_E2E_RUNTIME_REFRESH_ONLY === "1";
+const turnChangeReviewReportPath =
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_REPORT?.trim() || undefined;
+const turnChangeReviewSidecarManifest =
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_SIDECAR_MANIFEST?.trim() || undefined;
+const turnChangeReviewSidecarExecutable =
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_SIDECAR_EXECUTABLE?.trim() || undefined;
+const configuredPlanGoalSoakMinutes = Number(process.env.JA_E2E_PLAN_GOAL_SOAK_MINUTES || 0);
+if (
+  !Number.isInteger(configuredPlanGoalSoakMinutes) ||
+  configuredPlanGoalSoakMinutes < 0 ||
+  configuredPlanGoalSoakMinutes > 1_440
+) {
+  throw new Error("JA_E2E_PLAN_GOAL_SOAK_MINUTES 必须是 0..1440 的整数");
+}
+if (
+  planGoalAcceptanceMode &&
+  (configuredPlanGoalContractVersion !== PLAN_GOAL_CONTRACT_VERSION ||
+    planGoalReportPath === undefined ||
+    !isAbsolute(planGoalReportPath))
+) {
+  throw new Error("Plan/Goal focused 模式必须提供 v1 contract 与绝对报告路径");
+}
+const automaticTitleAcceptanceMode =
+  process.env.JA_E2E_AUTOMATIC_TITLE === "1" ||
+  operationRecoveryAcceptanceMode ||
+  inputQueueAcceptanceMode ||
+  toolLifecycleAcceptanceMode ||
+  toolFailureAcceptanceMode ||
+  composerContextAcceptanceMode ||
+  planGoalAcceptanceMode ||
+  turnChangeReviewAcceptanceMode;
+// 侧栏未读/失败提醒需要可控地把 Turn 停在 running，再在用户切离后分别提交成功与失败；
+// 复用现有 loopback Responses fixture 可避免 wall-clock 竞态，也不会产生付费 Provider 调用。
+const realProviderMode =
+  configuredRealProviderMode ||
+  automaticTitleAcceptanceMode ||
+  sidebarThreadAcceptanceMode ||
+  taskThreadsAcceptanceMode ||
+  planGoalAcceptanceMode ||
+  turnChangeReviewAcceptanceMode ||
+  runtimeRefreshAcceptanceMode;
+// Goal soak 的时长只从首个 not_met 之后开始计量；启动、审批、前置 evaluator、八帧矩阵、
+// crash/restart 与清理另有 30 分钟 runner 开销预算，不能挤占用户要求的 120 分钟有效 soak。
+// 各产品等待仍由更窄的局部 Deadline 失败关闭，扩大这里只避免外层计时器提前截断证据链。
+const planGoalScenarioOverheadMs = 1_800_000;
+// 普通 smoke 已覆盖两轮应用进程、真实 PTY/剪贴板/附件与故障恢复；总预算只包围完整证据链，
+// 每个产品操作仍由更窄的局部 deadline 失败关闭，不能借此掩盖卡死或无限重试。
+const defaultRunDeadlineMs = 1_800_000;
+const runDeadlineMs = planGoalAcceptanceMode
+  ? configuredPlanGoalSoakMinutes * 60_000 + planGoalScenarioOverheadMs
+  : defaultRunDeadlineMs;
 const cdpStartupDeadlineMs = 120_000;
 const turnDeadlineMs = realProviderMode ? 180_000 : 30_000;
+// Codex shell 结构矩阵包含两个真实 pointer drag、键盘焦点与视觉采样，不与模型 Turn 共用预算；
+// 单个 DOM/原生动作仍由同一绝对期限约束，避免逐断言重置造成无界扩张。
+const codexShellDeadlineMs = 120_000;
 const closeDeadlineMs = 20_000;
 const pollMs = 1_000;
 const snapshotTimeoutMs = 15_000;
@@ -85,10 +184,154 @@ const nativeShortcutCases = Object.freeze([
 const visualEvidenceDirectory = process.env.JA_E2E_SCREENSHOT_DIR?.trim() || undefined;
 const visualTheme = process.env.JA_E2E_THEME === "light" ? "light" : "dark";
 const shellOnlyMode = process.env.JA_E2E_SHELL_ONLY === "1";
+const projectNewConversationAcceptanceMode =
+  process.env.JA_E2E_PROJECT_NEW_CONVERSATION_ONLY === "1";
+const workspaceSwitchPerformanceMode = process.env.JA_E2E_WORKSPACE_SWITCH_PERF_ONLY === "1";
+const themeMatrixAcceptanceMode = process.env.JA_E2E_THEME_MATRIX_ONLY === "1";
+// 全量桌面验收也必须使用显式 loopback Provider；生产内核不再保留按模型名触发的测试实现。
+const defaultDesktopLoopbackMode =
+  !configuredRealProviderMode &&
+  !automaticTitleAcceptanceMode &&
+  !sidebarThreadAcceptanceMode &&
+  !taskThreadsAcceptanceMode &&
+  !projectNewConversationAcceptanceMode &&
+  !workspaceSwitchPerformanceMode &&
+  !themeMatrixAcceptanceMode &&
+  !planGoalAcceptanceMode &&
+  !runtimeRefreshAcceptanceMode;
 const allowTrashCommit = process.env.JA_E2E_ALLOW_TRASH === "1";
 const configuredEdgeDriverPath = process.env.JA_E2E_EDGEDRIVER_PATH?.trim() || undefined;
 const edgeDriverRunnerPath = join(repoRoot, "scripts", "e2e", "webview2-edgedriver-runner.cmd");
+const clipboardFixtureBrokerPath = join(
+  repoRoot,
+  "scripts",
+  "e2e",
+  "windows-clipboard-fixture.ps1",
+);
 const edgeDriverProfileDirectoryName = "edgedriver-profile";
+// 数量复现真实故障中数千个生成文件的压力，同时把普通 untracked 控制在足以暴露 Git 扫描回归的规模。
+const workspaceSwitchIgnoredFixtureCount = 4_500;
+const workspaceSwitchUntrackedFixtureCount = 2_000;
+const workspaceSwitchRoundTrips = 6;
+const turnChangeReviewSmallPayloadBytes = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_SMALL_BYTES || 65_536,
+);
+const turnChangeReviewLargePayloadBytes = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_LARGE_BYTES || 1_048_576,
+);
+const turnChangeReviewLargeLogicalLines = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_LARGE_LINES || 10_000,
+);
+const turnChangeReviewPerformanceSamples = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_PERFORMANCE_SAMPLES || 30,
+);
+const turnChangeReviewSelectionP95BudgetMs = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_SELECTION_P95_MS || 50,
+);
+const turnChangeReviewSmallP95BudgetMs = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_SMALL_P95_MS || 300,
+);
+const turnChangeReviewLargeP95BudgetMs = Number(
+  process.env.JA_E2E_TURN_CHANGE_REVIEW_LARGE_P95_MS || 800,
+);
+const defaultE2eContextWindowTokens = 128_000;
+const turnChangeReviewContextWindowTokens = 2_000_000;
+const composerContextSkill = Object.freeze({
+  skillId: "skill_composer_context",
+  name: "composer-context",
+  description: "Composer context acceptance Skill",
+  bodyMarker: "JA_COMPOSER_CONTEXT_SKILL_ACTIVE",
+});
+const runtimeRefreshFixtureContract = Object.freeze({
+  scenarioId: "runtime_refresh",
+  prompt: "运行环境热更新真窗验收",
+  finalReply: "运行环境热更新验收完成",
+  automaticTitle: "运行环境热更新验收",
+  toolName: "mcp:mcp_runtime_refresh:refresh_echo",
+  oldWorkspaceMarker: "JA_RUNTIME_REFRESH_WORKSPACE_V1",
+  newWorkspaceMarker: "JA_RUNTIME_REFRESH_WORKSPACE_V1",
+  oldSkillMarker: "JA_RUNTIME_REFRESH_SKILL_V1",
+  newSkillMarker: "JA_RUNTIME_REFRESH_SKILL_V1",
+  thinking: "runtime refresh private thinking",
+  signature: "runtime-refresh-private-signature",
+});
+// 此期限只拒绝真正卡死；实际体验由逐次样本与 p95 报告，而不以脆弱的亚秒门禁代替性能证据。
+const workspaceSwitchDeadlineMs = 20_000;
+const workspaceSwitchMemorySettleMs = 2_000;
+const themeMatrixPalettes = Object.freeze([
+  Object.freeze({ value: "xcode", label: "Xcode" }),
+  Object.freeze({ value: "fleet", label: "Fleet" }),
+  Object.freeze({ value: "obsidian", label: "Obsidian" }),
+  Object.freeze({ value: "claude", label: "Claude" }),
+]);
+const themeMatrixModes = Object.freeze([
+  Object.freeze({ value: "light", label: "浅色" }),
+  Object.freeze({ value: "dark", label: "深色" }),
+]);
+const themeMatrixViewports = Object.freeze([
+  Object.freeze({ width: 1440, height: 900 }),
+  Object.freeze({ width: 1280, height: 820 }),
+  Object.freeze({ width: 980, height: 720 }),
+  Object.freeze({ width: 720, height: 640 }),
+]);
+const themeMatrixAnchors = Object.freeze({
+  xcode: Object.freeze({
+    light: Object.freeze({
+      background: "#f5f5f5",
+      content: "#ffffff",
+      editor: "#ffffff",
+      accent: "#007aff",
+    }),
+    dark: Object.freeze({
+      background: "#1c1d2b",
+      content: "#292a30",
+      editor: "#292a30",
+      accent: "#0a84ff",
+    }),
+  }),
+  fleet: Object.freeze({
+    light: Object.freeze({
+      background: "#f2f2f2",
+      content: "#ffffff",
+      editor: "#ffffff",
+      accent: "#726cf9",
+    }),
+    dark: Object.freeze({
+      background: "#090909",
+      content: "#18191b",
+      editor: "#18191b",
+      accent: "#726cf9",
+    }),
+  }),
+  obsidian: Object.freeze({
+    light: Object.freeze({
+      background: "#f6f6f6",
+      content: "#ffffff",
+      editor: "#ffffff",
+      accent: "#9873f7",
+    }),
+    dark: Object.freeze({
+      background: "#1e1e1e",
+      content: "#242424",
+      editor: "#242424",
+      accent: "#8a5cf5",
+    }),
+  }),
+  claude: Object.freeze({
+    light: Object.freeze({
+      background: "#f5f4ed",
+      content: "#faf9f5",
+      editor: "#faf9f5",
+      accent: "#d97757",
+    }),
+    dark: Object.freeze({
+      background: "#141413",
+      content: "#1a1918",
+      editor: "#1a1918",
+      accent: "#c6613f",
+    }),
+  }),
+});
 
 /**
  * 生成 runner 私有 WebView2 profile。该路径只交给 EdgeDriver 的 webviewOptions，
@@ -158,7 +401,15 @@ const approvalFixtureTool = "shell";
 const approvalFixtureCallId = "call_fake_shell";
 const businessFixtureFile = "business-context.md";
 const attachmentFixtureFile = "attachment-e2e.txt";
+const unavailableAttachmentFixtureFile = "attachment-unavailable-e2e.txt";
 const businessExpectedFinal = "ORBIT-7429|DUAL_APPROVAL|48H";
+const ordinaryDsmlTextFragments = Object.freeze([
+  "普通文本示例：<｜｜D",
+  "SML｜｜tool_calls><｜｜DS",
+  'ML｜｜invoke name="shell">Get-Location<｜｜DSML｜｜invoke><｜｜DSML｜｜tool_calls>。',
+  "这些标记只是正文，对话已正常完成。",
+]);
+const ordinaryDsmlText = ordinaryDsmlTextFragments.join("");
 const businessPrompt =
   "必须先调用 read 工具读取项目根目录 business-context.md，再严格按文件中的“验收输出”回复一行；不要添加解释。";
 const frozenExitStageSequence = [
@@ -261,18 +512,45 @@ async function captureVisualEvidence(page, filename) {
   await page.screenshot({ path: join(visualEvidenceRunDirectory, filename), fullPage: false });
 }
 
-/** 只发布完整成功的运行结果，避免后续阶段失败的证据覆盖标准 QA 证据。 */
+/**
+ * 从真实 WebView2 读取公共分隔器及其光带伪元素；运行时证据只判断主题 token 已解析和
+ * 渐变已绘制，不把 Chromium 的具体颜色序列化格式固化成跨版本合同。
+ */
+async function readResizeHandleVisual(separator) {
+  return separator.evaluate((element) => {
+    const style = globalThis.getComputedStyle(element);
+    const spotlight = globalThis.getComputedStyle(element, "::after");
+    return {
+      sharedClass: element.classList.contains("ja-resize-handle"),
+      pointerY: element.style.getPropertyValue("--ja-resize-pointer-y").trim(),
+      accent: style.getPropertyValue("--ja-accent").trim(),
+      focus: style.getPropertyValue("--ja-focus").trim(),
+      backgroundImage: spotlight.backgroundImage,
+      backgroundColor: spotlight.backgroundColor,
+      opacity: Number.parseFloat(spotlight.opacity),
+      focused: globalThis.document.activeElement === element,
+      dragging: element.hasAttribute("data-dragging"),
+    };
+  });
+}
+
+/**
+ * 普通 smoke 只在完整成功后从 staging 发布；Plan/Goal focused driver 已直接写入其隔离证据目录，
+ * 此处只枚举而不自复制，二者都必须返回真实文件才能通过最终非空门。
+ */
 async function publishVisualEvidenceRun() {
   if (visualEvidenceDirectory === undefined || visualEvidenceRunDirectory === undefined) return [];
   await mkdir(visualEvidenceDirectory, { recursive: true });
-  const entries = await readdir(visualEvidenceRunDirectory, { withFileTypes: true });
+  const sourceDirectory = planGoalAcceptanceMode
+    ? visualEvidenceDirectory
+    : visualEvidenceRunDirectory;
+  const entries = await readdir(sourceDirectory, { withFileTypes: true });
   const published = [];
   for (const entry of entries) {
     if (!entry.isFile()) continue;
-    await copyFile(
-      join(visualEvidenceRunDirectory, entry.name),
-      join(visualEvidenceDirectory, entry.name),
-    );
+    if (sourceDirectory !== visualEvidenceDirectory) {
+      await copyFile(join(sourceDirectory, entry.name), join(visualEvidenceDirectory, entry.name));
+    }
     published.push(entry.name);
   }
   return published.sort();
@@ -428,6 +706,10 @@ async function captureResponsiveVisualEvidence(page) {
       const tabs = [...globalThis.document.querySelectorAll('[role="tab"]')]
         .map((tab) => tab.textContent?.trim() ?? "")
         .filter(Boolean);
+      const returnButton = globalThis.document.querySelector(".ja-settings-return");
+      const search = globalThis.document.querySelector(".ja-settings-search");
+      const returnRect = returnButton?.getBoundingClientRect();
+      const searchRect = search?.getBoundingClientRect();
       return {
         innerWidth: globalThis.innerWidth,
         innerHeight: globalThis.innerHeight,
@@ -442,6 +724,22 @@ async function captureResponsiveVisualEvidence(page) {
         conversationCount: globalThis.document.querySelectorAll(".ja-conversation").length,
         navigationCount: globalThis.document.querySelectorAll(".ja-navigation-sidebar").length,
         workbenchCount: globalThis.document.querySelectorAll(".ja-workbench").length,
+        returnCount: globalThis.document.querySelectorAll(".ja-settings-return").length,
+        legacyScopeCount: globalThis.document.querySelectorAll(".ja-settings-scope").length,
+        legacyStartCount: globalThis.document.querySelectorAll(".ja-settings-start").length,
+        legacyHeadingCount: globalThis.document.querySelectorAll(".ja-settings-sidebar-heading")
+          .length,
+        returnSearchGeometry:
+          returnRect === undefined || searchRect === undefined
+            ? null
+            : {
+                leftDelta: Math.abs(returnRect.left - searchRect.left),
+                widthDelta: Math.abs(returnRect.width - searchRect.width),
+              },
+        returnFocused: globalThis.document.activeElement === returnButton,
+        returnOutline: returnButton?.matches(":focus-visible")
+          ? globalThis.getComputedStyle(returnButton).outlineStyle
+          : "none",
         tabs,
       };
     });
@@ -453,6 +751,13 @@ async function captureResponsiveVisualEvidence(page) {
       metrics.conversationCount !== 0 ||
       metrics.navigationCount !== 0 ||
       metrics.workbenchCount !== 0 ||
+      metrics.returnCount !== 1 ||
+      metrics.legacyScopeCount !== 0 ||
+      metrics.legacyStartCount !== 0 ||
+      metrics.legacyHeadingCount !== 0 ||
+      metrics.returnSearchGeometry === null ||
+      metrics.returnSearchGeometry.leftDelta > 1 ||
+      metrics.returnSearchGeometry.widthDelta > 1 ||
       JSON.stringify(metrics.tabs) !== JSON.stringify(["模型", "Skills", "MCP", "执行确认", "外观"])
     ) {
       throw new Error(`${label} 设置专属 Shell 不完整：${JSON.stringify(metrics)}`);
@@ -464,6 +769,12 @@ async function captureResponsiveVisualEvidence(page) {
         metrics.reducedMotion !== expectedMedia.reducedMotion)
     ) {
       throw new Error(`${label} 媒体能力模拟未生效：${JSON.stringify(metrics)}`);
+    }
+    if (
+      expectedMedia.forcedColors === true &&
+      (!metrics.returnFocused || metrics.returnOutline === "none")
+    ) {
+      throw new Error(`${label} 返回应用焦点在高对比度下不可见：${JSON.stringify(metrics)}`);
     }
     await captureVisualEvidence(
       page,
@@ -500,6 +811,7 @@ async function captureResponsiveVisualEvidence(page) {
       mobile: false,
     });
     await page.emulateMedia({ forcedColors: "active", reducedMotion: "reduce" });
+    await page.getByRole("button", { name: "返回应用", exact: true }).focus();
     await record("forced-colors-reduced-motion-1280x820", {
       forcedColors: true,
       reducedMotion: true,
@@ -525,28 +837,19 @@ function conversationSurface(page) {
 
 /**
  * 通过设置页的真实 Radix 控件切换本轮视觉主题和产品级辅助偏好。
- * 主题必须落到 document authority，减少动效/高对比度必须进入语义 data attribute；
- * 环境变量只选择本轮目标值，不能再仅用于截图文件名。
+ * 先提交 WebView 本地辅助偏好、最后单独等待主题 CAS 收敛，避免主题保存期间的 Query 重读
+ * 与后续本地状态提交交错；主题必须落到 document authority，辅助偏好必须进入语义 data attribute；
+ * 聚焦业务验收可跳过设置页截图矩阵，避免用无关路由门禁掩盖目标状态机证据。
  */
-async function applyVisualPreferences(page, deadline) {
+async function applyVisualPreferences(page, deadline, { captureSettingsEvidence = true } = {}) {
   const timeout = () => Math.max(1, deadline - Date.now());
   await page.getByRole("button", { name: "设置", exact: true }).click();
   const settings = page.getByRole("region", { name: "设置页面", exact: true });
   await settings.waitFor({ state: "visible", timeout: timeout() });
   await settings.getByRole("tab", { name: "外观", exact: true }).click();
-  const theme = settings.getByRole("combobox", { name: "主题", exact: true });
-  await theme.click();
-  await page
-    .getByRole("option", { name: visualTheme === "light" ? "浅色" : "深色", exact: true })
-    .click();
-  await page.waitForFunction(
-    (expectedTheme) =>
-      globalThis.document.documentElement.getAttribute("data-theme") === expectedTheme,
-    visualTheme,
-    { timeout: timeout() },
-  );
   for (const [name, attribute] of [
     ["减少动效", "data-reduce-motion"],
+    ["降低透明度", "data-reduced-transparency"],
     ["提高对比度", "data-high-contrast"],
   ]) {
     const toggle = settings.getByRole("switch", { name, exact: true });
@@ -582,31 +885,708 @@ async function applyVisualPreferences(page, deadline) {
       { timeout: timeout() },
     );
   }
+  const theme = settings.getByRole("combobox", { name: "外观模式", exact: true });
+  await theme.click();
+  await page
+    .getByRole("option", { name: visualTheme === "light" ? "浅色" : "深色", exact: true })
+    .click();
   await page.waitForFunction(
     (expectedTheme) => {
       const root = globalThis.document.documentElement;
       return (
         root.getAttribute("data-theme") === expectedTheme &&
-        root.getAttribute("data-reduce-motion") === "true" &&
-        root.getAttribute("data-high-contrast") === "true"
+        root.getAttribute("data-theme-mode") === expectedTheme
       );
     },
     visualTheme,
     { timeout: timeout() },
   );
+  try {
+    await page.waitForFunction(
+      (expectedTheme) => {
+        const root = globalThis.document.documentElement;
+        return (
+          root.getAttribute("data-theme") === expectedTheme &&
+          root.getAttribute("data-reduce-motion") === "true" &&
+          root.getAttribute("data-reduced-transparency") === "true" &&
+          root.getAttribute("data-high-contrast") === "true"
+        );
+      },
+      visualTheme,
+      { timeout: timeout() },
+    );
+  } catch (error) {
+    const state = await page.evaluate(() => {
+      const root = globalThis.document.documentElement;
+      return {
+        theme: root.getAttribute("data-theme"),
+        themeMode: root.getAttribute("data-theme-mode"),
+        reducedMotion: root.getAttribute("data-reduce-motion"),
+        reducedTransparency: root.getAttribute("data-reduced-transparency"),
+        highContrast: root.getAttribute("data-high-contrast"),
+      };
+    });
+    throw new Error(`外观偏好未收敛：${JSON.stringify(state)}`, { cause: error });
+  }
   const evidence = await page.evaluate(() => ({
     theme: globalThis.document.documentElement.getAttribute("data-theme"),
     reducedMotion: globalThis.document.documentElement.getAttribute("data-reduce-motion"),
+    reducedTransparency: globalThis.document.documentElement.getAttribute(
+      "data-reduced-transparency",
+    ),
     highContrast: globalThis.document.documentElement.getAttribute("data-high-contrast"),
   }));
-  await captureVisualEvidence(
-    page,
-    `implementation-settings-center-${visualTheme}-native-current.png`,
-  );
-  const responsive = await captureResponsiveVisualEvidence(page);
-  await settings.getByRole("button", { name: "返回对话", exact: true }).click();
+  if (captureSettingsEvidence) {
+    await captureVisualEvidence(
+      page,
+      `implementation-settings-center-${visualTheme}-native-current.png`,
+    );
+  }
+  const responsive = captureSettingsEvidence ? await captureResponsiveVisualEvidence(page) : [];
+  await settings.getByRole("button", { name: "返回应用", exact: true }).click();
   await conversationSurface(page).waitFor({ state: "visible", timeout: timeout() });
   return { status: "passed", ...evidence, responsive };
+}
+
+/**
+ * 每次都从产品公开的设置入口重新定位 Appearance；设置 Shell 可以隐藏工作区，但不得卸载
+ * Editor/Terminal owner，因此矩阵不会通过直接写 localStorage 或 DOM attribute 绕过真实控件。
+ */
+async function openThemeMatrixAppearanceSettings(page, deadline) {
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const settings = page.getByRole("region", { name: "设置页面", exact: true });
+  if (!(await settings.isVisible().catch(() => false))) {
+    await page.getByRole("button", { name: "设置", exact: true }).click({ timeout: timeout() });
+  }
+  await settings.waitFor({ state: "visible", timeout: timeout() });
+  await settings.getByRole("tab", { name: "外观", exact: true }).click({ timeout: timeout() });
+  return settings;
+}
+
+/**
+ * 只通过 Radix combobox/option 改变一个外观维度，并等待 document authority 收敛；
+ * 选择当前值时允许控件不触发回调，但根属性仍必须与请求一致。
+ */
+async function selectThemeMatrixAppearanceValue(
+  page,
+  settings,
+  { controlName, optionName, rootAttribute, value },
+  deadline,
+) {
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const trigger = settings.getByRole("combobox", { name: controlName, exact: true });
+  await trigger.waitFor({ state: "visible", timeout: timeout() });
+  await page.waitForFunction(
+    (accessibleName) => {
+      const candidate = [...globalThis.document.querySelectorAll('[role="combobox"]')].find(
+        (element) => element.getAttribute("aria-label") === accessibleName,
+      );
+      return (
+        candidate !== undefined &&
+        !candidate.hasAttribute("disabled") &&
+        candidate.getAttribute("aria-disabled") !== "true"
+      );
+    },
+    controlName,
+    { timeout: timeout() },
+  );
+  await trigger.click({ timeout: timeout() });
+  await page.getByRole("option", { name: optionName, exact: true }).click({ timeout: timeout() });
+  await page.waitForFunction(
+    ({ attribute, expected }) =>
+      globalThis.document.documentElement.getAttribute(attribute) === expected,
+    { attribute: rootAttribute, expected: value },
+    { timeout: timeout() },
+  );
+  await page.waitForFunction(
+    (accessibleName) => {
+      const candidate = [...globalThis.document.querySelectorAll('[role="combobox"]')].find(
+        (element) => element.getAttribute("aria-label") === accessibleName,
+      );
+      return (
+        candidate !== undefined &&
+        !candidate.hasAttribute("disabled") &&
+        candidate.getAttribute("aria-disabled") !== "true"
+      );
+    },
+    controlName,
+    { timeout: timeout() },
+  );
+}
+
+/**
+ * 在隔离项目中打开真实 Files Editor 与 xterm，并把节点引用仅保存在当前 WebView 内存中；
+ * 这允许后续主题切换证明 React 没有重建重组件，同时证据只记录 fixture 长度/hash 与 opaque identity。
+ */
+async function prepareThemeMatrixWorkbench(page, deadline, signal) {
+  let stepDeadline = deadline;
+  /**
+   * 每个真实工作台准备步骤使用独立上限并输出稳定阶段名，避免单个缺失控件耗尽整轮矩阵期限。
+   */
+  const beginStep = (name) => {
+    stepDeadline = Math.min(deadline, Date.now() + 45_000);
+    console.log(`JA_E2E_THEME_MATRIX_STAGE ${name}`);
+  };
+  /** 把 Playwright 等待绑定到当前步骤，而不是复用十五分钟全局期限。 */
+  const timeout = () => Math.max(1, stepDeadline - Date.now());
+  beginStep("runtime_ready");
+  await waitForRuntimeReady(page, stepDeadline, signal);
+  beginStep("project_selection");
+  const selectedProject = page.locator(
+    '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
+  );
+  if ((await selectedProject.count()) === 0) {
+    await page.getByRole("button", { name: "添加项目", exact: true }).click({ timeout: timeout() });
+  }
+  await selectedProject.waitFor({ state: "visible", timeout: timeout() });
+
+  beginStep("workbench_files");
+  const workbench = page.locator('.ja-inspector[aria-label="工作区面板"]');
+  if (!(await workbench.isVisible().catch(() => false))) {
+    await page
+      .getByRole("button", { name: "显示工作区面板", exact: true })
+      .click({ timeout: timeout() });
+  }
+  await workbench.waitFor({ state: "visible", timeout: timeout() });
+  await chooseWorkbenchTool(page, "文件", stepDeadline);
+  const filesWorkspace = workbench.getByRole("region", { name: "文件工作区", exact: true });
+  const sampleNode = filesWorkspace
+    .getByRole("tree", { name: "工作区文件", exact: true })
+    .locator('[data-path="sample.ts"]');
+  await sampleNode.waitFor({ state: "visible", timeout: timeout() });
+  await sampleNode.click({ timeout: timeout() });
+  const editor = filesWorkspace.getByRole("region", { name: "编辑文件 sample.ts", exact: true });
+  await editor.waitFor({ state: "visible", timeout: timeout() });
+  const content = editor.locator('.cm-content[contenteditable="true"]');
+  await content.click({ timeout: timeout() });
+  await content.press("Control+A");
+  beginStep("editor_baseline");
+  const editorBaseline = await editor.evaluate((editorElement) => {
+    /** FNV-1a 只证明隔离 fixture 内容稳定，不把编辑器文本复制到持久证据。 */
+    const digest = (value) => {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return (hash >>> 0).toString(16).padStart(8, "0");
+    };
+    const editorContent = editorElement.querySelector('.cm-content[contenteditable="true"]');
+    const editorText = editorContent?.textContent ?? "";
+    const selectionText = globalThis.getSelection()?.toString() ?? "";
+    if (editorText.length === 0 || selectionText.length === 0) {
+      throw new Error("Theme Matrix 无法建立 CodeMirror 内容与选择基线");
+    }
+    return {
+      editorLength: editorText.length,
+      editorDigest: digest(editorText),
+      selectionLength: selectionText.length,
+      selectionDigest: digest(selectionText),
+    };
+  });
+
+  beginStep("workbench_terminal");
+  await chooseWorkbenchTool(page, "终端", stepDeadline);
+  const terminalWorkspace = workbench.getByRole("region", { name: "终端工作区", exact: true });
+  await terminalWorkspace.waitFor({ state: "visible", timeout: timeout() });
+  const terminalTab = await activeTerminalTab(terminalWorkspace, stepDeadline);
+  const pane = terminalTab.panel.locator(".ja-terminal-pane[data-pane-id]").first();
+  await pane
+    .locator(".ja-terminal-pane-state")
+    .getByText("运行中", { exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  await pane.locator(".xterm").waitFor({ state: "visible", timeout: timeout() });
+  await page.waitForFunction(
+    () => {
+      const candidate = globalThis.document.querySelector(
+        '.ja-terminal-workspace [role="tabpanel"]:not([hidden]) .ja-terminal-pane[data-pane-id]',
+      );
+      return (
+        candidate?.getAttribute("data-terminal-session-id") &&
+        candidate.getAttribute("data-terminal-session-generation")
+      );
+    },
+    undefined,
+    { timeout: timeout() },
+  );
+
+  beginStep("workbench_baseline");
+  return page.evaluate((initialEditor) => {
+    /** FNV-1a 只证明隔离 fixture 画面内容稳定，不把终端路径或文本复制到持久证据。 */
+    const digest = (value) => {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return (hash >>> 0).toString(16).padStart(8, "0");
+    };
+    const editorRegion = globalThis.document.querySelector('[aria-label="编辑文件 sample.ts"]');
+    const editor = editorRegion?.querySelector(".cm-editor");
+    const editorContent = editor?.querySelector('.cm-content[contenteditable="true"]');
+    const terminalPane = globalThis.document.querySelector(
+      '.ja-terminal-workspace [role="tabpanel"]:not([hidden]) .ja-terminal-pane[data-pane-id]',
+    );
+    const xterm = terminalPane?.querySelector(".xterm");
+    const terminalRows = xterm?.querySelector(".xterm-rows")?.textContent ?? "";
+    if (
+      !(editor instanceof globalThis.HTMLElement) ||
+      !(editorContent instanceof globalThis.HTMLElement) ||
+      !(terminalPane instanceof globalThis.HTMLElement) ||
+      !(xterm instanceof globalThis.HTMLElement)
+    ) {
+      throw new Error("Theme Matrix 缺少 Editor 或 xterm 真实节点");
+    }
+    const baseline = {
+      ...initialEditor,
+      terminalLength: terminalRows.length,
+      terminalDigest: digest(terminalRows),
+      paneId: terminalPane.getAttribute("data-pane-id"),
+      sessionId: terminalPane.getAttribute("data-terminal-session-id"),
+      sessionGeneration: terminalPane.getAttribute("data-terminal-session-generation"),
+    };
+    globalThis.__JA_E2E_THEME_MATRIX_WORKBENCH__ = {
+      editor,
+      editorContent,
+      terminalPane,
+      xterm,
+      baseline,
+    };
+    return baseline;
+  }, editorBaseline);
+}
+
+/**
+ * 对当前主界面读取四主题关键 token、overflow、CodeMirror/xterm 热更新与原生 session identity；
+ * 自定义色值先经浏览器规范化，避免 hex/rgb 表示差异造成伪失败。
+ */
+async function captureThemeMatrixFrame(page, client, expected, viewport, reducedMotion, deadline) {
+  try {
+    await client.send("Emulation.setDeviceMetricsOverride", {
+      ...viewport,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await page.emulateMedia({
+      forcedColors: "none",
+      reducedMotion: reducedMotion ? "reduce" : "no-preference",
+    });
+    await page.waitForFunction(
+      ({ palette, mode, motion }) => {
+        const root = globalThis.document.documentElement;
+        return (
+          root.dataset["palette"] === palette &&
+          root.dataset["theme"] === mode &&
+          root.dataset["themeMode"] === mode &&
+          globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches === motion
+        );
+      },
+      { palette: expected.palette, mode: expected.mode, motion: reducedMotion },
+      { timeout: Math.max(1, deadline - Date.now()) },
+    );
+    const evidence = await page.evaluate(
+      ({ palette, mode, anchors, motion }) => {
+        const root = globalThis.document.documentElement;
+        const styles = globalThis.getComputedStyle(root);
+        const refs = globalThis.__JA_E2E_THEME_MATRIX_WORKBENCH__;
+        /** 浏览器自身解析 CSS Color，使 token 审计不依赖源码的大小写与简写形式。 */
+        const canonicalColor = (value) => {
+          const probe = globalThis.document.createElement("span");
+          probe.style.color = value;
+          globalThis.document.body.append(probe);
+          const result = globalThis.getComputedStyle(probe).color;
+          probe.remove();
+          return result;
+        };
+        const token = (name) => styles.getPropertyValue(name).trim();
+        const requiredTokens = [
+          "--ja-background",
+          "--ja-content",
+          "--ja-surface",
+          "--ja-control",
+          "--ja-selected",
+          "--ja-border",
+          "--ja-border-strong",
+          "--ja-foreground",
+          "--ja-foreground-muted",
+          "--ja-accent",
+          "--ja-accent-emphasis",
+          "--ja-on-accent",
+          "--ja-focus",
+          "--ja-editor-background",
+          "--ja-window-surface",
+          "--ja-syntax-keyword",
+          "--ja-diff-inserted",
+          "--ja-scrollbar-thumb",
+          "--ja-terminal-background",
+          "--ja-terminal-foreground",
+          "--ja-terminal-ansi-red",
+          "--ja-terminal-ansi-blue",
+        ];
+        const missingTokens = requiredTokens.filter((name) => token(name).length === 0);
+        const actualAnchors = {
+          background: canonicalColor(token("--ja-background")),
+          content: canonicalColor(token("--ja-content")),
+          editor: canonicalColor(token("--ja-editor-background")),
+          accent: canonicalColor(token("--ja-accent")),
+        };
+        const expectedAnchors = Object.fromEntries(
+          Object.entries(anchors).map(([name, value]) => [name, canonicalColor(value)]),
+        );
+        const terminalToken = canonicalColor(token("--ja-terminal-background"));
+        const viewportNode = refs?.xterm?.querySelector(".xterm-viewport");
+        const xtermBackground =
+          viewportNode instanceof globalThis.HTMLElement
+            ? globalThis.getComputedStyle(viewportNode).backgroundColor
+            : "";
+        const conversationHeading = globalThis.document.querySelector(".ja-conversation-heading");
+        const conversationTitle = conversationHeading?.querySelector("strong");
+        const conversationIcon = conversationHeading?.querySelector("svg");
+        const conversationHeadingColor =
+          conversationHeading === null
+            ? ""
+            : globalThis.getComputedStyle(conversationHeading).color;
+        const conversationTitleColor =
+          conversationTitle === null || conversationTitle === undefined
+            ? ""
+            : globalThis.getComputedStyle(conversationTitle).color;
+        const conversationIconColor =
+          conversationIcon === null || conversationIcon === undefined
+            ? ""
+            : globalThis.getComputedStyle(conversationIcon).color;
+        const horizontalOverflow = [globalThis.document.documentElement, globalThis.document.body]
+          .filter((element) => element.scrollWidth > element.clientWidth + 1)
+          .map((element) => ({
+            tag: element.tagName,
+            clientWidth: element.clientWidth,
+            scrollWidth: element.scrollWidth,
+          }));
+        return {
+          palette: root.dataset["palette"],
+          theme: root.dataset["theme"],
+          themeMode: root.dataset["themeMode"],
+          reducedTransparency: root.dataset["reducedTransparency"],
+          reducedMotionMedia: globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches,
+          width: globalThis.innerWidth,
+          height: globalThis.innerHeight,
+          missingTokens,
+          actualAnchors,
+          expectedAnchors,
+          terminalToken,
+          xtermBackground,
+          conversationHeadingColor,
+          conversationTitleColor,
+          conversationIconColor,
+          horizontalOverflow,
+          editorConnected: refs?.editor?.isConnected === true,
+          editorSameNode:
+            refs?.editor ===
+            globalThis.document.querySelector('[aria-label="编辑文件 sample.ts"] .cm-editor'),
+          editorTheme: refs?.editor?.getAttribute("data-ja-code-theme"),
+          terminalConnected: refs?.terminalPane?.isConnected === true,
+          terminalSameNode:
+            refs?.terminalPane ===
+            globalThis.document.querySelector(
+              '.ja-terminal-workspace [role="tabpanel"]:not([hidden]) .ja-terminal-pane[data-pane-id]',
+            ),
+          xtermSameNode: refs?.xterm === refs?.terminalPane?.querySelector(".xterm"),
+          paneId: refs?.terminalPane?.getAttribute("data-pane-id"),
+          sessionId: refs?.terminalPane?.getAttribute("data-terminal-session-id"),
+          sessionGeneration: refs?.terminalPane?.getAttribute("data-terminal-session-generation"),
+          expectedMotion: motion,
+          expectedPalette: palette,
+          expectedMode: mode,
+        };
+      },
+      { ...expected, motion: reducedMotion },
+    );
+    if (
+      evidence.palette !== expected.palette ||
+      evidence.theme !== expected.mode ||
+      evidence.themeMode !== expected.mode ||
+      evidence.reducedTransparency !== "true" ||
+      evidence.reducedMotionMedia !== reducedMotion ||
+      evidence.width !== viewport.width ||
+      evidence.height !== viewport.height ||
+      evidence.missingTokens.length !== 0 ||
+      JSON.stringify(evidence.actualAnchors) !== JSON.stringify(evidence.expectedAnchors) ||
+      evidence.horizontalOverflow.length !== 0 ||
+      !evidence.editorConnected ||
+      !evidence.editorSameNode ||
+      evidence.editorTheme !== `${expected.palette}-${expected.mode}` ||
+      !evidence.terminalConnected ||
+      !evidence.terminalSameNode ||
+      !evidence.xtermSameNode ||
+      evidence.conversationHeadingColor.length === 0 ||
+      evidence.conversationHeadingColor !== evidence.conversationTitleColor ||
+      evidence.conversationHeadingColor !== evidence.conversationIconColor ||
+      evidence.xtermBackground !== evidence.terminalToken
+    ) {
+      throw new Error(`Theme Matrix frame 不完整：${JSON.stringify(evidence)}`);
+    }
+    await captureVisualEvidence(
+      page,
+      `theme-matrix-${expected.palette}-${expected.mode}-${reducedMotion ? "reduced" : "normal"}-${viewport.width}x${viewport.height}.png`,
+    );
+    return evidence;
+  } finally {
+    await page
+      .emulateMedia({ forcedColors: "none", reducedMotion: "no-preference" })
+      .catch(() => undefined);
+    await client.send("Emulation.clearDeviceMetricsOverride").catch(() => undefined);
+  }
+}
+
+/**
+ * 执行四 Palette x 浅深 x viewport x motion 的真实桌面矩阵；每次从设置页切换后回到同一
+ * Workbench 验证重组件身份，最后 reload 只验证本地持久化恢复，不产生 Provider 调用。
+ */
+async function runThemeMatrixAcceptanceSession(page, deadline, diagnostics, signal, recordStage) {
+  recordStage?.("theme_matrix:workbench");
+  const baseline = await prepareThemeMatrixWorkbench(page, deadline, signal);
+  const configurationWritesBefore = {
+    replace: await tauriInvokeCount(page, "ja_configuration_replace"),
+    patch: await tauriInvokeCount(page, "ja_configuration_patch"),
+    reset: await tauriInvokeCount(page, "ja_configuration_reset"),
+  };
+  let settings = await openThemeMatrixAppearanceSettings(page, deadline);
+  const reducedTransparency = settings.getByRole("switch", {
+    name: "降低透明度",
+    exact: true,
+  });
+  await reducedTransparency.waitFor({
+    state: "visible",
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  await page.waitForFunction(
+    () => {
+      const candidate = globalThis.document.querySelector(
+        '[role="switch"][aria-label="降低透明度"]',
+      );
+      return (
+        candidate !== null &&
+        !candidate.hasAttribute("disabled") &&
+        candidate.getAttribute("aria-disabled") !== "true"
+      );
+    },
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  if ((await reducedTransparency.getAttribute("aria-checked")) !== "true") {
+    await reducedTransparency.click({ timeout: Math.max(1, deadline - Date.now()) });
+  }
+  await page.waitForFunction(
+    () =>
+      globalThis.document.documentElement.dataset["reducedTransparency"] === "true" &&
+      globalThis.document
+        .querySelector('[role="switch"][aria-label="降低透明度"]')
+        ?.getAttribute("aria-checked") === "true" &&
+      !globalThis.document
+        .querySelector('[role="switch"][aria-label="降低透明度"]')
+        ?.hasAttribute("disabled") &&
+      globalThis.document
+        .querySelector('[role="switch"][aria-label="降低透明度"]')
+        ?.getAttribute("aria-disabled") !== "true",
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  const frames = [];
+  const client = await page.context().newCDPSession(page);
+  try {
+    for (const palette of themeMatrixPalettes) {
+      for (const mode of themeMatrixModes) {
+        recordStage?.(`theme_matrix:${palette.value}_${mode.value}`);
+        await selectThemeMatrixAppearanceValue(
+          page,
+          settings,
+          {
+            controlName: "配色主题",
+            optionName: palette.label,
+            rootAttribute: "data-palette",
+            value: palette.value,
+          },
+          deadline,
+        );
+        await selectThemeMatrixAppearanceValue(
+          page,
+          settings,
+          {
+            controlName: "外观模式",
+            optionName: mode.label,
+            rootAttribute: "data-theme-mode",
+            value: mode.value,
+          },
+          deadline,
+        );
+        await page.waitForFunction(
+          ({ expectedPalette, expectedMode }) => {
+            const root = globalThis.document.documentElement;
+            return (
+              root.dataset["palette"] === expectedPalette && root.dataset["theme"] === expectedMode
+            );
+          },
+          { expectedPalette: palette.value, expectedMode: mode.value },
+          { timeout: Math.max(1, deadline - Date.now()) },
+        );
+        await settings.getByRole("button", { name: "返回应用", exact: true }).click();
+        await conversationSurface(page).waitFor({
+          state: "visible",
+          timeout: Math.max(1, deadline - Date.now()),
+        });
+        await chooseWorkbenchTool(page, "文件", deadline);
+        await page
+          .locator('[aria-label="编辑文件 sample.ts"] .cm-editor')
+          .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+        await page.waitForFunction(
+          (expectedTheme) =>
+            globalThis.document
+              .querySelector('[aria-label="编辑文件 sample.ts"] .cm-editor')
+              ?.getAttribute("data-ja-code-theme") === expectedTheme,
+          `${palette.value}-${mode.value}`,
+          { timeout: Math.max(1, deadline - Date.now()) },
+        );
+        await chooseWorkbenchTool(page, "终端", deadline);
+        const expected = {
+          palette: palette.value,
+          mode: mode.value,
+          anchors: themeMatrixAnchors[palette.value][mode.value],
+        };
+        for (const viewport of themeMatrixViewports) {
+          for (const motion of [false, true]) {
+            frames.push(
+              await captureThemeMatrixFrame(page, client, expected, viewport, motion, deadline),
+            );
+          }
+        }
+        settings = await openThemeMatrixAppearanceSettings(page, deadline);
+      }
+    }
+  } finally {
+    await page
+      .emulateMedia({ forcedColors: "none", reducedMotion: "no-preference" })
+      .catch(() => undefined);
+    await client.send("Emulation.clearDeviceMetricsOverride").catch(() => undefined);
+    // Direct CDP 与 WebView2 target 共用生命周期；与 runner 其它矩阵一致，不显式 detach 唯一 renderer。
+  }
+  await settings.getByRole("button", { name: "返回应用", exact: true }).click();
+  await chooseWorkbenchTool(page, "文件", deadline);
+  const editorContent = page.locator(
+    '[aria-label="编辑文件 sample.ts"] .cm-content[contenteditable="true"]',
+  );
+  await editorContent.evaluate((element) => element.focus());
+  await page.waitForFunction(
+    ({ expectedLength, expectedDigest }) => {
+      /** 与初始基线使用相同的有界 digest，证明 CodeMirror model selection 在失焦后恢复。 */
+      const digest = (value) => {
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < value.length; index += 1) {
+          hash ^= value.charCodeAt(index);
+          hash = Math.imul(hash, 0x01000193);
+        }
+        return (hash >>> 0).toString(16).padStart(8, "0");
+      };
+      const selection = globalThis.getSelection()?.toString() ?? "";
+      return selection.length === expectedLength && digest(selection) === expectedDigest;
+    },
+    { expectedLength: baseline.selectionLength, expectedDigest: baseline.selectionDigest },
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  await chooseWorkbenchTool(page, "终端", deadline);
+  const finalWorkbench = await page.evaluate(() => {
+    /** 与 prepare 阶段相同的摘要确保内容比较不把隔离路径写入 evidence。 */
+    const digest = (value) => {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return (hash >>> 0).toString(16).padStart(8, "0");
+    };
+    const refs = globalThis.__JA_E2E_THEME_MATRIX_WORKBENCH__;
+    const editorText = refs?.editorContent?.textContent ?? "";
+    const terminalText = refs?.xterm?.querySelector(".xterm-rows")?.textContent ?? "";
+    return {
+      editorSameNode:
+        refs?.editor ===
+        globalThis.document.querySelector('[aria-label="编辑文件 sample.ts"] .cm-editor'),
+      editorLength: editorText.length,
+      editorDigest: digest(editorText),
+      terminalSameNode: refs?.terminalPane?.querySelector(".xterm") === refs?.xterm,
+      terminalLength: terminalText.length,
+      terminalDigest: digest(terminalText),
+      paneId: refs?.terminalPane?.getAttribute("data-pane-id"),
+      sessionId: refs?.terminalPane?.getAttribute("data-terminal-session-id"),
+      sessionGeneration: refs?.terminalPane?.getAttribute("data-terminal-session-generation"),
+    };
+  });
+  if (
+    !finalWorkbench.editorSameNode ||
+    finalWorkbench.editorLength !== baseline.editorLength ||
+    finalWorkbench.editorDigest !== baseline.editorDigest ||
+    !finalWorkbench.terminalSameNode ||
+    finalWorkbench.terminalLength < baseline.terminalLength ||
+    finalWorkbench.paneId !== baseline.paneId ||
+    finalWorkbench.sessionId !== baseline.sessionId ||
+    finalWorkbench.sessionGeneration !== baseline.sessionGeneration
+  ) {
+    throw new Error(`Theme Matrix 热切换破坏 Workbench 状态：${JSON.stringify(finalWorkbench)}`);
+  }
+  const configurationWritesAfter = {
+    replace: await tauriInvokeCount(page, "ja_configuration_replace"),
+    patch: await tauriInvokeCount(page, "ja_configuration_patch"),
+    reset: await tauriInvokeCount(page, "ja_configuration_reset"),
+  };
+  if (JSON.stringify(configurationWritesAfter) !== JSON.stringify(configurationWritesBefore)) {
+    throw new Error("Theme Matrix 本地偏好错误触发 App Server configuration 保存");
+  }
+  const consoleErrors = diagnostics.console.filter((entry) => entry.startsWith("error:"));
+  if (consoleErrors.length !== 0 || diagnostics.pageErrors.length !== 0) {
+    throw new Error(
+      `Theme Matrix 出现 WebView 控制台错误：${JSON.stringify({ consoleErrors, pageErrors: diagnostics.pageErrors })}`,
+    );
+  }
+  recordStage?.("theme_matrix:reload");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForRuntimeReady(page, deadline, signal);
+  await page.waitForFunction(
+    () => {
+      const root = globalThis.document.documentElement;
+      return (
+        root.dataset["palette"] === "claude" &&
+        root.dataset["theme"] === "dark" &&
+        root.dataset["themeMode"] === "dark" &&
+        root.dataset["reducedTransparency"] === "true"
+      );
+    },
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  const reloadConsoleErrors = diagnostics.console.filter((entry) => entry.startsWith("error:"));
+  if (reloadConsoleErrors.length !== 0 || diagnostics.pageErrors.length !== 0) {
+    throw new Error(
+      `Theme Matrix reload 出现 WebView 控制台错误：${JSON.stringify({ consoleErrors: reloadConsoleErrors, pageErrors: diagnostics.pageErrors })}`,
+    );
+  }
+  return {
+    status: "passed",
+    combinations: themeMatrixPalettes.length * themeMatrixModes.length,
+    frameCount: frames.length,
+    viewports: themeMatrixViewports,
+    motionModes: ["normal", "reduced"],
+    reducedTransparency: true,
+    consoleErrorCount: 0,
+    configurationWrites: configurationWritesAfter,
+    workbench: {
+      editorPreserved: true,
+      editorSelectionPreserved: true,
+      terminalPreserved: true,
+      paneId: finalWorkbench.paneId,
+      sessionId: finalWorkbench.sessionId,
+      sessionGeneration: finalWorkbench.sessionGeneration,
+    },
+    reload: { palette: "claude", theme: "dark", themeMode: "dark", reducedTransparency: true },
+    frames,
+  };
 }
 
 /**
@@ -641,16 +1621,24 @@ async function beginRealtimeDraftObservation(page) {
 
 /**
  * 同时要求协议 delta 顺序和 Draft DOM 时序先于同 Turn terminal；只比较本地单调时钟和业务
- * identity，不复制 Provider 文本，从而可用于真实 OpenAI/Anthropic 流而不泄漏内容。
+ * identity，不复制 Provider 文本，从而可用于真实 OpenAI/Anthropic 流而不泄漏内容。终态跨
+ * Rust event queue 异步到达，因此在同一 Turn deadline 内等待，不能用一次瞬时采样制造竞态。
  */
-async function assertRealtimeDeltaBeforeTerminal(page) {
-  const events = await captureRawTauriEvents(page);
-  const terminal = events.findLast(
-    (event) => event.method === "turn/terminal" && event.observedAt !== undefined,
+async function assertRealtimeDeltaBeforeTerminal(page, deadline, signal) {
+  let events;
+  let terminal;
+  await waitForCondition(
+    "带本地时钟的 turn/terminal",
+    async () => {
+      events = await captureRawTauriEvents(page);
+      terminal = events.findLast(
+        (event) => event.method === "turn/terminal" && event.observedAt !== undefined,
+      );
+      return terminal?.turnId !== undefined && terminal.observedAt !== undefined;
+    },
+    deadline,
+    signal,
   );
-  if (terminal?.turnId === undefined || terminal.observedAt === undefined) {
-    throw new Error("实时门禁缺少带本地时钟的 turn/terminal");
-  }
   const delta = events.find(
     (event) =>
       event.method === "assistant/text-delta" &&
@@ -815,6 +1803,7 @@ function throwIfAborted(signal) {
 function waitForDelay(durationMs, signal) {
   return new Promise((resolvePromise, rejectPromise) => {
     let timer;
+    /** 取消时同步解除 timer/listener，避免短轮询在阶段清理后继续回调。 */
     const onAbort = () => {
       globalThis.clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
@@ -840,6 +1829,7 @@ function raceWithSignal(operation, signal) {
     return Promise.reject(signal.reason ?? new Error("E2E 已取消"));
   }
   return new Promise((resolvePromise, rejectPromise) => {
+    /** Playwright 操作不可取消时先拒绝外层等待，真实资源仍交给统一 cleanup。 */
     const onAbort = () => rejectPromise(signal.reason ?? new Error("E2E 已取消"));
     signal?.addEventListener("abort", onAbort, { once: true });
     Promise.resolve()
@@ -879,19 +1869,24 @@ async function createRunDirectories() {
   const root = await mkdtemp(join(tmpdir(), "ja-desktop-e2e-"));
   const workspace = join(root, "workspace");
   const settings = join(root, "settings");
-  const home = join(root, "home");
-  const data = join(root, "data");
+  // 生产 Host 从隔离 USERPROFILE 解析唯一 Ja Home；fixture 必须写入同一个目录，不能另造
+  // root/home 让测试配置与真实 App Server owner 分叉。SQLite 同样跟随 Ja Home 的 data 子目录。
+  const home = join(settings, ".ja");
+  const data = join(home, "data");
   const webview = join(root, "webview");
   const runtime = join(root, "runtime");
   const appData = join(root, "appdata");
   const roaming = join(appData, "roaming");
   const local = join(appData, "local");
+  const desktop = join(settings, "Desktop");
   try {
     await Promise.all([
       mkdir(workspace),
-      mkdir(settings),
-      mkdir(home),
-      mkdir(data),
+      // Windows common file dialog 会从隔离 USERPROFILE 解析 Desktop Known Folder；缺失时会先弹出
+      // “位置不可用”错误框，使 picker 验收误中错误 owner。递归创建同时建立 profile 根。
+      mkdir(desktop, { recursive: true }),
+      mkdir(home, { recursive: true }),
+      mkdir(data, { recursive: true }),
       mkdir(webview),
       mkdir(runtime),
       mkdir(roaming, { recursive: true }),
@@ -901,12 +1896,146 @@ async function createRunDirectories() {
     Object.defineProperty(error, "e2eRoot", { value: root, enumerable: false });
     throw error;
   }
-  return { root, workspace, settings, home, data, webview, runtime, appData, roaming, local };
+  return {
+    root,
+    workspace,
+    settings,
+    home,
+    data,
+    webview,
+    runtime,
+    appData,
+    roaming,
+    local,
+  };
 }
 
 /**
- * 只读取一次显式启用的 provider，验证不含凭据的 loopback URL，并在复制任何子进程环境前
- * 从 process.env 删除密钥。返回值只由本 runner 与私有 settings 文件持有。
+ * 从本轮隔离 Java 日志中提取稳定异常类别；只保留 WARN/ERROR 与 Agent loop 自身诊断，避免
+ * 将 Provider 正文、Workspace 内容或大段框架启动日志复制进 E2E summary。
+ */
+async function captureManagedJavaDiagnostics(directories) {
+  const logPath = resolve(directories.settings, ".ja", "logs", "java", "app-server.log");
+  const root = `${resolve(directories.root)}\\`.toLowerCase();
+  if (!logPath.toLowerCase().startsWith(root)) {
+    throw new Error("Java 诊断日志不属于本轮隔离根");
+  }
+  try {
+    const metadata = await stat(logPath);
+    if (!metadata.isFile() || metadata.size > 4 * 1024 * 1024) {
+      return { status: "unavailable", reason: "invalid_size" };
+    }
+    const lines = (await readFile(logPath, "utf8"))
+      .split(/\r?\n/u)
+      .filter(
+        (line) =>
+          line.includes("AgentTurnExecution") ||
+          line.includes(" WARN ") ||
+          line.includes(" ERROR "),
+      )
+      .slice(-80)
+      .map((line) => redact(line, directories));
+    return { status: "captured", lines };
+  } catch {
+    return { status: "missing", lines: [] };
+  }
+}
+
+/**
+ * 核验 Task 五类结构化指标的稳定 event/field 合同，并从隔离日志只提取事件名；原始日志、
+ * prompt、Secret 与绝对路径都不进入 summary，运行时至少必须证明 active 与 Mailbox 链被写入。
+ */
+async function captureTaskMetricEvidence(directories, scenario) {
+  const definitions = [
+    {
+      name: "task_active_count",
+      fields: ["active_count"],
+      path: join(
+        repoRoot,
+        "app-server/src/main/java/io/github/kongweiguang/ja/task/application/TaskCoordinator.java",
+      ),
+    },
+    {
+      name: "task_mailbox_lag",
+      fields: ["lag_ms", "message_count"],
+      path: join(
+        repoRoot,
+        "app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/task/MybatisTaskRepository.java",
+      ),
+    },
+    {
+      name: "workspace_write_lease_wait",
+      fields: ["wait_ms"],
+      path: join(
+        repoRoot,
+        "app-server/src/main/java/io/github/kongweiguang/ja/conversation/application/loop/WorkspaceWriteLeaseCoordinator.java",
+      ),
+    },
+    {
+      name: "task_recovery_suspended",
+      fields: ["suspended_count"],
+      path: join(
+        repoRoot,
+        "app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/task/TaskRecoveryPersistence.java",
+      ),
+    },
+    {
+      name: "task_progress_coalesced_total",
+      fields: ["count"],
+      path: join(repoRoot, "crates/ja-runtime/src/app_server_process/client/session/events.rs"),
+    },
+  ];
+  const definitionChecks = await Promise.all(
+    definitions.map(async (definition) => {
+      const source = await readFile(definition.path, "utf8");
+      return {
+        name: definition.name,
+        present:
+          source.includes(`event=${definition.name}`) ||
+          source.includes(`metric = "${definition.name}"`),
+        fieldsPresent: definition.fields.every(
+          (field) => source.includes(`${field}=`) || source.includes(`${field} =`),
+        ),
+      };
+    }),
+  );
+  const logPath = resolve(directories.home, "logs", "java", "app-server.log");
+  let metricLines = [];
+  try {
+    const metadata = await stat(logPath);
+    if (metadata.isFile() && metadata.size <= 4 * 1024 * 1024) {
+      const names = new Set(definitions.map((definition) => definition.name));
+      metricLines = (await readFile(logPath, "utf8"))
+        .split(/\r?\n/u)
+        .filter((line) => [...names].some((name) => line.includes(`event=${name}`)));
+    }
+  } catch {
+    metricLines = [];
+  }
+  const forbidden = [
+    scenario.prompt,
+    scenario.followupPrompt,
+    scenario.agentRootPrompt,
+    scenario.levelOneBrief,
+    scenario.levelTwoBrief,
+    scenario.levelThreeBrief,
+    "JA_TITLE_LOOPBACK_ONLY",
+    resolve(directories.root),
+  ];
+  return {
+    definitions: definitionChecks,
+    runtimeEventNames: definitions
+      .filter((definition) => metricLines.some((line) => line.includes(`event=${definition.name}`)))
+      .map((definition) => definition.name),
+    runtimeRedactionValid: forbidden.every(
+      (value) => typeof value !== "string" || !metricLines.some((line) => line.includes(value)),
+    ),
+  };
+}
+
+/**
+ * 只读取一次显式启用的自定义供应商配置，验证不含凭据的 loopback URL，并在复制任何子进程环境前
+ * 从 process.env 删除密钥。Wire 协议由 API 规范独立选择，供应商名称不参与路由。
  */
 function readRealProviderConfig() {
   if (!configuredRealProviderMode) return undefined;
@@ -917,7 +2046,10 @@ function readRealProviderConfig() {
   delete process.env.JA_E2E_REAL_PROVIDER_API_KEY;
   const baseUrl = process.env.JA_E2E_REAL_PROVIDER_BASE_URL?.trim() || "http://localhost:60842/v1";
   const model = process.env.JA_E2E_REAL_PROVIDER_MODEL?.trim() || "gpt-5.6-sol";
+  const name = process.env.JA_E2E_REAL_PROVIDER_NAME?.trim() || "E2E Real Provider";
+  delete process.env.JA_E2E_REAL_PROVIDER_NAME;
   const api = process.env.JA_E2E_REAL_PROVIDER_API?.trim() || "openai_responses";
+  delete process.env.JA_E2E_REAL_PROVIDER_API;
   const configureViaUi = process.env.JA_E2E_CONFIGURE_VIA_UI === "1";
   delete process.env.JA_E2E_CONFIGURE_VIA_UI;
   let parsed;
@@ -946,18 +2078,69 @@ function readRealProviderConfig() {
   if (model.length < 1 || model.length > 256 || /[\0\r\n]/u.test(model)) {
     throw new Error("真实 Provider 模型名称不合法");
   }
-  if (api !== "openai_responses" && api !== "anthropic_messages") {
-    throw new Error("真实 Provider API 只允许 openai_responses 或 anthropic_messages");
+  if (name.length < 1 || name.length > 512 || /[\0\r\n]/u.test(name)) {
+    throw new Error("真实 Provider 名称不合法");
+  }
+  if (!new Set(["anthropic_messages", "openai_chat_completions", "openai_responses"]).has(api)) {
+    throw new Error("真实 Provider API 规范不受 v1 支持");
   }
   sensitiveRedactions.add(apiKey);
   sensitiveRedactions.add(parsed.href.replace(/\/$/u, ""));
-  return { apiKey, baseUrl: parsed.href.replace(/\/$/u, ""), model, api, configureViaUi };
+  return {
+    apiKey,
+    baseUrl: parsed.href.replace(/\/$/u, ""),
+    model,
+    name,
+    api,
+    configureViaUi,
+  };
 }
 
 /**
- * 为 Files、search 和四类原生 Git Review 构造已提交、分支与脏改动。
+ * 以分片目录和有界并发写入小文件，避免 fixture 自身用一次性 Promise 风暴制造与产品无关的内存峰值。
  */
-async function initializeWorkspaceFixture(workspace, gitCommand, signal) {
+async function writeWorkspaceSwitchFileFixture(directory, count, signal) {
+  const shardSize = 250;
+  const batchSize = 64;
+  await mkdir(directory, { recursive: true });
+  for (let shardStart = 0; shardStart < count; shardStart += shardSize) {
+    throwIfAborted(signal);
+    const shard = join(directory, `shard-${String(shardStart / shardSize).padStart(3, "0")}`);
+    await mkdir(shard, { recursive: true });
+    const shardEnd = Math.min(count, shardStart + shardSize);
+    for (let batchStart = shardStart; batchStart < shardEnd; batchStart += batchSize) {
+      throwIfAborted(signal);
+      const batchEnd = Math.min(shardEnd, batchStart + batchSize);
+      await Promise.all(
+        Array.from({ length: batchEnd - batchStart }, (_, offset) =>
+          writeFile(
+            join(shard, `item-${String(batchStart + offset).padStart(6, "0")}.txt`),
+            "x\n",
+            "utf8",
+          ),
+        ),
+      );
+    }
+  }
+}
+
+/** Git 的 `-z` 输出没有路径转义；只计非空记录可同时正确覆盖 Unicode 与空格路径。 */
+function nulSeparatedPathCount(value) {
+  return String(value ?? "")
+    .split("\0")
+    .filter((entry) => entry.length > 0).length;
+}
+
+/**
+ * 为 Files、search 和四类原生 Git Review 构造已提交、分支与脏改动；性能模式额外创建
+ * 已被 Git 明确认定为 ignored 的 `.codex-target` 与普通 untracked 小文件。
+ */
+async function initializeWorkspaceFixture(
+  workspace,
+  gitCommand,
+  signal,
+  { workspaceSwitchPerformance = false } = {},
+) {
   const sample = join(workspace, "sample.ts");
   const agentChangeFixtureDirectory = join(workspace, ".ja-fixture");
   const agentChangeFixture = join(agentChangeFixtureDirectory, "change.txt");
@@ -984,6 +2167,9 @@ async function initializeWorkspaceFixture(workspace, gitCommand, signal) {
     ),
   );
   await writeFile(sample, 'export const greeting = "hello";\n', "utf8");
+  if (workspaceSwitchPerformance) {
+    await writeFile(join(workspace, ".gitignore"), "/.codex-target/\n", "utf8");
+  }
   const runGit = async (args) =>
     execFileAsync(gitCommand, args, {
       cwd: workspace,
@@ -996,13 +2182,14 @@ async function initializeWorkspaceFixture(workspace, gitCommand, signal) {
   await runGit(["checkout", "-b", "main"]);
   await runGit(["config", "user.name", "Ja E2E"]);
   await runGit(["config", "user.email", "ja-e2e@localhost"]);
-  await runGit([
-    "add",
+  const initialTrackedPaths = [
     "sample.ts",
     ".ja-fixture/change.txt",
     "folder-fixture/child.txt",
     "overflow-fixture",
-  ]);
+  ];
+  if (workspaceSwitchPerformance) initialTrackedPaths.push(".gitignore");
+  await runGit(["add", ...initialTrackedPaths]);
   await runGit(["commit", "-m", "fixture"]);
   await runGit(["branch", "review-base"]);
   await writeFile(join(workspace, "committed-change.txt"), "Ja committed review fixture\n", "utf8");
@@ -1022,6 +2209,11 @@ async function initializeWorkspaceFixture(workspace, gitCommand, signal) {
     "utf8",
   );
   await writeFile(
+    join(workspace, unavailableAttachmentFixtureFile),
+    "Ja unavailable attachment fixture with distinct content\n",
+    "utf8",
+  );
+  await writeFile(
     join(workspace, businessFixtureFile),
     [
       "# 退款业务规则",
@@ -1034,6 +2226,56 @@ async function initializeWorkspaceFixture(workspace, gitCommand, signal) {
     ].join("\n"),
     "utf8",
   );
+  if (!workspaceSwitchPerformance) return undefined;
+
+  await Promise.all([
+    writeWorkspaceSwitchFileFixture(
+      join(workspace, ".codex-target"),
+      workspaceSwitchIgnoredFixtureCount,
+      signal,
+    ),
+    writeWorkspaceSwitchFileFixture(
+      join(workspace, "workspace-switch-untracked"),
+      workspaceSwitchUntrackedFixtureCount,
+      signal,
+    ),
+  ]);
+  const [ignored, untracked] = await Promise.all([
+    runGit([
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ".codex-target",
+    ]),
+    runGit([
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      "workspace-switch-untracked",
+    ]),
+  ]);
+  const ignoredCodexTargetFiles = nulSeparatedPathCount(ignored.stdout);
+  const ordinaryUntrackedFiles = nulSeparatedPathCount(untracked.stdout);
+  if (
+    ignoredCodexTargetFiles !== workspaceSwitchIgnoredFixtureCount ||
+    ordinaryUntrackedFiles !== workspaceSwitchUntrackedFixtureCount
+  ) {
+    throw new Error(
+      `workspace switch fixture 分类不完整：${JSON.stringify({ ignoredCodexTargetFiles, ordinaryUntrackedFiles })}`,
+    );
+  }
+  return {
+    ignoredCodexTargetFiles,
+    ordinaryUntrackedFiles,
+    ignoredRoot: ".codex-target",
+    untrackedRoot: "workspace-switch-untracked",
+    fileBytes: 2,
+  };
 }
 
 /** 启动带请求计数器的 loopback 页面，用于证明 Preview 确实加载了真实子 WebView。 */
@@ -1066,11 +2308,15 @@ async function startPreviewFixture() {
 }
 
 /**
- * 固定四类标题验收语料；每个短标题都低于生产 48 code point 上限，并让成功标题保留同一
- * 搜索词，从而能在元数据刷新前后验证搜索输入、焦点与选中项而不制造无结果歧义。
+ * 集中固定 loopback Provider 的可识别语料；每个场景使用唯一 prompt，让多 Turn 历史可按
+ * 最后标记确定性路由，同时避免任何聚焦验收误连外部或付费 Provider。
  */
 function automaticTitleScenarios() {
   return Object.freeze({
+    defaultDesktop: Object.freeze({
+      id: "default_desktop",
+      reply: "default desktop loopback",
+    }),
     success: Object.freeze({
       id: "success",
       prompt: "标题同步验收 初始短标题",
@@ -1096,6 +2342,126 @@ function automaticTitleScenarios() {
       reply: "首轮取消前不得输出",
       secondPrompt: "第二轮成功也不改标题",
       secondReply: "取消后第二轮回复完成",
+    }),
+    operationRecovery: Object.freeze({
+      id: "operation_recovery",
+      prompt: "操作恢复验收 强杀前输入",
+      reply: "操作恢复验收最终回复",
+      automaticTitle: "操作恢复验收 智能总结",
+    }),
+    inputQueue: Object.freeze({
+      id: "input_queue",
+      prompt: "回复中队列验收 首轮读取文件",
+      reply: "首轮工具调用完成",
+      automaticTitle: "回复中队列验收",
+      steering: "先按新方向处理",
+      steeringReply: "调整方向已优先处理",
+      editable: "这条普通消息需要编辑",
+      edited: "编辑后的普通消息",
+      editedReply: "编辑后的普通消息已处理",
+      deletable: "这条消息应当删除",
+      followUp: "最后一条普通消息",
+      followUpReply: "最后一条普通消息已处理",
+      attachmentReply: "附件消息已独立处理",
+      unavailablePrompt: "移除失效附件后继续处理",
+      unavailableReply: "失效附件修复后已继续处理",
+    }),
+    composerContext: Object.freeze({
+      id: "composer_context",
+      prompt: "Composer 上下文首轮验收",
+      reply: "Composer 上下文首轮完成",
+      automaticTitle: "Composer 上下文验收",
+      queued: "Composer 上下文排队验收",
+      queuedReply: "Composer 上下文排队完成",
+    }),
+    toolLifecycle: Object.freeze({
+      id: "tool_lifecycle",
+      prompt: "工具生命周期验收 stdin EOF 与逐项结算",
+      reply: "工具生命周期验收最终回复",
+      automaticTitle: "工具生命周期验收",
+    }),
+    shellFailureRecovery: Object.freeze({
+      id: "shell_failure_recovery",
+      prompt: "未知 Tool 失败后模型自纠正验收",
+      reply: "未知 Tool 已纠正，Shell 执行成功。",
+      automaticTitle: "未知 Tool 自纠正验收",
+    }),
+    readStallFailure: Object.freeze({
+      id: "read_stall_failure",
+      prompt: "Read 参数连续错误后模型自纠正验收",
+      reply: "Read 参数已纠正，文件读取成功。",
+      automaticTitle: "Read 参数自纠正验收",
+    }),
+    dsmlProtocolFailure: Object.freeze({
+      id: "model_protocol_failure",
+      prompt: "模型普通正文标记分片展示与恢复验收",
+      reply: ordinaryDsmlText,
+    }),
+    sidebarCompleted: Object.freeze({
+      id: "sidebar_completed",
+      prompt: "侧栏未读成功验收 首轮回复",
+      reply: "侧栏未读成功验收回复完成",
+      automaticTitle: "侧栏未读成功验收",
+    }),
+    sidebarFailure: Object.freeze({
+      id: "sidebar_failure",
+      prompt: "侧栏未读失败验收",
+    }),
+    sidebarApproval: Object.freeze({
+      id: "sidebar_approval",
+      prompt: "侧栏等待批准验收",
+      reply: "侧栏审批后的回复不应在本轮验收前生成",
+    }),
+    taskThreads: Object.freeze({
+      id: "task_threads",
+      taskName: "Task 真窗侧边任务",
+      renamedTaskName: "Task 真窗侧边任务已改名",
+      prompt: "Task 线程真窗验收",
+      reply: "Task 线程真窗验收完成",
+      followupPrompt: "Task 线程后台 follow-up 验收",
+      followupReply: "Task 线程后台 follow-up 已完成",
+      agentRootPrompt: "Task 线程原生 Subagent 树验收",
+      agentRootReply: "Task 线程 Subagent 已派发",
+      automaticTitle: "Task 线程真窗验收",
+      levelOneName: "Task 真窗一级 Subagent",
+      levelOneBrief: "Task 真窗一级 brief",
+      levelTwoName: "Task 真窗二级 Subagent",
+      levelTwoBrief: "Task 真窗二级 brief",
+      levelThreeName: "Task 真窗三级 Subagent",
+      levelThreeBrief: "Task 真窗三级 approval brief",
+      approvalCommand: "Write-Output JA_TASK_SUBAGENT_APPROVAL",
+    }),
+    planGoal: Object.freeze({
+      id: "plan_goal",
+      prompt: "Plan Goal 真窗验收目标",
+      reply: "Plan Goal 结构化执行已结算",
+      objective: "用确定性证据完成 Plan Goal 真窗验收目标",
+      revisedObjective: "用确定性证据完成 Plan Goal 真窗验收目标 v1",
+      scope: "隔离 Windows Tauri WebView2",
+      verification: "验证结构化计划、续跑、证据与独立 evaluator",
+      stepTitle: "执行确定性验收步骤",
+      stepDescription: "通过内建 extension 绑定真实 Tool result 并请求独立验收",
+      criterion: "当前计划版本存在有效的真实 Tool 证据",
+      approvalCommand: "Write-Output JA_PLAN_GOAL_APPROVAL_WAIT",
+      completionCommand: "Write-Output JA_PLAN_GOAL_EVIDENCE_OK",
+      recoveryObjective: "用确定性证据完成 Plan Goal 真窗验收目标的崩溃恢复",
+      recoveryStepTitle: "验证副作用 Tool 崩溃恢复",
+      recoveryStepDescription: "在真实 Shell STARTED 边界强杀隔离 App Server 并回读恢复状态",
+      recoveryCriterion: "副作用 Tool 未盲目重放且 Goal 进入人工恢复状态",
+      recoveryCommand:
+        "Start-Sleep -Seconds 120; Write-Output JA_PLAN_GOAL_RECOVERY_SHOULD_NOT_COMPLETE",
+    }),
+    turnChangeReview: Object.freeze({
+      id: "turn_change_review",
+      prompt: "本轮修改真窗生产验收",
+      reply: "本轮修改真窗生产验收完成",
+      automaticTitle: "本轮修改真窗验收",
+      smallPath: ".ja-fixture/turn-change-review-small.txt",
+      largePath: ".ja-fixture/turn-change-review-large.txt",
+      smallMarker: "JA_TURN_CHANGE_SMALL",
+      largeMarker: "JA_TURN_CHANGE_LARGE",
+      zeroPrompt: "本轮不修改文件，只回复完成。",
+      zeroReply: "零修改轮次已完成。",
     }),
   });
 }
@@ -1132,7 +2498,10 @@ async function readBoundedFixtureJson(request) {
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 2 * 1024 * 1024) throw new Error("fixture request exceeded byte limit");
+    // 本轮修改压力夹具的 Tool history 会携带约 3 MiB 的精确参数；8 MiB 仍是严格上限，
+    // 且只在该独立 focused mode 放宽，避免其它 Provider 场景无意扩大内存面。
+    const maximumBytes = turnChangeReviewAcceptanceMode ? 8 * 1024 * 1024 : 2 * 1024 * 1024;
+    if (size > maximumBytes) throw new Error("fixture request exceeded byte limit");
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -1206,29 +2575,989 @@ function titleFixtureTextStream(text, requestNumber) {
   ].join("");
 }
 
+/** 生成 Runtime Refresh 首次请求的原生 Responses Tool call，旧参数故意不兼容新目录。 */
+function runtimeRefreshOpenAiToolStream(requestNumber) {
+  const item = {
+    id: `item_runtime_refresh_${requestNumber}`,
+    type: "function_call",
+    call_id: `call_runtime_refresh_${requestNumber}`,
+    name: runtimeRefreshFixtureContract.toolName,
+    arguments: JSON.stringify({ value: "old-value" }),
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(
+        `resp_runtime_refresh_${requestNumber}`,
+        "completed",
+        [item],
+        true,
+      ),
+    }),
+  ].join("");
+}
+
+/** Anthropic SSE 每帧同时写 event 与 data，避免测试依赖客户端对缺失 event 的宽松兼容。 */
+function runtimeRefreshAnthropicEvent(type, payload) {
+  return `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
+}
+
+/** 第二次请求返回私有 thinking 与新 schema Tool call，供第三次同 Profile 请求验证 continuation。 */
+function runtimeRefreshAnthropicToolStream() {
+  return [
+    runtimeRefreshAnthropicEvent("message_start", {
+      message: {
+        id: "msg_runtime_refresh_tool",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "runtime-new-model",
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 13, output_tokens: 0 },
+      },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_start", {
+      index: 0,
+      content_block: { type: "thinking", thinking: "" },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_delta", {
+      index: 0,
+      delta: { type: "thinking_delta", thinking: runtimeRefreshFixtureContract.thinking },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_delta", {
+      index: 0,
+      delta: { type: "signature_delta", signature: runtimeRefreshFixtureContract.signature },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_stop", { index: 0 }),
+    runtimeRefreshAnthropicEvent("content_block_start", {
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "call_runtime_refresh_new",
+        name: runtimeRefreshFixtureContract.toolName,
+        input: { value: 42 },
+      },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_stop", { index: 1 }),
+    runtimeRefreshAnthropicEvent("message_delta", {
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 7 },
+    }),
+    runtimeRefreshAnthropicEvent("message_stop", {}),
+  ].join("");
+}
+
+/** 第三次请求故意省略 Usage；UI 必须展示最新 UNKNOWN，不能回退第二次的 KNOWN。 */
+function runtimeRefreshAnthropicFinalStream(text) {
+  return [
+    runtimeRefreshAnthropicEvent("message_start", {
+      message: {
+        id: "msg_runtime_refresh_final",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "runtime-new-model",
+        stop_reason: null,
+        stop_sequence: null,
+      },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_start", {
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_delta", {
+      index: 0,
+      delta: { type: "text_delta", text },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_stop", { index: 0 }),
+    runtimeRefreshAnthropicEvent("message_delta", {
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+    }),
+    runtimeRefreshAnthropicEvent("message_stop", {}),
+  ].join("");
+}
+
+/** 自动标题仍走当前 Anthropic Provider；它不计入同 Turn 的三次 ASSISTANT Usage。 */
+function runtimeRefreshAnthropicTitleStream(text) {
+  return [
+    runtimeRefreshAnthropicEvent("message_start", {
+      message: {
+        id: "msg_runtime_refresh_title",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "runtime-new-model",
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 0 },
+      },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_start", {
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_delta", {
+      index: 0,
+      delta: { type: "text_delta", text },
+    }),
+    runtimeRefreshAnthropicEvent("content_block_stop", { index: 0 }),
+    runtimeRefreshAnthropicEvent("message_delta", {
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 4 },
+    }),
+    runtimeRefreshAnthropicEvent("message_stop", {}),
+  ].join("");
+}
+
+/** 以精确 Content-Type 写入 Provider 流，并在 flush 后记录传输终态。 */
+function writeRuntimeRefreshProviderStream(response, stream, attempt) {
+  const body = Buffer.from(stream, "utf8");
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "content-length": String(body.length),
+    "cache-control": "no-store",
+  });
+  attempt.responded = true;
+  response.end(body);
+}
+
+/**
+ * 启动双协议 loopback Provider。只保留请求 Profile 的布尔证据，不持久化 system prompt、
+ * Tool 参数或 Header；第一请求的门用于在零响应字节边界内修改真实运行环境。
+ */
+async function startRuntimeRefreshProviderFixture() {
+  const attempts = [];
+  const firstRequestGate = createFixtureGate();
+  let turnRequestCount = 0;
+  const server = createHttpServer(async (request, response) => {
+    if (request.method !== "POST") {
+      response.writeHead(405, { "content-length": "0" });
+      response.end();
+      return;
+    }
+    let payload;
+    try {
+      payload = await readBoundedFixtureJson(request);
+    } catch {
+      response.writeHead(400, { "content-length": "0" });
+      response.end();
+      return;
+    }
+    const api = request.url?.endsWith("/responses")
+      ? "openai_responses"
+      : request.url?.endsWith("/messages")
+        ? "anthropic_messages"
+        : undefined;
+    if (api === undefined) {
+      response.writeHead(404, { "content-length": "0" });
+      response.end();
+      return;
+    }
+    const serialized = JSON.stringify(payload);
+    const titleRequest =
+      serialized.includes("<user_request>") && serialized.includes("<assistant_reply>");
+    const attempt = {
+      kind: titleRequest ? "title" : "turn",
+      api,
+      ordinal: titleRequest ? undefined : ++turnRequestCount,
+      responded: false,
+      finished: false,
+      disconnected: false,
+    };
+    attempts.push(attempt);
+    response.once("finish", () => {
+      attempt.finished = true;
+    });
+    response.once("close", () => {
+      if (!attempt.finished) attempt.disconnected = true;
+    });
+    if (titleRequest) {
+      if (api !== "anthropic_messages") {
+        response.writeHead(409, { "content-length": "0" });
+        response.end();
+        return;
+      }
+      writeRuntimeRefreshProviderStream(
+        response,
+        runtimeRefreshAnthropicTitleStream(runtimeRefreshFixtureContract.automaticTitle),
+        attempt,
+      );
+      return;
+    }
+    const tools = Array.isArray(payload.tools) ? payload.tools : [];
+    const tool = tools.find(
+      (candidate) => candidate?.name === runtimeRefreshFixtureContract.toolName,
+    );
+    if (attempt.ordinal === 1) {
+      Object.assign(attempt, {
+        contractValid:
+          api === "openai_responses" &&
+          payload.model === "runtime-old-model" &&
+          serialized.includes(runtimeRefreshFixtureContract.oldWorkspaceMarker) &&
+          serialized.includes(runtimeRefreshFixtureContract.oldSkillMarker) &&
+          tool?.parameters?.properties?.value?.type === "string",
+        oldPromptSeen: serialized.includes(runtimeRefreshFixtureContract.oldWorkspaceMarker),
+        oldSkillSeen: serialized.includes(runtimeRefreshFixtureContract.oldSkillMarker),
+        oldSchemaSeen: tool?.parameters?.properties?.value?.type === "string",
+      });
+      if (!attempt.contractValid) {
+        response.writeHead(409, { "content-length": "0" });
+        response.end();
+        return;
+      }
+      await firstRequestGate.promise;
+      if (!attempt.disconnected && !response.destroyed) {
+        writeRuntimeRefreshProviderStream(response, runtimeRefreshOpenAiToolStream(1), attempt);
+      }
+      return;
+    }
+    if (attempt.ordinal === 2) {
+      Object.assign(attempt, {
+        contractValid:
+          api === "anthropic_messages" &&
+          payload.model === "runtime-new-model" &&
+          payload.output_config?.effort === "high" &&
+          serialized.includes(runtimeRefreshFixtureContract.newWorkspaceMarker) &&
+          serialized.includes(runtimeRefreshFixtureContract.newSkillMarker) &&
+          tool?.input_schema?.properties?.value?.type === "integer",
+        newPromptSeen: serialized.includes(runtimeRefreshFixtureContract.newWorkspaceMarker),
+        newSkillSeen: serialized.includes(runtimeRefreshFixtureContract.newSkillMarker),
+        newSchemaSeen: tool?.input_schema?.properties?.value?.type === "integer",
+      });
+      if (!attempt.contractValid) {
+        response.writeHead(409, { "content-length": "0" });
+        response.end();
+        return;
+      }
+      writeRuntimeRefreshProviderStream(response, runtimeRefreshAnthropicToolStream(), attempt);
+      return;
+    }
+    if (attempt.ordinal === 3) {
+      const privateContinuationSeen =
+        serialized.includes(runtimeRefreshFixtureContract.thinking) &&
+        serialized.includes(runtimeRefreshFixtureContract.signature) &&
+        serialized.includes("call_runtime_refresh_new") &&
+        serialized.includes("tool_result");
+      Object.assign(attempt, {
+        contractValid:
+          api === "anthropic_messages" &&
+          payload.model === "runtime-new-model" &&
+          payload.output_config?.effort === "high" &&
+          privateContinuationSeen,
+        privateContinuationSeen,
+      });
+      if (!attempt.contractValid) {
+        response.writeHead(409, { "content-length": "0" });
+        response.end();
+        return;
+      }
+      writeRuntimeRefreshProviderStream(
+        response,
+        runtimeRefreshAnthropicFinalStream(runtimeRefreshFixtureContract.finalReply),
+        attempt,
+      );
+      return;
+    }
+    response.writeHead(409, { "content-length": "0" });
+    response.end();
+  });
+  await new Promise((resolvePromise, rejectPromise) => {
+    server.once("error", rejectPromise);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string")
+    throw new Error("Runtime Refresh Provider 未绑定端口");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  return {
+    attempts,
+    providerConfig: {
+      apiKey: "DUMMY_RUNTIME_REFRESH",
+      baseUrl,
+      model: "runtime-old-model",
+      name: "Runtime Refresh Provider",
+      api: "openai_responses",
+    },
+    releaseFirstRequest: () => firstRequestGate.release(),
+    close: async () => {
+      firstRequestGate.release();
+      server.closeAllConnections?.();
+      await new Promise((resolvePromise) => server.close(resolvePromise));
+    },
+    diagnosticSnapshot: () => attempts.map((attempt) => ({ ...attempt })),
+  };
+}
+
+/**
+ * 首轮只返回一个真实 `read` Tool call；后续 Provider 请求必须等整批 Tool 持久化后才会出现，
+ * 因而可用请求顺序证明 Steering 没有中断在途 Provider 或 Tool。
+ */
+function inputQueueToolStream(requestNumber, workspacePath) {
+  const responseId = `resp_queue_tool_${requestNumber}`;
+  const argumentsJson = JSON.stringify({
+    path: join(workspacePath, "sample.ts"),
+    offset: 1,
+    limit: 8,
+  });
+  const item = {
+    id: `item_queue_tool_${requestNumber}`,
+    type: "function_call",
+    call_id: `call_queue_tool_${requestNumber}`,
+    name: "read",
+    arguments: argumentsJson,
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * 生成具有精确 UTF-8 字节数和逻辑行数的 ASCII fixture；首行保留短 marker，后续 edit
+ * 只替换该 marker，从而每个 revision 都测同一大文件而不重复搬运正文。
+ */
+export function turnChangeReviewContent(byteLength, logicalLines, marker) {
+  if (
+    !Number.isSafeInteger(byteLength) ||
+    !Number.isSafeInteger(logicalLines) ||
+    logicalLines < 1 ||
+    marker.length + Math.max(0, logicalLines - 1) > byteLength
+  ) {
+    throw new Error("Turn Change Review fixture 预算无效");
+  }
+  const lineBreaks = Math.max(0, logicalLines - 1);
+  const suffixBytes = byteLength - marker.length - lineBreaks;
+  return `${marker}${"\n".repeat(lineBreaks)}${"x".repeat(suffixBytes)}`;
+}
+
+/**
+ * 每个 Provider continuation 只返回一个原生 write call，使 App Server 分别持久化 64 KiB 与
+ * 1 MiB 冻结文件；后续 30 次查看都读取同一终态 artifact，不以重复 Tool commit 代替读取性能。
+ */
+export function turnChangeReviewToolStream(tool, argumentsValue, step) {
+  if (!new Set(["small", "large"]).has(step)) {
+    throw new Error(`Turn Change Review Tool 阶段无效：${String(step)}`);
+  }
+  const responseId = `resp_turn_change_review_${step}`;
+  const item = {
+    id: `item_turn_change_review_${step}`,
+    type: "function_call",
+    call_id: `call_turn_change_review_${step}`,
+    name: tool,
+    arguments: JSON.stringify(argumentsValue),
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * 只认可当前 Review fixture 的固定 Tool identity；HTTP 重试不会推进阶段，失败 Tool 输出也不会
+ * 被误当作已完成修改。闭集结果不保留 output 正文，诊断只暴露成功、失败与重复 identity。
+ */
+export function inspectTurnChangeReviewToolOutputs(input) {
+  const expected = ["call_turn_change_review_small", "call_turn_change_review_large"];
+  const matches = Array.isArray(input)
+    ? input.filter(
+        (item) => item?.type === "function_call_output" && expected.includes(item.call_id),
+      )
+    : [];
+  const successfulCallIds = [];
+  const failedCallIds = [];
+  const duplicateCallIds = [];
+  for (const callId of expected) {
+    const outputs = matches.filter((item) => item.call_id === callId);
+    if (outputs.length > 1) duplicateCallIds.push(callId);
+    if (outputs.length === 1) {
+      if (outputs[0].status === "incomplete") failedCallIds.push(callId);
+      else successfulCallIds.push(callId);
+    }
+  }
+  const contiguous = successfulCallIds.every((callId, index) => callId === expected[index]);
+  return {
+    successfulCallIds,
+    failedCallIds,
+    duplicateCallIds,
+    successfulCount: contiguous ? successfulCallIds.length : 0,
+    valid: contiguous && failedCallIds.length === 0 && duplicateCallIds.length === 0,
+  };
+}
+
+/** 返回实际 SSE frame 的 UTF-8 字节数，生产 fixture 在发送前据此守住单事件 2 MiB 上限。 */
+export function turnChangeReviewSseEventBytes(stream) {
+  if (typeof stream !== "string" || stream.length === 0) {
+    throw new Error("Turn Change Review SSE 不能为空");
+  }
+  return stream
+    .split("\n\n")
+    .filter((frame) => frame.length > 0)
+    .map((frame) => Buffer.byteLength(`${frame}\n\n`, "utf8"));
+}
+
+/**
+ * 等待 ServerResponse 的真实 drain 或关闭；关闭属于可重试的传输终态，不把正常 Provider 重试
+ * 升级为 fixture handler 崩溃。
+ */
+function waitForTurnChangeReviewDrain(response) {
+  return new Promise((resolveDrain, rejectDrain) => {
+    const cleanup = () => {
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      response.off("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolveDrain(true);
+    };
+    const onClose = () => {
+      cleanup();
+      resolveDrain(false);
+    };
+    const onError = (error) => {
+      cleanup();
+      rejectDrain(error);
+    };
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+    response.once("error", onError);
+  });
+}
+
+/**
+ * Review 的大 Tool SSE 以 64 KiB 有界分块并尊重 backpressure；其它 fixture 继续使用 11 字节
+ * 碎片以覆盖流解析边界，避免为修复压力夹具降低既有协议测试强度。
+ */
+export async function writeTurnChangeReviewFixtureBody(response, body) {
+  const chunkBytes = 64 * 1024;
+  let chunks = 0;
+  let drainWaits = 0;
+  let writtenBytes = 0;
+  for (let offset = 0; offset < body.length; offset += chunkBytes) {
+    if (response.destroyed || response.writableEnded) break;
+    const chunk = body.subarray(offset, offset + chunkBytes);
+    chunks += 1;
+    writtenBytes += chunk.length;
+    if (!response.write(chunk)) {
+      drainWaits += 1;
+      if (!(await waitForTurnChangeReviewDrain(response))) break;
+    }
+  }
+  return { chunks, drainWaits, writtenBytes, disconnected: writtenBytes !== body.length };
+}
+
+/**
+ * 返回两个真实 Shell 调用：首项快速完成，次项等待 stdin EOF 后短暂运行。
+ * 两个调用使用全局唯一身份，使真窗能观察逐 ordinal 结算而不触发数据库主键冲突。
+ */
+function toolLifecycleStream(requestNumber) {
+  const responseId = `resp_tool_lifecycle_${requestNumber}`;
+  const definitions = [
+    {
+      id: `item_tool_lifecycle_fast_${requestNumber}`,
+      call_id: `call_tool_lifecycle_fast_${requestNumber}`,
+      command: "Write-Output 'JA_WEBVIEW_FIRST_TOOL'",
+    },
+    {
+      id: `item_tool_lifecycle_eof_${requestNumber}`,
+      call_id: `call_tool_lifecycle_eof_${requestNumber}`,
+      command:
+        "$input=[Console]::In.ReadToEnd(); if($input.Length -ne 0){exit 9}; " +
+        "Start-Sleep -Seconds 3; Write-Output 'JA_WEBVIEW_STDIN_EOF'",
+    },
+  ];
+  const items = definitions.map((definition) => ({
+    id: definition.id,
+    type: "function_call",
+    call_id: definition.call_id,
+    name: "shell",
+    arguments: JSON.stringify({ command: definition.command }),
+  }));
+  const events = [];
+  let sequence = 0;
+  for (const [outputIndex, item] of items.entries()) {
+    events.push(
+      titleFixtureEvent("response.output_item.added", sequence++, {
+        output_index: outputIndex,
+        item: { ...item, arguments: "" },
+      }),
+      titleFixtureEvent("response.function_call_arguments.done", sequence++, {
+        item_id: item.id,
+        arguments: item.arguments,
+        output_index: outputIndex,
+      }),
+      titleFixtureEvent("response.output_item.done", sequence++, {
+        output_index: outputIndex,
+        item,
+      }),
+    );
+  }
+  events.push(
+    titleFixtureEvent("response.completed", sequence, {
+      response: titleFixtureResponse(responseId, "completed", items, true),
+    }),
+  );
+  return events.join("");
+}
+
+/**
+ * 先返回模型可纠正的原生 Tool 错误，再返回一个真实成功调用；连续三个 Read schema 错误
+ * 刻意超过旧熔断阈值，证明失败结果只反馈模型且不会移除 Tool catalog 或强制终止本轮。
+ */
+function toolFailureStream(scenario, scenarioTurnAttempt, requestNumber, workspacePath) {
+  const readRecovery = scenario.id === "read_stall_failure";
+  const readArgumentsInvalid = readRecovery && scenarioTurnAttempt <= 3;
+  const recoveringUnknownTool = !readRecovery && scenarioTurnAttempt === 1;
+  const responseId = `resp_${scenario.id}_${requestNumber}`;
+  const item = {
+    id: `item_${scenario.id}_${requestNumber}`,
+    type: "function_call",
+    call_id: `call_${scenario.id}_${requestNumber}`,
+    name: recoveringUnknownTool ? "unknown_e2e_tool" : readRecovery ? "read" : "shell",
+    arguments: JSON.stringify(
+      readRecovery
+        ? readArgumentsInvalid
+          ? { path: join(workspacePath, businessFixtureFile), offset: "one", limit: 8 }
+          : { path: join(workspacePath, businessFixtureFile), offset: 1, limit: 8 }
+        : recoveringUnknownTool
+          ? {}
+          : { command: "Write-Output 'JA_E2E_UNKNOWN_TOOL_RECOVERED'" },
+    ),
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * 把 DSML-like 标记拆到多个原生文本 delta 中，同时让 completed item 保留完整正文；这证明
+ * 流边界和标记内容都不会把普通助手文本误判成 Tool，也不会依赖 TCP 恰好如何分包。
+ */
+function ordinaryDsmlTextStream(text, requestNumber) {
+  if (ordinaryDsmlTextFragments.join("") !== text) {
+    throw new Error("DSML-like 普通文本 fixture 与分片合同不一致");
+  }
+  const responseId = `resp_model_protocol_text_${requestNumber}`;
+  const itemId = `message_model_protocol_text_${requestNumber}`;
+  const finalItem = {
+    id: itemId,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [], logprobs: [] }],
+  };
+  const events = [
+    titleFixtureEvent("response.created", 0, {
+      response: titleFixtureResponse(responseId, "in_progress", [], false),
+    }),
+  ];
+  for (const [index, fragment] of ordinaryDsmlTextFragments.entries()) {
+    events.push(
+      titleFixtureEvent("response.output_text.delta", index + 1, {
+        content_index: 0,
+        delta: fragment,
+        item_id: itemId,
+        logprobs: [],
+        output_index: 0,
+      }),
+    );
+  }
+  const completedSequence = ordinaryDsmlTextFragments.length + 1;
+  events.push(
+    titleFixtureEvent("response.output_text.done", completedSequence, {
+      content_index: 0,
+      item_id: itemId,
+      output_index: 0,
+      text,
+    }),
+    titleFixtureEvent("response.completed", completedSequence + 1, {
+      response: titleFixtureResponse(responseId, "completed", [finalItem], true),
+    }),
+  );
+  return events.join("");
+}
+
+/**
+ * 返回一个真实 shell Tool call，使生产审批策略把 Turn 稳定停在 waiting_approval；这里不执行
+ * 命令，因而既能验证当前会话仍显示实时状态，也不会给真窗验收引入额外外部副作用。
+ */
+function sidebarApprovalToolStream(requestNumber) {
+  const responseId = `resp_sidebar_approval_${requestNumber}`;
+  const item = {
+    id: `item_sidebar_approval_${requestNumber}`,
+    type: "function_call",
+    call_id: `call_sidebar_approval_${requestNumber}`,
+    name: "shell",
+    arguments: JSON.stringify({ command: "Write-Output JA_SIDEBAR_APPROVAL" }),
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * 为全量桌面矩阵生成稳定的审批 Tool call。固定 call identity 只在每个独立 Turn 内复用，
+ * 让批准、拒绝、取消、CAS 和重启恢复继续覆盖生产持久化，而不恢复 Java 测试后门。
+ */
+function defaultDesktopApprovalToolStream(requestNumber) {
+  const responseId = `resp_default_approval_${requestNumber}`;
+  const item = {
+    id: `item_default_approval_${requestNumber}`,
+    type: "function_call",
+    call_id: approvalFixtureCallId,
+    name: "shell",
+    arguments: JSON.stringify({ command: "Write-Output JA_FAKE_APPROVAL_FIXTURE" }),
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * 生成 Task 真窗专用的原生 Responses function_call；参数严格使用 Java Task Tool 当前 schema，
+ * 让验收穿过 Provider codec、AgentLoop 与 TaskUseCase，而不是从 Renderer 伪造 Child 数据。
+ */
+function taskThreadsToolStream(toolName, argumentsValue, requestNumber) {
+  const responseId = `resp_task_threads_tool_${requestNumber}`;
+  const item = {
+    id: `item_task_threads_tool_${requestNumber}`,
+    type: "function_call",
+    call_id: `call_task_threads_tool_${requestNumber}`,
+    name: toolName,
+    arguments: JSON.stringify(argumentsValue),
+  };
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      arguments: item.arguments,
+      output_index: 0,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * Plan/Goal fixture 只发 Provider 原生 function_call；目标、revision 与 run identity 来自
+ * 真实 Goal 快照，不能用 Markdown 或模型文本完成标记替代结构化 extension Tool。
+ */
+function planGoalToolStream(toolName, argumentsValue, requestNumber) {
+  const item = {
+    id: `fc_plan_goal_${requestNumber}`,
+    type: "function_call",
+    call_id: `call_plan_goal_${requestNumber}`,
+    name: toolName,
+    arguments: JSON.stringify(argumentsValue),
+  };
+  const responseId = `resp_plan_goal_${requestNumber}`;
+  return [
+    titleFixtureEvent("response.output_item.added", 0, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    titleFixtureEvent("response.function_call_arguments.done", 1, {
+      item_id: item.id,
+      output_index: 0,
+      arguments: item.arguments,
+    }),
+    titleFixtureEvent("response.output_item.done", 2, { output_index: 0, item }),
+    titleFixtureEvent("response.completed", 3, {
+      response: titleFixtureResponse(responseId, "completed", [item], true),
+    }),
+  ].join("");
+}
+
+/**
+ * 独立 evaluator 请求由 extension Tool 提交；该 Tool 的结果回到模型后必须结束当前 Turn，
+ * 否则确定性 fixture 会重复申请同一审批并遮蔽后续“继续处理”创建的新 continuation。
+ */
+function trailingPlanGoalToolCall(input) {
+  if (!Array.isArray(input)) return undefined;
+  const result = input.at(-1);
+  if (result?.type !== "function_call_output" || typeof result.call_id !== "string") {
+    return undefined;
+  }
+  return input.findLast(
+    (item) => item?.type === "function_call" && item.call_id === result.call_id,
+  );
+}
+
+/**
+ * evaluator fixture 必须从无 Tool 请求中的冻结 JSON 读取完整 criteria，不能复用 continuation
+ * 的可变上下文猜测单个 ID；Goal criteria 与可选 Plan criteria 会在该请求中合并。
+ */
+function planGoalEvaluatorCriteria(input) {
+  if (!Array.isArray(input)) throw new Error("Plan/Goal evaluator 请求缺少 input 数组");
+  for (const item of input.toReversed()) {
+    if (item?.role !== "user" || !Array.isArray(item.content)) continue;
+    for (const block of item.content.toReversed()) {
+      if (block?.type !== "input_text" || typeof block.text !== "string") continue;
+      let payload;
+      try {
+        payload = JSON.parse(block.text);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(payload?.criteria) || payload.criteria.length === 0) continue;
+      const ids = payload.criteria.map((criterion) => criterion?.criterionId);
+      if (
+        ids.some((criterionId) => typeof criterionId !== "string" || criterionId.length === 0) ||
+        new Set(ids).size !== ids.length
+      ) {
+        throw new Error("Plan/Goal evaluator criteria identity 无效");
+      }
+      return ids;
+    }
+  }
+  throw new Error("Plan/Goal evaluator 请求未携带冻结 criteria");
+}
+
+/**
+ * 下一动作只由当前 Tool result 和权威 Goal 投影决定，不能按 Provider 请求序号推导；取消可能
+ * 发生在模型响应前后，序号在两种合法时序下并不等价。非法 step 参数直接失败关闭 fixture。
+ */
+function nextPlanGoalToolName(input, context) {
+  const prior = trailingPlanGoalToolCall(input);
+  if (prior?.name === "goal_request_evaluation") return undefined;
+  if (prior?.name === "shell") {
+    // 无 Plan 的 Goal 没有步骤执行 identity；其真实 shell 结果应直接作为验收证据进入 evaluator。
+    return context?.kind === "goal" && context?.planRevisionId == null
+      ? "goal_request_evaluation"
+      : "plan_step_update";
+  }
+  if (prior?.name === "plan_step_update") {
+    const argumentsValue = JSON.parse(prior.arguments);
+    if (argumentsValue.status === "running") return "plan_step_update";
+    if (argumentsValue.status === "succeeded") {
+      return context?.kind === "plan" ? undefined : "goal_request_evaluation";
+    }
+    throw new Error(`Plan/Goal fixture step 终态无效：${String(argumentsValue.status)}`);
+  }
+  if (context?.projection?.latestEvaluation?.verdict === "not_met") {
+    return "goal_request_evaluation";
+  }
+  return "shell";
+}
+
+/**
+ * 从当前请求最后一个原生 function_call 推导 continuation 的 owner。不能按 brief 的包含关系
+ * 判断：父级 spawn_agent 参数天然包含 Child brief，会把 Root continuation 错门控成 Child。
+ */
+function taskThreadsContinuationStep(scenario, input) {
+  if (!Array.isArray(input) || !input.some((item) => item?.type === "function_call_output")) {
+    return undefined;
+  }
+  let lastToolCall;
+  for (const item of input) {
+    if (item?.type === "function_call") lastToolCall = item;
+  }
+  if (lastToolCall === undefined || typeof lastToolCall.arguments !== "string") return undefined;
+  let argumentsValue;
+  try {
+    argumentsValue = JSON.parse(lastToolCall.arguments);
+  } catch {
+    return undefined;
+  }
+  if (lastToolCall.name === "spawn_agent") {
+    if (argumentsValue?.taskName === scenario.levelOneName) return "root_continuation";
+    if (argumentsValue?.taskName === scenario.levelTwoName) return "level_one_continuation";
+    if (argumentsValue?.taskName === scenario.levelThreeName) return "level_two_continuation";
+  }
+  return lastToolCall.name === "shell" && argumentsValue?.command === scenario.approvalCommand
+    ? "level_three_continuation"
+    : undefined;
+}
+
+/**
+ * 初始请求只按 fixture 唯一标记识别身份，续轮则严格服从结构化 Tool call 归属；未知续轮
+ * 返回 undefined 交给 Provider 合同失败关闭，避免测试悄悄落入普通文本响应。
+ */
+function taskThreadsRequestStep(scenario, input, kind) {
+  if (kind === "title") return "title";
+  const continuationStep = taskThreadsContinuationStep(scenario, input);
+  if (continuationStep !== undefined) return continuationStep;
+  const serializedInput = JSON.stringify(input ?? []);
+  if (serializedInput.includes("function_call_output")) return undefined;
+  if (serializedInput.includes(scenario.levelThreeBrief)) {
+    return "level_three_approval";
+  }
+  if (serializedInput.includes(scenario.levelTwoBrief)) {
+    return "level_two_spawn";
+  }
+  if (serializedInput.includes(scenario.levelOneBrief)) {
+    return "level_one_spawn";
+  }
+  if (serializedInput.includes(scenario.agentRootPrompt)) {
+    return "root_spawn";
+  }
+  if (serializedInput.includes(scenario.followupPrompt)) return "side_followup";
+  return "side_initial";
+}
+
 /**
  * 启动仅绑定 IPv4 loopback 的生产 Provider fixture。常规首轮与自动标题分别设门，真窗可以
  * 在服务端尚未发送任何模型字节时断言即时短标题，并确定性制造失败、取消和迟到 CAS 竞态。
  */
-async function startAutomaticTitleProviderFixture() {
+async function startAutomaticTitleProviderFixture(workspacePath) {
   const scenarios = automaticTitleScenarios();
   const scenarioList = Object.values(scenarios);
   const attempts = [];
+  const summaryAttempts = [];
+  const exchanges = [];
+  let planGoalContext;
+  let planGoalEvidenceCallId;
+  let planGoalSoakStartedAt;
+  let planGoalSoakInputRequested = false;
+  let planGoalContextReady = createFixtureGate();
+  let planGoalPostEvaluationContextReady = createFixtureGate();
+  let planGoalContextMode = "normal";
+  let planGoalContinuationOffset = 0;
   const gates = new Map([
     [`${scenarios.success.id}:turn`, createFixtureGate()],
     [`${scenarios.success.id}:title`, createFixtureGate()],
     [`${scenarios.manual.id}:title`, createFixtureGate()],
     [`${scenarios.cancellation.id}:turn`, createFixtureGate()],
+    [`${scenarios.operationRecovery.id}:turn`, createFixtureGate()],
+    [`${scenarios.inputQueue.id}:turn`, createFixtureGate()],
+    [`${scenarios.composerContext.id}:turn`, createFixtureGate()],
+    [`${scenarios.sidebarCompleted.id}:turn`, createFixtureGate()],
+    [`${scenarios.sidebarFailure.id}:turn`, createFixtureGate()],
+    [`${scenarios.taskThreads.id}:side_followup`, createFixtureGate()],
+    [`${scenarios.taskThreads.id}:level_one_continuation`, createFixtureGate()],
+    [`${scenarios.taskThreads.id}:level_two_continuation`, createFixtureGate()],
+    [`${scenarios.taskThreads.id}:level_three_continuation`, createFixtureGate()],
   ]);
+  const turnChangeReviewGates = new Map();
 
-  /** 只按受控 fixture 文本识别请求归属，无法识别的生产请求必须失败关闭。 */
+  /**
+   * 只按受控 fixture 文本识别请求归属，并选择历史中最后出现的场景标记；多 Turn 请求会携带
+   * 早先用户消息，若按声明顺序取首个命中会把新 Turn 错路由到旧场景。无法识别时必须失败关闭。
+   */
   function classify(payload) {
     const serialized = JSON.stringify(payload?.input ?? []);
-    const scenario = scenarioList.find(
-      (candidate) =>
-        serialized.includes(candidate.prompt) ||
-        (candidate.secondPrompt !== undefined && serialized.includes(candidate.secondPrompt)),
-    );
+    const completePayload = JSON.stringify(payload ?? {});
+    let scenario = scenarioList
+      .map((candidate) => {
+        const markers = [
+          candidate.prompt,
+          candidate.secondPrompt,
+          candidate.queued,
+          candidate.followupPrompt,
+          candidate.zeroPrompt,
+          candidate.agentRootPrompt,
+          candidate.levelOneBrief,
+          candidate.levelTwoBrief,
+          candidate.levelThreeBrief,
+        ];
+        if (candidate.id === scenarios.inputQueue.id) {
+          markers.push(
+            candidate.steering,
+            candidate.edited,
+            candidate.editable,
+            candidate.followUp,
+            candidate.unavailablePrompt,
+          );
+        }
+        return {
+          candidate,
+          lastIndex: Math.max(
+            ...markers
+              .filter((marker) => typeof marker === "string")
+              .map((marker) => serialized.lastIndexOf(marker)),
+          ),
+        };
+      })
+      .filter(({ lastIndex }) => lastIndex >= 0)
+      .sort((left, right) => right.lastIndex - left.lastIndex)[0]?.candidate;
+    if (
+      scenario === undefined &&
+      planGoalAcceptanceMode &&
+      completePayload.includes(scenarios.planGoal.objective)
+    ) {
+      scenario = scenarios.planGoal;
+    }
+    let consumedInput;
+    if (scenario === undefined && defaultDesktopLoopbackMode) {
+      const matches = serialized.match(
+        /__JA_FAKE_APPROVAL_FIXTURE__|E2E parallel B run_[a-z0-9]+|E2E turn run_[a-z0-9]+/gu,
+      );
+      consumedInput = matches?.at(-1);
+      if (consumedInput !== undefined) scenario = scenarios.defaultDesktop;
+    }
     if (scenario === undefined) return undefined;
     const kind =
       serialized.includes("<user_request>") && serialized.includes("<assistant_reply>")
@@ -1238,10 +3567,54 @@ async function startAutomaticTitleProviderFixture() {
       kind === "turn" &&
       scenario.secondPrompt !== undefined &&
       serialized.includes(scenario.secondPrompt);
-    return { scenario, kind, secondTurn };
+    const queuedInputs =
+      scenario.id === scenarios.inputQueue.id
+        ? [
+            scenario.steering,
+            scenario.edited,
+            scenario.editable,
+            scenario.deletable,
+            scenario.followUp,
+            scenario.unavailablePrompt,
+          ]
+        : [];
+    consumedInput ??= queuedInputs
+      .map((text) => ({ text, index: serialized.lastIndexOf(text) }))
+      .filter((candidate) => candidate.index >= 0)
+      .sort((left, right) => right.index - left.index)[0]?.text;
+    const recoveryScenario = [
+      scenarios.shellFailureRecovery.id,
+      scenarios.readStallFailure.id,
+    ].includes(scenario.id);
+    const turnChangeReviewProgress =
+      scenario.id === scenarios.turnChangeReview.id
+        ? inspectTurnChangeReviewToolOutputs(payload?.input)
+        : undefined;
+    const toolOutputSeen = recoveryScenario
+      ? Array.isArray(payload.input) &&
+        payload.input.some(
+          (item) =>
+            item?.type === "function_call_output" &&
+            item.call_id?.startsWith(`call_${scenario.id}_`) === true,
+        )
+      : turnChangeReviewProgress !== undefined
+        ? turnChangeReviewProgress.successfulCount > 0
+        : [
+            scenarios.inputQueue.id,
+            scenarios.toolLifecycle.id,
+            scenarios.defaultDesktop.id,
+          ].includes(scenario.id) && serialized.includes("function_call_output");
+    return {
+      scenario,
+      kind,
+      secondTurn,
+      consumedInput,
+      toolOutputSeen,
+      turnChangeReviewProgress,
+    };
   }
 
-  /** 返回指定场景与请求类型的生产 `/responses` 交换次数，不计 token 预估请求。 */
+  /** 返回指定场景与请求类型的生产 `/responses` 交换次数；本地 Token 估算不得产生 HTTP 交换。 */
   function attemptCount(scenarioId, kind) {
     return attempts.filter((attempt) => attempt.scenarioId === scenarioId && attempt.kind === kind)
       .length;
@@ -1257,9 +3630,106 @@ async function startAutomaticTitleProviderFixture() {
     ).length;
   }
 
+  /**
+   * 读取所有已到达 continuation 中最大的成功 Tool 前缀；HTTP retry 不增加该计数，因此真窗
+   * 只能在 App Server 已提交对应 function_call_output 后释放下一阶段。
+   */
+  function turnChangeReviewCommittedToolCount() {
+    return Math.max(
+      0,
+      ...attempts
+        .filter(
+          (attempt) =>
+            attempt.scenarioId === scenarios.turnChangeReview.id && attempt.kind === "turn",
+        )
+        .map((attempt) => attempt.turnChangeReviewProgress?.successfulCount ?? 0),
+    );
+  }
+
   /** 标记指定请求门可继续；不存在门说明该行为本就应立即响应。 */
   function release(scenarioId, kind) {
     gates.get(`${scenarioId}:${kind}`)?.release();
+  }
+
+  /** Task 专用阶段门只接受固定闭集，避免测试调用方用任意键释放其它场景。 */
+  function releaseTaskStep(step) {
+    if (
+      !new Set([
+        "side_followup",
+        "level_one_continuation",
+        "level_two_continuation",
+        "level_three_continuation",
+      ]).has(step)
+    ) {
+      throw new Error(`未知 Task fixture 阶段 ${String(step)}`);
+    }
+    gates.get(`${scenarios.taskThreads.id}:${step}`)?.release();
+  }
+
+  /**
+   * 只释放指定 continuation ordinal；门在请求到达前也可创建，避免 UI 与 Provider 的调度先后
+   * 形成竞态，同时禁止跳过 ordinal 1 的初始 write。
+   */
+  function releaseTurnChangeReviewStep(ordinal) {
+    if (!Number.isSafeInteger(ordinal) || ordinal < 2 || ordinal > 3) {
+      throw new Error(`未知 Turn Change Review fixture 阶段 ${String(ordinal)}`);
+    }
+    let gate = turnChangeReviewGates.get(ordinal);
+    if (gate === undefined) {
+      gate = createFixtureGate();
+      turnChangeReviewGates.set(ordinal, gate);
+    }
+    gate.release();
+  }
+
+  /**
+   * 由真窗 RPC 快照更新下一次 continuation 的 CAS identity；Provider fixture 不自行生成
+   * Goal、revision、run 或 step ID，因而旧快照只会触发服务端冲突而不会误写别的 Goal。
+   */
+  function setPlanGoalContext(context) {
+    const commonIdentity =
+      context !== null &&
+      typeof context === "object" &&
+      typeof context.runId === "string" &&
+      typeof context.planRevisionId === "string" &&
+      typeof context.stepId === "string" &&
+      typeof context.criterionId === "string";
+    const planIdentity =
+      context?.kind === "plan" &&
+      typeof context.planId === "string" &&
+      Number.isSafeInteger(context.planRevision);
+    const goalIdentity =
+      context?.kind !== "plan" &&
+      typeof context?.goalId === "string" &&
+      Number.isSafeInteger(context?.goalRevision);
+    if (!commonIdentity || (!planIdentity && !goalIdentity)) {
+      throw new Error("Plan/Goal fixture context 无效");
+    }
+    planGoalContext = { ...context };
+    planGoalContextReady.release();
+    planGoalPostEvaluationContextReady.release();
+  }
+
+  /**
+   * 第二个恢复 Goal 必须等待自己的 attach ACK 后才能生成 Tool 参数；同时冻结已有 continuation
+   * 数量，使恢复场景从 ordinal 1 开始，而不是继承首个已完成 Goal 的 Provider 轮次。
+   */
+  function resetPlanGoalContext(mode) {
+    if (!new Set(["normal", "standalone", "recovery"]).has(mode)) {
+      throw new Error(`Plan/Goal fixture mode 无效：${String(mode)}`);
+    }
+    planGoalContext = undefined;
+    planGoalEvidenceCallId = undefined;
+    planGoalSoakInputRequested = false;
+    planGoalContextMode = mode;
+    planGoalContinuationOffset = attempts.filter(
+      (attempt) =>
+        attempt.scenarioId === scenarios.planGoal.id &&
+        attempt.kind === "turn" &&
+        attempt.planGoalEvaluationRequest !== true,
+    ).length;
+    planGoalContextReady = createFixtureGate();
+    planGoalPostEvaluationContextReady = createFixtureGate();
   }
 
   /** 暴露不含正文的请求计数快照，供重启时证明没有后台重放。 */
@@ -1277,7 +3747,40 @@ async function startAutomaticTitleProviderFixture() {
     }));
   }
 
-  const server = createHttpServer(async (request, response) => {
+  /**
+   * 返回有界且脱敏的 Provider 交换诊断；只保留路由、分类、消费顺序和传输终态，避免把
+   * Provider 请求正文、Header、凭据或 Workspace 内容写入失败 summary。
+   */
+  function diagnosticSnapshot() {
+    return exchanges.slice(-32).map((exchange) => ({ ...exchange }));
+  }
+
+  /**
+   * focused mode 每次只落盘路由、状态和闭集失败码，便于在 UI deadline 前判断 Summary 合同；
+   * 请求正文、Header、路径、模型输出和 Workspace 内容都不会写入该诊断。
+   */
+  async function persistTurnChangeProviderDiagnostics() {
+    if (!turnChangeReviewAcceptanceMode || turnChangeReviewReportPath === undefined) return;
+    const path = `${turnChangeReviewReportPath}.provider.json`;
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, `${JSON.stringify(diagnosticSnapshot(), null, 2)}\n`, "utf8");
+    } catch {
+      // 诊断写入不属于 Provider 合同，磁盘观测失败不得改变被测 Turn 的网络结果。
+    }
+  }
+
+  let handlerFailure;
+
+  /** 将 async HTTP 回调中的异常保留给主 runner，避免 rejected callback 越过 main.finally。 */
+  function assertHandlerHealthy() {
+    if (handlerFailure !== undefined) {
+      throw new Error("loopback Provider handler failed", { cause: handlerFailure });
+    }
+  }
+
+  /** 单次 loopback 请求的完整处理；外层 server callback 统一收敛未预期异常。 */
+  async function handleFixtureRequest(request, response) {
     if (request.method !== "POST") {
       response.writeHead(405, { "content-length": "0" });
       response.end();
@@ -1287,74 +3790,352 @@ async function startAutomaticTitleProviderFixture() {
     try {
       payload = await readBoundedFixtureJson(request);
     } catch {
+      exchanges.push({
+        ordinal: exchanges.length + 1,
+        route: "request_body",
+        classified: false,
+        responseStatus: 400,
+        contractFailures: ["malformed_or_oversized_body"],
+      });
+      await persistTurnChangeProviderDiagnostics();
       response.writeHead(400, { "content-length": "0" });
       response.end();
       return;
     }
-    if (request.url?.endsWith("/responses/input_tokens")) {
-      const body = Buffer.from('{"input_tokens":5}', "utf8");
-      response.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(body.length),
-        "cache-control": "no-store",
-      });
-      response.end(body);
-      return;
-    }
     if (!request.url?.endsWith("/responses")) {
+      exchanges.push({
+        ordinal: exchanges.length + 1,
+        route: "unknown",
+        classified: false,
+        responseStatus: 404,
+      });
+      await persistTurnChangeProviderDiagnostics();
       response.writeHead(404, { "content-length": "0" });
       response.end();
       return;
     }
-    const classified = classify(payload);
+    const exchange = {
+      ordinal: exchanges.length + 1,
+      route: "responses",
+      classified: false,
+      responseStatus: undefined,
+      requestBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    };
+    exchanges.push(exchange);
+    const summaryClassification = classifyContextSummaryRequest(payload);
+    exchange.summaryClassification = summaryClassification.kind;
+    exchange.summaryContractFailures = summaryClassification.failures ?? [];
+    if (summaryClassification.kind !== "none") {
+      const summaryAttempt = {
+        kind: "context_summary",
+        contractValid: summaryClassification.kind === "valid",
+        responded: false,
+      };
+      summaryAttempts.push(summaryAttempt);
+      Object.assign(exchange, {
+        routeKind: "context_summary",
+        contractValid: summaryAttempt.contractValid,
+        contractFailures: summaryClassification.failures ?? [],
+      });
+      if (summaryClassification.kind !== "valid") {
+        exchange.responseStatus = 400;
+        await persistTurnChangeProviderDiagnostics();
+        response.writeHead(400, { "content-length": "0", "cache-control": "no-store" });
+        summaryAttempt.responded = true;
+        response.end();
+        return;
+      }
+      let body;
+      try {
+        body = Buffer.from(
+          contextSummaryFixtureStream(summaryClassification.prompt, summaryAttempts.length),
+          "utf8",
+        );
+      } catch {
+        exchange.responseStatus = 400;
+        exchange.contractFailures = ["summary_response_build"];
+        await persistTurnChangeProviderDiagnostics();
+        response.writeHead(400, { "content-length": "0", "cache-control": "no-store" });
+        summaryAttempt.responded = true;
+        response.end();
+        return;
+      }
+      response.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      });
+      for (let offset = 0; offset < body.length; offset += 11) {
+        response.write(body.subarray(offset, offset + 11));
+      }
+      summaryAttempt.responded = true;
+      exchange.responseStatus = 200;
+      await persistTurnChangeProviderDiagnostics();
+      response.end();
+      return;
+    }
+    const serializedInput = JSON.stringify(payload?.input ?? []);
+    const serializedPayload = JSON.stringify(payload ?? {});
+    const nativeAttachmentCount = (serializedInput.match(/"type":"input_file"/gu) ?? []).length;
+    // 文本/普通二进制不得伪装成 Provider 原生文件；它们必须以受管 Tool identity 进入上下文。
+    const managedAttachmentCount = (
+      serializedInput.match(
+        /Attachment att_[A-Za-z0-9_-]+ is available through the read_attachment tool\./gu,
+      ) ?? []
+    ).length;
+    const toolFinalizationEnvelope =
+      typeof payload.instructions === "string" &&
+      payload.instructions.includes("automatic Tool retries are now stopped") &&
+      (payload.tools === undefined ||
+        (Array.isArray(payload.tools) && payload.tools.length === 0)) &&
+      payload.previous_response_id === undefined;
+    let classified = classify(payload);
+    if (
+      classified === undefined &&
+      inputQueueAcceptanceMode &&
+      attemptCount(scenarios.inputQueue.id, "turn") >= 1
+    ) {
+      const serialized = JSON.stringify(payload?.input ?? []);
+      const queuedInputs = [
+        scenarios.inputQueue.steering,
+        scenarios.inputQueue.edited,
+        scenarios.inputQueue.followUp,
+      ];
+      const continuationIndex = attemptCount(scenarios.inputQueue.id, "turn") - 1;
+      classified = {
+        scenario: scenarios.inputQueue,
+        kind: "turn",
+        secondTurn: false,
+        consumedInput:
+          queuedInputs.find((text) => serialized.includes(text)) ?? queuedInputs[continuationIndex],
+        toolOutputSeen: serialized.includes("function_call_output"),
+      };
+    }
+    if (
+      classified === undefined &&
+      toolLifecycleAcceptanceMode &&
+      attemptCount(scenarios.toolLifecycle.id, "turn") >= 1
+    ) {
+      classified = {
+        scenario: scenarios.toolLifecycle,
+        kind: "turn",
+        secondTurn: false,
+        consumedInput: undefined,
+        toolOutputSeen: JSON.stringify(payload?.input ?? []).includes("function_call_output"),
+      };
+    }
+    const shellFailureAttempts = attemptCount(scenarios.shellFailureRecovery.id, "turn");
+    const readFailureAttempts = attemptCount(scenarios.readStallFailure.id, "turn");
+    if (
+      toolFailureAcceptanceMode &&
+      classified?.kind !== "title" &&
+      classified?.scenario?.id !== scenarios.dsmlProtocolFailure.id &&
+      ((readFailureAttempts >= 1 &&
+        (serializedInput.includes("function_call_output") || toolFinalizationEnvelope)) ||
+        (classified === undefined && (shellFailureAttempts >= 1 || readFailureAttempts >= 1)))
+    ) {
+      // 新用户 Turn 也会携带旧 Tool 输出，因此只有 Read 首次请求已经发生后才能锁定其续轮；
+      // 这时完整旧历史的排列不再参与归属，避免后续请求回退到更早的 Shell。
+      const scenario =
+        readFailureAttempts >= 1 ? scenarios.readStallFailure : scenarios.shellFailureRecovery;
+      classified = {
+        scenario,
+        kind: "turn",
+        secondTurn: false,
+        consumedInput: undefined,
+        toolOutputSeen: serializedInput.includes("function_call_output"),
+      };
+    }
+    if (
+      classified === undefined &&
+      planGoalAcceptanceMode &&
+      serializedPayload.includes('"plan_step_update"') &&
+      serializedPayload.includes('"goal_request_evaluation"')
+    ) {
+      // 批准 ACK 与隐藏 continuation 并发发生；只有完整 Goal extension catalog 才能进入此门。
+      // IncomingMessage 在请求体读完后可被客户端正常半关闭，不能把 request.destroyed 当作取消；
+      // 真正断开由下方 aborted/response close 记录，响应通道失效才允许提前退出。
+      await planGoalContextReady.promise;
+      if (response.destroyed) return;
+      classified = {
+        scenario: scenarios.planGoal,
+        kind: "turn",
+        secondTurn: false,
+        consumedInput: undefined,
+        toolOutputSeen: serializedInput.includes("function_call_output"),
+      };
+    }
     if (classified === undefined) {
+      exchange.responseStatus = 422;
+      await persistTurnChangeProviderDiagnostics();
       response.writeHead(422, { "content-length": "0" });
       response.end();
       return;
     }
-    const { scenario, kind, secondTurn } = classified;
+    const { scenario, kind, secondTurn, consumedInput, toolOutputSeen, turnChangeReviewProgress } =
+      classified;
+    const planGoalEvaluationRequest =
+      scenario.id === scenarios.planGoal.id &&
+      kind === "turn" &&
+      !toolFinalizationEnvelope &&
+      (!Array.isArray(payload?.tools) || payload.tools.length === 0);
+    const planGoalContinuationAttempt =
+      scenario.id === scenarios.planGoal.id && !planGoalEvaluationRequest
+        ? attempts.filter(
+            (attempt) =>
+              attempt.scenarioId === scenarios.planGoal.id &&
+              attempt.kind === "turn" &&
+              attempt.planGoalEvaluationRequest !== true,
+          ).length +
+          1 -
+          planGoalContinuationOffset
+        : undefined;
+    const completedPlanGoalEvaluations = attempts.filter(
+      (candidate) =>
+        candidate.scenarioId === scenarios.planGoal.id &&
+        candidate.planGoalEvaluationRequest === true &&
+        candidate.responded === true,
+    ).length;
+    const planGoalSoakComplete =
+      configuredPlanGoalSoakMinutes === 0 ||
+      (planGoalSoakStartedAt !== undefined &&
+        Date.now() - planGoalSoakStartedAt >= configuredPlanGoalSoakMinutes * 60_000);
+    const taskThreadStep =
+      scenario.id === scenarios.taskThreads.id
+        ? taskThreadsRequestStep(scenario, payload?.input, kind)
+        : undefined;
+    const finalizationRequest = kind === "turn" && toolFinalizationEnvelope;
+    Object.assign(exchange, {
+      classified: true,
+      scenarioId: scenario.id,
+      kind,
+      consumedInput,
+      toolOutputSeen,
+      finalizationRequest,
+      taskThreadStep,
+      planGoalEvaluationRequest,
+      planGoalContinuationAttempt,
+      nativeAttachmentCount,
+      turnChangeReviewProgress,
+    });
     const contractValid =
-      kind !== "title" ||
-      (payload.model === "ja-title-loopback-model" &&
-        payload.max_output_tokens === 64 &&
-        typeof payload.instructions === "string" &&
-        payload.tools === undefined &&
-        payload.tool_choice === undefined &&
-        payload.parallel_tool_calls === undefined &&
-        payload.previous_response_id === undefined &&
-        payload.reasoning === undefined &&
-        payload.temperature === undefined &&
-        payload.top_p === undefined);
+      (scenario.id !== scenarios.taskThreads.id ||
+        kind !== "turn" ||
+        taskThreadStep !== undefined) &&
+      (kind !== "title" ||
+        (payload.model === "ja-title-loopback-model" &&
+          payload.max_output_tokens === 64 &&
+          typeof payload.instructions === "string" &&
+          payload.tools === undefined &&
+          payload.tool_choice === undefined &&
+          payload.parallel_tool_calls === undefined &&
+          payload.previous_response_id === undefined &&
+          payload.reasoning === undefined &&
+          payload.temperature === undefined &&
+          payload.top_p === undefined)) &&
+      (scenario.id !== scenarios.turnChangeReview.id ||
+        kind !== "turn" ||
+        turnChangeReviewProgress?.valid === true);
+    const attemptStartedAt = Date.now();
     const attempt = {
       scenarioId: scenario.id,
       kind,
       secondTurn,
+      consumedInput,
+      toolOutputSeen,
+      finalizationRequest,
+      nativeAttachmentCount,
+      managedAttachmentCount,
       contractValid,
+      toolCatalogPresent: Array.isArray(payload.tools) && payload.tools.length > 0,
+      shellToolDeclared:
+        Array.isArray(payload.tools) && payload.tools.some((tool) => tool?.name === "shell"),
+      readToolDeclared:
+        Array.isArray(payload.tools) && payload.tools.some((tool) => tool?.name === "read"),
       responded: false,
       finished: false,
       disconnected: false,
       streamStarted: false,
+      responseBytes: 0,
+      responseChunks: 0,
+      drainWaits: 0,
+      elapsedMs: 0,
+      turnChangeReviewProgress,
+      composerContextProjection:
+        kind === "turn" && scenario.id === scenarios.composerContext.id
+          ? {
+              skillActivated: serializedPayload.includes(composerContextSkill.bodyMarker),
+              fileReferenceProjected:
+                serializedPayload.includes("Workspace reference [file] sample.ts") &&
+                serializedPayload.includes("content not preloaded"),
+              directoryReferenceProjected:
+                serializedPayload.includes("Workspace reference [directory] folder-fixture") &&
+                serializedPayload.includes("content not preloaded"),
+              workspaceBodyAbsent:
+                !serializedPayload.includes('export const greeting = "hello from Ja"') &&
+                !serializedPayload.includes("visible directory fixture"),
+            }
+          : undefined,
+      planGoalEvaluationRequest,
+      planGoalContinuationAttempt,
     };
     attempts.push(attempt);
     /** `finish` 在响应交给内核后触发，不等待可被 keep-alive 延长的 socket close。 */
     const markFinished = () => {
       attempt.finished = true;
+      attempt.elapsedMs = Date.now() - attemptStartedAt;
+      exchange.finished = true;
+      exchange.disconnected = false;
+      exchange.elapsedMs = attempt.elapsedMs;
+      void persistTurnChangeProviderDiagnostics();
     };
     /** 只有尚未 flush 的连接关闭才是取消；正常 keep-alive close 不能覆盖成功终态。 */
     const markDisconnected = () => {
-      if (!attempt.finished) attempt.disconnected = true;
+      if (!attempt.finished) {
+        attempt.disconnected = true;
+        attempt.elapsedMs = Date.now() - attemptStartedAt;
+        exchange.finished = false;
+        exchange.disconnected = true;
+        exchange.elapsedMs = attempt.elapsedMs;
+        void persistTurnChangeProviderDiagnostics();
+      }
     };
     request.once("aborted", markDisconnected);
     response.once("finish", markFinished);
     response.once("close", markDisconnected);
 
     if (!contractValid) {
+      exchange.responseStatus = 400;
+      await persistTurnChangeProviderDiagnostics();
       response.writeHead(400, { "content-length": "0" });
       attempt.responded = true;
       response.end();
       return;
     }
 
+    const scenarioTurnAttempt = attemptCount(scenario.id, "turn");
+    let gate = gates.get(
+      scenario.id === scenarios.taskThreads.id && taskThreadStep !== undefined
+        ? `${scenario.id}:${taskThreadStep}`
+        : `${scenario.id}:${kind}`,
+    );
+    const turnChangeReviewStage =
+      scenario.id === scenarios.turnChangeReview.id && kind === "turn"
+        ? (turnChangeReviewProgress?.successfulCount ?? 0) + 1
+        : undefined;
+    if (
+      scenario.id === scenarios.turnChangeReview.id &&
+      kind === "turn" &&
+      !serializedInput.includes(scenario.zeroPrompt) &&
+      turnChangeReviewStage >= 2 &&
+      turnChangeReviewStage <= 3
+    ) {
+      gate = turnChangeReviewGates.get(turnChangeReviewStage);
+      if (gate === undefined) {
+        gate = createFixtureGate();
+        turnChangeReviewGates.set(turnChangeReviewStage, gate);
+      }
+    }
     if (kind === "title" && scenario.id === scenarios.titleFailure.id) {
       const body = Buffer.from(
         '{"error":{"message":"fixture failure","type":"server_error","code":"fixture_failure"}}',
@@ -1367,39 +4148,464 @@ async function startAutomaticTitleProviderFixture() {
         "cache-control": "no-store",
       });
       attempt.responded = true;
+      exchange.responseStatus = 503;
       response.end(body);
       return;
     }
 
-    const gate = gates.get(`${scenario.id}:${kind}`);
+    if (kind === "turn" && scenario.id === scenarios.sidebarFailure.id) {
+      // 先让真窗切离目标 Thread，再提交不可重试的 Provider 错误；这样红色失败提醒必然代表未读，
+      // 而不是依赖网络快慢碰巧赶在 React 已读确认之前出现。
+      await gate?.promise;
+      if (attempt.disconnected || response.destroyed) return;
+      const body = Buffer.from(
+        '{"error":{"message":"sidebar failure fixture","type":"invalid_request_error","code":"sidebar_failure"}}',
+        "utf8",
+      );
+      response.writeHead(400, {
+        "content-type": "application/json",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      });
+      attempt.responded = true;
+      exchange.responseStatus = 400;
+      response.end(body);
+      return;
+    }
+
+    let operationHeartbeat;
+    let operationHeadersFlushed = false;
     if (gate !== undefined && !(scenario.id === scenarios.cancellation.id && secondTurn)) {
-      await gate.promise;
+      // Operation/Composer/输入队列验收会刻意把首轮请求停在可排队窗口；先发送不含
+      // OpenAI 事件、模型内容或 Usage 的 SSE comment 心跳，稳定同一次物理请求且不制造草稿事实。
+      const taskContinuationHeartbeat =
+        scenario.id === scenarios.taskThreads.id &&
+        typeof taskThreadStep === "string" &&
+        taskThreadStep.endsWith("_continuation");
+      if (
+        ((scenario.id === scenarios.operationRecovery.id ||
+          scenario.id === scenarios.composerContext.id ||
+          scenario.id === scenarios.inputQueue.id ||
+          scenario.id === scenarios.turnChangeReview.id) &&
+          kind === "turn") ||
+        taskContinuationHeartbeat
+      ) {
+        response.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-store",
+        });
+        response.flushHeaders();
+        response.write(": ja-e2e-provider-pending\n\n");
+        operationHeadersFlushed = true;
+        operationHeartbeat = globalThis.setInterval(() => {
+          if (!response.destroyed) response.write(": ja-e2e-provider-pending\n\n");
+        }, 1_000);
+        operationHeartbeat.unref?.();
+      }
+      try {
+        await gate.promise;
+      } finally {
+        if (operationHeartbeat !== undefined) globalThis.clearInterval(operationHeartbeat);
+      }
     }
     if (attempt.disconnected || response.destroyed) return;
+    const inputQueueToolCall =
+      kind === "turn" && scenario.id === scenarios.inputQueue.id && scenarioTurnAttempt === 1;
+    const toolLifecycleCall =
+      kind === "turn" && scenario.id === scenarios.toolLifecycle.id && scenarioTurnAttempt === 1;
+    const shellFailureCall =
+      kind === "turn" &&
+      scenario.id === scenarios.shellFailureRecovery.id &&
+      scenarioTurnAttempt <= 2;
+    const readFailureCall =
+      kind === "turn" && scenario.id === scenarios.readStallFailure.id && scenarioTurnAttempt <= 4;
+    const ordinaryDsmlTextReply =
+      kind === "turn" &&
+      scenario.id === scenarios.dsmlProtocolFailure.id &&
+      scenarioTurnAttempt === 1;
+    const sidebarApprovalToolCall = kind === "turn" && scenario.id === scenarios.sidebarApproval.id;
+    const defaultDesktopApprovalToolCall =
+      kind === "turn" &&
+      scenario.id === scenarios.defaultDesktop.id &&
+      consumedInput === approvalFixtureInput &&
+      !toolOutputSeen;
+    const turnChangeReviewTool =
+      kind !== "turn" ||
+      scenario.id !== scenarios.turnChangeReview.id ||
+      serializedInput.includes(scenario.zeroPrompt) ||
+      turnChangeReviewProgress.successfulCount > 1
+        ? undefined
+        : turnChangeReviewProgress.successfulCount === 0
+          ? {
+              step: "small",
+              name: "write",
+              arguments: {
+                path: join(workspacePath, scenario.smallPath),
+                content: turnChangeReviewContent(
+                  turnChangeReviewSmallPayloadBytes,
+                  512,
+                  scenario.smallMarker,
+                ),
+              },
+            }
+          : {
+              step: "large",
+              name: "write",
+              arguments: {
+                path: join(workspacePath, scenario.largePath),
+                content: turnChangeReviewContent(
+                  turnChangeReviewLargePayloadBytes,
+                  turnChangeReviewLargeLogicalLines,
+                  scenario.largeMarker,
+                ),
+              },
+            };
+    const taskThreadsTool =
+      kind === "turn" && scenario.id === scenarios.taskThreads.id
+        ? taskThreadStep === "root_spawn"
+          ? {
+              name: "spawn_agent",
+              arguments: {
+                taskName: scenario.levelOneName,
+                brief: scenario.levelOneBrief,
+                accessMode: "full_access",
+              },
+            }
+          : taskThreadStep === "level_one_spawn"
+            ? {
+                name: "spawn_agent",
+                arguments: {
+                  taskName: scenario.levelTwoName,
+                  brief: scenario.levelTwoBrief,
+                  accessMode: "full_access",
+                },
+              }
+            : taskThreadStep === "level_two_spawn"
+              ? {
+                  name: "spawn_agent",
+                  arguments: {
+                    taskName: scenario.levelThreeName,
+                    brief: scenario.levelThreeBrief,
+                    accessMode: "approval_required",
+                  },
+                }
+              : taskThreadStep === "level_three_approval"
+                ? {
+                    name: "shell",
+                    arguments: { command: scenario.approvalCommand },
+                  }
+                : undefined
+        : undefined;
+    if (scenario.id === scenarios.planGoal.id && planGoalContext === undefined) {
+      await planGoalContextReady.promise;
+      if (attempt.disconnected || response.destroyed) return;
+    }
+    if (
+      scenario.id === scenarios.planGoal.id &&
+      planGoalContextMode === "normal" &&
+      completedPlanGoalEvaluations > 0 &&
+      !planGoalSoakComplete &&
+      !planGoalSoakInputRequested
+    ) {
+      // 首轮 evaluator 完成后 Goal revision 已推进；等待 runner 回读权威投影，禁止用旧 CAS
+      // identity 构造 soak 输入请求并把测试竞态误报成 continuation 无进展。
+      await planGoalPostEvaluationContextReady.promise;
+      if (attempt.disconnected || response.destroyed) return;
+    }
+    const trailingPlanGoalTool = trailingPlanGoalToolCall(payload?.input);
+    const planGoalAggregateRevision =
+      planGoalContext?.kind === "plan"
+        ? planGoalContext.planRevision
+        : planGoalContext?.goalRevision;
+    const planGoalToolName =
+      scenario.id === scenarios.planGoal.id &&
+      !planGoalEvaluationRequest &&
+      (!finalizationRequest || planGoalContextMode === "recovery")
+        ? planGoalContextMode === "recovery"
+          ? "shell"
+          : planGoalContextMode === "standalone"
+            ? nextPlanGoalToolName(payload?.input, planGoalContext)
+            : trailingPlanGoalTool?.name === "goal_request_evaluation"
+              ? undefined
+              : completedPlanGoalEvaluations > 0 &&
+                  !planGoalSoakComplete &&
+                  !planGoalSoakInputRequested
+                ? "goal_request_input"
+                : completedPlanGoalEvaluations > 0 && !planGoalSoakComplete
+                  ? undefined
+                  : completedPlanGoalEvaluations > 0
+                    ? "goal_request_evaluation"
+                    : nextPlanGoalToolName(payload?.input, planGoalContext)
+        : undefined;
+    const planGoalTool =
+      planGoalToolName === undefined
+        ? undefined
+        : planGoalToolName === "shell"
+          ? {
+              name: "shell",
+              arguments: {
+                command:
+                  planGoalContextMode === "recovery"
+                    ? scenarios.planGoal.recoveryCommand
+                    : scenarios.planGoal.approvalCommand,
+              },
+            }
+          : planGoalToolName === "plan_step_update"
+            ? {
+                name: "plan_step_update",
+                arguments: {
+                  target: planGoalContext.kind === "plan" ? "plan" : "goal",
+                  ...(planGoalContext.kind === "plan"
+                    ? {
+                        planId: planGoalContext.planId,
+                        expectedPlanRevision:
+                          planGoalContext.planRevision +
+                          (trailingPlanGoalTool?.name === "plan_step_update" ? 1 : 0),
+                      }
+                    : {
+                        goalId: planGoalContext.goalId,
+                        expectedGoalRevision:
+                          planGoalContext.goalRevision +
+                          (trailingPlanGoalTool?.name === "plan_step_update" ? 1 : 0),
+                      }),
+                  runId: planGoalContext.runId,
+                  stepId: planGoalContext.stepId,
+                  expectedStatus: trailingPlanGoalTool?.name === "shell" ? "ready" : "running",
+                  status: trailingPlanGoalTool?.name === "shell" ? "running" : "succeeded",
+                  failureSignature: null,
+                  evidenceClaims:
+                    trailingPlanGoalTool?.name === "shell"
+                      ? []
+                      : [
+                          {
+                            criterionId: planGoalContext.criterionId,
+                            callId: planGoalEvidenceCallId,
+                            summary: "确定性 shell Tool 已由当前 Run 成功执行",
+                          },
+                        ],
+                  idempotencyKey: `plan-goal-step-${planGoalAggregateRevision}-${planGoalContinuationAttempt}`,
+                },
+              }
+            : planGoalToolName === "goal_request_input"
+              ? {
+                  name: "goal_request_input",
+                  arguments: {
+                    goalId: planGoalContext.goalId,
+                    expectedGoalRevision: planGoalContext.goalRevision,
+                    runId: planGoalContext.runId,
+                    prompt: "长稳窗口结束后，请确认继续独立验收。",
+                    expiresAt: new Date(Date.now() + 4 * 60 * 60_000).toISOString(),
+                    idempotencyKey: `plan-goal-soak-input-${planGoalContext.goalRevision}`,
+                  },
+                }
+              : {
+                  name: "goal_request_evaluation",
+                  arguments: {
+                    goalId: planGoalContext.goalId,
+                    // 首次显式关联 Plan 的 Goal 要计入两次 step update；首轮 evaluator 之后，
+                    // runner 每次都回写权威 Goal revision，输入响应已包含自身 CAS 增量，禁止再次 +1。
+                    expectedGoalRevision:
+                      planGoalContext.goalRevision +
+                      (completedPlanGoalEvaluations === 0
+                        ? planGoalContext.planRevisionId == null
+                          ? 0
+                          : 2
+                        : 0),
+                    runId: planGoalContext.runId,
+                    planRevisionId: planGoalContext.planRevisionId,
+                    evidenceClaims:
+                      completedPlanGoalEvaluations === 0 && planGoalContext.planRevisionId == null
+                        ? [
+                            {
+                              criterionId: planGoalContext.criterionId,
+                              callId: planGoalEvidenceCallId,
+                              summary: "确定性 shell Tool 已由 Goal-only Run 成功执行",
+                            },
+                          ]
+                        : [],
+                    idempotencyKey: `plan-goal-evaluate-${planGoalContext.goalRevision}-${completedPlanGoalEvaluations}`,
+                  },
+                };
+    if (planGoalTool?.name === "goal_request_input") {
+      planGoalSoakInputRequested = true;
+    }
+    if (planGoalTool?.name === "shell") {
+      // planGoalToolStream 使用当前 attempts 长度生成 call_id；保存该真实身份供下一轮证据 claim，
+      // 不能由模型文本或布尔标记伪造“有新证据”。
+      planGoalEvidenceCallId = `call_plan_goal_${attempts.length}`;
+    }
+    if (planGoalTool?.name === "plan_step_update" && planGoalEvidenceCallId === undefined) {
+      throw new Error("Plan/Goal fixture 缺少已执行 Tool call identity");
+    }
+    if (
+      scenario.id === scenarios.planGoal.id &&
+      planGoalEvaluationRequest &&
+      completedPlanGoalEvaluations === 0
+    ) {
+      // 有效 soak 从首轮 not_met 即将返回时开始；若在批准计划或组装上下文时提前计时，
+      // 构建和前置交互会被错误计入 120 分钟窗口，且首轮 evaluator 会被自身等待门阻塞。
+      planGoalSoakStartedAt ??= Date.now();
+      planGoalPostEvaluationContextReady = createFixtureGate();
+    }
+    const planGoalMet = completedPlanGoalEvaluations > 0 && planGoalSoakComplete;
+    const evaluatorCriteria = planGoalEvaluationRequest
+      ? planGoalEvaluatorCriteria(payload?.input)
+      : undefined;
+    const hasStructuredToolStream =
+      turnChangeReviewTool !== undefined ||
+      planGoalTool !== undefined ||
+      taskThreadsTool !== undefined ||
+      defaultDesktopApprovalToolCall ||
+      inputQueueToolCall ||
+      toolLifecycleCall ||
+      shellFailureCall ||
+      readFailureCall ||
+      sidebarApprovalToolCall;
     const text =
       kind === "title"
-        ? scenario.automaticTitle
-        : secondTurn
-          ? scenario.secondReply
-          : scenario.reply;
-    if (typeof text !== "string" || text.length === 0) {
+        ? (scenario.automaticTitle ?? "Ja E2E")
+        : scenario.id === scenarios.inputQueue.id
+          ? scenarioTurnAttempt === 2
+            ? scenario.steeringReply
+            : scenarioTurnAttempt === 3
+              ? scenario.editedReply
+              : scenarioTurnAttempt === 4
+                ? scenario.followUpReply
+                : scenarioTurnAttempt === 5
+                  ? scenario.attachmentReply
+                  : scenarioTurnAttempt === 6
+                    ? scenario.unavailableReply
+                    : scenario.reply
+          : scenario.id === scenarios.composerContext.id
+            ? scenarioTurnAttempt === 1
+              ? scenario.reply
+              : scenario.queuedReply
+            : scenario.id === scenarios.taskThreads.id
+              ? taskThreadStep === "side_followup"
+                ? scenario.followupReply
+                : taskThreadStep === "root_continuation"
+                  ? scenario.agentRootReply
+                  : scenario.reply
+              : scenario.id === scenarios.planGoal.id && planGoalEvaluationRequest
+                ? JSON.stringify({
+                    verdict: planGoalMet ? "met" : "not_met",
+                    criteria: evaluatorCriteria.map((criterionId) => ({
+                      criterionId,
+                      verdict: planGoalMet ? "met" : "not_met",
+                      reason: planGoalMet
+                        ? "当前 revision 的确定性证据满足验收"
+                        : "首次独立评估要求继续补充证据",
+                    })),
+                    summary: planGoalMet ? "验收已满足" : "验收暂未满足",
+                  })
+                : scenario.id === scenarios.planGoal.id &&
+                    trailingPlanGoalTool?.name === "goal_request_evaluation"
+                  ? "独立验收请求已提交。"
+                  : scenario.id === scenarios.defaultDesktop.id
+                    ? consumedInput === approvalFixtureInput
+                      ? `Fake response: ${approvalFixtureVisibleInput}`
+                      : `Fake response: ${consumedInput}`
+                    : scenario.id === scenarios.turnChangeReview.id &&
+                        serializedInput.includes(scenario.zeroPrompt)
+                      ? scenario.zeroReply
+                      : secondTurn
+                        ? scenario.secondReply
+                        : scenario.reply;
+    if (!hasStructuredToolStream && (typeof text !== "string" || text.length === 0)) {
+      exchange.responseStatus = 500;
       response.writeHead(500, { "content-length": "0" });
       attempt.responded = true;
       response.end();
       return;
     }
-    const body = Buffer.from(titleFixtureTextStream(text, attempts.length), "utf8");
-    response.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "content-length": String(body.length),
-      "cache-control": "no-store",
-    });
+    const encodedStream =
+      turnChangeReviewTool !== undefined
+        ? turnChangeReviewToolStream(
+            turnChangeReviewTool.name,
+            turnChangeReviewTool.arguments,
+            turnChangeReviewTool.step,
+          )
+        : planGoalTool !== undefined
+          ? planGoalToolStream(planGoalTool.name, planGoalTool.arguments, attempts.length)
+          : taskThreadsTool !== undefined
+            ? taskThreadsToolStream(
+                taskThreadsTool.name,
+                taskThreadsTool.arguments,
+                attempts.length,
+              )
+            : defaultDesktopApprovalToolCall
+              ? defaultDesktopApprovalToolStream(attempts.length)
+              : inputQueueToolCall
+                ? inputQueueToolStream(attempts.length, workspacePath)
+                : toolLifecycleCall
+                  ? toolLifecycleStream(attempts.length)
+                  : shellFailureCall || readFailureCall
+                    ? toolFailureStream(
+                        scenario,
+                        scenarioTurnAttempt,
+                        attempts.length,
+                        workspacePath,
+                      )
+                    : ordinaryDsmlTextReply
+                      ? ordinaryDsmlTextStream(text, attempts.length)
+                      : sidebarApprovalToolCall
+                        ? sidebarApprovalToolStream(attempts.length)
+                        : titleFixtureTextStream(text, attempts.length);
+    if (
+      scenario.id === scenarios.turnChangeReview.id &&
+      Math.max(...turnChangeReviewSseEventBytes(encodedStream)) >= 2 * 1024 * 1024
+    ) {
+      throw new Error("Turn Change Review fixture SSE event exceeded 2 MiB");
+    }
+    const body = Buffer.from(encodedStream, "utf8");
+    if (!operationHeadersFlushed) {
+      response.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      });
+    }
     attempt.streamStarted = true;
-    for (let offset = 0; offset < body.length; offset += 11) {
-      response.write(body.subarray(offset, offset + 11));
+    attempt.responseBytes = body.length;
+    exchange.responseBytes = body.length;
+    if (scenario.id === scenarios.turnChangeReview.id) {
+      const write = await writeTurnChangeReviewFixtureBody(response, body);
+      attempt.responseChunks = write.chunks;
+      attempt.drainWaits = write.drainWaits;
+      exchange.responseChunks = write.chunks;
+      exchange.drainWaits = write.drainWaits;
+      if (write.disconnected) {
+        await persistTurnChangeProviderDiagnostics();
+        return;
+      }
+    } else {
+      for (let offset = 0; offset < body.length; offset += 11) {
+        response.write(body.subarray(offset, offset + 11));
+      }
     }
     attempt.responded = true;
+    exchange.responseStatus = 200;
+    await persistTurnChangeProviderDiagnostics();
     response.end();
+  }
+
+  const server = createHttpServer((request, response) => {
+    void handleFixtureRequest(request, response).catch(async (error) => {
+      handlerFailure ??= error instanceof Error ? error : new Error(String(error));
+      exchanges.push({
+        ordinal: exchanges.length + 1,
+        route: "handler_failure",
+        classified: false,
+        responseStatus: 500,
+        contractFailures: ["fixture_handler_failure"],
+      });
+      await persistTurnChangeProviderDiagnostics();
+      if (response.destroyed || response.writableEnded) return;
+      if (!response.headersSent) {
+        response.writeHead(500, { "content-length": "0", "cache-control": "no-store" });
+      }
+      response.end();
+    });
   });
   await new Promise((resolvePromise, rejectPromise) => {
     server.once("error", rejectPromise);
@@ -1413,7 +4619,9 @@ async function startAutomaticTitleProviderFixture() {
 
   /** 释放所有门并关闭精确 loopback server，避免失败场景残留活动连接或延迟 Promise。 */
   async function close() {
+    planGoalContextReady.release();
     for (const gate of gates.values()) gate.release();
+    for (const gate of turnChangeReviewGates.values()) gate.release();
     await new Promise((resolvePromise) => {
       server.close(() => resolvePromise());
       server.closeAllConnections?.();
@@ -1424,16 +4632,26 @@ async function startAutomaticTitleProviderFixture() {
     scenarios,
     providerConfig: {
       api: "openai_responses",
-      apiKey: "JA_TITLE_LOOPBACK_ONLY",
+      apiKey: "JA_TITLE_LOOPBACK_FIXTURE",
       baseUrl: `http://127.0.0.1:${address.port}/v1`,
       model: "ja-title-loopback-model",
       configureViaUi: false,
+      defaultDesktop: defaultDesktopLoopbackMode,
     },
     attempts,
+    summaryAttempts,
+    summaryAttemptCount: () => summaryAttempts.length,
+    assertHandlerHealthy,
     attemptCount,
     finishedCount,
     release,
     snapshot,
+    diagnosticSnapshot,
+    releaseTaskStep,
+    releaseTurnChangeReviewStep,
+    turnChangeReviewCommittedToolCount,
+    setPlanGoalContext,
+    resetPlanGoalContext,
     close,
   };
 }
@@ -1494,14 +4712,39 @@ async function readProductionMainWindowConfig() {
 /**
  * 写入本轮私有 Tauri overlay；按已独占的前端端口派生测试 identifier，避免 single-instance
  * mutex 与用户或其它隔离验收窗口共享。这里只继承产品窗口事实与 dev origin，WebView2 的
- * UDF 和调试端口仍由同一个子进程环境 owner 注入，避免形成两套 browser 参数。
+ * UDF 和调试端口仍由同一个子进程环境 owner 注入，避免形成两套 browser 参数。本轮修改
+ * focused mode 额外把已验明身份的 Native Image 映射到 production resource 相对路径。
  */
 async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
   const configPath = join(directories.runtime, "tauri.e2e.conf.json");
-  const origin = `http://localhost:${frontendPort}`;
-  const websocket = `ws://localhost:${frontendPort}`;
+  const origin = `http://127.0.0.1:${frontendPort}`;
+  const websocket = `ws://127.0.0.1:${frontendPort}`;
   const devCsp = `default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ${origin} ${websocket}; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`;
   const productionWindow = await readProductionMainWindowConfig();
+  let focusedNativeResources;
+  const focusedNativeExecutable = planGoalAcceptanceMode
+    ? planGoalSidecarExecutable
+    : turnChangeReviewAcceptanceMode
+      ? turnChangeReviewSidecarExecutable
+      : configuredNativeSidecarDirectory === undefined
+        ? undefined
+        : join(
+            configuredNativeSidecarDirectory,
+            "sidecars",
+            "ja-app-server-x86_64-pc-windows-msvc.exe",
+          );
+  if (focusedNativeExecutable !== undefined) {
+    if (!isAbsolute(focusedNativeExecutable)) {
+      throw new Error("focused Native 验收缺少绝对 sidecar executable 路径");
+    }
+    const expectedFileName = "ja-app-server-x86_64-pc-windows-msvc.exe";
+    if (parse(focusedNativeExecutable).base !== expectedFileName) {
+      throw new Error("focused Native sidecar 文件名与 production target 不一致");
+    }
+    focusedNativeResources = {
+      [focusedNativeExecutable]: `sidecars/${expectedFileName}`,
+    };
+  }
   const config = {
     identifier: `io.github.kongweiguang.ja.e2e.run${frontendPort}`,
     build: {
@@ -1520,46 +4763,68 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
       ],
       security: { devCsp },
     },
+    ...(focusedNativeResources === undefined
+      ? {}
+      : { bundle: { resources: focusedNativeResources } }),
   };
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
   return configPath;
 }
 
 /**
- * 以纯函数生成当前唯一受支持的 v4 Provider/Model 配置 fixture，使静态合同可以在不写盘、
- * 不接触凭据的前提下拒绝旧 profile schema 与已移除的 Chat Completions API。
+ * 以纯函数生成 v1 Provider/Model 配置 fixture，使静态合同可以在不写盘、不接触凭据的前提下
+ * 覆盖每个显式 API 和场景所需的访问模式。访问模式必须由调用场景显式传入，避免
+ * Thread 偏好与 App Server 配置不一致时把测试失败误判为回复链故障。Turn Change focused
+ * 模式独占更大窗口以容纳 1 MiB 与 2 MiB Tool history，普通模式继续使用生产基准 fixture。
  */
-function buildSettingsDocument(providerConfig) {
+function buildSettingsDocument(
+  providerConfig,
+  {
+    defaultAccessMode = "approval_required",
+    includeComposerContextSkill = false,
+    turnWallTimeoutMs = 30_000,
+  } = {},
+) {
+  if (!new Set(["approval_required", "full_access"]).has(defaultAccessMode)) {
+    throw new Error(`E2E 设置 fixture 不支持访问模式 ${defaultAccessMode}`);
+  }
+  if (!Number.isSafeInteger(turnWallTimeoutMs) || turnWallTimeoutMs < 1_000) {
+    throw new Error("E2E Turn wall timeout 必须是至少一秒的安全整数");
+  }
   const real = providerConfig !== undefined;
   const tomlString = (value) => JSON.stringify(String(value));
-  const providerKind = providerConfig?.api === "anthropic_messages" ? "anthropic" : "openai";
   return [
-    "schema_version = 4",
+    "schema_version = 1",
     "config_revision = 1",
-    'default_access_mode = "approval_required"',
+    `default_access_mode = "${defaultAccessMode}"`,
     'default_provider_id = "provider_e2e"',
     'default_model_id = "model_e2e"',
     "default_reasoning_level = { __ja_null = true }",
     "mcp_servers = []",
-    "skills = []",
+    ...(includeComposerContextSkill
+      ? [
+          `skills = [{ skill_id = "${composerContextSkill.skillId}", name = "${composerContextSkill.name}", scope = "user", enabled = true, description = "${composerContextSkill.description}" }]`,
+        ]
+      : ["skills = []"]),
     "",
     "[[providers]]",
     'provider_id = "provider_e2e"',
-    `name = ${tomlString(real ? "E2E Real Provider" : "E2E Fake")}`,
-    `provider = "${providerKind}"`,
+    `name = ${tomlString(providerConfig?.name ?? (real ? "E2E Real Provider" : "E2E Fake"))}`,
     `api = "${providerConfig?.api ?? "openai_responses"}"`,
     `base_url = ${tomlString(providerConfig?.baseUrl ?? "http://127.0.0.1:9/v1")}`,
     'credential_id = "cred_e2e"',
     "[providers.network_timeouts]",
     "connect_timeout_ms = 5000",
-    "request_timeout_ms = 30000",
+    // Task 树验收会刻意把 continuation 保持到用户确认递归取消；请求上限必须与本场景
+    // 的 Turn 上限一致，否则网络层会先制造 MODEL_UNAVAILABLE，验收不到真实取消语义。
+    `request_timeout_ms = ${Math.max(30_000, turnWallTimeoutMs)}`,
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
     "[providers.agent_defaults.turn_limits]",
     "max_model_rounds = 32",
     "max_tool_calls = 128",
-    "wall_timeout_ms = 30000",
+    `wall_timeout_ms = ${turnWallTimeoutMs}`,
     "[[providers.models]]",
     'model_id = "model_e2e"',
     `name = ${tomlString(real ? "E2E Real Model" : "E2E Fake Model")}`,
@@ -1567,22 +4832,214 @@ function buildSettingsDocument(providerConfig) {
     "reasoning_level_map = {}",
     "default_reasoning_level = { __ja_null = true }",
     "[providers.models.capabilities]",
-    "context_window_tokens = 128000",
+    `context_window_tokens = ${
+      turnChangeReviewAcceptanceMode
+        ? turnChangeReviewContextWindowTokens
+        : defaultE2eContextWindowTokens
+    }`,
     "max_output_tokens = 8192",
     "",
   ].join("\n");
 }
 
 /**
+ * 构造 Runtime Refresh 双 Provider 配置；两个模型都预先可见，活跃 Turn 只通过真实 Composer
+ * 偏好切换路由。config_revision 单独递增，用于证明配置代际也是 continuation 等价键。
+ */
+function buildRuntimeRefreshSettingsDocument(baseUrl, controlPath, reportPath, revision) {
+  if (![1, 2].includes(revision)) throw new Error("Runtime Refresh 配置 revision 无效");
+  const tomlString = (value) => JSON.stringify(String(value));
+  const provider = ({ providerId, name, api, credentialId, modelId, model }) => [
+    "[[providers]]",
+    `provider_id = ${tomlString(providerId)}`,
+    `name = ${tomlString(name)}`,
+    `api = ${tomlString(api)}`,
+    `base_url = ${tomlString(baseUrl)}`,
+    `credential_id = ${tomlString(credentialId)}`,
+    "[providers.network_timeouts]",
+    "connect_timeout_ms = 5000",
+    "request_timeout_ms = 180000",
+    "[providers.agent_defaults]",
+    "[providers.agent_defaults.context]",
+    "auto_compact = true",
+    "[providers.agent_defaults.turn_limits]",
+    "max_model_rounds = 32",
+    "max_tool_calls = 128",
+    "wall_timeout_ms = 180000",
+    "[[providers.models]]",
+    `model_id = ${tomlString(modelId)}`,
+    `name = ${tomlString(name)}`,
+    `model = ${tomlString(model)}`,
+    'reasoning_level_map = { medium = "medium", high = "high" }',
+    'default_reasoning_level = "medium"',
+    "[providers.models.capabilities]",
+    "context_window_tokens = 128000",
+    "max_output_tokens = 8192",
+    "",
+  ];
+  return [
+    "schema_version = 1",
+    `config_revision = ${revision}`,
+    'default_access_mode = "full_access"',
+    'default_provider_id = "provider_e2e"',
+    'default_model_id = "model_e2e"',
+    'default_reasoning_level = "medium"',
+    "",
+    ...provider({
+      providerId: "provider_e2e",
+      name: "Runtime Refresh Old",
+      api: "openai_responses",
+      credentialId: "cred_e2e",
+      modelId: "model_e2e",
+      model: "runtime-old-model",
+    }),
+    ...provider({
+      providerId: "provider_refresh",
+      name: "Runtime Refresh New",
+      api: "anthropic_messages",
+      credentialId: "cred_refresh",
+      modelId: "model_refresh",
+      model: "runtime-new-model",
+    }),
+    "[[mcp_servers]]",
+    'mcp_id = "mcp_runtime_refresh"',
+    'name = "Runtime Refresh MCP"',
+    'transport = "stdio"',
+    // Native 进程策略拒绝可执行路径中的链接；NVM 的 nodejs 链接必须先解析为当前真实 Node。
+    `endpoint = ${tomlString(realpathSync(process.execPath))}`,
+    `args = [${tomlString(join(repoRoot, "scripts", "e2e", "fixtures", "runtime-refresh-mcp.mjs"))}, ${tomlString(controlPath)}, ${tomlString(reportPath)}]`,
+    "env = {}",
+    "headers = {}",
+    'auth = { kind = "none" }',
+    "enabled = true",
+    "",
+    "[[skills]]",
+    'skill_id = "skill_runtime_refresh"',
+    'name = "runtime-refresh"',
+    'scope = "user"',
+    "enabled = true",
+    'description = "Runtime refresh acceptance Skill"',
+    "",
+  ].join("\n");
+}
+
+/** Skill 目录身份保持不变，只替换正文 marker，证明 activation-time 内容在下一请求重新读取。 */
+async function writeRuntimeRefreshSkill(jaHome, revision) {
+  const marker =
+    revision === 1
+      ? runtimeRefreshFixtureContract.oldSkillMarker
+      : runtimeRefreshFixtureContract.newSkillMarker;
+  const skillDirectory = join(jaHome, "skills", "runtime-refresh");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    [
+      "---",
+      "name: runtime-refresh",
+      "description: Runtime refresh acceptance Skill.",
+      "---",
+      "<!-- @author kongweiguang -->",
+      "",
+      "# Runtime refresh acceptance",
+      "",
+      marker,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+/** Workspace 指令只携带固定 marker，避免把 E2E 编排文字误当成模型行为证据。 */
+async function writeRuntimeRefreshWorkspaceInstructions(workspace, revision) {
+  const marker =
+    revision === 1
+      ? runtimeRefreshFixtureContract.oldWorkspaceMarker
+      : runtimeRefreshFixtureContract.newWorkspaceMarker;
+  await writeFile(
+    join(workspace, "AGENTS.md"),
+    `<!-- @author kongweiguang -->\n\n${marker}\n`,
+    "utf8",
+  );
+}
+
+/** 原子替换配置，避免文件 watcher 在写入中途观察到半份 TOML。 */
+async function replaceRuntimeRefreshConfiguration(jaHome, document) {
+  const target = join(jaHome, "config.toml");
+  const temporary = join(jaHome, "config.runtime-refresh.next.toml");
+  await writeFile(temporary, document, "utf8");
+  await rename(temporary, target);
+}
+
+/**
+ * 首次写入完整配置、Skill 和 ACL 收紧的凭据文件；后续更新只替换 config.toml，不接触 Secret。
+ */
+async function writeRuntimeRefreshSettings(
+  jaHome,
+  workspace,
+  providerConfig,
+  controlPath,
+  reportPath,
+) {
+  await mkdir(jaHome, { recursive: true });
+  await Promise.all([
+    writeRuntimeRefreshSkill(jaHome, 1),
+    writeRuntimeRefreshWorkspaceInstructions(workspace, 1),
+    writeFile(controlPath, '{"revision":1}\n', "utf8"),
+  ]);
+  await replaceRuntimeRefreshConfiguration(
+    jaHome,
+    buildRuntimeRefreshSettingsDocument(providerConfig.baseUrl, controlPath, reportPath, 1),
+  );
+  const authPath = join(jaHome, "auth.json");
+  await writeFile(
+    authPath,
+    `${JSON.stringify({ cred_e2e: providerConfig.apiKey, cred_refresh: providerConfig.apiKey })}\n`,
+    "utf8",
+  );
+  const account = `${process.env.USERDOMAIN ?? "."}\\${process.env.USERNAME ?? ""}`;
+  if (account.endsWith("\\")) throw new Error("无法确定当前 Windows ACL 用户");
+  await execFileAsync("icacls.exe", [authPath, "/inheritance:r", "/grant:r", `${account}:(F)`], {
+    windowsHide: true,
+    maxBuffer: 1 * 1024 * 1024,
+    timeout: snapshotTimeoutMs,
+  });
+}
+
+/**
+ * 在隔离 Ja Home 写入一个真实用户 Skill；配置只保存稳定 skillId，正文仍由 App Server
+ * 在每条消息开始时读取，因而 E2E 能区分目录发现与 activation-time 内容加载。
+ */
+async function writeComposerContextSkill(jaHome) {
+  const skillDirectory = join(jaHome, "skills", composerContextSkill.name);
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    [
+      "---",
+      `name: ${composerContextSkill.name}`,
+      `description: ${composerContextSkill.description}.`,
+      "---",
+      "<!-- @author kongweiguang -->",
+      "",
+      "# Composer context acceptance",
+      "",
+      composerContextSkill.bodyMarker,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+/**
  * 在本轮私有 user Home 下写入当前拆分后的 config/auth schema。
  * 离线 UI 模式使用非敏感占位值且不发起 Turn；真实 loopback 模式只在临时且受 ACL 保护的
- * auth 文件中保存密钥。
+ * auth 文件中保存密钥。默认保持需审批，只有必须执行 Shell 的受控场景显式放宽。
  */
-async function writeSettings(jaHome, providerConfig) {
+async function writeSettings(jaHome, providerConfig, options) {
   // Ja App Server sidecar 通过 --home-dir-base64 接收这个精确目录。
   // fixture 与该 owner 保持一致，避免桌面 profile 遮蔽配置。
   await mkdir(jaHome, { recursive: true });
-  const config = buildSettingsDocument(providerConfig);
+  const config = buildSettingsDocument(providerConfig, options);
   const configPath = join(jaHome, "config.toml");
   const authPath = join(jaHome, "auth.json");
   await writeFile(configPath, config, "utf8");
@@ -1603,6 +5060,12 @@ async function writeSettings(jaHome, providerConfig) {
   return { configPath, authPath };
 }
 
+/** 只接受 Windows 进程表返回的非负安全整数，缺失或溢出必须保持 unavailable。 */
+function optionalProcessMemoryBytes(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 /**
  * 在共享 gate 准入后获取一次有界进程快照，并只保留仍可由 Win32 process table 打开的 PID。
  *
@@ -1615,7 +5078,7 @@ async function runProcessSnapshot(signal) {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     "$live = @{}; Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.HandleCount -gt 0 -and $_.Threads.Count -gt 0 } | ForEach-Object { $live[[int]$_.Id] = $true }",
-    "Get-CimInstance Win32_Process | Where-Object { $live.ContainsKey([int]$_.ProcessId) } | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress",
+    "Get-CimInstance Win32_Process | Where-Object { $live.ContainsKey([int]$_.ProcessId) } | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate,WorkingSetSize,PrivatePageCount | ConvertTo-Json -Compress",
   ].join("; ");
   const stdout = await new Promise((resolvePromise, rejectPromise) => {
     const child = execFile(
@@ -1654,6 +5117,8 @@ async function runProcessSnapshot(signal) {
       name: typeof entry.Name === "string" ? entry.Name : "",
       commandLine: typeof entry.CommandLine === "string" ? entry.CommandLine : "",
       creationDate: typeof entry.CreationDate === "string" ? entry.CreationDate : "",
+      workingSetBytes: optionalProcessMemoryBytes(entry.WorkingSetSize),
+      privateMemoryBytes: optionalProcessMemoryBytes(entry.PrivatePageCount),
     }))
     .filter((entry) => Number.isInteger(entry.pid) && entry.pid > 0);
 }
@@ -2029,8 +5494,8 @@ function assertPreexistingJaGuardContract() {
 }
 
 /**
- * 固定 Terminal 外层事务顺序：普通可见性切换必须保留 PTY；显式关闭则先等待原生 ACK，
- * 验证全部旧 PTY 身份已消失，再移除 Tab，最后只重新打开全新 session。
+ * 固定 Terminal 外层事务顺序：普通切换、drawer 与本地侧边任务草稿都必须保留 PTY；
+ * 显式关闭则先等待原生 ACK，验证全部旧 PTY 身份已消失，再移除 Tab，最后只重新打开全新 session。
  */
 function assertOuterTerminalCapabilityContract() {
   const source = exerciseOuterWorkbenchLifecycle.toString();
@@ -2041,13 +5506,13 @@ function assertOuterTerminalCapabilityContract() {
     'assertOwnedIdentitiesAlive(remainingShells, signal, "右侧栏收起")',
     switchedAlive,
   );
-  const sideChatAlive = source.indexOf(
-    'assertOwnedIdentitiesAlive(remainingShells, signal, "侧边聊天收栏")',
+  const sideTaskDraftAlive = source.indexOf(
+    'assertOwnedIdentitiesAlive(remainingShells, signal, "侧边任务草稿关闭")',
     drawerAlive,
   );
   const acknowledged = source.indexOf(
     'JSON.stringify(["start", "rejected", "start", "resolved"])',
-    sideChatAlive,
+    sideTaskDraftAlive,
   );
   const ptysGone = source.indexOf("waitForOwnedIdentitiesGone(remainingShells", acknowledged);
   const tabRemoved = source.indexOf("ja-workbench-tab-shell[data-tab=", ptysGone);
@@ -2055,8 +5520,8 @@ function assertOuterTerminalCapabilityContract() {
   if (
     switchedAlive < 0 ||
     drawerAlive <= switchedAlive ||
-    sideChatAlive <= drawerAlive ||
-    acknowledged <= sideChatAlive ||
+    sideTaskDraftAlive <= drawerAlive ||
+    acknowledged <= sideTaskDraftAlive ||
     ptysGone <= acknowledged ||
     tabRemoved <= ptysGone ||
     freshSessions <= tabRemoved
@@ -2133,6 +5598,82 @@ function processTree(rootIdentity, snapshot, incompleteObserved) {
     }
   }
   return owned;
+}
+
+/**
+ * 只在本轮 launcher 后代中恰有一个完整 renderer 身份时读取内存；候选不唯一、根已退出或
+ * Windows 未提供字段时返回明确 unavailable，避免把 browser/GPU 或其他 Ja 实例冒充页面。
+ */
+async function captureIsolatedRendererMemory(nativeScope, label, signal) {
+  throwIfAborted(signal);
+  const snapshot = await processSnapshot(signal);
+  const tree = processTree(nativeScope.rootIdentity, snapshot, nativeScope.incompleteObserved);
+  if (tree === undefined) {
+    return { status: "unavailable", label, reason: "launcher_root_not_revalidated" };
+  }
+  const renderers = [...tree.values()].filter(
+    (entry) =>
+      entry.name.toLowerCase() === "msedgewebview2.exe" &&
+      entry.commandLine.toLowerCase().includes("--type=renderer"),
+  );
+  if (renderers.length !== 1) {
+    return {
+      status: "unavailable",
+      label,
+      reason: "renderer_identity_not_unique",
+      candidateCount: renderers.length,
+    };
+  }
+  const renderer = renderers[0];
+  if (
+    !hasProcessIdentity(renderer) ||
+    !Number.isSafeInteger(renderer.workingSetBytes) ||
+    !Number.isSafeInteger(renderer.privateMemoryBytes)
+  ) {
+    return { status: "unavailable", label, reason: "renderer_memory_fields_unavailable" };
+  }
+  return {
+    status: "available",
+    label,
+    ownerPid: renderer.pid,
+    ownerCreatedAt: renderer.creationDate,
+    workingSetBytes: renderer.workingSetBytes,
+    privateMemoryBytes: renderer.privateMemoryBytes,
+  };
+}
+
+/**
+ * 只有全部样本都来自同一 owner-verified renderer 时才计算峰值与回稳增量；任何缺口都会
+ * 保留原始样本并把总体证据降为 unavailable，而不是拼接不同进程的内存曲线。
+ */
+function summarizeRendererMemory(samples) {
+  const unavailable = samples.find((sample) => sample.status !== "available");
+  if (samples.length < 2 || unavailable !== undefined) {
+    return {
+      status: "unavailable",
+      reason: unavailable?.reason ?? "insufficient_renderer_samples",
+      samples,
+    };
+  }
+  const owners = new Set(samples.map((sample) => `${sample.ownerPid}:${sample.ownerCreatedAt}`));
+  if (owners.size !== 1) {
+    return { status: "unavailable", reason: "renderer_identity_changed", samples };
+  }
+  const baseline = samples[0];
+  const settled = samples.at(-1);
+  return {
+    status: "available",
+    ownerPid: baseline.ownerPid,
+    ownerCreatedAt: baseline.ownerCreatedAt,
+    sampleCount: samples.length,
+    peakWorkingSetBytes: Math.max(...samples.map((sample) => sample.workingSetBytes)),
+    peakPrivateMemoryBytes: Math.max(...samples.map((sample) => sample.privateMemoryBytes)),
+    settledWorkingSetBytes: settled.workingSetBytes,
+    settledPrivateMemoryBytes: settled.privateMemoryBytes,
+    settledWorkingSetDeltaBytes: settled.workingSetBytes - baseline.workingSetBytes,
+    settledPrivateMemoryDeltaBytes: settled.privateMemoryBytes - baseline.privateMemoryBytes,
+    samples,
+  };
 }
 
 /**
@@ -2231,6 +5772,7 @@ function startProcessWatcher(rootIdentity, observed, incompleteObserved, signal)
         await new Promise((resolvePromise, rejectPromise) => {
           let timer;
           let rejectNow;
+          /** timer 与 abort 竞争经同一终点结算，保证 watcher 每轮最多唤醒一次。 */
           const finish = (callback, value) => {
             globalThis.clearTimeout(timer);
             signal?.removeEventListener("abort", rejectNow);
@@ -2421,6 +5963,17 @@ function buildTauriEnv(
     env.JA_E2E_EDGEDRIVER_PORT = String(edgeDriverPort);
     env.JA_E2E_EDGEDRIVER_SESSION_PATH = edgeDriverSessionPath;
     env.JA_E2E_WEBVIEW_DATA_DIR = edgeDriverDataDirectory(directories);
+  }
+  if (
+    planGoalAcceptanceMode ||
+    turnChangeReviewAcceptanceMode ||
+    configuredNativeSidecarDirectory !== undefined
+  ) {
+    // Native focused mode 必须让 Rust 走 `app.path().resource_dir()`；任何 JVM/JAR 变量都会
+    // 改写 LaunchConfig owner，即使其路径无效也不能作为“无回退”的验收证据。
+    delete env.JA_DEBUG_JAVA;
+    delete env.JA_DEBUG_JAR;
+    delete env.JA_E2E_APP_SERVER_JAR;
   }
   if (productionRuntime) env.JA_E2E_RUNTIME_MODE = "production";
   const inheritedPath = rootProcessEnv.PATH ?? rootProcessEnv.Path ?? "";
@@ -2747,16 +6300,20 @@ function assertLaunchRuntimeRoot(directories) {
 }
 
 /**
- * 解码 debug sidecar 的四目录身份，并在任何 UI 断言前证明它们都属于本轮临时根。
- * 这里按各目录的真实职责分别比对，不能继续把 durable data 误当成短生命周期 runtime；
- * 同时要求日志留在隔离 USERPROFILE 的固定 Ja Home 内，避免真窗通过但污染开发者目录。
+ * 解码 App Server sidecar 的四目录身份，并在任何 UI 断言前证明它们都属于本轮临时根。
+ * 可执行文件名由调用场景收窄：普通调试链默认只接受 JVM，Native-only 验收只接受 manifest
+ * 已验证的 sidecar 名称；目录仍按真实职责逐项比对，避免真窗通过但污染开发者目录。
  */
-function assertRuntimeIsolation(snapshot, directories) {
-  const java = snapshot.find(
-    (entry) =>
-      entry.name.toLowerCase() === "java.exe" && entry.commandLine.includes("--data-dir-base64="),
+function assertRuntimeIsolation(snapshot, directories, expectedExecutableNames = ["java.exe"]) {
+  const executableNames = new Set(
+    expectedExecutableNames.map((name) => String(name).toLowerCase()),
   );
-  if (java === undefined) {
+  const appServer = snapshot.find(
+    (entry) =>
+      executableNames.has(entry.name.toLowerCase()) &&
+      entry.commandLine.includes("--data-dir-base64="),
+  );
+  if (appServer === undefined) {
     throw new Error("未找到带隔离目录标识的 Ja App Server sidecar");
   }
   const comparable = (value) =>
@@ -2771,9 +6328,11 @@ function assertRuntimeIsolation(snapshot, directories) {
     log: join(directories.settings, ".ja", "logs", "java"),
   };
   const decoded = {};
-  // 四个参数必须一次性完整出现；缺少任意一项都说明 Host 与 Java 的目录合同已漂移。
+  // 四个参数必须一次性完整出现；缺少任意一项都说明 Host 与 App Server 的目录合同已漂移。
   for (const [name, expectedPath] of Object.entries(expected)) {
-    const encoded = new RegExp(`--${name}-dir-base64=([^\\s"]+)`, "iu").exec(java.commandLine)?.[1];
+    const encoded = new RegExp(`--${name}-dir-base64=([^\\s"]+)`, "iu").exec(
+      appServer.commandLine,
+    )?.[1];
     if (encoded === undefined) {
       throw new Error(`Ja App Server sidecar 缺少 ${name}-dir 标识`);
     }
@@ -2784,10 +6343,296 @@ function assertRuntimeIsolation(snapshot, directories) {
     decoded[name] = redact(actualPath, directories);
   }
   return {
-    javaPid: java.pid,
+    appServerPid: appServer.pid,
     decodedDirectories: decoded,
     expectedRoot: redact(directories.root, directories),
   };
+}
+
+/**
+ * 只强杀当前 launcher 树中已复验四目录隔离身份的 App Server；PID 在执行前后都按创建时间
+ * 与命令行重验；调用方显式收窄 JVM 或 Native executable 名，避免同名进程或 PID 复用进入
+ * 故障注入范围。
+ */
+async function forceKillIsolatedAppServer(
+  nativeScope,
+  directories,
+  deadline,
+  signal,
+  expectedExecutableNames = ["java.exe"],
+) {
+  throwIfAborted(signal);
+  const snapshot = await processSnapshot(signal);
+  const tree = processTree(nativeScope.rootIdentity, snapshot, nativeScope.incompleteObserved);
+  if (tree === undefined) throw new Error("强杀前无法复验本轮 launcher 进程树");
+  for (const [pid, entry] of tree) nativeScope.observed.set(pid, entry);
+  const isolation = assertRuntimeIsolation(
+    [...tree.values()],
+    directories,
+    expectedExecutableNames,
+  );
+  const expected = tree.get(isolation.appServerPid);
+  if (expected === undefined || !hasProcessIdentity(expected)) {
+    throw new Error("强杀前缺少 App Server 完整进程身份");
+  }
+  const fresh = (await processSnapshot(signal)).find((entry) =>
+    sameProcessIdentity(expected, entry),
+  );
+  if (fresh === undefined) throw new Error("强杀前 App Server 身份已经变化");
+  await execFileAsync("taskkill.exe", ["/PID", String(expected.pid), "/F"], {
+    windowsHide: true,
+    maxBuffer: 1 * 1024 * 1024,
+    timeout: snapshotTimeoutMs,
+    signal,
+  });
+  await waitForCondition(
+    "隔离 App Server 强杀完成",
+    async () =>
+      !(await processSnapshot(signal)).some((entry) => sameProcessIdentity(expected, entry)),
+    deadline,
+    signal,
+  );
+  return { pid: expected.pid, isolated: true, forceKilled: true };
+}
+
+/**
+ * 只读回收指定 Goal 的 Tool attempt 恢复事实；返回 identity、generation 和终态字段，既不参与
+ * App Server 事务，也不通过测试进程修补状态。恢复场景要求唯一 attempt，避免任选一行掩盖重放。
+ */
+function goalToolAttemptFact(directories, goalId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    const rows = database
+      .prepare(
+        "SELECT a.tool_attempt_id, a.turn_id, a.call_id, a.process_generation, a.side_effect, " +
+          "a.state, a.started_at, a.completed_at, g.status AS goal_status, g.phase AS goal_phase, " +
+          "g.recovery_required FROM goal_tool_attempts a JOIN goals g ON g.goal_id = a.goal_id " +
+          "WHERE a.goal_id = ? ORDER BY a.prepared_at",
+      )
+      .all(goalId);
+    if (rows.length !== 1) {
+      throw new Error(`Goal Tool attempt 数量异常：${rows.length}`);
+    }
+    return rows[0];
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * 以只读连接验证终态是否仍遗留执行游标；查询只接受参数化 turnId，且连接在单次断言后关闭，
+ * 不参与 App Server 的 SQLite 写事务；短时等待自动标题结算，避免把数据库正常互斥当作回归。
+ */
+function turnExecutionRowCount(directories, turnId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    database.exec("PRAGMA busy_timeout = 5000");
+    const row = database
+      .prepare("SELECT COUNT(*) AS row_count FROM turn_execution WHERE turn_id = ?")
+      .get(turnId);
+    return Number(row?.row_count ?? -1);
+  } finally {
+    database.close();
+  }
+}
+
+/** 只读抽取 Operation 游标；不返回 prompt、Tool 参数或其它可能包含用户内容的字段。 */
+function runtimeRefreshExecutionFact(directories, turnId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    const row = database
+      .prepare("SELECT schema_version, state_json FROM turn_execution WHERE turn_id = ?")
+      .get(turnId);
+    if (row === undefined) return undefined;
+    const state = JSON.parse(row.state_json);
+    return {
+      schemaVersion: Number(row.schema_version),
+      kind: state.kind,
+      modelRound: state.common?.modelRound,
+      usedToolCalls: state.common?.usedToolCalls,
+      nextProviderOrdinal: state.common?.nextProviderOrdinal,
+      deadlineAt: state.common?.deadlineAt,
+    };
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * 终态只读核验请求级 Usage、不可变 Tool binding 与 Tool 结果；所有查询按 turnId 参数化，
+ * profile_json 只解析模型/代际摘要，不进入通用桌面日志。
+ */
+function runtimeRefreshPersistenceFacts(directories, turnId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    const usage = database
+      .prepare(
+        "SELECT request_id, model_round, request_ordinal, certainty, profile_json, " +
+          "input_tokens, output_tokens, total_tokens FROM usage " +
+          "WHERE turn_id = ? AND purpose = 'ASSISTANT' ORDER BY request_ordinal",
+      )
+      .all(turnId)
+      .map((row) => ({ ...row, profile: JSON.parse(row.profile_json) }));
+    const bindings = database
+      .prepare(
+        "SELECT b.call_id, b.batch_id, b.route_kind, b.local_name, b.server_id, b.remote_name, " +
+          "b.schema_hash, b.route_hash, b.catalog_revision, b.access_mode, t.state, " +
+          "t.presentation_json FROM tool_bindings b JOIN tools t " +
+          "ON t.turn_id=b.turn_id AND t.call_id=b.call_id WHERE b.turn_id=? ORDER BY t.ordinal",
+      )
+      .all(turnId)
+      .map((row) => ({ ...row, presentation: JSON.parse(row.presentation_json) }));
+    const unavailableResults = database
+      .prepare(
+        "SELECT COUNT(*) AS row_count FROM messages WHERE turn_id=? AND role='TOOL' " +
+          "AND instr(blocks_json, 'TOOL_BINDING_UNAVAILABLE') > 0",
+      )
+      .get(turnId);
+    const turn = database
+      .prepare("SELECT state, completed_at, error_code FROM turns WHERE turn_id=?")
+      .get(turnId);
+    return {
+      usage,
+      bindings,
+      unavailableResultCount: Number(unavailableResults?.row_count ?? -1),
+      turn,
+      terminalExecutionDeleted:
+        Number(
+          database
+            .prepare("SELECT COUNT(*) AS row_count FROM turn_execution WHERE turn_id=?")
+            .get(turnId)?.row_count ?? -1,
+        ) === 0,
+    };
+  } finally {
+    database.close();
+  }
+}
+
+/** MCP report 允许写入中的最后一行暂时缺失换行；只返回已经完成解析的 NDJSON 事件。 */
+async function readRuntimeRefreshMcpReport(reportPath) {
+  try {
+    const text = await readFile(reportPath, "utf8");
+    return text
+      .split(/\r?\n/u)
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+/**
+ * 只读核对指定 Turn 的公开时间线与 Provider 上下文都保留 DSML-like 普通模型正文；测试
+ * 输入本身不含该词，因此命中只能来自目标响应；只读探针短时等待生产提交，不修改对话数据。
+ */
+function dsmlPersistenceRowCount(directories, turnId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    database.exec("PRAGMA busy_timeout = 5000");
+    const row = database
+      .prepare(
+        "SELECT " +
+          "(SELECT COUNT(*) FROM timeline_messages WHERE turn_id = ? AND instr(upper(public_text), 'DSML') > 0) + " +
+          "(SELECT COUNT(*) FROM messages WHERE turn_id = ? AND instr(upper(blocks_json), 'DSML') > 0) AS row_count",
+      )
+      .get(turnId, turnId);
+    return Number(row?.row_count ?? -1);
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * 只读定位本轮 Thread 中按展示名预留的唯一附件；返回受管 identity 与 blob 摘要，绝不把
+ * 物理路径写入证据。重复行表示测试前提失效，不能随意挑一行制造确定性假象。
+ */
+function queuedAttachmentFact(directories, threadId, displayName) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    const rows = database
+      .prepare(
+        "SELECT a.attachment_id, a.blob_sha256, a.status, pia.input_id, " +
+          "p.input_revision, p.validation_status, p.issue_error_code " +
+          "FROM pending_input_attachments pia " +
+          "JOIN pending_inputs p ON p.input_id = pia.input_id " +
+          "JOIN attachments a ON a.attachment_id = pia.attachment_id " +
+          "WHERE p.thread_id = ? AND p.state = 'PENDING' AND a.display_name = ?",
+      )
+      .all(threadId, displayName);
+    if (rows.length !== 1) {
+      throw new Error(`排队附件权威行数量异常：${displayName}=${rows.length}`);
+    }
+    return rows[0];
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * 按稳定 attachmentId 回读最终预留/消息归属，证明附件只能处于一个 owner 下；查询不会加入
+ * 或修正生产事实，避免 E2E 通过数据库旁路掩盖绑定事务缺陷。
+ */
+function attachmentOwnershipFact(directories, attachmentId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    return database
+      .prepare(
+        "SELECT a.status, a.blob_sha256, pia.input_id, ma.message_id, m.role, m.turn_id " +
+          "FROM attachments a " +
+          "LEFT JOIN pending_input_attachments pia ON pia.attachment_id = a.attachment_id " +
+          "LEFT JOIN message_attachments ma ON ma.attachment_id = a.attachment_id " +
+          "LEFT JOIN messages m ON m.message_id = ma.message_id " +
+          "WHERE a.attachment_id = ?",
+      )
+      .get(attachmentId);
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * App Server 终态提交与只读验收可能在 Windows SQLite 文件锁上短暂交叠；只重试明确的
+ * SQLITE_BUSY，并受调用方 deadline 与两秒局部预算共同限制，持续锁和其它 SQL 错误仍原样失败。
+ */
+async function readSqliteFact(label, reader, deadline, signal) {
+  const readDeadline = Math.min(deadline, Date.now() + 2_000);
+  let value;
+  await waitForCondition(
+    label,
+    () => {
+      try {
+        value = reader();
+        return true;
+      } catch (error) {
+        if (error?.errcode === 5 || error?.code === "SQLITE_BUSY") return false;
+        throw error;
+      }
+    },
+    readDeadline,
+    signal,
+  );
+  return value;
+}
+
+/**
+ * 仅删除当前随机 E2E data 根内由 SQLite 指向的 SHA-256 普通目标，用真实跨资源缺失触发
+ * fail-closed；任何路径越界或摘要异常都在执行删除前终止。
+ */
+async function removeIsolatedAttachmentBlob(directories, sha256) {
+  if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(sha256)) {
+    throw new Error("隔离附件缺少合法 blob 摘要");
+  }
+  const blobRoot = resolve(directories.data, "attachments", "blobs");
+  const blob = resolve(blobRoot, sha256);
+  const containment = relative(blobRoot, blob);
+  if (containment !== sha256 || containment.startsWith("..") || isAbsolute(containment)) {
+    throw new Error("拒绝删除隔离附件根以外的目标");
+  }
+  const metadata = await stat(blob);
+  if (!metadata.isFile()) throw new Error("隔离附件 blob 不是普通文件");
+  await rm(blob);
+  return { removed: true, sha256 };
 }
 
 /**
@@ -3154,17 +6999,43 @@ async function waitForWebViewProfileReady(
 }
 
 /**
- * 定位真实 Tauri WebView 页面，同时忽略 devtools/blank target；
- * 后续还会检查页面文本，单纯连接 CDP socket 不足以通过验收。
+ * 定位真实 Tauri WebView 页面，启动等待不消耗整轮业务预算；仅对本轮 dev server 尚未就绪
+ * 留下的错误页重试一次真实导航，绝不向页面注入替代内容或放宽后续业务断言。
  */
 async function waitForPage(browser, frontendPort, deadline, signal) {
-  while (Date.now() < deadline) {
+  const startupDeadline = Math.min(deadline, Date.now() + cdpStartupDeadlineMs);
+  const recoveredPages = new Set();
+  while (Date.now() < startupDeadline) {
     throwIfAborted(signal);
+    if (!browser.isConnected()) throw new Error("隔离 WebView2 已断开");
     for (const context of browser.contexts()) {
       for (const page of context.pages()) {
         const url = page.url();
-        if (url.includes(`localhost:${frontendPort}`) || url.includes("tauri://localhost")) {
+        if (
+          url.startsWith(`http://127.0.0.1:${frontendPort}/`) ||
+          url.startsWith("tauri://localhost/")
+        ) {
           return page;
+        }
+        if (url === "chrome-error://chromewebdata/" && !recoveredPages.has(page)) {
+          const target = `http://127.0.0.1:${frontendPort}/`;
+          const ready = await fetch(target, {
+            signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, startupDeadline - Date.now()))),
+          })
+            .then(async (response) => {
+              const valid =
+                response.ok && response.headers.get("content-type")?.includes("text/html");
+              await response.body?.cancel();
+              return valid;
+            })
+            .catch(() => false);
+          if (ready) {
+            recoveredPages.add(page);
+            await page.goto(target, {
+              waitUntil: "domcontentloaded",
+              timeout: Math.max(1, Math.min(10_000, startupDeadline - Date.now())),
+            });
+          }
         }
       }
     }
@@ -3198,7 +7069,10 @@ function attachPageDiagnostics(page, directories) {
   return diagnostics;
 }
 
-/** Tauri bridge 就绪后安装 RPC、workspace 与 native shortcut 三个有界只读 listener。 */
+/**
+ * Tauri bridge 就绪后安装 RPC、workspace 与 native shortcut 三个有界只读 listener；RPC
+ * 上限覆盖 22 次 Tool revision 的完整事务序列和终态，仍拒绝形成无界诊断队列。
+ */
 async function installRawTauriEventProbe(page) {
   await page.waitForFunction(
     () => {
@@ -3229,7 +7103,7 @@ async function installRawTauriEventProbe(page) {
         const list = Array.isArray(globalThis.__JA_E2E_TAURI_EVENTS__)
           ? globalThis.__JA_E2E_TAURI_EVENTS__
           : [];
-        if (list.length < 128) {
+        if (list.length < 2048) {
           list.push(
             value !== null && typeof value === "object"
               ? { ...value, __jaObservedAt: globalThis.performance.now() }
@@ -3370,6 +7244,11 @@ function installTauriInvokeProbeInPage() {
   )
     globalThis.__JA_E2E_TAURI_INVOKE_PHASE_TRACES__ = {};
   if (
+    globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__ === null ||
+    typeof globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__ !== "object"
+  )
+    globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__ = { active: 0, maximum: 0 };
+  if (
     globalThis.__JA_E2E_WORKSPACE_WATCH_LIFECYCLE__ === null ||
     typeof globalThis.__JA_E2E_WORKSPACE_WATCH_LIFECYCLE__ !== "object"
   )
@@ -3459,20 +7338,134 @@ function installTauriInvokeProbeInPage() {
     // Files 冒烟通过这些计数区分原生事件投递与权威读取投影；若省略，
     // 每次成功读取都会被误判为 timeout。
     const workspaceLifecycleObserved = [
+      "ja_workspace_tree",
       "ja_workspace_read_file",
       "ja_workspace_watch_start",
       "ja_workspace_watch_rescan",
       "ja_workspace_watch_stop",
     ].includes(command);
+    // 附件命令只记录名称与终态，不记录 operation/session identity、文件名或 Channel payload。
+    // picker/drop 的 resolved + ready DOM 共同证明 Channel completed 事件被 renderer 消费。
+    const attachmentLifecycleObserved = [
+      "ja_attachment_picker_import",
+      "ja_attachment_drop_import",
+      "ja_attachment_clipboard_import",
+      "ja_attachment_discard",
+      "ja_attachment_preview_open",
+      "ja_attachment_preview_read",
+      "ja_attachment_preview_close",
+    ].includes(command);
+    const attachmentPreviewAuthorizationKind =
+      command === "ja_attachment_preview_open" &&
+      ["draft", "thread"].includes(args?.input?.authorization?.kind)
+        ? args.input.authorization.kind
+        : undefined;
+    const attachmentPreviewArgumentShape =
+      command === "ja_attachment_preview_open"
+        ? {
+            argumentFields:
+              args !== null && typeof args === "object" ? Object.keys(args).sort() : [],
+            inputFields:
+              args?.input !== null && typeof args?.input === "object"
+                ? Object.keys(args.input).sort()
+                : [],
+            authorizationFields:
+              args?.input?.authorization !== null && typeof args?.input?.authorization === "object"
+                ? Object.keys(args.input.authorization).sort()
+                : [],
+          }
+        : undefined;
+    // Review 仅保留命令名对应的 start 计数；参数、返回值、错误与 Git 内容都不进入 probe。
+    const reviewCommandObserved = ["ja_review_catalog", "ja_review_snapshot"].includes(command);
+    // 终态修改查看只记录完整单文件读取的 phase 与并发数；identity、路径和 Diff 不离开产品边界。
+    const turnChangeReviewCommandObserved = command === "ja_turn_change_set_read";
+    if (turnChangeReviewCommandObserved) {
+      const lifecycle = globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__;
+      lifecycle.active += 1;
+      lifecycle.maximum = Math.max(lifecycle.maximum, lifecycle.active);
+    }
+    // Composer @ 只记录专用路径搜索命令的生命周期，不保存 query、Workspace 或结果路径。
+    const composerPathSearchObserved = command === "ja_runtime_workspace_path_search";
+    // Queue ACK probe 只记录命令名与 phase；正文、引用、Turn identity 和 revision 都留在产品边界内。
+    const inputQueueLifecycleObserved = command === "ja_turn_input_enqueue";
+    // Thread 列表诊断只保留 phase/errorCode，用于区分 UI 空结果与服务端恢复失败。
+    const threadListLifecycleObserved = command === "ja_thread_list";
+    // Task probe 只保留 command 与生命周期计数；Child identity、brief、上下文和结果均不得进入 summary。
+    const taskLifecycleObserved = [
+      "ja_thread_read",
+      "ja_thread_rename",
+      "ja_runtime_task_create",
+      "ja_runtime_task_list",
+      "ja_runtime_task_read",
+      "ja_runtime_task_observe",
+      "ja_runtime_task_unobserve",
+      "ja_runtime_task_seen",
+      "ja_runtime_task_message_send",
+      "ja_runtime_task_followup",
+      "ja_runtime_task_cancel",
+      "ja_runtime_task_tree_delete",
+    ].includes(command);
+    // Goal probe 只记录稳定 command 与生命周期，不复制 objective、plan definition、hash、证据
+    // 摘要或幂等键；旧版本冲突仍通过 rejected phase 的稳定 errorCode 归因。
+    const goalLifecycleObserved = [
+      "ja_runtime_goal_read",
+      "ja_runtime_goal_events_read",
+      "ja_runtime_goal_observe",
+      "ja_runtime_goal_unobserve",
+      "ja_runtime_plan_read",
+      "ja_runtime_plan_revisions_list",
+      "ja_runtime_goal_evidence_list",
+      "ja_runtime_goal_create",
+      "ja_runtime_goal_plan_attach",
+      "ja_runtime_goal_plan_detach",
+      "ja_runtime_goal_pause",
+      "ja_runtime_goal_resume",
+      "ja_runtime_goal_stop",
+      "ja_runtime_goal_input_respond",
+      "ja_runtime_plan_create",
+      "ja_runtime_plan_draft_save",
+      "ja_runtime_plan_draft_discard",
+      "ja_runtime_plan_propose",
+      "ja_runtime_plan_approve",
+      "ja_runtime_plan_execute",
+      "ja_runtime_plan_reject",
+    ].includes(command);
+    // Runtime start 只记录阶段与 Rust 已脱敏的稳定错误码；启动参数恒为空，原始 child
+    // 诊断仍留在 native 日志，避免真窗失败被统一 UI 文案抹平后只能靠猜测归因。
+    const runtimeStartLifecycleObserved = command === "ja_runtime_start";
     if (command === "ja_workspace_watch_start" && Number.isSafeInteger(args?.input?.generation)) {
       globalThis.__JA_E2E_WORKSPACE_WATCH_LIFECYCLE__.latestStartRequested = args.input.generation;
     }
     if (command === "ja_workspace_watch_stop" && Number.isSafeInteger(args?.input?.generation)) {
       globalThis.__JA_E2E_WORKSPACE_WATCH_LIFECYCLE__.latestStopRequested = args.input.generation;
     }
+    const turnLifecycleObserved = command === "ja_turn_start" || command === "ja_turn_resume";
+    const previewLifecycleObserved = [
+      "ja_preview_open",
+      "ja_preview_navigate",
+      "ja_preview_layout",
+      "ja_preview_close",
+    ].includes(command);
+    const previewMetadata = previewLifecycleObserved
+      ? {
+          sessionId: typeof args?.input?.sessionId === "string" ? args.input.sessionId : undefined,
+          generation: Number.isSafeInteger(args?.input?.generation)
+            ? args.input.generation
+            : undefined,
+        }
+      : {};
+    // Turn 失败诊断只保留判别类型和字段集合；不记录正文、引用值、identity 或 deadline。
+    const turnContentShape =
+      command === "ja_turn_start" && Array.isArray(args?.input?.content)
+        ? args.input.content.map((part) => ({
+            type: typeof part?.type === "string" ? part.type : "<invalid>",
+            fields:
+              part !== null && typeof part === "object" ? Object.keys(part).sort() : ["<invalid>"],
+          }))
+        : undefined;
     const observed =
       command === "plugin:opener|open_url" ||
-      command === "ja_turn_start" ||
+      turnLifecycleObserved ||
       command === "ja_terminal_open" ||
       command === "ja_terminal_input" ||
       command === "ja_terminal_poll" ||
@@ -3482,21 +7475,61 @@ function installTauriInvokeProbeInPage() {
       command === "ja_native_shortcut_context_activate" ||
       command === "ja_workspace_trash_commit" ||
       workspaceLifecycleObserved ||
-      command === "ja_preview_open" ||
-      command === "ja_preview_navigate" ||
-      command === "ja_preview_layout" ||
-      command === "ja_preview_close";
-    if (observed)
+      attachmentLifecycleObserved ||
+      reviewCommandObserved ||
+      turnChangeReviewCommandObserved ||
+      composerPathSearchObserved ||
+      inputQueueLifecycleObserved ||
+      threadListLifecycleObserved ||
+      taskLifecycleObserved ||
+      goalLifecycleObserved ||
+      runtimeStartLifecycleObserved ||
+      previewLifecycleObserved;
+    if (
+      reviewCommandObserved ||
+      turnChangeReviewCommandObserved ||
+      composerPathSearchObserved ||
+      inputQueueLifecycleObserved ||
+      threadListLifecycleObserved ||
+      taskLifecycleObserved ||
+      goalLifecycleObserved ||
+      runtimeStartLifecycleObserved
+    ) {
+      append({ command, phase: "start" });
+    } else if (observed) {
       append({
         command,
         suppressed: suppress,
         phase: "start",
         previewVisible,
+        ...(turnContentShape === undefined ? {} : { contentShape: turnContentShape }),
+        ...previewMetadata,
         ...terminalInputMetadata,
         ...nativeShortcutMetadata,
+        ...(attachmentPreviewAuthorizationKind === undefined
+          ? {}
+          : { authorizationKind: attachmentPreviewAuthorizationKind }),
+        ...(attachmentPreviewArgumentShape === undefined
+          ? {}
+          : { argumentShape: attachmentPreviewArgumentShape }),
       });
+    }
     if (suppress) return undefined;
     try {
+      const injectedTurnChangeDelay = turnChangeReviewCommandObserved
+        ? globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_MS__
+        : 0;
+      if (
+        Number.isSafeInteger(injectedTurnChangeDelay) &&
+        injectedTurnChangeDelay > 0 &&
+        Number.isSafeInteger(globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_REMAINING__) &&
+        globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_REMAINING__ > 0
+      ) {
+        globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_REMAINING__ -= 1;
+        await new Promise((resolvePromise) =>
+          globalThis.setTimeout(resolvePromise, injectedTurnChangeDelay),
+        );
+      }
       if (
         command === "ja_terminal_close_all" &&
         globalThis.__JA_E2E_FAIL_NEXT_TERMINAL_CLOSE_ALL__ === true
@@ -3505,7 +7538,7 @@ function installTauriInvokeProbeInPage() {
         throw new Error("JA_E2E_INJECTED_TERMINAL_CLOSE_ALL_FAILURE");
       }
       const result = await delegate();
-      if (command === "ja_turn_start") {
+      if (turnLifecycleObserved) {
         const accepted = result !== null && typeof result === "object" ? result : {};
         append({
           command,
@@ -3564,19 +7597,26 @@ function installTauriInvokeProbeInPage() {
         }
         append({ command, phase: "resolved" });
       } else if (
-        [
-          "ja_preview_open",
-          "ja_preview_navigate",
-          "ja_preview_layout",
-          "ja_preview_close",
-        ].includes(command)
+        turnChangeReviewCommandObserved ||
+        composerPathSearchObserved ||
+        inputQueueLifecycleObserved ||
+        threadListLifecycleObserved ||
+        taskLifecycleObserved ||
+        goalLifecycleObserved ||
+        runtimeStartLifecycleObserved
       ) {
-        append({ command, phase: "resolved", previewVisible });
+        append({ command, phase: "resolved" });
+        if (turnChangeReviewCommandObserved)
+          globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__.active -= 1;
+      } else if (attachmentLifecycleObserved) {
+        append({ command, phase: "resolved" });
+      } else if (previewLifecycleObserved) {
+        append({ command, phase: "resolved", previewVisible, ...previewMetadata });
       }
       return result;
     } catch (error) {
       if (
-        command === "ja_turn_start" ||
+        turnLifecycleObserved ||
         command === "ja_terminal_open" ||
         command === "ja_terminal_close_all" ||
         command === "ja_terminal_input" ||
@@ -3585,22 +7625,55 @@ function installTauriInvokeProbeInPage() {
         command === "ja_native_shortcut_context_update" ||
         command === "ja_native_shortcut_context_activate" ||
         workspaceLifecycleObserved ||
-        [
-          "ja_preview_open",
-          "ja_preview_navigate",
-          "ja_preview_layout",
-          "ja_preview_close",
-        ].includes(command)
+        composerPathSearchObserved ||
+        inputQueueLifecycleObserved ||
+        threadListLifecycleObserved ||
+        taskLifecycleObserved ||
+        goalLifecycleObserved ||
+        runtimeStartLifecycleObserved ||
+        attachmentLifecycleObserved ||
+        turnChangeReviewCommandObserved ||
+        previewLifecycleObserved
       ) {
         const candidate = error !== null && typeof error === "object" ? error : {};
+        // Tauri 在不同 WebView2/runtime 组合中可能把 command rejection 交付为结构体或
+        // 字符串；探针只提取固定错误闭集，既保留诊断能力也避免把原始 native 文本落盘。
+        const serializedErrorCode = typeof candidate.code === "string" ? candidate.code : "";
+        const stringError = typeof error === "string" ? error : "";
+        const knownErrorCodes = [
+          "invalid_input",
+          "unsupported",
+          "token_not_found",
+          "token_expired",
+          "wrong_window",
+          "source_unavailable",
+          "invalid_image",
+          "image_budget_exceeded",
+          "cache_budget_exceeded",
+          "state_unavailable",
+        ];
+        const stableErrorCode =
+          serializedErrorCode !== ""
+            ? serializedErrorCode
+            : (knownErrorCodes.find((code) => stringError.includes(code)) ??
+              (stringError.includes("temporarily unavailable") ? "source_unavailable" : undefined));
         append({
           command,
           phase: "rejected",
           previewVisible,
-          errorCode: typeof candidate.code === "string" ? candidate.code : undefined,
+          errorCode: stableErrorCode,
+          ...previewMetadata,
           ...terminalInputMetadata,
           ...nativeShortcutMetadata,
+          ...(attachmentPreviewAuthorizationKind === undefined
+            ? {}
+            : { authorizationKind: attachmentPreviewAuthorizationKind }),
+          ...(attachmentPreviewArgumentShape === undefined
+            ? {}
+            : { argumentShape: attachmentPreviewArgumentShape }),
         });
+        if (turnChangeReviewCommandObserved)
+          globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__.active -= 1;
       }
       throw error;
     }
@@ -3667,6 +7740,33 @@ async function tauriInvokeTrace(page, command) {
       turnId: typeof call.turnId === "string" ? call.turnId : undefined,
       threadRevision: Number.isSafeInteger(call.threadRevision) ? call.threadRevision : undefined,
       errorCode: typeof call.errorCode === "string" ? call.errorCode : undefined,
+      contentShape: Array.isArray(call.contentShape)
+        ? call.contentShape.map((part) => ({
+            type: typeof part?.type === "string" ? part.type : "<invalid>",
+            fields: Array.isArray(part?.fields)
+              ? part.fields.filter((field) => typeof field === "string")
+              : ["<invalid>"],
+          }))
+        : undefined,
+      authorizationKind: ["draft", "thread"].includes(call.authorizationKind)
+        ? call.authorizationKind
+        : undefined,
+      argumentShape:
+        call.argumentShape !== null && typeof call.argumentShape === "object"
+          ? {
+              argumentFields: Array.isArray(call.argumentShape.argumentFields)
+                ? call.argumentShape.argumentFields.filter((field) => typeof field === "string")
+                : [],
+              inputFields: Array.isArray(call.argumentShape.inputFields)
+                ? call.argumentShape.inputFields.filter((field) => typeof field === "string")
+                : [],
+              authorizationFields: Array.isArray(call.argumentShape.authorizationFields)
+                ? call.argumentShape.authorizationFields.filter(
+                    (field) => typeof field === "string",
+                  )
+                : [],
+            }
+          : undefined,
       projectCapabilitiesEnabled: call.projectCapabilitiesEnabled === true,
       conversationFocusEnabled: call.conversationFocusEnabled === true,
       ready: call.ready === true,
@@ -3711,6 +7811,101 @@ async function tauriInvokePhaseCount(page, command, phase, previewVisible) {
 }
 
 /**
+ * 读取 picker 的最小验收投影：只保留当前调用新增的 phase/error code、失败卡稳定错误码
+ * 与附件卡片状态计数，不读取文件名、operation identity、Channel payload 或本地路径。
+ */
+async function attachmentPickerAcceptanceSnapshot(page, traceOffset) {
+  const [trace, draft] = await Promise.all([
+    tauriInvokeTrace(page, "ja_attachment_picker_import"),
+    page.evaluate(() => ({
+      listCount: globalThis.document.querySelectorAll('[aria-label="待发送附件"]').length,
+      importingCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="importing"]',
+      ).length,
+      readyCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="ready"]',
+      ).length,
+      failedCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="failed"]',
+      ).length,
+      failedErrorCodes: Array.from(
+        globalThis.document.querySelectorAll('.ja-composer-attachment[data-state="failed"]'),
+        (element) => element.getAttribute("data-error-code"),
+      ).filter((value) => typeof value === "string" && value.length > 0),
+      removingCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="removing"]',
+      ).length,
+    })),
+  ]);
+  const currentTrace = trace.slice(traceOffset).map(({ phase, errorCode }) => ({
+    phase,
+    errorCode,
+  }));
+  const startCount = currentTrace.filter(({ phase }) => phase === "start").length;
+  const resolvedCount = currentTrace.filter(({ phase }) => phase === "resolved").length;
+  const rejected = currentTrace.findLast(({ phase }) => phase === "rejected");
+  const stage =
+    rejected !== undefined
+      ? "channel_rejected"
+      : startCount === 0
+        ? "invoke_not_started_after_dialog_closed"
+        : resolvedCount === 0
+          ? "channel_pending_after_dialog_closed"
+          : draft.readyCount === 0
+            ? "resolved_without_ready_dom"
+            : "ready";
+  const snapshot = { stage, trace: currentTrace, draft };
+  attachmentPickerLastEvidence = snapshot;
+  return snapshot;
+}
+
+/**
+ * 原生 Dialog 已关闭后只给 picker Channel 与 React 权威卡片十秒收敛；这段小文件导入不应借用
+ * 15 分钟全局预算。超时携带脱敏阶段快照，使 dialog、invoke 和 DOM 的断点可以直接区分。
+ */
+async function waitForAttachmentPickerAcceptance(page, traceOffset, deadline, signal) {
+  let snapshot = await attachmentPickerAcceptanceSnapshot(page, traceOffset);
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    if (snapshot.stage === "ready") return snapshot;
+    if (snapshot.stage === "channel_rejected") {
+      throw new Error(`附件 picker Channel 被拒绝：${JSON.stringify(snapshot)}`);
+    }
+    await waitForDelay(Math.min(50, Math.max(1, deadline - Date.now())), signal);
+    snapshot = await attachmentPickerAcceptanceSnapshot(page, traceOffset);
+  }
+  throw new Error(`附件 picker 短期限未收敛：${JSON.stringify(snapshot)}`);
+}
+
+/** 失败摘要只记录命令 phase、卡片计数和公开错误码，避免全局 abort 后失去 picker 断点。 */
+async function captureAttachmentPickerEvidence(page) {
+  return {
+    invokeLifecycle: (await tauriInvokeTrace(page, "ja_attachment_picker_import")).map(
+      ({ phase, errorCode }) => ({ phase, errorCode }),
+    ),
+    draft: await page.evaluate(() => ({
+      listCount: globalThis.document.querySelectorAll('[aria-label="待发送附件"]').length,
+      importingCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="importing"]',
+      ).length,
+      readyCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="ready"]',
+      ).length,
+      failedCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="failed"]',
+      ).length,
+      failedErrorCodes: Array.from(
+        globalThis.document.querySelectorAll('.ja-composer-attachment[data-state="failed"]'),
+        (element) => element.getAttribute("data-error-code"),
+      ).filter((value) => typeof value === "string" && value.length > 0),
+      removingCount: globalThis.document.querySelectorAll(
+        '.ja-composer-attachment[data-state="removing"]',
+      ).length,
+    })),
+  };
+}
+
+/**
  * 只捕获聚合的 workspace 生命周期阶段与 opaque generation，使失败的真窗运行能区分
  * listener 漏接和 session 抖动，同时不序列化 workspace ID、路径、revision 或文件内容。
  */
@@ -3728,6 +7923,7 @@ async function captureWorkspaceInvokeLifecycle(page) {
         ? globalThis.__JA_E2E_WORKSPACE_WATCH_LIFECYCLE__
         : {};
     const commands = [
+      "ja_workspace_tree",
       "ja_workspace_watch_start",
       "ja_workspace_watch_stop",
       "ja_workspace_watch_rescan",
@@ -3836,7 +8032,7 @@ async function captureRawTauriEvents(page) {
       const events = Array.isArray(globalThis.__JA_E2E_TAURI_EVENTS__)
         ? globalThis.__JA_E2E_TAURI_EVENTS__
         : [];
-      return events.slice(-128).map((value) => {
+      return events.slice(-2048).map((value) => {
         const envelope = value !== null && typeof value === "object" ? value : {};
         const payload = envelope.payload !== undefined ? envelope.payload : envelope;
         const parsed = JaEventSchema.safeParse(payload);
@@ -3871,8 +8067,40 @@ async function captureRawTauriEvents(page) {
         serverInstanceId:
           typeof params.serverInstanceId === "string" ? params.serverInstanceId : undefined,
         turnId: typeof params.turnId === "string" ? params.turnId : undefined,
+        ordinal: Number.isSafeInteger(params.ordinal) ? params.ordinal : undefined,
+        resultCallIds: Array.isArray(params.results)
+          ? params.results.flatMap((result) =>
+              typeof result?.callId === "string" ? [result.callId] : [],
+            )
+          : [],
+        resultOrdinals: Array.isArray(params.results)
+          ? params.results.flatMap((result) =>
+              Number.isSafeInteger(result?.ordinal) ? [result.ordinal] : [],
+            )
+          : [],
+        resultOutcomes: Array.isArray(params.results)
+          ? params.results.flatMap((result) =>
+              typeof result?.outcome === "string" ? [result.outcome] : [],
+            )
+          : [],
+        resultErrorCodes: Array.isArray(params.results)
+          ? params.results.flatMap((result) =>
+              typeof result?.errorCode === "string" ? [result.errorCode] : [],
+            )
+          : [],
+        resultOutputNonEmpty: Array.isArray(params.results)
+          ? params.results.map(
+              (result) =>
+                typeof result?.presentation?.outputPreview === "string" &&
+                result.presentation.outputPreview.trim().length > 0,
+            )
+          : [],
         status: typeof params.status === "string" ? params.status : undefined,
         terminalState: typeof params.state === "string" ? params.state : undefined,
+        errorCode: typeof params.errorCode === "string" ? params.errorCode : undefined,
+        finalMessageNonEmpty:
+          typeof params.finalMessage?.text === "string" &&
+          params.finalMessage.text.trim().length > 0,
         approvalId: typeof params.approvalId === "string" ? params.approvalId : undefined,
         expiresAt: typeof params.expiresAt === "string" ? params.expiresAt : undefined,
         callId: typeof params.callId === "string" ? params.callId : undefined,
@@ -3975,8 +8203,127 @@ async function captureTimelineReducerState(page) {
 }
 
 /**
- * 从真实 WebView2 读取 Files 布局和唯一滚动端口；几何只用于验收自适应契约，
- * 不作为产品状态或固定像素快照，避免 DPI/窗口变化产生脆弱断言。
+ * 直接回读当前 reducer 所属 Thread 的原生权威快照，并只保留结构化、无正文诊断。
+ * 该证据用于区分 Rust/Java 投影畸形、domain seam 拒绝与终态队列悬挂；消息正文、路径和
+ * Provider payload 一律不进入持久化结果，避免诊断能力扩大产品数据暴露面。
+ */
+async function captureAuthoritativeThreadSnapshot(page, expectedThreadId) {
+  try {
+    return await page.evaluate(async (requestedThreadId) => {
+      const invoke = globalThis.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== "function") return { status: "bridge_unavailable" };
+      const [{ useTimelineStore }, { timelineSnapshotValidationReason }] = await Promise.all([
+        import("/src/features/conversation/application/timelineStore.ts"),
+        import("/src/features/conversation/domain/timelineContracts.ts"),
+      ]);
+      const state = useTimelineStore.getState();
+      const current = globalThis.document.querySelector(
+        '[aria-label="最近对话列表"] button[data-thread-id][aria-current="page"]',
+      );
+      const selectedThreadId = current?.getAttribute("data-thread-id") ?? undefined;
+      const reducerThreadId = Object.values(state.turns).find((turn) =>
+        ["completed", "failed", "cancelled"].includes(turn.status),
+      )?.threadId;
+      const threadId = requestedThreadId ?? selectedThreadId ?? reducerThreadId;
+      if (threadId === undefined) return { status: "thread_unavailable" };
+      try {
+        const value = await invoke("ja_thread_read", { input: { threadId, limit: 200 } });
+        const snapshot = value !== null && typeof value === "object" ? value : {};
+        const turns = Array.isArray(snapshot.turns) ? snapshot.turns : [];
+        const items = Array.isArray(snapshot.items) ? snapshot.items : [];
+        const queue =
+          snapshot.inputQueue !== null && typeof snapshot.inputQueue === "object"
+            ? snapshot.inputQueue
+            : undefined;
+        const contextUsage =
+          snapshot.contextUsage !== null && typeof snapshot.contextUsage === "object"
+            ? snapshot.contextUsage
+            : undefined;
+        return {
+          status: "resolved",
+          selectedThreadMatches: selectedThreadId === undefined || selectedThreadId === threadId,
+          validationReason: timelineSnapshotValidationReason(value) ?? null,
+          revision: Number.isSafeInteger(snapshot.revision) ? snapshot.revision : null,
+          nextCursor: snapshot.nextCursor ?? null,
+          turnCount: turns.length,
+          turns: turns.slice(0, 8).map((turn) => ({
+            fields: Object.keys(turn ?? {}).sort(),
+            turnId: typeof turn?.turnId === "string" ? turn.turnId : null,
+            status: turn?.status,
+            errorCode: typeof turn?.errorCode === "string" ? turn.errorCode : null,
+            hasCompletedAt: typeof turn?.completedAt === "string",
+          })),
+          itemCount: items.length,
+          items: items.slice(0, 24).map((item) => ({
+            fields: Object.keys(item ?? {}).sort(),
+            turnId: typeof item?.turnId === "string" ? item.turnId : null,
+            kind: item?.kind,
+            hasTurnOwner: turns.some((turn) => turn?.turnId === item?.turnId),
+            owningTurnStatus: turns.find((turn) => turn?.turnId === item?.turnId)?.status,
+            textNonEmpty: typeof item?.text === "string" && item.text.trim().length > 0,
+            modelRound: Number.isSafeInteger(item?.modelRound) ? item.modelRound : undefined,
+            presentationKind: item?.presentation?.kind,
+            presentationStatus: item?.presentation?.status,
+            presentationOutputNonEmpty:
+              typeof item?.presentation?.outputPreview === "string" &&
+              item.presentation.outputPreview.trim().length > 0,
+          })),
+          inputQueue:
+            snapshot.inputQueue === null
+              ? null
+              : {
+                  fields: Object.keys(queue ?? {}).sort(),
+                  accepting: queue?.accepting,
+                  revision: queue?.revision,
+                  itemCount: Array.isArray(queue?.items) ? queue.items.length : null,
+                  items: Array.isArray(queue?.items)
+                    ? queue.items.slice(0, 16).map((item) => ({
+                        inputId: typeof item?.inputId === "string" ? item.inputId : null,
+                        inputRevision: Number.isSafeInteger(item?.inputRevision)
+                          ? item.inputRevision
+                          : null,
+                        status: item?.status,
+                        issueErrorCode:
+                          typeof item?.issue?.errorCode === "string" ? item.issue.errorCode : null,
+                        attachmentCount: Array.isArray(item?.attachments)
+                          ? item.attachments.length
+                          : null,
+                      }))
+                    : [],
+                  turnIsTerminal: turns.some(
+                    (turn) =>
+                      turn?.turnId === queue?.turnId &&
+                      ["completed", "failed", "cancelled"].includes(turn?.status),
+                  ),
+                },
+          contextUsage:
+            snapshot.contextUsage === null
+              ? null
+              : {
+                  fields: Object.keys(contextUsage ?? {}).sort(),
+                  certainty: contextUsage?.certainty,
+                  modelRound: contextUsage?.modelRound,
+                  hasTurnOwner: turns.some((turn) => turn?.turnId === contextUsage?.turnId),
+                },
+          bodyTextPreview: globalThis.document.body.innerText.slice(0, 1_000),
+        };
+      } catch (error) {
+        const candidate = error !== null && typeof error === "object" ? error : {};
+        return {
+          status: "rejected",
+          errorCode: typeof candidate.code === "string" ? candidate.code : "unknown",
+        };
+      }
+    }, expectedThreadId);
+  } catch {
+    return { status: "capture_unavailable" };
+  }
+}
+
+/**
+ * 从真实 WebView2 读取 Files 布局和唯一滚动端口；Arborist 的 `role=tree` 是固定高的
+ * 键盘容器，react-window 子节点才拥有 overflow，因此必须按浏览器计算样式识别滚动
+ * 责任，不能把 ARIA 节点误当 scrollport。几何只验收相对契约，避免 DPI 变化制造假失败。
  */
 async function captureFilesTreeGeometry(filesWorkspace) {
   return filesWorkspace.evaluate((workspace) => {
@@ -3994,6 +8341,30 @@ async function captureFilesTreeGeometry(filesWorkspace) {
     ) {
       return { valid: false, reason: "missing_files_geometry_surface" };
     }
+    const scrollports = [...tree.querySelectorAll("*")].filter((candidate) => {
+      if (!(candidate instanceof globalThis.HTMLElement)) return false;
+      const overflowY = globalThis.getComputedStyle(candidate).overflowY;
+      return overflowY === "auto" || overflowY === "scroll";
+    });
+    const scrollport = tree.firstElementChild;
+    if (
+      scrollports.length !== 1 ||
+      !(scrollport instanceof globalThis.HTMLElement) ||
+      scrollports[0] !== scrollport
+    ) {
+      return {
+        valid: false,
+        reason: "files_scrollport_cardinality",
+        scrollportCount: scrollports.length,
+        candidates: scrollports.slice(0, 4).map((candidate) => ({
+          tagName: candidate.tagName,
+          className: candidate.className,
+          clientHeight: candidate.clientHeight,
+          scrollHeight: candidate.scrollHeight,
+          overflowY: globalThis.getComputedStyle(candidate).overflowY,
+        })),
+      };
+    }
     const explorerRect = explorer.getBoundingClientRect();
     const hostRect = host.getBoundingClientRect();
     const toolbarRect = toolbar.getBoundingClientRect();
@@ -4008,8 +8379,31 @@ async function captureFilesTreeGeometry(filesWorkspace) {
       viewportBottom: viewportRect.bottom,
       treeClientHeight: tree.clientHeight,
       treeScrollHeight: tree.scrollHeight,
-      overflowY: tree.scrollHeight > tree.clientHeight + 1,
+      scrollportClientHeight: scrollport.clientHeight,
+      scrollportScrollHeight: scrollport.scrollHeight,
+      scrollportScrollTop: scrollport.scrollTop,
+      scrollportOverflowY: globalThis.getComputedStyle(scrollport).overflowY,
+      overflowY: scrollport.scrollHeight > scrollport.clientHeight + 1,
     };
+  });
+}
+
+/**
+ * 对 Arborist 唯一 scrollport 做一次短距离原生 DOM 滚动并回读；只改变 E2E fixture 的
+ * 瞬时视口，不触碰业务状态，用于证明 WebView2 中滚动端口不只是拥有较大的占位高度。
+ */
+async function exerciseFilesTreeScroll(filesWorkspace) {
+  return filesWorkspace.evaluate((workspace) => {
+    const tree = workspace.querySelector('.ja-file-tree-viewport [role="tree"]');
+    const scrollport = tree?.firstElementChild;
+    if (!(scrollport instanceof globalThis.HTMLElement)) {
+      return { valid: false, reason: "missing_files_scrollport" };
+    }
+    const maximum = Math.max(0, scrollport.scrollHeight - scrollport.clientHeight);
+    const requested = Math.min(60, maximum);
+    const before = scrollport.scrollTop;
+    scrollport.scrollTop = requested;
+    return { valid: true, before, requested, after: scrollport.scrollTop, maximum };
   });
 }
 
@@ -4110,8 +8504,12 @@ async function captureUiEvidence(page, directories, parentSignal) {
       cancelButtonCount,
       alerts,
       timeline,
+      composerQueue,
       tauriEvents,
       turnStartInvokeLifecycle,
+      threadListInvokeLifecycle,
+      threadReadInvokeLifecycle,
+      attachmentPickerEvidence,
       workspaceEvents,
       workspaceInvokeLifecycle,
       nativeShortcutEvents,
@@ -4119,6 +8517,7 @@ async function captureUiEvidence(page, directories, parentSignal) {
       filesState,
       terminalState,
       reducerState,
+      authoritativeThreadSnapshot,
       runtimeStartup,
     ] = await Promise.all([
       read(() => page.locator('textarea[aria-label="消息"]').inputValue(), "<unavailable>"),
@@ -4126,8 +8525,23 @@ async function captureUiEvidence(page, directories, parentSignal) {
       read(() => page.locator('button[aria-label="取消"]').count(), -1),
       read(() => page.locator('[role="alert"]').allTextContents(), []),
       read(() => page.locator('[aria-label="对话时间线"]').innerText(), "<unavailable>"),
+      read(
+        () =>
+          page.locator(".ja-composer-queue__item").evaluateAll((items) =>
+            items.slice(0, 16).map((item) => ({
+              dataState: item.getAttribute("data-state"),
+              dataKind: item.getAttribute("data-kind"),
+              attachmentCount: item.querySelectorAll(".ja-composer-queue__attachment").length,
+              issueVisible: item.querySelector('[role="alert"]') !== null,
+            })),
+          ),
+        [],
+      ),
       read(() => captureRawTauriEvents(page), []),
       read(() => tauriInvokeTrace(page, "ja_turn_start"), []),
+      read(() => tauriInvokeTrace(page, "ja_thread_list"), []),
+      read(() => tauriInvokeTrace(page, "ja_thread_read"), []),
+      read(() => captureAttachmentPickerEvidence(page), { unavailable: true }),
       read(() => captureWorkspaceWatcherEvents(page), { status: "unavailable", events: [] }),
       read(() => captureWorkspaceInvokeLifecycle(page), { unavailable: true }),
       read(() => captureNativeShortcutEvents(page), { status: "unavailable", events: [] }),
@@ -4135,6 +8549,7 @@ async function captureUiEvidence(page, directories, parentSignal) {
       read(() => captureFilesWorkspaceState(page), { unavailable: true }),
       read(() => captureTerminalWorkspaceState(page), { unavailable: true }),
       read(() => captureTimelineReducerState(page), { unavailable: true }),
+      read(() => captureAuthoritativeThreadSnapshot(page), { status: "unavailable" }),
       read(() => captureRuntimeStartupState(page), { unavailable: true }),
     ]);
     return {
@@ -4143,8 +8558,12 @@ async function captureUiEvidence(page, directories, parentSignal) {
       cancelButtonCount,
       alerts: alerts.map((value) => redact(value, directories)),
       timeline: redact(timeline, directories),
+      composerQueue,
       tauriEvents,
       turnStartInvokeLifecycle,
+      threadListInvokeLifecycle,
+      threadReadInvokeLifecycle,
+      attachmentPickerEvidence,
       workspaceEvents,
       workspaceInvokeLifecycle,
       nativeShortcutEvents,
@@ -4152,6 +8571,12 @@ async function captureUiEvidence(page, directories, parentSignal) {
       filesState,
       terminalState,
       reducerState,
+      authoritativeThreadSnapshot: {
+        ...authoritativeThreadSnapshot,
+        ...(typeof authoritativeThreadSnapshot.bodyTextPreview === "string"
+          ? { bodyTextPreview: redact(authoritativeThreadSnapshot.bodyTextPreview, directories) }
+          : {}),
+      },
       runtimeStartup,
     };
   } finally {
@@ -4295,6 +8720,7 @@ async function selectThreadById(page, threadId, deadline, signal) {
     threadId,
     { timeout: Math.max(1, deadline - Date.now()) },
   );
+  await waitForComposerFocus(page, deadline);
 }
 
 /** hard reload 后通过公开标题栏控件恢复持久化收起的导航，不直接改偏好存储。 */
@@ -4331,6 +8757,21 @@ async function selectProjectThreadById(page, threadId, deadline, signal) {
       timeout: Math.max(1, deadline - Date.now()),
     },
   );
+  const target = page.locator(`[aria-label="最近对话列表"] button[data-thread-id="${threadId}"]`);
+  const recoveryError = page.getByRole("alert").filter({ hasText: "历史会话" });
+  await waitForCondition(
+    "project thread restore",
+    async () => (await target.isVisible()) || (await recoveryError.count()) > 0,
+    deadline,
+    signal,
+  );
+  if (!(await target.isVisible())) {
+    const lifecycle = {
+      list: await tauriInvokeTrace(page, "ja_thread_list"),
+      read: await tauriInvokeTrace(page, "ja_thread_read"),
+    };
+    throw new Error(`项目 Thread 恢复失败：${JSON.stringify(lifecycle)}`);
+  }
   await selectThreadById(page, threadId, deadline, signal);
 }
 
@@ -4416,7 +8857,7 @@ function tauriProcessIds(tree, snapshot, preexistingJaIdentities = []) {
  * owner 复验同时保护用户正在运行的其它 Ja。先走用户真实的右键路径；Windows 11 XAML
  * 代理在浮层切换后可能立即失效，键盘兜底必须重新打开浮层并重新获取元素，菜单 owner 仍须复验。
  */
-async function requestTrayExit(processIds, signal) {
+export async function requestTrayExit(processIds, signal) {
   throwIfAborted(signal);
   const targetPids = [...new Set(processIds)].filter(
     (pid) => Number.isSafeInteger(pid) && pid > 0 && pid <= 0xffff_ffff,
@@ -5761,7 +10202,11 @@ function productProcessEntries(observed, directories, preexistingJaIdentities = 
   });
 }
 
-/** 停止 watcher 后只等待本轮 identity；exit trace 与进程归零是 shortcut cleanup 的外部边界。 */
+/**
+ * 停止 watcher 后只处理本轮 identity。完整桌面 Gate 必须通过托盘退出与 exit trace；
+ * 聚焦性能 Gate 不验收退出语义，改走 owner-verified tree cleanup，避免 Windows 通知区
+ * 物理交互阻断与 workspace switch 无关的测量，同时仍要求新鲜快照、进程归零和既有 Ja 守卫。
+ */
 async function cleanupPhase(
   runId,
   phase,
@@ -5773,7 +10218,12 @@ async function cleanupPhase(
   directories,
   evidence,
   runSignal,
+  cleanupMode = "tray_exit",
 ) {
+  if (cleanupMode !== "tray_exit" && cleanupMode !== "owned_tree") {
+    throw new Error(`${phase} cleanup mode 无效: ${cleanupMode}`);
+  }
+  const requireTrayExit = cleanupMode === "tray_exit";
   let failure;
   let finalTree = { live: [], reused: [], incompleteLive: [], snapshotStatus: "not_captured" };
   let tauriPids = [];
@@ -5811,7 +10261,7 @@ async function cleanupPhase(
       failure ??= new Error(`${phase} 未观察到本轮产品进程身份`);
     }
     tauriPids = tauriProcessIds(observed, current, preexistingJaIdentities);
-    if (tauriPids.length > 0) {
+    if (requireTrayExit && tauriPids.length > 0) {
       try {
         exitRequest = {
           status: "requested",
@@ -5822,39 +10272,49 @@ async function cleanupPhase(
         // “进程仍存活”覆盖根因，同时 force cleanup 仍按精确 owned tree 继续执行。
         failure ??= new Error(`${phase} 托盘退出请求失败`, { cause: error });
       }
-    }
-    try {
-      const productGrace = await waitForTreeGone(
-        productObserved,
-        graceful.deadline,
-        graceful.signal,
-      );
-      const settledGrace = await settleGracefulProductObservation(
-        phase,
-        productObserved,
-        productGrace,
-      );
-      gracefulSnapshot = {
-        status: settledGrace.snapshotStatus ?? "fresh",
-        error: settledGrace.snapshotError,
+    } else if (!requireTrayExit) {
+      exitRequest = {
+        status: "not_exercised",
+        reason: "workspace_switch_performance_owned_tree_cleanup",
       };
-      productLiveAfterGrace = settledGrace.live;
-      failure ??= settledGrace.failure;
-    } catch (error) {
-      if (graceful.signal.aborted && productObserved.size > 0) {
-        const settledGrace = await settleGracefulProductObservation(phase, productObserved, {
-          aborted: true,
-          live: [],
-        });
+    }
+    if (requireTrayExit) {
+      try {
+        const productGrace = await waitForTreeGone(
+          productObserved,
+          graceful.deadline,
+          graceful.signal,
+        );
+        const settledGrace = await settleGracefulProductObservation(
+          phase,
+          productObserved,
+          productGrace,
+        );
         gracefulSnapshot = {
           status: settledGrace.snapshotStatus ?? "fresh",
           error: settledGrace.snapshotError,
         };
         productLiveAfterGrace = settledGrace.live;
         failure ??= settledGrace.failure;
-      } else if (!graceful.signal.aborted) {
-        failure ??= error;
+      } catch (error) {
+        if (graceful.signal.aborted && productObserved.size > 0) {
+          const settledGrace = await settleGracefulProductObservation(phase, productObserved, {
+            aborted: true,
+            live: [],
+          });
+          gracefulSnapshot = {
+            status: settledGrace.snapshotStatus ?? "fresh",
+            error: settledGrace.snapshotError,
+          };
+          productLiveAfterGrace = settledGrace.live;
+          failure ??= settledGrace.failure;
+        } else if (!graceful.signal.aborted) {
+          failure ??= error;
+        }
       }
+    } else {
+      gracefulSnapshot = { status: "not_exercised" };
+      productLiveAfterGrace = [...productObserved.values()];
     }
   } catch (error) {
     if (!graceful.signal.aborted) {
@@ -5890,7 +10350,7 @@ async function cleanupPhase(
     forcedDevTree = [...observed.values()].filter((entry) =>
       afterGrace.some((candidate) => sameProcessIdentity(entry, candidate)),
     );
-    if (liveAfterForce.length > 0) {
+    if (requireTrayExit && liveAfterForce.length > 0) {
       failure ??= new Error(`${phase} 产品进程在 graceful deadline 后仍存活`);
     }
     force = createDeadline(`${phase} force cleanup`, closeDeadlineMs);
@@ -5926,6 +10386,7 @@ async function cleanupPhase(
   }
 
   evidence[phase].process = {
+    cleanupMode,
     root:
       rootIdentity === undefined ? undefined : summarizeProcessIdentity(rootIdentity, directories),
     observed: [...observed.values()].map((entry) => summarizeProcessIdentity(entry, directories)),
@@ -5967,7 +10428,7 @@ async function cleanupPhase(
     ...exitTrace,
     outcome: exitTrace.status === "complete" ? "complete" : "incomplete",
   };
-  if (exitTrace.status !== "complete") {
+  if (requireTrayExit && exitTrace.status !== "complete") {
     failure ??= new Error(`${phase} exit trace ${exitTrace.status}`);
   }
   evidence.tree.push({
@@ -5984,16 +10445,34 @@ async function cleanupPhase(
   }
   evidence[phase].nativeShortcutExitCleanup = {
     status:
+      requireTrayExit &&
       exitTrace.status === "complete" &&
       finalTree.snapshotStatus === "fresh" &&
       finalTree.live.length === 0 &&
       (finalTree.incompleteLive?.length ?? 0) === 0
         ? "passed"
-        : "failed",
+        : requireTrayExit
+          ? "failed"
+          : "not_exercised",
     fullExitTrace: exitTrace.status === "complete",
     ownedProcessesGone:
       finalTree.live.length === 0 && (finalTree.incompleteLive?.length ?? 0) === 0,
     registryBoundary: "private_not_exposed_process_exit_is_final_controller_cleanup",
+  };
+  evidence[phase].ownedTreeCleanup = {
+    status:
+      !requireTrayExit &&
+      rootIdentity !== undefined &&
+      finalTree.snapshotStatus === "fresh" &&
+      finalTree.live.length === 0 &&
+      (finalTree.incompleteLive?.length ?? 0) === 0
+        ? "passed"
+        : requireTrayExit
+          ? "not_exercised"
+          : "failed",
+    ownerVerified: rootIdentity !== undefined,
+    ownedProcessesGone:
+      finalTree.live.length === 0 && (finalTree.incompleteLive?.length ?? 0) === 0,
   };
   const preexistingVerification = await verifyPreexistingJaGuard(
     preexistingJaIdentities,
@@ -6008,8 +10487,8 @@ async function cleanupPhase(
 
 /**
  * 使用与正式 Gate 相同的生产 binary、窗口配置、Java sidecar 和隔离目录预热 WebView2 UDF，
- * 但不开放 CDP。完成 profile ACK 后仍走真实托盘退出、exit trace、进程归零与既有 JA 守卫，
- * 使 fresh-profile 适配不会弱化两轮正式桌面验收或遗留额外产品进程。
+ * 但不开放 CDP。调用方显式选择 cleanup mode：完整 Gate 保持真实托盘退出，聚焦性能 Gate
+ * 只验收 owner-verified tree cleanup；两者都要求进程归零与既有 Ja 守卫。
  */
 async function primeWebViewProfile({
   runId,
@@ -6022,6 +10501,7 @@ async function primeWebViewProfile({
   preexistingJaIdentities,
   evidence,
   runDeadline,
+  cleanupMode = "tray_exit",
 }) {
   const phase = "profilePrime";
   const exitTracePath = join(directories.runtime, `ja-exit-trace-${runId}-${phase}.jsonl`);
@@ -6087,6 +10567,7 @@ async function primeWebViewProfile({
         directories,
         evidence,
         runDeadline.signal,
+        cleanupMode,
       );
     } finally {
       evidence[phase].launcher = launcherOutputSummary(launch, directories);
@@ -6097,11 +10578,12 @@ async function primeWebViewProfile({
 }
 
 /**
- * 在单一本地预算内验证 Codex 风格 shell，并报告最后一个语义 checkpoint。
- * 控件缺失时必须趁页面仍可检查立即失败，避免耗尽整轮 deadline 并抹去证据。
+ * 在独立于模型 Turn 的单一本地预算内验证 Codex 风格 shell，并报告最后一个语义 checkpoint。
+ * 控件缺失时必须趁页面仍可检查立即失败，避免耗尽整轮 deadline 并抹去证据；预算只覆盖
+ * 两个真实 pointer drag、键盘焦点与视觉采样，不放宽产品自身的交互边界。
  */
 async function assertCodexShellStructure(page, deadline, signal, recordStage) {
-  const structureDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  const structureDeadline = Math.min(deadline, Date.now() + codexShellDeadlineMs);
   const timeout = () => Math.max(1, structureDeadline - Date.now());
   const stage = (name) => recordStage?.(`codex_shell:${name}`);
   throwIfAborted(signal);
@@ -6120,11 +10602,21 @@ async function assertCodexShellStructure(page, deadline, signal, recordStage) {
   }
   stage("layout");
   const structure = await page.evaluate(() => {
+    const navigationContent = globalThis.document.querySelector(".ja-navigation-content");
     const projects = globalThis.document.querySelector(".ja-navigation-projects");
+    const projectList = globalThis.document.querySelector(".ja-navigation-project-list");
     const history = globalThis.document.querySelector(".ja-navigation-history");
+    const historyList = globalThis.document.querySelector(".ja-navigation-history-list");
     const runtime = globalThis.document.querySelector(".ja-navigation-runtime");
     const settings = globalThis.document.querySelector(".ja-navigation-settings");
     const titlebar = globalThis.document.querySelector(".ja-titlebar");
+    const navigationStyle =
+      navigationContent === null ? undefined : globalThis.getComputedStyle(navigationContent);
+    const projectStyle = projects === null ? undefined : globalThis.getComputedStyle(projects);
+    const projectListStyle =
+      projectList === null ? undefined : globalThis.getComputedStyle(projectList);
+    const historyListStyle =
+      historyList === null ? undefined : globalThis.getComputedStyle(historyList);
     const follows = (first, second) =>
       first !== null &&
       second !== null &&
@@ -6134,10 +10626,35 @@ async function assertCodexShellStructure(page, deadline, signal, recordStage) {
       runtimeBeforeSettings: follows(runtime, settings),
       titlebarText: titlebar?.textContent?.trim() ?? "",
       captionCount: globalThis.document.querySelectorAll(".ja-titlebar-caption").length,
+      navigationOverflowY: navigationStyle?.overflowY,
+      navigationScrollbarGutter: navigationStyle?.scrollbarGutter,
+      navigationScrollbarWidth: navigationStyle?.scrollbarWidth,
+      navigationScrollbarColor: navigationStyle?.scrollbarColor,
+      projectMaxHeight: projectStyle?.maxHeight,
+      projectListOverflowY: projectListStyle?.overflowY,
+      historyListOverflowY: historyListStyle?.overflowY,
+      projectListNaturalHeight:
+        projectList !== null && projectList.clientHeight + 1 >= projectList.scrollHeight,
+      historyListNaturalHeight:
+        historyList !== null && historyList.clientHeight + 1 >= historyList.scrollHeight,
     };
   });
   if (!structure.projectsBeforeHistory || !structure.runtimeBeforeSettings) {
     throw new Error("Codex shell 区域顺序不符合项目、对话、状态、设置的约束");
+  }
+  if (
+    structure.navigationOverflowY !== "auto" ||
+    !String(structure.navigationScrollbarGutter).includes("stable") ||
+    structure.navigationScrollbarWidth !== "thin" ||
+    !structure.navigationScrollbarColor ||
+    structure.navigationScrollbarColor === "auto" ||
+    structure.projectMaxHeight !== "none" ||
+    structure.projectListOverflowY !== "visible" ||
+    structure.historyListOverflowY !== "visible" ||
+    !structure.projectListNaturalHeight ||
+    !structure.historyListNaturalHeight
+  ) {
+    throw new Error(`导航栏未形成单一主题化滚动面：${JSON.stringify(structure)}`);
   }
   stage("navigation_sections");
   const projectToggle = page.getByRole("button", { name: "折叠项目", exact: true });
@@ -6170,10 +10687,59 @@ async function assertCodexShellStructure(page, deadline, signal, recordStage) {
   if (!Number.isFinite(navigationSizeBefore) || navigationBox === null)
     throw new Error("导航栏分隔器缺少真实尺寸");
   const navigationX = navigationBox.x + navigationBox.width / 2;
-  const navigationY = navigationBox.y + navigationBox.height / 2;
-  await page.mouse.move(navigationX, navigationY);
+  const navigationTopY = navigationBox.y + navigationBox.height * 0.25;
+  const navigationBottomY = navigationBox.y + navigationBox.height * 0.75;
+  await page.mouse.move(navigationX, navigationTopY);
+  await waitForCondition(
+    "导航栏光带跟随上部指针",
+    async () => {
+      const visual = await readResizeHandleVisual(navigationSeparator);
+      return Math.abs(Number.parseFloat(visual.pointerY) - 25) <= 0.5 && visual.opacity >= 0.8;
+    },
+    structureDeadline,
+    signal,
+  );
+  await captureVisualEvidence(
+    page,
+    `implementation-navigation-spotlight-top-${visualTheme}-native.png`,
+  );
+  await page.mouse.move(navigationX, navigationBottomY);
+  await waitForCondition(
+    "导航栏光带跟随下部指针",
+    async () => {
+      const visual = await readResizeHandleVisual(navigationSeparator);
+      return Math.abs(Number.parseFloat(visual.pointerY) - 75) <= 0.5 && visual.opacity >= 0.8;
+    },
+    structureDeadline,
+    signal,
+  );
+  const navigationHoverVisual = await readResizeHandleVisual(navigationSeparator);
+  if (
+    !navigationHoverVisual.sharedClass ||
+    navigationHoverVisual.accent === "" ||
+    navigationHoverVisual.focus === "" ||
+    !navigationHoverVisual.backgroundImage.includes("gradient")
+  )
+    throw new Error(`导航栏光带未消费主题渐变：${JSON.stringify(navigationHoverVisual)}`);
+  await captureVisualEvidence(
+    page,
+    `implementation-navigation-spotlight-bottom-${visualTheme}-native.png`,
+  );
   await page.mouse.down();
-  await page.mouse.move(navigationX + 48, navigationY, { steps: 6 });
+  await page.mouse.move(navigationX + 48, navigationBottomY, { steps: 6 });
+  await waitForCondition(
+    "导航栏光带在命中区外保持拖动追踪",
+    async () => {
+      const visual = await readResizeHandleVisual(navigationSeparator);
+      return (
+        visual.dragging &&
+        Math.abs(Number.parseFloat(visual.pointerY) - 75) <= 0.5 &&
+        visual.opacity >= 0.99
+      );
+    },
+    structureDeadline,
+    signal,
+  );
   await page.mouse.up();
   await page.waitForFunction(
     (before) =>
@@ -6187,7 +10753,31 @@ async function assertCodexShellStructure(page, deadline, signal, recordStage) {
     { timeout: timeout() },
   );
   const navigationSizeAfter = Number(await navigationSeparator.getAttribute("aria-valuenow"));
+  await page.mouse.move(navigationX + 96, navigationBottomY);
+  await waitForCondition(
+    "导航栏 idle 离开后清理光带坐标",
+    async () => (await readResizeHandleVisual(navigationSeparator)).pointerY === "",
+    structureDeadline,
+    signal,
+  );
   await navigationSeparator.focus();
+  // Playwright 的程序化 focus 不会把 Chromium 输入模态从 mouse 切换为 keyboard；用一对可逆
+  // 方向键触发真实键盘路径，既形成 :focus-visible，又不改变最终持久宽度。
+  await navigationSeparator.press("ArrowLeft");
+  await navigationSeparator.press("ArrowRight");
+  await waitForCondition(
+    "导航栏键盘焦点使用中心主题光带",
+    async () => {
+      const visual = await readResizeHandleVisual(navigationSeparator);
+      return visual.focused && visual.pointerY === "" && visual.opacity >= 0.8;
+    },
+    structureDeadline,
+    signal,
+  );
+  await captureVisualEvidence(
+    page,
+    `implementation-navigation-spotlight-focus-center-${visualTheme}-native.png`,
+  );
   await page.keyboard.press("ArrowLeft");
   await page.keyboard.press("ArrowRight");
   if (
@@ -6248,8 +10838,9 @@ async function assertCodexShellStructure(page, deadline, signal, recordStage) {
 }
 
 /**
- * 从只读 native snapshot、生命周期事件与可见失败页提取最小启动证据。三条信号必须同时保留，
- * 因为 start_failed 后权威 snapshot 可能已回落为 stopped，而仅看最终状态会丢失真实失败终态。
+ * 从只读 native snapshot、生命周期事件、App Shell 结构与可见失败页提取最小启动证据。
+ * 结构证据只记录闭集状态，不读取页面正文，既能区分侧栏合法隐藏与 React 未挂载，也避免把
+ * 工作区路径、对话正文或凭据带入持久化 E2E summary。
  */
 async function captureRuntimeStartupState(page) {
   return page
@@ -6296,6 +10887,22 @@ async function captureRuntimeStartupState(page) {
           accessibleName: element.getAttribute("aria-label"),
           text: element.textContent?.trim().slice(0, 160) ?? "",
         }));
+      const shell = globalThis.document.querySelector('.ja-shell[data-app-ready="true"]');
+      const layout = globalThis.document.querySelector(".ja-layout");
+      const sidebarToggle = globalThis.document.querySelector(
+        'button[aria-label="显示侧边栏"], button[aria-label="隐藏侧边栏"]',
+      );
+      const appSurface = {
+        documentReadyState: globalThis.document.readyState,
+        appShellReady: shell instanceof globalThis.HTMLElement,
+        settingsVisible: globalThis.document.querySelector(".ja-settings-view") !== null,
+        layoutClassName: layout?.getAttribute("class") ?? undefined,
+        titlebarPresent: globalThis.document.querySelector(".ja-titlebar") !== null,
+        sidebarToggleLabel: sidebarToggle?.getAttribute("aria-label") ?? undefined,
+        innerWidth: globalThis.innerWidth,
+        innerHeight: globalThis.innerHeight,
+        bodyChildCount: globalThis.document.body?.children.length ?? 0,
+      };
       const failure = globalThis.document.querySelector(".ja-error-state");
       const failureSurface =
         failure instanceof globalThis.HTMLElement
@@ -6307,20 +10914,22 @@ async function captureRuntimeStartupState(page) {
                 .map((button) => button.textContent?.trim().slice(0, 80) ?? ""),
             }
           : undefined;
-      return { nativeState, statusEvents, runtimeSurface, failureSurface };
+      return { nativeState, statusEvents, runtimeSurface, appSurface, failureSurface };
     })
     .catch(() => ({
       nativeState: { status: "unavailable" },
       statusEvents: [],
       runtimeSurface: [],
+      appSurface: { documentReadyState: "unavailable", appShellReady: false },
       captureUnavailable: true,
     }));
 }
 
 /**
  * 侧栏把 runtime 健康度建模为只读 status，设置入口是相邻的独立按钮；轮询同时监听
- * crashed/incompatible/faulted/recovery_required 与产品失败页，使确定失败立即携带现场退出，
- * 而正常冷启动仍拥有独立的局部预算，不会消耗整轮 15 分钟期限。
+ * crashed/incompatible/faulted/recovery_required 与产品失败页，使确定失败立即携带现场退出。
+ * 失败摘要额外读取 probe 已捕获的 start 阶段与稳定错误码，不重试有副作用的启动命令；
+ * 正常冷启动仍拥有独立局部预算，不会消耗整轮场景期限。
  */
 async function waitForRuntimeReady(page, deadline, signal) {
   const readyDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
@@ -6346,7 +10955,12 @@ async function waitForRuntimeReady(page, deadline, signal) {
       terminalFailures.has(observed.nativeState.status) ||
       observed.failureSurface !== undefined
     ) {
-      throw new Error(`本地运行时启动已进入失败终态：${JSON.stringify(observed)}`);
+      const startLifecycle = (await tauriInvokeTrace(page, "ja_runtime_start")).map(
+        ({ phase, errorCode }) => ({ phase, errorCode }),
+      );
+      throw new Error(
+        `本地运行时启动已进入失败终态：${JSON.stringify({ ...observed, startLifecycle })}`,
+      );
     }
     await waitForDelay(250, signal);
   }
@@ -6354,8 +10968,8 @@ async function waitForRuntimeReady(page, deadline, signal) {
 }
 
 /**
- * 用两个只读原生命令区分“通用 Workspace 不可用”“Thread list 被 Rust 拒绝”和
- * “Thread 已创建但 renderer 解码失败”。证据只保留状态、错误码和字段名，不复制路径或正文。
+ * 用三个只读原生命令区分“通用 Workspace 不可用”“Thread list/read 被 Rust 拒绝”和
+ * “Thread 已创建但 renderer 严格解码失败”。证据只保留状态、数量、错误码和字段名。
  */
 async function captureInitialHistoryState(page) {
   return page
@@ -6391,6 +11005,38 @@ async function captureInitialHistoryState(page) {
           first?.preferences !== null && typeof first?.preferences === "object"
             ? first.preferences
             : undefined;
+        let threadRead = { status: "skipped" };
+        if (typeof first?.threadId === "string") {
+          try {
+            const readValue = await invoke("ja_thread_read", {
+              input: { threadId: first.threadId },
+            });
+            const read = readValue !== null && typeof readValue === "object" ? readValue : {};
+            const turns = Array.isArray(read.turns) ? read.turns : [];
+            const timelineItems = Array.isArray(read.items) ? read.items : [];
+            threadRead = {
+              status: readValue !== null && typeof readValue === "object" ? "resolved" : "invalid",
+              fields: Object.keys(read).sort(),
+              turnCount: turns.length,
+              itemCount: timelineItems.length,
+              firstTurnFields:
+                turns[0] !== null && typeof turns[0] === "object"
+                  ? Object.keys(turns[0]).sort()
+                  : [],
+              firstItemFields:
+                timelineItems[0] !== null && typeof timelineItems[0] === "object"
+                  ? Object.keys(timelineItems[0]).sort()
+                  : [],
+            };
+          } catch (error) {
+            const candidate = error !== null && typeof error === "object" ? error : {};
+            threadRead = {
+              status: "rejected",
+              errorCode: errorCode(error),
+              errorFields: Object.keys(candidate).sort(),
+            };
+          }
+        }
         return {
           workspace,
           threadList: {
@@ -6399,6 +11045,7 @@ async function captureInitialHistoryState(page) {
             firstFields: first === undefined ? [] : Object.keys(first).sort(),
             preferenceFields: preferences === undefined ? [] : Object.keys(preferences).sort(),
           },
+          threadRead,
         };
       } catch (error) {
         return { workspace, threadList: { status: "rejected", errorCode: errorCode(error) } };
@@ -6502,7 +11149,8 @@ async function waitForComposerAdmission(page, deadline) {
 
 /**
  * 证明无项目流程没有静默绑定确定性的 E2E picker。项目入口以当前唯一的左栏“添加项目”
- * 为准；项目列表必须选中显式 general 行，真实项目不得冒充当前范围。
+ * 为准；项目列表必须在调用方期限内收敛到显式 general 行。切换提交跨 React/native 异步边界，
+ * 因此不能在 pointer click 返回后立即采样，否则会把仍在推进的旧 project 投影误报成失败。
  */
 async function assertGeneralConversationScope(page, deadline) {
   const scopeDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
@@ -6514,14 +11162,36 @@ async function assertGeneralConversationScope(page, deadline) {
   await page
     .getByRole("button", { name: "添加项目", exact: true })
     .waitFor({ state: "visible", timeout: timeout() });
-  const selectedGeneral = await page
-    .locator('[aria-label="项目列表"] button[data-scope-kind="general"][aria-current="page"]')
-    .count();
-  const selectedProjects = await page
-    .locator('[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]')
-    .count();
-  if (selectedGeneral !== 1 || selectedProjects !== 0)
-    throw new Error("无项目对话范围的显式选中状态不闭环");
+  try {
+    await page.waitForFunction(
+      () => {
+        const list = globalThis.document.querySelector('[aria-label="项目列表"]');
+        if (list === null) return false;
+        const selectedGeneral = list.querySelectorAll(
+          'button[data-scope-kind="general"][aria-current="page"]',
+        );
+        const selectedProjects = list.querySelectorAll(
+          'button[data-scope-kind="project"][aria-current="page"]',
+        );
+        return selectedGeneral.length === 1 && selectedProjects.length === 0;
+      },
+      undefined,
+      { timeout: timeout() },
+    );
+  } catch (error) {
+    const state = await page.evaluate(() =>
+      Array.from(
+        globalThis.document.querySelectorAll('[aria-label="项目列表"] button[data-scope-kind]'),
+      ).map((entry) => ({
+        kind: entry.getAttribute("data-scope-kind"),
+        current: entry.getAttribute("aria-current"),
+        label: entry.getAttribute("aria-label"),
+      })),
+    );
+    throw new Error(`无项目对话范围的显式选中状态未在期限内闭环：${JSON.stringify(state)}`, {
+      cause: error,
+    });
+  }
 }
 
 /**
@@ -6555,33 +11225,61 @@ const workbenchTabValues = Object.freeze({
   文件: "files",
   终端: "terminal",
   浏览器: "preview",
+  子智能体: "agents",
 });
 
-/** 打开真实 plus-tab launcher 并验证五个产品操作，避免绕过公开交互入口。 */
+/**
+ * 打开真实 plus-tab 菜单并验证五个当前工作台能力；局部 10 秒预算避免失效入口耗尽
+ * 整场真窗 deadline，且只按真实 role/name 契约定位 portal 中的菜单。
+ */
 async function openWorkbenchLauncher(page, deadline) {
+  const interactionDeadline = Math.min(deadline, Date.now() + 10_000);
   const trigger = page.getByRole("button", { name: "新建标签页", exact: true });
-  await trigger.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  await clickVerifiedControl(page, trigger, deadline);
-  const launcher = page.getByRole("region", { name: "新标签页启动器", exact: true });
-  await launcher.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  const actions = Object.freeze({
-    审查: "Ctrl+Shift+G",
-    终端: "Ctrl+`",
-    浏览器: "Ctrl+T",
-    文件: "Ctrl+P",
-    侧边聊天: "Ctrl+Alt+S",
+  await trigger.waitFor({
+    state: "visible",
+    timeout: Math.max(1, interactionDeadline - Date.now()),
   });
-  for (const [label, shortcut] of Object.entries(actions)) {
-    const action = launcher.locator(".ja-workbench-launcher-action").filter({ hasText: label });
+  await clickVerifiedControl(page, trigger, interactionDeadline);
+  const launcher = page.getByRole("menu", { name: "新建标签页", exact: true });
+  await launcher.waitFor({
+    state: "visible",
+    timeout: Math.max(1, interactionDeadline - Date.now()),
+  });
+  const actions = Object.freeze([
+    Object.freeze({ label: "审查", shortcut: "Ctrl+Shift+G" }),
+    Object.freeze({ label: "终端", shortcut: "Ctrl+`" }),
+    Object.freeze({ label: "浏览器", shortcut: "Ctrl+T" }),
+    Object.freeze({ label: "文件", shortcut: "Ctrl+P" }),
+    Object.freeze({ label: "子智能体" }),
+  ]);
+  for (const { label, shortcut } of actions) {
+    const action = launcher.getByRole("menuitem", { name: label });
     await action.waitFor({
       state: "visible",
-      timeout: Math.max(1, deadline - Date.now()),
+      timeout: Math.max(1, interactionDeadline - Date.now()),
     });
-    await action
-      .getByText(shortcut, { exact: true })
-      .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+    if (shortcut !== undefined) {
+      await action.getByText(shortcut, { exact: true }).waitFor({
+        state: "visible",
+        timeout: Math.max(1, interactionDeadline - Date.now()),
+      });
+    }
   }
   return launcher;
+}
+
+/**
+ * 通过已打开菜单的可访问角色选择动作；独立 10 秒预算让菜单项漂移快速暴露，
+ * 不把全局场景预算误当作单次 UI 操作超时。
+ */
+async function clickWorkbenchMenuItem(page, launcher, name, deadline) {
+  const interactionDeadline = Math.min(deadline, Date.now() + 10_000);
+  const action = launcher.getByRole("menuitem", { name });
+  await action.waitFor({
+    state: "visible",
+    timeout: Math.max(1, interactionDeadline - Date.now()),
+  });
+  await clickVerifiedControl(page, action, interactionDeadline);
 }
 
 /** 选择已有 outer tab，若不存在则通过 plus-tab launcher 创建，确保遵循唯一公开路径。 */
@@ -6597,12 +11295,9 @@ async function chooseWorkbenchTool(page, name, deadline) {
     await existing.evaluate((tab) => tab.scrollIntoView({ block: "nearest", inline: "nearest" }));
     await clickVerifiedControl(page, existing, deadline);
   } else {
-    const launcher = await openWorkbenchLauncher(page, deadline);
-    await clickVerifiedControl(
-      page,
-      launcher.locator(".ja-workbench-launcher-action").filter({ hasText: name }),
-      deadline,
-    );
+    const interactionDeadline = Math.min(deadline, Date.now() + 10_000);
+    const launcher = await openWorkbenchLauncher(page, interactionDeadline);
+    await clickWorkbenchMenuItem(page, launcher, name, interactionDeadline);
   }
   await page.locator(`[data-tab-panel="${value}"]:not([hidden])`).waitFor({
     state: "visible",
@@ -6695,8 +11390,8 @@ async function waitForWorkbenchCollapsed(workbench, deadline, signal) {
 }
 
 /**
- * 在单个有界循环中观察 Review 成功面与回退面，使 MergeView 缺失时能报告结构状态，
- * 同时绝不将 diff/editor payload 复制到 E2E 诊断。
+ * 在单个有界循环中观察 MergeView 或 native 有界 Unified 成功面与回退面；结束前保留最后
+ * 一次有效诊断，避免 1ms locator timeout 覆盖真实失败，同时绝不复制 diff/editor payload。
  */
 async function waitForReviewDiff(review, path, deadline) {
   let lastDiagnostic = {
@@ -6707,6 +11402,8 @@ async function waitForReviewDiff(review, path, deadline) {
     diffNodes: [],
   };
   while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining < 25) break;
     let observation;
     try {
       observation = await review.evaluate(
@@ -6769,12 +11466,20 @@ async function waitForReviewDiff(review, path, deadline) {
                   (element) => element.getAttribute("aria-label") === expectedLabel,
                 );
           const merge = region?.querySelector(".cm-mergeView");
+          const unified =
+            diffRoot === null
+              ? undefined
+              : [...diffRoot.querySelectorAll(".ja-review-unified[aria-label]")].find(
+                  (element) => element.getAttribute("aria-label") === `统一 Diff ${expectedPath}`,
+                );
+          const unifiedCode = unified?.querySelector(".ja-review-unified-code");
           const empty = diffRoot?.querySelector(".ja-review-empty");
           const emptyText = empty?.textContent?.replace(/\s+/gu, " ").trim() ?? "";
           const regionVisible = isVisible(region);
           const mergeVisible = isVisible(merge);
+          const unifiedVisible = isVisible(unified) && isVisible(unifiedCode);
           const state =
-            regionVisible && mergeVisible
+            (regionVisible && mergeVisible) || unifiedVisible
               ? "success"
               : empty?.classList.contains("is-error") === true
                 ? "error"
@@ -6800,7 +11505,7 @@ async function waitForReviewDiff(review, path, deadline) {
                     diffRoot,
                     ...diffRoot.children,
                     ...diffRoot.querySelectorAll(
-                      ".ja-review-empty, .ja-editor-diff, .cm-mergeView",
+                      ".ja-review-empty, .ja-editor-diff, .cm-mergeView, .ja-review-unified",
                     ),
                   ]),
                 ]
@@ -6840,6 +11545,8 @@ async function waitForReviewDiff(review, path, deadline) {
             regionVisible,
             mergeFound: merge !== null && merge !== undefined,
             mergeVisible,
+            unifiedFound: unified !== undefined,
+            unifiedVisible,
             safeVisibleText,
             targetRow: describeRow(targetRow),
             selectedRow: describeRow(selectedRow),
@@ -6879,6 +11586,8 @@ async function waitForReviewDiff(review, path, deadline) {
         regionVisible: observation.regionVisible,
         mergeFound: observation.mergeFound,
         mergeVisible: observation.mergeVisible,
+        unifiedFound: observation.unifiedFound,
+        unifiedVisible: observation.unifiedVisible,
         safeVisibleText: redact(observation.safeVisibleText),
         targetRow: sanitizeRow(observation.targetRow),
         selectedRow: sanitizeRow(observation.selectedRow),
@@ -6898,20 +11607,20 @@ async function waitForReviewDiff(review, path, deadline) {
     }
     await waitForDelay(Math.min(100, Math.max(1, deadline - Date.now())));
   }
-  throw new Error(`审查 Diff 未达到可见 MergeView 成功态：${JSON.stringify(lastDiagnostic)}`);
+  throw new Error(`审查 Diff 未达到可见安全渲染态：${JSON.stringify(lastDiagnostic)}`);
 }
 
 /**
- * 选择一个 native-owned source，并等待其权威 snapshot 可见，避免把 UI 乐观状态当作事实。
+ * 通过统一 Radix Select 的 Trigger 与 Portal option 选择固定来源，并等待 native snapshot 收敛；
+ * option 不属于 Review DOM，不能再用原生 selectOption 或从 Trigger 向下查找。
  */
 async function selectReviewSource(review, optionName, deadline) {
   const source = review.getByRole("combobox", { name: "审查来源", exact: true });
-  const option = source.getByRole("option", { name: optionName, exact: true });
-  await option.waitFor({ state: "attached", timeout: Math.max(1, deadline - Date.now()) });
-  const value = await option.getAttribute("value");
-  if (value === null) throw new Error(`审查来源缺少 value：${optionName}`);
-  await source.selectOption(value);
-  const kind = value.split(":", 1)[0];
+  await source.click({ timeout: Math.max(1, deadline - Date.now()) });
+  const option = review.page().getByRole("option", { name: optionName, exact: true });
+  await option.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await option.click({ timeout: Math.max(1, deadline - Date.now()) });
+  const kind = optionName === "未暂存" ? "unstaged" : "staged";
   await review
     .page()
     .waitForFunction(
@@ -6922,17 +11631,27 @@ async function selectReviewSource(review, optionName, deadline) {
       { expectedKind: kind },
       { timeout: Math.max(1, deadline - Date.now()) },
     );
-  return value;
+  return optionName;
 }
 
-/** 选择 catalog 实际返回的首个 Branch 或 Commit，避免测试根据显示文本伪造 Git identity。 */
+/**
+ * 打开 Portal 后从 catalog 实际渲染的选项选择首个 Branch 或 Commit；Branch 标签由 native
+ * catalog 决定，runner 只排除两个固定来源与带“提交”前缀的 Commit，不伪造 Git identity。
+ */
 async function selectReviewSourceByKind(review, kind, deadline) {
   const source = review.getByRole("combobox", { name: "审查来源", exact: true });
-  const options = source.locator(`option[value^="${kind}:"]`);
-  await options.first().waitFor({ state: "attached", timeout: Math.max(1, deadline - Date.now()) });
-  const value = await options.first().getAttribute("value");
-  if (value === null) throw new Error(`审查 catalog 缺少 ${kind} identity`);
-  await source.selectOption(value);
+  await source.click({ timeout: Math.max(1, deadline - Date.now()) });
+  const options = review.page().getByRole("option");
+  await options.first().waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  const labels = await options.allTextContents();
+  const optionIndex = labels.findIndex((label) => {
+    const normalized = label.trim();
+    if (kind === "commit") return normalized.startsWith("提交 ");
+    return normalized !== "未暂存" && normalized !== "已暂存" && !normalized.startsWith("提交 ");
+  });
+  if (optionIndex < 0) throw new Error(`审查 catalog 缺少 ${kind} identity`);
+  const selectedLabel = labels[optionIndex].trim();
+  await options.nth(optionIndex).click({ timeout: Math.max(1, deadline - Date.now()) });
   await review
     .page()
     .waitForFunction(
@@ -6943,7 +11662,7 @@ async function selectReviewSourceByKind(review, kind, deadline) {
       { expectedKind: kind },
       { timeout: Math.max(1, deadline - Date.now()) },
     );
-  return value;
+  return selectedLabel;
 }
 
 /**
@@ -6975,14 +11694,31 @@ async function exerciseNativeReviewFlow(
   const rows = review.locator(".ja-review-file-row");
   const expectedPath = "sample.ts";
   const fixtureRow = rows.filter({ hasText: expectedPath });
-  await waitForCondition(
-    "Unstaged fixture 稳定可见",
-    async () =>
-      (await review.locator(".ja-review-empty.is-loading").count()) === 0 &&
-      (await fixtureRow.count()) === 1 &&
-      (await fixtureRow.isVisible()),
-    resolvedDeadline,
-  );
+  try {
+    await waitForCondition(
+      "Unstaged fixture 稳定可见",
+      async () =>
+        (await review.locator(".ja-review-empty.is-loading").count()) === 0 &&
+        (await fixtureRow.count()) === 1 &&
+        (await fixtureRow.isVisible()),
+      resolvedDeadline,
+    );
+  } catch (failure) {
+    const diagnostic = await review.evaluate((panel) => ({
+      source: panel.getAttribute("data-source"),
+      loading: panel.querySelector(".ja-review-empty.is-loading") !== null,
+      alertCount: panel.querySelectorAll('[role="alert"]').length,
+      rowCount: panel.querySelectorAll(".ja-review-file-row").length,
+      expectedFixturePresent: Array.from(panel.querySelectorAll(".ja-review-file-row")).some(
+        (row) => row.textContent?.includes("sample.ts"),
+      ),
+    }));
+    const snapshotLifecycle = await tauriInvokeTrace(page, "ja_review_snapshot");
+    throw new Error(
+      `Unstaged fixture 未稳定：${JSON.stringify({ diagnostic, snapshotLifecycle })}`,
+      { cause: failure },
+    );
+  }
   if ((await rows.count()) === 0) {
     const result = {
       status: required ? "blocked" : "skipped",
@@ -7036,23 +11772,19 @@ async function exerciseNativeReviewFlow(
     .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   await selectReviewSource(review, "未暂存", deadline);
   await currentRow().waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  const confirmation = new Promise((resolvePromise, rejectPromise) => {
-    page.once("dialog", async (dialog) => {
-      try {
-        const type = dialog.type();
-        await dialog.accept();
-        resolvePromise(type);
-      } catch (error) {
-        rejectPromise(error);
-      }
-    });
-  });
   await clickVerifiedControl(
     page,
     currentRow().getByRole("button", { name: "撤销文件", exact: true }),
     deadline,
   );
-  if ((await confirmation) !== "confirm") throw new Error("Review Revert 未显示确认对话框");
+  const confirmation = page.getByRole("alertdialog", { name: "撤销文件变更？", exact: true });
+  await confirmation.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await clickVerifiedControl(
+    page,
+    confirmation.getByRole("button", { name: "确认撤销", exact: true }),
+    deadline,
+  );
+  await confirmation.waitFor({ state: "detached", timeout: Math.max(1, deadline - Date.now()) });
   await review
     .getByText("已撤销。", { exact: true })
     .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
@@ -7121,17 +11853,253 @@ async function closeWorkspaceExplorerWindow(workspace, signal) {
     "} while ([DateTime]::UtcNow -lt $deadline)",
     "exit 4",
   ].join("\n");
-  const { stdout } = await execFileAsync(
+  const { stdout } = await runBoundedWindowsHelper(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", script],
     {
       windowsHide: true,
-      timeout: 15_000,
       signal,
       env: { ...process.env, JA_E2E_EXPLORER_TARGET: resolvedWorkspace },
     },
+    15_000,
+    "关闭 E2E Explorer 窗口 helper",
   );
   if (!String(stdout).includes("closed")) throw new Error("未观察到 E2E 工作区 Explorer 窗口");
+}
+
+/**
+ * 用独立的本地期限执行会启动长生命周期 Windows 子进程的原生 helper。`execFile` 的 timeout
+ * 只终止直接子进程；Explorer 继承管道句柄后仍可能让回调永久等待 EOF，因此这里在超时或
+ * 全局取消时按精确 helper PID 终止整棵树，并主动收敛 Promise，不让一个拖放步骤耗尽整轮。
+ */
+function runBoundedWindowsHelper(command, args, options, timeoutMs, label) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const { signal, maxBuffer = 512 * 1024, ...spawnOptions } = options;
+    const child = spawn(command, args, {
+      ...spawnOptions,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let terminating = false;
+    /** 诊断只保留尾部有界文本，避免原生 helper 异常输出撑爆 E2E summary。 */
+    const appendBounded = (current, chunk) => {
+      const next = `${current}${String(chunk)}`;
+      return next.length <= maxBuffer ? next : next.slice(-maxBuffer);
+    };
+    child.stdout?.on("data", (chunk) => {
+      stdout = appendBounded(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = appendBounded(stderr, chunk);
+    });
+    /** 所有终态经单一闸门清理 timer/listener，防止 exit、error 与 abort 重复结算。 */
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (error === undefined) {
+        resolvePromise({ stdout, stderr });
+      } else {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        rejectPromise(error);
+      }
+    };
+    /** Windows helper 可能把管道句柄传给子进程，因此取消时按直接 PID 回收整棵 owned tree。 */
+    const terminate = (error) => {
+      if (settled || terminating) return;
+      terminating = true;
+      if (child.pid === undefined) {
+        finish(error);
+        return;
+      }
+      const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      const killDeadline = globalThis.setTimeout(() => {
+        killer.kill();
+        finish(error);
+      }, 5_000);
+      killer.once("exit", () => {
+        globalThis.clearTimeout(killDeadline);
+        finish(error);
+      });
+      killer.once("error", () => {
+        globalThis.clearTimeout(killDeadline);
+        child.kill();
+        finish(error);
+      });
+    };
+    /** 全局取消沿用原始 Error，保留稳定阶段归因而不暴露 helper 参数。 */
+    const onAbort = () => {
+      const reason = signal?.reason;
+      terminate(reason instanceof Error ? reason : new Error(String(reason ?? `${label} 已取消`)));
+    };
+    const timer = globalThis.setTimeout(
+      () => terminate(new Error(`${label} 超过 ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, exitSignal) => {
+      if (terminating) return;
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const error = new Error(
+        `${label} 退出异常：code=${String(code)} signal=${String(exitSignal)}`,
+      );
+      error.code = code;
+      error.signal = exitSignal;
+      finish(error);
+    });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+/**
+ * 启动单一 STA broker，在同一进程内保留原始 IDataObject；只有全部格式已物化后才允许测试写入。
+ * Abort 为调用方 finally 的显式 restore 保留短暂优先窗口，随后才以 EOF 兜底恢复；所有 stdin
+ * 写入经回调结算，避免进程退出与清理竞争产生未处理的 write-after-end。
+ */
+async function startWindowsClipboardFixtureBroker(signal) {
+  const child = spawn(
+    nativeInputPowerShell,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-File", clipboardFixtureBrokerPath],
+    { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  let stdoutBuffer = "";
+  let stderr = "";
+  let terminalError;
+  let restoreStarted = false;
+  let abortCloseTimer;
+  const messages = [];
+  const waiters = [];
+  /** broker 终止后一次性拒绝全部等待者，禁止后续命令误等到全局 deadline。 */
+  const rejectWaiters = (error) => {
+    terminalError = error;
+    while (waiters.length > 0) waiters.shift().reject(error);
+  };
+  /** stdout 单行 ACK 严格按 FIFO 交给命令调用者，保持 clipboard case 与结果一一对应。 */
+  const deliver = (value) => {
+    const waiter = waiters.shift();
+    if (waiter === undefined) messages.push(value);
+    else waiter.resolve(value);
+  };
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += String(chunk);
+    const lines = stdoutBuffer.split(/\r?\n/u);
+    stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines.filter(Boolean)) {
+      try {
+        deliver(JSON.parse(line));
+      } catch {
+        rejectWaiters(new Error("clipboard broker 返回了非 JSON 证据"));
+      }
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr = `${stderr}${String(chunk)}`.slice(-8_192);
+  });
+  child.stdin.on("error", (error) => rejectWaiters(error));
+  child.once("error", (error) => rejectWaiters(error));
+  child.once("exit", (code, exitSignal) => {
+    globalThis.clearTimeout(abortCloseTimer);
+    signal?.removeEventListener("abort", onAbort);
+    if (code !== 0) {
+      rejectWaiters(
+        new Error(
+          `clipboard broker 异常退出：${JSON.stringify({ code, signal: exitSignal, stderr })}`,
+        ),
+      );
+    } else {
+      rejectWaiters(new Error("clipboard broker 已关闭"));
+    }
+  });
+  /** 只结束一次 stdin，让 broker 走自身 finally 恢复剪贴板，而不是从外部强杀 STA owner。 */
+  const endInput = () => {
+    if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
+  };
+  /** Abort 先唤醒调用方 finally；若其未开始 restore，再以 EOF 兜底恢复原 IDataObject。 */
+  const onAbort = () => {
+    if (restoreStarted || abortCloseTimer !== undefined) return;
+    abortCloseTimer = globalThis.setTimeout(endInput, 5_000);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+
+  /** 写命令前复验流生命周期，并用 callback 捕获异步 pipe 错误，禁止未处理 error event。 */
+  const writeCommand = (command, label) =>
+    new Promise((resolvePromise, rejectPromise) => {
+      if (terminalError !== undefined) {
+        rejectPromise(terminalError);
+        return;
+      }
+      if (child.stdin.destroyed || child.stdin.writableEnded) {
+        rejectPromise(new Error(`${label} clipboard broker stdin 已关闭`));
+        return;
+      }
+      child.stdin.write(`${JSON.stringify(command)}\n`, (error) => {
+        if (error === null || error === undefined) resolvePromise();
+        else rejectPromise(error);
+      });
+    });
+
+  /** 每条命令必须在 10 秒内得到单行 ACK，防止剪贴板 owner 挂起整套桌面矩阵。 */
+  const next = (label) => {
+    if (messages.length > 0) return Promise.resolve(messages.shift());
+    if (terminalError !== undefined) return Promise.reject(terminalError);
+    return new Promise((resolvePromise, rejectPromise) => {
+      const waiter = {
+        resolve(value) {
+          globalThis.clearTimeout(timer);
+          resolvePromise(value);
+        },
+        reject(error) {
+          globalThis.clearTimeout(timer);
+          rejectPromise(error);
+        },
+      };
+      const timer = globalThis.setTimeout(() => {
+        const index = waiters.indexOf(waiter);
+        if (index >= 0) waiters.splice(index, 1);
+        rejectPromise(new Error(`${label} clipboard broker ACK 超时`));
+      }, 10_000);
+      waiters.push(waiter);
+    });
+  };
+  const ready = await next("startup");
+  if (ready.status !== "ready")
+    throw new Error(`clipboard broker 未就绪：${JSON.stringify(ready)}`);
+  return {
+    /** 写入一个严格格式 fixture；真实 Clipboard ownership 完成后才返回。 */
+    async set(kind, values = {}) {
+      await writeCommand({ action: "set", kind, ...values }, kind);
+      const result = await next(kind);
+      if (result.status !== "set" || result.kind !== kind) {
+        throw new Error(`clipboard fixture 写入失败：${JSON.stringify(result)}`);
+      }
+      return result;
+    },
+    /** 恢复原始 IDataObject 并核对格式集合，再允许 broker 退出。 */
+    async restore() {
+      restoreStarted = true;
+      globalThis.clearTimeout(abortCloseTimer);
+      signal?.removeEventListener("abort", onAbort);
+      await writeCommand({ action: "restore" }, "restore");
+      const result = await next("restore");
+      endInput();
+      if (result.status !== "restored" || result.formatsMatch !== true) {
+        throw new Error(`clipboard 恢复未通过：${JSON.stringify(result)}`);
+      }
+      return result;
+    },
+  };
 }
 
 /** 刷新准确的 spawned closure，并返回其中唯一的 Ja 窗口 owner。 */
@@ -7256,7 +12224,7 @@ async function invokeOwnedWindowAction(identity, action, signal, size) {
 
 const nativeTextInputMaxLength = 128;
 
-/** 固定 native input 七种形状，禁止自由脚本、越界虚拟键、坐标或文本进入 PowerShell。 */
+/** 固定 native input 六种形状，禁止自由脚本、越界虚拟键、坐标或文本进入 PowerShell。 */
 function normalizeOwnedNativeInput(operation) {
   const allowedModifiers = new Set([0x10, 0x11, 0x12, 0x5b, 0x5c, 0xa4, 0xa5]);
   if (operation?.kind === "reset_modifiers") return { kind: "reset_modifiers" };
@@ -7276,7 +12244,7 @@ function normalizeOwnedNativeInput(operation) {
       throw new Error("native chord 输入越界");
     return { kind: "chord", key: operation.key, repetitions: operation.repetitions, modifiers };
   }
-  if (operation?.kind === "text" || operation?.kind === "terminal_text") {
+  if (operation?.kind === "text") {
     const containsControlCharacter =
       typeof operation.text === "string" &&
       [...operation.text].some((character) => {
@@ -7290,7 +12258,7 @@ function normalizeOwnedNativeInput(operation) {
       containsControlCharacter
     )
       throw new Error("native text 输入越界");
-    return { kind: operation.kind, text: operation.text };
+    return { kind: "text", text: operation.text };
   }
   if (
     operation?.kind === "move" ||
@@ -7349,6 +12317,7 @@ function normalizeOwnedNativeInput(operation) {
  * DPI-safe 坐标。显式 modifier reset 只发送 key-up，用于隔离先前 CDP 或
  * SendInput 动作遗留的逻辑按键状态；输入后的 foreground 只做有界观察，
  * 容忍 child HWND 焦点切换产生的瞬时空 handle，但绝不主动抢回或接受其它进程。
+ * helper 失败只返回异常类型、HRESULT 与固定原因，不回显环境变量、路径或输入正文。
  */
 function buildOwnedNativeInputScript() {
   return [
@@ -7358,6 +12327,7 @@ function buildOwnedNativeInputScript() {
     "$expectedCommand = [Environment]::GetEnvironmentVariable('JA_E2E_WINDOW_COMMAND')",
     "$expectedMillis = [long][Environment]::GetEnvironmentVariable('JA_E2E_WINDOW_CREATED_MS')",
     "$operation = [Environment]::GetEnvironmentVariable('JA_E2E_NATIVE_INPUT') | ConvertFrom-Json",
+    "try {",
     '$row = Get-CimInstance Win32_Process -Filter "ProcessId = $pidValue"',
     "if ($null -eq $row) { throw 'owned window process vanished' }",
     "$actualMillis = ([DateTimeOffset]$row.CreationDate).ToUnixTimeMilliseconds()",
@@ -7379,6 +12349,8 @@ function buildOwnedNativeInputScript() {
     '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h,int c);',
     '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
     '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);',
+    '[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint flags);',
     '[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
     '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,IntPtr p);',
     '[DllImport("user32.dll",EntryPoint="GetWindowThreadProcessId")] public static extern uint GetWindowThreadProcessIdWithPid(IntPtr h,out uint p);',
@@ -7391,7 +12363,6 @@ function buildOwnedNativeInputScript() {
     "public static void ResetModifiers(){var v=new List<INPUT>();foreach(var k in new ushort[]{0x10,0x11,0x12,0x5B,0x5C,0xA0,0xA1,0xA2,0xA3,0xA4,0xA5})v.Add(K(k,2));S(v);}",
     "public static void Chord(ushort[] m,ushort k,int n){var v=new List<INPUT>();foreach(var x in m)v.Add(K(x,0));for(int i=0;i<n;i++)v.Add(K(k,0));v.Add(K(k,2));for(int i=m.Length-1;i>=0;i--)v.Add(K(m[i],2));S(v);}",
     "public static void Text(IntPtr h,string t){var l=GetKeyboardLayout(GetWindowThreadProcessId(h,IntPtr.Zero));foreach(char c in t){short m=VkKeyScanEx(c,l);var v=new List<INPUT>();if(m==-1){v.Add(W(c,0));v.Add(W(c,2));}else{ushort k=(ushort)(m&255);int s=(m>>8)&255;if((s&1)!=0)v.Add(K(0x10,0));if((s&2)!=0)v.Add(K(0x11,0));if((s&4)!=0)v.Add(K(0x12,0));v.Add(K(k,0));v.Add(K(k,2));if((s&4)!=0)v.Add(K(0x12,2));if((s&2)!=0)v.Add(K(0x11,2));if((s&1)!=0)v.Add(K(0x10,2));}S(v);}}",
-    "public static void TerminalText(string t){foreach(char c in t){S(new List<INPUT>{W(c,0),W(c,2)});System.Threading.Thread.Sleep(1);}}",
     "static POINT P(IntPtr h,double x,double y,double rw,double rh){RECT r;POINT p=new POINT();if(!GetClientRect(h,out r)||!ClientToScreen(h,ref p))throw new Win32Exception(Marshal.GetLastWin32Error());int w=r.Right-r.Left,q=r.Bottom-r.Top;if(w<1||q<1)throw new InvalidOperationException();p.X+=Math.Min(w-1,Math.Max(0,(int)Math.Round(x*w/rw)));p.Y+=Math.Min(q-1,Math.Max(0,(int)Math.Round(y*q/rh)));return p;}",
     "public static void Move(IntPtr h,double x,double y,double rw,double rh){var p=P(h,x,y,rw,rh);if(!SetCursorPos(p.X,p.Y))throw new Win32Exception(Marshal.GetLastWin32Error());}",
     "public static void Click(IntPtr h,double x,double y,double rw,double rh){var p=P(h,x,y,rw,rh);if(!SetCursorPos(p.X,p.Y))throw new Win32Exception(Marshal.GetLastWin32Error());S(new List<INPUT>{M(2),M(4)});}",
@@ -7404,15 +12375,17 @@ function buildOwnedNativeInputScript() {
     "if ($handle -eq [IntPtr]::Zero) { throw 'owned process has no main window handle' }",
     "if ([JaE2eNativeInput]::GetForegroundWindow() -ne $handle) { [void][JaE2eNativeInput]::ShowWindowAsync($handle,9); do { $focused=[JaE2eNativeInput]::SetForegroundWindow($handle); if(-not $focused){$focused=(New-Object -ComObject WScript.Shell).AppActivate($pidValue)}; if ([JaE2eNativeInput]::GetForegroundWindow() -eq $handle) { break }; Start-Sleep -Milliseconds 50 } while ([DateTime]::UtcNow -lt $deadline) }",
     "if ([JaE2eNativeInput]::GetForegroundWindow() -ne $handle -or [JaE2eNativeInput]::IsIconic($handle)) { throw 'owned window is not foreground' }",
-    "if($operation.kind -eq 'reset_modifiers'){[JaE2eNativeInput]::ResetModifiers()}elseif($operation.kind -eq 'chord'){[uint16[]]$m=@($operation.modifiers|ForEach-Object{[uint16]$_});[JaE2eNativeInput]::Chord($m,[uint16]$operation.key,[int]$operation.repetitions)}elseif($operation.kind -eq 'text'){[JaE2eNativeInput]::Text($handle,[string]$operation.text)}elseif($operation.kind -eq 'terminal_text'){[JaE2eNativeInput]::TerminalText([string]$operation.text)}elseif($operation.kind -eq 'move'){[JaE2eNativeInput]::Move($handle,[double]$operation.x,[double]$operation.y,[double]$operation.rendererWidth,[double]$operation.rendererHeight)}elseif($operation.kind -eq 'click'){[JaE2eNativeInput]::Click($handle,[double]$operation.x,[double]$operation.y,[double]$operation.rendererWidth,[double]$operation.rendererHeight)}elseif($operation.kind -eq 'click_chord'){[uint16[]]$m=@($operation.modifiers|ForEach-Object{[uint16]$_});[JaE2eNativeInput]::ChordClick($handle,$m,[double]$operation.x,[double]$operation.y,[double]$operation.rendererWidth,[double]$operation.rendererHeight)}else{throw 'unsupported input'}",
+    "if($operation.kind -eq 'reset_modifiers'){[JaE2eNativeInput]::ResetModifiers()}elseif($operation.kind -eq 'chord'){[uint16[]]$m=@($operation.modifiers|ForEach-Object{[uint16]$_});[JaE2eNativeInput]::Chord($m,[uint16]$operation.key,[int]$operation.repetitions)}elseif($operation.kind -eq 'text'){[JaE2eNativeInput]::Text($handle,[string]$operation.text)}elseif($operation.kind -eq 'move'){[JaE2eNativeInput]::Move($handle,[double]$operation.x,[double]$operation.y,[double]$operation.rendererWidth,[double]$operation.rendererHeight)}elseif($operation.kind -eq 'click'){[JaE2eNativeInput]::Click($handle,[double]$operation.x,[double]$operation.y,[double]$operation.rendererWidth,[double]$operation.rendererHeight)}elseif($operation.kind -eq 'click_chord'){[uint16[]]$m=@($operation.modifiers|ForEach-Object{[uint16]$_});[JaE2eNativeInput]::ChordClick($handle,$m,[double]$operation.x,[double]$operation.y,[double]$operation.rendererWidth,[double]$operation.rendererHeight)}else{throw 'unsupported input'}",
     "$rect=[JaE2eNativeInput]::Rect($handle);$foregroundDeadline=[DateTime]::UtcNow.AddMilliseconds(750);do{$foregroundHandle=[JaE2eNativeInput]::GetForegroundWindow();[uint32]$foregroundPid=0;if($foregroundHandle -ne [IntPtr]::Zero){[void][JaE2eNativeInput]::GetWindowThreadProcessIdWithPid($foregroundHandle,[ref]$foregroundPid)};if($foregroundHandle -eq $handle){break};Start-Sleep -Milliseconds 25}while([DateTime]::UtcNow -lt $foregroundDeadline);[pscustomobject]@{pid=$pidValue;kind=[string]$operation.kind;foreground=$foregroundHandle -eq $handle;foregroundPid=$foregroundPid;foregroundHandle=$foregroundHandle.ToInt64();ownedHandle=$handle.ToInt64();left=$rect.Left;top=$rect.Top;width=$rect.Right-$rect.Left;height=$rect.Bottom-$rect.Top}|ConvertTo-Json -Compress",
+    "} catch { $failure=$_.Exception.GetBaseException();$nativeError=if($failure -is [System.ComponentModel.Win32Exception]){$failure.NativeErrorCode}else{0};$rawReason=[string]$failure.Message;$fixedReasons=@('owned window process vanished','owned window identity changed','owned process has no main window handle','owned window is not foreground','unsupported input');$reason=if($fixedReasons -contains $rawReason){$rawReason}elseif($rawReason -match 'error CS[0-9]+'){'native_input_helper_compile_failed'}elseif($nativeError -ne 0){'native_input_win32_failed'}else{'native_input_helper_failed'};[pscustomobject]@{errorType=$failure.GetType().Name;reason=$reason;hresult=[int]$failure.HResult;nativeError=[int]$nativeError}|ConvertTo-Json -Compress;exit 1 }",
   ].join("\n");
 }
 
 /**
  * 每次输入前复核完整进程 identity，再由隐藏 PowerShell 7 调用 Win32。只有
  * 专用于建立焦点的纯 click 可把瞬时空 foreground 交给随后的 DOM/child 焦点
- * 断言裁决；文本、按键、URL 点击和任何其它进程前台仍必须立即失败。
+ * 断言裁决；helper 异常仅保留结构化安全字段，文本、按键、URL 点击和任何其它
+ * 进程前台仍必须立即失败。
  */
 async function invokeOwnedNativeInput(identity, operation, signal) {
   const creationMillis = parseWindowsCreationDate(identity?.creationDate);
@@ -7513,20 +12486,24 @@ async function completeOwnedFileDialog(identity, ownedRoot, filePath, signal) {
     "public static class JaE2eFileDialog {",
     "public delegate bool EnumWindowsProc(IntPtr h,IntPtr l);",
     "[StructLayout(LayoutKind.Sequential)] public struct KI { public ushort vk; public ushort scan; public uint flags; public uint time; public UIntPtr extra; }",
-    "[StructLayout(LayoutKind.Explicit)] public struct U { [FieldOffset(0)] public KI key; }",
+    "[StructLayout(LayoutKind.Sequential)] public struct MI { public int dx; public int dy; public uint data; public uint flags; public uint time; public UIntPtr extra; }",
+    "[StructLayout(LayoutKind.Explicit)] public struct U { [FieldOffset(0)] public KI key; [FieldOffset(0)] public MI mouse; }",
     "[StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public U value; }",
     '[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc p,IntPtr l);',
     '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+    '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);',
     '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '[DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h,int id);',
     '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);',
     '[DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,StringBuilder s,int n);',
+    '[DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h,uint msg,IntPtr w,string text);',
     '[DllImport("user32.dll",SetLastError=true)] public static extern uint SendInput(uint count,INPUT[] inputs,int size);',
     "static INPUT K(ushort k,uint f){return new INPUT{type=1,value=new U{key=new KI{vk=k,flags=f}}};}",
     "static INPUT W(char c,uint f){return new INPUT{type=1,value=new U{key=new KI{scan=c,flags=f|4}}};}",
     "static void S(List<INPUT> v){var a=v.ToArray();if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=(uint)a.Length)throw new Win32Exception(Marshal.GetLastWin32Error());}",
     "public static string Class(IntPtr h){var s=new StringBuilder(256);return GetClassName(h,s,s.Capacity)>0?s.ToString():string.Empty;}",
     'public static IntPtr Find(uint pid){IntPtr found=IntPtr.Zero;EnumWindows((h,l)=>{uint owner;GetWindowThreadProcessId(h,out owner);if(owner==pid&&IsWindowVisible(h)&&Class(h)=="#32770"){found=h;return false;}return true;},IntPtr.Zero);return found;}',
-    "public static void Choose(string path){S(new List<INPUT>{K(0x11,0),K(0x4C,0),K(0x4C,2),K(0x11,2)});System.Threading.Thread.Sleep(80);foreach(char c in path)S(new List<INPUT>{W(c,0),W(c,2)});S(new List<INPUT>{K(0x0D,0),K(0x0D,2)});}",
+    "public static void Choose(IntPtr dialog,string path){var fileName=GetDlgItem(dialog,1148);if(fileName==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error());SendMessage(fileName,0x000C,IntPtr.Zero,path);S(new List<INPUT>{K(0x0D,0),K(0x0D,2)});System.Threading.Thread.Sleep(200);if(IsWindow(dialog))S(new List<INPUT>{K(0x0D,0),K(0x0D,2)});}",
     "}",
     "'@",
     "$deadline=[DateTime]::UtcNow.AddSeconds(10);$dialog=[IntPtr]::Zero",
@@ -7538,7 +12515,9 @@ async function completeOwnedFileDialog(identity, ownedRoot, filePath, signal) {
     "do{$foreground=[JaE2eFileDialog]::GetForegroundWindow();if($foreground -eq $dialog){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $foregroundDeadline)",
     "$foregroundPid=[uint32]0;[JaE2eFileDialog]::GetWindowThreadProcessId($foreground,[ref]$foregroundPid)|Out-Null",
     'if($foreground -ne $dialog){throw "owned common file dialog is not foreground; dialog=$dialog foreground=$foreground foregroundPid=$foregroundPid foregroundClass=$([JaE2eFileDialog]::Class($foreground))"}',
-    "[JaE2eFileDialog]::Choose($filePath)",
+    // Windows 11 的 Common Item Dialog 不保证 Alt+N 在不同语言和视图状态下落到文件名框；
+    // 只在 owner、class 与 foreground 均已验证后，写固定 child id，再走真实 Enter 提交。
+    "[JaE2eFileDialog]::Choose($dialog,$filePath)",
     "$closeDeadline=[DateTime]::UtcNow.AddSeconds(10);do{if([JaE2eFileDialog]::Find([uint32]$pidValue) -eq [IntPtr]::Zero){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $closeDeadline)",
     "$closed=[JaE2eFileDialog]::Find([uint32]$pidValue) -eq [IntPtr]::Zero",
     "if(-not $closed){throw 'owned common file dialog did not close'}",
@@ -7594,35 +12573,664 @@ async function completeOwnedFileDialog(identity, ownedRoot, filePath, signal) {
 }
 
 /**
- * 通过 Composer 的真实用户入口覆盖 import -> discard -> re-import；每次 picker 都由 Ja 所有的
- * 原生对话框完成，最终只把 App Server 签发的 attachment identity 留在草稿中供 Turn 绑定。
+ * 只打开本轮临时工作区的 Explorer，通过 UI Automation 定位真实文件项，再用 Win32
+ * mouse input 拖到 Ja Composer。整个过程不创建 DOM DragEvent，也不向 WebView 传路径。
  */
-async function exerciseAttachmentDraft(page, nativeScope, directories, deadline, signal) {
+async function dragOwnedExplorerFileToComposer(
+  page,
+  identity,
+  ownedRoot,
+  filePath,
+  deadline,
+  signal,
+) {
+  const creationMillis = parseWindowsCreationDate(identity?.creationDate);
+  if (!hasProcessIdentity(identity) || creationMillis === undefined) {
+    throw new Error("原生 Explorer 拖放缺少完整 Ja 进程身份");
+  }
+  const root = resolve(ownedRoot);
+  const candidate = resolve(filePath);
+  const relativePath = relative(root, candidate);
+  if (
+    relativePath === "" ||
+    relativePath === ".." ||
+    relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error("原生 Explorer 拖放 fixture 越出本轮私有目录");
+  }
+  if (!(await stat(candidate)).isFile()) throw new Error("原生 Explorer 拖放 fixture 不是普通文件");
+  // 真实 OLE 落点固定在 Composer 内稳定的编辑面；表单中心会随附件带、队列和 Preview
+  // 改变，可能落到临时工具层并让 Ja-owned HWND 检查产生假阳性。
+  const composerInput = page.getByRole("textbox", { name: "消息", exact: true });
+  const point = await waitForRenderedSurface(
+    composerInput,
+    "Composer 原生拖放编辑面",
+    deadline,
+    signal,
+  );
+  const renderer = await page.evaluate(() => ({
+    width: globalThis.innerWidth,
+    height: globalThis.innerHeight,
+  }));
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$pidValue=[int][Environment]::GetEnvironmentVariable('JA_E2E_WINDOW_PID')",
+    "$expectedName=[Environment]::GetEnvironmentVariable('JA_E2E_WINDOW_NAME')",
+    "$expectedCommand=[Environment]::GetEnvironmentVariable('JA_E2E_WINDOW_COMMAND')",
+    "$expectedMillis=[long][Environment]::GetEnvironmentVariable('JA_E2E_WINDOW_CREATED_MS')",
+    "$root=[IO.Path]::GetFullPath([Environment]::GetEnvironmentVariable('JA_E2E_EXPLORER_ROOT'))",
+    "$file=[IO.Path]::GetFullPath([Environment]::GetEnvironmentVariable('JA_E2E_EXPLORER_FILE'))",
+    "$itemName=[IO.Path]::GetFileName($file)",
+    "$itemStem=[IO.Path]::GetFileNameWithoutExtension($itemName)",
+    '$row=Get-CimInstance Win32_Process -Filter "ProcessId = $pidValue"',
+    "if($null -eq $row){throw 'owned Ja process vanished'}",
+    "$actualMillis=([DateTimeOffset]$row.CreationDate).ToUnixTimeMilliseconds()",
+    "if(-not [string]::Equals([string]$row.Name,$expectedName,[StringComparison]::Ordinal)-or -not [string]::Equals([string]$row.CommandLine,$expectedCommand,[StringComparison]::Ordinal)-or $actualMillis -ne $expectedMillis){throw 'owned Ja identity changed'}",
+    "if(-not [string]::Equals([IO.Path]::GetDirectoryName($file),$root,[StringComparison]::OrdinalIgnoreCase)-or -not [IO.File]::Exists($file)){throw 'Explorer fixture containment failed'}",
+    "Start-Process explorer.exe -ArgumentList $root | Out-Null",
+    "$deadline=[DateTime]::UtcNow.AddSeconds(12);$window=$null",
+    "do{$shell=New-Object -ComObject Shell.Application;foreach($candidate in @($shell.Windows())){try{$folder=[IO.Path]::GetFullPath([string]$candidate.Document.Folder.Self.Path);if([string]::Equals($folder,$root,[StringComparison]::OrdinalIgnoreCase)){$window=$candidate;break}}catch{}};if($null -ne $window){break};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $deadline)",
+    "if($null -eq $window){throw 'owned Explorer window not found'}",
+    "$explorerHandle=[IntPtr][long]$window.HWND",
+    "Add-Type -AssemblyName UIAutomationClient",
+    "Add-Type -AssemblyName UIAutomationTypes",
+    "$explorer=[Windows.Automation.AutomationElement]::FromHandle($explorerHandle)",
+    "$typeCondition=New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)",
+    "$shellItem=$window.Document.Folder.ParseName($itemName);if($null -eq $shellItem){throw 'Explorer shell item not found'}",
+    // Shell 精确选择真实文件，UIA 再按“选中 + 完整名或隐藏扩展名后的 stem”读取渲染项；
+    // Explorer 左侧导航同样可能是 selected ListItem，不能只取窗口中的首个选中项。
+    "$window.Document.SelectItem($shellItem,29)",
+    "$itemDeadline=[DateTime]::UtcNow.AddSeconds(5);$item=$null",
+    "do{$items=$explorer.FindAll([Windows.Automation.TreeScope]::Descendants,$typeCondition);foreach($candidateItem in $items){try{$selection=$null;$candidateName=[string]$candidateItem.Current.Name;if($candidateItem.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern,[ref]$selection)-and ([Windows.Automation.SelectionItemPattern]$selection).Current.IsSelected-and([string]::Equals($candidateName,$itemName,[StringComparison]::OrdinalIgnoreCase)-or[string]::Equals($candidateName,$itemStem,[StringComparison]::OrdinalIgnoreCase))){$item=$candidateItem;break}}catch{}};if($null-ne$item){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow-lt$itemDeadline)",
+    "if($null -eq $item){throw 'Explorer file item not found'}",
+    "$scroll=$null;if($item.TryGetCurrentPattern([Windows.Automation.ScrollItemPattern]::Pattern,[ref]$scroll)){([Windows.Automation.ScrollItemPattern]$scroll).ScrollIntoView()}",
+    "$select=$null;if($item.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern,[ref]$select)){([Windows.Automation.SelectionItemPattern]$select).Select()}",
+    "Add-Type -TypeDefinition @'",
+    "using System; using System.Collections.Generic; using System.ComponentModel; using System.Runtime.InteropServices; using System.Threading;",
+    "public static class JaE2eExplorerDrag {",
+    "[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }",
+    "[StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }",
+    "[StructLayout(LayoutKind.Sequential)] public struct MI { public int dx; public int dy; public uint data; public uint flags; public uint time; public UIntPtr extra; }",
+    "[StructLayout(LayoutKind.Explicit)] public struct U { [FieldOffset(0)] public MI mouse; }",
+    "[StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public U value; }",
+    '[DllImport("user32.dll",SetLastError=true)] public static extern uint SendInput(uint count,INPUT[] inputs,int size);',
+    '[DllImport("user32.dll",SetLastError=true)] public static extern bool GetClientRect(IntPtr h,out RECT r);',
+    '[DllImport("user32.dll",SetLastError=true)] public static extern bool GetWindowRect(IntPtr h,out RECT r);',
+    '[DllImport("user32.dll",SetLastError=true)] public static extern bool ClientToScreen(IntPtr h,ref POINT p);',
+    '[DllImport("user32.dll",SetLastError=true)] public static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int height,uint flags);',
+    '[DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);',
+    '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+    '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);',
+    '[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint flags);',
+    '[DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);',
+    '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);',
+    '[DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder name,int capacity);',
+    "static INPUT M(uint flags,int dx,int dy){return new INPUT{type=0,value=new U{mouse=new MI{flags=flags,dx=dx,dy=dy}}};}",
+    "static void S(uint flags,int dx,int dy){var input=new[]{M(flags,dx,dy)};if(SendInput(1,input,Marshal.SizeOf(typeof(INPUT)))!=1)throw new Win32Exception(Marshal.GetLastWin32Error());}",
+    "// Explorer 的 OLE drag threshold 只接受完整鼠标输入轨迹；统一用虚拟桌面绝对 SendInput，避免 SetCursorPos 移动被当成非输入定位。",
+    'static void Move(int x,int y){int vx=GetSystemMetrics(76),vy=GetSystemMetrics(77),vw=GetSystemMetrics(78),vh=GetSystemMetrics(79);if(vw<2||vh<2)throw new InvalidOperationException("virtual desktop unavailable");int dx=(int)Math.Round((x-vx)*65535d/(vw-1)),dy=(int)Math.Round((y-vy)*65535d/(vh-1));S(0xC001,dx,dy);}',
+    "public static POINT Target(IntPtr h,double x,double y,double rw,double rh){RECT r;var p=new POINT();if(!GetClientRect(h,out r)||!ClientToScreen(h,ref p))throw new Win32Exception(Marshal.GetLastWin32Error());int w=r.Right-r.Left,q=r.Bottom-r.Top;p.X+=Math.Min(w-1,Math.Max(0,(int)Math.Round(x*w/rw)));p.Y+=Math.Min(q-1,Math.Max(0,(int)Math.Round(y*q/rh)));return p;}",
+    "// 将 Explorer 放到目标点的对侧，避免持久化的最大化窗口遮住 Ja 后让真实鼠标 drop 落回 Explorer。",
+    'public static RECT ExposeTarget(IntPtr explorer,POINT target){int sw=GetSystemMetrics(0),sh=GetSystemMetrics(1);int w=Math.Min(720,Math.Max(480,sw/2)),h=Math.Min(560,Math.Max(360,sh/2));int x=target.X>=sw/2?0:Math.Max(0,sw-w),y=target.Y>=sh/2?0:Math.Max(0,sh-h);if(!SetWindowPos(explorer,IntPtr.Zero,x,y,w,h,0x0040))throw new Win32Exception(Marshal.GetLastWin32Error());RECT r;if(!GetWindowRect(explorer,out r))throw new Win32Exception(Marshal.GetLastWin32Error());if(target.X>=r.Left&&target.X<r.Right&&target.Y>=r.Top&&target.Y<r.Bottom)throw new InvalidOperationException("Explorer still covers Ja drop target");return r;}',
+    "// 只回传窗口 class 父链，不暴露 HWND；用于证明 OLE 实际命中面与 Ja 注册面是否一致。",
+    'public static string ClassChain(IntPtr h){var classes=new List<string>();for(int i=0;i<8&&h!=IntPtr.Zero;i++){var name=new System.Text.StringBuilder(256);classes.Add(GetClassName(h,name,name.Capacity)>0?name.ToString():"unknown");h=GetParent(h);}return string.Join(">",classes);}',
+    "public static void Drag(int sx,int sy,int tx,int ty){Move(sx,sy);Thread.Sleep(150);S(2,0,0);int sign=tx>=sx?1:-1;foreach(int delta in new[]{2,4,8,12}){Move(sx+sign*delta,sy);Thread.Sleep(45);}Thread.Sleep(120);int bx=sx+sign*12;for(int i=1;i<=40;i++){int x=bx+(tx-bx)*i/40,y=sy+(ty-sy)*i/40;Move(x,y);Thread.Sleep(20);}Thread.Sleep(800);S(4,0,0);}",
+    "}",
+    "'@",
+    "$process=Get-Process -Id $pidValue -ErrorAction Stop;$jaHandle=$process.MainWindowHandle",
+    "if($jaHandle -eq [IntPtr]::Zero){throw 'owned Ja window handle missing'}",
+    "$target=[JaE2eExplorerDrag]::Target($jaHandle,[double][Environment]::GetEnvironmentVariable('JA_E2E_TARGET_X'),[double][Environment]::GetEnvironmentVariable('JA_E2E_TARGET_Y'),[double][Environment]::GetEnvironmentVariable('JA_E2E_RENDERER_WIDTH'),[double][Environment]::GetEnvironmentVariable('JA_E2E_RENDERER_HEIGHT'))",
+    "$explorerRect=[JaE2eExplorerDrag]::ExposeTarget($explorerHandle,$target);Start-Sleep -Milliseconds 300",
+    "if(-not [JaE2eExplorerDrag]::SetForegroundWindow($jaHandle)){throw 'Ja did not accept foreground before drag'}",
+    "$jaForegroundDeadline=[DateTime]::UtcNow.AddSeconds(3);do{if([JaE2eExplorerDrag]::GetForegroundWindow()-eq $jaHandle){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $jaForegroundDeadline)",
+    "if([JaE2eExplorerDrag]::GetForegroundWindow()-ne $jaHandle){throw 'Ja is not foreground before Explorer layering'}",
+    "if(-not [JaE2eExplorerDrag]::SetForegroundWindow($explorerHandle)){throw 'Explorer did not accept foreground'}",
+    "$foregroundDeadline=[DateTime]::UtcNow.AddSeconds(3);do{if([JaE2eExplorerDrag]::GetForegroundWindow()-eq $explorerHandle){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $foregroundDeadline)",
+    "if([JaE2eExplorerDrag]::GetForegroundWindow()-ne $explorerHandle){throw 'Explorer is not foreground'}",
+    '$source=$item.GetClickablePoint();$sourceX=[int][Math]::Round($source.X);$sourceY=[int][Math]::Round($source.Y);$sourceWindow=[JaE2eExplorerDrag]::WindowFromPoint(([JaE2eExplorerDrag+POINT]@{X=$sourceX;Y=$sourceY}));$sourceRoot=[JaE2eExplorerDrag]::GetAncestor($sourceWindow,2);[uint32]$sourcePid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($sourceRoot,[ref]$sourcePid);[uint32]$explorerPid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($explorerHandle,[ref]$explorerPid);if($sourcePid-ne$explorerPid){throw "Explorer source point is covered by pid $sourcePid"}',
+    '$targetWindow=[JaE2eExplorerDrag]::WindowFromPoint($target);$targetClassChain=[JaE2eExplorerDrag]::ClassChain($targetWindow);$targetRoot=[JaE2eExplorerDrag]::GetAncestor($targetWindow,2);[uint32]$targetPid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($targetRoot,[ref]$targetPid);if($targetPid-ne[uint32]$pidValue){throw "Ja drop target is covered by pid $targetPid"}',
+    "[JaE2eExplorerDrag]::Drag($sourceX,$sourceY,$target.X,$target.Y)",
+    "$foreground=[JaE2eExplorerDrag]::GetForegroundWindow();[uint32]$foregroundPid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($foreground,[ref]$foregroundPid)",
+    "[pscustomobject]@{pid=$pidValue;explorerFolderMatched=$true;itemMatched=$true;sourceOwnedByExplorer=$true;targetExposed=$true;targetPid=$targetPid;targetClassChain=$targetClassChain;input='win32_send_input_drag';foregroundPid=$foregroundPid}|ConvertTo-Json -Compress",
+  ].join("\n");
+  let stdout;
+  try {
+    ({ stdout } = await runBoundedWindowsHelper(
+      nativeInputPowerShell,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command", script],
+      {
+        windowsHide: true,
+        maxBuffer: 512 * 1024,
+        signal,
+        env: {
+          ...process.env,
+          JA_E2E_WINDOW_PID: String(identity.pid),
+          JA_E2E_WINDOW_NAME: identity.name,
+          JA_E2E_WINDOW_COMMAND: identity.commandLine,
+          JA_E2E_WINDOW_CREATED_MS: String(creationMillis),
+          JA_E2E_EXPLORER_ROOT: root,
+          JA_E2E_EXPLORER_FILE: candidate,
+          JA_E2E_TARGET_X: String(point.x),
+          JA_E2E_TARGET_Y: String(point.y),
+          JA_E2E_RENDERER_WIDTH: String(renderer.width),
+          JA_E2E_RENDERER_HEIGHT: String(renderer.height),
+        },
+      },
+      30_000,
+      "原生 Explorer 拖放 helper",
+    ));
+  } catch (error) {
+    throw new Error(
+      `原生 Explorer 拖放失败：${JSON.stringify({ code: error?.code ?? null, signal: error?.signal ?? null, stderr: redact(String(error?.stderr ?? "").slice(-2_048)) })}`,
+      { cause: error },
+    );
+  } finally {
+    await closeWorkspaceExplorerWindow(root, signal).catch(() => undefined);
+  }
+  const payload = String(stdout).trim().split(/\r?\n/u).filter(Boolean).at(-1);
+  const evidence = payload === undefined ? undefined : JSON.parse(payload);
+  if (
+    evidence?.pid !== identity.pid ||
+    evidence?.explorerFolderMatched !== true ||
+    evidence?.itemMatched !== true ||
+    evidence?.sourceOwnedByExplorer !== true ||
+    evidence?.targetExposed !== true ||
+    evidence?.targetPid !== identity.pid ||
+    evidence?.input !== "win32_send_input_drag"
+  ) {
+    throw new Error("原生 Explorer 拖放未返回有效的 owner/file/input 证据");
+  }
+  return evidence;
+}
+
+/** 建立真实网页 child WebView 基线，供附件模式返回后核对 URL、target 与导航状态未丢失。 */
+async function prepareAttachmentWebPreview(page, previewFixture, deadline, signal) {
+  const workbench = await ensureWorkbenchVisible(page, deadline);
+  await chooseWorkbenchTool(page, "浏览器", deadline);
+  const url = `${previewFixture.url}attachment-state`;
+  const requests = previewFixture.requestCount();
+  const address = workbench.getByRole("textbox", { name: "Preview 地址", exact: true });
+  await address.fill(url);
+  await clickVerifiedControl(
+    page,
+    workbench.getByRole("button", { name: "刷新或访问", exact: true }),
+    deadline,
+  );
+  await page.waitForFunction(
+    (expected) =>
+      globalThis.document.querySelector(".ja-preview-viewport")?.getAttribute("data-url") ===
+      expected,
+    url,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  await waitForCondition(
+    "附件验收网页 Preview 真实请求",
+    () => previewFixture.requestCount() > requests,
+    deadline,
+    signal,
+  );
+  await waitForPreviewChildPage(page, url, deadline, signal);
+  return { workbench, url };
+}
+
+/**
+ * 从 Composer 或历史附件的真实按钮进入文本 Preview，并核对 open/read ACK、CodeMirror 内容、
+ * 地址栏互斥、网页 child 状态恢复和来源焦点返回。open 在十秒内先收敛为 ACK 或稳定拒绝，
+ * 避免全局 deadline 清理窗口后把真实原生错误掩盖成 CDP page closed。
+ */
+async function exerciseTextAttachmentPreview(
+  page,
+  source,
+  fileName,
+  expectedWebUrl,
+  deadline,
+  signal,
+) {
+  /** Preview 的所有等待共享同一绝对期限，避免逐步重置预算掩盖卡死。 */
   const timeout = () => Math.max(1, deadline - Date.now());
-  const filePath = join(directories.workspace, attachmentFixtureFile);
-  const ownedWindow = await resolveOwnedJaWindow(nativeScope, signal);
-  const add = page.getByRole("button", { name: "添加附件", exact: true });
+  const openTraceOffset = (await tauriInvokeTrace(page, "ja_attachment_preview_open")).length;
+  const openBefore = await tauriInvokePhaseCount(page, "ja_attachment_preview_open", "resolved");
+  const readBefore = await tauriInvokePhaseCount(page, "ja_attachment_preview_read", "resolved");
+  await clickVerifiedControl(page, source, deadline);
+  const openDeadline = Math.min(deadline, Date.now() + 10_000);
+  await waitForCondition(
+    "attachment preview open 终态",
+    async () => {
+      const trace = (await tauriInvokeTrace(page, "ja_attachment_preview_open")).slice(
+        openTraceOffset,
+      );
+      return trace.some(({ phase }) => phase === "resolved" || phase === "rejected");
+    },
+    openDeadline,
+    signal,
+  );
+  const openTrace = (await tauriInvokeTrace(page, "ja_attachment_preview_open")).slice(
+    openTraceOffset,
+  );
+  const started = openTrace.find(({ phase }) => phase === "start");
+  if (started?.authorizationKind !== "draft" && started?.authorizationKind !== "thread") {
+    throw new Error(
+      `attachment preview open authorization trace missing (${JSON.stringify(started?.argumentShape ?? {})})`,
+    );
+  }
+  const rejection = openTrace.findLast(({ phase }) => phase === "rejected");
+  if (rejection !== undefined) {
+    throw new Error(
+      `attachment preview open rejected (${rejection.errorCode ?? "unknown"}, authorization=${rejection.authorizationKind ?? "unknown"}, shape=${JSON.stringify(started?.argumentShape ?? {})})`,
+    );
+  }
+  const workbench = await ensureWorkbenchVisible(page, deadline);
+  await workbench
+    .locator('.ja-workbench-tab-shell[data-tab="preview"][data-state="active"]')
+    .waitFor({ state: "visible", timeout: timeout() });
+  await workbench
+    .getByRole("heading", { name: fileName, exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  if ((await workbench.getByRole("textbox", { name: "Preview 地址", exact: true }).count()) !== 0) {
+    throw new Error("附件 Preview 模式仍暴露网页地址栏");
+  }
+  const textPreview = workbench.locator(".ja-attachment-text-preview");
+  await textPreview.waitFor({ state: "visible", timeout: timeout() });
+  await waitForCondition(
+    "附件 Preview 文本内容",
+    async () => (await codeMirrorText(textPreview)).includes("Ja managed attachment fixture"),
+    deadline,
+    signal,
+  );
+  await waitForCondition(
+    "attachment preview open/read ACK",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_attachment_preview_open", "resolved")) > openBefore &&
+      (await tauriInvokePhaseCount(page, "ja_attachment_preview_read", "resolved")) > readBefore,
+    deadline,
+    signal,
+  );
+  const closeBefore = await tauriInvokePhaseCount(page, "ja_attachment_preview_close", "resolved");
+  await clickVerifiedControl(
+    page,
+    workbench.getByRole("button", { name: "返回网页预览", exact: true }),
+    deadline,
+  );
+  await waitForCondition(
+    "attachment preview close ACK",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_attachment_preview_close", "resolved")) > closeBefore,
+    deadline,
+    signal,
+  );
+  await page.waitForFunction(
+    ({ name, expected }) => {
+      const active = globalThis.document.activeElement;
+      const address = globalThis.document.querySelector('[aria-label="Preview 地址"]');
+      const viewport = globalThis.document.querySelector(".ja-preview-viewport");
+      return (
+        active instanceof globalThis.HTMLButtonElement &&
+        active.getAttribute("aria-label") === `预览附件 ${name}` &&
+        address instanceof globalThis.HTMLInputElement &&
+        (expected === undefined ||
+          (address.value === expected && viewport?.getAttribute("data-url") === expected))
+      );
+    },
+    { name: fileName, expected: expectedWebUrl },
+    { timeout: timeout() },
+  );
+  if (expectedWebUrl !== undefined) {
+    await waitForPreviewChildPage(page, expectedWebUrl, deadline, signal);
+  }
+  return { opened: true, textRead: true, webStateRestored: expectedWebUrl !== undefined };
+}
+
+/**
+ * 用单一 STA broker 写入五种真实 Windows clipboard 格式，并始终恢复进入测试前的 IDataObject。
+ * 每一项都由 owned Ja HWND 上的 Win32 Ctrl+V 触发；DOM 只负责核对结果，不能合成 ClipboardEvent。
+ */
+async function exerciseWindowsClipboardMatrix(page, ownedWindow, directories, deadline, signal) {
+  /** 五种格式共享整轮 deadline，使 clipboard 占用或编码延迟不能无界叠加。 */
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const composerInput = page.getByRole("textbox", { name: "消息", exact: true });
   const pending = page.getByRole("list", { name: "待发送附件", exact: true });
-  const importOnce = async () => {
-    const invokeCountBefore = await tauriInvokeCount(page, "ja_attachment_import");
-    await add.waitFor({ state: "visible", timeout: timeout() });
-    const [nativeDialog] = await Promise.all([
-      completeOwnedFileDialog(ownedWindow, directories.root, filePath, signal),
-      clickVerifiedControl(page, add, deadline),
-    ]);
-    await pending.waitFor({ state: "visible", timeout: timeout() });
-    await pending
-      .getByText(attachmentFixtureFile, { exact: true })
-      .waitFor({ state: "visible", timeout: timeout() });
-    await waitForCondition(
-      "attachment import invoke ACK",
-      async () => (await tauriInvokeCount(page, "ja_attachment_import")) > invokeCountBefore,
+  const broker = await startWindowsClipboardFixtureBroker(signal);
+  let evidence;
+  /** 每次都重新确认 owned HWND 与 textarea 焦点，再通过 Win32 键盘路径触发真实粘贴。 */
+  const paste = async () => {
+    await focusOwnedRendererTarget(
+      page,
+      ownedWindow,
+      composerInput,
+      "Composer clipboard 输入面",
       deadline,
       signal,
     );
-    return nativeDialog;
+    return invokeOwnedNativeInput(
+      ownedWindow,
+      { kind: "chord", modifiers: [0x11], key: 0x56, repetitions: 1 },
+      signal,
+    );
   };
+  /**
+   * 需要原生导入的格式在五秒内必须出现 command start；若 Win32 chord 未进入 WebView，允许
+   * 重新建立同一 owned HWND/Composer 焦点后补投一次，任何已启动命令都禁止重放。
+   */
+  const pasteImportable = async (label, commandStartsBefore) => {
+    const attempts = [];
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      attempts.push(await paste());
+      try {
+        await waitForCondition(
+          `${label} clipboard command start`,
+          async () =>
+            (await tauriInvokePhaseCount(page, "ja_attachment_clipboard_import", "start")) >
+            commandStartsBefore,
+          Math.min(deadline, Date.now() + 5_000),
+          signal,
+        );
+        return attempts;
+      } catch (error) {
+        if (attempt >= 2 || Date.now() >= deadline) throw error;
+      }
+    }
+    throw new Error(`${label} clipboard command 未启动`);
+  };
+  /** 文本格式只在 Composer 仍为空时补投一次；任何部分文本都失败，避免重复粘贴被误判为成功。 */
+  const pasteText = async (label, marker) => {
+    const attempts = [];
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      attempts.push(await paste());
+      try {
+        await page.waitForFunction(
+          (expected) =>
+            globalThis.document.querySelector('textarea[aria-label="消息"]')?.value === expected,
+          marker,
+          { timeout: Math.min(10_000, Math.max(1, deadline - Date.now())) },
+        );
+        return attempts;
+      } catch (error) {
+        const value = await composerInput.inputValue();
+        if (value !== "" || attempt >= 2 || Date.now() >= deadline) throw error;
+      }
+    }
+    throw new Error(`${label} clipboard 文本未进入 Composer`);
+  };
+  /** case 间必须等待 discard ACK，防止前一附件污染后一格式的零增量断言。 */
+  const removeReadyAttachment = async (fileName) => {
+    const discardBefore = await tauriInvokeCount(page, "ja_attachment_discard");
+    await clickVerifiedControl(
+      page,
+      page.getByRole("button", { name: `移除附件 ${fileName}`, exact: true }),
+      deadline,
+    );
+    await pending.waitFor({ state: "detached", timeout: timeout() });
+    await waitForCondition(
+      `clipboard ${fileName} discard ACK`,
+      async () => (await tauriInvokeCount(page, "ja_attachment_discard")) > discardBefore,
+      deadline,
+      signal,
+    );
+  };
+
+  try {
+    const bitmapStartsBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "start",
+    );
+    const bitmapResolvedBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "resolved",
+    );
+    await broker.set("bitmap");
+    const bitmapInput = await pasteImportable("bitmap", bitmapStartsBefore);
+    const bitmapDeadline = Math.min(deadline, Date.now() + 20_000);
+    await pending
+      .locator('.ja-composer-attachment[data-state="ready"]')
+      .filter({ hasText: "pasted-image.png" })
+      .waitFor({ state: "visible", timeout: Math.max(1, bitmapDeadline - Date.now()) });
+    await waitForCondition(
+      "clipboard bitmap Channel completed ACK",
+      async () =>
+        (await tauriInvokePhaseCount(page, "ja_attachment_clipboard_import", "resolved")) >
+        bitmapResolvedBefore,
+      bitmapDeadline,
+      signal,
+    );
+    await removeReadyAttachment("pasted-image.png");
+
+    const fileDropStartsBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "start",
+    );
+    const fileDropResolvedBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "resolved",
+    );
+    await broker.set("file_drop", {
+      path: join(directories.workspace, attachmentFixtureFile),
+    });
+    const fileDropInput = await pasteImportable("CF_HDROP", fileDropStartsBefore);
+    const fileDropDeadline = Math.min(deadline, Date.now() + 20_000);
+    await pending
+      .locator('.ja-composer-attachment[data-state="ready"]')
+      .filter({ hasText: attachmentFixtureFile })
+      .waitFor({ state: "visible", timeout: Math.max(1, fileDropDeadline - Date.now()) });
+    await waitForCondition(
+      "clipboard CF_HDROP Channel completed ACK",
+      async () =>
+        (await tauriInvokePhaseCount(page, "ja_attachment_clipboard_import", "resolved")) >
+        fileDropResolvedBefore,
+      fileDropDeadline,
+      signal,
+    );
+    await removeReadyAttachment(attachmentFixtureFile);
+
+    const plainTextMarker = "JA clipboard plain text";
+    await composerInput.fill("");
+    const plainTextStartsBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "start",
+    );
+    await broker.set("text", { marker: plainTextMarker });
+    const plainTextInput = await pasteText("纯文本", plainTextMarker);
+    if (
+      (await tauriInvokePhaseCount(page, "ja_attachment_clipboard_import", "start")) !==
+      plainTextStartsBefore
+    ) {
+      throw new Error("纯文本 Ctrl+V 错误调用了原生附件命令");
+    }
+
+    const textImageMarker = "JA clipboard text wins";
+    await composerInput.fill("");
+    const textImageStartsBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "start",
+    );
+    await broker.set("text_image", { marker: textImageMarker });
+    const textImageInput = await pasteText("文本+图片", textImageMarker);
+    if (
+      (await tauriInvokePhaseCount(page, "ja_attachment_clipboard_import", "start")) !==
+        textImageStartsBefore ||
+      (await pending.count()) !== 0
+    ) {
+      throw new Error("文本+图片 Ctrl+V 未保持纯文本优先级");
+    }
+
+    await composerInput.fill("");
+    const htmlStartsBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "start",
+    );
+    const htmlResolvedBefore = await tauriInvokePhaseCount(
+      page,
+      "ja_attachment_clipboard_import",
+      "resolved",
+    );
+    await broker.set("html", { marker: "JA clipboard HTML only" });
+    const htmlInput = await pasteImportable("HTML-only", htmlStartsBefore);
+    const htmlDeadline = Math.min(deadline, Date.now() + 20_000);
+    await waitForCondition(
+      "HTML-only clipboard nothing_importable ACK",
+      async () =>
+        (await tauriInvokePhaseCount(page, "ja_attachment_clipboard_import", "resolved")) >
+        htmlResolvedBefore,
+      htmlDeadline,
+      signal,
+    );
+    await page
+      .getByRole("status")
+      .filter({ hasText: "剪贴板中没有可导入的文件或图片。" })
+      .waitFor({ state: "attached", timeout: Math.max(1, htmlDeadline - Date.now()) });
+    if (
+      (await composerInput.inputValue()) !== "" ||
+      (await pending.count()) !== 0 ||
+      (await page.locator('.ja-composer-attachment[data-state="failed"]').count()) !== 0
+    ) {
+      throw new Error("HTML-only Ctrl+V 创建了文本或虚假附件失败卡");
+    }
+
+    evidence = {
+      status: "awaiting_clipboard_restore",
+      syntheticEventUsed: false,
+      bitmap: {
+        fileName: "pasted-image.png",
+        input: bitmapInput.at(-1)?.kind,
+        attemptCount: bitmapInput.length,
+      },
+      fileDrop: {
+        fileName: attachmentFixtureFile,
+        input: fileDropInput.at(-1)?.kind,
+        attemptCount: fileDropInput.length,
+      },
+      plainText: {
+        nativePaste: true,
+        attachmentInvokeDelta: 0,
+        input: plainTextInput.at(-1)?.kind,
+        attemptCount: plainTextInput.length,
+      },
+      textImage: {
+        textWon: true,
+        attachmentInvokeDelta: 0,
+        input: textImageInput.at(-1)?.kind,
+        attemptCount: textImageInput.length,
+      },
+      htmlOnly: {
+        outcome: "nothing_importable",
+        failedCardCreated: false,
+        input: htmlInput.at(-1)?.kind,
+        attemptCount: htmlInput.length,
+      },
+    };
+    return evidence;
+  } finally {
+    const restore = await broker.restore();
+    if (evidence !== undefined) {
+      // 只有 IDataObject 格式集合回读一致后才发布通过证据，避免用交互成功掩盖用户剪贴板损坏。
+      evidence.clipboardRestored = true;
+      evidence.restoredFormatCount = restore.formatCount;
+      evidence.status = "passed";
+      attachmentClipboardLastEvidence = evidence;
+    }
+  }
+}
+
+/**
+ * 通过真实 Windows picker 与生产 Channel 导入一份隔离文件；调用方只取得脱敏对话框证据，
+ * attachment identity 继续由页面和 SQLite 权威投影持有，避免 E2E 借测试接缝伪造附件。
+ */
+async function importAttachmentWithPicker(
+  page,
+  ownedWindow,
+  directories,
+  fileName,
+  deadline,
+  signal,
+) {
+  const filePath = join(directories.workspace, fileName);
+  const add = page.getByRole("button", { name: "添加附件", exact: true });
+  const pending = page.getByRole("list", { name: "待发送附件", exact: true });
+  const traceOffset = (await tauriInvokeTrace(page, "ja_attachment_picker_import")).length;
+  await add.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  const [nativeDialog] = await Promise.all([
+    completeOwnedFileDialog(ownedWindow, directories.root, filePath, signal),
+    clickVerifiedControl(page, add, deadline),
+  ]);
+  const pickerDeadline = Math.min(deadline, Date.now() + 10_000);
+  const pickerAcceptance = await waitForAttachmentPickerAcceptance(
+    page,
+    traceOffset,
+    pickerDeadline,
+    signal,
+  );
+  await pending
+    .locator('.ja-composer-attachment[data-state="ready"]')
+    .filter({ hasText: fileName })
+    .waitFor({ state: "visible", timeout: Math.max(1, pickerDeadline - Date.now()) });
+  return { ...nativeDialog, pickerAcceptance };
+}
+
+/**
+ * 通过真实 picker Channel、Explorer OLE drop、preview/remove/re-import 完成草稿闭环；最终只把
+ * App Server 签发的 attachment identity 留在 Composer；剪贴板矩阵在同一 STA broker 内保存并
+ * 恢复原始 IDataObject，所有 case 都通过 owned HWND 的真实 Ctrl+V 进入 WebView2；阶段回调只记录
+ * 脱敏 checkpoint，使任一原生子链在共享期限内失败时仍能定位，而不暴露路径或 token。
+ */
+async function exerciseAttachmentDraft(
+  page,
+  nativeScope,
+  directories,
+  previewFixture,
+  deadline,
+  signal,
+  recordStage,
+) {
+  /** Picker、Preview、Drop 与 Clipboard 共享绝对期限，单一入口不能吞掉其余验收预算。 */
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const filePath = join(directories.workspace, attachmentFixtureFile);
+  const ownedWindow = await resolveOwnedJaWindow(nativeScope, signal);
+  const pending = page.getByRole("list", { name: "待发送附件", exact: true });
+  recordStage?.("attachment_web_preview");
+  const webPreview = await prepareAttachmentWebPreview(page, previewFixture, deadline, signal);
+  /** 每次 picker 都核对 Channel 与 ready DOM，第二次导入证明移除后的资源可重新接纳。 */
+  const importOnce = () =>
+    importAttachmentWithPicker(
+      page,
+      ownedWindow,
+      directories,
+      attachmentFixtureFile,
+      deadline,
+      signal,
+    );
+  recordStage?.("attachment_first_picker");
   const firstDialog = await importOnce();
+  const previewButton = pending.getByRole("button", {
+    name: `预览附件 ${attachmentFixtureFile}`,
+    exact: true,
+  });
+  recordStage?.("attachment_text_preview");
+  const draftPreview = await exerciseTextAttachmentPreview(
+    page,
+    previewButton,
+    attachmentFixtureFile,
+    webPreview.url,
+    deadline,
+    signal,
+  );
+  recordStage?.("attachment_remove_preview");
+  await clickVerifiedControl(page, previewButton, deadline);
+  await webPreview.workbench
+    .getByRole("heading", { name: attachmentFixtureFile, exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  const previewCloseBeforeRemove = await tauriInvokePhaseCount(
+    page,
+    "ja_attachment_preview_close",
+    "resolved",
+  );
   const discardCountBefore = await tauriInvokeCount(page, "ja_attachment_discard");
   await clickVerifiedControl(
     page,
@@ -7636,6 +13244,160 @@ async function exerciseAttachmentDraft(page, nativeScope, directories, deadline,
     deadline,
     signal,
   );
+  await waitForCondition(
+    "attachment remove closes preview",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_attachment_preview_close", "resolved")) >
+      previewCloseBeforeRemove,
+    deadline,
+    signal,
+  );
+  await webPreview.workbench
+    .getByRole("textbox", { name: "Preview 地址", exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  await page.waitForFunction(
+    (expected) => {
+      const address = globalThis.document.querySelector('[aria-label="Preview 地址"]');
+      const viewport = globalThis.document.querySelector(".ja-preview-viewport");
+      return (
+        address instanceof globalThis.HTMLInputElement &&
+        address.value === expected &&
+        viewport?.getAttribute("data-url") === expected
+      );
+    },
+    webPreview.url,
+    { timeout: timeout() },
+  );
+  await waitForPreviewChildPage(page, webPreview.url, deadline, signal);
+
+  // 剪贴板与 Explorer 是两条独立的原生入口；先固定 Ctrl+V 证据，避免 OLE 拖放故障遮蔽主问题。
+  recordStage?.("attachment_clipboard_matrix");
+  const clipboardImagePaste = await exerciseWindowsClipboardMatrix(
+    page,
+    ownedWindow,
+    directories,
+    deadline,
+    signal,
+  );
+
+  const dropStartBefore = await tauriInvokePhaseCount(page, "ja_attachment_drop_import", "start");
+  const dropResolvedBefore = await tauriInvokePhaseCount(
+    page,
+    "ja_attachment_drop_import",
+    "resolved",
+  );
+  const nativeDropAttempts = [];
+  /** 每次尝试都保留 Win32 owner/file/input 证据；只有首投完全未进入 command 时才允许重试。 */
+  const performNativeDrop = async () => {
+    const attempt = await dragOwnedExplorerFileToComposer(
+      page,
+      ownedWindow,
+      directories.workspace,
+      filePath,
+      deadline,
+      signal,
+    );
+    nativeDropAttempts.push(attempt);
+    attachmentDropLastEvidence = {
+      status: "awaiting_command_start",
+      attempts: nativeDropAttempts,
+      commandTrace: (await tauriInvokeTrace(page, "ja_attachment_drop_import")).slice(
+        dropStartBefore,
+      ),
+    };
+    return attempt;
+  };
+  recordStage?.("attachment_explorer_drop");
+  let nativeDrop = await performNativeDrop();
+  const firstCommandDeadline = Math.min(deadline, Date.now() + 5_000);
+  try {
+    await waitForCondition(
+      "attachment Explorer drop command start",
+      async () =>
+        (await tauriInvokePhaseCount(page, "ja_attachment_drop_import", "start")) > dropStartBefore,
+      firstCommandDeadline,
+      signal,
+    );
+  } catch (error) {
+    throwIfAborted(signal);
+    if (Date.now() >= deadline) throw error;
+    nativeDrop = await performNativeDrop();
+    const retryCommandDeadline = Math.min(deadline, Date.now() + 5_000);
+    await waitForCondition(
+      "attachment Explorer drop retry command start",
+      async () =>
+        (await tauriInvokePhaseCount(page, "ja_attachment_drop_import", "start")) > dropStartBefore,
+      retryCommandDeadline,
+      signal,
+    );
+  }
+  attachmentDropLastEvidence = {
+    status: "command_started",
+    attempts: nativeDropAttempts,
+    commandTrace: (await tauriInvokeTrace(page, "ja_attachment_drop_import")).slice(
+      dropStartBefore,
+    ),
+  };
+  // 原生 helper 成功只证明输入已投递；Rust Event、Channel 与 ready DOM 必须在独立短期限内
+  // 形成下游 ACK，避免错误坐标或 OLE 拒绝再次耗尽整套桌面矩阵。
+  const dropDeadline = Math.min(deadline, Date.now() + 20_000);
+  try {
+    await pending
+      .locator('.ja-composer-attachment[data-state="ready"]')
+      .filter({ hasText: attachmentFixtureFile })
+      .waitFor({ state: "visible", timeout: Math.max(1, dropDeadline - Date.now()) });
+  } catch (error) {
+    // 失败证据只保留状态、可见文案和恢复动作，不读取 DOM 外的源路径或 native token。
+    const cards = await pending.locator(".ja-composer-attachment").evaluateAll((elements) =>
+      elements.map((element) => ({
+        state: element.getAttribute("data-state"),
+        errorCode: element.getAttribute("data-error-code"),
+        text: element.textContent?.trim() ?? "",
+        actions: [...element.querySelectorAll("button")].map(
+          (button) => button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "",
+        ),
+      })),
+    );
+    attachmentDropLastEvidence = {
+      status: "channel_not_ready",
+      attempts: nativeDropAttempts,
+      commandTrace: (await tauriInvokeTrace(page, "ja_attachment_drop_import")).slice(
+        dropStartBefore,
+      ),
+      cards,
+    };
+    throw error;
+  }
+  await waitForCondition(
+    "attachment Explorer drop Channel completed ACK",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_attachment_drop_import", "start")) > dropStartBefore &&
+      (await tauriInvokePhaseCount(page, "ja_attachment_drop_import", "resolved")) >
+        dropResolvedBefore,
+    dropDeadline,
+    signal,
+  );
+  attachmentDropLastEvidence = {
+    status: "passed",
+    attempts: nativeDropAttempts,
+    commandTrace: (await tauriInvokeTrace(page, "ja_attachment_drop_import")).slice(
+      dropStartBefore,
+    ),
+  };
+  const dropDiscardBefore = await tauriInvokeCount(page, "ja_attachment_discard");
+  await clickVerifiedControl(
+    page,
+    page.getByRole("button", { name: `移除附件 ${attachmentFixtureFile}`, exact: true }),
+    deadline,
+  );
+  await pending.waitFor({ state: "detached", timeout: timeout() });
+  await waitForCondition(
+    "dropped attachment discard ACK",
+    async () => (await tauriInvokeCount(page, "ja_attachment_discard")) > dropDiscardBefore,
+    deadline,
+    signal,
+  );
+  recordStage?.("attachment_second_picker");
   const secondDialog = await importOnce();
   return {
     status: "ready_for_turn",
@@ -7646,19 +13408,39 @@ async function exerciseAttachmentDraft(page, nativeScope, directories, deadline,
       closed: secondDialog.closed,
     },
     importedTwice: firstDialog.closed === true && secondDialog.closed === true,
-    discardedOnce: true,
+    pickerChannel: {
+      first: firstDialog.pickerAcceptance,
+      second: secondDialog.pickerAcceptance,
+    },
+    discardedTwice: true,
+    removeClosedPreview: true,
+    draftPreview,
+    webPreviewUrl: webPreview.url,
+    nativeDrop: {
+      status: "passed",
+      input: nativeDrop.input,
+      explorerFolderMatched: nativeDrop.explorerFolderMatched,
+      itemMatched: nativeDrop.itemMatched,
+      sourceOwnedByExplorer: nativeDrop.sourceOwnedByExplorer,
+      targetExposed: nativeDrop.targetExposed,
+      targetOwnedByJa: nativeDrop.targetPid === ownedWindow.pid,
+      syntheticEventUsed: false,
+    },
+    clipboardImagePaste,
   };
 }
 
-/** 展开已完成 Turn 的工作过程后核对附件标题，避免 hidden DOM 被误当成用户可见历史。 */
+/**
+ * 附件必须直接显示在所属 USER Message 的 exchange 内；限定当前 row 查找可同时阻止
+ * 跨消息误归属和旧 WorkProcess 隐藏投影被验收脚本误判为用户可见历史。
+ */
 async function assertAttachmentHistoryVisible(turnRow, fileName, deadline) {
-  const process = turnRow.locator(".ja-work-process");
-  await process.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  const attachment = process.getByText(fileName, { exact: true });
-  if (!(await attachment.isVisible())) {
-    await process.locator(".ja-work-process__trigger").click();
-  }
-  await attachment.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  const preview = turnRow.getByRole("button", {
+    name: `预览附件 ${fileName}`,
+    exact: true,
+  });
+  await preview.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  return preview;
 }
 
 /** 将 renderer 尺寸与 Win32 外框分开读取，避免混淆客户区与窗口边界。 */
@@ -7766,9 +13548,11 @@ async function focusOwnedRendererTarget(page, identity, locator, label, deadline
     } catch (error) {
       const message = String(error?.message ?? error);
       const foregroundWasStolen =
-        message.startsWith("Win32 SendInput 身份或前台证据无效：") &&
-        message.includes('"foreground":false') &&
-        message.includes('"ownedHandle":');
+        (message.startsWith("Win32 SendInput 身份或前台证据无效：") &&
+          message.includes('"foreground":false') &&
+          message.includes('"ownedHandle":')) ||
+        (message.startsWith("Win32 SendInput helper 失败：") &&
+          message.includes('"reason":"owned window is not foreground"'));
       if (!foregroundWasStolen || attempt >= 8 || Date.now() >= deadline) throw error;
     }
   }
@@ -7931,9 +13715,9 @@ async function waitForNativeShortcutDestination(page, workbench, definition, dea
 }
 
 /**
- * 发送一个 Win32 chord，断言唯一 native 事件、UI 落点与零 terminal input
- * 增量；Side Chat marker 只用布局稳定的大写字母与下划线，避免数字键在
- * 非 US Windows 布局下经 `VkKeyScanEx` 变成标点造成假失败。
+ * 发送一个 Win32 chord，断言唯一 native 事件、UI 落点与零 terminal input 增量；仅当 helper
+ * 明确证明外部窗口抢走前台，或 handler 已截获按键但短窗口内没有发布事件时，才对同一 verified
+ * HWND 最多重发三次。最终仍要求事件恰好一次，迟到造成重复不会被掩盖；其它原生错误立即失败。
  */
 async function sendAndAssertNativeShortcut(
   page,
@@ -7949,7 +13733,6 @@ async function sendAndAssertNativeShortcut(
   if (definition.command === "side_chat") await composer.fill("");
   const before = await nativeShortcutEventCount(page);
   const terminalBefore = await terminalInputInvokeCount(page);
-  await invokeOwnedNativeInput(identity, { kind: "reset_modifiers" }, signal);
   await page.evaluate(() => {
     globalThis.__JA_E2E_NATIVE_KEY_PROBE_CONTROLLER__?.abort?.();
     const controller = new globalThis.AbortController();
@@ -7977,18 +13760,44 @@ async function sendAndAssertNativeShortcut(
     globalThis.__JA_E2E_NATIVE_KEY_PROBE_CONTROLLER__ = controller;
     globalThis.__JA_E2E_NATIVE_KEY_PROBE__ = events;
   });
-  await invokeOwnedNativeInput(
-    identity,
-    { kind: "chord", key: definition.key, modifiers: definition.modifiers, repetitions },
-    signal,
-  );
+  let nativeEventObserved = false;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await invokeOwnedWindowAction(identity, "focus", signal);
+    await invokeOwnedNativeInput(identity, { kind: "reset_modifiers" }, signal);
+    try {
+      await invokeOwnedNativeInput(
+        identity,
+        { kind: "chord", key: definition.key, modifiers: definition.modifiers, repetitions },
+        signal,
+      );
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      const foregroundWasStolen =
+        message.includes('"reason":"owned window is not foreground"') ||
+        (message.startsWith("Win32 SendInput 身份或前台证据无效：") &&
+          message.includes('"foreground":false'));
+      const eventAlreadyPublished = (await nativeShortcutEventCount(page)) > before;
+      if (!foregroundWasStolen || eventAlreadyPublished || attempt >= 3) throw error;
+      continue;
+    }
+    const attemptDeadline = Math.min(deadline, Date.now() + 4_000);
+    try {
+      await waitForCondition(
+        `${source} ${definition.command} native event attempt ${attempt}`,
+        async () => (await nativeShortcutEventCount(page)) >= before + 1,
+        attemptDeadline,
+        signal,
+      );
+      nativeEventObserved = true;
+      break;
+    } catch (error) {
+      if (attempt >= 3 || Date.now() >= deadline) throw error;
+    }
+  }
   try {
-    await waitForCondition(
-      `${source} ${definition.command} native event`,
-      async () => (await nativeShortcutEventCount(page)) >= before + 1,
-      Math.min(deadline, Date.now() + 12_000),
-      signal,
-    );
+    if (!nativeEventObserved) {
+      throw new Error(`${source} ${definition.command} native event 未发布`);
+    }
   } catch (error) {
     const diagnostic = await page.evaluate(() => ({
       activeElement:
@@ -8051,7 +13860,7 @@ async function sendAndAssertNativeShortcut(
  * 只接受最新 prepare=false 与 activate=true 两阶段 ACK；任一阶段仍 pending 时继续等待，
  * 避免把 renderer 尚未预置 exact identity 的窗口误判成原生快捷键已就绪。
  */
-async function waitForNativeShortcutContextReady(page, deadline, signal) {
+async function waitForNativeShortcutContextReady(page, expectedContext, deadline, signal) {
   let latest;
   await waitForCondition(
     "native shortcut context ready",
@@ -8067,8 +13876,8 @@ async function waitForNativeShortcutContextReady(page, deadline, signal) {
         prepare?.phase === "resolved" &&
         !prepare.ready &&
         prepare.mainHandlerStatus === "ready" &&
-        prepare.projectCapabilitiesEnabled &&
-        prepare.conversationFocusEnabled &&
+        prepare.projectCapabilitiesEnabled === expectedContext.projectCapabilitiesEnabled &&
+        prepare.conversationFocusEnabled === expectedContext.conversationFocusEnabled &&
         activate?.phase === "resolved" &&
         activate.ready &&
         activate.mainHandlerStatus === "ready"
@@ -8087,13 +13896,14 @@ async function exerciseNativeShortcutSurface(
   identity,
   source,
   prepareFocus,
+  definitions,
   deadline,
   signal,
 ) {
   const offset = await nativeShortcutEventCount(page);
   const terminalBefore = await terminalInputInvokeCount(page);
   const cases = [];
-  for (const definition of nativeShortcutCases) {
+  for (const definition of definitions) {
     await prepareFocus();
     cases.push(
       await sendAndAssertNativeShortcut(
@@ -8110,7 +13920,7 @@ async function exerciseNativeShortcutSurface(
   const commands = (await captureNativeShortcutEvents(page)).events
     .slice(offset)
     .map(({ command }) => command);
-  const expected = nativeShortcutCases.map(({ command }) => command);
+  const expected = definitions.map(({ command }) => command);
   if (
     JSON.stringify(commands) !== JSON.stringify(expected) ||
     (await terminalInputInvokeCount(page)) !== terminalBefore
@@ -8226,7 +14036,10 @@ async function exerciseNativeShortcutNegativeInputs(
   };
 }
 
-/** 在 xterm 与真实 Preview child 各跑五键并恢复 Preview，不改变既有视觉 capture 状态。 */
+/**
+ * 在 xterm 与真实 Preview child 各跑四个项目动作；Side Chat 仅在产品允许的已收栏 main
+ * 上下文执行，避免用不可能同时成立的 capability 位伪造原生快捷键覆盖。
+ */
 async function exerciseNativeShortcuts(
   page,
   workbench,
@@ -8259,13 +14072,20 @@ async function exerciseNativeShortcuts(
       );
     await focusOwnedPreviewChild(page, identity, workbench, deadline, signal);
   };
-  const context = await waitForNativeShortcutContextReady(page, deadline, signal);
+  const projectContext = await waitForNativeShortcutContextReady(
+    page,
+    { projectCapabilitiesEnabled: true, conversationFocusEnabled: false },
+    deadline,
+    signal,
+  );
+  const projectCases = nativeShortcutCases.filter(({ command }) => command !== "side_chat");
   const xterm = await exerciseNativeShortcutSurface(
     page,
     workbench,
     identity,
     "xterm",
     prepareXtermFocus,
+    projectCases,
     deadline,
     signal,
   );
@@ -8275,6 +14095,7 @@ async function exerciseNativeShortcuts(
     identity,
     "preview",
     preparePreviewFocus,
+    projectCases,
     deadline,
     signal,
   );
@@ -8286,14 +14107,45 @@ async function exerciseNativeShortcuts(
     deadline,
     signal,
   );
+  await clickVerifiedControl(
+    page,
+    workbench.getByRole("button", { name: "收起右侧栏", exact: true }),
+    deadline,
+  );
+  await waitForWorkbenchCollapsed(workbench, deadline, signal);
+  const conversationContext = await waitForNativeShortcutContextReady(
+    page,
+    { projectCapabilitiesEnabled: true, conversationFocusEnabled: true },
+    deadline,
+    signal,
+  );
+  await focusOwnedMainComposer(page, identity, deadline, signal);
+  const sideChat = await sendAndAssertNativeShortcut(
+    page,
+    workbench,
+    identity,
+    nativeShortcutCases.find(({ command }) => command === "side_chat"),
+    "main",
+    deadline,
+    signal,
+  );
   await ensureWorkbenchVisible(page, deadline);
   await chooseWorkbenchTool(page, "浏览器", deadline);
-  return { status: "passed", input: "win32_send_input", context, xterm, preview, negative };
+  return {
+    status: "passed",
+    input: "win32_send_input",
+    context: { project: projectContext, conversation: conversationContext },
+    xterm,
+    preview,
+    sideChat,
+    negative,
+  };
 }
 
 /**
- * hard reload 前释放 probes，重载后用不依赖项目 Thread 恢复的 Side Chat chord 证明 renderer lease 已重绑。
- * 该阶段只验证 listener 生命周期；完整五键和项目能力随后仍在 xterm 与 Preview child 上逐项验收。
+ * hard reload 前释放 probes，重载后在收起的 Workbench 与已激活 conversation scope 下发送 Side Chat
+ * chord，证明 renderer lease 已重绑。不能在发键前打开 Workbench，否则产品会正确撤销该命令权限；
+ * 完整五键和项目能力随后仍在 xterm 与 Preview child 上逐项验收。
  */
 async function exerciseNativeShortcutHardReload(page, workbench, identity, deadline, signal) {
   await removeRawTauriEventProbe(page);
@@ -8318,7 +14170,13 @@ async function exerciseNativeShortcutHardReload(page, workbench, identity, deadl
     deadline,
     signal,
   );
-  await ensureWorkbenchVisible(page, deadline);
+  await waitForWorkbenchCollapsed(workbench, deadline, signal);
+  await waitForNativeShortcutContextReady(
+    page,
+    { projectCapabilitiesEnabled: true, conversationFocusEnabled: true },
+    deadline,
+    signal,
+  );
   await invokeOwnedWindowAction(identity, "focus", signal);
   await focusOwnedMainComposer(page, identity, deadline, signal);
   const result = await sendAndAssertNativeShortcut(
@@ -8569,10 +14427,64 @@ async function waitForRenderedSurface(locator, label, deadline, signal) {
   throw new Error(`${label} 未形成可见且可命中的真实界面：${JSON.stringify(lastEvidence)}`);
 }
 
-/** 通过 CodeMirror 真实 contenteditable surface 替换文档，避免绕过编辑器事件链。 */
+/**
+ * 只记录编辑能力、写入门和布局，不读取 CodeMirror 正文或用户路径，供失败报告定位。
+ */
+async function captureCodeMirrorEditability(editor) {
+  return editor.evaluate((editorElement) => {
+    const container = editorElement.closest(".ja-files-editor-content");
+    const contentElement = editorElement.querySelector(".cm-content");
+    const hostElement = editorElement.querySelector(".ja-code-editor__host");
+    const editorRect = editorElement.getBoundingClientRect();
+    const hostRect = hostElement?.getBoundingClientRect();
+    const contentRect = contentElement?.getBoundingClientRect();
+    const contentStyle =
+      contentElement instanceof globalThis.HTMLElement
+        ? globalThis.getComputedStyle(contentElement)
+        : undefined;
+    return {
+      contentPresent: contentElement !== null,
+      contentEditable: contentElement?.getAttribute("contenteditable") ?? null,
+      documentReadOnly: container?.getAttribute("data-document-read-only") ?? null,
+      lifecycleClosing: container?.getAttribute("data-lifecycle-closing") ?? null,
+      mutationRecoveryRequired: container?.getAttribute("data-mutation-recovery-required") ?? null,
+      editorBox: { width: editorRect.width, height: editorRect.height },
+      hostBox: hostRect === undefined ? null : { width: hostRect.width, height: hostRect.height },
+      contentBox:
+        contentRect === undefined ? null : { width: contentRect.width, height: contentRect.height },
+      contentVisibility: contentStyle?.visibility ?? null,
+      contentDisplay: contentStyle?.display ?? null,
+    };
+  });
+}
+
+/**
+ * 通过 CodeMirror 真实 contenteditable surface 替换文档，避免绕过编辑器事件链；
+ * 超时只记录脱敏的写入门与几何状态，使只读根因可诊断而不把文件正文带入报告。
+ */
 async function replaceCodeMirrorContent(editor, content, deadline) {
+  const diagnosticDeadline = Math.min(deadline, Date.now() + 10_000);
+  const surface = editor.locator(".cm-content");
+  await surface.waitFor({
+    state: "visible",
+    timeout: Math.max(1, diagnosticDeadline - Date.now()),
+  });
+  const initialEvidence = await captureCodeMirrorEditability(editor);
   const input = editor.locator('.cm-content[contenteditable="true"]');
-  await input.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  try {
+    await input.waitFor({
+      state: "visible",
+      timeout: Math.max(1, diagnosticDeadline - Date.now()),
+    });
+  } catch (error) {
+    const finalEvidence = await captureCodeMirrorEditability(editor).catch(() => ({
+      diagnosticUnavailable: true,
+    }));
+    throw new Error(
+      `CodeMirror 编辑面未就绪：${JSON.stringify({ initialEvidence, finalEvidence })}`,
+      { cause: error },
+    );
+  }
   await input.fill(content);
 }
 
@@ -8674,7 +14586,8 @@ async function exerciseFilesWorkspace(
     Math.abs(initialGeometry.hostHeight - initialGeometry.explorerHeight) > 4 ||
     Math.abs(initialGeometry.viewportHeight - expectedViewportHeight) > 4 ||
     Math.abs(initialGeometry.viewportBottom - initialGeometry.hostBottom) > 4 ||
-    Math.abs(initialGeometry.treeClientHeight - initialGeometry.viewportHeight) > 4
+    Math.abs(initialGeometry.treeClientHeight - initialGeometry.viewportHeight) > 4 ||
+    Math.abs(initialGeometry.scrollportClientHeight - initialGeometry.viewportHeight) > 4
   ) {
     throw new Error(`Files 文件树没有占满可用高度：${JSON.stringify(initialGeometry)}`);
   }
@@ -8692,12 +14605,25 @@ async function exerciseFilesWorkspace(
   if (overflowGeometry.valid !== true || overflowGeometry.overflowY !== true) {
     throw new Error(`Files 内容超过 viewport 后没有内部滚动：${JSON.stringify(overflowGeometry)}`);
   }
+  const scrollEvidence = await exerciseFilesTreeScroll(filesWorkspace);
+  if (
+    scrollEvidence.valid !== true ||
+    scrollEvidence.maximum <= 1 ||
+    scrollEvidence.requested <= 0 ||
+    Math.abs(scrollEvidence.after - scrollEvidence.requested) > 1
+  ) {
+    throw new Error(`Files 内部滚动端口不能实际滚动：${JSON.stringify(scrollEvidence)}`);
+  }
   await overflowDirectory
     .getByRole("button", { name: "折叠overflow-fixture", exact: true })
     .click({ timeout: timeout() });
   await overflowChild.waitFor({ state: "hidden", timeout: timeout() });
   const collapsedGeometry = await captureFilesTreeGeometry(filesWorkspace);
-  if (collapsedGeometry.valid !== true || collapsedGeometry.overflowY) {
+  if (
+    collapsedGeometry.valid !== true ||
+    collapsedGeometry.overflowY ||
+    collapsedGeometry.scrollportScrollTop > 1
+  ) {
     throw new Error(`Files 折叠大量节点后没有释放滚动：${JSON.stringify(collapsedGeometry)}`);
   }
 
@@ -9397,8 +15323,10 @@ async function assertTerminalPaneGeometry(page, panel, paneId, label, deadline) 
 }
 
 /**
- * 聚焦一个真实 xterm，并通过 Win32 `SendInput` 写入，使 PTY 测试覆盖桌面用户相同的
- * 原生键盘/IME 链路，而不是 CDP 键盘合成。
+ * 先用 Win32 `SendInput` 在本轮 Ja 窗口建立真实 xterm focus，再以 WebView2 原生文本
+ * 插入发送确定性 ASCII 正文，隔离宿主 IME/TSF 配置；提交仍走原生 Enter。
+ * 成功必须同时观察精确长度的 typed IPC ACK 与命令唯一输出 marker，因此文本插入
+ * 不能绕过产品终端链路，也不依赖不同 Shell 对预提交行编辑内容的回显策略。
  */
 async function writeTerminalCommand(
   page,
@@ -9492,107 +15420,31 @@ async function writeTerminalCommand(
     paneId,
     { timeout: Math.max(1, deadline - Date.now()) },
   );
-  // terminal 命令是确定性的 ASCII 测试数据，并非 IME 验收样本。VK_PACKET 绕过用户当前 IME，
-  // 但仍经过 Win32、WebView2、xterm textarea/onData、typed IPC 与真实 PTY。
-  /** 在接受 Enter 或任何聚焦后例外前，要求完整输入命令已到达 owned xterm。 */
-  const waitForCommandEcho = (echoDeadline) =>
-    page.waitForFunction(
-      ({ selector, expected }) => {
-        const rows = globalThis.document.querySelector(selector)?.querySelectorAll(":scope > div");
-        if (rows === undefined || rows.length === 0) return false;
-        return [...rows]
-          .map((row) => (row.textContent ?? "").trimEnd())
-          .join("")
-          .includes(expected);
-      },
-      { selector: `[data-pane-id="${paneId}"] .xterm-rows`, expected: command },
-      { timeout: Math.max(1, echoDeadline - Date.now()) },
-    );
-  let textInput;
-  let textAttempts = 0;
-  let textEchoError;
-  // 新拆分的 WebView2/xterm 可能比 VK_PACKET 到达 helper 提前一个原生消息轮次暴露 DOM focus。
-  // 只允许在 Enter 前重试，并先通过 xterm/typed IPC 发送真实 Ctrl+C，
-  // 避免部分输入与下一次尝试拼接或重复执行。
-  for (let attempt = 1; attempt <= 3 && Date.now() < deadline; attempt += 1) {
-    textAttempts = attempt;
-    let candidate;
-    try {
-      candidate = await invokeOwnedNativeInput(
-        identity,
-        { kind: "terminal_text", text: command },
-        signal,
-      );
-    } catch (error) {
-      const message = String(error?.message ?? error);
-      const foregroundWasStolenAfterInput =
-        message.startsWith("Win32 SendInput 身份或前台证据无效：") &&
-        message.includes('"kind":"terminal_text"') &&
-        message.includes('"foreground":false') &&
-        message.includes('"ownedHandle":');
-      if (!foregroundWasStolenAfterInput) throw error;
-      candidate = { kind: "terminal_text", foreground: false, downstreamEcho: true };
-    }
-    try {
-      // VK_PACKET 变更通过 textarea reconciliation 到达 xterm。本地 PTY echo ACK
-      // 可防止一次焦点竞态耗尽整轮预算。
-      await waitForCommandEcho(Math.min(deadline, Date.now() + 3_000));
-      textInput = candidate;
-      textEchoError = undefined;
-      break;
-    } catch (error) {
-      textEchoError = error;
-    }
-    if (attempt >= 3 || Date.now() >= deadline) break;
-    await focusOwnedRendererTarget(
-      page,
-      identity,
-      screen,
-      "清理终端残留输入前的活动输入面",
-      deadline,
-      signal,
-    );
-    const clearInputResolvedBefore = await tauriInvokePhaseCount(
-      page,
-      "ja_terminal_input",
-      "resolved",
-    );
-    await invokeOwnedNativeInput(
-      identity,
-      { kind: "chord", key: 0x43, modifiers: [0x11], repetitions: 1 },
-      signal,
-    );
-    await waitForCondition(
-      "终端 Ctrl+C 清理已进入 typed IPC",
-      async () =>
-        (await tauriInvokePhaseCount(page, "ja_terminal_input", "resolved")) >
-        clearInputResolvedBefore,
-      Math.min(deadline, Date.now() + 3_000),
-      signal,
-    );
-    await focusOwnedRendererTarget(
-      page,
-      identity,
-      screen,
-      "重试终端文本前的活动输入面",
-      deadline,
-      signal,
-    );
-    await page.waitForFunction(
-      (expectedPaneId) => {
-        const active = globalThis.document.activeElement;
-        return (
-          active instanceof globalThis.HTMLTextAreaElement &&
-          active.classList.contains("xterm-helper-textarea") &&
-          active.closest(".ja-terminal-pane")?.getAttribute("data-pane-id") === expectedPaneId
-        );
-      },
-      paneId,
-      { timeout: Math.max(1, deadline - Date.now()) },
-    );
-    await invokeOwnedNativeInput(identity, { kind: "reset_modifiers" }, signal);
-  }
-  if (textInput === undefined) {
+  // terminal 命令是确定性的 ASCII 测试数据，并非 IME 验收样本。WebView2 text insertion
+  // 避免宿主输入法把 ASCII 转为 composition；精确 IPC ACK 必须先于原生 Enter。
+  const textResolvedBefore = await tauriInvokePhaseCount(page, "ja_terminal_input", "resolved");
+  await page.keyboard.insertText(command);
+  await waitForCondition(
+    "终端正文已进入 typed IPC",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_terminal_input", "resolved")) > textResolvedBefore,
+    Math.min(deadline, Date.now() + 3_000),
+    signal,
+  );
+  const textTrace = await tauriInvokeTrace(page, "ja_terminal_input")
+    .then((trace) => trace.slice(inputTraceOffset))
+    .catch(() => []);
+  const expectedTextBytes = Buffer.byteLength(command, "utf8");
+  const textAcknowledged = textTrace.some(
+    (entry) => entry.phase === "resolved" && entry.dataLength === expectedTextBytes,
+  );
+  const textInput = {
+    kind: "webview_insert_text",
+    nativeFocus: true,
+    downstreamAck: textAcknowledged,
+  };
+  const textAttempts = 1;
+  if (!textAcknowledged) {
     const rendered = await pane.evaluate((surface, expected) => {
       const active = globalThis.document.activeElement;
       const rows = surface.querySelector(".xterm-rows");
@@ -9616,24 +15468,20 @@ async function writeTerminalCommand(
         inputProbe: globalThis.__JA_E2E_XTERM_INPUT_PROBE__ ?? null,
       };
     }, command);
-    const inputTrace = await tauriInvokeTrace(page, "ja_terminal_input")
-      .then((trace) => trace.slice(inputTraceOffset))
-      .catch(() => []);
     const inputTraceSummary = {
-      count: inputTrace.length,
+      count: textTrace.length,
       phases: Object.fromEntries(
         ["start", "resolved", "rejected"].map((phase) => [
           phase,
-          inputTrace.filter((entry) => entry.phase === phase).length,
+          textTrace.filter((entry) => entry.phase === phase).length,
         ]),
       ),
       dataLengths: [
-        ...new Set(inputTrace.map((entry) => entry.dataLength).filter(Number.isSafeInteger)),
+        ...new Set(textTrace.map((entry) => entry.dataLength).filter(Number.isSafeInteger)),
       ],
     };
     throw new Error(
-      `终端文本未完整进入对应 PTY：${JSON.stringify({ textAttempts, inputTrace: inputTraceSummary, rendered })}`,
-      { cause: textEchoError },
+      `终端文本未形成精确 typed IPC ACK：${JSON.stringify({ expectedTextBytes, inputTrace: inputTraceSummary, rendered })}`,
     );
   }
   let enterInput;
@@ -9738,7 +15586,8 @@ async function writeTerminalCommand(
         text: {
           kind: textInput.kind,
           foreground: textInput.foreground,
-          downstreamEcho: textInput.downstreamEcho === true,
+          nativeFocus: textInput.nativeFocus === true,
+          downstreamAck: textInput.downstreamAck === true,
           length: command.length,
           attempts: textAttempts,
         },
@@ -9873,7 +15722,8 @@ async function exerciseTerminalWorkspace(
   await waitForRenderedSurface(creator, "新建终端表单", deadline, signal);
   await creator
     .getByRole("combobox", { name: "Shell profile", exact: true })
-    .selectOption("power_shell");
+    .click({ timeout: timeout() });
+  await page.getByRole("option", { name: "PowerShell", exact: true }).click({ timeout: timeout() });
   await creator.getByRole("textbox", { name: "工作目录", exact: true }).fill("e2e-move-target");
   await clickVerifiedControl(
     page,
@@ -10318,8 +16168,87 @@ async function exerciseBrowserWorkspace(page, workbench, previewFixture, deadlin
     failureUrl,
     { timeout: timeout() },
   );
-  const nativeFailure = workbench.locator('.ja-preview-error[role="alert"]');
-  await nativeFailure.waitFor({ state: "visible", timeout: timeout() });
+  // 原生加载失败由共享 ErrorState 投影；以可访问语义锁定，避免与地址策略错误的样式类耦合。
+  const nativeFailure = workbench.getByRole("alert").filter({
+    // inner locator 从 Page 根开始，才会相对每个 alert 查询 heading，而不是嵌套查找工作台。
+    has: page.getByRole("heading", { name: "浏览器预览异常", exact: true }),
+  });
+  try {
+    await nativeFailure.waitFor({ state: "visible", timeout: timeout() });
+  } catch (error) {
+    const navigateTrace = await tauriInvokeTrace(page, "ja_preview_navigate");
+    const lastNavigation = navigateTrace.findLast(
+      (entry) => entry.phase === "start" && entry.sessionId !== undefined,
+    );
+    const authoritative =
+      lastNavigation?.sessionId === undefined
+        ? undefined
+        : await page
+            .evaluate(async (sessionId) => {
+              const value = await globalThis.__TAURI_INTERNALS__?.invoke("ja_preview_state", {
+                input: { sessionId },
+              });
+              return value !== null && typeof value === "object"
+                ? {
+                    generation: Number.isSafeInteger(value.generation)
+                      ? value.generation
+                      : undefined,
+                    status: typeof value.status === "string" ? value.status : undefined,
+                    loadStatus:
+                      typeof value.load_status === "string" ? value.load_status : undefined,
+                  }
+                : undefined;
+            }, lastNavigation.sessionId)
+            .catch(() => undefined);
+    const renderer = await workbench.evaluate((root) => {
+      /** 只采集布局和可访问属性，避免失败证据带出 Preview URL 或页面正文。 */
+      const describeElement = (element) => {
+        if (!(element instanceof globalThis.HTMLElement)) return null;
+        const style = globalThis.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return {
+          tag: element.tagName.toLowerCase(),
+          className: typeof element.className === "string" ? element.className.slice(0, 120) : "",
+          hidden: element.hidden,
+          inert: element.hasAttribute("inert"),
+          ariaHidden: element.getAttribute("aria-hidden"),
+          display: style.display,
+          visibility: style.visibility,
+          opacity: style.opacity,
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      };
+      const previewPanel = root.querySelector('[data-tab-panel="preview"]');
+      const alert = Array.from(root.querySelectorAll('[role="alert"]')).find((entry) =>
+        entry.textContent?.includes("浏览器预览异常"),
+      );
+      const alertAncestors = [];
+      let current = alert;
+      while (current instanceof globalThis.HTMLElement && alertAncestors.length < 8) {
+        alertAncestors.push(describeElement(current));
+        current = current.parentElement;
+      }
+      return {
+        activeTab: root.getAttribute("data-active-tab"),
+        openTabs: root.getAttribute("data-open-tabs"),
+        previewPanel: describeElement(previewPanel),
+        inspector: describeElement(root.closest(".ja-inspector")),
+        workspacePanel: describeElement(root.closest("#workbench")),
+        activeElement: describeElement(globalThis.document.activeElement),
+        alerts: Array.from(root.querySelectorAll('[role="alert"]')).map((entry) => ({
+          text: (entry.textContent ?? "").trim().slice(0, 160),
+          element: describeElement(entry),
+        })),
+        alertAncestors,
+        loading: root.textContent?.includes("正在加载预览…") === true,
+      };
+    });
+    throw new Error(
+      `Preview 原生失败未投影：${JSON.stringify({ authoritative, renderer, navigateTrace })}`,
+      { cause: error },
+    );
+  }
   if ((await nativeFailure.innerText()).includes("只支持 http://"))
     throw new Error("Preview native failure 被前端 scheme 错误冒充");
 
@@ -10458,17 +16387,19 @@ async function exercisePreviewShortcutRegistrationLifecycle(
   };
 }
 
-/** 只读取当前 UI preference 的 Workbench 投影，避免把无关 localStorage 内容带入证据。 */
+/**
+ * 只读取首版持久 Workbench 投影；`inspectorOpen` 是进程期状态，刻意不从 localStorage
+ * 恢复或作为持久证据，避免 E2E 把临时抽屉状态误判为重启事实。
+ */
 async function readWorkbenchPreference(page) {
   return page.evaluate(() => {
-    const raw = globalThis.localStorage.getItem("ja-ui-preferences-v10");
+    const raw = globalThis.localStorage.getItem("ja-ui-preferences-v1");
     const document = raw === null ? undefined : JSON.parse(raw);
     return {
       version: document?.version,
       tabs: document?.state?.rightPanelTabs,
       active: document?.state?.rightPanelTab,
       workbenchSize: document?.state?.workbenchSize,
-      inspectorOpen: document?.state?.inspectorOpen,
     };
   });
 }
@@ -10532,10 +16463,59 @@ async function verifyJoinedInspectorLayout(page, deadline, signal) {
     throw new Error("工作台分隔器缺少可测量的真实布局");
   const dragDistance = Math.min(96, Math.max(48, layoutBox.width * 0.07));
   const startX = separatorBox.x + separatorBox.width / 2;
-  const startY = separatorBox.y + separatorBox.height / 2;
-  await page.mouse.move(startX, startY);
+  const topY = separatorBox.y + separatorBox.height * 0.25;
+  const bottomY = separatorBox.y + separatorBox.height * 0.75;
+  await page.mouse.move(startX, topY);
+  await waitForCondition(
+    "工作台光带跟随上部指针",
+    async () => {
+      const visual = await readResizeHandleVisual(separator);
+      return Math.abs(Number.parseFloat(visual.pointerY) - 25) <= 0.5 && visual.opacity >= 0.8;
+    },
+    deadline,
+    signal,
+  );
+  await captureVisualEvidence(
+    page,
+    `implementation-workbench-spotlight-top-${visualTheme}-native.png`,
+  );
+  await page.mouse.move(startX, bottomY);
+  await waitForCondition(
+    "工作台光带跟随下部指针",
+    async () => {
+      const visual = await readResizeHandleVisual(separator);
+      return Math.abs(Number.parseFloat(visual.pointerY) - 75) <= 0.5 && visual.opacity >= 0.8;
+    },
+    deadline,
+    signal,
+  );
+  const workbenchHoverVisual = await readResizeHandleVisual(separator);
+  if (
+    !workbenchHoverVisual.sharedClass ||
+    workbenchHoverVisual.accent === "" ||
+    workbenchHoverVisual.focus === "" ||
+    !workbenchHoverVisual.backgroundImage.includes("gradient")
+  )
+    throw new Error(`工作台光带未消费主题渐变：${JSON.stringify(workbenchHoverVisual)}`);
+  await captureVisualEvidence(
+    page,
+    `implementation-workbench-spotlight-bottom-${visualTheme}-native.png`,
+  );
   await page.mouse.down();
-  await page.mouse.move(startX - dragDistance, startY, { steps: 8 });
+  await page.mouse.move(startX - dragDistance, bottomY, { steps: 8 });
+  await waitForCondition(
+    "工作台光带在命中区外保持拖动追踪",
+    async () => {
+      const visual = await readResizeHandleVisual(separator);
+      return (
+        visual.dragging &&
+        Math.abs(Number.parseFloat(visual.pointerY) - 75) <= 0.5 &&
+        visual.opacity >= 0.99
+      );
+    },
+    deadline,
+    signal,
+  );
   await page.mouse.up();
   await waitForCondition(
     "工作台 pointer resize 提交",
@@ -10545,7 +16525,31 @@ async function verifyJoinedInspectorLayout(page, deadline, signal) {
   );
   const resizedSize = Number(await separator.getAttribute("aria-valuenow"));
 
+  await page.mouse.move(startX - dragDistance - 48, bottomY);
+  await waitForCondition(
+    "工作台 idle 离开后清理光带坐标",
+    async () => (await readResizeHandleVisual(separator)).pointerY === "",
+    deadline,
+    signal,
+  );
   await separator.focus();
+  // 与导航分隔器相同，程序化 focus 不产生 :focus-visible；可逆键盘事务同时证明工作台
+  // 分隔器的真实键盘路径，并保持视觉采样前后的持久尺寸一致。
+  await separator.press("ArrowRight");
+  await separator.press("ArrowLeft");
+  await waitForCondition(
+    "工作台键盘焦点使用中心主题光带",
+    async () => {
+      const visual = await readResizeHandleVisual(separator);
+      return visual.focused && visual.pointerY === "" && visual.opacity >= 0.8;
+    },
+    deadline,
+    signal,
+  );
+  await captureVisualEvidence(
+    page,
+    `implementation-workbench-spotlight-focus-center-${visualTheme}-native.png`,
+  );
   await page.keyboard.press("ArrowRight");
   await waitForCondition(
     "工作台键盘缩小",
@@ -10569,7 +16573,7 @@ async function verifyJoinedInspectorLayout(page, deadline, signal) {
     const conversationRect = conversationPanel?.getBoundingClientRect();
     const workbenchRect = workbenchPanel?.getBoundingClientRect();
     const layoutRect = layout.getBoundingClientRect();
-    const raw = globalThis.localStorage.getItem("ja-ui-preferences-v10");
+    const raw = globalThis.localStorage.getItem("ja-ui-preferences-v1");
     const document = raw === null ? {} : JSON.parse(raw);
     const state = document?.state ?? {};
     const configuredSize = Number.parseFloat(
@@ -10599,7 +16603,7 @@ async function verifyJoinedInspectorLayout(page, deadline, signal) {
   )
     throw new Error(`右栏退役尺寸仍在偏好中：${JSON.stringify(snapshot)}`);
   if (
-    snapshot.preferenceVersion !== 12 ||
+    snapshot.preferenceVersion !== 14 ||
     !Number.isFinite(snapshot.persistedSize) ||
     Math.abs(snapshot.persistedSize - snapshot.configuredSize) > 0.01 ||
     snapshot.workbenchRatio === undefined ||
@@ -10732,7 +16736,8 @@ async function ensureWorkbenchVisible(page, deadline) {
 }
 
 /**
- * 覆盖无破坏抽屉转换、事务化终端关闭、休眠布局重开、关闭最后 Tab 与 v10 确定性恢复。
+ * 覆盖无破坏抽屉转换、侧边任务本地草稿、事务化终端关闭、休眠布局重开、
+ * 关闭最后 Tab 与当前偏好版本的确定性恢复；草稿关闭不能误建 Task 或终止后台 PTY。
  */
 async function exerciseOuterWorkbenchLifecycle(
   page,
@@ -10745,6 +16750,12 @@ async function exerciseOuterWorkbenchLifecycle(
   signal,
 ) {
   let launcher = await openWorkbenchLauncher(page, deadline);
+  const launcherDismissDeadline = Math.min(deadline, Date.now() + 10_000);
+  await page.keyboard.press("Escape");
+  await launcher.waitFor({
+    state: "hidden",
+    timeout: Math.max(1, launcherDismissDeadline - Date.now()),
+  });
   await clickVerifiedControl(
     page,
     workbench.getByRole("button", { name: "关闭新标签页", exact: true }),
@@ -10784,19 +16795,33 @@ async function exerciseOuterWorkbenchLifecycle(
   await assertOwnedIdentitiesAlive(remainingShells, signal, "右侧栏收起");
 
   await ensureWorkbenchVisible(page, deadline);
-  launcher = await openWorkbenchLauncher(page, deadline);
+  const sideTaskDraftDeadline = Math.min(deadline, Date.now() + 10_000);
+  launcher = await openWorkbenchLauncher(page, sideTaskDraftDeadline);
+  await clickWorkbenchMenuItem(page, launcher, "新建侧边任务", sideTaskDraftDeadline);
+  const sideTaskDraft = workbench.getByRole("region", { name: "新建侧边任务", exact: true });
+  await sideTaskDraft.waitFor({
+    state: "visible",
+    timeout: Math.max(1, sideTaskDraftDeadline - Date.now()),
+  });
+  const sideTaskTab = workbench.getByRole("tab", { name: "新侧边任务", exact: true });
+  await sideTaskTab.waitFor({
+    state: "visible",
+    timeout: Math.max(1, sideTaskDraftDeadline - Date.now()),
+  });
+  if ((await sideTaskTab.getAttribute("aria-selected")) !== "true") {
+    throw new Error("新建侧边任务后草稿 Tab 未成为活动项");
+  }
+  await assertOwnedIdentitiesAlive(remainingShells, signal, "侧边任务草稿打开");
   await clickVerifiedControl(
     page,
-    launcher.locator(".ja-workbench-launcher-action").filter({ hasText: "侧边聊天" }),
+    workbench.getByRole("button", { name: "关闭新侧边任务", exact: true }),
     deadline,
   );
-  const sideChatCollapsed = await waitForWorkbenchCollapsed(workbench, deadline, signal);
-  await page.waitForFunction(
-    () => globalThis.document.activeElement?.getAttribute("aria-label") === "消息",
-    undefined,
-    { timeout: Math.max(1, deadline - Date.now()) },
-  );
-  await assertOwnedIdentitiesAlive(remainingShells, signal, "侧边聊天收栏");
+  await sideTaskDraft.waitFor({
+    state: "detached",
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  await assertOwnedIdentitiesAlive(remainingShells, signal, "侧边任务草稿关闭");
 
   await ensureWorkbenchVisible(page, deadline);
   const newTabCloseBeforeTerminal = workbench.getByRole("button", {
@@ -10901,7 +16926,8 @@ async function exerciseOuterWorkbenchLifecycle(
   if (
     !Array.isArray(failedPreference.tabs) ||
     !failedPreference.tabs.includes("terminal") ||
-    failedPreference.inspectorOpen !== true
+    failedPreference.active !== "terminal" ||
+    (await workbench.getAttribute("data-visible")) !== "true"
   ) {
     throw new Error(`closeAll 失败后 Terminal 偏好未保留：${JSON.stringify(failedPreference)}`);
   }
@@ -10942,41 +16968,46 @@ async function exerciseOuterWorkbenchLifecycle(
     throw new Error("Terminal 外层 Tab 成功关闭后工作区仍保持挂载");
   const collapsed = await waitForWorkbenchCollapsed(workbench, deadline, signal);
   const closedPreference = await readWorkbenchPreference(page);
-  if (
-    JSON.stringify(closedPreference.tabs) !== JSON.stringify([]) ||
-    closedPreference.inspectorOpen !== false
-  ) {
+  if (JSON.stringify(closedPreference.tabs) !== JSON.stringify([])) {
     throw new Error(`关闭最后一个 Terminal Tab 后偏好未收起：${JSON.stringify(closedPreference)}`);
   }
 
   await ensureWorkbenchVisible(page, deadline);
-  launcher = await openWorkbenchLauncher(page, deadline);
-  await clickVerifiedControl(
-    page,
-    launcher.locator(".ja-workbench-launcher-action").filter({ hasText: "终端" }),
-    deadline,
-  );
+  const terminalMenuDeadline = Math.min(deadline, Date.now() + 10_000);
+  launcher = await openWorkbenchLauncher(page, terminalMenuDeadline);
+  await clickWorkbenchMenuItem(page, launcher, "终端", terminalMenuDeadline);
   await terminalWorkspace.waitFor({
     state: "visible",
     timeout: Math.max(1, deadline - Date.now()),
   });
-  await page.waitForFunction(
-    (paneCount) => {
-      const panes = [
-        ...globalThis.document.querySelectorAll(
-          ".ja-terminal-workspace .ja-terminal-pane[data-pane-id]",
-        ),
-      ];
-      return (
-        panes.length === paneCount &&
-        panes.every(
-          (pane) => pane.querySelector(".ja-terminal-pane-state")?.textContent?.trim() === "运行中",
-        )
-      );
-    },
-    persistedPaneIds.length,
-    { timeout: Math.max(1, deadline - Date.now()) },
-  );
+  let reopenedPaneSnapshot = [];
+  try {
+    await waitForCondition(
+      "重开 Terminal 恢复全部运行中 pane",
+      async () => {
+        reopenedPaneSnapshot = await terminalWorkspace
+          .locator(".ja-terminal-pane[data-pane-id]")
+          .evaluateAll((panes) =>
+            panes.map((pane) => ({
+              paneId: pane.getAttribute("data-pane-id"),
+              state: pane.querySelector(".ja-terminal-pane-state")?.textContent?.trim() ?? null,
+              sessionId: pane.getAttribute("data-terminal-session-id"),
+              generation: pane.getAttribute("data-terminal-session-generation"),
+            })),
+          );
+        return (
+          reopenedPaneSnapshot.length === persistedPaneIds.length &&
+          reopenedPaneSnapshot.every(({ state }) => state === "运行中")
+        );
+      },
+      deadline,
+      signal,
+    );
+  } catch (error) {
+    throw new Error(`重开 Terminal 运行态不完整：${JSON.stringify(reopenedPaneSnapshot)}`, {
+      cause: error,
+    });
+  }
   const reopenedPaneIds = await terminalWorkspace
     .locator(".ja-terminal-pane[data-pane-id]")
     .evaluateAll((panes) => panes.map((pane) => pane.getAttribute("data-pane-id")).sort());
@@ -11033,7 +17064,7 @@ async function exerciseOuterWorkbenchLifecycle(
   if (
     JSON.stringify(persisted.tabs) !== JSON.stringify(order) ||
     persisted.active !== active ||
-    persisted.version !== 12
+    persisted.version !== 14
   ) {
     throw new Error(`当前工作区 Tab 偏好未同步：${JSON.stringify({ order, active, persisted })}`);
   }
@@ -11043,7 +17074,7 @@ async function exerciseOuterWorkbenchLifecycle(
       dragged: { before: orderBefore, after: orderAfter },
       ordinarySwitchPreservedPty: true,
       drawerCollapse: drawerCollapsed,
-      sideChat: sideChatCollapsed,
+      sideTaskDraft: { created: true, closedWithoutTaskCreation: true },
       browserNativeClose: true,
       terminalExplicitClose: {
         failedAttemptRetainedTab: true,
@@ -11100,11 +17131,7 @@ async function exerciseProjectWorkbench(
   const projectThreadId = await currentThreadId(page, stepDeadline(), signal);
   stage("open_drawer");
   actionDeadline = stepDeadline();
-  const openWorkbench = page.getByRole("button", { name: "显示工作区面板", exact: true });
-  await openWorkbench.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
-  await openWorkbench.click();
-  const workbench = page.locator('.ja-inspector[aria-label="工作区面板"]');
-  await workbench.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
+  const workbench = await ensureWorkbenchVisible(page, actionDeadline);
   stage("joined_inspector_layout");
   const inspectorLayout = await verifyJoinedInspectorLayout(page, stepDeadline(), signal);
   stage("scope_round_trip");
@@ -11118,25 +17145,6 @@ async function exerciseProjectWorkbench(
   );
   await workbench.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
   const ownedWindow = await resolveOwnedJaWindow(nativeScope, signal);
-  stage("open_with_menu");
-  actionDeadline = stepDeadline();
-  const openWithTrigger = page.getByRole("button", { name: "打开方式", exact: true });
-  if ((await openWithTrigger.count()) !== 1)
-    throw new Error("中栏标题缺少唯一的工作区打开方式入口");
-  await openWithTrigger.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
-  await clickVerifiedControl(page, openWithTrigger, actionDeadline);
-  const openWithMenu = page.locator('.ja-workspace-open-menu[role="menu"][data-state="open"]');
-  await waitForRenderedSurface(openWithMenu, "打开方式菜单", actionDeadline, signal);
-  const targetCount = await openWithMenu.getByRole("menuitem").count();
-  if (targetCount < 1) throw new Error("打开方式白名单为空");
-  const fileExplorer = openWithMenu
-    .locator('[role="menuitem"]')
-    .filter({ hasText: "文件资源管理器" });
-  if ((await fileExplorer.count()) !== 1 || !(await fileExplorer.isEnabled()))
-    throw new Error("文件资源管理器白名单目标不可用");
-  stage("open_explorer");
-  await clickVerifiedControl(page, fileExplorer, actionDeadline);
-  await closeWorkspaceExplorerWindow(directories.workspace, signal);
 
   stage("summary");
   actionDeadline = stepDeadline();
@@ -11159,8 +17167,7 @@ async function exerciseProjectWorkbench(
   actionDeadline = stepDeadline(60_000);
   await closeWorkbenchTabsExcept(page, workbench, ["review"], actionDeadline);
   const launcher = await openWorkbenchLauncher(page, actionDeadline);
-  await launcher.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
-  await ensureConversationSummaryOpen(page, actionDeadline);
+  // 新菜单与环境摘要同为互斥浮层；摘要已在上一阶段独立取证，此处保持真实菜单可交互。
   await captureNativeMaximizedVisualEvidence(
     page,
     `implementation-codex-workbench-launcher-${visualTheme}-native-2560x1392.png`,
@@ -11176,11 +17183,10 @@ async function exerciseProjectWorkbench(
   nativeViewport = await assertNativeMaximizedVisualViewport(page, actionDeadline);
 
   stage("review");
-  await clickVerifiedControl(
-    page,
-    launcher.locator(".ja-workbench-launcher-action").filter({ hasText: "审查" }),
-    actionDeadline,
-  );
+  // Launcher 的真窗响应式矩阵拥有独立预算；Review 必须重新取得阶段预算，避免前一阶段
+  // 合法用满窗口后把 1ms 余量误报为撤销链路失败。
+  actionDeadline = stepDeadline(60_000);
+  await clickWorkbenchMenuItem(page, launcher, "审查", actionDeadline);
   await page
     .locator('[data-tab-panel="review"]:not([hidden])')
     .waitFor({ state: "visible", timeout: timeout(actionDeadline) });
@@ -11243,17 +17249,25 @@ async function exerciseProjectWorkbench(
 
   stage("file_search");
   actionDeadline = stepDeadline();
-  await clickVerifiedControl(
-    page,
-    filesWorkspace.getByRole("tab", { name: "搜索", exact: true }),
-    actionDeadline,
-  );
   const searchInput = filesWorkspace.getByRole("searchbox", { name: "搜索工作区", exact: true });
   await searchInput.fill("Ja workbench");
-  await filesWorkspace
+  const searchResult = filesWorkspace
     .getByRole("list", { name: "搜索结果", exact: true })
-    .getByText("new-file.txt", { exact: true })
-    .waitFor({ state: "visible", timeout: timeout(actionDeadline) });
+    .getByRole("button", { name: /new-file\.txt/u });
+  await searchResult.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
+  await searchResult.click({ button: "right" });
+  await clickVerifiedControl(
+    page,
+    page.getByRole("menuitem", { name: "添加到对话", exact: true }),
+    actionDeadline,
+  );
+  const removeSearchReference = page.getByRole("button", {
+    name: "移除上下文 new-file.txt",
+    exact: true,
+  });
+  await removeSearchReference.waitFor({ state: "visible", timeout: timeout(actionDeadline) });
+  await removeSearchReference.click();
+  await removeSearchReference.waitFor({ state: "detached", timeout: timeout(actionDeadline) });
   await captureRendererVisualEvidenceAtViewport(
     page,
     `implementation-codex-workbench-files-${visualTheme}-renderer-1280x720.png`,
@@ -11294,7 +17308,9 @@ async function exerciseProjectWorkbench(
   );
 
   stage("outer_tab_lifecycle");
-  actionDeadline = stepDeadline(60_000);
+  // 本阶段包含 fault-injection closeAll、四个 PTY 的退出/重建和侧边任务草稿事务；
+  // 使用一个 180 秒共享上限，避免每个等待各自扩张预算，同时给 Windows 进程回收留足空间。
+  actionDeadline = stepDeadline(180_000);
   const tabLifecycle = await exerciseOuterWorkbenchLifecycle(
     page,
     workbench,
@@ -11337,7 +17353,6 @@ async function exerciseProjectWorkbench(
   );
   stage("completed");
   return {
-    openTargets: targetCount,
     projectThreadId,
     review,
     launcher: true,
@@ -11364,28 +17379,31 @@ async function exerciseProjectWorkbench(
 }
 
 /**
- * 通过真实 Settings 表单创建首个 Provider 与模型；密钥只进入 password input，
+ * 通过真实 Settings 表单创建首个 Provider 与模型；名称/API 使用显式正交输入，密钥只进入 password input，
  * 保存后必须立即清空并只留下“已配置”投影，避免页面验收依赖预写配置或 Secret 回显。
  */
 async function configureRealProviderThroughUi(page, providerConfig, deadline) {
   const timeout = () => Math.max(1, deadline - Date.now());
   const settings = page.getByRole("region", { name: "设置页面", exact: true });
   await settings.waitFor({ state: "visible", timeout: timeout() });
-  await settings.getByRole("button", { name: "新增 Provider", exact: true }).click();
-  await settings.getByLabel("服务商名称", { exact: true }).fill("E2E Real Provider");
-  if (providerConfig.api === "anthropic_messages") {
-    await settings.getByRole("combobox", { name: "服务商", exact: true }).click();
-    await page.getByRole("option", { name: "Anthropic", exact: true }).click();
+  if ((await settings.getByRole("button", { name: "返回应用", exact: true }).count()) !== 0) {
+    throw new Error("首次模型配置门禁不应显示返回应用");
   }
-  const apiLabel =
-    providerConfig.api === "anthropic_messages" ? "Anthropic Messages" : "OpenAI Responses";
-  await settings.getByRole("combobox", { name: "接口", exact: true }).click();
+  await settings.getByRole("button", { name: "新增 Provider", exact: true }).click();
+  await settings.getByLabel("服务商名称", { exact: true }).fill(providerConfig.name);
+  const apiLabel = {
+    anthropic_messages: "Anthropic Messages",
+    openai_responses: "OpenAI Responses",
+    openai_chat_completions: "OpenAI Chat Completions",
+  }[providerConfig.api];
+  if (apiLabel === undefined) throw new Error("真实 Provider API 不受设置页支持");
+  await settings.getByRole("combobox", { name: "API 规范", exact: true }).click();
   await page.getByRole("option", { name: apiLabel, exact: true }).click();
   await settings.getByLabel("Base URL", { exact: true }).fill(providerConfig.baseUrl);
   await settings.getByLabel("首个模型名称", { exact: true }).fill("E2E Real Model");
   await settings.getByLabel("上游模型", { exact: true }).fill(providerConfig.model);
   await settings.getByRole("button", { name: "保存 Provider", exact: true }).click();
-  await settings.getByText("E2E Real Provider", { exact: true }).waitFor({
+  await settings.getByText(providerConfig.name, { exact: true }).waitFor({
     state: "visible",
     timeout: timeout(),
   });
@@ -11406,7 +17424,10 @@ async function configureRealProviderThroughUi(page, providerConfig, deadline) {
     state: "visible",
     timeout: timeout(),
   });
-  await settings.getByRole("button", { name: "返回对话", exact: true }).click();
+  const returnButton = settings.getByRole("button", { name: "返回应用", exact: true });
+  await returnButton.waitFor({ state: "visible", timeout: timeout() });
+  if ((await returnButton.count()) !== 1) throw new Error("设置页返回应用按钮数量错误");
+  await returnButton.click();
 }
 
 /** 验证 model editor 只回显已配置状态，password input 必须保持空值。 */
@@ -11428,7 +17449,7 @@ async function assertRedactedModelCredential(page, deadline) {
   ) {
     throw new Error("模型 API Key 编辑器泄漏了已保存凭据");
   }
-  await settings.getByRole("button", { name: "返回对话", exact: true }).click();
+  await settings.getByRole("button", { name: "返回应用", exact: true }).click();
   await conversationSurface(page).waitFor({ state: "visible", timeout: timeout() });
 }
 
@@ -11482,28 +17503,60 @@ async function runProjectBusinessConversation(page, workbench, deadline, directo
 
 /**
  * 向已验证控件发送一次真实 pointer click。Approval button 会立即替换为 loading/resolved DOM；
- * 使用冻结命中点可避免 locator 对正确消失的节点重试，后续产品状态断言仍作为最终裁决。
+ * 使用冻结命中点可避免 locator 对正确消失的节点重试，后续产品状态断言仍作为最终裁决；
+ * 单次定位最多十秒，失效选择器不能占满整轮测试预算。
  */
 async function clickVerifiedControl(page, locator, deadline) {
-  await locator.waitFor({ state: "attached", timeout: Math.max(1, deadline - Date.now()) });
+  const interactionDeadline = Math.min(deadline, Date.now() + 10_000);
+  await locator.waitFor({
+    state: "attached",
+    timeout: Math.max(1, interactionDeadline - Date.now()),
+  });
   if (!(await locator.isEnabled())) {
     throw new Error("E2E control is visible but disabled");
   }
   // 横向条带中的 tab 可能有效，但部分被固定 launcher 控件裁切。先滚动真实 DOM container；
   // 随后的最上层 hit-test 仍会拒绝任何剩余重叠。
-  await locator.scrollIntoViewIfNeeded({ timeout: Math.max(1, deadline - Date.now()) });
-  const hit = await waitForRenderedSurface(locator, "E2E control", deadline);
+  await locator.scrollIntoViewIfNeeded({ timeout: Math.max(1, interactionDeadline - Date.now()) });
+  const hit = await waitForRenderedSurface(locator, "E2E control", interactionDeadline);
   await page.mouse.click(hit.x, hit.y);
 }
 
 /**
- * 通过真实“新会话”控件创建一个 Thread，并等待列表数量、active identity 与旧 Thread 同时变化；
- * 不调用隐藏 RPC，确保后续标题断言覆盖和用户相同的创建路径。
+ * 等待真实 WebView2 把焦点交给当前可编辑 Composer；用 activeElement 验证最终键盘落点，
+ * 避免仅凭 textarea 可见就把侧栏或 Dialog 仍持有焦点误报为通过。
+ */
+async function waitForComposerFocus(page, deadline) {
+  await page.waitForFunction(
+    () => {
+      const composer = globalThis.document.querySelector('textarea[aria-label="消息"]');
+      return (
+        composer instanceof globalThis.HTMLTextAreaElement &&
+        !composer.disabled &&
+        globalThis.document.activeElement === composer
+      );
+    },
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+}
+
+/**
+ * 通过真实“新会话”控件创建一个 Thread，并按创建前集合识别唯一新增 identity；随后显式复选该项，
+ * 抵御旧 Thread 的迟到 Goal 事件覆盖 active 状态。不调用隐藏创建 RPC，最终键盘落点仍走用户路径。
  */
 async function createConversationThread(page, deadline, signal) {
   const previousThreadId = await currentThreadId(page, deadline, signal);
   const rows = page.getByRole("list", { name: "最近对话列表" }).locator("button[data-thread-id]");
   const countBefore = await rows.count();
+  const idsBefore = new Set(
+    await rows.evaluateAll((candidates) =>
+      candidates.flatMap((candidate) => {
+        const threadId = candidate.getAttribute("data-thread-id");
+        return threadId === null ? [] : [threadId];
+      }),
+    ),
+  );
   const create = page.locator('button[aria-label="新会话"]');
   await create.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   await page.waitForFunction(
@@ -11516,19 +17569,4169 @@ async function createConversationThread(page, deadline, signal) {
   );
   await create.click();
   await page.waitForFunction(
-    ({ previous, before }) => {
+    ({ previous, before, knownIds }) => {
       const candidates = Array.from(
         globalThis.document.querySelectorAll('[aria-label="最近对话列表"] button[data-thread-id]'),
       );
       const active = candidates.find(
         (candidate) => candidate.getAttribute("aria-current") === "page",
       );
-      return candidates.length >= before + 1 && active?.getAttribute("data-thread-id") !== previous;
+      return (
+        candidates.length >= before + 1 &&
+        active?.getAttribute("data-thread-id") !== previous &&
+        candidates.some((candidate) => !knownIds.includes(candidate.getAttribute("data-thread-id")))
+      );
     },
-    { previous: previousThreadId, before: countBefore },
+    { previous: previousThreadId, before: countBefore, knownIds: [...idsBefore] },
     { timeout: Math.max(1, deadline - Date.now()) },
   );
-  return currentThreadId(page, deadline, signal);
+  const createdIds = (
+    await rows.evaluateAll((candidates) =>
+      candidates.flatMap((candidate) => {
+        const threadId = candidate.getAttribute("data-thread-id");
+        return threadId === null ? [] : [threadId];
+      }),
+    )
+  ).filter((threadId) => !idsBefore.has(threadId));
+  if (createdIds.length !== 1) {
+    throw new Error(`新会话创建后新增 Thread identity 数量异常：${createdIds.length}`);
+  }
+  const createdThreadId = createdIds[0];
+  // Goal 终态事件可能在创建 ACK 后刷新旧 Thread；显式复选新增项可稳定恢复场景的真实用户路径。
+  await selectThreadById(page, createdThreadId, deadline, signal);
+  await waitForComposerFocus(page, deadline);
+  const activeThreadId = await currentThreadId(page, deadline, signal);
+  if (activeThreadId !== createdThreadId)
+    throw new Error("新会话焦点稳定后 active Thread identity 漂移");
+  return createdThreadId;
+}
+
+/**
+ * 以最短真实用户路径验证“选择项目后的空会话复用”：项目切换、effective Settings、历史装载
+ * 仍走生产 Tauri/JA-RPC，再次点击新会话不得新增空 Thread。
+ */
+async function runProjectNewConversationAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  signal,
+  recordStage,
+) {
+  const stage = (name) => recordStage?.(`project_new:${name}`);
+  const startupDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  stage("load");
+  await page.waitForFunction(
+    () =>
+      globalThis.document.readyState === "interactive" ||
+      globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: Math.max(1, startupDeadline - Date.now()) },
+  );
+  stage("general_ready");
+  await page
+    .getByRole("heading", { name: "你想让 Ja 帮你完成什么？", exact: true })
+    .waitFor({ state: "visible", timeout: Math.max(1, startupDeadline - Date.now()) });
+  await waitForRuntimeReady(page, startupDeadline, signal);
+  await waitForInitialThread(page, startupDeadline, signal);
+  await assertGeneralConversationScope(page, startupDeadline);
+
+  const generalThreadId = await currentThreadId(page, startupDeadline, signal);
+  stage("select_project");
+  await clickVerifiedControl(
+    page,
+    page.getByRole("button", { name: "添加项目", exact: true }),
+    startupDeadline,
+  );
+  const selectedProject = page.locator(
+    '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
+  );
+  await selectedProject.waitFor({
+    state: "visible",
+    timeout: Math.max(1, startupDeadline - Date.now()),
+  });
+  await page.waitForFunction(
+    (previous) => {
+      const selected = globalThis.document.querySelector(
+        '[aria-label="最近对话列表"] button[aria-current="page"]',
+      );
+      return selected?.getAttribute("data-thread-id") !== previous;
+    },
+    generalThreadId,
+    { timeout: Math.max(1, startupDeadline - Date.now()) },
+  );
+  await assertProjectConversationScope(page, startupDeadline);
+  const initialProjectThreadId = await currentThreadId(page, startupDeadline, signal);
+
+  stage("reuse_empty_thread");
+  const rows = page.getByRole("list", { name: "最近对话列表" }).locator("button[data-thread-id]");
+  const threadCountBefore = await rows.count();
+  await clickVerifiedControl(page, page.locator('button[aria-label="新会话"]'), startupDeadline);
+  await waitForComposerFocus(page, startupDeadline);
+  const reusedThreadId = await currentThreadId(page, startupDeadline, signal);
+  const threadCountAfter = await rows.count();
+  if (
+    reusedThreadId !== initialProjectThreadId ||
+    reusedThreadId === generalThreadId ||
+    threadCountAfter !== threadCountBefore
+  ) {
+    throw new Error("项目空会话重复新建产生了额外 Thread");
+  }
+  await assertProjectConversationScope(page, startupDeadline);
+  const selectedProjectLabel = await selectedProject.getAttribute("aria-label");
+  stage("completed");
+  return {
+    generalThreadId,
+    initialProjectThreadId,
+    reusedThreadId,
+    threadCountBefore,
+    threadCountAfter,
+    selectedProjectLabel,
+    newConversationEnabled: await page.locator('button[aria-label="新会话"]').isEnabled(),
+    ui: await captureUiEvidence(page, directories, signal),
+  };
+}
+
+/**
+ * 通过产品 Tauri command 调用 Goal RPC，同时把失败压缩为稳定 code；返回值只在当前 WebView
+ * 内用于 CAS，调用方不得把 objective、plan body、hash 或幂等键写入持久 E2E summary。
+ */
+async function invokePlanGoalCommand(page, command, input) {
+  return page.evaluate(
+    async ({ commandName, commandInput }) => {
+      const invoke = globalThis.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== "function") return { ok: false, code: "TAURI_BRIDGE_UNAVAILABLE" };
+      try {
+        return { ok: true, value: await invoke(commandName, { input: commandInput }) };
+      } catch (error) {
+        const candidate = error !== null && typeof error === "object" ? error : {};
+        const nested =
+          candidate.error !== null && typeof candidate.error === "object" ? candidate.error : {};
+        const code = [candidate.code, candidate.errorCode, nested.code].find(
+          (value) => typeof value === "string" && /^[A-Z][A-Z0-9_]{2,63}$/u.test(value),
+        );
+        return { ok: false, code: code ?? "GOAL_RPC_REJECTED" };
+      }
+    },
+    { commandName: command, commandInput: input },
+  );
+}
+
+/**
+ * 恢复场景同样遵守活动 Goal 的 run-replacement 边界；先暂停并等待旧 continuation/lease 收口，
+ * attach 重试复用一个幂等键，成功后再显式恢复，避免 E2E 为恢复路径保留协议旁路。
+ */
+async function attachPlanForRecovery(page, goalProjection, plan, revision, deadline, signal) {
+  const pauseKey = `plan-goal-recovery-pause-${Date.now().toString(36)}`;
+  const paused = await invokePlanGoalCommand(page, "ja_runtime_goal_pause", {
+    goalId: goalProjection.goal.goalId,
+    expectedGoalRevision: goalProjection.goal.revision,
+    idempotencyKey: pauseKey,
+  });
+  if (paused.ok !== true || paused.value?.goal?.status !== "paused") {
+    throw new Error(`恢复 Goal pause 失败：${paused.code ?? "UNKNOWN"}`);
+  }
+  const attachKey = `plan-goal-recovery-attach-${Date.now().toString(36)}`;
+  let attached;
+  await waitForCondition(
+    "恢复 Goal attach settlement",
+    async () => {
+      const candidate = await invokePlanGoalCommand(page, "ja_runtime_goal_plan_attach", {
+        goalId: paused.value.goal.goalId,
+        expectedGoalRevision: paused.value.goal.revision,
+        idempotencyKey: attachKey,
+        planId: plan.plan.planId,
+        planRevisionId: revision.planRevisionId,
+        planHash: revision.planHash,
+      });
+      if (candidate.ok === true) {
+        attached = candidate;
+        return true;
+      }
+      if (candidate.code === "GOAL_INVALID_STATE") return false;
+      throw new Error(`恢复 Goal attach 失败：${candidate.code}`);
+    },
+    Math.min(deadline, Date.now() + 5_000),
+    signal,
+    50,
+  );
+  if (attached?.value?.goal === undefined) throw new Error("恢复 Goal attach 未返回权威投影");
+  const resumed = await invokePlanGoalCommand(page, "ja_runtime_goal_resume", {
+    goalId: attached.value.goal.goalId,
+    expectedGoalRevision: attached.value.goal.revision,
+    idempotencyKey: `${attachKey}:resume`,
+  });
+  if (resumed.ok !== true || resumed.value?.goal?.status !== "active") {
+    throw new Error(`恢复 Goal resume 失败：${resumed.code ?? "UNKNOWN"}`);
+  }
+  return resumed;
+}
+
+/** Goal ACK 的身份只能来自严格 RPC 投影；缺字段时立即失败，不从 DOM 文本猜测。 */
+function planGoalSnapshotIdentity(result) {
+  if (result?.ok !== true || result.value === null || typeof result.value !== "object") {
+    throw new Error(`Plan/Goal RPC 未返回投影：${result?.code ?? "UNKNOWN"}`);
+  }
+  const goal = result.value.goal;
+  const projection = result.value.plan;
+  const revision = projection?.currentRevision ?? result.value.currentRevision ?? null;
+  const step = Array.isArray(revision?.steps) ? revision.steps[0] : undefined;
+  const criterion = Array.isArray(revision?.acceptanceCriteria)
+    ? revision.acceptanceCriteria[0]
+    : undefined;
+  if (
+    goal === null ||
+    typeof goal !== "object" ||
+    typeof goal.goalId !== "string" ||
+    !Number.isSafeInteger(goal.revision)
+  ) {
+    throw new Error("Plan/Goal ACK 缺少服务端 goal identity");
+  }
+  return {
+    goal,
+    projection,
+    revision,
+    goalId: goal.goalId,
+    goalRevision: goal.revision,
+    runId: goal.currentRunId ?? goal.activeRunId ?? null,
+    planRevisionId:
+      revision?.planRevisionId ?? goal.planRevisionId ?? goal.activePlanRevisionId ?? null,
+    planHash: revision?.planHash ?? goal.planHash ?? null,
+    stepId: step?.stepId ?? null,
+    criterionId: criterion?.criterionId ?? null,
+  };
+}
+
+/**
+ * 从 owner Thread 的 JA-RPC 快照提取 Turn、审批和 Tool 的关联身份。这里刻意不读取 DOM
+ * 或正文，避免 pause 后残留卡片成为第二状态源，并让 resume 验收能够拒绝旧 Turn/旧审批。
+ */
+async function readPlanGoalThreadAuthority(page, threadId) {
+  if (!/^(?:thread|thr)_[A-Za-z0-9._-]+$/u.test(threadId)) {
+    throw new Error("Plan/Goal owner thread identity 非法");
+  }
+  const snapshot = await page.evaluate(async (expectedThreadId) => {
+    const invoke = globalThis.__TAURI_INTERNALS__?.invoke;
+    if (typeof invoke !== "function") return { status: "bridge_unavailable" };
+    try {
+      const value = await invoke("ja_thread_read", {
+        input: { threadId: expectedThreadId, limit: 200 },
+      });
+      const root = value !== null && typeof value === "object" ? value : {};
+      const turns = Array.isArray(root.turns) ? root.turns : [];
+      const items = Array.isArray(root.items) ? root.items : [];
+      return {
+        status: "resolved",
+        revision: Number.isSafeInteger(root.revision) ? root.revision : null,
+        turns: turns.flatMap((turn) =>
+          typeof turn?.turnId === "string" && typeof turn?.status === "string"
+            ? [{ turnId: turn.turnId, status: turn.status }]
+            : [],
+        ),
+        approvals: items.flatMap((item) =>
+          item?.kind === "approval" &&
+          typeof item.approvalId === "string" &&
+          typeof item.turnId === "string" &&
+          typeof item.callId === "string"
+            ? [
+                {
+                  approvalId: item.approvalId,
+                  turnId: item.turnId,
+                  callId: item.callId,
+                  toolName: typeof item.toolName === "string" ? item.toolName : null,
+                  decision: typeof item.decision === "string" ? item.decision : null,
+                },
+              ]
+            : [],
+        ),
+        toolCalls: items.flatMap((item) =>
+          item?.kind === "tool_call" &&
+          typeof item.turnId === "string" &&
+          typeof item.callId === "string"
+            ? [
+                {
+                  turnId: item.turnId,
+                  callId: item.callId,
+                  toolName: typeof item.toolName === "string" ? item.toolName : null,
+                  presentationStatus:
+                    typeof item.presentation?.status === "string" ? item.presentation.status : null,
+                },
+              ]
+            : [],
+        ),
+      };
+    } catch {
+      return { status: "rejected" };
+    }
+  }, threadId);
+  if (
+    snapshot?.status !== "resolved" ||
+    !Number.isSafeInteger(snapshot.revision) ||
+    !Array.isArray(snapshot.turns) ||
+    !Array.isArray(snapshot.approvals) ||
+    !Array.isArray(snapshot.toolCalls)
+  ) {
+    throw new Error(`Plan/Goal owner Thread 权威快照不可用：${snapshot?.status ?? "invalid"}`);
+  }
+  return snapshot;
+}
+
+/**
+ * Plan/Goal 扩展 Tool 与 Shell 共享 ApprovalMiddleware；验收必须按权威关联身份逐个批准，
+ * 不能把 Tool 之间短暂出现的 working phase 当成下一阶段已经提交。DOM 只承担用户点击，
+ * 待审批事实与批准终态分别由 Thread JA-RPC 快照确认。
+ */
+async function approvePendingPlanGoalTool(page, { goalId, threadId, toolName }, deadline, signal) {
+  let requested;
+  await waitForCondition(
+    `Goal ${toolName} 权威审批出现`,
+    async () => {
+      const goalRead = await invokePlanGoalCommand(page, "ja_runtime_goal_read", { goalId });
+      if (goalRead.ok !== true) return false;
+      const identity = planGoalSnapshotIdentity(goalRead);
+      const authority = await readPlanGoalThreadAuthority(page, threadId);
+      const pending = authority.approvals.findLast(
+        (approval) => approval.toolName === toolName && approval.decision === null,
+      );
+      if (pending === undefined) return false;
+      const turn = authority.turns.find((candidate) => candidate.turnId === pending.turnId);
+      const tool = authority.toolCalls.find(
+        (candidate) =>
+          candidate.turnId === pending.turnId &&
+          candidate.callId === pending.callId &&
+          candidate.toolName === toolName &&
+          candidate.presentationStatus === "waiting_approval",
+      );
+      if (
+        identity.goal.status !== "active" ||
+        identity.goal.phase !== "waiting_approval" ||
+        turn?.status !== "waiting_approval" ||
+        tool === undefined
+      ) {
+        return false;
+      }
+      requested = pending;
+      return true;
+    },
+    deadline,
+    signal,
+  );
+
+  const turnRow = page.locator(`.ja-chat-timeline__row[data-turn-id="${requested.turnId}"]`);
+  const approvalCard = turnRow
+    .getByText(requested.callId, { exact: true })
+    .locator("xpath=ancestor::section[1]");
+  const approval = approvalCard.getByRole("button", { name: "批准", exact: true });
+  await approval.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await clickVerifiedControl(page, approval, deadline);
+
+  await waitForCondition(
+    `Goal ${toolName} 批准持久化`,
+    async () => {
+      const authority = await readPlanGoalThreadAuthority(page, threadId);
+      return authority.approvals.some(
+        (candidate) =>
+          candidate.approvalId === requested.approvalId &&
+          candidate.turnId === requested.turnId &&
+          candidate.callId === requested.callId &&
+          candidate.toolName === toolName &&
+          candidate.decision === "approve",
+      );
+    },
+    deadline,
+    signal,
+  );
+  return requested;
+}
+
+/**
+ * App Server 被故障注入终止后，通过真实桌面的“重新启动”恢复同一 Rust owner；循环只处理可见
+ * 重试入口并受绝对期限约束，不能从测试进程直接创建第二个 bridge 或绕过产品恢复路径。
+ */
+async function restartRuntimeAfterGoalCrash(page, deadline, signal) {
+  await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
+  let retryCount = 0;
+  await waitForCondition(
+    "Goal crash 后桌面运行时重新连接",
+    async () => {
+      const connected = await page
+        .getByRole("status", { name: "本地运行时：已连接", exact: true })
+        .isVisible()
+        .catch(() => false);
+      if (connected) return true;
+      const retry = page.getByRole("button", { name: "重新启动", exact: true });
+      if (
+        (await retry.isVisible().catch(() => false)) &&
+        (await retry.isEnabled().catch(() => false))
+      ) {
+        await retry.click({ timeout: Math.max(1, Math.min(5_000, deadline - Date.now())) });
+        retryCount += 1;
+      }
+      return false;
+    },
+    deadline,
+    signal,
+  );
+  await installRawTauriEventProbe(page);
+  await installTauriInvokeProbe(page);
+  return retryCount;
+}
+
+/**
+ * 恢复场景先批准独立 Plan，再创建 Goal 并显式 attach 精确 revision/hash；approve 本身不得启动
+ * run。直建不会替 React 刷新 Thread catalog，因此 attach 后重载 WebView，再只终止本轮隔离
+ * Java identity，以多源证据证明副作用 Tool 没有被盲目重放。
+ */
+async function runPlanGoalCrashRecoveryAcceptance(
+  page,
+  threadId,
+  directories,
+  providerFixture,
+  nativeScope,
+  nativeSidecar,
+  deadline,
+  signal,
+  stage,
+) {
+  const scenario = providerFixture.scenarios.planGoal;
+  const definition = {
+    objective: scenario.recoveryObjective,
+    scope: [scenario.scope],
+    nonGoals: ["不验证副作用是否在外部系统完成"],
+    constraints: ["只使用隔离 loopback Provider 和本轮临时目录"],
+    acceptanceCriteria: [
+      {
+        criterionId: "criterion_crash_recovery",
+        description: scenario.recoveryCriterion,
+        required: true,
+      },
+    ],
+    steps: [
+      {
+        stepId: "step_crash_recovery",
+        title: scenario.recoveryStepTitle,
+        description: scenario.recoveryStepDescription,
+        required: true,
+        dependsOn: [],
+      },
+    ],
+    dependencies: [],
+    risks: ["进程退出后外部副作用结果未知"],
+    verificationStrategy: ["回读持久 Tool attempt 与 Goal 恢复投影"],
+  };
+  providerFixture.resetPlanGoalContext("recovery");
+  stage("crash_recovery:create_plan");
+  const ownerThread = await readPlanGoalThreadAuthority(page, threadId);
+  if (!Number.isSafeInteger(ownerThread.revision)) {
+    throw new Error("恢复 Plan 无法取得 owner Thread revision");
+  }
+  let planResult = await invokePlanGoalCommand(page, "ja_runtime_plan_create", {
+    owner: { kind: "thread", threadId },
+    objective: scenario.recoveryObjective,
+    expectedThreadRevision: ownerThread.revision,
+    idempotencyKey: `plan-goal-recovery-plan-create-${Date.now().toString(36)}`,
+  });
+  if (planResult.ok !== true || typeof planResult.value?.plan?.planId !== "string") {
+    throw new Error(`恢复 Plan 创建失败：${planResult.code ?? "UNKNOWN"}`);
+  }
+  let plan = planResult.value;
+  planResult = await invokePlanGoalCommand(page, "ja_runtime_plan_draft_save", {
+    threadId,
+    planId: plan.plan.planId,
+    expectedPlanRevision: plan.plan.revision,
+    idempotencyKey: `plan-goal-recovery-draft-${Date.now().toString(36)}`,
+    draft: definition,
+  });
+  if (planResult.ok !== true || typeof planResult.value?.plan?.revision !== "number") {
+    throw new Error(`恢复 Plan 草稿保存失败：${planResult.code ?? "UNKNOWN"}`);
+  }
+  plan = planResult.value;
+  planResult = await invokePlanGoalCommand(page, "ja_runtime_plan_propose", {
+    threadId,
+    planId: plan.plan.planId,
+    expectedPlanRevision: plan.plan.revision,
+    idempotencyKey: `plan-goal-recovery-propose-${Date.now().toString(36)}`,
+  });
+  const frozenRevision = planResult.value?.currentRevision;
+  if (
+    planResult.ok !== true ||
+    typeof frozenRevision?.planRevisionId !== "string" ||
+    typeof frozenRevision?.planHash !== "string"
+  ) {
+    throw new Error(`恢复 Plan 冻结失败：${planResult.code ?? "UNKNOWN"}`);
+  }
+  plan = planResult.value;
+  planResult = await invokePlanGoalCommand(page, "ja_runtime_plan_approve", {
+    threadId,
+    planId: plan.plan.planId,
+    expectedPlanRevision: plan.plan.revision,
+    planRevisionId: frozenRevision.planRevisionId,
+    planHash: frozenRevision.planHash,
+    idempotencyKey: `plan-goal-recovery-approve-${Date.now().toString(36)}`,
+  });
+  if (
+    planResult.ok !== true ||
+    planResult.value?.plan?.status !== "approved" ||
+    planResult.value?.plan?.activeRunId !== null
+  ) {
+    throw new Error(`恢复 Plan 批准边界无效：${planResult.code ?? "UNKNOWN"}`);
+  }
+
+  stage("crash_recovery:create_goal");
+  const createdGoal = await invokePlanGoalCommand(page, "ja_runtime_goal_create", {
+    owner: { kind: "thread", threadId },
+    objective: scenario.recoveryObjective,
+    acceptanceCriteria: [],
+    expectedGoalRevision: 0,
+    idempotencyKey: `plan-goal-recovery-goal-create-${Date.now().toString(36)}`,
+  });
+  if (createdGoal.ok !== true || typeof createdGoal.value?.goal?.goalId !== "string") {
+    throw new Error(`恢复 Goal 创建失败：${createdGoal.code ?? "UNKNOWN"}`);
+  }
+  const attachedGoal = await attachPlanForRecovery(
+    page,
+    createdGoal.value,
+    plan,
+    frozenRevision,
+    deadline,
+    signal,
+  );
+  if (
+    attachedGoal.ok !== true ||
+    typeof attachedGoal.value?.goal?.currentRunId !== "string" ||
+    attachedGoal.value?.goal?.planLink?.planRevisionId !== frozenRevision.planRevisionId
+  ) {
+    throw new Error(`恢复 Goal attach 失败：${attachedGoal.code ?? "UNKNOWN"}`);
+  }
+  let identity = {
+    goal: attachedGoal.value.goal,
+    projection: attachedGoal.value,
+    revision: frozenRevision,
+    goalId: attachedGoal.value.goal.goalId,
+    goalRevision: attachedGoal.value.goal.revision,
+    runId: attachedGoal.value.goal.currentRunId,
+    planRevisionId: frozenRevision.planRevisionId,
+    planHash: frozenRevision.planHash,
+    stepId: frozenRevision.steps[0].stepId,
+    criterionId: frozenRevision.acceptanceCriteria[0].criterionId,
+  };
+  providerFixture.setPlanGoalContext(identity);
+
+  stage("crash_recovery:project_goal");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForRuntimeReady(page, deadline, signal);
+  await selectThreadById(page, threadId, deadline, signal);
+  await installRawTauriEventProbe(page);
+  await installTauriInvokeProbe(page);
+  const status = page.locator(`[data-goal-ui="status"][data-goal-id="${identity.goalId}"]`);
+  await status.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForCondition(
+    "恢复 Goal attach ACK",
+    async () => {
+      const candidate = await invokePlanGoalCommand(page, "ja_runtime_goal_read", {
+        goalId: identity.goalId,
+      });
+      if (candidate.ok !== true) return false;
+      if (
+        candidate.value?.goal?.status !== "active" ||
+        candidate.value?.goal?.currentRunId !== identity.runId ||
+        candidate.value?.goal?.planLink?.planRevisionId !== identity.planRevisionId
+      ) {
+        return false;
+      }
+      identity = {
+        ...identity,
+        goal: candidate.value.goal,
+        goalRevision: candidate.value.goal.revision,
+      };
+      return true;
+    },
+    deadline,
+    signal,
+  );
+  providerFixture.setPlanGoalContext(identity);
+
+  stage("crash_recovery:approval_wait");
+  const approval = page.getByRole("button", { name: "批准", exact: true });
+  await waitForCondition(
+    "恢复 Goal Shell approval admission",
+    async () => {
+      const candidate = await invokePlanGoalCommand(page, "ja_runtime_goal_read", {
+        goalId: identity.goalId,
+      });
+      return (
+        candidate.ok === true &&
+        candidate.value?.goal?.status === "active" &&
+        candidate.value?.goal?.phase === "waiting_approval" &&
+        (await approval.count()) === 1 &&
+        (await approval.isEnabled())
+      );
+    },
+    deadline,
+    signal,
+  );
+  await approval.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await clickVerifiedControl(page, approval, deadline);
+
+  stage("crash_recovery:started");
+  let started;
+  await waitForCondition(
+    "恢复 Goal 副作用 Tool STARTED",
+    async () => {
+      try {
+        const candidate = goalToolAttemptFact(directories, identity.goalId);
+        if (
+          candidate.state !== "STARTED" ||
+          Number(candidate.side_effect) !== 1 ||
+          candidate.completed_at !== null
+        ) {
+          return false;
+        }
+        started = candidate;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    deadline,
+    signal,
+  );
+  const providerAttempts = providerFixture.attemptCount(scenario.id, "turn");
+  const expectedExecutables = [nativeSidecar.fileName];
+  const priorIsolation = assertRuntimeIsolation(
+    await processSnapshot(signal),
+    directories,
+    expectedExecutables,
+  );
+
+  stage("crash_recovery:force_kill");
+  const forceKill = await forceKillIsolatedAppServer(
+    nativeScope,
+    directories,
+    deadline,
+    signal,
+    expectedExecutables,
+  );
+  if (forceKill.pid !== priorIsolation.appServerPid) {
+    throw new Error("恢复故障注入终止了非预期 App Server identity");
+  }
+
+  stage("crash_recovery:restart");
+  const retryCount = await restartRuntimeAfterGoalCrash(page, deadline, signal);
+  await selectThreadById(page, threadId, deadline, signal);
+  const currentIsolation = assertRuntimeIsolation(
+    await processSnapshot(signal),
+    directories,
+    expectedExecutables,
+  );
+  if (currentIsolation.appServerPid === forceKill.pid) {
+    throw new Error("恢复后仍使用已终止的 App Server PID");
+  }
+
+  stage("crash_recovery:verify");
+  let recovered;
+  let recoveredProjection;
+  await waitForCondition(
+    "恢复 Goal UNKNOWN 与 needs_attention 收敛",
+    async () => {
+      try {
+        const fact = goalToolAttemptFact(directories, identity.goalId);
+        const projection = await invokePlanGoalCommand(page, "ja_runtime_goal_read", {
+          goalId: identity.goalId,
+        });
+        if (
+          fact.state !== "UNKNOWN" ||
+          fact.goal_status !== "PAUSED" ||
+          fact.goal_phase !== "NEEDS_ATTENTION" ||
+          Number(fact.recovery_required) !== 1 ||
+          fact.completed_at === null ||
+          projection.ok !== true ||
+          projection.value?.goal?.status !== "paused" ||
+          projection.value?.goal?.phase !== "needs_attention"
+        ) {
+          return false;
+        }
+        recovered = fact;
+        recoveredProjection = projection.value;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    deadline,
+    signal,
+  );
+  await page
+    .locator(
+      `[data-goal-ui="status"][data-goal-id="${identity.goalId}"][data-phase="needs_attention"]`,
+    )
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await assertNoAdditionalTitleAttempts(
+    providerFixture,
+    scenario.id,
+    "turn",
+    providerAttempts,
+    1_200,
+    signal,
+  );
+  // attempt identity 必须保留旧 generation；新进程只能结算它，不能覆写为当前 generation。
+  if (Number(recovered.process_generation) !== Number(started.process_generation)) {
+    throw new Error("恢复结算改写了 Tool attempt generation");
+  }
+  return {
+    status: "passed",
+    goalId: identity.goalId,
+    toolAttemptId: recovered.tool_attempt_id,
+    priorState: started.state,
+    recoveredState: recovered.state,
+    goalStatus: recoveredProjection.goal.status,
+    goalPhase: recoveredProjection.goal.phase,
+    recoveryRequired: Number(recovered.recovery_required) === 1,
+    sideEffect: Number(recovered.side_effect) === 1,
+    providerAttemptsBeforeCrash: providerAttempts,
+    providerAttemptsAfterRestart: providerFixture.attemptCount(scenario.id, "turn"),
+    priorJavaPid: forceKill.pid,
+    currentJavaPid: currentIsolation.appServerPid,
+    retryCount,
+    blindReplay: false,
+  };
+}
+
+/**
+ * Plan/Goal v1 通过独立 driver 验证 Plan-only、Goal-only 与显式 attach/detach，并将完整
+ * 真窗报告写到父 runner 指定路径。报告写入发生在严格校验之后，半成品不能冒充 PASS。
+ */
+async function runIndependentPlanGoalAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  providerFixture,
+  nativeScope,
+  nativeSidecar,
+  signal,
+  recordStage,
+) {
+  if (providerFixture === undefined || planGoalReportPath === undefined) {
+    throw new Error("Plan/Goal v1 验收缺少 loopback fixture 或报告路径");
+  }
+  const threadId = await currentThreadId(page, deadline, signal);
+  const driver = createPlanGoalWebView2Driver({
+    page,
+    threadId,
+    scenario: providerFixture.scenarios.planGoal,
+    deadline,
+    signal,
+    soakMinutes: configuredPlanGoalSoakMinutes,
+    screenshotDirectory:
+      visualEvidenceDirectory ?? join(dirname(planGoalReportPath), "screenshots"),
+    readThread: readPlanGoalThreadAuthority,
+    approveGoalTool: approvePendingPlanGoalTool,
+    setProviderContext: providerFixture.setPlanGoalContext,
+    resetProviderContext: providerFixture.resetPlanGoalContext,
+    prepareVisualPreferences: (targetPage, targetDeadline) =>
+      applyVisualPreferences(targetPage, targetDeadline, { captureSettingsEvidence: false }),
+    runCrashRecovery: async () => {
+      // 主闭环 detach 后 Plan 仍是合法独立 aggregate；恢复注入使用新真实 Thread，不能为测试
+      // 偷偷终结该 Plan，也不能撞上 V1 schema 的 owner 唯一非终态 Plan 约束。
+      const recoveryThreadId = await createConversationThread(page, deadline, signal);
+      return runPlanGoalCrashRecoveryAcceptance(
+        page,
+        recoveryThreadId,
+        directories,
+        providerFixture,
+        nativeScope,
+        nativeSidecar,
+        deadline,
+        signal,
+        recordStage ?? (() => {}),
+      );
+    },
+    invokeCount: (command) => tauriInvokePhaseCount(page, command, "start"),
+    nativeSidecar,
+    recordStage,
+  });
+  const report = await collectPlanGoalAcceptanceReport(driver, {
+    expectedSoakMinutes: configuredPlanGoalSoakMinutes,
+  });
+  validatePlanGoalAcceptanceReport(report, {
+    expectedSoakMinutes: configuredPlanGoalSoakMinutes,
+  });
+  await writeFile(planGoalReportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  return report;
+}
+
+/**
+ * 用真实 WebView2 驱动侧边任务的草稿、首次持久化、详情观察、主 Timeline 回开与总览投影。
+ * Provider 只返回立即完成的本地文本；本场景不伪造 Agent 自动 spawn、Approval 或取消行为。
+ * 草稿入口单独限时，前置 Thread 不可用时不能耗尽整轮原生验收预算。
+ */
+async function runTaskThreadsAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  providerFixture,
+  signal,
+  recordStage,
+) {
+  if (providerFixture === undefined) throw new Error("Task 线程验收缺少 loopback Provider fixture");
+  const stage = (name) => recordStage?.(`task_threads:${name}`);
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const scenarios = providerFixture.scenarios;
+  const scenario = scenarios.taskThreads;
+  const initialTaskName = scenario.prompt;
+  stage("startup");
+  await page.waitForFunction(
+    () => ["interactive", "complete"].includes(globalThis.document.readyState),
+    undefined,
+    { timeout: timeout() },
+  );
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  await assertGeneralConversationScope(page, deadline);
+  await waitForComposerAdmission(page, deadline);
+  const rootThreadId = await currentThreadId(page, deadline, signal);
+  const workbench = await ensureWorkbenchVisible(page, deadline);
+  const commands = Object.freeze({
+    create: "ja_runtime_task_create",
+    list: "ja_runtime_task_list",
+    read: "ja_runtime_task_read",
+    threadRead: "ja_thread_read",
+    observe: "ja_runtime_task_observe",
+    unobserve: "ja_runtime_task_unobserve",
+    followup: "ja_runtime_task_followup",
+    seen: "ja_runtime_task_seen",
+    cancel: "ja_runtime_task_cancel",
+    rename: "ja_thread_rename",
+  });
+  const initialCounts = {
+    create: await tauriInvokeCount(page, commands.create),
+    list: await tauriInvokeCount(page, commands.list),
+    read: await tauriInvokeCount(page, commands.read),
+    threadRead: await tauriInvokeCount(page, commands.threadRead),
+    observe: await tauriInvokeCount(page, commands.observe),
+    unobserve: await tauriInvokeCount(page, commands.unobserve),
+    followup: await tauriInvokeCount(page, commands.followup),
+    seen: await tauriInvokeCount(page, commands.seen),
+    cancel: await tauriInvokeCount(page, commands.cancel),
+    rename: await tauriInvokeCount(page, commands.rename),
+  };
+
+  stage("draft");
+  const draftDeadline = Math.min(deadline, Date.now() + 10_000);
+  const launcher = await openWorkbenchLauncher(page, draftDeadline);
+  await clickWorkbenchMenuItem(page, launcher, "新建侧边任务", draftDeadline);
+  const draft = page.getByRole("region", { name: "新建侧边任务", exact: true });
+  await draft.waitFor({
+    state: "visible",
+    timeout: Math.max(1, draftDeadline - Date.now()),
+  });
+  const createAfterDraftOpen = await tauriInvokeCount(page, commands.create);
+  if (createAfterDraftOpen !== initialCounts.create) {
+    throw new Error("打开侧边任务草稿时错误调用了 task/create");
+  }
+  if (
+    (await draft.getByText("从当前主任务分出一个独立工作面", { exact: true }).count()) !== 0 ||
+    (await draft.getByText("首次发送后，任务会保存并独立运行。", { exact: true }).count()) !== 0 ||
+    (await draft.getByText("Enter 发送，Shift+Enter 换行", { exact: true }).count()) !== 0 ||
+    (await draft.getByText("草稿", { exact: true }).count()) !== 0 ||
+    (await draft.getByRole("textbox", { name: "侧边任务名称", exact: true }).count()) !== 0 ||
+    (await draft.locator(".ja-task-detail-header").count()) !== 0
+  ) {
+    throw new Error("侧边任务草稿仍展示重复标题、名称输入或内部状态文案");
+  }
+  const taskComposer = draft.locator(".ja-task-composer");
+  const taskComposerSurface = taskComposer.locator(":scope > .ja-composer");
+  const taskInput = taskComposer.getByRole("textbox", { name: "消息", exact: true });
+  const mainComposerSurface = page.locator(
+    ".ja-conversation-composer-dock.ja-conversation-content-rail > .ja-composer",
+  );
+  await taskComposerSurface.waitFor({ state: "visible", timeout: timeout() });
+  await mainComposerSurface.waitFor({ state: "visible", timeout: timeout() });
+  const draftComposerEvidence = await page.evaluate(() => {
+    const taskRegion = globalThis.document.querySelector('[aria-label="新建侧边任务"]');
+    const taskRail = taskRegion?.querySelector(".ja-task-composer");
+    const taskSurface = taskRail?.querySelector(":scope > .ja-composer");
+    const taskTextarea = taskSurface?.querySelector('textarea[aria-label="消息"]');
+    const mainSurface = globalThis.document.querySelector(
+      ".ja-conversation-composer-dock.ja-conversation-content-rail > .ja-composer",
+    );
+    if (
+      !(taskRegion instanceof globalThis.HTMLElement) ||
+      !(taskRail instanceof globalThis.HTMLElement) ||
+      !(taskSurface instanceof globalThis.HTMLElement) ||
+      !(taskTextarea instanceof globalThis.HTMLTextAreaElement) ||
+      !(mainSurface instanceof globalThis.HTMLElement)
+    ) {
+      throw new Error("侧边任务或主对话 Composer DOM 不完整");
+    }
+    const regionRect = taskRegion.getBoundingClientRect();
+    const railRect = taskRail.getBoundingClientRect();
+    /** 只比较主/侧 Composer 共享的表面属性，排除布局位置与聚焦态造成的合理差异。 */
+    const styleFields = (element) => {
+      const style = globalThis.getComputedStyle(element);
+      return {
+        borderRadius: style.borderRadius,
+        borderStyle: style.borderStyle,
+        borderWidth: style.borderWidth,
+        backgroundColor: style.backgroundColor,
+        gap: style.gap,
+        padding: style.padding,
+      };
+    };
+    return {
+      contentRailReused: taskRail.classList.contains("ja-conversation-content-rail"),
+      composerSurfaceCount: taskRail.querySelectorAll(".ja-composer").length,
+      messageInputCount: taskRail.querySelectorAll('textarea[aria-label="消息"]').length,
+      taskNameInputCount: taskRail.querySelectorAll('[aria-label="侧边任务名称"]').length,
+      centered:
+        Math.abs(regionRect.left + regionRect.width / 2 - (railRect.left + railRect.width / 2)) <=
+        1,
+      sideInset: regionRect.width - railRect.width,
+      taskSurface: styleFields(taskSurface),
+      mainSurface: styleFields(mainSurface),
+    };
+  });
+  if (
+    draftComposerEvidence.contentRailReused !== true ||
+    draftComposerEvidence.composerSurfaceCount !== 1 ||
+    draftComposerEvidence.messageInputCount !== 1 ||
+    draftComposerEvidence.taskNameInputCount !== 0 ||
+    draftComposerEvidence.centered !== true ||
+    draftComposerEvidence.sideInset < 30 ||
+    JSON.stringify(draftComposerEvidence.taskSurface) !==
+      JSON.stringify(draftComposerEvidence.mainSurface)
+  ) {
+    throw new Error(`侧边任务没有复用主 Composer：${JSON.stringify(draftComposerEvidence)}`);
+  }
+  await captureVisualEvidence(page, `side-task-draft-${visualTheme}-native-before-focus.png`);
+  await taskInput.focus();
+  const focusedComposerEvidence = await taskInput.evaluate((textarea) => {
+    const inputStyle = globalThis.getComputedStyle(textarea);
+    const surface = textarea.closest(".ja-composer");
+    if (!(surface instanceof globalThis.HTMLElement))
+      throw new Error("侧边任务 Composer surface 缺失");
+    const surfaceStyle = globalThis.getComputedStyle(surface);
+    return {
+      inputFocused: globalThis.document.activeElement === textarea,
+      inputBorderStyle: inputStyle.borderStyle,
+      inputBorderWidth: inputStyle.borderWidth,
+      inputOutlineStyle: inputStyle.outlineStyle,
+      inputOutlineWidth: inputStyle.outlineWidth,
+      inputBoxShadow: inputStyle.boxShadow,
+      surfaceBorderStyle: surfaceStyle.borderStyle,
+      surfaceBorderWidth: surfaceStyle.borderWidth,
+      surfaceBoxShadow: surfaceStyle.boxShadow,
+    };
+  });
+  if (
+    focusedComposerEvidence.inputFocused !== true ||
+    focusedComposerEvidence.inputBorderStyle !== "none" ||
+    focusedComposerEvidence.inputBorderWidth !== "0px" ||
+    focusedComposerEvidence.inputOutlineStyle !== "none" ||
+    focusedComposerEvidence.inputOutlineWidth !== "0px" ||
+    focusedComposerEvidence.inputBoxShadow !== "none" ||
+    focusedComposerEvidence.surfaceBorderStyle === "none" ||
+    focusedComposerEvidence.surfaceBorderWidth === "0px" ||
+    focusedComposerEvidence.surfaceBoxShadow === "none"
+  ) {
+    throw new Error(`侧边任务聚焦仍出现内部输入框：${JSON.stringify(focusedComposerEvidence)}`);
+  }
+  await captureVisualEvidence(page, `side-task-draft-${visualTheme}-native-focused.png`);
+  const separator = page.getByRole("separator", { name: "调整工作台宽度", exact: true });
+  await separator.waitFor({ state: "visible", timeout: timeout() });
+  /** 在同一原生窗口读取内容边界，证明 24%/60% 两端都没有裁切或横向溢出。 */
+  const readTaskLayout = async () =>
+    taskComposer.evaluate((rail) => {
+      const region = rail.closest(".ja-task-detail");
+      const surface = rail.querySelector(":scope > .ja-composer");
+      const input = surface?.querySelector('textarea[aria-label="消息"]');
+      if (
+        !(region instanceof globalThis.HTMLElement) ||
+        !(surface instanceof globalThis.HTMLElement) ||
+        !(input instanceof globalThis.HTMLTextAreaElement)
+      ) {
+        throw new Error("侧边任务响应式布局 DOM 不完整");
+      }
+      const regionRect = region.getBoundingClientRect();
+      const railRect = rail.getBoundingClientRect();
+      const surfaceRect = surface.getBoundingClientRect();
+      return {
+        regionWidth: regionRect.width,
+        railWidth: railRect.width,
+        surfaceWidth: surfaceRect.width,
+        inlineStart: railRect.left - regionRect.left,
+        inlineEnd: regionRect.right - railRect.right,
+        railOverflow: rail.scrollWidth - rail.clientWidth,
+        surfaceOverflow: surface.scrollWidth - surface.clientWidth,
+        inputOverflow: input.scrollWidth - input.clientWidth,
+      };
+    });
+  await separator.press("Home");
+  await page.waitForFunction(
+    () =>
+      globalThis.document
+        .querySelector('[role="separator"][aria-label="调整工作台宽度"]')
+        ?.getAttribute("aria-valuenow") === "24",
+    undefined,
+    { timeout: timeout() },
+  );
+  const narrowTaskLayout = await readTaskLayout();
+  if (
+    narrowTaskLayout.regionWidth <= 0 ||
+    narrowTaskLayout.railWidth <= 0 ||
+    narrowTaskLayout.surfaceWidth <= 0 ||
+    narrowTaskLayout.inlineStart < 15 ||
+    narrowTaskLayout.inlineEnd < 15 ||
+    narrowTaskLayout.railOverflow > 1 ||
+    narrowTaskLayout.surfaceOverflow > 1 ||
+    narrowTaskLayout.inputOverflow > 1
+  ) {
+    throw new Error(`窄侧栏 Composer 布局溢出：${JSON.stringify(narrowTaskLayout)}`);
+  }
+  await captureVisualEvidence(page, `side-task-draft-${visualTheme}-native-narrow.png`);
+  await separator.press("End");
+  await page.waitForFunction(
+    () =>
+      globalThis.document
+        .querySelector('[role="separator"][aria-label="调整工作台宽度"]')
+        ?.getAttribute("aria-valuenow") === "60",
+    undefined,
+    { timeout: timeout() },
+  );
+  const wideTaskLayout = await readTaskLayout();
+  if (
+    wideTaskLayout.regionWidth <= narrowTaskLayout.regionWidth ||
+    wideTaskLayout.inlineStart < 15 ||
+    wideTaskLayout.inlineEnd < 15 ||
+    wideTaskLayout.railOverflow > 1 ||
+    wideTaskLayout.surfaceOverflow > 1 ||
+    wideTaskLayout.inputOverflow > 1
+  ) {
+    throw new Error(`宽侧栏 Composer 布局溢出：${JSON.stringify(wideTaskLayout)}`);
+  }
+  await captureVisualEvidence(page, `side-task-draft-${visualTheme}-native-wide.png`);
+
+  stage("create");
+  await taskInput.fill(scenario.prompt);
+  await clickVerifiedControl(
+    page,
+    draft.getByRole("button", { name: "发送", exact: true }),
+    deadline,
+  );
+  await waitForCondition(
+    "侧边任务首次发送只调用一次 task/create",
+    async () => (await tauriInvokeCount(page, commands.create)) === initialCounts.create + 1,
+    deadline,
+    signal,
+  );
+  const stableTab = workbench.locator('.ja-workbench-tab-shell[data-tab^="side-task:thr_"]');
+  await stableTab.waitFor({ state: "visible", timeout: timeout() });
+  const stableTabKey = await stableTab.getAttribute("data-tab");
+  if (stableTabKey === null || !/^side-task:thr_[A-Za-z0-9._-]+$/u.test(stableTabKey)) {
+    throw new Error("侧边任务草稿没有替换为稳定 Child Thread Tab");
+  }
+  const childThreadId = stableTabKey.slice("side-task:".length);
+  if (
+    (await workbench.locator('.ja-workbench-tab-shell[data-tab^="side-task:draft_"]').count()) !== 0
+  ) {
+    throw new Error("侧边任务创建 ACK 后仍保留草稿 Tab");
+  }
+  const detail = page.getByRole("region", { name: initialTaskName, exact: true });
+  await detail.waitFor({ state: "visible", timeout: timeout() });
+  await detail
+    .locator(".ja-task-context > summary")
+    .filter({
+      hasText: /^继承自主任务 revision \d+$/u,
+    })
+    .waitFor({
+      state: "visible",
+      timeout: timeout(),
+    });
+  await waitForCondition(
+    "侧边任务详情建立 task/observe",
+    async () => (await tauriInvokeCount(page, commands.observe)) > initialCounts.observe,
+    deadline,
+    signal,
+  );
+  await waitForTitleFixtureAttempts(providerFixture, scenario.id, "turn", 1, deadline, signal);
+  await waitForTitleFixtureFinished(providerFixture, scenario.id, "turn", 1, deadline, signal);
+  await detail.getByText(scenario.reply, { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+
+  stage("close_without_cancel");
+  const observeAfterCreate = await tauriInvokeCount(page, commands.observe);
+  const unobserveBeforeClose = await tauriInvokeCount(page, commands.unobserve);
+  await clickVerifiedControl(
+    page,
+    workbench.getByRole("button", { name: `关闭${initialTaskName}`, exact: true }),
+    deadline,
+  );
+  await page.waitForFunction(
+    (tabKey) =>
+      globalThis.document.querySelector(`.ja-workbench-tab-shell[data-tab="${tabKey}"]`) === null,
+    stableTabKey,
+    { timeout: timeout() },
+  );
+  await waitForCondition(
+    "关闭侧边任务 Tab 释放 task observation",
+    async () => (await tauriInvokeCount(page, commands.unobserve)) > unobserveBeforeClose,
+    deadline,
+    signal,
+  );
+  const unobserveAfterClose = await tauriInvokeCount(page, commands.unobserve);
+  const cancelAfterClose = await tauriInvokeCount(page, commands.cancel);
+  if (cancelAfterClose !== initialCounts.cancel) {
+    throw new Error("关闭侧边任务 Tab 错误调用了 task/cancel");
+  }
+
+  stage("timeline_reopen");
+  const activityCard = page
+    .locator(".ja-task-activity-card")
+    .filter({ hasText: initialTaskName })
+    .first();
+  await activityCard.waitFor({ state: "visible", timeout: timeout() });
+  await clickVerifiedControl(page, activityCard, deadline);
+  await page
+    .locator(`.ja-workbench-tab-shell[data-tab="${stableTabKey}"][data-state="active"]`)
+    .waitFor({
+      state: "visible",
+      timeout: timeout(),
+    });
+  await detail.waitFor({ state: "visible", timeout: timeout() });
+  await detail
+    .locator(".ja-task-context > summary")
+    .filter({
+      hasText: /^继承自主任务 revision \d+$/u,
+    })
+    .waitFor({
+      state: "visible",
+      timeout: timeout(),
+    });
+  await waitForCondition(
+    "Timeline 重开详情重新建立 task/observe",
+    async () => (await tauriInvokeCount(page, commands.observe)) > observeAfterCreate,
+    deadline,
+    signal,
+  );
+
+  stage("background_followup");
+  const followupBefore = await tauriInvokeCount(page, commands.followup);
+  const sideComposer = detail.locator(".ja-task-structured-composer");
+  await sideComposer
+    .getByRole("textbox", { name: "消息", exact: true })
+    .fill(scenario.followupPrompt);
+  await clickVerifiedControl(
+    page,
+    sideComposer.getByRole("button", { name: "发送", exact: true }),
+    deadline,
+  );
+  await waitForCondition(
+    "完成后的 Side Task 可以提交 follow-up",
+    async () => (await tauriInvokeCount(page, commands.followup)) === followupBefore + 1,
+    deadline,
+    signal,
+  );
+  await waitForTitleFixtureAttempts(providerFixture, scenario.id, "turn", 2, deadline, signal);
+
+  stage("overview");
+  await chooseWorkbenchTool(page, "子智能体", deadline);
+  const overview = page.getByRole("region", { name: "子智能体总览", exact: true });
+  await overview.waitFor({ state: "visible", timeout: timeout() });
+  const overviewRow = overview.getByRole("treeitem").filter({ hasText: initialTaskName });
+  await overviewRow.waitFor({ state: "visible", timeout: timeout() });
+  if (!(await overviewRow.innerText()).includes("侧边任务")) {
+    throw new Error("子智能体总览没有按侧边任务类型展示 Child Thread");
+  }
+  const hiddenDetailCounts = {
+    read: await tauriInvokeCount(page, commands.read),
+    threadRead: await tauriInvokeCount(page, commands.threadRead),
+    observe: await tauriInvokeCount(page, commands.observe),
+  };
+  providerFixture.releaseTaskStep("side_followup");
+  await waitForTitleFixtureFinished(providerFixture, scenario.id, "turn", 2, deadline, signal);
+  await overviewRow.getByLabel(/条未读$/u).waitFor({ state: "visible", timeout: timeout() });
+  await waitForDelay(300, signal);
+  const hiddenDetailDelta = {
+    read: (await tauriInvokeCount(page, commands.read)) - hiddenDetailCounts.read,
+    threadRead: (await tauriInvokeCount(page, commands.threadRead)) - hiddenDetailCounts.threadRead,
+    observe: (await tauriInvokeCount(page, commands.observe)) - hiddenDetailCounts.observe,
+  };
+  if (Object.values(hiddenDetailDelta).some((count) => count !== 0)) {
+    throw new Error(`隐藏 Task 详情触发重型读取：${JSON.stringify(hiddenDetailDelta)}`);
+  }
+
+  stage("spawn_subagent_tree");
+  const taskStepTimeout = () => Math.min(timeout(), 60_000);
+  await waitForComposerAdmission(page, deadline);
+  const rootComposer = page.locator(".ja-conversation").getByRole("textbox", {
+    name: "消息",
+    exact: true,
+  });
+  await rootComposer.fill(scenario.agentRootPrompt);
+  await clickVerifiedControl(
+    page,
+    page.locator(".ja-conversation").getByRole("button", { name: "发送", exact: true }),
+    deadline,
+  );
+  stage("spawn_subagent_tree:root_continuation");
+  await page.getByText(scenario.agentRootReply, { exact: true }).waitFor({
+    state: "visible",
+    timeout: taskStepTimeout(),
+  });
+  const levelRows = [scenario.levelOneName, scenario.levelTwoName, scenario.levelThreeName].map(
+    (name) => overview.getByRole("treeitem").filter({ hasText: name }),
+  );
+  for (const [index, row] of levelRows.entries()) {
+    stage(`spawn_subagent_tree:level_${index + 1}`);
+    await row.waitFor({ state: "visible", timeout: taskStepTimeout() });
+  }
+  const levels = await Promise.all(levelRows.map((row) => row.getAttribute("aria-level")));
+  if (JSON.stringify(levels) !== JSON.stringify(["1", "2", "3"])) {
+    throw new Error(`Subagent 树没有保持三层父子邻接：${JSON.stringify(levels)}`);
+  }
+
+  stage("subagent_approval");
+  await clickVerifiedControl(page, levelRows[2], deadline);
+  const levelThreeDetail = page.getByRole("region", { name: scenario.levelThreeName, exact: true });
+  await levelThreeDetail.waitFor({ state: "visible", timeout: timeout() });
+  const approve = levelThreeDetail.getByRole("button", { name: "批准", exact: true });
+  await approve.waitFor({ state: "visible", timeout: timeout() });
+  await clickVerifiedControl(page, approve, deadline);
+  await levelThreeDetail.getByRole("status").filter({ hasText: "已批准" }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await waitForTitleFixtureAttempts(providerFixture, scenario.id, "turn", 10, deadline, signal);
+
+  stage("attached_cancel_propagation");
+  await chooseWorkbenchTool(page, "子智能体", deadline);
+  const refreshedLevelOne = overview
+    .getByRole("treeitem")
+    .filter({ hasText: scenario.levelOneName });
+  await clickVerifiedControl(page, refreshedLevelOne, deadline);
+  const levelOneDetail = page.getByRole("region", { name: scenario.levelOneName, exact: true });
+  await levelOneDetail.waitFor({ state: "visible", timeout: timeout() });
+  await clickVerifiedControl(
+    page,
+    levelOneDetail.getByRole("button", { name: "取消任务", exact: true }),
+    deadline,
+  );
+  const confirm = levelOneDetail.getByRole("group", { name: "确认取消任务", exact: true });
+  await confirm.getByText("将同时取消 2 个未结束后代", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await clickVerifiedControl(
+    page,
+    confirm.getByRole("button", { name: "确认取消", exact: true }),
+    deadline,
+  );
+  await chooseWorkbenchTool(page, "子智能体", deadline);
+  await waitForCondition(
+    "ATTACHED 取消递归传播到两层后代",
+    async () => {
+      const rows = [scenario.levelOneName, scenario.levelTwoName, scenario.levelThreeName].map(
+        (name) => overview.getByRole("treeitem").filter({ hasText: name }),
+      );
+      return (await Promise.all(rows.map((row) => row.innerText()))).every((text) =>
+        text.includes("已取消"),
+      );
+    },
+    deadline,
+    signal,
+  );
+  if (!(await overviewRow.innerText()).includes("已完成")) {
+    throw new Error("取消 ATTACHED 树错误影响了 INDEPENDENT Side Task");
+  }
+  stage("rename_side_task");
+  await clickVerifiedControl(page, overviewRow, deadline);
+  await detail.waitFor({ state: "visible", timeout: timeout() });
+  const renameBefore = await tauriInvokeCount(page, commands.rename);
+  const taskTab = stableTab.getByRole("tab", { name: initialTaskName, exact: true });
+  await taskTab.press("F2");
+  const renameInput = stableTab.getByRole("textbox", { name: "侧边任务名称", exact: true });
+  await renameInput.waitFor({ state: "visible", timeout: timeout() });
+  if ((await renameInput.inputValue()) !== initialTaskName) {
+    throw new Error("侧边任务原位改名没有从当前 Tab 名称开始");
+  }
+  await renameInput.fill(scenario.renamedTaskName);
+  await renameInput.press("Enter");
+  await waitForCondition(
+    "侧边任务改名只提交一次 thread/rename",
+    async () => (await tauriInvokeCount(page, commands.rename)) === renameBefore + 1,
+    deadline,
+    signal,
+  );
+  await stableTab
+    .getByRole("tab", { name: scenario.renamedTaskName, exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  const renamedDetail = page.getByRole("region", {
+    name: scenario.renamedTaskName,
+    exact: true,
+  });
+  await renamedDetail.waitFor({ state: "visible", timeout: timeout() });
+  if (
+    (await renamedDetail.getByRole("heading", { name: scenario.renamedTaskName }).count()) !== 0 ||
+    (await renamedDetail.locator(".ja-task-detail-header").count()) !== 0
+  ) {
+    throw new Error("侧边任务改名后正文重新出现重复人物或任务抬头");
+  }
+  await captureVisualEvidence(page, `side-task-renamed-${visualTheme}-native.png`);
+  const finalCounts = {
+    create: await tauriInvokeCount(page, commands.create),
+    list: await tauriInvokeCount(page, commands.list),
+    read: await tauriInvokeCount(page, commands.read),
+    threadRead: await tauriInvokeCount(page, commands.threadRead),
+    observe: await tauriInvokeCount(page, commands.observe),
+    unobserve: await tauriInvokeCount(page, commands.unobserve),
+    followup: await tauriInvokeCount(page, commands.followup),
+    seen: await tauriInvokeCount(page, commands.seen),
+    cancel: await tauriInvokeCount(page, commands.cancel),
+    rename: await tauriInvokeCount(page, commands.rename),
+  };
+  const metrics = await captureTaskMetricEvidence(directories, scenario);
+  const ui = await captureUiEvidence(page, directories, signal);
+  const reducerState =
+    ui.reducerState !== null && typeof ui.reducerState === "object" ? ui.reducerState : {};
+  const resyncRequired =
+    reducerState.resyncRequired !== null && typeof reducerState.resyncRequired === "object"
+      ? reducerState.resyncRequired
+      : { unavailable: true };
+  const conversationTurns =
+    reducerState.turns !== null && typeof reducerState.turns === "object"
+      ? Object.values(reducerState.turns)
+      : [{ threadId: childThreadId, status: "unavailable" }];
+  const childConversationTurns = conversationTurns.filter(
+    (turn) => turn?.threadId === childThreadId,
+  );
+  stage("completed");
+  return {
+    status: "passed",
+    draftChromeAbsent: true,
+    composerParity: draftComposerEvidence,
+    composerFocus: focusedComposerEvidence,
+    responsiveComposer: {
+      narrow: narrowTaskLayout,
+      wide: wideTaskLayout,
+    },
+    rootThreadIdPresent: /^(?:thread|thr)_[A-Za-z0-9._-]+$/u.test(rootThreadId),
+    draftCreateDelta: createAfterDraftOpen - initialCounts.create,
+    createDelta: finalCounts.create - initialCounts.create,
+    stableTabReplaced: true,
+    contextInheritanceVisible: true,
+    activityCardVisible: true,
+    activityCardReopenedSameTab: true,
+    overviewVisible: true,
+    completedFollowupVisible: true,
+    backgroundFollowupUnreadVisible: true,
+    hiddenDetailDelta,
+    subagentTreeLevels: levels.map(Number),
+    subagentApprovalResolved: true,
+    attachedCancelPropagation: true,
+    sideTaskIndependentAfterCancel: true,
+    renamedTabVisible: true,
+    renamedDetailWithoutDuplicateHeading: true,
+    metrics,
+    observeDelta: finalCounts.observe - initialCounts.observe,
+    closeUnobserveDelta: unobserveAfterClose - unobserveBeforeClose,
+    totalUnobserveDelta: finalCounts.unobserve - initialCounts.unobserve,
+    // 关闭语义必须冻结在 Tab 关闭完成的时点，不能混入后续用户明确取消 ATTACHED 树的调用。
+    closeCancelDelta: cancelAfterClose - initialCounts.cancel,
+    followupDelta: finalCounts.followup - initialCounts.followup,
+    cancelDelta: finalCounts.cancel - initialCounts.cancel,
+    renameDelta: finalCounts.rename - initialCounts.rename,
+    providerTurnAttempts: providerFixture.attemptCount(scenario.id, "turn"),
+    restartExpectation: {
+      rootThreadId,
+      childThreadId,
+      taskNames: [
+        scenario.renamedTaskName,
+        scenario.levelOneName,
+        scenario.levelTwoName,
+        scenario.levelThreeName,
+      ],
+    },
+    conversationResyncRequiredCount: Object.keys(resyncRequired).length,
+    conversationChildTurnCount: childConversationTurns.length,
+    conversationChildRunningCount: childConversationTurns.filter(
+      (turn) => turn?.status === "running",
+    ).length,
+    ui,
+  };
+}
+
+/**
+ * 重启后只从主 Timeline 与 Task 摘要投影恢复活动、未读和树结构；保持总览选中期间禁止
+ * task/read、thread/read 与 task/observe，证明恢复没有偷偷物化任何 Child Transcript。
+ */
+async function runTaskThreadsRestartSession(
+  page,
+  deadline,
+  directories,
+  expectation,
+  signal,
+  recordStage,
+) {
+  const stage = (name) => recordStage?.(`task_threads_restart:${name}`);
+  const timeout = () => Math.max(1, deadline - Date.now());
+  stage("startup");
+  await page.waitForFunction(
+    () => ["interactive", "complete"].includes(globalThis.document.readyState),
+    undefined,
+    { timeout: timeout() },
+  );
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  if ((await currentThreadId(page, deadline, signal)) !== expectation.rootThreadId) {
+    throw new Error("Task 重启后没有恢复原主任务");
+  }
+  const activityNames = [expectation.taskNames[0], expectation.taskNames[1]];
+  for (const name of activityNames) {
+    await page.locator(".ja-task-activity-card").filter({ hasText: name }).first().waitFor({
+      state: "visible",
+      timeout: timeout(),
+    });
+  }
+
+  stage("overview");
+  await ensureWorkbenchVisible(page, deadline);
+  await chooseWorkbenchTool(page, "子智能体", deadline);
+  const overview = page.getByRole("region", { name: "子智能体总览", exact: true });
+  await overview.waitFor({ state: "visible", timeout: timeout() });
+  const rows = expectation.taskNames.map((name) =>
+    overview.getByRole("treeitem").filter({ hasText: name }),
+  );
+  for (const row of rows) await row.waitFor({ state: "visible", timeout: timeout() });
+  await rows[0].getByLabel(/条未读$/u).waitFor({ state: "visible", timeout: timeout() });
+  const levels = await Promise.all(rows.slice(1).map((row) => row.getAttribute("aria-level")));
+  if (JSON.stringify(levels) !== JSON.stringify(["1", "2", "3"])) {
+    throw new Error(`Task 重启后树邻接丢失：${JSON.stringify(levels)}`);
+  }
+  const descendantStates = await Promise.all(rows.slice(1).map((row) => row.innerText()));
+  if (!descendantStates.every((text) => text.includes("已取消"))) {
+    throw new Error("Task 重启后 ATTACHED 取消终态没有完整恢复");
+  }
+  if (!(await rows[0].innerText()).includes("已完成")) {
+    throw new Error("Task 重启后 INDEPENDENT Side Task 状态错误");
+  }
+  const hiddenBefore = {
+    read: await tauriInvokeCount(page, "ja_runtime_task_read"),
+    threadRead: await tauriInvokeCount(page, "ja_thread_read"),
+    observe: await tauriInvokeCount(page, "ja_runtime_task_observe"),
+  };
+  await waitForDelay(300, signal);
+  const hiddenDetailDelta = {
+    read: (await tauriInvokeCount(page, "ja_runtime_task_read")) - hiddenBefore.read,
+    threadRead: (await tauriInvokeCount(page, "ja_thread_read")) - hiddenBefore.threadRead,
+    observe: (await tauriInvokeCount(page, "ja_runtime_task_observe")) - hiddenBefore.observe,
+  };
+  if (Object.values(hiddenDetailDelta).some((count) => count !== 0)) {
+    throw new Error(`Task 重启总览物化隐藏详情：${JSON.stringify(hiddenDetailDelta)}`);
+  }
+  stage("completed");
+  return {
+    status: "passed",
+    rootThreadRestored: true,
+    activityRestored: true,
+    unreadRestored: true,
+    treeLevels: levels.map(Number),
+    attachedCancellationRestored: true,
+    sideTaskIndependentRestored: true,
+    hiddenDetailDelta,
+    ui: await captureUiEvidence(page, directories, signal),
+  };
+}
+
+/**
+ * 用真实 WebView2、生产 JA-RPC 与隔离 SQLite 闭环侧栏会话状态和恢复路径；该聚焦模式
+ * 不依赖托盘物理交互，退出只清理已复验 owner tree，避免通知区偶发失焦遮蔽业务证据。
+ */
+async function runSidebarThreadAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  providerFixture,
+  signal,
+  recordStage,
+) {
+  if (providerFixture === undefined) {
+    throw new Error("侧栏会话验收缺少 loopback Provider fixture");
+  }
+  const stage = (name) => recordStage?.(`sidebar_thread:${name}`);
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const scenarios = providerFixture.scenarios;
+  stage("startup");
+  await page.waitForFunction(
+    () => ["interactive", "complete"].includes(globalThis.document.readyState),
+    undefined,
+    { timeout: timeout() },
+  );
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  await assertGeneralConversationScope(page, deadline);
+  const appearance = await applyVisualPreferences(page, deadline, {
+    captureSettingsEvidence: false,
+  });
+  const history = page.getByRole("list", { name: "最近对话列表" });
+  if ((await history.innerText()).includes("就绪")) throw new Error("历史行仍显示就绪文字");
+  await captureVisualEvidence(
+    page,
+    `implementation-sidebar-thread-${visualTheme}-native-current.png`,
+  );
+
+  stage("completed_unread_running");
+  const firstThreadId = await currentThreadId(page, deadline, signal);
+  const firstRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${firstThreadId}"])`,
+  );
+  await waitForComposerAdmission(page, deadline);
+  await page.getByRole("textbox", { name: "消息" }).fill(scenarios.sidebarCompleted.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(
+    providerFixture,
+    scenarios.sidebarCompleted.id,
+    "turn",
+    1,
+    deadline,
+    signal,
+  );
+  await firstRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  const secondThreadId = await createConversationThread(page, deadline, signal);
+  await firstRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  providerFixture.release(scenarios.sidebarCompleted.id, "turn");
+  await waitForTitleFixtureFinished(
+    providerFixture,
+    scenarios.sidebarCompleted.id,
+    "turn",
+    1,
+    deadline,
+    signal,
+  );
+  await firstRow.getByRole("img", { name: "有新回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+
+  stage("completed_unread_tooltip");
+  await firstRow.getByRole("img", { name: "有新回复", exact: true }).hover();
+  await page.getByRole("tooltip", { name: "有新回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+
+  stage("pin_and_unread_reload");
+  await firstRow.hover();
+  await firstRow.getByRole("button", { name: "置顶", exact: true }).click();
+  await conversationSurface(page).hover();
+  await firstRow.getByRole("img", { name: "已置顶", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await firstRow.getByRole("img", { name: "有新回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await page.waitForFunction(
+    (expected) =>
+      globalThis.document
+        .querySelector('[aria-label="最近对话列表"] button[data-thread-id]')
+        ?.getAttribute("data-thread-id") === expected,
+    firstThreadId,
+    { timeout: timeout() },
+  );
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  let restoredFirstRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${firstThreadId}"])`,
+  );
+  await restoredFirstRow.getByRole("img", { name: "已置顶", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await restoredFirstRow.getByRole("img", { name: "有新回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+
+  stage("completed_seen_persisted");
+  await selectThreadById(page, firstThreadId, deadline, signal);
+  await page
+    .getByRole("region", { name: "对话时间线", exact: true })
+    .getByText(scenarios.sidebarCompleted.reply, { exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  await restoredFirstRow.getByRole("img", { name: "有新回复", exact: true }).waitFor({
+    state: "detached",
+    timeout: timeout(),
+  });
+  await restoredFirstRow.getByRole("img", { name: "已置顶", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  restoredFirstRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${firstThreadId}"])`,
+  );
+  if ((await restoredFirstRow.getByRole("img", { name: "有新回复", exact: true }).count()) !== 0) {
+    throw new Error("成功回复已读边界在重载后回退为未读");
+  }
+  await restoredFirstRow.getByRole("img", { name: "已置顶", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+
+  stage("failed_unread_running");
+  const failedThreadId = await createConversationThread(page, deadline, signal);
+  const failedRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${failedThreadId}"])`,
+  );
+  await waitForComposerAdmission(page, deadline);
+  await page.getByRole("textbox", { name: "消息" }).fill(scenarios.sidebarFailure.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(
+    providerFixture,
+    scenarios.sidebarFailure.id,
+    "turn",
+    1,
+    deadline,
+    signal,
+  );
+  await failedRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  const neutralThreadId = await createConversationThread(page, deadline, signal);
+  await failedRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  providerFixture.release(scenarios.sidebarFailure.id, "turn");
+  await waitForTitleFixtureFinished(
+    providerFixture,
+    scenarios.sidebarFailure.id,
+    "turn",
+    1,
+    deadline,
+    signal,
+  );
+  await failedRow.getByRole("img", { name: "回复失败", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await failedRow.getByRole("img", { name: "回复失败", exact: true }).hover();
+  await page.getByRole("tooltip", { name: "回复失败", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  const restoredFailedRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${failedThreadId}"])`,
+  );
+  await restoredFailedRow.getByRole("img", { name: "回复失败", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await selectThreadById(page, failedThreadId, deadline, signal);
+  await restoredFailedRow.getByRole("img", { name: "回复失败", exact: true }).waitFor({
+    state: "detached",
+    timeout: timeout(),
+  });
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  if ((await restoredFailedRow.getByRole("img", { name: "回复失败", exact: true }).count()) !== 0) {
+    throw new Error("失败回复已读边界在重载后回退为未读");
+  }
+
+  stage("waiting_approval_current");
+  const approvalThreadId = await createConversationThread(page, deadline, signal);
+  const approvalRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${approvalThreadId}"])`,
+  );
+  await waitForComposerAdmission(page, deadline);
+  await page.getByRole("textbox", { name: "消息" }).fill(scenarios.sidebarApproval.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await page.getByRole("heading", { name: "工具调用需要确认", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await approvalRow.getByRole("img", { name: "等待批准", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await approvalRow.hover();
+  const blockedArchive = approvalRow.getByRole("button", { name: "回复结束后可归档" });
+  if ((await blockedArchive.getAttribute("aria-disabled")) !== "true") {
+    throw new Error("非终态会话的归档入口未被权威状态锁定");
+  }
+
+  stage("archive_undo");
+  await selectThreadById(page, firstThreadId, deadline, signal);
+  restoredFirstRow = history.locator(
+    `.ja-navigation-thread-row:has(button[data-thread-id="${firstThreadId}"])`,
+  );
+  const firstTitle = (await restoredFirstRow.locator("button[data-thread-id]").innerText()).trim();
+  await restoredFirstRow.hover();
+  await restoredFirstRow.getByRole("button", { name: "归档", exact: true }).click();
+  await restoredFirstRow.waitFor({ state: "detached", timeout: timeout() });
+  await page.getByRole("button", { name: "撤销", exact: true }).click();
+  await restoredFirstRow.waitFor({ state: "visible", timeout: timeout() });
+  if ((await currentThreadId(page, deadline, signal)) !== firstThreadId) {
+    throw new Error("归档撤销后未恢复原选择");
+  }
+  if ((await restoredFirstRow.getByRole("img", { name: "已置顶" }).count()) !== 0) {
+    throw new Error("归档恢复错误保留了置顶状态");
+  }
+  if ((await restoredFirstRow.getByRole("img", { name: "有新回复" }).count()) !== 0) {
+    throw new Error("归档撤销错误回退了已读边界");
+  }
+
+  stage("search_restore");
+  await restoredFirstRow.hover();
+  await restoredFirstRow.getByRole("button", { name: "归档", exact: true }).click();
+  await restoredFirstRow.waitFor({ state: "detached", timeout: timeout() });
+  await page.getByRole("button", { name: "搜索对话", exact: true }).click();
+  const search = page.getByRole("searchbox", { name: "搜索对话", exact: true });
+  await search.fill(firstTitle);
+  const archivedOption = page.getByRole("option", {
+    name: `恢复并打开：${firstTitle}`,
+    exact: true,
+  });
+  await archivedOption.waitFor({ state: "visible", timeout: timeout() });
+  if (!(await archivedOption.innerText()).includes("已归档 · 恢复并打开")) {
+    throw new Error("搜索结果未解释归档状态与恢复动作");
+  }
+  await archivedOption.click();
+  await waitForComposerFocus(page, deadline);
+  await restoredFirstRow.waitFor({ state: "visible", timeout: timeout() });
+  if ((await currentThreadId(page, deadline, signal)) !== firstThreadId) {
+    throw new Error("搜索恢复后未打开目标会话");
+  }
+  if ((await restoredFirstRow.getByRole("img", { name: "有新回复" }).count()) !== 0) {
+    throw new Error("搜索恢复并打开错误制造了未读提醒");
+  }
+
+  stage("reduced_motion");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const reducedMotion = await page.evaluate(() => {
+    const sheet = [...globalThis.document.styleSheets].find((candidate) => {
+      try {
+        return [...candidate.cssRules].some((rule) =>
+          rule.cssText.includes("prefers-reduced-motion"),
+        );
+      } catch {
+        return false;
+      }
+    });
+    return sheet !== undefined && globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  });
+  if (!reducedMotion) throw new Error("WebView2 未应用减少动效媒体状态");
+  stage("completed");
+  return {
+    status: "passed",
+    firstThreadId,
+    secondThreadId,
+    failedThreadId,
+    neutralThreadId,
+    approvalThreadId,
+    pinnedSurvivedReload: true,
+    busyArchiveBlocked: true,
+    archiveUndoRestoredSelection: true,
+    searchRestoreOpened: true,
+    completedUnreadPersistedUntilSeen: true,
+    failedUnreadPersistedUntilSeen: true,
+    seenPersistedAcrossReload: true,
+    activeStatusVisibleForCurrentAndBackgroundThreads: true,
+    statusTooltipsVisible: true,
+    noReadinessText: true,
+    reducedMotion: true,
+    appearance,
+    ui: await captureUiEvidence(page, directories, signal),
+  };
+}
+
+/** 返回进程 watcher 已捕获的 Git 子进程身份集合，不记录命令行或工作区路径。 */
+function turnChangeReviewGitProcessIds(observed) {
+  return new Set(
+    [...observed.values()]
+      .filter((entry) => entry.name.toLowerCase() === "git.exe")
+      .map((entry) => `${entry.pid}:${entry.creationDate}`),
+  );
+}
+
+/** 读取与终态修改查看相关的重型 native 命令计数；参数和响应内容不进入报告。 */
+async function turnChangeReviewInvokeCounts(page) {
+  const [review, files, frozenRead] = await Promise.all([
+    reviewInvokeCounts(page),
+    workspaceFilesInvokeCounts(page),
+    tauriInvokeCount(page, "ja_turn_change_set_read"),
+  ]);
+  return { review, files, frozenRead };
+}
+
+/** 读取脱敏的终态正文并发水位，证明最多两个在途且隐藏后归零。 */
+async function turnChangeReviewReadLifecycle(page) {
+  return page.evaluate(() => {
+    const lifecycle = globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__;
+    return {
+      active: Number.isSafeInteger(lifecycle?.active) ? lifecycle.active : 0,
+      maximum: Number.isSafeInteger(lifecycle?.maximum) ? lifecycle.maximum : 0,
+    };
+  });
+}
+
+/**
+ * 检查 frozen Review 与当前范围标题在媒体/viewport 下真实渲染且不溢出；不依赖已删除的
+ * 独立摘要组件，也不写 DOM 状态来伪造主题或缩放。
+ */
+async function assertTurnChangeReviewVisualFrame(page, label) {
+  // 重开后的读取属于正常无缓存行为；视觉验收必须等到真实正文，而不只截标题或 loading。
+  await page.locator('[data-turn-review-kind="frozen_turn"] [data-review-diff-path]').waitFor({
+    state: "visible",
+    timeout: 30_000,
+  });
+  const frame = await page.evaluate((expectedLabel) => {
+    const panel = globalThis.document.querySelector("[data-turn-review-kind]");
+    const scope = panel?.querySelector('button[aria-label^="审阅范围：第"]');
+    if (
+      !(panel instanceof globalThis.HTMLElement) ||
+      !(scope instanceof globalThis.HTMLButtonElement)
+    ) {
+      return { label: expectedLabel, failure: "surface_missing" };
+    }
+    const panelRect = panel.getBoundingClientRect();
+    const scopeRect = scope.getBoundingClientRect();
+    return {
+      label: expectedLabel,
+      failure: null,
+      theme: globalThis.document.documentElement.dataset["theme"],
+      forcedColors: globalThis.matchMedia("(forced-colors: active)").matches,
+      width: globalThis.innerWidth,
+      devicePixelRatio: globalThis.devicePixelRatio,
+      horizontalOverflow:
+        globalThis.document.documentElement.scrollWidth >
+        globalThis.document.documentElement.clientWidth + 1,
+      scopeInViewport: scopeRect.left >= -1 && scopeRect.right <= globalThis.innerWidth + 1,
+      panelInViewport: panelRect.left >= -1 && panelRect.right <= globalThis.innerWidth + 1,
+    };
+  }, label);
+  if (
+    frame.failure !== null ||
+    frame.horizontalOverflow ||
+    !frame.scopeInViewport ||
+    !frame.panelInViewport
+  ) {
+    throw new Error(`Turn Change Review 视觉矩阵失败：${JSON.stringify(frame)}`);
+  }
+  await captureVisualEvidence(page, `turn-change-review-${label}.png`);
+  return frame;
+}
+
+/**
+ * 使用真实设置控件覆盖亮/暗主题，再用 CDP 覆盖 forced-colors、窄窗和 200% DPI 等价视口；
+ * 每项均复验 frozen Review，避免只截图应用壳层。
+ */
+async function captureTurnChangeReviewVisualMatrix(page, deadline, signal, recordStage) {
+  const frames = [];
+  const reopenReads = [];
+  const stepDeadline = () => Math.min(deadline, Date.now() + 30_000);
+  for (const mode of themeMatrixModes) {
+    recordStage?.(`turn_change_review:visual_${mode.value}`);
+    const actionDeadline = stepDeadline();
+    const readBefore = await tauriInvokeCount(page, "ja_turn_change_set_read");
+    const settings = await openThemeMatrixAppearanceSettings(page, actionDeadline);
+    await selectThemeMatrixAppearanceValue(
+      page,
+      settings,
+      {
+        controlName: "外观模式",
+        optionName: mode.label,
+        rootAttribute: "data-theme-mode",
+        value: mode.value,
+      },
+      actionDeadline,
+    );
+    if ((await tauriInvokeCount(page, "ja_turn_change_set_read")) !== readBefore) {
+      throw new Error(`设置页隐藏 Review 时触发正文读取：${mode.value}`);
+    }
+    await settings.getByRole("button", { name: "返回应用", exact: true }).click();
+    await page
+      .locator('[data-turn-review-kind="frozen_turn"]')
+      .waitFor({ state: "visible", timeout: Math.max(1, actionDeadline - Date.now()) });
+    await waitForCondition(
+      `主题切换返回后重新读取 ${mode.value}`,
+      async () => (await tauriInvokeCount(page, "ja_turn_change_set_read")) === readBefore + 1,
+      actionDeadline,
+      signal,
+    );
+    reopenReads.push(mode.value);
+    frames.push(await assertTurnChangeReviewVisualFrame(page, mode.value));
+  }
+  const client = await page.context().newCDPSession(page);
+  try {
+    recordStage?.("turn_change_review:visual_forced_colors");
+    await page.emulateMedia({ forcedColors: "active", reducedMotion: "reduce" });
+    const forced = await assertTurnChangeReviewVisualFrame(page, "forced-colors");
+    if (!forced.forcedColors) throw new Error("Turn Change Review forced-colors 未生效");
+    frames.push(forced);
+
+    recordStage?.("turn_change_review:visual_narrow");
+    await client.send("Emulation.setDeviceMetricsOverride", {
+      width: 720,
+      height: 640,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    // CDP ACK 先于 WebView2 的 resize/渲染提交；必须读取生效后的几何事实再做视觉断言。
+    try {
+      await page.waitForFunction(
+        () =>
+          globalThis.innerWidth === 720 && Math.abs(globalThis.devicePixelRatio - 1) <= 0.000001,
+        undefined,
+        { timeout: Math.max(1, Math.min(10_000, deadline - Date.now())) },
+      );
+    } catch (error) {
+      const metrics = await client.send("Runtime.evaluate", {
+        expression:
+          "JSON.stringify({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,scale:visualViewport.scale})",
+        returnByValue: true,
+      });
+      throw new Error(`Turn Review native viewport did not apply: ${metrics.result.value}`, {
+        cause: error,
+      });
+    }
+    frames.push(await assertTurnChangeReviewVisualFrame(page, "narrow"));
+
+    recordStage?.("turn_change_review:visual_zoom_200");
+    await client.send("Emulation.setDeviceMetricsOverride", {
+      width: 640,
+      height: 410,
+      deviceScaleFactor: 2,
+      mobile: false,
+    });
+    await page.waitForFunction(
+      () => globalThis.innerWidth === 640 && Math.abs(globalThis.devicePixelRatio - 2) <= 0.000001,
+      undefined,
+      {
+        timeout: Math.max(1, Math.min(10_000, deadline - Date.now())),
+      },
+    );
+    const zoom = await assertTurnChangeReviewVisualFrame(page, "zoom-200");
+    if (!devicePixelRatioMatches(zoom.devicePixelRatio, 2))
+      throw new Error("Turn Change Review 200% 缩放未生效");
+    frames.push(zoom);
+  } finally {
+    await page
+      .emulateMedia({ forcedColors: "none", reducedMotion: "no-preference" })
+      .catch(() => undefined);
+    await client.send("Emulation.clearDeviceMetricsOverride").catch(() => undefined);
+    await client.detach().catch(() => undefined);
+  }
+  return {
+    light: frames.some((frame) => frame.label === "light" && frame.theme === "light"),
+    dark: frames.some((frame) => frame.label === "dark" && frame.theme === "dark"),
+    forcedColors: frames.some((frame) => frame.label === "forced-colors" && frame.forcedColors),
+    narrow: frames.some((frame) => frame.label === "narrow" && frame.width === 720),
+    zoom200: frames.some(
+      (frame) => frame.label === "zoom-200" && devicePixelRatioMatches(frame.devicePixelRatio, 2),
+    ),
+    reopenReads,
+    frames,
+  };
+}
+
+/** 在打开终态面板前包装 Worker 构造与 terminate，只记录数量以证明隐藏释放资源。 */
+async function installTurnChangeReviewWorkerProbe(page) {
+  await page.evaluate(() => {
+    if (globalThis.__JA_E2E_TURN_CHANGE_WORKER_PROBE_INSTALLED__ === true) return;
+    const NativeWorker = globalThis.Worker;
+    const lifecycle = { created: 0, terminated: 0, active: 0 };
+    globalThis.__JA_E2E_TURN_CHANGE_WORKERS__ = lifecycle;
+    globalThis.Worker = new Proxy(NativeWorker, {
+      construct(target, argumentsList) {
+        const worker = Reflect.construct(target, argumentsList);
+        const terminate = worker.terminate.bind(worker);
+        let closed = false;
+        lifecycle.created += 1;
+        lifecycle.active += 1;
+        worker.terminate = () => {
+          if (!closed) {
+            closed = true;
+            lifecycle.terminated += 1;
+            lifecycle.active -= 1;
+          }
+          terminate();
+        };
+        return worker;
+      },
+    });
+    globalThis.__JA_E2E_TURN_CHANGE_WORKER_PROBE_INSTALLED__ = true;
+  });
+}
+
+/** 返回脱敏 Worker 数量，不读取脚本 URL、消息或正文。 */
+async function turnChangeReviewWorkerLifecycle(page) {
+  return page.evaluate(() => {
+    const lifecycle = globalThis.__JA_E2E_TURN_CHANGE_WORKERS__;
+    return {
+      created: Number.isSafeInteger(lifecycle?.created) ? lifecycle.created : 0,
+      terminated: Number.isSafeInteger(lifecycle?.terminated) ? lifecycle.terminated : 0,
+      active: Number.isSafeInteger(lifecycle?.active) ? lifecycle.active : 0,
+    };
+  });
+}
+
+/**
+ * 同一 Renderer 时钟测量可见控件 click 到选中态和正文首帧；窄栏详情通过上下文件或刷新导航，
+ * 绝不直接点击隐藏文件树。随后核对原生完整单文件读取恰增一次。
+ */
+async function measureFrozenTurnReviewFile(page, file, previousPath, deadline) {
+  const readBefore = await tauriInvokeCount(page, "ja_turn_change_set_read");
+  const measurement = await page.evaluate(
+    ({ expectedPath, expectedMarker, oldPath, timeoutMs }) =>
+      new Promise((resolvePromise, rejectPromise) => {
+        const panel = globalThis.document.querySelector('[data-turn-review-kind="frozen_turn"]');
+        const button = [...(panel?.querySelectorAll('button[role="treeitem"]') ?? [])].find(
+          (candidate) => candidate.getAttribute("aria-label") === `查看 ${expectedPath} 的本轮修改`,
+        );
+        if (!(button instanceof globalThis.HTMLButtonElement)) {
+          rejectPromise(new Error(`未找到终态文件 ${expectedPath}`));
+          return;
+        }
+        const selected = [...(panel?.querySelectorAll('button[role="treeitem"]') ?? [])].find(
+          (candidate) => candidate.getAttribute("aria-selected") === "true",
+        );
+        const rows = [...(panel?.querySelectorAll('button[role="treeitem"]') ?? [])];
+        const selectedIndex = rows.indexOf(selected);
+        const targetIndex = rows.indexOf(button);
+        let action = button;
+        if (button.getClientRects().length === 0) {
+          const actionLabel =
+            selectedIndex === targetIndex
+              ? "重新读取本轮修改"
+              : targetIndex === selectedIndex - 1
+                ? "上一个文件"
+                : targetIndex === selectedIndex + 1
+                  ? "下一个文件"
+                  : undefined;
+          action = [...panel.querySelectorAll("button")].find(
+            (candidate) => candidate.getAttribute("aria-label") === actionLabel,
+          );
+        }
+        if (
+          !(action instanceof globalThis.HTMLButtonElement) ||
+          action.disabled ||
+          action.getClientRects().length === 0
+        ) {
+          rejectPromise(new Error(`终态文件 ${expectedPath} 没有可见导航控件`));
+          return;
+        }
+        const startedAt = globalThis.performance.now();
+        let selectedAt;
+        let contentAt;
+        let loadingAt;
+        let plainBeforeHighlight = false;
+        let staleBodyCleared = false;
+        const finish = () => {
+          if (!Number.isFinite(selectedAt) || !Number.isFinite(contentAt)) return;
+          globalThis.clearTimeout(timer);
+          observer.disconnect();
+          resolvePromise({
+            selectionMs: selectedAt - startedAt,
+            contentMs: contentAt - startedAt,
+            loadingMs: Number.isFinite(loadingAt) ? loadingAt - startedAt : null,
+            plainBeforeHighlight,
+            staleBodyCleared,
+          });
+        };
+        const capture = () => {
+          if (button.getAttribute("aria-selected") === "true" && !Number.isFinite(selectedAt)) {
+            selectedAt = globalThis.performance.now();
+            staleBodyCleared ||= oldPath === undefined;
+          }
+          if (
+            oldPath !== undefined &&
+            globalThis.document.querySelector(`[data-review-diff-path="${oldPath}"]`) === null
+          )
+            staleBodyCleared = true;
+          const content = globalThis.document.querySelector(
+            `[data-review-diff-path="${expectedPath}"]`,
+          );
+          const loading = [...globalThis.document.querySelectorAll('[role="status"]')].find(
+            (candidate) => candidate.textContent?.includes(expectedPath),
+          );
+          if (loading !== undefined && !Number.isFinite(loadingAt))
+            loadingAt = globalThis.performance.now();
+          if (
+            content instanceof globalThis.HTMLElement &&
+            content.textContent?.includes(expectedMarker) &&
+            !Number.isFinite(contentAt) &&
+            staleBodyCleared
+          ) {
+            contentAt = globalThis.performance.now();
+            plainBeforeHighlight =
+              ["plain", "loading"].includes(content.getAttribute("data-review-syntax")) &&
+              content.querySelector("[data-syntax-role]") === null;
+          }
+          finish();
+        };
+        const observer = new globalThis.MutationObserver(capture);
+        observer.observe(globalThis.document.body, {
+          attributes: true,
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
+        const timer = globalThis.setTimeout(() => {
+          observer.disconnect();
+          rejectPromise(new Error(`终态文件读取超时 ${expectedPath}`));
+        }, timeoutMs);
+        action.click();
+        capture();
+      }),
+    {
+      expectedPath: file.path,
+      expectedMarker: file.marker,
+      oldPath: previousPath,
+      timeoutMs: Math.max(1, Math.min(10_000, deadline - Date.now())),
+    },
+  );
+  await waitForCondition(
+    "终态单文件读取计数",
+    async () => (await tauriInvokeCount(page, "ja_turn_change_set_read")) === readBefore + 1,
+    Math.min(deadline, Date.now() + 5_000),
+  );
+  if (measurement.staleBodyCleared !== true) {
+    throw new Error(`切换到 ${file.path} 时旧正文未立即退出`);
+  }
+  return measurement;
+}
+
+/** 汇总 30 次真实样本并保留原始值，p95 使用同一线性算法。 */
+function summarizeTurnChangeReviewSamples(samples) {
+  const rounded = (value) => Math.round(value * 10) / 10;
+  return {
+    samples: samples.length,
+    minimumMs: rounded(Math.min(...samples)),
+    p95Ms: rounded(linearPercentile(samples, 0.95)),
+    maximumMs: rounded(Math.max(...samples)),
+    valuesMs: samples.map(rounded),
+  };
+}
+
+/**
+ * 三个相邻 animation frame 通过可见上下文件控件提交 A-B-A，确保首两个读取已启动而第三个
+ * 只占 latest pending；窄栏隐藏的文件树只用于读取选中 identity，不承载点击。
+ */
+async function triggerFrozenTurnReviewAba(page, paths, readBefore) {
+  return page.evaluate(
+    async ({ expectedPaths, initialReads }) => {
+      const readCount = () => {
+        const bucket = globalThis.__JA_E2E_TAURI_INVOKE_COUNTS__?.["ja_turn_change_set_read"];
+        return Number.isSafeInteger(bucket?.start) ? bucket.start : 0;
+      };
+      const deltas = [];
+      for (const [index, expectedPath] of expectedPaths.entries()) {
+        const rows = [...globalThis.document.querySelectorAll('button[role="treeitem"]')];
+        const button = rows.find(
+          (candidate) => candidate.getAttribute("aria-label") === `查看 ${expectedPath} 的本轮修改`,
+        );
+        if (!(button instanceof globalThis.HTMLButtonElement))
+          throw new Error(`A-B-A 缺少文件 ${expectedPath}`);
+        const selected = rows.find(
+          (candidate) => candidate.getAttribute("aria-selected") === "true",
+        );
+        const selectedIndex = rows.indexOf(selected);
+        const targetIndex = rows.indexOf(button);
+        const actionLabel =
+          selectedIndex === targetIndex
+            ? "重新读取本轮修改"
+            : targetIndex === selectedIndex - 1
+              ? "上一个文件"
+              : targetIndex === selectedIndex + 1
+                ? "下一个文件"
+                : undefined;
+        const action = [...globalThis.document.querySelectorAll("button")].find(
+          (candidate) => candidate.getAttribute("aria-label") === actionLabel,
+        );
+        if (
+          !(action instanceof globalThis.HTMLButtonElement) ||
+          action.disabled ||
+          action.getClientRects().length === 0
+        )
+          throw new Error(`A-B-A 文件 ${expectedPath} 没有可见导航控件`);
+        action.click();
+        if (index < 2) {
+          const expectedDelta = index + 1;
+          for (let frame = 0; frame < 20 && readCount() - initialReads < expectedDelta; frame += 1)
+            await new Promise(globalThis.requestAnimationFrame);
+        } else {
+          await new Promise(globalThis.requestAnimationFrame);
+          await new Promise(globalThis.requestAnimationFrame);
+        }
+        deltas.push(readCount() - initialReads);
+      }
+      return deltas;
+    },
+    { expectedPaths: paths, initialReads: readBefore },
+  );
+}
+
+/**
+ * 通过真实“添加项目”入口让 App Server 创建 Workspace/Thread，再用只读公开命令核对 fixture
+ * root、trust 与当前选中 Thread 的同一 identity；不直接写入内部 Workspace ID 或 tracker。
+ */
+async function bindTurnChangeReviewWorkspace(page, expectedRoot, deadline, signal) {
+  await assertGeneralConversationScope(page, deadline);
+  const generalThreadId = await currentThreadId(page, deadline, signal);
+  await clickVerifiedControl(
+    page,
+    page.getByRole("button", { name: "添加项目", exact: true }),
+    deadline,
+  );
+  await page
+    .locator('[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]')
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await page.waitForFunction(
+    (previousThreadId) => {
+      const selected = globalThis.document.querySelector(
+        '[aria-label="最近对话列表"] button[data-thread-id][aria-current="page"]',
+      );
+      return selected?.getAttribute("data-thread-id") !== previousThreadId;
+    },
+    generalThreadId,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  await assertProjectConversationScope(page, deadline);
+  const projectThreadId = await currentThreadId(page, deadline, signal);
+  const authority = await page.evaluate(
+    async ({ rootPath, selectedThreadId }) => {
+      const invoke = globalThis.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== "function") return { status: "bridge_unavailable" };
+      const normalizePath = (value) =>
+        value.replaceAll("/", "\\").replace(/\\+$/u, "").toLocaleLowerCase("en-US");
+      try {
+        const pageValue = await invoke("ja_workspace_list", { input: { limit: 200 } });
+        const workspaces = Array.isArray(pageValue?.items) ? pageValue.items : [];
+        const matching = workspaces.filter(
+          (workspace) =>
+            typeof workspace?.root === "string" &&
+            normalizePath(workspace.root) === normalizePath(rootPath),
+        );
+        if (matching.length !== 1 || typeof matching[0]?.workspaceId !== "string") {
+          return { status: "workspace_mismatch", matchingCount: matching.length };
+        }
+        const workspace = matching[0];
+        const threadPage = await invoke("ja_thread_list", {
+          input: { workspaceId: workspace.workspaceId, limit: 200 },
+        });
+        const threads = Array.isArray(threadPage?.items) ? threadPage.items : [];
+        const selected = threads.find((thread) => thread?.threadId === selectedThreadId);
+        return {
+          status: "resolved",
+          rootMatched: true,
+          trusted: workspace.trust === "trusted",
+          selectedThreadMatched: selected?.workspaceId === workspace.workspaceId,
+          workspaceRevision: Number.isSafeInteger(workspace.revision)
+            ? workspace.revision
+            : undefined,
+        };
+      } catch {
+        return { status: "readback_rejected" };
+      }
+    },
+    { rootPath: expectedRoot, selectedThreadId: projectThreadId },
+  );
+  if (
+    authority.status !== "resolved" ||
+    authority.rootMatched !== true ||
+    authority.trusted !== true ||
+    authority.selectedThreadMatched !== true
+  ) {
+    throw new Error(
+      `Turn Change Review Workspace identity 前置证明失败：${JSON.stringify(authority)}`,
+    );
+  }
+  return {
+    openedThroughProductUi: true,
+    rootMatched: true,
+    trusted: true,
+    selectedThreadMatched: true,
+    threadId: projectThreadId,
+    workspaceRevision: authority.workspaceRevision,
+  };
+}
+
+/**
+ * 性能阶段完成后立即写独立 checkpoint；`partial` 明确不能替代完整产品验收，且内容只包含
+ * 运行身份、数值指标和视觉布尔矩阵，不持久化文件路径、正文或 Provider payload。
+ */
+async function writeTurnChangeReviewPerformanceCheckpoint(
+  reportPath,
+  sidecarIdentity,
+  performance,
+  visualMatrix,
+) {
+  const checkpointPath = `${reportPath}.performance.json`;
+  await mkdir(dirname(checkpointPath), { recursive: true });
+  await writeFile(
+    checkpointPath,
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        status: "partial",
+        mode: "turn_change_review",
+        stage: "performance",
+        stageStatus: "passed",
+        completeAcceptance: false,
+        runtime: {
+          platform: process.platform,
+          surface: "tauri_webview2",
+          nativeSidecar: {
+            used: true,
+            identityMatched: true,
+            fileName: sidecarIdentity.fileName,
+            sizeBytes: sidecarIdentity.sizeBytes,
+            sha256: sidecarIdentity.sha256,
+          },
+        },
+        visualMatrix,
+        performance,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+}
+
+/**
+ * 执行 frozen-only 本轮修改真窗验收：运行中无专用入口，终态卡只读打开；所有文件正文
+ * 每次通过完整单文件 JA-RPC 读取，A-B-A、隐藏释放和性能样本均来自真实 WebView2。
+ */
+async function runTurnChangeReviewAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  providerFixture,
+  nativeScope,
+  sidecarIdentity,
+  signal,
+  recordStage,
+) {
+  if (providerFixture === undefined || sidecarIdentity === undefined) {
+    throw new Error("本轮修改验收缺少 Provider 或 Native sidecar identity");
+  }
+  const scenario = providerFixture.scenarios.turnChangeReview;
+  const stage = (name) => recordStage?.(`turn_change_review:${name}`);
+  /** 每个 UI/IPC 等待独立限制为 30 秒，避免一个漂移选择器占满整场真窗总预算。 */
+  const stepDeadline = () => Math.min(deadline, Date.now() + 30_000);
+  const timeout = () => Math.max(1, stepDeadline() - Date.now());
+  stage("startup");
+  await waitForRuntimeReady(page, stepDeadline(), signal);
+  await waitForInitialThread(page, stepDeadline(), signal);
+  await waitForComposerAdmission(page, stepDeadline());
+  await waitForCondition(
+    "本轮修改 Native sidecar process",
+    async () =>
+      [...nativeScope.observed.values()].some(
+        (entry) => entry.name.toLowerCase() === sidecarIdentity.fileName.toLowerCase(),
+      ),
+    stepDeadline(),
+    signal,
+  );
+  const nativeSidecarUsed = [...nativeScope.observed.values()].some(
+    (entry) => entry.name.toLowerCase() === sidecarIdentity.fileName.toLowerCase(),
+  );
+
+  stage("bind_workspace");
+  const workspaceIdentity = await bindTurnChangeReviewWorkspace(
+    page,
+    directories.workspace,
+    stepDeadline(),
+    signal,
+  );
+  await waitForComposerAdmission(page, stepDeadline());
+
+  stage("default_git");
+  await ensureWorkbenchVisible(page, stepDeadline());
+  await page.keyboard.press("Control+Shift+G");
+  const gitWorkbench = page.locator('.ja-workbench[data-active-tab="review"]');
+  await gitWorkbench.waitFor({ state: "visible", timeout: timeout() });
+  const gitPanel = gitWorkbench.locator('[data-ja-review-shell][data-source="uncommitted"]');
+  await gitPanel.waitFor({ state: "visible", timeout: timeout() });
+  await gitPanel
+    .getByRole("button", { name: "审阅范围：未提交", exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  await closeWorkbenchTabsExcept(page, gitWorkbench, [], stepDeadline());
+  await assertReviewSurfaceClosed(page);
+
+  const invokesBefore = await turnChangeReviewInvokeCounts(page);
+  const gitBefore = turnChangeReviewGitProcessIds(nativeScope.observed);
+  stage("running_no_preview");
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  await composer.fill(scenario.prompt);
+  await composer.press("Enter");
+  await waitForCondition(
+    "首个修改 Tool 已提交且第二阶段在等待",
+    async () => {
+      providerFixture.assertHandlerHealthy();
+      return providerFixture.turnChangeReviewCommittedToolCount() >= 1;
+    },
+    stepDeadline(),
+    signal,
+  );
+  const runningAfterFirst = {
+    changeCards: await page.locator(".ja-turn-changes").count(),
+    frozenPanels: await page.locator('[data-turn-review-kind="frozen_turn"]').count(),
+  };
+  if (runningAfterFirst.changeCards !== 0 || runningAfterFirst.frozenPanels !== 0) {
+    throw new Error(`运行中错误暴露本轮查看入口：${JSON.stringify(runningAfterFirst)}`);
+  }
+  providerFixture.releaseTurnChangeReviewStep(2);
+  await waitForCondition(
+    "第二个修改 Tool 已提交且终态阶段在等待",
+    async () => {
+      providerFixture.assertHandlerHealthy();
+      return providerFixture.turnChangeReviewCommittedToolCount() >= 2;
+    },
+    stepDeadline(),
+    signal,
+  );
+  const invokesWhileRunning = await turnChangeReviewInvokeCounts(page);
+  const gitAfter = turnChangeReviewGitProcessIds(nativeScope.observed);
+  const hiddenReviewIo = {
+    reviewHidden: true,
+    ignoredFiles: workspaceSwitchIgnoredFixtureCount,
+    untrackedFiles: workspaceSwitchUntrackedFixtureCount,
+    delta: {
+      gitSnapshot: invokesWhileRunning.review.snapshot - invokesBefore.review.snapshot,
+      gitSubprocess: [...gitAfter].filter((identity) => !gitBefore.has(identity)).length,
+      fullTreeScan: invokesWhileRunning.files.tree - invokesBefore.files.tree,
+    },
+    nativeInvokes: {
+      frozenRead: invokesWhileRunning.frozenRead - invokesBefore.frozenRead,
+    },
+  };
+  if (
+    (await page.locator(".ja-turn-changes").count()) !== 0 ||
+    Object.values({ ...hiddenReviewIo.delta, ...hiddenReviewIo.nativeInvokes }).some(
+      (value) => value !== 0,
+    )
+  ) {
+    throw new Error(`运行中隐藏 Review 触发入口或重型 IO：${JSON.stringify(hiddenReviewIo)}`);
+  }
+
+  stage("terminal_freeze");
+  providerFixture.releaseTurnChangeReviewStep(3);
+  await waitForCondition(
+    "终态回复可见",
+    async () => {
+      providerFixture.assertHandlerHealthy();
+      return (await page.getByText(scenario.reply, { exact: true }).count()) > 0;
+    },
+    stepDeadline(),
+    signal,
+  );
+  const changeCard = page.locator(".ja-turn-changes").last();
+  await changeCard.waitFor({ state: "visible", timeout: timeout() });
+  const openChange = changeCard.getByRole("button", { name: "查看修改", exact: true });
+  await openChange.waitFor({ state: "visible", timeout: timeout() });
+  // toBeVisible 不能证明长文件名具有可读宽度；这里用真实全局 CSS 下的几何防止双网格回归。
+  const fileNamesReadable = await changeCard.locator(".ja-turn-changes__files code").evaluateAll(
+    (names) =>
+      names.length === 2 &&
+      names.every((name) => {
+        const rect = name.getBoundingClientRect();
+        const row = name.parentElement.getBoundingClientRect();
+        return (
+          rect.width >= 48 &&
+          rect.height > 0 &&
+          rect.left >= row.left &&
+          rect.right <= row.right + 1
+        );
+      }),
+  );
+  if (!fileNamesReadable) throw new Error("终态修改卡文件名没有可读宽度");
+  if (
+    (await changeCard.getByText(scenario.smallPath, { exact: true }).count()) !== 1 ||
+    (await changeCard.getByText(scenario.largePath, { exact: true }).count()) !== 1
+  ) {
+    throw new Error("终态修改卡未显示两个冻结文件摘要");
+  }
+  const files = {
+    small: { path: scenario.smallPath, marker: scenario.smallMarker },
+    large: { path: scenario.largePath, marker: scenario.largeMarker },
+  };
+
+  await installTurnChangeReviewWorkerProbe(page);
+  const readBaseline = await tauriInvokeCount(page, "ja_turn_change_set_read");
+  await clickVerifiedControl(page, openChange, stepDeadline());
+  const frozenPanel = page.locator('[data-turn-review-kind="frozen_turn"]');
+  await frozenPanel.waitFor({ state: "visible", timeout: timeout() });
+  await frozenPanel
+    .getByRole("button", { name: "审阅范围：第 1 轮修改", exact: true })
+    .waitFor({ state: "visible", timeout: timeout() });
+  await waitForCondition(
+    "终态默认单文件读取",
+    async () => (await tauriInvokeCount(page, "ja_turn_change_set_read")) > readBaseline,
+    stepDeadline(),
+    signal,
+  );
+  const readBeforeDetail = await tauriInvokeCount(page, "ja_turn_change_set_read");
+  const selectedTreeFile = frozenPanel.locator('button[role="treeitem"][aria-selected="true"]');
+  await selectedTreeFile.waitFor({ state: "visible", timeout: timeout() });
+  await clickVerifiedControl(page, selectedTreeFile, stepDeadline());
+  await waitForCondition(
+    "终态文件树进入详情并重新读取",
+    async () => (await tauriInvokeCount(page, "ja_turn_change_set_read")) === readBeforeDetail + 1,
+    stepDeadline(),
+    signal,
+  );
+  await frozenPanel.locator("[data-review-diff-path]").waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  const writableActions = await frozenPanel
+    .getByRole("button", { name: /暂存|取消暂存|撤销|批准/u })
+    .count();
+  if (writableActions !== 0) throw new Error("终态修改查看错误暴露 Git 写操作");
+
+  let previousPath = await frozenPanel
+    .locator("[data-review-diff-path]")
+    .getAttribute("data-review-diff-path");
+  const initialReads = (await tauriInvokeCount(page, "ja_turn_change_set_read")) - readBaseline;
+  let expectedReads = initialReads;
+
+  stage("performance");
+  const prewarm = previousPath === files.large.path ? files.small : files.large;
+  await measureFrozenTurnReviewFile(page, prewarm, previousPath ?? undefined, stepDeadline());
+  previousPath = prewarm.path;
+  expectedReads += 1;
+  const smallContentSamples = [];
+  const largeContentSamples = [];
+  const selectionSamples = [];
+  const plainSamples = [];
+  for (let index = 0; index < turnChangeReviewPerformanceSamples; index += 1) {
+    for (const [file, bucket] of [
+      [files.small, smallContentSamples],
+      [files.large, largeContentSamples],
+    ]) {
+      const measured = await measureFrozenTurnReviewFile(page, file, previousPath, stepDeadline());
+      selectionSamples.push(measured.selectionMs);
+      bucket.push(measured.contentMs);
+      plainSamples.push(measured.plainBeforeHighlight);
+      previousPath = file.path;
+      expectedReads += 1;
+    }
+  }
+
+  stage("loading_delay");
+  await page.evaluate(() => {
+    globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_MS__ = 300;
+    globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_REMAINING__ = 1;
+  });
+  const loading = await measureFrozenTurnReviewFile(
+    page,
+    files.small,
+    previousPath,
+    stepDeadline(),
+  );
+  previousPath = files.small.path;
+  expectedReads += 1;
+  if (
+    !Number.isFinite(loading.loadingMs) ||
+    loading.loadingMs < 120 ||
+    loading.loadingMs >= loading.contentMs
+  ) {
+    throw new Error(`120ms loading 行为无效：${JSON.stringify(loading)}`);
+  }
+
+  stage("aba_latest");
+  await page.evaluate(() => {
+    globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_MS__ = 300;
+    globalThis.__JA_E2E_TURN_CHANGE_READ_DELAY_REMAINING__ = 2;
+  });
+  const abaReadBefore = await tauriInvokeCount(page, "ja_turn_change_set_read");
+  const abaPaths = [files.large.path, files.small.path, files.large.path];
+  const abaStartDeltas = await triggerFrozenTurnReviewAba(page, abaPaths, abaReadBefore);
+  if (JSON.stringify(abaStartDeltas) !== JSON.stringify([1, 2, 2])) {
+    throw new Error(`A-B-A 未形成 2 active + 1 latest pending：${JSON.stringify(abaStartDeltas)}`);
+  }
+  await waitForCondition(
+    "A-B-A 三次单文件读取",
+    async () => (await tauriInvokeCount(page, "ja_turn_change_set_read")) === abaReadBefore + 3,
+    stepDeadline(),
+    signal,
+  );
+  await frozenPanel
+    .locator(`[data-review-diff-path="${files.large.path}"]`)
+    .waitFor({ state: "visible", timeout: timeout() });
+  previousPath = files.large.path;
+  expectedReads += 3;
+  await waitForCondition(
+    "A-B-A 读取释放",
+    async () => (await turnChangeReviewReadLifecycle(page)).active === 0,
+    stepDeadline(),
+    signal,
+  );
+  const readLifecycle = await turnChangeReviewReadLifecycle(page);
+
+  const visualMatrix = await captureTurnChangeReviewVisualMatrix(
+    page,
+    deadline,
+    signal,
+    recordStage,
+  );
+  expectedReads += visualMatrix.reopenReads.length;
+  const actualReadCount = (await tauriInvokeCount(page, "ja_turn_change_set_read")) - readBaseline;
+  if (actualReadCount !== expectedReads) {
+    throw new Error(`性能阶段读取计数包含预读或缺读：${actualReadCount}/${expectedReads}`);
+  }
+  const performance = {
+    before: { status: "not_measured", reason: "no_same_contract_native_baseline" },
+    after: {
+      selection: summarizeTurnChangeReviewSamples(selectionSamples),
+      small: {
+        payloadBytes: turnChangeReviewSmallPayloadBytes,
+        ...summarizeTurnChangeReviewSamples(smallContentSamples),
+      },
+      large: {
+        payloadBytes: turnChangeReviewLargePayloadBytes,
+        logicalLines: turnChangeReviewLargeLogicalLines,
+        ...summarizeTurnChangeReviewSamples(largeContentSamples),
+      },
+      actualReadCount,
+      abaReread: true,
+      prefetchReads: 0,
+      cacheHits: 0,
+      maxActiveReads: readLifecycle.maximum,
+      maxPendingReads: 1,
+      latestSelectionWins: true,
+      loading: {
+        hiddenBefore120Ms: loading.loadingMs >= 120,
+        visibleAfter120Ms: Number.isFinite(loading.loadingMs),
+        observedAtMs: Math.round(loading.loadingMs * 10) / 10,
+      },
+      plainBeforeHighlight: plainSamples.some(Boolean),
+    },
+  };
+  await writeTurnChangeReviewPerformanceCheckpoint(
+    turnChangeReviewReportPath,
+    sidecarIdentity,
+    performance,
+    visualMatrix,
+  );
+
+  stage("zero_change_and_history");
+  await composer.fill(scenario.zeroPrompt);
+  await composer.press("Enter");
+  await waitForCondition(
+    "零修改终态回复可见",
+    async () => {
+      providerFixture.assertHandlerHealthy();
+      return (await page.getByText(scenario.zeroReply, { exact: true }).count()) > 0;
+    },
+    stepDeadline(),
+    signal,
+  );
+  const changeCardsAfterZero = await page.locator(".ja-turn-changes").count();
+  const scopeAfterZero = await frozenPanel
+    .getByRole("button", { name: "审阅范围：第 1 轮修改", exact: true })
+    .count();
+  if (changeCardsAfterZero !== 1 || scopeAfterZero !== 1) {
+    throw new Error("零修改轮次错误新增入口或替换历史轮次");
+  }
+
+  stage("hide_cleanup");
+  const beforeHide = await turnChangeReviewInvokeCounts(page);
+  const workbench = page.locator(".ja-workbench");
+  await closeWorkbenchTabsExcept(page, workbench, [], stepDeadline());
+  await assertReviewSurfaceClosed(page);
+  await page.waitForTimeout(250);
+  const afterHide = await turnChangeReviewInvokeCounts(page);
+  const workerLifecycle = await turnChangeReviewWorkerLifecycle(page);
+  const hiddenAfterClose = {
+    gitSnapshot: afterHide.review.snapshot - beforeHide.review.snapshot,
+    fullTreeScan: afterHide.files.tree - beforeHide.files.tree,
+    frozenRead: afterHide.frozenRead - beforeHide.frozenRead,
+  };
+  if (
+    Object.values(hiddenAfterClose).some((value) => value !== 0) ||
+    workerLifecycle.active !== 0
+  ) {
+    throw new Error(
+      `隐藏后仍有 Review IO 或 Worker：${JSON.stringify({ hiddenAfterClose, workerLifecycle })}`,
+    );
+  }
+  hiddenReviewIo.workersAfterHide = workerLifecycle.active;
+  hiddenReviewIo.afterCloseDelta = hiddenAfterClose;
+
+  const readsAfterHide = (await tauriInvokeCount(page, "ja_turn_change_set_read")) - readBaseline;
+  if (readsAfterHide !== actualReadCount) {
+    throw new Error(`性能阶段结束后发生意外正文读取：${readsAfterHide}/${actualReadCount}`);
+  }
+
+  const rawEvents = await captureRawTauriEvents(page);
+  const modelUnavailableCount = rawEvents.filter(
+    (event) => event.method === "turn/terminal" && event.errorCode === "MODEL_UNAVAILABLE",
+  ).length;
+
+  stage("non_git");
+  const gitDirectory = join(directories.workspace, ".git");
+  const hiddenGitDirectory = join(directories.workspace, ".git-ja-e2e-hidden");
+  let gitHidden = false;
+  try {
+    await rename(gitDirectory, hiddenGitDirectory);
+    gitHidden = true;
+    await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+    await waitForRuntimeReady(page, stepDeadline(), signal);
+    await waitForInitialThread(page, stepDeadline(), signal);
+    await selectProjectThreadById(page, workspaceIdentity.threadId, stepDeadline(), signal);
+    await assertProjectConversationScope(page, stepDeadline());
+    const recoveredCard = page.locator(".ja-turn-changes").first();
+    await recoveredCard.waitFor({ state: "visible", timeout: timeout() });
+    await clickVerifiedControl(
+      page,
+      recoveredCard.getByRole("button", { name: "查看修改", exact: true }),
+      stepDeadline(),
+    );
+    const nonGitPanel = page.locator('[data-turn-review-kind="frozen_turn"]');
+    await nonGitPanel.waitFor({ state: "visible", timeout: timeout() });
+    const nonGitReadBefore = await tauriInvokeCount(page, "ja_turn_change_set_read");
+    const nonGitSmallFile = nonGitPanel.getByRole("treeitem", {
+      name: `查看 ${files.small.path} 的本轮修改`,
+      exact: true,
+    });
+    await nonGitSmallFile.waitFor({ state: "visible", timeout: timeout() });
+    await clickVerifiedControl(page, nonGitSmallFile, stepDeadline());
+    await waitForCondition(
+      "非 Git 项目的冻结修改读取",
+      async () =>
+        (await tauriInvokeCount(page, "ja_turn_change_set_read")) === nonGitReadBefore + 1,
+      stepDeadline(),
+      signal,
+    );
+    await nonGitPanel
+      .locator(`[data-review-diff-path="${files.small.path}"]`)
+      .filter({ hasText: files.small.marker })
+      .waitFor({ state: "visible", timeout: timeout() });
+    const scopeTrigger = nonGitPanel.getByRole("button", {
+      name: "审阅范围：第 1 轮修改",
+      exact: true,
+    });
+    await clickVerifiedControl(page, scopeTrigger, stepDeadline());
+    const scopeMenu = page.locator('.ja-review-source-menu[role="menu"]:visible');
+    await scopeMenu.waitFor({ state: "visible", timeout: timeout() });
+    if (
+      (await scopeMenu.getByText("未提交", { exact: true }).count()) !== 0 ||
+      (await scopeMenu.getByText("比较", { exact: true }).count()) !== 0
+    ) {
+      throw new Error("非 Git 项目仍展示不可用的 Git 范围");
+    }
+    await page.keyboard.press("Escape");
+  } finally {
+    if (gitHidden) await rename(hiddenGitDirectory, gitDirectory);
+  }
+  return {
+    schemaVersion: 1,
+    status: "passed",
+    mode: "turn_change_review",
+    runtime: {
+      platform: process.platform,
+      surface: "tauri_webview2",
+      nativeSidecar: {
+        used: nativeSidecarUsed,
+        identityMatched: nativeSidecarUsed,
+        fileName: sidecarIdentity.fileName,
+        sizeBytes: sidecarIdentity.sizeBytes,
+        sha256: sidecarIdentity.sha256,
+      },
+    },
+    provider: {
+      kind: "deterministic_loopback",
+      externalCalls: 0,
+      summaryAttempts: providerFixture.summaryAttemptCount(),
+      turnAttempts: providerFixture.attemptCount(scenario.id, "turn"),
+      toolCommits: providerFixture.turnChangeReviewCommittedToolCount(),
+      summaryObserved: providerFixture.summaryAttemptCount() > 0,
+      toolContinuationObserved: providerFixture.turnChangeReviewCommittedToolCount() === 2,
+      modelUnavailableCount,
+    },
+    workspaceIdentity,
+    product: {
+      defaultReviewSource: "git_uncommitted",
+      runningTurnPreviewVisible: false,
+      terminalChangeActionLabel: "查看修改",
+      zeroChangeActionVisible: false,
+      historicalTurnIdentityPreserved: true,
+      nonGitFrozenReviewReadable: true,
+      frozenReviewWritableActions: writableActions > 0,
+    },
+    visualMatrix,
+    hiddenReviewIo,
+    performance,
+  };
+}
+
+/** 读取 Review 两个命令的累计 start 次数，不读取参数、结果或 Git 内容。 */
+async function reviewInvokeCounts(page) {
+  const [catalog, snapshot] = await Promise.all([
+    tauriInvokeCount(page, "ja_review_catalog"),
+    tauriInvokeCount(page, "ja_review_snapshot"),
+  ]);
+  return { catalog, snapshot };
+}
+
+/** 读取 Files 重型 Tree/Watcher 命令累计次数，不采集 workspace、路径或 revision。 */
+async function workspaceFilesInvokeCounts(page) {
+  const [tree, watchStart, watchStop, watchRescan] = await Promise.all([
+    tauriInvokeCount(page, "ja_workspace_tree"),
+    tauriInvokeCount(page, "ja_workspace_watch_start"),
+    tauriInvokeCount(page, "ja_workspace_watch_stop"),
+    tauriInvokeCount(page, "ja_workspace_watch_rescan"),
+  ]);
+  return { tree, watchStart, watchStop, watchRescan };
+}
+
+/**
+ * 同时验证 Inspector 的可访问状态与实际布局均为关闭；缺少 Workbench 的 general scope 也属于
+ * 明确关闭，避免仅凭 Review Tab 是否被持久选择推断重型 snapshot 应否运行。
+ */
+async function assertReviewSurfaceClosed(page) {
+  const state = await page.evaluate(() => {
+    const inspector = globalThis.document.querySelector(".ja-inspector");
+    if (!(inspector instanceof globalThis.HTMLElement)) {
+      return { present: false, ariaHidden: true, dataVisible: false, rendered: false };
+    }
+    const style = globalThis.getComputedStyle(inspector);
+    const rect = inspector.getBoundingClientRect();
+    return {
+      present: true,
+      ariaHidden: inspector.getAttribute("aria-hidden") === "true",
+      dataVisible: inspector.hasAttribute("data-visible"),
+      rendered:
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0,
+    };
+  });
+  if (!state.ariaHidden || state.dataVisible || state.rendered) {
+    throw new Error(`Review 性能门禁要求右侧 Inspector 保持关闭：${JSON.stringify(state)}`);
+  }
+  return state;
+}
+
+/** 活跃 Turn 中通过产品控件切换模型、推理和访问模式，并等待每次偏好 ACK 恢复可操作。 */
+async function selectRuntimeRefreshPreferences(page, deadline) {
+  const oldModel = page.getByRole("button", { name: /当前模型：runtime-old-model/u });
+  const access = page.getByRole("combobox", { name: "访问模式", exact: true });
+  await oldModel.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  if (!(await oldModel.isEnabled()) || !(await access.isEnabled())) {
+    throw new Error("活动 Turn 错误禁用了模型或访问模式控件");
+  }
+  await oldModel.click();
+  const newModelOption = page.getByRole("menuitemradio", {
+    name: "runtime-new-model",
+    exact: true,
+  });
+  await newModelOption.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await newModelOption.click();
+  const newModel = page.getByRole("button", { name: /当前模型：runtime-new-model/u });
+  await newModel.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await newModel.click();
+  const reasoning = page.getByRole("menuitem", { name: /^推理强度/u });
+  await reasoning.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await reasoning.focus();
+  await reasoning.press("ArrowRight");
+  const high = page.getByRole("menuitemradio", { name: "高", exact: true });
+  await high.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await high.click();
+  await access.click();
+  await page.getByRole("option", { name: "需要审批", exact: true }).click();
+  await waitForCondition(
+    "Runtime Refresh 偏好控件 ACK",
+    async () => {
+      const trigger = page.getByRole("button", { name: /当前模型：runtime-new-model/u });
+      return (
+        (await trigger.count()) === 1 &&
+        (await trigger.isEnabled()) &&
+        (await access.isEnabled()) &&
+        (await access.innerText()).includes("需要审批")
+      );
+    },
+    deadline,
+  );
+  return { modelEnabled: true, reasoningSelected: "high", accessMode: "approval_required" };
+}
+
+/**
+ * 在同一 Turn 的三个请求边界完成真实热更新验收：首请求保持旧环境，旧 batch 精确失败，
+ * 第二/三请求采用同一新 Profile 并保留 Anthropic 私有 continuation。
+ */
+async function runRuntimeRefreshAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  fixture,
+  controlPath,
+  reportPath,
+  signal,
+  recordStage,
+) {
+  if (fixture === undefined) throw new Error("Runtime Refresh 验收缺少双协议 loopback Provider");
+  const stage = (name) => recordStage?.(`runtime_refresh:${name}`);
+  const stepDeadline = () => Math.min(deadline, Date.now() + 90_000);
+  stage("startup");
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  await waitForComposerAdmission(page, deadline);
+  await executeComposerCommand(page, "project", stepDeadline());
+  await assertProjectConversationScope(page, stepDeadline());
+  await waitForComposerAdmission(page, stepDeadline());
+  stage("activate_skill");
+  await selectComposerSuggestion(
+    page,
+    "$runtime-refresh",
+    "Skills",
+    "runtime-refresh",
+    "mouse",
+    stepDeadline(),
+  );
+  const turnStartOffset = (await tauriInvokeTrace(page, "ja_turn_start")).length;
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  await composer.fill(runtimeRefreshFixtureContract.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  stage("request_1_pending");
+  await waitForCondition(
+    "Runtime Refresh 首次 Provider 请求",
+    () => fixture.attempts.some((attempt) => attempt.kind === "turn" && attempt.ordinal === 1),
+    stepDeadline(),
+    signal,
+  );
+  const firstAttempt = fixture.attempts.find(
+    (attempt) => attempt.kind === "turn" && attempt.ordinal === 1,
+  );
+  if (firstAttempt?.contractValid !== true || firstAttempt.responded) {
+    throw new Error(`首次请求未稳定冻结在物理 dispatch：${JSON.stringify(firstAttempt)}`);
+  }
+  const accepted = (await tauriInvokeTrace(page, "ja_turn_start"))
+    .slice(turnStartOffset)
+    .findLast((entry) => entry.phase === "resolved");
+  if (typeof accepted?.turnId !== "string")
+    throw new Error("Runtime Refresh 缺少 turn/start identity");
+  const turnId = accepted.turnId;
+  const firstExecution = await readSqliteFact(
+    "Runtime Refresh 首次 Operation 游标",
+    () => runtimeRefreshExecutionFact(directories, turnId),
+    stepDeadline(),
+    signal,
+  );
+  if (firstExecution?.kind !== "PROVIDER_PENDING") {
+    throw new Error(`首次请求未持久化 PROVIDER_PENDING：${JSON.stringify(firstExecution)}`);
+  }
+  const firstMcpReport = await readRuntimeRefreshMcpReport(reportPath);
+  if (
+    !firstMcpReport.some(
+      (event) => event.kind === "request" && event.method === "tools/list" && event.revision === 1,
+    )
+  ) {
+    throw new Error("首次 Provider 请求前未延迟发现 MCP revision 1");
+  }
+  stage("update_preferences");
+  const controls = await selectRuntimeRefreshPreferences(page, stepDeadline());
+  stage("update_environment");
+  await Promise.all([
+    writeRuntimeRefreshWorkspaceInstructions(directories.workspace, 2),
+    writeRuntimeRefreshSkill(directories.home, 2),
+    replaceRuntimeRefreshConfiguration(
+      directories.home,
+      buildRuntimeRefreshSettingsDocument(
+        fixture.providerConfig.baseUrl,
+        controlPath,
+        reportPath,
+        2,
+      ),
+    ),
+  ]);
+  await writeFile(controlPath, '{"revision":2}\n', "utf8");
+  await waitForCondition(
+    "Runtime Refresh MCP list_changed",
+    async () =>
+      (await readRuntimeRefreshMcpReport(reportPath)).some(
+        (event) => event.kind === "notification" && event.revision === 2,
+      ),
+    stepDeadline(),
+    signal,
+  );
+  if ((await page.locator("[data-sonner-toast]").count()) !== 0) {
+    throw new Error("运行环境更新错误显示了独立 toast");
+  }
+  stage("release_request_1");
+  fixture.releaseFirstRequest();
+  await waitForCondition(
+    "Runtime Refresh 第二次 Provider 请求",
+    () => fixture.attempts.some((attempt) => attempt.kind === "turn" && attempt.ordinal === 2),
+    stepDeadline(),
+    signal,
+  );
+  const secondAttempt = fixture.attempts.find(
+    (attempt) => attempt.kind === "turn" && attempt.ordinal === 2,
+  );
+  if (secondAttempt?.contractValid !== true) {
+    throw new Error(`下一请求未采用最新环境：${JSON.stringify(secondAttempt)}`);
+  }
+  const turnRow = page.locator(`.ja-chat-timeline__row[data-turn-id="${turnId}"]`);
+  const approve = turnRow.getByRole("button", { name: "批准", exact: true });
+  await approve.waitFor({ state: "visible", timeout: Math.max(1, stepDeadline() - Date.now()) });
+  const secondExecution = await readSqliteFact(
+    "Runtime Refresh Tool batch 游标",
+    () => runtimeRefreshExecutionFact(directories, turnId),
+    stepDeadline(),
+    signal,
+  );
+  if (
+    secondExecution?.deadlineAt !== firstExecution.deadlineAt ||
+    secondExecution.modelRound < firstExecution.modelRound ||
+    secondExecution.usedToolCalls <= firstExecution.usedToolCalls
+  ) {
+    throw new Error("环境更新重置了 Operation Deadline 或累计游标");
+  }
+  let mcpReport = await readRuntimeRefreshMcpReport(reportPath);
+  if (mcpReport.some((event) => event.kind === "tool_call")) {
+    throw new Error("旧 Tool batch 被同名重路由到 revision 2");
+  }
+  stage("approve_request_2_tool");
+  await clickVerifiedControl(page, approve, stepDeadline());
+  await waitForCondition(
+    "Runtime Refresh revision 2 MCP Tool",
+    async () =>
+      (await readRuntimeRefreshMcpReport(reportPath)).filter(
+        (event) => event.kind === "tool_call" && event.revision === 2,
+      ).length === 1,
+    stepDeadline(),
+    signal,
+  );
+  await waitForCondition(
+    "Runtime Refresh 第三次 Provider 请求",
+    () => fixture.attempts.some((attempt) => attempt.kind === "turn" && attempt.ordinal === 3),
+    stepDeadline(),
+    signal,
+  );
+  const thirdAttempt = fixture.attempts.find(
+    (attempt) => attempt.kind === "turn" && attempt.ordinal === 3,
+  );
+  if (thirdAttempt?.contractValid !== true || thirdAttempt.privateContinuationSeen !== true) {
+    throw new Error(`相同 Profile 未复用 Anthropic continuation：${JSON.stringify(thirdAttempt)}`);
+  }
+  stage("final");
+  await waitForTurnFinal(
+    page,
+    runtimeRefreshFixtureContract.prompt,
+    runtimeRefreshFixtureContract.finalReply,
+    stepDeadline(),
+    signal,
+    directories,
+  );
+  await page.getByRole("status", { name: "上下文使用量未知", exact: true }).waitFor({
+    state: "visible",
+    timeout: Math.max(1, stepDeadline() - Date.now()),
+  });
+  if ((await page.getByRole("progressbar", { name: "上下文使用量" }).count()) !== 0) {
+    throw new Error("最新 UNKNOWN Usage 错误回退为旧 KNOWN 计量");
+  }
+  const visibleText = await page.locator("body").innerText();
+  for (const forbidden of ["冻结差异", "正在读取冻结差异", "最近一轮修改"]) {
+    if (visibleText.includes(forbidden)) throw new Error(`界面仍暴露冻结概念：${forbidden}`);
+  }
+  const facts = await readSqliteFact(
+    "Runtime Refresh 终态持久化",
+    () => runtimeRefreshPersistenceFacts(directories, turnId),
+    stepDeadline(),
+    signal,
+  );
+  const [firstUsage, secondUsage, thirdUsage] = facts.usage;
+  const profilesChanged = [
+    "providerId",
+    "modelId",
+    "api",
+    "upstreamModel",
+    "requestedReasoning",
+    "effectiveReasoning",
+    "accessMode",
+    "configGeneration",
+    "promptRevision",
+    "toolCatalogRevision",
+  ].every((key) => firstUsage?.profile?.[key] !== secondUsage?.profile?.[key]);
+  const profilesReused =
+    JSON.stringify(secondUsage?.profile) === JSON.stringify(thirdUsage?.profile);
+  const [oldBinding, newBinding] = facts.bindings;
+  if (
+    facts.usage.length !== 3 ||
+    facts.usage.map((entry) => entry.request_ordinal).join(",") !== "1,2,3" ||
+    facts.usage.map((entry) => entry.certainty).join(",") !== "KNOWN,KNOWN,UNKNOWN" ||
+    firstUsage.profile.providerId !== "provider_e2e" ||
+    secondUsage.profile.providerId !== "provider_refresh" ||
+    secondUsage.profile.modelId !== "model_refresh" ||
+    secondUsage.profile.api !== "anthropic_messages" ||
+    secondUsage.profile.requestedReasoning !== "high" ||
+    secondUsage.profile.effectiveReasoning !== "high" ||
+    secondUsage.profile.accessMode !== "APPROVAL_REQUIRED" ||
+    !profilesChanged ||
+    !profilesReused ||
+    facts.bindings.length !== 2 ||
+    oldBinding.route_kind !== "MCP" ||
+    oldBinding.local_name !== runtimeRefreshFixtureContract.toolName ||
+    oldBinding.state !== "FAILED" ||
+    !JSON.stringify(oldBinding.presentation).includes("TOOL_BINDING_UNAVAILABLE") ||
+    newBinding.route_kind !== "MCP" ||
+    newBinding.local_name !== runtimeRefreshFixtureContract.toolName ||
+    newBinding.state !== "SUCCEEDED" ||
+    facts.unavailableResultCount !== 1 ||
+    facts.turn?.state !== "COMPLETED" ||
+    facts.turn?.error_code !== null ||
+    facts.terminalExecutionDeleted !== true
+  ) {
+    throw new Error("Runtime Refresh SQLite 请求/Profile/Tool 证据不完整");
+  }
+  mcpReport = await readRuntimeRefreshMcpReport(reportPath);
+  const calls = mcpReport.filter((event) => event.kind === "tool_call");
+  if (calls.length !== 1 || calls[0].revision !== 2 || calls[0].valueType !== "number") {
+    throw new Error("MCP 只应执行一次 revision 2 Tool");
+  }
+  stage("completed");
+  return {
+    status: "passed",
+    turnId,
+    controls,
+    operation: { first: firstExecution, second: secondExecution, terminalDeleted: true },
+    provider: fixture.diagnosticSnapshot(),
+    usage: facts.usage.map(({ request_id, request_ordinal, certainty, profile }) => ({
+      requestId: request_id,
+      requestOrdinal: request_ordinal,
+      certainty,
+      profile,
+    })),
+    tools: facts.bindings.map((binding) => ({
+      callId: binding.call_id,
+      routeKind: binding.route_kind,
+      state: binding.state,
+      catalogRevision: binding.catalog_revision,
+    })),
+    mcp: { listChanged: true, toolCalls: calls.length, revision: calls[0].revision },
+    ui: { unknownUsage: true, legacyFreezeCopyAbsent: true, extraToastAbsent: true },
+  };
+}
+
+/**
+ * 以真实 pointer click 为起点，以目标 scope 已选中且 Composer admission 恢复为终点计时；
+ * 每次操作都有独立 20 秒期限，因此某次卡死不会借用后续轮次预算。
+ */
+async function measureWorkspaceScopeSwitch(
+  page,
+  { round, direction, targetScope, trigger, triggerKind },
+  overallDeadline,
+  signal,
+) {
+  const switchDeadline = Math.min(overallDeadline, Date.now() + workspaceSwitchDeadlineMs);
+  const startedAt = performance.now();
+  await clickVerifiedControl(page, trigger, switchDeadline);
+  if (targetScope === "general") {
+    await assertGeneralConversationScope(page, switchDeadline);
+  } else if (targetScope === "project") {
+    await assertProjectConversationScope(page, switchDeadline);
+  } else {
+    throw new Error("workspace switch 性能门禁收到未知目标 scope");
+  }
+  await waitForComposerAdmission(page, switchDeadline);
+  const reviewSurface = await assertReviewSurfaceClosed(page);
+  throwIfAborted(signal);
+  return {
+    round,
+    direction,
+    targetScope,
+    trigger: triggerKind,
+    durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+    deadlineMs: workspaceSwitchDeadlineMs,
+    visibleScopeReady: true,
+    reviewSurface,
+  };
+}
+
+/**
+ * 等待 Composer 真实 listbox 完成加载；三类触发共用该入口，避免测试通过 class 名绕过
+ * 可访问性合同，也让超时始终受本轮桌面 deadline 约束。
+ */
+async function waitForComposerSuggestionList(page, accessibleName, deadline) {
+  const list = page.getByRole("listbox", { name: accessibleName, exact: true });
+  await list.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await page.waitForFunction(
+    (name) => {
+      const candidate = [...globalThis.document.querySelectorAll('[role="listbox"]')].find(
+        (element) => element.getAttribute("aria-label") === name,
+      );
+      return candidate !== undefined && candidate.getAttribute("aria-busy") !== "true";
+    },
+    accessibleName,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  return list;
+}
+
+/**
+ * 通过原生 textarea 输入 token 并定位产品 option；键盘路径额外往返一次 active descendant，
+ * 证明 Arrow 导航没有把焦点移入面板，鼠标路径则使用真实 pointer click。
+ */
+async function selectComposerSuggestion(page, token, listName, optionText, method, deadline) {
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  await composer.fill(token);
+  const list = await waitForComposerSuggestionList(page, listName, deadline);
+  const option = list.getByRole("option").filter({ hasText: optionText }).first();
+  await option.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  if (method === "keyboard") {
+    const initial = await composer.getAttribute("aria-activedescendant");
+    await composer.press("ArrowDown");
+    const moved = await composer.getAttribute("aria-activedescendant");
+    if ((await list.getByRole("option").count()) > 1 && moved === initial) {
+      throw new Error("Composer ArrowDown 未改变 active descendant");
+    }
+    await composer.press("ArrowUp");
+    if ((await composer.getAttribute("aria-activedescendant")) !== initial) {
+      throw new Error("Composer ArrowUp 未恢复 active descendant");
+    }
+    const activeText = await list
+      .locator(`#${initial}`)
+      .innerText()
+      .catch(() => "");
+    if (!activeText.includes(optionText)) {
+      throw new Error(`Composer 键盘起点不是目标建议：${activeText}`);
+    }
+    await composer.press("Enter");
+  } else {
+    await clickVerifiedControl(page, option, deadline);
+  }
+  await page.waitForFunction(
+    ({ expectedToken, expectedLabel }) => {
+      const input = globalThis.document.querySelector('textarea[aria-label="消息"]');
+      const chips = [...globalThis.document.querySelectorAll(".ja-composer-context__chip")];
+      return (
+        input instanceof globalThis.HTMLTextAreaElement &&
+        input.value !== expectedToken &&
+        globalThis.document.activeElement === input &&
+        chips.some((chip) => chip.textContent?.includes(expectedLabel))
+      );
+    },
+    { expectedToken: token, expectedLabel: optionText },
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+}
+
+/** 打开精确 slash command 并用 Enter 选择，所有动作都经过 Composer descriptor。 */
+async function executeComposerCommand(page, command, deadline) {
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  await composer.fill(`/${command}`);
+  const list = await waitForComposerSuggestionList(page, "指令", deadline);
+  const option = list
+    .getByRole("option")
+    .filter({ hasText: `/${command}` })
+    .first();
+  await option.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  if ((await option.getAttribute("aria-disabled")) === "true") {
+    throw new Error(`/${command} 在预期可执行状态下被禁用：${await option.innerText()}`);
+  }
+  await composer.press("Enter");
+}
+
+/**
+ * 读取 Chip 的可见、tooltip 与按钮语义，不复制 workspace 绝对路径；返回值只包含计划中固定的
+ * 相对路径和 Skill 元数据。
+ */
+async function readComposerChipEvidence(page) {
+  return page.locator(".ja-composer-context__chip").evaluateAll((chips) =>
+    chips.map((chip) => {
+      const copy = chip.querySelector(".ja-composer-context__copy");
+      const remove = chip.querySelector("button");
+      return {
+        label: copy?.querySelector("strong")?.textContent?.trim(),
+        title: copy?.getAttribute("title"),
+        removeLabel: remove?.getAttribute("aria-label"),
+        removeTitle: remove?.getAttribute("title"),
+      };
+    }),
+  );
+}
+
+/**
+ * 在真实设置控件切换浅深色，并以 CDP 模拟 Windows 100/150/200% 有效视口；每一档都重新
+ * 打开真实 @ 面板，验证碰撞、焦点和无水平溢出。forced-colors 与 reduced-motion 使用浏览器
+ * 媒体状态，不通过写 DOM attribute 伪造。
+ */
+async function exerciseComposerVisualMatrix(page, deadline, recordStage) {
+  const stepDeadline = () => Math.min(deadline, Date.now() + 30_000);
+  const themeEvidence = [];
+  for (const mode of themeMatrixModes) {
+    recordStage?.(`composer_context:visual_theme_${mode.value}_open`);
+    const settings = await openThemeMatrixAppearanceSettings(page, stepDeadline());
+    recordStage?.(`composer_context:visual_theme_${mode.value}_select`);
+    await selectThemeMatrixAppearanceValue(
+      page,
+      settings,
+      {
+        controlName: "外观模式",
+        optionName: mode.label,
+        rootAttribute: "data-theme-mode",
+        value: mode.value,
+      },
+      stepDeadline(),
+    );
+    await settings.getByRole("button", { name: "返回应用", exact: true }).click();
+    await conversationSurface(page).waitFor({
+      state: "visible",
+      timeout: Math.max(1, stepDeadline() - Date.now()),
+    });
+    const composer = page.getByRole("textbox", { name: "消息", exact: true });
+    await composer.fill("$composer");
+    recordStage?.(`composer_context:visual_theme_${mode.value}_suggestions`);
+    await waitForComposerSuggestionList(page, "Skills", stepDeadline());
+    themeEvidence.push(
+      await page.evaluate(
+        (expected) => ({
+          expected,
+          theme: globalThis.document.documentElement.dataset["theme"],
+          themeMode: globalThis.document.documentElement.dataset["themeMode"],
+          focused:
+            globalThis.document.activeElement ===
+            globalThis.document.querySelector('textarea[aria-label="消息"]'),
+        }),
+        mode.value,
+      ),
+    );
+    await composer.press("Escape");
+    await composer.fill("");
+  }
+
+  const client = await page.context().newCDPSession(page);
+  const zoomEvidence = [];
+  try {
+    await page.emulateMedia({ forcedColors: "active", reducedMotion: "reduce" });
+    for (const scale of [1, 1.5, 2]) {
+      recordStage?.(`composer_context:visual_zoom_${Math.round(scale * 100)}`);
+      const width = Math.floor(1280 / scale);
+      const height = Math.floor(820 / scale);
+      await client.send("Emulation.setDeviceMetricsOverride", {
+        width,
+        height,
+        deviceScaleFactor: scale,
+        mobile: false,
+      });
+      const composer = page.getByRole("textbox", { name: "消息", exact: true });
+      await composer.fill("@sample");
+      await waitForComposerSuggestionList(page, "文件与目录", stepDeadline());
+      const frame = await page.evaluate((expectedScale) => {
+        const input = globalThis.document.querySelector('textarea[aria-label="消息"]');
+        const panel = globalThis.document.querySelector(".ja-composer-suggestions");
+        const form = input?.closest(".ja-composer");
+        if (
+          !(input instanceof globalThis.HTMLTextAreaElement) ||
+          !(panel instanceof globalThis.HTMLElement) ||
+          !(form instanceof globalThis.HTMLElement)
+        ) {
+          throw new Error("Composer zoom matrix 缺少真实输入或建议面板");
+        }
+        const panelRect = panel.getBoundingClientRect();
+        const formRect = form.getBoundingClientRect();
+        return {
+          percent: Math.round(expectedScale * 100),
+          devicePixelRatio: globalThis.devicePixelRatio,
+          width: globalThis.innerWidth,
+          height: globalThis.innerHeight,
+          focused: globalThis.document.activeElement === input,
+          panelAboveComposer: panelRect.bottom <= formRect.top + 1,
+          panelInsideViewport:
+            panelRect.left >= 0 &&
+            panelRect.right <= globalThis.innerWidth + 1 &&
+            panelRect.top >= 0,
+          horizontalOverflow:
+            globalThis.document.documentElement.scrollWidth >
+            globalThis.document.documentElement.clientWidth + 1,
+          forcedColors: globalThis.matchMedia("(forced-colors: active)").matches,
+          reducedMotion: globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches,
+          animationDuration: globalThis.getComputedStyle(panel).animationDuration,
+        };
+      }, scale);
+      if (
+        !frame.focused ||
+        !frame.panelAboveComposer ||
+        !frame.panelInsideViewport ||
+        frame.horizontalOverflow ||
+        !frame.forcedColors ||
+        !frame.reducedMotion
+      ) {
+        throw new Error(`Composer ${frame.percent}% 视觉矩阵失败：${JSON.stringify(frame)}`);
+      }
+      zoomEvidence.push(frame);
+      await composer.press("Escape");
+      await composer.fill("");
+    }
+  } finally {
+    await page
+      .emulateMedia({ forcedColors: "none", reducedMotion: "no-preference" })
+      .catch(() => undefined);
+    await client.send("Emulation.clearDeviceMetricsOverride").catch(() => undefined);
+  }
+  if (
+    themeEvidence.some(
+      (entry) =>
+        entry.theme !== entry.expected || entry.themeMode !== entry.expected || !entry.focused,
+    ) ||
+    zoomEvidence.map(({ percent }) => percent).join(",") !== "100,150,200"
+  ) {
+    throw new Error("Composer 主题或缩放矩阵证据不完整");
+  }
+  return { themes: themeEvidence, zoom: zoomEvidence, forcedColors: true, reducedMotion: true };
+}
+
+/**
+ * 逐项驱动 @/$// 的真实 WebView2 交互、Provider 暂停队列与 reload 恢复；所有负向 IO
+ * 断言都读取 Tauri adapter probe 的命令计数，不以源代码搜索替代运行证据。
+ */
+async function runComposerContextAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  providerFixture,
+  signal,
+  recordStage,
+) {
+  if (providerFixture === undefined) throw new Error("Composer context 验收缺少 loopback Provider");
+  const stage = (name) => recordStage?.(`composer_context:${name}`);
+  const timeout = () => Math.max(1, deadline - Date.now());
+  const scenarios = providerFixture.scenarios;
+  stage("startup");
+  await page.waitForFunction(
+    () => ["interactive", "complete"].includes(globalThis.document.readyState),
+    undefined,
+    { timeout: timeout() },
+  );
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  await assertGeneralConversationScope(page, deadline);
+  await waitForComposerAdmission(page, deadline);
+
+  stage("ime");
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  const imeClient = await page.context().newCDPSession(page);
+  const pathSearchBeforeIme = await tauriInvokeCount(page, "ja_runtime_workspace_path_search");
+  await composer.focus();
+  await imeClient.send("Input.imeSetComposition", {
+    text: "/settings",
+    selectionStart: 9,
+    selectionEnd: 9,
+    replacementStart: 0,
+    replacementEnd: 0,
+  });
+  await page.evaluate(
+    () =>
+      new Promise((resolvePromise) =>
+        globalThis.requestAnimationFrame(() => globalThis.requestAnimationFrame(resolvePromise)),
+      ),
+  );
+  const imeState = await page.evaluate(() => ({
+    panelCount: globalThis.document.querySelectorAll(".ja-composer-suggestions").length,
+    settingsCount: globalThis.document.querySelectorAll('[aria-label="设置页面"]').length,
+    focused:
+      globalThis.document.activeElement ===
+      globalThis.document.querySelector('textarea[aria-label="消息"]'),
+  }));
+  await imeClient.send("Input.imeSetComposition", {
+    text: "",
+    selectionStart: 0,
+    selectionEnd: 0,
+    replacementStart: 0,
+    replacementEnd: 9,
+  });
+  await composer.fill("");
+  if (
+    imeState.panelCount !== 0 ||
+    imeState.settingsCount !== 0 ||
+    !imeState.focused ||
+    (await tauriInvokeCount(page, "ja_runtime_workspace_path_search")) !== pathSearchBeforeIme
+  ) {
+    throw new Error(`IME composition 错误打开或执行 Composer 建议：${JSON.stringify(imeState)}`);
+  }
+
+  stage("project_command");
+  await executeComposerCommand(page, "project", deadline);
+  await page
+    .locator('[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]')
+    .waitFor({ state: "visible", timeout: timeout() });
+  await assertProjectConversationScope(page, deadline);
+  await waitForComposerAdmission(page, deadline);
+
+  stage("slash_inventory");
+  const heavyBeforeSlash = {
+    review: await reviewInvokeCounts(page),
+    files: await workspaceFilesInvokeCounts(page),
+    pathSearch: await tauriInvokeCount(page, "ja_runtime_workspace_path_search"),
+  };
+  await composer.fill("/");
+  const commandList = await waitForComposerSuggestionList(page, "指令", deadline);
+  const commands = await commandList.getByRole("option").evaluateAll((options) =>
+    options.map((option) => ({
+      name: option.querySelector("strong")?.textContent?.trim(),
+      detail: option.querySelector("small")?.textContent?.trim(),
+      disabled: option.getAttribute("aria-disabled") === "true",
+    })),
+  );
+  const expectedNames = [
+    "/new",
+    "/project",
+    "/search",
+    "/files",
+    "/review",
+    "/terminal",
+    "/preview",
+    "/settings",
+    "/sidebar",
+    "/back",
+    "/forward",
+    "/chat",
+  ];
+  if (commands.map(({ name }) => name).join(",") !== expectedNames.join(",")) {
+    throw new Error(`Composer 十二条指令展示不完整：${JSON.stringify(commands)}`);
+  }
+  const disabledReasons = Object.fromEntries(
+    commands.filter(({ disabled }) => disabled).map(({ name, detail }) => [name, detail]),
+  );
+  for (const [name, reason] of Object.entries({
+    "/review": "本轮没有可审查的修改",
+    "/preview": "当前没有可预览目标",
+    "/back": "没有更早的页面",
+    "/forward": "没有可前进的页面",
+    "/chat": "当前已在对话",
+  })) {
+    if (disabledReasons[name] !== reason) {
+      throw new Error(`${name} 未展示真实不可用原因：${JSON.stringify(disabledReasons)}`);
+    }
+  }
+  const selectionBeforeEscape = await composer.evaluate((input) => ({
+    start: input.selectionStart,
+    end: input.selectionEnd,
+  }));
+  await composer.press("Escape");
+  const escaped = await composer.evaluate((input) => ({
+    value: input.value,
+    expanded: input.getAttribute("aria-expanded"),
+    focused: globalThis.document.activeElement === input,
+    start: input.selectionStart,
+    end: input.selectionEnd,
+  }));
+  const heavyAfterSlash = {
+    review: await reviewInvokeCounts(page),
+    files: await workspaceFilesInvokeCounts(page),
+    pathSearch: await tauriInvokeCount(page, "ja_runtime_workspace_path_search"),
+  };
+  if (
+    escaped.value !== "/" ||
+    escaped.expanded !== "false" ||
+    !escaped.focused ||
+    escaped.start !== selectionBeforeEscape.start ||
+    escaped.end !== selectionBeforeEscape.end ||
+    JSON.stringify(heavyAfterSlash) !== JSON.stringify(heavyBeforeSlash)
+  ) {
+    throw new Error("Composer Esc 或 slash 零重型 IO 合同失败");
+  }
+  await composer.fill("");
+
+  stage("command_actions");
+  const commandDeadline = () => Math.min(deadline, Date.now() + turnDeadlineMs);
+  stage("command_search");
+  await executeComposerCommand(page, "search", commandDeadline());
+  await page.getByRole("searchbox", { name: "搜索对话", exact: true }).waitFor({
+    state: "visible",
+    timeout: Math.max(1, commandDeadline() - Date.now()),
+  });
+  await page.keyboard.press("Escape");
+  await waitForComposerFocus(page, commandDeadline());
+  stage("command_files");
+  await executeComposerCommand(page, "files", commandDeadline());
+  await page.locator('.ja-workbench[data-active-tab="files"]').waitFor({
+    state: "visible",
+    timeout: Math.max(1, commandDeadline() - Date.now()),
+  });
+  stage("command_chat_from_files");
+  await executeComposerCommand(page, "chat", commandDeadline());
+  await page
+    .locator(".ja-layout.is-inspector-hidden")
+    .waitFor({ state: "visible", timeout: Math.max(1, commandDeadline() - Date.now()) });
+  stage("command_terminal");
+  await executeComposerCommand(page, "terminal", commandDeadline());
+  await page.locator('.ja-workbench[data-active-tab="terminal"]').waitFor({
+    state: "visible",
+    timeout: Math.max(1, commandDeadline() - Date.now()),
+  });
+  stage("command_chat_from_terminal");
+  await executeComposerCommand(page, "chat", commandDeadline());
+  await page
+    .locator(".ja-layout.is-inspector-hidden")
+    .waitFor({ state: "visible", timeout: Math.max(1, commandDeadline() - Date.now()) });
+  stage("command_settings");
+  await executeComposerCommand(page, "settings", commandDeadline());
+  const settings = page.getByRole("region", { name: "设置页面", exact: true });
+  await settings.waitFor({
+    state: "visible",
+    timeout: Math.max(1, commandDeadline() - Date.now()),
+  });
+  await settings.getByRole("button", { name: "返回应用", exact: true }).click();
+  await waitForComposerFocus(page, commandDeadline());
+  const layout = page.locator(".ja-layout");
+  const sidebarInitiallyHidden = await layout.evaluate((element) =>
+    element.classList.contains("is-sidebar-hidden"),
+  );
+  stage("command_sidebar_hide");
+  await executeComposerCommand(page, "sidebar", commandDeadline());
+  await page.waitForFunction(
+    (initial) =>
+      globalThis.document.querySelector(".ja-layout")?.classList.contains("is-sidebar-hidden") !==
+      initial,
+    sidebarInitiallyHidden,
+    { timeout: Math.max(1, commandDeadline() - Date.now()) },
+  );
+  stage("command_sidebar_restore");
+  await executeComposerCommand(page, "sidebar", commandDeadline());
+  await page.waitForFunction(
+    (initial) =>
+      globalThis.document.querySelector(".ja-layout")?.classList.contains("is-sidebar-hidden") ===
+      initial,
+    sidebarInitiallyHidden,
+    { timeout: Math.max(1, commandDeadline() - Date.now()) },
+  );
+  stage("command_new");
+  await executeComposerCommand(page, "new", commandDeadline());
+  await waitForComposerFocus(page, commandDeadline());
+
+  stage("trigger_boundaries");
+  const searchesBeforeBoundaries = await tauriInvokeCount(page, "ja_runtime_workspace_path_search");
+  for (const invalid of ["mail@sample", "cash$composer", "hello /files"]) {
+    await composer.fill(invalid);
+    await page.evaluate(
+      () => new Promise((resolvePromise) => globalThis.requestAnimationFrame(resolvePromise)),
+    );
+    if ((await page.locator(".ja-composer-suggestions").count()) !== 0) {
+      throw new Error(`非 token 边界错误打开建议：${invalid}`);
+    }
+  }
+  if (
+    (await tauriInvokeCount(page, "ja_runtime_workspace_path_search")) !== searchesBeforeBoundaries
+  ) {
+    throw new Error("非 token 边界触发了 workspace/path/search");
+  }
+  await composer.fill("");
+
+  stage("skill_only");
+  const startsBeforeSkillOnly = await tauriInvokeCount(page, "ja_turn_start");
+  await selectComposerSuggestion(
+    page,
+    "$composer",
+    "Skills",
+    composerContextSkill.name,
+    "keyboard",
+    deadline,
+  );
+  const skillOnlySend = page.getByRole("button", { name: "发送", exact: true });
+  if (await skillOnlySend.isEnabled()) throw new Error("单独 Skill 错误构成可发送消息");
+  await skillOnlySend.click({ force: true });
+  if ((await tauriInvokeCount(page, "ja_turn_start")) !== startsBeforeSkillOnly) {
+    throw new Error("单独 Skill 触发了模型 Turn");
+  }
+  await page
+    .getByRole("button", { name: `移除上下文 ${composerContextSkill.name}`, exact: true })
+    .click();
+
+  stage("workspace_references");
+  const pathSearchBeforeReferences = await tauriInvokeCount(
+    page,
+    "ja_runtime_workspace_path_search",
+  );
+  await selectComposerSuggestion(page, "@sample", "文件与目录", "sample.ts", "keyboard", deadline);
+  await selectComposerSuggestion(
+    page,
+    "@folder-fixture",
+    "文件与目录",
+    "folder-fixture",
+    "mouse",
+    deadline,
+  );
+  const chipsBeforeDuplicate = await readComposerChipEvidence(page);
+  await selectComposerSuggestion(page, "@sample", "文件与目录", "sample.ts", "mouse", deadline);
+  const chipsAfterDuplicate = await readComposerChipEvidence(page);
+  if (
+    chipsBeforeDuplicate.length !== 2 ||
+    chipsAfterDuplicate.length !== 2 ||
+    !chipsAfterDuplicate.some(
+      (chip) =>
+        chip.label === "sample.ts" &&
+        chip.title === "sample.ts" &&
+        chip.removeLabel === "移除上下文 sample.ts" &&
+        chip.removeTitle === "移除",
+    ) ||
+    !chipsAfterDuplicate.some(
+      (chip) => chip.label === "folder-fixture" && chip.title === "folder-fixture",
+    ) ||
+    (await tauriInvokeCount(page, "ja_runtime_workspace_path_search")) <
+      pathSearchBeforeReferences + 3
+  ) {
+    throw new Error(`Workspace Chip 去重或可访问语义失败：${JSON.stringify(chipsAfterDuplicate)}`);
+  }
+  await page.getByRole("button", { name: "移除上下文 folder-fixture", exact: true }).click();
+  if ((await readComposerChipEvidence(page)).some(({ label }) => label === "folder-fixture")) {
+    throw new Error("Workspace Chip 移除未收敛");
+  }
+  await page.getByRole("button", { name: "移除上下文 sample.ts", exact: true }).click();
+
+  stage("visual_matrix");
+  const visualMatrix = await exerciseComposerVisualMatrix(page, deadline, recordStage);
+  await composer.fill("");
+
+  stage("active_queue");
+  const queueStepDeadline = () => Math.min(deadline, Date.now() + 60_000);
+  const threadId = await currentThreadId(page, queueStepDeadline(), signal);
+  stage("active_queue_skill");
+  await selectComposerSuggestion(
+    page,
+    "$composer",
+    "Skills",
+    composerContextSkill.name,
+    "mouse",
+    queueStepDeadline(),
+  );
+  stage("active_queue_file");
+  await selectComposerSuggestion(
+    page,
+    "@sample",
+    "文件与目录",
+    "sample.ts",
+    "keyboard",
+    queueStepDeadline(),
+  );
+  stage("active_queue_directory");
+  await selectComposerSuggestion(
+    page,
+    "@folder-fixture",
+    "文件与目录",
+    "folder-fixture",
+    "mouse",
+    queueStepDeadline(),
+  );
+  await composer.fill(scenarios.composerContext.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  stage("active_queue_first_provider_attempt");
+  await waitForTitleFixtureAttempts(
+    providerFixture,
+    scenarios.composerContext.id,
+    "turn",
+    1,
+    queueStepDeadline(),
+    signal,
+  );
+  const firstAttempt = providerFixture.attempts.find(
+    (attempt) => attempt.scenarioId === scenarios.composerContext.id && attempt.kind === "turn",
+  );
+  if (
+    firstAttempt?.composerContextProjection?.skillActivated !== true ||
+    firstAttempt.composerContextProjection.fileReferenceProjected !== true ||
+    firstAttempt.composerContextProjection.directoryReferenceProjected !== true ||
+    firstAttempt.composerContextProjection.workspaceBodyAbsent !== true
+  ) {
+    throw new Error(
+      `模型上下文投影未保持 Skill 实时激活和 @ 不预读：${JSON.stringify(firstAttempt?.composerContextProjection)}`,
+    );
+  }
+  stage("active_queue_queued_skill");
+  await selectComposerSuggestion(
+    page,
+    "$composer",
+    "Skills",
+    composerContextSkill.name,
+    "keyboard",
+    queueStepDeadline(),
+  );
+  stage("active_queue_queued_file");
+  await selectComposerSuggestion(
+    page,
+    "@sample",
+    "文件与目录",
+    "sample.ts",
+    "mouse",
+    queueStepDeadline(),
+  );
+  stage("active_queue_queued_directory");
+  await selectComposerSuggestion(
+    page,
+    "@folder-fixture",
+    "文件与目录",
+    "folder-fixture",
+    "keyboard",
+    queueStepDeadline(),
+  );
+  await composer.fill(scenarios.composerContext.queued);
+  const enqueueTraceOffset = (await tauriInvokeTrace(page, "ja_turn_input_enqueue")).length;
+  await page.getByRole("button", { name: "排队发送", exact: true }).click();
+  stage("active_queue_ack");
+  const queueRow = page
+    .locator(".ja-composer-queue__item")
+    .filter({ hasText: scenarios.composerContext.queued });
+  await queueRow.waitFor({
+    state: "visible",
+    timeout: Math.max(1, queueStepDeadline() - Date.now()),
+  });
+  const queuedReferences = await queueRow.innerText();
+  if (
+    ![composerContextSkill.name, "sample.ts", "folder-fixture"].every((reference) =>
+      queuedReferences.includes(reference),
+    )
+  ) {
+    throw new Error("活动回复排队未保留 Skill/Workspace 结构化引用");
+  }
+  await waitForCondition(
+    "Composer queue enqueue ACK",
+    async () =>
+      (await tauriInvokeTrace(page, "ja_turn_input_enqueue"))
+        .slice(enqueueTraceOffset)
+        .some(({ phase }) => phase === "resolved" || phase === "rejected"),
+    queueStepDeadline(),
+    signal,
+  );
+  const queueEnqueueLifecycle = (await tauriInvokeTrace(page, "ja_turn_input_enqueue"))
+    .slice(enqueueTraceOffset)
+    .map(({ phase, errorCode }) => ({ phase, errorCode }));
+  const enqueueRejection = queueEnqueueLifecycle.findLast(({ phase }) => phase === "rejected");
+  if (enqueueRejection !== undefined) {
+    throw new Error(`Composer queue enqueue 被拒绝：${enqueueRejection.errorCode ?? "unknown"}`);
+  }
+  if (
+    queueEnqueueLifecycle.filter(({ phase }) => phase === "start").length !== 1 ||
+    queueEnqueueLifecycle.filter(({ phase }) => phase === "resolved").length !== 1
+  ) {
+    throw new Error(`Composer queue enqueue ACK 不唯一：${JSON.stringify(queueEnqueueLifecycle)}`);
+  }
+  stage("active_queue_reload");
+  await page.reload({
+    waitUntil: "domcontentloaded",
+    timeout: Math.max(1, queueStepDeadline() - Date.now()),
+  });
+  await waitForRuntimeReady(page, queueStepDeadline(), signal);
+  await waitForInitialThread(page, queueStepDeadline(), signal);
+  await installRawTauriEventProbe(page);
+  await installTauriInvokeProbe(page);
+  await selectProjectThreadById(page, threadId, queueStepDeadline(), signal);
+  const restoredQueue = page
+    .locator(".ja-composer-queue__item")
+    .filter({ hasText: scenarios.composerContext.queued });
+  await restoredQueue.waitFor({
+    state: "visible",
+    timeout: Math.max(1, queueStepDeadline() - Date.now()),
+  });
+  const restoredQueueReferences = await restoredQueue.innerText();
+  const queueReloadRecovered = [composerContextSkill.name, "sample.ts", "folder-fixture"].every(
+    (reference) => restoredQueueReferences.includes(reference),
+  );
+  stage("active_queue_release");
+  providerFixture.release(scenarios.composerContext.id, "turn");
+  await waitForTitleFixtureAttempts(
+    providerFixture,
+    scenarios.composerContext.id,
+    "turn",
+    2,
+    queueStepDeadline(),
+    signal,
+  );
+  stage("active_queue_second_provider_finished");
+  await waitForTitleFixtureFinished(
+    providerFixture,
+    scenarios.composerContext.id,
+    "turn",
+    2,
+    queueStepDeadline(),
+    signal,
+  );
+  await page
+    .getByRole("region", { name: "对话时间线", exact: true })
+    .getByText(scenarios.composerContext.queuedReply, { exact: true })
+    .waitFor({ state: "visible", timeout: Math.max(1, queueStepDeadline() - Date.now()) });
+  const heavyAfterContext = {
+    review: await reviewInvokeCounts(page),
+    files: await workspaceFilesInvokeCounts(page),
+  };
+  stage("completed");
+  return {
+    status: "passed",
+    threadId,
+    ime: { ...imeState, pathSearchDelta: 0 },
+    commands: {
+      shown: commands,
+      disabledReasons,
+      executed: ["project", "search", "files", "chat", "terminal", "settings", "sidebar", "new"],
+    },
+    slashHeavyIoDelta: {
+      reviewCatalog: heavyAfterSlash.review.catalog - heavyBeforeSlash.review.catalog,
+      reviewSnapshot: heavyAfterSlash.review.snapshot - heavyBeforeSlash.review.snapshot,
+      filesTree: heavyAfterSlash.files.tree - heavyBeforeSlash.files.tree,
+      filesWatchStart: heavyAfterSlash.files.watchStart - heavyBeforeSlash.files.watchStart,
+      filesWatchStop: heavyAfterSlash.files.watchStop - heavyBeforeSlash.files.watchStop,
+      filesWatchRescan: heavyAfterSlash.files.watchRescan - heavyBeforeSlash.files.watchRescan,
+      pathSearch: heavyAfterSlash.pathSearch - heavyBeforeSlash.pathSearch,
+    },
+    workspace: {
+      pathSearchCount:
+        (await tauriInvokeCount(page, "ja_runtime_workspace_path_search")) -
+        pathSearchBeforeReferences,
+      chips: chipsAfterDuplicate,
+      duplicateSuppressed: chipsAfterDuplicate.length === chipsBeforeDuplicate.length,
+      removeCompleted: true,
+    },
+    skillOnlyBlocked: true,
+    modelProjection: firstAttempt.composerContextProjection,
+    visualMatrix,
+    queueEnqueueLifecycle,
+    queueReloadRecovered,
+    processRestartExpectation: {
+      threadId,
+      firstPrompt: scenarios.composerContext.prompt,
+      queuedPrompt: scenarios.composerContext.queued,
+      expectedReferences: ["sample.ts", "folder-fixture", composerContextSkill.name],
+    },
+    heavyCommandsAfterExplicitActions: heavyAfterContext,
+    ui: await captureUiEvidence(page, directories, signal),
+  };
+}
+
+/**
+ * 第二次真实 Tauri 启动只回读 App Server/SQLite 权威 Timeline；不能依赖首个 WebView 的
+ * React state，从而证明结构化引用在进程重启后仍可恢复。
+ */
+async function runComposerContextRestartSession(
+  page,
+  expectation,
+  deadline,
+  directories,
+  signal,
+  recordStage,
+) {
+  recordStage?.("composer_context_restart:load");
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  await selectProjectThreadById(page, expectation.threadId, deadline, signal);
+  const timeline = page.getByRole("region", { name: "对话时间线", exact: true });
+  const rows = [];
+  for (const prompt of [expectation.firstPrompt, expectation.queuedPrompt]) {
+    const message = timeline.getByRole("article", { name: "用户问题", exact: true }).filter({
+      hasText: prompt,
+    });
+    await message.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+    const references = await message
+      .getByRole("list", { name: "消息引用", exact: true })
+      .innerText();
+    if (!expectation.expectedReferences.every((reference) => references.includes(reference))) {
+      throw new Error(`重启后消息引用不完整：${JSON.stringify({ prompt, references })}`);
+    }
+    rows.push({ prompt, references: expectation.expectedReferences });
+  }
+  await waitForComposerAdmission(page, deadline);
+  recordStage?.("composer_context_restart:completed");
+  return {
+    status: "passed",
+    threadId: expectation.threadId,
+    historyReferencesRecovered: true,
+    rows,
+    ui: await captureUiEvidence(page, directories, signal),
+  };
+}
+
+/** 使用线性插值计算稳定分位值，小样本 p95 不会被机械折叠成单个最大值。 */
+function linearPercentile(values, percentile) {
+  if (values.length === 0 || percentile < 0 || percentile > 1) {
+    throw new Error("workspace switch percentile 输入无效");
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const position = (sorted.length - 1) * percentile;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  const weight = position - lower;
+  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+}
+
+/** 汇总逐次可见完成时延，同时保留原样本供不同机器重新计算和比较。 */
+function summarizeWorkspaceSwitchLatencies(switches) {
+  const values = switches.map((entry) => entry.durationMs);
+  const rounded = (value) => Math.round(value * 10) / 10;
+  return {
+    sampleCount: values.length,
+    minMs: rounded(Math.min(...values)),
+    averageMs: rounded(values.reduce((total, value) => total + value, 0) / values.length),
+    p50Ms: rounded(linearPercentile(values, 0.5)),
+    p95Ms: rounded(linearPercentile(values, 0.95)),
+    maxMs: rounded(Math.max(...values)),
+    deadlineMs: workspaceSwitchDeadlineMs,
+    samples: switches,
+  };
+}
+
+/**
+ * 在 Review/Inspector 始终关闭的前提下，先经真实“添加项目”进入项目，再进行多轮
+ * project→general→project 往返；同时采样命令增量、可见完成时延与 owner-verified renderer 内存。
+ */
+async function runWorkspaceSwitchPerformanceSession(
+  page,
+  deadline,
+  directories,
+  nativeScope,
+  signal,
+  recordStage,
+) {
+  const stage = (name) => recordStage?.(`workspace_perf:${name}`);
+  const startupDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  stage("general_ready");
+  await page.waitForFunction(
+    () =>
+      globalThis.document.readyState === "interactive" ||
+      globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: Math.max(1, startupDeadline - Date.now()) },
+  );
+  await waitForRuntimeReady(page, startupDeadline, signal);
+  await waitForInitialThread(page, startupDeadline, signal);
+  await assertGeneralConversationScope(page, startupDeadline);
+  await waitForComposerAdmission(page, startupDeadline);
+  await assertReviewSurfaceClosed(page);
+
+  const [reviewBefore, filesBefore] = await Promise.all([
+    reviewInvokeCounts(page),
+    workspaceFilesInvokeCounts(page),
+  ]);
+  const memorySamples = [
+    await captureIsolatedRendererMemory(nativeScope, "general_before_switches", signal),
+  ];
+  const switches = [];
+  stage("add_project");
+  switches.push(
+    await measureWorkspaceScopeSwitch(
+      page,
+      {
+        round: 0,
+        direction: "general_to_project",
+        targetScope: "project",
+        trigger: page.getByRole("button", { name: "添加项目", exact: true }),
+        triggerKind: "add_project",
+      },
+      deadline,
+      signal,
+    ),
+  );
+  memorySamples.push(await captureIsolatedRendererMemory(nativeScope, "project_after_add", signal));
+
+  const projects = page.locator('[aria-label="项目列表"] button[data-scope-kind="project"]');
+  if ((await projects.count()) !== 1)
+    throw new Error("workspace switch 性能 fixture 项目数量不是一");
+  for (let round = 1; round <= workspaceSwitchRoundTrips; round += 1) {
+    stage(`round_${round}_general`);
+    switches.push(
+      await measureWorkspaceScopeSwitch(
+        page,
+        {
+          round,
+          direction: "project_to_general",
+          targetScope: "general",
+          trigger: page.getByRole("button", { name: "切换到无项目对话", exact: true }),
+          triggerKind: "scope_row",
+        },
+        deadline,
+        signal,
+      ),
+    );
+    memorySamples.push(
+      await captureIsolatedRendererMemory(nativeScope, `round_${round}_general`, signal),
+    );
+
+    stage(`round_${round}_project`);
+    switches.push(
+      await measureWorkspaceScopeSwitch(
+        page,
+        {
+          round,
+          direction: "general_to_project",
+          targetScope: "project",
+          trigger: projects.first(),
+          triggerKind: "scope_row",
+        },
+        deadline,
+        signal,
+      ),
+    );
+    memorySamples.push(
+      await captureIsolatedRendererMemory(nativeScope, `round_${round}_project`, signal),
+    );
+  }
+
+  stage("settle");
+  await waitForDelay(workspaceSwitchMemorySettleMs, signal);
+  memorySamples.push(
+    await captureIsolatedRendererMemory(nativeScope, "project_after_settle", signal),
+  );
+  await assertReviewSurfaceClosed(page);
+  const [reviewAfter, filesAfter] = await Promise.all([
+    reviewInvokeCounts(page),
+    workspaceFilesInvokeCounts(page),
+  ]);
+  const reviewDelta = {
+    catalog: reviewAfter.catalog - reviewBefore.catalog,
+    snapshot: reviewAfter.snapshot - reviewBefore.snapshot,
+  };
+  if (reviewDelta.snapshot !== 0) {
+    throw new Error(
+      `隐藏 Review 在 workspace switch 期间触发 snapshot：${JSON.stringify({ before: reviewBefore.snapshot, after: reviewAfter.snapshot, delta: reviewDelta.snapshot })}`,
+    );
+  }
+  const filesDelta = {
+    tree: filesAfter.tree - filesBefore.tree,
+    watchStart: filesAfter.watchStart - filesBefore.watchStart,
+    watchStop: filesAfter.watchStop - filesBefore.watchStop,
+    watchRescan: filesAfter.watchRescan - filesBefore.watchRescan,
+  };
+  if (
+    filesDelta.tree !== 0 ||
+    filesDelta.watchStart !== 0 ||
+    filesDelta.watchStop !== 0 ||
+    filesDelta.watchRescan !== 0
+  ) {
+    throw new Error(
+      `隐藏 Files 在 workspace switch 期间触发重型命令：${JSON.stringify({ before: filesBefore, after: filesAfter, delta: filesDelta })}`,
+    );
+  }
+  stage("completed");
+  return {
+    status: "passed",
+    roundTrips: workspaceSwitchRoundTrips,
+    switchCount: switches.length,
+    latency: summarizeWorkspaceSwitchLatencies(switches),
+    reviewCommands: { before: reviewBefore, after: reviewAfter, delta: reviewDelta },
+    filesCommands: { before: filesBefore, after: filesAfter, delta: filesDelta },
+    rendererMemory: summarizeRendererMemory(memorySamples),
+    finalScope: "project",
+    ui: await captureUiEvidence(page, directories, signal),
+  };
 }
 
 /** 读取侧栏指定 Thread 的可见标题，忽略状态圆点与完成状态文案。 */
@@ -11768,9 +21971,22 @@ async function renameConversationThroughUi(page, currentTitle, nextTitle, deadli
   await dialog.waitFor({ state: "detached", timeout: Math.max(1, deadline - Date.now()) });
 }
 
-/** 等待指定 Thread 的权威终态事件，并可选择限制 cancelled/completed 状态。 */
-async function waitForConversationTerminal(page, threadId, expectedState, deadline, signal) {
+/**
+ * 等待指定 Thread 的权威终态：优先使用实时 terminal 事件；WebView reload 或晚订阅导致事件探针
+ * 断档时，回退到由 thread/read 恢复并持续归并的 Timeline reducer 投影，避免把已完成 Turn 误判为超时。
+ */
+async function waitForConversationTerminal(
+  page,
+  threadId,
+  expectedState,
+  deadline,
+  signal,
+  expectedTurnId,
+) {
   let terminal;
+  let reducerTerminal;
+  let reducerObservedAt;
+  const terminalEventGraceMs = 1_000;
   await waitForCondition(
     `${threadId} terminal ${expectedState}`,
     async () => {
@@ -11778,9 +21994,42 @@ async function waitForConversationTerminal(page, threadId, expectedState, deadli
         (event) =>
           event.method === "turn/terminal" &&
           event.threadId === threadId &&
+          (expectedTurnId === undefined || event.turnId === expectedTurnId) &&
           (expectedState === undefined || event.terminalState === expectedState),
       );
-      return terminal !== undefined;
+      if (terminal !== undefined) {
+        return true;
+      }
+      if (expectedState === undefined) {
+        return false;
+      }
+      const reducer = await captureTimelineReducerState(page);
+      const restoredTurn = Object.entries(reducer.turns ?? {}).find(
+        ([turnId, turn]) =>
+          turn.threadId === threadId &&
+          turn.status === expectedState &&
+          (expectedTurnId === undefined || turnId === expectedTurnId),
+      );
+      if (restoredTurn === undefined) {
+        return false;
+      }
+      if (reducerTerminal === undefined) {
+        reducerTerminal = {
+          method: "turn/terminal",
+          threadId,
+          turnId: restoredTurn[0],
+          terminalState: expectedState,
+          evidenceSource: "timeline-reducer",
+        };
+        reducerObservedAt = Date.now();
+      }
+      // reducer 与原始 Event 分属不同异步投影。短暂等待原始 Event 可保留 finalMessage、
+      // errorCode 等完整证据；宽限期到达后仍回退 reducer，覆盖 reload 和晚订阅场景。
+      if (Date.now() - reducerObservedAt < terminalEventGraceMs) {
+        return false;
+      }
+      terminal = reducerTerminal;
+      return true;
     },
     deadline,
     signal,
@@ -11812,13 +22061,15 @@ async function waitForAutomaticTitleTurnFinal(page, threadId, expectedText, dead
 
 /**
  * 在生产 App Server、真实 Tauri/WebView2 与内建 loopback Provider 上覆盖即时标题、自动标题、
- * 失败回退、人工 CAS、首轮取消、后续不补生成和搜索刷新；不使用测试 RPC 或客户端 fake。
+ * 首问 ACK 可见性、失败回退、人工 CAS、首轮取消、后续不补生成和搜索刷新；不使用测试 RPC
+ * 或客户端 fake。
  */
 async function runAutomaticTitleAcceptanceSession(
   page,
   deadline,
   directories,
   fixture,
+  nativeScope,
   recordIsolation,
   signal,
   recordStage,
@@ -11863,6 +22114,13 @@ async function runAutomaticTitleAcceptanceSession(
     deadline,
     signal,
   );
+  await page
+    .locator(".ja-chat-message-user")
+    .filter({ hasText: scenarios.success.prompt })
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await page
+    .locator('.ja-chat-message-final[data-response-state="working"]')
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   if (
     (await page
       .locator(".ja-chat-message-final")
@@ -12077,6 +22335,49 @@ async function runAutomaticTitleAcceptanceSession(
   );
   await captureVisualEvidence(page, "automatic-thread-title-webview2.png");
   recordIsolation(assertRuntimeIsolation(await processSnapshot(signal), directories));
+
+  stage("operation_recovery_admission");
+  const recoveryThreadId = await createConversationThread(page, deadline, signal);
+  const turnTraceOffset = (await tauriInvokeTrace(page, "ja_turn_start")).length;
+  await page.getByRole("textbox", { name: "消息" }).fill(scenarios.operationRecovery.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(
+    fixture,
+    scenarios.operationRecovery.id,
+    "turn",
+    1,
+    deadline,
+    signal,
+  );
+  const recoveryAttempt = fixture.attempts.find(
+    (attempt) => attempt.scenarioId === scenarios.operationRecovery.id && attempt.kind === "turn",
+  );
+  if (recoveryAttempt?.streamStarted || recoveryAttempt?.responded) {
+    throw new Error("Operation 强杀前 loopback 已发送模型输出");
+  }
+  await assertVisibleConversationTitle(
+    page,
+    recoveryThreadId,
+    scenarios.operationRecovery.prompt,
+    deadline,
+    signal,
+  );
+  const accepted = (await tauriInvokeTrace(page, "ja_turn_start"))
+    .slice(turnTraceOffset)
+    .findLast((entry) => entry.phase === "resolved");
+  if (typeof accepted?.turnId !== "string" || accepted.turnId.length === 0) {
+    throw new Error("Operation 强杀前缺少 turn/start Accepted identity");
+  }
+  stage("operation_recovery_force_kill");
+  const forceKill = await forceKillIsolatedAppServer(nativeScope, directories, deadline, signal);
+  await assertNoAdditionalTitleAttempts(
+    fixture,
+    scenarios.operationRecovery.id,
+    "turn",
+    1,
+    400,
+    signal,
+  );
   const providerAttempts = fixture.snapshot();
   if (providerAttempts.some((entry) => entry.invalidTitleContracts !== 0)) {
     throw new Error("自动标题请求未满足冻结模型、64 Token、无 Tool 或无续接合同");
@@ -12094,7 +22395,1245 @@ async function runAutomaticTitleAcceptanceSession(
       },
     ],
     activeThreadId: successThreadId,
+    operationRecovery: {
+      threadId: recoveryThreadId,
+      turnId: accepted.turnId,
+      provisionalTitle: scenarios.operationRecovery.prompt,
+      forceKill,
+    },
     providerAttempts,
+  };
+}
+
+/**
+ * 专用 Operation 真窗第一阶段只建立一个 PROVIDER_PENDING Turn 并强杀隔离 App Server；不运行标题、
+ * 搜索或普通取消矩阵，避免无关场景消耗故障恢复的全局期限。
+ */
+async function runOperationRecoveryAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  fixture,
+  nativeScope,
+  recordIsolation,
+  signal,
+  recordStage,
+) {
+  const stage = (name) => {
+    recordStage?.(`operation:${name}`);
+    console.log(`JA_E2E_OPERATION_STAGE phase=first name=${name}`);
+  };
+  stage("load");
+  await page.waitForFunction(
+    () =>
+      globalThis.document.readyState === "interactive" ||
+      globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  await page
+    .getByRole("heading", { name: "你想让 Ja 帮你完成什么？", exact: true })
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForRuntimeReady(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  await waitForComposerAdmission(page, deadline);
+  const scenario = fixture.scenarios.operationRecovery;
+  const threadId = await currentThreadId(page, deadline, signal);
+  const turnTraceOffset = (await tauriInvokeTrace(page, "ja_turn_start")).length;
+  stage("provider_pending");
+  await page.getByRole("textbox", { name: "消息" }).fill(scenario.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "turn", 1, deadline, signal);
+  const attempt = fixture.attempts.find(
+    (candidate) => candidate.scenarioId === scenario.id && candidate.kind === "turn",
+  );
+  if (attempt?.streamStarted || attempt?.responded) {
+    throw new Error("Operation 强杀前 loopback 已发送模型输出");
+  }
+  await assertVisibleConversationTitle(page, threadId, scenario.prompt, deadline, signal);
+  const accepted = (await tauriInvokeTrace(page, "ja_turn_start"))
+    .slice(turnTraceOffset)
+    .findLast((entry) => entry.phase === "resolved");
+  if (typeof accepted?.turnId !== "string" || accepted.turnId.length === 0) {
+    throw new Error("Operation 强杀前缺少 turn/start Accepted identity");
+  }
+  recordIsolation(assertRuntimeIsolation(await processSnapshot(signal), directories));
+  stage("force_kill");
+  const forceKill = await forceKillIsolatedAppServer(nativeScope, directories, deadline, signal);
+  // 受门控的 Node ServerResponse 可能在 gate release 前不发布 close；精确进程身份消失与请求计数
+  // 不增长才是强杀边界，第二阶段 release 时旧连接只会被 destroyed 检查丢弃。
+  await assertNoAdditionalTitleAttempts(fixture, scenario.id, "turn", 1, 400, signal);
+  return {
+    operationRecovery: {
+      threadId,
+      turnId: accepted.turnId,
+      provisionalTitle: scenario.prompt,
+      forceKill,
+    },
+    providerAttempts: fixture.snapshot(),
+  };
+}
+
+/**
+ * 专用 Operation 真窗第二阶段证明启动零重放、UNKNOWN Usage、真实 turn/resume、唯一 Provider 重试、
+ * 终态游标删除以及 WebView2 reload 后的 SQLite 历史一致性。
+ */
+async function runOperationRecoveryRestartSession(
+  page,
+  expectation,
+  fixture,
+  deadline,
+  directories,
+  signal,
+  recordStage,
+) {
+  const stage = (name) => {
+    recordStage?.(`operation_restart:${name}`);
+    console.log(`JA_E2E_OPERATION_STAGE phase=restart name=${name}`);
+  };
+  stage("load");
+  await page.waitForFunction(
+    () =>
+      globalThis.document.readyState === "interactive" ||
+      globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
+  stage("runtime_ready");
+  await waitForRuntimeReady(page, deadline, signal);
+  const recovery = expectation.operationRecovery;
+  if (recovery === undefined) throw new Error("重启验收缺少 Operation 恢复身份");
+  stage("zero_replay");
+  if (JSON.stringify(fixture.snapshot()) !== JSON.stringify(expectation.providerAttempts)) {
+    throw new Error("重启自动重放了 Operation Provider 请求");
+  }
+  stage("select_thread");
+  await selectThreadById(page, recovery.threadId, deadline, signal);
+  stage("title");
+  await assertVisibleConversationTitle(
+    page,
+    recovery.threadId,
+    recovery.provisionalTitle,
+    deadline,
+    signal,
+  );
+  stage("suspended_timeline");
+  await page
+    .getByLabel("最终答复")
+    .getByText("运行被中断", { exact: true })
+    .waitFor({
+      state: "visible",
+      timeout: Math.max(1, deadline - Date.now()),
+    });
+  stage("suspended_composer");
+  await page
+    .getByLabel("发送消息")
+    .getByText("运行被中断", { exact: true })
+    .waitFor({
+      state: "visible",
+      timeout: Math.max(1, deadline - Date.now()),
+    });
+  stage("unknown_usage");
+  await page.getByRole("status", { name: "上下文使用量未知", exact: true }).waitFor({
+    state: "visible",
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  if ((await page.getByRole("progressbar", { name: "上下文使用量" }).count()) !== 0) {
+    throw new Error("UNKNOWN Usage 被投影成了确定 Token 或百分比");
+  }
+  stage("zero_replay_window");
+  await assertNoAdditionalTitleAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "turn",
+    1,
+    600,
+    signal,
+  );
+  const starts = await tauriInvokePhaseCount(page, "ja_turn_resume", "start");
+  const resolved = await tauriInvokePhaseCount(page, "ja_turn_resume", "resolved");
+  stage("resume_click");
+  await clickVerifiedControl(
+    page,
+    page.getByRole("button", { name: "继续运行", exact: true }),
+    deadline,
+  );
+  stage("resume_invoke");
+  await waitForCondition(
+    "turn/resume Tauri invoke resolved",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_turn_resume", "start")) === starts + 1 &&
+      (await tauriInvokePhaseCount(page, "ja_turn_resume", "resolved")) === resolved + 1,
+    deadline,
+    signal,
+  );
+  stage("provider_attempt_2");
+  await waitForTitleFixtureAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "turn",
+    2,
+    deadline,
+    signal,
+  );
+  stage("release_provider");
+  fixture.release(fixture.scenarios.operationRecovery.id, "turn");
+  stage("final_reply");
+  await waitForAutomaticTitleTurnFinal(
+    page,
+    recovery.threadId,
+    fixture.scenarios.operationRecovery.reply,
+    deadline,
+    signal,
+  );
+  stage("automatic_title");
+  await waitForTitleFixtureAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "title",
+    1,
+    deadline,
+    signal,
+  );
+  await waitForTitleFixtureFinished(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "title",
+    1,
+    deadline,
+    signal,
+  );
+  stage("no_third_request");
+  await assertNoAdditionalTitleAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "turn",
+    2,
+    600,
+    signal,
+  );
+  if (
+    (await page.getByText("运行被中断", { exact: true }).count()) !== 0 ||
+    (await page.getByRole("button", { name: "继续运行", exact: true }).count()) !== 0
+  ) {
+    throw new Error("Operation 完成后仍保留可重复 Resume 的入口");
+  }
+  stage("terminal_execution");
+  if (turnExecutionRowCount(directories, recovery.turnId) !== 0) {
+    throw new Error("Operation 终态仍遗留 turn_execution 游标");
+  }
+  stage("reload");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForRuntimeReady(page, deadline, signal);
+  await selectThreadById(page, recovery.threadId, deadline, signal);
+  await page
+    .locator(".ja-chat-message-final")
+    .filter({ hasText: fixture.scenarios.operationRecovery.reply })
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForComposerAdmission(page, deadline);
+  if ((await page.getByText("运行被中断", { exact: true }).count()) !== 0) {
+    throw new Error("WebView2 reload 后错误恢复为 suspended");
+  }
+  stage("complete");
+  return {
+    threadId: recovery.threadId,
+    turnId: recovery.turnId,
+    forceKilled: recovery.forceKill.forceKilled,
+    providerAttemptsBeforeResume: 1,
+    providerAttemptsAfterResume: 2,
+    unknownUsageVisible: true,
+    resumeInvokeResolved: true,
+    terminalExecutionDeleted: true,
+    webViewReloadRecovered: true,
+    providerAttempts: fixture.snapshot(),
+  };
+}
+
+/**
+ * 在真实 WebView2 中完成回复中队列的最短闭环：首轮 Provider 被门控时连续入队，随后编辑、
+ * 删除与提升；重载必须从权威 `thread/read.inputQueue` 恢复，释放后 Steering 只能在 Tool
+ * batch 完成后的下一次 Provider 请求出现，普通消息继续按 FIFO 各自获得回复。视觉证据必须先经
+ * 产品设置页切换到请求主题，避免环境变量只改变文件名却未改变真实 WebView2 渲染状态。
+ */
+/**
+ * 在生产 App Server 与真实 WebView2 中验证 Tool pending -> running -> completed 全链路。
+ * 第二个 Shell 会等待 stdin EOF 并保持短时运行，给 UI 一个确定性观察窗口。
+ */
+async function runToolLifecycleAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  fixture,
+  signal,
+  recordStage,
+) {
+  if (fixture === undefined) throw new Error("Tool 生命周期验收缺少 loopback Provider fixture");
+  const scenario = fixture.scenarios.toolLifecycle;
+  const stage = (name) => recordStage?.(`tool_lifecycle:${name}`);
+  const toolDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  const timeout = () => Math.max(1, toolDeadline - Date.now());
+
+  stage("runtime_ready");
+  await waitForRuntimeReady(page, toolDeadline, signal);
+  await waitForInitialThread(page, toolDeadline, signal);
+  await assertGeneralConversationScope(page, toolDeadline);
+  await waitForComposerAdmission(page, toolDeadline);
+
+  stage("full_access");
+  const accessMode = page.getByRole("combobox", { name: "访问模式", exact: true });
+  await accessMode.click();
+  await page.getByRole("option", { name: "完全访问", exact: true }).click();
+  await page.waitForFunction(
+    () =>
+      globalThis.document
+        .querySelector('[role="combobox"][aria-label="访问模式"]')
+        ?.textContent?.includes("完全访问") === true,
+    undefined,
+    { timeout: timeout() },
+  );
+  await waitForComposerAdmission(page, toolDeadline);
+
+  const threadId = await currentThreadId(page, toolDeadline, signal);
+  const readsBefore = await tauriInvokePhaseCount(page, "ja_thread_read", "start");
+  stage("send");
+  await page.getByRole("textbox", { name: "消息" }).fill(scenario.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "turn", 1, toolDeadline, signal);
+
+  stage("running_projection");
+  const workProcess = page.locator(".ja-work-process").last();
+  await workProcess.waitFor({ state: "visible", timeout: timeout() });
+  const steps = workProcess.locator(".ja-work-step");
+  if ((await steps.count()) === 0) {
+    await workProcess.locator(".ja-work-process__trigger").click();
+  }
+  let runningProjection;
+  await waitForCondition(
+    "Tool partial batch running projection",
+    async () => {
+      const [events, texts] = await Promise.all([
+        captureRawTauriEvents(page),
+        steps.allInnerTexts().catch(() => []),
+      ]);
+      const scoped = events.filter((event) => event.threadId === threadId);
+      const started = scoped.filter((event) => event.method === "tool/started");
+      const committed = scoped.filter((event) => event.method === "tool/batch-committed");
+      const firstCompleted = texts.some((text) => text.includes("完成"));
+      const secondRunning = texts.some((text) => text.includes("进行中"));
+      if (started.length < 2 || committed.length < 1 || !firstCompleted || !secondRunning) {
+        return false;
+      }
+      runningProjection = {
+        startedCallIds: started.map((event) => event.callId),
+        committedCallIds: committed.flatMap((event) => event.resultCallIds),
+        visibleStepCount: texts.length,
+        firstCompleted,
+        secondRunning,
+        waitingVisible: texts.some((text) => text.includes("等待执行")),
+      };
+      return runningProjection.waitingVisible === false;
+    },
+    toolDeadline,
+    signal,
+  );
+
+  stage("final_reply");
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "turn", 2, toolDeadline, signal);
+  await waitForAutomaticTitleTurnFinal(page, threadId, scenario.reply, toolDeadline, signal);
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "title", 1, toolDeadline, signal);
+  await waitForTitleFixtureFinished(fixture, scenario.id, "title", 1, toolDeadline, signal);
+
+  const events = (await captureRawTauriEvents(page)).filter((event) => event.threadId === threadId);
+  const started = events.filter((event) => event.method === "tool/started");
+  const committed = events.filter((event) => event.method === "tool/batch-committed");
+  const terminal = events.findLast((event) => event.method === "turn/terminal");
+  const turnId = started[0]?.turnId;
+  if (
+    started.length !== 2 ||
+    started[0]?.ordinal !== 0 ||
+    started[1]?.ordinal !== 1 ||
+    committed.length !== 2 ||
+    committed[0]?.resultOrdinals?.[0] !== 0 ||
+    committed[1]?.resultOrdinals?.[0] !== 1 ||
+    terminal?.terminalState !== "completed" ||
+    typeof turnId !== "string"
+  ) {
+    throw new Error("Tool started、逐项 batch 或终态事件顺序不完整");
+  }
+  const readsAfterLiveTurn = await tauriInvokePhaseCount(page, "ja_thread_read", "start");
+  if (readsAfterLiveTurn !== readsBefore) {
+    throw new Error("Tool 逐项提交触发了意外 thread/read resync");
+  }
+  const snapshot = await captureAuthoritativeThreadSnapshot(page, threadId);
+  if (
+    snapshot.status !== "resolved" ||
+    snapshot.validationReason !== null ||
+    snapshot.items.filter((item) => item.presentationKind === "shell").length !== 2 ||
+    snapshot.items.some(
+      (item) => item.presentationKind === "shell" && item.presentationStatus !== "success",
+    )
+  ) {
+    throw new Error(`Tool 终态权威快照不完整：${JSON.stringify(snapshot)}`);
+  }
+  if (turnExecutionRowCount(directories, turnId) !== 0) {
+    throw new Error("Tool 完成后仍遗留 turn_execution 游标");
+  }
+
+  stage("reload_recovery");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, toolDeadline, signal);
+  await selectThreadById(page, threadId, toolDeadline, signal);
+  await page.locator(".ja-chat-message-final").filter({ hasText: scenario.reply }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await waitForComposerAdmission(page, toolDeadline);
+  if ((await page.getByText("等待执行", { exact: true }).count()) !== 0) {
+    throw new Error("WebView2 重载后 Tool 终态回退为等待执行");
+  }
+
+  stage("complete");
+  return {
+    status: "passed",
+    threadId,
+    turnId,
+    pendingToRunningVisible: true,
+    partialBatchVisible: runningProjection,
+    startedOrdinals: started.map((event) => event.ordinal),
+    committedOrdinals: committed.flatMap((event) => event.resultOrdinals),
+    finalReplyVisible: true,
+    noLiveResync: true,
+    durableSnapshot: true,
+    terminalExecutionDeleted: true,
+    webViewReloadRecovered: true,
+    providerAttempts: fixture.snapshot(),
+  };
+}
+
+/**
+ * 在真实 App Server 与 WebView2 中证明 Tool 错误属于模型可纠正的普通结果：未知 Tool 后可
+ * 执行一次 Shell，三个 schema 错误后可执行一次 Read；DSML-like 分片正文也必须正常完成并
+ * 经权威 thread/read 与 WebView reload 恢复。fixture 只访问 runner 私有工作区和 loopback。
+ */
+async function runToolFailureAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  fixture,
+  signal,
+  recordStage,
+) {
+  if (fixture === undefined) throw new Error("Tool 失败验收缺少 loopback Provider fixture");
+  const scenarios = fixture.scenarios;
+  const stage = (name) => recordStage?.(`tool_failure:${name}`);
+  const failureDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  const timeout = () => Math.max(1, failureDeadline - Date.now());
+
+  stage("runtime_ready");
+  await waitForRuntimeReady(page, failureDeadline, signal);
+  await waitForInitialThread(page, failureDeadline, signal);
+  await assertGeneralConversationScope(page, failureDeadline);
+  await waitForComposerAdmission(page, failureDeadline);
+
+  stage("appearance");
+  const appearance = await applyVisualPreferences(page, failureDeadline, {
+    captureSettingsEvidence: false,
+  });
+
+  stage("full_access");
+  const accessMode = page.getByRole("combobox", { name: "访问模式", exact: true });
+  await accessMode.click();
+  await page.getByRole("option", { name: "完全访问", exact: true }).click();
+  await waitForComposerAdmission(page, failureDeadline);
+
+  const threadId = await currentThreadId(page, failureDeadline, signal);
+  stage("unknown_tool_recovery");
+  await page.getByRole("textbox", { name: "消息" }).fill(scenarios.shellFailureRecovery.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(
+    fixture,
+    scenarios.shellFailureRecovery.id,
+    "turn",
+    3,
+    failureDeadline,
+    signal,
+  );
+  await waitForAutomaticTitleTurnFinal(
+    page,
+    threadId,
+    scenarios.shellFailureRecovery.reply,
+    failureDeadline,
+    signal,
+  );
+  const shellEvents = (await captureRawTauriEvents(page)).filter(
+    (event) => event.threadId === threadId,
+  );
+  const shellStarted = shellEvents.filter(
+    (event) =>
+      event.method === "tool/started" &&
+      event.callId?.startsWith("call_shell_failure_recovery_") === true,
+  );
+  const shellCommitted = shellEvents.filter(
+    (event) =>
+      event.method === "tool/batch-committed" &&
+      event.resultCallIds.some((callId) => callId.startsWith("call_shell_failure_recovery_")),
+  );
+  const shellTurnId = shellStarted[0]?.turnId;
+  const shellAttempts = fixture.attempts.filter(
+    (attempt) =>
+      attempt.scenarioId === scenarios.shellFailureRecovery.id && attempt.kind === "turn",
+  );
+  if (
+    shellStarted.length !== 1 ||
+    shellCommitted.length !== 2 ||
+    shellCommitted[0]?.resultOutcomes?.[0] !== "failed" ||
+    shellCommitted[0]?.resultErrorCodes?.[0] !== "TOOL_BINDING_UNAVAILABLE" ||
+    shellCommitted[0]?.resultOutputNonEmpty?.[0] !== true ||
+    shellCommitted[1]?.resultOutcomes?.[0] !== "succeeded" ||
+    shellCommitted[1]?.resultErrorCodes?.length !== 0 ||
+    shellCommitted[1]?.resultOutputNonEmpty?.[0] !== true ||
+    shellAttempts.length !== 3 ||
+    shellAttempts.some(
+      (attempt) =>
+        attempt.finalizationRequest === true ||
+        attempt.toolCatalogPresent !== true ||
+        attempt.shellToolDeclared !== true ||
+        attempt.readToolDeclared !== true,
+    ) ||
+    shellAttempts[0]?.toolOutputSeen !== false ||
+    shellAttempts.slice(1).some((attempt) => attempt.toolOutputSeen !== true) ||
+    typeof shellTurnId !== "string"
+  ) {
+    throw new Error("未知 Tool 结果反馈、Tool catalog 保留或 Shell 自纠正证据不完整");
+  }
+  if (turnExecutionRowCount(directories, shellTurnId) !== 0) {
+    throw new Error("未知 Tool 自纠正完成后仍遗留 turn_execution 游标");
+  }
+  const shellSnapshot = await captureAuthoritativeThreadSnapshot(page, threadId);
+  if (
+    shellSnapshot.status !== "resolved" ||
+    shellSnapshot.validationReason !== null ||
+    !shellSnapshot.turns?.some(
+      (turn) =>
+        turn.turnId === shellTurnId && turn.status === "completed" && turn.errorCode === null,
+    ) ||
+    !shellSnapshot.items?.some(
+      (item) =>
+        item.turnId === shellTurnId &&
+        item.kind === "final_answer" &&
+        item.owningTurnStatus === "completed" &&
+        item.textNonEmpty === true,
+    )
+  ) {
+    throw new Error(`未知 Tool 自纠正权威快照不完整：${JSON.stringify(shellSnapshot)}`);
+  }
+
+  stage("schema_error_recovery");
+  await waitForComposerAdmission(page, failureDeadline);
+  await page.getByRole("textbox", { name: "消息" }).fill(scenarios.readStallFailure.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(
+    fixture,
+    scenarios.readStallFailure.id,
+    "turn",
+    5,
+    failureDeadline,
+    signal,
+  );
+  await waitForAutomaticTitleTurnFinal(
+    page,
+    threadId,
+    scenarios.readStallFailure.reply,
+    failureDeadline,
+    signal,
+  );
+  const readEvents = (await captureRawTauriEvents(page)).filter(
+    (event) => event.threadId === threadId,
+  );
+  const readStarted = readEvents.filter(
+    (event) =>
+      event.method === "tool/started" &&
+      event.callId?.startsWith("call_read_stall_failure_") === true,
+  );
+  const readCommitted = readEvents.filter(
+    (event) =>
+      event.method === "tool/batch-committed" &&
+      event.resultCallIds.some((callId) => callId.startsWith("call_read_stall_failure_")),
+  );
+  const readTurnId = readStarted[0]?.turnId;
+  const readAttempts = fixture.attempts.filter(
+    (attempt) => attempt.scenarioId === scenarios.readStallFailure.id && attempt.kind === "turn",
+  );
+  if (
+    readStarted.length !== 1 ||
+    readCommitted.length !== 4 ||
+    readCommitted
+      .slice(0, 3)
+      .some(
+        (event) =>
+          event.resultOutcomes?.[0] !== "failed" ||
+          event.resultErrorCodes?.[0] !== "TOOL_ARGUMENTS_INVALID" ||
+          event.resultOutputNonEmpty?.[0] !== true,
+      ) ||
+    readCommitted[3]?.resultOutcomes?.[0] !== "succeeded" ||
+    readCommitted[3]?.resultErrorCodes?.length !== 0 ||
+    readCommitted[3]?.resultOutputNonEmpty?.[0] !== true ||
+    readAttempts.length !== 5 ||
+    readAttempts.some(
+      (attempt) =>
+        attempt.finalizationRequest === true ||
+        attempt.toolCatalogPresent !== true ||
+        attempt.shellToolDeclared !== true ||
+        attempt.readToolDeclared !== true,
+    ) ||
+    readAttempts[0]?.toolOutputSeen !== false ||
+    readAttempts.slice(1).some((attempt) => attempt.toolOutputSeen !== true) ||
+    typeof readTurnId !== "string"
+  ) {
+    throw new Error("Read schema 错误结果反馈、连续纠正或最终成功证据不完整");
+  }
+  if (turnExecutionRowCount(directories, readTurnId) !== 0) {
+    throw new Error("Read 自纠正完成后仍遗留 turn_execution 游标");
+  }
+
+  const snapshot = await captureAuthoritativeThreadSnapshot(page, threadId);
+  const readItems =
+    snapshot.items?.filter(
+      (item) => item.turnId === readTurnId && item.presentationKind === "read",
+    ) ?? [];
+  if (
+    snapshot.status !== "resolved" ||
+    snapshot.validationReason !== null ||
+    !snapshot.turns?.some(
+      (turn) =>
+        turn.turnId === readTurnId && turn.status === "completed" && turn.errorCode === null,
+    ) ||
+    !snapshot.items?.some(
+      (item) =>
+        item.turnId === readTurnId &&
+        item.kind === "final_answer" &&
+        item.owningTurnStatus === "completed" &&
+        item.textNonEmpty === true,
+    ) ||
+    readItems.length !== 4 ||
+    readItems
+      .slice(0, 3)
+      .some(
+        (item) => item.presentationStatus !== "error" || item.presentationOutputNonEmpty !== true,
+      ) ||
+    readItems[3]?.presentationStatus !== "success" ||
+    readItems[3]?.presentationOutputNonEmpty !== true
+  ) {
+    throw new Error(`Read 自纠正权威快照不完整：${JSON.stringify(snapshot)}`);
+  }
+
+  stage("ordinary_dsml_text");
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  await composer.fill(scenarios.dsmlProtocolFailure.prompt);
+  await beginRealtimeDraftObservation(page);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(
+    fixture,
+    scenarios.dsmlProtocolFailure.id,
+    "turn",
+    1,
+    failureDeadline,
+    signal,
+  );
+  await waitForAutomaticTitleTurnFinal(
+    page,
+    threadId,
+    scenarios.dsmlProtocolFailure.reply,
+    failureDeadline,
+    signal,
+  );
+  const dsmlEvents = (await captureRawTauriEvents(page)).filter(
+    (event) => event.threadId === threadId,
+  );
+  const dsmlTerminal = dsmlEvents.findLast(
+    (event) => event.method === "turn/terminal" && event.terminalState === "completed",
+  );
+  const dsmlTurnId = dsmlTerminal?.turnId;
+  const dsmlAttempts = fixture.attempts.filter(
+    (attempt) => attempt.scenarioId === scenarios.dsmlProtocolFailure.id && attempt.kind === "turn",
+  );
+  const dsmlDeltas = dsmlEvents.filter(
+    (event) => event.turnId === dsmlTurnId && event.method === "assistant/text-delta",
+  );
+  const dsmlSnapshot = await captureAuthoritativeThreadSnapshot(page, threadId);
+  const durableDsmlReply = dsmlSnapshot.items?.some(
+    (item) =>
+      item.turnId === dsmlTurnId &&
+      item.kind === "final_answer" &&
+      item.owningTurnStatus === "completed" &&
+      item.textNonEmpty === true,
+  );
+  if (
+    typeof dsmlTurnId !== "string" ||
+    dsmlAttempts.length !== 1 ||
+    dsmlAttempts[0]?.toolCatalogPresent !== true ||
+    dsmlAttempts[0]?.finalizationRequest === true ||
+    dsmlDeltas.length < 1 ||
+    dsmlTerminal?.finalMessageNonEmpty !== true ||
+    durableDsmlReply !== true ||
+    (await page.locator("body").innerText()).includes(scenarios.dsmlProtocolFailure.reply) !==
+      true ||
+    dsmlPersistenceRowCount(directories, dsmlTurnId) < 1 ||
+    turnExecutionRowCount(directories, dsmlTurnId) !== 0
+  ) {
+    throw new Error(
+      `DSML-like 普通分片正文完成与持久化证据不完整：${JSON.stringify({
+        turnIdValid: typeof dsmlTurnId === "string",
+        providerAttempts: dsmlAttempts.length,
+        catalogPresent: dsmlAttempts[0]?.toolCatalogPresent,
+        finalizationRequest: dsmlAttempts[0]?.finalizationRequest,
+        textDeltaCount: dsmlDeltas.length,
+        terminalState: dsmlTerminal?.terminalState,
+        durableReply: durableDsmlReply === true,
+        persistenceRowCount:
+          typeof dsmlTurnId === "string"
+            ? dsmlPersistenceRowCount(directories, dsmlTurnId)
+            : undefined,
+        executionRows:
+          typeof dsmlTurnId === "string"
+            ? turnExecutionRowCount(directories, dsmlTurnId)
+            : undefined,
+      })}`,
+    );
+  }
+  if (
+    dsmlSnapshot.status !== "resolved" ||
+    dsmlSnapshot.validationReason !== null ||
+    !dsmlSnapshot.turns?.some(
+      (turn) =>
+        turn.turnId === dsmlTurnId && turn.status === "completed" && turn.errorCode === null,
+    )
+  ) {
+    throw new Error(`DSML-like 普通正文权威完成快照不完整：${JSON.stringify(dsmlSnapshot)}`);
+  }
+  if ((await page.getByRole("article", { name: "失败说明" }).count()) !== 0) {
+    throw new Error("可纠正 Tool 错误或普通 DSML-like 正文被错误升级为 Turn 失败");
+  }
+  await captureVisualEvidence(page, `tool-recovery-${visualTheme}-native.png`);
+
+  stage("history_reload_recovery");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, failureDeadline, signal);
+  await selectThreadById(page, threadId, failureDeadline, signal);
+  for (const expectedReply of [
+    scenarios.shellFailureRecovery.reply,
+    scenarios.readStallFailure.reply,
+    scenarios.dsmlProtocolFailure.reply,
+  ]) {
+    await page
+      .locator(".ja-chat-message-final")
+      .filter({ hasText: expectedReply })
+      .waitFor({ state: "visible", timeout: timeout() });
+  }
+  const reloadedSnapshot = await captureAuthoritativeThreadSnapshot(page, threadId);
+  const completedTurnIds = new Set([shellTurnId, readTurnId, dsmlTurnId]);
+  const restoredFinalTurnIds = new Set(
+    reloadedSnapshot.items
+      ?.filter(
+        (item) =>
+          completedTurnIds.has(item.turnId) &&
+          item.kind === "final_answer" &&
+          item.owningTurnStatus === "completed" &&
+          item.textNonEmpty === true,
+      )
+      .map((item) => item.turnId),
+  );
+  if (
+    reloadedSnapshot.status !== "resolved" ||
+    reloadedSnapshot.validationReason !== null ||
+    restoredFinalTurnIds.size !== completedTurnIds.size ||
+    dsmlPersistenceRowCount(directories, dsmlTurnId) < 1 ||
+    (await page.getByRole("article", { name: "失败说明" }).count()) !== 0
+  ) {
+    throw new Error(
+      `WebView2 重载后 Tool 自纠正历史未完整恢复：${JSON.stringify(reloadedSnapshot)}`,
+    );
+  }
+
+  stage("complete");
+  return {
+    status: "passed",
+    threadId,
+    appearance,
+    shell: {
+      turnId: shellTurnId,
+      providerAttempts: shellAttempts.length,
+      failedResults: 1,
+      executions: shellStarted.length,
+      errorCode: shellCommitted[0]?.resultErrorCodes?.[0],
+      recoveredOutcome: shellCommitted[1]?.resultOutcomes?.[0],
+      outputsNonEmpty: shellCommitted.every((event) => event.resultOutputNonEmpty?.[0] === true),
+      toolCatalogPreserved: shellAttempts.every((attempt) => attempt.toolCatalogPresent === true),
+      finalReplyVisible: true,
+    },
+    read: {
+      turnId: readTurnId,
+      providerAttempts: readAttempts.length,
+      executions: readStarted.length,
+      failedResults: readCommitted.slice(0, 3).length,
+      successfulResults: readCommitted.slice(3).length,
+      errorCodes: readCommitted.slice(0, 3).flatMap((event) => event.resultErrorCodes),
+      outputsNonEmpty: readCommitted.every((event) => event.resultOutputNonEmpty?.[0] === true),
+      recoveredOutcome: readCommitted[3]?.resultOutcomes?.[0],
+      toolCatalogPreserved: readAttempts.every((attempt) => attempt.toolCatalogPresent === true),
+      finalReplyVisible: true,
+      durableSnapshot: true,
+    },
+    historyReadRecovered: true,
+    webViewReloadRecovered: true,
+    dsml: {
+      turnId: dsmlTurnId,
+      providerAttempts: dsmlAttempts.length,
+      textDeltaCount: dsmlDeltas.length,
+      terminalState: dsmlTerminal?.terminalState,
+      toolExecutions: dsmlEvents.filter(
+        (event) => event.turnId === dsmlTurnId && event.method === "tool/started",
+      ).length,
+      persistenceRowCount: dsmlPersistenceRowCount(directories, dsmlTurnId),
+      webViewReloadRecovered: true,
+    },
+    providerAttempts: fixture.snapshot(),
+  };
+}
+
+async function runInputQueueAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  fixture,
+  previewFixture,
+  nativeScope,
+  signal,
+  recordStage,
+  recordSnapshotEvidence,
+) {
+  const scenario = fixture.scenarios.inputQueue;
+  const stage = (name) => recordStage?.(`input_queue:${name}`);
+  const queueDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  const timeout = () => Math.max(1, queueDeadline - Date.now());
+  const composer = page.getByLabel("发送消息");
+  const textbox = page.getByRole("textbox", { name: "消息" });
+  const queue = composer.getByRole("list", { name: "排队消息" });
+  const row = (text) => queue.locator(".ja-composer-queue__item").filter({ hasText: text });
+
+  /** 每次提交都等权威 ACK 行进入 ready，证明草稿清空后仍可立即录入下一条。 */
+  const enqueue = async (text) => {
+    await textbox.fill(text);
+    await page.getByRole("button", { name: "排队发送", exact: true }).click();
+    await row(text).waitFor({ state: "visible", timeout: timeout() });
+    await page.waitForFunction(
+      (expected) => {
+        const item = [...globalThis.document.querySelectorAll(".ja-composer-queue__item")].find(
+          (candidate) => candidate.textContent?.includes(expected),
+        );
+        const draft = globalThis.document.querySelector('[aria-label="消息"]');
+        return item?.getAttribute("data-state") === "ready" && draft?.value === "";
+      },
+      text,
+      { timeout: timeout() },
+    );
+    await page.getByRole("button", { name: "停止生成", exact: true }).waitFor({
+      state: "visible",
+      timeout: timeout(),
+    });
+  };
+
+  stage("runtime_ready");
+  await waitForRuntimeReady(page, queueDeadline, signal);
+  stage("appearance_preferences");
+  const appearance = await applyVisualPreferences(page, queueDeadline, {
+    captureSettingsEvidence: false,
+  });
+  // 当前产品会复用项目下已选中的空 Thread；队列验收直接使用该权威 identity，避免把“必须新增”
+  // 的旧导航假设耦合到 Composer 场景。
+  const threadId = await currentThreadId(page, queueDeadline, signal);
+  await textbox.fill(scenario.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "turn", 1, queueDeadline, signal);
+  await page.getByRole("button", { name: "停止生成", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+
+  stage("enqueue");
+  await enqueue(scenario.deletable);
+  await enqueue(scenario.editable);
+  await enqueue(scenario.steering);
+  await enqueue(scenario.followUp);
+
+  stage("edit");
+  await row(scenario.editable)
+    .getByRole("button", { name: /更多操作/u })
+    .click();
+  await page.getByRole("menuitem", { name: "编辑消息", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: /编辑第 .*条消息/u });
+  await editor.fill(scenario.edited);
+  await editor.press("Enter");
+  await row(scenario.edited).waitFor({ state: "visible", timeout: timeout() });
+
+  stage("delete");
+  await row(scenario.deletable)
+    .getByRole("button", { name: /删除第 .*条消息/u })
+    .click();
+  await row(scenario.deletable).waitFor({ state: "detached", timeout: timeout() });
+
+  stage("prioritize");
+  await row(scenario.steering)
+    .getByRole("button", { name: /调整方向：/u })
+    .click();
+  await page.waitForFunction(
+    (expected) => {
+      const items = [...globalThis.document.querySelectorAll(".ja-composer-queue__item")];
+      return (
+        items[0]?.textContent?.includes(expected) === true &&
+        items[0]?.getAttribute("data-kind") === "steering" &&
+        items[0]?.querySelector('button[aria-label^="已调整方向"]')?.hasAttribute("disabled") ===
+          true
+      );
+    },
+    scenario.steering,
+    { timeout: timeout() },
+  );
+
+  stage("attachment_only_enqueue");
+  const ownedWindow = await resolveOwnedJaWindow(nativeScope, signal);
+  const webPreview = await prepareAttachmentWebPreview(page, previewFixture, queueDeadline, signal);
+  await importAttachmentWithPicker(
+    page,
+    ownedWindow,
+    directories,
+    attachmentFixtureFile,
+    queueDeadline,
+    signal,
+  );
+  await page.getByRole("button", { name: "排队发送", exact: true }).click();
+  const validAttachmentRow = row(attachmentFixtureFile);
+  await validAttachmentRow.waitFor({ state: "visible", timeout: timeout() });
+  await page.waitForFunction(
+    (expected) => {
+      const item = [...globalThis.document.querySelectorAll(".ja-composer-queue__item")].find(
+        (candidate) => candidate.textContent?.includes(expected),
+      );
+      return item?.getAttribute("data-state") === "ready";
+    },
+    attachmentFixtureFile,
+    { timeout: timeout() },
+  );
+  await page.getByRole("list", { name: "待发送附件" }).waitFor({
+    state: "detached",
+    timeout: timeout(),
+  });
+  const queuedPreviewBeforeReload = await exerciseTextAttachmentPreview(
+    page,
+    validAttachmentRow.getByRole("button", {
+      name: `预览附件 ${attachmentFixtureFile}`,
+      exact: true,
+    }),
+    attachmentFixtureFile,
+    webPreview.url,
+    queueDeadline,
+    signal,
+  );
+
+  stage("unavailable_attachment_enqueue");
+  await importAttachmentWithPicker(
+    page,
+    ownedWindow,
+    directories,
+    unavailableAttachmentFixtureFile,
+    queueDeadline,
+    signal,
+  );
+  await textbox.fill(scenario.unavailablePrompt);
+  await page.getByRole("button", { name: "排队发送", exact: true }).click();
+  const unavailableRow = row(scenario.unavailablePrompt);
+  await unavailableRow.waitFor({ state: "visible", timeout: timeout() });
+  await page.waitForFunction(
+    (expected) => {
+      const item = [...globalThis.document.querySelectorAll(".ja-composer-queue__item")].find(
+        (candidate) => candidate.textContent?.includes(expected),
+      );
+      return item?.getAttribute("data-state") === "ready";
+    },
+    scenario.unavailablePrompt,
+    { timeout: timeout() },
+  );
+  await unavailableRow.getByText(unavailableAttachmentFixtureFile, { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  const validAttachment = queuedAttachmentFact(directories, threadId, attachmentFixtureFile);
+  const unavailableAttachment = queuedAttachmentFact(
+    directories,
+    threadId,
+    unavailableAttachmentFixtureFile,
+  );
+
+  const beforeReload = await page.locator(".ja-composer-queue__item").allTextContents();
+  if (beforeReload.length !== 5) throw new Error("队列编辑删除并加入附件后条目数量不是五");
+  const visualAppearance = await page.evaluate(() => {
+    const root = globalThis.document.documentElement;
+    const styles = globalThis.getComputedStyle(root);
+    return {
+      theme: root.getAttribute("data-theme"),
+      themeMode: root.getAttribute("data-theme-mode"),
+      palette: root.getAttribute("data-palette"),
+      background: styles.getPropertyValue("--ja-background").trim(),
+    };
+  });
+  if (
+    visualAppearance.theme !== visualTheme ||
+    visualAppearance.themeMode !== visualTheme ||
+    visualAppearance.palette !== "xcode"
+  ) {
+    throw new Error(`队列截图前主题未保持：${JSON.stringify(visualAppearance)}`);
+  }
+  await captureVisualEvidence(page, `input-queue-${visualTheme}-native.png`);
+  const narrowVisual = await captureRendererVisualEvidenceAtViewport(
+    page,
+    `input-queue-${visualTheme}-narrow.png`,
+    { width: 720, height: 820 },
+  );
+
+  stage("reload_restore");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, queueDeadline, signal);
+  // WebView reload 会销毁页面级诊断 callback；重新安装只读探针，后续消费/终态失败必须保留
+  // 完整 JA-RPC revision 证据，不能把 reload 前的空数组误当成服务端未发事件。
+  await installRawTauriEventProbe(page);
+  await installTauriInvokeProbe(page);
+  await selectThreadById(page, threadId, queueDeadline, signal);
+  for (const text of [
+    scenario.steering,
+    scenario.edited,
+    scenario.followUp,
+    attachmentFixtureFile,
+    scenario.unavailablePrompt,
+  ]) {
+    await row(text).waitFor({ state: "visible", timeout: timeout() });
+  }
+  const restored = await page.locator(".ja-composer-queue__item").allTextContents();
+  if (restored.length !== 5 || !restored[0]?.includes(scenario.steering)) {
+    throw new Error("WebView2 重载后未恢复权威队列顺序");
+  }
+  const queuedPreviewAfterReload = await exerciseTextAttachmentPreview(
+    page,
+    row(attachmentFixtureFile).getByRole("button", {
+      name: `预览附件 ${attachmentFixtureFile}`,
+      exact: true,
+    }),
+    attachmentFixtureFile,
+    webPreview.url,
+    queueDeadline,
+    signal,
+  );
+
+  stage("invalidate_managed_blob");
+  const unavailableBlob = await removeIsolatedAttachmentBlob(
+    directories,
+    unavailableAttachment.blob_sha256,
+  );
+
+  stage("release_tool_round");
+  fixture.release(scenario.id, "turn");
+  const approvalHeading = page.getByRole("heading", {
+    name: "工具调用需要确认",
+    exact: true,
+  });
+  await approvalHeading.waitFor({ state: "visible", timeout: timeout() });
+  const approvalCard = approvalHeading.locator("xpath=ancestor::section[1]");
+  await approvalCard.getByText("read", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await clickVerifiedControl(
+    page,
+    approvalCard.getByRole("button", { name: "批准", exact: true }),
+    queueDeadline,
+  );
+  await approvalCard.getByText("已批准", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "turn", 5, queueDeadline, signal);
+  await page.getByRole("button", { name: "继续运行", exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(),
+  });
+  const suspendedRow = row(scenario.unavailablePrompt);
+  await page.waitForFunction(
+    (expected) => {
+      const item = [...globalThis.document.querySelectorAll(".ja-composer-queue__item")].find(
+        (candidate) => candidate.textContent?.includes(expected),
+      );
+      return item?.getAttribute("data-state") === "error";
+    },
+    scenario.unavailablePrompt,
+    { timeout: timeout() },
+  );
+  if (
+    (await textbox.isEnabled()) !== true ||
+    (await page.getByRole("button", { name: "添加附件", exact: true }).isEnabled()) !== true ||
+    (await page.getByRole("button", { name: "排队发送", exact: true }).count()) !== 0
+  ) {
+    throw new Error("SUSPENDED 未保持可编辑草稿或错误暴露了提交入口");
+  }
+  await suspendedRow
+    .getByRole("button", {
+      name: new RegExp(`移除附件 ${unavailableAttachmentFixtureFile}$`, "u"),
+    })
+    .click();
+  await page.waitForFunction(
+    ({ expected, removed }) => {
+      const item = [...globalThis.document.querySelectorAll(".ja-composer-queue__item")].find(
+        (candidate) => candidate.textContent?.includes(expected),
+      );
+      return (
+        item?.getAttribute("data-state") === "ready" &&
+        item.textContent?.includes(removed) === false
+      );
+    },
+    { expected: scenario.unavailablePrompt, removed: unavailableAttachmentFixtureFile },
+    { timeout: timeout() },
+  );
+  await page.getByRole("button", { name: "继续运行", exact: true }).click();
+  await waitForTitleFixtureAttempts(fixture, scenario.id, "turn", 6, queueDeadline, signal);
+  await waitForConversationTerminal(page, threadId, "completed", queueDeadline, signal);
+  recordSnapshotEvidence?.(await captureAuthoritativeThreadSnapshot(page, threadId));
+  // 自动标题与终态元数据会重排最近会话；按权威 identity 重新选中，避免在已离开的
+  // Conversation surface 上等待回复，把导航投影变化误报为队列消费失败。
+  await selectThreadById(page, threadId, queueDeadline, signal);
+  for (const reply of [
+    scenario.steeringReply,
+    scenario.editedReply,
+    scenario.followUpReply,
+    scenario.attachmentReply,
+    scenario.unavailableReply,
+  ]) {
+    await page.locator(".ja-chat-message-final").filter({ hasText: reply }).waitFor({
+      state: "visible",
+      timeout: timeout(),
+    });
+  }
+  await queue.waitFor({ state: "detached", timeout: timeout() });
+  await waitForComposerAdmission(page, queueDeadline);
+
+  const validOwnership = await readSqliteFact(
+    "有效附件归属读取",
+    () => attachmentOwnershipFact(directories, validAttachment.attachment_id),
+    queueDeadline,
+    signal,
+  );
+  const unavailableOwnership = await readSqliteFact(
+    "失效附件归属读取",
+    () => attachmentOwnershipFact(directories, unavailableAttachment.attachment_id),
+    queueDeadline,
+    signal,
+  );
+  if (
+    validOwnership?.status !== "BOUND" ||
+    typeof validOwnership.message_id !== "string" ||
+    validOwnership.input_id !== null ||
+    validOwnership.role !== "USER"
+  ) {
+    throw new Error(`附件未绑定具体 USER Message：${JSON.stringify(validOwnership)}`);
+  }
+  if (
+    unavailableOwnership?.status !== "DISCARDED" ||
+    unavailableOwnership.input_id !== null ||
+    unavailableOwnership.message_id !== null
+  ) {
+    throw new Error(`移除的问题附件仍被预留或绑定：${JSON.stringify(unavailableOwnership)}`);
+  }
+  const timelinePreview = await exerciseTextAttachmentPreview(
+    page,
+    page.getByRole("button", { name: `预览附件 ${attachmentFixtureFile}`, exact: true }),
+    attachmentFixtureFile,
+    webPreview.url,
+    queueDeadline,
+    signal,
+  );
+
+  const turnAttempts = fixture.attempts.filter(
+    (attempt) => attempt.scenarioId === scenario.id && attempt.kind === "turn",
+  );
+  const rawConsumedOrder = turnAttempts.slice(1).map((attempt) => attempt.consumedInput);
+  const attachmentAttempt = turnAttempts[4];
+  if (
+    attachmentAttempt?.managedAttachmentCount !== 1 ||
+    (turnAttempts[3]?.managedAttachmentCount ?? 0) !== 0 ||
+    attachmentAttempt?.nativeAttachmentCount !== 0
+  ) {
+    throw new Error(
+      `附件-only Provider 请求未携带唯一受管引用：${JSON.stringify(
+        turnAttempts.map((attempt) => ({
+          managed: attempt.managedAttachmentCount,
+          native: attempt.nativeAttachmentCount,
+        })),
+      )}`,
+    );
+  }
+  const consumedOrder = rawConsumedOrder.map((value, index) =>
+    index === 3 ? attachmentFixtureFile : value,
+  );
+  const expectedOrder = [
+    scenario.steering,
+    scenario.edited,
+    scenario.followUp,
+    attachmentFixtureFile,
+    scenario.unavailablePrompt,
+  ];
+  if (JSON.stringify(consumedOrder) !== JSON.stringify(expectedOrder)) {
+    throw new Error(`Provider 消费顺序错误: ${JSON.stringify(consumedOrder)}`);
+  }
+  if (turnAttempts[1]?.toolOutputSeen !== true) {
+    throw new Error("Steering Provider 请求未观察到首轮 Tool output");
+  }
+  const timelineText = await page.locator(".ja-chat-timeline").innerText();
+  const timelineReplies = [
+    scenario.steeringReply,
+    scenario.editedReply,
+    scenario.followUpReply,
+    scenario.attachmentReply,
+    scenario.unavailableReply,
+  ];
+  const replyOffsets = timelineReplies.map((reply) => timelineText.indexOf(reply));
+  if (
+    replyOffsets.some((offset) => offset < 0) ||
+    !replyOffsets.every((offset, index) => index === 0 || replyOffsets[index - 1] < offset)
+  ) {
+    throw new Error("Timeline 中逐条回复顺序错误");
+  }
+  stage("complete");
+  return {
+    threadId,
+    queuedBeforeReload: beforeReload.length,
+    queuedAfterReload: restored.length,
+    consumedOrder,
+    toolOutputBeforeSteering: true,
+    toolApprovalCompleted: true,
+    timelineReplyOrder: "steering_then_fifo",
+    attachmentOnly: {
+      queuedPreviewBeforeReload,
+      queuedPreviewAfterReload,
+      timelinePreview,
+      boundToUserMessage: true,
+    },
+    attachmentUnavailable: {
+      ...unavailableBlob,
+      suspended: true,
+      repairedByRemovingAttachment: true,
+      resumedExplicitly: true,
+    },
+    appearance,
+    visualAppearance,
+    narrowVisual,
+    providerAttempts: fixture.snapshot(),
   };
 }
 
@@ -12102,7 +23641,14 @@ async function runAutomaticTitleAcceptanceSession(
  * 第二个真实 Tauri 生命周期只从持久 SQLite/UI 恢复标题；同时确认重启没有重放成功、失败或
  * 迟到标题请求，并再次从搜索 Dialog 读取自动标题。
  */
-async function runAutomaticTitleRestartSession(page, expectation, fixture, deadline, signal) {
+async function runAutomaticTitleRestartSession(
+  page,
+  expectation,
+  fixture,
+  deadline,
+  directories,
+  signal,
+) {
   await page.waitForFunction(
     () =>
       globalThis.document.readyState === "interactive" ||
@@ -12156,10 +23702,146 @@ async function runAutomaticTitleRestartSession(page, expectation, fixture, deadl
   if (JSON.stringify(afterRestart) !== JSON.stringify(expectation.providerAttempts)) {
     throw new Error("重启重放了自动标题 Provider 请求");
   }
+
+  const recovery = expectation.operationRecovery;
+  if (recovery === undefined) throw new Error("重启验收缺少 Operation 恢复身份");
+  await selectThreadById(page, recovery.threadId, deadline, signal);
+  await assertVisibleConversationTitle(
+    page,
+    recovery.threadId,
+    recovery.provisionalTitle,
+    deadline,
+    signal,
+  );
+  await page
+    .getByLabel("最终答复")
+    .getByText("运行被中断", { exact: true })
+    .waitFor({
+      state: "visible",
+      timeout: Math.max(1, deadline - Date.now()),
+    });
+  await page
+    .getByLabel("发送消息")
+    .getByText("运行被中断", { exact: true })
+    .waitFor({
+      state: "visible",
+      timeout: Math.max(1, deadline - Date.now()),
+    });
+  await page.getByRole("status", { name: "上下文使用量未知", exact: true }).waitFor({
+    state: "visible",
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  if ((await page.getByRole("progressbar", { name: "上下文使用量" }).count()) !== 0) {
+    throw new Error("UNKNOWN Usage 被投影成了确定 Token 或百分比");
+  }
+  await assertNoAdditionalTitleAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "turn",
+    1,
+    600,
+    signal,
+  );
+
+  const resumeStarts = await tauriInvokePhaseCount(page, "ja_turn_resume", "start");
+  const resumeResolved = await tauriInvokePhaseCount(page, "ja_turn_resume", "resolved");
+  await clickVerifiedControl(
+    page,
+    page.getByRole("button", { name: "继续运行", exact: true }),
+    deadline,
+  );
+  await waitForCondition(
+    "turn/resume Tauri invoke resolved",
+    async () =>
+      (await tauriInvokePhaseCount(page, "ja_turn_resume", "start")) === resumeStarts + 1 &&
+      (await tauriInvokePhaseCount(page, "ja_turn_resume", "resolved")) === resumeResolved + 1,
+    deadline,
+    signal,
+  );
+  await waitForTitleFixtureAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "turn",
+    2,
+    deadline,
+    signal,
+  );
+  fixture.release(fixture.scenarios.operationRecovery.id, "turn");
+  await waitForAutomaticTitleTurnFinal(
+    page,
+    recovery.threadId,
+    fixture.scenarios.operationRecovery.reply,
+    deadline,
+    signal,
+  );
+  await waitForTitleFixtureAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "title",
+    1,
+    deadline,
+    signal,
+  );
+  await waitForTitleFixtureFinished(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "title",
+    1,
+    deadline,
+    signal,
+  );
+  await assertVisibleConversationTitle(
+    page,
+    recovery.threadId,
+    fixture.scenarios.operationRecovery.automaticTitle,
+    deadline,
+    signal,
+  );
+  await assertNoAdditionalTitleAttempts(
+    fixture,
+    fixture.scenarios.operationRecovery.id,
+    "turn",
+    2,
+    600,
+    signal,
+  );
+  if (
+    (await page.getByText("运行被中断", { exact: true }).count()) !== 0 ||
+    (await page.getByRole("button", { name: "继续运行", exact: true }).count()) !== 0
+  ) {
+    throw new Error("Operation 完成后仍保留可重复 Resume 的入口");
+  }
+  if (turnExecutionRowCount(directories, recovery.turnId) !== 0) {
+    throw new Error("Operation 终态仍遗留 turn_execution 游标");
+  }
+
+  await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForRuntimeReady(page, deadline, signal);
+  await selectThreadById(page, recovery.threadId, deadline, signal);
+  await page
+    .locator(".ja-chat-message-final")
+    .filter({ hasText: fixture.scenarios.operationRecovery.reply })
+    .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForComposerAdmission(page, deadline);
+  if ((await page.getByText("运行被中断", { exact: true }).count()) !== 0) {
+    throw new Error("WebView2 reload 后错误恢复为 suspended");
+  }
+  const completedAttempts = fixture.snapshot();
   return {
     titles: expectation.titles,
-    providerAttempts: afterRestart,
+    providerAttempts: completedAttempts,
     searchRecovered: true,
+    operationRecovery: {
+      threadId: recovery.threadId,
+      turnId: recovery.turnId,
+      forceKilled: recovery.forceKill.forceKilled,
+      providerAttemptsBeforeResume: 1,
+      providerAttemptsAfterResume: 2,
+      unknownUsageVisible: true,
+      resumeInvokeResolved: true,
+      terminalExecutionDeleted: true,
+      webViewReloadRecovered: true,
+    },
   };
 }
 
@@ -12217,25 +23899,32 @@ async function runFirstSession(
   const visual = appearance.responsive;
   stage("general_scope_after_visual");
   await assertGeneralConversationScope(page, deadline);
-  if (providerConfig !== undefined) {
+  if (providerConfig !== undefined && providerConfig.defaultDesktop !== true) {
     stage("redacted_credential");
     await assertRedactedModelCredential(page, deadline);
   }
   stage("isolation");
   recordIsolation(assertRuntimeIsolation(await processSnapshot(signal), directories));
   const marker = `JA_REAL_PROVIDER_${runId}`;
-  const input = providerConfig === undefined ? `E2E turn ${runId}` : `只回复一行：${marker}`;
-  const expectedFinal = providerConfig === undefined ? `Fake response: ${input}` : marker;
+  const localDesktopProvider =
+    providerConfig === undefined || providerConfig.defaultDesktop === true;
+  const input = localDesktopProvider ? `E2E turn ${runId}` : `只回复一行：${marker}`;
+  const expectedFinal = localDesktopProvider ? `Fake response: ${input}` : marker;
   stage("ordinary_admission");
   await waitForComposerAdmission(page, deadline);
   await assertGeneralConversationScope(page, deadline);
   stage("attachment_draft");
+  // 附件矩阵内部共享四分钟绝对期限；picker、Preview、剪贴板与 Explorer 各自仍保留更窄 ACK，
+  // 防止任一 Windows 原生入口借用整轮 smoke 总预算掩盖卡死。
+  const attachmentDraftDeadline = Math.min(deadline, Date.now() + 240_000);
   const attachment = await exerciseAttachmentDraft(
     page,
     nativeScope,
     directories,
-    deadline,
+    previewFixture,
+    attachmentDraftDeadline,
     signal,
+    stage,
   );
   stage("ordinary_send");
   await beginRealtimeDraftObservation(page);
@@ -12256,7 +23945,7 @@ async function runFirstSession(
     .waitFor({ state: "visible", timeout: Math.max(1, turnDeadline - Date.now()) });
   stage("ordinary_final_wait");
   const finalMessage = page.locator(".ja-chat-message-final").filter({ hasText: expectedFinal });
-  if (providerConfig === undefined) {
+  if (localDesktopProvider) {
     await finalMessage.waitFor({
       state: "visible",
       timeout: Math.max(1, turnDeadline - Date.now()),
@@ -12266,14 +23955,26 @@ async function runFirstSession(
   }
   stage("ordinary_completed");
   await waitForTurnRowConvergence(page, input, expectedFinal, turnDeadline, signal);
-  const realtime = await assertRealtimeDeltaBeforeTerminal(page);
+  const realtime = await assertRealtimeDeltaBeforeTerminal(page, turnDeadline, signal);
   const turnRow = page.locator(".ja-chat-timeline__row").filter({ hasText: input });
-  await assertAttachmentHistoryVisible(turnRow, attachment.fileName, turnDeadline);
+  const historyPreviewButton = await assertAttachmentHistoryVisible(
+    turnRow,
+    attachment.fileName,
+    turnDeadline,
+  );
+  attachment.historyPreview = await exerciseTextAttachmentPreview(
+    page,
+    historyPreviewButton,
+    attachment.fileName,
+    attachment.webPreviewUrl,
+    turnDeadline,
+    signal,
+  );
   attachment.status = "bound_and_visible";
   if ((await page.locator(".ja-chat-avatar, .ja-chat-message__avatar").count()) !== 0) {
     throw new Error("对话时间线仍存在头像");
   }
-  if (providerConfig !== undefined) {
+  if (!localDesktopProvider) {
     const process = turnRow.locator(".ja-work-process");
     await process.waitFor({ state: "visible", timeout: Math.max(1, turnDeadline - Date.now()) });
     const steps = process.locator(".ja-work-step");
@@ -12311,7 +24012,7 @@ async function runFirstSession(
     timelineText: redact(timelineText, directories),
     conversationScope: "general",
   };
-  if (providerConfig !== undefined) {
+  if (!localDesktopProvider) {
     stage("project_business_conversation");
     primaryConversation = await runProjectBusinessConversation(
       page,
@@ -12323,7 +24024,7 @@ async function runFirstSession(
   }
   let parallel;
   let approvalMatrix;
-  if (!shellOnlyMode && providerConfig === undefined) {
+  if (!shellOnlyMode && localDesktopProvider) {
     stage("approval_project_reselect");
     const approvalScopeDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
     await selectProjectThreadById(page, workbench.projectThreadId, approvalScopeDeadline, signal);
@@ -12948,11 +24649,24 @@ async function runRestartSession(
     const restoredRow = page
       .locator(".ja-chat-timeline__row")
       .filter({ hasText: expectedAttachment.input });
-    await assertAttachmentHistoryVisible(restoredRow, expectedAttachment.fileName, deadline);
+    const restoredPreviewButton = await assertAttachmentHistoryVisible(
+      restoredRow,
+      expectedAttachment.fileName,
+      deadline,
+    );
+    const historyPreview = await exerciseTextAttachmentPreview(
+      page,
+      restoredPreviewButton,
+      expectedAttachment.fileName,
+      undefined,
+      deadline,
+      signal,
+    );
     attachment = {
       status: "restored",
       fileName: expectedAttachment.fileName,
       threadId: expectedWorkbench.originalThreadId,
+      historyPreview,
     };
     if (conversationScope === "project") {
       await selectProjectThreadById(page, expectedWorkbench.projectThreadId, deadline, signal);
@@ -13052,20 +24766,19 @@ async function cleanupRunRoot(root) {
   await rm(resolvedRoot, { recursive: true, force: true }).catch(() => undefined);
 }
 
-/** 静态锁定 SendInput、固定五键、800/799 与超过九槽的 churn，不启动窗口或进程。 */
+/**
+ * 静态锁定 SendInput、终端文本/原生提交分工、固定五键、800/799 与超过九槽的 churn；
+ * 这些源码门只防止原生验收路径被静默替换，不启动窗口、进程或输入法。
+ */
 function assertNativeInputContract() {
   const script = buildOwnedNativeInputScript();
   if (
     !script.includes("SendInput(uint count, INPUT[] inputs, int size)") ||
     !script.includes("VkKeyScanEx") ||
     !script.includes("GetKeyboardLayout") ||
-    !script.includes("TerminalText(string t)") ||
-    !script.includes("S(new List<INPUT>{W(c,0),W(c,2)})") ||
-    !script.includes("Thread.Sleep(1)") ||
     !script.includes("ResetModifiers()") ||
     !script.includes("ChordClick(IntPtr h,ushort[] m") ||
     !script.includes("Move(IntPtr h,double x,double y") ||
-    !script.includes("$operation.kind -eq 'terminal_text'") ||
     !script.includes("$operation.kind -eq 'reset_modifiers'") ||
     !script.includes("$operation.kind -eq 'click_chord'") ||
     !script.includes("$operation.kind -eq 'move'") ||
@@ -13085,11 +24798,17 @@ function assertNativeInputContract() {
   )
     throw new Error("native shortcut modifier、诊断或 context ACK 门禁漂移");
   if (
-    !String(writeTerminalCommand).includes('kind: "terminal_text"') ||
-    !String(writeTerminalCommand).includes("PTY echo") ||
-    !String(writeTerminalCommand).includes("downstreamEcho")
+    !String(writeTerminalCommand).includes("page.keyboard.insertText(command)") ||
+    !String(writeTerminalCommand).includes('kind: "webview_insert_text"') ||
+    !String(writeTerminalCommand).includes("nativeFocus: true") ||
+    !String(writeTerminalCommand).includes("key: 0x0d") ||
+    !String(writeTerminalCommand).includes('Buffer.byteLength(command, "utf8")') ||
+    !String(writeTerminalCommand).includes('entry.phase === "resolved"') ||
+    !String(writeTerminalCommand).includes("entry.dataLength === expectedTextBytes") ||
+    !String(writeTerminalCommand).includes("downstreamAck") ||
+    !String(writeTerminalCommand).includes("logicalText.includes(expected)")
   )
-    throw new Error("终端物理键输入或 Enter 栅栏契约漂移");
+    throw new Error("终端文本、物理聚焦或提交栅栏契约漂移");
   if (
     !String(enterOwnedComposerMarker).includes("value === marker") ||
     !String(enterOwnedComposerMarker).includes("focusOwnedMainComposer") ||
@@ -13132,7 +24851,12 @@ function assertNativeInputContract() {
     rendererHeight: 2,
   });
   normalizeOwnedNativeInput({ kind: "text", text: "Ja 原生输入" });
-  normalizeOwnedNativeInput({ kind: "terminal_text", text: "x".repeat(nativeTextInputMaxLength) });
+  let rejectedTerminalText = false;
+  try {
+    normalizeOwnedNativeInput({ kind: "terminal_text", text: "x" });
+  } catch {
+    rejectedTerminalText = true;
+  }
   let rejectedControlText = false;
   try {
     normalizeOwnedNativeInput({ kind: "text", text: `Ja${String.fromCharCode(0)}INPUT` });
@@ -13159,6 +24883,7 @@ function assertNativeInputContract() {
     rejectedModifiedClick = true;
   }
   if (
+    !rejectedTerminalText ||
     !rejectedControlText ||
     !rejectedOversizedText ||
     !rejectedModifiedClick ||
@@ -13168,6 +24893,10 @@ function assertNativeInputContract() {
   const responsive = String(captureResponsiveVisualEvidence);
   if (
     !responsive.includes("width: 799") ||
+    !responsive.includes("返回应用") ||
+    !responsive.includes(".ja-settings-return") ||
+    !responsive.includes(".ja-settings-scope") ||
+    !responsive.includes(".ja-settings-start") ||
     responsive.includes("width: 704") ||
     responsive.includes("width: 703")
   )
@@ -13288,58 +25017,57 @@ function assertCdpDiscoveryContract() {
 }
 
 /**
- * 直接检查纯 TOML fixture 的字段闭集，避免注释或死代码中的旧名让字符串源码检查误报。
+ * 直接检查纯 TOML fixture 的字段闭集与全部合法 API，避免注释或死代码中的旧名
+ * 让字符串源码检查误报。
  * 两个可空默认值必须使用可逆 null sentinel，省略任一处都会重新引入 Native round-trip 漂移。
  */
-function assertSettingsV4Contract() {
-  const fixtures = [
-    buildSettingsDocument(undefined),
+function assertSettingsV1Contract() {
+  const apis = ["anthropic_messages", "openai_chat_completions", "openai_responses"];
+  const fixtures = apis.map((api) =>
     buildSettingsDocument({
-      api: "anthropic_messages",
+      name: `Custom ${api}`,
+      api,
       baseUrl: "http://127.0.0.1:9/v1",
-      model: "ja-e2e-anthropic",
+      model: `ja-e2e-${api}`,
     }),
-  ];
+  );
   const required = [
-    "schema_version = 4",
+    "schema_version = 1",
     "[[providers]]",
     "[[providers.models]]",
     'default_provider_id = "provider_e2e"',
     'default_model_id = "model_e2e"',
   ];
-  const forbidden = [
-    "schema_version = 3",
-    "schema_version = 2",
-    "default_profile_id",
-    "[[profiles]]",
-    "openai_chat_completions",
-    "default_reasoning_effort",
-    "reasoning_efforts",
-    "skill_ids",
-    "mcp_ids",
-    "input_modalities",
-  ];
   for (const fixture of fixtures) {
     if (required.some((token) => !fixture.split(/\r?\n/u).includes(token))) {
-      throw new Error("v4 Provider/Model 设置 fixture 缺少必填字段");
-    }
-    if (forbidden.some((token) => fixture.includes(token))) {
-      throw new Error("v4 设置 fixture 重新引入旧 schema、字段或已移除 API");
+      throw new Error("v1 Provider/Model 设置 fixture 缺少必填字段");
     }
     if (
       (fixture.match(/^default_reasoning_level = \{ __ja_null = true \}$/gmu)?.length ?? 0) !== 2
     ) {
-      throw new Error("v4 设置 fixture 的 reasoning null sentinel 不完整");
+      throw new Error("v1 设置 fixture 的 reasoning null sentinel 不完整");
     }
     if ((fixture.match(/^reasoning_level_map = \{\}$/gmu)?.length ?? 0) !== 1) {
-      throw new Error("v4 设置 fixture 的 reasoning level map 不完整");
+      throw new Error("v1 设置 fixture 的 reasoning level map 不完整");
     }
   }
-  if (!fixtures[0].includes('api = "openai_responses"')) {
-    throw new Error("v4 设置 fixture 缺少 OpenAI Responses API");
+  for (const [api, fixture] of apis.map((value, index) => [value, fixtures[index]])) {
+    if (!fixture.includes(`api = "${api}"`)) {
+      throw new Error(`v1 设置 fixture 缺少 ${api} API`);
+    }
   }
-  if (!fixtures[1].includes('api = "anthropic_messages"')) {
-    throw new Error("v4 设置 fixture 缺少 Anthropic Messages API");
+  const accessModeFixtures = ["approval_required", "full_access"].map((defaultAccessMode) => ({
+    defaultAccessMode,
+    fixture: buildSettingsDocument(undefined, { defaultAccessMode }),
+  }));
+  for (const { defaultAccessMode, fixture } of accessModeFixtures) {
+    const declarations = fixture.match(/^default_access_mode = "[^"]+"$/gmu) ?? [];
+    if (
+      declarations.length !== 1 ||
+      declarations[0] !== `default_access_mode = "${defaultAccessMode}"`
+    ) {
+      throw new Error(`v1 设置 fixture 的 ${defaultAccessMode} 访问模式漂移`);
+    }
   }
 }
 
@@ -13360,22 +25088,148 @@ function assertAutomaticTitleFixtureLifecycleContract() {
     !source.includes('response.once("finish", markFinished)') ||
     !source.includes('response.once("close", markDisconnected)') ||
     !source.includes("titleFixtureExchangeFinished(attempt)") ||
-    !source.includes("if (!attempt.finished) attempt.disconnected = true")
+    !source.includes("if (!attempt.finished) {") ||
+    !source.includes("attempt.disconnected = true") ||
+    !source.includes("turnChangeReviewCommittedToolCount") ||
+    !source.includes("serialized.lastIndexOf(marker)") ||
+    !source.includes("right.lastIndex - left.lastIndex") ||
+    !source.includes('serializedInput.includes("function_call_output")') ||
+    !source.includes("toolFinalizationEnvelope") ||
+    !source.includes(
+      'kind === "turn" && scenario.id === scenarios.inputQueue.id && scenarioTurnAttempt === 1',
+    ) ||
+    !source.includes(
+      'const readFailureAttempts = attemptCount(scenarios.readStallFailure.id, "turn")',
+    ) ||
+    !source.includes("readFailureAttempts >= 1")
   ) {
-    throw new Error("自动标题 fixture finish/close 事件接线漂移");
+    throw new Error("自动标题 fixture 多轮路由或 finish/close 事件接线漂移");
   }
 }
 
-/** 锁定桌面生产门禁必须走到的真实 UI/native 命令，防止 helper 再次成为未接线死代码。 */
+/**
+ * 以纯 fixture 锁定 opt-in、数据规模、Review 零 snapshot、逐次 deadline 与 renderer owner
+ * 降级语义；该门禁不创建文件、进程或窗口，可在真窗前快速发现脚本接线漂移。
+ */
+function assertWorkspaceSwitchPerformanceContract() {
+  if (
+    optionalProcessMemoryBytes("1024") !== 1_024 ||
+    optionalProcessMemoryBytes(-1) !== undefined ||
+    optionalProcessMemoryBytes(Number.POSITIVE_INFINITY) !== undefined
+  ) {
+    throw new Error("workspace switch 进程内存字段解析漂移");
+  }
+  if (
+    linearPercentile([1, 3], 0.5) !== 2 ||
+    summarizeWorkspaceSwitchLatencies([{ durationMs: 1 }, { durationMs: 3 }]).p50Ms !== 2
+  ) {
+    throw new Error("workspace switch 时延分位计算漂移");
+  }
+  const memoryFixture = summarizeRendererMemory([
+    {
+      status: "available",
+      label: "before",
+      ownerPid: 101,
+      ownerCreatedAt: "fixture",
+      workingSetBytes: 100,
+      privateMemoryBytes: 80,
+    },
+    {
+      status: "available",
+      label: "after",
+      ownerPid: 101,
+      ownerCreatedAt: "fixture",
+      workingSetBytes: 140,
+      privateMemoryBytes: 90,
+    },
+  ]);
+  if (
+    memoryFixture.status !== "available" ||
+    memoryFixture.peakWorkingSetBytes !== 140 ||
+    summarizeRendererMemory([{ status: "unavailable", reason: "fixture" }]).status !== "unavailable"
+  ) {
+    throw new Error("workspace switch renderer 内存证据降级语义漂移");
+  }
+
+  const fixtureSource = String(initializeWorkspaceFixture);
+  const sessionSource = String(runWorkspaceSwitchPerformanceSession);
+  const rendererSource = String(captureIsolatedRendererMemory);
+  const probeSource = String(installTauriInvokeProbeInPage);
+  const processSource = String(runProcessSnapshot);
+  const cleanupSource = String(cleanupPhase);
+  const primeSource = String(primeWebViewProfile);
+  const mainSource = String(main);
+  if (
+    workspaceSwitchIgnoredFixtureCount < 4_382 ||
+    workspaceSwitchUntrackedFixtureCount < 2_000 ||
+    workspaceSwitchRoundTrips < 3 ||
+    workspaceSwitchDeadlineMs !== 20_000 ||
+    !fixtureSource.includes('join(workspace, ".codex-target")') ||
+    !fixtureSource.includes("--ignored") ||
+    !fixtureSource.includes("workspace-switch-untracked") ||
+    !sessionSource.includes("reviewDelta.snapshot !== 0") ||
+    !sessionSource.includes("filesDelta.tree !== 0") ||
+    !sessionSource.includes("workspaceFilesInvokeCounts") ||
+    !sessionSource.includes("measureWorkspaceScopeSwitch") ||
+    !sessionSource.includes("captureIsolatedRendererMemory") ||
+    !rendererSource.includes("processTree") ||
+    !rendererSource.includes("--type=renderer") ||
+    !rendererSource.includes('status: "unavailable"') ||
+    !probeSource.includes('"ja_review_catalog", "ja_review_snapshot"') ||
+    !probeSource.includes('"ja_workspace_tree"') ||
+    !probeSource.includes('append({ command, phase: "start" })') ||
+    !processSource.includes("WorkingSetSize,PrivatePageCount") ||
+    !cleanupSource.includes('cleanupMode = "tray_exit"') ||
+    !cleanupSource.includes('reason: "workspace_switch_performance_owned_tree_cleanup"') ||
+    !cleanupSource.includes('status: "not_exercised"') ||
+    !primeSource.includes("cleanupMode,") ||
+    !mainSource.includes("workspaceSwitchPerformanceMode") ||
+    !mainSource.includes("runWorkspaceSwitchPerformanceSession") ||
+    !mainSource.includes("inputQueueAcceptanceMode") ||
+    !mainSource.includes("toolLifecycleAcceptanceMode") ||
+    !mainSource.includes("evidence.first.ownedTreeCleanup?.status")
+  ) {
+    throw new Error("workspace switch 性能模式接线漂移");
+  }
+}
+
+/** 锁定桌面生产门禁必须走到的真实 UI/native 命令与 Tool 失败闭环，防止 helper 再次成为未接线死代码。 */
 function assertDesktopInteractionContract() {
   const firstSession = String(runFirstSession);
   const workbench = String(exerciseProjectWorkbench);
   const restart = String(runRestartSession);
   const runtimeReady = String(waitForRuntimeReady);
+  const attachmentDraft = [
+    String(exerciseAttachmentDraft),
+    String(importAttachmentWithPicker),
+  ].join("\n");
+  const clipboardMatrix = String(exerciseWindowsClipboardMatrix);
+  const attachmentPreview = String(exerciseTextAttachmentPreview);
+  const attachmentHistory = String(assertAttachmentHistoryVisible);
+  const explorerDrag = String(dragOwnedExplorerFileToComposer);
+  const tauriProbe = String(installTauriInvokeProbeInPage);
+  const pickerAcceptance = String(waitForAttachmentPickerAcceptance);
+  const pickerSnapshot = String(attachmentPickerAcceptanceSnapshot);
+  const toolFailure = String(runToolFailureAcceptanceSession);
+  const toolFailureProvider = [String(toolFailureStream), String(ordinaryDsmlTextStream)].join(
+    "\n",
+  );
+  const mainSource = String(main);
+  const attachmentProbeCommands = [
+    "ja_attachment_picker_import",
+    "ja_attachment_drop_import",
+    "ja_attachment_clipboard_import",
+    "ja_attachment_discard",
+    "ja_attachment_preview_open",
+    "ja_attachment_preview_read",
+    "ja_attachment_preview_close",
+  ];
   const connectedSurfaces = [
     exerciseNativeShortcutHardReload,
     runAutomaticTitleAcceptanceSession,
     runAutomaticTitleRestartSession,
+    runToolLifecycleAcceptanceSession,
+    runToolFailureAcceptanceSession,
     runFirstSession,
     runRestartSession,
   ].map(String);
@@ -13384,9 +25238,38 @@ function assertDesktopInteractionContract() {
     !firstSession.includes("beginRealtimeDraftObservation") ||
     !firstSession.includes("assertRealtimeDeltaBeforeTerminal") ||
     !firstSession.includes("exerciseAttachmentDraft") ||
+    !firstSession.includes("exerciseTextAttachmentPreview") ||
     !workbench.includes("verifyJoinedInspectorLayout") ||
-    !String(exerciseAttachmentDraft).includes("ja_attachment_import") ||
-    !String(exerciseAttachmentDraft).includes("ja_attachment_discard") ||
+    !attachmentDraft.includes("ja_attachment_picker_import") ||
+    !attachmentDraft.includes("ja_attachment_drop_import") ||
+    !attachmentDraft.includes("ja_attachment_discard") ||
+    !attachmentDraft.includes("dragOwnedExplorerFileToComposer") ||
+    !attachmentDraft.includes("Date.now() + 5_000") ||
+    !attachmentDraft.includes("attachment Explorer drop retry command start") ||
+    !attachmentDraft.includes('status: "command_started"') ||
+    !attachmentDraft.includes("waitForAttachmentPickerAcceptance") ||
+    !attachmentDraft.includes("Date.now() + 10_000") ||
+    !attachmentDraft.includes("clipboardImagePaste") ||
+    !attachmentDraft.includes("syntheticEventUsed: false") ||
+    !clipboardMatrix.includes("startWindowsClipboardFixtureBroker") ||
+    !clipboardMatrix.includes('broker.set("bitmap")') ||
+    !clipboardMatrix.includes('broker.set("file_drop"') ||
+    !clipboardMatrix.includes('broker.set("text"') ||
+    !clipboardMatrix.includes('broker.set("text_image"') ||
+    !clipboardMatrix.includes('broker.set("html"') ||
+    !clipboardMatrix.includes('kind: "chord"') ||
+    !clipboardMatrix.includes("const restore = await broker.restore()") ||
+    !clipboardMatrix.includes("evidence.clipboardRestored = true") ||
+    clipboardMatrix.includes('status: "blocked"') ||
+    attachmentDraft.includes("ja_attachment_import") ||
+    !attachmentPreview.includes("ja_attachment_preview_open") ||
+    !attachmentPreview.includes("ja_attachment_preview_read") ||
+    !attachmentPreview.includes("ja_attachment_preview_close") ||
+    !attachmentHistory.includes('getByRole("button"') ||
+    !attachmentHistory.includes("预览附件 ${fileName}") ||
+    attachmentHistory.includes(".ja-work-process") ||
+    attachmentProbeCommands.some((command) => !tauriProbe.includes(command)) ||
+    !restart.includes("exerciseTextAttachmentPreview") ||
     !String(runApprovalLifecycleMatrix).includes("ja_turn_cancel") ||
     !String(exerciseApprovalRevisionCas).includes("ja_approval_respond") ||
     !String(runApprovalLifecycleMatrix).includes("exerciseApprovalResponderCompetition") ||
@@ -13396,11 +25279,79 @@ function assertDesktopInteractionContract() {
     !firstSession.includes("applyVisualPreferences(page, appearanceDeadline)") ||
     !restart.includes("expectedPendingApproval")
   ) {
-    throw new Error("桌面附件、流式、右栏、取消或审批恢复门禁未接入真实调用链");
+    const requiredFragments = {
+      firstVisual: firstSession.includes("applyVisualPreferences"),
+      firstDraft: firstSession.includes("beginRealtimeDraftObservation"),
+      firstRealtime: firstSession.includes("assertRealtimeDeltaBeforeTerminal"),
+      firstAttachment: firstSession.includes("exerciseAttachmentDraft"),
+      firstPreview: firstSession.includes("exerciseTextAttachmentPreview"),
+      joinedInspector: workbench.includes("verifyJoinedInspectorLayout"),
+      pickerImport: attachmentDraft.includes("ja_attachment_picker_import"),
+      dropImport: attachmentDraft.includes("ja_attachment_drop_import"),
+      discard: attachmentDraft.includes("ja_attachment_discard"),
+      explorer: attachmentDraft.includes("dragOwnedExplorerFileToComposer"),
+      dialogBudget: attachmentDraft.includes("Date.now() + 5_000"),
+      dialogStage: attachmentDraft.includes("attachment Explorer drop retry command start"),
+      commandStarted: attachmentDraft.includes('status: "command_started"'),
+      pickerWait: attachmentDraft.includes("waitForAttachmentPickerAcceptance"),
+      pickerBudget: attachmentDraft.includes("Date.now() + 10_000"),
+      clipboard: attachmentDraft.includes("clipboardImagePaste"),
+      noSynthetic: attachmentDraft.includes("syntheticEventUsed: false"),
+      broker: clipboardMatrix.includes("startWindowsClipboardFixtureBroker"),
+      bitmap: clipboardMatrix.includes('broker.set("bitmap")'),
+      fileDrop: clipboardMatrix.includes('broker.set("file_drop"'),
+      text: clipboardMatrix.includes('broker.set("text"'),
+      textImage: clipboardMatrix.includes('broker.set("text_image"'),
+      html: clipboardMatrix.includes('broker.set("html"'),
+      chord: clipboardMatrix.includes('kind: "chord"'),
+      restore: clipboardMatrix.includes("const restore = await broker.restore()"),
+      restored: clipboardMatrix.includes("evidence.clipboardRestored = true"),
+      noBlocked: !clipboardMatrix.includes('status: "blocked"'),
+      noLegacyImport: !attachmentDraft.includes("ja_attachment_import"),
+      previewOpen: attachmentPreview.includes("ja_attachment_preview_open"),
+      previewRead: attachmentPreview.includes("ja_attachment_preview_read"),
+      previewClose: attachmentPreview.includes("ja_attachment_preview_close"),
+      historyOwnedByUserMessage:
+        attachmentHistory.includes('getByRole("button"') &&
+        attachmentHistory.includes("预览附件 ${fileName}") &&
+        !attachmentHistory.includes(".ja-work-process"),
+      commands: !attachmentProbeCommands.some((command) => !tauriProbe.includes(command)),
+      restartPreview: restart.includes("exerciseTextAttachmentPreview"),
+      cancellation: String(runApprovalLifecycleMatrix).includes("ja_turn_cancel"),
+      revisionCas: String(exerciseApprovalRevisionCas).includes("ja_approval_respond"),
+      competition: String(runApprovalLifecycleMatrix).includes(
+        "exerciseApprovalResponderCompetition",
+      ),
+      appearanceDeadline: firstSession.includes(
+        "const appearanceDeadline = Math.min(deadline, Date.now() + turnDeadlineMs)",
+      ),
+      appearanceCall: firstSession.includes("applyVisualPreferences(page, appearanceDeadline)"),
+      restartApproval: restart.includes("expectedPendingApproval"),
+    };
+    throw new Error(
+      `桌面附件、流式、右栏、取消或审批恢复门禁未接入真实调用链：${Object.entries(requiredFragments)
+        .filter(([, passed]) => !passed)
+        .map(([name]) => name)
+        .join(", ")}`,
+    );
+  }
+  if (
+    !pickerAcceptance.includes("channel_rejected") ||
+    !pickerAcceptance.includes("附件 picker 短期限未收敛") ||
+    !pickerSnapshot.includes("channel_pending_after_dialog_closed") ||
+    !pickerSnapshot.includes("resolved_without_ready_dom") ||
+    !String(captureUiEvidence).includes("attachmentPickerEvidence") ||
+    !mainSource.includes("attachmentPickerAcceptance = attachmentPickerLastEvidence") ||
+    !mainSource.includes("attachmentDropAcceptance = attachmentDropLastEvidence")
+  ) {
+    throw new Error("附件 picker 短期限阶段诊断门禁漂移");
   }
   if (
     !runtimeReady.includes('name: "本地运行时：已连接"') ||
     !runtimeReady.includes("captureRuntimeStartupState") ||
+    !runtimeReady.includes('tauriInvokeTrace(page, "ja_runtime_start")') ||
+    !runtimeReady.includes("startLifecycle") ||
+    !tauriProbe.includes('command === "ja_runtime_start"') ||
     !runtimeReady.includes("terminalFailures") ||
     !runtimeReady.includes("turnDeadlineMs") ||
     connectedSurfaces.some(
@@ -13411,16 +25362,435 @@ function assertDesktopInteractionContract() {
   ) {
     throw new Error("桌面运行时 status 语义或局部启动期限门禁漂移");
   }
+  if (
+    !toolFailure.includes('resultErrorCodes?.[0] !== "TOOL_BINDING_UNAVAILABLE"') ||
+    !toolFailure.includes('resultErrorCodes?.[0] !== "TOOL_ARGUMENTS_INVALID"') ||
+    !toolFailure.includes('resultOutcomes?.[0] !== "succeeded"') ||
+    !toolFailure.includes("attempt.toolCatalogPresent !== true") ||
+    !toolFailure.includes("readStarted.length !== 1") ||
+    !toolFailure.includes("readAttempts.length !== 5") ||
+    !toolFailure.includes("dsmlDeltas.length < 1") ||
+    !toolFailure.includes("dsmlPersistenceRowCount(directories, dsmlTurnId) < 1") ||
+    !toolFailure.includes('stage("history_reload_recovery")') ||
+    !toolFailure.includes("restoredFinalTurnIds.size !== completedTurnIds.size") ||
+    !toolFailure.includes('getByRole("article", { name: "失败说明" }).count()') ||
+    !toolFailureProvider.includes('recoveringUnknownTool ? "unknown_e2e_tool"') ||
+    !toolFailureProvider.includes('offset: "one"') ||
+    !toolFailureProvider.includes("scenarioTurnAttempt <= 3") ||
+    !toolFailureProvider.includes("JA_E2E_UNKNOWN_TOOL_RECOVERED") ||
+    !toolFailureProvider.includes("ordinaryDsmlTextFragments.entries()") ||
+    !toolFailureProvider.includes('titleFixtureEvent("response.output_text.delta"') ||
+    toolFailure.includes("TOOL_STALLED") ||
+    toolFailure.includes("MODEL_PROTOCOL_ERROR") ||
+    !mainSource.includes("runToolFailureAcceptanceSession") ||
+    !mainSource.includes("{ toolFailure: titleAcceptance }")
+  ) {
+    throw new Error("Tool 错误反馈、自纠正、普通正文或 history/reload 门禁漂移");
+  }
   const nativeDialog = String(completeOwnedFileDialog);
   if (
     !nativeDialog.includes("#32770") ||
     !nativeDialog.includes("SendInput") ||
+    !nativeDialog.includes("GetDlgItem") ||
+    !nativeDialog.includes("SendMessage") ||
     !nativeDialog.includes("$foregroundDeadline=[DateTime]::UtcNow.AddSeconds(3)") ||
     !nativeDialog.includes("$foregroundPid=[uint32]0") ||
     !nativeDialog.includes("stderr: redact(stderrTail)") ||
     nativeDialog.includes("clipboard")
   ) {
     throw new Error("原生附件对话框 owner 或无剪贴板输入合同漂移");
+  }
+  if (
+    !explorerDrag.includes("UIAutomationClient") ||
+    !explorerDrag.includes("Shell.Application") ||
+    !explorerDrag.includes("SendInput") ||
+    !explorerDrag.includes("ExposeTarget") ||
+    !explorerDrag.includes("WindowFromPoint") ||
+    !explorerDrag.includes("GetClickablePoint") ||
+    !explorerDrag.includes("sourceOwnedByExplorer") ||
+    !explorerDrag.includes("targetExposed") ||
+    !explorerDrag.includes("targetPid") ||
+    !explorerDrag.includes('getByRole("textbox", { name: "消息", exact: true })') ||
+    !explorerDrag.includes("Composer 原生拖放编辑面") ||
+    !explorerDrag.includes("win32_send_input_drag") ||
+    !attachmentDraft.includes("const dropDeadline = Math.min(deadline, Date.now() + 20_000)") ||
+    explorerDrag.includes("DragEvent")
+  ) {
+    throw new Error("Composer 原生 Explorer 拖放或禁止合成事件合同漂移");
+  }
+}
+
+/**
+ * 静态锁定 Theme Matrix 的真实 UI、语义 token、重组件 identity、无配置写入与 reload 路径，
+ * 防止后续重构只保留环境变量却绕过设置页或降级为单一截图。
+ */
+function assertThemeMatrixContract() {
+  const session = String(runThemeMatrixAcceptanceSession);
+  const frame = String(captureThemeMatrixFrame);
+  const preparation = String(prepareThemeMatrixWorkbench);
+  const mainSource = String(main);
+  const ownedTreeFocusedModeUses =
+    mainSource.match(/themeMatrixAcceptanceMode \|\|/gu)?.length ?? 0;
+  if (
+    themeMatrixPalettes.map(({ value }) => value).join(",") !== "xcode,fleet,obsidian,claude" ||
+    themeMatrixModes.map(({ value }) => value).join(",") !== "light,dark" ||
+    themeMatrixViewports.map(({ width, height }) => `${width}x${height}`).join(",") !==
+      "1440x900,1280x820,980x720,720x640" ||
+    !session.includes('controlName: "配色主题"') ||
+    !session.includes('controlName: "外观模式"') ||
+    !session.includes('name: "降低透明度"') ||
+    !session.includes('tauriInvokeCount(page, "ja_configuration_replace")') ||
+    !session.includes('page.reload({ waitUntil: "domcontentloaded"') ||
+    !frame.includes('"--ja-editor-background"') ||
+    !frame.includes('"--ja-terminal-background"') ||
+    !frame.includes("editorSameNode") ||
+    !frame.includes("xtermSameNode") ||
+    !preparation.includes("data-terminal-session-id") ||
+    !preparation.includes("selectionDigest") ||
+    !mainSource.includes('["theme_matrix", themeMatrixAcceptanceMode]') ||
+    !mainSource.includes("delete process.env.JA_E2E_THEME_MATRIX_ONLY") ||
+    !mainSource.includes("themeMatrixAcceptanceMode") ||
+    !mainSource.includes("Theme Matrix 验收必须使用 fake Provider") ||
+    !mainSource.includes("runThemeMatrixAcceptanceSession") ||
+    !mainSource.includes("themeMatrix.frameCount !== 64") ||
+    !mainSource.includes('cleanupMode: "owned_tree"') ||
+    ownedTreeFocusedModeUses !== 3
+  ) {
+    throw new Error("四主题 Theme Matrix 聚焦模式接线漂移");
+  }
+}
+
+/**
+ * 以纯源码与 fixture 断言 Composer context 聚焦模式已经接入真实两阶段桌面生命周期；
+ * 这里不替代真窗，只防止完整交互 helper 因遗漏 main 分派而再次成为不可执行的死代码。
+ */
+function assertComposerContextContract() {
+  const sessionSource = String(runComposerContextAcceptanceSession);
+  const restartSource = String(runComposerContextRestartSession);
+  const providerSource = String(startAutomaticTitleProviderFixture);
+  const invokeProbeSource = String(installTauriInvokeProbeInPage);
+  const mainSource = String(main);
+  const settingsFixture = buildSettingsDocument(undefined, {
+    includeComposerContextSkill: true,
+  });
+  const checks = {
+    settingsSkillId: settingsFixture.includes(`skill_id = "${composerContextSkill.skillId}"`),
+    settingsSkillName: settingsFixture.includes(`name = "${composerContextSkill.name}"`),
+    imeComposition: sessionSource.includes("Input.imeSetComposition"),
+    workspaceSearch: sessionSource.includes("ja_runtime_workspace_path_search"),
+    queueEnqueueProbe: invokeProbeSource.includes('command === "ja_turn_input_enqueue"'),
+    queueEnqueueTerminalWait:
+      sessionSource.includes('"Composer queue enqueue ACK"') &&
+      sessionSource.includes("queueEnqueueLifecycle"),
+    reloadThreadIdentity:
+      sessionSource.includes(
+        "selectProjectThreadById(page, threadId, queueStepDeadline(), signal)",
+      ) &&
+      restartSource.includes(
+        "selectProjectThreadById(page, expectation.threadId, deadline, signal)",
+      ),
+    expectedNames: sessionSource.includes("expectedNames = ["),
+    restartExpectation: sessionSource.includes("processRestartExpectation"),
+    restartMessageReference: restartSource.includes('name: "消息引用"'),
+    providerProjection: providerSource.includes("composerContextProjection"),
+    providerNoPreload: providerSource.includes("content not preloaded"),
+    mainMode: mainSource.includes('["composer_context", composerContextAcceptanceMode]'),
+    mainEnvironmentCleanup: mainSource.includes("delete process.env.JA_E2E_COMPOSER_CONTEXT_ONLY"),
+    mainSkillFixture: mainSource.includes("writeComposerContextSkill(directories.home)"),
+    mainSettingsFixture: mainSource.includes(
+      "includeComposerContextSkill: composerContextAcceptanceMode",
+    ),
+    mainFirstSession: mainSource.includes("runComposerContextAcceptanceSession"),
+    mainRestartSession: mainSource.includes("runComposerContextRestartSession"),
+    mainEvidenceGate: mainSource.includes("Composer context 真窗证据不完整"),
+  };
+  const failedChecks = Object.entries(checks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  if (failedChecks.length > 0) {
+    throw new Error(`Composer @/$// 聚焦模式接线漂移：${failedChecks.join(", ")}`);
+  }
+}
+
+/**
+ * 静态锁定 Task 真窗模式的 invoke 计数、loopback 路由、真实 UI 交互和 main 接线；
+ * 该门禁只防死代码与外部 Provider 回退，不能替代 Windows WebView2 运行证据。
+ */
+function assertTaskThreadsContract() {
+  const probeSource = String(installTauriInvokeProbeInPage);
+  const scenarioSource = String(automaticTitleScenarios);
+  const sessionSource = String(runTaskThreadsAcceptanceSession);
+  const restartSource = String(runTaskThreadsRestartSession);
+  const workbenchLifecycleSource = String(exerciseOuterWorkbenchLifecycle);
+  const workbenchMenuSource = `${String(openWorkbenchLauncher)}\n${String(clickWorkbenchMenuItem)}`;
+  const mainSource = String(main);
+  const checks = {
+    probeThreadRead: probeSource.includes('"ja_thread_read"'),
+    probeCreate: probeSource.includes('"ja_runtime_task_create"'),
+    probeObserve: probeSource.includes('"ja_runtime_task_observe"'),
+    probeUnobserve: probeSource.includes('"ja_runtime_task_unobserve"'),
+    probeCancel: probeSource.includes('"ja_runtime_task_cancel"'),
+    providerScenario: scenarioSource.includes("taskThreads"),
+    taskDraftMenu:
+      workbenchMenuSource.includes('getByRole("menu", { name: "新建标签页", exact: true })') &&
+      workbenchMenuSource.includes('getByRole("menuitem", { name })') &&
+      workbenchMenuSource.includes("Date.now() + 10_000") &&
+      !workbenchMenuSource.includes("ja-workbench-launcher-action") &&
+      !workbenchMenuSource.includes("新标签页启动器") &&
+      sessionSource.includes(
+        'clickWorkbenchMenuItem(page, launcher, "新建侧边任务", draftDeadline)',
+      ) &&
+      sessionSource.includes("const draftDeadline = Math.min(deadline, Date.now() + 10_000)") &&
+      workbenchLifecycleSource.includes(
+        'clickWorkbenchMenuItem(page, launcher, "新建侧边任务", sideTaskDraftDeadline)',
+      ),
+    draftNoCreate: sessionSource.includes("createAfterDraftOpen !== initialCounts.create"),
+    singleCreate: sessionSource.includes("initialCounts.create + 1"),
+    stableTab: sessionSource.includes("side-task:thr_"),
+    inheritedContext: sessionSource.includes("继承自主任务 revision"),
+    activityCard: sessionSource.includes(".ja-task-activity-card"),
+    overview: sessionSource.includes('name: "子智能体总览"'),
+    closeUnobserve: sessionSource.includes("关闭侧边任务 Tab 释放 task observation"),
+    closeNoCancel: sessionSource.includes("cancelAfterClose !== initialCounts.cancel"),
+    reducerIsolation: sessionSource.includes("conversationResyncRequiredCount"),
+    noStaleChildTurn: sessionSource.includes("conversationChildRunningCount"),
+    completedFollowup: sessionSource.includes("完成后的 Side Task 可以提交 follow-up"),
+    hiddenDetailIo: sessionSource.includes("隐藏 Task 详情触发重型读取"),
+    nativeSpawn: sessionSource.includes("spawn_subagent_tree"),
+    threeLevelTree: sessionSource.includes("Subagent 树没有保持三层父子邻接"),
+    approval: sessionSource.includes('name: "批准"'),
+    attachedCancel: sessionSource.includes("ATTACHED 取消递归传播到两层后代"),
+    independentSideTask: sessionSource.includes("INDEPENDENT Side Task"),
+    structuredMetrics: sessionSource.includes("captureTaskMetricEvidence"),
+    restartActivity: restartSource.includes("activityRestored"),
+    restartUnread: restartSource.includes("unreadRestored"),
+    restartNoMaterialization: restartSource.includes("Task 重启总览物化隐藏详情"),
+    mainMode: mainSource.includes('["task_threads", taskThreadsAcceptanceMode]'),
+    mainEnvironmentCleanup: mainSource.includes("delete process.env.JA_E2E_TASK_THREADS_ONLY"),
+    mainFixture:
+      mainSource.includes("automaticTitleAcceptanceMode ||") &&
+      mainSource.includes("sidebarThreadAcceptanceMode ||") &&
+      mainSource.includes("taskThreadsAcceptanceMode") &&
+      mainSource.includes("startAutomaticTitleProviderFixture(directories.workspace)"),
+    mainSession: mainSource.includes("runTaskThreadsAcceptanceSession"),
+    mainRestartSession: mainSource.includes("runTaskThreadsRestartSession"),
+    mainEvidenceGate: mainSource.includes("Task 线程真窗证据不完整"),
+  };
+  const failedChecks = Object.entries(checks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  if (failedChecks.length > 0) {
+    throw new Error(`Task 线程聚焦模式接线漂移：${failedChecks.join(", ")}`);
+  }
+}
+
+/**
+ * 静态锁定 Plan/Goal 的真实 UI/RPC/Provider/视觉与恢复接线；该探针只证明场景完整存在，
+ * 最终 Gate 仍要求真窗返回 crashRecovery=passed，不能用字符串检查替代运行时证据。
+ */
+function assertPlanGoalContract() {
+  const mainSource = String(main);
+  const sessionSource = String(runIndependentPlanGoalAcceptanceSession);
+  const driverSource = String(createPlanGoalWebView2Driver);
+  const configSource = String(writeE2eTauriConfig);
+  const envSource = String(buildTauriEnv);
+  const nativeValidationSource = String(validateFocusedNativeSidecar);
+  const providerSource = String(startAutomaticTitleProviderFixture);
+  const planGoalToolSequenceSource = String(nextPlanGoalToolName);
+  const conversationCreateSource = String(createConversationThread);
+  const recoverySource = String(runPlanGoalCrashRecoveryAcceptance);
+  const recoveryAttachSource = String(attachPlanForRecovery);
+  const checks = {
+    version:
+      PLAN_GOAL_CONTRACT_VERSION === 1 &&
+      configuredPlanGoalContractVersion >= 0 &&
+      mainSource.includes("JA_E2E_PLAN_GOAL_CONTRACT_VERSION"),
+    report:
+      mainSource.includes("JA_E2E_PLAN_GOAL_REPORT") &&
+      sessionSource.includes("collectPlanGoalAcceptanceReport") &&
+      sessionSource.includes("validatePlanGoalAcceptanceReport") &&
+      sessionSource.includes("writeFile(planGoalReportPath"),
+    independentSession:
+      mainSource.includes("runIndependentPlanGoalAcceptanceSession") &&
+      sessionSource.includes("createPlanGoalWebView2Driver") &&
+      driverSource.includes("commands.planExecute") &&
+      driverSource.includes("commands.attach") &&
+      driverSource.includes("commands.detach"),
+    approvalBeforeExecution:
+      driverSource.includes("approvedRunId") &&
+      driverSource.includes("planApprovalDidNotExecute") &&
+      driverSource.includes("standalonePlanCompleted"),
+    authority:
+      driverSource.includes("stalePlanApproval") &&
+      driverSource.includes("staleGoalRevision") &&
+      driverSource.includes('goal.goal.phase, "working"'),
+    detailIoGate:
+      sessionSource.includes("invokeCount") &&
+      driverSource.includes("hiddenPlanDetailIoDelta") &&
+      driverSource.includes("explicitPlanDetailIoDelta") &&
+      driverSource.includes('getByRole("button", { name: "关闭计划"'),
+    nativeOnly:
+      mainSource.includes("validatePlanGoalConfiguration") &&
+      mainSource.includes("[planGoalSidecar.fileName]") &&
+      sessionSource.includes("nativeSidecar") &&
+      configSource.includes("planGoalSidecarExecutable") &&
+      envSource
+        .replace(/\s+/gu, " ")
+        .includes("planGoalAcceptanceMode || turnChangeReviewAcceptanceMode") &&
+      nativeValidationSource.includes("hashNativeSidecar") &&
+      nativeValidationSource.includes("manifest?.noFallback !== true"),
+    composer:
+      driverSource.includes("exerciseComposer") &&
+      driverSource.includes("composerEvidence") &&
+      driverSource.includes("goalIndicatorOverridesPlan"),
+    visual:
+      driverSource.includes("captureVisualMatrix") &&
+      driverSource.includes("visualEvidence") &&
+      sessionSource.includes("screenshotDirectory"),
+    evaluatorAndSoak:
+      driverSource.includes('"not_met"') &&
+      driverSource.includes('"met"') &&
+      driverSource.includes("soakMinutes * 60_000") &&
+      driverSource.includes("goal_request_evaluation"),
+    crashRecovery:
+      driverSource.includes("runCrashRecovery") &&
+      recoverySource.includes('"ja_runtime_plan_create"') &&
+      recoverySource.includes('"ja_runtime_plan_approve"') &&
+      recoverySource.includes("planResult.value?.plan?.activeRunId !== null") &&
+      recoverySource.includes("attachPlanForRecovery") &&
+      recoveryAttachSource.includes('"ja_runtime_goal_pause"') &&
+      recoveryAttachSource.includes('"ja_runtime_goal_plan_attach"') &&
+      recoveryAttachSource.includes('"ja_runtime_goal_resume"') &&
+      recoveryAttachSource.includes("attached = candidate") &&
+      recoveryAttachSource.includes('candidate.code === "GOAL_INVALID_STATE"') &&
+      recoverySource.includes('candidate.state !== "STARTED"') &&
+      recoverySource.includes('fact.state !== "UNKNOWN"') &&
+      recoverySource.includes('fact.goal_phase !== "NEEDS_ATTENTION"') &&
+      recoverySource.includes("expectedExecutables") &&
+      recoverySource.includes("forceKillIsolatedAppServer") &&
+      conversationCreateSource.includes("idsBefore") &&
+      conversationCreateSource.includes("selectThreadById(page, createdThreadId"),
+    mockProvider:
+      providerSource.includes('new Set(["normal", "standalone", "recovery"])') &&
+      providerSource.includes('context?.kind === "plan"') &&
+      planGoalToolSequenceSource.includes(
+        'context?.kind === "goal" && context?.planRevisionId == null',
+      ) &&
+      providerSource.includes('target: planGoalContext.kind === "plan" ? "plan" : "goal"') &&
+      providerSource.includes("failureSignature: null") &&
+      providerSource.includes("planGoalContext.planRevisionId == null") &&
+      providerSource.includes("确定性 shell Tool 已由 Goal-only Run 成功执行") &&
+      providerSource.includes('trailingPlanGoalTool?.name === "goal_request_evaluation"') &&
+      providerSource.includes("planGoalAggregateRevision") &&
+      mainSource.includes("Plan/Goal 验收必须使用确定性 loopback Provider"),
+  };
+  const failed = Object.entries(checks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  if (failed.length > 0) {
+    throw new Error(`Plan/Goal v1 聚焦模式接线漂移：${failed.join(", ")}`);
+  }
+}
+/**
+ * 静态锁定 frozen-only Review 的 Native 启动、两次 Tool 写入、单文件 read 探针与性能预算；
+ * 该合同不引用运行中 Summary、preview revision 或 session lease，避免其它 focused mode 被旧能力阻塞。
+ */
+function assertTurnChangeReviewContract() {
+  const mainSource = String(main);
+  const sessionSource = String(runTurnChangeReviewAcceptanceSession);
+  const checkpointSource = String(writeTurnChangeReviewPerformanceCheckpoint);
+  const configSource = String(writeE2eTauriConfig);
+  const envSource = String(buildTauriEnv);
+  const providerSource = String(startAutomaticTitleProviderFixture);
+  const invokeProbeSource = String(installTauriInvokeProbeInPage);
+  const countSource = String(turnChangeReviewInvokeCounts);
+  const measurementSource = String(measureFrozenTurnReviewFile);
+  if (
+    !mainSource.includes('["turn_change_review", turnChangeReviewAcceptanceMode]') ||
+    !mainSource.includes("runTurnChangeReviewAcceptanceSession") ||
+    !sessionSource.includes("selectProjectThreadById(page, workspaceIdentity.threadId") ||
+    !sessionSource.includes("writeTurnChangeReviewPerformanceCheckpoint") ||
+    !checkpointSource.includes('status: "partial"') ||
+    !checkpointSource.includes('stageStatus: "passed"') ||
+    !checkpointSource.includes("completeAcceptance: false") ||
+    !mainSource.includes("disabled_native_sidecar_only") ||
+    !mainSource.includes("[turnChangeReviewSidecar.fileName]") ||
+    !configSource.includes("bundle: { resources: focusedNativeResources }") ||
+    !envSource.includes("delete env.JA_DEBUG_JAVA") ||
+    !providerSource.includes("turnChangeReviewCommittedToolCount") ||
+    !providerSource.includes("inspectTurnChangeReviewToolOutputs") ||
+    !providerSource.includes("writeTurnChangeReviewFixtureBody") ||
+    !providerSource.includes("turnChangeReviewSmallPayloadBytes") ||
+    !providerSource.includes("turnChangeReviewLargePayloadBytes") ||
+    !providerSource.includes("releaseTurnChangeReviewStep") ||
+    !invokeProbeSource.includes('command === "ja_turn_change_set_read"') ||
+    !invokeProbeSource.includes("__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__") ||
+    !countSource.includes('tauriInvokeCount(page, "ja_turn_change_set_read")') ||
+    !measurementSource.includes('["plain", "loading"].includes') ||
+    !sessionSource.includes('.ja-review-source-menu[role="menu"]:visible') ||
+    turnChangeReviewPerformanceSamples !== 30 ||
+    turnChangeReviewSelectionP95BudgetMs !== 50 ||
+    turnChangeReviewSmallP95BudgetMs !== 300 ||
+    turnChangeReviewLargeP95BudgetMs !== 800
+  ) {
+    throw new Error("Turn Change Review frozen-only focused mode 接线漂移");
+  }
+}
+
+/**
+ * 静态锁定 Runtime Refresh focused mode 的双协议、安全点、真实控件与 SQLite 证据，
+ * 防止后续重构把真窗 Gate 降级为单元夹具或外部 Provider。
+ */
+function assertRuntimeRefreshContract() {
+  const mainSource = main.toString();
+  const sessionSource = runRuntimeRefreshAcceptanceSession.toString();
+  const providerSource = startRuntimeRefreshProviderFixture.toString();
+  const settingsSource = buildRuntimeRefreshSettingsDocument.toString();
+  if (
+    !mainSource.includes('"runtime_refresh", runtimeRefreshAcceptanceMode') ||
+    !mainSource.includes("delete process.env.JA_E2E_RUNTIME_REFRESH_ONLY") ||
+    !mainSource.includes("runRuntimeRefreshAcceptanceSession") ||
+    !mainSource.includes("startRuntimeRefreshProviderFixture") ||
+    !providerSource.includes('api === "openai_responses"') ||
+    !providerSource.includes('api === "anthropic_messages"') ||
+    !providerSource.includes("privateContinuationSeen") ||
+    !sessionSource.includes("selectRuntimeRefreshPreferences") ||
+    !sessionSource.includes("TOOL_BINDING_UNAVAILABLE") ||
+    !sessionSource.includes("runtimeRefreshPersistenceFacts") ||
+    !sessionSource.includes('certainty).join(",") !== "KNOWN,KNOWN,UNKNOWN"') ||
+    !settingsSource.includes('default_access_mode = "full_access"') ||
+    !settingsSource.includes('api: "anthropic_messages"') ||
+    !settingsSource.includes('mcp_id = "mcp_runtime_refresh"')
+  ) {
+    throw new Error("Runtime Refresh 真窗 focused mode 接线漂移");
+  }
+}
+
+/**
+ * 静态锁定通用 Native stage 的绝对目录、既有 identity validator、resource overlay 与 JVM 绕过；
+ * Task/runtime-refresh 的业务流程无需知道 sidecar 来源，也不能把普通 JAR 运行报告成 Native。
+ */
+function assertGenericNativeSidecarContract() {
+  const readerSource = readFocusedNativeSidecar.toString();
+  const configSource = writeE2eTauriConfig.toString();
+  const envSource = buildTauriEnv.toString();
+  const mainSource = main.toString();
+  if (
+    !readerSource.includes("validateFocusedNativeSidecar") ||
+    !readerSource.includes("sidecar-manifest.json") ||
+    !readerSource.includes("isAbsolute(directory)") ||
+    !readerSource.includes("专用 Native 配置与通用 stage 目录不一致") ||
+    !configSource.includes("configuredNativeSidecarDirectory") ||
+    !configSource.includes("focusedNativeResources") ||
+    !envSource.includes("configuredNativeSidecarDirectory !== undefined") ||
+    !envSource.includes("delete env.JA_DEBUG_JAVA") ||
+    !envSource.includes("delete env.JA_DEBUG_JAR") ||
+    !mainSource.includes("JA_E2E_NATIVE_SIDECAR_DIRECTORY") ||
+    !mainSource.includes('evidence.setup.jar = "native_only"') ||
+    !mainSource.includes("configuredNativeSidecar.identity") ||
+    !mainSource.includes("configuredNativeSidecar.identity.fileName")
+  ) {
+    throw new Error("通用 staged Native sidecar 接线漂移");
   }
 }
 
@@ -13436,9 +25806,17 @@ function assertStaticContracts() {
   assertExitTraceContract();
   assertNativeInputContract();
   assertCdpDiscoveryContract();
-  assertSettingsV4Contract();
+  assertSettingsV1Contract();
   assertAutomaticTitleFixtureLifecycleContract();
+  assertWorkspaceSwitchPerformanceContract();
   assertDesktopInteractionContract();
+  assertThemeMatrixContract();
+  assertComposerContextContract();
+  assertTaskThreadsContract();
+  assertPlanGoalContract();
+  assertTurnChangeReviewContract();
+  assertRuntimeRefreshContract();
+  assertGenericNativeSidecarContract();
   if (!String(clickVerifiedControl).includes("scrollIntoViewIfNeeded"))
     throw new Error("真实控件滚动命中门禁漂移");
   if (
@@ -13449,9 +25827,137 @@ function assertStaticContracts() {
 }
 
 /**
- * 先预热全新隔离 WebView2 profile，再运行两轮真实桌面生命周期并分别保存进程树与
- * CDP 证据；第二轮成功不能掩盖第一轮 Cargo、Java 或 WebView2 泄漏。
+ * 先预热全新隔离 WebView2 profile，再运行真实桌面生命周期并保存进程树与 CDP 证据；
+ * 完整门禁运行两轮；聚焦验收只运行一轮，并按场景选择真实托盘退出或 owner-verified tree 清理。
  */
+/** Native Image 使用流式摘要，避免在共享桌面 runner 中分配整文件副本。 */
+async function hashNativeSidecar(path) {
+  const digest = createHash("sha256");
+  await new Promise((resolveHash, rejectHash) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => digest.update(chunk));
+    stream.once("error", rejectHash);
+    stream.once("end", resolveHash);
+  });
+  return digest.digest("hex");
+}
+
+/**
+ * focused Native 场景统一复核 manifest、真实文件和 production target identity；外层 runner
+ * 的预检不能替代启动进程内的二次校验，否则验证与启动之间的文件替换会逃逸证据链。
+ */
+async function validateFocusedNativeSidecar(label, manifestPath, executablePath) {
+  if (
+    manifestPath === undefined ||
+    !isAbsolute(manifestPath) ||
+    executablePath === undefined ||
+    !isAbsolute(executablePath)
+  ) {
+    throw new Error(`${label} manifest 与 executable 必须使用绝对路径`);
+  }
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const executableStat = await stat(executablePath);
+  const expectedFileName = "ja-app-server-x86_64-pc-windows-msvc.exe";
+  const staged = manifest?.sidecar?.stagedArtifact;
+  if (
+    manifest?.product !== "Ja" ||
+    manifest?.nativeImageOnly !== true ||
+    manifest?.noFallback !== true ||
+    manifest?.stagingMode !== "copy" ||
+    manifest?.sidecar?.relativePath !== `sidecars/${expectedFileName}` ||
+    manifest?.sidecar?.sourceArtifact?.sha256 !== staged?.sha256 ||
+    manifest?.sidecar?.sourceArtifact?.sizeBytes !== staged?.sizeBytes ||
+    !executableStat.isFile() ||
+    staged?.sizeBytes !== executableStat.size ||
+    parse(executablePath).base !== expectedFileName ||
+    (await hashNativeSidecar(executablePath)) !== staged?.sha256
+  ) {
+    throw new Error(`${label} staging manifest 与 Native sidecar identity 不一致`);
+  }
+  return {
+    used: true,
+    identityMatched: true,
+    noFallback: true,
+    fileName: expectedFileName,
+    sizeBytes: executableStat.size,
+    sha256: staged.sha256,
+  };
+}
+
+/**
+ * 将一个绝对 stage 目录收敛为既有 focused validator 的两个固定输入；专用 Plan/Goal 与
+ * Turn Change 配置仍拥有优先级，但与通用目录同时出现时必须指向同一份已暂存产物。
+ */
+async function readFocusedNativeSidecar(label, directory) {
+  if (directory === undefined) return undefined;
+  if (!isAbsolute(directory)) {
+    throw new Error("JA_E2E_NATIVE_SIDECAR_DIRECTORY 必须是绝对 stage 目录");
+  }
+  const stageDirectory = resolve(directory);
+  const manifestPath = join(stageDirectory, "sidecar-manifest.json");
+  const executablePath = join(
+    stageDirectory,
+    "sidecars",
+    "ja-app-server-x86_64-pc-windows-msvc.exe",
+  );
+  const dedicatedPaths = [
+    ["Plan/Goal", planGoalSidecarManifest, planGoalSidecarExecutable],
+    ["Turn Change Review", turnChangeReviewSidecarManifest, turnChangeReviewSidecarExecutable],
+  ];
+  for (const [dedicatedLabel, dedicatedManifest, dedicatedExecutable] of dedicatedPaths) {
+    if (dedicatedManifest === undefined && dedicatedExecutable === undefined) continue;
+    if (
+      dedicatedManifest === undefined ||
+      dedicatedExecutable === undefined ||
+      !isAbsolute(dedicatedManifest) ||
+      !isAbsolute(dedicatedExecutable) ||
+      resolve(dedicatedManifest).toLowerCase() !== manifestPath.toLowerCase() ||
+      resolve(dedicatedExecutable).toLowerCase() !== executablePath.toLowerCase()
+    ) {
+      throw new Error(`${dedicatedLabel} 专用 Native 配置与通用 stage 目录不一致`);
+    }
+  }
+  const identity = await validateFocusedNativeSidecar(label, manifestPath, executablePath);
+  return { identity, manifestPath, executablePath };
+}
+
+/** Plan/Goal focused mode 与最终报告共用同一份进程内 Native identity。 */
+async function validatePlanGoalConfiguration() {
+  if (!planGoalAcceptanceMode) return undefined;
+  return validateFocusedNativeSidecar(
+    "Plan/Goal",
+    planGoalSidecarManifest,
+    planGoalSidecarExecutable,
+  );
+}
+
+/** Turn Change Review 在固定负载预算之外复用统一 Native identity 校验。 */
+async function validateTurnChangeReviewConfiguration() {
+  if (!turnChangeReviewAcceptanceMode) return undefined;
+  const integerBudgets = [
+    [turnChangeReviewSmallPayloadBytes, 65_536, "small payload"],
+    [turnChangeReviewLargePayloadBytes, 1_048_576, "large payload"],
+    [turnChangeReviewLargeLogicalLines, 10_000, "large lines"],
+    [turnChangeReviewPerformanceSamples, 30, "samples"],
+    [turnChangeReviewSelectionP95BudgetMs, 50, "selection p95 budget"],
+    [turnChangeReviewSmallP95BudgetMs, 300, "small p95 budget"],
+    [turnChangeReviewLargeP95BudgetMs, 800, "large p95 budget"],
+  ];
+  for (const [actual, expected, label] of integerBudgets) {
+    if (!Number.isSafeInteger(actual) || actual !== expected) {
+      throw new Error(`Turn Change Review ${label} 必须固定为 ${expected}`);
+    }
+  }
+  if (turnChangeReviewReportPath === undefined || !isAbsolute(turnChangeReviewReportPath)) {
+    throw new Error("Turn Change Review report 必须使用绝对路径");
+  }
+  return validateFocusedNativeSidecar(
+    "Turn Change Review",
+    turnChangeReviewSidecarManifest,
+    turnChangeReviewSidecarExecutable,
+  );
+}
+
 async function main() {
   if (process.platform !== "win32") {
     throw new Error("该 E2E 仅支持 Windows 11");
@@ -13459,13 +25965,94 @@ async function main() {
   if (automaticTitleAcceptanceMode && configuredRealProviderMode) {
     throw new Error("自动标题验收禁止同时启用外部 Provider 模式");
   }
+  if (themeMatrixAcceptanceMode && configuredRealProviderMode) {
+    throw new Error("Theme Matrix 验收必须使用 fake Provider，禁止外部或付费调用");
+  }
+  if (taskThreadsAcceptanceMode && configuredRealProviderMode) {
+    throw new Error("Task 线程验收必须使用 fake Provider，禁止外部或付费调用");
+  }
+  if (planGoalAcceptanceMode && configuredRealProviderMode) {
+    throw new Error("Plan/Goal 验收必须使用确定性 loopback Provider，禁止外部或付费调用");
+  }
+  if (turnChangeReviewAcceptanceMode && configuredRealProviderMode) {
+    throw new Error("Turn Change Review 验收必须使用确定性 loopback Provider，禁止外部或付费调用");
+  }
+  if (runtimeRefreshAcceptanceMode && configuredRealProviderMode) {
+    throw new Error("Runtime Refresh 验收必须使用确定性 loopback Provider，禁止外部或付费调用");
+  }
+  if (
+    configuredNativeSidecarDirectory !== undefined &&
+    !taskThreadsAcceptanceMode &&
+    !runtimeRefreshAcceptanceMode &&
+    !planGoalAcceptanceMode &&
+    !turnChangeReviewAcceptanceMode
+  ) {
+    throw new Error("通用 staged Native sidecar 只允许用于 Task 或 Runtime Refresh focused 验收");
+  }
+  const focusedAcceptanceModes = [
+    ["automatic_title", process.env.JA_E2E_AUTOMATIC_TITLE === "1"],
+    ["operation_recovery", operationRecoveryAcceptanceMode],
+    ["input_queue", inputQueueAcceptanceMode],
+    ["tool_lifecycle", toolLifecycleAcceptanceMode],
+    ["tool_failure", toolFailureAcceptanceMode],
+    ["sidebar_thread", sidebarThreadAcceptanceMode],
+    ["project_new_conversation", projectNewConversationAcceptanceMode],
+    ["workspace_switch_performance", workspaceSwitchPerformanceMode],
+    ["theme_matrix", themeMatrixAcceptanceMode],
+    ["composer_context", composerContextAcceptanceMode],
+    ["task_threads", taskThreadsAcceptanceMode],
+    ["plan_goal", planGoalAcceptanceMode],
+    ["turn_change_review", turnChangeReviewAcceptanceMode],
+    ["runtime_refresh", runtimeRefreshAcceptanceMode],
+  ].filter(([, enabled]) => enabled);
+  if (focusedAcceptanceModes.length > 1) {
+    throw new Error(
+      `聚焦验收模式必须独占运行：${focusedAcceptanceModes.map(([name]) => name).join(", ")}`,
+    );
+  }
+  if (
+    workspaceSwitchPerformanceMode &&
+    (projectNewConversationAcceptanceMode ||
+      automaticTitleAcceptanceMode ||
+      configuredRealProviderMode ||
+      sidebarThreadAcceptanceMode ||
+      toolLifecycleAcceptanceMode)
+  ) {
+    throw new Error("workspace switch 性能模式必须独占运行且只使用 fake Provider");
+  }
   const runId = `run_${Date.now().toString(36)}`;
   assertStaticContracts();
   await ensureJava25Runtime();
+  const configuredNativeSidecar = await readFocusedNativeSidecar(
+    "通用 focused Native",
+    configuredNativeSidecarDirectory,
+  );
+  const planGoalSidecar = await validatePlanGoalConfiguration();
+  const turnChangeReviewSidecar = await validateTurnChangeReviewConfiguration();
   let providerConfig = readRealProviderConfig();
   const runDeadline = createDeadline("E2E 全局期限", runDeadlineMs);
   // readRealProviderConfig 已删除环境中的明文 key；子进程只接收私有设置文档路径。
   delete process.env.JA_E2E_AUTOMATIC_TITLE;
+  delete process.env.JA_E2E_OPERATION_RECOVERY_ONLY;
+  delete process.env.JA_E2E_INPUT_QUEUE_ONLY;
+  delete process.env.JA_E2E_TOOL_LIFECYCLE_ONLY;
+  delete process.env.JA_E2E_TOOL_FAILURE_ONLY;
+  delete process.env.JA_E2E_WORKSPACE_SWITCH_PERF_ONLY;
+  delete process.env.JA_E2E_SIDEBAR_THREAD_ONLY;
+  delete process.env.JA_E2E_THEME_MATRIX_ONLY;
+  delete process.env.JA_E2E_COMPOSER_CONTEXT_ONLY;
+  delete process.env.JA_E2E_TASK_THREADS_ONLY;
+  delete process.env.JA_E2E_PLAN_GOAL_ONLY;
+  delete process.env.JA_E2E_PLAN_GOAL_CONTRACT_VERSION;
+  delete process.env.JA_E2E_PLAN_GOAL_REPORT;
+  delete process.env.JA_E2E_PLAN_GOAL_SOAK_MINUTES;
+  delete process.env.JA_E2E_PLAN_GOAL_SIDECAR_EXECUTABLE;
+  delete process.env.JA_E2E_PLAN_GOAL_SIDECAR_MANIFEST;
+  delete process.env.JA_E2E_TURN_CHANGE_REVIEW_ONLY;
+  delete process.env.JA_E2E_TURN_CHANGE_REVIEW_SIDECAR_EXECUTABLE;
+  delete process.env.JA_E2E_TURN_CHANGE_REVIEW_SIDECAR_MANIFEST;
+  delete process.env.JA_E2E_RUNTIME_REFRESH_ONLY;
+  delete process.env.JA_E2E_NATIVE_SIDECAR_DIRECTORY;
   const baseEnv = { ...process.env };
   let directories = {};
   let cleanupRoot;
@@ -13475,6 +26062,9 @@ async function main() {
   let tauriConfigPath;
   let previewFixture;
   let automaticTitleFixture;
+  let runtimeRefreshFixture;
+  let runtimeRefreshControlPath;
+  let runtimeRefreshReportPath;
   const evidence = {
     runId,
     frontendPort: undefined,
@@ -13487,11 +26077,52 @@ async function main() {
       jar: "pending",
       settings: "pending",
       edgeDriver: configuredEdgeDriverPath === undefined ? "disabled" : "pending",
-      provider: automaticTitleAcceptanceMode
-        ? "automatic_title_loopback"
-        : providerConfig === undefined
-          ? "fake"
-          : "real_loopback",
+      acceptanceMode: workspaceSwitchPerformanceMode
+        ? "workspace_switch_performance"
+        : themeMatrixAcceptanceMode
+          ? "theme_matrix"
+          : planGoalAcceptanceMode
+            ? "plan_goal"
+            : turnChangeReviewAcceptanceMode
+              ? "turn_change_review"
+              : taskThreadsAcceptanceMode
+                ? "task_threads"
+                : composerContextAcceptanceMode
+                  ? "composer_context"
+                  : sidebarThreadAcceptanceMode
+                    ? "sidebar_thread"
+                    : toolLifecycleAcceptanceMode
+                      ? "tool_lifecycle"
+                      : toolFailureAcceptanceMode
+                        ? "tool_failure"
+                        : inputQueueAcceptanceMode
+                          ? "input_queue"
+                          : projectNewConversationAcceptanceMode
+                            ? "project_new_conversation"
+                            : "full",
+      provider: operationRecoveryAcceptanceMode
+        ? "operation_recovery_loopback"
+        : turnChangeReviewAcceptanceMode
+          ? "turn_change_review_loopback"
+          : planGoalAcceptanceMode
+            ? "plan_goal_loopback"
+            : taskThreadsAcceptanceMode
+              ? "task_threads_loopback"
+              : composerContextAcceptanceMode
+                ? "composer_context_loopback"
+                : toolLifecycleAcceptanceMode
+                  ? "tool_lifecycle_loopback"
+                  : toolFailureAcceptanceMode
+                    ? "tool_failure_loopback"
+                    : inputQueueAcceptanceMode
+                      ? "input_queue_loopback"
+                      : sidebarThreadAcceptanceMode
+                        ? "sidebar_thread_loopback"
+                        : automaticTitleAcceptanceMode
+                          ? "automatic_title_loopback"
+                          : providerConfig === undefined
+                            ? "fake"
+                            : "real_loopback",
     },
     visualContract: {
       requested: visualEvidenceDirectory !== undefined,
@@ -13529,6 +26160,8 @@ async function main() {
   let firstAttachment;
   let firstPendingApproval;
   let automaticTitleExpectation;
+  let composerContextExpectation;
+  let taskThreadsExpectation;
   let preexistingJaIdentities = [];
   let preexistingJaBaselineReady = false;
   try {
@@ -13557,8 +26190,16 @@ async function main() {
     evidence.frontendPort = frontendPort;
     evidence.setup.ports = "ready";
     evidence.realRuntime.before = await captureRealRuntimeEvidence(baseEnv, directories);
-    const jar = await assertAppServerJar(runDeadline.signal);
-    evidence.setup.jar = { present: true, path: redact(jar, directories) };
+    if (planGoalAcceptanceMode || turnChangeReviewAcceptanceMode) {
+      evidence.setup.jar = "disabled_native_sidecar_only";
+      evidence.setup.nativeSidecar = planGoalSidecar ?? turnChangeReviewSidecar;
+    } else if (configuredNativeSidecar !== undefined) {
+      evidence.setup.jar = "native_only";
+      evidence.setup.nativeSidecar = configuredNativeSidecar.identity;
+    } else {
+      const jar = await assertAppServerJar(runDeadline.signal);
+      evidence.setup.jar = { present: true, path: redact(jar, directories) };
+    }
     const [pnpmCommand, cargoCommand, gitCommand] = await Promise.all([
       locateCommand("pnpm.cmd", runDeadline.signal),
       locateCargoCommand(runDeadline.signal),
@@ -13566,17 +26207,76 @@ async function main() {
     ]);
     await warmTauriBinary(directories, baseEnv, cargoCommand, runDeadline.signal);
     evidence.setup.compile = "ready";
-    await initializeWorkspaceFixture(directories.workspace, gitCommand, runDeadline.signal);
-    previewFixture = await startPreviewFixture();
-    if (automaticTitleAcceptanceMode) {
-      automaticTitleFixture = await startAutomaticTitleProviderFixture();
+    const workspaceFixture = await initializeWorkspaceFixture(
+      directories.workspace,
+      gitCommand,
+      runDeadline.signal,
+      {
+        workspaceSwitchPerformance:
+          workspaceSwitchPerformanceMode ||
+          composerContextAcceptanceMode ||
+          turnChangeReviewAcceptanceMode,
+      },
+    );
+    if (workspaceFixture !== undefined) evidence.setup.workspaceFixture = workspaceFixture;
+    if (
+      !workspaceSwitchPerformanceMode &&
+      !themeMatrixAcceptanceMode &&
+      !planGoalAcceptanceMode &&
+      !turnChangeReviewAcceptanceMode &&
+      !runtimeRefreshAcceptanceMode &&
+      !composerContextAcceptanceMode &&
+      !taskThreadsAcceptanceMode
+    ) {
+      previewFixture = await startPreviewFixture();
+    }
+    if (
+      defaultDesktopLoopbackMode ||
+      automaticTitleAcceptanceMode ||
+      sidebarThreadAcceptanceMode ||
+      taskThreadsAcceptanceMode ||
+      planGoalAcceptanceMode ||
+      turnChangeReviewAcceptanceMode
+    ) {
+      automaticTitleFixture = await startAutomaticTitleProviderFixture(directories.workspace);
       providerConfig = automaticTitleFixture.providerConfig;
+    }
+    if (runtimeRefreshAcceptanceMode) {
+      runtimeRefreshFixture = await startRuntimeRefreshProviderFixture();
+      providerConfig = runtimeRefreshFixture.providerConfig;
+      runtimeRefreshControlPath = join(directories.runtime, "runtime-refresh-mcp-control.json");
+      runtimeRefreshReportPath = join(directories.runtime, "runtime-refresh-mcp-report.ndjson");
     }
     if (providerConfig?.configureViaUi === true) {
       await mkdir(directories.home, { recursive: true });
       evidence.setup.settings = "pending_ui_configuration";
+    } else if (runtimeRefreshAcceptanceMode) {
+      await writeRuntimeRefreshSettings(
+        directories.home,
+        directories.workspace,
+        providerConfig,
+        runtimeRefreshControlPath,
+        runtimeRefreshReportPath,
+      );
+      evidence.setup.settings = "ready";
     } else {
-      await writeSettings(directories.home, providerConfig);
+      if (composerContextAcceptanceMode) {
+        await writeComposerContextSkill(directories.home);
+      }
+      await writeSettings(directories.home, providerConfig, {
+        defaultAccessMode:
+          toolLifecycleAcceptanceMode ||
+          toolFailureAcceptanceMode ||
+          taskThreadsAcceptanceMode ||
+          turnChangeReviewAcceptanceMode
+            ? "full_access"
+            : "approval_required",
+        includeComposerContextSkill: composerContextAcceptanceMode,
+        turnWallTimeoutMs:
+          taskThreadsAcceptanceMode || planGoalAcceptanceMode || turnChangeReviewAcceptanceMode
+            ? 180_000
+            : 30_000,
+      });
       evidence.setup.settings = "ready";
     }
     assertLaunchRuntimeRoot(directories);
@@ -13591,9 +26291,44 @@ async function main() {
       preexistingJaIdentities,
       evidence,
       runDeadline,
+      // profile prime 只建立隔离 WebView2 用户目录，不承担产品退出入口验收；固定按已复验
+      // launcher owner 的进程树回收，避免 Windows 11 托盘浮层波动在正式交互开始前误判失败。
+      cleanupMode: "owned_tree",
     });
     evidence.setup.profilePrime = "ready";
+    if (
+      inputQueueAcceptanceMode ||
+      sidebarThreadAcceptanceMode ||
+      toolFailureAcceptanceMode ||
+      themeMatrixAcceptanceMode ||
+      composerContextAcceptanceMode ||
+      taskThreadsAcceptanceMode ||
+      planGoalAcceptanceMode ||
+      turnChangeReviewAcceptanceMode ||
+      runtimeRefreshAcceptanceMode
+    ) {
+      // 这些 owned_tree 聚焦模式都需要先完成一次真实 profile 初始化；owner tree 归零后仍给
+      // WebView2/UserData 与 App Server 连接留出短暂释放窗口，避免正式验收首次握手争用旧句柄。
+      await waitForDelay(2_000, runDeadline.signal);
+    }
     for (const phase of ["first", "second"]) {
+      if (
+        (projectNewConversationAcceptanceMode ||
+          workspaceSwitchPerformanceMode ||
+          themeMatrixAcceptanceMode ||
+          inputQueueAcceptanceMode ||
+          toolLifecycleAcceptanceMode ||
+          toolFailureAcceptanceMode ||
+          sidebarThreadAcceptanceMode ||
+          planGoalAcceptanceMode ||
+          turnChangeReviewAcceptanceMode ||
+          runtimeRefreshAcceptanceMode) &&
+        phase === "second"
+      )
+        break;
+      attachmentPickerLastEvidence = undefined;
+      attachmentClipboardLastEvidence = undefined;
+      attachmentDropLastEvidence = undefined;
       throwIfAborted(runDeadline.signal);
       assertLaunchRuntimeRoot(directories);
       const exitTracePath = join(directories.runtime, `ja-exit-trace-${runId}-${phase}.jsonl`);
@@ -13639,9 +26374,11 @@ async function main() {
       let watcher;
       let cleanupFailure;
       let phaseStage = `${phase}:launch`;
+      /** 只输出受限阶段名，保留卡点证据而不等待整轮失败才产生报告。 */
       const recordStage = (value) => {
         if (typeof value === "string" && value.length <= 64) {
           phaseStage = value;
+          process.stdout.write(`JA_E2E_STAGE ${redact(value, directories)}\n`);
         }
       };
       try {
@@ -13703,30 +26440,337 @@ async function main() {
           recordStage(`${phase}:diagnostics`);
           diagnostics = attachPageDiagnostics(page, directories);
           if (phase === "first") {
-            if (automaticTitleAcceptanceMode) {
+            if (runtimeRefreshAcceptanceMode) {
+              const runtimeRefresh = await raceWithSignal(
+                () =>
+                  runRuntimeRefreshAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    runtimeRefreshFixture,
+                    runtimeRefreshControlPath,
+                    runtimeRefreshReportPath,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                runtimeRefresh,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                  configuredNativeSidecar === undefined
+                    ? ["java.exe"]
+                    : [configuredNativeSidecar.identity.fileName],
+                ),
+              };
+            } else if (turnChangeReviewAcceptanceMode) {
+              const turnChangeReview = await raceWithSignal(
+                () =>
+                  runTurnChangeReviewAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    automaticTitleFixture,
+                    { rootIdentity, observed, incompleteObserved },
+                    turnChangeReviewSidecar,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                turnChangeReview,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                  [turnChangeReviewSidecar.fileName],
+                ),
+              };
+            } else if (themeMatrixAcceptanceMode) {
+              const themeMatrix = await raceWithSignal(
+                () =>
+                  runThemeMatrixAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    diagnostics,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                themeMatrix,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                ),
+              };
+            } else if (planGoalAcceptanceMode) {
+              const planGoal = await raceWithSignal(
+                () =>
+                  runIndependentPlanGoalAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    automaticTitleFixture,
+                    { rootIdentity, observed, incompleteObserved },
+                    planGoalSidecar,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                planGoal,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                  [planGoalSidecar.fileName],
+                ),
+              };
+            } else if (workspaceSwitchPerformanceMode) {
+              const workspaceSwitchPerformance = await raceWithSignal(
+                () =>
+                  runWorkspaceSwitchPerformanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    { rootIdentity, observed, incompleteObserved },
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                workspaceSwitchPerformance,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                ),
+              };
+            } else if (taskThreadsAcceptanceMode) {
+              const taskThreads = await raceWithSignal(
+                () =>
+                  runTaskThreadsAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    automaticTitleFixture,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              taskThreadsExpectation = taskThreads.restartExpectation;
+              evidence.first = {
+                ...evidence.first,
+                taskThreads,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                  configuredNativeSidecar === undefined
+                    ? ["java.exe"]
+                    : [configuredNativeSidecar.identity.fileName],
+                ),
+              };
+            } else if (sidebarThreadAcceptanceMode) {
+              const sidebarThread = await raceWithSignal(
+                () =>
+                  runSidebarThreadAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    automaticTitleFixture,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                sidebarThread,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                ),
+              };
+            } else if (projectNewConversationAcceptanceMode) {
+              const projectNewConversation = await raceWithSignal(
+                () =>
+                  runProjectNewConversationAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                projectNewConversation,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                ),
+              };
+            } else if (composerContextAcceptanceMode) {
+              const composerContext = await raceWithSignal(
+                () =>
+                  runComposerContextAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    automaticTitleFixture,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              composerContextExpectation = composerContext.processRestartExpectation;
+              evidence.first = {
+                ...evidence.first,
+                composerContext,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                ),
+              };
+            } else if (automaticTitleAcceptanceMode) {
               if (automaticTitleFixture === undefined) {
                 throw new Error("自动标题验收缺少 loopback fixture");
               }
               let isolation;
               const titleAcceptance = await raceWithSignal(
                 () =>
-                  runAutomaticTitleAcceptanceSession(
-                    page,
-                    sessionDeadline,
-                    directories,
-                    automaticTitleFixture,
-                    (value) => {
-                      isolation = value;
-                    },
-                    runDeadline.signal,
-                    recordStage,
-                  ),
+                  toolFailureAcceptanceMode
+                    ? runToolFailureAcceptanceSession(
+                        page,
+                        sessionDeadline,
+                        directories,
+                        automaticTitleFixture,
+                        runDeadline.signal,
+                        recordStage,
+                      )
+                    : toolLifecycleAcceptanceMode
+                      ? runToolLifecycleAcceptanceSession(
+                          page,
+                          sessionDeadline,
+                          directories,
+                          automaticTitleFixture,
+                          runDeadline.signal,
+                          recordStage,
+                        )
+                      : inputQueueAcceptanceMode
+                        ? runInputQueueAcceptanceSession(
+                            page,
+                            sessionDeadline,
+                            directories,
+                            automaticTitleFixture,
+                            previewFixture,
+                            { rootIdentity, observed, incompleteObserved },
+                            runDeadline.signal,
+                            recordStage,
+                            (value) => {
+                              evidence[phase].inputQueueThreadSnapshot = {
+                                ...value,
+                                ...(typeof value.bodyTextPreview === "string"
+                                  ? { bodyTextPreview: redact(value.bodyTextPreview, directories) }
+                                  : {}),
+                              };
+                            },
+                          )
+                        : operationRecoveryAcceptanceMode
+                          ? runOperationRecoveryAcceptanceSession(
+                              page,
+                              sessionDeadline,
+                              directories,
+                              automaticTitleFixture,
+                              { rootIdentity, observed, incompleteObserved },
+                              (value) => {
+                                isolation = value;
+                              },
+                              runDeadline.signal,
+                              recordStage,
+                            )
+                          : runAutomaticTitleAcceptanceSession(
+                              page,
+                              sessionDeadline,
+                              directories,
+                              automaticTitleFixture,
+                              { rootIdentity, observed, incompleteObserved },
+                              (value) => {
+                                isolation = value;
+                              },
+                              runDeadline.signal,
+                              recordStage,
+                            ),
                 runDeadline.signal,
               );
               automaticTitleExpectation = titleAcceptance;
               evidence.first = {
                 ...evidence.first,
-                automaticTitle: titleAcceptance,
+                ...(toolLifecycleAcceptanceMode
+                  ? { toolLifecycle: titleAcceptance }
+                  : toolFailureAcceptanceMode
+                    ? { toolFailure: titleAcceptance }
+                    : inputQueueAcceptanceMode
+                      ? { inputQueue: titleAcceptance }
+                      : operationRecoveryAcceptanceMode
+                        ? { operationRecovery: titleAcceptance.operationRecovery }
+                        : { automaticTitle: titleAcceptance }),
                 pageUrl: redact(page.url(), directories),
                 pageTitle: redact(await page.title(), directories),
                 diagnostics,
@@ -13804,24 +26848,98 @@ async function main() {
               };
             }
           } else {
-            if (automaticTitleAcceptanceMode) {
-              if (automaticTitleFixture === undefined || automaticTitleExpectation === undefined) {
-                throw new Error("重启标题验收缺少第一轮证据");
+            if (taskThreadsAcceptanceMode) {
+              if (taskThreadsExpectation === undefined) {
+                throw new Error("Task 重启验收缺少第一轮身份");
               }
               const restarted = await raceWithSignal(
                 () =>
-                  runAutomaticTitleRestartSession(
+                  runTaskThreadsRestartSession(
                     page,
-                    automaticTitleExpectation,
-                    automaticTitleFixture,
                     sessionDeadline,
+                    directories,
+                    taskThreadsExpectation,
                     runDeadline.signal,
+                    recordStage,
                   ),
                 runDeadline.signal,
               );
               evidence.second = {
                 ...evidence.second,
-                automaticTitle: restarted,
+                taskThreads: restarted,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                  configuredNativeSidecar === undefined
+                    ? ["java.exe"]
+                    : [configuredNativeSidecar.identity.fileName],
+                ),
+              };
+            } else if (composerContextAcceptanceMode) {
+              if (composerContextExpectation === undefined) {
+                throw new Error("Composer context 重启验收缺少第一轮证据");
+              }
+              const restarted = await raceWithSignal(
+                () =>
+                  runComposerContextRestartSession(
+                    page,
+                    composerContextExpectation,
+                    sessionDeadline,
+                    directories,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.second = {
+                ...evidence.second,
+                composerContext: restarted,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                ),
+              };
+            } else if (automaticTitleAcceptanceMode) {
+              if (automaticTitleFixture === undefined || automaticTitleExpectation === undefined) {
+                throw new Error("重启标题验收缺少第一轮证据");
+              }
+              const restarted = await raceWithSignal(
+                () =>
+                  operationRecoveryAcceptanceMode
+                    ? runOperationRecoveryRestartSession(
+                        page,
+                        automaticTitleExpectation,
+                        automaticTitleFixture,
+                        sessionDeadline,
+                        directories,
+                        runDeadline.signal,
+                        recordStage,
+                      )
+                    : runAutomaticTitleRestartSession(
+                        page,
+                        automaticTitleExpectation,
+                        automaticTitleFixture,
+                        sessionDeadline,
+                        directories,
+                        runDeadline.signal,
+                      ),
+                runDeadline.signal,
+              );
+              evidence.second = {
+                ...evidence.second,
+                ...(operationRecoveryAcceptanceMode
+                  ? { operationRecovery: restarted }
+                  : { automaticTitle: restarted }),
                 pageUrl: redact(page.url(), directories),
                 pageTitle: redact(await page.title(), directories),
                 diagnostics,
@@ -13879,7 +26997,21 @@ async function main() {
           }
         } catch (error) {
           evidence[phase].stage = phaseStage;
+          if (attachmentPickerLastEvidence !== undefined) {
+            evidence[phase].attachmentPickerAcceptance = attachmentPickerLastEvidence;
+          }
+          if (attachmentClipboardLastEvidence !== undefined) {
+            evidence[phase].attachmentClipboardAcceptance = attachmentClipboardLastEvidence;
+          }
+          if (attachmentDropLastEvidence !== undefined) {
+            evidence[phase].attachmentDropAcceptance = attachmentDropLastEvidence;
+          }
           if (page !== undefined) {
+            evidence[phase].pageUrl = redact(page.url(), directories);
+            evidence[phase].pageTitle = redact(
+              await page.title().catch(() => "<unavailable>"),
+              directories,
+            );
             evidence[phase].afterFailure = await captureUiEvidence(
               page,
               directories,
@@ -13895,6 +27027,7 @@ async function main() {
             requestFailed: [],
             rawTauriEvents: [],
           };
+          evidence[phase].managedJavaDiagnostics = await captureManagedJavaDiagnostics(directories);
           evidence[phase].launcher = launcherOutputSummary(launch, directories);
           sessionError = error;
           throw error;
@@ -13934,6 +27067,19 @@ async function main() {
             directories,
             evidence,
             runDeadline.signal,
+            workspaceSwitchPerformanceMode ||
+              themeMatrixAcceptanceMode ||
+              inputQueueAcceptanceMode ||
+              toolLifecycleAcceptanceMode ||
+              toolFailureAcceptanceMode ||
+              sidebarThreadAcceptanceMode ||
+              composerContextAcceptanceMode ||
+              taskThreadsAcceptanceMode ||
+              planGoalAcceptanceMode ||
+              turnChangeReviewAcceptanceMode ||
+              runtimeRefreshAcceptanceMode
+              ? "owned_tree"
+              : "tray_exit",
           );
         } finally {
           // 在托盘退出/force cleanup 后捕获 stream tail，使进程退出期间发出的 shutdown marker
@@ -13953,7 +27099,350 @@ async function main() {
     evidence.preexistingJaGuard.final = finalPreexistingVerification.evidence;
     if (finalPreexistingVerification.failure !== undefined)
       throw finalPreexistingVerification.failure;
-    if (automaticTitleAcceptanceMode) {
+    if (runtimeRefreshAcceptanceMode) {
+      const report = evidence.first.runtimeRefresh;
+      if (
+        report?.status !== "passed" ||
+        report.controls?.modelEnabled !== true ||
+        report.controls?.reasoningSelected !== "high" ||
+        report.controls?.accessMode !== "approval_required" ||
+        report.provider?.filter((attempt) => attempt.kind === "turn").length !== 3 ||
+        report.usage?.length !== 3 ||
+        report.usage.at(-1)?.certainty !== "UNKNOWN" ||
+        report.tools?.length !== 2 ||
+        report.mcp?.toolCalls !== 1 ||
+        report.ui?.unknownUsage !== true ||
+        report.ui?.legacyFreezeCopyAbsent !== true ||
+        report.ui?.extraToastAbsent !== true ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Runtime Refresh 真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (turnChangeReviewAcceptanceMode) {
+      const report = evidence.first.turnChangeReview;
+      if (
+        report?.status !== "passed" ||
+        report.runtime?.nativeSidecar?.used !== true ||
+        report.provider?.modelUnavailableCount !== 0 ||
+        report.product?.defaultReviewSource !== "git_uncommitted" ||
+        report.product?.runningTurnPreviewVisible !== false ||
+        report.product?.terminalChangeActionLabel !== "查看修改" ||
+        report.product?.zeroChangeActionVisible !== false ||
+        report.product?.historicalTurnIdentityPreserved !== true ||
+        report.product?.nonGitFrozenReviewReadable !== true ||
+        report.product?.frozenReviewWritableActions !== false ||
+        Object.values(report.hiddenReviewIo?.delta ?? {}).some((value) => value !== 0) ||
+        Object.values(report.hiddenReviewIo?.nativeInvokes ?? {}).some((value) => value !== 0) ||
+        report.hiddenReviewIo?.workersAfterHide !== 0 ||
+        report.performance?.after?.selection?.samples < turnChangeReviewPerformanceSamples ||
+        report.performance?.after?.selection?.p95Ms > turnChangeReviewSelectionP95BudgetMs ||
+        report.performance?.after?.small?.samples < turnChangeReviewPerformanceSamples ||
+        report.performance?.after?.small?.p95Ms > turnChangeReviewSmallP95BudgetMs ||
+        report.performance?.after?.large?.samples < turnChangeReviewPerformanceSamples ||
+        report.performance?.after?.large?.p95Ms > turnChangeReviewLargeP95BudgetMs ||
+        report.performance?.after?.abaReread !== true ||
+        report.performance?.after?.prefetchReads !== 0 ||
+        report.performance?.after?.cacheHits !== 0 ||
+        report.performance?.after?.maxActiveReads > 2 ||
+        report.performance?.after?.maxPendingReads > 1 ||
+        report.performance?.after?.latestSelectionWins !== true ||
+        report.performance?.after?.loading?.hiddenBefore120Ms !== true ||
+        report.performance?.after?.loading?.visibleAfter120Ms !== true ||
+        report.performance?.after?.plainBeforeHighlight !== true ||
+        report.visualMatrix?.light !== true ||
+        report.visualMatrix?.dark !== true ||
+        report.visualMatrix?.forcedColors !== true ||
+        report.visualMatrix?.narrow !== true ||
+        report.visualMatrix?.zoom200 !== true ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Turn Change Review 真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (planGoalAcceptanceMode) {
+      const planGoal = evidence.first.planGoal;
+      try {
+        validatePlanGoalAcceptanceReport(planGoal, {
+          expectedSoakMinutes: configuredPlanGoalSoakMinutes,
+        });
+      } catch (error) {
+        throw new Error("Plan/Goal v1 真窗证据不完整", { cause: error });
+      }
+      if (
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Plan/Goal v1 进程树清理证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (taskThreadsAcceptanceMode) {
+      const taskThreads = evidence.first.taskThreads;
+      const restarted = evidence.second.taskThreads;
+      if (
+        taskThreads?.status !== "passed" ||
+        taskThreads.rootThreadIdPresent !== true ||
+        taskThreads.draftCreateDelta !== 0 ||
+        taskThreads.draftChromeAbsent !== true ||
+        taskThreads.composerParity?.contentRailReused !== true ||
+        taskThreads.composerParity?.composerSurfaceCount !== 1 ||
+        taskThreads.composerParity?.messageInputCount !== 1 ||
+        taskThreads.composerParity?.taskNameInputCount !== 0 ||
+        taskThreads.composerFocus?.inputFocused !== true ||
+        taskThreads.composerFocus?.inputBorderWidth !== "0px" ||
+        taskThreads.composerFocus?.inputOutlineWidth !== "0px" ||
+        taskThreads.responsiveComposer?.narrow?.railOverflow > 1 ||
+        taskThreads.responsiveComposer?.narrow?.surfaceOverflow > 1 ||
+        taskThreads.responsiveComposer?.wide?.railOverflow > 1 ||
+        taskThreads.responsiveComposer?.wide?.surfaceOverflow > 1 ||
+        taskThreads.createDelta !== 1 ||
+        taskThreads.stableTabReplaced !== true ||
+        taskThreads.contextInheritanceVisible !== true ||
+        taskThreads.activityCardVisible !== true ||
+        taskThreads.activityCardReopenedSameTab !== true ||
+        taskThreads.overviewVisible !== true ||
+        taskThreads.completedFollowupVisible !== true ||
+        taskThreads.backgroundFollowupUnreadVisible !== true ||
+        taskThreads.hiddenDetailDelta?.read !== 0 ||
+        taskThreads.hiddenDetailDelta?.threadRead !== 0 ||
+        taskThreads.hiddenDetailDelta?.observe !== 0 ||
+        JSON.stringify(taskThreads.subagentTreeLevels) !== JSON.stringify([1, 2, 3]) ||
+        taskThreads.subagentApprovalResolved !== true ||
+        taskThreads.attachedCancelPropagation !== true ||
+        taskThreads.sideTaskIndependentAfterCancel !== true ||
+        taskThreads.renamedTabVisible !== true ||
+        taskThreads.renamedDetailWithoutDuplicateHeading !== true ||
+        taskThreads.renameDelta !== 1 ||
+        taskThreads.metrics?.definitions?.length !== 5 ||
+        taskThreads.metrics.definitions.some(
+          (definition) => definition.present !== true || definition.fieldsPresent !== true,
+        ) ||
+        taskThreads.metrics.runtimeRedactionValid !== true ||
+        !taskThreads.metrics.runtimeEventNames.includes("task_active_count") ||
+        !taskThreads.metrics.runtimeEventNames.includes("task_mailbox_lag") ||
+        taskThreads.observeDelta < 2 ||
+        taskThreads.closeUnobserveDelta < 1 ||
+        taskThreads.closeCancelDelta !== 0 ||
+        taskThreads.followupDelta !== 1 ||
+        taskThreads.cancelDelta !== 1 ||
+        taskThreads.providerTurnAttempts < 10 ||
+        taskThreads.conversationResyncRequiredCount !== 0 ||
+        taskThreads.conversationChildTurnCount !== 0 ||
+        taskThreads.conversationChildRunningCount !== 0 ||
+        restarted?.status !== "passed" ||
+        restarted.rootThreadRestored !== true ||
+        restarted.activityRestored !== true ||
+        restarted.unreadRestored !== true ||
+        JSON.stringify(restarted.treeLevels) !== JSON.stringify([1, 2, 3]) ||
+        restarted.attachedCancellationRestored !== true ||
+        restarted.sideTaskIndependentRestored !== true ||
+        restarted.hiddenDetailDelta?.read !== 0 ||
+        restarted.hiddenDetailDelta?.threadRead !== 0 ||
+        restarted.hiddenDetailDelta?.observe !== 0 ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed" ||
+        evidence.second.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Task 线程真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (composerContextAcceptanceMode) {
+      const first = evidence.first.composerContext;
+      const restarted = evidence.second.composerContext;
+      if (
+        first?.status !== "passed" ||
+        first.ime?.pathSearchDelta !== 0 ||
+        first.commands?.shown?.length !== 12 ||
+        first.slashHeavyIoDelta?.reviewCatalog !== 0 ||
+        first.slashHeavyIoDelta?.reviewSnapshot !== 0 ||
+        first.slashHeavyIoDelta?.filesTree !== 0 ||
+        first.slashHeavyIoDelta?.pathSearch !== 0 ||
+        first.workspace?.duplicateSuppressed !== true ||
+        first.workspace?.removeCompleted !== true ||
+        first.skillOnlyBlocked !== true ||
+        first.modelProjection?.skillActivated !== true ||
+        first.modelProjection?.fileReferenceProjected !== true ||
+        first.modelProjection?.directoryReferenceProjected !== true ||
+        first.modelProjection?.workspaceBodyAbsent !== true ||
+        first.visualMatrix?.themes?.length !== 2 ||
+        first.visualMatrix?.zoom?.length !== 3 ||
+        first.visualMatrix?.forcedColors !== true ||
+        first.visualMatrix?.reducedMotion !== true ||
+        first.queueEnqueueLifecycle?.map(({ phase }) => phase).join(",") !== "start,resolved" ||
+        first.queueReloadRecovered !== true ||
+        restarted?.status !== "passed" ||
+        restarted.historyReferencesRecovered !== true ||
+        restarted.rows?.length !== 2 ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed" ||
+        evidence.second.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Composer context 真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (themeMatrixAcceptanceMode) {
+      const themeMatrix = evidence.first.themeMatrix;
+      if (
+        themeMatrix?.status !== "passed" ||
+        themeMatrix.combinations !== 8 ||
+        themeMatrix.frameCount !== 64 ||
+        themeMatrix.reducedTransparency !== true ||
+        themeMatrix.workbench?.editorPreserved !== true ||
+        themeMatrix.workbench?.editorSelectionPreserved !== true ||
+        themeMatrix.workbench?.terminalPreserved !== true ||
+        themeMatrix.reload?.palette !== "claude" ||
+        themeMatrix.reload?.theme !== "dark" ||
+        themeMatrix.reload?.themeMode !== "dark" ||
+        themeMatrix.reload?.reducedTransparency !== true ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("四主题 Theme Matrix 真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (toolFailureAcceptanceMode) {
+      const toolFailure = evidence.first.toolFailure;
+      if (
+        toolFailure?.status !== "passed" ||
+        toolFailure.appearance?.theme !== visualTheme ||
+        toolFailure.appearance?.reducedMotion !== "true" ||
+        toolFailure.appearance?.highContrast !== "true" ||
+        toolFailure.shell?.providerAttempts !== 3 ||
+        toolFailure.shell?.failedResults !== 1 ||
+        toolFailure.shell?.executions !== 1 ||
+        toolFailure.shell?.errorCode !== "TOOL_BINDING_UNAVAILABLE" ||
+        toolFailure.shell?.recoveredOutcome !== "succeeded" ||
+        toolFailure.shell?.outputsNonEmpty !== true ||
+        toolFailure.shell?.toolCatalogPreserved !== true ||
+        toolFailure.shell?.finalReplyVisible !== true ||
+        toolFailure.read?.providerAttempts !== 5 ||
+        toolFailure.read?.executions !== 1 ||
+        toolFailure.read?.failedResults !== 3 ||
+        toolFailure.read?.successfulResults !== 1 ||
+        toolFailure.read?.errorCodes?.length !== 3 ||
+        toolFailure.read.errorCodes.some((code) => code !== "TOOL_ARGUMENTS_INVALID") ||
+        toolFailure.read?.outputsNonEmpty !== true ||
+        toolFailure.read?.recoveredOutcome !== "succeeded" ||
+        toolFailure.read?.toolCatalogPreserved !== true ||
+        toolFailure.read?.finalReplyVisible !== true ||
+        toolFailure.read?.durableSnapshot !== true ||
+        toolFailure.historyReadRecovered !== true ||
+        toolFailure.webViewReloadRecovered !== true ||
+        toolFailure.dsml?.providerAttempts !== 1 ||
+        toolFailure.dsml?.textDeltaCount < 1 ||
+        toolFailure.dsml?.terminalState !== "completed" ||
+        toolFailure.dsml?.toolExecutions !== 0 ||
+        toolFailure.dsml?.persistenceRowCount < 1 ||
+        toolFailure.dsml?.webViewReloadRecovered !== true ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Tool 错误反馈、自纠正与普通正文恢复真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (toolLifecycleAcceptanceMode) {
+      const lifecycle = evidence.first.toolLifecycle;
+      if (
+        lifecycle?.status !== "passed" ||
+        lifecycle.pendingToRunningVisible !== true ||
+        lifecycle.partialBatchVisible?.firstCompleted !== true ||
+        lifecycle.partialBatchVisible?.secondRunning !== true ||
+        lifecycle.partialBatchVisible?.waitingVisible !== false ||
+        lifecycle.finalReplyVisible !== true ||
+        lifecycle.noLiveResync !== true ||
+        lifecycle.durableSnapshot !== true ||
+        lifecycle.terminalExecutionDeleted !== true ||
+        lifecycle.webViewReloadRecovered !== true ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("Tool 生命周期真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (sidebarThreadAcceptanceMode) {
+      if (
+        evidence.first.sidebarThread?.status !== "passed" ||
+        evidence.first.sidebarThread?.pinnedSurvivedReload !== true ||
+        evidence.first.sidebarThread?.completedUnreadPersistedUntilSeen !== true ||
+        evidence.first.sidebarThread?.failedUnreadPersistedUntilSeen !== true ||
+        evidence.first.sidebarThread?.seenPersistedAcrossReload !== true ||
+        evidence.first.sidebarThread?.activeStatusVisibleForCurrentAndBackgroundThreads !== true ||
+        evidence.first.sidebarThread?.archiveUndoRestoredSelection !== true ||
+        evidence.first.sidebarThread?.searchRestoreOpened !== true ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("侧栏会话状态与恢复真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (inputQueueAcceptanceMode) {
+      const inputQueue = evidence.first.inputQueue;
+      if (
+        inputQueue?.queuedBeforeReload !== 5 ||
+        inputQueue?.queuedAfterReload !== 5 ||
+        inputQueue?.toolOutputBeforeSteering !== true ||
+        inputQueue?.toolApprovalCompleted !== true ||
+        inputQueue?.timelineReplyOrder !== "steering_then_fifo" ||
+        inputQueue?.attachmentOnly?.boundToUserMessage !== true ||
+        inputQueue?.attachmentOnly?.queuedPreviewBeforeReload?.textRead !== true ||
+        inputQueue?.attachmentOnly?.queuedPreviewAfterReload?.textRead !== true ||
+        inputQueue?.attachmentOnly?.timelinePreview?.textRead !== true ||
+        inputQueue?.attachmentUnavailable?.removed !== true ||
+        inputQueue?.attachmentUnavailable?.suspended !== true ||
+        inputQueue?.attachmentUnavailable?.repairedByRemovingAttachment !== true ||
+        inputQueue?.attachmentUnavailable?.resumedExplicitly !== true ||
+        inputQueue?.appearance?.theme !== visualTheme ||
+        inputQueue?.appearance?.reducedMotion !== "true" ||
+        inputQueue?.appearance?.highContrast !== "true" ||
+        inputQueue?.visualAppearance?.theme !== visualTheme ||
+        inputQueue?.visualAppearance?.themeMode !== visualTheme ||
+        inputQueue?.visualAppearance?.palette !== "xcode" ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed"
+      ) {
+        throw new Error("回复中队列真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (workspaceSwitchPerformanceMode) {
+      const performanceEvidence = evidence.first.workspaceSwitchPerformance;
+      if (
+        performanceEvidence?.status !== "passed" ||
+        performanceEvidence.switchCount !== workspaceSwitchRoundTrips * 2 + 1 ||
+        performanceEvidence.reviewCommands?.delta?.snapshot !== 0 ||
+        performanceEvidence.filesCommands?.delta?.tree !== 0 ||
+        performanceEvidence.filesCommands?.delta?.watchStart !== 0 ||
+        performanceEvidence.filesCommands?.delta?.watchStop !== 0 ||
+        performanceEvidence.filesCommands?.delta?.watchRescan !== 0 ||
+        evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
+        evidence.first.ownedTreeCleanup?.status !== "passed" ||
+        evidence.profilePrime.nativeShortcutExitCleanup?.status !== "not_exercised" ||
+        evidence.first.nativeShortcutExitCleanup?.status !== "not_exercised"
+      ) {
+        throw new Error("workspace switch 性能真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (projectNewConversationAcceptanceMode) {
+      if (
+        evidence.first.projectNewConversation?.newConversationEnabled !== true ||
+        evidence.first.projectNewConversation?.reusedThreadId === undefined ||
+        evidence.first.projectNewConversation?.threadCountBefore !==
+          evidence.first.projectNewConversation?.threadCountAfter
+      ) {
+        throw new Error("项目空会话复用真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (operationRecoveryAcceptanceMode) {
+      if (
+        evidence.first.operationRecovery?.turnId === undefined ||
+        evidence.second.operationRecovery?.terminalExecutionDeleted !== true ||
+        evidence.second.operationRecovery?.webViewReloadRecovered !== true
+      ) {
+        throw new Error("Operation 恢复真窗证据不完整");
+      }
+      evidence.acceptance = { blocked: [], gated: [] };
+    } else if (automaticTitleAcceptanceMode) {
       if (
         evidence.first.automaticTitle === undefined ||
         evidence.second.automaticTitle === undefined ||
@@ -13966,6 +27455,7 @@ async function main() {
     } else {
       evidence.acceptance = {
         blocked: [
+          evidence.first.attachment?.clipboardImagePaste,
           evidence.first.workbench?.files?.nativeDrop,
           evidence.first.workbench?.files?.trash,
           {
@@ -13994,13 +27484,30 @@ async function main() {
     evidence.realRuntime.after = await captureRealRuntimeEvidence(baseEnv, directories);
     assertRealRuntimeUnchanged(evidence.realRuntime.before, evidence.realRuntime.after);
     evidence.realRuntime.unchanged = true;
+    if (automaticTitleFixture !== undefined) {
+      evidence.providerFixture = automaticTitleFixture.diagnosticSnapshot();
+    }
+    if (runtimeRefreshFixture !== undefined) {
+      evidence.runtimeRefreshProviderFixture = runtimeRefreshFixture.diagnosticSnapshot();
+    }
     evidence.visualContract.published = await publishVisualEvidenceRun();
     if (visualEvidenceDirectory !== undefined && evidence.visualContract.published.length === 0) {
       throw new Error("桌面视觉验收未发布任何截图");
     }
+    if (turnChangeReviewAcceptanceMode) {
+      await mkdir(dirname(turnChangeReviewReportPath), { recursive: true });
+      await writeFile(
+        turnChangeReviewReportPath,
+        `${JSON.stringify(evidence.first.turnChangeReview, null, 2)}\n`,
+        "utf8",
+      );
+    }
     const summaryPath = await writeRunSummary(runId, evidence, "passed", undefined, directories);
+    const cdpPorts = [evidence.first.cdp?.port, evidence.second.cdp?.port]
+      .filter((port) => Number.isSafeInteger(port))
+      .join(",");
     process.stdout.write(
-      `JA_E2E_OK run=${runId} cdp=${evidence.first.cdp?.port},${evidence.second.cdp?.port} blocked=${evidence.acceptance.blocked.length} summary=${summaryPath}\n`,
+      `JA_E2E_OK run=${runId} cdp=${cdpPorts} blocked=${evidence.acceptance.blocked.length} summary=${summaryPath}\n`,
     );
   } catch (error) {
     if (directories.root === undefined && typeof error?.e2eRoot === "string") {
@@ -14010,6 +27517,12 @@ async function main() {
     const currentStage = evidence.first.stage ?? evidence.second.stage ?? "setup";
     const errorMessage = error instanceof Error ? error.message : String(error ?? "E2E 失败");
     let reportError = new Error(`${errorMessage} [stage=${currentStage}]`, { cause: error });
+    if (automaticTitleFixture !== undefined) {
+      evidence.providerFixture = automaticTitleFixture.diagnosticSnapshot();
+    }
+    if (runtimeRefreshFixture !== undefined) {
+      evidence.runtimeRefreshProviderFixture = runtimeRefreshFixture.diagnosticSnapshot();
+    }
     if (evidence.realRuntime.before !== undefined) {
       try {
         evidence.realRuntime.after = await captureRealRuntimeEvidence(baseEnv, directories);
@@ -14041,20 +27554,28 @@ async function main() {
   } finally {
     runDeadline.cancel();
     await automaticTitleFixture?.close().catch(() => undefined);
+    await runtimeRefreshFixture?.close().catch(() => undefined);
     await previewFixture?.close().catch(() => undefined);
     await cleanupRunRoot(cleanupRoot ?? directories.root);
   }
 }
 
-if (process.env.JA_E2E_STATIC_CONTRACT_ONLY === "1") {
-  assertStaticContracts();
-  process.stdout.write("JA_E2E_STATIC_CONTRACT_OK\n");
-} else {
-  const releaseDesktopSmokeLock = await acquireDesktopSmokeLock();
-  try {
-    const exitCode = await main();
-    if (Number.isInteger(exitCode)) process.exitCode = exitCode;
-  } finally {
-    await releaseDesktopSmokeLock();
+const directExecution =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+
+// 被诊断脚本导入时只暴露精确 owner 的 graceful-exit helper，不启动完整桌面验收。
+if (directExecution) {
+  if (process.env.JA_E2E_STATIC_CONTRACT_ONLY === "1") {
+    assertStaticContracts();
+    process.stdout.write("JA_E2E_STATIC_CONTRACT_OK\n");
+  } else {
+    const releaseDesktopSmokeLock = await acquireDesktopSmokeLock();
+    try {
+      const exitCode = await main();
+      if (Number.isInteger(exitCode)) process.exitCode = exitCode;
+    } finally {
+      await releaseDesktopSmokeLock();
+    }
   }
 }

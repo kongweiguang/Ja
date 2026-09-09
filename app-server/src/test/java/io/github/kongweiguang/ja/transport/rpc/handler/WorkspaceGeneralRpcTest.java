@@ -63,7 +63,8 @@ final class WorkspaceGeneralRpcTest {
                 request(mapper, "c:thread-general", "thread/create", mapper.createObjectNode()
                         .putNull("cwd").put("title", "无项目测试")
                         .put("providerId", "provider_test").put("modelId", "model_test")
-                        .put("reasoningLevel", "medium").put("accessMode", "approval_required")),
+                        .put("reasoningLevel", "medium").put("accessMode", "approval_required")
+                        .put("collaborationMode", "default")),
                 request(mapper, "c:general-cwd", "workspace/open-general", mapper.createObjectNode()
                         .put("cwd", temporaryRoot.toString())),
                 request(mapper, "c:general-extra", "workspace/open-general", mapper.createObjectNode()
@@ -106,7 +107,8 @@ final class WorkspaceGeneralRpcTest {
                 request(mapper, "c:thread", "thread/create", mapper.createObjectNode()
                         .put("cwd", project.toString()).put("title", "项目会话")
                         .put("providerId", "provider_test").put("modelId", "model_test")
-                        .put("reasoningLevel", "medium").put("accessMode", "approval_required")));
+                        .put("reasoningLevel", "medium").put("accessMode", "approval_required")
+                        .put("collaborationMode", "default")));
         RunResult trustRun = run(configuration, history, mapper,
                 workspaces -> workspaces.openWorkspace(
                         new WorkspaceUseCase.OpenWorkspace(project, null)),
@@ -133,6 +135,34 @@ final class WorkspaceGeneralRpcTest {
         assertEquals(2, trustRun.prepareCalls());
         assertEquals(0, listRun.prepareCalls());
         assertEquals(1, unregisterRun.prepareCalls());
+    }
+
+    /** thread/seen 只转发精确身份与 revision，无 Turn 时幂等返回完整已读投影并严格拒绝额外字段。 */
+    @Test
+    void threadSeenUsesStrictParamsAndReturnsCompleteProjection(@TempDir Path temporaryRoot) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        SidecarConfiguration configuration = configuration(temporaryRoot);
+        WorkspaceHistory history = new WorkspaceHistory();
+        RunResult created = run(configuration, history, mapper,
+                request(mapper, "c:create-seen", "thread/create", mapper.createObjectNode()
+                        .putNull("cwd").put("title", "已读测试")
+                        .put("providerId", "provider_test").put("modelId", "model_test")
+                        .putNull("reasoningLevel").put("accessMode", "approval_required")
+                        .put("collaborationMode", "default")));
+        String threadId = result(created.frames(), "c:create-seen").path("threadId").textValue();
+
+        RunResult seen = run(configuration, history, mapper,
+                request(mapper, "c:seen", "thread/seen", mapper.createObjectNode()
+                        .put("threadId", threadId).put("expectedThreadRevision", 0)),
+                request(mapper, "c:seen-extra", "thread/seen", mapper.createObjectNode()
+                        .put("threadId", threadId).put("expectedThreadRevision", 0).put("turnId", "turn_client")));
+
+        ObjectNode projection = result(seen.frames(), "c:seen");
+        assertExactKeys(projection, "threadId", "workspaceId", "title", "preferences", "status", "pinned",
+                "latestTurnStatus", "latestTurnSeen", "activeGoalId", "revision", "createdAt", "updatedAt");
+        assertTrue(projection.path("latestTurnSeen").booleanValue());
+        assertTrue(projection.path("latestTurnStatus").isNull());
+        assertEquals("INVALID_PARAMS", errorCode(seen.frames(), "c:seen-extra"));
     }
 
     /** 仓储返回不同物理根时必须在 transport 绑定前映射为脱敏约束错误。 */
@@ -208,10 +238,10 @@ final class WorkspaceGeneralRpcTest {
         return new RunResult(frames, prepareCalls.get());
     }
 
-    /** 构造严格 v2 initialize 请求，复用生产 capability 与 limit owner。 */
+    /** 构造唯一首版 initialize 请求，避免 Workspace 测试误走已经删除的历史协议。 */
     private static ObjectNode initialize(ObjectMapper mapper) {
-        ObjectNode params = mapper.createObjectNode().put("protocolMajor", 2).put("protocolMinor", 0)
-                .put("clientVersion", "2.0.0");
+        ObjectNode params = mapper.createObjectNode().put("protocolMajor", 1).put("protocolMinor", 0)
+                .put("clientVersion", "0.1.0");
         params.set("capabilities", HandshakeHandler.capabilities(mapper));
         params.set("limits", HandshakeHandler.limits(mapper));
         return request(mapper, "c:init", "runtime/initialize", params);
@@ -231,7 +261,10 @@ final class WorkspaceGeneralRpcTest {
 
     /** 解包成功 JSON-RPC envelope，供测试断言公开结果。 */
     private static ObjectNode result(List<ObjectNode> frames, String id) {
-        return (ObjectNode) response(frames, id).path("result");
+        ObjectNode frame = response(frames, id);
+        assertTrue(frame.path("result") instanceof ObjectNode,
+                () -> "response does not contain an object result: " + frame);
+        return (ObjectNode) frame.path("result");
     }
 
     /** 严格比较公开对象字段，防止旧 DTO 或持久化字段重新出现。 */
@@ -335,7 +368,8 @@ final class WorkspaceGeneralRpcTest {
             }
             ThreadSummary value = new ThreadSummary(
                     request.threadId(), request.workspaceId(), request.title(), request.preferences(),
-                    ThreadSummary.Status.ACTIVE, 0, request.occurredAt(), request.occurredAt());
+                    ThreadSummary.Status.ACTIVE, false, null, true, null, 0,
+                    request.occurredAt(), request.occurredAt());
             threads.put(value.threadId(), value);
             return value;
         }
@@ -366,9 +400,17 @@ final class WorkspaceGeneralRpcTest {
         /** 本测试未声明自动标题写入能力。 */
         @Override public boolean writeAutomaticTitle(String threadId, String title, long revision) { throw new UnsupportedOperationException(); }
 
+        /** 无 Turn 的内存投影已经是已读；此幂等路径不应伪造新 revision。 */
+        @Override
+        public synchronized ThreadSummary markThreadSeen(String threadId, long expectedThreadRevision) {
+            ThreadSummary current = threads.get(threadId);
+            if (current == null) throw new IllegalStateException("thread is missing");
+            return current;
+        }
+
         /** 本测试未声明归档能力。 */
         @Override
-        public void archiveThread(String threadId, long expectedThreadRevision) {
+        public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) {
             throw new UnsupportedOperationException();
         }
 

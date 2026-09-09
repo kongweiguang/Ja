@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
- * Production-sidecar smoke test for an explicitly authorized loopback endpoint
- * implementing Anthropic Messages or OpenAI Responses. The API key is accepted only through the parent
- * environment and is removed from the Java child's environment; it reaches
- * the sidecar solely inside the v2 credential/set request on stdin.
+ * Production-sidecar smoke test for an explicitly authorized loopback endpoint implementing one of the
+ * supported API specifications. The custom provider name never selects a wire adapter. The API key is accepted only through
+ * the parent environment and is removed from the Java child's environment; it reaches the sidecar solely
+ * inside the v1 credential/set request on stdin.
  */
 
 import { execFile, spawn } from "node:child_process";
@@ -22,9 +22,9 @@ const execFileAsync = promisify(execFile);
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDirectory, "..", "..");
-const errorCatalog = JSON.parse(readFileSync(
-  join(repoRoot, "contracts", "ja-rpc", "v2", "error-catalog.json"), "utf8",
-));
+const errorCatalog = JSON.parse(
+  readFileSync(join(repoRoot, "contracts", "ja-rpc", "v1", "error-catalog.json"), "utf8"),
+);
 const errorCategories = new Set(errorCatalog.categories);
 const errorsByNumericCode = new Map(errorCatalog.errors.map((entry) => [entry.code, entry]));
 const errorIdPattern = /^err_[0-9a-f]{32}$/u;
@@ -33,21 +33,110 @@ const readyToken = "0123456789abcdef0123456789abcdef";
 const providerId = "provider_real_provider_smoke";
 const modelId = "model_real_provider_smoke";
 const credentialId = "cred_real_provider_smoke";
+const reasoningLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const requestTimeoutMs = 120_000;
 const exitTimeoutMs = 20_000;
 const methods = [
-  "runtime/initialize", "runtime/health", "runtime/shutdown", "workspace/open", "workspace/open-general", "workspace/list",
-  "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list",
-  "thread/read", "thread/archive", "thread/delete", "turn/start", "turn/cancel", "turn/steer", "turn/follow-up",
-  "approval/respond", "configuration/read", "configuration/patch", "configuration/replace",
-  "configuration/reset", "credential/set", "credential/delete", "skill/list", "mcp/list",
-  "mcp/test", "mcp/list-tools",
+  "runtime/initialize",
+  "runtime/health",
+  "runtime/shutdown",
+  "workspace/open",
+  "workspace/open-general",
+  "workspace/list",
+  "workspace/path/search",
+  "workspace/set-trust",
+  "workspace/unregister",
+  "thread/create",
+  "thread/list",
+  "thread/search",
+  "thread/read",
+  "thread/rename",
+  "thread/pin",
+  "thread/seen",
+  "thread/preferences/update",
+  "thread/archive",
+  "thread/restore",
+  "thread/delete",
+  "thread/compact",
+  "goal/read",
+  "goal/events/read",
+  "goal/observe",
+  "goal/unobserve",
+  "plan/read",
+  "plan/revisions/list",
+  "goal/evidence/list",
+  "goal/create",
+  "goal/pause",
+  "goal/resume",
+  "goal/stop",
+  "goal/input/respond",
+  "plan/draft/save",
+  "plan/draft/discard",
+  "plan/propose",
+  "plan/approve",
+  "plan/reject",
+  "task/create",
+  "task/list",
+  "task/read",
+  "task/observe",
+  "task/unobserve",
+  "task/seen",
+  "task/message/send",
+  "task/followup",
+  "task/cancel",
+  "task/tree/delete",
+  "attachment/import",
+  "attachment/discard",
+  "attachment/preview/open",
+  "attachment/preview/read",
+  "attachment/preview/close",
+  "turn/start",
+  "turn/resume",
+  "turn/cancel",
+  "turn/input/enqueue",
+  "turn/input/prioritize",
+  "turn/input/update",
+  "turn/input/delete",
+  "turn/change-set/read",
+  "approval/respond",
+  "configuration/read",
+  "configuration/patch",
+  "configuration/replace",
+  "configuration/reset",
+  "credential/set",
+  "credential/delete",
+  "skill/list",
+  "mcp/list",
+  "mcp/test",
+  "model/test",
+  "mcp/list-tools",
+  "tool/artifact/read",
 ];
 const events = [
-  "runtime/status-changed", "turn/state-changed", "assistant/model-step-committed",
-  "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/batch-committed",
-  "approval/requested", "approval/resolved", "context/compacted", "workspace/dirty",
-  "turn/terminal", "configuration/changed",
+  "runtime/status-changed",
+  "turn/state-changed",
+  "turn/input-queue-changed",
+  "turn/input-consumed",
+  "assistant/model-step-committed",
+  "assistant/text-delta",
+  "assistant/reasoning-summary-delta",
+  "tool/started",
+  "tool/batch-committed",
+  "approval/requested",
+  "approval/resolved",
+  "context/compaction-started",
+  "context/compacted",
+  "context/compaction-failed",
+  "workspace/dirty",
+  "turn/terminal",
+  "thread/metadata-changed",
+  "configuration/changed",
+  "task/activity",
+  "task/progress",
+  "task/mailbox-changed",
+  "goal/changed",
+  "goal/activity",
+  "goal/input-requested",
 ];
 
 /** Reads one mandatory environment value without ever including its value in an error. */
@@ -75,8 +164,14 @@ function containsAsciiControl(value) {
 export function validatedLoopbackBaseUrl(value, variableName = "provider base URL") {
   const url = new URL(value);
   const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
-  if (url.protocol !== "http:" || !loopbackHosts.has(url.hostname)
-      || url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+  if (
+    url.protocol !== "http:" ||
+    !loopbackHosts.has(url.hostname) ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
     throw new Error(`${variableName} must be a credential-free loopback HTTP URL`);
   }
   return url.toString().replace(/\/+$/, "");
@@ -84,8 +179,9 @@ export function validatedLoopbackBaseUrl(value, variableName = "provider base UR
 
 /** Resolves the exact freshly built sidecar artifact and rejects a missing or empty jar. */
 async function resolveJar() {
-  const jar = resolve(process.env.JA_REAL_PROVIDER_JAR
-    ?? join(repoRoot, "app-server", "target", "ja-app-server.jar"));
+  const jar = resolve(
+    process.env.JA_REAL_PROVIDER_JAR ?? join(repoRoot, "app-server", "target", "ja-app-server.jar"),
+  );
   const metadata = await stat(jar);
   if (!metadata.isFile() || metadata.size === 0) {
     throw new Error("the production sidecar jar is missing or empty");
@@ -155,7 +251,10 @@ async function createPersistentDirectories() {
  */
 async function cleanupIsolatedDirectories(root) {
   const target = resolve(root);
-  if (dirname(target) !== resolve(tmpdir()) || !target.split(/[\\/]/).at(-1)?.startsWith(temporaryPrefix)) {
+  if (
+    dirname(target) !== resolve(tmpdir()) ||
+    !target.split(/[\\/]/).at(-1)?.startsWith(temporaryPrefix)
+  ) {
     throw new Error("refusing to clean a non-owned smoke directory");
   }
   await rm(target, { recursive: true, force: false });
@@ -180,7 +279,8 @@ function redact(value, secrets) {
 /** Extracts only bounded exception classes plus Ja-owned provider codes/details from redacted stderr. */
 function stderrDiagnosticSignals(value) {
   const signals = new Set();
-  const providerPattern = /provider_failure_code=([A-Z][A-Z0-9_]{1,63}) provider_failure_detail=([A-Za-z0-9 _.-]{1,160}) semantic_accepted=/gu;
+  const providerPattern =
+    /provider_failure_code=([A-Z][A-Z0-9_]{1,63}) provider_failure_detail=([A-Za-z0-9 _.-]{1,160}) semantic_accepted=/gu;
   for (const match of String(value ?? "").matchAll(providerPattern)) {
     signals.add(`${match[1]}:${match[2].replaceAll(" ", "_")}`);
     if (signals.size >= 24) return [...signals].join(",");
@@ -196,21 +296,66 @@ function stderrDiagnosticSignals(value) {
 
 /** Admits only a path-free, body-free terminal summary suitable for live smoke diagnostics. */
 function safeTerminalMessage(value) {
-  if (typeof value !== "string" || value.length === 0 || value.length > 256) return "NO_SAFE_MESSAGE";
+  if (typeof value !== "string" || value.length === 0 || value.length > 256)
+    return "NO_SAFE_MESSAGE";
   return /^[A-Za-z0-9 _-]+$/u.test(value) ? value : "UNSAFE_ERROR_MESSAGE";
 }
 
 /** Returns only the bounded JA-RPC method sequence for one Turn, without retaining event payloads. */
 function turnEventMethods(events, turnId) {
-  return events.filter((frame) => frame?.params?.turnId === turnId && typeof frame.method === "string")
-    .slice(-24).map((frame) => frame.method).join(",");
+  return events
+    .filter((frame) => frame?.params?.turnId === turnId && typeof frame.method === "string")
+    .slice(-24)
+    .map((frame) => frame.method)
+    .join(",");
+}
+
+/** 从完成终态读取非空答复；messageId 与 Turn 关联共同证明它不是临时 delta 或前序回合文本。 */
+export function committedTerminalReply(frame, turnId) {
+  const message = frame?.params?.finalMessage;
+  if (
+    frame?.method !== "turn/terminal" ||
+    frame.params?.turnId !== turnId ||
+    frame.params?.state !== "completed" ||
+    typeof message?.messageId !== "string" ||
+    message.messageId.trim().length === 0 ||
+    message.messageId.length > 256 ||
+    /[\0\r\n]/u.test(message.messageId) ||
+    typeof message.text !== "string" ||
+    message.text.trim().length === 0
+  )
+    return null;
+  return message.text;
+}
+
+/**
+ * 只从当前结构化 USER Message 契约读取文本块，避免 smoke 因沿用已删除的扁平 text 字段
+ * 误报持久化失败；附件或其它内容块不会被字符串化后参与匹配。
+ */
+export function userInputContainsText(item, expectedText) {
+  return (
+    item?.kind === "user_input" &&
+    typeof expectedText === "string" &&
+    expectedText.length > 0 &&
+    Array.isArray(item.content) &&
+    item.content.some(
+      (block) =>
+        block?.type === "text" &&
+        typeof block.text === "string" &&
+        block.text.includes(expectedText),
+    )
+  );
 }
 
 /** Returns only the bounded durable item-kind sequence, never message or Tool payload data. */
 function durableItemKinds(history) {
   if (!Array.isArray(history?.items)) return "unavailable";
-  return history.items.slice(-24).map((item) =>
-    typeof item?.kind === "string" && /^[a-z_]{1,48}$/u.test(item.kind) ? item.kind : "invalid").join(",");
+  return history.items
+    .slice(-24)
+    .map((item) =>
+      typeof item?.kind === "string" && /^[a-z_]{1,48}$/u.test(item.kind) ? item.kind : "invalid",
+    )
+    .join(",");
 }
 
 /** Scans only smoke-owned ordinary files under a fixed byte budget for a persisted credential. */
@@ -267,23 +412,38 @@ function withTimeout(promise, timeoutMs, label) {
  */
 export function requireRpcErrorCode(error) {
   const data = error?.data;
-  const hasRetryAfter = data !== null && typeof data === "object"
-    && Object.hasOwn(data, "retryAfterMs");
+  const hasRetryAfter =
+    data !== null && typeof data === "object" && Object.hasOwn(data, "retryAfterMs");
   const expectedErrorKeys = ["code", "data", "message"];
   const expectedDataKeys = hasRetryAfter
     ? ["category", "errorCode", "errorId", "retryAfterMs", "retryable"]
     : ["category", "errorCode", "errorId", "retryable"];
-  const catalogEntry = Number.isSafeInteger(error?.code) ? errorsByNumericCode.get(error.code) : undefined;
-  const validRetryAfter = !hasRetryAfter || (data.retryable === true
-    && Number.isSafeInteger(data.retryAfterMs) && data.retryAfterMs >= 1 && data.retryAfterMs <= 3_600_000);
-  if (data === null || typeof data !== "object" || Array.isArray(data)
-      || JSON.stringify(Object.keys(error).sort()) !== JSON.stringify(expectedErrorKeys)
-      || JSON.stringify(Object.keys(data).sort()) !== JSON.stringify(expectedDataKeys)
-      || typeof error.message !== "string" || error.message.length < 1 || error.message.length > 512
-      || catalogEntry === undefined || data.errorCode !== catalogEntry.errorCode
-      || !errorCategories.has(data.category) || data.category !== catalogEntry.category
-      || data.retryable !== catalogEntry.retryable || !errorIdPattern.test(data.errorId)
-      || !validRetryAfter) {
+  const catalogEntry = Number.isSafeInteger(error?.code)
+    ? errorsByNumericCode.get(error.code)
+    : undefined;
+  const validRetryAfter =
+    !hasRetryAfter ||
+    (data.retryable === true &&
+      Number.isSafeInteger(data.retryAfterMs) &&
+      data.retryAfterMs >= 1 &&
+      data.retryAfterMs <= 3_600_000);
+  if (
+    data === null ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    JSON.stringify(Object.keys(error).sort()) !== JSON.stringify(expectedErrorKeys) ||
+    JSON.stringify(Object.keys(data).sort()) !== JSON.stringify(expectedDataKeys) ||
+    typeof error.message !== "string" ||
+    error.message.length < 1 ||
+    error.message.length > 512 ||
+    catalogEntry === undefined ||
+    data.errorCode !== catalogEntry.errorCode ||
+    !errorCategories.has(data.category) ||
+    data.category !== catalogEntry.category ||
+    data.retryable !== catalogEntry.retryable ||
+    !errorIdPattern.test(data.errorId) ||
+    !validRetryAfter
+  ) {
     throw new Error("sidecar returned an invalid JA-RPC error contract");
   }
   return data.errorCode;
@@ -310,12 +470,9 @@ export class JsonlSession {
     delete childEnvironment.JA_REAL_PROVIDER_API_KEY;
     delete childEnvironment.JA_REAL_PROVIDER_BASE_URL;
     delete childEnvironment.JA_REAL_PROVIDER_MODEL;
-    delete childEnvironment.JA_REAL_PROVIDER_OPENAI_API_KEY;
-    delete childEnvironment.JA_REAL_PROVIDER_ANTHROPIC_API_KEY;
-    delete childEnvironment.JA_REAL_PROVIDER_OPENAI_BASE_URL;
-    delete childEnvironment.JA_REAL_PROVIDER_ANTHROPIC_BASE_URL;
-    delete childEnvironment.JA_REAL_PROVIDER_OPENAI_MODEL;
-    delete childEnvironment.JA_REAL_PROVIDER_ANTHROPIC_MODEL;
+    delete childEnvironment.JA_REAL_PROVIDER_NAME;
+    delete childEnvironment.JA_REAL_PROVIDER_API;
+    delete childEnvironment.JA_REAL_PROVIDER_REASONING_LEVEL;
     delete childEnvironment.JA_REAL_PROVIDER_AUTHORIZED;
     const args = [
       ...prefixArgs,
@@ -414,7 +571,13 @@ export class JsonlSession {
         this.waiters = this.waiters.filter((waiter) => waiter.timer !== timer);
         rejectEvent(new Error("required sidecar event timed out"));
       }, timeoutMs);
-      this.waiters.push({ method: undefined, predicate, resolve: resolveEvent, reject: rejectEvent, timer });
+      this.waiters.push({
+        method: undefined,
+        predicate,
+        resolve: resolveEvent,
+        reject: rejectEvent,
+        timer,
+      });
     });
   }
 
@@ -452,7 +615,9 @@ export class JsonlSession {
     }
     if (typeof frame?.method === "string") {
       if (frame.method === "host-tool/cancel") {
-        this.failProtocol(new Error("direct real-provider smoke does not execute reverse requests"));
+        this.failProtocol(
+          new Error("direct real-provider smoke does not execute reverse requests"),
+        );
         return;
       }
       this.events.push(frame);
@@ -460,7 +625,10 @@ export class JsonlSession {
         this.events.shift();
       }
       for (const waiter of [...this.waiters]) {
-        if ((waiter.method === undefined || waiter.method === frame.method) && waiter.predicate(frame)) {
+        if (
+          (waiter.method === undefined || waiter.method === frame.method) &&
+          waiter.predicate(frame)
+        ) {
           clearTimeout(waiter.timer);
           this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
           waiter.resolve(frame);
@@ -474,11 +642,17 @@ export class JsonlSession {
    * any server request here proves the direct Provider boundary has drifted.
    */
   acceptServerRequest(frame) {
-    const reverseRequest = typeof frame?.id === "string" && frame.id.startsWith("h:")
-      && frame.method === "host-tool/invoke";
-    this.failProtocol(new Error(reverseRequest
-      ? "direct real-provider smoke does not execute reverse requests"
-      : "unexpected sidecar server request"));
+    const reverseRequest =
+      typeof frame?.id === "string" &&
+      frame.id.startsWith("h:") &&
+      frame.method === "host-tool/invoke";
+    this.failProtocol(
+      new Error(
+        reverseRequest
+          ? "direct real-provider smoke does not execute reverse requests"
+          : "unexpected sidecar server request",
+      ),
+    );
   }
 
   /** Makes a protocol violation sticky so no later frame can revive the failed session. */
@@ -528,15 +702,23 @@ export class JsonlSession {
  * negotiating a subset with a stale sidecar.
  */
 export function assertDirectProviderCapabilities(capabilities) {
-  const expectedKeys = ["accessModes", "events", "methods"];
-  if (capabilities === null || typeof capabilities !== "object"
-      || JSON.stringify(Object.keys(capabilities).sort()) !== JSON.stringify(expectedKeys)) {
+  const expectedKeys = ["accessModes", "collaborationModes", "events", "features", "methods"];
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    JSON.stringify(Object.keys(capabilities).sort()) !== JSON.stringify(expectedKeys)
+  ) {
     throw new Error("direct provider capabilities have an invalid shape");
   }
-  if (JSON.stringify(capabilities.methods) !== JSON.stringify(methods)
-      || JSON.stringify(capabilities.events) !== JSON.stringify(events)
-      || JSON.stringify(capabilities.accessModes) !== JSON.stringify(["approval_required", "full_access"])) {
-    throw new Error("direct provider capabilities do not match JA-RPC v2");
+  if (
+    JSON.stringify(capabilities.methods) !== JSON.stringify(methods) ||
+    JSON.stringify(capabilities.events) !== JSON.stringify(events) ||
+    JSON.stringify(capabilities.accessModes) !==
+      JSON.stringify(["approval_required", "full_access"]) ||
+    JSON.stringify(capabilities.collaborationModes) !== JSON.stringify(["default", "plan"]) ||
+    JSON.stringify(capabilities.features) !== JSON.stringify(["task_threads_v1", "plan_goal_v1"])
+  ) {
+    throw new Error("direct provider capabilities do not match JA-RPC v1");
   }
   return capabilities;
 }
@@ -547,9 +729,11 @@ export function initializeParams() {
     methods: [...methods],
     events: [...events],
     accessModes: ["approval_required", "full_access"],
+    collaborationModes: ["default", "plan"],
+    features: ["task_threads_v1", "plan_goal_v1"],
   });
   return {
-    protocolMajor: 2,
+    protocolMajor: 1,
     protocolMinor: 0,
     clientVersion: "real-provider-smoke",
     capabilities,
@@ -562,54 +746,66 @@ export function initializeParams() {
       maxConcurrentTurns: 8,
       maxAdmittedTurns: 64,
       maxThreadQueuedTurns: 8,
+      maxTurnQueuedInputs: 8,
+      maxTurnQueuedInputBytes: 524_288,
       maxSnapshotPageItems: 200,
       maxToolBatchConcurrency: 8,
     },
   };
 }
 
-/** 构造完整的无 Secret Provider 配置；凭据字节只通过 credential/set 传输。 */
-export function providerConfigurationDocument({ endpoint, provider, api, model,
-  selectedProviderId = providerId, selectedModelId = modelId, revision = 0 }) {
-  const supported = (provider === "openai" && api === "openai_responses")
-    || (provider === "anthropic" && api === "anthropic_messages");
-  if (!supported) {
-    throw new Error("unsupported API for v3 provider document");
+/** 构造完整的无 Secret 自定义供应商配置；名称不参与路由，凭据字节只通过 credential/set 传输。 */
+export function providerConfigurationDocument({
+  endpoint,
+  name = "Authorized loopback provider",
+  api,
+  model,
+  selectedProviderId = providerId,
+  selectedModelId = modelId,
+  selectedCredentialId = credentialId,
+  reasoningLevel = "medium",
+  revision = 0,
+}) {
+  if (!new Set(["anthropic_messages", "openai_chat_completions", "openai_responses"]).has(api)) {
+    throw new Error("unsupported API specification for v1 provider document");
+  }
+  if (!reasoningLevels.has(reasoningLevel)) {
+    throw new Error("unsupported reasoning level for v1 provider document");
   }
   return {
-    schema_version: 3,
+    schema_version: 1,
     config_revision: revision,
     default_access_mode: "approval_required",
     default_provider_id: selectedProviderId,
     default_model_id: selectedModelId,
-    default_reasoning_effort: "high",
-    providers: [{
-      provider_id: selectedProviderId,
-      name: "Authorized loopback provider",
-      provider,
-      api,
-      base_url: endpoint,
-      credential_id: credentialId,
-      network_timeouts: { connect_timeout_ms: 5_000, request_timeout_ms: 120_000 },
-      agent_defaults: {
-        context: { auto_compact: true },
-        turn_limits: { max_model_rounds: 32, max_tool_calls: 128, wall_timeout_ms: 120_000 },
-        skill_ids: [],
-        mcp_ids: [],
-      },
-      models: [{
-        model_id: selectedModelId,
-        name: "Authorized loopback model",
-        model,
-        capabilities: {
-          context_window_tokens: 128_000,
-          max_output_tokens: 8_192,
-          input_modalities: ["text"],
+    default_reasoning_level: reasoningLevel,
+    providers: [
+      {
+        provider_id: selectedProviderId,
+        name,
+        api,
+        base_url: endpoint,
+        credential_id: selectedCredentialId,
+        network_timeouts: { connect_timeout_ms: 5_000, request_timeout_ms: 120_000 },
+        agent_defaults: {
+          context: { auto_compact: true },
+          turn_limits: { max_model_rounds: 32, max_tool_calls: 128, wall_timeout_ms: 120_000 },
         },
-        reasoning_efforts: ["low", "medium", "high"],
-        default_reasoning_effort: "high",
-      }],
-    }],
+        models: [
+          {
+            model_id: selectedModelId,
+            name: "Authorized loopback model",
+            model,
+            capabilities: {
+              context_window_tokens: 128_000,
+              max_output_tokens: 8_192,
+            },
+            reasoning_level_map: { [reasoningLevel]: reasoningLevel },
+            default_reasoning_level: reasoningLevel,
+          },
+        ],
+      },
+    ],
     mcp_servers: [],
     skills: [],
   };
@@ -620,8 +816,10 @@ export function providerConfigurationDocument({ endpoint, provider, api, model,
  * only the explicitly selected smoke provider in the authoritative document.
  */
 function persistentConfigurationDocument(current, selected) {
-  const base = current !== null && typeof current === "object" && !Array.isArray(current)
-    ? current : providerConfigurationDocument(selected);
+  const base =
+    current !== null && typeof current === "object" && !Array.isArray(current)
+      ? current
+      : providerConfigurationDocument(selected);
   const selectedDocument = providerConfigurationDocument({
     ...selected,
     revision: Number.isSafeInteger(base.config_revision) ? base.config_revision + 1 : 0,
@@ -631,34 +829,82 @@ function persistentConfigurationDocument(current, selected) {
     : [];
   return {
     ...base,
-    schema_version: 3,
+    schema_version: 1,
     config_revision: selectedDocument.config_revision,
-    default_access_mode: base.default_access_mode === "full_access" ? "full_access" : "approval_required",
+    default_access_mode:
+      base.default_access_mode === "full_access" ? "full_access" : "approval_required",
     default_provider_id: selected.selectedProviderId,
     default_model_id: selected.selectedModelId,
-    default_reasoning_effort: "high",
+    default_reasoning_level: selected.reasoningLevel,
     providers: [...providers, selectedDocument.providers[0]],
     mcp_servers: Array.isArray(base.mcp_servers) ? base.mcp_servers : [],
     skills: Array.isArray(base.skills) ? base.skills : [],
   };
 }
 
-/** Builds the only Tool turn accepted by this gate: a read plus an explicitly approved shell echo. */
+/** 构造 Read + Shell 验收，但让模型仅依据注入环境自行选择 Shell 方言。 */
 export function providerToolTurnInput({ inputPath, inputMarker, shellMarker, finalMarker }) {
   for (const value of [inputPath, inputMarker, shellMarker, finalMarker]) {
-    if (typeof value !== "string" || value.length === 0 || value.length > 256
-        || /[\r\n]/u.test(value)) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      value.length > 256 ||
+      /[\r\n]/u.test(value)
+    ) {
       throw new Error("provider Tool fixture values are invalid");
     }
   }
-  const shellCommand = process.platform === "win32"
-    ? `Write-Output '${shellMarker}'`
-    : `printf '%s\\n' '${shellMarker}'`;
   return [
     "Use exactly two built-in tools in this order and no others.",
     `First call read with the JSON arguments {"path":"${inputPath}"}; the file content must contain ${inputMarker}.`,
-    `Then call shell with the JSON arguments ${JSON.stringify({ command: shellCommand })}; wait for the human approval request and do not substitute another command.`,
+    `Then call shell exactly once. Determine its command dialect only from the injected execution environment and the shell tool description. Use that dialect's native output primitive, not a cross-shell alias, to write exactly ${shellMarker} to stdout. Wait for the human approval request before execution.`,
     `After both Tool results, reply with exactly ${finalMarker} and no other text.`,
+  ].join(" ");
+}
+
+/**
+ * 证明 Windows 模型调用确实遵循注入的 PowerShell 方言，而不是恰好执行 Bash 也支持的
+ * 通用命令；只检查脱敏后的持久 command，不读取 Provider 请求或原始参数。
+ */
+export function assertWindowsPowerShellSelection(history, turnId, shellMarker) {
+  const shell = history?.items?.find(
+    (item) => item.kind === "tool_call" && item.turnId === turnId && item.toolName === "shell",
+  );
+  const command = shell?.presentation?.command;
+  const powerShellPrimitive =
+    /\b(?:Write-Output|Write-Host|Out-String|Select-Object|Get-ChildItem)\b|\$PSVersionTable|\[Console\]::Write(?:Line)?/iu;
+  const posixPrimitive = /\b(?:printf|head|tail|grep|sed|awk)\b/iu;
+  if (
+    shell?.presentation?.kind !== "shell" ||
+    typeof command !== "string" ||
+    !command.includes(shellMarker) ||
+    !powerShellPrimitive.test(command) ||
+    posixPrimitive.test(command)
+  ) {
+    throw new Error("model did not select the injected Windows PowerShell dialect");
+  }
+  return "powershell";
+}
+
+/** 构造一个确定失败的本机 Shell 调用，模型必须消费稳定错误后给出唯一最终回复。 */
+export function providerFailingToolTurnInput({ shellMarker }) {
+  if (
+    typeof shellMarker !== "string" ||
+    shellMarker.length === 0 ||
+    shellMarker.length > 256 ||
+    /[\r\n]/u.test(shellMarker)
+  ) {
+    throw new Error("provider failing Tool fixture value is invalid");
+  }
+  const shellCommand =
+    process.platform === "win32"
+      ? `Write-Error '${shellMarker}'; exit 23`
+      : `printf '%s\n' '${shellMarker}' >&2; exit 23`;
+  return [
+    "Use exactly one built-in tool and do not use any other tool.",
+    `Call shell with the JSON arguments ${JSON.stringify({ command: shellCommand })}.`,
+    "The command is expected to fail. After receiving its Tool result, do not retry or call another tool.",
+    "Give one concise user-visible final reply explaining that the command failed and what the user can do next.",
   ].join(" ");
 }
 
@@ -669,11 +915,19 @@ export function collectToolEvidence(events, turnId) {
   }
   const toolNames = new Map();
   for (const frame of events) {
-    if (frame?.method !== "assistant/model-step-committed" || frame.params?.turnId !== turnId
-        || !Array.isArray(frame.params.toolCalls)) continue;
+    if (
+      frame?.method !== "assistant/model-step-committed" ||
+      frame.params?.turnId !== turnId ||
+      !Array.isArray(frame.params.toolCalls)
+    )
+      continue;
     for (const call of frame.params.toolCalls) {
-      if (typeof call?.callId !== "string" || !call.callId.startsWith("call_")
-          || typeof call.toolName !== "string" || call.toolName.length === 0) {
+      if (
+        typeof call?.callId !== "string" ||
+        !call.callId.startsWith("call_") ||
+        typeof call.toolName !== "string" ||
+        call.toolName.length === 0
+      ) {
         throw new Error("assistant/model-step-committed contained an invalid Tool call projection");
       }
       toolNames.set(call.callId, call.toolName);
@@ -687,8 +941,12 @@ export function collectToolEvidence(events, turnId) {
     }
     for (const result of frame.params.results) {
       const toolName = toolNames.get(result?.callId);
-      if (typeof result?.callId !== "string" || !result.callId.startsWith("call_")
-          || typeof toolName !== "string" || typeof result.outcome !== "string") {
+      if (
+        typeof result?.callId !== "string" ||
+        !result.callId.startsWith("call_") ||
+        typeof toolName !== "string" ||
+        typeof result.outcome !== "string"
+      ) {
         throw new Error("tool/batch-committed contained an invalid Tool projection");
       }
       evidence.push({
@@ -702,10 +960,18 @@ export function collectToolEvidence(events, turnId) {
   return evidence;
 }
 
-/** Waits for read and approved-shell evidence, failing immediately if the Turn reaches another terminal state. */
-async function waitForRequiredToolEvidence(session, turnId, timeoutMs = requestTimeoutMs) {
+/** 等待精确 Tool 顺序与结果闭集；任何提前终态、额外调用或结果漂移都立即失败。 */
+async function waitForRequiredToolEvidence(
+  session,
+  turnId,
+  expected = ["read", "shell"],
+  expectedOutcomes = ["succeeded", "succeeded"],
+  timeoutMs = requestTimeoutMs,
+) {
   const deadline = Date.now() + timeoutMs;
-  const expected = ["read", "shell"];
+  if (expected.length === 0 || expected.length !== expectedOutcomes.length) {
+    throw new Error("expected Tool evidence is invalid");
+  }
   while (Date.now() < deadline) {
     const evidence = collectToolEvidence(session.events, turnId);
     const names = evidence.map((entry) => entry.toolName);
@@ -713,62 +979,215 @@ async function waitForRequiredToolEvidence(session, turnId, timeoutMs = requestT
       throw new Error("provider Tool turn invoked an unexpected Tool or order");
     }
     if (names.length === expected.length) {
-      if (evidence.some((entry) => entry.outcome !== "succeeded")) {
-        throw new Error("provider Tool turn did not complete every required Tool");
+      if (evidence.some((entry, index) => entry.outcome !== expectedOutcomes[index])) {
+        throw new Error("provider Tool turn outcomes did not match the required sequence");
       }
       return evidence;
     }
     const observedCallIds = new Set(evidence.map((entry) => entry.callId));
     const remaining = Math.max(1, deadline - Date.now());
-    const event = await session.waitForAnyEvent((frame) =>
-      frame.params?.turnId === turnId
-        && (frame?.method === "turn/terminal"
-          || (frame?.method === "tool/batch-committed" && Array.isArray(frame.params?.results)
-            && frame.params.results.some((result) => !observedCallIds.has(result?.callId)))), remaining);
+    const event = await session.waitForAnyEvent(
+      (frame) =>
+        frame.params?.turnId === turnId &&
+        (frame?.method === "turn/terminal" ||
+          (frame?.method === "tool/batch-committed" &&
+            Array.isArray(frame.params?.results) &&
+            frame.params.results.some((result) => !observedCallIds.has(result?.callId)))),
+      remaining,
+    );
     if (event.method === "turn/terminal") {
-      throw new Error(`provider Tool turn ended before required Tools: ${event.params?.state ?? "unknown"}`);
+      throw new Error(
+        `provider Tool turn ended before required Tools: ${event.params?.state ?? "unknown"}`,
+      );
     }
   }
   throw new Error("provider Tool evidence timed out");
 }
 
-/** Verifies that the durable Thread projection contains both Tool pairs and the committed approval decision. */
-export function assertDurableToolHistory(history, threadId, turnId, approvalId) {
-  if (history?.threadId !== threadId || !Number.isSafeInteger(history.revision)
-      || !Array.isArray(history.items)) {
-    throw new Error("thread/read did not return a durable snapshot");
+/** 等待并提交一个精确 Tool 审批；所有公开字段先校验，随后才允许产生执行副作用。 */
+async function approveExpectedTool(session, turnId, expectedToolName, handledApprovalIds) {
+  const approvalOrTerminal = await session.waitForAnyEvent(
+    (frame) =>
+      frame.params?.turnId === turnId &&
+      (frame?.method === "turn/terminal" ||
+        (frame?.method === "approval/requested" &&
+          !handledApprovalIds.has(frame.params?.approvalId))),
+    requestTimeoutMs,
+  );
+  if (approvalOrTerminal.method === "turn/terminal") {
+    let historyKinds = "unavailable";
+    try {
+      historyKinds = durableItemKinds(
+        assertRpcSuccess(
+          await session.request("thread/read", {
+            threadId: approvalOrTerminal.params?.threadId,
+            cursor: null,
+            limit: 200,
+          }),
+          "thread/read failed Tool turn",
+        ),
+      );
+    } catch {
+      // The original terminal remains primary; history diagnostics must never hide it.
+    }
+    throw new Error(
+      `provider Tool turn ended before all approvals: ${approvalOrTerminal.params?.state ?? "unknown"}` +
+        ` with ${approvalOrTerminal.params?.errorCode ?? "UNKNOWN_ERROR"}` +
+        ` ${safeTerminalMessage(approvalOrTerminal.params?.errorMessage)}` +
+        ` events=${turnEventMethods(session.events, turnId)}` +
+        ` history=${historyKinds}`,
+    );
   }
-  const calls = history.items.filter((item) => item.kind === "tool_call");
-  const results = history.items.filter((item) => item.kind === "tool_result");
-  const names = [...calls, ...results].map((item) => item.toolName);
-  if (calls.length !== 2 || results.length !== 2
-      || JSON.stringify(names) !== JSON.stringify(["read", "shell", "read", "shell"])) {
-    throw new Error("thread/read did not persist the required Tool call/result pairs");
+  const approval = approvalOrTerminal.params;
+  if (
+    typeof approval?.approvalId !== "string" ||
+    !approval.approvalId.startsWith("appr_") ||
+    typeof approval.callId !== "string" ||
+    !approval.callId.startsWith("call_") ||
+    approval.toolName !== expectedToolName ||
+    typeof approval.reason !== "string" ||
+    typeof approval.expiresAt !== "string" ||
+    !Number.isSafeInteger(approval.threadRevision)
+  ) {
+    throw new Error(
+      `provider Tool approval had an invalid v1 projection ${JSON.stringify({
+        approvalId:
+          typeof approval?.approvalId === "string" && approval.approvalId.startsWith("appr_"),
+        callId: typeof approval?.callId === "string" && approval.callId.startsWith("call_"),
+        tool: approval?.toolName === expectedToolName,
+        reason: typeof approval?.reason === "string",
+        expiresAt: typeof approval?.expiresAt === "string",
+        threadRevision: Number.isSafeInteger(approval?.threadRevision),
+      })}`,
+    );
   }
-  if (calls.some((item) => typeof item.callId !== "string" || !item.callId.startsWith("call_"))
-      || results.some((item) => typeof item.callId !== "string" || !item.callId.startsWith("call_"))
-      || calls.some((item, index) => item.callId !== results[index].callId)) {
-    throw new Error("thread/read did not preserve Tool call/result correlation");
+  handledApprovalIds.add(approval.approvalId);
+  const approvalResponse = assertRpcSuccess(
+    await session.request("approval/respond", {
+      approvalId: approval.approvalId,
+      turnId,
+      decision: "approve",
+      expectedThreadRevision: approval.threadRevision,
+    }),
+    "approval/respond",
+  );
+  if (
+    approvalResponse?.accepted !== true ||
+    approvalResponse.approvalId !== approval.approvalId ||
+    approvalResponse.turnId !== turnId ||
+    approvalResponse.decision !== "approve" ||
+    !Number.isSafeInteger(approvalResponse.threadRevision)
+  ) {
+    throw new Error("approval/respond returned an invalid committed projection");
   }
-  const approval = history.items.find((item) => item.kind === "approval"
-    && item.approvalId === approvalId && item.turnId === turnId);
-  if (approval?.decision !== "approve") {
-    throw new Error("thread/read did not persist the approved shell decision");
+  const resolved = await session.waitForEvent(
+    "approval/resolved",
+    (frame) => frame.params?.turnId === turnId && frame.params?.approvalId === approval.approvalId,
+  );
+  if (resolved.params?.decision !== "approve") {
+    throw new Error("provider Tool approval resolved with an unexpected decision");
   }
-  return { items: history.items.length, toolCalls: calls.length, toolResults: results.length };
+  return approval;
 }
 
-/** Starts one sanitized production child and completes the v2 ready handshake before returning it. */
+/**
+ * 按 Turn 身份验证规范 Tool 终态、审批与最终回复，避免同一 Thread 后续 Tool 污染恢复断言。
+ * expectation 使用显式闭集而非兼容猜测，使成功与失败 Tool 共享同一条持久化门禁。
+ */
+export function assertDurableToolHistory(history, threadId, turnId, approvalId, expectation = {}) {
+  if (
+    history?.threadId !== threadId ||
+    !Number.isSafeInteger(history.revision) ||
+    !Array.isArray(history.items)
+  ) {
+    throw new Error("thread/read did not return a durable snapshot");
+  }
+  const expectedCalls = expectation.calls ?? [
+    { toolName: "read", status: "success" },
+    { toolName: "shell", status: "success" },
+  ];
+  if (
+    !Array.isArray(expectedCalls) ||
+    expectedCalls.length === 0 ||
+    expectedCalls.some(
+      (call) =>
+        typeof call?.toolName !== "string" ||
+        !new Set(["success", "error", "cancelled"]).has(call.status) ||
+        (Object.hasOwn(call, "exitCode") && !Number.isSafeInteger(call.exitCode)),
+    )
+  ) {
+    throw new Error("durable Tool expectation is invalid");
+  }
+  const calls = history.items.filter((item) => item.kind === "tool_call" && item.turnId === turnId);
+  if (
+    calls.length !== expectedCalls.length ||
+    calls.some((item, index) => {
+      const expected = expectedCalls[index];
+      return (
+        item.toolName !== expected.toolName ||
+        item?.presentation?.status !== expected.status ||
+        (Object.hasOwn(expected, "exitCode") && item?.presentation?.exitCode !== expected.exitCode)
+      );
+    })
+  ) {
+    throw new Error("thread/read did not persist the required Turn-scoped Tool presentations");
+  }
+  if (calls.some((item) => typeof item.callId !== "string" || !item.callId.startsWith("call_"))) {
+    throw new Error("thread/read did not preserve Tool call identities");
+  }
+  const approval = history.items.find(
+    (item) => item.kind === "approval" && item.approvalId === approvalId && item.turnId === turnId,
+  );
+  if (
+    approval?.decision !== "approve" ||
+    !calls.some((call) => call.callId === approval.callId && call.toolName === approval.toolName)
+  ) {
+    throw new Error("thread/read did not persist the approved shell decision");
+  }
+  if (
+    expectation.finalText !== undefined &&
+    (typeof expectation.finalText !== "string" ||
+      expectation.finalText.trim().length === 0 ||
+      !history.items.some(
+        (item) =>
+          item.kind === "final_answer" &&
+          item.turnId === turnId &&
+          item.text === expectation.finalText,
+      ))
+  ) {
+    throw new Error("thread/read did not persist the exact committed Tool Turn reply");
+  }
+  return {
+    items: history.items.length,
+    toolCalls: calls.length,
+    successfulTools: calls.filter((item) => item.presentation.status === "success").length,
+    failedTools: calls.filter((item) => item.presentation.status === "error").length,
+  };
+}
+
+/** Starts one sanitized production child and completes the v1 ready handshake before returning it. */
 async function startProductionSession({ command, prefixArgs, directories, apiKey, endpoint }) {
   const session = new JsonlSession({ command, prefixArgs, directories, apiKey, endpoint });
   try {
-    const initialized = assertRpcSuccess(await session.request("runtime/initialize", initializeParams()), "runtime/initialize");
-    if (initialized?.runtime?.engine !== "ja-kernel" || typeof initialized?.runtime?.engineVersion !== "string") {
+    const initialized = assertRpcSuccess(
+      await session.request("runtime/initialize", initializeParams()),
+      "runtime/initialize",
+    );
+    if (
+      initialized?.runtime?.engine !== "ja-kernel" ||
+      typeof initialized?.runtime?.engineVersion !== "string"
+    ) {
       throw new Error("sidecar did not start as the Ja Kernel production runtime");
     }
     session.notifyInitialized();
-    await session.waitForEvent("runtime/status-changed", (frame) => frame.params?.status === "ready"
-      && frame.params?.readyToken === readyToken && frame.params?.generation > 0, 20_000);
+    await session.waitForEvent(
+      "runtime/status-changed",
+      (frame) =>
+        frame.params?.status === "ready" &&
+        frame.params?.readyToken === readyToken &&
+        frame.params?.generation > 0,
+      20_000,
+    );
     return { session, initialized };
   } catch (error) {
     await session.forceClose();
@@ -781,19 +1200,9 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   if (process.env.JA_REAL_PROVIDER_AUTHORIZED !== "1") {
     throw new Error("JA_REAL_PROVIDER_AUTHORIZED=1 is required for paid provider traffic");
   }
-  const provider = (process.env.JA_REAL_PROVIDER_PROVIDER ?? "openai").trim();
-  if (provider !== "openai" && provider !== "anthropic") {
-    throw new Error("JA_REAL_PROVIDER_PROVIDER must be openai or anthropic");
-  }
-  const apiKeyName = provider === "openai"
-    ? "JA_REAL_PROVIDER_OPENAI_API_KEY"
-    : "JA_REAL_PROVIDER_ANTHROPIC_API_KEY";
-  const endpointName = provider === "openai"
-    ? "JA_REAL_PROVIDER_OPENAI_BASE_URL"
-    : "JA_REAL_PROVIDER_ANTHROPIC_BASE_URL";
-  const modelName = provider === "openai"
-    ? "JA_REAL_PROVIDER_OPENAI_MODEL"
-    : "JA_REAL_PROVIDER_ANTHROPIC_MODEL";
+  const apiKeyName = "JA_REAL_PROVIDER_API_KEY";
+  const endpointName = "JA_REAL_PROVIDER_BASE_URL";
+  const modelName = "JA_REAL_PROVIDER_MODEL";
   const apiKey = requiredEnvironment(apiKeyName);
   if (apiKey.length > 8_192 || containsAsciiControl(apiKey)) {
     throw new Error(`${apiKeyName} is invalid`);
@@ -801,21 +1210,25 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   // Minimize the inheritance window before any child is created; the local
   // variable remains available only for the correlated stdin response.
   delete process.env.JA_REAL_PROVIDER_API_KEY;
-  delete process.env.JA_REAL_PROVIDER_OPENAI_API_KEY;
-  delete process.env.JA_REAL_PROVIDER_ANTHROPIC_API_KEY;
   const endpoint = validatedLoopbackBaseUrl(requiredEnvironment(endpointName), endpointName);
-  const defaultApi = provider === "openai" ? "openai_responses" : "anthropic_messages";
-  const api = (process.env.JA_REAL_PROVIDER_API ?? defaultApi).trim();
-  const validApis = provider === "openai"
-    ? new Set(["openai_responses"])
-    : new Set(["anthropic_messages"]);
-  if (!validApis.has(api)) {
-    throw new Error("JA_REAL_PROVIDER_API does not match JA_REAL_PROVIDER_PROVIDER");
+  const name = (process.env.JA_REAL_PROVIDER_NAME ?? "Authorized loopback provider").trim();
+  delete process.env.JA_REAL_PROVIDER_NAME;
+  if (name.length === 0 || name.length > 512 || containsAsciiControl(name)) {
+    throw new Error("JA_REAL_PROVIDER_NAME is invalid");
+  }
+  const api = (process.env.JA_REAL_PROVIDER_API ?? "openai_responses").trim();
+  if (!new Set(["anthropic_messages", "openai_chat_completions", "openai_responses"]).has(api)) {
+    throw new Error("JA_REAL_PROVIDER_API is unsupported");
   }
   delete process.env.JA_REAL_PROVIDER_API;
   const model = process.env[modelName]?.trim() ?? "";
   if (model.length === 0 || model.length > 128 || /[\r\n]/u.test(model)) {
     throw new Error(`${modelName} is invalid`);
+  }
+  const reasoningLevel = (process.env.JA_REAL_PROVIDER_REASONING_LEVEL ?? "medium").trim();
+  delete process.env.JA_REAL_PROVIDER_REASONING_LEVEL;
+  if (!reasoningLevels.has(reasoningLevel)) {
+    throw new Error("JA_REAL_PROVIDER_REASONING_LEVEL is unsupported");
   }
   const persistent = process.env.JA_REAL_PROVIDER_PERSIST_HOME === "1";
   delete process.env.JA_REAL_PROVIDER_PERSIST_HOME;
@@ -840,50 +1253,84 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   try {
     ({ session, initialized } = await startProductionSession(launch));
 
-    const configuration = assertRpcSuccess(await session.request("configuration/read", {}), "configuration/read");
-    if (!persistent && (configuration?.user?.version !== "cfg_missing"
-        || configuration?.credentialVersion !== "cfg_missing")) {
+    const configuration = assertRpcSuccess(
+      await session.request("configuration/read", {}),
+      "configuration/read",
+    );
+    if (
+      !persistent &&
+      (configuration?.cas?.userVersion !== "cfg_missing" ||
+        configuration?.cas?.credentialVersion !== "cfg_missing")
+    ) {
       throw new Error("fresh smoke home did not report missing configuration generations");
     }
-    const selectedConfiguration = { endpoint, provider, api, model, selectedProviderId, selectedModelId };
+    const selectedConfiguration = {
+      endpoint,
+      name,
+      api,
+      model,
+      reasoningLevel,
+      selectedProviderId,
+      selectedModelId,
+    };
     const document = persistent
       ? persistentConfigurationDocument(configuration?.user?.document, selectedConfiguration)
       : providerConfigurationDocument(selectedConfiguration);
-    const configured = assertRpcSuccess(await session.request("configuration/replace", {
-      scope: "user",
-      expectedVersion: configuration.user.version,
-      document,
-    }), "configuration/replace");
-    if (configured?.accepted !== true || configured?.scope !== "user"
-        || typeof configured?.version !== "string") {
+    const configured = assertRpcSuccess(
+      await session.request("configuration/replace", {
+        scope: "user",
+        expectedVersion: configuration.cas.userVersion,
+        document,
+      }),
+      "configuration/replace",
+    );
+    if (
+      configured?.accepted !== true ||
+      configured?.scope !== "user" ||
+      typeof configured?.version !== "string"
+    ) {
       throw new Error("configuration/replace returned an invalid result");
     }
-    const credential = assertRpcSuccess(await session.request("credential/set", {
-      credentialId,
-      secret: apiKey,
-      expectedVersion: configuration.credentialVersion,
-    }), "credential/set");
-    if (credential?.accepted !== true || credential?.credentialId !== credentialId
-        || credential?.configured !== true || typeof credential?.version !== "string") {
+    const credential = assertRpcSuccess(
+      await session.request("credential/set", {
+        credentialId,
+        secret: apiKey,
+        expectedVersion: configuration.cas.credentialVersion,
+      }),
+      "credential/set",
+    );
+    if (
+      credential?.accepted !== true ||
+      credential?.credentialId !== credentialId ||
+      credential?.configured !== true ||
+      typeof credential?.version !== "string"
+    ) {
       throw new Error("credential/set returned an invalid redacted projection");
     }
 
-    const workspace = assertRpcSuccess(await session.request("workspace/open", {
-      cwd: directories.workspace,
-      displayName: "Real provider smoke",
-    }), "workspace/open");
+    const workspace = assertRpcSuccess(
+      await session.request("workspace/open", {
+        cwd: directories.workspace,
+        displayName: "Real provider smoke",
+      }),
+      "workspace/open",
+    );
     if (typeof workspace?.workspaceId !== "string" || !workspace.workspaceId.startsWith("ws_")) {
       throw new Error("workspace/open returned an invalid workspace identity");
     }
 
-    const created = assertRpcSuccess(await session.request("thread/create", {
-      cwd: directories.workspace,
-      title: "Real provider smoke",
-      providerId: selectedProviderId,
-      modelId: selectedModelId,
-      reasoningEffort: "high",
-      accessMode: "approval_required",
-    }), "thread/create");
+    const created = assertRpcSuccess(
+      await session.request("thread/create", {
+        cwd: directories.workspace,
+        title: "Real provider smoke",
+        providerId: selectedProviderId,
+        modelId: selectedModelId,
+        reasoningLevel,
+        accessMode: "approval_required",
+        collaborationMode: "default",
+      }),
+      "thread/create",
+    );
     const threadId = created?.threadId;
     if (typeof threadId !== "string" || !threadId.startsWith("thr_")) {
       throw new Error("thread/create returned an invalid thread identity");
@@ -892,27 +1339,39 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       throw new Error("thread/create did not retain Java's workspace identity");
     }
     const textMarker = `JA_REAL_PROVIDER_TEXT_${Date.now().toString(36)}`;
-    const textAccepted = assertRpcSuccess(await session.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: `Reply with exactly ${textMarker}. Do not call tools.` }],
-    }), "turn/start");
+    const textAccepted = assertRpcSuccess(
+      await session.request("turn/start", {
+        threadId,
+        content: [{ type: "text", text: `Reply with exactly ${textMarker}. Do not call tools.` }],
+      }),
+      "turn/start",
+    );
     const textTurnId = textAccepted?.turnId;
     if (typeof textTurnId !== "string" || !textTurnId.startsWith("turn_")) {
       throw new Error("text turn/start returned an invalid turn identity");
     }
-    const textTerminal = await session.waitForEvent("turn/terminal", (frame) => frame.params?.turnId === textTurnId);
+    const textTerminal = await session.waitForEvent(
+      "turn/terminal",
+      (frame) => frame.params?.turnId === textTurnId,
+    );
     if (textTerminal.params?.state !== "completed") {
       // Only the closed error code is safe to expose here; Provider messages and stderr remain
       // bounded inside the smoke so a failed live call cannot turn diagnostics into a body leak.
-      throw new Error(`real provider text turn ended as ${textTerminal.params?.state ?? "unknown"}`
-        + ` with ${textTerminal.params?.errorCode ?? "UNKNOWN_ERROR"}`
-        + ` ${safeTerminalMessage(textTerminal.params?.errorMessage)}`
-        + ` events=${turnEventMethods(session.events, textTurnId)}`);
+      throw new Error(
+        `real provider text turn ended as ${textTerminal.params?.state ?? "unknown"}` +
+          ` with ${textTerminal.params?.errorCode ?? "UNKNOWN_ERROR"}` +
+          ` ${safeTerminalMessage(textTerminal.params?.errorMessage)}` +
+          ` events=${turnEventMethods(session.events, textTurnId)}`,
+      );
     }
-    const textTerminalCount = session.events.filter((frame) => frame.method === "turn/terminal"
-      && frame.params?.turnId === textTurnId).length;
-    if (textTerminalCount !== 1 || !JSON.stringify(session.events).includes(textMarker)) {
-      throw new Error("real provider text stream did not publish one marker-bearing terminal turn");
+    const textTerminalCount = session.events.filter(
+      (frame) => frame.method === "turn/terminal" && frame.params?.turnId === textTurnId,
+    ).length;
+    const textFinalReply = committedTerminalReply(textTerminal, textTurnId);
+    if (textTerminalCount !== 1 || textFinalReply === null) {
+      throw new Error(
+        "real provider text stream did not publish one committed non-empty terminal reply",
+      );
     }
 
     const inputPath = `provider-tool-input-${Date.now().toString(36)}.txt`;
@@ -924,12 +1383,23 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       encoding: "utf8",
       flag: "wx",
     });
-    const toolAccepted = assertRpcSuccess(await session.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: providerToolTurnInput({
-        inputPath, inputMarker, shellMarker, finalMarker: toolFinalMarker,
-      }) }],
-    }), "turn/start Tool");
+    const toolAccepted = assertRpcSuccess(
+      await session.request("turn/start", {
+        threadId,
+        content: [
+          {
+            type: "text",
+            text: providerToolTurnInput({
+              inputPath,
+              inputMarker,
+              shellMarker,
+              finalMarker: toolFinalMarker,
+            }),
+          },
+        ],
+      }),
+      "turn/start Tool",
+    );
     const toolTurnId = toolAccepted?.turnId;
     if (typeof toolTurnId !== "string" || !toolTurnId.startsWith("turn_")) {
       throw new Error("Tool turn/start returned an invalid turn identity");
@@ -937,80 +1407,135 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const approvedTools = [];
     const handledApprovalIds = new Set();
     for (const expectedToolName of ["read", "shell"]) {
-      const approvalOrTerminal = await session.waitForAnyEvent((frame) =>
-        frame.params?.turnId === toolTurnId
-          && (frame?.method === "turn/terminal"
-            || (frame?.method === "approval/requested"
-              && !handledApprovalIds.has(frame.params?.approvalId))), requestTimeoutMs);
-      if (approvalOrTerminal.method === "turn/terminal") {
-        let historyKinds = "unavailable";
-        try {
-          historyKinds = durableItemKinds(assertRpcSuccess(await session.request("thread/read", {
-            threadId, cursor: null, limit: 200,
-          }), "thread/read failed Tool turn"));
-        } catch {
-          // The original terminal remains primary; history diagnostics must never hide it.
-        }
-        throw new Error(`provider Tool turn ended before all approvals: ${approvalOrTerminal.params?.state ?? "unknown"}`
-          + ` with ${approvalOrTerminal.params?.errorCode ?? "UNKNOWN_ERROR"}`
-          + ` ${safeTerminalMessage(approvalOrTerminal.params?.errorMessage)}`
-          + ` events=${turnEventMethods(session.events, toolTurnId)}`
-          + ` history=${historyKinds}`);
-      }
-      const approval = approvalOrTerminal.params;
-      if (typeof approval?.approvalId !== "string" || !approval.approvalId.startsWith("appr_")
-          || typeof approval.callId !== "string" || !approval.callId.startsWith("call_")
-          || approval.toolName !== expectedToolName || typeof approval.reason !== "string"
-          || typeof approval.expiresAt !== "string" || !Number.isSafeInteger(approval.threadRevision)) {
-        throw new Error(`provider Tool approval had an invalid v2 projection ${JSON.stringify({
-          approvalId: typeof approval?.approvalId === "string" && approval.approvalId.startsWith("appr_"),
-          callId: typeof approval?.callId === "string" && approval.callId.startsWith("call_"),
-          tool: approval?.toolName === expectedToolName,
-          reason: typeof approval?.reason === "string",
-          expiresAt: typeof approval?.expiresAt === "string",
-          threadRevision: Number.isSafeInteger(approval?.threadRevision),
-        })}`);
-      }
-      handledApprovalIds.add(approval.approvalId);
-      const approvalResponse = assertRpcSuccess(await session.request("approval/respond", {
-        approvalId: approval.approvalId,
-        turnId: toolTurnId,
-        decision: "approve",
-        expectedThreadRevision: approval.threadRevision,
-      }), "approval/respond");
-      if (approvalResponse?.accepted !== true || approvalResponse.approvalId !== approval.approvalId
-          || approvalResponse.turnId !== toolTurnId || approvalResponse.decision !== "approve"
-          || !Number.isSafeInteger(approvalResponse.threadRevision)) {
-        throw new Error("approval/respond returned an invalid committed projection");
-      }
-      const resolved = await session.waitForEvent("approval/resolved", (frame) =>
-        frame.params?.turnId === toolTurnId && frame.params?.approvalId === approval.approvalId);
-      if (resolved.params?.decision !== "approve") {
-        throw new Error("provider Tool approval resolved with an unexpected decision");
-      }
-      approvedTools.push(approval);
+      approvedTools.push(
+        await approveExpectedTool(session, toolTurnId, expectedToolName, handledApprovalIds),
+      );
     }
     const shellApproval = approvedTools.find((approval) => approval.toolName === "shell");
     const toolEvidence = await waitForRequiredToolEvidence(session, toolTurnId);
     const readEvidence = toolEvidence.find((entry) => entry.toolName === "read");
     const shellEvidence = toolEvidence.find((entry) => entry.toolName === "shell");
     const toolEventsJson = JSON.stringify(session.events);
-    if (readEvidence === undefined || shellEvidence === undefined
-        || !toolEventsJson.includes(inputMarker) || !toolEventsJson.includes(shellMarker)) {
+    if (
+      readEvidence === undefined ||
+      shellEvidence === undefined ||
+      !toolEventsJson.includes(inputMarker) ||
+      !toolEventsJson.includes(shellMarker)
+    ) {
       throw new Error("provider Tool results did not prove the bounded fixture inputs");
     }
-    const toolTerminal = await session.waitForEvent("turn/terminal", (frame) => frame.params?.turnId === toolTurnId);
-    if (toolTerminal.params?.state !== "completed" || !JSON.stringify(session.events).includes(toolFinalMarker)) {
-      throw new Error("provider Tool turn did not publish one marker-bearing completed terminal");
+    const toolTerminal = await session.waitForEvent(
+      "turn/terminal",
+      (frame) => frame.params?.turnId === toolTurnId,
+    );
+    const toolFinalReply = committedTerminalReply(toolTerminal, toolTurnId);
+    if (toolFinalReply === null) {
+      throw new Error("provider Tool turn did not publish one committed non-empty terminal reply");
     }
 
-    const history = assertRpcSuccess(await session.request("thread/read", { threadId }), "thread/read");
-    if (!history.items.some((item) => item.kind === "user_input" && item.text?.includes(textMarker))
-        || !history.items.some((item) => item.kind === "assistant_message" && item.text?.includes(textMarker))
-        || !history.items.some((item) => item.kind === "assistant_message" && item.text?.includes(toolFinalMarker))) {
-      throw new Error("thread/read did not restore both real provider text turns");
+    const failedShellMarker = `JA_REAL_PROVIDER_EXPECTED_FAILURE_${Date.now().toString(36)}`;
+    const failedToolAccepted = assertRpcSuccess(
+      await session.request("turn/start", {
+        threadId,
+        content: [
+          {
+            type: "text",
+            text: providerFailingToolTurnInput({
+              shellMarker: failedShellMarker,
+            }),
+          },
+        ],
+      }),
+      "turn/start failing Tool",
+    );
+    const failedToolTurnId = failedToolAccepted?.turnId;
+    if (typeof failedToolTurnId !== "string" || !failedToolTurnId.startsWith("turn_")) {
+      throw new Error("failing Tool turn/start returned an invalid turn identity");
     }
-    const durable = assertDurableToolHistory(history, threadId, toolTurnId, shellApproval.approvalId);
+    const failedToolApproval = await approveExpectedTool(
+      session,
+      failedToolTurnId,
+      "shell",
+      handledApprovalIds,
+    );
+    approvedTools.push(failedToolApproval);
+    const failedToolEvidence = await waitForRequiredToolEvidence(
+      session,
+      failedToolTurnId,
+      ["shell"],
+      ["failed"],
+    );
+    const failedToolTerminal = await session.waitForEvent(
+      "turn/terminal",
+      (frame) => frame.params?.turnId === failedToolTurnId,
+    );
+    const failedToolEvents = collectToolEvidence(session.events, failedToolTurnId);
+    const failedToolTerminalCount = session.events.filter(
+      (frame) => frame.method === "turn/terminal" && frame.params?.turnId === failedToolTurnId,
+    ).length;
+    const failedToolEventsJson = JSON.stringify(
+      session.events.filter((frame) => frame.params?.turnId === failedToolTurnId),
+    );
+    const failedToolFinalReply = committedTerminalReply(failedToolTerminal, failedToolTurnId);
+    if (
+      failedToolTerminal.params?.state !== "completed" ||
+      failedToolTerminalCount !== 1 ||
+      failedToolEvents.length !== 1 ||
+      failedToolEvidence[0]?.outcome !== "failed" ||
+      !failedToolEventsJson.includes(failedShellMarker) ||
+      failedToolFinalReply === null
+    ) {
+      throw new Error(
+        `failed Tool result did not converge to one marker-bearing completed Turn ${JSON.stringify({
+          state: failedToolTerminal.params?.state ?? "unknown",
+          terminalCount: failedToolTerminalCount,
+          toolResultCount: failedToolEvents.length,
+          outcomes: failedToolEvents.map((entry) => entry.outcome),
+          shellMarkerObserved: failedToolEventsJson.includes(failedShellMarker),
+          finalReplyCommitted: failedToolFinalReply !== null,
+          methods: turnEventMethods(session.events, failedToolTurnId),
+        })}`,
+      );
+    }
+
+    const history = assertRpcSuccess(
+      await session.request("thread/read", { threadId }),
+      "thread/read",
+    );
+    if (
+      !history.items.some((item) => userInputContainsText(item, textMarker)) ||
+      !history.items.some(
+        (item) =>
+          item.kind === "final_answer" &&
+          item.turnId === textTurnId &&
+          item.text === textFinalReply,
+      )
+    ) {
+      throw new Error("thread/read did not restore all real provider final answers");
+    }
+    const durable = assertDurableToolHistory(
+      history,
+      threadId,
+      toolTurnId,
+      shellApproval.approvalId,
+      { finalText: toolFinalReply },
+    );
+    const shellDialect =
+      process.platform === "win32"
+        ? assertWindowsPowerShellSelection(history, toolTurnId, shellMarker)
+        : "platform_not_checked";
+    const failedDurable = assertDurableToolHistory(
+      history,
+      threadId,
+      failedToolTurnId,
+      failedToolApproval.approvalId,
+      {
+        calls: [{ toolName: "shell", status: "error", exitCode: 23 }],
+        finalText: failedToolFinalReply,
+      },
+    );
+    const firstSessionRetainedOutput = `${JSON.stringify(session.events)}\n${session.stderr}`;
+    const firstTokenMarkerPaths = [...session.tokenMarkerPaths];
     const firstExit = await session.shutdown();
     if (firstExit.code !== 0 || firstExit.signal !== null) {
       throw new Error(`production sidecar first exit had code ${firstExit.code ?? "none"}`);
@@ -1021,25 +1546,67 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     if (restartedInitialized?.runtime?.engine !== "ja-kernel") {
       throw new Error("restarted sidecar did not negotiate the Ja Kernel runtime");
     }
-    const afterRestart = assertRpcSuccess(await session.request("configuration/read", {}), "configuration/read after restart");
-    if (afterRestart?.user?.version !== configured.version
-        || afterRestart?.credentialVersion !== credential.version
-        || afterRestart?.credentials?.[credentialId]?.configured !== true) {
-      throw new Error("sidecar restart did not recover the Java-owned configuration and credential generation");
+    const afterRestart = assertRpcSuccess(
+      await session.request("configuration/read", {}),
+      "configuration/read after restart",
+    );
+    if (
+      afterRestart?.cas?.userVersion !== configured.version ||
+      afterRestart?.cas?.credentialVersion !== credential.version ||
+      afterRestart?.credentials?.[credentialId]?.configured !== true
+    ) {
+      throw new Error(
+        "sidecar restart did not recover the Java-owned configuration and credential generation",
+      );
     }
-    const recoveredHistory = assertRpcSuccess(await session.request("thread/read", { threadId }),
-      "thread/read after restart");
-    const recovered = assertDurableToolHistory(recoveredHistory, threadId, toolTurnId, shellApproval.approvalId);
+    const recoveredHistory = assertRpcSuccess(
+      await session.request("thread/read", { threadId }),
+      "thread/read after restart",
+    );
+    const recovered = assertDurableToolHistory(
+      recoveredHistory,
+      threadId,
+      toolTurnId,
+      shellApproval.approvalId,
+      { finalText: toolFinalReply },
+    );
+    const failedRecovered = assertDurableToolHistory(
+      recoveredHistory,
+      threadId,
+      failedToolTurnId,
+      failedToolApproval.approvalId,
+      {
+        calls: [{ toolName: "shell", status: "error", exitCode: 23 }],
+        finalText: failedToolFinalReply,
+      },
+    );
     if (recoveredHistory.revision < history.revision) {
       throw new Error("sidecar restart recovered an older Thread revision");
     }
+    if (
+      !recoveredHistory.items.some(
+        (item) =>
+          item.kind === "final_answer" &&
+          item.turnId === textTurnId &&
+          item.text === textFinalReply,
+      )
+    ) {
+      throw new Error("sidecar restart did not recover the committed text reply");
+    }
     if (!persistent) {
-      const cleared = assertRpcSuccess(await session.request("credential/delete", {
-        credentialId,
-        expectedVersion: afterRestart.credentialVersion,
-      }), "credential/delete after restart");
-      if (cleared?.accepted !== true || cleared?.credentialId !== credentialId
-          || cleared?.configured !== false || typeof cleared?.version !== "string") {
+      const cleared = assertRpcSuccess(
+        await session.request("credential/delete", {
+          credentialId,
+          expectedVersion: afterRestart.cas.credentialVersion,
+        }),
+        "credential/delete after restart",
+      );
+      if (
+        cleared?.accepted !== true ||
+        cleared?.credentialId !== credentialId ||
+        cleared?.configured !== false ||
+        typeof cleared?.version !== "string"
+      ) {
         throw new Error("credential/delete returned an invalid redacted projection");
       }
     }
@@ -1051,11 +1618,11 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     if (!logMetadata.isFile() || logMetadata.size === 0 || logMetadata.size > 16 * 1024 * 1024) {
       throw new Error("production sidecar runtime log was not persisted");
     }
-    const retainedOutput = `${JSON.stringify(session.events)}\n${await readFile(
-      join(directories.logs, "app-server.log"), "utf8",
+    const retainedOutput = `${firstSessionRetainedOutput}\n${JSON.stringify(session.events)}\n${session.stderr}\n${await readFile(
+      join(directories.logs, "app-server.log"),
+      "utf8",
     )}`;
-    if (retainedOutput.includes(apiKey) || toolEventsJson.includes(apiKey)
-        || retainedOutput.includes(endpoint) || toolEventsJson.includes(endpoint)) {
+    if (retainedOutput.includes(apiKey) || retainedOutput.includes(endpoint)) {
       throw new Error("provider credential or endpoint escaped the redacted runtime boundary");
     }
     if (!persistent) await assertSecretAbsentFromOwnedFiles(directories.root, apiKey);
@@ -1063,12 +1630,18 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       status: "passed",
       runtime: "production",
       engineVersion: initialized.runtime.engineVersion,
-      provider,
+      providerName: name,
       api,
       model,
+      reasoningLevel,
       textTurnStatus: textTerminal.params.state,
       toolTurnStatus: toolTerminal.params.state,
+      failedToolTurnStatus: failedToolTerminal.params.state,
+      failedToolOutcome: failedToolEvidence[0].outcome,
+      failedToolExitCode: 23,
+      failedToolFinalReply: failedDurable.failedTools === 1 && failedRecovered.failedTools === 1,
       toolNames: toolEvidence.map((entry) => entry.toolName),
+      shellDialect,
       approvedToolNames: approvedTools.map((approval) => approval.toolName),
       approvalResolved: true,
       historyItems: durable.items,
@@ -1076,17 +1649,21 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       restartRecovered: true,
       exitCode: exit.code,
       firstExitCode: firstExit.code,
-      tokenMarkerPaths: session.tokenMarkerPaths,
+      tokenMarkerPaths: [...new Set([...firstTokenMarkerPaths, ...session.tokenMarkerPaths])],
       logBytes: logMetadata.size,
     };
     if (!silent) process.stdout.write(`${JSON.stringify(report)}\n`);
     return report;
   } catch (error) {
-    const diagnostic = session?.stderr === "" || session === undefined
-      ? "" : " (sidecar stderr was captured and redacted)";
+    const diagnostic =
+      session?.stderr === "" || session === undefined
+        ? ""
+        : " (sidecar stderr was captured and redacted)";
     const signals = stderrDiagnosticSignals(session?.stderr);
     const classified = signals === "" ? "" : ` [signals=${signals}]`;
-    throw new Error(`${redact(error?.message ?? error, [apiKey, endpoint])}${classified}${diagnostic}`);
+    throw new Error(
+      `${redact(error?.message ?? error, [apiKey, endpoint])}${classified}${diagnostic}`,
+    );
   } finally {
     await session?.forceClose();
     if (toolFixturePath !== undefined) await rm(toolFixturePath, { force: true });
@@ -1096,7 +1673,9 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   await runSmoke().catch((error) => {
-    process.stderr.write(`real-provider-smoke failed: ${redact(error?.message ?? error, [process.env.JA_REAL_PROVIDER_API_KEY])}\n`);
+    process.stderr.write(
+      `real-provider-smoke failed: ${redact(error?.message ?? error, [process.env.JA_REAL_PROVIDER_API_KEY])}\n`,
+    );
     process.exitCode = 1;
   });
 }

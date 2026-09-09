@@ -158,6 +158,28 @@ async fn watchdog_completion_is_generation_scoped_and_bounded() {
     assert!(!watchdog.complete(id, 8).expect("released completion"));
 }
 
+/// redirect 代际推进必须复用同一绝对预算；否则不可达页面可以通过重复 Started callback
+/// 永久续期，并让 Preview 一直停留在 loading。
+#[test]
+fn watchdog_rebinds_generation_without_replacing_the_timeout_budget() {
+    let (runtime, watchdog) = manual_watchdog();
+    let id = PreviewId::new();
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_by_timeout = fired.clone();
+    watchdog
+        .arm(id, 3, Duration::from_secs(60), move || {
+            fired_by_timeout.store(true, Ordering::Release);
+        })
+        .expect("initial arm");
+
+    assert!(watchdog.rebind(id, 4).expect("redirect rebind"));
+    assert_eq!(runtime.pending.lock().expect("scheduled tasks").len(), 1);
+    assert!(!watchdog.complete(id, 3).expect("stale completion"));
+    runtime.run_all();
+    assert!(fired.load(Ordering::Acquire));
+    assert!(!watchdog.complete(id, 4).expect("expired task removed"));
+}
+
 /// 确认关停会释放全部会话任务，并永久拒绝晚到的超时注册。
 #[tokio::test]
 async fn watchdog_cancel_all_releases_all_pending_tasks() {

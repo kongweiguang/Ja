@@ -20,8 +20,11 @@ public interface AttachmentRepository {
     /** 只允许 DRAFT 单向进入 DISCARDED。 */
     AttachmentMetadata discardDraft(String attachmentId, Instant discardedAt);
 
-    /** 按当前 Thread 读取已绑定附件，拒绝跨 Thread identity。 */
-    Optional<AttachmentMetadata> findBound(String attachmentId, String threadId);
+    /** 按 attachmentId 与 Workspace 读取仍有效的草稿，防止跨 Workspace 预览。 */
+    Optional<AttachmentMetadata> findDraft(String attachmentId, String workspaceId);
+
+    /** 按当前 Thread 读取排队预留或消息已绑定附件，拒绝跨 Thread identity。 */
+    Optional<AttachmentMetadata> findThread(String attachmentId, String threadId);
 
     /** 把到期草稿批量转为 EXPIRED，并返回本轮变化数量。 */
     int expireDrafts(Instant now);

@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   AppearanceSettings,
@@ -12,7 +12,6 @@ import type {
   AccessMode,
   DefaultModelSelection,
   ProviderModelSave,
-  ProviderProjection,
   ProviderSave,
   SettingsDocument,
   SettingsConfigurationChange,
@@ -54,25 +53,29 @@ interface SettingsControllerOptions {
   runtimePort: SettingsRuntimePort;
 }
 
-/** Settings controller 只暴露 v4 Provider 聚合，不保留 Profile 激活兼容入口。 */
+/** Settings controller 只暴露 v1 Provider 聚合，模型选择始终归属已保存 Provider。 */
 export interface SettingsController {
   loaded: LoadedSettings | undefined;
+  /** 当前 Workspace 的 effective 配置，只供对话、Composer 与 Turn 准入消费。 */
   snapshot: SettingsSnapshot;
+  /** 设置页唯一可编辑投影，始终来自用户级配置文档。 */
+  globalSnapshot: SettingsSnapshot;
   loading: boolean;
   synchronizing: boolean;
   scopeReady: boolean;
+  /** 当前 effective 配置所属项目，用于 Workspace 切换准入和竞态隔离。 */
   scopeWorkspaceId: string | undefined;
-  scope: "global" | "project";
-  projectAvailable: boolean;
   error: string | undefined;
   ports: SettingsPorts;
   reload(): Promise<void>;
-  setScope(scope: "global" | "project"): void;
 }
 
-/** 将 Ja Kernel 的 Skill 健康状态收敛为设置 UI 的有限枚举。 */
-function skillStatus(status: "healthy" | "invalid" | "unavailable"): SkillProjection["status"] {
-  return status === "healthy" ? "ready" : "error";
+/** 将健康与启用事实分开收敛，避免把已发现但未授权的 Skill 显示成已加载。 */
+function skillStatus(
+  status: "healthy" | "invalid" | "unavailable",
+  enabled: boolean,
+): SkillProjection["status"] {
+  return status === "healthy" ? (enabled ? "ready" : "disabled") : "error";
 }
 
 /** 仅保存 Skill 摘要，禁止把正文或执行实现复制到 React 状态。 */
@@ -80,12 +83,10 @@ function projectSkills(result: SkillListResult): SkillProjection[] {
   return result.items.map((skill) => ({
     id: skill.skillId,
     name: skill.name,
-    source:
-      skill.scope === "builtin" ? "builtin" : skill.scope === "workspace" ? "workspace" : "user",
+    source: skill.scope,
     description: skill.description ?? "",
     enabled: skill.enabled,
-    status: skillStatus(skill.status),
-    ...(skill.status === "healthy" ? { lastGood: "刚刚" } : {}),
+    status: skillStatus(skill.status, skill.enabled),
   }));
 }
 
@@ -133,11 +134,9 @@ function projectMcpTools(result: McpToolsResult): McpToolProjection[] {
  */
 function toSettingsSnapshot(
   document: SettingsDocument,
-  userDocument: SettingsDocument,
-  projectOverrides: LoadedSettings["projectOverrides"],
   runtimeSkills: SkillProjection[],
   runtimeMcpServers: McpServerProjection[],
-  appearance: Pick<AppearanceSettings, "reducedMotion" | "highContrast">,
+  appearance: AppearanceSettings,
 ): SettingsSnapshot {
   return {
     revision: document.revision,
@@ -172,27 +171,33 @@ function toSettingsSnapshot(
         status: observed?.status ?? (server.enabled ? ("unknown" as const) : ("disabled" as const)),
         tools: observed?.tools ?? [],
         ...(observed?.lastError === undefined ? {} : { lastError: observed.lastError }),
-        globallyEnabled:
-          userDocument.mcpServers.find((item) => item.mcpRevision === server.mcpRevision)
-            ?.enabled ?? false,
-        projectOverridden: projectOverrides.disabledMcpIds.includes(server.mcpRevision),
       };
     }),
-    skills: runtimeSkills.map((skill) => ({
-      ...skill,
-      globallyEnabled:
-        userDocument.skills?.find((item) => item.skillId === skill.id)?.enabled ?? false,
-      projectOverridden: projectOverrides.disabledSkillIds.includes(skill.id),
-    })),
+    skills: runtimeSkills.map((skill) => {
+      const enabled = document.skills.find((item) => item.skillId === skill.id)?.enabled ?? false;
+      return { ...skill, enabled, status: enabled ? skill.status : ("disabled" as const) };
+    }),
     defaultAccessMode: document.defaultAccessMode,
-    globalAccessMode: userDocument.defaultAccessMode,
-    projectOverrides,
     appearance: {
-      theme: document.theme,
-      palette: "xcode",
+      theme: appearance.theme,
+      palette: appearance.palette,
       reducedMotion: appearance.reducedMotion,
+      reducedTransparency: appearance.reducedTransparency,
       highContrast: appearance.highContrast,
     },
+  };
+}
+
+/** 未完成首次读取时提供稳定空投影，且只携带本地外观偏好，不伪造配置来源。 */
+function emptySettingsSnapshot(appearance: AppearanceSettings): SettingsSnapshot {
+  return {
+    revision: 0,
+    defaultSelection: null,
+    providers: [],
+    skills: [],
+    mcpServers: [],
+    defaultAccessMode: "full_access",
+    appearance,
   };
 }
 
@@ -212,113 +217,8 @@ function moveById<T>(
 }
 
 /**
- * Overlay 表单会提交完整 effective 对象；只有值相对 effective 真正变化时才覆盖 user 值，
- * 从而避免未编辑的项目收紧项被反向扁平写入用户层。
- */
-function userValueAfterEffectiveEdit<T>(userValue: T, effectiveValue: T, submittedValue: T): T {
-  return JSON.stringify(submittedValue) === JSON.stringify(effectiveValue)
-    ? structuredClone(userValue)
-    : structuredClone(submittedValue);
-}
-
-/** Provider 保存逐叶合并 user/effective，模型目录由独立模型动作管理。 */
-function mergeUserProviderEdit(
-  user: ProviderProjection,
-  effective: ProviderProjection,
-  submitted: ProviderSave,
-): ProviderProjection {
-  return {
-    providerId: user.providerId,
-    name: userValueAfterEffectiveEdit(user.name, effective.name, submitted.name),
-    provider: userValueAfterEffectiveEdit(user.provider, effective.provider, submitted.provider),
-    api: userValueAfterEffectiveEdit(user.api, effective.api, submitted.api),
-    baseUrl: userValueAfterEffectiveEdit(user.baseUrl, effective.baseUrl, submitted.baseUrl),
-    credentialId: userValueAfterEffectiveEdit(
-      user.credentialId,
-      effective.credentialId,
-      submitted.credentialId,
-    ),
-    credentialConfigured: effective.credentialConfigured,
-    networkTimeouts: {
-      connectTimeoutMs: userValueAfterEffectiveEdit(
-        user.networkTimeouts.connectTimeoutMs,
-        effective.networkTimeouts.connectTimeoutMs,
-        submitted.networkTimeouts.connectTimeoutMs,
-      ),
-      requestTimeoutMs: userValueAfterEffectiveEdit(
-        user.networkTimeouts.requestTimeoutMs,
-        effective.networkTimeouts.requestTimeoutMs,
-        submitted.networkTimeouts.requestTimeoutMs,
-      ),
-    },
-    agentDefaults: {
-      context: {
-        autoCompact: userValueAfterEffectiveEdit(
-          user.agentDefaults.context.autoCompact,
-          effective.agentDefaults.context.autoCompact,
-          submitted.agentDefaults.context.autoCompact,
-        ),
-      },
-      turnLimits: {
-        maxModelRounds: userValueAfterEffectiveEdit(
-          user.agentDefaults.turnLimits.maxModelRounds,
-          effective.agentDefaults.turnLimits.maxModelRounds,
-          submitted.agentDefaults.turnLimits.maxModelRounds,
-        ),
-        maxToolCalls: userValueAfterEffectiveEdit(
-          user.agentDefaults.turnLimits.maxToolCalls,
-          effective.agentDefaults.turnLimits.maxToolCalls,
-          submitted.agentDefaults.turnLimits.maxToolCalls,
-        ),
-        wallTimeoutMs: userValueAfterEffectiveEdit(
-          user.agentDefaults.turnLimits.wallTimeoutMs,
-          effective.agentDefaults.turnLimits.wallTimeoutMs,
-          submitted.agentDefaults.turnLimits.wallTimeoutMs,
-        ),
-      },
-    },
-    models: structuredClone(user.models),
-  };
-}
-
-/** 模型能力逐字段回写 user 层，未改动的 project 收紧值保持只读。 */
-function mergeUserModelEdit(
-  user: ProviderModelSave,
-  effective: ProviderModelSave,
-  submitted: ProviderModelSave,
-): ProviderModelSave {
-  return {
-    modelId: user.modelId,
-    name: userValueAfterEffectiveEdit(user.name, effective.name, submitted.name),
-    model: userValueAfterEffectiveEdit(user.model, effective.model, submitted.model),
-    capabilities: {
-      contextWindowTokens: userValueAfterEffectiveEdit(
-        user.capabilities.contextWindowTokens,
-        effective.capabilities.contextWindowTokens,
-        submitted.capabilities.contextWindowTokens,
-      ),
-      maxOutputTokens: userValueAfterEffectiveEdit(
-        user.capabilities.maxOutputTokens,
-        effective.capabilities.maxOutputTokens,
-        submitted.capabilities.maxOutputTokens,
-      ),
-    },
-    reasoningLevelMap: userValueAfterEffectiveEdit(
-      user.reasoningLevelMap,
-      effective.reasoningLevelMap,
-      submitted.reasoningLevelMap,
-    ),
-    defaultReasoningLevel: userValueAfterEffectiveEdit(
-      user.defaultReasoningLevel,
-      effective.defaultReasoningLevel,
-      submitted.defaultReasoningLevel,
-    ),
-  };
-}
-
-/**
- * Settings snapshot 按 workspace、App Server 实例和 runtime generation 分代；scope 切换
- * 让无法取消的旧 native 结果只能写回旧 key，配置事件则精确失效当前 key。
+ * Settings snapshot 按 workspace、App Server 实例和 runtime generation 分代；workspace 切换
+ * 让无法取消的旧 native 结果只能写回旧 key，编辑层切换不重新读取 effective 配置。
  */
 function settingsSnapshotQueryKey(
   workspaceId: string | undefined,
@@ -339,13 +239,29 @@ function runtimeProjectionKey(
   kind: "storage" | "skills" | "mcp",
   serverInstanceId: string | null | undefined,
   runtimeGeneration: number | undefined,
+  scopeKey = "global",
 ) {
-  return ["settings", kind, serverInstanceId ?? "unavailable", runtimeGeneration ?? 0] as const;
+  return [
+    "settings",
+    kind,
+    serverInstanceId ?? "unavailable",
+    runtimeGeneration ?? 0,
+    scopeKey,
+  ] as const;
+}
+
+/** 只读取可公开分支判断的稳定错误码，原生错误正文和敏感上下文不得进入 UI。 */
+function settingsErrorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object"
+    ? ((error as { code?: unknown }).code as string | undefined)
+    : undefined;
 }
 
 /**
- * 独占设置文档、Provider、Skill/MCP 健康投影和 CAS 保存；workspace identity 仅作为
- * snapshot 查询参数，controller 不保存或切换 workspace，也不拥有会话状态。
+ * 独占设置文档、Provider、Skill/MCP 健康投影和 CAS 保存；当前 workspace 决定 effective
+ * snapshot 与 Turn admission；设置动作固定写 userDocument，项目覆盖继续由 App Server
+ * 从可信 Workspace 的 .ja/config.toml 合并，controller 不提供项目编辑入口。
+ * controller 不保存或切换 workspace，也不拥有会话状态。
  */
 export function useSettingsController({
   adapter,
@@ -357,25 +273,23 @@ export function useSettingsController({
   runtimePort,
 }: SettingsControllerOptions): SettingsController {
   const queryClient = useQueryClient();
-  const [scope, setScopeState] = useState<"global" | "project">("global");
   // Workspace owner 位于 composition；每次 render 直接派生 query key，避免 ref 更新不触发 render
-  // 而让 controller 继续观察旧项目配置。
+  // 而让 controller 继续观察旧项目配置。设置页的编辑层不能改变会话消费的 effective 配置。
   const projectWorkspaceId =
     workspaceScope?.kind === "project" ? workspaceScope.workspaceId : undefined;
-  const queryWorkspaceId = scope === "project" ? projectWorkspaceId : undefined;
-  const setScope = useCallback(
-    (next: "global" | "project"): void => {
-      setScopeState(next === "project" && projectWorkspaceId !== undefined ? "project" : "global");
-    },
-    [projectWorkspaceId],
-  );
-
-  /** 项目解绑后立即回到全局，禁止保留指向旧 workspace 的可写作用域。 */
-  useEffect(() => {
-    if (projectWorkspaceId === undefined) setScopeState("global");
-  }, [projectWorkspaceId]);
-  const { reducedMotion, highContrast, setThemeMode, setHighContrast, setReduceMotion } =
-    appearancePort;
+  const queryWorkspaceId = projectWorkspaceId;
+  const {
+    themeMode,
+    palette,
+    reducedMotion,
+    reducedTransparency,
+    highContrast,
+    setThemeMode,
+    setPalette,
+    setHighContrast,
+    setReduceMotion,
+    setReducedTransparency,
+  } = appearancePort;
   const runtimeReady =
     runtimeState !== undefined && ["ready", "busy"].includes(runtimeState.status);
   // Query 与失效 effect 只依赖投影中的分代标量；调用方重建等值对象时不能形成 fetch 循环。
@@ -386,6 +300,7 @@ export function useSettingsController({
   const configurationWorkspaceId = configurationChange?.workspaceId;
   const configurationScopeKey = queryWorkspaceId ?? "general";
   const handledConfigurationVersionsRef = useRef<Map<string, string>>(new Map());
+  const credentialMutationTailRef = useRef<Promise<void>>(Promise.resolve());
   // User 变更影响全部有效配置，Project 变更只允许推进匹配 workspace 的 key；其它项目的
   // timeline 事件不能让当前项目产生一次无意义的 configuration/read。
   const configurationMatchesScope =
@@ -395,9 +310,16 @@ export function useSettingsController({
     () => settingsSnapshotQueryKey(queryWorkspaceId, runtimeServerInstanceId, runtimeGeneration),
     [queryWorkspaceId, runtimeGeneration, runtimeServerInstanceId],
   );
+  const skillWorkspaceId = workspaceScope?.kind === "project" ? queryWorkspaceId : undefined;
   const skillsKey = useMemo(
-    () => runtimeProjectionKey("skills", runtimeServerInstanceId, runtimeGeneration),
-    [runtimeGeneration, runtimeServerInstanceId],
+    () =>
+      runtimeProjectionKey(
+        "skills",
+        runtimeServerInstanceId,
+        runtimeGeneration,
+        skillWorkspaceId ?? "global",
+      ),
+    [runtimeGeneration, runtimeServerInstanceId, skillWorkspaceId],
   );
   const mcpKey = useMemo(
     () => runtimeProjectionKey("mcp", runtimeServerInstanceId, runtimeGeneration),
@@ -441,7 +363,12 @@ export function useSettingsController({
   /** Skill catalog 按 runtime generation 读取一次，显式 mutation 后才重新获取。 */
   const skillsQuery = useQuery({
     queryKey: skillsKey,
-    queryFn: async () => projectSkills(await runtimePort.listSkills()),
+    queryFn: async () =>
+      projectSkills(
+        await runtimePort.listSkills(
+          skillWorkspaceId === undefined ? undefined : { workspaceId: skillWorkspaceId },
+        ),
+      ),
     enabled: runtimeReady,
   });
 
@@ -494,7 +421,12 @@ export function useSettingsController({
     await Promise.all([
       queryClient.fetchQuery({
         queryKey: skillsKey,
-        queryFn: async () => projectSkills(await runtimePort.listSkills()),
+        queryFn: async () =>
+          projectSkills(
+            await runtimePort.listSkills(
+              skillWorkspaceId === undefined ? undefined : { workspaceId: skillWorkspaceId },
+            ),
+          ),
         staleTime: 0,
       }),
       queryClient.fetchQuery({
@@ -503,14 +435,20 @@ export function useSettingsController({
         staleTime: 0,
       }),
     ]);
-  }, [mcpKey, queryClient, runtimePort, skillsKey]);
+  }, [mcpKey, queryClient, runtimePort, skillWorkspaceId, skillsKey]);
 
   /** user CAS replace 只接受已加载 user 文档，effective/project 投影永不成为写入基线。 */
   const saveDocument = useCallback(
     async (userDocument: SettingsDocument): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      const version = await adapter.save(userDocument, current.cas.userVersion);
+      let version: string;
+      try {
+        version = await adapter.save(userDocument, current.cas.userVersion);
+      } catch (error) {
+        if (settingsErrorCode(error) === "revision_conflict") await reload();
+        throw error;
+      }
       updateLoadedQuery((snapshot) => ({
         ...snapshot,
         userDocument,
@@ -521,65 +459,15 @@ export function useSettingsController({
     [adapter, currentLoaded, reload, updateLoadedQuery],
   );
 
-  /**
-   * 项目设置只提交稀疏 Merge Patch；CAS 冲突或校验失败后立即重读权威快照，直接控件不保留
-   * 可能已过期的乐观值。
-   */
-  const saveProjectPatch = useCallback(
-    async (patch: Record<string, unknown>): Promise<void> => {
-      const current = currentLoaded();
-      if (current === undefined || queryWorkspaceId === undefined)
-        throw new Error("project settings unavailable");
-      try {
-        await adapter.patch({
-          scope: "project",
-          workspaceId: queryWorkspaceId,
-          expectedVersion: current.cas.projectVersion,
-          patch,
-        });
-      } catch (error) {
-        await reload();
-        throw error;
-      }
-      await reload();
-    },
-    [adapter, currentLoaded, queryWorkspaceId, reload],
-  );
-
-  /** 删除整个项目层必须走 App Server reset，不用空对象猜测 Merge Patch 语义。 */
-  const resetProject = useCallback(async (): Promise<void> => {
-    const current = currentLoaded();
-    if (current === undefined || queryWorkspaceId === undefined)
-      throw new Error("project settings unavailable");
-    try {
-      await adapter.reset({
-        scope: "project",
-        workspaceId: queryWorkspaceId,
-        expectedVersion: current.cas.projectVersion,
-      });
-    } finally {
-      await reload();
-    }
-  }, [adapter, currentLoaded, queryWorkspaceId, reload]);
-
-  /** 保存 Provider 时只把相对 effective 的真实编辑应用到 user 文档。 */
+  /** 保存 Provider 固定以 userDocument 为读写基线，项目 effective 值不得进入全局表单。 */
   const saveProvider = useCallback(
     async (provider: ProviderSave): Promise<void> => {
-      if (scope === "project") throw new Error("project provider is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      const effective = current.document.providers.find(
-        (item) => item.providerId === provider.providerId,
-      );
       const existing = current.userDocument.providers.find(
         (item) => item.providerId === provider.providerId,
       );
-      if (effective !== undefined && existing === undefined)
-        throw new Error("project provider is read only");
-      const merged: ProviderProjection =
-        existing === undefined || effective === undefined
-          ? { ...provider, credentialConfigured: false }
-          : mergeUserProviderEdit(existing, effective, provider);
+      const merged = { ...provider, credentialConfigured: existing?.credentialConfigured ?? false };
       const firstModel = merged.models[0];
       if (firstModel === undefined) throw new Error("provider requires model");
       await saveDocument({
@@ -598,13 +486,12 @@ export function useSettingsController({
               ),
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** 删除默认 Provider 时只接受用户显式选择的替代项，避免按数组顺序静默改变默认模型。 */
   const deleteProvider = useCallback(
     async (providerId: string, replacement: DefaultModelSelection | null): Promise<void> => {
-      if (scope === "project") throw new Error("project provider is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       const providers = current.userDocument.providers.filter(
@@ -636,13 +523,12 @@ export function useSettingsController({
         defaultSelection,
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** Provider 排序只改变展示与分组顺序，不改变稳定 ID 或默认选择。 */
   const moveProvider = useCallback(
     async (providerId: string, direction: -1 | 1): Promise<void> => {
-      if (scope === "project") throw new Error("project provider is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       const providers = moveById(
@@ -658,33 +544,20 @@ export function useSettingsController({
         providers,
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
-  /** 单模型保存按 effective 差异更新 user 能力，并同步收敛根默认思考档位。 */
+  /** 单模型保存只更新用户级模型能力，并同步收敛根默认思考档位。 */
   const saveModel = useCallback(
     async (providerId: string, model: ProviderModelSave): Promise<void> => {
-      if (scope === "project") throw new Error("project model catalog is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      const effectiveProvider = current.document.providers.find(
-        (candidate) => candidate.providerId === providerId,
-      );
       const provider = current.userDocument.providers.find(
         (candidate) => candidate.providerId === providerId,
       );
-      if (provider === undefined || effectiveProvider === undefined)
-        throw new Error("provider unavailable");
+      if (provider === undefined) throw new Error("provider unavailable");
       const userModel = provider.models.find((candidate) => candidate.modelId === model.modelId);
-      const effectiveModel = effectiveProvider.models.find(
-        (candidate) => candidate.modelId === model.modelId,
-      );
-      if (effectiveModel !== undefined && userModel === undefined)
-        throw new Error("project model is read only");
-      const savedModel =
-        userModel === undefined || effectiveModel === undefined
-          ? model
-          : mergeUserModelEdit(userModel, effectiveModel, model);
+      const savedModel = model;
       const exists = userModel !== undefined;
       const models = exists
         ? provider.models.map((candidate) =>
@@ -714,7 +587,7 @@ export function useSettingsController({
         ),
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** 删除默认模型时只接受用户显式选择的替代项，且替代项必须仍存在于删除后的目录。 */
@@ -724,7 +597,6 @@ export function useSettingsController({
       modelId: string,
       replacement: DefaultModelSelection | null,
     ): Promise<void> => {
-      if (scope === "project") throw new Error("project model catalog is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       const provider = current.userDocument.providers.find(
@@ -763,13 +635,12 @@ export function useSettingsController({
         providers: remainingProviders,
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** 模型验证只允许全局已保存身份，测试请求正文和回答始终由 App Server 隔离。 */
   const testModel = useCallback(
     async (providerId: string, modelId: string) => {
-      if (scope === "project") throw new Error("project model test is unavailable");
       const current = currentLoaded();
       const model = current?.userDocument.providers
         .find((provider) => provider.providerId === providerId)
@@ -777,13 +648,12 @@ export function useSettingsController({
       if (model === undefined) throw new Error("model unavailable");
       return runtimePort.testModel(providerId, modelId);
     },
-    [currentLoaded, runtimePort, scope],
+    [currentLoaded, runtimePort],
   );
 
   /** 模型排序只交换同一 Provider 内相邻项，不能跨 Provider 移动身份。 */
   const moveModel = useCallback(
     async (providerId: string, modelId: string, direction: -1 | 1): Promise<void> => {
-      if (scope === "project") throw new Error("project model catalog is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       const provider = current.userDocument.providers.find(
@@ -800,7 +670,7 @@ export function useSettingsController({
         ),
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** 默认选择必须命中真实模型，思考档位由模型能力闭集裁决。 */
@@ -808,7 +678,7 @@ export function useSettingsController({
     async (selection: DefaultModelSelection): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      const model = current.document.providers
+      const model = current.userDocument.providers
         .find((provider) => provider.providerId === selection.providerId)
         ?.models.find((candidate) => candidate.modelId === selection.modelId);
       if (
@@ -818,73 +688,42 @@ export function useSettingsController({
       ) {
         throw new Error("default selection unavailable");
       }
-      if (scope === "project") {
-        await saveProjectPatch({
-          default_provider_id: selection.providerId,
-          default_model_id: selection.modelId,
-          default_reasoning_level: selection.reasoningLevel,
-        });
-        return;
-      }
       await saveDocument({
         ...current.userDocument,
         revision: current.userDocument.revision + 1,
         defaultSelection: selection,
       });
     },
-    [currentLoaded, saveDocument, saveProjectPatch, scope],
+    [currentLoaded, saveDocument],
   );
 
-  /** 恢复模型继承必须删除三个关联叶子，避免留下半覆盖的 Provider/Model/Reasoning 组合。 */
-  const restoreDefaultSelection = useCallback(async (): Promise<void> => {
-    if (scope !== "project") return;
-    await saveProjectPatch({
-      default_provider_id: null,
-      default_model_id: null,
-      default_reasoning_level: null,
-    });
-  }, [saveProjectPatch, scope]);
-
-  /** 持久化根默认访问模式；每个 Turn 的实际快照由 App Server 冻结。 */
+  /** 持久化根默认访问模式；Thread 的请求级实际值仍由 App Server 在安全点解析。 */
   const saveAccessMode = useCallback(
     async (mode: AccessMode): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      if (scope === "project") {
-        if (mode === "full_access" && current.userDocument.defaultAccessMode !== "full_access")
-          throw new Error("project access cannot exceed global access");
-        await saveProjectPatch({
-          default_access_mode:
-            mode === current.userDocument.defaultAccessMode ? null : "approval_required",
-        });
-        return;
-      }
       await saveDocument({
         ...current.userDocument,
         revision: current.userDocument.revision + 1,
         defaultAccessMode: mode,
       });
     },
-    [currentLoaded, saveDocument, saveProjectPatch, scope],
+    [currentLoaded, saveDocument],
   );
 
   /**
-   * 外观中的 WebView 偏好写入唯一 UI preferences store；theme 同步到当前脱敏文档投影，
-   * 不新增第二套持久 store，也不触碰 credential。
+   * 外观全部写入唯一 UI preference owner；JA-RPC 配置不拥有 theme/palette/accessibility，
+   * 因而这里不能伪造 Config replace，否则权威重读会把短暂主题切换覆盖回 system。
    */
   const saveAppearance = useCallback(
-    async (appearance: AppearanceSettings): Promise<void> => {
-      const current = currentLoaded();
-      if (current === undefined) throw new Error("settings unavailable");
-      setThemeMode(appearance.theme);
-      setHighContrast(appearance.highContrast);
-      setReduceMotion(appearance.reducedMotion);
-      updateLoadedQuery((snapshot) => ({
-        ...snapshot,
-        document: { ...snapshot.document, theme: appearance.theme },
-      }));
+    async (appearance: AppearanceSettings, changed: keyof AppearanceSettings): Promise<void> => {
+      if (changed === "theme") setThemeMode(appearance.theme);
+      if (changed === "palette") setPalette(appearance.palette);
+      if (changed === "highContrast") setHighContrast(appearance.highContrast);
+      if (changed === "reducedMotion") setReduceMotion(appearance.reducedMotion);
+      if (changed === "reducedTransparency") setReducedTransparency(appearance.reducedTransparency);
     },
-    [currentLoaded, setHighContrast, setReduceMotion, setThemeMode, updateLoadedQuery],
+    [setHighContrast, setPalette, setReduceMotion, setReducedTransparency, setThemeMode],
   );
 
   /** 保存 MCP 定义时保留高级非敏感 map，并通过同一 CAS replace 路径提交。 */
@@ -892,29 +731,6 @@ export function useSettingsController({
     async (server: McpServerSave): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      if (scope === "project") {
-        const global = current.userDocument.mcpServers.find(
-          (item) => item.mcpRevision === server.mcpRevision,
-        );
-        if (global === undefined || !global.enabled)
-          throw new Error("project MCP server is unavailable");
-        const disabled = current.userDocument.mcpServers
-          .filter(
-            (item) =>
-              item.enabled &&
-              current.document.mcpServers.find(
-                (effective) => effective.mcpRevision === item.mcpRevision,
-              )?.enabled === false,
-          )
-          .map((item) => item.mcpRevision);
-        const next = new Set(disabled);
-        if (server.enabled) next.delete(server.mcpRevision);
-        else next.add(server.mcpRevision);
-        await saveProjectPatch({
-          mcp_servers: [...next].map((mcpId) => ({ mcp_id: mcpId, enabled: false })),
-        });
-        return;
-      }
       const existing = current.userDocument.mcpServers.find(
         (item) => item.mcpRevision === server.mcpRevision,
       );
@@ -933,7 +749,7 @@ export function useSettingsController({
               ),
       });
     },
-    [currentLoaded, saveDocument, saveProjectPatch, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** 运行一次真实 MCP probe 并只更新对应 server 的健康投影。 */
@@ -941,7 +757,7 @@ export function useSettingsController({
     async (
       mcpRevision: string,
     ): Promise<"unknown" | "connected" | "disabled" | "testing" | "error"> => {
-      const server = currentLoaded()?.document.mcpServers.find(
+      const server = currentLoaded()?.userDocument.mcpServers.find(
         (item) => item.mcpRevision === mcpRevision,
       );
       if (server === undefined || !server.enabled) return "disabled";
@@ -967,7 +783,6 @@ export function useSettingsController({
   /** 删除 MCP 只移除全局目录定义；Credential 引用保持独立，避免配置删除产生隐式 Secret 级联。 */
   const deleteMcp = useCallback(
     async (mcpRevision: string): Promise<void> => {
-      if (scope === "project") throw new Error("project MCP catalog is read only");
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       const mcpServers = current.userDocument.mcpServers.filter(
@@ -981,13 +796,13 @@ export function useSettingsController({
         mcpServers,
       });
     },
-    [currentLoaded, saveDocument, scope],
+    [currentLoaded, saveDocument],
   );
 
   /** 通过现有 CAS/reconfigure 路径禁用 MCP，不在 UI 伪造关闭状态。 */
   const closeMcp = useCallback(
     async (mcpRevision: string): Promise<void> => {
-      const server = currentLoaded()?.document.mcpServers.find(
+      const server = currentLoaded()?.userDocument.mcpServers.find(
         (item) => item.mcpRevision === mcpRevision,
       );
       if (server === undefined) throw new Error("MCP server unavailable");
@@ -1011,119 +826,164 @@ export function useSettingsController({
     async (skillRevision: string, enabled: boolean): Promise<void> => {
       const current = currentLoaded();
       const observed = runtimeSkills.find((skill) => skill.id === skillRevision);
-      const configured = current?.userDocument.skills?.find(
+      const configured = current?.userDocument.skills.find(
         (skill) => skill.skillId === skillRevision,
       );
-      if (current === undefined || observed === undefined || configured === undefined)
-        throw new Error("skill unavailable");
-      if (scope === "project") {
-        if (!configured.enabled)
-          throw new Error("project Skill cannot enable a global disabled item");
-        const disabled = (current.userDocument.skills ?? [])
-          .filter(
-            (skill) =>
-              skill.enabled &&
-              current.document.skills?.find((effective) => effective.skillId === skill.skillId)
-                ?.enabled === false,
-          )
-          .map((skill) => skill.skillId);
-        const next = new Set(disabled);
-        if (enabled) next.delete(skillRevision);
-        else next.add(skillRevision);
-        await saveProjectPatch({
-          skills: [...next].map((skillId) => ({ skill_id: skillId, enabled: false })),
-        });
-        await refreshRuntimeSettings();
-        return;
-      }
+      if (current === undefined || observed === undefined) throw new Error("skill unavailable");
+      const skills = current.userDocument.skills;
       await saveDocument({
         ...current.userDocument,
         revision: current.userDocument.revision + 1,
-        skills: current.userDocument.skills?.map((skill) =>
-          skill.skillId === skillRevision ? { ...skill, enabled } : skill,
-        ),
+        skills:
+          configured === undefined
+            ? [
+                ...skills,
+                {
+                  skillId: observed.id,
+                  name: observed.name,
+                  scope: observed.source,
+                  enabled,
+                  description: observed.description,
+                },
+              ]
+            : skills.map((skill) =>
+                skill.skillId === skillRevision ? { ...skill, enabled } : skill,
+              ),
       });
       await refreshRuntimeSettings();
     },
-    [currentLoaded, refreshRuntimeSettings, runtimeSkills, saveDocument, saveProjectPatch, scope],
+    [currentLoaded, refreshRuntimeSettings, runtimeSkills, saveDocument],
   );
 
-  /** Secret 只穿过 native credential port，不写入 React state 或设置文档。 */
+  /**
+   * Credential CAS 冲突只允许权威重读后重试一次；成功也必须重读脱敏投影，
+   * 避免将 command 回执或本地推测冒充 credentialConfigured 事实。
+   */
+  const mutateCredential = useCallback(
+    async (mutation: (expectedVersion: string) => Promise<string>): Promise<void> => {
+      const operation = credentialMutationTailRef.current.then(async () => {
+        const current = currentLoaded();
+        if (current === undefined) throw new Error("settings unavailable");
+        try {
+          await mutation(current.cas.credentialVersion);
+        } catch (error) {
+          if (settingsErrorCode(error) !== "revision_conflict") throw error;
+          await reload();
+          const refreshed = currentLoaded();
+          if (refreshed === undefined) throw error;
+          await mutation(refreshed.cas.credentialVersion);
+        }
+        await reload();
+      });
+      credentialMutationTailRef.current = operation.catch(() => undefined);
+      await operation;
+    },
+    [currentLoaded, reload],
+  );
+
+  /** Secret 只穿过 native credential port，CAS 恢复期间也不写入 React state 或设置文档。 */
   const setCredential = useCallback(
     async (credentialId: string, secret: string): Promise<void> => {
-      const current = currentLoaded();
-      if (current === undefined) throw new Error("settings unavailable");
-      const version = await adapter.setCredential(
-        credentialId,
-        secret,
-        current.cas.credentialVersion,
+      await mutateCredential((expectedVersion) =>
+        adapter.setCredential(credentialId, secret, expectedVersion),
       );
-      updateLoadedQuery((snapshot) => ({
-        ...snapshot,
-        cas: { ...snapshot.cas, credentialVersion: version },
-      }));
-      await reload();
     },
-    [adapter, currentLoaded, reload, updateLoadedQuery],
+    [adapter, mutateCredential],
   );
 
-  /** 删除 native Secret 时保留 Provider/MCP 中的不透明 credential 引用。 */
+  /**
+   * 首次创建跨配置文档和凭据库分两次提交：先让 Provider 成为可见、可恢复事实，再写 Secret。
+   * 第二步失败时保留 Provider，调用方可用同一稳定 ID 重试，避免产生不可见的孤立凭据。
+   */
+  const createProvider = useCallback(
+    async (provider: ProviderSave, secret: string): Promise<void> => {
+      await saveProvider(provider);
+      try {
+        await setCredential(provider.credentialId, secret);
+      } catch (cause) {
+        throw Object.assign(new Error("provider credential save failed"), {
+          code: "provider_saved_credential_failed",
+          cause,
+        });
+      }
+    },
+    [saveProvider, setCredential],
+  );
+
+  /** 删除 native Secret 复用同一 CAS 恢复语义，并保留 Provider/MCP 中的不透明引用。 */
   const deleteCredential = useCallback(
     async (credentialId: string): Promise<void> => {
-      const current = currentLoaded();
-      if (current === undefined) throw new Error("settings unavailable");
-      const version = await adapter.deleteCredential(credentialId, current.cas.credentialVersion);
-      updateLoadedQuery((snapshot) => ({
-        ...snapshot,
-        cas: { ...snapshot.cas, credentialVersion: version },
-      }));
-      await reload();
+      await mutateCredential((expectedVersion) =>
+        adapter.deleteCredential(credentialId, expectedVersion),
+      );
     },
-    [adapter, currentLoaded, reload, updateLoadedQuery],
+    [adapter, mutateCredential],
   );
-
-  /** Query 返回新设置后同步唯一外观 owner；不从 renderer 反向生成配置版本。 */
-  useEffect(() => {
-    if (loaded !== undefined) setThemeMode(loaded.document.theme);
-  }, [loaded, setThemeMode]);
 
   /** 合并后的只读 snapshot 不缓存 Secret，也不把 runtime 健康状态写回设置文档。 */
   const snapshot = useMemo<SettingsSnapshot>(
     () =>
       loaded === undefined
-        ? {
-            revision: 0,
-            defaultSelection: null,
-            providers: [],
-            skills: [],
-            mcpServers: [],
-            defaultAccessMode: "full_access",
-            globalAccessMode: "full_access",
-            projectOverrides: {
-              defaultSelection: false,
-              accessMode: false,
-              disabledSkillIds: [],
-              disabledMcpIds: [],
-            },
-            appearance: { theme: "system", palette: "xcode", reducedMotion, highContrast },
-          }
-        : toSettingsSnapshot(
-            loaded.document,
-            loaded.userDocument,
-            loaded.projectOverrides,
-            runtimeSkills,
-            runtimeMcpServers,
-            {
-              reducedMotion,
-              highContrast,
-            },
-          ),
-    [highContrast, loaded, reducedMotion, runtimeMcpServers, runtimeSkills],
+        ? emptySettingsSnapshot({
+            theme: themeMode,
+            palette,
+            reducedMotion,
+            reducedTransparency,
+            highContrast,
+          })
+        : toSettingsSnapshot(loaded.document, runtimeSkills, runtimeMcpServers, {
+            theme: themeMode,
+            palette,
+            reducedMotion,
+            reducedTransparency,
+            highContrast,
+          }),
+    [
+      highContrast,
+      loaded,
+      palette,
+      reducedMotion,
+      reducedTransparency,
+      runtimeMcpServers,
+      runtimeSkills,
+      themeMode,
+    ],
+  );
+
+  /** 全局设置投影复用同一脱敏映射，但配置值严格取自 userDocument。 */
+  const globalSnapshot = useMemo<SettingsSnapshot>(
+    () =>
+      loaded === undefined
+        ? emptySettingsSnapshot({
+            theme: themeMode,
+            palette,
+            reducedMotion,
+            reducedTransparency,
+            highContrast,
+          })
+        : toSettingsSnapshot(loaded.userDocument, runtimeSkills, runtimeMcpServers, {
+            theme: themeMode,
+            palette,
+            reducedMotion,
+            reducedTransparency,
+            highContrast,
+          }),
+    [
+      highContrast,
+      loaded,
+      palette,
+      reducedMotion,
+      reducedTransparency,
+      runtimeMcpServers,
+      runtimeSkills,
+      themeMode,
+    ],
   );
 
   /** 以稳定 action 集合作为 UI 边界，避免视图接触 adapter 或 CAS 文档。 */
   const ports = useMemo<SettingsPorts>(
     () => ({
+      onCreateProvider: createProvider,
       onSaveProvider: saveProvider,
       onDeleteProvider: deleteProvider,
       onMoveProvider: moveProvider,
@@ -1132,7 +992,6 @@ export function useSettingsController({
       onDeleteModel: deleteModel,
       onMoveModel: moveModel,
       onDefaultSelectionChange: saveDefaultSelection,
-      onRestoreDefaultSelection: restoreDefaultSelection,
       onReplaceCredential: setCredential,
       onClearCredential: deleteCredential,
       onSaveMcp: saveMcp,
@@ -1142,21 +1001,19 @@ export function useSettingsController({
       onToggleSkill: toggleSkill,
       onAccessModeChange: saveAccessMode,
       onAppearanceChange: saveAppearance,
-      onResetProject: resetProject,
     }),
     [
       closeMcp,
+      createProvider,
       deleteModel,
       deleteMcp,
       deleteProvider,
       deleteCredential,
       moveModel,
       moveProvider,
-      resetProject,
       saveAppearance,
       saveAccessMode,
       saveDefaultSelection,
-      restoreDefaultSelection,
       saveMcp,
       saveModel,
       saveProvider,
@@ -1191,15 +1048,13 @@ export function useSettingsController({
   return {
     loaded,
     snapshot,
+    globalSnapshot,
     loading,
     synchronizing,
     scopeReady,
     scopeWorkspaceId: queryWorkspaceId,
-    scope,
-    projectAvailable: projectWorkspaceId !== undefined,
     error,
     ports,
     reload,
-    setScope,
   };
 }

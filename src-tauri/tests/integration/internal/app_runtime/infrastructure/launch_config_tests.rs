@@ -96,8 +96,8 @@ fn debug_runtime_root_hook_reads_expected_name() {
     );
 }
 
-/// 使用 Windows desktop QA 相同 external Runtime-root seam 验证完整 debug Java 构造，
-/// 同时覆盖独立 log storage。
+/// 使用 Windows desktop QA 相同 external Runtime-root seam 验证完整 debug Java 构造；
+/// home/data 必须保持调用方给出的 canonical 布局，不能从 run 父目录偷偷派生。
 #[cfg(debug_assertions)]
 #[test]
 fn debug_java_constructor_accepts_desktop_runtime_layout() {
@@ -108,13 +108,25 @@ fn debug_java_constructor_accepts_desktop_runtime_layout() {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().expect("test jar fixture"));
     let root = std::env::temp_dir().join(format!("ja-debug-java-{}", Uuid::new_v4()));
+    let home = root.join("settings").join(".ja");
+    let data = home.join("data");
+    let run = root.join("runtime").join("run");
     let logs = std::env::var_os("JA_TEST_JAVA_LOGS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("settings").join(".ja").join("logs").join("java"));
+        .unwrap_or_else(|| home.join("logs").join("java"));
     fs::create_dir_all(&logs).expect("debug Java logs");
-    let result = LaunchConfig::debug_java(executable, jar, root.join("run"), logs);
+    let config = LaunchConfig::debug_java(executable, jar, home.clone(), data.clone(), run, logs)
+        .expect("debug Java launch config");
+    assert_eq!(
+        config.sidecar.home_dir,
+        fs::canonicalize(&home).expect("canonical home")
+    );
+    assert_eq!(
+        config.sidecar.data_dir,
+        fs::canonicalize(&data).expect("canonical data")
+    );
+    assert_ne!(config.sidecar.home_dir, root.join("runtime").join("home"));
     let _ = fs::remove_dir_all(root);
-    assert!(result.is_ok());
 }
 
 /// Release build 必须忽略传入的 lookup closure，证明 debug-only environment seam 不能被生产

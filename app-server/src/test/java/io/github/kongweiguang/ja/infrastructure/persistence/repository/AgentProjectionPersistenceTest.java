@@ -3,9 +3,13 @@
 
 package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
+import io.github.kongweiguang.ja.conversation.domain.AttachmentSummary;
+import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
+import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
@@ -23,42 +27,87 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.sql.Statement;
+import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
 
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.binding;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
-import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.runtime;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.usageFact;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 真实 SQLite 重启覆盖阶段、Tool artifact、TurnChangeSet 与身份隔离。 */
 final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
 
     /**
-     * 结果和 diff 在事务后按完整身份分页恢复；重建 Repository 后仍保持 progress/final 分离，
-     * 猜中 artifactId 但缺少所属 Thread/Turn/Call 任一身份都不得读取正文。
+     * started 事务必须同时推进内部 Tool 状态与公开 presentation；重建 Repository 后的
+     * thread/read 也只能看到 running，不能退回截图中的“等待执行”。
+     */
+    @Test
+    void restoresRunningPresentationAfterStartedCommit() throws Exception {
+        try (TestDatabase database = database("agent-projection-running")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = store.admit(new ConversationRepository.TurnAdmission(
+                    "thr_agent", "turn_agent",
+                    "item_user", new ModelMessage(ModelRole.USER, List.of(new TextContent("run"))),
+                    List.of(), 0, START, execution("cfg_agent")));
+            ConversationRepository.CommitReceipt prepared = store.commit(new ConversationRepository.CommitRequest(
+                    "thr_agent", "turn_agent", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolPreparedFact("call_agent", "shell",
+                            JsonObjects.builder().putText("command", "echo ok").build(), 0,
+                            ToolSideEffect.EXTERNAL, presentation(ToolPresentation.Status.PENDING, null),
+                            binding("batch_fixture", "call_agent", "shell"))),
+                    admission.turnMutationVersion(), START.plusSeconds(1), execution("cfg_agent")));
+
+            store.commit(new ConversationRepository.CommitRequest(
+                    "thr_agent", "turn_agent", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolStartedFact("call_agent")),
+                    prepared.turnMutationVersion(), START.plusSeconds(2), execution("cfg_agent")));
+            store.close();
+
+            MybatisConversationRepository restoredStore = database.agentStore();
+            ThreadSnapshot snapshot = database.history(restoredStore)
+                    .readThread("thr_agent", null, 100).orElseThrow();
+            ThreadSnapshot.ToolItem tool = snapshot.items().stream()
+                    .filter(ThreadSnapshot.ToolItem.class::isInstance)
+                    .map(ThreadSnapshot.ToolItem.class::cast)
+                    .findFirst().orElseThrow();
+            assertEquals(ToolPresentation.Status.RUNNING, tool.presentation().status());
+            restoredStore.close();
+        }
+    }
+
+    /**
+     * 结果和 diff 在事务后按完整身份分页恢复；最近 UNKNOWN Usage 必须保留未知语义而非回退上一条
+     * KNOWN 计量，猜中 artifactId 但缺少所属 Thread/Turn/Call 任一身份都不得读取正文。
      */
     @Test
     void restoresSafeTimelineAndIsolatedArtifactsAfterRepositoryRestart() throws Exception {
         try (TestDatabase database = database("agent-projection-restart")) {
             MybatisConversationRepository store = initialized(database);
             ConversationRepository.AdmissionReceipt admission = store.admit(new ConversationRepository.TurnAdmission(
-                    "thr_agent", "turn_agent", runtime("provider_agent", "model_agent", "cfg_agent"),
+                    "thr_agent", "turn_agent",
                     "item_user", new ModelMessage(ModelRole.USER, List.of(new TextContent("run"))),
-                    List.of(), 0, START));
+                    List.of(), 0, START, execution("cfg_agent")));
             ToolPresentation pending = presentation(ToolPresentation.Status.PENDING, null);
             ConversationRepository.CommitReceipt running = store.commit(new ConversationRepository.CommitRequest(
                     "thr_agent", "turn_agent", TurnState.RUNNING,
                     List.of(new ConversationRepository.AssistantFact("item_progress",
                                     new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("working"))),
                                     "working", "public reasoning", 1),
-                            new ConversationRepository.UsageFact(new ModelUsage(42, 8, 50), 1),
+                            usageFact(1, 1, null),
+                            usageFact(1, 1, new ModelUsage(42, 8, 50)),
                             new ConversationRepository.ToolPreparedFact("call_agent", "shell",
                                     JsonObjects.builder().putText("command", "echo ok").build(), 0,
-                                    ToolSideEffect.EXTERNAL, pending)),
-                    admission.turnMutationVersion(), START.plusSeconds(1)));
+                                    ToolSideEffect.EXTERNAL, pending,
+                                    binding("batch_fixture", "call_agent", "shell"))),
+                    admission.turnMutationVersion(), START.plusSeconds(1), execution("cfg_agent")));
             String toolContent = "甲😀乙\nstdout";
             ToolPresentation completed = presentation(ToolPresentation.Status.SUCCESS, "artifact_tool_agent");
             ConversationRepository.CommitReceipt tool = store.commit(new ConversationRepository.CommitRequest(
@@ -68,19 +117,18 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
                                     toolContent, false, completed, toolContent),
                             new ConversationRepository.ToolResultMessageFact("item_tool",
                                     new ModelMessage(ModelRole.TOOL,
-                                            List.of(new ToolResultContent("call_agent", toolContent, false))))),
-                    running.turnMutationVersion(), START.plusSeconds(2)));
+                                            List.of(new ToolResultContent("call_agent", toolContent, false)))),
+                            usageFact(2, 2, null)),
+                    running.turnMutationVersion(), START.plusSeconds(2), execution("cfg_agent")));
+            String diff = "--- a/甲.txt\n+++ b/甲.txt\n@@ -1,1 +1,1 @@\n-甲\n+乙😀\n";
+            TurnChangeSet changeSet = new TurnChangeSet(TurnChangeSet.State.COMPLETE, java.util.Set.of(),
+                    List.of(new TurnChangeSet.FileChange("甲.txt", TurnChangeSet.FileStatus.MODIFIED,
+                            1L, 0L, false, false)),
+                    new TurnChangeSet.Stats(1, 1, 0, 0, false), "artifact_change_agent");
             store.commitTerminal(new ConversationRepository.TerminalCommit(
                     "thr_agent", "turn_agent", TurnState.COMPLETED, "done", null, null,
                     "item_final", new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("done"))),
-                    List.of(), tool.turnMutationVersion(), START.plusSeconds(3)));
-            String diff = "diff --git a/甲.txt b/甲.txt\n+乙😀\n";
-            TurnChangeSet changeSet = database.history(store).commitChangeSet(new ThreadUseCase.ChangeSetCommit(
-                    "thr_agent", "turn_agent", "ws_agent",
-                    new TurnChangeSet(TurnChangeSet.State.AVAILABLE, null,
-                            List.of(new TurnChangeSet.FileChange("甲.txt", null,
-                                    TurnChangeSet.FileStatus.MODIFIED, 1L, 0L, false, false)),
-                            new TurnChangeSet.Stats(1, 1, 0, 0, false), null),
+                    List.of(), tool.turnMutationVersion(), START.plusSeconds(3), changeSet,
                     sha256(diff), (long) diff.getBytes(StandardCharsets.UTF_8).length, diff));
             assertNotNull(changeSet.artifactId());
 
@@ -96,8 +144,14 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
                     .map(ThreadSnapshot.TextItem.class::cast)
                     .filter(item -> item.kind() == ThreadSnapshot.TextKind.FINAL_ANSWER).count());
             assertEquals(changeSet, snapshot.turns().getFirst().changeSet());
-            assertEquals(new ThreadSnapshot.ContextUsage(
-                    "turn_agent", 1, 42, 8, 50, START.plusSeconds(1)), snapshot.contextUsage());
+            assertEquals("turn_agent", snapshot.contextUsage().turnId());
+            assertEquals("request_2", snapshot.contextUsage().request().requestId());
+            assertEquals(2, snapshot.contextUsage().request().requestOrdinal());
+            assertEquals(ProviderRequestUsage.Certainty.UNKNOWN,
+                    snapshot.contextUsage().request().certainty());
+            assertEquals("provider_test", snapshot.contextUsage().request().profile().providerId());
+            assertEquals("model_test", snapshot.contextUsage().request().profile().modelId());
+            assertNull(snapshot.contextUsage().request().usage());
 
             ThreadUseCase.TextArtifactPage first = restored.readToolArtifact(
                     "thr_agent", "turn_agent", "call_agent", "artifact_tool_agent", 0, 2).orElseThrow();
@@ -112,20 +166,61 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
             assertTrue(restored.readToolArtifact("thr_agent", "turn_agent", "call_other",
                     "artifact_tool_agent", 0, 64).isEmpty());
 
-            StringBuilder restoredDiff = new StringBuilder();
-            int offset = 0;
-            do {
-                ThreadUseCase.BinaryTextArtifactPage page = restored.readChangeSetArtifact(
-                        "thr_agent", "turn_agent", changeSet.artifactId(), offset, 17).orElseThrow();
-                restoredDiff.append(page.content());
-                if (page.nextOffsetBytes() == null) break;
-                assertTrue(page.nextOffsetBytes() > offset);
-                offset = page.nextOffsetBytes();
-            } while (true);
-            assertEquals(diff, restoredDiff.toString());
+            ThreadUseCase.ChangeSetArtifactFile restoredFile = restored.readChangeSetArtifact(
+                    "thr_agent", "turn_agent", changeSet.artifactId(), "甲.txt").orElseThrow();
+            String restoredDiff = new String(Base64.getDecoder().decode(restoredFile.contentBase64()),
+                    StandardCharsets.UTF_8);
+            assertEquals(diff, restoredDiff);
+            assertEquals(diff.getBytes(StandardCharsets.UTF_8).length, restoredFile.byteLength());
             assertFalse(restored.readChangeSetArtifact(
-                    "thr_agent", "turn_other", changeSet.artifactId(), 0, 64).isPresent());
+                    "thr_agent", "turn_other", changeSet.artifactId(), "甲.txt").isPresent());
             restoredStore.close();
+        }
+    }
+
+    /**
+     * 迁移遗留的坏附件引用必须能通过严格 thread/read 投影为可识别占位，并允许用户编辑移除；
+     * 不可用摘要只保留原 identity，不读取不存在或不属于该 input 的附件元数据。
+     */
+    @Test
+    void restoresAndRepairsUnavailableQueuedAttachment() throws Exception {
+        try (TestDatabase database = database("agent-projection-unavailable-attachment")) {
+            MybatisConversationRepository store = initialized(database);
+            store.admit(new ConversationRepository.TurnAdmission(
+                    "thr_agent", "turn_agent", "item_user",
+                    new ModelMessage(ModelRole.USER, List.of(new TextContent("run"))),
+                    List.of(), 0, START, execution("cfg_agent")));
+            try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession();
+                 Statement sql = session.getConnection().createStatement()) {
+                sql.executeUpdate("INSERT INTO pending_inputs(input_id,thread_id,turn_id,kind,content_json,"
+                        + "state,validation_status,issue_error_code,issue_message,issue_retryable,input_revision,"
+                        + "created_at,updated_at) VALUES ('input_broken','thr_agent','turn_agent','FOLLOW_UP',"
+                        + "'[{\"kind\":\"attachment\",\"attachmentId\":\"att_missing\"}]','PENDING',"
+                        + "'NEEDS_ATTENTION','ATTACHMENT_UNAVAILABLE','附件不可用，请移除后继续。',0,1,"
+                        + "'2026-08-25T12:00:01Z','2026-08-25T12:00:01Z')");
+                sql.executeUpdate("UPDATE turns SET input_queue_revision=1 WHERE turn_id='turn_agent'");
+                session.commit();
+            }
+
+            ThreadSnapshot snapshot = database.history(store)
+                    .readThread("thr_agent", null, 100).orElseThrow();
+            InputQueue.QueuedInput broken = snapshot.inputQueue().items().getFirst();
+            assertEquals(InputQueue.Status.NEEDS_ATTENTION, broken.status());
+            assertEquals("ATTACHMENT_UNAVAILABLE", broken.issue().errorCode());
+            assertEquals(List.of(new AttachmentSummary(
+                    "att_missing", "附件不可用", 0, "binary", "application/octet-stream")),
+                    broken.attachments());
+
+            ConversationRepository.QueueMutation repaired = store.updateInput(
+                    "thr_agent", "turn_agent", "input_broken", 1,
+                    new UserContent(List.of(new TextContent("已移除失效附件"))),
+                    START.plusSeconds(2));
+            InputQueue.QueuedInput repairedInput = repaired.inputQueue().items().getFirst();
+            assertEquals(InputQueue.Status.PENDING, repairedInput.status());
+            assertNull(repairedInput.issue());
+            assertTrue(repairedInput.attachments().isEmpty());
+            assertTrue(repairedInput.content().attachmentIds().isEmpty());
+            store.close();
         }
     }
 

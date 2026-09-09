@@ -15,14 +15,25 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct TempRunDir(PathBuf);
+
+static JVM_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 串行化本测试目标内会启动或观察 Java sidecar 的生命周期用例：这些用例虽然隔离了目录，
+/// 但仍共享宿主 CPU、进程枚举和严格启动 deadline，并行冷启动会把资源争用误判为产品超时。
+/// poison 只表示前一用例失败，不应阻止后续用例执行并提供独立诊断证据。
+fn jvm_runtime_test_guard() -> MutexGuard<'static, ()> {
+    JVM_RUNTIME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl TempRunDir {
     /// 为每个测试创建唯一目录，避免并行 worker 共享 sidecar cwd，或误读其他测试的文件。
@@ -129,13 +140,12 @@ fn configure_isolated_profile(harness: &RuntimeHostHarness) {
                     "providers": [{
                         "provider_id": "provider_host",
                         "name": "Host integration",
-                        "provider": "openai",
                         "api": "openai_responses",
                         "base_url": "http://127.0.0.1:9/v1",
                         "credential_id": "cred_host",
                         "network_timeouts": {
-                            "connect_timeout_ms": 5000,
-                            "request_timeout_ms": 30000
+                            "connect_timeout_ms": 100,
+                            "request_timeout_ms": 1000
                         },
                         "agent_defaults": {
                             "context": {"auto_compact": true},
@@ -334,7 +344,7 @@ fn join_with_deadline<T: Send + 'static>(
         .map_err(|_| "test worker join deadline elapsed")?
 }
 
-/// 只构造 JA-RPC v2 当前 Turn 输入；Thread 身份必须先由 Java 持久化用例签发。
+/// 只构造 JA-RPC v1 当前 Turn 输入；Thread 身份必须先由 Java 持久化用例签发。
 fn valid_turn(thread_id: String, text: &str) -> TurnStartInput {
     TurnStartInput {
         thread_id,
@@ -364,7 +374,7 @@ fn assert_no_token(value: &Value) {
     }
 }
 
-/// 只读取公开的 `method` 字段，避免测试绑定完整内部 JA-RPC v2 帧结构。
+/// 只读取公开的 `method` 字段，避免测试绑定完整内部 JA-RPC v1 帧结构。
 fn method(value: &Value) -> Option<&str> {
     value.get("method").and_then(Value::as_str)
 }
@@ -395,6 +405,7 @@ where
 /// 每实例 actor gate 排除调度时序干扰，使 backpressure 成为确定的 admission 合同。
 #[test]
 fn concurrent_calls_have_bounded_queue_admission() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("queue");
     let sink: EventSink = Arc::new(|_| Ok(()));
     let placeholder = run_dir.0.join("queue-sidecar-placeholder.exe");
@@ -434,6 +445,7 @@ fn concurrent_calls_have_bounded_queue_admission() {
 /// Java25 隔离 Turn 与有界关闭，确保测试经过同一 production composition。
 #[test]
 fn tauri_mock_composition_smoke_uses_typed_commands() {
+    let _jvm_guard = jvm_runtime_test_guard();
     use crate::app_runtime::{RPC_FRAME_EVENT, cleanup_on_exit, register_commands};
     use tauri::Emitter;
     use tauri::Listener;
@@ -476,7 +488,17 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
             .map_err(|_| EventEmitError::DeliveryFailed)
     });
     let host = RuntimeHost::new(marked_fixture_config(&run_dir, &marker), sink);
+    // Mock composition 必须托管与生产 workspace-open 相同的附件预览状态；这里使用空 host，
+    // 只验证 Workspace 切换时的有界清理，不为测试创建第二套协议或文件读取能力。
+    let attachment_preview_host = Arc::new(
+        crate::attachment_preview::AttachmentPreviewHost::new()
+            .expect("mock attachment preview host"),
+    );
     let app = register_commands(mock_builder())
+        .manage(
+            crate::attachment_preview::AttachmentPreviewRuntimeState::new(Arc::new(host.clone())),
+        )
+        .manage(attachment_preview_host)
         .manage(host)
         .build(mock_context(noop_assets()))
         .expect("mock Tauri app");
@@ -555,7 +577,7 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
                 "scope": "user",
                 "expectedVersion": user_version,
                 "document": {
-                    "schema_version": 4,
+                    "schema_version": 1,
                     "config_revision": 1,
                     "default_access_mode": "full_access",
                     "default_provider_id": "provider_host",
@@ -564,7 +586,6 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
                     "providers": [{
                         "provider_id": "provider_host",
                         "name": "Fixture",
-                        "provider": "openai",
                         "api": "openai_responses",
                         "base_url": "http://127.0.0.1:8080/v1",
                         "credential_id": "cred_host",
@@ -631,7 +652,8 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
                 "providerId": "provider_host",
                 "modelId": "model_host",
                 "reasoningLevel": "medium",
-                "accessMode": "full_access"
+                "accessMode": "full_access",
+                "collaborationMode": "default"
             }
         }),
     )
@@ -717,6 +739,7 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
 /// 只有确认当前 identity/revision 后才允许惰性创建 bridge，防止陈旧确认越过恢复门禁。
 #[test]
 fn tauri_mock_recovery_gate_is_typed_and_lazy() {
+    let _jvm_guard = jvm_runtime_test_guard();
     use crate::app_runtime::{
         RPC_FRAME_EVENT, RuntimeRecoveryStateDto as RuntimeRecoveryState, cleanup_on_exit,
         register_commands,
@@ -733,7 +756,7 @@ fn tauri_mock_recovery_gate_is_typed_and_lazy() {
         .expect("create recovery directory");
     std::fs::write(
         &recovery_path,
-        br#"{"schemaVersion":2,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000002","revision":9,"generation":1}"#,
+        br#"{"schemaVersion":1,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000002","revision":9,"generation":1}"#,
     )
     .expect("recovery marker");
     let app_slot: Arc<OnceLock<tauri::AppHandle<tauri::test::MockRuntime>>> =
@@ -834,6 +857,7 @@ fn tauri_mock_recovery_gate_is_typed_and_lazy() {
 /// 只有显式重试成功回收进程后才能再次关闭，避免窗口退出掩盖隔离区中的活跃 owner。
 #[test]
 fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
+    let _jvm_guard = jvm_runtime_test_guard();
     use crate::handle_exit_requested;
     use tauri::Manager;
     use tauri::RunEvent;
@@ -949,6 +973,7 @@ fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
 /// 前一个 Turn 完成后，后一个 Turn 也不能因生命周期投影而误报失败并诱发 UI 重试。
 #[test]
 fn real_java_turn_and_shutdown_close_without_token_leak() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("turn");
     let marker = format!("ja-marker-{}", std::process::id());
     let total_deadline = Instant::now() + Duration::from_secs(30);
@@ -1109,6 +1134,7 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
 /// 测试仅断言脱敏投影和进程清理，避免把已经删除的 Rust 配置 owner 重新带回生产边界。
 #[test]
 fn real_java_configuration_read_is_java_owned_and_secret_free() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("replay");
     let (sink, receiver) = event_sink();
     let harness = RuntimeHostHarness::new(fixture_config(&run_dir), sink);
@@ -1133,6 +1159,7 @@ fn real_java_configuration_read_is_java_owned_and_secret_free() {
 #[cfg(windows)]
 #[test]
 fn slow_handshake_shutdown_has_one_total_deadline() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("slow-shutdown");
     let marker = format!("ja-slow-marker-{}", std::process::id());
     let total_deadline = Instant::now() + Duration::from_secs(30);
@@ -1220,6 +1247,7 @@ fn slow_handshake_shutdown_has_one_total_deadline() {
 /// 恢复标记必须在 spawn 前阻止新 sidecar；只有显式确认才能清除并重新进入 Java25 启动路径。
 #[test]
 fn recovery_marker_blocks_start_until_explicit_acknowledgement() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("recovery-gate");
     let marker = format!("ja-recovery-marker-{}", std::process::id());
     let recovery_path = run_dir.0.join("runtime").join("ja-runtime-recovery.json");
@@ -1227,7 +1255,7 @@ fn recovery_marker_blocks_start_until_explicit_acknowledgement() {
         .expect("create recovery directory");
     std::fs::write(
         &recovery_path,
-        br#"{"schemaVersion":2,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000001","revision":7,"generation":1}"#,
+        br#"{"schemaVersion":1,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000001","revision":7,"generation":1}"#,
     )
     .expect("recovery marker");
     let sink: EventSink = Arc::new(|_| Ok(()));
@@ -1261,6 +1289,7 @@ fn recovery_marker_blocks_start_until_explicit_acknowledgement() {
 /// 验证重复生命周期调用保持幂等，后续 start 必须创建干净进程而不能复用陈旧 event pump。
 #[test]
 fn repeated_start_stop_is_bounded_and_idempotent() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("lifecycle");
     let sink: EventSink = Arc::new(|_| Ok(()));
     let bridge = RuntimeHostHarness::bridge(fixture_config(&run_dir), sink).expect("bridge actor");
@@ -1294,6 +1323,7 @@ fn repeated_start_stop_is_bounded_and_idempotent() {
 /// 验证 launch failure 保持稳定错误，不触发自动重启循环，也不残留任何 child 进程。
 #[test]
 fn launch_failure_does_not_crash_loop() {
+    let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("failure");
     let missing = run_dir.0.join("missing-sidecar");
     let sink: EventSink = Arc::new(|_| Ok(()));

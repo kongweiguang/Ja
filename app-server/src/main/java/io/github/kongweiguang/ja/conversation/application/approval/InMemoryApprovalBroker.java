@@ -36,6 +36,19 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
     private final ConcurrentHashMap<String, Instant> tombstones = new ConcurrentHashMap<>();
     private final Object tombstoneLock = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicReference<DecisionStore> decisionStore =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    /** 只允许组合一次持久 owner，防止不同 Repository 竞争同一审批 Future。 */
+    @Override
+    public void bindDecisionStore(DecisionStore store) {
+        Objects.requireNonNull(store, "store");
+        DecisionStore current = decisionStore.get();
+        if (current == store) return;
+        if (!decisionStore.compareAndSet(null, store)) {
+            throw new IllegalStateException("approval decision store is already bound");
+        }
+    }
 
     /**
      * 创建并独占单线程超时调度器，确保审批到期任务不会占用公共执行器。
@@ -91,9 +104,15 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
             Instant now = clock.instant();
             purgeTombstones(now);
             if (!request.expiresAt().isAfter(now)) {
-                rememberTombstone(request.approvalId(), now);
-                return CompletableFuture.completedFuture(
-                        new Resolution(request.approvalId(), ApprovalDecision.DENY, request.expiresAt()));
+                DecisionStore durable = decisionStore.get();
+                if (durable != null && durable.persist(
+                        request.approvalId(), ApprovalDecision.DENY, request.expiresAt())) {
+                    rememberTombstone(request.approvalId(), now);
+                    return CompletableFuture.completedFuture(
+                            new Resolution(request.approvalId(), ApprovalDecision.DENY, request.expiresAt()));
+                }
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("expired approval decision was not persisted"));
             }
             if (tombstones.containsKey(request.approvalId())) {
                 return CompletableFuture.failedFuture(new IllegalArgumentException("approvalId was already used"));
@@ -108,18 +127,21 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
             }
             try {
                 CancellationToken.Registration registration = cancellationToken.onCancellation(
-                        () -> finish(candidate, ApprovalDecision.DENY, clock.instant()));
+                        () -> finishDurably(candidate, ApprovalDecision.DENY,
+                                boundedResolutionTime(candidate, clock.instant())));
                 candidate.installRegistration(registration);
                 long delayNanos = Math.max(0L, Duration.between(clock.instant(), request.expiresAt()).toNanos());
                 candidate.installExpiry(scheduler.schedule(
-                        () -> finish(candidate, ApprovalDecision.DENY, candidate.request.expiresAt()),
+                        () -> finishDurably(candidate, ApprovalDecision.DENY, candidate.request.expiresAt()),
                         delayNanos, TimeUnit.NANOSECONDS));
                 if (cancellationToken.isCancellationRequested()) {
-                    finish(candidate, ApprovalDecision.DENY, clock.instant());
+                    finishDurably(candidate, ApprovalDecision.DENY,
+                            boundedResolutionTime(candidate, clock.instant()));
                 }
                 return candidate.result;
             } catch (RuntimeException exception) {
-                if (finish(candidate, ApprovalDecision.DENY, clock.instant())) {
+                if (finishDurably(candidate, ApprovalDecision.DENY,
+                        boundedResolutionTime(candidate, clock.instant()))) {
                     return CompletableFuture.failedFuture(exception);
                 }
                 return candidate.result;
@@ -145,10 +167,10 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
         if (!now.isBefore(approval.request.expiresAt())
             || !resolvedAt.isBefore(approval.request.expiresAt())
             || resolvedAt.isAfter(now)) {
-            finish(approval, ApprovalDecision.DENY, approval.request.expiresAt());
+            finishDurably(approval, ApprovalDecision.DENY, approval.request.expiresAt());
             return false;
         }
-        return finish(approval, response, resolvedAt);
+        return finishDurably(approval, response, resolvedAt);
     }
 
     /**
@@ -163,7 +185,8 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
         pending.values().stream()
                 .filter(approval -> approval.request.permission().threadId().equals(threadId)
                                     && approval.request.permission().turnId().equals(turnId))
-                .forEach(approval -> finish(approval, ApprovalDecision.DENY, now));
+                .forEach(approval -> finishDurably(approval, ApprovalDecision.DENY,
+                        boundedResolutionTime(approval, now)));
     }
 
     /**
@@ -183,12 +206,26 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
-            Instant now = clock.instant();
-            pending.values().forEach(approval -> finish(approval, ApprovalDecision.DENY, now));
-            if (ownsScheduler) {
-                scheduler.shutdownNow();
+            try {
+                Instant now = clock.instant();
+                for (PendingApproval approval : pending.values()) {
+                    if (!finishDurably(approval, ApprovalDecision.DENY,
+                            boundedResolutionTime(approval, now))) {
+                        throw new IllegalStateException("approval shutdown decision was not persisted");
+                    }
+                }
+                if (ownsScheduler) {
+                    scheduler.shutdownNow();
+                }
+                tombstones.clear();
+            } catch (RuntimeException failure) {
+                /*
+                 * SQLite 未确认前不能永久关闭内存 owner；恢复 open 位让应用关闭协调器可重试，
+                 * 已成功完成的审批仍由墓碑保持 exactly-once。
+                 */
+                closed.set(false);
+                throw failure;
             }
-            tombstones.clear();
         } finally {
             lifecycle.writeLock().unlock();
         }
@@ -207,6 +244,25 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
         approval.disposeRegistrations();
         approval.result.complete(new Resolution(approval.request.approvalId(), response, resolvedAt));
         return true;
+    }
+
+    /** 自动拒绝与外部响应共享 persist-before-wake；失败保留 waiter 供恢复或后续重试。 */
+    private boolean finishDurably(PendingApproval approval, ApprovalDecision response, Instant resolvedAt) {
+        if (!approval.resolving.compareAndSet(false, true)) return false;
+        try {
+            if (approval.finished.get()) return false;
+            DecisionStore durable = decisionStore.get();
+            return durable != null
+                    && durable.persist(approval.request.approvalId(), response, resolvedAt)
+                    && finish(approval, response, resolvedAt);
+        } finally {
+            approval.resolving.set(false);
+        }
+    }
+
+    /** 到期后的本地取消使用原 expiry 作为权威时刻，使持久拒绝仍满足审批时间约束。 */
+    private static Instant boundedResolutionTime(PendingApproval approval, Instant candidate) {
+        return candidate.isAfter(approval.request.expiresAt()) ? approval.request.expiresAt() : candidate;
     }
 
     /**
@@ -248,6 +304,7 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
     private static final class PendingApproval {
         private final ApprovalRequest request;
         private final CompletableFuture<Resolution> result = new CompletableFuture<>();
+        private final AtomicBoolean resolving = new AtomicBoolean();
         private final AtomicBoolean finished = new AtomicBoolean();
         private volatile CancellationToken.Registration cancellationRegistration;
         private volatile ScheduledFuture<?> expiry;

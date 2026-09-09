@@ -6,7 +6,7 @@ package io.github.kongweiguang.ja.conversation.domain.turn;
 import java.util.Objects;
 
 /**
- * Turn 对外可观察且必须单调推进的六态闭集。
+ * Turn 对外可观察且必须单调推进的七态闭集。
  */
 public enum TurnState {
     /**
@@ -21,6 +21,10 @@ public enum TurnState {
      * 已持久化审批请求并等待用户决定。
      */
     WAITING_APPROVAL,
+    /**
+     * 进程中断后保留了可校验执行游标，只有用户显式恢复才可再次产生外部作用。
+     */
+    SUSPENDED,
     /**
      * 已提交最终 assistant 消息的成功终态。
      */
@@ -48,8 +52,9 @@ public enum TurnState {
         Objects.requireNonNull(target, "target");
         if (this == target || terminal()) return false;
         return switch (this) {
-            case QUEUED, WAITING_APPROVAL -> target == RUNNING || target.terminal();
-            case RUNNING -> target == WAITING_APPROVAL || target.terminal();
+            case QUEUED, WAITING_APPROVAL -> target == RUNNING || target == SUSPENDED || target.terminal();
+            case RUNNING -> target == WAITING_APPROVAL || target == SUSPENDED || target.terminal();
+            case SUSPENDED -> target == QUEUED || target.terminal();
             case COMPLETED, FAILED, CANCELLED -> false;
         };
     }

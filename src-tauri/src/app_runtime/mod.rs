@@ -21,20 +21,30 @@ pub(crate) use application::{
     SkillListParams, SkillListResultData, ThreadArchiveParams, ThreadArchiveResultData,
     ThreadCompactParams, ThreadCompactResultData, ThreadCreateParams, ThreadCreateResultData,
     ThreadDeleteParams, ThreadDeleteResultData, ThreadListParams, ThreadListResultData,
-    ThreadPreferencesUpdateParams, ThreadPreferencesUpdateResultData, ThreadReadParams,
-    ThreadReadResultData, ThreadRenameParams, ThreadRenameResultData, ThreadSearchParams,
-    ThreadSearchResultData, TurnChangeCaptureContext, WorkspaceListParams, WorkspaceListResultData,
-    WorkspaceRuntimeSource,
+    ThreadPinParams, ThreadPinResultData, ThreadPreferencesUpdateParams,
+    ThreadPreferencesUpdateResultData, ThreadReadParams, ThreadReadResultData, ThreadRenameParams,
+    ThreadRenameResultData, ThreadRestoreParams, ThreadRestoreResultData, ThreadSearchParams,
+    ThreadSearchResultData, ThreadSeenParams, ThreadSeenResultData, WorkspaceListParams,
+    WorkspaceListResultData, WorkspaceRuntimeSource,
 };
 pub use application::{EventEmitError, RuntimeCommandError};
-pub(crate) use domain::valid_frozen_turn_id;
 pub use domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
-    GeneralWorkspace, ManualRecoveryConfirmation, ManualRecoveryReason, RuntimeConfigurationStatus,
-    RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo,
-    ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnContentPart, TurnQueuedInput,
-    TurnQueuedInputResult, TurnStartInput, WorkspaceDto, WorkspaceOpenInput,
+    AttachmentSummary, GeneralWorkspace, InputQueue, ManualRecoveryConfirmation,
+    ManualRecoveryReason, QueuedInput, QueuedInputIssue, RuntimeConfigurationStatus,
+    RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo, TaskActivity,
+    TaskContextPreviewItem, TaskContextSeed, TaskCreateInput, TaskCreateResult, TaskFollowupInput,
+    TaskFollowupResult, TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput,
+    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
+    TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
+    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted,
+    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
+    TurnContentPart, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult,
+    TurnInputUpdate, TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspaceOpenInput,
+    WorkspacePathSearchInput, WorkspacePathSearchItem, WorkspacePathSearchResult,
+};
+pub(crate) use domain::{
+    GoalMethod, GoalPayload, GoalPayloadError, GoalRequest, GoalResponse, valid_frozen_turn_id,
 };
 pub use infrastructure::EventSink;
 pub(crate) use infrastructure::HomeLayout;

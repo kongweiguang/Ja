@@ -10,8 +10,8 @@
 use super::git::{CancellationToken, GitError, GitReadOnly};
 use crate::review::application::{ReviewError, ReviewNativePort};
 use crate::review::domain::{
-    ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewFile, ReviewRevision, ReviewSnapshot,
-    ReviewSource, ReviewTarget,
+    ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewFile, ReviewFileId, ReviewRevision,
+    ReviewSnapshot, ReviewSource, ReviewTarget,
 };
 use crate::workspace::{MutationInfrastructureError, WorkspaceError, WorkspaceHandle};
 
@@ -87,17 +87,66 @@ impl ReviewNativePort for NativeReviewAdapter {
         source: &ReviewSource,
         cancellation: &CancellationToken,
     ) -> Result<ReviewSnapshot, ReviewError> {
-        self.materialize_snapshot(source, cancellation)
+        let snapshot = self.materialize_snapshot(source, cancellation)?;
+        super::snapshot_cache::remember(self.workspace.id(), &snapshot);
+        Ok(snapshot)
     }
 
-    /// 只补读 application 已从新鲜 snapshot 解析出的文件，禁止把 caller 字符串当路径。
-    fn materialize_file(
+    /// cache key 使用随机 Workspace identity，避免同路径删除重建后复用旧 selector。
+    fn cached_file(
         &self,
         source: &ReviewSource,
+        revision: &ReviewRevision,
+        file_id: &ReviewFileId,
+    ) -> Option<ReviewFile> {
+        super::snapshot_cache::file(self.workspace.id(), source, revision, file_id)
+    }
+
+    /// 补读目标 diff 后用缓存证据复核 revision；每条 Git 命令保持独立仓库安全校验。
+    fn load_file_at_revision(
+        &self,
+        source: &ReviewSource,
+        expected: &ReviewRevision,
         file: &ReviewFile,
+        validate_revision: bool,
         cancellation: &CancellationToken,
     ) -> Result<ReviewFile, ReviewError> {
-        self.materialize_one_file(source, file, cancellation)
+        if !validate_revision {
+            return if file.requires_diff_load() {
+                self.materialize_one_file(source, file, cancellation)
+            } else {
+                Ok(file.clone())
+            };
+        }
+        let Some(cached) = super::snapshot_cache::snapshot(self.workspace.id(), source, expected)
+        else {
+            let loaded = if file.requires_diff_load() {
+                self.materialize_one_file(source, file, cancellation)?
+            } else {
+                file.clone()
+            };
+            if self.probe_revision(source, cancellation)? != expected.as_str() {
+                return Err(ReviewError::ReviewStale);
+            }
+            return Ok(loaded);
+        };
+        let loaded = (|| {
+            let loaded = if file.requires_diff_load() {
+                self.materialize_one_file(source, file, cancellation)?
+            } else {
+                file.clone()
+            };
+            let current =
+                self.probe_cached_revision(source, &cached, &file.file_id, cancellation)?;
+            if current != expected.as_str() {
+                return Err(ReviewError::ReviewStale);
+            }
+            Ok(loaded)
+        })();
+        if loaded.is_err() {
+            super::snapshot_cache::invalidate(self.workspace.id(), source);
+        }
+        loaded
     }
 
     /// 把 CAS、路径锁、临时 index 与 worktree recovery 统一分派给 mutation 模块。

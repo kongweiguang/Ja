@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.conversation.adapter.out.provider.shared;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
+import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -13,36 +14,32 @@ import java.util.HexFormat;
 import java.util.Objects;
 
 /**
- * 冻结一次 Provider 请求的发送正文、精确计量正文和 Token 相关指纹。
- *
- * <p>计量接口通常不接受 {@code stream} 等传输控制字段，因此两个 HTTP 正文不要求字节完全
- * 相同；它们必须由同一个冻结节点派生，且只允许删除不影响输入 Token 的传输字段。</p>
+ * 冻结一次 Provider 请求的发送正文、本地输入 Token 估算和请求指纹。
  */
 public final class ProviderRequestEnvelope {
     private final byte[] sendBody;
-    private final byte[] countBody;
     private final String fingerprint;
+    private final long inputTokenEstimate;
 
     /**
-     * 从唯一冻结请求节点派生两个正文，避免 count 与 send 分别执行可能漂移的业务映射。
+     * 从唯一请求节点派生发送正文与协议感知的预算证据，估算阶段不得调用任何 Provider 计量接口。
      */
-    public static ProviderRequestEnvelope freeze(ObjectNode request) {
+    public static ProviderRequestEnvelope freeze(ObjectNode request, ModelPort.Api api) {
         Objects.requireNonNull(request, "request");
-        ObjectNode send = request.deepCopy();
-        ObjectNode count = request.deepCopy();
-        count.remove("stream");
-        byte[] sendBody = AbstractStreamingModelAdapter.serializeRequest(send);
-        byte[] countBody = AbstractStreamingModelAdapter.serializeRequest(count);
-        return new ProviderRequestEnvelope(sendBody, countBody, sha256(countBody));
+        Objects.requireNonNull(api, "api");
+        byte[] sendBody = AbstractStreamingModelAdapter.serializeRequest(request.deepCopy());
+        long inputTokenEstimate = ProviderInputTokenEstimator.estimate(request.deepCopy(), api);
+        return new ProviderRequestEnvelope(sendBody, sha256(sendBody), inputTokenEstimate);
     }
 
     /**
      * 防御性复制正文，使 OkHttp RequestBody 和计量缓存不能观察到调用方后续修改。
      */
-    private ProviderRequestEnvelope(byte[] sendBody, byte[] countBody, String fingerprint) {
+    private ProviderRequestEnvelope(byte[] sendBody, String fingerprint, long inputTokenEstimate) {
         this.sendBody = Arrays.copyOf(Objects.requireNonNull(sendBody, "sendBody"), sendBody.length);
-        this.countBody = Arrays.copyOf(Objects.requireNonNull(countBody, "countBody"), countBody.length);
         this.fingerprint = Objects.requireNonNull(fingerprint, "fingerprint");
+        if (inputTokenEstimate < 0) throw new IllegalArgumentException("inputTokenEstimate must not be negative");
+        this.inputTokenEstimate = inputTokenEstimate;
     }
 
     /** 返回发送端使用的冻结正文副本，防止传输层持有可变数组。 */
@@ -50,24 +47,20 @@ public final class ProviderRequestEnvelope {
         return Arrays.copyOf(sendBody, sendBody.length);
     }
 
-    /** 返回计量端使用的冻结正文副本，防止重试改变指纹对应内容。 */
-    public byte[] countBody() {
-        return Arrays.copyOf(countBody, countBody.length);
-    }
-
-    /** 返回仅由 Token 相关计量正文派生的稳定 SHA-256 指纹。 */
+    /** 返回由完整发送正文派生的稳定 SHA-256 指纹。 */
     public String fingerprint() {
         return fingerprint;
     }
 
     /**
-     * 返回冻结计量正文的 UTF-8 字节数作为 Token 严格上界。
+     * 返回协议感知的本地输入 Token 保守估计。
      *
-     * <p>该值只供明确缺少官方计量端点的 OpenAI-compatible 服务使用。完整历史 JSON 中每个
-     * tokenizer token 至少消费一个底层字节，因此字节数可能显著高估，但不会低估窗口占用。</p>
+     * <p>文本仍以冻结 JSON 的 UTF-8 字节数作为上界，协议原生图片则按公开的尺寸计量规则估算，
+     * 避免把 Base64 传输膨胀误算为文本 Token。兼容端点可能采用不同 tokenizer，因此该值只用于
+     * 请求前本地准入；响应后的 Provider usage 与真实 {@code CONTEXT_LIMIT} 仍是权威事实。</p>
      */
-    public long conservativeInputTokenUpperBound() {
-        return countBody.length;
+    public long inputTokenEstimate() {
+        return inputTokenEstimate;
     }
 
     /**

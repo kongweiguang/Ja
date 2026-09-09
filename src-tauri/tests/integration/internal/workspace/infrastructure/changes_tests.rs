@@ -67,6 +67,47 @@ fn oversized_initial_baseline_starts_degraded_and_recovers() {
     assert!(!detector.requires_initial_rescan());
 }
 
+/// 可再生目录不能消耗 watcher 的 entry 预算，也不能因内部编译 churn 进入轮询差异。
+#[test]
+fn generated_directories_are_excluded_from_polling_baselines() {
+    let root = TempWorkspace::create();
+    let target = root.0.join("target");
+    fs::create_dir_all(&target).expect("create ignored target");
+    for index in 0..32 {
+        fs::write(target.join(format!("artifact-{index}.bin")), "generated")
+            .expect("generated artifact");
+    }
+    fs::write(root.0.join("source.rs"), "before").expect("source fixture");
+    let mut detector = PollingChangeDetector::new(
+        root.handle(),
+        PollingPolicy {
+            max_entries: 2,
+            ..PollingPolicy::default()
+        },
+    )
+    .expect("ignored children do not overflow baseline");
+    assert!(!detector.requires_initial_rescan());
+
+    fs::write(target.join("artifact-0.bin"), "changed generated").expect("change artifact");
+    let batch = detector.rescan().expect("rescan ignored tree");
+    assert!(!batch.requires_rescan);
+    assert!(batch.changes.is_empty());
+}
+
+/// Watcher start 使用未初始化 detector，确保初始基线不会重新进入切换关键路径。
+#[test]
+fn uninitialized_detector_defers_baseline_until_reconciliation() {
+    let root = TempWorkspace::create();
+    fs::write(root.0.join("source.rs"), "source").expect("source fixture");
+    let mut detector =
+        PollingChangeDetector::new_uninitialized(root.handle(), PollingPolicy::default());
+
+    assert!(detector.requires_initial_rescan());
+    let recovered = detector.rescan().expect("lazy baseline");
+    assert!(recovered.requires_rescan);
+    assert!(!detector.requires_initial_rescan());
+}
+
 /// 直接 rescan 必须返回触发对账的编辑，包括粗粒度文件系统 mtime 无法识别的等长内容变化。
 #[test]
 fn rescan_emits_diff_before_replacing_baseline() {

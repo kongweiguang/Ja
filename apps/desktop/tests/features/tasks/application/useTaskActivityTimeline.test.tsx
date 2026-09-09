@@ -1,0 +1,155 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { act, cleanup, renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  publishTaskHostEvent,
+  useTaskActivityTimeline,
+  type TaskActivity,
+  type TaskSummary,
+} from "@/features/tasks";
+import { useTimelineStore } from "@/features/conversation";
+
+const task: TaskSummary = {
+  taskThreadId: "thr_child",
+  parentThreadId: "thr_root",
+  rootThreadId: "thr_root",
+  originTurnId: "turn_parent",
+  taskName: "检查合同",
+  depth: 1,
+  taskKind: "subagent",
+  lifecycle: "attached",
+  state: "running",
+  revision: 2,
+  latestActivitySequence: 3,
+  unreadCount: 0,
+  descendantCount: 0,
+  runningDescendantCount: 0,
+  needsAttentionCount: 0,
+  latestSafeSummary: "正在检查",
+  startedAt: "2026-09-03T08:00:00Z",
+  completedAt: null,
+  updatedAt: "2026-09-03T08:00:02Z",
+};
+
+/** 创建最小持久 Activity 投影，调用方可覆盖 identity 以验证根隔离与幂等替换。 */
+function activity(overrides: Partial<TaskActivity> = {}): TaskActivity {
+  return {
+    activitySequence: 3,
+    activityId: "activity_child",
+    taskThreadId: "thr_child",
+    actorThreadId: "thr_root",
+    causalTurnId: "turn_parent",
+    kind: "progress",
+    summary: { text: "正在检查" },
+    createdAt: "2026-09-03T08:00:02Z",
+    ...overrides,
+  };
+}
+
+/** 发布路径与生产 Runtime composition 一致，测试不直接改写 hook 内部状态。 */
+function publish(rootThreadId: string, nextActivity: TaskActivity, nextTask = task): void {
+  publishTaskHostEvent({
+    method: "task/activity",
+    params: {
+      rootThreadId,
+      taskThreadId: nextTask.taskThreadId,
+      taskRevision: nextTask.revision,
+      activity: nextActivity,
+      task: { ...nextTask, rootThreadId },
+    },
+  });
+}
+
+/** 通过真实 Timeline reducer 安装 thread/read 快照，验证 hook 不依赖 Task 面板额外读取。 */
+function prepareSnapshot(
+  rootThreadId = "thr_root",
+  activities: Array<{ activity: TaskActivity; task: TaskSummary }> = [],
+  generation = 1,
+): void {
+  useTimelineStore.getState().reset();
+  expect(
+    useTimelineStore.getState().applyRuntimeStatus({
+      status: "ready",
+      generation,
+      serverInstanceId: `srv_${generation}`,
+    }),
+  ).toBe("applied");
+  expect(
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: rootThreadId,
+        revision: 4,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: activities,
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_tasks",
+    ),
+  ).toBe("applied");
+}
+
+afterEach(() => {
+  cleanup();
+  useTimelineStore.getState().reset();
+});
+
+describe("useTaskActivityTimeline", () => {
+  it("从 thread/read 快照恢复活动，并与乱序实时事件按 identity 去重排序", () => {
+    prepareSnapshot("thr_root", [{ activity: activity(), task }]);
+    const { result, rerender } = renderHook(
+      ({ rootThreadId, generation }) => useTaskActivityTimeline(rootThreadId, generation),
+      { initialProps: { rootThreadId: "thr_root", generation: 1 } },
+    );
+
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual(["activity_child"]);
+
+    act(() => publish("thr_other", activity({ activityId: "activity_other" })));
+    expect(result.current).toHaveLength(1);
+
+    act(() => publish("thr_root", activity({ summary: { text: "已更新" }, activitySequence: 4 })));
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0]?.activity.summary.text).toBe("已更新");
+    act(() =>
+      publish("thr_root", activity({ activityId: "activity_earlier", activitySequence: 2 })),
+    );
+    expect(result.current.map((entry) => entry.activity.activitySequence)).toEqual([2, 4]);
+
+    rerender({ rootThreadId: "thr_other", generation: 1 });
+    expect(result.current).toEqual([]);
+    act(() => publish("thr_other", activity({ activityId: "activity_other" })));
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0]?.task.rootThreadId).toBe("thr_other");
+  });
+
+  it("空快照替换会清除旧活动，runtime generation 改变时不会泄漏上一代投影", () => {
+    prepareSnapshot("thr_root", [{ activity: activity(), task }]);
+    const { result, rerender } = renderHook(
+      ({ generation }) => useTaskActivityTimeline("thr_root", generation),
+      { initialProps: { generation: 1 } },
+    );
+    expect(result.current).toHaveLength(1);
+
+    act(() => prepareSnapshot("thr_root", [], 1));
+    expect(result.current).toEqual([]);
+
+    act(() => publish("thr_root", activity({ activityId: "activity_live" })));
+    expect(result.current).toHaveLength(1);
+    rerender({ generation: 2 });
+    expect(result.current).toEqual([]);
+
+    act(() => {
+      useTimelineStore.getState().applyRuntimeStatus({
+        status: "ready",
+        generation: 2,
+        serverInstanceId: "srv_2",
+      });
+    });
+    expect(result.current).toEqual([]);
+  });
+});

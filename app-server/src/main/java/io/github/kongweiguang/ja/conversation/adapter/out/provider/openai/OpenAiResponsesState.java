@@ -9,8 +9,6 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.Abstra
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderSseReader;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderStreamResult;
-import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidator;
-import io.github.kongweiguang.ja.conversation.adapter.out.tools.ToolSchemaException;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
@@ -94,24 +92,21 @@ final class OpenAiResponsesState {
     }
 
     /**
-     * 流干净结束后生成最终结果和 usage 效果，提交职责由 Adapter 承担。
+     * 流干净结束后生成最终结果和 usage 效果；响应身份只用于本次流内对账，不发布为远端续传
+     * 状态，下一轮必须从 Ja 的权威历史重建完整原生 input。
      */
     ProviderStreamResult finish() {
         if (!terminal || finishReason == null || !tools.isEmpty()) {
             throw new ProviderProtocolException(
                     "STREAM_TRUNCATED", "OpenAI stream ended without explicit completion", true);
         }
-        ModelPort.Continuation continuation = responseId == null
-                ? null : new ModelPort.Continuation("openai_responses", responseId);
         List<ModelPort.ModelEvent> effects = usage == null
                 ? List.of() : List.of(new ModelPort.UsageEvent(usage));
         return new ProviderStreamResult(
-                new ModelPort.ModelOutcome(finishReason, continuation, usage), effects);
+                new ModelPort.ModelOutcome(finishReason, null, usage), effects);
     }
 
-    /**
-     * 只为相邻轮次的私有续接捕获响应身份。
-     */
+    /** 捕获流内响应身份以拒绝同一次物理请求中途切换对象，不把该身份带入下一轮。 */
     private void capture(JsonNode response) {
         String id = requiredText(response, "id", false);
         if (!"response".equals(requiredText(response, "object", false))
@@ -183,23 +178,21 @@ final class OpenAiResponsesState {
     }
 
     /**
-     * Tool 调用可观察前，使用冻结 schema 校验完整参数并生成待提交效果。
+     * Tool 调用可观察前只恢复已知 strict 参数；未知 Tool 与参数错误交给 Runner 回传 ToolResult。
      */
     private void emitTool(ToolAccumulator tool, Function<String, ToolSpec> toolLookup,
                           List<ModelPort.ModelEvent> effects) {
         if (tool.emitted()) return;
         JsonNode wireArguments = parseArguments(tool.arguments());
         ToolSpec spec = toolLookup.apply(tool.name());
-        JsonNode arguments;
-        try {
+        JsonNode arguments = wireArguments;
+        if (spec != null) {
             JsonNode sourceSchema = ProviderJsonValues.toNode(spec.inputSchema());
-            arguments = OpenAiStrictArgumentRestorer.restore(sourceSchema, wireArguments);
-            new NetworkntToolArgumentValidator(writeValidationJson(sourceSchema))
-                    .validate(writeValidationJson(arguments));
-        } catch (IllegalArgumentException | ToolSchemaException failure) {
-            throw new ProviderProtocolException(
-                    "TOOL_SCHEMA_INVALID", "OpenAI Tool arguments do not match the declared schema",
-                    false);
+            try {
+                arguments = OpenAiStrictArgumentRestorer.restore(sourceSchema, wireArguments);
+            } catch (IllegalArgumentException ignored) {
+                // 原始对象仍需进入 Runner，后者会形成可恢复失败且绝不执行非法参数。
+            }
         }
         JsonObject values = ProviderJsonValues.toObject(arguments);
         if (emittedItems.containsKey(tool.itemId()) || emittedCalls.containsKey(tool.callId())) {
@@ -307,17 +300,6 @@ final class OpenAiResponsesState {
         } catch (IOException | RuntimeException failure) {
             throw new ProviderProtocolException(
                     "PROVIDER_JSON", "OpenAI Tool arguments are invalid JSON", false);
-        }
-    }
-
-    /**
-     * 将已校验节点编码为 Validator 的协议无关 JSON 文本边界，不暴露 Jackson 版本。
-     */
-    private static String writeValidationJson(JsonNode value) {
-        try {
-            return AbstractStreamingModelAdapter.JSON.writeValueAsString(value);
-        } catch (Exception failure) {
-            throw new IllegalArgumentException("Tool validation JSON could not be encoded", failure);
         }
     }
 

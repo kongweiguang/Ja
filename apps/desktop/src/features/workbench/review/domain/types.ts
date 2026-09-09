@@ -3,6 +3,7 @@
 
 /** Review 来源只描述用户选择的权威快照，不携带 Git 命令或 native 句柄。 */
 export type ReviewSource =
+  | { kind: "uncommitted" }
   | { kind: "unstaged" }
   | { kind: "staged" }
   | { kind: "branch"; refId: string }
@@ -58,6 +59,7 @@ interface ReviewHunk {
 
 export interface ReviewFile {
   fileId: string;
+  layer: "staged" | "unstaged" | "untracked" | "comparison";
   path: string;
   oldPath: string | null;
   status: ReviewFileStatus;
@@ -103,6 +105,7 @@ export interface ReviewFileDiff {
   source: ReviewSource;
   revision: string;
   fileId: string;
+  layer: ReviewFile["layer"];
   path: string;
   oldPath: string | null;
   status: ReviewFileStatus;

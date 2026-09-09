@@ -7,7 +7,6 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
-import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 
 import java.util.Optional;
@@ -47,10 +46,27 @@ public interface ThreadUseCase {
      */
     boolean writeAutomaticTitle(String threadId, String title, long expectedThreadRevision);
 
+    /** 通过 revision CAS 更新置顶事实并返回服务端重排所需的完整投影。 */
+    default ThreadSummary pinThread(String threadId, boolean pinned, long expectedThreadRevision) {
+        throw new UnsupportedOperationException("thread pinning is unavailable");
+    }
+
     /**
-     * 通过 revision CAS 归档空闲 Thread。
+     * 以 revision CAS 确认当前最新成功或失败 Turn 已被看到；无可确认结果时幂等返回。
      */
-    void archiveThread(String threadId, long expectedThreadRevision);
+    default ThreadSummary markThreadSeen(String threadId, long expectedThreadRevision) {
+        throw new UnsupportedOperationException("thread seen boundary is unavailable");
+    }
+
+    /**
+     * 通过 revision CAS 归档空闲 Thread，并返回可供撤销保存的权威投影。
+     */
+    ThreadSummary archiveThread(String threadId, long expectedThreadRevision);
+
+    /** 通过 revision CAS 恢复已归档 Thread；恢复后始终保持未置顶。 */
+    default ThreadSummary restoreThread(String threadId, long expectedThreadRevision) {
+        throw new UnsupportedOperationException("thread restore is unavailable");
+    }
 
     /**
      * 通过 revision CAS 删除空闲 Thread。
@@ -62,11 +78,6 @@ public interface ThreadUseCase {
      */
     Optional<TurnSummary> findTurn(String turnId);
 
-    /** 由 Rust 前向提交一次 Turn 文件差异，Java 负责身份、hash 与唯一性门。 */
-    default TurnChangeSet commitChangeSet(ChangeSetCommit request) {
-        throw new UnsupportedOperationException("change set persistence is unavailable");
-    }
-
     /** 通过严格四元身份按 Unicode code point 分页读取已脱敏 Tool 输出。 */
     default Optional<TextArtifactPage> readToolArtifact(String threadId, String turnId, String callId,
                                                         String artifactId, int offsetCharacters,
@@ -74,21 +85,17 @@ public interface ThreadUseCase {
         throw new UnsupportedOperationException("tool artifact persistence is unavailable");
     }
 
-    /** 通过严格三元身份按 UTF-8 byte 分页读取冻结 diff。 */
-    default Optional<BinaryTextArtifactPage> readChangeSetArtifact(String threadId, String turnId, String artifactId,
-                                                                   int offsetBytes, int limitBytes) {
+    /** 通过严格三元身份与 artifact 内文件键一次读取完整冻结 Diff，不回退到当前工作区。 */
+    default Optional<ChangeSetArtifactFile> readChangeSetArtifact(String threadId, String turnId, String artifactId,
+                                                                  String filePath) {
         throw new UnsupportedOperationException("change set artifact persistence is unavailable");
     }
-
-    /** Rust 捕获事实与可选 diff；artifactId 只能由 Java 在提交成功后分配。 */
-    record ChangeSetCommit(String threadId, String turnId, String workspaceId, TurnChangeSet changeSet,
-                           String sha256, Long byteLength, String unifiedDiff) { }
 
     /** Tool artifact 使用 code point 游标，避免切断 UTF-16 surrogate pair。 */
     record TextArtifactPage(String artifactId, int offsetCharacters, Integer nextOffsetCharacters,
                             int totalCharacters, boolean truncated, String content) { }
 
-    /** Diff artifact 使用 UTF-8 byte 游标，offset 必须落在字符边界。 */
-    record BinaryTextArtifactPage(String artifactId, int offsetBytes, Integer nextOffsetBytes,
-                                  int byteLength, boolean truncated, String content) { }
+    /** 冻结单文件以标准 Base64 携带原始 UTF-8 bytes，摘要只覆盖该文件 Diff。 */
+    record ChangeSetArtifactFile(String artifactId, String filePath, int byteLength, String sha256,
+                                 String contentBase64) { }
 }

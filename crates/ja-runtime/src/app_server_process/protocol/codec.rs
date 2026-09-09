@@ -6,7 +6,7 @@
 //! Frame 值对象、资源 limits、错误脱敏和 BufRead framing 分属独立模块；这里仅编排
 //! 原始 JSON 审计与 typed envelope 构造，避免安全校验出现第二份实现。
 
-use super::catalog::{V2_CLIENT_METHODS, V2_EVENT_METHODS};
+use super::catalog::{V1_CLIENT_METHODS, V1_EVENT_METHODS};
 use super::error_policy::{CodecError, parse_error};
 use super::frame::{Present, RpcFrame, valid_client_id, valid_wire_id};
 use super::json as codec_json;
@@ -118,11 +118,11 @@ pub(crate) fn decode_frame_with_forbidden(
 fn validate_decoded_method(id: Option<&str>, method: Option<&str>) -> Result<(), CodecError> {
     match (id, method) {
         (_, None) => Ok(()),
-        (Some(id), Some(method)) if valid_client_id(id) && V2_CLIENT_METHODS.contains(&method) => {
+        (Some(id), Some(method)) if valid_client_id(id) && V1_CLIENT_METHODS.contains(&method) => {
             Ok(())
         }
         (None, Some("runtime/initialized")) => Ok(()),
-        (None, Some(method)) if V2_EVENT_METHODS.contains(&method) => Ok(()),
+        (None, Some(method)) if V1_EVENT_METHODS.contains(&method) => Ok(()),
         _ => Err(CodecError::InvalidEnvelope),
     }
 }
@@ -260,7 +260,7 @@ pub(super) fn validate_ready_token_fields(method: &str, params: &Value) -> Resul
     Ok(())
 }
 
-/// 根 envelope 是 v2 的闭集；拒绝未知字段，避免 typed projection 静默
+/// 根 envelope 是 v1 的闭集；拒绝未知字段，避免 typed projection 静默
 /// 丢弃新旧协议扩展后仍把 frame 当作已完整验证。
 fn reject_unknown_root_fields(object: &Map<String, Value>) -> Result<(), CodecError> {
     const KNOWN: &[&str] = &["jsonrpc", "id", "method", "params", "result", "error"];
@@ -282,7 +282,7 @@ pub(super) fn contains_ready_token_marker(value: &Value) -> bool {
     }
 }
 
-/// 校验 v2 challenge 的固定小写十六进制文本，不接受短值、Unicode 或大小写变体。
+/// 校验 v1 challenge 的固定小写十六进制文本，不接受短值、Unicode 或大小写变体。
 pub fn valid_ready_token(value: &str) -> bool {
     value.len() == READY_TOKEN_HEX_BYTES
         && value

@@ -30,6 +30,36 @@ fn thread_list_input_is_workspace_scoped() {
     );
 }
 
+/// Thread 创建必须显式携带协作模式与 nullable reasoning，Plan 不能由旧 native DTO 静默降级。
+#[test]
+fn thread_create_input_requires_collaboration_mode() {
+    let valid = json!({
+        "title": "Demo",
+        "providerId": "provider_demo",
+        "modelId": "model_demo",
+        "reasoningLevel": null,
+        "accessMode": "full_access",
+        "collaborationMode": "plan"
+    });
+    let input: ThreadCreateInput =
+        serde_json::from_value(valid.clone()).expect("valid thread create");
+    assert!(validate_thread_create(&input).is_ok());
+
+    let mut missing_mode = valid.clone();
+    missing_mode
+        .as_object_mut()
+        .expect("thread create object")
+        .remove("collaborationMode");
+    assert!(serde_json::from_value::<ThreadCreateInput>(missing_mode).is_err());
+
+    let mut missing_reasoning = valid;
+    missing_reasoning
+        .as_object_mut()
+        .expect("thread create object")
+        .remove("reasoningLevel");
+    assert!(serde_json::from_value::<ThreadCreateInput>(missing_reasoning).is_err());
+}
+
 /// v3 create 结果为直接投影，并只接受下一轮 Provider/Model 偏好而非旧 Profile binding。
 #[test]
 fn thread_create_result_is_direct() {
@@ -41,10 +71,15 @@ fn thread_create_result_is_direct() {
             "modelId": "model_demo",
             "reasoningLevel": "medium",
             "accessMode": "full_access",
+            "collaborationMode": "default",
             "titleSource": "manual"
         },
         "title": "Demo",
         "status": "active",
+        "pinned": false,
+        "latestTurnStatus": null,
+        "latestTurnSeen": true,
+        "activeGoalId": null,
         "revision": 1,
         "createdAt": "2026-08-25T00:00:00Z",
         "updatedAt": "2026-08-25T00:00:00Z"
@@ -87,13 +122,47 @@ fn thread_page_rejects_old_list_key() {
         "threadId": "thr_demo", "workspaceId": "ws_demo",
         "preferences": {
             "providerId": "provider_demo", "modelId": "model_demo",
-            "reasoningLevel": null, "accessMode": "approval_required", "titleSource": "auto"
+            "reasoningLevel": null, "accessMode": "approval_required",
+            "collaborationMode": "default", "titleSource": "auto"
         },
-        "title": "Demo", "status": "active", "revision": 1,
+        "title": "Demo", "status": "active", "pinned": false,
+        "latestTurnStatus": null, "latestTurnSeen": true, "activeGoalId": null, "revision": 1,
         "createdAt": "2026-08-25T00:00:00Z", "updatedAt": "2026-08-25T00:00:00Z"
     }]);
     assert!(parse_thread_page(json!({"items": items.clone(), "nextCursor": null})).is_ok());
     assert!(parse_thread_page(json!({"threads": items, "nextCursor": null})).is_err());
+}
+
+/// 已读投影必须由 Java 完整返回；缺失字段或无 Turn 却声称未读都属于损坏响应。
+#[test]
+fn thread_seen_projection_is_required_and_consistent() {
+    let valid = json!({
+        "threadId": "thr_demo", "workspaceId": "ws_demo", "preferences": null,
+        "title": "Demo", "status": "active", "pinned": false,
+        "latestTurnStatus": "completed", "latestTurnSeen": true,
+        "activeGoalId": "goal_demo", "revision": 2,
+        "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-01T00:01:00Z"
+    });
+    assert!(parse_thread(valid.clone()).is_ok());
+
+    let mut missing = valid.clone();
+    missing
+        .as_object_mut()
+        .expect("thread object")
+        .remove("latestTurnSeen");
+    assert!(parse_thread(missing).is_err());
+
+    let mut missing_goal = valid.clone();
+    missing_goal
+        .as_object_mut()
+        .expect("thread object")
+        .remove("activeGoalId");
+    assert!(parse_thread(missing_goal).is_err());
+
+    let mut impossible = valid;
+    impossible["latestTurnStatus"] = serde_json::Value::Null;
+    impossible["latestTurnSeen"] = json!(false);
+    assert!(parse_thread(impossible).is_err());
 }
 
 /// Snapshot pagination 拒绝已删除的 afterSeq/event replay shape。
@@ -123,27 +192,28 @@ fn thread_read_rejects_private_item_fields() {
         "revision": 1,
         "turns": [],
         "items": [{"itemId": "item_demo", "metadata": {"secretValue": "hidden"}}],
+        "inputQueue": null,
         "contextUsage": null,
         "nextCursor": null
     });
     assert!(parse_thread_read(result).is_err());
 }
 
-/// 该 fixture 镜像当前 Java V4 snapshot：Turn 的 runtime/changeSet/completedAt/errorCode 均
-/// 显式存在，Tool 只携带安全 presentation，便于锁定冷启动恢复的真实 wire 形状。
-fn v4_thread_read_fixture() -> serde_json::Value {
+/// 该 fixture 镜像当前 Java snapshot：Turn 的 changeSet/completedAt/errorCode 均显式存在，
+/// Tool 只携带安全 presentation，Provider 请求画像归属 Usage 而不再伪装成 Turn 单一 runtime。
+fn v1_thread_read_fixture() -> serde_json::Value {
     json!({
         "threadId": "thr_demo",
         "revision": 11,
         "turns": [{
             "turnId": "turn_demo",
             "status": "completed",
-            "runtime": null,
             "requestedAt": "2026-08-30T10:00:00Z",
             "updatedAt": "2026-08-30T10:00:02Z",
             "completedAt": "2026-08-30T10:00:02Z",
             "changeSet": {
-                "state": "available",
+                "state": "complete",
+                "incompleteReasons": [],
                 "files": [{
                     "path": "src/main.rs", "status": "modified",
                     "additions": 1, "deletions": 0,
@@ -160,7 +230,13 @@ fn v4_thread_read_fixture() -> serde_json::Value {
         "items": [
             {
                 "itemId": "item_user_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "user_input", "text": "检查合同"
+                "turnId": "turn_demo", "kind": "user_input",
+                "content": [
+                    {"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"src/main.rs","kind":"file"},
+                    {"type":"skill_reference","skillId":"skill_demo"},
+                    {"type":"text","text":"检查合同"}
+                ],
+                "attachments": []
             },
             {
                 "itemId": "item_progress_demo", "createdAt": "2026-08-30T10:00:00Z",
@@ -191,19 +267,35 @@ fn v4_thread_read_fixture() -> serde_json::Value {
                 "expiresAt": "2026-08-30T10:05:00Z", "decision": null
             },
             {
-                "itemId": "item_attachment_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "attachment", "attachmentId": "att_demo",
-                "displayName": "设计说明.pdf", "sizeBytes": 2048, "mediaKind": "pdf",
-                "mediaType": "application/pdf", "state": "bound"
-            },
-            {
                 "itemId": "item_final_demo", "createdAt": "2026-08-30T10:00:02Z",
                 "turnId": "turn_demo", "kind": "final_answer", "text": "合同检查完成。"
             }
         ],
+        "inputQueue": null,
+        "taskActivities": [],
+        "goalActivities": [],
         "contextUsage": {
             "turnId": "turn_demo",
+            "requestId": "request_demo",
+            "requestOrdinal": 1,
             "modelRound": 1,
+            "purpose": "assistant",
+            "certainty": "known",
+            "profile": {
+                "providerId": "provider_demo",
+                "modelId": "model_demo",
+                "api": "openai_responses",
+                "upstreamModel": "gpt-5",
+                "requestedReasoning": null,
+                "effectiveReasoning": null,
+                "accessMode": "approval_required",
+                "collaborationMode": "default",
+                "configGeneration": "cfg_demo",
+                "promptRevision": "prompt_demo",
+                "toolCatalogRevision": "tools_demo",
+                "contextWindowTokens": 128000,
+                "maxOutputTokens": 4096
+            },
             "inputTokens": 100,
             "outputTokens": 20,
             "totalTokens": 120,
@@ -213,13 +305,12 @@ fn v4_thread_read_fixture() -> serde_json::Value {
     })
 }
 
-/// 冷启动恢复必须接受包含 `changeSet`、精确 Usage 且 `runtime:null` 的真实 V4 快照；缺失必需
-/// nullable 字段与绝对文件路径仍应关闭失败。
+/// 冷启动恢复必须接受包含 `changeSet` 与精确 Usage 的真实快照；缺失必需 nullable 字段与
+/// 绝对文件路径仍应关闭失败，旧 Turn runtime 快照不再作为恢复事实。
 #[test]
-fn thread_read_accepts_v4_snapshot_and_preserves_required_nulls() {
-    let fixture = v4_thread_read_fixture();
-    let parsed = parse_thread_read(fixture.clone()).expect("V4 history fixture");
-    assert!(parsed.turns[0].runtime.is_none());
+fn thread_read_accepts_v1_snapshot_and_preserves_required_nulls() {
+    let fixture = v1_thread_read_fixture();
+    let parsed = parse_thread_read(fixture.clone()).expect("v1 history fixture");
     assert_eq!(
         parsed.turns[0]
             .change_set
@@ -233,7 +324,7 @@ fn thread_read_accepts_v4_snapshot_and_preserves_required_nulls() {
             usage.output_tokens,
             usage.total_tokens
         )),
-        Some((100, 20, 120))
+        Some((Some(100), Some(20), Some(120)))
     );
 
     let mut missing_context_usage = fixture.clone();
@@ -255,26 +346,120 @@ fn thread_read_accepts_v4_snapshot_and_preserves_required_nulls() {
     assert!(parse_thread_read(absolute_path).is_err());
 }
 
-/// Context Usage 不能悬挂到其它 Turn，也不能用小于输入输出之和的 total 伪造较低占用。
+/// 新建 Thread 在首条消息前会返回完全空的 Timeline；该合法产品态不能因只测过有内容 fixture
+/// 而被 Rust 严格解析器误判为 runtime unavailable。
+#[test]
+fn thread_read_accepts_a_new_empty_thread_snapshot() {
+    let parsed = parse_thread_read(serde_json::json!({
+        "threadId": "thr_empty",
+        "revision": 1,
+        "turns": [],
+        "items": [],
+        "taskActivities": [],
+        "goalActivities": [],
+        "contextUsage": null,
+        "inputQueue": null,
+        "nextCursor": null
+    }))
+    .expect("new empty thread snapshot");
+
+    assert_eq!(parsed.thread_id, "thr_empty");
+    assert!(parsed.turns.is_empty());
+    assert!(parsed.items.is_empty());
+}
+
+/// Goal 终态必须是有界、唯一且按事件序号升序的不可逆事实，运行中状态不得混入历史时间线。
+#[test]
+fn thread_read_validates_terminal_goal_activities() {
+    let mut fixture = v1_thread_read_fixture();
+    fixture["goalActivities"] = json!([{
+        "goalId": "goal_done",
+        "objective": "完成生产验收",
+        "status": "achieved",
+        "goalRevision": 8,
+        "eventSequence": 21,
+        "occurredAt": "2026-09-05T00:00:00Z"
+    }]);
+    assert!(parse_thread_read(fixture.clone()).is_ok());
+
+    fixture["goalActivities"][0]["status"] = json!("active");
+    assert!(parse_thread_read(fixture).is_err());
+}
+
+/// 冷启动快照接受 Java 持久化的 suspended，且非终态必须保留显式 null completedAt/errorCode。
+#[test]
+fn thread_read_accepts_suspended_turn_snapshot() {
+    let mut fixture = v1_thread_read_fixture();
+    fixture["turns"][0]["status"] = json!("suspended");
+    fixture["turns"][0]["completedAt"] = Value::Null;
+    fixture["turns"][0]["changeSet"] = Value::Null;
+    fixture["turns"][0]["errorCode"] = Value::Null;
+    fixture["items"] = json!([]);
+    fixture["inputQueue"] = json!({
+        "turnId": "turn_demo",
+        "revision": 0,
+        "accepting": true,
+        "items": []
+    });
+    fixture["contextUsage"] = Value::Null;
+
+    let parsed = parse_thread_read(fixture).expect("suspended history fixture");
+    assert_eq!(parsed.turns[0].status, "suspended");
+    assert!(parsed.turns[0].completed_at.is_none());
+}
+
+/// Context Usage 必须同时归属快照内的 Turn 和请求 identity，且不能伪造较低的 total 占用。
 #[test]
 fn thread_read_rejects_orphaned_or_inconsistent_context_usage() {
-    let mut orphaned = v4_thread_read_fixture();
+    let mut orphaned = v1_thread_read_fixture();
     orphaned["contextUsage"]["turnId"] = json!("turn_other");
     assert!(parse_thread_read(orphaned).is_err());
 
-    let mut inconsistent = v4_thread_read_fixture();
+    let mut missing_turn = v1_thread_read_fixture();
+    missing_turn["contextUsage"]
+        .as_object_mut()
+        .expect("context usage object")
+        .remove("turnId");
+    assert!(parse_thread_read(missing_turn).is_err());
+
+    let mut invalid_request = v1_thread_read_fixture();
+    invalid_request["contextUsage"]["requestId"] = json!("turn_other");
+    assert!(parse_thread_read(invalid_request).is_err());
+
+    let mut inconsistent = v1_thread_read_fixture();
     inconsistent["contextUsage"]["totalTokens"] = json!(119);
     assert!(parse_thread_read(inconsistent).is_err());
 }
 
-/// Java 对可选 change-set 与单文件字段使用“缺失”而非 `null`；Rust 反序列化后再次投影给
-/// WebView 时必须保留该语义，否则 TypeScript 严格判别联合会把合法历史误判为运行时不可用。
+/// UNKNOWN Usage 必须完整保留为空计量；混入任意 Token 数会破坏崩溃窗口的事实语义并被拒绝。
+#[test]
+fn thread_read_accepts_strict_unknown_context_usage() {
+    let mut fixture = v1_thread_read_fixture();
+    fixture["contextUsage"]["certainty"] = json!("unknown");
+    fixture["contextUsage"]["inputTokens"] = Value::Null;
+    fixture["contextUsage"]["outputTokens"] = Value::Null;
+    fixture["contextUsage"]["totalTokens"] = Value::Null;
+
+    let parsed = parse_thread_read(fixture.clone()).expect("unknown context usage");
+    let usage = parsed.context_usage.expect("usage");
+    assert_eq!(usage.certainty, "unknown");
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+        (None, None, None)
+    );
+
+    fixture["contextUsage"]["inputTokens"] = json!(0);
+    assert!(parse_thread_read(fixture).is_err());
+}
+
+/// Java 对可选 artifact 使用“缺失”而非 `null`；Rust 再投影给 WebView 时必须保留该语义，
+/// 同时拒绝 JA-RPC 2.0 的 unavailable/reason 和可选文本统计兼容形状。
 #[test]
 fn thread_read_serialization_omits_absent_change_set_fields() {
-    let mut fixture = v4_thread_read_fixture();
+    let mut fixture = v1_thread_read_fixture();
     fixture["turns"][0]["changeSet"] = json!({
-        "state": "unavailable",
-        "reason": "not_git",
+        "state": "partial",
+        "incompleteReasons": ["recovery_boundary"],
         "files": [],
         "stats": {
             "files": 0,
@@ -285,57 +470,62 @@ fn thread_read_serialization_omits_absent_change_set_fields() {
         }
     });
 
-    let parsed = parse_thread_read(fixture).expect("unavailable change set fixture");
+    let parsed = parse_thread_read(fixture).expect("partial change set fixture");
     let projected = serde_json::to_value(parsed).expect("WebView history projection");
     let change_set = projected["turns"][0]["changeSet"]
         .as_object()
         .expect("change set object");
 
-    assert_eq!(change_set.get("reason"), Some(&json!("not_git")));
+    assert_eq!(
+        change_set.get("incompleteReasons"),
+        Some(&json!(["recovery_boundary"]))
+    );
     assert!(!change_set.contains_key("artifactId"));
 
-    let mut available = v4_thread_read_fixture();
-    let available_change_set = available["turns"][0]["changeSet"]
+    let mut complete = v1_thread_read_fixture();
+    let complete_change_set = complete["turns"][0]["changeSet"]
         .as_object_mut()
-        .expect("available change set");
-    available_change_set.remove("artifactId");
-    let available_file = available_change_set["files"][0]
-        .as_object_mut()
-        .expect("available change file");
-    available_file.remove("oldPath");
-    available_file.remove("additions");
-    available_file.remove("deletions");
+        .expect("complete change set");
+    complete_change_set.remove("artifactId");
     let projected = serde_json::to_value(
-        parse_thread_read(available).expect("available change set without artifact"),
+        parse_thread_read(complete).expect("complete change set without artifact"),
     )
-    .expect("WebView available history projection");
+    .expect("WebView complete history projection");
     let change_set = projected["turns"][0]["changeSet"]
         .as_object()
         .expect("available change set object");
-    assert!(!change_set.contains_key("reason"));
     assert!(!change_set.contains_key("artifactId"));
-    let change_file = change_set["files"][0]
-        .as_object()
-        .expect("projected change file");
-    assert!(!change_file.contains_key("oldPath"));
-    assert!(!change_file.contains_key("additions"));
-    assert!(!change_file.contains_key("deletions"));
+
+    let mut legacy = v1_thread_read_fixture();
+    legacy["turns"][0]["changeSet"]["state"] = json!("available");
+    assert!(parse_thread_read(legacy).is_err());
+
+    let mut missing_reasons = v1_thread_read_fixture();
+    missing_reasons["turns"][0]["changeSet"]
+        .as_object_mut()
+        .expect("change set")
+        .remove("incompleteReasons");
+    assert!(parse_thread_read(missing_reasons).is_err());
+
+    let mut renamed = v1_thread_read_fixture();
+    renamed["turns"][0]["changeSet"]["files"][0]["status"] = json!("renamed");
+    assert!(parse_thread_read(renamed).is_err());
 }
 
 /// Tool 状态必须来自当前闭集；历史中的旧 `unknown` 不能被投影成一个看似真实的步骤，
 /// 应关闭失败并由调用方重新读取权威快照。
 #[test]
 fn thread_read_rejects_unknown_tool_presentation_status() {
-    let mut fixture = v4_thread_read_fixture();
+    let mut fixture = v1_thread_read_fixture();
     fixture["items"][3]["presentation"]["status"] = json!("unknown");
     assert!(parse_thread_read(fixture).is_err());
 }
 
 /// Snapshot item 页精确接受 200 条并拒绝第 201 条；字节预算继续受 4 MiB frame 边界约束，
-/// 不因 V4 Tool/change-set 扩展而形成无界恢复路径。
+/// 不因首版 Tool/change-set 扩展而形成无界恢复路径。
 #[test]
-fn thread_read_enforces_v4_item_page_limit() {
-    let mut fixture = v4_thread_read_fixture();
+fn thread_read_enforces_v1_item_page_limit() {
+    let mut fixture = v1_thread_read_fixture();
     let items = (0..200)
         .map(|index| {
             json!({

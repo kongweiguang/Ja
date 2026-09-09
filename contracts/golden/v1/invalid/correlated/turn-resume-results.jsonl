@@ -1,0 +1,12 @@
+{"jsonrpc":"2.0","id":"c:resume-result-missing","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":7}}
+{"jsonrpc":"2.0","id":"c:resume-result-missing","result":{"accepted":true,"turnId":"turn_suspended","threadRevision":8}}
+{"jsonrpc":"2.0","id":"c:resume-result-null","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":7}}
+{"jsonrpc":"2.0","id":"c:resume-result-null","result":{"accepted":true,"queued":null,"turnId":"turn_suspended","threadRevision":8}}
+{"jsonrpc":"2.0","id":"c:resume-result-unknown","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":7}}
+{"jsonrpc":"2.0","id":"c:resume-result-unknown","result":{"accepted":true,"queued":true,"turnId":"turn_suspended","threadRevision":8,"operationId":"op_forbidden"}}
+{"jsonrpc":"2.0","id":"c:resume-result-not-queued","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":7}}
+{"jsonrpc":"2.0","id":"c:resume-result-not-queued","result":{"accepted":true,"queued":false,"turnId":"turn_suspended","threadRevision":8}}
+{"jsonrpc":"2.0","id":"c:cancel-result-status","method":"turn/cancel","params":{"turnId":"turn_suspended","expectedThreadRevision":7}}
+{"jsonrpc":"2.0","id":"c:cancel-result-status","result":{"accepted":true,"turnId":"turn_suspended","status":"paused","threadRevision":8}}
+{"jsonrpc":"2.0","id":"c:thread-result-status","method":"thread/read","params":{"threadId":"thr_demo","limit":50}}
+{"jsonrpc":"2.0","id":"c:thread-result-status","result":{"threadId":"thr_demo","revision":7,"turns":[{"turnId":"turn_suspended","status":"paused","requestedAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:01:00Z","completedAt":null,"errorCode":null,"changeSet":null}],"items":[],"taskActivities":[],"goalActivities":[],"inputQueue":null,"contextUsage":null,"nextCursor":null}}

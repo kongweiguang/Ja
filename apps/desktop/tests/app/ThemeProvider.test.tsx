@@ -40,6 +40,7 @@ describe("ThemeProvider", () => {
       palette: "xcode",
       highContrast: false,
       reduceMotion: false,
+      reducedTransparency: false,
     });
   });
 
@@ -57,5 +58,30 @@ describe("ThemeProvider", () => {
     act(() => media.setMatches(true));
 
     await waitFor(() => expect(document.documentElement.dataset["theme"]).toBe("dark"));
+  });
+
+  it("显式 dark 覆盖系统浅色并保持当前 palette 与无障碍属性", async () => {
+    installColorSchemeMedia(false);
+    useUiPreferencesStore.setState({
+      themeMode: "dark",
+      palette: "claude",
+      reducedTransparency: true,
+    });
+
+    render(
+      <ThemeProvider>
+        <span>content</span>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset["theme"]).toBe("dark");
+      expect(document.documentElement.dataset["themeMode"]).toBe("dark");
+      expect(document.documentElement.dataset["palette"]).toBe("claude");
+      expect(document.documentElement.dataset["reducedTransparency"]).toBe("true");
+      expect(document.documentElement.classList).toContain("ja-theme-dark");
+      expect(document.documentElement.classList).toContain("ja-palette-claude");
+      expect(document.documentElement.classList).toContain("ja-reduced-transparency");
+    });
   });
 });

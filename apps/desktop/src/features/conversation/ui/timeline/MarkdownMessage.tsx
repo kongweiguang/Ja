@@ -4,7 +4,7 @@
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import ReactMarkdown, { type Components } from "react-markdown";
-import { isValidElement, type MouseEvent, type ReactElement, type ReactNode } from "react";
+import { isValidElement, useMemo, type MouseEvent, type ReactElement, type ReactNode } from "react";
 import { CopyTextButton } from "@/shared/ui/CopyTextButton";
 
 interface MarkdownMessageProps {
@@ -96,7 +96,8 @@ function textFromMarkdownNode(node: ReactNode): string {
 
 /**
  * 在 Render 阶段净化既保留 Model 编写 Markdown 的可用性，又让 Script、Event Handler、
- * Unsafe URL 与 Embedded Object Payload 失去执行能力。
+ * Unsafe URL 与 Embedded Object Payload 失去执行能力；组件映射按 Host Callback 缓存，避免真实 delta
+ * 高频更新时反复重建 Markdown Renderer。
  */
 export function MarkdownMessage({
   content,
@@ -104,12 +105,17 @@ export function MarkdownMessage({
   onOpenLink,
   onCopyText,
 }: MarkdownMessageProps): ReactElement {
+  // delta 只替换 Markdown 内容；稳定组件映射可避免每个 24ms 批次都让 ReactMarkdown 重建渲染器。
+  const components = useMemo(
+    () => createSafeMarkdownComponents(onOpenLink, onCopyText),
+    [onCopyText, onOpenLink],
+  );
   return (
     <div className={className === undefined ? "ja-markdown" : `ja-markdown ${className}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}
-        components={createSafeMarkdownComponents(onOpenLink, onCopyText)}
+        components={components}
       >
         {content}
       </ReactMarkdown>

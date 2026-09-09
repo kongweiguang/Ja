@@ -7,6 +7,7 @@ export type { SettingsController } from "./application/useSettingsController";
 export type {
   SettingsAdapter,
   SettingsAppearancePort,
+  SettingsDesktopPort,
   SettingsRuntimePort,
 } from "./application/ports";
 export type { DesktopNotificationPreference } from "./ui/sections";

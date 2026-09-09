@@ -13,14 +13,12 @@ pub mod interface;
 
 pub(crate) use application::ReviewService;
 pub use application::{ReviewError, ReviewErrorCode};
-pub(crate) use domain::TurnChangeSet;
 pub use domain::{
     ReviewAction, ReviewApplyResult, ReviewCatalog, ReviewCatalogLimit, ReviewCommit,
-    ReviewCommitId, ReviewFile, ReviewFileDiff, ReviewFileId, ReviewFileStatus, ReviewHunk,
-    ReviewHunkId, ReviewLine, ReviewLineKind, ReviewOperationId, ReviewRef, ReviewRefId,
-    ReviewRevision, ReviewSnapshot, ReviewSource, ReviewStats, ReviewTarget,
+    ReviewCommitId, ReviewFile, ReviewFileDiff, ReviewFileId, ReviewFileLayer, ReviewFileStatus,
+    ReviewHunk, ReviewHunkId, ReviewLine, ReviewLineKind, ReviewOperationId, ReviewRef,
+    ReviewRefId, ReviewRevision, ReviewSnapshot, ReviewSource, ReviewStats, ReviewTarget,
 };
-pub(crate) use infrastructure::TurnChangeBaseline;
 pub use interface::{
     JA_REVIEW_INVALIDATED_EVENT, ReviewApplyInput, ReviewApplyResultDto, ReviewCancelInput,
     ReviewCancelResultDto, ReviewCatalogDto, ReviewCatalogInput, ReviewCommandError,

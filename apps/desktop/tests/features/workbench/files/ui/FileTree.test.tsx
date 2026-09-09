@@ -411,4 +411,23 @@ describe("FileTree production explorer interactions", () => {
     await waitFor(() => expect(onRename).toHaveBeenCalledOnce());
     expect(onRename).toHaveBeenCalledWith(node, "index.ts");
   });
+
+  it("adds ordinary files and directories to the current conversation without reading them", async () => {
+    const user = userEvent.setup();
+    const node = directory("src", [file("src/main.ts")]);
+    const onAddToConversation = vi.fn();
+    render(
+      <FileTree
+        nodes={[node]}
+        selectedPath={node.path}
+        onAddToConversation={onAddToConversation}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "工作区文件" });
+    tree.focus();
+
+    fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
+    await user.click(screen.getByRole("menuitem", { name: "添加到对话" }));
+    expect(onAddToConversation).toHaveBeenCalledWith(node);
+  });
 });

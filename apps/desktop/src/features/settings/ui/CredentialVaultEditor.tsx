@@ -21,6 +21,17 @@ interface CredentialVaultEditorProps {
   onClearCredential: SettingsPorts["onClearCredential"];
 }
 
+/** 只读取脱敏稳定 code 生成可操作反馈，不展示 native message 或底层存储诊断。 */
+function credentialSaveFailureMessage(error: unknown): string {
+  const code =
+    error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  if (code === "revision_conflict") return "配置版本仍有冲突，请重新加载设置后再试。";
+  if (code === "storage_unavailable") return "系统凭据库暂时不可用，请稍后重试。";
+  if (code === "invalid_input") return "密钥或凭据引用无效，请检查后重试。";
+  if (code === "invalid_response") return "凭据配置异常，请先恢复设置后再保存。";
+  return "密钥保存失败，请检查系统凭据库后重试。";
+}
+
 /**
  * Secret 只停留在非受控密码输入框，并在每次尝试后清空；这样 Credential 可以进入原生 Vault，
  * 却不会成为 React 状态、持久化 Settings 文档或可复用反馈文本。
@@ -58,8 +69,8 @@ export function CredentialVaultEditor({
     try {
       await onReplaceCredential(normalizedReference, secret);
       setFeedback("密钥已保存到系统凭据库；界面不会回显密钥内容。");
-    } catch {
-      setFeedback("密钥保存失败，请检查系统凭据库后重试。");
+    } catch (error) {
+      setFeedback(credentialSaveFailureMessage(error));
     } finally {
       if (secretRef.current !== null) secretRef.current.value = "";
       setPending(undefined);

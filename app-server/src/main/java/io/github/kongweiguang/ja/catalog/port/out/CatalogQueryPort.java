@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 
+import java.nio.file.Path;
 import java.util.concurrent.CompletionStage;
 
 /**
@@ -15,9 +16,10 @@ import java.util.concurrent.CompletionStage;
  */
 public interface CatalogQueryPort {
     /**
-     * 从同一配置租约读取 Skill 页面，端口实现不得读取未冻结的配置。
+     * 从同一配置租约和可选规范工作区发现 Skill 页面；null 明确关闭项目来源。
      */
     CursorPage<SkillDescriptor> listSkills(ConfigurationGenerationPort.Lease generation,
+                                           Path workspaceRoot, boolean workspaceTrusted,
                                            String cursor, int limit);
 
     /**

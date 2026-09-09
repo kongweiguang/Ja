@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
@@ -7,6 +8,7 @@ import { ReadyHandshake } from "@/api/protocol/handshake";
 
 const READY_TOKEN = "0123456789abcdef0123456789abcdef" as ReadyToken;
 
+/** Runtime 生命周期 fixture 固定协商后的 feature tuple，避免测试绕过握手能力闭集。 */
 function readyEvent() {
   return {
     jsonrpc: "2.0" as const,
@@ -18,6 +20,7 @@ function readyEvent() {
       occurredAt: "2026-08-25T12:00:00Z",
       status: "ready" as const,
       generation: 1,
+      features: ["task_threads_v1", "plan_goal_v1"] as const,
       readyToken: READY_TOKEN,
     },
   };
@@ -90,6 +93,7 @@ describe("Ja ready-token handshake", () => {
         occurredAt: "2026-08-25T12:00:00Z",
         status: "failed",
         generation: 1,
+        features: ["task_threads_v1", "plan_goal_v1"],
         reason: "runtime_lifecycle",
       },
     });
@@ -106,6 +110,7 @@ describe("Ja ready-token handshake", () => {
           occurredAt: "2026-08-25T12:00:00Z",
           status: "failed",
           generation: 1,
+          features: ["task_threads_v1", "plan_goal_v1"],
         },
       }),
     ).toThrow();

@@ -16,7 +16,7 @@
   border-radius: var(--ja-radius-lg);
   color: var(--ja-foreground);
   background: var(--ja-surface-raised);
-  box-shadow: 0 0.35rem 1rem rgb(0 0 0 / 7%);
+  box-shadow: var(--ja-shadow-sm);
 }
 
 .ja-approval-card__heading {

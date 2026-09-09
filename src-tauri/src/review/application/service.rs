@@ -49,7 +49,7 @@ impl ReviewService {
         self.native.snapshot(&source, cancellation)
     }
 
-    /// 在同一新鲜 snapshot 上解析 opaque file id，并只对 metadata-only 文件补读内容。
+    /// 优先从 native 有界缓存解析 opaque file id，再以 strong evidence probe 封闭外部修改竞态。
     pub(crate) fn file_diff(
         &self,
         source: ReviewSource,
@@ -57,29 +57,32 @@ impl ReviewService {
         file_id: &ReviewFileId,
         cancellation: &CancellationToken,
     ) -> Result<ReviewFileDiff, ReviewError> {
-        let snapshot = self.native.snapshot(&source, cancellation)?;
-        if &snapshot.revision != revision {
-            return Err(ReviewError::ReviewStale);
-        }
-        let Some(file) = snapshot.files.iter().find(|file| &file.file_id == file_id) else {
-            return Err(ReviewError::InvalidInput);
-        };
-        let file = if file.metadata_only && !file.binary {
-            let fresh = self.native.materialize_file(&source, file, cancellation)?;
-            // lazy 原生读取与首次 snapshot 之间仍可能发生外部 Git/worktree 变化；补读后再次
-            // 校验 revision，避免把新内容装进旧 revision 的 file diff 响应。
-            let confirmed = self.native.snapshot(&source, cancellation)?;
-            if &confirmed.revision != revision
-                || !confirmed.files.iter().any(|file| &file.file_id == file_id)
-            {
-                return Err(ReviewError::ReviewStale);
+        let cached = self.native.cached_file(&source, revision, file_id);
+        let (file, requires_freshness_probe) = match cached {
+            Some(file) => (file, true),
+            None => {
+                let snapshot = self.native.snapshot(&source, cancellation)?;
+                if &snapshot.revision != revision {
+                    return Err(ReviewError::ReviewStale);
+                }
+                let file = snapshot
+                    .files
+                    .into_iter()
+                    .find(|file| &file.file_id == file_id)
+                    .ok_or(ReviewError::InvalidInput)?;
+                let needs_probe = file.requires_diff_load();
+                (file, needs_probe)
             }
-            fresh
-        } else {
-            file.clone()
         };
+        let file = self.native.load_file_at_revision(
+            &source,
+            revision,
+            &file,
+            requires_freshness_probe,
+            cancellation,
+        )?;
         Ok(ReviewFileDiff {
-            revision: snapshot.revision,
+            revision: revision.clone(),
             source,
             file,
         })

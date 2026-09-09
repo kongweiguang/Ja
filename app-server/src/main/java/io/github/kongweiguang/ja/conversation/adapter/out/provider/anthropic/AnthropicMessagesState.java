@@ -10,10 +10,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.Abstra
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderSseReader;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderStreamResult;
-import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidator;
-import io.github.kongweiguang.ja.conversation.adapter.out.tools.ToolSchemaException;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
-import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort.FinishReason;
@@ -24,7 +21,6 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
 
 /**
  * 负责事件顺序、usage 和 Tool 聚合的 Anthropic Messages 状态机。
@@ -38,6 +34,7 @@ final class AnthropicMessagesState {
     private long startInputTokens;
     private long startCacheCreationTokens;
     private long startCacheReadTokens;
+    private boolean startUsageSeen;
     private int nextOrdinal;
     private FinishReason finishReason;
     private ModelUsage usage;
@@ -48,8 +45,7 @@ final class AnthropicMessagesState {
     /**
      * 归约文档化的 Messages 事件并返回语义效果，不在状态迁移中执行外部 IO。
      */
-    List<ModelPort.ModelEvent> reduce(
-            ProviderSseReader.Event event, Function<String, ToolSpec> toolLookup) {
+    List<ModelPort.ModelEvent> reduce(ProviderSseReader.Event event) {
         if (messageStopped) throw protocol("Anthropic emitted data after message_stop");
         if (messageDeltaSeen && !"message_stop".equals(event.name())) {
             throw protocol("Anthropic emitted data after message_delta");
@@ -60,7 +56,7 @@ final class AnthropicMessagesState {
             case "message_start" -> messageStart(data);
             case "content_block_start" -> contentStart(data, effects);
             case "content_block_delta" -> contentDelta(data, effects);
-            case "content_block_stop" -> contentStop(requiredIndex(data), toolLookup);
+            case "content_block_stop" -> contentStop(requiredIndex(data));
             case "message_delta" -> messageDelta(data);
             case "message_stop" -> messageStop();
             case "ping" -> {
@@ -86,11 +82,15 @@ final class AnthropicMessagesState {
             || !message.path("content").isArray() || !message.path("content").isEmpty()) {
             throw protocol("Anthropic message_start shape is invalid");
         }
-        JsonNode usage = requiredObject(message, "usage");
-        startInputTokens = requiredNonNegative(usage, "input_tokens");
-        requiredNonNegative(usage, "output_tokens");
-        startCacheCreationTokens = optionalNonNegative(usage, "cache_creation_input_tokens");
-        startCacheReadTokens = optionalNonNegative(usage, "cache_read_input_tokens");
+        JsonNode usage = message.get("usage");
+        if (usage != null && !usage.isNull()) {
+            if (!usage.isObject()) throw protocol("Anthropic message_start usage is invalid");
+            startInputTokens = requiredNonNegative(usage, "input_tokens");
+            requiredNonNegative(usage, "output_tokens");
+            startCacheCreationTokens = optionalNonNegative(usage, "cache_creation_input_tokens");
+            startCacheReadTokens = optionalNonNegative(usage, "cache_read_input_tokens");
+            startUsageSeen = true;
+        }
         messageStarted = true;
     }
 
@@ -186,9 +186,9 @@ final class AnthropicMessagesState {
     }
 
     /**
-     * 校验 Tool 并私下保存，只有完整流证明安全后才允许 Adapter 提交。
+     * 完整组装 Tool 并私下保存；目录与 Schema 校验由 Runner 生成可恢复的 ToolResult。
      */
-    private void contentStop(long index, Function<String, ToolSpec> toolLookup) {
+    private void contentStop(long index) {
         requireStarted();
         BlockKind kind = openBlocks.remove(index);
         if (kind == null) {
@@ -209,15 +209,6 @@ final class AnthropicMessagesState {
         }
         if (tool == null) throw protocol("Anthropic omitted Tool block metadata");
         JsonNode arguments = parseArguments(tool.arguments());
-        ToolSpec spec = toolLookup.apply(tool.name());
-        try {
-            JsonNode sourceSchema = ProviderJsonValues.toNode(spec.inputSchema());
-            new NetworkntToolArgumentValidator(writeJson(sourceSchema)).validate(writeJson(arguments));
-        } catch (ToolSchemaException failure) {
-            throw new ProviderProtocolException(
-                    "TOOL_SCHEMA_INVALID", "Anthropic Tool arguments do not match the declared schema",
-                    false);
-        }
         JsonObject values = ProviderJsonValues.toObject(arguments);
         readyTools.add(new ReadyTool(tool.id(), tool.name(), values, tool.ordinal()));
     }
@@ -234,18 +225,30 @@ final class AnthropicMessagesState {
         if ("model_context_window_exceeded".equals(reason)) {
             throw new ModelPort.ContextOverflowException(null);
         }
-        finishReason = mapFinishReason(reason);
+        FinishReason reportedReason = mapFinishReason(reason);
+        if (!readyTools.isEmpty() && reportedReason == FinishReason.STOP) {
+            /* Anthropic-compatible 网关可能以 end_turn 结束完整 tool_use；块级元数据和 JSON 已在
+             * contentStop 验证，实际语义应由完整原生调用决定，并保留 thinking continuation。 */
+            finishReason = FinishReason.TOOL_CALLS;
+        } else {
+            finishReason = reportedReason;
+        }
         if ((finishReason == FinishReason.TOOL_CALLS) != !readyTools.isEmpty()) {
             throw new ProviderProtocolException(
                     "FINISH_REASON", "Anthropic Tool output disagrees with stop reason", false);
         }
-        JsonNode value = requiredObject(event, "usage");
-        long input = checkedAdd(
-                optionalOr(value, "input_tokens", startInputTokens),
-                optionalOr(value, "cache_creation_input_tokens", startCacheCreationTokens),
-                optionalOr(value, "cache_read_input_tokens", startCacheReadTokens));
-        long output = requiredNonNegative(value, "output_tokens");
-        usage = new ModelUsage(input, output, checkedAdd(input, output));
+        JsonNode value = event.get("usage");
+        if (value != null && !value.isNull()) {
+            if (!value.isObject()) throw protocol("Anthropic message_delta usage is invalid");
+            long output = requiredNonNegative(value, "output_tokens");
+            if (startUsageSeen || value.has("input_tokens")) {
+                long input = checkedAdd(
+                        optionalOr(value, "input_tokens", startInputTokens),
+                        optionalOr(value, "cache_creation_input_tokens", startCacheCreationTokens),
+                        optionalOr(value, "cache_read_input_tokens", startCacheReadTokens));
+                usage = new ModelUsage(input, output, checkedAdd(input, output));
+            }
+        }
         messageDeltaSeen = true;
     }
 
@@ -263,7 +266,7 @@ final class AnthropicMessagesState {
      * 流干净结束后生成最终结果和有序效果，提交职责由 Adapter 承担。
      */
     ProviderStreamResult finish() {
-        if (!messageStarted || !messageStopped || finishReason == null || usage == null
+        if (!messageStarted || !messageStopped || finishReason == null
             || !openBlocks.isEmpty() || !tools.isEmpty() || !thinking.isEmpty()) {
             throw new ProviderProtocolException(
                     "STREAM_TRUNCATED", "Anthropic stream ended without explicit completion", true);
@@ -273,8 +276,8 @@ final class AnthropicMessagesState {
             effects.add(new ModelPort.ToolCallReady(
                     tool.id(), tool.name(), tool.arguments(), tool.ordinal()));
         }
-        effects.add(new ModelPort.UsageEvent(usage));
-        ModelPort.Continuation continuation = finishReason == FinishReason.TOOL_CALLS
+        if (usage != null) effects.add(new ModelPort.UsageEvent(usage));
+        ModelPort.Continuation continuation = !readyTools.isEmpty()
                 ? AnthropicMessagesContinuation.encode(privateBlocks) : null;
         return new ProviderStreamResult(
                 new ModelPort.ModelOutcome(finishReason, continuation, usage), effects);

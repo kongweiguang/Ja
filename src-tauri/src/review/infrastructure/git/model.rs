@@ -23,6 +23,7 @@ pub struct GitStatusEntry {
     pub worktree_status: Option<char>,
     pub path: String,
     pub original_path: Option<String>,
+    pub(crate) state_evidence: Vec<u8>,
 }
 
 /// raw diff byte 保留 binary patch，避免错误猜测 UTF-8 编码。

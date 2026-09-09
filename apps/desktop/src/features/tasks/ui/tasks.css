@@ -1,0 +1,386 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-task-overview,
+.ja-task-detail {
+  display: flex;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  color: var(--ja-foreground);
+}
+
+.ja-task-overview-header,
+.ja-task-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.8rem 0.9rem 0.65rem;
+  border-bottom: 1px solid var(--ja-window-border);
+}
+
+.ja-task-overview-header h2,
+.ja-task-detail-header h2 {
+  margin: 0;
+  font-size: var(--ja-text-body-size);
+  line-height: var(--ja-line-body);
+}
+
+.ja-task-overview-header p,
+.ja-task-detail-header small,
+.ja-task-detail-header span {
+  margin: 0.15rem 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-task-detail-header > div:first-child > span {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.ja-task-detail-header svg,
+.ja-task-overview-header svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
+.ja-task-sections {
+  overflow: auto;
+  min-height: 0;
+  padding: 0.65rem 0.55rem 1rem;
+  scrollbar-color: var(--ja-scrollbar-thumb) var(--ja-scrollbar-track);
+}
+
+/* 主对话只追加低频活动卡；间距与 Task 详情共享节奏但不创建第二个滚动容器。 */
+.ja-task-timeline-activities {
+  display: grid;
+  gap: 0.5rem;
+  padding-block: 0.5rem 1rem;
+}
+
+.ja-task-section + .ja-task-section {
+  margin-top: 0.8rem;
+}
+
+.ja-task-section h3 {
+  margin: 0 0 0.35rem;
+  padding: 0 0.35rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  font-weight: 600;
+}
+
+.ja-task-tree {
+  display: grid;
+  gap: 0.18rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ja-task-tree-group {
+  display: grid;
+  gap: 0.18rem;
+  margin: 0;
+  padding: 0 0 0 0.9rem;
+  list-style: none;
+}
+
+.ja-task-tree-row {
+  display: grid;
+  grid-template-columns: 1.15rem minmax(0, 1fr) auto 1rem;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.5rem 0.45rem;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ja-task-tree-row:hover,
+.ja-task-tree-row:focus-visible {
+  background: var(--ja-control-hover);
+}
+
+.ja-task-tree-row:focus-visible,
+.ja-task-activity-card:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-task-tree-branch svg,
+.ja-task-tree-row > svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  color: var(--ja-foreground-muted);
+}
+
+.ja-task-tree-main,
+.ja-task-tree-title {
+  display: flex;
+  min-width: 0;
+}
+
+.ja-task-tree-main {
+  flex-direction: column;
+  gap: 0.12rem;
+}
+
+.ja-task-tree-title {
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.ja-task-tree-title strong,
+.ja-task-tree-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-task-tree-title small,
+.ja-task-tree-meta,
+.ja-task-tree-summary {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-task-tree-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.ja-task-tree-meta svg {
+  width: 0.45rem;
+  height: 0.45rem;
+  fill: currentColor;
+}
+
+.ja-task-tree-meta svg[data-state="running"] {
+  color: var(--ja-accent);
+}
+.ja-task-tree-meta svg[data-state="waiting_approval"] {
+  color: var(--ja-warning);
+}
+.ja-task-tree-meta svg[data-state="failed"] {
+  color: var(--ja-danger);
+}
+.ja-task-tree-meta svg[data-state="completed"] {
+  color: var(--ja-success);
+}
+
+.ja-task-unread {
+  min-width: 1.25rem;
+  padding: 0.08rem 0.32rem;
+  border-radius: 999px;
+  color: var(--ja-accent-foreground);
+  background: var(--ja-accent);
+  font-size: 0.68rem;
+  text-align: center;
+}
+
+.ja-task-context {
+  margin: 0.6rem 0.75rem 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--ja-window-border);
+  border-radius: var(--ja-radius-sm);
+  background: var(--ja-control);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-task-context summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+}
+
+.ja-task-context summary svg {
+  width: 0.85rem;
+  height: 0.85rem;
+  transition: transform 120ms ease;
+}
+
+.ja-task-context[open] summary svg {
+  transform: rotate(180deg);
+}
+.ja-task-context p {
+  color: var(--ja-foreground-muted);
+  white-space: pre-wrap;
+}
+.ja-task-context ol {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0.45rem 0;
+  padding: 0;
+  list-style: none;
+}
+.ja-task-context li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  align-items: start;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--ja-window-border);
+}
+.ja-task-context li span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ja-task-context li small {
+  color: var(--ja-foreground-muted);
+}
+.ja-task-context code {
+  color: var(--ja-foreground-muted);
+}
+
+.ja-task-chat-timeline {
+  flex: 1;
+  min-height: 0;
+}
+
+.ja-task-cancel-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.ja-task-cancel-confirm {
+  justify-content: flex-end;
+  max-width: 15rem;
+}
+
+.ja-task-composer {
+  min-width: 0;
+  flex-shrink: 0;
+  margin-block: 0.55rem max(12px, env(safe-area-inset-bottom));
+}
+
+.ja-task-structured-composer {
+  margin: 0;
+}
+
+.ja-task-structured-composer .ja-composer__model-trigger {
+  display: none;
+}
+
+.ja-task-live-progress,
+.ja-task-loading {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-task-live-progress,
+.ja-task-inline-error {
+  margin: 0 0.75rem 0.45rem;
+}
+
+.ja-task-inline-error,
+.ja-task-read-alert {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-task-read-alert {
+  margin: 0.45rem 0.75rem 0;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--ja-danger) 30%, var(--ja-window-border));
+  border-radius: var(--ja-radius-sm);
+}
+
+.ja-task-read-alert span {
+  min-width: 0;
+  flex: 1;
+}
+
+.ja-task-inline-error svg,
+.ja-task-read-alert > svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
+.ja-task-closed-note {
+  margin: 0.55rem 0.75rem 0.75rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-task-loading,
+.ja-task-draft-spacer {
+  margin: auto;
+  padding: 1rem;
+  text-align: center;
+}
+.ja-task-draft-spacer {
+  flex: 1;
+}
+.ja-task-spin {
+  animation: ja-task-spin 900ms linear infinite;
+}
+
+.ja-task-activity-card {
+  display: grid;
+  grid-template-columns: 1.25rem minmax(0, 1fr) auto;
+  width: 100%;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--ja-window-border);
+  border-radius: var(--ja-radius-md);
+  color: inherit;
+  background: var(--ja-control);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ja-task-activity-card:hover {
+  background: var(--ja-control-hover);
+}
+.ja-task-activity-icon svg {
+  width: 1rem;
+  height: 1rem;
+  color: var(--ja-foreground-muted);
+}
+.ja-task-activity-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+.ja-task-activity-copy span {
+  overflow: hidden;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-task-state {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+@keyframes ja-task-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-task-context summary svg,
+  .ja-task-spin {
+    transition: none;
+    animation: none;
+  }
+}

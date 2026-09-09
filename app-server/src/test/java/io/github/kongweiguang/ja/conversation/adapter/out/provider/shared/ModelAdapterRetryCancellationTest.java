@@ -18,14 +18,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import mockwebserver3.MockResponse;
+import mockwebserver3.MockWebServer;
+import mockwebserver3.RecordedRequest;
 import okhttp3.ConnectionPool;
 import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
@@ -54,7 +63,7 @@ final class ModelAdapterRetryCancellationTest {
             else ModelAdapterTestSupport.sse(exchange, COMPLETE, 9);
         })) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
                                 event -> java.util.concurrent.CompletableFuture.completedFuture(null),
@@ -66,13 +75,106 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
+    /** 第一次 loopback 连接被拒绝后等待代理恢复，证明应用退避而非 OkHttp 隐式重放完成恢复。 */
+    @Test
+    void retriesAfterTransientConnectionRefusalWhenLoopbackRecovers() throws Exception {
+        MockWebServer unavailable = new MockWebServer();
+        unavailable.start(InetAddress.getByName("127.0.0.1"), 0);
+        int port = unavailable.getPort();
+        unavailable.close();
+
+        MockWebServer recovered = new MockWebServer();
+        recovered.setDispatcher(new mockwebserver3.Dispatcher() {
+            /** 恢复后的本地端点只返回一次完整 SSE，隔离旧重试窗口与新退避窗口的真实请求次数。 */
+            @Override
+            public MockResponse dispatch(RecordedRequest request) {
+                return new MockResponse.Builder().code(200)
+                        .setHeader("Content-Type", "text/event-stream; charset=utf-8")
+                        .body(COMPLETE)
+                        .build();
+            }
+        });
+        ScheduledExecutorService starter = Executors.newSingleThreadScheduledExecutor();
+        AtomicReference<Throwable> startupFailure = new AtomicReference<>();
+        try {
+            URI baseUri = URI.create("http://127.0.0.1:" + port);
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                    baseUri, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                long requestStartedAt = System.nanoTime();
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
+                                ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture();
+                starter.schedule(() -> {
+                    try {
+                        recovered.start(InetAddress.getByName("127.0.0.1"), port);
+                    } catch (IOException failure) {
+                        startupFailure.set(failure);
+                    }
+                }, 750, TimeUnit.MILLISECONDS);
+                ModelPort.ModelOutcome outcome = future.get(8, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requestStartedAt) >= 700);
+            }
+            assertNull(startupFailure.get());
+            assertEquals(1, recovered.getRequestCount());
+        } finally {
+            starter.shutdownNow();
+            recovered.close();
+        }
+    }
+
+    /** 连接预算较短时，首个 SSE 正文仍可等待到请求总预算，避免慢首 token 被误判为断连。 */
+    @Test
+    void allowsFirstSseBodyAfterConnectTimeoutWithinRequestTimeout() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.setDispatcher(new mockwebserver3.Dispatcher() {
+                /** 将首个正文延迟到连接预算之后，验证读超时使用请求总预算而非连接预算。 */
+                @Override
+                public MockResponse dispatch(RecordedRequest request) {
+                    return new MockResponse.Builder().code(200)
+                            .setHeader("Content-Type", "text/event-stream; charset=utf-8")
+                            .body(COMPLETE)
+                            .bodyDelay(2_500, TimeUnit.MILLISECONDS)
+                            .build();
+                }
+            });
+            server.start(InetAddress.getByName("127.0.0.1"), 0);
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                    URI.create("http://127.0.0.1:" + server.getPort()),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(8, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+            assertEquals(1, server.getRequestCount());
+        }
+    }
+
+    /** 连接、读取和写入分别遵守对应预算，防止流式请求用连接超时提前截断。 */
+    @Test
+    void requestClientUsesRequestTimeoutForBodyIo() throws Exception {
+        ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                URI.create("http://127.0.0.1:1"), ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(17));
+        try (ModelTransport transport = new ModelTransport()) {
+            OkHttpClient client = transport.clientFor(configuration);
+            assertEquals(configuration.connectTimeout(), client.connectTimeoutMillis() == 0
+                    ? Duration.ZERO : Duration.ofMillis(client.connectTimeoutMillis()));
+            assertEquals(configuration.requestTimeout(), Duration.ofMillis(client.readTimeoutMillis()));
+            assertEquals(configuration.requestTimeout(), Duration.ofMillis(client.writeTimeoutMillis()));
+        }
+    }
+
     /** 自动标题等自带本地回退的请求必须在首个瞬时失败后结束，不能触发共享三次重试。 */
     @Test
     void singleAttemptPolicyDisablesTransientRetry() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.status(exchange, 503, "0"))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
             ModelPort.ModelRequest singleAttempt = new ModelPort.ModelRequest(
                     base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
@@ -105,7 +207,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, committedThenTruncated, 5))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
                         adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
@@ -130,7 +232,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, oversized, 4096))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
                         adapter.start(ModelAdapterTestSupport.request(configuration),
@@ -150,7 +252,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, unknown, 3))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
                         adapter.start(ModelAdapterTestSupport.request(configuration),
@@ -169,7 +271,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, COMPLETE, 5))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (ModelAdapterFactory factory = new ModelAdapterFactory()) {
                 ModelPort.ModelOutcome outcome = factory.start(ModelAdapterTestSupport.request(configuration),
                                 event -> CompletableFuture.completedFuture(null), CancellationToken.none())
@@ -187,7 +289,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             ModelAdapterFactory factory = new ModelAdapterFactory();
             ModelAdapter adapter = factory.create(configuration);
             try {
@@ -237,7 +339,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, error, 4))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
                         adapter.start(ModelAdapterTestSupport.request(configuration),
@@ -269,7 +371,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, text, 8))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
                         adapter.start(ModelAdapterTestSupport.request(configuration),
@@ -291,7 +393,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
             try (ModelTransport transport = new ModelTransport();
                  OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration, transport)) {
@@ -338,7 +440,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, twoEvents, 1))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
@@ -365,7 +467,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, COMPLETE, 4))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
             cancellation.cancel();
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
@@ -387,7 +489,7 @@ final class ModelAdapterRetryCancellationTest {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
                         adapter.start(ModelAdapterTestSupport.request(configuration),

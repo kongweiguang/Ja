@@ -114,9 +114,13 @@ final class ThreadCompactionHandlerTest {
         /** 注入唯一允许执行的压缩端口，测试不创建存储、Provider 或配置文件。 */
         private Harness(ContextCompactionUseCase compactions) {
             RpcServiceBindings bindings = new RpcServiceBindings(unsupported(io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase.class),
+                    unsupported(io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase.class),
                     unsupported(ThreadUseCase.class), unsupported(TurnUseCase.class), compactions,
                     unsupported(ApprovalUseCase.class), unsupported(CatalogUseCase.class),
                     unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.class),
+                    unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase.class),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveTasks(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
                     new DeadlineCloseable() {
                         /** 测试组合没有外部资源，deadline close 保持无副作用。 */
                         @Override public void closeAt(long shutdownDeadlineNanos) { }

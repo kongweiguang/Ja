@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   selectItemsForThread,
+  selectTaskActivitiesForRoot,
   useTimelineStore,
 } from "@/features/conversation/application/timelineStore";
 import type { TimelineEvent } from "@/features/conversation/domain/timelineContracts";
@@ -49,7 +50,10 @@ function prepareStore(): void {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       },
       "ws_store",
@@ -67,7 +71,10 @@ describe("timeline Zustand seam", () => {
           revision: 0,
           turns: [],
           items: [],
+          inputQueue: null,
           contextUsage: null,
+          taskActivities: [],
+          goalActivities: [],
           nextCursor: null,
         },
         "ws_store",
@@ -85,6 +92,61 @@ describe("timeline Zustand seam", () => {
     ).toBe("applied");
     expect(useTimelineStore.getState().turns["turn_store"]?.status).toBe("running");
     expect(useTimelineStore.getState().threadRevisionByThread["thr_store"]).toBe(1);
+  });
+
+  it("exposes the current root task activity snapshot without materializing task detail", () => {
+    prepareStore();
+    const entry = {
+      activity: {
+        activitySequence: 3,
+        activityId: "activity_store",
+        taskThreadId: "thr_child",
+        actorThreadId: "thr_store",
+        causalTurnId: "turn_store",
+        kind: "progress" as const,
+        summary: { text: "正在检查" },
+        createdAt: "2026-09-03T08:00:02Z",
+      },
+      task: {
+        taskThreadId: "thr_child",
+        parentThreadId: "thr_store",
+        rootThreadId: "thr_store",
+        originTurnId: "turn_store",
+        taskName: "检查合同",
+        depth: 1,
+        taskKind: "subagent" as const,
+        lifecycle: "attached" as const,
+        state: "running" as const,
+        revision: 2,
+        latestActivitySequence: 3,
+        unreadCount: 1,
+        descendantCount: 0,
+        runningDescendantCount: 0,
+        needsAttentionCount: 0,
+        latestSafeSummary: "正在检查",
+        startedAt: "2026-09-03T08:00:00Z",
+        completedAt: null,
+        updatedAt: "2026-09-03T08:00:02Z",
+      },
+    };
+    expect(
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId: "thr_store",
+          revision: 1,
+          turns: [],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          taskActivities: [entry],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_store",
+      ),
+    ).toBe("applied");
+    expect(selectTaskActivitiesForRoot("thr_store")(useTimelineStore.getState())).toEqual([entry]);
+    expect(selectTaskActivitiesForRoot("thr_unknown")(useTimelineStore.getState())).toEqual([]);
   });
 
   it("uses the turn/start revision as the baseline for the independent event stream", () => {
@@ -109,6 +171,40 @@ describe("timeline Zustand seam", () => {
         (item) => item.kind === "user_message" && item.text === "hello",
       ),
     ).toBe(true);
+  });
+
+  /** 首轮临时标题与 Turn 准入共享 revision；metadata 先到不能吞掉随后到达的 ACK。 */
+  it("projects the first user message when provisional title metadata arrives before the ACK", () => {
+    prepareStore();
+    useTimelineStore.getState().recordThreadMetadataRevision("thr_store", 1);
+
+    expect(
+      useTimelineStore.getState().applyTurnAccepted({
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        submittedText: "首条消息必须立即可见",
+        submittedAt: "2026-08-18T00:00:00Z",
+      }),
+    ).toBe("applied");
+
+    const accepted = useTimelineStore.getState();
+    expect(accepted.turns["turn_store"]).toMatchObject({
+      threadId: "thr_store",
+      status: "queued",
+      threadRevision: 1,
+    });
+    expect(accepted.threads["thr_store"]?.activeTurnId).toBe("turn_store");
+    expect(selectItemsForThread("thr_store")(accepted)).toContainEqual(
+      expect.objectContaining({
+        kind: "user_message",
+        status: "completed",
+        text: "首条消息必须立即可见",
+      }),
+    );
+    expect(
+      accepted.applyHostEvent({ kind: "timeline", event: event(2, "queued", "running") }),
+    ).toBe("applied");
   });
 
   it("projects assistant deltas as visible items before the terminal event", () => {
@@ -205,7 +301,31 @@ describe("timeline Zustand seam", () => {
           messageId: "item_model_step",
           text: "run tool",
           modelRound: 1,
-          usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+          usage: {
+            requestId: "request_store_1",
+            requestOrdinal: 1,
+            modelRound: 1,
+            purpose: "assistant",
+            certainty: "known",
+            profile: {
+              providerId: "provider_demo",
+              modelId: "model_demo",
+              api: "openai_responses",
+              upstreamModel: "gpt-5.6-sol",
+              requestedReasoning: "medium",
+              effectiveReasoning: "medium",
+              accessMode: "approval_required",
+              configGeneration: "cfg_demo",
+              promptRevision: "prompt_demo",
+              toolCatalogRevision: "tools_demo",
+              contextWindowTokens: 128_000,
+              maxOutputTokens: 16_000,
+            },
+            inputTokens: 4,
+            outputTokens: 1,
+            totalTokens: 5,
+            measuredAt: "2026-08-18T00:00:01Z",
+          },
           toolCalls: [
             {
               callId: "call_store",

@@ -2,6 +2,9 @@
   "resources": {
     "includes": [
       {
+        "pattern": "ja-build\\.properties"
+      },
+      {
         "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/AttachmentMapper\\.xml"
       },
       {

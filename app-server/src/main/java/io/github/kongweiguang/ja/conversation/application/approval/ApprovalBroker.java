@@ -23,9 +23,23 @@ public interface ApprovalBroker extends ApprovalUseCase {
     CompletionStage<Resolution> request(ApprovalRequest request, CancellationToken cancellationToken);
 
     /**
+     * 安装唯一持久决定闸门；外部 resolve 必须先由该回调提交 SQLite，再完成进程内 Future。
+     */
+    default void bindDecisionStore(DecisionStore store) {
+        Objects.requireNonNull(store, "store");
+    }
+
+    /**
      * 关闭指定 Turn 的全部待审批项，防止取消后仍能恢复 Tool 执行。
      */
     void cancelTurn(String threadId, String turnId, String reason);
+
+    /** Broker 唤醒 waiter 前使用的同步持久化边界。 */
+    @FunctionalInterface
+    interface DecisionStore {
+        /** 返回 false 表示该审批已过期、重复或不再持有 WAITING_APPROVAL 状态门。 */
+        boolean persist(String approvalId, ApprovalDecision decision, Instant resolvedAt);
+    }
 
     /**
      * 与单个 Tool 权限请求绑定的有界审批登记。

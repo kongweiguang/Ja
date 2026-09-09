@@ -7,7 +7,7 @@ import java.nio.file.Path;
 import java.util.Optional;
 
 /**
- * 从配置、Skill 和 MCP 出站能力中冻结一个 Turn 的运行时快照。
+ * 从配置、Skill 元数据目录和 MCP 出站能力中组装一次请求或 Tool batch 的短租约。
  */
 public interface TurnRuntimeResolver {
     /**
@@ -23,6 +23,17 @@ public interface TurnRuntimeResolver {
     /** 默认模型选择只由配置 Owner 提供，conversation 不猜测 Provider 或 Model 身份。 */
     default Optional<DefaultModelSelection> defaultModelSelection(Path workspaceRoot) {
         return Optional.empty();
+    }
+
+    /**
+     * 当前配置仍可读取，但 Provider、Model、已启用 Skill 名称或 Tool 能力已无法按原身份解析；
+     * 该分类允许 Resume fail-closed，同时不吞掉 IO、事务和编程错误。
+     */
+    final class RuntimeMismatchException extends RuntimeException {
+        /** 只暴露稳定脱敏消息；具体配置内容与路径不得跨 conversation 边界。 */
+        public RuntimeMismatchException(String message) {
+            super(message == null || message.isBlank() ? "request runtime is unavailable" : message);
+        }
     }
 
     /** 配置默认值跨端口只暴露稳定选择器和公开能力。 */

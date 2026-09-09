@@ -38,7 +38,8 @@ fn facade_rejects_secret_sidecar_environment() {
 }
 
 /// 在真实 Windows child 上只经过公共 façade 完成 start、握手、request 与 shutdown，
-/// 证明进程行为已归属 crate integration test；fixture 不使用 Harness 或私有模块。
+/// 证明进程行为已归属 crate integration test；fixture 固定当前唯一协议 minor，避免旧版本
+/// 被严格兼容门禁拒绝后掩盖生命周期验证，且不使用 Harness 或私有模块。
 #[cfg(windows)]
 #[test]
 fn facade_owns_real_sidecar_process_lifecycle() {
@@ -66,7 +67,7 @@ fn facade_owns_real_sidecar_process_lifecycle() {
     let script_path = root.join("public-fixture.ps1");
     let script = r#"
 $ErrorActionPreference = 'Stop'
-$initializeResult = '{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"2.0.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8}}'
+$initializeResult = '{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}'
 function Write-Lf([string]$Text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text + [char]10)
     $stdout = [Console]::OpenStandardOutput()

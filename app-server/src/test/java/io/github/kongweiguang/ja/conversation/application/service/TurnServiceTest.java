@@ -8,6 +8,10 @@ import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.AttachmentSummary;
+import io.github.kongweiguang.ja.conversation.domain.UserContent;
+import io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 
@@ -17,37 +21,52 @@ import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadMetadataEvent;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 
 import io.github.kongweiguang.ja.conversation.application.loop.AgentLoop;
+import io.github.kongweiguang.ja.conversation.application.loop.QueuedInputBoundary;
+import io.github.kongweiguang.ja.conversation.application.loop.TerminalCoordinator;
+import io.github.kongweiguang.ja.conversation.application.loop.TurnExecutionPlan;
 import io.github.kongweiguang.ja.conversation.application.loop.TurnQueue;
-import io.github.kongweiguang.ja.conversation.application.middleware.MiddlewareChain;
 import io.github.kongweiguang.ja.conversation.application.title.AutomaticThreadTitleScheduler;
 import io.github.kongweiguang.ja.conversation.application.cancellation.DefaultCancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.conversation.port.out.ModelEventSink;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
+import io.github.kongweiguang.ja.conversation.port.out.ToolArgumentValidator;
+import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.support.TestJsonValueCodec;
 import io.github.kongweiguang.ja.conversation.port.out.TurnToolSessionFactory;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.out.RuntimeLease;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
+import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSession;
+import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
+import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
 import io.github.kongweiguang.ja.support.FixedAgentPromptSession;
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
+import io.github.kongweiguang.ja.conversation.domain.prompt.AgentPromptSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
+import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.application.context.ContextOrchestratorFactory;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryDocument;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryGenerator;
+import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspaceReferenceValidator;
 import java.nio.file.Path;
 import java.net.URI;
 import java.time.Clock;
@@ -55,6 +74,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -70,28 +92,27 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
-import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.runtime;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.profile;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
 
 /** Turn 用例服务回归集，锁定准入、取消确认、终态提交、失败结算与关闭时限。 */
 final class TurnServiceTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-25T12:00:00Z"), ZoneOffset.UTC);
+    private static final WorkspaceReferenceValidator WORKSPACE_REFERENCES = request ->
+            new WorkspaceReferenceValidator.ValidatedReference(
+                    request.workspaceId(), request.relativePath(), request.kind());
 
     /** 锁定准入接受 Base64URL generation 前缀字符，避免合法实例标识被误拒绝。 */
     @Test
     void admissionAcceptsBase64UrlGenerationPrefixCharacters() {
-        ModelMessage message = new ModelMessage(ModelRole.USER,
-                List.of(new TextContent("test")));
-        ConversationRepository.TurnAdmission hyphen = new ConversationRepository.TurnAdmission(
-                "thr_test", "turn_hyphen", runtime("provider_test", "model_test", "cfg_-Abc123"), "item_hyphen",
-                message, List.of(), 0, CLOCK.instant());
-        ConversationRepository.TurnAdmission underscore = new ConversationRepository.TurnAdmission(
-                "thr_test", "turn_underscore", runtime("provider_test", "model_test", "cfg__Abc123"), "item_underscore",
-                message, List.of(), 0, CLOCK.instant());
-        assertEquals("cfg_-Abc123", hyphen.runtime().configGeneration());
-        assertEquals("cfg__Abc123", underscore.runtime().configGeneration());
+        assertEquals("cfg_-Abc123",
+                profile("provider_test", "model_test", "cfg_-Abc123").configGeneration());
+        assertEquals("cfg__Abc123",
+                profile("provider_test", "model_test", "cfg__Abc123").configGeneration());
     }
 
     /** Runtime 解析失败不得预留队列、写入准入事务或产生需要猜测释放的半成品租约。 */
@@ -101,7 +122,7 @@ final class TurnServiceTest {
         ModelPort model = (request, sink, cancellation) ->
                 CompletableFuture.failedFuture(new AssertionError("model must not run"));
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         TurnRuntimeResolver resolver = new TurnRuntimeResolver() {
@@ -115,10 +136,131 @@ final class TurnServiceTest {
             }
         };
         try (queue; loop; cancellations;
-             TurnService service = new TurnService(store, loop, queue, cancellations, resolver, CLOCK)) {
+             TurnService service = new TurnService(store, loop, queue, cancellations, resolver, CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             assertThrows(IllegalStateException.class, () -> service.start(request("turn_resolution"),
                     event -> CompletableFuture.completedFuture(null)));
             assertEquals(0, store.revision());
+        }
+    }
+
+    /** Resume 只有真实 CAS 竞争映射为 FIFO 顺序冲突。 */
+    @Test
+    void resumeMapsOnlyStorageCasConflictToOrderConflict() {
+        RuntimeException failure = resumeFailure(StorageException.Code.CAS_CONFLICT);
+        TurnUseCase.TurnResumeException mapped = assertInstanceOf(
+                TurnUseCase.TurnResumeException.class, failure);
+        assertEquals(TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT, mapped.failure());
+    }
+
+    /** Resume 目标在 CAS 前消失时映射为不可恢复，而不是误导调用方重排 FIFO。 */
+    @Test
+    void resumeMapsStorageNotFoundToNotResumable() {
+        RuntimeException failure = resumeFailure(StorageException.Code.NOT_FOUND);
+        TurnUseCase.TurnResumeException mapped = assertInstanceOf(
+                TurnUseCase.TurnResumeException.class, failure);
+        assertEquals(TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE, mapped.failure());
+    }
+
+    /** 事务或 IO 故障必须保持基础设施失败，禁止伪装成可重试业务冲突。 */
+    @Test
+    void resumePreservesUnexpectedStorageFailure() {
+        RuntimeException failure = resumeFailure(StorageException.Code.TRANSACTION);
+        StorageException storage = assertInstanceOf(StorageException.class, failure);
+        assertEquals(StorageException.Code.TRANSACTION, storage.code());
+    }
+
+    /** Resume 环境解析失败保持原始稳定分类，不再伪装成已删除的 Turn 指纹错误。 */
+    @Test
+    void resumeMapsExpectedRuntimeResolutionFailuresToFingerprintMismatch() {
+        List<RuntimeException> failures = List.of(
+                new TurnRuntimeResolver.RuntimeMismatchException("configured Skill is unavailable"),
+                new ConfigurationError(ConfigurationError.Code.MISSING_PROVIDER_OR_MODEL,
+                        "provider is unavailable"),
+                new ConfigurationError(ConfigurationError.Code.CORRUPT_CONFIG,
+                        "configuration is invalid"));
+
+        for (RuntimeException failure : failures) {
+            assertEquals(failure.getClass(), resumeResolutionFailure(failure).getClass());
+        }
+    }
+
+    /** 配置 IO 故障不是运行时漂移，必须保留原分类供上层告警和重试。 */
+    @Test
+    void resumePreservesRuntimeResolutionInfrastructureFailure() {
+        ConfigurationError failure = assertInstanceOf(ConfigurationError.class,
+                resumeResolutionFailure(new ConfigurationError(
+                        ConfigurationError.Code.IO_FAILURE, "configuration storage unavailable")));
+
+        assertEquals(ConfigurationError.Code.IO_FAILURE, failure.code());
+    }
+
+    /**
+     * Resume 必须恢复 execution 引用的摘要与 Skill 名称，同时把 latest checkpoint 摘要作为
+     * 下一 Provider 轮次输入；Skill 正文版本不属于持久恢复身份。
+     */
+    @Test
+    void resumeRestoresReferencedPromptAndUsesLatestSummaryForNextProvider() throws Exception {
+        RecordingStore store = new RecordingStore();
+        List<TurnExecutionState.ActiveSkill> activeSkills = List.of(
+                new TurnExecutionState.ActiveSkill("skill_review"));
+        store.prepareResumeCandidate("provider prompt summary", "latest checkpoint summary", activeSkills);
+        TrackingPromptSession prompt = new TrackingPromptSession(activeSkills);
+        ModelPort model = (request, sink, cancellation) -> {
+            sink.onEvent(new ModelPort.TextDelta("done"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations,
+                     runtimeResolver(new AtomicInteger(), prompt), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.Accepted accepted = service.resume(
+                    "turn_resume", 0, event -> CompletableFuture.completedFuture(null));
+
+            assertEquals(TurnState.COMPLETED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+            assertEquals(List.of("provider prompt summary", "latest checkpoint summary",
+                            "latest checkpoint summary"),
+                    prompt.restoredSummaries);
+            assertEquals(activeSkills, prompt.restoredSkills.get());
+            assertEquals("latest checkpoint summary", prompt.preparedSummaries.getFirst());
+        }
+    }
+
+    /** 强杀恢复后的首轮仍拥有一次自动标题机会，并且标题输入必须使用持久化的原始用户请求。 */
+    @Test
+    void resumedFirstTurnPreservesAutomaticTitleOwnership() throws Exception {
+        RecordingStore store = new RecordingStore();
+        store.prepareTitleEligibleResumeCandidate("original request");
+        ModelPort model = (request, sink, cancellation) -> {
+            sink.onEvent(new ModelPort.TextDelta("done"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        AtomicReference<AutomaticThreadTitleScheduler.Request> titleRequest = new AtomicReference<>();
+        AutomaticThreadTitleScheduler titles = (request, sink) -> {
+            titleRequest.set(request);
+            return CompletableFuture.completedFuture(null);
+        };
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations,
+                     runtimeResolver(), CLOCK, titles, WORKSPACE_REFERENCES)) {
+            TurnUseCase.Accepted accepted = service.resume(
+                    "turn_resume", 0, event -> CompletableFuture.completedFuture(null));
+
+            assertEquals(TurnState.COMPLETED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+            assertNotNull(titleRequest.get());
+            assertEquals("original request", titleRequest.get().firstUserRequest());
         }
     }
 
@@ -130,12 +272,13 @@ final class TurnServiceTest {
         ModelPort model = (request, sink, cancellation) ->
                 CompletableFuture.failedFuture(new AssertionError("model must not run"));
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
              TurnService service = new TurnService(store, loop, queue, cancellations,
-                     runtimeResolver(releases), CLOCK)) {
+                     runtimeResolver(releases), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             service.stopAccepting();
             assertThrows(java.util.concurrent.RejectedExecutionException.class,
                     () -> service.start(request("turn_rejected"),
@@ -145,7 +288,32 @@ final class TurnServiceTest {
         }
     }
 
-    /** 正常终态和 finally 清理共享幂等租约，成功完成后底层代际只归还一次。 */
+    /** 协作模式参与冻结运行时身份，Plan 请求绝不能借用 Default Prompt/Tool catalog。 */
+    @Test
+    void rejectsResolvedRuntimeWithDifferentCollaborationMode() {
+        AtomicInteger releases = new AtomicInteger();
+        RecordingStore store = new RecordingStore();
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("model must not run"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations,
+                     runtimeResolver(releases,
+                             new FixedAgentPromptSession(ContextBudget.capabilities(1_000_000, 8_192, true)),
+                             io.github.kongweiguang.ja.conversation.domain.CollaborationMode.PLAN),
+                     CLOCK, AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.start(request("turn_mode_mismatch"),
+                            event -> CompletableFuture.completedFuture(null)));
+            assertEquals(1, releases.get());
+            assertEquals(0, store.revision());
+        }
+    }
+
+    /** 未启用自动标题时准入、planning 与 dispatch 短租约必须逐一且只释放一次。 */
     @Test
     void completedTurnReleasesRuntimeLeaseExactlyOnce() throws Exception {
         AtomicInteger releases = new AtomicInteger();
@@ -156,18 +324,19 @@ final class TurnServiceTest {
                     ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
         };
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
              TurnService service = new TurnService(store, loop, queue, cancellations,
-                     runtimeResolver(releases), CLOCK)) {
+                     runtimeResolver(releases), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"),
                     event -> CompletableFuture.completedFuture(null));
             assertEquals(TurnState.COMPLETED,
                     accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
             assertTrue(queue.awaitQuiescence(Duration.ofSeconds(1)));
-            assertEquals(1, releases.get());
+            assertEquals(3, releases.get());
         }
     }
 
@@ -181,12 +350,13 @@ final class TurnServiceTest {
                     ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
         };
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
              TurnService service = new TurnService(store, loop, queue, cancellations,
-                     runtimeResolver(), CLOCK)) {
+                     runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(
                     request("turn_test", "", List.of("att_first", "att_second")),
                     event -> CompletableFuture.completedFuture(null));
@@ -199,9 +369,9 @@ final class TurnServiceTest {
         }
     }
 
-    /** 成功 Turn 不等待自动标题，但冻结配置租约必须延长到后台标题任务真实结束。 */
+    /** 成功 Turn 不等待自动标题；标题 worker 只在真正发送前打开并独立释放最新请求租约。 */
     @Test
-    void completedTurnSchedulesTitleWithoutBlockingAndKeepsFrozenLease() throws Exception {
+    void completedTurnSchedulesTitleWithoutBlockingAndKeepsRequestLease() throws Exception {
         AtomicInteger releases = new AtomicInteger();
         RecordingStore store = new RecordingStore();
         ModelPort model = (request, sink, cancellation) -> {
@@ -216,23 +386,26 @@ final class TurnServiceTest {
             return titleCompletion;
         };
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
              TurnService service = new TurnService(store, loop, queue, cancellations,
-                     runtimeResolver(releases), CLOCK, titles)) {
+                     runtimeResolver(releases), CLOCK, titles, WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "first request"),
                     event -> CompletableFuture.completedFuture(null));
             assertEquals(TurnState.COMPLETED,
                     accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
             assertNotNull(titleRequest.get());
             assertEquals("first request", titleRequest.get().firstUserRequest());
-            assertEquals("provider_test", titleRequest.get().runtime().providerId());
-            assertEquals(0, releases.get());
+            try (AutomaticThreadTitleScheduler.RequestRuntime runtime =
+                         titleRequest.get().runtimeFactory().open(Duration.ofSeconds(1))) {
+                assertEquals("provider_test", runtime.configuration().providerId());
+            }
+            assertEquals(4, releases.get());
             assertTrue(queue.awaitQuiescence(Duration.ofSeconds(1)));
             titleCompletion.complete(null);
-            assertEquals(1, releases.get());
+            assertEquals(4, releases.get());
         }
     }
 
@@ -248,12 +421,12 @@ final class TurnServiceTest {
             return CompletableFuture.completedFuture(null);
         };
         AgentLoop loop = new AgentLoop(metered(failed), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
              TurnService service = new TurnService(store, loop, queue, cancellations,
-                     runtimeResolver(), CLOCK, titles)) {
+                     runtimeResolver(), CLOCK, titles, WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_failed_first", "first request"),
                     event -> CompletableFuture.completedFuture(null));
             assertEquals(TurnState.FAILED,
@@ -278,12 +451,12 @@ final class TurnServiceTest {
             return CompletableFuture.completedFuture(null);
         };
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
              TurnService service = new TurnService(store, loop, queue, cancellations,
-                     runtimeResolver(), CLOCK, titles)) {
+                     runtimeResolver(), CLOCK, titles, WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_later", "later request"),
                     event -> CompletableFuture.completedFuture(null));
             assertEquals(TurnState.COMPLETED,
@@ -308,7 +481,7 @@ final class TurnServiceTest {
                     ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
         };
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         TurnEventSink events = new TurnEventSink() {
@@ -327,7 +500,8 @@ final class TurnServiceTest {
             }
         };
         try (queue; loop; cancellations;
-             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "first request"), events);
             assertEquals(TurnState.COMPLETED,
                     accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
@@ -345,20 +519,30 @@ final class TurnServiceTest {
         BlockingModel model = new BlockingModel();
         RecordingStore store = new RecordingStore();
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        AtomicInteger propagatedCancellations = new AtomicInteger();
             // TurnService 是准入 Owner，其 Solon 依赖由外层生命周期关闭。
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            service.bindCancellationListener((threadId, turnId) -> {
+                assertEquals("thr_test", threadId);
+                assertEquals("turn_test", turnId);
+                propagatedCancellations.incrementAndGet();
+            });
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel"),
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
+            long expectedRevision = store.revision();
             long before = System.nanoTime();
-            TurnUseCase.CancelResult result = service.cancel("turn_test", store.revision());
+            TurnUseCase.CancelResult result = service.cancel("turn_test", expectedRevision);
+            service.cancel("turn_test", expectedRevision);
             long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - before);
             assertTrue(elapsedMillis < 100, "cancel ACK took " + elapsedMillis + "ms");
             assertEquals(TurnState.RUNNING, result.status());
+            assertEquals(1, propagatedCancellations.get());
             assertTrue(model.cleanupStarted.await(1, TimeUnit.SECONDS));
             assertEquals(0, store.terminals.get());
             model.modelRelease.countDown();
@@ -374,13 +558,132 @@ final class TurnServiceTest {
         }
     }
 
+    /** 监听器瞬时失败后只保留一条退避重试链，重复取消不能并行派发同一持久欠账。 */
+    @Test
+    void retriesCancellationPropagationOnceWithoutDuplicateDispatch() throws Exception {
+        BlockingModel model = new BlockingModel();
+        RecordingStore store = new RecordingStore();
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        AtomicInteger attempts = new AtomicInteger();
+        CountDownLatch propagated = new CountDownLatch(1);
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            service.bindCancellationListener((threadId, turnId) -> {
+                assertEquals("thr_test", threadId);
+                assertEquals("turn_test", turnId);
+                if (attempts.incrementAndGet() == 1) {
+                    throw new IllegalStateException("transient task listener failure");
+                }
+                propagated.countDown();
+            });
+            TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel retry"),
+                    event -> CompletableFuture.completedFuture(null));
+            assertTrue(model.started.await(1, TimeUnit.SECONDS));
+            long expectedRevision = store.revision();
+
+            service.cancel("turn_test", expectedRevision);
+            service.cancel("turn_test", expectedRevision);
+
+            assertTrue(propagated.await(2, TimeUnit.SECONDS));
+            assertEquals(2, attempts.get());
+            model.modelRelease.countDown();
+            model.cleanupRelease.countDown();
+            assertEquals(TurnState.CANCELLED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+        }
+    }
+
+    /** 默认入队后通过 identity 提升，不能再从旧双入口直接创建 Steering。 */
+    @Test
+    void enqueuesFollowUpsAndPrioritizesByIdentity() throws Exception {
+        BlockingModel model = new BlockingModel();
+        RecordingStore store = new RecordingStore();
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.Accepted accepted = service.start(request("turn_test", "queue"),
+                    event -> CompletableFuture.completedFuture(null));
+            assertTrue(model.started.await(1, TimeUnit.SECONDS));
+
+            service.enqueueInput("turn_test", content("follow"));
+            TurnUseCase.InputMutation second = service.enqueueInput("turn_test", content("steer"));
+            service.prioritizeInput("turn_test", second.inputId(), 1);
+
+            assertEquals(List.of(ConversationRepository.InputKind.FOLLOW_UP,
+                            ConversationRepository.InputKind.STEERING),
+                    store.queuedInputs().stream().map(ConversationRepository.PendingInput::kind).toList());
+            assertEquals(List.of("follow", "steer"),
+                    store.queuedInputs().stream().map(input -> input.content().text()).toList());
+            assertTrue(store.queuedInputs().stream().allMatch(input ->
+                    input.threadId().equals("thr_test") && input.turnId().equals("turn_test")));
+
+            service.cancel("turn_test", store.revision());
+            assertTrue(model.cleanupStarted.await(1, TimeUnit.SECONDS));
+            model.modelRelease.countDown();
+            model.cleanupRelease.countDown();
+            assertEquals(TurnState.CANCELLED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+        }
+    }
+
+    /**
+     * 运行 owner 释放后的 SUSPENDED Turn 仍允许按 item revision 修复和删除问题队首；
+     * mutation 只返回 SQLite 权威 ACK，不复用已结束 sink，也不得隐式恢复或接收新输入。
+     */
+    @Test
+    void repairsAndDeletesSuspendedInputWithoutActiveOwner() {
+        RecordingStore store = new RecordingStore();
+        store.prepareSuspendedAttachmentInput();
+        AtomicInteger releases = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("model must not run"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations,
+                     runtimeResolver(releases), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.InputMutation repaired = service.updateInput(
+                    "turn_resume", "input_suspended", 2, content("repaired"));
+
+            InputQueue.QueuedInput repairedHead = repaired.inputQueue().items().getFirst();
+            assertEquals(InputQueue.Status.PENDING, repairedHead.status());
+            assertEquals(null, repairedHead.issue());
+            assertEquals(3, repairedHead.inputRevision());
+            assertEquals("repaired", repairedHead.content().text());
+            assertTrue(repairedHead.attachments().isEmpty());
+            assertEquals(TurnState.SUSPENDED, store.state);
+            assertEquals(0, releases.get());
+
+            TurnUseCase.InputMutationException enqueueFailure = assertThrows(
+                    TurnUseCase.InputMutationException.class,
+                    () -> service.enqueueInput("turn_resume", content("must wait for resume")));
+            assertEquals(TurnUseCase.InputMutationFailure.TURN_NOT_FOUND, enqueueFailure.failure());
+
+            TurnUseCase.InputMutation deleted = service.deleteInput(
+                    "turn_resume", "input_suspended", 3);
+            assertTrue(deleted.inputQueue().items().isEmpty());
+            assertEquals(TurnState.SUSPENDED, store.state);
+        }
+    }
+
     /** 复现取消唤醒模型等待的真实顺序，并锁定终态发布屏障与复用线程中断隔离。 */
     @Test
     void cancellationPublishesTerminalBeforeCompletionAndDoesNotInterruptNextTurn() throws Exception {
         CancellationProbeModel model = new CancellationProbeModel();
         RecordingStore store = new RecordingStore();
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         CompletableFuture<Void> terminalRelease = new CompletableFuture<>();
@@ -388,7 +691,7 @@ final class TurnServiceTest {
         AtomicInteger terminalPublications = new AtomicInteger();
         try (queue; loop; cancellations;
                 TurnService service = new TurnService(store, loop, queue, cancellations,
-                        runtimeResolver(), CLOCK)) {
+                        runtimeResolver(), CLOCK, AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted cancelled = service.start(request("turn_test", "cancel"), event -> {
                 if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.Terminal) {
                     terminalPublications.incrementAndGet();
@@ -424,17 +727,48 @@ final class TurnServiceTest {
         RecordingStore store = new RecordingStore();
         store.rejectCancellationClaims = true;
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel"),
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
             TurnUseCase.TurnCancellationException failure = assertThrows(
                     TurnUseCase.TurnCancellationException.class,
                     () -> service.cancel("turn_test", store.revision()));
+            assertEquals(TurnUseCase.CancelFailure.CONFLICT, failure.failure());
+            assertFalse(model.cleanupStarted.await(150, TimeUnit.MILLISECONDS));
+            model.modelRelease.countDown();
+            assertEquals(TurnState.FAILED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+        }
+    }
+
+    /** 生产 Repository 的稳定 CAS_CONFLICT 也必须映射为用例冲突，供 RPC 做有界单版重试。 */
+    @Test
+    void storageCancellationConflictMapsToUseCaseWithoutPublishingToken() throws Exception {
+        BlockingModel model = new BlockingModel();
+        RecordingStore store = new RecordingStore();
+        store.cancellationStorageFailure = new StorageException(
+                StorageException.Code.CAS_CONFLICT, "forced cancellation conflict");
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel"),
+                    event -> CompletableFuture.completedFuture(null));
+            assertTrue(model.started.await(1, TimeUnit.SECONDS));
+
+            TurnUseCase.TurnCancellationException failure = assertThrows(
+                    TurnUseCase.TurnCancellationException.class,
+                    () -> service.cancel("turn_test", store.revision()));
+
             assertEquals(TurnUseCase.CancelFailure.CONFLICT, failure.failure());
             assertFalse(model.cleanupStarted.await(150, TimeUnit.MILLISECONDS));
             model.modelRelease.countDown();
@@ -450,10 +784,11 @@ final class TurnServiceTest {
         RecordingStore store = new RecordingStore();
         FailOnceCancellationCoordinator cancellations = new FailOnceCancellationCoordinator();
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel"),
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS), () ->
@@ -480,10 +815,11 @@ final class TurnServiceTest {
         RecordingStore store = new RecordingStore();
         LostScopeCancellationCoordinator cancellations = new LostScopeCancellationCoordinator();
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"),
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
@@ -510,11 +846,12 @@ final class TurnServiceTest {
         ModelPort failingModel = (request, sink, cancellation) ->
                 CompletableFuture.failedFuture(new IllegalStateException("provider failed"));
         AgentLoop loop = new AgentLoop(failingModel, new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "fail"),
                     event -> CompletableFuture.completedFuture(null));
             ExecutionException failure = assertThrows(ExecutionException.class,
@@ -534,11 +871,12 @@ final class TurnServiceTest {
         ModelPort failingModel = (request, sink, cancellation) ->
                 CompletableFuture.failedFuture(new IllegalStateException("provider failed"));
         AgentLoop loop = new AgentLoop(failingModel, new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"),
                     event -> CompletableFuture.completedFuture(null));
             AtomicInteger completions = new AtomicInteger();
@@ -553,6 +891,72 @@ final class TurnServiceTest {
         }
     }
 
+    /** 应急失败也必须把安全回复、错误和 FAILED 状态原子提交，避免外层兜底重新制造空白终态。 */
+    @Test
+    void emergencyFailurePersistsAndPublishesSafeFinalReply() {
+        RecordingStore store = new RecordingStore();
+        store.state = TurnState.RUNNING;
+        store.revision = 7;
+        store.turnMutationVersion = 3;
+        AtomicReference<TurnEvent.Terminal> published = new AtomicReference<>();
+        Path workspace = Path.of("C:\\ja-test-workspace");
+        TurnRuntimeRequest runtimeRequest = new TurnRuntimeRequest(
+                "thr_test", "turn_test", workspace, "ws_turn_service", "provider_test", "model_test", "medium",
+                AccessMode.APPROVAL_REQUIRED,
+                io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
+                TurnOrigin.USER,
+                TurnLimits.defaults().wallTimeout(), CLOCK.instant());
+        try (DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+                RuntimeLease lease = runtimeResolver().resolve(runtimeRequest)) {
+            CancellationCoordinator.CancellationScope cancellation =
+                    cancellations.open("thr_test", "turn_emergency");
+            try (cancellation) {
+                TurnExecutionState.Common common = new TurnExecutionState.Common(
+                        0, 0, 1, null, List.of(),
+                        CLOCK.instant().plus(lease.limits().wallTimeout()),
+                        io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
+                TurnExecutionState.Ready execution = new TurnExecutionState.Ready(
+                        common, TurnExecutionState.Next.ASSISTANT, null);
+                TurnExecutionPlan plan = new TurnExecutionPlan(
+                        "thr_test", "turn_emergency", workspace, content("test"), lease.model(),
+                        lease.accessMode(), lease.limits(), CLOCK.instant(), "ws_turn_service", 7, 3, "",
+                        lease.promptSession(), QueuedInputBoundary.plainTextOnly(),
+                         lease.attachments(), lease.tools(), lease.generationId(),
+                         lease.toolSessions(), lease.outputLimits(), lease.presentationSecrets(),
+                         CLOCK.instant().plus(lease.limits().wallTimeout()),
+                         (requestCommon, summary) -> {
+                             throw new AssertionError("runtime refresh is outside emergency settlement test");
+                         });
+                TurnOwnership owner = new TurnOwnership(
+                        plan, event -> {
+                            if (event instanceof TurnEvent.Terminal terminal) published.set(terminal);
+                            return CompletableFuture.completedFuture(null);
+                        }, cancellation, new TerminalCoordinator(),
+                        new CompletableFuture<>(), false,
+                        CLOCK.instant().plus(lease.limits().wallTimeout()), execution);
+
+                new TurnTerminalSettlement(store, CLOCK).settleEmergency(
+                        owner, TurnState.FAILED, "INTERNAL_ERROR", "turn execution failed",
+                        new AssertionError("internal provider detail"));
+                var result = owner.completion.join();
+                assertEquals(TurnState.FAILED, result.state());
+                assertNotNull(result.terminal().finalMessage());
+            } finally {
+                cancellations.complete("thr_test", "turn_emergency");
+            }
+        }
+
+        assertEquals(TurnState.FAILED, store.state());
+        assertNotNull(store.lastTerminalCommit);
+        assertNotNull(store.lastTerminalCommit.finalMessage());
+        assertNotNull(published.get());
+        assertNotNull(published.get().finalMessage());
+        assertEquals(store.lastTerminalCommit.summary(), published.get().summary());
+        assertEquals(store.lastTerminalCommit.finalMessageId(), published.get().finalMessage().messageId());
+        assertEquals(store.lastTerminalCommit.summary(), published.get().finalMessage().text());
+        assertFalse(published.get().finalMessage().text().contains("turn execution failed"));
+    }
+
     /** 锁定不安全 generation 直接失败结算而不伪造紧急终态。 */
     @Test
     void unsafeGenerationSettlesWithoutEmergencyTerminal() throws Exception {
@@ -563,11 +967,12 @@ final class TurnServiceTest {
                     ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
         };
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"), event ->
                     event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.TextDelta
                             ? CompletableFuture.failedFuture(new IllegalStateException("pipe failed"))
@@ -590,7 +995,7 @@ final class TurnServiceTest {
         ModelPort unreachable = (request, sink, cancellation) ->
                 CompletableFuture.failedFuture(new AssertionError("queued model ran"));
         AgentLoop loop = new AgentLoop(unreachable, new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         CountDownLatch blockerStarted = new CountDownLatch(1);
         CountDownLatch blockerRelease = new CountDownLatch(1);
@@ -605,7 +1010,8 @@ final class TurnServiceTest {
         RejectingTerminalExecutor terminal = new RejectingTerminalExecutor();
         try (queue; loop; cancellations;
                 TurnService service = new TurnService(
-                        store, loop, queue, cancellations, runtimeResolver(), CLOCK, terminal)) {
+                        store, loop, queue, cancellations, runtimeResolver(), CLOCK, terminal,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"),
                     event -> CompletableFuture.completedFuture(null));
             TurnUseCase.CancelResult result = service.cancel("turn_test", store.revision());
@@ -627,11 +1033,12 @@ final class TurnServiceTest {
         BlockingModel model = new BlockingModel();
         RecordingStore store = new RecordingStore();
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
         TurnQueue queue = new TurnQueue(8, 4, 1);
         DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
         try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK)) {
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             service.start(request("turn_test"), event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
             CompletableFuture<Void> first = CompletableFuture.runAsync(() -> service.closeAt(
@@ -661,30 +1068,60 @@ final class TurnServiceTest {
     /** 允许附件场景复用同一运行时身份，同时由 TurnStartRequest 校验 text/attachment 非空组合。 */
     private static TurnStartRequest request(String turnId, String input, List<String> attachmentIds) {
         return new TurnStartRequest("thr_test", turnId, "ws_turn_service",
-                Path.of("C:/workspace"), input, attachmentIds, "provider_test", "model_test", "medium",
+                Path.of("C:/workspace"), content(input, attachmentIds),
+                "provider_test", "model_test", "medium",
                 AccessMode.APPROVAL_REQUIRED,
+                io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
                 TurnLimits.defaults().wallTimeout(),
                 0, 0, CLOCK.instant());
     }
 
-    /** 模拟 composition root 冻结同一配置代际的命令、预算、Tool 和 MCP 工厂。 */
+    /** 单文本测试也走 UserContent，防止测试继续依赖已删除的字符串双轨。 */
+    private static UserContent content(String text) {
+        return content(text, List.of());
+    }
+
+    /** 按生产规范构造附件后正文的输入；空正文不会生成非法 Text block。 */
+    private static UserContent content(String text, List<String> attachmentIds) {
+        List<UserContentBlock> blocks = new ArrayList<>();
+        attachmentIds.stream().map(AttachmentContent::new).forEach(blocks::add);
+        if (!text.isBlank()) blocks.add(new TextContent(text));
+        return new UserContent(blocks);
+    }
+
+    /** 模拟 composition root 为每个安全点解析同一配置代际的命令、预算、Tool 和 MCP 工厂。 */
     private static TurnRuntimeResolver runtimeResolver() {
         return runtimeResolver(new AtomicInteger());
     }
 
     /** 注入释放计数器，验证所有权从准入到完成只归还一次。 */
     private static TurnRuntimeResolver runtimeResolver(AtomicInteger releases) {
+        return runtimeResolver(releases,
+                new FixedAgentPromptSession(ContextBudget.capabilities(1_000_000, 8_192, true)));
+    }
+
+    /** 注入 Prompt Session 以验证 Resume 恢复参数，同时保持配置与 Tool 指纹校验一致。 */
+    private static TurnRuntimeResolver runtimeResolver(AtomicInteger releases, AgentPromptSession promptSession) {
+        return runtimeResolver(releases, promptSession,
+                io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT);
+    }
+
+    /** 显式注入协作模式，覆盖 Resolver 发生模式漂移时的失败关闭边界。 */
+    private static TurnRuntimeResolver runtimeResolver(AtomicInteger releases, AgentPromptSession promptSession,
+                                                       io.github.kongweiguang.ja.conversation.domain.CollaborationMode
+                                                               collaborationMode) {
         return new TurnRuntimeResolver() {
             /** 按入站意图创建不可变运行时租约，不依赖 Wire DTO 或配置 Adapter。 */
             @Override
             public RuntimeLease resolve(TurnRuntimeRequest start) {
                 return new RuntimeLease("cfg_test", modelConfiguration(), AccessMode.APPROVAL_REQUIRED,
+                        collaborationMode,
                         TurnLimits.defaults(), List.of(), new EmptyMcp(),
                         new ToolProjectionLimits(64_000, 16_000),
-                        new FixedAgentPromptSession(
-                                ContextBudget.capabilities(1_000_000, 8_192, true)),
+                        promptSession,
                         request -> { throw new AssertionError("text-only test must not read attachments"); },
                         List.of("test-secret"),
+                        "0".repeat(64), "prompt_test", "medium",
                         releases::incrementAndGet);
             }
 
@@ -721,6 +1158,11 @@ final class TurnServiceTest {
         return new TestJsonValueCodec();
     }
 
+    /** 使用真实 Schema 适配器，确保服务测试与生产 Runner 的参数准入语义一致。 */
+    private static ToolArgumentValidator argumentValidator() {
+        return new NetworkntToolArgumentValidation(argumentsCodec());
+    }
+
     /**
      * 为生命周期测试替身补上确定性的 Provider 精确计量接缝；测试仍由 delegate 控制发送，
      * 但不会因 ModelPort 的生产 fail-closed 默认实现提前终止 Turn。
@@ -728,10 +1170,10 @@ final class TurnServiceTest {
     private static ModelPort metered(ModelPort delegate) {
         return new ModelPort() {
             /** 返回与测试 envelope 绑定的稳定计量证据，不执行任何网络调用。 */
-            @Override public CompletionStage<InputTokenCount> countInputTokens(
+            @Override public InputTokenEstimate estimateInputTokens(
                     ModelRequest request, CancellationToken cancellationToken) {
                 cancellationToken.throwIfCancellationRequested();
-                return CompletableFuture.completedFuture(new InputTokenCount(1, "0".repeat(64)));
+                return new InputTokenEstimate(1, "0".repeat(64));
             }
 
             /** 保留原测试替身的发送、阻塞与取消语义。 */
@@ -760,7 +1202,7 @@ final class TurnServiceTest {
     /** 提供无真实凭据的固定模型配置，确保服务回归不会访问外部 Provider。 */
     private static ModelPort.ModelConfiguration modelConfiguration() {
         return new ModelPort.ModelConfiguration("provider_test", "model_test", "cfg_test",
-                ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, "test",
+                ModelPort.Api.OPENAI_RESPONSES, "test",
                 URI.create("https://example.invalid/v1"), "test", Duration.ofSeconds(5),
                 Duration.ofSeconds(30), java.util.Set.of(ModelPort.InputModality.TEXT),
                 ModelPort.GenerationOptions.defaults());
@@ -895,18 +1337,74 @@ final class TurnServiceTest {
         }
     }
 
+    /** 运行到 Repository.resume 并返回待验证异常，确保租约与队列清理走真实服务路径。 */
+    private static RuntimeException resumeFailure(StorageException.Code code) {
+        RecordingStore store = new RecordingStore();
+        store.prepareResumeFailure(code);
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("model must not run"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations,
+                     runtimeResolver(new AtomicInteger()), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            return assertThrows(RuntimeException.class, () -> service.resume(
+                    "turn_resume", 0, event -> CompletableFuture.completedFuture(null)));
+        }
+    }
+
+    /** 注入解析阶段失败并运行真实 Resume 前半段，证明错误映射不会越过 Repository CAS。 */
+    private static RuntimeException resumeResolutionFailure(RuntimeException injected) {
+        RecordingStore store = new RecordingStore();
+        store.prepareResumeCandidate();
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("model must not run"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        TurnRuntimeResolver resolver = new TurnRuntimeResolver() {
+            /** 在返回任何租约前抛出指定稳定分类。 */
+            @Override public RuntimeLease resolve(TurnRuntimeRequest request) { throw injected; }
+
+            /** Resume 测试不执行工作区预热。 */
+            @Override public void prepareWorkspace(Path workspaceRoot) { }
+        };
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, resolver, CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            return assertThrows(RuntimeException.class, () -> service.resume(
+                    "turn_resume", 0, event -> CompletableFuture.completedFuture(null)));
+        }
+    }
+
     /** 记录 revision、Turn 状态与提交次数的存储假实现，用于断言生命周期顺序。 */
     private static final class RecordingStore implements ConversationRepository {
+        /** 服务层夹具不注入 Child mailbox；执行器若误用必须显式失败。 */
+        @Override public TaskMailboxConsumption consumeTaskMailbox(TaskMailboxCommit request) {
+            throw new UnsupportedOperationException("task mailbox is not configured by this test");
+        }
         private long revision;
         private long turnMutationVersion;
         private TurnState state = TurnState.QUEUED;
         private boolean cancellationClaimed;
         private boolean rejectCancellationClaims;
+        private StorageException cancellationStorageFailure;
         private int terminalCommitFailures;
+        private TerminalCommit lastTerminalCommit;
         private boolean provisionalTitleEnabled = true;
         private final AtomicInteger terminals = new AtomicInteger();
         private final List<StoredMessage> messages = new java.util.ArrayList<>();
+        private final List<PendingInput> queuedInputs = new java.util.ArrayList<>();
+        private final Map<String, Long> queuedInputRevisions = new HashMap<>();
+        private final Map<String, InputQueue.Issue> queuedInputIssues = new HashMap<>();
+        private long inputQueueRevision;
         private TurnAdmission lastAdmission;
+        private ResumeCandidate resumeCandidate;
+        private StorageException resumeFailure;
 
         /** 回读当前 Thread revision，供测试验证每次持久化推进。 */
         synchronized long revision() { return revision; }
@@ -918,9 +1416,59 @@ final class TurnServiceTest {
         synchronized TurnAdmission lastAdmission() {
             return lastAdmission;
         }
+        /** 返回排队输入快照，避免并发 Turn owner 与断言共享可变集合。 */
+        synchronized List<PendingInput> queuedInputs() {
+            return List.copyOf(queuedInputs);
+        }
         /** 模拟实际 Repository 已存在首条消息时的 admission 回执，后续 Turn 不再取得标题所有权。 */
         synchronized void disableProvisionalTitle() {
             provisionalTitleEnabled = false;
+        }
+        /** 配置完整 SUSPENDED 候选，并把指定存储分类注入原子 Resume 门。 */
+        synchronized void prepareResumeFailure(StorageException.Code code) {
+            prepareResumeCandidate();
+            resumeFailure = new StorageException(code, "forced resume failure");
+        }
+        /** 配置完整 SUSPENDED 候选，使测试可在解析或 Repository CAS 边界注入失败。 */
+        synchronized void prepareResumeCandidate() {
+            prepareResumeCandidate("", "", List.of());
+        }
+        /** 构造真窗故障对应的挂起队首：附件仍被预留，条目已因消费失败推进到 revision 2。 */
+        synchronized void prepareSuspendedAttachmentInput() {
+            prepareResumeCandidate();
+            PendingInput input = new PendingInput("input_suspended", "thr_test", "turn_resume",
+                    InputKind.FOLLOW_UP, content("", List.of("att_missing")), CLOCK.instant());
+            queuedInputs.add(input);
+            queuedInputRevisions.put(input.inputId(), 2L);
+            queuedInputIssues.put(input.inputId(), new InputQueue.Issue(
+                    "ATTACHMENT_UNAVAILABLE", "排队附件已不可用，请移除后再继续。", true));
+            inputQueueRevision = 2;
+        }
+        /** 配置摘要与 Active Skill 都非空的候选，证明服务不会混淆 Prompt 校验与下一轮上下文。 */
+        synchronized void prepareResumeCandidate(String promptSummary, String latestSummary,
+                                                 List<TurnExecutionState.ActiveSkill> activeSkills) {
+            state = TurnState.SUSPENDED;
+            TurnExecutionState.Common common = new TurnExecutionState.Common(
+                    0, 0, 1, promptSummary.isEmpty() ? null : "cp_prompt",
+                    activeSkills, CLOCK.instant().plus(TurnLimits.defaults().wallTimeout()),
+                    io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
+            if (messages.isEmpty()) {
+                messages.add(new StoredMessage("item_user_resume", "turn_resume", 1,
+                        new ModelMessage(ModelRole.USER, List.of(new TextContent("resume"))), CLOCK.instant()));
+            }
+            resumeCandidate = new ResumeCandidate("thr_test", "turn_resume", "ws_test",
+                    Path.of("C:\\ja-test-workspace"), 0, 0,
+                    new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null),
+                    promptSummary, latestSummary, content("resume"), null, false);
+        }
+        /** 将已准备候选标记为首轮标题 owner，用于验证跨进程恢复不丢失一次性标题责任。 */
+        synchronized void prepareTitleEligibleResumeCandidate(String originalUserInput) {
+            prepareResumeCandidate();
+            resumeCandidate = new ResumeCandidate(resumeCandidate.threadId(), resumeCandidate.turnId(),
+                    resumeCandidate.workspaceId(), resumeCandidate.workspaceRoot(),
+                    resumeCandidate.threadRevision(), resumeCandidate.turnMutationVersion(),
+                    resumeCandidate.execution(), resumeCandidate.promptSummary(),
+                    resumeCandidate.latestCheckpointSummary(), content(originalUserInput), null, true);
         }
         /** 禁止用例创建 Thread，确保测试从已存在会话快照开始。 */
         @Override public ThreadSnapshot createThread(ThreadDefinition thread) { throw new UnsupportedOperationException(); }
@@ -932,11 +1480,111 @@ final class TurnServiceTest {
             return new AdmissionReceipt(admission.threadId(), admission.turnId(), ++revision, 0,
                     provisionalTitleEnabled && messages.size() == 1 ? "测试首问" : null);
         }
+        /** 返回预置恢复候选；普通服务测试没有配置时保持空。 */
+        @Override public synchronized Optional<ResumeCandidate> findResumeCandidate(String turnId) {
+            return Optional.ofNullable(resumeCandidate);
+        }
+        /** 注入精确存储失败，防止服务测试依赖异常文本映射。 */
+        @Override public synchronized ResumeReceipt resume(String turnId, long expectedThreadRevision,
+                                                            long expectedTurnMutationVersion,
+                                                            Instant occurredAt) {
+            if (resumeFailure != null) throw resumeFailure;
+            return new ResumeReceipt("thr_test", turnId, ++revision, ++turnMutationVersion);
+        }
         /** 校验 mutation version 后记录中间态，防止测试绕过 CAS 语义。 */
         @Override public synchronized CommitReceipt commit(CommitRequest request) {
             assertEquals(turnMutationVersion, request.expectedTurnMutationVersion());
             state = request.state();
             return new CommitReceipt(++revision, ++turnMutationVersion);
+        }
+        /** Service 夹具不执行 Agent STOP 结算，调用即表明测试越过服务职责边界。 */
+        @Override public CommitReceipt commitAssistantSettlement(CommitRequest request) {
+            throw new UnsupportedOperationException("Assistant settlement is outside TurnService tests");
+        }
+        /** 记录默认 FOLLOW_UP，并返回可用于 ACK/event 收敛的完整队列。 */
+        @Override public synchronized QueueMutation enqueueInput(PendingInput input) {
+            queuedInputs.add(input);
+            queuedInputRevisions.put(input.inputId(), 1L);
+            inputQueueRevision++;
+            return new QueueMutation(input.inputId(), inputQueue(), revision, true);
+        }
+        /** Fake 按 identity 把普通输入提升为 Steering，并模拟首个正 item revision。 */
+        @Override public synchronized QueueMutation prioritizeInput(String threadId, String turnId,
+                                                                     String inputId, long expectedInputRevision,
+                                                                     Instant occurredAt) {
+            for (int index = 0; index < queuedInputs.size(); index++) {
+                PendingInput input = queuedInputs.get(index);
+                if (input.inputId().equals(inputId)) {
+                    requireInputRevision(inputId, expectedInputRevision);
+                    queuedInputs.set(index, new PendingInput(input.inputId(), input.threadId(), input.turnId(),
+                            InputKind.STEERING, input.content(), input.createdAt()));
+                    queuedInputRevisions.put(inputId, expectedInputRevision + 1);
+                    inputQueueRevision++;
+                    return new QueueMutation(inputId, inputQueue(), revision, true);
+                }
+            }
+            throw InputQueueException.of(InputQueueFailure.NOT_FOUND);
+        }
+        /** 编辑用精确 item revision 替换内容并清除旧问题，模拟 Repository 的单事务修复语义。 */
+        @Override public synchronized QueueMutation updateInput(
+                String threadId, String turnId, String inputId, long expectedInputRevision,
+                UserContent content, Instant occurredAt) {
+            for (int index = 0; index < queuedInputs.size(); index++) {
+                PendingInput input = queuedInputs.get(index);
+                if (!input.inputId().equals(inputId)) continue;
+                requireInputRevision(inputId, expectedInputRevision);
+                queuedInputs.set(index, new PendingInput(input.inputId(), input.threadId(), input.turnId(),
+                        input.kind(), content, input.createdAt()));
+                queuedInputRevisions.put(inputId, expectedInputRevision + 1);
+                queuedInputIssues.remove(inputId);
+                inputQueueRevision++;
+                return new QueueMutation(inputId, inputQueue(), revision, true);
+            }
+            throw InputQueueException.of(InputQueueFailure.NOT_FOUND);
+        }
+        /** 删除用精确 item revision 清理队列投影；附件丢弃由生产 Repository 的既有事务测试覆盖。 */
+        @Override public synchronized QueueMutation deleteInput(
+                String threadId, String turnId, String inputId, long expectedInputRevision,
+                Instant occurredAt) {
+            requireInputRevision(inputId, expectedInputRevision);
+            boolean removed = queuedInputs.removeIf(input -> input.inputId().equals(inputId));
+            if (!removed) throw InputQueueException.of(InputQueueFailure.NOT_FOUND);
+            queuedInputRevisions.remove(inputId);
+            queuedInputIssues.remove(inputId);
+            inputQueueRevision++;
+            return new QueueMutation(inputId, inputQueue(), revision, true);
+        }
+        /** Fake 与生产一样先区分缺失 identity 和过期 revision，不解析异常文本。 */
+        private void requireInputRevision(String inputId, long expectedInputRevision) {
+            Long actual = queuedInputRevisions.get(inputId);
+            if (actual == null) throw InputQueueException.of(InputQueueFailure.NOT_FOUND);
+            if (actual != expectedInputRevision) throw InputQueueException.of(InputQueueFailure.CONFLICT);
+        }
+        /** 服务层 fixture 不模拟运行期排队，STOP continuation 必须明确返回空而非继承生产语义。 */
+        @Override public Optional<InputConsumption> commitWithNextInput(
+                CommitRequest request, InputSelection selection) {
+            return Optional.empty();
+        }
+
+        /** Fake 全量投影遵循 Steering 优先、普通 FIFO 的真实顺序。 */
+        private InputQueue inputQueue() {
+            List<InputQueue.QueuedInput> items = java.util.stream.Stream.concat(
+                            queuedInputs.stream().filter(input -> input.kind() == InputKind.STEERING),
+                            queuedInputs.stream().filter(input -> input.kind() == InputKind.FOLLOW_UP))
+                    .map(input -> {
+                        InputQueue.Issue issue = queuedInputIssues.get(input.inputId());
+                        List<AttachmentSummary> attachments = input.content().attachmentIds().stream()
+                                .map(attachmentId -> new AttachmentSummary(
+                                        attachmentId, "missing.png", 16, "image", "image/png"))
+                                .toList();
+                        return new InputQueue.QueuedInput(input.inputId(), input.turnId(), input.content(),
+                                InputQueue.Kind.valueOf(input.kind().name()), attachments,
+                                issue == null ? InputQueue.Status.PENDING : InputQueue.Status.NEEDS_ATTENTION,
+                                issue, queuedInputRevisions.getOrDefault(input.inputId(), 1L), input.createdAt());
+                    })
+                    .toList();
+            String turnId = resumeCandidate == null ? "turn_test" : resumeCandidate.turnId();
+            return new InputQueue(turnId, inputQueueRevision, true, items);
         }
         /** 服务层测试不执行 Tool；若误入取消 Tool 收敛边界应立即暴露错误。 */
         @Override public CommitReceipt commitCancellationToolBatch(CancellationToolBatchCommit request) {
@@ -952,6 +1600,7 @@ final class TurnServiceTest {
             long expected = request.expectedTurnMutationVersion();
             assertEquals(turnMutationVersion, expected);
             if (cancellationClaimed) assertEquals(TurnState.CANCELLED, request.state());
+            lastTerminalCommit = request;
             state = request.state();
             terminals.incrementAndGet();
             return new CommitReceipt(++revision, ++turnMutationVersion);
@@ -959,6 +1608,7 @@ final class TurnServiceTest {
         /** 原子记录取消声明及新 revision，模拟生产存储的取消所有权边界。 */
         @Override public synchronized CancellationClaim claimCancellation(String threadId, String turnId,
                 long expectedThreadRevision, String reason, Instant occurredAt) {
+            if (cancellationStorageFailure != null) throw cancellationStorageFailure;
             if (rejectCancellationClaims) {
                 throw ConversationRepository.CancellationClaimException.of(
                         ConversationRepository.CancellationFailure.CONFLICT);
@@ -979,14 +1629,15 @@ final class TurnServiceTest {
         }
         /** 返回当前 Turn 快照，使取消流程以持久状态而非内存猜测决策。 */
         @Override public synchronized Optional<TurnSnapshot> findTurn(String threadId, String turnId) {
-            return Optional.of(new TurnSnapshot(threadId, turnId, state, runtime(),
+            return Optional.of(new TurnSnapshot(threadId, turnId, state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, revision,
                     turnMutationVersion));
         }
         /** 返回包含当前准入 Turn 与消息的 Thread 快照，避免夹具硬编码身份把后续 Turn 误判为缺失。 */
         @Override public synchronized Optional<ThreadSnapshot> readThread(String threadId) {
-            String admittedTurnId = lastAdmission == null ? "turn_test" : lastAdmission.turnId();
-            TurnSnapshot turn = new TurnSnapshot("thr_test", admittedTurnId, state, runtime(),
+            String admittedTurnId = lastAdmission != null ? lastAdmission.turnId()
+                    : resumeCandidate == null ? "turn_test" : resumeCandidate.turnId();
+            TurnSnapshot turn = new TurnSnapshot("thr_test", admittedTurnId, state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, revision,
                     turnMutationVersion);
             return Optional.of(new ThreadSnapshot("thr_test", "ws_test", "test", preferences(), revision,
@@ -994,6 +1645,70 @@ final class TurnServiceTest {
         }
         /** 夹具不持有外部资源，关闭保留记录供测试完成最终断言。 */
         @Override public void close() { }
+    }
+
+    /** 记录恢复与下一轮 prepare 的摘要边界，避免测试只检查最终状态而漏掉 Prompt 接线错误。 */
+    private static final class TrackingPromptSession implements AgentPromptSession {
+        private static final String REVISION = "prompt_fixture";
+        private final List<TurnExecutionState.ActiveSkill> activeSkills;
+        private final List<String> restoredSummaries = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final AtomicReference<List<TurnExecutionState.ActiveSkill>> restoredSkills =
+                new AtomicReference<>();
+        private final List<String> preparedSummaries = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        /** 固定预期 Skill 引用，使 restore 与随后 Tool guard 使用同一快照。 */
+        private TrackingPromptSession(List<TurnExecutionState.ActiveSkill> activeSkills) {
+            this.activeSkills = List.copyOf(activeSkills);
+        }
+
+        /** 记录下一轮实际摘要，并返回与持久 revision 一致的固定 Prompt。 */
+        @Override public PreparedPrompt prepare(String summary, List<ToolSpec> tools) {
+            preparedSummaries.add(summary);
+            return new PreparedPrompt(new AgentPromptSnapshot("fixture system", REVISION, 4),
+                    ContextBudget.capabilities(1_000_000, 8_192, true));
+        }
+        /** 测试没有 Tool，门禁保持允许但仍满足完整端口。 */
+        @Override public ToolGuard beforeTool(
+                AgentTool.Invocation invocation, ToolSideEffect sideEffect, String batchRevision) {
+            return ToolGuard.allow();
+        }
+        /** 测试没有 Tool settlement，不产生额外 Prompt 变化。 */
+        @Override public void afterTool(AgentTool.Invocation invocation, AgentTool.ToolResult result) { }
+        /** 恢复测试不允许执行期新增 Skill。 */
+        @Override public SkillActivation activateSkill(SkillCatalog.SkillDocument document) {
+            throw new AssertionError("unexpected Skill activation");
+        }
+        /** 恢复夹具只允许当前 Skill 集对应的稳定 ID 被校验。 */
+        @Override public void validateSkillReferences(List<String> skillIds) {
+            assertEquals(activeSkills.stream().map(TurnExecutionState.ActiveSkill::skillId).toList(), skillIds);
+        }
+        /** 测试候选只携带稳定 ID，commit 不引入额外文件 IO。 */
+        @Override public SkillReplacement prepareSkillReplacement(List<String> skillIds) {
+            validateSkillReferences(skillIds);
+            return new SkillReplacement() {
+                /** 返回持久 execution 引用的 revision。 */
+                @Override public String promptRevision() { return REVISION; }
+                /** 返回消息边界替换后的稳定引用。 */
+                @Override public List<TurnExecutionState.ActiveSkill> activeSkillReferences() { return activeSkills; }
+                /** 该夹具没有可变 Prompt 正文，提交只表示消费 CAS 已成功。 */
+                @Override public void commit() { }
+            };
+        }
+        /** 测试不读取 Skill 文件，仅以名称集合模拟一次消息边界的原子替换。 */
+        @Override public void replaceActiveSkills(List<String> skillIds) {
+            validateSkillReferences(skillIds);
+        }
+        /** 返回持久 execution 引用的 revision。 */
+        @Override public String currentRevision() { return REVISION; }
+        /** 返回恢复后按名称记录的 Active Skill 引用。 */
+        @Override public List<TurnExecutionState.ActiveSkill> activeSkillReferences() { return activeSkills; }
+        /** 精确记录旧 checkpoint summary 与 Skill 名称，不要求历史正文或 Prompt revision。 */
+        @Override public void restoreActiveSkills(String summary,
+                                                   List<TurnExecutionState.ActiveSkill> references) {
+            assertEquals(activeSkills, references);
+            restoredSummaries.add(summary);
+            restoredSkills.set(List.copyOf(references));
+        }
     }
 
     /** 禁止意外审批调用的假代理，使服务用例不会静默跨入人工确认路径。 */

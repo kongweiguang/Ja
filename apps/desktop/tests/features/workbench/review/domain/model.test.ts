@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ReviewFile, ReviewSnapshot } from "@/features/workbench/review/domain/types";
 import {
   actionLabel,
+  canRenderUnifiedDiff,
   canRenderTextDiff,
   diffMatchesSnapshot,
   filterReviewFiles,
@@ -18,6 +19,7 @@ import {
 const files: ReviewFile[] = [
   {
     fileId: "file_a",
+    layer: "unstaged",
     path: "src/a.ts",
     oldPath: null,
     status: "modified",
@@ -38,6 +40,7 @@ const files: ReviewFile[] = [
   },
   {
     fileId: "file_b",
+    layer: "unstaged",
     path: "README.md",
     oldPath: null,
     status: "added",
@@ -49,6 +52,7 @@ const files: ReviewFile[] = [
   },
   {
     fileId: "file_c",
+    layer: "unstaged",
     path: "assets/icon.bin",
     oldPath: null,
     status: "conflicted",
@@ -78,6 +82,8 @@ function snapshot(source: ReviewSnapshot["source"] = { kind: "unstaged" }): Revi
 
 describe("Review model", () => {
   it("keeps source keys unambiguous across source variants", () => {
+    expect(sourceKey({ kind: "uncommitted" })).toBe("uncommitted");
+    expect(sourceLabel({ kind: "uncommitted" })).toBe("未提交");
     expect(sourceKey({ kind: "unstaged" })).toBe("unstaged");
     expect(sourceKey({ kind: "branch", refId: "main" })).toBe("branch:main");
     expect(sourceLabel({ kind: "commit", commitId: "abcdef012345" })).toBe("提交 abcdef01");
@@ -111,6 +117,7 @@ describe("Review model", () => {
           source: current.source,
           revision: "rev_1",
           fileId: "file_a",
+          layer: "unstaged",
           path: "src/a.ts",
           oldPath: null,
           status: "modified",
@@ -132,6 +139,29 @@ describe("Review model", () => {
           source: current.source,
           revision: "rev_old",
           fileId: "file_a",
+          layer: "unstaged",
+          path: "src/a.ts",
+          oldPath: null,
+          status: "modified",
+          binary: false,
+          truncated: false,
+          original: "old",
+          modified: "new",
+          unified: null,
+          hunks: [],
+          lines: [],
+        },
+        current,
+      ),
+    ).toBe(false);
+    expect(
+      diffMatchesSnapshot(
+        {
+          workspaceId: "ws_demo",
+          source: current.source,
+          revision: "rev_1",
+          fileId: "file_a",
+          layer: "staged",
           path: "src/a.ts",
           oldPath: null,
           status: "modified",
@@ -160,6 +190,7 @@ describe("Review model", () => {
         source: { kind: "unstaged" },
         revision: "rev_1",
         fileId: "file_a",
+        layer: "unstaged",
         path: "src/a.ts",
         oldPath: null,
         status: "modified",
@@ -168,6 +199,25 @@ describe("Review model", () => {
         original: "old",
         modified: "new",
         unified: null,
+        hunks: [],
+        lines: [],
+      }),
+    ).toBe(true);
+    expect(
+      canRenderUnifiedDiff({
+        workspaceId: "ws_demo",
+        source: { kind: "unstaged" },
+        revision: "rev_1",
+        fileId: "file_a",
+        layer: "unstaged",
+        path: "src/a.ts",
+        oldPath: null,
+        status: "modified",
+        binary: false,
+        truncated: false,
+        original: null,
+        modified: null,
+        unified: "@@ -1 +1 @@\n-old\n+new",
         hunks: [],
         lines: [],
       }),

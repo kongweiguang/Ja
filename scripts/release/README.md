@@ -14,6 +14,10 @@ Windows：`WINDOWS_CERTIFICATE`（base64 PFX）、`WINDOWS_CERTIFICATE_PASSWORD`
 
 macOS：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`。
 
+桌面更新签名：`TAURI_SIGNING_PRIVATE_KEY`，以及密钥设有密码时所需的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥必须与应用内置 updater 公钥匹配，不得为通过构建而临时替换。
+
 Windows 证书由 `scripts/release/prepare-windows-signing.ps1` 临时导入当前用户证书存储，并只向后续步骤输出配置路径、signtool 路径和清理用 thumbprint。工作流结束时会删除 PFX、临时配置和证书对象。
 
-当前工作流不自动创建或公开 GitHub Release；`RELEASE-PREVIEW` 仍需在签名、供应链归档和真机验收全部通过后，由发布 owner 另行授权。
+`v*` 标签路径在 Native 矩阵通过后，汇总签名产物并生成 `latest.json`，自动创建未公开的 GitHub draft Release；手工 `release=true` 不执行该汇总任务。工作流不会自动公开 Release，也不会覆盖同名 Release。
+
+公开发布仍须在签名、供应链归档、安装与更新验收全部通过后，由发布 owner 在用户授权范围内执行。缺少凭据或产物时保持未公开；已经公开的版本不得移动 tag 或静默复用版本号，修复应使用新版本。

@@ -4,7 +4,106 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const LIGHT_TERMINAL_THEME = {
+  background: "#1e1f22",
+  foreground: "#e6e8ed",
+  cursor: "#8fafff",
+  selectionBackground: "#4b6baf66",
+  black: "#2e3436",
+  red: "#cc0000",
+  green: "#4e9a06",
+  yellow: "#c4a000",
+  blue: "#3465a4",
+  magenta: "#75507b",
+  cyan: "#06989a",
+  white: "#d3d7cf",
+  brightBlack: "#555753",
+  brightRed: "#ef2929",
+  brightGreen: "#8ae234",
+  brightYellow: "#fce94f",
+  brightBlue: "#729fcf",
+  brightMagenta: "#ad7fa8",
+  brightCyan: "#34e2e2",
+  brightWhite: "#eeeeec",
+} as const;
+
+const XCODE_DARK_TERMINAL_THEME = {
+  background: "#292a30",
+  foreground: "#f5f5f7",
+  cursor: "#64d2ff",
+  selectionBackground: "rgb(10 132 255 / 34%)",
+  black: "#1c1d2b",
+  red: "#ff453a",
+  green: "#30d158",
+  yellow: "#ffd60a",
+  blue: "#0a84ff",
+  magenta: "#bf5af2",
+  cyan: "#64d2ff",
+  white: "#f2f2f7",
+  brightBlack: "#8e8e93",
+  brightRed: "#ff6961",
+  brightGreen: "#32d74b",
+  brightYellow: "#ffd60a",
+  brightBlue: "#409cff",
+  brightMagenta: "#da8fff",
+  brightCyan: "#70d7ff",
+  brightWhite: "#ffffff",
+} as const;
+
+const FLEET_LIGHT_TERMINAL_THEME = {
+  ...LIGHT_TERMINAL_THEME,
+  background: "#ffffff",
+  foreground: "#202124",
+  cursor: "#726cf9",
+  selectionBackground: "rgb(114 108 249 / 24%)",
+  blue: "#625ce9",
+  brightBlue: "#726cf9",
+} as const;
+
+const TERMINAL_THEME_TOKEN_NAMES = {
+  background: "--ja-terminal-background",
+  foreground: "--ja-terminal-foreground",
+  cursor: "--ja-terminal-cursor",
+  selectionBackground: "--ja-terminal-selection",
+  black: "--ja-terminal-ansi-black",
+  red: "--ja-terminal-ansi-red",
+  green: "--ja-terminal-ansi-green",
+  yellow: "--ja-terminal-ansi-yellow",
+  blue: "--ja-terminal-ansi-blue",
+  magenta: "--ja-terminal-ansi-magenta",
+  cyan: "--ja-terminal-ansi-cyan",
+  white: "--ja-terminal-ansi-white",
+  brightBlack: "--ja-terminal-ansi-bright-black",
+  brightRed: "--ja-terminal-ansi-bright-red",
+  brightGreen: "--ja-terminal-ansi-bright-green",
+  brightYellow: "--ja-terminal-ansi-bright-yellow",
+  brightBlue: "--ja-terminal-ansi-bright-blue",
+  brightMagenta: "--ja-terminal-ansi-bright-magenta",
+  brightCyan: "--ja-terminal-ansi-bright-cyan",
+  brightWhite: "--ja-terminal-ansi-bright-white",
+} as const;
+
+/**
+ * JSDOM 不加载应用入口的 root token stylesheet；测试显式安装同一合同，才能验证 xterm
+ * 消费完整色板，而不是被测试环境的空 computed style 掩盖。
+ */
+function applyTerminalThemeTokens(theme: Record<keyof typeof LIGHT_TERMINAL_THEME, string>): void {
+  for (const [key, tokenName] of Object.entries(TERMINAL_THEME_TOKEN_NAMES)) {
+    document.documentElement.style.setProperty(
+      tokenName,
+      theme[key as keyof typeof LIGHT_TERMINAL_THEME],
+    );
+  }
+}
+
+/** 每条用例清理 inline token，避免主题切换断言泄漏到相邻终端生命周期测试。 */
+function clearTerminalThemeTokens(): void {
+  for (const tokenName of Object.values(TERMINAL_THEME_TOKEN_NAMES)) {
+    document.documentElement.style.removeProperty(tokenName);
+  }
+}
 
 interface MockTerminalLink {
   text: string;
@@ -19,6 +118,8 @@ interface TerminalMock {
   getLineCalls: number[];
   linksForLine: (lineNumber: number) => MockTerminalLink[] | undefined;
   options: { theme?: unknown };
+  selection?: { column: number; row: number; length: number };
+  select: (column: number, row: number, length: number) => void;
   selectCalls: Array<{ column: number; row: number; length: number }>;
   setBufferLines: (lines: readonly { text: string; isWrapped: boolean }[], cols: number) => void;
   scrollToLineCalls: number[];
@@ -42,10 +143,13 @@ const mocks = vi.hoisted(() => {
   const terminals: TerminalMock[] = [];
   const searchAddons: SearchAddonMock[] = [];
   const observers: Array<{ observeCount: number; disconnectCount: number }> = [];
+  let resolvedTheme: "light" | "dark" = "light";
+  let palette: "xcode" | "fleet" | "obsidian" | "claude" = "xcode";
   class HoistedMockTerminal implements TerminalMock {
     cols = 80;
     rows = 24;
     options: { theme?: unknown } = {};
+    selection: { column: number; row: number; length: number } | undefined;
     selectCalls: Array<{ column: number; row: number; length: number }> = [];
     scrollToLineCalls: number[] = [];
     writes: Array<string | Uint8Array> = [];
@@ -93,7 +197,8 @@ const mocks = vi.hoisted(() => {
     disposed = false;
     focusCount = 0;
     clearSelectionCount = 0;
-    constructor() {
+    constructor(options: { theme?: unknown } = {}) {
+      this.options = { theme: options.theme };
       terminals.push(this);
     }
     loadAddon(): void {
@@ -178,13 +283,15 @@ const mocks = vi.hoisted(() => {
     focus(): void {
       this.focusCount += 1;
     }
-    /** 不在 JSDOM 复制 xterm selection model，仅记录搜索 cleanup。 */
+    /** 搜索关闭同步清空测试 selection 投影，保持与 xterm 公共合同一致。 */
     clearSelection(): void {
       this.clearSelectionCount += 1;
+      this.selection = undefined;
     }
     /** 记录 search controller 请求的精确 xterm 公共 selection。 */
     select(column: number, row: number, length: number): void {
-      this.selectCalls.push({ column, row, length });
+      this.selection = { column, row, length };
+      this.selectCalls.push(this.selection);
     }
     /** 不引入 renderer 依赖，仅记录公共 scroll 目标。 */
     scrollToLine(row: number): void {
@@ -235,6 +342,18 @@ const mocks = vi.hoisted(() => {
     terminals,
     searchAddons,
     observers,
+    get resolvedTheme(): "light" | "dark" {
+      return resolvedTheme;
+    },
+    set resolvedTheme(value: "light" | "dark") {
+      resolvedTheme = value;
+    },
+    get palette(): "xcode" | "fleet" | "obsidian" | "claude" {
+      return palette;
+    },
+    set palette(value: "xcode" | "fleet" | "obsidian" | "claude") {
+      palette = value;
+    },
     HoistedMockTerminal,
     HoistedMockResizeObserver,
     HoistedMockSearchAddon,
@@ -242,6 +361,10 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock("@xterm/xterm", () => ({ Terminal: mocks.HoistedMockTerminal }));
+vi.mock("@/shared/hooks/useResolvedTheme", () => ({
+  useResolvedTheme: () => mocks.resolvedTheme,
+  useUiPalette: () => mocks.palette,
+}));
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
     fit(): void {}
@@ -252,8 +375,15 @@ vi.mock("@xterm/addon-search", () => ({ SearchAddon: mocks.HoistedMockSearchAddo
 
 import { TerminalPanel } from "@/features/workbench/terminal/ui/TerminalPanel";
 
+beforeEach(() => {
+  mocks.resolvedTheme = "light";
+  mocks.palette = "xcode";
+  applyTerminalThemeTokens(LIGHT_TERMINAL_THEME);
+});
+
 afterEach(() => {
   cleanup();
+  clearTerminalThemeTokens();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   mocks.terminals.length = 0;
@@ -267,6 +397,49 @@ describe("TerminalPanel", () => {
     const rendered = render(<TerminalPanel />);
     fireEvent.pointerDown(rendered.container.querySelector(".xterm-screen") as HTMLElement);
     expect(mocks.terminals[0]?.focusCount).toBe(1);
+  });
+
+  /**
+   * Palette 与明暗变化只更新同一实例的公开 option，并验证背景、前景、光标、选择和
+   * ANSI 16 色均来自 root token，同时保留 scrollback、selection 与 PTY subscription。
+   */
+  it("maps the complete token palette and updates it without recreating xterm", () => {
+    const onAttach = vi.fn();
+    const onDetach = vi.fn();
+    const onData = vi.fn();
+    const rendered = render(
+      <TerminalPanel
+        initialText={"persisted scrollback\n"}
+        onAttach={onAttach}
+        onDetach={onDetach}
+        onData={onData}
+      />,
+    );
+    const terminal = mocks.terminals[0];
+    terminal?.select(4, 2, 6);
+
+    expect(terminal?.options.theme).toEqual(LIGHT_TERMINAL_THEME);
+    applyTerminalThemeTokens(FLEET_LIGHT_TERMINAL_THEME);
+    mocks.palette = "fleet";
+    rendered.rerender(<TerminalPanel onAttach={onAttach} onDetach={onDetach} onData={onData} />);
+
+    expect(terminal?.options.theme).toEqual(FLEET_LIGHT_TERMINAL_THEME);
+    applyTerminalThemeTokens(XCODE_DARK_TERMINAL_THEME);
+    mocks.palette = "xcode";
+    mocks.resolvedTheme = "dark";
+    rendered.rerender(<TerminalPanel onAttach={onAttach} onDetach={onDetach} onData={onData} />);
+
+    expect(mocks.terminals).toHaveLength(1);
+    expect(mocks.terminals[0]).toBe(terminal);
+    expect(terminal?.options.theme).toEqual(XCODE_DARK_TERMINAL_THEME);
+    expect(terminal?.writes).toEqual(["persisted scrollback\n"]);
+    expect(terminal?.selection).toEqual({ column: 4, row: 2, length: 6 });
+    expect(terminal?.selectCalls).toEqual([{ column: 4, row: 2, length: 6 }]);
+    expect(terminal?.disposed).toBe(false);
+    expect(onAttach).toHaveBeenCalledOnce();
+    expect(onDetach).not.toHaveBeenCalled();
+    terminal?.emitData("pwd\n");
+    expect(onData).toHaveBeenCalledWith("pwd\n");
   });
 
   it("keeps one instance and observer across rerenders, appends output once, and detaches only on unmount", () => {

@@ -5,10 +5,12 @@ package io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpRuntime;
+import io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpToolCatalog;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.McpSessionFactory;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.SdkMcpSessionFactory;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
+import io.github.kongweiguang.ja.catalog.adapter.out.skills.JaSkillSources;
 import io.github.kongweiguang.ja.catalog.domain.McpServerDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
@@ -16,6 +18,7 @@ import io.github.kongweiguang.ja.catalog.port.out.CatalogQueryPort;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
+import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
 import io.github.kongweiguang.ja.foundation.json.JacksonJsonValues;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.WorkspaceBoundary;
@@ -26,9 +29,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,7 +42,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 不持有可变 active 快照的配置代际作用域 Skill/MCP 目录。
+ * 不持有可变 active Skill 正文的配置代际作用域 Skill/MCP 目录。
  *
  * <p>每次 Settings 调用都从传入的不可变代际重建 Descriptor 投影。
  * 工作区发现只按代际标识与规范 cwd 缓存非 Secret MCP Schema；启动定义在捕获时从活动 Turn 租约重建。</p>
@@ -51,7 +55,12 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
     private final McpLimits limits;
     private final Path stdioWorkingDirectory;
     private final McpSessionFactory sessionFactory;
-    private final ConcurrentHashMap<WorkspaceKey, WorkspaceCatalog> workspaces = new ConcurrentHashMap<>();
+    private final SkillCatalog skillSources;
+    private final Path agentsSkillRoot;
+    private final Path jaSkillRoot;
+    private final ConcurrentHashMap<Path, WorkspaceRegistration> workspaces = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ServiceKey, McpServiceDirectory> serviceDirectories =
+            new ConcurrentHashMap<>();
     private final ExecutorService probes = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("ja-generation-mcp-", 0).factory());
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -60,14 +69,27 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
      * 创建代际目录但不读取配置或打开 MCP 传输，避免构造器产生外部副作用。
      */
     public GenerationCatalog(ObjectMapper objectMapper, McpLimits limits) {
-        this(Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize(), objectMapper, limits);
+        this(Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize(), objectMapper, limits,
+                new JaSkillSources(), Path.of(System.getProperty("user.home"), ".agents", "skills"),
+                Path.of(System.getProperty("user.home"), ".ja", "skills"));
     }
 
     /**
      * 绑定 Java 所有的 home/general 工作区，供仅 Settings 使用的 MCP 探测。
      */
     public GenerationCatalog(Path stdioWorkingDirectory, ObjectMapper objectMapper, McpLimits limits) {
-        this(stdioWorkingDirectory, objectMapper, limits, new SdkMcpSessionFactory(objectMapper, limits));
+        this(stdioWorkingDirectory, objectMapper, limits, new JaSkillSources(),
+                Path.of(System.getProperty("user.home"), ".agents", "skills"),
+                Path.of(System.getProperty("user.home"), ".ja", "skills"));
+    }
+
+    /**
+     * 生产组合显式复用 Turn 的 Skill 发现/实时读取器和两类默认用户根，避免 Settings 形成第二套规则。
+     */
+    public GenerationCatalog(Path stdioWorkingDirectory, ObjectMapper objectMapper, McpLimits limits,
+                             SkillCatalog skillSources, Path agentsSkillRoot, Path jaSkillRoot) {
+        this(stdioWorkingDirectory, objectMapper, limits, new SdkMcpSessionFactory(objectMapper, limits),
+                skillSources, agentsSkillRoot, jaSkillRoot);
     }
 
     /**
@@ -75,72 +97,175 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
      */
     GenerationCatalog(Path stdioWorkingDirectory, ObjectMapper objectMapper, McpLimits limits,
                       McpSessionFactory sessionFactory) {
+        this(stdioWorkingDirectory, objectMapper, limits, sessionFactory, new JaSkillSources(),
+                Path.of(System.getProperty("user.home"), ".agents", "skills"),
+                Path.of(System.getProperty("user.home"), ".ja", "skills"));
+    }
+
+    /**
+     * 完整测试接缝允许隔离 MCP 传输和 Skill 来源，但仍固定所有规范绝对根目录。
+     */
+    GenerationCatalog(Path stdioWorkingDirectory, ObjectMapper objectMapper, McpLimits limits,
+                      McpSessionFactory sessionFactory, SkillCatalog skillSources,
+                      Path agentsSkillRoot, Path jaSkillRoot) {
         this.stdioWorkingDirectory = Objects.requireNonNull(stdioWorkingDirectory, "stdioWorkingDirectory")
                 .toAbsolutePath().normalize();
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper").copy();
         this.limits = Objects.requireNonNull(limits, "limits");
         this.sessionFactory = Objects.requireNonNull(sessionFactory, "sessionFactory");
+        this.skillSources = Objects.requireNonNull(skillSources, "skillSources");
+        this.agentsSkillRoot = Objects.requireNonNull(agentsSkillRoot, "agentsSkillRoot")
+                .toAbsolutePath().normalize();
+        this.jaSkillRoot = Objects.requireNonNull(jaSkillRoot, "jaSkillRoot")
+                .toAbsolutePath().normalize();
     }
 
     /**
-     * 发现一个工作区目录，并且只缓存此代际的非 Secret Tool Schema。
+     * 纯登记工作区与定义修订并失效旧目录，不启动进程、联网或调用 initialize/tools/list。
      */
     public void prepareWorkspace(Path workspaceRoot, ConfigurationGenerationPort.Lease lease) {
         Objects.requireNonNull(lease, "lease");
         ConfigurationGenerationSnapshot generation = lease.snapshot();
         Path workspace = new WorkspaceBoundary(workspaceRoot).root();
         List<McpServerDefinition> definitions = definitions(generation, lease, workspace);
-        McpGateway.McpSnapshot snapshot;
-        try (McpRuntime runtime = new McpRuntime(definitions, limits, objectMapper, sessionFactory)) {
-            snapshot = runtime.snapshot();
-        } catch (RuntimeException failure) {
-            throw new IllegalStateException("mcp_workspace_refresh_failed");
-        }
-        WorkspaceKey key = new WorkspaceKey(generation.generationId(), workspace);
-        workspaces.put(key, new WorkspaceCatalog(snapshot, snapshot.createdAt()));
+        Map<String, String> revisions = definitions.stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
+                McpServerDefinition::id, McpServerDefinition::definitionRevision));
+        workspaces.put(workspace, new WorkspaceRegistration(generation.generationId(), revisions));
+        serviceDirectories.forEach((key, directory) -> {
+            if (key.workspaceRoot().equals(workspace)
+                && !Objects.equals(revisions.get(key.serverId()), key.definitionRevision())) {
+                directory.retire(false);
+            }
+        });
         if (workspaces.size() > MAXIMUM_WORKSPACE_CATALOGS) {
-            workspaces.keySet().stream().sorted(Comparator.comparing(WorkspaceKey::generationId))
+            workspaces.keySet().stream().sorted(Comparator.comparing(Path::toString))
                     .limit(workspaces.size() - MAXIMUM_WORKSPACE_CATALOGS)
                     .forEach(workspaces::remove);
         }
     }
 
     /**
-     * 从活动租约与缓存 Schema 捕获选中定义，不进行全局安装。
+     * Provider 安全点逐服务懒发现并聚合健康目录；单个服务失败只贡献空工具集。
      */
+    @SuppressWarnings("PMD.CloseResource")
     TurnCatalog capture(ConfigurationGenerationPort.Lease lease,
                          ConfigurationGenerationSnapshot.AgentDefaults defaults, Path workspaceRoot) {
         ConfigurationGenerationSnapshot generation = lease.snapshot();
+        Path workspace = new WorkspaceBoundary(workspaceRoot).root();
         List<ConfigurationGenerationSnapshot.McpServer> enabled = generation.mcpDefinitions().stream()
                 .filter(ConfigurationGenerationSnapshot.McpServer::enabled).toList();
         if (enabled.isEmpty()) {
-            return new TurnCatalog(List.of(), McpRuntime.catalogSnapshot(List.of(), objectMapper, Instant.EPOCH));
+            retireUnselected(workspace, Map.of());
+            workspaces.put(workspace, new WorkspaceRegistration(generation.generationId(), Map.of()));
+            McpGateway.McpSnapshot empty = McpRuntime.catalogSnapshot(List.of(), List.of(), objectMapper, Instant.EPOCH);
+            return new TurnCatalog(empty, Map.of(), Map.of());
         }
-        Path workspace = new WorkspaceBoundary(workspaceRoot).root();
-        WorkspaceCatalog catalog = workspaces.get(new WorkspaceKey(generation.generationId(), workspace));
-        if (catalog == null) throw new IllegalStateException("mcp_workspace_catalog_missing");
-        Set<String> selectedIds = enabled.stream().map(ConfigurationGenerationSnapshot.McpServer::mcpId)
-                .collect(java.util.stream.Collectors.toUnmodifiableSet());
         List<McpServerDefinition> selected = new ArrayList<>();
         for (ConfigurationGenerationSnapshot.McpServer server : enabled) {
             selected.add(GenerationMcpDefinitionFactory.create(server, workspace, lease));
         }
-        List<McpGateway.McpTool> tools = catalog.snapshot().tools().stream()
-                .filter(tool -> selectedIds.contains(tool.serverId())).toList();
-        return new TurnCatalog(selected, McpRuntime.catalogSnapshot(tools, objectMapper, catalog.refreshedAt()));
+        Map<String, String> selectedRevisions = selected.stream().collect(
+                java.util.stream.Collectors.toUnmodifiableMap(
+                        McpServerDefinition::id, McpServerDefinition::definitionRevision));
+        retireUnselected(workspace, selectedRevisions);
+        Map<String, McpServiceDirectory> capturedServices = new LinkedHashMap<>();
+        List<McpGateway.McpTool> tools = new ArrayList<>();
+        for (McpServerDefinition definition : selected) {
+            retireSuperseded(workspace, definition, true);
+            ServiceKey key = new ServiceKey(workspace, definition.id(), definition.definitionRevision());
+            McpServiceDirectory directory = serviceDirectories.computeIfAbsent(key,
+                    ignored -> new McpServiceDirectory(definition, limits, objectMapper, sessionFactory));
+            capturedServices.put(definition.id(), directory);
+            tools.addAll(directory.snapshot().tools());
+        }
+        workspaces.put(workspace, new WorkspaceRegistration(generation.generationId(), selectedRevisions));
+        McpGateway.McpSnapshot snapshot = McpRuntime.catalogSnapshot(tools, selected, objectMapper, Instant.now());
+        Map<String, McpGateway.RouteIdentity> identities =
+                McpToolCatalog.routeIdentities(snapshot, selected.stream().collect(
+                        java.util.stream.Collectors.toUnmodifiableMap(
+                                McpServerDefinition::id, java.util.function.Function.identity())), objectMapper);
+        return new TurnCatalog(snapshot, identities, capturedServices);
     }
 
     /**
-     * 从调用方精确代际列出 Skill Descriptor，禁止读取可变目录字段。
+     * 同一工作区和 serverId 只保留当前 definitionRevision；旧 batch pin 会把实际关闭延迟到结算后。
+     */
+    private void retireSuperseded(
+            Path workspace, McpServerDefinition current, boolean closeWhenIdle) {
+        serviceDirectories.forEach((key, directory) -> {
+            if (key.workspaceRoot().equals(workspace)
+                && key.serverId().equals(current.id())
+                && !key.definitionRevision().equals(current.definitionRevision())) {
+                if (serviceDirectories.remove(key, directory)) {
+                    directory.retire(closeWhenIdle);
+                }
+            }
+        });
+    }
+
+    /**
+     * Provider 安全点回收已禁用或定义已改变的空闲服务；被旧 batch pin 的 owner 延迟到 release。
+     */
+    private void retireUnselected(Path workspace, Map<String, String> selectedRevisions) {
+        serviceDirectories.forEach((key, directory) -> {
+            if (key.workspaceRoot().equals(workspace)
+                && !Objects.equals(selectedRevisions.get(key.serverId()), key.definitionRevision())
+                && serviceDirectories.remove(key, directory)) {
+                directory.retire(true);
+            }
+        });
+    }
+
+    /**
+     * 发现四类默认来源的元数据后按名称合并当前配置；未登记项不会被自动授权或读取正文。
      */
     @Override
     public CursorPage<SkillDescriptor> listSkills(
-            ConfigurationGenerationPort.Lease lease, String cursor, int limit) {
-        List<SkillDescriptor> values = lease.snapshot().skillDefinitions().stream()
-                .map(skill -> new SkillDescriptor(skill.skillId(), skill.name(), skill.scope(),
-                        skill.enabled(), skill.enabled() ? "available" : "disabled", skill.description()))
+            ConfigurationGenerationPort.Lease lease, Path workspaceRoot, boolean workspaceTrusted,
+            String cursor, int limit) {
+        ConfigurationGenerationSnapshot generation = lease.snapshot();
+        Path discoveryRoot = workspaceRoot == null ? stdioWorkingDirectory : workspaceRoot;
+        SkillCatalog.Catalog discovered = skillSources.discover(new SkillCatalog.DiscoveryRequest(
+                discoveryRoot, agentsSkillRoot, jaSkillRoot,
+                workspaceRoot != null && workspaceTrusted && generation.trusted()));
+        Map<String, ConfigurationGenerationSnapshot.Skill> configured = configuredByName(generation);
+        List<SkillDescriptor> values = discovered.skills().stream()
+                .map(skill -> skillDescriptor(skill, configured.get(skill.name())))
                 .sorted(Comparator.comparing(SkillDescriptor::skillId)).toList();
         return page(values, cursor, limit, SkillDescriptor::skillId);
+    }
+
+    /**
+     * 配置名称是发现项与持久授权的稳定连接键；后出现项覆盖前项以沿用 effective 文档的最终顺序。
+     */
+    private static Map<String, ConfigurationGenerationSnapshot.Skill> configuredByName(
+            ConfigurationGenerationSnapshot generation) {
+        LinkedHashMap<String, ConfigurationGenerationSnapshot.Skill> configured = new LinkedHashMap<>();
+        generation.skillDefinitions().forEach(skill -> configured.put(skill.name(), skill));
+        return Map.copyOf(configured);
+    }
+
+    /**
+     * 已登记项沿用持久 skillId/enabled；新发现项按受限目录名派生稳定身份且默认禁用。
+     */
+    private static SkillDescriptor skillDescriptor(
+            SkillCatalog.SkillDescriptor discovered, ConfigurationGenerationSnapshot.Skill configured) {
+        String skillId = configured == null ? "skill_" + discovered.name() : configured.skillId();
+        boolean enabled = configured != null && configured.enabled();
+        return new SkillDescriptor(skillId, discovered.name(), scope(discovered.source()), enabled,
+                "healthy", discovered.description());
+    }
+
+    /**
+     * 将 Kernel 的来源枚举映射为 Settings 的四个产品分组，不泄露本地目录结构。
+     */
+    private static String scope(SkillCatalog.Source source) {
+        return switch (source) {
+            case BUNDLED -> "builtin";
+            case AGENTS_USER -> "user";
+            case JA_USER -> "ja";
+            case WORKSPACE -> "project";
+        };
     }
 
     /**
@@ -174,7 +299,12 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
             List<McpServerDefinition> definitions = List.of(GenerationMcpDefinitionFactory.create(
                     server, stdioWorkingDirectory, lease));
             try (McpRuntime runtime = new McpRuntime(definitions, limits, objectMapper, sessionFactory)) {
-                int tools = (int) runtime.snapshot().tools().stream()
+                McpGateway.McpSnapshot snapshot = runtime.snapshot();
+                if (runtime.unavailableServerIds().contains(mcpId)) {
+                    return new McpServerDescriptor(server.mcpId(), server.name(), transport(server),
+                            "unavailable", 0);
+                }
+                int tools = (int) snapshot.tools().stream()
                         .filter(tool -> tool.serverId().equals(mcpId)).count();
                 return new McpServerDescriptor(server.mcpId(), server.name(), transport(server),
                         "available", tools);
@@ -196,7 +326,11 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
         List<McpServerDefinition> definitions = List.of(GenerationMcpDefinitionFactory.create(server,
                 stdioWorkingDirectory, lease));
         try (McpRuntime runtime = new McpRuntime(definitions, limits, objectMapper, sessionFactory)) {
-            List<McpToolDescriptor> values = runtime.snapshot().tools().stream()
+            McpGateway.McpSnapshot snapshot = runtime.snapshot();
+            if (runtime.unavailableServerIds().contains(mcpId)) {
+                throw new IllegalStateException("mcp_tools_unavailable");
+            }
+            List<McpToolDescriptor> values = snapshot.tools().stream()
                     .map(tool -> new McpToolDescriptor(tool.spec().name(), tool.spec().description(),
                             JacksonJsonValues.toNode(objectMapper, tool.spec().inputSchema()).toString()))
                     .toList();
@@ -211,11 +345,25 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
         workspaces.clear();
+        List<RuntimeException> failures = new ArrayList<>();
+        serviceDirectories.values().forEach(directory -> {
+            try {
+                directory.close();
+            } catch (RuntimeException failure) {
+                failures.add(failure);
+            }
+        });
+        serviceDirectories.clear();
         probes.shutdownNow();
         try {
             probes.awaitTermination(limits.closeTimeout().toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+        }
+        if (!failures.isEmpty()) {
+            IllegalStateException failure = new IllegalStateException("mcp_catalog_close_failed");
+            failures.forEach(failure::addSuppressed);
+            throw failure;
         }
     }
 
@@ -277,25 +425,36 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
     /**
      * 以代际标识与规范 cwd 隔离配置或信任更新前后的 Schema 缓存。
      */
-    private record WorkspaceKey(String generationId, Path workspaceRoot) {
+    private record WorkspaceRegistration(String generationId, Map<String, String> definitionRevisions) {
+        /**
+         * 只保存脱敏修订，不保留定义或 Secret，保证工作区登记仍是轻量状态操作。
+         */
+        private WorkspaceRegistration {
+            Objects.requireNonNull(generationId, "generationId");
+            definitionRevisions = Map.copyOf(definitionRevisions);
+        }
     }
 
     /**
-     * 仅含 Schema 的工作区缓存有意排除启动定义和凭据值。
+     * 服务 owner 的最小稳定键覆盖工作区、服务身份和完整定义修订。
      */
-    private record WorkspaceCatalog(McpGateway.McpSnapshot snapshot, Instant refreshedAt) {
+    private record ServiceKey(Path workspaceRoot, String serverId, String definitionRevision) {
     }
 
     /**
      * 仅供租约绑定 MCP Session Factory 消费的包内交接值。
      */
-    record TurnCatalog(List<McpServerDefinition> definitions, McpGateway.McpSnapshot snapshot) {
+    record TurnCatalog(
+            McpGateway.McpSnapshot snapshot,
+            Map<String, McpGateway.RouteIdentity> routeIdentities,
+            Map<String, McpServiceDirectory> services) {
         /**
-         * 为一个 Turn 冻结选中路由与 Schema 投影。
+         * 防御性复制单次 Provider 请求安全点选中的路由与 Schema 投影。
          */
         TurnCatalog {
-            definitions = List.copyOf(definitions);
             Objects.requireNonNull(snapshot, "snapshot");
+            routeIdentities = Map.copyOf(routeIdentities);
+            services = Map.copyOf(services);
         }
     }
 }

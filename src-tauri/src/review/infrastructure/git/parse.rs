@@ -33,6 +33,7 @@ pub(crate) fn parse_status(
                     worktree_status: None,
                     path: text_field(record)?,
                     original_path: None,
+                    state_evidence: record.to_vec(),
                 });
             }
             b'1' => {
@@ -47,6 +48,7 @@ pub(crate) fn parse_status(
                     worktree_status: Some(status[1] as char),
                     path: fields[8].to_owned(),
                     original_path: None,
+                    state_evidence: fields[2..8].join(" ").into_bytes(),
                 });
             }
             b'2' => {
@@ -62,6 +64,7 @@ pub(crate) fn parse_status(
                     worktree_status: Some(status[1] as char),
                     path: fields[9].to_owned(),
                     original_path: Some(text_field(records[index])?),
+                    state_evidence: fields[2..9].join(" ").into_bytes(),
                 });
                 index += 1;
             }
@@ -77,6 +80,7 @@ pub(crate) fn parse_status(
                     worktree_status: Some(status[1] as char),
                     path: fields[10].to_owned(),
                     original_path: None,
+                    state_evidence: fields[2..10].join(" ").into_bytes(),
                 });
             }
             b'?' | b'!' => {
@@ -95,6 +99,7 @@ pub(crate) fn parse_status(
                     worktree_status: None,
                     path,
                     original_path: None,
+                    state_evidence: Vec::new(),
                 });
             }
             _ => return Err(GitError::Parse),

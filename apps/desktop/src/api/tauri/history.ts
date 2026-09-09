@@ -16,6 +16,7 @@ import {
   type Thread,
   type ThreadReadResult,
 } from "../protocol/protocol";
+import { CollaborationModeSchema } from "../protocol/goal";
 import {
   defaultNativeBridge,
   normalizeRuntimeError,
@@ -33,8 +34,11 @@ export const JA_HISTORY_COMMANDS = {
   threadSearch: "ja_thread_search",
   threadRead: "ja_thread_read",
   threadRename: "ja_thread_rename",
+  threadPin: "ja_thread_pin",
+  threadSeen: "ja_thread_seen",
   threadPreferencesUpdate: "ja_thread_preferences_update",
   threadArchive: "ja_thread_archive",
+  threadRestore: "ja_thread_restore",
   threadDelete: "ja_thread_delete",
   threadCompact: "ja_thread_compact",
 } as const;
@@ -63,6 +67,7 @@ const ThreadCreateInputSchema = z
     modelId: ModelIdSchema,
     reasoningLevel: ReasoningLevelSchema.nullable(),
     accessMode: AccessModeSchema,
+    collaborationMode: CollaborationModeSchema,
   })
   .strict();
 const ThreadListInputSchema = PageInputSchema.extend({ workspaceId: WorkspaceIdSchema }).strict();
@@ -83,6 +88,7 @@ const ThreadMutationInputSchema = z
     expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
+const ThreadPinInputSchema = ThreadMutationInputSchema.extend({ pinned: z.boolean() }).strict();
 const ThreadRenameInputSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -97,6 +103,7 @@ const ThreadPreferencesUpdateInputSchema = z
     modelId: ModelIdSchema,
     reasoningLevel: ReasoningLevelSchema.nullable(),
     accessMode: AccessModeSchema,
+    collaborationMode: CollaborationModeSchema,
     expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
@@ -156,6 +163,7 @@ export type HistoryThreadPreferencesUpdateInput = z.infer<
   typeof ThreadPreferencesUpdateInputSchema
 >;
 export type HistoryThreadMutationInput = z.infer<typeof ThreadMutationInputSchema>;
+export type HistoryThreadPinInput = z.infer<typeof ThreadPinInputSchema>;
 export type HistoryThreadCompactResult = z.infer<typeof ThreadCompactResultSchema>;
 export interface HistoryThreadListResult {
   items: HistoryThread[];
@@ -181,7 +189,10 @@ export interface HistoryAdapter {
   threadRead(input: HistoryThreadReadInput): Promise<HistoryThreadReadResult>;
   threadRename(input: HistoryThreadRenameInput): Promise<HistoryThread>;
   threadPreferencesUpdate(input: HistoryThreadPreferencesUpdateInput): Promise<HistoryThread>;
-  threadArchive?: (input: HistoryThreadMutationInput) => Promise<void>;
+  threadPin(input: HistoryThreadPinInput): Promise<HistoryThread>;
+  threadSeen(input: HistoryThreadMutationInput): Promise<HistoryThread>;
+  threadArchive(input: HistoryThreadMutationInput): Promise<HistoryThread>;
+  threadRestore(input: HistoryThreadMutationInput): Promise<HistoryThread>;
   threadDelete?: (input: HistoryThreadMutationInput) => Promise<void>;
   threadCompact(input: HistoryThreadMutationInput): Promise<HistoryThreadCompactResult>;
 }
@@ -299,7 +310,7 @@ export class TauriHistoryAdapter implements HistoryAdapter {
     );
   }
 
-  /** 整体更新下一轮运行偏好，既有 Turn 的冻结快照不会被 renderer 改写。 */
+  /** 整体更新运行偏好；不打断在途请求，并由同一 Turn 的下一 Provider 请求读取。 */
   threadPreferencesUpdate(input: HistoryThreadPreferencesUpdateInput): Promise<HistoryThread> {
     return invokeHistory(
       this.bridge,
@@ -310,14 +321,47 @@ export class TauriHistoryAdapter implements HistoryAdapter {
     );
   }
 
+  /** 以显式目标状态提交置顶 CAS；完整返回值是 UI 重排和后续 CAS 的唯一依据。 */
+  threadPin(input: HistoryThreadPinInput): Promise<HistoryThread> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadPin,
+      input,
+      ThreadPinInputSchema,
+      ThreadSchema,
+    );
+  }
+
+  /** 只确认服务端当前 latest Turn 已实际呈现；完整投影防止 Renderer 本地伪造已读边界。 */
+  threadSeen(input: HistoryThreadMutationInput): Promise<HistoryThread> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadSeen,
+      input,
+      ThreadMutationInputSchema,
+      ThreadSchema,
+    );
+  }
+
   /** 只归档一个精确 thread revision，不提供 active-thread fallback。 */
-  async threadArchive(input: HistoryThreadMutationInput): Promise<void> {
-    await invokeHistory(
+  threadArchive(input: HistoryThreadMutationInput): Promise<HistoryThread> {
+    return invokeHistory(
       this.bridge,
       JA_HISTORY_COMMANDS.threadArchive,
       input,
       ThreadMutationInputSchema,
-      AcceptedResultSchema,
+      ThreadSchema,
+    );
+  }
+
+  /** 恢复归档会话并接收服务端强制未置顶的完整投影。 */
+  threadRestore(input: HistoryThreadMutationInput): Promise<HistoryThread> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadRestore,
+      input,
+      ThreadMutationInputSchema,
+      ThreadSchema,
     );
   }
 

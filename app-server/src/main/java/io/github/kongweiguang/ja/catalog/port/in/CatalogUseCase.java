@@ -16,9 +16,9 @@ import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
  */
 public interface CatalogUseCase {
     /**
-     * 从当前通用配置代际列出 Skill 描述，不读取正文。
+     * 从可选已打开工作区列出真实发现的 Skill；null 只读取通用来源且不启用项目扫描。
      */
-    CursorPage<SkillDescriptor> listSkills(String cursor, int limit);
+    CursorPage<SkillDescriptor> listSkills(String workspaceId, String cursor, int limit);
 
     /**
      * 从当前通用配置代际列出已脱敏 MCP 状态。

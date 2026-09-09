@@ -9,12 +9,14 @@ import type {
   PreviewUnsubscribe,
   PreviewViewport,
 } from "./ports";
+import type { PreviewSessionHintStorage } from "./previewSessionHintStorage";
 
 const MAX_EARLY_PREVIEW_EVENTS = 512;
+const PREVIEW_LOADING_RECONCILE_INTERVAL_MS = 500;
+const PREVIEW_RENDERER_LOAD_DEADLINE_MS = 31_000;
 const PREVIEW_LOAD_ERROR = "预览加载失败，请重试。";
 const PREVIEW_CLOSE_ERROR = "浏览器关闭失败，请重试。";
 const PREVIEW_RECOVERY_ERROR = "浏览器恢复未完成，请重试。";
-
 interface PendingPreviewOpen {
   projectGeneration: number;
   events: PreviewEvent[];
@@ -25,6 +27,17 @@ interface PendingPreviewOpen {
 interface PendingPreviewRecovery {
   projectGeneration: number;
   promise: Promise<void>;
+}
+
+interface PreviewLoadDeadline {
+  navigationIntent: number;
+  startedAt: number;
+}
+
+interface PendingPreviewLayout {
+  projectGeneration: number;
+  sessionId: string;
+  viewport: PreviewViewport;
 }
 
 export interface PreviewWorkspaceLifecycle {
@@ -68,6 +81,18 @@ function mergePreviewSnapshot(
   return { ...next, load_status: current.load_status };
 }
 
+/** 比较完整 viewport，避免 React/ResizeObserver 重复测量把相同矩形送入原生队列。 */
+function previewViewportEquals(left: PreviewViewport | undefined, right: PreviewViewport): boolean {
+  return (
+    left !== undefined &&
+    left.x === right.x &&
+    left.y === right.y &&
+    left.width === right.width &&
+    left.height === right.height &&
+    left.visible === right.visible
+  );
+}
+
 /**
  * Preview application controller 是 child WebView 生命周期的唯一前端 owner。
  * 它以 workspace generation、session generation 与 intent sequence 三重栅栏拒绝迟到结果，
@@ -76,6 +101,7 @@ function mergePreviewSnapshot(
 export function usePreviewLifecycleController(
   workspaceId: string | undefined,
   adapter: NativePreviewPort,
+  sessionHints: PreviewSessionHintStorage,
 ): PreviewLifecycleController {
   const [snapshot, setSnapshot] = useState<PreviewSessionSnapshot>();
   const [loading, setLoading] = useState(false);
@@ -84,6 +110,8 @@ export function usePreviewLifecycleController(
   const projectGenerationRef = useRef(0);
   const sessionRef = useRef<PreviewSessionSnapshot | undefined>(undefined);
   const viewportRef = useRef<PreviewViewport | undefined>(undefined);
+  const pendingLayoutRef = useRef<PendingPreviewLayout | undefined>(undefined);
+  const layoutTaskRef = useRef<Promise<void> | undefined>(undefined);
   const cleanupTaskRef = useRef<Promise<void> | undefined>(undefined);
   const closingSessionIdRef = useRef<string | undefined>(undefined);
   const openingRef = useRef<PendingPreviewOpen | undefined>(undefined);
@@ -91,8 +119,15 @@ export function usePreviewLifecycleController(
   const recoveryBlockedRef = useRef(false);
   const eventCursorRef = useRef<{ sessionId: string; sequence: number } | undefined>(undefined);
   const navigationIntentRef = useRef(0);
+  const failedNavigationRef = useRef<{ sessionId: string; navigationIntent: number } | undefined>(
+    undefined,
+  );
+  const [loadDeadline, setLoadDeadline] = useState<PreviewLoadDeadline>();
 
-  /** 提交权威快照前核对 workspace 与 session identity，并统一派生加载状态。 */
+  /**
+   * 提交权威快照前核对 workspace 与 session identity，并统一派生加载状态。本次用户导航一旦
+   * 被判定失败，迟到的 WebView2 内部导航事实只能更新诊断快照，不能覆盖恢复面板。
+   */
   const commitSnapshot = useCallback(
     (next: PreviewSessionSnapshot, generation: number, expectedSessionId?: string): boolean => {
       if (
@@ -106,15 +141,31 @@ export function usePreviewLifecycleController(
       const committed = mergePreviewSnapshot(current, next);
       sessionRef.current = committed;
       setSnapshot(committed);
+      const navigationFailed =
+        failedNavigationRef.current?.sessionId === committed.id &&
+        failedNavigationRef.current.navigationIntent === navigationIntentRef.current;
       if (committed.status === "closed") {
+        failedNavigationRef.current = undefined;
+        setLoadDeadline(undefined);
         setLoading(false);
+      } else if (navigationFailed) {
+        setLoadDeadline(undefined);
+        setLoading(false);
+        setError(PREVIEW_LOAD_ERROR);
       } else if (committed.load_status === "loading") {
         setLoading(true);
         setError(undefined);
       } else if (committed.load_status === "finished") {
+        failedNavigationRef.current = undefined;
+        setLoadDeadline(undefined);
         setLoading(false);
         setError(undefined);
       } else {
+        failedNavigationRef.current = {
+          sessionId: committed.id,
+          navigationIntent: navigationIntentRef.current,
+        };
+        setLoadDeadline(undefined);
         setLoading(false);
         setError((message) => message ?? PREVIEW_LOAD_ERROR);
       }
@@ -172,6 +223,10 @@ export function usePreviewLifecycleController(
           commitSnapshot({ ...base, title: event.kind.title }, generation, event.session_id);
           break;
         case "load_failed":
+          failedNavigationRef.current = {
+            sessionId: event.session_id,
+            navigationIntent: navigationIntentRef.current,
+          };
           commitSnapshot({ ...base, load_status: "failed" }, generation, event.session_id);
           setError(event.kind.message);
           break;
@@ -197,6 +252,7 @@ export function usePreviewLifecycleController(
             return;
           sessionRef.current = undefined;
           setSnapshot({ ...base, status: "closed" });
+          setLoadDeadline(undefined);
           setLoading(false);
           setError(undefined);
           break;
@@ -318,6 +374,7 @@ export function usePreviewLifecycleController(
             sessionRef.current = undefined;
             eventCursorRef.current = undefined;
           }
+          if (workspaceId !== undefined) sessionHints.forget(workspaceId, current.id);
         }
         await recoverPending(generation);
         if (projectGenerationRef.current === generation) {
@@ -331,7 +388,7 @@ export function usePreviewLifecycleController(
       cleanupTaskRef.current = task;
       return task;
     },
-    [adapter, recoverPending],
+    [adapter, recoverPending, sessionHints, workspaceId],
   );
 
   /** 首次导航创建 session，后续导航携带 generation；每次 await 后都重验意图栅栏。 */
@@ -342,6 +399,8 @@ export function usePreviewLifecycleController(
       const current = sessionRef.current;
       if (current === undefined && openingRef.current?.projectGeneration === generation) return;
       const navigationIntent = ++navigationIntentRef.current;
+      failedNavigationRef.current = undefined;
+      setLoadDeadline({ navigationIntent, startedAt: Date.now() });
       setLoading(true);
       setError(undefined);
       const opening: PendingPreviewOpen | undefined =
@@ -424,6 +483,7 @@ export function usePreviewLifecycleController(
             projectGenerationRef.current === generation &&
             navigationIntentRef.current === navigationIntent
           ) {
+            setLoadDeadline(undefined);
             setLoading(false);
             setError(recoveryBlockedRef.current ? PREVIEW_RECOVERY_ERROR : PREVIEW_LOAD_ERROR);
           }
@@ -438,31 +498,68 @@ export function usePreviewLifecycleController(
     [adapter, applyEvent, commitSnapshot, reconcileSession, recoverPending, workspaceId],
   );
 
-  /** DOM 几何只影响当前已打开 session，迟到 layout 错误不能污染新 workspace。 */
+  /**
+   * 串行排空原生 layout，并在一个调用未完成时只保留最新矩形；WebView2 resize burst
+   * 因此不会积压并回放过期 bounds，也不会让旧 session 的失败污染当前 Workspace。
+   */
+  const drainPendingLayout = useCallback((): void => {
+    if (layoutTaskRef.current !== undefined) return;
+    const task = (async (): Promise<void> => {
+      while (pendingLayoutRef.current !== undefined) {
+        const pending = pendingLayoutRef.current;
+        pendingLayoutRef.current = undefined;
+        try {
+          await adapter.layout(pending.sessionId, pending.viewport);
+        } catch {
+          const newerLayoutPending = pendingLayoutRef.current !== undefined;
+          if (
+            !newerLayoutPending &&
+            projectGenerationRef.current === pending.projectGeneration &&
+            sessionRef.current?.id === pending.sessionId
+          )
+            setError(PREVIEW_LOAD_ERROR);
+        }
+      }
+    })().finally(() => {
+      if (layoutTaskRef.current === task) layoutTaskRef.current = undefined;
+    });
+    layoutTaskRef.current = task;
+  }, [adapter]);
+
+  /** DOM 几何只影响当前已打开 session；相同矩形去重，变化矩形进入 latest-wins 通道。 */
   const updateViewport = useCallback(
     (viewport: PreviewViewport): void => {
+      if (previewViewportEquals(viewportRef.current, viewport)) return;
       viewportRef.current = viewport;
       const current = sessionRef.current;
       if (current === undefined || current.status !== "open") return;
-      const generation = projectGenerationRef.current;
-      void adapter.layout(current.id, viewport).catch(() => {
-        if (projectGenerationRef.current === generation && sessionRef.current?.id === current.id)
-          setError(PREVIEW_LOAD_ERROR);
-      });
+      pendingLayoutRef.current = {
+        projectGeneration: projectGenerationRef.current,
+        sessionId: current.id,
+        viewport,
+      };
+      drainPendingLayout();
     },
-    [adapter],
+    [drainPendingLayout],
   );
 
   /** workspace identity 变化时先使全部 continuation 失效；真正切换由外层 ACK 生命周期保护。 */
+  const deadlineSessionId = snapshot?.id;
+  const deadlineSessionGeneration = snapshot?.generation;
+  const deadlineSessionStatus = snapshot?.status;
+  const deadlineLoadStatus = snapshot?.load_status;
   useEffect(() => {
     projectGenerationRef.current += 1;
     navigationIntentRef.current += 1;
     recoveryBlockedRef.current = workspaceId !== undefined;
     sessionRef.current = undefined;
     viewportRef.current = undefined;
+    pendingLayoutRef.current = undefined;
     openingRef.current = undefined;
     eventCursorRef.current = undefined;
+    failedNavigationRef.current = undefined;
     setSnapshot(undefined);
+    setLoadDeadline(undefined);
     setLoading(false);
     setRecovering(false);
     setError(undefined);
@@ -473,13 +570,46 @@ export function usePreviewLifecycleController(
     };
   }, [workspaceId]);
 
-  /** workspace 挂载后先证明 orphan queue 已清空，再允许创建新 child。 */
+  /** open 快照提交后保存 opaque hint；closed 事件会同步撤销，undefined 初态不得擦掉 reload 线索。 */
+  useEffect(() => {
+    if (workspaceId === undefined || snapshot === undefined) return;
+    if (snapshot.status === "open") sessionHints.remember(workspaceId, snapshot.id);
+    else sessionHints.forget(workspaceId, snapshot.id);
+  }, [sessionHints, snapshot, workspaceId]);
+
+  /**
+   * workspace 挂载后优先用 Rust state 复核 reload 前的 session；不存在或已关闭时清除 hint，
+   * 再执行既有 orphan recovery。hint 介质从不单独恢复 URL、状态或授权事实。
+   */
   useEffect(() => {
     if (workspaceId === undefined) return undefined;
     const generation = projectGenerationRef.current;
-    void recoverPending(generation).catch(() => undefined);
-    return undefined;
-  }, [recoverPending, workspaceId]);
+    let disposed = false;
+    void (async (): Promise<void> => {
+      const hintedSessionId = sessionHints.read(workspaceId);
+      if (hintedSessionId !== undefined) {
+        try {
+          const restored = await adapter.state(hintedSessionId);
+          if (disposed || projectGenerationRef.current !== generation) return;
+          if (restored.id === hintedSessionId && restored.status === "open") {
+            sessionRef.current = restored;
+            eventCursorRef.current = undefined;
+            recoveryBlockedRef.current = false;
+            commitSnapshot(restored, generation, hintedSessionId);
+            await reconcileSession(hintedSessionId, generation, restored.generation);
+            return;
+          }
+        } catch {
+          // 无效、过期或不属于当前 native owner 的 hint 与不存在使用同一恢复路径。
+        }
+        sessionHints.forget(workspaceId, hintedSessionId);
+      }
+      await recoverPending(generation).catch(() => undefined);
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [adapter, commitSnapshot, reconcileSession, recoverPending, sessionHints, workspaceId]);
 
   /** 每个 workspace 只保留一个原生订阅，异步返回的迟到 handle 立即释放。 */
   useEffect(() => {
@@ -499,6 +629,104 @@ export function usePreviewLifecycleController(
       void unsubscribe?.();
     };
   }, [adapter, applyEvent, workspaceId]);
+
+  /**
+   * loading 期间周期性回读有界事件与权威快照，补偿 WebView2 completion 和 Tauri live event
+   * 之间的时序窗口；终态、identity 变化或 renderer 截止后立即停止，避免后台 Preview
+   * 产生持续 IPC。
+   */
+  useEffect(() => {
+    if (
+      workspaceId === undefined ||
+      deadlineSessionId === undefined ||
+      deadlineSessionGeneration === undefined ||
+      deadlineSessionStatus !== "open" ||
+      deadlineLoadStatus !== "loading"
+    )
+      return undefined;
+    const projectGeneration = projectGenerationRef.current;
+    const sessionId = deadlineSessionId;
+    const minimumGeneration = deadlineSessionGeneration;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    /** 单次回读结束后仅为仍处于同一 loading identity 的 session 安排下一轮。 */
+    const reconcileWhileLoading = async (): Promise<void> => {
+      await reconcileSession(sessionId, projectGeneration, minimumGeneration);
+      const current = sessionRef.current;
+      const deadlineReached =
+        failedNavigationRef.current?.sessionId === sessionId &&
+        failedNavigationRef.current.navigationIntent === navigationIntentRef.current;
+      if (
+        disposed ||
+        deadlineReached ||
+        projectGenerationRef.current !== projectGeneration ||
+        current?.id !== sessionId ||
+        current.status !== "open" ||
+        current.load_status !== "loading"
+      )
+        return;
+      timer = setTimeout(() => void reconcileWhileLoading(), PREVIEW_LOADING_RECONCILE_INTERVAL_MS);
+    };
+
+    timer = setTimeout(() => void reconcileWhileLoading(), PREVIEW_LOADING_RECONCILE_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [
+    deadlineLoadStatus,
+    deadlineSessionGeneration,
+    deadlineSessionId,
+    deadlineSessionStatus,
+    reconcileSession,
+    workspaceId,
+  ]);
+
+  /**
+   * Rust 的 30 秒 watchdog 是权威终态；renderer 多保留 1 秒传播余量后提供脱敏故障保险。
+   * 预算绑定用户导航 intent 的首次开始时间，而不是 WebView2 内部 generation；重定向或错误页
+   * 重试可以推进 generation，但不能无限延长同一次用户操作。新导航、终态或 workspace 切换会
+   * 更换该 intent，旧 timer 因此不能污染恢复后的页面。
+   */
+  useEffect(() => {
+    if (
+      workspaceId === undefined ||
+      deadlineSessionId === undefined ||
+      deadlineSessionGeneration === undefined ||
+      deadlineSessionStatus !== "open" ||
+      deadlineLoadStatus !== "loading" ||
+      loadDeadline === undefined
+    )
+      return undefined;
+    const projectGeneration = projectGenerationRef.current;
+    const sessionId = deadlineSessionId;
+    const navigationIntent = loadDeadline.navigationIntent;
+    const elapsed = Math.max(0, Date.now() - loadDeadline.startedAt);
+    const remaining = Math.max(0, PREVIEW_RENDERER_LOAD_DEADLINE_MS - elapsed);
+    const timer = setTimeout(() => {
+      const current = sessionRef.current;
+      if (
+        projectGenerationRef.current !== projectGeneration ||
+        navigationIntentRef.current !== navigationIntent ||
+        current?.id !== sessionId ||
+        current.status !== "open" ||
+        current.load_status !== "loading"
+      )
+        return;
+      failedNavigationRef.current = { sessionId, navigationIntent };
+      setLoading(false);
+      setError(PREVIEW_LOAD_ERROR);
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [
+    deadlineLoadStatus,
+    deadlineSessionGeneration,
+    deadlineSessionId,
+    deadlineSessionStatus,
+    loadDeadline,
+    workspaceId,
+  ]);
 
   /** 外层只获得 ACK-first close port，不获得 session identity 或 native handle。 */
   const workspaceLifecycle = useMemo<PreviewWorkspaceLifecycle | undefined>(

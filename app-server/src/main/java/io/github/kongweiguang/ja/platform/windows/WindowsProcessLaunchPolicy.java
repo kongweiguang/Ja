@@ -40,7 +40,11 @@ final class WindowsProcessLaunchPolicy {
     /**
      * 单个环境变量值的字符上限。
      */
-    private static final int MAX_ENVIRONMENT_VALUE_LENGTH = 8_192;
+    private static final int MAX_ENVIRONMENT_VALUE_LENGTH = 32_767;
+    /**
+     * CreateProcessW Unicode 环境块（含每项终止符与最终终止符）的硬字符上限。
+     */
+    private static final int MAX_ENVIRONMENT_BLOCK_CHARACTERS = 32_767;
     /**
      * 允许跨越进程边界的环境变量名称语法。
      */
@@ -119,12 +123,22 @@ final class WindowsProcessLaunchPolicy {
         }
         Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         Map<String, String> copy = new java.util.LinkedHashMap<>();
+        int blockCharacters = 1;
         for (Map.Entry<String, String> entry : environment.entrySet()) {
             String name = entry.getKey();
             String value = entry.getValue();
             if (name == null || !ENVIRONMENT_NAME.matcher(name).matches() || !names.add(name)
                 || value == null || value.length() > MAX_ENVIRONMENT_VALUE_LENGTH
                 || value.indexOf('\0') >= 0) {
+                throw new IOException("windows_process_environment_invalid");
+            }
+            try {
+                blockCharacters = Math.addExact(blockCharacters,
+                        Math.addExact(name.length(), Math.addExact(value.length(), 2)));
+            } catch (ArithmeticException overflow) {
+                throw new IOException("windows_process_environment_invalid");
+            }
+            if (blockCharacters > MAX_ENVIRONMENT_BLOCK_CHARACTERS) {
                 throw new IOException("windows_process_environment_invalid");
             }
             copy.put(name, value);

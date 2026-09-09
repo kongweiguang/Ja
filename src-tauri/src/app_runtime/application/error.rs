@@ -5,6 +5,8 @@
 
 use serde::Serialize;
 
+use crate::app_runtime::GoalPayloadError;
+
 /// 稳定且脱敏的命令错误；内部进程错误仅保留在日志中，WebView 不得接收路径、token、stack 或 child command。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +24,13 @@ impl std::fmt::Display for RuntimeCommandError {
 }
 
 impl std::error::Error for RuntimeCommandError {}
+
+impl From<GoalPayloadError> for RuntimeCommandError {
+    /// 领域层只表达 payload 不可接纳，application 在唯一边界收敛为稳定参数错误。
+    fn from(_: GoalPayloadError) -> Self {
+        Self::invalid_params()
+    }
+}
 
 impl RuntimeCommandError {
     /// 为受信任启动设置生成唯一配置错误形态，避免调用方依赖内部原因。

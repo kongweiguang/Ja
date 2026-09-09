@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 const MAX_WORKSPACE_ID_BYTES: usize = 128;
 const MAX_RELATIVE_CWD_BYTES: usize = 4_096;
+const MAX_OPEN_WORKERS: usize = 8;
 const MAX_POLL_WORKERS: usize = 8;
 const MAX_CLOSE_WORKERS: usize = 8;
 const HOST_POISON_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,6 +52,7 @@ impl TerminalWorkspaceResolver for RuntimeHost {
 pub struct TerminalCommandHost {
     pub(crate) lifecycle: Arc<Mutex<TerminalHostLifecycle>>,
     pub(crate) failed: Arc<AtomicBool>,
+    open_workers: Arc<tokio::sync::Semaphore>,
     poll_workers: Arc<tokio::sync::Semaphore>,
     close_workers: Arc<tokio::sync::Semaphore>,
 }
@@ -75,6 +77,7 @@ impl Default for TerminalCommandHost {
         Self {
             lifecycle: Arc::new(Mutex::new(TerminalHostLifecycle::default())),
             failed: Arc::new(AtomicBool::new(false)),
+            open_workers: Arc::new(tokio::sync::Semaphore::new(MAX_OPEN_WORKERS)),
             poll_workers: Arc::new(tokio::sync::Semaphore::new(MAX_POLL_WORKERS)),
             close_workers: Arc::new(tokio::sync::Semaphore::new(MAX_CLOSE_WORKERS)),
         }
@@ -431,7 +434,7 @@ pub fn ja_terminal_profiles() -> Vec<ShellProfile> {
 
 /// 通过原生 workspace owner 打开一个 portable-pty session，并返回不透明 identity。
 #[tauri::command]
-pub fn ja_terminal_open(
+pub async fn ja_terminal_open(
     input: TerminalOpenInput,
     state: tauri::State<'_, TerminalCommandHost>,
     runtime: tauri::State<'_, RuntimeHost>,
@@ -439,17 +442,39 @@ pub fn ja_terminal_open(
     validate_workspace_id(&input.workspace_id)?;
     let cwd = parse_relative_cwd(input.relative_cwd)?;
     let root = runtime.resolve_terminal_workspace(&input.workspace_id)?;
+    let state = state.inner().clone();
+    let workers = state.open_workers.clone();
     let request = LaunchRequest {
         profile: input.profile,
         cwd,
         env: Default::default(),
         size: input.size,
     };
-    let handle = state.open(&input.workspace_id, root, request)?;
-    Ok(TerminalSessionInfo {
-        session_id: handle.id(),
-        generation: handle.generation(),
+    run_bounded_terminal_open(workers, move || {
+        let handle = state.open(&input.workspace_id, root, request)?;
+        Ok(TerminalSessionInfo {
+            session_id: handle.id(),
+            generation: handle.generation(),
+        })
     })
+    .await
+}
+
+/// 把 ConPTY/openpty、Shell 创建和进程树绑定整体移出 Tauri command 调度线程；独立 permit
+/// 覆盖完整阻塞区，既允许最多八个持久窗格并行恢复，也拒绝 renderer 制造额外等待队列。
+pub(crate) async fn run_bounded_terminal_open<T: Send + 'static>(
+    workers: Arc<tokio::sync::Semaphore>,
+    operation: impl FnOnce() -> Result<T, TerminalError> + Send + 'static,
+) -> Result<T, TerminalError> {
+    let permit = workers
+        .try_acquire_owned()
+        .map_err(|_| TerminalError::new(TerminalErrorCode::QueueFull))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|_| TerminalError::new(TerminalErrorCode::WorkerShutdownTimeout))?
 }
 
 /// 用同一个绝对 deadline 关闭 workspace 持有的全部 session，避免逐个延长退出预算。

@@ -16,16 +16,43 @@ const THREADS: readonly ThreadProjection[] = [
     threadId: "thread_recent",
     title: "迁移方案",
     status: "active",
+    pinned: false,
+    latestTurnStatus: "completed",
+    latestTurnSeen: true,
   },
   {
     threadId: "thread_ui",
     title: "桌面界面优化",
     status: "active",
+    pinned: false,
+    latestTurnStatus: "completed",
+    latestTurnSeen: true,
   },
 ];
 
 describe("ConversationSearchDialog", () => {
   afterEach(() => cleanup());
+
+  /** 搜索是临时浮层：背景保持可见，点击面板外仍通过 Radix 的 dismiss 事务关闭。 */
+  it("使用透明外部点击层并在点击其它区域时关闭", async () => {
+    const user = userEvent.setup();
+    const onOpenChange = vi.fn();
+    render(
+      <ConversationSearchDialog
+        open
+        shortcutLabel="Ctrl+K"
+        onOpenChange={onOpenChange}
+        onSearch={async () => THREADS}
+        onSelect={vi.fn()}
+        onRestore={vi.fn()}
+      />,
+    );
+
+    const overlay = document.querySelector<HTMLElement>(".ja-conversation-search-overlay");
+    expect(overlay).toHaveClass("ja-dialog-overlay");
+    await user.click(overlay!);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
 
   it("空查询展示最近会话，并支持命中高亮和 Enter 打开", async () => {
     const user = userEvent.setup();
@@ -39,12 +66,13 @@ describe("ConversationSearchDialog", () => {
         onOpenChange={onOpenChange}
         onSearch={onSearch}
         onSelect={onSelect}
+        onRestore={vi.fn()}
       />,
     );
 
     expect(await screen.findByText("最近会话")).toBeVisible();
     expect(screen.getByText("Ctrl+K")).toBeVisible();
-    expect(await screen.findByRole("option", { name: "迁移方案" })).toHaveAttribute(
+    expect(await screen.findByRole("option", { name: "打开：迁移方案" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -69,10 +97,11 @@ describe("ConversationSearchDialog", () => {
         onOpenChange={vi.fn()}
         onSearch={async (query) => (query === "无" ? [] : THREADS)}
         onSelect={onSelect}
+        onRestore={vi.fn()}
       />,
     );
     const input = screen.getByRole("searchbox", { name: "搜索对话" });
-    await screen.findByRole("option", { name: "迁移方案" });
+    await screen.findByRole("option", { name: "打开：迁移方案" });
     await user.clear(input);
     await user.type(input, "无");
     await screen.findByText("没有匹配的会话");
@@ -83,6 +112,30 @@ describe("ConversationSearchDialog", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
+  /** 归档结果保留独立恢复路径，不能直接走 active Thread 的选择入口。 */
+  it("marks archived results and restores them before opening", async () => {
+    const user = userEvent.setup();
+    const archived = { ...THREADS[0]!, status: "archived" as const };
+    const onSelect = vi.fn();
+    const onRestore = vi.fn();
+    render(
+      <ConversationSearchDialog
+        open
+        shortcutLabel="Ctrl+K"
+        onOpenChange={vi.fn()}
+        onSearch={async () => [archived]}
+        onSelect={onSelect}
+        onRestore={onRestore}
+      />,
+    );
+
+    const result = await screen.findByRole("option", { name: "恢复并打开：迁移方案" });
+    expect(result).toHaveTextContent("已归档 · 恢复并打开");
+    await user.click(result);
+    expect(onRestore).toHaveBeenCalledWith("thread_recent");
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("长结果键盘导航时保持活动项可见且不移动输入焦点", async () => {
     const longResults = Array.from(
       { length: 18 },
@@ -90,6 +143,9 @@ describe("ConversationSearchDialog", () => {
         threadId: `thread_${index}`,
         title: `会话 ${index + 1}`,
         status: "active",
+        pinned: false,
+        latestTurnStatus: "completed",
+        latestTurnSeen: true,
       }),
     );
     const scrollIntoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
@@ -100,11 +156,12 @@ describe("ConversationSearchDialog", () => {
         onOpenChange={vi.fn()}
         onSearch={async () => longResults}
         onSelect={vi.fn()}
+        onRestore={vi.fn()}
       />,
     );
 
     const input = screen.getByRole("searchbox", { name: "搜索对话" });
-    await screen.findByRole("option", { name: "会话 18" });
+    await screen.findByRole("option", { name: "打开：会话 18" });
     scrollIntoView.mockClear();
     fireEvent.keyDown(input, { key: "End" });
 
@@ -112,15 +169,29 @@ describe("ConversationSearchDialog", () => {
       expect(scrollIntoView).toHaveBeenLastCalledWith({ block: "nearest", inline: "nearest" }),
     );
     expect(scrollIntoView.mock.contexts.at(-1)).toBe(
-      screen.getByRole("option", { name: "会话 18" }),
+      screen.getByRole("option", { name: "打开：会话 18" }),
     );
     expect(input).toHaveFocus();
   });
 
   it("标题元数据变化时静默刷新当前查询并按 Thread 保留选择与焦点", async () => {
     const searchable: readonly ThreadProjection[] = [
-      { threadId: "thread_a", title: "会话 A", status: "active" },
-      { threadId: "thread_b", title: "会话 B", status: "active" },
+      {
+        threadId: "thread_a",
+        title: "会话 A",
+        status: "active",
+        pinned: false,
+        latestTurnStatus: "completed",
+        latestTurnSeen: true,
+      },
+      {
+        threadId: "thread_b",
+        title: "会话 B",
+        status: "active",
+        pinned: false,
+        latestTurnStatus: "completed",
+        latestTurnSeen: true,
+      },
     ];
     let resolveRefresh: ((items: readonly ThreadProjection[]) => void) | undefined;
     const refreshResult = new Promise<readonly ThreadProjection[]>((resolve) => {
@@ -138,32 +209,50 @@ describe("ConversationSearchDialog", () => {
       onOpenChange: vi.fn(),
       onSearch,
       onSelect: vi.fn(),
+      onRestore: vi.fn(),
     } as const;
     const { rerender } = render(<ConversationSearchDialog {...props} />);
 
     const input = screen.getByRole("searchbox", { name: "搜索对话" });
-    await screen.findByRole("option", { name: "会话 B" });
+    await screen.findByRole("option", { name: "打开：会话 B" });
     fireEvent.change(input, { target: { value: "会话" } });
     await waitFor(() => expect(onSearch).toHaveBeenLastCalledWith("会话"));
-    await screen.findByRole("option", { name: "会话 B" });
+    await screen.findByRole("option", { name: "打开：会话 B" });
     fireEvent.keyDown(input, { key: "ArrowDown" });
-    expect(screen.getByRole("option", { name: "会话 B" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: "打开：会话 B" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
 
     rerender(<ConversationSearchDialog {...props} refreshIdentity="evt_title_1" />);
     await waitFor(() => expect(onSearch).toHaveBeenCalledTimes(3));
     expect(input).toHaveValue("会话");
     expect(input).toHaveFocus();
     expect(screen.queryByLabelText("正在搜索")).not.toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "会话 B" })).toBeVisible();
+    expect(screen.getByRole("option", { name: "打开：会话 B" })).toBeVisible();
 
     await act(async () => {
       resolveRefresh?.([
-        { threadId: "thread_b", title: "会话 B 新标题", status: "active" },
-        { threadId: "thread_a", title: "会话 A 新标题", status: "active" },
+        {
+          threadId: "thread_b",
+          title: "会话 B 新标题",
+          status: "active",
+          pinned: false,
+          latestTurnStatus: "completed",
+          latestTurnSeen: true,
+        },
+        {
+          threadId: "thread_a",
+          title: "会话 A 新标题",
+          status: "active",
+          pinned: false,
+          latestTurnStatus: "completed",
+          latestTurnSeen: true,
+        },
       ]);
       await refreshResult;
     });
-    expect(screen.getByRole("option", { name: "会话 B 新标题" })).toHaveAttribute(
+    expect(screen.getByRole("option", { name: "打开：会话 B 新标题" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -173,7 +262,7 @@ describe("ConversationSearchDialog", () => {
     await waitFor(() => expect(onSearch).toHaveBeenCalledTimes(4));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("正在搜索")).not.toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "会话 B 新标题" })).toHaveAttribute(
+    expect(screen.getByRole("option", { name: "打开：会话 B 新标题" })).toHaveAttribute(
       "aria-selected",
       "true",
     );

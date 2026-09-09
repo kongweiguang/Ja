@@ -18,7 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-/** 编码并严格校验 Summary v2 的事实来源与退休清单结构。 */
+/** 编码并严格校验 Summary v1 的事实来源与退休清单结构。 */
 final class SummaryDocumentCodec {
     private static final List<String> FACT_FIELDS = List.of(
             "goals", "constraints", "completedProgress", "currentProgress", "blockers", "decisions",
@@ -60,10 +60,10 @@ final class SummaryDocumentCodec {
             JsonNode root = AbstractStreamingModelAdapter.JSON.readTree(parser);
             if (!(root instanceof ObjectNode object) || parser.nextToken() != null
                 || object.size() != FACT_FIELDS.size() + 1 || !object.has("retirements")) {
-                throw failure("summary model returned an invalid v2 document shape");
+                throw failure("summary model returned an invalid v1 document shape");
             }
             for (String field : FACT_FIELDS) if (!object.has(field)) {
-                throw failure("summary model returned an invalid v2 document shape");
+                throw failure("summary model returned an invalid v1 document shape");
             }
             return new SummaryDocument(
                     facts(object, "goals"), facts(object, "constraints"),

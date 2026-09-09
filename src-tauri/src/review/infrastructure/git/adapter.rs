@@ -211,10 +211,7 @@ impl GitReadOnly {
         index: Option<&Path>,
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>, GitError> {
-        self.workspace
-            .resolve_directory("")
-            .map_err(|_| GitError::Workspace)?;
-        validate_worktree(&self.workspace)?;
+        self.validate_review_context()?;
         if let Some(index) = index {
             self.validate_review_index_path(index, true)?;
         }
@@ -223,16 +220,21 @@ impl GitReadOnly {
             command.env("GIT_INDEX_FILE", index);
         }
         let output = run_git(command, &self.policy, cancellation)?;
-        self.workspace
-            .resolve_directory("")
-            .map_err(|_| GitError::Workspace)?;
-        validate_worktree(&self.workspace)?;
+        self.validate_review_context()?;
         if !output.status.success() {
             return Err(GitError::CommandFailed {
                 code: output.status.code(),
             });
         }
         Ok(output.stdout)
+    }
+
+    /// 每条命令前后使用同一准入检查，避免性能优化绕过配置与对象目录边界。
+    fn validate_review_context(&self) -> Result<(), GitError> {
+        self.workspace
+            .resolve_directory("")
+            .map_err(|_| GitError::Workspace)?;
+        validate_worktree(&self.workspace)
     }
 
     /// 将真实及临时 index 限制在同一已准入元数据目录，临时文件名仅接受 Review 生成的封闭前缀。

@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"c:seen-missing","method":"thread/seen","params":{"threadId":"thr_demo","expectedThreadRevision":6}}
+{"jsonrpc":"2.0","id":"c:seen-missing","result":{"threadId":"thr_demo","workspaceId":"ws_demo","preferences":null,"title":"Demo","status":"active","pinned":false,"latestTurnStatus":"completed","revision":7,"createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:01:00Z"}}
+{"jsonrpc":"2.0","id":"c:seen-empty-turn","method":"thread/seen","params":{"threadId":"thr_empty","expectedThreadRevision":0}}
+{"jsonrpc":"2.0","id":"c:seen-empty-turn","result":{"threadId":"thr_empty","workspaceId":"ws_demo","preferences":null,"title":"Empty","status":"active","pinned":false,"latestTurnStatus":null,"latestTurnSeen":false,"revision":1,"createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:01:00Z"}}

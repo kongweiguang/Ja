@@ -147,6 +147,41 @@ final class WindowsJobObjectTest {
     }
 
     /**
+     * 复现桌面 Host Job -> App Server JVM -> Shell Job 的两级托管链；普通单 JVM 用例只验证
+     * 最内层 Job，无法发现父 Job 策略导致的 CreateProcess/AssignProcessToJobObject 差异。
+     */
+    @Test
+    void nestedHostJobAllowsAppServerToLaunchOwnedPowerShell(@TempDir Path temp) throws Exception {
+        Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
+        List<String> command = List.of(
+                java.toString(),
+                "-cp",
+                System.getProperty("java.class.path"),
+                NestedShellProbe.class.getName(),
+                temp.toAbsolutePath().toString());
+        Map<String, String> environment = minimalWindowsEnvironment();
+
+        try (WindowsJobObject hostJob = WindowsJobObject.create()) {
+            Process appServer = WindowsProcessLauncher.launch(command, temp, environment, hostJob);
+            try {
+                appServer.getOutputStream().close();
+                assertTrue(appServer.waitFor(8, TimeUnit.SECONDS), "nested App Server probe must settle");
+                String stdout = new String(appServer.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                String stderr = new String(appServer.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+
+                assertEquals(0, appServer.exitValue(), "nested probe stderr=" + stderr);
+                assertTrue(stdout.contains("nested-shell-ok"), "nested probe stdout=" + stdout);
+                hostJob.closeAfterRootExit();
+            } finally {
+                if (appServer.isAlive()) {
+                    hostJob.terminate();
+                }
+                WindowsProcessLauncher.close(appServer);
+            }
+        }
+    }
+
+    /**
      * 证明关闭精确进程 owner 会取消另一 platform thread 上的同步匿名管道读取；先观察有界超时，
      * 再要求 close 后得到 EOF，避免测试只覆盖尚未进入 ReadFile 的快速路径。
      */
@@ -289,6 +324,21 @@ final class WindowsJobObjectTest {
         }
     }
 
+    /**
+     * 只向嵌套 JVM 传递启动 Java/PowerShell 所需的非敏感变量，保持与 Rust Host env_clear
+     * 边界一致，避免开发终端的完整环境掩盖托管差异。
+     */
+    private static Map<String, String> minimalWindowsEnvironment() {
+        java.util.LinkedHashMap<String, String> values = new java.util.LinkedHashMap<>();
+        for (String name : List.of("SystemRoot", "ComSpec", "PATH", "PATHEXT", "TEMP", "TMP")) {
+            String value = System.getenv(name);
+            if (value != null) {
+                values.put(name, value);
+            }
+        }
+        return Map.copyOf(values);
+    }
+
     /** 为关闭后的句柄释放预留短暂收敛窗口。 */
     private static void awaitHandleCountAtMost(long maximum, Duration timeout) throws Exception {
         Instant deadline = Instant.now().plus(timeout);
@@ -366,6 +416,60 @@ final class WindowsJobObjectTest {
             } catch (Throwable failure) {
                 throw new AssertionError("cannot query Windows handle count", failure);
             }
+        }
+    }
+
+    /**
+     * 独立 JVM 入口模拟由 Rust Job 托管的 App Server；它再创建 Shell Job 并执行真实
+     * PowerShell，使测试包含生产中缺失于普通 ShellToolTest 的父 Job 层级。
+     */
+    public static final class NestedShellProbe {
+        /** 工具入口由父测试以绝对 cwd 启动，任何异常都转成短脱敏 stderr 与非零退出码。 */
+        public static void main(String[] arguments) {
+            try {
+                Path workingDirectory = Path.of(arguments[0]).toAbsolutePath().normalize();
+                String systemRoot = System.getenv("SystemRoot");
+                Path powershell = Path.of(systemRoot, "System32", "WindowsPowerShell", "v1.0",
+                        "powershell.exe");
+                try (WindowsJobObject shellJob = WindowsJobObject.create()) {
+                    Process shell = WindowsProcessLauncher.launch(
+                            List.of(powershell.toString(), "-NoLogo", "-NoProfile", "-NonInteractive",
+                                    "-Command", "Write-Output 'nested-shell-ok'"),
+                            workingDirectory,
+                            minimalWindowsEnvironment(),
+                            shellJob);
+                    try {
+                        shell.getOutputStream().close();
+                        if (!shell.waitFor(5, TimeUnit.SECONDS)) {
+                            throw new IOException("nested_shell_timeout");
+                        }
+                        String stdout = new String(shell.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                        String stderr = new String(shell.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+                        if (shell.exitValue() != 0 || !stdout.contains("nested-shell-ok")) {
+                            throw new IOException("nested_shell_failed exit=" + shell.exitValue()
+                                    + " stderrEmpty=" + stderr.isEmpty());
+                        }
+                        shellJob.closeAfterRootExit();
+                        System.out.print(stdout);
+                    } finally {
+                        if (shell.isAlive()) {
+                            shellJob.terminate();
+                        }
+                        WindowsProcessLauncher.close(shell);
+                    }
+                }
+            } catch (Exception failure) {
+                System.err.println(failure.getClass().getSimpleName() + ":" + failure.getMessage());
+                Throwable cause = failure.getCause();
+                if (cause != null) {
+                    System.err.println(cause.getClass().getSimpleName() + ":" + cause.getMessage());
+                }
+                System.exit(90);
+            }
+        }
+
+        /** 该类型只作为独立 JVM 入口，不允许实例化。 */
+        private NestedShellProbe() {
         }
     }
 }

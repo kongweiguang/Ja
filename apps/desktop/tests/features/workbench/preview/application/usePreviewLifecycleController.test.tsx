@@ -7,6 +7,7 @@ import {
   usePreviewLifecycleController,
   type NativePreviewPort,
   type PreviewEvent,
+  type PreviewSessionHintStorage,
   type PreviewSessionSnapshot,
   type PreviewViewport,
 } from "@/features/workbench/preview";
@@ -14,6 +15,7 @@ import type { WorkspaceProjection } from "@/features/workspace";
 
 interface JaWorkbenchAdapters {
   preview: NativePreviewPort;
+  sessionHints: PreviewSessionHintStorage;
 }
 
 const PREVIEW_VIEWPORT: PreviewViewport = {
@@ -75,7 +77,11 @@ function useJaWorkbench(
   selectedProject: WorkspaceProjection | undefined,
   adapters: JaWorkbenchAdapters,
 ) {
-  const controller = usePreviewLifecycleController(selectedProject?.workspaceId, adapters.preview);
+  const controller = usePreviewLifecycleController(
+    selectedProject?.workspaceId,
+    adapters.preview,
+    adapters.sessionHints,
+  );
   return { ...controller, previewWorkspaceLifecycle: controller.workspaceLifecycle };
 }
 
@@ -83,6 +89,7 @@ function useJaWorkbench(
 function createAdapters(): JaWorkbenchAdapters & {
   previewEvents: (event: PreviewEvent) => void;
 } {
+  const hints = new Map<string, string>();
   const snapshot: PreviewSessionSnapshot = {
     id: "00000000-0000-4000-8000-000000000002",
     generation: 0,
@@ -127,11 +134,32 @@ function createAdapters(): JaWorkbenchAdapters & {
   };
   return {
     preview,
+    sessionHints: {
+      read: (workspaceId) => hints.get(workspaceId),
+      remember: (workspaceId, sessionId) => hints.set(workspaceId, sessionId),
+      forget: (workspaceId, expectedSessionId) => {
+        if (expectedSessionId === undefined || hints.get(workspaceId) === expectedSessionId)
+          hints.delete(workspaceId);
+      },
+    },
     previewEvents: (event) => previewListener(event),
   };
 }
 
 describe("usePreviewLifecycleController", () => {
+  it("rehydrates a reload hint only through authoritative native state", async () => {
+    const adapters = createAdapters();
+    const sessionId = "00000000-0000-4000-8000-000000000002";
+    adapters.sessionHints.remember(project.workspaceId, sessionId);
+
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+
+    await waitFor(() => expect(result.current.preview.url).toBe("https://example.com/"));
+    expect(adapters.preview.state).toHaveBeenCalledWith(sessionId);
+    expect(adapters.preview.events).toHaveBeenCalledWith(sessionId, 512);
+    expect(adapters.preview.recoverPending).not.toHaveBeenCalled();
+  });
+
   it("waits for initial orphan recovery before admitting the first native open", async () => {
     const adapters = createAdapters();
     const recovery =
@@ -255,6 +283,44 @@ describe("usePreviewLifecycleController", () => {
     expect(adapters.preview.close).toHaveBeenCalledOnce();
   });
 
+  it("coalesces a resize burst to the latest native Preview layout", async () => {
+    const adapters = createAdapters();
+    const firstLayout = createDeferred<PreviewSessionSnapshot>();
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.subscribe).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    act(() => result.current.preview.onNavigate("https://example.com/"));
+    await waitFor(() => expect(result.current.preview.url).toBe("https://example.com/"));
+    const session = await adapters.preview.state("00000000-0000-4000-8000-000000000002");
+    adapters.preview.layout = vi
+      .fn()
+      .mockImplementationOnce(() => firstLayout.promise)
+      .mockResolvedValue(session);
+
+    act(() => result.current.preview.onViewportChange({ ...PREVIEW_VIEWPORT, width: 500 }));
+    await waitFor(() => expect(adapters.preview.layout).toHaveBeenCalledOnce());
+    act(() => {
+      result.current.preview.onViewportChange({ ...PREVIEW_VIEWPORT, width: 520 });
+      result.current.preview.onViewportChange({ ...PREVIEW_VIEWPORT, width: 540 });
+    });
+    expect(adapters.preview.layout).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      firstLayout.resolve(session);
+      await flushMicrotasks();
+    });
+    await waitFor(() => expect(adapters.preview.layout).toHaveBeenCalledTimes(2));
+    expect(adapters.preview.layout).toHaveBeenLastCalledWith(
+      "00000000-0000-4000-8000-000000000002",
+      expect.objectContaining({ width: 540 }),
+    );
+
+    act(() => result.current.preview.onViewportChange({ ...PREVIEW_VIEWPORT, width: 540 }));
+    await act(flushMicrotasks);
+    expect(adapters.preview.layout).toHaveBeenCalledTimes(2);
+  });
+
   it("reconciles an early higher-generation load event against state after open ACK", async () => {
     const adapters = createAdapters();
     const pendingOpen =
@@ -349,6 +415,162 @@ describe("usePreviewLifecycleController", () => {
     expect(adapters.preview.close).toHaveBeenCalledOnce();
     expect(adapters.preview.close).toHaveBeenCalledWith("00000000-0000-4000-8000-000000000002");
     expect(result.current.preview.url).toBeUndefined();
+  });
+
+  it("reconciles a native load failure when the live Preview event is missed", async () => {
+    const adapters = createAdapters();
+    const loading: PreviewSessionSnapshot = {
+      id: "00000000-0000-4000-8000-000000000002",
+      generation: 0,
+      status: "open",
+      load_status: "loading",
+      url: "https://unavailable.example/",
+      title: "Unavailable",
+      window: { label: "ja-preview", url: "https://unavailable.example/" },
+      dropped_events: 0,
+    };
+    const failed: PreviewSessionSnapshot = { ...loading, load_status: "failed" };
+    adapters.preview.open = vi.fn(async () => ({ snapshot: loading, window: loading.window }));
+    vi.mocked(adapters.preview.state).mockResolvedValueOnce(loading).mockResolvedValue(failed);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.subscribe).toHaveBeenCalledTimes(1));
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    act(() => result.current.preview.onNavigate("https://unavailable.example/"));
+
+    await waitFor(() => expect(result.current.preview.error).toBe("预览加载失败，请重试。"), {
+      timeout: 2_000,
+    });
+    expect(result.current.preview.loading).toBe(false);
+    expect(adapters.preview.events).toHaveBeenCalledWith(loading.id, 512);
+    expect(adapters.preview.state).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed after the renderer deadline when native loading never settles", async () => {
+    const adapters = createAdapters();
+    const stalled: PreviewSessionSnapshot = {
+      id: "00000000-0000-4000-8000-000000000002",
+      generation: 0,
+      status: "open",
+      load_status: "loading",
+      url: "https://stalled.example/",
+      title: "Stalled",
+      window: { label: "ja-preview", url: "https://stalled.example/" },
+      dropped_events: 0,
+    };
+    adapters.preview.open = vi.fn(async () => ({ snapshot: stalled, window: stalled.window }));
+    adapters.preview.state = vi.fn(async () => stalled);
+    const { result, unmount } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.preview.onNavigate("https://stalled.example/"));
+      await act(flushMicrotasks);
+      await vi.waitFor(() => expect(result.current.preview.url).toBe("https://stalled.example/"));
+      expect(result.current.preview.loading).toBe(true);
+
+      await act(() => vi.advanceTimersByTimeAsync(31_000));
+      expect(result.current.preview.loading).toBe(false);
+      expect(result.current.preview.error).toBe("预览加载失败，请重试。");
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not renew the renderer deadline when WebView2 advances loading generations", async () => {
+    const adapters = createAdapters();
+    const stalled: PreviewSessionSnapshot = {
+      id: "00000000-0000-4000-8000-000000000002",
+      generation: 0,
+      status: "open",
+      load_status: "loading",
+      url: "https://stalled.example/",
+      title: "Stalled",
+      window: { label: "ja-preview", url: "https://stalled.example/" },
+      dropped_events: 0,
+    };
+    let generation = 0;
+    adapters.preview.open = vi.fn(async () => ({ snapshot: stalled, window: stalled.window }));
+    adapters.preview.state = vi.fn(async () => ({ ...stalled, generation: generation++ }));
+    const { result, unmount } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.preview.onNavigate("https://stalled.example/"));
+      await act(flushMicrotasks);
+      await vi.waitFor(() => expect(result.current.preview.url).toBe("https://stalled.example/"));
+
+      await act(() => vi.advanceTimersByTimeAsync(31_000));
+
+      expect(generation).toBeGreaterThan(1);
+      expect(result.current.preview.loading).toBe(false);
+      expect(result.current.preview.error).toBe("预览加载失败，请重试。");
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * 原生 watchdog 后 WebView2 仍可能补发错误页的 committed/finished；同一用户导航必须保持
+   * 可恢复错误，避免真窗从错误面板倒退成看似成功的空白预览。
+   */
+  it("keeps a failed navigation terminal when late WebView2 events arrive", async () => {
+    const adapters = createAdapters();
+    const stalled: PreviewSessionSnapshot = {
+      id: "00000000-0000-4000-8000-000000000002",
+      generation: 1,
+      status: "open",
+      load_status: "loading",
+      url: "https://stalled.example/",
+      title: "Stalled",
+      window: { label: "ja-preview", url: "https://stalled.example/" },
+      dropped_events: 0,
+    };
+    adapters.preview.open = vi.fn(async () => ({ snapshot: stalled, window: stalled.window }));
+    adapters.preview.state = vi.fn(async () => stalled);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    act(() => result.current.preview.onNavigate("https://stalled.example/"));
+    await waitFor(() => expect(result.current.preview.url).toBe("https://stalled.example/"));
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: stalled.id,
+        generation: 1,
+        sequence: 1,
+        kind: { type: "load_failed", message: "预览加载失败，请重试。" },
+      }),
+    );
+    expect(result.current.preview.error).toBe("预览加载失败，请重试。");
+    expect(result.current.preview.loading).toBe(false);
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: stalled.id,
+        generation: 2,
+        sequence: 2,
+        kind: {
+          type: "navigation_committed",
+          source: "redirect",
+          url: "edge-error://edgewebdata/",
+        },
+      }),
+    );
+    act(() =>
+      adapters.previewEvents({
+        session_id: stalled.id,
+        generation: 2,
+        sequence: 3,
+        kind: { type: "load_finished", url: "edge-error://edgewebdata/" },
+      }),
+    );
+
+    expect(result.current.preview.error).toBe("预览加载失败，请重试。");
+    expect(result.current.preview.loading).toBe(false);
   });
 
   it("retains the Preview identity after a redacted close failure and clears it only after retry succeeds", async () => {

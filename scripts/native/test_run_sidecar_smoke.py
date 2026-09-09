@@ -21,8 +21,9 @@ import jsonschema
 
 
 SCRIPT = Path(__file__).with_name("run-sidecar-smoke.py")
-FIXTURE = Path(__file__).parents[1] / "e2e" / "fixtures" / "v2-smoke-mock-sidecar.mjs"
-SCHEMA = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
+FIXTURE = Path(__file__).parents[1] / "e2e" / "fixtures" / "v1-smoke-mock-sidecar.mjs"
+SCHEMA = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
+GOLDEN = Path(__file__).parents[2] / "contracts" / "golden" / "v1" / "valid" / "core.jsonl"
 SPEC = importlib.util.spec_from_file_location("run_sidecar_smoke", SCRIPT)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import machinery failure is environmental
     raise RuntimeError("native smoke module is unavailable")
@@ -31,43 +32,121 @@ sys.modules[SPEC.name] = SMOKE
 SPEC.loader.exec_module(SMOKE)
 
 
-class NativeSmokeV2Test(unittest.TestCase):
-    """Verifies exact v2 frames and the complete mock-sidecar lifecycle."""
+class NativeSmokeV1Test(unittest.TestCase):
+    """Verifies exact v1 frames and the complete mock-sidecar lifecycle."""
 
-    def test_initialize_is_exact_v2_and_configuration_free(self) -> None:
-        """Keeps Secret/configuration ownership out of initialize and removes every v1 field."""
+    def test_secret_scan_distinguishes_public_protocol_names_from_values(self) -> None:
+        """公开 credential 方法名必须可观测，但带值的 API key、Bearer 与 smoke secret 仍须被拦截。"""
+
+        self.assertIsNone(SMOKE.LEAK_PATTERN.search('"method":"credential/set"'))
+        self.assertIsNotNone(SMOKE.LEAK_PATTERN.search('"apiKey":"abcdefgh12345678"'))
+        self.assertIsNotNone(SMOKE.LEAK_PATTERN.search("Bearer " + "abcdefgh12345678"))
+        self.assertIn(SMOKE.SMOKE_SECRET, f"payload={SMOKE.SMOKE_SECRET}")
+
+    def test_initialize_is_exact_v1_and_configuration_free(self) -> None:
+        """将 Native offer 绑定到 golden v1 闭集，防止发布脚本滞后于三端合同。"""
 
         params = SMOKE.initialize_frame()["params"]
-        self.assertEqual(2, params["protocolMajor"])
+        golden_params = json.loads(GOLDEN.read_text(encoding="utf-8").splitlines()[0])["params"]
+        methods = params["capabilities"]["methods"]
+        self.assertEqual(1, params["protocolMajor"])
+        self.assertEqual(0, params["protocolMinor"])
         self.assertEqual(
             {"protocolMajor", "protocolMinor", "clientVersion", "capabilities", "limits"},
             set(params),
         )
         self.assertNotIn("configSnapshot", params)
         self.assertNotIn("apiKey", str(params))
-        self.assertNotIn("runtime/configure", params["capabilities"]["methods"])
-        self.assertIn("thread/compact", params["capabilities"]["methods"])
-        self.assertIn("thread/preferences/update", params["capabilities"]["methods"])
-        self.assertIn("attachment/import", params["capabilities"]["methods"])
+        self.assertNotIn("runtime/configure", methods)
+        self.assertIn("thread/compact", methods)
+        self.assertIn("thread/pin", methods)
+        self.assertIn("thread/seen", methods)
+        self.assertIn("thread/restore", methods)
+        self.assertIn("thread/preferences/update", methods)
+        self.assertIn("workspace/path/search", methods)
+        self.assertIn("task/create", methods)
+        self.assertIn("task/tree/delete", methods)
+        self.assertIn("goal/read", methods)
+        self.assertIn("goal/create", methods)
+        self.assertIn("goal/plan/attach", methods)
+        self.assertIn("goal/plan/detach", methods)
+        self.assertIn("plan/create", methods)
+        self.assertIn("plan/draft/save", methods)
+        self.assertIn("plan/approve", methods)
+        self.assertIn("plan/execute", methods)
+        self.assertIn("attachment/import", methods)
+        self.assertIn("attachment/preview/open", methods)
+        self.assertIn("turn/resume", methods)
+        self.assertIn("turn/input/enqueue", methods)
+        self.assertIn("turn/input/prioritize", methods)
+        self.assertIn("model/test", methods)
+        self.assertIn("turn/change-set/read", methods)
+        self.assertNotIn("turn/change-preview/open", methods)
+        self.assertNotIn("turn/change-set/commit", methods)
+        self.assertEqual(78, len(methods))
+        self.assertEqual(len(methods), len(set(methods)))
         self.assertIn("context/compaction-started", params["capabilities"]["events"])
         self.assertIn("context/compaction-failed", params["capabilities"]["events"])
         self.assertIn("thread/metadata-changed", params["capabilities"]["events"])
+        self.assertIn("task/activity", params["capabilities"]["events"])
+        self.assertIn("goal/changed", params["capabilities"]["events"])
+        self.assertIn("goal/activity", params["capabilities"]["events"])
+        self.assertIn("goal/input-requested", params["capabilities"]["events"])
+        self.assertNotIn("turn/change-preview-updated", params["capabilities"]["events"])
+        self.assertEqual(["default", "plan"], params["capabilities"]["collaborationModes"])
+        self.assertEqual(
+            ["task_threads_v1", "plan_goal_v1"],
+            params["capabilities"]["features"],
+        )
         self.assertEqual(["approval_required", "full_access"], params["capabilities"]["accessModes"])
+        self.assertEqual(golden_params["capabilities"], params["capabilities"])
+        self.assertEqual(golden_params["limits"], params["limits"])
+
+    def test_initialize_identity_requires_current_product_version(self) -> None:
+        """真实 Native 门从根版本源校验 Kernel 身份，避免过期 sidecar 通过启动级探针。"""
+
+        result = {"runtime": {"engine": "ja-kernel", "engineVersion": "0.1.0"}}
+        self.assertIs(result, SMOKE.require_initialize_identity(result, SMOKE.EXPECTED_ENGINE_VERSION))
+        with self.assertRaisesRegex(RuntimeError, "expected Kernel engine version"):
+            SMOKE.require_initialize_identity(
+                {"runtime": {"engine": "ja-kernel", "engineVersion": "2.0.0"}},
+                SMOKE.EXPECTED_ENGINE_VERSION,
+            )
 
     def test_workspace_and_thread_use_cwd_without_client_identity(self) -> None:
         """Requires Java to assign workspaceId instead of accepting a client-computed identity."""
 
         workspace = Path(tempfile.gettempdir()) / "ja-合同-workspace"
         opened = SMOKE.workspace_open_frame(workspace)["params"]
+        trusted = SMOKE.workspace_trust_frame("ws_demo")["params"]
         created = SMOKE.thread_create_frame(workspace)["params"]
         self.assertEqual({"cwd", "displayName"}, set(opened))
+        self.assertEqual({"workspaceId": "ws_demo", "trust": "trusted"}, trusted)
         self.assertEqual(
-            {"cwd", "title", "providerId", "modelId", "reasoningEffort", "accessMode"},
+            {
+                "cwd", "title", "providerId", "modelId", "reasoningLevel", "accessMode",
+                "collaborationMode",
+            },
             set(created),
         )
+        self.assertEqual("default", created["collaborationMode"])
+        self.assertNotIn("reasoningEffort", created)
         self.assertNotIn("workspaceId", created)
         self.assertNotIn("configRevision", created)
         self.assertNotIn("profileId", created)
+
+    def test_lifecycle_probes_can_create_an_isolated_thread(self) -> None:
+        """EOF 探针必须使用独立请求与 Thread，避免继承取消探针的 Tool 结果。"""
+
+        workspace = Path(tempfile.gettempdir()) / "ja-isolated-probe-workspace"
+        frame = SMOKE.thread_create_frame(
+            workspace,
+            frame_id="c:eof-thread",
+            title="Native stdin EOF smoke",
+        )
+        self.assertEqual("c:eof-thread", frame["id"])
+        self.assertEqual("Native stdin EOF smoke", frame["params"]["title"])
+        self.assertEqual(str(workspace.resolve()), frame["params"]["cwd"])
 
     def test_sidecar_command_is_the_exact_current_cli(self) -> None:
         """Locks the four directory arguments accepted by the single App Server composition graph."""
@@ -88,25 +167,78 @@ class NativeSmokeV2Test(unittest.TestCase):
         )
         self.assertEqual(6, len(command))
 
-    def test_emitted_requests_validate_against_the_current_v2_schema(self) -> None:
+    def test_emitted_requests_validate_against_the_current_v1_schema(self) -> None:
         """Checks the authoritative schema directly so handler-aligned builders cannot drift silently."""
 
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         frames = [
             SMOKE.initialize_frame(),
             SMOKE.workspace_open_frame(Path(tempfile.gettempdir()) / "ja-合同-workspace"),
+            SMOKE.workspace_trust_frame("ws_demo"),
             SMOKE.thread_create_frame(Path(tempfile.gettempdir()) / "ja-合同-workspace"),
+            SMOKE.thread_rename_frame("thr_demo", 1),
             SMOKE.configuration_replace_frame("cfg_missing"),
             SMOKE.turn_start_frame("thr_demo", "current content contract"),
-            SMOKE.skill_list_frame(),
+            SMOKE.skill_list_frame("ws_demo"),
             SMOKE.health_read_frame(),
             SMOKE.shutdown_frame(),
         ]
         for frame in frames:
             jsonschema.Draft202012Validator(schema).validate(frame)
 
-    def test_loopback_provider_serves_current_responses_token_count(self) -> None:
-        """Locks the official input_tokens route needed before every production model send."""
+    def test_loopback_configuration_document_is_exact_v1(self) -> None:
+        """Locks the production smoke fixture to v1 and rejects every removed configuration field."""
+
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        frame = SMOKE.configuration_replace_frame(
+            "cfg_missing",
+            "http://127.0.0.1:41001/v1",
+            "http://127.0.0.1:41002/mcp",
+        )
+        jsonschema.Draft202012Validator(schema).validate(frame)
+
+        document = frame["params"]["document"]
+        provider = document["providers"][0]
+        model = provider["models"][0]
+        self.assertEqual(1, document["schema_version"])
+        self.assertEqual({"context", "turn_limits"}, set(provider["agent_defaults"]))
+        self.assertEqual(
+            {"context_window_tokens", "max_output_tokens"},
+            set(model["capabilities"]),
+        )
+        self.assertEqual({}, model["reasoning_level_map"])
+        self.assertIsNone(model["default_reasoning_level"])
+        encoded = json.dumps(document, sort_keys=True)
+        for removed_field in (
+            "default_reasoning_effort",
+            "reasoning_efforts",
+            "input_modalities",
+            "skill_ids",
+            "mcp_ids",
+        ):
+            self.assertNotIn(removed_field, encoded)
+
+    def test_workspace_skill_fixture_matches_configured_identity(self) -> None:
+        """Keeps Native Skill coverage on a real workspace package after bundled Skills were removed."""
+
+        with tempfile.TemporaryDirectory(prefix="ja-native-skill-test-") as parent:
+            workspace = Path(parent) / "workspace"
+            workspace.mkdir()
+            document = SMOKE.write_workspace_skill(workspace)
+            content = document.read_text(encoding="utf-8")
+            configured = SMOKE.configuration_document(
+                "http://127.0.0.1:41001/v1",
+                "http://127.0.0.1:41002/mcp",
+            )["skills"][0]
+
+            self.assertEqual(workspace / ".agents" / "skills" / SMOKE.SKILL_NAME / "SKILL.md", document)
+            self.assertIn(f"name: {SMOKE.SKILL_NAME}\n", content)
+            self.assertIn(f"description: {SMOKE.SKILL_DESCRIPTION}.\n", content)
+            self.assertEqual(SMOKE.SKILL_NAME, configured["name"])
+        self.assertEqual("project", configured["scope"])
+
+    def test_loopback_provider_rejects_retired_responses_token_count(self) -> None:
+        """Keeps the retired count route absent so a production preflight call breaks the smoke."""
 
         provider = SMOKE.LoopbackProvider()
         try:
@@ -118,24 +250,59 @@ class NativeSmokeV2Test(unittest.TestCase):
                 headers={"Content-Type": "application/json"},
             )
             response = connection.getresponse()
-            self.assertEqual(200, response.status)
-            self.assertEqual({"input_tokens": 5}, json.loads(response.read()))
+            self.assertEqual(11, response.version)
+            self.assertEqual(404, response.status)
+            response.read()
+            self.assertEqual(0, provider.request_count)
             connection.close()
         finally:
             provider.close()
 
+    def test_known_context_usage_requires_exact_durable_provider_accounting(self) -> None:
+        """Reject unknown or mis-correlated Usage before Native smoke can report persistence success."""
+
+        usage = {
+            "turnId": "turn_expected",
+            "modelRound": 1,
+            "purpose": "assistant",
+            "certainty": "known",
+            "inputTokens": 5,
+            "outputTokens": 5,
+            "totalTokens": 10,
+            "measuredAt": "2026-09-02T00:00:00Z",
+        }
+        self.assertEqual(
+            usage,
+            SMOKE.require_known_context_usage({"contextUsage": usage}, "turn_expected"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "exact persisted Provider Usage"):
+            SMOKE.require_known_context_usage(
+                {"contextUsage": {**usage, "certainty": "unknown", "inputTokens": None}},
+                "turn_expected",
+            )
+        with self.assertRaisesRegex(RuntimeError, "exact persisted Provider Usage"):
+            SMOKE.require_known_context_usage({"contextUsage": usage}, "turn_other")
+
     @unittest.skipIf(shutil.which("node") is None, "Node.js is required for the mock sidecar")
     def test_mock_sidecar_exercises_four_unicode_roots_and_cleans_temp_home(self) -> None:
-        """Runs the real parser/correlation client against a no-network child and checks cleanup."""
+        """复制当前 v1 mock 到临时目录，验证四个 Unicode 根目录与受控清理。"""
 
         node = Path(shutil.which("node") or "")
-        with tempfile.TemporaryDirectory(prefix="ja-native-smoke-test-") as parent:
+        with tempfile.TemporaryDirectory(prefix="ja-native-fixture-") as fixture_parent, \
+                tempfile.TemporaryDirectory(prefix="ja-native-smoke-test-") as parent:
+            fixture_source = FIXTURE.read_text(encoding="utf-8")
+            runtime_fixture = Path(fixture_parent) / FIXTURE.name
+            runtime_fixture.write_text(
+                fixture_source,
+                encoding="utf-8",
+                newline="\n",
+            )
             identity = SMOKE.executable_identity(node)
             report = SMOKE.run_smoke(
                 node,
                 Path(parent),
                 15.0,
-                [str(FIXTURE)],
+                [str(runtime_fixture)],
                 identity["sha256"],
                 identity["sizeBytes"],
                 identity["mtimeNs"],
@@ -152,6 +319,7 @@ class NativeSmokeV2Test(unittest.TestCase):
             self.assertEqual("blocked", report["subgates"]["okhttpSse"]["status"])
             self.assertEqual("blocked", report["subgates"]["mcp"]["status"])
             self.assertEqual("blocked", report["subgates"]["shellCancellation"]["status"])
+            self.assertEqual("blocked", report["subgates"]["shellStdinEof"]["status"])
             self.assertEqual(
                 SMOKE.REQUIRED_SUBGATES,
                 tuple(report["requiredSubgates"]["required"]),
@@ -248,6 +416,48 @@ class NativeSmokeV2Test(unittest.TestCase):
         """锁定 Tool 只提交 PowerShell 7 命令文本，不在参数中选择或猜测可执行文件。"""
 
         self.assertEqual("Start-Sleep -Seconds 30", SMOKE.SHELL_COMMAND)
+        self.assertNotEqual(SMOKE.SHELL_CANCEL_CALL_ID, SMOKE.SHELL_STDIN_EOF_CALL_ID)
+
+    def test_loopback_provider_requires_advertised_shell_capability(self) -> None:
+        """自动标题可包含相同用户文本，但没有 Tool 能力时不得被夹具误路由为 Shell。"""
+
+        server = SMOKE.LoopbackProvider()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server.server_port, timeout=1.0)
+        try:
+            title_request = json.dumps({
+                "input": [{"role": "user", "content": "stdin EOF"}],
+                "tools": [],
+            }).encode("utf-8")
+            connection.request(
+                "POST",
+                "/v1/responses",
+                body=title_request,
+                headers={"Content-Type": "application/json"},
+            )
+            title_response = connection.getresponse()
+            title_stream = title_response.read().decode("utf-8")
+            self.assertEqual(200, title_response.status)
+            self.assertIn(SMOKE.SMOKE_TEXT, title_stream)
+            self.assertNotIn(SMOKE.SHELL_STDIN_EOF_CALL_ID, title_stream)
+
+            tool_request = json.dumps({
+                "input": [{"role": "user", "content": "stdin EOF"}],
+                "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+            }).encode("utf-8")
+            connection.request(
+                "POST",
+                "/v1/responses",
+                body=tool_request,
+                headers={"Content-Type": "application/json"},
+            )
+            tool_response = connection.getresponse()
+            tool_stream = tool_response.read().decode("utf-8")
+            self.assertEqual(200, tool_response.status)
+            self.assertIn(SMOKE.SHELL_STDIN_EOF_CALL_ID, tool_stream)
+            self.assertIn("JA_NATIVE_STDIN_EOF", tool_stream)
+        finally:
+            connection.close()
+            server.close()
 
     def test_terminal_failure_label_excludes_message(self) -> None:
         """Allows stable diagnosis without copying provider or Tool failure text into smoke evidence."""

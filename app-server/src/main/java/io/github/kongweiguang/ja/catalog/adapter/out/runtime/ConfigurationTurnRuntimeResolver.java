@@ -11,34 +11,53 @@ import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.BuiltInTools;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
+import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
 import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
+import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
+import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
+import io.github.kongweiguang.ja.conversation.port.out.AgentCapability;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSession;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSessionFactory;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
+import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.RuntimeLease;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
+import io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.conversation.port.out.TurnToolSessionFactory;
+import io.github.kongweiguang.ja.foundation.json.JsonArray;
+import io.github.kongweiguang.ja.foundation.json.JsonNull;
+import io.github.kongweiguang.ja.foundation.json.JsonObject;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
+import io.github.kongweiguang.ja.foundation.json.JsonValue;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.Optional;
 import java.util.Comparator;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 
 /**
- * 从同一配置代际冻结 Provider、Skill、MCP 与预算，供 TurnService 原子接管。
+ * 在每次 Provider 请求安全点解析 Provider、MCP、Skills 与预算，并交接短生命周运行时。
  */
 public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolver {
     private final ConfigurationGenerationPort configurations;
@@ -51,6 +70,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     private final GenerationTurnMcpSessionFactory mcpSessions;
     private final AgentPromptSessionFactory promptSessions;
     private final ManagedAttachmentReader attachments;
+    private final AgentCapabilityCatalog capabilities;
+    private final TaskCapabilityCeilingPort taskCeilings;
 
     /**
      * 注入窄端口和无状态适配器，Resolver 本身不读取配置文件或持有 secret。
@@ -64,7 +85,9 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             GenerationCatalog generationCatalog,
             GenerationTurnMcpSessionFactory mcpSessions,
             AgentPromptSessionFactory promptSessions,
-            ManagedAttachmentReader attachments) {
+            ManagedAttachmentReader attachments,
+            AgentCapabilityCatalog capabilities,
+            TaskCapabilityCeilingPort taskCeilings) {
         this.configurations = Objects.requireNonNull(configurations, "configurations");
         this.skills = Objects.requireNonNull(skills, "skills");
         this.agentsSkillRoot = Objects.requireNonNull(agentsSkillRoot, "agentsSkillRoot")
@@ -77,6 +100,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         this.mcpSessions = Objects.requireNonNull(mcpSessions, "mcpSessions");
         this.promptSessions = Objects.requireNonNull(promptSessions, "promptSessions");
         this.attachments = Objects.requireNonNull(attachments, "attachments");
+        this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
+        this.taskCeilings = Objects.requireNonNull(taskCeilings, "taskCeilings");
     }
 
     /**
@@ -87,6 +112,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     @SuppressWarnings("PMD.CloseResource")
     public RuntimeLease resolve(TurnRuntimeRequest request) {
         Objects.requireNonNull(request, "request");
+        Optional<JsonObject> inheritedCeiling = taskCeilings.read(request.threadId());
         ConfigurationGenerationPort.Lease lease = configurations.acquire(request.workspaceRoot());
         boolean transferred = false;
         try {
@@ -98,25 +124,49 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             TurnLimits limits = limits(request, provider, selectedModel);
             ModelPort.ModelConfiguration model = model(
                     provider, selectedModel, request.reasoningLevel(), lease, limits.maxOutputTokens());
-            SkillCatalog.SkillSnapshot skillSnapshot = skillSnapshot(
-                    request.workspaceRoot(), lease);
+            SkillResolution availableSkills = skillCatalog(request.workspaceRoot(), lease);
+            SkillResolution skillResolution = restrictSkills(availableSkills, inheritedCeiling);
             ContextBudget contextBudget = contextBudget(
                     selectedModel.capabilities(), provider.agentDefaults().context());
+            AccessMode resolvedAccessMode = accessMode(request.accessMode(), lease.snapshot().accessMode());
+            ThreadPreferences requestPreferences = new ThreadPreferences(provider.providerId(), selectedModel.modelId(),
+                    request.reasoningLevel(), resolvedAccessMode, request.collaborationMode(),
+                    ThreadPreferences.TitleSource.MANUAL);
+            Instant requestDeadline = request.requestedAt().plus(limits.wallTimeout());
+            AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities = capabilities.prepare(
+                    new AgentCapability.Request(request.threadId(), request.turnId(), request.workspaceRoot(),
+                            request.workspaceId(), requestPreferences, lease.generationId(), requestDeadline,
+                            request.origin()));
             AgentPromptSession promptSession = promptSessions.open(new AgentPromptSessionFactory.SessionRequest(
                     request.threadId(), request.workspaceRoot(), jaHome, lease.snapshot().trusted(),
-                    shellCapability.executionEnvironment(request.workspaceRoot()), contextBudget, skills, skillSnapshot));
+                    promptEnvironment(request, preparedCapabilities), contextBudget, skills,
+                    skillResolution.catalog(), skillResolution.skillNamesById()));
             List<AgentTool> builtInTools = BuiltInTools.create(
-                    request.workspaceRoot(), skills, skillSnapshot, shellCapability, promptSession,
+                    request.workspaceRoot(), skills, skillResolution.catalog(), shellCapability, promptSession,
                     attachments).snapshot();
-            TurnToolSessionFactory toolSessions = toolSessions(
-                    new TurnMcpSessionFactory.Context(provider.providerId(), selectedModel.modelId(),
-                            request.workspaceRoot(),
-                            request.requestedAt().plus(limits.wallTimeout())), lease);
+            TurnMcpSessionFactory.Context toolContext = new TurnMcpSessionFactory.Context(
+                    provider.providerId(), selectedModel.modelId(), request.workspaceRoot(),
+                    requestDeadline);
+            GenerationTurnMcpSessionFactory.CatalogSnapshot mcpCatalog =
+                    mcpSessions.catalog(toolContext, lease);
+            String catalogDigest = toolCatalogDigest(builtInTools, preparedCapabilities.toolContributions(),
+                    mcpCatalog.snapshot(), mcpCatalog.routeIdentities());
+            validateInheritedCeiling(inheritedCeiling, requestPreferences, catalogDigest,
+                    mcpCatalog.snapshot().revision());
+            AgentCapability.CatalogIdentity catalogIdentity = new AgentCapability.CatalogIdentity(
+                    catalogDigest, mcpCatalog.snapshot().revision(), skillResolution.skillNamesById().keySet());
+            AgentCapability.Binding capabilityBinding = preparedCapabilities.bind(catalogIdentity);
+            List<AgentTool> requestTools = new ArrayList<>(builtInTools.size() + capabilityBinding.tools().size());
+            requestTools.addAll(builtInTools);
+            requestTools.addAll(capabilityBinding.tools());
+            TurnToolSessionFactory toolSessions = toolSessions(mcpCatalog);
             ToolProjectionLimits outputLimits = new ToolProjectionLimits(20_000, 20_000);
             RuntimeLease runtimeLease = new RuntimeLease(lease.generationId(), model,
-                    accessMode(request.accessMode(), lease.snapshot().accessMode()), limits,
-                    builtInTools, toolSessions, outputLimits, promptSession, attachments,
-                    presentationSecrets(provider, lease.snapshot(), lease, model.apiKey()), lease);
+                    resolvedAccessMode, request.collaborationMode(), limits,
+                    List.copyOf(requestTools), toolSessions, outputLimits, promptSession, attachments,
+                    presentationSecrets(lease.snapshot(), lease, model.apiKey()),
+                    catalogDigest, promptSession.currentRevision(),
+                    request.reasoningLevel(), lease);
             transferred = true;
             return runtimeLease;
         } finally {
@@ -126,12 +176,224 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         }
     }
 
+    /** 能力说明来自同一次 prepare 并自然进入 Prompt revision；Tool 安全身份由独立目录摘要负责。 */
+    private String promptEnvironment(
+            TurnRuntimeRequest request, AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities) {
+        String environment = shellCapability.executionEnvironment(request.workspaceRoot());
+        String fragment = preparedCapabilities.promptFragment();
+        return fragment.isBlank() ? environment : environment + "\n\n" + fragment;
+    }
+
+    /** Child 只能看见 seed 允许的 Skill ID；配置新增 Skill 不会扩大已创建任务的能力。 */
+    static SkillResolution restrictSkills(SkillResolution current, Optional<JsonObject> ceiling) {
+        if (ceiling.isEmpty()) return current;
+        JsonObject inherited = ceiling.orElseThrow();
+        if ("task_access_v1".equals(ceilingVersion(inherited))) {
+            accessCeiling(inherited);
+            return current;
+        }
+        Set<String> allowed = ceilingSkillIds(inherited);
+        Map<String, String> names = current.skillNamesById().entrySet().stream()
+                .filter(entry -> allowed.contains(entry.getKey()))
+                .collect(java.util.stream.Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
+        List<SkillCatalog.SkillDescriptor> descriptors = current.catalog().skills().stream()
+                .filter(item -> names.containsValue(item.name())).toList();
+        return new SkillResolution(new SkillCatalog.Catalog(descriptors), names);
+    }
+
+    /** Skill 允许集合是严格 v1 ceiling 的必填字段，缺失、重复或类型错误均拒绝恢复。 */
+    private static Set<String> ceilingSkillIds(JsonObject ceiling) {
+        if (!(ceiling.get("version") instanceof JsonText version)
+                || !"task_capability_v1".equals(version.value())
+                || !(ceiling.get("skillIds") instanceof JsonArray values)) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+        }
+        Set<String> ids = new LinkedHashSet<>();
+        for (JsonValue value : values.values()) {
+            if (!(value instanceof JsonText text) || text.value().isBlank() || !ids.add(text.value())) {
+                throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+            }
+        }
+        return Set.copyOf(ids);
+    }
+
+    /** 模型与 Tool/MCP 身份必须保持父上限；AccessMode 与 Skill 只可收窄，配置代际仅用于审计。 */
+    static void validateInheritedCeiling(Optional<JsonObject> inherited,
+                                         ThreadPreferences current, String toolDigest, String mcpRevision) {
+        if (inherited.isEmpty()) return;
+        JsonObject ceiling = inherited.orElseThrow();
+        if ("task_access_v1".equals(ceilingVersion(ceiling))) {
+            AccessMode allowed = accessCeiling(ceiling);
+            if (allowed == AccessMode.APPROVAL_REQUIRED
+                    && current.accessMode() != AccessMode.APPROVAL_REQUIRED) {
+                throw new TurnRuntimeResolver.RuntimeMismatchException("Task access exceeds its parent ceiling");
+            }
+            return;
+        }
+        Set<String> fields = Set.of("version", "providerId", "modelId", "reasoningLevel", "accessMode",
+                "collaborationMode", "configGeneration", "toolCatalogDigest", "mcpCatalogRevision", "skillIds");
+        if (!ceiling.members().keySet().equals(fields)) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+        }
+        requireCeilingText(ceiling, "version", "task_capability_v1");
+        JsonValue access = ceiling.get("accessMode");
+        if (!(access instanceof JsonText text)
+                || !("approval_required".equals(text.value()) || "full_access".equals(text.value()))) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+        }
+        if ("approval_required".equals(text.value()) && current.accessMode() != AccessMode.APPROVAL_REQUIRED) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task access exceeds its parent ceiling");
+        }
+        requireCeilingText(ceiling, "collaborationMode",
+                current.collaborationMode().name().toLowerCase(java.util.Locale.ROOT));
+        requireCeilingText(ceiling, "providerId", current.providerId());
+        requireCeilingText(ceiling, "modelId", current.modelId());
+        if (!(ceiling.get("configGeneration") instanceof JsonText generation)
+                || generation.value().isBlank()) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+        }
+        JsonValue reasoning = ceiling.get("reasoningLevel");
+        if (!(reasoning instanceof JsonText) && !(reasoning instanceof JsonNull)) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+        }
+        String expectedReasoning = reasoning instanceof JsonText value ? value.value() : null;
+        if (!Objects.equals(expectedReasoning, current.reasoningLevel())) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task reasoning changed from its parent ceiling");
+        }
+        requireCeilingText(ceiling, "toolCatalogDigest", toolDigest);
+        requireCeilingText(ceiling, "mcpCatalogRevision", mcpRevision);
+        ceilingSkillIds(ceiling);
+    }
+
+    /** Ceiling 版本必须显式属于当前闭集，未知版本不会降级为 access-only 或忽略约束。 */
+    private static String ceilingVersion(JsonObject ceiling) {
+        if (!(ceiling.get("version") instanceof JsonText version)
+                || !("task_access_v1".equals(version.value())
+                || "task_capability_v1".equals(version.value()))) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is invalid");
+        }
+        return version.value();
+    }
+
+    /** Side Task 的 v1 上限严格只允许版本与 AccessMode，当前 Turn 只能保持或收窄。 */
+    private static AccessMode accessCeiling(JsonObject ceiling) {
+        if (!ceiling.members().keySet().equals(Set.of("version", "accessMode"))) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task access ceiling is invalid");
+        }
+        requireCeilingText(ceiling, "version", "task_access_v1");
+        JsonValue access = ceiling.get("accessMode");
+        if (!(access instanceof JsonText text)
+                || !("approval_required".equals(text.value()) || "full_access".equals(text.value()))) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task access ceiling is invalid");
+        }
+        return "approval_required".equals(text.value())
+                ? AccessMode.APPROVAL_REQUIRED : AccessMode.FULL_ACCESS;
+    }
+
+    /** 不透明身份按精确值比较；同名 Tool 或 MCP 在 route 变化后也不能静默复用。 */
+    private static void requireCeilingText(JsonObject ceiling, String field, String actual) {
+        if (!(ceiling.get(field) instanceof JsonText expected) || !expected.value().equals(actual)) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling changed: " + field);
+        }
+    }
+
     /**
-     * 冻结当前 Turn 真正可触达的 Provider、MCP 配置与进程环境敏感值；排序后先替换长值，
+     * 在物化能力 Tool 前汇总模型可见的完整安全目录并拒绝跨来源重名；目录摘要直接覆盖每个 Tool 的
+     * Schema、副作用、工作区可观察性与固定路由，不借能力 catalog hash 间接代表这些事实。
+     */
+    static String toolCatalogDigest(
+            List<AgentTool> builtInTools,
+            List<AgentCapability.ToolContribution> capabilityTools,
+            McpGateway.McpSnapshot mcpSnapshot,
+            Map<String, McpGateway.RouteIdentity> mcpRoutes) {
+        Objects.requireNonNull(builtInTools, "builtInTools");
+        Objects.requireNonNull(capabilityTools, "capabilityTools");
+        Objects.requireNonNull(mcpSnapshot, "mcpSnapshot");
+        Map<String, McpGateway.RouteIdentity> routes = Map.copyOf(
+                Objects.requireNonNull(mcpRoutes, "mcpRoutes"));
+        if (routes.size() != mcpSnapshot.tools().size()) {
+            throw new IllegalArgumentException("MCP route identities do not match catalog tools");
+        }
+        List<ToolCatalogEntry> entries = new ArrayList<>(
+                builtInTools.size() + capabilityTools.size() + mcpSnapshot.tools().size());
+        builtInTools.forEach(tool -> entries.add(new ToolCatalogEntry(
+                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.bindingDescriptor())));
+        capabilityTools.forEach(tool -> entries.add(new ToolCatalogEntry(
+                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.bindingDescriptor())));
+        for (McpGateway.McpTool tool : mcpSnapshot.tools()) {
+            McpGateway.RouteIdentity route = Objects.requireNonNull(
+                    routes.get(tool.spec().name()), "MCP route identity");
+            if (!tool.spec().name().equals(route.localName())
+                    || !tool.serverId().equals(route.serverId())
+                    || !mcpSnapshot.revision().equals(route.catalogRevision())) {
+                throw new IllegalArgumentException("MCP route identity does not match catalog snapshot");
+            }
+            AgentTool.ToolBindingDescriptor descriptor = new AgentTool.ToolBindingDescriptor(
+                    AgentTool.RouteKind.MCP, route.localName(), route.serverId(), route.remoteName(),
+                    route.schemaHash(), route.routeHash());
+            entries.add(new ToolCatalogEntry(tool.spec(),
+                    ToolSideEffect.EXTERNAL,
+                    AgentTool.WorkspaceMutationMode.UNOBSERVABLE, descriptor));
+        }
+        Set<String> names = new HashSet<>();
+        for (ToolCatalogEntry entry : entries) {
+            if (!names.add(entry.spec().name())) {
+                throw new IllegalArgumentException("duplicate_tool_name: " + entry.spec().name());
+            }
+        }
+        StringBuilder canonical = new StringBuilder();
+        appendToken(canonical, 'v', "tool_catalog_v2");
+        entries.stream().sorted(Comparator.comparing(entry -> entry.spec().name())).forEach(entry -> {
+            ToolSpec spec = entry.spec();
+            AgentTool.ToolBindingDescriptor descriptor = entry.bindingDescriptor();
+            appendToken(canonical, 'n', spec.name());
+            appendToken(canonical, 'd', spec.description());
+            appendToken(canonical, 's', AgentTool.canonicalSchema(spec.inputSchema()));
+            appendToken(canonical, 'e', entry.sideEffect().name());
+            appendToken(canonical, 'w', entry.workspaceMutationMode().name());
+            appendToken(canonical, 'k', descriptor.routeKind().name());
+            appendToken(canonical, 'l', descriptor.localName());
+            appendToken(canonical, 'i', descriptor.serverId());
+            appendToken(canonical, 'r', descriptor.remoteName());
+            appendToken(canonical, 'h', descriptor.schemaHash());
+            appendToken(canonical, 'b', descriptor.routeHash());
+        });
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
+    /** 统一三类 Tool 的目录投影，摘要与重名检查不需要提前创建可执行适配器。 */
+    private record ToolCatalogEntry(
+            ToolSpec spec,
+            ToolSideEffect sideEffect,
+            AgentTool.WorkspaceMutationMode workspaceMutationMode,
+            AgentTool.ToolBindingDescriptor bindingDescriptor) {
+        /** 目录项拒绝空安全字段，避免摘要阶段把不完整声明降级为默认值。 */
+        private ToolCatalogEntry {
+            Objects.requireNonNull(spec, "spec");
+            Objects.requireNonNull(sideEffect, "sideEffect");
+            Objects.requireNonNull(workspaceMutationMode, "workspaceMutationMode");
+            Objects.requireNonNull(bindingDescriptor, "bindingDescriptor");
+            if (!spec.name().equals(bindingDescriptor.localName())) {
+                throw new IllegalArgumentException("Tool binding name does not match catalog entry");
+            }
+        }
+    }
+
+    /** 长度前缀让相邻字段不可产生拼接歧义，内容无需依赖某个 JSON 库的转义或 Map 配置。 */
+    private static void appendToken(StringBuilder target, char type, String value) {
+        target.append(type).append(value.length()).append(':').append(value);
+    }
+
+    /**
+     * 捕获当前请求真正可触达的 Provider、MCP 配置与进程环境敏感值；排序后先替换长值，
      * 防止一个短 Secret 提前破坏另一个长 Secret 的完整匹配。
      */
     private static List<String> presentationSecrets(
-            ConfigurationGenerationSnapshot.Provider provider,
             ConfigurationGenerationSnapshot snapshot,
             ConfigurationGenerationPort.Lease lease,
             String providerSecret) {
@@ -167,7 +429,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     }
 
     /**
-     * 预热仅持有一次短租约，并在 Schema 准备完成或失败后立即释放。
+     * Workspace 生命周期只登记配置与定义 revision；短租约结束前不得启动 MCP 或读取 Tool schema。
      */
     @Override
     public void prepareWorkspace(Path workspaceRoot) {
@@ -212,28 +474,22 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     }
 
     /**
-     * 显式穷举配置枚举并冻结模型输入模态，同时短时借用凭据；禁止通过名称或旧 Provider 别名回退。
+     * 显式穷举配置枚举并解析本次模型输入模态，同时短时借用凭据；禁止通过名称或旧 Provider 别名回退。
      */
-    private static ModelPort.ModelConfiguration model(
+    static ModelPort.ModelConfiguration model(
             ConfigurationGenerationSnapshot.Provider provider,
             ConfigurationGenerationSnapshot.Model selectedModel,
             String reasoningLevel,
             ConfigurationGenerationPort.Lease lease,
             int maxOutputTokens) {
-        ModelPort.Provider modelProvider = switch (provider.provider()) {
-            case OPENAI -> ModelPort.Provider.OPENAI;
-            case ANTHROPIC -> ModelPort.Provider.ANTHROPIC;
-        };
-        ModelPort.Api api = switch (provider.api()) {
-            case OPENAI_RESPONSES -> ModelPort.Api.OPENAI_RESPONSES;
-            case ANTHROPIC_MESSAGES -> ModelPort.Api.ANTHROPIC_MESSAGES;
-        };
-        String apiKey = provider.credentialId() == null ? "" : lease.secretFor(provider.credentialId());
-        if (provider.credentialId() != null && (apiKey == null || apiKey.isEmpty())) {
-            throw new IllegalStateException("Provider credential is unavailable");
+        ModelPort.Api api = modelApi(provider.api());
+        String apiKey = lease.secretFor(provider.credentialId());
+        if (apiKey == null || apiKey.isEmpty()) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException(
+                    "Provider credential is unavailable");
         }
         return new ModelPort.ModelConfiguration(provider.providerId(), selectedModel.modelId(),
-                lease.generationId(), modelProvider, api, selectedModel.model(), provider.baseUrl(), apiKey,
+                lease.generationId(), api, selectedModel.model(), provider.baseUrl(), apiKey,
                 provider.networkTimeouts().connectTimeout(), provider.networkTimeouts().requestTimeout(),
                 selectedModel.capabilities().inputModalities().stream()
                         .map(modality -> ModelPort.InputModality.valueOf(modality.name()))
@@ -242,47 +498,89 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                         upstreamReasoning(reasoningLevel, selectedModel)));
     }
 
+    /** 显式映射配置 API，运行时严格执行选定协议且绝不自动 fallback。 */
+    private static ModelPort.Api modelApi(ConfigurationGenerationSnapshot.Api api) {
+        return switch (api) {
+            case OPENAI_RESPONSES -> ModelPort.Api.OPENAI_RESPONSES;
+            case ANTHROPIC_MESSAGES -> ModelPort.Api.ANTHROPIC_MESSAGES;
+            case OPENAI_CHAT_COMPLETIONS -> ModelPort.Api.OPENAI_CHAT_COMPLETIONS;
+        };
+    }
+
     /**
-     * 依据冻结 Provider 的 Skill ID 选择固定 revision，缺失或禁用条目直接拒绝 Turn。
+     * 依据配置中的稳定名称选择本 Turn 可发现目录；正文直到 read 激活时才访问对应资源。
      */
-    private SkillCatalog.SkillSnapshot skillSnapshot(
+    private SkillResolution skillCatalog(
             Path workspaceRoot, ConfigurationGenerationPort.Lease lease) {
-        SkillCatalog.SnapshotRequest request = new SkillCatalog.SnapshotRequest(
+        SkillCatalog.DiscoveryRequest request = new SkillCatalog.DiscoveryRequest(
                 workspaceRoot, agentsSkillRoot, jaSkillRoot, lease.snapshot().trusted());
         List<ConfigurationGenerationSnapshot.Skill> enabled = lease.snapshot().skillDefinitions().stream()
                 .filter(ConfigurationGenerationSnapshot.Skill::enabled).toList();
         if (enabled.isEmpty()) {
             // 未授权任何 Skill 时不扫描无关目录；严格格式错误只能阻断真正选择了 Skill 的 Turn。
-            return skills.emptySnapshot();
+            return new SkillResolution(skills.emptyCatalog(), Map.of());
         }
         Set<String> allowedNames = new HashSet<>();
         for (ConfigurationGenerationSnapshot.Skill skill : enabled) {
             allowedNames.add(skill.name());
         }
-        SkillCatalog.SkillSnapshot complete = skills.snapshot(request);
-        List<String> revisions = complete.skills().stream()
+        SkillCatalog.Catalog discovered = skills.discover(request);
+        List<String> availableNames = discovered.skills().stream()
                 .filter(descriptor -> allowedNames.contains(descriptor.name()))
-                .map(SkillCatalog.SkillDescriptor::revision)
+                .map(SkillCatalog.SkillDescriptor::name)
                 .toList();
-        if (revisions.size() != allowedNames.size()) {
-            throw new IllegalStateException("Turn Skill is unavailable");
+        if (availableNames.size() != allowedNames.size()) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException(
+                    "configured Turn Skill is unavailable");
         }
-        return skills.select(complete, revisions);
+        return new SkillResolution(skills.select(discovered, availableNames),
+                skillNamesById(enabled, discovered));
     }
 
     /**
-     * 让 MCP 会话延迟到 AgentLoop 使用时打开，同时持续绑定当前配置租约。
+     * 稳定 ID 只能来自本次解析的配置代际，发现目录只证明对应名称本代际可读；两者求交后再发布，
+     * 避免用展示名称反推配置身份，也不会把未启用或未发现条目暴露给消息引用。
      */
-    private TurnToolSessionFactory toolSessions(TurnMcpSessionFactory.Context context,
-                                                ConfigurationGenerationPort.Lease lease) {
+    static Map<String, String> skillNamesById(
+            List<ConfigurationGenerationSnapshot.Skill> definitions,
+            SkillCatalog.Catalog discovered) {
+        Set<String> discoveredNames = discovered.skills().stream()
+                .map(SkillCatalog.SkillDescriptor::name)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Map<String, String> identities = new java.util.LinkedHashMap<>();
+        definitions.stream()
+                .filter(ConfigurationGenerationSnapshot.Skill::enabled)
+                .filter(skill -> discoveredNames.contains(skill.name()))
+                .forEach(skill -> identities.put(skill.skillId(), skill.name()));
+        return java.util.Collections.unmodifiableMap(identities);
+    }
+
+    /** 同步携带筛选后的目录与配置身份表，防止两个 Prompt 输入来自不同发现结果。 */
+    record SkillResolution(
+            SkillCatalog.Catalog catalog,
+            Map<String, String> skillNamesById) {
+        /** 防御性复制两项同源结果，Resolver 后续组装不能替换其中任一集合。 */
+        SkillResolution {
+            catalog = Objects.requireNonNull(catalog, "catalog");
+            skillNamesById = Map.copyOf(Objects.requireNonNull(skillNamesById, "skillNamesById"));
+        }
+    }
+
+    /**
+     * 延迟到 AgentLoop 准备 Provider 请求时 pin 同一个不透明目录句柄；通知刷新只影响下一请求。
+     */
+    private TurnToolSessionFactory toolSessions(
+            GenerationTurnMcpSessionFactory.CatalogSnapshot catalogSnapshot) {
+        Objects.requireNonNull(catalogSnapshot, "catalogSnapshot");
         return cancellation -> {
-            TurnMcpSessionFactory.Session opened = mcpSessions.open(context, lease, cancellation);
+            TurnMcpSessionFactory.Session opened = mcpSessions.open(catalogSnapshot, cancellation);
             try {
-                List<AgentTool> adapted = McpAgentTool.adapt(opened.gateway(), opened.snapshot());
+                List<AgentTool> adapted = McpAgentTool.adapt(
+                        opened.gateway(), opened.snapshot(), catalogSnapshot.routeIdentities());
                 return new TurnToolSessionFactory.Session() {
                     private boolean closed;
 
-                    /** 返回冻结的 MCP Tool；会话关闭后拒绝复用失效连接。 */
+                    /** 返回本次 Provider 请求绑定的 MCP Tool；会话关闭后拒绝复用失效连接。 */
                     @Override
                     public List<AgentTool> tools() {
                         if (closed) {
@@ -346,15 +644,21 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     private static void validateReasoning(
             String requested, ConfigurationGenerationSnapshot.Model model) {
         if (requested == null) return;
-        ConfigurationGenerationSnapshot.ReasoningLevel effort =
-                ConfigurationGenerationSnapshot.ReasoningLevel.valueOf(
-                        requested.toUpperCase(java.util.Locale.ROOT));
+        final ConfigurationGenerationSnapshot.ReasoningLevel effort;
+        try {
+            effort = ConfigurationGenerationSnapshot.ReasoningLevel.valueOf(
+                    requested.toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException invalid) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException(
+                    "reasoning level is unavailable");
+        }
         if (!model.reasoningLevelMap().containsKey(effort)) {
-            throw new IllegalArgumentException("reasoning level is unsupported");
+            throw new TurnRuntimeResolver.RuntimeMismatchException(
+                    "reasoning level is unsupported");
         }
     }
 
-    /** 在 Turn admission 将逻辑档位冻结为模型声明的上游值；null 保持 Provider 默认。 */
+    /** 将本次请求的逻辑档位解析为模型声明的上游值；null 保持 Provider 默认。 */
     private static String upstreamReasoning(
             String requested, ConfigurationGenerationSnapshot.Model model) {
         if (requested == null) return null;

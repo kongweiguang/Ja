@@ -1,7 +1,7 @@
-# @author kongweiguang
-# SPDX-License-Identifier: GPL-3.0-or-later
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 
-# JA RPC v2 三端合同 Gate
+# JA RPC v1 三端合同 Gate
 
 `run.py` 是 schema-first 的唯一入口。它固定让 Java、Rust、TypeScript production parser
 读取同一绝对路径 corpus，并在末尾输出相同 digest 与实际 frame count。不存在跳过 production
@@ -24,13 +24,27 @@ stream、redaction 与 corpus digest。上下文语料额外冻结 `thread/compa
 Token 实际下降或 unchanged 不变式、三类 Thread lifecycle、trigger/strategy 闭集和稳定错误 tuple。
 Golden 文件不含真实凭据；配置入站的 apiKey 只使用 `DUMMY_ONLY_NOT_A_SECRET`。
 
+输入队列语料冻结四个 `turn/input/*` 方法、`thread/read.inputQueue` 的 required-nullable 投影、
+两类严格事件以及 mutation 的 `{accepted,inputId,inputQueue}` 结果。独立消费者同时检查四类
+`content[]` 的固定顺序和发送门禁、Steering 前缀顺序、引用 identity 唯一性、8 条队列上限和
+524,288 bytes 紧凑 UTF-8 JSON 总预算；运行时代码不再读取旧 `text` 队列字段。
+
+Workspace 路径搜索语料冻结 `workspace/path/search` 的 Thread、Workspace、runtime generation 与
+query 回显栅栏，只允许最多 50 个相对路径和 `file/directory` 类型。独立消费者显式拒绝绝对路径
+与响应扩展字段，避免把路径搜索扩大为正文预读或 Rust 所有的 Workspace 扫描。
+
+Goal/Plan 语料冻结 17 个方法、3 个事件、8 个稳定错误、required-nullable 投影、结构化 DAG、
+精确 revision/hash 批准和证据来源闭集。Python 独立消费者必须实际读取正负 Goal corpus，逐个关联
+method-specific result，并证明缺 CAS、缺幂等键、缺 hash、Markdown draft 和不完整事件均被拒绝。
+
 Agent 过程语料同时冻结 `ToolPresentation` 的严格字段和 Secret/路径边界、四种历史文本阶段、
-Tool artifact 字符分页、Turn change-set 的 available/unavailable 判别联合、2 MiB Diff 上限以及
-独立的 UTF-8 byte 分页读取。`workspaceDirty/dirtyReason`、raw `arguments/content/value` 和
+Tool artifact 字符分页、Turn change-set 的 `complete|partial` 判别、活动预览 open/read/close、
+summary-only 更新事件、2 MiB Diff 上限以及独立的 UTF-8 byte 分页读取。`turn/change-set/commit`、
+`workspaceDirty/dirtyReason`、raw `arguments/content/value` 和
 `assistant_message` 只存在于 invalid corpus。Java/Rust probe 使用各自 production parser，
 TypeScript probe 使用 renderer 的 method/event/result parser；任何一端暂未完成 breaking 迁移时，
 完整 Gate 必须保持失败。
 
 `python_consumer.py` 另外按命名 `$defs` 消费 Agent 过程专用 transcript，直接验证新方法结果，
-并交叉检查 ChangeSet 统计、Diff SHA-256/UTF-8 byteLength、Tool 字符页和 Diff byte 页；这样
+并交叉检查 ChangeSet 统计、Tool 字符页和冻结/活动 Diff byte 页；这样
 invalid response 不会仅因为 orphan correlation 被误算成具体 DTO 已拒绝。

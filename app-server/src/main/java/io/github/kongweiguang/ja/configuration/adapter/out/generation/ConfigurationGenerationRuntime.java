@@ -72,7 +72,7 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
                 diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_PROVIDER", true));
             } else {
                 String credentialId = credentialForProvider(read.effective(), selectedProvider);
-                if (credentialId != null && !auth.contains(credentialId)) {
+                if (!auth.contains(credentialId)) {
                     diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_CREDENTIAL", true));
                 }
             }
@@ -158,14 +158,14 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
         currentGenerations.values().removeIf(candidate -> candidate == generation);
     }
 
-    /**
-     * catalogEntries 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。
-     */
+    /** 从严格 v1 文档复制显式目录；缺失或错误类型必须失败，不能降级为空目录。 */
     private static List<JsonNode> catalogEntries(JsonNode effective, String key) {
         JsonNode value = effective.get(key);
-        if (value == null || !value.isArray()) return List.of();
-        List<JsonNode> entries = new ArrayList<>(value.size());
-        for (JsonNode entry : value) entries.add(entry.deepCopy());
+        if (!(value instanceof ArrayNode array)) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "configuration catalog is invalid");
+        }
+        List<JsonNode> entries = new ArrayList<>(array.size());
+        for (JsonNode entry : array) entries.add(entry.deepCopy());
         return List.copyOf(entries);
     }
 
@@ -186,34 +186,50 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
         }
     }
 
-    /** 只返回根级默认 Provider，不按数组首项隐式选择。 */
+    /** 只返回根级显式默认 Provider；完整 v1 文档中的错误类型或悬空引用立即失败。 */
     private static String selectProvider(JsonNode document) {
         JsonNode defaultId = document.get("default_provider_id");
-        JsonNode providers = document.get("providers");
-        if (defaultId != null && defaultId.isTextual()) {
-            if (providers != null && providers.isArray()) {
-                for (JsonNode provider : providers) {
-                    if (defaultId.textValue().equals(provider.path("provider_id").asText())) {
-                        return defaultId.textValue();
-                    }
-                }
-            }
-            return null;
+        if (defaultId == null || (!defaultId.isNull() && !defaultId.isTextual())) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                    "default provider is invalid");
         }
-        return null;
+        if (defaultId.isNull()) return null;
+        JsonNode providers = document.get("providers");
+        if (!(providers instanceof ArrayNode array)) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                    "provider catalog is invalid");
+        }
+        for (JsonNode provider : array) {
+            JsonNode providerId = provider.get("provider_id");
+            if (providerId != null && providerId.isTextual()
+                && defaultId.textValue().equals(providerId.textValue())) {
+                return defaultId.textValue();
+            }
+        }
+        throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                "default provider is unavailable");
     }
 
-    /** 按稳定 Provider ID 读取 credential 引用，不扫描 Model 或显示名。 */
+    /** 按稳定 Provider ID 读取当前 v1 的必填 credential 引用，不为损坏目录返回空值。 */
     private static String credentialForProvider(JsonNode document, String providerId) {
         JsonNode providers = document.get("providers");
-        if (providers == null || !providers.isArray()) return null;
-        for (JsonNode provider : providers) {
-            if (provider.path("provider_id").asText().equals(providerId)) {
+        if (!(providers instanceof ArrayNode array)) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                    "provider catalog is invalid");
+        }
+        for (JsonNode provider : array) {
+            JsonNode identity = provider.get("provider_id");
+            if (identity != null && identity.isTextual() && identity.textValue().equals(providerId)) {
                 JsonNode credential = provider.get("credential_id");
-                return credential != null && credential.isTextual() ? credential.textValue() : null;
+                if (credential == null || !credential.isTextual() || credential.textValue().isBlank()) {
+                    throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                            "provider credential reference is invalid");
+                }
+                return credential.textValue();
             }
         }
-        return null;
+        throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                "provider credential reference is unavailable");
     }
 
     /**

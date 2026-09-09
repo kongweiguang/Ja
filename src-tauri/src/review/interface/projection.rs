@@ -59,6 +59,11 @@ pub(super) fn project_catalog(
 pub(crate) fn project_snapshot(workspace_id: &str, snapshot: ReviewSnapshot) -> ReviewSnapshotDto {
     let source = snapshot.source.clone();
     let capabilities = match source {
+        ReviewSource::Uncommitted => ReviewCapabilitiesDto {
+            stage: true,
+            unstage: true,
+            revert: true,
+        },
         ReviewSource::Unstaged => ReviewCapabilitiesDto {
             stage: true,
             unstage: false,
@@ -95,6 +100,7 @@ pub(crate) fn project_snapshot(workspace_id: &str, snapshot: ReviewSnapshot) -> 
 pub(super) fn project_file(file: &ReviewFile) -> ReviewFileDto {
     ReviewFileDto {
         file_id: file.file_id.as_str().to_owned(),
+        layer: file.layer.into(),
         path: file.path.clone(),
         old_path: file.old_path.clone(),
         status: file.status.into(),
@@ -127,6 +133,7 @@ pub(crate) fn project_file_diff(workspace_id: &str, diff: ReviewFileDiff) -> Rev
         source: diff.source.into(),
         revision: diff.revision.into_string(),
         file_id: diff.file.file_id.as_str().to_owned(),
+        layer: diff.file.layer.into(),
         path: diff.file.path.clone(),
         old_path: diff.file.old_path.clone(),
         status: diff.file.status.into(),

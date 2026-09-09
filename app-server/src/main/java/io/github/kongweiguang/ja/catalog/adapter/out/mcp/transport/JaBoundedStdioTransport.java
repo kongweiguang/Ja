@@ -57,7 +57,23 @@ public final class JaBoundedStdioTransport extends BoundedMcpTransport {
             McpJsonMapper jsonMapper,
             McpLimits limits,
             McpDeadline deadline) {
-        super(jsonMapper, protocolVersions);
+        this(command, workingDirectory, environment, protocolVersions, jsonMapper, limits, deadline, () -> {
+        });
+    }
+
+    /**
+     * 生产 Session 注入目录失效观察者；构造阶段仍不启动子进程。
+     */
+    public JaBoundedStdioTransport(
+            List<String> command,
+            java.nio.file.Path workingDirectory,
+            Map<String, String> environment,
+            List<String> protocolVersions,
+            McpJsonMapper jsonMapper,
+            McpLimits limits,
+            McpDeadline deadline,
+            Runnable toolsChanged) {
+        super(jsonMapper, protocolVersions, toolsChanged);
         this.command = List.copyOf(command);
         this.workingDirectory = Objects.requireNonNull(workingDirectory, "workingDirectory");
         this.environment = Map.copyOf(environment);
@@ -73,6 +89,8 @@ public final class JaBoundedStdioTransport extends BoundedMcpTransport {
     public Mono<Void> connect(
             Function<Mono<McpSchema.JSONRPCMessage>, Mono<McpSchema.JSONRPCMessage>> handler) {
         Objects.requireNonNull(handler, "handler");
+        Function<Mono<McpSchema.JSONRPCMessage>, Mono<McpSchema.JSONRPCMessage>> observed =
+                observeNotifications(handler);
         return Mono.fromRunnable(() -> {
             synchronized (lifecycleLock) {
                 if (closing.get() || process != null) {
@@ -95,7 +113,7 @@ public final class JaBoundedStdioTransport extends BoundedMcpTransport {
                     }
                     throw new IllegalStateException("mcp_stdio_start_failed", failure);
                 }
-                ioExecutor.execute(() -> readStdout(handler));
+                ioExecutor.execute(() -> readStdout(observed));
                 ioExecutor.execute(this::writeStdin);
                 ioExecutor.execute(this::drainStderr);
                 ioExecutor.execute(this::watchExit);

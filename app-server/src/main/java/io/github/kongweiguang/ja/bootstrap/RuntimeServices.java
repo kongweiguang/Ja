@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.bootstrap;
 
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
+import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
@@ -12,8 +13,11 @@ import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
+import io.github.kongweiguang.ja.goal.port.in.GoalUseCase;
 import io.github.kongweiguang.ja.transport.rpc.RpcServiceBindings;
+import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase;
 
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -29,13 +33,17 @@ public final class RuntimeServices implements DeadlineCloseable {
     /**
      * 固定一次连接需要的明确入站端口，避免 transport 取得 Solon 容器或 Service Locator。
      */
-    public RuntimeServices(WorkspaceUseCase workspaces, ThreadUseCase threads, TurnUseCase turns,
+    public RuntimeServices(WorkspaceUseCase workspaces, WorkspacePathSearchUseCase workspacePathSearch,
+                           ThreadUseCase threads, TurnUseCase turns,
                            ContextCompactionUseCase compactions, ApprovalBroker approvals, CatalogUseCase catalog,
-                           AttachmentUseCase attachments,
+                           AttachmentUseCase attachments, AttachmentPreviewUseCase attachmentPreviews,
+                           TaskUseCase tasks,
+                           GoalUseCase goals,
                            Consumer<ShutdownDeadline> closeAction) {
         this.closeAction = Objects.requireNonNull(closeAction, "closeAction");
         this.bindings = new RpcServiceBindings(
-                workspaces, threads, turns, compactions, approvals, catalog, attachments, this);
+                workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog,
+                attachments, attachmentPreviews, tasks, goals, this);
     }
 
     /**

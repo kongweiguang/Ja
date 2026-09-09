@@ -21,7 +21,6 @@ import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -52,7 +51,8 @@ final class OpenAiResponsesCodec {
     }
 
     /**
-     * 将稳定 Ja 请求映射为冻结的 Responses wire contract。
+     * 将稳定 Ja 请求映射为冻结的 Responses wire contract；每轮携带完整原生条目历史，避免把
+     * Tool 续传正确性交给网关侧 response 存储和 call-id 关联状态。
      */
     static ObjectNode encodeRequest(ModelPort.ModelRequest request) {
         ObjectNode root = AbstractStreamingModelAdapter.JSON.createObjectNode();
@@ -60,74 +60,15 @@ final class OpenAiResponsesCodec {
         root.put("instructions", request.prompt().systemPrompt());
         ModelPort.Continuation continuation = request.continuation();
         if (continuation != null) {
-            if (!"openai_responses".equals(continuation.protocol())) {
-                throw new IllegalArgumentException("OpenAI Responses continuation protocol is required");
-            }
-            root.put("previous_response_id", continuation.opaqueState());
-            root.set("input", continuationInput(request.messages()));
-        } else {
-            root.set("input", input(request.messages()));
+            throw new ProviderProtocolException(
+                    "REMOTE_CONTINUATION_UNSUPPORTED",
+                    "OpenAI Responses requests must carry complete native input history", false);
         }
+        root.set("input", input(request.messages()));
         applyGeneration(root, request.configuration().generation());
         OpenAiProviderSupport.applyToolsAndStreaming(root, request.tools(),
                 OpenAiResponsesCodec::tool);
         return root;
-    }
-
-    /**
-     * 只发送续接响应之后产生的 Tool 结果，因为 previous_response_id 已在 Provider 端关联更早的
-     * user、assistant 和 function-call 条目。
-     */
-    private static ArrayNode continuationInput(List<ModelMessage> messages) {
-        int assistantIndex = -1;
-        Set<String> expectedCalls = Set.of();
-        for (int index = messages.size() - 1; index >= 0; index--) {
-            ModelMessage message = messages.get(index);
-            if (message.role() != ModelRole.ASSISTANT) continue;
-            Set<String> calls = new HashSet<>();
-            for (ModelContent block : message.content()) {
-                if (block instanceof ToolCallContent call && !calls.add(call.callId())) {
-                    throw continuationFailure();
-                }
-            }
-            if (!calls.isEmpty()) {
-                assistantIndex = index;
-                expectedCalls = Set.copyOf(calls);
-                break;
-            }
-        }
-        if (assistantIndex < 0 || assistantIndex == messages.size() - 1) {
-            throw continuationFailure();
-        }
-        ArrayNode result = AbstractStreamingModelAdapter.JSON.createArrayNode();
-        Set<String> actualCalls = new HashSet<>();
-        for (int index = assistantIndex + 1; index < messages.size(); index++) {
-            ModelMessage message = messages.get(index);
-            if (message.role() != ModelRole.TOOL || message.content().isEmpty()) {
-                throw continuationFailure();
-            }
-            for (ModelContent block : message.content()) {
-                if (!(block instanceof ToolResultContent output)
-                    || !expectedCalls.contains(output.callId()) || !actualCalls.add(output.callId())) {
-                    throw continuationFailure();
-                }
-                ObjectNode item = result.addObject();
-                item.put("type", "function_call_output");
-                item.put("call_id", output.callId());
-                item.put("output", output.content());
-                if (output.error()) item.put("status", "incomplete");
-            }
-        }
-        if (!actualCalls.equals(expectedCalls)) throw continuationFailure();
-        return result;
-    }
-
-    /**
-     * 当完整历史无法证明续接后缀时，生成一条已脱敏的请求失败。
-     */
-    private static ProviderProtocolException continuationFailure() {
-        return new ProviderProtocolException(
-                "CONTINUATION_INPUT", "OpenAI continuation Tool results are invalid", false);
     }
 
     /**

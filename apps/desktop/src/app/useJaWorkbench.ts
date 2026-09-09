@@ -7,6 +7,7 @@ import {
   usePreviewLifecycleController,
   type NativePreviewPort,
   type PreviewLifecycleProjection,
+  type PreviewSessionHintStorage,
   type PreviewWorkspaceLifecycle,
 } from "@/features/workbench/preview";
 import type { TerminalWorkspaceAdapter } from "@/features/workbench/terminal";
@@ -37,9 +38,14 @@ export interface JaWorkbenchProjection {
 export function useJaWorkbench(
   project: WorkspaceProjection | undefined,
   adapters: JaWorkbenchAdapters,
+  previewSessionHints: PreviewSessionHintStorage,
   onSelectedTabChange?: (tab: WorkbenchTab) => void,
 ): JaWorkbenchProjection {
-  const preview = usePreviewLifecycleController(project?.workspaceId, adapters.preview);
+  const preview = usePreviewLifecycleController(
+    project?.workspaceId,
+    adapters.preview,
+    previewSessionHints,
+  );
 
   /** selection 只转发给 shell owner，能力组合层不保留第二份可漂移状态。 */
   const onTabChange = useCallback(

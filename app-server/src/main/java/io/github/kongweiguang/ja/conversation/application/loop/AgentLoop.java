@@ -5,13 +5,21 @@ package io.github.kongweiguang.ja.conversation.application.loop;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.application.context.ContextOrchestratorFactory;
-import io.github.kongweiguang.ja.conversation.application.middleware.MiddlewareChain;
+import io.github.kongweiguang.ja.conversation.application.observation.ExecutionObservers;
+import io.github.kongweiguang.ja.conversation.application.policy.ToolPolicyChain;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.TurnResult;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
+import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
+import io.github.kongweiguang.ja.conversation.port.out.ToolPolicy;
+import io.github.kongweiguang.ja.conversation.port.out.WorkspaceWriteClaimPort;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
+import io.github.kongweiguang.ja.conversation.port.out.ToolArgumentValidator;
+import io.github.kongweiguang.ja.conversation.port.out.GoalToolExecutionPort;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 
@@ -35,6 +43,7 @@ public final class AgentLoop implements DeadlineCloseable {
     private final AgentToolRunner toolRunner;
     private final DeltaTimerScheduler deltaTimers;
     private final AgentTurnExecution turnExecution;
+    private final TaskMailboxInbox taskMailboxInbox;
     private final Object runLifecycle = new Object();
     private final Set<ActiveRun> activeRuns = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -50,9 +59,32 @@ public final class AgentLoop implements DeadlineCloseable {
             ConversationRepository store,
             ContextOrchestratorFactory contextFactory,
             JsonValueCodec argumentsCodec,
-            MiddlewareChain middleware) {
+            ToolArgumentValidator argumentValidator,
+            List<? extends ToolPolicy> policies,
+            List<? extends ExecutionObserver> observers) {
         this(model, approvalBroker, store, contextFactory,
-                argumentsCodec, middleware, Clock.systemUTC());
+                argumentsCodec, argumentValidator, policies, observers, Clock.systemUTC());
+    }
+
+    /**
+     * 组合根在发布 Loop 前绑定 SQLite write claims；保留既有构造签名供纯 Loop 测试使用无副作用边界。
+     */
+    public void bindWorkspaceWriteClaims(WorkspaceWriteClaimPort claims, long processGeneration) {
+        toolRunner.bindWriteLeases(new WorkspaceWriteLeaseCoordinator(
+                Objects.requireNonNull(claims, "claims"), Clock.systemUTC(), processGeneration));
+    }
+
+    /** Goal Tool ledger 与既有 Runner 共用真实调用顺序，不建立第二套 Tool executor。 */
+    public void bindGoalToolExecution(GoalToolExecutionPort goalTools) {
+        toolRunner.bindGoalTools(Objects.requireNonNull(goalTools, "goalTools"));
+    }
+
+    /**
+     * 绑定 Task Mailbox 的唯一 SQLite owner；Tool Gateway 与 Loop 共享 Repository 事实，
+     * 但消息只在运行 Turn 的安全点 claim，空闲 Task 不会被此绑定主动唤醒。
+     */
+    public void bindTaskMailbox(TaskMailboxPort tasks) {
+        taskMailboxInbox.bind(Objects.requireNonNull(tasks, "tasks"));
     }
 
     /**
@@ -64,21 +96,28 @@ public final class AgentLoop implements DeadlineCloseable {
             ConversationRepository store,
             ContextOrchestratorFactory contextFactory,
             JsonValueCodec argumentsCodec,
-            MiddlewareChain middleware,
+            ToolArgumentValidator argumentValidator,
+            List<? extends ToolPolicy> policies,
+            List<? extends ExecutionObserver> observers,
             Clock clock) {
         ModelPort requiredModel = Objects.requireNonNull(model, "model");
         ConversationRepository requiredStore = Objects.requireNonNull(store, "store");
+        approvalBroker.bindDecisionStore(requiredStore::resolveApproval);
         Clock requiredClock = Objects.requireNonNull(clock, "clock");
         ContextOrchestratorFactory requiredContextFactory =
                 Objects.requireNonNull(contextFactory, "contextFactory");
         AgentContextMapper contextMapper =
                 new AgentContextMapper(Objects.requireNonNull(argumentsCodec, "argumentsCodec"));
-        MiddlewareChain requiredMiddleware = Objects.requireNonNull(middleware, "middleware");
-        AgentLoopPersistence persistence = new AgentLoopPersistence(requiredStore, requiredClock, requiredMiddleware);
+        ToolPolicyChain policyChain = new ToolPolicyChain(policies);
+        ExecutionObservers executionObservers = new ExecutionObservers(observers);
+        this.taskMailboxInbox = new TaskMailboxInbox();
+        AgentLoopPersistence persistence = new AgentLoopPersistence(
+                requiredStore, requiredClock, executionObservers, taskMailboxInbox);
         this.deltaTimers = new DeltaTimerScheduler();
         this.toolRunner =
                 new AgentToolRunner(Objects.requireNonNull(approvalBroker, "approvalBroker"),
-                        requiredClock, requiredMiddleware);
+                        requiredClock, policyChain, executionObservers,
+                        Objects.requireNonNull(argumentValidator, "argumentValidator"));
         this.turnExecution =
                 new AgentTurnExecution(
                         requiredModel,
@@ -90,7 +129,7 @@ public final class AgentLoop implements DeadlineCloseable {
                         toolRunner,
                         deltaTimers,
                         closed::get,
-                        requiredMiddleware);
+                        executionObservers);
     }
 
     /**
@@ -98,11 +137,12 @@ public final class AgentLoop implements DeadlineCloseable {
      */
     public CompletionStage<TurnResult> run(
             TurnExecutionPlan request, CancellationToken cancellation, TurnEventSink sink,
-            TerminalCoordinator terminalCoordinator) {
+            TerminalCoordinator terminalCoordinator, TurnExecutionState initialExecution) {
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(cancellation, "cancellation");
         Objects.requireNonNull(sink, "sink");
         Objects.requireNonNull(terminalCoordinator, "terminalCoordinator");
+        Objects.requireNonNull(initialExecution, "initialExecution");
         ActiveRun active;
         synchronized (runLifecycle) {
             if (closed.get())
@@ -112,7 +152,7 @@ public final class AgentLoop implements DeadlineCloseable {
         }
         try {
             return CompletableFuture.completedFuture(
-                    execute(request, cancellation, sink, terminalCoordinator));
+                    execute(request, cancellation, sink, terminalCoordinator, initialExecution));
         } catch (RuntimeException failure) {
             return CompletableFuture.failedFuture(failure);
         } finally {
@@ -195,8 +235,9 @@ public final class AgentLoop implements DeadlineCloseable {
      * 执行模型轮次；只有 STOP 轮次可以提供最终 assistant 文本。
      */
     private TurnResult execute(TurnExecutionPlan request, CancellationToken cancellation,
-                               TurnEventSink sink, TerminalCoordinator terminalCoordinator) {
-        return turnExecution.execute(request, cancellation, sink, terminalCoordinator);
+                               TurnEventSink sink, TerminalCoordinator terminalCoordinator,
+                               TurnExecutionState initialExecution) {
+        return turnExecution.execute(request, cancellation, sink, terminalCoordinator, initialExecution);
     }
 
     /**
@@ -298,13 +339,18 @@ public final class AgentLoop implements DeadlineCloseable {
         int toolCalls;
         int nextToolOrdinal;
         long nextStreamSequence = 1;
+        TurnExecutionState execution;
 
         /**
          * 从已提交快照的修订号初始化状态，后续只能随成功持久化的迁移单调前进。
          */
-        RuntimeState(long threadRevision, long turnMutationVersion) {
+        RuntimeState(long threadRevision, long turnMutationVersion, TurnExecutionState execution) {
             this.threadRevision = threadRevision;
             this.turnMutationVersion = turnMutationVersion;
+            this.execution = Objects.requireNonNull(execution, "execution");
+            this.toolCalls = execution.common().usedToolCalls();
+            this.nextToolOrdinal = execution instanceof TurnExecutionState.Tools tools
+                    ? tools.lastOrdinal() + 1 : execution.common().usedToolCalls();
         }
 
         /**
@@ -330,7 +376,7 @@ public final class AgentLoop implements DeadlineCloseable {
     /**
      * 携带稳定应用错误码的 Loop 失败，供上层在不解析异常文本的情况下映射 RPC 错误。
      */
-    static final class LoopFailure extends RuntimeException {
+    public static final class LoopFailure extends RuntimeException {
         @Serial
         private static final long serialVersionUID = 1L;
 
@@ -339,7 +385,7 @@ public final class AgentLoop implements DeadlineCloseable {
         /**
          * 将错误码与安全消息成对固定，避免后续异常包装丢失机器可读分类。
          */
-        LoopFailure(String code, String message) {
+        public LoopFailure(String code, String message) {
             super(message);
             this.code = code;
         }
@@ -347,8 +393,26 @@ public final class AgentLoop implements DeadlineCloseable {
         /**
          * 返回跨应用边界使用的稳定错误码。
          */
-        String code() {
+        public String code() {
             return code;
+        }
+    }
+
+    /** 排队输入需要用户修复时，Turn 已持久化为 SUSPENDED，服务层不得再提交失败终态。 */
+    public static final class InputNeedsAttentionException extends IllegalStateException {
+        @Serial
+        private static final long serialVersionUID = 1L;
+        private final String errorCode;
+
+        /** 只携带稳定错误码，具体修复信息由权威 InputQueue 投影提供。 */
+        InputNeedsAttentionException(String errorCode) {
+            super("queued input needs attention");
+            this.errorCode = Objects.requireNonNull(errorCode, "errorCode");
+        }
+
+        /** 返回队列问题闭集中的稳定错误码。 */
+        public String errorCode() {
+            return errorCode;
         }
     }
 

@@ -68,6 +68,19 @@ fn available_profiles_match_resolver_and_platform_closed_set() {
     }
 }
 
+/// Windows 受管 PTY 必须跳过宿主 Profile，避免用户启动脚本阻塞首屏或改变原生启动边界。
+#[cfg(windows)]
+#[test]
+fn windows_powershell_profiles_start_without_host_profile() {
+    for profile in [ShellProfile::Default, ShellProfile::PowerShell] {
+        let resolved = resolve_shell(profile).expect("Windows PowerShell profile");
+        assert_eq!(
+            resolved.args,
+            vec![OsString::from("-NoLogo"), OsString::from("-NoProfile")]
+        );
+    }
+}
+
 /// policy 只接受 canonical workspace 内的目录，验证正常子目录仍可启动。
 #[test]
 fn policy_accepts_child_directory() {

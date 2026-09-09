@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package io.github.kongweiguang.ja.conversation.application.loop;
 
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
+import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
 
@@ -10,6 +12,10 @@ import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.AttachmentSummary;
+import io.github.kongweiguang.ja.conversation.domain.UserContent;
+import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 
@@ -21,19 +27,27 @@ import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolState;
 
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
+import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
+import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSession;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.application.cancellation.DefaultCancellationCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
 import io.github.kongweiguang.ja.conversation.port.out.ModelEventSink;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
+import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
+import io.github.kongweiguang.ja.conversation.port.out.ToolArgumentValidator;
 import io.github.kongweiguang.ja.support.TestJsonValueCodec;
 import io.github.kongweiguang.ja.conversation.port.out.TurnToolSessionFactory;
 import io.github.kongweiguang.ja.support.FixedAgentPromptSession;
@@ -44,7 +58,7 @@ import io.github.kongweiguang.ja.conversation.application.context.checkpoint.Che
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
 import io.github.kongweiguang.ja.conversation.application.context.ContextOrchestratorFactory;
-import io.github.kongweiguang.ja.conversation.application.middleware.MiddlewareChain;
+import io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryDocument;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryGenerator;
 import java.net.URI;
@@ -54,16 +68,21 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Objects;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -73,11 +92,203 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
-import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.runtime;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.profile;
 
 /** Agent Loop 回归集，锁定多轮 Tool、审批、事件顺序、取消刷新与终态持久化。 */
 final class AgentLoopTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-25T12:00:00Z"), ZoneOffset.UTC);
+
+    /** Task Mailbox 必须在首次 Provider 前作为 USER message 原子注入，并让空闲外的运行 Turn 看见。 */
+    @Test
+    void consumesTaskMailboxAtProviderSafePoint() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        UserContent content = new UserContent(List.of(new TextContent("child update")));
+        TaskMailboxPort.ClaimedMessage message = new TaskMailboxPort.ClaimedMessage(
+                1, "msg_mailbox", "thr_test", "thr_parent", "thr_test", "turn_parent",
+                TaskMailboxPort.MessageKind.MESSAGE, content, "tool:turn_parent:call_send", "turn_test");
+        store.mailbox = List.of(message);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            requests.incrementAndGet();
+            assertTrue(request.messages().stream().anyMatch(value -> value.role() == ModelRole.USER
+                    && value.content().stream().anyMatch(TextContent.class::isInstance)
+                    && value.content().stream().filter(TextContent.class::isInstance)
+                    .map(TextContent.class::cast).anyMatch(text -> text.text().equals("child update"))));
+            sink.onEvent(new ModelPort.TextDelta("acknowledged"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            loop.bindTaskMailbox(taskMailbox(message));
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(1, requests.get());
+            assertTrue(store.mailboxConsumed);
+            assertEquals(List.of("hello", "child update", "acknowledged"), store.messages.stream()
+                    .map(ConversationRepository.StoredMessage::message)
+                    .flatMap(value -> value.content().stream())
+                    .filter(TextContent.class::isInstance).map(TextContent.class::cast)
+                    .map(TextContent::text).toList());
+        }
+    }
+
+    /** 只实现 claim 的 Task Repository；重复安全点返回空批次，避免测试伪造重复投递。 */
+    private static TaskMailboxPort taskMailbox(TaskMailboxPort.ClaimedMessage message) {
+        AtomicBoolean claimed = new AtomicBoolean();
+        return (targetThreadId, turnId, limit, occurredAt) -> claimed.compareAndSet(false, true)
+                ? new TaskMailboxPort.ClaimBatch(List.of(message), message.sequence())
+                : new TaskMailboxPort.ClaimBatch(List.of(), 0);
+    }
+
+    /**
+     * Provider 运行中进入的 Steering/follow-up 必须由 STOP settlement 原子承接；Steering 跨轮优先，
+     * 同类保持 FIFO，最终历史不能出现 USER 反插到产生它的 Assistant 前面。
+     */
+    @Test
+    void settlesAssistantBeforePrioritizedQueuedInputs() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger calls = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int call = calls.incrementAndGet();
+            if (call == 1) {
+                store.queue(pending("input_follow_1", ConversationRepository.InputKind.FOLLOW_UP,
+                        "follow-1", CLOCK.instant().plusSeconds(1)));
+                store.queue(pending("input_steer_1", ConversationRepository.InputKind.STEERING,
+                        "steer-1", CLOCK.instant().plusSeconds(2)));
+                store.queue(pending("input_steer_2", ConversationRepository.InputKind.STEERING,
+                        "steer-2", CLOCK.instant().plusSeconds(3)));
+                store.queue(pending("input_follow_2", ConversationRepository.InputKind.FOLLOW_UP,
+                        "follow-2", CLOCK.instant().plusSeconds(4)));
+            }
+            sink.onEvent(new ModelPort.TextDelta("assistant-" + call)).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(4, calls.get());
+            assertEquals(List.of("hello", "assistant-1", "steer-1", "steer-2", "assistant-2",
+                            "follow-1", "assistant-3", "follow-2", "assistant-4"),
+                    store.messages.stream().map(message -> text(message.message())).toList());
+        }
+    }
+
+    /**
+     * SQLite 预留仍有效但物理 blob 已不可读时，必须保留精确 FIFO 队首并挂起 Turn；
+     * 该可恢复失败不能继续消费附件，也不能被通用异常分支改写成 FAILED 终态。
+     */
+    @Test
+    void suspendsWithoutConsumingQueuedInputWhenAttachmentBlobIsUnavailable() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        ModelPort model = (request, sink, cancellation) -> {
+            store.queue(pendingAttachment("input_missing_attachment", ConversationRepository.InputKind.FOLLOW_UP,
+                    "att_missing_blob", CLOCK.instant().plusSeconds(1)));
+            sink.onEvent(new ModelPort.TextDelta("assistant-before-queue-check")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        ManagedAttachmentReader unavailable = request -> {
+            throw new ManagedAttachmentReader.ReadFailure(new IllegalStateException("private blob path"));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            CompletionException failure = assertThrows(CompletionException.class, () -> run(loop,
+                    requestWithAttachments(List.of(), mcp, unavailable), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join());
+
+            AgentLoop.InputNeedsAttentionException attention = assertInstanceOf(
+                    AgentLoop.InputNeedsAttentionException.class, failure.getCause());
+            assertEquals("ATTACHMENT_UNAVAILABLE", attention.errorCode());
+            assertEquals(TurnState.SUSPENDED, store.state);
+            assertEquals(0, store.terminalCommits);
+            assertEquals(1, store.assistantSettlementCommits);
+            assertEquals(1, store.pendingInputs.size());
+            InputQueue.QueuedInput head = store.inputQueue().items().getFirst();
+            assertEquals("input_missing_attachment", head.inputId());
+            assertEquals(InputQueue.Status.NEEDS_ATTENTION, head.status());
+            assertEquals("ATTACHMENT_UNAVAILABLE", head.issue().errorCode());
+        }
+    }
+
+    /**
+     * 前一 Assistant 已提交后因坏附件挂起时，恢复必须先消费修复后的 FOLLOW_UP 再请求 Provider；
+     * 否则会生成一条没有 USER owner 的额外回复，并把后续 fixture/真实上下文整体错位一轮。
+     */
+    @Test
+    void resumedReadyTurnConsumesRepairedFollowUpBeforeProvider() {
+        RecordingStore store = new RecordingStore();
+        store.prepareRecoveredFollowUp("repaired-follow-up");
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger calls = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            calls.incrementAndGet();
+            assertEquals("repaired-follow-up", text(request.messages().getLast()));
+            sink.onEvent(new ModelPort.TextDelta("reply-after-repair")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        TurnExecutionState.Ready initial = execution("cfg_test");
+        TurnExecutionState.Common common = new TurnExecutionState.Common(
+                1, initial.common().usedToolCalls(), initial.common().nextProviderOrdinal(),
+                initial.common().promptCheckpointId(), initial.common().activeSkills(),
+                initial.common().deadlineAt(), initial.common().origin());
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null),
+                    new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null))
+                    .toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(1, calls.get());
+            assertEquals(List.of("hello", "assistant-before-suspend", "repaired-follow-up",
+                            "reply-after-repair"),
+                    store.messages.stream().map(message -> text(message.message())).toList());
+        }
+    }
+
+    /**
+     * Tool 执行期间进入的输入只能在 ToolResultMessage 已结算后消费；Steering 先进入下一轮，
+     * follow-up 则等待该轮自然 STOP，避免任一 USER Message 越过已发生副作用的 Tool 事实。
+     */
+    @Test
+    void settlesToolResultBeforeQueuedInputs() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        TwoRoundToolModel delegate = new TwoRoundToolModel();
+        ModelPort model = (request, sink, cancellation) -> {
+            if (request.round() == 2) {
+                assertEquals(null, request.continuation(),
+                        "Tool 后消费 Steering 必须失效只接受 Tool result 的 Provider continuation");
+            }
+            return delegate.start(request, sink, cancellation);
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(new QueueingEchoTool(store)), mcp),
+                    CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
+                    .toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(List.of(ModelRole.USER, ModelRole.ASSISTANT, ModelRole.TOOL, ModelRole.USER,
+                            ModelRole.ASSISTANT, ModelRole.USER, ModelRole.ASSISTANT),
+                    store.messages.stream().map(message -> message.message().role()).toList());
+            assertEquals("steer-after-tool", text(store.messages.get(3).message()));
+            assertEquals("follow-after-tool", text(store.messages.get(5).message()));
+            assertInstanceOf(ToolResultContent.class,
+                    store.messages.get(2).message().content().getFirst());
+        }
+    }
 
     /** 执行计划进入异常或调试日志时不得借 record 默认输出泄漏用户输入或安全投影 Secret。 */
     @Test
@@ -125,6 +336,82 @@ final class AgentLoopTest {
         }
     }
 
+    /** Provider 失败必须形成可重试的模型不可用终态，不能再伪装成 Ja 内部错误。 */
+    @Test
+    void providerFailureMapsToModelUnavailableTerminal() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        ModelPort model = (request, sink, cancellation) -> CompletableFuture.failedFuture(
+                new ModelPort.ModelUnavailableException("provider request failed", null));
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("MODEL_UNAVAILABLE", result.terminal().errorCode());
+            assertEquals("model provider is unavailable", result.terminal().errorMessage());
+            assertEquals(1, store.terminalCommits);
+        }
+    }
+
+    /** 不可重试的 Provider 请求拒绝属于协议错误，不能误导用户等待服务恢复。 */
+    @Test
+    void deterministicProviderRejectionMapsToProtocolTerminal() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        ModelPort model = (request, sink, cancellation) -> CompletableFuture.failedFuture(
+                new ProviderProtocolException("HTTP_STATUS", "provider rejected request", false));
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("MODEL_PROTOCOL_ERROR", result.terminal().errorCode());
+            assertEquals("model provider rejected the request", result.terminal().errorMessage());
+            assertEquals(1, store.terminalCommits);
+        }
+    }
+
+    /** Provider 普通正文夹带 DSML 示例时必须原样完成，且不能因字面内容伪造 Tool 执行。 */
+    @Test
+    void textualDsmlToolMarkupCompletesAsOrdinaryAnswerWithoutExecutingTool() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        String answer = "说明：<｜｜DSML｜｜tool_calls>{\"name\":\"echo\"} 只是普通文本。";
+        ModelPort model = (request, sink, cancellation) -> {
+            CompletionStage<Void> accepted = CompletableFuture.completedFuture(null);
+            for (String fragment : List.of("说明：<｜", "｜DSML｜", "｜tool_calls>",
+                    "{\"name\":\"echo\"}", " 只是普通文本。")) {
+                accepted = accepted.thenCompose(ignored -> sink.onEvent(new ModelPort.TextDelta(fragment)));
+            }
+            return accepted.thenApply(ignored -> new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        List<TurnEvent> published = new ArrayList<>();
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(), event -> {
+                published.add(event);
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(null, result.terminal().errorCode());
+            assertEquals(1, store.terminalCommits);
+            assertEquals(2, store.messages.size());
+            assertEquals(answer, text(store.messages.getLast().message()));
+            assertEquals(answer, published.stream().filter(TurnEvent.TextDelta.class::isInstance)
+                    .map(TurnEvent.TextDelta.class::cast).map(TurnEvent.TextDelta::text)
+                    .collect(java.util.stream.Collectors.joining()));
+            TurnEvent.Terminal terminal = published.stream().filter(TurnEvent.Terminal.class::isInstance)
+                    .map(TurnEvent.Terminal.class::cast).findFirst().orElseThrow();
+            assertEquals(answer, terminal.finalMessage().text());
+            assertTrue(store.facts.stream().noneMatch(ConversationRepository.ToolPreparedFact.class::isInstance));
+        }
+    }
+
     /** 锁定 Tool 事实一一对应且助手 blocks 保持结构化，防止多轮转换丢失关联。 */
     @Test
     void toolFactsRemainOneToOneAndAssistantBlocksStayStructured() {
@@ -157,7 +444,315 @@ final class AgentLoopTest {
             List<ConversationRepository.Fact> toolBatch = store.commits.stream()
                     .filter(facts -> facts.stream().anyMatch(ConversationRepository.ToolResultFact.class::isInstance))
                     .findFirst().orElseThrow();
-            assertTrue(toolBatch.stream().anyMatch(ConversationRepository.ToolStartedFact.class::isInstance));
+            assertFalse(toolBatch.stream().anyMatch(ConversationRepository.ToolStartedFact.class::isInstance));
+            assertTrue(store.commits.stream().anyMatch(facts -> facts.size() == 1
+                    && facts.getFirst() instanceof ConversationRepository.ToolStartedFact));
+        }
+    }
+
+    /**
+     * 1 MiB/10,000 行写入的大参数触发自动摘要时，Loop 仍要继续下一轮 Provider，并在 Tool batch
+     * 提交后把已确认修改原子冻结到成功终态，不依赖已删除的运行期 preview 投影。
+     */
+    @Test
+    void largeMutationReceiptSurvivesCompactionAndContinuesProviderRound() {
+        String content = "JA_TURN_CHANGE_REVISION_000" + "\n".repeat(9_999)
+                + "x".repeat(1_048_576 - 27 - 9_999);
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        List<CheckpointStore.ContextCheckpoint> checkpoints = new ArrayList<>();
+        List<TurnEvent> events = new ArrayList<>();
+        List<io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent> contextEvents =
+                new ArrayList<>();
+        AtomicInteger modelRounds = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = modelRounds.incrementAndGet();
+            assertEquals(round, request.round());
+            if (round == 1) {
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_large_write", "echo", textArguments(content), 0))
+                        .toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS,
+                        new ModelPort.Continuation("test", "large-write"),
+                        new ModelUsage(1, 1, 2)));
+            }
+            assertEquals(2, round, "压缩后必须只继续一次 Provider，而不是阻塞或重放 Tool");
+            assertEquals(null, request.continuation(), "本地压缩后不得复用压缩前的 Provider continuation");
+            assertTrue(request.messages().stream().flatMap(message -> message.content().stream())
+                    .anyMatch(ToolCallContent.class::isInstance));
+            assertTrue(request.messages().stream().flatMap(message -> message.content().stream())
+                    .anyMatch(ToolResultContent.class::isInstance),
+                    "压缩后仍须成对保留当前 Tool 调用与结果，不能生成非法 Provider 历史");
+            sink.onEvent(new ModelPort.TextDelta("complete after compaction"))
+                    .toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        AgentTool tool = new EchoTool() {
+            /** 精确文本模式要求成功结果携带可信收据，禁止未知 mutator 降级掩盖本用例。 */
+            @Override public WorkspaceMutationMode workspaceMutationMode() {
+                return WorkspaceMutationMode.EXACT_TEXT;
+            }
+
+            /** 让收据正文与 Provider 发出的参数逐字一致，并携带已验证的 Workspace 相对身份。 */
+            @Override public CompletionStage<ToolResult> execute(
+                    Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
+                assertEquals(content, ((JsonText) invocation.arguments().get("text")).value());
+                return CompletableFuture.completedFuture(new ToolResult(
+                        io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome.SUCCEEDED,
+                        "ok", Optional.empty(), null,
+                        Optional.of(AgentTool.MutationReceipt.confined(
+                                context.workspaceRoot(), "large.txt", context.workspaceRoot().resolve("large.txt"),
+                                false, "", true, content))));
+            }
+        };
+
+        try (AgentLoop loop = new AgentLoop(withTokenCounting(model), new NoopApprovalBroker(), store,
+                compactingContextFactory(store, checkpoints), argumentsCodec(), argumentValidator(),
+                List.of(), List.of(), CLOCK)) {
+            TurnResult result = run(loop, largeMutationCompactingRequest(tool, mcp), CancellationToken.none(),
+                    new TurnEventSink() {
+                        /** 记录权威 Turn 事务，供 Tool batch 与终态提交顺序断言使用。 */
+                        @Override public CompletionStage<Void> publish(TurnEvent event) {
+                            events.add(event);
+                            return CompletableFuture.completedFuture(null);
+                        }
+
+                        /** 记录自动摘要生命周期，证明大 Tool 参数确实经过产品压缩链。 */
+                        @Override public CompletionStage<Void> publish(
+                                io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent event) {
+                            contextEvents.add(event);
+                            return CompletableFuture.completedFuture(null);
+                        }
+                    }).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(2, modelRounds.get());
+            assertEquals(1, checkpoints.size());
+            assertTrue(contextEvents.stream().anyMatch(
+                    io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.Compacted.class::isInstance));
+            int toolBatch = indexOfEvent(events, TurnEvent.ToolBatchCommitted.class);
+            int terminal = indexOfEvent(events, TurnEvent.Terminal.class);
+            assertTrue(toolBatch >= 0 && terminal > toolBatch);
+            TurnEvent.Terminal completed = assertInstanceOf(TurnEvent.Terminal.class, events.get(terminal));
+            assertEquals(1, completed.changeSet().stats().files());
+            assertEquals(10_000, completed.changeSet().stats().additions());
+            assertTrue(completed.changeSet().artifactId() != null);
+        }
+    }
+
+    /** 同参数只读 Tool 连续失败时仍保持完整工具目录，让模型自行恢复而不触发隐藏收口轮。 */
+    @Test
+    void repeatedReadFailuresKeepToolsAvailableUntilModelRecovers() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        RecoveringTool tool = new RecoveringTool("read", ToolSideEffect.READ_ONLY, 3);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            assertEquals(round, request.round());
+            assertEquals(List.of(tool.spec()), request.tools(), "每轮都必须保留同一 Tool schema");
+            if (round <= 4) {
+                if (round > 1) assertTrue(latestToolResult(request).error());
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_read_" + round, "read", textArguments("same"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS,
+                        new ModelPort.Continuation("test", "read-" + round), new ModelUsage(1, 1, 2)));
+            }
+            assertFalse(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("recovered"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(5, requests.get());
+            assertEquals(4, tool.executions.get());
+            assertEquals("recovered", text(store.terminal.finalMessage()));
+        }
+    }
+
+    /** EXTERNAL Tool 的显式失败也只回注模型，不擅自剥夺下一轮合法结构化调用能力。 */
+    @Test
+    void externalToolFailureCanBeCorrectedByLaterToolCall() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        RecoveringTool tool = new RecoveringTool("publish", ToolSideEffect.EXTERNAL, 1);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            assertEquals(List.of(tool.spec()), request.tools());
+            if (round <= 2) {
+                if (round == 2) assertTrue(latestToolResult(request).error());
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_publish_" + round, "publish", textArguments("same"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertFalse(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("published"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(3, requests.get());
+            assertEquals(2, tool.executions.get());
+        }
+    }
+
+    /** 持续失败只受公开的模型轮次预算约束，不再被等价参数或 Tool 副作用启发式提前截断。 */
+    @Test
+    void repeatedToolFailuresStopOnlyAtConfiguredModelRoundLimit() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        FailingReadTool tool = new FailingReadTool();
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            assertEquals(List.of(tool.spec()), request.tools());
+            if (round > 1) assertTrue(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.ToolCallReady(
+                    "call_budget_" + round, "read", textArguments("same"), 0));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, requestWithModelRoundLimit(List.of(tool), mcp, 4),
+                    CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
+                    .toCompletableFuture().join();
+
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("BUDGET_EXCEEDED", result.terminal().errorCode());
+            assertEquals(4, requests.get());
+            assertEquals(4, tool.executions.get());
+        }
+    }
+
+    /** FinishReason.STOP 不得覆盖同轮已完成的原生 Tool call，调用仍应结算一次后继续模型轮次。 */
+    @Test
+    void stopOutcomeWithToolCallExecutesStructuredCallAndContinues() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        RecoveringTool tool = new RecoveringTool("echo", ToolSideEffect.READ_ONLY, 0);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            if (round == 1) {
+                sink.onEvent(new ModelPort.ToolCallReady("call_stop", "echo", textArguments("x"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+            }
+            assertFalse(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("complete"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(2, requests.get());
+            assertEquals(1, tool.executions.get());
+        }
+    }
+
+    /** 参数校验失败必须作为 Tool error 回注，模型改正后才越过真实执行边界。 */
+    @Test
+    void invalidToolArgumentsReturnErrorAndAllowCorrectedCall() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        RequiredPathTool tool = new RequiredPathTool();
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            assertEquals(List.of(tool.spec()), request.tools());
+            if (round == 1) {
+                sink.onEvent(new ModelPort.ToolCallReady("call_invalid", "read", JsonObject.empty(), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            if (round == 2) {
+                assertTrue(latestToolResult(request).error());
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_corrected", "read", pathArguments("README.md"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertFalse(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("read complete"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(3, requests.get());
+            assertEquals(1, tool.executions.get(), "非法参数不得进入 Tool 实现");
+        }
+    }
+
+    /** unknown Tool 必须形成配对错误结果，模型下一轮改用目录中的合法 Tool 后可正常完成。 */
+    @Test
+    void unknownToolReturnsErrorAndAllowsKnownToolRecovery() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        RecoveringTool tool = new RecoveringTool("echo", ToolSideEffect.READ_ONLY, 0);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            assertEquals(List.of(tool.spec()), request.tools());
+            if (round == 1) {
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_unknown", "missing_tool", textArguments("x"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            if (round == 2) {
+                assertTrue(latestToolResult(request).error());
+                sink.onEvent(new ModelPort.ToolCallReady("call_known", "echo", textArguments("x"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertFalse(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("complete"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(3, requests.get());
+            assertEquals(1, tool.executions.get());
+            List<ConversationRepository.ToolPreparedFact> prepared = store.facts.stream()
+                    .filter(ConversationRepository.ToolPreparedFact.class::isInstance)
+                    .map(ConversationRepository.ToolPreparedFact.class::cast).toList();
+            assertEquals(2, prepared.size());
+            assertEquals("missing_tool", prepared.getFirst().toolName());
+            assertEquals(null, prepared.getFirst().binding());
+            assertTrue(prepared.getLast().binding() != null);
+            assertEquals(1, store.facts.stream()
+                    .filter(ConversationRepository.ToolStartedFact.class::isInstance).count(),
+                    "unknown Tool 不得伪造执行开始事实");
         }
     }
 
@@ -218,12 +813,166 @@ final class AgentLoopTest {
                     }).toCompletableFuture().join();
             assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
             assertEquals(1_024, tool.executions.get());
-            TurnEvent.ToolBatchCommitted batch = events.stream()
+            List<TurnEvent.ToolBatchCommitted> batches = events.stream()
                     .filter(TurnEvent.ToolBatchCommitted.class::isInstance)
                     .map(TurnEvent.ToolBatchCommitted.class::cast)
-                    .findFirst().orElseThrow();
-            assertEquals(1_024, batch.results().size());
-            assertEquals(1_023, batch.results().getLast().ordinal());
+                    .toList();
+            assertEquals(1_024, batches.size());
+            assertTrue(batches.stream().allMatch(batch -> batch.results().size() == 1));
+            assertEquals(1_023, batches.getLast().results().getFirst().ordinal());
+        }
+    }
+
+    /**
+     * 请求级配置刷新只能改变单次 Provider 窗口，不能扩大 Turn admission 已固定的累计 Tool 预算。
+     */
+    @Test
+    void requestRuntimeRefreshCannotExpandOperationToolBudget() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        SlidingWindowTool tool = new SlidingWindowTool(0);
+        TurnExecutionPlan operation = requestWithToolLimit(List.of(tool), mcp, 1);
+        TurnExecutionPlan refreshed = requestWithToolLimit(List.of(tool), mcp, 2);
+        TurnExecutionPlan dynamic = withRequestRuntime(operation,
+                (common, summary) -> new TurnExecutionPlan.RequestRuntime(
+                        refreshed, profile("provider_test", "model_test", "cfg_test"), () -> { }));
+
+        try (AgentLoop loop = loop(new BatchToolModel(2), store, mcp)) {
+            TurnResult result = run(loop, dynamic, CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("BUDGET_EXCEEDED", result.terminal().errorCode());
+            assertEquals(0, tool.executions.get());
+        }
+    }
+
+    /**
+     * 下一 Provider 安全点采用最新模型 Profile；任一等价键变化都必须丢弃上一请求 continuation。
+     */
+    @Test
+    void nextProviderRequestUsesLatestProfileAndDropsStaleContinuation() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        TurnExecutionPlan operation = request(List.of(new EchoTool()), mcp);
+        TurnExecutionPlan first = runtimeView(operation, modelConfiguration("model_first", "cfg_first"));
+        TurnExecutionPlan second = runtimeView(operation, modelConfiguration("model_second", "cfg_second"));
+        AtomicInteger opens = new AtomicInteger();
+        AtomicInteger providerCalls = new AtomicInteger();
+        List<TurnExecutionState.Common> safePoints = new ArrayList<>();
+        TurnExecutionPlan dynamic = withRequestRuntime(operation, (common, summary) -> {
+            safePoints.add(common);
+            opens.incrementAndGet();
+            TurnExecutionPlan selected = providerCalls.get() == 0 ? first : second;
+            return new TurnExecutionPlan.RequestRuntime(selected,
+                    profile("provider_test", selected.model().modelId(), selected.model().configGeneration()),
+                    () -> { });
+        });
+        ModelPort model = (request, sink, cancellation) -> {
+            int call = providerCalls.incrementAndGet();
+            if (call == 1) {
+                assertEquals("model_first", request.configuration().modelId());
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_profile", "echo", textArguments("x"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS,
+                        new ModelPort.Continuation("test", "stale"), new ModelUsage(1, 1, 2)));
+            }
+            assertEquals("model_second", request.configuration().modelId());
+            assertEquals(null, request.continuation());
+            sink.onEvent(new ModelPort.TextDelta("complete"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = new AgentLoop(withTokenCounting(model), new ImmediateSessionApproval(), store,
+                contextFactory(store), argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK)) {
+            TurnResult result = run(loop, dynamic, CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null), new TurnExecutionState.Ready(
+                            new TurnExecutionState.Common(0, 0, 1, null, List.of(), operation.deadlineAt(),
+                                    io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER),
+                            TurnExecutionState.Next.ASSISTANT, null)).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(2, providerCalls.get());
+            assertTrue(opens.get() >= providerCalls.get(), "每次 Provider dispatch 前必须至少打开一次 runtime");
+            assertTrue(safePoints.stream().anyMatch(common -> common.modelRound() == 0
+                    && common.usedToolCalls() == 0 && common.nextProviderOrdinal() == 1));
+            assertTrue(safePoints.stream().anyMatch(common -> common.modelRound() == 1
+                    && common.usedToolCalls() == 1 && common.nextProviderOrdinal() == 2));
+            assertTrue(safePoints.stream().allMatch(common -> common.deadlineAt().equals(operation.deadlineAt())));
+        }
+    }
+
+    /** 完整 Profile 未变化时必须复用上一请求 continuation，避免无意义地重建权威历史。 */
+    @Test
+    void nextProviderRequestReusesContinuationForEquivalentProfile() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        ModelPort.Continuation expected = new ModelPort.Continuation("test", "stable");
+        ModelPort model = (request, sink, cancellation) -> {
+            if (request.round() == 1) {
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_stable_profile", "echo", textArguments("x"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, expected, new ModelUsage(1, 1, 2)));
+            }
+            assertEquals(expected, request.continuation());
+            sink.onEvent(new ModelPort.TextDelta("complete"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(new EchoTool()), mcp),
+                    CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
+                    .toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+        }
+    }
+
+    /**
+     * Planning 后窗口缩小时必须在 intent 与 HTTP 之前按最新上限失败关闭；一次压缩恢复也不得
+     * 绕过新的 send ceiling，避免把本地已知越界请求交给远端 Provider 判定。
+     */
+    @Test
+    void latestContextWindowShrinkPreventsProviderDispatch() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        TurnExecutionPlan operation = request(List.of(), mcp);
+        AtomicInteger opens = new AtomicInteger();
+        AtomicInteger providerCalls = new AtomicInteger();
+        TurnExecutionPlan dynamic = withRequestRuntime(operation, (common, summary) -> {
+            ContextBudget budget = opens.getAndIncrement() == 0
+                    ? ContextBudget.capabilities(1_000_000, 8_192, true)
+                    : ContextBudget.capabilities(16, 8, true);
+            TurnExecutionPlan view = fixedPlan(operation.threadId(), operation.turnId(),
+                    operation.workspaceRoot(), operation.content(), operation.model(), operation.accessMode(),
+                    operation.limits(), operation.requestedAt(), operation.workspaceId(),
+                    operation.initialThreadRevision(), operation.initialTurnMutationVersion(),
+                    operation.initialSummary(), new FixedAgentPromptSession(budget),
+                    operation.queuedInputBoundary(), operation.attachments(), operation.tools(),
+                    operation.configRevision(), operation.toolSessions(), operation.outputLimits(),
+                    operation.presentationSecrets());
+            return new TurnExecutionPlan.RequestRuntime(view,
+                    profile("provider_test", "model_test", "cfg_test"), () -> { });
+        });
+        ModelPort model = (request, sink, cancellation) -> {
+            providerCalls.incrementAndGet();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, dynamic, CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("CONTEXT_LIMIT", result.terminal().errorCode());
+            assertEquals(0, providerCalls.get());
+            assertTrue(store.facts.stream()
+                    .filter(ConversationRepository.UsageFact.class::isInstance)
+                    .map(ConversationRepository.UsageFact.class::cast)
+                    .noneMatch(fact -> fact.certainty()
+                            == ConversationRepository.UsageCertainty.UNKNOWN));
         }
     }
 
@@ -347,7 +1096,7 @@ final class AgentLoopTest {
                     event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
             assertEquals(TurnState.CANCELLED, result.state(), () -> terminalFailure(result, store));
             assertEquals(1, store.terminalCommits);
-            assertEquals(2L, store.terminal.expectedTurnMutationVersion());
+            assertEquals(3L, store.terminal.expectedTurnMutationVersion());
         }
     }
 
@@ -395,14 +1144,18 @@ final class AgentLoopTest {
                     "Tool 模型步已提交的 Usage 不得在取消终态重复持久化");
             TurnEvent.Terminal terminalEvent = assertInstanceOf(
                     TurnEvent.Terminal.class, events.get(terminal));
-            assertEquals(1, terminalEvent.usage().modelRound());
-            assertEquals(2, terminalEvent.usage().usage().totalTokens());
+            TurnEvent.ModelStepCommitted modelStep = events.stream()
+                    .filter(TurnEvent.ModelStepCommitted.class::isInstance)
+                    .map(TurnEvent.ModelStepCommitted.class::cast)
+                    .findFirst().orElseThrow();
+            assertEquals(1, modelStep.usage().modelRound());
+            assertEquals(2, modelStep.usage().usage().totalTokens());
+            assertEquals(modelStep.usage(), terminalEvent.usage(),
+                    "取消终态只复用已提交请求的展示事实，不得生成新的 Usage 身份");
         }
     }
 
-    /**
-     * 锁定轮次间取消仍沿用上一轮已提交的 Usage 身份，不能在新 AgentRound 创建前提前重置计量边界。
-     */
+    /** 轮次间取消复用已提交模型步的精确 Usage 身份，终态只投影且不得再次持久化该请求。 */
     @Test
     void cancellationBetweenModelRoundsDoesNotRepeatCommittedUsage() {
         RecordingStore store = new RecordingStore();
@@ -440,7 +1193,14 @@ final class AgentLoopTest {
             assertFalse(store.terminal.facts().stream()
                     .anyMatch(ConversationRepository.UsageFact.class::isInstance));
             TurnEvent.Terminal terminal = assertInstanceOf(TurnEvent.Terminal.class, events.getLast());
-            assertEquals(1, terminal.usage().modelRound());
+            TurnEvent.ModelStepCommitted modelStep = events.stream()
+                    .filter(TurnEvent.ModelStepCommitted.class::isInstance)
+                    .map(TurnEvent.ModelStepCommitted.class::cast)
+                    .findFirst().orElseThrow();
+            assertEquals(1, modelStep.usage().modelRound());
+            assertEquals(2, modelStep.usage().usage().totalTokens());
+            assertEquals(modelStep.usage(), terminal.usage(),
+                    "轮次间取消必须复用已提交请求的精确 Usage 身份");
         }
     }
 
@@ -488,6 +1248,58 @@ final class AgentLoopTest {
         }
     }
 
+    /**
+     * WAITING_APPROVAL 被外部取消时必须先用 cancellation 专用 CAS 提交 Tool result，再提交唯一
+     * CANCELLED 终态；该回归直接锁定 Goal 暂停后下一 continuation 可重建合法 Provider 历史。
+     */
+    @Test
+    void cancellationWhileWaitingApprovalCommitsToolResultBeforeTerminal() throws Exception {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        DefaultCancellationCoordinator coordinator = new DefaultCancellationCoordinator();
+        CancellationCoordinator.CancellationScope cancellation = coordinator.open("thr_test", "turn_test");
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        ModelPort model = (request, sink, token) -> {
+            sink.onEvent(new ModelPort.ToolCallReady(
+                    "call_cancel_approval", "echo", textArguments("x"), 0));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.TOOL_CALLS,
+                    new ModelPort.Continuation("test", "cancelled-approval"),
+                    new ModelUsage(1, 1, 2)));
+        };
+
+        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
+                CLOCK, 8, 32, Duration.ofMinutes(10));
+             AgentLoop loop = new AgentLoop(withTokenCounting(model), broker, store,
+                     contextFactory(store), argumentsCodec(), argumentValidator(),
+                     List.of(), List.of(), CLOCK)) {
+            CompletableFuture<TurnResult> result = CompletableFuture.supplyAsync(() -> run(
+                    loop, protectedRequest(List.of(new EchoTool()), mcp), cancellation, event -> {
+                        events.add(event);
+                        return CompletableFuture.completedFuture(null);
+                    }).toCompletableFuture().join());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            while (broker.pendingCount() == 0 && System.nanoTime() < deadline) Thread.sleep(1);
+            assertEquals(1, broker.pendingCount());
+
+            store.claimCancellation("thr_test", "turn_test", store.committedRevision,
+                    "test cancellation", CLOCK.instant());
+            assertEquals(CancellationCoordinator.CancelOutcome.REQUESTED,
+                    coordinator.cancel("thr_test", "turn_test", "test cancellation")
+                            .toCompletableFuture().get(1, TimeUnit.SECONDS));
+            TurnResult terminal = result.get(1, TimeUnit.SECONDS);
+
+            assertEquals(TurnState.CANCELLED, terminal.state(), () -> terminalFailure(terminal, store));
+            assertTrue(store.messages.stream().flatMap(message -> message.message().content().stream())
+                    .anyMatch(ToolResultContent.class::isInstance));
+            assertTrue(indexOfEvent(events, TurnEvent.ToolBatchCommitted.class)
+                    < indexOfEvent(events, TurnEvent.Terminal.class));
+        } finally {
+            coordinator.complete("thr_test", "turn_test");
+            coordinator.close();
+        }
+    }
+
     /** 锁定终态提交失败仍关闭协调作用域且不重试副作用。 */
     @Test
     void terminalCommitFailureClosesCoordinatorWithoutRetry() {
@@ -522,7 +1334,8 @@ final class AgentLoopTest {
         ConversationRepository.CommitReceipt receipt = new ConversationRepository.CommitReceipt(2, 2);
         TurnEvent.Terminal event = new TurnEvent.Terminal(
                 new TurnEvent.Context("evt_projection_retry", "thr_test", "turn_test", 2, CLOCK.instant()),
-                TurnState.FAILED, "failed", "INTERNAL_ERROR", "failed", null, null);
+                TurnState.FAILED, "failed", "INTERNAL_ERROR", "failed",
+                new TurnEvent.FinalMessage("item_failure", "failed"), null);
 
         assertThrows(TerminalCoordinator.ProjectionFailure.class,
                 () -> coordinator.finish(() -> {
@@ -551,7 +1364,8 @@ final class AgentLoopTest {
         ConversationRepository.CommitReceipt receipt = new ConversationRepository.CommitReceipt(2, 2);
         TurnEvent.Terminal event = new TurnEvent.Terminal(
                 new TurnEvent.Context("evt_concurrent_terminal", "thr_test", "turn_test", 2,
-                        CLOCK.instant()), TurnState.FAILED, "", "INTERNAL_ERROR", "failed", null, null);
+                        CLOCK.instant()), TurnState.FAILED, "failed", "INTERNAL_ERROR", "failed",
+                new TurnEvent.FinalMessage("item_failure", "failed"), null);
 
         CompletableFuture<TerminalCoordinator.Finish> owner = CompletableFuture.supplyAsync(
                 () -> coordinator.finish(() -> {
@@ -602,7 +1416,8 @@ final class AgentLoopTest {
         List<CheckpointStore.ContextCheckpoint> checkpoints = new ArrayList<>();
         try (AgentLoop loop = new AgentLoop(withTokenCounting(new TwoRoundToolModel()),
                 new NoopApprovalBroker(), store,
-                compactingContextFactory(store, checkpoints), argumentsCodec(), new MiddlewareChain(List.of()), CLOCK)) {
+                compactingContextFactory(store, checkpoints), argumentsCodec(), argumentValidator(),
+                List.of(), List.of(), CLOCK)) {
             TurnResult result = run(loop, compactingRequest(mcp), CancellationToken.none(),
                     new io.github.kongweiguang.ja.conversation.port.in.TurnEventSink() {
                         /** 记录普通 Turn 事件以验证最终 revision 顺序。 */
@@ -648,7 +1463,8 @@ final class AgentLoopTest {
         TurnEvent.Terminal terminal = events.stream()
                 .filter(TurnEvent.Terminal.class::isInstance)
                 .map(TurnEvent.Terminal.class::cast).findFirst().orElseThrow();
-        assertEquals(2L, compacted.getFirst().context().threadRevision());
+        assertEquals(checkpoints.getFirst().sourceRevision() + 1,
+                compacted.getFirst().context().threadRevision());
         assertTrue(terminal.context().threadRevision() > compacted.getFirst().context().threadRevision());
         assertEquals(store.committedRevision, terminal.context().threadRevision());
     }
@@ -656,7 +1472,7 @@ final class AgentLoopTest {
     /** 组合真实 Agent Loop 与隔离端口假实现，保持用例集中验证编排顺序。 */
     private static AgentLoop loop(ModelPort model, RecordingStore store, TurnToolSessionFactory mcp) {
         return new AgentLoop(withTokenCounting(model), new NoopApprovalBroker(), store,
-                contextFactory(store), argumentsCodec(), new MiddlewareChain(List.of()), CLOCK);
+                contextFactory(store), argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
     }
 
     /** 为函数式模型 fake 补齐显式计量端口；计数随冻结 envelope 内容收缩，绝不回退生产实现。 */
@@ -664,7 +1480,7 @@ final class AgentLoopTest {
         return new ModelPort() {
             /** 以 fixture 字符规模产生确定性计量，使压缩与发送复用同一请求身份。 */
             @Override
-            public java.util.concurrent.CompletionStage<InputTokenCount> countInputTokens(
+            public InputTokenEstimate estimateInputTokens(
                     ModelRequest request, CancellationToken cancellationToken) {
                 long characters = request.prompt().systemPrompt().length();
                 characters = Math.addExact(characters, request.messages().toString().length());
@@ -673,7 +1489,7 @@ final class AgentLoopTest {
                     characters = Math.addExact(characters, request.continuation().opaqueState().length());
                 }
                 long tokens = Math.max(1L, Math.addExact(characters, 3L) / 4L);
-                return CompletableFuture.completedFuture(new InputTokenCount(tokens, "0".repeat(64)));
+                return new InputTokenEstimate(tokens, "0".repeat(64));
             }
 
             /** 模型事件与取消语义仍完全委托给各测试用例自己的 fake。 */
@@ -690,24 +1506,106 @@ final class AgentLoopTest {
     private static java.util.concurrent.CompletionStage<TurnResult> run(
             AgentLoop loop, TurnExecutionPlan request, CancellationToken cancellation,
             TurnEventSink sink) {
-        return loop.run(request, cancellation, sink, new TerminalCoordinator());
+        return loop.run(request, cancellation, sink, new TerminalCoordinator(), execution("cfg_test"));
+    }
+
+    /** 注入持久恢复游标，证明跨进程 READY 边界不会被默认初始状态掩盖。 */
+    private static java.util.concurrent.CompletionStage<TurnResult> run(
+            AgentLoop loop, TurnExecutionPlan request, CancellationToken cancellation,
+            TurnEventSink sink, TurnExecutionState initialExecution) {
+        return loop.run(request, cancellation, sink, new TerminalCoordinator(), initialExecution);
     }
 
     /** 构造基础执行请求，固定身份和限制以避免非目标输入漂移。 */
     private static TurnExecutionPlan request(List<AgentTool> tools, TurnToolSessionFactory toolSessions) {
-        ModelPort.ModelConfiguration model = new ModelPort.ModelConfiguration(
-                "provider_test", "model_test", "cfg_test",
-                ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, "gpt-test",
-                URI.create("https://example.invalid/v1"), "test-only", Duration.ofSeconds(5),
-                Duration.ofSeconds(30), java.util.Set.of(ModelPort.InputModality.TEXT),
-                ModelPort.GenerationOptions.defaults());
+        return request(tools, toolSessions, AccessMode.FULL_ACCESS);
+    }
+
+    /** 审批专项显式冻结保护模式，避免其它 Loop 测试依赖可选扩展绕过内核审批。 */
+    private static TurnExecutionPlan protectedRequest(
+            List<AgentTool> tools, TurnToolSessionFactory toolSessions) {
+        return request(tools, toolSessions, AccessMode.APPROVAL_REQUIRED);
+    }
+
+    /** 只有测试意图决定冻结权限模式，生产 Runner 始终执行对应内核审批语义。 */
+    private static TurnExecutionPlan request(
+            List<AgentTool> tools, TurnToolSessionFactory toolSessions, AccessMode accessMode) {
+        ModelPort.ModelConfiguration model = modelConfiguration("model_test", "cfg_test");
         ContextBudget budget = ContextBudget.capabilities(1_000_000, 8_192, true);
-        return new TurnExecutionPlan("thr_test", "turn_test", Path.of("C:/workspace"),
-                "hello", List.of(), model, AccessMode.APPROVAL_REQUIRED, TurnLimits.defaults(), CLOCK.instant(),
-                "ws_agent_loop", 0, 0, new FixedAgentPromptSession(budget), request -> {
+        return fixedPlan("thr_test", "turn_test", Path.of("C:/workspace"),
+                content("hello"), model, accessMode, TurnLimits.defaults(), CLOCK.instant(),
+                "ws_agent_loop", 0, 0, "", new FixedAgentPromptSession(budget),
+                QueuedInputBoundary.plainTextOnly(), request -> {
                     throw new AssertionError("text-only test must not read attachments");
                 }, tools, "cfg_test", toolSessions,
                 new ToolProjectionLimits(64_000, 16_000), List.of("test-only"));
+    }
+
+    /** 只替换受管附件读取端口，使队列消费测试能注入物理 blob 失败而不改变其它执行事实。 */
+    private static TurnExecutionPlan requestWithAttachments(
+            List<AgentTool> tools, TurnToolSessionFactory toolSessions, ManagedAttachmentReader attachments) {
+        TurnExecutionPlan base = request(tools, toolSessions);
+        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
+                base.model(), base.accessMode(), base.limits(), base.requestedAt(), base.workspaceId(),
+                base.initialThreadRevision(), base.initialTurnMutationVersion(), base.initialSummary(),
+                base.promptSession(), base.queuedInputBoundary(), attachments, base.tools(),
+                base.configRevision(), base.toolSessions(), base.outputLimits(), base.presentationSecrets());
+    }
+
+    /** 构造请求级模型身份；Provider adapter fake 仍可检查模型与配置代际是否在安全点切换。 */
+    private static ModelPort.ModelConfiguration modelConfiguration(String modelId, String generation) {
+        return new ModelPort.ModelConfiguration(
+                "provider_test", modelId, generation, ModelPort.Api.OPENAI_RESPONSES, modelId,
+                URI.create("https://example.invalid/v1"), "test-only", Duration.ofSeconds(5),
+                Duration.ofSeconds(30), java.util.Set.of(ModelPort.InputModality.TEXT),
+                ModelPort.GenerationOptions.defaults());
+    }
+
+    /** 复制请求级执行视图，只替换真实 Provider 模型，不改变 Operation 身份或工具目录。 */
+    private static TurnExecutionPlan runtimeView(TurnExecutionPlan source,
+                                                 ModelPort.ModelConfiguration model) {
+        return fixedPlan(source.threadId(), source.turnId(), source.workspaceRoot(), source.content(),
+                model, source.accessMode(), source.limits(), source.requestedAt(), source.workspaceId(),
+                source.initialThreadRevision(), source.initialTurnMutationVersion(), source.initialSummary(),
+                new FixedAgentPromptSession(ContextBudget.capabilities(1_000_000, 8_192, true)),
+                source.queuedInputBoundary(), source.attachments(), source.tools(), model.configGeneration(),
+                source.toolSessions(), source.outputLimits(), source.presentationSecrets());
+    }
+
+    /** 为稳定 Operation 注入每次调用都可返回不同环境的安全点 factory。 */
+    private static TurnExecutionPlan withRequestRuntime(
+            TurnExecutionPlan source, TurnExecutionPlan.RequestRuntimeFactory factory) {
+        return new TurnExecutionPlan(source.threadId(), source.turnId(), source.workspaceRoot(), source.content(),
+                source.model(), source.accessMode(), source.limits(), source.requestedAt(), source.workspaceId(),
+                source.initialThreadRevision(), source.initialTurnMutationVersion(), source.initialSummary(),
+                source.promptSession(), source.queuedInputBoundary(), source.attachments(), source.tools(),
+                source.configRevision(), source.toolSessions(), source.outputLimits(), source.presentationSecrets(),
+                source.deadlineAt(), factory);
+    }
+
+    /** 构造运行期排队输入，时间与身份均显式固定以验证优先级和稳定 FIFO。 */
+    private static ConversationRepository.PendingInput pending(
+            String inputId, ConversationRepository.InputKind kind, String text, Instant createdAt) {
+        return new ConversationRepository.PendingInput(
+                inputId, "thr_test", "turn_test", kind, content(text), createdAt);
+    }
+
+    /** 构造附件-only 排队输入，确保公开文本为空时仍经过完整消费准入。 */
+    private static ConversationRepository.PendingInput pendingAttachment(
+            String inputId, ConversationRepository.InputKind kind, String attachmentId, Instant createdAt) {
+        return new ConversationRepository.PendingInput(inputId, "thr_test", "turn_test", kind,
+                new UserContent(List.of(new AttachmentContent(attachmentId))), createdAt);
+    }
+
+    /** 测试文本也走生产结构化合同，避免旧字符串入口继续掩盖块顺序问题。 */
+    private static UserContent content(String text) {
+        return new UserContent(List.of(new TextContent(text)));
+    }
+
+    /** 提取本用例的单文本历史内容，结构化 blocks 会立即失败而不是被字符串化隐藏。 */
+    private static String text(ModelMessage message) {
+        assertEquals(1, message.content().size());
+        return assertInstanceOf(TextContent.class, message.content().getFirst()).text();
     }
 
     /**
@@ -718,21 +1616,87 @@ final class AgentLoopTest {
         TurnExecutionPlan base = request(tools, toolSessions);
         TurnLimits limits = new TurnLimits(base.limits().maxModelRounds(), maxToolCalls,
                 base.limits().maxInputTokens(), base.limits().maxOutputTokens(), base.limits().wallTimeout());
-        return new TurnExecutionPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.userInput(),
-                base.attachmentIds(), base.model(), base.accessMode(), limits, base.requestedAt(), base.workspaceId(),
-                base.initialThreadRevision(), base.initialTurnMutationVersion(), base.promptSession(), base.attachments(),
+        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
+                base.model(), base.accessMode(), limits, base.requestedAt(), base.workspaceId(),
+                base.initialThreadRevision(), base.initialTurnMutationVersion(), base.initialSummary(),
+                base.promptSession(), base.queuedInputBoundary(), base.attachments(),
                 base.tools(),
                 base.configRevision(), base.toolSessions(), base.outputLimits(), base.presentationSecrets());
+    }
+
+    /** 只收紧模型轮次，验证持续 Tool 调用最终只能由公开预算终止。 */
+    private static TurnExecutionPlan requestWithModelRoundLimit(
+            List<AgentTool> tools, TurnToolSessionFactory toolSessions, int maxModelRounds) {
+        TurnExecutionPlan base = request(tools, toolSessions);
+        TurnLimits limits = new TurnLimits(maxModelRounds, base.limits().maxToolCalls(),
+                base.limits().maxInputTokens(), base.limits().maxOutputTokens(), base.limits().wallTimeout());
+        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
+                base.model(), base.accessMode(), limits, base.requestedAt(), base.workspaceId(),
+                base.initialThreadRevision(), base.initialTurnMutationVersion(), base.initialSummary(),
+                base.promptSession(), base.queuedInputBoundary(), base.attachments(), base.tools(),
+                base.configRevision(), base.toolSessions(),
+                base.outputLimits(), base.presentationSecrets());
     }
 
     /** 构造必经压缩的执行请求，用于隔离检查点事件发布边界。 */
     private static TurnExecutionPlan compactingRequest(TurnToolSessionFactory toolSessions) {
         TurnExecutionPlan base = request(List.of(new EchoTool()), toolSessions);
-        return new TurnExecutionPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.userInput(),
-                base.attachmentIds(), base.model(), base.accessMode(), base.limits(), base.requestedAt(), base.workspaceId(),
+        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
+                base.model(), base.accessMode(), base.limits(), base.requestedAt(), base.workspaceId(),
                 base.initialThreadRevision(), base.initialTurnMutationVersion(),
-                new FixedAgentPromptSession(ContextBudget.capabilities(10_000, 1_000, true)), base.attachments(), base.tools(),
+                base.initialSummary(), new FixedAgentPromptSession(ContextBudget.capabilities(10_000, 1_000, true)),
+                base.queuedInputBoundary(), base.attachments(), base.tools(),
                 base.configRevision(), base.toolSessions(), base.outputLimits(), base.presentationSecrets());
+    }
+
+    /**
+     * 让 1 MiB Tool envelope 越过提前压缩阈值但仍低于 Provider 硬上限；该预算同时验证压缩
+     * 为后续轮次留余量，而不是用不可能容纳单个配对 Tool 事实的小窗口制造伪失败。
+     */
+    private static TurnExecutionPlan largeMutationCompactingRequest(
+            AgentTool tool, TurnToolSessionFactory toolSessions) {
+        TurnExecutionPlan base = request(List.of(tool), toolSessions);
+        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
+                base.model(), base.accessMode(), base.limits(), base.requestedAt(), base.workspaceId(),
+                base.initialThreadRevision(), base.initialTurnMutationVersion(),
+                base.initialSummary(), new FixedAgentPromptSession(
+                        ContextBudget.capabilities(300_000, 10_000, true)),
+                base.queuedInputBoundary(), base.attachments(), base.tools(),
+                base.configRevision(), base.toolSessions(), base.outputLimits(), base.presentationSecrets());
+    }
+
+    /**
+     * 纯循环测试显式注入固定请求 factory；固定行为只存在于 test source，生产计划不再接受 null
+     * factory 或隐式回退到准入环境。
+     */
+    private static TurnExecutionPlan fixedPlan(
+            String threadId, String turnId, Path workspaceRoot, UserContent content,
+            ModelPort.ModelConfiguration model, AccessMode accessMode, TurnLimits limits,
+            Instant requestedAt, String workspaceId, long initialThreadRevision,
+            long initialTurnMutationVersion, String initialSummary,
+            AgentPromptSession promptSession, QueuedInputBoundary queuedInputBoundary,
+            ManagedAttachmentReader attachments, List<AgentTool> tools, String configRevision,
+            TurnToolSessionFactory toolSessions, ToolProjectionLimits outputLimits,
+            List<String> presentationSecrets) {
+        AtomicReference<TurnExecutionPlan> holder = new AtomicReference<>();
+        TurnExecutionPlan.RequestRuntimeFactory factory = (common, summary) -> {
+            TurnExecutionPlan plan = Objects.requireNonNull(holder.get(), "fixed test plan");
+            var profile = new io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile(
+                    model.providerId(), model.modelId(),
+                    model.api().name().toLowerCase(java.util.Locale.ROOT), model.model(),
+                    model.generation().reasoningLevel(), model.generation().reasoningLevel(), accessMode,
+                    io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
+                    model.configGeneration(), plan.promptSession().currentRevision(), "0".repeat(64),
+                    Math.addExact(limits.maxInputTokens(), limits.maxOutputTokens()), limits.maxOutputTokens());
+            return new TurnExecutionPlan.RequestRuntime(plan, profile, () -> { });
+        };
+        TurnExecutionPlan plan = new TurnExecutionPlan(threadId, turnId, workspaceRoot, content,
+                model, accessMode, limits, requestedAt, workspaceId, initialThreadRevision,
+                initialTurnMutationVersion, initialSummary, promptSession, queuedInputBoundary,
+                attachments, tools, configRevision, toolSessions, outputLimits, presentationSecrets,
+                requestedAt.plus(limits.wallTimeout()), factory);
+        holder.set(plan);
+        return plan;
     }
 
     /** 构造禁止意外压缩的上下文工厂，使普通 Loop 用例快速暴露越界调用。 */
@@ -792,8 +1756,8 @@ final class AgentLoopTest {
         return new io.github.kongweiguang.ja.conversation.application.context.summary.SummaryModel() {
             /** 返回合法且确定的 Provider 计量夹具，窗口判断不读取 estimatedTokens。 */
             @Override
-            public ModelPort.InputTokenCount countInputTokens(SummaryPrompt prompt) {
-                return new ModelPort.InputTokenCount(100, "0".repeat(64));
+            public ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
+                return new ModelPort.InputTokenEstimate(100, "0".repeat(64));
             }
 
             /** 委托各用例定义完整替换摘要结果。 */
@@ -807,6 +1771,11 @@ final class AgentLoopTest {
     /** 使用真实 JSON 形状编解码 Tool 参数，避免多轮用例绕过 wire 边界。 */
     private static JsonValueCodec argumentsCodec() {
         return new TestJsonValueCodec();
+    }
+
+    /** 使用生产 Schema 引擎验证 Loop 中模型纠错闭环，避免测试绕过真实参数边界。 */
+    private static ToolArgumentValidator argumentValidator() {
+        return new NetworkntToolArgumentValidation(argumentsCodec());
     }
 
     /** 从提交记录中提取指定事实，集中校验唯一性并拒绝缺失。 */
@@ -830,6 +1799,86 @@ final class AgentLoopTest {
                 + ", message=" + result.terminal().errorMessage() + ", commits="
                 + store.commits.stream().map(commit -> commit.stream()
                         .map(fact -> fact.getClass().getSimpleName()).toList()).toList();
+    }
+
+    /** 返回稳定结构化错误的只读 Tool，用于验证错误本身不会被误当成进展。 */
+    private static final class FailingReadTool implements AgentTool {
+        private final ToolSpec spec = new ToolSpec("read", "read",
+                JsonObjects.builder().putText("type", "object").build());
+        private final AtomicInteger executions = new AtomicInteger();
+
+        /** 名称固定为 read，使模型与目录绑定相同 Tool。 */
+        @Override public ToolSpec spec() { return spec; }
+
+        /** 失败读取没有外部副作用，显式声明后才能进入有限重试策略。 */
+        @Override public ToolSideEffect sideEffect() { return ToolSideEffect.READ_ONLY; }
+
+        /** 每次都返回相同安全错误，复现模型只更换 callId 的盲重试。 */
+        @Override public CompletionStage<ToolResult> execute(
+                Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
+            executions.incrementAndGet();
+            return CompletableFuture.completedFuture(new ToolResult(
+                    io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome.FAILED,
+                    "path not found", Optional.empty(), "PATH_NOT_FOUND"));
+        }
+    }
+
+    /** 前若干次返回失败、随后成功的 Tool，用于证明 Loop 把恢复决策留给模型。 */
+    private static final class RecoveringTool implements AgentTool {
+        private final ToolSpec spec;
+        private final ToolSideEffect sideEffect;
+        private final int failuresBeforeSuccess;
+        private final AtomicInteger executions = new AtomicInteger();
+
+        /** 固定名称、副作用和恢复点，使 READ_ONLY 与 EXTERNAL 用例共享同一确定性执行边界。 */
+        private RecoveringTool(String name, ToolSideEffect sideEffect, int failuresBeforeSuccess) {
+            this.spec = new ToolSpec(name, name,
+                    JsonObjects.builder().putText("type", "object").build());
+            this.sideEffect = sideEffect;
+            this.failuresBeforeSuccess = failuresBeforeSuccess;
+        }
+
+        /** 返回模型每轮应持续看见的稳定 Schema。 */
+        @Override public ToolSpec spec() { return spec; }
+
+        /** 显式暴露副作用类别，回归两类失败都不触发隐藏的 Loop 拦截。 */
+        @Override public ToolSideEffect sideEffect() { return sideEffect; }
+
+        /** 按固定次数失败后成功，避免依赖时钟、文件系统或外部服务。 */
+        @Override public CompletionStage<ToolResult> execute(
+                Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
+            int attempt = executions.incrementAndGet();
+            if (attempt <= failuresBeforeSuccess) {
+                return CompletableFuture.completedFuture(new ToolResult(
+                        io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome.FAILED,
+                        "temporary failure", Optional.empty(), "TOOL_FAILED"));
+            }
+            return CompletableFuture.completedFuture(ToolResult.success("ok"));
+        }
+    }
+
+    /** 必填 path 的 Tool 用生产 Schema 引擎约束参数，执行次数只记录真正合法的调用。 */
+    private static final class RequiredPathTool implements AgentTool {
+        private final AtomicInteger executions = new AtomicInteger();
+        private final ToolSpec spec = new ToolSpec("read", "read",
+                JsonObjects.builder()
+                        .putText("type", "object")
+                        .put("properties", JsonObjects.builder()
+                                .put("path", JsonObjects.builder().putText("type", "string").build())
+                                .build())
+                        .put("required", new JsonArray(List.of(new JsonText("path"))))
+                        .putBoolean("additionalProperties", false)
+                        .build());
+
+        /** 返回包含必填字段的严格 Schema，使参数错误可回注给模型纠正。 */
+        @Override public ToolSpec spec() { return spec; }
+
+        /** 合法调用才进入实现，计数用于证明校验错误没有产生副作用。 */
+        @Override public CompletionStage<ToolResult> execute(
+                Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
+            executions.incrementAndGet();
+            return CompletableFuture.completedFuture(ToolResult.success("ok"));
+        }
     }
 
     /** 首轮发出 Tool、次轮返回文本的模型假实现，用于覆盖基本 Agent Loop。 */
@@ -943,6 +1992,26 @@ final class AgentLoopTest {
         /** 原样回显参数内容，使断言能追踪每次调用的精确对应关系。 */
         @Override public CompletionStage<ToolResult> execute(Invocation invocation,
                 ExecutionContext context, CancellationToken cancellationToken) {
+            return CompletableFuture.completedFuture(ToolResult.success("ok"));
+        }
+    }
+
+    /** Tool 返回前写入两类输入，确定性复现 Tool settlement 与并发 RPC 的顺序边界。 */
+    private static final class QueueingEchoTool extends EchoTool {
+        private final RecordingStore store;
+
+        /** 绑定当前 Loop 的记录存储，使排队动作发生在真实 Tool 执行窗口内。 */
+        private QueueingEchoTool(RecordingStore store) {
+            this.store = store;
+        }
+
+        /** 先排队 Steering 与 follow-up，再返回成功结果以验证 Tool 事实必须先提交。 */
+        @Override public CompletionStage<ToolResult> execute(Invocation invocation,
+                ExecutionContext context, CancellationToken cancellationToken) {
+            store.queue(pending("input_follow_after_tool", ConversationRepository.InputKind.FOLLOW_UP,
+                    "follow-after-tool", CLOCK.instant().plusSeconds(1)));
+            store.queue(pending("input_steer_after_tool", ConversationRepository.InputKind.STEERING,
+                    "steer-after-tool", CLOCK.instant().plusSeconds(2)));
             return CompletableFuture.completedFuture(ToolResult.success("ok"));
         }
     }
@@ -1071,6 +2140,21 @@ final class AgentLoopTest {
         return JsonObjects.builder().putText("text", value).build();
     }
 
+    /** 构造满足 RequiredPathTool Schema 的最小参数，集中避免测试 JSON 形状漂移。 */
+    private static JsonObject pathArguments(String value) {
+        return JsonObjects.builder().putText("path", value).build();
+    }
+
+    /** 读取最新 Tool result，确保纠错断言观察 Provider 下一轮真正收到的结构化消息。 */
+    private static ToolResultContent latestToolResult(ModelPort.ModelRequest request) {
+        return request.messages().reversed().stream()
+                .flatMap(message -> message.content().stream())
+                .filter(ToolResultContent.class::isInstance)
+                .map(ToolResultContent.class::cast)
+                .findFirst()
+                .orElseThrow();
+    }
+
     /** 读取会话授权状态的 Tool 假实现，用于证明授权发生在执行之前。 */
     private static final class GrantAwareTool extends EchoTool {
         private final AtomicInteger grants;
@@ -1179,12 +2263,35 @@ final class AgentLoopTest {
 
     /** 记录提交事实、revision 与消息的存储假实现，用于断言 Agent Loop 原子顺序。 */
     private static final class RecordingStore implements ConversationRepository {
+        private List<TaskMailboxPort.ClaimedMessage> mailbox = List.of();
+        private boolean mailboxConsumed;
+
+        /** 有配置时模拟原子 USER message 与版本推进；普通用例仍拒绝意外消费。 */
+        @Override public TaskMailboxConsumption consumeTaskMailbox(TaskMailboxCommit request) {
+            if (mailbox.isEmpty()) {
+                throw new UnsupportedOperationException("task mailbox is not configured by this test");
+            }
+            assertEquals(mailbox, request.messages());
+            assertEquals(turnMutationVersion, request.expectedTurnMutationVersion());
+            List<StoredMessage> added = new ArrayList<>();
+            for (TaskMailboxPort.ClaimedMessage value : mailbox) {
+                ModelMessage modelMessage = new ModelMessage(ModelRole.USER, List.copyOf(value.content().blocks()));
+                StoredMessage stored = new StoredMessage("item_task_" + value.messageId(), "turn_test",
+                        messages.size() + 1L, modelMessage, request.occurredAt());
+                messages.add(stored);
+                added.add(stored);
+            }
+            mailboxConsumed = true;
+            return new TaskMailboxConsumption(added, ++committedRevision, ++turnMutationVersion,
+                    request.executionState());
+        }
         private long committedRevision;
         private long turnMutationVersion;
         private boolean mcpClosed;
         private boolean mcpClosedAtTerminal;
         private TerminalCommit terminal;
         private int terminalCommits;
+        private int assistantSettlementCommits;
         private TurnState state = TurnState.QUEUED;
         private boolean cancellationClaimed;
         private long cancellationExpectedRevision = -1;
@@ -1193,6 +2300,11 @@ final class AgentLoopTest {
         private final List<List<Fact>> commits = new ArrayList<>();
         private boolean laterAdmitted;
         private final List<StoredMessage> messages;
+        private final Map<String, ToolBinding> toolBindings = new HashMap<>();
+        private final List<PendingInput> pendingInputs = new ArrayList<>();
+        private long inputQueueRevision;
+        private String attentionInputId;
+        private InputQueue.Issue attentionIssue;
 
         /** 创建空记录存储，适合不依赖 MCP 关闭顺序的基础用例。 */
         private RecordingStore() {
@@ -1225,6 +2337,59 @@ final class AgentLoopTest {
             commits.add(request.facts());
             appendMessages(request.facts());
             return new CommitReceipt(++committedRevision, ++turnMutationVersion);
+        }
+        /** 记录不消费队首的 STOP Final 结算，确保坏附件分支不退回普通 progress 提交。 */
+        @Override public CommitReceipt commitAssistantSettlement(CommitRequest request) {
+            assertEquals(turnMutationVersion, request.expectedTurnMutationVersion());
+            if (cancellationClaimed) {
+                throw new AssertionError("Assistant settlement crossed cancellation claim");
+            }
+            assistantSettlementCommits++;
+            state = request.state();
+            facts.addAll(request.facts());
+            commits.add(request.facts());
+            appendMessages(request.facts());
+            return new CommitReceipt(++committedRevision, ++turnMutationVersion);
+        }
+        /** 先记录 Assistant settlement，再在同一伪事务追加优先输入，复现生产原子边界。 */
+        @Override public Optional<InputConsumption> commitWithNextInput(CommitRequest request,
+                                                                         InputSelection selection) {
+            assertEquals(turnMutationVersion, request.expectedTurnMutationVersion());
+            PendingInput input = nextInput(InputKind.STEERING)
+                    .or(() -> nextInput(InputKind.FOLLOW_UP)).orElse(null);
+            if (input == null) return Optional.empty();
+            if (selection == null || !selection.equals(InputSelection.from(queuedInput(input)))) {
+                return Optional.empty();
+            }
+            state = request.state();
+            facts.addAll(request.facts());
+            commits.add(request.facts());
+            appendMessages(request.facts());
+            pendingInputs.remove(input);
+            ModelMessage message = new ModelMessage(ModelRole.USER, List.copyOf(input.content().blocks()));
+            messages.add(new StoredMessage("item_" + input.inputId(), input.turnId(), messages.size() + 1L,
+                    message, request.occurredAt()));
+            String userItemId = "item_" + input.inputId();
+            return Optional.of(new InputConsumption(queuedInput(input), userItemId, message,
+                    request.occurredAt(), inputQueue(), ++committedRevision, ++turnMutationVersion));
+        }
+        /** 普通轮次入口只消费指定类型的首项，保持 Steering 不会越过同类先入项。 */
+        @Override public Optional<InputConsumption> consumeInput(String threadId, String turnId,
+                                                                  InputSelection selection,
+                                                                  long expectedTurnMutationVersion,
+                                                                  Instant occurredAt,
+                                                                  TurnExecutionState executionState) {
+            assertEquals(turnMutationVersion, expectedTurnMutationVersion);
+            PendingInput input = nextInput(selection.kind()).orElse(null);
+            if (input == null) return Optional.empty();
+            if (!selection.equals(InputSelection.from(queuedInput(input)))) return Optional.empty();
+            pendingInputs.remove(input);
+            ModelMessage message = new ModelMessage(ModelRole.USER, List.copyOf(input.content().blocks()));
+            messages.add(new StoredMessage("item_" + input.inputId(), turnId, messages.size() + 1L,
+                    message, occurredAt));
+            String userItemId = "item_" + input.inputId();
+            return Optional.of(new InputConsumption(queuedInput(input), userItemId, message,
+                    occurredAt, inputQueue(), ++committedRevision, ++turnMutationVersion));
         }
         /** 只允许取消后的完整 Tool batch 推进版本，继续拒绝其它非终态事实。 */
         @Override public CommitReceipt commitCancellationToolBatch(CancellationToolBatchCommit cancellationCommit) {
@@ -1268,18 +2433,34 @@ final class AgentLoopTest {
         }
         /** 返回当前 Turn 快照，使 Loop 以持久状态恢复取消与 revision。 */
         @Override public Optional<TurnSnapshot> findTurn(String threadId, String turnId) {
-            return Optional.of(new TurnSnapshot(threadId, turnId, state, runtime(),
+            return Optional.of(new TurnSnapshot(threadId, turnId, state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, committedRevision,
                     turnMutationVersion));
         }
+        /** 只回读已经随 ToolPreparedFact 提交的冻结 binding，禁止 fake 从当前 Tool 目录补造路由。 */
+        @Override public Optional<ToolBinding> findToolBinding(String turnId, String callId) {
+            return Optional.ofNullable(toolBindings.get(callId));
+        }
+        /**
+         * 审批取消仍以持久 DENY 关闭 WAITING_APPROVAL 门并推进 CAS；取消声明不阻止该配对事务，
+         * 后续 Tool result 会通过 cancellation 专用通道继续收口。
+         */
+        @Override public synchronized boolean resolveApproval(String approvalId, ApprovalDecision decision,
+                                                               Instant resolvedAt) {
+            if (state != TurnState.WAITING_APPROVAL) return false;
+            state = TurnState.RUNNING;
+            committedRevision++;
+            turnMutationVersion++;
+            return true;
+        }
         /** 返回消息与 Turn 的一致快照，供上下文编排构造模型历史。 */
         @Override public Optional<ThreadSnapshot> readThread(String threadId) {
-            TurnSnapshot turn = new TurnSnapshot("thr_test", "turn_test", state, runtime(),
+            TurnSnapshot turn = new TurnSnapshot("thr_test", "turn_test", state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, committedRevision,
                     turnMutationVersion);
             List<TurnSnapshot> turns = new ArrayList<>(List.of(turn));
             if (laterAdmitted) {
-                turns.add(new TurnSnapshot("thr_test", "turn_later", TurnState.QUEUED, runtime(),
+                turns.add(new TurnSnapshot("thr_test", "turn_later", TurnState.QUEUED,
                         CLOCK.instant().plusSeconds(1), CLOCK.instant().plusSeconds(1), null,
                         committedRevision, 0));
             }
@@ -1298,8 +2479,81 @@ final class AgentLoopTest {
                 } else if (fact instanceof ToolResultMessageFact result) {
                     messages.add(new StoredMessage(result.messageId(), "turn_test", messages.size() + 1L,
                             result.message(), CLOCK.instant()));
+                } else if (fact instanceof ToolPreparedFact prepared && prepared.binding() != null) {
+                    toolBindings.put(prepared.callId(), prepared.binding());
                 }
             }
+        }
+
+        /** 模拟并发 RPC 在 Provider 运行期间写入 durable queue，不推进执行版本。 */
+        private void queue(PendingInput input) {
+            pendingInputs.add(input);
+            inputQueueRevision++;
+        }
+
+        /**
+         * 构造“Assistant 已提交、问题队首已修复、Turn 等待显式 Resume”的持久事实；该状态与
+         * 真窗附件恢复一致，且不伪造新的 admission 或运行 owner。
+         */
+        private void prepareRecoveredFollowUp(String text) {
+            messages.add(new StoredMessage("item_assistant_before_suspend", "turn_test", messages.size() + 1L,
+                    new ModelMessage(ModelRole.ASSISTANT,
+                            List.of(new TextContent("assistant-before-suspend"))), CLOCK.instant()));
+            queue(pending("input_repaired", InputKind.FOLLOW_UP, text, CLOCK.instant().plusSeconds(1)));
+        }
+
+        /** Fake 将 SQLite 预留视为有效，使测试单独覆盖其后的物理 blob 探测门。 */
+        @Override public boolean queuedAttachmentsAvailable(
+                String threadId, InputQueue.QueuedInput input, Instant now) {
+            return true;
+        }
+
+        /** 只修改精确 FIFO head 的修复事实并推进 Thread/Queue revision，Turn mutation 留给状态迁移。 */
+        @Override public QueueMutation markInputNeedsAttention(
+                String threadId, String turnId, InputSelection selection,
+                InputQueue.Issue issue, Instant occurredAt) {
+            PendingInput input = nextInput(selection.kind()).orElseThrow();
+            assertEquals(InputSelection.from(queuedInput(input)), selection);
+            attentionInputId = selection.inputId();
+            attentionIssue = issue;
+            InputQueue queue = inputQueue();
+            return new QueueMutation(selection.inputId(), queue, ++committedRevision, true);
+        }
+
+        /** 按生产优先级返回真实队首，使消费前校验与精确 selection CAS 在 Loop 测试中均被覆盖。 */
+        @Override public Optional<InputQueue.QueuedInput> peekInput(String turnId, InputKind kind) {
+            PendingInput input = kind == null
+                    ? nextInput(InputKind.STEERING).or(() -> nextInput(InputKind.FOLLOW_UP)).orElse(null)
+                    : nextInput(kind).orElse(null);
+            return Optional.ofNullable(input).map(this::queuedInput);
+        }
+
+        /** 按生产 SQLite rowid 的持久插入顺序选取指定类型首项，时间戳和随机 ID 不参与 FIFO。 */
+        private Optional<PendingInput> nextInput(InputKind kind) {
+            return pendingInputs.stream().filter(input -> input.kind() == kind).findFirst();
+        }
+
+        /** Fake 也返回完整权威队列，避免 Loop 测试退回已删除的局部回执。 */
+        private InputQueue inputQueue() {
+            inputQueueRevision++;
+            List<InputQueue.QueuedInput> items = java.util.stream.Stream.concat(
+                            pendingInputs.stream().filter(input -> input.kind() == InputKind.STEERING),
+                            pendingInputs.stream().filter(input -> input.kind() == InputKind.FOLLOW_UP))
+                    .map(this::queuedInput).toList();
+            return new InputQueue("turn_test", inputQueueRevision, true, items);
+        }
+
+        /** Fake 条目从结构化 content 派生同序附件摘要，并在标记后公开精确修复问题。 */
+        private InputQueue.QueuedInput queuedInput(PendingInput input) {
+            boolean needsAttention = input.inputId().equals(attentionInputId);
+            List<AttachmentSummary> attachments = input.content().attachmentIds().stream()
+                    .map(attachmentId -> new AttachmentSummary(
+                            attachmentId, "missing.png", 16, "image", "image/png"))
+                    .toList();
+            return new InputQueue.QueuedInput(input.inputId(), input.turnId(), input.content(),
+                    InputQueue.Kind.valueOf(input.kind().name()), attachments,
+                    needsAttention ? InputQueue.Status.NEEDS_ATTENTION : InputQueue.Status.PENDING,
+                    needsAttention ? attentionIssue : null, needsAttention ? 2 : 1, input.createdAt());
         }
 
         /** 在运行轮次中准入后续 Turn，专门复现同 Thread revision 前进。 */

@@ -23,10 +23,10 @@ pub(super) fn spawn_event_drain(spec: EventDrainSpec) -> Result<EventDrain, Runt
                 server_instance_id: spec.server_instance_id,
                 ready_token: spec.ready_token,
                 sink: spec.sink,
-                signal_sender: spec.signal_sender,
                 terminal_fault: spec.terminal_fault,
                 current_generation: spec.current_generation,
                 cancel_receiver,
+                task_observations: spec.task_observations,
             });
             let _ = detached_event_generation.compare_exchange(
                 generation,
@@ -71,22 +71,20 @@ pub(super) fn event_drain_loop(mut context: EventDrainContext) {
         }
         match event {
             SessionEvent::Notification(frame) => {
-                if !notification_matches_identity(&frame, &context.server_instance_id) {
+                if !notification_matches_identity(
+                    &frame,
+                    &context.server_instance_id,
+                    context.generation,
+                ) {
                     continue;
                 }
-                if let Some((thread_id, turn_id)) = terminal_turn_identity(&frame) {
-                    // terminal 必须等 frozen change-set 提交完成后再到达 React；否则最终答复会先于
-                    // 本 Turn 修改事实出现，历史恢复也可能观察到不完整终态。
-                    if !queue_turn_terminal(
-                        &context.signal_sender,
+                if frame.method() == Some("task/progress")
+                    && !task_progress_is_observed(
+                        &frame,
                         context.generation,
-                        thread_id,
-                        turn_id,
-                        frame,
-                        &context.terminal_fault,
-                    ) {
-                        break;
-                    }
+                        &context.task_observations,
+                    )
+                {
                     continue;
                 }
                 if let Err(error) = emit_frame(&context.sink, &frame) {
@@ -172,6 +170,19 @@ pub(super) fn event_drain_loop(mut context: EventDrainContext) {
     }
 }
 
+/// Progress 仅在 observation handle 仍属于当前 sidecar generation 时投影，reload 后旧帧被丢弃。
+pub(crate) fn task_progress_is_observed(
+    frame: &RpcFrame,
+    generation: u64,
+    registry: &TaskObservationRegistry,
+) -> bool {
+    frame
+        .params()
+        .and_then(|params| params.get("observationId"))
+        .and_then(Value::as_str)
+        .is_some_and(|observation_id| registry.is_active(observation_id, generation))
+}
+
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
 /// 将 child exit status 收敛为稳定且不含 secret 的诊断类别；原始 OS code 不进入 WebView 契约。
 pub(super) fn terminal_exit_reason(code: Option<i32>) -> u8 {
@@ -206,50 +217,6 @@ pub(super) fn terminal_protocol_reason(error: &CodecError) -> u8 {
 }
 
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
-/// 通过同一有界 actor lane 路由 terminal Turn identity，使 Java 关闭对应 Turn 后 pending
-/// approval 能同步退役。
-pub(super) fn queue_turn_terminal(
-    sender: &SyncSender<BridgeSignal>,
-    generation: u64,
-    thread_id: String,
-    turn_id: String,
-    frame: RpcFrame,
-    terminal_fault: &Arc<TerminalFault>,
-) -> bool {
-    match sender.try_send(BridgeSignal::TurnTerminal {
-        generation,
-        thread_id,
-        turn_id,
-        frame,
-    }) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-            terminal_fault.publish(generation, TERMINAL_SIGNAL_QUEUE);
-            false
-        }
-    }
-}
-
-/// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
-/// 从 terminal notification 只提取已验证 Turn identity，其它 event data 继续走既有 WebView
-/// 投影路径。
-pub(super) fn terminal_turn_identity(frame: &RpcFrame) -> Option<(String, String)> {
-    if frame.method() != Some("turn/terminal") {
-        return None;
-    }
-    let params = frame.params()?.as_object()?;
-    let thread_id = params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .filter(|value| value.starts_with("thr_") && valid_id(value, 128))?;
-    let turn_id = params
-        .get("turnId")
-        .and_then(Value::as_str)
-        .filter(|value| value.starts_with("turn_") && valid_id(value, 128))?;
-    Some((thread_id.to_owned(), turn_id.to_owned()))
-}
-
-/// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
 /// 在 poll 前和 emit 前各检查一次 cancellation，关闭竞态窗口。
 pub(super) fn event_is_current(
     cancel_receiver: &Receiver<()>,
@@ -270,101 +237,6 @@ pub(super) fn generation_is_current(current_generation: &AtomicU64, generation: 
 /// emit 失败只表示 renderer 暂时不可达，Rust 仍拥有健康 sidecar，不能因此销毁用户回合。
 pub(crate) fn projection_failure_is_terminal(error: &RuntimeCommandError) -> bool {
     error.code != "RUNTIME_EVENT_DELIVERY_FAILED"
-}
-
-/// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
-/// 处理异步 server request，同时禁止 stale generation 修改新 supervisor 或暴露私有 request ID。
-pub(super) fn drain_signals(
-    config: &LaunchConfig,
-    sink: &EventSink,
-    runtime: &mut Option<RunningRuntime>,
-    receiver: &Receiver<BridgeSignal>,
-    pending_turn_changes: &mut HashMap<String, TurnChangeBaseline>,
-    host_turn_workspaces: &mut HashMap<String, String>,
-    exit_control: &ExitControl,
-) {
-    while let Ok(signal) = receiver.try_recv() {
-        match signal {
-            BridgeSignal::TurnTerminal {
-                generation,
-                thread_id,
-                turn_id,
-                frame,
-            } => {
-                if runtime
-                    .as_ref()
-                    .is_some_and(|current| current.generation == generation)
-                {
-                    let commit = finish_host_turn_change(
-                        &turn_id,
-                        pending_turn_changes,
-                        host_turn_workspaces,
-                    )
-                    .map(|(workspace_id, change_set)| {
-                        commit_turn_change_set_runtime(
-                            config,
-                            runtime,
-                            &thread_id,
-                            &turn_id,
-                            &workspace_id,
-                            &change_set,
-                            exit_control,
-                        )
-                    });
-                    // 只有本 host 准入的 Turn 才能提交 change-set；恢复或其它 session 的
-                    // terminal 没有 ownership 记录，继续只投影 Java 权威事实。
-                    if let Some(commit) = commit {
-                        emit_terminal_after_change_set(sink, &frame, generation, commit);
-                    } else if emit_frame(sink, &frame).is_err() {
-                        tracing::warn!(
-                            generation,
-                            "runtime terminal event delivery failed after change-set processing"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// 从独立 host identity 账本消费 Turn；若 baseline 意外缺失或 workspace 不一致，提交显式
-/// capture_failed，不能把 `null` 或空 available 当成可靠零修改。
-pub(crate) fn finish_host_turn_change(
-    turn_id: &str,
-    pending_turn_changes: &mut HashMap<String, TurnChangeBaseline>,
-    host_turn_workspaces: &mut HashMap<String, String>,
-) -> Option<(String, TurnChangeSet)> {
-    let workspace_id = host_turn_workspaces.remove(turn_id)?;
-    let change_set = match pending_turn_changes.remove(turn_id) {
-        Some(baseline) if baseline.workspace_id() == workspace_id => baseline.finish(),
-        Some(_) | None => TurnChangeSet::unavailable(
-            crate::review::domain::TurnChangeUnavailableReason::CaptureFailed,
-        ),
-    };
-    Some((workspace_id, change_set))
-}
-
-/// Change-set commit 失败时仍投递 terminal，作为 UI 发起权威 Thread 重读的安全触发器；
-/// 失败只写稳定 code，不记录正文、路径或 RPC payload，也不盲重试可能已提交的 artifact。
-pub(crate) fn emit_terminal_after_change_set(
-    sink: &EventSink,
-    frame: &RpcFrame,
-    generation: u64,
-    commit: Result<(), RuntimeCommandError>,
-) {
-    if let Err(error) = commit {
-        tracing::warn!(
-            generation,
-            error_code = error.code,
-            "Turn change-set commit was not confirmed; terminal requires authoritative refresh"
-        );
-    }
-    if emit_frame(sink, frame).is_err() {
-        tracing::warn!(
-            generation,
-            "runtime terminal event delivery failed after change-set processing"
-        );
-    }
 }
 
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
@@ -527,14 +399,17 @@ pub(super) fn terminal_runtime(context: TerminalCleanupContext<'_>, reason: &str
 }
 
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
-/// 投影前把每个 v2 notification fence 到精确 Java 进程实例；任何 event type 都不能省略 identity，
-/// 否则重启前后的数据会混流。
-pub(crate) fn notification_matches_identity(frame: &RpcFrame, expected: &str) -> bool {
-    frame
-        .params()
-        .and_then(|params| params.get("serverInstanceId"))
-        .and_then(Value::as_str)
-        .is_some_and(|instance| instance == expected)
+/// 投影前把每个 JA-RPC 1.0 notification fence 到精确 Java 进程实例与 host generation；任一字段
+/// 缺失或漂移都代表迟到/跨代数据，必须在进入 sanitizer 与 WebView 前丢弃。
+pub(crate) fn notification_matches_identity(
+    frame: &RpcFrame,
+    expected_instance: &str,
+    expected_generation: u64,
+) -> bool {
+    frame.params().is_some_and(|params| {
+        params.get("serverInstanceId").and_then(Value::as_str) == Some(expected_instance)
+            && params.get("generation").and_then(Value::as_u64) == Some(expected_generation)
+    })
 }
 
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。

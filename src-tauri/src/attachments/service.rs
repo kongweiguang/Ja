@@ -3,6 +3,9 @@
 
 use super::error::{AttachmentIngressError, AttachmentIngressErrorCode, map_io_error};
 use super::model::{IngressAttachment, IngressLimits, IngressToken};
+use super::operation::{
+    AttachmentOperationRegistry, ItemCancellation, RetryAttempt, RetryAttemptRegistry,
+};
 use super::platform::{
     FileSnapshot, create_staging_file, open_source, prepare_ingress_root, rename_no_replace,
     require_regular_metadata, snapshot_file, snapshot_path, validate_source_path,
@@ -19,18 +22,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const TOKEN_COLLISION_RETRIES: usize = 16;
 
-/// 外置测试使用的不含路径 checkpoint；生产默认 observer 为空，且不会扩大日志/IPC 表面。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IngressCheckpoint {
-    PreflightComplete { index: usize },
-    SourceOpened { index: usize },
-    CopyComplete { index: usize },
-}
-
 #[derive(Debug)]
-struct PreflightFile {
+pub(crate) struct AdmittedAttachmentSource {
     source: PathBuf,
-    display_name: String,
+    pub(crate) display_name: String,
+    pub(crate) size_bytes: u64,
     snapshot: FileSnapshot,
 }
 
@@ -73,6 +69,8 @@ pub(crate) struct AttachmentIngress {
     root: PathBuf,
     limits: IngressLimits,
     staged: Mutex<HashMap<IngressToken, PathBuf>>,
+    operations: AttachmentOperationRegistry,
+    retry_attempts: RetryAttemptRegistry,
     closed: AtomicBool,
 }
 
@@ -92,27 +90,17 @@ impl AttachmentIngress {
             root,
             limits,
             staged: Mutex::new(HashMap::new()),
+            operations: AttachmentOperationRegistry::default(),
+            retry_attempts: RetryAttemptRegistry::default(),
             closed: AtomicBool::new(false),
         })
     }
 
-    /// dialog 取消映射为空成功；非空 batch 才执行数量、总量与安全复制。
-    pub(crate) fn stage_paths(
+    /// Channel workflow 先对整批完成数量与总量 admission，再逐项复制，避免重复添加绕过原生预算。
+    pub(crate) fn admit_paths(
         &self,
         paths: Vec<PathBuf>,
-    ) -> Result<Vec<IngressAttachment>, AttachmentIngressError> {
-        self.stage_paths_with_observer(paths, |_| {})
-    }
-
-    /// observer 只暴露 index/checkpoint，用于确定性制造 TOCTOU；绝对路径仍留在测试 closure 自身。
-    pub(crate) fn stage_paths_with_observer<F>(
-        &self,
-        paths: Vec<PathBuf>,
-        mut observer: F,
-    ) -> Result<Vec<IngressAttachment>, AttachmentIngressError>
-    where
-        F: FnMut(IngressCheckpoint),
-    {
+    ) -> Result<Vec<AdmittedAttachmentSource>, AttachmentIngressError> {
         self.require_open()?;
         verify_ingress_root(&self.root)?;
         if paths.is_empty() {
@@ -123,10 +111,9 @@ impl AttachmentIngress {
                 AttachmentIngressErrorCode::TooManyFiles,
             ));
         }
-
         let mut batch_bytes = 0_u64;
-        let mut preflight = Vec::with_capacity(paths.len());
-        for (index, source) in paths.into_iter().enumerate() {
+        let mut admitted = Vec::with_capacity(paths.len());
+        for source in paths {
             let current = self.preflight(source)?;
             batch_bytes = batch_bytes
                 .checked_add(current.snapshot.size)
@@ -138,41 +125,163 @@ impl AttachmentIngress {
                     AttachmentIngressErrorCode::BatchTooLarge,
                 ));
             }
-            preflight.push(current);
-            observer(IngressCheckpoint::PreflightComplete { index });
+            admitted.push(current);
         }
+        Ok(admitted)
+    }
 
-        let mut prepared = Vec::with_capacity(preflight.len());
-        for (index, source) in preflight.into_iter().enumerate() {
-            prepared.push(self.stage_one(source, index, &mut observer)?);
-        }
-        let mut registry = self.staged.lock().map_err(|_| {
-            AttachmentIngressError::new(AttachmentIngressErrorCode::StateUnavailable)
-        })?;
-        if self.closed.load(Ordering::Acquire) {
+    /// 已 admission 的单项复制可独立取消并报告确定字节进度；成功后立即进入 token registry。
+    pub(crate) fn stage_admitted_with_control(
+        &self,
+        source: AdmittedAttachmentSource,
+        cancellation: &ItemCancellation,
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<IngressAttachment, AttachmentIngressError> {
+        self.require_open()?;
+        let prepared = self.stage_one(source, &|| cancellation.is_cancelled(), &mut progress)?;
+        self.register_prepared(prepared)
+    }
+
+    /// 剪贴板像素编码后直接进入 Rust-owned staging，避免制造临时源路径或扩大 filesystem scope。
+    pub(crate) fn stage_bytes_with_control(
+        &self,
+        display_name: String,
+        bytes: &[u8],
+        cancellation: &ItemCancellation,
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<IngressAttachment, AttachmentIngressError> {
+        self.require_open()?;
+        verify_ingress_root(&self.root)?;
+        let total = u64::try_from(bytes.len())
+            .map_err(|_| AttachmentIngressError::new(AttachmentIngressErrorCode::FileTooLarge))?;
+        if total > self.limits.max_file_bytes || total > self.limits.max_batch_bytes {
             return Err(AttachmentIngressError::new(
-                AttachmentIngressErrorCode::LifecycleClosed,
+                AttachmentIngressErrorCode::FileTooLarge,
             ));
         }
-        for attachment in &prepared {
-            if registry.contains_key(&attachment.value.ingress_token) {
+        let (token, part_path, final_path, mut staging) = self.create_unique_staging()?;
+        let mut guard = StagedGuard::new(part_path);
+        let mut digest = Sha256::new();
+        let mut copied = 0_u64;
+        for chunk in bytes.chunks(COPY_BUFFER_BYTES) {
+            if cancellation.is_cancelled() {
                 return Err(AttachmentIngressError::new(
-                    AttachmentIngressErrorCode::StagingFailed,
+                    AttachmentIngressErrorCode::Cancelled,
                 ));
             }
+            staging.write_all(chunk).map_err(|error| {
+                map_io_error(
+                    AttachmentIngressErrorCode::StagingFailed,
+                    "staging_bytes_write",
+                    error,
+                )
+            })?;
+            digest.update(chunk);
+            copied = copied.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            progress(copied, total);
         }
-        for attachment in &prepared {
-            registry.insert(
-                attachment.value.ingress_token.clone(),
-                attachment.guard.path.clone(),
-            );
+        if cancellation.is_cancelled() {
+            return Err(AttachmentIngressError::new(
+                AttachmentIngressErrorCode::Cancelled,
+            ));
         }
-        let mut result = Vec::with_capacity(prepared.len());
-        for mut attachment in prepared {
-            attachment.guard.disarm();
-            result.push(attachment.value);
+        staging.flush().map_err(|error| {
+            map_io_error(
+                AttachmentIngressErrorCode::StagingFailed,
+                "staging_bytes_flush",
+                error,
+            )
+        })?;
+        staging.sync_all().map_err(|error| {
+            map_io_error(
+                AttachmentIngressErrorCode::StagingFailed,
+                "staging_bytes_sync",
+                error,
+            )
+        })?;
+        drop(staging);
+        rename_no_replace(&guard.path, &final_path)?;
+        guard.path = final_path;
+        self.register_prepared(PreparedAttachment {
+            value: IngressAttachment {
+                ingress_token: token,
+                display_name,
+                size_bytes: copied,
+                sha256: hex_lower(&digest.finalize()),
+            },
+            guard,
+        })
+    }
+
+    /// operation 在 dialog 前登记，确保取消命令不会和异步 picker callback 丢失竞态。
+    pub(crate) fn begin_operation(&self, operation_id: &str) -> Result<(), AttachmentIngressError> {
+        self.require_open()?;
+        self.operations.begin(operation_id)
+    }
+
+    /// item 在 started event 前绑定独立取消句柄，整批和逐项取消均不泄漏源文件信息。
+    pub(crate) fn register_operation_item(
+        &self,
+        operation_id: &str,
+        item_id: &str,
+    ) -> Result<ItemCancellation, AttachmentIngressError> {
+        self.operations.register_item(operation_id, item_id)
+    }
+
+    /// cancel 只接受 UI 已持有的 opaque identity，不接受路径或 ingress token。
+    pub(crate) fn cancel_operation(
+        &self,
+        operation_id: &str,
+        item_id: Option<&str>,
+    ) -> Result<bool, AttachmentIngressError> {
+        self.operations.cancel(operation_id, item_id)
+    }
+
+    /// worker 所有终态共用 finish tombstone，迟到 cancel 不会作用到未来复用 identity。
+    pub(crate) fn finish_operation(&self, operation_id: &str) {
+        self.operations.finish(operation_id);
+    }
+
+    /// Runtime 可重试失败保留一次性 attempt；容量失败时 caller 负责立即删除 staging。
+    pub(crate) fn retain_retry_attempt(
+        &self,
+        attempt_id: String,
+        item_id: String,
+        attachment: IngressAttachment,
+    ) -> Result<(), AttachmentIngressError> {
+        self.retry_attempts.insert(attempt_id, item_id, attachment)
+    }
+
+    /// retry 消费旧 attempt，确保双击或并发调用只能有一个 worker 获得 staging 所有权。
+    pub(crate) fn take_retry_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<RetryAttempt, AttachmentIngressError> {
+        let attempt = self.retry_attempts.take(attempt_id)?;
+        if attempt.is_expired() {
+            let _ = self.discard(&attempt.attachment.ingress_token);
+            Err(AttachmentIngressError::new(
+                AttachmentIngressErrorCode::AttemptNotFound,
+            ))
+        } else {
+            Ok(attempt)
         }
-        Ok(result)
+    }
+
+    /// 显式移除或 TTL 到期都删除 retry staging；未知 capability 稳定失败关闭。
+    pub(crate) fn discard_retry_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(), AttachmentIngressError> {
+        let attempt = self.retry_attempts.take(attempt_id)?;
+        self.discard(&attempt.attachment.ingress_token)
+    }
+
+    /// TTL worker 幂等清理仍存在的 attempt；已被 retry/discard 消费时为空成功。
+    pub(crate) fn expire_retry_attempt(&self, attempt_id: &str) {
+        if let Some(attempt) = self.retry_attempts.expire(attempt_id) {
+            let _ = self.discard(&attempt.attachment.ingress_token);
+        }
     }
 
     /// App Server 已完成受管导入后删除 staging；失败保留 registry 映射，调用方可重试 cleanup。
@@ -188,6 +297,10 @@ impl AttachmentIngress {
     /// app shutdown 关闭 admission 并清理仍受 registry 管理的全部 staging；重复调用安全为空成功。
     pub(crate) fn shutdown(&self) -> Result<(), AttachmentIngressError> {
         self.closed.store(true, Ordering::Release);
+        self.operations.shutdown();
+        for attempt in self.retry_attempts.drain() {
+            let _ = self.discard(&attempt.attachment.ingress_token);
+        }
         let mut registry = self.staged.lock().map_err(|_| {
             AttachmentIngressError::new(AttachmentIngressErrorCode::StateUnavailable)
         })?;
@@ -225,7 +338,10 @@ impl AttachmentIngress {
     }
 
     /// preflight 同时验证 spelling、节点类型、物理 identity、hardlink 与产品上限。
-    fn preflight(&self, source: PathBuf) -> Result<PreflightFile, AttachmentIngressError> {
+    fn preflight(
+        &self,
+        source: PathBuf,
+    ) -> Result<AdmittedAttachmentSource, AttachmentIngressError> {
         validate_source_path(&source)?;
         let metadata = require_regular_metadata(&source)?;
         let snapshot = snapshot_path(&source)?;
@@ -242,23 +358,26 @@ impl AttachmentIngress {
             .ok_or_else(|| {
                 AttachmentIngressError::new(AttachmentIngressErrorCode::UnsupportedPath)
             })?;
-        Ok(PreflightFile {
+        Ok(AdmittedAttachmentSource {
             source,
             display_name,
+            size_bytes: snapshot.size,
             snapshot,
         })
     }
 
     /// 单文件复制绑定实际 handle，在 publish 前后复核 identity/size/mtime，任何变化都回滚自己生成的 staging。
-    fn stage_one<F>(
+    fn stage_one(
         &self,
-        preflight: PreflightFile,
-        index: usize,
-        observer: &mut F,
-    ) -> Result<PreparedAttachment, AttachmentIngressError>
-    where
-        F: FnMut(IngressCheckpoint),
-    {
+        preflight: AdmittedAttachmentSource,
+        should_cancel: &dyn Fn() -> bool,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<PreparedAttachment, AttachmentIngressError> {
+        if should_cancel() {
+            return Err(AttachmentIngressError::new(
+                AttachmentIngressErrorCode::Cancelled,
+            ));
+        }
         validate_source_path(&preflight.source)?;
         let mut source = open_source(&preflight.source)?;
         let opened = snapshot_file(&source)?;
@@ -268,14 +387,17 @@ impl AttachmentIngress {
                 AttachmentIngressErrorCode::SourceChanged,
             ));
         }
-        observer(IngressCheckpoint::SourceOpened { index });
-
         let (token, part_path, final_path, mut staging) = self.create_unique_staging()?;
         let mut guard = StagedGuard::new(part_path);
         let mut digest = Sha256::new();
         let mut copied = 0_u64;
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
+            if should_cancel() {
+                return Err(AttachmentIngressError::new(
+                    AttachmentIngressErrorCode::Cancelled,
+                ));
+            }
             let count = source.read(&mut buffer).map_err(|error| {
                 map_io_error(
                     AttachmentIngressErrorCode::SourceReadFailed,
@@ -306,8 +428,13 @@ impl AttachmentIngress {
                 )
             })?;
             digest.update(&buffer[..count]);
+            progress(copied, opened.size);
         }
-        observer(IngressCheckpoint::CopyComplete { index });
+        if should_cancel() {
+            return Err(AttachmentIngressError::new(
+                AttachmentIngressErrorCode::Cancelled,
+            ));
+        }
         if copied != opened.size || snapshot_file(&source)? != opened {
             return Err(AttachmentIngressError::new(
                 AttachmentIngressErrorCode::SourceChanged,
@@ -346,6 +473,29 @@ impl AttachmentIngress {
             },
             guard,
         })
+    }
+
+    /// 单项 staging 在 registry 内原子取得 ownership 后才解除 guard，避免取消竞态留下孤儿文件。
+    fn register_prepared(
+        &self,
+        mut prepared: PreparedAttachment,
+    ) -> Result<IngressAttachment, AttachmentIngressError> {
+        let mut registry = self.staged.lock().map_err(|_| {
+            AttachmentIngressError::new(AttachmentIngressErrorCode::StateUnavailable)
+        })?;
+        if self.closed.load(Ordering::Acquire)
+            || registry.contains_key(&prepared.value.ingress_token)
+        {
+            return Err(AttachmentIngressError::new(
+                AttachmentIngressErrorCode::LifecycleClosed,
+            ));
+        }
+        registry.insert(
+            prepared.value.ingress_token.clone(),
+            prepared.guard.path.clone(),
+        );
+        prepared.guard.disarm();
+        Ok(prepared.value)
     }
 
     /// token 与两个目标名都由 Rust 生成；碰撞只重试，绝不接受 caller 指定 staging 文件名。

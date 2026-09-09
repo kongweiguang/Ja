@@ -63,9 +63,8 @@ impl SettingsQueryInput {
             .as_object()
             .ok_or_else(RuntimeCommandError::invalid_params)?;
         match method {
-            SettingsQueryMethod::SkillList | SettingsQueryMethod::McpList => {
-                validate_page(object, false)?
-            }
+            SettingsQueryMethod::SkillList => validate_page(object, Some(("workspaceId", "ws_")))?,
+            SettingsQueryMethod::McpList => validate_page(object, None)?,
             SettingsQueryMethod::McpTest => {
                 if object.len() != 1 {
                     return Err(RuntimeCommandError::invalid_params());
@@ -87,7 +86,7 @@ impl SettingsQueryInput {
                     return Err(RuntimeCommandError::invalid_params());
                 }
                 required_id(object, "mcpId", "mcp_")?;
-                validate_page(object, true)?;
+                validate_page(object, Some(("mcpId", "mcp_")))?;
             }
         }
         Ok((method, Value::Object(object.clone())))
@@ -95,17 +94,22 @@ impl SettingsQueryInput {
 }
 
 /// 设计原因：该函数维护封闭查询 allowlist 与结果上限，不允许演化为任意 RPC 通道。
-/// 验证共享 cursor page shape，不静默接受旧 empty-only Settings query 或超限 server response
-/// 请求。
+/// 验证共享 cursor page shape，并只放行调用方声明的 opaque identity；路径和任意扩展字段
+/// 仍在进入 sidecar 前失败关闭。
 fn validate_page(
     object: &Map<String, Value>,
-    allow_mcp_id: bool,
+    identity: Option<(&str, &str)>,
 ) -> Result<(), RuntimeCommandError> {
-    if object
-        .keys()
-        .any(|key| !(matches!(key.as_str(), "cursor" | "limit") || allow_mcp_id && key == "mcpId"))
-    {
+    if object.keys().any(|key| {
+        !(matches!(key.as_str(), "cursor" | "limit")
+            || identity.is_some_and(|(field, _)| key == field))
+    }) {
         return Err(RuntimeCommandError::invalid_params());
+    }
+    if let Some((field, prefix)) = identity
+        && object.contains_key(field)
+    {
+        required_id(object, field, prefix)?;
     }
     if let Some(cursor) = object.get("cursor") {
         let cursor = cursor

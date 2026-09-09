@@ -121,7 +121,7 @@
   border-radius: var(--ja-radius-sm);
   padding: 0.25rem;
   background: var(--ja-surface);
-  box-shadow: 0 10px 30px rgb(0 0 0 / 34%);
+  box-shadow: var(--ja-shadow-floating);
   overflow: auto;
 }
 .ja-file-tree-context-menu button {
@@ -189,37 +189,16 @@
   padding: 0 0.55rem;
   background: var(--ja-surface);
 }
-.ja-files-workspace-mode {
+.ja-files-workspace-heading {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 0.15rem;
-}
-.ja-files-workspace-mode button {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  min-height: var(--ja-control-height-compact);
-  border: 1px solid transparent;
-  border-radius: var(--ja-radius-sm);
-  padding: 0 0.55rem;
-  color: var(--ja-foreground-muted);
-  background: transparent;
+  gap: 0.4rem;
+  color: var(--ja-foreground);
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
-  cursor: pointer;
 }
-.ja-files-workspace-mode button:hover,
-.ja-files-workspace-mode button.is-active {
-  color: var(--ja-foreground);
-  background: var(--ja-surface-muted);
-}
-.ja-files-workspace-mode button:focus-visible {
-  border-color: var(--ja-focus);
-  outline: 2px solid color-mix(in srgb, var(--ja-focus) 28%, transparent);
-  outline-offset: 1px;
-}
-.ja-files-workspace-mode svg {
+.ja-files-workspace-heading svg {
   width: 0.85rem;
   height: 0.85rem;
 }
@@ -260,19 +239,8 @@
   width: 32%;
   min-height: 0;
   flex: 0 1 15rem;
-  border-right: 1px solid var(--ja-border);
-  overflow: hidden;
-}
-.ja-files-workspace-explorer[hidden] {
-  display: none;
-}
-.ja-files-workspace-search {
-  display: flex;
-  min-width: 13rem;
-  width: 34%;
-  min-height: 0;
-  flex: 0 1 18rem;
-  border-right: 1px solid var(--ja-border);
+  order: 2;
+  border-left: 1px solid var(--ja-border);
   overflow: hidden;
 }
 .ja-files-workspace-editor {
@@ -280,6 +248,7 @@
   min-width: 0;
   min-height: 0;
   flex: 1;
+  order: 1;
   flex-direction: column;
   overflow: hidden;
   background: var(--ja-background);
@@ -504,7 +473,7 @@
   position: fixed;
   z-index: 90;
   inset: 0;
-  background: rgb(0 0 0 / 48%);
+  background: var(--ja-modal-overlay);
 }
 .ja-files-save-as-dialog {
   position: fixed;
@@ -619,8 +588,8 @@
 }
 .ja-files-save-as-actions button[type="submit"] {
   border-color: var(--ja-accent);
-  color: var(--ja-accent-foreground, #fff);
-  background: var(--ja-accent);
+  color: var(--ja-on-accent);
+  background: var(--ja-accent-emphasis);
 }
 .ja-files-save-as-actions button:disabled {
   cursor: wait;
@@ -791,11 +760,11 @@
 }
 .ja-files-trash-actions button.is-danger {
   border-color: var(--ja-danger);
-  color: var(--ja-accent-foreground, #fff);
-  background: var(--ja-danger);
+  color: var(--ja-on-danger);
+  background: var(--ja-danger-emphasis);
 }
 .ja-files-trash-actions button.is-danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--ja-danger) 88%, #000);
+  background: color-mix(in srgb, var(--ja-danger-emphasis) 88%, var(--ja-foreground));
 }
 .ja-files-trash-actions button:disabled,
 .ja-files-trash-close:disabled {
@@ -833,18 +802,17 @@
   .ja-files-workspace-body {
     flex-direction: column;
   }
-  .ja-files-workspace-explorer,
-  .ja-files-workspace-search {
+  .ja-files-workspace-explorer {
     min-width: 0;
     width: 100%;
     max-width: none;
     flex: 1 1 auto;
-    border-right: 0;
+    order: 1;
+    border-left: 0;
     border-bottom: 1px solid var(--ja-border);
   }
   /* 没有打开文档时不让空编辑器抢占纵向空间；文件树/搜索先使用全部可用高度。 */
-  .ja-files-workspace-body.is-browser-only .ja-files-workspace-explorer,
-  .ja-files-workspace-body.is-browser-only .ja-files-workspace-search {
+  .ja-files-workspace-body.is-browser-only .ja-files-workspace-explorer {
     flex: 1;
     border-bottom: 0;
   }
@@ -853,6 +821,7 @@
   }
   .ja-files-workspace-editor {
     min-height: 12rem;
+    order: 2;
   }
   /* 打开文档后只给编辑器保留可工作的有界高度，其余纵向空间全部归资源树/搜索。 */
   .ja-files-workspace-body.has-open-document .ja-files-workspace-editor {

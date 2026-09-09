@@ -1,6 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import type {
+  AttachmentPreviewAuthorization,
+  AttachmentPreviewSession,
+} from "../domain/attachmentPreviewModel";
+export type {
+  AttachmentPreviewAuthorization,
+  AttachmentPreviewTarget,
+} from "../domain/attachmentPreviewModel";
+
 export interface PreviewViewport {
   x: number;
   y: number;
@@ -76,4 +85,30 @@ export interface PreviewPort {
   reload?: () => void;
   retryRecovery?: () => void;
   changeViewport?: (viewport: PreviewViewport) => void;
+}
+
+/** application open result 复用 domain session 投影，port 只补充异步能力而不复制业务形状。 */
+export type AttachmentPreviewOpenResult = AttachmentPreviewSession;
+
+export interface AttachmentPreviewReadResult {
+  previewSessionId: string;
+  offsetBytes: number;
+  nextOffsetBytes: number;
+  endOfFile: boolean;
+  truncated: boolean;
+  content: string;
+}
+
+/** application 只拥有 session 生命周期与有界读取，不获得通用 JA-RPC 或资源协议能力。 */
+export interface AttachmentPreviewPort {
+  open(target: {
+    attachmentId: string;
+    authorization: AttachmentPreviewAuthorization;
+  }): Promise<AttachmentPreviewOpenResult>;
+  read(
+    previewSessionId: string,
+    offsetBytes: number,
+    maxBytes?: number,
+  ): Promise<AttachmentPreviewReadResult>;
+  close(previewSessionId: string): Promise<void>;
 }

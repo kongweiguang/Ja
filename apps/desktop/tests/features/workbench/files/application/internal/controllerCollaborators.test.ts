@@ -16,6 +16,20 @@ interface StateCell<T> {
   write: (value: T | ((current: T) => T)) => void;
 }
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+/** 构造可控 Promise，精确验证 workspace deadline 与迟到保存 ACK 的先后关系。 */
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 /** 模拟 React functional writer，但把断言值留在测试边界，协作者不会获得额外 store。 */
 function stateCell<T>(initial: T): StateCell<T> {
   let current = initial;
@@ -190,5 +204,75 @@ describe("Files controller collaborators", () => {
     second.release();
     expect(lifecycleFence.current).toBe(false);
     expect(closing.value).toBe(false);
+  });
+
+  it("Lifecycle 保存永久 pending 时有界拒绝切换并恢复旧草稿编辑状态", async () => {
+    vi.useFakeTimers();
+    try {
+      const documents: { current: Record<string, OpenDocument> } = {
+        current: { "main.ts": dirtyDocument("main.ts") },
+      };
+      const lifecycleFence = { current: false };
+      const lifecycleLease = { current: undefined as Promise<void> | undefined };
+      const lifecycleLeaseHolders = { current: 0 };
+      const closing = stateCell(false);
+      const scheduledSave = vi.fn();
+      const notice = vi.fn();
+      const save = deferred<boolean>();
+      const deadlineTimer: SaveTimerPort = {
+        set: (delay, callback) => globalThis.setTimeout(callback, delay),
+        clear: (handle) =>
+          globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+      };
+      const coordinator = new FilesSaveCoordinator({
+        timer: deadlineTimer,
+        saveOnce: () => save.promise,
+        shouldContinue: () => false,
+      });
+      const useCases = createLifecycleUseCases({
+        saveCoordinator: coordinator,
+        mounted: { current: true },
+        lifecycleFence,
+        lifecycleLease,
+        lifecycleLeaseHolders,
+        documents,
+        scheduledSave: { current: scheduledSave },
+        flush: { current: (path) => coordinator.flush(path) },
+        inFlight: { current: new Map<string, number>() },
+        externalConflictChecks: { current: new Set<string>() },
+        setLifecycleClosing: closing.write,
+        onNotice: notice,
+        workspaceChangeDeadline: { timeoutMillis: 1_000, timer: deadlineTimer },
+      });
+
+      const outcome = useCases.flushForWorkspaceChange().then(
+        () => "granted" as const,
+        (error: unknown) => error,
+      );
+      expect(lifecycleFence.current).toBe(true);
+      expect(closing.value).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      const timeout = await outcome;
+      expect(timeout).toBeInstanceOf(Error);
+      expect((timeout as Error).message).toBe("文件保存等待超时，已拒绝切换");
+      expect(lifecycleFence.current).toBe(false);
+      expect(lifecycleLease.current).toBeUndefined();
+      expect(lifecycleLeaseHolders.current).toBe(0);
+      expect(closing.value).toBe(false);
+      expect(documents.current["main.ts"]?.content).toBe("draft");
+      expect(scheduledSave).toHaveBeenCalledWith("main.ts");
+      expect(notice).toHaveBeenCalledWith(
+        "文件保存等待超时，已取消项目切换；草稿仍保留，请检查后重试。",
+      );
+
+      save.resolve(true);
+      await vi.runAllTimersAsync();
+      expect(await outcome).toBe(timeout);
+      expect(lifecycleLeaseHolders.current).toBe(0);
+      expect(lifecycleFence.current).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

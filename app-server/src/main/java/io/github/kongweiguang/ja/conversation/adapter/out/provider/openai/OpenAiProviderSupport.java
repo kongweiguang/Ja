@@ -38,24 +38,7 @@ final class OpenAiProviderSupport {
                 .header("Accept", "text/event-stream")
                 .header("Content-Type", "application/json")
                 .post(RequestBody.create(body, JSON_MEDIA_TYPE));
-        if (!configuration.apiKey().isEmpty()) {
-            builder.header("Authorization", "Bearer " + configuration.apiKey());
-        }
-        return builder.build();
-    }
-
-    /**
-     * 构造官方输入计量请求；与 send 共用 envelope，仅切换端点、Accept 与计量正文。
-     */
-    static Request tokenCountPost(ModelPort.ModelConfiguration configuration, byte[] body) {
-        Request.Builder builder = new Request.Builder()
-                .url(AbstractStreamingModelAdapter.endpoint(configuration.baseUri(), "/v1/responses/input_tokens"))
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .post(RequestBody.create(body, JSON_MEDIA_TYPE));
-        if (!configuration.apiKey().isEmpty()) {
-            builder.header("Authorization", "Bearer " + configuration.apiKey());
-        }
+        builder.header("Authorization", "Bearer " + configuration.apiKey());
         return builder.build();
     }
 
@@ -71,19 +54,6 @@ final class OpenAiProviderSupport {
         return new ProviderProtocolException(
                 "HTTP_STATUS", AbstractStreamingModelAdapter.serviceFailureDetail(status, error), retryable,
                 RetryAfter.parse(headers.get("Retry-After")));
-    }
-
-    /**
-     * 将明确不存在的 input_tokens 路由区分为能力缺失，使 Adapter 能安全切换到完整历史上界；
-     * 认证、限流和服务故障仍沿用普通失败语义，不能被降级路径掩盖。
-     */
-    static RuntimeException tokenCountFailure(int status, Headers headers, JsonNode error) {
-        if (status == 404 && error != null
-            && "not_found".equals(error.path("error").path("code").textValue())) {
-            return new ProviderProtocolException(
-                    "TOKEN_COUNT_UNSUPPORTED", "OpenAI input token count endpoint is unavailable", false);
-        }
-        return serviceFailure(status, headers, error);
     }
 
     /**

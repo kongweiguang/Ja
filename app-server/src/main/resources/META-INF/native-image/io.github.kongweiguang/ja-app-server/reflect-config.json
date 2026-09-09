@@ -1,5 +1,134 @@
 [
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper",
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ParentRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TurnCausalityRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskRouteRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ContextSeedRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ActivityRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxStats",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ChildTurnInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ContextSeedInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$LineageInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ActivityInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ProjectionInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxBind",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxConsume",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ProjectionCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ProjectionActivityCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$FollowUpProjectionCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$SeenCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TreeDelete",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TerminalTaskRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$WriteClaimInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$WriteClaimRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$WriteClaimCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentMapper",
     "allDeclaredMethods": true
   },
@@ -108,6 +237,11 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputStats",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SnapshotItemRow",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -129,6 +263,11 @@
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$TurnInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InternalTurnContextInsert",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
@@ -193,6 +332,26 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$UsageSettlement",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolBindingInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolBindingRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentRecords$AttachmentReservation",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputInsert",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -203,12 +362,32 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputKey",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputConsume",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputMutation",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputAttention",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputCancel",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputQueueAdvance",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
@@ -263,6 +442,21 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadPinCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadSeenCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadRestore",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SnapshotPage",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -289,6 +483,126 @@
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$RecoveryCommand",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolApprovalRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ApprovalDecisionRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ContextUsageRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$TurnExecutionRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$TurnExecutionWrite",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolPresentationUpdate",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolApprovalStatusUpdate",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolSettlement",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$TimelineMessageInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolArtifactInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolArtifactRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolArtifactKey",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetInsert",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetArtifactKey",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetArtifactRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadSearch",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadTitleCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadPreferencesCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadAdmissionCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$RecoveryTurnRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$RecoveryTurnCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$RecoveryToolMessage",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ResumeTurnRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ResumeTurnCas",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
@@ -367,5 +681,30 @@
         ]
       }
     ]
+  },
+  {
+    "name": "io.github.kongweiguang.ja.goal.domain.GoalModels$PlanDefinition",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.goal.domain.GoalModels$PlanStep",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.goal.domain.GoalModels$AcceptanceCriterion",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.goal.domain.GoalModels$Goal",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.goal.domain.GoalModels$PlanRevision",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true
   }
 ]

@@ -18,7 +18,7 @@ const RECOVERY_FILE_NAME: &str = "ja-runtime-recovery.json";
 pub(crate) const RECOVERY_ACK_FILE_NAME: &str = "ja-runtime-recovery-ack.json";
 pub(crate) const RECOVERY_TEMP_PREFIX: &str = "ja-runtime-recovery.json.tmp-";
 const RECOVERY_ACK_TEMP_PREFIX: &str = "ja-runtime-recovery-ack.json.tmp-";
-const RECOVERY_SCHEMA_VERSION: u64 = 2;
+const RECOVERY_SCHEMA_VERSION: u64 = 1;
 pub(crate) const MAX_RECOVERY_BYTES: u64 = 4096;
 static NEXT_RECOVERY_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 

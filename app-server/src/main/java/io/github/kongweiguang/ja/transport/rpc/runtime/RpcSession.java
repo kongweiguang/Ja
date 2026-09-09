@@ -9,6 +9,8 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcException;
 import io.github.kongweiguang.ja.transport.rpc.protocol.TurnEventWireMapper;
 import io.github.kongweiguang.ja.transport.rpc.protocol.ContextCompactionEventWireMapper;
 import io.github.kongweiguang.ja.transport.rpc.protocol.ThreadMetadataEventWireMapper;
+import io.github.kongweiguang.ja.transport.rpc.protocol.TaskEventWireMapper;
+import io.github.kongweiguang.ja.transport.rpc.protocol.GoalEventWireMapper;
 import io.github.kongweiguang.ja.transport.rpc.RpcServiceBindings;
 import io.github.kongweiguang.ja.transport.rpc.RpcServicesFactory;
 
@@ -16,6 +18,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
+import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ApprovalUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
@@ -31,13 +34,24 @@ import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
+import io.github.kongweiguang.ja.goal.port.in.GoalUseCase;
+import io.github.kongweiguang.ja.goal.port.in.PlanExecutionEventSink;
+import io.github.kongweiguang.ja.goal.port.in.GoalEvent;
+import io.github.kongweiguang.ja.goal.port.in.GoalEventSink;
+import io.github.kongweiguang.ja.goal.domain.GoalModels;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase;
+import io.github.kongweiguang.ja.task.port.in.TaskEvent;
+import io.github.kongweiguang.ja.task.port.in.TaskEventSink;
+import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
+import io.github.kongweiguang.ja.task.port.out.TaskRepositoryException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -58,18 +72,26 @@ public final class RpcSession implements AutoCloseable {
     private final ApprovalCompletions approvalCompletions;
     private final CancellationSource cancellation = new CancellationSource();
     private final Map<String, TurnNotificationContext> turnNotificationContexts = new ConcurrentHashMap<>();
+    private final Set<String> taskObservationIds = ConcurrentHashMap.newKeySet();
+    private final Map<String, String> goalObservations = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> goalTurnNotifications = new ConcurrentHashMap<>();
     private final String serverInstanceId = "srv_ja_" + UUID.randomUUID().toString().replace("-", "");
     private final AtomicLong eventIds = new AtomicLong();
-    private final AtomicLong notificationSequences = new AtomicLong();
     private final AtomicBoolean closing = new AtomicBoolean();
     private final DeadlineCloseCoordinator closeCoordinator = new DeadlineCloseCoordinator();
     private volatile WorkspaceUseCase workspaces;
+    private volatile WorkspacePathSearchUseCase workspacePathSearch;
     private volatile ThreadUseCase threads;
     private volatile TurnUseCase turns;
     private volatile ContextCompactionUseCase compactions;
     private volatile ApprovalUseCase approvalUseCase;
     private volatile CatalogUseCase catalog;
     private volatile AttachmentUseCase attachments;
+    private volatile AttachmentPreviewUseCase attachmentPreviews;
+    private volatile TaskUseCase tasks;
+    private volatile GoalUseCase goals;
+    private volatile AutoCloseable taskSubscription;
+    private volatile AutoCloseable goalSubscription;
     private volatile DeadlineCloseable lifecycle;
     private volatile String readyToken;
     private volatile boolean initialized;
@@ -115,13 +137,82 @@ public final class RpcSession implements AutoCloseable {
             throw JaRpcException.of(JaErrorCatalog.CONFIG_INVALID, "runtime configuration is invalid");
         }
         workspaces = opened.workspaces();
+        workspacePathSearch = opened.workspacePathSearch();
         threads = opened.threads();
         turns = opened.turns();
         compactions = opened.compactions();
         approvalUseCase = opened.approvals();
         catalog = opened.catalog();
         attachments = opened.attachments();
+        attachmentPreviews = opened.attachmentPreviews();
+        tasks = opened.tasks();
+        goals = opened.goals();
         lifecycle = opened.lifecycle();
+        taskSubscription = tasks.subscribe(new TaskEventSink() {
+            /** Task 事件统一复用连接级 sequence 与 stdout owner。 */
+            @Override public java.util.concurrent.CompletionStage<Void> publish(TaskEvent event) {
+                return RpcSession.this.publish(event);
+            }
+
+            /** Child Turn 继续走现有语义通知和审批关联链。 */
+            @Override public TurnEventSink turnEvents() {
+                return RpcSession.this.eventSink();
+            }
+
+            /** Child 的流式事件在入队前取得与普通 Turn 相同的连接级关联。 */
+            @Override public void registerTurn(String turnId, String workspaceId, String threadId,
+                                               long initialThreadRevision) {
+                RpcSession.this.registerTurnNotificationContext(turnId, workspaceId, threadId,
+                        initialThreadRevision);
+            }
+
+            /** Child admission 失败时复用普通 Turn 的上下文清理入口。 */
+            @Override public void abandonTurn(String turnId) {
+                RpcSession.this.abandonTurnNotification(turnId);
+            }
+        });
+        goalSubscription = goals.subscribe(new GoalEventSink() {
+            /**
+             * created 是 UI 获得服务端 Goal identity 的唯一低频发现事件；其余更新只投影当前连接
+             * 显式 observe 的 Goal，避免未展开 Goal 持续占用 stdout 带宽。
+             */
+            @Override public java.util.concurrent.CompletionStage<Void> publish(GoalEvent event) {
+                boolean discovery = "created".equals(event.activity().kind());
+                if (!discovery && !observesGoal(event.snapshot().goal().goalId())) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return RpcSession.this.publish(event);
+            }
+
+            /** 只有当前连接已经 observe 对应 Goal 时才登记 continuation Timeline。 */
+            @Override public boolean registerTurn(String goalId, String turnId, String workspaceId,
+                                                  String threadId, long initialThreadRevision) {
+                if (!observesGoal(goalId) || closing.get()) return false;
+                RpcSession.this.registerTurnNotificationContext(turnId, workspaceId, threadId,
+                        initialThreadRevision);
+                goalTurnNotifications.computeIfAbsent(goalId, ignored -> ConcurrentHashMap.newKeySet())
+                        .add(turnId);
+                if (!observesGoal(goalId) || closing.get()) {
+                    abandonGoalTurn(goalId, turnId);
+                    return false;
+                }
+                return true;
+            }
+
+            /** 解除观察后流事件静默丢弃；权威审批和 Turn 状态仍可由快照重新读取。 */
+            @Override public java.util.concurrent.CompletionStage<Void> publishTurn(
+                    String goalId, TurnEvent event) {
+                if (!observesGoal(goalId) || !turnNotificationContexts.containsKey(eventTurnId(event))) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return RpcSession.this.publish(event);
+            }
+
+            /** admission 失败、Turn 结束或取消后清理 Goal 与 Turn 两侧索引。 */
+            @Override public void abandonTurn(String goalId, String turnId) {
+                abandonGoalTurn(goalId, turnId);
+            }
+        });
         initialized = true;
         notifyRuntime("starting", "initialize").join();
     }
@@ -187,6 +278,17 @@ public final class RpcSession implements AutoCloseable {
         return Objects.requireNonNull(workspaces, "workspace use case");
     }
 
+    /** 返回 Composer 路径建议的有界 Java 用例，不向 Handler 暴露物理根或 NIO adapter。 */
+    public WorkspacePathSearchUseCase workspacePathSearch() {
+        requireReady();
+        return Objects.requireNonNull(workspacePathSearch, "workspace path search use case");
+    }
+
+    /** 返回服务端签发的连接代际，供异步建议结果关联且不接受 WebView 伪造。 */
+    public long runtimeGeneration() {
+        return runtimeGeneration;
+    }
+
     /** 返回 Thread 入站端口。 */
     public ThreadUseCase threads() {
         requireReady();
@@ -226,6 +328,162 @@ public final class RpcSession implements AutoCloseable {
     public AttachmentUseCase attachments() {
         requireReady();
         return Objects.requireNonNull(attachments, "attachment use case");
+    }
+
+    /** 返回附件短期预览端口；读取授权与普通附件生命周期共享同一个应用 owner。 */
+    public AttachmentPreviewUseCase attachmentPreviews() {
+        requireReady();
+        return Objects.requireNonNull(attachmentPreviews, "attachment preview use case");
+    }
+
+    /** 返回 Task 入站端口；隐藏详情是否读取由调用方显式 task/read 决定。 */
+    public TaskUseCase tasks() {
+        requireReady();
+        return Objects.requireNonNull(tasks, "task use case");
+    }
+
+    /** 返回 Goal 入站端口；读取、控制和计划批准始终经过同一聚合 CAS 边界。 */
+    public GoalUseCase goals() {
+        requireReady();
+        return Objects.requireNonNull(goals, "goal use case");
+    }
+
+    /**
+     * standalone Plan 只把内部 Turn 投影回发起当前命令的连接；连接关闭后执行可继续持久化，
+     * 但事件静默停止，重连通过 thread/read 恢复，避免借用 Goal observation 或跨窗口广播。
+     */
+    public PlanExecutionEventSink planExecutionEvents() {
+        requireReady();
+        return new PlanExecutionEventSink() {
+            /** admission 前登记与普通 Turn 相同的连接级通知上下文。 */
+            @Override public boolean registerTurn(String turnId, String workspaceId, String threadId,
+                                                  long initialThreadRevision) {
+                if (closing.get()) return false;
+                registerTurnNotificationContext(turnId, workspaceId, threadId, initialThreadRevision);
+                if (!closing.get()) return true;
+                abandonTurnNotification(turnId);
+                return false;
+            }
+
+            /** 连接或关联已关闭时不把后台执行失败升级为 Plan run 失败。 */
+            @Override public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {
+                if (closing.get() || !turnNotificationContexts.containsKey(eventTurnId(event))) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return RpcSession.this.publish(event);
+            }
+
+            /** 完成与 admission 失败共用幂等清理。 */
+            @Override public void abandonTurn(String turnId) {
+                abandonTurnNotification(turnId);
+            }
+        };
+    }
+
+    /**
+     * 在返回快照前先登记连接级过滤 identity，使并发 mutation 不会落在 read 与 observe 之间；
+     * 最多允许 256 个句柄，防止失控页面制造无界内存状态。
+     */
+    public GoalObservation observeGoal(String goalId) {
+        requireReady();
+        if (goalObservations.size() >= 256) {
+            throw JaRpcException.of(JaErrorCatalog.GOAL_INVALID_STATE, "goal observation capacity is exhausted");
+        }
+        String observationId = "observe_goal_" + UUID.randomUUID().toString().replace("-", "");
+        goalObservations.put(observationId, requireIdentifier(goalId, "goal_"));
+        if (closing.get()) {
+            goalObservations.remove(observationId);
+            throw JaRpcException.of(JaErrorCatalog.SHUTTING_DOWN, "runtime is shutting down");
+        }
+        try {
+            return new GoalObservation(observationId, goals().read(goalId));
+        } catch (RuntimeException failure) {
+            goalObservations.remove(observationId);
+            throw failure;
+        }
+    }
+
+    /** 只释放本连接签发的 observation identity，不能猜测 Goal ID 解除其它句柄。 */
+    public void unobserveGoal(String observationId) {
+        requireReady();
+        String goalId = goalObservations.remove(observationId);
+        if (goalId == null) {
+            throw JaRpcException.of(JaErrorCatalog.GOAL_INVALID_STATE,
+                    "goal observation is not owned by this session");
+        }
+        if (!observesGoal(goalId)) abandonGoalTurns(goalId);
+    }
+
+    /** containsValue 只扫描有界的 256 个 observation，避免另建可能漂移的引用计数。 */
+    private boolean observesGoal(String goalId) {
+        return goalObservations.containsValue(goalId);
+    }
+
+    /** TurnEvent 的两类流式增量没有 Context，其余事件统一从持久 Context 取得 identity。 */
+    private static String eventTurnId(TurnEvent event) {
+        if (event instanceof TurnEvent.TextDelta delta) return delta.turnId();
+        if (event instanceof TurnEvent.ReasoningSummaryDelta delta) return delta.turnId();
+        return event.context().turnId();
+    }
+
+    /** 单个 continuation 清理同时移除反向集合和既有通知上下文，重复调用保持幂等。 */
+    private void abandonGoalTurn(String goalId, String turnId) {
+        Set<String> turnsForGoal = goalTurnNotifications.get(goalId);
+        if (turnsForGoal != null) {
+            turnsForGoal.remove(turnId);
+            if (turnsForGoal.isEmpty()) goalTurnNotifications.remove(goalId, turnsForGoal);
+        }
+        abandonTurnNotification(turnId);
+    }
+
+    /** 最后一个 observation 关闭时释放该 Goal 尚在途的全部连接级流关联。 */
+    private void abandonGoalTurns(String goalId) {
+        Set<String> turnsForGoal = goalTurnNotifications.remove(goalId);
+        if (turnsForGoal != null) turnsForGoal.forEach(this::abandonTurnNotification);
+    }
+
+    /** observe 回执将句柄和同一时刻读取的完整投影绑定。 */
+    public record GoalObservation(String observationId, GoalModels.GoalSnapshot snapshot) {
+        /** 防止 transport 内部构造不完整 observation。 */
+        public GoalObservation {
+            Objects.requireNonNull(observationId, "observationId");
+            Objects.requireNonNull(snapshot, "snapshot");
+        }
+    }
+
+    /**
+     * 建立当前连接拥有的 Task observation；关闭竞态发生在远端创建之后时立即补偿释放，
+     * 防止一个已经不可见的连接把高频 progress 订阅遗留到进程生命周期结束。
+     */
+    public TaskUseCase.Observation observeTask(String taskThreadId, long expectedTaskRevision) {
+        requireReady();
+        // TaskUseCase 是组合根拥有的长生命周期端口；这里只借用它建立连接级 observation。
+        @SuppressWarnings("PMD.CloseResource")
+        TaskUseCase owner = Objects.requireNonNull(tasks, "task use case");
+        TaskUseCase.Observation observation = owner.observe(taskThreadId, expectedTaskRevision);
+        if (!taskObservationIds.add(observation.observationId())) {
+            owner.unobserve(observation.observationId());
+            throw new TaskRepositoryException(TaskRepositoryException.Code.OBSERVATION_INVALID,
+                    "task observation identity is already owned");
+        }
+        if (closing.get() && taskObservationIds.remove(observation.observationId())) {
+            owner.unobserve(observation.observationId());
+            throw JaRpcException.of(JaErrorCatalog.SHUTTING_DOWN, "runtime is shutting down");
+        }
+        return observation;
+    }
+
+    /**
+     * 只释放当前连接登记的 observation；先移除本地所有权再调用 Task owner，使幂等重试不会
+     * 越过连接边界关闭另一会话的句柄，也不会在底层失败后由 close 重复执行同一释放。
+     */
+    public void unobserveTask(String observationId) {
+        requireReady();
+        if (!taskObservationIds.remove(observationId)) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.OBSERVATION_INVALID,
+                    "task observation is not owned by this session");
+        }
+        Objects.requireNonNull(tasks, "task use case").unobserve(observationId);
     }
 
     /** 返回连接级审批提交关联器，仅用于普通审批响应。 */
@@ -346,7 +604,7 @@ public final class RpcSession implements AutoCloseable {
             ContextCompactionEventWireMapper.WireEvent wire =
                     new ContextCompactionEventWireMapper(mapper, serverInstanceId).map(event);
             ObjectNode params = wire.params();
-            params.put("sequence", nextNotificationSequence()).put("generation", runtimeGeneration);
+            params.put("generation", runtimeGeneration);
             CompletableFuture<Void> published = writer.notification(wire.method(), params);
             published.whenComplete((ignored, failure) -> {
                 if (failure != null) failProjection(failure);
@@ -367,6 +625,40 @@ public final class RpcSession implements AutoCloseable {
             ObjectNode params = new ThreadMetadataEventWireMapper(mapper, serverInstanceId).map(event);
             addNotificationMetadata(params, "thread_metadata");
             CompletableFuture<Void> published = writer.notification("thread/metadata-changed", params);
+            published.whenComplete((ignored, failure) -> {
+                if (failure != null) failProjection(failure);
+            });
+            return published;
+        } catch (Throwable failure) {
+            failProjection(failure);
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    /** Durable Task 事件不可丢；progress 交给 Rust 有界投影按 Task 合并。 */
+    public CompletableFuture<Void> publish(TaskEvent event) {
+        try {
+            TaskEventWireMapper.WireEvent wire = new TaskEventWireMapper(mapper).map(event);
+            ObjectNode params = wire.params();
+            addNotificationMetadata(params, "task");
+            CompletableFuture<Void> published = writer.notification(wire.method(), params);
+            published.whenComplete((ignored, failure) -> {
+                if (failure != null) failProjection(failure);
+            });
+            return published;
+        } catch (Throwable failure) {
+            failProjection(failure);
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    /** Goal 事件复用唯一 stdout sequence；持久 goal/event revision 由领域事件原样保留。 */
+    public CompletableFuture<Void> publish(GoalEvent event) {
+        try {
+            GoalEventWireMapper.WireEvent wire = new GoalEventWireMapper(mapper).map(event);
+            ObjectNode params = wire.params();
+            addNotificationMetadata(params, "goal");
+            CompletableFuture<Void> published = writer.notification(wire.method(), params);
             published.whenComplete((ignored, failure) -> {
                 if (failure != null) failProjection(failure);
             });
@@ -431,13 +723,14 @@ public final class RpcSession implements AutoCloseable {
         if (durable != null) turn.observeRevision(durable.threadRevision());
         params.put("serverInstanceId", serverInstanceId);
         if (!params.has("eventId")) params.put("eventId", nextEventId("stream"));
-        params.put("sequence", nextNotificationSequence());
         if (!params.has("occurredAt")) params.put("occurredAt", clock.instant().toString());
         params.put("generation", runtimeGeneration);
         params.put("workspaceId", turn.workspaceId());
         if (!params.has("threadId")) params.put("threadId", turn.threadId());
         if (!params.has("turnId")) params.put("turnId", turnId);
-        if (!params.has("threadRevision")) params.put("threadRevision", turn.threadRevision());
+        if (!(event instanceof TurnEvent.InputQueueChanged) && !params.has("threadRevision")) {
+            params.put("threadRevision", turn.threadRevision());
+        }
     }
 
     /** 配置写入提交后仅发送脱敏的 scope、workspace 与 version 事实。 */
@@ -463,16 +756,16 @@ public final class RpcSession implements AutoCloseable {
         ObjectNode params = mapper.createObjectNode();
         addNotificationMetadata(params, "runtime");
         params.put("status", status);
+        params.putArray("features").add("task_threads_v1").add("plan_goal_v1");
         if ("ready".equals(status)) params.put("readyToken", readyToken);
         if (reason != null && !reason.isBlank()) params.put("reason", boundedReason(reason));
         return writer.notification("runtime/status-changed", params);
     }
 
-    /** 为非 Turn 语义通知写入同一组公共元数据，确保跨类型事件可按 sequence 排序。 */
+    /** 为非 Turn 语义通知写入同一组公共元数据；物理 sequence 由唯一 stdout owner 分配。 */
     private void addNotificationMetadata(ObjectNode params, String category) {
         params.put("serverInstanceId", serverInstanceId);
         params.put("eventId", nextEventId(category));
-        params.put("sequence", nextNotificationSequence());
         params.put("occurredAt", clock.instant().toString());
         params.put("generation", runtimeGeneration);
     }
@@ -480,13 +773,6 @@ public final class RpcSession implements AutoCloseable {
     /** 分配当前进程实例内唯一且不含用户数据的事件标识。 */
     private String nextEventId(String category) {
         return "evt_" + category + "_" + eventIds.incrementAndGet();
-    }
-
-    /** 使用溢出检测分配单调通知序号，绝不在同一实例内回绕。 */
-    private long nextNotificationSequence() {
-        long sequence = notificationSequences.incrementAndGet();
-        if (sequence < 1) throw new IllegalStateException("notification sequence overflow");
-        return sequence;
     }
 
     /** 校验内部关联标识，防止无效键污染连接级状态。 */
@@ -573,15 +859,52 @@ public final class RpcSession implements AutoCloseable {
         closing.set(true);
         CancellationSource.CancelResult cancellationResult = cancellation.cancel("runtime_closed");
         approvalCompletions.close();
+        RuntimeException failure = cancellationResult.callbackFailure().orElse(null);
+        // Task owner 稍后由 lifecycle 统一关闭；此处只先释放当前连接拥有的 observation。
+        if (tasks != null) {
+            for (String observationId : Set.copyOf(taskObservationIds)) {
+                if (!taskObservationIds.remove(observationId)) continue;
+                try {
+                    tasks.unobserve(observationId);
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
+            }
+        }
+        // Subscription 由 RpcSession 独占，并在 lifecycle 关闭 Task owner 前解除。
+        if (taskSubscription != null) {
+            try {
+                taskSubscription.close();
+            } catch (Exception closeFailure) {
+                RuntimeException subscriptionFailure = new IllegalStateException(
+                        "task event subscription could not close", closeFailure);
+                if (failure == null) failure = subscriptionFailure;
+                else failure.addSuppressed(subscriptionFailure);
+            }
+        }
+        goalObservations.clear();
+        goalTurnNotifications.keySet().forEach(this::abandonGoalTurns);
+        // Goal subscription 同样属于连接投影，必须在关闭共享 runtime owner 前解除。
+        if (goalSubscription != null) {
+            try {
+                goalSubscription.close();
+            } catch (Exception closeFailure) {
+                RuntimeException subscriptionFailure = new IllegalStateException(
+                        "goal event subscription could not close", closeFailure);
+                if (failure == null) failure = subscriptionFailure;
+                else failure.addSuppressed(subscriptionFailure);
+            }
+        }
         // 生命周期资源由本方法在共享 Deadline 下显式关闭，不能使用 try-with-resources 重置预算。
         @SuppressWarnings("PMD.CloseResource")
         DeadlineCloseable runtime = lifecycle;
-        RuntimeException failure = cancellationResult.callbackFailure().orElse(null);
         if (runtime != null) {
             try {
                 runtime.closeAt(deadline.deadlineNanos());
             } catch (RuntimeException closeFailure) {
-                failure = closeFailure;
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
             }
         }
         // RuntimeLease 由 TurnService 在 quiescence 内释放，RPC 不再持有配置代际资源。

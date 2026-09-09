@@ -105,18 +105,24 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 通过共享传输按请求身份冻结唯一 envelope，使 count 和 send 即使使用不同 Adapter 实例
-     * 仍复用同一正文与指纹。
+     * 按请求身份冻结唯一 envelope，并在正常、取消、协议失败和下游回调失败后
+     * 统一释放完整 Prompt。Adapter 只能在这个边界内借用 envelope，避免复制 finally 时
+     * 遗漏异常分支或把共享传输变成无上限内容缓存。
      */
-    protected final ProviderRequestEnvelope envelope(
-            ModelPort.ModelRequest request, Supplier<com.fasterxml.jackson.databind.node.ObjectNode> encoder) {
-        return transport.envelope(request,
-                () -> ProviderRequestEnvelope.freeze(Objects.requireNonNull(encoder.get(), "encoded request")));
-    }
-
-    /** 最终发送或失败关闭后立即释放冻结 Prompt，避免共享连接池同时变成内容缓存。 */
-    protected final void releaseEnvelope(ModelPort.ModelRequest request) {
-        transport.releaseEnvelope(request);
+    protected final <T> T withFrozenEnvelope(
+            ModelPort.ModelRequest request,
+            Supplier<com.fasterxml.jackson.databind.node.ObjectNode> encoder,
+            Function<ProviderRequestEnvelope, T> operation) {
+        Objects.requireNonNull(encoder, "encoder");
+        Objects.requireNonNull(operation, "operation");
+        ProviderRequestEnvelope frozen = transport.envelope(request,
+                () -> ProviderRequestEnvelope.freeze(
+                        Objects.requireNonNull(encoder.get(), "encoded request"), request.configuration().api()));
+        try {
+            return operation.apply(frozen);
+        } finally {
+            transport.releaseEnvelope(request);
+        }
     }
 
     /**
@@ -130,17 +136,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         Objects.requireNonNull(eventSink, "eventSink");
         return submit(request, cancellationToken,
                 controller -> executeGoverned(request, eventSink, controller));
-    }
-
-    /**
-     * 在与发送相同的传输生命周期内执行官方输入计量，并把任何非取消失败收敛为稳定门禁错误。
-     */
-    @SuppressWarnings("PMD.CloseResource")
-    @Override
-    public CompletionStage<ModelPort.InputTokenCount> countInputTokens(
-            ModelPort.ModelRequest request, CancellationToken cancellationToken) {
-        return submit(request, cancellationToken,
-                controller -> executeTokenCountGoverned(request, controller));
     }
 
     /**
@@ -184,84 +179,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             activeControllers.remove(controller);
             transport.unregister(controller);
         });
-    }
-
-    /**
-     * 校验官方计量响应并维护冻结 envelope：只有成功计量才允许后续正式请求复用完整 Prompt。
-     */
-    protected final ModelPort.InputTokenCount completeTokenCount(
-            ModelPort.ModelRequest request, ProviderRequestEnvelope envelope,
-            Supplier<JsonNode> responseSupplier, String providerName) {
-        Objects.requireNonNull(request, "request");
-        Objects.requireNonNull(envelope, "envelope");
-        Objects.requireNonNull(responseSupplier, "responseSupplier");
-        String provider = Objects.requireNonNull(providerName, "providerName");
-        boolean counted = false;
-        try {
-            JsonNode response = responseSupplier.get();
-            JsonNode value = response.get("input_tokens");
-            if (value == null || !value.canConvertToLong() || value.longValue() < 0) {
-                throw new ProviderProtocolException(
-                        "TOKEN_COUNT_RESPONSE", provider + " token count response is invalid", false);
-            }
-            counted = true;
-            return new ModelPort.InputTokenCount(value.longValue(), envelope.fingerprint());
-        } finally {
-            if (!counted) releaseEnvelope(request);
-        }
-    }
-
-    /**
-     * 计量只在无语义输出阶段重试瞬时故障；三次失败后禁止进入正式模型请求。
-     */
-    private ModelPort.InputTokenCount executeTokenCountWithRetry(
-            ModelPort.ModelRequest request, RequestController controller) {
-        controller.bindThread(Thread.currentThread());
-        Throwable last = null;
-        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            controller.throwIfStopped();
-            try {
-                return executeProviderTokenCountAttempt(request, controller);
-            } catch (CancellationException cancelled) {
-                throw cancelled;
-            } catch (ProviderProtocolException failure) {
-                last = failure;
-                if (!failure.retryable() || attempt == MAX_ATTEMPTS) break;
-                awaitBackoff(attempt, failure.retryAfter().orElse(null), controller);
-            } catch (RuntimeException failure) {
-                last = failure;
-                break;
-            }
-        }
-        LOGGER.warn("Provider token count stopped provider={} api={} model={} reason=unavailable",
-                configuration.provider(), configuration.api(), configuration.model());
-        throw new ModelPort.TokenCountUnavailableException(last);
-    }
-
-    /** 将一次完整计量（含内部重试）计为一个熔断样本，用户取消不污染失败计数。 */
-    private ModelPort.InputTokenCount executeTokenCountGoverned(
-            ModelPort.ModelRequest request, RequestController controller) {
-        ProviderCircuitBreaker.Permit permit = transport.acquireCircuit(
-                configuration, ProviderCircuitBreaker.Operation.COUNT);
-        try {
-            ModelPort.InputTokenCount result = executeTokenCountWithRetry(request, controller);
-            permit.success();
-            return result;
-        } catch (CancellationException cancelled) {
-            permit.cancelled();
-            throw cancelled;
-        } catch (RuntimeException failure) {
-            permit.failure();
-            throw failure;
-        }
-    }
-
-    /**
-     * Provider 子类实现官方计量 HTTP 映射；默认失败保证未实现者无法使用字符估算替代。
-     */
-    protected ModelPort.InputTokenCount executeProviderTokenCountAttempt(
-            ModelPort.ModelRequest request, RequestController controller) {
-        throw new ModelPort.TokenCountUnavailableException(null);
     }
 
     /**
@@ -347,6 +264,21 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         });
     }
 
+    /** 使用独立 data-only Reader 执行 Chat SSE，不放宽命名 SSE 的事件字段白名单。 */
+    protected static void executeChatSse(
+            OkHttpClient client, Request request, RequestController controller,
+            ProviderErrorMapper errorMapper, Consumer<OpenAiChatSseReader.Event> eventConsumer) {
+        Objects.requireNonNull(eventConsumer, "eventConsumer");
+        executeSseBody(client, request, controller, errorMapper, bounded -> {
+            OpenAiChatSseReader reader = new OpenAiChatSseReader(bounded);
+            OpenAiChatSseReader.Event event;
+            while ((event = reader.next()) != null) {
+                controller.throwIfStopped();
+                eventConsumer.accept(event);
+            }
+        });
+    }
+
     /**
      * 统一单次 SSE HTTP 交换、受限流、取消与资源释放；协议 Reader 只消费已经通过状态和
      * Content-Type 校验的 bounded body；子类只获得一次性输入流，不能绕过容量和清理边界。
@@ -364,33 +296,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             }
             return null;
         });
-    }
-
-    /**
-     * 执行一次受限 JSON HTTP 交换，供官方 Token 计量端点复用状态、取消和错误映射规则。
-     */
-    protected static JsonNode executeJson(
-            OkHttpClient client, Request request, RequestController controller,
-            ProviderErrorMapper errorMapper) {
-        return executeHttp(client, request, controller, errorMapper,
-                "provider token count exchange failed", response -> {
-                    MediaType contentType = response.body().contentType();
-                    if (contentType == null || !"application".equalsIgnoreCase(contentType.type())
-                        || !"json".equalsIgnoreCase(contentType.subtype())) {
-                        throw new ProviderProtocolException(
-                                "CONTENT_TYPE", "provider token count response has an invalid content type", false);
-                    }
-                    byte[] body;
-                    try (InputStream input = response.body().byteStream()) {
-                        body = readLimited(input, MAX_ERROR_BODY_BYTES);
-                    }
-                    JsonNode value = JSON.readTree(body);
-                    if (value == null || !value.isObject()) {
-                        throw new ProviderProtocolException(
-                                "TOKEN_COUNT_RESPONSE", "provider token count response is invalid", false);
-                    }
-                    return value;
-                });
     }
 
     /** 单一 HTTP exchange owner 统一 Call/Response 注册、错误映射、取消复核和确定性释放。 */
@@ -473,10 +378,11 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 使用有界 jitter 等待，避免并发 Turn 的重试风暴同步发生。
+     * 使用 1s/2s 的有界指数退避等待，给短暂代理重启留下恢复窗口；jitter 只打散并发 Turn，
+     * Controller 仍在每个切片前复核取消与请求总 Deadline，且不改变三次尝试和语义接纳门禁。
      */
     public static void awaitBackoff(int attempt, Duration retryAfter, RequestController controller) {
-        long baseMillis = attempt == 1 ? 100L : 250L;
+        long baseMillis = attempt == 1 ? 1_000L : 2_000L;
         long hintMillis = retryAfter == null ? 0L : retryAfter.toMillis();
         long delayMillis = Math.min(60_000L,
                 Math.max(baseMillis, hintMillis) + ThreadLocalRandom.current().nextLong(0L, 26L));
@@ -510,21 +416,13 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         if (ownsTransport) transport.close();
     }
 
-    /**
-     * 构造 Provider 请求前校验 URI 和凭据不变量。
-     */
+    /** 构造 Provider 请求前再次校验 URI，凭据完整性已由冻结模型配置的构造边界保证。 */
     private static ModelPort.ModelConfiguration requireSafeConfiguration(
             ModelPort.ModelConfiguration configuration) {
         Objects.requireNonNull(configuration, "configuration");
         URI baseUri = configuration.baseUri();
         if (baseUri.getUserInfo() != null || baseUri.getQuery() != null || baseUri.getFragment() != null) {
             throw new IllegalArgumentException("model baseUri must not contain userinfo, query, or fragment");
-        }
-        String host = baseUri.getHost();
-        boolean loopback = "localhost".equalsIgnoreCase(host)
-                           || "127.0.0.1".equals(host) || "::1".equals(host);
-        if (configuration.apiKey().isEmpty() && !loopback) {
-            throw new IllegalArgumentException("hosted model profiles require an API key");
         }
         return configuration;
     }

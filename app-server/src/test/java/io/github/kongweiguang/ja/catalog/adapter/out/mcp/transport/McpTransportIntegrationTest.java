@@ -8,6 +8,9 @@ import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpRuntime;
+import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.McpSession;
+import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.SdkMcpSessionFactory;
+import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpDeadline;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.testsupport.McpStdioFixture;
@@ -28,6 +31,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import mockwebserver3.Dispatcher;
 import mockwebserver3.MockResponse;
@@ -40,7 +44,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
     /** 在无外部网络与用户凭据的条件下验证真实 MCP SDK 适配边界。 */
@@ -84,6 +87,30 @@ final class McpTransportIntegrationTest {
             assertFalse(String.join("\n", observations).contains("resolved"));
         }
         assertTrue(awaitExit(pid));
+    }
+
+    /** 原始 list_changed 在 SDK 自动 tools/list 之前只发布 dirty，避免绕过 Ja 分页和聚合预算。 */
+    @Test
+    void stdioObservesToolsChangedWithoutSdkAutoPagination(@TempDir Path directory) throws Exception {
+        Path report = directory.resolve("list-changed-report.txt");
+        Path classes = Path.of(McpStdioFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        McpServerDefinition definition = McpServerDefinition.stdio(
+                "list-changed-fixture",
+                List.of(javaExecutable(), "-cp", classes.toString(), McpStdioFixture.class.getName(),
+                        report.toString(), "list-changed"),
+                directory,
+                Map.of(),
+                List.of("2025-06-18"));
+        AtomicInteger changes = new AtomicInteger();
+        McpDeadline deadline = McpDeadline.forOperation(McpLimits.DEFAULT, System::nanoTime);
+        try (McpSession session = new SdkMcpSessionFactory(JSON, McpLimits.DEFAULT)
+                .open(definition, deadline, changes::incrementAndGet)) {
+            session.initialize();
+            assertEquals(1, session.listTools(null).tools().size());
+            assertTrue(awaitValue(changes, 1));
+            List<String> observations = Files.readAllLines(report, StandardCharsets.UTF_8);
+            assertEquals(1, observations.stream().filter("method=tools/list"::equals).count());
+        }
     }
 
     /** 验证 Streamable HTTP 使用显式 Mapper，且只在创建请求时注入已解析 Header。 */
@@ -175,7 +202,7 @@ final class McpTransportIntegrationTest {
                     defaults.startupTimeout(), defaults.requestTimeout(), defaults.closeTimeout());
 
             try (McpRuntime runtime = new McpRuntime(List.of(definition), limits, new ObjectMapper())) {
-                assertThrows(IllegalStateException.class, runtime::snapshot);
+                assertTrue(runtime.snapshot().tools().isEmpty());
             }
         }
     }
@@ -188,7 +215,7 @@ final class McpTransportIntegrationTest {
                     "http-content-type-fixture", URI.create(fixture.url()), Map.of(), List.of("2025-06-18"));
             try (McpRuntime runtime = new McpRuntime(
                     List.of(definition), McpLimits.DEFAULT, new ObjectMapper())) {
-                assertThrows(IllegalStateException.class, runtime::snapshot);
+                assertTrue(runtime.snapshot().tools().isEmpty());
             }
         }
     }
@@ -217,7 +244,7 @@ final class McpTransportIntegrationTest {
                 Duration.ofSeconds(3), defaults.requestTimeout(), defaults.closeTimeout());
         try (McpRuntime runtime = new McpRuntime(
                 List.of(definition), limits, new ObjectMapper())) {
-            assertThrows(IllegalStateException.class, runtime::snapshot);
+            assertTrue(runtime.snapshot().tools().isEmpty());
         }
         assertTrue(awaitFile(report));
         long pid = Long.parseLong(Files.readAllLines(report, StandardCharsets.UTF_8).getFirst());
@@ -236,6 +263,16 @@ final class McpTransportIntegrationTest {
             if (Files.isRegularFile(path) && Files.size(path) > 0) {
                 return true;
             }
+            Thread.sleep(20);
+        }
+        return false;
+    }
+
+    /** 有界等待通知观察值，避免依赖线程调度顺序或固定 sleep。 */
+    private static boolean awaitValue(AtomicInteger value, int expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < deadline) {
+            if (value.get() >= expected) return true;
             Thread.sleep(20);
         }
         return false;

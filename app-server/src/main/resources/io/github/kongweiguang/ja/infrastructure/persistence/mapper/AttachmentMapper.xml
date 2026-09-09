@@ -13,7 +13,7 @@
       <arg column="display_name" javaType="string"/><arg column="size_bytes" javaType="_long"/>
       <arg column="media_kind" javaType="string"/><arg column="media_type" javaType="string"/>
       <arg column="status" javaType="string"/><arg column="created_at" javaType="string"/>
-      <arg column="expires_at" javaType="string"/><arg column="bound_turn_id" javaType="string"/></constructor>
+      <arg column="expires_at" javaType="string"/><arg column="bound_message_id" javaType="string"/></constructor>
   </resultMap>
   <resultMap id="titleGenerationRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentRecords$TitleGenerationRow">
     <constructor><arg column="generation_id" javaType="string"/><arg column="thread_id" javaType="string"/>
@@ -36,33 +36,82 @@
   </insert>
   <select id="selectAttachment" resultMap="attachmentRow">
     SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
-      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ta.turn_id AS bound_turn_id
-    FROM attachments a LEFT JOIN turn_attachments ta ON ta.attachment_id=a.attachment_id
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ma.message_id AS bound_message_id
+    FROM attachments a LEFT JOIN message_attachments ma ON ma.attachment_id=a.attachment_id
     WHERE a.attachment_id=#{attachmentId}
   </select>
-  <select id="selectBoundAttachment" resultMap="attachmentRow">
+  <select id="selectUnreservedDraft" resultMap="attachmentRow">
     SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
-      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ta.turn_id AS bound_turn_id
-    FROM attachments a JOIN turn_attachments ta ON ta.attachment_id=a.attachment_id
-      JOIN turns t ON t.turn_id=ta.turn_id
-    WHERE a.attachment_id=#{attachmentId} AND t.thread_id=#{threadId} AND a.status='BOUND'
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,NULL AS bound_message_id
+    FROM attachments a
+    WHERE a.attachment_id=#{attachmentId} AND a.workspace_id=#{workspaceId} AND a.status='DRAFT'
+      AND NOT EXISTS(SELECT 1 FROM pending_input_attachments p
+        WHERE p.attachment_id=a.attachment_id)
+  </select>
+  <select id="selectThreadAttachment" resultMap="attachmentRow">
+    SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ma.message_id AS bound_message_id
+    FROM attachments a
+    LEFT JOIN message_attachments ma ON ma.attachment_id=a.attachment_id
+    LEFT JOIN messages m ON m.message_id=ma.message_id
+    LEFT JOIN pending_input_attachments pia ON pia.attachment_id=a.attachment_id
+    LEFT JOIN pending_inputs pi ON pi.input_id=pia.input_id AND pi.state='PENDING'
+    WHERE a.attachment_id=#{attachmentId}
+      AND ((a.status='BOUND' AND m.thread_id=#{threadId})
+        OR (a.status='DRAFT' AND pi.thread_id=#{threadId}))
   </select>
   <update id="discardDraft">
     UPDATE attachments SET status='DISCARDED',discarded_at=#{discardedAt},blob_sha256=NULL
     WHERE attachment_id=#{attachmentId} AND status='DRAFT'
+      AND NOT EXISTS(SELECT 1 FROM pending_input_attachments p WHERE p.attachment_id=#{attachmentId})
   </update>
   <update id="bindDraft">
     UPDATE attachments SET status='BOUND',bound_at=#{boundAt}
     WHERE attachment_id=#{attachmentId} AND workspace_id=#{workspaceId} AND status='DRAFT'
       AND expires_at&gt;#{boundAt} AND blob_sha256 IS NOT NULL
+      AND NOT EXISTS(SELECT 1 FROM pending_input_attachments p
+        WHERE p.attachment_id=attachments.attachment_id)
   </update>
-  <insert id="insertTurnAttachment">
-    INSERT INTO turn_attachments(turn_id,attachment_id,ordinal,created_at)
-    VALUES(#{turnId},#{attachmentId},#{ordinal},#{boundAt})
+  <insert id="insertMessageAttachment">
+    INSERT INTO message_attachments(message_id,attachment_id,ordinal,created_at)
+    VALUES(#{messageId},#{attachmentId},#{ordinal},#{boundAt})
   </insert>
+  <insert id="insertPendingInputAttachment">
+    INSERT INTO pending_input_attachments(input_id,attachment_id,ordinal,created_at)
+    VALUES(#{inputId},#{attachmentId},#{ordinal},#{createdAt})
+  </insert>
+  <select id="selectReservationInputId" resultType="string">
+    SELECT input_id FROM pending_input_attachments WHERE attachment_id=#{attachmentId}
+  </select>
+  <update id="discardReservedAttachment">
+    UPDATE attachments SET status='DISCARDED',discarded_at=#{discardedAt},blob_sha256=NULL
+    WHERE attachment_id=#{attachmentId} AND status='DRAFT'
+      AND EXISTS(SELECT 1 FROM pending_input_attachments p
+        WHERE p.input_id=#{inputId} AND p.attachment_id=attachments.attachment_id)
+  </update>
+  <update id="discardPendingInputAttachments">
+    UPDATE attachments SET status='DISCARDED',discarded_at=#{discardedAt},blob_sha256=NULL
+    WHERE status='DRAFT' AND EXISTS(SELECT 1 FROM pending_input_attachments p
+      WHERE p.input_id=#{inputId} AND p.attachment_id=attachments.attachment_id)
+  </update>
+  <update id="discardTurnPendingInputAttachments">
+    UPDATE attachments SET status='DISCARDED',discarded_at=#{discardedAt},blob_sha256=NULL
+    WHERE status='DRAFT' AND EXISTS(SELECT 1 FROM pending_input_attachments p
+      JOIN pending_inputs i ON i.input_id=p.input_id
+      WHERE i.turn_id=#{turnId} AND i.state='PENDING' AND p.attachment_id=attachments.attachment_id)
+  </update>
+  <delete id="deletePendingInputAttachments">
+    DELETE FROM pending_input_attachments WHERE input_id=#{inputId}
+  </delete>
+  <delete id="deleteTurnPendingInputAttachments">
+    DELETE FROM pending_input_attachments WHERE input_id IN (
+      SELECT input_id FROM pending_inputs WHERE turn_id=#{turnId} AND state='PENDING')
+  </delete>
   <update id="expireDrafts">
     UPDATE attachments SET status='EXPIRED',expired_at=#{expiredAt},blob_sha256=NULL
     WHERE status='DRAFT' AND expires_at&lt;=#{expiredAt}
+      AND NOT EXISTS(SELECT 1 FROM pending_input_attachments p
+        WHERE p.attachment_id=attachments.attachment_id)
   </update>
   <select id="selectUnreferencedBlobs" resultType="string">
     SELECT b.sha256 FROM attachment_blobs b

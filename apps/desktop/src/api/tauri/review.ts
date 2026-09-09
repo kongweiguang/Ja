@@ -30,6 +30,7 @@ const RevisionSchema = StableTokenSchema;
 const OperationIdSchema = StableTokenSchema.max(128);
 
 const ReviewSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("uncommitted") }).strict(),
   z.object({ kind: z.literal("unstaged") }).strict(),
   z.object({ kind: z.literal("staged") }).strict(),
   z.object({ kind: z.literal("branch"), refId: StableTokenSchema }).strict(),
@@ -123,6 +124,7 @@ const ReviewFileStatusSchema = z.enum([
   "conflicted",
   "untracked",
 ]);
+const ReviewFileLayerSchema = z.enum(["staged", "unstaged", "untracked", "comparison"]);
 const ReviewHunkSchema = z
   .object({
     hunkId: StableTokenSchema,
@@ -137,6 +139,7 @@ const ReviewHunkSchema = z
 const ReviewFileSchema = z
   .object({
     fileId: StableTokenSchema,
+    layer: ReviewFileLayerSchema,
     path: WorkspaceNonEmptyRelativePathSchema,
     oldPath: WorkspaceNonEmptyRelativePathSchema.nullable(),
     status: ReviewFileStatusSchema,
@@ -192,6 +195,7 @@ const ReviewFileDiffSchema = z
     source: ReviewSourceSchema,
     revision: RevisionSchema,
     fileId: StableTokenSchema,
+    layer: ReviewFileLayerSchema,
     path: WorkspaceNonEmptyRelativePathSchema,
     oldPath: WorkspaceNonEmptyRelativePathSchema.nullable(),
     status: ReviewFileStatusSchema,

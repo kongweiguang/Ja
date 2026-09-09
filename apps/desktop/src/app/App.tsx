@@ -19,6 +19,8 @@ function App({
   projectPicker,
   historyAdapter,
   attachmentPort,
+  attachmentPreviewPort,
+  nativeDropPort,
   workbenchAdapters,
   desktopAdapters,
   navigationAdapters,
@@ -30,6 +32,8 @@ function App({
         projectPicker={projectPicker}
         historyAdapter={historyAdapter}
         attachmentPort={attachmentPort}
+        attachmentPreviewPort={attachmentPreviewPort}
+        nativeDropPort={nativeDropPort}
         workbenchAdapters={workbenchAdapters}
         desktopAdapters={desktopAdapters}
         navigationAdapters={navigationAdapters}

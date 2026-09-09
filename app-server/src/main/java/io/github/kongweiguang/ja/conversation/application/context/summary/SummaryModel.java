@@ -19,11 +19,11 @@ import java.util.Optional;
 @FunctionalInterface
 public interface SummaryModel {
     /**
-     * 使用 Provider 官方接口计量冻结摘要提示；实现必须让紧随其后的 summarize 复用同一 envelope。
+     * 对冻结摘要提示执行纯本地保守估算；实现不得发起 Provider 请求。
      */
-    default ModelPort.InputTokenCount countInputTokens(SummaryPrompt prompt) {
+    default ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
         Objects.requireNonNull(prompt, "prompt");
-        throw new ModelPort.TokenCountUnavailableException(null);
+        throw new UnsupportedOperationException("local summary input token estimation is not implemented");
     }
 
     /**

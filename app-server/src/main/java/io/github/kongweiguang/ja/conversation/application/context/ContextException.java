@@ -48,10 +48,6 @@ public final class ContextException extends RuntimeException {
          */
         CONTEXT_LIMIT,
         /**
-         * Provider 官方输入计量不可用；该失败发生时禁止发送模型请求。
-         */
-        TOKEN_COUNT_UNAVAILABLE,
-        /**
          * 摘要模型或摘要结果未满足压缩契约。
          */
         SUMMARY_FAILURE,

@@ -387,6 +387,24 @@ final class TurnQueueTest {
         }
     }
 
+    /** 幂等 admission 复用旧 Turn 时应正常释放容量，且绝不执行本次 phantom 任务。 */
+    @Test
+    void releasesUnsubmittedReservationForIdempotentReplay() throws Exception {
+        try (TurnQueue queue = new TurnQueue(1, 1, 1)) {
+            AtomicInteger executions = new AtomicInteger();
+            TurnQueue.Reservation reservation = queue.reserve("thr_replay", "turn_replay_attempt");
+            reservation.releaseWithoutExecution();
+
+            reservation.completion().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            assertEquals(0, executions.get());
+            assertEquals(0, queue.admittedCount());
+
+            queue.submit("thr_replay", "turn_after_replay", executions::incrementAndGet)
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+            assertEquals(1, executions.get());
+        }
+    }
+
     /** 有界等待并将超时转为断言失败，避免并发测试无限挂起。 */
     private static void await(CountDownLatch latch) {
         try {

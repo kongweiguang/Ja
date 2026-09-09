@@ -6,7 +6,6 @@ package io.github.kongweiguang.ja.transport.rpc.protocol;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
-import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 
@@ -57,7 +56,7 @@ public final class TurnEventWireMapper {
                 params.put("text", value.text());
                 if (value.reasoningSummary() != null) params.put("reasoningSummary", value.reasoningSummary());
                 params.put("modelRound", value.modelRound());
-                if (value.usage() != null) params.set("usage", usage(value.usage()));
+                params.set("usage", RpcResults.requestUsage(mapper, value.usage(), value.context().occurredAt()));
                 ArrayNode calls = params.putArray("toolCalls");
                 value.toolCalls().forEach(call -> {
                     ObjectNode item = calls.addObject();
@@ -65,6 +64,11 @@ public final class TurnEventWireMapper {
                     item.set("presentation", presentations.map(call.presentation()));
                     item.put("ordinal", call.ordinal());
                 });
+            }
+            case TurnEvent.ToolStarted value -> {
+                method = "tool/started";
+                params.put("callId", value.callId());
+                params.put("ordinal", value.ordinal());
             }
             case TurnEvent.ToolBatchCommitted value -> {
                 method = "tool/batch-committed";
@@ -92,6 +96,33 @@ public final class TurnEventWireMapper {
                 params.put("decision", wire(value.decision()));
                 params.put("from", "waiting_approval").put("to", "running");
             }
+            case TurnEvent.InputQueueChanged value -> {
+                method = "turn/input-queue-changed";
+                params.remove("threadRevision");
+                params.set("inputQueue", RpcResults.inputQueue(mapper, value.inputQueue()));
+            }
+            case TurnEvent.InputConsumed value -> {
+                method = "turn/input-consumed";
+                params.set("input", RpcResults.queuedInput(mapper, value.input()));
+                ObjectNode userItem = params.putObject("userItem").put("itemId", value.userItem().itemId())
+                        .put("createdAt", value.userItem().createdAt().toString())
+                        .put("turnId", value.userItem().turnId()).put("kind", "user_input");
+                userItem.set("content", RpcResults.userContent(mapper, value.userItem().content()));
+                userItem.set("attachments", RpcResults.attachmentSummaries(mapper,
+                        value.userItem().attachments()));
+                params.set("inputQueue", RpcResults.inputQueue(mapper, value.inputQueue()));
+                if (value.assistantSettlement() != null) {
+                    TurnEvent.AssistantSettlement settlement = value.assistantSettlement();
+                    ObjectNode assistant = params.putObject("assistantSettlement")
+                            .put("messageId", settlement.messageId()).put("text", settlement.text())
+                            .put("modelRound", settlement.modelRound());
+                    assistant.set("usage", RpcResults.requestUsage(
+                            mapper, settlement.usage(), value.context().occurredAt()));
+                    if (settlement.reasoningSummary() != null) {
+                        assistant.put("reasoningSummary", settlement.reasoningSummary());
+                    }
+                }
+            }
             case TurnEvent.Terminal value -> {
                 method = "turn/terminal";
                 params.put("state", wire(value.state()));
@@ -103,12 +134,10 @@ public final class TurnEventWireMapper {
                             .put("text", value.finalMessage().text());
                 }
                 if (value.usage() != null) {
-                    TurnEvent.TerminalUsage terminalUsage = value.usage();
-                    params.putObject("usage").put("inputTokens", terminalUsage.usage().inputTokens())
-                            .put("outputTokens", terminalUsage.usage().outputTokens())
-                            .put("totalTokens", terminalUsage.usage().totalTokens())
-                            .put("modelRound", terminalUsage.modelRound());
+                    params.set("usage", RpcResults.requestUsage(
+                            mapper, value.usage(), value.context().occurredAt()));
                 }
+                params.set("changeSet", RpcResults.changeSet(mapper, value.changeSet()));
             }
             case TurnEvent.TextDelta ignored ->
                     throw new IllegalStateException("draft events must be handled before durable mapping");
@@ -116,14 +145,6 @@ public final class TurnEventWireMapper {
                     throw new IllegalStateException("draft events must be handled before durable mapping");
         }
         return new WireEvent(method, params);
-    }
-
-    /**
-     * 仅映射 Provider 实际返回的 usage，避免用零值伪造计量事实。
-     */
-    private ObjectNode usage(ModelUsage value) {
-        return mapper.createObjectNode().put("inputTokens", value.inputTokens())
-                .put("outputTokens", value.outputTokens()).put("totalTokens", value.totalTokens());
     }
 
     /**

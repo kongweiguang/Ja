@@ -67,4 +67,43 @@ describe("usePreviewController", () => {
     expect(result.current.viewModel.draft).toBe("https://openai.com/docs");
     expect(result.current.viewModel.projection?.origin).toBe("https://openai.com");
   });
+
+  it("附件投影切入和返回时保留网页 URL 草稿与导航 port", () => {
+    const port = createPort();
+    const attachmentPort = {
+      open: vi.fn(async () => new Promise<never>(() => undefined)),
+      read: vi.fn(),
+      close: vi.fn(async () => undefined),
+    };
+    const attachmentTarget = {
+      attachmentId: "att_image_1",
+      displayName: "shot.png",
+      mediaKind: "image" as const,
+      authorization: { kind: "draft" as const },
+    };
+    const { result, rerender } = renderHook(
+      ({ target }) =>
+        usePreviewController({
+          url: "https://example.com/path",
+          loading: false,
+          recovering: false,
+          active: true,
+          port,
+          attachmentTarget: target,
+          attachmentPort,
+        }),
+      { initialProps: { target: undefined as typeof attachmentTarget | undefined } },
+    );
+    act(() => result.current.actions.changeDraft("https://draft.example/path"));
+
+    rerender({ target: attachmentTarget });
+    expect(result.current.viewModel.mode).toBe("attachment");
+    expect(result.current.viewModel.draft).toBe("https://draft.example/path");
+
+    rerender({ target: undefined });
+    expect(result.current.viewModel.mode).toBe("web");
+    expect(result.current.viewModel.draft).toBe("https://draft.example/path");
+    expect(port.navigate).not.toHaveBeenCalled();
+    expect(port.reload).not.toHaveBeenCalled();
+  });
 });

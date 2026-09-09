@@ -15,12 +15,15 @@ import type {
   AccessMode,
   SettingsDocument,
   ThemeMode,
+  UiPalette,
 } from "../domain/types";
 
 /**
  * Application action Port 只接受规范 DTO；UI 的 Probe/Status 投影不能被误写回设置文档。
  */
 export interface SettingsPorts {
+  /** 首次创建先提交 Provider 聚合，再把一次性 Secret 写入独立凭据 owner。 */
+  onCreateProvider: (provider: ProviderSave, secret: string) => Promise<void>;
   onSaveProvider: (provider: ProviderSave) => Promise<void>;
   onDeleteProvider: (
     providerId: string,
@@ -36,7 +39,6 @@ export interface SettingsPorts {
   ) => Promise<void>;
   onMoveModel: (providerId: string, modelId: string, direction: -1 | 1) => Promise<void>;
   onDefaultSelectionChange: (selection: DefaultModelSelection) => Promise<void>;
-  onRestoreDefaultSelection: () => Promise<void>;
   /** 通过原生一次性 Command 替换 Credential，且绝不把它返回状态层。 */
   onReplaceCredential: (credentialId: string, secret: string) => Promise<void>;
   /** 清除 Credential 时保留不含 Secret 的 Model 或 MCP Selector。 */
@@ -47,8 +49,10 @@ export interface SettingsPorts {
   onCloseMcp: (id: string) => Promise<void>;
   onToggleSkill: (id: string, enabled: boolean) => Promise<void>;
   onAccessModeChange: (mode: AccessMode) => Promise<void>;
-  onAppearanceChange: (appearance: AppearanceSettings) => Promise<void>;
-  onResetProject: () => Promise<void>;
+  onAppearanceChange: (
+    appearance: AppearanceSettings,
+    changed: keyof AppearanceSettings,
+  ) => Promise<void>;
 }
 
 /**
@@ -78,11 +82,35 @@ export interface SettingsAdapter {
  * Port 只暴露本用例需要的外观事实和动作，不形成第二套持久化 owner。
  */
 export interface SettingsAppearancePort {
+  themeMode: ThemeMode;
+  palette: UiPalette;
   reducedMotion: boolean;
+  reducedTransparency: boolean;
   highContrast: boolean;
   setThemeMode(mode: ThemeMode): void;
+  setPalette(palette: UiPalette): void;
   setHighContrast(enabled: boolean): void;
   setReduceMotion(enabled: boolean): void;
+  setReducedTransparency(enabled: boolean): void;
+}
+
+export type SettingsUpdateCheckResult =
+  | { kind: "unavailable" }
+  | { kind: "up-to-date" }
+  | { kind: "available"; currentVersion: string; version: string; publishedAt?: string };
+
+export interface SettingsUpdateProgress {
+  readonly downloadedBytes: number;
+  readonly contentLength?: number;
+  readonly percent?: number;
+}
+
+/** 桌面设置只消费外链与更新四个窄动作，不感知 Tauri plugin、Resource 或 command 名称。 */
+export interface SettingsDesktopPort {
+  openExternalUrl(url: string): Promise<void>;
+  checkForUpdate(): Promise<SettingsUpdateCheckResult>;
+  installUpdate(onProgress: (progress: SettingsUpdateProgress) => void): Promise<void>;
+  relaunchAfterUpdate(): Promise<void>;
 }
 
 /** Runtime 生命周期只提供设置首次读取的 generation admission。 */
@@ -106,7 +134,7 @@ export interface SkillListResult {
   items: Array<{
     skillId: string;
     name: string;
-    scope: "builtin" | "user" | "workspace";
+    scope: "builtin" | "user" | "ja" | "project";
     enabled: boolean;
     status: "healthy" | "invalid" | "unavailable";
     description: string;
@@ -143,7 +171,7 @@ interface ModelTestResult {
 
 /** Settings runtime 端口只暴露领域能力，JA-RPC method 与 params envelope 留在 composition/infrastructure。 */
 export interface SettingsRuntimePort {
-  listSkills(): Promise<SkillListResult>;
+  listSkills(input?: { workspaceId?: string }): Promise<SkillListResult>;
   listMcpServers(): Promise<McpListResult>;
   testMcp(mcpRevision: string): Promise<McpTestResult>;
   listMcpTools(mcpRevision: string): Promise<McpToolsResult>;

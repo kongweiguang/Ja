@@ -87,10 +87,21 @@ public interface HistoryMapper {
     /** admission 以单次 CAS 推进 revision，并在首次占有 PLACEHOLDER 时原子写入临时标题。 */
     int compareAndSetThreadAdmission(PersistenceRecords.ThreadAdmissionCas values);
 
+    /** 以 revision CAS 更新 active Thread 的 pinned_at。 */
+    int compareAndSetThreadPin(PersistenceRecords.ThreadPinCas values);
+
+    /**
+     * 以 revision CAS 仅确认当前最新 COMPLETED/FAILED Turn，竞争或无可确认事实均返回零行。
+     */
+    int compareAndSetThreadSeen(PersistenceRecords.ThreadSeenCas values);
+
     /**
      * 以 revision 更新归档或删除标记，竞争失败返回零行。
      */
     int updateThreadLifecycle(PersistenceRecords.ThreadLifecycle values);
+
+    /** 以 revision CAS 恢复归档 Thread，并强制保持未置顶。 */
+    int restoreThread(PersistenceRecords.ThreadRestore values);
 
     /**
      * 统计非终态 Turn，作为 Thread 生命周期变更的关闭门。
@@ -111,6 +122,6 @@ public interface HistoryMapper {
     /** 在 change set 事务内保存已经校验的 UTF-8 diff。 */
     int insertChangeSetArtifact(PersistenceRecords.ChangeSetInsert values);
 
-    /** 通过 thread+turn+artifact 三元身份读取冻结 diff。 */
+    /** 每次通过 thread+turn+artifact 三元身份读取冻结 diff 正文，不复用应用层正文缓存。 */
     PersistenceRecords.ChangeSetArtifactRow selectChangeSetArtifact(PersistenceRecords.ChangeSetArtifactKey values);
 }

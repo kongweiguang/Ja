@@ -102,7 +102,7 @@ public record SummaryDocument(
 
     /** 按固定标题序列化当前有效事实；退休清单只用于验证和审计，不进入普通 Agent Prompt。 */
     public String toPromptText() {
-        StringBuilder text = new StringBuilder("Ja Context Summary v2\n");
+        StringBuilder text = new StringBuilder("Ja Context Summary v1\n");
         append(text, "Goals", goals);
         append(text, "Effective Constraints", constraints);
         append(text, "Completed Progress", completedProgress);

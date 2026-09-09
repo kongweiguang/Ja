@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
-import errorCatalog from "../../../../../contracts/ja-rpc/v2/error-catalog.json";
+import errorCatalog from "../../../../../contracts/ja-rpc/v1/error-catalog.json";
 import {
   JA_ERROR_CODES,
   JaError,
@@ -12,11 +12,11 @@ import {
   mapValidationError,
 } from "@/api/protocol/errors";
 
-describe("JA-RPC v2 error boundary", () => {
+describe("JA-RPC v1 error boundary", () => {
   /** 将生产 mapper 锁定到仓库内唯一的 code/errorCode/category/retryable 目录。 */
   it("matches every frozen typed error tuple", () => {
     expect(errorCatalog.schemaVersion).toBe(2);
-    expect(errorCatalog.errors).toHaveLength(58);
+    expect(errorCatalog.errors).toHaveLength(Object.keys(JA_ERROR_CODES).length);
     expect(
       Object.entries(JA_ERROR_CODES).map(([errorCode, code]) => ({ code, errorCode })),
     ).toEqual(errorCatalog.errors.map(({ code, errorCode }) => ({ code, errorCode })));
@@ -47,6 +47,57 @@ describe("JA-RPC v2 error boundary", () => {
         }).errorCode,
       ).toBe("INTERNAL_ERROR");
     }
+  });
+
+  /** Task 与 Workspace 写租约错误必须保留恢复语义，避免 UI 对容量、权限和超时统一盲重试。 */
+  it("keeps task and write lease recovery tuples stable", () => {
+    expect(
+      errorCatalog.errors.filter(
+        ({ errorCode }) =>
+          errorCode.startsWith("TASK_") || errorCode === "WORKSPACE_WRITE_LEASE_TIMEOUT",
+      ),
+    ).toEqual([
+      { code: -32073, errorCode: "TASK_NOT_FOUND", category: "not_found", retryable: false },
+      {
+        code: -32074,
+        errorCode: "TASK_RELATION_INVALID",
+        category: "validation",
+        retryable: false,
+      },
+      {
+        code: -32075,
+        errorCode: "TASK_CONTEXT_REVISION_CONFLICT",
+        category: "conflict",
+        retryable: true,
+      },
+      {
+        code: -32076,
+        errorCode: "TASK_PERMISSION_DENIED",
+        category: "permission",
+        retryable: false,
+      },
+      { code: -32077, errorCode: "TASK_DEPTH_LIMIT", category: "capacity", retryable: false },
+      { code: -32078, errorCode: "TASK_TREE_LIMIT", category: "capacity", retryable: false },
+      { code: -32079, errorCode: "TASK_MAILBOX_FULL", category: "capacity", retryable: true },
+      {
+        code: -32083,
+        errorCode: "TASK_TREE_DELETE_REQUIRED",
+        category: "conflict",
+        retryable: false,
+      },
+      {
+        code: -32084,
+        errorCode: "TASK_OBSERVATION_INVALID",
+        category: "not_found",
+        retryable: false,
+      },
+      {
+        code: -32085,
+        errorCode: "WORKSPACE_WRITE_LEASE_TIMEOUT",
+        category: "timeout",
+        retryable: true,
+      },
+    ]);
   });
 
   /** 保留目录批准的退避与 errorId，且不为无退避错误合成默认值。 */

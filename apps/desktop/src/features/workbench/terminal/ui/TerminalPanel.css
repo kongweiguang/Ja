@@ -9,7 +9,7 @@
   overflow: hidden;
   border-top: 1px solid var(--ja-border);
   padding: 0.35rem;
-  background: var(--ja-background);
+  background: var(--ja-terminal-workspace-background);
 }
 .ja-terminal-panel .xterm {
   height: 100%;
@@ -19,7 +19,7 @@
   min-width: 0;
 }
 .ja-terminal-panel .xterm-viewport {
-  background: transparent !important;
+  background: var(--ja-terminal-background) !important;
 }
 
 .ja-terminal-search {
@@ -33,9 +33,9 @@
   padding: 0.3rem;
   border: 1px solid var(--ja-border);
   border-radius: 0.35rem;
-  background: var(--ja-panel, #25262a);
-  color: var(--ja-muted, #a7abb4);
-  box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 28%);
+  background: var(--ja-terminal-popup);
+  color: var(--ja-terminal-muted);
+  box-shadow: var(--ja-shadow-md);
 }
 
 .ja-terminal-search input {

@@ -14,6 +14,8 @@ import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentConte
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
+import io.github.kongweiguang.ja.conversation.domain.model.SkillReferenceContent;
+import io.github.kongweiguang.ja.conversation.domain.model.WorkspaceReferenceContent;
 import io.github.kongweiguang.ja.conversation.domain.prompt.AgentPromptSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
@@ -145,6 +147,12 @@ final class AgentContextMapper {
             } else if (content instanceof TextContent text) {
                 blocks.add(new ContextMessage.TextBlock(text.text()));
                 characters = Math.addExact(characters, text.text().length());
+            } else if (content instanceof WorkspaceReferenceContent reference) {
+                String manifest = workspaceReferenceManifest(reference);
+                blocks.add(new ContextMessage.TextBlock(manifest));
+                characters = Math.addExact(characters, manifest.length());
+            } else if (content instanceof SkillReferenceContent) {
+                // Skill 正文只进入本条消息的动态 System；用户历史保留引用但不能把 ID 伪装成提示词。
             } else if (content instanceof ToolCallContent call) {
                 String arguments = writeArguments(call.arguments());
                 blocks.add(new ContextMessage.ToolCallBlock(call.callId(), call.name(), arguments));
@@ -252,6 +260,14 @@ final class AgentContextMapper {
     /** 统一生成安全 fallback，使不支持的媒体不会被伪装成已原生理解。 */
     private static String attachmentManifest(String attachmentId) {
         return "Attachment " + attachmentId + " is available through the read_attachment tool.";
+    }
+
+    /**
+     * Workspace 引用只告诉模型路径与类型，并明确正文未预加载；是否读取由后续真实 Tool 决策。
+     */
+    private static String workspaceReferenceManifest(WorkspaceReferenceContent reference) {
+        return "Workspace reference [" + reference.kind().name().toLowerCase(java.util.Locale.ROOT)
+                + "] " + reference.relativePath() + " (content not preloaded).";
     }
 
     /** 单个冻结请求共享 Codec 总量预算，超过时按附件顺序稳定回退到 Tool。 */

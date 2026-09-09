@@ -1,10 +1,14 @@
 /* @author kongweiguang */
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
+.ja-dialog-overlay.ja-conversation-search-overlay {
+  background: transparent;
+}
+
 .ja-conversation-search-dialog {
-  top: min(28vh, 240px);
+  top: 50%;
   width: min(calc(100vw - 32px), 640px);
-  max-height: min(70vh, 620px);
+  max-height: min(calc(100vh - 32px), 620px);
   padding: 0;
   border-radius: 8px;
   overflow: hidden;
@@ -86,7 +90,7 @@
 .ja-conversation-search-results button {
   display: grid;
   min-height: 40px;
-  grid-template-columns: 16px minmax(0, 1fr);
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   padding: 0 10px;
@@ -119,6 +123,12 @@
 .ja-conversation-search-results button > span {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-conversation-search-results button > small {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
   white-space: nowrap;
 }
 

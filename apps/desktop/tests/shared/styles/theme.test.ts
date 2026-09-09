@@ -20,6 +20,7 @@ describe("theme selection", () => {
       palette: "xcode",
       highContrast: true,
       reduceMotion: true,
+      reducedTransparency: true,
       prefersDark: false,
     });
     expect(root.dataset["theme"]).toBe("dark");
@@ -27,12 +28,14 @@ describe("theme selection", () => {
     expect(root.dataset["palette"]).toBe("xcode");
     expect(root.dataset["highContrast"]).toBe("true");
     expect(root.dataset["reduceMotion"]).toBe("true");
+    expect(root.dataset["reducedTransparency"]).toBe("true");
     expect(root).toHaveClass(
       "ja-theme-dark",
       "ja-theme-mode-dark",
       "ja-palette-xcode",
       "ja-high-contrast",
       "ja-reduce-motion",
+      "ja-reduced-transparency",
     );
   });
 
@@ -44,6 +47,7 @@ describe("theme selection", () => {
       palette: "developer_blue",
       highContrast: false,
       reduceMotion: false,
+      reducedTransparency: false,
       prefersDark: false,
     });
     expect(root.dataset["theme"]).toBe("light");
@@ -51,5 +55,38 @@ describe("theme selection", () => {
     expect(root.dataset["palette"]).toBe("xcode");
     expect(root).toHaveClass("ja-theme-light", "ja-theme-mode-system", "ja-palette-xcode");
     expect(root).not.toHaveClass("ja-theme-dark", "ja-high-contrast", "ja-reduce-motion");
+    expect(root).not.toHaveClass("ja-reduced-transparency");
   });
+
+  it.each([
+    ["xcode", "light"],
+    ["xcode", "dark"],
+    ["fleet", "light"],
+    ["fleet", "dark"],
+    ["obsidian", "light"],
+    ["obsidian", "dark"],
+    ["claude", "light"],
+    ["claude", "dark"],
+  ] as const)(
+    "applies the %s palette in %s mode without leaving the previous palette class",
+    (palette, mode) => {
+      const root = document.createElement("html");
+      root.className = "ja-palette-xcode ja-palette-fleet ja-palette-obsidian ja-palette-claude";
+      applyTheme(root, {
+        mode,
+        palette,
+        highContrast: false,
+        reduceMotion: false,
+        reducedTransparency: false,
+        prefersDark: false,
+      });
+      expect(root.dataset["palette"]).toBe(palette);
+      expect(root).toHaveClass(`ja-palette-${palette}`, `ja-theme-${mode}`);
+      expect(
+        ["xcode", "fleet", "obsidian", "claude"].filter((value) =>
+          root.classList.contains(`ja-palette-${value}`),
+        ),
+      ).toEqual([palette]);
+    },
+  );
 });

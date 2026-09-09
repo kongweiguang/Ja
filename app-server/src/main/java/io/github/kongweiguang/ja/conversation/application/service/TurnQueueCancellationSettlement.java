@@ -100,15 +100,14 @@ final class TurnQueueCancellationSettlement {
     }
 
     /**
-     * 按 Scope、协调器索引、活动表、运行时租约顺序尽力释放全部资源。
+     * 按 Scope、协调器索引和活动表顺序尽力释放全部资源；请求级租约由执行器就地释放。
      * 任一步失败都不能阻断后续释放；聚合后的异常交给最终 completion 统一传播。
      */
     private Throwable release(TurnService.Key key, TurnOwnership turn) {
         Throwable failure = runReleaseStep(null, turn.cancellation::close);
         failure = runReleaseStep(failure,
                 () -> cancellations.complete(key.threadId(), key.turnId()));
-        failure = runReleaseStep(failure, () -> active.remove(key, turn));
-        return runReleaseStep(failure, turn.runtimeLease::close);
+        return runReleaseStep(failure, () -> active.remove(key, turn));
     }
 
     /**

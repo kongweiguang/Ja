@@ -19,7 +19,7 @@ where
     assert!(serde_json::from_value::<T>(input).is_err());
 }
 
-/// 在 Tauri 边界锁定 JA-RPC v2 五种写 DTO 的必填语义，避免把约束推迟到 Java 运行期才发现。
+/// 在 Tauri 边界锁定 JA-RPC v1 五种写 DTO 的必填语义，避免把约束推迟到 Java 运行期才发现。
 #[test]
 fn cas_write_dtos_reject_missing_and_null_expected_version() {
     assert_expected_version_is_required::<ConfigPatchInput>(json!({
@@ -47,7 +47,7 @@ fn cas_write_dtos_reject_missing_and_null_expected_version() {
     }));
 }
 
-/// 用户级写入必须省略 workspaceId 而不是发送 null，因为严格 Java v2 handler 会把字段存在视为项目写入声明。
+/// 用户级写入必须省略 workspaceId 而不是发送 null，因为严格 Java v1 handler 会把字段存在视为项目写入声明。
 #[test]
 fn user_scope_write_dtos_omit_workspace_identity() {
     let patch: ConfigPatchInput = serde_json::from_value(json!({

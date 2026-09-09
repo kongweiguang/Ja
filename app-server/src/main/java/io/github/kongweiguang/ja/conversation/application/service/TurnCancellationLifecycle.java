@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.application.cancellation.Cancellat
 import io.github.kongweiguang.ja.conversation.application.loop.TurnQueue;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
+import io.github.kongweiguang.ja.foundation.error.StorageException;
 
 import java.time.Clock;
 import java.util.Map;
@@ -231,7 +232,8 @@ final class TurnCancellationLifecycle {
     }
 
     /**
-     * 把 conversation 端口的取消类别映射为入站用例错误，未知存储故障保持不可伪装。
+     * 把 conversation 端口与生产 Repository 的稳定取消类别映射为入站用例错误；仅 CAS 与缺失
+     * 可以越过应用边界，其他存储故障保持原样，避免 transport 把不可用误判为用户竞争。
      */
     private ConversationRepository.CancellationClaim claimCancellation(TurnService.Key key,
                                                                        long expectedThreadRevision,
@@ -247,6 +249,14 @@ final class TurnCancellationLifecycle {
                         TurnUseCase.CancelFailure.CONFLICT);
                 case UNAVAILABLE -> failure;
             };
+        } catch (StorageException failure) {
+            if (failure.code() == StorageException.Code.CAS_CONFLICT) {
+                throw TurnUseCase.TurnCancellationException.of(TurnUseCase.CancelFailure.CONFLICT);
+            }
+            if (failure.code() == StorageException.Code.NOT_FOUND) {
+                throw TurnUseCase.TurnCancellationException.of(TurnUseCase.CancelFailure.TURN_NOT_FOUND);
+            }
+            throw failure;
         }
     }
 

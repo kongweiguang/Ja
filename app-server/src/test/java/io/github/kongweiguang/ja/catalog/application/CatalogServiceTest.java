@@ -17,6 +17,8 @@ import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSna
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.workspace.domain.Workspace;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 
 import java.lang.reflect.Proxy;
 import java.net.URI;
@@ -43,9 +45,10 @@ final class CatalogServiceTest {
     void ownsAndClosesEveryConfigurationGenerationLease() {
         RecordingGenerationPort generations = new RecordingGenerationPort();
         RecordingQueryPort queries = new RecordingQueryPort();
-        CatalogService service = new CatalogService(queries, generations, unsupportedModel());
+        CatalogService service = new CatalogService(
+                queries, generations, unsupportedModel(), unsupportedWorkspaces());
 
-        service.listSkills(null, 10);
+        service.listSkills(null, null, 10);
         service.listMcp(null, 10);
         service.testMcp(MCP_ID).toCompletableFuture().join();
         service.readMcpTools(MCP_ID, null, 10);
@@ -66,7 +69,8 @@ final class CatalogServiceTest {
             sink.onEvent(new ModelPort.TextDelta("discarded response body"));
             return providerResult;
         };
-        CatalogService service = new CatalogService(new RecordingQueryPort(), generations, modelPort);
+        CatalogService service = new CatalogService(
+                new RecordingQueryPort(), generations, modelPort, unsupportedWorkspaces());
 
         CompletionStage<CatalogService.ModelTestResult> result = service.testModel(
                 "provider_fixture", "model_fixture", CancellationToken.none());
@@ -84,10 +88,79 @@ final class CatalogServiceTest {
         assertTrue(generations.lease.closed());
     }
 
+    /** Catalog 模型探测按三种显式协议路由，并逐个读取自定义供应商自己的凭据引用。 */
+    @Test
+    void deepSeekModelTestsKeepApiAndCredentialIdentity() {
+        Map<ConfigurationGenerationSnapshot.Api, ModelPort.Api> routes = Map.of(
+                ConfigurationGenerationSnapshot.Api.ANTHROPIC_MESSAGES, ModelPort.Api.ANTHROPIC_MESSAGES,
+                ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES, ModelPort.Api.OPENAI_RESPONSES,
+                ConfigurationGenerationSnapshot.Api.OPENAI_CHAT_COMPLETIONS,
+                ModelPort.Api.OPENAI_CHAT_COMPLETIONS);
+
+        routes.forEach((configuredApi, expectedApi) -> {
+            String suffix = configuredApi.name().toLowerCase(java.util.Locale.ROOT);
+            String credentialId = "cred_" + suffix;
+            String secret = "secret-" + suffix;
+            ModelGenerationPort generations = new ModelGenerationPort(
+                    configuredApi, credentialId, secret);
+            AtomicReference<ModelPort.ModelRequest> captured = new AtomicReference<>();
+            ModelPort modelPort = (request, sink, cancellation) -> {
+                captured.set(request);
+                return CompletableFuture.completedFuture(
+                        new ModelPort.ModelOutcome(ModelPort.FinishReason.STOP, null, null));
+            };
+            CatalogService service = new CatalogService(
+                    new RecordingQueryPort(), generations, modelPort, unsupportedWorkspaces());
+
+            service.testModel("provider_fixture", "model_fixture", CancellationToken.none())
+                    .toCompletableFuture().join();
+
+            ModelPort.ModelConfiguration configuration = captured.get().configuration();
+            assertEquals(expectedApi, configuration.api());
+            assertEquals(secret, configuration.apiKey());
+            assertTrue(generations.lease.closed());
+        });
+    }
+
     /** 本用例只验证查询租约；任何意外模型探测都必须显式失败而不是访问外部 Provider。 */
     private static ModelPort unsupportedModel() {
         return (request, sink, cancellation) ->
                 CompletableFuture.failedFuture(new AssertionError("unexpected model test"));
+    }
+
+    /** 仅通用 catalog 测试不应解析工作区，任何意外跨域调用都立即失败。 */
+    private static WorkspaceUseCase unsupportedWorkspaces() {
+        return (WorkspaceUseCase) Proxy.newProxyInstance(CatalogServiceTest.class.getClassLoader(),
+                new Class<?>[]{WorkspaceUseCase.class}, (proxy, method, arguments) -> {
+                    throw new AssertionError("unexpected workspace call: " + method.getName());
+                });
+    }
+
+    /**
+     * workspaceId 只能通过已打开 Workspace 能力解析，且同一规范根必须同时进入配置租约和发现端口。
+     */
+    @Test
+    void resolvesOpenProjectWorkspaceBeforeSkillDiscovery() {
+        Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-catalog-project")
+                .toAbsolutePath().normalize();
+        RecordingGenerationPort generations = new RecordingGenerationPort(root);
+        RecordingQueryPort queries = new RecordingQueryPort();
+        Workspace workspace = new Workspace("ws_fixture", root, "Fixture", Workspace.Trust.TRUSTED, 0);
+        WorkspaceUseCase workspaces = (WorkspaceUseCase) Proxy.newProxyInstance(
+                CatalogServiceTest.class.getClassLoader(), new Class<?>[]{WorkspaceUseCase.class},
+                (proxy, method, arguments) -> switch (method.getName()) {
+                    case "requireOpenWorkspace" -> workspace;
+                    case "isGeneralWorkspace" -> false;
+                    default -> throw new AssertionError("unexpected workspace call: " + method.getName());
+                });
+        CatalogService service = new CatalogService(
+                queries, generations, unsupportedModel(), workspaces);
+
+        service.listSkills("ws_fixture", null, 10);
+
+        assertEquals(root, queries.skillWorkspace.get());
+        assertTrue(queries.skillWorkspaceTrusted);
+        assertTrue(generations.leases.getFirst().closed());
     }
 
     /**
@@ -119,11 +192,22 @@ final class CatalogServiceTest {
     /** 记录每次 application 取得的通用配置租约。 */
     private static final class RecordingGenerationPort implements ConfigurationGenerationPort {
         private final List<RecordingLease> leases = new CopyOnWriteArrayList<>();
+        private final Path expectedWorkspaceRoot;
 
-        /** 强制 catalog 查询使用通用工作区，并为每个命令返回独立租约。 */
+        /** 默认夹具只允许通用配置租约。 */
+        private RecordingGenerationPort() {
+            this(null);
+        }
+
+        /** 项目夹具固定唯一规范根，防止测试误把 workspaceId 当路径传递。 */
+        private RecordingGenerationPort(Path expectedWorkspaceRoot) {
+            this.expectedWorkspaceRoot = expectedWorkspaceRoot;
+        }
+
+        /** 强制 catalog 查询使用预期工作区，并为每个命令返回独立租约。 */
         @Override
         public Lease acquire(Path workspaceRoot) {
-            assertNull(workspaceRoot);
+            assertEquals(expectedWorkspaceRoot, workspaceRoot);
             RecordingLease lease = new RecordingLease();
             leases.add(lease);
             return lease;
@@ -136,6 +220,14 @@ final class CatalogServiceTest {
 
         /** 冻结测试 Secret 只供单次租约读取，避免 fake 绕过真实凭据生命周期。 */
         private ModelGenerationPort(String secret) {
+            this(ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES, "cred_fixture", secret);
+        }
+
+        /** 冻结指定 API 与独立凭据，覆盖自定义供应商的多协议模型探测路由。 */
+        private ModelGenerationPort(
+                ConfigurationGenerationSnapshot.Api api,
+                String expectedCredentialId,
+                String secret) {
             lease = new RecordingLease() {
                 /** 关闭前返回配置代际，证明模型请求不会在租约外构造。 */
                 @Override
@@ -148,14 +240,14 @@ final class CatalogServiceTest {
                 @Override
                 public ConfigurationGenerationSnapshot snapshot() {
                     requireOpen();
-                    return modelSnapshot();
+                    return modelSnapshot(api, expectedCredentialId);
                 }
 
                 /** 只允许解析测试 Provider 声明的凭据引用，不接受任意 Selector。 */
                 @Override
                 public String secretFor(String credentialId) {
                     requireOpen();
-                    assertEquals("cred_fixture", credentialId);
+                    assertEquals(expectedCredentialId, credentialId);
                     return secret;
                 }
             };
@@ -169,16 +261,17 @@ final class CatalogServiceTest {
     }
 
     /** 构造不含附件能力的模型目录，防止探测请求继承正常 Turn 能力。 */
-    private static ConfigurationGenerationSnapshot modelSnapshot() {
+    private static ConfigurationGenerationSnapshot modelSnapshot(
+            ConfigurationGenerationSnapshot.Api api,
+            String credentialId) {
         ConfigurationGenerationSnapshot.Model model = new ConfigurationGenerationSnapshot.Model(
                 "model_fixture", "Fixture", "gpt-fixture",
                 new ConfigurationGenerationSnapshot.Capabilities(
                         128_000, 8_192, List.of(ConfigurationGenerationSnapshot.InputModality.TEXT)),
                 Map.of(), null);
         ConfigurationGenerationSnapshot.Provider provider = new ConfigurationGenerationSnapshot.Provider(
-                "provider_fixture", "Fixture", ConfigurationGenerationSnapshot.ProviderType.OPENAI,
-                ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES,
-                URI.create("https://example.com/v1"), "cred_fixture",
+                "provider_fixture", "Fixture", api,
+                URI.create("https://example.com/v1"), credentialId,
                 new ConfigurationGenerationSnapshot.NetworkTimeouts(
                         Duration.ofSeconds(5), Duration.ofMinutes(2)),
                 new ConfigurationGenerationSnapshot.AgentDefaults(
@@ -232,12 +325,17 @@ final class CatalogServiceTest {
     /** 记录 application 是否在活动租约内委派了全部 catalog 查询。 */
     private static final class RecordingQueryPort implements CatalogQueryPort {
         private final AtomicInteger calls = new AtomicInteger();
+        private final AtomicReference<Path> skillWorkspace = new AtomicReference<>();
+        private boolean skillWorkspaceTrusted;
 
         /** 验证 Skill 查询发生在租约关闭前。 */
         @Override
         public CursorPage<SkillDescriptor> listSkills(
-                ConfigurationGenerationPort.Lease generation, String cursor, int limit) {
+                ConfigurationGenerationPort.Lease generation, Path workspaceRoot, boolean workspaceTrusted,
+                String cursor, int limit) {
             admit(generation);
+            skillWorkspace.set(workspaceRoot);
+            skillWorkspaceTrusted = workspaceTrusted;
             return new CursorPage<>(List.of(), null);
         }
 

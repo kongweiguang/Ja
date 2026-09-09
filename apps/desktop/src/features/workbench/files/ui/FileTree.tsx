@@ -304,6 +304,7 @@ export function FileTree({
   onTrash,
   onRefresh,
   onContextMenu,
+  onAddToConversation,
   onNativeDropToken,
   openTargets = [],
   onOpenTarget,
@@ -349,8 +350,19 @@ export function FileTree({
       onCreateDirectory !== undefined ||
       onRefresh !== undefined ||
       (isManagedEntry(node) &&
-        (onRename !== undefined || onTrash !== undefined || openMenuAvailable)),
-    [onCreateDirectory, onCreateFile, onRefresh, onRename, onTrash, openMenuAvailable],
+        (onAddToConversation !== undefined ||
+          onRename !== undefined ||
+          onTrash !== undefined ||
+          openMenuAvailable)),
+    [
+      onAddToConversation,
+      onCreateDirectory,
+      onCreateFile,
+      onRefresh,
+      onRename,
+      onTrash,
+      openMenuAvailable,
+    ],
   );
 
   /** 用户继续编辑代表新的 Rename 候选，清除前一次 Enter/blur 的幂等哨兵后才允许提交。 */
@@ -1009,6 +1021,22 @@ export function FileTree({
           }}
           onKeyDown={onContextMenuKeyDown}
         >
+          {onAddToConversation === undefined ||
+          contextMenu.node === undefined ||
+          !isManagedEntry(contextMenu.node) ? null : (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const node = contextMenu.node;
+                if (node === undefined) return;
+                closeContextMenu(false);
+                onAddToConversation(node);
+              }}
+            >
+              <span>添加到对话</span>
+            </button>
+          )}
           {onCreateFile === undefined ? null : (
             <button
               type="button"

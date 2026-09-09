@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"c:path-search-missing-thread","method":"workspace/path/search","params":{"workspaceId":"ws_demo","query":"src"}}
+{"jsonrpc":"2.0","id":"c:path-search-control","method":"workspace/path/search","params":{"threadId":"thr_demo","workspaceId":"ws_demo","query":"src\nmain"}}
+{"jsonrpc":"2.0","id":"c:path-search-limit","method":"workspace/path/search","params":{"threadId":"thr_demo","workspaceId":"ws_demo","query":"src","limit":51}}
+{"jsonrpc":"2.0","id":"c:path-search-generation","method":"workspace/path/search","params":{"threadId":"thr_demo","workspaceId":"ws_demo","query":"src"},"generation":2}

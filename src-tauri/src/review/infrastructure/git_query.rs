@@ -29,6 +29,14 @@ pub(super) struct NameStatusRecord {
     pub(super) status: ReviewFileStatus,
 }
 
+/// numstat 只保存树统计所需事实；binary 以 `None` 表达而不伪造 0 行。
+#[derive(Debug, Clone)]
+pub(super) struct NumStatRecord {
+    pub(super) path: String,
+    pub(super) additions: Option<u64>,
+    pub(super) deletions: Option<u64>,
+}
+
 /// 对 candidate ref 排序，使 conventional base 优先，并保持 fallback lexical order 稳定。
 pub(super) fn base_ref_priority(ref_id: &str) -> u8 {
     match ref_id {
@@ -100,6 +108,93 @@ pub(super) fn diff_args(kind: &SourceKind, names_only: bool) -> Vec<OsString> {
         }
     }
     args
+}
+
+/// 为 line totals 构造不生成 patch 正文的固定 numstat 查询。
+pub(super) fn numstat_args(kind: &SourceKind) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("diff"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-color"),
+        OsString::from("--no-textconv"),
+        OsString::from("--find-renames"),
+        OsString::from("--numstat"),
+        OsString::from("-z"),
+    ];
+    match kind {
+        SourceKind::Unstaged => {}
+        SourceKind::Staged => args.push(OsString::from("--cached")),
+        SourceKind::Range { left, right } => {
+            args.push(OsString::from(left));
+            args.push(OsString::from(right));
+        }
+    }
+    args.push(OsString::from("--"));
+    args
+}
+
+/// 解析 `--numstat -z`，严格保留 rename 的 old/new NUL companion 与二进制未知统计。
+pub(super) fn parse_numstat(
+    workspace: &WorkspaceHandle,
+    bytes: &[u8],
+) -> Result<Vec<NumStatRecord>, ReviewError> {
+    let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut records = Vec::new();
+    let mut index = 0_usize;
+    while index < fields.len() {
+        let field = fields[index];
+        index += 1;
+        if field.is_empty() {
+            continue;
+        }
+        let mut columns = field.splitn(3, |byte| *byte == b'\t');
+        let additions = columns.next().ok_or(ReviewError::Parse)?;
+        let deletions = columns.next().ok_or(ReviewError::Parse)?;
+        let path = columns.next().ok_or(ReviewError::Parse)?;
+        let parse_count = |value: &[u8]| -> Result<Option<u64>, ReviewError> {
+            if value == b"-" {
+                return Ok(None);
+            }
+            let value = std::str::from_utf8(value).map_err(|_| ReviewError::Parse)?;
+            value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| ReviewError::Parse)
+        };
+        let additions = parse_count(additions)?;
+        let deletions = parse_count(deletions)?;
+        let (old_path, path) = if path.is_empty() {
+            let old_path = fields.get(index).ok_or(ReviewError::Parse)?;
+            let new_path = fields.get(index + 1).ok_or(ReviewError::Parse)?;
+            index = index.checked_add(2).ok_or(ReviewError::Parse)?;
+            (
+                Some(String::from_utf8(old_path.to_vec()).map_err(|_| ReviewError::Parse)?),
+                String::from_utf8(new_path.to_vec()).map_err(|_| ReviewError::Parse)?,
+            )
+        } else {
+            (
+                None,
+                String::from_utf8(path.to_vec()).map_err(|_| ReviewError::Parse)?,
+            )
+        };
+        workspace
+            .validate_git_path(&path)
+            .map_err(ReviewError::from)?;
+        if let Some(old_path) = old_path.as_deref() {
+            workspace
+                .validate_git_path(old_path)
+                .map_err(ReviewError::from)?;
+        }
+        records.push(NumStatRecord {
+            path,
+            additions,
+            deletions,
+        });
+        if records.len() > MAX_REVIEW_FILES {
+            return Err(ReviewError::Parse);
+        }
+    }
+    Ok(records)
 }
 
 /// 解析 NUL name-status，并在返回前按 canonical workspace policy 校验每条路径。

@@ -114,7 +114,7 @@ fn tree_projection_is_camel_case_and_path_free() {
     assert_eq!(value["directoryRevision"]["sha256"], directory_hash);
 }
 
-/// 验证 v2 Workspace open 会原子替换待确认的原生绑定；Java 返回身份前，
+/// 验证首版 Workspace open 会原子替换待确认的原生绑定；Java 返回身份前，
 /// 协议 Workspace id 仍不得取得文件能力，避免 Rust 提前复制业务事实。
 #[test]
 fn host_workspace_open_switch_replaces_pending_binding() {

@@ -2,15 +2,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import type { WorkspaceOpenTarget, WorkspaceOpenTargetInfo } from "../domain/openTarget";
-import type { TimelineEvent, TimelineSnapshot } from "../domain/timelineContracts";
+import type {
+  AttachmentSummary,
+  InputQueue,
+  TimelineEvent,
+  TimelineSnapshot,
+} from "../domain/timelineContracts";
+import type { ConversationContextReference, UserContentBlock } from "../domain/userContent";
 
 /** Conversation 目录使用的服务端 Thread 投影，不包含 timeline item 正文。 */
 export interface ConversationThread {
   threadId: string;
   workspaceId: string;
+  activeGoalId: string | null;
   preferences: ConversationThreadPreferences | null;
   title: string;
   status: "active" | "archived" | "deleted";
+  pinned: boolean;
+  latestTurnStatus:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "suspended"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | null;
+  latestTurnSeen: boolean;
   revision: number;
   createdAt: string;
   updatedAt: string;
@@ -54,6 +72,7 @@ export interface ConversationHistoryPort {
     modelId: string;
     reasoningLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
     accessMode: "approval_required" | "full_access";
+    collaborationMode: ConversationCollaborationMode;
   }): Promise<ConversationThread>;
   threadList(input: { workspaceId: string; cursor?: string; limit?: number }): Promise<{
     items: ConversationThread[];
@@ -76,6 +95,24 @@ export interface ConversationHistoryPort {
     modelId: string;
     reasoningLevel: ReasoningLevel | null;
     accessMode: ConversationAccessMode;
+    collaborationMode: ConversationCollaborationMode;
+    expectedThreadRevision: number;
+  }): Promise<ConversationThread>;
+  threadPin(input: {
+    threadId: string;
+    pinned: boolean;
+    expectedThreadRevision: number;
+  }): Promise<ConversationThread>;
+  threadSeen(input: {
+    threadId: string;
+    expectedThreadRevision: number;
+  }): Promise<ConversationThread>;
+  threadArchive(input: {
+    threadId: string;
+    expectedThreadRevision: number;
+  }): Promise<ConversationThread>;
+  threadRestore(input: {
+    threadId: string;
     expectedThreadRevision: number;
   }): Promise<ConversationThread>;
   threadRead(input: {
@@ -92,6 +129,7 @@ export interface ConversationHistoryPort {
 /** Conversation application 使用的模型选项，不反向依赖 Settings 的完整配置结构。 */
 export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ConversationAccessMode = "approval_required" | "full_access";
+export type ConversationCollaborationMode = "default" | "plan";
 
 /**
  * Composer 模型项同时保留真实上游模型标识与用户别名；前者用于避免 Provider/配置名称遮蔽
@@ -109,16 +147,17 @@ export interface ConversationModelOption {
   defaultReasoningLevel: ReasoningLevel | null;
 }
 
-/** Conversation 只传递稳定的 v4 模型选择，不复制 Provider 连接配置。 */
+/** Conversation 只传递稳定的 v1 模型选择，不复制 Provider 连接配置。 */
 export interface ConversationModelSelection {
   providerId: string;
   modelId: string;
   reasoningLevel: ReasoningLevel | null;
 }
 
-/** Thread 偏好是下一 Turn 的唯一选择事实，既有 Turn 的 runtime snapshot 不受此对象变化影响。 */
+/** Thread 偏好在下一次 Provider 请求安全点生效，不改变已经发出的请求或已准备 Tool batch。 */
 export interface ConversationThreadPreferences extends ConversationModelSelection {
   accessMode: ConversationAccessMode;
+  collaborationMode: ConversationCollaborationMode;
   titleSource: "placeholder" | "auto" | "manual";
 }
 
@@ -134,26 +173,29 @@ export interface ConversationAcceptedTurn {
 export interface ConversationCancelResult {
   accepted: true;
   turnId: string;
-  status: "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
+  status:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "suspended"
+    | "completed"
+    | "failed"
+    | "cancelled";
   threadRevision: number;
 }
 
-/** 追加输入 ACK 保留服务端签发的 input identity，前端不自行生成队列项。 */
-export interface ConversationQueuedInputResult {
+/** 队列 mutation ACK 总是返回全量权威投影，避免 Response 与 Event 形成双 owner。 */
+export interface ConversationInputQueueMutationResult {
   accepted: true;
   inputId: string;
-  turnId: string;
-  kind: "steering" | "follow_up";
-  status: "queued";
+  inputQueue: InputQueue;
 }
-
-/** 活动 Turn 的追加输入只区分两个服务端消费时机，不在前端复制队列实现。 */
-export type ConversationQueueMode = "steering" | "follow_up";
 
 /** Composer 提交意图只包含文本与当前 UI 模型选择，避免 UI 拼装 Runtime DTO。 */
 export interface ConversationSubmit {
   text: string;
   attachmentIds?: readonly string[];
+  contextReferences?: readonly ConversationContextReference[];
 }
 
 /** WebView 只接收受管附件 identity 与展示元数据，绝不接收用户绝对路径或 staging token。 */
@@ -161,12 +203,122 @@ export interface ConversationAttachment {
   attachmentId: string;
   fileName: string;
   sizeBytes: number;
+  mediaKind: "text" | "image" | "pdf" | "binary";
   mediaType?: string | null;
+  /** 缩略图只能来自 Rust 受控协议，缺失时 UI 使用文件类型图标而不是读取本地路径。 */
+  thumbnailUrl?: string;
 }
 
-/** 原生 picker、Rust ingress 与 App Server import 必须在一次 adapter 调用内完成。 */
+/** 单个导入尝试的阶段只描述可观察进度，不暴露 staging 或 App Server 内部边界。 */
+export type ConversationAttachmentImportPhase = "copying" | "importing";
+
+/** Channel 事件按 operation、attempt 与 item 三重 identity 隔离，允许多文件并发且不串进度。 */
+export type ConversationAttachmentImportEvent =
+  | {
+      kind: "started";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+      fileName: string;
+      sizeBytes?: number;
+      mediaKind?: ConversationAttachment["mediaKind"];
+      mediaType?: string | null;
+    }
+  | {
+      kind: "progress";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+      phase: ConversationAttachmentImportPhase;
+      bytesCopied: number;
+      totalBytes?: number;
+    }
+  | {
+      kind: "completed";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+      attachment: ConversationAttachment;
+    }
+  | {
+      kind: "failed";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+      fileName?: string;
+      sizeBytes?: number;
+      mediaKind?: ConversationAttachment["mediaKind"];
+      mediaType?: string | null;
+      code: string;
+      message: string;
+      retryable: boolean;
+    }
+  | {
+      kind: "cancelled";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+    };
+
+/** Composer 草稿附件显式枚举恢复状态；只有 ready 项持有可提交 attachmentId。 */
+export type ConversationAttachmentDraftItem =
+  | {
+      state: "importing";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+      fileName: string;
+      sizeBytes?: number;
+      mediaKind?: ConversationAttachment["mediaKind"];
+      mediaType?: string | null;
+      phase: ConversationAttachmentImportPhase;
+      bytesCopied: number;
+      totalBytes?: number;
+      cancelRequested?: boolean;
+    }
+  | ({ state: "ready"; itemId: string } & ConversationAttachment)
+  | {
+      state: "failed";
+      operationId: string;
+      attemptId: string;
+      itemId: string;
+      fileName: string;
+      sizeBytes?: number;
+      mediaKind?: ConversationAttachment["mediaKind"];
+      mediaType?: string | null;
+      code: string;
+      message: string;
+      retryable: boolean;
+    }
+  | {
+      state: "removing";
+      itemId: string;
+      fileName: string;
+      sizeBytes: number;
+      mediaKind: ConversationAttachment["mediaKind"];
+      mediaType?: string | null;
+      thumbnailUrl?: string;
+    };
+
+export interface ConversationAttachmentImportInput {
+  operationId: string;
+  onEvent: (event: ConversationAttachmentImportEvent) => void;
+}
+
+export interface ConversationClipboardImportResult {
+  outcome: "accepted" | "nothing_importable" | "busy";
+}
+
+/** 原生 picker/drop/clipboard/retry 各有窄入口，长任务进度只通过 caller-owned Channel 返回。 */
 export interface ConversationAttachmentPort {
-  importAttachments(): Promise<readonly ConversationAttachment[]>;
+  pickerImport(input: ConversationAttachmentImportInput): Promise<void>;
+  dropImport(input: ConversationAttachmentImportInput & { dropToken: string }): Promise<void>;
+  clipboardImport(
+    input: ConversationAttachmentImportInput,
+  ): Promise<ConversationClipboardImportResult>;
+  retryImport(input: ConversationAttachmentImportInput & { attemptId: string }): Promise<void>;
+  cancelImport(input: { operationId: string; itemId?: string }): Promise<void>;
+  discardAttempt(input: { attemptId: string }): Promise<void>;
   discardAttachment(input: { attachmentId: string }): Promise<void>;
 }
 
@@ -179,12 +331,22 @@ export interface ConversationArtifactPort {
     callId: string;
     artifactId: string;
   }): Promise<string>;
-  readTurnDiff(input: {
-    workspaceId: string;
-    threadId: string;
-    turnId: string;
+  readTurnDiff(
+    input: {
+      workspaceId: string;
+      threadId: string;
+      turnId: string;
+      artifactId: string;
+      filePath: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<{
     artifactId: string;
-  }): Promise<string>;
+    filePath: string;
+    byteLength: number;
+    sha256: string;
+    content: string;
+  }>;
 }
 
 /**
@@ -194,14 +356,41 @@ export interface ConversationArtifactPort {
 export interface ConversationTurnPort {
   submitTurn(input: {
     threadId: string;
-    content: Array<{ type: "text"; text: string } | { type: "attachment"; attachmentId: string }>;
+    content: UserContentBlock[];
+    /**
+     * 附件摘要仅用于 turn/start ACK 前后的本地 Timeline 投影；Runtime adapter 必须在调用
+     * JA-RPC 前剥离它，服务端仍根据 attachmentId 建立权威绑定与持久摘要。
+     */
+    projectionAttachments?: readonly AttachmentSummary[];
+  }): Promise<ConversationAcceptedTurn>;
+  resumeTurn(input: {
+    turnId: string;
+    expectedThreadRevision: number;
   }): Promise<ConversationAcceptedTurn>;
   cancelTurn(input: {
     turnId: string;
     expectedThreadRevision: number;
   }): Promise<ConversationCancelResult>;
-  steerTurn(input: { turnId: string; text: string }): Promise<ConversationQueuedInputResult>;
-  followUpTurn(input: { turnId: string; text: string }): Promise<ConversationQueuedInputResult>;
+  enqueueTurnInput(input: {
+    turnId: string;
+    content: UserContentBlock[];
+  }): Promise<ConversationInputQueueMutationResult>;
+  prioritizeTurnInput(input: {
+    turnId: string;
+    inputId: string;
+    expectedInputRevision: number;
+  }): Promise<ConversationInputQueueMutationResult>;
+  updateTurnInput(input: {
+    turnId: string;
+    inputId: string;
+    expectedInputRevision: number;
+    content: UserContentBlock[];
+  }): Promise<ConversationInputQueueMutationResult>;
+  deleteTurnInput(input: {
+    turnId: string;
+    inputId: string;
+    expectedInputRevision: number;
+  }): Promise<ConversationInputQueueMutationResult>;
   approvalRespond(input: {
     approvalId: string;
     turnId: string;
@@ -210,13 +399,23 @@ export interface ConversationTurnPort {
   }): Promise<void>;
 }
 
-/** 偏好更新通过 Thread CAS 落盘，只影响下一 Turn，不触发 Settings 默认值或新建会话。 */
+/** Plan mode 只等待独立 Plan artifact 的持久化 ACK，不读取、创建或改写 Goal 聚合。 */
+export interface ConversationPlanCreationPort {
+  create(
+    ownerThreadId: string,
+    objective: string,
+    expectedThreadRevision: number,
+  ): Promise<boolean>;
+}
+
+/** 偏好更新通过 Thread CAS 落盘，在下一次 Provider 请求安全点生效且不触发 Settings 默认值。 */
 export interface ConversationPreferencesPort {
   updatePreferences(input: {
     providerId: string;
     modelId: string;
     reasoningLevel: ReasoningLevel | null;
     accessMode: ConversationAccessMode;
+    collaborationMode: ConversationCollaborationMode;
   }): Promise<void>;
 }
 

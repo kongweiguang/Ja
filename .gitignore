@@ -38,6 +38,7 @@ yarn-debug.log*
 # Rust / Tauri build outputs
 target/
 target-*/
+/.codex-target/
 .cargo/target-*/
 src-tauri/target/
 *.rlib
@@ -105,7 +106,6 @@ release/
 secrets/
 *.secret
 credentials.*
-!src-tauri/src/settings/credentials.rs
 *.pem
 *.key
 *.p12
@@ -119,3 +119,5 @@ credentials.*
 !app-server/src/main/resources/META-INF/native-image/**
 !Cargo.lock
 /.codegraph
+
+.soloncode/

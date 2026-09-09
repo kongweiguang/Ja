@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SIDEBAR_RATIO_DEFAULT,
   SIDEBAR_WIDTH_DEFAULT,
@@ -13,8 +13,10 @@ import {
   clampSidebarRatio,
   clampSidebarWidth,
   clampWorkbenchSize,
+  getRightPanelSessionState,
   normalizeRightPanelTab,
   normalizeUiPalette,
+  useRightPanelSessionStore,
   useUiPreferencesStore,
 } from "@/shared/preferences/uiPreferences";
 
@@ -26,6 +28,7 @@ function resetPreferences(): void {
     palette: "xcode",
     highContrast: false,
     reduceMotion: false,
+    reducedTransparency: false,
     desktopNotifications: false,
     sidebarCollapsed: false,
     projectSectionCollapsed: false,
@@ -33,10 +36,8 @@ function resetPreferences(): void {
     sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
     sidebarRatio: SIDEBAR_RATIO_DEFAULT,
     workbenchSize: WORKBENCH_SIZE_DEFAULT,
-    inspectorOpen: false,
-    rightPanelTab: "files",
-    rightPanelTabs: ["review", "files", "preview"],
   });
+  useRightPanelSessionStore.setState({ scopes: new Map() });
 }
 
 describe("ui navigation preferences", () => {
@@ -52,72 +53,129 @@ describe("ui navigation preferences", () => {
     expect(clampWorkbenchSize(100)).toBe(WORKBENCH_SIZE_MAX);
   });
 
-  it("persists only durable UI preferences and never stores transient inspector state", () => {
-    useUiPreferencesStore.getState().setInspectorOpen(true);
+  it("persists only durable global UI preferences and never stores conversation state", () => {
     useUiPreferencesStore.getState().setSidebarCollapsed(true);
     useUiPreferencesStore.getState().setProjectSectionCollapsed(true);
     useUiPreferencesStore.getState().setHistorySectionCollapsed(true);
     useUiPreferencesStore.getState().setWorkbenchSize(44.5);
     useUiPreferencesStore.getState().setDesktopNotifications(true);
-    const raw = localStorage.getItem("ja-ui-preferences-v10") ?? "";
+    useUiPreferencesStore.getState().setPalette("claude");
+    useUiPreferencesStore.getState().setReducedTransparency(true);
+    const raw = localStorage.getItem("ja-ui-preferences-v1") ?? "";
     expect(raw).toContain('"sidebarCollapsed":true');
     expect(raw).toContain('"desktopNotifications":true');
     expect(raw).toContain('"projectSectionCollapsed":true');
     expect(raw).toContain('"historySectionCollapsed":true');
     expect(raw).toContain('"workbenchSize":44.5');
+    expect(raw).toContain('"palette":"claude"');
+    expect(raw).toContain('"reducedTransparency":true');
+    expect(raw).toContain('"version":1');
     expect(raw).not.toContain("inspectorOpen");
+    expect(raw).not.toContain("rightPanelTab");
+    expect(raw).not.toContain("rightPanelTabs");
     expect(raw).not.toContain("terminalLayouts");
     expect(raw).not.toContain("sessionId");
   });
 
-  /** 旧介质中的打开状态与已淘汰尺寸字段不能进入当前单一 schema。 */
-  it.each([10, 11])(
-    "drops retired inspector layout state from stored v%s state",
-    async (version) => {
-      useUiPreferencesStore.setState({ inspectorOpen: true });
-      localStorage.setItem(
-        "ja-ui-preferences-v10",
-        JSON.stringify({
-          version,
-          state: {
-            inspectorOpen: true,
-            inspectorSize: 42,
-            conversationRatio: 58,
-            rightPanelTab: "terminal",
-            rightPanelTabs: ["terminal", "files"],
-          },
-        }),
-      );
-      await useUiPreferencesStore.persist.rehydrate();
+  /** 首版只读取当前 key 与 envelope 版本，开发期 key 和不支持版本都不能进入 store。 */
+  it("ignores retired keys and unsupported envelope versions", async () => {
+    localStorage.removeItem("ja-ui-preferences-v1");
+    localStorage.setItem(
+      "ja-ui-preferences-v10",
+      JSON.stringify({ version: 14, state: { palette: "obsidian", rightPanelTab: "terminal" } }),
+    );
+    await useUiPreferencesStore.persist.rehydrate();
+    expect(useUiPreferencesStore.getState()).toMatchObject({ palette: "xcode" });
+    expect(useUiPreferencesStore.getState()).not.toHaveProperty("rightPanelTab");
 
-      const state = useUiPreferencesStore.getState();
-      expect(state).toMatchObject({
-        inspectorOpen: false,
-        workbenchSize: WORKBENCH_SIZE_DEFAULT,
-        rightPanelTab: "terminal",
-        rightPanelTabs: ["terminal", "files"],
-      });
-      expect(state).not.toHaveProperty("inspectorSize");
-      expect(state).not.toHaveProperty("inspectorRatio");
-      expect(state).not.toHaveProperty("conversationRatio");
-    },
-  );
+    localStorage.setItem(
+      "ja-ui-preferences-v1",
+      JSON.stringify({ version: 2, state: { palette: "obsidian", rightPanelTab: "terminal" } }),
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await useUiPreferencesStore.persist.rehydrate();
+    expect(useUiPreferencesStore.getState()).toMatchObject({ palette: "xcode" });
+    expect(useUiPreferencesStore.getState()).not.toHaveProperty("rightPanelTab");
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+  });
 
-  it("keeps selected workbench tabs reachable without reviving closed capabilities", () => {
-    useUiPreferencesStore.getState().setRightPanelTabs([]);
-    expect(useUiPreferencesStore.getState()).toMatchObject({
+  it("keeps selected workbench tabs reachable inside their owning conversation", () => {
+    const scope = "server-1:1:workspace-1:thread-1";
+    useRightPanelSessionStore.getState().setRightPanelTabs(scope, []);
+    expect(
+      getRightPanelSessionState(useRightPanelSessionStore.getState().scopes, scope),
+    ).toMatchObject({
       inspectorOpen: false,
       rightPanelTabs: [],
     });
-    useUiPreferencesStore.getState().setRightPanelTab("terminal");
-    expect(useUiPreferencesStore.getState()).toMatchObject({
+    useRightPanelSessionStore.getState().setRightPanelTab(scope, "terminal");
+    expect(
+      getRightPanelSessionState(useRightPanelSessionStore.getState().scopes, scope),
+    ).toMatchObject({
       rightPanelTab: "terminal",
       rightPanelTabs: ["terminal"],
     });
   });
 
+  it("keeps all right panel capabilities process-local and outside global persistence", () => {
+    const scope = "server-1:1:workspace-1:thread-1";
+    useRightPanelSessionStore.getState().setRightPanelTab(scope, "agents");
+    useRightPanelSessionStore.getState().setRightPanelTab(scope, "subagent:thr_child");
+    useRightPanelSessionStore.getState().setRightPanelTab(scope, "side-task:draft_12345678");
+    const state = getRightPanelSessionState(useRightPanelSessionStore.getState().scopes, scope);
+    expect(state.rightPanelTabs).toEqual([
+      "new",
+      "agents",
+      "subagent:thr_child",
+      "side-task:draft_12345678",
+    ]);
+    const raw = localStorage.getItem("ja-ui-preferences-v1") ?? "";
+    expect(raw).not.toContain('"agents"');
+    expect(raw).not.toContain("thr_child");
+    expect(raw).not.toContain("draft_12345678");
+  });
+
   it("rejects values outside the current enum closures", () => {
     expect(normalizeUiPalette("legacy" as never)).toBe("xcode");
+    expect(["xcode", "fleet", "obsidian", "claude"].map(normalizeUiPalette)).toEqual([
+      "xcode",
+      "fleet",
+      "obsidian",
+      "claude",
+    ]);
     expect(normalizeRightPanelTab("git" as never)).toBe("files");
+  });
+
+  it("restores palette and transparency while normalizing a damaged palette", async () => {
+    localStorage.setItem(
+      "ja-ui-preferences-v1",
+      JSON.stringify({
+        version: 1,
+        state: { palette: "obsidian", reducedTransparency: true },
+      }),
+    );
+    await useUiPreferencesStore.persist.rehydrate();
+    expect(useUiPreferencesStore.getState()).toMatchObject({
+      palette: "obsidian",
+      reducedTransparency: true,
+    });
+
+    localStorage.setItem(
+      "ja-ui-preferences-v1",
+      JSON.stringify({ version: 1, state: { palette: "damaged" } }),
+    );
+    await useUiPreferencesStore.persist.rehydrate();
+    expect(useUiPreferencesStore.getState().palette).toBe("xcode");
+  });
+
+  it("keeps the applied session value when localStorage persistence fails", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota", "QuotaExceededError");
+    });
+
+    expect(() => useUiPreferencesStore.getState().setPalette("fleet")).toThrow();
+    expect(useUiPreferencesStore.getState().palette).toBe("fleet");
+    setItem.mockRestore();
   });
 });

@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.conversation.domain.prompt.AgentPromptSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSession;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
@@ -49,9 +50,52 @@ public final class FixedAgentPromptSession implements AgentPromptSession {
         return SkillActivation.activated("activated fixture skill");
     }
 
+    /** 固定夹具不暴露 Skill 目录；只有空选择可通过身份校验。 */
+    @Override
+    public void validateSkillReferences(List<String> skillIds) {
+        if (!skillIds.isEmpty()) {
+            throw new IllegalStateException("fixed prompt fixture has no selectable Skills");
+        }
+    }
+
+    /** 固定夹具返回不改变 revision 的两阶段候选，使队列 CAS miss 可验证为零 Prompt 副作用。 */
+    @Override
+    public SkillReplacement prepareSkillReplacement(List<String> skillIds) {
+        validateSkillReferences(skillIds);
+        return new SkillReplacement() {
+            /** 固定候选沿用测试 revision。 */
+            @Override public String promptRevision() { return REVISION; }
+            /** 固定候选不包含 Skill。 */
+            @Override public List<TurnExecutionState.ActiveSkill> activeSkillReferences() { return List.of(); }
+            /** 固定候选没有可发布的动态状态。 */
+            @Override public void commit() { }
+        };
+    }
+
+    /** 固定夹具没有 Skill 文件系统，空集合仅表达清除且无需改变 revision。 */
+    @Override
+    public void replaceActiveSkills(List<String> skillIds) {
+        validateSkillReferences(skillIds);
+    }
+
     /** 返回固定 revision，使连续 Tool batch 能验证循环逻辑而不受文件 IO 干扰。 */
     @Override
     public String currentRevision() {
         return REVISION;
+    }
+
+    /** 非 Prompt 聚焦测试没有 Skill 正文 owner，因此始终返回空引用。 */
+    @Override
+    public List<TurnExecutionState.ActiveSkill> activeSkillReferences() {
+        return List.of();
+    }
+
+    /** 固定夹具只接受空 Skill；非 Prompt 测试不模拟实时文件恢复。 */
+    @Override
+    public void restoreActiveSkills(
+            String summary, List<TurnExecutionState.ActiveSkill> references) {
+        if (!summary.isEmpty() || !references.isEmpty()) {
+            throw new IllegalStateException("fixed prompt fixture cannot restore dynamic Skill state");
+        }
     }
 }

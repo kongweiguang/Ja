@@ -138,6 +138,8 @@ describe("desktop capability manifest", () => {
         "clipboard-manager:allow-write-text",
         "log:allow-log",
         "opener:allow-open-url",
+        "updater:default",
+        "process:allow-restart",
       ]),
     );
     expect(identifiers).not.toEqual(
@@ -149,6 +151,7 @@ describe("desktop capability manifest", () => {
         "opener:default",
         "opener:allow-open-path",
         "opener:allow-reveal-item-in-dir",
+        "process:default",
       ]),
     );
     const opener = policy.permissions.find(
@@ -169,9 +172,30 @@ describe("desktop capability manifest", () => {
       "tauri_plugin_dialog::init",
       "tauri_plugin_opener::init",
       "tauri_plugin_notification::init",
+      "tauri_plugin_process::init",
+      "tauri_plugin_updater::Builder",
       "tauri_plugin_window_state::Builder",
     ]) {
       expect(source.indexOf(registration, singleInstance + 1)).toBeGreaterThan(singleInstance);
     }
+  });
+
+  /** Updater 信任根、静态端点和 v2 产物开关属于同一个发布契约，任一漂移都应在 CI 静态失败。 */
+  it("pins the signed GitHub updater contract", () => {
+    const configuration = JSON.parse(
+      readFileSync(resolve(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"),
+    ) as {
+      bundle: { createUpdaterArtifacts?: boolean | string };
+      plugins?: {
+        updater?: { endpoints?: string[]; pubkey?: string; windows?: { installMode?: string } };
+      };
+    };
+    expect(configuration.bundle.createUpdaterArtifacts).toBe(true);
+    expect(configuration.plugins?.updater).toEqual({
+      endpoints: ["https://github.com/kongweiguang/Ja/releases/latest/download/latest.json"],
+      pubkey:
+        "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFBQzEyMDM4Nzc1MEI2OEIKUldTTHRsQjNPQ0RCcWc4Vm5PbnBpYVhjZnhjMEgzNit1OThtaldLNjhFc2JZOFh3aEloaCtaWmUK",
+      windows: { installMode: "passive" },
+    });
   });
 });

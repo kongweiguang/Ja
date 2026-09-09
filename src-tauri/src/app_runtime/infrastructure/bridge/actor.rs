@@ -31,26 +31,56 @@ pub(crate) enum BridgeCommand {
     GeneralWorkspaceRead {
         reply: Reply<Value>,
     },
+    WorkspacePathSearch {
+        input: WorkspacePathSearchInput,
+        reply: Reply<WorkspacePathSearchResult>,
+    },
     HealthRead {
         reply: Reply<()>,
     },
     TurnStart {
         params: Value,
-        baseline: Option<Box<TurnChangeBaseline>>,
         reply: Reply<TurnAccepted>,
     },
     TurnCancel {
         params: Value,
         reply: Reply<TurnCancelResult>,
     },
-    TurnQueuedInput {
+    TurnResume {
+        params: Value,
+        reply: Reply<TurnAccepted>,
+    },
+    TurnInput {
         method: &'static str,
         params: Value,
-        reply: Reply<TurnQueuedInputResult>,
+        reply: Reply<TurnInputResult>,
     },
-    TurnChangeSetRead {
-        input: TurnChangeSetReadInput,
-        reply: Reply<TurnChangeSetReadResult>,
+    Task {
+        method: TaskMethod,
+        params: Value,
+        reply: Reply<Value>,
+    },
+    Goal {
+        method: GoalMethod,
+        params: Value,
+        reply: Reply<Value>,
+    },
+    TaskObserve {
+        input: TaskObserveInput,
+        owner: &'static str,
+        reply: Reply<TaskObserveResult>,
+    },
+    TaskUnobserve {
+        input: TaskUnobserveInput,
+        owner: &'static str,
+        reply: Reply<()>,
+    },
+    TaskObservationsRelease {
+        owner: &'static str,
+        reply: Reply<usize>,
+    },
+    TurnChangeSetReadLease {
+        reply: Reply<TurnChangeSetReadLease>,
     },
     ToolArtifactRead {
         input: ToolArtifactReadInput,
@@ -67,6 +97,18 @@ pub(crate) enum BridgeCommand {
     },
     AttachmentDiscard {
         input: AttachmentDiscardInput,
+        reply: Reply<()>,
+    },
+    AttachmentPreviewOpen {
+        input: AttachmentPreviewOpenParams,
+        reply: Reply<AttachmentPreviewOpenResult>,
+    },
+    AttachmentPreviewRead {
+        input: AttachmentPreviewReadParams,
+        reply: Reply<AttachmentPreviewReadResult>,
+    },
+    AttachmentPreviewClose {
+        input: AttachmentPreviewCloseParams,
         reply: Reply<()>,
     },
     History {
@@ -86,15 +128,6 @@ pub(crate) enum BridgeCommand {
 pub(crate) struct ShutdownRequest {
     pub(crate) reply: Reply<()>,
     pub(crate) deadline: Instant,
-}
-
-pub(super) enum BridgeSignal {
-    TurnTerminal {
-        generation: u64,
-        thread_id: String,
-        turn_id: String,
-        frame: RpcFrame,
-    },
 }
 
 /// 终态 fault 保留在数据命令 lane 之外，避免通知突发让 actor 无法观察 crash cleanup。
@@ -222,6 +255,8 @@ pub(crate) struct RuntimeBridgeInner {
     pub(crate) recovery_path: PathBuf,
     pub(crate) actor_join: Mutex<Option<JoinHandle<()>>>,
     pub(crate) runtime_control: Arc<dyn RuntimeControlPort>,
+    pub(crate) current_generation: Arc<AtomicU64>,
+    pub(crate) change_set_reads_in_flight: Arc<AtomicUsize>,
 }
 
 impl RuntimeBridgeInner {
@@ -471,7 +506,6 @@ impl Drop for RuntimeBridgeInner {
 pub(super) struct ActorContext {
     pub(super) config: LaunchConfig,
     pub(super) sink: EventSink,
-    pub(super) signal_sender: SyncSender<BridgeSignal>,
     pub(super) current_generation: Arc<AtomicU64>,
     pub(super) terminal_fault: Arc<TerminalFault>,
     pub(super) detached_event_generation: Arc<AtomicU64>,
@@ -481,6 +515,7 @@ pub(super) struct ActorContext {
     pub(super) shutdown_completed: Arc<AtomicBool>,
     pub(super) completion: Arc<Completion>,
     pub(super) runtime_control: Arc<dyn RuntimeControlPort>,
+    pub(super) task_observations: Arc<TaskObservationRegistry>,
 }
 
 /// 设计原因：该函数位于单 owner actor 边界，必须保持命令顺序、终态可见性与有界等待。
@@ -489,7 +524,6 @@ pub(super) fn actor_loop(
     context: ActorContext,
     command_receiver: Receiver<BridgeCommand>,
     shutdown_receiver: Receiver<ShutdownRequest>,
-    signal_receiver: Receiver<BridgeSignal>,
     terminal_receiver: Receiver<()>,
 ) {
     context
@@ -500,10 +534,6 @@ pub(super) fn actor_loop(
     let mut runtime: Option<RunningRuntime> = None;
     let mut pending_cleanup: Option<SidecarSupervisor> = None;
     let mut next_generation = 1_u64;
-    let mut pending_turn_changes = HashMap::<String, TurnChangeBaseline>::new();
-    // host-owned identity 与 baseline 分开保存，使异常丢失 baseline 时仍能提交显式
-    // capture_failed；没有 host identity 的恢复/外部 Turn 不能被 Rust 越权改写。
-    let mut host_turn_workspaces = HashMap::<String, String>::new();
     let mut shutdown_completed = false;
     loop {
         if let Ok(request) = shutdown_receiver.try_recv() {
@@ -512,6 +542,19 @@ pub(super) fn actor_loop(
                 .set_phase(RuntimeControlPhase::ShutdownReceived);
             context.runtime_control.record("actor_shutdown_received");
             let deadline = effective_shutdown_deadline(request.deadline, &context.exit_control);
+            if let Err(error) = release_task_observations_runtime(
+                &context.config,
+                &mut runtime,
+                TASK_OBSERVATION_OWNER_MAIN,
+                &context.task_observations,
+                &context.exit_control,
+            ) {
+                tracing::debug!(
+                    code = error.code,
+                    "task observation shutdown cleanup was not acknowledged"
+                );
+                context.task_observations.clear();
+            }
             let result = stop_runtime(
                 &context.sink,
                 &mut runtime,
@@ -591,15 +634,6 @@ pub(super) fn actor_loop(
             }
             continue;
         }
-        drain_signals(
-            &context.config,
-            &context.sink,
-            &mut runtime,
-            &signal_receiver,
-            &mut pending_turn_changes,
-            &mut host_turn_workspaces,
-            &context.exit_control,
-        );
         drain_terminal_fault(
             TerminalCleanupContext {
                 config: &context.config,
@@ -614,8 +648,7 @@ pub(super) fn actor_loop(
             &terminal_receiver,
         );
         if runtime.is_none() {
-            pending_turn_changes.clear();
-            host_turn_workspaces.clear();
+            context.task_observations.clear();
         }
         match command_receiver.recv_timeout(ACTOR_POLL_TIMEOUT) {
             Ok(BridgeCommand::Start { reply }) => {
@@ -629,13 +662,13 @@ pub(super) fn actor_loop(
                     runtime: &mut runtime,
                     pending_cleanup: &mut pending_cleanup,
                     next_generation: &mut next_generation,
-                    signal_sender: &context.signal_sender,
                     terminal_fault: &context.terminal_fault,
                     detached_event_generation: &context.detached_event_generation,
                     cleanup_fault: &context.cleanup_fault,
                     current_generation: &context.current_generation,
                     exit_control: &context.exit_control,
                     runtime_control: &context.runtime_control,
+                    task_observations: &context.task_observations,
                 });
                 if result.is_err() {
                     context
@@ -655,6 +688,19 @@ pub(super) fn actor_loop(
                     .runtime_control
                     .set_phase(RuntimeControlPhase::StopReceived);
                 context.runtime_control.record("actor_stop_received");
+                if let Err(error) = release_task_observations_runtime(
+                    &context.config,
+                    &mut runtime,
+                    TASK_OBSERVATION_OWNER_MAIN,
+                    &context.task_observations,
+                    &context.exit_control,
+                ) {
+                    tracing::debug!(
+                        code = error.code,
+                        "task observation stop cleanup was not acknowledged"
+                    );
+                    context.task_observations.clear();
+                }
                 let result = stop_runtime(
                     &context.sink,
                     &mut runtime,
@@ -720,6 +766,14 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
+            Ok(BridgeCommand::WorkspacePathSearch { input, reply }) => {
+                let _ = reply.send(workspace_path_search_runtime(
+                    &context.config,
+                    &mut runtime,
+                    input,
+                    &context.exit_control,
+                ));
+            }
             Ok(BridgeCommand::HealthRead { reply }) => {
                 let _ = reply.send(health_read_runtime(
                     &context.config,
@@ -727,34 +781,13 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
-            Ok(BridgeCommand::TurnStart {
-                params,
-                baseline,
-                reply,
-            }) => {
-                let mut baseline = baseline.map(|value| *value);
-                if let Some(candidate) = baseline.as_ref() {
-                    let workspace_id = candidate.workspace_id().to_owned();
-                    let concurrent = pending_turn_changes
-                        .values()
-                        .any(|value| value.workspace_id() == workspace_id);
-                    if concurrent {
-                        for value in pending_turn_changes.values_mut() {
-                            if value.workspace_id() == workspace_id {
-                                *value = TurnChangeBaseline::concurrent(workspace_id.clone());
-                            }
-                        }
-                        baseline = Some(TurnChangeBaseline::concurrent(workspace_id));
-                    }
-                }
-                let result =
-                    turn_runtime(&context.config, &mut runtime, params, &context.exit_control);
-                if let (Ok(accepted), Some(baseline)) = (&result, baseline) {
-                    host_turn_workspaces
-                        .insert(accepted.turn_id.clone(), baseline.workspace_id().to_owned());
-                    pending_turn_changes.insert(accepted.turn_id.clone(), baseline);
-                }
-                let _ = reply.send(result);
+            Ok(BridgeCommand::TurnStart { params, reply }) => {
+                let _ = reply.send(turn_runtime(
+                    &context.config,
+                    &mut runtime,
+                    params,
+                    &context.exit_control,
+                ));
             }
             Ok(BridgeCommand::TurnCancel { params, reply }) => {
                 let _ = reply.send(turn_cancel_runtime(
@@ -764,12 +797,20 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
-            Ok(BridgeCommand::TurnQueuedInput {
+            Ok(BridgeCommand::TurnResume { params, reply }) => {
+                let _ = reply.send(turn_resume_runtime(
+                    &context.config,
+                    &mut runtime,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TurnInput {
                 method,
                 params,
                 reply,
             }) => {
-                let _ = reply.send(turn_queued_input_runtime(
+                let _ = reply.send(turn_input_runtime(
                     &context.config,
                     &mut runtime,
                     method,
@@ -777,13 +818,88 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
-            Ok(BridgeCommand::TurnChangeSetRead { input, reply }) => {
-                let _ = reply.send(turn_change_set_read_runtime(
+            Ok(BridgeCommand::Task {
+                method,
+                params,
+                reply,
+            }) => {
+                let _ = reply.send(task_request_runtime(
+                    &context.config,
+                    &mut runtime,
+                    method,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::Goal {
+                method,
+                params,
+                reply,
+            }) => {
+                let _ = reply.send(goal_request_runtime(
+                    &context.config,
+                    &mut runtime,
+                    method,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TaskObserve {
+                input,
+                owner,
+                reply,
+            }) => {
+                let result = task_observe_runtime(
                     &context.config,
                     &mut runtime,
                     input,
+                    owner,
+                    &context.task_observations,
+                    &context.exit_control,
+                );
+                if let Some(orphan) = deliver_task_observe_reply(reply, result) {
+                    let observation_id = orphan.observation_id.clone();
+                    if task_unobserve_runtime(
+                        &context.config,
+                        &mut runtime,
+                        TaskUnobserveInput {
+                            observation_id: orphan.observation_id,
+                        },
+                        owner,
+                        &context.task_observations,
+                        &context.exit_control,
+                    )
+                    .is_err()
+                    {
+                        context.task_observations.remove(&observation_id);
+                    }
+                }
+            }
+            Ok(BridgeCommand::TaskUnobserve {
+                input,
+                owner,
+                reply,
+            }) => {
+                let _ = reply.send(task_unobserve_runtime(
+                    &context.config,
+                    &mut runtime,
+                    input,
+                    owner,
+                    &context.task_observations,
                     &context.exit_control,
                 ));
+            }
+            Ok(BridgeCommand::TaskObservationsRelease { owner, reply }) => {
+                let _ = reply.send(release_task_observations_runtime(
+                    &context.config,
+                    &mut runtime,
+                    owner,
+                    &context.task_observations,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TurnChangeSetReadLease { reply }) => {
+                let _ = reply.send(turn_change_set_read_lease_runtime(&mut runtime));
             }
             Ok(BridgeCommand::ToolArtifactRead { input, reply }) => {
                 let _ = reply.send(tool_artifact_read_runtime(
@@ -816,6 +932,30 @@ pub(super) fn actor_loop(
             }
             Ok(BridgeCommand::AttachmentDiscard { input, reply }) => {
                 let _ = reply.send(attachment_discard_runtime(
+                    &context.config,
+                    &mut runtime,
+                    input,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::AttachmentPreviewOpen { input, reply }) => {
+                let _ = reply.send(attachment_preview_open_runtime(
+                    &context.config,
+                    &mut runtime,
+                    input,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::AttachmentPreviewRead { input, reply }) => {
+                let _ = reply.send(attachment_preview_read_runtime(
+                    &context.config,
+                    &mut runtime,
+                    input,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::AttachmentPreviewClose { input, reply }) => {
+                let _ = reply.send(attachment_preview_close_runtime(
                     &context.config,
                     &mut runtime,
                     input,
@@ -866,6 +1006,19 @@ pub(super) fn actor_loop(
         }
     }
     if !shutdown_completed {
+        if let Err(error) = release_task_observations_runtime(
+            &context.config,
+            &mut runtime,
+            TASK_OBSERVATION_OWNER_MAIN,
+            &context.task_observations,
+            &context.exit_control,
+        ) {
+            tracing::debug!(
+                code = error.code,
+                "task observation disconnect cleanup was not acknowledged"
+            );
+            context.task_observations.clear();
+        }
         let deadline = context.exit_control.trigger().deadline;
         while !cleanup_confirmed(
             &runtime,
@@ -934,6 +1087,7 @@ pub(super) fn actor_loop(
         }
     }
     context.terminal_fault.clear();
+    context.task_observations.clear();
     context.runtime_control.record(if shutdown_completed {
         "actor_completion_shutdown"
     } else {

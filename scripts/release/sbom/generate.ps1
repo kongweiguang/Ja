@@ -218,21 +218,20 @@ function Get-InputEvidence {
         'src-tauri/Cargo.toml',
         'Cargo.lock',
         'app-server/pom.xml',
-        'LICENSE',
-        'THIRD_PARTY_NOTICES.md',
-        'legal/third-party/manifest.json'
+        'LICENSE'
     )
     $facts = @()
     foreach ($relativePath in $relativePaths) {
         $path = Resolve-RepositoryPath -Path $relativePath -BasePath $RepositoryRoot -RequireExisting
         $facts += Get-FileEvidence -Path $path -RepositoryRoot $RepositoryRoot
     }
-    # A removed or not-yet-reviewed license archive is a release blocker, not a
-    # report-generation failure. Hash its entry point only when one exists; the
-    # dedicated archive audit below records the missing state deterministically.
-    $licenseEntry = Resolve-RepositoryPath -Path 'LICENSES/README.md' -BasePath $RepositoryRoot
-    if (Test-Path -LiteralPath $licenseEntry -PathType Leaf) {
-        $facts += Get-FileEvidence -Path $licenseEntry -RepositoryRoot $RepositoryRoot
+    # Optional notice and review entry points are evidence when present, while their absence is
+    # handled by the dedicated archive audit instead of aborting report generation prematurely.
+    foreach ($relativePath in @('THIRD_PARTY_NOTICES.md', 'legal/third-party/manifest.json', 'LICENSES/README.md')) {
+        $entry = Resolve-RepositoryPath -Path $relativePath -BasePath $RepositoryRoot
+        if (Test-Path -LiteralPath $entry -PathType Leaf) {
+            $facts += Get-FileEvidence -Path $entry -RepositoryRoot $RepositoryRoot
+        }
     }
     return @($facts | Sort-Object path)
 }

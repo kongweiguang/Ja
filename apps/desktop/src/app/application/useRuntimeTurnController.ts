@@ -14,9 +14,13 @@ import {
   type TurnAccepted,
   type TurnCancelInput,
   type TurnCancelResult,
-  type TurnQueuedInput,
-  type TurnQueuedInputResult,
+  type InputQueueMutationResult,
+  type TurnResumeInput,
+  type TurnInputEnqueue,
+  type TurnInputMutation,
+  type TurnInputUpdate,
   type TurnStartInput,
+  type RuntimeTurnSubmissionInput,
 } from "./runtimePorts";
 import type { BootState } from "../bootState";
 
@@ -26,10 +30,13 @@ export interface RuntimePendingOperation<T> {
 }
 
 export interface RuntimeTurnController {
-  readonly submitTurn: (input: TurnStartInput) => Promise<TurnAccepted>;
+  readonly submitTurn: (input: RuntimeTurnSubmissionInput) => Promise<TurnAccepted>;
+  readonly resumeTurn: (input: TurnResumeInput) => Promise<TurnAccepted>;
   readonly cancelTurn: (input: TurnCancelInput) => Promise<TurnCancelResult>;
-  readonly steerTurn: (input: TurnQueuedInput) => Promise<TurnQueuedInputResult>;
-  readonly followUpTurn: (input: TurnQueuedInput) => Promise<TurnQueuedInputResult>;
+  readonly enqueueTurnInput: (input: TurnInputEnqueue) => Promise<InputQueueMutationResult>;
+  readonly prioritizeTurnInput: (input: TurnInputMutation) => Promise<InputQueueMutationResult>;
+  readonly updateTurnInput: (input: TurnInputUpdate) => Promise<InputQueueMutationResult>;
+  readonly deleteTurnInput: (input: TurnInputMutation) => Promise<InputQueueMutationResult>;
   readonly approvalRespond: (input: ApprovalResponseInput) => Promise<void>;
   readonly applyHostEvent: (event: Exclude<RuntimeHostEvent, { kind: "status" }>) => boolean;
 }
@@ -39,6 +46,12 @@ interface PendingTurnEventBuffer {
   readonly turnIds: Set<string>;
   readonly submittedAt: string;
   readonly submittedText: string;
+  readonly submittedAttachments: NonNullable<RuntimeTurnSubmissionInput["projectionAttachments"]>;
+}
+
+interface PendingInputEventBuffer {
+  pendingCount: number;
+  readonly events: Extract<RuntimeHostEvent, { kind: "timeline" }>[];
 }
 
 interface RuntimeTurnControllerOptions {
@@ -78,6 +91,15 @@ function pendingBufferForEvent(
   return Array.from(buffers.values()).find((buffer) => buffer.turnIds.has(params.turnId as string));
 }
 
+/** 输入 mutation ACK 之前按 Turn 缓冲全部事件，防止 consumed 被后续 terminal 越过。 */
+function pendingInputBufferForEvent(
+  buffers: Map<string, PendingInputEventBuffer>,
+  event: Extract<RuntimeHostEvent, { kind: "timeline" }>,
+): PendingInputEventBuffer | undefined {
+  const turnId = (event.event.params as { turnId?: unknown }).turnId;
+  return typeof turnId === "string" ? buffers.get(turnId) : undefined;
+}
+
 /**
  * Turn controller 独占 early-event buffer 与 Turn/Approval 用例；它只读取 lifecycle controller
  * 提供的 generation gate、串行 operation port 和注入的 projection port，不知道 Conversation
@@ -95,13 +117,15 @@ export function useRuntimeTurnController({
   isTurnGenerationCurrent,
 }: RuntimeTurnControllerOptions): RuntimeTurnController {
   const pendingEventsRef = useRef<Map<string, PendingTurnEventBuffer>>(new Map());
+  const pendingInputEventsRef = useRef<Map<string, PendingInputEventBuffer>>(new Map());
+  const inputMutationSequenceRef = useRef(0);
 
   /**
    * start 请求在串行 lane 入口前后都复核 generation；ACK 前缓存早到事件，ACK 后先投影
    * accepted identity 再按原顺序重放，避免 Timeline 出现无归属增量。
    */
   const submitTurn = useCallback(
-    (input: TurnStartInput): Promise<TurnAccepted> => {
+    (input: RuntimeTurnSubmissionInput): Promise<TurnAccepted> => {
       const lifecycleEpoch = lifecycleEpochRef.current;
       const generation = runtimeStateRef.current?.generation;
       if (generation === undefined || !isTurnGateCurrent(lifecycleEpoch, generation)) {
@@ -116,13 +140,15 @@ export function useRuntimeTurnController({
           turnIds: new Set(),
           submittedAt: new Date().toISOString(),
           submittedText: submittedTurnText(input),
+          submittedAttachments: input.projectionAttachments ?? [],
         });
       }
       const pending = enqueueOperation(key, () => {
         if (!isTurnGateCurrent(lifecycleEpoch, generation)) {
           throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
         }
-        return runtime.turnStart(input);
+        const { projectionAttachments: _projectionAttachments, ...turnStartInput } = input;
+        return runtime.turnStart(turnStartInput);
       });
       return pending.promise
         .then((accepted) => {
@@ -137,6 +163,7 @@ export function useRuntimeTurnController({
               turnId: accepted.turnId,
               threadRevision: accepted.threadRevision,
               submittedText: buffer.submittedText,
+              submittedAttachments: buffer.submittedAttachments,
               submittedAt: buffer.submittedAt,
             });
             pendingEventsRef.current.delete(input.threadId);
@@ -204,12 +231,66 @@ export function useRuntimeTurnController({
     [bootRef, enqueueOperation, lifecycleEpochRef, recoveryRef, runtime, runtimeStateRef],
   );
 
-  /** steering/follow-up 共用 generation fence 与串行 lane，durable FIFO 仍由 Java 独占。 */
-  const queueTurnInput = useCallback(
-    (kind: "steering" | "follow_up", input: TurnQueuedInput): Promise<TurnQueuedInputResult> => {
+  /**
+   * Resume 是用户对既有持久 Operation 的新授权；它使用 revision CAS 和 generation fence，
+   * 但不调用 applyTurnAccepted，因为 Turn identity 已存在且后续状态仍由权威事件推进。
+   */
+  const resumeTurn = useCallback(
+    (input: TurnResumeInput): Promise<TurnAccepted> => {
+      const lifecycleEpoch = lifecycleEpochRef.current;
+      if (
+        recoveryRef.current?.required === true ||
+        bootRef.current.status === "recovery_required"
+      ) {
+        return Promise.reject(
+          new RuntimeHostError("RECOVERY_REQUIRED", "需要先完成运行时恢复", false),
+        );
+      }
+      const expectedGeneration = runtimeStateRef.current?.generation;
+      const pending = enqueueOperation(
+        `turnResume:${input.turnId}:${input.expectedThreadRevision}`,
+        () => {
+          const currentGeneration = runtimeStateRef.current?.generation;
+          if (
+            expectedGeneration === undefined ||
+            currentGeneration !== expectedGeneration ||
+            lifecycleEpochRef.current !== lifecycleEpoch
+          ) {
+            throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+          }
+          return runtime.turnResume(input);
+        },
+      );
+      return pending.promise.catch((error: unknown) => {
+        throw normalizeRuntimeError(error);
+      });
+    },
+    [bootRef, enqueueOperation, lifecycleEpochRef, recoveryRef, runtime, runtimeStateRef],
+  );
+
+  /** 每个调用使用唯一 operation key；连续相同文本也必须成为不同持久队列条目。 */
+  const mutateTurnInput = useCallback(
+    <T extends TurnInputEnqueue | TurnInputMutation | TurnInputUpdate>(
+      input: T,
+      mutation: (input: T) => Promise<InputQueueMutationResult>,
+    ): Promise<InputQueueMutationResult> => {
       const lifecycleEpoch = lifecycleEpochRef.current;
       const expectedGeneration = runtimeStateRef.current?.generation;
-      const key = `turnInput:${kind}:${input.turnId}`;
+      const existingBuffer = pendingInputEventsRef.current.get(input.turnId);
+      if (existingBuffer === undefined)
+        pendingInputEventsRef.current.set(input.turnId, { pendingCount: 1, events: [] });
+      else existingBuffer.pendingCount += 1;
+      inputMutationSequenceRef.current += 1;
+      const key = `turnInput:${input.turnId}:${inputMutationSequenceRef.current}`;
+      /** 最后一条 mutation 结算后再按接收顺序重放，保持 Thread revision 流的原子顺序。 */
+      const settleBuffer = (): void => {
+        const buffer = pendingInputEventsRef.current.get(input.turnId);
+        if (buffer === undefined) return;
+        buffer.pendingCount -= 1;
+        if (buffer.pendingCount > 0) return;
+        pendingInputEventsRef.current.delete(input.turnId);
+        for (const event of buffer.events) projection.applyHostEvent(event);
+      };
       const pending = enqueueOperation(key, () => {
         if (
           recoveryRef.current?.required === true ||
@@ -221,32 +302,47 @@ export function useRuntimeTurnController({
         if (expectedGeneration === undefined || currentGeneration !== expectedGeneration) {
           throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
         }
-        return kind === "steering" ? runtime.turnSteer(input) : runtime.turnFollowUp(input);
+        return mutation(input);
       });
       return pending.promise
         .then((result) => {
           if (lifecycleEpochRef.current !== lifecycleEpoch) {
             throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
           }
+          projection.applyInputQueue(result.inputQueue);
+          settleBuffer();
           return result;
         })
         .catch((error: unknown) => {
+          settleBuffer();
           throw normalizeRuntimeError(error);
         });
     },
-    [bootRef, enqueueOperation, lifecycleEpochRef, recoveryRef, runtime, runtimeStateRef],
+    [bootRef, enqueueOperation, lifecycleEpochRef, projection, recoveryRef, runtimeStateRef],
   );
 
-  /** steering 只为下一个 Tool boundary 排队 guidance，不中断当前工作。 */
-  const steerTurn = useCallback(
-    (input: TurnQueuedInput): Promise<TurnQueuedInputResult> => queueTurnInput("steering", input),
-    [queueTurnInput],
+  /** 默认入队始终是 follow-up，立即引导只能对已签发 inputId 再显式提升。 */
+  const enqueueTurnInput = useCallback(
+    (input: TurnInputEnqueue): Promise<InputQueueMutationResult> =>
+      mutateTurnInput(input, runtime.turnInputEnqueue.bind(runtime)),
+    [mutateTurnInput, runtime],
   );
 
-  /** follow-up 只在 active Turn 即将结束时消费，保持与 steering 不同的业务语义。 */
-  const followUpTurn = useCallback(
-    (input: TurnQueuedInput): Promise<TurnQueuedInputResult> => queueTurnInput("follow_up", input),
-    [queueTurnInput],
+  /** 提升、编辑和删除共享同一条目 revision CAS 与 ACK/Event 缓冲语义。 */
+  const prioritizeTurnInput = useCallback(
+    (input: TurnInputMutation): Promise<InputQueueMutationResult> =>
+      mutateTurnInput(input, runtime.turnInputPrioritize.bind(runtime)),
+    [mutateTurnInput, runtime],
+  );
+  const updateTurnInput = useCallback(
+    (input: TurnInputUpdate): Promise<InputQueueMutationResult> =>
+      mutateTurnInput(input, runtime.turnInputUpdate.bind(runtime)),
+    [mutateTurnInput, runtime],
+  );
+  const deleteTurnInput = useCallback(
+    (input: TurnInputMutation): Promise<InputQueueMutationResult> =>
+      mutateTurnInput(input, runtime.turnInputDelete.bind(runtime)),
+    [mutateTurnInput, runtime],
   );
 
   /** Approval decision 按业务 identity 合并 in-flight，不向 Context 暴露 private request id。 */
@@ -271,6 +367,11 @@ export function useRuntimeTurnController({
   const applyHostEvent = useCallback(
     (event: Exclude<RuntimeHostEvent, { kind: "status" }>): boolean => {
       if (event.kind === "timeline") {
+        const inputBuffer = pendingInputBufferForEvent(pendingInputEventsRef.current, event);
+        if (inputBuffer !== undefined) {
+          inputBuffer.events.push(event);
+          return false;
+        }
         const buffer = pendingBufferForEvent(pendingEventsRef.current, event);
         if (buffer !== undefined) {
           const turnId = (event.event.params as { turnId?: unknown }).turnId;
@@ -285,5 +386,15 @@ export function useRuntimeTurnController({
     [projection],
   );
 
-  return { submitTurn, cancelTurn, steerTurn, followUpTurn, approvalRespond, applyHostEvent };
+  return {
+    submitTurn,
+    resumeTurn,
+    cancelTurn,
+    enqueueTurnInput,
+    prioritizeTurnInput,
+    updateTurnInput,
+    deleteTurnInput,
+    approvalRespond,
+    applyHostEvent,
+  };
 }

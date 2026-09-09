@@ -86,6 +86,24 @@ fn open_emits_snapshot_and_event() {
     assert!(matches!(events[0].kind, PreviewEventKind::Opened { .. }));
 }
 
+/// 原生可见性只在平台操作成功后推进，重复 resize 可据此跳过 WebView2 show。
+#[test]
+fn native_visibility_is_internal_and_explicitly_committed() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager.open("https://example.test/").expect("open");
+    let id = opened.snapshot.id;
+
+    assert!(!manager.native_visible(id).expect("initial visibility"));
+    manager
+        .commit_native_visibility(id, true)
+        .expect("show committed");
+    assert!(manager.native_visible(id).expect("visible"));
+    manager
+        .commit_native_visibility(id, false)
+        .expect("hide committed");
+    assert!(!manager.native_visible(id).expect("hidden"));
+}
+
 #[test]
 /// 模拟创建子 WebView 时同步到达的回调，确保返回值重读最新代际与 URL，而非返回陈旧快照。
 fn authoritative_open_result_observes_creation_callback_generation() {

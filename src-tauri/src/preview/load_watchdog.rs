@@ -116,6 +116,25 @@ impl PreviewLoadWatchdog {
         Ok(())
     }
 
+    /// WebView2 的 redirect/Started callback 只推进当前加载代际，不代表新的用户预算。
+    /// 因此在保留原 task 与绝对到期时间的同时更新 completion generation；没有活动 task
+    /// 时返回 false，由调用方决定是否建立新的有界 watchdog。
+    pub(crate) fn rebind(
+        &self,
+        session_id: PreviewId,
+        generation: PreviewGeneration,
+    ) -> Result<bool, PreviewError> {
+        let mut state = self.lock_state()?;
+        if state.shutdown_started {
+            return Err(PreviewError::new(PreviewErrorCode::ShutdownStarted));
+        }
+        let Some(pending) = state.pending.get_mut(&session_id) else {
+            return Ok(false);
+        };
+        pending.ticket.generation = generation;
+        Ok(true)
+    }
+
     /// 只取消与 engine completion 当前 generation 对应的 timeout；旧 navigation 的晚到
     /// completion 不能解除较新的 load。
     pub(crate) fn complete(
@@ -162,14 +181,14 @@ impl PreviewLoadWatchdog {
         Ok(())
     }
 
-    /// 只有 generation 与不透明 attempt token 都仍为当前值时才领取 timeout；
-    /// completion、replacement 与 close 都会使其 stale。
+    /// 只有不透明 attempt token 仍为当前值时才领取 timeout；generation 可由同一加载 intent
+    /// 的 redirect callback 原地重绑定，而 replacement、completion 与 close 都会更换或移除 token。
     fn expire(&self, ticket: LoadTimeoutTicket) -> Result<bool, PreviewError> {
         let mut state = self.lock_state()?;
         let matches = state
             .pending
             .get(&ticket.session_id)
-            .is_some_and(|pending| pending.ticket == ticket);
+            .is_some_and(|pending| pending.ticket.token == ticket.token);
         if matches {
             state.pending.remove(&ticket.session_id);
             return Ok(true);

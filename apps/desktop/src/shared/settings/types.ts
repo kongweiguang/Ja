@@ -1,9 +1,8 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/** Settings v4 的共享值只描述 Provider、Model 与脱敏引用，不承载 runtime 观测状态。 */
-export type ProviderApi = "anthropic_messages" | "openai_responses";
-export type ProviderKind = "anthropic" | "openai";
+/** Settings v1 的共享值只描述 Provider、Model 与脱敏引用，不承载 runtime 观测状态。 */
+export type ProviderApi = "anthropic_messages" | "openai_responses" | "openai_chat_completions";
 export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type McpTransport = "stdio" | "streamable_http";
 
@@ -34,7 +33,6 @@ interface AgentDefaults {
 export interface ProviderSave {
   providerId: string;
   name: string;
-  provider: ProviderKind;
   api: ProviderApi;
   baseUrl: string;
   credentialId: string;

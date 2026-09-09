@@ -3,6 +3,9 @@
 
 package io.github.kongweiguang.ja.conversation.adapter.out.tools;
 
+import io.github.kongweiguang.ja.platform.windows.WindowsJobObject;
+import io.github.kongweiguang.ja.platform.windows.WindowsProcessLauncher;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -62,6 +65,17 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
      * 生成不可被自定义 System Prompt 替代的精简环境块，使模型和实际执行器共享同一方言。
      */
     public String executionEnvironment(Path cwd) {
+        String dialectRules = switch (dialect) {
+            case POWERSHELL -> """
+                    This is PowerShell 7, not Bash. Do not use POSIX-only commands such as head, tail,
+                    grep, sed, or awk. Use PowerShell cmdlets such as Select-Object -First/-Last and
+                    Get-Content, and use rg.exe for repository search when it is available.""";
+            case WINDOWS_POWERSHELL -> """
+                    This is Windows PowerShell 5.1, not Bash. Do not use POSIX-only commands such as head,
+                    tail, grep, sed, or awk. Use PowerShell cmdlets such as Select-Object -First/-Last and
+                    Get-Content, and use rg.exe for repository search when it is available.""";
+            case ZSH, BASH -> "Use only the declared POSIX shell dialect for shell tool calls.";
+        };
         return """
                 <execution_environment>
                 os: %s
@@ -69,8 +83,9 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
                 cwd: %s
                 path_style: %s
                 </execution_environment>
-                Use only the declared shell dialect for shell tool calls."""
-                .formatted(os.wireName, dialect.wireName, cwd.toAbsolutePath().normalize(), pathStyle);
+                %s"""
+                .formatted(os.wireName, dialect.wireName, cwd.toAbsolutePath().normalize(), pathStyle,
+                        dialectRules);
     }
 
     /**
@@ -78,8 +93,10 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
      */
     public String toolDescription() {
         return switch (dialect) {
-            case POWERSHELL -> "Execute PowerShell 7 commands";
-            case WINDOWS_POWERSHELL -> "Execute Windows PowerShell 5.1 commands";
+            case POWERSHELL -> "Execute PowerShell 7 commands. This is not Bash: use Select-Object "
+                    + "instead of head/tail and rg.exe instead of grep when available.";
+            case WINDOWS_POWERSHELL -> "Execute Windows PowerShell 5.1 commands. This is not Bash: use "
+                    + "Select-Object instead of head/tail and rg.exe instead of grep when available.";
             case ZSH -> "Execute zsh commands";
             case BASH -> "Execute Bash commands";
         };
@@ -91,6 +108,9 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
     boolean preflight() {
         if (!Files.isRegularFile(executable)) {
             return false;
+        }
+        if (os == OperatingSystem.WINDOWS) {
+            return preflightWindows();
         }
         Process process = null;
         try {
@@ -112,6 +132,30 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
             return false;
         } finally {
             if (process != null && process.isAlive()) process.destroyForcibly();
+        }
+    }
+
+    /**
+     * 与 Shell Tool 共用挂起创建、路径策略和 Job 接纳，避免应用执行别名仅通过 JVM 预检。
+     * 探针不产生输出，五秒内必须退出；无论成功或失败都先回收 Job，再关闭本地进程句柄。
+     */
+    private boolean preflightWindows() {
+        Process process = null;
+        try {
+            try (WindowsJobObject job = WindowsJobObject.create()) {
+                process = WindowsProcessLauncher.launch(commandLine("exit 0"),
+                        executable.getParent(), environment, job);
+                process.getOutputStream().close();
+                return process.waitFor(PREFLIGHT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                        && process.exitValue() == 0;
+            } finally {
+                if (process != null) WindowsProcessLauncher.close(process);
+            }
+        } catch (IOException failure) {
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 

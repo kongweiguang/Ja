@@ -1,0 +1,420 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-review-shell {
+  --ja-review-tree-width: 240px;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--ja-foreground);
+  background: var(--ja-window-surface);
+  container: ja-review-shell / inline-size;
+}
+
+.ja-review-shell-header {
+  display: flex;
+  min-height: 2.55rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.34rem 0.55rem 0.34rem 0.7rem;
+  border-bottom: 1px solid var(--ja-window-border);
+  background: var(--ja-window-surface);
+}
+.ja-review-shell-scope {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  font-size: 0.8125rem;
+}
+.ja-review-shell-scope > * {
+  max-width: 100%;
+}
+.ja-review-shell-scope > strong {
+  overflow: hidden;
+  font-weight: var(--ja-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-review-shell-summary {
+  display: inline-flex;
+  min-width: max-content;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ja-foreground-muted);
+  font: 0.75rem/1.25 var(--ja-font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ja-review-shell-summary .is-added,
+.ja-review-tree-file-delta span:first-child {
+  color: var(--ja-success);
+}
+.ja-review-shell-summary .is-removed,
+.ja-review-tree-file-delta span:last-child {
+  color: var(--ja-danger);
+}
+.ja-review-shell-navigation {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.1rem;
+  margin-left: auto;
+}
+.ja-review-shell .ja-icon-button {
+  appearance: none;
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    color 120ms var(--ja-ease-native),
+    border-color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native),
+    transform 80ms var(--ja-ease-native);
+}
+.ja-review-shell .ja-icon-button:hover:not(:disabled),
+.ja-review-shell .ja-icon-button[data-state="open"] {
+  border-color: var(--ja-border);
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-review-shell .ja-icon-button:active:not(:disabled) {
+  transform: scale(0.96);
+}
+.ja-review-shell .ja-icon-button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+.ja-review-shell .ja-icon-button:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+.ja-review-shell .ja-icon-button > svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.8;
+}
+
+.ja-review-shell-notice {
+  flex: 0 0 auto;
+  padding: 0.38rem 0.7rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ja-warning) 30%, var(--ja-window-border));
+  color: var(--ja-warning);
+  background: var(--ja-warning-soft);
+  font-size: 0.75rem;
+}
+.ja-review-shell-toolbar {
+  display: flex;
+  min-height: 2.25rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.22rem 0.55rem;
+  border-bottom: 1px solid var(--ja-window-border);
+  background: var(--ja-window-surface);
+}
+.ja-review-shell-file-navigation {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.ja-review-shell-body {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr) 20px var(--ja-review-tree-width);
+  overflow: hidden;
+}
+.ja-review-shell-diff,
+.ja-review-shell-tree {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--ja-window-surface);
+}
+.ja-review-shell-diff {
+  display: flex;
+  flex-direction: column;
+}
+.ja-review-shell-tree {
+  border-left: 1px solid var(--ja-window-border);
+}
+.ja-review-tree-resizer {
+  position: relative;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+}
+.ja-review-tree-resizer::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 9px;
+  width: 1px;
+  background: var(--ja-window-border);
+  content: "";
+}
+.ja-review-tree-resizer:hover::after,
+.ja-review-tree-resizer:focus-visible::after {
+  width: 2px;
+  background: var(--ja-accent);
+}
+.ja-review-tree-resizer:focus-visible {
+  outline: 0;
+}
+.ja-review-shell-mobile-bar {
+  display: none;
+}
+
+.ja-review-tree {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--ja-window-surface);
+}
+.ja-review-tree-tools {
+  display: flex;
+  min-height: 2.45rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.28rem;
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid var(--ja-window-border);
+}
+.ja-review-tree-search {
+  display: flex;
+  min-width: 0;
+  height: 1.85rem;
+  flex: 1;
+  align-items: center;
+  gap: 0.28rem;
+  padding: 0 0.42rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: var(--ja-window-surface-muted);
+}
+.ja-review-tree-search svg {
+  width: 0.78rem;
+  height: 0.78rem;
+  flex: 0 0 auto;
+}
+.ja-review-tree-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ja-foreground);
+  background: transparent;
+  font: 0.75rem/1.25 var(--ja-font-ui);
+}
+.ja-review-tree-search:focus-within {
+  border-color: color-mix(in srgb, var(--ja-accent) 55%, var(--ja-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ja-accent) 18%, transparent);
+}
+.ja-review-tree-grouping-menu {
+  min-width: 148px;
+}
+.ja-review-tree-grouping-menu .ja-menu-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  gap: 8px;
+}
+.ja-review-tree-grouping-indicator {
+  display: grid;
+  color: var(--ja-accent);
+  place-items: center;
+}
+.ja-review-tree-grouping-indicator > svg {
+  width: 14px;
+  height: 14px;
+}
+.ja-review-tree-scroll {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+.ja-review-tree-spacer {
+  position: relative;
+  min-height: 100%;
+}
+.ja-review-tree-virtual-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 32px;
+}
+.ja-review-tree-file,
+.ja-review-tree-branch {
+  display: flex;
+  width: 100%;
+  height: 32px;
+  min-width: 0;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.15rem 0.4rem 0.15rem calc(0.45rem + var(--ja-review-tree-depth, 0) * 0.9rem);
+  border: 0;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font-size: 0.8125rem;
+  letter-spacing: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.ja-review-tree-file:hover,
+.ja-review-tree-branch:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-review-tree-file[aria-selected="true"] {
+  color: var(--ja-foreground);
+  background: var(--ja-control-active);
+  box-shadow: inset 2px 0 var(--ja-accent);
+}
+.ja-review-tree-file:focus-visible,
+.ja-review-tree-branch:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
+}
+.ja-review-tree-file-icon,
+.ja-review-tree-branch > svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex: 0 0 auto;
+}
+.ja-review-tree-file-icon {
+  display: grid;
+  place-items: center;
+  color: var(--ja-accent);
+}
+.ja-review-tree-file-icon svg {
+  width: 0.82rem;
+  height: 0.82rem;
+}
+.ja-review-tree-file-icon[data-status="added"],
+.ja-review-tree-file-icon[data-status="untracked"] {
+  color: var(--ja-success);
+}
+.ja-review-tree-file-icon[data-status="deleted"],
+.ja-review-tree-file-icon[data-status="conflicted"] {
+  color: var(--ja-danger);
+}
+.ja-review-tree-file-name,
+.ja-review-tree-branch > span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-review-tree-file-name {
+  font-family: var(--ja-font-mono);
+}
+.ja-review-tree-file-status,
+.ja-review-tree-file-binary {
+  color: var(--ja-foreground-tertiary);
+  font: 600 0.6875rem/1 var(--ja-font-mono);
+}
+.ja-review-tree-file-delta {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 0.24rem;
+  font: 0.6875rem/1 var(--ja-font-mono);
+}
+.ja-review-tree-branch > small {
+  color: var(--ja-foreground-tertiary);
+  font-size: 0.6875rem;
+}
+.ja-review-tree-branch.is-group {
+  font-weight: var(--ja-weight-semibold);
+}
+.ja-review-tree-state {
+  display: grid;
+  min-height: 8rem;
+  margin: 0;
+  place-items: center;
+  color: var(--ja-foreground-muted);
+  font-size: 0.75rem;
+}
+
+.ja-review-shell[data-review-layout="narrow"] .ja-review-shell-body {
+  display: block;
+}
+.ja-review-shell[data-review-layout="narrow"] .ja-review-tree-resizer {
+  display: none;
+}
+.ja-review-shell[data-review-layout="narrow"] .ja-review-shell-tree,
+.ja-review-shell[data-review-layout="narrow"] .ja-review-shell-diff {
+  width: 100%;
+  height: 100%;
+}
+.ja-review-shell[data-review-layout="narrow"] .ja-review-shell-diff {
+  display: none;
+}
+.ja-review-shell[data-review-layout="narrow"].is-detail-open .ja-review-shell-tree {
+  display: none;
+}
+.ja-review-shell[data-review-layout="narrow"].is-detail-open .ja-review-shell-diff {
+  display: flex;
+}
+.ja-review-shell[data-review-layout="narrow"] .ja-review-shell-mobile-bar {
+  display: flex;
+  min-height: 2.2rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.18rem 0.45rem;
+  border-bottom: 1px solid var(--ja-window-border);
+  color: var(--ja-foreground-muted);
+  font-size: 0.75rem;
+}
+.ja-review-shell[data-review-layout="narrow"] .ja-review-shell-mobile-bar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@container ja-review-shell (max-width: 480px) {
+  .ja-review-shell-header {
+    gap: 0.3rem;
+    padding-right: 0.4rem;
+    padding-left: 0.5rem;
+  }
+  .ja-review-shell-summary {
+    gap: 0.32rem;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ja-review-shell * {
+    scroll-behavior: auto !important;
+  }
+  .ja-review-shell .ja-icon-button {
+    transition: none;
+  }
+}
+@media (forced-colors: active) {
+  .ja-review-tree-file[aria-selected="true"] {
+    outline: 1px solid Highlight;
+  }
+}

@@ -13,13 +13,18 @@ import type { ExternalRefreshMode } from "./documentUseCases";
 import type { ControllerRef } from "./controllerPorts";
 
 export interface ReconciliationUseCases {
-  reconcileAuthoritativeWorkspace: () => void;
+  reconcileAuthoritativeWorkspace: (options?: ReconciliationOptions) => void;
   handleWorkspaceChanged: (event: WorkspaceChangedEvent) => void;
+}
+
+export interface ReconciliationOptions {
+  readonly rescanWatcher?: boolean;
 }
 
 interface ReconciliationUseCasesContext {
   workspaceId: string;
   watchRescan: FilesWorkspaceOperations["watchRescan"];
+  watcherReady: ControllerRef<boolean>;
   documents: ControllerRef<Record<string, OpenDocument>>;
   workspaceGeneration: ControllerRef<number>;
   reconciliationTask: ControllerRef<Promise<void> | undefined>;
@@ -42,20 +47,26 @@ interface ReconciliationUseCasesContext {
 export function createReconciliationUseCases(
   context: ReconciliationUseCasesContext,
 ): ReconciliationUseCases {
-  /** overflow 或窗口恢复时合并为一条全量对账任务，旧 workspace 晚结果必须丢弃。 */
-  function reconcileAuthoritativeWorkspace(): void {
+  /**
+   * 合并同一 generation 的全量对账；面板重新激活时 Watcher 尚未完成启动，调用方可跳过
+   * rescan 并直接读取权威 Tree/Read，避免把正常启动时序误报成扫描失败。
+   */
+  function reconcileAuthoritativeWorkspace(options?: ReconciliationOptions): void {
     if (context.reconciliationTask.current !== undefined) return;
     const generation = context.workspaceGeneration.current;
+    const rescanWatcher = (options?.rescanWatcher ?? true) && context.watcherReady.current;
     const baselines = Object.entries(context.documents.current).map(([path, document]) => ({
       path,
       revision: document.revision,
     }));
     const task = (async (): Promise<void> => {
-      try {
-        await context.watchRescan?.({ workspaceId: context.workspaceId });
-      } catch {
-        if (generation === context.workspaceGeneration.current)
-          context.onNotice?.("工作区重新扫描失败，正在直接刷新文件状态。");
+      if (rescanWatcher) {
+        try {
+          await context.watchRescan?.({ workspaceId: context.workspaceId });
+        } catch {
+          if (generation === context.workspaceGeneration.current)
+            context.onNotice?.("工作区重新扫描失败，正在直接刷新文件状态。");
+        }
       }
       if (generation !== context.workspaceGeneration.current) return;
       await context.loadDirectory("");

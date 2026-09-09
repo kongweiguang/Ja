@@ -204,7 +204,10 @@ pub(crate) fn available_shell_profiles() -> Vec<ShellProfile> {
         .collect()
 }
 
-/// 解析默认 profile，使不同桌面平台提供自然的原生 shell。
+/// 解析默认 profile，使不同桌面平台提供自然且启动行为确定的原生 shell。
+///
+/// Windows 集成终端不加载宿主 PowerShell Profile：Profile 既会把任意用户启动逻辑带入受管
+/// PTY，也会显著延迟首屏；用户仍可在终端就绪后按需加载自己的配置。
 pub(crate) fn resolve_shell(profile: ShellProfile) -> Result<ResolvedShell, TerminalError> {
     let profile = match profile {
         ShellProfile::Default => {
@@ -251,7 +254,7 @@ pub(crate) fn resolve_shell(profile: ShellProfile) -> Result<ResolvedShell, Term
                     let program = candidates.into_iter().find(|path| path.is_file());
                     (
                         program.ok_or(TerminalError::new(TerminalErrorCode::InvalidShell))?,
-                        vec!["-NoLogo".into()],
+                        vec!["-NoLogo".into(), "-NoProfile".into()],
                     )
                 }
                 ShellProfile::Cmd => {

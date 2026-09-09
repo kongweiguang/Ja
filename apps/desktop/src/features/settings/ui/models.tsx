@@ -3,7 +3,7 @@
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { ArrowDown, ArrowUp, Pencil, Play, Plus, Trash2, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Button,
@@ -16,7 +16,6 @@ import {
 import type {
   DefaultModelSelection,
   ProviderApi,
-  ProviderKind,
   ProviderModelSave,
   ProviderSave,
   ReasoningLevel,
@@ -30,7 +29,6 @@ import {
   emptyProviderDraft,
   emptyProviderModelDraft,
   Field,
-  providerOptions,
   SectionHeader,
   settingsMutationErrorMessage,
   SettingsSelect,
@@ -38,9 +36,9 @@ import {
 import { CredentialVaultEditor } from "./CredentialVaultEditor";
 
 interface ProviderEditorState {
-  providerId?: string;
+  providerId: string;
+  modelId: string;
   name: string;
-  provider: ProviderKind;
   api: ProviderApi;
   baseUrl: string;
   credentialId: string;
@@ -53,17 +51,13 @@ interface ModelChoice {
   label: string;
 }
 
-/** Provider 类型映射唯一原生 API，禁止重新引入旧协议的兼容选择。 */
-function defaultApi(provider: ProviderKind): ProviderApi {
-  return provider === "anthropic" ? "anthropic_messages" : "openai_responses";
-}
-
 /** 创建空编辑器状态；Secret 不进入任何 React state，只由非受控 Vault 输入持有。 */
 function emptyEditorState(): ProviderEditorState {
   const provider = emptyProviderDraft();
   return {
+    providerId: canonicalRevision("provider"),
+    modelId: canonicalRevision("model"),
     name: provider.name,
-    provider: provider.provider,
     api: provider.api,
     baseUrl: provider.baseUrl,
     credentialId: provider.credentialId,
@@ -76,8 +70,8 @@ function emptyEditorState(): ProviderEditorState {
 function stateForProvider(provider: ProviderProjection): ProviderEditorState {
   return {
     providerId: provider.providerId,
+    modelId: canonicalRevision("model"),
     name: provider.name,
-    provider: provider.provider,
     api: provider.api,
     baseUrl: provider.baseUrl,
     credentialId: provider.credentialId,
@@ -86,11 +80,11 @@ function stateForProvider(provider: ProviderProjection): ProviderEditorState {
   };
 }
 
-/** 为新增模型生成当前产品的显式能力基线，避免 Provider UI 猜测远端能力探测结果。 */
-function newModel(name: string, model: string): ProviderModelSave {
+/** 为新增模型使用预分配稳定 ID，失败重试不会创建另一个逻辑模型。 */
+function newModel(modelId: string, name: string, model: string): ProviderModelSave {
   const draft = emptyProviderModelDraft();
   return {
-    modelId: canonicalRevision("model"),
+    modelId,
     name: name.trim(),
     model: model.trim(),
     capabilities: draft.capabilities,
@@ -547,7 +541,6 @@ function ProviderCard({
       const next: ProviderSave = {
         ...provider,
         name: editor.name.trim(),
-        provider: editor.provider,
         api: editor.api,
         baseUrl: editor.baseUrl.trim(),
         credentialId: editor.credentialId,
@@ -571,8 +564,16 @@ function ProviderCard({
     }
     setBusy(true);
     try {
-      await ports.onSaveModel(provider.providerId, newModel(editor.modelName, editor.model));
-      setEditor((current) => ({ ...current, modelName: "", model: "" }));
+      await ports.onSaveModel(
+        provider.providerId,
+        newModel(editor.modelId, editor.modelName, editor.model),
+      );
+      setEditor((current) => ({
+        ...current,
+        modelId: canonicalRevision("model"),
+        modelName: "",
+        model: "",
+      }));
       toast.success("模型已添加");
       return true;
     } catch (error) {
@@ -722,26 +723,11 @@ function ProviderCard({
                   onChange={(event) => setEditor({ ...editor, name: event.target.value })}
                 />
               </Field>
-              <Field id={`${provider.providerId}-kind`} label="服务商">
-                <SettingsSelect
-                  id={`${provider.providerId}-kind`}
-                  value={editor.provider}
-                  options={providerOptions}
-                  onValueChange={(value) => {
-                    const kind = value as ProviderKind;
-                    setEditor({ ...editor, provider: kind, api: defaultApi(kind) });
-                  }}
-                />
-              </Field>
-              <Field id={`${provider.providerId}-api`} label="接口">
+              <Field id={`${provider.providerId}-api`} label="API 规范">
                 <SettingsSelect
                   id={`${provider.providerId}-api`}
                   value={editor.api}
-                  options={apiOptions.filter((option) =>
-                    editor.provider === "anthropic"
-                      ? option.value === "anthropic_messages"
-                      : option.value !== "anthropic_messages",
-                  )}
+                  options={apiOptions}
                   onValueChange={(value) => setEditor({ ...editor, api: value as ProviderApi })}
                 />
               </Field>
@@ -895,24 +881,22 @@ function ProviderCard({
   );
 }
 
-/** 模型与服务商页面完整管理 v4 聚合，不再暴露旧 Profile 激活入口。 */
+/** 模型与服务商页面完整管理 v1 聚合，连接与模型能力保持同一 Provider 所有权。 */
 export function ModelsSection({
   providers,
   defaultSelection,
   ports,
-  projectMode = false,
-  projectOverridden = false,
 }: {
   providers: SettingsSnapshot["providers"];
   defaultSelection: SettingsSnapshot["defaultSelection"];
   snapshotRevision: number;
   ports: SettingsPorts;
-  projectMode?: boolean;
-  projectOverridden?: boolean;
 }): React.ReactElement {
   const [editor, setEditor] = useState<ProviderEditorState>(emptyEditorState);
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [creationFeedback, setCreationFeedback] = useState<string>();
+  const secretRef = useRef<HTMLInputElement>(null);
   const [selectedProviderId, setSelectedProviderId] = useState(
     defaultSelection?.providerId ?? providers[0]?.providerId,
   );
@@ -937,155 +921,90 @@ export function ModelsSection({
     }
   }, [adding, defaultSelection?.providerId, providers, selectedProviderId]);
 
-  /** 新建 Provider 与首个模型必须原子提交，确保默认选择永远不会指向空聚合。 */
+  /** 关闭创建器时清除草稿和 Secret DOM，下一次打开必须获得全新的稳定身份。 */
+  const resetCreator = (): void => {
+    if (secretRef.current !== null) secretRef.current.value = "";
+    setEditor(emptyEditorState());
+    setCreationFeedback(undefined);
+  };
+
+  /** 进行中的跨存储提交不能被关闭；其余关闭路径统一释放敏感输入与失败反馈。 */
+  const changeAdding = (open: boolean): void => {
+    if (!open && busy) return;
+    setAdding(open);
+    if (!open) resetCreator();
+  };
+
+  /**
+   * 新建 Provider、首模型和独立 Secret 由一个应用用例完成；Secret 每次尝试后立即清空，
+   * 凭据写入失败则保留同一 Provider/Model ID 和非敏感草稿供原地重试。
+   */
   const createProvider = async (): Promise<boolean> => {
+    const secret = secretRef.current?.value ?? "";
+    setCreationFeedback(undefined);
     if (
       editor.name.trim() === "" ||
       editor.baseUrl.trim() === "" ||
       editor.modelName.trim() === "" ||
       editor.model.trim() === ""
     ) {
-      toast.error("请完整填写服务商、Base URL 和首个模型");
+      const message = "请完整填写服务商、Base URL 和首个模型";
+      if (secretRef.current !== null) secretRef.current.value = "";
+      setCreationFeedback(message);
+      toast.error(message);
+      return false;
+    }
+    if (secret.length === 0) {
+      const message = "请输入 API key / token";
+      setCreationFeedback(message);
+      toast.error(message);
       return false;
     }
     setBusy(true);
     try {
       const defaults = emptyProviderDraft();
-      const providerId = canonicalRevision("provider");
-      await ports.onSaveProvider({
-        ...defaults,
-        providerId,
-        name: editor.name.trim(),
-        provider: editor.provider,
-        api: editor.api,
-        baseUrl: editor.baseUrl.trim(),
-        credentialId: editor.credentialId,
-        models: [newModel(editor.modelName, editor.model)],
-      });
-      setEditor(emptyEditorState());
-      setSelectedProviderId(providerId);
+      await ports.onCreateProvider(
+        {
+          ...defaults,
+          providerId: editor.providerId,
+          name: editor.name.trim(),
+          api: editor.api,
+          baseUrl: editor.baseUrl.trim(),
+          credentialId: editor.credentialId,
+          models: [newModel(editor.modelId, editor.modelName, editor.model)],
+        },
+        secret,
+      );
+      setSelectedProviderId(editor.providerId);
       setAdding(false);
-      toast.success("服务商和模型已添加");
+      resetCreator();
+      toast.success("服务商、模型和密钥已保存");
       return true;
     } catch (error) {
-      toast.error(settingsMutationErrorMessage(error, "服务商添加失败"));
+      const code =
+        error !== null && typeof error === "object"
+          ? (error as { code?: unknown }).code
+          : undefined;
+      const message =
+        code === "provider_saved_credential_failed"
+          ? "Provider 已保存，但密钥保存失败，请重新输入后重试"
+          : settingsMutationErrorMessage(error, "服务商添加失败");
+      if (code === "provider_saved_credential_failed") setSelectedProviderId(editor.providerId);
+      setCreationFeedback(message);
+      toast.error(message);
       return false;
     } finally {
+      if (secretRef.current !== null) secretRef.current.value = "";
       setBusy(false);
     }
   };
-
-  /** 项目作用域只允许选择全局已有模型与其逻辑档位，不展示路由、凭据和能力编辑器。 */
-  if (projectMode) {
-    const models = providers.flatMap((provider) =>
-      provider.models.map((model) => ({ provider, model })),
-    );
-    const selected =
-      models.find(
-        ({ provider, model }) =>
-          provider.providerId === defaultSelection?.providerId &&
-          model.modelId === defaultSelection.modelId,
-      ) ?? models[0];
-    const selectedId =
-      selected === undefined
-        ? ""
-        : modelSelectionId(selected.provider.providerId, selected.model.modelId);
-    const levels =
-      selected === undefined
-        ? []
-        : (Object.keys(selected.model.reasoningLevelMap) as ReasoningLevel[]);
-    return (
-      <div className="ja-settings-section">
-        <SectionHeader
-          title="项目模型"
-          action={
-            projectOverridden ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={busy}
-                onClick={() => {
-                  setBusy(true);
-                  void ports
-                    .onRestoreDefaultSelection()
-                    .then(() => toast.success("模型已恢复继承全局设置"))
-                    .catch((error: unknown) =>
-                      toast.error(settingsMutationErrorMessage(error, "模型继承恢复失败")),
-                    )
-                    .finally(() => setBusy(false));
-                }}
-              >
-                恢复继承
-              </Button>
-            ) : (
-              <span className="ja-settings-override-state">继承全局</span>
-            )
-          }
-        />
-        {selected === undefined ? (
-          <p className="ja-settings-empty">全局尚未配置可用模型。</p>
-        ) : (
-          <div className="ja-settings-group">
-            <div className="ja-settings-row">
-              <div>
-                <strong>模型</strong>
-                <span>仅选择全局已有模型</span>
-              </div>
-              <SettingsSelect
-                id="project-default-model"
-                value={selectedId}
-                options={models.map(({ provider, model }) => ({
-                  value: modelSelectionId(provider.providerId, model.modelId),
-                  label: `${provider.name} · ${model.name}`,
-                }))}
-                onValueChange={(value) => {
-                  const target = models.find(
-                    ({ provider, model }) =>
-                      modelSelectionId(provider.providerId, model.modelId) === value,
-                  );
-                  if (target === undefined) return;
-                  void ports.onDefaultSelectionChange({
-                    providerId: target.provider.providerId,
-                    modelId: target.model.modelId,
-                    reasoningLevel: target.model.defaultReasoningLevel,
-                  });
-                }}
-              />
-            </div>
-            <div className="ja-settings-row">
-              <div>
-                <strong>思考档位</strong>
-                <span>只显示当前模型支持的档位</span>
-              </div>
-              <SettingsSelect
-                id="project-reasoning-level"
-                value={defaultSelection?.reasoningLevel ?? "default"}
-                options={[
-                  { value: "default", label: "模型默认" },
-                  ...reasoningLevels.filter((item) => levels.includes(item.value)),
-                ]}
-                onValueChange={(value) =>
-                  void ports.onDefaultSelectionChange({
-                    providerId: selected.provider.providerId,
-                    modelId: selected.model.modelId,
-                    reasoningLevel: value === "default" ? null : (value as ReasoningLevel),
-                  })
-                }
-              />
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  }
 
   return (
     <div className="ja-settings-section">
       <SectionHeader
         title="模型与服务商"
         action={
-          <Button type="button" variant="primary" size="sm" onClick={() => setAdding(true)}>
+          <Button type="button" variant="primary" size="sm" onClick={() => changeAdding(true)}>
             <Plus aria-hidden="true" />
             新增 Provider
           </Button>
@@ -1100,7 +1019,7 @@ export function ModelsSection({
               className={`ja-settings-provider-master${!adding && provider.providerId === selectedProvider?.providerId ? " is-selected" : ""}`}
               onClick={() => {
                 setSelectedProviderId(provider.providerId);
-                setAdding(false);
+                changeAdding(false);
               }}
             >
               <strong>{provider.name}</strong>
@@ -1124,7 +1043,7 @@ export function ModelsSection({
           )}
         </div>
       </div>
-      <Dialog modal open={adding} onOpenChange={setAdding}>
+      <Dialog modal open={adding} onOpenChange={changeAdding}>
         <DialogContent
           className="ja-settings-sheet"
           overlayClassName="ja-settings-dialog-overlay"
@@ -1137,11 +1056,17 @@ export function ModelsSection({
                 id="new-provider-description"
                 className="ja-settings-dialog-description"
               >
-                首次保存会同时创建一个 text-only 模型，确保默认选择始终有效。
+                首次保存会同时写入 Provider、首个模型和独立密钥。
               </DialogDescription>
             </div>
             <DialogClose asChild>
-              <Button type="button" variant="ghost" size="sm" aria-label="关闭新增 Provider">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label="关闭新增 Provider"
+                disabled={busy}
+              >
                 <X aria-hidden="true" />
               </Button>
             </DialogClose>
@@ -1156,34 +1081,11 @@ export function ModelsSection({
                   onChange={(event) => setEditor({ ...editor, name: event.target.value })}
                 />
               </Field>
-              <Field id="new-provider-kind" label="服务商">
-                <SettingsSelect
-                  id="new-provider-kind"
-                  value={editor.provider}
-                  options={providerOptions}
-                  onValueChange={(value) => {
-                    const provider = value as ProviderKind;
-                    setEditor({
-                      ...editor,
-                      provider,
-                      api: defaultApi(provider),
-                      baseUrl:
-                        provider === "anthropic"
-                          ? "https://api.anthropic.com"
-                          : "https://api.openai.com/v1",
-                    });
-                  }}
-                />
-              </Field>
-              <Field id="new-provider-api" label="接口">
+              <Field id="new-provider-api" label="API 规范">
                 <SettingsSelect
                   id="new-provider-api"
                   value={editor.api}
-                  options={apiOptions.filter((option) =>
-                    editor.provider === "anthropic"
-                      ? option.value === "anthropic_messages"
-                      : option.value !== "anthropic_messages",
-                  )}
+                  options={apiOptions}
                   onValueChange={(value) => setEditor({ ...editor, api: value as ProviderApi })}
                 />
               </Field>
@@ -1193,6 +1095,18 @@ export function ModelsSection({
                   className="ja-settings-input"
                   value={editor.baseUrl}
                   onChange={(event) => setEditor({ ...editor, baseUrl: event.target.value })}
+                />
+              </Field>
+              <Field id="new-provider-secret" label="API key / token">
+                <input
+                  ref={secretRef}
+                  id="new-provider-secret"
+                  className="ja-settings-input"
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="输入后保存，不会回显"
+                  aria-describedby="new-provider-feedback"
+                  disabled={busy}
                 />
               </Field>
               <Field id="new-provider-model-name" label="首个模型名称">
@@ -1212,11 +1126,16 @@ export function ModelsSection({
                 />
               </Field>
             </div>
+            {creationFeedback === undefined ? null : (
+              <p id="new-provider-feedback" className="ja-settings-feedback" role="status">
+                {creationFeedback}
+              </p>
+            )}
           </div>
           <div className="ja-settings-sheet-footer">
             {providers.length > 0 ? (
               <DialogClose asChild>
-                <Button type="button" variant="secondary" size="sm">
+                <Button type="button" variant="secondary" size="sm" disabled={busy}>
                   取消
                 </Button>
               </DialogClose>

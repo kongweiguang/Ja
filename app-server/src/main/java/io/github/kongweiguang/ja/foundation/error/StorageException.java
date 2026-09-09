@@ -48,10 +48,6 @@ public final class StorageException extends RuntimeException {
          */
         TRANSACTION,
         /**
-         * 目录或数据库不符合全新代际标记。
-         */
-        FRESH_SCHEMA_REQUIRED,
-        /**
          * 存储代际或实例身份发生冲突。
          */
         STORAGE_CONFLICT,

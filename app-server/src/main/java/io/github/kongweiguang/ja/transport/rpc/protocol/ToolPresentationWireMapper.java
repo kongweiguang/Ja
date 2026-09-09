@@ -23,7 +23,7 @@ final class ToolPresentationWireMapper {
     }
 
     /**
-     * 只写 JA-RPC v2 声明的展示字段；空可选值保持缺失，原始 Tool 参数和结果没有映射入口。
+     * 只写 JA-RPC v1 声明的展示字段；空可选值保持缺失，原始 Tool 参数和结果没有映射入口。
      */
     ObjectNode map(ToolPresentation value) {
         Objects.requireNonNull(value, "value");

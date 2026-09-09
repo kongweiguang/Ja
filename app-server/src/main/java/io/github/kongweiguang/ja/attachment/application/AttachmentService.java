@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.attachment.application;
 
 import io.github.kongweiguang.ja.attachment.domain.AttachmentFailure;
 import io.github.kongweiguang.ja.attachment.domain.AttachmentMetadata;
+import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.out.AttachmentBlobStore;
 import io.github.kongweiguang.ja.attachment.port.out.AttachmentRepository;
@@ -20,8 +21,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -32,18 +36,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 受管附件的唯一应用服务；导入、生命周期、Thread 可见读取和 24 小时回收共享同一状态边界。
  */
-public final class AttachmentService implements AttachmentUseCase, DeadlineCloseable {
+public final class AttachmentService implements AttachmentUseCase, AttachmentPreviewUseCase, DeadlineCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(AttachmentService.class);
     private static final Duration DRAFT_TTL = Duration.ofHours(24);
     private static final Duration IMPORT_MAX_AGE = Duration.ofHours(1);
     private static final Duration IMPORT_CLOCK_SKEW = Duration.ofMinutes(5);
     private static final int GC_BATCH_SIZE = 256;
     private static final int GC_MAX_BATCHES = 4;
+    private static final Duration PREVIEW_IDLE_TTL = Duration.ofMinutes(5);
+    private static final int PREVIEW_SESSION_LIMIT = 32;
+    private static final long TEXT_PREVIEW_LIMIT = 1024L * 1024;
     private final AttachmentRepository repository;
     private final AttachmentBlobStore blobs;
     private final Clock clock;
     private final ScheduledExecutorService scheduler;
     private final Object mutationMonitor = new Object();
+    private final Object previewMonitor = new Object();
+    private final Map<String, PreviewSession> previewSessions = new LinkedHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     /**
@@ -115,7 +124,9 @@ public final class AttachmentService implements AttachmentUseCase, DeadlineClose
         Objects.requireNonNull(discardedAt, "discardedAt");
         synchronized (mutationMonitor) {
             try {
-                return repository.discardDraft(attachmentId, discardedAt);
+                AttachmentMetadata discarded = repository.discardDraft(attachmentId, discardedAt);
+                closePreviewsForAttachment(attachmentId);
+                return discarded;
             } catch (StorageException persistenceFailure) {
                 throw map(persistenceFailure);
             }
@@ -130,7 +141,7 @@ public final class AttachmentService implements AttachmentUseCase, DeadlineClose
         ensureOpen();
         Objects.requireNonNull(request, "request");
         try {
-            AttachmentMetadata metadata = repository.findBound(request.attachmentId(), request.threadId())
+            AttachmentMetadata metadata = repository.findThread(request.attachmentId(), request.threadId())
                     .orElseThrow(() -> new AttachmentFailure(AttachmentFailure.Code.NOT_FOUND));
             byte[] bytes = blobs.readRange(metadata.sha256(), request.offsetBytes(), request.maxBytes());
             boolean physicalEnd = request.offsetBytes() + bytes.length >= metadata.sizeBytes();
@@ -147,6 +158,146 @@ public final class AttachmentService implements AttachmentUseCase, DeadlineClose
             throw map(storageFailure);
         } catch (StorageException persistenceFailure) {
             throw map(persistenceFailure);
+        }
+    }
+
+    /**
+     * 打开前先清理空闲 session，再从 DRAFT Workspace 或 BOUND Thread 权威关系授权；不支持媒体拒绝创建假预览。
+     */
+    @Override
+    public PreviewDescriptor openPreview(PreviewOpenRequest request) {
+        ensureOpen();
+        Objects.requireNonNull(request, "request");
+        synchronized (previewMonitor) {
+            Instant now = clock.instant();
+            purgeExpiredPreviews(now);
+            AttachmentMetadata metadata = authorizePreview(
+                    request.attachmentId(), request.authorization(), now);
+            if (previewSessions.size() >= PREVIEW_SESSION_LIMIT) {
+                throw new AttachmentFailure(AttachmentFailure.Code.CONFLICT);
+            }
+            PreviewKind previewKind = switch (metadata.mediaKind()) {
+                case IMAGE -> PreviewKind.IMAGE;
+                case TEXT -> PreviewKind.TEXT;
+                case PDF, BINARY -> throw new AttachmentFailure(AttachmentFailure.Code.INVALID_REQUEST);
+            };
+            String previewSessionId = "apv_" + UUID.randomUUID().toString().replace("-", "");
+            previewSessions.put(previewSessionId, new PreviewSession(previewSessionId,
+                    request.attachmentId(), request.authorization(), now));
+            return new PreviewDescriptor(previewSessionId, metadata.attachmentId(), metadata.displayName(),
+                    metadata.sizeBytes(), metadata.mediaKind(), metadata.mediaType(), previewKind);
+        }
+    }
+
+    /**
+     * 每个分段都重新验证原始授权，使丢弃、过期或 Thread 关系变化立即失败关闭；内容只以 Base64 有界返回给 Rust。
+     */
+    @Override
+    public PreviewReadResult readPreview(PreviewReadRequest request) {
+        ensureOpen();
+        Objects.requireNonNull(request, "request");
+        synchronized (previewMonitor) {
+            Instant now = clock.instant();
+            PreviewSession session = requirePreviewSession(request.previewSessionId(), now);
+            try {
+                AttachmentMetadata metadata = authorizePreview(
+                        session.attachmentId(), session.authorization(), now);
+                PreviewReadResult result = readPreviewSegment(request, metadata);
+                previewSessions.put(session.previewSessionId(), session.accessedAt(now));
+                return result;
+            } catch (AttachmentFailure failure) {
+                previewSessions.remove(request.previewSessionId());
+                throw failure;
+            } catch (AttachmentBlobStore.Failure storageFailure) {
+                previewSessions.remove(request.previewSessionId());
+                throw map(storageFailure);
+            }
+        }
+    }
+
+    /** 有效格式的未知或已关闭 session 与首次关闭返回相同结果，避免暴露 session 历史。 */
+    @Override
+    public void closePreview(String previewSessionId) {
+        ensureOpen();
+        if (previewSessionId == null || !previewSessionId.matches("apv_[0-9a-f]{32}")) {
+            throw new IllegalArgumentException("invalid preview session identity");
+        }
+        synchronized (previewMonitor) {
+            previewSessions.remove(previewSessionId);
+        }
+    }
+
+    /** 根据媒体类型应用各自读取上限；文本截断点也按 UTF-8 边界回退，不能输出半个码点。 */
+    private PreviewReadResult readPreviewSegment(PreviewReadRequest request, AttachmentMetadata metadata) {
+        long previewEnd = metadata.mediaKind() == AttachmentMetadata.MediaKind.TEXT
+                ? Math.min(metadata.sizeBytes(), TEXT_PREVIEW_LIMIT) : metadata.sizeBytes();
+        if (request.offsetBytes() > previewEnd) {
+            throw new AttachmentFailure(AttachmentFailure.Code.INVALID_REQUEST);
+        }
+        boolean truncated = metadata.mediaKind() == AttachmentMetadata.MediaKind.TEXT
+                && metadata.sizeBytes() > TEXT_PREVIEW_LIMIT;
+        if (request.offsetBytes() == previewEnd) {
+            return new PreviewReadResult(request.previewSessionId(), request.offsetBytes(),
+                    request.offsetBytes(), "", true, truncated);
+        }
+        int readSize = Math.toIntExact(Math.min(request.limitBytes(), previewEnd - request.offsetBytes()));
+        byte[] bytes = blobs.readRange(metadata.sha256(), request.offsetBytes(), readSize);
+        if (bytes.length == 0 || bytes.length > readSize
+            || request.offsetBytes() + bytes.length < Math.min(previewEnd, request.offsetBytes() + readSize)) {
+            throw new AttachmentFailure(AttachmentFailure.Code.CONTENT_CORRUPT);
+        }
+        int consumed = bytes.length;
+        if (metadata.mediaKind() == AttachmentMetadata.MediaKind.TEXT) {
+            boolean physicalEnd = request.offsetBytes() + bytes.length >= metadata.sizeBytes();
+            consumed = decodeText(bytes, physicalEnd).consumedBytes();
+        }
+        long next = request.offsetBytes() + consumed;
+        boolean eof = request.offsetBytes() + bytes.length >= previewEnd;
+        return new PreviewReadResult(request.previewSessionId(), request.offsetBytes(), next,
+                Base64.getEncoder().encodeToString(Arrays.copyOf(bytes, consumed)), eof, truncated);
+    }
+
+    /** DRAFT 只允许未预留 Composer 草稿；Thread 分支每次从队列或消息关系重新授权。 */
+    private AttachmentMetadata authorizePreview(String attachmentId, Authorization authorization, Instant now) {
+        try {
+            if (authorization instanceof DraftAuthorization draft) {
+                AttachmentMetadata metadata = repository.findDraft(attachmentId, draft.workspaceId())
+                        .orElseThrow(() -> new AttachmentFailure(AttachmentFailure.Code.NOT_FOUND));
+                if (!metadata.expiresAt().isAfter(now)) {
+                    throw new AttachmentFailure(AttachmentFailure.Code.NOT_FOUND);
+                }
+                return metadata;
+            }
+            if (authorization instanceof ThreadAuthorization thread) {
+                return repository.findThread(attachmentId, thread.threadId())
+                        .orElseThrow(() -> new AttachmentFailure(AttachmentFailure.Code.NOT_FOUND));
+            }
+            throw new AttachmentFailure(AttachmentFailure.Code.INVALID_REQUEST);
+        } catch (StorageException persistenceFailure) {
+            throw map(persistenceFailure);
+        }
+    }
+
+    /** 空闲满五分钟即删除；边界包含恰好 TTL，避免 session 多存活一个请求周期。 */
+    private void purgeExpiredPreviews(Instant now) {
+        previewSessions.values().removeIf(session ->
+                !session.lastAccessAt().plus(PREVIEW_IDLE_TTL).isAfter(now));
+    }
+
+    /** 读取不存在或已空闲过期的 session 都返回相同 NOT_FOUND，并在返回前完成删除。 */
+    private PreviewSession requirePreviewSession(String previewSessionId, Instant now) {
+        PreviewSession session = previewSessions.get(previewSessionId);
+        if (session == null || !session.lastAccessAt().plus(PREVIEW_IDLE_TTL).isAfter(now)) {
+            previewSessions.remove(previewSessionId);
+            throw new AttachmentFailure(AttachmentFailure.Code.NOT_FOUND);
+        }
+        return session;
+    }
+
+    /** 草稿成功丢弃后同步撤销同附件所有预览，不等待下一次 read 才释放 session 配额。 */
+    private void closePreviewsForAttachment(String attachmentId) {
+        synchronized (previewMonitor) {
+            previewSessions.values().removeIf(session -> session.attachmentId().equals(attachmentId));
         }
     }
 
@@ -245,7 +396,12 @@ public final class AttachmentService implements AttachmentUseCase, DeadlineClose
     /** 先阻止新任务并中断 Scheduler，只消费组合根提供的剩余关闭预算。 */
     @Override
     public void closeAt(long shutdownDeadlineNanos) {
-        if (closed.compareAndSet(false, true)) scheduler.shutdownNow();
+        if (closed.compareAndSet(false, true)) {
+            scheduler.shutdownNow();
+            synchronized (previewMonitor) {
+                previewSessions.clear();
+            }
+        }
         long remaining = shutdownDeadlineNanos - System.nanoTime();
         if (remaining <= 0 && !scheduler.isTerminated()) {
             throw new IllegalStateException("attachment scheduler close deadline expired");
@@ -262,4 +418,13 @@ public final class AttachmentService implements AttachmentUseCase, DeadlineClose
 
     /** UTF-8 分段保存真实消费字节数，下一页 offset 不能按 Java 字符数推导。 */
     private record TextSegment(int consumedBytes, String text) { }
+
+    /** session 只保存重新授权所需 identity 与最近访问时间，不缓存 blob identity 或内容。 */
+    private record PreviewSession(String previewSessionId, String attachmentId,
+                                  Authorization authorization, Instant lastAccessAt) {
+        /** 成功读取后用不可变替换更新时间，失败不会延长 session 生命周期。 */
+        private PreviewSession accessedAt(Instant now) {
+            return new PreviewSession(previewSessionId, attachmentId, authorization, now);
+        }
+    }
 }

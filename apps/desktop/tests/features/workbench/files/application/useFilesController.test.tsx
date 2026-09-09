@@ -287,7 +287,6 @@ describe("FilesWorkspace", () => {
     await screen.findByText("main.ts");
     await user.click(screen.getByText("main.ts"));
     await screen.findByRole("tab", { name: "main.ts" });
-    await user.click(screen.getByRole("tab", { name: "搜索" }));
     await user.type(screen.getByRole("searchbox", { name: "搜索工作区" }), "main");
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /^main\.ts/ })).toBeInTheDocument(),
@@ -1651,6 +1650,68 @@ describe("FilesWorkspace", () => {
     expect(editor).not.toHaveAttribute("readonly");
     fireEvent.change(editor, { target: { value: "editing recovered" } });
     expect(editor).toHaveValue("editing recovered");
+  });
+
+  /**
+   * 隐藏 Files 必须保留 controller/lifecycle，但不能预读目录或注册原生观察者；重新显示时
+   * 通过权威对账恢复，随后再次隐藏要完整释放本轮订阅。
+   */
+  it("defers native Files activity until visible and suspends it again when hidden", async () => {
+    const { operations } = createOperations();
+    const stop = vi.fn(async () => undefined);
+    const firstWatchSubscription = deferred<WatchSubscription>();
+    const unlistenFocus = vi.fn(async () => undefined);
+    const unlistenDrop = vi.fn(async () => undefined);
+    operations.watchStart = vi
+      .fn()
+      .mockImplementationOnce(() => firstWatchSubscription.promise)
+      .mockResolvedValue({ stop });
+    operations.subscribeWindowFocus = vi.fn(async () => unlistenFocus);
+    operations.subscribeNativeDrop = vi.fn(async () => unlistenDrop);
+
+    const view = render(
+      <FilesWorkspace workspaceId="ws_test" operations={operations} activityEnabled={false} />,
+    );
+    await act(async () => Promise.resolve());
+
+    expect(operations.tree).not.toHaveBeenCalled();
+    expect(operations.watchStart).not.toHaveBeenCalled();
+    expect(operations.subscribeWindowFocus).not.toHaveBeenCalled();
+    expect(operations.subscribeNativeDrop).not.toHaveBeenCalled();
+
+    view.rerender(
+      <FilesWorkspace workspaceId="ws_test" operations={operations} activityEnabled={true} />,
+    );
+    await screen.findByText("main.ts");
+    await waitFor(() => expect(operations.watchStart).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(operations.subscribeWindowFocus).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(operations.subscribeNativeDrop).toHaveBeenCalledTimes(1));
+    expect(operations.watchRescan).not.toHaveBeenCalled();
+    await act(async () => {
+      firstWatchSubscription.resolve({ stop });
+      await Promise.resolve();
+    });
+    const rootReads = vi
+      .mocked(operations.tree)
+      .mock.calls.filter(([input]) => input.relativePath === "").length;
+
+    view.rerender(
+      <FilesWorkspace workspaceId="ws_test" operations={operations} activityEnabled={false} />,
+    );
+    await waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(unlistenFocus).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(unlistenDrop).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <FilesWorkspace workspaceId="ws_test" operations={operations} activityEnabled={true} />,
+    );
+    await waitFor(() => expect(operations.watchStart).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(
+        vi.mocked(operations.tree).mock.calls.filter(([input]) => input.relativePath === ""),
+      ).toHaveLength(rootReads + 1),
+    );
+    expect(operations.watchRescan).not.toHaveBeenCalled();
   });
 
   it("cleans up watcher and native-drop listeners when async subscriptions resolve after unmount", async () => {

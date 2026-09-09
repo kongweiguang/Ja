@@ -27,6 +27,28 @@ function formatTokenCount(value: number): string {
  * 因而使用可聚焦 progressbar 语义，避免把纯信息伪装成按钮。
  */
 export function ContextUsageIndicator({ usage }: ContextUsageIndicatorProps): ReactElement {
+  if (usage.certainty === "unknown") {
+    return (
+      <Tooltip
+        delayDuration={220}
+        sideOffset={8}
+        className="ja-context-usage-tooltip"
+        content={
+          <div className="ja-context-usage-tooltip__content">最近一次模型请求的 Token 用量未知</div>
+        }
+      >
+        <span
+          className="ja-context-usage"
+          data-tone="warning"
+          role="status"
+          aria-label="上下文使用量未知"
+          tabIndex={0}
+        >
+          <span aria-hidden="true">?</span>
+        </span>
+      </Tooltip>
+    );
+  }
   const used = formatTokenCount(usage.usedTokens);
   const limit = formatTokenCount(usage.limitTokens);
   const valueNow = Math.min(100, Math.max(0, usage.percentage));

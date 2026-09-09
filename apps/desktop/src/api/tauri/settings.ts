@@ -124,8 +124,7 @@ const UiProviderSchema = z
   .object({
     providerId: ConfigProviderIdSchema,
     name: z.string().min(1).max(MAX_STRING),
-    provider: z.enum(["anthropic", "openai"]),
-    api: z.enum(["anthropic_messages", "openai_responses"]),
+    api: z.enum(["anthropic_messages", "openai_responses", "openai_chat_completions"]),
     baseUrl: z.string().min(1).max(2_048),
     credentialId: CredentialRefSchema,
     credentialConfigured: z.boolean(),
@@ -175,7 +174,7 @@ const UiSkillSchema = z
   .object({
     skillId: z.string().regex(/^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/),
     name: z.string(),
-    scope: z.enum(["builtin", "user", "workspace"]),
+    scope: z.enum(["builtin", "user", "ja", "project"]),
     enabled: z.boolean(),
     description: z.string(),
   })
@@ -191,7 +190,7 @@ const WindowSettingsSchema = z
 /** Renderer 聚合不含 Secret；credentialConfigured 只是 native read 的脱敏状态。 */
 const SettingsDocumentSchema = z
   .object({
-    schemaVersion: z.literal(4),
+    schemaVersion: z.literal(1),
     revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     theme: z.enum(["system", "light", "dark"]),
     defaultAccessMode: z.enum(["approval_required", "full_access"]),
@@ -205,7 +204,7 @@ const SettingsDocumentSchema = z
       .nullable(),
     providers: z.array(UiProviderSchema).max(MAX_ENTRIES),
     mcpServers: z.array(UiMcpSchema).max(MAX_ENTRIES),
-    skills: z.array(UiSkillSchema).optional(),
+    skills: z.array(UiSkillSchema),
     window: WindowSettingsSchema,
   })
   .strict();
@@ -235,8 +234,6 @@ export interface LoadedSettings {
     disabledSkillIds: string[];
     disabledMcpIds: string[];
   };
-  source: "Default" | "Primary" | "Backup";
-  recovered: boolean;
   cas: ConfigReadResult["cas"];
 }
 
@@ -329,7 +326,8 @@ export type SettingsAdapterErrorCode =
   | "invalid_input"
   | "invalid_response"
   | "command_failed"
-  | "revision_conflict";
+  | "revision_conflict"
+  | "storage_unavailable";
 export class SettingsAdapterError extends Error {
   /** 错误只携带稳定 code 与脱敏文案，禁止原生路径、Secret 或任意 cause 穿过 renderer 边界。 */
   constructor(readonly code: SettingsAdapterErrorCode) {
@@ -340,7 +338,9 @@ export class SettingsAdapterError extends Error {
           ? "设置配置无效，需要先恢复；当前已禁止保存覆盖"
           : code === "revision_conflict"
             ? "设置已被其他窗口修改，请重新加载后再保存"
-            : "设置操作失败",
+            : code === "storage_unavailable"
+              ? "设置存储暂时不可用，请稍后重试"
+              : "设置操作失败",
     );
     this.name = "SettingsAdapterError";
   }
@@ -366,19 +366,17 @@ function parseResult<T>(schema: z.ZodType<T>, value: unknown): T {
     throw new SettingsAdapterError("invalid_response");
   }
 }
-/** 原生失败只识别可恢复的 CAS 冲突，其余诊断不跨 renderer。 */
+/** 只按当前 JA-RPC 稳定错误码分类，原生 message、路径和存储诊断不得进入 Renderer。 */
 function commandFailed(error: unknown): SettingsAdapterError {
   if (error instanceof SettingsAdapterError) return error;
   const value =
     error !== null && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
   const code = value?.["code"] ?? value?.["error"] ?? error;
-  return new SettingsAdapterError(
-    code === "RevisionConflict" ||
-    code === "CONFIG_VERSION_CONFLICT" ||
-    code === "CREDENTIAL_VERSION_CONFLICT"
-      ? "revision_conflict"
-      : "command_failed",
-  );
+  if (code === "CONFIG_CONFLICT") return new SettingsAdapterError("revision_conflict");
+  if (code === "STORAGE_UNAVAILABLE") return new SettingsAdapterError("storage_unavailable");
+  if (code === "CONFIG_INVALID") return new SettingsAdapterError("invalid_input");
+  if (code === "CONFIG_CORRUPTED") return new SettingsAdapterError("invalid_response");
+  return new SettingsAdapterError("command_failed");
 }
 /** 固定白名单调用将原生异常收敛为稳定 Settings 错误。 */
 async function invokeSettings(
@@ -411,7 +409,6 @@ function toUiProvider(
   return {
     providerId: provider.provider_id,
     name: provider.name,
-    provider: provider.provider,
     api: provider.api,
     baseUrl: provider.base_url,
     credentialId: provider.credential_id,
@@ -441,14 +438,14 @@ function toUiProvider(
     })),
   };
 }
-/** 完整 v4 native 文档只映射受信任字段，theme/window 留在 UI preference owner。 */
+/** 完整 v1 native 文档只映射受信任字段，theme/window 留在 UI preference owner。 */
 function toUiDocument(
   config: z.infer<typeof ConfigDocumentSchema>,
   credentials: Record<string, { configured: boolean }>,
 ): SettingsDocument {
   const hasDefault = config.default_provider_id !== null && config.default_model_id !== null;
   return {
-    schemaVersion: 4,
+    schemaVersion: 1,
     revision: config.config_revision,
     theme: "system",
     defaultAccessMode: config.default_access_mode,
@@ -485,7 +482,7 @@ function toUiDocument(
 /** 用户层确实缺失时建立合法空基线；该路径不用于损坏或无法解析的配置恢复。 */
 function emptySettingsDocument(): SettingsDocument {
   return {
-    schemaVersion: 4,
+    schemaVersion: 1,
     revision: 0,
     theme: "system",
     defaultAccessMode: "full_access",
@@ -497,7 +494,7 @@ function emptySettingsDocument(): SettingsDocument {
   };
 }
 
-/** 配置读取必须完整命中严格 v4；任何非法 effective/user 文档都 fail closed。 */
+/** 配置读取必须完整命中严格 v1；其它版本或非法 effective/user 文档都 fail closed。 */
 function parseConfigResponse(value: unknown): z.infer<typeof ConfigDocumentSchema> {
   const parsed = ConfigDocumentSchema.safeParse(value);
   if (!parsed.success) throw new SettingsAdapterError("invalid_response");
@@ -508,7 +505,6 @@ function toNativeProvider(provider: SettingsProvider): z.infer<typeof ConfigProv
   return ConfigProviderSchema.parse({
     provider_id: provider.providerId,
     name: provider.name,
-    provider: provider.provider,
     api: provider.api,
     base_url: provider.baseUrl,
     credential_id: provider.credentialId,
@@ -539,7 +535,7 @@ function toNativeProvider(provider: SettingsProvider): z.infer<typeof ConfigProv
     ),
   });
 }
-/** UI MCP 投影按真实 v4 auth 判别联合写回，避免把认证类型降级成 transport 猜测。 */
+/** UI MCP 投影按真实 v1 auth 判别联合写回，避免把认证类型降级成 transport 猜测。 */
 function toNativeMcp(server: SettingsMcpServer): z.infer<typeof ConfigMcpServerSchema> {
   return {
     mcp_id: server.mcpRevision,
@@ -562,10 +558,10 @@ function toNativeMcp(server: SettingsMcpServer): z.infer<typeof ConfigMcpServerS
     enabled: server.enabled,
   };
 }
-/** UI 聚合生成完整 v4 文档，默认选择不变量由 ConfigDocumentSchema 再次验证。 */
+/** UI 聚合生成完整 v1 文档，默认选择不变量由 ConfigDocumentSchema 再次验证。 */
 function settingsDocumentValue(document: SettingsDocument): z.infer<typeof ConfigDocumentSchema> {
   return ConfigDocumentSchema.parse({
-    schema_version: 4,
+    schema_version: 1,
     config_revision: document.revision,
     default_access_mode: document.defaultAccessMode,
     default_provider_id: document.defaultSelection?.providerId ?? null,
@@ -573,7 +569,7 @@ function settingsDocumentValue(document: SettingsDocument): z.infer<typeof Confi
     default_reasoning_level: document.defaultSelection?.reasoningLevel ?? null,
     providers: document.providers.map(toNativeProvider),
     mcp_servers: document.mcpServers.map(toNativeMcp),
-    skills: (document.skills ?? []).map((skill) => ({
+    skills: document.skills.map((skill) => ({
       skill_id: skill.skillId,
       name: skill.name,
       scope: skill.scope,
@@ -616,7 +612,7 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
       await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.patch, { input: parsed }),
     );
   }
-  /** 原子替换只接受严格 v4 文档与显式 CAS。 */
+  /** 原子替换只接受严格 v1 文档与显式 CAS，renderer 不提供版本转换。 */
   async replace(input: ConfigReplaceInput): Promise<ConfigWriteResult> {
     const parsed = parseInput(ConfigReplaceInputSchema, input);
     assertConfigValuesSafe(parsed.document);
@@ -655,8 +651,6 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
       document: toUiDocument(effective, read.credentials),
       userDocument,
       projectOverrides: projectOverrides(read.project),
-      source: userMissing ? "Default" : "Primary",
-      recovered: false,
       cas: read.cas,
     };
   }

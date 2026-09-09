@@ -26,37 +26,17 @@ import java.util.Objects;
  */
 final class JaFlywayResources implements ResourceProvider {
     private static final String RESOURCE_ROOT = "db/migration/";
-    private static final List<String> MIGRATIONS = List.of(
-            RESOURCE_ROOT + "V1__kernel.sql",
-            RESOURCE_ROOT + "V2__thread_runtime_preferences.sql",
-            RESOURCE_ROOT + "V3__managed_attachments_and_title_usage.sql",
-            RESOURCE_ROOT + "V4__safe_agent_timeline.sql",
-            RESOURCE_ROOT + "V5__close_agent_timeline_states.sql",
-            RESOURCE_ROOT + "V6__reasoning_levels.sql");
+    private static final List<String> MIGRATIONS = List.of(RESOURCE_ROOT + "V1__kernel.sql");
 
     /**
-     * 返回只包含 Ja 允许且按版本排序的有限 migration 集合；V6 也必须进入 Native Image 资源闭集。
+     * 只暴露首版 V1；资源闭集不包含历史脚本，因此 Native Image 和 JVM 不可能走出不同升级链。
      */
     static JaFlywayResources provider() {
         return new JaFlywayResources();
     }
 
     /**
-     * 从受控资源闭集导出当前 schema 版本，使恢复检查点与 Flyway 实际发布集合保持同源，
-     * 避免在启动组合中维护第二个容易漂移的版本常量。
-     */
-    static String latestVersion() {
-        String filename = MIGRATIONS.getLast().substring(RESOURCE_ROOT.length());
-        int separator = filename.indexOf("__");
-        if (separator <= 1 || filename.charAt(0) != 'V') {
-            throw new StorageException(StorageException.Code.INVALID_CONFIGURATION,
-                    "latest Flyway migration version is invalid");
-        }
-        return filename.substring(1, separator);
-    }
-
-    /**
-     * 精确解析 migration 路径，不探测任意文件系统位置。
+     * 精确解析唯一 migration 路径，不探测任意文件系统位置或历史脚本名。
      */
     @Override
     public LoadableResource getResource(String name) {

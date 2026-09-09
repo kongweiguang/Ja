@@ -28,6 +28,7 @@ function makeController(overrides: Partial<PreviewViewModel> = {}): PreviewContr
       active: true,
       canRetryRecovery: false,
       canReportViewport: false,
+      mode: "web",
       ...overrides,
     },
     actions: {
@@ -35,6 +36,15 @@ function makeController(overrides: Partial<PreviewViewModel> = {}): PreviewContr
       submit: vi.fn(),
       retryRecovery: vi.fn(),
       changeViewport: vi.fn(),
+      attachment: {
+        dismiss: vi.fn(),
+        retry: vi.fn(),
+        zoomIn: vi.fn(),
+        zoomOut: vi.fn(),
+        fit: vi.fn(),
+        actualSize: vi.fn(),
+        reportImageFailure: vi.fn(),
+      },
     },
   };
 }
@@ -110,5 +120,138 @@ describe("PreviewPanelView", () => {
       height: 540,
       visible: false,
     });
+  });
+
+  it("附件模式隐藏地址栏，焦点进入标题区并提供图片缩放与返回", async () => {
+    const user = userEvent.setup();
+    const controller = makeController({
+      mode: "attachment",
+      attachment: {
+        status: "ready",
+        target: {
+          attachmentId: "att_image_1",
+          displayName: "screenshot.png",
+          mediaKind: "image",
+          authorization: { kind: "draft" },
+        },
+        session: {
+          previewSessionId: "preview-session-1",
+          attachmentId: "att_image_1",
+          displayName: "screenshot.png",
+          sizeBytes: 1024,
+          mediaKind: "image",
+          mediaType: "image/png",
+          resourceUrl: "ja-attachment://localhost/preview/resource-token-1",
+        },
+        content: {
+          kind: "image",
+          resourceUrl: "ja-attachment://localhost/preview/resource-token-1",
+          zoom: { mode: "fit", percent: 100 },
+        },
+      },
+    });
+    render(<PreviewPanelView viewModel={controller.viewModel} actions={controller.actions} />);
+
+    expect(screen.queryByLabelText("Preview 地址")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "screenshot.png" })).toHaveFocus();
+    expect(screen.getByRole("group", { name: "图片缩放" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "放大" }));
+    expect(controller.actions.attachment.zoomIn).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "返回网页预览" }));
+    expect(controller.actions.attachment.dismiss).toHaveBeenCalledOnce();
+  });
+
+  it("从网页切到附件时隐藏但不关闭 native 网页 viewport", () => {
+    const rect = {
+      x: 840,
+      y: 250,
+      width: 430,
+      height: 540,
+      top: 250,
+      right: 1270,
+      bottom: 790,
+      left: 840,
+      toJSON: () => undefined,
+    };
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(rect);
+    const web = makeController({ canReportViewport: true });
+    const rendered = render(<PreviewPanelView viewModel={web.viewModel} actions={web.actions} />);
+    const attachment = makeController({
+      mode: "attachment",
+      attachment: {
+        status: "loading",
+        target: {
+          attachmentId: "att_image_1",
+          displayName: "shot.png",
+          mediaKind: "image",
+          authorization: { kind: "draft" },
+        },
+      },
+    });
+
+    rendered.rerender(
+      <PreviewPanelView viewModel={attachment.viewModel} actions={attachment.actions} />,
+    );
+
+    expect(web.actions.changeViewport).toHaveBeenLastCalledWith({
+      x: 840,
+      y: 250,
+      width: 430,
+      height: 540,
+      visible: false,
+    });
+    expect(web.actions.attachment.dismiss).not.toHaveBeenCalled();
+  });
+
+  it("文本附件复用只读 CodeMirror 并明确展示 1 MiB 截断", () => {
+    const controller = makeController({
+      mode: "attachment",
+      attachment: {
+        status: "ready",
+        target: {
+          attachmentId: "att_text_1",
+          displayName: "notes.txt",
+          mediaKind: "text",
+          authorization: { kind: "thread", threadId: "thread-1" },
+        },
+        session: {
+          previewSessionId: "preview-session-1",
+          attachmentId: "att_text_1",
+          displayName: "notes.txt",
+          sizeBytes: 2_000_000,
+          mediaKind: "text",
+          mediaType: "text/plain",
+        },
+        content: { kind: "text", text: "hello preview", truncated: true },
+      },
+    });
+    render(<PreviewPanelView viewModel={controller.viewModel} actions={controller.actions} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("仅展示前 1 MiB");
+    expect(screen.getByLabelText("只读文件 notes.txt")).toBeVisible();
+    expect(document.querySelector(".cm-content")).toHaveTextContent("hello preview");
+  });
+
+  it("附件错误保留返回路径并只在可重试时展示重试", async () => {
+    const user = userEvent.setup();
+    const controller = makeController({
+      mode: "attachment",
+      attachment: {
+        status: "error",
+        target: {
+          attachmentId: "att_text_1",
+          displayName: "notes.txt",
+          mediaKind: "text",
+          authorization: { kind: "draft" },
+        },
+        message: "暂时无法打开附件预览",
+        retryable: true,
+      },
+    });
+    render(<PreviewPanelView viewModel={controller.viewModel} actions={controller.actions} />);
+
+    expect(screen.getByText("暂时无法打开附件预览")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    expect(controller.actions.attachment.retry).toHaveBeenCalledOnce();
   });
 });

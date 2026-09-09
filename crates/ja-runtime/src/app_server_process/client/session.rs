@@ -830,27 +830,23 @@ impl Session {
 
     /// 把 monitor 的退出事实送入同一个控制队列，保证 supervisor 可统一 poll。
     pub(crate) fn report_process_exit(&self, code: Option<i32>) {
-        push_event(
+        wire::publish_terminal_and_fail_closed_with_reason(
             &self.inner,
+            TerminalReason::ProcessExited,
             SessionEvent::ProcessExited {
                 generation: self.inner.generation,
                 code,
             },
-            EventPriority::Control,
-            QueueKind::Control,
         );
-        wire::fail_closed_with_reason(&self.inner, TerminalReason::ProcessExited);
     }
 
     /// 报告 monitor 无法取得稳定退出码，并释放 pending waiters，避免 wait 失败留下悬挂请求。
     pub(crate) fn report_process_fault(&self) {
-        push_event(
+        wire::publish_terminal_and_fail_closed_with_reason(
             &self.inner,
+            TerminalReason::Fault,
             SessionEvent::ProtocolFault(codec::CodecError::Io),
-            EventPriority::Control,
-            QueueKind::Control,
         );
-        fail_closed(&self.inner);
     }
 
     /// 让 supervisor 把 writer join 纳入同一个 shutdown deadline。

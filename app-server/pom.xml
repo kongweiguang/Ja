@@ -15,7 +15,7 @@
 
     <groupId>io.github.kongweiguang</groupId>
     <artifactId>ja-app-server</artifactId>
-    <version>1.0.0</version>
+    <version>0.1.0</version>
     <packaging>jar</packaging>
 
     <name>Ja App Server</name>
@@ -232,11 +232,16 @@
             <artifactId>mybatis</artifactId>
             <version>${mybatis.version}</version>
         </dependency>
-        <dependency>
-            <groupId>org.flywaydb</groupId>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
             <version>${flyway.version}</version>
-        </dependency>
+    </dependency>
+    <dependency>
+      <groupId>io.github.java-diff-utils</groupId>
+      <artifactId>java-diff-utils</artifactId>
+      <version>4.17</version>
+    </dependency>
 
         <!-- Provider and MCP network adapters share OkHttp ownership.  The JVM
              artifact is explicit because the generic coordinate is metadata. -->
@@ -358,6 +363,20 @@
     <build>
         <directory>${ja.build.directory}</directory>
         <finalName>${project.artifactId}</finalName>
+        <resources>
+            <!-- 生产资源保持逐字复制；只有版本资源允许 Maven 展开 project.version。 -->
+            <resource>
+                <directory>${project.basedir}/src/main/resources</directory>
+                <filtering>false</filtering>
+            </resource>
+            <resource>
+                <directory>${project.basedir}/src/main/version</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>ja-build.properties</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -402,6 +421,7 @@
                 <version>${maven-resources-plugin.version}</version>
                 <configuration>
                     <encoding>${project.build.sourceEncoding}</encoding>
+                    <propertiesEncoding>${project.build.sourceEncoding}</propertiesEncoding>
                 </configuration>
             </plugin>
             <plugin>

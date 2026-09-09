@@ -1,0 +1,85 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-review-source-trigger {
+  display: inline-flex;
+  min-width: 0;
+  height: 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ja-foreground);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color 120ms var(--ja-ease-native),
+    border-color 120ms var(--ja-ease-native);
+}
+
+.ja-review-source-trigger > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-review-source-trigger > svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--ja-foreground-muted);
+}
+
+.ja-review-source-trigger:hover,
+.ja-review-source-trigger[data-state="open"] {
+  border-color: var(--ja-border);
+  background: var(--ja-surface-muted);
+}
+
+.ja-review-source-trigger:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-review-source-menu {
+  min-width: 184px;
+  max-width: min(320px, calc(100vw - 16px));
+}
+
+.ja-review-source-menu .ja-menu-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 16px;
+  gap: 8px;
+}
+
+.ja-review-source-menu .ja-menu-item > svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ja-review-source-menu .ja-menu-item > span {
+  grid-column: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-review-source-check {
+  grid-column: 3;
+  color: var(--ja-accent);
+}
+
+.ja-review-source-chevron {
+  grid-column: 3;
+  color: var(--ja-foreground-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-review-source-trigger {
+    transition: none;
+  }
+}

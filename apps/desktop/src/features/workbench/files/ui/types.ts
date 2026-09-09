@@ -1,6 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import type { ReactNode } from "react";
 import type {
   FilesActions,
   FilesSearchResult,
@@ -15,6 +16,7 @@ import type { WorkspaceFileNode } from "../domain/types";
 export interface FilesWorkspaceViewProps {
   viewModel: FilesViewModel;
   actions: FilesActions;
+  onAddToConversation?: (node: Pick<WorkspaceFileNode, "path" | "kind">) => void;
 }
 
 /** SearchPanel 只消费 application projection 和语义 intent，不直接读取 Runtime。 */
@@ -26,7 +28,9 @@ export interface SearchPanelProps {
   error?: string;
   onQueryChange?: (query: string) => void;
   onOpenResult?: (result: FilesSearchResult) => void;
+  onAddToConversation?: (result: FilesSearchResult) => void;
   onRetry?: () => void;
+  idleContent?: ReactNode;
 }
 
 /** Save As 对话框只表达相对路径 intent，不接触 workspace 或 native adapter。 */
@@ -70,6 +74,7 @@ export interface FileTreeProps {
   onTrash?: (node: WorkspaceFileNode) => void | Promise<void>;
   onRefresh?: (relativePath?: string) => void | Promise<void>;
   onContextMenu?: (node: WorkspaceFileNode, event: MouseEvent) => void;
+  onAddToConversation?: (node: WorkspaceFileNode) => void;
   onNativeDropToken?: (dropToken: string, targetDirectory: string) => void | Promise<void>;
   openTargets?: readonly FilesOpenTarget[];
   onOpenTarget?: (target: FilesOpenTarget["target"], relativePath: string) => void | Promise<void>;

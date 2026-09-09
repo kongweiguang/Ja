@@ -4,7 +4,10 @@
 import {
   timelineEventFromUnknown,
   timelineSnapshotFromUnknown,
+  type InputQueue,
   type TimelineEvent,
+  type TimelineGoalActivity,
+  type TimelineTaskActivityEntry,
   type TimelineSnapshotItem,
 } from "./timelineContracts";
 import type {
@@ -19,6 +22,7 @@ import type {
   TimelineTurn,
   TimelineTurnState,
 } from "./timelineTypes";
+import { contextReferencesFromUserContent, textFromUserContent } from "./userContent";
 
 type SemanticEvent = Exclude<
   TimelineEvent,
@@ -46,10 +50,21 @@ type ModelStepCommittedEvent = Extract<
   ThreadSemanticEvent,
   { method: "assistant/model-step-committed" }
 >;
+type ToolStartedEvent = Extract<ThreadSemanticEvent, { method: "tool/started" }>;
 type ToolBatchCommittedEvent = Extract<ThreadSemanticEvent, { method: "tool/batch-committed" }>;
+type InputConsumedEvent = Extract<ThreadSemanticEvent, { method: "turn/input-consumed" }>;
+type InputQueueChangedEvent = Extract<TimelineEvent, { method: "turn/input-queue-changed" }>;
 
 const EVENT_DEDUP_WINDOW = 1024;
 const textEncoder = new TextEncoder();
+
+/**
+ * 将权威终态机器码投影为最小重试语义；只有目录中明确可恢复的模型不可用允许提示重试，
+ * 其余未知码保持保守，避免 UI 擅自扩大失败契约。
+ */
+function turnError(errorCode: string): NonNullable<TimelineTurn["error"]> {
+  return { code: errorCode, retryable: errorCode === "MODEL_UNAVAILABLE" };
+}
 
 type ResyncReason =
   | "server_instance_changed"
@@ -104,6 +119,7 @@ interface TimelineThreadProjection {
   status: "active" | "archived" | "deleted";
   revision: number;
   activeTurnId?: string;
+  latestTurnId?: string;
   updatedAt?: string;
 }
 
@@ -128,7 +144,7 @@ interface ContextCompactionProjection {
   threadRevision: number;
   inputTokensBefore: number | null;
   inputTokensAfter: number | null;
-  strategyVersion: "ja-context-v3";
+  strategyVersion: "ja-context-v1";
   checkpointId?: string;
   errorCode?: string;
   occurredAt: string;
@@ -140,6 +156,8 @@ export interface AcceptedTurnProjection {
   turnId: string;
   threadRevision: number;
   submittedText: string;
+  /** ACK 的临时用户消息必须保留附件摘要；后续 Snapshot 会用服务端权威事实整体替换。 */
+  submittedAttachments?: readonly import("./timelineContracts").AttachmentSummary[];
   submittedAt: string;
 }
 
@@ -155,9 +173,14 @@ export interface TimelineState {
   itemIdsByThread: Record<string, string[]>;
   toolItemIdByCallId: Record<string, string>;
   pendingToolOrdinalByCallId: Record<string, number>;
+  /** 只记录当前 live stream 已接收的 started，不能从 Snapshot 的 running 状态反推。 */
+  liveStartedToolCorrelations: Record<string, true>;
   approvalsById: Record<string, TimelineApprovalState>;
   contextCompactionByThread: Record<string, ContextCompactionProjection>;
   contextUsageByThread: Record<string, TimelineContextUsage>;
+  taskActivitiesByRootThread: Record<string, readonly TimelineTaskActivityEntry[]>;
+  goalActivitiesByOwnerThread: Record<string, readonly TimelineGoalActivity[]>;
+  inputQueueByTurn: Record<string, InputQueue>;
   threadRevisionByThread: Record<string, number>;
   streamSeqByTurn: Record<string, number>;
   /** 未提交的 Assistant/Reasoning 文本；发生重连或 Gap 时必须丢弃。 */
@@ -182,9 +205,13 @@ export function createTimelineState(): TimelineState {
     itemIdsByThread: {},
     toolItemIdByCallId: {},
     pendingToolOrdinalByCallId: {},
+    liveStartedToolCorrelations: {},
     approvalsById: {},
     contextCompactionByThread: {},
     contextUsageByThread: {},
+    taskActivitiesByRootThread: {},
+    goalActivitiesByOwnerThread: {},
+    inputQueueByTurn: {},
     threadRevisionByThread: {},
     streamSeqByTurn: {},
     draftByTurn: {},
@@ -209,9 +236,13 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
     itemIdsByThread: {},
     toolItemIdByCallId: {},
     pendingToolOrdinalByCallId: {},
+    liveStartedToolCorrelations: {},
     approvalsById: {},
     contextCompactionByThread: {},
     contextUsageByThread: {},
+    taskActivitiesByRootThread: {},
+    goalActivitiesByOwnerThread: {},
+    inputQueueByTurn: {},
     threadRevisionByThread: {},
     streamSeqByTurn: {},
     draftByTurn: {},
@@ -333,6 +364,11 @@ export function requireActiveTurnResync(
   return activeThreadIds.size === 0 ? outcome(state, "applied") : next;
 }
 
+/** mutation CAS 失败后触发一次权威 thread/read，避免组件在陈旧队列上继续猜测。 */
+export function requireThreadResync(state: TimelineState, threadId: string): TimelineState {
+  return resync(state, threadId, "invalid_event");
+}
+
 /** Context lifecycle 拥有可空 Turn identity，必须先于普通 Turn Event 单独分派。 */
 function isContextCompactionEvent(event: TimelineEvent): event is ContextCompactionEvent {
   return (
@@ -351,17 +387,18 @@ function isThreadEvent(event: TimelineEvent): event is ThreadSemanticEvent {
   );
 }
 
-/** 仅对六种 Terminal Turn 状态返回 true，与冻结协议保持一致。 */
+/** 仅对三种 Terminal Turn 状态返回 true；Suspended 仍是阻塞 Thread 的可恢复状态。 */
 function isTerminalState(status: TimelineTurnState): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
-/** 校验一次六态 Lifecycle 边，不接纳内部 Agent Phase。 */
+/** 校验一次七态 Lifecycle 边，不接纳内部 Agent Phase。 */
 function isLegalTransition(from: TimelineTurnState, to: TimelineTurnState): boolean {
   const legal: Readonly<Record<TimelineTurnState, readonly TimelineTurnState[]>> = {
-    queued: ["running", "completed", "failed", "cancelled"],
-    running: ["waiting_approval", "completed", "failed", "cancelled"],
-    waiting_approval: ["running", "completed", "failed", "cancelled"],
+    queued: ["running", "suspended", "completed", "failed", "cancelled"],
+    running: ["waiting_approval", "suspended", "completed", "failed", "cancelled"],
+    waiting_approval: ["running", "suspended", "completed", "failed", "cancelled"],
+    suspended: ["queued", "cancelled"],
     completed: [],
     failed: [],
     cancelled: [],
@@ -434,11 +471,20 @@ function snapshotToolStatus(presentation: ToolPresentation): TimelineItemStatus 
   }
 }
 
+/** Snapshot 只为仍可能收到 live 结算事件的 Tool 重建关联，终态 presentation 永不回流。 */
+function isTerminalToolPresentation(presentation: ToolPresentation): boolean {
+  return ["success", "error", "cancelled"].includes(presentation.status);
+}
+
 /**
  * 转换持久 Snapshot 事实，但不假装它仍携带 Live Event Stream 的逐 Turn 进度。
  * Tool 历史按 callId 只投影一行，presentation 已包含最新持久状态，与 Live 原位更新保持一致。
  */
-function projectSnapshotItem(item: TimelineSnapshotItem, threadId: string): TimelineItemAdapter {
+function projectSnapshotItem(
+  item: TimelineSnapshotItem,
+  threadId: string,
+  failureReply: boolean,
+): TimelineItemAdapter {
   const base = {
     itemId: item.itemId,
     threadId,
@@ -448,7 +494,13 @@ function projectSnapshotItem(item: TimelineSnapshotItem, threadId: string): Time
   };
   switch (item.kind) {
     case "user_input":
-      return { ...base, kind: "user_message", text: item.text };
+      return {
+        ...base,
+        kind: "user_message",
+        text: textFromUserContent(item.content),
+        contextReferences: contextReferencesFromUserContent(item.content),
+        attachments: item.attachments,
+      };
     case "assistant_progress":
       return {
         ...base,
@@ -466,7 +518,14 @@ function projectSnapshotItem(item: TimelineSnapshotItem, threadId: string): Time
         metadata: { phase: "reasoning_summary", modelRound: item.modelRound },
       };
     case "final_answer":
-      return { ...base, kind: "agent_message", text: item.text, final: true, title: "Final" };
+      return {
+        ...base,
+        kind: "agent_message",
+        text: item.text,
+        final: true,
+        title: "Final",
+        ...(failureReply ? { metadata: { failureReply: true } } : {}),
+      };
     case "tool_call":
       return {
         ...base,
@@ -498,41 +557,13 @@ function projectSnapshotItem(item: TimelineSnapshotItem, threadId: string): Time
           requiresUserAction: item.decision === null,
         },
       };
-    case "attachment": {
-      const size =
-        item.sizeBytes < 1024
-          ? `${item.sizeBytes} B`
-          : item.sizeBytes < 1024 * 1024
-            ? `${(item.sizeBytes / 1024).toFixed(1)} KB`
-            : `${(item.sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
-      const kind =
-        item.mediaKind === "pdf"
-          ? "PDF"
-          : item.mediaKind === "image"
-            ? "图片"
-            : item.mediaKind === "text"
-              ? "文本"
-              : "文件";
-      return {
-        ...base,
-        kind: "commentary",
-        title: item.displayName,
-        summary: `${kind} · ${size}`,
-        metadata: {
-          attachmentId: item.attachmentId,
-          sizeBytes: item.sizeBytes,
-          mediaKind: item.mediaKind,
-          mediaType: item.mediaType,
-          attachmentState: item.state,
-        },
-      };
-    }
   }
 }
 
 /**
- * 应用完整且未分页的 Thread Snapshot，并丢弃该 Thread 所有 In-flight 投影。
- * Workspace 由 History 调用方提供，因为 Wire Snapshot 明确省略其所有权。
+ * 应用完整且未分页的 Thread Snapshot，并丢弃无法由快照继续确认的 In-flight 投影。
+ * Workspace 由 History 调用方提供，因为 Wire Snapshot 明确省略其所有权；已提交的 live 修改摘要
+ * 只有在同一 runtime 身份且 Turn 仍可持有 tracker 时保留，避免恢复读取让摘要在 Tool 间歇消失。
  */
 export function applySnapshot(
   state: TimelineState,
@@ -553,6 +584,11 @@ export function applySnapshot(
     (priorThread !== undefined && priorThread.workspaceId !== workspaceId)
   ) {
     return outcome(state, "invalid");
+  }
+  const currentRevision = state.threadRevisionByThread[snapshot.threadId];
+  if (currentRevision !== undefined && snapshot.revision < currentRevision) {
+    // thread/read 可能早于随后到达的 committed event 发起；晚到快照不能让 Turn 状态和消息归属倒退。
+    return outcome(state, "late");
   }
   let next = state;
   const threadTurnIds = new Set(
@@ -614,11 +650,50 @@ export function applySnapshot(
       ([correlation]) => !correlation.startsWith(`${snapshot.threadId}:`),
     ),
   );
+  const liveStartedToolCorrelations = Object.fromEntries(
+    Object.entries(next.liveStartedToolCorrelations).filter(
+      ([correlation]) => !correlation.startsWith(`${snapshot.threadId}:`),
+    ),
+  );
+  for (const item of snapshot.items) {
+    if (item.kind !== "tool_call") continue;
+    const owner = snapshot.turns.find((turn) => turn.turnId === item.turnId);
+    if (owner === undefined) return outcome(state, "invalid");
+    if (isTerminalState(owner.status) || isTerminalToolPresentation(item.presentation)) continue;
+    const correlation = toolCorrelation(snapshot.threadId, item.turnId, item.callId);
+    if (
+      toolItemIdByCallId[correlation] !== undefined ||
+      pendingToolOrdinalByCallId[correlation] !== undefined
+    )
+      return outcome(state, "invalid");
+    toolItemIdByCallId[correlation] = item.itemId;
+    pendingToolOrdinalByCallId[correlation] = item.ordinal;
+  }
   const contextCompactionByThread = { ...next.contextCompactionByThread };
   delete contextCompactionByThread[snapshot.threadId];
   const contextUsageByThread = { ...next.contextUsageByThread };
   if (snapshot.contextUsage === null) delete contextUsageByThread[snapshot.threadId];
   else contextUsageByThread[snapshot.threadId] = snapshot.contextUsage;
+  const inputQueueByTurn = Object.fromEntries(
+    Object.entries(next.inputQueueByTurn).filter(([turnId]) => !threadTurnIds.has(turnId)),
+  );
+  if (snapshot.inputQueue !== null) {
+    const queueTurn = snapshot.turns.find((turn) => turn.turnId === snapshot.inputQueue?.turnId);
+    if (queueTurn === undefined || isTerminalState(queueTurn.status))
+      return outcome(state, "invalid");
+    const currentQueue = next.inputQueueByTurn[snapshot.inputQueue.turnId];
+    if (
+      currentQueue?.revision === snapshot.inputQueue.revision &&
+      JSON.stringify(currentQueue) !== JSON.stringify(snapshot.inputQueue)
+    )
+      return resync(state, snapshot.threadId, "invalid_event");
+    // Queue revision 不占用 Thread revision；同 revision 的迟到 thread/read 仍可能早于队列事件取样，
+    // 因此快照只能补齐或前进队列，不能撤销已由 ACK/Event 提交的附件修复事实。
+    inputQueueByTurn[snapshot.inputQueue.turnId] =
+      currentQueue !== undefined && currentQueue.revision > snapshot.inputQueue.revision
+        ? currentQueue
+        : snapshot.inputQueue;
+  }
   const snapshotThread: TimelineThreadProjection = {
     ...(priorThread ?? {
       threadId: snapshot.threadId,
@@ -629,6 +704,7 @@ export function applySnapshot(
     workspaceId,
     revision: snapshot.revision,
     activeTurnId: undefined,
+    latestTurnId: snapshot.turns.at(-1)?.turnId,
   };
   next = {
     ...next,
@@ -647,10 +723,7 @@ export function applySnapshot(
             status: turn.status,
             startedAt: turn.requestedAt,
             ...(turn.completedAt === null ? {} : { completedAt: turn.completedAt }),
-            ...(turn.errorCode === null
-              ? {}
-              : { error: { code: turn.errorCode, retryable: false } }),
-            ...(turn.runtime === null ? {} : { runtime: turn.runtime }),
+            ...(turn.errorCode === null ? {} : { error: turnError(turn.errorCode) }),
             changeSet: turn.changeSet,
             threadRevision: snapshot.revision,
           },
@@ -661,8 +734,18 @@ export function applySnapshot(
     approvalsById,
     toolItemIdByCallId,
     pendingToolOrdinalByCallId,
+    liveStartedToolCorrelations,
     contextCompactionByThread,
     contextUsageByThread,
+    taskActivitiesByRootThread: {
+      ...next.taskActivitiesByRootThread,
+      [snapshot.threadId]: snapshot.taskActivities,
+    },
+    goalActivitiesByOwnerThread: {
+      ...next.goalActivitiesByOwnerThread,
+      [snapshot.threadId]: snapshot.goalActivities,
+    },
+    inputQueueByTurn,
     threadRevisionByThread: {
       ...next.threadRevisionByThread,
       [snapshot.threadId]: snapshot.revision,
@@ -677,15 +760,29 @@ export function applySnapshot(
       Object.entries(next.resyncRequired).filter(([id]) => id !== snapshot.threadId),
     ),
   };
+  // 失败 Turn 可能已因队列输入产生过早期 Final；只有终态事务最后追加的 Final 才是安全收口回复。
+  const failedTurnIds = new Set(
+    snapshot.turns.filter((turn) => turn.status === "failed").map((turn) => turn.turnId),
+  );
+  const failureReplyByTurn = new Map<string, string>();
+  for (const item of snapshot.items) {
+    if (item.kind === "final_answer" && failedTurnIds.has(item.turnId))
+      failureReplyByTurn.set(item.turnId, item.itemId);
+  }
+  const failureReplyItemIds = new Set(failureReplyByTurn.values());
   for (const item of snapshot.items)
-    next = putItem(next, projectSnapshotItem(item, snapshot.threadId));
+    next = putItem(
+      next,
+      projectSnapshotItem(item, snapshot.threadId, failureReplyItemIds.has(item.itemId)),
+    );
   return outcome(next, "applied");
 }
 
 /**
  * 在独立 Event Stream 排空前安装 turn/start 已提交 Revision。Tauri Command Reply 与 Event
  * 使用不同 Channel，因此该 Baseline 是线性化点：它允许 Revision N+1 Event 合法进入，
- * 同时不放宽普通 Gap 校验。
+ * 同时不放宽普通 Gap 校验。首轮临时标题与准入共享同一 Revision，metadata 若先到只会推进
+ * Revision 索引而不会创建 Turn；这种精确同 Revision 竞态仍须由 ACK 补齐用户消息与 Turn identity。
  */
 export function applyTurnAccepted(
   state: TimelineState,
@@ -700,8 +797,16 @@ export function applyTurnAccepted(
       ? outcome(state, "duplicate")
       : resync(state, accepted.threadId, "invalid_event");
   }
-  if (accepted.threadRevision <= currentRevision) return outcome(state, "late");
-  if (accepted.threadRevision !== currentRevision + 1)
+  const thread = state.threads[accepted.threadId];
+  if (thread === undefined) return resync(state, accepted.threadId, "missing_item");
+  const metadataPrecededAdmissionAck =
+    accepted.threadRevision === currentRevision && accepted.threadRevision > thread.revision;
+  if (
+    accepted.threadRevision < currentRevision ||
+    (accepted.threadRevision === currentRevision && !metadataPrecededAdmissionAck)
+  )
+    return outcome(state, "late");
+  if (accepted.threadRevision !== currentRevision + 1 && !metadataPrecededAdmissionAck)
     return resync(state, accepted.threadId, "gap", "gap");
   if (
     Object.values(state.turns).some(
@@ -710,8 +815,6 @@ export function applyTurnAccepted(
   ) {
     return resync(state, accepted.threadId, "invalid_event");
   }
-  const thread = state.threads[accepted.threadId];
-  if (thread === undefined) return resync(state, accepted.threadId, "missing_item");
   const turn: TimelineTurn = {
     turnId: accepted.turnId,
     threadId: accepted.threadId,
@@ -728,6 +831,7 @@ export function applyTurnAccepted(
         ...thread,
         revision: accepted.threadRevision,
         activeTurnId: accepted.turnId,
+        latestTurnId: accepted.turnId,
         updatedAt: accepted.submittedAt,
       },
     },
@@ -739,7 +843,7 @@ export function applyTurnAccepted(
       Object.entries(state.resyncRequired).filter(([threadId]) => threadId !== accepted.threadId),
     ),
   };
-  if (accepted.submittedText.trim() !== "") {
+  if (accepted.submittedText.trim() !== "" || (accepted.submittedAttachments?.length ?? 0) > 0) {
     next = putItem(next, {
       itemId: `item_local_${accepted.turnId.slice("turn_".length)}`,
       threadId: accepted.threadId,
@@ -747,20 +851,52 @@ export function applyTurnAccepted(
       kind: "user_message",
       status: "completed",
       text: accepted.submittedText,
+      attachments: [...(accepted.submittedAttachments ?? [])],
       createdAt: accepted.submittedAt,
     });
   }
   return outcome(next, "applied");
 }
 
-/** 进入语义投影前校验 Event 所有权与 Revision 单调性。 */
+/**
+ * 合并 ACK 或无 Thread-revision 事件携带的全量队列；队列 revision 可以跨过未观察的中间值，
+ * 因为每个投影都是完整快照。相同 revision 的不同正文则必须重读，不能按到达顺序猜 owner。
+ */
+export function applyInputQueue(state: TimelineState, inputQueue: InputQueue): TimelineState {
+  if (state.handshake.phase !== "ready") return outcome(state, "rejected");
+  const turn = state.turns[inputQueue.turnId];
+  if (turn === undefined) return outcome(state, "invalid");
+  const current = state.inputQueueByTurn[inputQueue.turnId];
+  if (current !== undefined && inputQueue.revision < current.revision)
+    return outcome(state, "late");
+  if (current !== undefined && inputQueue.revision === current.revision) {
+    return JSON.stringify(current) === JSON.stringify(inputQueue)
+      ? outcome(state, "duplicate")
+      : resync(state, turn.threadId, "invalid_event");
+  }
+  return outcome(
+    {
+      ...state,
+      inputQueueByTurn: { ...state.inputQueueByTurn, [inputQueue.turnId]: inputQueue },
+    },
+    "applied",
+  );
+}
+
+/**
+ * 进入语义投影前校验 Event 所有权与 Revision 单调性。
+ *
+ * Thread revision 是持久业务事实的版本，不是公开通知的连续序号；服务端内部事务可以推进
+ * revision 而不产生语义事件。连接内漏事件由 transport 的 sequence/generation 检测，因此这里
+ * 只拒绝相同或倒退 revision，避免把合法的内部版本跳跃误判为通知丢失。
+ */
 function admitThreadEvent(
   state: TimelineState,
   event: ThreadSemanticEvent,
 ): TimelineState | undefined {
   const params = event.params;
   const currentRevision = state.threadRevisionByThread[params.threadId] ?? 0;
-  // v2 Tool Receipt 明确省略 serverInstanceId；只对真实携带该字段的 Event Family 比较身份。
+  // v1 Tool Receipt 明确省略 serverInstanceId；只对真实携带该字段的 Event Family 比较身份。
   const eventServerInstanceId =
     "serverInstanceId" in params ? params["serverInstanceId"] : undefined;
   if (
@@ -772,7 +908,6 @@ function admitThreadEvent(
   // Event ID 去重发生在 Admission 之前。因此，旧 Revision 或相等 Revision 上未见过的 Event
   // 是 Stream 不一致而非无害重复；接纳它会允许不同 Payload 覆盖历史。
   if (params.threadRevision <= currentRevision) return undefined;
-  if (params.threadRevision !== currentRevision + 1) return undefined;
   if (params.workspaceId.trim() === "") return undefined;
   const existingThread = state.threads[params.threadId];
   if (existingThread !== undefined && existingThread.workspaceId !== params.workspaceId)
@@ -845,10 +980,8 @@ function updateToolPresentationStatus(
 }
 
 /** 仅在已提交 Event 携带 Provider Usage 时投影；缺失必须继续保持缺失。 */
-function usageMetadata(
-  usage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined,
-): ItemMetadata | undefined {
-  return usage === undefined
+function usageMetadata(usage: TimelineContextUsage | undefined): ItemMetadata | undefined {
+  return usage === undefined || usage.certainty === "unknown"
     ? undefined
     : {
         usageInputTokens: usage.inputTokens,
@@ -858,45 +991,32 @@ function usageMetadata(
 }
 
 /**
- * 将 Provider Usage 独立于可见文本保存到 Thread；Tool-only ModelStep 也必须推进真实计量。
- * 任一数值越界或总量不一致都会拒绝整个事件，不能用部分字段渲染貌似精确的百分比。
+ * 按 requestOrdinal 保存最新请求事实；同一 requestId 只允许 UNKNOWN 原位升级为相同画像的 KNOWN。
+ * 迟到低序请求不覆盖，身份或画像冲突则拒绝事件，避免 UI 展示混合代际事实。
  */
 function recordContextUsage(
   state: TimelineState,
   threadId: string,
-  turnId: string,
-  modelRound: number,
-  usage: { inputTokens: number; outputTokens: number; totalTokens: number },
-  measuredAt: string,
+  usage: TimelineContextUsage,
 ): TimelineState | undefined {
-  const minimumTotal = usage.inputTokens + usage.outputTokens;
-  if (
-    !Number.isSafeInteger(modelRound) ||
-    modelRound < 1 ||
-    modelRound > 128 ||
-    !Number.isSafeInteger(usage.inputTokens) ||
-    usage.inputTokens < 0 ||
-    !Number.isSafeInteger(usage.outputTokens) ||
-    usage.outputTokens < 0 ||
-    !Number.isSafeInteger(usage.totalTokens) ||
-    usage.totalTokens < 0 ||
-    !Number.isSafeInteger(minimumTotal) ||
-    usage.totalTokens < minimumTotal ||
-    !Number.isFinite(Date.parse(measuredAt))
-  )
-    return undefined;
+  const current = state.contextUsageByThread[threadId];
+  if (current !== undefined) {
+    if (usage.requestOrdinal < current.requestOrdinal) return state;
+    if (usage.requestOrdinal === current.requestOrdinal) {
+      if (usage.requestId !== current.requestId) return undefined;
+      const sameProfile = JSON.stringify(usage.profile) === JSON.stringify(current.profile);
+      if (!sameProfile) return undefined;
+      if (current.certainty === "known")
+        return JSON.stringify(usage) === JSON.stringify(current) ? state : undefined;
+      if (usage.certainty === "unknown")
+        return JSON.stringify(usage) === JSON.stringify(current) ? state : undefined;
+    }
+  }
   return {
     ...state,
     contextUsageByThread: {
       ...state.contextUsageByThread,
-      [threadId]: {
-        turnId,
-        modelRound,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        totalTokens: usage.totalTokens,
-        measuredAt,
-      },
+      [threadId]: usage,
     },
   };
 }
@@ -918,14 +1038,7 @@ function applyModelStepCommitted(
 
   let next = state;
   if (params.usage !== undefined) {
-    const recorded = recordContextUsage(
-      next,
-      params.threadId,
-      params.turnId,
-      params.modelRound,
-      params.usage,
-      params.occurredAt,
-    );
+    const recorded = recordContextUsage(next, params.threadId, params.usage);
     if (recorded === undefined) return undefined;
     next = recorded;
   }
@@ -1010,8 +1123,51 @@ function applyModelStepCommitted(
 }
 
 /**
- * 在一个 Reducer 结果中应用完整 Tool 事务，使结果 presentation 与状态不会在不同
- * Revision 或 Subscription 中被观察到。
+ * started 只推进 Prepared Tool 的既有安全投影；callId、ordinal、Turn 与未终结状态必须同时
+ * 命中，防止连续调用串线或迟到事件把终态降回 running。
+ */
+function applyToolStarted(
+  state: TimelineState,
+  event: ToolStartedEvent,
+): TimelineState | undefined {
+  const params = event.params;
+  const turn = state.turns[params.turnId];
+  if (turn?.status !== "running") return undefined;
+  const correlation = toolCorrelation(params.threadId, params.turnId, params.callId);
+  const itemId = state.toolItemIdByCallId[correlation];
+  const item = itemId === undefined ? undefined : state.items[itemId];
+  const presentation = item?.metadata?.presentation;
+  if (
+    itemId === undefined ||
+    item === undefined ||
+    presentation === undefined ||
+    state.pendingToolOrdinalByCallId[correlation] !== params.ordinal ||
+    state.liveStartedToolCorrelations[correlation] === true ||
+    (item.status !== "started" && item.status !== "in_progress") ||
+    (presentation.status !== "pending" && presentation.status !== "running")
+  )
+    return undefined;
+  const updated = updateItem(state, itemId, {
+    status: "in_progress",
+    metadata: {
+      ...item.metadata,
+      presentation: { ...presentation, status: "running" },
+      requiresUserAction: false,
+    },
+  });
+  if (updated === undefined) return undefined;
+  return {
+    ...updated,
+    liveStartedToolCorrelations: {
+      ...updated.liveStartedToolCorrelations,
+      [correlation]: true,
+    },
+  };
+}
+
+/**
+ * 在一个 Reducer 结果中应用本次已结算的非空 Tool 子集；Java 按 ordinal 逐调用提交，
+ * 因此未出现在 results 中的 Tool 必须继续保留 pending/running，不能触发全量 resync。
  */
 function applyToolBatchCommitted(
   state: TimelineState,
@@ -1020,18 +1176,26 @@ function applyToolBatchCommitted(
   const params = event.params;
   const turn = state.turns[params.turnId];
   if (turn?.status !== "running") return undefined;
-  const pendingPrefix = `${params.threadId}:${params.turnId}:`;
-  const pending = Object.entries(state.pendingToolOrdinalByCallId).filter(([key]) =>
-    key.startsWith(pendingPrefix),
-  );
-  if (pending.length !== params.results.length) return undefined;
 
   let next = state;
   const pendingToolOrdinalByCallId = { ...state.pendingToolOrdinalByCallId };
+  const liveStartedToolCorrelations = { ...state.liveStartedToolCorrelations };
+  const resultCallIds = new Set<string>();
   for (const result of params.results) {
+    if (resultCallIds.has(result.callId)) return undefined;
+    resultCallIds.add(result.callId);
     const correlation = toolCorrelation(params.threadId, params.turnId, result.callId);
     const itemId = next.toolItemIdByCallId[correlation];
-    if (itemId === undefined || pendingToolOrdinalByCallId[correlation] !== result.ordinal)
+    const item = itemId === undefined ? undefined : next.items[itemId];
+    const presentation = item?.metadata?.presentation;
+    if (
+      itemId === undefined ||
+      item === undefined ||
+      presentation === undefined ||
+      pendingToolOrdinalByCallId[correlation] !== result.ordinal ||
+      (item.status !== "started" && item.status !== "in_progress") ||
+      !["pending", "running", "waiting_approval"].includes(presentation.status)
+    )
       return undefined;
     const status: TimelineItemStatus =
       result.outcome === "succeeded"
@@ -1055,8 +1219,9 @@ function applyToolBatchCommitted(
     if (updated === undefined) return undefined;
     next = updated;
     delete pendingToolOrdinalByCallId[correlation];
+    delete liveStartedToolCorrelations[correlation];
   }
-  return { ...next, pendingToolOrdinalByCallId };
+  return { ...next, pendingToolOrdinalByCallId, liveStartedToolCorrelations };
 }
 
 /**
@@ -1149,7 +1314,100 @@ function applyContextCompactionEvent(
   return { ...rememberEvent(next, params.eventId), lastOutcome: "applied" };
 }
 
-/** 按公开六态 Lifecycle 与已提交 Item 规则应用一个语义 Event。 */
+/** 队列变化不占用 Thread revision；全量 revision 单调覆盖即可恢复 ACK/Event 乱序。 */
+function applyInputQueueChanged(
+  state: TimelineState,
+  event: InputQueueChangedEvent,
+): TimelineState {
+  const params = event.params;
+  if (state.seenEventIds[params.eventId] === true) return outcome(state, "duplicate");
+  if (
+    state.handshake.generation !== params.generation ||
+    (state.serverInstanceId !== undefined && state.serverInstanceId !== params.serverInstanceId)
+  )
+    return resync(state, params.threadId, "server_instance_changed");
+  const turn = state.turns[params.turnId];
+  const thread = state.threads[params.threadId];
+  if (
+    turn?.threadId !== params.threadId ||
+    thread?.workspaceId !== params.workspaceId ||
+    params.inputQueue.turnId !== params.turnId
+  )
+    return resync(state, params.threadId, "invalid_event");
+  const merged = applyInputQueue(state, params.inputQueue);
+  if (merged.lastOutcome === "invalid" || merged.lastOutcome === "resync_required") return merged;
+  return {
+    ...rememberEvent(merged, params.eventId),
+    lastOutcome: merged.lastOutcome === "late" ? "late" : "applied",
+  };
+}
+
+/**
+ * 消费事件在同一 Thread revision 中提交上一轮 STOP 回复、用户消息和剩余队列，确保队列行
+ * 原子迁移进 Timeline；较新的 ACK 队列不会被迟到消费事件回退。
+ */
+function applyInputConsumed(
+  state: TimelineState,
+  event: InputConsumedEvent,
+): TimelineState | undefined {
+  const params = event.params;
+  const turn = state.turns[params.turnId];
+  if (turn === undefined || isTerminalState(turn.status)) return undefined;
+  let next = clearDraft(state, params.turnId);
+  const settlement = params.assistantSettlement;
+  if (settlement !== undefined) {
+    if (settlement.usage !== undefined) {
+      const recorded = recordContextUsage(next, params.threadId, settlement.usage);
+      if (recorded === undefined) return undefined;
+      next = recorded;
+    }
+    if (settlement.reasoningSummary?.trim())
+      next = putItem(next, {
+        itemId: `${settlement.messageId}_reasoning`,
+        threadId: params.threadId,
+        turnId: params.turnId,
+        kind: "commentary",
+        status: "completed",
+        text: settlement.reasoningSummary,
+        title: "思考摘要",
+        metadata: { phase: "reasoning_summary", modelRound: settlement.modelRound },
+        createdAt: params.occurredAt,
+      });
+    if (settlement.text.trim())
+      next = putItem(next, {
+        itemId: settlement.messageId,
+        threadId: params.threadId,
+        turnId: params.turnId,
+        kind: "agent_message",
+        status: "completed",
+        text: settlement.text,
+        title: "Final",
+        final: true,
+        metadata: {
+          modelRound: settlement.modelRound,
+          ...usageMetadata(settlement.usage),
+        },
+        createdAt: params.occurredAt,
+      });
+  }
+  next = putItem(next, {
+    itemId: params.userItem.itemId,
+    threadId: params.threadId,
+    turnId: params.turnId,
+    kind: "user_message",
+    status: "completed",
+    text: textFromUserContent(params.userItem.content),
+    contextReferences: contextReferencesFromUserContent(params.userItem.content),
+    attachments: params.userItem.attachments,
+    createdAt: params.userItem.createdAt,
+  });
+  const merged = applyInputQueue(next, params.inputQueue);
+  return merged.lastOutcome === "invalid" || merged.lastOutcome === "resync_required"
+    ? undefined
+    : merged;
+}
+
+/** 应用持久事件；终态保留已确认回答，并通过一次权威快照补齐未随 terminal 发送的最终轮摘要。 */
 function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): TimelineState {
   const currentRevision = state.threadRevisionByThread[event.params.threadId] ?? 0;
   if (event.params.threadRevision <= currentRevision) {
@@ -1183,6 +1441,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
             [params.threadId]: {
               ...thread,
               activeTurnId: isTerminalState(params.to) ? undefined : params.turnId,
+              latestTurnId: params.turnId,
             },
           },
         };
@@ -1194,9 +1453,21 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       next = projected;
       break;
     }
+    case "tool/started": {
+      const projected = applyToolStarted(next, event);
+      if (projected === undefined) return resync(state, event.params.threadId, "missing_item");
+      next = projected;
+      break;
+    }
     case "tool/batch-committed": {
       const projected = applyToolBatchCommitted(next, event);
       if (projected === undefined) return resync(state, event.params.threadId, "missing_item");
+      next = projected;
+      break;
+    }
+    case "turn/input-consumed": {
+      const projected = applyInputConsumed(next, event);
+      if (projected === undefined) return resync(state, event.params.threadId, "invalid_event");
       next = projected;
       break;
     }
@@ -1323,14 +1594,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
             ? "cancelled"
             : "failed";
       if (params.usage !== undefined) {
-        const recorded = recordContextUsage(
-          next,
-          params.threadId,
-          params.turnId,
-          params.usage.modelRound,
-          params.usage,
-          params.occurredAt,
-        );
+        const recorded = recordContextUsage(next, params.threadId, params.usage);
         if (recorded === undefined) return resync(state, params.threadId, "invalid_event");
         next = recorded;
       }
@@ -1352,7 +1616,10 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
                 {
                   final: true,
                   title: "Final",
-                  metadata: usageMetadata(params.usage),
+                  metadata: {
+                    ...usageMetadata(params.usage),
+                    ...(params.state === "failed" ? { failureReply: true } : {}),
+                  },
                 },
               ),
               summary: params.summary,
@@ -1367,9 +1634,8 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
             status: params.state,
             completedAt: params.occurredAt,
             threadRevision: params.threadRevision,
-            ...(params.errorCode === undefined
-              ? {}
-              : { error: { code: params.errorCode, retryable: false } }),
+            changeSet: params.changeSet,
+            ...(params.errorCode === undefined ? {} : { error: turnError(params.errorCode) }),
           },
         },
       };
@@ -1380,17 +1646,20 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
           threads: { ...next.threads, [params.threadId]: { ...thread, activeTurnId: undefined } },
         };
       next = closePendingApprovals(next, params.threadId, params.turnId, params.occurredAt);
+      const inputQueueByTurn = { ...next.inputQueueByTurn };
+      delete inputQueueByTurn[params.turnId];
+      next = {
+        ...next,
+        inputQueueByTurn,
+        resyncRequired: { ...next.resyncRequired, [params.threadId]: "terminal_snapshot" },
+      };
       break;
     }
     default:
       return outcome(state, "invalid");
   }
   next = rememberEvent(commitThreadRevision(next, event), event.params.eventId);
-  // Rust 在转发 terminal 前已经提交本轮 ChangeSet，但 terminal frame 不重复携带该大对象；
-  // 先保留可见终态与 Final，再请求一次权威 Snapshot 补齐冻结差异。
-  return event.method === "turn/terminal"
-    ? resync(next, event.params.threadId, "terminal_snapshot")
-    : { ...next, lastOutcome: "applied" };
+  return { ...next, lastOutcome: "applied" };
 }
 
 /** 校验有界文本与元数据后创建投影 Item，防止超限内容进入状态。 */
@@ -1488,6 +1757,7 @@ export function applyLiveEvent(state: TimelineState, event: TimelineEvent): Time
       event.method === "assistant/text-delta" ? "assistant" : "reasoning",
     );
   if (state.seenEventIds[event.params.eventId] === true) return outcome(state, "duplicate");
+  if (event.method === "turn/input-queue-changed") return applyInputQueueChanged(state, event);
   if (isContextCompactionEvent(event)) return applyContextCompactionEvent(state, event);
   if (!isThreadEvent(event)) return outcome(state, "invalid");
   return applyThreadEvent(state, event);

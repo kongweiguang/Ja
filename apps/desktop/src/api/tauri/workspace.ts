@@ -8,6 +8,7 @@ import {
   RuntimeHostError,
   type RuntimeNativeBridge,
 } from "./runtime";
+import { nativeDropRouterFor, parseNativeDropEvent } from "./nativeDrop";
 
 /**
  * 前端路径相对于原生 workspace binding；空字符串是唯一例外，Rust 用它表示
@@ -332,14 +333,6 @@ const WorkspaceChangedEventSchema = z
     requiresRescan: z.boolean(),
   })
   .strict();
-/** 原生窗口 drag/drop 只携带一次性 token 与 screen point，不传路径。 */
-const WorkspaceNativeDropEventSchema = z
-  .object({
-    dropToken: z.string().min(1).max(128),
-    x: z.number().finite().min(-1e9).max(1e9),
-    y: z.number().finite().min(-1e9).max(1e9),
-  })
-  .strict();
 const WorkspaceSearchHitSchema = z
   .object({
     relativePath: WorkspaceRelativePathSchema,
@@ -389,7 +382,11 @@ export type WorkspaceWatchStopResult = z.infer<typeof WorkspaceWatchStopResultSc
 export type WorkspaceWatchRescanResult = z.infer<typeof WorkspaceWatchRescanResultSchema>;
 export type WorkspaceChangedEvent = z.infer<typeof WorkspaceChangedEventSchema>;
 export type WorkspaceChangedListener = (event: WorkspaceChangedEvent) => void;
-export type WorkspaceNativeDropEvent = z.infer<typeof WorkspaceNativeDropEventSchema>;
+export type WorkspaceNativeDropEvent = {
+  dropToken: string;
+  x: number;
+  y: number;
+};
 export type WorkspaceNativeDropListener = (event: WorkspaceNativeDropEvent) => void;
 export type WorkspaceUnsubscribe = () => void | Promise<void>;
 
@@ -664,13 +661,9 @@ export class TauriWorkspaceHostAdapter implements WorkspaceMutationHostAdapter {
   /** 订阅固定原生 drag/drop 事件，但不转发路径。 */
   async subscribeNativeDrop(listener: WorkspaceNativeDropListener): Promise<WorkspaceUnsubscribe> {
     try {
-      return await this.bridge.listen<unknown>(JA_WORKSPACE_EVENTS.nativeDrop, (payload) => {
-        try {
-          listener(parseWorkspaceNativeDropEvent(payload));
-        } catch {
-          // 非法事件 payload 在 UI callback 看到路径形状或 renderer 注入字段前丢弃。
-        }
-      });
+      return await nativeDropRouterFor(this.bridge).subscribeCommit((event) =>
+        listener({ dropToken: event.dropToken, x: event.x, y: event.y }),
+      );
     } catch (error) {
       throw normalizeRuntimeError(error);
     }
@@ -689,7 +682,9 @@ export function parseWorkspaceChangedEvent(payload: unknown): WorkspaceChangedEv
 /** 在 WebView 边界解析只含 token 与 point 的原生 drop event。 */
 export function parseWorkspaceNativeDropEvent(payload: unknown): WorkspaceNativeDropEvent {
   try {
-    return WorkspaceNativeDropEventSchema.parse(payload);
+    const event = parseNativeDropEvent(payload);
+    if (event.phase !== "drop") throw new Error("not a drop commit");
+    return { dropToken: event.dropToken, x: event.x, y: event.y };
   } catch {
     throw new RuntimeHostError("INVALID_INPUT", "原生拖入事件无效", false);
   }

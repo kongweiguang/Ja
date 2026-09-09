@@ -9,6 +9,7 @@
 mod error;
 pub(crate) mod interface;
 mod model;
+mod operation;
 mod platform;
 mod service;
 
@@ -17,4 +18,6 @@ pub(crate) use error::{AttachmentIngressError, AttachmentIngressErrorCode};
 #[allow(unused_imports)]
 pub(crate) use model::{IngressAttachment, IngressLimits, IngressToken};
 #[allow(unused_imports)]
-pub(crate) use service::{AttachmentIngress, IngressCheckpoint};
+pub(crate) use operation::{ItemCancellation, RETRY_ATTEMPT_TTL, RetryAttempt};
+#[allow(unused_imports)]
+pub(crate) use service::{AdmittedAttachmentSource, AttachmentIngress};

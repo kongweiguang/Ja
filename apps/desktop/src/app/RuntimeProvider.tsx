@@ -38,7 +38,7 @@ export function RuntimeProvider({
   const state = useMemo<RuntimeStateController>(
     () => ({
       boot: controllers.state.boot,
-      lastEvent: controllers.state.lastEvent,
+      lastConfigurationEvent: controllers.state.lastConfigurationEvent,
       lastThreadMetadataEvent: controllers.state.lastThreadMetadataEvent,
       recovery: controllers.state.recovery,
       runtimeState: controllers.state.runtimeState,
@@ -46,7 +46,7 @@ export function RuntimeProvider({
     }),
     [
       controllers.state.boot,
-      controllers.state.lastEvent,
+      controllers.state.lastConfigurationEvent,
       controllers.state.lastThreadMetadataEvent,
       controllers.state.recovery,
       controllers.state.runtimeState,
@@ -75,16 +75,22 @@ export function RuntimeProvider({
     () => ({
       approvalRespond: controllers.turns.approvalRespond,
       cancelTurn: controllers.turns.cancelTurn,
-      followUpTurn: controllers.turns.followUpTurn,
-      steerTurn: controllers.turns.steerTurn,
+      deleteTurnInput: controllers.turns.deleteTurnInput,
+      enqueueTurnInput: controllers.turns.enqueueTurnInput,
+      prioritizeTurnInput: controllers.turns.prioritizeTurnInput,
+      resumeTurn: controllers.turns.resumeTurn,
       submitTurn: controllers.turns.submitTurn,
+      updateTurnInput: controllers.turns.updateTurnInput,
     }),
     [
       controllers.turns.approvalRespond,
       controllers.turns.cancelTurn,
-      controllers.turns.followUpTurn,
-      controllers.turns.steerTurn,
+      controllers.turns.deleteTurnInput,
+      controllers.turns.enqueueTurnInput,
+      controllers.turns.prioritizeTurnInput,
+      controllers.turns.resumeTurn,
       controllers.turns.submitTurn,
+      controllers.turns.updateTurnInput,
     ],
   );
 

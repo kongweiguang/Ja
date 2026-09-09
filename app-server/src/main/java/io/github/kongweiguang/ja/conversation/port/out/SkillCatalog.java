@@ -6,46 +6,44 @@ package io.github.kongweiguang.ja.conversation.port.out;
 import io.github.kongweiguang.ja.foundation.validation.ContractChecks;
 
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 
 /**
- * 从受信任来源冻结 Skill 目录并按修订读取资源的出站 SPI。
+ * 渐进发现 Skill 元数据，并在实际激活后实时读取资源的出站 SPI。
  */
 public interface SkillCatalog {
     /**
-     * 按内置、用户、工作区优先级冻结目录，保证一个 Turn 内不会随文件变化漂移。
+     * 按内置、用户、工作区优先级发现名称和描述；正文保持在原始来源中，直到 read 才读取。
      */
-    SkillSnapshot snapshot(SnapshotRequest request);
+    Catalog discover(DiscoveryRequest request);
 
     /**
-     * 创建不扫描任何来源的空能力快照，供未启用 Skill 的 Provider 保持最小启动面。
+     * 创建不扫描任何来源的空目录，供禁用 Skill 的 Provider 保持最小启动面。
      */
-    SkillSnapshot emptySnapshot();
+    Catalog emptyCatalog();
 
     /**
-     * 从同一个完整快照按 revision 派生 Turn 视图，禁止在过滤期间重新读取或切换目录代际。
+     * 从同一个发现结果按名称派生可见目录，禁止筛选阶段重新扫描来源或扩大可见集合。
      */
-    SkillSnapshot select(SkillSnapshot snapshot, List<String> allowedRevisions);
+    Catalog select(Catalog catalog, List<String> allowedNames);
 
     /**
-     * 只从给定快照修订读取有界资源，禁止绕过快照读取最新文件。
+     * 从目录绑定的原始 locator 实时读取有界资源，不缓存正文或内容 revision。
      */
-    SkillDocument read(SkillSnapshot snapshot, SkillReadRequest request);
+    SkillDocument read(Catalog catalog, SkillReadRequest request);
 
     /**
-     * 创建 Skill 快照所需的 cwd、两类用户来源与冻结信任事实。
+     * 发现 Skill 元数据所需的 cwd、两类用户来源与工作区信任事实。
      */
-    record SnapshotRequest(
+    record DiscoveryRequest(
             Path workspaceDirectory,
             Path agentsSkillRoot,
             Path jaSkillRoot,
             boolean workspaceTrusted) {
         /**
-         * 路径必须由 App Server 的权威 home/workspace 配置显式派生；信任值由同一配置代际冻结，
-         * Adapter 只能据此关闭项目来源，不能自行推测或扩大信任。
+         * 路径必须由 App Server 权威 home/workspace 配置显式派生；Adapter 只能依据信任值关闭项目来源。
          */
-        public SnapshotRequest {
+        public DiscoveryRequest {
             workspaceDirectory = ContractChecks.absolutePath(workspaceDirectory, "workspaceDirectory");
             agentsSkillRoot = ContractChecks.absolutePath(agentsSkillRoot, "agentsSkillRoot");
             jaSkillRoot = ContractChecks.absolutePath(jaSkillRoot, "jaSkillRoot");
@@ -53,27 +51,23 @@ public interface SkillCatalog {
     }
 
     /**
-     * 一个 Turn 可重复读取的不可变 Skill 目录与生成时刻。
+     * 单次发现得到的稳定元数据目录；正文仍由 read 从原始来源实时取得。
      */
-    record SkillSnapshot(String revision, List<SkillDescriptor> skills, Instant createdAt) {
+    record Catalog(List<SkillDescriptor> skills) {
         /**
-         * 固化目录修订和条目顺序，使恢复与重试得到相同 Skill 解析结果。
+         * 复制条目并固定展示顺序，避免调用方修改列表而越过 select 边界。
          */
-        public SkillSnapshot {
-            revision = ContractChecks.identifier(revision, "revision");
+        public Catalog {
             skills = ContractChecks.immutableList(skills, "skills");
-            if (createdAt == null) {
-                throw new IllegalArgumentException("createdAt is required");
-            }
         }
     }
 
     /**
-     * 目录中公开的 Skill 身份、说明、来源与内容修订。
+     * 目录中公开的 Skill 身份、说明与最终解析来源，不暴露内容版本或物理路径。
      */
-    record SkillDescriptor(String name, String description, Source source, String revision) {
+    record SkillDescriptor(String name, String description, Source source) {
         /**
-         * 校验公开描述并保留来源，供覆盖冲突和审计解释使用。
+         * 元数据只承担模型发现与覆盖解释，不能携带 Tool 授权或正文缓存。
          */
         public SkillDescriptor {
             name = ContractChecks.identifier(name, "name");
@@ -81,7 +75,6 @@ public interface SkillCatalog {
             if (source == null) {
                 throw new IllegalArgumentException("source is required");
             }
-            revision = ContractChecks.identifier(revision, "revision");
         }
     }
 
@@ -89,34 +82,26 @@ public interface SkillCatalog {
      * Skill 来源按声明顺序形成从低到高的覆盖优先级。
      */
     enum Source {
-        /**
-         * 应用随包发布的内置 Skill。
-         */
+        /** 应用随包发布的内置 Skill。 */
         BUNDLED(0),
-        /**
-         * Agent Skills 通用用户目录中的个人 Skill。
-         */
+        /** Agent Skills 通用用户目录中的个人 Skill。 */
         AGENTS_USER(1),
-        /**
-         * Ja home 中的个人 Skill。
-         */
+        /** Ja home 中的个人 Skill。 */
         JA_USER(2),
-        /**
-         * 当前工作区声明且受信任边界约束的项目 Skill。
-         */
+        /** 当前工作区声明且受信任边界约束的项目 Skill。 */
         WORKSPACE(3);
 
         private final int priority;
 
         /**
-         * 显式固定优先级，避免未来仅调整枚举声明位置就静默改变覆盖语义。
+         * 显式固定优先级，避免调整枚举声明位置时静默改变覆盖语义。
          */
         Source(int priority) {
             this.priority = priority;
         }
 
         /**
-         * 数值只表达覆盖与目录展示顺序，不作为授权；越具体、越靠后的来源优先级越高。
+         * 数值只表达覆盖与展示顺序，不作为授权；越具体的来源优先级越高。
          */
         public int priority() {
             return priority;
@@ -124,11 +109,11 @@ public interface SkillCatalog {
     }
 
     /**
-     * 在已冻结 Skill 内读取单个相对资源的有界请求。
+     * 在已发现 Skill 内读取单个相对资源的有界请求。
      */
     record SkillReadRequest(String skillName, String resourcePath, int maxCharacters) {
         /**
-         * 规范化分隔符并拒绝绝对路径或父级逃逸，文件系统复核仍由 Adapter 执行。
+         * 先规范化分隔符并拒绝显然逃逸；物理 containment 与重解析点仍由 Adapter 在每次 read 复核。
          */
         public SkillReadRequest {
             skillName = ContractChecks.identifier(skillName, "skillName");
@@ -142,16 +127,15 @@ public interface SkillCatalog {
     }
 
     /**
-     * 返回给 Agent Loop 的有界 Skill 文档及截断事实。
+     * 返回给 Agent Loop 的实时有界 Skill 文档及截断事实。
      */
-    record SkillDocument(String skillName, String resourcePath, String revision, String content, boolean truncated) {
+    record SkillDocument(String skillName, String resourcePath, String content, boolean truncated) {
         /**
-         * 固化读取修订与截断后的正文，避免调用方误把部分内容当作最新完整文件。
+         * 文档不携带 revision，避免调用方把一次读取误建模为不可变包代际。
          */
         public SkillDocument {
             skillName = ContractChecks.identifier(skillName, "skillName");
             resourcePath = ContractChecks.text(resourcePath, "resourcePath", 1_024, false);
-            revision = ContractChecks.identifier(revision, "revision");
             content = ContractChecks.text(content, "content", 4_000_000, true);
         }
     }

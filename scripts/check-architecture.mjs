@@ -5,6 +5,7 @@ import { access, readdir, readFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkInitialBaseline } from "./check-initial-baseline.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const desktopRoot = path.join(repositoryRoot, "apps", "desktop");
@@ -642,10 +643,11 @@ function retiredApiInSource(source, retiredApis) {
   return retiredApis.find((retired) => code.includes(retired)) ?? null;
 }
 
-/** v10 使用独立 key/schema，生产代码不得再次读取或迁移 v8/v9。 */
+/** 首版只接受当前 key/schema，不允许通过 Zustand migrate 恢复开发期偏好。 */
 function containsRetiredPreferenceStorage(source) {
   return (
-    /["'][^"']*(?:preferences|ui)[^"']*v(?:8|9)[^"']*["']/i.test(source) ||
+    /ja-ui-preferences-v(?:[2-9]\d*|1\d+)\b/.test(source) ||
+    /\bmigrate\s*:/.test(stripTypeScriptCommentsAndStrings(source)) ||
     /\b(?:migrate|upgrade|readLegacy)[A-Za-z0-9_]*(?:Preferences|UiState)\b/.test(
       stripTypeScriptCommentsAndStrings(source),
     )
@@ -1345,16 +1347,21 @@ async function checkReactUiOwnership() {
   return violations;
 }
 
-/** 主题查询统一复用 hook，feedback 语义组件只允许由 shared primitives 定义。 */
+/** 主题查询统一复用 shared hook；允许 Provider 消费更高层的最终主题，避免 leaf 重复解析系统偏好。 */
 async function checkSharedUiReuse() {
   const violations = [];
   const themeProvider = await readFile(
     path.join(desktopSourceRoot, "app", "ThemeProvider.tsx"),
     "utf8",
   );
-  if (!moduleSpecifiers(themeProvider).some((specifier) => specifier.endsWith("/useMediaQuery"))) {
+  const themeHooks = new Set(["/useMediaQuery", "/useResolvedTheme"]);
+  if (
+    !moduleSpecifiers(themeProvider).some((specifier) =>
+      [...themeHooks].some((suffix) => specifier.endsWith(suffix)),
+    )
+  ) {
     violations.push(
-      "apps/desktop/src/app/ThemeProvider.tsx: ThemeProvider 必须复用 shared useMediaQuery",
+      "apps/desktop/src/app/ThemeProvider.tsx: ThemeProvider 必须复用 shared 主题解析 hook",
     );
   }
   for (const file of await collectSourceFiles(desktopSourceRoot)) {
@@ -1938,14 +1945,8 @@ function isRustCommentTarget(filePath) {
     const parts = portablePath(tauriRelative).split("/");
     const owner = parts[0];
     return (
-      [
-        "app_runtime",
-        "workspace",
-        "review",
-        "terminal",
-        "preview",
-        "settings",
-      ].includes(owner) || ["lib.rs", "native_shortcuts.rs"].includes(parts[0])
+      ["app_runtime", "workspace", "review", "terminal", "preview", "settings"].includes(owner) ||
+      ["lib.rs", "native_shortcuts.rs"].includes(parts[0])
     );
   }
   const runtimeRelative = path.relative(path.join(runtimeCrateRoot, "src"), filePath);
@@ -2080,7 +2081,7 @@ async function checkRetiredApis() {
       containsRetiredPreferenceStorage(source)
     ) {
       violations.push(
-        `${path.relative(repositoryRoot, file)}: UI preferences 只能读取 v10 key/schema，禁止 v8/v9 或迁移入口`,
+        `${path.relative(repositoryRoot, file)}: UI preferences 只能读取 v1 key/schema，禁止历史 key 或迁移入口`,
       );
     }
     if (
@@ -2088,7 +2089,7 @@ async function checkRetiredApis() {
       containsRetiredWorkbenchPreferenceMapping(source)
     ) {
       violations.push(
-        `${path.relative(repositoryRoot, file)}: UI preferences v10 不得保留旧 Workbench Tab 修复映射`,
+        `${path.relative(repositoryRoot, file)}: UI preferences v1 不得保留旧 Workbench Tab 修复映射`,
       );
     }
     if (relative.startsWith("features/command/") && containsLegacyCommandPaletteMapping(source)) {
@@ -2691,8 +2692,10 @@ function checkRuleFixtures() {
     if (retiredApiInSource(`fn ${retired}() {}`, retiredRustApis) !== retired)
       fixtureFailures.push(`旧 Git API ${retired} reject fixture 未命中`);
   }
-  if (containsRetiredPreferenceStorage("name: 'ja-ui-preferences-v10'"))
-    fixtureFailures.push("preferences v10 allow fixture 被误拒绝");
+  if (containsRetiredPreferenceStorage("name: 'ja-ui-preferences-v1'"))
+    fixtureFailures.push("preferences v1 allow fixture 被误拒绝");
+  if (!containsRetiredPreferenceStorage("migrate: (value) => value"))
+    fixtureFailures.push("preferences migration reject fixture 未命中");
   if (!containsRetiredPreferenceStorage("name: 'ja-ui-preferences-v9'"))
     fixtureFailures.push("preferences v9 key reject fixture 未命中");
   return fixtureFailures;
@@ -3098,6 +3101,7 @@ async function main() {
     ...(await checkAuthorMarkers()),
     ...(await checkChineseFunctionComments()),
     ...(await checkRetiredApis()),
+    ...(await checkInitialBaseline(repositoryRoot)),
     ...(await checkRuntimeCrateBoundary()),
   ];
   if (violations.length > 0) {

@@ -11,7 +11,7 @@ import java.util.Objects;
  * 表示一次事务读取获得的 Thread 元数据与混合历史项页面。
  */
 public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> items,
-                             ContextUsage contextUsage, String nextCursor) {
+                             ContextUsage contextUsage, InputQueue inputQueue, String nextCursor) {
     /**
      * 深层集合以不可变副本发布，保证事务结束后结果不会漂移。
      */
@@ -21,8 +21,8 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
         items = List.copyOf(Objects.requireNonNull(items, "items"));
     }
 
-    /** Turn 元数据不参与 item cursor；每个元素携带 admission 时冻结的独立运行快照。 */
-    public record Turn(String turnId, String status, TurnRuntimeSnapshot runtime,
+    /** Turn 元数据只表达 Operation 生命周期；模型事实必须从请求级 Usage Profile 读取。 */
+    public record Turn(String turnId, String status,
                        Instant requestedAt, Instant updatedAt, Instant completedAt, String errorCode,
                        TurnChangeSet changeSet) {
         /** 历史只公开稳定错误码，错误正文和 Provider 私有续传状态仍留在服务端。 */
@@ -42,18 +42,13 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
     /**
      * 最近一次已提交模型轮次的 Provider Usage；它是恢复上下文指示器的权威事实，不是字符估算。
      */
-    public record ContextUsage(String turnId, int modelRound, long inputTokens, long outputTokens,
-                               long totalTokens, Instant measuredAt) {
+    public record ContextUsage(String turnId, ProviderRequestUsage request, Instant measuredAt) {
         /**
          * Usage 必须能关联到快照中的真实 Turn，且总量不得小于输入与输出之和。
          */
         public ContextUsage {
             requireIdentifier(turnId, "turn_", "turnId");
-            if (modelRound < 1 || modelRound > 128 || inputTokens < 0 || outputTokens < 0
-                || totalTokens < 0 || inputTokens > Long.MAX_VALUE - outputTokens
-                || totalTokens < inputTokens + outputTokens) {
-                throw new IllegalArgumentException("invalid context usage");
-            }
+            Objects.requireNonNull(request, "request");
             Objects.requireNonNull(measuredAt, "measuredAt");
         }
     }
@@ -61,7 +56,7 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
     /**
      * 历史项闭集只包含当前公开合同允许回放的持久化事实。
      */
-    public sealed interface Item permits TextItem, ToolItem, ApprovalItem, AttachmentItem {
+    public sealed interface Item permits UserInputItem, TextItem, ToolItem, ApprovalItem {
         /**
          * 返回追加写入时生成的不透明条目身份。
          */
@@ -74,6 +69,22 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
 
         /** 每个平坦历史项显式携带所属 Turn，禁止客户端按 Thread 合并推断。 */
         String turnId();
+    }
+
+    /** 用户输入保留四类结构化 block；Renderer 不再从纯文本和附件旁表反推提交内容。 */
+    public record UserInputItem(String itemId, Instant createdAt, String turnId,
+                                UserContent content, List<AttachmentSummary> attachments) implements Item {
+        /** 消息身份、Turn 关联和规范 content 必须来自同一 SQLite 快照。 */
+        public UserInputItem {
+            requireItem(itemId, createdAt);
+            requireIdentifier(turnId, "turn_", "turnId");
+            Objects.requireNonNull(content, "content");
+            attachments = List.copyOf(Objects.requireNonNull(attachments, "attachments"));
+            if (!content.attachmentIds().equals(attachments.stream()
+                    .map(AttachmentSummary::attachmentId).toList())) {
+                throw new IllegalArgumentException("attachment summaries do not match content order");
+            }
+        }
     }
 
     /**
@@ -140,41 +151,17 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
         }
     }
 
-    /** 表示已与 Turn 关联的公开附件事实，不包含 hash、ingress token 或物理路径。 */
-    public record AttachmentItem(String itemId, Instant createdAt, String attachmentId, String turnId,
-                                 String displayName, long sizeBytes, String mediaKind,
-                                 String mediaType, String state) implements Item {
-        /** 历史投影只接受公开闭集；存储损坏必须失败而非伪造附件能力。 */
-        public AttachmentItem {
-            requireItem(itemId, createdAt);
-            requireIdentifier(attachmentId, "att_", "attachmentId");
-            requireIdentifier(turnId, "turn_", "turnId");
-            if (displayName == null || displayName.isBlank() || displayName.length() > 512
-                || displayName.chars().anyMatch(Character::isISOControl) || sizeBytes < 0
-                || sizeBytes > 100L * 1024 * 1024
-                || !Objects.requireNonNull(mediaKind, "mediaKind").matches("text|image|pdf|binary")
-                || mediaType == null || mediaType.isBlank() || mediaType.length() > 128
-                || !Objects.requireNonNull(state, "state").matches("draft|bound|discarded|expired")) {
-                throw new IllegalArgumentException("invalid attachment history item");
-            }
-        }
-    }
-
     /**
      * 可见文本类型与 Wire 名称解耦。
      */
     public enum TextKind {
-        /**
-         * 用户提交的输入文本。
-         */
-        USER_INPUT,
         /**
          * 模型提交的最终可见回复。
          */
         ASSISTANT_PROGRESS,
         /** Provider 明确返回的公开 reasoning summary，不是隐藏推理正文。 */
         REASONING_SUMMARY,
-        /** 仅由成功 terminal finalMessage 产生的最终答复。 */
+        /** 由 Provider STOP 产生的独立答复；既包括终态回复，也包括消费下一条排队输入前的结算。 */
         FINAL_ANSWER
     }
 

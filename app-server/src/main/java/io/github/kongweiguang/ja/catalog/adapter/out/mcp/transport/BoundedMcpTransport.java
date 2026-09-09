@@ -11,6 +11,7 @@ import reactor.core.publisher.Mono;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * 统一有界 MCP 传输与 SDK 之间不随载体变化的生命周期边界。
@@ -21,6 +22,7 @@ import java.util.function.Consumer;
 abstract class BoundedMcpTransport implements McpClientTransport {
     protected final McpJsonMapper jsonMapper;
     protected final List<String> protocolVersions;
+    private final Runnable toolsChanged;
     private volatile Consumer<Throwable> exceptionHandler = ignored -> {
     };
 
@@ -28,8 +30,17 @@ abstract class BoundedMcpTransport implements McpClientTransport {
      * 复制 SDK 共享输入，使具体传输不能受调用方后续修改或 ServiceLoader 默认值影响。
      */
     BoundedMcpTransport(McpJsonMapper jsonMapper, List<String> protocolVersions) {
+        this(jsonMapper, protocolVersions, () -> {
+        });
+    }
+
+    /**
+     * 绑定无阻塞目录失效观察者；通知只发布 dirty，不在 SDK 回调线程中重拉或持锁。
+     */
+    BoundedMcpTransport(McpJsonMapper jsonMapper, List<String> protocolVersions, Runnable toolsChanged) {
         this.jsonMapper = Objects.requireNonNull(jsonMapper, "jsonMapper");
         this.protocolVersions = List.copyOf(protocolVersions);
+        this.toolsChanged = Objects.requireNonNull(toolsChanged, "toolsChanged");
     }
 
     /**
@@ -70,6 +81,26 @@ abstract class BoundedMcpTransport implements McpClientTransport {
      */
     protected final void reportTransportFailure(Throwable failure) {
         exceptionHandler.accept(failure);
+    }
+
+    /**
+     * 在消息交给 SDK 前消费原始 list_changed；SDK 2.0.1 会先无界聚合 tools/list 才完成通知，
+     * 因此该通知只在自有传输发布 dirty，后续安全点再由 Ja 有界分页完整重拉。
+     */
+    protected final Function<Mono<io.modelcontextprotocol.spec.McpSchema.JSONRPCMessage>,
+            Mono<io.modelcontextprotocol.spec.McpSchema.JSONRPCMessage>> observeNotifications(
+            Function<Mono<io.modelcontextprotocol.spec.McpSchema.JSONRPCMessage>,
+                    Mono<io.modelcontextprotocol.spec.McpSchema.JSONRPCMessage>> handler) {
+        Objects.requireNonNull(handler, "handler");
+        return messages -> handler.apply(messages.flatMap(message -> {
+            if (message instanceof io.modelcontextprotocol.spec.McpSchema.JSONRPCNotification notification
+                && io.modelcontextprotocol.spec.McpSchema.METHOD_NOTIFICATION_TOOLS_LIST_CHANGED
+                        .equals(notification.method())) {
+                toolsChanged.run();
+                return Mono.empty();
+            }
+            return Mono.just(message);
+        }));
     }
 
     /**

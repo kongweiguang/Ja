@@ -3,15 +3,18 @@
 
 import { create, type StoreApi, type UseBoundStore } from "zustand";
 import type { ConversationHostEvent } from "./ports";
-import type { TimelineSnapshot } from "../domain/timelineContracts";
+import type { TimelineSnapshot, TimelineTaskActivityEntry } from "../domain/timelineContracts";
+import type { InputQueue } from "../domain/timelineContracts";
 import type { TimelineItemAdapter } from "../domain/timelineTypes";
 import {
   applyLiveEvent,
+  applyInputQueue,
   applySnapshot,
   applyTurnAccepted,
   applyRuntimeStatus,
   createTimelineState,
   requireActiveTurnResync,
+  requireThreadResync,
   type AcceptedTurnProjection,
   type TimelineState,
 } from "../domain/timelineReducer";
@@ -20,14 +23,16 @@ export interface TimelineStore extends TimelineState {
   applySnapshot: (snapshot: TimelineSnapshot, workspaceId: string) => TimelineState["lastOutcome"];
   applyHostEvent: (event: ConversationHostEvent) => TimelineState["lastOutcome"];
   applyTurnAccepted: (accepted: AcceptedTurnProjection) => TimelineState["lastOutcome"];
+  applyInputQueue: (inputQueue: InputQueue) => TimelineState["lastOutcome"];
   applyRuntimeStatus: (
     status: Parameters<typeof applyRuntimeStatus>[1],
   ) => TimelineState["lastOutcome"];
   recordThreadMetadataRevision: (threadId: string, revision: number) => void;
+  requestThreadResync: (threadId: string) => void;
   reset: () => void;
 }
 
-const TIMELINE_STORE_GLOBAL_KEY = "__JA_TIMELINE_STORE_V3__";
+const TIMELINE_STORE_GLOBAL_KEY = "__JA_TIMELINE_STORE_V1__";
 
 type TimelineStoreRegistry = typeof globalThis & {
   [TIMELINE_STORE_GLOBAL_KEY]?: UseBoundStore<StoreApi<TimelineStore>>;
@@ -37,6 +42,7 @@ const draftItemByProjection = new WeakMap<
   TimelineState["draftByTurn"][string],
   TimelineItemAdapter
 >();
+const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
  * 把同一份 Draft Projection 映射为稳定的 Item 引用；公开回复 delta 直接占用 Agent Message
@@ -108,6 +114,16 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       });
       return nextOutcome;
     },
+    /** Mutation ACK 与队列事件共享同一个 reducer，按 queue revision 幂等收敛。 */
+    applyInputQueue: (inputQueue) => {
+      let nextOutcome: TimelineState["lastOutcome"] = "rejected";
+      set((state) => {
+        const next = applyInputQueue(state, inputQueue);
+        nextOutcome = next.lastOutcome;
+        return next;
+      });
+      return nextOutcome;
+    },
     applyRuntimeStatus: (status) => {
       let nextOutcome: TimelineState["lastOutcome"] = "rejected";
       set((state) => {
@@ -132,6 +148,8 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
           },
         };
       }),
+    /** 队列 CAS 冲突只建立一次 authoritative read 意图，不在 Renderer 猜测条目现状。 */
+    requestThreadResync: (threadId) => set((state) => requireThreadResync(state, threadId)),
     reset: () => set(createTimelineState()),
   }));
 }
@@ -162,6 +180,17 @@ export const selectItemsForThread = (threadId: string) => (state: TimelineStore)
   });
   return [...committed, ...drafts];
 };
+
+/** 主 Timeline 只读取当前 root 的持久活动切片；稳定空数组避免隐藏视图产生无效重渲染。 */
+export const selectTaskActivitiesForRoot = (rootThreadId: string) => (state: TimelineStore) =>
+  state.taskActivitiesByRootThread[rootThreadId] ?? EMPTY_TASK_ACTIVITIES;
+
+const EMPTY_GOAL_ACTIVITIES: readonly import("../domain/timelineContracts").TimelineGoalActivity[] =
+  [];
+
+/** Goal 终态由 thread/read 恢复，稳定空数组避免没有历史目标时触发无效重渲染。 */
+export const selectGoalActivitiesForOwner = (ownerThreadId: string) => (state: TimelineStore) =>
+  state.goalActivitiesByOwnerThread[ownerThreadId] ?? EMPTY_GOAL_ACTIVITIES;
 
 /**
  * Resolution Tombstone 对卡片隐藏但保留在状态中，避免使用同一 approvalId 的迟到请求复活用户任务。

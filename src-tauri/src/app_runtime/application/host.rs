@@ -6,17 +6,25 @@
 use super::{
     ConfigurationRequest, ConfigurationResponse, HistoryRequest, HistoryResponse,
     RuntimeBridgePort, RuntimeCommandError, RuntimePlatformPort, SettingsRequest, SettingsResponse,
-    TurnChangeCaptureContext,
 };
 use crate::app_runtime::domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
-    GeneralWorkspace, ManualRecoveryConfirmation, RuntimeConfigurationStatus, RuntimeRecoveryState,
-    RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo, ToolArtifactReadInput,
+    GeneralWorkspace, GoalRequest, GoalResponse, ManualRecoveryConfirmation,
+    RuntimeConfigurationStatus, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind,
+    RuntimeStorageInfo, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
+    TaskListInput, TaskListResult, TaskMessageInput, TaskMessageResult, TaskMutationInput,
+    TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
+    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput,
     ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnQueuedInput, TurnQueuedInputResult,
-    TurnStartInput, WorkspaceDto, WorkspaceOpenInput,
+    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
+    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
+    WorkspaceDto, WorkspaceOpenInput, WorkspacePathSearchInput, WorkspacePathSearchResult,
 };
 use crate::workspace::{WorkspaceHandle, WorkspaceRegistry};
+use ja_runtime::app_server_process::{
+    AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
+    AttachmentPreviewReadParams, AttachmentPreviewReadResult,
+};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -197,23 +205,10 @@ impl RuntimeHost {
         Ok(public)
     }
 
-    /// 仅通过已通过恢复与受信任配置检查的 bridge 路由强类型 Turn，确保生命周期门禁唯一。
+    /// 仅通过已通过恢复与受信任配置检查的 bridge 路由强类型 Turn；修改归属完全由 Java tracker
+    /// 持有，启动路径不得触发 Git、tree、watcher 或 snapshot。
     pub fn turn_start(&self, input: TurnStartInput) -> Result<TurnAccepted, RuntimeCommandError> {
-        let bridge = self.ensure_bridge()?;
-        let capture = {
-            let workspace = self.workspace_guard()?;
-            let binding = workspace
-                .as_ref()
-                .ok_or_else(RuntimeCommandError::unavailable)?;
-            TurnChangeCaptureContext {
-                workspace_id: binding
-                    .workspace_id
-                    .clone()
-                    .ok_or_else(RuntimeCommandError::unavailable)?,
-                workspace: binding.handle.clone(),
-            }
-        };
-        bridge.turn_start_with_workspace(input, capture)
+        self.ensure_bridge()?.turn_start(input)
     }
 
     /// 通过当前 bridge 路由取消而不替换或停止 sidecar；完成事实仍只能从事件通道到达。
@@ -224,20 +219,163 @@ impl RuntimeHost {
         self.ensure_bridge()?.turn_cancel(input)
     }
 
-    /// 在当前 Java-owned Turn 上排队 steering，不把 FIFO 投影到 Rust 状态，也不暴露通用协议 method。
-    pub fn turn_steer(
-        &self,
-        input: TurnQueuedInput,
-    ) -> Result<TurnQueuedInputResult, RuntimeCommandError> {
-        self.ensure_bridge()?.turn_steer(input)
+    /// 通过当前受 instance/generation fence 保护的 bridge 恢复 Turn；Rust 不读取或缓存执行游标。
+    pub fn turn_resume(&self, input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_resume(input)
     }
 
-    /// 在完成边界排队 follow-up，同时维持 Java 对 admission、持久化、取消与恢复的唯一所有权。
-    pub fn turn_follow_up(
+    /// 通过当前 generation 的固定 lane 入队普通消息，RuntimeHost 不缓存队列副本。
+    pub fn turn_input_enqueue(
         &self,
-        input: TurnQueuedInput,
-    ) -> Result<TurnQueuedInputResult, RuntimeCommandError> {
-        self.ensure_bridge()?.turn_follow_up(input)
+        input: TurnInputEnqueue,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_input_enqueue(input)
+    }
+
+    /// 提升条目只转发 item CAS，点击顺序和安全消费点继续由 Java 独占。
+    pub fn turn_input_prioritize(
+        &self,
+        input: TurnInputPrioritize,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_input_prioritize(input)
+    }
+
+    /// 编辑通过条目 revision 防止覆盖消费竞态，Host 不把该 CAS 扩张为 Turn execution mutation。
+    pub fn turn_input_update(
+        &self,
+        input: TurnInputUpdate,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_input_update(input)
+    }
+
+    /// 删除仅作用于 Java durable queue，Host 不依据本地事件投影预判条目存在性。
+    pub fn turn_input_delete(
+        &self,
+        input: TurnInputDelete,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_input_delete(input)
+    }
+
+    /// 侧边任务创建必须经过当前 Java transaction，Host 不缓存草稿或 lineage。
+    pub fn task_create(
+        &self,
+        input: TaskCreateInput,
+    ) -> Result<TaskCreateResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_create(input)
+    }
+
+    /// 总览直接读取 Java projection，隐藏能力不会在 Host 扫描 Child transcript。
+    pub fn task_list(&self, input: TaskListInput) -> Result<TaskListResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_list(input)
+    }
+
+    /// 任务详情读取复用 Java cursor，不在 Host 保存 activity/mailbox 副本。
+    pub fn task_read(&self, input: TaskReadInput) -> Result<TaskReadResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_read(input)
+    }
+
+    /// 高频观察句柄由当前 sidecar connection 持有，Host 只通过 ready fence 准入。
+    pub fn task_observe(
+        &self,
+        input: TaskObserveInput,
+    ) -> Result<TaskObserveResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_observe(input)
+    }
+
+    /// 显式释放观察句柄；connection 关闭时的兜底回收仍属于 Java session owner。
+    pub fn task_unobserve(&self, input: TaskUnobserveInput) -> Result<(), RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_unobserve(input)
+    }
+
+    /// Hard reload 直接使用既有 bridge 清理 renderer owner，不为清理动作惰性启动新 sidecar。
+    pub fn release_task_observations(
+        &self,
+        owner: &'static str,
+    ) -> Result<usize, RuntimeCommandError> {
+        let bridge = self.bridge_guard()?.clone();
+        match bridge {
+            Some(bridge) => bridge.release_task_observations(owner),
+            None => Ok(0),
+        }
+    }
+
+    /// 已读边界由 Java CAS 推进，不用最后收到的 event sequence 替代服务端 revision。
+    pub fn task_seen(&self, input: TaskSeenInput) -> Result<TaskSummary, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_seen(input)
+    }
+
+    /// QueueOnly 消息走固定 Mailbox 方法，Host 不唤醒空闲任务。
+    pub fn task_message_send(
+        &self,
+        input: TaskMessageInput,
+    ) -> Result<TaskMessageResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_message_send(input)
+    }
+
+    /// followup 的 Turn 创建和排队保持在 Java 原子用例内，Host 只传递 typed intent。
+    pub fn task_followup(
+        &self,
+        input: TaskFollowupInput,
+    ) -> Result<TaskFollowupResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_followup(input)
+    }
+
+    /// 取消传播完全依据 Java lineage，Rust/Tauri 不遍历或推断 ATTACHED 后代。
+    pub fn task_cancel(
+        &self,
+        input: TaskMutationInput,
+    ) -> Result<TaskSummary, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_cancel(input)
+    }
+
+    /// 显式整树删除通过唯一 typed 入口代理，普通 Thread 删除不会走到这里。
+    pub fn task_tree_delete(
+        &self,
+        input: TaskTreeDeleteInput,
+    ) -> Result<TaskTreeDeleteResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_tree_delete(input)
+    }
+
+    /// `@` 查询先验证 active Workspace binding，再由 Java 对 Thread 归属与路径 confinement 复核。
+    pub fn workspace_path_search(
+        &self,
+        input: WorkspacePathSearchInput,
+    ) -> Result<WorkspacePathSearchResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.authorize_workspace_identity(&input.workspace_id)?;
+        self.ready_bridge()?.workspace_path_search(input)
     }
 
     /// active Workspace binding 是 artifact reader 的第一层授权；Java 再校验 Thread/Turn/Artifact
@@ -290,6 +428,19 @@ impl RuntimeHost {
             });
         }
         bridge.history(request)
+    }
+
+    /// Goal/Plan 只允许在已 Ready 的 Java generation 上执行，Host 不缓存 projection 或批准状态。
+    pub(crate) fn goal_request(
+        &self,
+        request: GoalRequest,
+    ) -> Result<GoalResponse, RuntimeCommandError> {
+        let bridge = self.bridge_guard()?.clone().ok_or(RuntimeCommandError {
+            code: "RUNTIME_NOT_READY",
+            message: "runtime is not ready",
+            retryable: true,
+        })?;
+        bridge.goal(request)
     }
 
     /// general-workspace 读取跨越 stdio 前要求 sidecar 完成当前握手；该命令绝不隐式启动 Java，也不回退到 Rust-owned 存储。
@@ -611,6 +762,47 @@ impl RuntimeHost {
             .validate()
             .map_err(|_| RuntimeCommandError::invalid_params())?;
         self.ready_bridge()?.attachment_discard(input)
+    }
+
+    /// 草稿授权只使用当前原生 Workspace owner，避免 renderer 的旧投影把刚导入的附件授权到另一 Workspace；
+    /// Thread 分支保留会话 identity，由 Java 同时校验排队预留与消息绑定关系。
+    pub(crate) fn attachment_preview_open_with_authorization(
+        &self,
+        attachment_id: String,
+        authorization: crate::attachment_preview::AttachmentPreviewAuthorizationInput,
+    ) -> Result<(AttachmentPreviewOpenResult, String), RuntimeCommandError> {
+        let workspace_id = self
+            .workspace_guard()?
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_id.clone())
+            .ok_or_else(RuntimeCommandError::unavailable)?;
+        let input = match authorization {
+            crate::attachment_preview::AttachmentPreviewAuthorizationInput::Draft => {
+                AttachmentPreviewOpenParams::draft(attachment_id, workspace_id.clone())
+            }
+            crate::attachment_preview::AttachmentPreviewAuthorizationInput::Thread {
+                thread_id,
+            } => AttachmentPreviewOpenParams::thread(attachment_id, thread_id),
+        }
+        .map_err(|_| RuntimeCommandError::invalid_params())?;
+        let bridge = self.ready_bridge()?;
+        Ok((bridge.attachment_preview_open(input)?, workspace_id))
+    }
+
+    /// read 仅路由 ja-runtime 已验证的 session/offset/limit，不接受任意 method。
+    pub(crate) fn attachment_preview_read(
+        &self,
+        input: AttachmentPreviewReadParams,
+    ) -> Result<AttachmentPreviewReadResult, RuntimeCommandError> {
+        self.ready_bridge()?.attachment_preview_read(input)
+    }
+
+    /// close 复用 Ready generation；应用退出时 App Server 仍会统一清空剩余 session。
+    pub(crate) fn attachment_preview_close(
+        &self,
+        input: AttachmentPreviewCloseParams,
+    ) -> Result<(), RuntimeCommandError> {
+        self.ready_bridge()?.attachment_preview_close(input)
     }
 
     /// 只暴露构造强类型确认所需的已脱敏 recovery identity；marker 路径与进程细节必须留在原生侧。

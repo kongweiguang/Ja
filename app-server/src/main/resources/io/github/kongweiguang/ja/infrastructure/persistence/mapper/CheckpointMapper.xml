@@ -21,6 +21,11 @@
       input_tokens,envelope_fingerprint,strategy_version,usage_json,created_at FROM context_checkpoints WHERE thread_id=#{threadId}
     ORDER BY source_revision DESC LIMIT 1
   </select>
+  <select id="selectCheckpointIdentity" resultMap="checkpointRow">
+    SELECT thread_id,checkpoint_id,source_revision,through_ordinal,retained_from_ordinal,retained_split_json,summary_json,
+      input_tokens,envelope_fingerprint,strategy_version,usage_json,created_at FROM context_checkpoints
+    WHERE thread_id=#{threadId} AND checkpoint_id=#{checkpointId}
+  </select>
   <select id="selectCheckpointSource" resultMap="checkpointRow">
     SELECT thread_id,checkpoint_id,source_revision,through_ordinal,retained_from_ordinal,retained_split_json,summary_json,
       input_tokens,envelope_fingerprint,strategy_version,usage_json,created_at FROM context_checkpoints

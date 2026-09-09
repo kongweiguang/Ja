@@ -9,8 +9,8 @@
 use super::error::{PreviewError, PreviewErrorCode};
 use super::load_watchdog::{LoadTimeoutRuntime, LoadTimeoutTask, PreviewLoadWatchdog};
 use super::model::{
-    NavigationSource, PreviewEvent, PreviewId, PreviewLimits, PreviewSessionSnapshot,
-    PreviewShutdownReport,
+    NavigationSource, PreviewEvent, PreviewId, PreviewLimits, PreviewLoadStatus,
+    PreviewSessionSnapshot, PreviewSessionStatus, PreviewShutdownReport,
 };
 use super::session::{PreviewCloseTicket, PreviewManager};
 #[cfg(windows)]
@@ -28,6 +28,7 @@ use url::Url;
 #[cfg(windows)]
 use webview2_com::{
     Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler,
 };
 #[cfg(windows)]
 use windows_core::BOOL;
@@ -48,6 +49,52 @@ const PREVIEW_NATIVE_HANDLER_INSTALL_TIMEOUT: Duration = Duration::from_secs(2);
 const PREVIEW_LOAD_TIMEOUT_MESSAGE: &str = "preview load timed out";
 const PREVIEW_NAVIGATION_FAILED_MESSAGE: &str = "preview navigation failed";
 const PREVIEW_NAVIGATION_BLOCKED_MESSAGE: &str = "preview navigation was blocked";
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct PreviewNavigationCompletionTracker {
+    pending: Option<(u64, u64)>,
+    allow_unmapped_initial: bool,
+}
+
+#[cfg(windows)]
+impl PreviewNavigationCompletionTracker {
+    /// handler 在 child 创建后安装，初始 Starting 可能已发生，因此只允许首个无映射 completion
+    /// 使用当前 generation；一旦观察到原生 Starting，后续必须按 NavigationId 精确配对。
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: None,
+            allow_unmapped_initial: true,
+        }
+    }
+
+    /// Wry 的策略 handler 先推进模型 generation；同一 UI thread 上随后记录 NavigationId，
+    /// 让旧页面的晚到 completion 无法完成较新的用户导航。
+    pub(crate) fn started(&mut self, navigation_id: u64, generation: u64) {
+        self.pending = Some((navigation_id, generation));
+        self.allow_unmapped_initial = false;
+    }
+
+    /// 只领取与最近 Starting 匹配的 completion；不匹配时保留当前映射，等待真正的终态到达。
+    pub(crate) fn completed(
+        &mut self,
+        navigation_id: u64,
+        fallback_generation: u64,
+    ) -> Option<u64> {
+        match self.pending {
+            Some((expected_id, generation)) if expected_id == navigation_id => {
+                self.pending = None;
+                Some(generation)
+            }
+            Some(_) => None,
+            None if self.allow_unmapped_initial => {
+                self.allow_unmapped_initial = false;
+                Some(fallback_generation)
+            }
+            None => None,
+        }
+    }
+}
 
 /// 包装 Tauri 全局 runtime 的任务句柄；Preview 状态层只看到可取消能力，
 /// 不获取 framework handle 或执行器类型。
@@ -596,11 +643,10 @@ pub async fn ja_preview_open(
             let current = callback_generation.load(Ordering::Acquire);
             match callback_manager.callback_navigation(id, current, url.as_str()) {
                 Ok(event) => {
-                    let _ = callback_watchdog.cancel(id);
                     let committed_generation = event.generation;
                     callback_generation.store(committed_generation, Ordering::Release);
                     emit_preview_event(&callback_app, event);
-                    if let Err(error) = arm_preview_load_timeout(
+                    if let Err(error) = rebind_preview_load_timeout(
                         &callback_watchdog,
                         &callback_manager,
                         &callback_app,
@@ -645,7 +691,7 @@ pub async fn ja_preview_open(
             let current = load_generation.load(Ordering::Acquire);
             match payload.event() {
                 PageLoadEvent::Started => {
-                    if let Err(error) = arm_preview_load_timeout(
+                    if let Err(error) = rebind_preview_load_timeout(
                         &load_watchdog,
                         &load_manager,
                         &load_app,
@@ -760,6 +806,10 @@ pub async fn ja_preview_open(
         state.rollback_created_webview(&app, id)?;
         return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
     }
+    if state.manager.commit_native_visibility(id, true).is_err() {
+        state.rollback_created_webview(&app, id)?;
+        return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
+    }
     // `add_child` 可能同步调用 navigation callback；返回 fresh snapshot 可防止 UI
     // 用旧 generation 覆盖 callback 已提交的新状态。
     match state.manager.authoritative_open_result(id) {
@@ -831,16 +881,28 @@ pub fn ja_preview_layout(
     let webview = app
         .get_webview(snapshot.window.label())
         .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+    let was_visible = state.manager.native_visible(input.session_id)?;
     if input.viewport.visible {
         input.viewport.validate_open()?;
         webview
             .set_bounds(input.viewport.logical_rect())
-            .and_then(|_| webview.show())
             .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
-    } else {
+        // Windows WebView2 对重复 show 并非无成本；拖动分栏时只更新 bounds，避免闪烁。
+        if !was_visible {
+            webview
+                .show()
+                .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+            state
+                .manager
+                .commit_native_visibility(input.session_id, true)?;
+        }
+    } else if was_visible {
         webview
             .hide()
             .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+        state
+            .manager
+            .commit_native_visibility(input.session_id, false)?;
     }
     Ok(snapshot)
 }
@@ -1011,15 +1073,49 @@ fn arm_preview_load_timeout(
     let timeout_manager = manager.clone();
     let timeout_app = app.clone();
     watchdog.arm(session_id, generation, PREVIEW_LOAD_TIMEOUT, move || {
+        // ticket 只证明这仍是当前 timer；WebView2 的 NavigationStarting callback 可能已推进
+        // generation，故提交前必须重新读取仍处于 loading 的权威 identity。
+        let Some(current_generation) = current_loading_generation(&timeout_manager, session_id)
+        else {
+            return;
+        };
         emit_preview_load_failure(
             &timeout_manager,
             &timeout_watchdog,
             &timeout_app,
             session_id,
-            generation,
+            current_generation,
             PREVIEW_LOAD_TIMEOUT_MESSAGE,
         );
     })
+}
+
+/// Engine redirect 与 PageLoad Started 仍属于 command 已准入的同一次加载 intent；只更新
+/// completion generation 而不重置绝对预算。若 callback 先于 command arm 到达，才补建 timer，
+/// 从而同时覆盖同步 callback 与无限 redirect/retry 两种边界。
+fn rebind_preview_load_timeout(
+    watchdog: &PreviewLoadWatchdog,
+    manager: &PreviewManager,
+    app: &tauri::AppHandle,
+    session_id: PreviewId,
+    generation: u64,
+) -> Result<(), PreviewError> {
+    if watchdog.rebind(session_id, generation)? {
+        return Ok(());
+    }
+    arm_preview_load_timeout(watchdog, manager, app, session_id, generation)
+}
+
+/// timeout ticket 与 WebView2 callback generation 可能短暂错位；只重新绑定仍为 open/loading
+/// 的权威 generation，已完成、失败或关闭的 session 绝不被迟到 timer 改写。
+pub(crate) fn current_loading_generation(
+    manager: &PreviewManager,
+    session_id: PreviewId,
+) -> Option<u64> {
+    let snapshot = manager.snapshot(session_id).ok()?;
+    (snapshot.status == PreviewSessionStatus::Open
+        && snapshot.load_status == PreviewLoadStatus::Loading)
+        .then_some(snapshot.generation)
 }
 
 /// 取消 watchdog，并在有界 replay queue 与 live event stream 同时记录脱敏故障；
@@ -1063,8 +1159,50 @@ async fn install_preview_navigation_completed(
                 let controller = platform_webview.controller();
                 let native_webview: ICoreWebView2 = unsafe { controller.CoreWebView2() }
                     .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+                let completion_tracker =
+                    Arc::new(Mutex::new(PreviewNavigationCompletionTracker::new()));
+                let starting_tracker = completion_tracker.clone();
+                let starting_generation = generation.clone();
+                let starting_handler =
+                    NavigationStartingEventHandler::create(Box::new(move |_, args| {
+                        let Some(args) = args else {
+                            return Ok(());
+                        };
+                        let mut navigation_id = 0u64;
+                        if unsafe { args.NavigationId(&mut navigation_id) }.is_err() {
+                            tracing::debug!("preview navigation identity was unavailable");
+                            return Ok(());
+                        }
+                        let Ok(mut tracker) = starting_tracker.lock() else {
+                            tracing::debug!("preview navigation identity tracker was unavailable");
+                            return Ok(());
+                        };
+                        tracker.started(navigation_id, starting_generation.load(Ordering::Acquire));
+                        Ok(())
+                    }));
+                let mut _starting_token = 0i64;
+                unsafe {
+                    native_webview.add_NavigationStarting(&starting_handler, &mut _starting_token)
+                }
+                .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+                let completed_tracker = completion_tracker;
                 let handler = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
                     let Some(args) = args else {
+                        return Ok(());
+                    };
+                    let mut navigation_id = 0u64;
+                    if unsafe { args.NavigationId(&mut navigation_id) }.is_err() {
+                        tracing::debug!("preview navigation completion identity was unavailable");
+                        return Ok(());
+                    }
+                    let completion_generation = {
+                        let Ok(mut tracker) = completed_tracker.lock() else {
+                            tracing::debug!("preview navigation identity tracker was unavailable");
+                            return Ok(());
+                        };
+                        tracker.completed(navigation_id, generation.load(Ordering::Acquire))
+                    };
+                    let Some(completion_generation) = completion_generation else {
                         return Ok(());
                     };
                     let mut succeeded = BOOL::default();
@@ -1077,7 +1215,7 @@ async fn install_preview_navigation_completed(
                         &watchdog,
                         &app,
                         session_id,
-                        generation.load(Ordering::Acquire),
+                        completion_generation,
                         succeeded.as_bool(),
                     );
                     Ok(())

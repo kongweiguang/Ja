@@ -252,9 +252,19 @@ fn validate_platform_spelling(path: &Path) -> Result<(), AttachmentIngressError>
         _ => None,
     });
     let allowed_prefix = prefix.is_some_and(|prefix: PrefixComponent<'_>| {
-        matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))
+        matches!(
+            prefix.kind(),
+            Prefix::Disk(_)
+                | Prefix::UNC(_, _)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::VerbatimUNC(_, _)
+        )
     });
     if !allowed_prefix {
+        tracing::warn!(
+            target: "ja.attachment.path.unsupported_prefix",
+            "attachment path prefix is unsupported"
+        );
         return Err(AttachmentIngressError::new(
             AttachmentIngressErrorCode::UnsupportedPath,
         ));
@@ -264,9 +274,26 @@ fn validate_platform_spelling(path: &Path) -> Result<(), AttachmentIngressError>
             continue;
         };
         let name = name.to_str().ok_or_else(|| {
+            tracing::warn!(
+                target: "ja.attachment.path.non_unicode_component",
+                "attachment path component is not unicode"
+            );
             AttachmentIngressError::new(AttachmentIngressErrorCode::UnsupportedPath)
         })?;
-        if name.contains(':') || is_reserved_windows_name(name) {
+        if name.contains(':') {
+            tracing::warn!(
+                target: "ja.attachment.path.alternate_stream",
+                "attachment path contains an alternate stream"
+            );
+            return Err(AttachmentIngressError::new(
+                AttachmentIngressErrorCode::UnsupportedPath,
+            ));
+        }
+        if is_reserved_windows_name(name) {
+            tracing::warn!(
+                target: "ja.attachment.path.reserved_name",
+                "attachment path contains a reserved name"
+            );
             return Err(AttachmentIngressError::new(
                 AttachmentIngressErrorCode::UnsupportedPath,
             ));

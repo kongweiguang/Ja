@@ -63,7 +63,17 @@ public final class JaBoundedHttpTransport extends BoundedMcpTransport {
     public JaBoundedHttpTransport(URI endpoint, Map<String, String> headers,
                            List<String> protocolVersions, McpJsonMapper jsonMapper, McpLimits limits,
                            McpDeadline deadline) {
-        super(jsonMapper, protocolVersions);
+        this(endpoint, headers, protocolVersions, jsonMapper, limits, deadline, () -> {
+        });
+    }
+
+    /**
+     * 生产 Session 注入目录失效观察者；回调只执行原子标记，不进入 OkHttp 或 SDK 的阻塞路径。
+     */
+    public JaBoundedHttpTransport(URI endpoint, Map<String, String> headers,
+                                  List<String> protocolVersions, McpJsonMapper jsonMapper, McpLimits limits,
+                                  McpDeadline deadline, Runnable toolsChanged) {
+        super(jsonMapper, protocolVersions, toolsChanged);
         this.endpoint = Objects.requireNonNull(endpoint, "endpoint");
         this.headers = Map.copyOf(headers);
         this.limits = Objects.requireNonNull(limits, "limits");
@@ -86,7 +96,7 @@ public final class JaBoundedHttpTransport extends BoundedMcpTransport {
      */
     @Override
     public Mono<Void> connect(Function<Mono<McpSchema.JSONRPCMessage>, Mono<McpSchema.JSONRPCMessage>> callback) {
-        handler = Objects.requireNonNull(callback, "callback");
+        handler = observeNotifications(Objects.requireNonNull(callback, "callback"));
         if (closing.get()) {
             return Mono.error(new IllegalStateException("mcp_http_closed"));
         }

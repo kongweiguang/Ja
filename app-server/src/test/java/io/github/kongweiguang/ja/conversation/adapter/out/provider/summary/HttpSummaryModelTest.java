@@ -66,21 +66,14 @@ final class HttpSummaryModelTest {
     @Test
     void summarizesWithOpenAiStructuredResponses() throws Exception {
         AtomicReference<String> requestBody = new AtomicReference<>();
-        AtomicReference<String> countBody = new AtomicReference<>();
         AtomicReference<String> authorization = new AtomicReference<>();
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
-            if (isCount(exchange)) {
-                countBody.set(new String(exchange.getRequestBody().readAllBytes(),
-                        java.nio.charset.StandardCharsets.UTF_8));
-                ModelAdapterTestSupport.json(exchange, 200, "{\"input_tokens\":12}");
-                return;
-            }
             requestBody.set(new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
             authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
             ModelAdapterTestSupport.sse(exchange, openAiSummary(DOCUMENT, new ModelUsage(12, 5, 17)), 7);
         }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
             SummaryGenerator.SummaryResult result = countedSummary(
                     factory.bind(binding(configuration, CancellationToken.none())), prompt());
 
@@ -89,8 +82,56 @@ final class HttpSummaryModelTest {
             assertEquals("Bearer test-secret", authorization.get());
             assertEquals(expectedOpenAiRequest(),
                     AbstractStreamingModelAdapter.JSON.readTree(requestBody.get()));
-            assertEquals(withoutStream(expectedOpenAiRequest()),
-                    AbstractStreamingModelAdapter.JSON.readTree(countBody.get()));
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 校验 Chat Completions 使用原生 response_format.json_schema 并返回完整 usage。 */
+    @Test
+    void summarizesWithOpenAiChatStructuredResponse() throws Exception {
+        AtomicReference<String> requestBody = new AtomicReference<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> {
+                    requestBody.set(new String(exchange.getRequestBody().readAllBytes(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+                    ModelAdapterTestSupport.sse(exchange,
+                            openAiChatSummary(DOCUMENT, new ModelUsage(12, 5, 17)), 7);
+                });
+             ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
+            ModelPort.ModelConfiguration configuration = configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_CHAT_COMPLETIONS);
+            SummaryGenerator.SummaryResult result = countedSummary(
+                    factory.bind(binding(configuration, CancellationToken.none())), prompt());
+
+            assertDocument(result.document());
+            assertEquals(new CheckpointUsage(12, 5, 17, 0, 0), result.usage());
+            JsonNode root = AbstractStreamingModelAdapter.JSON.readTree(requestBody.get());
+            assertEquals("json_schema", root.path("response_format").path("type").textValue());
+            JsonNode jsonSchema = root.path("response_format").path("json_schema");
+            assertEquals("ja_context_summary", jsonSchema.path("name").textValue());
+            assertTrue(jsonSchema.path("strict").booleanValue());
+            assertEquals(expectedSchema(), jsonSchema.path("schema"));
+            assertTrue(root.path("stream_options").path("include_usage").booleanValue());
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** Summary 比普通对话更严格：Chat 即使语义完成，缺失 usage 也必须拒绝检查点。 */
+    @Test
+    void rejectsOpenAiChatSummaryWithoutUsage() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(
+                        exchange, openAiChatSummary(DOCUMENT, null), 7));
+             ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
+            ModelPort.ModelConfiguration configuration = configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_CHAT_COMPLETIONS);
+
+            ContextException failure = assertThrows(ContextException.class, () ->
+                    countedSummary(factory.bind(
+                            binding(configuration, CancellationToken.none())), prompt()));
+
+            assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -99,12 +140,12 @@ final class HttpSummaryModelTest {
     void summaryDoesNotClearCallerInterrupt() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> {
-                    if (!respondToCount(exchange, 2)) ModelAdapterTestSupport.sse(
+                    ModelAdapterTestSupport.sse(
                             exchange, openAiSummary(DOCUMENT, new ModelUsage(2, 1, 3)), 7);
                 });
              ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
             Thread.currentThread().interrupt();
             try {
                 SummaryGenerator.SummaryResult result = countedSummary(factory.bind(
@@ -121,21 +162,14 @@ final class HttpSummaryModelTest {
     @Test
     void summarizesWithAnthropicStructuredMessages() throws Exception {
         AtomicReference<String> requestBody = new AtomicReference<>();
-        AtomicReference<String> countBody = new AtomicReference<>();
         AtomicReference<String> apiKey = new AtomicReference<>();
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
-            if (isCount(exchange)) {
-                countBody.set(new String(exchange.getRequestBody().readAllBytes(),
-                        java.nio.charset.StandardCharsets.UTF_8));
-                ModelAdapterTestSupport.json(exchange, 200, "{\"input_tokens\":12}");
-                return;
-            }
             requestBody.set(new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
             apiKey.set(exchange.getRequestHeaders().getFirst("x-api-key"));
             ModelAdapterTestSupport.sse(exchange, anthropicSummary(DOCUMENT, 12, 5), 5);
         }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.ANTHROPIC, ModelPort.Api.ANTHROPIC_MESSAGES);
+                    server.baseUri(), ModelPort.Api.ANTHROPIC_MESSAGES);
             SummaryGenerator.SummaryResult result = countedSummary(
                     factory.bind(binding(configuration, CancellationToken.none())), prompt());
 
@@ -144,8 +178,7 @@ final class HttpSummaryModelTest {
             assertEquals("test-secret", apiKey.get());
             assertEquals(expectedAnthropicRequest(),
                     AbstractStreamingModelAdapter.JSON.readTree(requestBody.get()));
-            assertEquals(withoutStream(expectedAnthropicRequest()),
-                    AbstractStreamingModelAdapter.JSON.readTree(countBody.get()));
+            assertEquals(1, server.calls());
         }
     }
 
@@ -156,12 +189,12 @@ final class HttpSummaryModelTest {
                 "\\{", "{\"goals\":[{\"text\":\"private-summary-sentinel\",\"sourceOrdinal\":1}],");
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> {
-                    if (!respondToCount(exchange, 3)) ModelAdapterTestSupport.sse(
+                    ModelAdapterTestSupport.sse(
                             exchange, openAiSummary(duplicate, new ModelUsage(3, 2, 5)), 11);
                 });
              ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
 
             ContextException failure = assertThrows(ContextException.class, () ->
                     countedSummary(factory.bind(binding(configuration, CancellationToken.none())), prompt()));
@@ -169,7 +202,7 @@ final class HttpSummaryModelTest {
             assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
             assertFalse(failure.getMessage().contains("private-summary-sentinel"));
             assertNull(failure.getCause());
-            assertEquals(2, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -181,12 +214,12 @@ final class HttpSummaryModelTest {
         cancellation.cancel();
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> {
-                    if (!respondToCount(exchange, 1)) ModelAdapterTestSupport.sse(
+                    ModelAdapterTestSupport.sse(
                             exchange, openAiSummary(DOCUMENT, new ModelUsage(1, 1, 2)), 8);
                 });
              ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
 
             assertThrows(CancellationException.class,
                     () -> countedSummary(factory.bind(binding(configuration, cancellation)), prompt()));
@@ -200,13 +233,11 @@ final class HttpSummaryModelTest {
         CountDownLatch responseStarted = new CountDownLatch(1);
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> {
-                    if (!respondToCount(exchange, 1)) {
-                        ModelAdapterTestSupport.stallingSse(exchange, responseStarted);
-                    }
+                    ModelAdapterTestSupport.stallingSse(exchange, responseStarted);
                 });
              ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
             SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
                     "thread-1", configuration, NOW.plusMillis(250), CancellationToken.none());
 
@@ -216,7 +247,7 @@ final class HttpSummaryModelTest {
             assertTrue(responseStarted.await(1, TimeUnit.SECONDS));
             assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
             assertNull(failure.getCause());
-            assertEquals(2, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -228,7 +259,7 @@ final class HttpSummaryModelTest {
                         exchange, openAiSummary(DOCUMENT, new ModelUsage(1, 1, 2)), 8));
              ModelAdapterFactory factory = new ModelAdapterFactory(new ExpiringClock())) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
             SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
                     "thread-1", configuration, NOW.plusMillis(250), CancellationToken.none());
 
@@ -244,8 +275,7 @@ final class HttpSummaryModelTest {
     @Test
     void retriesTransientStatusBeforeStructuredOutput() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
-            if (respondToCount(exchange, 4)) return;
-            if (call == 2) {
+            if (call == 1) {
                 ModelAdapterTestSupport.status(exchange, 503);
             } else {
                 ModelAdapterTestSupport.sse(
@@ -253,13 +283,13 @@ final class HttpSummaryModelTest {
             }
         }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
 
             SummaryGenerator.SummaryResult result = countedSummary(factory.bind(
                     binding(configuration, CancellationToken.none())), prompt());
 
             assertDocument(result.document());
-            assertEquals(3, server.calls());
+            assertEquals(2, server.calls());
         }
     }
 
@@ -276,46 +306,26 @@ final class HttpSummaryModelTest {
                 """.formatted(ModelAdapterTestSupport.openAiResponse("resp_partial", "in_progress"));
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> {
-                    if (!respondToCount(exchange, 1)) ModelAdapterTestSupport.sse(exchange, partial, 3);
+                    ModelAdapterTestSupport.sse(exchange, partial, 3);
                 });
              ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(
-                    server.baseUri(), ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES);
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
 
             ContextException failure = assertThrows(ContextException.class, () ->
                     countedSummary(factory.bind(binding(configuration, CancellationToken.none())), prompt()));
 
             assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
             assertNull(failure.getCause());
-            assertEquals(2, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
-    /** 先执行官方计量再发送同一提示，匹配生产 Summary 的失败关闭准入顺序。 */
+    /** 先执行纯本地保守估算再发送同一冻结提示，匹配生产 Summary 的预算准入顺序。 */
     private static SummaryGenerator.SummaryResult countedSummary(
             SummaryModel model, SummaryModel.SummaryPrompt prompt) {
-        model.countInputTokens(prompt);
+        model.estimateInputTokens(prompt);
         return model.summarize(prompt);
-    }
-
-    /** 识别两家 Provider 的官方计量端点并返回最小合法响应。 */
-    private static boolean respondToCount(ModelAdapterTestSupport.Exchange exchange, long inputTokens) {
-        if (!isCount(exchange)) return false;
-        ModelAdapterTestSupport.json(exchange, 200, "{\"input_tokens\":" + inputTokens + "}");
-        return true;
-    }
-
-    /** 只按官方端点路径识别计量请求，避免测试依赖调用次序。 */
-    private static boolean isCount(ModelAdapterTestSupport.Exchange exchange) {
-        return exchange.getRequestURI().getPath().endsWith("/input_tokens")
-                || exchange.getRequestURI().getPath().endsWith("/count_tokens");
-    }
-
-    /** 官方计量正文只允许从冻结发送正文移除 stream，所有 Token 相关字段必须保持相等。 */
-    private static JsonNode withoutStream(JsonNode send) {
-        com.fasterxml.jackson.databind.node.ObjectNode count = send.deepCopy();
-        count.remove("stream");
-        return count;
     }
 
     /** 构造冻结 Turn 绑定，并确保生成的诊断始终隐藏 secret。 */
@@ -327,7 +337,7 @@ final class HttpSummaryModelTest {
         return binding;
     }
 
-    /** 为两种 Provider 请求映射 fixture 创建同一份显式摘要 prompt。 */
+    /** 为不同 API 请求映射 fixture 创建同一份显式摘要 prompt。 */
     private static SummaryModel.SummaryPrompt prompt() {
         SummaryDocument previous = new SummaryDocument(
                 List.of(new SummaryDocument.Fact("prior", 1)), List.of(), List.of(), List.of(), List.of(),
@@ -335,15 +345,15 @@ final class HttpSummaryModelTest {
         ContextMessage message = ContextMessage.text(
                 "message-1", "turn-1", 1, ContextMessage.Role.USER, "source evidence", 4);
         return new SummaryModel.SummaryPrompt(
-                "ja-context-summary-v2", "strategy-v1", "thread-1",
+                "ja-context-summary-v1", "strategy-v1", "thread-1",
                 Optional.of(previous), List.of(message), Optional.empty(), 500, List.of());
     }
 
     /** 创建输出上限更高的原生 Provider/Model 快照，使 prompt 预留成为最终上限。 */
     private static ModelPort.ModelConfiguration configuration(
-            URI baseUri, ModelPort.Provider provider, ModelPort.Api api) {
+            URI baseUri, ModelPort.Api api) {
         return new ModelPort.ModelConfiguration(
-                "provider_test", "model_test", "cfg_test", provider, api, "test-model",
+                "provider_test", "model_test", "cfg_test", api, "test-model",
                 baseUri, "test-secret",
                 Duration.ofSeconds(2), Duration.ofSeconds(20),
                 java.util.Set.of(ModelPort.InputModality.TEXT),
@@ -372,6 +382,19 @@ final class HttpSummaryModelTest {
                 """.formatted(
                 ModelAdapterTestSupport.openAiResponse("resp_summary", "in_progress"), delta, delta,
                 ModelAdapterTestSupport.openAiResponse("resp_summary", "completed", usage, output));
+    }
+
+    /** 生成 data-only Chat Summary 流，并允许用 null 明确构造 usage 缺失场景。 */
+    private static String openAiChatSummary(String document, ModelUsage usage) throws IOException {
+        String delta = AbstractStreamingModelAdapter.JSON.writeValueAsString(document);
+        String usageJson = usage == null ? "" : ",\"usage\":{"
+                + "\"prompt_tokens\":" + usage.inputTokens()
+                + ",\"completion_tokens\":" + usage.outputTokens()
+                + ",\"total_tokens\":" + usage.totalTokens() + "}";
+        return "data: {\"id\":\"chatcmpl_summary\",\"object\":\"chat.completion.chunk\","
+                + "\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,"
+                + "\"delta\":{\"content\":" + delta + "},\"finish_reason\":\"stop\"}]"
+                + usageJson + "}\n\ndata: [DONE]\n\n";
     }
 
     /** 生成最小完整 Messages 流，并将结构化 JSON 作为单个文本块携带。 */
@@ -436,7 +459,7 @@ final class HttpSummaryModelTest {
         return root;
     }
 
-    /** 构造两种 Provider fixture 共用的 Summary v2 事实与退休严格 Schema。 */
+    /** 构造两种 Provider fixture 共用的 Summary v1 事实与退休严格 Schema。 */
     private static JsonNode expectedSchema() {
         com.fasterxml.jackson.databind.node.ObjectNode schema =
                 AbstractStreamingModelAdapter.JSON.createObjectNode();
@@ -468,7 +491,7 @@ final class HttpSummaryModelTest {
     /** 冻结作为 Provider 单个用户输入字符串携带的带版本证据 JSON。 */
     private static String expectedPayload() throws IOException {
         String expected = """
-                {"promptVersion":"ja-context-summary-v2","strategyVersion":"strategy-v1",
+                {"promptVersion":"ja-context-summary-v1","strategyVersion":"strategy-v1",
                 "threadId":"thread-1","maxOutputTokens":500,"violations":[],"previousSummary":{
                 "goals":[{"text":"prior","sourceOrdinal":1}],"constraints":[],"completedProgress":[],
                 "currentProgress":[],"blockers":[],"decisions":[],"nextSteps":[],"criticalFacts":[],

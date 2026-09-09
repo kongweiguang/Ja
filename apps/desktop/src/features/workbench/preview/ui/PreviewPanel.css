@@ -150,3 +150,159 @@
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
 }
+
+/* 附件模式使用单一实色内容面；只有紧凑工具栏承担控制层，不叠加装饰卡片。 */
+.ja-preview-panel[data-preview-mode="attachment"] {
+  gap: 0;
+  padding: 0;
+}
+.ja-attachment-preview {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ja-background);
+}
+.ja-attachment-preview-toolbar {
+  display: flex;
+  min-width: 0;
+  min-height: 2.45rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.28rem;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0.25rem 0.4rem;
+  background: color-mix(in srgb, var(--ja-surface) 90%, transparent);
+}
+.ja-attachment-preview-toolbar h2 {
+  min-width: 2rem;
+  flex: 1;
+  overflow: hidden;
+  margin: 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-caption-size);
+  font-weight: 600;
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-attachment-preview-toolbar h2:focus-visible {
+  border-radius: 0.25rem;
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+.ja-attachment-preview-zoom {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.06rem;
+}
+.ja-attachment-preview-zoom output {
+  width: 2.8rem;
+  color: var(--ja-foreground-muted);
+  font: var(--ja-text-caption-size) / var(--ja-line-caption) var(--ja-font-mono);
+  text-align: center;
+}
+.ja-attachment-preview-state {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  align-content: center;
+  justify-self: stretch;
+}
+.ja-attachment-preview-state button {
+  min-width: 4rem;
+  min-height: 1.9rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground);
+  background: var(--ja-surface);
+  cursor: pointer;
+}
+.ja-attachment-image-stage {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: clamp(0.5rem, 2vw, 1.25rem);
+  background: var(--ja-background);
+  overscroll-behavior: contain;
+}
+.ja-attachment-image-stage img {
+  display: block;
+  flex: 0 0 auto;
+  border-radius: 0.35rem;
+  box-shadow: 0 0.4rem 1.5rem color-mix(in srgb, var(--ja-foreground) 16%, transparent);
+  image-rendering: auto;
+  user-select: none;
+}
+.ja-attachment-image-stage[data-zoom-mode="fit"] img {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 100%;
+  object-fit: contain;
+}
+.ja-attachment-text-preview {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ja-background);
+}
+.ja-attachment-preview-notice {
+  margin: 0;
+  border-bottom: 1px solid var(--ja-border);
+  padding: 0.32rem 0.65rem;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-attachment-text-preview .ja-editor-toolbar {
+  min-height: 2rem;
+}
+
+@media (max-width: 32rem) {
+  .ja-attachment-preview-toolbar {
+    flex-wrap: wrap;
+  }
+  .ja-attachment-preview-toolbar h2 {
+    min-width: 0;
+  }
+  .ja-attachment-preview-zoom {
+    width: 100%;
+    justify-content: flex-end;
+    border-top: 1px solid var(--ja-border);
+    padding-top: 0.2rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-preview-icon-button,
+  .ja-attachment-image-stage img {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .ja-attachment-preview-toolbar,
+  .ja-attachment-preview-notice,
+  .ja-attachment-image-stage {
+    border-color: CanvasText;
+    background: Canvas;
+  }
+  .ja-attachment-image-stage img {
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
+}

@@ -2,16 +2,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import {
+  Archive,
   ChevronRight,
+  CircleAlert,
+  CircleMinus,
+  CirclePause,
+  CircleX,
+  LoaderCircle,
   MoreHorizontal,
   Pencil,
+  Pin,
+  PinOff,
   Plus,
   Search,
   Settings2,
   SquarePen,
   type LucideIcon,
 } from "lucide-react";
-import { useState, type ReactElement } from "react";
+import { memo, useState, type ReactElement, type ReactNode, type SyntheticEvent } from "react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -21,6 +29,10 @@ import {
   MenuContent,
   MenuItem,
   MenuTrigger,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Tooltip,
 } from "@/shared/ui/primitives";
 import { WorkspaceScopeRow } from "@/features/workspace";
 import type { DesktopPlatform, ThreadProjection } from "../domain/navigationModels";
@@ -38,16 +50,59 @@ interface NavigationProject {
   displayName: string;
 }
 
-/** 将 thread 状态映射为可见文案，避免只依赖彩色圆点表达活动状态。 */
-function threadStatus(status: ThreadProjection["status"]): string {
-  switch (status) {
-    case "active":
-      return "就绪";
-    case "archived":
-      return "已归档";
-    case "deleted":
-      return "已删除";
-  }
+/** 实时状态与未读提醒使用同一无障碍命名入口，但终态成功不冒充持续运行状态。 */
+function turnStatusLabel(status: NonNullable<ThreadProjection["latestTurnStatus"]>): string {
+  return {
+    queued: "等待回复",
+    running: "正在回复",
+    waiting_approval: "等待批准",
+    suspended: "回复已暂停",
+    completed: "有新回复",
+    failed: "回复失败",
+    cancelled: "回复已取消",
+  }[status];
+}
+
+/**
+ * 实时阶段与 cancelled 状态始终可见；completed/failed 只在服务端权威未读时提示。
+ * cancelled 的中性图标只说明最近结果，并不进入未读边界；Pin 同样保持独立语义。
+ */
+function ThreadTurnStatus({
+  thread,
+  active,
+}: {
+  thread: ThreadProjection;
+  active: boolean;
+}): ReactElement | null {
+  const status = thread.latestTurnStatus;
+  if (status === null || (["completed", "failed"].includes(status) && thread.latestTurnSeen))
+    return null;
+  const label = turnStatusLabel(status);
+  const Icon = {
+    queued: LoaderCircle,
+    running: LoaderCircle,
+    waiting_approval: CircleAlert,
+    suspended: CirclePause,
+    completed: undefined,
+    failed: CircleX,
+    cancelled: CircleMinus,
+  }[status];
+  return (
+    <Tooltip content={label}>
+      <span className={`ja-navigation-thread-state is-${status}`} role="img" aria-label={label}>
+        {Icon === undefined ? (
+          <span className="ja-navigation-thread-complete-dot" />
+        ) : (
+          <Icon aria-hidden="true" />
+        )}
+        {active ? (
+          <span className="ja-visually-hidden" aria-live="polite">
+            {label}
+          </span>
+        ) : null}
+      </span>
+    </Tooltip>
+  );
 }
 
 /** 描述顶层动作；主会话入口显示文字标签，搜索入口保持紧凑，避免混淆主次。 */
@@ -73,6 +128,8 @@ export interface NavigationSidebarProps {
   projectSectionCollapsed: boolean;
   historySectionCollapsed: boolean;
   runtimeLabel: string;
+  runtimeIssueReason?: string;
+  runtimeIssueContent?: ReactNode;
   runtimeTone: "ready" | "busy" | "warning" | "danger" | "idle";
   currentThreadId?: string;
   threads: ThreadProjection[];
@@ -88,6 +145,9 @@ export interface NavigationSidebarProps {
   onSelectConversation: (threadId: string) => void | Promise<void>;
   onOpenConversationSearch: () => void;
   onRenameConversation: (threadId: string, title: string) => Promise<void>;
+  onPinConversation: (threadId: string, pinned: boolean) => Promise<void>;
+  onArchiveConversation: (threadId: string) => Promise<void>;
+  mutatingThreadIds: readonly string[];
   onChooseProject: () => void | Promise<void>;
   onSelectGeneral: () => void | Promise<void>;
   onSelectProject: (workspaceId: string) => void | Promise<void>;
@@ -281,6 +341,9 @@ function HistoryRow({
   compact,
   onSelect,
   onRequestRename,
+  onPin,
+  onArchive,
+  pending,
   onRequestClose,
 }: {
   thread: ThreadProjection;
@@ -288,44 +351,108 @@ function HistoryRow({
   compact: boolean;
   onSelect: (threadId: string) => void | Promise<void>;
   onRequestRename: (thread: ThreadProjection) => void;
+  onPin: (threadId: string, pinned: boolean) => Promise<void>;
+  onArchive: (threadId: string) => Promise<void>;
+  pending: boolean;
   onRequestClose: () => void;
 }): ReactElement {
   const title = thread.title || "未命名对话";
-  const status = threadStatus(thread.status);
+  const canArchive =
+    thread.latestTurnStatus === null ||
+    ["completed", "failed", "cancelled"].includes(thread.latestTurnStatus);
+  const archiveLabel = canArchive ? "归档" : "回复结束后可归档";
+  const stopRowAction = (event: SyntheticEvent): void => event.stopPropagation();
   return (
-    <div className="ja-navigation-thread-row" data-active={active || undefined}>
+    <div
+      className="ja-navigation-thread-row"
+      data-active={active || undefined}
+      data-pending={pending || undefined}
+    >
       <button
         type="button"
         className="ja-navigation-thread"
         data-thread-id={thread.threadId}
         data-active={active || undefined}
         aria-current={active ? "page" : undefined}
-        title={actionTitle(`${title} · ${status}`)}
+        aria-label={title}
+        title={actionTitle(title)}
         onClick={() =>
           runNavigationAction(() => onSelect(thread.threadId), compact, onRequestClose)
         }
       >
-        <span className={`ja-navigation-thread-dot is-${thread.status}`} aria-hidden="true" />
         <span>{title}</span>
-        <small>{status}</small>
+        <span className="ja-navigation-thread-static" aria-hidden={false}>
+          {thread.pinned ? (
+            <Tooltip content="已置顶">
+              <span className="ja-navigation-thread-pin" role="img" aria-label="已置顶">
+                <Pin aria-hidden="true" />
+              </span>
+            </Tooltip>
+          ) : null}
+          <ThreadTurnStatus thread={thread} active={active} />
+        </span>
       </button>
-      <Menu>
-        <MenuTrigger asChild>
-          <IconButton
-            className="ja-navigation-thread-menu"
-            label={`对话菜单：${title}`}
-            tooltip="对话菜单"
-          >
-            <MoreHorizontal aria-hidden="true" />
-          </IconButton>
-        </MenuTrigger>
-        <MenuContent align="end">
-          <MenuItem onSelect={() => onRequestRename(thread)}>
-            <Pencil aria-hidden="true" />
-            重命名
-          </MenuItem>
-        </MenuContent>
-      </Menu>
+      <div
+        className="ja-navigation-thread-actions"
+        onClick={stopRowAction}
+        onPointerDown={stopRowAction}
+      >
+        <IconButton
+          className="ja-navigation-thread-action is-pin"
+          label={thread.pinned ? "取消置顶" : "置顶"}
+          tooltip={thread.pinned ? "取消置顶" : "置顶"}
+          aria-disabled={pending || undefined}
+          onClick={() => {
+            if (!pending) void onPin(thread.threadId, !thread.pinned);
+          }}
+        >
+          {thread.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
+        </IconButton>
+        <IconButton
+          className="ja-navigation-thread-action is-archive"
+          label={archiveLabel}
+          tooltip={archiveLabel}
+          aria-disabled={pending || !canArchive || undefined}
+          onClick={() => {
+            if (!pending && canArchive) void onArchive(thread.threadId);
+          }}
+        >
+          <Archive aria-hidden="true" />
+        </IconButton>
+        <Menu>
+          <MenuTrigger asChild>
+            <IconButton
+              className="ja-navigation-thread-action ja-navigation-thread-menu"
+              label={`对话菜单：${title}`}
+              tooltip="对话菜单"
+              aria-disabled={pending || undefined}
+            >
+              <MoreHorizontal aria-hidden="true" />
+            </IconButton>
+          </MenuTrigger>
+          <MenuContent align="end" onCloseAutoFocus={(event) => event.preventDefault()}>
+            <MenuItem
+              disabled={pending}
+              onSelect={() => void onPin(thread.threadId, !thread.pinned)}
+            >
+              {thread.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
+              {thread.pinned ? "取消置顶" : "置顶"}
+            </MenuItem>
+            <MenuItem disabled={pending} onSelect={() => onRequestRename(thread)}>
+              <Pencil aria-hidden="true" />
+              重命名
+            </MenuItem>
+            <MenuItem
+              disabled={pending || !canArchive}
+              title={canArchive ? undefined : archiveLabel}
+              onSelect={() => void onArchive(thread.threadId)}
+            >
+              <Archive aria-hidden="true" />
+              归档
+            </MenuItem>
+          </MenuContent>
+        </Menu>
+      </div>
     </div>
   );
 }
@@ -368,8 +495,14 @@ function SectionToggle({ title, open }: { title: string; open: boolean }): React
   );
 }
 
-/** 按 Codex 结构渲染侧栏：主工具栏、独立项目与最近历史，最后是 Runtime/Settings footer。 */
-export function NavigationSidebar(props: NavigationSidebarProps): ReactElement {
+/**
+ * 按 Codex 结构渲染侧栏，并用 props identity 隔离 Timeline 高频更新；真实目录、选择或状态变化
+ * 仍正常提交，流式正文与 Tool metadata 不应让整个导航树重复渲染或重启动画。
+ * 异常详情在状态旁按需打开并居中排版，悬停只解释原因，恢复操作仍由组合层持有。
+ */
+export const NavigationSidebar = memo(function NavigationSidebar(
+  props: NavigationSidebarProps,
+): ReactElement {
   const [renameThread, setRenameThread] = useState<ThreadProjection>();
   const topActions = buildTopActions(props);
   const settingsShortcut = navigationShortcut("open-settings", props.platform);
@@ -472,7 +605,7 @@ export function NavigationSidebar(props: NavigationSidebarProps): ReactElement {
             </div>
             <CollapsibleContent className="ja-navigation-section-content">
               <div className="ja-navigation-history-list" role="list" aria-label="最近对话列表">
-                {props.historyBusy ? (
+                {props.historyBusy && props.threads.length === 0 ? (
                   <p className="ja-navigation-empty" role="status">
                     正在读取会话…
                   </p>
@@ -495,6 +628,9 @@ export function NavigationSidebar(props: NavigationSidebarProps): ReactElement {
                       compact={props.compact}
                       onSelect={props.onSelectConversation}
                       onRequestRename={setRenameThread}
+                      onPin={props.onPinConversation}
+                      onArchive={props.onArchiveConversation}
+                      pending={props.mutatingThreadIds.includes(thread.threadId)}
                       onRequestClose={props.onRequestClose}
                     />
                   </div>
@@ -513,10 +649,35 @@ export function NavigationSidebar(props: NavigationSidebarProps): ReactElement {
           title={`本地运行时：${props.runtimeLabel}`}
         >
           <span className={`ja-navigation-status-dot is-${props.runtimeTone}`} aria-hidden="true" />
-          <span>
+          <span className="ja-navigation-runtime-label">
             <strong>本地运行时</strong>
             <small aria-live="polite">{props.runtimeLabel}</small>
           </span>
+          {props.runtimeIssueReason === undefined ? null : (
+            <Popover>
+              <Tooltip content={props.runtimeIssueReason}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="ja-navigation-runtime-issue"
+                    aria-label="运行时异常详情"
+                  >
+                    <CircleAlert aria-hidden="true" />
+                  </button>
+                </PopoverTrigger>
+              </Tooltip>
+              <PopoverContent
+                className="ja-navigation-runtime-popover"
+                side="top"
+                align="center"
+                sideOffset={10}
+                collisionPadding={12}
+                aria-label="运行时异常详情"
+              >
+                {props.runtimeIssueContent ?? props.runtimeIssueReason}
+              </PopoverContent>
+            </Popover>
+          )}
         </div>
         <button
           type="button"
@@ -544,4 +705,4 @@ export function NavigationSidebar(props: NavigationSidebarProps): ReactElement {
       />
     </aside>
   );
-}
+});

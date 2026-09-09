@@ -4,7 +4,6 @@
 package io.github.kongweiguang.ja.conversation.adapter.out.provider.openai;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ModelTransport;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderRequestEnvelope;
@@ -57,11 +56,25 @@ public final class OpenAiResponsesAdapter extends AbstractStreamingModelAdapter 
      */
     private static ModelPort.ModelConfiguration requireOpenAi(
             ModelPort.ModelConfiguration configuration) {
-        if (configuration == null || configuration.provider() != ModelPort.Provider.OPENAI
-            || configuration.api() != ModelPort.Api.OPENAI_RESPONSES) {
+        if (configuration == null || configuration.api() != ModelPort.Api.OPENAI_RESPONSES) {
             throw new IllegalArgumentException("OpenAI Responses configuration is required");
         }
         return configuration;
+    }
+
+    /**
+     * 对冻结 Responses envelope 执行纯本地保守估算，reasoning/cache 子项不会参与预算重复相加。
+     */
+    @Override
+    public ModelPort.InputTokenEstimate estimateInputTokens(
+            ModelPort.ModelRequest request,
+            io.github.kongweiguang.ja.foundation.concurrent.CancellationToken cancellationToken) {
+        java.util.Objects.requireNonNull(request, "request");
+        java.util.Objects.requireNonNull(cancellationToken, "cancellationToken");
+        cancellationToken.throwIfCancellationRequested();
+        return withFrozenEnvelope(request, () -> OpenAiResponsesCodec.encodeRequest(request),
+                frozen -> new ModelPort.InputTokenEstimate(
+                        frozen.inputTokenEstimate(), frozen.fingerprint()));
     }
 
     /**
@@ -70,78 +83,14 @@ public final class OpenAiResponsesAdapter extends AbstractStreamingModelAdapter 
     @Override
     protected ModelPort.ModelOutcome executeProviderAttempt(
             ModelPort.ModelRequest request, StreamContext context, RequestController controller) {
-        ProviderRequestEnvelope envelope = envelope(request, () -> OpenAiResponsesCodec.encodeRequest(request));
-        try {
-            return executeEncoded(envelope.sendBody(), context, controller);
-        } finally {
-            releaseEnvelope(request);
-        }
+        return withFrozenEnvelope(request, () -> OpenAiResponsesCodec.encodeRequest(request),
+                frozen -> executeEncoded(frozen, context, controller));
     }
 
-    /**
-     * 调用 Responses 官方 input_tokens 端点，并把权威计量与冻结 envelope 指纹绑定。
-     */
-    @Override
-    protected ModelPort.InputTokenCount executeProviderTokenCountAttempt(
-            ModelPort.ModelRequest request, RequestController controller) {
-        ProviderRequestEnvelope envelope = envelope(request, () -> OpenAiResponsesCodec.encodeRequest(request));
-        try {
-            return completeTokenCount(request, envelope,
-                    () -> executeJson(httpClient(),
-                            OpenAiProviderSupport.tokenCountPost(configuration(), envelope.countBody()),
-                            controller, OpenAiProviderSupport::tokenCountFailure), "OpenAI");
-        } catch (ProviderProtocolException failure) {
-            if (!"TOKEN_COUNT_UNSUPPORTED".equals(failure.code())) throw failure;
-            ProviderRequestEnvelope fallback = envelope(request,
-                    () -> OpenAiResponsesCodec.encodeRequest(withoutContinuation(request)));
-            return new ModelPort.InputTokenCount(
-                    fallback.conservativeInputTokenUpperBound(), fallback.fingerprint());
-        }
-    }
-
-    /**
-     * 通过唯一共享传输路径执行预编码的普通请求或 Summary 请求。
-     */
-    public ModelPort.ModelOutcome executeEncoded(
-            ObjectNode encoded, StreamContext context, RequestController controller) {
-        return executeEncoded(serializeRequest(encoded), context, controller);
-    }
-
-    /** 使用 Summary 已冻结的 envelope 发送，确保正式请求与先前官方计量共享同一 Token 正文。 */
+    /** 使用 Summary 已冻结的 envelope 发送，保持预算指纹与发送正文一致。 */
     public ModelPort.ModelOutcome executeEncoded(
             ProviderRequestEnvelope envelope, StreamContext context, RequestController controller) {
         return executeEncoded(envelope.sendBody(), context, controller);
-    }
-
-    /** 对 Summary 已冻结的 envelope 调用官方计量端点，不经过普通 Agent Codec 二次映射。 */
-    public ModelPort.InputTokenCount countEncoded(
-            ProviderRequestEnvelope envelope, RequestController controller) {
-        final com.fasterxml.jackson.databind.JsonNode response;
-        try {
-            response = executeJson(
-                    httpClient(), OpenAiProviderSupport.tokenCountPost(configuration(), envelope.countBody()),
-                    controller, OpenAiProviderSupport::tokenCountFailure);
-        } catch (ProviderProtocolException failure) {
-            if (!"TOKEN_COUNT_UNSUPPORTED".equals(failure.code())) throw failure;
-            return new ModelPort.InputTokenCount(
-                    envelope.conservativeInputTokenUpperBound(), envelope.fingerprint());
-        }
-        com.fasterxml.jackson.databind.JsonNode value = response.get("input_tokens");
-        if (value == null || !value.canConvertToLong() || value.longValue() < 0) {
-            throw new io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException(
-                    "TOKEN_COUNT_RESPONSE", "OpenAI token count response is invalid", false);
-        }
-        return new ModelPort.InputTokenCount(value.longValue(), envelope.fingerprint());
-    }
-
-    /**
-     * 在代理缺少官方计量能力时移除不透明续接，确保保守字节上界覆盖实际发送的全部历史，
-     * 而不是只覆盖 previous_response_id 之后的 Tool 结果。
-     */
-    private static ModelPort.ModelRequest withoutContinuation(ModelPort.ModelRequest request) {
-        return new ModelPort.ModelRequest(
-                request.configuration(), request.prompt(), request.messages(), request.tools(), null,
-                request.round(), request.retryPolicy());
     }
 
     /**

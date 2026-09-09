@@ -1,6 +1,6 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""运行唯一的 JA-RPC v2 跨语言语料门禁。"""
+"""运行唯一的 JA-RPC v1 跨语言语料门禁。"""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def main() -> int:
                         "-ntp",
                         "-f",
                         str(ROOT / "app-server" / "pom.xml"),
-                        "-Dja.build.directory=target-rpc-v2-contract",
+                        "-Dja.build.directory=target-rpc-v1-contract",
                         "-Dtest=GoldenCorpusTest",
                         "test",
                     ),

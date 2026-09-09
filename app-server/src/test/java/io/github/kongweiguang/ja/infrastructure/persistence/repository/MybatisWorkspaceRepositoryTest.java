@@ -27,7 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
-import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.runtime;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.binding;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -101,22 +102,23 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
                     preferences("provider_tool", "model_tool"), START));
             ConversationRepository.AdmissionReceipt admission = store.admit(
                     new ConversationRepository.TurnAdmission(
-                            "thr_tool", "turn_tool", runtime("provider_tool", "model_tool", "cfg_tool"),
+                            "thr_tool", "turn_tool",
                             "item_user_tool",
                             new ModelMessage(ModelRole.USER, List.of(new TextContent("运行命令"))),
-                            List.of(), 0, START));
+                            List.of(), 0, START, execution("cfg_tool")));
             store.commit(new ConversationRepository.CommitRequest(
                     "thr_tool", "turn_tool", TurnState.RUNNING,
                     List.of(
                             new ConversationRepository.ToolPreparedFact(
                                     "call_tool", "shell", JsonObjects.builder()
                                      .put("argv", new JsonArray(List.of(new JsonText("pwsh.exe")))).build(), 0,
-                                     ToolSideEffect.EXTERNAL, presentation(ToolPresentation.Status.PENDING)),
+                                     ToolSideEffect.EXTERNAL, presentation(ToolPresentation.Status.PENDING),
+                                     binding("batch_fixture", "call_tool", "shell")),
                             new ConversationRepository.ToolStartedFact("call_tool"),
                              new ConversationRepository.ToolResultFact(
                                      "call_tool", ToolState.FAILED, "", true,
                                      presentation(ToolPresentation.Status.ERROR), "")),
-                    admission.turnMutationVersion(), START.plusSeconds(1)));
+                    admission.turnMutationVersion(), START.plusSeconds(1), execution("cfg_tool")));
 
             ThreadSnapshot snapshot = history.readThread("thr_tool", null, 20).orElseThrow();
             ThreadSnapshot.ToolItem call = snapshot.items().stream()

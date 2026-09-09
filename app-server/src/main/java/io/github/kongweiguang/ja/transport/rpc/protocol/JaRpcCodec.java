@@ -23,30 +23,23 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * 为刻意收窄的 {@code ja-rpc/v2} 信封集合提供严格 UTF-8 JSONL 编解码。
+ * 为刻意收窄的 {@code ja-rpc/v1} 信封集合提供严格 UTF-8 JSONL 编解码。
  */
 public final class JaRpcCodec {
     public static final int DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
     private static final Set<String> REQUEST_FIELDS = Set.of("jsonrpc", "id", "method", "params");
     private static final Set<String> NOTIFICATION_FIELDS = Set.of("jsonrpc", "method", "params");
     private static final Set<String> RESPONSE_FIELDS = Set.of("jsonrpc", "id", "result", "error");
-    private static final Set<String> CLIENT_METHODS = Set.of(
-            "runtime/initialize", "runtime/health", "runtime/shutdown",
-            "workspace/open", "workspace/open-general", "workspace/list", "workspace/set-trust", "workspace/unregister",
-            "thread/create", "thread/list", "thread/search", "thread/read", "thread/rename",
-            "thread/preferences/update", "thread/archive", "thread/delete", "thread/compact",
-            "turn/change-set/commit", "turn/change-set/read", "tool/artifact/read",
-            "attachment/import", "attachment/discard",
-            "turn/start", "turn/cancel", "turn/steer", "turn/follow-up", "approval/respond",
-            "configuration/read", "configuration/patch",
-            "configuration/replace", "configuration/reset", "credential/set", "credential/delete", "skill/list", "mcp/list", "mcp/test",
-            "model/test", "mcp/list-tools");
+    private static final Set<String> CLIENT_METHODS = RpcMethod.wireNames();
     private static final Set<String> SERVER_NOTIFICATIONS = Set.of(
             "runtime/initialized", "runtime/status-changed", "turn/state-changed", "assistant/model-step-committed",
-            "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/batch-committed",
+            "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",
             "approval/requested", "approval/resolved", "context/compaction-started", "context/compacted",
             "context/compaction-failed",
-            "workspace/dirty", "turn/terminal", "thread/metadata-changed", "configuration/changed");
+            "workspace/dirty", "turn/input-queue-changed", "turn/input-consumed", "turn/terminal",
+            "thread/metadata-changed", "configuration/changed",
+            "task/activity", "task/progress", "task/mailbox-changed",
+            "goal/changed", "goal/activity", "goal/input-requested");
 
     private final ObjectMapper mapper;
     private final int maxFrameBytes;
@@ -188,7 +181,7 @@ public final class JaRpcCodec {
     }
 
     /**
-     * 要求字段为 ObjectNode，因为每个 v2 方法都拥有具名且经 Schema 校验的参数或结果结构。
+     * 要求字段为 ObjectNode，因为每个首版 v1 方法都拥有具名且经 Schema 校验的参数或结果结构。
      */
     private static ObjectNode object(ObjectNode envelope, String field) {
         JsonNode value = envelope.get(field);

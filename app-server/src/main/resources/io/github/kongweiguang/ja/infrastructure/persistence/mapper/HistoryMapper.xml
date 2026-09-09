@@ -14,10 +14,14 @@
       <arg column="thread_id" javaType="string"/><arg column="workspace_id" javaType="string"/>
       <arg column="title" javaType="string"/><arg column="provider_id" javaType="string"/>
       <arg column="model_id" javaType="string"/><arg column="reasoning_level" javaType="string"/>
-      <arg column="access_mode" javaType="string"/><arg column="title_source" javaType="string"/>
+      <arg column="access_mode" javaType="string"/><arg column="collaboration_mode" javaType="string"/>
+      <arg column="title_source" javaType="string"/>
       <arg column="revision" javaType="_long"/><arg column="created_at" javaType="string"/>
-      <arg column="updated_at" javaType="string"/><arg column="archived_at" javaType="string"/>
-      <arg column="deleted_at" javaType="string"/>
+      <arg column="updated_at" javaType="string"/><arg column="pinned_at" javaType="string"/>
+      <arg column="archived_at" javaType="string"/><arg column="deleted_at" javaType="string"/>
+      <arg column="latest_turn_status" javaType="string"/>
+      <arg column="latest_turn_seen" javaType="_boolean"/>
+      <arg column="active_goal_id" javaType="string"/>
     </constructor>
   </resultMap>
   <resultMap id="snapshotItemRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SnapshotItemRow">
@@ -27,23 +31,27 @@
       <arg column="call_id" javaType="string"/><arg column="tool_name" javaType="string"/>
       <arg column="tool_ordinal" javaType="java.lang.Long"/><arg column="tool_state" javaType="string"/>
       <arg column="message_kind" javaType="string"/><arg column="public_text" javaType="string"/>
+      <arg column="blocks_json" javaType="string"/>
       <arg column="model_round" javaType="java.lang.Long"/><arg column="presentation_json" javaType="string"/>
       <arg column="approval_id" javaType="string"/><arg column="decision" javaType="string"/>
       <arg column="expires_at" javaType="string"/>
-      <arg column="attachment_id" javaType="string"/><arg column="display_name" javaType="string"/>
-      <arg column="size_bytes" javaType="java.lang.Long"/><arg column="media_kind" javaType="string"/>
-      <arg column="media_type" javaType="string"/><arg column="attachment_state" javaType="string"/>
+      <arg column="attachments_json" javaType="string"/>
     </constructor>
   </resultMap>
   <resultMap id="contextUsageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ContextUsageRow">
     <constructor>
-      <arg column="turn_id" javaType="string"/><arg column="model_round" javaType="_long"/>
-      <arg column="input_tokens" javaType="_long"/><arg column="output_tokens" javaType="_long"/>
-      <arg column="total_tokens" javaType="_long"/><arg column="occurred_at" javaType="string"/>
+      <arg column="turn_id" javaType="string"/><arg column="request_id" javaType="string"/>
+      <arg column="model_round" javaType="_long"/><arg column="request_ordinal" javaType="_int"/>
+      <arg column="purpose" javaType="string"/><arg column="certainty" javaType="string"/>
+      <arg column="profile_json" javaType="string"/>
+      <arg column="input_tokens" javaType="java.lang.Long"/>
+      <arg column="output_tokens" javaType="java.lang.Long"/><arg column="total_tokens" javaType="java.lang.Long"/>
+      <arg column="occurred_at" javaType="string"/>
     </constructor>
   </resultMap>
   <resultMap id="changeSetArtifactRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetArtifactRow">
-    <constructor><arg column="artifact_id" javaType="string"/><arg column="content" javaType="string"/>
+    <constructor><arg column="artifact_id" javaType="string"/><arg column="sha256" javaType="string"/>
+      <arg column="content" javaType="string"/>
       <arg column="byte_length" javaType="_long"/></constructor>
   </resultMap>
   <select id="selectWorkspace" resultMap="workspaceRow">
@@ -70,15 +78,21 @@
       AND NOT EXISTS(SELECT 1 FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL)
   </delete>
   <select id="selectThread" resultMap="threadRow">
-    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
-      revision,created_at,updated_at,archived_at,deleted_at
+    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+      revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
+      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+      COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
+        WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+      (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
+        AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
     FROM threads WHERE thread_id=#{threadId} AND deleted_at IS NULL
   </select>
   <insert id="insertThread">
-    INSERT INTO threads(thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
+    INSERT INTO threads(thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,
+      collaboration_mode,title_source,
       revision,created_at,updated_at)
     VALUES(#{threadId},#{workspaceId},#{title},#{providerId},#{modelId},#{reasoningLevel},#{accessMode},
-      #{titleSource},0,#{createdAt},#{createdAt})
+      #{collaborationMode},#{titleSource},0,#{createdAt},#{createdAt})
   </insert>
   <update id="compareAndSetThread">
     UPDATE threads SET revision=revision+1,updated_at=#{occurredAt}
@@ -92,16 +106,36 @@
     UPDATE threads SET revision=revision+1,updated_at=#{occurredAt} WHERE thread_id=#{threadId} AND deleted_at IS NULL
   </update>
   <select id="selectThreadPage" resultMap="threadRow">
-    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
-      revision,created_at,updated_at,archived_at,deleted_at
-    FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL
-    <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND thread_id&lt;#{cursorId}))</if>
-    ORDER BY updated_at DESC,thread_id DESC LIMIT #{limit}
+    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+      revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
+      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+      COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
+        WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+      (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
+        AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
+    FROM threads WHERE workspace_id=#{workspaceId} AND archived_at IS NULL AND deleted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM thread_lineage WHERE child_thread_id=threads.thread_id)
+    <if test="cursorPinned != null">AND (
+      (CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END)&lt;#{cursorPinned}
+      OR ((CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END)=#{cursorPinned} AND (
+        COALESCE(pinned_at,updated_at)&lt;#{cursorSortTime}
+        OR (COALESCE(pinned_at,updated_at)=#{cursorSortTime} AND updated_at&lt;#{cursorUpdatedAt})
+        OR (COALESCE(pinned_at,updated_at)=#{cursorSortTime} AND updated_at=#{cursorUpdatedAt} AND thread_id&lt;#{cursorId})
+      ))
+    )</if>
+    ORDER BY CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END DESC,
+      COALESCE(pinned_at,updated_at) DESC,updated_at DESC,thread_id DESC LIMIT #{limit}
   </select>
   <select id="searchThreadPage" resultMap="threadRow">
-    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,title_source,
-      revision,created_at,updated_at,archived_at,deleted_at
+    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+      revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
+      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+      COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
+        WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+      (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
+        AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
     FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM thread_lineage WHERE child_thread_id=threads.thread_id)
     <if test="normalizedQuery != ''">AND instr(lower(title),#{normalizedQuery})&gt;0</if>
     <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND thread_id&lt;#{cursorId}))</if>
     ORDER BY updated_at DESC,thread_id DESC LIMIT #{limit}
@@ -120,54 +154,105 @@
   </update>
   <update id="compareAndSetThreadPreferences">
     UPDATE threads SET provider_id=#{providerId},model_id=#{modelId},reasoning_level=#{reasoningLevel},
-      access_mode=#{accessMode},revision=revision+1,updated_at=#{occurredAt}
+      access_mode=#{accessMode},collaboration_mode=#{collaborationMode},revision=revision+1,updated_at=#{occurredAt}
     WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
   </update>
   <update id="compareAndSetThreadAdmission">
     UPDATE threads SET provider_id=#{providerId},model_id=#{modelId},reasoning_level=#{reasoningLevel},
-      access_mode=#{accessMode},
+      access_mode=#{accessMode},collaboration_mode=#{collaborationMode},
       <if test="provisionalTitle != null">title=#{provisionalTitle},</if>
       revision=revision+1,updated_at=#{occurredAt}
     WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
     <if test="provisionalTitle != null">AND title_source='PLACEHOLDER'</if>
   </update>
-  <update id="updateThreadLifecycle">
-    UPDATE threads
-    <choose><when test="delete == true">SET deleted_at=#{occurredAt},</when><otherwise>SET archived_at=#{occurredAt},</otherwise></choose>
+  <update id="compareAndSetThreadPin">
+    UPDATE threads SET pinned_at=#{pinnedAt},revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision}
+      AND archived_at IS NULL AND deleted_at IS NULL
+  </update>
+  <update id="compareAndSetThreadSeen">
+    UPDATE threads SET last_seen_turn_sequence=(
+        SELECT turn_sequence FROM turns WHERE turns.thread_id=threads.thread_id
+        ORDER BY turn_sequence DESC LIMIT 1),
       revision=revision+1,updated_at=#{occurredAt}
     WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
+      AND (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id
+        ORDER BY turn_sequence DESC LIMIT 1) IN ('COMPLETED','FAILED')
+      AND COALESCE(last_seen_turn_sequence,0)&lt;(
+        SELECT turn_sequence FROM turns WHERE turns.thread_id=threads.thread_id
+        ORDER BY turn_sequence DESC LIMIT 1)
+  </update>
+  <update id="updateThreadLifecycle">
+    UPDATE threads
+    <choose><when test="delete == true">SET deleted_at=#{occurredAt},pinned_at=NULL,</when><otherwise>SET archived_at=#{occurredAt},pinned_at=NULL,</otherwise></choose>
+      revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
+      <if test="delete == false">AND archived_at IS NULL</if>
+      <if test="delete == true">AND NOT EXISTS (
+        SELECT 1 FROM thread_lineage
+        WHERE child_thread_id=#{threadId} OR parent_thread_id=#{threadId}
+      )</if>
+  </update>
+  <update id="restoreThread">
+    UPDATE threads SET archived_at=NULL,pinned_at=NULL,revision=revision+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND revision=#{expectedRevision}
+      AND archived_at IS NOT NULL AND deleted_at IS NULL
   </update>
   <select id="countActiveTurns" resultType="int">
-    SELECT COUNT(*) FROM turns WHERE thread_id=#{threadId} AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+    SELECT COUNT(*) FROM turns WHERE thread_id=#{threadId}
+      AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL','SUSPENDED')
   </select>
+  <!-- 同一提交的摘要/正文先于 Tool，Tool 使用原始 ordinal；游标从原条目还原相同排序键，避免随机 ID 颠倒因果或分页漏行。 -->
   <select id="selectSnapshotItems" resultMap="snapshotItemRow">
-    SELECT * FROM (
-      SELECT item_id,'message' AS item_kind,created_at,turn_id,NULL AS call_id,NULL AS tool_name,
-        NULL AS tool_ordinal,NULL AS tool_state,message_kind,public_text,model_round,NULL AS presentation_json,
-        NULL AS approval_id,NULL AS decision,
-        NULL AS expires_at,NULL AS attachment_id,NULL AS display_name,NULL AS size_bytes,NULL AS media_kind,
-        NULL AS media_type,NULL AS attachment_state
-      FROM timeline_messages WHERE thread_id=#{threadId}
+    WITH items AS (
+      SELECT tm.item_id,'message' AS item_kind,tm.created_at,tm.turn_id,NULL AS call_id,NULL AS tool_name,
+        NULL AS tool_ordinal,NULL AS tool_state,tm.message_kind,tm.public_text,m.blocks_json,tm.model_round,
+        NULL AS presentation_json,
+        NULL AS approval_id,NULL AS decision,NULL AS expires_at,
+        CASE WHEN tm.message_kind='USER_INPUT' THEN COALESCE((
+          SELECT json_group_array(json_object(
+            'attachmentId',ordered.attachment_id,'displayName',ordered.display_name,
+            'sizeBytes',ordered.size_bytes,'mediaKind',lower(ordered.media_kind),
+            'mediaType',ordered.media_type))
+          FROM (SELECT ma.attachment_id,a.display_name,a.size_bytes,a.media_kind,a.media_type
+                FROM message_attachments ma JOIN attachments a ON a.attachment_id=ma.attachment_id
+                WHERE ma.message_id=tm.item_id ORDER BY ma.ordinal) ordered
+        ),json_array()) ELSE NULL END AS attachments_json
+      FROM timeline_messages tm LEFT JOIN messages m ON m.message_id=tm.item_id
+      WHERE tm.thread_id=#{threadId}
       UNION ALL SELECT call_id||'_call','tool_call',created_at,turn_id,call_id,tool_name,ordinal,state,
-        NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL FROM tools WHERE thread_id=#{threadId}
+        NULL,NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL FROM tools WHERE thread_id=#{threadId}
       UNION ALL SELECT a.approval_id,'approval',a.requested_at,a.turn_id,a.call_id,t.tool_name,NULL,NULL,
-        NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at,NULL,NULL,NULL,NULL,NULL,NULL
+        NULL,NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at,NULL
         FROM approvals a JOIN tools t ON t.turn_id=a.turn_id AND t.call_id=a.call_id
         WHERE a.thread_id=#{threadId}
-      UNION ALL SELECT ta.attachment_id||'_attachment','attachment',ta.created_at,ta.turn_id,
-        NULL,NULL,ta.ordinal,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,a.attachment_id,a.display_name,a.size_bytes,
-        lower(a.media_kind),a.media_type,lower(a.status)
-        FROM turn_attachments ta JOIN turns t ON t.turn_id=ta.turn_id
-          JOIN attachments a ON a.attachment_id=ta.attachment_id
-        WHERE t.thread_id=#{threadId}
-    ) items
-    <if test="cursorTime != null">WHERE created_at&gt;#{cursorTime} OR (created_at=#{cursorTime} AND item_id&gt;#{cursorId})</if>
-    ORDER BY created_at,item_id LIMIT #{limit}
+    ), ordered_items AS (
+      SELECT items.*, CASE
+        WHEN message_kind='USER_INPUT' THEN 0
+        WHEN message_kind='REASONING_SUMMARY' THEN 1
+        WHEN message_kind='ASSISTANT_PROGRESS' THEN 2
+        WHEN item_kind='tool_call' THEN 3
+        WHEN item_kind='approval' THEN 4
+        ELSE 5 END AS semantic_order,
+        COALESCE(tool_ordinal,-1) AS ordinal_order
+      FROM items
+    )
+    SELECT * FROM ordered_items
+    <if test="cursorTime != null">
+      WHERE (created_at,semantic_order,ordinal_order,item_id)&gt;(
+        #{cursorTime},
+        (SELECT semantic_order FROM ordered_items WHERE item_id=#{cursorId}),
+        (SELECT ordinal_order FROM ordered_items WHERE item_id=#{cursorId}),
+        #{cursorId})
+    </if>
+    ORDER BY created_at,semantic_order,ordinal_order,item_id LIMIT #{limit}
   </select>
   <select id="selectLatestContextUsage" resultMap="contextUsageRow">
-    SELECT turn_id,model_round,input_tokens,output_tokens,total_tokens,created_at AS occurred_at
-    FROM usage WHERE thread_id=#{threadId}
-    ORDER BY created_at DESC,model_round DESC,usage_id DESC LIMIT 1
+    SELECT u.turn_id,u.request_id,u.model_round,u.request_ordinal,u.purpose,u.certainty,
+      u.profile_json,u.input_tokens,u.output_tokens,u.total_tokens,u.created_at AS occurred_at
+    FROM usage u JOIN turns x ON x.turn_id=u.turn_id
+    WHERE u.thread_id=#{threadId}
+    ORDER BY x.turn_sequence DESC,u.request_ordinal DESC,u.usage_id DESC LIMIT 1
   </select>
   <insert id="insertChangeSet">
     INSERT INTO turn_change_sets(thread_id,turn_id,workspace_id,change_set_json,artifact_id,committed_at)
@@ -181,7 +266,10 @@
     VALUES(#{artifactId},#{threadId},#{turnId},#{unifiedDiff},#{sha256},#{byteLength},#{occurredAt})
   </insert>
   <select id="selectChangeSetArtifact" resultMap="changeSetArtifactRow">
-    SELECT artifact_id,content,byte_length FROM change_set_artifacts
-    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND artifact_id=#{artifactId}
+    SELECT a.artifact_id,a.sha256,a.content,a.byte_length FROM change_set_artifacts a
+    JOIN threads t ON t.thread_id=a.thread_id AND t.deleted_at IS NULL
+    JOIN turns x ON x.turn_id=a.turn_id AND x.thread_id=a.thread_id
+    WHERE a.thread_id=#{threadId} AND a.turn_id=#{turnId} AND a.artifact_id=#{artifactId}
+      AND x.state IN ('COMPLETED','FAILED','CANCELLED')
   </select>
 </mapper>

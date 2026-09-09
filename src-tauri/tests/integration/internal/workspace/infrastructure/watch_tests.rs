@@ -130,6 +130,30 @@ fn event_collection_coalesces_duplicate_paths_and_errors() {
     assert!(requires_rescan);
 }
 
+/// 高频构建目录事件必须在进入有界队列前被移除，源码事件仍保留原始 notify 语义。
+#[test]
+fn generated_events_are_filtered_before_queueing() {
+    let root = if cfg!(windows) {
+        PathBuf::from(r"C:\workspace")
+    } else {
+        PathBuf::from("/workspace")
+    };
+    let event = Event::new(notify::event::EventKind::Modify(
+        notify::event::ModifyKind::Any,
+    ))
+    .add_path(root.join("target").join("debug").join("artifact.obj"))
+    .add_path(root.join("src").join("main.rs"));
+
+    let filtered = retain_relevant_event_paths(&root, Ok(event))
+        .expect("source event remains")
+        .expect("valid notify event");
+    assert_eq!(filtered.paths, vec![root.join("src").join("main.rs")]);
+
+    let generated_only = Event::new(notify::event::EventKind::Any)
+        .add_path(root.join("node_modules").join("cache.bin"));
+    assert!(retain_relevant_event_paths(&root, Ok(generated_only)).is_none());
+}
+
 /// callback 队列饱和后仍保持有界，并记录 overflow 供 worker 发出下一次 rescan marker，
 /// 不能阻塞 notify backend。
 #[test]

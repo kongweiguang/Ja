@@ -4,10 +4,17 @@
 <FindBugsFilter>
     <!-- 当前不建立历史 baseline；只有带中文技术原因的精确 bug pattern/class 才能加入。 -->
 
-    <!-- 这些方法负责把异步、关闭和端口失败重新抛为已分类运行时异常；“总是抛出”正是其契约。 -->
+    <!-- 这些方法负责把异步、关闭和端口失败重新抛为已分类运行时异常；摘要与标题短租约还必须在
+         绑定失败时关闭后原样重抛。“总是抛出”或“捕获后重抛”正是这些精确边界的契约。 -->
     <Match>
         <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
-        <Class name="~io\.github\.kongweiguang\.ja\.(bootstrap\.RuntimeResourceLifecycle|catalog\.adapter\.out\.mcp\.runtime\.(McpRuntime|McpRuntimeLifecycle)|catalog\.adapter\.out\.runtime\.ConfigurationTurnRuntimeResolver|configuration\.adapter\.out\.security\.windows\.CredentialStore|conversation\.adapter\.out\.provider\.(ModelAdapterFactory|shared\.(AbstractStreamingModelAdapter|ModelTransport|RequestController)|summary\.HttpSummaryModel)|conversation\.application\.(cancellation\.DefaultCancellationCoordinator|context\.ContextCompactionLifecycle|loop\.(AgentLoop|AgentLoopPersistence|AgentToolRunner|AgentTurnExecution|DeltaTimerScheduler\$TimerHandle|TerminalCoordinator|TurnQueue)|service\.(TurnService|TurnShutdown|TurnTerminalSettlement))|conversation\.port\.out\.RuntimeLease|foundation\.concurrent\.ShutdownDeadline|transport\.rpc\.(handler\.TurnApprovalHandler|runtime\.(RpcServer|RpcSession)))"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(bootstrap\.RuntimeResourceLifecycle|catalog\.adapter\.out\.mcp\.runtime\.(McpRuntime|McpRuntimeLifecycle)|catalog\.adapter\.out\.runtime\.ConfigurationTurnRuntimeResolver|configuration\.adapter\.out\.security\.windows\.CredentialStore|conversation\.adapter\.out\.provider\.(ModelAdapterFactory|shared\.(AbstractStreamingModelAdapter|ModelTransport|RequestController)|summary\.HttpSummaryModel)|conversation\.application\.(cancellation\.DefaultCancellationCoordinator|context\.(ContextCompactionLifecycle|summary\.ModelSummaryGenerator(?:\$RequestRuntime)?)|loop\.(AgentLoop|AgentLoopPersistence|AgentToolRunner|AgentTurnExecution|DeltaTimerScheduler\$TimerHandle|TerminalCoordinator|TurnQueue)|service\.(TurnService|TurnShutdown|TurnTerminalSettlement)|title\.AutomaticThreadTitleScheduler\$RequestRuntime)|conversation\.port\.out\.RuntimeLease|foundation\.concurrent\.ShutdownDeadline|transport\.rpc\.(handler\.TurnApprovalHandler|runtime\.(RpcServer|RpcSession)))"/>
+    </Match>
+
+    <!-- Goal 事务桥返回原始领域异常供 catch 边界重新抛出；该“返回运行时异常”是稳定错误映射契约。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.goal.adapter.out.persistence.GoalUnitOfWork"/>
     </Match>
 
     <!-- AbstractExecutorService 的 nullable 默认注解弱于本实现的显式 fail-fast 契约，两个 override 必须拒绝 null。 -->
@@ -19,13 +26,19 @@
     <!-- 下列 record 在构造时使用 List.copyOf、不可修改 Map 或递归 JSON 冻结，返回引用本身不可变。 -->
     <Match>
         <Bug pattern="EI_EXPOSE_REP"/>
-        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.support\.McpServerDefinition|configuration\.adapter\.out\.generation\.ConfigGeneration\$Profile|conversation\.application\.context\.summary\.SummaryDocument|conversation\.domain\.model\.(ModelMessage|ToolCallContent)|conversation\.domain\.permission\.PermissionRequest|conversation\.domain\.tool\.ToolSpec|conversation\.port\.in\.TurnEvent\$ToolCall|conversation\.port\.out\.(AgentTool\$(Invocation|ToolResult)|McpGateway\$(McpInvocation|McpResult|McpSnapshot)|ModelPort\$(ModelRequest|ToolCallReady)|SkillCatalog\$SkillSnapshot))"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.support\.McpServerDefinition|configuration\.adapter\.out\.generation\.ConfigGeneration\$Profile|conversation\.application\.context\.summary\.SummaryDocument|conversation\.domain\.model\.(ModelMessage|ToolCallContent)|conversation\.domain\.permission\.PermissionRequest|conversation\.domain\.tool\.ToolSpec|conversation\.port\.in\.TurnEvent\$ToolCall|conversation\.port\.out\.(AgentTool\$(Invocation|ToolResult)|McpGateway\$(McpInvocation|McpResult|McpSnapshot)|ModelPort\$(ModelRequest|ToolCallReady)|SkillCatalog\$Catalog))"/>
     </Match>
 
     <!-- 这些精确类型暴露的是注入端口或带租约的资源所有权，不是可复制的数据表示。 -->
     <Match>
         <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
         <Class name="~io\.github\.kongweiguang\.ja\.(bootstrap\.SolonRuntimeComposition|catalog\.adapter\.out\.runtime\.ConfigurationTurnRuntimeResolver\$1|configuration\.adapter\.out\.generation\.ConfigGeneration\$Lease|infrastructure\.persistence\.database\.JaDatabase|platform\.windows\.WindowsNativeProcess|transport\.rpc\.RpcServiceBindings)"/>
+    </Match>
+
+    <!-- GoalService 借用组合根唯一 PlanExecutionCoordinator 生命周期端口；该端口不可复制，也不是对外暴露的可变数据。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.goal.application.GoalService"/>
     </Match>
 
     <!-- ObjectMapper、MyBatis Mapper proxy 与 RpcSession 都是组合根、事务或连接生命周期注入的 owner；
@@ -44,13 +57,19 @@
     <!-- 私有校验函数由同文件嵌套 record 的 compact constructor 或匿名实现调用，SpotBugs 未归因该字节码调用。 -->
     <Match>
         <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
-        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.application\.context\.(checkpoint\.CheckpointStore|summary\.SummaryModel)|conversation\.port\.in\.(ContextCompactionEvent|TurnEvent)|conversation\.port\.out\.ConversationRepository)"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.application\.context\.(checkpoint\.CheckpointStore|summary\.SummaryModel)|conversation\.domain\.turn\.TurnExecutionState|conversation\.port\.in\.(ContextCompactionEvent|TurnEvent)|conversation\.port\.out\.ConversationRepository)"/>
+    </Match>
+
+    <!-- 审批等待 API 在中断时按契约抛出已分类运行时异常，调用方必须在 Turn 边界统一收口。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker"/>
     </Match>
 
     <!-- 这些构造器只做参数校验或冻结依赖，类没有 finalizer，资源分配均由独立 owner 在构造成功后接管。 -->
     <Match>
         <Bug pattern="CT_CONSTRUCTOR_THROW"/>
-        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.transport\.BoundedMcpTransport|conversation\.adapter\.out\.provider\.shared\.AbstractStreamingModelAdapter|conversation\.adapter\.out\.tools\.(BuiltInTools\$WorkspacePathReadTool|ToolSupport))"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.transport\.BoundedMcpTransport|conversation\.adapter\.out\.provider\.shared\.AbstractStreamingModelAdapter|conversation\.adapter\.out\.tools\.(BuiltInTools\$WorkspacePathReadTool|ToolSupport)|conversation\.port\.out\.ModelPort\$ModelUnavailableException)"/>
     </Match>
 
     <!-- 这些窄函数式端口横跨 IO、进程、FFM 或事务回调，保留 Exception 以便唯一边界统一分类和回滚。 -->

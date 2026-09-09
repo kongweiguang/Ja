@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { WorkspaceMutationHostAdapter } from "@/api/tauri/workspace";
+import type { WorkspaceChangedEvent, WorkspaceMutationHostAdapter } from "@/api/tauri/workspace";
 import { observeWindowFocus } from "@/api/tauri/window";
 import type {
   FileReadDto,
@@ -14,8 +14,32 @@ import type {
 export type WorkspaceFilesHostPort = WorkspaceMutationHostAdapter;
 
 const TREE_PAGE_SIZE = 200;
+const MAX_PENDING_WATCH_EVENTS = 64;
 const WATCH_GENERATION_MILLIS_STRIDE = 1_024;
 let nextWatcherGeneration = Math.max(1, Date.now() * WATCH_GENERATION_MILLIS_STRIDE);
+
+interface WatchSessionState {
+  generation: number;
+  status: "starting" | "active" | "closed";
+  pendingEvents: WorkspaceChangedEvent[];
+}
+
+/** Start ACK 前只保存一个有界事件前缀；超过预算时折叠为根级对账提示。 */
+function queuePendingWatchEvent(session: WatchSessionState, event: WorkspaceChangedEvent): void {
+  if (session.pendingEvents.some((pending) => pending.requiresRescan)) return;
+  if (event.requiresRescan || session.pendingEvents.length >= MAX_PENDING_WATCH_EVENTS) {
+    session.pendingEvents = [
+      {
+        relativePath: "",
+        generation: session.generation,
+        revision: null,
+        requiresRescan: true,
+      },
+    ];
+    return;
+  }
+  session.pendingEvents.push(event);
+}
 
 /**
  * 为整个 renderer 分配单调 generation，而不是按 workspace/factory 从 1
@@ -63,7 +87,7 @@ export function createFilesWorkspaceOperations(
   adapter: WorkspaceMutationHostAdapter,
   focusObserver: typeof observeWindowFocus = observeWindowFocus,
 ): FilesWorkspaceOperations {
-  const watchSessionGenerations = new Map<string, number>();
+  const watchSessions = new Map<string, WatchSessionState>();
 
   return {
     tree: async (input) => {
@@ -172,7 +196,12 @@ export function createFilesWorkspaceOperations(
     /** 先安装广播 listener，再以全局唯一 generation 启动并精确过滤事件。 */
     watchStart: async (input, listener) => {
       const requestedGeneration = allocateWatcherGeneration();
-      watchSessionGenerations.set(input.workspaceId, requestedGeneration);
+      const session: WatchSessionState = {
+        generation: requestedGeneration,
+        status: "starting",
+        pendingEvents: [],
+      };
+      watchSessions.set(input.workspaceId, session);
       let unlisten: (() => void | Promise<void>) | undefined;
       let listenerActive = false;
       /** 在晚到 start、失败和 effect cleanup 中只释放这一个原生 callback 一次。 */
@@ -184,8 +213,13 @@ export function createFilesWorkspaceOperations(
       let ownsNativeSession = false;
       try {
         unlisten = await adapter.subscribeChanged((event) => {
-          if (watchSessionGenerations.get(input.workspaceId) !== requestedGeneration) return;
+          if (watchSessions.get(input.workspaceId) !== session) return;
           if (event.generation !== requestedGeneration) return;
+          if (session.status === "starting") {
+            queuePendingWatchEvent(session, event);
+            return;
+          }
+          if (session.status !== "active") return;
           listener(event);
         });
         listenerActive = true;
@@ -194,16 +228,25 @@ export function createFilesWorkspaceOperations(
           generation: requestedGeneration,
         });
         ownsNativeSession = started.started && started.generation === requestedGeneration;
-        if (!ownsNativeSession) {
+        if (ownsNativeSession && watchSessions.get(input.workspaceId) === session) {
+          session.status = "active";
+          const pendingEvents = session.pendingEvents;
+          session.pendingEvents = [];
+          for (const event of pendingEvents) listener(event);
+        } else {
+          session.status = "closed";
+          session.pendingEvents = [];
           await releaseListener();
-          if (watchSessionGenerations.get(input.workspaceId) === requestedGeneration) {
-            watchSessionGenerations.delete(input.workspaceId);
+          if (watchSessions.get(input.workspaceId) === session) {
+            watchSessions.delete(input.workspaceId);
           }
         }
       } catch (error) {
+        session.status = "closed";
+        session.pendingEvents = [];
         await releaseListener();
-        if (watchSessionGenerations.get(input.workspaceId) === requestedGeneration) {
-          watchSessionGenerations.delete(input.workspaceId);
+        if (watchSessions.get(input.workspaceId) === session) {
+          watchSessions.delete(input.workspaceId);
         }
         throw error;
       }
@@ -212,6 +255,8 @@ export function createFilesWorkspaceOperations(
         stop: async () => {
           if (stopped) return;
           stopped = true;
+          session.status = "closed";
+          session.pendingEvents = [];
           try {
             if (ownsNativeSession) {
               await adapter.watchStop({
@@ -221,29 +266,31 @@ export function createFilesWorkspaceOperations(
             }
           } finally {
             await releaseListener();
-            if (watchSessionGenerations.get(input.workspaceId) === requestedGeneration) {
-              watchSessionGenerations.delete(input.workspaceId);
+            if (watchSessions.get(input.workspaceId) === session) {
+              watchSessions.delete(input.workspaceId);
             }
           }
         },
       };
     },
-    /** rescan 只能复用当前 session generation，不能自行推进生命周期身份。 */
+    /** Start ACK 前的 focus 对账由初始 Tree 覆盖；静默跳过可避免伪造“扫描失败”。 */
     watchRescan: async (input) => {
-      const sessionGeneration = watchSessionGenerations.get(input.workspaceId);
-      if (sessionGeneration === undefined) throw new Error("workspace watcher is not active");
+      const session = watchSessions.get(input.workspaceId);
+      if (session?.status !== "active") return;
       await adapter.watchRescan({
         workspaceId: input.workspaceId,
-        generation: sessionGeneration,
+        generation: session.generation,
       });
     },
     /** stop 只终止调用时仍由该 workspace 持有的 generation。 */
     watchStop: async (input) => {
-      const generation = watchSessionGenerations.get(input.workspaceId);
-      if (generation === undefined) return;
-      await adapter.watchStop({ workspaceId: input.workspaceId, generation });
-      if (watchSessionGenerations.get(input.workspaceId) === generation) {
-        watchSessionGenerations.delete(input.workspaceId);
+      const session = watchSessions.get(input.workspaceId);
+      if (session === undefined) return;
+      session.status = "closed";
+      session.pendingEvents = [];
+      await adapter.watchStop({ workspaceId: input.workspaceId, generation: session.generation });
+      if (watchSessions.get(input.workspaceId) === session) {
+        watchSessions.delete(input.workspaceId);
       }
     },
     /** 不把 native window owner 泄露给 feature，只暴露一个窄 focus 信号。 */

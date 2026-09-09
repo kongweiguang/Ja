@@ -38,6 +38,7 @@ struct SessionState {
     next_sequence: u64,
     dropped_events: u64,
     close_token: Option<u64>,
+    native_visible: bool,
 }
 
 /// 不透明 claim 保证原生 close 与模型 finalization 成对执行。
@@ -101,6 +102,7 @@ impl PreviewManager {
             next_sequence: 1,
             dropped_events: 0,
             close_token: None,
+            native_visible: false,
         };
         Self::push_event(
             &mut session,
@@ -349,6 +351,32 @@ impl PreviewManager {
     pub fn active_count(&self) -> Result<usize, PreviewError> {
         let state = self.lock_state()?;
         Ok(state.sessions.len())
+    }
+
+    /// 读取原生 child WebView 的最后一次成功可见性；该事实只用于跳过幂等 show/hide，
+    /// 不进入公共 snapshot，避免把平台布局细节扩大为 renderer 协议。
+    pub(crate) fn native_visible(&self, id: PreviewId) -> Result<bool, PreviewError> {
+        let state = self.lock_state()?;
+        state
+            .sessions
+            .get(&id)
+            .map(|session| session.native_visible)
+            .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))
+    }
+
+    /// 仅在原生 show/hide 成功后提交可见性，使失败重试仍会执行必要的平台操作。
+    pub(crate) fn commit_native_visibility(
+        &self,
+        id: PreviewId,
+        visible: bool,
+    ) -> Result<(), PreviewError> {
+        let mut state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get_mut(&id)
+            .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+        session.native_visible = visible;
+        Ok(())
     }
 
     /// 永久拒绝新 mutation，同时为 ACK-first shutdown 保留原生 identity；

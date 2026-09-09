@@ -97,16 +97,17 @@ public final class ModelTransport implements AutoCloseable {
     }
 
     /**
-     * 在保留共享 Dispatcher 和 Pool 的同时派生短生命周期请求视图。read timeout 必须有限，
-     * 避免 SSE 事件间无限等待；Adapter 的单调 Deadline 仍提供更严格的 Turn 总体边界。
+     * 在保留共享 Dispatcher 和 Pool 的同时派生短生命周期请求视图。连接建立受 connectTimeout
+     * 约束，而读写和完整交换受 requestTimeout 约束，允许首个 SSE token 晚于连接预算到达；
+     * Adapter 的单调 Deadline 仍提供同一 Turn 的最终边界。
      */
     OkHttpClient clientFor(ModelPort.ModelConfiguration configuration) {
         Objects.requireNonNull(configuration, "configuration");
         ensureOpen();
         return client.newBuilder()
                 .connectTimeout(configuration.connectTimeout())
-                .readTimeout(configuration.connectTimeout())
-                .writeTimeout(configuration.connectTimeout())
+                .readTimeout(configuration.requestTimeout())
+                .writeTimeout(configuration.requestTimeout())
                 .callTimeout(configuration.requestTimeout())
                 .build();
     }

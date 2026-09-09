@@ -13,6 +13,7 @@ export default tseslint.config(
       ".agents/**",
       ".skills-cache/**",
       ".tmp/**",
+      ".codex-target/**",
       "dist",
       "node_modules",
       "src-tauri",

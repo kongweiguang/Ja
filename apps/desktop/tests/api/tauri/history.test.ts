@@ -23,15 +23,20 @@ function thread(threadId = "thr_fixture") {
   return {
     threadId,
     workspaceId: "ws_server",
+    activeGoalId: null,
     preferences: {
       providerId: "provider_fixture",
       modelId: "model_fixture",
       reasoningLevel: "medium" as const,
       accessMode: "approval_required" as const,
+      collaborationMode: "default" as const,
       titleSource: "placeholder" as const,
     },
     title: "Fixture conversation",
     status: "active" as const,
+    pinned: false,
+    latestTurnStatus: "completed" as const,
+    latestTurnSeen: false,
     revision: 0,
     createdAt: "2026-08-18T00:00:00Z",
     updatedAt: "2026-08-18T00:00:00Z",
@@ -47,16 +52,6 @@ function snapshot() {
       {
         turnId: "turn_fixture",
         status: "completed",
-        runtime: {
-          providerId: "provider_fixture",
-          modelId: "model_fixture",
-          provider: "openai",
-          api: "openai_responses",
-          upstreamModel: "gpt-5.6-sol",
-          reasoningLevel: "medium",
-          accessMode: "full_access",
-          configGeneration: "cfg_fixture",
-        },
         requestedAt: "2026-08-18T00:00:00Z",
         updatedAt: "2026-08-18T00:00:04Z",
         completedAt: "2026-08-18T00:00:04Z",
@@ -70,7 +65,8 @@ function snapshot() {
         turnId: "turn_fixture",
         kind: "user_input",
         createdAt: "2026-08-18T00:00:00Z",
-        text: "hello",
+        content: [{ type: "text", text: "hello" }],
+        attachments: [],
       },
       {
         itemId: "item_call",
@@ -104,11 +100,14 @@ function snapshot() {
       },
     ],
     contextUsage: null,
+    inputQueue: null,
+    taskActivities: [],
+    goalActivities: [],
     nextCursor: null,
   };
 }
 
-describe("TauriHistoryAdapter v2", () => {
+describe("TauriHistoryAdapter v1", () => {
   it("uses the dedicated runtime workspace command instead of the file open-with command", () => {
     expect(JA_HISTORY_COMMANDS.workspaceOpen).toBe("ja_runtime_workspace_open");
   });
@@ -145,7 +144,14 @@ describe("TauriHistoryAdapter v2", () => {
               accessMode: "full_access",
             },
           };
+        case JA_HISTORY_COMMANDS.threadPin:
+          return { ...thread(), pinned: true, revision: 4 };
+        case JA_HISTORY_COMMANDS.threadSeen:
+          return { ...thread(), latestTurnSeen: true, revision: 4 };
         case JA_HISTORY_COMMANDS.threadArchive:
+          return { ...thread(), status: "archived", revision: 4 };
+        case JA_HISTORY_COMMANDS.threadRestore:
+          return { ...thread(), revision: 5 };
         case JA_HISTORY_COMMANDS.threadDelete:
           return { accepted: true };
         case JA_HISTORY_COMMANDS.threadCompact:
@@ -176,6 +182,7 @@ describe("TauriHistoryAdapter v2", () => {
       modelId: "model_fixture",
       reasoningLevel: "medium",
       accessMode: "approval_required",
+      collaborationMode: "default",
     });
     await adapter.threadList({ workspaceId: "ws_demo", limit: 200 });
     await expect(
@@ -193,9 +200,13 @@ describe("TauriHistoryAdapter v2", () => {
       modelId: "model_fixture",
       reasoningLevel: "high",
       accessMode: "full_access",
+      collaborationMode: "plan",
       expectedThreadRevision: 4,
     });
+    await adapter.threadPin({ threadId: "thr_fixture", pinned: true, expectedThreadRevision: 3 });
+    await adapter.threadSeen({ threadId: "thr_fixture", expectedThreadRevision: 3 });
     await adapter.threadArchive({ threadId: "thr_fixture", expectedThreadRevision: 3 });
+    await adapter.threadRestore({ threadId: "thr_fixture", expectedThreadRevision: 4 });
     await adapter.threadDelete({ threadId: "thr_fixture", expectedThreadRevision: 4 });
     await adapter.threadCompact({ threadId: "thr_fixture", expectedThreadRevision: 4 });
 
@@ -215,6 +226,7 @@ describe("TauriHistoryAdapter v2", () => {
             modelId: "model_fixture",
             reasoningLevel: "medium",
             accessMode: "approval_required",
+            collaborationMode: "default",
           },
         },
       ],
@@ -243,13 +255,26 @@ describe("TauriHistoryAdapter v2", () => {
             modelId: "model_fixture",
             reasoningLevel: "high",
             accessMode: "full_access",
+            collaborationMode: "plan",
             expectedThreadRevision: 4,
           },
         },
       ],
       [
+        JA_HISTORY_COMMANDS.threadPin,
+        { input: { threadId: "thr_fixture", pinned: true, expectedThreadRevision: 3 } },
+      ],
+      [
+        JA_HISTORY_COMMANDS.threadSeen,
+        { input: { threadId: "thr_fixture", expectedThreadRevision: 3 } },
+      ],
+      [
         JA_HISTORY_COMMANDS.threadArchive,
         { input: { threadId: "thr_fixture", expectedThreadRevision: 3 } },
+      ],
+      [
+        JA_HISTORY_COMMANDS.threadRestore,
+        { input: { threadId: "thr_fixture", expectedThreadRevision: 4 } },
       ],
       [
         JA_HISTORY_COMMANDS.threadDelete,
@@ -324,6 +349,7 @@ describe("TauriHistoryAdapter v2", () => {
         modelId: "model_fixture",
         reasoningLevel: "medium",
         accessMode: "approval_required",
+        collaborationMode: "default",
       }),
     ).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE" });
 

@@ -33,17 +33,16 @@ export interface ToolPresentation {
   artifactId?: string;
 }
 
-interface TurnChangeFile {
+export interface TurnChangeFile {
   path: string;
-  oldPath?: string;
-  status: "added" | "modified" | "deleted" | "renamed";
-  additions?: number;
-  deletions?: number;
+  status: "added" | "modified" | "deleted";
+  additions: number;
+  deletions: number;
   binary: boolean;
   truncated: boolean;
 }
 
-interface TurnChangeStats {
+export interface TurnChangeStats {
   files: number;
   additions: number;
   deletions: number;
@@ -51,14 +50,22 @@ interface TurnChangeStats {
   truncated: boolean;
 }
 
-export type TurnChangeSet =
-  | { state: "available"; files: TurnChangeFile[]; stats: TurnChangeStats; artifactId?: string }
-  | {
-      state: "unavailable";
-      reason: "concurrent_turn" | "not_git" | "capture_failed" | "diff_too_large";
-      files: TurnChangeFile[];
-      stats: TurnChangeStats;
-    };
+export type TurnChangeIncompleteReason =
+  | "unknown_mutator"
+  | "mutation_chain_broken"
+  | "outside_workspace"
+  | "limit_exceeded"
+  | "capture_failed"
+  | "commit_unconfirmed"
+  | "recovery_boundary";
+
+export interface TurnChangeSet {
+  state: "complete" | "partial";
+  incompleteReasons: TurnChangeIncompleteReason[];
+  files: TurnChangeFile[];
+  stats: TurnChangeStats;
+  artifactId?: string;
+}
 
 export interface ItemMetadata {
   callId?: string;
@@ -91,6 +98,8 @@ export interface ItemMetadata {
   truncated?: boolean;
   modelRound?: number;
   presentation?: ToolPresentation;
+  /** 标识由 Ja 运行时生成并持久化的失败收口正文，避免与 Provider 半截输出混淆。 */
+  failureReply?: boolean;
 }
 
 /** 由已提交 Protocol Event 组装、且仅由 Renderer 持有的 Item。 */
@@ -101,6 +110,10 @@ export interface TimelineItemAdapter {
   kind: TimelineItemKind;
   status: TimelineItemStatus;
   text?: string;
+  /** 用户消息的结构化引用与正文并列展示，永远不包含预读文件或 Skill 正文。 */
+  contextReferences?: import("./userContent").ConversationContextReference[];
+  /** 附件摘要与所属用户消息共同投影，避免按 Turn 聚合后失去精确消息归属。 */
+  attachments?: import("./timelineContracts").AttachmentSummary[];
   title?: string;
   metadata?: ItemMetadata;
   final?: boolean;
@@ -114,36 +127,60 @@ export interface TimelineItemAdapter {
 
 export type WorkStepAdapter = TimelineItemAdapter;
 
-/** 六种公开 Turn 状态必须精确映射冻结的 JA-RPC 合同。 */
+/** 七种公开 Turn 状态必须精确映射冻结的 JA-RPC 合同。 */
 export type TimelineTurnState =
   | "queued"
   | "running"
   | "waiting_approval"
+  | "suspended"
   | "completed"
   | "failed"
   | "cancelled";
 
-/** 历史只保留解释既有 Turn 所需的非敏感运行选择。 */
-export interface TimelineTurnRuntimeSnapshot {
+/** 每次 Provider 请求的实际非敏感执行画像；下一安全点可与同一 Turn 的上一请求不同。 */
+export interface ProviderRequestProfile {
   providerId: string;
   modelId: string;
-  provider: "openai" | "anthropic";
-  api: "openai_responses" | "anthropic_messages";
+  api: "anthropic_messages" | "openai_responses" | "openai_chat_completions";
   upstreamModel: string;
-  reasoningLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+  requestedReasoning: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+  effectiveReasoning: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
   accessMode: "approval_required" | "full_access";
   configGeneration: string;
+  promptRevision: string;
+  toolCatalogRevision: string;
+  contextWindowTokens: number;
+  maxOutputTokens: number;
 }
 
-/** 最近一次已提交模型轮次的精确 Provider Usage；身份通过所属 Turn 的冻结 runtime 解析。 */
-export interface TimelineContextUsage {
-  turnId: string;
+/** Usage 公共身份字段把计量绑定到唯一 Provider 请求，而不是整个 Turn。 */
+interface TimelineContextUsageBase {
+  requestId: string;
+  requestOrdinal: number;
   modelRound: number;
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+  purpose: "assistant" | "summary";
   measuredAt: string;
 }
+
+/** 首版请求始终携带完整画像；UNKNOWN 只表示 Provider 未提供可信计量。 */
+export type TimelineContextUsage =
+  | (TimelineContextUsageBase & {
+      profile: ProviderRequestProfile;
+      certainty: "known";
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+    })
+  | (TimelineContextUsageBase & {
+      profile: ProviderRequestProfile;
+      certainty: "unknown";
+      inputTokens: null;
+      outputTokens: null;
+      totalTokens: null;
+    });
+
+/** Thread 重读没有事件外壳，因此必须显式携带 Usage 所属 Turn。 */
+export type TimelineThreadContextUsage = TimelineContextUsage & { turnId: string };
 
 export interface TimelineTurn {
   turnId: string;
@@ -153,7 +190,6 @@ export interface TimelineTurn {
   startedAt?: string;
   completedAt?: string;
   error?: { code: string; retryable: boolean };
-  runtime?: TimelineTurnRuntimeSnapshot;
   /** undefined 表示 terminal 后仍在重读；null 表示权威历史确认该 Turn 没有差异记录。 */
   changeSet?: TurnChangeSet | null;
 }
@@ -291,6 +327,8 @@ export function turnStatusLabel(status: TimelineTurnState): string {
       return "生成中";
     case "waiting_approval":
       return "等待确认";
+    case "suspended":
+      return "运行被中断";
     case "completed":
       return "已完成";
     case "cancelled":

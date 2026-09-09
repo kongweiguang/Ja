@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::review::domain::{
-    ReviewFile, ReviewFileDiff, ReviewFileId, ReviewFileStatus, ReviewHunk, ReviewHunkId,
-    ReviewLine, ReviewLineKind, ReviewRevision, ReviewSnapshot, ReviewStats,
+    ReviewFile, ReviewFileDiff, ReviewFileId, ReviewFileLayer, ReviewFileStatus, ReviewHunk,
+    ReviewHunkId, ReviewLine, ReviewLineKind, ReviewRevision, ReviewSnapshot, ReviewStats,
 };
 use serde_json::json;
 
@@ -26,6 +26,7 @@ fn review_wire_fixture_matches_typed_adapter() {
     };
     let file = ReviewFile {
         file_id: ReviewFileId::parse("file_fixture").expect("file id"),
+        layer: ReviewFileLayer::Unstaged,
         path: "a.txt".to_owned(),
         old_path: None,
         status: ReviewFileStatus::Modified,
@@ -34,8 +35,11 @@ fn review_wire_fixture_matches_typed_adapter() {
         binary: false,
         metadata_only: false,
         hunks: vec![hunk],
+        diff_loaded: true,
         patch: b"@@ -1,1 +1,1 @@\n-new\n+newer\n".to_vec(),
         revision_evidence: b"fixture".to_vec(),
+        state_evidence: b"fixture".to_vec(),
+        worktree_evidence: None,
     };
     let snapshot = project_snapshot(
         "ws_fixture",
@@ -55,6 +59,7 @@ fn review_wire_fixture_matches_typed_adapter() {
     let value = serde_json::to_value(snapshot).expect("snapshot fixture");
     assert_eq!(value["workspaceId"], "ws_fixture");
     assert_eq!(value["source"]["kind"], "unstaged");
+    assert_eq!(value["files"][0]["layer"], "unstaged");
     assert_eq!(value["files"][0]["truncated"], false);
     assert_eq!(value["capabilities"]["stage"], true);
     assert!(value["capabilities"].get("exact").is_none());
@@ -69,9 +74,19 @@ fn review_wire_fixture_matches_typed_adapter() {
     );
     let value = serde_json::to_value(diff).expect("file diff fixture");
     assert_eq!(value["fileId"], "file_fixture");
+    assert_eq!(value["layer"], "unstaged");
     assert!(value.get("file").is_none());
     assert_eq!(value["lines"][0]["kind"], "addition");
     assert_eq!(value["lines"][0]["newLine"], 1);
+}
+
+/// 聚合来源必须是明确 tagged variant，不能由客户端把 staged/unstaged 数组临时拼接。
+#[test]
+fn uncommitted_source_wire_is_explicit() {
+    assert_eq!(
+        serde_json::to_value(ReviewSourceDto::Uncommitted).expect("source fixture"),
+        json!({ "kind": "uncommitted" })
+    );
 }
 
 /// 锁定 invalidation event 只是一条 refetch hint，不能演化为第二份 mutation ledger。

@@ -22,8 +22,9 @@ pub(crate) use ports::{
     SkillListParams, SkillListResultData, ThreadArchiveParams, ThreadArchiveResultData,
     ThreadCompactParams, ThreadCompactResultData, ThreadCreateParams, ThreadCreateResultData,
     ThreadDeleteParams, ThreadDeleteResultData, ThreadListParams, ThreadListResultData,
-    ThreadPreferencesUpdateParams, ThreadPreferencesUpdateResultData, ThreadReadParams,
-    ThreadReadResultData, ThreadRenameParams, ThreadRenameResultData, ThreadSearchParams,
-    ThreadSearchResultData, TurnChangeCaptureContext, WorkspaceListParams, WorkspaceListResultData,
-    WorkspaceRuntimeSource,
+    ThreadPinParams, ThreadPinResultData, ThreadPreferencesUpdateParams,
+    ThreadPreferencesUpdateResultData, ThreadReadParams, ThreadReadResultData, ThreadRenameParams,
+    ThreadRenameResultData, ThreadRestoreParams, ThreadRestoreResultData, ThreadSearchParams,
+    ThreadSearchResultData, ThreadSeenParams, ThreadSeenResultData, WorkspaceListParams,
+    WorkspaceListResultData, WorkspaceRuntimeSource,
 };

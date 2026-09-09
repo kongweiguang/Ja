@@ -2,7 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useTimelineStore } from "@/features/conversation";
-import type { RuntimeProjectionPort } from "../application/runtimePorts";
+import type { RuntimeHostEvent, RuntimeProjectionPort } from "../application/runtimePorts";
+
+type RuntimeProjectionEvent = Exclude<RuntimeHostEvent, { kind: "status" }>;
+
+/**
+ * 提取 Timeline 事件携带的 Thread identity；全局配置事件和 projection fault 没有 Thread，
+ * 仍需交给原有 reducer 处理，不能因 Child 隔离而吞掉 Runtime 级故障信号。
+ */
+function timelineThreadId(event: RuntimeProjectionEvent): string | undefined {
+  if (event.kind !== "timeline") return undefined;
+  const threadId = (event.event.params as { readonly threadId?: unknown }).threadId;
+  return typeof threadId === "string" ? threadId : undefined;
+}
 
 /**
  * 在 composition 边界把 Runtime 的已准入 projection intent 交给唯一 Conversation Store。
@@ -20,9 +32,19 @@ export function bindRuntimeProjectionPort(): RuntimeProjectionPort {
     applyTurnAccepted: (accepted) => {
       useTimelineStore.getState().applyTurnAccepted(accepted);
     },
-    /** Host event 已在 Runtime adapter 校验；composition 不重复解释 wire 或复制 reducer。 */
+    /** 队列 ACK 先写入全量 projection，随后重放的 Event 只允许更高 revision 覆盖。 */
+    applyInputQueue: (inputQueue) => {
+      useTimelineStore.getState().applyInputQueue(inputQueue);
+    },
+    /**
+     * Thread Snapshot 是 Conversation 投影的 admission：未加载的 Child Thread 只由 Task
+     * activity/progress 与 thread/read 驱动，不能把其 Turn、Delta 或 Approval 物化进主 Store。
+     */
     applyHostEvent: (event) => {
-      useTimelineStore.getState().applyHostEvent(event);
+      const store = useTimelineStore.getState();
+      const threadId = timelineThreadId(event);
+      if (threadId !== undefined && store.threads[threadId] === undefined) return;
+      store.applyHostEvent(event);
     },
   };
 }

@@ -5,6 +5,7 @@
 
 use super::changes::{ChangeDetector, PollingChangeDetector, PollingPolicy};
 use super::registry::WorkspaceHandle;
+use super::search::is_default_ignored_relative_path;
 use crate::workspace::WorkspaceError;
 use crate::workspace::application::WorkspaceWatchPort;
 use crate::workspace::domain::{
@@ -286,6 +287,24 @@ pub(crate) fn relative_event_path(root: &Path, path: &Path) -> Option<String> {
     Some(value)
 }
 
+/// 在 notify callback 进入有界队列前丢弃构建/cache 目录事件；如果只在 worker
+/// 消费阶段过滤，持续编译仍会先灌满队列并错误升级为根级 rescan。
+pub(crate) fn retain_relevant_event_paths(
+    root: &Path,
+    result: notify::Result<Event>,
+) -> Option<notify::Result<Event>> {
+    match result {
+        Ok(mut event) => {
+            event.paths.retain(|path| {
+                relative_event_path(root, path)
+                    .is_none_or(|relative| !is_default_ignored_relative_path(&relative))
+            });
+            (!event.paths.is_empty()).then_some(Ok(event))
+        }
+        Err(error) => Some(Err(error)),
+    }
+}
+
 /// 发出已经归一化的 workspace 事件；该边界只接受相对路径和扫描所得 revision，
 /// 让 polling rescan 无需为同一批路径再次读取或 hash 文件。
 fn emit_projected_change(
@@ -339,6 +358,9 @@ pub(crate) fn collect_event(
         Ok(event) => {
             for path in event.paths {
                 if let Some(relative) = relative_event_path(root, &path) {
+                    if is_default_ignored_relative_path(&relative) {
+                        continue;
+                    }
                     if !pending.contains(&relative) && pending.len() >= MAX_COALESCED_PATHS {
                         pending.clear();
                         *requires_rescan = true;
@@ -707,11 +729,14 @@ fn start_session(
         let (event_sender, event_receiver) = mpsc::sync_channel(MAX_PENDING_NATIVE_EVENTS);
         let event_overflow = Arc::new(AtomicBool::new(false));
         let callback_overflow = Arc::clone(&event_overflow);
+        let callback_root = workspace.root_path().to_path_buf();
         let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
         let (exit_sender, exit_receiver) = mpsc::sync_channel(1);
         let mut watcher = RecommendedWatcher::new(
             move |result| {
-                enqueue_native_event(&event_sender, &callback_overflow, result);
+                if let Some(relevant) = retain_relevant_event_paths(&callback_root, result) {
+                    enqueue_native_event(&event_sender, &callback_overflow, relevant);
+                }
             },
             Config::default().with_poll_interval(Duration::from_millis(100)),
         )
@@ -719,11 +744,10 @@ fn start_session(
         watcher
             .watch(workspace.root_path(), RecursiveMode::Recursive)
             .map_err(|_| WorkspaceError::WatchUnavailable)?;
-        // notify 已开始接收事件，初始扫描期间的变化进入有界队列；即使扫描降级，
-        // overflow bit 也会让 worker 用根级 marker 诚实地要求权威刷新。
-        let detector = PollingChangeDetector::new(workspace.clone(), PollingPolicy::default())
-            .map_err(|_| WorkspaceError::WatchUnavailable)?;
-        let initial_rescan_required = detector.requires_initial_rescan();
+        // notify 已开始接收事件，切换关键路径只登记惰性 detector；初始文件树本身是
+        // 权威快照，后续 focus/overflow 才需要构建轮询基线。
+        let detector =
+            PollingChangeDetector::new_uninitialized(workspace.clone(), PollingPolicy::default());
         // ownership 表在 native 资源构造完成后才提交；锁获取失败时局部 watcher
         // 会随函数返回而释放，不会留下未注册的 OS listener。
         let registration_deadline = stop_deadline_after(WATCH_STOP_TIMEOUT);
@@ -774,9 +798,6 @@ fn start_session(
         detector_table.insert(workspace.id(), detector);
         drop(detector_table);
         drop(session_table);
-        if initial_rescan_required {
-            let _ = emit_change(&sink, &workspace, String::new(), generation, true);
-        }
         Ok((true, generation))
     })
 }

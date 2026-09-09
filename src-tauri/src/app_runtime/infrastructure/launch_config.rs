@@ -325,24 +325,25 @@ where
 
 #[cfg(debug_assertions)]
 impl LaunchConfig {
-    /// 仅允许 host 控制的 debug 环境选择 Java 25 与本地 jar；启动参数严格跟随 Java 当前四目录合同。
+    /// 仅允许 host 控制的 debug 环境选择 Java 25 与本地 jar；home/data 必须由同一个
+    /// HomeLayout 显式传入，避免 debug 启动从 run 目录另行派生出第二套配置根目录。
     pub fn debug_java(
         java: PathBuf,
         jar: PathBuf,
+        home_dir: PathBuf,
+        data_dir: PathBuf,
         run_dir: PathBuf,
         java_logs_dir: PathBuf,
     ) -> Result<Self, RuntimeCommandError> {
         if !java.is_absolute() || !java.is_file() || !jar.is_absolute() || !jar.is_file() {
             return Err(RuntimeCommandError::configuration());
         }
+        let home_dir = prepare_runtime_directory(home_dir)?;
+        let data_dir = prepare_runtime_directory(data_dir)?;
         let run_dir = selected_runtime_dir(run_dir)?;
         fs::create_dir_all(&run_dir).map_err(|_| RuntimeCommandError::configuration())?;
         let run_dir =
             fs::canonicalize(run_dir).map_err(|_| RuntimeCommandError::configuration())?;
-        let home_dir =
-            prepare_runtime_directory(run_dir.parent().unwrap_or(&run_dir).join("home"))?;
-        let data_dir =
-            prepare_runtime_directory(run_dir.parent().unwrap_or(&run_dir).join("data"))?;
         let java_logs_dir = validated_log_directory(java_logs_dir)?;
         let mut sidecar =
             bounded_sidecar_with_dirs(java, home_dir, data_dir, run_dir, java_logs_dir.clone());

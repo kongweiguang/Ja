@@ -7,9 +7,10 @@ import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 
 import java.util.Objects;
 
-/** Thread 下一轮使用的模型与权限偏好；每个 Turn 接纳时会复制为独立运行快照。 */
+/** Thread 当前模型、权限与协作偏好；在途请求不变，下一 Provider 请求安全点重新读取。 */
 public record ThreadPreferences(String providerId, String modelId, String reasoningLevel,
-                                AccessMode accessMode, TitleSource titleSource) {
+                                AccessMode accessMode, CollaborationMode collaborationMode,
+                                TitleSource titleSource) {
     /** 偏好只保存稳定选择器与公开能力，不保存端点、凭据或 Provider 私有参数。 */
     public ThreadPreferences {
         providerId = identifier(providerId, "provider_", "providerId");
@@ -18,12 +19,13 @@ public record ThreadPreferences(String providerId, String modelId, String reason
             throw new IllegalArgumentException("invalid reasoningLevel");
         }
         Objects.requireNonNull(accessMode, "accessMode");
+        Objects.requireNonNull(collaborationMode, "collaborationMode");
         Objects.requireNonNull(titleSource, "titleSource");
     }
 
     /** 标题归属变化不应重写模型选择，因此只替换来源枚举并保留其它偏好。 */
     public ThreadPreferences withTitleSource(TitleSource source) {
-        return new ThreadPreferences(providerId, modelId, reasoningLevel, accessMode,
+        return new ThreadPreferences(providerId, modelId, reasoningLevel, accessMode, collaborationMode,
                 Objects.requireNonNull(source, "source"));
     }
 

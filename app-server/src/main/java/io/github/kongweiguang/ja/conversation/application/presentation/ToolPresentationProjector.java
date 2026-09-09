@@ -43,6 +43,7 @@ public final class ToolPresentationProjector {
             "(?<![A-Za-z0-9_])\\\\\\\\[^\\r\\n\\t\"']+");
     private static final Pattern POSIX_ABSOLUTE = Pattern.compile(
             "(?<![A-Za-z0-9_:/])/(?!/)[^\\r\\n\\t\"' ]+");
+    private static final Pattern SKILL_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
 
     /** 禁止实例化纯投影器，避免意外持有原始 Tool 数据。 */
     private ToolPresentationProjector() {
@@ -243,11 +244,15 @@ public final class ToolPresentationProjector {
                 .replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t");
     }
 
-    /** 只从 path 字段提取工作区相对路径，工作区外或特殊 URI 使用安全占位。 */
+    /**
+     * 只从 path 字段提取工作区相对路径；Skill 仅公开不含物理位置的逻辑名称，
+     * 其它工作区外路径和资源 URI 继续使用安全占位。
+     */
     private static List<String> relativePaths(JsonObject arguments, Path root) {
         String raw = text(arguments, "path");
         if (raw == null) return List.of();
-        if (raw.startsWith("skill://") || raw.startsWith("ja-artifact://")) return List.of("[resource]");
+        if (raw.startsWith("skill://")) return List.of(skillPreview(raw));
+        if (raw.startsWith("ja-artifact://")) return List.of("[resource]");
         try {
             Path candidate = Path.of(raw);
             Path absolute = (candidate.isAbsolute() ? candidate : root.resolve(candidate)).toAbsolutePath().normalize();
@@ -257,6 +262,16 @@ public final class ToolPresentationProjector {
         } catch (InvalidPathException invalid) {
             return List.of("[invalid-path]");
         }
+    }
+
+    /**
+     * Skill 预览只保留经过标识符校验的名称；资源子路径和畸形输入都不进入持久化展示。
+     */
+    private static String skillPreview(String raw) {
+        String address = raw.substring("skill://".length());
+        int separator = address.indexOf('/');
+        String name = separator < 0 ? address : address.substring(0, separator);
+        return SKILL_NAME.matcher(name).matches() ? "skill://" + name : "[resource]";
     }
 
     /** 统一清理 ANSI、危险控制字符、常见凭据和本地绝对路径。 */

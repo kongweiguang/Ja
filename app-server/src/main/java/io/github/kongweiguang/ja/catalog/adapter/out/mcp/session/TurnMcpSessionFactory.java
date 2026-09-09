@@ -10,10 +10,11 @@ import io.github.kongweiguang.ja.foundation.validation.ContractChecks;
 
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
 
 /**
- * 从精确冻结的配置代际租约打开一个 Turn 作用域 MCP 能力。
+ * 从单次 Provider 请求解析的精确配置代际打开 MCP 能力。
  */
 @FunctionalInterface
 public interface TurnMcpSessionFactory {
@@ -50,9 +51,14 @@ public interface TurnMcpSessionFactory {
         McpGateway gateway();
 
         /**
-         * 返回模型轮次开始前已由 initialize/discovery 冻结的目录。
+         * 返回模型轮次开始前已由有界 discovery 确认的目录。
          */
         McpGateway.McpSnapshot snapshot();
+
+        /**
+         * 返回模型可见本地名对应的精确 MCP 路由身份，供 Tool batch 在执行前后持久化并比对。
+         */
+        Map<String, McpGateway.RouteIdentity> routeIdentities();
 
         /**
          * 取消调用并关闭所有 Turn 独占的 HTTP/stdio 资源。
@@ -60,4 +66,5 @@ public interface TurnMcpSessionFactory {
         @Override
         void close();
     }
+
 }

@@ -31,10 +31,23 @@ pub(crate) fn is_default_ignored_directory(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
         || name.eq_ignore_ascii_case("dist")
         || name.eq_ignore_ascii_case("build")
+        || name.eq_ignore_ascii_case(".codex-target")
+        || name
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("target-"))
         || name.eq_ignore_ascii_case(".tmp")
         || name
             .get(..5)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".tmp-"))
+}
+
+/// Watcher 与搜索共用相同的可再生目录边界，避免构建产物既耗尽扫描预算，
+/// 又通过高频原生事件反向触发无意义的全量 reconciliation。
+pub(crate) fn is_default_ignored_relative_path(relative_path: &str) -> bool {
+    relative_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .any(is_default_ignored_directory)
 }
 
 /// 搜索策略通过条目、字节、结果与时间预算保证查询天然有界，即使仓库含海量生成文件或大 binary。

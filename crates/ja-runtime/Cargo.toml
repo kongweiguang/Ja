@@ -3,7 +3,7 @@
 
 [package]
 name = "ja-runtime"
-version = "0.1.0"
+version.workspace = true
 description = "Tauri-independent Ja App Server host runtime"
 authors = ["kongweiguang"]
 license = "GPL-3.0-or-later"

@@ -388,7 +388,7 @@ export function useWorkspaceController({
   }, []);
 
   /**
-   * 首个有效 v4 配置自动打开 general workspace；key 只包含 runtime generation 与 ready，
+   * 首个有效 v1 配置自动打开 general workspace；key 只包含 runtime generation 与 ready，
    * StrictMode 或失败重渲染不会重复创建 durable Thread，runtime 重启后则允许重新绑定。
    */
   useEffect(() => {

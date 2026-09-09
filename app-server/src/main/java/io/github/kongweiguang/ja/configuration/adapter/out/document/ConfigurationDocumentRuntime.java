@@ -45,7 +45,6 @@ public final class ConfigurationDocumentRuntime {
     private final ObjectMapper mapper;
     private final TomlCodec toml;
     private final ConfigurationDocumentFactory documentFactory;
-    private final ConfigurationSchemaMigration schemaMigration;
     private final ConfigurationPathPolicy pathPolicy;
     private final CredentialStore credentialStore;
 
@@ -58,7 +57,6 @@ public final class ConfigurationDocumentRuntime {
         this.mapper = Objects.requireNonNull(mapper, "mapper");
         this.toml = new TomlCodec(mapper);
         this.documentFactory = new ConfigurationDocumentFactory(mapper);
-        this.schemaMigration = new ConfigurationSchemaMigration(mapper);
         this.pathPolicy = new ConfigurationPathPolicy(homeDirectory);
         this.credentialStore = new CredentialStore(pathPolicy.credentialPath(), mapper);
     }
@@ -308,17 +306,16 @@ public final class ConfigurationDocumentRuntime {
             return new LayerLoad(scope, false, false, ConfigurationStore.version(path),
                     ConfigurationData.LayerStatus.UNTRUSTED, null);
         }
-        final java.util.Optional<byte[]> current;
+        final byte[] bytes;
         try {
-            current = ConfigurationMutationCoordinator.execute(path, () -> {
+            bytes = ConfigurationMutationCoordinator.execute(path, () -> {
                 try {
-                    return schemaMigration.readCurrent(path, scope);
+                    return ConfigurationStore.read(path);
                 } catch (IOException failure) {
                     throw new UncheckedIOException(failure);
                 }
             });
-            if (current.isEmpty()) return LayerLoad.missing(scope, trusted);
-            byte[] bytes = current.orElseThrow();
+            if (bytes == null) return LayerLoad.missing(scope, trusted);
             if (bytes.length > MAX_CONFIG_BYTES) {
                 return new LayerLoad(scope, true, trusted, ConfigurationStore.versionOf(bytes),
                         ConfigurationData.LayerStatus.CORRUPT, null);
@@ -330,11 +327,9 @@ public final class ConfigurationDocumentRuntime {
             return new LayerLoad(scope, true, trusted, ConfigurationStore.version(path),
                     ConfigurationData.LayerStatus.CORRUPT, null);
         }
-        byte[] bytes = current.orElseThrow();
         String version = ConfigurationStore.versionOf(bytes);
         try {
             ObjectNode document = toml.parse(new String(bytes, StandardCharsets.UTF_8));
-            normalizeUserNullableFields(document, scope);
             validateDocument(document, scope);
             return new LayerLoad(scope, true, trusted, version,
                     ConfigurationData.LayerStatus.VALID, document);
@@ -344,31 +339,6 @@ public final class ConfigurationDocumentRuntime {
         } catch (RuntimeException failure) {
             return new LayerLoad(scope, true, trusted, version,
                     ConfigurationData.LayerStatus.CORRUPT, null);
-        }
-    }
-
-    /**
-     * 补齐 v4 完整用户文档因 TOML 无原生 null 而遗漏的可空字段，使权威读取、
-     * effective 合并和 RPC 投影仍保持当前严格合同；项目 overlay 必须保持稀疏，不能在此注入覆盖语义。
-     */
-    private static void normalizeUserNullableFields(ObjectNode document, ConfigurationScope scope) {
-        if (scope != ConfigurationScope.USER
-            || document.path("schema_version").longValue() != ConfigurationDocumentFactory.CURRENT_SCHEMA_VERSION) {
-            return;
-        }
-        for (String key : List.of("default_provider_id", "default_model_id", "default_reasoning_level")) {
-            if (!document.has(key)) document.putNull(key);
-        }
-        JsonNode providers = document.get("providers");
-        if (!(providers instanceof ArrayNode providerArray)) return;
-        for (JsonNode provider : providerArray) {
-            JsonNode models = provider.get("models");
-            if (!(models instanceof ArrayNode modelArray)) continue;
-            for (JsonNode model : modelArray) {
-                if (model instanceof ObjectNode object && !object.has("default_reasoning_level")) {
-                    object.putNull("default_reasoning_level");
-                }
-            }
         }
     }
 

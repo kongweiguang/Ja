@@ -27,14 +27,13 @@ public final class TurnChangeSetCodec {
     /** 只保存文件事实、汇总和 artifactId，不复制 unified diff。 */
     public String write(TurnChangeSet value) {
         ObjectNode root = mapper.createObjectNode().put("state", wire(value.state()));
-        if (value.reason() != null) root.put("reason", value.reason());
+        ArrayNode reasons = root.putArray("incompleteReasons");
+        value.incompleteReasons().stream().map(TurnChangeSetCodec::wire).sorted().forEach(reasons::add);
         ArrayNode files = root.putArray("files");
         value.files().forEach(file -> {
-            ObjectNode node = files.addObject().put("path", file.path()).put("status", wire(file.status()))
+            files.addObject().put("path", file.path()).put("status", wire(file.status()))
+                    .put("additions", file.additions()).put("deletions", file.deletions())
                     .put("binary", file.binary()).put("truncated", file.truncated());
-            if (file.oldPath() != null) node.put("oldPath", file.oldPath());
-            if (file.additions() != null) node.put("additions", file.additions());
-            if (file.deletions() != null) node.put("deletions", file.deletions());
         });
         TurnChangeSet.Stats stats = value.stats();
         root.putObject("stats").put("files", stats.files()).put("additions", stats.additions())
@@ -48,17 +47,23 @@ public final class TurnChangeSetCodec {
     public TurnChangeSet read(String value) {
         try {
             JsonNode root = mapper.readTree(value);
+            java.util.EnumSet<TurnChangeSet.IncompleteReason> reasons =
+                    java.util.EnumSet.noneOf(TurnChangeSet.IncompleteReason.class);
+            for (JsonNode reason : required(root, "incompleteReasons")) {
+                if (!reason.isTextual()) throw invalid();
+                reasons.add(TurnChangeSet.IncompleteReason.valueOf(reason.textValue().toUpperCase(Locale.ROOT)));
+            }
             List<TurnChangeSet.FileChange> files = new ArrayList<>();
             for (JsonNode file : required(root, "files")) {
-                files.add(new TurnChangeSet.FileChange(text(file, "path"), optionalText(file, "oldPath"),
+                files.add(new TurnChangeSet.FileChange(text(file, "path"),
                         TurnChangeSet.FileStatus.valueOf(text(file, "status").toUpperCase(Locale.ROOT)),
-                        optionalLong(file, "additions"), optionalLong(file, "deletions"),
+                        longValue(file, "additions"), longValue(file, "deletions"),
                         required(file, "binary").booleanValue(), required(file, "truncated").booleanValue()));
             }
             JsonNode stats = required(root, "stats");
             return new TurnChangeSet(
                     TurnChangeSet.State.valueOf(text(root, "state").toUpperCase(Locale.ROOT)),
-                    optionalText(root, "reason"), files,
+                    reasons, files,
                     new TurnChangeSet.Stats(longValue(stats, "files"), longValue(stats, "additions"),
                             longValue(stats, "deletions"), longValue(stats, "binaryFiles"),
                             required(stats, "truncated").booleanValue()), optionalText(root, "artifactId"));
@@ -92,13 +97,6 @@ public final class TurnChangeSetCodec {
     /** 读取必需非负 long。 */
     private static long longValue(JsonNode node, String field) {
         JsonNode value = required(node, field);
-        if (!value.canConvertToLong()) throw invalid();
-        return value.longValue();
-    }
-    /** 读取可选非负 long。 */
-    private static Long optionalLong(JsonNode node, String field) {
-        JsonNode value = node.get(field);
-        if (value == null || value.isNull()) return null;
         if (!value.canConvertToLong()) throw invalid();
         return value.longValue();
     }

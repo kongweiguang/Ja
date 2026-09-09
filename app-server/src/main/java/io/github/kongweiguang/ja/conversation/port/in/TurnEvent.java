@@ -4,8 +4,12 @@
 package io.github.kongweiguang.ja.conversation.port.in;
 
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
+import io.github.kongweiguang.ja.conversation.domain.AttachmentSummary;
+import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
-import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
+import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import java.time.Instant;
@@ -16,8 +20,10 @@ import java.util.Objects;
  * 除一次性流式草稿外，每个持久化事务至多发布一个 Provider 中立的 Turn 事件。
  */
 public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.ModelStepCommitted,
-        TurnEvent.TextDelta, TurnEvent.ReasoningSummaryDelta, TurnEvent.ToolBatchCommitted,
-        TurnEvent.ApprovalRequested, TurnEvent.ApprovalResolved, TurnEvent.Terminal {
+        TurnEvent.TextDelta, TurnEvent.ReasoningSummaryDelta, TurnEvent.ToolStarted,
+        TurnEvent.ToolBatchCommitted,
+        TurnEvent.ApprovalRequested, TurnEvent.ApprovalResolved, TurnEvent.InputQueueChanged,
+        TurnEvent.InputConsumed, TurnEvent.Terminal {
     /**
      * 返回已提交事件的持久化上下文；一次性流式草稿没有事务上下文。
      */
@@ -34,13 +40,17 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
                     value.text(), value.reasoningSummary(), value.modelRound(), value.usage(), value.toolCalls());
             case TextDelta value -> value;
             case ReasoningSummaryDelta value -> value;
+            case ToolStarted value -> new ToolStarted(replacement, value.callId(), value.ordinal());
             case ToolBatchCommitted value -> new ToolBatchCommitted(replacement,
                     value.results());
             case ApprovalRequested value -> new ApprovalRequested(replacement, value.approvalId(), value.callId(),
                     value.toolName(), value.reason(), value.expiresAt());
             case ApprovalResolved value -> new ApprovalResolved(replacement, value.approvalId(), value.decision());
+            case InputQueueChanged value -> new InputQueueChanged(replacement, value.inputQueue());
+            case InputConsumed value -> new InputConsumed(replacement, value.input(), value.userItem(),
+                    value.inputQueue(), value.assistantSettlement());
             case Terminal value -> new Terminal(replacement, value.state(), value.summary(), value.errorCode(),
-                    value.errorMessage(), value.finalMessage(), value.usage());
+                    value.errorMessage(), value.finalMessage(), value.usage(), value.changeSet());
         };
     }
 
@@ -79,11 +89,73 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
         }
     }
 
+    /** 队列 CRUD 已提交；该事件只按 queue revision 收敛，不推进 Thread revision。 */
+    record InputQueueChanged(Context context, InputQueue inputQueue) implements TurnEvent {
+        /** 关联必须属于同一 Turn，防止跨 Turn 全量投影被错误覆盖。 */
+        public InputQueueChanged {
+            Objects.requireNonNull(context, "context");
+            Objects.requireNonNull(inputQueue, "inputQueue");
+            if (!context.turnId().equals(inputQueue.turnId())) {
+                throw new IllegalArgumentException("input queue turn mismatch");
+            }
+        }
+    }
+
+    /** 一条输入已从队列原子迁移到公开 Timeline，并携带消费后的权威队列。 */
+    record InputConsumed(Context context, InputQueue.QueuedInput input, UserItem userItem,
+                         InputQueue inputQueue, AssistantSettlement assistantSettlement) implements TurnEvent {
+        /** 消费前条目、公开 item 与消费后队列必须保持同一 Turn 关联。 */
+        public InputConsumed {
+            Objects.requireNonNull(context, "context");
+            Objects.requireNonNull(input, "input");
+            Objects.requireNonNull(userItem, "userItem");
+            Objects.requireNonNull(inputQueue, "inputQueue");
+            if (!context.turnId().equals(input.turnId()) || !context.turnId().equals(userItem.turnId())
+                || !context.turnId().equals(inputQueue.turnId())) {
+                throw new IllegalArgumentException("consumed input turn mismatch");
+            }
+        }
+    }
+
+    /** 消费事务写入的公开 USER_INPUT Timeline 事实。 */
+    record UserItem(String itemId, Instant createdAt, String turnId, UserContent content,
+                    List<AttachmentSummary> attachments) {
+        /** Timeline identity、完整内容与附件顺序必须能直接映射到 thread/read 的相同 item。 */
+        public UserItem {
+            itemId = identifier(itemId, "itemId", "item_");
+            Objects.requireNonNull(createdAt, "createdAt");
+            turnId = identifier(turnId, "turnId", "turn_");
+            Objects.requireNonNull(content, "content");
+            attachments = List.copyOf(Objects.requireNonNull(attachments, "attachments"));
+            if (!content.attachmentIds().equals(attachments.stream()
+                    .map(AttachmentSummary::attachmentId).toList())) {
+                throw new IllegalArgumentException("user item attachment summaries do not match content");
+            }
+        }
+    }
+
+    /** STOP 边界消费时携带此前同事务结算的 Assistant，Tool 安全点消费时为空。 */
+    record AssistantSettlement(String messageId, String text, int modelRound,
+                               ProviderRequestUsage usage, String reasoningSummary) {
+        /** 结算投影必须携带本次请求事实，避免客户端把最新 Assistant 关联到旧 Profile。 */
+        public AssistantSettlement {
+            messageId = identifier(messageId, "messageId", "item_");
+            text = boundedText(text, "text", 1_048_576, true);
+            if (modelRound < 1 || modelRound > 128) {
+                throw new IllegalArgumentException("modelRound is outside the turn bound");
+            }
+            Objects.requireNonNull(usage, "usage");
+            if (reasoningSummary != null) {
+                reasoningSummary = boundedText(reasoningSummary, "reasoningSummary", 1_048_576, false);
+            }
+        }
+    }
+
     /**
      * 包含 Tool 调用的完整模型轮次已经持久提交。
      */
     record ModelStepCommitted(Context context, String messageId, String text, String reasoningSummary, int modelRound,
-                              ModelUsage usage, List<ToolCall> toolCalls) implements TurnEvent {
+                              ProviderRequestUsage usage, List<ToolCall> toolCalls) implements TurnEvent {
         /**
          * 要求至少一个完整 Tool 调用，纯文本最终消息由 Terminal 承载。
          */
@@ -97,6 +169,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
             if (modelRound < 1 || modelRound > 128) {
                 throw new IllegalArgumentException("modelRound is outside the turn bound");
             }
+            Objects.requireNonNull(usage, "usage");
             toolCalls = List.copyOf(Objects.requireNonNull(toolCalls, "toolCalls"));
             if (toolCalls.isEmpty()) {
                 throw new IllegalArgumentException("model step requires Tool calls");
@@ -166,6 +239,22 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
         @Override
         public Context context() {
             return null;
+        }
+    }
+
+    /**
+     * 单个 Tool 已越过执行边界，并已把内部状态与安全展示投影原子提交为运行中。
+     */
+    record ToolStarted(Context context, String callId, int ordinal) implements TurnEvent {
+        /**
+         * callId 与 Turn 全局 ordinal 共同关联 Prepared 行，避免连续 Tool 的 started 通知串线。
+         */
+        public ToolStarted {
+            Objects.requireNonNull(context, "context");
+            callId = identifier(callId, "callId", "call_");
+            if (ordinal < 0 || ordinal > 1_023) {
+                throw new IllegalArgumentException("ordinal is outside the turn bound");
+            }
         }
     }
 
@@ -241,15 +330,16 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
      * Turn 唯一终态及其最终消息、错误投影和累计用量。
      */
     record Terminal(Context context, TurnState state, String summary, String errorCode, String errorMessage,
-                    FinalMessage finalMessage, TerminalUsage usage)
+                    FinalMessage finalMessage, ProviderRequestUsage usage, TurnChangeSet changeSet)
             implements TurnEvent {
         /**
-         * 只接受与终态类别一致的公开投影：成功必须有最终消息，失败必须有稳定错误，
+         * 只接受与终态类别一致的公开投影：成功和失败必须有最终消息，失败还必须有稳定错误，
          * 取消不得伪装为失败；在领域端口处收紧可避免各 transport 重复猜测条件字段。
          */
         public Terminal {
             Objects.requireNonNull(context, "context");
             Objects.requireNonNull(state, "state");
+            Objects.requireNonNull(changeSet, "changeSet");
             if (!state.terminal()) {
                 throw new IllegalArgumentException("terminal state required");
             }
@@ -267,7 +357,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
                     }
                 }
                 case FAILED -> {
-                    if (finalMessage != null || errorCode == null || errorMessage == null) {
+                    if (finalMessage == null || errorCode == null || errorMessage == null) {
                         throw new IllegalArgumentException("failed terminal has invalid projection");
                     }
                 }
@@ -278,6 +368,13 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
                 }
                 case QUEUED, RUNNING, WAITING_APPROVAL -> throw new IllegalArgumentException("terminal state required");
             }
+        }
+
+        /** 既有测试构造也必须获得明确 complete 空 ChangeSet，禁止终态继续出现缺失事实。 */
+        public Terminal(Context context, TurnState state, String summary, String errorCode, String errorMessage,
+                        FinalMessage finalMessage, ProviderRequestUsage usage) {
+            this(context, state, summary, errorCode, errorMessage, finalMessage, usage,
+                    TurnChangeSet.emptyComplete());
         }
     }
 
@@ -291,21 +388,6 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
         public FinalMessage {
             messageId = identifier(messageId, "messageId", "item_");
             text = boundedText(text, "text", 1_048_576, true);
-        }
-    }
-
-    /**
-     * Turn 结束时的累计 Provider 用量与最后模型轮次。
-     */
-    record TerminalUsage(ModelUsage usage, int modelRound) {
-        /**
-         * 限制轮次并要求权威用量，避免终态统计与持久事实不一致。
-         */
-        public TerminalUsage {
-            Objects.requireNonNull(usage, "usage");
-            if (modelRound < 1 || modelRound > 128) {
-                throw new IllegalArgumentException("modelRound is outside the turn bound");
-            }
         }
     }
 

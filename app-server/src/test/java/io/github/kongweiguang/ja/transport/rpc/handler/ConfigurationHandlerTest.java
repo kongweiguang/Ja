@@ -42,7 +42,7 @@ import java.util.Optional;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
-/** 验证配置 RPC 只通过工作区入站端口解析 workspaceId，并保持 v2 配置约束。 */
+/** 验证配置 RPC 只通过工作区入站端口解析 workspaceId，并保持首版配置约束。 */
 final class ConfigurationHandlerTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-26T12:00:00Z"), ZoneOffset.UTC);
 
@@ -212,11 +212,15 @@ final class ConfigurationHandlerTest {
         private Harness(Workspace workspace) {
             workspaces = new RecordingWorkspaces(workspace);
             RpcServiceBindings services = new RpcServiceBindings(workspaces,
+                    unusedPort(io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase.class),
                     unusedPort(ThreadUseCase.class), unusedPort(TurnUseCase.class),
                     (command, events, cancellation) -> { throw new UnsupportedOperationException("context compaction is unavailable"); },
                     unusedPort(ApprovalUseCase.class), unusedPort(CatalogUseCase.class),
                     unusedPort(io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.class),
-                    noOpLifecycle());
+                        unusedPort(io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase.class),
+                        io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveTasks(),
+                        io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                        noOpLifecycle());
             Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-configuration-handler-test")
                     .toAbsolutePath();
             SidecarConfiguration sidecar = new SidecarConfiguration(
@@ -348,7 +352,7 @@ final class ConfigurationHandlerTest {
                     "providers", new ConfigurationUseCase.ArrayValue(java.util.List.of(provider))));
         }
 
-        /** 记录 RFC 7396 对象 Patch、目标层、内部根目录与 CAS 版本，并返回固定 v2 结果。 */
+        /** 记录 RFC 7396 对象 Patch、目标层、内部根目录与 CAS 版本，并返回固定首版结果。 */
         @Override
         public ConfigurationUseCase.MutationResult patch(
                 ConfigurationScope scope, Path workspaceRoot, ConfigurationUseCase.Document patch,

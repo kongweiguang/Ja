@@ -4,6 +4,7 @@
 // Preview command 适配层的私有状态机单元测试。
 
 use super::*;
+use crate::preview::NavigationSource;
 
 /// 构造一组合法的检查器视口，集中表达后续校验用例共同依赖的边界。
 fn visible_viewport() -> PreviewViewportInput {
@@ -80,6 +81,22 @@ fn preview_viewport_requires_finite_visible_open_bounds() {
     );
 }
 
+/// 旧页面 completion 不能领取新导航的 generation；初始导航只保留一次无 Starting 的受控路径。
+#[cfg(windows)]
+#[test]
+fn preview_navigation_completion_matches_native_navigation_identity() {
+    let mut initial = PreviewNavigationCompletionTracker::new();
+    assert_eq!(initial.completed(7, 3), Some(3));
+    assert_eq!(initial.completed(7, 4), None);
+
+    let mut tracker = PreviewNavigationCompletionTracker::new();
+    tracker.started(11, 4);
+    tracker.started(12, 5);
+    assert_eq!(tracker.completed(11, 5), None);
+    assert_eq!(tracker.completed(12, 99), Some(5));
+    assert_eq!(tracker.completed(12, 99), None);
+}
+
 /// 确认只有 URL 策略拒绝可映射为页面加载失败，陈旧回调与宿主故障不得冒充远端错误。
 #[test]
 fn only_navigation_policy_errors_are_reportable_load_failures() {
@@ -95,6 +112,34 @@ fn only_navigation_policy_errors_are_reportable_load_failures() {
     assert!(!is_navigation_policy_error(
         PreviewErrorCode::InternalStateUnavailable
     ));
+}
+
+/// timeout 必须跟随当前仍在 loading 的权威 generation，但不能覆盖已经成功的终态。
+#[test]
+fn load_timeout_rebinds_generation_only_while_authoritative_session_is_loading() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager.open("https://example.test/initial").expect("open");
+    let navigated = manager
+        .navigate(
+            opened.snapshot.id,
+            opened.snapshot.generation,
+            NavigationSource::User,
+            "https://example.test/next",
+        )
+        .expect("navigate");
+
+    assert_eq!(
+        current_loading_generation(&manager, opened.snapshot.id),
+        Some(navigated.generation)
+    );
+    manager
+        .callback_load_finished(
+            opened.snapshot.id,
+            navigated.generation,
+            "https://example.test/next",
+        )
+        .expect("finish");
+    assert_eq!(current_loading_generation(&manager, opened.snapshot.id), None);
 }
 
 /// 确认恢复只处理内部标记的子 WebView，并在成功后清理身份且允许幂等重试。

@@ -35,6 +35,12 @@ fn commit_source_is_read_only() {
     );
 }
 
+/// 未提交聚合仍是可写来源，其具体 action 必须由每个文件的层身份继续收窄。
+#[test]
+fn uncommitted_source_is_not_read_only() {
+    assert!(!ReviewSource::Uncommitted.is_read_only());
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1_024))]
 

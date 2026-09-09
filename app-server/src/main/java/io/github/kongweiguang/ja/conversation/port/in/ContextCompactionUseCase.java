@@ -71,8 +71,6 @@ public interface ContextCompactionUseCase {
         CONFLICT,
         /** Thread 仍有活动 Turn。 */
         THREAD_BUSY,
-        /** Provider 未返回官方 Token 计量。 */
-        TOKEN_COUNT_UNAVAILABLE,
         /** 摘要模型未产生可提交结果。 */
         SUMMARY_FAILURE,
         /** 压缩后仍无法满足上下文预算。 */

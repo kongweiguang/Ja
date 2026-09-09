@@ -6,11 +6,17 @@
  * 以及右对齐的紧凑 User Turn。外层 Shell 持有 Viewport，本文件只负责 Timeline 几何。
  */
 .ja-chat-timeline {
+  position: relative;
   display: flex;
   min-height: 0;
   flex: 1;
   flex-direction: column;
   color: var(--ja-foreground);
+}
+
+/* 外部持久活动跟随虚拟化 Turn spacer，共享主 Timeline 的滚动与阅读宽度。 */
+.ja-chat-timeline__tail {
+  position: relative;
 }
 
 .ja-chat-timeline__empty {
@@ -57,23 +63,29 @@
   align-items: start;
   margin-bottom: 28px;
   overflow-wrap: anywhere;
-  animation: ja-chat-message-enter 200ms var(--ja-ease-native) both;
 }
 
-@keyframes ja-chat-message-enter {
+/* 只有刚提交的消息与活动响应壳拥有因果入场；历史虚拟行重新挂载时保持静止。 */
+.ja-chat-message-new,
+.ja-chat-message-draft {
+  animation: ja-chat-response-enter 160ms var(--ja-ease-native) both;
+}
+
+@keyframes ja-chat-response-enter {
   from {
     opacity: 0;
-    transform: translateY(7px) scale(0.995);
+    transform: translateY(3px);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: translateY(0);
   }
 }
 
 .ja-chat-message-user {
   grid-template-areas:
     "body"
+    "error"
     "actions";
   grid-template-columns: minmax(0, 1fr);
   justify-content: end;
@@ -99,6 +111,12 @@
   padding-left: 0.75rem;
 }
 
+/* 用户消息的失败事实由紧邻提示表达，避免在右对齐气泡容器左缘制造无归属的长红线。 */
+.ja-chat-message-user.ja-chat-message-failed {
+  border-left: 0;
+  padding-left: 0;
+}
+
 .ja-chat-message__body {
   grid-area: body;
   min-width: 0;
@@ -109,15 +127,14 @@
   padding-inline: var(--ja-turn-inline-inset, 8px);
 }
 
-/* 失败强调占用 inset 内部空间，保证正文首字仍与普通答复和过程标题对齐。 */
+/* 失败详情由正文内的终态面板承载，外层只维持与普通答复一致的阅读轴。 */
 .ja-chat-message-final.ja-chat-message-failed {
   border-left: 0;
   padding-left: 0;
 }
 
 .ja-chat-message-final.ja-chat-message-failed .ja-chat-message__body {
-  border-left: 2px solid var(--ja-danger);
-  padding-left: calc(var(--ja-turn-inline-inset, 8px) - 2px);
+  padding-left: var(--ja-turn-inline-inset, 8px);
 }
 
 .ja-chat-message__meta {
@@ -129,32 +146,6 @@
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
-}
-
-.ja-chat-message-in_progress .ja-chat-message__meta {
-  justify-content: flex-start;
-  gap: 0.42rem;
-}
-
-.ja-chat-message-in_progress .ja-chat-message__meta::before {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ja-accent);
-  content: "";
-  animation: ja-stream-pulse 1.25s ease-in-out infinite;
-}
-
-@keyframes ja-stream-pulse {
-  0%,
-  100% {
-    opacity: 0.42;
-    transform: scale(0.82);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1);
-  }
 }
 
 .ja-chat-message__meta strong {
@@ -182,6 +173,18 @@
   margin-top: 0.08rem;
 }
 
+/* 发送结果属于已发送消息，不占用 Composer 的输入和操作区域。 */
+.ja-chat-message__send-error {
+  grid-area: error;
+  justify-self: end;
+  max-width: min(100%, 36rem);
+  margin: 0.35rem 0 0;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-align: right;
+}
+
 .ja-chat-message-final .ja-chat-message__actions {
   justify-self: start;
   margin-left: var(--ja-turn-inline-inset, 8px);
@@ -199,12 +202,156 @@
   border-radius: 50%;
 }
 
-.ja-chat-message__placeholder {
-  display: inline-block;
-  margin-top: 0.35rem;
+.ja-chat-response__status {
+  display: flex;
+  min-height: 1rem;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.45rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+/* 失败是独立终态而不是 Final Answer；用单一克制面板组织结论、恢复路径和诊断码。 */
+.ja-chat-failure {
+  display: grid;
+  gap: 0.38rem;
+  margin-top: 0.25rem;
+  padding: 0.68rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--ja-danger) 38%, var(--ja-border));
+  border-radius: var(--ja-radius-md);
+  background: color-mix(in srgb, var(--ja-danger) 5%, var(--ja-surface-control));
+}
+
+.ja-chat-failure__heading {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+}
+
+.ja-chat-failure__heading svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex: 0 0 auto;
+}
+
+.ja-chat-failure__completion,
+.ja-chat-failure__summary,
+.ja-chat-failure__recovery,
+.ja-chat-failure__code {
+  margin: 0;
+}
+
+.ja-chat-failure__completion,
+.ja-chat-failure__summary,
+.ja-chat-failure__recovery {
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
+}
+
+.ja-chat-failure__completion {
+  color: var(--ja-foreground);
+}
+
+.ja-chat-failure__code {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.32rem 0.48rem;
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-chat-failure__code code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ja-foreground-muted);
+  font-family: var(--ja-font-mono);
+}
+
+.ja-chat-failure__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.7rem;
+  margin-top: 0.15rem;
+}
+
+.ja-chat-failure__actions .ja-button {
+  gap: 0.32rem;
+}
+
+.ja-chat-failure__actions .ja-button svg {
+  width: 0.78rem;
+  height: 0.78rem;
+}
+
+.ja-chat-failure__actions > span {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-chat-failure__partial-note {
+  margin: 0 0 0.45rem;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-chat-activity-dots {
+  display: inline-flex;
+  height: 4px;
+  align-items: center;
+  gap: 3px;
+}
+
+.ja-chat-activity-dots > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: ja-response-dot-breathe 1.2s ease-in-out infinite;
+}
+
+.ja-chat-activity-dots > span:nth-child(2) {
+  animation-delay: 160ms;
+}
+
+.ja-chat-activity-dots > span:nth-child(3) {
+  animation-delay: 320ms;
+}
+
+@keyframes ja-response-dot-breathe {
+  0%,
+  100% {
+    opacity: 0.36;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1);
+  }
+}
+
+.ja-chat-response__content {
+  animation: ja-chat-response-content-enter 140ms var(--ja-ease-native) both;
+}
+
+@keyframes ja-chat-response-content-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .ja-markdown {
@@ -228,9 +375,7 @@
   border-radius: 18px 18px 7px 18px;
   color: var(--ja-foreground);
   background: color-mix(in srgb, var(--ja-surface-raised) 72%, var(--ja-surface-muted) 28%);
-  box-shadow:
-    0 1px 1px rgb(0 0 0 / 4%),
-    0 4px 14px rgb(0 0 0 / 5%);
+  box-shadow: var(--ja-shadow-sm);
 }
 
 .ja-chat-message-user .ja-markdown {
@@ -241,24 +386,27 @@
   margin-top: 0;
 }
 
-/* 历史附件与用户问题共享右侧阅读区，但保持文件身份独立，避免被已完成工作过程折叠。 */
+/* 附件是用户消息的常驻内容；在同一气泡内使用稳定宽度，避免 attachment-only 消息依赖负边距定位。 */
+.ja-chat-message-user .ja-chat-message__body--with-attachments {
+  width: min(560px, 100%);
+}
+
 .ja-chat-attachments {
   display: grid;
-  width: min(560px, 78%);
-  max-width: min(560px, 78%);
+  width: 100%;
+  max-width: 100%;
   gap: 0.35rem;
-  margin: -20px 0 20px auto;
+  margin: 0.55rem 0 0;
   padding: 0;
   list-style: none;
 }
 
+.ja-chat-message-user .ja-chat-attachments:first-child {
+  margin-top: 0;
+}
+
 .ja-chat-attachment {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
   min-height: 2.25rem;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.45rem 0.65rem;
   border: 1px solid var(--ja-border);
   border-radius: var(--ja-radius-md);
   color: var(--ja-foreground-muted);
@@ -267,10 +415,66 @@
   line-height: var(--ja-line-control);
 }
 
-.ja-chat-attachment > svg {
+.ja-chat-attachment__content {
+  display: grid;
+  width: 100%;
+  min-height: 2.25rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.65rem;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+
+.ja-chat-attachment__content.is-previewable {
+  cursor: pointer;
+  transition: background-color 120ms var(--ja-ease-native);
+}
+
+.ja-chat-attachment__content.is-previewable:hover {
+  background: var(--ja-surface-control-hover);
+}
+
+.ja-chat-attachment__content.is-previewable:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-chat-attachment__content > svg {
   width: 0.95rem;
   height: 0.95rem;
   color: var(--ja-foreground-tertiary);
+}
+
+/* 缩略图保持固定画幅，受管图片加载、失败或替换时不会推动历史消息重新排版。 */
+.ja-chat-attachment__thumbnail {
+  display: grid;
+  width: 2.6rem;
+  height: 2.6rem;
+  flex: none;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 3px;
+  color: var(--ja-foreground-tertiary);
+  background: var(--ja-surface-muted);
+}
+
+.ja-chat-attachment__thumbnail > img,
+.ja-chat-attachment__thumbnail > svg {
+  width: 100%;
+  height: 100%;
+}
+
+.ja-chat-attachment__thumbnail > img {
+  object-fit: cover;
+}
+
+.ja-chat-attachment__thumbnail[data-state="loading"] {
+  opacity: 0.72;
 }
 
 .ja-chat-attachment__name {
@@ -382,18 +586,6 @@
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
-  animation: ja-work-process-enter 180ms var(--ja-ease-native) both;
-}
-
-@keyframes ja-work-process-enter {
-  from {
-    opacity: 0;
-    transform: translateY(5px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 .ja-work-process__trigger {
@@ -581,6 +773,22 @@
 .ja-work-step:last-child {
   border-bottom: 0;
 }
+
+/* Commentary 是与 Tool 交错的叙事正文，不显示“回复过程”步骤壳、图标、状态或分隔线。 */
+.ja-work-step--commentary {
+  min-width: 0;
+  padding: 0.62rem 0.15rem 0.5rem;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-body-size);
+  line-height: var(--ja-line-body);
+  list-style: none;
+}
+
+.ja-work-step--commentary .ja-markdown {
+  gap: 0.5rem;
+  margin-top: 0;
+}
+
 .ja-work-step-failed {
   color: var(--ja-danger);
 }
@@ -616,31 +824,6 @@
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
 }
-.ja-work-step__paths {
-  display: grid;
-  gap: 0.16rem;
-  margin: 0.28rem 0;
-  padding: 0;
-  color: var(--ja-foreground-muted);
-  font: var(--ja-text-caption-size) / var(--ja-line-caption) var(--ja-font-mono);
-  list-style: none;
-}
-.ja-work-step__paths li {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ja-work-step__metrics {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.26rem 0.5rem;
-  color: var(--ja-foreground-tertiary);
-  font-size: var(--ja-text-caption-size);
-  line-height: var(--ja-line-caption);
-}
-.ja-work-step__metrics span {
-  white-space: nowrap;
-}
 .ja-work-step__duration {
   display: inline-flex;
   align-items: center;
@@ -655,31 +838,94 @@
 }
 
 .ja-tool-details {
-  display: grid;
   min-width: 0;
-  gap: 0.36rem;
-  margin-top: 0.42rem;
 }
 
-.ja-tool-details__command {
+/* Tool 行是唯一折叠入口；动作、目标和箭头保持在同一阅读轴。 */
+.ja-tool-details__trigger {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
-  gap: 0.5rem;
+  width: 100%;
+  min-height: 1.24rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.48rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--ja-duration-fast) var(--ja-ease-native);
 }
 
-.ja-tool-details__command > span,
+@media (hover: hover) {
+  .ja-tool-details__trigger:hover {
+    background: color-mix(in srgb, var(--ja-foreground) 4.5%, transparent);
+  }
+}
+
+.ja-tool-details__trigger:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
+}
+
+.ja-tool-details__label,
+.ja-tool-details__summary {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+  white-space: nowrap;
+}
+
+.ja-tool-details__label {
+  font-weight: var(--ja-weight-semibold);
+}
+
+.ja-tool-details__trigger > code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground);
+  font: var(--ja-text-caption-size) / 1.45 var(--ja-font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-tool-details__summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.ja-tool-details__summary svg {
+  width: 0.72rem;
+  height: 0.72rem;
+  transition: transform var(--ja-duration-fast) var(--ja-ease-native);
+}
+
+.ja-tool-details__trigger[data-state="open"] .ja-tool-details__summary svg {
+  transform: rotate(180deg);
+}
+
+.ja-tool-details__content {
+  display: grid;
+  gap: 0.36rem;
+  overflow: hidden;
+  padding: 0.36rem 0 0.08rem;
+}
+
+.ja-tool-details__content[data-state="open"] {
+  animation: ja-work-content-open 190ms var(--ja-ease-native);
+}
+
+.ja-tool-details__content[data-state="closed"] {
+  animation: ja-work-content-close 130ms var(--ja-ease-native);
+}
+
 .ja-tool-details__cwd {
   color: var(--ja-foreground-tertiary);
   font-size: var(--ja-text-caption-size);
-}
-
-.ja-tool-details__command code {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  color: var(--ja-foreground);
-  font: var(--ja-text-caption-size) / 1.55 var(--ja-font-mono);
-  white-space: pre-wrap;
 }
 
 .ja-tool-details__input,
@@ -753,7 +999,6 @@
   border: 1px solid var(--ja-border);
   border-radius: var(--ja-radius-md);
   background: var(--ja-surface-control);
-  animation: ja-chat-message-enter 180ms var(--ja-ease-native) both;
 }
 
 .ja-turn-changes__header {
@@ -797,17 +1042,50 @@
   list-style: none;
 }
 
+/* 列表项只承载整行；三列布局仅属于内部控件，避免嵌套网格把文件名挤成零宽度。 */
 .ja-turn-changes__files li {
+  display: block;
+  min-width: 0;
+}
+
+.ja-turn-changes__files li > button,
+.ja-turn-changes__files li > div {
   display: grid;
   min-width: 0;
   grid-template-columns: 3.2rem minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.4rem;
-  color: var(--ja-foreground-muted);
-  font-size: var(--ja-text-caption-size);
 }
 
-.ja-turn-changes__files li > span {
+.ja-turn-changes__files li > button,
+.ja-turn-changes__files li > div {
+  width: 100%;
+  min-height: 2rem;
+  padding: 0 0.35rem;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  text-align: left;
+}
+
+.ja-turn-changes__files li > button {
+  cursor: pointer;
+  transition: background-color var(--ja-duration-fast) var(--ja-ease-native);
+}
+
+.ja-turn-changes__files li > button:hover {
+  background: color-mix(in srgb, var(--ja-foreground) 5%, transparent);
+}
+
+.ja-turn-changes__files li > button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
+}
+
+.ja-turn-changes__files li > :is(button, div) > span {
   color: var(--ja-foreground-tertiary);
 }
 
@@ -825,6 +1103,41 @@
   font: inherit;
   font-family: var(--ja-font-mono);
   white-space: nowrap;
+}
+
+.ja-turn-changes__expand {
+  display: inline-flex;
+  min-height: 1.8rem;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.35rem;
+  margin: 0 -0.25rem -0.2rem;
+  padding: 0.25rem;
+  border: 0;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ja-turn-changes__expand:hover,
+.ja-turn-changes__expand:focus-visible {
+  color: var(--ja-foreground);
+}
+
+.ja-turn-changes__expand:focus-visible {
+  outline: 2px solid var(--ja-focus-ring);
+  outline-offset: 1px;
+}
+
+.ja-turn-changes__expand svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  transition: transform var(--ja-motion-fast) ease;
+}
+
+.ja-turn-changes__expand[aria-expanded="true"] svg {
+  transform: rotate(180deg);
 }
 
 .ja-turn-changes > p {
@@ -880,30 +1193,22 @@
   color: var(--ja-danger);
 }
 
-.ja-chat-timeline__turn-error {
-  width: auto;
-  margin: 0.2rem var(--ja-turn-inline-inset, 8px) 0.65rem;
-  color: var(--ja-danger);
-  font-size: var(--ja-text-caption-size);
-  line-height: var(--ja-line-caption);
-}
-
 .ja-chat-timeline__jump-latest {
-  position: sticky;
+  position: absolute;
   z-index: 2;
   bottom: 0.85rem;
+  right: 1rem;
   display: flex;
   width: fit-content;
   align-items: center;
   gap: 0.35rem;
   min-height: 1.9rem;
-  margin: 0 1rem 0.5rem auto;
   padding: 0.3rem 0.68rem;
   border: 1px solid var(--ja-border-strong);
   border-radius: var(--ja-radius-lg);
   color: var(--ja-foreground);
   background: var(--ja-surface-raised);
-  box-shadow: 0 0.35rem 1rem rgb(0 0 0 / 12%);
+  box-shadow: var(--ja-shadow-md);
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
   cursor: pointer;
@@ -923,10 +1228,6 @@
 
 @media (max-width: 640px) {
   .ja-chat-message-user {
-    max-width: 90%;
-  }
-  .ja-chat-attachments {
-    width: 90%;
     max-width: 90%;
   }
   .ja-turn-changes__header {
@@ -956,17 +1257,32 @@
     pointer-events: auto;
     transform: none;
   }
+
+  .ja-chat-activity-dots > span {
+    background: currentColor;
+  }
+
+  .ja-chat-failure {
+    border-color: CanvasText;
+    background: Canvas;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ja-chat-message,
+  .ja-chat-message-new,
+  .ja-chat-message-draft,
   .ja-chat-message__actions,
-  .ja-chat-message-in_progress .ja-chat-message__meta::before,
+  .ja-chat-response__content,
+  .ja-chat-activity-dots > span,
   .ja-work-process,
   .ja-work-process__trigger,
   .ja-work-process__content,
   .ja-work-process__chevron,
+  .ja-tool-details__trigger,
+  .ja-tool-details__content,
+  .ja-tool-details__summary svg,
   .ja-turn-changes,
+  .ja-turn-changes__files li > button,
   .ja-chat-timeline__jump-latest {
     animation: none;
     transition: none;

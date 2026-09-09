@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { z } from "zod";
-import { defaultNativeBridge } from "./runtime";
+import { defaultNativeBridge, type RuntimeNativeBridge } from "./runtime";
+import { nativeDropRouterFor, parseNativeDropEvent } from "./nativeDrop";
 
 /**
  * command 列表保持封闭，Terminal 调用方不能把 adapter 扩张为通用进程或 executable RPC surface。
@@ -102,14 +103,6 @@ const TerminalDropInputSchema = z
   })
   .strict();
 
-const TerminalNativeDropEventSchema = z
-  .object({
-    dropToken: z.string().uuid(),
-    x: z.number().finite().min(-1e9).max(1e9),
-    y: z.number().finite().min(-1e9).max(1e9),
-  })
-  .strict();
-
 const TerminalEventKindSchema = z.discriminatedUnion("type", [
   z
     .object({
@@ -154,13 +147,26 @@ export type TerminalSessionInfo = z.infer<typeof TerminalSessionInfoSchema>;
 export type TerminalEvent = z.infer<typeof TerminalEventSchema>;
 export type ShellProfile = z.infer<typeof ShellProfileSchema>;
 export type TerminalIdentity = z.infer<typeof TerminalIdentitySchema>;
-export type TerminalNativeDropEvent = z.infer<typeof TerminalNativeDropEventSchema>;
+export type TerminalNativeDropEvent = {
+  dropToken: string;
+  x: number;
+  y: number;
+};
 export type TerminalUnsubscribe = () => void | Promise<void>;
 
 /** 窄 bridge 可在测试中注入，但仍只准入已知 Terminal command。 */
 export interface TerminalNativeBridge {
   invoke(command: TerminalCommand, args?: Record<string, unknown>): Promise<unknown>;
-  listen?(event: string, handler: (payload: unknown) => void): Promise<TerminalUnsubscribe>;
+  listen?<T>(event: string, handler: (payload: T) => void): Promise<TerminalUnsubscribe>;
+}
+
+/**
+ * 将可选测试 bridge 收窄为共享拖放路由所需的监听能力；保持 invoke-only 测试桩无需伪造事件系统。
+ */
+function supportsNativeDrop(
+  bridge: TerminalNativeBridge,
+): bridge is TerminalNativeBridge & Pick<RuntimeNativeBridge, "listen"> {
+  return bridge.listen !== undefined;
 }
 
 export type TerminalAdapterErrorCode = "invalid_input" | "invalid_response" | "command_failed";
@@ -320,17 +326,13 @@ export class TauriTerminalAdapter {
   async subscribeNativeDrop(
     listener: (event: TerminalNativeDropEvent) => void,
   ): Promise<TerminalUnsubscribe> {
-    if (this.bridge.listen === undefined) {
+    if (!supportsNativeDrop(this.bridge)) {
       throw new TerminalAdapterError("command_failed");
     }
     try {
-      return await this.bridge.listen(JA_TERMINAL_EVENTS.nativeDrop, (payload) => {
-        try {
-          listener(parseTerminalNativeDropEvent(payload));
-        } catch {
-          // 携带路径或形状畸形的事件必须在 Terminal UI 看到前丢弃。
-        }
-      });
+      return await nativeDropRouterFor(this.bridge).subscribeCommit((event) =>
+        listener({ dropToken: event.dropToken, x: event.x, y: event.y }),
+      );
     } catch (error) {
       throw commandFailed(error);
     }
@@ -340,7 +342,9 @@ export class TauriTerminalAdapter {
 /** 解析唯一 native-drop 事件形状，不保留被拒绝的字段或值。 */
 export function parseTerminalNativeDropEvent(payload: unknown): TerminalNativeDropEvent {
   try {
-    return TerminalNativeDropEventSchema.parse(payload);
+    const event = parseNativeDropEvent(payload);
+    if (event.phase !== "drop") throw new Error("not a drop commit");
+    return { dropToken: event.dropToken, x: event.x, y: event.y };
   } catch {
     throw new TerminalAdapterError("invalid_input");
   }

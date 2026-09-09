@@ -6,8 +6,8 @@
 use crate::app_runtime::WorkspaceLookup;
 use crate::review::application::{ReviewError, ReviewErrorCode};
 use crate::review::domain::{
-    ReviewAction, ReviewCommitId, ReviewFileId, ReviewFileStatus, ReviewHunkId, ReviewRefId,
-    ReviewSource, ReviewTarget,
+    ReviewAction, ReviewCommitId, ReviewFileId, ReviewFileLayer, ReviewFileStatus, ReviewHunkId,
+    ReviewRefId, ReviewSource, ReviewTarget,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -116,6 +116,7 @@ impl std::error::Error for ReviewCommandError {}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ReviewSourceDto {
+    Uncommitted,
     Unstaged,
     Staged,
     Branch {
@@ -134,6 +135,7 @@ impl TryFrom<ReviewSourceDto> for ReviewSource {
     /// 把 wire 字符串收敛为强类型 selector，后续层不再重复长度、控制字符或 Thread 前缀判断。
     fn try_from(value: ReviewSourceDto) -> Result<Self, Self::Error> {
         match value {
+            ReviewSourceDto::Uncommitted => Ok(Self::Uncommitted),
             ReviewSourceDto::Unstaged => Ok(Self::Unstaged),
             ReviewSourceDto::Staged => Ok(Self::Staged),
             ReviewSourceDto::Branch { ref_id } => ReviewRefId::parse(ref_id)
@@ -150,6 +152,7 @@ impl From<ReviewSource> for ReviewSourceDto {
     /// 将可信 domain selector 投影回既有 tagged wire shape，不暴露值对象内部表示。
     fn from(value: ReviewSource) -> Self {
         match value {
+            ReviewSource::Uncommitted => Self::Uncommitted,
             ReviewSource::Unstaged => Self::Unstaged,
             ReviewSource::Staged => Self::Staged,
             ReviewSource::Branch { ref_id } => Self::Branch {
@@ -158,6 +161,28 @@ impl From<ReviewSource> for ReviewSourceDto {
             ReviewSource::Commit { commit_id } => Self::Commit {
                 commit_id: commit_id.into_string(),
             },
+        }
+    }
+}
+
+/// Git 比较层的稳定 wire 枚举；该字段是 file identity 的组成部分，不允许缺省推断。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFileLayerDto {
+    Staged,
+    Unstaged,
+    Untracked,
+    Comparison,
+}
+
+impl From<ReviewFileLayer> for ReviewFileLayerDto {
+    /// 在 IPC 边界逐项映射层身份，避免前端从 source/status 猜测部分暂存关系。
+    fn from(value: ReviewFileLayer) -> Self {
+        match value {
+            ReviewFileLayer::Staged => Self::Staged,
+            ReviewFileLayer::Unstaged => Self::Unstaged,
+            ReviewFileLayer::Untracked => Self::Untracked,
+            ReviewFileLayer::Comparison => Self::Comparison,
         }
     }
 }
@@ -352,6 +377,7 @@ pub struct ReviewHunkDto {
 #[serde(rename_all = "camelCase")]
 pub struct ReviewFileDto {
     pub file_id: String,
+    pub layer: ReviewFileLayerDto,
     pub path: String,
     pub old_path: Option<String>,
     pub status: ReviewFileStatusDto,
@@ -421,6 +447,7 @@ pub struct ReviewFileDiffDto {
     pub source: ReviewSourceDto,
     pub revision: String,
     pub file_id: String,
+    pub layer: ReviewFileLayerDto,
     pub path: String,
     pub old_path: Option<String>,
     pub status: ReviewFileStatusDto,

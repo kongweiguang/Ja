@@ -37,14 +37,13 @@ describe("TauriTurnArtifactAdapter", () => {
     expect(bridge.invoke).toHaveBeenCalledWith("ja_tool_artifact_read", { input });
   });
 
-  it("使用 UTF-8 byte 页读取冻结差异并拒绝越界或畸形返回", async () => {
+  it("一次读取完整本轮修改并拒绝非法路径或畸形返回", async () => {
     const bridge = bridgeWith({
       artifactId: "artifact_diff",
-      offsetBytes: 0,
-      nextOffsetBytes: 32,
-      byteLength: 64,
-      truncated: true,
-      content: "--- a/file\n+++ b/file",
+      filePath: "src/main.ts",
+      byteLength: 4,
+      sha256: "a".repeat(64),
+      content: "abcd",
     });
     const adapter = new TauriTurnArtifactAdapter(bridge);
     const input = {
@@ -52,28 +51,81 @@ describe("TauriTurnArtifactAdapter", () => {
       threadId: "thr_demo",
       turnId: "turn_demo",
       artifactId: "artifact_diff",
-      offsetBytes: 0,
-      limitBytes: 65_536,
+      filePath: "src/main.ts",
     };
-    await expect(adapter.readTurnDiffPage(input)).resolves.toMatchObject({ nextOffsetBytes: 32 });
-    expect(bridge.invoke).toHaveBeenCalledWith("ja_turn_change_set_read", { input });
 
-    await expect(
-      adapter.readTurnDiffPage({ ...input, offsetBytes: 2_097_153 }),
-    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(adapter.readTurnDiff(input)).resolves.toMatchObject({ content: "abcd" });
+    expect(bridge.invoke).toHaveBeenCalledWith("ja_turn_change_set_read", { input });
+    await expect(adapter.readTurnDiff({ ...input, filePath: "../main.ts" })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+    });
     expect(bridge.invoke).toHaveBeenCalledTimes(1);
 
     const malformed = new TauriTurnArtifactAdapter(
       bridgeWith({
         ...input,
-        nextOffsetBytes: null,
         byteLength: 2,
-        truncated: false,
+        sha256: "a".repeat(64),
         content: "x\0",
       }),
     );
-    await expect(malformed.readTurnDiffPage(input)).rejects.toMatchObject({
+    await expect(malformed.readTurnDiff(input)).rejects.toMatchObject({
       code: "RUNTIME_UNAVAILABLE",
     });
+  });
+
+  /** artifact、path、UTF-8 总长度与摘要任一不闭合都必须在 WebView 边界失败。 */
+  it.each([
+    [
+      "artifact identity",
+      {
+        artifactId: "artifact_other",
+        filePath: "src/main.ts",
+        byteLength: 1,
+        sha256: "a".repeat(64),
+        content: "x",
+      },
+    ],
+    [
+      "file identity",
+      {
+        artifactId: "artifact_diff",
+        filePath: "src/other.ts",
+        byteLength: 1,
+        sha256: "a".repeat(64),
+        content: "x",
+      },
+    ],
+    [
+      "UTF-8 byte length",
+      {
+        artifactId: "artifact_diff",
+        filePath: "src/main.ts",
+        byteLength: 2,
+        sha256: "a".repeat(64),
+        content: "x",
+      },
+    ],
+    [
+      "digest",
+      {
+        artifactId: "artifact_diff",
+        filePath: "src/main.ts",
+        byteLength: 3,
+        sha256: "invalid",
+        content: "界",
+      },
+    ],
+  ])("拒绝不一致的%s", async (_label, response) => {
+    const adapter = new TauriTurnArtifactAdapter(bridgeWith(response));
+    await expect(
+      adapter.readTurnDiff({
+        workspaceId: "ws_demo",
+        threadId: "thr_demo",
+        turnId: "turn_demo",
+        artifactId: "artifact_diff",
+        filePath: "src/main.ts",
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE" });
   });
 });

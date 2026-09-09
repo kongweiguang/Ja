@@ -46,17 +46,37 @@ public final class ContextOrchestratorFactory {
      * 在绑定仍有效时创建专属编排器；过期或取消的 Turn 不得启动摘要模型。
      */
     public ContextOrchestrator create(SummaryModel.TurnBinding binding) {
+        return create(binding, ModelSummaryGenerator.SummaryOperation.none());
+    }
+
+    /**
+     * 自动 Turn 压缩注入持久 Summary Operation；手动压缩继续使用无 Operation 的公开入口。
+     */
+    public ContextOrchestrator create(SummaryModel.TurnBinding binding,
+                                       ModelSummaryGenerator.SummaryOperation operation) {
         Objects.requireNonNull(binding, "binding");
         binding.cancellationToken().throwIfCancellationRequested();
         if (!clock.instant().isBefore(binding.deadline())) {
             throw new ContextException(ContextException.Code.SUMMARY_FAILURE,
                     "summary model deadline expired before Turn binding");
         }
-        SummaryModel model = Objects.requireNonNull(summaryModels.bind(binding),
-                "summary model factory returned null");
-        SummaryGenerator generator = new ModelSummaryGenerator(model, binding, clock, limits);
+        return create(binding.threadId(), () -> ModelSummaryGenerator.RequestRuntime.unprofiled(binding), operation);
+    }
+
+    /**
+     * 自动压缩在每个摘要计量和 Provider 发送安全点调用 runtimeFactory，避免 ContextOrchestrator
+     * 的生命周期把 Provider、模型、Prompt、Skill 或 Tool catalog 固定到整个 assistant round。
+     */
+    public ContextOrchestrator create(String threadId,
+                                      ModelSummaryGenerator.RequestRuntimeFactory runtimeFactory,
+                                      ModelSummaryGenerator.SummaryOperation operation) {
+        if (threadId == null || threadId.isBlank()) throw new IllegalArgumentException("invalid threadId");
+        Objects.requireNonNull(runtimeFactory, "runtimeFactory");
+        Objects.requireNonNull(operation, "operation");
+        SummaryGenerator generator = new ModelSummaryGenerator(
+                summaryModels, runtimeFactory, clock, limits, operation);
         return new ContextOrchestrator(new ContextCompactionService(
                 checkpoints, new ContextPolicy(), generator, clock,
-                ContextCompactionService::newCheckpointId), binding.threadId());
+                ContextCompactionService::newCheckpointId), threadId);
     }
 }

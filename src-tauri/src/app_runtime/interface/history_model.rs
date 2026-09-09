@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-// 冻结 JA-RPC v2 history 方法的 typed、有界 Tauri adapter。
+// 冻结 JA-RPC v1 history 方法的 typed、有界 Tauri adapter。
 
+use super::dto::{InputQueueDto, TaskActivityDto, TaskSummaryDto};
 use crate::app_runtime::{
     HistoryRequest, HistoryResponse, RuntimeCommandError, RuntimeHost, ThreadArchiveParams,
-    ThreadCompactParams, ThreadCreateParams, ThreadDeleteParams, ThreadListParams,
-    ThreadPreferencesUpdateParams, ThreadReadParams, ThreadRenameParams, ThreadSearchParams,
-    WorkspaceListParams,
+    ThreadCompactParams, ThreadCreateParams, ThreadDeleteParams, ThreadListParams, ThreadPinParams,
+    ThreadPreferencesUpdateParams, ThreadReadParams, ThreadRenameParams, ThreadRestoreParams,
+    ThreadSearchParams, ThreadSeenParams, WorkspaceListParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 const MAX_CURSOR: usize = 256;
 const MAX_PAGE: u32 = 200;
@@ -27,9 +29,12 @@ pub(crate) enum HistoryMethod {
     ThreadSearch,
     ThreadRead,
     ThreadRename,
+    ThreadPin,
+    ThreadSeen,
     ThreadPreferencesUpdate,
     ThreadCompact,
     ThreadArchive,
+    ThreadRestore,
     ThreadDelete,
 }
 
@@ -57,6 +62,8 @@ pub(crate) fn request_history(
         HistoryMethod::ThreadRename => {
             HistoryRequest::ThreadRename(ThreadRenameParams::try_new(bytes)?)
         }
+        HistoryMethod::ThreadPin => HistoryRequest::ThreadPin(ThreadPinParams::try_new(bytes)?),
+        HistoryMethod::ThreadSeen => HistoryRequest::ThreadSeen(ThreadSeenParams::try_new(bytes)?),
         HistoryMethod::ThreadPreferencesUpdate => {
             HistoryRequest::ThreadPreferencesUpdate(ThreadPreferencesUpdateParams::try_new(bytes)?)
         }
@@ -65,6 +72,9 @@ pub(crate) fn request_history(
         }
         HistoryMethod::ThreadArchive => {
             HistoryRequest::ThreadArchive(ThreadArchiveParams::try_new(bytes)?)
+        }
+        HistoryMethod::ThreadRestore => {
+            HistoryRequest::ThreadRestore(ThreadRestoreParams::try_new(bytes)?)
         }
         HistoryMethod::ThreadDelete => {
             HistoryRequest::ThreadDelete(ThreadDeleteParams::try_new(bytes)?)
@@ -79,12 +89,15 @@ pub(crate) fn request_history(
         (HistoryMethod::ThreadSearch, HistoryResponse::ThreadSearch(value)) => value.into_bytes(),
         (HistoryMethod::ThreadRead, HistoryResponse::ThreadRead(value)) => value.into_bytes(),
         (HistoryMethod::ThreadRename, HistoryResponse::ThreadRename(value)) => value.into_bytes(),
+        (HistoryMethod::ThreadPin, HistoryResponse::ThreadPin(value)) => value.into_bytes(),
+        (HistoryMethod::ThreadSeen, HistoryResponse::ThreadSeen(value)) => value.into_bytes(),
         (
             HistoryMethod::ThreadPreferencesUpdate,
             HistoryResponse::ThreadPreferencesUpdate(value),
         ) => value.into_bytes(),
         (HistoryMethod::ThreadCompact, HistoryResponse::ThreadCompact(value)) => value.into_bytes(),
         (HistoryMethod::ThreadArchive, HistoryResponse::ThreadArchive(value)) => value.into_bytes(),
+        (HistoryMethod::ThreadRestore, HistoryResponse::ThreadRestore(value)) => value.into_bytes(),
         (HistoryMethod::ThreadDelete, HistoryResponse::ThreadDelete(value)) => value.into_bytes(),
         _ => return Err(history_response_rejected("history_variant")),
     };
@@ -125,7 +138,7 @@ pub struct ThreadSearchInput {
     pub limit: Option<u32>,
 }
 
-/// 只提交 cwd/title 与 v4 模型偏好创建 Thread；连接、凭据与配置代际仍由 Java 持有。
+/// 只提交 cwd/title 与 v1 模型偏好创建 Thread；连接、凭据与配置代际仍由 Java 持有。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadCreateInput {
@@ -134,8 +147,10 @@ pub struct ThreadCreateInput {
     pub title: String,
     pub provider_id: String,
     pub model_id: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub reasoning_level: Option<String>,
     pub access_mode: String,
+    pub collaboration_mode: String,
 }
 
 /// 读取一页权威 Thread snapshot，不重放 event journal。
@@ -165,8 +180,10 @@ pub struct ThreadPreferencesUpdateInput {
     pub thread_id: String,
     pub provider_id: String,
     pub model_id: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub reasoning_level: Option<String>,
     pub access_mode: String,
+    pub collaboration_mode: String,
     pub expected_thread_revision: u64,
 }
 
@@ -175,6 +192,15 @@ pub struct ThreadPreferencesUpdateInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadMutationInput {
     pub thread_id: String,
+    pub expected_thread_revision: u64,
+}
+
+/// 置顶显式携带目标布尔值；不使用 toggle，避免并发重试反转用户意图。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadPinInput {
+    pub thread_id: String,
+    pub pinned: bool,
     pub expected_thread_revision: u64,
 }
 
@@ -200,9 +226,16 @@ pub struct WorkspaceListResult {
 pub struct ThreadDto {
     pub thread_id: String,
     pub workspace_id: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub preferences: Option<ThreadPreferencesDto>,
     pub title: String,
     pub status: String,
+    pub pinned: bool,
+    #[serde(deserialize_with = "required_nullable")]
+    pub latest_turn_status: Option<String>,
+    pub latest_turn_seen: bool,
+    #[serde(deserialize_with = "required_nullable")]
+    pub active_goal_id: Option<String>,
     pub revision: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -214,9 +247,20 @@ pub struct ThreadDto {
 pub struct ThreadPreferencesDto {
     pub provider_id: String,
     pub model_id: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub reasoning_level: Option<String>,
     pub access_mode: String,
+    pub collaboration_mode: String,
     pub title_source: String,
+}
+
+/// required-nullable 字段必须显式出现在 Thread wire object 中，避免 Option 将字段缺失伪装成 null。
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Thread keyset page，不携带 active-profile 或 active-workspace replay data。
@@ -235,29 +279,75 @@ pub struct ThreadReadResult {
     pub revision: u64,
     pub turns: Vec<ThreadSnapshotTurnDto>,
     pub items: Vec<Value>,
+    pub task_activities: Vec<ThreadTaskActivityDto>,
+    pub goal_activities: Vec<ThreadGoalActivityDto>,
     pub context_usage: Option<ThreadContextUsageDto>,
+    pub input_queue: Option<InputQueueDto>,
     pub next_cursor: Option<String>,
 }
 
-/// 最近一次已提交模型轮次的精确 Provider Usage；`turn_id` 绑定冻结 runtime，避免模型切换后误用。
+/// 主 Thread 快照把低频 Activity 与同一时刻的 Task 摘要绑定，避免 UI 再做全树扫描。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadTaskActivityDto {
+    pub activity: TaskActivityDto,
+    pub task: TaskSummaryDto,
+}
+
+/// Conversation 时间线只接收不可逆 Goal 摘要；完整计划与证据必须继续通过专用 Goal command 读取。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadGoalActivityDto {
+    pub goal_id: String,
+    pub objective: String,
+    pub status: String,
+    pub goal_revision: u64,
+    pub event_sequence: u64,
+    pub occurred_at: String,
+}
+
+/// 最近一次 Provider 请求的 Usage；画像与计量状态必须来自同一持久事实。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadContextUsageDto {
     pub turn_id: String,
+    pub request_id: String,
+    pub request_ordinal: u64,
     pub model_round: u32,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
+    pub purpose: String,
+    pub certainty: String,
+    pub profile: ProviderRequestProfileDto,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub measured_at: String,
 }
 
-/// 历史 Turn 只公开冻结的非敏感路由事实与稳定失败码。
+/// 每次请求的非敏感 Provider 画像；不包含 URL、凭据或请求正文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRequestProfileDto {
+    pub provider_id: String,
+    pub model_id: String,
+    pub api: String,
+    pub upstream_model: String,
+    pub requested_reasoning: Option<String>,
+    pub effective_reasoning: Option<String>,
+    pub access_mode: String,
+    pub collaboration_mode: String,
+    pub config_generation: String,
+    pub prompt_revision: String,
+    pub tool_catalog_revision: String,
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+}
+
+/// 历史 Turn 只公开生命周期、只读修改和稳定失败码，不再伪装单一运行环境。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadSnapshotTurnDto {
     pub turn_id: String,
     pub status: String,
-    pub runtime: Option<ThreadRuntimeSnapshotDto>,
     pub requested_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -265,50 +355,31 @@ pub struct ThreadSnapshotTurnDto {
     pub error_code: Option<String>,
 }
 
-/// Turn admission 快照排除 URL 与 Secret，且 Provider API 维持当前两类闭集。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ThreadRuntimeSnapshotDto {
-    pub provider_id: String,
-    pub model_id: String,
-    pub provider: String,
-    pub api: String,
-    pub upstream_model: String,
-    pub reasoning_level: Option<String>,
-    pub access_mode: String,
-    pub config_generation: String,
-}
-
-/// V4 历史只保存冻结 change-set 摘要；精确 diff 内容必须通过受身份约束的 artifact reader 读取。
+/// 历史只保存 Java tracker 冻结的 change-set 摘要；精确 diff 必须通过受身份约束的 artifact reader 读取。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TurnChangeSetDto {
     pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub incomplete_reasons: Vec<String>,
     pub files: Vec<TurnChangeFileDto>,
     pub stats: TurnChangeStatsDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
 }
 
-/// 单文件变化保持相对路径和可证明的行统计；binary 文件不接受伪造的文本行数。
+/// 单文件变化只接受精确文本 tracker 的三种净状态和完整行统计，不在 Rust 推断 rename。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TurnChangeFileDto {
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_path: Option<String>,
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additions: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deletions: Option<u64>,
+    pub additions: u64,
+    pub deletions: u64,
     pub binary: bool,
     pub truncated: bool,
 }
 
-/// 聚合统计与冻结文件列表绑定；unavailable 快照必须保持全零且非 truncated。
+/// 聚合统计必须与冻结文件列表逐项一致，避免恢复后向 WebView 投影矛盾摘要。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TurnChangeStatsDto {
@@ -378,8 +449,39 @@ pub(super) fn dispatch_mutation(
     Ok(accepted)
 }
 
+/// Seen/archive/restore 都返回完整 Thread；固定 enum 参数避免形成任意 history method tunnel。
+pub(super) fn dispatch_thread_lifecycle(
+    input: ThreadMutationInput,
+    state: &RuntimeHost,
+    method: HistoryMethod,
+) -> Result<ThreadDto, RuntimeCommandError> {
+    validate_prefixed(&input.thread_id, "thr_", 100)?;
+    validate_revision(input.expected_thread_revision)?;
+    let result = request_history(
+        state,
+        method,
+        serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
+    )?;
+    parse_thread(result)
+}
+
+/// Pin 使用显式目标状态与 revision CAS，成功后解析完整服务端投影。
+pub(super) fn dispatch_pin(
+    input: ThreadPinInput,
+    state: &RuntimeHost,
+) -> Result<ThreadDto, RuntimeCommandError> {
+    validate_prefixed(&input.thread_id, "thr_", 100)?;
+    validate_revision(input.expected_thread_revision)?;
+    let result = request_history(
+        state,
+        HistoryMethod::ThreadPin,
+        serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
+    )?;
+    parse_thread(result)
+}
+
 /// 设计原因：该函数集中维护 History DTO 的边界与完整性，避免 command 重复协议判断。
-/// 请求到达 actor 前应用公共 v2 keyset 上限。
+/// 请求到达 actor 前应用公共 v1 keyset 上限。
 pub(super) fn validate_page(input: &PageInput) -> Result<(), RuntimeCommandError> {
     validate_pagination(&input.cursor, input.limit)
 }
@@ -429,6 +531,7 @@ pub(crate) fn validate_thread_create(input: &ThreadCreateInput) -> Result<(), Ru
         &input.model_id,
         input.reasoning_level.as_deref(),
         &input.access_mode,
+        &input.collaboration_mode,
     )?;
     validate_title(&input.title)?;
     Ok(())
@@ -451,6 +554,7 @@ pub(crate) fn validate_thread_preferences_update(
         &input.model_id,
         input.reasoning_level.as_deref(),
         &input.access_mode,
+        &input.collaboration_mode,
     )?;
     validate_revision(input.expected_thread_revision)
 }
@@ -498,6 +602,10 @@ pub(crate) fn parse_thread(value: Value) -> Result<ThreadDto, RuntimeCommandErro
             "preferences",
             "title",
             "status",
+            "pinned",
+            "latestTurnStatus",
+            "latestTurnSeen",
+            "activeGoalId",
             "revision",
             "createdAt",
             "updatedAt",
@@ -518,8 +626,8 @@ pub(crate) fn parse_thread_page(value: Value) -> Result<ThreadListResult, Runtim
     Ok(page)
 }
 
-/// 解析权威 V4 snapshot；先检查嵌套判别联合与必需 nullable 字段，再反序列化 typed DTO。
-/// 这样无计量时显式 `contextUsage:null` 可恢复，而缺失 `runtime/changeSet/completedAt/errorCode` 不会被
+/// 解析权威首版 snapshot；先检查嵌套判别联合与必需 nullable 字段，再反序列化 typed DTO。
+/// 这样无计量时显式 `contextUsage:null` 可恢复，而缺失 `changeSet/completedAt/errorCode` 不会被
 /// `Option` 静默当成同一种语义；失败日志只记录稳定阶段，不包含正文或 raw payload。
 pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, RuntimeCommandError> {
     let object = value
@@ -532,7 +640,10 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
                     "revision",
                     "turns",
                     "items",
+                    "taskActivities",
+                    "goalActivities",
                     "contextUsage",
+                    "inputQueue",
                     "nextCursor",
                 ],
             )
@@ -552,11 +663,34 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
     if items.len() > MAX_PAGE as usize || !items.iter().all(valid_snapshot_item_wire) {
         return Err(history_response_rejected("thread_read_items_shape"));
     }
+    let thread_id = object
+        .get("threadId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| history_response_rejected("thread_read_identity"))?;
+    validate_thread_task_activities(object.get("taskActivities"), thread_id)
+        .map_err(|_| history_response_rejected("thread_read_task_activities"))?;
+    validate_thread_goal_activities(object.get("goalActivities"))
+        .map_err(|_| history_response_rejected("thread_read_goal_activities"))?;
     if !object
         .get("contextUsage")
         .is_some_and(|usage| usage.is_null() || valid_context_usage_wire(usage))
     {
         return Err(history_response_rejected("thread_read_context_usage_shape"));
+    }
+    if !object.get("inputQueue").is_some_and(|queue| {
+        queue.is_null()
+            || queue
+                .get("turnId")
+                .and_then(Value::as_str)
+                .is_some_and(|turn_id| {
+                    crate::app_runtime::infrastructure::bridge::operations::parse_input_queue(
+                        Some(queue),
+                        turn_id,
+                    )
+                    .is_ok()
+                })
+    }) {
+        return Err(history_response_rejected("thread_read_input_queue_shape"));
     }
     let result: ThreadReadResult = serde_json::from_value(value)
         .map_err(|_| history_response_rejected("thread_read_decode"))?;
@@ -565,6 +699,8 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
     if result.revision > MAX_SAFE_INTEGER
         || result.turns.len() > MAX_PAGE as usize
         || result.items.len() > MAX_PAGE as usize
+        || result.task_activities.len() > 128
+        || result.goal_activities.len() > 128
     {
         return Err(history_response_rejected("thread_read_limits"));
     }
@@ -576,6 +712,20 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
     if let Some(usage) = &result.context_usage {
         validate_context_usage(usage, &result.turns)
             .map_err(|_| history_response_rejected("thread_read_context_usage_semantics"))?;
+    }
+    if let Some(queue) = &result.input_queue {
+        let owner_is_manageable = result.turns.iter().any(|turn| {
+            turn.turn_id == queue.turn_id
+                && matches!(
+                    turn.status.as_str(),
+                    "queued" | "running" | "waiting_approval" | "suspended"
+                )
+        });
+        if !owner_is_manageable {
+            return Err(history_response_rejected(
+                "thread_read_input_queue_semantics",
+            ));
+        }
     }
     let encoded = serde_json::to_vec(&result.items)
         .map_err(|_| history_response_rejected("thread_read_encode"))?;
@@ -592,8 +742,80 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
     Ok(result)
 }
 
-/// V4 Turn 的四个 nullable 字段在 wire 上必须存在；`null` 表示历史事实未知/不存在，缺失则
-/// 表示协议漂移。change-set 对象继续进入其专用闭集校验。
+/// Goal 终态按 SQLite 全局 event sequence 升序且 identity 唯一，避免重载后卡片重排或重复。
+fn validate_thread_goal_activities(value: Option<&Value>) -> Result<(), RuntimeCommandError> {
+    let entries = value
+        .and_then(Value::as_array)
+        .filter(|entries| entries.len() <= 128)
+        .ok_or_else(|| history_response_rejected("thread_read_goal_activities_shape"))?;
+    let mut previous_sequence = None;
+    let mut goal_ids = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let activity: ThreadGoalActivityDto = serde_json::from_value(entry.clone())
+            .map_err(|_| history_response_rejected("thread_read_goal_activity_shape"))?;
+        if validate_prefixed(&activity.goal_id, "goal_", 100).is_err()
+            || activity.objective.is_empty()
+            || activity.objective.len() > 32_768
+            || !matches!(activity.status.as_str(), "achieved" | "stopped")
+            || activity.goal_revision == 0
+            || activity.goal_revision > MAX_SAFE_INTEGER
+            || activity.event_sequence == 0
+            || activity.event_sequence > MAX_SAFE_INTEGER
+            || !valid_timestamp(&activity.occurred_at)
+            || previous_sequence.is_some_and(|previous| activity.event_sequence <= previous)
+            || !goal_ids.insert(activity.goal_id)
+        {
+            return Err(history_response_rejected(
+                "thread_read_goal_activity_semantics",
+            ));
+        }
+        previous_sequence = Some(activity.event_sequence);
+    }
+    Ok(())
+}
+
+/// Activity 列表复用 Task 响应的严格解析器并补齐 JSON 无法表达的 root、顺序与唯一性关联。
+fn validate_thread_task_activities(
+    value: Option<&Value>,
+    thread_id: &str,
+) -> Result<(), RuntimeCommandError> {
+    let entries = value
+        .and_then(Value::as_array)
+        .filter(|entries| entries.len() <= 128)
+        .ok_or_else(|| history_response_rejected("thread_read_task_activities_shape"))?;
+    let mut previous_sequence = None;
+    let mut activity_ids = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .filter(|object| exact_keys(object, &["activity", "task"]))
+            .ok_or_else(|| history_response_rejected("thread_read_task_activity_shape"))?;
+        let activity_value = object.get("activity").unwrap_or(&Value::Null);
+        let task_value = object.get("task").unwrap_or(&Value::Null);
+        let activity =
+            crate::app_runtime::infrastructure::bridge::tasks::parse_task_activity_value(
+                activity_value,
+            )?;
+        let task = crate::app_runtime::infrastructure::bridge::tasks::parse_task_summary_value(
+            task_value,
+        )?;
+        let sequence = activity.activity_sequence;
+        if activity.task_thread_id != task.task_thread_id
+            || task.root_thread_id != thread_id
+            || sequence > task.latest_activity_sequence
+            || previous_sequence.is_some_and(|previous| sequence <= previous)
+            || !activity_ids.insert(activity.activity_id)
+        {
+            return Err(history_response_rejected(
+                "thread_read_task_activity_semantics",
+            ));
+        }
+        previous_sequence = Some(sequence);
+    }
+    Ok(())
+}
+
+/// Turn 的三个 nullable 字段在 wire 上必须存在；旧 runtime 字段会被闭集直接拒绝。
 fn valid_snapshot_turn_wire(value: &Value) -> bool {
     value.as_object().is_some_and(|turn| {
         exact_keys(
@@ -601,7 +823,6 @@ fn valid_snapshot_turn_wire(value: &Value) -> bool {
             &[
                 "turnId",
                 "status",
-                "runtime",
                 "requestedAt",
                 "updatedAt",
                 "completedAt",
@@ -609,11 +830,8 @@ fn valid_snapshot_turn_wire(value: &Value) -> bool {
                 "errorCode",
             ],
         ) && turn
-            .get("runtime")
-            .is_some_and(|runtime| runtime.is_null() || valid_runtime_snapshot_wire(runtime))
-            && turn
-                .get("completedAt")
-                .is_some_and(|completed| completed.is_null() || valid_timestamp_value(completed))
+            .get("completedAt")
+            .is_some_and(|completed| completed.is_null() || valid_timestamp_value(completed))
             && turn.get("errorCode").is_some_and(|error| {
                 error.is_null() || error.as_str().is_some_and(valid_error_code)
             })
@@ -623,28 +841,7 @@ fn valid_snapshot_turn_wire(value: &Value) -> bool {
     })
 }
 
-/// Runtime snapshot 的 nullable reasoningLevel 必须显式存在，防止缺列与模型默认值混为一谈。
-fn valid_runtime_snapshot_wire(value: &Value) -> bool {
-    value.as_object().is_some_and(|runtime| {
-        exact_keys(
-            runtime,
-            &[
-                "providerId",
-                "modelId",
-                "provider",
-                "api",
-                "upstreamModel",
-                "reasoningLevel",
-                "accessMode",
-                "configGeneration",
-            ],
-        ) && runtime
-            .get("reasoningLevel")
-            .is_some_and(|level| level.is_null() || level.as_str().is_some_and(is_reasoning_level))
-    })
-}
-
-/// Usage wire 是封闭对象且数值必须能被 JavaScript 精确表达；加法使用 checked_add 防止溢出绕过。
+/// Usage wire 必须同时声明请求顺序与完整画像；UNKNOWN 只允许 Token 为空。
 fn valid_context_usage_wire(value: &Value) -> bool {
     let Some(usage) = value.as_object() else {
         return false;
@@ -653,31 +850,128 @@ fn valid_context_usage_wire(value: &Value) -> bool {
         usage,
         &[
             "turnId",
+            "requestId",
+            "requestOrdinal",
             "modelRound",
+            "purpose",
+            "certainty",
+            "profile",
             "inputTokens",
             "outputTokens",
             "totalTokens",
             "measuredAt",
         ],
     ) || !validate_prefixed_value(usage.get("turnId"), "turn_", 128)
+        || !validate_prefixed_value(usage.get("requestId"), "request_", 103)
+        || !integer_in_range(usage.get("requestOrdinal"), 1, MAX_SAFE_INTEGER)
         || !integer_in_range(usage.get("modelRound"), 1, 128)
-        || !integer_in_range(usage.get("inputTokens"), 0, MAX_SAFE_INTEGER)
-        || !integer_in_range(usage.get("outputTokens"), 0, MAX_SAFE_INTEGER)
-        || !integer_in_range(usage.get("totalTokens"), 0, MAX_SAFE_INTEGER)
+        || !matches!(
+            usage.get("purpose").and_then(Value::as_str),
+            Some("assistant" | "summary")
+        )
         || !usage.get("measuredAt").is_some_and(valid_timestamp_value)
     {
         return false;
     }
-    usage
-        .get("inputTokens")
-        .and_then(Value::as_u64)
-        .zip(usage.get("outputTokens").and_then(Value::as_u64))
-        .and_then(|(input, output)| input.checked_add(output))
-        .zip(usage.get("totalTokens").and_then(Value::as_u64))
-        .is_some_and(|(minimum, total)| total >= minimum)
+    if !usage
+        .get("profile")
+        .is_some_and(valid_provider_request_profile_wire)
+    {
+        return false;
+    }
+    match usage.get("certainty").and_then(Value::as_str) {
+        Some("known") => {
+            integer_in_range(usage.get("inputTokens"), 0, MAX_SAFE_INTEGER)
+                && integer_in_range(usage.get("outputTokens"), 0, MAX_SAFE_INTEGER)
+                && integer_in_range(usage.get("totalTokens"), 0, MAX_SAFE_INTEGER)
+                && usage
+                    .get("inputTokens")
+                    .and_then(Value::as_u64)
+                    .zip(usage.get("outputTokens").and_then(Value::as_u64))
+                    .and_then(|(input, output)| input.checked_add(output))
+                    .zip(usage.get("totalTokens").and_then(Value::as_u64))
+                    .is_some_and(|(minimum, total)| total >= minimum)
+        }
+        Some("unknown") => ["inputTokens", "outputTokens", "totalTokens"]
+            .iter()
+            .all(|key| usage.get(*key).is_some_and(Value::is_null)),
+        _ => false,
+    }
 }
 
-/// V4 item 是封闭判别联合；按 kind 检查精确 key，避免 serde `Value` 接受残缺 Tool、审批或
+/// 请求画像使用封闭字段集和正数预算；缺字段时不能由当前配置补齐。
+fn valid_provider_request_profile_wire(value: &Value) -> bool {
+    let Some(profile) = value.as_object() else {
+        return false;
+    };
+    exact_keys(
+        profile,
+        &[
+            "providerId",
+            "modelId",
+            "api",
+            "upstreamModel",
+            "requestedReasoning",
+            "effectiveReasoning",
+            "accessMode",
+            "collaborationMode",
+            "configGeneration",
+            "promptRevision",
+            "toolCatalogRevision",
+            "contextWindowTokens",
+            "maxOutputTokens",
+        ],
+    ) && validate_prefixed_value(profile.get("providerId"), "provider_", 128)
+        && validate_prefixed_value(profile.get("modelId"), "model_", 128)
+        && matches!(
+            profile.get("api").and_then(Value::as_str),
+            Some("anthropic_messages" | "openai_responses" | "openai_chat_completions")
+        )
+        && profile
+            .get("upstreamModel")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+            })
+        && ["requestedReasoning", "effectiveReasoning"]
+            .iter()
+            .all(|field| {
+                profile.get(*field).is_some_and(|value| {
+                    value.is_null() || value.as_str().is_some_and(is_reasoning_level)
+                })
+            })
+        && matches!(
+            profile.get("accessMode").and_then(Value::as_str),
+            Some("approval_required" | "full_access")
+        )
+        && matches!(
+            profile.get("collaborationMode").and_then(Value::as_str),
+            Some("default" | "plan")
+        )
+        && profile
+            .get("configGeneration")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("cfg_") && value.len() <= 128)
+        && ["promptRevision", "toolCatalogRevision"]
+            .iter()
+            .all(|field| {
+                profile
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        !value.is_empty()
+                            && value.len() <= 256
+                            && value.chars().all(|character| {
+                                character.is_ascii_alphanumeric()
+                                    || matches!(character, '_' | '-' | '.' | ':')
+                            })
+                    })
+            })
+        && integer_in_range(profile.get("contextWindowTokens"), 1, MAX_SAFE_INTEGER)
+        && integer_in_range(profile.get("maxOutputTokens"), 1, MAX_SAFE_INTEGER)
+}
+
+/// 首版 item 是封闭判别联合；按 kind 检查精确 key，避免 serde `Value` 接受残缺 Tool、审批或
 ///附件记录，同时只验证安全展示 DTO，不允许 raw arguments/result 回到 WebView。
 fn valid_snapshot_item_wire(value: &Value) -> bool {
     let Some(item) = value.as_object() else {
@@ -690,7 +984,19 @@ fn valid_snapshot_item_wire(value: &Value) -> bool {
         return false;
     }
     match item.get("kind").and_then(Value::as_str) {
-        Some("user_input" | "final_answer") => {
+        Some("user_input") => {
+            exact_keys(item, &["itemId", "createdAt", "turnId", "kind", "content", "attachments"])
+                && item.get("turnId").and_then(Value::as_str).is_some_and(|turn_id| {
+                    crate::app_runtime::infrastructure::bridge::operations::parse_turn_content(
+                        item.get("content"), turn_id,
+                    ).and_then(|content| {
+                        crate::app_runtime::infrastructure::bridge::operations::parse_attachment_summaries(
+                            item.get("attachments"), &content,
+                        )
+                    }).is_ok()
+                })
+        }
+        Some("final_answer") => {
             exact_keys(item, &["itemId", "createdAt", "turnId", "kind", "text"])
                 && item
                     .get("text")
@@ -760,41 +1066,6 @@ fn valid_snapshot_item_wire(value: &Value) -> bool {
                             .as_str()
                             .is_some_and(|value| matches!(value, "approve" | "deny"))
                 })
-        }
-        Some("attachment") => {
-            exact_keys(
-                item,
-                &[
-                    "itemId",
-                    "createdAt",
-                    "turnId",
-                    "kind",
-                    "attachmentId",
-                    "displayName",
-                    "sizeBytes",
-                    "mediaKind",
-                    "mediaType",
-                    "state",
-                ],
-            ) && validate_prefixed_value(item.get("attachmentId"), "att_", 101)
-                && item.get("displayName").is_some_and(valid_safe_name)
-                && integer_in_range(item.get("sizeBytes"), 0, 104_857_600)
-                && item
-                    .get("mediaKind")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "text" | "image" | "pdf" | "binary"))
-                && item.get("mediaType").is_some_and(|media_type| {
-                    media_type.as_str().is_some_and(|value| {
-                        (3..=128).contains(&value.chars().count())
-                            && !value.chars().any(char::is_control)
-                    })
-                })
-                && item
-                    .get("state")
-                    .and_then(Value::as_str)
-                    .is_some_and(|state| {
-                        matches!(state, "draft" | "bound" | "discarded" | "expired")
-                    })
         }
         _ => false,
     }
@@ -878,27 +1149,41 @@ fn valid_tool_presentation_wire(value: &Value) -> bool {
         })
 }
 
-/// Frozen change-set 的 available/unavailable 变体使用不同 key 集合；旧 Turn 使用顶层 null，
-/// 不接受缺失字段或兼容别名。
+/// Frozen change-set 与运行预览共享 JA-RPC 1.0 的唯一完整性合同；旧 Turn 只允许顶层 null，
+/// 不接受旧状态、原因别名或 rename 推断。
 fn valid_change_set_wire(value: &Value) -> bool {
     let Some(change_set) = value.as_object() else {
         return false;
     };
     let state = change_set.get("state").and_then(Value::as_str);
-    let keys_valid = match state {
-        Some("available") => {
-            exact_keys_allowing(change_set, &["state", "files", "stats"], &["artifactId"])
-        }
-        Some("unavailable") => exact_keys(change_set, &["state", "reason", "files", "stats"]),
-        _ => false,
+    if !matches!(state, Some("complete" | "partial"))
+        || !exact_keys_allowing(
+            change_set,
+            &["state", "incompleteReasons", "files", "stats"],
+            &["artifactId"],
+        )
+    {
+        return false;
+    }
+    let Some(reasons) = change_set
+        .get("incompleteReasons")
+        .and_then(Value::as_array)
+    else {
+        return false;
     };
-    if !keys_valid {
+    if reasons.len() > 7
+        || reasons.iter().enumerate().any(|(index, reason)| {
+            !reason.as_str().is_some_and(valid_change_incomplete_reason)
+                || reasons[..index].iter().any(|previous| previous == reason)
+        })
+        || (state == Some("complete")) != reasons.is_empty()
+    {
         return false;
     }
     let Some(files) = change_set.get("files").and_then(Value::as_array) else {
         return false;
     };
-    if files.len() > 10_000 || !files.iter().all(valid_change_file_wire) {
+    if files.len() > 256 || !files.iter().all(valid_change_file_wire) {
         return false;
     }
     let Some(stats) = change_set.get("stats").and_then(Value::as_object) else {
@@ -913,82 +1198,93 @@ fn valid_change_set_wire(value: &Value) -> bool {
             "binaryFiles",
             "truncated",
         ],
-    ) || !integer_in_range(stats.get("files"), 0, 10_000)
+    ) || !integer_in_range(stats.get("files"), 0, 256)
         || !integer_in_range(stats.get("additions"), 0, MAX_SAFE_INTEGER)
         || !integer_in_range(stats.get("deletions"), 0, MAX_SAFE_INTEGER)
-        || !integer_in_range(stats.get("binaryFiles"), 0, 10_000)
+        || !integer_in_range(stats.get("binaryFiles"), 0, 256)
         || !stats.get("truncated").is_some_and(Value::is_boolean)
         || stats.get("files").and_then(Value::as_u64) != Some(files.len() as u64)
     {
         return false;
     }
-    match state {
-        Some("available") => optional_value(change_set.get("artifactId"), |artifact| {
-            validate_prefixed_value(Some(artifact), "artifact_", 128)
-        }),
-        Some("unavailable") => {
-            files.is_empty()
-                && change_set
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .is_some_and(|reason| {
-                        matches!(
-                            reason,
-                            "concurrent_turn" | "not_git" | "capture_failed" | "diff_too_large"
-                        )
-                    })
-                && stats.get("files").and_then(Value::as_u64) == Some(0)
-                && stats.get("additions").and_then(Value::as_u64) == Some(0)
-                && stats.get("deletions").and_then(Value::as_u64) == Some(0)
-                && stats.get("binaryFiles").and_then(Value::as_u64) == Some(0)
-                && stats.get("truncated").and_then(Value::as_bool) == Some(false)
-        }
-        _ => false,
-    }
+    let additions = files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.get("additions")?.as_u64()?)
+    });
+    let deletions = files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.get("deletions")?.as_u64()?)
+    });
+    optional_value(change_set.get("artifactId"), |artifact| {
+        validate_prefixed_value(Some(artifact), "artifact_", 128)
+    }) && stats.get("additions").and_then(Value::as_u64) == additions
+        && stats.get("deletions").and_then(Value::as_u64) == deletions
+        && stats.get("binaryFiles").and_then(Value::as_u64)
+            == Some(
+                files
+                    .iter()
+                    .filter(|file| file.get("binary") == Some(&Value::Bool(true)))
+                    .count() as u64,
+            )
+        && stats.get("truncated").and_then(Value::as_bool)
+            == Some(
+                files
+                    .iter()
+                    .any(|file| file.get("truncated") == Some(&Value::Bool(true))),
+            )
 }
 
-/// 单文件 shape 允许按文本/binary 事实省略行统计，并强制 oldPath 只属于 rename。
+/// 单文件 shape 精确镜像 Java 文本 tracker；binary 字段保留跨端结构但当前只允许 false。
 fn valid_change_file_wire(value: &Value) -> bool {
     let Some(file) = value.as_object() else {
         return false;
     };
-    if !exact_keys_allowing(
+    exact_keys(
         file,
-        &["path", "status", "binary", "truncated"],
-        &["oldPath", "additions", "deletions"],
-    ) || !file.get("path").is_some_and(valid_relative_path)
-        || !file.get("binary").is_some_and(Value::is_boolean)
-        || !file.get("truncated").is_some_and(Value::is_boolean)
-        || !optional_value(file.get("additions"), |value| {
-            integer_in_range(Some(value), 0, MAX_SAFE_INTEGER)
-        })
-        || !optional_value(file.get("deletions"), |value| {
-            integer_in_range(Some(value), 0, MAX_SAFE_INTEGER)
-        })
-    {
-        return false;
-    }
-    let renamed = file.get("status").and_then(Value::as_str) == Some("renamed");
-    if !file
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "added" | "modified" | "deleted" | "renamed"))
-        || renamed != file.contains_key("oldPath")
-        || !optional_value(file.get("oldPath"), valid_relative_path)
-    {
-        return false;
-    }
-    !file.get("binary").and_then(Value::as_bool).unwrap_or(false)
-        || (!file.contains_key("additions") && !file.contains_key("deletions"))
+        &[
+            "path",
+            "status",
+            "additions",
+            "deletions",
+            "binary",
+            "truncated",
+        ],
+    ) && file.get("path").is_some_and(valid_relative_path)
+        && file
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "added" | "modified" | "deleted"))
+        && integer_in_range(file.get("additions"), 0, MAX_SAFE_INTEGER)
+        && integer_in_range(file.get("deletions"), 0, MAX_SAFE_INTEGER)
+        && file.get("binary").and_then(Value::as_bool) == Some(false)
+        && file.get("truncated").is_some_and(Value::is_boolean)
 }
 
-/// 严格校验历史 Turn 与两类 Provider API；Rust 不推导缺失运行快照或错误语义。
+/// partial 原因保持七项闭集，防止旧不可用原因或未来未支持语义被恢复为可信摘要。
+fn valid_change_incomplete_reason(value: &str) -> bool {
+    matches!(
+        value,
+        "unknown_mutator"
+            | "mutation_chain_broken"
+            | "outside_workspace"
+            | "limit_exceeded"
+            | "capture_failed"
+            | "commit_unconfirmed"
+            | "recovery_boundary"
+    )
+}
+
+/// 严格校验历史 Turn 与 Wire API；Rust 不推导供应商品牌或错误语义。
 fn validate_snapshot_turn(turn: &ThreadSnapshotTurnDto) -> Result<(), RuntimeCommandError> {
     validate_prefixed(&turn.turn_id, "turn_", 128)
         .map_err(|_| RuntimeCommandError::unavailable())?;
     if !matches!(
         turn.status.as_str(),
-        "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled"
+        "queued"
+            | "running"
+            | "waiting_approval"
+            | "suspended"
+            | "completed"
+            | "failed"
+            | "cancelled"
     ) || !valid_timestamp(&turn.requested_at)
         || !valid_timestamp(&turn.updated_at)
         || turn
@@ -1002,59 +1298,92 @@ fn validate_snapshot_turn(turn: &ThreadSnapshotTurnDto) -> Result<(), RuntimeCom
     {
         return Err(RuntimeCommandError::unavailable());
     }
-    if let Some(runtime) = &turn.runtime {
-        validate_prefixed(&runtime.provider_id, "provider_", 128)
-            .map_err(|_| RuntimeCommandError::unavailable())?;
-        validate_prefixed(&runtime.model_id, "model_", 128)
-            .map_err(|_| RuntimeCommandError::unavailable())?;
-        if !matches!(runtime.provider.as_str(), "openai" | "anthropic")
-            || !matches!(
-                runtime.api.as_str(),
-                "openai_responses" | "anthropic_messages"
-            )
-            || runtime.upstream_model.is_empty()
-            || runtime.upstream_model.len() > 512
-            || runtime.upstream_model.chars().any(char::is_control)
-            || runtime
-                .reasoning_level
-                .as_ref()
-                .is_some_and(|value| !is_reasoning_level(value))
-            || !matches!(
-                runtime.access_mode.as_str(),
-                "approval_required" | "full_access"
-            )
-            || !runtime.config_generation.starts_with("cfg_")
-            || runtime.config_generation.len() > 128
-        {
-            return Err(RuntimeCommandError::unavailable());
-        }
-    }
     Ok(())
 }
 
-/// 恢复 Usage 时同时绑定快照中的真实 Turn；Tool-only 轮次不要求存在可见文本，但身份不能悬空。
+/// 恢复 Usage 时同时校验请求 identity 与所属 Turn；事件外壳不参与冷启动恢复，因而快照必须
+/// 自带关联键，并拒绝指向当前分页中不存在 Turn 的悬空计量事实。
 fn validate_context_usage(
     usage: &ThreadContextUsageDto,
     turns: &[ThreadSnapshotTurnDto],
 ) -> Result<(), RuntimeCommandError> {
     validate_prefixed(&usage.turn_id, "turn_", 128)
         .map_err(|_| RuntimeCommandError::unavailable())?;
-    let tokens_valid = usage.model_round > 0
+    validate_prefixed(&usage.request_id, "request_", 103)
+        .map_err(|_| RuntimeCommandError::unavailable())?;
+    let profile_valid = validate_provider_request_profile(&usage.profile);
+    let tokens_valid = usage.request_ordinal > 0
+        && usage.request_ordinal <= MAX_SAFE_INTEGER
+        && usage.model_round > 0
         && usage.model_round <= 128
-        && usage.input_tokens <= MAX_SAFE_INTEGER
-        && usage.output_tokens <= MAX_SAFE_INTEGER
-        && usage.total_tokens <= MAX_SAFE_INTEGER
-        && usage
-            .input_tokens
-            .checked_add(usage.output_tokens)
-            .is_some_and(|minimum| usage.total_tokens >= minimum);
-    if !tokens_valid
+        && matches!(usage.purpose.as_str(), "assistant" | "summary")
+        && match (
+            usage.certainty.as_str(),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+        ) {
+            ("known", Some(input), Some(output), Some(total)) => {
+                input <= MAX_SAFE_INTEGER
+                    && output <= MAX_SAFE_INTEGER
+                    && total <= MAX_SAFE_INTEGER
+                    && input
+                        .checked_add(output)
+                        .is_some_and(|minimum| total >= minimum)
+            }
+            ("unknown", None, None, None) => true,
+            _ => false,
+        };
+    if !profile_valid
+        || !tokens_valid
         || !valid_timestamp(&usage.measured_at)
         || !turns.iter().any(|turn| turn.turn_id == usage.turn_id)
     {
         return Err(RuntimeCommandError::unavailable());
     }
     Ok(())
+}
+
+/// 对 serde 后的请求画像重复关键语义校验，避免仅依赖预解析 JSON 形状。
+fn validate_provider_request_profile(profile: &ProviderRequestProfileDto) -> bool {
+    validate_prefixed(&profile.provider_id, "provider_", 128).is_ok()
+        && validate_prefixed(&profile.model_id, "model_", 128).is_ok()
+        && matches!(
+            profile.api.as_str(),
+            "anthropic_messages" | "openai_responses" | "openai_chat_completions"
+        )
+        && !profile.upstream_model.is_empty()
+        && profile.upstream_model.len() <= 512
+        && !profile.upstream_model.chars().any(char::is_control)
+        && profile
+            .requested_reasoning
+            .as_deref()
+            .is_none_or(is_reasoning_level)
+        && profile
+            .effective_reasoning
+            .as_deref()
+            .is_none_or(is_reasoning_level)
+        && matches!(
+            profile.access_mode.as_str(),
+            "approval_required" | "full_access"
+        )
+        && matches!(profile.collaboration_mode.as_str(), "default" | "plan")
+        && profile.config_generation.starts_with("cfg_")
+        && profile.config_generation.len() <= 128
+        && [
+            profile.prompt_revision.as_str(),
+            profile.tool_catalog_revision.as_str(),
+        ]
+        .iter()
+        .all(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+                })
+        })
+        && (1..=MAX_SAFE_INTEGER).contains(&profile.context_window_tokens)
+        && (1..=MAX_SAFE_INTEGER).contains(&profile.max_output_tokens)
 }
 
 /// History parser 的拒绝日志只写稳定阶段与内部错误码；不得记录 Thread ID、绝对路径、正文、
@@ -1152,6 +1481,7 @@ fn validate_thread(thread: &ThreadDto) -> Result<(), RuntimeCommandError> {
             &preferences.model_id,
             preferences.reasoning_level.as_deref(),
             &preferences.access_mode,
+            &preferences.collaboration_mode,
         )
         .map_err(|_| RuntimeCommandError::unavailable())?;
         if !matches!(
@@ -1164,6 +1494,23 @@ fn validate_thread(thread: &ThreadDto) -> Result<(), RuntimeCommandError> {
     if thread.title.is_empty()
         || thread.title.len() > MAX_TITLE
         || !matches!(thread.status.as_str(), "active" | "archived" | "deleted")
+        || thread.latest_turn_status.as_deref().is_some_and(|status| {
+            !matches!(
+                status,
+                "queued"
+                    | "running"
+                    | "waiting_approval"
+                    | "suspended"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+            )
+        })
+        || thread.latest_turn_status.is_none() && !thread.latest_turn_seen
+        || thread
+            .active_goal_id
+            .as_deref()
+            .is_some_and(|value| !valid_goal_id(value))
         || thread.revision > MAX_SAFE_INTEGER
         || !valid_timestamp(&thread.created_at)
         || !valid_timestamp(&thread.updated_at)
@@ -1179,18 +1526,20 @@ fn validate_runtime_preferences(
     model_id: &str,
     reasoning_level: Option<&str>,
     access_mode: &str,
+    collaboration_mode: &str,
 ) -> Result<(), RuntimeCommandError> {
     validate_prefixed(provider_id, "provider_", 128)?;
     validate_prefixed(model_id, "model_", 128)?;
     if reasoning_level.is_some_and(|value| !is_reasoning_level(value))
         || !matches!(access_mode, "approval_required" | "full_access")
+        || !matches!(collaboration_mode, "default" | "plan")
     {
         return Err(RuntimeCommandError::invalid_params());
     }
     Ok(())
 }
 
-/// 仅接受 schema v4 的逻辑思考档位；`None` 由调用方保留为模型默认，不能与 `off` 混同。
+/// 仅接受 schema v1 的逻辑思考档位；`None` 由调用方保留为模型默认，不能与 `off` 混同。
 fn is_reasoning_level(value: &str) -> bool {
     matches!(
         value,
@@ -1269,6 +1618,19 @@ fn validate_prefixed_value(value: Option<&Value>, prefix: &str, maximum: usize) 
 }
 
 /// Tool 名称使用有界 ASCII identifier，禁止路径分隔符与控制字符进入展示路由。
+/// Thread 投影中的 Goal identity 使用协议闭集，不能把任意服务端字符串带入恢复查询。
+fn valid_goal_id(value: &str) -> bool {
+    let Some(body) = value.strip_prefix("goal_") else {
+        return false;
+    };
+    !body.is_empty()
+        && body.len() <= 96
+        && body.as_bytes()[0].is_ascii_alphanumeric()
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn valid_identifier_value(value: &Value) -> bool {
     value.as_str().is_some_and(|identifier| {
         !identifier.is_empty()
@@ -1301,7 +1663,7 @@ fn valid_safe_name(value: &Value) -> bool {
     })
 }
 
-/// V4 历史只允许 workspace-relative `/` 路径；拒绝盘符、绝对路径、反斜杠、ISO 控制字符和
+/// 首版历史只允许 workspace-relative `/` 路径；拒绝盘符、绝对路径、反斜杠、ISO 控制字符和
 /// `..` 父级段，避免 Review 入口恢复后越界。
 fn valid_relative_path(value: &Value) -> bool {
     value.as_str().is_some_and(|path| {

@@ -5,7 +5,7 @@
 //!
 //! 校验独立于进程监督，避免协议 schema 与 child 生命周期清理互相耦合。
 
-use super::catalog::{V2_CLIENT_METHODS, V2_EVENT_METHODS};
+use super::catalog::{V1_CLIENT_METHODS, V1_EVENT_METHODS};
 use super::frame::RpcFrame;
 use super::limits::{Limits, MIN_MAX_FRAME_BYTES};
 use crate::app_server_process::error::AppServerProcessError;
@@ -21,17 +21,19 @@ const READY_TOKEN_HEX_BYTES: usize = READY_TOKEN_BYTES * 2;
 pub(crate) const MAX_READY_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 构造不携带业务配置的 v2 initialize。配置、凭据和 workspace 解析均由
+/// 构造不携带业务配置的 v1 initialize。配置、凭据和 workspace 解析均由
 /// Ja App Server 自己读取/持有；Rust 只协商 transport capability 与资源预算。
 pub(crate) fn default_initialize_params(limits: &Limits) -> Value {
     serde_json::json!({
-        "protocolMajor": 2,
+        "protocolMajor": 1,
         "protocolMinor": 0,
         "clientVersion": "ja-host",
         "capabilities": {
-            "methods": V2_CLIENT_METHODS,
-            "events": V2_EVENT_METHODS,
-            "accessModes": ["approval_required", "full_access"]
+            "methods": V1_CLIENT_METHODS,
+            "events": V1_EVENT_METHODS,
+            "accessModes": ["approval_required", "full_access"],
+            "collaborationModes": ["default", "plan"],
+            "features": ["task_threads_v1", "plan_goal_v1"]
         },
         "limits": limits.to_value(),
     })
@@ -75,15 +77,10 @@ pub(crate) fn validate_initialize_params(
     let object = value
         .as_object()
         .ok_or(AppServerProcessError::InvalidConfig)?;
-    if object.get("protocolMajor").and_then(Value::as_i64) != Some(2) {
+    if object.get("protocolMajor").and_then(Value::as_i64) != Some(1) {
         return Err(AppServerProcessError::InvalidConfig);
     }
-    if object
-        .get("protocolMinor")
-        .and_then(Value::as_i64)
-        .filter(|minor| (0..=i64::from(i32::MAX)).contains(minor))
-        .is_none()
-    {
+    if object.get("protocolMinor").and_then(Value::as_i64) != Some(0) {
         return Err(AppServerProcessError::InvalidConfig);
     }
     if !bounded_string(object.get("clientVersion"), 128) {
@@ -198,15 +195,17 @@ fn fill_csprng(bytes: &mut [u8; READY_TOKEN_BYTES]) -> Result<(), AppServerProce
     }
 }
 
-/// 校验 initialize 两端能力 object；能力只包含方法、事件和两档访问模式。
+/// 校验 initialize 两端能力 object；任务线程能力必须显式协商，不能仅凭方法存在推断。
 pub(crate) fn validate_capabilities(value: Option<&Value>) -> Result<(), AppServerProcessError> {
     let Some(object) = value.and_then(Value::as_object) else {
         return Err(AppServerProcessError::ProtocolFault);
     };
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "methods" | "events" | "accessModes"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "methods" | "events" | "accessModes" | "collaborationModes" | "features"
+        )
+    }) {
         return Err(AppServerProcessError::ProtocolFault);
     }
     validate_string_array(object.get("methods"), 256, 128, None)?;
@@ -217,6 +216,32 @@ pub(crate) fn validate_capabilities(value: Option<&Value>) -> Result<(), AppServ
         32,
         Some(&["approval_required", "full_access"]),
     )?;
+    validate_string_array(
+        object.get("collaborationModes"),
+        2,
+        32,
+        Some(&["default", "plan"]),
+    )?;
+    if object
+        .get("collaborationModes")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.len() != 2)
+    {
+        return Err(AppServerProcessError::ProtocolFault);
+    }
+    validate_string_array(
+        object.get("features"),
+        2,
+        32,
+        Some(&["task_threads_v1", "plan_goal_v1"]),
+    )?;
+    if object
+        .get("features")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.len() != 2)
+    {
+        return Err(AppServerProcessError::ProtocolFault);
+    }
     Ok(())
 }
 
@@ -265,17 +290,6 @@ pub(crate) fn valid_schema_id(value: &str, prefix: &str, max_len: usize) -> bool
         && bytes[1..].iter().all(|byte| {
             byte.is_ascii_alphanumeric() || *byte == b'.' || *byte == b'_' || *byte == b'-'
         })
-}
-
-/// 校验 serverVersion 的受控 ASCII 形状，避免把任意诊断文本当版本字段。
-pub(crate) fn valid_version(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 128
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[1..]
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-' | b'+'))
 }
 
 /// 只接受完整 RFC3339 date-time，避免格式伪造绕过 ready 事件的协议校验。
@@ -405,6 +419,8 @@ pub(crate) fn validate_remote_limits(
         "maxThreadQueuedTurns",
         "maxSnapshotPageItems",
         "maxToolBatchConcurrency",
+        "maxTurnQueuedInputs",
+        "maxTurnQueuedInputBytes",
     ];
     if object
         .keys()
@@ -428,6 +444,8 @@ pub(crate) fn validate_remote_limits(
     let thread_queued_turns = number_usize("maxThreadQueuedTurns")?;
     let snapshot_page_items = number_usize("maxSnapshotPageItems")?;
     let tool_batch_concurrency = number_usize("maxToolBatchConcurrency")?;
+    let turn_queued_inputs = number_usize("maxTurnQueuedInputs")?;
+    let turn_queued_input_bytes = number_usize("maxTurnQueuedInputBytes")?;
     if !(MIN_MAX_FRAME_BYTES..=4_194_304).contains(&max_frame)
         || !(1..=256).contains(&inbound)
         || control_outbound != 64
@@ -438,6 +456,8 @@ pub(crate) fn validate_remote_limits(
         || !(1..=8).contains(&thread_queued_turns)
         || snapshot_page_items != 200
         || !(1..=8).contains(&tool_batch_concurrency)
+        || turn_queued_inputs != 8
+        || turn_queued_input_bytes != 524_288
         || max_frame != local.max_frame_bytes
         || inbound != local.inbound_queue_frames
         || data_outbound != local.outbound_queue_frames

@@ -9,11 +9,11 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * 在编译期镜像冻结的 JA-RPC v2 错误目录，保证数值码、分类与重试语义唯一。
+ * 在编译期镜像冻结的 JA-RPC v1 错误目录，保证数值码、分类与重试语义唯一。
  */
 public enum JaErrorCatalog {
     /**
-     * JSONL 信封结构、编码或字段角色不符合 JA-RPC v2。
+     * JSONL 信封结构、编码或字段角色不符合 JA-RPC v1。
      */
     INVALID_FRAME(-32001, ErrorCategory.PROTOCOL, false),
     /**
@@ -125,6 +125,24 @@ public enum JaErrorCatalog {
      */
     TURN_NOT_FOUND(-32032, ErrorCategory.NOT_FOUND, false),
     /**
+     * Turn 不处于可恢复的挂起状态，或其持久执行游标已经终结。
+     */
+    TURN_NOT_RESUMABLE(-32065, ErrorCategory.CONFLICT, false),
+    /**
+     * 同一 Thread 存在更早的非终态 Turn，必须先按 admission 顺序处理。
+     */
+    TURN_RESUME_ORDER_CONFLICT(-32066, ErrorCategory.CONFLICT, true),
+    /** 单 Turn 的回复中输入队列达到数量或 UTF-8 字节上限。 */
+    TURN_INPUT_QUEUE_FULL(-32068, ErrorCategory.CAPACITY, true),
+    /** 请求引用的待处理输入不存在、已消费或已删除。 */
+    QUEUED_INPUT_NOT_FOUND(-32069, ErrorCategory.NOT_FOUND, false),
+    /** Workspace 文件或目录引用在准入或消费时不再满足权威路径约束。 */
+    WORKSPACE_REFERENCE_INVALID(-32070, ErrorCategory.VALIDATION, false),
+    /** Skill 身份有效，但实时读取 SKILL.md 暂时失败。 */
+    SKILL_LOAD_FAILED(-32071, ErrorCategory.UNAVAILABLE, true),
+    /** 单条结构化消息或权威队列累计内容超过固定字节预算。 */
+    CONTENT_TOO_LARGE(-32072, ErrorCategory.CAPACITY, false),
+    /**
      * 当前领域状态不允许执行请求动作。
      */
     INVALID_STATE(-32034, ErrorCategory.CONFLICT, false),
@@ -168,10 +186,6 @@ public enum JaErrorCatalog {
      * 外部进程输出超过有界采集上限。
      */
     PROCESS_OUTPUT_LIMIT(-32047, ErrorCategory.CAPACITY, false),
-    /**
-     * Provider 官方 Token 计量端点暂时不可用，禁止继续摘要或普通模型发送。
-     */
-    TOKEN_COUNT_UNAVAILABLE(-32048, ErrorCategory.UNAVAILABLE, true),
     /**
      * 摘要生成、修复与确定性降级均无法产生可提交的生产摘要。
      */
@@ -224,6 +238,20 @@ public enum JaErrorCatalog {
     ATTACHMENT_CONFLICT(-32063, ErrorCategory.CONFLICT, false),
     /** staging 或受管内容暂时不可用、已变化或未通过完整性复核。 */
     ATTACHMENT_UNAVAILABLE(-32064, ErrorCategory.UNAVAILABLE, true),
+    /** 请求引用的 Child Thread 不存在于当前任务树。 */
+    TASK_NOT_FOUND(-32073, ErrorCategory.NOT_FOUND, false),
+    /** 父子关系、任务类型或生命周期组合不合法。 */
+    TASK_RELATION_INVALID(-32074, ErrorCategory.VALIDATION, false),
+    /** 创建时声明的父 Thread revision 已过期。 */
+    TASK_CONTEXT_REVISION_CONFLICT(-32075, ErrorCategory.CONFLICT, true),
+    /** 调用方不在同一根任务树或试图扩大冻结权限上限。 */
+    TASK_PERMISSION_DENIED(-32076, ErrorCategory.PERMISSION, false),
+    /** 新 Child Thread 将超过最多四层的任务深度。 */
+    TASK_DEPTH_LIMIT(-32077, ErrorCategory.CAPACITY, false),
+    /** 当前根任务已经达到最多六十四个后代。 */
+    TASK_TREE_LIMIT(-32078, ErrorCategory.CAPACITY, false),
+    /** 目标 Mailbox 已达到持久条目或内容预算。 */
+    TASK_MAILBOX_FULL(-32079, ErrorCategory.CAPACITY, true),
     /**
      * 服务端发生已脱敏的非预期内部错误。
      */
@@ -235,7 +263,29 @@ public enum JaErrorCatalog {
     /**
      * 运行时未能在有界时间内完成关闭。
      */
-    SHUTDOWN_TIMEOUT(-32082, ErrorCategory.TIMEOUT, false);
+    SHUTDOWN_TIMEOUT(-32082, ErrorCategory.TIMEOUT, false),
+    /** 普通 Thread 删除遇到 Child Thread 时必须改用显式整树删除。 */
+    TASK_TREE_DELETE_REQUIRED(-32083, ErrorCategory.CONFLICT, false),
+    /** observe/seen 使用了不存在、过期或不属于当前连接的观察句柄。 */
+    TASK_OBSERVATION_INVALID(-32084, ErrorCategory.NOT_FOUND, false),
+    /** Workspace 写租约未能在 Turn 的冻结期限内取得。 */
+    WORKSPACE_WRITE_LEASE_TIMEOUT(-32085, ErrorCategory.TIMEOUT, true),
+    /** 请求引用的 Goal 不存在或不属于当前可见任务边界。 */
+    GOAL_NOT_FOUND(-32086, ErrorCategory.NOT_FOUND, false),
+    /** mutation 使用了过期 Goal revision，调用方必须重读权威投影。 */
+    GOAL_REVISION_CONFLICT(-32087, ErrorCategory.CONFLICT, true),
+    /** 当前 Goal 状态不允许所请求的生命周期转换。 */
+    GOAL_INVALID_STATE(-32088, ErrorCategory.CONFLICT, false),
+    /** 结构化 Plan、DAG 或验收定义违反冻结约束。 */
+    PLAN_INVALID(-32089, ErrorCategory.VALIDATION, false),
+    /** 批准引用的 Plan revision 或 canonical hash 已失效。 */
+    PLAN_APPROVAL_STALE(-32090, ErrorCategory.CONFLICT, false),
+    /** 当前 revision 缺少完成必要验收所需的可信证据。 */
+    GOAL_EVIDENCE_INCOMPLETE(-32091, ErrorCategory.CONFLICT, false),
+    /** 未知外部副作用或进程代际变化要求用户显式恢复。 */
+    GOAL_RECOVERY_REQUIRED(-32092, ErrorCategory.CONFLICT, false),
+    /** 输入请求已过期，旧回复不能推动 Goal。 */
+    GOAL_INPUT_EXPIRED(-32093, ErrorCategory.TIMEOUT, false);
 
     private static final Map<Integer, JaErrorCatalog> BY_CODE = Arrays.stream(values())
             .collect(Collectors.toUnmodifiableMap(JaErrorCatalog::code, Function.identity()));

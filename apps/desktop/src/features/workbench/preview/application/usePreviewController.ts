@@ -9,7 +9,17 @@ import {
   resolvePreviewNavigation,
   type PreviewUrlProjection,
 } from "../domain/previewModel";
-import type { PreviewPort, PreviewViewport } from "./ports";
+import type { AttachmentPreviewProjection } from "../domain/attachmentPreviewModel";
+import type {
+  AttachmentPreviewPort,
+  AttachmentPreviewTarget,
+  PreviewPort,
+  PreviewViewport,
+} from "./ports";
+import {
+  useAttachmentPreviewController,
+  type AttachmentPreviewActions,
+} from "./useAttachmentPreviewController";
 
 export interface PreviewControllerOptions {
   url: string;
@@ -18,6 +28,9 @@ export interface PreviewControllerOptions {
   error?: string;
   active: boolean;
   port: PreviewPort;
+  attachmentTarget?: AttachmentPreviewTarget;
+  attachmentPort?: AttachmentPreviewPort;
+  onDismissAttachment?: (target: AttachmentPreviewTarget) => void;
 }
 
 export interface PreviewViewModel {
@@ -31,6 +44,8 @@ export interface PreviewViewModel {
   active: boolean;
   canRetryRecovery: boolean;
   canReportViewport: boolean;
+  mode: "web" | "attachment";
+  attachment?: AttachmentPreviewProjection;
 }
 
 export interface PreviewActions {
@@ -38,6 +53,7 @@ export interface PreviewActions {
   submit: () => void;
   retryRecovery: () => void;
   changeViewport: (viewport: PreviewViewport) => void;
+  attachment: AttachmentPreviewActions;
 }
 
 export interface PreviewController {
@@ -53,8 +69,17 @@ export function usePreviewController({
   error,
   active,
   port,
+  attachmentTarget,
+  attachmentPort,
+  onDismissAttachment,
 }: PreviewControllerOptions): PreviewController {
   const [address, dispatch] = useReducer(reducePreviewAddress, url, createPreviewAddressState);
+  const attachment = useAttachmentPreviewController({
+    target: attachmentTarget,
+    port: attachmentPort,
+    onDismiss: onDismissAttachment,
+  });
+  const mode = attachmentTarget === undefined ? "web" : "attachment";
 
   /** native URL 更新时重置本地草稿，避免地址栏继续显示已经过期的用户输入。 */
   useEffect(() => {
@@ -103,6 +128,8 @@ export function usePreviewController({
       active,
       canRetryRecovery: port.retryRecovery !== undefined,
       canReportViewport: port.changeViewport !== undefined,
+      mode,
+      attachment: attachment.projection,
     }),
     [
       active,
@@ -110,12 +137,17 @@ export function usePreviewController({
       address.validationError,
       error,
       loading,
+      mode,
       port.changeViewport,
       port.retryRecovery,
       recovering,
       url,
+      attachment.projection,
     ],
   );
 
-  return { viewModel, actions: { changeDraft, submit, retryRecovery, changeViewport } };
+  return {
+    viewModel,
+    actions: { changeDraft, submit, retryRecovery, changeViewport, attachment: attachment.actions },
+  };
 }

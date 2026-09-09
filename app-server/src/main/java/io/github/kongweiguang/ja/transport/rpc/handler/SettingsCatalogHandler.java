@@ -63,9 +63,11 @@ public final class SettingsCatalogHandler implements RpcHandler {
      * 映射统一的 items 页面，禁止 Skill 正文、来源路径或配置实现类型进入 Wire。
      */
     private ObjectNode skills(ObjectNode params) {
-        RpcParams.requireOnly(params, "cursor", "limit");
+        RpcParams.requireOnly(params, "workspaceId", "cursor", "limit");
+        String workspaceId = RpcParams.optionalText(params, "workspaceId", 100);
+        if (workspaceId != null) workspaceId = RpcParams.identifier(workspaceId, "ws_", 100);
         CursorPage<SkillDescriptor> page = session.catalog().listSkills(
-                RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params));
+                workspaceId, RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params));
         ObjectNode result = session.mapper().createObjectNode();
         ArrayNode values = result.putArray("items");
         page.items().forEach(value -> values.addObject().put("skillId", value.skillId())

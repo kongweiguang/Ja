@@ -3,47 +3,49 @@
 
 import { describe, expect, it } from "vitest";
 import { resolveContextUsage } from "@/features/conversation/domain/contextUsage";
-import type {
-  TimelineContextUsage,
-  TimelineTurnRuntimeSnapshot,
-} from "@/features/conversation/domain/timelineTypes";
+import type { TimelineContextUsage } from "@/features/conversation/domain/timelineTypes";
 
-const RUNTIME: TimelineTurnRuntimeSnapshot = {
+const PROFILE = {
   providerId: "provider_openai",
   modelId: "model_gpt",
-  provider: "openai",
   api: "openai_responses",
   upstreamModel: "gpt-5.6-sol",
-  reasoningLevel: "medium",
+  requestedReasoning: "medium",
+  effectiveReasoning: "medium",
   accessMode: "approval_required",
   configGeneration: "cfg_1",
-};
+  promptRevision: "prompt_1",
+  toolCatalogRevision: "tools_1",
+  contextWindowTokens: 128_000,
+  maxOutputTokens: 16_000,
+} as const;
 
 const USAGE: TimelineContextUsage = {
-  turnId: "turn_1",
+  requestId: "request_1",
+  requestOrdinal: 1,
   modelRound: 1,
+  purpose: "assistant",
+  profile: PROFILE,
+  certainty: "known",
   inputTokens: 42_000,
   outputTokens: 2_000,
   totalTokens: 44_000,
   measuredAt: "2026-08-31T00:00:01Z",
 };
 
-/** 统一构造已通过身份冻结的输入，让各断言只改变其关心的上下文事实。 */
+/** 统一构造已通过请求画像校验的输入，让各断言只改变其关心的上下文事实。 */
 function resolve(overrides: Partial<Parameters<typeof resolveContextUsage>[0]> = {}) {
   return resolveContextUsage({
     usage: USAGE,
-    runtime: RUNTIME,
-    providerId: RUNTIME.providerId,
-    modelId: RUNTIME.modelId,
-    contextWindowTokens: 128_000,
     ...overrides,
   });
 }
 
 describe("context usage presentation", () => {
-  /** 只有 Usage 所属 Turn 的冻结 Provider/Model 与当前选择一致时，才允许显示真实占用。 */
-  it("只向当前模型投影 Provider 的真实输入 Token", () => {
+  /** 上下文窗口只取自该请求画像，当前偏好变化不能改写历史百分比。 */
+  it("只按请求画像投影 Provider 的真实输入 Token", () => {
     expect(resolve()).toEqual({
+      certainty: "known",
       usedTokens: 42_000,
       limitTokens: 128_000,
       percentage: 33,
@@ -52,10 +54,26 @@ describe("context usage presentation", () => {
       source: "provider",
       measuredAt: USAGE.measuredAt,
     });
-    expect(resolve({ providerId: "provider_anthropic" })).toBeUndefined();
-    expect(resolve({ modelId: "model_other" })).toBeUndefined();
     expect(resolve({ usage: undefined })).toBeUndefined();
-    expect(resolve({ runtime: undefined })).toBeUndefined();
+  });
+
+  /** 崩溃窗口的 UNKNOWN Usage 只展示不确定事实，不能参与百分比或压缩覆盖计算。 */
+  it("把未知 Provider Usage 投影为不可量化状态", () => {
+    expect(
+      resolve({
+        usage: {
+          ...USAGE,
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+        },
+      }),
+    ).toEqual({
+      certainty: "unknown",
+      source: "provider",
+      measuredAt: USAGE.measuredAt,
+    });
   });
 
   /** 压缩只在成功且晚于 Provider Usage 时覆盖输入量，旧事件或中间态不能倒退展示事实。 */
@@ -98,8 +116,12 @@ describe("context usage presentation", () => {
   it("在 80% 警告并在 95% 进入危险态", () => {
     expect(
       resolve({
-        usage: { ...USAGE, inputTokens: 79_000, totalTokens: 81_000 },
-        contextWindowTokens: 100_000,
+        usage: {
+          ...USAGE,
+          profile: { ...PROFILE, contextWindowTokens: 100_000 },
+          inputTokens: 79_000,
+          totalTokens: 81_000,
+        },
       }),
     ).toMatchObject({
       percentage: 79,
@@ -107,20 +129,32 @@ describe("context usage presentation", () => {
     });
     expect(
       resolve({
-        usage: { ...USAGE, inputTokens: 80_000, totalTokens: 82_000 },
-        contextWindowTokens: 100_000,
+        usage: {
+          ...USAGE,
+          profile: { ...PROFILE, contextWindowTokens: 100_000 },
+          inputTokens: 80_000,
+          totalTokens: 82_000,
+        },
       }),
     ).toMatchObject({ percentage: 80, ringPercentage: 80, tone: "warning" });
     expect(
       resolve({
-        usage: { ...USAGE, inputTokens: 95_000, totalTokens: 97_000 },
-        contextWindowTokens: 100_000,
+        usage: {
+          ...USAGE,
+          profile: { ...PROFILE, contextWindowTokens: 100_000 },
+          inputTokens: 95_000,
+          totalTokens: 97_000,
+        },
       }),
     ).toMatchObject({ percentage: 95, ringPercentage: 95, tone: "danger" });
     expect(
       resolve({
-        usage: { ...USAGE, inputTokens: 120_000, totalTokens: 122_000 },
-        contextWindowTokens: 100_000,
+        usage: {
+          ...USAGE,
+          profile: { ...PROFILE, contextWindowTokens: 100_000 },
+          inputTokens: 120_000,
+          totalTokens: 122_000,
+        },
       }),
     ).toMatchObject({ percentage: 120, ringPercentage: 100, tone: "danger" });
   });

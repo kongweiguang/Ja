@@ -14,6 +14,7 @@ import io.github.kongweiguang.ja.conversation.application.context.summary.Summar
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryGenerator;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
+import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
 import java.time.Clock;
@@ -28,8 +29,6 @@ import java.util.function.Supplier;
  * 协调纯策略、慢摘要生成和唯一窄 Checkpoint CAS 边界。
  */
 public final class ContextCompactionService {
-    private static final String STRATEGY_VERSION = "ja-context-v3";
-
     private final CheckpointStore checkpoints;
     private final ContextPolicy policy;
     private final SummaryGenerator generator;
@@ -138,11 +137,12 @@ public final class ContextCompactionService {
             throw new ContextException(ContextException.Code.CONTEXT_LIMIT,
                     "compacted context did not produce a smaller sendable envelope");
         }
+        long checkpointSourceRevision = generator.checkpointSourceRevision(request.sourceRevision());
         CheckpointStore.ContextCheckpoint checkpoint = new CheckpointStore.ContextCheckpoint(
                 checkpointIds.get(), request.threadId(), plan.throughOrdinal(),
-                plan.retainedFromOrdinal(), request.sourceRevision(), plan.retainedSplit(), replacement,
+                plan.retainedFromOrdinal(), checkpointSourceRevision, plan.retainedSplit(), replacement,
                 (int) Math.min(Integer.MAX_VALUE, compactedTokens), compactedMeasurement.fingerprint(),
-                STRATEGY_VERSION,
+                ContextCompactionEvent.STRATEGY_VERSION,
                 generated.usage(), clock.instant());
         CheckpointStore.CommittedCheckpoint committed;
         try {
@@ -152,7 +152,8 @@ public final class ContextCompactionService {
              */
             request.cancellation().throwIfCancellationRequested();
             committed = checkpoints.commit(new CheckpointStore.CommitRequest(
-                    request.threadId(), request.sourceRevision(), checkpoint));
+                    request.threadId(), checkpointSourceRevision, checkpoint,
+                    generator.checkpointTurnOperation()));
         } catch (CheckpointStore.CommitConflict failure) {
             throw new ContextException(ContextException.Code.CAS_CONFLICT,
                     "context source changed while summary was generated", failure);
@@ -236,7 +237,7 @@ public final class ContextCompactionService {
             Optional<SummaryDocument> previousInput = previous.hasNoFacts()
                     ? Optional.empty() : Optional.of(previous);
             SummaryGenerator.SummaryResult result = generator.generate(new SummaryGenerator.SummaryRequest(threadId,
-                    previousInput, plan.summaryInput(), plan.splitTurn(), STRATEGY_VERSION,
+                    previousInput, plan.summaryInput(), plan.splitTurn(), ContextCompactionEvent.STRATEGY_VERSION,
                     budget));
             if (result == null || result.document().hasNoFacts()) {
                 throw new ContextException(ContextException.Code.SUMMARY_FAILURE,

@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { FilesSaveCoordinator } from "../FilesSaveCoordinator";
+import type { FilesSaveCoordinator, SaveTimerPort } from "../FilesSaveCoordinator";
 import type { FilesWorkspaceCloseLease, OpenDocument } from "../types";
 import type { ControllerRef, StateWriter } from "./controllerPorts";
 
@@ -23,6 +23,54 @@ interface LifecycleUseCasesContext {
   externalConflictChecks: ControllerRef<Set<string>>;
   setLifecycleClosing: StateWriter<boolean>;
   onNotice?: (message: string) => void;
+  workspaceChangeDeadline?: {
+    timeoutMillis: number;
+    timer: SaveTimerPort;
+  };
+}
+
+const WORKSPACE_CHANGE_FLUSH_TIMEOUT_MILLIS = 5_000;
+
+const systemDeadlineTimer: SaveTimerPort = {
+  /** 生产默认时钟只负责切换交互预算，不取消或伪造底层文件保存结果。 */
+  set: (delayMillis, callback) => globalThis.setTimeout(callback, delayMillis),
+  /** 及时释放已完成 barrier 的计时器，避免长期工作区会话累积无效回调。 */
+  clear: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+};
+
+class WorkspaceChangeFlushTimeoutError extends Error {
+  /** 用具名错误区分交互预算耗尽与真实保存/冲突失败，以提供稳定且不泄漏底层细节的提示。 */
+  public constructor() {
+    super("文件保存等待超时，已拒绝切换");
+    this.name = "WorkspaceChangeFlushTimeoutError";
+  }
+}
+
+/**
+ * 仅限制调用方等待 barrier 的时长；底层 CAS 继续完成并受 workspace/draft generation
+ * 栅栏约束，因此 timeout 绝不被解释为保存成功，也不会让迟到 ACK 取得切换 lease。
+ */
+function awaitWithinWorkspaceChangeBudget(
+  task: Promise<void>,
+  deadline: NonNullable<LifecycleUseCasesContext["workspaceChangeDeadline"]>,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timeoutHandle: unknown = undefined;
+    const settle = (complete: () => void): void => {
+      if (settled) return;
+      settled = true;
+      deadline.timer.clear(timeoutHandle);
+      complete();
+    };
+    timeoutHandle = deadline.timer.set(deadline.timeoutMillis, () => {
+      settle(() => reject(new WorkspaceChangeFlushTimeoutError()));
+    });
+    void task.then(
+      () => settle(resolve),
+      (error: unknown) => settle(() => reject(error)),
+    );
+  });
 }
 
 /**
@@ -30,6 +78,11 @@ interface LifecycleUseCasesContext {
  * hook 持有，协作者只实现冻结、flush、失败恢复和 lease 释放顺序。
  */
 export function createLifecycleUseCases(context: LifecycleUseCasesContext): LifecycleUseCases {
+  const workspaceChangeDeadline = context.workspaceChangeDeadline ?? {
+    timeoutMillis: WORKSPACE_CHANGE_FLUSH_TIMEOUT_MILLIS,
+    timer: systemDeadlineTimer,
+  };
+
   /**
    * 解除失败切换建立的编辑 fence，并只为尚未尝试的 dirty 草稿恢复末键计时；
    * saveError/conflict 保持暂停，避免无界自动重试。
@@ -56,7 +109,7 @@ export function createLifecycleUseCases(context: LifecycleUseCasesContext): Life
       context.lifecycleFence.current = true;
       context.setLifecycleClosing(true);
       context.saveCoordinator.cancelScheduled();
-      barrier = (async (): Promise<void> => {
+      const flushTask = (async (): Promise<void> => {
         /** 已知冲突先失败，禁止在切换期间偷偷覆盖外部版本。 */
         const conflict = Object.values(context.documents.current).find(
           (document) => document.status === "conflict",
@@ -80,11 +133,18 @@ export function createLifecycleUseCases(context: LifecycleUseCasesContext): Life
               context.externalConflictChecks.current.has(document.path),
           );
         if (unsafe !== undefined) throw new Error("文件草稿未能安全保存");
-      })().catch((error: unknown) => {
-        releaseLifecycleFence();
-        context.onNotice?.("当前工作区仍有未保存或冲突的文件，请处理后再切换。");
-        throw error;
-      });
+      })();
+      barrier = awaitWithinWorkspaceChangeBudget(flushTask, workspaceChangeDeadline).catch(
+        (error: unknown) => {
+          releaseLifecycleFence();
+          context.onNotice?.(
+            error instanceof WorkspaceChangeFlushTimeoutError
+              ? "文件保存等待超时，已取消项目切换；草稿仍保留，请检查后重试。"
+              : "当前工作区仍有未保存或冲突的文件，请处理后再切换。",
+          );
+          throw error;
+        },
+      );
       context.lifecycleLease.current = barrier;
     }
     await barrier;

@@ -6,12 +6,13 @@
 use super::dto::*;
 use super::history_model::WorkspaceWireDto;
 use crate::app_runtime::{RuntimeCommandError, RuntimeHost};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 把会等待 actor、文件或跨进程 I/O 的 Runtime 用例移出 Tauri command 执行线程。
 /// 统一适配 Join 失败能避免 WebView 事件投影与同步 invoke 相互等待，同时不在每个 command
 /// 复制线程策略或改变领域错误。
-async fn run_blocking<T: Send + 'static>(
+pub(super) async fn run_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, RuntimeCommandError> + Send + 'static,
 ) -> Result<T, RuntimeCommandError> {
     tauri::async_runtime::spawn_blocking(operation)
@@ -66,6 +67,16 @@ pub async fn ja_runtime_general_workspace(
     run_blocking(move || host.general_workspace().map(Into::into)).await
 }
 
+/// 查询当前 Thread Workspace 的有界相对路径候选，不读取正文或触发 Files/Review 状态。
+#[tauri::command]
+pub async fn ja_runtime_workspace_path_search(
+    input: WorkspacePathSearchInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<WorkspacePathSearchResultDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.workspace_path_search(input.into()).map(Into::into)).await
+}
+
 /// 启动类型化 Turn；executable、cwd 与握手值始终由受信 Host 决定。
 #[tauri::command]
 pub async fn ja_turn_start(
@@ -86,24 +97,54 @@ pub async fn ja_turn_cancel(
     run_blocking(move || host.turn_cancel(input.into()).map(Into::into)).await
 }
 
-/// 将 steering 输入追加到 Java durable FIFO；Tool 边界由 Java 事务决定。
+/// 显式恢复一个 Java-owned suspended Turn；该 command 不操作进程级 recovery marker。
 #[tauri::command]
-pub async fn ja_turn_steer(
-    input: TurnQueuedInputDto,
+pub async fn ja_turn_resume(
+    input: TurnResumeInputDto,
     state: tauri::State<'_, RuntimeHost>,
-) -> Result<TurnQueuedInputResultDto, RuntimeCommandError> {
+) -> Result<TurnAcceptedDto, RuntimeCommandError> {
     let host = state.inner().clone();
-    run_blocking(move || host.turn_steer(input.into()).map(Into::into)).await
+    run_blocking(move || host.turn_resume(input.into()).map(Into::into)).await
 }
 
-/// 将 follow-up 输入排到活动 Turn 完成边界，不开放重排或删除队列能力。
+/// 默认把文本加入普通 follow-up FIFO；kind 与优先序不由 renderer 提交。
 #[tauri::command]
-pub async fn ja_turn_follow_up(
-    input: TurnQueuedInputDto,
+pub async fn ja_turn_input_enqueue(
+    input: TurnInputEnqueueDto,
     state: tauri::State<'_, RuntimeHost>,
-) -> Result<TurnQueuedInputResultDto, RuntimeCommandError> {
+) -> Result<TurnInputResultDto, RuntimeCommandError> {
     let host = state.inner().clone();
-    run_blocking(move || host.turn_follow_up(input.into()).map(Into::into)).await
+    run_blocking(move || host.turn_input_enqueue(input.into()).map(Into::into)).await
+}
+
+/// 把指定条目提升为 steering；安全消费点和点击顺序由 Java transaction 裁决。
+#[tauri::command]
+pub async fn ja_turn_input_prioritize(
+    input: TurnInputPrioritizeDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TurnInputResultDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.turn_input_prioritize(input.into()).map(Into::into)).await
+}
+
+/// 使用条目 revision 编辑尚未消费的文本，不跨 WebView await 持有 Runtime lock。
+#[tauri::command]
+pub async fn ja_turn_input_update(
+    input: TurnInputUpdateDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TurnInputResultDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.turn_input_update(input.into()).map(Into::into)).await
+}
+
+/// 删除尚未消费的条目；已消费/陈旧 identity 由 Java 以稳定错误返回。
+#[tauri::command]
+pub async fn ja_turn_input_delete(
+    input: TurnInputDeleteDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TurnInputResultDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.turn_input_delete(input.into()).map(Into::into)).await
 }
 
 /// 读取 Java 持久化且已脱敏的 Tool artifact；workspaceId 只用于 native active binding 授权。
@@ -143,9 +184,28 @@ pub async fn ja_runtime_acknowledge_recovery(
 pub async fn ja_runtime_workspace_open(
     input: WorkspaceOpenInputDto,
     state: tauri::State<'_, RuntimeHost>,
+    attachment_previews: tauri::State<'_, Arc<crate::attachment_preview::AttachmentPreviewHost>>,
+    attachment_preview_runtime: tauri::State<
+        '_,
+        crate::attachment_preview::AttachmentPreviewRuntimeState,
+    >,
 ) -> Result<WorkspaceWireDto, RuntimeCommandError> {
     let host = state.inner().clone();
-    run_blocking(move || host.start_and_open_workspace(input.into()).map(Into::into)).await
+    let attachment_previews = Arc::clone(attachment_previews.inner());
+    let attachment_preview_runtime = attachment_preview_runtime.inner().clone();
+    run_blocking(move || {
+        crate::attachment_preview::commands::close_for_workspace_switch(
+            &attachment_preview_runtime,
+            &attachment_previews,
+        )
+        .map_err(|error| RuntimeCommandError {
+            code: "ATTACHMENT_PREVIEW_CLOSE_FAILED",
+            message: "attachment previews could not be closed",
+            retryable: error.retryable,
+        })?;
+        host.start_and_open_workspace(input.into()).map(Into::into)
+    })
+    .await
 }
 
 /// 将类型化审批决定交给当前 pending Java request，不开放 generic server response。

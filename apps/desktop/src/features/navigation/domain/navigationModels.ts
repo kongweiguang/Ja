@@ -18,4 +18,15 @@ export interface ThreadProjection {
   readonly threadId: string;
   readonly title: string;
   readonly status: "active" | "archived" | "deleted";
+  readonly pinned: boolean;
+  readonly latestTurnStatus:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "suspended"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | null;
+  readonly latestTurnSeen: boolean;
 }

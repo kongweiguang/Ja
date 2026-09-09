@@ -49,6 +49,14 @@ public final class McpDeadline {
     }
 
     /**
+     * 持久服务目录不绑定某个 Turn 的绝对终点；每次发现、调用和关闭仍由 phase cap 有界。
+     * 这样保留 list_changed session 时不会因首次请求的 Deadline 到期而永久失效。
+     */
+    public static McpDeadline forServiceDirectory(LongSupplier nanoTime) {
+        return new McpDeadline(Long.MAX_VALUE, Objects.requireNonNull(nanoTime, "nanoTime"));
+    }
+
+    /**
      * 同时按局部策略和作用域绝对边界限制单个阶段。
      */
     public long phaseDeadline(Duration cap) {

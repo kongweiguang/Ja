@@ -4,8 +4,13 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useJaWorkbench, type JaWorkbenchAdapters } from "@/app/useJaWorkbench";
-import type { NativePreviewPort, PreviewSessionSnapshot } from "@/features/workbench/preview";
+import type {
+  NativePreviewPort,
+  PreviewSessionHintStorage,
+  PreviewSessionSnapshot,
+} from "@/features/workbench/preview";
 import type { WorkspaceProjection } from "@/features/workspace";
+import { capabilityWorkbenchTab } from "@/features/workbench";
 
 const project: WorkspaceProjection = {
   kind: "project",
@@ -51,12 +56,20 @@ describe("useJaWorkbench composition", () => {
   it("只转发 shell selection 且不保存第二份 selectedTab", () => {
     const adapters = createAdapters();
     const onSelectedTabChange = vi.fn();
-    const { result } = renderHook(() => useJaWorkbench(project, adapters, onSelectedTabChange));
+    const previewSessionHints: PreviewSessionHintStorage = {
+      read: () => undefined,
+      remember: () => undefined,
+      forget: () => undefined,
+    };
+    const { result } = renderHook(() =>
+      useJaWorkbench(project, adapters, previewSessionHints, onSelectedTabChange),
+    );
 
-    act(() => result.current.onTabChange("preview"));
+    const previewTab = capabilityWorkbenchTab("preview");
+    act(() => result.current.onTabChange(previewTab));
 
     expect(result.current).not.toHaveProperty("selectedTab");
-    expect(onSelectedTabChange).toHaveBeenCalledWith("preview");
+    expect(onSelectedTabChange).toHaveBeenCalledWith(previewTab);
     expect(adapters.preview.open).not.toHaveBeenCalled();
   });
 });

@@ -85,8 +85,7 @@ public final class ConfigGeneration implements AutoCloseable {
         this.providers = catalog.providers();
         this.skillDefinitions = catalog.skillDefinitions();
         this.mcpDefinitions = catalog.mcpDefinitions();
-        this.accessMode = parseAccessMode(
-                this.effectiveConfig.path("default_access_mode").asText("full_access"));
+        this.accessMode = parseAccessMode(requiredText(this.effectiveConfig, "default_access_mode"));
         this.catalogDigest = catalogDigest;
         this.leaseState = new ConfigGenerationLeaseState(() -> {
             clearSecrets();
@@ -164,12 +163,12 @@ public final class ConfigGeneration implements AutoCloseable {
         return copyNodes(mcpServers);
     }
 
-    /** 返回冻结 Provider 目录，模型仍归属其 Provider，不建立扁平 Profile 兼容索引。 */
+    /** 返回冻结 Provider 目录，模型只在所属 Provider 内索引，不建立跨 Provider 扁平查找。 */
     public List<ProviderDefinition> providers() {
         return List.copyOf(providers.values());
     }
 
-    /** 返回配置代际唯一的执行模式；缺省值固定为全部执行以保持 Pi 风格的直接体验。 */
+    /** 返回配置代际唯一的显式执行模式。 */
     public AccessMode accessMode() {
         return accessMode;
     }
@@ -308,7 +307,7 @@ public final class ConfigGeneration implements AutoCloseable {
     }
 
     /** Provider 保存连接和 Agent 默认值，多个模型共享同一稳定路由。 */
-    public record ProviderDefinition(String providerId, String name, ProviderType provider, Api api,
+    public record ProviderDefinition(String providerId, String name, Api api,
                                      URI baseUrl, String credentialId,
                                      NetworkTimeoutConfig networkTimeouts,
                                      AgentDefaultsConfig agentDefaults,
@@ -317,7 +316,6 @@ public final class ConfigGeneration implements AutoCloseable {
         public ProviderDefinition {
             ConfigGenerationValueRules.requireIdentifier(providerId, "provider_");
             name = ConfigGenerationValueRules.boundedText(name, "name", 512, false);
-            java.util.Objects.requireNonNull(provider, "provider");
             java.util.Objects.requireNonNull(api, "api");
             java.util.Objects.requireNonNull(baseUrl, "baseUrl");
             if (!baseUrl.isAbsolute() || baseUrl.getUserInfo() != null
@@ -327,16 +325,13 @@ public final class ConfigGeneration implements AutoCloseable {
                    && ConfigGenerationValueRules.isLoopback(baseUrl))) {
                 throw new IllegalArgumentException("provider base URL is invalid");
             }
-            if (provider == ProviderType.ANTHROPIC && api != Api.ANTHROPIC_MESSAGES
-                || provider == ProviderType.OPENAI && api == Api.ANTHROPIC_MESSAGES) {
-                throw new IllegalArgumentException("provider/API pair is invalid");
-            }
-            if (credentialId != null) ConfigGenerationValueRules.requireIdentifier(credentialId, "cred_");
+            ConfigGenerationValueRules.requireIdentifier(credentialId, "cred_");
             java.util.Objects.requireNonNull(networkTimeouts, "networkTimeouts");
             java.util.Objects.requireNonNull(agentDefaults, "agentDefaults");
             models = List.copyOf(models);
             if (models.isEmpty()) throw new IllegalArgumentException("provider models are missing");
         }
+
     }
 
     /** Model 只保存模型自身能力，不重复 Provider 连接和 Agent 默认值。 */
@@ -359,24 +354,11 @@ public final class ConfigGeneration implements AutoCloseable {
 
     /** Provider 级 Agent 默认值只固定上下文和 Turn 上限，目录启停由根级事实决定。 */
     public record AgentDefaultsConfig(ContextConfig context, TurnLimitConfig turnLimits) {
-        /** 冻结两个真实默认对象，使已开始 Turn 始终观察同一代际。 */
+        /** 固定代际内两个默认对象；后续 Provider 请求可改读更新后的配置代际。 */
         public AgentDefaultsConfig {
             java.util.Objects.requireNonNull(context, "context");
             java.util.Objects.requireNonNull(turnLimits, "turnLimits");
         }
-    }
-
-    /** 配置域支持的 Provider 类型，conversation 负责映射到自身模型端口。 */
-    public enum ProviderType {
-        /**
-         * 使用 OpenAI Provider，并要求匹配 OpenAI Responses API。
-         */
-        OPENAI,
-
-        /**
-         * 使用 Anthropic Provider，并要求匹配 Anthropic Messages API。
-         */
-        ANTHROPIC
     }
 
     /**
@@ -391,7 +373,12 @@ public final class ConfigGeneration implements AutoCloseable {
         /**
          * 使用 Anthropic Messages API。
          */
-        ANTHROPIC_MESSAGES
+        ANTHROPIC_MESSAGES,
+
+        /**
+         * 使用 OpenAI Chat Completions API。
+         */
+        OPENAI_CHAT_COMPLETIONS
     }
 
     /**
@@ -416,6 +403,15 @@ public final class ConfigGeneration implements AutoCloseable {
             case "full_access" -> AccessMode.FULL_ACCESS;
             default -> throw new IllegalArgumentException("permission mode unsupported");
         };
+    }
+
+    /** 代际只读取已经通过 v1 Policy 的必填文本，不为缺失字段提供运行时默认值。 */
+    private static String requiredText(ObjectNode object, String key) {
+        JsonNode value = object.get(key);
+        if (value == null || !value.isTextual() || value.textValue().isBlank()) {
+            throw new IllegalArgumentException("configuration text is missing");
+        }
+        return value.textValue();
     }
 
     /** Model 能力上限和输入模态共同决定附件与上下文准入。 */
@@ -551,9 +547,9 @@ public final class ConfigGeneration implements AutoCloseable {
             name = ConfigGenerationValueRules.boundedText(name, "name", 512, false);
             java.util.Objects.requireNonNull(transport, "transport");
             endpoint = ConfigGenerationValueRules.boundedText(endpoint, "endpoint", 4_096, false);
-            args = List.copyOf(args == null ? List.of() : args);
-            env = Map.copyOf(env == null ? Map.of() : env);
-            headers = Map.copyOf(headers == null ? Map.of() : headers);
+            args = List.copyOf(java.util.Objects.requireNonNull(args, "args"));
+            env = Map.copyOf(java.util.Objects.requireNonNull(env, "env"));
+            headers = Map.copyOf(java.util.Objects.requireNonNull(headers, "headers"));
             java.util.Objects.requireNonNull(auth, "auth");
         }
     }
@@ -792,19 +788,16 @@ public final class ConfigGeneration implements AutoCloseable {
         /** 把内部 Provider 定义转换为不含 Secret 的领域投影。 */
         private static ConfigurationGenerationSnapshot.Provider projectProvider(
                 ConfigGeneration.ProviderDefinition provider) {
-            ConfigurationGenerationSnapshot.ProviderType providerType = switch (provider.provider()) {
-                case OPENAI -> ConfigurationGenerationSnapshot.ProviderType.OPENAI;
-                case ANTHROPIC -> ConfigurationGenerationSnapshot.ProviderType.ANTHROPIC;
+            ConfigurationGenerationSnapshot.Api api = switch (provider.api()) {
+                case OPENAI_RESPONSES -> ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES;
+                case ANTHROPIC_MESSAGES -> ConfigurationGenerationSnapshot.Api.ANTHROPIC_MESSAGES;
+                case OPENAI_CHAT_COMPLETIONS -> ConfigurationGenerationSnapshot.Api.OPENAI_CHAT_COMPLETIONS;
             };
-        ConfigurationGenerationSnapshot.Api api = switch (provider.api()) {
-            case OPENAI_RESPONSES -> ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES;
-            case ANTHROPIC_MESSAGES -> ConfigurationGenerationSnapshot.Api.ANTHROPIC_MESSAGES;
-        };
             ConfigGeneration.AgentDefaultsConfig defaults = provider.agentDefaults();
             ConfigGeneration.TurnLimitConfig turnLimits = defaults.turnLimits();
             ConfigGeneration.NetworkTimeoutConfig timeouts = provider.networkTimeouts();
             return new ConfigurationGenerationSnapshot.Provider(provider.providerId(), provider.name(),
-                    providerType, api, provider.baseUrl(), provider.credentialId(),
+                    api, provider.baseUrl(), provider.credentialId(),
                     new ConfigurationGenerationSnapshot.NetworkTimeouts(
                             timeouts.connectTimeout(), timeouts.requestTimeout()),
                     new ConfigurationGenerationSnapshot.AgentDefaults(

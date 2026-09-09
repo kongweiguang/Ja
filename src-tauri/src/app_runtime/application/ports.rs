@@ -6,12 +6,20 @@
 use super::error::RuntimeCommandError;
 use crate::app_runtime::domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
-    ManualRecoveryConfirmation, RuntimeRecoveryState, RuntimeStatus, RuntimeStorageInfo,
-    ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnQueuedInput, TurnQueuedInputResult,
-    TurnStartInput, WorkspaceDto,
+    GoalRequest, GoalResponse, ManualRecoveryConfirmation, RuntimeRecoveryState, RuntimeStatus,
+    RuntimeStorageInfo, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
+    TaskListInput, TaskListResult, TaskMessageInput, TaskMessageResult, TaskMutationInput,
+    TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
+    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput,
+    ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
+    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
+    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
+    WorkspaceDto, WorkspacePathSearchInput, WorkspacePathSearchResult,
 };
-use crate::workspace::WorkspaceHandle;
+use ja_runtime::app_server_process::{
+    AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
+    AttachmentPreviewReadParams, AttachmentPreviewReadResult,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,12 +83,18 @@ define_operation_payload!(
     ThreadReadResultData,
     ThreadRenameParams,
     ThreadRenameResultData,
+    ThreadPinParams,
+    ThreadPinResultData,
+    ThreadSeenParams,
+    ThreadSeenResultData,
     ThreadPreferencesUpdateParams,
     ThreadPreferencesUpdateResultData,
     ThreadCompactParams,
     ThreadCompactResultData,
     ThreadArchiveParams,
     ThreadArchiveResultData,
+    ThreadRestoreParams,
+    ThreadRestoreResultData,
     ThreadDeleteParams,
     ThreadDeleteResultData,
     SkillListParams,
@@ -124,9 +138,12 @@ pub(crate) enum HistoryRequest {
     ThreadSearch(ThreadSearchParams),
     ThreadRead(ThreadReadParams),
     ThreadRename(ThreadRenameParams),
+    ThreadPin(ThreadPinParams),
+    ThreadSeen(ThreadSeenParams),
     ThreadPreferencesUpdate(ThreadPreferencesUpdateParams),
     ThreadCompact(ThreadCompactParams),
     ThreadArchive(ThreadArchiveParams),
+    ThreadRestore(ThreadRestoreParams),
     ThreadDelete(ThreadDeleteParams),
 }
 
@@ -138,9 +155,12 @@ pub(crate) enum HistoryResponse {
     ThreadSearch(ThreadSearchResultData),
     ThreadRead(ThreadReadResultData),
     ThreadRename(ThreadRenameResultData),
+    ThreadPin(ThreadPinResultData),
+    ThreadSeen(ThreadSeenResultData),
     ThreadPreferencesUpdate(ThreadPreferencesUpdateResultData),
     ThreadCompact(ThreadCompactResultData),
     ThreadArchive(ThreadArchiveResultData),
+    ThreadRestore(ThreadRestoreResultData),
     ThreadDelete(ThreadDeleteResultData),
 }
 
@@ -178,26 +198,114 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
         trust: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError>;
     fn general_workspace(&self) -> Result<WorkspaceDto, RuntimeCommandError>;
+    /// 路径搜索默认失败关闭，只有生产 Java owner 或明确 fixture 可返回当前 generation 结果。
+    fn workspace_path_search(
+        &self,
+        _input: WorkspacePathSearchInput,
+    ) -> Result<WorkspacePathSearchResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     fn health(&self) -> Result<(), RuntimeCommandError>;
     fn turn_start(&self, input: TurnStartInput) -> Result<TurnAccepted, RuntimeCommandError>;
-    /// 生产 bridge 使用已绑定 Workspace 捕获 Turn baseline；fake 默认保留原有 turn/start 行为，
-    /// 不得伪造 change-set 成功。
-    fn turn_start_with_workspace(
-        &self,
-        input: TurnStartInput,
-        _workspace: TurnChangeCaptureContext,
-    ) -> Result<TurnAccepted, RuntimeCommandError> {
-        self.turn_start(input)
-    }
     fn turn_cancel(&self, input: TurnCancelInput) -> Result<TurnCancelResult, RuntimeCommandError>;
-    fn turn_steer(
+    /// 既有 fake 默认不声称支持持久恢复；生产 bridge 必须显式覆盖并路由到 Java owner。
+    fn turn_resume(&self, _input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 旧 fake 默认失败关闭新队列能力；生产 bridge 必须显式覆盖四个固定 mutation。
+    fn turn_input_enqueue(
         &self,
-        input: TurnQueuedInput,
-    ) -> Result<TurnQueuedInputResult, RuntimeCommandError>;
-    fn turn_follow_up(
+        _input: TurnInputEnqueue,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// prioritize 不回退为旧 steering admission，防止测试双轨掩盖生产协议漂移。
+    fn turn_input_prioritize(
         &self,
-        input: TurnQueuedInput,
-    ) -> Result<TurnQueuedInputResult, RuntimeCommandError>;
+        _input: TurnInputPrioritize,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// update 默认关闭，只有真实 Java owner 或明确实现队列 CAS 的 fake 可返回成功。
+    fn turn_input_update(
+        &self,
+        _input: TurnInputUpdate,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// delete 默认关闭，避免 fake 在没有消费竞态模型时伪造删除结果。
+    fn turn_input_delete(
+        &self,
+        _input: TurnInputDelete,
+    ) -> Result<TurnInputResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// task/create 默认失败关闭；只有生产 Java owner 或显式任务 fixture 能创建 Child Thread。
+    fn task_create(
+        &self,
+        _input: TaskCreateInput,
+    ) -> Result<TaskCreateResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// task/list 默认不扫描本地缓存，防止 fake 掩盖 Java projection 缺失。
+    fn task_list(&self, _input: TaskListInput) -> Result<TaskListResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// task/read 默认不物化 transcript，生产 bridge 必须走固定 JA-RPC reader。
+    fn task_read(&self, _input: TaskReadInput) -> Result<TaskReadResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// observation 只能由真实 connection owner 创建，fake 不返回伪 handle。
+    fn task_observe(
+        &self,
+        _input: TaskObserveInput,
+    ) -> Result<TaskObserveResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// unobserve 默认失败关闭，避免调用方把未释放的 handle 误判为已清理。
+    fn task_unobserve(&self, _input: TaskUnobserveInput) -> Result<(), RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// Reload 清理默认失败关闭，只有维护真实 connection registry 的生产 bridge 可以成功。
+    fn release_task_observations(
+        &self,
+        _owner: &'static str,
+    ) -> Result<usize, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// seen 的 unread CAS 只由 Java 投影返回，不从 renderer 计数派生。
+    fn task_seen(&self, _input: TaskSeenInput) -> Result<TaskSummary, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// QueueOnly message 默认关闭，fake 不在内存中模拟 exactly-once Mailbox。
+    fn task_message_send(
+        &self,
+        _input: TaskMessageInput,
+    ) -> Result<TaskMessageResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// followup 默认关闭，避免未建模的 fake 伪造 Child Turn 调度。
+    fn task_followup(
+        &self,
+        _input: TaskFollowupInput,
+    ) -> Result<TaskFollowupResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// cancel 传播由 Java lineage 决定，application port 不接受传播开关。
+    fn task_cancel(&self, _input: TaskMutationInput) -> Result<TaskSummary, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 整树删除只在真实持久化事务确认后返回数量。
+    fn task_tree_delete(
+        &self,
+        _input: TaskTreeDeleteInput,
+    ) -> Result<TaskTreeDeleteResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// Goal/Plan 默认失败关闭；只有生产 Java owner 或显式协议 fixture 可实现持久状态变更。
+    fn goal(&self, _request: GoalRequest) -> Result<GoalResponse, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     /// 冻结 diff 只能通过固定 reader 读取；默认关闭可防止 fake 绕过 Java 持久化归属校验。
     fn turn_change_set_read(
         &self,
@@ -228,18 +336,33 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
         // 默认失败关闭可避免测试 port 在未实现持久化语义时伪造 discard 成功。
         Err(RuntimeCommandError::unavailable())
     }
+    /// 附件预览 open 默认失败关闭，fake 必须显式实现才能伪造 Java 授权。
+    fn attachment_preview_open(
+        &self,
+        _input: AttachmentPreviewOpenParams,
+    ) -> Result<AttachmentPreviewOpenResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 附件预览 read 默认失败关闭，防止测试端口绕过 opaque session。
+    fn attachment_preview_read(
+        &self,
+        _input: AttachmentPreviewReadParams,
+    ) -> Result<AttachmentPreviewReadResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 附件预览 close 默认失败关闭，只有真实 owner 可确认 session 已释放。
+    fn attachment_preview_close(
+        &self,
+        _input: AttachmentPreviewCloseParams,
+    ) -> Result<(), RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     fn history(&self, request: HistoryRequest) -> Result<HistoryResponse, RuntimeCommandError>;
     fn settings(&self, request: SettingsRequest) -> Result<SettingsResponse, RuntimeCommandError>;
     fn shutdown(&self) -> Result<(), RuntimeCommandError>;
     fn shutdown_until(&self, deadline: Instant) -> Result<(), RuntimeCommandError>;
     fn exit_ready(&self) -> bool;
     fn record_forced_exit(&self);
-}
-
-/// RuntimeHost 从 App Server identity 与 canonical handle 构造的 Turn 捕获上下文。
-pub(crate) struct TurnChangeCaptureContext {
-    pub(crate) workspace_id: String,
-    pub(crate) workspace: WorkspaceHandle,
 }
 
 /// Workspace 输入经原生路径策略解析后才形成 application 可使用的受信 capability source。

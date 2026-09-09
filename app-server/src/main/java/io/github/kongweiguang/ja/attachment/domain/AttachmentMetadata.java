@@ -12,7 +12,7 @@ import java.util.Objects;
 public record AttachmentMetadata(String attachmentId, String workspaceId, String displayName,
                                  long sizeBytes, String sha256, MediaKind mediaKind,
                                  String mediaType, Status status, Instant createdAt,
-                                 Instant expiresAt, String boundTurnId) {
+                                 Instant expiresAt, String boundMessageId) {
     /**
      * 集中约束可持久化和可返回 UI 的字段，避免 Adapter 以路径或自由状态字符串补足缺失事实。
      */
@@ -35,8 +35,8 @@ public record AttachmentMetadata(String attachmentId, String workspaceId, String
         Objects.requireNonNull(status, "status");
         Objects.requireNonNull(createdAt, "createdAt");
         Objects.requireNonNull(expiresAt, "expiresAt");
-        if (boundTurnId != null) boundTurnId = identifier(boundTurnId, "turn_", "boundTurnId");
-        if ((status == Status.BOUND) != (boundTurnId != null)) {
+        if (boundMessageId != null) boundMessageId = identifier(boundMessageId, "item_", "boundMessageId");
+        if ((status == Status.BOUND) != (boundMessageId != null)) {
             throw new IllegalArgumentException("attachment binding state is inconsistent");
         }
     }

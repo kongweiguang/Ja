@@ -148,6 +148,31 @@ mod protocol_catalog_scope {
     }
 }
 
+mod attachment_preview_scope {
+    pub(crate) use crate::app_server_process::*;
+    pub(crate) use serde_json::{Value, json};
+
+    mod tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/unit/app_server_process/protocol/attachment_preview_tests.rs"
+        ));
+    }
+}
+
+mod turn_change_set_scope {
+    pub(crate) use crate::app_server_process::protocol::validate_turn_change_set_request;
+    pub(crate) use crate::app_server_process::*;
+    pub(crate) use serde_json::{Value, json};
+
+    mod tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/unit/app_server_process/protocol/turn_change_set_tests.rs"
+        ));
+    }
+}
+
 mod protocol_codec_scope {
     pub(crate) use crate::app_server_process::protocol::codec::*;
     pub(crate) use crate::app_server_process::{CodecError, RpcFrame};

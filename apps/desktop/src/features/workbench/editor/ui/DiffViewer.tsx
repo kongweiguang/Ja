@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { basicSetup } from "codemirror";
-import { EditorState } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { MergeView } from "@codemirror/merge";
-import { useEffect, useRef, type ReactElement } from "react";
-import { languageExtension } from "../domain/language";
+import { useEffect, useMemo, useRef, type ReactElement } from "react";
+import { languageExtension } from "@/shared/syntax";
+import { useResolvedTheme, useUiPalette } from "@/shared/hooks/useResolvedTheme";
 import { CopyTextButton } from "@/shared/ui/CopyTextButton";
+import { semanticCodeMirrorThemeExtension } from "./semanticCodeMirrorTheme";
+import { formatDiffClipboard } from "../domain/diffClipboard";
 import "./Editor.css";
 
 export interface DiffViewerProps {
@@ -21,7 +24,7 @@ export interface DiffViewerProps {
 
 /**
  * 实际 Diff Algorithm 使用 CodeMirror MergeView；两侧 Document 保持只读，
- * 并且只从权威外部 Revision 更新。
+ * 并且只从权威外部 Revision 更新。两侧共享同一 Theme Compartment，避免配色或明暗切换重算 Diff。
  */
 export function DiffViewer({
   filePath,
@@ -31,8 +34,13 @@ export function DiffViewer({
   revision,
   onCopyText,
 }: DiffViewerProps): ReactElement {
+  const resolvedTheme = useResolvedTheme();
+  const palette = useUiPalette();
   const hostRef = useRef<HTMLDivElement>(null);
   const mergeRef = useRef<MergeView | undefined>(undefined);
+  const themeCompartment = useMemo(() => new Compartment(), []);
+  const initialResolvedThemeRef = useRef(resolvedTheme);
+  const initialPaletteRef = useRef(palette);
   const initialDocuments = useRef({ original, modified });
   useEffect(() => {
     initialDocuments.current = { original, modified };
@@ -45,6 +53,12 @@ export function DiffViewer({
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
       EditorView.lineWrapping,
+      themeCompartment.of(
+        semanticCodeMirrorThemeExtension(
+          initialPaletteRef.current,
+          initialResolvedThemeRef.current,
+        ),
+      ),
     ];
     const extension = languageExtension(filePath, language);
     if (extension !== undefined) {
@@ -64,7 +78,17 @@ export function DiffViewer({
       merge.destroy();
       mergeRef.current = undefined;
     };
-  }, [filePath, language]);
+  }, [filePath, language, themeCompartment]);
+  useEffect(() => {
+    const merge = mergeRef.current;
+    if (merge === undefined) return;
+    // MergeView 两侧必须在同一帧使用相同 Theme Effect，避免双栏短暂出现配色分裂。
+    const effect = themeCompartment.reconfigure(
+      semanticCodeMirrorThemeExtension(palette, resolvedTheme),
+    );
+    merge.a.dispatch({ effects: effect });
+    merge.b.dispatch({ effects: effect });
+  }, [palette, resolvedTheme, themeCompartment]);
   useEffect(() => {
     const merge = mergeRef.current;
     if (merge === undefined) return;
@@ -89,11 +113,6 @@ export function DiffViewer({
       <div className="ja-editor-diff__host" ref={hostRef} />
     </section>
   );
-}
-
-/** 按需生成显式双边 Review Payload；它不冒充生成的 Unified Patch，并精确保留用户所见内容。 */
-function formatDiffClipboard(filePath: string, original: string, modified: string): string {
-  return `文件：${filePath}\n\n--- 原始内容\n${original}\n\n+++ 修改后内容\n${modified}`;
 }
 
 /**

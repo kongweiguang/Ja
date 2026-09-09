@@ -11,11 +11,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationScope;
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
+import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
+import io.github.kongweiguang.ja.goal.domain.GoalModels;
+import io.github.kongweiguang.ja.goal.port.in.GoalEvent;
+import io.github.kongweiguang.ja.goal.port.in.GoalEventSink;
+import io.github.kongweiguang.ja.goal.port.in.GoalUseCase;
+import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 import java.io.ByteArrayInputStream;
@@ -50,7 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class RpcServerTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-25T12:00:00Z"), ZoneOffset.UTC);
 
-    /** 提供 JA-RPC v2 Sidecar 边界要求的四个明确根目录，避免测试依赖用户目录。 */
+    /** 提供 JA-RPC v1 Sidecar 边界要求的四个明确根目录，避免测试依赖用户目录。 */
     private static SidecarConfiguration testConfiguration() {
         java.nio.file.Path root = java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-server-test")
                 .toAbsolutePath().normalize();
@@ -79,10 +86,138 @@ final class RpcServerTest {
         assertEquals(0, server.run());
         String wire = output.toString(StandardCharsets.UTF_8);
         assertTrue(wire.contains("\"engine\":\"ja-kernel\""));
+        assertTrue(wire.contains("\"engineVersion\":\"0.1.0\""));
         assertTrue(wire.contains("\"status\":\"ready\""));
         assertTrue(wire.contains("\"status\":\"stopped\""));
+        assertTrue(wire.contains("\"features\":[\"task_threads_v1\",\"plan_goal_v1\"]"));
         assertFalse(wire.contains("provider-secret"));
         assertTrue(closed.get());
+    }
+
+    /**
+     * Goal 创建发生前 UI 不可能持有 observation；created 必须作为唯一低频发现事件送达，
+     * 后续未观察变更仍保持静默，避免关闭 Workbench 后产生无界状态流。
+     */
+    @Test
+    void publishesGoalCreationBeforeObservationAndFiltersLaterChanges() {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        AtomicReference<GoalEventSink> subscribed = new AtomicReference<>();
+        GoalModels.GoalSnapshot snapshot = goalDiscoverySnapshot();
+        GoalUseCase goalOwner = (GoalUseCase) Proxy.newProxyInstance(
+                RpcServerTest.class.getClassLoader(), new Class<?>[]{GoalUseCase.class},
+                (proxy, method, arguments) -> switch (method.getName()) {
+                    case "subscribe" -> {
+                        subscribed.set((GoalEventSink) arguments[0]);
+                        yield (AutoCloseable) () -> subscribed.set(null);
+                    }
+                    case "read" -> snapshot;
+                    default -> throw new UnsupportedOperationException("unexpected Goal call: " + method.getName());
+                });
+        RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, () -> { });
+        RpcServiceBindings bindings = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
+                base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
+                base.attachments(), base.attachmentPreviews(), base.tasks(), goalOwner, base.lifecycle());
+
+        try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
+             RpcSession session = new RpcSession(testConfiguration(), mapper, CLOCK, writer,
+                     ignored -> bindings, TestConfigurationPorts.unavailable(), 73)) {
+            session.initialize();
+            session.ready("0123456789abcdef0123456789abcdef");
+            GoalEventSink sink = subscribed.get();
+            sink.publish(new GoalEvent(snapshot, new GoalModels.PublicEvent(
+                    1, 0, "created", "Goal 已创建", CLOCK.instant()))).toCompletableFuture().join();
+            String afterCreation = output.toString(StandardCharsets.UTF_8);
+            assertTrue(afterCreation.contains("\"method\":\"goal/changed\""));
+            assertTrue(afterCreation.contains("\"goalId\":\"goal_discovery\""));
+
+            sink.publish(new GoalEvent(snapshot, new GoalModels.PublicEvent(
+                    2, 0, "plan_draft_saved", "计划草稿已保存", CLOCK.instant())))
+                    .toCompletableFuture().join();
+            assertEquals(afterCreation, output.toString(StandardCharsets.UTF_8));
+
+            RpcSession.GoalObservation observation = session.observeGoal("goal_discovery");
+            assertTrue(sink.registerTurn("goal_discovery", "turn_goal", "ws_goal", "thr_discovery", 0));
+            sink.publishTurn("goal_discovery", new TurnEvent.TextDelta("turn_goal", 1, "等待批准"))
+                    .toCompletableFuture().join();
+            sink.publishTurn("goal_discovery", new TurnEvent.ApprovalRequested(
+                    new TurnEvent.Context("evt_goal_approval", "thr_discovery", "turn_goal", 1,
+                            CLOCK.instant()), "appr_goal", "call_goal", "shell", "需要批准",
+                    CLOCK.instant().plusSeconds(60))).toCompletableFuture().join();
+            String whileObserved = output.toString(StandardCharsets.UTF_8);
+            assertTrue(whileObserved.contains("\"method\":\"assistant/text-delta\""));
+            assertTrue(whileObserved.contains("\"method\":\"approval/requested\""));
+            assertTrue(whileObserved.contains("\"turnId\":\"turn_goal\""));
+
+            session.unobserveGoal(observation.observationId());
+            sink.publishTurn("goal_discovery", new TurnEvent.TextDelta("turn_goal", 2, "不得投影"))
+                    .toCompletableFuture().join();
+            assertEquals(whileObserved, output.toString(StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * 连接关闭必须保留最早的取消失败，并按实际清理顺序挂载 observation、订阅和生命周期失败；
+     * 后续资源仍全部尝试关闭，避免一个诊断异常截断真实资源回收。
+     */
+    @Test
+    void closePreservesFirstFailureAndSuppressesLaterCleanupFailures() {
+        ObjectMapper mapper = new ObjectMapper();
+        List<String> order = new java.util.ArrayList<>();
+        IllegalStateException cancellationFailure = new IllegalStateException("cancellation failed");
+        IllegalStateException observationFailure = new IllegalStateException("observation failed");
+        IllegalStateException subscriptionFailure = new IllegalStateException("subscription failed");
+        IllegalStateException lifecycleFailure = new IllegalStateException("lifecycle failed");
+        TaskUseCase taskOwner = (TaskUseCase) Proxy.newProxyInstance(RpcServerTest.class.getClassLoader(),
+                new Class<?>[]{TaskUseCase.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "subscribe" -> (AutoCloseable) () -> {
+                        order.add("subscription");
+                        throw subscriptionFailure;
+                    };
+                    case "observe" -> new TaskUseCase.Observation("observe_close", "thr_task_close", 1);
+                    case "unobserve" -> {
+                        order.add("unobserve");
+                        throw observationFailure;
+                    }
+                    default -> throw new AssertionError("unexpected TaskUseCase call: " + method.getName());
+                });
+        DeadlineCloseable lifecycle = new DeadlineCloseable() {
+            /** 关闭组合根时记录顺序并制造最终失败。 */
+            @Override public void closeAt(long shutdownDeadlineNanos) {
+                order.add("lifecycle");
+                throw lifecycleFailure;
+            }
+
+            /** 测试只允许生产路径传递绝对 Deadline。 */
+            @Override public void close() {
+                throw new AssertionError("deadline-aware close is required");
+            }
+        };
+        RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, () -> { });
+        RpcServiceBindings bindings = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
+                base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
+                base.attachments(), base.attachmentPreviews(), taskOwner, base.goals(), lifecycle);
+        try (StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024)) {
+            RpcSession session = new RpcSession(testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> bindings, TestConfigurationPorts.unavailable(), 71);
+            session.initialize();
+            session.ready("0123456789abcdef0123456789abcdef");
+            session.observeTask("thr_task_close", 1);
+            session.cancellationToken().onCancellation(() -> {
+                order.add("cancellation");
+                throw cancellationFailure;
+            });
+
+            RuntimeException actual = assertThrows(RuntimeException.class,
+                    () -> session.close(ShutdownDeadline.start(Duration.ofSeconds(2))));
+
+            assertSame(cancellationFailure, actual);
+            assertEquals(List.of("cancellation", "unobserve", "subscription", "lifecycle"), order);
+            assertEquals(3, actual.getSuppressed().length);
+            assertSame(observationFailure, actual.getSuppressed()[0]);
+            assertSame(subscriptionFailure, actual.getSuppressed()[1].getCause());
+            assertSame(lifecycleFailure, actual.getSuppressed()[2]);
+        }
     }
 
     /** 验证任意入站响应信封都会在进入应用状态前被拒绝。 */
@@ -272,6 +407,29 @@ final class RpcServerTest {
         assertTrue(output.toString(StandardCharsets.UTF_8).contains("\"errorCode\":\"INVALID_PARAMS\""));
     }
 
+    /** 旧协议不得触发应用对象图创建，确保首版进程不会隐式承担历史升级责任。 */
+    @Test
+    void rejectsLegacyProtocolBeforeFactoryOpen() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode initialize = initialize(mapper);
+        ObjectNode params = (ObjectNode) initialize.path("params");
+        params.put("protocolMajor", 2).put("protocolMinor", 1);
+        AtomicInteger opened = new AtomicInteger();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        RpcServer server = new RpcServer(new ByteArrayInputStream(
+                (mapper.writeValueAsString(initialize) + "\n").getBytes(StandardCharsets.UTF_8)), output,
+                testConfiguration(), CLOCK,
+                ignored -> {
+                    opened.incrementAndGet();
+                    return new EmptyServices(new AtomicBoolean()).bindings();
+                }, TestConfigurationPorts.unavailable());
+
+        assertEquals(0, server.run());
+        assertEquals(0, opened.get());
+        assertTrue(output.toString(StandardCharsets.UTF_8)
+                .contains("\"errorCode\":\"PROTOCOL_VERSION_UNSUPPORTED\""));
+    }
+
     /** 验证配置损坏只会降低健康状态，同时保留 initialize 与 Settings 边界的可用性。 */
     @Test
     void exposesRedactedConfigurationDegradedHealth() throws Exception {
@@ -309,7 +467,7 @@ final class RpcServerTest {
                 .put("method", "configuration/patch");
         write.set("params", mapper.createObjectNode().put("scope", "user")
                 .put("expectedVersion", "cfg_missing")
-                .set("patch", mapper.createObjectNode().put("default_profile_id", "profile_test")));
+                .set("patch", mapper.createObjectNode().put("unexpected", true)));
         ObjectNode credential = mapper.createObjectNode().put("jsonrpc", "2.0").put("id", "c:credential")
                 .put("method", "credential/set");
         credential.set("params", mapper.createObjectNode().put("credentialId", "cred_test")
@@ -358,20 +516,30 @@ final class RpcServerTest {
         assertEquals("CONFLICT", RpcServer.mapPersistenceFailure(StorageException.Code.CAS_CONFLICT).errorCode());
         assertEquals("STORAGE_UNAVAILABLE",
                 RpcServer.mapPersistenceFailure(StorageException.Code.IO).errorCode());
-        assertEquals("SCHEMA_MISMATCH",
-                RpcServer.mapPersistenceFailure(StorageException.Code.FRESH_SCHEMA_REQUIRED).errorCode());
     }
 
-    /** 使用与生产一致的能力和限制定义构造严格 initialize 请求，避免测试复制契约常量。 */
+    /** 使用生产能力和限制构造唯一首版 initialize 请求，避免测试复制其余合同常量。 */
     private static ObjectNode initialize(ObjectMapper mapper) {
-        ObjectNode params = mapper.createObjectNode().put("protocolMajor", 2).put("protocolMinor", 0)
-                .put("clientVersion", "2.0.0");
+        ObjectNode params = mapper.createObjectNode().put("protocolMajor", 1).put("protocolMinor", 0)
+                .put("clientVersion", "0.1.0");
         params.set("capabilities", HandshakeContractTestAccess.capabilities(mapper));
         params.set("limits", HandshakeContractTestAccess.limits(mapper));
         ObjectNode request = mapper.createObjectNode().put("jsonrpc", "2.0")
                 .put("id", "c:init").put("method", "runtime/initialize");
         request.set("params", params);
         return request;
+    }
+
+    /** 创建最小可执行 Goal 快照，确保 transport 测试不依赖 Plan 聚合或持久层 fixture。 */
+    private static GoalModels.GoalSnapshot goalDiscoverySnapshot() {
+        GoalModels.Goal goal = new GoalModels.Goal("goal_discovery", "thr_discovery",
+                GoalModels.OwnerKind.ROOT_THREAD, "验证 Goal 发现事件", 1, GoalModels.GoalStatus.ACTIVE,
+                GoalModels.GoalPhase.WORKING, 0, null, 0, 0, null, false,
+                CLOCK.instant(), CLOCK.instant());
+        GoalModels.GoalDefinition definition = new GoalModels.GoalDefinition(
+                goal.goalId(), 1, goal.objective(), List.of(), CLOCK.instant());
+        return new GoalModels.GoalSnapshot(goal, definition, null, null, 0, 0,
+                null, null, null, null, null, 1);
     }
 
     /** 按 ID 读取唯一响应结果，避免断言把输入请求误认为标准输出帧。 */

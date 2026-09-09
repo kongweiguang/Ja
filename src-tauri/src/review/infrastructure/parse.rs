@@ -135,31 +135,82 @@ fn parse_file_block(block: Vec<u8>) -> Result<ParsedFilePatch, ReviewError> {
     })
 }
 
-/// 从 diff header 解析两个展示路径；遇到 quotePath 转义时仍由 name-status 覆盖。
+/// 解析 Git diff header 的两个 C-style path token，使空格、引号与 quotePath 八进制 UTF-8
+/// 仍能精确关联 NUL name-status；非法 token 只降级 metadata，不猜测另一个文件。
 fn parse_diff_git_paths(line: &[u8]) -> (Option<String>, Option<String>) {
-    let text = String::from_utf8_lossy(line)
-        .trim_end_matches('\n')
-        .to_owned();
-    let Some(rest) = text.strip_prefix("diff --git ") else {
+    let Some(mut rest) = line.strip_prefix(b"diff --git ") else {
         return (None, None);
     };
-    let Some(split) = rest.find(" b/") else {
+    let Some((left, consumed)) = parse_git_path_token(rest) else {
         return (None, None);
     };
-    let left = rest.get(..split).unwrap_or_default().trim();
-    let right = rest.get(split + 3..).unwrap_or_default().trim();
+    rest = &rest[consumed..];
+    while rest.first() == Some(&b' ') {
+        rest = &rest[1..];
+    }
+    let Some((right, _)) = parse_git_path_token(rest) else {
+        return (None, None);
+    };
     (
-        left.strip_prefix("a/").map(unquote_path),
-        right.strip_prefix("b/").map(unquote_path),
+        left.strip_prefix(b"a/")
+            .and_then(|path| String::from_utf8(path.to_vec()).ok()),
+        right
+            .strip_prefix(b"b/")
+            .and_then(|path| String::from_utf8(path.to_vec()).ok()),
     )
 }
 
-/// 仅移除 Git quote wrapper，不做有损八进制转换；精确路径仍由 NUL name-status 决定。
-fn unquote_path(path: &str) -> String {
-    path.strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(path)
-        .to_owned()
+/// 读取一个 Git C-style quoted 或普通 token，并返回消费 byte 数；只实现 Git path quote
+/// grammar，不接受 shell escaping，因此结果不能被解释为命令文本。
+fn parse_git_path_token(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if input.first() != Some(&b'"') {
+        let end = input
+            .iter()
+            .position(|byte| matches!(byte, b' ' | b'\r' | b'\n'))
+            .unwrap_or(input.len());
+        return (end > 0).then(|| (input[..end].to_vec(), end));
+    }
+    let mut output = Vec::new();
+    let mut index = 1_usize;
+    while index < input.len() {
+        match input[index] {
+            b'"' => return Some((output, index + 1)),
+            b'\\' => {
+                index += 1;
+                let escaped = *input.get(index)?;
+                if escaped.is_ascii_digit() && escaped < b'8' {
+                    let mut value = 0_u16;
+                    let mut digits = 0;
+                    while digits < 3
+                        && input
+                            .get(index)
+                            .is_some_and(|byte| byte.is_ascii_digit() && *byte < b'8')
+                    {
+                        value = value * 8 + u16::from(input[index] - b'0');
+                        index += 1;
+                        digits += 1;
+                    }
+                    output.push(u8::try_from(value).ok()?);
+                    continue;
+                }
+                output.push(match escaped {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 0x0b,
+                    b'f' => 0x0c,
+                    b'r' => b'\r',
+                    b'\\' => b'\\',
+                    b'"' => b'"',
+                    _ => return None,
+                });
+            }
+            byte => output.push(byte),
+        }
+        index += 1;
+    }
+    None
 }
 
 /// 将 hunk header 解析为 UI 与 hunk identity hash 共用的四个坐标。

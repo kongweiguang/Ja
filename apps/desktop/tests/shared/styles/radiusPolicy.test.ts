@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 const DESKTOP_SOURCE = join(process.cwd(), "apps", "desktop", "src");
 const COMPOSER_STYLE = join("features", "conversation", "ui", "composer", "composer.css");
+const TASKS_STYLE = join("features", "tasks", "ui", "tasks.css");
 const TIMELINE_STYLE = join("features", "conversation", "ui", "timeline", "timeline.css");
 
 /** 递归读取生产 CSS，避免新增 Feature 绕过紧凑工作台与明确 Apple 输入器的圆角边界。 */
@@ -26,11 +27,18 @@ function radiusPixels(value: string): number | undefined {
   return undefined;
 }
 
-/** 只有滚动条和标准 Switch 轨道可以使用胶囊几何，文本标签与浮层都必须保持克制。 */
-function approvedPill(source: string, valueOffset: number): boolean {
+/**
+ * 只有滚动条、标准 Switch 轨道和 Task 未读计数可以使用胶囊几何；Task 例外同时绑定
+ * 文件与 selector，避免其它文本标签借同名样式或任意 999px 绕过紧凑工作台约束。
+ */
+function approvedPill(file: string, source: string, valueOffset: number): boolean {
   const ruleStart = source.lastIndexOf("}", valueOffset) + 1;
   const selector = source.slice(ruleStart, source.lastIndexOf("{", valueOffset)).trim();
-  return selector === ".ja-scrollbar-thumb" || selector === ".ja-settings-switch";
+  return (
+    selector === ".ja-scrollbar-thumb" ||
+    selector === ".ja-settings-switch" ||
+    (relative(DESKTOP_SOURCE, file) === TASKS_STYLE && selector === ".ja-task-unread")
+  );
 }
 
 /**
@@ -48,7 +56,7 @@ function approvedComposerRadius(
   const selector = source.slice(ruleStart, source.lastIndexOf("{", valueOffset)).trim();
   if (selector === ".ja-composer") return pixels === 20 || pixels === 18;
   return (
-    (selector === ".ja-composer__attachments li" || selector === ".ja-composer__model-trigger") &&
+    (selector === ".ja-composer-attachment" || selector === ".ja-composer__model-trigger") &&
     pixels === 10
   );
 }
@@ -74,6 +82,14 @@ function approvedUserMessageRadius(
 
 describe("shared desktop radius policy", () => {
   it("keeps the workbench compact while allowing explicit Apple input and message geometry", () => {
+    const composerSource = readFileSync(join(DESKTOP_SOURCE, COMPOSER_STYLE), "utf8");
+    expect(composerSource).toMatch(
+      /\.ja-composer\s*\{[\s\S]*?--ja-composer-suggestion-radius:\s*14px;/,
+    );
+    expect(composerSource).toMatch(
+      /\.ja-composer-suggestions\s*\{[\s\S]*?border-radius:\s*var\(--ja-composer-suggestion-radius\);/,
+    );
+
     const violations: string[] = [];
     for (const file of cssFiles(DESKTOP_SOURCE)) {
       const source = readFileSync(file, "utf8");
@@ -84,7 +100,7 @@ describe("shared desktop radius policy", () => {
         if (
           pixels !== undefined &&
           pixels > 8 &&
-          !approvedPill(source, offset) &&
+          !approvedPill(file, source, offset) &&
           !approvedComposerRadius(file, source, offset, pixels) &&
           !approvedUserMessageRadius(file, source, offset, value)
         ) {

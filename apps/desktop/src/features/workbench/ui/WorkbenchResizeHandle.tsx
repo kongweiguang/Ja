@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactElement,
 } from "react";
+import { useResizeHandleSpotlight } from "@/shared/hooks/useResizeHandleSpotlight";
 
 export interface WorkbenchResizeHandleProps {
   readonly size: number;
@@ -42,6 +43,7 @@ export function WorkbenchResizeHandle({
   const layoutWidthRef = useRef(1);
   const startSizeRef = useRef(size);
   const previewSizeRef = useRef(size);
+  const spotlight = useResizeHandleSpotlight(handleRef);
 
   /** 外部持久值变化时刷新提交基线，避免下一次拖动从过期比例开始。 */
   useEffect(() => {
@@ -59,9 +61,9 @@ export function WorkbenchResizeHandle({
     [maxSize, minSize, onPreview],
   );
 
-  /** 统一结束所有 pointer 生命周期，并在释放捕获前清除 id 以避免 lostcapture 重复提交。 */
+  /** 统一结束所有 pointer 生命周期，并同步清理非正常结束的光带状态。 */
   const finishResize = useCallback(
-    (pointerId?: number): void => {
+    (pointerId?: number, forceSpotlightClear = false): void => {
       const activePointerId = pointerIdRef.current;
       if (
         activePointerId === undefined ||
@@ -73,8 +75,9 @@ export function WorkbenchResizeHandle({
       if (handle?.hasPointerCapture(activePointerId)) handle.releasePointerCapture(activePointerId);
       onCommit(previewSizeRef.current);
       setDragging(false);
+      spotlight.finishDrag(forceSpotlightClear);
     },
-    [onCommit],
+    [onCommit, spotlight],
   );
 
   /** window 监听保证光标越过会话或 Workbench 内容后仍持续响应，不依赖狭窄元素命中。 */
@@ -82,12 +85,15 @@ export function WorkbenchResizeHandle({
     if (!dragging) return undefined;
     /** 忽略非活动触点，防止多指输入改变本次布局事务。 */
     const preview = (event: PointerEvent): void => {
-      if (pointerIdRef.current === event.pointerId) previewFromClientX(event.clientX);
+      if (pointerIdRef.current !== event.pointerId) return;
+      spotlight.updateDrag(event.clientY);
+      previewFromClientX(event.clientX);
     };
-    /** 正常释放和系统取消使用同一提交语义。 */
-    const finish = (event: PointerEvent): void => finishResize(event.pointerId);
+    /** 正常释放保留真实 hover，系统取消则同时清除失效的光带位置。 */
+    const finish = (event: PointerEvent): void =>
+      finishResize(event.pointerId, event.type === "pointercancel");
     /** WebView2 失焦可能吞掉 pointerup，故提交最后一个已经显示的尺寸。 */
-    const finishOnBlur = (): void => finishResize();
+    const finishOnBlur = (): void => finishResize(undefined, true);
     window.addEventListener("pointermove", preview);
     window.addEventListener("pointerup", finish);
     window.addEventListener("pointercancel", finish);
@@ -98,13 +104,14 @@ export function WorkbenchResizeHandle({
       window.removeEventListener("pointercancel", finish);
       window.removeEventListener("blur", finishOnBlur);
     };
-  }, [dragging, finishResize, previewFromClientX]);
+  }, [dragging, finishResize, previewFromClientX, spotlight]);
 
   /** 只允许主 pointer 开始拖动，并以真实分栏容器宽度换算百分比。 */
   const startResize = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (event.button !== 0) return;
     event.preventDefault();
     pointerIdRef.current = event.pointerId;
+    spotlight.beginDrag(event.clientY);
     startXRef.current = event.clientX;
     startSizeRef.current = size;
     previewSizeRef.current = size;
@@ -138,7 +145,7 @@ export function WorkbenchResizeHandle({
   return (
     <div
       ref={handleRef}
-      className="ja-workbench-resize-handle"
+      className="ja-resize-handle ja-workbench-resize-handle"
       data-dragging={dragging || undefined}
       role="separator"
       aria-label="调整工作台宽度"
@@ -148,8 +155,12 @@ export function WorkbenchResizeHandle({
       aria-valuenow={size}
       aria-valuetext={`${size.toFixed(1)}%`}
       tabIndex={0}
+      onFocus={spotlight.onFocus}
+      onPointerEnter={spotlight.onPointerEnter}
+      onPointerMove={spotlight.onPointerMove}
+      onPointerLeave={spotlight.onPointerLeave}
       onPointerDown={startResize}
-      onLostPointerCapture={(event) => finishResize(event.pointerId)}
+      onLostPointerCapture={(event) => finishResize(event.pointerId, true)}
       onKeyDown={resizeWithKeyboard}
     />
   );

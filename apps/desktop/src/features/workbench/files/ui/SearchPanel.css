@@ -10,6 +10,11 @@
   overflow: hidden;
   padding: 0.65rem;
 }
+.ja-search-panel > .ja-file-tree-host {
+  min-height: 0;
+  flex: 1;
+  margin: 0 -0.65rem -0.65rem;
+}
 .ja-search-input-wrap {
   display: flex;
   min-height: 2.05rem;

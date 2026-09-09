@@ -23,7 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
-import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.runtime;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.usageFact;
 
 import io.github.kongweiguang.ja.bootstrap.App;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
@@ -61,19 +62,20 @@ final class EmbeddedSolonPersistenceTest {
                     "embedded", preferences("provider_embedded", "model_embedded"), now));
             ConversationRepository.AdmissionReceipt admission = store.admit(new ConversationRepository.TurnAdmission(
                     "thr_embedded", "turn_embedded",
-                    runtime("provider_embedded", "model_embedded", "cfg_embedded"), "item_user",
+                    "item_user",
                     new ModelMessage(ModelRole.USER,
-                            List.of(new TextContent("hello"))), List.of(), 0, now));
+                            List.of(new TextContent("hello"))), List.of(), 0, now,
+                    execution("cfg_embedded")));
             ConversationRepository.CommitReceipt running = store.commit(new ConversationRepository.CommitRequest(
                     "thr_embedded", "turn_embedded", TurnState.RUNNING, List.of(),
-                    admission.turnMutationVersion(), now.plusSeconds(1)));
+                    admission.turnMutationVersion(), now.plusSeconds(1), execution("cfg_embedded")));
             ModelUsage usage = new ModelUsage(3, 2, 5);
             long expected = running.turnMutationVersion();
             assertThrows(StorageException.class, () -> store.commitTerminal(new ConversationRepository.TerminalCommit(
                     "thr_embedded", "turn_embedded", TurnState.COMPLETED, "done", null, null,
                     "item_final", new ModelMessage(ModelRole.ASSISTANT,
                     List.of(new TextContent("done"))),
-                    List.of(new ConversationRepository.UsageFact(usage, 1), new ConversationRepository.UsageFact(usage, 1)),
+                    List.of(usageFact(1, 1, usage), usageFact(1, 1, usage)),
                     expected, now.plusSeconds(2))));
             assertEquals(TurnState.RUNNING,
                     store.findTurn("thr_embedded", "turn_embedded").orElseThrow().state());

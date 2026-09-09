@@ -6,21 +6,36 @@ package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
+import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
-import io.github.kongweiguang.ja.conversation.domain.TurnRuntimeSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.domain.ThreadTitlePolicy;
+import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.UserContent;
+import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
+import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentRecords;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ToolPresentationCodec;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnExecutionStateCodec;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnChangeSetCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.TaskMailboxPersistence;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.TaskRecoveryPersistence;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.TaskTerminalPersistence;
 import org.apache.ibatis.session.SqlSessionFactory;
 
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -32,9 +47,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class MybatisConversationRepository implements ConversationRepository {
     private static final long MAX_TURN_ATTACHMENT_BYTES = 250L * 1024 * 1024;
+    private static final int MAX_QUEUED_INPUTS = 8;
+    private static final long MAX_QUEUED_INPUT_BYTES = 512L * 1024;
     private final MybatisUnitOfWork transactions;
+    private final ObjectMapper objectMapper;
     private final PersistenceCodec codec;
+    private final TurnExecutionStateCodec executions;
     private final ToolPresentationCodec presentations;
+    private final TurnChangeSetCodec changeSets;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     /**
@@ -42,8 +62,11 @@ public final class MybatisConversationRepository implements ConversationReposito
      */
     public MybatisConversationRepository(SqlSessionFactory sessions, ObjectMapper objectMapper) {
         transactions = new MybatisUnitOfWork(sessions);
+        this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
         codec = new PersistenceCodec(objectMapper);
+        executions = new TurnExecutionStateCodec(objectMapper);
         presentations = new ToolPresentationCodec(objectMapper);
+        changeSets = new TurnChangeSetCodec(objectMapper);
     }
 
     /**
@@ -52,8 +75,11 @@ public final class MybatisConversationRepository implements ConversationReposito
     public MybatisConversationRepository(SqlSessionFactory sessions, ObjectMapper objectMapper,
                                          MybatisUnitOfWork.SessionOwner owner) {
         transactions = new MybatisUnitOfWork(sessions, owner);
+        this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
         codec = new PersistenceCodec(objectMapper);
+        executions = new TurnExecutionStateCodec(objectMapper);
         presentations = new ToolPresentationCodec(objectMapper);
+        changeSets = new TurnChangeSetCodec(objectMapper);
     }
 
     /**
@@ -65,12 +91,7 @@ public final class MybatisConversationRepository implements ConversationReposito
         Objects.requireNonNull(thread, "thread");
         return transactions.required(mapper -> {
             if (mapper.history().selectWorkspace(thread.workspaceId()) == null) notFound("workspace");
-            requireChanged(mapper.history().insertThread(new PersistenceRecords.ThreadInsert(
-                            thread.threadId(), thread.workspaceId(), thread.title(),
-                            thread.preferences().providerId(), thread.preferences().modelId(),
-                            thread.preferences().reasoningLevel(), thread.preferences().accessMode().name(),
-                            thread.preferences().titleSource().name(),
-                            instant(thread.createdAt()))),
+            requireChanged(mapper.history().insertThread(ThreadPersistenceMapping.toInsert(thread)),
                     "thread insert lost");
             return new ThreadSnapshot(thread.threadId(), thread.workspaceId(), thread.title(),
                     thread.preferences(), 0, List.of(), List.of(), thread.createdAt(), thread.createdAt());
@@ -87,36 +108,65 @@ public final class MybatisConversationRepository implements ConversationReposito
         return transactions.required(mapper -> {
             PersistenceRecords.ThreadRow thread = requireThread(mapper, admission.threadId());
             requireRevision(thread, admission.expectedThreadRevision());
-            TurnRuntimeSnapshot runtime = admission.runtime();
-            requireChanged(mapper.agent().insertTurn(new PersistenceRecords.TurnInsert(
-                    admission.turnId(), admission.threadId(), runtime.providerId(), runtime.modelId(),
-                    runtime.provider(), runtime.api(), runtime.upstreamModel(), runtime.reasoningLevel(),
-                    runtime.accessMode().name(), runtime.configGeneration(), instant(admission.requestedAt()))),
-                    "turn insert lost");
-            List<String> attachmentNames = bindAttachments(mapper, thread.workspaceId(), admission);
+            insertTurnExecution(mapper, admission.turnId(), admission.threadId(),
+                    admission.initialExecution(), admission.requestedAt(), "");
             long ordinal = mapper.agent().selectNextMessageOrdinal(admission.threadId());
             requireChanged(mapper.agent().insertMessage(new PersistenceRecords.MessageInsert(
                     admission.messageId(), admission.threadId(), admission.turnId(), ordinal,
                     admission.userMessage().role().name(), codec.writeMessage(admission.userMessage()),
                     instant(admission.requestedAt()))), "user message insert lost");
+            List<String> attachmentNames = bindAttachments(mapper, thread.workspaceId(), admission);
             String visibleUserInput = visibleText(admission.userMessage());
-            if (!visibleUserInput.isBlank()) {
-                insertTimelineMessage(mapper, admission.messageId(), admission.threadId(), admission.turnId(),
-                        "USER_INPUT", visibleUserInput, null, admission.requestedAt());
-            }
+            insertTimelineMessage(mapper, admission.messageId(), admission.threadId(), admission.turnId(),
+                    "USER_INPUT", visibleUserInput, null, admission.requestedAt());
             String provisionalTitle = null;
             if (ordinal == 1 && "PLACEHOLDER".equals(thread.titleSource())) {
                 String candidate = ThreadTitlePolicy.provisionalTitle(visibleUserInput, attachmentNames);
                 if (!candidate.isBlank()) provisionalTitle = candidate;
             }
             requireChanged(mapper.history().compareAndSetThreadAdmission(
-                    new PersistenceRecords.ThreadAdmissionCas(admission.threadId(), runtime.providerId(),
-                            runtime.modelId(), runtime.reasoningLevel(), runtime.accessMode().name(), provisionalTitle,
+                    new PersistenceRecords.ThreadAdmissionCas(admission.threadId(), thread.providerId(),
+                            thread.modelId(), thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(),
+                            provisionalTitle,
                             admission.expectedThreadRevision(), instant(admission.requestedAt()))),
                     "thread admission revision lost");
             return new AdmissionReceipt(admission.threadId(), admission.turnId(),
                     admission.expectedThreadRevision() + 1, 0, provisionalTitle);
         });
+    }
+
+    /** continuation 与用户 Turn 共用同一 CAS/FIFO 事实，但不伪造消息或可见输入。 */
+    @Override
+    public AdmissionReceipt admitContinuation(ContinuationAdmission admission) {
+        ensureOpen();
+        Objects.requireNonNull(admission, "admission");
+        return transactions.required(mapper -> {
+            PersistenceRecords.ThreadRow thread = requireThread(mapper, admission.threadId());
+            requireRevision(thread, admission.expectedThreadRevision());
+            insertTurnExecution(mapper, admission.turnId(), admission.threadId(),
+                    admission.initialExecution(), admission.requestedAt(), "continuation ");
+            requireChanged(mapper.agent().insertInternalTurnContext(
+                    new PersistenceRecords.InternalTurnContextInsert(admission.turnId(),
+                            admission.initialExecution().common().origin().name(), admission.hiddenContext(),
+                            instant(admission.requestedAt()))), "continuation context insert lost");
+            requireChanged(mapper.history().compareAndSetThreadAdmission(
+                    new PersistenceRecords.ThreadAdmissionCas(admission.threadId(), thread.providerId(),
+                            thread.modelId(), thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(),
+                            null, admission.expectedThreadRevision(), instant(admission.requestedAt()))),
+                    "continuation admission revision lost");
+            return new AdmissionReceipt(admission.threadId(), admission.turnId(),
+                    admission.expectedThreadRevision() + 1, 0, null);
+        });
+    }
+
+    /** Turn 与执行游标必须在同一事务共同出现；label 仅区分故障诊断，不改变持久状态。 */
+    private void insertTurnExecution(PersistenceMappers mapper, String turnId, String threadId,
+                                     TurnExecutionState initialExecution, Instant requestedAt,
+                                     String label) {
+        requireChanged(mapper.agent().insertTurn(new PersistenceRecords.TurnInsert(
+                turnId, threadId, instant(requestedAt))), label + "turn insert lost");
+        requireChanged(mapper.agent().insertTurnExecution(executionWrite(
+                turnId, initialExecution)), label + "initial execution state insert lost");
     }
 
     /**
@@ -129,9 +179,11 @@ public final class MybatisConversationRepository implements ConversationReposito
         List<String> displayNames = new java.util.ArrayList<>(admission.attachmentIds().size());
         for (String attachmentId : admission.attachmentIds()) {
             AttachmentRecords.AttachmentRow row = mapper.attachments().selectAttachment(attachmentId);
+            String reservationOwner = mapper.attachments().selectReservationInputId(attachmentId);
             if (row == null) notFound("attachment");
             if (!workspaceId.equals(row.workspaceId()) || !"DRAFT".equals(row.status())
-                || row.blobSha256() == null || !Instant.parse(row.expiresAt()).isAfter(admission.requestedAt())) {
+                || row.blobSha256() == null || reservationOwner != null
+                || !Instant.parse(row.expiresAt()).isAfter(admission.requestedAt())) {
                 throw conflict("attachment is not an available draft for this workspace");
             }
             try {
@@ -147,14 +199,105 @@ public final class MybatisConversationRepository implements ConversationReposito
         for (int ordinal = 0; ordinal < admission.attachmentIds().size(); ordinal++) {
             String attachmentId = admission.attachmentIds().get(ordinal);
             AttachmentRecords.AttachmentBind binding = new AttachmentRecords.AttachmentBind(
-                    attachmentId, workspaceId, admission.turnId(), ordinal,
+                    attachmentId, workspaceId, admission.messageId(), ordinal,
                     instant(admission.requestedAt()));
             requireChanged(mapper.attachments().bindDraft(binding),
                     "attachment changed during turn admission");
-            requireChanged(mapper.attachments().insertTurnAttachment(binding),
-                    "turn attachment relation insert lost");
+            requireChanged(mapper.attachments().insertMessageAttachment(binding),
+                    "message attachment relation insert lost");
         }
         return List.copyOf(displayNames);
+    }
+
+    /**
+     * 队列预留保持附件为 DRAFT，但用唯一关系阻止其它消息、TTL 或手工 discard 抢占；
+     * 更新先验证全部新事实，再差量丢弃移出项，任何唯一约束竞争都会回滚整个输入 CAS。
+     */
+    private static void replaceAttachmentReservations(PersistenceMappers mapper, String workspaceId,
+                                                      String inputId, List<String> previousIds,
+                                                      List<String> nextIds, Instant occurredAt) {
+        long totalBytes = 0;
+        for (String attachmentId : nextIds) {
+            AttachmentRecords.AttachmentRow row = requireQueuedDraft(mapper, workspaceId, inputId,
+                    attachmentId, occurredAt, ReservationRequirement.AVAILABLE_OR_OWNED,
+                    "attachment is not available for queue reservation");
+            try {
+                totalBytes = Math.addExact(totalBytes, row.sizeBytes());
+            } catch (ArithmeticException overflow) {
+                throw conflict("queued attachment quota exceeded");
+            }
+            if (totalBytes > MAX_TURN_ATTACHMENT_BYTES) {
+                throw conflict("queued attachment quota exceeded");
+            }
+        }
+        java.util.Set<String> next = java.util.Set.copyOf(nextIds);
+        for (String attachmentId : previousIds) {
+            if (!next.contains(attachmentId)
+                    && inputId.equals(mapper.attachments().selectReservationInputId(attachmentId))) {
+                requireChanged(mapper.attachments().discardReservedAttachment(
+                        inputId, attachmentId, instant(occurredAt)),
+                        "removed queued attachment changed concurrently");
+            }
+        }
+        mapper.attachments().deletePendingInputAttachments(inputId);
+        for (int ordinal = 0; ordinal < nextIds.size(); ordinal++) {
+            requireChanged(mapper.attachments().insertPendingInputAttachment(
+                    new AttachmentRecords.AttachmentReservation(inputId, nextIds.get(ordinal), ordinal,
+                            instant(occurredAt))), "attachment reservation insert lost");
+        }
+    }
+
+    /**
+     * 消费时把预留原子迁移为具体 USER Message 关系；任何缺失、过期或 owner 漂移都拒绝提交，
+     * 从而不产生附件已出队但消息不可预览的半状态。
+     */
+    private static void bindReservedAttachments(PersistenceMappers mapper, String workspaceId,
+                                                String inputId, String messageId,
+                                                UserContent content, Instant occurredAt) {
+        List<String> attachmentIds = content.attachmentIds();
+        for (String attachmentId : attachmentIds) {
+            requireQueuedDraft(mapper, workspaceId, inputId, attachmentId, occurredAt,
+                    ReservationRequirement.OWNED,
+                    "queued attachment is unavailable during consumption");
+        }
+        mapper.attachments().deletePendingInputAttachments(inputId);
+        for (int ordinal = 0; ordinal < attachmentIds.size(); ordinal++) {
+            AttachmentRecords.AttachmentBind binding = new AttachmentRecords.AttachmentBind(
+                    attachmentIds.get(ordinal), workspaceId, messageId, ordinal, instant(occurredAt));
+            requireChanged(mapper.attachments().bindDraft(binding),
+                    "queued attachment changed during consumption");
+            requireChanged(mapper.attachments().insertMessageAttachment(binding),
+                    "queued message attachment relation insert lost");
+        }
+    }
+
+    /**
+     * 队列附件的 Workspace、状态、blob、期限与预留 owner 在一个读取边界内校验；枚举显式区分
+     * 准入/编辑可占用与消费必须已占用两种规则，避免调用方用 boolean 颠倒 ownership 语义。
+     */
+    private static AttachmentRecords.AttachmentRow requireQueuedDraft(
+            PersistenceMappers mapper, String workspaceId, String inputId, String attachmentId,
+            Instant occurredAt, ReservationRequirement requirement, String failureMessage) {
+        AttachmentRecords.AttachmentRow row = mapper.attachments().selectAttachment(attachmentId);
+        String reservationOwner = mapper.attachments().selectReservationInputId(attachmentId);
+        boolean validOwner = switch (requirement) {
+            case AVAILABLE_OR_OWNED -> reservationOwner == null || inputId.equals(reservationOwner);
+            case OWNED -> inputId.equals(reservationOwner);
+        };
+        if (row == null || !workspaceId.equals(row.workspaceId()) || !"DRAFT".equals(row.status())
+                || row.blobSha256() == null || !Instant.parse(row.expiresAt()).isAfter(occurredAt)
+                || !validOwner) {
+            throw conflict(failureMessage);
+        }
+        return row;
+    }
+
+    /** 预留校验的闭集，防止附件消费路径接受尚未占用的草稿。 */
+    private enum ReservationRequirement {
+        /** 入队或编辑允许未占用草稿，也允许当前 input 的幂等重验。 */
+        AVAILABLE_OR_OWNED,
+        /** 消费只接受已由当前 input 独占的草稿。 */
+        OWNED
     }
 
     /**
@@ -164,22 +307,239 @@ public final class MybatisConversationRepository implements ConversationReposito
     public CommitReceipt commit(CommitRequest request) {
         ensureOpen();
         Objects.requireNonNull(request, "request");
+        return commitFacts(request, false);
+    }
+
+    /**
+     * 队首在事务外完成物理校验后仍可能不可用；此时只结算已经完成的 STOP Assistant，
+     * 不消费、关闭或推进队列 revision，让随后精确 selection CAS 仍能标记原队首并支持修复恢复。
+     */
+    @Override
+    public CommitReceipt commitAssistantSettlement(CommitRequest request) {
+        ensureOpen();
+        Objects.requireNonNull(request, "request");
+        return commitFacts(request, true);
+    }
+
+    /**
+     * 普通批次与 STOP Assistant 共享同一事务骨架，只让事实应用策略显式区分是否为 Assistant 结算。
+     */
+    private CommitReceipt commitFacts(CommitRequest request, boolean assistantSettlement) {
         return transactions.required(mapper -> {
             PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
                     request.expectedTurnMutationVersion());
             TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
             requireCancellationNotClaimed(turn);
-            requireTransition(current, request.state(), false, !request.facts().isEmpty());
-            long threadRevision = allocateThreadRevision(mapper, request.threadId(), request.occurredAt());
-            applyFacts(mapper, request.threadId(), request.turnId(), request.facts(),
-                    request.occurredAt());
-            requireChanged(mapper.agent().compareAndSetTurn(new PersistenceRecords.TurnCas(
-                            request.threadId(), request.turnId(), request.state().name(),
-                            request.expectedTurnMutationVersion(), instant(request.occurredAt()),
-                            null, null, null, null)),
-                    "turn state changed concurrently");
+            long threadRevision = applyCommitFacts(mapper, request, current, assistantSettlement);
+            finishCommit(mapper, request);
             return new CommitReceipt(threadRevision, request.expectedTurnMutationVersion() + 1);
         });
+    }
+
+    /**
+     * 在同一 SQLite 写事务中先提交前一 Assistant 事实，再追加最高优先级的排队 USER Message；
+     * 这样消息 ordinal 不会倒序，进程也不存在“Assistant 已提交但输入仍未消费”的恢复裂缝。
+     */
+    @Override
+    public Optional<InputConsumption> commitWithNextInput(CommitRequest request, InputSelection selection) {
+        ensureOpen();
+        Objects.requireNonNull(request, "request");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
+                    request.expectedTurnMutationVersion());
+            TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
+            requireCancellationNotClaimed(turn);
+            PersistenceRecords.PendingInputRow row = mapper.agent().selectPendingInput(
+                    new PersistenceRecords.PendingInputQuery(request.turnId(), null));
+            if (row == null) {
+                if (selection != null) throw InputQueueException.of(InputQueueFailure.CONFLICT);
+                if (turn.acceptingInputs()) {
+                    requireChanged(mapper.agent().closeInputQueue(new PersistenceRecords.InputQueueAdvance(
+                                    request.turnId(), turn.inputQueueRevision(), instant(request.occurredAt()))),
+                            "input queue close lost its empty gate");
+                }
+                return Optional.empty();
+            }
+            if (selection == null) throw InputQueueException.of(InputQueueFailure.CONFLICT);
+            requireSelection(row, selection);
+            // 有下一条输入意味着当前 Provider STOP 已形成独立答复边界；该 Assistant 事实必须
+            // 作为 Final 持久化，否则刷新后会被折叠进工作过程，破坏逐条回复语义。
+            long threadRevision = applyCommitFacts(mapper, request, current, true);
+            InputQueue.QueuedInput input = queuedInput(row);
+            ModelMessage message = new ModelMessage(ModelRole.USER, List.copyOf(input.content().blocks()));
+            String userItemId = "item_" + UUID.randomUUID();
+            insertMessage(mapper, request.threadId(), request.turnId(), userItemId, message, request.occurredAt());
+            bindReservedAttachments(mapper, requireThread(mapper, request.threadId()).workspaceId(),
+                    input.inputId(), userItemId, input.content(), request.occurredAt());
+            requireChanged(mapper.agent().consumePendingInput(
+                    new PersistenceRecords.PendingInputConsume(input.inputId(), input.inputRevision(),
+                            instant(request.occurredAt()))),
+                    "input was consumed concurrently");
+            insertTimelineMessage(mapper, userItemId, request.threadId(), request.turnId(),
+                    "USER_INPUT", input.content().text(), null, request.occurredAt());
+            requireChanged(mapper.agent().advanceInputQueue(new PersistenceRecords.InputQueueAdvance(
+                            request.turnId(), turn.inputQueueRevision(), instant(request.occurredAt()))),
+                    "input queue revision changed concurrently");
+            finishCommit(mapper, request);
+            InputQueue queue = inputQueue(mapper, request.turnId(), turn.inputQueueRevision() + 1, true);
+            return Optional.of(new InputConsumption(input, userItemId, message, request.occurredAt(), queue,
+                    threadRevision, request.expectedTurnMutationVersion() + 1));
+        });
+    }
+
+    /**
+     * Mailbox claim 与 USER message 必须在一个事务中逐字段重验后结算；稳定 item identity 使异常回滚
+     * 和进程恢复都不会把同一消息伪装成新的模型输入。
+     */
+    @Override
+    public TaskMailboxConsumption consumeTaskMailbox(TaskMailboxCommit request) {
+        ensureOpen();
+        Objects.requireNonNull(request, "request");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
+                    request.expectedTurnMutationVersion());
+            TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
+            requireCancellationNotClaimed(turn);
+            requireTransition(current, request.state(), false, true);
+            List<TaskRecords.MailboxRow> stored = mapper.tasks().selectBoundMailboxForTurn(
+                    request.turnId(), request.messages().size() + 1);
+            requireMailboxClaim(stored, request.messages(), codec);
+            long threadRevision = allocateThreadRevision(mapper, request.threadId(), request.occurredAt());
+            List<StoredMessage> userMessages = new java.util.ArrayList<>(stored.size());
+            for (int index = 0; index < stored.size(); index++) {
+                TaskRecords.MailboxRow row = stored.get(index);
+                TaskMailboxPort.ClaimedMessage claimed = request.messages().get(index);
+                ModelMessage message = new ModelMessage(ModelRole.USER, List.copyOf(claimed.content().blocks()));
+                if (claimed.kind() == TaskMailboxPort.MessageKind.FOLLOW_UP) {
+                    userMessages.add(requireFollowUpAdmissionMessage(
+                            mapper, request.threadId(), request.turnId(), message, codec));
+                } else {
+                    String itemId = taskMailboxItemId(row.messageId());
+                    long ordinal = mapper.agent().selectNextMessageOrdinal(request.threadId());
+                    requireChanged(mapper.agent().insertMessage(new PersistenceRecords.MessageInsert(
+                                    itemId, request.threadId(), request.turnId(), ordinal, ModelRole.USER.name(),
+                                    codec.writeMessage(message), instant(request.occurredAt()))),
+                            "task mailbox USER message identity already exists");
+                    userMessages.add(new StoredMessage(itemId, request.turnId(), ordinal,
+                            message, request.occurredAt()));
+                }
+            }
+            int consumed = TaskMailboxPersistence.consumeBoundForTurn(
+                    mapper, request.turnId(), request.occurredAt());
+            if (consumed != stored.size()) throw conflict("task mailbox claim changed concurrently");
+            finishCommit(mapper, request.threadId(), request.turnId(), request.state(),
+                    request.expectedTurnMutationVersion(), request.occurredAt(), request.executionState());
+            return new TaskMailboxConsumption(userMessages, threadRevision,
+                    request.expectedTurnMutationVersion() + 1, request.executionState());
+        });
+    }
+
+    /** 数据库 BOUND 行必须与调用方 claim 逐字段一致，避免过期批次吞掉后来重新绑定的内容。 */
+    private static void requireMailboxClaim(List<TaskRecords.MailboxRow> stored,
+                                            List<TaskMailboxPort.ClaimedMessage> claimed,
+                                            PersistenceCodec codec) {
+        if (stored.size() != claimed.size()) throw conflict("task mailbox claim is stale");
+        for (int index = 0; index < stored.size(); index++) {
+            TaskRecords.MailboxRow row = stored.get(index);
+            TaskMailboxPort.ClaimedMessage message = claimed.get(index);
+            if (row.mailboxSequence() != message.sequence()
+                    || !row.messageId().equals(message.messageId())
+                    || !row.rootThreadId().equals(message.rootThreadId())
+                    || !row.senderThreadId().equals(message.senderThreadId())
+                    || !row.targetThreadId().equals(message.targetThreadId())
+                    || !Objects.equals(row.causalTurnId(), message.causalTurnId())
+                    || !row.kind().equals(message.kind().name())
+                    || !row.idempotencyKey().equals(message.idempotencyKey())
+                    || !"BOUND".equals(row.state())
+                    || !Objects.equals(row.boundTurnId(), message.boundTurnId())
+                    || !codec.readUserContent(row.contentJson()).equals(message.content())) {
+                throw conflict("task mailbox claim is stale");
+            }
+        }
+    }
+
+    /** Mailbox 全局 message identity 经名称 UUID 映射为 messages 表允许的稳定 item identity。 */
+    private static String taskMailboxItemId(String mailboxMessageId) {
+        return "item_task_mailbox_" + UUID.nameUUIDFromBytes(
+                mailboxMessageId.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * FOLLOW_UP 的 USER message 已由 Turn admission 原子写入；消费 Mailbox 时复核该 Turn 首条 USER
+     * 与 claim 内容一致并复用，不得重复插入相同 prompt。
+     */
+    private static StoredMessage requireFollowUpAdmissionMessage(
+            PersistenceMappers mapper, String threadId, String turnId,
+            ModelMessage expected, PersistenceCodec codec) {
+        return mapper.agent().selectMessages(threadId).stream()
+                .filter(row -> turnId.equals(row.turnId()) && ModelRole.USER.name().equals(row.role()))
+                .findFirst()
+                .map(row -> {
+                    ModelMessage stored = codec.readMessage(row.role(), row.blocksJson());
+                    if (!stored.equals(expected)) throw conflict("follow-up admission message differs from mailbox");
+                    return new StoredMessage(row.messageId(), row.turnId(), row.ordinal(), stored,
+                            Instant.parse(row.createdAt()));
+                })
+                .orElseThrow(() -> conflict("follow-up admission USER message is unavailable"));
+    }
+
+    /**
+     * 在输入消费等可选动作之前统一校验状态边并提交事实；只有 STOP 后继续消费输入的路径
+     * 把 Assistant 结算标为 Final，Tool 中间轮仍保持 progress，避免两类边界在历史中混淆。
+     */
+    private long applyCommitFacts(PersistenceMappers mapper, CommitRequest request, TurnState current,
+                                  boolean assistantSettlement) {
+        boolean advancesExecution = advancesExecution(mapper, request.turnId(), request.executionState());
+        requireProviderPendingUsage(request, advancesExecution);
+        requireTransition(current, request.state(), false, !request.facts().isEmpty() || advancesExecution);
+        long threadRevision = allocateThreadRevision(mapper, request.threadId(), request.occurredAt());
+        applyFacts(mapper, request.threadId(), request.turnId(), request.facts(), request.occurredAt(),
+                assistantSettlement);
+        return threadRevision;
+    }
+
+    /**
+     * Provider intent 与 UNKNOWN Usage 必须同事务出现，避免恢复时猜测请求是否已经 dispatch；
+     * Profile、ordinal 和 purpose 全量匹配也阻止错误请求占用后续 KNOWN settlement。
+     */
+    private static void requireProviderPendingUsage(CommitRequest request, boolean advancesExecution) {
+        if (!(request.executionState() instanceof TurnExecutionState.ProviderPending pending)) return;
+        if (!advancesExecution) throw conflict("Provider request intent was already committed");
+        UsagePurpose expectedPurpose = pending.purpose() == TurnExecutionState.ProviderPurpose.SUMMARY
+                ? UsagePurpose.SUMMARY : UsagePurpose.ASSISTANT;
+        long matches = request.facts().stream()
+                .filter(UsageFact.class::isInstance)
+                .map(UsageFact.class::cast)
+                .filter(usage -> usage.requestId().equals(pending.requestId())
+                        && usage.modelRound() == Math.max(1, pending.common().modelRound() + 1)
+                        && usage.requestOrdinal() == pending.common().nextProviderOrdinal()
+                        && usage.purpose() == expectedPurpose
+                        && usage.certainty() == UsageCertainty.UNKNOWN
+                        && usage.profile().equals(pending.profile()))
+                .count();
+        if (matches != 1) {
+            throw new IllegalArgumentException("Provider pending requires one matching UNKNOWN usage fact");
+        }
+    }
+
+    /** 执行游标与 Turn CAS 必须作为每条普通提交路径的最后一步，避免部分成功暴露给并发调用。 */
+    private void finishCommit(PersistenceMappers mapper, CommitRequest request) {
+        finishCommit(mapper, request.threadId(), request.turnId(), request.state(),
+                request.expectedTurnMutationVersion(), request.occurredAt(), request.executionState());
+    }
+
+    /**
+     * 普通 Provider 提交与 Task mailbox 消费必须共享同一个 execution + CAS 收口顺序；
+     * 参数化边界避免两条事务路径各自复制状态写入，并保证任一步失败时整体回滚。
+     */
+    private void finishCommit(PersistenceMappers mapper, String threadId, String turnId, TurnState state,
+                              long expectedTurnMutationVersion, Instant occurredAt,
+                              TurnExecutionState executionState) {
+        replaceExecution(mapper, turnId, executionState);
+        requireChanged(mapper.agent().compareAndSetTurn(new PersistenceRecords.TurnCas(
+                        threadId, turnId, state.name(), expectedTurnMutationVersion, instant(occurredAt),
+                        null, null, null, null)),
+                "turn state changed concurrently");
     }
 
     /**
@@ -200,7 +560,8 @@ public final class MybatisConversationRepository implements ConversationReposito
             }
             requireTransition(current, request.state(), false, true);
             long threadRevision = allocateThreadRevision(mapper, request.threadId(), request.occurredAt());
-            applyFacts(mapper, request.threadId(), request.turnId(), request.facts(), request.occurredAt());
+            applyFacts(mapper, request.threadId(), request.turnId(), request.facts(), request.occurredAt(), false);
+            replaceExecution(mapper, request.turnId(), request.executionState());
             requireChanged(mapper.agent().advanceCancellationToolBatch(new PersistenceRecords.TurnAdvance(
                             request.threadId(), request.turnId(), request.expectedTurnMutationVersion(),
                             current.name(), instant(request.occurredAt()))),
@@ -219,14 +580,31 @@ public final class MybatisConversationRepository implements ConversationReposito
         return transactions.required(mapper -> {
             PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
                     request.expectedTurnMutationVersion());
+            String workspaceId = requireThread(mapper, request.threadId()).workspaceId();
             long expectedMutationVersion = request.expectedTurnMutationVersion();
             TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
+            if (request.state() != TurnState.COMPLETED && request.facts().stream()
+                    .anyMatch(ReasoningSummaryFact.class::isInstance)) {
+                throw new IllegalArgumentException("reasoning summary requires successful terminal state");
+            }
             requireTransition(current, request.state(), true, !request.facts().isEmpty());
             requireTerminalAfterCancellation(turn, request.state());
             long threadRevision = allocateThreadRevision(mapper, request.threadId(), request.occurredAt());
             applyFacts(mapper, request.threadId(), request.turnId(), request.facts(),
-                    request.occurredAt());
+                    request.occurredAt(), false);
             settleTerminalTools(mapper, request.turnId(), request.state(), request.occurredAt());
+            PersistenceRecords.PendingInputStats inputStats = mapper.agent().selectPendingInputStats(request.turnId());
+            mapper.attachments().discardTurnPendingInputAttachments(
+                    request.turnId(), instant(request.occurredAt()));
+            mapper.attachments().deleteTurnPendingInputAttachments(request.turnId());
+            mapper.agent().cancelPendingInputs(new PersistenceRecords.PendingInputCancel(
+                    request.turnId(), instant(request.occurredAt())));
+            if (turn.acceptingInputs() || inputStats.inputCount() > 0) {
+                requireChanged(mapper.agent().advanceInputQueue(new PersistenceRecords.InputQueueAdvance(
+                                request.turnId(), turn.inputQueueRevision(), instant(request.occurredAt()))),
+                        "terminal input queue revision changed concurrently");
+            }
+            mapper.agent().closePendingApprovals(request.turnId(), instant(request.occurredAt()));
             if (request.finalMessage() != null) {
                 insertMessage(mapper, request.threadId(), request.turnId(), request.finalMessageId(),
                         request.finalMessage(), request.occurredAt());
@@ -238,6 +616,24 @@ public final class MybatisConversationRepository implements ConversationReposito
                             instant(request.occurredAt()), instant(request.occurredAt()), request.summary(),
                             request.errorCode(), request.errorMessage())),
                     "terminal gate already committed");
+            PersistenceRecords.ChangeSetInsert changeSet = new PersistenceRecords.ChangeSetInsert(
+                    request.threadId(), request.turnId(), workspaceId,
+                    changeSets.write(request.changeSet()), request.changeSet().artifactId(),
+                    request.changeSetSha256(), request.changeSetByteLength(), request.changeSetUnifiedDiff(),
+                    instant(request.occurredAt()));
+            if (request.changeSet().artifactId() != null
+                    && mapper.history().insertChangeSetArtifact(changeSet) != 1) {
+                throw new StorageException(StorageException.Code.TRANSACTION,
+                        "turn change artifact insert lost");
+            }
+            if (mapper.history().insertChangeSet(changeSet) != 1) {
+                throw new StorageException(StorageException.Code.TRANSACTION,
+                        "turn change set insert lost");
+            }
+            // Task 事实必须位于 Turn CAS winner 的同一事务，失败会回滚最终消息和 Turn 终态。
+            TaskTerminalPersistence.settle(mapper, objectMapper, request);
+            requireChanged(mapper.agent().deleteTurnExecution(request.turnId()),
+                    "terminal execution state delete lost");
             return new CommitReceipt(threadRevision, expectedMutationVersion + 1);
         });
     }
@@ -313,62 +709,379 @@ public final class MybatisConversationRepository implements ConversationReposito
         });
     }
 
-    /** 排队仅验证 Turn 仍活动并插入一行，不推进执行 CAS，避免 UI 排队打断当前 Tool。 */
+    /** Resume 候选在一个 SQLite 快照内联表读取并严格解码 execution。 */
     @Override
-    public void enqueueInput(PendingInput input) {
+    public Optional<ResumeCandidate> findResumeCandidate(String turnId) {
+        ensureOpen();
+        return transactions.required(mapper -> {
+            PersistenceRecords.ResumeTurnRow row = mapper.agent().selectResumeTurn(turnId);
+            if (row == null) return Optional.empty();
+            if (row.schemaVersion() != TurnExecutionState.SCHEMA_VERSION) {
+                throw new StorageException(StorageException.Code.INVALID_STATE,
+                        "Turn execution schema is unsupported");
+            }
+            TurnExecutionState execution = executions.read(row.stateJson());
+            PersistenceRecords.CheckpointRow latest = mapper.checkpoint().selectCheckpoint(row.threadId());
+            String latestSummary = checkpointSummary(latest);
+            String promptSummary = "";
+            String promptCheckpointId = execution.common().promptCheckpointId();
+            if (promptCheckpointId != null) {
+                PersistenceRecords.CheckpointRow referenced = latest != null
+                        && promptCheckpointId.equals(latest.checkpointId()) ? latest
+                        : mapper.checkpoint().selectCheckpointIdentity(row.threadId(), promptCheckpointId);
+                if (referenced == null) {
+                    throw new StorageException(StorageException.Code.INVALID_STATE,
+                            "Turn prompt checkpoint is unavailable");
+                }
+                promptSummary = checkpointSummary(referenced);
+            }
+            UserContent originalContent = null;
+            String internalContext = null;
+            if (execution.common().origin().internal()) {
+                if (!execution.common().origin().name().equals(row.internalOrigin())) {
+                    throw new StorageException(StorageException.Code.INVALID_STATE,
+                            "Turn internal context origin does not match execution");
+                }
+                internalContext = requiredText(row.internalContextJson(), "internal_context_json");
+            } else {
+                if (row.internalOrigin() != null || row.internalContextJson() != null) {
+                    throw new StorageException(StorageException.Code.INVALID_STATE,
+                            "User Turn unexpectedly has internal context");
+                }
+                ModelMessage originalUser = codec.readMessage(ModelRole.USER.name(),
+                        requiredText(row.originalUserBlocksJson(), "original_user_blocks_json"));
+                List<io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock> originalBlocks =
+                        originalUser.content().stream()
+                                .filter(io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock.class::isInstance)
+                                .map(io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock.class::cast)
+                                .toList();
+                originalContent = new UserContent(originalBlocks);
+            }
+            return Optional.of(new ResumeCandidate(row.threadId(), row.turnId(), row.workspaceId(),
+                    Path.of(row.rootPath()), row.threadRevision(), row.turnMutationVersion(),
+                    execution, promptSummary, latestSummary, originalContent, internalContext,
+                    row.provisionalTitleEligible()));
+        });
+    }
+
+    /** 解码 SQLite checkpoint 的结构化摘要并生成 Prompt 唯一规范文本；空行表示从未压缩。 */
+    private String checkpointSummary(PersistenceRecords.CheckpointRow row) {
+        return row == null ? "" : codec.readSummary(row.summaryJson()).toPromptText();
+    }
+
+    /** Resume 先赢 Turn 的 head-of-line CAS，再推进一次 Thread revision，二者同事务可见。 */
+    @Override
+    public ResumeReceipt resume(String turnId, long expectedThreadRevision,
+                                long expectedTurnMutationVersion, Instant occurredAt) {
+        ensureOpen();
+        Objects.requireNonNull(occurredAt, "occurredAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.ResumeTurnRow row = mapper.agent().selectResumeTurn(turnId);
+            if (row == null) notFound("suspended turn");
+            requireChanged(mapper.agent().resumeSuspendedTurn(new PersistenceRecords.ResumeTurnCas(
+                    turnId, row.threadId(), expectedThreadRevision, expectedTurnMutationVersion,
+                    instant(occurredAt))), "turn is not the resumable thread head");
+            requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
+                    row.threadId(), expectedThreadRevision, instant(occurredAt))),
+                    "thread revision is stale");
+            return new ResumeReceipt(row.threadId(), turnId, expectedThreadRevision + 1,
+                    expectedTurnMutationVersion + 1);
+        });
+    }
+
+    /** SUSPENDED 没有进程内 owner，取消直接原子关闭输入、审批和 execution。 */
+    @Override
+    public CancelResult cancelSuspended(String turnId, long expectedThreadRevision, Instant occurredAt) {
+        ensureOpen();
+        Objects.requireNonNull(occurredAt, "occurredAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.ResumeTurnRow row = mapper.agent().selectResumeTurn(turnId);
+            if (row == null) notFound("suspended turn");
+            requireChanged(mapper.agent().cancelSuspendedTurn(new PersistenceRecords.ResumeTurnCas(
+                    turnId, row.threadId(), expectedThreadRevision, row.turnMutationVersion(),
+                    instant(occurredAt))), "suspended turn changed concurrently");
+            requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
+                    row.threadId(), expectedThreadRevision, instant(occurredAt))),
+                    "thread revision is stale");
+            mapper.attachments().discardTurnPendingInputAttachments(turnId, instant(occurredAt));
+            mapper.attachments().deleteTurnPendingInputAttachments(turnId);
+            mapper.agent().cancelPendingInputs(new PersistenceRecords.PendingInputCancel(turnId, instant(occurredAt)));
+            mapper.agent().closePendingApprovals(turnId, instant(occurredAt));
+            requireChanged(mapper.agent().deleteTurnExecution(turnId), "suspended execution delete lost");
+            TaskRecoveryPersistence.reconcileTerminal(
+                    mapper, objectMapper, turnId, TurnState.CANCELLED, occurredAt);
+            return new CancelResult(turnId, expectedThreadRevision + 1, row.turnMutationVersion() + 1);
+        });
+    }
+
+    /** 单快照计数只服务执行准入，不替代 resume 事务中的 head-of-line CAS。 */
+    @Override
+    public boolean hasSuspendedTurn(String threadId) {
+        ensureOpen();
+        return transactions.required(mapper -> mapper.agent().countSuspendedTurns(threadId) > 0);
+    }
+
+    /** 恢复只读取 callId 已持久审批；空结果表示该 Tool 从未请求审批。 */
+    @Override
+    public Optional<PendingApproval> findApproval(String turnId, String callId) {
+        ensureOpen();
+        return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectToolApproval(
+                        new PersistenceRecords.ToolKey(turnId, callId)))
+                .map(row -> new PendingApproval(row.approvalId(), row.decision() == null
+                        ? null : ApprovalDecision.valueOf(row.decision()), Instant.parse(row.expiresAt()))));
+    }
+
+    /** Tool batch 恢复只读取 Provider settlement 已提交的不可变绑定，不从当前目录补全缺失字段。 */
+    @Override
+    public Optional<ToolBinding> findToolBinding(String turnId, String callId) {
+        ensureOpen();
+        return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectToolBinding(
+                        new PersistenceRecords.ToolKey(turnId, callId)))
+                .map(row -> new ToolBinding(row.batchId(), row.callId(),
+                        AgentTool.RouteKind.valueOf(requiredText(row.routeKind(), "route_kind")),
+                        requiredText(row.localName(), "local_name"),
+                        requiredText(row.serverId(), "server_id"),
+                        requiredText(row.remoteName(), "remote_name"),
+                        requiredText(row.schemaHash(), "schema_hash"),
+                        requiredText(row.routeHash(), "route_hash"),
+                        requiredText(row.catalogRevision(), "catalog_revision"),
+                        AccessMode.valueOf(requiredText(row.accessMode(), "access_mode")))));
+    }
+
+    /**
+     * 审批响应在单事务内写 decision、Tool 投影、Turn 状态、execution 与 Thread revision；
+     * 只有提交返回 true 后 InMemoryApprovalBroker 才允许完成 waiter。
+     */
+    @Override
+    public boolean resolveApproval(String approvalId, ApprovalDecision decision, Instant resolvedAt) {
+        ensureOpen();
+        Objects.requireNonNull(approvalId, "approvalId");
+        Objects.requireNonNull(decision, "decision");
+        Objects.requireNonNull(resolvedAt, "resolvedAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.ApprovalDecisionRow row = mapper.agent().selectApprovalDecision(approvalId);
+            if (row == null || row.decision() != null || !"WAITING_APPROVAL".equals(row.turnState())) return false;
+            Instant expiresAt = Instant.parse(row.expiresAt());
+            boolean withinDecisionWindow = decision == ApprovalDecision.DENY
+                    ? !expiresAt.isBefore(resolvedAt) : expiresAt.isAfter(resolvedAt);
+            if (!withinDecisionWindow) return false;
+            PersistenceRecords.TurnExecutionRow executionRow = mapper.agent().selectTurnExecution(row.turnId());
+            if (executionRow == null || executionRow.schemaVersion() != TurnExecutionState.SCHEMA_VERSION) {
+                throw new StorageException(StorageException.Code.INVALID_STATE,
+                        "approval execution state is unavailable");
+            }
+            TurnExecutionState execution = executions.read(executionRow.stateJson());
+            if (!(execution instanceof TurnExecutionState.Tools)) {
+                throw new StorageException(StorageException.Code.INVALID_STATE,
+                        "approval does not own a Tool execution cursor");
+            }
+            requireChanged(mapper.agent().resolveApproval(new PersistenceRecords.ApprovalResolve(
+                    row.turnId(), approvalId, row.callId(), decision.name(), instant(resolvedAt))),
+                    "approval response lost its pending row");
+            requireChanged(mapper.agent().markApprovalToolRunning(
+                    new PersistenceRecords.ToolApprovalStatusUpdate(row.turnId(), row.callId(), instant(resolvedAt))),
+                    "approval response lost its Tool projection");
+            replaceExecution(mapper, row.turnId(), execution);
+            requireChanged(mapper.agent().compareAndSetTurn(new PersistenceRecords.TurnCas(
+                    row.threadId(), row.turnId(), TurnState.RUNNING.name(), row.turnMutationVersion(),
+                    instant(resolvedAt), null, null, null, null)),
+                    "approval response lost its Turn state gate");
+            allocateThreadRevision(mapper, row.threadId(), resolvedAt);
+            return true;
+        });
+    }
+
+    /** 入队只推进独立 queue revision，绝不修改执行 mutation version 或中断当前 Provider/Tool。 */
+    @Override
+    public QueueMutation enqueueInput(PendingInput input) {
         ensureOpen();
         Objects.requireNonNull(input, "input");
-        transactions.required(mapper -> {
-            PersistenceRecords.TurnRow turn = mapper.agent().selectTurn(
-                    new PersistenceRecords.TurnKey(input.threadId(), input.turnId()));
-            if (turn == null || TurnState.valueOf(requiredText(turn.state(), "state")).terminal()
-                || turn.cancelRequestedAt() != null) {
-                throw conflict("turn cannot accept queued input");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = acceptingInputTurn(mapper, input.threadId(), input.turnId());
+            PersistenceRecords.PendingInputStats stats = mapper.agent().selectPendingInputStats(input.turnId());
+            String contentJson = codec.writeUserContent(input.content());
+            long addedBytes = utf8Bytes(contentJson);
+            if (stats.inputCount() >= MAX_QUEUED_INPUTS
+                || stats.totalBytes() > MAX_QUEUED_INPUT_BYTES - addedBytes) {
+                throw InputQueueException.of(InputQueueFailure.CAPACITY);
             }
             requireChanged(mapper.agent().insertPendingInput(new PersistenceRecords.PendingInputInsert(
-                    input.inputId(), input.threadId(), input.turnId(), input.kind().name(), input.text(),
+                    input.inputId(), input.threadId(), input.turnId(), input.kind().name(), contentJson,
                     instant(input.createdAt()))), "input identity must be unique");
-            return null;
+            PersistenceRecords.ThreadRow thread = requireThread(mapper, input.threadId());
+            replaceAttachmentReservations(mapper, thread.workspaceId(), input.inputId(),
+                    List.of(), input.content().attachmentIds(), input.createdAt());
+            return advanceQueue(mapper, turn, input.inputId(), input.createdAt(), true);
+        });
+    }
+
+    /** Peek 只读取 SQL 已排序的 head；消费仍用条目 revision CAS 防止验证后编辑被误吞。 */
+    @Override
+    public Optional<InputQueue.QueuedInput> peekInput(String turnId, InputKind kind) {
+        ensureOpen();
+        Objects.requireNonNull(turnId, "turnId");
+        return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectPendingInput(
+                        new PersistenceRecords.PendingInputQuery(turnId, kind == null ? null : kind.name())))
+                .map(this::queuedInput));
+    }
+
+    /**
+     * SQLite 事实必须在真正消费前重验；只接受仍未过期、blob 存在且由同一 input 独占预留的 DRAFT。
+     */
+    @Override
+    public boolean queuedAttachmentsAvailable(String threadId, InputQueue.QueuedInput input, Instant now) {
+        ensureOpen();
+        Objects.requireNonNull(threadId, "threadId");
+        Objects.requireNonNull(input, "input");
+        Objects.requireNonNull(now, "now");
+        return transactions.required(mapper -> input.content().attachmentIds().stream().allMatch(attachmentId -> {
+            AttachmentRecords.AttachmentRow attachment =
+                    mapper.attachments().selectThreadAttachment(attachmentId, threadId);
+            return attachment != null
+                   && "DRAFT".equals(attachment.status())
+                   && attachment.blobSha256() != null
+                   && Instant.parse(attachment.expiresAt()).isAfter(now)
+                   && input.inputId().equals(mapper.attachments().selectReservationInputId(attachmentId));
+        }));
+    }
+
+    /** 消费期拒绝只改变队列修复事实，Turn 挂起仍由 Loop 的独立状态事务负责。 */
+    @Override
+    public QueueMutation markInputNeedsAttention(String threadId, String turnId, InputSelection selection,
+                                                 InputQueue.Issue issue, Instant occurredAt) {
+        ensureOpen();
+        Objects.requireNonNull(selection, "selection");
+        Objects.requireNonNull(issue, "issue");
+        Objects.requireNonNull(occurredAt, "occurredAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = acceptingInputTurn(mapper, threadId, turnId);
+            PersistenceRecords.PendingInputRow head = mapper.agent().selectPendingInput(
+                    new PersistenceRecords.PendingInputQuery(turnId, selection.kind().name()));
+            if (head == null) throw InputQueueException.of(InputQueueFailure.NOT_FOUND);
+            requireSelection(head, selection);
+            InputQueue.QueuedInput current = queuedInput(head);
+            if (current.status() == InputQueue.Status.NEEDS_ATTENTION && issue.equals(current.issue())) {
+                return mutation(mapper, turn, selection.inputId(), false);
+            }
+            requireChanged(mapper.agent().markPendingInputNeedsAttention(
+                            new PersistenceRecords.PendingInputAttention(turnId, selection.inputId(),
+                                    selection.inputRevision(), issue.errorCode(), issue.message(), issue.retryable(),
+                                    instant(occurredAt))),
+                    "input attention update lost its revision gate");
+            return advanceQueue(mapper, turn, selection.inputId(), occurredAt, true);
+        });
+    }
+
+    /** 提升只在 FOLLOW_UP -> STEERING 时分配点击序；已经提升的条目保持幂等。 */
+    @Override
+    public QueueMutation prioritizeInput(String threadId, String turnId, String inputId,
+                                         long expectedInputRevision, Instant occurredAt) {
+        ensureOpen();
+        Objects.requireNonNull(occurredAt, "occurredAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = acceptingInputTurn(mapper, threadId, turnId);
+            PersistenceRecords.PendingInputRow row = pendingInput(mapper, turnId, inputId);
+            if (InputKind.STEERING.name().equals(row.kind())) {
+                return mutation(mapper, turn, inputId, false);
+            }
+            requireInputRevision(row, expectedInputRevision);
+            Long priority = mapper.agent().selectNextInputPriority(turnId);
+            requireChanged(mapper.agent().prioritizePendingInput(new PersistenceRecords.PendingInputMutation(
+                            turnId, inputId, expectedInputRevision, null, priority, instant(occurredAt))),
+                    "input prioritization lost its revision gate");
+            return advanceQueue(mapper, turn, inputId, occurredAt, true);
+        });
+    }
+
+    /**
+     * 编辑在同一事务计算替换后的结构化 JSON UTF-8 总量，避免两个并发编辑分别通过容量判断；
+     * 单字段长度由 UserContent 值对象负责，不能把 JSON 包装开销误算进旧正文字符上限。
+     */
+    @Override
+    public QueueMutation updateInput(String threadId, String turnId, String inputId,
+                                     long expectedInputRevision, UserContent content, Instant occurredAt) {
+        ensureOpen();
+        String contentJson = codec.writeUserContent(Objects.requireNonNull(content, "content"));
+        long contentBytes = utf8Bytes(contentJson);
+        Objects.requireNonNull(occurredAt, "occurredAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = acceptingInputTurn(mapper, threadId, turnId);
+            PersistenceRecords.PendingInputRow row = pendingInput(mapper, turnId, inputId);
+            requireInputRevision(row, expectedInputRevision);
+            PersistenceRecords.PendingInputStats stats = mapper.agent().selectPendingInputStats(turnId);
+            long replacementBytes = stats.totalBytes() - utf8Bytes(row.contentJson()) + contentBytes;
+            if (replacementBytes > MAX_QUEUED_INPUT_BYTES) {
+                throw InputQueueException.of(InputQueueFailure.CAPACITY);
+            }
+            UserContent previous = codec.readUserContent(row.contentJson());
+            PersistenceRecords.ThreadRow thread = requireThread(mapper, threadId);
+            replaceAttachmentReservations(mapper, thread.workspaceId(), inputId,
+                    previous.attachmentIds(), content.attachmentIds(), occurredAt);
+            requireChanged(mapper.agent().updatePendingInput(new PersistenceRecords.PendingInputMutation(
+                            turnId, inputId, expectedInputRevision, contentJson, null, instant(occurredAt))),
+                    "input update lost its revision gate");
+            return advanceQueue(mapper, turn, inputId, occurredAt, true);
+        });
+    }
+
+    /** 删除保留已解决行供恢复审计，只从权威 PENDING 投影中移除。 */
+    @Override
+    public QueueMutation deleteInput(String threadId, String turnId, String inputId,
+                                     long expectedInputRevision, Instant occurredAt) {
+        ensureOpen();
+        Objects.requireNonNull(occurredAt, "occurredAt");
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = acceptingInputTurn(mapper, threadId, turnId);
+            PersistenceRecords.PendingInputRow row = pendingInput(mapper, turnId, inputId);
+            requireInputRevision(row, expectedInputRevision);
+            mapper.attachments().discardPendingInputAttachments(inputId, instant(occurredAt));
+            mapper.attachments().deletePendingInputAttachments(inputId);
+            requireChanged(mapper.agent().deletePendingInput(new PersistenceRecords.PendingInputMutation(
+                            turnId, inputId, expectedInputRevision, null, null, instant(occurredAt))),
+                    "input delete lost its revision gate");
+            return advanceQueue(mapper, turn, inputId, occurredAt, true);
         });
     }
 
     /** 标记消费和 USER Message 插入共享一个事务，并以 Turn mutation version 拒绝终态竞态。 */
     @Override
-    public Optional<InputConsumption> consumeInput(String threadId, String turnId, InputKind kind,
-                                                   long expectedTurnMutationVersion, Instant occurredAt) {
+    public Optional<InputConsumption> consumeInput(String threadId, String turnId, InputSelection selection,
+                                                   long expectedTurnMutationVersion, Instant occurredAt,
+                                                   TurnExecutionState executionState) {
         ensureOpen();
-        Objects.requireNonNull(kind, "kind");
+        Objects.requireNonNull(selection, "selection");
         Objects.requireNonNull(occurredAt, "occurredAt");
+        Objects.requireNonNull(executionState, "executionState");
         return transactions.required(mapper -> {
             checkedTurn(mapper, threadId, turnId, expectedTurnMutationVersion);
             PersistenceRecords.PendingInputRow row = mapper.agent().selectPendingInput(
-                    new PersistenceRecords.PendingInputQuery(turnId, kind.name()));
+                    new PersistenceRecords.PendingInputQuery(turnId, selection.kind().name()));
             if (row == null) return Optional.empty();
-            String inputId = requiredText(row.inputId(), "input_id");
+            requireSelection(row, selection);
+            InputQueue.QueuedInput input = queuedInput(row);
+            ModelMessage message = new ModelMessage(ModelRole.USER, List.copyOf(input.content().blocks()));
+            String userItemId = "item_" + UUID.randomUUID();
+            insertMessage(mapper, threadId, turnId, userItemId, message, occurredAt);
+            bindReservedAttachments(mapper, requireThread(mapper, threadId).workspaceId(),
+                    input.inputId(), userItemId, input.content(), occurredAt);
             requireChanged(mapper.agent().consumePendingInput(
-                    new PersistenceRecords.PendingInputConsume(inputId, instant(occurredAt))),
+                    new PersistenceRecords.PendingInputConsume(input.inputId(), input.inputRevision(),
+                            instant(occurredAt))),
                     "input was consumed concurrently");
-            ModelMessage message = new ModelMessage(ModelRole.USER,
-                    List.of(new TextContent(requiredValue(row.text(), "text"))));
-            insertMessage(mapper, threadId, turnId, "item_" + UUID.randomUUID(), message, occurredAt);
+            insertTimelineMessage(mapper, userItemId, threadId, turnId,
+                    "USER_INPUT", input.content().text(), null, occurredAt);
             long revision = allocateThreadRevision(mapper, threadId, occurredAt);
             requireChanged(mapper.agent().advanceInputConsumption(new PersistenceRecords.InputAdvance(
                     threadId, turnId, expectedTurnMutationVersion, instant(occurredAt))),
                     "turn changed during input consumption");
-            return Optional.of(new InputConsumption(inputId, message, revision,
+            replaceExecution(mapper, turnId, executionState);
+            PersistenceRecords.TurnRow turn = mapper.agent().selectTurn(new PersistenceRecords.TurnKey(threadId, turnId));
+            requireChanged(mapper.agent().advanceInputQueue(new PersistenceRecords.InputQueueAdvance(
+                            turnId, turn.inputQueueRevision(), instant(occurredAt))),
+                    "input queue revision changed during consumption");
+            InputQueue queue = inputQueue(mapper, turnId, turn.inputQueueRevision() + 1, turn.acceptingInputs());
+            return Optional.of(new InputConsumption(input, userItemId, message, occurredAt, queue, revision,
                     expectedTurnMutationVersion + 1));
-        });
-    }
-
-    /** 取消剩余队列不推进 revision；Turn 的取消声明已经提供唯一可观察状态变化。 */
-    @Override
-    public void cancelInputs(String turnId, Instant occurredAt) {
-        ensureOpen();
-        Objects.requireNonNull(occurredAt, "occurredAt");
-        transactions.required(mapper -> {
-            mapper.agent().cancelPendingInputs(new PersistenceRecords.PendingInputCancel(
-                    turnId, instant(occurredAt)));
-            return null;
         });
     }
 
@@ -424,14 +1137,15 @@ public final class MybatisConversationRepository implements ConversationReposito
      * 将 sealed facts 映射到内聚表，禁止用事件 journal 充当业务事实。
      */
     private void applyFacts(PersistenceMappers mapper, String threadId, String turnId,
-                            List<Fact> facts, Instant occurredAt) {
+                            List<Fact> facts, Instant occurredAt, boolean assistantSettlement) {
         for (Fact fact : facts) {
             switch (fact) {
                 case AssistantFact assistant -> {
                     insertMessage(mapper, threadId, turnId,
                             assistant.messageId(), assistant.message(), occurredAt);
                     insertTimelineMessage(mapper, assistant.messageId(), threadId, turnId,
-                            "ASSISTANT_PROGRESS", assistant.publicText(), assistant.modelRound(), occurredAt);
+                            assistantSettlement ? "FINAL_ANSWER" : "ASSISTANT_PROGRESS",
+                            assistant.publicText(), assistantSettlement ? null : assistant.modelRound(), occurredAt);
                     if (assistant.reasoningSummary() != null) {
                         insertTimelineMessage(mapper, assistant.messageId() + "_reasoning", threadId, turnId,
                                 "REASONING_SUMMARY", assistant.reasoningSummary(), assistant.modelRound(), occurredAt);
@@ -439,11 +1153,24 @@ public final class MybatisConversationRepository implements ConversationReposito
                 }
                 case ToolResultMessageFact resultMessage -> insertMessage(mapper, threadId, turnId,
                         resultMessage.messageId(), resultMessage.message(), occurredAt);
-                case ToolPreparedFact prepared -> requireChanged(mapper.agent().insertTool(
-                        new PersistenceRecords.ToolInsert(prepared.callId(), threadId, turnId, prepared.ordinal(),
-                                prepared.toolName(), prepared.sideEffect().name(),
-                                presentations.write(prepared.presentation()), instant(occurredAt))),
-                        "tool call must be unique by callId and ordinal");
+                case ToolPreparedFact prepared -> {
+                    requireChanged(mapper.agent().insertTool(
+                                    new PersistenceRecords.ToolInsert(prepared.callId(), threadId, turnId,
+                                            prepared.ordinal(), prepared.toolName(), prepared.sideEffect().name(),
+                                            presentations.write(prepared.presentation()), instant(occurredAt))),
+                            "tool call must be unique by callId and ordinal");
+                    ToolBinding binding = prepared.binding();
+                    /* 未知名称必须保留 Tool 调用事实供模型纠正，但不存在可安全恢复的执行路由；
+                     * 缺行是明确的 unavailable 语义，不能用虚假 descriptor 污染 binding 审计。 */
+                    if (binding != null) {
+                        requireChanged(mapper.agent().insertToolBinding(new PersistenceRecords.ToolBindingInsert(
+                                        turnId, binding.batchId(), binding.callId(), binding.routeKind().name(),
+                                        binding.localName(), binding.serverId(), binding.remoteName(),
+                                        binding.schemaHash(), binding.routeHash(), binding.catalogRevision(),
+                                        binding.accessMode().name(), instant(occurredAt))),
+                                "Tool binding must be unique and match its prepared call");
+                    }
+                }
                 case ToolStartedFact started -> requireChanged(mapper.agent().startTool(
                                 new PersistenceRecords.ToolStart(turnId, started.callId(), instant(occurredAt))),
                         "tool start requires PREPARED call");
@@ -462,13 +1189,58 @@ public final class MybatisConversationRepository implements ConversationReposito
                             "tool result requires exactly one unfinished call");
                 }
                 case ApprovalFact approval -> persistApproval(mapper, threadId, turnId, approval, occurredAt);
-                case UsageFact usage -> requireChanged(mapper.agent().insertUsage(
-                        new PersistenceRecords.UsageInsert("usage_" + turnId + "_" + usage.modelRound(),
-                                threadId, turnId, usage.modelRound(), usage.usage().inputTokens(),
-                                usage.usage().outputTokens(), usage.usage().totalTokens(), instant(occurredAt))),
-                        "usage round must be unique");
+                case UsageFact usage -> persistUsage(mapper, threadId, turnId, usage, occurredAt);
+                case ReasoningSummaryFact reasoning -> insertTimelineMessage(mapper,
+                        reasoning.messageId() + "_reasoning", threadId, turnId,
+                        "REASONING_SUMMARY", reasoning.text(), reasoning.modelRound(), occurredAt);
             }
         }
+    }
+
+    /**
+     * Dispatch 前插入 UNKNOWN；可靠计量只能原位升级同 request/profile 行，禁止追加第二条请求事实。
+     */
+    private void persistUsage(PersistenceMappers mapper, String threadId, String turnId,
+                              UsageFact usage, Instant occurredAt) {
+        String profileJson = codec.writeProviderRequestProfile(usage.profile());
+        if (usage.certainty() == UsageCertainty.UNKNOWN) {
+            requireChanged(mapper.agent().insertUsage(new PersistenceRecords.UsageInsert(
+                            "usage_" + usage.requestId().substring("request_".length()),
+                            usage.requestId(), threadId, turnId, usage.modelRound(), usage.requestOrdinal(),
+                            usage.purpose().name(), usage.certainty().name(), profileJson,
+                            null, null, null, instant(occurredAt))),
+                    "Provider request usage must be unique by Turn ordinal");
+            return;
+        }
+        ModelUsage measured = Objects.requireNonNull(usage.usage(), "known usage");
+        requireChanged(mapper.agent().settleUsage(new PersistenceRecords.UsageSettlement(
+                        usage.requestId(), turnId, usage.requestOrdinal(), usage.purpose().name(),
+                        profileJson, measured.inputTokens(), measured.outputTokens(),
+                        measured.totalTokens(), instant(occurredAt))),
+                "known Provider usage must settle its UNKNOWN request");
+    }
+
+    /** 严格读取当前游标并比较完整值；损坏 JSON 不得借 cursor-only 提交被静默覆盖。 */
+    private boolean advancesExecution(PersistenceMappers mapper, String turnId,
+                                      TurnExecutionState replacement) {
+        PersistenceRecords.TurnExecutionRow current = mapper.agent().selectTurnExecution(turnId);
+        if (current == null || current.schemaVersion() != TurnExecutionState.SCHEMA_VERSION) {
+            throw new StorageException(StorageException.Code.INVALID_STATE,
+                    "Turn execution state is unavailable");
+        }
+        return !executions.read(current.stateJson()).equals(replacement);
+    }
+
+    /** 显式状态整体替换；缺失游标必须 fail closed，不能根据历史猜测执行位置。 */
+    private void replaceExecution(PersistenceMappers mapper, String turnId, TurnExecutionState replacement) {
+        requireChanged(mapper.agent().replaceTurnExecution(executionWrite(turnId, replacement)),
+                "Turn execution state replace lost");
+    }
+
+    /** Codec 和 schema version 同源，禁止 Mapper 调用方自行拼接 JSON。 */
+    private PersistenceRecords.TurnExecutionWrite executionWrite(String turnId, TurnExecutionState state) {
+        return new PersistenceRecords.TurnExecutionWrite(turnId, TurnExecutionState.SCHEMA_VERSION,
+                executions.write(state));
     }
 
     /**
@@ -549,7 +1321,7 @@ public final class MybatisConversationRepository implements ConversationReposito
     }
 
     /**
-     * 六态转换显式 fail closed，不允许从终态产生第二终态。
+     * 状态转换显式 fail closed；同态提交必须携带事实或推进 execution cursor，禁止空 no-op 刷 revision。
      */
     private static void requireTransition(TurnState current, TurnState target,
                                           boolean terminalCommit, boolean carriesFacts) {
@@ -598,7 +1370,6 @@ public final class MybatisConversationRepository implements ConversationReposito
     private static TurnSnapshot turnSnapshot(PersistenceRecords.TurnRow row, long threadRevision) {
         return new TurnSnapshot(requiredText(row.threadId(), "thread_id"),
                 requiredText(row.turnId(), "turn_id"), TurnState.valueOf(requiredText(row.state(), "state")),
-                PersistenceRowProjections.turnRuntime(row),
                 Instant.parse(requiredText(row.requestedAt(), "requested_at")),
                 Instant.parse(requiredText(row.updatedAt(), "updated_at")),
                 row.completedAt() == null ? null : Instant.parse(row.completedAt()), threadRevision,
@@ -661,6 +1432,100 @@ public final class MybatisConversationRepository implements ConversationReposito
     private static String requiredValue(String value, String column) {
         if (value == null) throw corrupted(column);
         return value;
+    }
+
+    /** 所有 CRUD 在同一写事务验证接收门，STOP 关闭后不能再穿透到 INSERT/UPDATE。 */
+    private static PersistenceRecords.TurnRow acceptingInputTurn(PersistenceMappers mapper,
+                                                                  String threadId, String turnId) {
+        PersistenceRecords.TurnRow turn = mapper.agent().selectTurn(new PersistenceRecords.TurnKey(threadId, turnId));
+        if (turn == null || TurnState.valueOf(requiredText(turn.state(), "state")).terminal()
+            || turn.cancelRequestedAt() != null || !turn.acceptingInputs()) {
+            throw InputQueueException.of(InputQueueFailure.NOT_ACCEPTING);
+        }
+        return turn;
+    }
+
+    /** 单项 mutation 先区分不存在与 stale revision，RPC 才能给出可恢复的精确错误。 */
+    private static PersistenceRecords.PendingInputRow pendingInput(PersistenceMappers mapper,
+                                                                    String turnId, String inputId) {
+        PersistenceRecords.PendingInputRow row = mapper.agent().selectPendingInputById(
+                new PersistenceRecords.PendingInputKey(turnId, inputId));
+        if (row == null) throw InputQueueException.of(InputQueueFailure.NOT_FOUND);
+        return row;
+    }
+
+    /** 条目 CAS 不允许调用方用队列 revision 替代 item revision。 */
+    private static void requireInputRevision(PersistenceRecords.PendingInputRow row, long expected) {
+        if (expected < 0 || row.inputRevision() != expected) {
+            throw InputQueueException.of(InputQueueFailure.CONFLICT);
+        }
+    }
+
+    /** 事务内重新读取真实队首并匹配 peek 门，任何编辑、提升或前序变化都作为并发冲突处理。 */
+    private static void requireSelection(PersistenceRecords.PendingInputRow row, InputSelection selection) {
+        if (!selection.inputId().equals(row.inputId()) || selection.inputRevision() != row.inputRevision()
+                || !selection.kind().name().equals(row.kind())) {
+            throw InputQueueException.of(InputQueueFailure.CONFLICT);
+        }
+    }
+
+    /** 有效 mutation 恰好推进一次 queue revision，再从同一事务构造全量投影。 */
+    private QueueMutation advanceQueue(PersistenceMappers mapper, PersistenceRecords.TurnRow turn,
+                                              String inputId, Instant occurredAt, boolean changed) {
+        requireChanged(mapper.agent().advanceInputQueue(new PersistenceRecords.InputQueueAdvance(
+                        turn.turnId(), turn.inputQueueRevision(), instant(occurredAt))),
+                "input queue revision changed concurrently");
+        PersistenceRecords.TurnRow advanced = mapper.agent().selectTurn(
+                new PersistenceRecords.TurnKey(turn.threadId(), turn.turnId()));
+        return mutation(mapper, advanced, inputId, changed);
+    }
+
+    /** ACK 与事件共享同一全量队列和 Thread revision，不从进程内状态猜测。 */
+    private QueueMutation mutation(PersistenceMappers mapper, PersistenceRecords.TurnRow turn,
+                                          String inputId, boolean changed) {
+        PersistenceRecords.ThreadRow thread = mapper.history().selectThread(turn.threadId());
+        if (thread == null) throw corrupted("thread_id");
+        return new QueueMutation(inputId, inputQueue(mapper, turn.turnId(), turn.inputQueueRevision(),
+                turn.acceptingInputs()), thread.revision(), changed);
+    }
+
+    /** SQL 已按 Steering 点击序和普通 FIFO 排序；Java 只做严格领域投影。 */
+    private InputQueue inputQueue(PersistenceMappers mapper, String turnId,
+                                         long revision, boolean accepting) {
+        List<InputQueue.QueuedInput> items = mapper.agent().selectPendingInputs(turnId).stream()
+                .map(this::queuedInput).toList();
+        return new InputQueue(turnId, revision, accepting, items);
+    }
+
+    /** 把数据库行映射为公开队列条目，不暴露内部 input/priority sequence。 */
+    private InputQueue.QueuedInput queuedInput(PersistenceRecords.PendingInputRow row) {
+        InputQueue.Kind kind;
+        try {
+            kind = InputQueue.Kind.valueOf(requiredText(row.kind(), "kind"));
+        } catch (IllegalArgumentException corruptedKind) {
+            throw corrupted("kind");
+        }
+        InputQueue.Status status;
+        try {
+            status = InputQueue.Status.valueOf(requiredText(row.validationStatus(), "validation_status"));
+        } catch (IllegalArgumentException corruptedStatus) {
+            throw corrupted("validation_status");
+        }
+        InputQueue.Issue issue = status == InputQueue.Status.PENDING ? null : new InputQueue.Issue(
+                requiredText(row.issueErrorCode(), "issue_error_code"),
+                requiredText(row.issueMessage(), "issue_message"),
+                Objects.requireNonNull(row.issueRetryable(), "issue_retryable"));
+        return new InputQueue.QueuedInput(requiredText(row.inputId(), "input_id"),
+                requiredText(row.turnId(), "turn_id"), codec.readUserContent(
+                        requiredValue(row.contentJson(), "content_json")), kind,
+                codec.readAttachmentSummaries(requiredText(row.attachmentsJson(), "attachments_json")),
+                status, issue,
+                row.inputRevision(), Instant.parse(requiredText(row.createdAt(), "created_at")));
+    }
+
+    /** 总量预算按实际 UTF-8 wire/storage 字节计算，不使用 UTF-16 char 数近似。 */
+    private static long utf8Bytes(String value) {
+        return value.getBytes(StandardCharsets.UTF_8).length;
     }
 
     /** 将缺失必需列统一归类为损坏数据，避免下游用默认值掩盖存储漂移。 */

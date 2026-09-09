@@ -17,6 +17,8 @@ export type ReviewViewMode = "split" | "unified";
 /** 使用确定性的来源身份，让 application 能拒绝异步返回的旧快照。 */
 export function sourceKey(source: ReviewSource): string {
   switch (source.kind) {
+    case "uncommitted":
+      return "uncommitted";
     case "unstaged":
       return "unstaged";
     case "staged":
@@ -31,6 +33,8 @@ export function sourceKey(source: ReviewSource): string {
 /** 保持来源标签紧凑，使窄窗口中的选择器仍可完整操作。 */
 export function sourceLabel(source: ReviewSource, branchLabel?: string): string {
   switch (source.kind) {
+    case "uncommitted":
+      return "未提交";
     case "unstaged":
       return "未暂存";
     case "staged":
@@ -57,7 +61,7 @@ export function canReviewAction(
 
 /** Branch 与 commit 必须保持只读，即使响应错误携带可变 capability 也不能放行。 */
 export function sourceAllowsMutation(source: ReviewSource): boolean {
-  return source.kind === "unstaged" || source.kind === "staged";
+  return source.kind === "uncommitted" || source.kind === "unstaged" || source.kind === "staged";
 }
 
 /** 仅按权威文件元数据筛选，不从文件名或 patch 文本猜测状态。 */
@@ -100,13 +104,18 @@ export function diffMatchesSnapshot(
   diff: ReviewFileDiff | undefined,
   snapshot: ReviewSnapshot | undefined,
 ): boolean {
+  const file = snapshot?.files.find((candidate) => candidate.fileId === diff?.fileId);
   return (
     diff !== undefined &&
     snapshot !== undefined &&
+    file !== undefined &&
     diff.workspaceId === snapshot.workspaceId &&
     sourceKey(diff.source) === sourceKey(snapshot.source) &&
     diff.revision === snapshot.revision &&
-    snapshot.files.some((file) => file.fileId === diff.fileId)
+    diff.path === file.path &&
+    diff.oldPath === file.oldPath &&
+    diff.layer === file.layer &&
+    diff.status === file.status
   );
 }
 
@@ -178,5 +187,18 @@ export function canRenderTextDiff(diff: ReviewFileDiff | undefined): boolean {
     !diff.truncated &&
     diff.original !== null &&
     diff.modified !== null
+  );
+}
+
+/**
+ * native adapter 只承诺返回有界 unified/line 投影，不承诺物化完整前后文件；只要响应仍是
+ * 非二进制、未截断且含任一结构化 Diff 表示，就允许视图安全降级为统一模式。
+ */
+export function canRenderUnifiedDiff(diff: ReviewFileDiff | undefined): boolean {
+  return (
+    diff !== undefined &&
+    !diff.binary &&
+    !diff.truncated &&
+    (diff.unified !== null || diff.lines.length > 0)
   );
 }

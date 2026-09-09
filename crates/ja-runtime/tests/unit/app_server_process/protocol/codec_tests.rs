@@ -23,7 +23,7 @@ fn success_frame(id: &str) -> RpcFrame {
         &jsonl(json!({"jsonrpc":"2.0", "id":id, "result":{}})),
         Limits::default().max_frame_bytes,
     )
-    .expect("response fixture must satisfy the v2 codec")
+    .expect("response fixture must satisfy the v1 codec")
 }
 
 /// 有界协议配置必须拒绝任何无界队列或日志行，避免攻击者把协商值变成内存分配指令。
@@ -77,7 +77,7 @@ fn exact_challenge_guard_does_not_reject_business_ids() {
     );
 }
 
-/// v2 response 不接受 unknown root/error 字段或非 object result，
+/// v1 response 不接受 unknown root/error 字段或非 object result，
 /// 防止 codec 丢字段后把新旧协议混合 frame 误判为合法。
 #[test]
 fn response_envelope_is_closed_and_object_typed() {
@@ -103,10 +103,10 @@ fn response_envelope_is_closed_and_object_typed() {
     }
 }
 
-/// 生产 decode 拒绝已删除的 request/event method，同时接受 v2 event 名与唯一的
+/// 生产 decode 拒绝已删除的 request/event method，同时接受 v1 event 名与唯一的
 /// initialized notification 合同。
 #[test]
-fn decoded_method_roles_use_the_frozen_v2_closures() {
+fn decoded_method_roles_use_the_frozen_v1_closures() {
     for invalid in [
         serde_json::json!({
             "jsonrpc":"2.0", "id":"c:removed", "method":"removed/method", "params":{}
@@ -141,6 +141,9 @@ fn decoded_method_roles_use_the_frozen_v2_closures() {
             "jsonrpc":"2.0", "method":"assistant/model-step-committed", "params":{}
         }),
         serde_json::json!({
+            "jsonrpc":"2.0", "method":"tool/started", "params":{}
+        }),
+        serde_json::json!({
             "jsonrpc":"2.0", "method":"tool/batch-committed", "params":{}
         }),
         serde_json::json!({
@@ -148,7 +151,7 @@ fn decoded_method_roles_use_the_frozen_v2_closures() {
             "params":{"readyToken":"0123456789abcdef0123456789abcdef"}
         }),
     ] {
-        decode_frame(&jsonl(valid), 4_096).expect("method belongs to the v2 role closure");
+        decode_frame(&jsonl(valid), 4_096).expect("method belongs to the v1 role closure");
     }
 }
 
@@ -212,7 +215,7 @@ fn codec_rejects_null_result_and_validates_hand_built_error() {
 }
 
 /// 构造 frozen error fixture，证明 code/errorCode/category/retryable 决定分类且 message
-/// 只服从 v2 的 1..512 字符边界；内容脱敏由 Java error mapper 负责。
+/// 只服从 v1 的 1..512 字符边界；内容脱敏由 Java error mapper 负责。
 #[test]
 fn codec_accepts_localized_catalog_errors_and_rejects_unsafe_messages() {
     /// fixture 只参数化允许变化的展示文本和 retryable，避免测试无意放宽冻结 error catalog。

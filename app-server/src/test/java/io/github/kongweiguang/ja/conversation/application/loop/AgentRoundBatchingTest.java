@@ -375,6 +375,52 @@ final class AgentRoundBatchingTest {
     assertEquals(2, round.textBlockMaterializations());
   }
 
+  /**
+   * 跨 delta 的 ASCII 与全角 DSML 保持普通正文语义，避免内容形状改变流式、上下文或终态结果。
+   */
+  @Test
+  void preservesSplitDsmlTextAsOrdinaryAssistantContent() {
+    assertTextPreserved(List.of("<", "||DS", "ML||tool_", "calls> as documentation"));
+    assertTextPreserved(List.of("<｜", "｜dsml｜", "｜inv", "oke name=\"shell\"> as an example"));
+  }
+
+  /** 普通尖括号正文只短暂等待到排除保留前缀，关闭时仍完整且有序发布。 */
+  @Test
+  void releasesOrdinaryAngleBracketTextAfterPrefixDisambiguation() {
+    ManualTimer timer = new ManualTimer();
+    List<TurnEvent> events = new ArrayList<>();
+    AgentRound round = round(timer, CancellationToken.none(), event -> accepted(events, event));
+
+    round.onEvent(new ModelPort.TextDelta("<"));
+    round.onEvent(new ModelPort.TextDelta("span>ordinary"));
+    round.close();
+
+    assertEquals(1, events.size());
+    assertEquals("<span>ordinary",
+        assertInstanceOf(TurnEvent.TextDelta.class, events.getFirst()).text());
+    assertEquals("<span>ordinary", round.terminalText());
+    assertEquals("<span>ordinary",
+        assertInstanceOf(TextContent.class, round.assistantContent().getFirst()).text());
+  }
+
+  /** 为每种分帧方式创建隔离轮次，确认草稿、最终文本与模型上下文保持同一原文。 */
+  private static void assertTextPreserved(List<String> fragments) {
+    ManualTimer timer = new ManualTimer();
+    List<TurnEvent> events = new ArrayList<>();
+    AgentRound round = round(timer, CancellationToken.none(), event -> accepted(events, event));
+    for (String fragment : fragments) {
+      round.onEvent(new ModelPort.TextDelta(fragment)).toCompletableFuture().join();
+    }
+    round.close();
+    String expected = String.join("", fragments);
+    assertEquals(expected, events.stream()
+        .map(TurnEvent.TextDelta.class::cast).map(TurnEvent.TextDelta::text)
+        .collect(java.util.stream.Collectors.joining()));
+    assertEquals(expected, round.terminalText());
+    assertEquals(expected,
+        assertInstanceOf(TextContent.class, round.assistantContent().getFirst()).text());
+  }
+
   /** 使用默认成功 sink 构造一轮 Agent 流，供纯批处理行为测试复用。 */
   private static AgentRound round(
       StreamingDeltaBatcher.Timer timer,

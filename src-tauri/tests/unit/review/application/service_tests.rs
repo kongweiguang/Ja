@@ -4,8 +4,8 @@
 use super::{CancellationToken, ReviewError, ReviewNativePort, ReviewService};
 use crate::review::domain::{
     ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewCommitId, ReviewFile, ReviewFileId,
-    ReviewFileStatus, ReviewOperationId, ReviewRevision, ReviewSnapshot, ReviewSource, ReviewStats,
-    ReviewTarget,
+    ReviewFileLayer, ReviewFileStatus, ReviewOperationId, ReviewRevision, ReviewSnapshot,
+    ReviewSource, ReviewStats, ReviewTarget,
 };
 use std::sync::{Arc, Barrier, Mutex};
 use uuid::Uuid;
@@ -75,19 +75,37 @@ impl ReviewNativePort for FakeReviewPort {
         Ok(self.snapshot.lock().expect("snapshot").clone())
     }
 
-    /// 记录 metadata-only 补读，并返回已经展开的文件。
-    fn materialize_file(
+    /// fake 不跨 service 调用保存 cache，强制用例覆盖 fresh snapshot fallback。
+    fn cached_file(
         &self,
         _source: &ReviewSource,
+        _revision: &ReviewRevision,
+        _file_id: &ReviewFileId,
+    ) -> Option<ReviewFile> {
+        None
+    }
+
+    /// 记录 lazy 补读，并在同一 fake 调用中模拟 native revision probe。
+    fn load_file_at_revision(
+        &self,
+        _source: &ReviewSource,
+        expected: &ReviewRevision,
         file: &ReviewFile,
+        validate_revision: bool,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewFile, ReviewError> {
-        *self.materialize_calls.lock().expect("materialize counter") += 1;
-        if self.drift_on_materialize {
-            self.snapshot.lock().expect("snapshot").revision = revision("revision_drifted");
-        }
         let mut expanded = file.clone();
-        expanded.metadata_only = false;
+        if file.requires_diff_load() {
+            *self.materialize_calls.lock().expect("materialize counter") += 1;
+            if self.drift_on_materialize {
+                self.snapshot.lock().expect("snapshot").revision = revision("revision_drifted");
+            }
+            expanded.metadata_only = false;
+            expanded.diff_loaded = true;
+        }
+        if validate_revision && self.snapshot.lock().expect("snapshot").revision != *expected {
+            return Err(ReviewError::ReviewStale);
+        }
         Ok(expanded)
     }
 
@@ -126,6 +144,7 @@ fn snapshot_fixture(revision: &str, metadata_only: bool) -> ReviewSnapshot {
         source: ReviewSource::Unstaged,
         files: vec![ReviewFile {
             file_id: file_id("file_fixture"),
+            layer: ReviewFileLayer::Unstaged,
             path: "file.txt".to_owned(),
             old_path: None,
             status: ReviewFileStatus::Modified,
@@ -134,8 +153,11 @@ fn snapshot_fixture(revision: &str, metadata_only: bool) -> ReviewSnapshot {
             binary: false,
             metadata_only,
             hunks: Vec::new(),
+            diff_loaded: !metadata_only,
             patch: Vec::new(),
             revision_evidence: b"fixture".to_vec(),
+            state_evidence: b"fixture".to_vec(),
+            worktree_evidence: None,
         }],
         stats: ReviewStats {
             files: 1,

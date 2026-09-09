@@ -41,7 +41,6 @@ pub(crate) struct HomePaths {
     java_logs_dir: PathBuf,
     skills_dir: PathBuf,
     run_dir: PathBuf,
-    backups_dir: PathBuf,
     cache_dir: PathBuf,
     exports_dir: PathBuf,
 }
@@ -55,7 +54,6 @@ impl HomePaths {
             java_logs_dir: root.join("logs").join("java"),
             skills_dir: root.join("skills"),
             run_dir: root.join("run"),
-            backups_dir: root.join("backups"),
             cache_dir: root.join("cache"),
             exports_dir: root.join("exports"),
             root,
@@ -103,8 +101,8 @@ impl HomeLayout {
         Self::from_root(PathBuf::from(profile).join(".ja"))
     }
 
-    /// 从显式绝对根目录初始化，供测试及后续 Tauri path 集成使用；拒绝相对路径和 traversal，
-    /// 防止路径静默绑定到进程工作目录。
+    /// 从显式绝对根目录初始化当前实际使用的目录；拒绝相对路径和 traversal，同时不创建
+    /// 没有 owner 的遗留备份空壳，避免用户主目录持续出现无效结构。
     pub(crate) fn from_root(root: PathBuf) -> Result<Self, HomeError> {
         ensure_directory_tree(&root)?;
         let paths = HomePaths::new(root);
@@ -114,7 +112,6 @@ impl HomeLayout {
             &paths.java_logs_dir,
             &paths.skills_dir,
             &paths.run_dir,
-            &paths.backups_dir,
             &paths.cache_dir,
             &paths.exports_dir,
         ] {

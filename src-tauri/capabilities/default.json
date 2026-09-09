@@ -22,6 +22,10 @@
     "notification:allow-request-permission",
     "notification:allow-notify",
     "clipboard-manager:allow-write-text",
-    "log:allow-log"
+    "allow-ja-desktop-commands",
+    "allow-ja-thread-seen",
+    "log:allow-log",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

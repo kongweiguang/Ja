@@ -124,7 +124,8 @@ pub(super) fn required_index(index: Option<&Path>) -> Result<&Path, ReviewError>
 pub(super) fn action_mutates_index(source: &ReviewSource, action: ReviewAction) -> bool {
     matches!(
         (source, action),
-        (ReviewSource::Unstaged, ReviewAction::Stage)
+        (ReviewSource::Uncommitted, _)
+            | (ReviewSource::Unstaged, ReviewAction::Stage)
             | (
                 ReviewSource::Staged,
                 ReviewAction::Unstage | ReviewAction::Revert
@@ -135,7 +136,10 @@ pub(super) fn action_mutates_index(source: &ReviewSource, action: ReviewAction) 
 /// 识别需要 exact preimage 才能在失败时 rollback 的 destructive worktree operation。
 pub(super) fn action_mutates_worktree(source: &ReviewSource, action: ReviewAction) -> bool {
     action == ReviewAction::Revert
-        && matches!(source, ReviewSource::Unstaged | ReviewSource::Staged)
+        && matches!(
+            source,
+            ReviewSource::Uncommitted | ReviewSource::Unstaged | ReviewSource::Staged
+        )
 }
 
 /// 将 file selection 展开到 rename 两侧并去重 fixed argv，不暴露 raw pathspec 构造。

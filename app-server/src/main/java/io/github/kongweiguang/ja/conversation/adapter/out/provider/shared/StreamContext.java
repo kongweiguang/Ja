@@ -66,13 +66,12 @@ public final class StreamContext {
     }
 
     /**
-     * 按冻结名称查找 Tool，并拒绝接纳目录外的调用。
+     * 只为已知 Tool 恢复 OpenAI strict 参数；目录外名称返回空值并由 Runner 回传失败结果。
      */
     public io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec tool(String name) {
         return request.tools().stream()
                 .filter(tool -> tool.name().equals(name))
                 .findFirst()
-                .orElseThrow(() -> new ProviderProtocolException(
-                        "UNKNOWN_TOOL", "provider requested an unknown tool", false));
+                .orElse(null);
     }
 }

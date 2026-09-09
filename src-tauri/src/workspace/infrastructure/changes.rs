@@ -2,6 +2,7 @@
 // @author kongweiguang
 
 use super::registry::{WorkspaceHandle, entry_kind, is_reparse_point};
+use super::search::is_default_ignored_directory;
 use super::tree::join_relative;
 use crate::workspace::WorkspaceError;
 use crate::workspace::domain::{EntryKind, FileRevision};
@@ -91,10 +92,10 @@ pub struct PollingChangeDetector {
 }
 
 impl PollingChangeDetector {
-    /// 尝试建立有界初始基线；超出条目、字节或时间预算时保留一个可恢复的
-    /// 降级 detector，而不是让 native notify 因大型工作区而无法启动。
-    pub fn new(workspace: WorkspaceHandle, policy: PollingPolicy) -> Result<Self, WorkspaceError> {
-        let policy = PollingPolicy {
+    /// 统一收窄扫描预算；即时启动与显式基线构建必须使用同一策略，避免两条路径
+    /// 对大型 Workspace 给出不同的上限和恢复语义。
+    fn normalized_policy(policy: PollingPolicy) -> PollingPolicy {
+        PollingPolicy {
             min_interval_millis: policy.min_interval_millis.clamp(1, 60_000),
             max_depth: policy.max_depth.min(256),
             max_entries: policy.max_entries.clamp(1, 1_000_000),
@@ -102,22 +103,34 @@ impl PollingChangeDetector {
             hash_limit_bytes: policy.hash_limit_bytes.min(16 * 1024 * 1024),
             max_total_bytes: policy.max_total_bytes.min(2 * 1024 * 1024 * 1024),
             max_scan_millis: policy.max_scan_millis.clamp(1, 60_000),
-        };
+        }
+    }
+
+    /// 原生 notify 启动路径只登记一个尚无基线的 detector，使 Workspace 切换不等待
+    /// 全量 metadata/hash。首次 focus 或 overflow 对账再在 blocking worker 中建立基线。
+    pub(crate) fn new_uninitialized(workspace: WorkspaceHandle, policy: PollingPolicy) -> Self {
+        Self {
+            workspace,
+            policy: Self::normalized_policy(policy),
+            snapshot: None,
+            last_poll: None,
+            generation: 0,
+        }
+    }
+
+    /// 尝试建立有界初始基线；超出条目、字节或时间预算时保留一个可恢复的
+    /// 降级 detector，而不是让 native notify 因大型工作区而无法启动。
+    pub fn new(workspace: WorkspaceHandle, policy: PollingPolicy) -> Result<Self, WorkspaceError> {
+        let mut detector = Self::new_uninitialized(workspace, policy);
         let deadline = Instant::now()
-            .checked_add(Duration::from_millis(policy.max_scan_millis))
+            .checked_add(Duration::from_millis(detector.policy.max_scan_millis))
             .unwrap_or_else(Instant::now);
-        let snapshot = match scan_workspace(&workspace, &policy, deadline) {
+        detector.snapshot = match scan_workspace(&detector.workspace, &detector.policy, deadline) {
             Ok(scan) if !scan.overflow => Some(scan.snapshot),
             Ok(_) | Err(WorkspaceError::ScanDeadlineExceeded) => None,
             Err(error) => return Err(error),
         };
-        Ok(Self {
-            workspace,
-            policy,
-            snapshot,
-            last_poll: None,
-            generation: 0,
-        })
+        Ok(detector)
     }
 
     /// 告知 watcher 初始基线是否不完整；调用方据此立即发出根级 rescan
@@ -285,6 +298,9 @@ fn scan_workspace(
                 });
             }
             let kind = entry_kind(&metadata);
+            if kind == EntryKind::Directory && is_default_ignored_directory(&name) {
+                continue;
+            }
             let relative = join_relative(&parent, &name);
             let revision = super::registry::metadata_for_path_with_deadline(
                 &path,

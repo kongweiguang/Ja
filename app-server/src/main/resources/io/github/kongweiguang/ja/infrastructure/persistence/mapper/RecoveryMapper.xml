@@ -2,38 +2,89 @@
 <!-- @author kongweiguang -->
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.RecoveryMapper">
+  <resultMap id="recoveryToolRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolRow">
+    <constructor>
+      <arg column="call_id" javaType="string"/><arg column="state" javaType="string"/>
+      <arg column="revision" javaType="_long"/><arg column="ordinal" javaType="_int"/>
+      <arg column="tool_name" javaType="string"/><arg column="side_effect" javaType="string"/>
+    </constructor>
+  </resultMap>
   <select id="selectRecoveryThreadIds" resultType="string">
     SELECT DISTINCT thread_id FROM turns WHERE state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
-    UNION SELECT DISTINCT thread_id FROM tools WHERE side_effect='EXTERNAL' AND state IN ('PREPARED','RUNNING')
     ORDER BY thread_id
   </select>
-  <update id="recoverActiveTurns">
-    UPDATE turns SET state='CANCELLED',mutation_version=mutation_version+1,updated_at=#{occurredAt},completed_at=#{occurredAt},
-      terminal_summary=CASE WHEN cancel_requested_at IS NOT NULL
-        THEN 'Cancelled before sidecar restart'
-        ELSE 'Recovered after sidecar restart' END,
-      error_code=CASE WHEN cancel_requested_at IS NOT NULL THEN 'CANCELLED' ELSE 'RUNTIME_RESTARTED' END,
-      error_message=CASE WHEN cancel_requested_at IS NOT NULL
-        THEN 'The Turn cancellation request was committed before the sidecar stopped.'
-        ELSE 'The previous sidecar stopped before the Turn reached a terminal state.' END
-    WHERE thread_id=#{threadId} AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+  <select id="selectRecoveryTurns" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$RecoveryTurnRow">
+    SELECT x.turn_id AS turnId,x.thread_id AS threadId,x.state,x.mutation_version AS mutationVersion,
+      x.cancel_requested_at AS cancelRequestedAt,e.schema_version AS schemaVersion,e.state_json AS stateJson
+    FROM turns x LEFT JOIN turn_execution e ON e.turn_id=x.turn_id
+    WHERE x.thread_id=#{threadId} AND x.state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+    ORDER BY x.turn_sequence
+  </select>
+  <update id="suspendTurn">
+    UPDATE turns SET state='SUSPENDED',mutation_version=mutation_version+1,updated_at=#{occurredAt}
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND mutation_version=#{expectedTurnMutationVersion}
+      AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL') AND cancel_requested_at IS NULL
   </update>
-  <update id="recoverRunningTools">
-    UPDATE tools SET state='UNKNOWN',
+  <update id="cancelTurn">
+    UPDATE turns SET state='CANCELLED',mutation_version=mutation_version+1,updated_at=#{occurredAt},completed_at=#{occurredAt},
+      accepting_inputs=0,input_queue_revision=input_queue_revision+1,
+      terminal_summary='Cancelled before sidecar restart',error_code='CANCELLED',
+      error_message='The Turn cancellation request was committed before the sidecar stopped.'
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND mutation_version=#{expectedTurnMutationVersion}
+      AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL') AND cancel_requested_at IS NOT NULL
+  </update>
+  <update id="failCorruptTurn">
+    UPDATE turns SET state='FAILED',mutation_version=mutation_version+1,updated_at=#{occurredAt},completed_at=#{occurredAt},
+      accepting_inputs=0,input_queue_revision=input_queue_revision+1,
+      terminal_summary='Execution recovery failed',error_code='TURN_EXECUTION_STATE_CORRUPT',
+      error_message='The persisted Turn execution state is missing or invalid.'
+    WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND mutation_version=#{expectedTurnMutationVersion}
+      AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL') AND cancel_requested_at IS NULL
+  </update>
+  <update id="replaceExecution">
+    UPDATE turn_execution SET schema_version=#{schemaVersion},state_json=#{stateJson} WHERE turn_id=#{turnId}
+  </update>
+  <delete id="deleteExecution">DELETE FROM turn_execution WHERE turn_id=#{turnId}</delete>
+  <select id="selectRecoveryTool" resultMap="recoveryToolRow">
+    SELECT call_id,state,revision,ordinal,tool_name,side_effect FROM tools
+    WHERE turn_id=#{turnId} AND ordinal=#{ordinal}
+  </select>
+  <update id="failUnsettledTool">
+    UPDATE tools SET state='FAILED',
       presentation_json=json_set(presentation_json,'$.status','error','$.outputPreview',
-        'Ja restarted around an external side effect; its outcome cannot be confirmed.'),
+        'Tool binding is unavailable.'),
       revision=revision+1,updated_at=#{occurredAt}
-    WHERE thread_id=#{threadId} AND side_effect='EXTERNAL' AND state IN ('PREPARED','RUNNING')
+    WHERE turn_id=#{turnId} AND call_id=#{callId} AND state IN ('PREPARED','RUNNING')
+  </update>
+  <insert id="insertUnavailableToolMessage">
+    INSERT INTO messages(message_id,thread_id,turn_id,ordinal,role,blocks_json,created_at)
+    VALUES(#{messageId},#{threadId},#{turnId},
+      (SELECT COALESCE(MAX(ordinal)+1,1) FROM messages WHERE thread_id=#{threadId}),'TOOL',
+      json_array(json_object('kind','tool_result','callId',#{callId},'content',#{content},'error',json('true'))),
+      #{occurredAt})
+  </insert>
+  <update id="denyExpiredApprovals">
+    UPDATE approvals SET decision='DENY',resolved_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND decision IS NULL AND expires_at&lt;#{occurredAt}
+  </update>
+  <update id="closePendingApprovals">
+    UPDATE approvals SET decision='DENY',resolved_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND decision IS NULL
+  </update>
+  <update id="cancelPendingInputs">
+    UPDATE pending_inputs SET state='CANCELLED',input_revision=input_revision+1,
+      updated_at=#{occurredAt},resolved_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND state='PENDING'
   </update>
   <insert id="insertRecoveredChangeSets">
     INSERT INTO turn_change_sets(thread_id,turn_id,workspace_id,change_set_json,artifact_id,committed_at)
     SELECT x.thread_id,x.turn_id,t.workspace_id,
-      json_object('state','unavailable','reason','capture_failed','files',json_array(),
+      json_object('state','partial','incompleteReasons',json_array('recovery_boundary'),'files',json_array(),
         'stats',json_object('files',0,'additions',0,'deletions',0,'binaryFiles',0,'truncated',json('false'))),
       NULL,#{occurredAt}
     FROM turns x JOIN threads t ON t.thread_id=x.thread_id
     WHERE x.thread_id=#{threadId} AND x.completed_at=#{occurredAt}
-      AND x.state='CANCELLED' AND x.error_code IN ('CANCELLED','RUNTIME_RESTARTED')
+      AND x.state IN ('CANCELLED','FAILED') AND x.error_code IN ('CANCELLED','TURN_EXECUTION_STATE_CORRUPT')
       AND NOT EXISTS(SELECT 1 FROM turn_change_sets c WHERE c.turn_id=x.turn_id)
   </insert>
   <update id="advanceRecoveredThread">

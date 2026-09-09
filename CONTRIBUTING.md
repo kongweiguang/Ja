@@ -39,7 +39,7 @@ mvn.cmd -version
 - `src-tauri/`：Tauri 壳与 Windows/macOS 原生能力；Rust 测试放在其 `tests/` 边界。
 - `crates/ja-runtime/`：不依赖 Tauri 的 Ja App Server host runtime。
 - `app-server/`：唯一 Java App Server 和 Agent Kernel，构建入口是 `app-server/pom.xml`。
-- `contracts/ja-rpc/v2/` 与 `contracts/golden/v2/`：JA-RPC v2 schema 与三端语料。
+- `contracts/ja-rpc/v1/` 与 `contracts/golden/v1/`：JA-RPC v1 schema 与三端语料。
 
 React 不直接读取 Ja 配置或凭据；Tauri/Rust 只代理 JA-RPC 并绑定原生能力；配置、Workspace
 identity、SQLite 和 Agent Runtime 由 Ja App Server 持有。不要恢复旧协议、旧字段、旧目录或
@@ -56,6 +56,7 @@ pnpm test
 pnpm build
 pnpm check:architecture
 pnpm check:unused
+pnpm version:check
 ```
 
 Rust 变更：

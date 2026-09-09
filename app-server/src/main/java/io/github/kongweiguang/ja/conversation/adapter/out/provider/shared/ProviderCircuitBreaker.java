@@ -28,7 +28,7 @@ public final class ProviderCircuitBreaker {
     /** 在 Provider IO 前取得许可；开路到期后只允许一个半开探测，其他调用快速失败。 */
     public Permit acquire(ModelPort.ModelConfiguration configuration, Operation operation) {
         Objects.requireNonNull(configuration, "configuration");
-        Key key = new Key(configuration.provider(), configuration.baseUri(), configuration.model(), operation);
+        Key key = new Key(configuration.api(), configuration.baseUri(), configuration.model(), operation);
         State state = states.computeIfAbsent(key, ignored -> new State());
         synchronized (state) {
             Instant now = clock.instant();
@@ -43,10 +43,8 @@ public final class ProviderCircuitBreaker {
         }
     }
 
-    /** count、普通发送与摘要各自熔断，避免一个故障面阻断其它操作。 */
+    /** 普通发送与摘要各自熔断；纯本地预算估算不属于 Provider 操作。 */
     public enum Operation {
-        /** Provider 官方输入 Token 计量。 */
-        COUNT,
         /** Agent 普通模型发送。 */
         SEND,
         /** Context Summary 结构化生成。 */
@@ -54,12 +52,12 @@ public final class ProviderCircuitBreaker {
     }
 
     /** 开路只暴露稳定本地分类，不携带端点、模型或上游异常文本。 */
-    public static final class CircuitOpenException extends RuntimeException {
+    public static final class CircuitOpenException extends ModelPort.ModelUnavailableException {
         private static final long serialVersionUID = 1L;
 
         /** 构造无堆栈稳定失败，避免高频开路请求扩大日志与内存压力。 */
         private CircuitOpenException() {
-            super("provider circuit is open", null, false, false);
+            super("provider circuit is open", null);
         }
     }
 
@@ -109,11 +107,11 @@ public final class ProviderCircuitBreaker {
         }
     }
 
-    /** Key 不含凭据与 Prompt，只使用治理所需的非敏感 Provider 身份。 */
-    private record Key(ModelPort.Provider provider, URI baseUri, String model, Operation operation) {
+    /** Key 不含凭据与 Prompt，只使用治理所需的非敏感 API、端点与模型身份。 */
+    private record Key(ModelPort.Api api, URI baseUri, String model, Operation operation) {
         /** 冻结完整键值，禁止 null 造成多个故障面意外合并。 */
         private Key {
-            Objects.requireNonNull(provider, "provider");
+            Objects.requireNonNull(api, "api");
             Objects.requireNonNull(baseUri, "baseUri");
             Objects.requireNonNull(model, "model");
             Objects.requireNonNull(operation, "operation");

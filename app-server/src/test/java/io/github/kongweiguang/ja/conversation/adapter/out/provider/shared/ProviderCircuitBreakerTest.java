@@ -24,20 +24,20 @@ final class ProviderCircuitBreakerTest {
         ProviderCircuitBreaker breaker = new ProviderCircuitBreaker(clock);
         ModelPort.ModelConfiguration configuration = configuration();
         for (int failure = 0; failure < 3; failure++) {
-            breaker.acquire(configuration, ProviderCircuitBreaker.Operation.COUNT).failure();
+            breaker.acquire(configuration, ProviderCircuitBreaker.Operation.SEND).failure();
         }
         assertThrows(ProviderCircuitBreaker.CircuitOpenException.class,
-                () -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.COUNT));
-        assertDoesNotThrow(() -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.SEND)
+                () -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.SEND));
+        assertDoesNotThrow(() -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.SUMMARY)
                 .cancelled());
 
         clock.advance(Duration.ofMinutes(5));
         ProviderCircuitBreaker.Permit probe = breaker.acquire(
-                configuration, ProviderCircuitBreaker.Operation.COUNT);
+                configuration, ProviderCircuitBreaker.Operation.SEND);
         assertThrows(ProviderCircuitBreaker.CircuitOpenException.class,
-                () -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.COUNT));
+                () -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.SEND));
         probe.success();
-        assertDoesNotThrow(() -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.COUNT)
+        assertDoesNotThrow(() -> breaker.acquire(configuration, ProviderCircuitBreaker.Operation.SEND)
                 .success());
     }
 
@@ -56,8 +56,8 @@ final class ProviderCircuitBreakerTest {
     /** 构造不含真实凭据的 loopback Provider/Model 快照，测试不会触发网络访问。 */
     private static ModelPort.ModelConfiguration configuration() {
         return new ModelPort.ModelConfiguration("provider_test", "model_test", "cfg_test",
-                ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, "test-model",
-                URI.create("http://127.0.0.1/v1"), "", Duration.ofSeconds(1),
+                ModelPort.Api.OPENAI_RESPONSES, "test-model",
+                URI.create("http://127.0.0.1/v1"), "fixture-only-api-key", Duration.ofSeconds(1),
                 Duration.ofSeconds(5), java.util.Set.of(ModelPort.InputModality.TEXT),
                 ModelPort.GenerationOptions.defaults());
     }

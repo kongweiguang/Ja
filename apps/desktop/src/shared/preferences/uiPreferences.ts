@@ -3,22 +3,36 @@
 
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { normalizeUiPalette, type ThemeMode, type UiPalette } from "@/shared/styles/theme";
+export { normalizeUiPalette } from "@/shared/styles/theme";
+export type { ThemeMode, UiPalette } from "@/shared/styles/theme";
 
-export type ThemeMode = "system" | "light" | "dark";
-/** Ja 只保留一套语义色板，字面量类型用于阻止界面重新引入并行主题系统。 */
-export type UiPalette = "xcode";
-
-/** Workbench 只持久化当前真实能力，旧 Tab id 不进入当前 schema。 */
-export type RightPanelTab = "review" | "files" | "terminal" | "preview" | "new";
+/** 偏好只保存稳定 key；Workbench 实际渲染使用带 kind/label 的受控描述符。 */
+export type RightPanelTab =
+  | "review"
+  | "files"
+  | "terminal"
+  | "preview"
+  | "plan"
+  | "agents"
+  | "new"
+  | `side-task:${string}`
+  | `subagent:${string}`;
 
 const RIGHT_PANEL_TABS: readonly RightPanelTab[] = [
   "review",
   "files",
   "terminal",
   "preview",
+  "plan",
+  "agents",
   "new",
 ];
-const DEFAULT_RIGHT_PANEL_TABS: readonly RightPanelTab[] = ["review", "files", "preview"];
+const DEFAULT_RIGHT_PANEL_STATE: RightPanelSessionState = {
+  inspectorOpen: false,
+  rightPanelTab: "new",
+  rightPanelTabs: ["new"],
+};
 
 export const SIDEBAR_WIDTH_MIN = 220;
 export const SIDEBAR_WIDTH_MAX = 960;
@@ -36,6 +50,7 @@ export interface UiPreferences {
   palette: UiPalette;
   highContrast: boolean;
   reduceMotion: boolean;
+  reducedTransparency: boolean;
   desktopNotifications: boolean;
   sidebarCollapsed: boolean;
   projectSectionCollapsed: boolean;
@@ -43,9 +58,6 @@ export interface UiPreferences {
   sidebarWidth: number;
   sidebarRatio: number;
   workbenchSize: number;
-  inspectorOpen: boolean;
-  rightPanelTab: RightPanelTab;
-  rightPanelTabs: RightPanelTab[];
 }
 
 export interface UiPreferencesStore extends UiPreferences {
@@ -53,6 +65,7 @@ export interface UiPreferencesStore extends UiPreferences {
   setPalette: (palette: UiPalette) => void;
   setHighContrast: (highContrast: boolean) => void;
   setReduceMotion: (reduceMotion: boolean) => void;
+  setReducedTransparency: (reducedTransparency: boolean) => void;
   setDesktopNotifications: (desktopNotifications: boolean) => void;
   setSidebarCollapsed: (sidebarCollapsed: boolean) => void;
   setProjectSectionCollapsed: (projectSectionCollapsed: boolean) => void;
@@ -60,9 +73,23 @@ export interface UiPreferencesStore extends UiPreferences {
   setSidebarWidth: (sidebarWidth: number) => void;
   setSidebarRatio: (sidebarRatio: number) => void;
   setWorkbenchSize: (workbenchSize: number) => void;
-  setInspectorOpen: (inspectorOpen: boolean) => void;
-  setRightPanelTab: (rightPanelTab: UiPreferences["rightPanelTab"]) => void;
-  setRightPanelTabs: (rightPanelTabs: readonly RightPanelTab[]) => void;
+}
+
+export interface RightPanelSessionState {
+  readonly inspectorOpen: boolean;
+  readonly rightPanelTab: RightPanelTab;
+  readonly rightPanelTabs: readonly RightPanelTab[];
+}
+
+export interface RightPanelSessionStore {
+  readonly scopes: ReadonlyMap<string, RightPanelSessionState>;
+  readonly setInspectorOpen: (scopeIdentity: string, inspectorOpen: boolean) => void;
+  readonly setRightPanelTab: (scopeIdentity: string, rightPanelTab: RightPanelTab) => void;
+  readonly setRightPanelTabs: (
+    scopeIdentity: string,
+    rightPanelTabs: readonly RightPanelTab[],
+  ) => void;
+  readonly toggleInspector: (scopeIdentity: string) => void;
 }
 
 const initialPreferences: UiPreferences = {
@@ -70,6 +97,7 @@ const initialPreferences: UiPreferences = {
   palette: "xcode",
   highContrast: false,
   reduceMotion: false,
+  reducedTransparency: false,
   desktopNotifications: false,
   sidebarCollapsed: false,
   projectSectionCollapsed: false,
@@ -77,15 +105,7 @@ const initialPreferences: UiPreferences = {
   sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
   sidebarRatio: SIDEBAR_RATIO_DEFAULT,
   workbenchSize: WORKBENCH_SIZE_DEFAULT,
-  inspectorOpen: false,
-  rightPanelTab: "files",
-  rightPanelTabs: [...DEFAULT_RIGHT_PANEL_TABS],
 };
-
-/** 只接受当前色板；未知值回到默认值而不解释任何历史 Palette。 */
-export function normalizeUiPalette(value: unknown): UiPalette {
-  return value === "xcode" ? value : "xcode";
-}
 
 /**
  * 校验 preference store 持久化的小型 enum；原生 Settings 文档有自己的 Schema，
@@ -97,6 +117,13 @@ function normalizeThemeMode(value: unknown): ThemeMode {
 
 /** 只接受当前可见 Tab；非法介质值回到 Files，绝不推断旧能力别名。 */
 export function normalizeRightPanelTab(value: unknown): RightPanelTab {
+  if (
+    typeof value === "string" &&
+    /^(?:side-task|subagent):thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u.test(value)
+  )
+    return value as RightPanelTab;
+  if (typeof value === "string" && /^side-task:draft_[A-Za-z0-9-]{8,64}$/u.test(value))
+    return value as RightPanelTab;
   switch (value) {
     case "review":
       return "review";
@@ -106,6 +133,10 @@ export function normalizeRightPanelTab(value: unknown): RightPanelTab {
       return "terminal";
     case "preview":
       return "preview";
+    case "plan":
+      return "plan";
+    case "agents":
+      return "agents";
     case "new":
       return "new";
     default:
@@ -113,10 +144,10 @@ export function normalizeRightPanelTab(value: unknown): RightPanelTab {
   }
 }
 
-/** 修复持久化 Tab 顺序，同时保留关闭最后一个 Tab 后刻意为空的条带。 */
+/** 规范化会话内 Tab 顺序，同时保留关闭最后一个 Tab 后刻意为空的条带。 */
 function normalizeRightPanelTabs(value: unknown, active: unknown): RightPanelTab[] {
   if (Array.isArray(value) && value.length === 0) return [];
-  const source = Array.isArray(value) ? value : DEFAULT_RIGHT_PANEL_TABS;
+  const source = Array.isArray(value) ? value : DEFAULT_RIGHT_PANEL_STATE.rightPanelTabs;
   const normalized: RightPanelTab[] = [];
   for (const tab of source) {
     const canonical = normalizeRightPanelTab(tab);
@@ -124,8 +155,79 @@ function normalizeRightPanelTabs(value: unknown, active: unknown): RightPanelTab
   }
   const selected = normalizeRightPanelTab(active);
   if (!normalized.includes(selected)) normalized.push(selected);
-  return normalized.slice(0, RIGHT_PANEL_TABS.length);
+  return normalized.slice(0, RIGHT_PANEL_TABS.length + 64);
 }
+
+/** 未建立会话 identity 时只返回不可变默认视图，避免空会话共用一个伪 scope。 */
+export function getRightPanelSessionState(
+  scopes: ReadonlyMap<string, RightPanelSessionState>,
+  scopeIdentity: string | undefined,
+): RightPanelSessionState {
+  if (!scopeIdentity) return DEFAULT_RIGHT_PANEL_STATE;
+  return scopes.get(scopeIdentity) ?? DEFAULT_RIGHT_PANEL_STATE;
+}
+
+/** 每次替换 Map 与单个 scope 快照，让 Zustand selector 只通知真正受影响的当前会话。 */
+function updateRightPanelSessionState(
+  scopes: ReadonlyMap<string, RightPanelSessionState>,
+  scopeIdentity: string,
+  update: (current: RightPanelSessionState) => RightPanelSessionState,
+): ReadonlyMap<string, RightPanelSessionState> {
+  if (!scopeIdentity) return scopes;
+  const next = new Map(scopes);
+  next.set(scopeIdentity, update(getRightPanelSessionState(scopes, scopeIdentity)));
+  return next;
+}
+
+/**
+ * 右栏开关、当前能力和打开列表由 composition 提供的会话 identity 唯一归属。
+ * 它们只在 renderer 生命周期内保留，不进入全局 UI preference；原生工作面不因 Java 重连销毁。
+ */
+export const useRightPanelSessionStore = create<RightPanelSessionStore>()((set) => ({
+  scopes: new Map(),
+  /** 打开已清空的会话右栏时只恢复中性 launcher，不继承其它会话能力。 */
+  setInspectorOpen: (scopeIdentity, inspectorOpen) =>
+    set((state) => ({
+      scopes: updateRightPanelSessionState(state.scopes, scopeIdentity, (current) =>
+        inspectorOpen && current.rightPanelTabs.length === 0
+          ? { inspectorOpen: true, rightPanelTab: "new", rightPanelTabs: ["new"] }
+          : { ...current, inspectorOpen },
+      ),
+    })),
+  /** 选择能力时在同一 scope 原子补回其 Tab，避免 active 指向不可达内容。 */
+  setRightPanelTab: (scopeIdentity, rightPanelTab) =>
+    set((state) => ({
+      scopes: updateRightPanelSessionState(state.scopes, scopeIdentity, (current) => {
+        const nextTab = normalizeRightPanelTab(rightPanelTab);
+        return {
+          ...current,
+          rightPanelTab: nextTab,
+          rightPanelTabs: current.rightPanelTabs.includes(nextTab)
+            ? current.rightPanelTabs
+            : [...current.rightPanelTabs, nextTab],
+        };
+      }),
+    })),
+  /** 关闭最后一个 Tab 时只折叠所属会话，不能改写其它会话或全局布局。 */
+  setRightPanelTabs: (scopeIdentity, rightPanelTabs) =>
+    set((state) => ({
+      scopes: updateRightPanelSessionState(state.scopes, scopeIdentity, (current) => {
+        const normalized = normalizeRightPanelTabs(rightPanelTabs, current.rightPanelTab);
+        return normalized.length === 0
+          ? { ...current, rightPanelTabs: normalized, inspectorOpen: false }
+          : { ...current, rightPanelTabs: normalized };
+      }),
+    })),
+  /** 基于目标 scope 的最新快照切换，迟到回调不会读取当前另一个会话的开关。 */
+  toggleInspector: (scopeIdentity) =>
+    set((state) => ({
+      scopes: updateRightPanelSessionState(state.scopes, scopeIdentity, (current) =>
+        !current.inspectorOpen && current.rightPanelTabs.length === 0
+          ? { inspectorOpen: true, rightPanelTab: "new", rightPanelTabs: ["new"] }
+          : { ...current, inspectorOpen: !current.inspectorOpen },
+      ),
+    })),
+}));
 
 /** 收紧持久值与 pointer 派生宽度，使损坏介质不能隐藏导航或占满 Workbench。 */
 export function clampSidebarWidth(width: number): number {
@@ -145,10 +247,7 @@ export function clampWorkbenchSize(size: number): number {
   return Math.min(WORKBENCH_SIZE_MAX, Math.max(WORKBENCH_SIZE_MIN, Math.round(size * 1000) / 1000));
 }
 
-/**
- * 校验当前持久 schema；inspectorOpen 是进程期状态，任何旧 envelope 中的值都不参与恢复，
- * 这样升级前曾打开右栏的用户也始终从专注的单栏工作区启动。
- */
+/** 校验首版持久 schema；右栏会话状态不属于这个全局偏好 envelope。 */
 function normalizePersistedPreferences(
   persisted: unknown,
   fallback: UiPreferences = initialPreferences,
@@ -157,11 +256,6 @@ function normalizePersistedPreferences(
     persisted !== null && typeof persisted === "object" && !Array.isArray(persisted)
       ? (persisted as Partial<UiPreferences>)
       : {};
-  const activeTab = normalizeRightPanelTab(stored.rightPanelTab ?? fallback.rightPanelTab);
-  const rightPanelTabs = normalizeRightPanelTabs(
-    stored.rightPanelTabs ?? fallback.rightPanelTabs,
-    activeTab,
-  );
   return {
     themeMode: normalizeThemeMode(stored.themeMode ?? fallback.themeMode),
     palette: normalizeUiPalette(stored.palette ?? fallback.palette),
@@ -169,6 +263,10 @@ function normalizePersistedPreferences(
       typeof stored.highContrast === "boolean" ? stored.highContrast : fallback.highContrast,
     reduceMotion:
       typeof stored.reduceMotion === "boolean" ? stored.reduceMotion : fallback.reduceMotion,
+    reducedTransparency:
+      typeof stored.reducedTransparency === "boolean"
+        ? stored.reducedTransparency
+        : fallback.reducedTransparency,
     desktopNotifications:
       typeof stored.desktopNotifications === "boolean"
         ? stored.desktopNotifications
@@ -188,24 +286,20 @@ function normalizePersistedPreferences(
     sidebarWidth: clampSidebarWidth(stored.sidebarWidth ?? fallback.sidebarWidth),
     sidebarRatio: clampSidebarRatio(stored.sidebarRatio ?? fallback.sidebarRatio),
     workbenchSize: clampWorkbenchSize(stored.workbenchSize ?? fallback.workbenchSize),
-    inspectorOpen: false,
-    rightPanelTab: activeTab,
-    rightPanelTabs,
   };
 }
 
 /**
- * 投影唯一允许进入 localStorage 的字段；inspectorOpen、actions、runtime 与未知键
+ * 投影唯一允许进入 localStorage 的字段；右栏会话状态、actions、runtime 与未知键
  * 即使通过类型逃逸混入 store，也不会被序列化边界保留。
  */
-function projectUiPreferencesForStorage(
-  state: UiPreferences,
-): Omit<UiPreferences, "inspectorOpen"> {
+function projectUiPreferencesForStorage(state: UiPreferences): UiPreferences {
   return {
     themeMode: state.themeMode,
     palette: normalizeUiPalette(state.palette),
     highContrast: state.highContrast,
     reduceMotion: state.reduceMotion,
+    reducedTransparency: state.reducedTransparency,
     desktopNotifications: state.desktopNotifications,
     sidebarCollapsed: state.sidebarCollapsed,
     projectSectionCollapsed: state.projectSectionCollapsed,
@@ -213,22 +307,21 @@ function projectUiPreferencesForStorage(
     sidebarWidth: state.sidebarWidth,
     sidebarRatio: state.sidebarRatio,
     workbenchSize: state.workbenchSize,
-    rightPanelTab: state.rightPanelTab,
-    rightPanelTabs: state.rightPanelTabs,
   };
 }
 
-/**
- * 只持久化可逆的显示偏好；凭据、prompt、thread 与 sidecar 状态没有进入本 store 的路径。
- */
+/** 只持久化全局显示偏好；凭据、prompt、thread 与 sidecar 状态不进入这个 store。 */
 export const useUiPreferencesStore = create<UiPreferencesStore>()(
   persist(
     (set) => ({
       ...initialPreferences,
       setThemeMode: (themeMode) => set({ themeMode: normalizeThemeMode(themeMode) }),
+      /** Palette 在唯一 store 边界规范化，避免调用方绕过闭集并污染持久化 envelope。 */
       setPalette: (palette) => set({ palette: normalizeUiPalette(palette) }),
       setHighContrast: (highContrast) => set({ highContrast }),
       setReduceMotion: (reduceMotion) => set({ reduceMotion }),
+      /** 透明度偏好只改变材质降级策略，不与高对比度或系统辅助功能合并成同一个状态。 */
+      setReducedTransparency: (reducedTransparency) => set({ reducedTransparency }),
       setDesktopNotifications: (desktopNotifications) => set({ desktopNotifications }),
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       setProjectSectionCollapsed: (projectSectionCollapsed) => set({ projectSectionCollapsed }),
@@ -237,44 +330,13 @@ export const useUiPreferencesStore = create<UiPreferencesStore>()(
       setSidebarRatio: (sidebarRatio) => set({ sidebarRatio: clampSidebarRatio(sidebarRatio) }),
       setWorkbenchSize: (workbenchSize) =>
         set({ workbenchSize: clampWorkbenchSize(workbenchSize) }),
-      /** 重新打开已完全关闭的 inspector 时从中性 launcher 开始，不复活旧能力。 */
-      setInspectorOpen: (inspectorOpen) =>
-        set((state) =>
-          inspectorOpen && state.rightPanelTabs.length === 0
-            ? { inspectorOpen: true, rightPanelTab: "new", rightPanelTabs: ["new"] }
-            : { inspectorOpen },
-        ),
-      /** 选择 feature 时若其先前已关闭则同时恢复，保证选择意图闭环。 */
-      setRightPanelTab: (rightPanelTab) =>
-        set((state) => {
-          const nextTab = normalizeRightPanelTab(rightPanelTab);
-          return {
-            rightPanelTab: nextTab,
-            rightPanelTabs: state.rightPanelTabs.includes(nextTab)
-              ? state.rightPanelTabs
-              : [...state.rightPanelTabs, nextTab],
-          };
-        }),
-      /** 持久化 Tab 顺序，并在关闭最后一个 Tab 后原子折叠 inspector。 */
-      setRightPanelTabs: (rightPanelTabs) =>
-        set((state) => {
-          const normalized = normalizeRightPanelTabs(rightPanelTabs, state.rightPanelTab);
-          return normalized.length === 0
-            ? { rightPanelTabs: normalized, inspectorOpen: false }
-            : { rightPanelTabs: normalized };
-        }),
     }),
     {
-      name: "ja-ui-preferences-v10",
-      version: 12,
+      name: "ja-ui-preferences-v1",
+      version: 1,
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => projectUiPreferencesForStorage(state),
-      /**
-       * 存储键保持稳定以保留尺寸与 Tab 偏好；旧 v10 envelope 只做当前字段投影，
-       * 其中 inspectorOpen 会被明确丢弃，不建立双轨读取。
-       */
-      migrate: (persisted) => normalizePersistedPreferences(persisted),
-      /** 恢复时明确关闭 inspector，旧 v10/v11 的 true 不能复活启动期抽屉。 */
+      /** 恢复只接受 Zustand 已确认版本一致的首版 envelope，并继续隔离损坏字段。 */
       merge: (persisted, current) => {
         const stored = normalizePersistedPreferences(persisted, current);
         return {
@@ -283,6 +345,7 @@ export const useUiPreferencesStore = create<UiPreferencesStore>()(
           palette: stored.palette ?? current.palette,
           highContrast: stored.highContrast ?? current.highContrast,
           reduceMotion: stored.reduceMotion ?? current.reduceMotion,
+          reducedTransparency: stored.reducedTransparency ?? current.reducedTransparency,
           desktopNotifications: stored.desktopNotifications ?? current.desktopNotifications,
           sidebarCollapsed: stored.sidebarCollapsed ?? current.sidebarCollapsed,
           projectSectionCollapsed:
@@ -292,9 +355,6 @@ export const useUiPreferencesStore = create<UiPreferencesStore>()(
           sidebarWidth: stored.sidebarWidth ?? current.sidebarWidth,
           sidebarRatio: stored.sidebarRatio ?? current.sidebarRatio,
           workbenchSize: stored.workbenchSize ?? current.workbenchSize,
-          inspectorOpen: false,
-          rightPanelTab: stored.rightPanelTab ?? current.rightPanelTab,
-          rightPanelTabs: stored.rightPanelTabs ?? current.rightPanelTabs,
         };
       },
     },

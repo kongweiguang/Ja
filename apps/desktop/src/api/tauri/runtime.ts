@@ -8,6 +8,7 @@ import { invokeNativeCommand } from "./nativeInvoke";
 // Credential bytes 由 Rust 拥有，永远不能进入 runtime command DTO。
 import {
   assertSafePayload,
+  InputQueueMutationResultSchema,
   SafeNameSchema,
   TurnContentSchema,
   parseEvent,
@@ -15,6 +16,8 @@ import {
   RevisionSchema as RuntimeGenerationSchema,
   WorkspaceIdSchema,
   type JaEvent,
+  type InputQueue,
+  type InputQueueMutationResult,
 } from "../protocol/protocol";
 import {
   parseMethodParams,
@@ -36,16 +39,20 @@ export const JA_RUNTIME_COMMANDS = {
   acknowledgeRecovery: "ja_runtime_acknowledge_recovery",
   approvalRespond: "ja_approval_respond",
   turnStart: "ja_turn_start",
+  turnResume: "ja_turn_resume",
   turnCancel: "ja_turn_cancel",
-  turnSteer: "ja_turn_steer",
-  turnFollowUp: "ja_turn_follow_up",
+  turnInputEnqueue: "ja_turn_input_enqueue",
+  turnInputPrioritize: "ja_turn_input_prioritize",
+  turnInputUpdate: "ja_turn_input_update",
+  turnInputDelete: "ja_turn_input_delete",
+  workspacePathSearch: "ja_runtime_workspace_path_search",
   query: "ja_runtime_query",
 } as const;
 
-/** Settings 只公开冻结的 Skills/MCP 方法；host health 留在 Rust 启动准入内部。 */
+/** Runtime query 只公开受控目录查询；host health 与任意 RPC path 不进入 WebView。 */
 export type RuntimeSettingsMethod = Extract<
   ClientMethod,
-  "skill/list" | "mcp/list" | "mcp/test" | "model/test" | "mcp/list-tools"
+  "workspace/path/search" | "skill/list" | "mcp/list" | "mcp/test" | "model/test" | "mcp/list-tools"
 >;
 export type RuntimeSettingsParams<M extends RuntimeSettingsMethod> = MethodParams<M>;
 export type RuntimeSettingsResult<M extends RuntimeSettingsMethod> = MethodResult<M>;
@@ -69,6 +76,8 @@ const RuntimeStatusKindSchema = z.enum([
   "incompatible",
   "faulted",
 ]);
+
+const RuntimeFeatureSchema = z.enum(["task_threads_v1", "plan_goal_v1"]);
 
 const RuntimeStatusWireKindSchema = z.enum([
   "starting",
@@ -108,6 +117,10 @@ const RuntimeStatusSchema = z
     status: RuntimeStatusKindSchema,
     generation: RuntimeGenerationSchema,
     serverInstanceId: ServerInstanceIdSchema.nullable().optional(),
+    features: z
+      .array(RuntimeFeatureSchema)
+      .max(3)
+      .refine((features) => new Set(features).size === features.length),
   })
   .strict()
   .refine((value) => isRuntimeCommandGenerationValid(value.status, value.generation), {
@@ -158,6 +171,17 @@ const TurnCancelInputSchema = z
   })
   .strict();
 
+/** Resume 使用同一 revision CAS 形状，但专用 Schema 防止后续 Cancel 字段演进污染恢复授权。 */
+const TurnResumeInputSchema = z
+  .object({
+    turnId: z
+      .string()
+      .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(101),
+    expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
 const TurnCancelResultSchema = z
   .object({
     accepted: z.literal(true),
@@ -165,29 +189,31 @@ const TurnCancelResultSchema = z
       .string()
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(101),
-    status: z.enum(["queued", "running", "waiting_approval", "completed", "failed", "cancelled"]),
+    status: z.enum([
+      "queued",
+      "running",
+      "waiting_approval",
+      "suspended",
+      "completed",
+      "failed",
+      "cancelled",
+    ]),
     threadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
 
-/** active-Turn 输入刻意小于第二个 turn/start envelope；其 thread、Provider/Model、权限和 deadline 已由 Java 拥有。 */
-const TurnQueuedInputSchema = z
+/** active-Turn 输入只携带队列 mutation 所需 identity，不复制 Thread 或运行时配置快照。 */
+const TurnInputEnqueueSchema = z
   .object({
     turnId: z
       .string()
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(101),
-    text: z
-      .string()
-      .min(1)
-      .max(4_000_000)
-      .refine((value) => !value.includes("\0"), "text contains NUL"),
+    content: TurnContentSchema,
   })
   .strict();
-
-const TurnQueuedInputResultSchema = z
+const TurnInputMutationSchema = z
   .object({
-    accepted: z.literal(true),
     inputId: z
       .string()
       .regex(/^input_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/)
@@ -196,10 +222,12 @@ const TurnQueuedInputResultSchema = z
       .string()
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(101),
-    kind: z.enum(["steering", "follow_up"]),
-    status: z.literal("queued"),
+    expectedInputRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
+const TurnInputUpdateSchema = TurnInputMutationSchema.extend({
+  content: TurnContentSchema,
+}).strict();
 
 const TurnAcceptedSchema = z
   .object({
@@ -209,6 +237,19 @@ const TurnAcceptedSchema = z
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(128),
     queued: z.boolean(),
+    threadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/** Resume 成功必须重新进入队列；专用结果闭集拒绝复用 start 的 queued=false 分支。 */
+const TurnResumeResultSchema = z
+  .object({
+    accepted: z.literal(true),
+    turnId: z
+      .string()
+      .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(128),
+    queued: z.literal(true),
     threadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
@@ -237,6 +278,10 @@ const RuntimeStatusEventParamsSchema = z
       .max(100),
     occurredAt: z.string().datetime({ offset: true }).max(64),
     status: RuntimeStatusWireKindSchema,
+    features: z
+      .array(RuntimeFeatureSchema)
+      .max(3)
+      .refine((features) => new Set(features).size === features.length),
     reason: z.string().max(1024).optional(),
     // Rust 在 WebView 交付前消费 ready challenge；generation zero 只会在 host
     // 启动/停止投影中省略，并在下方恢复。
@@ -307,10 +352,14 @@ export type RuntimeRecoveryState = z.infer<typeof RuntimeRecoveryStateSchema>;
 export type ManualRecoveryConfirmation = z.infer<typeof ManualRecoveryConfirmationSchema>;
 export type TurnStartInput = z.infer<typeof TurnStartInputSchema>;
 export type TurnAccepted = z.infer<typeof TurnAcceptedSchema>;
+export type TurnResumeInput = z.infer<typeof TurnResumeInputSchema>;
+export type TurnResumeResult = z.infer<typeof TurnResumeResultSchema>;
 export type TurnCancelInput = z.infer<typeof TurnCancelInputSchema>;
 export type TurnCancelResult = z.infer<typeof TurnCancelResultSchema>;
-export type TurnQueuedInput = z.infer<typeof TurnQueuedInputSchema>;
-export type TurnQueuedInputResult = z.infer<typeof TurnQueuedInputResultSchema>;
+export type TurnInputEnqueue = z.infer<typeof TurnInputEnqueueSchema>;
+export type TurnInputMutation = z.infer<typeof TurnInputMutationSchema>;
+export type TurnInputUpdate = z.infer<typeof TurnInputUpdateSchema>;
+export type { InputQueue, InputQueueMutationResult };
 export type ApprovalResponseInput = z.infer<typeof ApprovalResponseInputSchema>;
 
 const SAFE_RUNTIME_REASONS = new Set([
@@ -382,6 +431,8 @@ export type RuntimeHostEvent =
       reason?: RuntimeReason;
     }
   | { kind: "timeline"; event: RuntimeTimelineEvent }
+  | { kind: "task"; event: RuntimeTaskEvent }
+  | { kind: "goal"; event: RuntimeGoalEvent }
   | { kind: "projection_fault"; reason: "invalid_native_event" };
 
 export type RuntimeHostUnsubscribe = () => void | Promise<void>;
@@ -433,9 +484,22 @@ const SAFE_RUNTIME_ERRORS: Record<string, { message: string; retryable: boolean 
   APPROVAL_ALREADY_RESOLVED: { message: "审批已处理", retryable: false },
   APPROVAL_NOT_FOUND: { message: "审批不存在", retryable: false },
   THREAD_BUSY: { message: "对话正在执行", retryable: true },
+  TURN_NOT_RESUMABLE: { message: "当前运行无法继续", retryable: false },
+  TURN_RESUME_ORDER_CONFLICT: { message: "请先处理更早中断的运行", retryable: true },
+  TURN_INPUT_QUEUE_FULL: { message: "排队消息已满，请等待处理后再发送", retryable: true },
+  QUEUED_INPUT_NOT_FOUND: { message: "这条排队消息已被处理", retryable: true },
+  TASK_NOT_FOUND: { message: "任务不存在或已删除", retryable: false },
+  TASK_RELATION_INVALID: { message: "任务关系无效", retryable: false },
+  TASK_CONTEXT_REVISION_CONFLICT: { message: "主任务上下文已变化，请重新创建", retryable: true },
+  TASK_PERMISSION_DENIED: { message: "当前任务无权执行此操作", retryable: false },
+  TASK_DEPTH_LIMIT: { message: "子任务层级已达到上限", retryable: false },
+  TASK_TREE_LIMIT: { message: "当前任务树已达到容量上限", retryable: false },
+  TASK_MAILBOX_FULL: { message: "任务消息队列已满，请稍后重试", retryable: true },
+  TASK_TREE_DELETE_REQUIRED: { message: "请使用整树删除并再次确认", retryable: false },
+  TASK_OBSERVATION_INVALID: { message: "任务观察已失效，请重新打开", retryable: true },
+  WORKSPACE_WRITE_LEASE_TIMEOUT: { message: "工作区写入繁忙，请稍后重试", retryable: true },
   THREAD_NOT_FOUND: { message: "对话不存在或已删除", retryable: false },
   CONFLICT: { message: "对话状态已变化，请刷新后重试", retryable: true },
-  TOKEN_COUNT_UNAVAILABLE: { message: "暂时无法精确计算上下文 Token", retryable: true },
   SUMMARY_FAILURE: { message: "上下文摘要生成失败", retryable: true },
   CONTEXT_LIMIT: { message: "当前上下文无法安全压缩到模型窗口内", retryable: false },
   INVALID_STATE: { message: "对话上下文状态异常，请重新打开会话", retryable: false },
@@ -537,18 +601,30 @@ const SAFE_TOKEN_METRIC_KEYS = new Set([
   "usageTotalTokens",
   "inputTokensBefore",
   "inputTokensAfter",
+  "contextWindowTokens",
+  "maxOutputTokens",
 ]);
-const NULLABLE_TOKEN_METRIC_KEYS = new Set(["inputTokensBefore", "inputTokensAfter"]);
+const POSITIVE_TOKEN_METRIC_KEYS = new Set(["contextWindowTokens", "maxOutputTokens"]);
+const NULLABLE_TOKEN_METRIC_KEYS = new Set([
+  "inputTokens",
+  "outputTokens",
+  "totalTokens",
+  "inputTokensBefore",
+  "inputTokensAfter",
+]);
 
 /**
- * pre-Zod 安全遍历只允许 Schema 拥有的 Token 指标；Context started/failed 的未产生指标
- * 显式为 null，其余值仍要求安全整数，防止相似字符串字段绕过敏感键策略。
+ * pre-Zod 安全遍历只放行协议拥有的数值形状：模型容量必须为正，计量允许为零，
+ * UNKNOWN Usage 与 Context 未产生的指标允许为 null。known/unknown 的组合约束仍由严格
+ * Zod 判别联合负责，避免安全扫描复制业务 Schema 或把合法完整画像误判为凭据泄漏。
  */
 function isSafeTokenMetric(key: string, value: unknown): boolean {
+  if (!SAFE_TOKEN_METRIC_KEYS.has(key)) return false;
+  if (value === null) return NULLABLE_TOKEN_METRIC_KEYS.has(key);
   return (
-    SAFE_TOKEN_METRIC_KEYS.has(key) &&
-    ((typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
-      (value === null && NULLABLE_TOKEN_METRIC_KEYS.has(key)))
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    (POSITIVE_TOKEN_METRIC_KEYS.has(key) ? value > 0 : value >= 0)
   );
 }
 
@@ -561,7 +637,33 @@ function isSafeCredentialReference(key: string, value: unknown): boolean {
   );
 }
 
-type RuntimeTimelineEvent = JaEvent;
+type RuntimeTaskEvent = Extract<
+  JaEvent,
+  { method: "task/activity" | "task/progress" | "task/mailbox-changed" }
+>;
+type RuntimeGoalEvent = Extract<
+  JaEvent,
+  { method: "goal/changed" | "goal/activity" | "goal/input-requested" }
+>;
+type RuntimeTimelineEvent = Exclude<JaEvent, RuntimeTaskEvent | RuntimeGoalEvent>;
+
+/** Task notification 在 IPC 边缘与主 Timeline 分流，避免 Child 事件被 Conversation reducer 误收。 */
+function isRuntimeTaskEvent(event: JaEvent): event is RuntimeTaskEvent {
+  return (
+    event.method === "task/activity" ||
+    event.method === "task/progress" ||
+    event.method === "task/mailbox-changed"
+  );
+}
+
+/** Goal notification 从 Timeline 独立分流，事件仅唤醒权威查询，不能写入 Conversation reducer。 */
+function isRuntimeGoalEvent(event: JaEvent): event is RuntimeGoalEvent {
+  return (
+    event.method === "goal/changed" ||
+    event.method === "goal/activity" ||
+    event.method === "goal/input-requested"
+  );
+}
 
 /** Java 只在 ToolPresentation 中发布工作区相对路径；其它 path/cwd 字段仍应拒绝。 */
 function isSafePresentationLocation(key: string, value: unknown, path: readonly string[]): boolean {
@@ -650,6 +752,7 @@ export function parseRuntimeHostEvent(value: unknown): RuntimeHostEvent {
         status: normalizeWireStatus(params.status),
         generation: params.generation ?? 0,
         serverInstanceId: params.serverInstanceId,
+        features: params.features,
       },
       eventId: params.eventId,
       occurredAt: params.occurredAt,
@@ -658,10 +761,10 @@ export function parseRuntimeHostEvent(value: unknown): RuntimeHostEvent {
         : { reason: safeRuntimeReason(params.reason) }),
     };
   }
-  return {
-    kind: "timeline",
-    event: parseEvent(value),
-  };
+  const event = parseEvent(value);
+  if (isRuntimeTaskEvent(event)) return { kind: "task", event };
+  if (isRuntimeGoalEvent(event)) return { kind: "goal", event };
+  return { kind: "timeline", event };
 }
 
 export interface RuntimeHostAdapter {
@@ -681,15 +784,21 @@ export interface RuntimeHostAdapter {
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
   /** 通过普通客户端请求发送业务 approval decision，不建立控制面旁路。 */
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
-  /** 发送一次已校验 Turn 输入，Provider/Model 与权限快照由 Ja App Server 冻结。 */
+  /** 发送一次已校验 Turn 输入；Provider/Model 与权限由 App Server 在每次请求安全点解析。 */
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
+  /** 显式授权恢复同一持久 Turn；返回值复用原接纳形状但不会创建新 Turn。 */
+  turnResume(input: TurnResumeInput): Promise<TurnResumeResult>;
   /** 请求取消，但终态仍以事件为权威，UI 不提前猜测完成。 */
   turnCancel(input: TurnCancelInput): Promise<TurnCancelResult>;
-  /** 为活动 Turn 的下一个 Tool 边界排队 guidance。 */
-  turnSteer(input: TurnQueuedInput): Promise<TurnQueuedInputResult>;
-  /** 为活动 Turn 的完成边界排队 message。 */
-  turnFollowUp(input: TurnQueuedInput): Promise<TurnQueuedInputResult>;
-  /** 查询固定 Skills/MCP settings surface，不公开通用 method tunnel。 */
+  /** 默认以 follow-up 语义追加一条持久输入。 */
+  turnInputEnqueue(input: TurnInputEnqueue): Promise<InputQueueMutationResult>;
+  /** 把尚未消费的输入提升为下一个安全点 guidance。 */
+  turnInputPrioritize(input: TurnInputMutation): Promise<InputQueueMutationResult>;
+  /** 使用条目 revision CAS 更新尚未消费的结构化内容。 */
+  turnInputUpdate(input: TurnInputUpdate): Promise<InputQueueMutationResult>;
+  /** 使用条目 revision CAS 删除尚未消费的输入。 */
+  turnInputDelete(input: TurnInputMutation): Promise<InputQueueMutationResult>;
+  /** 查询固定 Workspace/Skills/MCP surface，不公开通用 method tunnel。 */
   query: RuntimeQuery;
   /** 订阅唯一 RuntimeHost 事件并只发布解析后的领域投影。 */
   subscribe(listener: RuntimeHostListener): Promise<RuntimeHostUnsubscribe>;
@@ -804,12 +913,26 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
     }
   }
 
-  /** Turn admission 只提交 thread 与文本输入；Provider/Model、权限、预算和 generation 由服务端冻结。 */
+  /** Turn admission 只提交 thread 与输入；Provider/Model、权限和预算由服务端请求安全点解析。 */
   async turnStart(input: TurnStartInput): Promise<TurnAccepted> {
     // 校验阶段拒绝未知字段、畸形 thread id、空输入和无界 deadline。
     const parsed = parseRuntimeInput(TurnStartInputSchema, input);
     // 跨进程和结果阶段复用公共 invoke，accepted identity 与 revision 必须满足严格 Schema。
     return this.invoke(JA_RUNTIME_COMMANDS.turnStart, { input: parsed }, TurnAcceptedSchema);
+  }
+
+  /** 通过 revision CAS 恢复中断 Turn；执行游标与运行时指纹仍完全由 App Server 校验。 */
+  async turnResume(input: TurnResumeInput): Promise<TurnResumeResult> {
+    const parsed = parseRuntimeInput(TurnResumeInputSchema, input);
+    const result = await this.invoke(
+      JA_RUNTIME_COMMANDS.turnResume,
+      { input: parsed },
+      TurnResumeResultSchema,
+    );
+    if (result.turnId !== parsed.turnId) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    }
+    return result;
   }
 
   /**
@@ -832,28 +955,54 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
     return result;
   }
 
-  /** 通过专用原生 command 排队即时 guidance，并校验返回身份属于请求的 Turn。 */
-  async turnSteer(input: TurnQueuedInput): Promise<TurnQueuedInputResult> {
-    return this.queueTurnInput(JA_RUNTIME_COMMANDS.turnSteer, "steering", input);
+  /** 默认追加只创建 follow-up；是否提升必须由用户对具体 inputId 显式授权。 */
+  async turnInputEnqueue(input: TurnInputEnqueue): Promise<InputQueueMutationResult> {
+    return this.mutateTurnInput(
+      JA_RUNTIME_COMMANDS.turnInputEnqueue,
+      TurnInputEnqueueSchema,
+      input,
+    );
   }
 
-  /** 为完成边界排队 message，但不向 WebView 暴露队列管理 API 或通用 method name。 */
-  async turnFollowUp(input: TurnQueuedInput): Promise<TurnQueuedInputResult> {
-    return this.queueTurnInput(JA_RUNTIME_COMMANDS.turnFollowUp, "follow_up", input);
+  /** 提升使用条目 CAS，避免陈旧菜单把已编辑或已消费消息改成 guidance。 */
+  async turnInputPrioritize(input: TurnInputMutation): Promise<InputQueueMutationResult> {
+    return this.mutateTurnInput(
+      JA_RUNTIME_COMMANDS.turnInputPrioritize,
+      TurnInputMutationSchema,
+      input,
+    );
   }
 
-  /** 共用严格校验，同时保持封闭 command/kind 对。 */
-  private async queueTurnInput(
-    command: typeof JA_RUNTIME_COMMANDS.turnSteer | typeof JA_RUNTIME_COMMANDS.turnFollowUp,
-    expectedKind: "steering" | "follow_up",
-    input: TurnQueuedInput,
-  ): Promise<TurnQueuedInputResult> {
-    // 校验阶段只允许当前 Turn identity 与有界文本，不能携带第二份 thread/Provider/Model 上下文。
-    const parsed = parseRuntimeInput(TurnQueuedInputSchema, input);
-    // 跨进程阶段 command 与 expected kind 由 adapter 闭集决定，调用方不能选择通用 method。
-    const result = await this.invoke(command, { input: parsed }, TurnQueuedInputResultSchema);
-    // 解析后的关联校验同时锁定 turnId 与 steering/follow-up kind，错配一律 fail closed。
-    if (result.turnId !== parsed.turnId || result.kind !== expectedKind) {
+  /** 编辑只允许替换文本，队列顺序继续由 App Server 权威返回。 */
+  async turnInputUpdate(input: TurnInputUpdate): Promise<InputQueueMutationResult> {
+    return this.mutateTurnInput(JA_RUNTIME_COMMANDS.turnInputUpdate, TurnInputUpdateSchema, input);
+  }
+
+  /** 删除不在 Renderer 先行移除，ACK 或事件的全量投影负责收敛。 */
+  async turnInputDelete(input: TurnInputMutation): Promise<InputQueueMutationResult> {
+    return this.mutateTurnInput(
+      JA_RUNTIME_COMMANDS.turnInputDelete,
+      TurnInputMutationSchema,
+      input,
+    );
+  }
+
+  /** 四个专用 command 共享严格边界，并验证 ACK 队列仍属于请求 Turn。 */
+  private async mutateTurnInput<T extends TurnInputEnqueue | TurnInputMutation | TurnInputUpdate>(
+    command:
+      | typeof JA_RUNTIME_COMMANDS.turnInputEnqueue
+      | typeof JA_RUNTIME_COMMANDS.turnInputPrioritize
+      | typeof JA_RUNTIME_COMMANDS.turnInputUpdate
+      | typeof JA_RUNTIME_COMMANDS.turnInputDelete,
+    schema: z.ZodType<T>,
+    input: T,
+  ): Promise<InputQueueMutationResult> {
+    const parsed = parseRuntimeInput(schema, input);
+    const result = await this.invoke(command, { input: parsed }, InputQueueMutationResultSchema);
+    if (result.inputQueue.turnId !== parsed.turnId) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    }
+    if ("inputId" in parsed && result.inputId !== parsed.inputId) {
       throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
     }
     return result;
@@ -876,10 +1025,20 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
     }
     try {
       // 跨进程阶段只调用统一 query command，method/params 被封装在固定 input 字段中。
-      const result = await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.query, {
-        input: { method, params: parsedParams },
-      });
-      // 结果阶段先拒绝敏感字段，再按原始 method 解析专用 result Schema。
+      const result =
+        method === "workspace/path/search"
+          ? await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.workspacePathSearch, {
+              input: parsedParams,
+            })
+          : await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.query, {
+              input: { method, params: parsedParams },
+            });
+      /* Workspace 搜索的 relativePath 是该专用 Command 刻意公开的产品数据；先用严格结果
+       * Schema 限定为相对路径，避免通用 path-key 防泄漏规则把合法结果误判成绝对路径泄漏。 */
+      if (method === "workspace/path/search") {
+        return parseMethodResult(method, result) as RuntimeSettingsResult<M>;
+      }
+      // 其它查询仍先拒绝敏感字段，再按原始 method 解析专用 result Schema。
       assertHostPayloadSafe(result);
       return parseMethodResult(method, result) as RuntimeSettingsResult<M>;
     } catch (error) {

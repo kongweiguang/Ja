@@ -1,0 +1,7 @@
+# @author kongweiguang
+"$schema" = "schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ja-thread-seen"
+description = "Allows the trusted main WebView to persist the latest Thread seen boundary."
+commands.allow = ["ja_thread_seen"]

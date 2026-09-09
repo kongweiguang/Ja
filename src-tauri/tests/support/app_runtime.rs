@@ -479,7 +479,7 @@ impl RuntimeHostHarness {
         }
     }
 
-    /// 经 JA-RPC v2 配置白名单写入测试 Profile，不开放任意 RPC 方法。
+    /// 经 JA-RPC v1 配置白名单写入测试 Profile，不开放任意 RPC 方法。
     pub fn config_request(
         &self,
         method: &'static str,
@@ -566,6 +566,7 @@ impl RuntimeHostHarness {
             model_id: model_id.to_owned(),
             reasoning_level: Some("medium".to_owned()),
             access_mode: "approval_required".to_owned(),
+            collaboration_mode: "default".to_owned(),
         };
         validate_thread_create(&input)?;
         let result = request_history(

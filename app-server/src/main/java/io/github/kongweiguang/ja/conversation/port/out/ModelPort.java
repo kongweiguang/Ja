@@ -16,7 +16,6 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
@@ -32,16 +31,14 @@ public interface ModelPort {
     }
 
     /**
-     * 使用 Provider 官方计量接口计算完整冻结请求的输入 Token；失败必须关闭发送链路。
-     *
-     * <p>默认实现刻意失败而不进行字符估算，既保留测试替身的函数式写法，也确保任何未显式
-     * 实现计量能力的生产适配器不会静默退化。</p>
+     * 对完整冻结 Provider envelope 做纯本地保守估算；实现不得发起网络请求或进入发送熔断器。
      */
-    default CompletionStage<InputTokenCount> countInputTokens(
+    default InputTokenEstimate estimateInputTokens(
             ModelRequest request, CancellationToken cancellationToken) {
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(cancellationToken, "cancellationToken");
-        return CompletableFuture.failedFuture(new TokenCountUnavailableException(null));
+        cancellationToken.throwIfCancellationRequested();
+        throw new UnsupportedOperationException("local input token estimation is not implemented");
     }
 
     /**
@@ -52,38 +49,55 @@ public interface ModelPort {
             ModelEventSink eventSink,
             CancellationToken cancellationToken);
 
-    /** 将权威计量值与请求指纹绑定，禁止在不同 envelope 之间复用结果。 */
-    record InputTokenCount(long tokens, String fingerprint) {
-        /** 拒绝非正计数和非 SHA-256 指纹，避免缺失计量被误当作空上下文。 */
-        public InputTokenCount {
-            if (tokens < 0 || fingerprint == null || !fingerprint.matches("[0-9a-f]{64}")) {
-                throw new IllegalArgumentException("invalid provider input token count");
+    /**
+     * 将本地保守准入估计与冻结请求指纹绑定；多模态和自定义模型不保证 tokenizer 严格上界，
+     * 更不能把该值当作响应内 Provider reported usage。
+     */
+    record InputTokenEstimate(long conservativeUpperBound, String fingerprint) {
+        /** 拒绝负估算和非 SHA-256 指纹，避免跨 envelope 复用预算证据。 */
+        public InputTokenEstimate {
+            if (conservativeUpperBound < 0 || fingerprint == null
+                || !fingerprint.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException("invalid local input token estimate");
             }
         }
     }
 
-    /** Provider 官方计量不可用时使用的稳定失败，调用方不得继续发送。 */
-    final class TokenCountUnavailableException extends RuntimeException {
+    /**
+     * Provider 请求、响应或容量门禁无法完成当前模型调用时使用的稳定应用边界异常。
+     *
+     * <p>具体 Adapter 可以保留内部受限诊断子类型，但 Agent Loop 只依赖这一 Provider 中立
+     * 分类，避免把外部服务故障误报为 Ja 内部错误。</p>
+     */
+    class ModelUnavailableException extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
-        /** 保留根因供边界内诊断，但固定公开消息并关闭本地堆栈。 */
-        public TokenCountUnavailableException(Throwable cause) {
-            super("provider input token count is unavailable", cause, false, false);
-        }
-    }
+        private final String terminalErrorCode;
 
-    /**
-     * 当前基线支持的模型服务提供方。
-     */
-    enum Provider {
         /**
-         * Anthropic 托管模型服务。
+         * 保留脱敏根因供受管日志分类，同时固定公开消息且不捕获本地堆栈。
          */
-        ANTHROPIC,
+        public ModelUnavailableException(String message, Throwable cause) {
+            this(message, cause, "MODEL_UNAVAILABLE");
+        }
+
         /**
-         * OpenAI 原生 Responses 服务。
+         * 允许 Provider adapter 在不泄漏 wire 细节的前提下区分瞬时不可用与确定性协议拒绝；
+         * Agent Loop 仍只消费稳定的 Provider 中立终态码。
          */
-        OPENAI
+        protected ModelUnavailableException(String message, Throwable cause, String terminalErrorCode) {
+            super(message, cause, false, false);
+            if (!"MODEL_UNAVAILABLE".equals(terminalErrorCode)
+                && !"MODEL_PROTOCOL_ERROR".equals(terminalErrorCode)) {
+                throw new IllegalArgumentException("invalid model terminal error code");
+            }
+            this.terminalErrorCode = terminalErrorCode;
+        }
+
+        /** 返回可安全持久化和展示的稳定终态分类，不暴露 Provider 专属诊断。 */
+        public final String terminalErrorCode() {
+            return terminalErrorCode;
+        }
     }
 
     /**
@@ -97,7 +111,11 @@ public interface ModelPort {
         /**
          * 采用 OpenAI Responses 原生响应协议。
          */
-        OPENAI_RESPONSES
+        OPENAI_RESPONSES,
+        /**
+         * 采用 OpenAI Chat Completions 流式对话协议。
+         */
+        OPENAI_CHAT_COMPLETIONS
     }
 
     /** 模型配置声明的输入模态；Provider Codec 能力仍是独立且必须同时满足的门。 */
@@ -111,13 +129,12 @@ public interface ModelPort {
     }
 
     /**
-     * 单个 Turn 冻结的 Provider、凭据引用结果、端点与生成参数。
+     * 单次 Provider 请求解析出的 Provider、凭据引用结果、端点与生成参数。
      */
     record ModelConfiguration(
             String providerId,
             String modelId,
             String configGeneration,
-            Provider provider,
             Api api,
             String model,
             URI baseUri,
@@ -127,13 +144,12 @@ public interface ModelPort {
             Set<InputModality> inputModalities,
             GenerationOptions generation) {
         /**
-         * 只接受原生 Provider/API 配对和 HTTPS 端点；loopback HTTP 仅供隔离测试。
+         * 只接受显式 Wire API 和 HTTPS 端点；loopback HTTP 仅供隔离测试。
          */
         public ModelConfiguration {
             providerId = ContractChecks.identifier(providerId, "providerId");
             modelId = ContractChecks.identifier(modelId, "modelId");
             configGeneration = ContractChecks.configurationGeneration(configGeneration);
-            Objects.requireNonNull(provider, "provider");
             Objects.requireNonNull(api, "api");
             model = ContractChecks.text(model, "model", 512, false);
             Objects.requireNonNull(baseUri, "baseUri");
@@ -142,7 +158,7 @@ public interface ModelPort {
                 || !("https".equalsIgnoreCase(baseUri.getScheme()) || isLoopbackHttp(baseUri))) {
                 throw new IllegalArgumentException("baseUri must be HTTPS or loopback HTTP");
             }
-            apiKey = ContractChecks.text(apiKey == null ? "" : apiKey, "apiKey", 8_192, true);
+            apiKey = ContractChecks.text(apiKey, "apiKey", 8_192, false);
             if (apiKey.chars().anyMatch(Character::isISOControl)) {
                 throw new IllegalArgumentException("apiKey contains control characters");
             }
@@ -152,11 +168,7 @@ public interface ModelPort {
             if (!inputModalities.contains(InputModality.TEXT) || inputModalities.size() > InputModality.values().length) {
                 throw new IllegalArgumentException("model input modalities must contain text");
             }
-            generation = generation == null ? GenerationOptions.defaults() : generation;
-            if (provider == Provider.ANTHROPIC && api != Api.ANTHROPIC_MESSAGES
-                || provider == Provider.OPENAI && api == Api.ANTHROPIC_MESSAGES) {
-                throw new IllegalArgumentException("provider and API are not a supported native pair");
-            }
+            Objects.requireNonNull(generation, "generation");
         }
 
         /**
@@ -166,7 +178,7 @@ public interface ModelPort {
         public String toString() {
             return "ModelConfiguration[providerId=" + providerId + ", modelId=" + modelId
                    + ", configGeneration=" + configGeneration
-                   + ", provider=" + provider + ", api=" + api + ", model=" + model + ", baseUri="
+                   + ", api=" + api + ", model=" + model + ", baseUri="
                    + baseUri + ", apiKey=<redacted>, connectTimeout=" + connectTimeout
                    + ", requestTimeout=" + requestTimeout + ", inputModalities=" + inputModalities
                    + ", generation=" + generation + "]";

@@ -12,15 +12,50 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_runtime_state,
         crate::app_runtime::ja_runtime_storage_info,
         crate::app_runtime::ja_runtime_general_workspace,
+        crate::app_runtime::ja_runtime_workspace_path_search,
         crate::app_runtime::ja_runtime_recovery_state,
         crate::app_runtime::ja_runtime_acknowledge_recovery,
         crate::app_runtime::ja_runtime_workspace_open,
         crate::app_runtime::ja_runtime_query,
+        crate::app_runtime::ja_runtime_task_create,
+        crate::app_runtime::ja_runtime_task_list,
+        crate::app_runtime::ja_runtime_task_read,
+        crate::app_runtime::ja_runtime_task_observe,
+        crate::app_runtime::ja_runtime_task_unobserve,
+        crate::app_runtime::ja_runtime_task_seen,
+        crate::app_runtime::ja_runtime_task_message_send,
+        crate::app_runtime::ja_runtime_task_followup,
+        crate::app_runtime::ja_runtime_task_cancel,
+        crate::app_runtime::ja_runtime_task_tree_delete,
+        crate::app_runtime::ja_runtime_goal_read,
+        crate::app_runtime::ja_runtime_goal_events_read,
+        crate::app_runtime::ja_runtime_goal_observe,
+        crate::app_runtime::ja_runtime_goal_unobserve,
+        crate::app_runtime::ja_runtime_plan_read,
+        crate::app_runtime::ja_runtime_plan_revisions_list,
+        crate::app_runtime::ja_runtime_goal_evidence_list,
+        crate::app_runtime::ja_runtime_goal_create,
+        crate::app_runtime::ja_runtime_goal_plan_attach,
+        crate::app_runtime::ja_runtime_goal_plan_detach,
+        crate::app_runtime::ja_runtime_goal_pause,
+        crate::app_runtime::ja_runtime_goal_resume,
+        crate::app_runtime::ja_runtime_goal_stop,
+        crate::app_runtime::ja_runtime_goal_input_respond,
+        crate::app_runtime::ja_runtime_plan_create,
+        crate::app_runtime::ja_runtime_plan_draft_save,
+        crate::app_runtime::ja_runtime_plan_draft_discard,
+        crate::app_runtime::ja_runtime_plan_propose,
+        crate::app_runtime::ja_runtime_plan_approve,
+        crate::app_runtime::ja_runtime_plan_execute,
+        crate::app_runtime::ja_runtime_plan_reject,
         crate::app_runtime::ja_approval_respond,
         crate::app_runtime::ja_turn_start,
+        crate::app_runtime::ja_turn_resume,
         crate::app_runtime::ja_turn_cancel,
-        crate::app_runtime::ja_turn_steer,
-        crate::app_runtime::ja_turn_follow_up,
+        crate::app_runtime::ja_turn_input_enqueue,
+        crate::app_runtime::ja_turn_input_prioritize,
+        crate::app_runtime::ja_turn_input_update,
+        crate::app_runtime::ja_turn_input_delete,
         crate::app_runtime::ja_tool_artifact_read,
         crate::app_runtime::ja_configuration_read,
         crate::app_runtime::ja_configuration_patch,
@@ -34,12 +69,23 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_thread_search,
         crate::app_runtime::ja_thread_read,
         crate::app_runtime::ja_thread_rename,
+        crate::app_runtime::ja_thread_pin,
+        crate::app_runtime::ja_thread_seen,
         crate::app_runtime::ja_thread_preferences_update,
         crate::app_runtime::ja_thread_compact,
         crate::app_runtime::ja_thread_archive,
+        crate::app_runtime::ja_thread_restore,
         crate::app_runtime::ja_thread_delete,
-        crate::attachments::interface::commands::ja_attachment_import,
+        crate::attachments::interface::commands::ja_attachment_picker_import,
+        crate::attachments::interface::commands::ja_attachment_drop_import,
+        crate::attachments::interface::commands::ja_attachment_clipboard_import,
+        crate::attachments::interface::commands::ja_attachment_retry,
+        crate::attachments::interface::commands::ja_attachment_cancel,
+        crate::attachments::interface::commands::ja_attachment_attempt_discard,
         crate::attachments::interface::commands::ja_attachment_discard,
+        crate::attachment_preview::commands::ja_attachment_preview_open,
+        crate::attachment_preview::commands::ja_attachment_preview_read,
+        crate::attachment_preview::commands::ja_attachment_preview_close,
         crate::review::interface::commands::ja_review_catalog,
         crate::review::interface::commands::ja_review_snapshot,
         crate::review::interface::commands::ja_review_file_diff,
@@ -72,8 +118,11 @@ macro_rules! ja_command_handler {
 }
 
 pub mod app_runtime;
+pub mod attachment_preview;
 pub(crate) mod attachments;
 pub(crate) mod diagnostics;
+#[cfg(windows)]
+pub(crate) mod native_drop;
 pub(crate) mod native_shortcuts;
 pub mod preview;
 pub mod review;
@@ -90,21 +139,148 @@ use std::fs;
 #[cfg(debug_assertions)]
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, RunEvent, webview::PageLoadEvent};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const WORKSPACE_NATIVE_DROP_EVENT: &str = "ja://workspace-native-drop";
 
-/// 只携带不透明、短生命周期的 Native Drop capability 与逻辑坐标；
+/// 原生拖放只投影阶段、逻辑坐标和数量；仅 Drop 终态携带一次性 capability。
 /// 源文件绝对路径始终留在 Rust 的一次性 plan 内。
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceNativeDropEventDto {
-    pub(crate) drop_token: String,
+    pub(crate) phase: NativeDropPhase,
     pub(crate) x: f64,
     pub(crate) y: f64,
+    pub(crate) count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) drop_token: Option<String>,
+}
+
+/// 固定阶段闭集让 renderer 能在 leave/cancel 时立即撤销反馈，而不靠计时器猜测原生状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeDropPhase {
+    Enter,
+    Over,
+    Leave,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveNativeDrag {
+    count: usize,
+    x: f64,
+    y: f64,
+}
+
+/// 应用级唯一拖放状态只记脱敏投影；路径在 workspace token registry 内部持有。
+#[derive(Default)]
+pub(crate) struct NativeDropRouter {
+    active: Mutex<Option<ActiveNativeDrag>>,
+}
+
+impl NativeDropRouter {
+    /// 把 Tauri 的物理事件转换为稳定四态合同，并保证 token 只在 Drop 分支签发一次。
+    pub(crate) fn project<F>(
+        &self,
+        label: &str,
+        event: &tauri::DragDropEvent,
+        scale_factor: f64,
+        issue_token: F,
+    ) -> Result<Option<WorkspaceNativeDropEventDto>, workspace::WorkspaceError>
+    where
+        F: FnOnce() -> Result<String, workspace::WorkspaceError>,
+    {
+        if label != MAIN_WINDOW_LABEL || !scale_factor.is_finite() || scale_factor <= 0.0 {
+            return Ok(None);
+        }
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => return Ok(None),
+        };
+        let logical = |position: &tauri::PhysicalPosition<f64>| {
+            let x = position.x / scale_factor;
+            let y = position.y / scale_factor;
+            (x.is_finite() && y.is_finite()).then_some((x, y))
+        };
+        match event {
+            tauri::DragDropEvent::Enter { paths, position } => {
+                let Some((x, y)) = logical(position) else {
+                    return Ok(None);
+                };
+                let state = ActiveNativeDrag {
+                    count: paths.len(),
+                    x,
+                    y,
+                };
+                *active = Some(state);
+                Ok(Some(WorkspaceNativeDropEventDto {
+                    phase: NativeDropPhase::Enter,
+                    x,
+                    y,
+                    count: state.count,
+                    drop_token: None,
+                }))
+            }
+            tauri::DragDropEvent::Over { position } => {
+                let Some((x, y)) = logical(position) else {
+                    return Ok(None);
+                };
+                let Some(state) = active.as_mut() else {
+                    return Ok(None);
+                };
+                state.x = x;
+                state.y = y;
+                Ok(Some(WorkspaceNativeDropEventDto {
+                    phase: NativeDropPhase::Over,
+                    x,
+                    y,
+                    count: state.count,
+                    drop_token: None,
+                }))
+            }
+            tauri::DragDropEvent::Leave => {
+                let Some(state) = active.take() else {
+                    return Ok(None);
+                };
+                Ok(Some(WorkspaceNativeDropEventDto {
+                    phase: NativeDropPhase::Leave,
+                    x: state.x,
+                    y: state.y,
+                    count: state.count,
+                    drop_token: None,
+                }))
+            }
+            tauri::DragDropEvent::Drop { paths, position } => {
+                let Some((x, y)) = logical(position) else {
+                    *active = None;
+                    return Ok(None);
+                };
+                let count = paths.len();
+                let drop_token = issue_token();
+                *active = None;
+                let drop_token = drop_token?;
+                Ok(Some(WorkspaceNativeDropEventDto {
+                    phase: NativeDropPhase::Drop,
+                    x,
+                    y,
+                    count,
+                    drop_token: Some(drop_token),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// renderer 投递失败时立即清空仅内存的 hover 事实，避免后续 Leave/Over 关联到未展示的序列。
+    fn cancel_active(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            *active = None;
+        }
+    }
 }
 
 #[cfg(desktop)]
@@ -262,7 +438,25 @@ pub fn run() {
     let callback_trace = exit_trace.clone();
     #[cfg(not(debug_assertions))]
     let callback_trace = exit_trace;
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().register_asynchronous_uri_scheme_protocol(
+        attachment_preview::ATTACHMENT_PREVIEW_SCHEME,
+        |context, request, responder| {
+            let response = context
+                .app_handle()
+                .try_state::<Arc<attachment_preview::AttachmentPreviewHost>>()
+                .map(|host| {
+                    attachment_preview::interface::protocol::attachment_protocol_response(
+                        host.inner(),
+                        context.webview_label(),
+                        &request.uri().to_string(),
+                    )
+                })
+                .unwrap_or_else(
+                    attachment_preview::interface::protocol::attachment_protocol_unavailable_response,
+                );
+            responder.respond(response);
+        },
+    );
     // Tauri 要求 single-instance 最先注册，使竞争失败的进程在其他插件或 sidecar 初始化前退出。
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -279,6 +473,12 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_clipboard_manager::init());
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_log::Builder::new().skip_logger().build());
+    // 更新检查与安装使用 Tauri 官方签名链；process 只承担安装后的显式重启，
+    // 两者都放在 desktop 分支，避免把桌面发布语义带入未来移动端 composition。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_process::init());
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(desktop)]
     let builder = builder.plugin(
         tauri_plugin_window_state::Builder::default()
@@ -294,22 +494,43 @@ pub fn run() {
     let setup_shortcuts = native_shortcuts.clone();
     let builder = builder
         .manage(native_shortcuts)
+        .manage(NativeDropRouter::default())
         // 同一 managed trace 覆盖窗口销毁与托盘显式退出；release 状态为零大小且永久禁用。
         .manage(exit_trace)
-        .manage(app_tray::AppExitCoordinator::default())
-        .on_page_load(move |webview, payload| {
-            if webview.label() == MAIN_WINDOW_LABEL && payload.event() == PageLoadEvent::Started {
-                webview
-                    .state::<app_tray::AppExitCoordinator>()
-                    .set_renderer_ready(false);
-                if let Err(error) = page_load_shortcuts.rotate_main_renderer_lease() {
-                    tracing::debug!(
-                        code = ?error.code,
-                        "native shortcut renderer lease could not rotate"
-                    );
-                }
+        .manage(app_tray::AppExitCoordinator::default());
+    #[cfg(windows)]
+    let builder = builder.manage(native_drop::NativeDropTargetHost::default());
+    let builder = builder.on_page_load(move |webview, payload| {
+        if webview.label() == MAIN_WINDOW_LABEL && payload.event() == PageLoadEvent::Started {
+            webview
+                .state::<app_tray::AppExitCoordinator>()
+                .set_renderer_ready(false);
+            if let Err(error) = page_load_shortcuts.rotate_main_renderer_lease() {
+                tracing::debug!(
+                    code = ?error.code,
+                    "native shortcut renderer lease could not rotate"
+                );
             }
-        });
+            if let Err(error) = webview
+                .state::<RuntimeHost>()
+                .release_task_observations(MAIN_WINDOW_LABEL)
+            {
+                tracing::debug!(
+                    code = error.code,
+                    "task observation renderer leases could not be released"
+                );
+            }
+        }
+        #[cfg(windows)]
+        if webview.label() == MAIN_WINDOW_LABEL && payload.event() == PageLoadEvent::Finished {
+            let host = webview.state::<native_drop::NativeDropTargetHost>();
+            native_drop::schedule_main_refresh(
+                webview.clone(),
+                webview.app_handle().clone(),
+                host.inner().clone(),
+            );
+        }
+    });
     let builder = builder.setup(move |app| {
         let home = HomeLayout::new().map_err(|error| {
             tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
@@ -356,7 +577,17 @@ pub fn run() {
         });
         // 即使需要 recovery 也继续托管 host，使窗口能渲染类型化恢复界面，
         // 而不是在 Tauri 创建 UI surface 前直接让 setup 失败。
-        app.manage(RuntimeHost::new(config, sink));
+        let runtime_host = RuntimeHost::new(config, sink);
+        let attachment_preview_host = Arc::new(
+            attachment_preview::AttachmentPreviewHost::new().map_err(|error| {
+                tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
+            })?,
+        );
+        app.manage(attachment_preview::AttachmentPreviewRuntimeState::new(
+            Arc::new(runtime_host.clone()),
+        ));
+        app.manage(attachment_preview_host);
+        app.manage(runtime_host);
         // 这些 managed host 是 PTY 与 Preview model 的唯一 owner；
         // configuration/auth 仍由 Ja App Server 持有。
         app.manage(terminal::TerminalCommandHost::new());
@@ -416,29 +647,47 @@ pub fn run() {
         RunEvent::WindowEvent { label, event, .. } => {
             handle_native_window_event(app_handle, &label, &event);
         }
-        RunEvent::ExitRequested { code, .. }
-            if handle_full_exit_request_event(app_handle, code, &callback_trace) =>
-        {
-            // 这是桌面产品中唯一由应用拥有的 programmatic exit 路径。Tauri 会再次发出
-            // 携带 `Some(0)` 的 `ExitRequested`，后续交还 Tauri，避免清理和轨迹循环或重复。
-            app_handle.exit(0);
+        RunEvent::ExitRequested { code, .. } => {
+            #[cfg(windows)]
+            if app_handle
+                .state::<native_drop::NativeDropTargetHost>()
+                .shutdown()
+                .is_err()
+            {
+                tracing::error!("native drop targets could not be revoked before exit");
+            }
+            if handle_full_exit_request_event(app_handle, code, &callback_trace) {
+                // 这是桌面产品中唯一由应用拥有的 programmatic exit 路径。Tauri 会再次发出
+                // 携带 `Some(0)` 的 `ExitRequested`，后续交还 Tauri，避免清理和轨迹循环或重复。
+                app_handle.exit(0);
+            }
         }
         RunEvent::Exit => {
             callback_trace.record(DebugExitTraceEvent::ExitEntered);
             let host = app_handle.state::<RuntimeHost>();
             let terminal = app_handle.state::<terminal::TerminalCommandHost>();
             let native_shortcuts = app_handle.state::<native_shortcuts::NativeShortcutHost>();
+            #[cfg(windows)]
+            let native_drop = app_handle.state::<native_drop::NativeDropTargetHost>();
+            #[cfg(windows)]
+            let native_drop_shutdown_complete = native_drop.is_shutdown_complete();
+            #[cfg(not(windows))]
+            let native_drop_shutdown_complete = true;
             let preview = app_handle.state::<preview::PreviewCommandHost>();
             let attachments = app_handle.state::<Arc<attachments::AttachmentIngress>>();
+            let attachment_previews =
+                app_handle.state::<Arc<attachment_preview::AttachmentPreviewHost>>();
             let preview_empty = preview.manager().active_count().unwrap_or(usize::MAX) == 0;
             let workspace_watchers_empty = workspace::is_shutdown_complete();
             if !host.exit_ready()
                 || !terminal.is_empty()
                 // Registry 条目可以真实地延迟到 controller destroy；退出门禁只要求 callback 已撤销。
                 || !native_shortcuts.is_revoked_for_controller_close()
+                || !native_drop_shutdown_complete
                 || !preview_empty
                 || !workspace_watchers_empty
                 || !attachments.is_shutdown_complete()
+                || attachment_previews.cache_bytes().unwrap_or(usize::MAX) != 0
             {
                 host.record_forced_exit();
                 tracing::error!("runtime Exit reached before cleanup confirmation");
@@ -449,57 +698,60 @@ pub fn run() {
     });
 }
 
-/// 在签发不透明 token 前把原生物理坐标换算为 renderer CSS 坐标。
-/// issuer closure 只对受信任主窗口和有效有限坐标求值，防止辅助窗口或畸形事件消费 Drop capability。
-pub(crate) fn build_native_drop_notification<F>(
-    label: &str,
-    physical_x: f64,
-    physical_y: f64,
-    scale_factor: f64,
-    issue_token: F,
-) -> Result<Option<WorkspaceNativeDropEventDto>, workspace::WorkspaceError>
-where
-    F: FnOnce() -> Result<String, workspace::WorkspaceError>,
-{
-    if label != MAIN_WINDOW_LABEL
-        || !physical_x.is_finite()
-        || !physical_y.is_finite()
-        || !scale_factor.is_finite()
-        || scale_factor <= 0.0
-    {
-        return Ok(None);
-    }
-    let drop_token = issue_token()?;
-    Ok(Some(WorkspaceNativeDropEventDto {
-        drop_token,
-        x: physical_x / scale_factor,
-        y: physical_y / scale_factor,
-    }))
-}
-
-/// 接纳 OS Drop 时不向 WebView 转发源路径；接纳或投递失败只记录固定分类，
-/// 确保文件路径与不透明 token 都不会经诊断泄漏。
+/// 接纳 OS 四态拖放时不向 WebView 转发源路径；接纳或投递失败只记录固定分类，
+/// 确保文件路径与不透明 token 都不会经诊断泄漏，且只有 Drop 会创建可消费 token。
 fn handle_native_window_event<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     label: &str,
     event: &tauri::WindowEvent,
 ) {
-    let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event else {
+    let tauri::WindowEvent::DragDrop(drag_event) = event else {
         return;
     };
+    let _ = handle_native_drag_drop(app_handle, label, drag_event);
+}
+
+/// 统一接纳 Wry 和 Windows 晚创建渲染 HWND 的原生拖放事件；返回值只表示事件已成功
+/// 投影给 main renderer，供 `IDropTarget` 决定系统光标效果，不改变 token 的唯一签发边界。
+pub(crate) fn handle_native_drag_drop<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    label: &str,
+    drag_event: &tauri::DragDropEvent,
+) -> bool {
     if label != MAIN_WINDOW_LABEL {
-        return;
+        return false;
     }
+    let router = app_handle.state::<NativeDropRouter>();
     let Some(window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) else {
         tracing::warn!("native workspace drop ignored because the main window is unavailable");
-        return;
+        router.cancel_active();
+        return false;
     };
     let Ok(scale_factor) = window.scale_factor() else {
         tracing::warn!("native workspace drop ignored because window scale is unavailable");
-        return;
+        router.cancel_active();
+        return false;
     };
-    match build_native_drop_notification(label, position.x, position.y, scale_factor, || {
-        workspace::issue_native_drop(paths.iter().cloned())
+    handle_native_drag_drop_at_scale(app_handle, label, drag_event, scale_factor)
+}
+
+/// Windows 自有 `IDropTarget` 已在 OLE 回调内取得命中 HWND 的实时 DPI；该入口只消费
+/// 已验证比例，避免同步反查 Tauri event loop 导致 COM 重入失败。
+pub(crate) fn handle_native_drag_drop_at_scale<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    label: &str,
+    drag_event: &tauri::DragDropEvent,
+    scale_factor: f64,
+) -> bool {
+    if label != MAIN_WINDOW_LABEL {
+        return false;
+    }
+    let router = app_handle.state::<NativeDropRouter>();
+    match router.project(label, drag_event, scale_factor, || match drag_event {
+        tauri::DragDropEvent::Drop { paths, .. } => {
+            workspace::issue_native_drop(paths.iter().cloned())
+        }
+        _ => unreachable!("native drop token is issued only for the Drop phase"),
     }) {
         Ok(Some(payload)) => {
             if app_handle
@@ -507,10 +759,16 @@ fn handle_native_window_event<R: tauri::Runtime>(
                 .is_err()
             {
                 tracing::warn!("native workspace drop notification could not be delivered");
+                router.cancel_active();
+                return false;
             }
+            true
         }
-        Ok(None) => {}
-        Err(_) => tracing::warn!("native workspace drop was rejected"),
+        Ok(None) => false,
+        Err(_) => {
+            tracing::warn!("native workspace drop was rejected");
+            false
+        }
     }
 }
 
@@ -540,6 +798,7 @@ fn handle_full_exit_requested<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(20));
     let runtime = app_handle.state::<RuntimeHost>();
     let attachments = app_handle.state::<Arc<attachments::AttachmentIngress>>();
+    let attachment_previews = app_handle.state::<Arc<attachment_preview::AttachmentPreviewHost>>();
     let terminal = app_handle.state::<terminal::TerminalCommandHost>();
     let native_shortcuts = app_handle.state::<native_shortcuts::NativeShortcutHost>();
     let preview = app_handle.state::<preview::PreviewCommandHost>();
@@ -548,6 +807,15 @@ fn handle_full_exit_requested<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R
     let preview_result = preview.shutdown_until(app_handle, deadline);
     let workspace_watcher_result = workspace::shutdown_all_until(deadline);
     let attachment_result = attachments.shutdown();
+    let attachment_preview_result = attachment_previews.drain_server_sessions().map(|sessions| {
+        for session in sessions {
+            if let Ok(params) =
+                ja_runtime::app_server_process::AttachmentPreviewCloseParams::new(session.as_str())
+            {
+                let _ = runtime.attachment_preview_close(params);
+            }
+        }
+    });
     let runtime_result = cleanup_on_exit_until(&runtime, deadline);
     if !native_shortcut_result
         .as_ref()
@@ -557,6 +825,7 @@ fn handle_full_exit_requested<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R
         || !preview_result.as_ref().is_ok_and(|report| report.complete)
         || workspace_watcher_result.is_err()
         || attachment_result.is_err()
+        || attachment_preview_result.is_err()
         || runtime_result.is_err()
     {
         tracing::error!("application cleanup did not complete before exit deadline");
@@ -599,6 +868,8 @@ fn debug_or_bundled_launch_config(
         return app_runtime::LaunchConfig::debug_java(
             java.into(),
             jar.into(),
+            home_dir,
+            data_dir,
             run_dir,
             java_logs_dir,
         );

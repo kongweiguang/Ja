@@ -58,7 +58,6 @@ export function McpSection({
   onCloseMcp,
   onReplaceCredential,
   onClearCredential,
-  projectMode = false,
 }: {
   servers: McpServerProjection[];
   snapshotRevision?: number;
@@ -68,7 +67,6 @@ export function McpSection({
   onCloseMcp: SettingsPorts["onCloseMcp"];
   onReplaceCredential: SettingsPorts["onReplaceCredential"];
   onClearCredential: SettingsPorts["onClearCredential"];
-  projectMode?: boolean;
 }): ReactElement {
   const [feedback, setFeedback] = useState<string>();
   const [pending, setPending] = useState<string>();
@@ -128,75 +126,6 @@ export function McpSection({
     reset(EMPTY_MCP_DRAFT);
     setFeedback(undefined);
   }, [formState.isDirty, reset, snapshotRevision]);
-
-  /** 项目行只修改禁用集合；失败时保留权威开关值并显示可恢复的冲突文案。 */
-  const saveProjectOverride = async (
-    server: McpServerProjection,
-    enabled: boolean,
-  ): Promise<void> => {
-    setPending(server.id);
-    try {
-      await onSaveMcp({
-        mcpRevision: server.mcpRevision,
-        name: server.name,
-        transport: server.transport,
-        endpoint: server.endpoint,
-        args: [...server.args],
-        env: { ...server.env },
-        headers: { ...server.headers },
-        auth: { ...server.auth },
-        enabled,
-      });
-    } catch (error) {
-      toast.error(settingsMutationErrorMessage(error, `${server.name} 项目设置保存失败`));
-    } finally {
-      setPending(undefined);
-    }
-  };
-
-  /** 项目作用域只提交启停覆盖，连接、凭据、测试和删除仍归全局目录所有。 */
-  if (projectMode) {
-    return (
-      <div className="ja-settings-section">
-        <SectionHeader title="项目 MCP" />
-        <div className="ja-settings-group">
-          {servers
-            .filter((server) => server.globallyEnabled === true)
-            .map((server) => (
-              <div className="ja-settings-row" key={server.id}>
-                <div>
-                  <strong>{server.name}</strong>
-                  <span>{server.transport}</span>
-                </div>
-                <div className="ja-settings-project-actions">
-                  {server.projectOverridden ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={pending === server.id}
-                      onClick={() => void saveProjectOverride(server, true)}
-                    >
-                      恢复继承
-                    </Button>
-                  ) : null}
-                  <SwitchField
-                    id={`project-mcp-${server.id}`}
-                    label={server.enabled ? "继承全局" : "项目停用"}
-                    checked={server.enabled}
-                    disabled={pending === server.id}
-                    onCheckedChange={(enabled) => void saveProjectOverride(server, enabled)}
-                  />
-                </div>
-              </div>
-            ))}
-          {servers.every((server) => server.globallyEnabled !== true) ? (
-            <p className="ja-settings-empty">全局尚未启用 MCP Server。</p>
-          ) : null}
-        </div>
-      </div>
-    );
-  }
 
   /** 读取单个字段错误而不让表单耦合自定义校验层。 */
   const fieldError = (name: keyof McpServerDraft): string | undefined =>

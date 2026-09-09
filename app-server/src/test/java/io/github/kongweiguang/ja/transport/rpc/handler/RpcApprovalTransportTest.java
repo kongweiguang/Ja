@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.transport.rpc.handler;
 
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
+import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcException;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
 import io.github.kongweiguang.ja.transport.rpc.RpcServiceBindings;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
@@ -20,6 +21,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.port.in.ApprovalUseCase;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
@@ -46,6 +48,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.transport.rpc.runtime.RpcRuntimeTestAccess.markReady;
@@ -56,7 +59,7 @@ final class RpcApprovalTransportTest {
     private static final Instant NOW = Instant.parse("2026-08-25T12:00:00Z");
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
 
-    /** 提供 JA-RPC v2 Sidecar 边界要求的四个明确根目录。 */
+    /** 提供 JA-RPC v1 Sidecar 边界要求的四个明确根目录。 */
     private static SidecarConfiguration testConfiguration() {
         Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-approval-test")
                 .toAbsolutePath().normalize();
@@ -164,8 +167,7 @@ final class RpcApprovalTransportTest {
             ObjectNode params = mapper.createObjectNode()
                     .put("threadId", "thr_start")
                     .put("deadlineMs", 2_500);
-            params.putArray("content").addObject().put("type", "text").put("text", "第一段");
-            params.withArray("content").addObject().put("type", "text").put("text", "第二段");
+            params.putArray("content").addObject().put("type", "text").put("text", "第一段\n第二段");
 
             ObjectNode response = new TurnApprovalHandler(current)
                     .handle(new RpcCommand(RpcMethod.TURN_START, params))
@@ -198,6 +200,63 @@ final class RpcApprovalTransportTest {
     }
 
     /**
+     * 以 Composer 真窗使用的完整上下文顺序穿过 transport，锁定 Skill、文件、目录和正文的
+     * 判别联合形状；测试不读取 Workspace，也不把引用值展开为正文。
+     */
+    @Test
+    void turnStartAcceptsCanonicalComposerContextBlocks() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        StartServices services = new StartServices();
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(),
+                    TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+
+            ObjectNode params = mapper.createObjectNode().put("threadId", "thr_start");
+            var content = params.putArray("content");
+            content.addObject().put("type", "skill_reference").put("skillId", "skill_composer_context");
+            content.addObject().put("type", "workspace_reference").put("workspaceId", "ws_start")
+                    .put("relativePath", "sample.ts").put("kind", "file");
+            content.addObject().put("type", "workspace_reference").put("workspaceId", "ws_start")
+                    .put("relativePath", "folder-fixture").put("kind", "directory");
+            content.addObject().put("type", "text").put("text", "Composer 上下文首轮验收");
+            assertDoesNotThrow(() -> RpcUserContent.parse(mapper.createArrayNode()
+                    .add(content.get(0)).add(content.get(3))), "skill + text");
+            assertDoesNotThrow(() -> RpcUserContent.parse(mapper.createArrayNode()
+                    .add(content.get(1)).add(content.get(3))), "file + text");
+            assertDoesNotThrow(() -> RpcUserContent.parse(mapper.createArrayNode()
+                    .add(content.get(2)).add(content.get(3))), "directory + text");
+            var parsedContent = assertDoesNotThrow(() -> RpcUserContent.parse(content), "full canonical content");
+            assertDoesNotThrow(() -> new TurnStartRequest(
+                    "thr_start", "turn_context", "ws_start", services.workspaceRoot,
+                    parsedContent, "provider_start", "model_start", "medium",
+                    io.github.kongweiguang.ja.conversation.domain.permission.AccessMode.APPROVAL_REQUIRED,
+                    io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
+                    Duration.ofHours(24), 7, 0, NOW), "domain turn request");
+
+            new TurnApprovalHandler(current)
+                    .handle(new RpcCommand(RpcMethod.TURN_START, params))
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            TurnStartRequest request = ((CapturingTurns) services.turns).request.get();
+            assertEquals(List.of("skill_composer_context"), request.content().skillIds());
+            assertEquals(List.of("sample.ts", "folder-fixture"), request.content().workspaceReferences()
+                    .stream().map(reference -> reference.relativePath()).toList());
+            assertEquals("Composer 上下文首轮验收", request.input());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /**
      * 自动标题可在 transport 读取 Thread 后推进 revision；turn/start 没有客户端 CAS 参数，
      * 因而必须在首次无副作用 admission 冲突后重读最新偏好，而不是把内部竞态暴露为随机失败。
      */
@@ -207,10 +266,10 @@ final class RpcApprovalTransportTest {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         ThreadSummary first = new ThreadSummary(
                 "thr_start", "ws_start", "占位标题", preferences("provider_start", "model_start"),
-                ThreadSummary.Status.ACTIVE, 7, NOW.minusSeconds(60), NOW);
+                ThreadSummary.Status.ACTIVE, false, null, true, null, 7, NOW.minusSeconds(60), NOW);
         ThreadSummary refreshed = new ThreadSummary(
                 "thr_start", "ws_start", "自动标题", preferences("provider_latest", "model_latest"),
-                ThreadSummary.Status.ACTIVE, 8, NOW.minusSeconds(60), NOW);
+                ThreadSummary.Status.ACTIVE, false, null, true, null, 8, NOW.minusSeconds(60), NOW);
         RetryingTurns turns = new RetryingTurns();
         StartServices services = new StartServices(new SequencedStartThreads(first, refreshed), turns);
         StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
@@ -234,6 +293,183 @@ final class RpcApprovalTransportTest {
             assertEquals("provider_latest", turns.request.get().providerId());
             assertEquals("model_latest", turns.request.get().modelId());
             assertEquals(9, response.path("threadRevision").longValue());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /**
+     * turn/resume 只接收原 Turn identity 与 Thread CAS；工作区和通知关联必须从权威投影恢复，
+     * 不能要求 React 回传运行时快照或生成新的 Operation identity。
+     */
+    @Test
+    void turnResumeDelegatesOriginalIdentityAndAuthoritativeNotificationContext() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        StartServices services = new StartServices();
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode()
+                    .put("turnId", "turn_resume")
+                    .put("expectedThreadRevision", 7);
+
+            ObjectNode response = new TurnApprovalHandler(current)
+                    .handle(new RpcCommand(RpcMethod.TURN_RESUME, params))
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            CapturingTurns turns = (CapturingTurns) services.turns;
+            assertEquals("turn_resume", turns.resumedTurn.get());
+            assertEquals(7, turns.resumedRevision.get());
+            assertEquals("turn_resume", response.path("turnId").textValue());
+            assertEquals(8, response.path("threadRevision").longValue());
+            assertTrue(response.path("accepted").booleanValue());
+            assertTrue(response.path("queued").booleanValue());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /** Transport 预检发现 Turn/Thread revision 漂移时必须返回专用可重试顺序冲突，不能降级为通用 CONFLICT。 */
+    @Test
+    void turnResumePrecheckUsesStableOrderConflict() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        StartServices services = new StartServices(6);
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode()
+                    .put("turnId", "turn_resume")
+                    .put("expectedThreadRevision", 7);
+
+            JaRpcException failure = assertThrows(JaRpcException.class,
+                    () -> new TurnApprovalHandler(current)
+                            .handle(new RpcCommand(RpcMethod.TURN_RESUME, params)));
+
+            assertEquals("TURN_RESUME_ORDER_CONFLICT", failure.errorCode());
+            assertTrue(failure.retryable());
+            assertEquals(null, ((CapturingTurns) services.turns).resumedTurn.get());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /** Operation 在审批回执后推进一版游标时，取消必须权威重读并只重试一次。 */
+    @Test
+    void turnCancelRetriesSingleOperationCursorConflictAgainstFreshRevision() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        RetryingCancellationTurns turns = new RetryingCancellationTurns();
+        StartServices services = new StartServices(new CancellationThreads(12, "RUNNING", false), turns);
+        StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_cancel")
+                    .put("expectedThreadRevision", 11);
+
+            ObjectNode response = new TurnApprovalHandler(current)
+                    .handle(new RpcCommand(RpcMethod.TURN_CANCEL, params))
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            assertEquals(2, turns.attempts.get());
+            assertEquals(12, turns.latestExpected.get());
+            assertTrue(response.path("accepted").booleanValue());
+            assertEquals("cancelled", response.path("status").textValue());
+            assertEquals(13, response.path("threadRevision").longValue());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /** 多版陈旧 cancellation 不是 Operation 单步竞态，必须保留原始 CONFLICT 且不重放。 */
+    @Test
+    void turnCancelDoesNotRetryAcrossMultipleRevisionAdvances() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        RetryingCancellationTurns turns = new RetryingCancellationTurns();
+        StartServices services = new StartServices(new CancellationThreads(13, "RUNNING", false), turns);
+        StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_cancel")
+                    .put("expectedThreadRevision", 11);
+
+            TurnUseCase.TurnCancellationException conflict = assertThrows(
+                    TurnUseCase.TurnCancellationException.class,
+                    () -> new TurnApprovalHandler(current)
+                            .handle(new RpcCommand(RpcMethod.TURN_CANCEL, params)));
+
+            assertEquals(TurnUseCase.CancelFailure.CONFLICT, conflict.failure());
+            assertEquals(1, turns.attempts.get());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /** 已进入终态的 Turn 不得借单版 revision 分支重新触发 cancellation。 */
+    @Test
+    void turnCancelDoesNotRetryTerminalTurn() throws Exception {
+        assertCancellationConflictNotRetried(new CancellationThreads(12, "COMPLETED", false));
+    }
+
+    /** 已提交 cancel intent 的 Turn 由首次 claim 独占，后续请求不得以新 revision 重放。 */
+    @Test
+    void turnCancelDoesNotRetryCommittedCancellationIntent() throws Exception {
+        assertCancellationConflictNotRetried(new CancellationThreads(12, "RUNNING", true));
+    }
+
+    /** 复用完整 RPC 会话断言拒绝路径只调用一次 Turn 用例，避免仅对白盒 helper 做假验证。 */
+    private static void assertCancellationConflictNotRetried(ThreadUseCase threads) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        RetryingCancellationTurns turns = new RetryingCancellationTurns();
+        StartServices services = new StartServices(threads, turns);
+        StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_cancel")
+                    .put("expectedThreadRevision", 11);
+
+            TurnUseCase.TurnCancellationException conflict = assertThrows(
+                    TurnUseCase.TurnCancellationException.class,
+                    () -> new TurnApprovalHandler(current)
+                            .handle(new RpcCommand(RpcMethod.TURN_CANCEL, params)));
+
+            assertEquals(TurnUseCase.CancelFailure.CONFLICT, conflict.failure());
+            assertEquals(1, turns.attempts.get());
         } finally {
             if (session != null) session.close();
             writer.close();
@@ -282,14 +518,14 @@ final class RpcApprovalTransportTest {
             /** 审批响应夹具不运行自动标题竞争。 */
             @Override public boolean writeAutomaticTitle(String threadId, String title, long revision) { throw new UnsupportedOperationException(); }
             /** 审批响应夹具不允许归档 Thread。 */
-            @Override public void archiveThread(String threadId, long expectedThreadRevision) { throw new UnsupportedOperationException(); }
+            @Override public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) { throw new UnsupportedOperationException(); }
             /** 审批响应夹具不允许删除 Thread。 */
             @Override public void deleteThread(String threadId, long expectedThreadRevision) { throw new UnsupportedOperationException(); }
 
             /** 返回响应关联与 CAS 使用的唯一 waiting_approval 快照。 */
             @Override
             public Optional<TurnSummary> findTurn(String turnId) {
-                return Optional.of(new TurnSummary("thr_test", turnId, "waiting_approval", 3));
+                return Optional.of(new TurnSummary("thr_test", turnId, "waiting_approval", 3, false));
             }
         }
     }
@@ -303,13 +539,19 @@ final class RpcApprovalTransportTest {
         private final ThreadSummary thread = new ThreadSummary(
                 "thr_start", "ws_start", "启动测试",
                 preferences("provider_start", "model_start"),
-                ThreadSummary.Status.ACTIVE, 7, NOW.minusSeconds(60), NOW);
+                ThreadSummary.Status.ACTIVE, false, null, true, null, 7, NOW.minusSeconds(60), NOW);
         private final ThreadUseCase threads;
         private final TurnUseCase turns;
 
         /** 默认夹具保持单次固定快照和捕获型 Turn 端口。 */
         private StartServices() {
             this.threads = new StartThreads(thread);
+            this.turns = new CapturingTurns();
+        }
+
+        /** 构造 revision 漂移夹具，使 Resume 在调用 Turn 用例前由 transport 稳定拒绝。 */
+        private StartServices(long resumeTurnRevision) {
+            this.threads = new StartThreads(thread, resumeTurnRevision);
             this.turns = new CapturingTurns();
         }
 
@@ -361,10 +603,17 @@ final class RpcApprovalTransportTest {
     /** 仅发布 turn/start 所需的固定 Thread 快照。 */
     private static final class StartThreads implements ThreadUseCase {
         private final ThreadSummary thread;
+        private final long resumeTurnRevision;
 
         /** 固定 Thread 权威投影，避免测试从 Wire 参数推导 Profile 或工作区。 */
         private StartThreads(ThreadSummary thread) {
+            this(thread, thread.revision());
+        }
+
+        /** 允许恢复用例单独冻结 Turn revision，以验证双快照预检的一致错误映射。 */
+        private StartThreads(ThreadSummary thread, long resumeTurnRevision) {
             this.thread = thread;
+            this.resumeTurnRevision = resumeTurnRevision;
         }
 
         /** 未声明 Thread 创建能力。 */
@@ -376,7 +625,7 @@ final class RpcApprovalTransportTest {
         /** 返回启动请求引用的唯一 Thread 快照。 */
         @Override public Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
             return thread.threadId().equals(threadId)
-                    ? Optional.of(new ThreadSnapshot(thread, List.of(), List.of(), null, null)) : Optional.empty();
+                    ? Optional.of(new ThreadSnapshot(thread, List.of(), List.of(), null, null, null)) : Optional.empty();
         }
         /** 未声明 Thread 重命名能力。 */
         @Override public ThreadSummary renameThread(String threadId, String title, long revision) { throw unsupported(); }
@@ -385,16 +634,22 @@ final class RpcApprovalTransportTest {
         /** 未声明自动标题写入能力。 */
         @Override public boolean writeAutomaticTitle(String threadId, String title, long revision) { throw unsupported(); }
         /** 未声明 Thread 归档能力。 */
-        @Override public void archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
+        @Override public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
         /** 未声明 Thread 删除能力。 */
         @Override public void deleteThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
-        /** 未声明 Turn 查找能力。 */
-        @Override public Optional<TurnSummary> findTurn(String turnId) { throw unsupported(); }
+        /** 仅为恢复测试返回原 suspended Turn，其他身份继续失败关闭。 */
+        @Override public Optional<TurnSummary> findTurn(String turnId) {
+            return "turn_resume".equals(turnId)
+                    ? Optional.of(new TurnSummary(thread.threadId(), turnId, "suspended", resumeTurnRevision, false))
+                    : Optional.empty();
+        }
     }
 
     /** 捕获 transport 交付的纯启动意图，并返回不触发异步终态的接纳回执。 */
     private static final class CapturingTurns implements TurnUseCase {
         private final AtomicReference<TurnStartRequest> request = new AtomicReference<>();
+        private final AtomicReference<String> resumedTurn = new AtomicReference<>();
+        private final AtomicReference<Long> resumedRevision = new AtomicReference<>();
 
         /** 保存唯一启动请求；未完成 Future 使测试专注准入边界而非执行生命周期。 */
         @Override
@@ -402,6 +657,15 @@ final class RpcApprovalTransportTest {
             if (!this.request.compareAndSet(null, request)) throw unsupported();
             return new Accepted(request.threadId(), request.turnId(),
                     request.expectedThreadRevision() + 1, true, new CompletableFuture<>());
+        }
+
+        /** 捕获原 Turn identity 与 CAS，证明 transport 没有生成新 Operation 或传递配置快照。 */
+        @Override
+        public Accepted resume(String turnId, long expectedThreadRevision, TurnEventSink sink) {
+            if (!resumedTurn.compareAndSet(null, turnId)) throw unsupported();
+            resumedRevision.set(expectedThreadRevision);
+            return new Accepted("thr_start", turnId, expectedThreadRevision + 1,
+                    true, new CompletableFuture<>());
         }
 
         /** 未声明取消能力。 */
@@ -431,7 +695,7 @@ final class RpcApprovalTransportTest {
         /** 首次返回读后即过期的投影，重试返回自动标题提交后的最新投影。 */
         @Override public Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
             ThreadSummary selected = reads.getAndIncrement() == 0 ? first : refreshed;
-            return Optional.of(new ThreadSnapshot(selected, List.of(), List.of(), null, null));
+            return Optional.of(new ThreadSnapshot(selected, List.of(), List.of(), null, null, null));
         }
         /** 竞态夹具不创建 Thread。 */
         @Override public ThreadSummary createThread(ThreadSummary.Creation request) { throw unsupported(); }
@@ -446,11 +710,75 @@ final class RpcApprovalTransportTest {
         /** 竞态夹具不写自动标题。 */
         @Override public boolean writeAutomaticTitle(String threadId, String title, long revision) { throw unsupported(); }
         /** 竞态夹具不归档。 */
-        @Override public void archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
+        @Override public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
         /** 竞态夹具不删除。 */
         @Override public void deleteThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
         /** 竞态夹具不读取 Turn。 */
         @Override public Optional<TurnSummary> findTurn(String turnId) { throw unsupported(); }
+    }
+
+    /** 仅提供 cancellation 重试所需的最新 Turn revision，其他 Thread 能力全部失败关闭。 */
+    private static final class CancellationThreads implements ThreadUseCase {
+        private final long revision;
+        private final String status;
+        private final boolean cancellationRequested;
+
+        /** 固定权威 revision、状态与 cancel intent，使所有拒绝条件不依赖线程调度。 */
+        private CancellationThreads(long revision, String status, boolean cancellationRequested) {
+            this.revision = revision;
+            this.status = status;
+            this.cancellationRequested = cancellationRequested;
+        }
+
+        /** 返回唯一活动 Turn 的最新持久 revision。 */
+        @Override public Optional<TurnSummary> findTurn(String turnId) {
+            return Optional.of(new TurnSummary(
+                    "thr_cancel", turnId, status, revision, cancellationRequested));
+        }
+        /** 取消夹具不创建 Thread。 */
+        @Override public ThreadSummary createThread(ThreadSummary.Creation request) { throw unsupported(); }
+        /** 取消夹具不列出 Thread。 */
+        @Override public CursorPage<ThreadSummary> listThreads(String workspaceId, String cursor, int limit) { throw unsupported(); }
+        /** 取消夹具不搜索 Thread。 */
+        @Override public CursorPage<ThreadSummary> searchThreads(String workspaceId, String query, String cursor, int limit) { throw unsupported(); }
+        /** 取消夹具不读取完整 Thread。 */
+        @Override public Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) { throw unsupported(); }
+        /** 取消夹具不重命名 Thread。 */
+        @Override public ThreadSummary renameThread(String threadId, String title, long revision) { throw unsupported(); }
+        /** 取消夹具不更新偏好。 */
+        @Override public ThreadSummary updatePreferences(String threadId, io.github.kongweiguang.ja.conversation.domain.ThreadPreferences value, long revision) { throw unsupported(); }
+        /** 取消夹具不写自动标题。 */
+        @Override public boolean writeAutomaticTitle(String threadId, String title, long revision) { throw unsupported(); }
+        /** 取消夹具不归档 Thread。 */
+        @Override public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
+        /** 取消夹具不删除 Thread。 */
+        @Override public void deleteThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
+    }
+
+    /** 第一次模拟游标竞态冲突，第二次只接受权威重读后的 revision。 */
+    private static final class RetryingCancellationTurns implements TurnUseCase {
+        private final AtomicInteger attempts = new AtomicInteger();
+        private final AtomicReference<Long> latestExpected = new AtomicReference<>();
+
+        /** 取消测试不接纳新 Turn。 */
+        @Override public Accepted start(TurnStartRequest request, TurnEventSink sink) { throw unsupported(); }
+        /** 首次返回稳定冲突，重试时验证使用了最新 revision。 */
+        @Override public CancelResult cancel(String turnId, long expectedThreadRevision) {
+            latestExpected.set(expectedThreadRevision);
+            if (attempts.incrementAndGet() == 1) {
+                throw TurnCancellationException.of(CancelFailure.CONFLICT);
+            }
+            if (expectedThreadRevision != 12) throw unsupported();
+            return new CancelResult(true, turnId, TurnState.CANCELLED, 13);
+        }
+        /** 关闭测试会话时停止准入。 */
+        @Override public void stopAccepting() { }
+        /** 测试没有真实执行，立即静默。 */
+        @Override public boolean awaitQuiescence(Duration timeout) { return true; }
+        /** 测试端口无资源。 */
+        @Override public void closeAt(long shutdownDeadlineNanos) { }
+        /** 测试端口无资源。 */
+        @Override public void close() { }
     }
 
     /** 第一次 admission 以存储 CAS 冲突失败，第二次捕获重读后的完整请求。 */

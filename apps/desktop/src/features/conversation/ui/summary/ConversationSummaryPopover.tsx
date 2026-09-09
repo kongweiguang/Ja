@@ -7,6 +7,7 @@ import {
   Clock3,
   FileDiff,
   FolderOpen,
+  GitBranch,
   ListChecks,
   MessageSquare,
   Workflow,
@@ -28,6 +29,7 @@ export interface ConversationSummary {
   additions?: number;
   deletions?: number;
   scope?: string;
+  gitBranch?: string;
   model?: string;
   runtime?: string;
   turnCount: number;
@@ -137,6 +139,13 @@ export function ConversationSummaryPopover({
             label="范围"
             value={<span title={summary.scope}>{summary.scope ?? "当前对话"}</span>}
           />
+          {summary.gitBranch === undefined ? null : (
+            <SummaryRow
+              icon={<GitBranch />}
+              label="分支"
+              value={<span title={summary.gitBranch}>{summary.gitBranch}</span>}
+            />
+          )}
           {summary.model === undefined ? null : (
             <SummaryRow
               icon={<Bot />}

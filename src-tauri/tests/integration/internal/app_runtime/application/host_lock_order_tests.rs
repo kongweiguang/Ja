@@ -9,7 +9,7 @@ use crate::app_runtime::{
     HistoryRequest, HistoryResponse, ManualRecoveryConfirmation, RuntimeBridgePort,
     RuntimePlatformPort, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo,
     SettingsRequest, SettingsResponse, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnQueuedInput, TurnQueuedInputResult, TurnStartInput, WorkspaceDto, WorkspaceRuntimeSource,
+    TurnStartInput, WorkspaceDto, WorkspaceRuntimeSource,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -205,22 +205,6 @@ impl RuntimeBridgePort for LockOrderBridge {
         &self,
         _input: TurnCancelInput,
     ) -> Result<TurnCancelResult, RuntimeCommandError> {
-        Err(RuntimeCommandError::unavailable())
-    }
-
-    /// Steering 不属于此应用锁测试，保持 fail-closed。
-    fn turn_steer(
-        &self,
-        _input: TurnQueuedInput,
-    ) -> Result<TurnQueuedInputResult, RuntimeCommandError> {
-        Err(RuntimeCommandError::unavailable())
-    }
-
-    /// Follow-up 不属于此应用锁测试，保持 fail-closed。
-    fn turn_follow_up(
-        &self,
-        _input: TurnQueuedInput,
-    ) -> Result<TurnQueuedInputResult, RuntimeCommandError> {
         Err(RuntimeCommandError::unavailable())
     }
 

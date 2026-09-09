@@ -14,6 +14,13 @@ pub(crate) mod protocol;
 
 pub use client::{EventPump, Session, SessionEvent};
 pub use error::AppServerProcessError;
-pub use lifecycle::{LifecycleState, SidecarSupervisor};
+pub use lifecycle::{LifecycleState, SidecarSupervisor, TurnChangeSetReadLease};
 pub use process::SidecarConfig;
-pub use protocol::{CodecError, Limits, RpcFrame, valid_ready_token};
+pub use protocol::{
+    ATTACHMENT_PREVIEW_READ_MAX_BYTES, ATTACHMENT_PREVIEW_READ_MIN_BYTES,
+    AttachmentPreviewCloseParams, AttachmentPreviewCloseResult, AttachmentPreviewContractError,
+    AttachmentPreviewOpenParams, AttachmentPreviewOpenResult, AttachmentPreviewReadParams,
+    AttachmentPreviewReadResult, CodecError, Limits, RpcFrame, TURN_CHANGE_SET_MAX_BYTES,
+    TurnChangeSetContractError, TurnChangeSetReadParams, TurnChangeSetReadResult,
+    valid_protocol_timestamp, valid_ready_token,
+};

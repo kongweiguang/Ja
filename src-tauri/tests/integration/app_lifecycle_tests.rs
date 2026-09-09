@@ -1,5 +1,6 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
+// @author kongweiguang
 
 use super::app_runtime::{EventEmitError, EventSink, LaunchConfig, RuntimeHost};
 use super::attachments::AttachmentIngress;
@@ -88,26 +89,32 @@ fn full_exit_jar() -> PathBuf {
 }
 
 /// 为 MockRuntime 测试创建唯一的真实 Java sidecar 启动快照，生产环境仍只使用 bundle 资源。
-/// 运行目录必须位于夹具根目录下一层，使 `home`、`data`、`logs` 都保持单测试隔离。
+/// 四类目录显式来自同一夹具布局，使测试不会依赖 debug 构造器猜测目录关系。
 fn full_exit_fixture_config(run_dir: PathBuf) -> LaunchConfig {
     let java = full_exit_java();
     let jar = full_exit_jar();
+    let home_dir = run_dir.join("home");
+    let data_dir = run_dir.join("data");
     let sidecar_run_dir = run_dir.join("runtime");
     let java_logs_dir = run_dir.join("logs").join("java");
     fs::create_dir_all(&java_logs_dir).expect("debug Java log directory");
     #[cfg(debug_assertions)]
     {
-        LaunchConfig::debug_java(java, jar, sidecar_run_dir, java_logs_dir)
-            .expect("debug Java25 config")
+        LaunchConfig::debug_java(
+            java,
+            jar,
+            home_dir,
+            data_dir,
+            sidecar_run_dir,
+            java_logs_dir,
+        )
+        .expect("debug Java25 config")
     }
     #[cfg(not(debug_assertions))]
     {
         RuntimeHostHarness::launch_config(
             java,
-            vec![
-                OsString::from("-jar"),
-                jar.into_os_string(),
-            ],
+            vec![OsString::from("-jar"), jar.into_os_string()],
             sidecar_run_dir,
         )
     }
@@ -164,7 +171,17 @@ fn run_full_exit_mock(
     use tauri::RunEvent;
     use tauri::test::{mock_builder, mock_context, noop_assets};
 
+    // MockRuntime 与生产退出处理器必须托管同一附件预览 owner；空 host 只验证 cleanup/readiness，
+    // Runtime adapter 绑定同一 RuntimeHost，避免测试用第二套远端 session 生命周期。
+    let attachment_preview_host = Arc::new(
+        super::attachment_preview::AttachmentPreviewHost::new()
+            .expect("mock attachment preview host"),
+    );
+    let attachment_preview_runtime =
+        super::attachment_preview::AttachmentPreviewRuntimeState::new(Arc::new(host.clone()));
     let app = mock_builder()
+        .manage(attachment_preview_runtime)
+        .manage(attachment_preview_host)
         .manage(host)
         // MockRuntime 必须托管与生产 composition root 相同的退出 owner；否则生产退出
         // handler 读取 AttachmentIngress 时会 panic，并把真正的生命周期断言掩盖为断连。

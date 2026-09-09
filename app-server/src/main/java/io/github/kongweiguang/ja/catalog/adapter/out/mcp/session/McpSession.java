@@ -48,7 +48,7 @@ public interface McpSession extends AutoCloseable {
     }
 
     /**
-     * 用于创建冻结 Kernel ToolSpec 的 Provider 中性远端 Tool 元数据。
+     * 用于创建请求级 Kernel ToolSpec 的 Provider 中性远端 Tool 元数据。
      */
     record RemoteTool(String name, String description, JsonObject inputSchema) {
         /**

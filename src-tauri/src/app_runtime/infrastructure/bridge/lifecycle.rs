@@ -20,10 +20,10 @@ pub(super) struct EventDrainContext {
     pub(super) server_instance_id: String,
     pub(super) ready_token: String,
     pub(super) sink: EventSink,
-    pub(super) signal_sender: SyncSender<BridgeSignal>,
     pub(super) terminal_fault: Arc<TerminalFault>,
     pub(super) current_generation: Arc<AtomicU64>,
     pub(super) cancel_receiver: Receiver<()>,
+    pub(super) task_observations: Arc<TaskObservationRegistry>,
 }
 
 pub(super) struct EventDrainSpec {
@@ -33,10 +33,10 @@ pub(super) struct EventDrainSpec {
     pub(super) server_instance_id: String,
     pub(super) ready_token: String,
     pub(super) sink: EventSink,
-    pub(super) signal_sender: SyncSender<BridgeSignal>,
     pub(super) terminal_fault: Arc<TerminalFault>,
     pub(super) current_generation: Arc<AtomicU64>,
     pub(super) detached_event_generation: Arc<AtomicU64>,
+    pub(super) task_observations: Arc<TaskObservationRegistry>,
 }
 
 impl EventDrain {
@@ -266,13 +266,13 @@ pub(super) struct StartRuntimeContext<'a> {
     pub(super) runtime: &'a mut Option<RunningRuntime>,
     pub(super) pending_cleanup: &'a mut Option<SidecarSupervisor>,
     pub(super) next_generation: &'a mut u64,
-    pub(super) signal_sender: &'a SyncSender<BridgeSignal>,
     pub(super) terminal_fault: &'a Arc<TerminalFault>,
     pub(super) detached_event_generation: &'a Arc<AtomicU64>,
     pub(super) cleanup_fault: &'a Arc<CleanupFault>,
     pub(super) current_generation: &'a Arc<AtomicU64>,
     pub(super) exit_control: &'a Arc<ExitControl>,
     pub(super) runtime_control: &'a Arc<dyn RuntimeControlPort>,
+    pub(super) task_observations: &'a Arc<TaskObservationRegistry>,
 }
 
 /// 设计原因：该函数维护 generation 生命周期转换，启动失败与停止都必须留下可确认的 owner 状态。
@@ -287,13 +287,13 @@ pub(super) fn start_runtime(
         runtime,
         pending_cleanup,
         next_generation,
-        signal_sender,
         terminal_fault,
         detached_event_generation,
         cleanup_fault,
         current_generation,
         exit_control,
         runtime_control,
+        task_observations,
     } = context;
     if exit_control.is_cancelled() {
         return Err(RuntimeCommandError::shutdown_timeout());
@@ -396,10 +396,10 @@ pub(super) fn start_runtime(
         server_instance_id: server_instance_id.clone(),
         ready_token: ready_token.clone(),
         sink: sink.clone(),
-        signal_sender: signal_sender.clone(),
         terminal_fault: Arc::clone(terminal_fault),
         current_generation: Arc::clone(current_generation),
         detached_event_generation: Arc::clone(detached_event_generation),
+        task_observations: Arc::clone(task_observations),
     }) {
         Ok(event_drain) => event_drain,
         Err(error) => {

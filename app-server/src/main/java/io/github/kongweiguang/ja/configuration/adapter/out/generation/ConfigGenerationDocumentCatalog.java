@@ -14,7 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** 把严格 v4 文档投影为冻结 Provider/Model、Skill 与 MCP catalog。 */
+/** 把严格 v1 文档投影为冻结 Provider/Model、Skill 与 MCP catalog。 */
 final class ConfigGenerationDocumentCatalog {
     private final Map<String, ConfigGeneration.ProviderDefinition> providers;
     private final Map<String, ConfigGeneration.Skill> skillDefinitions;
@@ -30,7 +30,7 @@ final class ConfigGenerationDocumentCatalog {
         this.mcpDefinitions = Map.copyOf(mcpDefinitions);
     }
 
-    /** 从已通过 v4 Policy 的 effective 文档建立强类型 catalog。 */
+    /** 从已通过 v1 Policy 的 effective 文档建立强类型 catalog。 */
     static ConfigGenerationDocumentCatalog parse(ObjectNode root) {
         return new ConfigGenerationDocumentCatalog(parseProviders(root), parseSkills(root),
                 parseMcpServers(root));
@@ -54,8 +54,7 @@ final class ConfigGenerationDocumentCatalog {
     /** 逐个解析 Provider，并在同一 Provider 内保持模型配置顺序。 */
     private static Map<String, ConfigGeneration.ProviderDefinition> parseProviders(ObjectNode root) {
         Map<String, ConfigGeneration.ProviderDefinition> values = new LinkedHashMap<>();
-        JsonNode source = root.get("providers");
-        if (!(source instanceof ArrayNode array)) return Map.of();
+        ArrayNode array = requireArray(root, "providers");
         for (JsonNode value : array) {
             ConfigGeneration.ProviderDefinition provider = parseProvider((ObjectNode) value);
             if (values.putIfAbsent(provider.providerId(), provider) != null) {
@@ -67,14 +66,10 @@ final class ConfigGenerationDocumentCatalog {
 
     /** 把连接与 Agent 默认值保持在 Provider 层，Model 不复制 credential 或 URL。 */
     private static ConfigGeneration.ProviderDefinition parseProvider(ObjectNode object) {
-        ConfigGeneration.ProviderType providerType = switch (text(object, "provider", null)) {
-            case "openai" -> ConfigGeneration.ProviderType.OPENAI;
-            case "anthropic" -> ConfigGeneration.ProviderType.ANTHROPIC;
-            default -> throw new IllegalArgumentException("provider unsupported");
-        };
-        ConfigGeneration.Api api = switch (text(object, "api", null)) {
+        ConfigGeneration.Api api = switch (requiredText(object, "api")) {
             case "openai_responses" -> ConfigGeneration.Api.OPENAI_RESPONSES;
             case "anthropic_messages" -> ConfigGeneration.Api.ANTHROPIC_MESSAGES;
+            case "openai_chat_completions" -> ConfigGeneration.Api.OPENAI_CHAT_COMPLETIONS;
             default -> throw new IllegalArgumentException("API unsupported");
         };
         ObjectNode network = requireObject(object, "network_timeouts");
@@ -82,8 +77,8 @@ final class ConfigGenerationDocumentCatalog {
         ObjectNode context = requireObject(defaults, "context");
         ObjectNode limits = requireObject(defaults, "turn_limits");
         return new ConfigGeneration.ProviderDefinition(
-                text(object, "provider_id", null), text(object, "name", null), providerType, api,
-                URI.create(text(object, "base_url", null)), text(object, "credential_id", null),
+                requiredText(object, "provider_id"), requiredText(object, "name"), api,
+                URI.create(requiredText(object, "base_url")), requiredText(object, "credential_id"),
                 new ConfigGeneration.NetworkTimeoutConfig(
                         Duration.ofMillis(number(network, "connect_timeout_ms")),
                         Duration.ofMillis(number(network, "request_timeout_ms"))),
@@ -98,20 +93,19 @@ final class ConfigGenerationDocumentCatalog {
     /** 模型能力、输入模态与思考档位均从具体模型读取，不继承 Provider 全局开关。 */
     private static List<ConfigGeneration.ModelDefinition> parseModels(ObjectNode provider) {
         List<ConfigGeneration.ModelDefinition> values = new ArrayList<>();
-        JsonNode source = provider.get("models");
-        if (!(source instanceof ArrayNode array)) return List.of();
+        ArrayNode array = requireArray(provider, "models");
         for (JsonNode value : array) {
             ObjectNode object = (ObjectNode) value;
             ObjectNode capabilities = requireObject(object, "capabilities");
             ConfigGeneration.ModelDefinition model = new ConfigGeneration.ModelDefinition(
-                    text(object, "model_id", null), text(object, "name", null),
-                    text(object, "model", null),
+                    requiredText(object, "model_id"), requiredText(object, "name"),
+                    requiredText(object, "model"),
                     new ConfigGeneration.CapabilitiesConfig(
                             number(capabilities, "context_window_tokens"),
                             number(capabilities, "max_output_tokens"),
-                            nativeModalities(provider, text(object, "model", null))),
+                            nativeModalities(provider, requiredText(object, "model"))),
                     reasoningLevelMap(object.get("reasoning_level_map")),
-                    optionalReasoning(object.get("default_reasoning_level")));
+                    nullableReasoning(object, "default_reasoning_level"));
             if (values.stream().anyMatch(existing -> existing.modelId().equals(model.modelId()))) {
                 throw new IllegalArgumentException("duplicate model identity");
             }
@@ -125,7 +119,7 @@ final class ConfigGenerationDocumentCatalog {
      */
     private static List<ConfigGeneration.InputModality> nativeModalities(
             ObjectNode provider, String model) {
-        String api = text(provider, "api", null);
+        String api = requiredText(provider, "api");
         boolean openAiNative = "openai_responses".equals(api)
                                && (model.startsWith("gpt-4o") || model.startsWith("gpt-4.1")
                                    || model.startsWith("gpt-5"));
@@ -149,9 +143,11 @@ final class ConfigGenerationDocumentCatalog {
         return Map.copyOf(result);
     }
 
-    /** 缺失或显式 null 表示模型不设置默认档位，否则必须属于闭集。 */
-    private static ConfigGeneration.ReasoningLevel optionalReasoning(JsonNode value) {
-        return value == null || value.isNull() ? null : reasoning(value.textValue());
+    /** 必填字段可显式为 null；缺失字段不能再被解释为未设置。 */
+    private static ConfigGeneration.ReasoningLevel nullableReasoning(ObjectNode object, String key) {
+        JsonNode value = object.get(key);
+        if (value == null) throw new IllegalArgumentException("reasoning level is missing");
+        return value.isNull() ? null : reasoning(requiredText(object, key));
     }
 
     /** 只映射逻辑七档，不接受厂商私有别名。 */
@@ -171,14 +167,13 @@ final class ConfigGenerationDocumentCatalog {
     /** 解析 Skill catalog，严格文档保证所有字段类型已闭集校验。 */
     private static Map<String, ConfigGeneration.Skill> parseSkills(ObjectNode root) {
         Map<String, ConfigGeneration.Skill> values = new LinkedHashMap<>();
-        JsonNode source = root.get("skills");
-        if (!(source instanceof ArrayNode array)) return Map.of();
+        ArrayNode array = requireArray(root, "skills");
         for (JsonNode value : array) {
             ObjectNode object = (ObjectNode) value;
             ConfigGeneration.Skill skill = new ConfigGeneration.Skill(
-                    text(object, "skill_id", null), text(object, "name", null),
-                    text(object, "scope", "user"), object.path("enabled").asBoolean(true),
-                    text(object, "description", ""));
+                    requiredText(object, "skill_id"), requiredText(object, "name"),
+                    requiredText(object, "scope"), requiredBoolean(object, "enabled"),
+                    requiredString(object, "description"));
             values.put(skill.skillId(), skill);
         }
         return Map.copyOf(values);
@@ -187,14 +182,16 @@ final class ConfigGenerationDocumentCatalog {
     /** 解析 MCP catalog，凭据仍只保存 credential ID。 */
     private static Map<String, ConfigGeneration.McpServer> parseMcpServers(ObjectNode root) {
         Map<String, ConfigGeneration.McpServer> values = new LinkedHashMap<>();
-        JsonNode source = root.get("mcp_servers");
-        if (!(source instanceof ArrayNode array)) return Map.of();
+        ArrayNode array = requireArray(root, "mcp_servers");
         for (JsonNode value : array) {
             ObjectNode object = (ObjectNode) value;
-            ConfigGeneration.Transport transport = "stdio".equals(text(object, "transport", "stdio"))
-                    ? ConfigGeneration.Transport.STDIO : ConfigGeneration.Transport.STREAMABLE_HTTP;
-            ObjectNode authObject = object.get("auth") instanceof ObjectNode auth ? auth : null;
-            ConfigGeneration.AuthKind kind = switch (text(authObject, "kind", "none")) {
+            ConfigGeneration.Transport transport = switch (requiredText(object, "transport")) {
+                case "stdio" -> ConfigGeneration.Transport.STDIO;
+                case "streamable_http" -> ConfigGeneration.Transport.STREAMABLE_HTTP;
+                default -> throw new IllegalArgumentException("MCP transport unsupported");
+            };
+            ObjectNode authObject = requireObject(object, "auth");
+            ConfigGeneration.AuthKind kind = switch (requiredText(authObject, "kind")) {
                 case "none" -> ConfigGeneration.AuthKind.NONE;
                 case "env" -> ConfigGeneration.AuthKind.ENV;
                 case "bearer" -> ConfigGeneration.AuthKind.BEARER;
@@ -202,28 +199,44 @@ final class ConfigGenerationDocumentCatalog {
                 default -> throw new IllegalArgumentException("MCP auth unsupported");
             };
             ConfigGeneration.McpServer server = new ConfigGeneration.McpServer(
-                    text(object, "mcp_id", null), text(object, "name", null), transport,
-                    text(object, "endpoint", null), strings(object.get("args")),
-                    stringsMap(object.get("env")), stringsMap(object.get("headers")),
-                    new ConfigGeneration.Auth(kind, text(authObject, "name", null),
-                            text(authObject, "credential_id", null)),
-                    object.path("enabled").asBoolean(true));
+                    requiredText(object, "mcp_id"), requiredText(object, "name"), transport,
+                    requiredText(object, "endpoint"), requiredStrings(object, "args"),
+                    requiredStringsMap(object, "env"), requiredStringsMap(object, "headers"),
+                    new ConfigGeneration.Auth(kind,
+                            kind == ConfigGeneration.AuthKind.ENV || kind == ConfigGeneration.AuthKind.HEADER
+                                    ? requiredText(authObject, "name") : null,
+                            kind == ConfigGeneration.AuthKind.NONE
+                                    ? null : requiredText(authObject, "credential_id")),
+                    requiredBoolean(object, "enabled"));
             values.put(server.mcpId(), server);
         }
         return Map.copyOf(values);
     }
 
-    /** 只接受文本节点，缺失时使用调用点明确提供的 fallback。 */
-    private static String text(JsonNode object, String key, String fallback) {
+    /** 只接受显式文本字段，generation 不承担旧文档默认值或别名转换。 */
+    private static String requiredText(ObjectNode object, String key) {
+        String value = requiredString(object, key);
+        if (value.isBlank()) throw new IllegalArgumentException("text is blank");
+        return value;
+    }
+
+    /** description 允许空文本，但字段本身仍必须存在。 */
+    private static String requiredString(ObjectNode object, String key) {
         JsonNode value = object == null ? null : object.get(key);
-        return value == null || value.isNull() ? fallback : value.isTextual() ? value.textValue()
-                : ConfigGenerationValueRules.throwValue("text");
+        if (value == null || !value.isTextual()) return ConfigGenerationValueRules.throwValue("text");
+        return value.textValue();
     }
 
     /** 要求嵌套对象存在，严格解析不使用空对象降级。 */
     private static ObjectNode requireObject(ObjectNode object, String key) {
         if (object.get(key) instanceof ObjectNode value) return value;
         throw new IllegalArgumentException("object is missing");
+    }
+
+    /** 要求当前 v1 的集合字段显式存在，禁止缺失集合被投影为空目录。 */
+    private static ArrayNode requireArray(ObjectNode object, String key) {
+        if (object.get(key) instanceof ArrayNode value) return value;
+        throw new IllegalArgumentException("array is missing");
     }
 
     /** 只接受整数节点，避免浮点或文本在时间和配额边界中被截断。 */
@@ -249,20 +262,34 @@ final class ConfigGenerationDocumentCatalog {
         return value.booleanValue();
     }
 
-    /** 读取 MCP 参数字符串数组，缺失时返回空集合。 */
-    private static List<String> strings(JsonNode value) {
-        if (!(value instanceof ArrayNode array)) return List.of();
+    /** 读取显式 MCP 参数数组，缺失或错误类型直接失败关闭。 */
+    private static List<String> requiredStrings(ObjectNode object, String key) {
+        JsonNode value = object.get(key);
+        if (!(value instanceof ArrayNode array)) throw new IllegalArgumentException("string array is missing");
         List<String> result = new ArrayList<>();
-        for (JsonNode entry : array) result.add(entry.textValue());
+        for (JsonNode entry : array) {
+            if (!entry.isTextual()) throw new IllegalArgumentException("string array is invalid");
+            result.add(entry.textValue());
+        }
         return List.copyOf(result);
     }
 
-    /** 读取 MCP 文本 Map，拒绝对象外类型。 */
-    private static Map<String, String> stringsMap(JsonNode value) {
-        if (value == null) return Map.of();
+    /** 读取显式 MCP 文本 Map，缺失字段不能再被解释为空 Map。 */
+    private static Map<String, String> requiredStringsMap(ObjectNode source, String key) {
+        JsonNode value = source.get(key);
         if (!(value instanceof ObjectNode object)) throw new IllegalArgumentException("map expected");
         Map<String, String> result = new LinkedHashMap<>();
-        object.properties().forEach(entry -> result.put(entry.getKey(), entry.getValue().textValue()));
+        object.properties().forEach(entry -> {
+            if (!entry.getValue().isTextual()) throw new IllegalArgumentException("map value expected");
+            result.put(entry.getKey(), entry.getValue().textValue());
+        });
         return Map.copyOf(result);
+    }
+
+    /** 布尔字段必须显式存在，避免 JsonNode 默认 false 吞掉损坏配置。 */
+    private static boolean requiredBoolean(ObjectNode object, String key) {
+        JsonNode value = object.get(key);
+        if (value == null || !value.isBoolean()) throw new IllegalArgumentException("boolean expected");
+        return value.booleanValue();
     }
 }

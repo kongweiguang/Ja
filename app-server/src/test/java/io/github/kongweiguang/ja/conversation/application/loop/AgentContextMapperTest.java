@@ -130,8 +130,9 @@ final class AgentContextMapperTest {
     /** 构造带显式输入模态的冻结测试配置，不创建网络或凭据副作用。 */
     private static ModelPort.ModelConfiguration configuration(Set<ModelPort.InputModality> modalities) {
         return new ModelPort.ModelConfiguration("provider_test", "model_test", "cfg_test",
-                ModelPort.Provider.OPENAI, ModelPort.Api.OPENAI_RESPONSES, "test-model",
-                URI.create("http://127.0.0.1:60842"), "", Duration.ofSeconds(1), Duration.ofSeconds(1),
+                ModelPort.Api.OPENAI_RESPONSES, "test-model",
+                URI.create("http://127.0.0.1:60842"), "fixture-only-api-key",
+                Duration.ofSeconds(1), Duration.ofSeconds(1),
                 modalities, ModelPort.GenerationOptions.defaults());
     }
 

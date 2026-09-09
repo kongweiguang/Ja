@@ -1,11 +1,11 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Settings } from "@/features/settings/ui/Settings";
-import type { SettingsPorts } from "@/features/settings/application/ports";
+import type { SettingsDesktopPort, SettingsPorts } from "@/features/settings/application/ports";
 import type { SettingsSection, SettingsSnapshot } from "@/features/settings/domain/types";
 
 const SNAPSHOT: SettingsSnapshot = {
@@ -19,7 +19,6 @@ const SNAPSHOT: SettingsSnapshot = {
     {
       providerId: "provider_openai",
       name: "OpenAI",
-      provider: "openai",
       api: "openai_responses",
       baseUrl: "https://api.openai.com/v1",
       credentialId: "cred_openai",
@@ -58,14 +57,13 @@ const SNAPSHOT: SettingsSnapshot = {
   skills: [],
   mcpServers: [],
   defaultAccessMode: "full_access",
-  globalAccessMode: "full_access",
-  projectOverrides: {
-    defaultSelection: false,
-    accessMode: false,
-    disabledSkillIds: [],
-    disabledMcpIds: [],
+  appearance: {
+    theme: "system",
+    palette: "xcode",
+    reducedMotion: false,
+    reducedTransparency: false,
+    highContrast: false,
   },
-  appearance: { theme: "system", palette: "xcode", reducedMotion: false, highContrast: false },
 };
 
 afterEach(cleanup);
@@ -73,6 +71,7 @@ afterEach(cleanup);
 /** Settings 测试端口全部使用稳定 mock，未触发能力不会被假成功掩盖。 */
 function ports(overrides: Partial<SettingsPorts> = {}): SettingsPorts {
   return {
+    onCreateProvider: vi.fn(async () => undefined),
     onSaveProvider: vi.fn(async () => undefined),
     onDeleteProvider: vi.fn(async () => undefined),
     onMoveProvider: vi.fn(async () => undefined),
@@ -81,7 +80,6 @@ function ports(overrides: Partial<SettingsPorts> = {}): SettingsPorts {
     onDeleteModel: vi.fn(async () => undefined),
     onMoveModel: vi.fn(async () => undefined),
     onDefaultSelectionChange: vi.fn(async () => undefined),
-    onRestoreDefaultSelection: vi.fn(async () => undefined),
     onReplaceCredential: vi.fn(async () => undefined),
     onClearCredential: vi.fn(async () => undefined),
     onSaveMcp: vi.fn(async () => undefined),
@@ -91,8 +89,17 @@ function ports(overrides: Partial<SettingsPorts> = {}): SettingsPorts {
     onToggleSkill: vi.fn(async () => undefined),
     onAccessModeChange: vi.fn(async () => undefined),
     onAppearanceChange: vi.fn(async () => undefined),
-    onResetProject: vi.fn(async () => undefined),
     ...overrides,
+  };
+}
+
+/** 设置页桌面端口默认投影为无更新，避免 UI 单测触发真实插件或网络。 */
+function desktop(): SettingsDesktopPort {
+  return {
+    openExternalUrl: vi.fn(async () => undefined),
+    checkForUpdate: vi.fn(async () => ({ kind: "up-to-date" as const })),
+    installUpdate: vi.fn(async () => undefined),
+    relaunchAfterUpdate: vi.fn(async () => undefined),
   };
 }
 
@@ -106,13 +113,102 @@ function renderSettings(
     <Settings
       snapshot={snapshot}
       ports={settingsPorts}
+      desktop={desktop()}
       section={section}
       onSectionChange={vi.fn()}
     />,
   );
 }
 
-describe("Settings v4 UI", () => {
+describe("Settings v1 UI", () => {
+  /** 四个真实来源始终占据稳定位置，空目录不会让页面结构在刷新时跳动。 */
+  it("groups discovered Skills by built-in, user, Ja, and project source", async () => {
+    const onToggleSkill = vi.fn(async () => undefined);
+    renderSettings("skills", ports({ onToggleSkill }), {
+      ...SNAPSHOT,
+      skills: [
+        {
+          id: "skill_review",
+          name: "review",
+          source: "user",
+          description: "Review changes",
+          enabled: false,
+          status: "disabled",
+        },
+        {
+          id: "skill_ja_tools",
+          name: "ja-tools",
+          source: "ja",
+          description: "Ja tools",
+          enabled: true,
+          status: "ready",
+        },
+        {
+          id: "skill_project_rules",
+          name: "project-rules",
+          source: "project",
+          description: "Project rules",
+          enabled: true,
+          status: "ready",
+        },
+      ],
+    });
+
+    for (const heading of ["内置", "用户", "Ja", "项目"]) {
+      expect(screen.getByRole("heading", { name: heading })).toBeDefined();
+    }
+    expect(screen.getByText("随 Ja 提供")).toBeDefined();
+    expect(screen.getByText("~/.agents/skills")).toBeDefined();
+    expect(screen.getByText("~/.ja/skills")).toBeDefined();
+    expect(screen.getByText(".agents/skills")).toBeDefined();
+    expect(screen.getByText("暂无 Skills")).toBeDefined();
+
+    await userEvent.click(screen.getByRole("switch", { name: "已停用" }));
+    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("skill_review", true));
+  });
+
+  it("shows one return action without duplicate heading, scope, or conversation controls", async () => {
+    const user = userEvent.setup();
+    const onReturnToApp = vi.fn();
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        ports={ports()}
+        desktop={desktop()}
+        section="models"
+        onSectionChange={vi.fn()}
+        onReturnToApp={onReturnToApp}
+      />,
+    );
+
+    expect(screen.getAllByRole("button", { name: "返回应用" })).toHaveLength(1);
+    expect(screen.getByRole("textbox", { name: "搜索设置" })).toBeDefined();
+    expect(screen.getAllByRole("tab")).toHaveLength(6);
+    expect(screen.getByRole("tab", { name: "关于" })).toBeDefined();
+    expect(screen.queryByText("Ja 偏好设置")).toBeNull();
+    expect(screen.queryByRole("group", { name: "设置作用域" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "开始对话" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "返回应用" }));
+    expect(onReturnToApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the return action while initial model configuration is required", () => {
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        ports={ports()}
+        desktop={desktop()}
+        section="models"
+        onSectionChange={vi.fn()}
+        required
+        onReturnToApp={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "返回应用" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "开始对话" })).toBeNull();
+  });
+
   it("keeps Provider connection fields in a dialog while the main list stays compact", async () => {
     const user = userEvent.setup();
     renderSettings("models");
@@ -171,8 +267,6 @@ describe("Settings v4 UI", () => {
       enabled: false,
       status: "disabled" as const,
       tools: [],
-      globallyEnabled: false,
-      projectOverridden: false,
     };
     renderSettings("mcp", ports({ onSaveMcp, onTestMcp, onCloseMcp, onDeleteMcp }), {
       ...SNAPSHOT,
@@ -205,84 +299,6 @@ describe("Settings v4 UI", () => {
     await user.click(screen.getByRole("menuitem", { name: "删除" }));
     await user.click(screen.getByRole("button", { name: "删除" }));
     await waitFor(() => expect(onDeleteMcp).toHaveBeenCalledWith("mcp_local"));
-  });
-
-  it("restores project Skill and MCP inheritance without exposing global editors", async () => {
-    const user = userEvent.setup();
-    const onToggleSkill = vi.fn(async () => undefined);
-    const projectSnapshot: SettingsSnapshot = {
-      ...SNAPSHOT,
-      skills: [
-        {
-          id: "skill_review",
-          name: "Review",
-          source: "builtin",
-          description: "Review changes",
-          enabled: false,
-          status: "disabled",
-          globallyEnabled: true,
-          projectOverridden: true,
-        },
-      ],
-      mcpServers: [
-        {
-          id: "mcp_local",
-          mcpRevision: "mcp_local",
-          name: "Local Tools",
-          transport: "stdio",
-          endpoint: "pwsh.exe",
-          protocolVersion: "2025-06-18",
-          args: [],
-          env: {},
-          headers: {},
-          auth: { kind: "none" },
-          enabled: false,
-          status: "disabled",
-          tools: [],
-          globallyEnabled: true,
-          projectOverridden: true,
-        },
-      ],
-      projectOverrides: {
-        ...SNAPSHOT.projectOverrides,
-        disabledSkillIds: ["skill_review"],
-        disabledMcpIds: ["mcp_local"],
-      },
-    };
-    render(
-      <Settings
-        snapshot={projectSnapshot}
-        ports={ports({ onToggleSkill })}
-        section="skills"
-        onSectionChange={vi.fn()}
-        scope="project"
-        projectAvailable
-      />,
-    );
-    expect(screen.queryByRole("button", { name: "新增 Provider" })).toBeNull();
-    await user.click(screen.getByRole("button", { name: "恢复继承" }));
-    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("skill_review", true));
-
-    cleanup();
-    const onSaveMcp = vi.fn(async () => undefined);
-    render(
-      <Settings
-        snapshot={projectSnapshot}
-        ports={ports({ onSaveMcp })}
-        section="mcp"
-        onSectionChange={vi.fn()}
-        scope="project"
-        projectAvailable
-      />,
-    );
-    expect(screen.queryByRole("button", { name: "新增 Server" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "测试" })).toBeNull();
-    await user.click(screen.getByRole("button", { name: "恢复继承" }));
-    await waitFor(() =>
-      expect(onSaveMcp).toHaveBeenCalledWith(
-        expect.objectContaining({ mcpRevision: "mcp_local", enabled: true }),
-      ),
-    );
   });
 
   it("adds a model through the Provider-scoped model action", async () => {
@@ -321,6 +337,99 @@ describe("Settings v4 UI", () => {
     expect(screen.getByLabelText("服务商名称")).toHaveProperty("value", "OpenAI 项目草稿");
   });
 
+  it("edits the API specification without a separate provider-brand selector", async () => {
+    const user = userEvent.setup();
+    const onSaveProvider = vi.fn(async () => undefined);
+    renderSettings("models", ports({ onSaveProvider }));
+    await user.click(screen.getByRole("button", { name: "编辑" }));
+
+    expect(screen.queryByLabelText("服务商")).toBeNull();
+    await user.click(screen.getByLabelText("API 规范"));
+    await user.click(screen.getByRole("option", { name: "Anthropic Messages" }));
+    await user.click(screen.getByRole("button", { name: "保存 Provider" }));
+    await waitFor(() => expect(onSaveProvider).toHaveBeenCalledTimes(1));
+    expect(onSaveProvider).toHaveBeenCalledWith(
+      expect.objectContaining({ api: "anthropic_messages" }),
+    );
+  });
+
+  it("creates a custom DeepSeek supplier with its own credential and any API specification", async () => {
+    const user = userEvent.setup();
+    const onCreateProvider = vi.fn<SettingsPorts["onCreateProvider"]>(async (provider) => {
+      expect(provider.credentialId).toMatch(/^cred_/);
+    });
+    const onSaveProvider = vi.fn<SettingsPorts["onSaveProvider"]>(async () => undefined);
+    renderSettings("models", ports({ onCreateProvider, onSaveProvider }));
+    await user.click(screen.getByRole("button", { name: "新增 Provider" }));
+    const dialog = screen.getByRole("dialog", { name: "新增 Provider" });
+    const secretInput = within(dialog).getByLabelText("API key / token");
+    expect(secretInput.getAttribute("type")).toBe("password");
+    expect(secretInput.getAttribute("autocomplete")).toBe("new-password");
+    await user.type(screen.getByLabelText("服务商名称"), "DeepSeek");
+    await user.type(screen.getByLabelText("Base URL"), "https://api.deepseek.com");
+
+    await user.click(screen.getByLabelText("API 规范"));
+    expect(screen.getByRole("option", { name: "Anthropic Messages" })).toBeDefined();
+    expect(screen.getByRole("option", { name: "OpenAI Chat Completions" })).toBeDefined();
+    expect(screen.getByRole("option", { name: "OpenAI Responses" })).toBeDefined();
+    await user.click(screen.getByRole("option", { name: "OpenAI Chat Completions" }));
+    await user.type(screen.getByLabelText("首个模型名称"), "DeepSeek Chat");
+    await user.type(screen.getByLabelText("上游模型"), "deepseek-chat");
+    await user.type(secretInput, "deepseek-test-secret");
+    await user.click(screen.getByRole("button", { name: "保存 Provider" }));
+
+    await waitFor(() => expect(onCreateProvider).toHaveBeenCalledTimes(1));
+    expect(onCreateProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "DeepSeek",
+        api: "openai_chat_completions",
+        baseUrl: "https://api.deepseek.com",
+        credentialId: expect.stringMatching(/^cred_/),
+      }),
+      "deepseek-test-secret",
+    );
+    expect(onCreateProvider.mock.calls[0]![0].credentialId).not.toBe("cred_openai");
+    expect(onSaveProvider).not.toHaveBeenCalled();
+  });
+
+  it("keeps stable Provider and model identities when credential persistence is retried", async () => {
+    const user = userEvent.setup();
+    const failure = Object.assign(new Error("redacted"), {
+      code: "provider_saved_credential_failed",
+    });
+    const onCreateProvider = vi
+      .fn<SettingsPorts["onCreateProvider"]>()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValueOnce(undefined);
+    renderSettings("models", ports({ onCreateProvider }));
+    await user.click(screen.getByRole("button", { name: "新增 Provider" }));
+    const dialog = screen.getByRole("dialog", { name: "新增 Provider" });
+    await user.type(within(dialog).getByLabelText("服务商名称"), "DeepSeek");
+    await user.type(within(dialog).getByLabelText("Base URL"), "https://api.deepseek.com");
+    await user.type(within(dialog).getByLabelText("首个模型名称"), "DeepSeek Chat");
+    await user.type(within(dialog).getByLabelText("上游模型"), "deepseek-chat");
+    const secretInput = within(dialog).getByLabelText("API key / token");
+    await user.type(secretInput, "first-secret");
+    await user.click(within(dialog).getByRole("button", { name: "保存 Provider" }));
+
+    await waitFor(() => expect(onCreateProvider).toHaveBeenCalledTimes(1));
+    expect(secretInput).toHaveProperty("value", "");
+    expect(
+      within(dialog).getByText("Provider 已保存，但密钥保存失败，请重新输入后重试"),
+    ).toBeDefined();
+    const firstProvider = onCreateProvider.mock.calls[0]![0];
+    await user.type(secretInput, "second-secret");
+    await user.click(within(dialog).getByRole("button", { name: "保存 Provider" }));
+
+    await waitFor(() => expect(onCreateProvider).toHaveBeenCalledTimes(2));
+    expect(onCreateProvider.mock.calls[1]![0].providerId).toBe(firstProvider.providerId);
+    expect(onCreateProvider.mock.calls[1]![0].models[0]?.modelId).toBe(
+      firstProvider.models[0]?.modelId,
+    );
+    expect(onCreateProvider.mock.calls[1]![1]).toBe("second-secret");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "新增 Provider" })).toBeNull());
+  });
+
   it("edits the full reasoning map without exposing renderer-owned input modalities", async () => {
     const user = userEvent.setup();
     const onSaveModel = vi.fn(async () => undefined);
@@ -352,12 +461,105 @@ describe("Settings v4 UI", () => {
   it("uses the shared Select surface and preserves Field ARIA wiring", async () => {
     const user = userEvent.setup();
     renderSettings("appearance");
-    const themeSelect = screen.getByRole("combobox", { name: "主题" });
+    const themeSelect = screen.getByRole("combobox", { name: "外观模式" });
     expect(themeSelect.classList.contains("ja-select-trigger")).toBe(true);
     expect(themeSelect.getAttribute("aria-describedby")).toBe("appearance-theme-hint");
     await user.click(themeSelect);
     expect(document.querySelector(".ja-select-content") !== null).toBe(true);
     expect(document.querySelector(".ja-settings-select-content")).toBe(null);
+  });
+
+  it("offers four keyboard-selectable palettes with decorative color previews", async () => {
+    const user = userEvent.setup();
+    const onAppearanceChange = vi.fn(async () => undefined);
+    renderSettings("appearance", ports({ onAppearanceChange }));
+    const paletteSelect = screen.getByRole("combobox", { name: "配色主题" });
+    expect(paletteSelect.getAttribute("aria-describedby")).toBe("appearance-palette-hint");
+
+    await user.click(paletteSelect);
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Xcode",
+      "Fleet",
+      "Obsidian",
+      "Claude",
+    ]);
+    expect(document.querySelectorAll(".ja-settings-palette-swatch")).toHaveLength(15);
+
+    await user.keyboard("{ArrowDown}{Enter}");
+    await waitFor(() =>
+      expect(onAppearanceChange).toHaveBeenCalledWith(
+        expect.objectContaining({ palette: "fleet" }),
+        "palette",
+      ),
+    );
+    expect(document.activeElement).toBe(paletteSelect);
+  });
+
+  it("reports persistence failure without claiming the applied session theme was rolled back", async () => {
+    const user = userEvent.setup();
+    renderSettings(
+      "appearance",
+      ports({ onAppearanceChange: vi.fn(async () => Promise.reject(new Error("quota"))) }),
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "配色主题" }));
+    await user.click(screen.getByRole("option", { name: "Claude" }));
+
+    expect((await screen.findByRole("status")).textContent).toContain("已应用但未保存");
+    expect(screen.queryByText(/仍保留上一次设置/)).toBeNull();
+  });
+
+  it("identifies the changed appearance field so stale sibling values are not persisted", async () => {
+    const user = userEvent.setup();
+    const onAppearanceChange = vi.fn(async () => undefined);
+    renderSettings("appearance", ports({ onAppearanceChange }));
+
+    await user.click(screen.getByRole("combobox", { name: "外观模式" }));
+    await user.click(screen.getByRole("option", { name: "深色" }));
+    await waitFor(() =>
+      expect(onAppearanceChange).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ theme: "dark" }),
+        "theme",
+      ),
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "配色主题" }));
+    await user.click(screen.getByRole("option", { name: "Obsidian" }));
+    await waitFor(() =>
+      expect(onAppearanceChange).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ palette: "obsidian" }),
+        "palette",
+      ),
+    );
+
+    await user.click(screen.getByRole("switch", { name: "减少动效" }));
+    await waitFor(() =>
+      expect(onAppearanceChange).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({ reducedMotion: true }),
+        "reducedMotion",
+      ),
+    );
+
+    await user.click(screen.getByRole("switch", { name: "降低透明度" }));
+    await waitFor(() =>
+      expect(onAppearanceChange).toHaveBeenNthCalledWith(
+        4,
+        expect.objectContaining({ reducedTransparency: true }),
+        "reducedTransparency",
+      ),
+    );
+
+    await user.click(screen.getByRole("switch", { name: "提高对比度" }));
+    await waitFor(() =>
+      expect(onAppearanceChange).toHaveBeenNthCalledWith(
+        5,
+        expect.objectContaining({ highContrast: true }),
+        "highContrast",
+      ),
+    );
   });
 
   it("searches nested model names without indexing credential secrets", async () => {
@@ -375,6 +577,7 @@ describe("Settings v4 UI", () => {
       <Settings
         snapshot={SNAPSHOT}
         ports={ports()}
+        desktop={desktop()}
         section="models"
         onSectionChange={onSectionChange}
       />,
@@ -400,6 +603,7 @@ describe("Settings v4 UI", () => {
           appearance: { ...SNAPSHOT.appearance, reducedMotion: true },
         }}
         ports={ports()}
+        desktop={desktop()}
         section="models"
         onSectionChange={vi.fn()}
       />,
@@ -411,50 +615,5 @@ describe("Settings v4 UI", () => {
     await waitFor(() =>
       expect(scrollIntoView).toHaveBeenCalledWith({ block: "center", behavior: "auto" }),
     );
-  });
-
-  it("shows project inheritance recovery and disables permission expansion", async () => {
-    const restore = vi.fn(async () => undefined);
-    render(
-      <Settings
-        snapshot={{
-          ...SNAPSHOT,
-          defaultAccessMode: "approval_required",
-          globalAccessMode: "approval_required",
-          projectOverrides: {
-            ...SNAPSHOT.projectOverrides,
-            defaultSelection: true,
-            accessMode: true,
-          },
-        }}
-        ports={ports({ onRestoreDefaultSelection: restore })}
-        section="models"
-        onSectionChange={vi.fn()}
-        scope="project"
-        projectAvailable
-      />,
-    );
-
-    await userEvent.click(screen.getByRole("button", { name: "恢复继承" }));
-    await waitFor(() => expect(restore).toHaveBeenCalledTimes(1));
-
-    cleanup();
-    render(
-      <Settings
-        snapshot={{
-          ...SNAPSHOT,
-          defaultAccessMode: "approval_required",
-          globalAccessMode: "approval_required",
-          projectOverrides: { ...SNAPSHOT.projectOverrides, accessMode: true },
-        }}
-        ports={ports()}
-        section="permissions"
-        onSectionChange={vi.fn()}
-        scope="project"
-        projectAvailable
-      />,
-    );
-    expect(screen.getByRole("radio", { name: /全部执行/ })).toHaveProperty("disabled", true);
-    expect(screen.getByText(/不能扩大权限/)).toBeDefined();
   });
 });

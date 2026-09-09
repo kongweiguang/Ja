@@ -1,19 +1,32 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { TimelineContextUsage, TimelineTurnRuntimeSnapshot } from "./timelineTypes";
+import type { TimelineContextUsage } from "./timelineTypes";
 
 type ContextUsageTone = "neutral" | "warning" | "danger";
 type ContextUsageSource = "provider" | "compaction";
 
 /** Composer 只消费已经完成身份校验和阈值计算的展示模型，不接触事件或配置原始对象。 */
-export interface ContextUsagePresentation {
+export type ContextUsagePresentation =
+  | KnownContextUsagePresentation
+  | UnknownContextUsagePresentation;
+
+/** 精确 Provider/压缩计量可渲染百分比环。 */
+interface KnownContextUsagePresentation {
+  certainty: "known";
   usedTokens: number;
   limitTokens: number;
   percentage: number;
   ringPercentage: number;
   tone: ContextUsageTone;
   source: ContextUsageSource;
+  measuredAt: string;
+}
+
+/** 崩溃窗口只声明计量未知，不伪造百分比或 Token 数。 */
+interface UnknownContextUsagePresentation {
+  certainty: "unknown";
+  source: "provider";
   measuredAt: string;
 }
 
@@ -26,11 +39,7 @@ interface ContextUsageCompactionFact {
 
 export interface ResolveContextUsageInput {
   usage?: TimelineContextUsage;
-  runtime?: TimelineTurnRuntimeSnapshot;
   compaction?: ContextUsageCompactionFact;
-  providerId?: string;
-  modelId?: string;
-  contextWindowTokens?: number;
 }
 
 /** 将时间文本折算为可比较事实；不合法时间必须使候选失效，不能隐式回退为零。 */
@@ -47,30 +56,29 @@ function usageTone(percentage: number): ContextUsageTone {
 }
 
 /**
- * 解析当前模型可展示的真实上下文占用。Provider/Model 身份不一致、新 Thread、缺失 Usage 或
- * 非法窗口都会返回 undefined；压缩计量仅在更晚且完整时覆盖基准 inputTokens。
+ * 只按该请求已提交的画像计算上下文占用；非法窗口保持不可展示，绝不借当前偏好补造。
+ * 压缩计量仅在更晚且完整时覆盖基准 inputTokens。
  */
 export function resolveContextUsage(
   input: ResolveContextUsageInput,
 ): ContextUsagePresentation | undefined {
-  const { usage, runtime, compaction, providerId, modelId, contextWindowTokens } = input;
+  const { usage, compaction } = input;
+  const contextWindowTokens = usage?.profile.contextWindowTokens;
   if (
     usage === undefined ||
-    runtime === undefined ||
-    providerId === undefined ||
-    modelId === undefined ||
-    runtime.providerId !== providerId ||
-    runtime.modelId !== modelId ||
     !Number.isSafeInteger(contextWindowTokens) ||
     contextWindowTokens === undefined ||
     contextWindowTokens <= 0 ||
-    !Number.isSafeInteger(usage.inputTokens) ||
-    usage.inputTokens < 0
+    (usage.certainty === "known" &&
+      (!Number.isSafeInteger(usage.inputTokens) || usage.inputTokens < 0))
   )
     return undefined;
 
   const providerTimestamp = timestamp(usage.measuredAt);
   if (providerTimestamp === undefined) return undefined;
+  if (usage.certainty === "unknown") {
+    return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
+  }
   let usedTokens = usage.inputTokens;
   let measuredAt = usage.measuredAt;
   let source: ContextUsageSource = "provider";
@@ -91,6 +99,7 @@ export function resolveContextUsage(
   const rawPercentage = (usedTokens / contextWindowTokens) * 100;
   if (!Number.isFinite(rawPercentage)) return undefined;
   return {
+    certainty: "known",
     usedTokens,
     limitTokens: contextWindowTokens,
     percentage: Math.round(rawPercentage),

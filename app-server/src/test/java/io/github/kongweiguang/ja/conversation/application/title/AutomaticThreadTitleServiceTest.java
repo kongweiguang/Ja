@@ -13,7 +13,6 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.ThreadTitlePolicy;
-import io.github.kongweiguang.ja.conversation.domain.TurnRuntimeSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
@@ -46,9 +45,9 @@ final class AutomaticThreadTitleServiceTest {
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
     private static final ModelUsage USAGE = new ModelUsage(80, 5, 85);
 
-    /** 成功调用必须使用冻结模型、空 Tool 与低预算，并发布可确定刷新的元数据事件。 */
+    /** 成功调用必须使用 worker 发送前解析的最新模型、空 Tool 与低预算，并发布可确定刷新的元数据事件。 */
     @Test
-    void successfulTitleUsesFrozenModelAndPublishesMetadata() throws Exception {
+    void successfulTitleUsesLatestRequestModelAndPublishesMetadata() throws Exception {
         FakeThreads threads = new FakeThreads();
         threads.preferences = preferences("provider_current", "model_current", ThreadPreferences.TitleSource.PLACEHOLDER);
         FakeUsage usage = new FakeUsage(false);
@@ -340,22 +339,15 @@ final class AutomaticThreadTitleServiceTest {
 
     /** 首问允许为空以覆盖 attachment-only Turn，成功回复仍须保持真实内容。 */
     private static AutomaticThreadTitleScheduler.Request request(String userText, String assistantReply) {
-        TurnRuntimeSnapshot runtime = runtime();
         return new AutomaticThreadTitleScheduler.Request(
-                "thr_test", "turn_first", 5, userText, assistantReply, runtime, configuration());
-    }
-
-    /** 创建不含端点与凭据的持久运行快照。 */
-    private static TurnRuntimeSnapshot runtime() {
-        return new TurnRuntimeSnapshot("provider_frozen", "model_frozen", "openai", "openai_responses",
-                "upstream-frozen", "high", AccessMode.APPROVAL_REQUIRED, "cfg_frozen");
+                "thr_test", "turn_first", 5, userText, assistantReply,
+                timeout -> new AutomaticThreadTitleScheduler.RequestRuntime(configuration(), () -> { }));
     }
 
     /** 创建仍携带测试凭据的进程内冻结配置，断言服务不会改写身份或上游模型。 */
     private static ModelPort.ModelConfiguration configuration() {
         return new ModelPort.ModelConfiguration(
-                "provider_frozen", "model_frozen", "cfg_frozen", ModelPort.Provider.OPENAI,
-                ModelPort.Api.OPENAI_RESPONSES, "upstream-frozen", URI.create("http://127.0.0.1:60842"),
+                "provider_frozen", "model_frozen", "cfg_frozen", ModelPort.Api.OPENAI_RESPONSES, "upstream-frozen", URI.create("http://127.0.0.1:60842"),
                 "test-secret", Duration.ofSeconds(2), Duration.ofSeconds(2),
                 java.util.Set.of(ModelPort.InputModality.TEXT),
                 new ModelPort.GenerationOptions(0.8, 0.9, 2_000, "high"));
@@ -364,7 +356,8 @@ final class AutomaticThreadTitleServiceTest {
     /** 创建完整 Thread 偏好，标题来源可由竞争场景单独指定。 */
     private static ThreadPreferences preferences(String providerId, String modelId,
                                                  ThreadPreferences.TitleSource source) {
-        return new ThreadPreferences(providerId, modelId, "medium", AccessMode.APPROVAL_REQUIRED, source);
+        return new ThreadPreferences(providerId, modelId, "medium", AccessMode.APPROVAL_REQUIRED,
+                io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT, source);
     }
 
     /** 为不施加背压的测试事件提供已完成阶段。 */
@@ -394,15 +387,15 @@ final class AutomaticThreadTitleServiceTest {
         public synchronized Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
             if (!summary.threadId().equals(threadId)) return Optional.empty();
             ThreadSnapshot.Turn first = new ThreadSnapshot.Turn(
-                    "turn_first", "completed", runtime(), NOW.minusSeconds(2), NOW, NOW, null, null);
+                    "turn_first", "completed", NOW.minusSeconds(2), NOW, NOW, null, null);
             List<ThreadSnapshot.Turn> turns = new ArrayList<>();
             turns.add(first);
             if (laterTurnPresent) {
                 turns.add(new ThreadSnapshot.Turn(
-                        "turn_later", "completed", runtime(), NOW.plusSeconds(1), NOW.plusSeconds(2),
+                        "turn_later", "completed", NOW.plusSeconds(1), NOW.plusSeconds(2),
                         NOW.plusSeconds(2), null, null));
             }
-            return Optional.of(new ThreadSnapshot(summary, turns, List.of(), null, null));
+            return Optional.of(new ThreadSnapshot(summary, turns, List.of(), null, null, null));
         }
 
         /** 人工标题推进 revision 并永久切换 manual 所有权。 */
@@ -435,7 +428,7 @@ final class AutomaticThreadTitleServiceTest {
         }
 
         /** 测试不归档 Thread。 */
-        @Override public void archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
+        @Override public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
         /** 测试不删除 Thread。 */
         @Override public void deleteThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
         /** 测试不按全局身份查找 Turn。 */
@@ -444,7 +437,7 @@ final class AutomaticThreadTitleServiceTest {
         /** 创建保持固定 Workspace 和时间的 Thread 投影，只改变标题、偏好与 revision。 */
         private static ThreadSummary summary(String title, ThreadPreferences value, long revision) {
             return new ThreadSummary("thr_test", "ws_test", title, value,
-                    ThreadSummary.Status.ACTIVE, revision, NOW.minusSeconds(60), NOW);
+                    ThreadSummary.Status.ACTIVE, false, null, true, null, revision, NOW.minusSeconds(60), NOW);
         }
     }
 

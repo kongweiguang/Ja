@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import {
+  Bot,
   Check,
   FileDiff,
   Files,
   Globe,
-  ListFilter,
   MessageCircle,
+  ListChecks,
   Plus,
   Terminal,
   X,
@@ -18,6 +19,8 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent,
+  type MouseEvent,
   type PointerEvent,
   type ReactElement,
   type ReactNode,
@@ -33,7 +36,14 @@ import {
   MenuSeparator,
   MenuTrigger,
 } from "@/shared/ui/primitives";
-import type { WorkbenchCapabilityTab, WorkbenchTab } from "../domain/tabs";
+import type {
+  WorkbenchCapability,
+  WorkbenchCapabilityTab,
+  WorkbenchTab,
+  WorkbenchTaskTab,
+} from "../domain/tabs";
+import { capabilityWorkbenchTab } from "../domain/tabs";
+import { WorkbenchTabContextMenu } from "./WorkbenchTabContextMenu";
 import "../Workbench.css";
 
 export interface WorkbenchProps {
@@ -41,22 +51,38 @@ export interface WorkbenchProps {
   openTabs: readonly WorkbenchTab[];
   onTabChange: (tab: WorkbenchTab) => void;
   onOpenTabsChange: (tabs: readonly WorkbenchTab[]) => void;
-  views: Partial<Record<Exclude<WorkbenchCapabilityTab, "new">, ReactNode>>;
-  capabilityShortcuts?: Partial<Record<WorkbenchTab, string>>;
+  views: Partial<Record<Exclude<WorkbenchCapability, "new">, ReactNode>>;
+  renderTaskView?: (tab: WorkbenchTaskTab) => ReactNode;
+  onCreateSideTask?: () => WorkbenchTaskTab | undefined;
+  capabilityShortcuts?: Partial<Record<WorkbenchCapability, string>>;
   conversationShortcut?: string;
   onClose?: () => void;
   onFocusConversation?: () => void;
-  onTabClose?: (tab: WorkbenchCapabilityTab) => void | Promise<void>;
+  onTabClose?: (tab: WorkbenchTab) => void | Promise<void>;
+  onTaskTabRename?: (tab: WorkbenchTaskTab, label: string) => Promise<void>;
+  onTabContextMenuOpenChange?: (open: boolean) => void;
+}
+
+interface TaskTabRenameSession {
+  readonly tabKey: string;
+  readonly value: string;
+  readonly failed: boolean;
+}
+
+interface TabContextMenuSession {
+  readonly tabKey: string;
+  readonly x: number;
+  readonly y: number;
 }
 
 interface TabDefinition {
-  value: WorkbenchCapabilityTab;
+  value: WorkbenchCapability;
   label: string;
   Icon: typeof Files;
 }
 
 interface CapabilityMenuDefinition {
-  value: WorkbenchTab;
+  value: WorkbenchCapability;
   label: string;
   Icon: typeof Files;
 }
@@ -66,10 +92,12 @@ const TAB_DEFINITIONS: readonly TabDefinition[] = [
   { value: "files", label: "文件", Icon: Files },
   { value: "terminal", label: "终端", Icon: Terminal },
   { value: "preview", label: "浏览器", Icon: Globe },
+  { value: "agents", label: "子智能体", Icon: Bot },
+  { value: "plan", label: "计划", Icon: ListChecks },
   { value: "new", label: "新标签页", Icon: Plus },
 ];
 
-const DEFAULT_SHORTCUTS: Partial<Record<WorkbenchCapabilityTab, string>> = {
+const DEFAULT_SHORTCUTS: Partial<Record<WorkbenchCapability, string>> = {
   review: "Ctrl+Shift+G",
   terminal: "Ctrl+`",
   preview: "Ctrl+T",
@@ -85,21 +113,25 @@ function availableTabDefinitions(views: WorkbenchProps["views"]): TabDefinition[
 function normalizeOpenTabs(
   tabs: readonly WorkbenchTab[],
   definitions: readonly TabDefinition[],
-): WorkbenchCapabilityTab[] {
+): WorkbenchTab[] {
   const available = new Set(definitions.map(({ value }) => value));
-  const normalized: WorkbenchCapabilityTab[] = [];
+  const normalized: WorkbenchTab[] = [];
+  const keys = new Set<string>();
   for (const tab of tabs) {
-    if (available.has(tab) && !normalized.includes(tab)) normalized.push(tab);
+    if (keys.has(tab.key)) continue;
+    if (tab.kind === "task" || available.has(tab.capability)) {
+      normalized.push(tab);
+      keys.add(tab.key);
+    }
   }
   return normalized;
 }
 
-/** 使用稳定能力名称，避免文件或 URL 变化反向污染 Shell 的 Tab 身份。 */
-function tabDisplayLabel(
-  tab: WorkbenchCapabilityTab,
-  definitions: readonly TabDefinition[],
-): string {
-  return definitions.find(({ value }) => value === tab)?.label ?? tab;
+/** 标签来自受控描述符；文件路径、URL 或任务摘要正文都不会成为稳定 key。 */
+function tabDisplayLabel(tab: WorkbenchTab, definitions: readonly TabDefinition[]): string {
+  return tab.kind === "task"
+    ? tab.label
+    : (definitions.find(({ value }) => value === tab.capability)?.label ?? tab.label);
 }
 
 /** 识别跨 realm Promise，使原生资源关闭 ACK 可以形成可拒绝事务。 */
@@ -108,10 +140,7 @@ function isPromiseLike(value: void | Promise<void>): value is Promise<void> {
 }
 
 /** 关闭错误只包含稳定能力名称，不能把原生路径或诊断信息带入界面。 */
-function tabCloseErrorMessage(
-  tab: WorkbenchCapabilityTab,
-  definitions: readonly TabDefinition[],
-): string {
+function tabCloseErrorMessage(tab: WorkbenchTab, definitions: readonly TabDefinition[]): string {
   return `${tabDisplayLabel(tab, definitions)}关闭失败，请重试。`;
 }
 
@@ -125,31 +154,50 @@ export function Workbench({
   onTabChange,
   onOpenTabsChange,
   views,
+  renderTaskView,
+  onCreateSideTask,
   capabilityShortcuts,
   conversationShortcut,
   onClose,
   onFocusConversation,
   onTabClose,
+  onTaskTabRename,
+  onTabContextMenuOpenChange,
 }: WorkbenchProps): ReactElement {
   const definitions = availableTabDefinitions(views);
   const openTabs = normalizeOpenTabs(controlledOpenTabs, definitions);
-  const activeTab = openTabs.includes(selectedTab) ? selectedTab : openTabs[0];
-  const openTabsKey = openTabs.join("\u0000");
-  const [draggingTab, setDraggingTab] = useState<WorkbenchCapabilityTab>();
-  const [dropTarget, setDropTarget] = useState<WorkbenchCapabilityTab>();
-  const [closingTab, setClosingTab] = useState<WorkbenchCapabilityTab>();
-  const [closeError, setCloseError] = useState<{ tab: WorkbenchCapabilityTab; message: string }>();
-  const dragRef = useRef<
-    | { tab: WorkbenchCapabilityTab; pointerId: number; dropTarget: WorkbenchCapabilityTab }
-    | undefined
-  >(undefined);
+  const activeTab = openTabs.find((tab) => tab.key === selectedTab.key) ?? openTabs[0];
+  const openTabsKey = openTabs.map((tab) => tab.key).join("\u0000");
+  const [draggingTab, setDraggingTab] = useState<string>();
+  const [dropTarget, setDropTarget] = useState<string>();
+  const [closingTab, setClosingTab] = useState<string>();
+  const [closingSequence, setClosingSequence] = useState(false);
+  const [closeError, setCloseError] = useState<{ tab: WorkbenchTab; message: string }>();
+  const [taskTabRename, setTaskTabRename] = useState<TaskTabRenameSession>();
+  const taskTabRenameKey = taskTabRename?.tabKey;
+  const [renamingTaskTab, setRenamingTaskTab] = useState<string>();
+  const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuSession>();
+  const dragRef = useRef<{ tabKey: string; pointerId: number; dropTargetKey: string } | undefined>(
+    undefined,
+  );
   const finishTabDragRef = useRef<(pointerId: number) => void>(() => undefined);
-  const closingTabRef = useRef<WorkbenchCapabilityTab | undefined>(undefined);
+  const closingTabRef = useRef<string | undefined>(undefined);
+  const closingSequenceRef = useRef(false);
+  const tabContextMenuTriggerRef = useRef<HTMLButtonElement | undefined>(undefined);
+  const contextMenuOpenRef = useRef(false);
+  const mountedRef = useRef(false);
+  const contextMenuOpenChangeRef = useRef(onTabContextMenuOpenChange);
+  const onTabCloseRef = useRef(onTabClose);
   const openTabsRef = useRef(openTabs);
-  const activeTabRef = useRef<WorkbenchCapabilityTab | undefined>(activeTab);
+  const activeTabRef = useRef<WorkbenchTab | undefined>(activeTab);
   const openTabsKeyRef = useRef<string | undefined>(undefined);
   const workbenchRef = useRef<HTMLDivElement>(null);
-  const pendingFocusTabRef = useRef<WorkbenchCapabilityTab | undefined>(undefined);
+  const pendingFocusTabRef = useRef<string | undefined>(undefined);
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const renameSubmittingRef = useRef<string | undefined>(undefined);
+  const renameComposingRef = useRef(false);
+  contextMenuOpenChangeRef.current = onTabContextMenuOpenChange;
+  onTabCloseRef.current = onTabClose;
 
   /** 清理纯指针排序状态，不提交任何 Tab 变化。 */
   const clearTabDrag = useCallback((): void => {
@@ -159,23 +207,25 @@ export function Workbench({
   }, []);
 
   /** 基于最后一次已提交投影排序，避免 window pointerup 使用过期 render。 */
-  const reorderTabs = (from: WorkbenchCapabilityTab, to: WorkbenchCapabilityTab): void => {
-    if (from === to) return;
+  const reorderTabs = (fromKey: string, toKey: string): void => {
+    if (fromKey === toKey) return;
     const nextTabs = [...openTabsRef.current];
-    const fromIndex = nextTabs.indexOf(from);
-    const toIndex = nextTabs.indexOf(to);
+    const fromIndex = nextTabs.findIndex((tab) => tab.key === fromKey);
+    const toIndex = nextTabs.findIndex((tab) => tab.key === toKey);
     if (fromIndex < 0 || toIndex < 0) return;
+    const moved = nextTabs[fromIndex];
+    if (moved === undefined) return;
     nextTabs.splice(fromIndex, 1);
-    nextTabs.splice(toIndex, 0, from);
+    nextTabs.splice(toIndex, 0, moved);
     onOpenTabsChange(nextTabs);
   };
 
   /** 一次 pointer transaction 最多提交一次排序，随后立即释放临时状态。 */
-  const finishTabDrag = (pointerId: number, releaseTarget?: WorkbenchCapabilityTab): void => {
+  const finishTabDrag = (pointerId: number, releaseTargetKey?: string): void => {
     const drag = dragRef.current;
     if (drag === undefined || drag.pointerId !== pointerId) return;
-    const target = releaseTarget ?? drag.dropTarget;
-    if (target !== drag.tab) reorderTabs(drag.tab, target);
+    const targetKey = releaseTargetKey ?? drag.dropTargetKey;
+    if (targetKey !== drag.tabKey) reorderTabs(drag.tabKey, targetKey);
     clearTabDrag();
   };
 
@@ -198,6 +248,40 @@ export function Workbench({
     };
   }, [clearTabDrag]);
 
+  /** 卸载会使正在等待的关闭 ACK 失效，避免旧 Workspace 继续提交偏好或释放后续资源。 */
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /** 真窗在 DOM 菜单显示前先隐藏原生 child WebView，关闭后再恢复当前 Preview。 */
+  useLayoutEffect(() => {
+    const open = tabContextMenu !== undefined;
+    if (contextMenuOpenRef.current === open) return;
+    contextMenuOpenRef.current = open;
+    contextMenuOpenChangeRef.current?.(open);
+  }, [tabContextMenu]);
+
+  /** 非正常卸载同样发出关闭通知，避免原生 Preview 永久停留在隐藏态。 */
+  useEffect(
+    () => () => {
+      if (contextMenuOpenRef.current) contextMenuOpenChangeRef.current?.(false);
+    },
+    [],
+  );
+
+  /** 外部受控投影移除菜单目标时同步关闭悬空菜单。 */
+  useEffect(() => {
+    if (
+      tabContextMenu !== undefined &&
+      !openTabs.some((tab) => tab.key === tabContextMenu.tabKey)
+    ) {
+      setTabContextMenu(undefined);
+    }
+  }, [openTabs, tabContextMenu]);
+
   useLayoutEffect(() => {
     const changed = activeTabRef.current !== activeTab || openTabsKeyRef.current !== openTabsKey;
     openTabsRef.current = openTabs;
@@ -205,12 +289,12 @@ export function Workbench({
     openTabsKeyRef.current = openTabsKey;
     if (changed && activeTab !== undefined) {
       workbenchRef.current
-        ?.querySelector<HTMLButtonElement>(`[data-workbench-tab="${activeTab}"]`)
+        ?.querySelector<HTMLButtonElement>(`[data-workbench-tab="${activeTab.key}"]`)
         ?.closest<HTMLElement>(".ja-workbench-tab-shell")
         ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
     }
     const pendingFocus = pendingFocusTabRef.current;
-    if (pendingFocus !== undefined && openTabs.includes(pendingFocus)) {
+    if (pendingFocus !== undefined && openTabs.some((tab) => tab.key === pendingFocus)) {
       const target = workbenchRef.current?.querySelector<HTMLButtonElement>(
         `[data-workbench-tab="${pendingFocus}"]`,
       );
@@ -219,76 +303,273 @@ export function Workbench({
         target.focus();
       }
     }
-  }, [activeTab, openTabs, openTabsKey]);
+  }, [activeTab, openTabs, openTabsKey, taskTabRename]);
 
-  /** 打开动作只提交受控意图；真实 feature 初始化仍由 composition root 决定。 */
-  const addTab = (tab: WorkbenchCapabilityTab): void => {
-    if (!openTabs.includes(tab)) onOpenTabsChange([...openTabs, tab]);
+  useLayoutEffect(() => {
+    if (taskTabRenameKey === undefined) return;
+    renameInputRef.current?.focus();
+    renameInputRef.current?.select();
+  }, [taskTabRenameKey]);
+
+  /** 只允许侧边任务进入原位命名；选择与编辑共用同一稳定 Tab identity。 */
+  const beginTaskTabRename = (tab: WorkbenchTaskTab): void => {
+    if (
+      tab.taskKind !== "side_task" ||
+      onTaskTabRename === undefined ||
+      renamingTaskTab !== undefined
+    )
+      return;
     onTabChange(tab);
+    renameComposingRef.current = false;
+    setTaskTabRename({ tabKey: tab.key, value: tab.label, failed: false });
   };
 
-  /** 资源释放成功后再提交关闭，活动 Tab 切换先于列表写入以避免归一化回插。 */
-  const commitTabClose = (tab: WorkbenchCapabilityTab): void => {
-    const currentTabs = openTabsRef.current;
-    const index = currentTabs.indexOf(tab);
-    if (index < 0) return;
-    const nextTabs = currentTabs.filter((openTab) => openTab !== tab);
-    if (activeTabRef.current === tab && nextTabs.length > 0) {
-      const nextActive = nextTabs[Math.min(index, nextTabs.length - 1)];
-      if (nextActive !== undefined) {
-        pendingFocusTabRef.current = nextActive;
-        onTabChange(nextActive);
-      }
-    }
-    onOpenTabsChange(nextTabs);
-    setCloseError((current) => (current?.tab === tab ? undefined : current));
-    if (nextTabs.length === 0) onClose?.();
-  };
-
-  /** 异步 teardown 是关闭事务的 ACK；拒绝时保留 Tab 并只提供同一动作重试。 */
-  const closeTab = (tab: WorkbenchCapabilityTab): void => {
-    if (closingTabRef.current !== undefined || !openTabsRef.current.includes(tab)) return;
-    setCloseError((current) => (current?.tab === tab ? undefined : current));
-    let teardown: void | Promise<void>;
-    try {
-      teardown = onTabClose?.(tab);
-    } catch {
-      setCloseError({ tab, message: tabCloseErrorMessage(tab, definitions) });
+  /** Enter 与 blur 共用 single-flight 提交；失败保留输入供重试，空值或未变化只退出编辑。 */
+  const submitTaskTabRename = (tab: WorkbenchTaskTab, value: string): void => {
+    if (renameSubmittingRef.current !== undefined) return;
+    const rename = onTaskTabRename;
+    if (rename === undefined) return;
+    const normalized = value.trim();
+    if (normalized === "" || normalized === tab.label) {
+      pendingFocusTabRef.current = tab.key;
+      setTaskTabRename(undefined);
       return;
     }
-    if (!isPromiseLike(teardown)) {
-      commitTabClose(tab);
-      return;
-    }
-    closingTabRef.current = tab;
-    setClosingTab(tab);
-    void Promise.resolve(teardown)
-      .then(() => commitTabClose(tab))
-      .catch(() => setCloseError({ tab, message: tabCloseErrorMessage(tab, definitions) }))
+    renameSubmittingRef.current = tab.key;
+    setRenamingTaskTab(tab.key);
+    setTaskTabRename((current) =>
+      current?.tabKey === tab.key ? { ...current, failed: false } : current,
+    );
+    void rename(tab, normalized)
+      .then(() => {
+        pendingFocusTabRef.current = tab.key;
+        setTaskTabRename((current) => (current?.tabKey === tab.key ? undefined : current));
+      })
+      .catch(() =>
+        setTaskTabRename((current) =>
+          current?.tabKey === tab.key ? { ...current, failed: true } : current,
+        ),
+      )
       .finally(() => {
-        if (closingTabRef.current !== tab) return;
-        closingTabRef.current = undefined;
-        setClosingTab(undefined);
+        if (renameSubmittingRef.current !== tab.key) return;
+        renameSubmittingRef.current = undefined;
+        setRenamingTaskTab(undefined);
       });
   };
 
+  /** F2 提供键盘入口；IME 组合中的 Enter 只确认候选，不提交标题。 */
+  const handleTaskTabKeyDown = (event: KeyboardEvent<HTMLElement>, tab: WorkbenchTaskTab): void => {
+    if (event.currentTarget instanceof HTMLInputElement) {
+      if (event.key === "Escape" && renamingTaskTab === undefined) {
+        event.preventDefault();
+        pendingFocusTabRef.current = tab.key;
+        setTaskTabRename(undefined);
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (!renameComposingRef.current && !event.nativeEvent.isComposing)
+          submitTaskTabRename(tab, event.currentTarget.value);
+      }
+      return;
+    }
+    if (event.key === "F2") {
+      event.preventDefault();
+      beginTaskTabRename(tab);
+    }
+  };
+
+  /**
+   * 启动占位只在没有实际 Tab 时存在；首次选择会结束该状态，后续选择才追加实例。
+   * 这里统一能力与侧边任务入口，避免不同入口留下不可交互的“新标签页”。
+   */
+  const openTab = (tab: WorkbenchTab): void => {
+    const actualTabs = openTabs.filter((openTab) => openTab.key !== "new");
+    const nextTabs = actualTabs.some((openTab) => openTab.key === tab.key)
+      ? actualTabs
+      : [...actualTabs, tab];
+    onTabChange(tab);
+    if (
+      nextTabs.length !== openTabs.length ||
+      nextTabs.some((item, index) => item !== openTabs[index])
+    ) {
+      onOpenTabsChange(nextTabs);
+    }
+  };
+
+  /** 打开能力只提交受控意图；真实 feature 初始化仍由 composition root 决定。 */
+  const addTab = (capability: WorkbenchCapability): void => {
+    openTab(capabilityWorkbenchTab(capability));
+  };
+
+  /** 草稿实例由上层签发进程期 identity；Shell 只打开且聚焦，不触发 task/create。 */
+  const addSideTaskDraft = (): void => {
+    const tab = onCreateSideTask?.();
+    if (tab === undefined) return;
+    openTab(tab);
+  };
+
+  /**
+   * 资源释放成功后按 key 从最新受控投影提交关闭；同步推进 refs 让串行批量不等待 React
+   * 重绘，同时活动 Tab 切换必须先于列表写入，避免偏好 store 把刚关闭项重新补回。
+   */
+  const commitTabClose = (tabKey: string): void => {
+    const currentTabs = openTabsRef.current;
+    const index = currentTabs.findIndex((openTab) => openTab.key === tabKey);
+    if (index < 0) return;
+    const nextTabs = currentTabs.filter((openTab) => openTab.key !== tabKey);
+    openTabsRef.current = nextTabs;
+    if (activeTabRef.current?.key === tabKey && nextTabs.length > 0) {
+      const nextActive = nextTabs[Math.min(index, nextTabs.length - 1)];
+      if (nextActive !== undefined) {
+        activeTabRef.current = nextActive;
+        pendingFocusTabRef.current = nextActive.key;
+        onTabChange(nextActive);
+      }
+    } else if (nextTabs.length === 0) {
+      activeTabRef.current = undefined;
+    }
+    onOpenTabsChange(nextTabs);
+    setCloseError((current) => (current?.tab.key === tabKey ? undefined : current));
+    if (nextTabs.length === 0) onClose?.();
+  };
+
+  /**
+   * 单个 Tab 的 teardown 是关闭 ACK；目标在等待期间会按 key 回查最新投影，拒绝时保留
+   * 当前及后续 Tab。回调引用更新不会取消已经开始的事务，也不会触发并发关闭。
+   */
+  const requestTabClose = (tabKey: string): Promise<boolean> => {
+    if (!mountedRef.current || closingTabRef.current !== undefined) return Promise.resolve(false);
+    const tab = openTabsRef.current.find((openTab) => openTab.key === tabKey);
+    if (tab === undefined) return Promise.resolve(true);
+    setCloseError((current) => (current?.tab.key === tab.key ? undefined : current));
+    closingTabRef.current = tab.key;
+    setClosingTab(tab.key);
+    let teardown: void | Promise<void>;
+    try {
+      teardown = onTabCloseRef.current?.(tab);
+    } catch {
+      setCloseError({ tab, message: tabCloseErrorMessage(tab, definitions) });
+      closingTabRef.current = undefined;
+      setClosingTab(undefined);
+      return Promise.resolve(false);
+    }
+    if (!isPromiseLike(teardown)) {
+      commitTabClose(tab.key);
+      closingTabRef.current = undefined;
+      setClosingTab(undefined);
+      return Promise.resolve(true);
+    }
+    return Promise.resolve(teardown)
+      .then(() => {
+        if (!mountedRef.current) return false;
+        commitTabClose(tab.key);
+        return true;
+      })
+      .catch(() => {
+        if (mountedRef.current)
+          setCloseError({ tab, message: tabCloseErrorMessage(tab, definitions) });
+        return false;
+      })
+      .finally(() => {
+        if (closingTabRef.current !== tab.key) return;
+        closingTabRef.current = undefined;
+        if (mountedRef.current) setClosingTab(undefined);
+      });
+  };
+
+  /** 普通关闭同样经过全局 single-flight，批量事务运行时不会插入第二个资源释放。 */
+  const closeTab = (tab: WorkbenchTab): void => {
+    if (closingSequenceRef.current) return;
+    void requestTabClose(tab.key);
+  };
+
+  /**
+   * 批量关闭冻结目标 key 与视觉顺序，但每一步从最新受控投影取实体并等待 ACK；首个
+   * 拒绝即停止，因此失败项和所有尚未处理的 Tab 都保持原样。
+   */
+  const closeTabsSerially = (tabKeys: readonly string[], preferredFocusKey?: string): void => {
+    if (closingSequenceRef.current || closingTabRef.current !== undefined || tabKeys.length === 0)
+      return;
+    closingSequenceRef.current = true;
+    setClosingSequence(true);
+    void (async () => {
+      try {
+        for (const tabKey of tabKeys) {
+          if (!mountedRef.current) break;
+          if (!(await requestTabClose(tabKey))) break;
+        }
+      } finally {
+        closingSequenceRef.current = false;
+        if (mountedRef.current) {
+          setClosingSequence(false);
+          const focusKey = openTabsRef.current.some((tab) => tab.key === preferredFocusKey)
+            ? preferredFocusKey
+            : activeTabRef.current?.key;
+          if (focusKey !== undefined) {
+            window.requestAnimationFrame(() => {
+              workbenchRef.current
+                ?.querySelector<HTMLButtonElement>(`[data-workbench-tab="${focusKey}"]`)
+                ?.focus();
+            });
+          }
+        }
+      }
+    })();
+  };
+
+  /** 右键只建立菜单上下文，不选择 Tab；文本输入保留 WebView2 的原生编辑菜单。 */
+  const openTabContextMenu = (event: MouseEvent<HTMLDivElement>, tab: WorkbenchTab): void => {
+    const target = event.target instanceof Element ? event.target : undefined;
+    if (
+      target !== undefined &&
+      target.closest("input, textarea, [contenteditable='true']") !== null
+    )
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    clearTabDrag();
+    tabContextMenuTriggerRef.current =
+      event.currentTarget.querySelector<HTMLButtonElement>("[data-workbench-tab]") ?? undefined;
+    setTabContextMenu({ tabKey: tab.key, x: event.clientX, y: event.clientY });
+  };
+
+  /** ContextMenu 与 Shift+F10 锚定 Tab 下缘，并保留原焦点供 Escape 恢复。 */
+  const openTabContextMenuFromKeyboard = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    tab: WorkbenchTab,
+  ): boolean => {
+    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    tabContextMenuTriggerRef.current = event.currentTarget;
+    setTabContextMenu({
+      tabKey: tab.key,
+      x: bounds.left + Math.min(24, Math.max(0, bounds.width)),
+      y: bounds.bottom,
+    });
+    return true;
+  };
+
   /** 记录排序起点；关闭按钮必须留在独立事务中。 */
-  const handleTabPointerDown = (
-    event: PointerEvent<HTMLDivElement>,
-    tab: WorkbenchCapabilityTab,
-  ): void => {
-    if ((event.target as HTMLElement).closest('[data-tab-close="true"]') !== null) return;
+  const handleTabPointerDown = (event: PointerEvent<HTMLDivElement>, tab: WorkbenchTab): void => {
+    if (
+      (event.target as HTMLElement).closest('[data-tab-close="true"],[data-tab-rename="true"]') !==
+      null
+    )
+      return;
     if (event.button !== 0 || event.isPrimary === false) return;
-    dragRef.current = { tab, pointerId: event.pointerId, dropTarget: tab };
-    setDraggingTab(tab);
-    setDropTarget(tab);
+    dragRef.current = { tabKey: tab.key, pointerId: event.pointerId, dropTargetKey: tab.key };
+    setDraggingTab(tab.key);
+    setDropTarget(tab.key);
   };
 
   /** 同步记录最后穿过的真实 Tab，供条外释放提交最终目标。 */
-  const handleTabPointerEnter = (tab: WorkbenchCapabilityTab): void => {
+  const handleTabPointerEnter = (tab: WorkbenchTab): void => {
     if (dragRef.current === undefined) return;
-    dragRef.current.dropTarget = tab;
-    setDropTarget(tab);
+    dragRef.current.dropTargetKey = tab.key;
+    setDropTarget(tab.key);
   };
 
   const focusConversation = onFocusConversation ?? onClose;
@@ -298,46 +579,111 @@ export function Workbench({
     <div
       ref={workbenchRef}
       className="ja-workbench"
-      data-active-tab={activeTab}
-      data-open-tabs={openTabs.join(",")}
-      aria-busy={closingTab === undefined ? undefined : true}
+      data-active-tab={activeTab?.key}
+      data-open-tabs={openTabs.map((tab) => tab.key).join(",")}
+      aria-busy={
+        closingTab === undefined && !closingSequence && renamingTaskTab === undefined
+          ? undefined
+          : true
+      }
     >
       <header className="ja-workbench-tabbar">
         <div className="ja-workbench-tabs" role="tablist" aria-label="工作区标签">
           {openTabs.map((tab) => {
             const label = tabDisplayLabel(tab, definitions);
-            const Icon = definitions.find(({ value }) => value === tab)?.Icon ?? Files;
-            const active = tab === activeTab;
+            const Icon =
+              tab.kind === "task"
+                ? Bot
+                : (definitions.find(({ value }) => value === tab.capability)?.Icon ?? Files);
+            const active = tab.key === activeTab?.key;
+            const renameSession = taskTabRename?.tabKey === tab.key ? taskTabRename : undefined;
             return (
               <div
-                key={tab}
+                key={tab.key}
                 className="ja-workbench-tab-shell"
                 data-state={active ? "active" : "inactive"}
-                data-tab={tab}
-                data-drop-target={dropTarget === tab ? "true" : undefined}
-                aria-grabbed={draggingTab === tab}
+                data-tab={tab.key}
+                data-drop-target={dropTarget === tab.key ? "true" : undefined}
+                aria-grabbed={draggingTab === tab.key}
                 onPointerDown={(event) => handleTabPointerDown(event, tab)}
                 onPointerEnter={() => handleTabPointerEnter(tab)}
-                onPointerUp={(event) => finishTabDrag(event.pointerId, tab)}
+                onPointerUp={(event) => finishTabDrag(event.pointerId, tab.key)}
                 onPointerCancel={clearTabDrag}
                 onLostPointerCapture={clearTabDrag}
+                onContextMenu={(event) => openTabContextMenu(event, tab)}
               >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  data-workbench-tab={tab}
-                  className="ja-workbench-tab"
-                  onClick={() => onTabChange(tab)}
-                >
-                  <Icon aria-hidden="true" />
-                  <span>{label}</span>
-                </button>
+                {tab.kind === "task" && renameSession !== undefined ? (
+                  <div
+                    role="tab"
+                    aria-selected={active}
+                    data-workbench-tab={tab.key}
+                    className="ja-workbench-tab is-renaming"
+                  >
+                    <Icon aria-hidden="true" />
+                    <input
+                      ref={renameInputRef}
+                      data-tab-rename="true"
+                      className="ja-workbench-tab-rename-input"
+                      aria-label="侧边任务名称"
+                      aria-invalid={renameSession.failed || undefined}
+                      title={renameSession.failed ? "重命名失败，请重试。" : undefined}
+                      value={renameSession.value}
+                      maxLength={96}
+                      disabled={renamingTaskTab === tab.key}
+                      onChange={(event) =>
+                        setTaskTabRename({
+                          tabKey: tab.key,
+                          value: event.currentTarget.value,
+                          failed: false,
+                        })
+                      }
+                      onCompositionStart={() => {
+                        renameComposingRef.current = true;
+                      }}
+                      onCompositionEnd={() => {
+                        renameComposingRef.current = false;
+                      }}
+                      onKeyDown={(event) => handleTaskTabKeyDown(event, tab)}
+                      onBlur={(event) => submitTaskTabRename(tab, event.currentTarget.value)}
+                    />
+                    {renameSession.failed ? (
+                      <span className="ja-visually-hidden" role="alert">
+                        重命名失败，请重试。
+                      </span>
+                    ) : null}
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    data-workbench-tab={tab.key}
+                    className="ja-workbench-tab"
+                    title={
+                      tab.kind === "task" &&
+                      tab.taskKind === "side_task" &&
+                      onTaskTabRename !== undefined
+                        ? "双击或按 F2 重命名"
+                        : undefined
+                    }
+                    onClick={() => onTabChange(tab)}
+                    onDoubleClick={() => tab.kind === "task" && beginTaskTabRename(tab)}
+                    onKeyDown={(event) => {
+                      if (openTabContextMenuFromKeyboard(event, tab)) return;
+                      if (tab.kind === "task") handleTaskTabKeyDown(event, tab);
+                    }}
+                  >
+                    <Icon aria-hidden="true" />
+                    <span>{label}</span>
+                  </button>
+                )}
                 <IconButton
                   className="ja-workbench-tab-close"
                   data-tab-close="true"
-                  label={closingTab === tab ? `正在关闭${label}` : `关闭${label}`}
-                  disabled={closingTab !== undefined}
+                  label={closingTab === tab.key ? `正在关闭${label}` : `关闭${label}`}
+                  disabled={
+                    closingTab !== undefined || closingSequence || renamingTaskTab === tab.key
+                  }
                   onPointerDown={(event) => event.stopPropagation()}
                   onClick={(event) => {
                     event.stopPropagation();
@@ -350,13 +696,6 @@ export function Workbench({
             );
           })}
         </div>
-        <IconButton
-          className="ja-workbench-add-tab"
-          label="新建标签页"
-          onClick={() => addTab("new")}
-        >
-          <Plus aria-hidden="true" />
-        </IconButton>
         <WorkbenchCapabilityMenu
           definitions={menuDefinitions}
           activeTab={activeTab}
@@ -364,6 +703,7 @@ export function Workbench({
           conversationShortcut={conversationShortcut}
           onSelect={addTab}
           onFocusConversation={focusConversation}
+          onCreateSideTask={onCreateSideTask === undefined ? undefined : addSideTaskDraft}
         />
         {onClose === undefined ? null : (
           <IconButton className="ja-workbench-drawer-toggle" label="收起右侧栏" onClick={onClose}>
@@ -371,7 +711,55 @@ export function Workbench({
           </IconButton>
         )}
       </header>
-      {closeError !== undefined && openTabs.includes(closeError.tab) ? (
+      {tabContextMenu === undefined
+        ? null
+        : (() => {
+            const contextTab = openTabs.find((tab) => tab.key === tabContextMenu.tabKey);
+            if (contextTab === undefined) return null;
+            const contextIndex = openTabs.findIndex((tab) => tab.key === contextTab.key);
+            const busy =
+              closingSequence || closingTab !== undefined || renamingTaskTab !== undefined;
+            return (
+              <WorkbenchTabContextMenu
+                label={tabDisplayLabel(contextTab, definitions)}
+                x={tabContextMenu.x}
+                y={tabContextMenu.y}
+                busy={busy}
+                canRename={
+                  contextTab.kind === "task" &&
+                  contextTab.taskKind === "side_task" &&
+                  onTaskTabRename !== undefined
+                }
+                canCloseOthers={openTabs.length > 1}
+                canCloseRight={contextIndex >= 0 && contextIndex < openTabs.length - 1}
+                onOpenChange={(open) => {
+                  if (!open) setTabContextMenu(undefined);
+                }}
+                onRestoreFocus={() => {
+                  const trigger = tabContextMenuTriggerRef.current;
+                  if (trigger?.isConnected) trigger.focus();
+                }}
+                onRename={() => {
+                  if (contextTab.kind === "task") beginTaskTabRename(contextTab);
+                }}
+                onClose={() => closeTabsSerially([contextTab.key], contextTab.key)}
+                onCloseOthers={() =>
+                  closeTabsSerially(
+                    openTabs.filter((tab) => tab.key !== contextTab.key).map((tab) => tab.key),
+                    contextTab.key,
+                  )
+                }
+                onCloseRight={() =>
+                  closeTabsSerially(
+                    openTabs.slice(contextIndex + 1).map((tab) => tab.key),
+                    contextTab.key,
+                  )
+                }
+                onCloseAll={() => closeTabsSerially(openTabs.map((tab) => tab.key))}
+              />
+            );
+          })()}
+      {closeError !== undefined && openTabs.some((tab) => tab.key === closeError.tab.key) ? (
         <ErrorState
           className="ja-feature-state ja-feature-error"
           title="关闭失败"
@@ -380,19 +768,29 @@ export function Workbench({
         />
       ) : null}
       {openTabs
-        .filter((tab) => tab !== "new")
+        .filter(
+          (tab): tab is WorkbenchCapabilityTab =>
+            tab.kind === "capability" && tab.capability !== "new",
+        )
         .map((tab) => (
           <div
-            key={tab}
+            key={tab.key}
             className="ja-workbench-content"
-            data-tab-panel={tab}
-            hidden={activeTab !== tab}
-            inert={activeTab !== tab}
+            data-tab-panel={tab.key}
+            hidden={activeTab?.key !== tab.key}
+            inert={activeTab?.key !== tab.key}
           >
-            <div className="ja-workbench-slot">{views[tab]}</div>
+            <div className="ja-workbench-slot">
+              {views[tab.capability as Exclude<WorkbenchCapability, "new">]}
+            </div>
           </div>
         ))}
-      {openTabs.includes("new") && activeTab === "new" ? (
+      {activeTab?.kind === "task" ? (
+        <div className="ja-workbench-content" data-tab-panel={activeTab.key}>
+          <div className="ja-workbench-slot">{renderTaskView?.(activeTab)}</div>
+        </div>
+      ) : null}
+      {activeTab?.kind === "capability" && activeTab.capability === "new" ? (
         <div className="ja-workbench-content" data-tab-panel="new">
           <NewTabLauncher
             definitions={definitions}
@@ -400,6 +798,7 @@ export function Workbench({
             onSelect={addTab}
             focusConversation={focusConversation}
             conversationShortcut={conversationShortcut}
+            onCreateSideTask={onCreateSideTask === undefined ? undefined : addSideTaskDraft}
           />
         </div>
       ) : null}
@@ -410,21 +809,26 @@ export function Workbench({
   );
 }
 
-/** 启动器只列出有真实投影的 feature，不创建占位能力。 */
+/** 启动器只列出有真实投影的 feature；新建侧边任务只创建本地草稿描述符。 */
 function NewTabLauncher({
   definitions,
   shortcuts,
   onSelect,
   focusConversation,
   conversationShortcut,
+  onCreateSideTask,
 }: {
   definitions: readonly TabDefinition[];
-  shortcuts?: Partial<Record<WorkbenchTab, string>>;
-  onSelect: (tab: WorkbenchCapabilityTab) => void;
+  shortcuts?: Partial<Record<WorkbenchCapability, string>>;
+  onSelect: (tab: WorkbenchCapability) => void;
   focusConversation?: () => void;
   conversationShortcut?: string;
+  onCreateSideTask?: () => void;
 }): ReactElement {
-  const launcherDefinitions = (["review", "terminal", "preview", "files"] as const)
+  /** 启动器顺序是稳定的产品导航约束，定义缺失时才从视图中收缩对应能力。 */
+  const launcherDefinitions = (
+    ["review", "terminal", "preview", "files", "agents", "plan"] as const
+  )
     .map((value) => definitions.find((definition) => definition.value === value))
     .filter((definition): definition is TabDefinition => definition !== undefined);
   return (
@@ -449,6 +853,13 @@ function NewTabLauncher({
             <kbd>{shortcuts?.[value] ?? DEFAULT_SHORTCUTS[value] ?? ""}</kbd>
           </button>
         ))}
+        {onCreateSideTask === undefined ? null : (
+          <button type="button" className="ja-workbench-launcher-action" onClick={onCreateSideTask}>
+            <MessageCircle aria-hidden="true" />
+            <span>新建侧边任务</span>
+            <kbd />
+          </button>
+        )}
         {focusConversation === undefined ? null : (
           <button
             type="button"
@@ -456,7 +867,7 @@ function NewTabLauncher({
             onClick={focusConversation}
           >
             <MessageCircle aria-hidden="true" />
-            <span>侧边聊天</span>
+            <span>返回主对话</span>
             <kbd>{conversationShortcut ?? "Ctrl+Alt+S"}</kbd>
           </button>
         )}
@@ -472,27 +883,29 @@ function capabilityMenuDefinitions(
   return definitions.filter(({ value }) => value !== "new");
 }
 
-/** 能力菜单只发出 Tab 意图，快捷键处理仍由 App composition 统一拥有。 */
+/** `+` 统一承载可用 Tab 菜单；侧边任务创建仍由 composition root 签发实例身份。 */
 function WorkbenchCapabilityMenu({
   definitions,
   activeTab,
   shortcuts,
   conversationShortcut,
+  onCreateSideTask,
   onSelect,
   onFocusConversation,
 }: {
   definitions: readonly CapabilityMenuDefinition[];
-  activeTab?: WorkbenchCapabilityTab;
-  shortcuts?: Partial<Record<WorkbenchTab, string>>;
+  activeTab?: WorkbenchTab;
+  shortcuts?: Partial<Record<WorkbenchCapability, string>>;
   conversationShortcut?: string;
-  onSelect: (tab: WorkbenchTab) => void;
+  onSelect: (tab: WorkbenchCapability) => void;
   onFocusConversation?: () => void;
+  onCreateSideTask?: () => void;
 }): ReactElement {
   return (
     <Menu>
       <MenuTrigger asChild>
-        <IconButton className="ja-workbench-capability-menu" label="打开右侧栏能力">
-          <ListFilter aria-hidden="true" />
+        <IconButton className="ja-workbench-add-tab" label="新建标签页">
+          <Plus aria-hidden="true" />
         </IconButton>
       </MenuTrigger>
       <MenuContent
@@ -510,19 +923,27 @@ function WorkbenchCapabilityMenu({
             <Icon aria-hidden="true" />
             <span>{label}</span>
             {shortcuts?.[value] === undefined ? null : <kbd>{shortcuts[value]}</kbd>}
-            {value === activeTab ? (
+            {activeTab?.kind === "capability" && value === activeTab.capability ? (
               <Check className="ja-workbench-menu-check" aria-hidden="true" />
             ) : null}
           </MenuItem>
         ))}
-        {onFocusConversation === undefined ? null : (
+        {onCreateSideTask === undefined && onFocusConversation === undefined ? null : (
           <>
             <MenuSeparator className="ja-workbench-add-menu-separator" />
-            <MenuItem className="ja-workbench-add-menu-item" onSelect={onFocusConversation}>
-              <MessageCircle aria-hidden="true" />
-              <span>侧边聊天</span>
-              <kbd>{conversationShortcut ?? "Ctrl+Alt+S"}</kbd>
-            </MenuItem>
+            {onCreateSideTask === undefined ? null : (
+              <MenuItem className="ja-workbench-add-menu-item" onSelect={onCreateSideTask}>
+                <MessageCircle aria-hidden="true" />
+                <span>新建侧边任务</span>
+              </MenuItem>
+            )}
+            {onFocusConversation === undefined ? null : (
+              <MenuItem className="ja-workbench-add-menu-item" onSelect={onFocusConversation}>
+                <MessageCircle aria-hidden="true" />
+                <span>返回主对话</span>
+                <kbd>{conversationShortcut ?? "Ctrl+Alt+S"}</kbd>
+              </MenuItem>
+            )}
           </>
         )}
       </MenuContent>

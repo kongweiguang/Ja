@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { useSettingsController } from "@/features/settings/application/useSettingsController";
 import type { LoadedSettings, SettingsDocument } from "@/features/settings/domain/types";
 import type { SettingsAdapter } from "@/features/settings/application/ports";
+import type { ProviderSave } from "@/shared/settings/types";
 
 const NO_PROJECT_OVERRIDES = {
   defaultSelection: false,
@@ -17,7 +18,7 @@ const NO_PROJECT_OVERRIDES = {
 };
 
 const DOCUMENT: SettingsDocument = {
-  schemaVersion: 4,
+  schemaVersion: 1,
   revision: 1,
   theme: "system",
   defaultAccessMode: "full_access",
@@ -26,7 +27,6 @@ const DOCUMENT: SettingsDocument = {
     {
       providerId: "provider_one",
       name: "OpenAI",
-      provider: "openai",
       api: "openai_responses",
       baseUrl: "https://api.openai.com/v1",
       credentialId: "cred_one",
@@ -79,11 +79,16 @@ function controllerOptions(
       deleteCredential: vi.fn(async () => "cfg_auth"),
     },
     appearancePort: {
+      themeMode: "system",
+      palette: "xcode",
       reducedMotion: false,
+      reducedTransparency: false,
       highContrast: false,
       setThemeMode: vi.fn(),
+      setPalette: vi.fn(),
       setHighContrast: vi.fn(),
       setReduceMotion: vi.fn(),
+      setReducedTransparency: vi.fn(),
     },
     workspaceScope: undefined,
     runtimeState: { status: "ready", generation: 1, serverInstanceId: "server" },
@@ -121,6 +126,44 @@ function renderController(
   );
 }
 
+/** 凭据快照夹具只改变脱敏 configured 与 CAS，不把测试 Secret 放进配置文档。 */
+function credentialSnapshot(configured: boolean, credentialVersion: string): LoadedSettings {
+  const document = structuredClone(DOCUMENT);
+  document.providers[0]!.credentialConfigured = configured;
+  return {
+    document: structuredClone(document),
+    userDocument: document,
+    projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
+    cas: {
+      userVersion: "cfg_user",
+      projectVersion: "cfg_missing",
+      credentialVersion,
+    },
+  };
+}
+
+/** 构造独立身份的新 Provider，复用稳定能力值但不携带脱敏 configured 投影。 */
+function newProviderSave(): ProviderSave {
+  const source = DOCUMENT.providers[0]!;
+  return {
+    providerId: "provider_two",
+    name: "DeepSeek",
+    api: "openai_chat_completions",
+    baseUrl: "https://api.deepseek.com",
+    credentialId: "cred_deep.seek",
+    networkTimeouts: structuredClone(source.networkTimeouts),
+    agentDefaults: structuredClone(source.agentDefaults),
+    models: [
+      {
+        ...structuredClone(source.models[0]!),
+        modelId: "model_deepseek",
+        name: "DeepSeek Chat",
+        model: "deepseek-chat",
+      },
+    ],
+  };
+}
+
 /** 用 Provider 名区分各作用域快照，让晚到请求是否覆盖当前 UI 可以被直接断言。 */
 function loadedSettings(providerName: string): LoadedSettings {
   const document = structuredClone(DOCUMENT);
@@ -129,8 +172,6 @@ function loadedSettings(providerName: string): LoadedSettings {
     document,
     userDocument: structuredClone(document),
     projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
-    source: "Primary",
-    recovered: false,
     cas: {
       userVersion: `cfg_user_${providerName}`,
       projectVersion: `cfg_project_${providerName}`,
@@ -139,7 +180,270 @@ function loadedSettings(providerName: string): LoadedSettings {
   };
 }
 
-describe("useSettingsController v4", () => {
+describe("useSettingsController v1", () => {
+  /** 配置 CAS 冲突时必须丢弃本地草稿并展示权威回读，避免用户继续基于旧版本编辑。 */
+  it("reloads the authoritative Provider document after a revision conflict", async () => {
+    let authoritativeName = "OpenAI";
+    const snapshot = vi.fn(async () => loadedSettings(authoritativeName));
+    const save = vi.fn(async () => {
+      authoritativeName = "Authoritative Provider";
+      throw Object.assign(new Error("redacted"), { code: "revision_conflict" });
+    });
+    const options = controllerOptions(snapshot, save);
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    let failure: unknown;
+
+    await act(async () => {
+      try {
+        await result.current.ports.onSaveProvider({
+          ...DOCUMENT.providers[0]!,
+          name: "Local Draft",
+        });
+      } catch (error) {
+        failure = error;
+      }
+    });
+
+    expect(failure).toMatchObject({ code: "revision_conflict" });
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.providers[0]?.name).toBe("Authoritative Provider"),
+    );
+  });
+
+  it("reloads authoritative credential CAS once and only projects configured after success", async () => {
+    let credentialVersion = "cfg_stale";
+    let configured = false;
+    const snapshot = vi.fn(async () => credentialSnapshot(configured, credentialVersion));
+    const setCredential = vi.fn(
+      async (_credentialId: string, _secret: string, expected: string) => {
+        if (expected === "cfg_stale") {
+          credentialVersion = "cfg_fresh";
+          throw Object.assign(new Error("redacted"), { code: "revision_conflict" });
+        }
+        configured = true;
+        credentialVersion = "cfg_written";
+        return credentialVersion;
+      },
+    );
+    const options = controllerOptions(snapshot);
+    options.adapter.setCredential = setCredential;
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.providers[0]?.credentialConfigured).toBe(false),
+    );
+    await act(async () => {
+      await result.current.ports.onReplaceCredential("cred_one", "test-secret");
+    });
+
+    expect(setCredential).toHaveBeenNthCalledWith(1, "cred_one", "test-secret", "cfg_stale");
+    expect(setCredential).toHaveBeenNthCalledWith(2, "cred_one", "test-secret", "cfg_fresh");
+    expect(snapshot).toHaveBeenCalledTimes(3);
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.providers[0]?.credentialConfigured).toBe(true),
+    );
+  });
+
+  /** 凭据写入必须串行消费权威 CAS，避免同时从同一 credentialVersion 发起互相冲突的提交。 */
+  it("serializes concurrent credential mutations through authoritative CAS readback", async () => {
+    let credentialVersion = "cfg_auth_1";
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let activeMutations = 0;
+    let maxActiveMutations = 0;
+    const snapshot = vi.fn(async () => credentialSnapshot(true, credentialVersion));
+    const setCredential = vi.fn(
+      async (_credentialId: string, secret: string, expectedVersion: string) => {
+        activeMutations += 1;
+        maxActiveMutations = Math.max(maxActiveMutations, activeMutations);
+        try {
+          if (secret === "first-secret") {
+            expect(expectedVersion).toBe("cfg_auth_1");
+            await firstGate;
+            credentialVersion = "cfg_auth_2";
+          } else {
+            expect(expectedVersion).toBe("cfg_auth_2");
+            credentialVersion = "cfg_auth_3";
+          }
+          return credentialVersion;
+        } finally {
+          activeMutations -= 1;
+        }
+      },
+    );
+    const options = controllerOptions(snapshot);
+    options.adapter.setCredential = setCredential;
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    let firstOperation: Promise<void> | undefined;
+    let secondOperation: Promise<void> | undefined;
+
+    act(() => {
+      firstOperation = result.current.ports.onReplaceCredential("cred_one", "first-secret");
+      secondOperation = result.current.ports.onReplaceCredential("cred_one", "second-secret");
+    });
+    await waitFor(() => expect(setCredential).toHaveBeenCalledTimes(1));
+    expect(setCredential).toHaveBeenNthCalledWith(1, "cred_one", "first-secret", "cfg_auth_1");
+    releaseFirst?.();
+    await act(async () => {
+      await Promise.all([firstOperation, secondOperation]);
+    });
+
+    expect(setCredential).toHaveBeenNthCalledWith(2, "cred_one", "second-secret", "cfg_auth_2");
+    expect(maxActiveMutations).toBe(1);
+    expect(snapshot).toHaveBeenCalledTimes(3);
+  });
+
+  it("creates Provider before its credential and exposes configured only after authoritative readback", async () => {
+    let document = structuredClone(DOCUMENT);
+    let userVersion = 1;
+    let credentialVersion = "cfg_auth_1";
+    const configured = new Set(["cred_one"]);
+    const order: string[] = [];
+    const snapshot = vi.fn(async (): Promise<LoadedSettings> => {
+      const projected = structuredClone(document);
+      for (const provider of projected.providers) {
+        provider.credentialConfigured = configured.has(provider.credentialId);
+      }
+      return {
+        document: structuredClone(projected),
+        userDocument: projected,
+        projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
+        cas: {
+          userVersion: `cfg_user_${userVersion}`,
+          projectVersion: "cfg_missing",
+          credentialVersion,
+        },
+      };
+    });
+    const save = vi.fn(async (next: SettingsDocument, expectedVersion: string) => {
+      order.push("provider");
+      expect(expectedVersion).toBe(`cfg_user_${userVersion}`);
+      document = structuredClone(next);
+      userVersion += 1;
+      return `cfg_user_${userVersion}`;
+    });
+    const setCredential = vi.fn(async (credentialId: string, _secret: string, expected: string) => {
+      order.push("credential");
+      expect(document.providers.some((provider) => provider.credentialId === credentialId)).toBe(
+        true,
+      );
+      expect(expected).toBe("cfg_auth_1");
+      configured.add(credentialId);
+      credentialVersion = "cfg_auth_2";
+      return credentialVersion;
+    });
+    const options = controllerOptions(snapshot, save);
+    options.adapter.setCredential = setCredential;
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+
+    await act(async () => {
+      await result.current.ports.onCreateProvider(newProviderSave(), "test-secret");
+    });
+
+    expect(order).toEqual(["provider", "credential"]);
+    expect(setCredential).toHaveBeenCalledWith("cred_deep.seek", "test-secret", "cfg_auth_1");
+    await waitFor(() => expect(result.current.globalSnapshot.providers).toHaveLength(2));
+    await waitFor(() =>
+      expect(
+        result.current.globalSnapshot.providers.find(
+          (provider) => provider.providerId === "provider_two",
+        )?.credentialConfigured,
+      ).toBe(true),
+    );
+  });
+
+  it("retains one recoverable Provider when credential persistence fails and reuses it on retry", async () => {
+    let document = structuredClone(DOCUMENT);
+    let userVersion = 1;
+    let configured = false;
+    let credentialAttempts = 0;
+    const snapshot = vi.fn(async (): Promise<LoadedSettings> => {
+      const projected = structuredClone(document);
+      const provider = projected.providers.find((item) => item.providerId === "provider_two");
+      if (provider !== undefined) provider.credentialConfigured = configured;
+      return {
+        document: structuredClone(projected),
+        userDocument: projected,
+        projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
+        cas: {
+          userVersion: `cfg_user_${userVersion}`,
+          projectVersion: "cfg_missing",
+          credentialVersion: credentialAttempts === 0 ? "cfg_auth_1" : "cfg_auth_2",
+        },
+      };
+    });
+    const save = vi.fn(async (next: SettingsDocument) => {
+      document = structuredClone(next);
+      userVersion += 1;
+      return `cfg_user_${userVersion}`;
+    });
+    const setCredential = vi.fn(async () => {
+      credentialAttempts += 1;
+      if (credentialAttempts === 1) {
+        throw Object.assign(new Error("redacted"), { code: "storage_unavailable" });
+      }
+      configured = true;
+      return "cfg_auth_3";
+    });
+    const options = controllerOptions(snapshot, save);
+    options.adapter.setCredential = setCredential;
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    const provider = newProviderSave();
+    let firstFailure: unknown;
+
+    await act(async () => {
+      try {
+        await result.current.ports.onCreateProvider(provider, "first-secret");
+      } catch (error) {
+        firstFailure = error;
+      }
+    });
+    expect(firstFailure).toMatchObject({ code: "provider_saved_credential_failed" });
+    await waitFor(() => expect(result.current.globalSnapshot.providers).toHaveLength(2));
+    expect(result.current.globalSnapshot.providers[1]?.credentialConfigured).toBe(false);
+
+    await act(async () => {
+      await result.current.ports.onCreateProvider(provider, "second-secret");
+    });
+    expect(
+      document.providers.filter((item) => item.providerId === provider.providerId),
+    ).toHaveLength(1);
+    await waitFor(() => expect(result.current.globalSnapshot.providers).toHaveLength(2));
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.providers[1]?.credentialConfigured).toBe(true),
+    );
+  });
+
+  it("does not touch credentials when the Provider document cannot be saved", async () => {
+    const snapshot = vi.fn(async () => credentialSnapshot(true, "cfg_auth"));
+    const save = vi.fn(async () => {
+      throw Object.assign(new Error("redacted"), { code: "storage_unavailable" });
+    });
+    const setCredential = vi.fn(async () => "cfg_auth_2");
+    const options = controllerOptions(snapshot, save);
+    options.adapter.setCredential = setCredential;
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    let failure: unknown;
+
+    await act(async () => {
+      try {
+        await result.current.ports.onCreateProvider(newProviderSave(), "test-secret");
+      } catch (error) {
+        failure = error;
+      }
+    });
+    expect(failure).toMatchObject({ code: "storage_unavailable" });
+    expect(setCredential).not.toHaveBeenCalled();
+  });
+
   it("keeps the current UI while a workspace scope synchronizes and ignores a late old result", async () => {
     let resolveProjectA: ((value: LoadedSettings) => void) | undefined;
     const projectA = new Promise<LoadedSettings>((resolve) => {
@@ -163,7 +467,6 @@ describe("useSettingsController v4", () => {
     await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("General"));
     expect(result.current.scopeReady).toBe(true);
     rerender({ workspaceId: "ws_project_a" });
-    act(() => result.current.setScope("project"));
     await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
     expect(result.current.loading).toBe(false);
     expect(result.current.synchronizing).toBe(true);
@@ -212,17 +515,15 @@ describe("useSettingsController v4", () => {
 
     await waitFor(() => expect(result.current.scopeReady).toBe(true));
     expect(snapshot).toHaveBeenCalledTimes(1);
-    act(() => result.current.setScope("project"));
+    rerender({ version: "cfg_project_2", workspaceId: "ws_project_a" });
     await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
     rerender({ version: "cfg_project_2", workspaceId: "ws_project_a" });
-    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(3));
-    rerender({ version: "cfg_project_2", workspaceId: "ws_project_a" });
     await act(async () => Promise.resolve());
-    expect(snapshot).toHaveBeenCalledTimes(3);
+    expect(snapshot).toHaveBeenCalledTimes(2);
 
     rerender({ version: "cfg_project_3", workspaceId: "ws_project_b" });
     await act(async () => Promise.resolve());
-    expect(snapshot).toHaveBeenCalledTimes(3);
+    expect(snapshot).toHaveBeenCalledTimes(2);
   });
 
   it("cancels an older same-scope refresh so its late result cannot overwrite a newer version", async () => {
@@ -233,8 +534,8 @@ describe("useSettingsController v4", () => {
     });
     const snapshot = vi.fn(async (): Promise<LoadedSettings> => {
       call += 1;
-      if (call === 3) return versionTwo;
-      return loadedSettings(call >= 4 ? "Version 3" : call === 2 ? "Project Initial" : "Version 1");
+      if (call === 2) return versionTwo;
+      return loadedSettings(call >= 3 ? "Version 3" : "Version 1");
     });
     const base = controllerOptions(snapshot);
     const { result, rerender } = renderHook(
@@ -257,11 +558,8 @@ describe("useSettingsController v4", () => {
     );
 
     await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("Version 1"));
-    act(() => result.current.setScope("project"));
-    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("Project Initial"));
     rerender({ version: "cfg_project_2" });
-    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
     expect(result.current.loading).toBe(false);
     expect(result.current.synchronizing).toBe(true);
 
@@ -272,7 +570,7 @@ describe("useSettingsController v4", () => {
       await versionTwo;
     });
     expect(result.current.snapshot.providers[0]?.name).toBe("Version 3");
-    expect(snapshot).toHaveBeenCalledTimes(4);
+    expect(snapshot).toHaveBeenCalledTimes(3);
   });
 
   it("loads Provider projection and saves model/default/access changes through one document owner", async () => {
@@ -288,8 +586,6 @@ describe("useSettingsController v4", () => {
         document: structuredClone(document),
         userDocument: structuredClone(document),
         projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
-        source: "Primary",
-        recovered: false,
         cas: {
           userVersion: `cfg_${version}`,
           projectVersion: "cfg_missing",
@@ -309,11 +605,16 @@ describe("useSettingsController v4", () => {
             deleteCredential: vi.fn(async () => "cfg_auth3"),
           },
           appearancePort: {
+            themeMode: "system",
+            palette: "xcode",
             reducedMotion: false,
+            reducedTransparency: false,
             highContrast: false,
             setThemeMode: vi.fn(),
+            setPalette: vi.fn(),
             setHighContrast: vi.fn(),
             setReduceMotion: vi.fn(),
+            setReducedTransparency: vi.fn(),
           },
           workspaceScope: undefined,
           runtimeState: { status: "ready", generation: 1, serverInstanceId: "server" },
@@ -365,6 +666,109 @@ describe("useSettingsController v4", () => {
     expect(save).toHaveBeenCalledTimes(3);
   });
 
+  it("keeps theme, palette, motion, transparency, and contrast in the UI preference owner", async () => {
+    const save = vi.fn(async () => "cfg_next");
+    const snapshot = vi.fn(async () => loadedSettings("Global"));
+    const options = controllerOptions(snapshot, save);
+    const setThemeMode = vi.fn();
+    const setPalette = vi.fn();
+    const setHighContrast = vi.fn();
+    const setReduceMotion = vi.fn();
+    const setReducedTransparency = vi.fn();
+    options.appearancePort = {
+      themeMode: "system",
+      palette: "xcode",
+      reducedMotion: false,
+      reducedTransparency: false,
+      highContrast: false,
+      setThemeMode,
+      setPalette,
+      setHighContrast,
+      setReduceMotion,
+      setReducedTransparency,
+    };
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.globalSnapshot.providers).toHaveLength(1));
+    setThemeMode.mockClear();
+    setHighContrast.mockClear();
+    setReduceMotion.mockClear();
+
+    await act(async () =>
+      result.current.ports.onAppearanceChange(
+        {
+          theme: "dark",
+          palette: "xcode",
+          reducedMotion: true,
+          reducedTransparency: false,
+          highContrast: false,
+        },
+        "reducedMotion",
+      ),
+    );
+    await act(async () =>
+      result.current.ports.onAppearanceChange(
+        {
+          theme: "dark",
+          palette: "xcode",
+          reducedMotion: false,
+          reducedTransparency: false,
+          highContrast: true,
+        },
+        "highContrast",
+      ),
+    );
+
+    expect(save).not.toHaveBeenCalled();
+    expect(setThemeMode).not.toHaveBeenCalled();
+    expect(setPalette).not.toHaveBeenCalled();
+    expect(setReduceMotion).toHaveBeenCalledWith(true);
+    expect(setHighContrast).toHaveBeenCalledWith(true);
+
+    await act(async () =>
+      result.current.ports.onAppearanceChange(
+        {
+          theme: "dark",
+          palette: "obsidian",
+          reducedMotion: true,
+          reducedTransparency: false,
+          highContrast: true,
+        },
+        "palette",
+      ),
+    );
+    await act(async () =>
+      result.current.ports.onAppearanceChange(
+        {
+          theme: "dark",
+          palette: "obsidian",
+          reducedMotion: true,
+          reducedTransparency: true,
+          highContrast: true,
+        },
+        "reducedTransparency",
+      ),
+    );
+
+    expect(setPalette).toHaveBeenCalledWith("obsidian");
+    expect(setReducedTransparency).toHaveBeenCalledWith(true);
+
+    await act(async () =>
+      result.current.ports.onAppearanceChange(
+        {
+          theme: "dark",
+          palette: "obsidian",
+          reducedMotion: true,
+          reducedTransparency: true,
+          highContrast: true,
+        },
+        "theme",
+      ),
+    );
+
+    expect(save).not.toHaveBeenCalled();
+    expect(setThemeMode).toHaveBeenCalledWith("dark");
+  });
+
   it("deleting the default Provider requires and applies an explicit replacement", async () => {
     const second = {
       ...structuredClone(DOCUMENT.providers[0]!),
@@ -385,8 +789,6 @@ describe("useSettingsController v4", () => {
               document: structuredClone(document),
               userDocument: structuredClone(document),
               projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
-              source: "Primary" as const,
-              recovered: false,
               cas: {
                 userVersion: "cfg_user",
                 projectVersion: "cfg_missing",
@@ -400,11 +802,16 @@ describe("useSettingsController v4", () => {
             deleteCredential: vi.fn(async () => "cfg_auth"),
           },
           appearancePort: {
+            themeMode: "system",
+            palette: "xcode",
             reducedMotion: false,
+            reducedTransparency: false,
             highContrast: false,
             setThemeMode: vi.fn(),
+            setPalette: vi.fn(),
             setHighContrast: vi.fn(),
             setReduceMotion: vi.fn(),
+            setReducedTransparency: vi.fn(),
           },
           workspaceScope: undefined,
           runtimeState: { status: "ready", generation: 1, serverInstanceId: "server" },
@@ -454,8 +861,6 @@ describe("useSettingsController v4", () => {
         document: structuredClone(effectiveDocument),
         userDocument: structuredClone(userDocument),
         projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
-        source: "Primary",
-        recovered: false,
         cas: {
           userVersion: "cfg_user",
           projectVersion: "cfg_project",
@@ -465,8 +870,8 @@ describe("useSettingsController v4", () => {
     );
     const { result } = renderController(snapshot, save, true);
     await waitFor(() => expect(result.current.snapshot.providers).toHaveLength(1));
-    const effectiveProvider = structuredClone(result.current.snapshot.providers[0]!);
-    const { credentialConfigured: _credentialConfigured, ...submitted } = effectiveProvider;
+    const globalProvider = structuredClone(result.current.globalSnapshot.providers[0]!);
+    const { credentialConfigured: _credentialConfigured, ...submitted } = globalProvider;
     expect(_credentialConfigured).toBe(true);
 
     await act(async () =>
@@ -489,8 +894,6 @@ describe("useSettingsController v4", () => {
         document: structuredClone(userDocument),
         userDocument: structuredClone(userDocument),
         projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
-        source: "Primary",
-        recovered: false,
         cas: {
           userVersion: "cfg_user",
           projectVersion: "cfg_missing",
@@ -512,20 +915,79 @@ describe("useSettingsController v4", () => {
     expect(userDocument.defaultSelection?.reasoningLevel).toBe("low");
   });
 
-  it("stays global by default and writes project model selection as a scoped merge patch", async () => {
-    const snapshot = vi.fn(async (input?: { workspaceId?: string }) =>
-      loadedSettings(input?.workspaceId === undefined ? "Global" : "Project"),
-    );
+  it("keeps project-effective conversation settings while every settings write targets user CAS", async () => {
+    let loaded = loadedSettings("Project B");
+    loaded.userDocument.providers[0]!.name = "Global A";
+    loaded.userDocument.defaultAccessMode = "approval_required";
+    loaded.userDocument.skills = [
+      {
+        skillId: "skill_review",
+        name: "Review",
+        scope: "user",
+        enabled: true,
+        description: "Review changes",
+      },
+    ];
+    loaded.document.skills = [{ ...loaded.userDocument.skills[0]!, enabled: false }];
+    const globalMcp = {
+      mcpRevision: "mcp_local",
+      name: "Local Tools",
+      transport: "stdio" as const,
+      endpoint: "pwsh.exe",
+      protocolVersion: "2025-06-18" as const,
+      args: [],
+      env: {},
+      headers: {},
+      auth: { kind: "none" as const },
+      enabled: true,
+    };
+    loaded.userDocument.mcpServers = [globalMcp];
+    loaded.document.mcpServers = [{ ...globalMcp, enabled: false }];
     const patch = vi.fn(async () => ({ version: "cfg_project_next" }));
-    const options = controllerOptions(snapshot);
+    const reset = vi.fn(async () => ({ version: "cfg_project_next" }));
+    const save = vi.fn(async (document: SettingsDocument) => {
+      loaded = { ...loaded, userDocument: structuredClone(document) };
+      return "cfg_user_next";
+    });
+    const snapshot = vi.fn(async () => structuredClone(loaded));
+    const options = controllerOptions(snapshot, save);
     options.adapter.patch = patch;
+    options.adapter.reset = reset;
     options.workspaceScope = { workspaceId: "ws_project", kind: "project" };
+    options.runtimePort.listSkills = vi.fn(async () => ({
+      items: [
+        {
+          skillId: "skill_review",
+          name: "Review",
+          scope: "user" as const,
+          enabled: false,
+          status: "healthy" as const,
+          description: "Review changes",
+        },
+      ],
+      nextCursor: null,
+    }));
+    options.runtimePort.listMcpServers = vi.fn(async () => ({
+      items: [
+        {
+          mcpId: "mcp_local",
+          name: "Local Tools",
+          transport: "stdio" as const,
+          status: "disabled" as const,
+          toolCount: 0,
+        },
+      ],
+      nextCursor: null,
+    }));
     const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
 
-    await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("Global"));
-    expect(snapshot).toHaveBeenLastCalledWith(undefined);
-    act(() => result.current.setScope("project"));
-    await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("Project"));
+    await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("Project B"));
+    expect(result.current.globalSnapshot.providers[0]?.name).toBe("Global A");
+    expect(result.current.snapshot.skills[0]?.enabled).toBe(false);
+    expect(result.current.globalSnapshot.skills[0]?.enabled).toBe(true);
+    expect(result.current.globalSnapshot.mcpServers[0]?.enabled).toBe(true);
+    expect(result.current.scopeWorkspaceId).toBe("ws_project");
+
     await act(async () =>
       result.current.ports.onDefaultSelectionChange({
         providerId: "provider_one",
@@ -533,97 +995,12 @@ describe("useSettingsController v4", () => {
         reasoningLevel: "low",
       }),
     );
+    await act(async () => result.current.ports.onAccessModeChange("full_access"));
+    await act(async () => result.current.ports.onToggleSkill("skill_review", false));
+    await act(async () => result.current.ports.onSaveMcp({ ...globalMcp, enabled: false }));
 
-    expect(patch).toHaveBeenCalledWith({
-      scope: "project",
-      workspaceId: "ws_project",
-      expectedVersion: "cfg_project_Project",
-      patch: {
-        default_provider_id: "provider_one",
-        default_model_id: "model_one",
-        default_reasoning_level: "low",
-      },
-    });
-  });
-
-  it("restores project model inheritance by deleting the complete selection tuple", async () => {
-    const patch = vi.fn(async () => ({ version: "cfg_project_next" }));
-    const options = controllerOptions(vi.fn(async () => loadedSettings("Project")));
-    options.adapter.patch = patch;
-    options.workspaceScope = { workspaceId: "ws_project", kind: "project" };
-    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
-
-    await waitFor(() => expect(result.current.scopeReady).toBe(true));
-    act(() => result.current.setScope("project"));
-    await waitFor(() => expect(result.current.scopeWorkspaceId).toBe("ws_project"));
-    await act(async () => result.current.ports.onRestoreDefaultSelection());
-
-    expect(patch).toHaveBeenCalledWith({
-      scope: "project",
-      workspaceId: "ws_project",
-      expectedVersion: "cfg_project_Project",
-      patch: {
-        default_provider_id: null,
-        default_model_id: null,
-        default_reasoning_level: null,
-      },
-    });
-  });
-
-  it("rejects project access expansion before issuing a patch", async () => {
-    const loaded = loadedSettings("Project");
-    loaded.userDocument.defaultAccessMode = "approval_required";
-    loaded.document.defaultAccessMode = "approval_required";
-    const patch = vi.fn(async () => ({ version: "cfg_project_next" }));
-    const options = controllerOptions(vi.fn(async () => loaded));
-    options.adapter.patch = patch;
-    options.workspaceScope = { workspaceId: "ws_project", kind: "project" };
-    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
-
-    await waitFor(() => expect(result.current.scopeReady).toBe(true));
-    act(() => result.current.setScope("project"));
-    await waitFor(() => expect(result.current.scopeWorkspaceId).toBe("ws_project"));
-    await expect(
-      act(async () => result.current.ports.onAccessModeChange("full_access")),
-    ).rejects.toThrow("project access cannot exceed global access");
+    expect(save).toHaveBeenCalledTimes(4);
     expect(patch).not.toHaveBeenCalled();
-  });
-
-  it("resets with the project CAS version and reloads after a conflicting patch", async () => {
-    const snapshot = vi.fn(async () => loadedSettings("Project"));
-    const conflict = new Error("revision conflict");
-    const patch = vi.fn(async () => Promise.reject(conflict));
-    const reset = vi.fn(async () => ({ version: "cfg_project_next" }));
-    const options = controllerOptions(snapshot);
-    options.adapter.patch = patch;
-    options.adapter.reset = reset;
-    options.workspaceScope = { workspaceId: "ws_project", kind: "project" };
-    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
-
-    await waitFor(() => expect(result.current.scopeReady).toBe(true));
-    act(() => result.current.setScope("project"));
-    await waitFor(() => expect(result.current.scopeWorkspaceId).toBe("ws_project"));
-    const callsBeforeConflict = snapshot.mock.calls.length;
-    let rejected: unknown;
-    await act(async () => {
-      try {
-        await result.current.ports.onDefaultSelectionChange({
-          providerId: "provider_one",
-          modelId: "model_one",
-          reasoningLevel: "low",
-        });
-      } catch (error) {
-        rejected = error;
-      }
-    });
-    expect(rejected).toBe(conflict);
-    await waitFor(() => expect(snapshot.mock.calls.length).toBeGreaterThan(callsBeforeConflict));
-
-    await act(async () => result.current.ports.onResetProject());
-    expect(reset).toHaveBeenCalledWith({
-      scope: "project",
-      workspaceId: "ws_project",
-      expectedVersion: "cfg_project_Project",
-    });
+    expect(reset).not.toHaveBeenCalled();
   });
 });

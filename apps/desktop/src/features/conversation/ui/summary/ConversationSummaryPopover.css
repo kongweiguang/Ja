@@ -11,9 +11,7 @@
   border-radius: var(--ja-radius-lg);
   color: var(--ja-foreground);
   background: color-mix(in srgb, var(--ja-window-surface-muted) 96%, transparent);
-  box-shadow:
-    var(--ja-shadow-floating),
-    inset 0 1px rgb(255 255 255 / 7%);
+  box-shadow: var(--ja-shadow-floating);
   backdrop-filter: blur(18px) saturate(1.08);
   transform-origin: var(--radix-popover-content-transform-origin);
   animation: ja-conversation-summary-enter 140ms var(--ja-ease-native);

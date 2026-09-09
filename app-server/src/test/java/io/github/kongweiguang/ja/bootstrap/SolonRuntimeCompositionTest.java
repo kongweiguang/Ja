@@ -3,6 +3,8 @@
 
 package io.github.kongweiguang.ja.bootstrap;
 
+import io.github.kongweiguang.ja.attachment.domain.AttachmentFailure;
+import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.infrastructure.aot.AotSideEffectGuard;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,6 +17,8 @@ import io.github.kongweiguang.ja.conversation.application.context.summary.Summar
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.AutomaticTitleUsagePort;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
+import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.TurnMcpSessionFactory;
 import io.github.kongweiguang.ja.configuration.adapter.out.ConfigurationRuntimeAdapter;
@@ -46,7 +50,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证 Bean 实例身份、AOT 隔离、部分启动清理和幂等逆序关闭。 */
 final class SolonRuntimeCompositionTest {
-    /** 启动原生入口组合，并证明每个核心端口都解析为唯一 Bean 实例。 */
+    /** 启动真实组合根，锁定唯一核心实例与显式能力装配，避免仅测试局部工厂而漏掉生产接线。 */
     @Test
     void solonPublishesOneCoreRuntimeGeneration() throws Exception {
         Path data = Files.createTempDirectory("ja-solon-");
@@ -69,6 +73,11 @@ final class SolonRuntimeCompositionTest {
             assertSame(model, summaryFactory);
             assertNotNull(Solon.context().getBean(ContextOrchestratorFactory.class));
             assertNotNull(Solon.context().getBean(TurnMcpSessionFactory.class));
+            TurnRuntimeResolver runtimeResolver = Solon.context().getBean(TurnRuntimeResolver.class);
+            assertTrue(runtimeResolver instanceof SolonRuntimeComposition.DeferredTurnRuntimeResolver);
+            assertNotNull(Solon.context().getBean("jaConfigurationTurnRuntimeResolver"));
+            assertNotNull(Solon.context().getBean("jaAgentCapabilityCatalog"));
+            assertNotNull(Solon.context().getBean("jaPlanGoalAgentCapability"));
             ConfigurationUseCase configuration = Solon.context().getBean(ConfigurationUseCase.class);
             ConfigurationGenerationUseCase generations =
                     Solon.context().getBean(ConfigurationGenerationUseCase.class);
@@ -112,6 +121,27 @@ final class SolonRuntimeCompositionTest {
         } finally {
             composition.close();
         }
+    }
+
+    /** 真实附件域失败必须在组合根收敛为消费者端口失败，且公开异常不携带底层存储文本。 */
+    @Test
+    void attachmentReaderMapsAttachmentFailureToSanitizedConsumerFailure() {
+        AttachmentFailure source = new AttachmentFailure(
+                AttachmentFailure.Code.CONTENT_CORRUPT, new IllegalStateException("private blob path"));
+        AttachmentUseCase attachments = (AttachmentUseCase) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{AttachmentUseCase.class},
+                (proxy, method, arguments) -> {
+                    if ("read".equals(method.getName())) throw source;
+                    throw new AssertionError("unexpected attachment operation: " + method.getName());
+                });
+        ManagedAttachmentReader reader = SolonRuntimeComposition.attachmentReader(attachments);
+
+        ManagedAttachmentReader.ReadFailure failure = assertThrows(
+                ManagedAttachmentReader.ReadFailure.class,
+                () -> reader.inspect("att_missing", "thr_test"));
+
+        assertSame(source, failure.getCause());
+        assertEquals("managed attachment read failed", failure.getMessage());
     }
 
     /** 在 AOT 期间调用真实资源 Bean 工厂和 Home 解析，证明装配不要求 Host 参数且不访问磁盘。 */

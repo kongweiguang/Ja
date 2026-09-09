@@ -16,7 +16,6 @@ function createViewModel(overrides: Partial<FilesViewModel> = {}): FilesViewMode
   return {
     nodes: [],
     treeLoading: false,
-    mode: "files",
     searchQuery: "",
     searchResults: [],
     searchLoading: false,
@@ -35,7 +34,6 @@ function createViewModel(overrides: Partial<FilesViewModel> = {}): FilesViewMode
  */
 function createActions(): FilesActions {
   return {
-    showFiles: vi.fn(),
     selectNode: vi.fn(),
     toggleDirectory: vi.fn(),
     retryTree: vi.fn(),
@@ -86,13 +84,41 @@ describe("FilesWorkspaceView", () => {
     expect(actions.retryTree).toHaveBeenCalledOnce();
   });
 
-  it("空 projection 同时呈现资源树和编辑器的空状态", () => {
+  it("空 projection 在右侧呈现可搜索资源树，编辑器不再引用左侧位置", () => {
     render(<FilesWorkspace viewModel={createViewModel()} actions={createActions()} />);
 
     expect(
       screen.getByLabelText("文件工作区").querySelector(".ja-files-workspace-body"),
     ).toHaveClass("is-browser-only");
     expect(screen.getByText("工作区没有可显示的文件")).toBeVisible();
-    expect(screen.getByText("从左侧文件树选择文件开始编辑。")).toBeVisible();
+    expect(screen.getByRole("searchbox", { name: "搜索工作区" })).toHaveAttribute(
+      "placeholder",
+      "筛选文件…",
+    );
+    expect(screen.getByText("从右侧文件树选择文件开始编辑。")).toBeVisible();
+  });
+
+  it("工具栏右侧只统计当前权威树已载入的普通文件", () => {
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          nodes: [
+            {
+              id: "directory:src",
+              name: "src",
+              path: "src",
+              kind: "directory",
+              children: [
+                { id: "file:src/main.ts", name: "main.ts", path: "src/main.ts", kind: "file" },
+              ],
+            },
+            { id: "file:README.md", name: "README.md", path: "README.md", kind: "file" },
+          ],
+        })}
+        actions={createActions()}
+      />,
+    );
+
+    expect(screen.getByText("2 个文件")).toBeVisible();
   });
 });

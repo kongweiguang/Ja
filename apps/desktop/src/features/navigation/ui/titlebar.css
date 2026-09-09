@@ -16,7 +16,7 @@
   padding-inline: 10px;
   border-block-end: 0;
   color: var(--ja-foreground-muted);
-  background: var(--ja-window-backdrop);
+  background: var(--ja-titlebar);
   user-select: none;
   -webkit-app-region: drag;
 }

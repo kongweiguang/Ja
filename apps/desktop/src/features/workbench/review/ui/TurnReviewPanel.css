@@ -1,0 +1,74 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-turn-review-diff {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ja-surface-muted);
+}
+.ja-turn-review-diff-header {
+  display: flex;
+  min-width: 0;
+  min-height: 2.2rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.42rem 0.7rem;
+  border-bottom: 1px solid var(--ja-window-border);
+  background: var(--ja-window-surface-muted);
+}
+.ja-turn-review-diff-header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground);
+  font: var(--ja-text-control-size) / var(--ja-line-control) var(--ja-font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-turn-review-diff-header > span {
+  flex: 0 0 auto;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-turn-review-diff-content {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+.ja-turn-review-diff-content > .ja-review-unified-diff {
+  min-height: 0;
+}
+.ja-turn-review-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 100%;
+  margin: 0;
+  padding: 1rem;
+  color: var(--ja-foreground-muted);
+  text-align: center;
+}
+.ja-turn-review-state.is-error {
+  flex-direction: column;
+  color: var(--ja-danger);
+}
+.ja-turn-review-spin {
+  animation: ja-turn-review-spin 0.8s linear infinite;
+}
+@keyframes ja-turn-review-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-turn-review-spin {
+    animation: none;
+  }
+}

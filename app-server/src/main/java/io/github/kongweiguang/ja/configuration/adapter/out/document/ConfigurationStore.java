@@ -157,28 +157,6 @@ public final class ConfigurationStore {
     }
 
     /**
-     * 为配置 schema 迁移执行不允许降级的原子发布；不支持 ATOMIC_MOVE 的文件系统必须失败，
-     * 因为迁移不能用非原子替换承担进程中断后的半发布风险。
-     */
-    static void writeAtomicRequired(Path target, byte[] bytes) throws IOException {
-        Objects.requireNonNull(bytes, "bytes");
-        Path absolute = absolute(target);
-        Path parent = requireParent(absolute);
-        validateExistingPath(parent, true);
-        Files.createDirectories(parent);
-        validateExistingPath(parent, true);
-        validateLeafIfPresent(absolute, false);
-        Path temporary = Files.createTempFile(parent, ".ja-migration-", ".tmp");
-        try {
-            writeAndForce(temporary, bytes);
-            Files.move(temporary, absolute, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
-        } finally {
-            Files.deleteIfExists(temporary);
-        }
-    }
-
-    /**
      * Windows 原子写入的故障注入端口，生产默认无操作且不参与资源所有权。
      */
 

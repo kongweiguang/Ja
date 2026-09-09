@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, relative } from "node:path";
+import { TextDecoder } from "node:util";
 import { describe, expect, it } from "vitest";
 import { ReadyHandshake } from "../../apps/desktop/src/api/protocol/handshake";
 import { mapRpcError } from "../../apps/desktop/src/api/protocol/errors";
@@ -21,6 +23,8 @@ type JsonObject = Record<string, unknown>;
 interface ConsumptionState {
   readonly pending: Map<string, string>;
   readonly handshake: ReadyHandshake;
+  readonly observedMethods: Set<string>;
+  readonly observedEvents: Set<string>;
   requestCount: number;
   responseCount: number;
   readyToken?: string;
@@ -146,11 +150,30 @@ function newState(): ConsumptionState {
   return {
     pending: new Map<string, string>(),
     handshake,
+    observedMethods: new Set<string>(),
+    observedEvents: new Set<string>(),
     requestCount: 0,
     responseCount: 0,
     readyObserved: false,
     kernelIdentity: false,
   };
+}
+
+/**
+ * Node consumer 独立复核 Rust IPC 边界负责的 digest 与严格 UTF-8，浏览器同步 schema
+ * 只承担 Base64 形态和 decoded 长度，不能伪装成已验证正文。
+ */
+function validateChangeSetArtifactResult(result: unknown): void {
+  const artifact = result as {
+    readonly byteLength: number;
+    readonly sha256: string;
+    readonly contentBase64: string;
+  };
+  const bytes = Buffer.from(artifact.contentBase64, "base64");
+  if (bytes.byteLength !== artifact.byteLength) throw new Error("artifact byte length mismatch");
+  if (createHash("sha256").update(bytes).digest("hex") !== artifact.sha256)
+    throw new Error("artifact digest mismatch");
+  new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
 /** Routes one client frame through the actual desktop parser and its method-aware schema. */
@@ -160,6 +183,7 @@ function consumeFrame(frame: JsonObject, state: ConsumptionState): void {
   if (method !== undefined && id !== undefined) {
     const request = parseRequest(frame);
     parseMethodParams(method as never, request.params);
+    state.observedMethods.add(method);
     state.requestCount += 1;
     state.pending.set(id, method);
     return;
@@ -172,6 +196,7 @@ function consumeFrame(frame: JsonObject, state: ConsumptionState): void {
   }
   if (method !== undefined) {
     const event = parseEvent(frame, { expectedReadyToken: state.readyToken });
+    state.observedEvents.add(event.method);
     if (event.method === "runtime/status-changed") {
       state.handshake.acceptRuntimeStatus(event.params.status, event.params.readyToken);
       if (event.params.status === "ready") state.readyObserved = true;
@@ -185,6 +210,7 @@ function consumeFrame(frame: JsonObject, state: ConsumptionState): void {
   state.pending.delete(id);
   if ("result" in response) {
     const result = parseMethodResult(originatingMethod as never, response.result);
+    if (originatingMethod === "turn/change-set/read") validateChangeSetArtifactResult(result);
     if (originatingMethod === "runtime/initialize") {
       const runtime = (result as { runtime?: { engine?: string; engineVersion?: string } }).runtime;
       state.kernelIdentity =
@@ -228,6 +254,8 @@ describe("JA-RPC shared golden corpus", () => {
     let frames = 0;
     let readyObserved = false;
     let kernelIdentity = false;
+    const observedMethods = new Set<string>();
+    const observedEvents = new Set<string>();
     for (const file of corpusFiles(false)) {
       expect(containsUnsupportedVocabulary(readFileSync(file, "utf8"))).toBe(false);
       const state = newState();
@@ -240,24 +268,92 @@ describe("JA-RPC shared golden corpus", () => {
       expect(state.pending.size).toBe(state.requestCount - state.responseCount);
       readyObserved ||= state.readyObserved;
       kernelIdentity ||= state.kernelIdentity;
+      state.observedMethods.forEach((method) => observedMethods.add(method));
+      state.observedEvents.forEach((event) => observedEvents.add(event));
     }
     expect(frames).toBe(recordCount(false));
     expect(readyObserved).toBe(true);
     expect(kernelIdentity).toBe(true);
+    for (const method of [
+      "thread/seen",
+      "turn/input/enqueue",
+      "turn/input/prioritize",
+      "turn/input/update",
+      "turn/input/delete",
+      "turn/change-set/read",
+      "task/create",
+      "task/list",
+      "task/read",
+      "task/observe",
+      "task/unobserve",
+      "task/seen",
+      "task/message/send",
+      "task/followup",
+      "task/cancel",
+      "task/tree/delete",
+      "goal/read",
+      "goal/events/read",
+      "goal/observe",
+      "goal/unobserve",
+      "plan/read",
+      "plan/revisions/list",
+      "goal/evidence/list",
+      "goal/create",
+      "goal/plan/attach",
+      "goal/plan/detach",
+      "goal/pause",
+      "goal/resume",
+      "goal/stop",
+      "goal/input/respond",
+      "plan/create",
+      "plan/draft/save",
+      "plan/draft/discard",
+      "plan/propose",
+      "plan/approve",
+      "plan/execute",
+      "plan/reject",
+    ]) {
+      expect(observedMethods.has(method), method).toBe(true);
+    }
+    for (const event of [
+      "turn/input-queue-changed",
+      "turn/input-consumed",
+      "task/activity",
+      "task/progress",
+      "task/mailbox-changed",
+      "goal/changed",
+      "goal/activity",
+      "goal/input-requested",
+    ]) {
+      expect(observedEvents.has(event), event).toBe(true);
+    }
   });
 
-  /** Requires all schema-negative frames to fail the same production consumer boundary. */
+  /**
+   * 普通负例逐帧失败；correlated 负例先准入合法请求，再要求方法相关的非法响应失败，
+   * 避免把建立 pending correlation 的前置请求误判成非法合同。
+   */
   it("rejects every negative frame", () => {
     let frames = 0;
     for (const file of corpusFiles(true)) {
+      const correlated = file.includes(join("invalid", "correlated"));
+      const state = newState();
+      let correlatedFailure = false;
       for (const frame of documents(file)) {
-        const state = newState();
+        const isRequest = typeof frame.method === "string" && typeof frame.id === "string";
+        if (correlated && isRequest) {
+          expect(() => consumeFrame(frame, state)).not.toThrow();
+          frames += 1;
+          continue;
+        }
         expect(
           () => consumeFrame(frame, state),
           `${relative(GOLDEN, file)}:${String(frame.id ?? frame.method ?? "unknown")}`,
         ).toThrow();
+        if (correlated) correlatedFailure = true;
         frames += 1;
       }
+      if (correlated) expect(correlatedFailure, relative(GOLDEN, file)).toBe(true);
     }
     expect(frames).toBe(recordCount(true));
   });

@@ -23,13 +23,24 @@
         "pattern": "db/migration/.*"
       },
       {
-        "pattern": "db/storage-baseline\\.json"
-      },
-      {
         "pattern": "logback\\.xml"
       },
       {
         "pattern": "skills/.*"
+      }
+    ],
+    "excludes": [
+      {
+        "pattern": "META-INF/native-image/.*"
+      },
+      {
+        "pattern": "META-INF/maven/.*"
+      },
+      {
+        "pattern": "META-INF/(LICENSE|NOTICE|DEPENDENCIES|COPYING)(\\..*)?"
+      },
+      {
+        "pattern": "META-INF/MANIFEST\\.MF"
       }
     ]
   }

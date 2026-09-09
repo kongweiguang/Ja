@@ -11,7 +11,6 @@ import {
 const provider = {
   providerId: "provider_openai",
   name: "OpenAI",
-  provider: "openai",
   api: "openai_responses",
   baseUrl: "https://api.openai.com/v1",
   credentialId: "cred_openai",
@@ -33,15 +32,22 @@ const model = {
   defaultReasoningLevel: "high",
 } as const;
 
-describe("settings v4 validation", () => {
-  it("accepts a native Provider/API pair", () => {
+describe("settings v1 validation", () => {
+  it("accepts a custom Provider with an explicit API specification", () => {
     expect(providerSchema.safeParse(provider).success).toBe(true);
   });
 
-  it("rejects Provider/API mismatch and unsafe URL", () => {
-    expect(providerSchema.safeParse({ ...provider, api: "anthropic_messages" }).success).toBe(
-      false,
-    );
+  it("accepts every supported API independently from the display name", () => {
+    for (const api of [
+      "anthropic_messages",
+      "openai_responses",
+      "openai_chat_completions",
+    ] as const) {
+      expect(providerSchema.safeParse({ ...provider, name: "DeepSeek", api }).success).toBe(true);
+    }
+  });
+
+  it("rejects an unsafe URL", () => {
     expect(
       providerSchema.safeParse({ ...provider, baseUrl: "http://example.com/v1" }).success,
     ).toBe(false);

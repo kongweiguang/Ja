@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useCallback, useEffect, useState } from "react";
-import type { WorkbenchTab } from "@/features/workbench";
+import type { WorkbenchTabKey } from "@/features/workbench";
 import { useMediaQuery } from "@/shared/hooks/useMediaQuery";
-import { useUiPreferencesStore } from "@/shared/preferences/uiPreferences";
+import {
+  getRightPanelSessionState,
+  useRightPanelSessionStore,
+  useUiPreferencesStore,
+} from "@/shared/preferences/uiPreferences";
 
 const COMPACT_NAVIGATION_QUERY = "(max-width: 979px)";
 // Windows 显示缩放会把 799px CDP viewport 投影为 799.333 CSS px；保留与 800px
@@ -19,29 +23,30 @@ export interface ResponsiveShellController {
   readonly inspectorOpen: boolean;
   readonly workbenchSize: number;
   readonly workbenchVisible: boolean;
-  readonly workbenchTab: WorkbenchTab;
-  readonly workbenchTabs: readonly WorkbenchTab[];
+  readonly workbenchTab: WorkbenchTabKey;
+  readonly workbenchTabs: readonly WorkbenchTabKey[];
   readonly setSidebarPreviewRatio: (ratio: number) => void;
   readonly commitSidebarRatio: (ratio: number) => void;
   readonly setWorkbenchPreviewSize: (size: number) => void;
   readonly commitWorkbenchSize: (size: number) => void;
   readonly setInspectorOpen: (open: boolean) => void;
-  readonly setWorkbenchTab: (tab: WorkbenchTab) => void;
-  readonly setWorkbenchTabs: (tabs: readonly WorkbenchTab[]) => void;
+  readonly setWorkbenchTab: (tab: WorkbenchTabKey) => void;
+  readonly setWorkbenchTabs: (tabs: readonly WorkbenchTabKey[]) => void;
   readonly toggleInspector: () => void;
   readonly toggleSidebar: () => void;
   readonly closeSidebar: () => void;
 }
 
 /**
- * 响应式 Shell controller 只拥有导航、工作台尺寸 preference 与瞬态 Drawer；两个尺寸
- * 都采用“预览后提交”，避免 pointermove 高频写入 localStorage。右栏断点刻意使用子像素
- * 上界，以抵御 Windows 显示缩放造成的 CSS viewport 取整差异。
+ * 响应式 Shell controller 让导航与工作台尺寸保持全局 preference，但把瞬态 Drawer
+ * 绑定到 composition 提供的会话 scope。两个尺寸采用“预览后提交”，避免 pointermove
+ * 高频写入 localStorage；右栏断点使用子像素上界以抵御 Windows 显示缩放取整差异。
  */
 export function useResponsiveShellController(
   settingsRequired: boolean,
   settingsVisible: boolean,
   workspaceAvailable: boolean,
+  rightPanelScopeIdentity?: string,
 ): ResponsiveShellController {
   const sidebarCollapsed = useUiPreferencesStore((state) => state.sidebarCollapsed);
   const setSidebarCollapsed = useUiPreferencesStore((state) => state.setSidebarCollapsed);
@@ -49,12 +54,14 @@ export function useResponsiveShellController(
   const setSidebarRatio = useUiPreferencesStore((state) => state.setSidebarRatio);
   const persistedWorkbenchSize = useUiPreferencesStore((state) => state.workbenchSize);
   const setWorkbenchSize = useUiPreferencesStore((state) => state.setWorkbenchSize);
-  const inspectorOpen = useUiPreferencesStore((state) => state.inspectorOpen);
-  const setInspectorOpen = useUiPreferencesStore((state) => state.setInspectorOpen);
-  const workbenchTab = useUiPreferencesStore((state) => state.rightPanelTab);
-  const setWorkbenchTab = useUiPreferencesStore((state) => state.setRightPanelTab);
-  const workbenchTabs = useUiPreferencesStore((state) => state.rightPanelTabs);
-  const setWorkbenchTabs = useUiPreferencesStore((state) => state.setRightPanelTabs);
+  const rightPanelState = useRightPanelSessionStore((state) =>
+    getRightPanelSessionState(state.scopes, rightPanelScopeIdentity),
+  );
+  const {
+    inspectorOpen,
+    rightPanelTab: workbenchTab,
+    rightPanelTabs: workbenchTabs,
+  } = rightPanelState;
   const [sidebarPreviewRatio, setSidebarPreviewRatio] = useState(sidebarRatio);
   const [workbenchPreviewSize, setWorkbenchPreviewSize] = useState(persistedWorkbenchSize);
   const [compactSidebarOpen, setCompactSidebarOpen] = useState(false);
@@ -63,14 +70,6 @@ export function useResponsiveShellController(
   const sidebarVisible =
     !settingsRequired && (compactNavigation ? compactSidebarOpen : !sidebarCollapsed);
   const workbenchVisible = !settingsVisible && inspectorOpen && workspaceAvailable;
-
-  /**
-   * Tauri/WebView2 可能在同一浏览器进程中复用 renderer 与 HMR store，单靠 persist merge
-   * 不能覆盖这种进程边界。Shell 每次挂载都关闭瞬态 inspector，确保重启后的首屏一致。
-   */
-  useEffect(() => {
-    setInspectorOpen(false);
-  }, [setInspectorOpen]);
 
   /** preferences rehydrate 后同步 live resize 预览，不在 pointer move 时反复持久化。 */
   useEffect(() => {
@@ -87,10 +86,40 @@ export function useResponsiveShellController(
     setCompactSidebarOpen(false);
   }, [compactNavigation, settingsVisible]);
 
-  /** 次级工作面只切换进程期抽屉；宽度偏好独立保留，不让开闭动作改写布局。 */
+  /**
+   * setter 捕获创建它的 scope；异步操作晚到时仍只写回发起会话，空会话则不产生共享状态。
+   */
+  const setInspectorOpen = useCallback(
+    (open: boolean): void => {
+      if (!rightPanelScopeIdentity) return;
+      useRightPanelSessionStore.getState().setInspectorOpen(rightPanelScopeIdentity, open);
+    },
+    [rightPanelScopeIdentity],
+  );
+
+  /** 选择能力只更新回调创建时的会话 scope，避免旧请求改写当前对话。 */
+  const setWorkbenchTab = useCallback(
+    (tab: WorkbenchTabKey): void => {
+      if (!rightPanelScopeIdentity) return;
+      useRightPanelSessionStore.getState().setRightPanelTab(rightPanelScopeIdentity, tab);
+    },
+    [rightPanelScopeIdentity],
+  );
+
+  /** 打开列表只更新回调创建时的会话 scope，并保留关闭最后一项时的折叠语义。 */
+  const setWorkbenchTabs = useCallback(
+    (tabs: readonly WorkbenchTabKey[]): void => {
+      if (!rightPanelScopeIdentity) return;
+      useRightPanelSessionStore.getState().setRightPanelTabs(rightPanelScopeIdentity, tabs);
+    },
+    [rightPanelScopeIdentity],
+  );
+
+  /** 次级工作面切换所属会话的进程期抽屉；宽度偏好仍独立全局保留。 */
   const toggleInspector = useCallback((): void => {
-    setInspectorOpen(!inspectorOpen);
-  }, [inspectorOpen, setInspectorOpen]);
+    if (!rightPanelScopeIdentity) return;
+    useRightPanelSessionStore.getState().toggleInspector(rightPanelScopeIdentity);
+  }, [rightPanelScopeIdentity]);
 
   /** 紧凑宽度修改瞬态 Drawer，桌面宽度才修改持久 collapse preference。 */
   const toggleSidebar = useCallback((): void => {

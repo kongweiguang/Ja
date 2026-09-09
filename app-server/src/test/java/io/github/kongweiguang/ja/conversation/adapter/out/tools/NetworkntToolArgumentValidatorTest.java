@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 
 /** 验证 Tool Schema 边界不依赖 Provider 或任何 Jackson 主版本类型。 */
 final class NetworkntToolArgumentValidatorTest {
-    /** 有效对象通过，而类型不匹配只返回固定的有界本地错误。 */
+    /** 有效对象通过，而类型不匹配只返回字段位置和约束，不回显字段值。 */
     @Test
     void validatesArgumentsWithoutProviderCoupling() {
         String schema = """
@@ -24,7 +24,8 @@ final class NetworkntToolArgumentValidatorTest {
         assertDoesNotThrow(() -> validator.validate("{\"path\":\"README.md\"}"));
         ToolSchemaException failure = assertThrows(ToolSchemaException.class,
                 () -> validator.validate("{\"path\":7}"));
-        assertEquals("tool arguments do not match the JSON Schema", failure.getMessage());
+        assertEquals("Tool field at /path has the wrong JSON type", failure.getMessage());
+        assertFalse(failure.getMessage().contains("7"));
     }
 
     /** 非法 Schema、参数内容和第三方异常不会进入公开诊断或 cause 链。 */

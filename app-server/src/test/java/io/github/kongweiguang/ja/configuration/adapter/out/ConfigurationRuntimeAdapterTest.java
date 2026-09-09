@@ -68,12 +68,9 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /**
-     * 早期 v3 TOML 可能省略无法原生表示的 null；读取层必须补齐严格合同要求的根级与模型级
-     * 可空字段，使 effective 和 user RPC 来源都不会让桌面端误判配置损坏。
-     */
+    /** 缺失必填 nullable 字段的 v1 文档必须失败关闭，读取层不得替旧形状补字段。 */
     @Test
-    void restoresNullableV3FieldsOmittedByEarlierTomlWriter() throws Exception {
+    void rejectsV1DocumentWithMissingNullableFields() throws Exception {
         String omittedNulls = profileConfig("nullable-model")
                 .replace("default_reasoning_level = \"medium\"\n", "")
                 .replace("reasoning_level_map = { medium = \"medium\" }", "reasoning_level_map = {}");
@@ -81,15 +78,12 @@ final class ConfigurationRuntimeAdapterTest {
 
         try (ConfigurationRuntimeAdapter service = service()) {
             ConfigurationUseCase.ReadResult read = service.read(null);
-            ObjectNode user = node(read.user().document());
             ObjectNode effective = node(read.effective());
 
-            assertTrue(user.has("default_reasoning_level"));
-            assertTrue(user.get("default_reasoning_level").isNull());
-            assertTrue(selectedModel(user).has("default_reasoning_level"));
-            assertTrue(selectedModel(user).get("default_reasoning_level").isNull());
+            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, read.user().status());
+            assertNull(read.user().document());
             assertTrue(effective.get("default_reasoning_level").isNull());
-            assertTrue(selectedModel(effective).get("default_reasoning_level").isNull());
+            assertTrue(effective.withArray("providers").isEmpty());
         }
     }
 
@@ -129,6 +123,8 @@ final class ConfigurationRuntimeAdapterTest {
         ObjectMapper mapper = new ObjectMapper();
         try (ConfigurationRuntimeAdapter service = service()) {
             ObjectNode firstPatch = userDocument("provider_model", "model_model", "ja-e2e-fake");
+            ((ObjectNode) firstPatch.withArray("providers").get(0))
+                    .put("credential_id", "cred_deep.seek");
             ConfigurationError missingExpected = assertThrows(ConfigurationError.class, () -> service.patch(
                     ConfigurationScope.USER, null, document(firstPatch), null));
             assertEquals(ConfigurationError.Code.INVALID_ARGUMENT, missingExpected.code());
@@ -142,7 +138,7 @@ final class ConfigurationRuntimeAdapterTest {
             assertEquals(ConfigurationError.Code.CAS_CONFLICT, stale.code());
 
             ConfigurationUseCase.CredentialResult credential = service.setCredential(
-                    "cred_model", "never-print-this-secret", "cfg_missing");
+                    "cred_deep.seek", "never-print-this-secret", "cfg_missing");
             assertTrue(credential.version().startsWith("cfg_"));
             assertTrue(credential.configured());
             assertFalse(credential.toString().contains("never-print-this-secret"));
@@ -200,9 +196,24 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** v3 只接受 Provider/Model 能力与自动压缩开关，并拒绝已删除的压缩阈值字段。 */
+    /** 完整 replace 缺失 schema 时必须拒绝，发布路径不得自动写入当前版本。 */
     @Test
-    void mergePatchAcceptsV3CapabilitiesAndRejectsLegacyContextFields() {
+    void replaceRejectsMissingSchemaWithoutRepairingDocument() {
+        ObjectNode value = userDocument("provider_strict", "model_strict", "strict-model");
+        value.remove("schema_version");
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationError failure = assertThrows(ConfigurationError.class,
+                    () -> service.replace(ConfigurationScope.USER, null, document(value), "cfg_missing"));
+
+            assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+            assertFalse(Files.exists(homeDirectory().resolve("config.toml")));
+        }
+    }
+
+    /** v1 只接受 Provider/Model 能力与自动压缩开关，并拒绝闭集外压缩阈值字段。 */
+    @Test
+    void mergePatchAcceptsV1CapabilitiesAndRejectsUnknownContextFields() {
         ObjectNode patch = userDocument("provider_budget", "model_budget", "budget-model");
         ObjectNode invalidDocument = patch.deepCopy();
         ((ObjectNode) invalidDocument.withArray("providers").get(0)
@@ -487,6 +498,23 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
+    /** 读取边界只接受当前 v1；其它版本不转换，也不改写调用方的原始字节。 */
+    @Test
+    void unsupportedConfigurationSchemaIsRejectedWithoutMigration() throws Exception {
+        Path config = homeDirectory().resolve("config.toml");
+        String unsupportedSchema = profileConfig("unsupported-schema-model")
+                .replace("schema_version = 1", "schema_version = 2");
+        Files.writeString(config, unsupportedSchema);
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult read = service.read(null);
+
+            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, read.user().status());
+            assertTrue(read.diagnostics().contains("CORRUPT_CONFIG"));
+            assertEquals(unsupportedSchema, Files.readString(config));
+        }
+    }
+
     /** windowsAuthFileIsCurrentUserOnly 集中维护 secret 与 credential 的脱敏边界，并确保敏感缓冲区按所有权生命周期清理。 */
     @Test
     void windowsAuthFileIsCurrentUserOnly() throws Exception {
@@ -597,9 +625,9 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** 生成完整 v3 用户配置，使运行时代际测试只改变上游模型名称。 */
+    /** 生成完整 v1 用户配置，使运行时代际测试只改变上游模型名称。 */
     private static String profileConfig(String model) {
-        return "schema_version = 4\n"
+        return "schema_version = 1\n"
                 + "config_revision = 1\n"
                 + "default_access_mode = \"approval_required\"\n"
                 + "default_provider_id = \"provider_model\"\n"
@@ -609,7 +637,6 @@ final class ConfigurationRuntimeAdapterTest {
                 + "[[providers]]\n"
                 + "provider_id = \"provider_model\"\n"
                 + "name = \"Test\"\n"
-                + "provider = \"openai\"\n"
                 + "api = \"openai_responses\"\n"
                 + "base_url = \"http://127.0.0.1\"\n"
                 + "credential_id = \"cred_model\"\n"
@@ -626,7 +653,7 @@ final class ConfigurationRuntimeAdapterTest {
 
     /** 生成只收紧模型输出上限的项目 overlay，项目层不复制 Provider 路由。 */
     private static String projectOverlayConfig(int maxOutputTokens) {
-        return "schema_version = 4\nconfig_revision = 1\ndefault_access_mode = \"approval_required\"\n"
+        return "schema_version = 1\nconfig_revision = 1\ndefault_access_mode = \"approval_required\"\n"
                 + "default_provider_id = \"provider_model\"\ndefault_model_id = \"model_model\"\n"
                 + "default_reasoning_level = \"medium\"\nmcp_servers = []\nskills = []\n"
                 + "[[providers]]\nprovider_id = \"provider_model\"\n"
@@ -638,10 +665,10 @@ final class ConfigurationRuntimeAdapterTest {
 
     /** catalogConfig 固定 Provider/Model 与 Skill/MCP 引用闭包。 */
     private static String catalogConfig(String endpoint) {
-        return "schema_version = 4\nconfig_revision = 1\ndefault_access_mode = \"full_access\"\n"
+        return "schema_version = 1\nconfig_revision = 1\ndefault_access_mode = \"full_access\"\n"
                 + "default_provider_id = \"provider_catalog\"\ndefault_model_id = \"model_catalog\"\n"
                 + "default_reasoning_level = \"medium\"\n"
-                + "[[providers]]\nprovider_id = \"provider_catalog\"\nname = \"Catalog\"\nprovider = \"openai\"\napi = \"openai_responses\"\nbase_url = \"http://127.0.0.1\"\ncredential_id = \"cred_model\"\n"
+                + "[[providers]]\nprovider_id = \"provider_catalog\"\nname = \"Catalog\"\napi = \"openai_responses\"\nbase_url = \"http://127.0.0.1\"\ncredential_id = \"cred_model\"\n"
                 + "[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n"
                 + "[providers.agent_defaults]\n"
                 + "[providers.agent_defaults.context]\nauto_compact = true\n"
@@ -649,7 +676,8 @@ final class ConfigurationRuntimeAdapterTest {
                 + "[[providers.models]]\nmodel_id = \"model_catalog\"\nname = \"Catalog Model\"\nmodel = \"fixture\"\nreasoning_level_map = { medium = \"medium\" }\ndefault_reasoning_level = \"medium\"\n"
                 + "[providers.models.capabilities]\ncontext_window_tokens = 128000\nmax_output_tokens = 8192\n"
                 + "[[mcp_servers]]\nmcp_id = \"mcp_catalog\"\nname = \"MCP\"\ntransport = \"stdio\"\n"
-                + "endpoint = \"" + endpoint + "\"\nenabled = true\n"
+                + "endpoint = \"" + endpoint + "\"\nargs = []\nenv = {}\nheaders = {}\n"
+                + "auth = { kind = \"none\" }\nenabled = true\n"
                 + "[[skills]]\nskill_id = \"skill_catalog\"\nname = \"Skill\"\nscope = \"user\"\nenabled = true\ndescription = \"Catalog\"\n";
     }
 
@@ -659,10 +687,10 @@ final class ConfigurationRuntimeAdapterTest {
                 .replace("enabled = true\n[[skills]]", "[[skills]]");
     }
 
-    /** 构造可直接 merge-patch 到缺失配置的完整 v4 用户文档。 */
+    /** 构造可直接 merge-patch 到缺失配置的完整 v1 用户文档。 */
     private static ObjectNode userDocument(String providerId, String modelId, String upstreamModel) {
         ObjectNode root = JSON.createObjectNode();
-        root.put("schema_version", 4).put("config_revision", 1)
+        root.put("schema_version", 1).put("config_revision", 1)
                 .put("default_access_mode", "approval_required")
                 .put("default_provider_id", providerId).put("default_model_id", modelId)
                 .put("default_reasoning_level", "medium");
@@ -670,7 +698,7 @@ final class ConfigurationRuntimeAdapterTest {
         root.putArray("skills");
         ObjectNode provider = root.putArray("providers").addObject();
         provider.put("provider_id", providerId).put("name", "Fixture")
-                .put("provider", "openai").put("api", "openai_responses")
+                .put("api", "openai_responses")
                 .put("base_url", "http://127.0.0.1:9/v1").put("credential_id", "cred_model");
         provider.putObject("network_timeouts").put("connect_timeout_ms", 5_000)
                 .put("request_timeout_ms", 30_000);

@@ -18,7 +18,11 @@ export function parseMethodParams<M extends ClientMethod>(
   params: unknown,
 ): MethodParams<M> {
   const allowCredentialSecret = method === "credential/set";
-  assertNoReadyTokenLeak(params, { allowCredentialSecret });
+  // attachment preview 的 authorization 是资源归属 tag；只在 params 根的精确键放行，
+  // 其它方法或嵌套位置仍按潜在凭据泄漏拒绝。
+  const allowAuthorizationPath =
+    method === "attachment/preview/open" ? (["authorization"] as const) : undefined;
+  assertNoReadyTokenLeak(params, { allowCredentialSecret, allowAuthorizationPath });
   return ParamsSchemaByMethod[method].parse(params) as MethodParams<M>;
 }
 

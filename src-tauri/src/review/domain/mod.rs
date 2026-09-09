@@ -7,13 +7,12 @@
 // Tauri。外部能力只能在 application 端口之后进入，避免领域对象被原生实现反向污染。
 
 pub(crate) mod model;
-pub(crate) mod turn_change;
 
+pub(crate) use model::ReviewWorktreeEvidence;
 pub use model::{
     MAX_REVIEW_DIFF_BYTES, MAX_REVIEW_DIFF_LINES, MAX_REVIEW_FILES, ReviewAction,
     ReviewApplyResult, ReviewCatalog, ReviewCatalogLimit, ReviewCommit, ReviewCommitId, ReviewFile,
-    ReviewFileDiff, ReviewFileId, ReviewFileStatus, ReviewHunk, ReviewHunkId, ReviewLine,
-    ReviewLineKind, ReviewOperationId, ReviewRef, ReviewRefId, ReviewRevision, ReviewSnapshot,
-    ReviewSource, ReviewStats, ReviewTarget,
+    ReviewFileDiff, ReviewFileId, ReviewFileLayer, ReviewFileStatus, ReviewHunk, ReviewHunkId,
+    ReviewLine, ReviewLineKind, ReviewOperationId, ReviewRef, ReviewRefId, ReviewRevision,
+    ReviewSnapshot, ReviewSource, ReviewStats, ReviewTarget,
 };
-pub(crate) use turn_change::*;

@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.conversation.adapter.out.provider.openai;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderRequestEnvelope;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
@@ -14,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.List;
 import java.util.Set;
 
@@ -41,6 +43,22 @@ final class OpenAiResponsesCodecTest {
         assertEquals("input_file", content.path(2).path("type").asText());
         assertEquals("guide.pdf", content.path(2).path("filename").asText());
         assertEquals("data:application/pdf;base64,AgM=", content.path(2).path("file_data").asText());
+    }
+
+    /** 真实 Codec 生成的 300 KB PNG 保留完整发送载荷，但本地预算不得按 Base64 文本膨胀。 */
+    @Test
+    void codecGeneratedLargePngUsesImageBudgetInsteadOfBase64Length() {
+        byte[] png = png(1_920, 1_080, 300 * 1024);
+        ModelPort.ModelRequest request = request(ModelRole.USER, List.of(
+                new TextContent("describe"), attachment(NativeAttachmentContent.Kind.IMAGE,
+                        "screen.png", "image/png", png.length,
+                        Base64.getEncoder().encodeToString(png))));
+
+        ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(
+                OpenAiResponsesCodec.encodeRequest(request), ModelPort.Api.OPENAI_RESPONSES);
+
+        assertTrue(envelope.sendBody().length > 400_000);
+        assertTrue(envelope.inputTokenEstimate() < 128_000);
     }
 
     /** Assistant 历史不得携带用户上传字节，避免生成不被 Responses 接受的 EasyInput。 */
@@ -82,13 +100,35 @@ final class OpenAiResponsesCodecTest {
             ModelRole role,
             List<io.github.kongweiguang.ja.conversation.domain.model.ModelContent> content) {
         ModelPort.ModelConfiguration configuration = new ModelPort.ModelConfiguration(
-                "provider_test", "model_test", "cfg_test", ModelPort.Provider.OPENAI,
-                ModelPort.Api.OPENAI_RESPONSES, "test-model", URI.create("http://127.0.0.1:60842"), "",
+                "provider_test", "model_test", "cfg_test", ModelPort.Api.OPENAI_RESPONSES, "test-model", URI.create("http://127.0.0.1:60842"), "fixture-only-api-key",
                 Duration.ofSeconds(1), Duration.ofSeconds(1),
                 Set.of(ModelPort.InputModality.TEXT, ModelPort.InputModality.IMAGE, ModelPort.InputModality.PDF),
                 ModelPort.GenerationOptions.defaults());
         return new ModelPort.ModelRequest(configuration,
                 new ModelPort.PromptPayload("system", "prompt_test"),
                 List.of(new ModelMessage(role, content)), List.of(), null, 1);
+    }
+
+    /** 生成带真实 PNG signature/IHDR 尺寸字段的有界测试载荷，尾部模拟压缩数据。 */
+    private static byte[] png(int width, int height, int length) {
+        byte[] value = new byte[Math.max(24, length)];
+        byte[] signature = {(byte) 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+        System.arraycopy(signature, 0, value, 0, signature.length);
+        value[11] = 13;
+        value[12] = 0x49;
+        value[13] = 0x48;
+        value[14] = 0x44;
+        value[15] = 0x52;
+        putBigEndian(value, 16, width);
+        putBigEndian(value, 20, height);
+        return value;
+    }
+
+    /** 写入 PNG 使用的网络字节序 32 位尺寸。 */
+    private static void putBigEndian(byte[] value, int offset, int number) {
+        value[offset] = (byte) (number >>> 24);
+        value[offset + 1] = (byte) (number >>> 16);
+        value[offset + 2] = (byte) (number >>> 8);
+        value[offset + 3] = (byte) number;
     }
 }

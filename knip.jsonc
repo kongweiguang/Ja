@@ -3,11 +3,24 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
     "apps/desktop/tests/app/e2e/main.tsx",
+    // 这些文件是桌面各 capability 的显式公共边界；仓库内未消费的导出仍供 composition/宿主按边界引用。
+    "apps/desktop/src/api/protocol/goal.ts",
+    "apps/desktop/src/api/protocol/protocol.ts",
+    "apps/desktop/src/api/tauri/attachmentPreview.ts",
+    "apps/desktop/src/api/tauri/runtime.ts",
+    "apps/desktop/src/features/conversation/index.ts",
+    "apps/desktop/src/features/goals/index.ts",
+    "apps/desktop/src/features/tasks/index.ts",
+    "apps/desktop/src/features/workbench/index.ts",
+    "apps/desktop/src/features/workbench/preview/application/index.ts",
+    "apps/desktop/src/features/workbench/preview/index.ts",
     "tests/contract/vitest.config.ts",
     "scripts/e2e/kernel-loop-smoke.mjs",
     "scripts/e2e/real-provider-smoke.mjs",
     // Python Native sidecar smoke 以进程 fixture 路径启动该文件；删除条件是该 smoke 改用生产产物或移除。
-    "scripts/e2e/fixtures/v2-smoke-mock-sidecar.mjs",
+    "scripts/e2e/fixtures/v1-smoke-mock-sidecar.mjs",
+    // Runtime refresh smoke 通过动态生成的 MCP TOML args 启动该文件；删除条件是改为静态模块引用或移除该验收。
+    "scripts/e2e/fixtures/runtime-refresh-mcp.mjs",
     "scripts/e2e/webview2-edgedriver-runner.mjs",
     "scripts/e2e/windows-desktop-smoke.mjs",
   ],
@@ -27,5 +40,12 @@
     // 真窗 smoke 中的 Vite 浏览器绝对路径只在 page.evaluate 运行；删除条件是改为 Knip 可解析的静态入口。
     "/src/api/protocol/protocol.ts",
     "/src/features/conversation/application/timelineStore.ts",
+    "/src/features/conversation/domain/timelineContracts.ts",
   ],
+  "ignoreBinaries": [
+    // Windows 真窗 runner 只在清理自己启动的进程树时调用系统 taskkill；删除条件是统一改用 Node 原生进程树终止。
+    "taskkill.exe",
+  ],
+  // Zod schema 与领域类型常在声明文件内部组合成公开根 schema；内部有真实引用时不按未使用出口处理。
+  "ignoreExportsUsedInFile": true,
 }

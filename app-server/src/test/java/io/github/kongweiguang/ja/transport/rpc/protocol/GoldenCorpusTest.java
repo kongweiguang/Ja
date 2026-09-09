@@ -4,33 +4,118 @@
 package io.github.kongweiguang.ja.transport.rpc.protocol;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.kongweiguang.ja.transport.rpc.handler.HandshakeContractTestAccess;
 import com.networknt.schema.Schema;
+import io.github.kongweiguang.ja.conversation.domain.UserContent;
+import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
+import io.github.kongweiguang.ja.conversation.domain.model.SkillReferenceContent;
+import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
+import io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock;
+import io.github.kongweiguang.ja.conversation.domain.model.WorkspaceReferenceContent;
 import com.networknt.schema.SchemaRegistry;
 import com.networknt.schema.SpecificationVersion;
 import com.networknt.schema.InputFormat;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
 import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
 import org.junit.jupiter.api.Test;
 
-/** 以冻结语料证明 Java 仅接受 JA-RPC v2，并拒绝旧协议及越界配置样例。 */
+/** 以冻结语料证明 Java 仅接受 JA-RPC v1，并拒绝旧协议及越界配置样例。 */
 final class GoldenCorpusTest {
+    private static final Map<String, String> RESULT_DEFINITIONS = Map.ofEntries(
+            Map.entry("workspace/list", "workspacePageResult"),
+            Map.entry("workspace/path/search", "workspacePathSearchResult"),
+            Map.entry("thread/create", "threadResult"),
+            Map.entry("thread/list", "threadPageResult"),
+            Map.entry("thread/search", "threadPageResult"),
+            Map.entry("thread/read", "threadReadResult"),
+            Map.entry("thread/rename", "threadResult"),
+            Map.entry("thread/preferences/update", "threadResult"),
+            Map.entry("thread/pin", "threadResult"),
+            Map.entry("thread/seen", "threadResult"),
+            Map.entry("thread/archive", "threadResult"),
+            Map.entry("thread/restore", "threadResult"),
+            Map.entry("goal/read", "goalProjectionResult"),
+            Map.entry("goal/events/read", "goalEventsResult"),
+            Map.entry("goal/observe", "goalObserveResult"),
+            Map.entry("goal/unobserve", "taskAcceptedResult"),
+            Map.entry("plan/read", "planProjection"),
+            Map.entry("plan/revisions/list", "planRevisionsResult"),
+            Map.entry("goal/evidence/list", "goalEvidenceResult"),
+            Map.entry("goal/create", "goalProjectionResult"),
+            Map.entry("goal/plan/attach", "goalProjectionResult"),
+            Map.entry("goal/plan/detach", "goalProjectionResult"),
+            Map.entry("goal/pause", "goalProjectionResult"),
+            Map.entry("goal/resume", "goalProjectionResult"),
+            Map.entry("goal/stop", "goalProjectionResult"),
+            Map.entry("goal/input/respond", "goalProjectionResult"),
+            Map.entry("plan/create", "planProjection"),
+            Map.entry("plan/draft/save", "planProjection"),
+            Map.entry("plan/draft/discard", "planProjection"),
+            Map.entry("plan/propose", "planProjection"),
+            Map.entry("plan/approve", "planProjection"),
+            Map.entry("plan/execute", "planProjection"),
+            Map.entry("plan/reject", "planProjection"),
+            Map.entry("task/create", "taskCreateResult"),
+            Map.entry("task/list", "taskListResult"),
+            Map.entry("task/read", "taskReadResult"),
+            Map.entry("task/observe", "taskObserveResult"),
+            Map.entry("task/unobserve", "taskAcceptedResult"),
+            Map.entry("task/seen", "taskMutationResult"),
+            Map.entry("task/message/send", "taskMessageResult"),
+            Map.entry("task/followup", "taskFollowupResult"),
+            Map.entry("task/cancel", "taskMutationResult"),
+            Map.entry("task/tree/delete", "taskTreeDeleteResult"),
+            Map.entry("skill/list", "skillPageResult"),
+            Map.entry("mcp/list", "mcpPageResult"),
+            Map.entry("mcp/list-tools", "mcpToolsResult"),
+            Map.entry("workspace/open-general", "workspaceResult"),
+            Map.entry("thread/compact", "threadCompactResult"),
+            Map.entry("attachment/import", "attachmentResult"),
+            Map.entry("attachment/discard", "attachmentResult"),
+            Map.entry("turn/start", "turnAcceptedResult"),
+            Map.entry("turn/resume", "turnResumeResult"),
+            Map.entry("turn/cancel", "turnCancelResult"),
+            Map.entry("turn/input/enqueue", "turnInputMutationResult"),
+            Map.entry("turn/input/prioritize", "turnInputMutationResult"),
+            Map.entry("turn/input/update", "turnInputMutationResult"),
+            Map.entry("turn/input/delete", "turnInputMutationResult"),
+            Map.entry("turn/change-set/read", "changeSetArtifactReadResult"),
+            Map.entry("configuration/read", "configReadResult"),
+            Map.entry("configuration/patch", "configMutationResult"),
+            Map.entry("configuration/replace", "configMutationResult"),
+            Map.entry("configuration/reset", "configMutationResult"),
+            Map.entry("credential/set", "credentialMutationResult"),
+            Map.entry("credential/delete", "credentialMutationResult"));
+
     /** 遍历全部正向帧，防止协议主版本或配置事件边界在局部测试之外发生漂移。 */
     @Test
-    void consumesEveryV2PositiveFrame() throws IOException {
+    void consumesEveryV1PositiveFrame() throws IOException {
         JaRpcCodec codec = new JaRpcCodec();
+        ObjectMapper mapper = new ObjectMapper();
         int frames = 0;
-        boolean sawV2 = false;
+        boolean sawV1 = false;
         boolean sawConfigChanged = false;
         for (Path file : corpusFiles(false)) {
             List<byte[]> documents = documents(file);
@@ -43,48 +128,187 @@ final class GoldenCorpusTest {
                     throw new AssertionError("positive frame rejected: " + file + ":" + (index + 1), failure);
                 }
                 if (frame instanceof JaRpcCodec.Request request && "runtime/initialize".equals(request.method())) {
-                    sawV2 = request.params().path("protocolMajor").intValue() == 2
+                    sawV1 = request.params().path("protocolMajor").intValue() == 1
                             && !request.params().has("configSnapshot");
+                    assertEquals(HandshakeContractTestAccess.capabilities(mapper),
+                            request.params().path("capabilities"),
+                            "Java runtime handshake must match the frozen client capability set");
                 }
                 if (frame instanceof JaRpcCodec.Notification notification
                         && "configuration/changed".equals(notification.method())) sawConfigChanged = true;
                 frames++;
             }
         }
-        assertTrue(frames > 0 && sawV2 && sawConfigChanged);
+        assertTrue(frames > 0 && sawV1 && sawConfigChanged);
     }
 
     /**
-     * 在正确责任边界拒绝全部反向帧：Codec 负责信封结构，冻结的 v2 Schema
+     * 在正确责任边界拒绝全部反向帧：Codec 负责信封结构，冻结的 v1 Schema
      * 及 Secret、cwd 规则负责方法和通知形态，避免生产解码器重复实现合同。
      */
     @Test
-    void rejectsEveryV2NegativeFrame() throws IOException {
+    void rejectsEveryV1NegativeFrame() throws IOException {
         JaRpcCodec codec = new JaRpcCodec();
-        Schema schema = v2Schema(codec);
+        ContractSchemas schemas = contractSchemas(codec);
         int frames = 0;
         for (Path file : corpusFiles(true)) {
+            boolean correlated = file.toString().contains(
+                    Path.of("invalid", "correlated").toString());
+            Map<String, String> pending = new HashMap<>();
             List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
             for (int index = 0; index < lines.size(); index++) {
                 String line = lines.get(index);
                 if (line.isBlank()) continue;
-                assertNegativeFrame(codec, schema, line.getBytes(StandardCharsets.UTF_8), file, index + 1);
+                byte[] bytes = line.getBytes(StandardCharsets.UTF_8);
+                JsonNode document = codec.mapper().readTree(bytes);
+                if (correlated && document.has("method") && document.has("id")) {
+                    registerCorrelatedRequest(codec, schemas.envelope(), pending,
+                            bytes, document, file, index + 1);
+                    continue;
+                }
+                if (correlated && document.has("id")) {
+                    assertNegativeCorrelatedResponse(codec, schemas, pending,
+                            bytes, document, file, index + 1);
+                } else {
+                    assertNegativeFrame(codec, schemas.envelope(), bytes, file, index + 1);
+                }
                 frames++;
             }
+            assertTrue(pending.isEmpty(), () -> "correlated negative response is missing: " + file);
         }
         assertTrue(frames > 0);
+    }
+
+    /** 消费事件必须原子保留队列摘要，不能让同一附件 ID 在 Timeline 中静默换名或换类型。 */
+    @Test
+    void rejectsConsumedAttachmentSummaryDrift() throws IOException {
+        JsonNode document = new ObjectMapper().readTree("""
+                {
+                  "jsonrpc":"2.0",
+                  "method":"turn/input-consumed",
+                  "params":{
+                    "turnId":"turn_demo",
+                    "input":{
+                      "turnId":"turn_demo",
+                      "content":[{"type":"attachment","attachmentId":"att_capture"}],
+                      "attachments":[{
+                        "attachmentId":"att_capture","displayName":"capture.png",
+                        "sizeBytes":128,"mediaKind":"image","mediaType":"image/png"
+                      }]
+                    },
+                    "userItem":{
+                      "turnId":"turn_demo",
+                      "content":[{"type":"attachment","attachmentId":"att_capture"}],
+                      "attachments":[{
+                        "attachmentId":"att_capture","displayName":"other.png",
+                        "sizeBytes":128,"mediaKind":"image","mediaType":"image/png"
+                      }]
+                    }
+                  }
+                }
+                """);
+
+        assertTrue(violatesSemanticBoundary(document));
     }
 
     /**
      * 仅在测试中加载仓库的 draft-2020-12 合同，使生产解码保持专注于有界
      * JSON-RPC 分帧，不在运行时重复维护每个方法的 Schema。
      */
-    private static Schema v2Schema(JaRpcCodec codec) throws IOException {
-        Path schemaPath = goldenRoot().resolve("..").resolve("ja-rpc").resolve("v2").resolve("schema")
-                .resolve("ja-rpc-v2.schema.json").normalize();
-        return SchemaRegistry.withDefaultDialect(SpecificationVersion.DRAFT_2020_12,
-                builder -> builder.schemaCacheEnabled(true)).getSchema(
-                        Files.readString(schemaPath, StandardCharsets.UTF_8));
+    private static ContractSchemas contractSchemas(JaRpcCodec codec) throws IOException {
+        Path schemaPath = goldenRoot().resolve("..").resolve("ja-rpc").resolve("v1").resolve("schema")
+                .resolve("ja-rpc-v1.schema.json").normalize();
+        String source = Files.readString(schemaPath, StandardCharsets.UTF_8);
+        ObjectNode document = (ObjectNode) codec.mapper().readTree(source);
+        SchemaRegistry registry = SchemaRegistry.withDefaultDialect(
+                SpecificationVersion.DRAFT_2020_12, builder -> builder.schemaCacheEnabled(true));
+        Map<String, Schema> results = new HashMap<>();
+        for (Map.Entry<String, String> entry : RESULT_DEFINITIONS.entrySet()) {
+            results.put(entry.getKey(), namedSchema(codec, registry, document, entry.getValue()));
+        }
+        return new ContractSchemas(registry.getSchema(source), Map.copyOf(results));
+    }
+
+    /**
+     * 从冻结合同的共享 `$defs` 构造方法结果 validator，避免 Java 测试复制字段闭集或 Turn 状态词汇。
+     */
+    private static Schema namedSchema(JaRpcCodec codec, SchemaRegistry registry,
+                                      ObjectNode document, String definition) {
+        ObjectNode wrapper = codec.mapper().createObjectNode();
+        wrapper.put("$schema", document.path("$schema").textValue());
+        wrapper.set("$defs", document.path("$defs").deepCopy());
+        wrapper.put("$ref", "#/$defs/" + definition);
+        return registry.getSchema(wrapper.toString());
+    }
+
+    /**
+     * correlated 目录中的请求只是为后续响应提供方法身份；它自身必须同时通过 Codec 与总 Schema。
+     */
+    private static void registerCorrelatedRequest(JaRpcCodec codec, Schema schema,
+                                                  Map<String, String> pending, byte[] bytes,
+                                                  JsonNode document, Path file, int lineNumber) {
+        try {
+            JaRpcCodec.Frame frame = codec.decode(bytes);
+            if (!(frame instanceof JaRpcCodec.Request request)
+                || !schema.validate(document.toString(), InputFormat.JSON).isEmpty()
+                || pending.putIfAbsent(request.id(), request.method()) != null) {
+                throw new AssertionError("invalid correlated request context: " + file + ":" + lineNumber);
+            }
+        } catch (JaRpcException failure) {
+            throw new AssertionError("correlated request context rejected: " + file + ":" + lineNumber,
+                    failure);
+        }
+    }
+
+    /**
+     * 响应先通过信封校验，再消费同文件 pending 方法并验证专属 result；只有至少一个边界拒绝才是有效负例。
+     */
+    private static void assertNegativeCorrelatedResponse(JaRpcCodec codec, ContractSchemas schemas,
+                                                         Map<String, String> pending, byte[] bytes,
+                                                         JsonNode document, Path file, int lineNumber) {
+        try {
+            codec.decode(bytes);
+        } catch (JaRpcException expected) {
+            pending.remove(document.path("id").textValue());
+            return;
+        }
+        boolean envelopeRejected = !schemas.envelope()
+                .validate(document.toString(), InputFormat.JSON).isEmpty();
+        String method = pending.remove(document.path("id").textValue());
+        boolean correlationRejected = method == null;
+        Schema resultSchema = method == null ? null : schemas.results().get(method);
+        boolean resultRejected = document.has("result") && resultSchema != null
+                && !resultSchema.validate(document.get("result").toString(), InputFormat.JSON).isEmpty();
+        boolean semanticRejected = rejectsChangeSetArtifactSemantics(method, document.path("result"));
+        assertTrue(envelopeRejected || correlationRejected || resultRejected || semanticRejected,
+                () -> "negative correlated response accepted: " + file + ":" + lineNumber);
+    }
+
+    /**
+     * JSON Schema 无法关联 Base64 正文、字节长度和摘要；仅对完整字段形态复核该跨字段不变量，
+     * 并要求正文是严格 UTF-8，避免历史 Diff 在不同消费者间产生不同解释。
+     */
+    private static boolean rejectsChangeSetArtifactSemantics(String method, JsonNode result) {
+        if (!"turn/change-set/read".equals(method)
+                || !result.path("contentBase64").isTextual()
+                || !result.path("byteLength").canConvertToInt()
+                || !result.path("sha256").isTextual()) return false;
+        try {
+            byte[] content = Base64.getDecoder().decode(result.path("contentBase64").textValue());
+            if (content.length != result.path("byteLength").intValue()) return true;
+            String digest = HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256").digest(content));
+            if (!digest.equals(result.path("sha256").textValue())) return true;
+            StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(content));
+            return false;
+        } catch (IllegalArgumentException | CharacterCodingException invalidContent) {
+            return true;
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
     }
 
     /**
@@ -134,13 +358,16 @@ final class GoldenCorpusTest {
                 return true;
             }
         }
+        if ("configuration/replace".equals(method) && params instanceof ObjectNode config
+                && providersShareCredential(config.path("document"))) return true;
         if ("runtime/initialize".equals(method)
-                && (object.path("params").path("protocolMajor").intValue() != 2
+                && (object.path("params").path("protocolMajor").intValue() != 1
                 || object.path("params").has("configSnapshot"))) return true;
         if ("turn/start".equals(method) && params instanceof ObjectNode turn) {
             if (turn.has("cwd") || turn.has("profileId") || turn.has("configRevision")) return true;
             JsonNode content = turn.get("content");
             if (content == null || !content.isArray()) return true;
+            if (invalidUserContent(content)) return true;
             Set<String> attachmentIds = new HashSet<>();
             int attachmentCount = 0;
             for (JsonNode item : content) {
@@ -159,6 +386,62 @@ final class GoldenCorpusTest {
         if ("context/compacted".equals(method) && params instanceof ObjectNode compacted) {
             return compacted.path("inputTokensAfter").longValue()
                     >= compacted.path("inputTokensBefore").longValue();
+        }
+        if ("turn/input-consumed".equals(method) && params instanceof ObjectNode consumed) {
+            JsonNode input = consumed.path("input");
+            JsonNode userItem = consumed.path("userItem");
+            return !input.path("turnId").equals(consumed.path("turnId"))
+                    || !userItem.path("turnId").equals(consumed.path("turnId"))
+                    || !input.path("content").equals(userItem.path("content"))
+                    || !input.path("attachments").equals(userItem.path("attachments"));
+        }
+        if ("task/tree/delete".equals(method) && params instanceof ObjectNode taskDelete) {
+            return !taskDelete.path("taskThreadId").equals(taskDelete.path("confirmTaskThreadId"));
+        }
+        return false;
+    }
+
+    /** 使用生产领域值对象镜像内容顺序、去重和可发送性，并补充同一 Workspace 的跨块约束。 */
+    private static boolean invalidUserContent(JsonNode content) {
+        try {
+            List<UserContentBlock> blocks = new java.util.ArrayList<>();
+            String workspaceId = null;
+            for (JsonNode item : content) {
+                String type = item.path("type").textValue();
+                switch (type == null ? "" : type) {
+                    case "text" -> blocks.add(new TextContent(item.path("text").textValue()));
+                    case "attachment" -> blocks.add(new AttachmentContent(item.path("attachmentId").textValue()));
+                    case "skill_reference" -> blocks.add(
+                            new SkillReferenceContent(item.path("skillId").textValue()));
+                    case "workspace_reference" -> {
+                        String currentWorkspace = item.path("workspaceId").textValue();
+                        if (workspaceId != null && !workspaceId.equals(currentWorkspace)) return true;
+                        workspaceId = currentWorkspace;
+                        blocks.add(new WorkspaceReferenceContent(currentWorkspace,
+                                item.path("relativePath").textValue(), WorkspaceReferenceContent.Kind.valueOf(
+                                item.path("kind").textValue().toUpperCase(java.util.Locale.ROOT))));
+                    }
+                    default -> { return true; }
+                }
+            }
+            new UserContent(blocks);
+            return false;
+        } catch (RuntimeException invalid) {
+            return true;
+        }
+    }
+
+    /**
+     * Provider 与凭据必须一一绑定；该跨数组项唯一性无法由当前 JSON Schema 直接表达，
+     * 因此 golden consumer 在合同边界镜像生产 Policy 的失败关闭规则。
+     */
+    private static boolean providersShareCredential(JsonNode document) {
+        JsonNode providers = document.path("providers");
+        if (!providers.isArray()) return false;
+        Set<String> credentialIds = new HashSet<>();
+        for (JsonNode provider : providers) {
+            String credentialId = provider.path("credential_id").textValue();
+            if (credentialId != null && !credentialIds.add(credentialId)) return true;
         }
         return false;
     }
@@ -190,9 +473,9 @@ final class GoldenCorpusTest {
                         .getBytes(StandardCharsets.UTF_8)));
     }
 
-    /** 只定位 v2 语料，避免已退役的 v1 夹具意外进入当前合同验证。 */
+    /** 只定位 v1 语料，目录外 fixture 永远不能成为当前协议输入。 */
     private static List<Path> corpusFiles(boolean invalid) throws IOException {
-        Path root = goldenRoot().resolve("v2");
+        Path root = goldenRoot().resolve("v1");
         try (java.util.stream.Stream<Path> paths = Files.walk(root)) {
             return paths.filter(Files::isRegularFile)
                     .filter(path -> path.toString().endsWith(".json") || path.toString().endsWith(".jsonl"))
@@ -207,6 +490,9 @@ final class GoldenCorpusTest {
         return Files.readAllLines(file, StandardCharsets.UTF_8).stream().filter(line -> !line.isBlank())
                 .map(line -> line.getBytes(StandardCharsets.UTF_8)).toList();
     }
+
+    /** 总信封与按 method 选择的成功结果 schema 共享同一份冻结合同来源。 */
+    private record ContractSchemas(Schema envelope, Map<String, Schema> results) { }
 
     /** 同时支持 Maven 模块目录和工作区根目录，避免测试启动位置改变合同来源。 */
     private static Path goldenRoot() {

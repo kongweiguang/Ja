@@ -5,9 +5,13 @@ package io.github.kongweiguang.ja.catalog.adapter.out.mcp.support;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -129,6 +133,54 @@ public record McpServerDefinition(
          * 通过受控 OkHttp 客户端使用 Streamable HTTP 传输 JSON-RPC。
          */
         STREAMABLE_HTTP
+    }
+
+    /**
+     * 对完整启动语义生成不可逆定义修订；Secret 值只参与 SHA-256，绝不进入日志、目录或持久绑定。
+     * Map 键和值分别排序并带长度编码，避免拼接歧义和 JVM 遍历顺序造成伪变更。
+     */
+    public String definitionRevision() {
+        StringBuilder canonical = new StringBuilder();
+        append(canonical, "transport", transport.name());
+        command.forEach(value -> append(canonical, "command", value));
+        append(canonical, "cwd", workingDirectory == null ? "" : workingDirectory.toString());
+        environment.entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> appendSecret(canonical, "env:" + entry.getKey(), entry.getValue()));
+        append(canonical, "endpoint", endpoint == null ? "" : endpoint.toASCIIString());
+        headers.entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> appendSecret(canonical,
+                        "header:" + entry.getKey().toLowerCase(Locale.ROOT), entry.getValue()));
+        bearerHeaders.stream().sorted(String.CASE_INSENSITIVE_ORDER)
+                .forEach(value -> append(canonical, "bearer", value.toLowerCase(Locale.ROOT)));
+        protocolVersions.forEach(value -> append(canonical, "protocol", value));
+        return "mcp-def-" + digest(canonical.toString());
+    }
+
+    /**
+     * 以长度前缀编码公开配置事实，避免换行、分隔符或空值制造相同修订。
+     */
+    private static void append(StringBuilder target, String name, String value) {
+        target.append(name.length()).append(':').append(name)
+                .append(value.length()).append(':').append(value).append(';');
+    }
+
+    /**
+     * 私密配置只把不可逆摘要纳入定义身份，防止 revision 调试输出反推出凭据正文。
+     */
+    private static void appendSecret(StringBuilder target, String name, String value) {
+        append(target, name, digest(value));
+    }
+
+    /**
+     * 使用 JDK 内置 SHA-256 保持 Native Image 与 JVM 一致，不增加易漂移的散列依赖。
+     */
+    private static String digest(String value) {
+        try {
+            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("sha256_unavailable", impossible);
+        }
     }
 
     /**

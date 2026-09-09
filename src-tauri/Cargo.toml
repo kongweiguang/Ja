@@ -3,7 +3,7 @@
 
 [package]
 name = "ja"
-version = "0.1.0"
+version.workspace = true
 description = "Ja desktop application"
 authors = ["kongweiguang"]
 license = "GPL-3.0-or-later"
@@ -52,6 +52,10 @@ uuid = { version = "=1.24.1", features = ["serde", "v4"] }
 url = { version = "=2.5.8", features = ["serde"] }
 sha2 = "=0.11.0"
 base64 = "=0.22.1"
+# 附件缩略图、右栏预览和剪贴板 PNG 共用受限编解码器；关闭默认 feature，避免引入未验收格式。
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# WebView2 不稳定暴露 Windows 剪贴板图片与 CF_HDROP；原生读取固定由 arboard 承担，且只启用图片解码能力。
+arboard = { version = "=3.6.1", default-features = false, features = ["image-data"] }
 # OS 事件在工作区相对路径通知合同后合并；桌面端仍执行权威的目录树/读取对账。
 notify = "=8.2.0"
 
@@ -75,6 +79,10 @@ tauri-plugin-notification = { version = "=2.3.3", default-features = false }
 tauri-plugin-clipboard-manager = { version = "=2.3.2", default-features = false }
 # plugin 仅作为固定形状的 WebView-to-tracing 桥接层；全局订阅器与文件输出仍由 Ja 持有，避免控制台转发泄漏载荷。
 tauri-plugin-log = { version = "=2.9.0", default-features = false, features = ["tracing"] }
+# Updater 只在 desktop composition root 注册；固定 rustls 避免把系统 TLS 差异带入发布检查链路。
+tauri-plugin-updater = { version = "=2.11.0", default-features = false, features = ["rustls-tls", "system-proxy", "zip"] }
+# 更新安装完成后只允许重启当前应用，不向 renderer 暴露任意进程或退出能力。
+tauri-plugin-process = { version = "=2.3.1", default-features = false }
 # Tracing 由 host 写入 stderr/文件，绝不写 stdout；stdout 专用于全双工 JSONL 协议。
 tracing = "=0.1.44"
 tracing-subscriber = "=0.3.23"
@@ -82,7 +90,7 @@ tracing-appender = "=0.2.5"
 
 [target.'cfg(windows)'.dependencies]
 # 回收站边界复用 Tauri 锁定的 Windows STA IFileOperation 投影；直接声明可避免在破坏性 I/O 中手写 COM vtable。
-windows = { version = "=0.61.3", default-features = false, features = ["std", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows = { version = "=0.61.3", default-features = false, features = ["std", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # windows 的 COM 实现宏通过匹配的 core crate 展开；仅限 Windows 与 std 作用域，不扩大桌面 capability。
 windows-core = { version = "=0.61.2", default-features = false, features = ["std"] }
 # 匹配 Tauri/Wry 锁定的投影，使 `with_webview` 无需全局 hook 或渲染器脚本注入即可注册作用域内的 WebView2 快捷键处理器。

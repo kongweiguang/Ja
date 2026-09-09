@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:path-search","method":"workspace/path/search","params":{"threadId":"thr_demo","workspaceId":"ws_demo","query":"src/main","limit":20}}
+{"jsonrpc":"2.0","id":"c:path-search","result":{"threadId":"thr_demo","workspaceId":"ws_demo","generation":3,"query":"src/main","items":[{"relativePath":"src/main.rs","kind":"file"},{"relativePath":"src/main","kind":"directory"}],"truncated":false}}

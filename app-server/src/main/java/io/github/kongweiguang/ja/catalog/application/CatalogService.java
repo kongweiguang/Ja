@@ -17,7 +17,10 @@ import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
+import io.github.kongweiguang.ja.workspace.domain.Workspace;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
@@ -32,21 +35,24 @@ public final class CatalogService implements CatalogUseCase {
     private final CatalogQueryPort queryPort;
     private final ConfigurationGenerationPort generations;
     private final ModelPort models;
+    private final WorkspaceUseCase workspaces;
 
     /**
      * 注入唯一查询端口，避免 application 感知 MCP SDK、Jackson 或文件系统实现。
      */
     public CatalogService(CatalogQueryPort queryPort, ConfigurationGenerationPort generations,
-                          ModelPort models) {
+                          ModelPort models, WorkspaceUseCase workspaces) {
         this.queryPort = Objects.requireNonNull(queryPort, "queryPort");
         this.generations = Objects.requireNonNull(generations, "generations");
         this.models = Objects.requireNonNull(models, "models");
+        this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
     }
 
     /**
      * 模型验证只冻结指定保存身份并发送固定短请求；Sink 丢弃所有流式正文，租约覆盖完整异步 IO。
      */
     @Override
+    @SuppressWarnings("PMD.CloseResource")
     public CompletionStage<ModelTestResult> testModel(
             String providerId, String modelId, CancellationToken cancellationToken) {
         ConfigurationGenerationPort.Lease lease = generations.acquire(null);
@@ -75,40 +81,45 @@ public final class CatalogService implements CatalogUseCase {
             ConfigurationGenerationSnapshot.Provider provider,
             ConfigurationGenerationSnapshot.Model model,
             ConfigurationGenerationPort.Lease lease) {
-        if (provider.credentialId() == null) {
-            throw new ConfigurationError(ConfigurationError.Code.MISSING_CREDENTIAL,
-                    "provider credential is unavailable");
-        }
         String secret = lease.secretFor(provider.credentialId());
         if (secret == null || secret.isBlank()) {
             throw new ConfigurationError(ConfigurationError.Code.MISSING_CREDENTIAL,
                     "provider credential is unavailable");
         }
-        ModelPort.Provider modelProvider = switch (provider.provider()) {
-            case OPENAI -> ModelPort.Provider.OPENAI;
-            case ANTHROPIC -> ModelPort.Provider.ANTHROPIC;
-        };
         ModelPort.Api api = switch (provider.api()) {
             case OPENAI_RESPONSES -> ModelPort.Api.OPENAI_RESPONSES;
             case ANTHROPIC_MESSAGES -> ModelPort.Api.ANTHROPIC_MESSAGES;
+            case OPENAI_CHAT_COMPLETIONS -> ModelPort.Api.OPENAI_CHAT_COMPLETIONS;
         };
         Duration requestTimeout = provider.networkTimeouts().requestTimeout().compareTo(Duration.ofSeconds(30)) > 0
                 ? Duration.ofSeconds(30) : provider.networkTimeouts().requestTimeout();
         return new ModelPort.ModelConfiguration(provider.providerId(), model.modelId(), lease.generationId(),
-                modelProvider, api, model.model(), provider.baseUrl(), secret,
+                api, model.model(), provider.baseUrl(), secret,
                 provider.networkTimeouts().connectTimeout(), requestTimeout,
                 Set.of(ModelPort.InputModality.TEXT),
                 new ModelPort.GenerationOptions(null, null, 16, null));
     }
 
     /**
-     * 在应用边界内持有通用配置租约，防止 RPC 或其他入站适配器接触跨域生命周期。
+     * 先把不透明 workspaceId 解析为本进程已验证的路径能力，再在同一配置代际内合并发现结果。
      */
     @Override
-    public CursorPage<SkillDescriptor> listSkills(String cursor, int limit) {
-        try (ConfigurationGenerationPort.Lease generation = generations.acquire(null)) {
-            return queryPort.listSkills(generation, cursor, limit);
+    public CursorPage<SkillDescriptor> listSkills(String workspaceId, String cursor, int limit) {
+        Workspace workspace = skillWorkspace(workspaceId);
+        Path workspaceRoot = workspace == null ? null : workspace.root();
+        boolean workspaceTrusted = workspace != null && workspace.trust() == Workspace.Trust.TRUSTED;
+        try (ConfigurationGenerationPort.Lease generation = generations.acquire(workspaceRoot)) {
+            return queryPort.listSkills(generation, workspaceRoot, workspaceTrusted, cursor, limit);
         }
+    }
+
+    /**
+     * 通用工作区与省略身份都关闭项目来源；项目路径只能来自已打开工作区，客户端不能注入本地路径。
+     */
+    private Workspace skillWorkspace(String workspaceId) {
+        if (workspaceId == null) return null;
+        Workspace workspace = workspaces.requireOpenWorkspace(workspaceId);
+        return workspaces.isGeneralWorkspace(workspace.root()) ? null : workspace;
     }
 
     /**

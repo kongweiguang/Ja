@@ -34,12 +34,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/** 验证每个 Turn 的 workspace 绑定、代际捕获、取消以及 stdio 子进程零残留。 */
+/** 验证每次请求的 workspace 绑定、代际捕获、batch 释放以及 stdio 子进程零残留。 */
 final class TurnMcpSessionFactoryTest {
     private static final ObjectMapper JSON = new ObjectMapper()
             .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
 
-    /** 验证从同一租约代际启动选定 stdio，并通过取消关闭其进程。 */
+    /** 验证同一代际复用选定 stdio，batch 取消只释放 pin，catalog 关闭才回收进程。 */
     @Test
     void bindsGenerationModelToTurnWorkspaceAndCancellation(@TempDir Path workspace) throws Exception {
         Path report = workspace.resolve("turn-mcp-report.txt");
@@ -50,6 +50,7 @@ final class TurnMcpSessionFactoryTest {
         Path data = Files.createDirectories(workspace.resolve("data"));
         Path run = Files.createDirectories(workspace.resolve("run"));
         Path logs = Files.createDirectories(workspace.resolve("logs"));
+        long[] observedPid = {-1L};
         Files.writeString(home.resolve("config.toml"), generationConfig(report, classes));
         SidecarConfiguration configuration = new SidecarConfiguration(
                 home, data, run, logs);
@@ -69,43 +70,54 @@ final class TurnMcpSessionFactoryTest {
                         provider.providerId(), modelDefinition.modelId(), workspace.toAbsolutePath(),
                         Instant.now().plus(Duration.ofSeconds(20)));
                 catalog.prepareWorkspace(workspace, lease);
-                TurnMcpSessionFactory factory = new GenerationTurnMcpSessionFactory(
+                assertFalse(Files.exists(report), "workspace prepare must not start MCP IO");
+                GenerationTurnMcpSessionFactory factory = new GenerationTurnMcpSessionFactory(
                         JSON, McpLimits.DEFAULT, catalog);
                 ManualToken token = new ManualToken();
 
-                TurnMcpSessionFactory.Session session = factory.open(context, lease, token);
+                GenerationTurnMcpSessionFactory.CatalogSnapshot providerCatalog =
+                        factory.catalog(context, lease);
+                assertEquals(1, providerCatalog.snapshot().tools().size());
+                assertEquals(1, providerCatalog.routeIdentities().size());
+
+                TurnMcpSessionFactory.Session session = factory.open(providerCatalog, token);
                 try {
+                    assertEquals(providerCatalog.snapshot(), session.snapshot());
                     assertEquals(1, session.snapshot().tools().size());
                     assertTrue(awaitObservation(report, "method=initialize"));
                     List<String> observations = Files.readAllLines(report, StandardCharsets.UTF_8);
                     long pid = Long.parseLong(observations.getFirst());
+                    observedPid[0] = pid;
                     assertTrue(observations.contains("cwd=" + workspace.toRealPath()));
                     assertTrue(observations.contains("secret=true"));
                     assertTrue(observations.contains("method=initialize"));
-                    assertFalse(observations.contains("method=tools/list"));
+                    assertTrue(observations.contains("method=tools/list"));
                     assertFalse((session.toString() + observations).contains(secret));
 
                     token.cancel();
-                    assertTrue(awaitExit(pid));
+                    assertTrue(ProcessHandle.of(pid).orElseThrow().isAlive(),
+                            "batch release keeps healthy notification session alive");
                 } finally {
                     session.close();
                 }
             }
+            catalog.close();
+            assertTrue(awaitExit(observedPid[0]));
         }
     }
 
     /** 使用凭据引用写入 Java 所有的 Schema，夹具不得包含 MCP Secret 明文。 */
     private static String generationConfig(Path report, Path classes) {
-        return "schema_version = 4\n"
+        return "schema_version = 1\n"
                 + "config_revision = 1\n"
                 + "default_access_mode = \"approval_required\"\n"
                 + "default_provider_id = \"provider_turn_mcp\"\n"
                 + "default_model_id = \"model_turn_mcp\"\n"
                 + "default_reasoning_level = \"medium\"\n"
+                + "skills = []\n"
                 + "[[providers]]\n"
                 + "provider_id = \"provider_turn_mcp\"\n"
                 + "name = \"Turn MCP\"\n"
-                + "provider = \"openai\"\n"
                 + "api = \"openai_responses\"\n"
                 + "base_url = \"http://127.0.0.1\"\n"
                 + "credential_id = \"cred_model\"\n"

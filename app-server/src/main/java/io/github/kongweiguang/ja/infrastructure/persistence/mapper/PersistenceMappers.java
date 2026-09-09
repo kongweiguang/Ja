@@ -9,7 +9,8 @@ import org.apache.ibatis.session.SqlSession;
  */
 public record PersistenceMappers(HistoryMapper history, AgentMapper agent, CheckpointMapper checkpoint,
                                  RecoveryMapper recovery, SchemaMapper schema,
-                                 InstructionScopeMapper instructionScopes, AttachmentMapper attachments) {
+                                 InstructionScopeMapper instructionScopes, AttachmentMapper attachments,
+                                 TaskMapper tasks) {
     /**
      * 从同一 SqlSession 创建所有职责 Mapper，保证跨表事实仍共享一个事务。
      */
@@ -19,6 +20,7 @@ public record PersistenceMappers(HistoryMapper history, AgentMapper agent, Check
                 session.getMapper(RecoveryMapper.class),
                 session.getMapper(SchemaMapper.class),
                 session.getMapper(InstructionScopeMapper.class),
-                session.getMapper(AttachmentMapper.class));
+                session.getMapper(AttachmentMapper.class),
+                session.getMapper(TaskMapper.class));
     }
 }

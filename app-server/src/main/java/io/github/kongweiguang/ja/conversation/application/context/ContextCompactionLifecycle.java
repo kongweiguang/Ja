@@ -14,8 +14,6 @@ import java.util.concurrent.CompletionException;
 
 /** 把压缩状态机事实统一转换为 Thread 级事件，供自动与手动入口复用。 */
 public final class ContextCompactionLifecycle {
-    public static final String STRATEGY_VERSION = "ja-context-v3";
-
     private final String workspaceId;
     private final String threadId;
     private final String turnId;
@@ -105,7 +103,7 @@ public final class ContextCompactionLifecycle {
                                                    Long inputTokensBefore, Long inputTokensAfter) {
         return new ContextCompactionEvent.Context("evt_" + UUID.randomUUID(), workspaceId, threadId, turnId,
                 threadRevision, clock.instant(), compactionId, trigger, sourceRevision,
-                inputTokensBefore, inputTokensAfter, STRATEGY_VERSION);
+                inputTokensBefore, inputTokensAfter, ContextCompactionEvent.STRATEGY_VERSION);
     }
 
     /** 同步等待事件入队，保证 started 先于摘要副作用、compacted 先于后续 Provider send。 */
@@ -122,7 +120,6 @@ public final class ContextCompactionLifecycle {
     private static ContextCompactionEvent.ErrorCode wire(ContextException.Code code) {
         return switch (Objects.requireNonNull(code, "code")) {
             case CAS_CONFLICT -> ContextCompactionEvent.ErrorCode.CONFLICT;
-            case TOKEN_COUNT_UNAVAILABLE -> ContextCompactionEvent.ErrorCode.TOKEN_COUNT_UNAVAILABLE;
             case SUMMARY_FAILURE -> ContextCompactionEvent.ErrorCode.SUMMARY_FAILURE;
             case CONTEXT_LIMIT -> ContextCompactionEvent.ErrorCode.CONTEXT_LIMIT;
             case INVALID_STATE -> ContextCompactionEvent.ErrorCode.INVALID_STATE;

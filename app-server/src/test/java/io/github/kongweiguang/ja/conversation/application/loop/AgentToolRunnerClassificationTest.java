@@ -15,23 +15,27 @@ import java.util.concurrent.CompletionStage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-/** 锁定 Tool 副作用分类，避免 read/read_attachment 被误记为可能修改工作区。 */
+/** 锁定 Tool 自声明副作用，禁止 Runner 按名称维护隐式白名单。 */
 final class AgentToolRunnerClassificationTest {
 
-    /** 只有读取类 Tool 是 READ_ONLY；写入和未知扩展仍需外部副作用保护。 */
+    /** 默认始终保守为 EXTERNAL，只有 Tool 显式声明后才能取得 READ_ONLY 语义。 */
     @Test
-    void readToolsNeverProduceExternalMutationClassification() {
-        assertEquals(ToolSideEffect.READ_ONLY, AgentToolRunner.sideEffect(tool("read")));
-        assertEquals(ToolSideEffect.READ_ONLY, AgentToolRunner.sideEffect(tool("read_attachment")));
-        assertEquals(ToolSideEffect.EXTERNAL, AgentToolRunner.sideEffect(tool("edit")));
-        assertEquals(ToolSideEffect.EXTERNAL, AgentToolRunner.sideEffect(tool("mcp_custom")));
+    void toolDeclarationOwnsSideEffectClassification() {
+        assertEquals(ToolSideEffect.EXTERNAL, tool("read", null).sideEffect());
+        assertEquals(ToolSideEffect.EXTERNAL, tool("mcp_custom", null).sideEffect());
+        assertEquals(ToolSideEffect.READ_ONLY, tool("read", ToolSideEffect.READ_ONLY).sideEffect());
     }
 
-    /** 测试 Tool 只暴露冻结名称，不执行任何外部能力。 */
-    private static AgentTool tool(String name) {
+    /** 测试 Tool 可选择显式副作用；null 保留端口定义的保守默认值。 */
+    private static AgentTool tool(String name, ToolSideEffect declared) {
         return new AgentTool() {
             /** 名称是本用例唯一变化量，空 Schema 足够覆盖分类边界。 */
             @Override public ToolSpec spec() { return new ToolSpec(name, "fixture", JsonObject.empty()); }
+
+            /** 仅为显式只读夹具覆盖默认值，避免测试重新引入名字推断。 */
+            @Override public ToolSideEffect sideEffect() {
+                return declared == null ? AgentTool.super.sideEffect() : declared;
+            }
 
             /** 分类测试若触发执行即说明 AgentToolRunner 边界发生回归。 */
             @Override public CompletionStage<ToolResult> execute(

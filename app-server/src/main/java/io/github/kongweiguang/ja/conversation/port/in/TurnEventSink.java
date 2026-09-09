@@ -10,6 +10,11 @@ import java.util.concurrent.CompletionStage;
  */
 @FunctionalInterface
 public interface TurnEventSink extends ContextCompactionEventSink, ThreadMetadataEventSink {
+    /** Root 恢复不绑定可见 Timeline；显式 no-op 避免调用方伪造事件订阅生命周期。 */
+    static TurnEventSink noop() {
+        return event -> java.util.concurrent.CompletableFuture.completedFuture(null);
+    }
+
     /**
      * 接收已提交事件或不可恢复草稿；完成阶段决定应用是否可以继续推进。
      */

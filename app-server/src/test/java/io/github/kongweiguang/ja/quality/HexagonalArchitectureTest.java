@@ -151,6 +151,36 @@ final class HexagonalArchitectureTest {
             .that().resideInAPackage("..conversation.port.in..")
             .should().dependOnClassesThat().resideInAPackage("..conversation.port.out..");
 
+    /**
+     * Agent 执行循环只能经 conversation 自有端口调用其它领域，新增 Goal、Task 或后续能力时不得把
+     * 具体领域类型重新引入核心循环，否则每次扩展仍需修改内核并破坏开闭原则。
+     */
+    @ArchTest
+    static final ArchRule CONVERSATION_LOOP_DOES_NOT_DEPEND_ON_FEATURE_DOMAINS = noClasses()
+            .that().resideInAPackage("..conversation.application.loop..")
+            .should().dependOnClassesThat().resideInAnyPackage("..goal..", "..task..");
+
+    /**
+     * conversation 内部按 domain、application、port 与 adapter 单向协作；顶层无环规则无法发现
+     * 同一领域内部的回流，因此单独冻结这条 DDD 边界。
+     */
+    @ArchTest
+    static final ArchRule CONVERSATION_RESPONSIBILITY_PACKAGES_ARE_ACYCLIC = slices()
+            .matching("io.github.kongweiguang.ja.conversation.(*)..")
+            .should().beFreeOfCycles();
+
+    /**
+     * 四类 Agent 扩展契约由 conversation 出站端口唯一拥有，具体领域只能实现这些端口，
+     * 不得在 application 或业务域复制第二套同名 SPI。
+     */
+    @ArchTest
+    static final ArchRule AGENT_EXTENSION_CONTRACTS_BELONG_TO_CONVERSATION_OUT_PORT = classes()
+            .that().haveSimpleName("AgentCapability")
+            .or().haveSimpleName("ContextTransform")
+            .or().haveSimpleName("ToolPolicy")
+            .or().haveSimpleName("ExecutionObserver")
+            .should().resideInAPackage("..conversation.port.out..");
+
     /** bootstrap 只能作为最外层组合根，任何其它生产包都不得反向依赖它。 */
     @ArchTest
     static final ArchRule BOOTSTRAP_HAS_NO_INBOUND_DEPENDENCIES = noClasses()

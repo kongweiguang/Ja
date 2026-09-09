@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! JA-RPC v2 错误目录投影、消息脱敏与稳定 codec 错误分类。
+//! JA-RPC v1 错误目录投影、消息脱敏与稳定 codec 错误分类。
 
 use super::catalog as codec_catalog;
 use super::codec::{is_ready_token_key, is_token_shaped};

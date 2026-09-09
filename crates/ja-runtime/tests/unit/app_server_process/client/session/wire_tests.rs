@@ -177,3 +177,27 @@ fn context_compaction_notifications_use_control_lane() {
         );
     }
 }
+
+/// Task 持久活动、Mailbox 变化和 Approval 交互不可按普通 delta 丢弃；只有 progress
+/// 保持可合并 data 语义。
+#[test]
+fn task_and_approval_facts_use_control_while_progress_stays_data() {
+    for method in [
+        "task/activity",
+        "task/mailbox-changed",
+        "approval/requested",
+        "approval/resolved",
+    ] {
+        let frame = RpcFrame::notification(method, serde_json::json!({})).expect("notification");
+        assert_eq!(
+            notification_routing(&frame),
+            (EventPriority::Control, QueueKind::Control)
+        );
+    }
+    let progress =
+        RpcFrame::notification("task/progress", serde_json::json!({})).expect("notification");
+    assert_eq!(
+        notification_routing(&progress),
+        (EventPriority::Data, QueueKind::Data)
+    );
+}

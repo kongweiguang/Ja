@@ -25,6 +25,7 @@ const MODEL_SELECTION = {
   providerId: "provider_1",
   modelId: "model_1",
   reasoningLevel: "medium" as const,
+  collaborationMode: "default" as const,
 };
 
 type HistoryAdmissionStatus = Extract<
@@ -37,6 +38,7 @@ function thread(threadId: string): ConversationThread {
   return {
     threadId,
     workspaceId: WORKSPACE.workspaceId,
+    activeGoalId: null,
     preferences: {
       ...MODEL_SELECTION,
       accessMode: "approval_required",
@@ -44,6 +46,9 @@ function thread(threadId: string): ConversationThread {
     },
     title: "新对话",
     status: "active",
+    pinned: false,
+    latestTurnStatus: null,
+    latestTurnSeen: true,
     revision: 0,
     createdAt: "2026-08-28T00:00:00Z",
     updatedAt: "2026-08-28T00:00:00Z",
@@ -53,12 +58,29 @@ function thread(threadId: string): ConversationThread {
 /** 为不关注目录变更的用例提供完整窄端口，避免旧 fixture 隐式缺少生产能力。 */
 function historyExtensions(): Pick<
   ConversationHistoryPort,
-  "threadSearch" | "threadRename" | "threadPreferencesUpdate"
+  | "threadSearch"
+  | "threadRename"
+  | "threadPreferencesUpdate"
+  | "threadPin"
+  | "threadSeen"
+  | "threadArchive"
+  | "threadRestore"
 > {
   return {
     threadSearch: vi.fn(async () => ({ items: [], nextCursor: null })),
     threadRename: vi.fn(async () => thread("thr_unused")),
     threadPreferencesUpdate: vi.fn(async () => thread("thr_unused")),
+    threadPin: vi.fn(async ({ threadId, pinned }) => ({ ...thread(threadId), pinned })),
+    threadSeen: vi.fn(async ({ threadId, expectedThreadRevision }) => ({
+      ...thread(threadId),
+      latestTurnSeen: true,
+      revision: expectedThreadRevision + 1,
+    })),
+    threadArchive: vi.fn(async ({ threadId }) => ({
+      ...thread(threadId),
+      status: "archived" as const,
+    })),
+    threadRestore: vi.fn(async ({ threadId }) => thread(threadId)),
   };
 }
 
@@ -102,7 +124,10 @@ describe("useConversationController", () => {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({
@@ -135,8 +160,676 @@ describe("useConversationController", () => {
       modelId: "model_1",
       reasoningLevel: "medium",
       accessMode: "approval_required",
+      collaborationMode: "default",
     });
     expect(useTimelineStore.getState().threads["thr_created"]?.workspaceId).toBe("ws_project");
+  });
+
+  it("当前会话没有任何 Turn 时重复新建仍复用同一个 Thread", async () => {
+    const existing = thread("thr_empty");
+    const threadCreate = vi.fn(async () => thread("thr_duplicate"));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate,
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    await act(async () => {
+      await Promise.all([result.current.create(), result.current.create()]);
+    });
+
+    expect(threadCreate).not.toHaveBeenCalled();
+    expect(result.current.currentThreadId).toBe(existing.threadId);
+    expect(result.current.threads).toHaveLength(1);
+  });
+
+  /** 当前范围切换后不得保留其它 Workspace 的同名 Thread，避免点击“新对话”隐式切回旧范围。 */
+  it("切换 workspace 后最近对话只保留当前范围", async () => {
+    const generalWorkspace: WorkspaceProjection = {
+      kind: "general",
+      workspaceId: "ws_general",
+      rootPath: "C:\\data\\general",
+      displayName: "无项目",
+      trust: "trusted",
+    };
+    const projectThread = thread("thr_project");
+    const generalThread = {
+      ...thread("thr_general"),
+      workspaceId: generalWorkspace.workspaceId,
+    };
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async ({ workspaceId }) => ({
+        items: workspaceId === WORKSPACE.workspaceId ? [projectThread] : [generalThread],
+        nextCursor: null,
+      })),
+      threadCreate: vi.fn(async () => projectThread),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result, rerender } = renderHook(
+      ({ workspace, revision }: { workspace: WorkspaceProjection; revision: number }) =>
+        useConversationController({
+          history,
+          workspace,
+          workspaceRevision: revision,
+          modelSelection: MODEL_SELECTION,
+          accessMode: "approval_required",
+          runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+          activateWorkspace: async () => undefined,
+        }),
+      { initialProps: { workspace: WORKSPACE, revision: 1 } },
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(projectThread.threadId));
+
+    rerender({ workspace: generalWorkspace, revision: 2 });
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(generalThread.threadId));
+    expect(result.current.threads).toEqual([generalThread]);
+  });
+
+  /** 已读确认只在终态 snapshot 已进入当前 Timeline 后发生，并在 CAS 竞争时仅重放一次。 */
+  it("marks the visible latest terminal Turn seen with one bounded conflict retry", async () => {
+    const existing = {
+      ...thread("thr_unseen"),
+      latestTurnStatus: "failed" as const,
+      latestTurnSeen: false,
+      revision: 3,
+    };
+    const terminalSnapshot = (revision: number) => ({
+      threadId: existing.threadId,
+      revision,
+      turns: [
+        {
+          turnId: "turn_failed",
+          status: "failed" as const,
+          requestedAt: "2026-09-01T00:00:00Z",
+          updatedAt: "2026-09-01T00:00:01Z",
+          completedAt: "2026-09-01T00:00:01Z",
+          errorCode: "MODEL_FAILED",
+          changeSet: null,
+        },
+      ],
+      items: [
+        {
+          itemId: "item_failed_summary",
+          turnId: "turn_failed",
+          kind: "final_answer" as const,
+          createdAt: "2026-09-01T00:00:01Z",
+          text: "回复失败",
+        },
+      ],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(terminalSnapshot(3))
+      .mockResolvedValueOnce(terminalSnapshot(4));
+    const threadSeen = vi
+      .fn<ConversationHistoryPort["threadSeen"]>()
+      .mockRejectedValueOnce({ code: "CONFLICT" })
+      .mockResolvedValueOnce({ ...existing, latestTurnSeen: true, revision: 5 });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadSeen,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    await waitFor(() => expect(threadSeen).toHaveBeenCalledTimes(2));
+    expect(threadSeen).toHaveBeenNthCalledWith(1, {
+      threadId: existing.threadId,
+      expectedThreadRevision: 3,
+    });
+    expect(threadSeen).toHaveBeenNthCalledWith(2, {
+      threadId: existing.threadId,
+      expectedThreadRevision: 4,
+    });
+    await waitFor(() =>
+      expect(
+        result.current.threads.find((value) => value.threadId === existing.threadId),
+      ).toMatchObject({ latestTurnStatus: "failed", latestTurnSeen: true, revision: 5 }),
+    );
+  });
+
+  /** seen 失败必须释放精确终态去重键；提醒保持未读，切离再打开才能发起下一次有界确认。 */
+  it("retries the unread confirmation after reopening when the first seen mutation fails", async () => {
+    const existing = {
+      ...thread("thr_unseen_failure"),
+      latestTurnStatus: "completed" as const,
+      latestTurnSeen: false,
+      revision: 2,
+    };
+    const neutral = thread("thr_seen_retry_neutral");
+    const threadSeen = vi
+      .fn<ConversationHistoryPort["threadSeen"]>()
+      .mockRejectedValueOnce({ code: "RUNTIME_UNAVAILABLE" })
+      .mockResolvedValueOnce({ ...existing, latestTurnSeen: true, revision: 3 });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing, neutral], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 2,
+        turns:
+          threadId === existing.threadId
+            ? [
+                {
+                  turnId: "turn_completed",
+                  status: "completed" as const,
+                  requestedAt: "2026-09-01T00:00:00Z",
+                  updatedAt: "2026-09-01T00:00:01Z",
+                  completedAt: "2026-09-01T00:00:01Z",
+                  errorCode: null,
+                  changeSet: null,
+                },
+              ]
+            : [],
+        items:
+          threadId === existing.threadId
+            ? [
+                {
+                  itemId: "item_completed",
+                  turnId: "turn_completed",
+                  kind: "final_answer" as const,
+                  createdAt: "2026-09-01T00:00:01Z",
+                  text: "完成",
+                },
+              ]
+            : [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadSeen,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.error).toContain("未读状态暂时无法同步"));
+    expect(threadSeen).toHaveBeenCalledOnce();
+    expect(result.current.threads[0]).toMatchObject({ latestTurnSeen: false });
+
+    await act(async () => {
+      await result.current.select(neutral.threadId);
+    });
+    await waitFor(() => expect(result.current.currentThreadId).toBe(neutral.threadId));
+    await act(async () => {
+      await result.current.select(existing.threadId);
+    });
+
+    await waitFor(() => expect(threadSeen).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(
+        result.current.threads.find((value) => value.threadId === existing.threadId),
+      ).toMatchObject({ latestTurnSeen: true, revision: 3 }),
+    );
+  });
+
+  /** 只有已加载 Timeline 的 latest Turn 转换可覆盖目录；未加载行继续保留服务端权威状态。 */
+  it("preserves unselected server Turn status while the selected Timeline changes", async () => {
+    const selected = { ...thread("thr_selected"), latestTurnStatus: null };
+    const unselected = {
+      ...thread("thr_unselected"),
+      latestTurnStatus: "failed" as const,
+      latestTurnSeen: false,
+    };
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [selected, unselected], nextCursor: null })),
+      threadCreate: vi.fn(async () => selected),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(selected.threadId));
+    expect(
+      result.current.threads.find((value) => value.threadId === unselected.threadId)
+        ?.latestTurnStatus,
+    ).toBe("failed");
+    expect(history.threadSeen).not.toHaveBeenCalled();
+
+    act(() => {
+      useTimelineStore.getState().applyTurnAccepted({
+        threadId: selected.threadId,
+        turnId: "turn_selected",
+        threadRevision: 1,
+        submittedText: "开始",
+        submittedAt: "2026-09-01T00:00:00Z",
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.threads.find((value) => value.threadId === selected.threadId)
+          ?.latestTurnStatus,
+      ).toBe("queued"),
+    );
+    expect(
+      result.current.threads.find((value) => value.threadId === unselected.threadId)
+        ?.latestTurnStatus,
+    ).toBe("failed");
+  });
+
+  /** 归档最后一个会话后清空当前 Timeline，避免空会话界面继续显示已归档内容。 */
+  it("returns to the empty conversation state after archiving the only thread", async () => {
+    const only = { ...thread("thr_only"), latestTurnStatus: "completed" as const };
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadArchive: vi.fn(async () => ({ ...only, status: "archived" as const, revision: 1 })),
+      threadList: vi.fn(async () => ({ items: [only], nextCursor: null })),
+      threadCreate: vi.fn(async () => only),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(only.threadId));
+
+    let undo: Awaited<ReturnType<typeof result.current.archive>> | undefined;
+    await act(async () => {
+      undo = await result.current.archive(only.threadId);
+    });
+    expect(undo?.archived.status).toBe("archived");
+    expect(result.current.currentThreadId).toBeUndefined();
+    expect(result.current.threads).toEqual([]);
+    expect(useTimelineStore.getState().threads).toEqual({});
+  });
+
+  it("当前会话已有 Turn 后允许新建，并把连续触发收口为一次创建", async () => {
+    const existing = thread("thr_started");
+    const created = thread("thr_created_after_turn");
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const threadCreate = vi.fn(async () => {
+      await createGate;
+      return created;
+    });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate,
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: threadId === existing.threadId ? 0 : 1,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyTurnAccepted({
+          threadId: existing.threadId,
+          turnId: "turn_started",
+          threadRevision: 1,
+          submittedText: "开始处理",
+          submittedAt: "2026-09-01T00:00:00Z",
+        }),
+      ).toBe("applied");
+    });
+
+    let firstCreate!: Promise<void>;
+    let secondCreate!: Promise<void>;
+    act(() => {
+      firstCreate = result.current.create();
+      secondCreate = result.current.create();
+    });
+    expect(threadCreate).toHaveBeenCalledOnce();
+    releaseCreate();
+    await act(async () => Promise.all([firstCreate, secondCreate]));
+
+    expect(threadCreate).toHaveBeenCalledOnce();
+    expect(result.current.currentThreadId).toBe(created.threadId);
+    expect(result.current.threads[0]?.threadId).toBe(created.threadId);
+  });
+
+  /** 迟到的目录响应只能覆盖发起时的事实，不能删除其后已经由 create ACK 持久化的新 Thread。 */
+  it("保留旧目录请求发出后创建并激活的新 Thread", async () => {
+    const existing = thread("thr_existing");
+    const discovered = { ...thread("thr_metadata"), revision: 2 };
+    const created = thread("thr_created_after_list");
+    let releaseStaleList!: () => void;
+    const staleListGate = new Promise<void>((resolve) => {
+      releaseStaleList = resolve;
+    });
+    const threadList = vi
+      .fn<ConversationHistoryPort["threadList"]>()
+      .mockResolvedValueOnce({ items: [existing], nextCursor: null })
+      .mockImplementationOnce(async () => {
+        await staleListGate;
+        return { items: [existing, discovered], nextCursor: null };
+      });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList,
+      threadCreate: vi.fn(async () => created),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: threadId === created.threadId ? 0 : 1,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result, rerender } = renderHook(
+      ({ event }: { event?: TimelineEvent }) =>
+        useConversationController({
+          history,
+          workspace: WORKSPACE,
+          workspaceRevision: 1,
+          modelSelection: MODEL_SELECTION,
+          accessMode: "approval_required",
+          runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+          metadataEvent: event,
+          activateWorkspace: async () => undefined,
+        }),
+      { initialProps: { event: undefined as TimelineEvent | undefined } },
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyTurnAccepted({
+          threadId: existing.threadId,
+          turnId: "turn_started",
+          threadRevision: 2,
+          submittedText: "开始处理",
+          submittedAt: "2026-09-01T00:00:00Z",
+        }),
+      ).toBe("applied");
+    });
+
+    rerender({ event: metadataEvent({ threadId: discovered.threadId, revision: 2 }) });
+    await waitFor(() => expect(threadList).toHaveBeenCalledTimes(2));
+    await act(async () => result.current.create());
+    expect(result.current.currentThreadId).toBe(created.threadId);
+    expect(result.current.threads[0]?.threadId).toBe(created.threadId);
+
+    await act(async () => {
+      releaseStaleList();
+      await staleListGate;
+    });
+    await waitFor(() =>
+      expect(result.current.threads.some((item) => item.threadId === discovered.threadId)).toBe(
+        true,
+      ),
+    );
+    expect(result.current.currentThreadId).toBe(created.threadId);
+    expect(result.current.threads[0]?.threadId).toBe(created.threadId);
+  });
+
+  /** workspace 投影刷新不得抢占 create 的 request token，否则 durable Thread 会存在但永远不进入 UI。 */
+  it("创建进行中忽略自动历史恢复并在完成后保持新 Thread 激活", async () => {
+    const existing = thread("thr_existing");
+    const created = thread("thr_created_during_refresh");
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const threadList = vi.fn(async () => ({ items: [existing], nextCursor: null }));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList,
+      threadCreate: vi.fn(async () => {
+        await createGate;
+        return created;
+      }),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result, rerender } = renderHook(
+      ({ workspaceRevision }: { workspaceRevision: number }) =>
+        useConversationController({
+          history,
+          workspace: WORKSPACE,
+          workspaceRevision,
+          modelSelection: MODEL_SELECTION,
+          accessMode: "approval_required",
+          runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+          activateWorkspace: async () => undefined,
+        }),
+      { initialProps: { workspaceRevision: 1 } },
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyTurnAccepted({
+          threadId: existing.threadId,
+          turnId: "turn_started",
+          threadRevision: 1,
+          submittedText: "开始处理",
+          submittedAt: "2026-09-01T00:00:00Z",
+        }),
+      ).toBe("applied");
+    });
+
+    let creation!: Promise<void>;
+    act(() => {
+      creation = result.current.create();
+    });
+    await waitFor(() => expect(history.threadCreate).toHaveBeenCalledOnce());
+    rerender({ workspaceRevision: 2 });
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyTurnAccepted({
+          threadId: existing.threadId,
+          turnId: "turn_gap",
+          threadRevision: 3,
+          submittedText: "制造需要后台重读的 revision gap",
+          submittedAt: "2026-09-01T00:00:01Z",
+        }),
+      ).toBe("gap");
+    });
+    await act(async () => {
+      releaseCreate();
+      await creation;
+    });
+
+    expect(threadList).toHaveBeenCalledOnce();
+    expect(history.threadRead).toHaveBeenCalledTimes(2);
+    expect(result.current.currentThreadId).toBe(created.threadId);
+    expect(result.current.threads[0]?.threadId).toBe(created.threadId);
   });
 
   it("模型切换用显式 Provider/Model 创建并选中新 Thread，不受旧活动选择闭包影响", async () => {
@@ -161,7 +854,10 @@ describe("useConversationController", () => {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({
@@ -200,6 +896,7 @@ describe("useConversationController", () => {
       modelId: "model_2",
       reasoningLevel: "medium",
       accessMode: "approval_required",
+      collaborationMode: "default",
       expectedThreadRevision: 0,
     });
     expect(result.current.currentThreadId).toBe("thr_initial");
@@ -233,7 +930,10 @@ describe("useConversationController", () => {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({
@@ -301,7 +1001,10 @@ describe("useConversationController", () => {
         revision: 17,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       }))
       .mockImplementationOnce(async ({ threadId }) => ({
@@ -309,7 +1012,10 @@ describe("useConversationController", () => {
         revision: 18,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       }));
     const history: ConversationHistoryPort = {
@@ -381,7 +1087,10 @@ describe("useConversationController", () => {
         revision: 7,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact,
@@ -437,7 +1146,10 @@ describe("useConversationController", () => {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({
@@ -478,7 +1190,79 @@ describe("useConversationController", () => {
     expect(threadList).toHaveBeenCalledTimes(1);
   });
 
-  it("terminal 后保留可见 Final 并只权威重读一次以恢复冻结 ChangeSet", async () => {
+  it("重复点击与已加载会话切换直接复用 timeline，不进入读取态", async () => {
+    const first = thread("thr_first");
+    const second = thread("thr_second");
+    const threadRead = vi.fn<ConversationHistoryPort["threadRead"]>(async ({ threadId }) => ({
+      threadId,
+      revision: 0,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    }));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
+      threadCreate: vi.fn(async () => first),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(first.threadId));
+    expect(threadRead).toHaveBeenCalledOnce();
+    act(() => {
+      expect(
+        useTimelineStore.getState().applySnapshot(
+          {
+            threadId: second.threadId,
+            revision: 0,
+            turns: [],
+            items: [],
+            inputQueue: null,
+            contextUsage: null,
+            taskActivities: [],
+            goalActivities: [],
+            nextCursor: null,
+          },
+          WORKSPACE.workspaceId,
+        ),
+      ).toBe("applied");
+    });
+
+    await act(async () => result.current.select(first.threadId));
+    expect(result.current.busy).toBe(false);
+    expect(threadRead).toHaveBeenCalledOnce();
+
+    await act(async () => result.current.select(second.threadId));
+    expect(result.current.currentThreadId).toBe(second.threadId);
+    expect(result.current.busy).toBe(false);
+    expect(threadRead).toHaveBeenCalledOnce();
+  });
+
+  /** terminal 先保留可见回答，再只读取一次权威历史补齐最终轮摘要，避免丢摘要或刷新循环。 */
+  it("terminal 保留 Final 并通过一次快照补齐最终轮公开摘要", async () => {
     const existing = thread("thr_terminal_refresh");
     let releaseTerminalSnapshot!: () => void;
     const terminalSnapshotGate = new Promise<void>((resolve) => {
@@ -491,7 +1275,10 @@ describe("useConversationController", () => {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })
       .mockImplementation(async ({ threadId }) => {
@@ -503,13 +1290,13 @@ describe("useConversationController", () => {
             {
               turnId: "turn_terminal",
               status: "completed" as const,
-              runtime: null,
               requestedAt: "2026-08-30T12:00:00Z",
               updatedAt: "2026-08-30T12:00:02Z",
               completedAt: "2026-08-30T12:00:02Z",
               errorCode: null,
               changeSet: {
-                state: "available" as const,
+                state: "complete" as const,
+                incompleteReasons: [],
                 files: [
                   {
                     path: "src/main.ts",
@@ -533,6 +1320,14 @@ describe("useConversationController", () => {
           ],
           items: [
             {
+              itemId: "item_terminal_reasoning",
+              turnId: "turn_terminal",
+              kind: "reasoning_summary" as const,
+              modelRound: 3,
+              createdAt: "2026-08-30T12:00:01Z",
+              text: "两个工具均已完成，现在整理结果。",
+            },
+            {
               itemId: "item_terminal_final",
               turnId: "turn_terminal",
               kind: "final_answer" as const,
@@ -540,15 +1335,27 @@ describe("useConversationController", () => {
               text: "权威最终答复",
             },
           ],
+          inputQueue: null,
           contextUsage: null,
+          taskActivities: [],
+          goalActivities: [],
           nextCursor: null,
         };
       });
+    const threadSeen = vi.fn<ConversationHistoryPort["threadSeen"]>(
+      async ({ expectedThreadRevision }) => ({
+        ...existing,
+        latestTurnStatus: "completed",
+        latestTurnSeen: true,
+        revision: expectedThreadRevision + 1,
+      }),
+    );
     const history: ConversationHistoryPort = {
       ...historyExtensions(),
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadSeen,
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -610,6 +1417,22 @@ describe("useConversationController", () => {
             state: "completed",
             summary: "完成",
             finalMessage: { messageId: "item_terminal_final", text: "可见最终答复" },
+            changeSet: {
+              state: "complete",
+              incompleteReasons: [],
+              files: [
+                {
+                  path: "src/main.ts",
+                  status: "modified",
+                  additions: 3,
+                  deletions: 1,
+                  binary: false,
+                  truncated: false,
+                },
+              ],
+              stats: { files: 1, additions: 3, deletions: 1, binaryFiles: 0, truncated: false },
+              artifactId: "terminal_event",
+            },
           },
         },
       });
@@ -617,7 +1440,19 @@ describe("useConversationController", () => {
 
     expect(useTimelineStore.getState().items["item_terminal_final"]?.text).toBe("可见最终答复");
     expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBe("terminal_snapshot");
-    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(threadSeen).toHaveBeenCalledWith({
+        threadId: existing.threadId,
+        expectedThreadRevision: 2,
+      }),
+    );
+    await waitFor(() =>
+      expect(result.current.threads[0]).toMatchObject({
+        latestTurnStatus: "completed",
+        latestTurnSeen: true,
+      }),
+    );
+    expect(threadRead).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       releaseTerminalSnapshot();
@@ -625,11 +1460,15 @@ describe("useConversationController", () => {
     });
     await waitFor(() =>
       expect(useTimelineStore.getState().turns["turn_terminal"]?.changeSet).toMatchObject({
-        state: "available",
+        state: "complete",
+        artifactId: "artifact_terminal_diff",
         stats: { files: 1, additions: 3, deletions: 1 },
       }),
     );
     expect(useTimelineStore.getState().items["item_terminal_final"]?.text).toBe("权威最终答复");
+    expect(useTimelineStore.getState().items["item_terminal_reasoning"]?.text).toBe(
+      "两个工具均已完成，现在整理结果。",
+    );
     expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
     await act(async () => Promise.resolve());
     expect(threadRead).toHaveBeenCalledTimes(2);
@@ -646,11 +1485,14 @@ describe("useConversationController", () => {
         revision: 3,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async () => {
-        throw { code: "TOKEN_COUNT_UNAVAILABLE", detail: "private provider payload" };
+        throw { code: "SUMMARY_FAILURE", detail: "private provider payload" };
       }),
     };
     const { result } = renderHook(() =>
@@ -668,7 +1510,7 @@ describe("useConversationController", () => {
     await act(async () => result.current.compact());
     expect(result.current.compaction).toEqual({
       phase: "error",
-      message: "暂时无法精确计算 Token，请稍后重试。",
+      message: "上下文摘要生成失败，请重试。",
       retryable: true,
     });
     expect(result.current.compaction.message).not.toContain("private");
@@ -686,7 +1528,10 @@ describe("useConversationController", () => {
         revision: 1,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({
@@ -759,7 +1604,10 @@ describe("useConversationController", () => {
         revision: 5,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({
@@ -823,7 +1671,10 @@ describe("useConversationController", () => {
         revision: 0,
         turns: [],
         items: [],
+        inputQueue: null,
         contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
       threadCompact: vi.fn(async (input) => ({

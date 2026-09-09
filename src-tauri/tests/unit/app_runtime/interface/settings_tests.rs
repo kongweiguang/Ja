@@ -29,6 +29,26 @@ fn validates_mcp_test_revisions() {
     assert!(invalid.validate().is_err());
 }
 
+/// Skill 目录只接受不透明 Workspace identity，确保项目来源可选但 Renderer 仍不能提交路径。
+#[test]
+fn validates_workspace_scoped_skill_list() {
+    let scoped = SettingsQueryInput {
+        method: "skill/list".to_owned(),
+        params: json!({"workspaceId": "ws_project", "limit": 20}),
+    };
+    assert!(scoped.validate().is_ok());
+    let path = SettingsQueryInput {
+        method: "skill/list".to_owned(),
+        params: json!({"workspaceId": "C:\\workspace"}),
+    };
+    assert!(path.validate().is_err());
+    let unrelated = SettingsQueryInput {
+        method: "skill/list".to_owned(),
+        params: json!({"cwd": "C:\\workspace"}),
+    };
+    assert!(unrelated.validate().is_err());
+}
+
 /// 模型验证参数必须同时携带保存后的 Provider/Model 身份，结果只允许脱敏模型名与耗时。
 #[test]
 fn validates_model_test_boundary() {

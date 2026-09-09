@@ -22,7 +22,9 @@ const MAIN_WINDOW_LABEL: &str = "main";
 mod test_prelude {
     pub(crate) use crate::app_runtime::{
         ApprovalResponseInput, EventSink, ManualRecoveryConfirmation, ManualRecoveryReason,
-        RuntimeCommandError, RuntimeHost, RuntimeStatusKind, WorkspaceLookup, WorkspaceOpenInput,
+        RuntimeCommandError, RuntimeHost, RuntimeStatusKind, TaskCreateInput, TaskFollowupInput,
+        TaskMessageInput, TaskMutationInput, TaskTreeDeleteInput, TurnContentPart, WorkspaceLookup,
+        WorkspaceOpenInput,
     };
     pub(crate) use crate::preview::{
         PreviewError, PreviewErrorCode, PreviewId, PreviewManager, PreviewPolicy,
@@ -82,6 +84,16 @@ unit_scope!(
     "/tests/unit/native_shortcuts_tests.rs"
 );
 unit_scope!(
+    attachment_preview_scope,
+    crate::attachment_preview,
+    "/tests/unit/attachment_preview/host_tests.rs"
+);
+unit_scope!(
+    attachment_preview_commands_scope,
+    crate::attachment_preview::commands,
+    "/tests/unit/attachment_preview/commands_tests.rs"
+);
+unit_scope!(
     app_tray_scope,
     crate::app_runtime::interface::app_tray,
     "/tests/unit/app_tray_tests.rs"
@@ -91,6 +103,11 @@ unit_scope!(
     app_runtime_domain_commands_scope,
     crate::app_runtime::domain::commands,
     "/tests/unit/app_runtime/domain/command_tests.rs"
+);
+unit_scope!(
+    app_runtime_domain_tasks_scope,
+    crate::app_runtime::domain::tasks,
+    "/tests/unit/app_runtime/domain/task_tests.rs"
 );
 unit_scope!(
     app_runtime_domain_runtime_scope,
@@ -114,9 +131,19 @@ unit_scope!(
     "/tests/unit/app_runtime/interface/event_projection_tests.rs"
 );
 unit_scope!(
+    app_runtime_bridge_tasks_scope,
+    crate::app_runtime::infrastructure::bridge::tasks,
+    "/tests/unit/app_runtime/infrastructure/task_bridge_tests.rs"
+);
+unit_scope!(
     app_runtime_history_model_scope,
     crate::app_runtime::interface::history_model,
     "/tests/unit/app_runtime/interface/history_tests.rs"
+);
+unit_scope!(
+    app_runtime_goal_interface_scope,
+    crate::app_runtime::interface::goal,
+    "/tests/unit/app_runtime/interface/goal_tests.rs"
 );
 unit_scope!(
     app_runtime_settings_model_scope,

@@ -25,6 +25,8 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const temporaryPrefix = "ja-kernel-loop-";
 const credentialId = "cred_kernel_smoke";
+const providerId = "provider_kernel_smoke";
+const modelId = "model_kernel_smoke";
 const requestTimeoutMs = 30_000;
 
 /** 只接受显式环境或当前唯一 app-server 构建目录中的非空 fat JAR。 */
@@ -84,11 +86,13 @@ async function cleanupDirectories(root) {
 /** 构造当前唯一严格空配置，不携带 Provider 或旧配置键。 */
 function emptyConfiguration() {
   return {
-    schema_version: 2,
+    schema_version: 1,
     config_revision: 0,
-    permission_mode: "full_access",
-    default_profile_id: null,
-    profiles: [],
+    default_access_mode: "full_access",
+    default_provider_id: null,
+    default_model_id: null,
+    default_reasoning_level: null,
+    providers: [],
     mcp_servers: [],
     skills: [],
   };
@@ -113,7 +117,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const jar = command === undefined ? await resolveJar() : undefined;
     session = new JsonlSession({
       command: java,
-      prefixArgs: prefixArgs ?? ["-jar", jar],
+      prefixArgs: prefixArgs ?? ["--enable-native-access=ALL-UNNAMED", "-jar", jar],
       directories,
       apiKey: "",
       endpoint: "",
@@ -186,6 +190,11 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const created = success(await session.request("thread/create", {
       cwd: directories.workspace,
       title: "Ja Kernel smoke",
+      providerId,
+      modelId,
+      reasoningLevel: null,
+      accessMode: "full_access",
+      collaborationMode: "default",
     }), "thread/create");
     if (typeof created?.threadId !== "string" || !created.threadId.startsWith("thr_")
         || created.workspaceId !== workspace.workspaceId) {

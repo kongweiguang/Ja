@@ -459,6 +459,27 @@ public final class TurnQueue implements AutoCloseable {
          */
         public void fail(Throwable failure) {
             Objects.requireNonNull(failure, "failure");
+            ReservationRemoval removal = removePendingReservation();
+            // 准入失败可能触发调用方 Continuation，因此只能在释放监视器后发布。
+            if (removal.removed()) entry.fail(failure);
+            publishDispatchFailures(removal.dispatchFailures());
+        }
+
+        /**
+         * admission 识别到幂等重放时正常释放未提交预留；已持久 Turn 由原执行 owner 继续，
+         * 当前调用不得制造失败终态或再次调度副作用。
+         */
+        public void releaseWithoutExecution() {
+            ReservationRemoval removal = removePendingReservation();
+            if (removal.removed()) entry.complete(null);
+            publishDispatchFailures(removal.dispatchFailures());
+        }
+
+        /**
+         * 失败与幂等重放共享同一个监视器内撤销事务；只把终态通知留给调用方，避免在锁内
+         * 执行 Continuation，同时确保容量、lane head 与后续调度始终作为一个原子变化。
+         */
+        private ReservationRemoval removePendingReservation() {
             boolean removed = false;
             ArrayDeque<DispatchFailure> dispatchFailures = null;
             synchronized (monitor) {
@@ -467,17 +488,21 @@ public final class TurnQueue implements AutoCloseable {
                     if (removedHead) removeReady(entry.lane);
                     entry.lane.pending.remove(entry);
                     admitted--;
-                    if (entry.lane.pending.isEmpty() && !entry.lane.running)
+                    if (entry.lane.pending.isEmpty() && !entry.lane.running) {
                         lanes.remove(entry.key.threadId, entry.lane);
-                    else if (removedHead) enqueueReady(entry.lane);
+                    } else if (removedHead) {
+                        enqueueReady(entry.lane);
+                    }
                     removed = true;
                     monitor.notifyAll();
                     dispatchFailures = scheduleHeads();
                 }
             }
-            // 准入失败可能触发调用方 Continuation，因此只能在释放监视器后发布。
-            if (removed) entry.fail(failure);
-            publishDispatchFailures(dispatchFailures);
+            return new ReservationRemoval(removed, dispatchFailures);
+        }
+
+        /** 撤销结果把锁内状态变化与锁外完成通知明确分开。 */
+        private record ReservationRemoval(boolean removed, ArrayDeque<DispatchFailure> dispatchFailures) {
         }
 
         /**

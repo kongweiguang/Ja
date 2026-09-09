@@ -5,13 +5,17 @@ package io.github.kongweiguang.ja.transport.rpc.runtime;
 
 import io.github.kongweiguang.ja.transport.rpc.handler.ConfigurationHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.AttachmentHandler;
+import io.github.kongweiguang.ja.transport.rpc.handler.AttachmentPreviewHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.HandshakeHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.HealthShutdownHandler;
+import io.github.kongweiguang.ja.transport.rpc.handler.GoalHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.SettingsCatalogHandler;
+import io.github.kongweiguang.ja.transport.rpc.handler.TaskHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.ThreadHistoryHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.ThreadCompactionHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.TurnApprovalHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.WorkspaceHandler;
+import io.github.kongweiguang.ja.transport.rpc.handler.WorkspacePathSearchHandler;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcCodec;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcException;
@@ -61,6 +65,7 @@ public final class RpcServer implements AutoCloseable {
     private final JaRpcCodec codec = new JaRpcCodec();
     private final StdioWriter writer;
     private final RpcSession session;
+    private final ThreadHistoryHandler threadHistory;
     private final RpcRouter router;
     private final BoundedVirtualExecutor requests;
     private final Set<String> inFlightIds = ConcurrentHashMap.newKeySet();
@@ -107,9 +112,12 @@ public final class RpcServer implements AutoCloseable {
         this.session = new RpcSession(configuration, codec.mapper(), clock, writer, factory,
                 configurationUseCase, runtimeGeneration);
         this.beforeDispatch = Objects.requireNonNull(beforeDispatch, "beforeDispatch");
+        this.threadHistory = new ThreadHistoryHandler(session);
         this.router = new RpcRouter(List.of(new HandshakeHandler(session), new WorkspaceHandler(session),
-                new ThreadHistoryHandler(session), new ThreadCompactionHandler(session),
-                new AttachmentHandler(session), new TurnApprovalHandler(session),
+                new WorkspacePathSearchHandler(session),
+                threadHistory, new ThreadCompactionHandler(session),
+                new AttachmentHandler(session), new AttachmentPreviewHandler(session),
+                new TurnApprovalHandler(session), new TaskHandler(session), new GoalHandler(session),
                 new SettingsCatalogHandler(session), new ConfigurationHandler(session),
                 new HealthShutdownHandler(session)));
         this.requests = new BoundedVirtualExecutor(
@@ -271,6 +279,15 @@ public final class RpcServer implements AutoCloseable {
             failure = failure.getCause();
         }
         if (failure instanceof JaRpcException rpc) return rpc;
+        if (failure instanceof TurnUseCase.TurnResumeException resume) {
+            return switch (resume.failure()) {
+                case TURN_NOT_RESUMABLE -> JaRpcException.of(JaErrorCatalog.TURN_NOT_RESUMABLE,
+                        "turn is not resumable");
+                case TURN_RESUME_ORDER_CONFLICT -> JaRpcException.of(
+                        JaErrorCatalog.TURN_RESUME_ORDER_CONFLICT,
+                        "an earlier turn must be resolved first");
+            };
+        }
         if (failure instanceof TurnUseCase.TurnCancellationException cancellation) {
             return switch (cancellation.failure()) {
                 case TURN_NOT_FOUND -> JaRpcException.of(JaErrorCatalog.TURN_NOT_FOUND,
@@ -323,8 +340,6 @@ public final class RpcServer implements AutoCloseable {
                     "storage queue is full");
             case QUEUE_TIMEOUT -> JaRpcException.of(JaErrorCatalog.REQUEST_DEADLINE_EXCEEDED,
                     "storage operation timed out");
-            case FRESH_SCHEMA_REQUIRED -> JaRpcException.of(JaErrorCatalog.SCHEMA_MISMATCH,
-                    "runtime schema is unavailable");
             case STORAGE_CONFLICT -> JaRpcException.of(JaErrorCatalog.STORAGE_CONFLICT,
                     "database locations conflict");
             case INVALID_STATE -> JaRpcException.of(JaErrorCatalog.INVALID_STATE,
@@ -405,17 +420,27 @@ public final class RpcServer implements AutoCloseable {
             }
         }
         if (ingressQuiesced) {
+            boolean changeSetReadsQuiesced = false;
             try {
-                session.close(deadline);
+                threadHistory.close(deadline);
+                changeSetReadsQuiesced = true;
             } catch (RuntimeException closeFailure) {
                 if (failure == null) failure = closeFailure;
                 else failure.addSuppressed(closeFailure);
             }
-            try {
-                writer.close(deadline);
-            } catch (RuntimeException closeFailure) {
-                if (failure == null) failure = closeFailure;
-                else failure.addSuppressed(closeFailure);
+            if (changeSetReadsQuiesced) {
+                try {
+                    session.close(deadline);
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
+                try {
+                    writer.close(deadline);
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
             }
         }
         if (failure != null) throw failure;

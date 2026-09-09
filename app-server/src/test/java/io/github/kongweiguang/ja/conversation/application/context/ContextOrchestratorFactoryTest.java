@@ -95,7 +95,8 @@ final class ContextOrchestratorFactoryTest {
                         new io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.Context(
                                 "evt_context", "ws_test", "thr_test", "turn_test", 5, NOW,
                                 "cmp_test", io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.Trigger.AUTOMATIC,
-                                4, 1_000L, (long) checkpoint.estimatedTokens(), "ja-context-v3"),
+                                4, 1_000L, (long) checkpoint.estimatedTokens(),
+                                io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.STRATEGY_VERSION),
                         checkpoint.checkpointId());
         assertEquals(checkpoint.checkpointId(), event.checkpointId());
         assertEquals(1, store.appended.size());
@@ -185,8 +186,7 @@ final class ContextOrchestratorFactoryTest {
 
     /** 构造真实不可变 Provider/Model 快照，且不导入任何 Provider 实现。 */
     private static ModelPort.ModelConfiguration configuration() {
-        return new ModelPort.ModelConfiguration("provider_test", "model_test", "cfg_test", ModelPort.Provider.OPENAI,
-                ModelPort.Api.OPENAI_RESPONSES, "test-model", URI.create("http://localhost:60842"),
+        return new ModelPort.ModelConfiguration("provider_test", "model_test", "cfg_test", ModelPort.Api.OPENAI_RESPONSES, "test-model", URI.create("http://localhost:60842"),
                 "fixture-key", Duration.ofSeconds(5), Duration.ofSeconds(20),
                 java.util.Set.of(ModelPort.InputModality.TEXT),
                 ModelPort.GenerationOptions.defaults());
@@ -222,8 +222,8 @@ final class ContextOrchestratorFactoryTest {
         return new SummaryModel() {
             /** 返回固定官方计量夹具，指纹仅用于满足强类型端口契约。 */
             @Override
-            public ModelPort.InputTokenCount countInputTokens(SummaryPrompt prompt) {
-                return new ModelPort.InputTokenCount(100, "0".repeat(64));
+            public ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
+                return new ModelPort.InputTokenEstimate(100, "0".repeat(64));
             }
 
             /** 把摘要结果及取消竞争留给单个测试定义。 */

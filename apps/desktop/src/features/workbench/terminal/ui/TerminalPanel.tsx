@@ -13,6 +13,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactElement,
 } from "react";
+import { useResolvedTheme, useUiPalette } from "@/shared/hooks/useResolvedTheme";
 import { IconButton } from "@/shared/ui/primitives";
 import type { TerminalOutputChunk } from "../application";
 import "@xterm/xterm/css/xterm.css";
@@ -47,12 +48,52 @@ export interface TerminalPanelProps {
   ariaLabel?: string;
 }
 
-const DEFAULT_THEME: ITheme = {
-  background: "#1e1f22",
-  foreground: "#e6e8ed",
-  cursor: "#8fafff",
-  selectionBackground: "#4b6baf66",
-};
+const TERMINAL_THEME_TOKEN_NAMES = {
+  background: "--ja-terminal-background",
+  foreground: "--ja-terminal-foreground",
+  cursor: "--ja-terminal-cursor",
+  selectionBackground: "--ja-terminal-selection",
+  black: "--ja-terminal-ansi-black",
+  red: "--ja-terminal-ansi-red",
+  green: "--ja-terminal-ansi-green",
+  yellow: "--ja-terminal-ansi-yellow",
+  blue: "--ja-terminal-ansi-blue",
+  magenta: "--ja-terminal-ansi-magenta",
+  cyan: "--ja-terminal-ansi-cyan",
+  white: "--ja-terminal-ansi-white",
+  brightBlack: "--ja-terminal-ansi-bright-black",
+  brightRed: "--ja-terminal-ansi-bright-red",
+  brightGreen: "--ja-terminal-ansi-bright-green",
+  brightYellow: "--ja-terminal-ansi-bright-yellow",
+  brightBlue: "--ja-terminal-ansi-bright-blue",
+  brightMagenta: "--ja-terminal-ansi-bright-magenta",
+  brightCyan: "--ja-terminal-ansi-bright-cyan",
+  brightWhite: "--ja-terminal-ansi-bright-white",
+} as const satisfies Partial<Record<keyof ITheme, string>>;
+
+/**
+ * 主题 token 是 WebView 与 xterm 的唯一配色合同；缺失时立即暴露集成错误，避免 xterm
+ * 静默回退自身 ANSI 默认值并形成只在部分终端状态出现的混合色板。
+ */
+function readTerminalThemeToken(styles: CSSStyleDeclaration, tokenName: string): string {
+  const value = styles.getPropertyValue(tokenName).trim();
+  if (value.length === 0) throw new Error(`Missing terminal theme token: ${tokenName}`);
+  return value;
+}
+
+/**
+ * xterm 无法直接解析 CSS var，因此在 document 主题已由 ThemeProvider 原子应用后，
+ * 将完整语义 token 投影为 ITheme；这里不缓存 DOM 样式，确保 system/light/dark 切换读取最新值。
+ */
+function readTerminalTheme(): ITheme {
+  const styles = globalThis.getComputedStyle(globalThis.document.documentElement);
+  return Object.fromEntries(
+    Object.entries(TERMINAL_THEME_TOKEN_NAMES).map(([key, tokenName]) => [
+      key,
+      readTerminalThemeToken(styles, tokenName),
+    ]),
+  ) as ITheme;
+}
 
 const MAX_LINK_PHYSICAL_LINES = 64;
 const MAX_LINK_CHARACTERS = 8_192;
@@ -272,7 +313,7 @@ export function TerminalPanel({
   initialData,
   output,
   outputs,
-  theme = DEFAULT_THEME,
+  theme,
   onAttach,
   onDetach,
   onData,
@@ -283,6 +324,8 @@ export function TerminalPanel({
   onOutputsConsumed,
   ariaLabel = "工作区终端",
 }: TerminalPanelProps): ReactElement {
+  const resolvedTheme = useResolvedTheme();
+  const palette = useUiPalette();
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
@@ -343,7 +386,7 @@ export function TerminalPanel({
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace",
       fontSize: 12,
-      theme: initialThemeRef.current,
+      theme: initialThemeRef.current ?? readTerminalTheme(),
     });
     terminalRef.current = terminal;
     const fitAddon = new FitAddon();
@@ -457,13 +500,16 @@ export function TerminalPanel({
     };
   }, [openExternalUrlOnce]);
 
-  /** 更新 xterm 暴露的可变 options 来切换运行时主题，可保持 scrollback、选择和 PTY 订阅不变。 */
+  /**
+   * 仅更新 xterm 暴露的可变 theme option；resolvedTheme 与 palette 只作为根 token 已切换的
+   * 触发器，保持实例、scrollback、选择、搜索状态和 PTY 订阅原地不变。
+   */
   useEffect(() => {
     const terminal = terminalRef.current;
     if (terminal !== null) {
-      terminal.options.theme = theme;
+      terminal.options.theme = theme ?? readTerminalTheme();
     }
-  }, [theme]);
+  }, [palette, resolvedTheme, theme]);
 
   /** 写入已确认批次中的全部未见成员；由 xterm owner 跟踪身份，避免 React 批处理丢失与 rerender 重放。 */
   useEffect(() => {

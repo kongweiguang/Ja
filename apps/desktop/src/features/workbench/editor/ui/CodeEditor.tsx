@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { basicSetup } from "codemirror";
-import { EditorState } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
-import { useEffect, useRef, type ReactElement } from "react";
-import { languageExtension } from "../domain/language";
+import { useEffect, useMemo, useRef, type ReactElement } from "react";
+import { languageExtension } from "@/shared/syntax";
+import { useResolvedTheme, useUiPalette } from "@/shared/hooks/useResolvedTheme";
+import { semanticCodeMirrorThemeExtension } from "./semanticCodeMirrorTheme";
 import "./Editor.css";
 
 export interface EditorRevealPosition {
@@ -28,7 +30,8 @@ export interface CodeEditorProps {
 
 /**
  * 每个 Document Path 只维持一个 CodeMirror View。Parent State 通过 Listener 接收 Draft Text，
- * 外部 Revision 带有显式 Annotation，避免被误认成用户编辑或触发 Autosave。
+ * 外部 Revision 带有显式 Annotation，避免被误认成用户编辑或触发 Autosave；主题切换通过
+ * 独立 Compartment 原位重配，Palette 与明暗变化都不能清空用户仍未保存的编辑状态。
  */
 export function CodeEditor({
   filePath,
@@ -42,8 +45,13 @@ export function CodeEditor({
   onSave,
   onBlur,
 }: CodeEditorProps): ReactElement {
+  const resolvedTheme = useResolvedTheme();
+  const palette = useUiPalette();
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | undefined>(undefined);
+  const themeCompartment = useMemo(() => new Compartment(), []);
+  const initialResolvedThemeRef = useRef(resolvedTheme);
+  const initialPaletteRef = useRef(palette);
   const initialContentRef = useRef(content);
   const externalUpdateRef = useRef(false);
   const onChangeRef = useRef(onChange);
@@ -74,6 +82,12 @@ export function CodeEditor({
       EditorState.readOnly.of(readOnly),
       EditorView.editable.of(!readOnly),
       EditorView.lineWrapping,
+      themeCompartment.of(
+        semanticCodeMirrorThemeExtension(
+          initialPaletteRef.current,
+          initialResolvedThemeRef.current,
+        ),
+      ),
       updateListener,
       keymap.of([
         {
@@ -101,7 +115,18 @@ export function CodeEditor({
       view.destroy();
       viewRef.current = undefined;
     };
-  }, [ariaLabel, filePath, language, readOnly]);
+  }, [ariaLabel, filePath, language, readOnly, themeCompartment]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (view === undefined) return;
+    // 配色与明暗只重配 Compartment，保留 selection、undo history、scroll 与未保存 Draft。
+    view.dispatch({
+      effects: themeCompartment.reconfigure(
+        semanticCodeMirrorThemeExtension(palette, resolvedTheme),
+      ),
+    });
+  }, [palette, resolvedTheme, themeCompartment]);
 
   useEffect(() => {
     const view = viewRef.current;

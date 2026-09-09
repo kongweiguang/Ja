@@ -77,7 +77,7 @@ const providerTurnLimitsSchema = z
   })
   .strict();
 
-/** 网络超时保持在 JA-RPC v2 可接受范围内，避免无界等待或立即超时。 */
+/** 网络超时保持在 JA-RPC v1 可接受范围内，避免无界等待或立即超时。 */
 const providerNetworkTimeoutsSchema = z
   .object({
     connectTimeoutMs: z.number().int().min(100).max(120_000),
@@ -127,8 +127,7 @@ export const providerSchema = z
       .regex(/^provider_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .optional(),
     name: z.string().trim().min(1, "请填写 Provider 名称。"),
-    provider: z.enum(["anthropic", "openai"]),
-    api: z.enum(["anthropic_messages", "openai_responses"]),
+    api: z.enum(["anthropic_messages", "openai_responses", "openai_chat_completions"]),
     baseUrl: optionalUrl,
     credentialId: z
       .string()
@@ -150,23 +149,9 @@ export const providerSchema = z
         message: "请输入无凭据参数的 HTTPS 地址，或本机回环 HTTP 地址。",
       });
     }
-    if (values.api === "anthropic_messages" && values.provider !== "anthropic") {
-      context.addIssue({
-        code: "custom",
-        path: ["provider"],
-        message: "Anthropic Messages 只能使用 anthropic provider。",
-      });
-    }
-    if (values.api === "openai_responses" && values.provider !== "openai") {
-      context.addIssue({
-        code: "custom",
-        path: ["provider"],
-        message: "OpenAI Responses 只能使用 openai provider。",
-      });
-    }
   });
 
-/** v4 不导出旧单模型配置入口，Provider 连接与模型能力必须分别校验。 */
+/** v1 只提供 Provider 聚合入口，Provider 连接与模型能力必须分别校验。 */
 
 /** MCP 表单规则同时约束安全 URL 与 stdio Secret 边界，不执行任何 native IO。 */
 export const mcpSchema = z

@@ -4,8 +4,6 @@
 package io.github.kongweiguang.ja.configuration.adapter.out.generation;
 
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * 统一约束 generation catalog 的稳定标识、有界文本、不变引用和 loopback URL。
@@ -26,20 +24,6 @@ final class ConfigGenerationValueRules {
             || !value.substring(prefix.length()).matches("[A-Za-z0-9][A-Za-z0-9._-]*")) {
             throw new IllegalArgumentException("identifier is invalid");
         }
-    }
-
-    /**
-     * immutableIdentifiers 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。
-     */
-    static List<String> immutableIdentifiers(List<String> values, String prefix) {
-        if (values == null) return List.of();
-        List<String> copy = new ArrayList<>(values.size());
-        for (String value : values) {
-            requireIdentifier(value, prefix);
-            if (copy.contains(value)) throw new IllegalArgumentException("duplicate identifier");
-            copy.add(value);
-        }
-        return List.copyOf(copy);
     }
 
     /**

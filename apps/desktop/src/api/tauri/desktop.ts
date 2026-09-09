@@ -9,6 +9,11 @@ import {
 } from "./notification";
 import { openExternalHttpUrl } from "./opener";
 import {
+  checkForDesktopUpdate,
+  installPendingDesktopUpdate,
+  relaunchAfterDesktopUpdate,
+} from "./updater";
+import {
   isCurrentWindowFocused,
   TauriNativeShortcutAdapter,
   type NativeShortcutPort,
@@ -22,6 +27,9 @@ export interface DesktopIntegrationAdapters {
   notify: (kind: DesktopNotificationKind) => Promise<void>;
   isWindowFocused: () => Promise<boolean>;
   nativeShortcuts: NativeShortcutPort;
+  checkForUpdate: typeof checkForDesktopUpdate;
+  installUpdate: typeof installPendingDesktopUpdate;
+  relaunchAfterUpdate: typeof relaunchAfterDesktopUpdate;
 }
 
 /** 只创建一次生产 adapter 集合，不向 feature 或 UI 组件暴露 plugin 的宽泛 API。 */
@@ -33,5 +41,8 @@ export function createDesktopIntegrationAdapters(): DesktopIntegrationAdapters {
     notify: sendDesktopNotification,
     isWindowFocused: isCurrentWindowFocused,
     nativeShortcuts: new TauriNativeShortcutAdapter(),
+    checkForUpdate: checkForDesktopUpdate,
+    installUpdate: installPendingDesktopUpdate,
+    relaunchAfterUpdate: relaunchAfterDesktopUpdate,
   };
 }

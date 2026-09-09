@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-
 // 有界 Workspace mutation 与 Native Drop 准入。
 //
 // renderer 只提供不透明 Workspace id、slash-separated 相对路径、expected revision

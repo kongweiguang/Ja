@@ -32,6 +32,7 @@ const snapshot: ReviewSnapshot = {
   files: [
     {
       fileId: "file_a",
+      layer: "unstaged",
       path: "src/main.rs",
       oldPath: null,
       status: "modified",
@@ -60,6 +61,7 @@ const fileDiff: ReviewFileDiff = {
   source,
   revision: "rev_1",
   fileId: "file_a",
+  layer: "unstaged",
   path: "src/main.rs",
   oldPath: null,
   status: "modified",
@@ -146,6 +148,29 @@ describe("TauriReviewAdapter", () => {
         source: { kind: "unknown" } as never,
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  it("accepts the aggregate uncommitted source and requires authoritative file layers", async () => {
+    const bridge = createBridge();
+    bridge.invoke = vi.fn(async () => ({
+      ...snapshot,
+      source: { kind: "uncommitted" },
+      capabilities: { stage: true, unstage: true, revert: true },
+    })) as RuntimeNativeBridge["invoke"];
+    await expect(
+      new TauriReviewAdapter(bridge).snapshot({
+        workspaceId: "ws_demo",
+        source: { kind: "uncommitted" },
+      }),
+    ).resolves.toMatchObject({ source: { kind: "uncommitted" } });
+
+    bridge.invoke = vi.fn(async () => ({
+      ...snapshot,
+      files: snapshot.files.map(({ layer: _layer, ...file }) => file),
+    })) as RuntimeNativeBridge["invoke"];
+    await expect(
+      new TauriReviewAdapter(bridge).snapshot({ workspaceId: "ws_demo", source }),
+    ).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE" });
   });
 
   it("drops malformed invalidation events and forwards valid metadata hints", async () => {

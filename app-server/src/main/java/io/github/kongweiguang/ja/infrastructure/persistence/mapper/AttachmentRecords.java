@@ -11,11 +11,11 @@ public final class AttachmentRecords {
     public record BlobRow(String sha256, long sizeBytes, String mediaKind, String mediaType,
                           String createdAt) { }
 
-    /** 附件生命周期投影；boundTurnId 仅在查询绑定时填充。 */
+    /** 附件生命周期投影；boundMessageId 仅在查询消息绑定时填充。 */
     public record AttachmentRow(String attachmentId, String workspaceId, String blobSha256,
                                 String contentSha256, String displayName, long sizeBytes,
                                 String mediaKind, String mediaType, String status,
-                                String createdAt, String expiresAt, String boundTurnId) { }
+                                String createdAt, String expiresAt, String boundMessageId) { }
 
     /** 导入 blob 的幂等插入参数。 */
     public record BlobInsert(String sha256, long sizeBytes, String mediaKind, String mediaType,
@@ -29,9 +29,13 @@ public final class AttachmentRecords {
     /** DRAFT→DISCARDED 状态门。 */
     public record AttachmentDiscard(String attachmentId, String discardedAt) { }
 
-    /** Turn admission 内的 DRAFT→BOUND 状态门。 */
-    public record AttachmentBind(String attachmentId, String workspaceId, String turnId,
+    /** USER Message 创建事务内的 DRAFT→BOUND 状态门。 */
+    public record AttachmentBind(String attachmentId, String workspaceId, String messageId,
                                  int ordinal, String boundAt) { }
+
+    /** 队列写事务内的 DRAFT 独占预留关系。 */
+    public record AttachmentReservation(String inputId, String attachmentId, int ordinal,
+                                        String createdAt) { }
 
     /** 自动标题 claim 的完整 durable identity。 */
     public record TitleGenerationInsert(String generationId, String threadId, String turnId,

@@ -34,7 +34,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.CompletionException;
 
 /** 在空闲 Thread 上复用生产 ContextOrchestrator，且永不执行普通模型发送。 */
 public final class ManualContextCompactionService implements ContextCompactionUseCase {
@@ -71,7 +70,7 @@ public final class ManualContextCompactionService implements ContextCompactionUs
 
     /**
      * 冻结 Thread、Provider/Model、Prompt、Tool schema 与配置代际后执行强制压缩；sender 为空操作，
-     * 因此唯一付费副作用是必要的 Token 计量和 Summary，而不会生成普通 assistant 回复。
+     * 因此唯一付费副作用是 Summary；预算估算为纯本地计算，不会生成普通 assistant 回复。
      */
     @Override
     @SuppressWarnings("PMD.CloseResource")
@@ -107,9 +106,11 @@ public final class ManualContextCompactionService implements ContextCompactionUs
                 snapshot.workspaceId(), snapshot.threadId(), null, snapshot.revision(), compactionId,
                 events, clock);
         TurnRuntimeRequest runtimeRequest = new TurnRuntimeRequest(
-                snapshot.threadId(), workspace.root(), workspace.workspaceId(),
+                snapshot.threadId(), null, workspace.root(), workspace.workspaceId(),
                 preferences.providerId(), preferences.modelId(), preferences.reasoningLevel(),
-                preferences.accessMode(), MANUAL_DEADLINE, requestedAt);
+                preferences.accessMode(), preferences.collaborationMode(),
+                io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER,
+                MANUAL_DEADLINE, requestedAt);
         try (RuntimeLease runtime = runtimes.resolve(runtimeRequest);
              TurnToolSessionFactory.Session mcp = runtime.toolSessions().open(cancellation)) {
             List<AgentTool> tools = new ArrayList<>(runtime.tools());
@@ -153,7 +154,7 @@ public final class ManualContextCompactionService implements ContextCompactionUs
     }
 
     /**
-     * 构造只做官方 Token 计量的完整 Provider envelope，并复用真实发送的附件双门，避免计量与实际请求分叉。
+     * 构造用于纯本地预算估算的完整 Provider envelope，并复用真实发送的附件双门。
      */
     private ContextTokenMeter meter(RuntimeLease runtime, List<ToolSpec> tools,
                                     CancellationToken cancellation, String threadId) {
@@ -166,19 +167,9 @@ public final class ManualContextCompactionService implements ContextCompactionUs
                     context, runtime.model(), prepared.snapshot(), tools, null, 1,
                     threadId, runtime.attachments(),
                     models.nativeAttachmentSupport(runtime.model()));
-            try {
-                ModelPort.InputTokenCount count = models.countInputTokens(request, cancellation)
-                        .toCompletableFuture().join();
-                return new ContextTokenMeter.Measurement(count.tokens(), count.fingerprint());
-            } catch (CompletionException wrapped) {
-                Throwable cause = wrapped.getCause();
-                if (cause instanceof java.util.concurrent.CancellationException cancelled) throw cancelled;
-                throw new ContextException(ContextException.Code.TOKEN_COUNT_UNAVAILABLE,
-                        "manual compaction token count is unavailable", cause);
-            } catch (ModelPort.TokenCountUnavailableException unavailable) {
-                throw new ContextException(ContextException.Code.TOKEN_COUNT_UNAVAILABLE,
-                        "manual compaction token count is unavailable", unavailable);
-            }
+            ModelPort.InputTokenEstimate estimate = models.estimateInputTokens(request, cancellation);
+            return new ContextTokenMeter.Measurement(
+                    estimate.conservativeUpperBound(), estimate.fingerprint());
         };
     }
 
@@ -186,7 +177,6 @@ public final class ManualContextCompactionService implements ContextCompactionUs
     private static Failure map(ContextException failure) {
         return switch (failure.code()) {
             case CAS_CONFLICT -> failure(Code.CONFLICT);
-            case TOKEN_COUNT_UNAVAILABLE -> failure(Code.TOKEN_COUNT_UNAVAILABLE);
             case SUMMARY_FAILURE -> failure(Code.SUMMARY_FAILURE);
             case CONTEXT_LIMIT -> failure(Code.CONTEXT_LIMIT);
             case INVALID_STATE -> failure(Code.INVALID_STATE);

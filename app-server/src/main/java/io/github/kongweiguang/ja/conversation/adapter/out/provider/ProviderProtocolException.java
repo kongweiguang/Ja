@@ -3,13 +3,15 @@
 
 package io.github.kongweiguang.ja.conversation.adapter.out.provider;
 
+import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+
 import java.time.Duration;
 import java.util.Optional;
 
 /**
  * 主动排除响应正文、凭据和不透明推理状态的受限 Provider 异常。
  */
-public final class ProviderProtocolException extends RuntimeException {
+public final class ProviderProtocolException extends ModelPort.ModelUnavailableException {
     private static final long serialVersionUID = 1L;
 
     private final String code;
@@ -42,7 +44,7 @@ public final class ProviderProtocolException extends RuntimeException {
      */
     private ProviderProtocolException(String code, String message, boolean retryable,
                                       Throwable cause, Duration retryAfter) {
-        super(message, cause);
+        super(message, cause, retryable ? "MODEL_UNAVAILABLE" : "MODEL_PROTOCOL_ERROR");
         this.code = requireSafeCode(code);
         this.retryable = retryable;
         if (retryAfter != null && (retryAfter.isNegative() || retryAfter.compareTo(Duration.ofSeconds(60)) > 0)) {

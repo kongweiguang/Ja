@@ -18,6 +18,19 @@ public interface ManagedAttachmentReader {
     ReadResult read(ReadRequest request);
 
     /**
+     * 将附件授权、缺失、损坏或底层 IO 失败收敛为消费者自有的稳定边界；调用方只按可恢复性分流，
+     * 不依赖附件切片的异常类型，也不会把物理路径或存储文本带入队列问题。
+     */
+    final class ReadFailure extends RuntimeException {
+        @java.io.Serial private static final long serialVersionUID = 1L;
+
+        /** 保留本地 cause 供诊断，公开消息固定为脱敏文本。 */
+        public ReadFailure(Throwable cause) {
+            super("managed attachment read failed", Objects.requireNonNull(cause, "cause"));
+        }
+    }
+
+    /**
      * 先通过最小 range 取得已授权元数据，避免仅为能力判断就把整个附件载入内存。
      */
     default Descriptor inspect(String attachmentId, String threadId) {

@@ -83,8 +83,7 @@ final class AnthropicMessagesCodecTest {
     /** 使用 loopback 配置生成最小冻结请求，保证测试只观察 Codec JSON。 */
     private static ModelPort.ModelRequest request(ModelRole role, List<ModelContent> content) {
         ModelPort.ModelConfiguration configuration = new ModelPort.ModelConfiguration(
-                "provider_test", "model_test", "cfg_test", ModelPort.Provider.ANTHROPIC,
-                ModelPort.Api.ANTHROPIC_MESSAGES, "test-model", URI.create("http://127.0.0.1:60842"), "",
+                "provider_test", "model_test", "cfg_test", ModelPort.Api.ANTHROPIC_MESSAGES, "test-model", URI.create("http://127.0.0.1:60842"), "fixture-only-api-key",
                 Duration.ofSeconds(1), Duration.ofSeconds(1),
                 Set.of(ModelPort.InputModality.TEXT, ModelPort.InputModality.IMAGE, ModelPort.InputModality.PDF),
                 ModelPort.GenerationOptions.defaults());

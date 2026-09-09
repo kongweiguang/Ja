@@ -105,6 +105,35 @@ final class StdioWriterTest {
         assertTrue(frames.get(1).contains("\"id\":\"c:approval\""));
     }
 
+    /** 双队列允许控制事实越过草稿，但 Wire sequence 必须严格跟随最终 stdout 物理顺序。 */
+    @Test
+    void assignsNotificationSequenceAtPhysicalWriteBoundary() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        BlockingCaptureOutput output = new BlockingCaptureOutput();
+        try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024)) {
+            CompletableFuture<Void> first = writer.notification("task/activity",
+                    mapper.createObjectNode().put("marker", "first").put("sequence", 99));
+            assertTrue(output.entered.await(1, TimeUnit.SECONDS));
+            CompletableFuture<Void> draft = writer.delta("assistant/text-delta",
+                    mapper.createObjectNode().put("marker", "draft").put("sequence", 7));
+            CompletableFuture<Void> control = writer.notification("turn/terminal",
+                    mapper.createObjectNode().put("marker", "control").put("sequence", 3));
+            output.release.countDown();
+            CompletableFuture.allOf(first, draft, control).join();
+        }
+        List<ObjectNode> frames = output.content().lines().map(line -> {
+            try {
+                return (ObjectNode) mapper.readTree(line);
+            } catch (IOException failure) {
+                throw new IllegalStateException(failure);
+            }
+        }).toList();
+        assertEquals(List.of(1L, 2L, 3L), frames.stream()
+                .map(frame -> frame.path("params").path("sequence").longValue()).toList());
+        assertEquals(List.of("first", "control", "draft"), frames.stream()
+                .map(frame -> frame.path("params").path("marker").textValue()).toList());
+    }
+
     /** 确保被中断的刷写仍终结异步阶段，且迟到回调不能复活已关闭 Writer。 */
     @Test
     void closeCompletesLateCallbackWithoutRevivingWriter() throws Exception {
@@ -140,6 +169,35 @@ final class StdioWriterTest {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted");
             }
+        }
+    }
+
+    /** 首帧阻塞后继续捕获全部字节，用于确定性制造 control/data 选择竞争。 */
+    private static final class BlockingCaptureOutput extends OutputStream {
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final ByteArrayOutputStream delegate = new ByteArrayOutputStream();
+        private boolean blocked;
+
+        /** 只在首次写入前阻塞，释放后保留完整 JSONL 供协议顺序断言。 */
+        @Override
+        public synchronized void write(int value) throws IOException {
+            if (!blocked) {
+                blocked = true;
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted");
+                }
+            }
+            delegate.write(value);
+        }
+
+        /** 返回 Writer 已关闭后的 UTF-8 内容，避免测试读取仍在变化的缓冲区。 */
+        private synchronized String content() {
+            return delegate.toString(java.nio.charset.StandardCharsets.UTF_8);
         }
     }
 }

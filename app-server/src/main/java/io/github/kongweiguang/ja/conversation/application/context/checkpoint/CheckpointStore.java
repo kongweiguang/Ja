@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.conversation.application.context.checkpoint;
 
 import io.github.kongweiguang.ja.conversation.application.context.ContextPolicy;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryDocument;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -29,7 +30,13 @@ public interface CheckpointStore {
     /**
      * 将预期 revision 与其摘要源绑定，防止适配器把 Checkpoint 写入错误 Thread 或源版本。
      */
-    record CommitRequest(String threadId, long expectedThreadRevision, ContextCheckpoint checkpoint) {
+    record CommitRequest(String threadId, long expectedThreadRevision, ContextCheckpoint checkpoint,
+                         Optional<TurnOperation> turnOperation) {
+        /** 手动压缩保持 Thread-only 提交，不伪造 Turn Operation。 */
+        public CommitRequest(String threadId, long expectedThreadRevision, ContextCheckpoint checkpoint) {
+            this(threadId, expectedThreadRevision, checkpoint, Optional.empty());
+        }
+
         /**
          * 在进入事务前校验 Thread 和源 revision 一致，缩小持久层需要防御的状态空间。
          */
@@ -38,6 +45,7 @@ public interface CheckpointStore {
                 throw new IllegalArgumentException("invalid checkpoint commit request");
             }
             checkpoint = Objects.requireNonNull(checkpoint, "checkpoint");
+            turnOperation = Objects.requireNonNull(turnOperation, "turnOperation");
             if (!threadId.equals(checkpoint.threadId())
                 || checkpoint.sourceRevision() != expectedThreadRevision) {
                 throw new IllegalArgumentException("checkpoint commit source mismatch");
@@ -46,10 +54,27 @@ public interface CheckpointStore {
     }
 
     /**
+     * 自动压缩把最终 READY(ASSISTANT) 与 checkpoint 放进同一事务，避免崩溃留下已提交摘要但旧游标。
+     */
+    record TurnOperation(String turnId, long expectedTurnMutationVersion,
+                         TurnExecutionState.Ready completedExecution) {
+        /** Turn 身份、CAS token 与完成状态必须完整，Adapter 不从历史推断。 */
+        public TurnOperation {
+            if (turnId == null || !turnId.startsWith("turn_") || expectedTurnMutationVersion < 0) {
+                throw new IllegalArgumentException("invalid checkpoint Turn Operation");
+            }
+            Objects.requireNonNull(completedExecution, "completedExecution");
+            if (completedExecution.next() != TurnExecutionState.Next.ASSISTANT) {
+                throw new IllegalArgumentException("checkpoint must complete into READY(ASSISTANT)");
+            }
+        }
+    }
+
+    /**
      * 表示 CAS 获胜者或幂等复用结果，并携带提交后的权威 Thread revision 与事件身份。
      */
     record CommittedCheckpoint(ContextCheckpoint checkpoint, long threadRevision, String eventId,
-                               boolean newlyCommitted) {
+                               boolean newlyCommitted, Long turnMutationVersion) {
         /**
          * 校验回执拥有合法 revision 和稳定事件 ID，避免发布不可关联的压缩通知。
          */
@@ -58,6 +83,9 @@ public interface CheckpointStore {
             if (threadRevision < 0) {
                 throw new IllegalArgumentException("threadRevision must be non-negative");
             }
+            if (turnMutationVersion != null && turnMutationVersion < 0) {
+                throw new IllegalArgumentException("turnMutationVersion must be non-negative");
+            }
             eventId = requiredEventId(eventId);
         }
 
@@ -65,14 +93,21 @@ public interface CheckpointStore {
          * 为首次插入构造回执；事件 ID 从 Checkpoint 身份确定性派生以支持幂等发布。
          */
         public static CommittedCheckpoint created(ContextCheckpoint checkpoint, long threadRevision) {
-            return new CommittedCheckpoint(checkpoint, threadRevision, eventIdFor(checkpoint), true);
+            return new CommittedCheckpoint(checkpoint, threadRevision, eventIdFor(checkpoint), true, null);
+        }
+
+        /** 自动 Turn 压缩同时返回推进后的 mutation version。 */
+        public static CommittedCheckpoint created(ContextCheckpoint checkpoint, long threadRevision,
+                                                  long turnMutationVersion) {
+            return new CommittedCheckpoint(checkpoint, threadRevision, eventIdFor(checkpoint), true,
+                    turnMutationVersion);
         }
 
         /**
          * 为并发获胜记录构造复用回执，明确禁止调用方再次发布压缩事件。
          */
         public static CommittedCheckpoint reused(ContextCheckpoint checkpoint, long threadRevision) {
-            return new CommittedCheckpoint(checkpoint, threadRevision, eventIdFor(checkpoint), false);
+            return new CommittedCheckpoint(checkpoint, threadRevision, eventIdFor(checkpoint), false, null);
         }
 
         /**

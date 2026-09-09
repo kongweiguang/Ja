@@ -420,6 +420,52 @@ describe("workbench files adapter", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
+  it("buffers early events and treats focus reconciliation before start ACK as a no-op", async () => {
+    const start = deferred<{ started: boolean; generation: number }>();
+    const listener = vi.fn();
+    let nativeListener: ((event: WorkspaceChangedEvent) => void) | undefined;
+    let requestedGeneration = 0;
+    const watchRescan = vi.fn(async () => ({
+      generation: requestedGeneration,
+      requiresRescan: false,
+      emittedPaths: 0,
+    }));
+    const operations = createFilesWorkspaceOperations(
+      createHost({
+        subscribeChanged: async (next) => {
+          nativeListener = next;
+          return () => undefined;
+        },
+        watchStart: async ({ generation }) => {
+          requestedGeneration = generation;
+          return start.promise;
+        },
+        watchRescan,
+      }),
+    );
+
+    const pendingStart = operations.watchStart?.({ workspaceId: "ws_test" }, listener);
+    await vi.waitFor(() => expect(requestedGeneration).toBeGreaterThan(0));
+    nativeListener?.({
+      relativePath: "src/main.rs",
+      generation: requestedGeneration,
+      revision: revision("file", "early"),
+      requiresRescan: false,
+    });
+    await expect(operations.watchRescan?.({ workspaceId: "ws_test" })).resolves.toBeUndefined();
+    expect(watchRescan).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+
+    start.resolve({ started: true, generation: requestedGeneration });
+    await pendingStart;
+    expect(listener).toHaveBeenCalledOnce();
+    await operations.watchRescan?.({ workspaceId: "ws_test" });
+    expect(watchRescan).toHaveBeenCalledWith({
+      workspaceId: "ws_test",
+      generation: requestedGeneration,
+    });
+  });
+
   it("scopes a late watcher cleanup to its own generation", async () => {
     const starts = new Map<number, Deferred<{ started: boolean; generation: number }>>();
     const watchStart = vi.fn(

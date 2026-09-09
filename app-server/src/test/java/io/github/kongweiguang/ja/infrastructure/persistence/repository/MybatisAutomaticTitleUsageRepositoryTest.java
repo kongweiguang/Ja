@@ -17,7 +17,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
-import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.runtime;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -78,9 +78,9 @@ final class MybatisAutomaticTitleUsageRepositoryTest extends PersistenceTestSupp
                 "thr_title", "ws_title", "Title",
                 preferences("provider_title", "model_title"), START));
         conversations.admit(new ConversationRepository.TurnAdmission(
-                "thr_title", "turn_title", runtime("provider_title", "model_title", "cfg_title"),
+                "thr_title", "turn_title",
                 "item_title", new ModelMessage(ModelRole.USER, List.of(new TextContent("hello"))),
-                List.of(), 0, START));
+                List.of(), 0, START, execution("cfg_title")));
     }
 
     /** 生成与冻结 Turn 完全一致的 durable claim。 */

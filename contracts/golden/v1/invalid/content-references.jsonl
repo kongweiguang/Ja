@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","id":"c:content-skill-only","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"skill_reference","skillId":"skill_demo"}]}}
+{"jsonrpc":"2.0","id":"c:content-order","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"text","text":"inspect"},{"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"src/main.rs","kind":"file"}]}}
+{"jsonrpc":"2.0","id":"c:content-duplicate-skill","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"skill_reference","skillId":"skill_demo"},{"type":"skill_reference","skillId":"skill_demo"},{"type":"text","text":"inspect"}]}}
+{"jsonrpc":"2.0","id":"c:content-cross-workspace","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"a.rs","kind":"file"},{"type":"workspace_reference","workspaceId":"ws_other","relativePath":"b.rs","kind":"file"}]}}
+{"jsonrpc":"2.0","id":"c:content-parent-path","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"../secret.txt","kind":"file"}]}}
+{"jsonrpc":"2.0","id":"c:content-unknown-reference","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"url_reference","url":"https://example.com"}]}}
+{"jsonrpc":"2.0","id":"c:content-workspace-missing-kind","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"src"}]}}

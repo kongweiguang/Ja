@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StrictMode, type ReactElement } from "react";
 import {
@@ -13,6 +13,7 @@ import {
 } from "@/app/RuntimeProvider";
 import {
   RuntimeApplicationError,
+  type InputQueueMutationResult,
   type RuntimeHostEvent,
   type RuntimeHostPort,
   type RuntimeProjectionPort,
@@ -20,8 +21,18 @@ import {
   type RuntimeStatus,
 } from "@/app/application/runtimePorts";
 
-const ready: RuntimeStatus = { status: "ready", generation: 1, serverInstanceId: "srv_fixture" };
-const stopped: RuntimeStatus = { status: "stopped", generation: 0, serverInstanceId: null };
+const ready: RuntimeStatus = {
+  status: "ready",
+  generation: 1,
+  serverInstanceId: "srv_fixture",
+  features: ["task_threads_v1", "plan_goal_v1"],
+};
+const stopped: RuntimeStatus = {
+  status: "stopped",
+  generation: 0,
+  serverInstanceId: null,
+  features: [],
+};
 const generalWorkspace = {
   workspaceId: "ws_runtime_a" as const,
   displayName: "无项目" as const,
@@ -50,7 +61,15 @@ function fakeProjection(): FakeProjection {
         calls.push(`status:${status.status}:${status.generation}`);
       },
       applyTurnAccepted: (accepted) => {
-        calls.push(`accepted:${accepted.turnId}:${accepted.threadRevision}`);
+        const attachments = accepted.submittedAttachments
+          ?.map((item) => item.attachmentId)
+          .join(",");
+        calls.push(
+          `accepted:${accepted.turnId}:${accepted.threadRevision}${attachments ? `:${attachments}` : ""}`,
+        );
+      },
+      applyInputQueue: (inputQueue) => {
+        calls.push(`queue:${inputQueue.turnId}:${inputQueue.revision}`);
       },
       applyHostEvent: (event) => {
         calls.push(
@@ -125,25 +144,37 @@ function fakeRuntime(initialState: RuntimeStatus = stopped): {
       turnInputs.push(input);
       return { accepted: true as const, turnId: "turn_fixture", queued: false, threadRevision: 1 };
     }),
+    turnResume: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: input.turnId,
+      queued: true,
+      threadRevision: input.expectedThreadRevision + 1,
+    })),
     turnCancel: vi.fn(async (input) => ({
       accepted: true as const,
       turnId: input.turnId,
       status: "cancelled" as const,
       threadRevision: input.expectedThreadRevision + 1,
     })),
-    turnSteer: vi.fn(async (input) => ({
-      accepted: true as const,
-      inputId: "input_steer",
-      turnId: input.turnId,
-      kind: "steering" as const,
-      status: "queued" as const,
-    })),
-    turnFollowUp: vi.fn(async (input) => ({
+    turnInputEnqueue: vi.fn(async (input) => ({
       accepted: true as const,
       inputId: "input_follow_up",
-      turnId: input.turnId,
-      kind: "follow_up" as const,
-      status: "queued" as const,
+      inputQueue: { turnId: input.turnId, revision: 1, accepting: true, items: [] },
+    })),
+    turnInputPrioritize: vi.fn(async (input) => ({
+      accepted: true as const,
+      inputId: input.inputId,
+      inputQueue: { turnId: input.turnId, revision: 2, accepting: true, items: [] },
+    })),
+    turnInputUpdate: vi.fn(async (input) => ({
+      accepted: true as const,
+      inputId: input.inputId,
+      inputQueue: { turnId: input.turnId, revision: 2, accepting: true, items: [] },
+    })),
+    turnInputDelete: vi.fn(async (input) => ({
+      accepted: true as const,
+      inputId: input.inputId,
+      inputQueue: { turnId: input.turnId, revision: 2, accepting: true, items: [] },
     })),
     approvalRespond: vi.fn(async () => undefined),
     query: (async () => ({ items: [], nextCursor: null })) as RuntimeHostPort["query"],
@@ -166,6 +197,7 @@ function fakeRuntime(initialState: RuntimeStatus = stopped): {
   };
 }
 
+/** 暴露 lifecycle 与 Turn 的最小测试入口，避免测试绕过 Context 直接调用 controller。 */
 function Probe(): ReactElement {
   const state = useRuntimeState();
   const lifecycle = useRuntimeLifecycle();
@@ -188,11 +220,54 @@ function Probe(): ReactElement {
       >
         submit
       </button>
+      <button
+        type="button"
+        onClick={() =>
+          void turns.submitTurn({
+            threadId: "thr_fixture",
+            content: [
+              { type: "attachment", attachmentId: "att_runtime_image" },
+              { type: "text", text: "识别图片" },
+            ],
+            projectionAttachments: [
+              {
+                attachmentId: "att_runtime_image",
+                displayName: "截图.png",
+                sizeBytes: 4096,
+                mediaKind: "image",
+                mediaType: "image/png",
+              },
+            ],
+          })
+        }
+      >
+        submit image
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          void turns
+            .enqueueTurnInput({
+              turnId: "turn_fixture",
+              content: [{ type: "text", text: "follow up" }],
+            })
+            .catch(() => undefined)
+        }
+      >
+        enqueue
+      </button>
     </div>
   );
 }
 
-describe("RuntimeProvider v2 lifecycle", () => {
+/** 记录只读 Runtime Context 的提交次数，验证 Timeline 高频事件不会穿透到应用壳消费者。 */
+function RuntimeStateRenderProbe({ onRender }: { onRender: () => void }): ReactElement {
+  const state = useRuntimeState();
+  onRender();
+  return <output data-testid="state-render-boot">{state.boot.status}</output>;
+}
+
+describe("RuntimeProvider v1 lifecycle", () => {
   afterEach(() => {
     cleanup();
   });
@@ -227,6 +302,66 @@ describe("RuntimeProvider v2 lifecycle", () => {
     expect(fake.calls).not.toContain("start");
     screen.getByRole("button", { name: "submit" }).click();
     await waitFor(() => expect(fake.calls).toContain("turnStart"));
+  });
+
+  /** Renderer 摘要只补齐 ACK 投影，传给 JA-RPC 的 turn/start 仍保持冻结 content 合同。 */
+  it("keeps attachment summaries in the ACK projection but strips them from turn/start", async () => {
+    const fake = fakeRuntime(ready);
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <Probe />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+
+    screen.getByRole("button", { name: "submit image" }).click();
+    await waitFor(() => expect(fake.calls).toContain("turnStart"));
+    expect(fake.turnInputs[0]).toEqual({
+      threadId: "thr_fixture",
+      content: [
+        { type: "attachment", attachmentId: "att_runtime_image" },
+        { type: "text", text: "识别图片" },
+      ],
+    });
+    expect(fake.projection.calls).toContain("accepted:turn_fixture:1:att_runtime_image");
+  });
+
+  it("keeps streaming assistant deltas out of the application-shell runtime context", async () => {
+    const fake = fakeRuntime(ready);
+    const onRender = vi.fn();
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <RuntimeStateRenderProbe onRender={onRender} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("state-render-boot")).toHaveTextContent("ready"));
+    const settledRenderCount = onRender.mock.calls.length;
+
+    act(() => {
+      fake.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "assistant/text-delta",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_delta_sidebar_stability",
+            sequence: 1,
+            generation: 1,
+            workspaceId: "ws_runtime_a",
+            threadId: "thr_fixture",
+            turnId: "turn_fixture",
+            threadRevision: 1,
+            occurredAt: "2026-08-26T00:00:01Z",
+            streamSeq: 1,
+            text: "正在调用工具",
+          },
+        },
+      });
+    });
+
+    expect(fake.projection.calls).toContain("event:assistant/text-delta");
+    expect(onRender).toHaveBeenCalledTimes(settledRenderCount);
   });
 
   it("keeps the replacement owner alive across StrictMode cleanup replay", async () => {
@@ -363,7 +498,12 @@ describe("RuntimeProvider v2 lifecycle", () => {
           state: "completed",
           summary: "done",
           finalMessage: { messageId: "item_final", text: "done" },
-          usage: { modelRound: 1, inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+          changeSet: {
+            state: "complete",
+            incompleteReasons: [],
+            files: [],
+            stats: { files: 0, additions: 0, deletions: 0, binaryFiles: 0, truncated: false },
+          },
         },
       },
     });
@@ -381,8 +521,126 @@ describe("RuntimeProvider v2 lifecycle", () => {
     ).toEqual(["accepted:turn_fixture:1", "event:turn/state-changed", "event:turn/terminal"]);
   });
 
+  it("replays input queue events only after the mutation ACK projection", async () => {
+    const fake = fakeRuntime(ready);
+    let resolveEnqueue: ((result: InputQueueMutationResult) => void) | undefined;
+    fake.runtime.turnInputEnqueue = vi.fn(
+      () =>
+        new Promise<InputQueueMutationResult>((resolve) => {
+          resolveEnqueue = resolve;
+        }),
+    );
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <Probe />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+
+    screen.getByRole("button", { name: "enqueue" }).click();
+    await waitFor(() => expect(fake.runtime.turnInputEnqueue).toHaveBeenCalledTimes(1));
+    act(() => {
+      fake.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "turn/input-queue-changed",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_input_queue_changed",
+            sequence: 2,
+            generation: 1,
+            workspaceId: "ws_runtime_a",
+            threadId: "thr_fixture",
+            turnId: "turn_fixture",
+            occurredAt: "2026-09-01T00:00:01Z",
+            inputQueue: {
+              turnId: "turn_fixture",
+              revision: 2,
+              accepting: true,
+              items: [],
+            },
+          },
+        },
+      });
+      fake.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "turn/input-consumed",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_input_consumed",
+            sequence: 3,
+            generation: 1,
+            workspaceId: "ws_runtime_a",
+            threadId: "thr_fixture",
+            turnId: "turn_fixture",
+            threadRevision: 2,
+            occurredAt: "2026-09-01T00:00:02Z",
+            input: {
+              inputId: "input_follow_up",
+              turnId: "turn_fixture",
+              content: [{ type: "text", text: "follow up" }],
+              attachments: [],
+              kind: "follow_up",
+              status: "pending",
+              issue: null,
+              inputRevision: 0,
+              createdAt: "2026-09-01T00:00:00Z",
+            },
+            userItem: {
+              itemId: "item_follow_up",
+              createdAt: "2026-09-01T00:00:02Z",
+              turnId: "turn_fixture",
+              kind: "user_input",
+              content: [{ type: "text", text: "follow up" }],
+              attachments: [],
+            },
+            inputQueue: {
+              turnId: "turn_fixture",
+              revision: 3,
+              accepting: true,
+              items: [],
+            },
+          },
+        },
+      });
+    });
+
+    expect(fake.projection.calls.some((call) => call.startsWith("queue:turn_fixture"))).toBe(false);
+    expect(fake.projection.calls.some((call) => call.startsWith("event:turn/input"))).toBe(false);
+
+    resolveEnqueue?.({
+      accepted: true,
+      inputId: "input_follow_up",
+      inputQueue: { turnId: "turn_fixture", revision: 1, accepting: true, items: [] },
+    });
+    await waitFor(() =>
+      expect(
+        fake.projection.calls.filter(
+          (call) => call.startsWith("queue:turn_fixture") || call.startsWith("event:turn/input"),
+        ),
+      ).toHaveLength(3),
+    );
+    expect(
+      fake.projection.calls.filter(
+        (call) => call.startsWith("queue:turn_fixture") || call.startsWith("event:turn/input"),
+      ),
+    ).toEqual([
+      "queue:turn_fixture:1",
+      "event:turn/input-queue-changed",
+      "event:turn/input-consumed",
+    ]);
+  });
+
   it("rejects late status from an older generation after current admission is ready", async () => {
-    const current = { status: "ready" as const, generation: 2, serverInstanceId: "srv_current" };
+    const current = {
+      status: "ready" as const,
+      generation: 2,
+      serverInstanceId: "srv_current",
+      features: ["task_threads_v1", "plan_goal_v1"] as const,
+    };
     const fake = fakeRuntime(current);
     render(
       <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
@@ -393,7 +651,7 @@ describe("RuntimeProvider v2 lifecycle", () => {
 
     fake.emit({
       kind: "status",
-      status: { status: "crashed", generation: 1, serverInstanceId: "srv_stale" },
+      status: { status: "crashed", generation: 1, serverInstanceId: "srv_stale", features: [] },
       eventId: "evt_stale_generation",
       occurredAt: "2026-08-26T00:00:03Z",
     });

@@ -10,10 +10,13 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SchemaMapper;
 import org.apache.ibatis.session.SqlSessionFactory;
 import org.apache.ibatis.session.SqlSession;
 import org.flywaydb.core.Flyway;
+import org.flywaydb.core.api.MigrationInfo;
+import org.flywaydb.core.api.FlywayException;
 import org.sqlite.SQLiteConfig;
 import org.sqlite.SQLiteDataSource;
 
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.util.Objects;
 
 /**
@@ -37,24 +40,24 @@ public final class JaDatabase implements AutoCloseable {
     }
 
     /**
-     * 打开唯一的新代际数据库。目录标记先于 SQLite 校验，并且首次 marker 只在 V1 成功后发布；
-     * 生产路径不会探测、复制或重写旧数据。
+     * 打开首版唯一数据库并把 schema 准入完全交给 Flyway history/checksum。
+     *
+     * <p>空库只执行事务化 V1；非空未知 schema、版本漂移、checksum 冲突和损坏数据库都由
+     * Flyway/SQLite 失败关闭。这里不 repair、不删除也不复制数据，避免启动路径演变成第二套
+     * 隐式迁移协议。</p>
      */
     public static JaDatabase open(DatabaseConfig config) {
         Objects.requireNonNull(config, "config");
         AotSideEffectGuard.requireRuntimeIo();
         DatabaseLease lease = null;
         try {
-            StorageBaseline.Admission baseline = StorageBaseline.prepare(config.databasePath());
             lease = DatabaseLease.acquire(config.databasePath());
-            baseline.verifyAfterLease();
             SQLiteDataSource source = dataSource(config);
             Flyway flyway = Flyway.configure().dataSource(source).locations(new String[0])
                     .resourceProvider(JaFlywayResources.provider()).baselineOnMigrate(false)
+                    .ignoreMigrationPatterns(new String[0])
                     .validateMigrationNaming(true).load();
-            new DatabaseMigrationRecovery(config.databasePath(), source,
-                    JaFlywayResources.latestVersion()).migrate(flyway);
-            baseline.complete();
+            migrateAndVerify(flyway, source);
             return new JaDatabase(config.databasePath(), source, lease);
         } catch (StorageException failure) {
             if (lease != null) lease.close();
@@ -62,6 +65,52 @@ public final class JaDatabase implements AutoCloseable {
         } catch (Exception failure) {
             if (lease != null) lease.close();
             throw new StorageException(StorageException.Code.IO, "cannot open Ja database", failure);
+        }
+    }
+
+    /**
+     * Flyway 执行和 SQLite 完整性回读都在进程 lease 内完成；任何 schema 漂移、future history、
+     * checksum 冲突或损坏都归类为稳定的存储冲突，调用方不能把它当作可 repair 的普通 I/O。
+     */
+    private static void migrateAndVerify(Flyway flyway, SQLiteDataSource source) {
+        try {
+            flyway.migrate();
+            MigrationInfo current = flyway.info().current();
+            if (current == null || current.getVersion() == null
+                || !"1".equals(current.getVersion().getVersion())
+                || flyway.info().pending().length != 0) {
+                throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
+                        "database schema is not the current Ja V1");
+            }
+            verifySqliteIntegrity(source);
+        } catch (StorageException failure) {
+            throw failure;
+        } catch (FlywayException | SQLException failure) {
+            throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
+                    "database schema or integrity check failed", failure);
+        }
+    }
+
+    /**
+     * SQLite 自身而非 Mapper 投影裁决物理完整性；完整性或外键检查出现任意结果行即拒绝启动，
+     * 且不会调用 repair、删除文件或改变 schema history。
+     */
+    private static void verifySqliteIntegrity(SQLiteDataSource source) throws SQLException {
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement();
+             java.sql.ResultSet integrity = statement.executeQuery("PRAGMA integrity_check")) {
+            if (!integrity.next() || !"ok".equalsIgnoreCase(integrity.getString(1)) || integrity.next()) {
+                throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
+                        "database integrity check failed");
+            }
+        }
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement();
+             java.sql.ResultSet violations = statement.executeQuery("PRAGMA foreign_key_check")) {
+            if (violations.next()) {
+                throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
+                        "database foreign key check failed");
+            }
         }
     }
 

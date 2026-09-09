@@ -121,6 +121,10 @@ jobs:
         shell: pwsh
         run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
 
+      - name: Verify product version projections
+        shell: pwsh
+        run: uv run --python 3.13 python -B scripts/version/product_version.py check
+
       - name: Run the complete cross-language contract gate
         shell: pwsh
         run: pwsh -NoProfile -File tests/contract/run.ps1
@@ -167,11 +171,11 @@ jobs:
 
       - name: Run Node script tests
         shell: pwsh
-        run: node --test scripts/e2e/provider-smoke.test.mjs
+        run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs
 
       - name: Run Python script tests
         shell: pwsh
-        run: uv run --with 'jsonschema[format]' python -B -m unittest scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar
+        run: uv run --python 3.13 --with 'jsonschema[format]' python -B -m unittest scripts.version.test_product_version scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar
 
       - name: Run PowerShell script tests
         shell: pwsh
@@ -579,8 +583,12 @@ jobs:
       - name: Build signed Tauri NSIS bundle (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw 'Updater signing private key is missing' }
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
           $source = Join-Path $stage 'sidecars/ja-app-server-${{ matrix.targetTriple }}.exe'
           $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
@@ -706,8 +714,11 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}"
           stage="$RUNNER_TEMP/ja-native-stage"
           source="$stage/sidecars/ja-app-server-${{ matrix.targetTriple }}"
           source_manifest="$stage/sidecar-manifest.json"
@@ -907,7 +918,61 @@ jobs:
             ${{ runner.temp }}/ja-native-evidence
             ${{ runner.temp }}/ja-native-stage
             src-tauri/target/release/bundle/${{ matrix.tauriBundle }}
+            src-tauri/target/release/bundle/macos
             ${{ runner.temp }}/ja-tauri-bundle-evidence
           if-no-files-found: warn
           compression-level: 0
           retention-days: 7
+
+  updater-draft-release:
+    name: Assemble signed updater draft
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: native-app-server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Download every native matrix artifact separately
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ja-native-app-server-*
+          path: ${{ runner.temp }}/ja-updater-input
+
+      - name: Generate the Tauri v2 static updater manifest
+        env:
+          JA_RELEASE_TAG: ${{ github.ref_name }}
+          JA_RELEASE_REPOSITORY: ${{ github.repository }}
+          JA_RELEASE_PUBLISHED_AT: ${{ github.event.repository.updated_at }}
+        run: |
+          set -euo pipefail
+          node scripts/release/create-updater-manifest.mjs \
+            --input "$RUNNER_TEMP/ja-updater-input" \
+            --output "$RUNNER_TEMP/ja-updater-release" \
+            --repository "$JA_RELEASE_REPOSITORY" \
+            --tag "$JA_RELEASE_TAG" \
+            --published-at "$JA_RELEASE_PUBLISHED_AT"
+          test -s "$RUNNER_TEMP/ja-updater-release/latest.json"
+
+      - name: Create an unpublished GitHub draft with signed updater assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JA_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$JA_RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to replace or mutate it: $JA_RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$JA_RELEASE_TAG" \
+            "$RUNNER_TEMP"/ja-updater-release/* \
+            --draft \
+            --verify-tag \
+            --title "Ja $JA_RELEASE_TAG" \
+            --notes "Signed Ja desktop candidate. Publish only after installer and updater acceptance."

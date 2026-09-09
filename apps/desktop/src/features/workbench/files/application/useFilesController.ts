@@ -20,7 +20,10 @@ import { createDocumentUseCases, type ExternalRefreshMode } from "./internal/doc
 import { DocumentSaveRuntimePort } from "./internal/controllerPorts";
 import { createLifecycleUseCases } from "./internal/lifecycleUseCases";
 import { createMutationUseCases, type TrashOperationSecret } from "./internal/mutationUseCases";
-import { createReconciliationUseCases } from "./internal/reconciliationUseCases";
+import {
+  createReconciliationUseCases,
+  type ReconciliationOptions,
+} from "./internal/reconciliationUseCases";
 import { createSaveAsUseCases } from "./internal/saveAsUseCases";
 import { createSearchUseCases } from "./internal/searchUseCases";
 import { createTreeUseCases } from "./internal/treeUseCases";
@@ -48,11 +51,13 @@ function workspaceRecoveryBlockedError(): Error & { code: "WORKSPACE_RECOVERY_RE
 
 /**
  * 作为 Files 唯一 application controller，集中拥有编辑投影、Watcher 对账、mutation
- * 协调与 workspace generation；UI 只消费稳定 view model/actions，不直接编排 native 端口。
+ * 协调与 workspace generation；隐藏时继续持有草稿和切换 fence，但暂停重型原生 IO，
+ * 重新可见后通过权威 Tree/Read 对账恢复，不让未显示的 Files 拖慢 workspace 切换。
  */
 export function useFilesController({
   workspaceId,
   operations,
+  activityEnabled = true,
   initialNodes = [],
   onNotice,
   onRegisterLifecycle,
@@ -67,7 +72,6 @@ export function useFilesController({
   const [documents, setDocuments] = useState<Record<string, OpenDocument>>({});
   const [documentOrder, setDocumentOrder] = useState<string[]>([]);
   const [activePath, setActivePath] = useState<string>();
-  const [mode, setMode] = useState<"files" | "search">("files");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<FilesSearchResult[]>([]);
   const [searchSummary, setSearchSummary] = useState<FilesSearchSummary>();
@@ -109,10 +113,14 @@ export function useFilesController({
   const searchRequestRef = useRef(0);
   const revisionRef = useRef(new Map<string, FileRevision>());
   const reconciliationTaskRef = useRef<Promise<void> | undefined>(undefined);
+  const watcherReadyRef = useRef(false);
   const trashRequestSequenceRef = useRef(0);
   const trashOperationRef = useRef<TrashOperationSecret | undefined>(undefined);
   const trashRequestRef = useRef<TrashRequest | undefined>(trashRequest);
   const mountedRef = useRef(false);
+  const activityEnabledRef = useRef(activityEnabled);
+  const previousActivityEnabledRef = useRef(activityEnabled);
+  const activityWorkspaceRef = useRef(workspaceId);
   const lifecycleFenceRef = useRef(false);
   const lifecycleLeaseRef = useRef<Promise<void> | undefined>(undefined);
   const lifecycleLeaseHoldersRef = useRef(0);
@@ -437,6 +445,7 @@ export function useFilesController({
       createReconciliationUseCases({
         workspaceId,
         watchRescan: operations.watchRescan,
+        watcherReady: watcherReadyRef,
         documents: documentsRef,
         workspaceGeneration: workspaceGenerationRef,
         reconciliationTask: reconciliationTaskRef,
@@ -452,7 +461,8 @@ export function useFilesController({
 
   /** 全量对账合并为主 hook 持有的一条共享任务。 */
   const reconcileAuthoritativeWorkspace = useCallback(
-    () => getReconciliationUseCases().reconcileAuthoritativeWorkspace(),
+    (options?: ReconciliationOptions) =>
+      getReconciliationUseCases().reconcileAuthoritativeWorkspace(options),
     [getReconciliationUseCases],
   );
   /** Watcher 有界 hint 统一交给权威 Tree/Read 协作者。 */
@@ -580,6 +590,11 @@ export function useFilesController({
   const closeRequestedDocument =
     closeDocumentRequest === undefined ? undefined : documents[closeDocumentRequest.path];
 
+  /** 让 workspace reset effect 读取本次 commit 的活动状态，而不因显隐切换重复清空草稿。 */
+  useEffect(() => {
+    activityEnabledRef.current = activityEnabled;
+  }, [activityEnabled]);
+
   useEffect(() => {
     workspaceGenerationRef.current += 1;
     treeRequestSequenceRef.current = 0;
@@ -592,6 +607,7 @@ export function useFilesController({
     externalReadRef.current.clear();
     externalConflictCheckRef.current.clear();
     reconciliationTaskRef.current = undefined;
+    watcherReadyRef.current = false;
     setNodes([...initialNodesRef.current]);
     setTreeError(undefined);
     setSelectedPath(undefined);
@@ -617,12 +633,25 @@ export function useFilesController({
     setLifecycleClosing(false);
     mutationRecoveryRequiredRef.current = false;
     setMutationRecoveryRequired(false);
-    void loadDirectory("");
+    if (activityEnabledRef.current) void loadDirectory("");
   }, [commitDocuments, loadDirectory, saveCoordinator, workspaceId]);
+
+  /**
+   * 从同一 workspace 的隐藏状态恢复时直接读取权威 Tree/Read；Watcher 在后续 effect 才启动，
+   * 此处跳过 rescan，避免正常激活时序产生一次必然失败的原生调用和错误提示。
+   */
+  useEffect(() => {
+    const workspaceChanged = activityWorkspaceRef.current !== workspaceId;
+    const wasEnabled = previousActivityEnabledRef.current;
+    activityWorkspaceRef.current = workspaceId;
+    previousActivityEnabledRef.current = activityEnabled;
+    if (!workspaceChanged && !wasEnabled && activityEnabled)
+      reconcileAuthoritativeWorkspace({ rescanWatcher: false });
+  }, [activityEnabled, reconcileAuthoritativeWorkspace, workspaceId]);
 
   useEffect(() => {
     let active = true;
-    if (openTargetsOperation === undefined) return () => undefined;
+    if (!activityEnabled || openTargetsOperation === undefined) return () => undefined;
     void openTargetsOperation({ workspaceId })
       .then((targets) => {
         if (active) setOpenTargetsState({ workspaceId, targets: [...targets] });
@@ -633,10 +662,11 @@ export function useFilesController({
     return () => {
       active = false;
     };
-  }, [openTargetsOperation, workspaceId]);
+  }, [activityEnabled, openTargetsOperation, workspaceId]);
 
   useEffect(() => {
-    if (operations.watchStart === undefined) return undefined;
+    watcherReadyRef.current = false;
+    if (!activityEnabled || operations.watchStart === undefined) return undefined;
     let active = true;
     const watchWorkspaceGeneration = workspaceGenerationRef.current;
     let subscription: WorkspaceWatchSubscription | undefined;
@@ -647,24 +677,29 @@ export function useFilesController({
       })
       .then((next) => {
         if (!active) stopWorkspaceWatch(next);
-        else subscription = next;
+        else {
+          subscription = next;
+          watcherReadyRef.current = true;
+        }
       })
       .catch(() => undefined);
     return () => {
       active = false;
+      watcherReadyRef.current = false;
       // pending start 由最终返回的 subscription 停止；提前调用 raw stop 会抢在 native
       // start 前执行，从而遗留一个晚到的 Watcher。
       if (subscription !== undefined) stopWorkspaceWatch(subscription);
     };
-  }, [handleWorkspaceChanged, operations, workspaceId]);
+  }, [activityEnabled, handleWorkspaceChanged, operations, workspaceId]);
 
   useEffect(() => {
+    if (!activityEnabled) return undefined;
     return subscribeBrowserReconciliation(reconcileAuthoritativeWorkspace);
-  }, [reconcileAuthoritativeWorkspace, subscribeBrowserReconciliation]);
+  }, [activityEnabled, reconcileAuthoritativeWorkspace, subscribeBrowserReconciliation]);
 
   /** 窗口恢复后 DOM focus 不可靠，因此使用 Tauri HWND focus 信号触发对账。 */
   useEffect(() => {
-    if (operations.subscribeWindowFocus === undefined) return undefined;
+    if (!activityEnabled || operations.subscribeWindowFocus === undefined) return undefined;
     let active = true;
     let unlisten: (() => void | Promise<void>) | undefined;
     void operations
@@ -680,10 +715,14 @@ export function useFilesController({
       active = false;
       void unlisten?.();
     };
-  }, [operations, reconcileAuthoritativeWorkspace]);
+  }, [activityEnabled, operations, reconcileAuthoritativeWorkspace]);
 
   useEffect(() => {
-    if (operations.subscribeNativeDrop === undefined || operations.importDrop === undefined)
+    if (
+      !activityEnabled ||
+      operations.subscribeNativeDrop === undefined ||
+      operations.importDrop === undefined
+    )
       return undefined;
     let active = true;
     let unlisten: (() => void | Promise<void>) | undefined;
@@ -703,7 +742,7 @@ export function useFilesController({
       active = false;
       void unlisten?.();
     };
-  }, [handleNativeDrop, operations, resolveNativeDropTarget]);
+  }, [activityEnabled, handleNativeDrop, operations, resolveNativeDropTarget]);
 
   useEffect(
     () => () => {
@@ -723,7 +762,6 @@ export function useFilesController({
       selectedPath,
       treeLoading,
       treeError,
-      mode,
       searchQuery,
       searchResults,
       searchSummary,
@@ -744,8 +782,6 @@ export function useFilesController({
       openTargets,
     },
     actions: {
-      showFiles: () => setMode("files"),
-      showSearch: operations.search === undefined ? undefined : () => setMode("search"),
       selectNode: (node) => {
         setSelectedPath(node.path);
         if (node.kind === "file") void openDocument(node.path);
@@ -784,7 +820,6 @@ export function useFilesController({
       openTarget: operations.openTarget === undefined ? undefined : handleOpenTarget,
       changeSearchQuery: runSearch,
       openSearchResult: (result) => {
-        setMode("files");
         void openDocument(result.path, { line: result.line, column: result.column });
       },
       selectDocument: (path) => {

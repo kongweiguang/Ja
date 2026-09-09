@@ -10,7 +10,14 @@
 
     <!-- 作者必须位于首行，避免许可证或 package 声明把所有权信息隐藏到文件中部。 -->
     <module name="RegexpHeader">
+        <property name="fileExtensions" value="java" />
         <property name="header" value="// @author kongweiguang" />
+    </module>
+
+    <!-- 构建版本资源使用 Properties 原生注释，不能套用 Java 行注释生成非法配置。 -->
+    <module name="RegexpHeader">
+        <property name="fileExtensions" value="properties" />
+        <property name="header" value="# @author kongweiguang" />
     </module>
 
     <module name="TreeWalker">

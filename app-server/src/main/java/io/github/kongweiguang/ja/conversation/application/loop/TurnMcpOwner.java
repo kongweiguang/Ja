@@ -10,14 +10,14 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * 独占一个 Turn 的 MCP Tool 会话，约束为只打开一次并在 Turn 收口时只关闭一次。
+ * 独占一次 Provider 请求或恢复批次的 MCP Tool 会话，约束为只打开一次并在该安全边界关闭一次。
  */
 final class TurnMcpOwner implements AutoCloseable {
     private TurnToolSessionFactory.Session session;
     private boolean closed;
 
     /**
-     * 在 Turn 生命周期内创建唯一会话；重复打开或关闭后重用会破坏快照一致性，因此直接拒绝。
+     * 为当前请求或恢复批次创建唯一会话；重复打开或关闭后重用会破坏目录一致性，因此直接拒绝。
      */
     void open(TurnToolSessionFactory factory, CancellationToken cancellation) {
         if (session != null || closed) {
@@ -27,7 +27,7 @@ final class TurnMcpOwner implements AutoCloseable {
     }
 
     /**
-     * 返回当前会话冻结的 Tool 列表，未打开或已关闭时禁止越过资源边界。
+     * 返回当前安全点解析出的 Tool 列表，未打开或已关闭时禁止越过资源边界。
      */
     List<AgentTool> tools() {
         if (session == null || closed) {

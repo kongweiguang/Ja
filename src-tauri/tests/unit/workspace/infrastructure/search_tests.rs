@@ -17,7 +17,27 @@ fn bounded_read_reports_deadline_as_partial() {
 fn default_ignored_directory_policy_is_narrow() {
     assert!(is_default_ignored_directory(".git"));
     assert!(is_default_ignored_directory("TARGET"));
+    assert!(is_default_ignored_directory("target-workspace-switch-fix"));
+    assert!(is_default_ignored_directory(".codex-target"));
     assert!(is_default_ignored_directory(".tmp-ci-artifacts"));
     assert!(!is_default_ignored_directory("src"));
     assert!(!is_default_ignored_directory("vendor"));
+    assert!(!is_default_ignored_directory(".codex-target-backup"));
+}
+
+/// Watcher 使用相对路径过滤时必须识别任意层级和 Windows separator，同时保留源码目录。
+#[test]
+fn ignored_relative_path_policy_matches_nested_generated_directories() {
+    assert!(is_default_ignored_relative_path(
+        "app-server/target/classes/App.class"
+    ));
+    assert!(is_default_ignored_relative_path(
+        r"apps\desktop\node_modules\vite\index.js"
+    ));
+    assert!(is_default_ignored_relative_path(
+        r".codex-target\debug\deps\ja.exe"
+    ));
+    assert!(!is_default_ignored_relative_path(
+        "src/targeting/service.rs"
+    ));
 }

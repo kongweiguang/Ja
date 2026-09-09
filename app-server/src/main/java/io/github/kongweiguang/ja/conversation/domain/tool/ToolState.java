@@ -26,9 +26,5 @@ public enum ToolState {
     /**
      * Tool 在取消作用域内终止。
      */
-    CANCELLED,
-    /**
-     * 重启后无法证明外部副作用是否完成。
-     */
-    UNKNOWN
+    CANCELLED
 }

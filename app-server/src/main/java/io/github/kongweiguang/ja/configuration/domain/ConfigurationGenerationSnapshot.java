@@ -28,7 +28,7 @@ public interface ConfigurationGenerationSnapshot {
     /** 返回本代际默认执行模式，单次 Turn 只能继承或收紧。 */
     AccessMode accessMode();
 
-    /** 返回代际创建时冻结的工作区信任结果，后续文件变化不得改写活动 Turn。 */
+    /** 返回本代际创建时的工作区信任结果；后续请求通过新代际观察变更。 */
     boolean trusted();
 
     /** 返回成对校验后的默认 Provider；空 catalog 明确返回 empty。 */
@@ -54,16 +54,16 @@ public interface ConfigurationGenerationSnapshot {
     }
 
     /** Provider 保存稳定连接、凭据引用、网络预算、Agent 默认值和模型目录。 */
-    record Provider(String providerId, String name, ProviderType provider, Api api, URI baseUrl,
+    record Provider(String providerId, String name, Api api, URI baseUrl,
                     String credentialId, NetworkTimeouts networkTimeouts,
                     AgentDefaults agentDefaults, List<Model> models) {
         /** 防御性复制模型列表，避免消费者修改冻结代际中的选择顺序。 */
         public Provider {
             Objects.requireNonNull(providerId, "providerId");
             Objects.requireNonNull(name, "name");
-            Objects.requireNonNull(provider, "provider");
             Objects.requireNonNull(api, "api");
             Objects.requireNonNull(baseUrl, "baseUrl");
+            Objects.requireNonNull(credentialId, "credentialId");
             Objects.requireNonNull(networkTimeouts, "networkTimeouts");
             Objects.requireNonNull(agentDefaults, "agentDefaults");
             models = List.copyOf(models);
@@ -117,22 +117,16 @@ public interface ConfigurationGenerationSnapshot {
     record NetworkTimeouts(Duration connectTimeout, Duration requestTimeout) {
     }
 
-    /** 配置域 Provider 类型；调用方必须显式穷举映射到具体适配器。 */
-    enum ProviderType {
-        /** 使用 OpenAI Provider。 */
-        OPENAI,
-
-        /** 使用 Anthropic Provider。 */
-        ANTHROPIC
-    }
-
     /** 配置域模型 API；调用方必须显式穷举映射。 */
     enum Api {
         /** 采用 OpenAI Responses API。 */
         OPENAI_RESPONSES,
 
         /** 采用 Anthropic Messages API。 */
-        ANTHROPIC_MESSAGES
+        ANTHROPIC_MESSAGES,
+
+        /** 采用 OpenAI Chat Completions API。 */
+        OPENAI_CHAT_COMPLETIONS
     }
 
     /** 模型声明可接收的输入模态，附件能力只依赖该闭集。 */

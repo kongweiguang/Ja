@@ -49,7 +49,7 @@ final class AttachmentHandlerTest {
             Set<String> fields = new java.util.HashSet<>();
             imported.fieldNames().forEachRemaining(fields::add);
             assertEquals(Set.of("attachmentId", "workspaceId", "displayName", "sizeBytes", "mediaKind",
-                    "mediaType", "state", "createdAt", "expiresAt", "boundTurnId"), fields);
+                    "mediaType", "state", "createdAt", "expiresAt", "boundMessageId"), fields);
             assertEquals("draft", imported.path("state").textValue());
             assertFalse(imported.toString().contains("sha256"));
             assertFalse(imported.toString().contains("ingressToken"));
@@ -88,7 +88,7 @@ final class AttachmentHandlerTest {
             return metadata(AttachmentMetadata.Status.DRAFT);
         }
 
-        /** 丢弃投影进入明确终态且不保留 boundTurnId。 */
+        /** 丢弃投影进入明确终态且不保留 boundMessageId。 */
         @Override public AttachmentMetadata discard(String attachmentId, Instant discardedAt) {
             return metadata(AttachmentMetadata.Status.DISCARDED);
         }

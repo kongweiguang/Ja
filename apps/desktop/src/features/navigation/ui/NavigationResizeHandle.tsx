@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactElement,
 } from "react";
+import { useResizeHandleSpotlight } from "@/shared/hooks/useResizeHandleSpotlight";
 
 interface NavigationResizeHandleProps {
   ratio: number;
@@ -39,6 +40,7 @@ export function NavigationResizeHandle({
   const layoutWidthRef = useRef(1);
   const startRatioRef = useRef(ratio);
   const previewRatioRef = useRef(ratio);
+  const spotlight = useResizeHandleSpotlight(handleRef);
 
   useEffect(() => {
     previewRatioRef.current = ratio;
@@ -55,9 +57,9 @@ export function NavigationResizeHandle({
     [maxRatio, minRatio, onPreview],
   );
 
-  /** 统一收口 pointerup、cancel、capture 丢失与窗口失焦，并且只提交一次最终尺寸。 */
+  /** 统一收口 pointerup、cancel、capture 丢失与窗口失焦，并同步清理非正常结束的光带状态。 */
   const finishResize = useCallback(
-    (pointerId?: number): void => {
+    (pointerId?: number, forceSpotlightClear = false): void => {
       const activePointerId = pointerIdRef.current;
       if (
         activePointerId === undefined ||
@@ -69,8 +71,9 @@ export function NavigationResizeHandle({
       if (handle?.hasPointerCapture(activePointerId)) handle.releasePointerCapture(activePointerId);
       onCommit(previewRatioRef.current);
       setDragging(false);
+      spotlight.finishDrag(forceSpotlightClear);
     },
-    [onCommit],
+    [onCommit, spotlight],
   );
 
   /** 在 window 上维持完整 pointer 事务，避免 WebView2 中分隔线被相邻层遮挡后拖动中断。 */
@@ -78,12 +81,15 @@ export function NavigationResizeHandle({
     if (!dragging) return undefined;
     /** 只接收本次捕获的 pointer，第二根触点不能改变当前布局。 */
     const preview = (event: PointerEvent): void => {
-      if (pointerIdRef.current === event.pointerId) previewFromClientX(event.clientX);
+      if (pointerIdRef.current !== event.pointerId) return;
+      spotlight.updateDrag(event.clientY);
+      previewFromClientX(event.clientX);
     };
-    /** 正常释放与系统取消共用相同提交路径。 */
-    const finish = (event: PointerEvent): void => finishResize(event.pointerId);
+    /** 正常释放保留真实 hover，系统取消则同时清除失效的光带位置。 */
+    const finish = (event: PointerEvent): void =>
+      finishResize(event.pointerId, event.type === "pointercancel");
     /** 原生窗口失焦时没有可靠 pointerup，因此提交最后可见预览。 */
-    const finishOnBlur = (): void => finishResize();
+    const finishOnBlur = (): void => finishResize(undefined, true);
     window.addEventListener("pointermove", preview);
     window.addEventListener("pointerup", finish);
     window.addEventListener("pointercancel", finish);
@@ -94,13 +100,14 @@ export function NavigationResizeHandle({
       window.removeEventListener("pointercancel", finish);
       window.removeEventListener("blur", finishOnBlur);
     };
-  }, [dragging, finishResize, previewFromClientX]);
+  }, [dragging, finishResize, previewFromClientX, spotlight]);
 
   /** 捕获单个 pointer，使光标离开狭窄分隔线命中区后仍能确定性调整尺寸。 */
   const startResize = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (event.button !== 0) return;
     event.preventDefault();
     pointerIdRef.current = event.pointerId;
+    spotlight.beginDrag(event.clientY);
     startXRef.current = event.clientX;
     startRatioRef.current = ratio;
     previewRatioRef.current = ratio;
@@ -134,7 +141,7 @@ export function NavigationResizeHandle({
   return (
     <div
       ref={handleRef}
-      className="ja-navigation-resize-handle"
+      className="ja-resize-handle ja-navigation-resize-handle"
       data-dragging={dragging || undefined}
       role="separator"
       aria-label="调整导航栏宽度"
@@ -144,8 +151,12 @@ export function NavigationResizeHandle({
       aria-valuenow={ratio}
       aria-valuetext={`${ratio.toFixed(1)}%`}
       tabIndex={0}
+      onFocus={spotlight.onFocus}
+      onPointerEnter={spotlight.onPointerEnter}
+      onPointerMove={spotlight.onPointerMove}
+      onPointerLeave={spotlight.onPointerLeave}
       onPointerDown={startResize}
-      onLostPointerCapture={(event) => finishResize(event.pointerId)}
+      onLostPointerCapture={(event) => finishResize(event.pointerId, true)}
       onKeyDown={resizeWithKeyboard}
     />
   );

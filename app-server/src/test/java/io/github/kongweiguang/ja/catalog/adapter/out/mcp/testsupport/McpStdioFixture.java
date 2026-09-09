@@ -26,6 +26,7 @@ public final class McpStdioFixture {
      */
     public static void main(String[] args) throws Exception {
         Path report = Path.of(args[0]);
+        boolean emitToolsChanged = java.util.Arrays.asList(args).contains("list-changed");
         Files.write(
                 report,
                 List.of(
@@ -53,6 +54,9 @@ public final class McpStdioFixture {
                 String result = fixtureResultFor(method);
                 System.out.println("{\"jsonrpc\":\"2.0\",\"id\":"
                         + id + ",\"result\":" + result + "}");
+                if (emitToolsChanged && "tools/list".equals(method)) {
+                    System.out.println("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}");
+                }
                 System.out.flush();
             }
         }

@@ -64,8 +64,49 @@ public final class NetworkntToolArgumentValidator {
             throw invalid("tool arguments could not be validated");
         }
         if (!errors.isEmpty()) {
-            throw invalid("tool arguments do not match the JSON Schema");
+            throw invalid(safeDiagnostic(errors.getFirst()));
         }
+    }
+
+    /**
+     * 只暴露首个失败的 Schema 字段、实例位置和约束类型；绝不使用第三方 message 或 instanceNode，
+     * 因为二者可能把命令、路径、正文或凭据值带回模型上下文。
+     */
+    private static String safeDiagnostic(com.networknt.schema.Error error) {
+        String location = safeLocation(error.getInstanceLocation() == null
+                ? null : error.getInstanceLocation().toString());
+        String property = safeProperty(error.getProperty());
+        String keyword = safeKeyword(error.getKeyword());
+        return switch (keyword) {
+            case "required" -> property == null
+                    ? "a required Tool field is missing at " + location
+                    : "required Tool field '" + property + "' is missing at " + location;
+            case "type" -> "Tool field at " + location + " has the wrong JSON type";
+            case "additionalProperties" -> property == null
+                    ? "Tool arguments contain an unexpected field at " + location
+                    : "Tool field '" + property + "' is not allowed at " + location;
+            default -> "Tool field at " + location + " violates the '" + keyword + "' constraint";
+        };
+    }
+
+    /** 保留引擎返回的 JSON Pointer 位置，限制字符和长度，避免诊断包含参数值。 */
+    private static String safeLocation(String value) {
+        if (value == null || value.isBlank() || value.length() > 256
+                || !value.matches("[A-Za-z0-9_.$/\\[\\]~\\-]+")) return "$";
+        return value;
+    }
+
+    /** 字段名来自公开 Tool Schema，但仍限制为普通标识，拒绝控制字符和诊断注入。 */
+    private static String safeProperty(String value) {
+        if (value == null || value.isBlank() || value.length() > 128
+                || !value.matches("[A-Za-z0-9_.\\-]+")) return null;
+        return value;
+    }
+
+    /** 未知约束名统一降级为 validation，避免第三方字符串进入 ToolResult。 */
+    private static String safeKeyword(String value) {
+        if (value == null || !value.matches("[A-Za-z][A-Za-z0-9_\\-]{0,63}")) return "validation";
+        return value;
     }
 
     /**

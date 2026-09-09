@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as Tabs from "@radix-ui/react-tabs";
-import * as AlertDialog from "@radix-ui/react-alert-dialog";
-import { ArrowLeft, MessageSquarePlus, Search, X } from "lucide-react";
+import { ArrowLeft, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Button, IconButton, ScrollArea } from "@/shared/ui/primitives";
 import type { SettingsSection, SettingsSnapshot } from "../domain/types";
-import type { SettingsPorts } from "../application/ports";
+import type { SettingsDesktopPort, SettingsPorts } from "../application/ports";
 import { ModelsSection } from "./models";
 import { McpSection } from "./mcp";
 import {
@@ -17,14 +16,17 @@ import {
 } from "./sections";
 import { sections } from "./shared";
 import { SkillsSection } from "./skills";
+import { AboutSection, SettingsUpdateAction } from "./about";
+import { useAppUpdater } from "../application/useAppUpdater";
 import "./settings.css";
 
 const sectionKeywords: Record<SettingsSection, string> = {
   models: "模型 服务商 provider api api key 明文 密钥 协议 地址 base url anthropic openai 活动",
-  skills: "skills 技能 指令 内置 用户 workspace 启用",
+  skills: "skills 技能 指令 内置 用户 ja 项目 启用",
   mcp: "mcp 工具 server transport stdio http endpoint credential ref 协议版本 oauth",
   permissions: "权限 沙箱 access 安全 只读 工作区 完全访问 命令",
   appearance: "外观 主题 深色 浅色 系统 动效 对比度 xcode 桌面通知 后台 完成 失败 确认",
+  about: "关于 Ja GitHub 开源 协议 GPL 版本 更新 软件更新",
 };
 
 interface SettingsSearchResult {
@@ -47,7 +49,7 @@ function settingsSearchResults(snapshot: SettingsSnapshot): SettingsSearchResult
         section: "models" as const,
         label: provider.name,
         detail: `${provider.api} · ${provider.models.length} 个模型`,
-        search: `${provider.name} ${provider.provider} ${provider.api} ${provider.baseUrl}`,
+        search: `${provider.name} ${provider.api} ${provider.baseUrl}`,
       },
       ...provider.models.map((model) => ({
         id: `model-${provider.providerId}-${model.modelId}`,
@@ -85,6 +87,13 @@ function settingsSearchResults(snapshot: SettingsSnapshot): SettingsSearchResult
       detail: "主题、动效、对比度与桌面通知",
       search: sectionKeywords.appearance,
     },
+    {
+      id: "about-product",
+      section: "about" as const,
+      label: "关于 Ja",
+      detail: "版本、GitHub 与软件更新",
+      search: sectionKeywords.about,
+    },
   ];
 }
 
@@ -112,12 +121,10 @@ export interface SettingsProps {
   section: SettingsSection;
   onSectionChange: (section: SettingsSection) => void;
   desktopNotifications?: DesktopNotificationPreference;
+  desktop: SettingsDesktopPort;
   disabled?: boolean;
   required?: boolean;
-  onOpenConversation?: () => void;
-  scope?: "global" | "project";
-  projectAvailable?: boolean;
-  onScopeChange?: (scope: "global" | "project") => void;
+  onReturnToApp?: () => void;
 }
 
 /**
@@ -129,13 +136,12 @@ export function Settings({
   section,
   onSectionChange,
   desktopNotifications,
+  desktop,
   disabled = false,
   required = false,
-  onOpenConversation,
-  scope = "global",
-  projectAvailable = false,
-  onScopeChange = () => {},
+  onReturnToApp,
 }: SettingsProps): React.ReactElement {
+  const updater = useAppUpdater(desktop);
   const [query, setQuery] = useState("");
   const indexedResults = useMemo(() => settingsSearchResults(snapshot), [snapshot]);
   const results = useMemo(
@@ -176,6 +182,7 @@ export function Settings({
 
   return (
     <section className="ja-settings" aria-label="Ja 设置" aria-busy={disabled} inert={disabled}>
+      <h1 className="ja-visually-hidden">Ja 设置</h1>
       <Tabs.Root
         className="ja-settings-tabs"
         value={section}
@@ -183,35 +190,12 @@ export function Settings({
         orientation="vertical"
       >
         <aside className="ja-settings-sidebar">
-          <div className="ja-settings-sidebar-heading">
-            {required ? null : (
-              <IconButton label="返回对话" onClick={onOpenConversation}>
-                <ArrowLeft aria-hidden="true" />
-              </IconButton>
-            )}
-            <div>
-              <h1>{required ? "先配置一个模型" : "设置"}</h1>
-              <span>{required ? "完成模型配置后开始对话" : "Ja 偏好设置"}</span>
-            </div>
-          </div>
-          {projectAvailable ? (
-            <div className="ja-settings-scope" role="group" aria-label="设置作用域">
-              <button
-                type="button"
-                aria-pressed={scope === "global"}
-                onClick={() => onScopeChange("global")}
-              >
-                全局
-              </button>
-              <button
-                type="button"
-                aria-pressed={scope === "project"}
-                onClick={() => onScopeChange("project")}
-              >
-                当前项目
-              </button>
-            </div>
-          ) : null}
+          {required || onReturnToApp === undefined ? null : (
+            <Button className="ja-settings-return" variant="ghost" onClick={onReturnToApp}>
+              <ArrowLeft aria-hidden="true" />
+              返回应用
+            </Button>
+          )}
           <label className="ja-settings-search">
             <Search aria-hidden="true" />
             <span className="ja-visually-hidden">搜索设置</span>
@@ -259,95 +243,54 @@ export function Settings({
               </button>
             </div>
           ) : null}
-          {required || onOpenConversation === undefined ? null : (
-            <Button className="ja-settings-start" variant="secondary" onClick={onOpenConversation}>
-              <MessageSquarePlus aria-hidden="true" />
-              开始对话
-            </Button>
-          )}
         </aside>
-        <ScrollArea className="ja-settings-content">
-          <Tabs.Content forceMount value="models" className="ja-settings-panel">
-            <ModelsSection
-              providers={snapshot.providers}
-              defaultSelection={snapshot.defaultSelection}
-              snapshotRevision={snapshot.revision}
-              ports={ports}
-              projectMode={scope === "project"}
-              projectOverridden={snapshot.projectOverrides.defaultSelection}
-            />
-          </Tabs.Content>
-          <Tabs.Content forceMount value="skills" className="ja-settings-panel">
-            <SkillsSection
-              skills={snapshot.skills}
-              onToggleSkill={ports.onToggleSkill}
-              projectMode={scope === "project"}
-            />
-          </Tabs.Content>
-          <Tabs.Content forceMount value="mcp" className="ja-settings-panel">
-            <McpSection
-              servers={snapshot.mcpServers}
-              snapshotRevision={snapshot.revision}
-              onSaveMcp={ports.onSaveMcp}
-              onDeleteMcp={ports.onDeleteMcp}
-              onTestMcp={ports.onTestMcp}
-              onCloseMcp={ports.onCloseMcp}
-              onReplaceCredential={ports.onReplaceCredential}
-              onClearCredential={ports.onClearCredential}
-              projectMode={scope === "project"}
-            />
-          </Tabs.Content>
-          <Tabs.Content forceMount value="permissions" className="ja-settings-panel">
-            <PermissionsSection
-              mode={snapshot.defaultAccessMode}
-              globalMode={snapshot.globalAccessMode}
-              projectMode={scope === "project"}
-              projectOverridden={snapshot.projectOverrides.accessMode}
-              onChange={ports.onAccessModeChange}
-            />
-          </Tabs.Content>
-          <Tabs.Content forceMount value="appearance" className="ja-settings-panel">
-            {scope === "project" ? (
-              <div className="ja-settings-section">
-                <div className="ja-settings-empty">外观设置始终应用于全局。</div>
-              </div>
-            ) : (
+        <div className="ja-settings-main">
+          <header className="ja-settings-toolbar">
+            <strong>设置</strong>
+            <SettingsUpdateAction updater={updater} />
+          </header>
+          <ScrollArea className="ja-settings-content">
+            <Tabs.Content forceMount value="models" className="ja-settings-panel">
+              <ModelsSection
+                providers={snapshot.providers}
+                defaultSelection={snapshot.defaultSelection}
+                snapshotRevision={snapshot.revision}
+                ports={ports}
+              />
+            </Tabs.Content>
+            <Tabs.Content forceMount value="skills" className="ja-settings-panel">
+              <SkillsSection skills={snapshot.skills} onToggleSkill={ports.onToggleSkill} />
+            </Tabs.Content>
+            <Tabs.Content forceMount value="mcp" className="ja-settings-panel">
+              <McpSection
+                servers={snapshot.mcpServers}
+                snapshotRevision={snapshot.revision}
+                onSaveMcp={ports.onSaveMcp}
+                onDeleteMcp={ports.onDeleteMcp}
+                onTestMcp={ports.onTestMcp}
+                onCloseMcp={ports.onCloseMcp}
+                onReplaceCredential={ports.onReplaceCredential}
+                onClearCredential={ports.onClearCredential}
+              />
+            </Tabs.Content>
+            <Tabs.Content forceMount value="permissions" className="ja-settings-panel">
+              <PermissionsSection
+                mode={snapshot.defaultAccessMode}
+                onChange={ports.onAccessModeChange}
+              />
+            </Tabs.Content>
+            <Tabs.Content forceMount value="appearance" className="ja-settings-panel">
               <AppearanceSection
                 appearance={snapshot.appearance}
                 onChange={ports.onAppearanceChange}
                 desktopNotifications={desktopNotifications}
               />
-            )}
-          </Tabs.Content>
-          {scope === "project" ? (
-            <div className="ja-settings-project-reset">
-              <AlertDialog.Root>
-                <AlertDialog.Trigger asChild>
-                  <Button variant="secondary">全部恢复全局设置</Button>
-                </AlertDialog.Trigger>
-                <AlertDialog.Portal>
-                  <AlertDialog.Overlay className="ja-settings-dialog-overlay" />
-                  <AlertDialog.Content className="ja-settings-confirm-dialog">
-                    <AlertDialog.Title>恢复全局设置？</AlertDialog.Title>
-                    <AlertDialog.Description>
-                      当前项目的模型、Skills、MCP 和执行确认覆盖将被删除。
-                    </AlertDialog.Description>
-                    <div className="ja-settings-form-actions">
-                      <AlertDialog.Cancel asChild>
-                        <Button variant="ghost">取消</Button>
-                      </AlertDialog.Cancel>
-                      <AlertDialog.Action asChild>
-                        <Button variant="primary" onClick={() => void ports.onResetProject()}>
-                          恢复
-                        </Button>
-                      </AlertDialog.Action>
-                    </div>
-                  </AlertDialog.Content>
-                </AlertDialog.Portal>
-              </AlertDialog.Root>
-            </div>
-          ) : null}
-        </ScrollArea>
+            </Tabs.Content>
+            <Tabs.Content forceMount value="about" className="ja-settings-panel">
+              <AboutSection updater={updater} openExternalUrl={desktop.openExternalUrl} />
+            </Tabs.Content>
+          </ScrollArea>
+        </div>
       </Tabs.Root>
     </section>
   );

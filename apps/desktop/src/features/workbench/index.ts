@@ -3,4 +3,19 @@
 
 export { Workbench } from "./ui/Workbench";
 export { WorkbenchResizeHandle } from "./ui/WorkbenchResizeHandle";
-export type { WorkbenchTab } from "./domain/tabs";
+export {
+  capabilityWorkbenchTab,
+  parseTaskWorkbenchTabKey,
+  sameWorkbenchTab,
+  sideTaskDraftWorkbenchTab,
+  taskWorkbenchTab,
+} from "./domain/tabs";
+export type {
+  WorkbenchCapability,
+  WorkbenchCapabilityTab,
+  WorkbenchTab,
+  WorkbenchTabKey,
+  WorkbenchTaskKind,
+  WorkbenchTaskTab,
+  WorkbenchTaskTabKey,
+} from "./domain/tabs";

@@ -33,7 +33,7 @@ public final class McpJsonValues {
     }
 
     /**
-     * 将 SDK Schema 收紧为对象；非对象输入不能进入冻结 ToolSpec。
+     * 将 SDK Schema 收紧为对象；非对象输入不能进入请求级 ToolSpec。
      */
     public static JsonObject objectFromSdk(ObjectMapper mapper, Object value) {
         JsonValue converted = fromSdk(mapper, value);

@@ -47,8 +47,8 @@
   line-height: var(--ja-line-control);
 }
 .ja-button-primary {
-  color: var(--ja-accent-foreground);
-  background: var(--ja-accent);
+  color: var(--ja-on-accent);
+  background: var(--ja-accent-emphasis);
 }
 .ja-button-primary:hover:not(:disabled) {
   background: var(--ja-accent-hover);
@@ -67,8 +67,8 @@
   background: transparent;
 }
 .ja-button-danger {
-  color: #fff;
-  background: var(--ja-danger);
+  color: var(--ja-on-danger);
+  background: var(--ja-danger-emphasis);
 }
 .ja-icon-button {
   font: inherit;
@@ -85,7 +85,7 @@
 .ja-floating-surface {
   z-index: 1200;
   color: var(--ja-foreground);
-  background: var(--ja-glass-strong);
+  background: var(--ja-menu);
   border: 1px solid var(--ja-glass-border);
   border-radius: var(--ja-radius-lg);
   box-shadow: var(--ja-shadow-floating);
@@ -264,7 +264,7 @@
   position: fixed;
   z-index: 1190;
   inset: 0;
-  background: color-mix(in srgb, var(--ja-foreground) 24%, transparent);
+  background: var(--ja-modal-overlay);
 }
 .ja-dialog-content {
   position: fixed;
@@ -292,21 +292,34 @@
   display: flex;
   padding: 2px;
   background: transparent;
+  opacity: 0.78;
   touch-action: none;
   user-select: none;
+  transition: opacity var(--ja-duration-fast) var(--ja-ease-native);
 }
 .ja-scrollbar[data-orientation="vertical"] {
-  width: 0.65rem;
+  width: var(--ja-scrollbar-size);
 }
 .ja-scrollbar[data-orientation="horizontal"] {
-  height: 0.65rem;
+  height: var(--ja-scrollbar-size);
   flex-direction: column;
+}
+.ja-scrollbar:hover,
+.ja-scrollbar:focus-within {
+  opacity: 1;
 }
 .ja-scrollbar-thumb {
   position: relative;
   flex: 1;
-  border-radius: 999px;
-  background: var(--ja-border-strong);
+  border-radius: var(--ja-scrollbar-radius);
+  background: var(--ja-scrollbar-thumb);
+}
+.ja-scrollbar:hover .ja-scrollbar-thumb,
+.ja-scrollbar:focus-within .ja-scrollbar-thumb {
+  background: var(--ja-scrollbar-thumb-hover);
+}
+.ja-scrollbar-thumb:active {
+  background: var(--ja-scrollbar-thumb-active);
 }
 .ja-tooltip-content {
   --ja-floating-transform-origin: var(--radix-tooltip-content-transform-origin);
@@ -361,7 +374,21 @@
 
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .ja-floating-surface {
-    background: var(--ja-surface-raised);
+    background: var(--ja-menu);
+  }
+}
+
+/* 用户与系统 accessibility 偏好优先于玻璃材质；关闭 blur 后仍保留实色层级与强边界。 */
+:root[data-reduced-transparency="true"] .ja-floating-surface,
+:root[data-high-contrast="true"] .ja-floating-surface {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
+  .ja-floating-surface {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 }
 

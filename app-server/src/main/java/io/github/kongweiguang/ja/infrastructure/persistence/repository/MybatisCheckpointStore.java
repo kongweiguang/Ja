@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.conversation.application.context.checkpoint.Che
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnExecutionStateCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
 import org.apache.ibatis.session.SqlSessionFactory;
 
@@ -20,6 +21,7 @@ import java.util.Objects;
 public final class MybatisCheckpointStore implements CheckpointStore {
     private final MybatisUnitOfWork transactions;
     private final PersistenceCodec codec;
+    private final TurnExecutionStateCodec executions;
 
     /**
      * 生产 factory 来自官方 MyBatis-Solon plugin，与 ConversationRepository 共用同一 datasource/事务 owner。
@@ -27,6 +29,7 @@ public final class MybatisCheckpointStore implements CheckpointStore {
     public MybatisCheckpointStore(SqlSessionFactory sessions, ObjectMapper objectMapper) {
         transactions = new MybatisUnitOfWork(sessions);
         codec = new PersistenceCodec(objectMapper);
+        executions = new TurnExecutionStateCodec(objectMapper);
     }
 
     /**
@@ -36,6 +39,7 @@ public final class MybatisCheckpointStore implements CheckpointStore {
                                   MybatisUnitOfWork.SessionOwner owner) {
         transactions = new MybatisUnitOfWork(sessions, owner);
         codec = new PersistenceCodec(objectMapper);
+        executions = new TurnExecutionStateCodec(objectMapper);
     }
 
     /**
@@ -87,13 +91,34 @@ public final class MybatisCheckpointStore implements CheckpointStore {
                     throw new StorageException(StorageException.Code.CAS_CONFLICT,
                             "checkpoint insert lost the source race");
                 }
+                Long turnMutationVersion = null;
+                if (request.turnOperation().isPresent()) {
+                    CheckpointStore.TurnOperation operation = request.turnOperation().orElseThrow();
+                    PersistenceRecords.TurnExecutionWrite execution = new PersistenceRecords.TurnExecutionWrite(
+                            operation.turnId(), io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState.SCHEMA_VERSION,
+                            executions.write(operation.completedExecution()));
+                    if (mapper.agent().replaceTurnExecution(execution) != 1) {
+                        throw new StorageException(StorageException.Code.CAS_CONFLICT,
+                                "checkpoint execution state changed before commit");
+                    }
+                    if (mapper.agent().compareAndSetTurn(new PersistenceRecords.TurnCas(
+                            request.threadId(), operation.turnId(), "RUNNING",
+                            operation.expectedTurnMutationVersion(), checkpoint.createdAt().toString(),
+                            null, null, null, null)) != 1) {
+                        throw new StorageException(StorageException.Code.CAS_CONFLICT,
+                                "checkpoint Turn mutation changed before commit");
+                    }
+                    turnMutationVersion = operation.expectedTurnMutationVersion() + 1;
+                }
                 Long committedRevision = mapper.history().allocateThreadRevision(new PersistenceRecords.ThreadRevision(
                         request.threadId(), checkpoint.createdAt().toString()));
                 if (committedRevision == null) {
                     throw new StorageException(StorageException.Code.NOT_FOUND,
                             "thread was not found");
                 }
-                return CommittedCheckpoint.created(checkpoint, committedRevision);
+                return turnMutationVersion == null
+                        ? CommittedCheckpoint.created(checkpoint, committedRevision)
+                        : CommittedCheckpoint.created(checkpoint, committedRevision, turnMutationVersion);
             });
         } catch (StorageException failure) {
             if (failure.code() == StorageException.Code.CAS_CONFLICT) {

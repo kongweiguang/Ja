@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"c:path-result-absolute","method":"workspace/path/search","params":{"threadId":"thr_demo","workspaceId":"ws_demo","query":"src"}}
+{"jsonrpc":"2.0","id":"c:path-result-absolute","result":{"threadId":"thr_demo","workspaceId":"ws_demo","generation":1,"query":"src","items":[{"relativePath":"C:/secret.txt","kind":"file"}],"truncated":false}}
+{"jsonrpc":"2.0","id":"c:path-result-extra","method":"workspace/path/search","params":{"threadId":"thr_demo","workspaceId":"ws_demo","query":"src"}}
+{"jsonrpc":"2.0","id":"c:path-result-extra","result":{"threadId":"thr_demo","workspaceId":"ws_demo","generation":1,"query":"src","items":[],"truncated":false,"root":"C:/workspace"}}

@@ -29,6 +29,19 @@ const ArtifactIdSchema = z
   .string()
   .regex(/^artifact_[A-Za-z0-9][A-Za-z0-9._-]{0,118}$/)
   .max(128);
+/** 与 JA-RPC relativePath 约束对齐，防止 renderer 借冻结读取探测 artifact 外路径。 */
+function excludesIsoControls(value: string): boolean {
+  return !Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+  });
+}
+const RelativePathSchema = z
+  .string()
+  .min(1)
+  .max(4_096)
+  .regex(/^(?!\/)(?![A-Za-z]:)(?!.*\\)(?!.*(?:^|\/)\.\.(?:\/|$)).+$/u)
+  .refine(excludesIsoControls);
 const PageOffsetSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const ToolArtifactReadInputSchema = z
   .object({
@@ -47,8 +60,7 @@ const TurnDiffReadInputSchema = z
     threadId: ThreadIdSchema,
     turnId: TurnIdSchema,
     artifactId: ArtifactIdSchema,
-    offsetBytes: z.number().int().min(0).max(2_097_152),
-    limitBytes: z.number().int().min(1).max(65_536),
+    filePath: RelativePathSchema,
   })
   .strict();
 const ToolArtifactPageSchema = z
@@ -64,16 +76,15 @@ const ToolArtifactPageSchema = z
       .refine((value) => !value.includes("\0")),
   })
   .strict();
-const TurnDiffPageSchema = z
+const TurnDiffSchema = z
   .object({
     artifactId: ArtifactIdSchema,
-    offsetBytes: z.number().int().min(0).max(2_097_152),
-    nextOffsetBytes: z.number().int().min(0).max(2_097_152).nullable(),
+    filePath: RelativePathSchema,
     byteLength: z.number().int().min(0).max(2_097_152),
-    truncated: z.boolean(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
     content: z
       .string()
-      .max(65_536)
+      .max(2_097_152)
       .refine((value) => !value.includes("\0")),
   })
   .strict();
@@ -81,11 +92,11 @@ const TurnDiffPageSchema = z
 export type ToolArtifactReadInput = z.infer<typeof ToolArtifactReadInputSchema>;
 export type TurnDiffReadInput = z.infer<typeof TurnDiffReadInputSchema>;
 export type ToolArtifactPage = z.infer<typeof ToolArtifactPageSchema>;
-export type TurnDiffPage = z.infer<typeof TurnDiffPageSchema>;
+export type TurnDiff = z.infer<typeof TurnDiffSchema>;
 
 export interface TurnArtifactAdapter {
   readToolPage(input: ToolArtifactReadInput): Promise<ToolArtifactPage>;
-  readTurnDiffPage(input: TurnDiffReadInput): Promise<TurnDiffPage>;
+  readTurnDiff(input: TurnDiffReadInput): Promise<TurnDiff>;
 }
 
 const COMMANDS = {
@@ -118,6 +129,18 @@ async function readPage<I, O>(
   }
 }
 
+/** 冻结 Diff 必须精确回显身份和 UTF-8 总长度，防止错误响应进入历史审阅。 */
+function validateTurnDiff(input: TurnDiffReadInput, result: TurnDiff): TurnDiff {
+  const contentBytes = new TextEncoder().encode(result.content).byteLength;
+  if (
+    result.artifactId !== input.artifactId ||
+    result.filePath !== input.filePath ||
+    contentBytes !== result.byteLength
+  )
+    throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时返回的修改内容无效。", true);
+  return result;
+}
+
 /** Tauri adapter 只读取 Java 已脱敏并持久化的冻结 artifact。 */
 export class TauriTurnArtifactAdapter implements TurnArtifactAdapter {
   constructor(private readonly bridge: Pick<RuntimeNativeBridge, "invoke"> = defaultNativeBridge) {}
@@ -133,15 +156,16 @@ export class TauriTurnArtifactAdapter implements TurnArtifactAdapter {
     );
   }
 
-  /** Turn diff 按 UTF-8 安全 byte offset 分页，读取的是终态冻结 artifact 而非当前工作树。 */
-  readTurnDiffPage(input: TurnDiffReadInput): Promise<TurnDiffPage> {
-    return readPage(
+  /** Turn diff 一次读取一个有界文件，读取的是终态冻结 artifact 而非当前工作树。 */
+  async readTurnDiff(input: TurnDiffReadInput): Promise<TurnDiff> {
+    const result = await readPage(
       this.bridge,
       COMMANDS.turnDiff,
       input,
       TurnDiffReadInputSchema,
-      TurnDiffPageSchema,
+      TurnDiffSchema,
     );
+    return validateTurnDiff(input, result);
   }
 }
 

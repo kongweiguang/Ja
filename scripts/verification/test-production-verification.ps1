@@ -42,7 +42,7 @@ function Get-ListOnlyInventory {
 
     $arguments = @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts\verification\run-production-verification.ps1'),
         '-EvidenceDirectory', $EvidenceDirectory, '-ListOnly')
-    if ($AllOptional) { $arguments += @('-IncludeNative', '-IncludeSoak', '-IncludeDesktop', '-IncludeRealProvider') }
+    if ($AllOptional) { $arguments += @('-IncludeNative', '-IncludeSoak', '-IncludeDesktop', '-IncludeRuntimeRefresh', '-IncludePlanGoal', '-IncludeTurnChangeReview', '-IncludeRealProvider') }
     if (-not [string]::IsNullOrWhiteSpace($CorrespondingSourcePath)) { $arguments += @('-CorrespondingSourcePath', $CorrespondingSourcePath) }
     foreach ($artifact in @($ArtifactPath)) { $arguments += @('-ArtifactPath', $artifact) }
     Push-Location $scratchRoot
@@ -59,8 +59,8 @@ $baseEvidence = Join-Path $scratchRoot 'list-base'
 $allEvidence = Join-Path $scratchRoot 'list-all'
 $base = @(Get-ListOnlyInventory -EvidenceDirectory $baseEvidence)
 $all = @(Get-ListOnlyInventory -EvidenceDirectory $allEvidence -AllOptional)
-Assert-VerificationInvariant -Condition ($base.Count -eq 36 -and @($base | Where-Object requested).Count -eq 27) -Name 'base-inventory-count'
-Assert-VerificationInvariant -Condition ($all.Count -eq 36 -and @($all | Where-Object requested).Count -eq 36) -Name 'all-inventory-count'
+Assert-VerificationInvariant -Condition ($base.Count -eq 40 -and @($base | Where-Object requested).Count -eq 27) -Name 'base-inventory-count'
+Assert-VerificationInvariant -Condition ($all.Count -eq 40 -and @($all | Where-Object requested).Count -eq 40) -Name 'all-inventory-count'
 Assert-VerificationInvariant -Condition (-not (Test-Path -LiteralPath $baseEvidence) -and -not (Test-Path -LiteralPath $allEvidence)) -Name 'list-only-no-write'
 
 $nativeBuilds = @($all | Where-Object name -eq 'java-native-build')
@@ -69,7 +69,12 @@ $nativePolicy = $all | Where-Object name -eq 'native-no-fallback-policy' | Selec
 $nativeSmoke = $all | Where-Object name -eq 'java-native-smoke' | Select-Object -First 1
 $soak = $all | Where-Object name -eq 'runtime-soak' | Select-Object -First 1
 $desktop = $all | Where-Object name -eq 'windows-webview2' | Select-Object -First 1
-$provider = $all | Where-Object name -eq 'real-provider-openai' | Select-Object -First 1
+$runtimeRefreshDesktop = $all | Where-Object name -eq 'runtime-refresh-windows-webview2' | Select-Object -First 1
+$planGoalDesktop = $all | Where-Object name -eq 'plan-goal-windows-webview2' | Select-Object -First 1
+$planGoalSoak = $all | Where-Object name -eq 'plan-goal-soak-120-minutes' | Select-Object -First 1
+$turnChangeStage = $all | Where-Object name -eq 'turn-change-review-sidecar-stage' | Select-Object -First 1
+$turnChangeDesktop = $all | Where-Object name -eq 'turn-change-review-windows-webview2' | Select-Object -First 1
+$provider = $all | Where-Object name -eq 'real-provider' | Select-Object -First 1
 $typescriptTests = $base | Where-Object name -eq 'typescript-tests' | Select-Object -First 1
 $sbomInputs = $all | Where-Object name -eq 'sbom-inputs' | Select-Object -First 1
 $sbomLicense = $all | Where-Object name -eq 'sbom-license' | Select-Object -First 1
@@ -90,6 +95,30 @@ Assert-VerificationInvariant -Condition (@($nativeBuild.dependsOn) -contains 'co
 Assert-VerificationInvariant -Condition (@($nativeSmoke.dependsOn) -contains 'native-artifact-freshness') -Name 'native-smoke-freshness-dependency'
 Assert-VerificationInvariant -Condition (@($soak.dependsOn) -contains 'java-native-smoke') -Name 'soak-smoke-dependency'
 Assert-VerificationInvariant -Condition (@($desktop.dependsOn) -contains 'desktop-build' -and -not $desktop.persistOutput) -Name 'desktop-runtime-dependency'
+Assert-VerificationInvariant -Condition ($runtimeRefreshDesktop.command -eq 'node.exe' `
+        -and @($runtimeRefreshDesktop.arguments) -contains 'scripts/e2e/windows-desktop-smoke.mjs' `
+        -and @($runtimeRefreshDesktop.dependsOn) -contains 'java-artifact-package' `
+        -and @($runtimeRefreshDesktop.dependsOn) -contains 'kernel-loop-smoke' `
+        -and @($runtimeRefreshDesktop.dependsOn) -contains 'rust-tauri-tests' `
+        -and @($runtimeRefreshDesktop.dependsOn) -contains 'rust-host-integration' `
+        -and @($runtimeRefreshDesktop.dependsOn) -contains 'typescript-tests' `
+        -and @($runtimeRefreshDesktop.dependsOn) -contains 'desktop-build' `
+        -and -not $runtimeRefreshDesktop.persistOutput) -Name 'runtime-refresh-independent-webview2-gate'
+Assert-VerificationInvariant -Condition (@($planGoalDesktop.dependsOn) -contains 'java-native-smoke' `
+        -and @($planGoalDesktop.dependsOn) -contains 'desktop-build' `
+        -and -not $planGoalDesktop.persistOutput) -Name 'plan-goal-desktop-native-loopback-gate'
+Assert-VerificationInvariant -Condition (@($planGoalSoak.dependsOn) -contains 'plan-goal-windows-webview2' `
+        -and -not $planGoalSoak.persistOutput) -Name 'plan-goal-soak-120-minute-loopback-gate'
+Assert-VerificationInvariant -Condition ($turnChangeStage.command -eq 'python.exe' `
+        -and @($turnChangeStage.arguments) -contains 'scripts/native/stage-sidecar.py' `
+        -and @($turnChangeStage.arguments) -contains '--target-triple' `
+        -and @($turnChangeStage.arguments) -contains 'x86_64-pc-windows-msvc' `
+        -and @($turnChangeStage.dependsOn) -contains 'java-native-smoke') -Name 'turn-change-native-sidecar-stage'
+Assert-VerificationInvariant -Condition ($turnChangeDesktop.command -eq 'node.exe' `
+        -and @($turnChangeDesktop.arguments) -contains 'scripts/e2e/turn-change-review-production.mjs' `
+        -and @($turnChangeDesktop.dependsOn) -contains 'turn-change-review-sidecar-stage' `
+        -and @($turnChangeDesktop.dependsOn) -contains 'desktop-build' `
+        -and -not $turnChangeDesktop.persistOutput) -Name 'turn-change-independent-webview2-gate'
 Assert-VerificationInvariant -Condition (@($provider.dependsOn) -contains 'provider-preflight' -and @($provider.dependsOn) -contains 'kernel-loop-smoke' -and -not $provider.persistOutput) -Name 'provider-runtime-dependency'
 Assert-VerificationInvariant -Condition (@($typescriptTests.arguments) -notcontains '--' `
         -and @($typescriptTests.arguments) -contains '--reporter=json' `
@@ -102,12 +131,10 @@ Assert-VerificationInvariant -Condition (@($sbomLicense.dependsOn) -contains 'sb
 
 $secret = 'sk-' + 'verification-selftest-' + [Guid]::NewGuid().ToString('N')
 $priorSecrets = @{
-    JA_REAL_PROVIDER_OPENAI_API_KEY = $env:JA_REAL_PROVIDER_OPENAI_API_KEY
-    JA_REAL_PROVIDER_ANTHROPIC_API_KEY = $env:JA_REAL_PROVIDER_ANTHROPIC_API_KEY
+    JA_REAL_PROVIDER_API_KEY = $env:JA_REAL_PROVIDER_API_KEY
 }
 try {
-    $env:JA_REAL_PROVIDER_OPENAI_API_KEY = $secret
-    $env:JA_REAL_PROVIDER_ANTHROPIC_API_KEY = $secret
+    $env:JA_REAL_PROVIDER_API_KEY = $secret
     $secretInventory = @(Get-ListOnlyInventory -EvidenceDirectory (Join-Path $scratchRoot 'list-secret') -AllOptional)
     Assert-VerificationInvariant -Condition (-not (($secretInventory | ConvertTo-Json -Depth 8).Contains($secret))) -Name 'list-only-secret-redaction'
 } finally {
@@ -123,7 +150,7 @@ Assert-VerificationInvariant -Condition ($LASTEXITCODE -ne 0 -and (Get-Content -
 Assert-VerificationInvariant -Condition (-not (Test-Path -LiteralPath (Join-Path $staleEvidence 'summary.json'))) -Name 'stale-evidence-no-overwrite'
 $staleSummary = $staleOutput | ConvertFrom-Json
 Assert-VerificationInvariant -Condition ($staleSummary.blocker -eq 'evidence-directory-not-fresh' -and -not $staleSummary.evidenceWritten) -Name 'stale-evidence-semantics'
-Assert-VerificationInvariant -Condition (@($staleSummary.results).Count -eq 36 `
+Assert-VerificationInvariant -Condition (@($staleSummary.results).Count -eq 40 `
         -and @($staleSummary.results | Where-Object { $null -eq $_.PSObject.Properties['requested'] -or $null -eq $_.PSObject.Properties['executed'] -or $null -eq $_.PSObject.Properties['blocked'] }).Count -eq 0) -Name 'requested-executed-blocked-shape'
 Assert-VerificationInvariant -Condition (@($staleSummary.results | Where-Object { -not $_.requested -and $_.passed }).Count -eq 0) -Name 'nonrequested-is-not-passed'
 
@@ -216,6 +243,9 @@ $mavenSummaryEvidence = & {
         [System.IO.File]::WriteAllText($path, "<testsuite name=`"fixture`" tests=`"$($entry.tests)`" failures=`"0`" errors=`"0`" skipped=`"$($entry.skipped)`" />", [System.Text.UTF8Encoding]::new($false))
         [System.IO.File]::SetLastWriteTimeUtc($path, [DateTime]::UtcNow)
     }
+    $staleSource = Join-Path $reportRoot 'TEST-prior-gate.xml'
+    [System.IO.File]::WriteAllText($staleSource, '<testsuite name="prior" tests="99" failures="0" errors="0" skipped="0" />', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::SetLastWriteTimeUtc($staleSource, $runStartedAt.UtcDateTime.AddMinutes(-1))
     $mavenSurefireSnapshot = Save-MavenSurefireSnapshot -GateResult $gate
     Remove-Item -LiteralPath (Join-Path $repositoryRoot 'app-server') -Recurse -Force
     $snapshot = Get-MavenTestEvidence -Since $runStartedAt
@@ -271,7 +301,8 @@ Assert-VerificationInvariant -Condition ($mavenSummaryEvidence.snapshot.status -
         -and $mavenSummaryEvidence.snapshot.source -eq 'surefire-xml-snapshot' `
         -and $mavenSummaryEvidence.snapshot.suites -eq 2 `
         -and $mavenSummaryEvidence.snapshot.tests -eq 12 `
-        -and $mavenSummaryEvidence.snapshot.snapshot.copiedCount -eq 2) -Name 'maven-snapshot-survives-target-delete'
+        -and $mavenSummaryEvidence.snapshot.snapshot.copiedCount -eq 2 `
+        -and $mavenSummaryEvidence.snapshot.snapshot.sourceReportCount -eq 3) -Name 'maven-snapshot-survives-target-delete'
 Assert-VerificationInvariant -Condition ($mavenSummaryEvidence.stale.status -eq 'blocked' `
         -and $mavenSummaryEvidence.stale.blocker -eq 'Maven Surefire snapshot is stale or future-dated') -Name 'maven-snapshot-stale-blocked'
 Assert-VerificationInvariant -Condition ($mavenSummaryEvidence.future.status -eq 'blocked' `
@@ -313,6 +344,76 @@ Assert-VerificationInvariant -Condition ($boundedDiagnostic.Contains('startup-ma
         -and $boundedDiagnostic.Contains('266 passed; 0 failed') `
         -and $boundedDiagnostic.Length -lt 17000) -Name 'bounded-diagnostic-preserves-head-and-verdict-tail'
 
+# Proves artifact budgets do not duplicate a failed prerequisite as a stale-file finding. Once the
+# producer succeeds, the same stale identity must remain a hard failure.
+$artifactSizeEvidence = & {
+    param([Parameter(Mandatory)][string]$VerificationScript)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($VerificationScript, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw 'verification size fixture could not parse runner' }
+    $definition = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-SizeGateEvidence'
+        }, $true)
+    if ($null -eq $definition) { throw 'verification size fixture function is missing' }
+    Invoke-Expression $definition.Extent.Text
+
+    $artifact = [ordered]@{ required = $true; exists = $true; freshThisRun = $false; actualBytes = 8; maxBytes = 16; path = 'native.exe'; producedBy = 'native-build' }
+    $results = @([ordered]@{ name = 'native-build'; passed = $false })
+    $blocked = Get-SizeGateEvidence -Artifacts @($artifact)
+    $results = @([ordered]@{ name = 'native-build'; passed = $true })
+    $produced = Get-SizeGateEvidence -Artifacts @($artifact)
+    return [ordered]@{ blocked = $blocked; produced = $produced }
+} (Join-Path $repositoryRoot 'scripts\verification\run-production-verification.ps1')
+Assert-VerificationInvariant -Condition ($artifactSizeEvidence.blocked.passed `
+        -and -not $artifactSizeEvidence.produced.passed `
+        -and $artifactSizeEvidence.produced.findings[0].rule -eq 'artifact-stale') -Name 'artifact-size-prerequisite-attribution'
+
+# Exercises the production secret scanner against evidence text and compiled JVM output. A class
+# constant pool is not a text disclosure surface, while a credential-shaped value in a log must
+# still fail closed with path/line/rule metadata only.
+$secretScanEvidence = & {
+    param(
+        [Parameter(Mandatory)][string]$VerificationScript,
+        [Parameter(Mandatory)][string]$FixtureDirectory
+    )
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($VerificationScript, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw 'verification secret fixture could not parse runner' }
+    foreach ($functionName in @('Test-GeneratedRepositoryPath', 'Get-SafePath', 'Get-SecretGateEvidence')) {
+        $definition = $ast.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+            }, $true)
+        if ($null -eq $definition) { throw "verification secret fixture function is missing: $functionName" }
+        Invoke-Expression $definition.Extent.Text
+    }
+
+    $repositoryRoot = Join-Path $FixtureDirectory 'repository'
+    $evidenceRoot = Join-Path $repositoryRoot 'evidence'
+    [System.IO.Directory]::CreateDirectory($repositoryRoot) | Out-Null
+    [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $evidenceRoot 'fixture.class'),
+        [System.Text.Encoding]::UTF8.GetBytes('authorization="credential-shaped-compiled-fixture"'))
+    [System.IO.File]::WriteAllText((Join-Path $evidenceRoot 'safe.log'),
+        'authorization="test-placeholder-value"', [System.Text.UTF8Encoding]::new($false))
+    $binaryIgnored = Get-SecretGateEvidence
+    $credentialFixture = 'credential-shaped-' + 'evidence-value'
+    [System.IO.File]::WriteAllText((Join-Path $evidenceRoot 'leak.log'),
+        ('authorization="' + $credentialFixture + '"'), [System.Text.UTF8Encoding]::new($false))
+    $textRejected = Get-SecretGateEvidence
+    return [ordered]@{ binaryIgnored = $binaryIgnored; textRejected = $textRejected }
+} (Join-Path $repositoryRoot 'scripts\verification\run-production-verification.ps1') (Join-Path $scratchRoot 'secret-scan-fixture')
+Assert-VerificationInvariant -Condition ($secretScanEvidence.binaryIgnored.passed `
+        -and -not $secretScanEvidence.textRejected.passed `
+        -and $secretScanEvidence.textRejected.findingCount -eq 1 `
+        -and $secretScanEvidence.textRejected.findings[0].path -eq 'evidence/leak.log' `
+        -and $secretScanEvidence.textRejected.findings[0].rule -eq 'credential-shaped-literal') -Name 'secret-scan-text-binary-boundary'
+
 # Loads the Native smoke subgate policy in isolation. These fixtures exercise blocked, missing and
 # mutated reports without launching Maven, Native Image or a sidecar process.
 $subgatePolicyEvidence = & {
@@ -327,7 +428,7 @@ $subgatePolicyEvidence = & {
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-NativeSmokeSubgateEvidence'
         }, $true)
     if ($null -eq $definition) { throw 'verification subgate fixture function is missing' }
-    $requiredNativeSmokeSubgates = @('jsonSchema', 'configAuth', 'okhttpSse', 'mcp', 'shellCancellation', 'sqlite', 'recovery', 'networknt')
+    $requiredNativeSmokeSubgates = @('jsonSchema', 'configAuth', 'okhttpSse', 'mcp', 'shellCancellation', 'shellStdinEof', 'sqlite', 'recovery', 'networknt')
     Invoke-Expression $definition.Extent.Text
 
     $complete = [ordered]@{}
@@ -451,7 +552,7 @@ $sbomInputFixtureEvidence = & {
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($VerificationScript, [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors.Count -ne 0) { throw 'verification SBOM input fixture could not parse runner' }
-    foreach ($functionName in @('Test-FreshTimestamp', 'Get-SafePath', 'Get-SbomInputEvidence')) {
+    foreach ($functionName in @('Test-FreshTimestamp', 'Test-FreshSbomInputTimestamp', 'Get-SafePath', 'Get-SbomInputEvidence')) {
         $definition = $ast.Find({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
@@ -462,6 +563,7 @@ $sbomInputFixtureEvidence = & {
 
     $repositoryRoot = [System.IO.Path]::GetFullPath($FixtureRepository)
     $freshnessFutureSkew = [TimeSpan]::FromMinutes(2)
+    $sbomInputMaxAge = [TimeSpan]::FromHours(24)
     $runStartedAt = [DateTimeOffset]::UtcNow.AddMinutes(-1)
     [System.IO.Directory]::CreateDirectory($repositoryRoot) | Out-Null
     $source = Join-Path $repositoryRoot 'corresponding-source.zip'
@@ -486,7 +588,7 @@ $sbomInputFixtureEvidence = & {
     $ArtifactPath = @($missing)
     $missingFileInputs = Get-SbomInputEvidence -Since $runStartedAt
 
-    [System.IO.File]::SetLastWriteTimeUtc($artifact, $runStartedAt.UtcDateTime.AddSeconds(-1))
+    [System.IO.File]::SetLastWriteTimeUtc($artifact, $runStartedAt.UtcDateTime.Subtract($sbomInputMaxAge).AddSeconds(-1))
     $ArtifactPath = @($artifact)
     $staleInputs = Get-SbomInputEvidence -Since $runStartedAt
 
@@ -563,6 +665,18 @@ Assert-VerificationInvariant -Condition ($verificationSource.Contains('[System.I
         -and $verificationSource.Contains('expectedIdentityMatched') `
         -and $verificationSource.Contains('java-25-preflight') `
         -and $verificationSource.Contains('sbom-bom-freshness') `
+        -and $verificationSource.Contains("[switch]`$IncludeRuntimeRefresh") `
+        -and $verificationSource.Contains("[switch]`$IncludePlanGoal") `
+        -and $verificationSource.Contains("[switch]`$IncludeTurnChangeReview") `
+        -and $verificationSource.Contains("JA_E2E_RUNTIME_REFRESH_ONLY = '1'") `
+        -and $verificationSource.Contains("JA_E2E_REAL_PROVIDER_API_KEY = ''") `
+        -and $verificationSource.Contains("JA_E2E_KEEP_TEMP = '0'") `
+        -and $verificationSource.Contains("JA_E2E_PLAN_GOAL_ONLY = '1'") `
+        -and $verificationSource.Contains("JA_E2E_PLAN_GOAL_SOAK_MINUTES = [string]`$PlanGoalSoakDurationMinutes") `
+        -and $verificationSource.Contains("JA_E2E_REAL_PROVIDER = '0'") `
+        -and $verificationSource.Contains("'plan-goal-soak-120-minutes'") `
+        -and $verificationSource.Contains("'runtime-refresh-windows-webview2'") `
+        -and $verificationSource.Contains("'turn-change-review-windows-webview2'") `
         -and $verificationSource.Contains('blocked-exit-code-2')) -Name 'freshness-identity-source-contract'
 Assert-VerificationInvariant -Condition ($soakSource.Contains('ReadToEndAsync()') `
         -and $soakSource.Contains("'bound-to-caller-identity'")) -Name 'soak-drain-and-identity-source-contract'

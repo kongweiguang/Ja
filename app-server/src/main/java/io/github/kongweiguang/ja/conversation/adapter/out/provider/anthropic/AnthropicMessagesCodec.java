@@ -73,6 +73,7 @@ final class AnthropicMessagesCodec {
         if (!request.tools().isEmpty()) {
             ArrayNode tools = root.putArray("tools");
             request.tools().forEach(tool -> tools.add(tool(tool)));
+            root.putObject("tool_choice").put("type", "auto");
         }
         root.put("stream", true);
         return root;
@@ -179,7 +180,7 @@ final class AnthropicMessagesCodec {
     }
 
     /**
-     * 将冻结 JSON Schema 转换为 Anthropic strict Tool 对象。
+     * 将冻结 JSON Schema 映射为 Anthropic 公开 Tool 字段闭集，避免发送未公开扩展字段造成兼容性漂移。
      */
     private static ObjectNode tool(ToolSpec specification) {
         JsonNode schema = ProviderJsonValues.toNode(specification.inputSchema());
@@ -191,7 +192,6 @@ final class AnthropicMessagesCodec {
         node.put("name", specification.name());
         node.put("description", specification.description());
         node.set("input_schema", schema);
-        node.put("strict", true);
         return node;
     }
 }

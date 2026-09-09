@@ -17,9 +17,12 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
         Some(&serde_json::json!([
             "runtime/status-changed",
             "turn/state-changed",
+            "turn/input-queue-changed",
+            "turn/input-consumed",
             "assistant/model-step-committed",
             "assistant/text-delta",
             "assistant/reasoning-summary-delta",
+            "tool/started",
             "tool/batch-committed",
             "approval/requested",
             "approval/resolved",
@@ -29,7 +32,13 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             "workspace/dirty",
             "turn/terminal",
             "thread/metadata-changed",
-            "configuration/changed"
+            "configuration/changed",
+            "task/activity",
+            "task/progress",
+            "task/mailbox-changed",
+            "goal/changed",
+            "goal/activity",
+            "goal/input-requested"
         ]))
     );
     assert!(capabilities.get("itemKinds").is_none());
@@ -39,6 +48,12 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             .get("methods")
             .and_then(Value::as_array)
             .is_some_and(|methods| methods.iter().any(|method| method == "turn/start"))
+    );
+    assert!(
+        capabilities
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|method| method == "turn/resume"))
     );
     assert!(
         capabilities
@@ -56,11 +71,54 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             .and_then(Value::as_array)
             .is_some_and(|methods| methods.iter().any(|method| method == "thread/compact"))
     );
+    assert!(
+        capabilities
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| {
+                methods
+                    .iter()
+                    .filter(|method| *method == "workspace/path/search")
+                    .count()
+                    == 1
+            })
+    );
     assert!(capabilities.get("hostTools").is_none());
     assert_eq!(
         capabilities.get("accessModes"),
         Some(&serde_json::json!(["approval_required", "full_access"]))
     );
+    assert_eq!(
+        capabilities.get("features"),
+        Some(&serde_json::json!(["task_threads_v1", "plan_goal_v1"]))
+    );
+    assert_eq!(
+        capabilities.get("collaborationModes"),
+        Some(&serde_json::json!(["default", "plan"]))
+    );
+    let methods = capabilities["methods"].as_array().expect("method catalog");
+    assert_eq!(params["protocolMajor"], 1);
+    assert_eq!(params["protocolMinor"], 0);
+    for method in [
+        "task/create",
+        "task/list",
+        "task/read",
+        "task/observe",
+        "task/unobserve",
+        "task/seen",
+        "task/message/send",
+        "task/followup",
+        "task/cancel",
+        "task/tree/delete",
+    ] {
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|candidate| *candidate == method)
+                .count(),
+            1
+        );
+    }
 }
 
 /// Session 的全局硬上限只为五分钟手动压缩留出响应余量；普通调用仍传入各自短 deadline。
@@ -69,13 +127,27 @@ fn default_session_limit_can_cover_manual_compaction() {
     assert_eq!(Limits::default().request_deadline_ms, 305_000);
 }
 
-/// initialize 刻意不包含业务配置；首次启动 home 为空时 v2 握手仍合法，缺少 profile
+/// 初始化必须双向锁定每 Turn 队列条目与 UTF-8 总字节预算，防止一端误以为队列无界。
+#[test]
+fn default_initialize_advertises_turn_input_queue_limits() {
+    let params = default_initialize_params(&Limits::default());
+    assert_eq!(params["limits"]["maxTurnQueuedInputs"], 8);
+    assert_eq!(params["limits"]["maxTurnQueuedInputBytes"], 524_288);
+}
+
+/// initialize 刻意不包含业务配置；首次启动 home 为空时 v1 握手仍合法，缺少 profile
 /// 或 credential 只在 Java admission Turn 时报告。
 #[test]
 fn initialize_has_no_business_configuration() {
     let params = default_initialize_params(&Limits::default());
     assert!(params.get("profiles").is_none());
-    validate_initialize_params(&params, &Limits::default()).expect("v2 initialize");
+    validate_initialize_params(&params, &Limits::default()).expect("v1 initialize");
+
+    // 首版没有升级窗口，不能将旧 2.1 offer 当作可协商的高版本。
+    let mut retired = params;
+    retired["protocolMajor"] = serde_json::json!(2);
+    retired["protocolMinor"] = serde_json::json!(1);
+    assert!(validate_initialize_params(&retired, &Limits::default()).is_err());
 }
 
 /// 锁定极简 capability 闭集；任何旧 Host Tool 或旧权限模式都必须在握手前失败。
@@ -92,7 +164,17 @@ fn removed_host_tools_and_access_modes_fail_closed() {
     workspace["accessModes"] = serde_json::json!(["workspace"]);
     let mut read_only = valid.clone();
     read_only["accessModes"] = serde_json::json!(["read_only"]);
-    for malformed in [host_tools, workspace, read_only] {
+    let mut missing_feature = valid.clone();
+    missing_feature["features"] = serde_json::json!([]);
+    let mut unknown_feature = valid.clone();
+    unknown_feature["features"] = serde_json::json!(["task_threads_v2"]);
+    for malformed in [
+        host_tools,
+        workspace,
+        read_only,
+        missing_feature,
+        unknown_feature,
+    ] {
         assert!(validate_capabilities(Some(&malformed)).is_err());
     }
 }

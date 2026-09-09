@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Clock3, LoaderCircle, Search } from "lucide-react";
+import { ArchiveRestore, Clock3, LoaderCircle, Search } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -23,6 +23,7 @@ export interface ConversationSearchDialogProps {
   onOpenChange(open: boolean): void;
   onSearch(query: string): Promise<readonly ThreadProjection[]>;
   onSelect(threadId: string): void | Promise<void>;
+  onRestore(threadId: string): void | Promise<void>;
 }
 
 /** 命中高亮只改变视觉片段，不改变服务端标题或使用不安全 HTML。 */
@@ -51,6 +52,7 @@ export function ConversationSearchDialog({
   onOpenChange,
   onSearch,
   onSelect,
+  onRestore,
 }: ConversationSearchDialogProps): ReactElement {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -61,6 +63,7 @@ export function ConversationSearchDialog({
           onOpenChange={onOpenChange}
           onSearch={onSearch}
           onSelect={onSelect}
+          onRestore={onRestore}
         />
       ) : null}
     </Dialog>
@@ -85,6 +88,7 @@ function ConversationSearchSession({
   onOpenChange,
   onSearch,
   onSelect,
+  onRestore,
 }: Omit<ConversationSearchDialogProps, "open">): ReactElement {
   const [query, setQuery] = useState("");
   const [outcome, setOutcome] = useState<SearchOutcome | null>(null);
@@ -184,10 +188,12 @@ function ConversationSearchSession({
     activeOption?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeIndex, results]);
 
-  /** 选择动作先关闭浮层，再打开 Thread，焦点由 Radix 恢复到触发前区域。 */
-  const selectResult = (threadId: string): void => {
+  /** 选择动作先关闭浮层；Radix 只做临时焦点归还，应用在 Thread 就绪后接管最终落点。 */
+  const selectResult = (thread: ThreadProjection): void => {
     onOpenChange(false);
-    void Promise.resolve(onSelect(threadId)).catch(() => undefined);
+    const action =
+      thread.status === "archived" ? onRestore(thread.threadId) : onSelect(thread.threadId);
+    void Promise.resolve(action).catch(() => undefined);
   };
 
   /** 完整键盘导航不依赖列表焦点；IME 组合期间 Enter 只确认候选，不打开会话。 */
@@ -217,12 +223,15 @@ function ConversationSearchSession({
     }
     if (event.key === "Enter" && results[activeIndex] !== undefined) {
       event.preventDefault();
-      selectResult(results[activeIndex].threadId);
+      selectResult(results[activeIndex]);
     }
   };
 
   return (
-    <DialogContent className="ja-conversation-search-dialog">
+    <DialogContent
+      className="ja-conversation-search-dialog"
+      overlayClassName="ja-conversation-search-overlay"
+    >
       <DialogTitle className="ja-visually-hidden">搜索对话</DialogTitle>
       <DialogDescription className="ja-visually-hidden">搜索当前工作区的会话标题</DialogDescription>
       <div className="ja-conversation-search-field">
@@ -269,10 +278,16 @@ function ConversationSearchSession({
               data-active={activeIndex === index || undefined}
               data-search-result-index={index}
               onPointerMove={() => setActiveIndex(index)}
-              onClick={() => selectResult(thread.threadId)}
+              aria-label={thread.status === "archived" ? `恢复并打开：${title}` : `打开：${title}`}
+              onClick={() => selectResult(thread)}
             >
-              <Clock3 aria-hidden="true" />
+              {thread.status === "archived" ? (
+                <ArchiveRestore aria-hidden="true" />
+              ) : (
+                <Clock3 aria-hidden="true" />
+              )}
               <span>{highlightedTitle(title, query)}</span>
+              {thread.status === "archived" ? <small>已归档 · 恢复并打开</small> : null}
             </button>
           );
         })}

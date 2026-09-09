@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.infrastructure.persistence.transaction;
 
 import io.github.kongweiguang.ja.foundation.error.StorageException;
+import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository.InputQueueException;
 
 import org.noear.solon.data.annotation.Transaction;
 import org.noear.solon.data.tran.TranPolicy;
@@ -31,6 +32,9 @@ final class PersistenceTransactions {
             TranUtils.execute(REQUIRED, () -> result.set(supplier.get()));
             return result.get();
         } catch (StorageException failure) {
+            throw failure;
+        } catch (InputQueueException failure) {
+            // 队列容量、接收门和条目 CAS 是公开业务失败，事务桥不得把它们降级成不透明存储错误。
             throw failure;
         } catch (Throwable failure) {
             throw new StorageException(StorageException.Code.TRANSACTION,

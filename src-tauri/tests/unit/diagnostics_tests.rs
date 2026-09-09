@@ -28,7 +28,7 @@ impl Write for SharedWriter {
     }
 }
 
-/// 验证原生日志丢弃敏感载荷，只保留 Rust 白名单允许的 UI 故障码。
+/// 验证原生日志丢弃敏感载荷，只保留 Rust 白名单允许的 UI 故障码和有界指标字段。
 #[test]
 fn formatter_omits_native_payloads_and_keeps_only_allowlisted_ui_codes() {
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -54,11 +54,29 @@ fn formatter_omits_native_payloads_and_keeps_only_allowlisted_ui_codes() {
             tracing::Level::ERROR,
             message = %"prompt content must not pass"
         );
+        tracing::info!(
+            target: "ja.metrics.event_queue",
+            metric = "task_progress_coalesced_total",
+            count = 8_u64,
+            lane = "data",
+            task_thread_id = "thr_secret",
+            "runtime event queue metric"
+        );
+        tracing::info!(
+            target: "ja.metrics.event_queue",
+            metric = "unknown_metric",
+            count = 99_u64,
+            path = %r"C:\private\metric.txt",
+            "unknown runtime metric"
+        );
     });
     let rendered = String::from_utf8(output.lock().expect("test log sink poisoned").clone())
         .expect("formatter must emit UTF-8");
 
     assert!(rendered.contains("code=ui.react_error_boundary"));
+    assert!(rendered.contains("metric=task_progress_coalesced_total lane=data count=8"));
+    assert!(!rendered.contains("unknown_metric"));
+    assert!(!rendered.contains("thr_secret"));
     assert!(!rendered.contains("private"));
     assert!(!rendered.contains("print secret"));
     assert!(!rendered.contains("sensitive payload"));

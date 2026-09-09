@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.conversation.port.in.ThreadMetadataEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.out.AutomaticTitleUsagePort;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationSource;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
@@ -107,7 +108,8 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
     }
 
     /**
-     * 先验证首个成功回复和 placeholder 所有权，再抢占持久调用资格，避免无效付费请求。
+     * 先验证首个成功回复和 placeholder 所有权，再在 model start 前打开最新请求环境；Provider
+     * 身份必须先写入 durable claim 才能发送，因此解析与 dispatch 之间只保留这一个 no-replay 边界。
      */
     private void run(Request request, ThreadMetadataEventSink sink, Job job) {
         try {
@@ -118,19 +120,27 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
                 return;
             }
             String generationId = generationId(request.threadId(), request.turnId());
-            AutomaticTitleUsagePort.ClaimResult claimed = usage.claim(
-                    new AutomaticTitleUsagePort.GenerationClaim(
-                            generationId, request.threadId(), request.turnId(), request.runtime().providerId(),
-                            request.runtime().modelId(), request.runtime().configGeneration(), clock.instant()));
-            if (claimed != AutomaticTitleUsagePort.ClaimResult.ACQUIRED) {
-                job.completion().complete(null);
-                return;
+            try (AutomaticThreadTitleScheduler.RequestRuntime runtime =
+                         request.runtimeFactory().open(timeout)) {
+                ModelPort.ModelConfiguration configuration = runtime.configuration();
+                AutomaticTitleUsagePort.ClaimResult claimed = usage.claim(
+                        new AutomaticTitleUsagePort.GenerationClaim(
+                                generationId, request.threadId(), request.turnId(), configuration.providerId(),
+                                configuration.modelId(), configuration.configGeneration(), clock.instant()));
+                if (claimed != AutomaticTitleUsagePort.ClaimResult.ACQUIRED) {
+                    job.completion().complete(null);
+                    return;
+                }
+                TitleCandidate candidate = generate(request, configuration, job.cancellation());
+                usage.recordModelOutcome(candidate.outcome(generationId, clock.instant()));
+                if (!closed.get() && candidate.title() != null) {
+                    commitAndPublish(request.threadId(), candidate.title(), initial.get().thread().revision(), sink);
+                }
             }
-            TitleCandidate candidate = generate(request, job.cancellation());
-            usage.recordModelOutcome(candidate.outcome(generationId, clock.instant()));
-            if (!closed.get() && candidate.title() != null) {
-                commitAndPublish(request.threadId(), candidate.title(), initial.get().thread().revision(), sink);
-            }
+            job.completion().complete(null);
+        } catch (TurnRuntimeResolver.RuntimeMismatchException unavailable) {
+            LOGGER.debug("Automatic title skipped because its request environment is unavailable threadId={} turnId={}",
+                    request.threadId(), request.turnId());
             job.completion().complete(null);
         } catch (Throwable failure) {
             if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -143,12 +153,12 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
     }
 
     /**
-     * 标题只属于仍为 placeholder 且首个 Turn 身份匹配并已成功的 Thread。调度入口已冻结“本次
+     * 标题只属于仍为 placeholder 且首个 Turn 身份匹配并已成功的 Thread。调度入口已确定“本次
      * admission 产生短标题”的所有权，因此后续 Turn 可以先于低优先级 worker 准入，不能反向饿死首轮标题。
      */
     private static boolean eligible(ThreadSnapshot snapshot, String turnId, long terminalThreadRevision) {
         ThreadSummary thread = snapshot.thread();
-        if (thread.revision() < terminalThreadRevision || thread.preferences() == null
+        if (thread.revision() < terminalThreadRevision
             || thread.preferences().titleSource() != ThreadPreferences.TitleSource.PLACEHOLDER) {
             return false;
         }
@@ -158,11 +168,12 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
     }
 
     /**
-     * 使用冻结模型配置构造无 Tool、无续传、低输出请求，并在独立短期限内等待 Provider 结果。
+     * 使用发送前解析的模型配置构造无 Tool、无续传、低输出请求，并在独立短期限内等待 Provider 结果。
      */
-    private TitleCandidate generate(Request request, CancellationSource cancellation)
+    private TitleCandidate generate(Request request, ModelPort.ModelConfiguration source,
+                                    CancellationSource cancellation)
             throws InterruptedException {
-        ModelPort.ModelConfiguration configuration = titleConfiguration(request.configuration(), timeout);
+        ModelPort.ModelConfiguration configuration = titleConfiguration(source, timeout);
         ModelPort.ModelRequest modelRequest = new ModelPort.ModelRequest(
                 configuration,
                 new ModelPort.PromptPayload(SYSTEM_PROMPT, PROMPT_REVISION),
@@ -187,7 +198,7 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
     }
 
     /**
-     * 派生配置只收紧网络与输出预算，不改变 Provider、Model、凭据或冻结配置代际。
+     * 派生配置只收紧网络与输出预算，不改变安全点刚解析出的 Provider、Model、凭据或配置代际。
      */
     private static ModelPort.ModelConfiguration titleConfiguration(
             ModelPort.ModelConfiguration source, Duration timeout) {
@@ -197,8 +208,8 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
         ModelPort.GenerationOptions generation = new ModelPort.GenerationOptions(
                 null, null, maxOutput, null);
         return new ModelPort.ModelConfiguration(
-                source.providerId(), source.modelId(), source.configGeneration(), source.provider(),
-                source.api(), source.model(), source.baseUri(), source.apiKey(),
+                source.providerId(), source.modelId(), source.configGeneration(), source.api(),
+                source.model(), source.baseUri(), source.apiKey(),
                 minimum(source.connectTimeout(), timeout), minimum(source.requestTimeout(), timeout),
                 source.inputModalities(), generation);
     }
@@ -238,8 +249,7 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
         ThreadSummary committed = threads.readThread(threadId, null, 1)
                 .orElseThrow(() -> new IllegalStateException("automatic title commit disappeared"))
                 .thread();
-        if (committed.preferences() == null
-            || committed.preferences().titleSource() != ThreadPreferences.TitleSource.AUTO) {
+        if (committed.preferences().titleSource() != ThreadPreferences.TitleSource.AUTO) {
             throw new IllegalStateException("automatic title commit has inconsistent ownership");
         }
         Objects.requireNonNull(sink.publish(new ThreadMetadataEvent(

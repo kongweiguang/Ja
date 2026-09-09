@@ -12,6 +12,9 @@
 }
 
 .ja-composer {
+  --ja-composer-padding-block-start: 13px;
+  --ja-composer-padding-inline: 14px;
+  --ja-composer-suggestion-radius: 14px;
   position: sticky;
   z-index: 2;
   bottom: max(12px, env(safe-area-inset-bottom));
@@ -24,10 +27,8 @@
   border: 1px solid var(--ja-border-strong);
   border-radius: 20px;
   color: var(--ja-foreground);
-  background: var(--ja-surface-raised);
-  box-shadow:
-    0 1px 1px rgb(0 0 0 / 5%),
-    0 10px 28px rgb(0 0 0 / 12%);
+  background: var(--ja-composer);
+  box-shadow: var(--ja-shadow-md);
   transition:
     border-color 140ms var(--ja-ease-native),
     box-shadow 140ms var(--ja-ease-native),
@@ -38,7 +39,7 @@
 .ja-composer:focus-within {
   border-color: color-mix(in srgb, var(--ja-focus) 65%, var(--ja-border));
   box-shadow:
-    0 12px 30px rgb(0 0 0 / 13%),
+    var(--ja-shadow-md),
     0 0 0 3px color-mix(in srgb, var(--ja-focus) 18%, transparent);
 }
 
@@ -50,51 +51,850 @@
   opacity: 0.7;
 }
 
-.ja-composer__context {
-  position: relative;
-  z-index: 0;
+/* Context 是消息内容而非全局设置；横向轻量 Chip 让正文仍保持唯一输入焦点。 */
+.ja-composer-context-list {
   display: flex;
-  width: calc(100% - 48px);
   min-width: 0;
-  min-height: 44px;
+  max-height: 88px;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
-  margin: 0 24px -9px;
-  padding: 9px 17px 15px;
-  overflow: hidden;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
+}
+
+.ja-composer-context__chip {
+  display: inline-grid;
+  min-width: 0;
+  max-width: min(320px, 100%);
+  min-height: 36px;
+  grid-template-columns: 18px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 3px 3px 9px;
   border: 1px solid var(--ja-border);
-  border-bottom: 0;
-  border-radius: 18px 18px 0 0;
-  color: var(--ja-foreground-tertiary);
-  background: var(--ja-surface-muted);
-  font-size: var(--ja-text-caption-size);
-  line-height: var(--ja-line-caption);
+  border-radius: var(--ja-radius-selection);
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-surface-muted) 72%, var(--ja-surface-raised));
 }
 
-.ja-composer__context > span {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 5px;
-}
-
-.ja-composer__context > span:first-child {
-  max-width: min(44%, 18rem);
+.ja-composer-context__icon {
+  display: grid;
   color: var(--ja-foreground-muted);
-  font-weight: var(--ja-weight-medium);
+  place-items: center;
 }
 
-.ja-composer__context > span > span {
+.ja-composer-context__icon > svg,
+.ja-composer-context__remove > svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.7;
+}
+
+.ja-composer-context__copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.ja-composer-context__copy > strong,
+.ja-composer-context__copy > small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.ja-composer__context svg {
+.ja-composer-context__copy > strong {
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-control);
+}
+
+.ja-composer-context__copy > small {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-composer-context__remove {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground-tertiary);
+  background: transparent;
+  cursor: pointer;
+  place-items: center;
+  transition:
+    color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native),
+    transform 120ms var(--ja-ease-native);
+}
+
+.ja-composer-context__remove:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+
+.ja-composer-context__remove:active {
+  transform: scale(0.94);
+}
+
+.ja-composer-context__remove:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+/* 独立根类避免继承 App 壳遗留按钮规则；Workspace 引用只通过真实 Files 回调获得按钮语义。 */
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"] {
+  position: relative;
+  box-sizing: border-box;
+  width: 196px;
+  max-width: 100%;
+  height: 72px;
+  min-height: 72px;
+  flex: 0 0 auto;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 9px;
+  overflow: hidden;
+  padding: 8px 30px 8px 9px;
+  border-radius: var(--ja-radius-lg);
+  background: color-mix(in srgb, var(--ja-surface-muted) 88%, transparent);
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"][data-openable="true"] {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 0;
+}
+
+.ja-composer-context__open {
+  display: grid;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  grid-column: 1 / -1;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 8px 30px 8px 9px;
+  border: 0;
+  border-radius: inherit;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ja-composer-context__open:hover {
+  background: color-mix(in srgb, var(--ja-control-hover) 70%, transparent);
+}
+
+.ja-composer-context__open:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  .ja-composer-context__icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  background: var(--ja-control-hover);
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  .ja-composer-context__icon
+  > svg {
+  width: 18px;
+  height: 18px;
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  .ja-composer-context__copy {
+  gap: 3px;
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  .ja-composer-context__copy
+  > strong {
+  display: flex;
+  min-width: 0;
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  .ja-composer-context__copy
+  > strong
+  > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  .ja-composer-context__copy
+  > strong
+  > span:last-child:not(:first-child) {
+  flex: 0 0 auto;
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  > .ja-composer-context__remove {
+  position: absolute;
+  z-index: 1;
+  top: 4px;
+  right: 4px;
+  width: 24px;
+  height: 24px;
+  border: 1px solid color-mix(in srgb, var(--ja-border-strong) 70%, transparent);
+  border-radius: 50%;
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-surface-raised) 88%, transparent);
+  box-shadow: var(--ja-shadow-sm);
+  backdrop-filter: blur(10px) saturate(1.15);
+}
+
+.ja-composer-context-list:not(.is-compact)
+  .ja-composer-context__chip[data-reference-type="workspace"]
+  > .ja-composer-context__remove:hover {
+  color: var(--ja-danger);
+  background: var(--ja-surface-raised);
+}
+
+.ja-composer-context__chip[data-available="false"] {
+  border-color: color-mix(in srgb, var(--ja-warning) 42%, var(--ja-border));
+  color: var(--ja-foreground-muted);
+  background: color-mix(in srgb, var(--ja-warning) 7%, var(--ja-surface-raised));
+}
+
+.ja-composer-context-list.is-compact {
+  max-height: 40px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.ja-composer-context-list.is-compact .ja-composer-context__chip {
+  min-height: 30px;
+  grid-template-columns: 15px minmax(0, 1fr);
+  padding: 3px 8px;
+}
+
+/* 建议面板锚定整个 Composer 向上展开，不参与正文布局，也不挂载任何重型 Workbench。 */
+.ja-composer-suggestions {
+  position: absolute;
+  z-index: 12;
+  inset-inline: 0;
+  bottom: calc(100% + 8px);
+  display: grid;
+  max-height: min(var(--ja-composer-suggestion-space, 52vh), 420px);
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--ja-border-strong) 88%, transparent);
+  border-radius: var(--ja-composer-suggestion-radius);
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-surface-raised) 88%, transparent);
+  box-shadow: var(--ja-shadow-floating);
+  backdrop-filter: blur(18px) saturate(1.18);
+  transform-origin: center bottom;
+  animation: ja-composer-suggestions-enter 160ms var(--ja-ease-native);
+}
+
+.ja-composer-suggestions__list {
+  min-width: 0;
+  padding: 5px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
+}
+
+.ja-composer-suggestions__group + .ja-composer-suggestions__group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--ja-border);
+}
+
+.ja-composer-suggestions__group-label {
+  padding: 5px 9px 3px;
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-caption);
+  letter-spacing: 0;
+}
+
+.ja-composer-suggestions__list [role="option"] {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: var(--ja-radius-lg);
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+
+.ja-composer-suggestions__list [role="option"].is-active {
+  background: var(--ja-control-hover);
+}
+
+.ja-composer-suggestions__list [role="option"][aria-disabled="true"] {
+  color: var(--ja-foreground-tertiary);
+}
+
+.ja-composer-suggestions__icon {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  color: var(--ja-foreground-muted);
+  place-items: center;
+}
+
+.ja-composer-suggestions__icon > svg,
+.ja-composer-suggestions__empty button > svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.65;
+}
+
+.ja-composer-suggestions__copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.ja-composer-suggestions__copy > strong,
+.ja-composer-suggestions__copy > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-suggestions__copy > strong {
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-control);
+}
+
+.ja-composer-suggestions__copy > small,
+.ja-composer-suggestions__hint {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-composer-suggestions kbd {
+  max-width: 140px;
+  overflow: hidden;
+  padding: 2px 6px;
+  border: 1px solid var(--ja-border);
+  border-radius: 7px;
+  color: var(--ja-foreground-tertiary);
+  background: var(--ja-surface-muted);
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-suggestions__loading {
+  display: grid;
+  gap: 7px;
+  padding: 5px;
+}
+
+.ja-composer-suggestions__loading > span[aria-hidden="true"] {
+  display: block;
+  height: 36px;
+  border-radius: var(--ja-radius-lg);
+  background: linear-gradient(
+    100deg,
+    var(--ja-surface-muted) 20%,
+    var(--ja-control-hover) 42%,
+    var(--ja-surface-muted) 64%
+  );
+  background-size: 220% 100%;
+  animation: ja-composer-skeleton 1.15s ease-in-out infinite;
+}
+
+.ja-composer-suggestions__empty {
+  display: grid;
+  min-height: 96px;
+  align-content: center;
+  justify-items: start;
+  gap: 4px;
+  padding: 14px;
+  color: var(--ja-foreground-muted);
+}
+
+.ja-composer-suggestions__empty > strong {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-medium);
+}
+
+.ja-composer-suggestions__empty > span {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-composer-suggestions__empty > button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  padding: 5px 9px;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground);
+  background: var(--ja-control);
+  font: inherit;
+  cursor: pointer;
+}
+
+.ja-composer-suggestions__empty > button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-composer-suggestions__hint {
+  padding: 5px 12px 7px;
+  border-top: 1px solid var(--ja-border);
+}
+
+@keyframes ja-composer-suggestions-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@keyframes ja-composer-skeleton {
+  to {
+    background-position: -220% 0;
+  }
+}
+
+/* 内联 command 只是当前 textarea 的编辑上下文，不创建嵌套表单或第二块输入卡片。 */
+.ja-composer__inline-command {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 3px 2px 8px;
+  border: 1px solid var(--ja-border);
+  border-radius: 8px;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface-muted);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-medium);
+}
+
+.ja-composer__inline-command > svg,
+.ja-composer__inline-command > button > svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  stroke-width: 1.7;
+}
+
+.ja-composer__inline-command > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer__inline-command > button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ja-foreground-tertiary);
+  background: transparent;
+  place-items: center;
+  cursor: pointer;
+}
+
+.ja-composer__inline-command > button:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+
+.ja-composer__inline-command > button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+/* 队列与输入区共享外轮廓，内部只用一条低对比分隔解释“等待处理”这一层级。 */
+.ja-composer-queue {
+  display: grid;
+  max-height: 152px;
+  min-width: 0;
+  gap: 0;
+  margin: calc(-1 * var(--ja-composer-padding-block-start))
+    calc(-1 * var(--ja-composer-padding-inline)) 0;
+  padding: 4px 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--ja-border);
+  border-radius: 19px 19px 0 0;
+  background: color-mix(in srgb, var(--ja-surface-muted) 62%, var(--ja-surface-raised));
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  list-style: none;
+  overscroll-behavior-y: contain;
+}
+
+.ja-composer-queue__item {
+  display: grid;
+  min-width: 0;
+  min-height: 48px;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 5px;
+  border-radius: var(--ja-radius-selection);
+  transition:
+    opacity 160ms var(--ja-ease-native),
+    transform 160ms var(--ja-ease-native),
+    background-color 160ms var(--ja-ease-native);
+}
+
+.ja-composer-queue__item + .ja-composer-queue__item {
+  border-top: 1px solid color-mix(in srgb, var(--ja-border) 72%, transparent);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.ja-composer-queue__item[data-kind="steering"] {
+  background: color-mix(in srgb, var(--ja-accent-soft) 42%, transparent);
+}
+
+.ja-composer-queue__item[data-state="pending"],
+.ja-composer-queue__item[data-state="busy"] {
+  opacity: 0.68;
+}
+
+.ja-composer-queue__item[data-state="error"] {
+  background: color-mix(in srgb, var(--ja-danger) 7%, transparent);
+}
+
+.ja-composer-queue__leading {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  color: var(--ja-foreground-tertiary);
+}
+
+.ja-composer-queue__leading > svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.65;
+}
+
+.ja-composer-queue__copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.ja-composer-queue__copy > span,
+.ja-composer-queue__copy > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-queue__copy > span {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-control);
+}
+
+.ja-composer-queue__copy > small,
+.ja-composer-queue__edit-error {
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-composer-queue__item[data-state="pending"] .ja-composer-queue__copy > small {
+  color: var(--ja-foreground-tertiary);
+}
+
+/* 附件摘要嵌入所属消息而不制造第二层卡片；窄窗时自然换行并保留扩展名 Tooltip。 */
+.ja-composer-queue-attachments {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ja-composer-queue-attachments > li {
+  display: grid;
+  max-width: min(220px, 100%);
+  min-width: 0;
+  min-height: 26px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 4px 2px 6px;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground-muted);
+  background: var(--ja-control);
+}
+
+.ja-composer-queue-attachment__preview {
+  display: grid;
+  min-width: 0;
+  height: 24px;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 4px;
+  align-items: center;
+  padding: 0 2px;
+  border: 0;
+  border-radius: var(--ja-radius-md);
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ja-composer-queue-attachment__preview[data-previewable="false"] {
+  cursor: default;
+}
+
+.ja-composer-queue-attachment__preview > svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.65;
+}
+
+.ja-composer-queue-attachment__preview > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-caption-size);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-queue-attachments > li > small {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  white-space: nowrap;
+}
+
+.ja-composer-queue-attachments > li > button:not(.ja-composer-queue-attachment__preview) {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+  place-items: center;
+}
+
+.ja-composer-queue-attachments > li > button:hover:not(:disabled) {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+
+.ja-composer-queue-attachments > li > button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-composer-queue-attachments > li > button:not(.ja-composer-queue-attachment__preview):disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.ja-composer-queue-attachments > li > button:not(.ja-composer-queue-attachment__preview) > svg {
   width: 13px;
   height: 13px;
-  flex: 0 0 auto;
-  stroke-width: 1.8;
+}
+
+.ja-composer-queue__actions,
+.ja-composer-queue__edit-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+}
+
+.ja-composer-queue__prioritize,
+.ja-composer-queue__more,
+.ja-composer-queue__icon-button,
+.ja-composer-queue__edit-actions button {
+  min-width: 28px;
+  min-height: 28px;
+  border: 1px solid transparent;
+  border-radius: var(--ja-radius-lg);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native),
+    transform 120ms var(--ja-ease-native);
+}
+
+.ja-composer-queue__prioritize {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 3px 7px;
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-medium);
+  white-space: nowrap;
+}
+
+.ja-composer-queue__more,
+.ja-composer-queue__icon-button,
+.ja-composer-queue__edit-actions button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  place-items: center;
+}
+
+.ja-composer-queue__prioritize > svg,
+.ja-composer-queue__more > svg,
+.ja-composer-queue__icon-button svg,
+.ja-composer-queue__edit-actions svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.7;
+}
+
+.ja-composer-queue__prioritize:hover:not(:disabled),
+.ja-composer-queue__more:hover:not(:disabled),
+.ja-composer-queue__icon-button:hover:not(:disabled),
+.ja-composer-queue__edit-actions button:hover:not(:disabled) {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+
+.ja-composer-queue__icon-button:hover:not(:disabled) {
+  color: var(--ja-danger);
+}
+
+.ja-composer-queue__prioritize:active:not(:disabled),
+.ja-composer-queue__more:active:not(:disabled),
+.ja-composer-queue__icon-button:active:not(:disabled),
+.ja-composer-queue__edit-actions button:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.ja-composer-queue__prioritize:focus-visible,
+.ja-composer-queue__more:focus-visible,
+.ja-composer-queue__icon-button:focus-visible,
+.ja-composer-queue__edit-actions button:focus-visible,
+.ja-composer-queue__editor textarea:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-composer-queue__prioritize:disabled,
+.ja-composer-queue__more:disabled,
+.ja-composer-queue__icon-button:disabled,
+.ja-composer-queue__edit-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+
+.ja-composer-queue__item[data-kind="steering"] .ja-composer-queue__prioritize:disabled {
+  color: var(--ja-accent);
+  opacity: 0.72;
+}
+
+.ja-composer-queue__editor {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.ja-composer-queue__editor textarea {
+  width: 100%;
+  min-height: 32px;
+  max-height: 72px;
+  resize: none;
+  padding: 5px 7px;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
+  outline: 0;
+  color: var(--ja-foreground);
+  background: var(--ja-surface-raised);
+  font: inherit;
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+}
+
+.ja-composer-queue__edit-error {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-queue__menu {
+  min-width: 9.5rem;
+}
+
+.ja-composer-queue__menu [role="menuitem"] {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ja-composer-queue__menu [role="menuitem"] > svg {
+  width: 15px;
+  height: 15px;
 }
 
 .ja-composer__input {
@@ -127,55 +927,262 @@
 
 .ja-composer__attachments {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  height: 80px;
+  min-width: 0;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
   margin: 0;
-  padding: 0;
+  padding: 0 2px 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
   list-style: none;
+  overscroll-behavior-x: contain;
 }
 
-.ja-composer__attachments li {
+.ja-composer-attachment {
+  position: relative;
   display: grid;
-  min-width: 0;
-  max-width: min(100%, 320px);
-  min-height: 30px;
-  grid-template-columns: 14px minmax(0, 1fr) auto 26px;
+  box-sizing: border-box;
+  width: 196px;
+  height: 72px;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
-  gap: 6px;
-  padding: 2px 2px 2px 8px;
+  overflow: hidden;
+  padding: 0;
   border: 1px solid var(--ja-border);
   border-radius: 10px;
-  background: var(--ja-surface-muted);
+  background: color-mix(in srgb, var(--ja-surface-muted) 88%, transparent);
+  transition:
+    border-color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native),
+    opacity 120ms var(--ja-ease-native);
 }
 
-.ja-composer__attachments li > svg {
+.ja-composer-attachment[data-media-kind="image"][data-has-thumbnail="true"] {
+  width: 72px;
+}
+
+.ja-composer-attachment[data-state="failed"] {
+  border-color: color-mix(in srgb, var(--ja-danger) 42%, var(--ja-border));
+}
+
+.ja-composer-attachment[data-state="removing"] {
+  opacity: 0.64;
+}
+
+.ja-composer-attachment__content {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 8px 30px 8px 9px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+
+button.ja-composer-attachment__content.is-previewable {
+  cursor: pointer;
+}
+
+button.ja-composer-attachment__content.is-previewable:hover {
+  background: var(--ja-control-hover);
+}
+
+button.ja-composer-attachment__content.is-previewable:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -3px;
+}
+
+.ja-composer-attachment__visual {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  overflow: hidden;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-control-hover);
+}
+
+.ja-composer-attachment__visual > img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ja-composer-attachment__visual > svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.7;
+}
+
+.ja-composer-attachment[data-media-kind="image"][data-has-thumbnail="true"]
+  .ja-composer-attachment__content {
+  grid-template-columns: 1fr;
+  padding: 0;
+}
+
+.ja-composer-attachment[data-media-kind="image"][data-has-thumbnail="true"]
+  .ja-composer-attachment__visual {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+.ja-composer-attachment[data-media-kind="image"][data-has-thumbnail="true"]
+  .ja-composer-attachment__copy {
+  display: none;
+}
+
+.ja-composer-attachment__copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.ja-composer-attachment__name {
+  display: flex;
+  min-width: 0;
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-control);
+}
+
+.ja-composer-attachment__name > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-attachment__name > span:last-child:not(:first-child) {
+  flex: 0 0 auto;
+}
+
+.ja-composer-attachment__copy small {
+  overflow: hidden;
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-composer-attachment__remove {
+  position: absolute;
+  z-index: 1;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--ja-border-strong) 70%, transparent);
+  border-radius: 50%;
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-surface-raised) 88%, transparent);
+  box-shadow: var(--ja-shadow-sm);
+  backdrop-filter: blur(10px) saturate(1.15);
+}
+
+.ja-composer-attachment__remove:hover:not(:disabled) {
+  color: var(--ja-danger);
+  background: var(--ja-surface-raised);
+}
+
+.ja-composer-attachment__remove:focus-visible,
+.ja-composer-attachment__retry:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-composer-attachment__remove svg {
+  width: 12px;
+  height: 12px;
+}
+
+.ja-composer-attachment__retry {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  min-height: 24px;
+  padding: 2px 7px;
+  border: 1px solid var(--ja-border);
+  border-radius: 8px;
+  color: var(--ja-foreground);
+  background: var(--ja-surface-raised);
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  cursor: pointer;
+}
+
+.ja-composer-attachment__progress {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    var(--ja-accent) var(--ja-attachment-progress),
+    transparent var(--ja-attachment-progress)
+  );
+}
+
+.ja-composer-attachment__spinner {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
   width: 14px;
   height: 14px;
   color: var(--ja-foreground-muted);
 }
 
-.ja-composer__attachments li > span {
-  overflow: hidden;
-  font-size: var(--ja-text-control-size);
-  line-height: var(--ja-line-control);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.ja-composer__drop-indicator {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  display: grid;
+  pointer-events: none;
+  place-items: center;
+  border: 1px solid var(--ja-accent);
+  border-radius: inherit;
+  color: var(--ja-accent);
+  background: color-mix(in srgb, var(--ja-surface-raised) 82%, transparent);
+  backdrop-filter: blur(14px) saturate(1.1);
 }
 
-.ja-composer__attachments small {
-  color: var(--ja-foreground-tertiary);
-  font-size: var(--ja-text-caption-size);
-  white-space: nowrap;
+.ja-composer__drop-indicator svg {
+  width: 24px;
+  height: 24px;
+  stroke-width: 1.7;
 }
 
-.ja-composer__attachments button {
-  width: 26px;
-  height: 26px;
+@supports not (backdrop-filter: blur(1px)) {
+  .ja-composer-suggestions,
+  .ja-composer-attachment__remove,
+  .ja-composer__drop-indicator {
+    background: var(--ja-surface-raised);
+  }
 }
 
-.ja-composer__attachments button svg {
-  width: 13px;
-  height: 13px;
+@media (prefers-contrast: more) {
+  .ja-composer-suggestions,
+  .ja-composer-context__chip,
+  .ja-composer-attachment__remove,
+  .ja-composer__drop-indicator {
+    border-color: var(--ja-foreground);
+    background: var(--ja-surface-raised);
+    backdrop-filter: none;
+  }
 }
 
 .ja-composer__toolbar {
@@ -310,11 +1317,10 @@
 }
 
 .ja-composer__access-select {
+  width: fit-content;
+  flex: 0 0 auto;
+  gap: 4px;
   color: var(--ja-warning);
-}
-
-.ja-composer__queue-select {
-  max-width: 112px !important;
 }
 
 .ja-composer__model-trigger {
@@ -499,9 +1505,18 @@
 }
 
 .ja-composer__action-button.is-cancel {
-  color: #fff;
+  color: var(--ja-on-accent);
   background: var(--ja-danger);
   box-shadow: 0 2px 6px color-mix(in srgb, var(--ja-danger) 24%, transparent);
+}
+
+/* 中断态只保留一行事实和两项真实动作，不把执行游标或恢复诊断暴露给用户。 */
+.ja-composer__interruption {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-caption);
+  white-space: nowrap;
 }
 
 .ja-composer__add-button:disabled,
@@ -542,17 +1557,11 @@
   }
 
   .ja-composer {
+    --ja-composer-padding-block-start: 11px;
+    --ja-composer-padding-inline: 12px;
     bottom: max(8px, env(safe-area-inset-bottom));
     padding: 11px 12px 10px;
     border-radius: 18px;
-  }
-
-  .ja-composer__context {
-    width: calc(100% - 32px);
-    gap: 8px;
-    margin-inline: 16px;
-    padding-inline: 13px;
-    border-radius: 16px 16px 0 0;
   }
 
   .ja-composer__toolbar {
@@ -574,9 +1583,38 @@
   }
 }
 
+@media (max-width: 620px) {
+  .ja-composer-queue__prioritize {
+    width: 28px;
+    padding: 0;
+  }
+
+  .ja-composer-queue__prioritize > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
 @media (forced-colors: active) {
   .ja-composer,
-  .ja-composer__attachments li,
+  .ja-composer-suggestions,
+  .ja-composer-suggestions__list [role="option"],
+  .ja-composer-suggestions__empty > button,
+  .ja-composer-context__chip,
+  .ja-composer-queue,
+  .ja-composer-queue__item,
+  .ja-composer-queue__prioritize,
+  .ja-composer-queue__more,
+  .ja-composer-queue__icon-button,
+  .ja-composer-queue__editor textarea,
+  .ja-composer-attachment,
+  .ja-composer-attachment__remove,
+  .ja-composer-attachment__retry,
+  .ja-composer__drop-indicator,
   .ja-composer .ja-select-trigger,
   .ja-composer__model-trigger,
   .ja-context-usage {
@@ -595,10 +1633,50 @@
     color: HighlightText;
     background: Highlight;
   }
+
+  .ja-composer-suggestions__list [role="option"].is-active {
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  .ja-composer-suggestions__list [role="option"][aria-disabled="true"] {
+    color: GrayText;
+  }
+
+  .ja-composer-queue__item[data-kind="steering"] {
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  .ja-composer-queue__prioritize:focus-visible,
+  .ja-composer-queue__more:focus-visible,
+  .ja-composer-queue__icon-button:focus-visible,
+  .ja-composer-queue__edit-actions button:focus-visible,
+  .ja-composer-queue__editor textarea:focus-visible {
+    outline-color: Highlight;
+  }
+
+  .ja-composer-attachment__progress {
+    background: linear-gradient(
+      90deg,
+      Highlight var(--ja-attachment-progress),
+      Canvas var(--ja-attachment-progress)
+    );
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .ja-composer,
+  .ja-composer-suggestions,
+  .ja-composer-suggestions__loading > span[aria-hidden="true"],
+  .ja-composer-context__chip > button,
+  .ja-composer-queue__item,
+  .ja-composer-queue__prioritize,
+  .ja-composer-queue__more,
+  .ja-composer-queue__icon-button,
+  .ja-composer-queue__edit-actions button,
+  .ja-composer-attachment,
+  .ja-composer-attachment__content,
   .ja-composer__spin,
   .ja-composer__add-button,
   .ja-composer__action-button,

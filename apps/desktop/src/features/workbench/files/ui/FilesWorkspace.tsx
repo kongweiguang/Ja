@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
-import { Files, Search, X } from "lucide-react";
+import { Files, X } from "lucide-react";
 import { lazy, Suspense, useCallback, useLayoutEffect, useRef, type ReactElement } from "react";
 import { EmptyState, IconButton, LoadingState } from "@/shared/ui/primitives";
 import { FileTree } from "./FileTree";
@@ -47,17 +47,31 @@ function revisionKey(revision: FileRevision): string {
   );
 }
 
+/** 只统计当前权威树已载入的普通文件，避免把目录或未展开后代虚报为文件总量。 */
+function loadedFileCount(nodes: FilesWorkspaceViewProps["viewModel"]["nodes"]): number {
+  return nodes.reduce(
+    (total, node) =>
+      total +
+      (node.kind === "file" ? 1 : 0) +
+      (node.children === undefined ? 0 : loadedFileCount(node.children)),
+    0,
+  );
+}
+
 /**
  * 纯视图只消费 view model/actions；资源读取、保存、Watcher、Move、Trash 与 Drop 的
  * generation/事务规则全部留在唯一 controller，避免 JSX 形成第二个状态 owner。
  */
-export function FilesWorkspace({ viewModel, actions }: FilesWorkspaceViewProps): ReactElement {
+export function FilesWorkspace({
+  viewModel,
+  actions,
+  onAddToConversation,
+}: FilesWorkspaceViewProps): ReactElement {
   const {
     nodes,
     selectedPath,
     treeLoading,
     treeError,
-    mode,
     searchQuery,
     searchResults,
     searchSummary,
@@ -79,6 +93,7 @@ export function FilesWorkspace({ viewModel, actions }: FilesWorkspaceViewProps):
   } = viewModel;
   const editorTabsRef = useRef<HTMLDivElement>(null);
   const openPathsKey = openPaths.join("\u0000");
+  const fileCount = loadedFileCount(nodes);
 
   /** 让程序恢复的 Tab 保持可见，但不抢走编辑器键盘焦点。 */
   useLayoutEffect(() => {
@@ -105,32 +120,12 @@ export function FilesWorkspace({ viewModel, actions }: FilesWorkspaceViewProps):
   return (
     <section className="ja-files-workspace" aria-label="文件工作区">
       <div className="ja-files-workspace-toolbar">
-        <div className="ja-files-workspace-mode" role="tablist" aria-label="文件工作区视图">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === "files"}
-            className={mode === "files" ? "is-active" : ""}
-            onClick={actions.showFiles}
-          >
-            <Files aria-hidden="true" />
-            文件
-          </button>
-          {actions.showSearch === undefined ? null : (
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === "search"}
-              className={mode === "search" ? "is-active" : ""}
-              onClick={actions.showSearch}
-            >
-              <Search aria-hidden="true" />
-              搜索
-            </button>
-          )}
+        <div className="ja-files-workspace-heading">
+          <Files aria-hidden="true" />
+          <span>文件</span>
         </div>
         <span className="ja-files-workspace-count">
-          {openPaths.length > 0 ? `${openPaths.length} 个打开的文件` : ""}
+          {fileCount > 0 ? `${fileCount} 个文件` : ""}
         </span>
       </div>
       {mutationRecoveryRequired ? (
@@ -145,48 +140,52 @@ export function FilesWorkspace({ viewModel, actions }: FilesWorkspaceViewProps):
       <div
         className={`ja-files-workspace-body${openPaths.length === 0 ? " is-browser-only" : " has-open-document"}`}
       >
-        <aside
-          className="ja-files-workspace-explorer"
-          aria-label="工作区资源管理器"
-          hidden={mode !== "files"}
-        >
-          <FileTree
-            nodes={nodes}
-            selectedPath={selectedPath}
-            loading={treeLoading}
-            error={treeError}
-            onSelect={actions.selectNode}
-            onDirectoryToggle={actions.toggleDirectory}
-            onRetry={actions.retryTree}
-            onCreateFile={actions.createFile}
-            onCreateDirectory={actions.createDirectory}
-            onRename={actions.rename}
-            onMove={actions.move}
-            onTrash={actions.trash}
-            onRefresh={actions.refreshTree}
-            onNativeDropToken={actions.importDrop}
-            openTargets={openTargets}
-            onOpenTarget={actions.openTarget}
+        <aside className="ja-files-workspace-explorer" aria-label="工作区资源管理器">
+          <SearchPanel
+            query={searchQuery}
+            results={searchResults}
+            summary={searchSummary}
+            loading={searchLoading}
+            error={searchError}
+            onQueryChange={actions.changeSearchQuery}
+            onOpenResult={actions.openSearchResult}
+            onAddToConversation={
+              onAddToConversation === undefined
+                ? undefined
+                : (result) => onAddToConversation({ path: result.path, kind: "file" })
+            }
+            idleContent={
+              <FileTree
+                nodes={nodes}
+                selectedPath={selectedPath}
+                loading={treeLoading}
+                error={treeError}
+                onSelect={actions.selectNode}
+                onDirectoryToggle={actions.toggleDirectory}
+                onRetry={actions.retryTree}
+                onCreateFile={actions.createFile}
+                onCreateDirectory={actions.createDirectory}
+                onRename={actions.rename}
+                onMove={actions.move}
+                onTrash={actions.trash}
+                onRefresh={actions.refreshTree}
+                onAddToConversation={
+                  onAddToConversation === undefined
+                    ? undefined
+                    : (node) => onAddToConversation({ path: node.path, kind: node.kind })
+                }
+                onNativeDropToken={actions.importDrop}
+                openTargets={openTargets}
+                onOpenTarget={actions.openTarget}
+              />
+            }
           />
         </aside>
-        {mode === "search" ? (
-          <div className="ja-files-workspace-search">
-            <SearchPanel
-              query={searchQuery}
-              results={searchResults}
-              summary={searchSummary}
-              loading={searchLoading}
-              error={searchError}
-              onQueryChange={actions.changeSearchQuery}
-              onOpenResult={actions.openSearchResult}
-            />
-          </div>
-        ) : null}
         <div className="ja-files-workspace-editor">
           {openPaths.length === 0 ? (
             <EmptyState
               className="ja-files-workspace-empty"
-              title="从左侧文件树选择文件开始编辑。"
+              title="从右侧文件树选择文件开始编辑。"
             />
           ) : (
             <>
@@ -235,7 +234,12 @@ export function FilesWorkspace({ viewModel, actions }: FilesWorkspaceViewProps):
               {activeDocument === undefined ? (
                 <EmptyState className="ja-files-workspace-empty" title="选择一个打开的文件。" />
               ) : (
-                <div className="ja-files-editor-content">
+                <div
+                  className="ja-files-editor-content"
+                  data-document-read-only={activeDocument.readOnly}
+                  data-lifecycle-closing={lifecycleClosing}
+                  data-mutation-recovery-required={mutationRecoveryRequired}
+                >
                   <div className="ja-files-editor-status" data-status={activeDocument.status}>
                     <span>{statusLabel(activeDocument)}</span>
                     <span>{activeDocument.encoding}</span>

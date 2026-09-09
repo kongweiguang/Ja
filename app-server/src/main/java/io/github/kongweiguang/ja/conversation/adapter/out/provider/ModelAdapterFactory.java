@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.conversation.adapter.out.provider;
 
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.anthropic.AnthropicMessagesAdapter;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiChatCompletionsAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiResponsesAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ModelTransport;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.summary.HttpSummaryModel;
@@ -47,6 +48,7 @@ public final class ModelAdapterFactory implements ModelPort, SummaryModel.Factor
         return switch (configuration.api()) {
             case ANTHROPIC_MESSAGES -> new AnthropicMessagesAdapter(configuration, transport);
             case OPENAI_RESPONSES -> new OpenAiResponsesAdapter(configuration, transport);
+            case OPENAI_CHAT_COMPLETIONS -> new OpenAiChatCompletionsAdapter(configuration, transport);
         };
     }
 
@@ -59,11 +61,12 @@ public final class ModelAdapterFactory implements ModelPort, SummaryModel.Factor
         return switch (configuration.api()) {
             case ANTHROPIC_MESSAGES -> AnthropicMessagesAdapter.nativeAttachmentSupport();
             case OPENAI_RESPONSES -> OpenAiResponsesAdapter.nativeAttachmentSupport();
+            case OPENAI_CHAT_COMPLETIONS -> OpenAiChatCompletionsAdapter.nativeAttachmentSupport();
         };
     }
 
     /**
-     * 将请求作用域 HTTP Summary Adapter 绑定到精确冻结的 Turn 配置代际。
+     * 将请求作用域 HTTP Summary Adapter 绑定到本次请求精确解析的配置代际。
      */
     @Override
     public SummaryModel bind(SummaryModel.TurnBinding binding) {
@@ -76,16 +79,11 @@ public final class ModelAdapterFactory implements ModelPort, SummaryModel.Factor
      */
     @SuppressWarnings("PMD.CloseResource")
     @Override
-    public CompletionStage<InputTokenCount> countInputTokens(
+    public InputTokenEstimate estimateInputTokens(
             ModelRequest request, CancellationToken cancellationToken) {
         Objects.requireNonNull(request, "request");
-        ModelAdapter adapter = create(request.configuration());
-        try {
-            return adapter.countInputTokens(request, cancellationToken)
-                    .whenComplete((ignored, failure) -> adapter.close());
-        } catch (RuntimeException failure) {
-            adapter.close();
-            throw failure;
+        try (ModelAdapter adapter = create(request.configuration())) {
+            return adapter.estimateInputTokens(request, cancellationToken);
         }
     }
 

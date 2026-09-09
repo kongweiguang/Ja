@@ -15,6 +15,10 @@ pub const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_REVIEW_DIFF_LINES: usize = 20_000;
 /// 单个 Review snapshot 允许保留的最大文件数。
 pub const MAX_REVIEW_FILES: usize = 100_000;
+/// 交互式 Review snapshot 可物化的最大文件数；Git 解析上限不能替代 UI 资源预算。
+pub const MAX_REVIEW_SNAPSHOT_FILES: usize = 2_000;
+/// 交互式 Review snapshot 可预检通过的文件正文总量，超限时不读取 untracked 内容。
+pub const MAX_REVIEW_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 const MAX_REVISION_BYTES: usize = 256;
 const MAX_TARGET_ID_BYTES: usize = 256;
@@ -134,8 +138,9 @@ impl ReviewCatalogLimit {
 }
 
 /// 选择 Review snapshot 代表的当前 Git 状态或显式 Git 对象范围。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReviewSource {
+    Uncommitted,
     Unstaged,
     Staged,
     Branch { ref_id: ReviewRefId },
@@ -147,6 +152,15 @@ impl ReviewSource {
     pub const fn is_read_only(&self) -> bool {
         matches!(self, Self::Branch { .. } | Self::Commit { .. })
     }
+}
+
+/// 文件所属的 Git 比较层；聚合来源用它区分同一路径的 index 与 worktree 变更。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewFileLayer {
+    Staged,
+    Unstaged,
+    Untracked,
+    Comparison,
 }
 
 /// 选择一次 Review mutation 的范围；id 必须来自当前 revision。
@@ -217,6 +231,7 @@ pub struct ReviewHunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewFile {
     pub file_id: ReviewFileId,
+    pub layer: ReviewFileLayer,
     pub path: String,
     pub old_path: Option<String>,
     pub status: ReviewFileStatus,
@@ -225,8 +240,26 @@ pub struct ReviewFile {
     pub binary: bool,
     pub metadata_only: bool,
     pub hunks: Vec<ReviewHunk>,
+    pub(crate) diff_loaded: bool,
     pub(crate) patch: Vec<u8>,
     pub(crate) revision_evidence: Vec<u8>,
+    pub(crate) state_evidence: Vec<u8>,
+    pub(crate) worktree_evidence: Option<ReviewWorktreeEvidence>,
+}
+
+impl ReviewFile {
+    /// 树快照只保存选择身份与统计，按文件读取前不把“尚未加载”误报为真实截断。
+    pub(crate) const fn requires_diff_load(&self) -> bool {
+        !self.diff_loaded && !self.binary
+    }
+}
+
+/// cache freshness 使用的结构化 worktree 证据不进入 DTO；digest 只复用未变文件，写前仍全量重验。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewWorktreeEvidence {
+    pub(crate) digest: [u8; 32],
+    pub(crate) size: u64,
+    pub(crate) modified_unix_millis: u128,
 }
 
 /// Review header 使用的有界聚合统计。

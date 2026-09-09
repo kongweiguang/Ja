@@ -21,16 +21,13 @@ import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.foundation.json.JsonText;
 import io.github.kongweiguang.ja.foundation.json.JsonValue;
 import java.nio.file.Path;
-import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -38,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -47,7 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 覆盖独立于 Provider 的资源边界与生命周期，避免测试依赖 SDK 内部实现。 */
 final class McpRuntimeTest {
-    /** 验证手动遍历 Cursor 会保留全部页面并冻结稳定、确定的版本。 */
+    /** 验证手动遍历 Cursor 会保留全部页面并生成稳定、确定的版本。 */
     @Test
     void snapshotUsesCursorPagesAndStableNamespace() {
         FakeSession session = new FakeSession(Map.of(
@@ -58,16 +56,16 @@ final class McpRuntimeTest {
             McpGateway.McpSnapshot first = runtime.snapshot();
             McpGateway.McpSnapshot second = runtime.snapshot();
             assertEquals(first.revision(), second.revision());
-            assertEquals(List.of("<first>", "page-2", "<first>", "page-2"), session.cursors);
+            assertEquals(List.of("<first>", "page-2"), session.cursors);
             assertEquals(2, first.tools().size());
             assertEquals("mcp:local:read-file", first.tools().getFirst().spec().name());
             assertTrue(first.tools().get(1).spec().name().startsWith("mcp:local:write_file-"));
         }
     }
 
-    /** 验证 Turn Runtime 启用规范 Map 排序后，冻结的 workspace 版本仍然有效。 */
+    /** 验证 Runtime 启用规范 Map 排序后，请求级 workspace 版本仍然有效。 */
     @Test
-    void frozenSnapshotRevisionIgnoresMapperMapOrderingConfiguration() {
+    void requestSnapshotRevisionIgnoresMapperMapOrderingConfiguration() {
         ObjectMapper discoveryMapper = new ObjectMapper();
         McpGateway.McpTool tool = new McpGateway.McpTool(
                 "local",
@@ -84,14 +82,60 @@ final class McpRuntimeTest {
                                         .build())
                                 .build()));
         McpGateway.McpSnapshot snapshot = McpToolCatalog.snapshot(
-                List.of(tool), discoveryMapper, Instant.EPOCH);
+                List.of(tool), Map.of("local", definition("local")), discoveryMapper, Instant.EPOCH);
         ObjectMapper turnMapper = discoveryMapper.copy()
                 .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
 
-        assertEquals(snapshot, McpToolCatalog.validateSnapshot(snapshot, turnMapper, Set.of("local")));
+        assertEquals(snapshot, McpToolCatalog.validateSnapshot(
+                snapshot, turnMapper, Map.of("local", definition("local"))));
     }
 
-    /** 验证重复 Cursor 会被拒绝，并立即关闭对应服务 Session。 */
+    /** 缺失服务定义时不能伪造 revision，否则无法证明缓存 Tool 的真实传输与认证身份。 */
+    @Test
+    void snapshotRejectsMissingServerDefinition() {
+        McpGateway.McpTool tool = new McpGateway.McpTool(
+                "missing",
+                McpToolCatalog.encodeRemoteName("echo"),
+                new ToolSpec("mcp:missing:echo", "echo",
+                        JsonObjects.builder().putText("type", "object").build()));
+
+        IllegalArgumentException failure = assertThrows(
+                IllegalArgumentException.class,
+                () -> McpToolCatalog.snapshot(
+                        List.of(tool), Map.of(), new ObjectMapper(), Instant.EPOCH));
+
+        assertEquals("mcp_route_definition_missing", failure.getMessage());
+    }
+
+    /** 相同 server/tool/schema 切换私密启动语义时，definition、route 与 catalog revision 都必须变化。 */
+    @Test
+    void routeIdentityIncludesHashedServerDefinition() {
+        Path cwd = Path.of(".").toAbsolutePath().normalize();
+        McpServerDefinition first = McpServerDefinition.stdio(
+                "identity", List.of("fixture"), cwd, Map.of("TOKEN", "first-secret"),
+                List.of("2025-06-18"));
+        McpServerDefinition second = McpServerDefinition.stdio(
+                "identity", List.of("fixture"), cwd, Map.of("TOKEN", "second-secret"),
+                List.of("2025-06-18"));
+        FakeSession firstSession = oneToolSession("echo");
+        FakeSession secondSession = oneToolSession("echo");
+        try (McpRuntime firstRuntime = runtime(List.of(first), McpLimits.DEFAULT,
+                (ignored, ignoredDeadline) -> firstSession);
+             McpRuntime secondRuntime = runtime(List.of(second), McpLimits.DEFAULT,
+                     (ignored, ignoredDeadline) -> secondSession)) {
+            McpGateway.McpSnapshot firstSnapshot = firstRuntime.snapshot();
+            McpGateway.McpSnapshot secondSnapshot = secondRuntime.snapshot();
+            var firstRoute = firstRuntime.routeIdentities(firstSnapshot).values().iterator().next();
+            var secondRoute = secondRuntime.routeIdentities(secondSnapshot).values().iterator().next();
+
+            assertFalse(first.definitionRevision().equals(second.definitionRevision()));
+            assertFalse(firstRoute.routeHash().equals(secondRoute.routeHash()));
+            assertFalse(firstSnapshot.revision().equals(secondSnapshot.revision()));
+            assertFalse((firstRoute + " " + secondRoute).contains("secret"));
+        }
+    }
+
+    /** 验证重复 Cursor 会隔离对应服务并立即关闭其 Session。 */
     @Test
     void paginationLoopClosesServer() {
         FakeSession session = new FakeSession(Map.of(
@@ -99,13 +143,12 @@ final class McpRuntimeTest {
                 "again", new McpSession.ToolPage(List.of(tool("two")), "again")));
         try (McpRuntime runtime = runtime(
                 List.of(definition("loop")), McpLimits.DEFAULT, (ignored, ignoredDeadline) -> session)) {
-            IllegalStateException failure = assertThrows(IllegalStateException.class, runtime::snapshot);
-            assertEquals("mcp_cursor_loop_or_limit", failure.getMessage());
+            assertTrue(runtime.snapshot().tools().isEmpty());
             assertEquals(1, session.closeCount.get());
         }
     }
 
-    /** 验证 Tool 或 Schema 洪泛在部分目录暴露给 Turn 前失败关闭。 */
+    /** 验证 Tool 或 Schema 洪泛只隔离失败服务，不暴露部分目录。 */
     @Test
     void toolFloodIsRejectedAtomically() {
         McpLimits limits = limits(2, 1024 * 1024, Duration.ofSeconds(2));
@@ -113,7 +156,7 @@ final class McpRuntimeTest {
                 List.of(tool("one"), tool("two"), tool("three")), null)));
         try (McpRuntime runtime = runtime(
                 List.of(definition("flood")), limits, (ignored, ignoredDeadline) -> session)) {
-            assertEquals("mcp_tool_limit", assertThrows(IllegalStateException.class, runtime::snapshot).getMessage());
+            assertTrue(runtime.snapshot().tools().isEmpty());
             assertEquals(1, session.closeCount.get());
         }
     }
@@ -125,9 +168,61 @@ final class McpRuntimeTest {
                 List.of(tool("same"), tool("same")), null)));
         try (McpRuntime runtime = runtime(
                 List.of(definition("duplicate")), McpLimits.DEFAULT, (ignored, ignoredDeadline) -> session)) {
-            assertEquals(
-                    "mcp_remote_tool_conflict",
-                    assertThrows(IllegalStateException.class, runtime::snapshot).getMessage());
+            assertTrue(runtime.snapshot().tools().isEmpty());
+        }
+    }
+
+    /** 一个 MCP 目录失败时仍返回其它健康服务，避免拖垮内建 Tool 与完整请求。 */
+    @Test
+    void discoveryFailureIsIsolatedPerServer() {
+        FakeSession healthy = oneToolSession("healthy");
+        FakeSession broken = new FakeSession(Map.of());
+        McpSessionFactory factory = (definition, ignoredDeadline) ->
+                definition.id().equals("healthy") ? healthy : broken;
+        try (McpRuntime runtime = runtime(
+                List.of(definition("healthy"), definition("broken")), McpLimits.DEFAULT, factory)) {
+            McpGateway.McpSnapshot snapshot = runtime.snapshot();
+            assertEquals(1, snapshot.tools().size());
+            assertEquals("mcp:healthy:healthy", snapshot.tools().getFirst().spec().name());
+            assertEquals(0, healthy.closeCount.get());
+            assertEquals(1, broken.closeCount.get());
+        }
+    }
+
+    /** 原始 list_changed 只标脏；旧 batch 在调用前重拉并因 schema 变化稳定失败，绝不执行同名 Tool。 */
+    @Test
+    void dirtyDirectoryRejectsChangedRouteBeforeInvocation() throws Exception {
+        FakeSession session = oneToolSession("echo");
+        AtomicReference<Runnable> notifier = new AtomicReference<>();
+        McpSessionFactory factory = new McpSessionFactory() {
+            /** 兼容测试工厂的基础入口。 */
+            @Override
+            public McpSession open(McpServerDefinition definition, McpDeadline deadline) {
+                return session;
+            }
+
+            /** 捕获生产目录的无阻塞通知入口。 */
+            @Override
+            public McpSession open(
+                    McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged) {
+                notifier.set(toolsChanged);
+                return session;
+            }
+        };
+        try (McpRuntime runtime = runtime(List.of(definition("dynamic")), McpLimits.DEFAULT, factory)) {
+            McpGateway.McpSnapshot original = runtime.snapshot();
+            session.pages = Map.of("<first>", new McpSession.ToolPage(
+                    List.of(tool("echo", "changed")), null));
+            notifier.get().run();
+
+            McpGateway.McpResult result = runtime.invoke(
+                    original,
+                    invocation("stale-call", original.tools().getFirst().spec().name(), 0),
+                    CancellationToken.none()).toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            assertEquals(new JsonText("tool_binding_unavailable"), structuredMember(result, "category"));
+            assertEquals(0, session.callCount.get());
+            assertEquals(List.of("<first>", "<first>"), session.cursors);
         }
     }
 
@@ -258,12 +353,12 @@ final class McpRuntimeTest {
                 Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1));
         try (McpRuntime runtime = runtime(
                 List.of(definition("alpha"), definition("beta")), limits, factory, ticker)) {
-            IllegalStateException failure = assertThrows(IllegalStateException.class, runtime::snapshot);
-            assertEquals("mcp_discovery_timeout", failure.getMessage());
+            McpGateway.McpSnapshot partial = runtime.snapshot();
+            assertEquals(1, partial.tools().size());
 
             McpGateway.McpSnapshot recovered = runtime.snapshot();
             assertEquals(2, recovered.tools().size());
-            assertEquals(2, alphaOpens.get());
+            assertEquals(1, alphaOpens.get());
             assertEquals(2, betaOpens.get());
         }
     }
@@ -412,9 +507,11 @@ final class McpRuntimeTest {
                 calls.getAndIncrement() == 0 ? Duration.ofMillis(600) : Duration.ofMillis(500));
         McpLimits limits = lifecycleLimits(
                 Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1));
-        McpRuntime runtime = runtime(
-                List.of(definition("turn-deadline")), limits,
-                (ignored, ignoredDeadline) -> session, ticker);
+        McpDeadline deadline = McpDeadline.forTurn(
+                Instant.EPOCH.plusSeconds(1), Clock.fixed(Instant.EPOCH, ZoneOffset.UTC), ticker::read);
+        McpRuntime runtime = new McpRuntime(
+                List.of(definition("turn-deadline")), limits, new ObjectMapper(),
+                (ignored, ignoredDeadline) -> session, null, deadline);
         McpGateway.McpSnapshot snapshot = runtime.snapshot();
         String toolName = snapshot.tools().getFirst().spec().name();
 
@@ -426,12 +523,12 @@ final class McpRuntimeTest {
                 .toCompletableFuture().get(1, TimeUnit.SECONDS);
         assertEquals(ToolOutcome.SUCCEEDED, first.outcome());
         assertEquals(ToolOutcome.FAILED, second.outcome());
-        assertEquals(new JsonText("timeout"), structuredMember(second, "category"));
+        assertEquals(new JsonText("cleanup_failure"), structuredMember(second, "category"));
         assertEquals(2, calls.get());
-        runtime.close();
+        assertTrue(suppressedMessages(captureClose(runtime)).contains("mcp_session_close_timeout"));
     }
 
-    /** 验证初始化、冻结目录访问、调用和清理共同消耗一个不可变 Turn 边界。 */
+    /** 验证初始化、请求级目录访问、调用和清理共同消耗原始绝对 Deadline。 */
     @Test
     void initializeAndInvokeShareAbsoluteTurnDeadline() throws Exception {
         FakeTicker ticker = new FakeTicker();
@@ -444,35 +541,35 @@ final class McpRuntimeTest {
         ObjectMapper mapper = new ObjectMapper()
                 .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
         String localName = "mcp:turn-wide:remote";
-        McpGateway.McpSnapshot frozen = McpRuntime.catalogSnapshot(
+        McpGateway.McpSnapshot requestSnapshot = McpRuntime.catalogSnapshot(
                 List.of(new McpGateway.McpTool(
                         "turn-wide",
-                        Base64.getUrlEncoder().withoutPadding()
-                                .encodeToString("remote".getBytes(StandardCharsets.UTF_8)),
+                        McpToolCatalog.encodeRemoteName("remote"),
                         new ToolSpec(
                                 localName,
                                 "turn-wide fixture",
                                 JsonObjects.builder().putText("type", "object")
                                         .putBoolean("additionalProperties", false).build()))),
-                mapper,
+                List.of(definition("turn-wide")), mapper,
                 Instant.EPOCH);
         McpSessionFactory factory = (ignored, admittedDeadline) -> {
             session.bindDeadline(admittedDeadline);
             return session;
         };
         McpRuntime runtime = new McpRuntime(
-                List.of(definition("turn-wide")), limits, mapper, factory, frozen, deadline);
+                List.of(definition("turn-wide")), limits, mapper, factory, requestSnapshot, deadline);
 
         runtime.initializeSessions();
-        assertEquals(frozen, runtime.snapshot());
+        assertEquals(requestSnapshot, runtime.snapshot());
         ticker.advance(Duration.ofMillis(500));
         McpGateway.McpResult result = runtime.invoke(
-                        frozen, invocation("cross-phase", localName, 0), CancellationToken.none())
+                        requestSnapshot, invocation("cross-phase", localName, 0), CancellationToken.none())
                 .toCompletableFuture().get(1, TimeUnit.SECONDS);
         assertEquals(ToolOutcome.FAILED, result.outcome());
         assertEquals(new JsonText("cleanup_failure"), structuredMember(result, "category"));
         assertEquals(Duration.ofMillis(1_100).toNanos(), ticker.read());
         assertEquals(1L, session.callEntered.getCount());
+        assertTrue(session.cursors.isEmpty());
         assertTrue(session.closeEntered.await(1, TimeUnit.SECONDS));
         assertEquals(1, session.closeCount.get());
         assertEquals(List.of(deadline.absoluteNanos(), deadline.absoluteNanos()),
@@ -515,7 +612,7 @@ final class McpRuntimeTest {
                 id, List.of("fixture"), Path.of(".").toAbsolutePath().normalize(), Map.of(), List.of("2025-06-18"));
     }
 
-    /** 使用冻结的本地名称与有序模型序号构造一次调用。 */
+    /** 使用请求级本地名称与有序模型序号构造一次调用。 */
     private static McpGateway.McpInvocation invocation(String callId, String name, int ordinal) {
         return new McpGateway.McpInvocation(
                 callId, name, JsonObjects.builder().putText("value", "ok").build(), ordinal);
@@ -525,6 +622,13 @@ final class McpRuntimeTest {
     private static McpSession.RemoteTool tool(String name) {
         return new McpSession.RemoteTool(name, "fixture tool", JsonObjects.builder()
                 .putText("type", "object").putBoolean("additionalProperties", false).build());
+    }
+
+    /** 创建带显式 schema 标记的 Tool，用于证明同名路由变化也会失败关闭。 */
+    private static McpSession.RemoteTool tool(String name, String marker) {
+        return new McpSession.RemoteTool(name, "fixture tool", JsonObjects.builder()
+                .putText("type", "object").putText("title", marker)
+                .putBoolean("additionalProperties", false).build());
     }
 
     /** 捕获稳定的 Runtime 关闭结果，以便确定性断言并发调用方。 */
@@ -604,11 +708,12 @@ final class McpRuntimeTest {
 
     /** 确定性伪实现记录 Cursor、并发、关闭、延迟及结果行为。 */
     private static final class FakeSession implements McpSession {
-        private final Map<String, ToolPage> pages;
+        private volatile Map<String, ToolPage> pages;
         private final List<String> cursors = new CopyOnWriteArrayList<>();
         private final AtomicInteger closeCount = new AtomicInteger();
         private final AtomicInteger active = new AtomicInteger();
         private final AtomicInteger maximumActive = new AtomicInteger();
+        private final AtomicInteger callCount = new AtomicInteger();
         private final AtomicBoolean callVirtual = new AtomicBoolean();
         private final AtomicBoolean closeVirtual = new AtomicBoolean();
         private final CountDownLatch callEntered = new CountDownLatch(1);
@@ -657,6 +762,7 @@ final class McpRuntimeTest {
         @Override
         public RemoteResult call(String toolName, JsonObject arguments) {
             recordDeadline();
+            callCount.incrementAndGet();
             callVirtual.set(Thread.currentThread().isVirtual());
             int current = active.incrementAndGet();
             activeThread = Thread.currentThread();

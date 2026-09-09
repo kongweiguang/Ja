@@ -13,7 +13,7 @@ import {
 } from "@/api/tauri/settings";
 
 const CONFIG = {
-  schema_version: 4,
+  schema_version: 1,
   config_revision: 7,
   default_access_mode: "approval_required",
   default_provider_id: "provider_openai",
@@ -23,7 +23,6 @@ const CONFIG = {
     {
       provider_id: "provider_openai",
       name: "OpenAI",
-      provider: "openai",
       api: "openai_responses",
       base_url: "https://api.openai.com/v1",
       credential_id: "cred_openai",
@@ -68,7 +67,7 @@ function readResult(): ConfigReadResult {
 /** 生成 UI 文档时只增加展示偏好和脱敏凭据状态。 */
 function uiDocument(): SettingsDocument {
   return {
-    schemaVersion: 4,
+    schemaVersion: 1,
     revision: 7,
     theme: "system",
     defaultAccessMode: "approval_required",
@@ -81,7 +80,6 @@ function uiDocument(): SettingsDocument {
       {
         providerId: "provider_openai",
         name: "OpenAI",
-        provider: "openai",
         api: "openai_responses",
         baseUrl: "https://api.openai.com/v1",
         credentialId: "cred_openai",
@@ -112,7 +110,7 @@ function uiDocument(): SettingsDocument {
   };
 }
 
-describe("TauriSettingsAdapter v4", () => {
+describe("TauriSettingsAdapter v1", () => {
   it("maps Provider models and credential status without exposing a secret", async () => {
     const bridge: SettingsNativeBridge = { invoke: vi.fn(async () => readResult()) };
     const loaded = await new TauriSettingsAdapter(bridge).snapshot();
@@ -159,9 +157,9 @@ describe("TauriSettingsAdapter v4", () => {
     expect(loaded).not.toHaveProperty("projectDocument");
   });
 
-  it("fails closed when effective v4 is invalid instead of returning an empty recovery document", async () => {
+  it("fails closed when effective v1 is invalid instead of returning an empty recovery document", async () => {
     const bridge: SettingsNativeBridge = {
-      invoke: vi.fn(async () => ({ ...readResult(), effective: { schema_version: 4 } })),
+      invoke: vi.fn(async () => ({ ...readResult(), effective: { schema_version: 1 } })),
     };
 
     await expect(new TauriSettingsAdapter(bridge).snapshot()).rejects.toEqual(
@@ -169,7 +167,7 @@ describe("TauriSettingsAdapter v4", () => {
     );
   });
 
-  it("saves only strict snake_case v4 and strips UI credential status", async () => {
+  it("saves only strict snake_case v1 and strips UI credential status", async () => {
     const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
       void args;
       return command === JA_SETTINGS_COMMANDS.replace
@@ -185,13 +183,74 @@ describe("TauriSettingsAdapter v4", () => {
         scope: "user",
         expectedVersion: "cfg_user",
         document: {
-          schema_version: 4,
+          schema_version: 1,
           providers: [{ provider_id: "provider_openai", models: [{ model_id: "model_gpt" }] }],
         },
       },
     });
     expect(JSON.stringify(replace?.[1])).not.toContain("credentialConfigured");
     expect(JSON.stringify(replace?.[1])).not.toContain("profiles");
+  });
+
+  it("round-trips DeepSeek Chat with a Provider-owned credential reference", async () => {
+    const native = structuredClone(CONFIG) as unknown as Record<string, unknown> & {
+      providers: Array<Record<string, unknown>>;
+    };
+    native.providers.push({
+      ...structuredClone(CONFIG.providers[0]),
+      provider_id: "provider_deepseek",
+      name: "DeepSeek",
+      api: "openai_chat_completions",
+      base_url: "https://api.deepseek.com",
+      credential_id: "cred_deepseek",
+      models: [
+        {
+          ...structuredClone(CONFIG.providers[0]!.models[0]),
+          model_id: "model_deepseek",
+          name: "DeepSeek Chat",
+          model: "deepseek-chat",
+        },
+      ],
+    });
+    const result = readResult();
+    const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      void args;
+      return command === JA_SETTINGS_COMMANDS.replace
+        ? { accepted: true, scope: "user", version: "cfg_next" }
+        : {
+            ...result,
+            effective: native,
+            user: { ...result.user, document: native },
+            credentials: {
+              cred_openai: { configured: true },
+              cred_deepseek: { configured: false },
+            },
+          };
+    });
+    const adapter = new TauriSettingsAdapter({ invoke });
+
+    const loaded = await adapter.snapshot();
+    expect(loaded.document.providers[1]).toMatchObject({
+      api: "openai_chat_completions",
+      credentialId: "cred_deepseek",
+      credentialConfigured: false,
+    });
+    expect(loaded.document.providers[0]?.credentialId).toBe("cred_openai");
+    await expect(adapter.save(loaded.userDocument, "cfg_user")).resolves.toBe("cfg_next");
+    const replace = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.replace);
+    expect(replace?.[1]).toMatchObject({
+      input: {
+        document: {
+          providers: [
+            { credential_id: "cred_openai" },
+            {
+              api: "openai_chat_completions",
+              credential_id: "cred_deepseek",
+            },
+          ],
+        },
+      },
+    });
   });
 
   it("round-trips MCP transport fields and explicit auth without transport guessing", async () => {
@@ -255,6 +314,26 @@ describe("TauriSettingsAdapter v4", () => {
     );
     expect(invoke).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["CONFIG_CONFLICT", "revision_conflict"],
+    ["STORAGE_UNAVAILABLE", "storage_unavailable"],
+    ["CONFIG_INVALID", "invalid_input"],
+    ["CONFIG_CORRUPTED", "invalid_response"],
+  ] as const)(
+    "maps current JA-RPC %s without exposing native diagnostics",
+    async (nativeCode, code) => {
+      const bridge: SettingsNativeBridge = {
+        invoke: vi.fn(async () => {
+          throw { code: nativeCode, message: "private storage path" };
+        }),
+      };
+
+      await expect(
+        new TauriSettingsAdapter(bridge).setCredential("cred_openai", "test-secret", "cfg_auth"),
+      ).rejects.toEqual(expect.objectContaining<Partial<SettingsAdapterError>>({ code }));
+    },
+  );
 
   it("projects only typed configuration change invalidation metadata", () => {
     expect(

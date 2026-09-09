@@ -9,6 +9,7 @@ import type {
   ProviderModelSave,
   ProviderSave,
 } from "@/shared/settings/types";
+import type { ThemeMode, UiPalette } from "@/shared/styles/theme";
 export type {
   DefaultModelSelection,
   McpServerSave,
@@ -16,11 +17,11 @@ export type {
   ProviderSave,
 } from "@/shared/settings/types";
 
-export type ThemeMode = "system" | "light" | "dark";
-type UiPalette = "xcode";
-export type SettingsSection = "models" | "skills" | "mcp" | "permissions" | "appearance";
+export { UI_PALETTE_LABELS, UI_PALETTE_ORDER } from "@/shared/styles/theme";
+export type { ThemeMode, UiPalette } from "@/shared/styles/theme";
+export type SettingsSection = "models" | "skills" | "mcp" | "permissions" | "appearance" | "about";
 export type AccessMode = "approval_required" | "full_access";
-export type SkillSource = "builtin" | "user" | "workspace";
+export type SkillSource = "builtin" | "user" | "ja" | "project";
 type SkillStatus = "ready" | "disabled" | "reloading" | "error";
 export type McpStatus = "unknown" | "connected" | "disabled" | "testing" | "error";
 type McpProtocolVersion = "2024-11-05" | "2025-03-26" | "2025-06-18";
@@ -65,8 +66,6 @@ export interface McpServerProjection extends McpServerSave {
   status: McpStatus;
   tools: McpToolProjection[];
   lastError?: string;
-  globallyEnabled?: boolean;
-  projectOverridden?: boolean;
 }
 export interface SkillProjection {
   id: string;
@@ -77,26 +76,25 @@ export interface SkillProjection {
   status: SkillStatus;
   lastGood?: string;
   error?: string;
-  globallyEnabled?: boolean;
-  projectOverridden?: boolean;
 }
 export interface AppearanceSettings {
   theme: ThemeMode;
   palette: UiPalette;
   reducedMotion: boolean;
+  reducedTransparency: boolean;
   highContrast: boolean;
 }
 
-/** camelCase v4 聚合是 application 唯一可见的配置事实，不泄漏 JA-RPC wire 字段。 */
+/** camelCase v1 聚合是 application 唯一可见的配置事实，不泄漏 JA-RPC wire 字段。 */
 export interface SettingsDocument {
-  schemaVersion: 4;
+  schemaVersion: 1;
   revision: number;
   theme: ThemeMode;
   defaultAccessMode: AccessMode;
   defaultSelection: DefaultModelSelection | null;
   providers: ProviderProjection[];
   mcpServers: SettingsMcpServer[];
-  skills?: SettingsSkill[];
+  skills: SettingsSkill[];
   window: { width: number; height: number; maximized: boolean };
 }
 
@@ -116,7 +114,7 @@ export interface SettingsMcpServer {
 interface SettingsSkill {
   skillId: string;
   name: string;
-  scope: "builtin" | "user" | "workspace";
+  scope: SkillSource;
   enabled: boolean;
   description: string;
 }
@@ -125,8 +123,6 @@ export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
   projectOverrides: ProjectSettingsOverrides;
-  source: "Default" | "Primary" | "Backup";
-  recovered: boolean;
   cas: { userVersion: string; projectVersion: string; credentialVersion: string };
 }
 
@@ -151,7 +147,5 @@ export interface SettingsSnapshot {
   skills: SkillProjection[];
   mcpServers: McpServerProjection[];
   defaultAccessMode: AccessMode;
-  globalAccessMode: AccessMode;
-  projectOverrides: ProjectSettingsOverrides;
   appearance: AppearanceSettings;
 }

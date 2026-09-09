@@ -198,11 +198,24 @@ mod review_git_query_scope {
     }
 }
 
-integration_scope!(
-    review_git_adapter_scope,
-    crate::review::infrastructure::git::adapter,
-    "/tests/integration/internal/review/infrastructure/git/adapter_tests.rs"
-);
+mod review_git_adapter_scope {
+    pub(crate) use crate::review::infrastructure::git::adapter::*;
+    pub(crate) use crate::test_prelude::*;
+
+    mod review_git_support {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/review_git.rs"
+        ));
+    }
+
+    mod tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/integration/internal/review/infrastructure/git/adapter_tests.rs"
+        ));
+    }
+}
 mod review_git_process_scope {
     pub(crate) use crate::review::infrastructure::git::adapter::GitPolicy;
     pub(crate) use crate::review::infrastructure::git::error::GitError;

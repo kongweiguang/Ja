@@ -21,13 +21,16 @@ public final class WorkspaceBoundary {
     private final Path physicalRoot;
 
     /**
-     * 同时固定词法根与物理根，以拒绝 junction、reparse point 和 symlink 逃逸。
+     * 同时固定现有词法根与物理根，以拒绝 junction、reparse point 和 symlink 逃逸；
+     * 路径能力不得在 Workspace 被外部删除后静默重建一个不同物理身份的空目录。
      */
     public WorkspaceBoundary(Path root) {
         Objects.requireNonNull(root, "root");
         try {
             this.root = root.toAbsolutePath().normalize();
-            Files.createDirectories(this.root);
+            if (!Files.isDirectory(this.root, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("workspace_root_unavailable");
+            }
             rejectLinkOrReparse(this.root);
             this.physicalRoot = this.root.toRealPath();
         } catch (IOException failure) {
@@ -82,6 +85,42 @@ public final class WorkspaceBoundary {
         rejectLinksAndReparse(lexicalTarget);
         Path parent = Objects.requireNonNull(lexicalTarget.getParent(), "target parent").toRealPath();
         requireContained(parent);
+    }
+
+    /**
+     * 在创建临时文件前冻结父目录的 NOFOLLOW 物理路径与文件系统 identity；该 opaque guard
+     * 只用于同一次 mutation，不向调用方暴露可被序列化的路径事实。
+     */
+    public MutationGuard mutationGuard(Path target) throws IOException {
+        Path lexicalTarget = Objects.requireNonNull(target, "target").toAbsolutePath().normalize();
+        revalidateParent(lexicalTarget);
+        Path parent = Objects.requireNonNull(lexicalTarget.getParent(), "target parent");
+        BasicFileAttributes attributes = Files.readAttributes(
+                parent, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        Object fileKey = attributes.fileKey();
+        if (!attributes.isDirectory()) {
+            throw new IOException("workspace_parent_identity_unavailable");
+        }
+        return new MutationGuard(parent, parent.toRealPath(LinkOption.NOFOLLOW_LINKS), fileKey);
+    }
+
+    /**
+     * 在临时文件创建、写入和 move 的每个边界复核同一父目录；Windows NIO 不提供可靠目录句柄，
+     * provider 也可能不提供 fileKey，因而 NOFOLLOW 真实路径与可用 fileKey 只能缩小竞态窗口，
+     * 不能宣称消除恶意 TOCTOU。
+     */
+    public void revalidateMutationGuard(MutationGuard guard) throws IOException {
+        MutationGuard expected = Objects.requireNonNull(guard, "guard");
+        rejectLinksAndReparse(expected.parent);
+        BasicFileAttributes attributes = Files.readAttributes(
+                expected.parent, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        Path noFollow = expected.parent.toRealPath(LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isDirectory()
+                || expected.fileKey != null && !expected.fileKey.equals(attributes.fileKey())
+                || !expected.noFollowRealPath.equals(noFollow)) {
+            throw new SecurityException("workspace_parent_identity_changed");
+        }
+        requireContained(expected.parent.toRealPath());
     }
 
     /**
@@ -238,6 +277,28 @@ public final class WorkspaceBoundary {
     private void requireContained(Path path) {
         if (!path.startsWith(physicalRoot)) {
             throw new SecurityException("workspace_physical_escape");
+        }
+    }
+
+    /**
+     * 父目录 mutation 身份刻意不提供访问器或默认 record 输出，避免诊断与 Tool 结果泄漏物理路径。
+     */
+    public static final class MutationGuard {
+        private final Path parent;
+        private final Path noFollowRealPath;
+        private final Object fileKey;
+
+        /** 只有 WorkspaceBoundary 能创建已完成 containment 检查的 guard。 */
+        private MutationGuard(Path parent, Path noFollowRealPath, Object fileKey) {
+            this.parent = parent;
+            this.noFollowRealPath = noFollowRealPath;
+            this.fileKey = fileKey;
+        }
+
+        /** 默认字符串只报告 opaque 类型，禁止把父目录和平台 fileKey 写入日志。 */
+        @Override
+        public String toString() {
+            return "MutationGuard[opaque]";
         }
     }
 

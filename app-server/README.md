@@ -17,6 +17,9 @@ JSONL/JSON-RPC。stdout 仅用于协议帧；日志、诊断和异常必须走 s
 和 SQLite 会话事实的唯一运行时核心。Java 也是 `config.toml`、`auth.json`、
 配置 generation、Workspace identity 与凭据持久化的唯一 owner；Rust 只拥有
 sidecar/stdio 生命周期、Windows 进程树与桌面原生能力，React 只消费脱敏投影。
+Provider 是用户自定义连接；名称不参与路由，每条配置按所选 API 规范决定请求、鉴权与 Usage 解析，并通过
+自己的凭据引用取得 API Key。每次模型请求前解析最新环境并在本地估算最终 envelope 的 Token 上界，实际 Usage 只取正式
+响应并由 Java 持久化。
 
 ## 日志目录
 
@@ -43,19 +46,66 @@ Base64URL 参数传给 JVM 或 Native Image；Java 从 `home` 自行读取配置
 | `configuration/adapter/out` | `document` 管配置文档与 Watcher，`generation` 管不可变代际和租约，`security/windows` 管凭据与 Windows 安全文件 |
 | `catalog/adapter/out/mcp` | `generation` 投影配置代际，`runtime` 编排目录与调用，`session` 隔离 SDK Client，`transport` 实现 stdio/HTTP，`support` 保存不可变共享值 |
 | `infrastructure/persistence` | `database` 持有 SQLite/Flyway 生命周期，`mapper` 定义 SQL 边界，`repository` 实现领域端口，`transaction` 统一提交回滚，`recovery` 编排启动恢复 |
-| `transport/rpc` | `protocol` 冻结 JA-RPC v2 Wire 合同，`handler` 适配用例，`runtime` 持有连接、路由、关闭屏障与 stdout 单写者 |
+| `transport/rpc` | `protocol` 冻结 JA-RPC v1 Wire 合同，`handler` 适配用例，`runtime` 持有连接、路由、关闭屏障与 stdout 单写者 |
 
 每个职责叶子包都有 `package-info.java` 说明允许内容与禁止边界；ArchUnit 检查领域纯度、
 六边形依赖方向、顶层包无环，以及 Provider、MCP、持久化、RPC、配置和 Context 的关键职责边界。
 
 模型固定看到 `read/edit/write`；只有进程级 Shell 预检成功时才额外看到 `shell`，复杂 Tool
-由当前 Turn 冻结的 MCP 列表提供。Windows 依次尝试 `PATH` 中的 PowerShell 7 和系统
+在 Provider 请求安全点按需发现，已生成 Tool batch 通过不可变 binding 精确路由。Windows 依次尝试 `PATH` 中的 PowerShell 7 和系统
 Windows PowerShell 5.1；两者都不可用时，执行环境明确标记 `shell: unavailable`，App Server
 仍保留配置、历史与 RPC 恢复面，不注册一个必然失败的 Shell Tool。Tool 在 Java App Server
 内执行，文件访问只受当前操作系统账户权限约束，Rust 不再提供 Host Tool 或 Sandbox RPC。
 旧 Tool 别名、旧权限/审批枚举、`change/*`、`runtime/configure` 和
-`initialize.configSnapshot` 均已删除且 fail closed。活动 Turn 支持持久 FIFO 的
-`turn/steer` 与 `turn/follow-up`，React 只提供逐条追加，不提供队列重排或编辑。
+`initialize.configSnapshot` 均已删除且 fail closed。活动 Turn 的权威输入队列由
+`turn/input/enqueue`、`turn/input/prioritize`、`turn/input/update` 与 `turn/input/delete`
+维护；Steering 在安全点优先消费，普通输入保持 FIFO，队列随 `thread/read` 和全量事件恢复。
+
+## Plan / Goal
+
+Plan 与 Goal 是两个独立聚合。`CollaborationMode=plan` 只控制当前 Thread 的计划协作语义；Goal 可依据冻结的
+objective 与验收条件直接持续执行，不要求先创建或批准 Plan。两者只通过显式、可解除的 `GoalPlanLink`
+关联：未关联 Goal 使用 Goal-only run；已关联 Goal run 才绑定获批的精确 Plan revision/hash。二者都与
+`AccessMode=approval_required|full_access` 正交，切换模式、创建 Goal 或建立关联都不会扩大 Tool 权限。
+Goal、Plan、PlanRevision、Approval、Run、StepExecution、Evidence、Evaluation 与可选 Link 由 Java 25
+App Server 和 SQLite 唯一持有。Plan 使用结构化 canonical JSON SHA-256；Goal 与 Plan mutation 分别使用各自
+revision CAS 和幂等键，批准及显式 Plan 执行必须绑定精确 revision/hash。Rust 只代理 typed JA-RPC，React
+不计算状态、hash 或完成结论。
+
+当前源码已经具备独立 Goal/Plan domain、V1 persistence、repository、完成门、recovery/lease 基础，以及
+编译期注册的 `PlanGoalAgentCapability`。计划模式会在请求 profile 中加入 `plan_propose`、`plan_step_update`；
+活动 Goal 上下文按需加入 `goal_request_input`、`goal_request_evaluation`。这些 Agent Tool 仍经过现有权限和
+内核审批，standalone Plan 的内部 Turn 事件只返回发起连接，Goal continuation 事件继续按 Goal observation 路由。
+
+截至 2026-09-05，`RpcServer` 已注册 Goal/Plan Handler 并发布 `goal/changed`、`goal/activity`、
+`goal/input-requested`；`GoalContinuationCoordinator`、独立无 Tool evaluator、启动恢复、Rust typed proxy 与
+React 权威投影均已进入生产 composition。桌面入口仍以握手的 `plan_goal_v1` capability 为上限；Native Image、
+隔离 Windows Tauri/WebView2 真窗矩阵和 120 分钟 mock soak 是发布前 Gate，不得由局部单测替代。
+
+## Agent 能力与扩展边界
+
+能力以 Java 25 的窄端口和显式组合实现，不提供动态插件加载、独立扩展状态库或第二套 Agent Runtime。
+`SolonRuntimeComposition` 注册 `AgentCapability`，`AgentCapabilityCatalog` 固定身份和顺序；
+Plan/Goal 与 Task 保留各自用例和状态机，仅将模型说明与工具适配到统一请求目录。
+
+能力先 `prepare` 一次冻结领域状态和现有 `ToolSpec` 安全描述，再由 Resolver 合并内置、能力、MCP
+目录并校验 Task 权限上限，最后 `bind` 最终目录身份。两阶段只为消除 Task 权限上限与目录摘要的
+相互依赖，不重复读取领域状态；绑定后的工具必须与准备时的描述、权限元数据和路由完全一致。
+Provider、Skills 和权限仍在请求安全点刷新，已生成工具批次不会按同名工具重新路由。
+
+- `ContextTransform` 同步增删不可变的派生 System 片段，结果在计量前进入 Prompt revision。
+  AGENTS、Skills、历史消息、身份和凭据不暴露给该接口；不支持历史消息改写。
+- `ToolPolicy` 是只能继续或拒绝的前置责任链；异常失败关闭，内核审批不可被移除或替换。
+- `ExecutionObserver` 按类型订阅安全执行元数据，不接收 API Key、参数或结果正文；观察故障不改变结算。
+- `AgentTool.sideEffect()` 默认 `EXTERNAL`，只读工具明确声明 `READ_ONLY`，不再按名称推断。
+  副作用与 `WorkspaceMutationMode` 独立，并共同进入目录和绑定身份。MCP 路由摘要由 MCP owner 生成。
+
+工具真实结果先经内核结算和持久化，再通知观察器；必要的规则刷新失败也不能丢失已经执行的结果。
+普通 Hook 必须短时、同步、无 IO，不拥有资源；IO 与关闭仍由现有适配器、租约、取消和 Deadline 负责。
+编译期 Java 扩展是可信进程内代码，不是沙箱，也不能以 Future 超时宣称已经强制终止实现。
+
+扩展验收见 `AgentCapabilityIntegrationTest`（真实 Prompt factory、Loop、临时文件和 SQLite），
+职责方向由 `HexagonalArchitectureTest` 固定。JVM 测试、Native 构建和 Windows 真窗验收是不同证据层级。
 
 ## 构建和测试
 

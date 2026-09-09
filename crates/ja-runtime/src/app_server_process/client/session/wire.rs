@@ -246,10 +246,7 @@ pub(super) fn writer_loop<W: Write + Send + 'static>(
                 } else {
                     SessionEvent::ProtocolFault(codec::CodecError::Io)
                 };
-                inner
-                    .events
-                    .push(event, EventPriority::Control, QueueKind::Control);
-                fail_closed(&inner);
+                publish_terminal_and_fail_closed(&inner, event);
                 break;
             }
         };
@@ -349,10 +346,22 @@ fn is_context_lifecycle_notification(frame: &RpcFrame) -> bool {
     )
 }
 
+/// Task activity/mailbox 与 Approval 是不可重建的即时交互信号；它们使用 control reserve，
+/// 队列耗尽时终止 generation，也不能像 progress/delta 一样静默丢弃。
+fn is_durable_interaction_notification(frame: &RpcFrame) -> bool {
+    matches!(
+        frame.method(),
+        Some("task/activity" | "task/mailbox-changed" | "approval/requested" | "approval/resolved")
+    )
+}
+
 /// 保持既有 runtime control lane，并提升 Turn terminal 与 Context 生命周期；queue kind
 /// 跟随 lane，因此 control reserve 真正耗尽时仍报告 fatal overflow，不静默丢最终事实。
 pub(crate) fn notification_routing(frame: &RpcFrame) -> (EventPriority, QueueKind) {
-    if is_turn_terminal_notification(frame) || is_context_lifecycle_notification(frame) {
+    if is_turn_terminal_notification(frame)
+        || is_context_lifecycle_notification(frame)
+        || is_durable_interaction_notification(frame)
+    {
         return (EventPriority::Control, QueueKind::Control);
     }
     if frame
@@ -409,13 +418,10 @@ fn reader_loop<R: Read>(reader: R, inner: Arc<SessionInner>) {
         let forbidden = match inner.forbidden_ready_tokens.lock() {
             Ok(forbidden) => forbidden.clone(),
             Err(_) => {
-                push_event(
+                publish_terminal_and_fail_closed(
                     &inner,
                     SessionEvent::ProtocolFault(codec::CodecError::InvalidEnvelope),
-                    EventPriority::Control,
-                    QueueKind::Control,
                 );
-                fail_closed(&inner);
                 break;
             }
         };
@@ -426,33 +432,15 @@ fn reader_loop<R: Read>(reader: R, inner: Arc<SessionInner>) {
         ) {
             Ok(frame) => dispatch_frame(frame, &inner),
             Err(codec::CodecError::UnexpectedEof) => {
-                push_event(
-                    &inner,
-                    SessionEvent::Eof,
-                    EventPriority::Control,
-                    QueueKind::Control,
-                );
-                fail_closed(&inner);
+                publish_terminal_and_fail_closed(&inner, SessionEvent::Eof);
                 break;
             }
             Err(codec::CodecError::HandshakeFailed) => {
-                push_event(
-                    &inner,
-                    SessionEvent::HandshakeFailed,
-                    EventPriority::Control,
-                    QueueKind::Control,
-                );
-                fail_closed(&inner);
+                publish_terminal_and_fail_closed(&inner, SessionEvent::HandshakeFailed);
                 break;
             }
             Err(error) => {
-                push_event(
-                    &inner,
-                    SessionEvent::ProtocolFault(error),
-                    EventPriority::Control,
-                    QueueKind::Control,
-                );
-                fail_closed(&inner);
+                publish_terminal_and_fail_closed(&inner, SessionEvent::ProtocolFault(error));
                 break;
             }
         }
@@ -464,13 +452,10 @@ fn dispatch_frame(frame: RpcFrame, inner: &Arc<SessionInner>) {
     match frame.validate() {
         Ok(FrameKind::Response) => {
             if !frame_payload_is_safe(&frame, inner, false) {
-                push_event(
+                publish_terminal_and_fail_closed(
                     inner,
                     SessionEvent::ProtocolFault(codec::CodecError::InvalidEnvelope),
-                    EventPriority::Control,
-                    QueueKind::Control,
                 );
-                fail_closed(inner);
                 return;
             }
             let pending = inner.pending.lock();
@@ -478,26 +463,22 @@ fn dispatch_frame(frame: RpcFrame, inner: &Arc<SessionInner>) {
                 Ok(mut pending) => pending.resolve(frame),
                 Err(poisoned) => {
                     drop(poisoned);
-                    push_event(
+                    publish_terminal_and_fail_closed(
                         inner,
                         SessionEvent::ProtocolFault(codec::CodecError::InvalidEnvelope),
-                        EventPriority::Control,
-                        QueueKind::Control,
                     );
-                    fail_closed(inner);
                     return;
                 }
             };
-            if matches!(disposition, ResolveDisposition::Delivered) {
+            // 本地 request deadline 只终止对应 waiter；迟到响应已被有界 tombstone 识别，
+            // 可以安全丢弃，不能因此关闭仍在执行 Turn 的健康 sidecar。
+            if matches!(
+                disposition,
+                ResolveDisposition::Delivered | ResolveDisposition::LateResponse
+            ) {
                 return;
             }
-            push_event(
-                inner,
-                SessionEvent::ResponseRejected,
-                EventPriority::Control,
-                QueueKind::Control,
-            );
-            fail_closed(inner);
+            publish_terminal_and_fail_closed(inner, SessionEvent::ResponseRejected);
         }
         Ok(FrameKind::Notification) => {
             let is_ready = frame.method() == Some("runtime/status-changed")
@@ -508,50 +489,35 @@ fn dispatch_frame(frame: RpcFrame, inner: &Arc<SessionInner>) {
                     == Some("ready");
             let is_initialized = frame.method() == Some("runtime/initialized");
             if !frame_payload_is_safe(&frame, inner, is_ready) {
-                push_event(
+                publish_terminal_and_fail_closed(
                     inner,
                     if is_ready || is_initialized {
                         SessionEvent::HandshakeFailed
                     } else {
                         SessionEvent::ProtocolFault(codec::CodecError::InvalidEnvelope)
                     },
-                    EventPriority::Control,
-                    QueueKind::Control,
                 );
-                fail_closed(inner);
                 return;
             }
             if is_ready && !inner.claim_ready_notification() {
-                push_event(
-                    inner,
-                    SessionEvent::HandshakeFailed,
-                    EventPriority::Control,
-                    QueueKind::Control,
-                );
-                fail_closed(inner);
+                publish_terminal_and_fail_closed(inner, SessionEvent::HandshakeFailed);
                 return;
             }
             if frame.method() == Some("turn/terminal") && !claim_terminal_identity(&frame, inner) {
-                push_event(
+                publish_terminal_and_fail_closed(
                     inner,
                     SessionEvent::ProtocolFault(codec::CodecError::InvalidEnvelope),
-                    EventPriority::Control,
-                    QueueKind::Control,
                 );
-                fail_closed(inner);
                 return;
             }
             let (priority, kind) = notification_routing(&frame);
             push_event(inner, frame.into_notification(), priority, kind);
         }
         Ok(FrameKind::ClientRequest) | Err(_) => {
-            push_event(
+            publish_terminal_and_fail_closed(
                 inner,
                 SessionEvent::ProtocolFault(codec::CodecError::InvalidEnvelope),
-                EventPriority::Control,
-                QueueKind::Control,
             );
-            fail_closed(inner);
         }
     }
 }
@@ -808,10 +774,42 @@ pub(super) fn fail_closed(inner: &Arc<SessionInner>) {
 
 /// 只执行一次终止通知，并在回调前关闭事实置位，避免回调重入重复旋转 generation。
 pub(super) fn fail_closed_with_reason(inner: &Arc<SessionInner>, reason: TerminalReason) {
+    terminate_session(inner, reason, None);
+}
+
+/// 原子提交终态和对应事件；`closed` 必须先于事件对 consumer 可见，而事件队列要到
+/// 入队后才关闭，才能同时阻止 ready 晋级并避免等待方错过终态。
+fn publish_terminal_and_fail_closed(inner: &Arc<SessionInner>, event: SessionEvent) {
+    publish_terminal_and_fail_closed_with_reason(inner, TerminalReason::Fault, event);
+}
+
+/// 允许 process monitor 保留 `ProcessExited` 原因，同时复用同一终态线性化顺序；
+/// 原因只进入受控 callback，事件仍使用脱敏的领域枚举。
+pub(super) fn publish_terminal_and_fail_closed_with_reason(
+    inner: &Arc<SessionInner>,
+    reason: TerminalReason,
+    event: SessionEvent,
+) {
+    terminate_session(inner, reason, Some(event));
+}
+
+/// ready/terminal gate 是生命周期线性化点；终态事件直接写入 control lane，避免通过
+/// `push_event` 的 overflow 回调重入同一 gate。首次终止负责完整资源清理，重复终止只补事实。
+fn terminate_session(
+    inner: &Arc<SessionInner>,
+    reason: TerminalReason,
+    terminal_event: Option<SessionEvent>,
+) {
     // 正常路径持有 ready gate，保证 promotion 与 terminal 二选一；gate 自身中毒时
     // promotion 已失去可信状态，仍以 closed atomic 为最终 fail-closed 事实继续清理。
     let _ready_terminal_gate = inner.ready_terminal_gate.lock().ok();
-    if !inner.closed.swap(true, Ordering::AcqRel) {
+    let first_terminal = !inner.closed.swap(true, Ordering::AcqRel);
+    if let Some(event) = terminal_event {
+        inner
+            .events
+            .push(event, EventPriority::Control, QueueKind::Control);
+    }
+    if first_terminal {
         // reader/writer thread 可能是 EOF 或 I/O fault 的唯一 observer；此处直接调用
         // process owner，不等待 UI poll。
         inner.writer.close();
@@ -856,6 +854,7 @@ pub(crate) fn is_terminal_event(event: &SessionEvent) -> bool {
             | SessionEvent::ResponseRejected
     ) || matches!(
         event,
-        SessionEvent::Notification(frame) if is_turn_terminal_notification(frame)
+        SessionEvent::Notification(frame)
+            if is_turn_terminal_notification(frame) || is_durable_interaction_notification(frame)
     )
 }

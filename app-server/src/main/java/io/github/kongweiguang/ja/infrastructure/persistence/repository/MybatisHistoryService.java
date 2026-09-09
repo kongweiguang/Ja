@@ -5,15 +5,20 @@ package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile;
+import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
+import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
-import io.github.kongweiguang.ja.conversation.domain.TurnRuntimeSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ToolPresentationCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnChangeSetCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
@@ -29,20 +34,30 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Workspace 出站仓储与 Thread 入站端口的单库实现；分页和快照不依赖进程级活动状态。
  */
 public final class MybatisHistoryService implements WorkspaceRepository, ThreadUseCase {
     private static final int MAX_PAGE = 500;
+    // 与首版 schema 和 TurnChangeTracker 的冻结上限共同构成持久 artifact 的硬边界。
+    private static final int MAX_CHANGE_SET_ARTIFACT_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_CHANGE_SET_FILES = 256;
+    private static final Pattern HUNK_HEADER = Pattern.compile(
+            "^@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@(?: .*)?$");
     private final MybatisUnitOfWork transactions;
     private final MybatisConversationRepository agentStore;
     private final ToolPresentationCodec presentations;
     private final TurnChangeSetCodec changeSets;
+    private final PersistenceCodec codec;
     private final Clock clock;
 
     /**
@@ -55,6 +70,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         Objects.requireNonNull(objectMapper, "objectMapper");
         presentations = new ToolPresentationCodec(objectMapper);
         changeSets = new TurnChangeSetCodec(objectMapper);
+        codec = new PersistenceCodec(objectMapper);
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
@@ -69,6 +85,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         Objects.requireNonNull(objectMapper, "objectMapper");
         presentations = new ToolPresentationCodec(objectMapper);
         changeSets = new TurnChangeSetCodec(objectMapper);
+        codec = new PersistenceCodec(objectMapper);
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
@@ -165,7 +182,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Thread 创建完全使用显式 workspace 与 v3 偏好输入，不读取 active 状态。
+     * Thread 创建完全使用显式 workspace 与完整偏好输入，不读取 active 状态。
      */
     @Override
     public ThreadSummary createThread(ThreadSummary.Creation request) {
@@ -181,10 +198,11 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     public CursorPage<ThreadSummary> listThreads(String workspaceId, String cursor, int limit) {
         Objects.requireNonNull(workspaceId, "workspaceId");
         checkLimit(limit);
-        Cursor key = decode(cursor);
-        return transactions.required(mapper -> threadPage(mapper.history().selectThreadPage(
+        ThreadCursor key = decodeThreadCursor(cursor);
+        return transactions.required(mapper -> activeThreadPage(mapper.history().selectThreadPage(
                 new PersistenceRecords.ThreadPage(
-                        workspaceId, key == null ? null : key.time(),
+                        workspaceId, key == null ? null : key.pinned(),
+                        key == null ? null : key.sortTime(), key == null ? null : key.updatedAt(),
                         key == null ? null : key.id(), limit + 1)), limit));
     }
 
@@ -198,13 +216,14 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         }
         checkLimit(limit);
         Cursor key = decode(cursor);
-        return transactions.required(mapper -> threadPage(mapper.history().searchThreadPage(
+        return transactions.required(mapper -> searchThreadPage(mapper.history().searchThreadPage(
                 new PersistenceRecords.ThreadSearch(workspaceId, normalized,
                         key == null ? null : key.time(), key == null ? null : key.id(), limit + 1)), limit));
     }
 
     /**
-     * authoritative snapshot 混合页面按 committed timestamp+itemId 唯一排序，不重放事件日志。
+     * 混合页面按提交时间、语义和 Tool ordinal 排序，随机 identity 只用于最终去重；
+     * Mapper 从游标指向的持久条目还原完整排序键，保证正文先于同批工具且跨页不丢不重。
      */
     @Override
     public Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
@@ -223,13 +242,37 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                 next = encode(requiredText(last.createdAt(), "created_at"),
                         requiredText(last.itemId(), "item_id"));
             }
-            List<ThreadSnapshot.Turn> turns = mapper.agent().selectTurns(threadId).stream()
+            List<PersistenceRecords.TurnRow> turnRows = mapper.agent().selectTurns(threadId);
+            List<ThreadSnapshot.Turn> turns = turnRows.stream()
                     .map(this::snapshotTurn).toList();
             List<ThreadSnapshot.Item> items = rows.stream().map(this::snapshotItem).toList();
             PersistenceRecords.ContextUsageRow usageRow = mapper.history().selectLatestContextUsage(threadId);
             ThreadSnapshot.ContextUsage contextUsage = usageRow == null ? null : contextUsage(usageRow);
-            return Optional.of(new ThreadSnapshot(thread(row), turns, items, contextUsage, next));
+            PersistenceRecords.TurnRow queueTurn = turnRows.stream()
+                    .filter(turn -> !io.github.kongweiguang.ja.conversation.domain.turn.TurnState
+                            .valueOf(requiredText(turn.state(), "state")).terminal())
+                    .findFirst().orElse(null);
+            InputQueue inputQueue = queueTurn == null ? null : inputQueue(mapper, queueTurn);
+            return Optional.of(new ThreadSnapshot(thread(row), turns, items, contextUsage, inputQueue, next));
         });
+    }
+
+    /** thread/read 从同一 SQLite 快照恢复首个非终态 Turn 的完整队列，事件丢失也不会丢状态。 */
+    private InputQueue inputQueue(PersistenceMappers mapper, PersistenceRecords.TurnRow turn) {
+        List<InputQueue.QueuedInput> queued = mapper.agent().selectPendingInputs(turn.turnId()).stream()
+                .map(row -> new InputQueue.QueuedInput(requiredText(row.inputId(), "input_id"),
+                        requiredText(row.turnId(), "turn_id"), codec.readUserContent(
+                                requiredText(row.contentJson(), "content_json")),
+                        InputQueue.Kind.valueOf(requiredText(row.kind(), "kind")),
+                        codec.readAttachmentSummaries(requiredText(row.attachmentsJson(), "attachments_json")),
+                        InputQueue.Status.valueOf(requiredText(row.validationStatus(), "validation_status")),
+                        row.issueErrorCode() == null ? null : new InputQueue.Issue(
+                                row.issueErrorCode(), requiredText(row.issueMessage(), "issue_message"),
+                                Objects.requireNonNull(row.issueRetryable(), "issue_retryable")),
+                        row.inputRevision(),
+                        Instant.parse(requiredText(row.createdAt(), "created_at"))))
+                .toList();
+        return new InputQueue(turn.turnId(), turn.inputQueueRevision(), turn.acceptingInputs(), queued);
     }
 
     /** 人工标题取得永久所有权；CAS 失败不会被误报为自动结果竞争。 */
@@ -248,6 +291,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
             int changed = mapper.history().compareAndSetThreadPreferences(
                     new PersistenceRecords.ThreadPreferencesCas(threadId, preferences.providerId(),
                             preferences.modelId(), preferences.reasoningLevel(), preferences.accessMode().name(),
+                            preferences.collaborationMode().name(),
                             expectedThreadRevision, clock.instant().toString()));
             if (changed != 1) throw conflict();
             return thread(mapper.history().selectThread(threadId));
@@ -264,8 +308,47 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
+     * 置顶时间由 App Server 时钟唯一分配；取消置顶写入 null，二者都经过 active+revision CAS。
+     */
+    @Override
+    public ThreadSummary pinThread(String threadId, boolean pinned, long expectedThreadRevision) {
+        return transactions.required(mapper -> {
+            String occurredAt = clock.instant().toString();
+            int changed = mapper.history().compareAndSetThreadPin(new PersistenceRecords.ThreadPinCas(
+                    threadId, pinned ? occurredAt : null, expectedThreadRevision, occurredAt));
+            if (changed != 1) throw conflict();
+            return thread(mapper.history().selectThread(threadId));
+        });
+    }
+
+    /**
+     * 已读边界只推进到事务开始时的最新成功/失败 Turn；无 Turn、实时态、取消态或已读都不改 revision。
+     */
+    @Override
+    public ThreadSummary markThreadSeen(String threadId, long expectedThreadRevision) {
+        Objects.requireNonNull(threadId, "threadId");
+        if (expectedThreadRevision < 0) throw new IllegalArgumentException("invalid thread revision");
+        return transactions.required(mapper -> {
+            int changed = mapper.history().compareAndSetThreadSeen(new PersistenceRecords.ThreadSeenCas(
+                    threadId, expectedThreadRevision, clock.instant().toString()));
+            PersistenceRecords.ThreadRow row = mapper.history().selectThread(threadId);
+            if (changed == 1) return thread(row);
+            if (row == null) throw conflict();
+            TurnState state = row.latestTurnStatus() == null ? null
+                    : TurnState.valueOf(requiredText(row.latestTurnStatus(), "latest_turn_status"));
+            if (state == null || state != TurnState.COMPLETED && state != TurnState.FAILED
+                || row.latestTurnSeen()) {
+                return thread(row);
+            }
+            throw conflict();
+        });
+    }
+
+    /**
      * 人工和系统标题共用事务边界；人工路径保持外部精确 revision CAS，自动路径把 revision
-     * 解释为安全下界并以 placeholder 来源作为真正所有权 CAS，避免读后重试窗口。
+     * 解释为安全下界并以 placeholder 来源作为真正所有权 CAS，避免读后重试窗口。Child
+     * 展示名来自 Thread，因此标题提交还在同一事务推进 Task revision，隔离提交前已读出的旧摘要；
+     * 根 Thread 没有 Task projection，该更新自然为零行且不改变普通对话语义。
      */
     private Optional<ThreadSummary> updateTitle(String threadId, String title, long expectedRevision,
                                                 boolean placeholderOnly) {
@@ -273,11 +356,14 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
             throw new IllegalArgumentException("invalid thread title");
         }
         return transactions.required(mapper -> {
-            String source = titleSourceStorage(placeholderOnly
-                    ? ThreadPreferences.TitleSource.AUTO : ThreadPreferences.TitleSource.MANUAL);
+            String occurredAt = clock.instant().toString();
+            String source = (placeholderOnly
+                    ? ThreadPreferences.TitleSource.AUTO : ThreadPreferences.TitleSource.MANUAL).name();
             int changed = mapper.history().compareAndSetThreadTitle(new PersistenceRecords.ThreadTitleCas(
-                    threadId, title, source, expectedRevision, clock.instant().toString(), placeholderOnly));
-            return changed == 1 ? Optional.of(thread(mapper.history().selectThread(threadId))) : Optional.empty();
+                    threadId, title, source, expectedRevision, occurredAt, placeholderOnly));
+            if (changed != 1) return Optional.empty();
+            mapper.tasks().advanceTitleProjection(threadId, occurredAt);
+            return Optional.of(thread(mapper.history().selectThread(threadId)));
         });
     }
 
@@ -285,8 +371,18 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      * archive 只允许 idle Thread，revision CAS 与生命周期标记同事务。
      */
     @Override
-    public void archiveThread(String threadId, long expectedThreadRevision) {
-        lifecycle(threadId, expectedThreadRevision, false);
+    public ThreadSummary archiveThread(String threadId, long expectedThreadRevision) {
+        return lifecycle(threadId, expectedThreadRevision, false);
+    }
+
+    /** 已归档 Thread 只能经显式 restore CAS 回到 active，且不会恢复旧置顶顺序。 */
+    @Override
+    public ThreadSummary restoreThread(String threadId, long expectedThreadRevision) {
+        return transactions.required(mapper -> {
+            if (mapper.history().restoreThread(new PersistenceRecords.ThreadRestore(
+                    threadId, expectedThreadRevision, clock.instant().toString())) != 1) throw conflict();
+            return thread(mapper.history().selectThread(threadId));
+        });
     }
 
     /**
@@ -304,37 +400,8 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     public Optional<TurnSummary> findTurn(String turnId) {
         return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectTurnById(turnId)).map(row ->
                 new TurnSummary(requiredText(row.threadId(), "thread_id"), requiredText(row.turnId(), "turn_id"),
-                        requiredText(row.state(), "state"), requiredNumber(row.threadRevision(), "thread_revision"))));
-    }
-
-    /** Rust 捕获结果只允许在终态 Turn 上提交一次；Java 重新核对 Workspace、统计、UTF-8 长度与 SHA-256。 */
-    @Override
-    public io.github.kongweiguang.ja.conversation.domain.TurnChangeSet commitChangeSet(ChangeSetCommit request) {
-        Objects.requireNonNull(request, "request");
-        var supplied = Objects.requireNonNull(request.changeSet(), "changeSet");
-        if (supplied.artifactId() != null) throw new IllegalArgumentException("artifactId is server owned");
-        validateStats(supplied);
-        byte[] diff = request.unifiedDiff() == null ? null
-                : request.unifiedDiff().getBytes(StandardCharsets.UTF_8);
-        if ((diff == null) != (request.sha256() == null || request.byteLength() == null)) {
-            throw new IllegalArgumentException("change set artifact fields must be paired");
-        }
-        if (diff != null && (diff.length > 2 * 1024 * 1024 || request.byteLength() != diff.length
-            || !sha256(request.unifiedDiff()).equals(request.sha256()))) {
-            throw new IllegalArgumentException("change set artifact integrity mismatch");
-        }
-        String artifactId = diff == null ? null
-                : "artifact_" + java.util.UUID.randomUUID().toString().replace("-", "");
-        var committed = new io.github.kongweiguang.ja.conversation.domain.TurnChangeSet(
-                supplied.state(), supplied.reason(), supplied.files(), supplied.stats(), artifactId);
-        return transactions.required(mapper -> {
-            PersistenceRecords.ChangeSetInsert insert = new PersistenceRecords.ChangeSetInsert(
-                    request.threadId(), request.turnId(), request.workspaceId(), changeSets.write(committed),
-                    artifactId, request.sha256(), request.byteLength(), request.unifiedDiff(), clock.instant().toString());
-            if (artifactId != null && mapper.history().insertChangeSetArtifact(insert) != 1) throw conflict();
-            if (mapper.history().insertChangeSet(insert) != 1) throw conflict();
-            return committed;
-        });
+                        requiredText(row.state(), "state"), requiredNumber(row.threadRevision(), "thread_revision"),
+                        row.cancelExpectedThreadRevision() != null)));
     }
 
     /** Tool artifact 使用 code point 游标，因此任意 offset 都不会落在 surrogate pair 中间。 */
@@ -357,60 +424,199 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         });
     }
 
-    /** Diff reader 验证 byte offset 位于 UTF-8 字符边界，并回退页尾以免切断 code point。 */
+    /**
+     * 每次点击都按完整身份读取持久 artifact，并在一次严格解析后只返回目标文件；不保留正文或索引缓存。
+     */
     @Override
-    public Optional<BinaryTextArtifactPage> readChangeSetArtifact(String threadId, String turnId,
-                                                                  String artifactId, int offsetBytes,
-                                                                  int limitBytes) {
-        if (offsetBytes < 0 || limitBytes < 1 || limitBytes > 65_536) {
-            throw new IllegalArgumentException("invalid artifact page");
-        }
-        return transactions.required(mapper -> Optional.ofNullable(mapper.history().selectChangeSetArtifact(
-                        new PersistenceRecords.ChangeSetArtifactKey(threadId, turnId, artifactId)))
-                .map(row -> bytePage(row, offsetBytes, limitBytes)));
+    public Optional<ChangeSetArtifactFile> readChangeSetArtifact(String threadId, String turnId,
+                                                                 String artifactId, String filePath) {
+        validateArtifactPath(filePath);
+        PersistenceRecords.ChangeSetArtifactRow row = transactions.required(mapper ->
+                mapper.history().selectChangeSetArtifact(new PersistenceRecords.ChangeSetArtifactKey(
+                        threadId, turnId, artifactId)));
+        if (row == null) return Optional.empty();
+        return extractChangeSetFile(row, filePath);
     }
 
-    /** 明细与汇总必须一致；未知行数保持缺失且不参与总和。 */
-    private static void validateStats(io.github.kongweiguang.ja.conversation.domain.TurnChangeSet value) {
-        long additions = value.files().stream().mapToLong(file -> file.additions() == null ? 0 : file.additions()).sum();
-        long deletions = value.files().stream().mapToLong(file -> file.deletions() == null ? 0 : file.deletions()).sum();
-        long binary = value.files().stream().filter(
-                io.github.kongweiguang.ja.conversation.domain.TurnChangeSet.FileChange::binary).count();
-        if (value.stats().files() != value.files().size() || value.stats().additions() != additions
-            || value.stats().deletions() != deletions || value.stats().binaryFiles() != binary
-            || value.stats().truncated() != value.files().stream().anyMatch(
-                    io.github.kongweiguang.ja.conversation.domain.TurnChangeSet.FileChange::truncated)) {
-            throw new IllegalArgumentException("change set stats mismatch");
-        }
-    }
-
-    /** UTF-8 byte 页只接受字符起点；页尾回退到完整字符并以 null 表示 EOF。 */
-    private static BinaryTextArtifactPage bytePage(PersistenceRecords.ChangeSetArtifactRow row,
-                                                   int offsetBytes, int limitBytes) {
+    /**
+     * 单次严格解析标准 unified diff：按 hunk 行数识别边界，正文中的 `---` 不会被误判成下一文件。
+     */
+    private static IndexedChangeSet indexChangeSet(PersistenceRecords.ChangeSetArtifactRow row) {
         byte[] bytes = row.content().getBytes(StandardCharsets.UTF_8);
-        if (bytes.length != row.byteLength() || offsetBytes > bytes.length
-            || offsetBytes < bytes.length && (bytes[offsetBytes] & 0xC0) == 0x80) {
-            throw new IllegalArgumentException("artifact byte offset is invalid");
+        if (bytes.length != row.byteLength() || bytes.length > MAX_CHANGE_SET_ARTIFACT_BYTES
+                || !sha256(bytes).equals(row.sha256())) {
+            throw new IllegalArgumentException("change set artifact length is invalid");
         }
-        int end = Math.min(bytes.length, offsetBytes + limitBytes);
-        while (end > offsetBytes && end < bytes.length && (bytes[end] & 0xC0) == 0x80) end--;
-        String content = new String(bytes, offsetBytes, end - offsetBytes, StandardCharsets.UTF_8);
-        return new BinaryTextArtifactPage(row.artifactId(), offsetBytes, end < bytes.length ? end : null,
-                bytes.length, end < bytes.length, content);
+        Map<String, ByteRange> files = new LinkedHashMap<>();
+        int cursor = 0;
+        while (cursor < bytes.length) {
+            requireChangeSetReadActive();
+            int fileStart = cursor;
+            ParsedLine before = line(bytes, cursor);
+            if (!before.text().startsWith("--- ")) throw malformedChangeSet();
+            cursor = before.next();
+            ParsedLine after = line(bytes, cursor);
+            if (!after.text().startsWith("+++ ")) throw malformedChangeSet();
+            cursor = after.next();
+            String filePath = headerPath(before.text(), after.text());
+            validateArtifactPath(filePath);
+            boolean sawHunk = false;
+            while (cursor < bytes.length && !startsWith(bytes, cursor, "--- ")) {
+                requireChangeSetReadActive();
+                ParsedLine hunk = line(bytes, cursor);
+                HunkCounts counts = hunkCounts(hunk.text());
+                sawHunk = true;
+                cursor = hunk.next();
+                int beforeLines = 0;
+                int afterLines = 0;
+                boolean previousBody = false;
+                while (beforeLines < counts.before() || afterLines < counts.after()) {
+                    requireChangeSetReadActive();
+                    ParsedLine body = line(bytes, cursor);
+                    if ("\\ No newline at end of file".equals(body.text())) {
+                        if (!previousBody) throw malformedChangeSet();
+                        previousBody = false;
+                        cursor = body.next();
+                        continue;
+                    }
+                    if (body.text().isEmpty()) throw malformedChangeSet();
+                    char prefix = body.text().charAt(0);
+                    if (prefix == ' ') {
+                        beforeLines++;
+                        afterLines++;
+                    } else if (prefix == '-') beforeLines++;
+                    else if (prefix == '+') afterLines++;
+                    else throw malformedChangeSet();
+                    if (beforeLines > counts.before() || afterLines > counts.after()) throw malformedChangeSet();
+                    previousBody = true;
+                    cursor = body.next();
+                }
+                if (cursor < bytes.length) {
+                    ParsedLine marker = line(bytes, cursor);
+                    if ("\\ No newline at end of file".equals(marker.text())) cursor = marker.next();
+                }
+                if (cursor < bytes.length && !startsWith(bytes, cursor, "@@ ")
+                        && !startsWith(bytes, cursor, "--- ")) throw malformedChangeSet();
+            }
+            if (!sawHunk || files.putIfAbsent(filePath, new ByteRange(fileStart, cursor)) != null) {
+                throw malformedChangeSet();
+            }
+            if (files.size() > MAX_CHANGE_SET_FILES) throw malformedChangeSet();
+        }
+        return new IndexedChangeSet(row.artifactId(), bytes, Map.copyOf(files));
     }
+
+    /**
+     * 每次请求只保留本次解析结果，并复制目标文件字节后立即释放聚合 artifact；文件摘要覆盖返回正文，
+     * Rust 因而可以在 Base64 解码后独立验证身份、长度和内容完整性。
+     */
+    private static Optional<ChangeSetArtifactFile> extractChangeSetFile(
+            PersistenceRecords.ChangeSetArtifactRow row, String filePath) {
+        IndexedChangeSet indexed = indexChangeSet(row);
+        ByteRange range = indexed.files().get(filePath);
+        if (range == null) return Optional.empty();
+        byte[] selected = java.util.Arrays.copyOfRange(indexed.bytes(), range.start(), range.end());
+        return Optional.of(new ChangeSetArtifactFile(indexed.artifactId(), filePath, selected.length,
+                sha256(selected), Base64.getEncoder().encodeToString(selected)));
+    }
+
+    /** header 的 before/after 只能表达同一路径或单侧 `/dev/null`，其它组合均视为损坏。 */
+    private static String headerPath(String beforeHeader, String afterHeader) {
+        String before = beforeHeader.substring(4);
+        String after = afterHeader.substring(4);
+        if ("/dev/null".equals(before) && after.startsWith("b/")) return after.substring(2);
+        if ("/dev/null".equals(after) && before.startsWith("a/")) return before.substring(2);
+        if (before.startsWith("a/") && after.startsWith("b/")
+                && before.substring(2).equals(after.substring(2))) return before.substring(2);
+        throw malformedChangeSet();
+    }
+
+    /** hunk 计数是文件边界的权威依据；超出 int 或不完整 header 均失败关闭。 */
+    private static HunkCounts hunkCounts(String header) {
+        Matcher matcher = HUNK_HEADER.matcher(header);
+        if (!matcher.matches()) throw malformedChangeSet();
+        try {
+            return new HunkCounts(matcher.group(2) == null ? 1 : Integer.parseInt(matcher.group(2)),
+                    matcher.group(4) == null ? 1 : Integer.parseInt(matcher.group(4)));
+        } catch (NumberFormatException invalid) {
+            throw malformedChangeSet();
+        }
+    }
+
+    /** 字节扫描保留精确换行范围；所有持久 artifact 都必须以完整 LF 行结束。 */
+    private static ParsedLine line(byte[] bytes, int start) {
+        if (start < 0 || start >= bytes.length) throw malformedChangeSet();
+        int end = start;
+        while (end < bytes.length && bytes[end] != '\n') end++;
+        if (end == bytes.length) throw malformedChangeSet();
+        return new ParsedLine(new String(bytes, start, end - start, StandardCharsets.UTF_8), end + 1);
+    }
+
+    /** ASCII 结构前缀直接在 UTF-8 字节上比较，避免为边界探测重复解码正文。 */
+    private static boolean startsWith(byte[] bytes, int offset, String prefix) {
+        if (offset < 0 || offset + prefix.length() > bytes.length) return false;
+        for (int index = 0; index < prefix.length(); index++) {
+            if (bytes[offset + index] != (byte) prefix.charAt(index)) return false;
+        }
+        return true;
+    }
+
+    /** artifact 路径只是内部 key，但仍拒绝绝对、反斜杠、控制字符和父目录形状。 */
+    private static void validateArtifactPath(String filePath) {
+        if (filePath == null || filePath.isBlank() || filePath.length() > 4_096
+                || filePath.startsWith("/") || filePath.endsWith("/") || filePath.indexOf('\\') >= 0
+                || filePath.indexOf('\0') >= 0 || filePath.indexOf('\r') >= 0 || filePath.indexOf('\n') >= 0) {
+            throw new IllegalArgumentException("invalid artifact file path");
+        }
+        for (String segment : filePath.split("/", -1)) {
+            if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) {
+                throw new IllegalArgumentException("invalid artifact file path");
+            }
+        }
+    }
+
+    /** 损坏 artifact 不允许以部分文件索引继续服务。 */
+    private static IllegalArgumentException malformedChangeSet() {
+        return new IllegalArgumentException("change set artifact is malformed");
+    }
+
+    /** 超时或关闭通过线程中断协作停止 SQL 后的 CPU 解析，避免迟到任务继续占用读取许可。 */
+    private static void requireChangeSetReadActive() {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new java.util.concurrent.CancellationException("change set read interrupted");
+        }
+    }
+
+    /** 每次物化正文都复算摘要，不让持久损坏或陈旧应用缓存绕过完整性门。 */
+    private static String sha256(byte[] content) {
+        try {
+            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
+    /** 文件范围使用 aggregate UTF-8 字节绝对偏移，选中后复制成独立返回正文。 */
+    private record ByteRange(int start, int end) { }
+    /** 单行同时保留已解码文本和下一行字节起点，避免字符数被误作 byte offset。 */
+    private record ParsedLine(String text, int next) { }
+    /** hunk 只需要两侧逻辑行计数来确认下一文件 header 的合法位置。 */
+    private record HunkCounts(int before, int after) { }
+    /** 单次请求的临时解析结果不跨请求保存，方法返回后即可回收聚合正文与索引。 */
+    private record IndexedChangeSet(String artifactId, byte[] bytes, Map<String, ByteRange> files) { }
 
     /**
      * 生命周期操作先检查 active Turn，再执行一次 CAS，不把竞争失败解释为成功。
      */
-    private void lifecycle(String threadId, long expectedRevision, boolean delete) {
-        transactions.required(mapper -> {
+    private ThreadSummary lifecycle(String threadId, long expectedRevision, boolean delete) {
+        return transactions.required(mapper -> {
             if (mapper.history().countActiveTurns(threadId) != 0) {
                 throw new StorageException(StorageException.Code.INVALID_STATE,
                         "active thread cannot change lifecycle");
             }
             if (mapper.history().updateThreadLifecycle(new PersistenceRecords.ThreadLifecycle(
                     threadId, expectedRevision, clock.instant().toString(), delete)) != 1) throw conflict();
-            return null;
+            return delete ? null : thread(mapper.history().selectThread(threadId));
         });
     }
 
@@ -422,7 +628,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         Instant createdAt = Instant.parse(requiredText(row.createdAt(), "created_at"));
         String itemId = snapshotItemId(kind, requiredText(row.itemId(), "item_id"));
         return switch (kind) {
-            case "message" -> textItem(row, createdAt, itemId);
+            case "message" -> messageItem(row, createdAt, itemId);
             case "tool_call" -> new ThreadSnapshot.ToolItem(itemId, createdAt,
                     requiredText(row.turnId(), "turn_id"), ThreadSnapshot.ToolKind.TOOL_CALL,
                     requiredText(row.callId(), "call_id"),
@@ -434,11 +640,6 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     requiredText(row.callId(), "call_id"), requiredText(row.toolName(), "tool_name"),
                     "Tool requires approval", row.decision(),
                     Instant.parse(requiredText(row.expiresAt(), "expires_at")));
-            case "attachment" -> new ThreadSnapshot.AttachmentItem(itemId, createdAt,
-                    requiredText(row.attachmentId(), "attachment_id"), requiredText(row.turnId(), "turn_id"),
-                    requiredText(row.displayName(), "display_name"), requiredNumber(row.sizeBytes(), "size_bytes"),
-                    requiredText(row.mediaKind(), "media_kind"), requiredText(row.mediaType(), "media_type"),
-                    requiredText(row.attachmentState(), "attachment_state"));
             default -> throw new StorageException(StorageException.Code.INVALID_STATE,
                     "unknown snapshot item kind");
         };
@@ -447,11 +648,18 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     /**
      * message 中多个 text blocks 保序拼接；Tool blocks 由 tools 表单独投影。
      */
-    private ThreadSnapshot.TextItem textItem(PersistenceRecords.SnapshotItemRow row, Instant createdAt,
-                                             String itemId) {
+    private ThreadSnapshot.Item messageItem(PersistenceRecords.SnapshotItemRow row, Instant createdAt,
+                                            String itemId) {
+        String messageKind = requiredText(row.messageKind(), "message_kind");
+        if ("USER_INPUT".equals(messageKind)) {
+            return new ThreadSnapshot.UserInputItem(itemId, createdAt,
+                    requiredText(row.turnId(), "turn_id"), codec.readUserContent(
+                            requiredText(row.blocksJson(), "blocks_json")),
+                    codec.readAttachmentSummaries(requiredText(row.attachmentsJson(), "attachments_json")));
+        }
         ThreadSnapshot.TextKind kind;
         try {
-            kind = ThreadSnapshot.TextKind.valueOf(requiredText(row.messageKind(), "message_kind"));
+            kind = ThreadSnapshot.TextKind.valueOf(messageKind);
         } catch (IllegalArgumentException invalid) {
             throw new StorageException(StorageException.Code.INVALID_STATE, "invalid timeline message kind");
         }
@@ -465,8 +673,19 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      */
     private ThreadSnapshot.ContextUsage contextUsage(PersistenceRecords.ContextUsageRow row) {
         try {
-            return new ThreadSnapshot.ContextUsage(requiredText(row.turnId(), "turn_id"),
-                    Math.toIntExact(row.modelRound()), row.inputTokens(), row.outputTokens(), row.totalTokens(),
+            ProviderRequestUsage.Certainty certainty = ProviderRequestUsage.Certainty.valueOf(
+                    requiredText(row.certainty(), "certainty"));
+            ProviderRequestProfile profile = codec.readProviderRequestProfile(
+                    requiredText(row.profileJson(), "profile_json"));
+            io.github.kongweiguang.ja.conversation.domain.model.ModelUsage usage =
+                    certainty == ProviderRequestUsage.Certainty.UNKNOWN ? null
+                            : new io.github.kongweiguang.ja.conversation.domain.model.ModelUsage(
+                                    row.inputTokens(), row.outputTokens(), row.totalTokens());
+            ProviderRequestUsage request = new ProviderRequestUsage(
+                    requiredText(row.requestId(), "request_id"), row.requestOrdinal(),
+                    Math.toIntExact(row.modelRound()), ProviderRequestUsage.Purpose.valueOf(
+                            requiredText(row.purpose(), "purpose")), certainty, profile, usage);
+            return new ThreadSnapshot.ContextUsage(requiredText(row.turnId(), "turn_id"), request,
                     Instant.parse(requiredText(row.occurredAt(), "occurred_at")));
         } catch (ArithmeticException | IllegalArgumentException failure) {
             throw new StorageException(StorageException.Code.INVALID_STATE, "invalid context usage");
@@ -490,16 +709,6 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         }
     }
 
-    /** 返回 UTF-8 内容 SHA-256，用于验证 Rust 交付的冻结 diff 没有跨 IPC 漂移。 */
-    private static String sha256(String value) {
-        try {
-            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 is unavailable", impossible);
-        }
-    }
-
     /**
      * 将 Workspace 行转换为领域对象，并在边界处校验必需列。
      */
@@ -517,28 +726,19 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                 ? ThreadSummary.Status.ACTIVE : ThreadSummary.Status.ARCHIVED;
         return new ThreadSummary(requiredText(row.threadId(), "thread_id"),
                 requiredText(row.workspaceId(), "workspace_id"), requiredText(row.title(), "title"),
-                PersistenceRowProjections.threadPreferences(row), status, row.revision(),
+                PersistenceRowProjections.threadPreferences(row), status, row.pinnedAt() != null,
+                row.latestTurnStatus() == null ? null
+                        : TurnState.valueOf(requiredText(row.latestTurnStatus(), "latest_turn_status")),
+                row.latestTurnSeen(), row.activeGoalId(),
+                row.revision(),
                 Instant.parse(requiredText(row.createdAt(), "created_at")),
                 Instant.parse(requiredText(row.updatedAt(), "updated_at")));
     }
 
-    /**
-     * Domain/Wire 使用面向产品的 AUTO/MANUAL，SQLite V2 schema 使用稳定事实名
-     * AUTOMATIC/USER；在唯一 persistence adapter 显式映射，避免枚举 name 泄漏成存储契约。
-     */
-    private static String titleSourceStorage(ThreadPreferences.TitleSource source) {
-        return switch (Objects.requireNonNull(source, "source")) {
-            case PLACEHOLDER -> "PLACEHOLDER";
-            case AUTO -> "AUTOMATIC";
-            case MANUAL -> "USER";
-        };
-    }
-
-    /** 历史 Turn 投影不读取消息页 cursor，并拒绝任何缺失的运行快照列。 */
+    /** 历史 Turn 只投影 Operation 生命周期；请求级模型事实由 Context Usage 提供。 */
     private ThreadSnapshot.Turn snapshotTurn(PersistenceRecords.TurnRow row) {
-        TurnRuntimeSnapshot runtime = PersistenceRowProjections.turnRuntime(row);
         return new ThreadSnapshot.Turn(requiredText(row.turnId(), "turn_id"),
-                requiredText(row.state(), "state").toLowerCase(Locale.ROOT), runtime,
+                requiredText(row.state(), "state").toLowerCase(Locale.ROOT),
                 Instant.parse(requiredText(row.requestedAt(), "requested_at")),
                 Instant.parse(requiredText(row.updatedAt(), "updated_at")),
                 row.completedAt() == null ? null : Instant.parse(row.completedAt()), row.errorCode(),
@@ -562,7 +762,21 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     /**
      * Thread 分页独立保持自己的稳定身份键，避免用动态列探测复用 Workspace 逻辑。
      */
-    private static CursorPage<ThreadSummary> threadPage(List<PersistenceRecords.ThreadRow> rows, int limit) {
+    private static CursorPage<ThreadSummary> activeThreadPage(List<PersistenceRecords.ThreadRow> rows, int limit) {
+        String next = null;
+        if (rows.size() > limit) {
+            rows = new ArrayList<>(rows.subList(0, limit));
+            PersistenceRecords.ThreadRow last = rows.getLast();
+            String updatedAt = requiredText(last.updatedAt(), "updated_at");
+            next = encodeThreadCursor(last.pinnedAt() == null ? 0 : 1,
+                    last.pinnedAt() == null ? updatedAt : last.pinnedAt(), updatedAt,
+                    requiredText(last.threadId(), "thread_id"));
+        }
+        return new CursorPage<>(rows.stream().map(MybatisHistoryService::thread).toList(), next);
+    }
+
+    /** 搜索保留归档项并继续使用纯更新时间 keyset，不让置顶改变恢复入口的结果顺序。 */
+    private static CursorPage<ThreadSummary> searchThreadPage(List<PersistenceRecords.ThreadRow> rows, int limit) {
         String next = null;
         if (rows.size() > limit) {
             rows = new ArrayList<>(rows.subList(0, limit));
@@ -571,6 +785,31 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     requiredText(last.threadId(), "thread_id"));
         }
         return new CursorPage<>(rows.stream().map(MybatisHistoryService::thread).toList(), next);
+    }
+
+    /** active Thread 游标冻结完整排序元组，跨置顶/普通分组翻页不会重复或遗漏。 */
+    private static String encodeThreadCursor(int pinned, String sortTime, String updatedAt, String id) {
+        String value = pinned + "\n" + sortTime + "\n" + updatedAt + "\n" + id;
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** 严格解析完整排序元组，拒绝缺失字段或越界分组值，避免跨页重复和遗漏。 */
+    private static ThreadCursor decodeThreadCursor(String cursor) {
+        if (cursor == null) return null;
+        try {
+            String[] parts = new String(Base64.getUrlDecoder().decode(cursor), StandardCharsets.UTF_8)
+                    .split("\n", -1);
+            if (parts.length != 4 || parts[3].isBlank()) {
+                throw new IllegalArgumentException();
+            }
+            int pinned = Integer.parseInt(parts[0]);
+            if (pinned < 0 || pinned > 1) throw new IllegalArgumentException();
+            Instant.parse(parts[1]);
+            Instant.parse(parts[2]);
+            return new ThreadCursor(pinned, parts[1], parts[2], parts[3]);
+        } catch (RuntimeException failure) {
+            throw new IllegalArgumentException("invalid thread history cursor", failure);
+        }
     }
 
     /**
@@ -607,6 +846,10 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      * 保存已经严格校验的 keyset 分页位置，禁止携带旧 offset 语义。
      */
     private record Cursor(String time, String id) {
+    }
+
+    /** 保存 active Thread 的四段稳定排序边界。 */
+    private record ThreadCursor(int pinned, String sortTime, String updatedAt, String id) {
     }
 
     /**

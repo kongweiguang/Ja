@@ -3,7 +3,7 @@
 
 """Run the production Native Image sidecar through a bounded activation handshake.
 
-This is a CI-only smoke gate. It deliberately uses the frozen protocol fixture shape instead of
+This is a CI-only smoke gate. It deliberately uses the current protocol fixture shape instead of
 implementing a second protocol client: the gate proves that the built executable starts, publishes
 the Ja Kernel identity, opens fresh SQLite and Skills through the production graph, exercises only
 host-local Provider/MCP probes, and shuts down cleanly.
@@ -33,22 +33,37 @@ import jsonschema
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 READY_TOKEN = "0123456789abcdef0123456789abcdef"
+EXPECTED_ENGINE_VERSION = json.loads(
+    (Path(__file__).parents[2] / "package.json").read_text(encoding="utf-8")
+)["version"]
 METHODS = [
     "runtime/initialize", "runtime/health", "runtime/shutdown", "workspace/open", "workspace/open-general", "workspace/list",
-    "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list", "thread/search",
-    "thread/read", "thread/rename", "thread/preferences/update", "thread/archive", "thread/delete", "thread/compact",
-    "attachment/import", "attachment/discard", "turn/start", "turn/cancel", "turn/steer", "turn/follow-up",
-    "turn/change-set/commit", "turn/change-set/read",
+    "workspace/path/search", "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list", "thread/search",
+    "thread/read", "thread/rename", "thread/pin", "thread/seen", "thread/preferences/update", "thread/archive",
+    "thread/restore", "thread/delete", "thread/compact",
+    "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read", "plan/revisions/list",
+    "goal/evidence/list", "goal/create", "goal/plan/attach", "goal/plan/detach", "goal/pause", "goal/resume",
+    "goal/stop", "goal/input/respond", "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose",
+    "plan/approve", "plan/execute", "plan/reject",
+    "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
+    "task/message/send", "task/followup", "task/cancel", "task/tree/delete",
+    "attachment/import", "attachment/discard", "attachment/preview/open", "attachment/preview/read",
+    "attachment/preview/close", "turn/start", "turn/resume", "turn/cancel", "turn/input/enqueue",
+    "turn/input/prioritize", "turn/input/update", "turn/input/delete", "turn/change-set/read",
     "approval/respond", "configuration/read", "configuration/patch", "configuration/replace",
     "configuration/reset", "credential/set", "credential/delete", "skill/list", "mcp/list",
-    "mcp/test", "mcp/list-tools", "tool/artifact/read",
+    "mcp/test", "model/test", "mcp/list-tools", "tool/artifact/read",
 ]
 EVENTS = [
-    "runtime/status-changed", "turn/state-changed", "assistant/model-step-committed",
-    "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/batch-committed",
+    "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",
+    "assistant/model-step-committed",
+    "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",
     "approval/requested", "approval/resolved", "context/compaction-started", "context/compacted",
     "context/compaction-failed",
-    "workspace/dirty", "turn/terminal", "thread/metadata-changed", "configuration/changed",
+    "workspace/dirty", "turn/terminal",
+    "thread/metadata-changed", "configuration/changed",
+    "task/activity", "task/progress", "task/mailbox-changed",
+    "goal/changed", "goal/activity", "goal/input-requested",
 ]
 SECRET_NAME_PARTS = (
     "API_KEY",
@@ -58,16 +73,29 @@ SECRET_NAME_PARTS = (
     "BEARER",
     "CREDENTIAL",
 )
-LEAK_PATTERN = re.compile(r"api[_ -]?key|bearer|sk-[a-z0-9]|github_token", re.IGNORECASE)
+# 协议目录合法包含 credential/set 等公开标识；这里只匹配带值的凭据形态，精确 smoke secret 另行检查。
+LEAK_PATTERN = re.compile(
+    r"api[_ -]?key[\"']?\s*[:=]\s*[\"']?[^\s,}\"]{8,}"
+    r"|bearer\s+[a-z0-9._-]{8,}|sk-[a-z0-9_-]{8,}|github_token\s*[:=]",
+    re.IGNORECASE,
+)
 SMOKE_SECRET = "ja-native-smoke-placeholder-secret"
-SCHEMA_PATH = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
+SCHEMA_PATH = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
 PROVIDER_ID = "provider_native_smoke"
 MODEL_ID = "model_native_smoke"
 CREDENTIAL_ID = "cred_native_smoke"
 MCP_ID = "mcp_native_smoke"
-SKILL_ID = "skill_native_coding"
+SKILL_ID = "skill_native_workspace"
+SKILL_NAME = "native-smoke"
+SKILL_DESCRIPTION = "Workspace Skill used by the Native activation gate"
 SMOKE_TEXT = "JA_NATIVE_PROVIDER_TEXT"
 SHELL_COMMAND = "Start-Sleep -Seconds 30"
+SHELL_CANCEL_CALL_ID = "call_shell_cancel"
+SHELL_STDIN_EOF_CALL_ID = "call_shell_stdin_eof"
+SHELL_STDIN_EOF_COMMAND = (
+    "$input=[Console]::In.ReadToEnd(); "
+    "if ($input.Length -ne 0) { exit 9 }; Write-Output 'JA_NATIVE_STDIN_EOF'"
+)
 
 # Keep this closure deliberately explicit.  A Native smoke report is a release gate, so adding a
 # capability without adding it here would silently turn an unverified feature into a green result.
@@ -77,6 +105,7 @@ REQUIRED_SUBGATES = (
     "okhttpSse",
     "mcp",
     "shellCancellation",
+    "shellStdinEof",
     "sqlite",
     "recovery",
     "networknt",
@@ -173,7 +202,7 @@ def initialize_frame() -> dict[str, Any]:
     """Build the smallest client capability document that exercises the real handshake.
 
     The production runtime must remain startable before a Provider/model selection is activated. The smoke
-    sends the complete frozen v2 capability vocabulary because the server rejects negotiation
+    sends the complete current v1 capability vocabulary because the server rejects negotiation
     subsets. No configuration or credential is sent, so this gate cannot call a provider.
     """
 
@@ -182,13 +211,15 @@ def initialize_frame() -> dict[str, Any]:
         "id": "c:init",
         "method": "runtime/initialize",
         "params": {
-            "protocolMajor": 2,
+            "protocolMajor": 1,
             "protocolMinor": 0,
             "clientVersion": "ja-native-ci",
             "capabilities": {
                 "methods": METHODS,
                 "events": EVENTS,
                 "accessModes": ["approval_required", "full_access"],
+                "collaborationModes": ["default", "plan"],
+                "features": ["task_threads_v1", "plan_goal_v1"],
             },
             "limits": {
                 "maxFrameBytes": 4194304,
@@ -199,6 +230,8 @@ def initialize_frame() -> dict[str, Any]:
                 "maxConcurrentTurns": 8,
                 "maxAdmittedTurns": 64,
                 "maxThreadQueuedTurns": 8,
+                "maxTurnQueuedInputs": 8,
+                "maxTurnQueuedInputBytes": 524_288,
                 "maxSnapshotPageItems": 200,
                 "maxToolBatchConcurrency": 8,
             },
@@ -214,6 +247,19 @@ def initialized_frame() -> dict[str, Any]:
         "method": "runtime/initialized",
         "params": {"readyToken": READY_TOKEN},
     }
+
+
+def require_initialize_identity(result: Any, expected_engine_version: str) -> dict[str, Any]:
+    """严格绑定 Kernel 名称和协议版本，防止 smoke 对过期 Native 产物误报通过。"""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("native sidecar did not acknowledge initialize")
+    runtime = result.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("engine") != "ja-kernel":
+        raise RuntimeError("initialize did not report the Ja Kernel runtime")
+    if runtime.get("engineVersion") != expected_engine_version:
+        raise RuntimeError("initialize did not report the expected Kernel engine version")
+    return result
 
 
 def shutdown_frame() -> dict[str, Any]:
@@ -236,10 +282,22 @@ def workspace_open_frame(workspace: Path) -> dict[str, Any]:
     }
 
 
-def skill_list_frame() -> dict[str, Any]:
-    """Force the production graph to open SQLite and scan Native Image Skill resources."""
+def workspace_trust_frame(workspace_id: str) -> dict[str, Any]:
+    """Trust the exact server-owned Workspace before project Skills may enter a Turn snapshot."""
 
-    return {"jsonrpc": "2.0", "id": "c:skills", "method": "skill/list", "params": {}}
+    return {
+        "jsonrpc": "2.0",
+        "id": "c:workspace-trust",
+        "method": "workspace/set-trust",
+        "params": {"workspaceId": workspace_id, "trust": "trusted"},
+    }
+
+
+def skill_list_frame(workspace_id: str | None = None) -> dict[str, Any]:
+    """Request the real Skill catalog while keeping project roots behind an opaque identity."""
+
+    params = {} if workspace_id is None else {"workspaceId": workspace_id}
+    return {"jsonrpc": "2.0", "id": "c:skills", "method": "skill/list", "params": params}
 
 
 def health_read_frame() -> dict[str, Any]:
@@ -258,21 +316,20 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
     """Build the bounded local-loopback document used by runtime probes.
 
     The document contains no credential bytes and points only at servers owned by this smoke
-    process. Keeping Provider and models in the same v3 batch as the MCP descriptor proves that the
+    process. Keeping Provider and models in the same v1 batch as the MCP descriptor proves that the
     executable resolves one immutable generation instead of relying on a test-only provider hook.
     """
 
     return {
-        "schema_version": 3,
+        "schema_version": 1,
         "config_revision": 0,
         "default_access_mode": "approval_required",
         "default_provider_id": PROVIDER_ID,
         "default_model_id": MODEL_ID,
-        "default_reasoning_effort": None,
+        "default_reasoning_level": None,
         "providers": [{
             "provider_id": PROVIDER_ID,
             "name": "Native local probe",
-            "provider": "openai",
             "api": "openai_responses",
             "base_url": provider_endpoint,
             "credential_id": CREDENTIAL_ID,
@@ -284,8 +341,6 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
                     "max_tool_calls": 8,
                     "wall_timeout_ms": 30_000,
                 },
-                "skill_ids": [SKILL_ID],
-                "mcp_ids": [MCP_ID],
             },
             "models": [{
                 "model_id": MODEL_ID,
@@ -294,10 +349,9 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
                 "capabilities": {
                     "context_window_tokens": 128_000,
                     "max_output_tokens": 8_192,
-                    "input_modalities": ["text"],
                 },
-                "reasoning_efforts": [],
-                "default_reasoning_effort": None,
+                "reasoning_level_map": {},
+                "default_reasoning_level": None,
             }],
         }],
         "mcp_servers": [{
@@ -313,12 +367,32 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
         }],
         "skills": [{
             "skill_id": SKILL_ID,
-            "name": "coding",
-            "scope": "builtin",
+            "name": SKILL_NAME,
+            "scope": "project",
             "enabled": True,
-            "description": "Built-in coding workflow used by the Native activation gate",
+            "description": SKILL_DESCRIPTION,
         }],
     }
+
+
+def write_workspace_skill(workspace: Path) -> Path:
+    """Create one real project Skill so Native discovery is tested without bundled fixtures."""
+
+    skill_root = workspace / ".agents" / "skills" / SKILL_NAME
+    skill_root.mkdir(parents=True)
+    document = skill_root / "SKILL.md"
+    document.write_text(
+        "---\n"
+        f"name: {SKILL_NAME}\n"
+        f"description: {SKILL_DESCRIPTION}.\n"
+        "---\n"
+        "<!-- @author kongweiguang -->\n\n"
+        "# Native smoke Skill\n\n"
+        "Do not perform a model turn.\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return document
 
 
 def configuration_replace_frame(
@@ -326,7 +400,7 @@ def configuration_replace_frame(
     provider_endpoint: str | None = None,
     mcp_endpoint: str | None = None,
 ) -> dict[str, Any]:
-    """通过 v3 replace CAS 构造严格的本地探针配置文档。
+    """通过 v1 replace CAS 构造严格的本地探针配置文档。
 
     无法提供 loopback 探针的调用方使用合同测试所需的空目录；生产 smoke 在发送前必须同时
     提供 Provider 与 MCP endpoint。
@@ -334,12 +408,12 @@ def configuration_replace_frame(
 
     document = configuration_document(provider_endpoint, mcp_endpoint) \
         if provider_endpoint and mcp_endpoint else {
-            "schema_version": 3,
+            "schema_version": 1,
             "config_revision": 0,
             "default_access_mode": "full_access",
             "default_provider_id": None,
             "default_model_id": None,
-            "default_reasoning_effort": None,
+            "default_reasoning_level": None,
             "providers": [],
             "mcp_servers": [],
             "skills": [],
@@ -379,20 +453,30 @@ def credential_delete_frame(expected_version: str) -> dict[str, Any]:
     }
 
 
-def thread_create_frame(workspace: Path) -> dict[str, Any]:
-    """Persist one Thread with explicit v3 preferences while Java retains canonical workspace identity."""
+def thread_create_frame(
+    workspace: Path,
+    *,
+    frame_id: str = "c:thread",
+    title: str = "Native activation smoke",
+) -> dict[str, Any]:
+    """Persist an isolated probe Thread while Java retains canonical workspace identity.
+
+    Distinct probe identities prevent an earlier Tool result from changing the deterministic
+    loopback Provider route selected for a later lifecycle probe.
+    """
 
     params: dict[str, Any] = {
         "cwd": str(workspace.resolve()),
-        "title": "Native activation smoke",
+        "title": title,
         "providerId": PROVIDER_ID,
         "modelId": MODEL_ID,
-        "reasoningEffort": None,
+        "reasoningLevel": None,
         "accessMode": "approval_required",
+        "collaborationMode": "default",
     }
     return {
         "jsonrpc": "2.0",
-        "id": "c:thread",
+        "id": frame_id,
         "method": "thread/create",
         "params": params,
     }
@@ -420,7 +504,7 @@ def mcp_tools_read_frame() -> dict[str, Any]:
 
 
 def turn_start_frame(thread_id: str, text: str) -> dict[str, Any]:
-    """Start a bounded workspace Turn through the public v2 RPC rather than a private test hook."""
+    """Start a bounded workspace Turn through the public v1 RPC rather than a private test hook."""
 
     return {
         "jsonrpc": "2.0", "id": "c:turn-start", "method": "turn/start",
@@ -453,9 +537,47 @@ def approval_response_frame(approval_id: str, turn_id: str, expected_revision: i
 
 
 def thread_read_frame(thread_id: str) -> dict[str, Any]:
-    """Read the durable Thread projection after a process restart."""
+    """Read the durable Thread projection before or after a process restart."""
 
     return {"jsonrpc": "2.0", "id": "c:thread-read", "method": "thread/read", "params": {"threadId": thread_id}}
+
+
+def thread_rename_frame(thread_id: str, expected_revision: int) -> dict[str, Any]:
+    """Take manual title ownership so the Provider request-count probe has exactly one producer."""
+
+    return {
+        "jsonrpc": "2.0",
+        "id": "c:thread-rename",
+        "method": "thread/rename",
+        "params": {
+            "threadId": thread_id,
+            "title": "Native activation smoke",
+            "expectedThreadRevision": expected_revision,
+        },
+    }
+
+
+def require_known_context_usage(
+    snapshot: dict[str, Any], expected_turn_id: str, expected_model_round: int = 1,
+) -> dict[str, Any]:
+    """Require the latest exact request Usage so an older KNOWN record cannot mask current state."""
+
+    usage = snapshot.get("contextUsage")
+    expected = {
+        "turnId": expected_turn_id,
+        "modelRound": expected_model_round,
+        "purpose": "assistant",
+        "certainty": "known",
+        "inputTokens": 5,
+        "outputTokens": 5,
+        "totalTokens": 10,
+    }
+    if not isinstance(usage, dict) or any(usage.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("Thread recovery did not return the exact persisted Provider Usage")
+    measured_at = usage.get("measuredAt")
+    if not isinstance(measured_at, str) or not measured_at:
+        raise RuntimeError("persisted Provider Usage has no measurement timestamp")
+    return usage
 
 
 def sanitized_environment() -> dict[str, str]:
@@ -535,10 +657,12 @@ class LoopbackProvider:
         class Handler(BaseHTTPRequestHandler):
             """Keep HTTP logging and request-body retention out of the smoke process."""
 
-            def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                """Serve current Responses token counting and the bounded streaming model path."""
+            protocol_version = "HTTP/1.1"
 
-                if self.path not in ("/v1/responses", "/v1/responses/input_tokens"):
+            def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                """Serve only the bounded generation path so remote token counting fails visibly."""
+
+                if self.path != "/v1/responses":
                     self.send_error(404)
                     return
                 length = int(self.headers.get("Content-Length", "0"))
@@ -554,26 +678,26 @@ class LoopbackProvider:
                     self.send_error(400)
                     return
                 owner.request_count += 1
-                if self.path == "/v1/responses/input_tokens":
-                    payload = json.dumps({"input_tokens": 5}, separators=(",", ":")).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
-                    return
                 input_items = request.get("input")
+                tools = request.get("tools")
                 has_tool_result = isinstance(input_items, list) and any(
                     isinstance(item, dict) and item.get("type") == "function_call_output"
                     for item in input_items
                 )
+                advertises_shell = isinstance(tools, list) and any(
+                    isinstance(tool, dict) and tool.get("name") == "shell"
+                    for tool in tools
+                )
                 # Dynamic guidance now lives in Provider instructions, so input contains only
-                # durable conversation messages and can be used directly for intent routing.
+                # durable conversation messages. Automatic title requests may contain the same
+                # user text but advertise no tools, so capability presence is also required.
                 prompt = json.dumps(input_items or [], ensure_ascii=False)
                 if has_tool_result:
                     stream = owner.text_stream("JA_NATIVE_SHELL_CANCELLED")
-                elif "shell" in prompt.casefold():
-                    stream = owner.shell_stream()
+                elif advertises_shell and "stdin eof" in prompt.casefold():
+                    stream = owner.shell_stream(SHELL_STDIN_EOF_COMMAND, SHELL_STDIN_EOF_CALL_ID)
+                elif advertises_shell and "shell" in prompt.casefold():
+                    stream = owner.shell_stream(SHELL_COMMAND, SHELL_CANCEL_CALL_ID)
                 else:
                     stream = owner.text_stream(SMOKE_TEXT)
                 payload = stream.encode("utf-8")
@@ -658,14 +782,15 @@ class LoopbackProvider:
             }),
         ))
 
-    def shell_stream(self) -> str:
-        """Return one shell Tool call so the public approval/cancel path can be exercised."""
+    def shell_stream(self, command: str, call_id: str) -> str:
+        """Return one globally unique shell Tool identity for a deterministic lifecycle probe."""
 
         response_id = f"resp_native_{self.request_count}"
+        item_id = f"item_{call_id}"
         arguments = json.dumps(
-            {"command": SHELL_COMMAND}, separators=(",", ":")
+            {"command": command}, separators=(",", ":")
         )
-        item = {"id": "item_shell", "type": "function_call", "call_id": "call_shell",
+        item = {"id": item_id, "type": "function_call", "call_id": call_id,
                 "name": "shell", "arguments": arguments}
         return "".join((
             self._event("response.created", 0, {"response": self._response(response_id, "in_progress", [], False)}),
@@ -673,10 +798,10 @@ class LoopbackProvider:
                 "output_index": 0, "item": {**item, "arguments": ""},
             }),
             self._event("response.function_call_arguments.delta", 2, {
-                "item_id": "item_shell", "delta": arguments, "output_index": 0,
+                "item_id": item_id, "delta": arguments, "output_index": 0,
             }),
             self._event("response.function_call_arguments.done", 3, {
-                "item_id": "item_shell", "name": "shell", "arguments": arguments, "output_index": 0,
+                "item_id": item_id, "name": "shell", "arguments": arguments, "output_index": 0,
             }),
             self._event("response.output_item.done", 4, {"output_index": 0, "item": item}),
             self._event("response.completed", 5, {
@@ -882,13 +1007,13 @@ def sidecar_command(
 
 
 def load_schema_validator() -> jsonschema.Draft202012Validator:
-    """Load the repository-owned v2 schema once so every outgoing smoke request is contract-checked."""
+    """Load the repository-owned v1 schema once so every outgoing smoke request is contract-checked."""
 
     try:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         return jsonschema.Draft202012Validator(schema)
     except (OSError, json.JSONDecodeError, jsonschema.SchemaError) as failure:
-        raise RuntimeError("v2 JSON Schema is unavailable or malformed") from failure
+        raise RuntimeError("v1 JSON Schema is unavailable or malformed") from failure
 
 
 def send_frame(
@@ -902,7 +1027,7 @@ def send_frame(
         try:
             validator.validate(frame)
         except jsonschema.ValidationError as failure:
-            raise RuntimeError("native smoke emitted a frame outside the v2 schema") from failure
+            raise RuntimeError("native smoke emitted a frame outside the v1 schema") from failure
 
     if process.stdin is None:
         raise RuntimeError("native sidecar stdin is unavailable")
@@ -1103,6 +1228,55 @@ def sanitized_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sanitized
 
 
+def native_probe_diagnostics(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """只保留状态、结果与 Usage 数值，便于定位门禁失败且不泄露身份或业务内容。"""
+
+    diagnostics: list[dict[str, Any]] = []
+    for document in documents:
+        method = document.get("method")
+        params = document.get("params")
+        occurred_at = params.get("occurredAt") if isinstance(params, dict) else None
+        if method == "tool/batch-committed" and isinstance(params, dict):
+            results = params.get("results")
+            diagnostics.append({
+                "method": method,
+                "occurredAt": occurred_at,
+                "outcomes": [
+                    result.get("outcome")
+                    for result in results
+                    if isinstance(result, dict) and isinstance(result.get("outcome"), str)
+                ] if isinstance(results, list) else [],
+            })
+        elif method == "turn/terminal" and isinstance(params, dict):
+            diagnostics.append({
+                "method": method,
+                "occurredAt": occurred_at,
+                "state": params.get("state"),
+                "errorCode": params.get("errorCode"),
+            })
+        elif method in ("turn/state-changed", "approval/requested", "approval/resolved", "tool/started") \
+                and isinstance(params, dict):
+            diagnostics.append({
+                "method": method,
+                "occurredAt": occurred_at,
+                "state": params.get("state"),
+            })
+        elif document.get("id") == "c:thread-read":
+            result = document.get("result")
+            usage = result.get("contextUsage") if isinstance(result, dict) else None
+            diagnostics.append({
+                "method": "thread/read",
+                "usage": {
+                    key: usage.get(key)
+                    for key in (
+                        "requestOrdinal", "modelRound", "purpose", "certainty",
+                        "inputTokens", "outputTokens", "totalTokens",
+                    )
+                } if isinstance(usage, dict) else None,
+            })
+    return diagnostics[-32:]
+
+
 def auth_acl_evidence(auth_path: Path) -> dict[str, Any]:
     """Prove the Windows auth file is non-inherited and current-user-only without retaining ACL text."""
 
@@ -1144,7 +1318,7 @@ def run_smoke(
     expected_size: int | None = None,
     expected_mtime_ns: int | None = None,
 ) -> dict[str, Any]:
-    """Execute the v2 lifecycle and every reachable local probe with bounded cleanup.
+    """Execute the v1 lifecycle and every reachable local probe with bounded cleanup.
 
     The real executable path receives loopback Provider/MCP servers so transport, schema, cancel,
     and recovery gates exercise production RPC.  A supplied command prefix denotes a contract
@@ -1179,6 +1353,7 @@ def run_smoke(
             encoding="utf-8",
             newline="\n",
         )
+    write_workspace_skill(workspace)
 
     provider_probe = LoopbackProvider() if command_prefix is None else None
     mcp_probe = LoopbackMcp() if command_prefix is None else None
@@ -1229,14 +1404,8 @@ def run_smoke(
     try:
         send(initialize_frame())
         initialize = read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:init")
-        if not isinstance(initialize.get("result"), dict):
-            raise RuntimeError("native sidecar did not acknowledge initialize")
-        result = initialize["result"]
-        runtime = result.get("runtime")
-        if not isinstance(runtime, dict) or runtime.get("engine") != "ja-kernel":
-            raise RuntimeError("initialize did not report the Ja Kernel runtime")
-        if not isinstance(runtime.get("engineVersion"), str) or not runtime["engineVersion"]:
-            raise RuntimeError("initialize did not report a Kernel engine version")
+        result = require_initialize_identity(initialize.get("result"), EXPECTED_ENGINE_VERSION)
+        runtime = result["runtime"]
 
         send(initialized_frame())
         read_until(stdout_collector, documents, deadline, validator=schema_validator, predicate=ready_frame)
@@ -1259,7 +1428,7 @@ def run_smoke(
         )
         if configuration_replace.get("accepted") is not True or configuration_replace.get("scope") != "user" \
                 or not isinstance(configuration_replace.get("version"), str):
-            raise RuntimeError("configuration replace returned an invalid v3 projection")
+            raise RuntimeError("configuration replace returned an invalid v1 projection")
 
         send(credential_set_frame(expected_credential_version))
         credential_set = require_success(
@@ -1280,6 +1449,20 @@ def run_smoke(
         if not isinstance(workspace_id, str) or not workspace_id.startswith("ws_"):
             raise RuntimeError("native sidecar returned an invalid workspace identity")
 
+        send(workspace_trust_frame(workspace_id))
+        workspace_trust = require_success(
+            read_until(
+                stdout_collector,
+                documents,
+                deadline,
+                validator=schema_validator,
+                frame_id="c:workspace-trust",
+            ),
+            "workspace trust",
+        )
+        if workspace_trust.get("accepted") is not True:
+            raise RuntimeError("native sidecar did not accept workspace trust")
+
         send(health_read_frame())
         health_response = read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:health")
         health = require_success(health_response, "health read")
@@ -1293,13 +1476,13 @@ def run_smoke(
         if not sqlite_ready or not kernel_ready:
             raise RuntimeError("native sidecar SQLite and Kernel health is not ready")
 
-        send(skill_list_frame())
+        send(skill_list_frame(workspace_id))
         skills_response = read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:skills")
         skills = require_success(skills_response, "Skill discovery").get("items")
         if not isinstance(skills, list) or not any(
-            isinstance(skill, dict) and skill.get("name") == "coding" for skill in skills
+            isinstance(skill, dict) and skill.get("name") == SKILL_NAME for skill in skills
         ):
-            raise RuntimeError("native sidecar did not discover the builtin coding Skill")
+            raise RuntimeError("native sidecar did not discover the workspace smoke Skill")
 
         mcp_evidence: dict[str, Any]
         networknt_evidence: dict[str, Any]
@@ -1360,11 +1543,27 @@ def run_smoke(
             raise RuntimeError("native sidecar did not persist a fresh-schema Thread")
         if thread.get("workspaceId") != workspace_id:
             raise RuntimeError("thread/create did not retain Java's workspace identity")
+        if provider_probe is not None:
+            thread_revision = thread.get("revision")
+            if not isinstance(thread_revision, int):
+                raise RuntimeError("thread/create did not return a revision")
+            send(thread_rename_frame(thread["threadId"], thread_revision))
+            thread = require_success(
+                read_until(stdout_collector, documents, deadline, validator=schema_validator,
+                           frame_id="c:thread-rename"),
+                "manual Thread title ownership",
+            )
 
+        recovery_usage_thread_id: str | None = None
+        recovery_usage_turn_id: str | None = None
+        recovery_usage_model_round = 1
         if provider_probe is None:
             okhttp_evidence = probe_blocked("the supplied mock fixture has no Provider HTTP/SSE probe")
             shell_cancel_evidence = probe_blocked(
                 "the supplied mock fixture has no shell approval/cancellation probe",
+            )
+            shell_stdin_eof_evidence = probe_blocked(
+                "the supplied mock fixture has no shell stdin EOF probe",
             )
         else:
             try:
@@ -1391,13 +1590,35 @@ def run_smoke(
                 ]
                 text_ok = text_terminal.get("params", {}).get("state") == "completed" \
                     and any(frame["params"].get("text") == SMOKE_TEXT for frame in text_events)
-                if not text_ok or provider_probe.request_count < 1:
+                text_turn_requests = provider_probe.request_count
+                if not text_ok or text_turn_requests != 1:
                     raise RuntimeError(f"Provider text Turn {terminal_failure_label(text_terminal)}")
-                okhttp_evidence = probe_passed(
-                    requests=provider_probe.request_count,
-                    textTurn=text_turn_id,
+                send(thread_read_frame(thread["threadId"]))
+                persisted_thread = require_success(
+                    read_until(stdout_collector, documents, deadline, validator=schema_validator,
+                               frame_id="c:thread-read"),
+                    "Provider Usage persistence",
                 )
+                persisted_usage = require_known_context_usage(persisted_thread, text_turn_id)
+                recovery_usage_thread_id = thread["threadId"]
+                recovery_usage_turn_id = text_turn_id
+                okhttp_evidence = probe_passed(
+                    requests=text_turn_requests,
+                    estimateHttpRequests=0,
+                    textTurn=text_turn_id,
+                    usage={key: persisted_usage[key] for key in (
+                        "certainty", "inputTokens", "outputTokens", "totalTokens",
+                    )},
+                )
+            except RuntimeError as failure:
+                reason = str(failure)
+                if "METHOD_NOT_FOUND" in reason or "provider" in reason.casefold() and "not" in reason.casefold():
+                    okhttp_evidence = probe_blocked(f"production Provider probe is unavailable: {reason}")
+                else:
+                    okhttp_evidence = probe_failed(f"production Provider probe failed: {reason}")
 
+            shell_turn_id: str | None = None
+            try:
                 send(turn_start_frame(
                     thread["threadId"],
                     "Use the shell tool with the exact command and wait for approval, then report completion.",
@@ -1409,6 +1630,8 @@ def run_smoke(
                 shell_turn_id = shell_accept.get("turnId")
                 if not isinstance(shell_turn_id, str) or not shell_turn_id.startswith("turn_"):
                     raise RuntimeError("Provider shell Turn returned an invalid identity")
+                recovery_usage_thread_id = thread["threadId"]
+                recovery_usage_turn_id = shell_turn_id
                 approval = read_until_turn_event(
                     stdout_collector, documents, deadline,
                     shell_turn_id,
@@ -1426,11 +1649,20 @@ def run_smoke(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:approval"),
                     "shell approval",
                 )
-                # approval/respond 只在 RUNNING 迁移已经持久化后返回该提交的 revision；Tool
-                # 结果提交前 revision 不再变化，因此直接使用回执可消除额外 snapshot 竞态。
-                cancel_revision = approval_result.get("threadRevision")
-                if not isinstance(cancel_revision, int):
-                    raise RuntimeError("approval response did not return a shell cancellation revision")
+                if not isinstance(approval_result.get("threadRevision"), int):
+                    raise RuntimeError("approval response did not return a committed revision")
+                started = read_until_turn_event(
+                    stdout_collector, documents, deadline,
+                    shell_turn_id,
+                    "tool/started",
+                    validator=schema_validator,
+                )
+                started_params = started.get("params", {})
+                cancel_revision = started_params.get("threadRevision")
+                if started_params.get("callId") != SHELL_CANCEL_CALL_ID \
+                        or started_params.get("ordinal") != 0 \
+                        or not isinstance(cancel_revision, int):
+                    raise RuntimeError("shell started projection is incomplete")
                 send(turn_cancel_frame(shell_turn_id, cancel_revision))
                 cancel_result = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:turn-cancel"),
@@ -1446,6 +1678,7 @@ def run_smoke(
                 state = terminal.get("params", {}).get("state")
                 shell_cancel_evidence = probe_passed(
                     turnId=shell_turn_id, approvalId=approval_id,
+                    startedRevision=cancel_revision,
                     cancelAccepted=cancel_result.get("accepted") is True,
                     terminalState=state,
                 ) if cancel_result.get("accepted") is True and state == "cancelled" else probe_failed(
@@ -1454,15 +1687,119 @@ def run_smoke(
             except RuntimeError as failure:
                 reason = str(failure)
                 tool_error = latest_tool_error_code(documents, shell_turn_id) \
-                    if "shell_turn_id" in locals() else None
+                    if shell_turn_id is not None else None
                 if tool_error is not None:
                     reason = f"{reason}; toolError={tool_error}"
                 if "METHOD_NOT_FOUND" in reason or "provider" in reason.casefold() and "not" in reason.casefold():
-                    okhttp_evidence = probe_blocked(f"production Provider probe is unavailable: {reason}")
-                    shell_cancel_evidence = probe_blocked("production shell cancellation probe is unavailable")
+                    shell_cancel_evidence = probe_blocked(
+                        f"production shell cancellation probe is unavailable: {reason}",
+                    )
                 else:
-                    okhttp_evidence = probe_failed(f"production Provider probe failed: {reason}")
-                    shell_cancel_evidence = probe_failed("shell cancellation probe could not complete after Provider failure")
+                    shell_cancel_evidence = probe_failed(
+                        f"production shell cancellation probe failed: {reason}",
+                    )
+
+            eof_turn_id: str | None = None
+            try:
+                send(thread_create_frame(
+                    workspace,
+                    frame_id="c:eof-thread",
+                    title="Native stdin EOF smoke",
+                ))
+                eof_thread = require_success(
+                    read_until(stdout_collector, documents, deadline, validator=schema_validator,
+                               frame_id="c:eof-thread"),
+                    "shell stdin EOF Thread persistence",
+                )
+                if not isinstance(eof_thread, dict) \
+                        or not str(eof_thread.get("threadId", "")).startswith("thr_") \
+                        or eof_thread.get("workspaceId") != workspace_id \
+                        or eof_thread.get("threadId") == thread["threadId"]:
+                    raise RuntimeError("shell stdin EOF probe did not persist an isolated Thread")
+                send(turn_start_frame(
+                    eof_thread["threadId"],
+                    "Use the shell tool to run the stdin EOF probe, then report completion.",
+                ))
+                eof_accept = require_success(
+                    read_until(stdout_collector, documents, deadline, validator=schema_validator,
+                               frame_id="c:turn-start"),
+                    "Provider shell stdin EOF turn",
+                )
+                eof_turn_id = eof_accept.get("turnId")
+                if not isinstance(eof_turn_id, str) or not eof_turn_id.startswith("turn_"):
+                    raise RuntimeError("Provider shell stdin EOF Turn returned an invalid identity")
+                eof_approval = read_until_turn_event(
+                    stdout_collector, documents, deadline,
+                    eof_turn_id,
+                    "approval/requested",
+                    validator=schema_validator,
+                )
+                eof_approval_params = eof_approval.get("params", {})
+                eof_approval_id = eof_approval_params.get("approvalId")
+                eof_approval_revision = eof_approval_params.get("threadRevision")
+                if not isinstance(eof_approval_id, str) or not eof_approval_id.startswith("appr_") \
+                        or not isinstance(eof_approval_revision, int):
+                    raise RuntimeError("shell stdin EOF approval projection is incomplete")
+                send(approval_response_frame(eof_approval_id, eof_turn_id, eof_approval_revision))
+                require_success(
+                    read_until(stdout_collector, documents, deadline, validator=schema_validator,
+                               frame_id="c:approval"),
+                    "shell stdin EOF approval",
+                )
+                eof_started = read_until_turn_event(
+                    stdout_collector, documents, deadline,
+                    eof_turn_id,
+                    "tool/started",
+                    validator=schema_validator,
+                )
+                eof_batch = read_until_turn_event(
+                    stdout_collector, documents, deadline,
+                    eof_turn_id,
+                    "tool/batch-committed",
+                    validator=schema_validator,
+                )
+                eof_terminal = read_until(
+                    stdout_collector, documents, deadline,
+                    validator=schema_validator,
+                    predicate=lambda frame: frame.get("method") == "turn/terminal"
+                    and isinstance(frame.get("params"), dict)
+                    and frame["params"].get("turnId") == eof_turn_id,
+                )
+                eof_started_params = eof_started.get("params", {})
+                eof_results = eof_batch.get("params", {}).get("results", [])
+                eof_result = eof_results[0] if len(eof_results) == 1 else {}
+                eof_ok = eof_started_params.get("callId") == SHELL_STDIN_EOF_CALL_ID \
+                    and eof_started_params.get("ordinal") == 0 \
+                    and isinstance(eof_result, dict) \
+                    and eof_result.get("callId") == SHELL_STDIN_EOF_CALL_ID \
+                    and eof_result.get("ordinal") == 0 \
+                    and eof_result.get("outcome") == "succeeded" \
+                    and eof_terminal.get("params", {}).get("state") == "completed"
+                recovery_usage_thread_id = eof_thread["threadId"]
+                recovery_usage_turn_id = eof_turn_id
+                recovery_usage_model_round = 2
+                shell_stdin_eof_evidence = probe_passed(
+                    turnId=eof_turn_id,
+                    started=True,
+                    toolOutcome=eof_result.get("outcome"),
+                    terminalState=eof_terminal.get("params", {}).get("state"),
+                ) if eof_ok else probe_failed(
+                    "shell stdin EOF probe did not start, settle and complete in order",
+                )
+            except RuntimeError as failure:
+                reason = str(failure)
+                tool_error = latest_tool_error_code(documents, eof_turn_id) \
+                    if eof_turn_id is not None else None
+                if tool_error is not None:
+                    reason = f"{reason}; toolError={tool_error}"
+                if "METHOD_NOT_FOUND" in reason or "provider" in reason.casefold() and "not" in reason.casefold():
+                    shell_stdin_eof_evidence = probe_blocked(
+                        f"production shell stdin EOF probe is unavailable: {reason}",
+                    )
+                else:
+                    shell_stdin_eof_evidence = probe_failed(
+                        f"production shell stdin EOF probe failed: {reason}",
+                    )
 
         send(credential_delete_frame(credential_set.get("version", "")))
         credential_delete = require_success(
@@ -1506,6 +1843,10 @@ def run_smoke(
 
         if mcp_probe is None:
             recovery_evidence = probe_blocked("the supplied mock fixture cannot be restarted with durable state")
+        elif recovery_usage_thread_id is None or recovery_usage_turn_id is None:
+            recovery_evidence = probe_failed(
+                "the production restart probe has no persisted Provider Usage identity",
+            )
         else:
             recovery_evidence = probe_failed("the production restart probe did not complete")
             try:
@@ -1530,12 +1871,15 @@ def run_smoke(
                 restarted_result = require_success(restarted_initialize, "restart initialize")
                 send(initialized_frame())
                 read_until(stdout_collector, documents, deadline, validator=schema_validator, predicate=ready_frame)
-                send(thread_read_frame(thread["threadId"]))
+                send(thread_read_frame(recovery_usage_thread_id))
                 recovered_thread = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:thread-read"),
                     "Thread recovery",
                 )
-                recovery_ok = recovered_thread.get("threadId") == thread["threadId"] \
+                recovered_usage = require_known_context_usage(
+                    recovered_thread, recovery_usage_turn_id, recovery_usage_model_round,
+                )
+                recovery_ok = recovered_thread.get("threadId") == recovery_usage_thread_id \
                     and isinstance(recovered_thread.get("revision"), int) \
                     and isinstance(restarted_result.get("runtime"), dict)
                 send(shutdown_frame())
@@ -1557,6 +1901,9 @@ def run_smoke(
                 recovery_evidence = probe_passed(
                     threadId=recovered_thread.get("threadId"),
                     revision=recovered_thread.get("revision"),
+                    usage={key: recovered_usage[key] for key in (
+                        "certainty", "inputTokens", "outputTokens", "totalTokens",
+                    )},
                 ) if recovery_ok else probe_failed(
                     "restart returned an incomplete durable Thread projection",
                 )
@@ -1603,6 +1950,7 @@ def run_smoke(
             "okhttpSse": okhttp_evidence,
             "mcp": mcp_evidence,
             "shellCancellation": shell_cancel_evidence,
+            "shellStdinEof": shell_stdin_eof_evidence,
             "sqlite": sqlite_evidence,
             "recovery": recovery_evidence,
             "networknt": networknt_evidence,
@@ -1615,6 +1963,7 @@ def run_smoke(
             "returnCode": process.returncode,
             "frameCount": len(documents),
             "methods": [doc.get("method") for doc in documents if isinstance(doc.get("method"), str)],
+            "diagnostics": native_probe_diagnostics(documents),
             "runtime": runtime,
             "executable": {**artifact, "expectedIdentityMatched": expected_identity_matched},
             "runtimeConfiguration": {

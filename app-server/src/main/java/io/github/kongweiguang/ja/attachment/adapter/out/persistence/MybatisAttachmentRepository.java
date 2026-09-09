@@ -72,11 +72,21 @@ public final class MybatisAttachmentRepository implements AttachmentRepository {
         });
     }
 
+    /** Composer 草稿必须未被队列预留；Workspace 与预留关系在同一 SQL 快照内鉴权。 */
+    @Override
+    public Optional<AttachmentMetadata> findDraft(String attachmentId, String workspaceId) {
+        Objects.requireNonNull(attachmentId, "attachmentId");
+        Objects.requireNonNull(workspaceId, "workspaceId");
+        return transactions.required(mapper -> Optional.ofNullable(
+                mapper.attachments().selectUnreservedDraft(attachmentId, workspaceId)).map(
+                MybatisAttachmentRepository::metadata));
+    }
+
     /** Thread 可见性由 join 权威验证，调用方不能仅凭 attachmentId 读取内容。 */
     @Override
-    public Optional<AttachmentMetadata> findBound(String attachmentId, String threadId) {
+    public Optional<AttachmentMetadata> findThread(String attachmentId, String threadId) {
         return transactions.required(mapper -> Optional.ofNullable(
-                mapper.attachments().selectBoundAttachment(attachmentId, threadId)).map(
+                mapper.attachments().selectThreadAttachment(attachmentId, threadId)).map(
                 MybatisAttachmentRepository::metadata));
     }
 
@@ -113,7 +123,7 @@ public final class MybatisAttachmentRepository implements AttachmentRepository {
         return new AttachmentMetadata(row.attachmentId(), row.workspaceId(), row.displayName(),
                 row.sizeBytes(), row.contentSha256(), AttachmentMetadata.MediaKind.valueOf(row.mediaKind()),
                 row.mediaType(), AttachmentMetadata.Status.valueOf(row.status()), Instant.parse(row.createdAt()),
-                Instant.parse(row.expiresAt()), row.boundTurnId());
+                Instant.parse(row.expiresAt()), row.boundMessageId());
     }
 
     /** CAS 冲突不携带 attachmentId 或 SQL。 */

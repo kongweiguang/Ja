@@ -184,30 +184,44 @@ describe("TauriTerminalAdapter", () => {
       invoke: vi.fn(async () => undefined) as TerminalNativeBridge["invoke"],
       listen: vi.fn(async (event: string, handler: (payload: unknown) => void) => {
         expect(event).toBe(JA_TERMINAL_EVENTS.nativeDrop);
-        handler({ dropToken: DROP_TOKEN, x: 12.5, y: 48 });
-        handler({ dropToken: DROP_TOKEN, x: 12.5, y: 48, path: "C:\\private\\secret" });
+        handler({ phase: "enter", x: 12.5, y: 48, count: 1 });
+        handler({ phase: "drop", dropToken: DROP_TOKEN, x: 12.5, y: 48, count: 1 });
+        handler({
+          phase: "drop",
+          dropToken: DROP_TOKEN,
+          x: 12.5,
+          y: 48,
+          count: 1,
+          path: "C:\\private\\secret",
+        });
         return unlisten;
       }) as TerminalNativeBridge["listen"],
     };
 
-    await expect(new TauriTerminalAdapter(bridge).subscribeNativeDrop(listener)).resolves.toBe(
-      unlisten,
-    );
+    const unsubscribe = await new TauriTerminalAdapter(bridge).subscribeNativeDrop(listener);
     expect(listener).toHaveBeenCalledOnce();
     expect(listener).toHaveBeenCalledWith({ dropToken: DROP_TOKEN, x: 12.5, y: 48 });
     expect(JSON.stringify(listener.mock.calls)).not.toContain("private");
-    expect(parseTerminalNativeDropEvent({ dropToken: DROP_TOKEN, x: 1, y: 2 })).toEqual({
-      dropToken: DROP_TOKEN,
-      x: 1,
-      y: 2,
-    });
-    expect(() =>
+    expect(
       parseTerminalNativeDropEvent({
+        phase: "drop",
         dropToken: DROP_TOKEN,
         x: 1,
         y: 2,
+        count: 1,
+      }),
+    ).toEqual({ dropToken: DROP_TOKEN, x: 1, y: 2 });
+    expect(() =>
+      parseTerminalNativeDropEvent({
+        phase: "drop",
+        dropToken: DROP_TOKEN,
+        x: 1,
+        y: 2,
+        count: 1,
         absolutePath: "C:\\private",
       }),
     ).toThrowError(TerminalAdapterError);
+    await unsubscribe();
+    expect(unlisten).toHaveBeenCalledOnce();
   });
 });

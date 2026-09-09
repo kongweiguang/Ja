@@ -4,6 +4,10 @@
 package io.github.kongweiguang.ja.conversation.application.service;
 
 import io.github.kongweiguang.ja.conversation.application.loop.TerminalCoordinator;
+import io.github.kongweiguang.ja.conversation.application.loop.TerminalFailureReplyPolicy;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
+import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnResult;
@@ -20,6 +24,7 @@ import java.util.UUID;
 final class TurnTerminalSettlement {
     private final ConversationRepository store;
     private final Clock clock;
+    private final TerminalFailureReplyPolicy failureReplies = new TerminalFailureReplyPolicy();
 
     /**
      * 固定权威 Repository 与时钟，使终态回执和事件使用同一持久化边界。
@@ -40,8 +45,10 @@ final class TurnTerminalSettlement {
         try {
             TerminalCoordinator.Outcome outcome = commitUnexpectedTerminal(turn, terminalState,
                     terminalCode, terminalMessage);
-            Throwable completionFailure = originalFailure == null
-                    ? turn.cancellationDebt.get() : originalFailure;
+            /* FAILED 已有权威终态和安全回复时，底层 Throwable 只属于内部诊断，不能再把已接纳请求
+             * 覆盖成 transport 异常；取消清理债务仍需显式暴露，避免伪报资源已安全释放。 */
+            Throwable completionFailure = terminalState == TurnState.FAILED ? null
+                    : originalFailure == null ? turn.cancellationDebt.get() : originalFailure;
             if (completionFailure == null) completeFromOutcome(turn, outcome);
             else completeExceptionally(turn, completionFailure);
         } catch (Throwable emergencyFailure) {
@@ -66,20 +73,36 @@ final class TurnTerminalSettlement {
         TurnState terminalState = state;
         String terminalCode = code;
         String terminalMessage = message;
+        String failureReply = terminalState == TurnState.FAILED
+                ? failureReplies.replyFor(terminalCode) : null;
+        String finalMessageId = failureReply == null ? null
+                : failureReplies.messageIdFor(turn.command().turnId(), turn.execution);
+        ModelMessage finalMessage = failureReply == null ? null
+                : new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(failureReply)));
+        java.util.concurrent.atomic.AtomicReference<io.github.kongweiguang.ja.conversation.application.change
+                .TurnChangeTracker.Frozen> frozenChange = new java.util.concurrent.atomic.AtomicReference<>();
         TerminalCoordinator.Finish finish = turn.terminalCoordinator.finish(
                 () -> {
                     ConversationRepository.TurnSnapshot current = store.findTurn(
                             turn.command().threadId(), turn.command().turnId()).orElseThrow();
+                    var frozen = turn.changeTracker.freeze();
+                    frozenChange.set(frozen);
                     return store.commitTerminal(new ConversationRepository.TerminalCommit(
-                            turn.command().threadId(), turn.command().turnId(), terminalState, "",
-                            terminalCode, terminalMessage, null, null, List.of(),
-                            current.turnMutationVersion(), clock.instant()));
+                            turn.command().threadId(), turn.command().turnId(), terminalState,
+                            failureReply == null ? "" : failureReply,
+                            terminalCode, terminalMessage, finalMessageId, finalMessage, List.of(),
+                            current.turnMutationVersion(), clock.instant(),
+                            frozen.changeSet(), frozen.sha256(), frozen.byteLength(), frozen.unifiedDiff()));
                 },
                 committed -> new TurnEvent.Terminal(new TurnEvent.Context(
                         "evt_" + UUID.randomUUID(), turn.command().threadId(), turn.command().turnId(),
-                        committed.threadRevision(), clock.instant()), terminalState, "",
+                        committed.threadRevision(), clock.instant()), terminalState,
+                        failureReply == null ? "" : failureReply,
                         terminalState == TurnState.FAILED ? terminalCode : null,
-                        terminalState == TurnState.FAILED ? terminalMessage : null, null, null),
+                        terminalState == TurnState.FAILED ? terminalMessage : null,
+                        failureReply == null ? null
+                                : new TurnEvent.FinalMessage(finalMessageId, failureReply), null,
+                        java.util.Objects.requireNonNull(frozenChange.get(), "frozen change set").changeSet()),
                 event -> turn.sink.publish(event));
         return finish.outcome();
     }

@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","id":"c:resume-missing-revision","method":"turn/resume","params":{"turnId":"turn_suspended"}}
+{"jsonrpc":"2.0","id":"c:resume-null-revision","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":null}}
+{"jsonrpc":"2.0","id":"c:resume-unknown-field","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":7,"force":true}}
+{"jsonrpc":"2.0","id":"c:resume-negative-revision","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":-1}}
+{"jsonrpc":"2.0","id":"c:resume-unsafe-revision","method":"turn/resume","params":{"turnId":"turn_suspended","expectedThreadRevision":9007199254740992}}

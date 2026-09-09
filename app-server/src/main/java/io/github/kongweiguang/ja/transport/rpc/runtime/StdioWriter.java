@@ -44,6 +44,7 @@ public final class StdioWriter implements AutoCloseable {
     private final AtomicReference<RuntimeException> ownerFailure = new AtomicReference<>();
     private final AtomicReference<CompletableFuture<Void>> closeCompletion = new AtomicReference<>();
     private final Thread owner;
+    private long notificationSequence;
 
     /**
      * 启动唯一平台 Writer 所有者，禁止请求或 Turn 工作线程直接写 stdout。
@@ -125,9 +126,17 @@ public final class StdioWriter implements AutoCloseable {
             if (!accepting.get() || failed.get()) {
                 throw new IllegalStateException("stdio writer is unavailable");
             }
+            ObjectNode sequencedEnvelope = dispatchCompletion ? envelope.deepCopy() : null;
             byte[] bytes;
             try {
-                bytes = mapper.writeValueAsBytes(envelope);
+                if (sequencedEnvelope != null) {
+                    ObjectNode params = notificationParams(sequencedEnvelope);
+                    // 最大正 long 预留最坏序列化宽度，保证 Writer 写入真实 sequence 后仍在帧预算内。
+                    params.put("sequence", Long.MAX_VALUE);
+                    bytes = mapper.writeValueAsBytes(sequencedEnvelope);
+                } else {
+                    bytes = mapper.writeValueAsBytes(envelope);
+                }
             } catch (IOException failure) {
                 throw new IllegalStateException("stdio serialization failed");
             }
@@ -139,7 +148,7 @@ public final class StdioWriter implements AutoCloseable {
                 accepting.set(false);
                 throw JaRpcException.of(JaErrorCatalog.QUEUE_FULL, "completion capacity is exhausted");
             }
-            Frame frame = new Frame(bytes, new CompletableFuture<>());
+            Frame frame = new Frame(bytes, sequencedEnvelope, new CompletableFuture<>());
             boolean accepted = (lane == Lane.CONTROL ? control : data).offer(frame);
             if (!accepted) {
                 if (dispatchCompletion) completionPermits.release();
@@ -231,7 +240,18 @@ public final class StdioWriter implements AutoCloseable {
      */
     private void write(Frame frame) {
         try {
-            output.write(frame.bytes());
+            byte[] bytes = frame.bytes();
+            if (frame.sequencedEnvelope() != null) {
+                long sequence = ++notificationSequence;
+                if (sequence < 1) throw new IllegalStateException("notification sequence overflow");
+                notificationParams(frame.sequencedEnvelope()).put("sequence", sequence);
+                bytes = mapper.writeValueAsBytes(frame.sequencedEnvelope());
+                if (bytes.length > maxFrameBytes) {
+                    throw JaRpcException.of(JaErrorCatalog.FRAME_TOO_LARGE,
+                            "outbound frame is too large");
+                }
+            }
+            output.write(bytes);
             output.write('\n');
             output.flush();
             frame.flushed().complete(null);
@@ -244,6 +264,14 @@ public final class StdioWriter implements AutoCloseable {
             frame.flushed().completeExceptionally(redacted);
             throw redacted;
         }
+    }
+
+    /** 通知必须携带对象型 params；只允许 Writer owner 在写出前补充物理顺序。 */
+    private static ObjectNode notificationParams(ObjectNode envelope) {
+        if (!(envelope.get("params") instanceof ObjectNode params)) {
+            throw new IllegalStateException("notification params are unavailable");
+        }
+        return params;
     }
 
     /**
@@ -288,7 +316,7 @@ public final class StdioWriter implements AutoCloseable {
     }
 
     /**
-     * 只接受小写 kebab-case 的领域/动作名称；该规则与 v2 合同一致，并拒绝 camelCase、
+     * 只接受小写 kebab-case 的领域/动作名称；该规则与首版 v1 合同一致，并拒绝 camelCase、
      * 空分段和未命名空间化的非法通知。
      */
     private static String requireMethod(String value) {
@@ -384,9 +412,9 @@ public final class StdioWriter implements AutoCloseable {
     }
 
     /**
-     * 保存不可变预序列化帧，防止入队后继续受 Jackson 节点变更影响。
+     * 保存不可变预检字节与 Writer 私有通知副本；sequence 只在物理写出点分配。
      */
-    private record Frame(byte[] bytes, CompletableFuture<Void> flushed) {
+    private record Frame(byte[] bytes, ObjectNode sequencedEnvelope, CompletableFuture<Void> flushed) {
         /**
          * 绑定唯一所有的字节数组与私有 flush 确认，拒绝部分帧状态。
          */

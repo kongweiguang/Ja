@@ -373,6 +373,47 @@ async fn bounded_close_worker_does_not_block_async_executor() {
     assert_eq!(workers.available_permits(), 1);
 }
 
+/// PTY 创建可能进入阻塞式 Win32/ConPTY 调用；open worker 必须让 current-thread async
+/// executor 继续调度，并在预算饱和时立即拒绝第二次启动而不是排队拖死界面。
+#[tokio::test]
+async fn bounded_open_worker_does_not_block_async_executor() {
+    let workers = Arc::new(tokio::sync::Semaphore::new(1));
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let first = tokio::spawn(run_bounded_terminal_open(workers.clone(), move || {
+        let _ = started_sender.send(());
+        release_receiver
+            .recv()
+            .map_err(|_| TerminalError::new(TerminalErrorCode::Cancelled))?;
+        Ok(7_u8)
+    }));
+    started_receiver
+        .await
+        .expect("blocking open worker started");
+    assert_eq!(workers.available_permits(), 0);
+
+    let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let second_marker = second_started.clone();
+    let second_error = run_bounded_terminal_open(workers.clone(), move || {
+        second_marker.store(true, std::sync::atomic::Ordering::Release);
+        Ok(9_u8)
+    })
+    .await
+    .expect_err("saturated open worker must not queue");
+    assert_eq!(second_error.code(), TerminalErrorCode::QueueFull);
+    assert!(!second_started.load(std::sync::atomic::Ordering::Acquire));
+
+    release_sender.send(()).expect("release first open worker");
+    assert_eq!(
+        first
+            .await
+            .expect("join first open task")
+            .expect("first open result"),
+        7
+    );
+    assert_eq!(workers.available_permits(), 1);
+}
+
 /// 伪造 session 不能消耗共享 native token，合法 Files 或 Terminal target 之后仍可使用它。
 #[test]
 fn wrong_session_is_rejected_before_drop_token_consumption() {

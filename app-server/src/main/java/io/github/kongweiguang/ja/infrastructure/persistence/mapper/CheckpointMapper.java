@@ -21,6 +21,10 @@ public interface CheckpointMapper {
      */
     PersistenceRecords.CheckpointRow selectCheckpoint(@Param("threadId") String threadId);
 
+    /** 按 Thread 与不可变 checkpoint ID 精确读取 Provider settlement 引用的摘要。 */
+    PersistenceRecords.CheckpointRow selectCheckpointIdentity(
+            @Param("threadId") String threadId, @Param("checkpointId") String checkpointId);
+
     /**
      * 精确读取 source 行，避免幂等重试把更新的 checkpoint 误认成自己的胜者。
      */

@@ -59,17 +59,22 @@ function Add-ArchitectureObservation {
     })
 }
 
-# Applies a regular expression to production Java only; tests and dependency
-# probes have separate policies and cannot hide a production fallback.
+# Applies a regular expression to production Java only. Exact exclusions are reserved for bootstrap
+# owners that execute before the governed abstraction exists; callers must name every such file.
 function Find-ProductionPattern {
     param(
         [Parameter(Mandatory)][string]$Rule,
         [Parameter(Mandatory)][string]$Pattern,
         [Parameter(Mandatory)][string]$Detail,
-        [string]$Root = $javaRoot
+        [string]$Root = $javaRoot,
+        [string[]]$ExcludedRelativePaths = @()
     )
 
     Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.java' | ForEach-Object {
+        $relativePath = Get-RepositoryRelativePath -Path $_.FullName
+        if ($ExcludedRelativePaths -contains $relativePath) {
+            return
+        }
         $lineNumber = 0
         foreach ($line in [System.IO.File]::ReadLines($_.FullName)) {
             $lineNumber++
@@ -104,7 +109,9 @@ if (Test-Path -LiteralPath $agentRoot) {
 }
 
 Find-ProductionPattern -Rule 'jdk-http' -Pattern '\bjava\.net\.http\b|\bHttpClient\.new(HttpClient|Builder)\b' -Detail 'production networking must use OkHttp only'
-Find-ProductionPattern -Rule 'direct-jdbc' -Pattern '\bDriverManager\b|\.prepareStatement\(|\.createStatement\(|\bResultSet\s+[A-Za-z_][A-Za-z0-9_]*\s*=' -Detail 'production persistence must use MyBatis mappers rather than manual JDBC execution or row mapping'
+# Migration recovery validates a detached backup before MyBatis can safely open it. Keep this one
+# bootstrap owner explicit; all normal persistence remains subject to the direct-JDBC prohibition.
+Find-ProductionPattern -Rule 'direct-jdbc' -Pattern '\bDriverManager\b|\.prepareStatement\(|\.createStatement\(|\bResultSet\s+[A-Za-z_][A-Za-z0-9_]*\s*=' -Detail 'production persistence must use MyBatis mappers rather than manual JDBC execution or row mapping' -ExcludedRelativePaths @('app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/database/DatabaseMigrationRecovery.java')
 Find-ProductionPattern -Rule 'obsolete-runtime' -Pattern '\b(StrictSseParser|RoutingModelPort|SingleWriter|SqliteSessionRepository|SqliteChangeStore|KernelRuntimeGraph|AtomicWorkspaceFiles)\b' -Detail 'obsolete production implementation remains reachable'
 Find-ProductionPattern -Rule 'obsolete-wire' -Pattern '"(profile/(save|activate|read)|mcp/(save|delete)|change/revertSet|secret/resolve|diagnostics/read)"' -Detail 'removed first-release wire method remains in production source'
 Find-ProductionPattern -Rule 'deferred-work' -Pattern '\b(TODO|FIXME|HACK|XXX)\b' -Detail 'deferred implementation marker is forbidden in final production source'

@@ -38,6 +38,7 @@ pub struct AttachmentMetadata {
     pub attachment_id: String,
     pub display_name: String,
     pub size_bytes: u64,
+    pub media_kind: String,
     pub media_type: Option<String>,
     pub state: String,
 }

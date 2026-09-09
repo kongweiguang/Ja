@@ -5,8 +5,8 @@
 
 use super::ReviewError;
 use crate::review::domain::{
-    ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewFile, ReviewRevision, ReviewSnapshot,
-    ReviewSource, ReviewTarget,
+    ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewFile, ReviewFileId, ReviewRevision,
+    ReviewSnapshot, ReviewSource, ReviewTarget,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -29,11 +29,21 @@ pub(crate) trait ReviewNativePort: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<ReviewSnapshot, ReviewError>;
 
-    /// 在应用层已根据 snapshot 解析 file id 后，按需补充 metadata-only diff。
-    fn materialize_file(
+    /// 从 native-owned bounded cache 解析 opaque selector；miss 由 application 回退到 fresh snapshot。
+    fn cached_file(
         &self,
         source: &ReviewSource,
+        revision: &ReviewRevision,
+        file_id: &ReviewFileId,
+    ) -> Option<ReviewFile>;
+
+    /// 在同一原生读取会话内按需补充 diff 并验证 revision，避免跨命令重复仓库扫描。
+    fn load_file_at_revision(
+        &self,
+        source: &ReviewSource,
+        expected: &ReviewRevision,
         file: &ReviewFile,
+        validate_revision: bool,
         cancellation: &CancellationToken,
     ) -> Result<ReviewFile, ReviewError>;
 

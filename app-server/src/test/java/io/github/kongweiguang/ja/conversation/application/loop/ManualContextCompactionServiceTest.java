@@ -7,7 +7,6 @@ import io.github.kongweiguang.ja.conversation.application.context.ContextOrchest
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryModel;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
-import io.github.kongweiguang.ja.conversation.domain.TurnRuntimeSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
@@ -38,7 +37,7 @@ final class ManualContextCompactionServiceTest {
     @Test
     void rejectsBusyThreadBeforeExternalWork() {
         ConversationRepository.TurnSnapshot turn = new ConversationRepository.TurnSnapshot(
-                "thr_test", "turn_test", TurnState.RUNNING, runtime(),
+                "thr_test", "turn_test", TurnState.RUNNING,
                 CLOCK.instant(), CLOCK.instant(), null, 7, 1);
         ManualContextCompactionService service = service(snapshot(7, List.of(turn)));
         ContextCompactionUseCase.Failure failure = assertThrows(ContextCompactionUseCase.Failure.class,
@@ -95,13 +94,9 @@ final class ManualContextCompactionServiceTest {
     /** 固定下一轮 Provider/Model 偏好，使早期门禁夹具不依赖配置 Owner。 */
     private static ThreadPreferences preferences() {
         return new ThreadPreferences("provider_test", "model_test", "medium",
-                AccessMode.APPROVAL_REQUIRED, ThreadPreferences.TitleSource.PLACEHOLDER);
-    }
-
-    /** 固定既有 Turn 的独立运行事实，避免测试借当前 Thread 偏好解释历史。 */
-    private static TurnRuntimeSnapshot runtime() {
-        return new TurnRuntimeSnapshot("provider_test", "model_test", "openai", "openai_responses",
-                "test-model", "medium", AccessMode.APPROVAL_REQUIRED, "cfg_test");
+                AccessMode.APPROVAL_REQUIRED,
+                io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
+                ThreadPreferences.TitleSource.PLACEHOLDER);
     }
 
     /** 非目标端口全部使用拒绝代理，任何越过早期门禁的调用都会使测试失败。 */
@@ -126,6 +121,10 @@ final class ManualContextCompactionServiceTest {
 
     /** 只允许 readThread 的存储夹具，所有 mutation 与关闭都保持显式可见。 */
     private static final class EarlyRepository implements ConversationRepository {
+        /** 手动压缩早期门禁不得触达 Child mailbox。 */
+        @Override public TaskMailboxConsumption consumeTaskMailbox(TaskMailboxCommit request) {
+            throw new UnsupportedOperationException("manual compaction must not consume task mailbox");
+        }
         private final ConversationRepository.ThreadSnapshot snapshot;
 
         /** 固定本次读取结果，null 表达不存在而不是异常。 */
@@ -144,6 +143,11 @@ final class ManualContextCompactionServiceTest {
         @Override public AdmissionReceipt admit(TurnAdmission admission) { throw unsupported(); }
         /** 早期门禁测试不提交事实。 */
         @Override public CommitReceipt commit(CommitRequest request) { throw unsupported(); }
+        /** 早期门禁测试也不得结算 Assistant，调用即证明压缩前置条件失效。 */
+        @Override public CommitReceipt commitAssistantSettlement(CommitRequest request) { throw unsupported(); }
+        /** 早期门禁测试不解释排队输入，调用即表示门禁失效。 */
+        @Override public Optional<InputConsumption> commitWithNextInput(
+                CommitRequest request, InputSelection selection) { throw unsupported(); }
         /** 早期门禁测试不提交取消 Tool batch。 */
         @Override public CommitReceipt commitCancellationToolBatch(CancellationToolBatchCommit request) { throw unsupported(); }
         /** 早期门禁测试不提交终态。 */

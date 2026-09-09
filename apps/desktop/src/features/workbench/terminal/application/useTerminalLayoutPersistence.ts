@@ -1,23 +1,47 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useState } from "react";
 import type { TerminalLayoutV1 } from "../domain/terminalLayout";
 import type { TerminalLayoutStorage } from "./terminalLayoutStorage";
 
+interface TerminalLayoutSnapshot {
+  workspaceId: string;
+  storage: TerminalLayoutStorage;
+  layout: TerminalLayoutV1 | undefined;
+}
+
 /**
- * composition 只派生当前 workspace 的启动布局并转发活跃 controller 提交；权威 schema 和介质
- * 写入均由 Terminal adapter 独占，通用 UI preference store 不再认识 Terminal 字段。
+ * composition 保留当前 workspace 最新的 dormant layout 投影并转发 controller 提交；该投影只为
+ * 同进程 capability 重挂提供输入，跨进程权威 schema 和介质仍由 Terminal adapter 独占。
+ * workspace/storage owner 变化时同步换代，避免把旧项目布局短暂交给新 controller。
  */
 export function useTerminalLayoutPersistence(
   workspaceId: string,
   storage: TerminalLayoutStorage,
 ): readonly [TerminalLayoutV1 | undefined, (layout: TerminalLayoutV1) => void] {
-  // 只在 workspace 或 storage adapter 变化时同步读取一次，避免 render 期间用 ref 维护平行状态。
-  const initialLayout = useMemo(() => storage.load(workspaceId), [storage, workspaceId]);
-  /** 写失败不破坏当前 controller 的内存布局；下次真实启动会重新从严格介质读取。 */
+  const [snapshot, setSnapshot] = useState<TerminalLayoutSnapshot>(() => ({
+    workspaceId,
+    storage,
+    layout: storage.load(workspaceId),
+  }));
+  let current = snapshot;
+  if (snapshot.workspaceId !== workspaceId || snapshot.storage !== storage) {
+    current = { workspaceId, storage, layout: storage.load(workspaceId) };
+    setSnapshot(current);
+  }
+
+  /**
+   * 先提交当前进程投影再写介质：localStorage quota/ACL 失败不能让显式关闭后的同进程重挂
+   * 回退旧布局；真正重启仍只接受 storage 严格解析成功的值。
+   */
   const save = useCallback(
     (layout: TerminalLayoutV1): void => {
+      setSnapshot((existing) =>
+        existing.workspaceId === layout.workspaceId && existing.storage === storage
+          ? { ...existing, layout }
+          : existing,
+      );
       try {
         storage.save(layout);
       } catch {
@@ -26,5 +50,5 @@ export function useTerminalLayoutPersistence(
     },
     [storage],
   );
-  return [initialLayout, save] as const;
+  return [current.layout, save] as const;
 }

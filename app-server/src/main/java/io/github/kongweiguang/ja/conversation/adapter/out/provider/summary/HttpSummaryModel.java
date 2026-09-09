@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.anthropic.AnthropicMessagesAdapter;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiChatCompletionsAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiResponsesAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ModelTransport;
@@ -79,19 +80,18 @@ public final class HttpSummaryModel implements SummaryModel {
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
-    /**
-     * 冻结 Summary Provider envelope 并调用官方计量端点；只保留最后一次成功计量供紧随发送复用。
-     */
+    /** 冻结 Summary Provider envelope 并在内存中计算保守上界，整个过程不会进入网络传输。 */
     @Override
-    public ModelPort.InputTokenCount countInputTokens(SummaryPrompt prompt) {
+    public ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
         Invocation invocation = invocation(prompt);
-        ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(encodedParams(invocation));
+        ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(
+                encodedParams(invocation), invocation.configuration().api());
         PreparedInvocation candidate = new PreparedInvocation(invocation, envelope);
-        ModelPort.InputTokenCount count = executeCount(candidate);
         synchronized (this) {
             prepared = candidate;
         }
-        return count;
+        return new ModelPort.InputTokenEstimate(
+                envelope.inputTokenEstimate(), envelope.fingerprint());
     }
 
     /**
@@ -105,7 +105,7 @@ public final class HttpSummaryModel implements SummaryModel {
             prepared = null;
         }
         if (current == null || !current.invocation().prompt().equals(prompt)) {
-            throw failure("summary prompt was not officially counted before send");
+            throw failure("summary prompt was not locally estimated before send");
         }
         Invocation invocation = current.invocation();
         return executeBounded(invocation.configuration().requestTimeout(),
@@ -140,51 +140,6 @@ public final class HttpSummaryModel implements SummaryModel {
             if (cancellation != null) cancellation.close();
             controller.complete();
             if (registered) transport.unregister(controller);
-        }
-    }
-
-    /** 在共享生命周期内异步执行计量，使 Deadline、取消和关闭语义与正式摘要一致。 */
-    private ModelPort.InputTokenCount executeCount(PreparedInvocation invocation) {
-        return executeBounded(invocation.invocation().configuration().requestTimeout(),
-                controller -> executeCountGoverned(invocation, controller));
-    }
-
-    /** 对官方计量执行最多三次提交前重试，所有尝试共享冻结 envelope 与绝对 Turn Deadline。 */
-    private ModelPort.InputTokenCount executeCountWithRetry(
-            PreparedInvocation invocation, RequestController controller) {
-        ProviderProtocolException last = null;
-        for (int attempt = 1; attempt <= AbstractStreamingModelAdapter.MAX_ATTEMPTS; attempt++) {
-            controller.throwIfStopped();
-            try {
-                return executeProviderCountAttempt(invocation, controller);
-            } catch (CancellationException cancelled) {
-                throw cancelled;
-            } catch (ProviderProtocolException failure) {
-                last = failure;
-                if (!failure.retryable() || attempt == AbstractStreamingModelAdapter.MAX_ATTEMPTS) throw failure;
-                AbstractStreamingModelAdapter.awaitBackoff(
-                        attempt, failure.retryAfter().orElse(null), controller);
-            }
-        }
-        throw new ProviderProtocolException(
-                "TOKEN_COUNT_UNAVAILABLE", "summary token count is unavailable", true, last);
-    }
-
-    /** 将一次完整官方计量及其内部重试作为 COUNT 熔断器的一个失败样本。 */
-    private ModelPort.InputTokenCount executeCountGoverned(
-            PreparedInvocation invocation, RequestController controller) {
-        ProviderCircuitBreaker.Permit permit = transport.acquireCircuit(
-                invocation.invocation().configuration(), ProviderCircuitBreaker.Operation.COUNT);
-        try {
-            ModelPort.InputTokenCount count = executeCountWithRetry(invocation, controller);
-            permit.success();
-            return count;
-        } catch (CancellationException cancelled) {
-            permit.cancelled();
-            throw cancelled;
-        } catch (RuntimeException failure) {
-            permit.failure();
-            throw failure;
         }
     }
 
@@ -246,6 +201,7 @@ public final class HttpSummaryModel implements SummaryModel {
             PreparedInvocation invocation, StreamContext context, RequestController controller) {
         return switch (invocation.invocation().configuration().api()) {
             case OPENAI_RESPONSES -> executeOpenAi(invocation, context, controller);
+            case OPENAI_CHAT_COMPLETIONS -> executeOpenAiChat(invocation, context, controller);
             case ANTHROPIC_MESSAGES -> executeAnthropic(invocation, context, controller);
         };
     }
@@ -256,6 +212,15 @@ public final class HttpSummaryModel implements SummaryModel {
     private ModelPort.ModelOutcome executeOpenAi(
             PreparedInvocation invocation, StreamContext context, RequestController controller) {
         try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(
+                invocation.invocation().configuration(), transport)) {
+            return adapter.executeEncoded(invocation.envelope(), context, controller);
+        }
+    }
+
+    /** 使用 Chat Completions 的正常状态机归约 JSON Schema 摘要结果。 */
+    private ModelPort.ModelOutcome executeOpenAiChat(
+            PreparedInvocation invocation, StreamContext context, RequestController controller) {
+        try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(
                 invocation.invocation().configuration(), transport)) {
             return adapter.executeEncoded(invocation.envelope(), context, controller);
         }
@@ -272,29 +237,11 @@ public final class HttpSummaryModel implements SummaryModel {
         }
     }
 
-    /** 使用与正式发送相同的 Provider Adapter 对冻结 Summary envelope 计量。 */
-    private ModelPort.InputTokenCount executeProviderCountAttempt(
-            PreparedInvocation invocation, RequestController controller) {
-        return switch (invocation.invocation().configuration().api()) {
-            case OPENAI_RESPONSES -> {
-                try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(
-                        invocation.invocation().configuration(), transport)) {
-                    yield adapter.countEncoded(invocation.envelope(), controller);
-                }
-            }
-            case ANTHROPIC_MESSAGES -> {
-                try (AnthropicMessagesAdapter adapter = new AnthropicMessagesAdapter(
-                        invocation.invocation().configuration(), transport)) {
-                    yield adapter.countEncoded(invocation.envelope(), controller);
-                }
-            }
-        };
-    }
-
-    /** 按冻结 API 唯一选择 Summary wire 参数，计量和发送不再分别编码。 */
+    /** 按冻结 API 唯一选择 Summary wire 参数，本地预算和发送不再分别编码。 */
     private static ObjectNode encodedParams(Invocation invocation) {
         return switch (invocation.configuration().api()) {
             case OPENAI_RESPONSES -> openAiParams(invocation);
+            case OPENAI_CHAT_COMPLETIONS -> openAiChatParams(invocation);
             case ANTHROPIC_MESSAGES -> anthropicParams(invocation);
         };
     }
@@ -316,6 +263,26 @@ public final class HttpSummaryModel implements SummaryModel {
         root.put("store", false);
         OpenAiResponsesAdapter.applyGeneration(root, invocation.configuration().generation());
         root.put("stream", true);
+        return root;
+    }
+
+    /** 构造 Chat Completions 原生结构化输出请求，不借用 Responses 字段或回退协议。 */
+    private static ObjectNode openAiChatParams(Invocation invocation) {
+        ObjectNode root = AbstractStreamingModelAdapter.JSON.createObjectNode();
+        root.put("model", invocation.configuration().model());
+        ArrayNode messages = root.putArray("messages");
+        messages.addObject().put("role", "system").put("content", INSTRUCTIONS);
+        messages.addObject().put("role", "user").put("content", invocation.payload());
+        ObjectNode format = root.putObject("response_format");
+        format.put("type", "json_schema");
+        ObjectNode schema = format.putObject("json_schema");
+        schema.put("name", "ja_context_summary");
+        schema.put("description", "A fixed-shape Ja context checkpoint summary");
+        schema.put("strict", true);
+        schema.set("schema", ProviderJsonValues.toNode(SummaryDocumentCodec.schema()));
+        OpenAiChatCompletionsAdapter.applyGeneration(root, invocation.configuration().generation());
+        root.put("stream", true);
+        root.putObject("stream_options").put("include_usage", true);
         return root;
     }
 
@@ -397,8 +364,7 @@ public final class HttpSummaryModel implements SummaryModel {
                 generation.temperature(), generation.topP(), output, generation.reasoningLevel());
         return new ModelPort.ModelConfiguration(
                 source.providerId(), source.modelId(), source.configGeneration(),
-                source.provider(), source.api(),
-                source.model(), source.baseUri(), source.apiKey(), connectTimeout, requestTimeout,
+                source.api(), source.model(), source.baseUri(), source.apiKey(), connectTimeout, requestTimeout,
                 source.inputModalities(), boundedGeneration);
     }
 

@@ -13,7 +13,7 @@ import java.util.Objects;
  */
 public record ToolSpec(String name, String description, JsonObject inputSchema) {
     /**
-     * 深复制模型可见 Schema；执行顺序与审批属于 Loop/Middleware，而不是 Tool 元数据。
+     * 固定模型可见 Schema；执行顺序与审批属于内核，不允许 Tool 元数据替代权限决策。
      */
     public ToolSpec {
         name = ContractChecks.identifier(name, "name");

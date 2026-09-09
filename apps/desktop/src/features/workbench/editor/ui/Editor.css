@@ -114,3 +114,25 @@
   outline: 2px solid color-mix(in srgb, var(--ja-focus) 28%, transparent);
   outline-offset: -2px;
 }
+
+/* Xcode Dark 的 code/diff 是稳定实色工作面；透明材质只允许存在于外层导航与浮层。 */
+.ja-theme-dark.ja-palette-xcode .ja-code-editor,
+.ja-theme-dark.ja-palette-xcode .ja-editor-viewer,
+.ja-theme-dark.ja-palette-xcode .ja-editor-diff,
+.ja-theme-dark.ja-palette-xcode .ja-code-editor .cm-editor,
+.ja-theme-dark.ja-palette-xcode .ja-editor-viewer .cm-editor,
+.ja-theme-dark.ja-palette-xcode .ja-editor-diff .cm-editor,
+.ja-theme-dark.ja-palette-xcode .ja-code-editor .cm-gutters,
+.ja-theme-dark.ja-palette-xcode .ja-editor-viewer .cm-gutters,
+.ja-theme-dark.ja-palette-xcode .ja-editor-diff .cm-gutters {
+  background: var(--ja-editor-background);
+}
+.ja-theme-dark.ja-palette-xcode .ja-editor-diff .cm-deletedChunk {
+  background: var(--ja-diff-deleted);
+}
+.ja-theme-dark.ja-palette-xcode .ja-editor-diff .cm-changedLine {
+  background: var(--ja-diff-changed);
+}
+.ja-theme-dark.ja-palette-xcode .ja-editor-diff .cm-insertedLine {
+  background: var(--ja-diff-inserted);
+}

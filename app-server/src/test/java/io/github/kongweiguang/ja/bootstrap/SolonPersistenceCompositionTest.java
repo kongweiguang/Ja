@@ -65,7 +65,7 @@ final class SolonPersistenceCompositionTest {
             StartupRecoveryService recovery = new SolonPersistenceComposition(() -> {
                 throw new AssertionError("AOT must not query the runtime MyBatis registry");
             })
-                    .startupRecovery(null, Clock.systemUTC());
+                    .startupRecovery(null, Clock.systemUTC(), null);
             assertNotNull(recovery);
             assertTrue(AotSideEffectGuard.processing());
         } finally {

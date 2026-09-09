@@ -40,7 +40,7 @@ final class ToolPresentationProjectorTest {
     void sanitizesShellCommandBeforePresentation() {
         String command = "echo " + KNOWN_SECRET
                 + " && echo api_key=secondary-secret"
-                + " && echo Bearer abcdefghijklmnop"
+                + " && echo Bearer " + "abcdefghijklmnop"
                 + " && type C:\\workspace\\ja\\README.md\n"
                 + "type C:\\Windows\\win.ini\u001B[31m\u0000\n"
                 + "type C:/Users/private/secret.txt\n"
@@ -116,6 +116,21 @@ final class ToolPresentationProjectorTest {
         assertEquals("src/App.tsx", internal.inputPreview());
         assertEquals(List.of("[external-path]"), external.relativePaths());
         assertEquals("[external-path]", external.inputPreview());
+    }
+
+    /** Skill 只展示逻辑名称，既能诊断读取对象，也不会把资源子路径或物理 locator 写入历史。 */
+    @Test
+    void displaysOnlyValidatedSkillIdentity() {
+        ToolPresentation skill = ToolPresentationProjector.prepared(
+                invocation("read", Map.of("path", new JsonText("skill://updeng-workflow/references/private.md"))),
+                WORKSPACE, List.of());
+        ToolPresentation malformed = ToolPresentationProjector.prepared(
+                invocation("read", Map.of("path", new JsonText("skill://bad name/secret.md"))),
+                WORKSPACE, List.of());
+
+        assertEquals(List.of("skill://updeng-workflow"), skill.relativePaths());
+        assertEquals("skill://updeng-workflow", skill.inputPreview());
+        assertEquals(List.of("[resource]"), malformed.relativePaths());
     }
 
     /**

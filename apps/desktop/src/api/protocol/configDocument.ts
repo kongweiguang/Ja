@@ -11,7 +11,7 @@ const MAX_CATALOG_REFERENCES = 128;
 const MAX_MAP_ENTRIES = 64;
 const MAX_MAP_VALUE = 8_192;
 
-/** 配置身份保持不透明，并只接受 schema v4 的稳定命名空间。 */
+/** 配置身份保持不透明，并只接受 schema v1 的稳定命名空间。 */
 export const ConfigCredentialRefSchema = z
   .string()
   .regex(/^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
@@ -131,8 +131,7 @@ export const ConfigProviderSchema = z
   .object({
     provider_id: ConfigProviderIdSchema,
     name: z.string().trim().min(1).max(MAX_TEXT),
-    provider: z.enum(["openai", "anthropic"]),
-    api: z.enum(["openai_responses", "anthropic_messages"]),
+    api: z.enum(["openai_responses", "anthropic_messages", "openai_chat_completions"]),
     base_url: z.string().min(1).max(2_048).refine(isSafeProviderUrl),
     credential_id: ConfigCredentialRefSchema,
     network_timeouts: configNetworkTimeoutsSchema,
@@ -141,12 +140,6 @@ export const ConfigProviderSchema = z
   })
   .strict()
   .superRefine((provider, context) => {
-    if (
-      (provider.provider === "openai" && provider.api === "anthropic_messages") ||
-      (provider.provider === "anthropic" && provider.api !== "anthropic_messages")
-    ) {
-      context.addIssue({ code: "custom", path: ["api"], message: "provider mismatch" });
-    }
     if (new Set(provider.models.map((model) => model.model_id)).size !== provider.models.length) {
       context.addIssue({ code: "custom", path: ["models"], message: "duplicate model id" });
     }
@@ -189,16 +182,16 @@ const ConfigSkillSchema = z
   .object({
     skill_id: configSkillIdSchema,
     name: z.string().min(1).max(MAX_TEXT),
-    scope: z.enum(["builtin", "user", "workspace"]),
+    scope: z.enum(["builtin", "user", "ja", "project"]),
     enabled: z.boolean(),
     description: z.string().max(8_192),
   })
   .strict();
 
-/** 解析 app-server 唯一接受的 v4 配置，并在 renderer 边界校验默认选择的真实引用。 */
+/** 只解析 app-server 返回的当前 v1 配置，并在 renderer 边界校验默认选择的真实引用。 */
 export const ConfigDocumentSchema = z
   .object({
-    schema_version: z.literal(4),
+    schema_version: z.literal(1),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
     default_access_mode: z.enum(["approval_required", "full_access"]),
     default_provider_id: ConfigProviderIdSchema.nullable(),
@@ -215,6 +208,16 @@ export const ConfigDocumentSchema = z
       document.providers.length
     ) {
       context.addIssue({ code: "custom", path: ["providers"], message: "duplicate provider id" });
+    }
+    if (
+      new Set(document.providers.map((provider) => provider.credential_id)).size !==
+      document.providers.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["providers"],
+        message: "duplicate provider credential id",
+      });
     }
     const hasProvider = document.default_provider_id !== null;
     const hasModel = document.default_model_id !== null;

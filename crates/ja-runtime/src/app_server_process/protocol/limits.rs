@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! JA-RPC v2 协商资源上限；这里只维护数值不变量与 initialize 投影。
+//! JA-RPC v1 协商资源上限；这里只维护数值不变量与 initialize 投影。
 
 use super::error_policy::CodecError;
 use serde_json::Value;
@@ -76,6 +76,8 @@ impl Limits {
             "maxThreadQueuedTurns": 8,
             "maxSnapshotPageItems": 200,
             "maxToolBatchConcurrency": 8,
+            "maxTurnQueuedInputs": 8,
+            "maxTurnQueuedInputBytes": 524_288,
         })
     }
 }

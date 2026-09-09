@@ -1,7 +1,11 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { ConversationHostEvent } from "@/features/conversation";
+import type {
+  AttachmentSummary,
+  ConversationHostEvent,
+  UserContentBlock,
+} from "@/features/conversation";
 
 type RuntimeStatusKind =
   | "starting"
@@ -19,6 +23,7 @@ export interface RuntimeStatus {
   status: RuntimeStatusKind;
   generation: number;
   serverInstanceId?: string | null;
+  features: readonly ("task_threads_v1" | "plan_goal_v1")[];
 }
 
 /** 恢复投影携带人工确认所需 CAS，不暴露 recovery 文件或原生诊断。 */
@@ -57,8 +62,13 @@ export interface GeneralWorkspace {
 
 export interface TurnStartInput {
   threadId: string;
-  content: Array<{ type: "text"; text: string } | { type: "attachment"; attachmentId: string }>;
+  content: UserContentBlock[];
   deadlineMs?: number;
+}
+
+/** turn/start 的 Renderer 投影摘要不进入 JA-RPC，只跨越 ACK 竞态补齐当前用户消息。 */
+export interface RuntimeTurnSubmissionInput extends TurnStartInput {
+  projectionAttachments?: readonly AttachmentSummary[];
 }
 
 export interface TurnAccepted {
@@ -66,6 +76,12 @@ export interface TurnAccepted {
   turnId: string;
   queued: boolean;
   threadRevision: number;
+}
+
+/** Resume 只携带原 Turn identity 与 Thread revision CAS，不允许 Renderer 提交执行状态。 */
+export interface TurnResumeInput {
+  turnId: string;
+  expectedThreadRevision: number;
 }
 
 export interface TurnCancelInput {
@@ -76,21 +92,61 @@ export interface TurnCancelInput {
 export interface TurnCancelResult {
   accepted: true;
   turnId: string;
-  status: "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
+  status:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "suspended"
+    | "completed"
+    | "failed"
+    | "cancelled";
   threadRevision: number;
 }
 
-export interface TurnQueuedInput {
-  turnId: string;
-  text: string;
-}
-
-export interface TurnQueuedInputResult {
-  accepted: true;
+export interface QueuedInput {
   inputId: string;
   turnId: string;
-  kind: "steering" | "follow_up";
-  status: "queued";
+  content: UserContentBlock[];
+  attachments: Array<{
+    attachmentId: string;
+    displayName: string;
+    sizeBytes: number;
+    mediaKind: "text" | "image" | "pdf" | "binary";
+    mediaType: string;
+  }>;
+  kind: "follow_up" | "steering";
+  status: "pending" | "needs_attention";
+  issue: { errorCode: string; message: string; retryable: boolean } | null;
+  inputRevision: number;
+  createdAt: string;
+}
+
+export interface InputQueue {
+  turnId: string;
+  revision: number;
+  accepting: boolean;
+  items: QueuedInput[];
+}
+
+export interface TurnInputEnqueue {
+  turnId: string;
+  content: UserContentBlock[];
+}
+
+export interface TurnInputMutation {
+  turnId: string;
+  inputId: string;
+  expectedInputRevision: number;
+}
+
+export interface TurnInputUpdate extends TurnInputMutation {
+  content: UserContentBlock[];
+}
+
+export interface InputQueueMutationResult {
+  accepted: true;
+  inputId: string;
+  inputQueue: InputQueue;
 }
 
 export interface ApprovalResponseInput {
@@ -104,7 +160,7 @@ interface RuntimeSkillListResult {
   items: Array<{
     skillId: string;
     name: string;
-    scope: "builtin" | "user" | "workspace";
+    scope: "builtin" | "user" | "ja" | "project";
     enabled: boolean;
     status: "healthy" | "invalid" | "unavailable";
     description: string;
@@ -140,7 +196,21 @@ interface RuntimeModelTestResult {
 }
 
 interface RuntimeSettingsOperations {
-  "skill/list": { params: { cursor?: string; limit?: number }; result: RuntimeSkillListResult };
+  "workspace/path/search": {
+    params: { threadId: string; workspaceId: string; query: string; limit?: number };
+    result: {
+      threadId: string;
+      workspaceId: string;
+      generation: number;
+      query: string;
+      items: Array<{ relativePath: string; kind: "file" | "directory" }>;
+      truncated: boolean;
+    };
+  };
+  "skill/list": {
+    params: { workspaceId?: string; cursor?: string; limit?: number };
+    result: RuntimeSkillListResult;
+  };
   "mcp/list": { params: { cursor?: string; limit?: number }; result: RuntimeMcpListResult };
   "mcp/test": { params: { mcpId: string }; result: RuntimeMcpTestResult };
   "model/test": {
@@ -190,6 +260,7 @@ interface RuntimeAcceptedTurnProjection {
   readonly turnId: string;
   readonly threadRevision: number;
   readonly submittedText: string;
+  readonly submittedAttachments?: readonly AttachmentSummary[];
   readonly submittedAt: string;
 }
 
@@ -201,6 +272,7 @@ export interface RuntimeProjectionPort {
   currentGeneration(): number;
   applyRuntimeStatus(status: RuntimeStatusProjection): void;
   applyTurnAccepted(accepted: RuntimeAcceptedTurnProjection): void;
+  applyInputQueue(inputQueue: InputQueue): void;
   applyHostEvent(event: Exclude<RuntimeHostEvent, { kind: "status" }>): void;
 }
 
@@ -218,9 +290,12 @@ export interface RuntimeHostPort {
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
+  turnResume(input: TurnResumeInput): Promise<TurnAccepted>;
   turnCancel(input: TurnCancelInput): Promise<TurnCancelResult>;
-  turnSteer(input: TurnQueuedInput): Promise<TurnQueuedInputResult>;
-  turnFollowUp(input: TurnQueuedInput): Promise<TurnQueuedInputResult>;
+  turnInputEnqueue(input: TurnInputEnqueue): Promise<InputQueueMutationResult>;
+  turnInputPrioritize(input: TurnInputMutation): Promise<InputQueueMutationResult>;
+  turnInputUpdate(input: TurnInputUpdate): Promise<InputQueueMutationResult>;
+  turnInputDelete(input: TurnInputMutation): Promise<InputQueueMutationResult>;
   query: RuntimeQuery;
   subscribe(listener: (event: RuntimeHostEvent) => void): Promise<RuntimeHostUnsubscribe>;
 }
@@ -230,6 +305,11 @@ export type RuntimeApplicationErrorCode =
   | "RUNTIME_UNAVAILABLE"
   | "RECOVERY_REQUIRED"
   | "RUNTIME_NOT_READY"
+  | "TURN_NOT_RESUMABLE"
+  | "TURN_RESUME_ORDER_CONFLICT"
+  | "TURN_INPUT_QUEUE_FULL"
+  | "QUEUED_INPUT_NOT_FOUND"
+  | "CONFLICT"
   | "SENSITIVE_EVENT_BLOCKED";
 
 const RUNTIME_ERROR_CATALOG: Record<
@@ -240,6 +320,11 @@ const RUNTIME_ERROR_CATALOG: Record<
   RUNTIME_UNAVAILABLE: { message: "运行时暂不可用", retryable: true },
   RECOVERY_REQUIRED: { message: "需要先完成运行时恢复", retryable: false },
   RUNTIME_NOT_READY: { message: "运行时尚未就绪，请重试", retryable: true },
+  TURN_NOT_RESUMABLE: { message: "当前运行无法继续", retryable: false },
+  TURN_RESUME_ORDER_CONFLICT: { message: "请先处理更早中断的运行", retryable: true },
+  TURN_INPUT_QUEUE_FULL: { message: "排队消息已满，请等待处理后再发送", retryable: true },
+  QUEUED_INPUT_NOT_FOUND: { message: "这条排队消息已被处理", retryable: true },
+  CONFLICT: { message: "排队消息已更新，请重试", retryable: true },
   SENSITIVE_EVENT_BLOCKED: { message: "运行时事件包含受保护数据", retryable: false },
 };
 

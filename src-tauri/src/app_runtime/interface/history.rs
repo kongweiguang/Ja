@@ -6,9 +6,10 @@
 use super::history_model::{
     AcceptedResult, HistoryMethod, PageInput, ThreadCompactInput, ThreadCompactResult,
     ThreadCreateInput, ThreadDto, ThreadListInput, ThreadListResult, ThreadMutationInput,
-    ThreadPreferencesUpdateInput, ThreadReadInput, ThreadReadResult, ThreadRenameInput,
-    ThreadSearchInput, WorkspaceListResult, dispatch_compaction, dispatch_mutation, parse_thread,
-    parse_thread_page, parse_thread_read, parse_workspace_page, request_history, validate_page,
+    ThreadPinInput, ThreadPreferencesUpdateInput, ThreadReadInput, ThreadReadResult,
+    ThreadRenameInput, ThreadSearchInput, WorkspaceListResult, dispatch_compaction,
+    dispatch_mutation, dispatch_pin, dispatch_thread_lifecycle, parse_thread, parse_thread_page,
+    parse_thread_read, parse_workspace_page, request_history, validate_page,
     validate_thread_create, validate_thread_list, validate_thread_preferences_update,
     validate_thread_read, validate_thread_rename, validate_thread_search,
 };
@@ -104,7 +105,7 @@ pub fn ja_thread_rename(
     parse_thread(result)
 }
 
-/// 整体替换 Thread 的下一轮 Provider/Model/reasoning/access 偏好，不改变已冻结 Turn 快照。
+/// 整体替换 Thread 偏好；在途 Provider 请求不变，同一 Turn 的下一请求读取新值。
 #[tauri::command]
 pub fn ja_thread_preferences_update(
     input: ThreadPreferencesUpdateInput,
@@ -137,8 +138,35 @@ pub async fn ja_thread_compact(
 pub fn ja_thread_archive(
     input: ThreadMutationInput,
     state: tauri::State<'_, RuntimeHost>,
-) -> Result<AcceptedResult, RuntimeCommandError> {
-    dispatch_mutation(input, &state, HistoryMethod::ThreadArchive)
+) -> Result<ThreadDto, RuntimeCommandError> {
+    dispatch_thread_lifecycle(input, &state, HistoryMethod::ThreadArchive)
+}
+
+/// 通过显式目标值和 revision CAS 更新置顶，返回权威 Thread 供 UI 重排。
+#[tauri::command]
+pub fn ja_thread_pin(
+    input: ThreadPinInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ThreadDto, RuntimeCommandError> {
+    dispatch_pin(input, &state)
+}
+
+/// 将当前最新 Turn 标记为已查看；Java 以 revision CAS 推进持久边界，Rust 不在本地伪造已读状态。
+#[tauri::command]
+pub fn ja_thread_seen(
+    input: ThreadMutationInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ThreadDto, RuntimeCommandError> {
+    dispatch_thread_lifecycle(input, &state, HistoryMethod::ThreadSeen)
+}
+
+/// 恢复归档 Thread；服务端强制清除置顶并返回完整 active 投影。
+#[tauri::command]
+pub fn ja_thread_restore(
+    input: ThreadMutationInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ThreadDto, RuntimeCommandError> {
+    dispatch_thread_lifecycle(input, &state, HistoryMethod::ThreadRestore)
 }
 
 /// 通过 expected revision CAS 逻辑删除 Thread，不在 command 复制生命周期规则。

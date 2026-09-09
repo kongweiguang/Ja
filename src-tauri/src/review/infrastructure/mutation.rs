@@ -12,8 +12,8 @@ use super::transaction::{
 };
 use crate::review::application::ReviewError;
 use crate::review::domain::{
-    ReviewAction, ReviewFile, ReviewFileStatus, ReviewRevision, ReviewSnapshot, ReviewSource,
-    ReviewTarget,
+    ReviewAction, ReviewFile, ReviewFileLayer, ReviewFileStatus, ReviewRevision, ReviewSnapshot,
+    ReviewSource, ReviewTarget,
 };
 use crate::workspace::{PathMutationQueue, resolve_relative};
 use std::collections::BTreeSet;
@@ -52,9 +52,24 @@ impl NativeReviewAdapter {
         }
         PathMutationQueue::global().with_paths(&lock_paths, || {
             // 锁内重新物化并执行第二次 revision CAS，封闭锁外 snapshot 与真实写入间的竞态。
-            let current = self.materialize(source, cancellation)?;
+            let mut current = self.materialize(source, cancellation)?;
             if current.revision != revision.as_str() {
                 return Err(ReviewError::ReviewStale);
+            }
+            if let ReviewTarget::Hunk { file_id, .. } = target {
+                let index = current
+                    .files
+                    .iter()
+                    .position(|file| file.file_id == *file_id)
+                    .ok_or(ReviewError::InvalidInput)?;
+                let materialized =
+                    self.materialize_one_file(source, &current.files[index], cancellation)?;
+                // path-specific patch 读取后再次重算 strong revision；外部写入不遵守 Ja 路径锁，
+                // 因此不能仅依赖锁前 CAS。
+                if self.probe_revision(source, cancellation)? != revision.as_str() {
+                    return Err(ReviewError::ReviewStale);
+                }
+                current.files[index] = materialized;
             }
             let selected = select_mutations(&current.files, target)?;
             let mut recovery = action_mutates_worktree(source, action)
@@ -98,12 +113,14 @@ impl NativeReviewAdapter {
                 recovery.commit();
             }
             let after = self.materialize(source, cancellation)?;
-            Ok(ReviewSnapshot {
+            let snapshot = ReviewSnapshot {
                 revision: ReviewRevision::parse(after.revision).map_err(|_| ReviewError::Parse)?,
                 source: source.clone(),
                 files: after.files,
                 stats: after.stats,
-            })
+            };
+            super::snapshot_cache::remember(self.workspace.id(), &snapshot);
+            Ok(snapshot)
         })
     }
 
@@ -120,6 +137,9 @@ impl NativeReviewAdapter {
             return Err(ReviewError::Cancelled);
         }
         match (source, action) {
+            (ReviewSource::Uncommitted, action) => {
+                self.apply_uncommitted(action, selected, index, cancellation)
+            }
             (ReviewSource::Unstaged, ReviewAction::Stage) => {
                 self.stage(selected, required_index(index)?, cancellation)
             }
@@ -131,6 +151,51 @@ impl NativeReviewAdapter {
             }
             (ReviewSource::Staged, ReviewAction::Revert) => {
                 self.revert_staged(selected, required_index(index)?, cancellation)
+            }
+            _ => Err(ReviewError::ReadOnlySource),
+        }
+    }
+
+    /// 聚合来源按 file layer 路由既有事务原语；All 只作用于支持该 action 的层。
+    fn apply_uncommitted(
+        &self,
+        action: ReviewAction,
+        selected: &[SelectedMutation],
+        index: Option<&Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ReviewError> {
+        let staged = selected
+            .iter()
+            .filter(|selection| selection.layer == ReviewFileLayer::Staged)
+            .cloned()
+            .collect::<Vec<_>>();
+        let unstaged = selected
+            .iter()
+            .filter(|selection| {
+                matches!(
+                    selection.layer,
+                    ReviewFileLayer::Unstaged | ReviewFileLayer::Untracked
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        match action {
+            ReviewAction::Stage if !unstaged.is_empty() => {
+                self.stage(&unstaged, required_index(index)?, cancellation)
+            }
+            ReviewAction::Unstage if !staged.is_empty() => {
+                self.unstage(&staged, required_index(index)?, cancellation)
+            }
+            ReviewAction::Revert if !staged.is_empty() || !unstaged.is_empty() => {
+                // 先消除 worktree 层，随后 staged revert 的 overlap 检查才不会把同路径的
+                // 已选未暂存变更当成外部竞态；任一步失败仍由外层 recovery/temporary index 回滚。
+                if !unstaged.is_empty() {
+                    self.revert_unstaged(&unstaged, cancellation)?;
+                }
+                if !staged.is_empty() {
+                    self.revert_staged(&staged, required_index(index)?, cancellation)?;
+                }
+                Ok(())
             }
             _ => Err(ReviewError::ReadOnlySource),
         }
@@ -350,6 +415,7 @@ impl NativeReviewAdapter {
 pub(super) struct SelectedMutation {
     pub(super) path: String,
     pub(super) old_path: Option<String>,
+    pub(super) layer: ReviewFileLayer,
     pub(super) status: ReviewFileStatus,
     pub(super) hunk: Option<Vec<u8>>,
 }
@@ -397,6 +463,7 @@ fn select_mutations(
             .map(|file| SelectedMutation {
                 path: file.path.clone(),
                 old_path: file.old_path.clone(),
+                layer: file.layer,
                 status: file.status,
                 hunk: None,
             })
@@ -409,6 +476,7 @@ fn select_mutations(
             Ok(vec![SelectedMutation {
                 path: file.path.clone(),
                 old_path: file.old_path.clone(),
+                layer: file.layer,
                 status: file.status,
                 hunk: None,
             }])
@@ -426,6 +494,7 @@ fn select_mutations(
             Ok(vec![SelectedMutation {
                 path: file.path.clone(),
                 old_path: file.old_path.clone(),
+                layer: file.layer,
                 status: file.status,
                 hunk: Some(hunk.raw_patch.clone()),
             }])

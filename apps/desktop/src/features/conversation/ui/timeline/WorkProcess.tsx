@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { ChevronDown, Clock3, Files, Search, ShieldAlert, Terminal, Wrench } from "lucide-react";
+import { ChevronDown, Clock3, Files, ShieldAlert, Terminal, Wrench } from "lucide-react";
 import { useState, type ReactElement } from "react";
 import {
   Collapsible,
@@ -16,13 +16,7 @@ import {
 } from "../approval/ApprovalCard";
 import type { TimelineApproval as ApprovalSummary } from "../../domain/timelineTypes";
 import {
-  itemByteCount,
-  itemChangedFiles,
-  itemChangedPaths,
-  itemDiffStat,
   itemDurationMs,
-  itemPresentedPaths,
-  itemTokenCount,
   turnDurationMs,
   workStepLabel,
   type WorkStepAdapter,
@@ -53,7 +47,14 @@ export interface WorkProcessProps {
   className?: string;
 }
 
-type WorkProcessState = "queued" | "active" | "waiting" | "failed" | "cancelled" | "completed";
+type WorkProcessState =
+  | "queued"
+  | "active"
+  | "waiting"
+  | "suspended"
+  | "failed"
+  | "cancelled"
+  | "completed";
 
 /**
  * 从权威 Turn、审批与 Item Status 派生单一用户可见状态，避免视图复制状态机。
@@ -73,6 +74,8 @@ function processState(
       return "active";
     case "waiting_approval":
       return "waiting";
+    case "suspended":
+      return "suspended";
     case "completed":
       return "completed";
     case "failed":
@@ -106,6 +109,8 @@ function processStatusLabel(state: WorkProcessState): string {
       return "进行中…";
     case "waiting":
       return "等待确认";
+    case "suspended":
+      return "运行被中断";
     case "completed":
       return "已完成";
     case "failed":
@@ -125,8 +130,6 @@ function StepIcon({ step }: { step: WorkStepAdapter }): ReactElement {
       return <Terminal aria-hidden="true" />;
     case "tool_call":
       return <Wrench aria-hidden="true" />;
-    case "commentary":
-      return <Search aria-hidden="true" />;
     case "approval":
       return <ShieldAlert aria-hidden="true" />;
     default:
@@ -192,23 +195,6 @@ function presentedStepStatusLabel(step: WorkStepAdapter): string {
   }
 }
 
-/** 按 Tool 类型说明路径含义，避免把读取或 Shell 涉及路径伪装成本轮修改。 */
-function presentedPathLabel(step: WorkStepAdapter): string {
-  switch (step.metadata?.presentation?.kind) {
-    case "read":
-      return "读取的文件";
-    case "edit":
-    case "write":
-      return "修改的文件";
-    case "shell":
-      return "命令涉及的文件";
-    case "mcp":
-      return "工具涉及的资源";
-    case undefined:
-      return "修改的文件";
-  }
-}
-
 /**
  * Detail 只渲染 Commentary Text 与显式 Item Summary。Item Kind 已在 Protocol 边界列入 Allowlist，
  * 因此 Hidden Reasoning Record 不能借由兜底展示通道进入组件。
@@ -222,38 +208,6 @@ function stepDetail(step: WorkStepAdapter): string | undefined {
     return undefined;
   }
   return text.length > 2_048 ? `${text.slice(0, 2_048)}…` : text;
-}
-
-/**
- * 构建紧凑且安全的 Metric Label；协议阶段只用于投影分流，界面改用模型轮次表达，
- * 避免把 `assistant_progress` 等内部枚举泄漏成面向用户的产品文案。
- */
-function stepMetricLabels(step: WorkStepAdapter): string[] {
-  const labels: string[] = [];
-  const metadata = step.metadata;
-  const toolName = metadata?.toolName?.trim();
-  const toolType = metadata?.toolKind?.trim();
-  if (toolName) labels.push(toolName);
-  if (toolType && toolType !== toolName) labels.push(toolType);
-  if (
-    metadata?.modelRound !== undefined &&
-    Number.isSafeInteger(metadata.modelRound) &&
-    metadata.modelRound > 0
-  ) {
-    labels.push(`模型第 ${metadata.modelRound} 轮`);
-  }
-  if (metadata?.requiresUserAction === true) labels.push("需要操作");
-  const tokens = itemTokenCount(step);
-  if (tokens !== undefined) labels.push(`${tokens.toLocaleString()} tokens`);
-  const bytes = itemByteCount(step);
-  if (bytes !== undefined) labels.push(`${bytes.toLocaleString()} bytes`);
-  const changedFiles = itemChangedFiles(step);
-  if (changedFiles !== undefined) labels.push(`${changedFiles.toLocaleString()} 个文件`);
-  const diff = itemDiffStat(step);
-  if (diff?.additions !== undefined) labels.push(`+${diff.additions.toLocaleString()}`);
-  if (diff?.deletions !== undefined) labels.push(`−${diff.deletions.toLocaleString()}`);
-  if (metadata?.truncated === true) labels.push("仅显示部分文件");
-  return labels;
 }
 
 /** 只有至少一个 Source Item 提供 Metric 时才合计可选值。 */
@@ -286,12 +240,19 @@ export function WorkProcess({
   onReadToolArtifact,
   className,
 }: WorkProcessProps): ReactElement | null {
-  const approvalPending = approvals.some(
-    (approval) =>
-      approvalDecisions[approval.approvalId] === undefined &&
-      approvalClosedAt[approval.approvalId] === undefined,
+  // 安全 Commentary 保留为无标签叙事；空摘要不创建占位行，Tool 继续承担可操作步骤身份。
+  const visibleSteps = steps.filter(
+    (step) => step.kind !== "commentary" || stepDetail(step) !== undefined,
   );
-  const state = processState(steps, turn, approvalPending);
+  const actionableSteps = visibleSteps.filter((step) => step.kind !== "commentary");
+  const approvalPending =
+    turn?.status !== "suspended" &&
+    approvals.some(
+      (approval) =>
+        approvalDecisions[approval.approvalId] === undefined &&
+        approvalClosedAt[approval.approvalId] === undefined,
+    );
+  const state = processState(visibleSteps, turn, approvalPending);
   const [manualDisclosure, setManualDisclosure] = useState<{
     state: WorkProcessState;
     open: boolean;
@@ -303,7 +264,7 @@ export function WorkProcess({
       : state !== "completed" || approvalPending;
 
   if (
-    steps.length === 0 &&
+    visibleSteps.length === 0 &&
     approvals.length === 0 &&
     (turn === undefined || turn.status === "completed")
   ) {
@@ -312,7 +273,7 @@ export function WorkProcess({
 
   // Call 关联把卡片排在对应 Prepared Tool 旁，即使 Approval Event 明确不携带展示 Item Identity。
   const stepIndexByCallId = new Map(
-    steps.flatMap((step, index) =>
+    visibleSteps.flatMap((step, index) =>
       step.metadata?.callId === undefined ? [] : [[step.metadata.callId, index] as const],
     ),
   );
@@ -321,21 +282,29 @@ export function WorkProcess({
       (stepIndexByCallId.get(left.callId) ?? Number.MAX_SAFE_INTEGER) -
       (stepIndexByCallId.get(right.callId) ?? Number.MAX_SAFE_INTEGER),
   );
+  // 未决审批只有恢复到 WAITING_APPROVAL 后才重新开放；Suspended 的唯一动作是继续或取消。
+  const visibleApprovals = orderedApprovals.filter(
+    (approval) =>
+      approvalDecisions[approval.approvalId] !== undefined ||
+      approvalClosedAt[approval.approvalId] !== undefined ||
+      turn === undefined ||
+      turn.status === "waiting_approval",
+  );
 
   // Turn 存在时只信任它的权威起止时间；仅无 Turn 的降级投影允许汇总步骤耗时。
   const durationMs =
-    turn === undefined ? sumOptional(steps.map(itemDurationMs)) : turnDurationMs(turn);
+    turn === undefined ? sumOptional(visibleSteps.map(itemDurationMs)) : turnDurationMs(turn);
   const duration = formatDuration(durationMs);
-  const failedStepCount = steps.filter((step) => step.status === "failed").length;
+  const failedStepCount = actionableSteps.filter((step) => step.status === "failed").length;
   const statusLabel = processStatusLabel(state);
   const recoveredFailureCount = state === "completed" ? failedStepCount : 0;
-  const hasDetails = steps.length > 0 || approvals.length > 0;
+  const hasDetails = visibleSteps.length > 0 || visibleApprovals.length > 0;
   const accessibleSummary = [
     "工作过程",
     statusLabel,
     recoveredFailureCount > 0 ? `${recoveredFailureCount} 步失败` : undefined,
     duration,
-    steps.length > 0 ? `${steps.length} 步` : undefined,
+    actionableSteps.length > 0 ? `${actionableSteps.length} 步` : undefined,
   ]
     .filter((label): label is string => label !== undefined)
     .join("，");
@@ -364,12 +333,12 @@ export function WorkProcess({
             {duration}
           </span>
         ) : null}
-        {steps.length > 0 ? (
+        {actionableSteps.length > 0 ? (
           <span className="ja-work-process__step-count">
             <span className="ja-work-process__separator" aria-hidden="true">
               ·
             </span>
-            {steps.length} 步
+            {actionableSteps.length} 步
           </span>
         ) : null}
         {hasDetails ? (
@@ -404,17 +373,27 @@ export function WorkProcess({
         )}
         {hasDetails ? (
           <CollapsibleContent className="ja-work-process__content">
-            {steps.length > 0 ? (
+            {visibleSteps.length > 0 ? (
               <ol className="ja-work-process__steps">
-                {steps.map((step) => {
+                {visibleSteps.map((step) => {
+                  const detail = stepDetail(step);
+                  if (step.kind === "commentary" && detail !== undefined) {
+                    return (
+                      <li key={step.itemId} className="ja-work-step--commentary">
+                        <MarkdownMessage
+                          content={detail}
+                          onOpenLink={onOpenLink}
+                          onCopyText={onCopyText}
+                        />
+                      </li>
+                    );
+                  }
                   // ToolPresentation 已在详情中显示自身耗时；通用步骤耗时只服务 commentary 等非 Tool 项，避免重复事实。
                   const stepDuration =
                     step.metadata?.presentation === undefined
                       ? formatDuration(itemDurationMs(step))
                       : undefined;
-                  const changedPaths = itemChangedPaths(step);
-                  const presentedPaths = itemPresentedPaths(step);
-                  const paths = presentedPaths.length > 0 ? presentedPaths : changedPaths;
+                  const hasPresentation = step.metadata?.presentation !== undefined;
                   return (
                     <li
                       key={step.itemId}
@@ -424,11 +403,13 @@ export function WorkProcess({
                         <StepIcon step={step} />
                       </span>
                       <div className="ja-work-step__body">
-                        <div className="ja-work-step__header">
-                          <strong>{workStepLabel(step)}</strong>
-                          <span>{presentedStepStatusLabel(step)}</span>
-                        </div>
-                        {stepDetail(step) ? (
+                        {hasPresentation ? null : (
+                          <div className="ja-work-step__header">
+                            <strong>{workStepLabel(step)}</strong>
+                            <span>{presentedStepStatusLabel(step)}</span>
+                          </div>
+                        )}
+                        {!hasPresentation && stepDetail(step) ? (
                           <MarkdownMessage
                             content={stepDetail(step) ?? ""}
                             className="ja-work-step__detail"
@@ -439,20 +420,6 @@ export function WorkProcess({
                         {step.metadata?.presentation === undefined ? null : (
                           <ToolStepDetails step={step} onReadArtifact={onReadToolArtifact} />
                         )}
-                        {paths.length > 0 ? (
-                          <ul className="ja-work-step__paths" aria-label={presentedPathLabel(step)}>
-                            {paths.map((path) => (
-                              <li key={path}>{path}</li>
-                            ))}
-                          </ul>
-                        ) : null}
-                        {stepMetricLabels(step).length > 0 ? (
-                          <div className="ja-work-step__metrics">
-                            {stepMetricLabels(step).map((label) => (
-                              <span key={label}>{label}</span>
-                            ))}
-                          </div>
-                        ) : null}
                         {stepDuration ? (
                           <span className="ja-work-step__duration">
                             <Clock3 aria-hidden="true" />
@@ -465,7 +432,7 @@ export function WorkProcess({
                 })}
               </ol>
             ) : null}
-            {orderedApprovals.map((approval) => (
+            {visibleApprovals.map((approval) => (
               <ApprovalCard
                 key={approval.approvalId}
                 approval={approval}

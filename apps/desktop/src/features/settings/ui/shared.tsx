@@ -4,7 +4,7 @@
 
 import * as Label from "@radix-ui/react-label";
 import * as Switch from "@radix-ui/react-switch";
-import { CircleAlert, Cloud, Laptop, Server, Shield, Sparkles } from "lucide-react";
+import { CircleAlert, Cloud, Info, Laptop, Server, Shield, Sparkles } from "lucide-react";
 import { cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { type UseFormSetError } from "react-hook-form";
 import { Select } from "@/shared/ui/primitives";
@@ -26,16 +26,13 @@ export const sections: ReadonlyArray<{ id: SettingsSection; label: string; icon:
   { id: "mcp", label: "MCP", icon: <Server size={16} aria-hidden="true" /> },
   { id: "permissions", label: "执行确认", icon: <Shield size={16} aria-hidden="true" /> },
   { id: "appearance", label: "外观", icon: <Laptop size={16} aria-hidden="true" /> },
+  { id: "about", label: "关于", icon: <Info size={16} aria-hidden="true" /> },
 ];
 
 export const apiOptions = [
   { value: "anthropic_messages", label: "Anthropic Messages" },
   { value: "openai_responses", label: "OpenAI Responses" },
-] as const;
-
-export const providerOptions = [
-  { value: "anthropic", label: "Anthropic" },
-  { value: "openai", label: "OpenAI" },
+  { value: "openai_chat_completions", label: "OpenAI Chat Completions" },
 ] as const;
 
 export const themeOptions = [
@@ -52,7 +49,8 @@ export const transportOptions = [
 export const sourceLabels: Record<SkillSource, string> = {
   builtin: "内置",
   user: "用户",
-  workspace: "Workspace",
+  ja: "Ja",
+  project: "项目",
 };
 
 /**
@@ -68,13 +66,12 @@ export function settingsMutationErrorMessage(error: unknown, fallback: string): 
     : fallback;
 }
 
-/** 新 Provider 使用安全显式默认值，并在首个保存前要求用户确认连接字段。 */
+/** 新供应商只预选常见 Wire 协议；名称和地址保持为空，避免把协议品牌冒充供应商身份。 */
 export function emptyProviderDraft(): ProviderDraft {
   return {
-    provider: "anthropic",
-    api: "anthropic_messages",
-    name: "Anthropic",
-    baseUrl: "https://api.anthropic.com",
+    api: "openai_chat_completions",
+    name: "",
+    baseUrl: "",
     credentialId: canonicalCredentialId(),
     networkTimeouts: { connectTimeoutMs: 10_000, requestTimeoutMs: 120_000 },
     agentDefaults: {
@@ -126,7 +123,7 @@ function parseKeyValueLines(value: string): Record<string, string> {
   );
 }
 
-/** 映射 MCP 表单值时完整保留 v4 transport 与认证字段，不把 Secret 放入文档。 */
+/** 映射 MCP 表单值时完整保留 v1 transport 与认证字段，不把 Secret 放入文档。 */
 export function toMcpSavePayload(
   values: McpServerDraft,
   revision = values.mcpRevision ?? canonicalRevision("mcp"),
@@ -190,16 +187,18 @@ export function SettingsSelect({
   ariaLabel,
   ariaDescribedBy,
   ariaInvalid,
+  disabled,
   "aria-describedby": ariaDescribedByAttribute,
   "aria-invalid": ariaInvalidAttribute,
 }: {
   id: string;
   value: string;
-  options: ReadonlyArray<{ value: string; label: string; disabled?: boolean }>;
+  options: ReadonlyArray<{ value: string; label: ReactNode; disabled?: boolean }>;
   onValueChange: (value: string) => void;
   ariaLabel?: string;
   ariaDescribedBy?: string;
   ariaInvalid?: boolean;
+  disabled?: boolean;
   "aria-describedby"?: string;
   "aria-invalid"?: boolean;
 }): ReactElement {
@@ -212,6 +211,7 @@ export function SettingsSelect({
       ariaLabel={ariaLabel}
       ariaDescribedBy={ariaDescribedBy ?? ariaDescribedByAttribute}
       ariaInvalid={ariaInvalid ?? ariaInvalidAttribute}
+      disabled={disabled}
     />
   );
 }

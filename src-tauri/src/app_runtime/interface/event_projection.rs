@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const RPC_FRAME_EVENT: &str = "ja://rpc/frame";
 const STATUS_EVENT_PREFIX: &str = "evt_host_";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+/// Host emitter 与 Java event validator 共享唯一 2.1 feature 顺序，避免两条 Ready 来源漂移。
+const RUNTIME_STATUS_FEATURES: [&str; 2] = ["task_threads_v1", "plan_goal_v1"];
 const NOTIFICATION_COMMON_FIELDS: [&str; 5] = [
     "serverInstanceId",
     "eventId",
@@ -29,6 +31,16 @@ const TURN_COMMON_FIELDS: [&str; 9] = [
     "threadId",
     "turnId",
     "threadRevision",
+];
+const TASK_COMMON_FIELDS: [&str; 8] = [
+    "serverInstanceId",
+    "eventId",
+    "sequence",
+    "occurredAt",
+    "generation",
+    "rootThreadId",
+    "taskThreadId",
+    "taskRevision",
 ];
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
@@ -183,7 +195,7 @@ fn valid_config_version(value: Option<&Value>) -> bool {
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
-/// 使用所有 v2 notification 共用的进程级顺序 metadata 校验唯一 runtime lifecycle 事件，避免建立第二套时序规则。
+/// 使用所有 v1 notification 共用的进程级顺序 metadata 校验唯一 runtime lifecycle 事件，避免建立第二套时序规则。
 fn validate_runtime_event(
     method: &str,
     params: &serde_json::Map<String, Value>,
@@ -196,7 +208,7 @@ fn validate_runtime_event(
             if !exact_keys_with_common(
                 params,
                 &NOTIFICATION_COMMON_FIELDS,
-                &["status"],
+                &["status", "features"],
                 &["reason", "readyToken"],
             ) {
                 return Err(invalid_projection());
@@ -207,11 +219,13 @@ fn validate_runtime_event(
                     value,
                     "starting" | "ready" | "shutting_down" | "stopped" | "failed"
                 )
-            }) || !valid_runtime_status(
-                status.unwrap_or_default(),
-                params.get("reason"),
-                params.get("readyToken"),
-            ) {
+            }) || params.get("features") != Some(&json!(RUNTIME_STATUS_FEATURES))
+                || !valid_runtime_status(
+                    status.unwrap_or_default(),
+                    params.get("reason"),
+                    params.get("readyToken"),
+                )
+            {
                 return Err(invalid_projection());
             }
         }
@@ -221,7 +235,7 @@ fn validate_runtime_event(
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
-/// 强制执行 v2 lifecycle status/reason/token tuple，使失败 shutdown 不会伪装成干净停止，并阻止 ready challenge 跨状态变体出现。
+/// 强制执行 v1 lifecycle status/reason/token tuple，使失败 shutdown 不会伪装成干净停止，并阻止 ready challenge 跨状态变体出现。
 fn valid_runtime_status(status: &str, reason: Option<&Value>, ready_token: Option<&Value>) -> bool {
     let reason = reason.and_then(Value::as_str);
     match status {
@@ -247,6 +261,12 @@ fn validate_kernel_event(
     method: &str,
     params: &serde_json::Map<String, Value>,
 ) -> Result<(), RuntimeCommandError> {
+    if method.starts_with("goal/") {
+        return validate_goal_event(method, params);
+    }
+    if method.starts_with("task/") {
+        return validate_task_event(method, params);
+    }
     if method == "thread/metadata-changed" {
         return validate_thread_metadata_event(params);
     }
@@ -255,6 +275,9 @@ fn validate_kernel_event(
         "context/compaction-started" | "context/compacted" | "context/compaction-failed"
     ) {
         return validate_context_event(method, params);
+    }
+    if method == "turn/input-queue-changed" {
+        return validate_input_queue_changed_event(params);
     }
     if matches!(
         method,
@@ -280,6 +303,7 @@ fn validate_kernel_event(
             if !exact(&["from", "to"], &[])
                 || !valid_turn_state(params.get("from"))
                 || !valid_turn_state(params.get("to"))
+                || !valid_turn_transition(params.get("from"), params.get("to"))
             {
                 return Err(invalid_projection());
             }
@@ -293,7 +317,16 @@ fn validate_kernel_event(
                 || !integer_in_range(params.get("modelRound"), 1, 128)
                 || !optional_bounded_text(params.get("reasoningSummary"), 0, 1_048_576)
                 || !optional_usage(params.get("usage"))
+                || !usage_matches_model_round(params.get("usage"), params.get("modelRound"))
                 || !valid_tool_calls(params.get("toolCalls"))
+            {
+                return Err(invalid_projection());
+            }
+        }
+        "tool/started" => {
+            if !exact(&["callId", "ordinal"], &[])
+                || !valid_prefixed(params.get("callId"), "call_", 101)
+                || !integer_in_range(params.get("ordinal"), 0, 1_023)
             {
                 return Err(invalid_projection());
             }
@@ -355,15 +388,25 @@ fn validate_kernel_event(
                 return Err(invalid_projection());
             }
         }
+        "turn/input-consumed" => {
+            if !exact(
+                &["input", "userItem", "inputQueue"],
+                &["assistantSettlement"],
+            ) || !valid_input_consumed_payload(params)
+            {
+                return Err(invalid_projection());
+            }
+        }
         "turn/terminal" => {
             if !exact(
-                &["state", "summary"],
+                &["state", "summary", "changeSet"],
                 &["finalMessage", "usage", "errorCode", "errorMessage"],
             ) || !bounded_text(params.get("summary"), 0, 1_048_576)
                 || !optional_terminal_message(params.get("finalMessage"))
                 || !optional_terminal_usage(params.get("usage"))
                 || !optional_identifier(params.get("errorCode"), 256)
                 || !optional_bounded_text(params.get("errorMessage"), 0, 1_048_576)
+                || !valid_change_set(params.get("changeSet"))
                 || !valid_terminal_condition(params)
             {
                 return Err(invalid_projection());
@@ -374,8 +417,282 @@ fn validate_kernel_event(
     Ok(())
 }
 
+/// Goal notification 使用独立 Goal revision/event sequence；changed 复用类型化完整投影，
+/// activity/input 保持小型闭集，避免错误落入要求 Turn identity 的通用分支。
+fn validate_goal_event(
+    method: &str,
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), RuntimeCommandError> {
+    if !valid_notification_common(params)
+        || !valid_prefixed(params.get("goalId"), "goal_", 101)
+        || !non_negative_integer(params.get("goalRevision"))
+        || !non_negative_integer(params.get("eventSequence"))
+    {
+        return Err(invalid_projection());
+    }
+    let exact = |required: &[&str]| {
+        exact_keys_with_common(
+            params,
+            &NOTIFICATION_COMMON_FIELDS,
+            &["goalId", "goalRevision", "eventSequence"]
+                .into_iter()
+                .chain(required.iter().copied())
+                .collect::<Vec<_>>(),
+            &[],
+        )
+    };
+    let valid = match method {
+        "goal/changed" => {
+            let projection = json!({
+                "goal": params.get("goal").cloned().unwrap_or(Value::Null),
+                "eventSequence": params.get("eventSequence").cloned().unwrap_or(Value::Null)
+            });
+            exact(&["goal"])
+                && serde_json::from_value::<super::goal::GoalProjectionResultDto>(projection)
+                    .is_ok_and(|value| {
+                        params.get("goalId").and_then(Value::as_str)
+                            == Some(value.goal.goal_id.as_str())
+                            && params.get("goalRevision").and_then(Value::as_u64)
+                                == Some(value.goal.revision)
+                            && params.get("eventSequence").and_then(Value::as_u64)
+                                == Some(value.event_sequence)
+                    })
+        }
+        "goal/activity" => {
+            exact(&["activity"])
+                && params
+                    .get("activity")
+                    .and_then(Value::as_object)
+                    .is_some_and(|activity| {
+                        exact_keys(activity, &["kind", "status", "summary", "stepId"], &[])
+                            && activity
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| {
+                                    matches!(kind, "run" | "step" | "evaluation" | "recovery")
+                                })
+                            && activity.get("status").and_then(Value::as_str).is_some_and(
+                                |status| {
+                                    matches!(
+                                        status,
+                                        "planning"
+                                            | "awaiting_approval"
+                                            | "working"
+                                            | "waiting_approval"
+                                            | "waiting_input"
+                                            | "verifying"
+                                            | "needs_attention"
+                                            | "paused"
+                                            | "achieved"
+                                            | "stopped"
+                                    )
+                                },
+                            )
+                            && bounded_text(activity.get("summary"), 1, 32_768)
+                            && activity.get("stepId").is_some_and(|step_id| {
+                                step_id.is_null() || valid_prefixed(Some(step_id), "step_", 101)
+                            })
+                    })
+        }
+        "goal/input-requested" => {
+            exact(&["input"])
+                && params
+                    .get("input")
+                    .and_then(Value::as_object)
+                    .is_some_and(|input| {
+                        exact_keys(
+                            input,
+                            &["inputRequestId", "prompt", "expiresAt", "createdAt"],
+                            &[],
+                        ) && valid_prefixed(input.get("inputRequestId"), "goalinput_", 106)
+                            && bounded_text(input.get("prompt"), 1, 32_768)
+                            && valid_timestamp(input.get("expiresAt"))
+                            && valid_timestamp(input.get("createdAt"))
+                    })
+        }
+        _ => false,
+    };
+    valid.then_some(()).ok_or_else(invalid_projection)
+}
+
+/// 三类 Task notification 使用独立 task revision 流；activity/mailbox 是不可丢事实，
+/// progress 额外绑定 connection-scoped observation handle。
+fn validate_task_event(
+    method: &str,
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), RuntimeCommandError> {
+    if !valid_task_common(params) {
+        return Err(invalid_projection());
+    }
+    let exact =
+        |required: &[&str]| exact_keys_with_common(params, &TASK_COMMON_FIELDS, required, &[]);
+    match method {
+        "task/activity" => {
+            if !exact(&["activity", "task"]) {
+                return Err(invalid_projection());
+            }
+            let activity =
+                crate::app_runtime::infrastructure::bridge::tasks::parse_task_activity_value(
+                    params.get("activity").unwrap_or(&Value::Null),
+                )
+                .map_err(|_| invalid_projection())?;
+            let task = crate::app_runtime::infrastructure::bridge::tasks::parse_task_summary_value(
+                params.get("task").unwrap_or(&Value::Null),
+            )
+            .map_err(|_| invalid_projection())?;
+            let task_thread_id = params.get("taskThreadId").and_then(Value::as_str);
+            let root_thread_id = params.get("rootThreadId").and_then(Value::as_str);
+            let task_revision = params.get("taskRevision").and_then(Value::as_u64);
+            if task_thread_id != Some(activity.task_thread_id.as_str())
+                || task_thread_id != Some(task.task_thread_id.as_str())
+                || root_thread_id != Some(task.root_thread_id.as_str())
+                || task_revision != Some(task.revision)
+                || activity.activity_sequence != task.latest_activity_sequence
+                || task.latest_safe_summary.as_deref() != Some(activity.summary.as_str())
+            {
+                return Err(invalid_projection());
+            }
+        }
+        "task/progress" => {
+            if !exact(&["observationId", "progressRevision", "safeSummary"])
+                || !valid_prefixed(params.get("observationId"), "observe_", 103)
+                || !non_negative_integer(params.get("progressRevision"))
+                || !bounded_text(params.get("safeSummary"), 0, 32_768)
+            {
+                return Err(invalid_projection());
+            }
+        }
+        "task/mailbox-changed" => {
+            if !exact(&["mailboxSequence", "unreadCount"])
+                || !positive_integer(params.get("mailboxSequence"))
+                || !non_negative_integer(params.get("unreadCount"))
+            {
+                return Err(invalid_projection());
+            }
+        }
+        _ => return Err(invalid_projection()),
+    }
+    Ok(())
+}
+
+/// Task 事件使用 root/task/revision，而非 Workspace/Turn identity；两套 revision 不可混用。
+fn valid_task_common(params: &serde_json::Map<String, Value>) -> bool {
+    valid_notification_common(params)
+        && valid_prefixed(params.get("rootThreadId"), "thr_", 100)
+        && valid_prefixed(params.get("taskThreadId"), "thr_", 100)
+        && non_negative_integer(params.get("taskRevision"))
+}
+
+/// 队列变更只参与独立 queue revision 流，因此明确排除 threadRevision，避免 reducer 混用两套 CAS。
+fn validate_input_queue_changed_event(
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), RuntimeCommandError> {
+    let required = [
+        "serverInstanceId",
+        "eventId",
+        "sequence",
+        "occurredAt",
+        "generation",
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "inputQueue",
+    ];
+    let turn_id = params.get("turnId").and_then(Value::as_str);
+    if !valid_notification_common(params)
+        || !exact_keys(params, &required, &[])
+        || !valid_prefixed(params.get("workspaceId"), "ws_", 99)
+        || !valid_prefixed(params.get("threadId"), "thr_", 100)
+        || !valid_prefixed(params.get("turnId"), "turn_", 101)
+        || turn_id.is_none_or(|turn_id| {
+            crate::app_runtime::infrastructure::bridge::operations::parse_input_queue(
+                params.get("inputQueue"),
+                turn_id,
+            )
+            .is_err()
+        })
+    {
+        return Err(invalid_projection());
+    }
+    Ok(())
+}
+
+/// 消费事件把队列行、公开 user item 与可选上一轮 Assistant 结算原子绑定，防止 UI 看到重复或错序消息。
+fn valid_input_consumed_payload(params: &serde_json::Map<String, Value>) -> bool {
+    let Some(turn_id) = params.get("turnId").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(input) = crate::app_runtime::infrastructure::bridge::operations::parse_queued_input(
+        params.get("input").unwrap_or(&Value::Null),
+        turn_id,
+    ) else {
+        return false;
+    };
+    let Ok(queue) = crate::app_runtime::infrastructure::bridge::operations::parse_input_queue(
+        params.get("inputQueue"),
+        turn_id,
+    ) else {
+        return false;
+    };
+    let Some(user_item) = params.get("userItem").and_then(Value::as_object) else {
+        return false;
+    };
+    let user_content = crate::app_runtime::infrastructure::bridge::operations::parse_turn_content(
+        user_item.get("content"),
+        turn_id,
+    );
+    let user_attachments = user_content.as_ref().ok().and_then(|content| {
+        crate::app_runtime::infrastructure::bridge::operations::parse_attachment_summaries(
+            user_item.get("attachments"),
+            content,
+        )
+        .ok()
+    });
+    let user_item_valid = exact_keys(
+        user_item,
+        &[
+            "itemId",
+            "createdAt",
+            "turnId",
+            "kind",
+            "content",
+            "attachments",
+        ],
+        &[],
+    ) && valid_prefixed(user_item.get("itemId"), "item_", 101)
+        && valid_timestamp(user_item.get("createdAt"))
+        && user_item.get("turnId").and_then(Value::as_str) == Some(turn_id)
+        && user_item.get("kind").and_then(Value::as_str) == Some("user_input")
+        && user_content.is_ok_and(|content| content == input.content)
+        && user_attachments.is_some_and(|attachments| attachments == input.attachments);
+    user_item_valid
+        && !queue
+            .items
+            .iter()
+            .any(|remaining| remaining.input_id == input.input_id)
+        && params
+            .get("assistantSettlement")
+            .is_none_or(valid_assistant_settlement)
+}
+
+/// 可选 Assistant 结算镜像 model-step 的公开字段，但不允许 Tool calls 混入队列消费原子事件。
+fn valid_assistant_settlement(value: &Value) -> bool {
+    value.as_object().is_some_and(|settlement| {
+        exact_keys(
+            settlement,
+            &["messageId", "text", "modelRound"],
+            &["usage", "reasoningSummary"],
+        ) && valid_prefixed(settlement.get("messageId"), "item_", 101)
+            && bounded_text(settlement.get("text"), 0, 1_048_576)
+            && integer_in_range(settlement.get("modelRound"), 1, 128)
+            && optional_usage(settlement.get("usage"))
+            && usage_matches_model_round(settlement.get("usage"), settlement.get("modelRound"))
+            && optional_bounded_text(settlement.get("reasoningSummary"), 0, 1_048_576)
+    })
+}
+
 /// 设计原因：Thread 标题通知不属于 Turn，因此不能复用要求 `turnId/threadRevision` 的
-/// Turn 公共字段；这里严格镜像 JA-RPC v2 golden，允许 admission 已提交的 provisional、
+/// Turn 公共字段；这里严格镜像 JA-RPC v1 golden，允许 admission 已提交的 provisional、
 /// 自动与人工标题刷新，同时拒绝旧 `profileId` 或未提交的标题进入 renderer。
 fn validate_thread_metadata_event(
     params: &serde_json::Map<String, Value>,
@@ -441,7 +758,7 @@ fn validate_context_event(
             .and_then(Value::as_str)
             .is_some_and(|trigger| matches!(trigger, "automatic" | "manual" | "overflow_recovery"))
         || !non_negative_integer(params.get("sourceRevision"))
-        || params.get("strategyVersion").and_then(Value::as_str) != Some("ja-context-v3")
+        || params.get("strategyVersion").and_then(Value::as_str) != Some("ja-context-v1")
         || params
             .get("sourceRevision")
             .and_then(Value::as_u64)
@@ -525,7 +842,6 @@ fn valid_error_code(value: Option<&Value>) -> bool {
             "THREAD_NOT_FOUND"
                 | "CONFLICT"
                 | "THREAD_BUSY"
-                | "TOKEN_COUNT_UNAVAILABLE"
                 | "SUMMARY_FAILURE"
                 | "CONTEXT_LIMIT"
                 | "CANCELLED"
@@ -612,9 +928,32 @@ fn valid_turn_state(value: Option<&Value>) -> bool {
     value.and_then(Value::as_str).is_some_and(|state| {
         matches!(
             state,
-            "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled"
+            "queued"
+                | "running"
+                | "waiting_approval"
+                | "suspended"
+                | "completed"
+                | "failed"
+                | "cancelled"
         )
     })
+}
+
+/// Turn 状态转换只接受当前持久执行模型的边；`suspended` 不影响进程 lifecycle，也不能直达 running。
+fn valid_turn_transition(from: Option<&Value>, to: Option<&Value>) -> bool {
+    matches!(
+        (from.and_then(Value::as_str), to.and_then(Value::as_str),),
+        (
+            Some("queued"),
+            Some("running" | "suspended" | "completed" | "failed" | "cancelled")
+        ) | (
+            Some("running"),
+            Some("waiting_approval" | "suspended" | "completed" | "failed" | "cancelled")
+        ) | (
+            Some("waiting_approval"),
+            Some("running" | "suspended" | "completed" | "failed" | "cancelled")
+        ) | (Some("suspended"), Some("queued" | "cancelled"))
+    )
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
@@ -644,14 +983,125 @@ fn optional_usage(value: Option<&Value>) -> bool {
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
-/// 要求冻结 v1 schema 中三个精确非负 usage counter，不接受别名或额外字段。
+/// 请求级 Usage 绑定唯一请求、用途和必填画像；UNKNOWN 只允许 Token 为空。
 fn valid_usage(value: &Value) -> bool {
-    value.as_object().is_some_and(|usage| {
-        exact_keys(usage, &["inputTokens", "outputTokens", "totalTokens"], &[])
-            && non_negative_integer(usage.get("inputTokens"))
-            && non_negative_integer(usage.get("outputTokens"))
-            && non_negative_integer(usage.get("totalTokens"))
-    })
+    let Some(usage) = value.as_object() else {
+        return false;
+    };
+    if !exact_keys(
+        usage,
+        &[
+            "requestId",
+            "requestOrdinal",
+            "modelRound",
+            "purpose",
+            "certainty",
+            "profile",
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "measuredAt",
+        ],
+        &[],
+    ) || !valid_prefixed(usage.get("requestId"), "request_", 103)
+        || !integer_in_range(usage.get("requestOrdinal"), 1, MAX_SAFE_INTEGER)
+        || !integer_in_range(usage.get("modelRound"), 1, 128)
+        || !matches!(
+            usage.get("purpose").and_then(Value::as_str),
+            Some("assistant" | "summary")
+        )
+        || !valid_timestamp(usage.get("measuredAt"))
+    {
+        return false;
+    }
+    if !usage
+        .get("profile")
+        .is_some_and(valid_provider_request_profile)
+    {
+        return false;
+    }
+    match usage.get("certainty").and_then(Value::as_str) {
+        Some("known") => {
+            let input = usage.get("inputTokens").and_then(Value::as_u64);
+            let output = usage.get("outputTokens").and_then(Value::as_u64);
+            let total = usage.get("totalTokens").and_then(Value::as_u64);
+            input
+                .zip(output)
+                .and_then(|(left, right)| left.checked_add(right))
+                .zip(total)
+                .is_some_and(|(minimum, total)| total <= MAX_SAFE_INTEGER && total >= minimum)
+        }
+        Some("unknown") => ["inputTokens", "outputTokens", "totalTokens"]
+            .iter()
+            .all(|field| usage.get(*field).is_some_and(Value::is_null)),
+        _ => false,
+    }
+}
+
+/// 外层模型事件与嵌套 Usage 必须归属同一 round；缺失 Usage 仍是合法的无计量事件。
+fn usage_matches_model_round(usage: Option<&Value>, model_round: Option<&Value>) -> bool {
+    usage.is_none() || usage.and_then(|value| value.get("modelRound")) == model_round
+}
+
+/// 请求画像是一次真实调用的完整非敏感事实，任何缺项都不能由 WebView 当前设置补齐。
+fn valid_provider_request_profile(value: &Value) -> bool {
+    let Some(profile) = value.as_object() else {
+        return false;
+    };
+    exact_keys(
+        profile,
+        &[
+            "providerId",
+            "modelId",
+            "api",
+            "upstreamModel",
+            "requestedReasoning",
+            "effectiveReasoning",
+            "accessMode",
+            "collaborationMode",
+            "configGeneration",
+            "promptRevision",
+            "toolCatalogRevision",
+            "contextWindowTokens",
+            "maxOutputTokens",
+        ],
+        &[],
+    ) && valid_prefixed(profile.get("providerId"), "provider_", 128)
+        && valid_prefixed(profile.get("modelId"), "model_", 128)
+        && matches!(
+            profile.get("api").and_then(Value::as_str),
+            Some("anthropic_messages" | "openai_responses" | "openai_chat_completions")
+        )
+        && bounded_text(profile.get("upstreamModel"), 1, 512)
+        && ["requestedReasoning", "effectiveReasoning"]
+            .iter()
+            .all(|field| {
+                profile.get(*field).is_some_and(|reasoning| {
+                    reasoning.is_null()
+                        || reasoning.as_str().is_some_and(|value| {
+                            matches!(
+                                value,
+                                "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                            )
+                        })
+                })
+            })
+        && matches!(
+            profile.get("accessMode").and_then(Value::as_str),
+            Some("approval_required" | "full_access")
+        )
+        && matches!(
+            profile.get("collaborationMode").and_then(Value::as_str),
+            Some("default" | "plan")
+        )
+        && profile
+            .get("configGeneration")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("cfg_") && value.len() <= 128)
+        && valid_identifier(profile.get("promptRevision"), 256)
+        && valid_identifier(profile.get("toolCatalogRevision"), 256)
+        && integer_in_range(profile.get("contextWindowTokens"), 1, MAX_SAFE_INTEGER)
+        && integer_in_range(profile.get("maxOutputTokens"), 1, MAX_SAFE_INTEGER)
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
@@ -822,19 +1272,143 @@ fn optional_terminal_message(value: Option<&Value>) -> bool {
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
-/// 校验可选 terminal usage，包括拥有该 usage 的 model round，保持归属事实完整。
+/// Terminal 与其它请求结算复用同一完整 Usage，不另建宽松计量形状。
 fn optional_terminal_usage(value: Option<&Value>) -> bool {
-    value.is_none()
-        || value.and_then(Value::as_object).is_some_and(|usage| {
-            exact_keys(
-                usage,
-                &["modelRound", "inputTokens", "outputTokens", "totalTokens"],
-                &[],
-            ) && integer_in_range(usage.get("modelRound"), 1, 128)
-                && non_negative_integer(usage.get("inputTokens"))
-                && non_negative_integer(usage.get("outputTokens"))
-                && non_negative_integer(usage.get("totalTokens"))
+    optional_usage(value)
+}
+
+/// 终态 ChangeSet 使用 JA-RPC 1.0 的完整冻结形状，逐文件统计和总计必须互相证明。
+fn valid_change_set(value: Option<&Value>) -> bool {
+    let Some(change_set) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    if !exact_keys(
+        change_set,
+        &["state", "incompleteReasons", "files", "stats"],
+        &["artifactId"],
+    ) || !valid_change_integrity(change_set.get("state"), change_set.get("incompleteReasons"))
+        || !optional_prefixed(change_set.get("artifactId"), "artifact_", 128)
+    {
+        return false;
+    }
+    let Some(files) = change_set.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    files.len() <= 256
+        && files.iter().all(valid_change_file)
+        && valid_change_stats(change_set.get("stats"), Some(files))
+}
+
+/// 文件摘要精确镜像 Java 文本 tracker，拒绝 rename、oldPath 和二进制兼容分支。
+fn valid_change_file(value: &Value) -> bool {
+    let Some(file) = value.as_object() else {
+        return false;
+    };
+    exact_keys(
+        file,
+        &[
+            "path",
+            "status",
+            "additions",
+            "deletions",
+            "binary",
+            "truncated",
+        ],
+        &[],
+    ) && valid_relative_path(file.get("path"))
+        && file
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "added" | "modified" | "deleted"))
+        && non_negative_integer(file.get("additions"))
+        && non_negative_integer(file.get("deletions"))
+        && file.get("binary").and_then(Value::as_bool) == Some(false)
+        && file.get("truncated").is_some_and(Value::is_boolean)
+}
+
+/// 预览通知可只校验统计边界；终态携带文件列表时还必须逐项汇总完全一致。
+fn valid_change_stats(value: Option<&Value>, files: Option<&[Value]>) -> bool {
+    let Some(stats) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    if !exact_keys(
+        stats,
+        &[
+            "files",
+            "additions",
+            "deletions",
+            "binaryFiles",
+            "truncated",
+        ],
+        &[],
+    ) || !integer_in_range(stats.get("files"), 0, 256)
+        || !non_negative_integer(stats.get("additions"))
+        || !non_negative_integer(stats.get("deletions"))
+        || !integer_in_range(stats.get("binaryFiles"), 0, 256)
+        || !stats.get("truncated").is_some_and(Value::is_boolean)
+        || stats.get("binaryFiles").and_then(Value::as_u64)
+            > stats.get("files").and_then(Value::as_u64)
+    {
+        return false;
+    }
+    let Some(files) = files else {
+        return true;
+    };
+    let additions = files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.get("additions")?.as_u64()?)
+    });
+    let deletions = files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.get("deletions")?.as_u64()?)
+    });
+    stats.get("files").and_then(Value::as_u64) == Some(files.len() as u64)
+        && stats.get("additions").and_then(Value::as_u64) == additions
+        && stats.get("deletions").and_then(Value::as_u64) == deletions
+        && stats.get("binaryFiles").and_then(Value::as_u64)
+            == Some(
+                files
+                    .iter()
+                    .filter(|file| file.get("binary") == Some(&Value::Bool(true)))
+                    .count() as u64,
+            )
+        && stats.get("truncated").and_then(Value::as_bool)
+            == Some(
+                files
+                    .iter()
+                    .any(|file| file.get("truncated") == Some(&Value::Bool(true))),
+            )
+}
+
+/// 完整性二态和七项原因闭集必须同步成立，重复原因也视为损坏通知。
+fn valid_change_integrity(state: Option<&Value>, reasons: Option<&Value>) -> bool {
+    let Some(state) = state.and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(reasons) = reasons.and_then(Value::as_array) else {
+        return false;
+    };
+    reasons.len() <= 7
+        && reasons.iter().enumerate().all(|(index, reason)| {
+            reason.as_str().is_some_and(valid_change_incomplete_reason)
+                && !reasons[..index].iter().any(|previous| previous == reason)
         })
+        && matches!(
+            (state, reasons.is_empty()),
+            ("complete", true) | ("partial", false)
+        )
+}
+
+/// 原因词汇保持协议闭集，未知扩展必须等 Rust 与 React 显式升级后再接收。
+fn valid_change_incomplete_reason(value: &str) -> bool {
+    matches!(
+        value,
+        "unknown_mutator"
+            | "mutation_chain_broken"
+            | "outside_workspace"
+            | "limit_exceeded"
+            | "capture_failed"
+            | "commit_unconfirmed"
+            | "recovery_boundary"
+    )
 }
 
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
@@ -910,6 +1484,7 @@ pub(crate) fn emit_status(
         ),
         ("occurredAt".to_owned(), Value::String(now_timestamp())),
         ("status".to_owned(), Value::String(status_name.to_owned())),
+        ("features".to_owned(), json!(RUNTIME_STATUS_FEATURES)),
         ("reason".to_owned(), Value::String(reason.to_owned())),
     ]);
     if generation > 0 {

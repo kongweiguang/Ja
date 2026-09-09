@@ -3,7 +3,7 @@
 
 use super::HomeLayout;
 
-/// 只验证 Rust 创建目录外壳而不提前创建数据库，确保 SQLite 的创建与迁移仍由 Java 唯一负责。
+/// 只创建有明确 owner 的目录外壳；数据库仍由 Java 创建，已淘汰的 backups 空壳不得复活。
 #[test]
 fn layout_does_not_precreate_database_file() {
     let root = std::env::temp_dir().join(format!(
@@ -17,5 +17,6 @@ fn layout_does_not_precreate_database_file() {
     let home = HomeLayout::from_root(root.clone()).expect("home layout");
     assert!(home.paths().data_dir().is_dir());
     assert!(!home.paths().data_dir().join("ja.db").exists());
+    assert!(!root.join("backups").exists());
     let _ = std::fs::remove_dir_all(root);
 }

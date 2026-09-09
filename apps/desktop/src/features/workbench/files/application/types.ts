@@ -67,6 +67,8 @@ export interface FilesWorkspaceLifecycle {
 export interface FilesWorkspaceProps {
   workspaceId: string;
   operations: FilesWorkspaceOperations;
+  /** 隐藏面板仍保留草稿与 lifecycle owner，但不启动 Tree、Watcher 或窗口订阅等原生 IO。 */
+  activityEnabled?: boolean;
   initialNodes?: readonly WorkspaceFileNode[];
   onNotice?: (message: string) => void;
   onRegisterLifecycle?: (lifecycle: FilesWorkspaceLifecycle | undefined) => void;
@@ -110,7 +112,6 @@ export interface FilesViewModel {
   selectedPath?: string;
   treeLoading: boolean;
   treeError?: string;
-  mode: "files" | "search";
   searchQuery: string;
   searchResults: readonly FilesSearchResult[];
   searchSummary?: FilesSearchSummary;
@@ -136,8 +137,6 @@ export interface FilesViewModel {
  * 同一个 controller 线性化，不能在组件内新增 mutation owner。
  */
 export interface FilesActions {
-  showFiles: () => void;
-  showSearch?: () => void;
   selectNode: (node: WorkspaceFileNode) => void;
   toggleDirectory: (node: WorkspaceFileNode) => void;
   retryTree: () => void;

@@ -46,7 +46,18 @@ public final class SdkMcpSessionFactory implements McpSessionFactory {
      */
     @Override
     public McpSession open(McpServerDefinition definition, McpDeadline deadline) {
+        return open(definition, deadline, () -> {
+        });
+    }
+
+    /**
+     * 把自有传输看到的原始 list_changed 直接发布给目录 owner，避免 SDK 自动聚合绕过 Ja 预算。
+     */
+    @Override
+    public McpSession open(
+            McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged) {
         Objects.requireNonNull(deadline, "deadline");
+        Objects.requireNonNull(toolsChanged, "toolsChanged");
         McpClientTransport transport = definition.transport() == McpServerDefinition.Transport.STDIO
                 ? new JaBoundedStdioTransport(
                 definition.command(),
@@ -55,10 +66,11 @@ public final class SdkMcpSessionFactory implements McpSessionFactory {
                 definition.protocolVersions(),
                 jsonMapper,
                 limits,
-                deadline)
+                deadline,
+                toolsChanged)
                 : new JaBoundedHttpTransport(
                 definition.endpoint(), definition.headers(), definition.protocolVersions(), jsonMapper,
-                limits, deadline);
+                limits, deadline, toolsChanged);
         McpSyncClient client = McpClient.sync(transport)
                 .requestTimeout(deadline.remaining(limits.requestTimeout(), "mcp_request_deadline_elapsed"))
                 .initializationTimeout(deadline.remaining(

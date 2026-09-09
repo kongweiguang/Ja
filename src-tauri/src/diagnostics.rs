@@ -26,6 +26,15 @@ const SAFE_WEBVIEW_EVENT_CODES: &[&str] = &[
     "ui.react_error_boundary",
 ];
 
+const EVENT_QUEUE_METRIC_TARGET: &str = "ja.metrics.event_queue";
+const SAFE_EVENT_QUEUE_METRICS: &[&str] = &[
+    "task_progress_coalesced_total",
+    "event_data_overflow_dropped_total",
+    "event_control_overflow_total",
+    "runtime_event_queue_totals",
+];
+const SAFE_EVENT_QUEUE_LANES: &[&str] = &["control", "data"];
+
 /// 在整个 Tauri 生命周期内持有非阻塞写入器，确保正常退出时能刷新缓冲记录。
 #[derive(Debug)]
 pub(crate) struct NativeTracingGuard {
@@ -63,8 +72,8 @@ pub(crate) fn initialize_native_tracing(
     })
 }
 
-/// 只格式化时间、级别、编译期 target 与可选的 WebView 白名单故障码。
-/// 原生消息可能合法包含路径或工具输出，因此绝不序列化消息字段。
+/// 只格式化时间、级别、编译期 target，以及固定白名单中的 WebView 故障码和运行时计数。
+/// 原生消息可能合法包含路径或工具输出，因此绝不序列化自由文本字段。
 #[derive(Default)]
 pub(crate) struct RedactedEventFormat {
     timer: SystemTime,
@@ -96,9 +105,95 @@ where
             if let Some(code) = visitor.code {
                 write!(writer, " code={code}")?;
             }
+        } else if metadata.target() == EVENT_QUEUE_METRIC_TARGET {
+            let mut visitor = SafeEventQueueMetricVisitor::default();
+            event.record(&mut visitor);
+            visitor.write_to(&mut writer)?;
         }
         writeln!(writer)
     }
+}
+
+/// EventQueue 只允许固定名称、固定 lane 与整数累计值进入日志，Task identity 和 frame 正文
+/// 即使被未来调用方误加到同一事件也不会被 formatter 序列化。
+#[derive(Default)]
+struct SafeEventQueueMetricVisitor {
+    metric: Option<&'static str>,
+    lane: Option<&'static str>,
+    count: Option<u64>,
+    task_progress_coalesced_total: Option<u64>,
+    event_data_overflow_dropped_total: Option<u64>,
+    event_control_overflow_total: Option<u64>,
+}
+
+impl SafeEventQueueMetricVisitor {
+    /// 输出顺序固定，便于本地采集器解析并避免 Debug 表示引入任意字符串。
+    fn write_to(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        let Some(metric) = self.metric else {
+            return Ok(());
+        };
+        write!(writer, " metric={metric}")?;
+        if let Some(lane) = self.lane {
+            write!(writer, " lane={lane}")?;
+        }
+        for (name, value) in [
+            ("count", self.count),
+            (
+                "task_progress_coalesced_total",
+                self.task_progress_coalesced_total,
+            ),
+            (
+                "event_data_overflow_dropped_total",
+                self.event_data_overflow_dropped_total,
+            ),
+            (
+                "event_control_overflow_total",
+                self.event_control_overflow_total,
+            ),
+        ] {
+            if let Some(value) = value {
+                write!(writer, " {name}={value}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Visit for SafeEventQueueMetricVisitor {
+    /// 字符串字段只能映射到编译期白名单，未知 metric/lane 保持缺失。
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "metric" => {
+                self.metric = SAFE_EVENT_QUEUE_METRICS
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            "lane" => {
+                self.lane = SAFE_EVENT_QUEUE_LANES
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            _ => {}
+        }
+    }
+
+    /// 只接收已知累计字段，任何 identity、长度或业务值不会被顺带发布。
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "count" => self.count = Some(value),
+            "task_progress_coalesced_total" => self.task_progress_coalesced_total = Some(value),
+            "event_data_overflow_dropped_total" => {
+                self.event_data_overflow_dropped_total = Some(value);
+            }
+            "event_control_overflow_total" => self.event_control_overflow_total = Some(value),
+            _ => {}
+        }
+    }
+
+    /// formatter 不接受 Debug 字段，防止非 typed tracing 调用绕过数值与白名单约束。
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
 }
 
 /// 只从插件的 `message` 字段提取已知诊断码；位置、文件、键值和任意消息字段全部丢弃。

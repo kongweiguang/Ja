@@ -45,6 +45,11 @@
       "type": {
         "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.AttachmentMapper"]
       }
+    },
+    {
+      "type": {
+        "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper"]
+      }
     }
   ],
   "foreign": {

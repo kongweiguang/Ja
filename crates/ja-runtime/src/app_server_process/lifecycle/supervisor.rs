@@ -10,10 +10,11 @@ use super::{LifecycleMachine, LifecycleState};
 use crate::app_server_process::client::{EventPump, Session, SessionEvent, TerminalReason};
 use crate::app_server_process::error::AppServerProcessError;
 use crate::app_server_process::protocol::{
-    Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, RpcFrame, V2_CLIENT_METHODS, checked_deadline,
-    error_is_incompatible, generate_ready_token, is_ready_notification,
-    is_runtime_ready_notification, valid_schema_id, valid_version, validate_capabilities,
-    validate_remote_limits,
+    AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewReadParams, Limits,
+    MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, RpcFrame, TurnChangeSetReadParams, V1_CLIENT_METHODS,
+    checked_deadline, error_is_incompatible, generate_ready_token, is_ready_notification,
+    is_runtime_ready_notification, valid_schema_id, validate_attachment_preview_request,
+    validate_capabilities, validate_remote_limits, validate_turn_change_set_request,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -35,6 +36,33 @@ pub struct SidecarSupervisor {
     ready_token_echo: Option<String>,
     pub(crate) terminal_signals: Arc<Mutex<VecDeque<TerminalSignal>>>,
     pub(crate) stopping: Arc<Mutex<bool>>,
+}
+
+/// 当前 sidecar generation 的窄只读句柄；它只允许读取冻结 ChangeSet，不能驱动生命周期或 Turn。
+pub struct TurnChangeSetReadLease {
+    session: Session,
+    stopping: Arc<Mutex<bool>>,
+    generation: u64,
+}
+
+impl TurnChangeSetReadLease {
+    /// 固定方法与 typed 参数在 session 内并发等待，5 秒超时仅留下 request tombstone，不关闭 runtime。
+    pub fn read(
+        &self,
+        params: TurnChangeSetReadParams,
+        timeout: Duration,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        let params = params
+            .into_value()
+            .map_err(|_| AppServerProcessError::ProtocolFault)?;
+        self.session
+            .request_with_gate("turn/change-set/read", params, timeout, &self.stopping)
+    }
+
+    /// generation 供宿主在完整读取结束后拒绝旧 sidecar 的迟到结果。
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl SidecarSupervisor {
@@ -275,14 +303,14 @@ impl SidecarSupervisor {
         }
     }
 
-    /// 用同一 v2 client 闭集提供短生命周期 supervisor request。
+    /// 用同一 v1 client 闭集提供短生命周期 supervisor request。
     pub fn request(
         &mut self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        if !V2_CLIENT_METHODS.contains(&method) {
+        if !V1_CLIENT_METHODS.contains(&method) {
             return Err(AppServerProcessError::ProtocolFault);
         }
         validate_turn_identity(method, &params)?;
@@ -306,6 +334,66 @@ impl SidecarSupervisor {
         let _ = self.lifecycle.mark_ready_again(generation);
         self.sync_terminal_signals();
         result
+    }
+
+    /// 仅通过类型化 DRAFT/BOUND 授权发起预览，防止 generic method lane 夹带路径或宽权限。
+    pub fn attachment_preview_open(
+        &mut self,
+        params: AttachmentPreviewOpenParams,
+        timeout: Duration,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        let params = params
+            .into_value()
+            .map_err(|_| AppServerProcessError::ProtocolFault)?;
+        self.request("attachment/preview/open", params, timeout)
+    }
+
+    /// 使用已验证的 64 KiB 分段参数读取预览，保持业务错误仍由 RpcFrame 原样返回。
+    pub fn attachment_preview_read(
+        &mut self,
+        params: AttachmentPreviewReadParams,
+        timeout: Duration,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        let params = params
+            .into_value()
+            .map_err(|_| AppServerProcessError::ProtocolFault)?;
+        self.request("attachment/preview/read", params, timeout)
+    }
+
+    /// 关闭 opaque preview session；固定方法避免上层自行拼接任意资源关闭请求。
+    pub fn attachment_preview_close(
+        &mut self,
+        params: AttachmentPreviewCloseParams,
+        timeout: Duration,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        let params = params
+            .into_value()
+            .map_err(|_| AppServerProcessError::ProtocolFault)?;
+        self.request("attachment/preview/close", params, timeout)
+    }
+
+    /// Actor 只在 Ready 线性化点签发当前 generation 的窄句柄，正文等待不占用生命周期 owner。
+    pub fn turn_change_set_read_lease(
+        &mut self,
+    ) -> Result<TurnChangeSetReadLease, AppServerProcessError> {
+        self.sync_terminal_signals();
+        if self.stopping_state()? {
+            return Err(AppServerProcessError::ShuttingDown);
+        }
+        if self.lifecycle.state() != LifecycleState::Ready {
+            return Err(match self.lifecycle.state() {
+                LifecycleState::Stopping => AppServerProcessError::ShuttingDown,
+                _ => AppServerProcessError::NotReady,
+            });
+        }
+        Ok(TurnChangeSetReadLease {
+            session: self
+                .session
+                .clone()
+                .ok_or(AppServerProcessError::NotReady)?,
+            stopping: Arc::clone(&self.stopping),
+            generation: self.lifecycle.generation(),
+        })
     }
 
     /// 仅为 host cancellation 返回当前 session clone；不会创建第二个 event-pump
@@ -533,7 +621,10 @@ impl SidecarSupervisor {
 
 /// 在进入 pending/queue 前锁定 Turn 与通用 Workspace 请求的身份边界；其余方法
 /// 继续由 typed Tauri adapter 与 Java schema 校验，避免 process owner 复制整份业务 schema。
-fn validate_turn_identity(method: &str, params: &Value) -> Result<(), AppServerProcessError> {
+pub(crate) fn validate_turn_identity(
+    method: &str,
+    params: &Value,
+) -> Result<(), AppServerProcessError> {
     let Some(object) = params.as_object() else {
         return Err(AppServerProcessError::ProtocolFault);
     };
@@ -551,6 +642,10 @@ fn validate_turn_identity(method: &str, params: &Value) -> Result<(), AppServerP
             .is_some_and(|value| valid_schema_id(value, prefix, max))
     };
     let valid = match method {
+        "attachment/preview/open" | "attachment/preview/read" | "attachment/preview/close" => {
+            validate_attachment_preview_request(method, params)
+        }
+        "turn/change-set/read" => validate_turn_change_set_request(method, params),
         "turn/start" => {
             exact_keys(&["threadId", "content", "deadlineMs"])
                 && valid_id("threadId", "thr_", 100)
@@ -566,13 +661,27 @@ fn validate_turn_identity(method: &str, params: &Value) -> Result<(), AppServerP
                 && valid_id("turnId", "turn_", 101)
                 && valid_revision("expectedThreadRevision")
         }
-        "turn/steer" | "turn/follow-up" => {
-            exact_keys(&["turnId", "text"])
-                && valid_id("turnId", "turn_", 108)
-                && object
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty() && text.len() <= 4_000_000)
+        "turn/input/enqueue" => {
+            exact_keys(&["turnId", "content"])
+                && valid_id("turnId", "turn_", 101)
+                && valid_turn_content(object.get("content"))
+                && queued_content_within_budget(object.get("content"))
+        }
+        "turn/input/prioritize" | "turn/input/delete" => {
+            exact_keys(&["turnId", "inputId", "expectedInputRevision"])
+                && valid_id("turnId", "turn_", 101)
+                && valid_id("inputId", "input_", 128)
+                && valid_revision("expectedInputRevision")
+                && object.get("expectedInputRevision").and_then(Value::as_u64) != Some(0)
+        }
+        "turn/input/update" => {
+            exact_keys(&["turnId", "inputId", "expectedInputRevision", "content"])
+                && valid_id("turnId", "turn_", 101)
+                && valid_id("inputId", "input_", 128)
+                && valid_revision("expectedInputRevision")
+                && object.get("expectedInputRevision").and_then(Value::as_u64) != Some(0)
+                && valid_turn_content(object.get("content"))
+                && queued_content_within_budget(object.get("content"))
         }
         "approval/respond" => {
             exact_keys(&["approvalId", "turnId", "decision", "expectedThreadRevision"])
@@ -587,6 +696,22 @@ fn validate_turn_identity(method: &str, params: &Value) -> Result<(), AppServerP
         // General Workspace identity 由 Java 读取并持有；这里固定 params 为空对象，
         // 防止调用方借共享 request lane 夹带 cwd 或 ID。
         "workspace/open-general" => object.is_empty(),
+        "workspace/path/search" => {
+            exact_keys(&["threadId", "workspaceId", "query", "limit"])
+                && valid_id("threadId", "thr_", 100)
+                && valid_id("workspaceId", "ws_", 100)
+                && object
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .is_some_and(|query| {
+                        query.chars().count() <= 256 && !query.chars().any(char::is_control)
+                    })
+                && object.get("limit").is_none_or(|limit| {
+                    limit
+                        .as_u64()
+                        .is_some_and(|limit| (1..=50).contains(&limit))
+                })
+        }
         _ => true,
     };
     if valid {
@@ -596,48 +721,120 @@ fn validate_turn_identity(method: &str, params: &Value) -> Result<(), AppServerP
     }
 }
 
-/// 校验 Turn 判别内容闭集；附件只允许 opaque identity，绝不接收路径或 ingress token。
+/// 校验统一消息内容闭集、顺序与去重；引用只携带 identity，不接收正文快照或绝对路径。
 fn valid_turn_content(value: Option<&Value>) -> bool {
     let Some(items) = value.and_then(Value::as_array) else {
         return false;
     };
+    if !(1..=64).contains(&items.len()) {
+        return false;
+    }
     let mut attachment_ids = std::collections::HashSet::new();
-    let mut attachment_count = 0usize;
+    let mut workspace_references = std::collections::HashSet::new();
+    let mut workspace_ids = std::collections::HashSet::new();
+    let mut skill_ids = std::collections::HashSet::new();
     let mut total_text = 0usize;
-    (1..=64).contains(&items.len())
-        && items.iter().all(|item| {
-            let Some(item) = item.as_object() else {
-                return false;
-            };
-            match item.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    item.len() == 2
-                        && item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| {
-                                total_text = total_text.saturating_add(text.len());
-                                !text.is_empty() && total_text <= 4_000_000 && !text.contains('\0')
-                            })
-                }
-                Some("attachment") => {
-                    item.len() == 2
-                        && item
-                            .get("attachmentId")
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| {
-                                attachment_count += 1;
-                                attachment_count <= 10
-                                    && valid_schema_id(id, "att_", 128)
-                                    && attachment_ids.insert(id)
-                            })
-                }
-                _ => false,
+    let mut phase = 0_u8;
+    let mut text_count = 0_u8;
+    let mut sendable = false;
+    for item in items {
+        let Some(item) = item.as_object() else {
+            return false;
+        };
+        let valid = match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                phase = 2;
+                text_count += 1;
+                sendable = true;
+                item.len() == 2
+                    && text_count == 1
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            total_text = total_text.saturating_add(text.len());
+                            !text.is_empty() && total_text <= 4_000_000 && !text.contains('\0')
+                        })
             }
-        })
+            Some("attachment") => {
+                sendable = true;
+                let ordered = phase <= 1;
+                phase = 1;
+                item.len() == 2
+                    && ordered
+                    && item
+                        .get("attachmentId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| {
+                            attachment_ids.len() < 10
+                                && valid_schema_id(id, "att_", 128)
+                                && attachment_ids.insert(id)
+                        })
+            }
+            Some("workspace_reference") => {
+                sendable = true;
+                item.len() == 4
+                    && phase == 0
+                    && item
+                        .get("workspaceId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|workspace_id| {
+                            workspace_ids.insert(workspace_id);
+                            workspace_ids.len() == 1
+                                && valid_schema_id(workspace_id, "ws_", 100)
+                                && item
+                                    .get("relativePath")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|path| {
+                                        valid_relative_reference_path(path)
+                                            && workspace_references.insert((workspace_id, path))
+                                    })
+                        })
+                    && matches!(
+                        item.get("kind").and_then(Value::as_str),
+                        Some("file" | "directory")
+                    )
+            }
+            Some("skill_reference") => {
+                item.len() == 2
+                    && phase == 0
+                    && item
+                        .get("skillId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| {
+                            valid_schema_id(id, "skill_", 101) && skill_ids.insert(id)
+                        })
+            }
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    sendable
 }
 
-/// 校验 v2 initialize 的唯一六字段结果，并返回已绑定的 server instance。
+/// 队列预算按实际紧凑 JSON bytes 校验，避免多字节路径或结构开销绕过 512 KiB 上限。
+fn queued_content_within_budget(value: Option<&Value>) -> bool {
+    value.is_some_and(|content| {
+        serde_json::to_vec(content).is_ok_and(|bytes| bytes.len() <= 524_288)
+    })
+}
+
+/// 相对引用拒绝盘符、反斜杠、控制字符与父级段；真实 reparse containment 由 Java 再验证。
+fn valid_relative_reference_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    !path.is_empty()
+        && path.chars().count() <= 4_096
+        && !path.starts_with('/')
+        && !has_drive_prefix
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|segment| segment == "..")
+}
+
+/// 校验 v1 initialize 的唯一六字段结果，并返回已绑定的 server instance。
 ///
 /// `serverVersion` 不是冻结合同字段；拒绝任何额外字段可避免桌面端把实现诊断误当成
 /// 可依赖能力，同时保留 runtime 的两字段 Kernel 身份约束。
@@ -672,7 +869,7 @@ pub(crate) fn validate_initialize_result(
         .and_then(Value::as_i64)
         .filter(|minor| (0..=i64::from(i32::MAX)).contains(minor))
         .ok_or(AppServerProcessError::ProtocolFault)?;
-    if major != 2 || minor != 0 {
+    if major != 1 || minor != 0 {
         return Err(AppServerProcessError::Incompatible);
     }
     let instance = object
@@ -690,10 +887,7 @@ pub(crate) fn validate_initialize_result(
     // 防止 pre-Kernel Java runtime 经 debug 分支被错误 admission。
     if runtime.len() != 2
         || runtime.get("engine").and_then(Value::as_str) != Some("ja-kernel")
-        || !runtime
-            .get("engineVersion")
-            .and_then(Value::as_str)
-            .is_some_and(valid_version)
+        || runtime.get("engineVersion").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION"))
     {
         return Err(AppServerProcessError::ProtocolFault);
     }

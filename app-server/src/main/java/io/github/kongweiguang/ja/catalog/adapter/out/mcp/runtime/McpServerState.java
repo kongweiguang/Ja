@@ -8,12 +8,15 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.McpSessionFacto
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpCloseResult;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpDeadline;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
+import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -26,6 +29,10 @@ final class McpServerState {
     private final ExecutorService cleanupExecutor;
     private final AtomicBoolean runtimeClosed;
     private final ReentrantLock callLock = new ReentrantLock(true);
+    private final AtomicLong directoryRevision = new AtomicLong();
+    private volatile long resolvedDirectoryRevision = -1L;
+    private volatile List<McpGateway.McpTool> directoryTools = List.of();
+    private volatile boolean lastDiscoveryFailed;
     private McpSession session;
     private CompletableFuture<McpCloseResult> sessionCloseCompletion =
             CompletableFuture.completedFuture(McpCloseResult.success());
@@ -80,7 +87,7 @@ final class McpServerState {
         if (current != null) {
             return current;
         }
-        McpSession opened = sessionFactory.open(definition, deadline);
+        McpSession opened = sessionFactory.open(definition, deadline, this::markDirectoryDirty);
         synchronized (this) {
             if (runtimeClosed.get()) {
                 current = null;
@@ -112,6 +119,69 @@ final class McpServerState {
     }
 
     /**
+     * 返回本次发现开始时的通知修订；发布阶段据此识别 list 与 list_changed 的竞态。
+     */
+    long discoveryRevision() {
+        return directoryRevision.get();
+    }
+
+    /**
+     * 通知回调只执行原子递增，不持锁、不落库也不触发 tools/list，避免阻塞传输与 SDK 线程。
+     */
+    void markDirectoryDirty() {
+        directoryRevision.incrementAndGet();
+    }
+
+    /**
+     * 只有完整有界分页成功后才发布新目录；若重拉期间又收到通知，目录保持 dirty 供下一安全点再拉。
+     */
+    void publishDirectory(List<McpGateway.McpTool> tools, long observedRevision) {
+        directoryTools = List.copyOf(tools);
+        resolvedDirectoryRevision = observedRevision;
+        lastDiscoveryFailed = false;
+    }
+
+    /**
+     * 将已通过 catalog revision 与路由校验的请求级快照设为初始目录；逐项复核 serverId，
+     * 避免未来调用方绕过 Runtime 校验后把其它服务的 Tool 注入当前状态。
+     */
+    void publishInitialDirectory(List<McpGateway.McpTool> tools) {
+        List<McpGateway.McpTool> initialTools = List.copyOf(tools);
+        if (initialTools.stream().anyMatch(tool -> !definition.id().equals(tool.serverId()))) {
+            throw new IllegalArgumentException("mcp_cached_snapshot_route_invalid");
+        }
+        publishDirectory(initialTools, directoryRevision.get());
+    }
+
+    /**
+     * 判断当前目录是否从未发现或已被原始 list_changed 通知失效。
+     */
+    boolean directoryDirty() {
+        return resolvedDirectoryRevision != directoryRevision.get();
+    }
+
+    /**
+     * 返回最近一次完整有界发现结果；dirty 结果不得直接用于新的 Provider 请求。
+     */
+    List<McpGateway.McpTool> directoryTools() {
+        return directoryTools;
+    }
+
+    /**
+     * 记录最近一次完整发现失败；Provider 聚合会隔离它，Settings 探测仍可准确报告 unavailable。
+     */
+    void markDiscoveryFailed() {
+        lastDiscoveryFailed = true;
+    }
+
+    /**
+     * 返回脱敏健康事实，不暴露底层异常或端点信息。
+     */
+    boolean discoveryFailed() {
+        return lastDiscoveryFailed;
+    }
+
+    /**
      * 原子分离当前传输，并返回共享关闭 Completion。
      */
     @SuppressWarnings("PMD.CloseResource")
@@ -124,6 +194,7 @@ final class McpServerState {
             }
             current = session;
             session = null;
+            markDirectoryDirty();
             completion = new CompletableFuture<>();
             sessionCloseCompletion = completion;
         }

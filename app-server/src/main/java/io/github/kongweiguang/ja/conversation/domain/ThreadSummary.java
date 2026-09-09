@@ -5,12 +5,14 @@ package io.github.kongweiguang.ja.conversation.domain;
 
 import java.time.Instant;
 import java.util.Objects;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 
 /**
  * 表示一个 Thread 的权威元数据投影。
  */
 public record ThreadSummary(String threadId, String workspaceId, String title,
-                            ThreadPreferences preferences, Status status, long revision,
+                            ThreadPreferences preferences, Status status, boolean pinned,
+                            TurnState latestTurnStatus, boolean latestTurnSeen, String activeGoalId, long revision,
                             Instant createdAt, Instant updatedAt) {
     /**
      * 在离开应用层前校验身份、状态和时间，避免 Wire 层修复损坏数据。
@@ -19,8 +21,12 @@ public record ThreadSummary(String threadId, String workspaceId, String title,
         threadId = identifier(threadId, "thr_", 96);
         workspaceId = identifier(workspaceId, "ws_", 96);
         title = title(title);
-        // v2 升级前的历史 Thread 没有可证明的 Provider/Model 映射；null 只表达这一只读事实。
+        Objects.requireNonNull(preferences, "preferences");
         Objects.requireNonNull(status, "status");
+        if (latestTurnStatus == null && !latestTurnSeen) {
+            throw new IllegalArgumentException("thread without turns must be seen");
+        }
+        if (activeGoalId != null) activeGoalId = goalIdentifier(activeGoalId);
         if (revision < 0) throw new IllegalArgumentException("invalid thread revision");
         Objects.requireNonNull(createdAt, "createdAt");
         Objects.requireNonNull(updatedAt, "updatedAt");
@@ -67,6 +73,14 @@ public record ThreadSummary(String threadId, String workspaceId, String title,
         if (value == null || value.length() > prefix.length() + bodyMaximum
             || !value.matches(java.util.regex.Pattern.quote(prefix) + "[A-Za-z0-9_-]{1," + bodyMaximum + "}")) {
             throw new IllegalArgumentException("invalid thread identity");
+        }
+        return value;
+    }
+
+    /** Goal 投影沿用 JA-RPC 可见 identity 字符集，但不把该扩展字符集放宽到 Thread/Workspace。 */
+    private static String goalIdentifier(String value) {
+        if (value.length() > 101 || !value.matches("goal_[A-Za-z0-9][A-Za-z0-9._-]{0,95}")) {
+            throw new IllegalArgumentException("invalid active goal identity");
         }
         return value;
     }

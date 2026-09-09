@@ -71,7 +71,6 @@ public final class ThreadCompactionHandler implements RpcHandler {
             case THREAD_NOT_FOUND -> JaErrorCatalog.THREAD_NOT_FOUND;
             case CONFLICT -> JaErrorCatalog.CONFLICT;
             case THREAD_BUSY -> JaErrorCatalog.THREAD_BUSY;
-            case TOKEN_COUNT_UNAVAILABLE -> JaErrorCatalog.TOKEN_COUNT_UNAVAILABLE;
             case SUMMARY_FAILURE -> JaErrorCatalog.SUMMARY_FAILURE;
             case CONTEXT_LIMIT -> JaErrorCatalog.CONTEXT_LIMIT;
             case CANCELLED -> JaErrorCatalog.CANCELLED;

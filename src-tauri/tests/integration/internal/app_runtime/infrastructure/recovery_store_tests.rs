@@ -19,10 +19,10 @@ fn create_private_test_dir(path: &Path) {
 #[test]
 fn recovery_marker_rejects_ambiguous_schema() {
     let fixtures: &[&[u8]] = &[
-        br#"{"schemaVersion":1,"status":"manual_recovery_required","attemptId":1,"generation":1,"extra":true}"#,
-        br#"{"schemaVersion":1,"status":"manual_recovery_required","attemptId":1,"attemptId":2,"generation":1}"#,
-        br#"{"schemaVersion":"1","status":"manual_recovery_required","attemptId":1,"generation":1}"#,
-        br#"{"schemaVersion":2,"status":"manual_recovery_required","attemptId":1,"generation":1}"#,
+        br#"{"schemaVersion":1,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000001","revision":1,"generation":1,"extra":true}"#,
+        br#"{"schemaVersion":1,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000001","recoveryId":"00000000-0000-4000-8000-000000000002","revision":1,"generation":1}"#,
+        br#"{"schemaVersion":"1","status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000001","revision":1,"generation":1}"#,
+        br#"{"schemaVersion":2,"status":"manual_recovery_required","recoveryId":"00000000-0000-4000-8000-000000000001","revision":1,"generation":1}"#,
     ];
     for fixture in fixtures {
         assert!(parse_recovery_marker(fixture).is_err());
@@ -153,7 +153,7 @@ fn acknowledgement_tombstone_is_repeatable_and_removed() {
     fs::write(
         run_dir.join(RECOVERY_ACK_FILE_NAME),
         format!(
-            "{{\"schemaVersion\":2,\"status\":\"manual_recovery_ack_pending\",\"recoveryId\":\"{id}\",\"revision\":11,\"reason\":\"SystemRestarted\"}}"
+            "{{\"schemaVersion\":1,\"status\":\"manual_recovery_ack_pending\",\"recoveryId\":\"{id}\",\"revision\":11,\"reason\":\"SystemRestarted\"}}"
         ),
     )
     .expect("ack tombstone");

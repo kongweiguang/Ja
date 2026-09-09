@@ -27,7 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
- * 把严格 JA-RPC v2 配置命令映射到配置入站端口；Jackson 只存在于该 Wire 边界。
+ * 把严格 JA-RPC v1 配置命令映射到配置入站端口；Jackson 只存在于该 Wire 边界。
  *
  * <p>workspaceId 在此解析为进程内 Path 能力，配置域只接收纯 JDK 不可变文档；Secret 仅能
  * 通过 credential/set 进入配置用例，任何响应和通知都不会回显输入。</p>
@@ -40,7 +40,7 @@ public final class ConfigurationHandler implements RpcHandler {
         this.session = session;
     }
 
-    /** 只注册冻结后的六个 v2 配置与凭据方法，未知动作由关闭的注册表拒绝。 */
+    /** 只注册冻结后的六个首版 v1 配置与凭据方法，未知动作由关闭的注册表拒绝。 */
     @Override
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.CONFIGURATION_READ, RpcMethod.CONFIGURATION_PATCH,

@@ -14,6 +14,7 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.InstructionSc
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.RecoveryMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SchemaMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.recovery.StartupRecoveryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisCheckpointStore;
 import io.github.kongweiguang.ja.attachment.adapter.out.persistence.MybatisAttachmentRepository;
@@ -53,6 +54,11 @@ public abstract class PersistenceTestSupport {
                         } catch (Throwable failure) {
                             session.rollback();
                             if (failure instanceof StorageException persistence) throw persistence;
+                            if (failure instanceof io.github.kongweiguang.ja.conversation.port.out
+                                    .ConversationRepository.InputQueueException queueFailure) {
+                                // 与生产事务桥一致保留稳定队列失败，避免测试只验证被包装后的假契约。
+                                throw queueFailure;
+                            }
                             throw new StorageException(StorageException.Code.TRANSACTION,
                                     "test transaction failed", failure);
                         }
@@ -80,6 +86,7 @@ public abstract class PersistenceTestSupport {
         configuration.addMapper(CheckpointMapper.class);
         configuration.addMapper(RecoveryMapper.class);
         configuration.addMapper(InstructionScopeMapper.class);
+        configuration.addMapper(TaskMapper.class);
         SqlSessionFactory sessions = new SqlSessionFactoryBuilder().build(configuration);
         database.bindWalCheckpoint(sessions);
         return new TestDatabase(database, sessions, new ObjectMapper());

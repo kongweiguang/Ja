@@ -3,11 +3,11 @@
 
 package io.github.kongweiguang.ja.conversation.application.title;
 
-import io.github.kongweiguang.ja.conversation.domain.TurnRuntimeSnapshot;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadMetadataEventSink;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 
+import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletionStage;
 
@@ -32,25 +32,47 @@ public interface AutomaticThreadTitleScheduler extends DeadlineCloseable {
     }
 
     /**
-     * 绑定首次成功回复、终态 revision 与仍有效的冻结配置；完整内容只停留在进程内。
+     * 绑定首次成功回复、终态 revision 与发送前解析的请求配置；完整内容只停留在进程内。
      */
     record Request(String threadId, String turnId, long terminalThreadRevision,
                    String firstUserRequest, String assistantReply,
-                   TurnRuntimeSnapshot runtime, ModelPort.ModelConfiguration configuration) {
-        /** 请求只能引用同一个冻结 Provider/Model/配置代际，禁止后台读取当前 Thread 偏好。 */
+                   RequestRuntimeFactory runtimeFactory) {
+        /** 调度边界只保留稳定事实和延迟 factory，不能提前解析或延长请求环境。 */
         public Request {
             Objects.requireNonNull(threadId, "threadId");
             Objects.requireNonNull(turnId, "turnId");
             if (terminalThreadRevision < 0) throw new IllegalArgumentException("invalid terminal revision");
             Objects.requireNonNull(firstUserRequest, "firstUserRequest");
             Objects.requireNonNull(assistantReply, "assistantReply");
-            Objects.requireNonNull(runtime, "runtime");
+            Objects.requireNonNull(runtimeFactory, "runtimeFactory");
+        }
+    }
+
+    /** 标题任务在真正调用模型前请求一次当前环境，完成后必须释放其底层配置租约。 */
+    @FunctionalInterface
+    interface RequestRuntimeFactory {
+        /** timeout 是标题请求的独立上限，解析器不得沿用已结束 Turn 的剩余时长。 */
+        RequestRuntime open(Duration timeout);
+    }
+
+    /** 只向标题服务暴露所需模型配置，同时保留底层租约的唯一释放责任。 */
+    record RequestRuntime(ModelPort.ModelConfiguration configuration,
+                          AutoCloseable release) implements AutoCloseable {
+        /** 配置和释放动作必须成对，避免后台失败路径泄漏凭据代际。 */
+        public RequestRuntime {
             Objects.requireNonNull(configuration, "configuration");
-            if (!runtime.providerId().equals(configuration.providerId())
-                || !runtime.modelId().equals(configuration.modelId())
-                || !runtime.configGeneration().equals(configuration.configGeneration())
-                || !runtime.upstreamModel().equals(configuration.model())) {
-                throw new IllegalArgumentException("title request does not match frozen Turn runtime");
+            Objects.requireNonNull(release, "release");
+        }
+
+        /** checked close 统一收敛，后台任务会记录稳定错误分类而不泄漏配置。 */
+        @Override
+        public void close() {
+            try {
+                release.close();
+            } catch (RuntimeException failure) {
+                throw failure;
+            } catch (Exception failure) {
+                throw new IllegalStateException("title request runtime release failed", failure);
             }
         }
     }

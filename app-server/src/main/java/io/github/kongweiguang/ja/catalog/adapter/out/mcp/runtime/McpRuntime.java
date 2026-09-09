@@ -31,7 +31,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 /**
@@ -39,13 +38,13 @@ import java.util.function.LongSupplier;
  */
 public final class McpRuntime implements McpGateway {
     private final List<McpServerDefinition> definitions;
+    private final Map<String, McpServerDefinition> definitionsById;
     private final Map<String, McpServerState> servers;
     private final McpLimits limits;
     private final ObjectMapper objectMapper;
-    private final McpSnapshot frozenSnapshot;
+    private final McpSnapshot catalogSnapshot;
     private final McpDeadline deadline;
     private final McpRuntimeLifecycle lifecycle;
-    private final AtomicLong invocationDeadlineNanos = new AtomicLong(Long.MIN_VALUE);
 
     /**
      * 从已解析私有配置创建 Native SDK Adapter，不读取活动配置。
@@ -73,12 +72,12 @@ public final class McpRuntime implements McpGateway {
     /**
      * 针对工作区刷新时发现的目录启动全新传输代际。
      */
-    McpRuntime(
+    public McpRuntime(
             List<McpServerDefinition> definitions,
             McpLimits limits,
             ObjectMapper objectMapper,
-            McpSnapshot frozenSnapshot) {
-        this(definitions, limits, objectMapper, new SdkMcpSessionFactory(objectMapper, limits), frozenSnapshot,
+            McpSnapshot catalogSnapshot) {
+        this(definitions, limits, objectMapper, new SdkMcpSessionFactory(objectMapper, limits), catalogSnapshot,
                 McpDeadline.forOperation(limits, System::nanoTime));
     }
 
@@ -89,10 +88,10 @@ public final class McpRuntime implements McpGateway {
             List<McpServerDefinition> definitions,
             McpLimits limits,
             ObjectMapper objectMapper,
-            McpSnapshot frozenSnapshot,
+            McpSnapshot catalogSnapshot,
             McpDeadline deadline) {
         this(definitions, limits, objectMapper, new SdkMcpSessionFactory(objectMapper, limits),
-                frozenSnapshot, deadline);
+                catalogSnapshot, deadline);
     }
 
     /**
@@ -103,8 +102,8 @@ public final class McpRuntime implements McpGateway {
             McpLimits limits,
             ObjectMapper objectMapper,
             McpSessionFactory sessionFactory,
-            McpSnapshot frozenSnapshot) {
-        this(definitions, limits, objectMapper, sessionFactory, frozenSnapshot,
+            McpSnapshot catalogSnapshot) {
+        this(definitions, limits, objectMapper, sessionFactory, catalogSnapshot,
                 McpDeadline.forOperation(limits, System::nanoTime));
     }
 
@@ -116,21 +115,21 @@ public final class McpRuntime implements McpGateway {
             McpLimits limits,
             ObjectMapper objectMapper,
             McpSessionFactory sessionFactory,
-            McpSnapshot frozenSnapshot,
+            McpSnapshot catalogSnapshot,
             LongSupplier nanoTime) {
-        this(definitions, limits, objectMapper, sessionFactory, frozenSnapshot,
+        this(definitions, limits, objectMapper, sessionFactory, catalogSnapshot,
                 McpDeadline.forOperation(limits, nanoTime));
     }
 
     /**
      * 创建 Runtime 所有的 Executor 前绑定显式生命周期 Deadline。
      */
-    McpRuntime(
+    public McpRuntime(
             List<McpServerDefinition> definitions,
             McpLimits limits,
             ObjectMapper objectMapper,
             McpSessionFactory sessionFactory,
-            McpSnapshot frozenSnapshot,
+            McpSnapshot catalogSnapshot,
             McpDeadline deadline) {
         Objects.requireNonNull(definitions, "definitions");
         this.limits = Objects.requireNonNull(limits, "limits");
@@ -141,43 +140,68 @@ public final class McpRuntime implements McpGateway {
         this.definitions = definitions.stream()
                 .sorted(java.util.Comparator.comparing(McpServerDefinition::id))
                 .toList();
+        this.definitionsById = this.definitions.stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
+                McpServerDefinition::id, java.util.function.Function.identity()));
         this.lifecycle = new McpRuntimeLifecycle(this.definitions, this.limits,
                 Objects.requireNonNull(sessionFactory, "sessionFactory"), this.deadline);
         this.servers = lifecycle.servers();
-        this.frozenSnapshot = McpToolCatalog.validateSnapshot(
-                frozenSnapshot, this.objectMapper, this.servers.keySet());
+        this.catalogSnapshot = McpToolCatalog.validateSnapshot(
+                catalogSnapshot, this.objectMapper, this.definitionsById);
+        if (this.catalogSnapshot != null) {
+            for (McpServerDefinition definition : this.definitions) {
+                List<McpTool> serverTools = this.catalogSnapshot.tools().stream()
+                        .filter(tool -> definition.id().equals(tool.serverId()))
+                        .toList();
+                this.servers.get(definition.id()).publishInitialDirectory(serverTools);
+            }
+        }
     }
 
     /**
-     * 使用显式 Cursor 页面发现所有服务，并冻结确定性聚合版本。
+     * 使用显式 Cursor 页面发现所有服务，并生成确定性聚合版本。
      */
     @Override
     public McpSnapshot snapshot() {
         requireOpen();
-        if (frozenSnapshot != null) {
-            return frozenSnapshot;
+        if (catalogSnapshot != null) {
+            return catalogSnapshot;
         }
         long deadlineNanos = deadline.phaseDeadline(limits.requestTimeout());
         List<McpTool> tools = new ArrayList<>();
         Set<String> localNames = new HashSet<>();
-        try {
-            for (McpServerDefinition definition : definitions) {
-                McpServerState holder = servers.get(definition.id());
-                tools.addAll(lifecycle.executeServerWithin(
-                        holder,
-                        deadlineNanos,
-                        "mcp_discovery_timeout",
-                        () -> discover(holder, localNames)));
+        for (McpServerDefinition definition : definitions) {
+            McpServerState holder = servers.get(definition.id());
+            try {
+                if (holder.directoryDirty()) {
+                    long observedRevision = holder.discoveryRevision();
+                    List<McpTool> discovered = lifecycle.executeServerWithin(
+                            holder,
+                            deadlineNanos,
+                            "mcp_discovery_timeout",
+                            () -> discover(holder, new HashSet<>()));
+                    holder.publishDirectory(discovered, observedRevision);
+                }
+                if (holder.directoryDirty()) {
+                    continue;
+                }
+                for (McpTool tool : holder.directoryTools()) {
+                    if (!localNames.add(tool.spec().name())) {
+                        throw new IllegalStateException("mcp_local_tool_conflict");
+                    }
+                    tools.add(tool);
+                }
+            } catch (RuntimeException isolatedFailure) {
+                // 单个远端目录失败不得关闭健康服务；失败服务保持 dirty，下一安全点可独立重试。
+                holder.markDiscoveryFailed();
+                holder.markDirectoryDirty();
+                tools.removeIf(tool -> tool.serverId().equals(definition.id()));
             }
-        } catch (RuntimeException failure) {
-            lifecycle.closeAllSessionsAfterFailure(failure, deadlineNanos);
-            throw failure;
         }
-        return catalogSnapshot(tools, objectMapper, Instant.now());
+        return McpToolCatalog.snapshot(tools, definitionsById, objectMapper, Instant.now());
     }
 
     /**
-     * 初始化选中传输，但对冻结工作区目录不重复调用 tools/list。
+     * 初始化选中传输，但对已提供的请求级目录不重复调用 tools/list。
      */
     public void initializeSessions() {
         requireOpen();
@@ -212,7 +236,7 @@ public final class McpRuntime implements McpGateway {
         Objects.requireNonNull(invocation, "invocation");
         Objects.requireNonNull(cancellationToken, "cancellationToken");
         requireOpen();
-        if (!McpToolCatalog.hasValidRevision(snapshot, objectMapper)) {
+        if (!McpToolCatalog.hasValidRevision(snapshot, objectMapper, definitionsById)) {
             throw new IllegalArgumentException("mcp_snapshot_revision_invalid");
         }
         McpTool tool = snapshot.tools().stream()
@@ -223,7 +247,10 @@ public final class McpRuntime implements McpGateway {
         if (holder == null) {
             throw new IllegalArgumentException("mcp_snapshot_server_missing");
         }
-        long deadlineNanos = invocationDeadline();
+        if (!refreshAndValidateBinding(holder, tool)) {
+            return CompletableFuture.completedFuture(bindingUnavailableResult());
+        }
+        long deadlineNanos = deadline.phaseDeadline(limits.requestTimeout());
         long remaining = remainingNanos(deadlineNanos);
         if (remaining <= 0) {
             return finishFailedInvocation(
@@ -250,6 +277,68 @@ public final class McpRuntime implements McpGateway {
     @Override
     public void close() {
         lifecycle.close();
+    }
+
+    /**
+     * 返回当前快照的精确路由证明，供请求级 Tool batch 在执行前持久化。
+     */
+    public Map<String, McpGateway.RouteIdentity>
+    routeIdentities(McpSnapshot snapshot) {
+        if (!McpToolCatalog.hasValidRevision(snapshot, objectMapper, definitionsById)) {
+            throw new IllegalArgumentException("mcp_snapshot_revision_invalid");
+        }
+        return McpToolCatalog.routeIdentities(snapshot, definitionsById, objectMapper);
+    }
+
+    /**
+     * Settings 探测读取逐服务脱敏失败集合；Provider 只使用 snapshot 中的健康 Tool。
+     */
+    public Set<String> unavailableServerIds() {
+        return servers.entrySet().stream().filter(entry -> entry.getValue().discoveryFailed())
+                .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    /**
+     * dirty 服务在调用前先走同一套有界分页，并与原 batch 的 schema/route hash 精确比较。
+     */
+    private boolean refreshAndValidateBinding(McpServerState holder, McpTool expected) {
+        if (!holder.directoryDirty()) {
+            return true;
+        }
+        long deadlineNanos = deadline.phaseDeadline(limits.requestTimeout());
+        try {
+            long observedRevision = holder.discoveryRevision();
+            List<McpTool> refreshed = lifecycle.executeServerWithin(
+                    holder, deadlineNanos, "mcp_discovery_timeout",
+                    () -> discover(holder, new HashSet<>()));
+            holder.publishDirectory(refreshed, observedRevision);
+            if (holder.directoryDirty()) {
+                return false;
+            }
+            McpTool current = refreshed.stream()
+                    .filter(tool -> tool.spec().name().equals(expected.spec().name()))
+                    .findFirst().orElse(null);
+            if (current == null) {
+                return false;
+            }
+            String expectedSchema = McpToolCatalog.schemaHash(expected, objectMapper);
+            String currentSchema = McpToolCatalog.schemaHash(current, objectMapper);
+            return expectedSchema.equals(currentSchema)
+                    && McpToolCatalog.routeHash(holder.definition(), expected, expectedSchema)
+                    .equals(McpToolCatalog.routeHash(holder.definition(), current, currentSchema));
+        } catch (RuntimeException failure) {
+            holder.markDiscoveryFailed();
+            holder.markDirectoryDirty();
+            return false;
+        }
+    }
+
+    /**
+     * 旧路由不可证明时返回稳定结果而不尝试同名 fallback，交由模型在下一请求基于最新目录继续。
+     */
+    private static McpResult bindingUnavailableResult() {
+        return new McpResult(true, "", java.util.Optional.of(JsonObjects.builder()
+                .putText("category", "tool_binding_unavailable").build()), ToolOutcome.FAILED);
     }
 
     /**
@@ -414,20 +503,6 @@ public final class McpRuntime implements McpGateway {
     }
 
     /**
-     * 只绑定一次首次调用上限，同时保留更早的绝对生命周期边界。
-     */
-    private long invocationDeadline() {
-        long current = invocationDeadlineNanos.get();
-        if (current != Long.MIN_VALUE) {
-            return current;
-        }
-        long candidate = deadline.phaseDeadline(limits.requestTimeout());
-        return invocationDeadlineNanos.compareAndSet(Long.MIN_VALUE, candidate)
-                ? candidate
-                : invocationDeadlineNanos.get();
-    }
-
-    /**
      * 使用创建 Deadline 的同一单调时钟计算剩余聚合预算。
      */
     private long remainingNanos(long deadlineNanos) {
@@ -435,11 +510,17 @@ public final class McpRuntime implements McpGateway {
     }
 
     /**
-     * 保留代际目录的包内接缝，同时委派目录所有权。
+     * 生产目录构建显式携带服务定义，使 catalog revision 覆盖传输与认证语义。
      */
     public static McpSnapshot catalogSnapshot(
-            List<McpTool> tools, ObjectMapper objectMapper, Instant createdAt) {
-        return McpToolCatalog.snapshot(tools, objectMapper, createdAt);
+            List<McpTool> tools,
+            List<McpServerDefinition> definitions,
+            ObjectMapper objectMapper,
+            Instant createdAt) {
+        Map<String, McpServerDefinition> byId = definitions.stream().collect(
+                java.util.stream.Collectors.toUnmodifiableMap(
+                        McpServerDefinition::id, java.util.function.Function.identity()));
+        return McpToolCatalog.snapshot(tools, byId, objectMapper, createdAt);
     }
 
     /**

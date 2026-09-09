@@ -13,6 +13,8 @@ import type {
   RuntimeSettingsParams,
   RuntimeSettingsResult,
 } from "../application/runtimePorts";
+import { publishTaskHostEvent } from "@/features/tasks";
+import { publishGoalHostEvent } from "@/features/goals";
 
 /**
  * 逐个映射冻结的 Settings 查询，让 application 自有的关联类型不反向依赖 JA-RPC schema。
@@ -25,6 +27,11 @@ async function queryRuntime<M extends RuntimeSettingsMethod>(
   params: RuntimeSettingsParams<M>,
 ): Promise<RuntimeSettingsResult<M>> {
   switch (method) {
+    case "workspace/path/search":
+      return (await adapter.query(
+        "workspace/path/search",
+        params as NativeRuntimeSettingsParams<"workspace/path/search">,
+      )) as RuntimeSettingsResult<M>;
     case "skill/list":
       return (await adapter.query(
         "skill/list",
@@ -57,7 +64,7 @@ async function queryRuntime<M extends RuntimeSettingsMethod>(
  * 在唯一 composition 边界把 Tauri Runtime adapter 投影为 application port。所有方法都
  * 保留原 adapter 的校验、订阅与错误语义，同时阻止 Provider 直接知道 Tauri 工厂。
  */
-function createRuntimeHostPort(
+export function createRuntimeHostPort(
   adapter: RuntimeHostAdapter = createRuntimeHostAdapter(),
 ): RuntimeHostPort {
   const query: RuntimeQuery = (method, params) => queryRuntime(adapter, method, params);
@@ -71,11 +78,40 @@ function createRuntimeHostPort(
     acknowledgeRecovery: (confirmation) => adapter.acknowledgeRecovery(confirmation),
     approvalRespond: (input) => adapter.approvalRespond(input),
     turnStart: (input) => adapter.turnStart(input),
+    turnResume: (input) => adapter.turnResume(input),
     turnCancel: (input) => adapter.turnCancel(input),
-    turnSteer: (input) => adapter.turnSteer(input),
-    turnFollowUp: (input) => adapter.turnFollowUp(input),
+    turnInputEnqueue: (input) => adapter.turnInputEnqueue(input),
+    turnInputPrioritize: (input) => adapter.turnInputPrioritize(input),
+    turnInputUpdate: (input) => adapter.turnInputUpdate(input),
+    turnInputDelete: (input) => adapter.turnInputDelete(input),
     query,
-    subscribe: (listener) => adapter.subscribe(listener),
+    /** Task notification 进入独立 feature bus；Conversation lifecycle 永远只看到自身闭集。 */
+    subscribe: (listener) =>
+      adapter.subscribe((event) => {
+        if (event.kind === "task") {
+          publishTaskHostEvent(event.event);
+          return;
+        }
+        if (event.kind === "goal") {
+          const params = event.event.params;
+          const ownerThreadId =
+            event.event.method === "goal/changed" && event.event.params.goal.owner.kind === "thread"
+              ? event.event.params.goal.owner.threadId
+              : undefined;
+          publishGoalHostEvent({
+            method: event.event.method,
+            goalId: params.goalId,
+            goalRevision: params.goalRevision,
+            eventSequence: params.eventSequence,
+            occurredAt: params.occurredAt,
+            ...(ownerThreadId === undefined ? {} : { ownerThreadId }),
+          });
+          return;
+        }
+        // Native adapter 与 Conversation domain 的结构由各自合同测试锁定；这里仅跨越 TS
+        // 对已投影附件字段的静态差异，Task 分支已在上方被彻底移除。
+        listener(event as Parameters<typeof listener>[0]);
+      }),
   };
 }
 

@@ -5,6 +5,10 @@
 resolver = "2"
 members = ["src-tauri", "crates/ja-runtime"]
 
+[workspace.package]
+# package.json 是跨生态产品版本的权威来源；同步脚本只把该值投影到 Cargo workspace。
+version = "0.1.0"
+
 [profile.release]
 # 发布参数由 workspace 根统一拥有，使桌面宿主与 Ja App Server 宿主生成
 # 相同的有界、panic-abort 产物，避免 crate 局部配置在交付时产生差异。

@@ -46,6 +46,86 @@ fn idle_supervisor_fixture() -> SidecarSupervisor {
     SidecarSupervisor::new(sidecar_config(&executable, &run_dir)).expect("idle supervisor fixture")
 }
 
+/// generic request lane 也必须执行预览授权和分页闭集，避免调用方绕过 typed 构造器。
+#[test]
+fn attachment_preview_identity_validation_fails_closed() {
+    assert!(
+        validate_turn_identity(
+            "attachment/preview/open",
+            &serde_json::json!({
+                "attachmentId": "att_draft",
+                "authorization": {"kind": "draft", "workspaceId": "ws_current"}
+            }),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "attachment/preview/open",
+            &serde_json::json!({
+                "attachmentId": "att_bound",
+                "authorization": {
+                    "kind": "thread",
+                    "threadId": "thr_history",
+                    "workspaceId": "ws_leaked"
+                }
+            }),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_turn_identity(
+            "attachment/preview/read",
+            &serde_json::json!({
+                "previewSessionId": "apv_session",
+                "offsetBytes": 0,
+                "limitBytes": 65_537
+            }),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_turn_identity(
+            "attachment/preview/close",
+            &serde_json::json!({"previewSessionId": "att_not_a_session"}),
+        )
+        .is_err()
+    );
+}
+
+/// generic session admission 对四个队列方法执行各自精确字段与预算校验，旧 steer/follow-up 不再准入。
+#[test]
+fn turn_input_identity_validation_is_method_specific() {
+    assert!(
+        validate_turn_identity(
+            "turn/input/enqueue",
+            &json!({"turnId":"turn_demo","content":[{"type":"text","text":"follow up"}]}),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/input/prioritize",
+            &json!({"turnId":"turn_demo","inputId":"input_demo","expectedInputRevision":1}),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/input/update",
+            &json!({"turnId":"turn_demo","inputId":"input_demo","expectedInputRevision":1,"content":[{"type":"text","text":"edited"}]}),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/input/delete",
+            &json!({"turnId":"turn_demo","inputId":"input_demo","expectedInputRevision":1,"position":0}),
+        )
+        .is_err()
+    );
+}
+
 /// stopping gate 中毒后 client 准入必须返回稳定 Faulted 并终结 lifecycle，不能从
 /// poisoned bool 推断仍可接收请求。
 #[test]
@@ -70,20 +150,23 @@ fn poisoned_terminal_signal_queue_faults_supervisor() {
     assert_eq!(supervisor.state(), LifecycleState::Faulted);
 }
 
-/// 构造最小合法 v2 initialize result，使 schema 测试不依赖真实 child process。
+/// 构造当前唯一 2.1 initialize result，使 schema 测试不依赖真实 child process，
+/// 并避免旧 minor 在进入待测字段约束前被兼容门禁提前拒绝。
 fn valid_initialize_result() -> Value {
     serde_json::json!({
-        "protocolMajor": 2,
+        "protocolMajor": 1,
         "protocolMinor": 0,
         "serverInstanceId": "srv_fixture",
         "runtime": {
             "engine": "ja-kernel",
-            "engineVersion": "2.0.0"
+            "engineVersion": "0.1.0"
         },
         "capabilities": {
             "methods": [],
             "events": [],
-            "accessModes": ["approval_required", "full_access"]
+            "accessModes": ["approval_required", "full_access"],
+            "collaborationModes": ["default", "plan"],
+            "features": ["task_threads_v1", "plan_goal_v1"]
         },
         "limits": Limits::default().to_value()
     })
@@ -172,7 +255,7 @@ fn real_child_invalid_ready_tokens_return_handshake_failed() {
         let script = r#"
 param([string]$Mode)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"2.0.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
     $businessRequests = 0
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
@@ -266,7 +349,7 @@ fn real_child_shutdown_retries_retained_owner_after_reap_timeout() {
     let script_path = fixture_dir.path.join("retry-shutdown.ps1");
     let script = r#"
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"2.0.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -380,7 +463,7 @@ fn real_child_handshake_concurrency_and_job_cleanup() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"2.0.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + "`n")
     $stdout = [Console]::OpenStandardOutput()
@@ -511,7 +594,7 @@ fn real_child_stdout_eof_kills_tree_without_event_consumer() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"2.0.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + "`n")
     $stdout = [Console]::OpenStandardOutput()
@@ -576,11 +659,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 
     // 不消费 supervisor event；即使 UI idle，EOF 本身也必须调用 terminal callback 并
     // 关闭完整 Job。
-    let result = supervisor.request(
-        "workspace/open-general",
-        json!({}),
-        Duration::from_secs(2),
-    );
+    let result = supervisor.request("workspace/open-general", json!({}), Duration::from_secs(2));
     assert_eq!(
         result,
         Err(app_server_process::AppServerProcessError::SessionClosed)
@@ -618,7 +697,7 @@ fn real_child_blocked_stdin_watchdog_joins_and_reaps_tree() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"2.0.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()

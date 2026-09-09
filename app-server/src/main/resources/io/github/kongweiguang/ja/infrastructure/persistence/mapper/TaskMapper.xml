@@ -1,0 +1,424 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper">
+  <sql id="taskSummaryColumns">
+    l.child_thread_id AS taskThreadId,l.parent_thread_id AS parentThreadId,l.root_thread_id AS rootThreadId,
+    l.origin_turn_id AS originTurnId,t.title AS taskName,l.depth,l.task_kind AS taskKind,l.lifecycle,
+    l.context_seed_id AS contextSeedId,l.created_at AS createdAt,p.revision,p.state,
+    p.latest_activity_sequence AS latestActivitySequence,p.last_seen_activity_sequence AS lastSeenActivitySequence,
+    p.unread_count AS unreadCount,p.descendant_count AS descendantCount,
+    p.running_descendant_count AS runningDescendantCount,p.needs_attention_count AS needsAttentionCount,
+    p.latest_safe_summary AS latestSafeSummary,p.started_at AS startedAt,p.completed_at AS completedAt,
+    p.updated_at AS updatedAt
+  </sql>
+
+  <select id="selectParent" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ParentRow">
+    SELECT t.thread_id AS threadId,t.workspace_id AS workspaceId,t.access_mode AS accessMode,t.revision,
+      l.root_thread_id AS rootThreadId,l.depth
+    FROM threads t LEFT JOIN thread_lineage l ON l.child_thread_id=t.thread_id
+    WHERE t.thread_id=#{threadId} AND t.deleted_at IS NULL
+  </select>
+  <select id="selectTurnCausality" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TurnCausalityRow">
+    SELECT thread_id AS threadId,root_turn_id AS rootTurnId,state,
+      cancel_requested_at AS cancelRequestedAt FROM turns WHERE turn_id=#{turnId}
+  </select>
+  <select id="selectTaskRoute" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskRouteRow">
+    SELECT t.thread_id AS threadId,l.root_thread_id AS rootThreadId,l.depth
+    FROM threads t LEFT JOIN thread_lineage l ON l.child_thread_id=t.thread_id
+    WHERE t.thread_id=#{threadId} AND t.deleted_at IS NULL
+  </select>
+  <select id="selectEffectiveMessages" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$MessageRow">
+    SELECT message_id AS messageId,turn_id AS turnId,ordinal,role,blocks_json AS blocksJson,created_at AS createdAt
+    FROM messages WHERE thread_id=#{threadId} AND ordinal&gt;=#{retainedFromOrdinal}
+    ORDER BY ordinal LIMIT #{limit}
+  </select>
+  <select id="countRootDescendants" resultType="int">
+    SELECT COUNT(*) FROM thread_lineage WHERE root_thread_id=#{rootThreadId}
+  </select>
+  <insert id="insertContextSeed">
+    INSERT INTO task_context_seeds(context_seed_id,parent_thread_id,parent_turn_id,parent_revision,inheritance_mode,
+      task_brief_json,effective_context_json,references_json,permission_ceiling_json,fingerprint,created_at)
+    VALUES(#{contextSeedId},#{parentThreadId},#{parentTurnId},#{parentRevision},#{inheritanceMode},
+      #{taskBriefJson},#{effectiveContextJson},#{referencesJson},#{permissionCeilingJson},#{fingerprint},#{createdAt})
+  </insert>
+  <insert id="insertChildTurn">
+    INSERT INTO turns(turn_id,thread_id,parent_turn_id,root_turn_id,state,requested_at,updated_at)
+    VALUES(#{turnId},#{threadId},#{parentTurnId},#{rootTurnId},'QUEUED',#{occurredAt},#{occurredAt})
+  </insert>
+  <insert id="insertLineage">
+    INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,origin_turn_id,task_name,depth,
+      task_kind,lifecycle,context_seed_id,created_at)
+    VALUES(#{childThreadId},#{parentThreadId},#{rootThreadId},#{originTurnId},#{taskName},#{depth},
+      #{taskKind},#{lifecycle},#{contextSeedId},#{createdAt})
+  </insert>
+  <select id="insertActivity" resultType="long" affectData="true">
+    INSERT INTO task_activities(activity_id,root_thread_id,task_thread_id,actor_thread_id,causal_turn_id,kind,
+      summary_json,created_at)
+    VALUES(#{activityId},#{rootThreadId},#{taskThreadId},#{actorThreadId},#{causalTurnId},#{kind},
+      #{summaryJson},#{createdAt}) RETURNING activity_sequence
+  </select>
+  <insert id="insertProjection">
+    INSERT INTO task_projections(task_thread_id,root_thread_id,state,latest_activity_sequence,unread_count,
+      latest_safe_summary,started_at,updated_at)
+    VALUES(#{taskThreadId},#{rootThreadId},#{state},#{latestActivitySequence},1,
+      #{latestSafeSummary},#{startedAt},#{updatedAt})
+  </insert>
+  <update id="incrementAncestorDescendants">
+    WITH RECURSIVE ancestors(thread_id) AS (
+      SELECT #{parentThreadId}
+      UNION ALL
+      SELECT l.parent_thread_id FROM thread_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id
+    )
+    UPDATE task_projections SET descendant_count=descendant_count+1,revision=revision+1
+    WHERE task_thread_id IN (SELECT thread_id FROM ancestors) AND descendant_count&lt;64
+  </update>
+  <update id="recomputeAncestorCounts">
+    WITH RECURSIVE ancestors(thread_id) AS (
+      SELECT parent_thread_id FROM thread_lineage WHERE child_thread_id=#{taskThreadId}
+      UNION ALL
+      SELECT l.parent_thread_id FROM thread_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id
+    )
+    UPDATE task_projections AS p SET
+      descendant_count=(WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM thread_lineage WHERE parent_thread_id=p.task_thread_id
+        UNION ALL SELECT l.child_thread_id FROM thread_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+      ) SELECT COUNT(*) FROM descendants),
+      running_descendant_count=(WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM thread_lineage WHERE parent_thread_id=p.task_thread_id
+        UNION ALL SELECT l.child_thread_id FROM thread_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+      ) SELECT COUNT(*) FROM task_projections WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state='RUNNING'),
+      needs_attention_count=(WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM thread_lineage WHERE parent_thread_id=p.task_thread_id
+        UNION ALL SELECT l.child_thread_id FROM thread_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+      ) SELECT COUNT(*) FROM task_projections WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state IN ('WAITING_APPROVAL','SUSPENDED')),
+      revision=revision+1,updated_at=#{occurredAt}
+    WHERE p.task_thread_id IN (SELECT thread_id FROM ancestors)
+  </update>
+  <update id="advanceTitleProjection">
+    UPDATE task_projections SET revision=revision+1,updated_at=#{occurredAt}
+    WHERE task_thread_id=#{taskThreadId}
+  </update>
+
+  <select id="selectTaskSummary" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow">
+    SELECT <include refid="taskSummaryColumns"/>
+    FROM thread_lineage l JOIN task_projections p ON p.task_thread_id=l.child_thread_id
+      JOIN threads t ON t.thread_id=l.child_thread_id
+    WHERE l.child_thread_id=#{taskThreadId} AND t.deleted_at IS NULL
+  </select>
+  <select id="selectTaskTree" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow">
+    SELECT <include refid="taskSummaryColumns"/>
+    FROM thread_lineage l JOIN task_projections p ON p.task_thread_id=l.child_thread_id
+      JOIN threads t ON t.thread_id=l.child_thread_id
+    WHERE l.root_thread_id=#{rootThreadId} AND t.deleted_at IS NULL
+    ORDER BY l.depth,l.created_at,l.child_thread_id
+  </select>
+  <select id="selectRootActivityProjections" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$RootActivityProjectionRow">
+    SELECT a.activity_sequence AS activitySequence,a.activity_id AS activityId,
+      a.root_thread_id AS activityRootThreadId,a.task_thread_id AS activityTaskThreadId,
+      a.actor_thread_id AS actorThreadId,a.causal_turn_id AS causalTurnId,
+      a.kind AS activityKind,a.summary_json AS activitySummaryJson,a.created_at AS activityCreatedAt,
+      l.child_thread_id AS lineageTaskThreadId,l.parent_thread_id AS parentThreadId,
+      l.root_thread_id AS lineageRootThreadId,l.origin_turn_id AS originTurnId,t.title AS taskName,
+      l.depth,l.task_kind AS taskKind,l.lifecycle,l.context_seed_id AS contextSeedId,
+      l.created_at AS lineageCreatedAt,p.task_thread_id AS projectionTaskThreadId,
+      p.root_thread_id AS projectionRootThreadId,p.revision AS projectionRevision,
+      p.state AS projectionState,p.latest_activity_sequence AS latestActivitySequence,
+      p.last_seen_activity_sequence AS lastSeenActivitySequence,p.unread_count AS unreadCount,
+      p.descendant_count AS descendantCount,p.running_descendant_count AS runningDescendantCount,
+      p.needs_attention_count AS needsAttentionCount,p.latest_safe_summary AS latestSafeSummary,
+      p.started_at AS startedAt,p.completed_at AS completedAt,p.updated_at AS projectionUpdatedAt,
+      t.thread_id AS persistedThreadId,t.deleted_at AS threadDeletedAt
+    FROM (
+      SELECT activity_sequence,activity_id,root_thread_id,task_thread_id,actor_thread_id,
+        causal_turn_id,kind,summary_json,created_at
+      FROM task_activities
+      WHERE root_thread_id=#{rootThreadId}
+        AND NOT EXISTS (
+          SELECT 1 FROM thread_lineage root_guard
+          WHERE root_guard.child_thread_id=#{rootThreadId}
+        )
+      ORDER BY activity_sequence DESC LIMIT #{limit}
+    ) a
+    LEFT JOIN thread_lineage l ON l.child_thread_id=a.task_thread_id
+    LEFT JOIN task_projections p ON p.task_thread_id=a.task_thread_id
+    LEFT JOIN threads t ON t.thread_id=a.task_thread_id
+    ORDER BY a.activity_sequence
+  </select>
+  <select id="selectContextSeed" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ContextSeedRow">
+    SELECT s.context_seed_id AS contextSeedId,s.parent_thread_id AS parentThreadId,
+      s.parent_turn_id AS parentTurnId,s.parent_revision AS parentRevision,
+      s.inheritance_mode AS inheritanceMode,s.task_brief_json AS taskBriefJson,
+      s.effective_context_json AS effectiveContextJson,s.references_json AS referencesJson,
+      s.permission_ceiling_json AS permissionCeilingJson,s.fingerprint,s.created_at AS createdAt
+    FROM task_context_seeds s JOIN thread_lineage l ON l.context_seed_id=s.context_seed_id
+    WHERE l.child_thread_id=#{taskThreadId}
+  </select>
+  <select id="selectActivities" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ActivityRow">
+    SELECT activity_sequence AS activitySequence,activity_id AS activityId,root_thread_id AS rootThreadId,
+      task_thread_id AS taskThreadId,actor_thread_id AS actorThreadId,causal_turn_id AS causalTurnId,
+      kind,summary_json AS summaryJson,created_at AS createdAt
+    FROM task_activities WHERE task_thread_id=#{taskThreadId} AND activity_sequence&gt;#{afterSequence}
+    ORDER BY activity_sequence LIMIT #{limit}
+  </select>
+  <select id="selectMailbox" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow">
+    SELECT mailbox_sequence AS mailboxSequence,message_id AS messageId,root_thread_id AS rootThreadId,
+      sender_thread_id AS senderThreadId,target_thread_id AS targetThreadId,causal_turn_id AS causalTurnId,
+      kind,content_json AS contentJson,idempotency_key AS idempotencyKey,state,bound_turn_id AS boundTurnId,
+      created_at AS createdAt,updated_at AS updatedAt,consumed_at AS consumedAt
+    FROM task_mailbox WHERE (sender_thread_id=#{taskThreadId} OR target_thread_id=#{taskThreadId})
+      AND mailbox_sequence&gt;#{afterSequence}
+    ORDER BY mailbox_sequence LIMIT #{limit}
+  </select>
+  <select id="selectMailboxByIdempotency" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow">
+    SELECT mailbox_sequence AS mailboxSequence,message_id AS messageId,root_thread_id AS rootThreadId,
+      sender_thread_id AS senderThreadId,target_thread_id AS targetThreadId,causal_turn_id AS causalTurnId,
+      kind,content_json AS contentJson,idempotency_key AS idempotencyKey,state,bound_turn_id AS boundTurnId,
+      created_at AS createdAt,updated_at AS updatedAt,consumed_at AS consumedAt
+    FROM task_mailbox WHERE sender_thread_id=#{senderThreadId} AND idempotency_key=#{idempotencyKey}
+  </select>
+  <select id="selectMailboxStats" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxStats">
+    SELECT COUNT(*) AS pendingCount,COALESCE(SUM(length(CAST(content_json AS BLOB))),0) AS pendingBytes
+    FROM task_mailbox WHERE target_thread_id=#{targetThreadId} AND state IN ('PENDING','BOUND')
+  </select>
+  <select id="insertMailbox" resultType="long" affectData="true">
+    INSERT INTO task_mailbox(message_id,root_thread_id,sender_thread_id,target_thread_id,causal_turn_id,kind,
+      content_json,idempotency_key,state,bound_turn_id,created_at,updated_at)
+    VALUES(#{messageId},#{rootThreadId},#{senderThreadId},#{targetThreadId},#{causalTurnId},#{kind},
+      #{contentJson},#{idempotencyKey},#{state},#{boundTurnId},#{createdAt},#{updatedAt})
+    ON CONFLICT(sender_thread_id,idempotency_key) DO NOTHING RETURNING mailbox_sequence
+  </select>
+  <update id="bindMailbox">
+    UPDATE task_mailbox SET state='BOUND',bound_turn_id=#{boundTurnId},updated_at=#{occurredAt}
+    WHERE message_id=#{messageId} AND target_thread_id=#{targetThreadId} AND kind='FOLLOW_UP' AND state='PENDING'
+  </update>
+  <select id="selectBoundMailboxForTurn" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow">
+    SELECT mailbox_sequence AS mailboxSequence,message_id AS messageId,root_thread_id AS rootThreadId,
+      sender_thread_id AS senderThreadId,target_thread_id AS targetThreadId,causal_turn_id AS causalTurnId,
+      kind,content_json AS contentJson,idempotency_key AS idempotencyKey,state,bound_turn_id AS boundTurnId,
+      created_at AS createdAt,updated_at AS updatedAt,consumed_at AS consumedAt
+    FROM task_mailbox WHERE bound_turn_id=#{turnId} AND state='BOUND'
+    ORDER BY mailbox_sequence LIMIT #{limit}
+  </select>
+  <update id="claimPendingMailbox">
+    UPDATE task_mailbox SET state='BOUND',bound_turn_id=#{turnId},updated_at=#{occurredAt}
+    WHERE mailbox_sequence IN (
+      SELECT mailbox_sequence FROM task_mailbox
+      WHERE target_thread_id=#{targetThreadId} AND state='PENDING'
+      ORDER BY mailbox_sequence LIMIT #{limit}
+    )
+  </update>
+  <update id="consumeBoundMailboxForTurn">
+    UPDATE task_mailbox SET state='CONSUMED',consumed_at=#{occurredAt},updated_at=#{occurredAt}
+    WHERE bound_turn_id=#{turnId} AND state='BOUND'
+  </update>
+  <update id="releaseBoundMailboxForTurn">
+    UPDATE task_mailbox SET state='PENDING',bound_turn_id=NULL,updated_at=#{occurredAt}
+    WHERE bound_turn_id=#{turnId} AND state='BOUND'
+  </update>
+  <update id="compareAndSetProjection">
+    UPDATE task_projections SET revision=revision+1,state=#{state},latest_activity_sequence=#{latestActivitySequence},
+      unread_count=unread_count+CASE WHEN #{incrementUnread} THEN 1 ELSE 0 END,
+      latest_safe_summary=#{latestSafeSummary},
+      started_at=COALESCE(started_at,#{startedAt}),completed_at=#{completedAt},updated_at=#{occurredAt}
+    WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+  </update>
+  <update id="compareAndSetProjectionActivity">
+    UPDATE task_projections SET revision=revision+1,latest_activity_sequence=#{latestActivitySequence},
+      unread_count=unread_count+1,latest_safe_summary=#{latestSafeSummary},updated_at=#{occurredAt}
+    WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+  </update>
+  <update id="compareAndSetFollowUpProjection">
+    UPDATE task_projections SET revision=revision+1,
+      state=CASE WHEN state IN ('RUNNING','WAITING_APPROVAL') THEN state ELSE 'QUEUED' END,
+      latest_activity_sequence=#{latestActivitySequence},unread_count=unread_count+1,
+      latest_safe_summary=#{latestSafeSummary},
+      completed_at=CASE WHEN state IN ('RUNNING','WAITING_APPROVAL') THEN completed_at ELSE NULL END,
+      updated_at=#{occurredAt}
+    WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+  </update>
+  <update id="compareAndSetSeen">
+    UPDATE task_projections SET revision=revision+1,last_seen_activity_sequence=#{throughActivitySequence},
+      unread_count=(SELECT COUNT(*) FROM task_activities a
+        WHERE a.task_thread_id=#{taskThreadId} AND a.activity_sequence&gt;#{throughActivitySequence}),
+      updated_at=#{occurredAt}
+    WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+      AND #{throughActivitySequence}&lt;=latest_activity_sequence
+      AND #{throughActivitySequence}&gt;=COALESCE(last_seen_activity_sequence,0)
+  </update>
+  <select id="selectAttachedDescendants" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow">
+    WITH RECURSIVE attached(child_thread_id,depth) AS (
+      SELECT child_thread_id,depth FROM thread_lineage
+      WHERE parent_thread_id=#{parentThreadId} AND lifecycle='ATTACHED'
+      UNION ALL
+      SELECT l.child_thread_id,l.depth FROM thread_lineage l JOIN attached a ON l.parent_thread_id=a.child_thread_id
+      WHERE l.lifecycle='ATTACHED'
+    )
+    SELECT <include refid="taskSummaryColumns"/>
+    FROM attached x JOIN thread_lineage l ON l.child_thread_id=x.child_thread_id
+      JOIN task_projections p ON p.task_thread_id=l.child_thread_id
+      JOIN threads t ON t.thread_id=l.child_thread_id
+    WHERE t.deleted_at IS NULL ORDER BY x.depth,l.created_at,l.child_thread_id
+  </select>
+  <select id="selectPendingCancellationPropagations" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$CancellationPropagationRow">
+    SELECT DISTINCT parent.thread_id AS parentThreadId,parent.turn_id AS parentTurnId
+    FROM turns parent
+    JOIN thread_lineage child_lineage
+      ON child_lineage.parent_thread_id=parent.thread_id
+      AND child_lineage.origin_turn_id=parent.turn_id
+      AND child_lineage.lifecycle='ATTACHED'
+    JOIN turns child_turn ON child_turn.thread_id=child_lineage.child_thread_id
+    WHERE parent.cancel_requested_at IS NOT NULL
+      AND child_turn.state NOT IN ('COMPLETED','FAILED','CANCELLED')
+    ORDER BY parent.requested_at,parent.turn_id
+  </select>
+  <select id="selectTaskByTurn" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TerminalTaskRow">
+    SELECT l.child_thread_id AS taskThreadId,l.parent_thread_id AS parentThreadId,
+      l.root_thread_id AS rootThreadId,p.revision AS taskRevision,p.state AS taskState
+    FROM turns x JOIN thread_lineage l ON l.child_thread_id=x.thread_id
+      JOIN task_projections p ON p.task_thread_id=l.child_thread_id
+    WHERE x.turn_id=#{turnId}
+  </select>
+  <select id="selectNextNonTerminalTaskTurnState" resultType="string">
+    SELECT state FROM turns
+    WHERE thread_id=#{taskThreadId} AND turn_id&lt;&gt;#{settledTurnId}
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+    ORDER BY requested_at,turn_id LIMIT 1
+  </select>
+
+  <select id="countDeleteTarget" resultType="int">
+    SELECT COUNT(*) FROM task_projections WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+  </select>
+  <select id="countNonTerminalTurnsInTree" resultType="int">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    )
+    SELECT COUNT(*) FROM turns WHERE thread_id IN (SELECT thread_id FROM tree)
+      AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+  </select>
+  <select id="countTaskSubtree" resultType="int">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) SELECT COUNT(*) FROM tree
+  </select>
+  <update id="softDeleteTaskThreads">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    )
+    UPDATE threads SET deleted_at=#{occurredAt},updated_at=#{occurredAt},revision=revision+1
+    WHERE thread_id IN (SELECT thread_id FROM tree) AND deleted_at IS NULL
+  </update>
+  <delete id="deleteTreeWriteClaims">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) DELETE FROM workspace_write_claims WHERE thread_id IN (SELECT thread_id FROM tree)
+  </delete>
+  <delete id="deleteTreeMailbox">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) DELETE FROM task_mailbox WHERE sender_thread_id IN (SELECT thread_id FROM tree)
+      OR target_thread_id IN (SELECT thread_id FROM tree)
+  </delete>
+  <delete id="deleteTreeActivities">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) DELETE FROM task_activities WHERE task_thread_id IN (SELECT thread_id FROM tree)
+  </delete>
+  <delete id="deleteTreeProjections">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) DELETE FROM task_projections WHERE task_thread_id IN (SELECT thread_id FROM tree)
+  </delete>
+  <select id="selectTreeSeedIds" resultType="string">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) SELECT context_seed_id FROM thread_lineage WHERE child_thread_id IN (SELECT thread_id FROM tree)
+  </select>
+  <delete id="deleteTreeLineage">
+    WITH RECURSIVE tree(thread_id) AS (
+      SELECT #{taskThreadId} UNION ALL
+      SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+    ) DELETE FROM thread_lineage WHERE child_thread_id IN (SELECT thread_id FROM tree)
+  </delete>
+  <delete id="deleteContextSeeds">
+    DELETE FROM task_context_seeds WHERE context_seed_id IN
+    <foreach item="seedId" collection="seedIds" open="(" separator="," close=")">#{seedId}</foreach>
+  </delete>
+  <update id="recomputeDescendantCounts">
+    UPDATE task_projections AS p SET descendant_count=(
+      WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM thread_lineage WHERE parent_thread_id=p.task_thread_id
+        UNION ALL
+        SELECT l.child_thread_id FROM thread_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+      ) SELECT COUNT(*) FROM descendants
+    ),running_descendant_count=(
+      WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM thread_lineage WHERE parent_thread_id=p.task_thread_id
+        UNION ALL SELECT l.child_thread_id FROM thread_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+      ) SELECT COUNT(*) FROM task_projections WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state='RUNNING'
+    ),needs_attention_count=(
+      WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM thread_lineage WHERE parent_thread_id=p.task_thread_id
+        UNION ALL SELECT l.child_thread_id FROM thread_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+      ) SELECT COUNT(*) FROM task_projections WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state IN ('WAITING_APPROVAL','SUSPENDED')
+    ),revision=revision+1,updated_at=#{occurredAt}
+    WHERE p.root_thread_id=#{rootThreadId}
+  </update>
+
+  <select id="selectNextFencingToken" resultType="long">
+    SELECT COALESCE(MAX(fencing_token),0)+1 FROM workspace_write_claims WHERE workspace_id=#{workspaceId}
+  </select>
+  <select id="allocateProcessGeneration" resultType="long" affectData="true">
+    UPDATE task_process_generation SET last_generation=last_generation+1 WHERE singleton_id=1
+    RETURNING last_generation
+  </select>
+  <select id="insertWriteClaim" resultType="long" affectData="true">
+    INSERT INTO workspace_write_claims(claim_id,workspace_id,thread_id,turn_id,process_generation,fencing_token,
+      state,requested_at)
+    VALUES(#{claimId},#{workspaceId},#{threadId},#{turnId},#{processGeneration},#{fencingToken},'WAITING',#{requestedAt})
+    RETURNING claim_sequence
+  </select>
+  <select id="selectWriteClaim" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$WriteClaimRow">
+    SELECT claim_sequence AS claimSequence,claim_id AS claimId,workspace_id AS workspaceId,thread_id AS threadId,
+      turn_id AS turnId,process_generation AS processGeneration,fencing_token AS fencingToken,state,
+      requested_at AS requestedAt,acquired_at AS acquiredAt,heartbeat_at AS heartbeatAt,released_at AS releasedAt
+    FROM workspace_write_claims WHERE claim_id=#{claimId}
+  </select>
+  <update id="acquireWriteClaim">
+    UPDATE workspace_write_claims SET state='HELD',acquired_at=#{occurredAt},heartbeat_at=#{occurredAt}
+    WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state='WAITING'
+      AND NOT EXISTS(SELECT 1 FROM workspace_write_claims held
+        WHERE held.workspace_id=workspace_write_claims.workspace_id AND held.state='HELD')
+      AND claim_sequence=(SELECT MIN(waiting.claim_sequence) FROM workspace_write_claims waiting
+        WHERE waiting.workspace_id=workspace_write_claims.workspace_id AND waiting.state='WAITING')
+  </update>
+  <update id="heartbeatWriteClaim">
+    UPDATE workspace_write_claims SET heartbeat_at=#{occurredAt}
+    WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state='HELD'
+  </update>
+  <update id="releaseWriteClaim">
+    UPDATE workspace_write_claims SET state='RELEASED',released_at=#{occurredAt}
+    WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state='HELD'
+  </update>
+  <update id="abandonWriteClaim">
+    UPDATE workspace_write_claims SET state='ABANDONED',released_at=#{occurredAt}
+    WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state IN ('WAITING','HELD')
+  </update>
+  <update id="abandonActiveWriteClaims">
+    UPDATE workspace_write_claims SET state='ABANDONED',released_at=#{occurredAt}
+    WHERE state IN ('WAITING','HELD')
+  </update>
+</mapper>

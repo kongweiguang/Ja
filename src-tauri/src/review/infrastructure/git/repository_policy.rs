@@ -246,7 +246,7 @@ pub(crate) fn validate_object_directory_with_limits(
         .map_err(|_| GitError::ExternalWorktree)?;
     for entry in fs::read_dir(&objects.path).map_err(|_| GitError::ExternalWorktree)? {
         budget.check_deadline()?;
-        let (name, _, metadata) = object_entry(entry.map_err(|_| GitError::ExternalWorktree)?)?;
+        let (name, path, metadata) = object_entry(entry.map_err(|_| GitError::ExternalWorktree)?)?;
         let child_rel = repo_child(objects_rel, &name);
         if metadata.is_dir() {
             if name == "info" {
@@ -254,7 +254,7 @@ pub(crate) fn validate_object_directory_with_limits(
             } else if name == "pack" {
                 scan_pack_directory(workspace, &child_rel, &mut budget, 1)?;
             } else if is_fanout_directory_name(&name) {
-                scan_fanout_directory(workspace, &child_rel, &mut budget, 1)?;
+                scan_fanout_directory(workspace, &objects, &path, &metadata, &mut budget, 1)?;
             } else {
                 return Err(GitError::ExternalWorktree);
             }
@@ -281,27 +281,42 @@ fn object_entry(entry: fs::DirEntry) -> Result<(String, PathBuf, fs::Metadata), 
     Ok((name, path, metadata))
 }
 
-/// 校验两位十六进制 fanout 目录本身，不枚举或打开内容寻址的松散对象正文。
+/// 在已持有的 objects 根 guard 下校验两位十六进制 fanout，不重复解析共同祖先。
 ///
 /// Git 在写对象时会创建 `tmp_obj_*`，异常退出后也可能留下该类普通文件。Git 不会按对象哈希
 /// 读取这些名字。松散对象本身又由哈希寻址，只是数据文件，不具备 Git 配置、对象目录跳转或
 /// 进程执行语义；若在 Windows 上逐个 canonicalize/打开数万个对象，会让同一 Turn 的多条 Git
-/// 命令反复线性扫描并稳定超时。因此只验证 fanout 目录的 containment、物理身份与链接状态；
+/// 命令反复线性扫描并稳定超时。因此只验证 fanout 是 objects 的直属规范目录且不是链接；
 /// 能够改变 Git 读取边界的 config、alternates、pack/info 元数据仍逐文件执行 containment 与
 /// hard-link 校验。此取舍让安全判断与 Git 实际的信任/寻址边界一致，而不与仓库对象数量耦合。
 fn scan_fanout_directory(
     workspace: &WorkspaceHandle,
-    relative: &str,
+    parent: &crate::workspace::ResolvedPath,
+    path: &Path,
+    observed: &fs::Metadata,
     budget: &mut ObjectScanBudget,
     depth: usize,
 ) -> Result<(), GitError> {
-    let directory = workspace
-        .resolve_guard(relative, Some(true))
-        .map_err(|_| GitError::ExternalWorktree)?;
     budget.visit_directory(depth)?;
-    workspace
-        .verify_resolved(&directory, Some(true))
-        .map_err(|_| GitError::ExternalWorktree)
+    if path.parent() != Some(parent.path.as_path())
+        || !observed.is_dir()
+        || observed.file_type().is_symlink()
+        || crate::workspace::is_reparse_point(observed)
+    {
+        return Err(GitError::ExternalWorktree);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| GitError::ExternalWorktree)?;
+    if canonical != path || !crate::workspace::path_is_within(workspace.root_path(), &canonical) {
+        return Err(GitError::ExternalWorktree);
+    }
+    let current = fs::symlink_metadata(&canonical).map_err(|_| GitError::ExternalWorktree)?;
+    if !current.is_dir()
+        || current.file_type().is_symlink()
+        || crate::workspace::is_reparse_point(&current)
+    {
+        return Err(GitError::ExternalWorktree);
+    }
+    Ok(())
 }
 
 /// 扫描对象 info 目录及 split commit-graph 元数据。

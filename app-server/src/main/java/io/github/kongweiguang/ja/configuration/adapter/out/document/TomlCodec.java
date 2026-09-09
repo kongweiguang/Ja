@@ -137,7 +137,7 @@ final class TomlCodec {
 
     /**
      * 输出 TOML 基线支持的赋值；JSON null 使用私有 inline-table 哨兵保存字段存在性，
-     * 因为 TOML 本身没有 null，同时 v3 完整文档必须区分“显式无默认值”和字段缺失。
+     * 因为 TOML 本身没有 null，同时 v1 完整文档必须区分“显式无默认值”和字段缺失。
      */
     private static void appendAssignment(StringBuilder output, String key, JsonNode value) {
         if (value == null || value.isBinary() || value.isMissingNode()

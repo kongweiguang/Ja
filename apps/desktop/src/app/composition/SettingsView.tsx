@@ -1,10 +1,11 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { lazy, Suspense, useEffect, type ReactElement } from "react";
+import { lazy, Suspense, type ReactElement } from "react";
 import type {
   DesktopNotificationPreference,
   SettingsController,
+  SettingsDesktopPort,
   SettingsSection,
 } from "@/features/settings";
 import { useRuntimeState } from "../RuntimeProvider";
@@ -21,8 +22,9 @@ export interface SettingsViewProps {
   readonly required: boolean;
   readonly section: SettingsSection;
   readonly onSectionChange: (section: SettingsSection) => void;
-  readonly onOpenConversation: () => void;
+  readonly onReturnToApp: () => void;
   readonly desktopNotifications: DesktopNotificationPreference;
+  readonly desktop: SettingsDesktopPort;
 }
 
 /**
@@ -34,15 +36,11 @@ export function SettingsView({
   required,
   section,
   onSectionChange,
-  onOpenConversation,
+  onReturnToApp,
   desktopNotifications,
+  desktop,
 }: SettingsViewProps): ReactElement {
   const { boot } = useRuntimeState();
-  const { setScope } = settings;
-  /** 每次重新进入设置都从全局开始；组件存活期间的切换由 controller 保留。 */
-  useEffect(() => {
-    setScope("global");
-  }, [setScope]);
   return (
     <section className="ja-settings-view" aria-label="设置页面">
       {boot.status === "recovery_required" ? <RecoveryPanel /> : null}
@@ -54,17 +52,15 @@ export function SettingsView({
         }
       >
         <LazySettings
-          snapshot={settings.snapshot}
+          snapshot={settings.globalSnapshot}
           ports={settings.ports}
           section={section}
           onSectionChange={onSectionChange}
           desktopNotifications={desktopNotifications}
+          desktop={desktop}
           disabled={settings.synchronizing}
           required={required}
-          onOpenConversation={onOpenConversation}
-          scope={settings.scope}
-          projectAvailable={settings.projectAvailable}
-          onScopeChange={setScope}
+          onReturnToApp={onReturnToApp}
         />
       </Suspense>
     </section>

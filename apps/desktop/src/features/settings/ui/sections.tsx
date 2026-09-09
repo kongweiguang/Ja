@@ -2,10 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { Shield } from "lucide-react";
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { toast } from "sonner";
-import { Button } from "@/shared/ui/primitives";
-import type { AppearanceSettings, AccessMode, ThemeMode } from "../domain/types";
+import {
+  UI_PALETTE_LABELS,
+  UI_PALETTE_ORDER,
+  type AppearanceSettings,
+  type AccessMode,
+  type ThemeMode,
+  type UiPalette,
+} from "../domain/types";
 import type { SettingsPorts } from "../application/ports";
 import {
   Field,
@@ -21,18 +27,46 @@ export interface DesktopNotificationPreference {
   onChange: (enabled: boolean) => Promise<boolean>;
 }
 
+const PALETTE_SWATCHES: Readonly<Record<UiPalette, readonly [string, string, string]>> = {
+  xcode: ["#f5f5f5", "#292a30", "#007aff"],
+  fleet: ["#f2f2f2", "#18191b", "#726cf9"],
+  obsidian: ["#f6f6f6", "#242424", "#9873f7"],
+  claude: ["#f5f4ed", "#1a1918", "#d97757"],
+};
+
+/**
+ * Palette 选项用可见名称承载语义，三个色点仅帮助快速辨认且从无障碍树隐藏，
+ * 避免屏幕阅读器重复朗读无法表达业务含义的颜色名称。
+ */
+function PaletteOptionLabel({ palette }: { palette: UiPalette }): React.ReactElement {
+  return (
+    <span className="ja-settings-palette-option">
+      <span>{UI_PALETTE_LABELS[palette]}</span>
+      <span className="ja-settings-palette-swatches" aria-hidden="true">
+        {PALETTE_SWATCHES[palette].map((color) => (
+          <span
+            className="ja-settings-palette-swatch"
+            key={color}
+            style={{ "--ja-palette-swatch": color } as CSSProperties}
+          />
+        ))}
+      </span>
+    </span>
+  );
+}
+
+/** 从偏好闭集派生下拉顺序，新增 Palette 时不会在设置页留下不可达状态。 */
+const paletteOptions = UI_PALETTE_ORDER.map((palette) => ({
+  value: palette,
+  label: <PaletteOptionLabel palette={palette} />,
+}));
+
 /** 只展示协议真正支持的两档权限，避免 UI 重新引入策略语言。 */
 export function PermissionsSection({
   mode: initialMode,
-  globalMode,
-  projectMode = false,
-  projectOverridden = false,
   onChange,
 }: {
   mode: AccessMode;
-  globalMode: AccessMode;
-  projectMode?: boolean;
-  projectOverridden?: boolean;
   onChange: SettingsPorts["onAccessModeChange"];
 }): React.ReactElement {
   const mode = initialMode;
@@ -66,23 +100,12 @@ export function PermissionsSection({
       data-setting-search="执行确认 需要确认 全部执行"
       tabIndex={-1}
     >
-      <SectionHeader
-        title="执行确认"
-        action={
-          projectMode && projectOverridden ? (
-            <Button type="button" variant="ghost" size="sm" onClick={() => void change(globalMode)}>
-              恢复继承
-            </Button>
-          ) : projectMode ? (
-            <span className="ja-settings-override-state">继承全局</span>
-          ) : undefined
-        }
-      />
+      <SectionHeader title="执行确认" />
       <fieldset className="ja-settings-permission-group">
         <legend>工具执行方式</legend>
         {choices.map((choice) => (
           <label
-            className={`ja-settings-permission-card${mode === choice.value ? " is-selected" : ""}${projectMode && globalMode === "approval_required" && choice.value === "full_access" ? " is-disabled" : ""}`}
+            className={`ja-settings-permission-card${mode === choice.value ? " is-selected" : ""}`}
             data-setting-search={`${choice.label} ${choice.description} ${choice.value}`}
             tabIndex={-1}
             key={choice.value}
@@ -92,9 +115,6 @@ export function PermissionsSection({
               name="ja-permission-mode"
               value={choice.value}
               checked={mode === choice.value}
-              disabled={
-                projectMode && globalMode === "approval_required" && choice.value === "full_access"
-              }
               onChange={() => void change(choice.value)}
             />
             <span className="ja-settings-radio" aria-hidden="true" />
@@ -105,9 +125,6 @@ export function PermissionsSection({
           </label>
         ))}
       </fieldset>
-      {projectMode && globalMode === "approval_required" ? (
-        <p className="ja-settings-hint">项目只能继承或收紧全局执行确认，不能扩大权限。</p>
-      ) : null}
       <div className="ja-settings-callout">
         <Shield size={16} aria-hidden="true" />
         <span>
@@ -118,7 +135,7 @@ export function PermissionsSection({
   );
 }
 
-/** Appearance 值只属于展示层；Document 副作用通过类型化回调交给 Host ThemeProvider。 */
+/** Appearance 值只属于本地 UI preference；类型化回调不会进入 App Server 配置保存链。 */
 export function AppearanceSection({
   appearance,
   onChange,
@@ -132,7 +149,10 @@ export function AppearanceSection({
   const [notificationPending, setNotificationPending] = useState(false);
   const [feedback, setFeedback] = useState<string>();
 
-  /** 更新单个字段时仍向 Host 提交完整 Snapshot，避免局部状态 owner 分裂。 */
+  /**
+   * 更新单个字段时仍向 Host 提交完整 Snapshot；持久化失败不会回滚已经生效的会话主题，
+   * 因而错误反馈必须如实区分“未保存”与“未应用”。
+   */
   const update = async <K extends keyof AppearanceSettings>(
     key: K,
     value: AppearanceSettings[K],
@@ -141,10 +161,10 @@ export function AppearanceSection({
     setPending(key);
     setFeedback(undefined);
     try {
-      await onChange(next);
+      await onChange(next, key);
     } catch {
-      setFeedback("外观保存失败，仍保留上一次设置。 ");
-      toast.error("外观保存失败");
+      setFeedback("已应用但未保存，请检查本地存储后重试。");
+      toast.error("外观已应用但未保存");
     } finally {
       setPending(undefined);
     }
@@ -178,18 +198,33 @@ export function AppearanceSection({
     <div
       className="ja-settings-section"
       data-setting-id="appearance-theme"
-      data-setting-search="主题 外观 动效 对比度 桌面通知"
+      data-setting-search="主题 配色 外观 动效 透明度 对比度 桌面通知 Xcode Fleet Obsidian Claude"
       tabIndex={-1}
     >
       <SectionHeader title="外观" />
       <div className="ja-settings-form-grid">
-        <Field id="appearance-theme" label="主题" hint="系统模式会随 Windows 外观自动切换。">
+        <Field
+          id="appearance-theme"
+          label="外观模式"
+          hint="跟随系统会随 Windows 的浅色或深色外观自动切换。"
+        >
           <SettingsSelect
             id="appearance-theme"
             value={appearance.theme}
             options={themeOptions}
             onValueChange={(value) => void update("theme", value as ThemeMode)}
-            ariaLabel="主题"
+            ariaLabel="外观模式"
+            disabled={pending !== undefined}
+          />
+        </Field>
+        <Field id="appearance-palette" label="配色主题" hint="只改变色彩气质，明暗由外观模式控制。">
+          <SettingsSelect
+            id="appearance-palette"
+            value={appearance.palette}
+            options={paletteOptions}
+            onValueChange={(value) => void update("palette", value as UiPalette)}
+            ariaLabel="配色主题"
+            disabled={pending !== undefined}
           />
         </Field>
       </div>
@@ -200,6 +235,14 @@ export function AppearanceSection({
           checked={appearance.reducedMotion}
           onCheckedChange={(checked) => void update("reducedMotion", checked)}
           hint="保留状态变化，同时减少位移与过渡。"
+          disabled={pending !== undefined}
+        />
+        <SwitchField
+          id="appearance-transparency"
+          label="降低透明度"
+          checked={appearance.reducedTransparency}
+          onCheckedChange={(checked) => void update("reducedTransparency", checked)}
+          hint="使用不透明材质和更清晰的边界。"
           disabled={pending !== undefined}
         />
         <SwitchField

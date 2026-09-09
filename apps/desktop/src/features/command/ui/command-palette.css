@@ -6,7 +6,7 @@
   position: fixed;
   z-index: 900;
   inset: 0;
-  background: rgb(13 14 18 / 42%);
+  background: var(--ja-command-overlay);
   animation: ja-command-fade 140ms var(--ja-ease-native);
 }
 
@@ -22,10 +22,8 @@
   overflow: hidden;
   border: 1px solid var(--ja-glass-border);
   border-radius: var(--ja-radius-lg);
-  background: var(--ja-glass-strong);
-  box-shadow:
-    var(--ja-shadow-floating),
-    inset 0 1px rgb(255 255 255 / 9%);
+  background: var(--ja-menu);
+  box-shadow: var(--ja-shadow-floating);
   backdrop-filter: blur(26px) saturate(145%);
   -webkit-backdrop-filter: blur(26px) saturate(145%);
   transform: translateX(-50%);

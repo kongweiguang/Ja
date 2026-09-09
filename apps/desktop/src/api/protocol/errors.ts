@@ -4,7 +4,7 @@
 import { RpcErrorSchema, type RpcError } from "./protocol";
 import { containsTokenShapedText } from "./readyToken";
 
-/** JA-RPC v2 的错误分类闭集；展示消息永远不参与分类。 */
+/** JA-RPC v1 的错误分类闭集；展示消息永远不参与分类。 */
 export type ErrorCategory =
   | "protocol"
   | "validation"
@@ -58,7 +58,6 @@ export const JA_ERROR_CATALOG = {
   TOOL_OUTCOME_UNKNOWN: { code: -32045, category: "internal", retryable: false },
   PROCESS_TIMEOUT: { code: -32046, category: "timeout", retryable: false },
   PROCESS_OUTPUT_LIMIT: { code: -32047, category: "capacity", retryable: false },
-  TOKEN_COUNT_UNAVAILABLE: { code: -32048, category: "unavailable", retryable: true },
   SUMMARY_FAILURE: { code: -32049, category: "unavailable", retryable: true },
   MODEL_PROTOCOL_ERROR: { code: -32050, category: "protocol", retryable: false },
   CONTEXT_LIMIT: { code: -32051, category: "capacity", retryable: false },
@@ -74,9 +73,34 @@ export const JA_ERROR_CATALOG = {
   ATTACHMENT_LIMIT_EXCEEDED: { code: -32062, category: "capacity", retryable: false },
   ATTACHMENT_CONFLICT: { code: -32063, category: "conflict", retryable: false },
   ATTACHMENT_UNAVAILABLE: { code: -32064, category: "unavailable", retryable: true },
+  TURN_NOT_RESUMABLE: { code: -32065, category: "conflict", retryable: false },
+  TURN_RESUME_ORDER_CONFLICT: { code: -32066, category: "conflict", retryable: true },
+  TURN_INPUT_QUEUE_FULL: { code: -32068, category: "capacity", retryable: true },
+  QUEUED_INPUT_NOT_FOUND: { code: -32069, category: "not_found", retryable: false },
+  WORKSPACE_REFERENCE_INVALID: { code: -32070, category: "validation", retryable: false },
+  SKILL_LOAD_FAILED: { code: -32071, category: "unavailable", retryable: true },
+  CONTENT_TOO_LARGE: { code: -32072, category: "capacity", retryable: false },
+  TASK_NOT_FOUND: { code: -32073, category: "not_found", retryable: false },
+  TASK_RELATION_INVALID: { code: -32074, category: "validation", retryable: false },
+  TASK_CONTEXT_REVISION_CONFLICT: { code: -32075, category: "conflict", retryable: true },
+  TASK_PERMISSION_DENIED: { code: -32076, category: "permission", retryable: false },
+  TASK_DEPTH_LIMIT: { code: -32077, category: "capacity", retryable: false },
+  TASK_TREE_LIMIT: { code: -32078, category: "capacity", retryable: false },
+  TASK_MAILBOX_FULL: { code: -32079, category: "capacity", retryable: true },
   INTERNAL_ERROR: { code: -32080, category: "internal", retryable: false },
   SIDECAR_CRASHED: { code: -32081, category: "unavailable", retryable: false },
   SHUTDOWN_TIMEOUT: { code: -32082, category: "timeout", retryable: false },
+  TASK_TREE_DELETE_REQUIRED: { code: -32083, category: "conflict", retryable: false },
+  TASK_OBSERVATION_INVALID: { code: -32084, category: "not_found", retryable: false },
+  WORKSPACE_WRITE_LEASE_TIMEOUT: { code: -32085, category: "timeout", retryable: true },
+  GOAL_NOT_FOUND: { code: -32086, category: "not_found", retryable: false },
+  GOAL_REVISION_CONFLICT: { code: -32087, category: "conflict", retryable: true },
+  GOAL_INVALID_STATE: { code: -32088, category: "conflict", retryable: false },
+  PLAN_INVALID: { code: -32089, category: "validation", retryable: false },
+  PLAN_APPROVAL_STALE: { code: -32090, category: "conflict", retryable: false },
+  GOAL_EVIDENCE_INCOMPLETE: { code: -32091, category: "conflict", retryable: false },
+  GOAL_RECOVERY_REQUIRED: { code: -32092, category: "conflict", retryable: false },
+  GOAL_INPUT_EXPIRED: { code: -32093, category: "timeout", retryable: false },
 } as const satisfies Record<string, { code: number; category: ErrorCategory; retryable: boolean }>;
 
 type CatalogErrorCode = keyof typeof JA_ERROR_CATALOG;
