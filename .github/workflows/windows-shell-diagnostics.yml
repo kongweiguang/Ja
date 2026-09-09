@@ -1,0 +1,23 @@
+# @author kongweiguang
+name: Windows shell launch diagnostics
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: liberica
+          java-version: "25"
+          cache: maven
+      - name: Compare fixed shell probes in isolated JVM
+        shell: pwsh
+        run: |
+          java -version
+          mvn.cmd -version
+          mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=WindowsShellLaunchProbeTest" test
