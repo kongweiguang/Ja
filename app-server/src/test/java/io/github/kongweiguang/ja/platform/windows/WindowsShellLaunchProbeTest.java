@@ -22,36 +22,47 @@ import org.junit.jupiter.api.io.TempDir;
 final class WindowsShellLaunchProbeTest {
     /** 每个候选均有硬时限；一轮输出全部差异，不以增加等待预算掩盖真实阻塞。 */
     @Test
-    @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    @Timeout(value = 180, unit = TimeUnit.SECONDS)
     void comparePipeLaunchEnvironments(@TempDir Path temp) throws Exception {
         List<String> runtime = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP");
-        List<String> windows = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP", "windir");
-        List<String> platform = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP",
-                "windir", "SystemDrive", "ProgramData", "ALLUSERSPROFILE", "PUBLIC", "OS",
-                "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "PSModulePath");
-        for (List<String> names : List.of(runtime)) {
-            Map<String, String> environment = new LinkedHashMap<>();
-            for (String name : names) {
-                String value = name.equals("PSModulePath")
-                        ? Path.of(System.getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "Modules").toString()
-                        : System.getenv(name);
-                if (value != null) environment.put(name, value);
-            }
-            for (boolean nativeLaunch : List.of(false, true)) {
-                probe(temp, environment, nativeLaunch);
-            }
+        Map<String, String> base = new LinkedHashMap<>();
+        for (String name : runtime) {
+            String value = System.getenv(name);
+            if (value != null) base.put(name, value);
         }
         Map<String, String> inherited = new LinkedHashMap<>();
         System.getenv().forEach((name, value) -> {
             if (name.matches("[A-Za-z_][A-Za-z0-9_]*")) inherited.put(name, value);
         });
         // 仅作为固定脚本的诊断对照，生产 Shell 白名单不采用这份环境，也不记录其值。
-        probe(temp, inherited, false);
-        probe(temp, inherited, true);
+        org.junit.jupiter.api.Assertions.assertTrue(probe(temp, inherited, false));
+        List<String> candidates = inherited.keySet().stream()
+                .filter(name -> runtime.stream().noneMatch(name::equalsIgnoreCase)).sorted().toList();
+        while (candidates.size() > 1) {
+            int middle = candidates.size() / 2;
+            List<String> left = candidates.subList(0, middle);
+            List<String> right = candidates.subList(middle, candidates.size());
+            if (probe(temp, selected(base, inherited, left), false)) candidates = left;
+            else if (probe(temp, selected(base, inherited, right), false)) candidates = right;
+            else {
+                System.out.println("JA_ENV_INTERACTION_KEYS=" + candidates);
+                return;
+            }
+        }
+        System.out.println("JA_REQUIRED_ENV_KEY=" + candidates);
+        org.junit.jupiter.api.Assertions.assertTrue(probe(temp, selected(base, inherited, candidates), true));
+    }
+
+    /** 只组合本轮对照指定的变量，大小写别名不重复加入环境块。 */
+    private static Map<String, String> selected(Map<String, String> base, Map<String, String> source,
+                                                List<String> names) {
+        Map<String, String> result = new LinkedHashMap<>(base);
+        for (String name : names) result.put(name, source.get(name));
+        return result;
     }
 
     /** 两种启动器共用相同参数、环境、cwd 与排空策略，输出不包含环境值或用户文件。 */
-    private static void probe(Path temp, Map<String, String> environment, boolean nativeLaunch) throws Exception {
+    private static boolean probe(Path temp, Map<String, String> environment, boolean nativeLaunch) throws Exception {
         List<String> command = List.of(Path.of(System.getenv("SystemRoot"), "System32",
                 "WindowsPowerShell", "v1.0", "powershell.exe").toString(),
                 "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
@@ -70,12 +81,13 @@ final class WindowsShellLaunchProbeTest {
                 process.getOutputStream().close();
                 CompletableFuture<String> stdout = capture(process.getInputStream());
                 CompletableFuture<String> stderr = capture(process.getErrorStream());
-                boolean exited = process.waitFor(8, TimeUnit.SECONDS);
+                boolean exited = process.waitFor(6, TimeUnit.SECONDS);
                 if (!exited) process.destroyForcibly();
                 process.waitFor(3, TimeUnit.SECONDS);
                 System.out.println("JA_SHELL_PROBE native=" + nativeLaunch + " keyCount=" + environment.size()
                         + " exited=" + exited + " stdout=" + stdout.get(3, TimeUnit.SECONDS)
                         + " stderr=" + stderr.get(3, TimeUnit.SECONDS));
+                return exited && stdout.get(3, TimeUnit.SECONDS).contains("JA_CMDLET");
             } finally {
                 if (nativeLaunch) WindowsProcessLauncher.close(process);
                 else if (process.isAlive()) process.destroyForcibly();
