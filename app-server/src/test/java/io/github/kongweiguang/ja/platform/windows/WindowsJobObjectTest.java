@@ -131,9 +131,7 @@ final class WindowsJobObjectTest {
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void suspendedLauncherRunsSystemPowerShell(@TempDir Path temp) throws Exception {
-        Map<String, String> environment = Map.of(
-                "SystemRoot", System.getenv("SystemRoot"),
-                "PATH", System.getenv("PATH"));
+        Map<String, String> environment = minimalWindowsEnvironment();
         try (WindowsJobObject job = WindowsJobObject.create()) {
             Process process = WindowsProcessLauncher.launch(
                     List.of("powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Milliseconds 100"),
@@ -334,7 +332,7 @@ final class WindowsJobObjectTest {
      */
     private static Map<String, String> minimalWindowsEnvironment() {
         java.util.LinkedHashMap<String, String> values = new java.util.LinkedHashMap<>();
-        for (String name : List.of("SystemRoot", "ComSpec", "PATH", "PATHEXT", "TEMP", "TMP")) {
+        for (String name : List.of("SystemRoot", "ComSpec", "PATH", "PATHEXT", "TEMP", "TMP", "PSModuleAnalysisCachePath")) {
             String value = System.getenv(name);
             if (value != null) {
                 values.put(name, value);

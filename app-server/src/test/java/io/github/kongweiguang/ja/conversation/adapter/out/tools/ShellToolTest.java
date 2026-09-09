@@ -128,6 +128,7 @@ final class ShellToolTest {
         copyHost(source, "SystemRoot");
         copyHost(source, "TEMP");
         copyHost(source, "TMP");
+        copyHost(source, "PSModuleAnalysisCachePath");
         ShellProfile profile = ShellCapability.detectAndPreflight("Windows 11", source::get,
                 ShellProfile::preflight).profile().orElseThrow();
         assertEquals(ShellProfile.Dialect.WINDOWS_POWERSHELL, profile.dialect());

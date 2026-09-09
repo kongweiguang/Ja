@@ -31,6 +31,7 @@ final class ShellProcessEnvironmentTest {
         source.put("SystemRoot", temp.resolve("Windows").toAbsolutePath().toString());
         source.put("ComSpec", temp.resolve("Windows/System32/cmd.exe").toAbsolutePath().toString());
         source.put("TEMP", temp.toAbsolutePath().toString());
+        source.put("PSModuleAnalysisCachePath", temp.resolve("module-cache").toAbsolutePath().toString());
         source.put("OPENAI_API_KEY", "must-not-cross-shell-boundary");
 
         Map<String, String> captured = ShellProcessEnvironment.capture(
@@ -40,6 +41,7 @@ final class ShellProcessEnvironmentTest {
         assertFalse(captured.get("PATH").contains(File.pathSeparator + "."));
         assertTrue(captured.get("PATHEXT").contains(".EXE"));
         assertTrue(captured.get("PATHEXT").contains(".CMD"));
+        assertTrue(captured.get("PSModuleAnalysisCachePath").endsWith("module-cache"));
         assertFalse(captured.containsKey("OPENAI_API_KEY"));
         assertFalse(captured.toString().contains("must-not-cross-shell-boundary"));
     }

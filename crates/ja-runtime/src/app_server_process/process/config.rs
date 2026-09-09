@@ -71,7 +71,7 @@ impl std::fmt::Debug for SidecarConfig {
 }
 
 /// 只保留平台矩阵验证过的原生 sidecar 环境；`env_clear` 后继续排除凭据、代理和任意
-/// 用户环境。`PATH` 与 `ComSpec` 是 shell/MCP 查找所需的非 secret coding-runtime 输入，
+/// 用户环境。`PATH`、`ComSpec` 与 PowerShell 模块分析缓存是非 secret runtime 输入，
 /// 临时目录别名统一指向 sidecar 已拥有的 run directory，不能继承用户 temp。
 fn default_runtime_environment(run_dir: &Path) -> BTreeMap<OsString, OsString> {
     default_runtime_environment_from(run_dir, |name| std::env::var_os(name))
@@ -89,7 +89,7 @@ where
     let mut environment = BTreeMap::new();
     #[cfg(windows)]
     {
-        for name in ["SystemRoot", "PATH", "ComSpec"] {
+        for name in ["SystemRoot", "PATH", "ComSpec", "PSModuleAnalysisCachePath"] {
             if let Some(value) = lookup(name) {
                 environment.insert(OsString::from(name), value);
             }
@@ -251,8 +251,10 @@ impl SidecarConfig {
             let name = name.to_string_lossy();
             if !allowed_env_name(&name)
                 || contains_secret_marker(&name)
-                || (!matches!(name.as_ref(), "PATH" | "ComSpec")
-                    && contains_secret_marker(&value.to_string_lossy()))
+                || (!matches!(
+                    name.as_ref(),
+                    "PATH" | "ComSpec" | "PSModuleAnalysisCachePath"
+                ) && contains_secret_marker(&value.to_string_lossy()))
             {
                 return Err(AppServerProcessError::InvalidConfig);
             }

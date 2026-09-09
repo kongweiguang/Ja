@@ -33,6 +33,8 @@ final class ShellProcessEnvironment {
     /**
      * 仅从显式白名单构造平台环境；Windows 缺少 PATHEXT 时补标准可执行扩展，修复
      * `env_clear` sidecar 中 PowerShell 无法解析 extensionless `.exe/.cmd` 的问题。
+     * 模块分析缓存路径是非敏感运行输入；丢弃预热缓存会让大型 Windows 环境的首个 cmdlet
+     * 同步扫描模块集合，远超 Shell 的正常交互预算。
      */
     static Map<String, String> capture(ShellProfile.OperatingSystem os,
                                        Function<String, String> lookup) {
@@ -45,6 +47,7 @@ final class ShellProcessEnvironment {
             put(result, "ComSpec", commandProcessor(lookup.apply("ComSpec"), systemRoot));
             put(result, "TEMP", safePathValue(lookup.apply("TEMP")));
             put(result, "TMP", safePathValue(lookup.apply("TMP")));
+            put(result, "PSModuleAnalysisCachePath", safePathValue(lookup.apply("PSModuleAnalysisCachePath")));
             put(result, "PATH", windowsPath(lookup.apply("PATH"), systemRoot));
             result.put("PATHEXT", windowsPathExtensions(lookup.apply("PATHEXT")));
         } else {
@@ -64,7 +67,7 @@ final class ShellProcessEnvironment {
         Objects.requireNonNull(os, "os");
         environment = Objects.requireNonNull(environment, "environment");
         Set<String> allowed = os == ShellProfile.OperatingSystem.WINDOWS
-                ? Set.of("SystemRoot", "ComSpec", "TEMP", "TMP", "PATH", "PATHEXT")
+                ? Set.of("SystemRoot", "ComSpec", "TEMP", "TMP", "PATH", "PATHEXT", "PSModuleAnalysisCachePath")
                 : Set.of("HOME", "TMPDIR", "PATH", "LANG", "LC_ALL");
         LinkedHashMap<String, String> copy = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : environment.entrySet()) {

@@ -44,6 +44,10 @@ fn default_runtime_environment_is_narrow() {
             OsString::from("C:\\Windows\\System32\\cmd.exe"),
         ),
         (
+            "PSModuleAnalysisCachePath".to_owned(),
+            OsString::from("C:\\PSModuleAnalysisCachePath\\ModuleAnalysisCache"),
+        ),
+        (
             "OPENAI_API_KEY".to_owned(),
             OsString::from("should-not-cross"),
         ),
@@ -61,8 +65,13 @@ fn default_runtime_environment_is_narrow() {
     #[cfg(windows)]
     assert!(names.iter().all(|name| matches!(
         name.as_str(),
-        "SystemRoot" | "PATH" | "ComSpec" | "TEMP" | "TMP"
+        "SystemRoot" | "PATH" | "ComSpec" | "TEMP" | "TMP" | "PSModuleAnalysisCachePath"
     )));
+    #[cfg(windows)]
+    assert_eq!(
+        environment.get(OsStr::new("PSModuleAnalysisCachePath")),
+        Some(&OsString::from("C:\\PSModuleAnalysisCachePath\\ModuleAnalysisCache"))
+    );
     #[cfg(windows)]
     assert_eq!(
         environment.get(OsStr::new("PATH")),

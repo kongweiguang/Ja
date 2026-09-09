@@ -52,6 +52,7 @@ pub(crate) fn allowed_env_name(name: &str) -> bool {
             | "SystemRoot"
             | "PATH"
             | "ComSpec"
+            | "PSModuleAnalysisCachePath"
             | "SystemDrive"
             | "WINDIR"
             | "TEMP"
