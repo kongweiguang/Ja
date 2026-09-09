@@ -67,7 +67,7 @@ concurrency:
 jobs:
   fast-verification:
     name: Contracts and workspace verification
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
       - name: Checkout exact event commit
@@ -213,7 +213,7 @@ jobs:
             targetTriple: x86_64-pc-windows-msvc
             tauriBundle: nsis
             bundleExtension: .exe
-            runner: windows-2022
+            runner: windows-2025
             nikSuffix: windows-amd64
             nikSha256: 8F8DBA29A26B0436C8A8A599F9C1A9C46929C417790C85788C2CD99DAF212B7A
           - platform: macos
