@@ -100,6 +100,11 @@ final class WindowsProcessNativeApi implements AutoCloseable {
      */
     static final int CREATE_UNICODE_ENVIRONMENT = 0x0000_0400;
     /**
+     * Tool 标准流全部重定向到管道，不继承宿主控制台；与 JDK ProcessBuilder 的重定向
+     * 路径一致，避免旧版 PowerShell 等待 CI/桌面宿主的控制台状态或弹出额外窗口。
+     */
+    static final int CREATE_NO_WINDOW = 0x0800_0000;
+    /**
      * STARTUPINFOW 启用显式标准句柄的标志。
      */
     static final int STARTF_USESTDHANDLES = 0x0000_0100;
@@ -215,7 +220,8 @@ final class WindowsProcessNativeApi implements AutoCloseable {
     }
 
     /**
-     * 创建可变 UTF-16 命令行并以挂起状态启动，标准流全部绑定到受控管道。
+     * 创建可变 UTF-16 命令行并以挂起状态启动；管道 IO 不附着宿主控制台，
+     * 仍由 Job 接纳后恢复主线程，控制台隔离不能绕过进程树所有权。
      */
     ProcessCreation createSuspended(
             WindowsProcessLaunchPolicy.LaunchSpec spec,
@@ -240,7 +246,7 @@ final class WindowsProcessNativeApi implements AutoCloseable {
             MemorySegment processInformation = arena.allocate(PROCESS_INFORMATION_BYTES, 8);
             NativeCall result = invoke(createProcess, application, commandLine,
                     MemorySegment.NULL, MemorySegment.NULL, 1,
-                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                     environmentBlock, directory, startup, processInformation);
             if ((int) result.value() == 0) {
                 throw new WindowsFailure("create_process", result.error());
