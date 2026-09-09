@@ -24,15 +24,14 @@ final class WindowsShellLaunchProbeTest {
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void comparePipeLaunchEnvironments(@TempDir Path temp) throws Exception {
-        List<String> basic = List.of("SystemRoot", "PATH");
         List<String> runtime = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP");
-        List<String> profile = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP",
-                "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH",
-                "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432");
-        for (List<String> names : List.of(basic, runtime, profile)) {
+        List<String> modules = List.of("SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP", "PSModulePath");
+        for (List<String> names : List.of(runtime, modules)) {
             Map<String, String> environment = new LinkedHashMap<>();
             for (String name : names) {
-                String value = System.getenv(name);
+                String value = name.equals("PSModulePath")
+                        ? Path.of(System.getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "Modules").toString()
+                        : System.getenv(name);
                 if (value != null) environment.put(name, value);
             }
             for (boolean nativeLaunch : List.of(false, true)) {
