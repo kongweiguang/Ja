@@ -119,6 +119,12 @@ jobs:
         shell: pwsh
         run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
 
+      - name: Cache Rust verification dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: ". -> src-tauri/target"
+          shared-key: ja-windows-verification
+
       # 功能测试依赖系统 Windows PowerShell；先独立证明 runner 自身可启动它，
       # 并把 .NET/模块首次初始化与 Ja Job Object 行为区分开。
       - name: Verify system Windows PowerShell readiness
@@ -189,7 +195,7 @@ jobs:
 
       - name: Run Python script tests
         shell: pwsh
-        run: uv run --python 3.13 --with 'jsonschema[format]' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar
+        run: uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar
 
       - name: Run PowerShell script tests
         shell: pwsh
@@ -247,6 +253,15 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
+
+      - name: Install uv for the native verifier
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9
+
+      - name: Cache target-specific Rust build dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: ". -> src-tauri/target"
+          shared-key: ja-native-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Verify source commit and native contract (Windows)
         if: matrix.platform == 'windows'
@@ -437,7 +452,7 @@ jobs:
           $mtimeNs = [int64](($artifact.LastWriteTimeUtc.Ticks - $unixEpochTicks) * 100L)
           $smokePath = Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json'
           $smokeArguments = @('-B', 'scripts/native/run-sidecar-smoke.py', '--executable', $artifactPath, '--data-dir', $data, '--output', $smokePath, '--expected-sha256', $sha256, '--expected-size', [string]$artifact.Length, '--expected-mtime-ns', [string]$mtimeNs)
-          & python @smokeArguments
+          & uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python @smokeArguments
           if ($LASTEXITCODE -ne 0) { throw "native sidecar smoke failed with exit code $LASTEXITCODE" }
           $report = Get-Content -LiteralPath $smokePath -Raw | ConvertFrom-Json
           $executableProperty = $report.PSObject.Properties['executable']
@@ -470,7 +485,7 @@ jobs:
             exit 1
           fi
           smoke="$JA_NATIVE_EVIDENCE/smoke.json"
-          python3 -B scripts/native/run-sidecar-smoke.py --executable "$artifact" --data-dir "$data" --output "$smoke" --expected-sha256 "$sha256" --expected-size "$size_bytes" --expected-mtime-ns "$mtime_ns"
+          uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B scripts/native/run-sidecar-smoke.py --executable "$artifact" --data-dir "$data" --output "$smoke" --expected-sha256 "$sha256" --expected-size "$size_bytes" --expected-mtime-ns "$mtime_ns"
           python3 - "$smoke" <<'PY'
           import json
           from pathlib import Path
@@ -486,7 +501,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          python -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.exe.sha256') --platform windows --arch x86_64 --runner windows-2022 --source-commit $env:GITHUB_SHA --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
+          python -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.exe.sha256') --platform windows --arch x86_64 --runner '${{ matrix.runner }}' --source-commit $env:GITHUB_SHA --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
 
       - name: Write checksum and build report (macOS)
         if: matrix.platform == 'macos'
