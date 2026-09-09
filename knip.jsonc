@@ -3,6 +3,7 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
     "apps/desktop/tests/app/e2e/main.tsx",
+    "scripts/docs/capture-readme.mjs",
     // 这些文件是桌面各 capability 的显式公共边界；仓库内未消费的导出仍供 composition/宿主按边界引用。
     "apps/desktop/src/api/protocol/goal.ts",
     "apps/desktop/src/api/protocol/protocol.ts",
@@ -31,6 +32,7 @@
     "apps/desktop/tests/app/e2e/reviewRedesignBrowserFixture.tsx",
     "apps/desktop/tests/app/e2e/smoothReviewBrowserFixture.tsx",
     "apps/desktop/tests/app/e2e/referencePreviewBrowserFixture.tsx",
+    "apps/desktop/tests/app/e2e/readmeBrowserFixture.tsx",
     "apps/desktop/tests/features/navigation/ui/workspaceCornerBrowserFixture.tsx",
   ],
   "project": [

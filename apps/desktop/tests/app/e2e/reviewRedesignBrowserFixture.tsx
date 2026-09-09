@@ -20,40 +20,61 @@ import "@/app/App.css";
 type ReviewFile = NonNullable<ReviewViewModel["state"]["snapshot"]>["files"][number];
 type ReviewFileDiff = NonNullable<ReviewViewModel["state"]["diff"]>;
 
-const FILES: readonly ReviewFile[] = [
-  reviewFile("conflict", "unstaged", "src/runtime/merge.ts", "conflicted", 8, 5),
-  reviewFile("partial-staged", "staged", "src/editor/partially-staged.ts", "modified", 4, 1),
-  reviewFile("partial-unstaged", "unstaged", "src/editor/partially-staged.ts", "modified", 3, 2),
-  reviewFile(
-    "settings",
-    "unstaged",
-    "src/features/settings/panels/AppearancePanel.tsx",
-    "modified",
-    12,
-    6,
-  ),
-  reviewFile("new-test", "untracked", "apps/desktop/tests/review/created.ts", "untracked", 18, 0),
-  reviewFile(
-    "rename",
-    "staged",
-    "crates/ja-runtime/src/review/git_snapshot.rs",
-    "renamed",
-    5,
-    2,
-    "crates/ja-runtime/src/review/snapshot.rs",
-  ),
-  reviewFile("deleted", "staged", "docs/legacy-review.md", "deleted", 0, 27),
-  reviewFile(
-    "binary",
-    "untracked",
-    "assets/review-preview.png",
-    "untracked",
-    null,
-    null,
-    null,
-    true,
-  ),
-];
+// README 只选择小型示例；默认入口继续保留完整回归语料与既有测试断言。
+const README_DEMO = new URLSearchParams(window.location.search).get("demo") === "readme";
+const FILES: readonly ReviewFile[] = README_DEMO
+  ? [
+      reviewFile("home-page", "unstaged", "src/pages/Home.tsx", "modified", 8, 3),
+      reviewFile("home-style", "unstaged", "src/styles/home.css", "modified", 5, 2),
+    ]
+  : [
+      reviewFile("conflict", "unstaged", "src/runtime/merge.ts", "conflicted", 8, 5),
+      reviewFile("partial-staged", "staged", "src/editor/partially-staged.ts", "modified", 4, 1),
+      reviewFile(
+        "partial-unstaged",
+        "unstaged",
+        "src/editor/partially-staged.ts",
+        "modified",
+        3,
+        2,
+      ),
+      reviewFile(
+        "settings",
+        "unstaged",
+        "src/features/settings/panels/AppearancePanel.tsx",
+        "modified",
+        12,
+        6,
+      ),
+      reviewFile(
+        "new-test",
+        "untracked",
+        "apps/desktop/tests/review/created.ts",
+        "untracked",
+        18,
+        0,
+      ),
+      reviewFile(
+        "rename",
+        "staged",
+        "crates/ja-runtime/src/review/git_snapshot.rs",
+        "renamed",
+        5,
+        2,
+        "crates/ja-runtime/src/review/snapshot.rs",
+      ),
+      reviewFile("deleted", "staged", "docs/legacy-review.md", "deleted", 0, 27),
+      reviewFile(
+        "binary",
+        "untracked",
+        "assets/review-preview.png",
+        "untracked",
+        null,
+        null,
+        null,
+        true,
+      ),
+    ];
 
 const SOURCE_OPTIONS: ReviewSource[] = [
   { kind: "uncommitted" },
@@ -190,20 +211,28 @@ function diffFor(file: ReviewFile, source: ReviewSource): ReviewFileDiff {
         kind: "deletion" as const,
         oldLine: line,
         newLine: null,
-        text: "const density = 'comfortable';",
+        text: README_DEMO ? "  const ctaLabel = '开始使用';" : "const density = 'comfortable';",
       };
     if (line === 6)
       return {
         kind: "addition" as const,
         oldLine: null,
         newLine: 5,
-        text: "const density = 'compact';",
+        text: README_DEMO ? "  const ctaLabel = '查看首页';" : "const density = 'compact';",
       };
     return {
       kind: "context" as const,
       oldLine: line > 6 ? line - 1 : line,
       newLine: line > 6 ? line - 1 : line,
-      text: `context line ${line}`,
+      text: !README_DEMO
+        ? `context line ${line}`
+        : line === 2
+          ? "  <h1>让团队更快完成工作</h1>"
+          : line === 3
+            ? "  <p>把想法变成清晰的下一步。</p>"
+            : line === 4
+              ? "  <HeroAction label={ctaLabel} />"
+                : `  <section data-block="${line}" />`,
     };
   });
   return {
@@ -242,7 +271,9 @@ export function ReviewRedesignBrowserFixture() {
   );
   const [source, setSource] = useState<ReviewSource>({ kind: "uncommitted" });
   const [layerFilter, setLayerFilter] = useState<ReviewLayerFilter>("all");
-  const [selectedFileId, setSelectedFileId] = useState("partial-unstaged");
+  const [selectedFileId, setSelectedFileId] = useState(
+    README_DEMO ? "home-page" : "partial-unstaged",
+  );
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<"unified" | "split">("unified");
   const [notice, setNotice] = useState<string>();
