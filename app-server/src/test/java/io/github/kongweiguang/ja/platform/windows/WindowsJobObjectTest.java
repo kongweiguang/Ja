@@ -129,6 +129,7 @@ final class WindowsJobObjectTest {
 
     /** 验证 Job 接纳后的功能退出；冷启动 runner 的系统 PowerShell 可超过 5 秒，保留 20 秒硬上限。 */
     @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void suspendedLauncherRunsSystemPowerShell(@TempDir Path temp) throws Exception {
         Map<String, String> environment = Map.of(
                 "SystemRoot", System.getenv("SystemRoot"),
@@ -138,6 +139,7 @@ final class WindowsJobObjectTest {
                     List.of("powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Milliseconds 100"),
                     temp, environment, job);
             try {
+                process.getOutputStream().close();
                 assertTrue(process.waitFor(20, TimeUnit.SECONDS));
                 assertEquals(0, process.exitValue());
             } finally {
@@ -152,6 +154,7 @@ final class WindowsJobObjectTest {
      * 外层预算包含 JVM 与系统 PowerShell 两次冷启动，不把宿主负载当作 Job 语义失败。
      */
     @Test
+    @Timeout(value = 40, unit = TimeUnit.SECONDS)
     void nestedHostJobAllowsAppServerToLaunchOwnedPowerShell(@TempDir Path temp) throws Exception {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         List<String> command = List.of(

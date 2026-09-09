@@ -22,10 +22,13 @@ import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
 import java.io.RandomAccessFile;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -65,8 +68,9 @@ class BuiltInToolsTest {
     @Test
     void returnsNonLeakingMutationReceiptsWithExplicitModes() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("receipt-workspace"));
+        Path workspaceInput = windowsShortPath(workspace);
         Path target = workspace.resolve("private-receipt.txt");
-        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+        ToolRegistry registry = BuiltInTools.create(workspaceInput, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
 
         AgentTool.ToolResult written = execute(registry, "write", JsonObjects.builder()
@@ -101,6 +105,7 @@ class BuiltInToolsTest {
                     registry.snapshot().stream().filter(tool -> toolName.equals(tool.spec().name())).findFirst()
                             .orElseThrow().sideEffect());
         }
+        assertTrue(written.mutationReceipt().isPresent(), written::toString);
         assertReceipt(written, target, false, "", "secret-before");
         assertReceipt(edited, target, true, "secret-before", "secret-after");
         assertEquals(workspace.toRealPath(), written.mutationReceipt().orElseThrow().confinedWorkspaceRoot());
@@ -116,7 +121,7 @@ class BuiltInToolsTest {
     @EnabledOnOs(OS.WINDOWS)
     void appliesReceiptAcrossNamespacedWorkspaceAndOrdinaryAbsoluteToolPath() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("namespaced-workspace"));
-        Path namespacedWorkspace = Path.of("\\\\?\\" + workspace.toAbsolutePath());
+        Path namespacedWorkspace = Path.of("\\\\?\\" + windowsShortPath(workspace).toAbsolutePath());
         Path target = workspace.resolve(".ja-fixture").resolve("turn-change-review.txt");
         ToolRegistry registry = BuiltInTools.create(namespacedWorkspace, new EmptySkills(), catalog(),
                 shellCapability(), promptSession(), unusedAttachments());
@@ -125,7 +130,7 @@ class BuiltInToolsTest {
                 .putText("path", target.toString()).putText("content", "JA_TURN_CHANGE_REVISION_000").build());
         TurnChangeTracker tracker = TurnChangeTracker.fresh(namespacedWorkspace);
 
-        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome(), result::toString);
         tracker.apply(result.mutationReceipt().orElseThrow());
         TurnChangeTracker.Frozen frozen = tracker.freeze();
         assertEquals(".ja-fixture/turn-change-review.txt", frozen.changeSet().files().getFirst().path());
@@ -361,11 +366,11 @@ class BuiltInToolsTest {
         assertFalse(result.content().contains(sensitivePath));
     }
 
-    /** 收据内容只允许通过专用字段读取，其它公开投影统一验证为脱敏。 */
+    /** 收据只通过专用字段读取；路径比较物理身份，不能把 Windows 短路径的拼写当成泄漏或越界。 */
     private static void assertReceipt(AgentTool.ToolResult result, Path path, boolean beforeExists,
-                                      String before, String after) {
+                                      String before, String after) throws IOException {
         AgentTool.MutationReceipt receipt = result.mutationReceipt().orElseThrow();
-        assertEquals(path.toAbsolutePath().normalize(), receipt.path());
+        assertTrue(Files.isSameFile(path, receipt.path()));
         assertEquals(beforeExists, receipt.beforeExists());
         assertEquals(before, receipt.beforeText());
         assertEquals(after, receipt.afterText());
@@ -424,6 +429,27 @@ class BuiltInToolsTest {
                     "att_fixture", "image.png", 11, "image", "image/png",
                     request.offsetBytes(), 11, true, "base64", "AAEC");
         };
+    }
+
+    /**
+     * Windows 回归必须使用操作系统实际返回的 8.3 alias，避免用字符串拼接伪造路径表示；
+     * 未启用 8.3 命名时跳过该专属夹具，普通路径测试仍覆盖其它平台的行为。
+     */
+    private static Path windowsShortPath(Path path) throws IOException, InterruptedException {
+        if (!System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win")) return path;
+        Process process = new ProcessBuilder("cmd.exe", "/d", "/c",
+                "for %I in (\"" + path.toAbsolutePath() + "\") do @echo %~sI")
+                .redirectErrorStream(true).start();
+        try {
+            assertTrue(process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS), "short path probe timed out");
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            assertEquals(0, process.exitValue());
+            String shortPath = output.lines().findFirst().orElse("").trim();
+            assertFalse(shortPath.isBlank());
+            return Path.of(shortPath);
+        } finally {
+            if (process.isAlive()) process.destroyForcibly();
+        }
     }
 
     /** 使用 Windows 原生 junction 机制，避免 symlink 开发者权限影响 reparse point 回归覆盖。 */

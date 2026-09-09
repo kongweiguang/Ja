@@ -95,6 +95,7 @@ final class ShellToolTest {
 
     /** 用 junction 复现路径策略分歧；20 秒仅给功能探测的系统 Shell 冷启动，超时语义由独立用例验证。 */
     @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void windowsAppsAliasFallsBackToExecutableShell() throws Exception {
         Path aliases = temp.resolve("aliases");
         Process junction = new ProcessBuilder(System.getenv("ComSpec"), "/c", "mklink", "/J",

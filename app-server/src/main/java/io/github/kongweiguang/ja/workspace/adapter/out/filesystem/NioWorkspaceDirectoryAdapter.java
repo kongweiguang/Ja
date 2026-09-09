@@ -72,12 +72,18 @@ public final class NioWorkspaceDirectoryAdapter implements WorkspaceDirectoryPor
     }
 
     /**
-     * 只做绝对规范路径比较，不检查存在性，也不会创建通用目录。
+     * 原始配置路径无需 IO 即可识别；已存在目录再比较物理根，兼容 Windows 8.3 拼写。
+     * 不创建目录，且物理比较沿用链接拒绝策略，防止外部链接冒充通用工作区。
      */
     @Override
     public boolean isGeneralDirectory(Path root) {
-        return Objects.requireNonNull(root, "root").toAbsolutePath().normalize()
-                .equals(generalDirectory);
+        Path normalized = Objects.requireNonNull(root, "root").toAbsolutePath().normalize();
+        if (normalized.equals(generalDirectory)) return true;
+        try {
+            return canonicalDirectory(normalized).equals(canonicalDirectory(generalDirectory));
+        } catch (IOException | WorkspaceFailure unavailable) {
+            return false;
+        }
     }
 
     /**

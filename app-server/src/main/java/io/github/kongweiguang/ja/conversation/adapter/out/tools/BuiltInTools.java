@@ -312,12 +312,38 @@ public final class BuiltInTools {
     private static MutationTarget mutationTarget(Path workspaceRoot, WorkspaceBoundary boundary,
                                                  String rawPath, boolean mustExist) throws IOException {
         Path requested = resolve(workspaceRoot, rawPath);
+        Optional<String> relative = workspaceRelative(workspaceRoot, requested);
+        if (relative.isEmpty()) return new MutationTarget(requested, null, null);
+        String relativePath = relative.orElseThrow();
+        Path admitted = mustExist ? boundary.existing(relativePath) : boundary.target(relativePath);
+        return new MutationTarget(admitted, boundary, relativePath);
+    }
+
+    /**
+     * 把普通盘符、8.3 alias 与 namespaced 绝对路径归并到同一 Workspace 相对身份；
+     * 只比较已存在祖先的文件 identity，避免用字符串前缀误判同一物理目录或放宽外部路径语义。
+     */
+    private static Optional<String> workspaceRelative(Path workspaceRoot, Path requested) throws IOException {
         Path rootIdentity = PathIdentities.normalized(workspaceRoot);
         Path targetIdentity = PathIdentities.normalized(requested);
-        if (!targetIdentity.startsWith(rootIdentity)) return new MutationTarget(requested, null, null);
-        String relative = rootIdentity.relativize(targetIdentity).toString().replace('\\', '/');
-        Path admitted = mustExist ? boundary.existing(relative) : boundary.target(relative);
-        return new MutationTarget(admitted, boundary, relative);
+        if (targetIdentity.startsWith(rootIdentity)) {
+            return Optional.of(rootIdentity.relativize(targetIdentity).toString().replace('\\', '/'));
+        }
+
+        Path physicalRoot = workspaceRoot.toAbsolutePath().normalize().toRealPath();
+        List<String> suffix = new ArrayList<>();
+        Path cursor = targetIdentity;
+        while (cursor != null) {
+            if (Files.exists(cursor, LinkOption.NOFOLLOW_LINKS)
+                    && Files.isSameFile(cursor, physicalRoot)) {
+                return Optional.of(String.join("/", suffix));
+            }
+            Path name = cursor.getFileName();
+            if (name == null) break;
+            suffix.add(0, name.toString());
+            cursor = cursor.getParent();
+        }
+        return Optional.empty();
     }
 
     /**

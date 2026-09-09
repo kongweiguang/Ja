@@ -27,12 +27,14 @@ public final class WorkspaceBoundary {
     public WorkspaceBoundary(Path root) {
         Objects.requireNonNull(root, "root");
         try {
-            this.root = root.toAbsolutePath().normalize();
-            if (!Files.isDirectory(this.root, LinkOption.NOFOLLOW_LINKS)) {
+            Path normalizedRoot = root.toAbsolutePath().normalize();
+            if (!Files.isDirectory(normalizedRoot, LinkOption.NOFOLLOW_LINKS)) {
                 throw new IOException("workspace_root_unavailable");
             }
-            rejectLinkOrReparse(this.root);
-            this.physicalRoot = this.root.toRealPath();
+            rejectLinkOrReparse(normalizedRoot);
+            Path canonicalRoot = normalizedRoot.toRealPath();
+            this.root = canonicalRoot;
+            this.physicalRoot = canonicalRoot;
         } catch (IOException failure) {
             throw new IllegalArgumentException("workspace_root_invalid", failure);
         }
@@ -79,7 +81,7 @@ public final class WorkspaceBoundary {
      */
     public void revalidateParent(Path target) throws IOException {
         Path lexicalTarget = Objects.requireNonNull(target, "target").toAbsolutePath().normalize();
-        if (!lexicalTarget.startsWith(root)) {
+        if (!hasPhysicalAncestor(lexicalTarget)) {
             throw new SecurityException("workspace_escape");
         }
         rejectLinksAndReparse(lexicalTarget);
@@ -211,7 +213,7 @@ public final class WorkspaceBoundary {
      */
     private Path admitExisting(Path path) throws IOException {
         Path lexicalPath = Objects.requireNonNull(path, "path").toAbsolutePath().normalize();
-        if (!lexicalPath.startsWith(root) && !lexicalPath.startsWith(physicalRoot)) {
+        if (!hasPhysicalAncestor(lexicalPath)) {
             throw new SecurityException("workspace_escape");
         }
         rejectLinksAndReparse(lexicalPath);
@@ -244,15 +246,32 @@ public final class WorkspaceBoundary {
      */
     private void rejectLinksAndReparse(Path candidate) throws IOException {
         Path cursor = candidate;
-        while (cursor != null && cursor.startsWith(root)) {
+        while (cursor != null) {
             if (Files.exists(cursor, LinkOption.NOFOLLOW_LINKS)) {
                 rejectLinkOrReparse(cursor);
-            }
-            if (cursor.equals(root)) {
-                return;
+                if (isPhysicalRoot(cursor)) return;
             }
             cursor = cursor.getParent();
         }
+    }
+
+    /**
+     * 比较已存在祖先的物理 identity，供逐分量 link/reparse 检查在长路径、8.3 alias 和 namespace
+     * 混用时确定停止边界；不存在的叶子只向上寻找真实父目录，不把目标创建前误判为 IO 失败。
+     */
+    private boolean hasPhysicalAncestor(Path candidate) throws IOException {
+        for (Path cursor = candidate; cursor != null; cursor = cursor.getParent()) {
+            if (Files.exists(cursor, LinkOption.NOFOLLOW_LINKS) && isPhysicalRoot(cursor)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 根 identity 同时支持路径文本相等和 Windows provider 的 fileKey/物理比较，避免 alias 误判。
+     */
+    private boolean isPhysicalRoot(Path candidate) throws IOException {
+        return candidate.equals(root) || candidate.equals(physicalRoot)
+                || Files.isSameFile(candidate, physicalRoot);
     }
 
     /**
@@ -272,12 +291,14 @@ public final class WorkspaceBoundary {
     }
 
     /**
-     * 集中物理包含检查，使读取与提交采用完全相同的语义。
+     * 集中物理包含检查，使读取与提交采用完全相同的语义；Windows 8.3 alias、长路径与
+     * namespaced 路径的文本可能不同，因此前缀不命中时必须回到文件系统 identity 判断，
+     * 不能把同一物理祖先误报成 Workspace 外路径。
      */
-    private void requireContained(Path path) {
-        if (!path.startsWith(physicalRoot)) {
-            throw new SecurityException("workspace_physical_escape");
-        }
+    private void requireContained(Path path) throws IOException {
+        Path candidate = Objects.requireNonNull(path, "path").toAbsolutePath().normalize();
+        if (candidate.startsWith(physicalRoot) || hasPhysicalAncestor(candidate)) return;
+        throw new SecurityException("workspace_physical_escape");
     }
 
     /**
