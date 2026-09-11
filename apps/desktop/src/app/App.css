@@ -618,35 +618,72 @@ button {
 }
 
 .ja-toaster {
+  --ja-titlebar-height: 36px;
+  width: min(356px, calc(100vw - 1.5rem));
+  max-width: calc(100vw - 1.5rem);
   z-index: 1000;
 }
-.ja-toaster [data-sonner-toast] {
+.ja-toaster[data-sonner-toaster] [data-sonner-toast] {
+  width: min(356px, calc(100vw - 1.5rem));
+  max-width: 100%;
+  min-height: 2.75rem;
+  padding: 0.72rem 2.85rem 0.72rem 0.9rem;
   border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-lg);
   color: var(--ja-foreground);
   background: color-mix(in srgb, var(--ja-surface-elevated, var(--ja-surface)) 94%, transparent);
   box-shadow: var(--ja-shadow-floating);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
   backdrop-filter: blur(18px) saturate(1.15);
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
 }
-.ja-toaster [data-description] {
+.ja-toaster[data-sonner-toaster] [data-description] {
   color: var(--ja-foreground-muted);
 }
-.ja-toaster [data-close-button] {
-  border-color: var(--ja-border);
+.ja-toaster[data-sonner-toaster] [data-sonner-toast][data-styled="true"] [data-close-button] {
+  top: 0.5rem;
+  right: 0.5rem;
+  left: auto;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border: 1px solid var(--ja-border);
+  border-radius: 50%;
   color: var(--ja-foreground-muted);
-  background: var(--ja-control);
+  background: var(--ja-surface-muted);
+  transform: none;
+}
+.ja-toaster[data-sonner-toaster] [data-sonner-toast][data-styled="true"] [data-close-button]:hover {
+  border-color: var(--ja-border-strong);
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
 }
 
 /* 模糊不可用或用户降低透明度时改用不透明语义表面，保证通知文字对比度且避免 GPU 模糊开销。 */
 @supports not (backdrop-filter: blur(1px)) {
-  .ja-toaster [data-sonner-toast] {
+  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
     background: var(--ja-surface-elevated, var(--ja-surface));
   }
 }
 
 @media (prefers-reduced-transparency: reduce) {
-  .ja-toaster [data-sonner-toast] {
+  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
     background: var(--ja-surface-elevated, var(--ja-surface));
     backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .ja-toaster[data-sonner-toaster] {
+    width: calc(100vw - 1rem);
+    max-width: calc(100vw - 1rem);
+  }
+  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
+    width: 100%;
+    max-width: 100%;
+    padding-inline-end: 2.75rem;
   }
 }
 
@@ -711,7 +748,7 @@ button {
   .ja-conversation-empty-icon {
     filter: none;
   }
-  .ja-toaster [data-sonner-toast] {
+  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
     border: 1px solid CanvasText;
     background: Canvas;
     backdrop-filter: none;

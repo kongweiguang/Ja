@@ -509,7 +509,12 @@ describe("NavigationSidebar", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("img", { name: "正在回复" }));
+    const spinner = screen.getByRole("img", { name: "正在回复" });
+    const threadButton = screen.getByRole("button", { name: "修复导航" });
+    expect(spinner.closest(".ja-navigation-thread")).toBe(threadButton);
+    expect(spinner).toHaveClass("ja-navigation-thread-state", "is-running");
+
+    fireEvent.click(spinner);
 
     expect(onSelectConversation).toHaveBeenCalledWith(thread.threadId);
   });

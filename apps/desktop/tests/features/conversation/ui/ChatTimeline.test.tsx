@@ -1185,6 +1185,29 @@ describe("ChatTimeline", () => {
     expect(onPrepareRetry).toHaveBeenCalledWith(turnId, "继续完成剩余工作");
   });
 
+  /** 摘要失败是上下文准备阶段的独立故障，不能沿用模型服务不可用的错误归因。 */
+  it("将上下文摘要失败解释为上下文准备问题", () => {
+    render(
+      <ChatTimeline
+        turns={[
+          {
+            turnId,
+            threadId: "thr_one",
+            status: "failed",
+            error: { code: "SUMMARY_FAILURE", retryable: true },
+          },
+        ]}
+        items={[baseItem({ itemId: "item_summary_failed", status: "failed" })]}
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("上下文摘要生成失败");
+    expect(alert).toHaveTextContent("请缩短当前对话");
+    expect(alert).toHaveTextContent("SUMMARY_FAILURE");
+    expect(alert).not.toHaveTextContent("模型服务暂时不可用");
+  });
+
   it("将预算耗尽解释为未完成并给出调整范围后的恢复路径", () => {
     render(
       <ChatTimeline

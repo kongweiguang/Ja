@@ -196,6 +196,11 @@ function turnFailurePresentation(
         summary: "模型服务暂时不可用，这次请求已经停止。",
         recovery: "请稍后重新编辑并发送上一条消息。",
       };
+    case "SUMMARY_FAILURE":
+      return {
+        summary: "上下文摘要生成失败，本轮回复已经停止。",
+        recovery: "请缩短当前对话后重新编辑并发送；若仍然失败，请新建会话。",
+      };
     case "MODEL_PROTOCOL_ERROR":
       return {
         summary: "模型响应格式有误或不完整，本轮未能完成。",

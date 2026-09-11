@@ -45,7 +45,19 @@ function JaToaster(): ReactElement {
     <Toaster
       className="ja-toaster"
       theme={theme}
-      position="bottom-right"
+      position="top-right"
+      offset={{
+        top: "calc(var(--ja-titlebar-height, 36px) + 0.75rem + env(safe-area-inset-top, 0px))",
+        right: "0.75rem",
+        bottom: "0.75rem",
+        left: "0.75rem",
+      }}
+      mobileOffset={{
+        top: "calc(var(--ja-titlebar-height, 36px) + 0.5rem + env(safe-area-inset-top, 0px))",
+        right: "0.5rem",
+        bottom: "0.5rem",
+        left: "0.5rem",
+      }}
       visibleToasts={4}
       closeButton
     />

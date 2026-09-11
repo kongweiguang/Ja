@@ -217,6 +217,8 @@
 /* 失败是独立终态而不是 Final Answer；用单一克制面板组织结论、恢复路径和诊断码。 */
 .ja-chat-failure {
   display: grid;
+  min-width: 0;
+  max-width: 100%;
   gap: 0.38rem;
   margin-top: 0.25rem;
   padding: 0.68rem 0.75rem;
@@ -227,6 +229,7 @@
 
 .ja-chat-failure__heading {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 0.42rem;
   color: var(--ja-danger);
@@ -238,6 +241,11 @@
   width: 0.9rem;
   height: 0.9rem;
   flex: 0 0 auto;
+}
+
+.ja-chat-failure__heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .ja-chat-failure__completion,
@@ -1290,6 +1298,15 @@
 @media (max-width: 640px) {
   .ja-chat-message-user {
     max-width: 90%;
+  }
+  .ja-chat-failure {
+    padding: 0.62rem;
+  }
+  .ja-chat-failure__actions {
+    align-items: flex-start;
+  }
+  .ja-chat-failure__actions > span {
+    max-width: 100%;
   }
   .ja-turn-changes__header {
     grid-template-columns: auto minmax(0, 1fr) auto;

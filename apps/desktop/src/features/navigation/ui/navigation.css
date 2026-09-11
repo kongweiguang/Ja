@@ -311,7 +311,8 @@
 
 .ja-navigation-thread-row {
   position: relative;
-  display: block;
+  display: grid;
+  min-height: 2.16rem;
   align-items: center;
   border-radius: var(--ja-radius-selection);
   background: transparent;
@@ -330,9 +331,10 @@
 }
 
 .ja-navigation-thread {
-  display: block;
+  display: flex;
   width: 100%;
   min-height: 2.16rem;
+  align-items: center;
   padding: 0 5.5rem 0 0.58rem;
   border: 0;
   border-radius: inherit;
@@ -437,8 +439,10 @@
   font-weight: var(--ja-weight-semibold);
 }
 
-.ja-navigation-thread > span {
+.ja-navigation-thread > span:first-child {
   display: block;
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
