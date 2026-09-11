@@ -8,12 +8,15 @@
  * MCP、ACL、恢复与 Native Image 能力必须继续由生产可执行文件证明，不能在这里伪造绿色证据。
  */
 
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import process from "node:process";
 import { createInterface } from "node:readline";
 
 const readyToken = "0123456789abcdef0123456789abcdef";
 const occurredAt = "2026-08-29T00:00:00Z";
+const productVersion = JSON.parse(
+  readFileSync("package.json", "utf8"),
+).version;
 const serverInstanceId = "srv_native_fixture";
 const workspaceId = "ws_native_fixture";
 const threadId = "thr_native_fixture";
@@ -123,7 +126,7 @@ function initializeResult() {
     protocolMajor: 1,
     protocolMinor: 0,
     serverInstanceId,
-    runtime: { engine: "ja-kernel", engineVersion: "0.1.1" },
+    runtime: { engine: "ja-kernel", engineVersion: productVersion },
     capabilities: {
       methods,
       events,

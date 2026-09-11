@@ -399,6 +399,7 @@ export function buildDesktopEnvironment({ evidenceDirectory, sidecarManifest, si
  * 目的是在产品链路尚未完成时返回 blocked，而不是让通用桌面路径制造伪阳性。
  */
 export async function findMissingIntegrationHooks(root = repoRoot, desktopRunner) {
+  const productVersion = JSON.parse(await readFile(join(root, "package.json"), "utf8")).version;
   const checks = [
     {
       path: desktopRunner ?? join(root, "scripts", "e2e", "windows-desktop-smoke.mjs"),
@@ -458,7 +459,7 @@ export async function findMissingIntegrationHooks(root = repoRoot, desktopRunner
     {
       path: join(root, "contracts", "golden", "v1", "valid", "core.jsonl"),
       label: "initialize-1.0-fixture",
-      tokens: ['"protocolMinor":0', '"engineVersion":"0.1.1"', "turn/change-set/read"],
+      tokens: ['"protocolMinor":0', `"engineVersion":"${productVersion}"`, "turn/change-set/read"],
       forbiddenTokens: ["turn_change_preview_v1", "turn/change-preview"],
     },
   ];
