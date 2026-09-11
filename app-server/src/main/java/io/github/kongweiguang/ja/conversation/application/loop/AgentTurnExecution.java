@@ -595,12 +595,7 @@ final class AgentTurnExecution {
             throw failure;
         } catch (ContextException failure) {
             String code =
-                    switch (failure.code()) {
-                        case CONTEXT_LIMIT -> "CONTEXT_LIMIT";
-                        case CAS_CONFLICT -> "CONFLICT";
-                        case SUMMARY_FAILURE -> "MODEL_UNAVAILABLE";
-                        case INVALID_STATE -> "INTERNAL_ERROR";
-                    };
+                    contextFailureCode(failure);
             return terminal(
                     request,
                     sink,
@@ -616,7 +611,7 @@ final class AgentTurnExecution {
                     currentUsageDurability == UsageDurability.NOT_COMMITTED,
                     usageCursor.latest,
                     code,
-                    "context preparation failed");
+                    contextFailureMessage(code));
         } catch (AgentLoop.LoopFailure failure) {
             return terminal(
                     request,
@@ -1383,6 +1378,7 @@ final class AgentTurnExecution {
     /** 优先保留领域稳定码，其余异常统一为内部失败且不暴露 message。 */
     private static String failureCode(RuntimeException failure) {
         if (failure instanceof AgentLoop.LoopFailure loopFailure) return loopFailure.code();
+        if (failure instanceof ContextException context) return contextFailureCode(context);
         if (failure instanceof ModelPort.ModelUnavailableException unavailable) {
             return unavailable.terminalErrorCode();
         }
@@ -1392,6 +1388,45 @@ final class AgentTurnExecution {
         if (failure instanceof TerminalCoordinator.CommitFailure) return "TERMINAL_COMMIT_FAILED";
         if (failure instanceof TerminalCoordinator.ProjectionFailure) return "TERMINAL_PROJECTION_FAILED";
         return "INTERNAL_ERROR";
+    }
+
+    /**
+     * 将上下文领域码投影为终态稳定码；摘要失败只有在异常链明确包含 Provider 不可用时
+     * 才恢复 Provider 语义，其余摘要故障保持 SUMMARY_FAILURE，避免容量、校验或摘要协议
+     * 错误被误导为外部服务不可用。
+     */
+    static String contextFailureCode(ContextException failure) {
+        Objects.requireNonNull(failure, "failure");
+        ModelPort.ModelUnavailableException unavailable = modelUnavailableCause(failure);
+        if (unavailable != null) return unavailable.terminalErrorCode();
+        return switch (failure.code()) {
+            case CONTEXT_LIMIT -> "CONTEXT_LIMIT";
+            case CAS_CONFLICT -> "CONFLICT";
+            case SUMMARY_FAILURE -> "SUMMARY_FAILURE";
+            case INVALID_STATE -> "INTERNAL_ERROR";
+        };
+    }
+
+    /** 返回受限异常链中的 Provider 故障根因，防止摘要包装层吞掉真实外部失败语义。 */
+    private static ModelPort.ModelUnavailableException modelUnavailableCause(Throwable failure) {
+        Throwable current = failure;
+        java.util.Set<Throwable> visited = java.util.Collections.newSetFromMap(
+                new java.util.IdentityHashMap<>());
+        for (int depth = 0; current != null && depth < 16 && visited.add(current); depth++) {
+            if (current instanceof ModelPort.ModelUnavailableException unavailable) return unavailable;
+            current = current.getCause();
+        }
+        return null;
+    }
+
+    /** 为上下文终态选择稳定脱敏文案，保持 Provider、摘要和预算失败的用户语义一致。 */
+    private static String contextFailureMessage(String code) {
+        return switch (code) {
+            case "MODEL_UNAVAILABLE" -> "model provider is unavailable";
+            case "MODEL_PROTOCOL_ERROR" -> "model provider rejected the request";
+            case "SUMMARY_FAILURE" -> "context summary generation failed";
+            default -> "context preparation failed";
+        };
     }
 
     /** 仅按稳定错误码识别期限耗尽，避免解析供应商或异常正文。 */

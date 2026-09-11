@@ -27,6 +27,8 @@ public final class TerminalFailureReplyPolicy {
                     "本轮未能完成：运行超过了本轮截止时间。Ja 已停止继续执行工具并保存失败状态，你可以稍后重新编辑原问题后再试。"),
             Map.entry("CONTEXT_LIMIT",
                     "本轮未能完成：当前对话上下文超过了可安全处理的范围。Ja 已保存失败状态，你可以压缩上下文或新建对话后重试。"),
+            Map.entry("SUMMARY_FAILURE",
+                    "本轮未能完成：对话摘要生成失败。Ja 已保存失败状态，你可以重新编辑原问题或新建对话后再试。"),
             Map.entry("CONFLICT",
                     "本轮未能完成：对话状态在运行期间发生了冲突。Ja 已停止本轮并保存失败状态，请刷新对话后重新编辑原问题。"),
             Map.entry("INVALID_STATE",

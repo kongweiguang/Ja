@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.conversation.application.context.ContextPolicy;
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointUsage;
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile;
+import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 
 import java.time.Clock;
 import java.util.List;
@@ -95,7 +96,21 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
                 accepted++;
             }
             if (chunk.isEmpty()) {
-                throw failure("a complete summary Turn exceeded the provider input window", null);
+                if (progress.stage() != SummaryOperation.Stage.CANDIDATE) {
+                    throw failure("a pending summary substep cannot be bypassed for an oversized Turn", null);
+                }
+                List<ContextMessage> oversizedTurn = turns.get(cursor);
+                SummaryDocument fallback = deterministicOversizedTurnFallback(
+                        chunkRequest(request, rolling, oversizedTurn), outputBudget, rolling, oversizedTurn);
+                int nextCursor = cursor + 1;
+                SummaryOperation.Progress acceptedProgress = SummaryOperation.Progress.candidate(
+                        fallback, usage, nextCursor, oversizedTurn.getLast().ordinal(), planFingerprint);
+                /* 仅在 ledger 已通过同一摘要验证器后推进；Provider 没有结果，因此不伪造用量。 */
+                operation.advance(acceptedProgress);
+                rolling = fallback;
+                cursor = nextCursor;
+                progress = acceptedProgress;
+                continue;
             }
             SummaryResult generated = generateChunk(chunkRequest(request, rolling, chunk),
                     outputBudget, inputCeiling, planFingerprint, accepted,
@@ -107,6 +122,22 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
                     rolling, usage, cursor, chunk.getLast().ordinal(), planFingerprint);
         }
         return new SummaryResult(rolling, usage);
+    }
+
+    /**
+     * 对无法完整放入摘要模型窗口的 Turn 只保留确定性关键证据；缺少用户或失败 Tool 证据时
+     * 仍失败关闭，避免用空摘要伪造已处理事实。该分支不发送 Provider 请求，但通过 Operation
+     * 游标持久推进，保证重启不会重复尝试同一必然超窗的 Turn。
+     */
+    private SummaryDocument deterministicOversizedTurnFallback(
+            SummaryRequest request, int outputBudget, SummaryDocument previous,
+            List<ContextMessage> oversizedTurn) {
+        SummaryDocument fallback = SummaryDocument.evidenceLedger(previous, oversizedTurn);
+        SummaryResult result = new SummaryResult(fallback, CheckpointUsage.none());
+        if (!validateResult(request, result, outputBudget).isEmpty()) {
+            throw failure("oversized summary Turn has no safe evidence ledger", null);
+        }
+        return fallback;
     }
 
     /** 自动 Summary 步骤提交后，checkpoint 使用 Operation 返回的最新 Thread revision。 */
@@ -241,6 +272,9 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
             estimate = current.estimateInputTokens(prompt);
         } catch (java.util.concurrent.CancellationException cancelled) {
             throw cancelled;
+        } catch (ModelPort.ModelUnavailableException unavailable) {
+            /* Provider 身份故障必须保留给上层，不能被误报成 Ja 摘要逻辑失败。 */
+            throw unavailable;
         } catch (RuntimeException unavailable) {
             throw failure("summary input token count is unavailable", unavailable);
         }

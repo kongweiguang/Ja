@@ -75,6 +75,110 @@ final class ModelSummaryGeneratorTest {
         assertFalse(invoked.get());
     }
 
+    /** 完整 Turn 超过摘要窗口时只写入关键 evidence ledger，并持久推进游标而不发送摘要请求。 */
+    @Test
+    void oversizedCompleteTurnFallsBackToEvidenceLedgerAndAdvancesOperation() {
+        AtomicBoolean summarized = new AtomicBoolean();
+        AtomicReference<ModelSummaryGenerator.SummaryOperation.Progress> persisted = new AtomicReference<>();
+        SummaryModel oversized = new SummaryModel() {
+            /** 固定报告超窗，确保回退分支只由确定性容量边界触发。 */
+            @Override
+            public ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
+                return new ModelPort.InputTokenEstimate(10_000, "8".repeat(64));
+            }
+
+            /** 该测试若进入模型摘要即失败，证明超窗 Turn 没有 Provider 副作用。 */
+            @Override
+            public SummaryGenerator.SummaryResult summarize(SummaryPrompt prompt) {
+                summarized.set(true);
+                throw new AssertionError("oversized Turn must use deterministic evidence ledger");
+            }
+        };
+        List<ContextMessage> messages = List.of(
+                ContextMessage.text("message-1", "turn-1", 1, ContextMessage.Role.USER,
+                        "retain this request", 1),
+                new ContextMessage("message-2", "turn-1", 2, ContextMessage.Role.TOOL,
+                        List.of(new ContextMessage.ToolResultBlock("call-1", "read",
+                                ContextMessage.ToolOutput.full("", "artifact://tool/1", 1,
+                                        "read failed"))), 1));
+        SummaryGenerator.SummaryRequest request = new SummaryGenerator.SummaryRequest(
+                "thread-1", Optional.empty(), messages, Optional.empty(), "strategy-test",
+                ContextBudget.capabilities(8_000, 1_000, true));
+
+        SummaryGenerator.SummaryResult result = new ModelSummaryGenerator(
+                oversized, BINDING, CLOCK, ModelSummaryGenerator.Limits.defaults(),
+                operation(persisted, null)).generate(request);
+
+        assertFalse(summarized.get());
+        assertEquals(1, persisted.get().nextTurn());
+        assertEquals(2L, persisted.get().throughOrdinal());
+        assertEquals(CheckpointUsage.none(), persisted.get().usage());
+        assertEquals(List.of("user: retain this request", "Tool read failed; artifact=artifact://tool/1"),
+                result.document().criticalFacts().stream().map(SummaryDocument.Fact::text).toList());
+    }
+
+    /** 超窗 Turn 没有可恢复用户或失败 Tool 证据时保持无 checkpoint 失败，不伪造已处理游标。 */
+    @Test
+    void oversizedTurnWithoutCriticalEvidenceFailsWithoutAdvancingOperation() {
+        AtomicBoolean summarized = new AtomicBoolean();
+        AtomicReference<ModelSummaryGenerator.SummaryOperation.Progress> persisted = new AtomicReference<>();
+        SummaryModel oversized = new SummaryModel() {
+            /** 固定报告超窗，触发确定性回退的 fail-closed 验证。 */
+            @Override
+            public ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
+                return new ModelPort.InputTokenEstimate(10_000, "9".repeat(64));
+            }
+
+            /** 普通助手事实不应触发 Provider 摘要调用。 */
+            @Override
+            public SummaryGenerator.SummaryResult summarize(SummaryPrompt prompt) {
+                summarized.set(true);
+                throw new AssertionError("summary Provider must not receive oversized Turn");
+            }
+        };
+        SummaryGenerator.SummaryRequest request = new SummaryGenerator.SummaryRequest(
+                "thread-1", Optional.empty(),
+                List.of(ContextMessage.text("message-1", "turn-1", 1,
+                        ContextMessage.Role.ASSISTANT, "ordinary assistant text", 1)),
+                Optional.empty(), "strategy-test", ContextBudget.capabilities(8_000, 1_000, true));
+
+        ContextException failure = assertThrows(ContextException.class, () -> new ModelSummaryGenerator(
+                oversized, BINDING, CLOCK, ModelSummaryGenerator.Limits.defaults(),
+                operation(persisted, null)).generate(request));
+
+        assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
+        assertFalse(summarized.get());
+        assertEquals(0, persisted.get().nextTurn());
+        assertEquals(CheckpointUsage.none(), persisted.get().usage());
+    }
+
+    /** 摘要计量阶段的真实 Provider 不可用必须原样上抛，供执行层恢复 MODEL_UNAVAILABLE 语义。 */
+    @Test
+    void providerUnavailableDuringSummaryMeasurementRemainsProviderFailure() {
+        ModelPort.ModelUnavailableException unavailable =
+                new ModelPort.ModelUnavailableException("provider unavailable", null);
+        SummaryModel model = new SummaryModel() {
+            /** 模拟摘要模型的 Provider 能力查询失败。 */
+            @Override
+            public ModelPort.InputTokenEstimate estimateInputTokens(SummaryPrompt prompt) {
+                throw unavailable;
+            }
+
+            /** 计量失败时不得进入摘要发送阶段。 */
+            @Override
+            public SummaryGenerator.SummaryResult summarize(SummaryPrompt prompt) {
+                throw new AssertionError("summary must not be sent after unavailable measurement");
+            }
+        };
+
+        ModelPort.ModelUnavailableException failure = assertThrows(
+                ModelPort.ModelUnavailableException.class,
+                () -> new ModelSummaryGenerator(model, BINDING, CLOCK).generate(request(message(100))));
+
+        assertEquals("MODEL_UNAVAILABLE", failure.terminalErrorCode());
+        assertEquals(unavailable, failure);
+    }
+
     /** 首次空摘要只允许一次带违规码的修复，并接受满足证据覆盖的修复结果。 */
     @Test
     void repairsInvalidDocumentOnce() {

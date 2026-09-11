@@ -19,7 +19,7 @@ final class TerminalFailureReplyPolicyTest {
     void coversKnownTerminalFailureCategories() {
         List<String> codes = List.of(
                 "MODEL_UNAVAILABLE", "MODEL_PROTOCOL_ERROR", "BUDGET_EXCEEDED",
-                "REQUEST_DEADLINE_EXCEEDED", "CONTEXT_LIMIT", "CONFLICT", "INVALID_STATE",
+                "REQUEST_DEADLINE_EXCEEDED", "CONTEXT_LIMIT", "SUMMARY_FAILURE", "CONFLICT", "INVALID_STATE",
                 "THREAD_BUSY", "APPROVAL_EXPIRED", "MCP_SERVER_UNAVAILABLE", "INTERNAL_ERROR");
 
         for (String code : codes) {
@@ -28,6 +28,17 @@ final class TerminalFailureReplyPolicyTest {
             assertTrue(reply.length() <= 512, code);
             assertTrue(reply.contains("本轮未能完成"), code);
         }
+    }
+
+    /** 摘要失败必须使用专门的可恢复文案，不能退回会误导用户的通用内部错误提示。 */
+    @Test
+    void summaryFailureUsesDedicatedRecoveryReply() {
+        String summaryFailure = policy.replyFor("SUMMARY_FAILURE");
+        String fallback = policy.replyFor("INTERNAL_ERROR");
+
+        assertTrue(summaryFailure.contains("对话摘要生成失败"));
+        assertTrue(summaryFailure.contains("重新编辑原问题"));
+        assertFalse(summaryFailure.equals(fallback));
     }
 
     /** 未知或缺失错误码必须安全降级到同一固定正文，不能把动态错误内容反射给用户。 */

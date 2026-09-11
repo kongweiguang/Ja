@@ -3,6 +3,8 @@
 
 package io.github.kongweiguang.ja.conversation.application.loop;
 
+import io.github.kongweiguang.ja.conversation.application.context.ContextException;
+import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -41,5 +43,18 @@ final class AgentTurnExecutionDiagnosticTest {
         });
 
         assertEquals("UNKNOWN", AgentTurnExecution.internalFailureOrigin(failure));
+    }
+
+    /** 普通摘要失败必须保留 SUMMARY_FAILURE，只有明确的 Provider 根因才映射外部不可用。 */
+    @Test
+    void preservesSummaryFailureAndProviderUnavailableSemantics() {
+        ContextException summaryFailure = new ContextException(
+                ContextException.Code.SUMMARY_FAILURE, "summary failed");
+        ContextException wrappedUnavailable = new ContextException(
+                ContextException.Code.SUMMARY_FAILURE, "summary failed",
+                new ModelPort.ModelUnavailableException("provider unavailable", null));
+
+        assertEquals("SUMMARY_FAILURE", AgentTurnExecution.contextFailureCode(summaryFailure));
+        assertEquals("MODEL_UNAVAILABLE", AgentTurnExecution.contextFailureCode(wrappedUnavailable));
     }
 }
