@@ -9,10 +9,12 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderReasoningSupport;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
@@ -52,19 +54,25 @@ final class OpenAiResponsesCodec {
 
     /**
      * 将稳定 Ja 请求映射为冻结的 Responses wire contract；每轮携带完整原生条目历史，避免把
-     * Tool 续传正确性交给网关侧 response 存储和 call-id 关联状态。
+     * Tool 续传正确性交给网关侧 response 存储和 call-id 关联状态。每次请求关闭远端存储并显式
+     * 请求 encrypted reasoning，空系统提示省略 instructions；这样即使本轮未显式配置 reasoning，
+     * 上游模型默认生成的原生 item 仍可安全进入下一轮完整历史。
      */
     static ObjectNode encodeRequest(ModelPort.ModelRequest request) {
         ObjectNode root = AbstractStreamingModelAdapter.JSON.createObjectNode();
         root.put("model", request.configuration().model());
-        root.put("instructions", request.prompt().systemPrompt());
+        root.put("store", false);
+        root.putArray("include").add("reasoning.encrypted_content");
+        if (!request.prompt().systemPrompt().isEmpty()) {
+            root.put("instructions", request.prompt().systemPrompt());
+        }
         ModelPort.Continuation continuation = request.continuation();
         if (continuation != null) {
             throw new ProviderProtocolException(
                     "REMOTE_CONTINUATION_UNSUPPORTED",
                     "OpenAI Responses requests must carry complete native input history", false);
         }
-        root.set("input", input(request.messages()));
+        root.set("input", input(request.configuration(), request.messages()));
         applyGeneration(root, request.configuration().generation());
         OpenAiProviderSupport.applyToolsAndStreaming(root, request.tools(),
                 OpenAiResponsesCodec::tool);
@@ -74,7 +82,8 @@ final class OpenAiResponsesCodec {
     /**
      * 在文本、函数调用和函数结果条目之间保持消息及内容顺序。
      */
-    private static ArrayNode input(List<ModelMessage> messages) {
+    private static ArrayNode input(
+            ModelPort.ModelConfiguration configuration, List<ModelMessage> messages) {
         ArrayNode result = AbstractStreamingModelAdapter.JSON.createArrayNode();
         for (ModelMessage message : messages) {
             List<ModelContent> pending = new ArrayList<>();
@@ -82,8 +91,13 @@ final class OpenAiResponsesCodec {
                 if (block instanceof TextContent || block instanceof NativeAttachmentContent) {
                     pending.add(block);
                 } else {
+                    if (block instanceof ReasoningContent reasoning && !matches(reasoning, configuration)) {
+                        continue;
+                    }
                     flushContent(result, message.role(), pending);
-                    if (block instanceof ToolCallContent call) {
+                    if (block instanceof ReasoningContent reasoning) {
+                        result.add(nativeReasoningItem(reasoning));
+                    } else if (block instanceof ToolCallContent call) {
                         ObjectNode item = result.addObject();
                         item.put("type", "function_call");
                         item.put("call_id", call.callId());
@@ -101,6 +115,34 @@ final class OpenAiResponsesCodec {
             flushContent(result, message.role(), pending);
         }
         return result;
+    }
+
+    /**
+     * 只回传与当前 Responses 身份完全匹配的 opaque 块，避免端点、模型或配置切换后重放签名材料。
+     */
+    private static boolean matches(
+            ReasoningContent reasoning, ModelPort.ModelConfiguration configuration) {
+        return "reasoning".equals(reasoning.wireField())
+                && reasoning.matches(configuration.providerId(), configuration.modelId(),
+                ProviderReasoningSupport.canonicalApi(configuration), configuration.model(),
+                ReasoningContent.endpointFingerprint(configuration.baseUri()));
+    }
+
+    /**
+     * 将完整 Responses reasoning item 原样放回 input；解析失败时拒绝请求而不发送残缺 opaque 状态。
+     */
+    private static JsonNode nativeReasoningItem(ReasoningContent reasoning) {
+        try {
+            JsonNode item = AbstractStreamingModelAdapter.JSON.readTree(reasoning.nativeJson());
+            if (item == null || !item.isObject() || !"reasoning".equals(item.path("type").textValue())) {
+                throw requestEncoding();
+            }
+            return item.deepCopy();
+        } catch (ProviderProtocolException failure) {
+            throw failure;
+        } catch (com.fasterxml.jackson.core.JsonProcessingException | RuntimeException failure) {
+            throw requestEncoding();
+        }
     }
 
     /**
@@ -205,5 +247,11 @@ final class OpenAiResponsesCodec {
      */
     private static String writeArguments(JsonObject arguments) {
         return ProviderJsonValues.write(arguments);
+    }
+
+    /** 构造不回显原生 reasoning 内容的稳定请求编码失败。 */
+    private static ProviderProtocolException requestEncoding() {
+        return new ProviderProtocolException(
+                "REQUEST_ENCODING", "OpenAI Responses message history is invalid", false);
     }
 }

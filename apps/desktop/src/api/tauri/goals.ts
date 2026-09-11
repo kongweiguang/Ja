@@ -22,6 +22,7 @@ export const JA_GOAL_COMMANDS = {
   observe: "ja_runtime_goal_observe",
   unobserve: "ja_runtime_goal_unobserve",
   planRead: "ja_runtime_plan_read",
+  currentPlanRead: "ja_runtime_plan_current_read",
   revisionsList: "ja_runtime_plan_revisions_list",
   evidenceList: "ja_runtime_goal_evidence_list",
   goalCreate: "ja_runtime_goal_create",
@@ -30,13 +31,18 @@ export const JA_GOAL_COMMANDS = {
   pause: "ja_runtime_goal_pause",
   resume: "ja_runtime_goal_resume",
   stop: "ja_runtime_goal_stop",
-  inputRespond: "ja_runtime_goal_input_respond",
   planCreate: "ja_runtime_plan_create",
   draftSave: "ja_runtime_plan_draft_save",
   draftDiscard: "ja_runtime_plan_draft_discard",
   propose: "ja_runtime_plan_propose",
-  approve: "ja_runtime_plan_approve",
   execute: "ja_runtime_plan_execute",
+  observePlan: "ja_runtime_plan_observe",
+  unobservePlan: "ja_runtime_plan_unobserve",
+  planEventsRead: "ja_runtime_plan_events_read",
+  planEvidenceList: "ja_runtime_plan_evidence_list",
+  pausePlan: "ja_runtime_plan_pause",
+  resumePlan: "ja_runtime_plan_resume",
+  stopPlan: "ja_runtime_plan_stop",
   reject: "ja_runtime_plan_reject",
 } as const;
 
@@ -49,6 +55,8 @@ export type GoalObserveResult = MethodResult<"goal/observe">;
 export type GoalUnobserveInput = MethodParams<"goal/unobserve">;
 export type PlanReadInput = MethodParams<"plan/read">;
 export type PlanReadResult = MethodResult<"plan/read">;
+export type PlanCurrentReadInput = MethodParams<"plan/current/read">;
+export type PlanCurrentReadResult = MethodResult<"plan/current/read">;
 export type PlanRevisionsListInput = MethodParams<"plan/revisions/list">;
 export type PlanRevisionsListResult = MethodResult<"plan/revisions/list">;
 export type GoalEvidenceListInput = MethodParams<"goal/evidence/list">;
@@ -57,12 +65,10 @@ export type GoalCreateInput = MethodParams<"goal/create">;
 export type GoalMutationInput = MethodParams<"goal/pause">;
 export type GoalMutationResult = MethodResult<"goal/pause">;
 export type GoalPlanAttachInput = MethodParams<"goal/plan/attach">;
-export type GoalInputRespondInput = MethodParams<"goal/input/respond">;
 export type PlanCreateInput = MethodParams<"plan/create">;
 export type PlanMutationInput = MethodParams<"plan/draft/discard">;
 export type PlanMutationResult = MethodResult<"plan/draft/discard">;
 export type PlanDraftSaveInput = MethodParams<"plan/draft/save">;
-export type PlanApproveInput = MethodParams<"plan/approve">;
 export type PlanExecuteInput = MethodParams<"plan/execute">;
 export type PlanRejectInput = MethodParams<"plan/reject">;
 
@@ -72,6 +78,7 @@ export interface GoalAdapter {
   observe(input: GoalObserveInput): Promise<GoalObserveResult>;
   unobserve(input: GoalUnobserveInput): Promise<void>;
   planRead(input: PlanReadInput): Promise<PlanReadResult>;
+  currentPlanRead(input: PlanCurrentReadInput): Promise<PlanCurrentReadResult>;
   revisionsList(input: PlanRevisionsListInput): Promise<PlanRevisionsListResult>;
   evidenceList(input: GoalEvidenceListInput): Promise<GoalEvidenceListResult>;
   create(input: GoalCreateInput): Promise<GoalMutationResult>;
@@ -80,13 +87,22 @@ export interface GoalAdapter {
   pause(input: GoalMutationInput): Promise<GoalMutationResult>;
   resume(input: GoalMutationInput): Promise<GoalMutationResult>;
   stop(input: GoalMutationInput): Promise<GoalMutationResult>;
-  inputRespond(input: GoalInputRespondInput): Promise<GoalMutationResult>;
   createPlan(input: PlanCreateInput): Promise<PlanMutationResult>;
   draftSave(input: PlanDraftSaveInput): Promise<PlanMutationResult>;
   draftDiscard(input: PlanMutationInput): Promise<PlanMutationResult>;
   propose(input: PlanMutationInput): Promise<PlanMutationResult>;
-  approve(input: PlanApproveInput): Promise<PlanMutationResult>;
   execute(input: PlanExecuteInput): Promise<PlanMutationResult>;
+  observePlan(input: MethodParams<"plan/observe">): Promise<MethodResult<"plan/observe">>;
+  unobservePlan(input: MethodParams<"plan/unobserve">): Promise<MethodResult<"plan/unobserve">>;
+  planEventsRead(
+    input: MethodParams<"plan/events/read">,
+  ): Promise<MethodResult<"plan/events/read">>;
+  planEvidenceList(
+    input: MethodParams<"plan/evidence/list">,
+  ): Promise<MethodResult<"plan/evidence/list">>;
+  pausePlan(input: MethodParams<"plan/pause">): Promise<MethodResult<"plan/pause">>;
+  resumePlan(input: MethodParams<"plan/resume">): Promise<MethodResult<"plan/resume">>;
+  stopPlan(input: MethodParams<"plan/stop">): Promise<MethodResult<"plan/stop">>;
   reject(input: PlanRejectInput): Promise<PlanMutationResult>;
 }
 
@@ -144,6 +160,11 @@ export class TauriGoalAdapter implements GoalAdapter {
     return invokeGoal(this.bridge, JA_GOAL_COMMANDS.planRead, "plan/read", input);
   }
 
+  /** 线程级恢复入口只读取最新独立 Plan；没有 Plan 时返回空值而不是伪造 not-found 错误。 */
+  currentPlanRead(input: PlanCurrentReadInput): Promise<PlanCurrentReadResult> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.currentPlanRead, "plan/current/read", input);
+  }
+
   /** revision 历史只按服务端 cursor 分页，不在客户端生成 diff 身份。 */
   revisionsList(input: PlanRevisionsListInput): Promise<PlanRevisionsListResult> {
     return invokeGoal(this.bridge, JA_GOAL_COMMANDS.revisionsList, "plan/revisions/list", input);
@@ -184,11 +205,6 @@ export class TauriGoalAdapter implements GoalAdapter {
     return invokeGoal(this.bridge, JA_GOAL_COMMANDS.stop, "goal/stop", input);
   }
 
-  /** 回复绑定服务端 input request identity，过期请求不得静默写入下一轮。 */
-  inputRespond(input: GoalInputRespondInput): Promise<GoalMutationResult> {
-    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.inputRespond, "goal/input/respond", input);
-  }
-
   /** 创建独立 Plan 只绑定 Thread，不隐式创建或激活 Goal。 */
   createPlan(input: PlanCreateInput): Promise<PlanMutationResult> {
     return invokeGoal(this.bridge, JA_GOAL_COMMANDS.planCreate, "plan/create", input);
@@ -209,14 +225,48 @@ export class TauriGoalAdapter implements GoalAdapter {
     return invokeGoal(this.bridge, JA_GOAL_COMMANDS.propose, "plan/propose", input);
   }
 
-  /** 批准绑定精确 revision 与 hash，即使 full_access 也不能省略。 */
-  approve(input: PlanApproveInput): Promise<PlanMutationResult> {
-    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.approve, "plan/approve", input);
-  }
-
-  /** execute 显式启动一次隐藏 PLAN_EXECUTION Turn，不进入 Goal 自动续跑。 */
+  /** execute 是唯一的 Plan 执行边界，服务端在同一事务中记录用户意图并创建 Run。 */
   execute(input: PlanExecuteInput): Promise<PlanMutationResult> {
     return invokeGoal(this.bridge, JA_GOAL_COMMANDS.execute, "plan/execute", input);
+  }
+
+  /** 注册当前连接对独立 Plan 的观察，并以服务端快照建立初始水位。 */
+  observePlan(input: MethodParams<"plan/observe">): Promise<MethodResult<"plan/observe">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.observePlan, "plan/observe", input);
+  }
+
+  /** 观察句柄是连接级资源；只撤销当前窗口订阅，避免关闭详情面板改变 Plan 聚合或执行租约。 */
+  unobservePlan(input: MethodParams<"plan/unobserve">): Promise<MethodResult<"plan/unobserve">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.unobservePlan, "plan/unobserve", input);
+  }
+
+  /** 分页读取不可变 Plan 事件，详情面板按需调用以控制长历史负载。 */
+  planEventsRead(
+    input: MethodParams<"plan/events/read">,
+  ): Promise<MethodResult<"plan/events/read">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.planEventsRead, "plan/events/read", input);
+  }
+
+  /** 精确绑定 Plan revision/run 读取验收证据，禁止跨执行轮拼接结果。 */
+  planEvidenceList(
+    input: MethodParams<"plan/evidence/list">,
+  ): Promise<MethodResult<"plan/evidence/list">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.planEvidenceList, "plan/evidence/list", input);
+  }
+
+  /** 先写入服务端暂停 fence 再停止领取新 Turn，以保留 ledger、Run 身份和可恢复边界。 */
+  pausePlan(input: MethodParams<"plan/pause">): Promise<MethodResult<"plan/pause">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.pausePlan, "plan/pause", input);
+  }
+
+  /** 以原 run 和累计预算恢复执行，不创建新的执行授权。 */
+  resumePlan(input: MethodParams<"plan/resume">): Promise<MethodResult<"plan/resume">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.resumePlan, "plan/resume", input);
+  }
+
+  /** 停止当前 Plan run 并保留已产生文件、证据与审计历史。 */
+  stopPlan(input: MethodParams<"plan/stop">): Promise<MethodResult<"plan/stop">> {
+    return invokeGoal(this.bridge, JA_GOAL_COMMANDS.stopPlan, "plan/stop", input);
   }
 
   /** reject 以 Goal CAS 标记当前提案并回到可编辑 draft，不隐式批准旧版本。 */

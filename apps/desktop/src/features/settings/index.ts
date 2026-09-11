@@ -8,7 +8,11 @@ export type {
   SettingsAdapter,
   SettingsAppearancePort,
   SettingsDesktopPort,
+  SettingsInterfacePreferences,
+  SettingsPorts,
   SettingsRuntimePort,
 } from "./application/ports";
 export type { DesktopNotificationPreference } from "./ui/sections";
-export type { SettingsSection } from "./domain/types";
+export type { SettingsSection, SettingsSnapshot } from "./domain/types";
+export type { InterfacePreferences } from "./application/interfacePreferences";
+export type { ExecutionScope } from "./domain/executionScope";

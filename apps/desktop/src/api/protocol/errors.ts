@@ -100,7 +100,12 @@ export const JA_ERROR_CATALOG = {
   PLAN_APPROVAL_STALE: { code: -32090, category: "conflict", retryable: false },
   GOAL_EVIDENCE_INCOMPLETE: { code: -32091, category: "conflict", retryable: false },
   GOAL_RECOVERY_REQUIRED: { code: -32092, category: "conflict", retryable: false },
-  GOAL_INPUT_EXPIRED: { code: -32093, category: "timeout", retryable: false },
+  INTERACTION_NOT_FOUND: { code: -32094, category: "not_found", retryable: false },
+  INTERACTION_REVISION_CONFLICT: { code: -32095, category: "conflict", retryable: true },
+  INTERACTION_INVALID_STATE: { code: -32096, category: "conflict", retryable: false },
+  INTERACTION_INVALID: { code: -32097, category: "validation", retryable: false },
+  PLAN_REVISION_CONFLICT: { code: -32098, category: "conflict", retryable: true },
+  PLAN_INVALID_STATE: { code: -32099, category: "conflict", retryable: false },
 } as const satisfies Record<string, { code: number; category: ErrorCategory; retryable: boolean }>;
 
 type CatalogErrorCode = keyof typeof JA_ERROR_CATALOG;

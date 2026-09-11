@@ -199,8 +199,8 @@ async function createPlan(page, commands, threadId, readThread, objective, stage
   return requirePlanProjection(result, `${stage} create`);
 }
 
-/** 保存、冻结并批准精确 Plan revision；批准后的 activeRunId 必须仍为空。 */
-async function approvePlanRevision(page, commands, threadId, projection, definition, stage) {
+  /** 保存并冻结精确 Plan revision；提案本身不得启动 standalone Run。 */
+async function proposePlanRevision(page, commands, threadId, projection, definition, stage) {
   let current = requirePlanProjection(
     await invokeCommand(page, commands.planDraftSave, {
       threadId,
@@ -223,19 +223,8 @@ async function approvePlanRevision(page, commands, threadId, projection, definit
   assert.equal(typeof current.currentRevision?.planRevisionId, "string");
   assert.equal(typeof current.currentRevision?.planHash, "string");
   const proposed = current.currentRevision;
-  current = requirePlanProjection(
-    await invokeCommand(page, commands.planApprove, {
-      threadId,
-      planId: current.plan.planId,
-      expectedPlanRevision: current.plan.revision,
-      planRevisionId: proposed.planRevisionId,
-      planHash: proposed.planHash,
-      idempotencyKey: idempotencyKey(`${stage}-approve`),
-    }),
-    `${stage} approve`,
-  );
-  assert.equal(current.plan.status, "approved");
-  assert.equal(current.plan.activeRunId, null, "plan/approve 不得启动 run");
+  assert.equal(current.plan.status, "awaiting_approval");
+  assert.equal(current.plan.activeRunId, null, "plan/propose 不得启动 run");
   return { projection: current, revision: proposed };
 }
 
@@ -544,7 +533,7 @@ export function createPlanGoalWebView2Driver(options) {
       "standalone",
     );
     assert.equal(standalone.plan.status, "draft");
-    ({ projection: standalone } = await approvePlanRevision(
+    ({ projection: standalone } = await proposePlanRevision(
       page,
       commands,
       threadId,
@@ -552,7 +541,7 @@ export function createPlanGoalWebView2Driver(options) {
       planDefinition(scenario, "main"),
       "standalone",
     ));
-    const approvedRunId = standalone.plan.activeRunId;
+    const proposedRunId = standalone.plan.activeRunId;
     resetProviderContext("standalone");
     standalone = requirePlanProjection(
       await invokeCommand(page, commands.planExecute, {
@@ -604,7 +593,7 @@ export function createPlanGoalWebView2Driver(options) {
       scenario.revisedObjective,
       "attach",
     );
-    const firstApproval = await approvePlanRevision(
+    const firstProposal = await proposePlanRevision(
       page,
       commands,
       threadId,
@@ -612,7 +601,7 @@ export function createPlanGoalWebView2Driver(options) {
       planDefinition(scenario, "main"),
       "attach-v1",
     );
-    attachPlan = firstApproval.projection;
+    attachPlan = firstProposal.projection;
     attachPlan = requirePlanProjection(
       await invokeCommand(page, commands.planDraftSave, {
         threadId,
@@ -635,28 +624,18 @@ export function createPlanGoalWebView2Driver(options) {
       }),
       "attach v1 propose",
     );
-    const stalePlan = await invokeCommand(page, commands.planApprove, {
+    const stalePlan = await invokeCommand(page, commands.planExecute, {
       threadId,
       planId: attachPlan.plan.planId,
       expectedPlanRevision: attachPlan.plan.revision,
-      planRevisionId: firstApproval.revision.planRevisionId,
-      planHash: firstApproval.revision.planHash,
+      planRevisionId: firstProposal.revision.planRevisionId,
+      planHash: firstProposal.revision.planHash,
       idempotencyKey: idempotencyKey("stale-plan"),
     });
     assert.equal(stalePlan.ok, false);
-    assert.equal(stalePlan.code, PLAN_GOAL_RPC_CONTRACT.errors.stalePlanApproval);
+    assert.equal(stalePlan.code, PLAN_GOAL_RPC_CONTRACT.errors.stalePlanRevision);
     const attachRevision = attachPlan.currentRevision;
-    attachPlan = requirePlanProjection(
-      await invokeCommand(page, commands.planApprove, {
-        threadId,
-        planId: attachPlan.plan.planId,
-        expectedPlanRevision: attachPlan.plan.revision,
-        planRevisionId: attachRevision.planRevisionId,
-        planHash: attachRevision.planHash,
-        idempotencyKey: idempotencyKey("attach-v2-approve"),
-      }),
-      "attach v1 approve",
-    );
+    assert.equal(attachPlan.plan.status, "awaiting_approval");
     assert.equal(attachPlan.plan.activeRunId, null);
 
     let goal = requireGoalProjection(
@@ -770,7 +749,7 @@ export function createPlanGoalWebView2Driver(options) {
     return {
       planCreatedWithoutGoal: true,
       standalonePlanCompleted: standalone.plan.status === "completed",
-      planApprovalDidNotExecute: approvedRunId === null,
+      planProposalDidNotExecute: proposedRunId === null,
       goalCreatedWithoutPlan: true,
       attachApprovedPlan: goal.goal.planLink?.planRevisionId === attachRevision.planRevisionId,
       attachedGoalOwnedRunStarted: typeof goal.goal.currentRunId === "string",
@@ -780,7 +759,7 @@ export function createPlanGoalWebView2Driver(options) {
       detachGoalRevisionAdvancedBy: detachMutationRevisionDelta,
       detachGoalContinued: true,
       staleGoalRevisionCode: staleGoal.code,
-      stalePlanApprovalCode: stalePlan.code,
+      stalePlanRevisionCode: stalePlan.code,
       hiddenPlanDetailIoDelta: state.hiddenPlanDetailIoDelta,
     };
   }
@@ -898,21 +877,22 @@ export function createPlanGoalWebView2Driver(options) {
     });
     state.evaluator = { verdicts: ["not_met"], continuedAfterNotMet: false };
     if (soakMinutes > 0) {
-      recordStage("plan_goal_v1:soak_input");
-      await approveGoalTool(
-        page,
-        { goalId, threadId, toolName: "goal_request_input" },
-        deadline,
-        signal,
-      );
+      recordStage("plan_goal_v1:soak_interaction");
       state.goal = await waitForCondition(
-        "Goal soak waiting_input",
+        "Goal soak Interaction waiting_input",
         async () => {
           const current = requireGoalProjection(
             await invokeCommand(page, "ja_runtime_goal_read", { goalId }),
             "goal soak read",
           );
-          return current.goal.phase === "waiting_input" && current.goal.pendingInput !== null
+          const interaction = await invokeCommand(page, "ja_runtime_interaction_read", { threadId });
+          return current.goal.phase === "waiting_input" &&
+            interaction.ok === true &&
+            interaction.value?.request?.status === "pending" &&
+            interaction.value.request.threadId === threadId &&
+            interaction.value.request.goalId === goalId &&
+            interaction.value.request.runId === current.goal.activeRunId &&
+            interaction.value.request.questions?.some((question) => question.questionId === "question_goal_soak_continue")
             ? current
             : false;
         },
@@ -923,7 +903,7 @@ export function createPlanGoalWebView2Driver(options) {
     return state.evaluator;
   }
 
-  /** 长稳使用用户输入作为稳定阻塞；窗口结束后显式继续，直到独立 evaluator 返回 met。 */
+  /** 长稳使用公共 Interaction 作为稳定阻塞；窗口结束后显式回答并继续 evaluator。 */
   async function soakEvidence() {
     recordStage("plan_goal_v1:soak");
     const goalId = state.goal.goal.goalId;
@@ -945,15 +925,61 @@ export function createPlanGoalWebView2Driver(options) {
     }
     if (soakMinutes > 0) {
       recordStage("plan_goal_v1:soak_resume");
-      state.goal = requireGoalProjection(
-        await invokeCommand(page, "ja_runtime_goal_input_respond", {
-          goalId,
-          expectedGoalRevision: state.goal.goal.revision,
-          inputRequestId: state.goal.goal.pendingInput.inputRequestId,
-          response: "继续执行当前 revision 的独立验收。",
-          idempotencyKey: idempotencyKey("goal-soak-respond"),
-        }),
-        "goal soak respond",
+      const beforeInteractionResume = state.goal.goal.revision;
+      const interaction = await waitForCondition(
+        "Goal soak Interaction snapshot",
+        async () => {
+          const result = await invokeCommand(page, "ja_runtime_interaction_read", { threadId });
+          return result.ok === true &&
+            result.value?.request?.status === "pending" &&
+            result.value.request.goalId === goalId &&
+            result.value.request.runId === state.goal.goal.activeRunId &&
+            result.value.request.questions?.some((question) => question.questionId === "question_goal_soak_continue")
+            ? result.value
+            : false;
+        },
+        deadline,
+        signal,
+      );
+      const answeredInteraction = await invokeCommand(page, "ja_runtime_interaction_respond", {
+        threadId,
+        requestId: interaction.request.requestId,
+        expectedRevision: interaction.request.revision,
+        answers: [{
+          questionId: "question_goal_soak_continue",
+          optionIds: ["option_continue_current_revision"],
+          freeText: null,
+          skipped: false,
+        }],
+        idempotencyKey: idempotencyKey("goal-soak-interaction-respond"),
+      });
+      if (
+        answeredInteraction.ok !== true ||
+        answeredInteraction.value?.request?.status !== "answered"
+      ) {
+        throw new Error(`Goal soak Interaction 回答失败：${answeredInteraction.code ?? "UNKNOWN"}`);
+      }
+      assert.equal(
+        answeredInteraction.value.request.answers?.some(
+          (answer) => answer.questionId === "question_goal_soak_continue" &&
+            answer.optionIds?.includes("option_continue_current_revision") &&
+            answer.skipped === false,
+        ),
+        true,
+      );
+      state.goal = await waitForCondition(
+        "Goal resume after Interaction",
+        async () => {
+          const current = requireGoalProjection(
+            await invokeCommand(page, "ja_runtime_goal_read", { goalId }),
+            "goal resume after interaction read",
+          );
+          return current.goal.revision > beforeInteractionResume && current.goal.phase !== "waiting_input"
+            ? current
+            : false;
+        },
+        deadline,
+        signal,
       );
       setProviderContext({
         goalId,

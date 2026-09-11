@@ -21,13 +21,17 @@ import {
   validatedLoopbackBaseUrl,
 } from "./real-provider-smoke.mjs";
 
-/** 冻结真实 Provider smoke 的完整事件词汇表，避免新增持久事件后付费验收在握手前失效。 */
+/** 冻结真实 Provider smoke 的完整 v1 能力词汇表，避免新增持久接口后付费验收在握手前失效。 */
 test("direct capabilities retain only the minimal v1 surface", () => {
   const capabilities = initializeParams().capabilities;
   assert.deepEqual(capabilities.accessModes, ["approval_required", "full_access"]);
   assert.deepEqual(capabilities.collaborationModes, ["default", "plan"]);
-  assert.deepEqual(capabilities.features, ["task_threads_v1", "plan_goal_v1"]);
+  assert.deepEqual(capabilities.features, ["task_threads_v1", "plan_goal_v1", "interaction_v1"]);
   assert.equal(capabilities.events.includes("tool/started"), true);
+  assert.equal(capabilities.events.includes("turn/messages_received"), true);
+  assert.equal(capabilities.methods.includes("plan/current/read"), true);
+  assert.equal(capabilities.methods.includes("goal/plan/attach"), true);
+  assert.equal(capabilities.methods.includes("task/close"), true);
 
   assert.throws(
     () => assertDirectProviderCapabilities({ ...capabilities, unexpectedCapability: {} }),

@@ -24,12 +24,15 @@ use webview2_com::{
         COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
         COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_PHYSICAL_KEY_STATUS,
         ICoreWebView2AcceleratorKeyPressedEventArgs, ICoreWebView2Controller,
+        ICoreWebView2Settings3,
     },
 };
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
+#[cfg(windows)]
+use windows_core::Interface;
 
 pub const NATIVE_SHORTCUT_EVENT: &str = "ja://native-shortcut";
 pub const NATIVE_SHORTCUT_STATUS_EVENT: &str = "ja://native-shortcut-status";
@@ -961,7 +964,9 @@ async fn install_claimed_webview(
 
 #[cfg(windows)]
 /// 注册 closure 不捕获 controller，避免 event source 与 callback 形成 COM 引用环；label
-/// 仅用于核对该 WebView 仍持有已发布 token。
+/// 仅用于核对该 WebView 仍持有已发布 token。关闭浏览器默认 accelerator，保留编辑按键
+/// 与 Ja 自己的 native/DOM 路由，避免刷新、打印等浏览器动作绕过应用生命周期。
+/// 禁用默认右键菜单但保留 DOM contextmenu，让已有的 Ja 自定义菜单继续工作。
 fn install_controller(
     controller: &ICoreWebView2Controller,
     app: tauri::AppHandle,
@@ -969,6 +974,18 @@ fn install_controller(
     label: String,
     attempt: u64,
 ) -> Result<i64, NativeShortcutError> {
+    unsafe {
+        controller
+            .CoreWebView2()
+            .and_then(|webview| webview.Settings())
+            .and_then(|settings| {
+                settings.SetAreDefaultContextMenusEnabled(false)?;
+                Ok(settings)
+            })
+            .and_then(|settings| settings.cast::<ICoreWebView2Settings3>())
+            .and_then(|settings| settings.SetAreBrowserAcceleratorKeysEnabled(false))
+            .map_err(|_| NativeShortcutError::new(NativeShortcutErrorCode::RegistrationFailed))?;
+    }
     let handler = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
         let Some(args) = args else {
             return Ok(());

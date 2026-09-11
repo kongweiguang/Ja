@@ -31,7 +31,8 @@
 
 .ja-chat-timeline__scroll {
   position: relative;
-  min-height: 16rem;
+  /* 问答停靠区展开后让出真实可用高度，不能用最小高度溢出并覆盖下方交互控件。 */
+  min-height: 0;
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -378,6 +379,58 @@
   box-shadow: var(--ja-shadow-sm);
 }
 
+/* 跨会话消息是外部事实：保持普通阅读宽度与轻量边界，不复用用户气泡或 Agent 颜色语义。 */
+.ja-chat-message-thread_message {
+  grid-template-areas:
+    "body"
+    "actions";
+  grid-template-columns: minmax(0, 1fr);
+  max-width: min(680px, 100%);
+  margin-bottom: 18px;
+  padding-inline: var(--ja-turn-inline-inset, 8px);
+}
+
+.ja-thread-message__body {
+  min-width: 0;
+  padding: 0.62rem 0.78rem 0.7rem;
+  border-left: 2px solid var(--ja-accent);
+  background: color-mix(in srgb, var(--ja-surface-muted) 58%, transparent);
+}
+
+.ja-thread-message__source {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.22rem 0.5rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-thread-message__source strong {
+  min-width: 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.ja-thread-message__content {
+  margin: 0.42rem 0 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-body-size);
+  line-height: var(--ja-line-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ja-chat-message-thread_message .ja-chat-message__actions {
+  justify-self: start;
+  margin-left: 0;
+  margin-top: 0.08rem;
+}
+
 .ja-chat-message-user .ja-markdown {
   margin-top: 0;
 }
@@ -542,25 +595,18 @@
   border: 1px solid var(--ja-border);
   border-radius: var(--ja-radius-lg);
   background: var(--ja-background);
-  font:
-    0.78rem/1.5 ui-monospace,
-    SFMono-Regular,
-    Consolas,
-    monospace;
+  font: var(--ja-code-font-size) / 1.5 var(--ja-font-mono);
 }
 .ja-markdown code {
   padding: 0.08rem 0.22rem;
   border-radius: 0.22rem;
   background: var(--ja-surface-muted);
-  font:
-    0.86em ui-monospace,
-    SFMono-Regular,
-    Consolas,
-    monospace;
+  font: var(--ja-code-font-size) / 1.5 var(--ja-font-mono);
 }
 .ja-markdown pre code {
   padding: 0;
   background: transparent;
+  font: inherit;
 }
 .ja-markdown a {
   color: var(--ja-accent);
@@ -789,6 +835,21 @@
   margin-top: 0;
 }
 
+/* 公开 reasoning summary 保持与 Commentary 同一阅读轴，只用语义样式与 DOM 属性区分来源。 */
+.ja-work-step--reasoning {
+  min-width: 0;
+  padding: 0.62rem 0.15rem 0.5rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-body-size);
+  line-height: var(--ja-line-body);
+  list-style: none;
+}
+
+.ja-work-step--reasoning .ja-markdown {
+  gap: 0.5rem;
+  margin-top: 0;
+}
+
 .ja-work-step-failed {
   color: var(--ja-danger);
 }
@@ -938,7 +999,7 @@
   border-radius: var(--ja-radius-sm);
   color: var(--ja-foreground-muted);
   background: var(--ja-background);
-  font: var(--ja-text-caption-size) / 1.55 var(--ja-font-mono);
+  font: var(--ja-code-font-size) / 1.55 var(--ja-font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1185,7 +1246,7 @@
   border: 1px solid var(--ja-border);
   border-radius: var(--ja-radius-md);
   background: var(--ja-background);
-  font: var(--ja-text-caption-size) / 1.55 var(--ja-font-mono);
+  font: var(--ja-code-font-size) / 1.55 var(--ja-font-mono);
   white-space: pre;
 }
 

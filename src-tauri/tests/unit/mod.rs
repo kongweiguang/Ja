@@ -22,9 +22,9 @@ const MAIN_WINDOW_LABEL: &str = "main";
 mod test_prelude {
     pub(crate) use crate::app_runtime::{
         ApprovalResponseInput, EventSink, ManualRecoveryConfirmation, ManualRecoveryReason,
-        RuntimeCommandError, RuntimeHost, RuntimeStatusKind, TaskCreateInput, TaskFollowupInput,
-        TaskMessageInput, TaskMutationInput, TaskTreeDeleteInput, TurnContentPart, WorkspaceLookup,
-        WorkspaceOpenInput,
+        RuntimeCommandError, RuntimeHost, RuntimeStatusKind, TaskCloseResult, TaskCreateInput,
+        TaskFollowupInput, TaskMessageInput, TaskMutationInput, TaskTreeDeleteInput,
+        TurnContentPart, WorkspaceLookup, WorkspaceOpenInput,
     };
     pub(crate) use crate::preview::{
         PreviewError, PreviewErrorCode, PreviewId, PreviewManager, PreviewPolicy,
@@ -98,7 +98,6 @@ unit_scope!(
     crate::app_runtime::interface::app_tray,
     "/tests/unit/app_tray_tests.rs"
 );
-
 unit_scope!(
     app_runtime_domain_commands_scope,
     crate::app_runtime::domain::commands,

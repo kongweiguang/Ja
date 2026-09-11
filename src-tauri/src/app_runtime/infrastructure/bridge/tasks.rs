@@ -5,7 +5,10 @@
 
 use super::*;
 use crate::app_runtime::domain::tasks::valid_task_cursor;
-use crate::app_runtime::domain::{TaskContextPreviewItem, valid_protocol_id};
+use crate::app_runtime::domain::{
+    TaskContextPreviewItem, TaskThreadPreferences, TaskThreadSummary, valid_protocol_id,
+};
+use crate::app_runtime::interface::history_model::{ThreadDto, parse_thread};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -125,6 +128,7 @@ pub(crate) enum TaskMethod {
     Followup,
     Cancel,
     TreeDelete,
+    Close,
 }
 
 impl TaskMethod {
@@ -137,10 +141,11 @@ impl TaskMethod {
             Self::Observe => "task/observe",
             Self::Unobserve => "task/unobserve",
             Self::Seen => "task/seen",
-            Self::MessageSend => "task/message/send",
+            Self::MessageSend => "thread/message/send",
             Self::Followup => "task/followup",
             Self::Cancel => "task/cancel",
             Self::TreeDelete => "task/tree/delete",
+            Self::Close => "task/close",
         }
     }
 }
@@ -189,13 +194,21 @@ impl RuntimeBridge {
         let expected_parent_thread_id = input.parent_thread_id.clone();
         let expected_parent_turn_id = input.parent_turn_id.clone();
         let expected_task_name = input.task_name.clone();
-        let params = json!({
+        let mut params = json!({
             "parentThreadId": input.parent_thread_id,
             "parentTurnId": input.parent_turn_id,
             "expectedParentRevision": input.expected_parent_revision,
             "taskName": input.task_name,
-            "content": turn_content_value(&input.content),
         });
+        if let Some(preferences) = input.preferences {
+            params["preferences"] = json!({
+                "providerId": preferences.provider_id,
+                "modelId": preferences.model_id,
+                "reasoningLevel": preferences.reasoning_level,
+                "accessMode": preferences.access_mode,
+                "collaborationMode": preferences.collaboration_mode,
+            });
+        }
         parse_task_create_result(
             self.task_request(TaskMethod::Create, params)?,
             &expected_parent_thread_id,
@@ -359,6 +372,20 @@ impl RuntimeBridge {
         let mut params = task_mutation_params(&input.mutation);
         params["confirmTaskThreadId"] = json!(input.confirm_task_thread_id);
         parse_task_tree_delete_result(self.task_request(TaskMethod::TreeDelete, params)?)
+    }
+
+    /// task/close 不携带 revision；Java 以 Thread 临时生命周期 owner 实现幂等关闭。
+    pub(crate) fn task_close(
+        &self,
+        input: TaskCloseInput,
+    ) -> Result<TaskCloseResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        parse_task_close_result(self.task_request(
+            TaskMethod::Close,
+            json!({"taskThreadId": input.task_thread_id}),
+        )?)
     }
 
     /// 所有 task 方法共享同一 actor/generation fence，但 method 只能来自闭集枚举。
@@ -536,7 +563,8 @@ impl TaskSummaryWire {
             && matches!(self.lifecycle.as_str(), "independent" | "attached")
             && matches!(
                 self.state.as_str(),
-                "queued"
+                "idle"
+                    | "queued"
                     | "running"
                     | "waiting_approval"
                     | "suspended"
@@ -611,6 +639,7 @@ struct TaskActivitySummaryWire {
 struct TaskActivityWire {
     activity_sequence: u64,
     activity_id: String,
+    root_thread_id: String,
     task_thread_id: String,
     actor_thread_id: String,
     #[serde(deserialize_with = "required_nullable")]
@@ -625,6 +654,7 @@ impl TaskActivityWire {
     fn into_domain(self) -> Result<TaskActivity, RuntimeCommandError> {
         if !(1..=MAX_SAFE_INTEGER).contains(&self.activity_sequence)
             || !valid_protocol_id(&self.activity_id, "activity_", 105)
+            || !valid_protocol_id(&self.root_thread_id, "thr_", 100)
             || !valid_protocol_id(&self.task_thread_id, "thr_", 100)
             || !valid_protocol_id(&self.actor_thread_id, "thr_", 100)
             || !self
@@ -633,7 +663,8 @@ impl TaskActivityWire {
                 .is_none_or(valid_frozen_turn_id)
             || !matches!(
                 self.kind.as_str(),
-                "dispatched"
+                "created"
+                    | "dispatched"
                     | "message_sent"
                     | "follow_up_queued"
                     | "progress"
@@ -652,6 +683,7 @@ impl TaskActivityWire {
         Ok(TaskActivity {
             activity_sequence: self.activity_sequence,
             activity_id: self.activity_id,
+            root_thread_id: self.root_thread_id,
             task_thread_id: self.task_thread_id,
             actor_thread_id: self.actor_thread_id,
             causal_turn_id: self.causal_turn_id,
@@ -788,7 +820,14 @@ impl TaskContextPreviewItemWire {
 impl TaskContextSeedWire {
     /// seed 响应只允许任务 brief、有界安全预览与 SHA-256 指纹，拒绝原始上下文正文。
     fn into_domain(self) -> Result<TaskContextSeed, RuntimeCommandError> {
-        let task_brief = parse_turn_content(Some(&self.task_brief), "turn_task_seed")?;
+        let task_brief = if self.task_brief.is_null() {
+            None
+        } else {
+            Some(parse_turn_content(
+                Some(&self.task_brief),
+                "turn_task_seed",
+            )?)
+        };
         if self.inherited_context_preview.len() > 24 {
             return Err(RuntimeCommandError::unavailable());
         }
@@ -805,7 +844,9 @@ impl TaskContextSeedWire {
         let inheritance_projection_matches = match self.inheritance_mode.as_str() {
             "effective_context" => self.inherited_context_summary.is_some(),
             "brief_only" => {
-                self.inherited_context_summary.is_none() && inherited_context_preview.is_empty()
+                task_brief.is_some()
+                    && self.inherited_context_summary.is_none()
+                    && inherited_context_preview.is_empty()
             }
             _ => false,
         };
@@ -844,7 +885,6 @@ impl TaskContextSeedWire {
 struct TaskCreateResultWire {
     accepted: bool,
     task: TaskSummaryWire,
-    turn_id: String,
 }
 
 /// create 结果必须确认 accepted=true，且 Child identity 仍绑定本次父级和用户任务名。
@@ -855,7 +895,7 @@ pub(crate) fn parse_task_create_result(
     expected_task_name: &str,
 ) -> Result<TaskCreateResult, RuntimeCommandError> {
     let wire: TaskCreateResultWire = strict_result(value)?;
-    if !wire.accepted || !valid_frozen_turn_id(&wire.turn_id) {
+    if !wire.accepted {
         return Err(RuntimeCommandError::unavailable());
     }
     let task = wire.task.into_domain()?;
@@ -864,13 +904,11 @@ pub(crate) fn parse_task_create_result(
         || task.task_name != expected_task_name
         || task.task_kind != "side_task"
         || task.lifecycle != "independent"
+        || task.state != "idle"
     {
         return Err(RuntimeCommandError::unavailable());
     }
-    Ok(TaskCreateResult {
-        task,
-        turn_id: wire.turn_id,
-    })
+    Ok(TaskCreateResult { task })
 }
 
 #[derive(Deserialize)]
@@ -933,6 +971,7 @@ fn valid_task_tree(items: &[TaskSummary], expected_root_thread_id: &str) -> bool
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskReadResultWire {
     task: TaskSummaryWire,
+    thread: Value,
     context_seed: TaskContextSeedWire,
     activities: Vec<TaskActivityWire>,
     mailbox: Vec<TaskMailboxMessageWire>,
@@ -940,7 +979,32 @@ struct TaskReadResultWire {
     next_cursor: Option<String>,
 }
 
-/// read 结果施加分页上限，并验证 activity/mailbox 均属于本次请求的 Child Thread。
+/// History parser 已完成 wire 完整性校验；此处只做反腐映射，避免 domain 持有 interface 类型。
+fn task_thread_from_history(thread: ThreadDto) -> TaskThreadSummary {
+    TaskThreadSummary {
+        thread_id: thread.thread_id,
+        workspace_id: thread.workspace_id,
+        active_goal_id: thread.active_goal_id,
+        preferences: thread.preferences.map(|preferences| TaskThreadPreferences {
+            provider_id: preferences.provider_id,
+            model_id: preferences.model_id,
+            reasoning_level: preferences.reasoning_level,
+            access_mode: preferences.access_mode,
+            collaboration_mode: preferences.collaboration_mode,
+            title_source: preferences.title_source,
+        }),
+        title: thread.title,
+        status: thread.status,
+        pinned: thread.pinned,
+        latest_turn_status: thread.latest_turn_status,
+        latest_turn_seen: thread.latest_turn_seen,
+        revision: thread.revision,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+    }
+}
+
+/// read 结果施加分页上限，复用 History 的 Thread 校验，并验证所有详情行属于本次 Child。
 pub(crate) fn parse_task_read_result(
     value: Value,
     expected_task_thread_id: &str,
@@ -956,6 +1020,11 @@ pub(crate) fn parse_task_read_result(
         return Err(RuntimeCommandError::unavailable());
     }
     let task = wire.task.into_domain()?;
+    let thread = parse_thread(wire.thread)?;
+    if thread.thread_id != task.task_thread_id {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let thread = task_thread_from_history(thread);
     let context_seed = wire.context_seed.into_domain()?;
     let activities = wire
         .activities
@@ -999,6 +1068,7 @@ pub(crate) fn parse_task_read_result(
     }
     Ok(TaskReadResult {
         task,
+        thread,
         context_seed,
         activities,
         mailbox,
@@ -1146,6 +1216,23 @@ fn parse_task_tree_delete_result(
     Ok(TaskTreeDeleteResult {
         deleted_task_count: wire.deleted_task_count,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskCloseResultWire {
+    closed: bool,
+}
+
+/// 关闭必须得到严格且为真的终态回执；额外字段或 false 都不能声明本地资源已释放。
+pub(crate) fn parse_task_close_result(
+    value: Value,
+) -> Result<TaskCloseResult, RuntimeCommandError> {
+    let wire: TaskCloseResultWire = strict_result(value)?;
+    if !wire.closed {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    Ok(TaskCloseResult { closed: true })
 }
 
 /// 所有 task 结果使用 deny_unknown_fields wire type 反序列化，避免新增字段静默穿过原生边界。

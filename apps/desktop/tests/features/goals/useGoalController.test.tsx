@@ -10,6 +10,7 @@ import {
   type GoalReadModel,
   type PlanReadModel,
 } from "@/features/goals";
+import { planProgressFromRevision } from "@/features/goals";
 import { goalModel } from "./goalFixtures";
 
 interface Deferred<T> {
@@ -44,7 +45,9 @@ function goalPort(initial: GoalReadModel = goalModel()): {
   /** Plan fake 从同一 fixture 提取独立投影，但不把 Plan mutation 伪装成 Goal ACK。 */
   const samePlan = async (): Promise<PlanReadModel> => ({
     plan: current.planState ?? fallbackPlan.planState!,
+    progress: planProgressFromRevision(current.plan ?? fallbackPlan.plan),
     revision: current.plan ?? fallbackPlan.plan,
+    revisionHydrationRequired: false,
     draft: current.planState === null ? fallbackPlan.draft : current.draft,
     approvedPlanRevisionId:
       (current.plan ?? fallbackPlan.plan)?.approvedAt === null
@@ -56,6 +59,12 @@ function goalPort(initial: GoalReadModel = goalModel()): {
   const port: GoalPort = {
     read: vi.fn(async () => current),
     readPlan: vi.fn(samePlan),
+    currentPlan: vi.fn(async () => undefined),
+    observePlan: vi.fn(async ({ planId }) => ({
+      observationId: `observe_${planId}_12345678`,
+      plan: await samePlan(),
+    })),
+    unobservePlan: vi.fn(async () => undefined),
     observe: vi.fn(async ({ goalId }) => ({
       observationId: `observe_${goalId}`,
       goalRevision: current.goal.revision,
@@ -63,6 +72,7 @@ function goalPort(initial: GoalReadModel = goalModel()): {
     unobserve: vi.fn(async () => undefined),
     revisions: vi.fn(async () => ({ items: current.plan === null ? [] : [current.plan] })),
     planRevisions: vi.fn(async () => ({ items: current.plan === null ? [] : [current.plan] })),
+    readPlanEvidence: vi.fn(async () => ({ items: [] })),
     evidence: vi.fn(async () => ({ items: [] })),
     create: vi.fn(same),
     createPlan: vi.fn(samePlan),
@@ -71,17 +81,18 @@ function goalPort(initial: GoalReadModel = goalModel()): {
     pause: vi.fn(same),
     resume: vi.fn(same),
     stop: vi.fn(same),
-    respondInput: vi.fn(same),
     saveDraft: vi.fn(samePlan),
     discardDraft: vi.fn(samePlan),
     propose: vi.fn(samePlan),
-    approve: vi.fn(samePlan),
+    pausePlan: vi.fn(samePlan),
+    resumePlan: vi.fn(samePlan),
+    stopPlan: vi.fn(samePlan),
     execute: vi.fn(samePlan),
     reject: vi.fn(samePlan),
-    subscribe: (listener) => {
+    subscribe: vi.fn((listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
-    },
+    }),
   };
   return {
     port,
@@ -207,6 +218,240 @@ describe("useGoalController", () => {
       });
     });
     await waitFor(() => expect(result.current.model?.goal.revision).toBe(8));
+  });
+
+  it("merges a lightweight Plan event without rereading immutable details", async () => {
+    const fake = goalPort();
+    const { result } = renderHook(() =>
+      useGoalController({
+        goalId: "goal_1",
+        ownerThreadId: "thr_1",
+        visible: true,
+        detailsVisible: false,
+        port: fake.port,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.planModel?.plan.status).toBe("awaiting_approval"));
+    const readsBeforeEvent = vi.mocked(fake.port.readPlan).mock.calls.length;
+    const initialPlan = result.current.planModel!.plan;
+    act(() => {
+      fake.emit({
+        method: "plan/changed",
+        planId: initialPlan.planId,
+        ownerThreadId: initialPlan.ownerThreadId,
+        planRevision: initialPlan.revision,
+        planEventSequence: result.current.planModel!.eventSequence + 1,
+        plan: { ...initialPlan, status: "paused", revision: initialPlan.revision + 1 },
+        progress: {
+          currentStepId: "step_contract",
+          currentStepTitle: "冻结契约",
+          completedRequiredSteps: 2,
+          totalRequiredSteps: 2,
+        },
+        goalRevision: 7,
+        eventSequence: 8,
+        occurredAt: "2026-09-04T10:21:00+08:00",
+      });
+    });
+
+    await waitFor(() => expect(result.current.planModel?.plan.status).toBe("paused"));
+    expect(result.current.planModel?.progress).toEqual({
+      currentStepId: "step_contract",
+      currentStepTitle: "冻结契约",
+      completedRequiredSteps: 2,
+      totalRequiredSteps: 2,
+    });
+    expect(fake.port.readPlan).toHaveBeenCalledTimes(readsBeforeEvent);
+  });
+
+  /** 提案尚未获准时 active identity 仍为空，轻量事件不能吞掉同 revision 的完整 ACK。 */
+  it("hydrates a proposed revision when the event arrives before its mutation ACK", async () => {
+    const initial = goalModel();
+    const fake = goalPort(initial);
+    const draft: PlanReadModel = {
+      plan: { ...initial.planState!, status: "draft", activePlanRevisionId: null },
+      progress: planProgressFromRevision(null),
+      revision: null,
+      revisionHydrationRequired: false,
+      draft: null,
+      approvedPlanRevisionId: null,
+      eventSequence: 3,
+    };
+    vi.mocked(fake.port.currentPlan).mockResolvedValue(draft);
+    vi.mocked(fake.port.observePlan).mockResolvedValue({
+      observationId: "observe_plan_1_12345678",
+      plan: draft,
+    });
+    const ack = deferred<PlanReadModel>();
+    vi.mocked(fake.port.propose).mockReturnValue(ack.promise);
+    vi.mocked(fake.port.readPlan).mockReturnValue(new Promise(() => {}));
+    const { result } = renderHook(() =>
+      useGoalController({ ownerThreadId: "thr_1", visible: true, port: fake.port }),
+    );
+    await waitFor(() => expect(result.current.planModel?.plan.status).toBe("draft"));
+    const proposed: PlanReadModel = {
+      ...draft,
+      plan: { ...draft.plan, status: "awaiting_approval", revision: draft.plan.revision + 1 },
+      revision: initial.plan,
+      eventSequence: 4,
+    };
+    let completed: Promise<boolean>;
+    act(() => {
+      completed = result.current.propose();
+    });
+    act(() =>
+      fake.emit({
+        method: "plan/changed",
+        planId: draft.plan.planId,
+        ownerThreadId: "thr_1",
+        plan: proposed.plan,
+        planEventSequence: 4,
+        goalRevision: 0,
+        eventSequence: 4,
+        occurredAt: "2026-09-10T00:00:00Z",
+      }),
+    );
+    await act(async () => {
+      ack.resolve(proposed);
+      await completed;
+    });
+    expect(result.current.planModel?.revision?.planRevisionId).toBe(initial.plan!.planRevisionId);
+    expect(result.current.planModel?.revisionHydrationRequired).toBe(false);
+  });
+
+  it("sends Plan pause with the active run and Plan revision CAS", async () => {
+    const initial = goalModel("working", "approved");
+    const running = {
+      ...initial,
+      planState: {
+        ...initial.planState!,
+        status: "executing" as const,
+        activePlanRevisionId: "planrev_2",
+        activeRunId: "run_1",
+      },
+    };
+    const fake = goalPort(running);
+    const { result } = renderHook(() =>
+      useGoalController({
+        goalId: "goal_1",
+        ownerThreadId: "thr_1",
+        visible: true,
+        port: fake.port,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.planModel?.plan.activeRunId).toBe("run_1"));
+    await act(async () => {
+      await expect(result.current.pausePlan()).resolves.toBe(true);
+    });
+    expect(fake.port.pausePlan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerThreadId: "thr_1",
+        planId: "plan_1",
+        runId: "run_1",
+        expectedPlanRevision: 3,
+        idempotencyKey: expect.stringMatching(/^goal-ui-pause-/),
+      }),
+    );
+  });
+
+  it("observes the visible Plan independently and releases only its own handle", async () => {
+    const fake = goalPort();
+    const { result, unmount } = renderHook(() =>
+      useGoalController({
+        goalId: "goal_1",
+        ownerThreadId: "thr_1",
+        visible: true,
+        port: fake.port,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.planModel?.plan.planId).toBe("plan_1"));
+    await waitFor(() => expect(fake.port.observePlan).toHaveBeenCalledOnce());
+    expect(fake.port.observePlan).toHaveBeenCalledWith({
+      ownerThreadId: "thr_1",
+      planId: "plan_1",
+    });
+
+    unmount();
+    await waitFor(() =>
+      expect(fake.port.unobservePlan).toHaveBeenCalledWith({
+        observationId: "observe_plan_1_12345678",
+      }),
+    );
+  });
+
+  it("discovers and observes a standalone Plan when the Thread has no Goal", async () => {
+    const fake = goalPort();
+    const standalone = {
+      ...(await fake.port.readPlan({ ownerThreadId: "thr_1", planId: "plan_1" })),
+    };
+    vi.mocked(fake.port.currentPlan).mockResolvedValue(standalone);
+    const { result } = renderHook(() =>
+      useGoalController({ ownerThreadId: "thr_1", visible: true, port: fake.port }),
+    );
+
+    await waitFor(() => expect(result.current.planModel?.plan.planId).toBe("plan_1"));
+    expect(fake.port.currentPlan).toHaveBeenCalledOnce();
+    await waitFor(() => expect(fake.port.observePlan).toHaveBeenCalledOnce());
+  });
+
+  it("clears an old revision and hydrates the new immutable body even when details are hidden", async () => {
+    const initial = goalModel();
+    const updatedRevision = {
+      ...initial.plan!,
+      planRevisionId: "planrev_new",
+      revisionNumber: 3,
+    };
+    const updated = {
+      ...initial,
+      planState: {
+        ...initial.planState!,
+        activePlanRevisionId: "planrev_new",
+        revision: 4,
+      },
+      plan: updatedRevision,
+      planEventSequence: 4,
+    };
+    const fake = goalPort(initial);
+    const { result } = renderHook(() =>
+      useGoalController({
+        goalId: "goal_1",
+        ownerThreadId: "thr_1",
+        visible: true,
+        detailsVisible: false,
+        port: fake.port,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.planModel?.revision?.planRevisionId).toBe("planrev_2"),
+    );
+    const readsBeforeEvent = vi.mocked(fake.port.readPlan).mock.calls.length;
+    fake.setCurrent(updated);
+    act(() => {
+      fake.emit({
+        method: "plan/changed",
+        planId: "plan_1",
+        ownerThreadId: "thr_1",
+        planEventSequence: 4,
+        planRevision: 4,
+        plan: {
+          ...result.current.planModel!.plan,
+          activePlanRevisionId: "planrev_new",
+          revision: 4,
+        },
+        progress: result.current.planModel!.progress,
+        goalRevision: 7,
+        eventSequence: 8,
+        occurredAt: "2026-09-04T10:21:00+08:00",
+      });
+    });
+
+    await waitFor(() => expect(result.current.planModel?.revisionHydrationRequired).toBe(false));
+    expect(fake.port.readPlan).toHaveBeenCalledTimes(readsBeforeEvent + 1);
+    expect(result.current.planModel?.revision?.planRevisionId).toBe("planrev_new");
   });
 
   it("releases mutation single-flight after ACK without waiting for auxiliary enrichment", async () => {
@@ -348,69 +593,72 @@ describe("useGoalController", () => {
   });
 
   /** 活动 Goal 的 run 替换必须先暂停并等待收口，关联 ACK 后才可恢复。 */
-  it("pauses, retries settlement with one key, attaches, and resumes an active Goal", async () => {
-    const initial = goalModel("working", "approved");
-    const paused = {
-      ...goalModel("paused", "approved"),
-      goal: { ...goalModel("paused", "approved").goal, revision: 8 },
-      eventSequence: 8,
-    };
-    const attached = {
-      ...paused,
-      goal: { ...paused.goal, revision: 9 },
-      eventSequence: 9,
-    };
-    const resumed = {
-      ...initial,
-      goal: { ...initial.goal, revision: 10 },
-      eventSequence: 10,
-    };
-    const fake = goalPort(initial);
-    const order: string[] = [];
-    vi.mocked(fake.port.pause).mockImplementation(async () => {
-      order.push("pause");
-      fake.setCurrent(paused);
-      return paused;
-    });
-    vi.mocked(fake.port.attachPlan)
-      .mockImplementationOnce(async () => {
-        order.push("attach:settling");
-        throw goalPortError("GOAL_INVALID_STATE");
-      })
-      .mockImplementationOnce(async () => {
-        order.push("attach");
-        fake.setCurrent(attached);
-        return attached;
+  it.each(["approved", "awaiting_approval"] as const)(
+    "pauses, attaches %s with one key, and resumes an active Goal",
+    async (planStatus) => {
+      const initial = goalModel("working", planStatus);
+      const paused = {
+        ...goalModel("paused", "approved"),
+        goal: { ...goalModel("paused", "approved").goal, revision: 8 },
+        eventSequence: 8,
+      };
+      const attached = {
+        ...paused,
+        goal: { ...paused.goal, revision: 9 },
+        eventSequence: 9,
+      };
+      const resumed = {
+        ...initial,
+        goal: { ...initial.goal, revision: 10 },
+        eventSequence: 10,
+      };
+      const fake = goalPort(initial);
+      const order: string[] = [];
+      vi.mocked(fake.port.pause).mockImplementation(async () => {
+        order.push("pause");
+        fake.setCurrent(paused);
+        return paused;
       });
-    vi.mocked(fake.port.resume).mockImplementation(async () => {
-      order.push("resume");
-      fake.setCurrent(resumed);
-      return resumed;
-    });
-    const { result } = renderHook(() =>
-      useGoalController({ goalId: "goal_1", visible: true, port: fake.port }),
-    );
-    await waitFor(() => expect(result.current.model).toBeDefined());
+      vi.mocked(fake.port.attachPlan)
+        .mockImplementationOnce(async () => {
+          order.push("attach:settling");
+          throw goalPortError("GOAL_INVALID_STATE");
+        })
+        .mockImplementationOnce(async () => {
+          order.push("attach");
+          fake.setCurrent(attached);
+          return attached;
+        });
+      vi.mocked(fake.port.resume).mockImplementation(async () => {
+        order.push("resume");
+        fake.setCurrent(resumed);
+        return resumed;
+      });
+      const { result } = renderHook(() =>
+        useGoalController({ goalId: "goal_1", visible: true, port: fake.port }),
+      );
+      await waitFor(() => expect(result.current.model).toBeDefined());
 
-    await act(async () => {
-      await expect(result.current.attachPlan()).resolves.toBe(true);
-    });
+      await act(async () => {
+        await expect(result.current.attachPlan()).resolves.toBe(true);
+      });
 
-    expect(order).toEqual(["pause", "attach:settling", "attach", "resume"]);
-    const mutationCalls = vi.mocked(fake.port.attachPlan).mock.calls;
-    const mutationKey = mutationCalls[0]?.[0].idempotencyKey;
-    expect(mutationCalls[1]?.[0].idempotencyKey).toBe(mutationKey);
-    expect(mutationCalls[0]?.[0].expectedGoalRevision).toBe(8);
-    expect(vi.mocked(fake.port.pause).mock.calls[0]?.[0]).toMatchObject({
-      expectedGoalRevision: 7,
-      idempotencyKey: `${mutationKey}:pause`,
-    });
-    expect(vi.mocked(fake.port.resume).mock.calls[0]?.[0]).toMatchObject({
-      expectedGoalRevision: 9,
-      idempotencyKey: `${mutationKey}:resume`,
-    });
-    expect(result.current.model?.goal).toMatchObject({ revision: 10, status: "active" });
-  });
+      expect(order).toEqual(["pause", "attach:settling", "attach", "resume"]);
+      const mutationCalls = vi.mocked(fake.port.attachPlan).mock.calls;
+      const mutationKey = mutationCalls[0]?.[0].idempotencyKey;
+      expect(mutationCalls[1]?.[0].idempotencyKey).toBe(mutationKey);
+      expect(mutationCalls[0]?.[0].expectedGoalRevision).toBe(8);
+      expect(vi.mocked(fake.port.pause).mock.calls[0]?.[0]).toMatchObject({
+        expectedGoalRevision: 7,
+        idempotencyKey: `${mutationKey}:pause`,
+      });
+      expect(vi.mocked(fake.port.resume).mock.calls[0]?.[0]).toMatchObject({
+        expectedGoalRevision: 9,
+        idempotencyKey: `${mutationKey}:resume`,
+      });
+      expect(result.current.model?.goal).toMatchObject({ revision: 10, status: "active" });
+    },
+  );
 
   /** 已暂停或 needs_attention 的 Goal 不由关联动作擅自恢复。 */
   it("attaches directly and remains paused when the Goal was already paused", async () => {
@@ -467,7 +715,7 @@ describe("useGoalController", () => {
 
     expect(fake.port.resume).not.toHaveBeenCalled();
     expect(result.current.model?.goal).toMatchObject({ revision: 8, status: "paused" });
-    expect(result.current.error).toBe("计划未能用于当前目标，请确认计划仍已批准。");
+    expect(result.current.error).toBe("计划未能用于当前目标，请确认当前版本仍可用。");
   });
 
   it("publishes the acknowledged Goal identity for the first Plan turn", async () => {
@@ -504,6 +752,38 @@ describe("useGoalController", () => {
         idempotencyKey: expect.stringMatching(/^goal-ui-create-/),
       }),
     );
+  });
+
+  /** 侧边 controller 只切换 owner kind，Goal identity 仍由服务端 ACK 决定。 */
+  it("creates a Goal owned by an independent side-task Thread", async () => {
+    const created = {
+      ...goalModel("working", "draft"),
+      goal: {
+        ...goalModel("working", "draft").goal,
+        ownerThreadId: "thr_side",
+      },
+    };
+    const fake = goalPort(created);
+    const { result } = renderHook(() =>
+      useGoalController({
+        ownerThreadId: "thr_side",
+        ownerKind: "independent_task",
+        visible: true,
+        port: fake.port,
+      }),
+    );
+
+    await act(async () => {
+      await expect(result.current.create("thr_side", "侧边任务目标")).resolves.toBe(true);
+    });
+
+    expect(fake.port.create).toHaveBeenCalledWith({
+      ownerThreadId: "thr_side",
+      ownerKind: "independent_task",
+      objective: "侧边任务目标",
+      expectedGoalRevision: 0,
+      idempotencyKey: expect.stringMatching(/^goal-ui-create-/),
+    });
   });
 
   /** 独立 Plan 创建只回传 artifact identity，不预建或激活 Goal。 */

@@ -14,8 +14,7 @@ public final class GoalRepositoryException extends RuntimeException {
         /** 结构化计划或 DAG 非法。 */ PLAN_INVALID,
         /** 批准的 revision/hash 不是当前精确版本。 */ PLAN_APPROVAL_STALE,
         /** 必要步骤、证据或 evaluator 未完成。 */ GOAL_EVIDENCE_INCOMPLETE,
-        /** 未知副作用或 workspace identity 需要人工恢复。 */ GOAL_RECOVERY_REQUIRED,
-        /** 输入请求不存在、已响应或已过期。 */ GOAL_INPUT_EXPIRED
+        /** 未知副作用或 workspace identity 需要人工恢复。 */ GOAL_RECOVERY_REQUIRED
     }
 
     private final Code code;

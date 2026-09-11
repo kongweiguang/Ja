@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// task/create 只接受父 identity、显式 nullable Turn、规范任务名与结构化内容。
+/// task/create 只接受父 identity、显式 nullable Turn 和规范任务名，不携带首轮内容。
 #[test]
 fn task_create_validation_closes_control_fields_and_content_budget() {
     let valid = TaskCreateInput {
@@ -11,9 +11,7 @@ fn task_create_validation_closes_control_fields_and_content_budget() {
         parent_turn_id: Some("turn_parent".to_owned()),
         expected_parent_revision: 4,
         task_name: "检查测试".to_owned(),
-        content: vec![TurnContentPart::Text {
-            text: "检查聚焦测试".to_owned(),
-        }],
+        preferences: None,
     };
     assert!(valid.validate().is_ok());
     assert!(
@@ -57,6 +55,21 @@ fn task_tree_delete_requires_exact_repeated_identity() {
         .validate()
         .is_err()
     );
+}
+
+/// 侧聊关闭只携带有效 Thread identity，避免把 revision 或控制字段伪装成生命周期状态。
+#[test]
+fn task_close_validation_requires_thread_identity() {
+    assert!(TaskCloseInput {
+        task_thread_id: "thr_side".to_owned(),
+    }
+    .validate()
+    .is_ok());
+    assert!(TaskCloseInput {
+        task_thread_id: "side".to_owned(),
+    }
+    .validate()
+    .is_err());
 }
 
 /// QueueOnly 与 followup 均限制 Mailbox payload；只有 followup 额外携带 Task revision。

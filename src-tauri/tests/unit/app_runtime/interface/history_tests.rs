@@ -30,6 +30,54 @@ fn thread_list_input_is_workspace_scoped() {
     );
 }
 
+/// 全局发现使用独立 scope 与最小目录投影，不得退化为完整 Thread 列表或正文查询。
+#[test]
+fn thread_discovery_uses_minimal_cross_workspace_projection() {
+    let input: ThreadDiscoverInput = serde_json::from_value(json!({
+        "scope": "all",
+        "query": "侧聊",
+        "limit": 20
+    }))
+    .expect("valid discovery input");
+    assert!(validate_thread_discover(&input).is_ok());
+    assert!(
+        validate_thread_discover(&ThreadDiscoverInput {
+            scope: "workspace".to_owned(),
+            query: None,
+            cursor: None,
+            limit: None,
+            workspace_id: None,
+        })
+        .is_err()
+    );
+
+    let page = json!({
+        "items": [{
+            "threadId": "thr_side",
+            "title": "临时旁支",
+            "kind": "side_chat",
+            "workspaceId": "ws_other",
+            "status": "idle"
+        }],
+        "nextCursor": null
+    });
+    assert!(parse_thread_discovery(page.clone()).is_ok());
+    assert!(
+        parse_thread_discovery(json!({
+            "items": [{
+                "threadId": "thr_side",
+                "title": "临时旁支",
+                "kind": "side_chat",
+                "workspaceId": "ws_other",
+                "status": "idle",
+                "revision": 1
+            }],
+            "nextCursor": null
+        }))
+        .is_err()
+    );
+}
+
 /// Thread 创建必须显式携带协作模式与 nullable reasoning，Plan 不能由旧 native DTO 静默降级。
 #[test]
 fn thread_create_input_requires_collaboration_mode() {
@@ -196,6 +244,41 @@ fn thread_read_rejects_private_item_fields() {
         "contextUsage": null,
         "nextCursor": null
     });
+    assert!(parse_thread_read(result).is_err());
+}
+
+/// 跨会话消息作为独立历史事实保留来源标题快照；缺失来源或混入其它字段必须关闭失败。
+#[test]
+fn thread_read_accepts_strict_thread_message_items() {
+    let mut result = json!({
+        "threadId": "thr_target",
+        "revision": 3,
+        "turns": [],
+        "items": [{
+            "itemId": "item_message_1",
+            "createdAt": "2026-09-05T00:00:00Z",
+            "turnId": "turn_target",
+            "kind": "thread_message",
+            "sourceThreadId": "thr_source",
+            "sourceTitle": "临时侧聊",
+            "content": "请检查这个旁支结果"
+        }],
+        "taskActivities": [],
+        "goalActivities": [],
+        "contextUsage": null,
+        "inputQueue": null,
+        "nextCursor": null
+    });
+    let parsed = parse_thread_read(result.clone()).expect("thread message item");
+    assert_eq!(parsed.items[0]["kind"], "thread_message");
+    assert_eq!(parsed.items[0]["sourceThreadId"], "thr_source");
+    assert_eq!(parsed.items[0]["sourceTitle"], "临时侧聊");
+
+    result["items"][0]["sourceThreadId"] = json!("thread_source");
+    assert!(parse_thread_read(result.clone()).is_err());
+
+    result["items"][0]["sourceThreadId"] = json!("thr_source");
+    result["items"][0]["extra"] = json!("must be rejected");
     assert!(parse_thread_read(result).is_err());
 }
 

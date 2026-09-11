@@ -8,6 +8,7 @@ import type {
   McpTransport,
   ProviderModelSave,
   ProviderSave,
+  ReasoningLevel,
 } from "@/shared/settings/types";
 import type { ThemeMode, UiPalette } from "@/shared/styles/theme";
 export type {
@@ -19,7 +20,15 @@ export type {
 
 export { UI_PALETTE_LABELS, UI_PALETTE_ORDER } from "@/shared/styles/theme";
 export type { ThemeMode, UiPalette } from "@/shared/styles/theme";
-export type SettingsSection = "models" | "skills" | "mcp" | "permissions" | "appearance" | "about";
+export type SettingsSection =
+  | "general"
+  | "appearance"
+  | "models"
+  | "subagents"
+  | "permissions"
+  | "skills"
+  | "mcp"
+  | "about";
 export type AccessMode = "approval_required" | "full_access";
 export type SkillSource = "builtin" | "user" | "ja" | "project";
 type SkillStatus = "ready" | "disabled" | "reloading" | "error";
@@ -85,13 +94,23 @@ export interface AppearanceSettings {
   highContrast: boolean;
 }
 
+/** 子智能体策略是用户级配置的唯一前端投影；引用为空表示派发时跟随父任务模型。 */
+export interface SubagentSettings {
+  enabled: boolean;
+  providerId: string | null;
+  modelId: string | null;
+  reasoningLevel: ReasoningLevel | null;
+}
+
 /** camelCase v1 聚合是 application 唯一可见的配置事实，不泄漏 JA-RPC wire 字段。 */
 export interface SettingsDocument {
   schemaVersion: 1;
   revision: number;
   theme: ThemeMode;
   defaultAccessMode: AccessMode;
+  clarificationEnabled?: boolean;
   defaultSelection: DefaultModelSelection | null;
+  subagents: SubagentSettings;
   providers: ProviderProjection[];
   mcpServers: SettingsMcpServer[];
   skills: SettingsSkill[];
@@ -143,9 +162,11 @@ export interface SettingsConfigurationChange {
 export interface SettingsSnapshot {
   revision: number;
   defaultSelection: DefaultModelSelection | null;
+  subagents: SubagentSettings;
   providers: ProviderProjection[];
   skills: SkillProjection[];
   mcpServers: McpServerProjection[];
   defaultAccessMode: AccessMode;
+  clarificationEnabled?: boolean;
   appearance: AppearanceSettings;
 }

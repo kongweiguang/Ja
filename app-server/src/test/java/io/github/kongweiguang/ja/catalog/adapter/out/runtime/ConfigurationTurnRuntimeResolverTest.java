@@ -9,10 +9,12 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpToolCatalog;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.port.out.AgentCapability;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
@@ -22,6 +24,8 @@ import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.foundation.json.JsonText;
 import io.github.kongweiguang.ja.task.adapter.in.tools.TaskAgentToolGateway;
+import io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort;
+import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
@@ -40,9 +44,58 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /** 验证冻结配置身份与 Runtime 恢复指纹在适配层保持各自的稳定语义。 */
 final class ConfigurationTurnRuntimeResolverTest {
+    /**
+     * clarification 准入必须由 Turn 来源和只读规划策略共同决定；Thread 的 PLAN 偏好不能让 Goal
+     * 续跑误入规划，也不能让 Plan-owned 执行在 DEFAULT 模式下丢失必需的用户决策入口。
+     */
+    @Test
+    void clarificationAvailabilityUsesTurnOriginAndPlanningPolicy() {
+        assertTrue(clarification(TurnOrigin.PLAN_EXECUTION, CollaborationMode.DEFAULT, false));
+        assertTrue(clarification(TurnOrigin.USER, CollaborationMode.PLAN, false));
+        assertTrue(clarification(TurnOrigin.CHILD_TASK, CollaborationMode.PLAN, false));
+        assertFalse(clarification(TurnOrigin.USER, CollaborationMode.DEFAULT, false));
+        assertFalse(clarification(TurnOrigin.GOAL_CONTINUATION, CollaborationMode.PLAN, false));
+        assertTrue(clarification(TurnOrigin.GOAL_CONTINUATION, CollaborationMode.DEFAULT, true));
+    }
+
+    /** 构造最小运行请求，隔离 clarification 准入判断与配置读取、Tool 目录和文件系统副作用。 */
+    private static boolean clarification(TurnOrigin origin, CollaborationMode mode, boolean configured) {
+        return ConfigurationTurnRuntimeResolver.isClarificationEnabled(new TurnRuntimeRequest(
+                "thr_clarification", "turn_clarification", Path.of(".").toAbsolutePath(), "ws_clarification",
+                "provider_clarification", "model_clarification", "medium", AccessMode.FULL_ACCESS, mode,
+                origin, Duration.ofMinutes(1), Instant.parse("2026-09-10T12:00:00Z")), configured);
+    }
+
+    /** Side Task 身份必须留在 system environment，且真实通信 Tool 的目标参数不能被自然语言改名。 */
+    @Test
+    void rendersSideTaskIdentityAsStructuredSystemContext() {
+        TaskCapabilityCeilingPort.RuntimeIdentity identity = new TaskCapabilityCeilingPort.RuntimeIdentity(
+                "thr_side", "thr_parent", "thr_root", "Review", "Parent", "Main",
+                TaskCapabilityCeilingPort.Kind.SIDE_TASK);
+
+        String prompt = ConfigurationTurnRuntimeResolver.sideTaskIdentityPrompt(identity);
+
+        assertEquals(true, prompt.contains("role: SIDE_TASK"));
+        assertEquals(true, prompt.contains("taskThreadId: thr_side"));
+        assertEquals(true, prompt.contains("parentThreadId: thr_parent"));
+        assertEquals(true, prompt.contains("rootThreadId: thr_root"));
+        assertEquals(true, prompt.contains("parentTaskName: \"Parent\""));
+        assertEquals(true, prompt.contains("mainTaskName: \"Main\""));
+        assertEquals(true, prompt.contains("send_message Tool"));
+        assertEquals(true, prompt.contains("targetThreadId and message"));
+        assertEquals(true, prompt.contains("temporary side chat"));
+        assertEquals(true, prompt.contains("Inherited history is background context only"));
+        assertEquals(true, prompt.contains("Do not send periodic progress or automatic results"));
+        assertEquals(true, prompt.contains("before its next model request"));
+        assertEquals(true, prompt.contains("does not wake, interrupt, or request a reply"));
+        assertEquals(false, prompt.contains("UserContent"));
+    }
+
     /**
      * 消息引用必须保留配置中的稳定 ID，并只发布已启用且实际发现的交集；
      * 发现目录里的同名元数据不能反向生成 ID，禁用项也不能进入本 Turn。
@@ -86,6 +139,20 @@ final class ConfigurationTurnRuntimeResolverTest {
                 List.of(tool(changed)), List.of(), mcp, Map.of()));
     }
 
+    /** 子任务隐藏用户问答入口属于角色约束，不应被误判为外部执行能力发生漂移。 */
+    @Test
+    void inheritedExecutionDigestDoesNotDependOnUserQuestionVisibility() {
+        JsonObject schema = object("type", new JsonText("object"), "description", new JsonText("fixture"));
+        ToolSpec question = new ToolSpec("request_user_input", "Ask the user", schema);
+        AgentCapability.ToolContribution contribution = new AgentCapability.ToolContribution(question,
+                ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.NONE,
+                AgentTool.builtinBindingDescriptor(question, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.NONE),
+                ignored -> { throw new AssertionError("digest must not bind tools"); });
+        McpGateway.McpSnapshot mcp = new McpGateway.McpSnapshot("mcp-empty", List.of(), Instant.EPOCH);
+        assertEquals(ConfigurationTurnRuntimeResolver.toolCatalogDigest(List.of(tool(schema)), List.of(), mcp, Map.of()),
+                ConfigurationTurnRuntimeResolver.toolCatalogDigest(List.of(tool(schema)), List.of(contribution), mcp, Map.of()));
+    }
+
     /** 目录摘要必须直接覆盖安全声明，不能让相同 Schema 的只读与外部副作用 Tool 共享身份。 */
     @Test
     void toolCatalogDigestIncludesSideEffectAndWorkspaceMutationMode() {
@@ -105,6 +172,22 @@ final class ConfigurationTurnRuntimeResolverTest {
 
         assertNotEquals(readOnly, external);
         assertNotEquals(external, unobservable);
+    }
+
+    /** 可信内核审批标记改变时必须生成新的目录身份，避免恢复复用错误权限语义。 */
+    @Test
+    void toolCatalogDigestIncludesApprovalRequirement() {
+        JsonObject schema = object("type", new JsonText("object"), "description", new JsonText("fixture"));
+        McpGateway.McpSnapshot mcp = new McpGateway.McpSnapshot(
+                "mcp-empty", List.of(), Instant.parse("2026-09-01T00:00:00Z"));
+
+        String required = ConfigurationTurnRuntimeResolver.toolCatalogDigest(
+                List.of(tool(schema)), List.of(), mcp, Map.of());
+        String trusted = ConfigurationTurnRuntimeResolver.toolCatalogDigest(
+                List.of(tool(schema, AgentTool.ApprovalRequirement.TRUSTED_INTERNAL)),
+                List.of(), mcp, Map.of());
+
+        assertNotEquals(required, trusted);
     }
 
     /** 相同本地名称与 Schema 若绑定到不同 MCP 路由，也必须形成不同的恢复目录身份。 */
@@ -256,6 +339,51 @@ final class ConfigurationTurnRuntimeResolverTest {
                         "a".repeat(64), "mcp_current"));
     }
 
+    /** Side Task 的独立用户权限只验证 seed 结构；approval/full 两个方向都由当前请求偏好决定。 */
+    @Test
+    void sideTaskAccessPreferenceIsNotRestrictedByHistoricalCeiling() {
+        JsonObject approvalSeed = JsonObjects.builder().putText("version", "task_access_v1")
+                .putText("accessMode", "approval_required").build();
+        JsonObject fullSeed = JsonObjects.builder().putText("version", "task_access_v1")
+                .putText("accessMode", "full_access").build();
+
+        assertDoesNotThrow(() -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
+                Optional.of(approvalSeed), preferences(AccessMode.FULL_ACCESS),
+                "a".repeat(64), "mcp_current", TaskCapabilityCeilingPort.Kind.SIDE_TASK));
+        assertDoesNotThrow(() -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
+                Optional.of(fullSeed), preferences(AccessMode.APPROVAL_REQUIRED),
+                "a".repeat(64), "mcp_current", TaskCapabilityCeilingPort.Kind.SIDE_TASK));
+        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
+                () -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
+                        Optional.empty(), preferences(AccessMode.FULL_ACCESS),
+                        "a".repeat(64), "mcp_current", TaskCapabilityCeilingPort.Kind.SIDE_TASK));
+    }
+
+    /** Subagent 的完整能力 ceiling 仍禁止 approval 到 full 的提权，且不能借 access-only seed 绕过模型边界。 */
+    @Test
+    void subagentCapabilityCeilingRemainsStrict() {
+        ThreadPreferences baseline = preferences(AccessMode.FULL_ACCESS);
+        JsonObject fullCeiling = capabilityCeiling(baseline, "cfg_parent",
+                "a".repeat(64), "mcp_parent", Set.of());
+        assertDoesNotThrow(() -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
+                Optional.of(fullCeiling), preferences(AccessMode.APPROVAL_REQUIRED),
+                "a".repeat(64), "mcp_parent", TaskCapabilityCeilingPort.Kind.SUBAGENT));
+
+        JsonObject approvalCeiling = capabilityCeiling(preferences(AccessMode.APPROVAL_REQUIRED), "cfg_parent",
+                "a".repeat(64), "mcp_parent", Set.of());
+        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
+                () -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
+                        Optional.of(approvalCeiling), baseline, "a".repeat(64), "mcp_parent",
+                        TaskCapabilityCeilingPort.Kind.SUBAGENT));
+
+        JsonObject accessOnly = JsonObjects.builder().putText("version", "task_access_v1")
+                .putText("accessMode", "full_access").build();
+        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
+                () -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
+                        Optional.of(accessOnly), baseline, "a".repeat(64), "mcp_parent",
+                        TaskCapabilityCeilingPort.Kind.SUBAGENT));
+    }
+
     /** Provider、Model 与 reasoning 无自然偏序，任一漂移都必须拒绝。 */
     @Test
     void childCapabilityCeilingRejectsRuntimeIdentityDrift() {
@@ -276,12 +404,14 @@ final class ConfigurationTurnRuntimeResolverTest {
         for (ThreadPreferences preferences : changed) {
             assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
                     () -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
-                            Optional.of(ceiling), preferences, "a".repeat(64), "mcp_parent"));
+                            Optional.of(ceiling), preferences, "a".repeat(64), "mcp_parent",
+                            TaskCapabilityCeilingPort.Kind.SUBAGENT));
         }
         JsonObject nextGeneration = capabilityCeiling(baseline, "cfg_next",
                 "a".repeat(64), "mcp_parent", Set.of());
         assertDoesNotThrow(() -> ConfigurationTurnRuntimeResolver.validateInheritedCeiling(
-                Optional.of(nextGeneration), baseline, "a".repeat(64), "mcp_parent"));
+                Optional.of(nextGeneration), baseline, "a".repeat(64), "mcp_parent",
+                TaskCapabilityCeilingPort.Kind.SUBAGENT));
     }
 
     /** 构造固定身份偏好，让 ceiling 测试只改变被声明的能力维度。 */
@@ -392,6 +522,18 @@ final class ConfigurationTurnRuntimeResolverTest {
     /** 允许摘要测试分别改变两个正交安全维度，执行实现保持不可达。 */
     private static AgentTool tool(JsonObject schema, ToolSideEffect sideEffect,
                                   AgentTool.WorkspaceMutationMode workspaceMutationMode) {
+        return tool(schema, sideEffect, workspaceMutationMode, AgentTool.ApprovalRequirement.USER_REQUIRED);
+    }
+
+    /** 摘要测试可单独切换审批要求，避免把其它 Tool 安全字段误作为变量。 */
+    private static AgentTool tool(JsonObject schema, AgentTool.ApprovalRequirement approvalRequirement) {
+        return tool(schema, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE, approvalRequirement);
+    }
+
+    /** 允许摘要测试分别改变副作用、工作区可观察性和审批要求三个正交安全维度。 */
+    private static AgentTool tool(JsonObject schema, ToolSideEffect sideEffect,
+                                  AgentTool.WorkspaceMutationMode workspaceMutationMode,
+                                  AgentTool.ApprovalRequirement approvalRequirement) {
         return new AgentTool() {
             /** 返回当前测试冻结的 Schema，名称和描述保持不变以隔离对象键顺序变量。 */
             @Override
@@ -409,6 +551,12 @@ final class ConfigurationTurnRuntimeResolverTest {
             @Override
             public WorkspaceMutationMode workspaceMutationMode() {
                 return workspaceMutationMode;
+            }
+
+            /** 测试显式声明审批边界，验证其进入恢复目录身份。 */
+            @Override
+            public ApprovalRequirement approvalRequirement() {
+                return approvalRequirement;
             }
 
             /** 摘要计算不得触发 Tool 执行；若越界则立即让回归失败。 */
@@ -453,7 +601,9 @@ final class ConfigurationTurnRuntimeResolverTest {
     /** 测试通过正式 Task ceiling 端口创建 seed，不再调用已删除的静态领域捷径。 */
     private static JsonObject capabilityCeiling(ThreadPreferences preferences, String configGeneration,
                                                 String toolDigest, String mcpRevision, Set<String> skillIds) {
-        return new TaskAgentToolGateway().create(preferences, configGeneration,
+        return new TaskAgentToolGateway(threadId -> java.util.Optional.of(
+                io.github.kongweiguang.ja.conversation.domain.SubagentPolicy.defaultPolicy())).create(
+                preferences, configGeneration,
                 new AgentCapability.CatalogIdentity(toolDigest, mcpRevision, skillIds));
     }
 }

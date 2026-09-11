@@ -2,6 +2,21 @@
   "resources": {
     "includes": [
       {
+        "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/SideChatPurgeMapper\\.xml"
+      },
+      {
+        "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/SideChatMapper\\.xml"
+      },
+      {
+        "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/ThreadDiscoveryMapper\\.xml"
+      },
+      {
+        "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/PlanEvaluationMapper\\.xml"
+      },
+      {
+        "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/InteractionMapper\\.xml"
+      },
+      {
         "pattern": "ja-build\\.properties"
       },
       {

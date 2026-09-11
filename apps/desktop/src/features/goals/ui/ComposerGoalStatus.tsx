@@ -19,6 +19,7 @@ export interface ComposerGoalStatusProps {
   readonly currentStepTitle?: string;
   readonly busy?: boolean;
   readonly onOpenGoal?: () => void;
+  readonly onOpenPlan?: () => void;
   readonly onDisablePlan?: () => void | Promise<void>;
 }
 
@@ -32,6 +33,7 @@ export function ComposerGoalStatus({
   currentStepTitle,
   busy = false,
   onOpenGoal,
+  onOpenPlan,
   onDisablePlan,
 }: ComposerGoalStatusProps): ReactElement | null {
   const [open, setOpen] = useState(false);
@@ -57,6 +59,12 @@ export function ComposerGoalStatus({
   const openGoal = (): void => {
     setOpen(false);
     onOpenGoal?.();
+  };
+
+  /** 无 Goal 的独立 Plan 仍需可进入编辑面板，不能借用 Goal 是否存在作为入口条件。 */
+  const openPlan = (): void => {
+    setOpen(false);
+    onOpenPlan?.();
   };
 
   return (
@@ -122,6 +130,12 @@ export function ComposerGoalStatus({
         )}
 
         <div className="ja-composer-goal-popover__actions">
+          {activeGoal !== undefined || onOpenPlan === undefined ? null : (
+            <button type="button" onClick={openPlan}>
+              查看计划
+              <ChevronRight aria-hidden="true" />
+            </button>
+          )}
           {activeGoal === undefined || onOpenGoal === undefined ? null : (
             <button type="button" onClick={openGoal}>
               查看目标

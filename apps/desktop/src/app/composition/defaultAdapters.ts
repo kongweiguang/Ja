@@ -22,6 +22,8 @@ import { createWorkspaceHostAdapter } from "@/api/tauri/workspace";
 import { nativeDropRouterFor } from "@/api/tauri/nativeDrop";
 import { defaultNativeBridge } from "@/api/tauri/runtime";
 import { createGoalAdapter } from "@/api/tauri/goals";
+import { createInteractionAdapter } from "@/api/tauri/interaction";
+import { createInteractionPort, subscribeInteractionHostEvents } from "@/features/conversation";
 import { createTurnArtifactAdapter, type TurnArtifactAdapter } from "@/api/tauri/turnArtifacts";
 import type { WorkspacePickerPort } from "@/features/workspace";
 import type { AttachmentPreviewPort } from "@/features/workbench/preview";
@@ -44,6 +46,10 @@ export const DEFAULT_HISTORY_ADAPTER = createHistoryAdapter();
 /** Goal feature 与 Task 共用唯一 Runtime 事件订阅，mutation 仍走专用 Tauri command。 */
 export const DEFAULT_GOAL_PORT = createGoalPort(createGoalAdapter(), {
   subscribe: subscribeGoalHostEvents,
+});
+/** 问答动作走专用 typed adapter，事件复用唯一宿主监听器。 */
+export const DEFAULT_INTERACTION_PORT = createInteractionPort(createInteractionAdapter(), {
+  subscribe: subscribeInteractionHostEvents,
 });
 /**
  * Composer 默认附件能力只组合脱敏的 Tauri adapter；原生路径、staging token 与 App Server

@@ -106,12 +106,12 @@ describe("useWindowFrameController", () => {
     const { result } = renderHook(() => useWindowFrameController(fixture.port, true));
 
     act(() => {
-      result.current.invoke("hide");
+      result.current.invoke("close");
       result.current.invoke("minimize");
     });
     expect(fixture.invoke).toHaveBeenCalledTimes(1);
-    expect(fixture.invoke).toHaveBeenCalledWith("hide");
-    expect(result.current.pendingAction).toBe("hide");
+    expect(fixture.invoke).toHaveBeenCalledWith("close");
+    expect(result.current.pendingAction).toBe("close");
 
     await act(async () => {
       completion.resolve();

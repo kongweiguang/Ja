@@ -15,6 +15,7 @@ import type {
 } from "../application/runtimePorts";
 import { publishTaskHostEvent } from "@/features/tasks";
 import { publishGoalHostEvent } from "@/features/goals";
+import { publishInteractionHostEvent, useTimelineStore } from "@/features/conversation";
 
 /**
  * 逐个映射冻结的 Settings 查询，让 application 自有的关联类型不反向依赖 JA-RPC schema。
@@ -90,6 +91,40 @@ export function createRuntimeHostPort(
       adapter.subscribe((event) => {
         if (event.kind === "task") {
           publishTaskHostEvent(event.event);
+          return;
+        }
+        if (event.kind === "interaction") {
+          const params = event.event.params;
+          // 取消问题在同一事务关闭挂起 Turn；仅标记对应会话回读，不在这里伪造终态或扫描隐藏会话。
+          if (params.kind === "cancelled") {
+            useTimelineStore.getState().requestThreadResync(params.threadId);
+          }
+          publishInteractionHostEvent({
+            kind:
+              params.kind === "answered"
+                ? "answered"
+                : params.kind === "cancelled"
+                  ? "cancelled"
+                  : "snapshot_changed",
+            threadId: params.threadId,
+            eventSequence: params.eventSequence,
+          });
+          return;
+        }
+        if (event.kind === "plan") {
+          const params = event.event.params;
+          publishGoalHostEvent({
+            method: "plan/changed",
+            planId: params.planId,
+            ownerThreadId: params.ownerThreadId,
+            planRevision: params.planRevision,
+            planEventSequence: params.eventSequence,
+            plan: { ...params.plan, ownerThreadId: params.plan.owner.threadId },
+            progress: params.progress,
+            goalRevision: 0,
+            eventSequence: params.eventSequence,
+            occurredAt: params.occurredAt,
+          });
           return;
         }
         if (event.kind === "goal") {

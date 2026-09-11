@@ -36,6 +36,12 @@ export type TimelineSnapshotItem =
       content: UserContentBlock[];
       attachments: AttachmentSummary[];
     })
+  | (SnapshotItemBase & {
+      kind: "thread_message";
+      sourceThreadId: string;
+      sourceTitle: string;
+      content: string;
+    })
   | (SnapshotItemBase & { kind: "assistant_progress"; text: string; modelRound: number })
   | (SnapshotItemBase & { kind: "reasoning_summary"; text: string; modelRound: number })
   | (SnapshotItemBase & { kind: "final_answer"; text: string })
@@ -85,6 +91,7 @@ export interface InputQueue {
 }
 
 export type TimelineTaskActivityKind =
+  | "created"
   | "dispatched"
   | "message_sent"
   | "follow_up_queued"
@@ -96,6 +103,9 @@ export type TimelineTaskActivityKind =
   | "cancelled"
   | "suspended";
 
+/** Task 初始创建阶段没有 Turn，故其状态闭集独立于普通 Turn 状态。 */
+export type TimelineTaskState = "idle" | TimelineTurnState;
+
 /** Conversation 只保存主 Timeline 卡片所需的 Task 摘要，不反向依赖完整 Task feature。 */
 export interface TimelineTaskSummary {
   taskThreadId: string;
@@ -106,7 +116,7 @@ export interface TimelineTaskSummary {
   depth: number;
   taskKind: "side_task" | "subagent";
   lifecycle: "independent" | "attached";
-  state: TimelineTurnState;
+  state: TimelineTaskState;
   revision: number;
   latestActivitySequence: number;
   unreadCount: number;
@@ -123,6 +133,7 @@ export interface TimelineTaskSummary {
 export interface TimelineTaskActivity {
   activitySequence: number;
   activityId: string;
+  rootThreadId: string;
   taskThreadId: string;
   actorThreadId: string;
   causalTurnId: string | null;
@@ -210,6 +221,12 @@ export type TimelineEvent =
           usage?: UsageProjection;
           reasoningSummary?: string;
         };
+      }
+    >
+  | EventEnvelope<
+      "turn/messages_received",
+      SemanticBase & {
+        items: Array<Extract<TimelineSnapshotItem, { kind: "thread_message" }>>;
       }
     >
   | EventEnvelope<
@@ -355,6 +372,7 @@ export type TimelineEvent =
 const TIMELINE_METHODS = new Set<TimelineEvent["method"]>([
   "turn/input-queue-changed",
   "turn/input-consumed",
+  "turn/messages_received",
   "turn/state-changed",
   "assistant/model-step-committed",
   "assistant/text-delta",
@@ -375,6 +393,7 @@ const TIMELINE_METHODS = new Set<TimelineEvent["method"]>([
 const WORKSPACE_SCOPED_METHODS = new Set<TimelineEvent["method"]>([
   "turn/input-queue-changed",
   "turn/input-consumed",
+  "turn/messages_received",
   "turn/state-changed",
   "assistant/model-step-committed",
   "assistant/text-delta",
@@ -487,6 +506,18 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
         (settlement["usage"] as TimelineContextUsage).modelRound !== settlement["modelRound"])
     )
       return undefined;
+  }
+  if (root["method"] === "turn/messages_received") {
+    const items = params["items"];
+    if (
+      !Array.isArray(items) ||
+      items.length === 0 ||
+      items.length > 256 ||
+      !items.every((item) => isThreadMessageItem(item, params["turnId"]))
+    )
+      return undefined;
+    const itemIds = items.map((item) => (item as Record<string, unknown>)["itemId"]);
+    if (new Set(itemIds).size !== itemIds.length) return undefined;
   }
   if (root["method"] === "turn/terminal") {
     if (params["usage"] !== undefined && !isTimelineContextUsage(params["usage"])) return undefined;
@@ -727,11 +758,11 @@ function isTimelineTaskActivityEntry(value: unknown, rootThreadId: string): bool
     return false;
   const activity = entry["activity"] as Record<string, unknown>;
   const task = entry["task"] as Record<string, unknown>;
-  const validTaskKind = task["taskKind"] === "side_task" || task["taskKind"] === "subagent";
-  const validLifecycle =
-    (task["taskKind"] === "side_task" && task["lifecycle"] === "independent") ||
-    (task["taskKind"] === "subagent" && task["lifecycle"] === "attached");
+  // Conversation Timeline 只展示当前会话直接委派的子任务；独立侧聊不能回流到来源会话。
+  const validTaskKind = task["taskKind"] === "subagent";
+  const validLifecycle = task["taskKind"] === "subagent" && task["lifecycle"] === "attached";
   const validState = [
+    "idle",
     "queued",
     "running",
     "waiting_approval",
@@ -741,6 +772,7 @@ function isTimelineTaskActivityEntry(value: unknown, rootThreadId: string): bool
     "cancelled",
   ].includes(String(task["state"]));
   const validActivityKind = [
+    "created",
     "dispatched",
     "message_sent",
     "follow_up_queued",
@@ -755,6 +787,7 @@ function isTimelineTaskActivityEntry(value: unknown, rootThreadId: string): bool
   const summary = activity["summary"] as Record<string, unknown> | undefined;
   return (
     typeof activity["activityId"] === "string" &&
+    typeof activity["rootThreadId"] === "string" &&
     typeof activity["taskThreadId"] === "string" &&
     typeof activity["actorThreadId"] === "string" &&
     (activity["causalTurnId"] === null || typeof activity["causalTurnId"] === "string") &&
@@ -767,7 +800,8 @@ function isTimelineTaskActivityEntry(value: unknown, rootThreadId: string): bool
     typeof task["taskThreadId"] === "string" &&
     task["taskThreadId"] === activity["taskThreadId"] &&
     typeof task["parentThreadId"] === "string" &&
-    task["rootThreadId"] === rootThreadId &&
+    task["parentThreadId"] === rootThreadId &&
+    task["rootThreadId"] === activity["rootThreadId"] &&
     (task["originTurnId"] === null || typeof task["originTurnId"] === "string") &&
     typeof task["taskName"] === "string" &&
     Number.isSafeInteger(task["depth"]) &&
@@ -879,6 +913,8 @@ function isTimelineSnapshotItem(value: unknown): value is TimelineSnapshotItem {
         item["content"].every(isUserContentBlock) &&
         isAttachmentSummaryList(item["attachments"], item["content"])
       );
+    case "thread_message":
+      return isThreadMessageItem(item);
     case "final_answer":
       return typeof item["text"] === "string";
     case "assistant_progress":
@@ -903,4 +939,53 @@ function isTimelineSnapshotItem(value: unknown): value is TimelineSnapshotItem {
     default:
       return false;
   }
+}
+
+/** 跨会话消息只允许冻结来源身份与纯文本正文，避免通信内容伪装成用户或系统输入。 */
+function isThreadMessageItem(value: unknown, expectedTurnId?: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  const keys = Object.keys(item).sort();
+  const expectedKeys = [
+    "content",
+    "createdAt",
+    "itemId",
+    "kind",
+    "sourceThreadId",
+    "sourceTitle",
+    "turnId",
+  ];
+  return (
+    keys.length === expectedKeys.length &&
+    keys.every((key, index) => key === expectedKeys[index]) &&
+    item["kind"] === "thread_message" &&
+    isThreadMessageIdentifier(item["itemId"], "item_", 101) &&
+    typeof item["createdAt"] === "string" &&
+    isThreadMessageIdentifier(item["turnId"], "turn_", 101) &&
+    (expectedTurnId === undefined || item["turnId"] === expectedTurnId) &&
+    isThreadMessageIdentifier(item["sourceThreadId"], "thr_", 100) &&
+    typeof item["sourceTitle"] === "string" &&
+    item["sourceTitle"].length > 0 &&
+    item["sourceTitle"].length <= 512 &&
+    item["sourceTitle"].trim().length > 0 &&
+    !item["sourceTitle"].includes("\u0000") &&
+    !item["sourceTitle"].includes("\r") &&
+    !item["sourceTitle"].includes("\n") &&
+    typeof item["content"] === "string" &&
+    item["content"].length <= 1_048_576 &&
+    !item["content"].includes("\u0000")
+  );
+}
+
+/** 复用 JA-RPC opaque identity grammar，避免 domain seam 接受 transport 已拒绝的路径或控制字符。 */
+function isThreadMessageIdentifier(
+  value: unknown,
+  prefix: string,
+  maximum: number,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maximum &&
+    new RegExp(`^${prefix}[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`).test(value)
+  );
 }

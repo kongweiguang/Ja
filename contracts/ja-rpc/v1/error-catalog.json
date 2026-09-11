@@ -83,6 +83,11 @@
     { "code": -32090, "errorCode": "PLAN_APPROVAL_STALE", "category": "conflict", "retryable": false },
     { "code": -32091, "errorCode": "GOAL_EVIDENCE_INCOMPLETE", "category": "conflict", "retryable": false },
     { "code": -32092, "errorCode": "GOAL_RECOVERY_REQUIRED", "category": "conflict", "retryable": false },
-    { "code": -32093, "errorCode": "GOAL_INPUT_EXPIRED", "category": "timeout", "retryable": false }
+    { "code": -32094, "errorCode": "INTERACTION_NOT_FOUND", "category": "not_found", "retryable": false },
+    { "code": -32095, "errorCode": "INTERACTION_REVISION_CONFLICT", "category": "conflict", "retryable": true },
+    { "code": -32096, "errorCode": "INTERACTION_INVALID_STATE", "category": "conflict", "retryable": false },
+    { "code": -32097, "errorCode": "INTERACTION_INVALID", "category": "validation", "retryable": false },
+    { "code": -32098, "errorCode": "PLAN_REVISION_CONFLICT", "category": "conflict", "retryable": true },
+    { "code": -32099, "errorCode": "PLAN_INVALID_STATE", "category": "conflict", "retryable": false }
   ]
 }

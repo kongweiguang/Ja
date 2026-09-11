@@ -91,6 +91,8 @@ export function SearchPanel({
   // 无法安全 Memoize 的命令式函数。
   // eslint-disable-next-line react-hooks/incompatible-library
   const rowVirtualizer = useVirtualizer({
+    // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
+    useFlushSync: false,
     count: results.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 58,

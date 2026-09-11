@@ -7,7 +7,6 @@ export {
   capabilityWorkbenchTab,
   parseTaskWorkbenchTabKey,
   sameWorkbenchTab,
-  sideTaskDraftWorkbenchTab,
   taskWorkbenchTab,
 } from "./domain/tabs";
 export type {

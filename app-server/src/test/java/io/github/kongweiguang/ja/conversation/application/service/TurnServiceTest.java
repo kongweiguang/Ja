@@ -1055,6 +1055,50 @@ final class TurnServiceTest {
         }
     }
 
+    /**
+     * 正常关闭先执行临时 owner 的前置收口，再发布 Turn shutdown fence；前置 hook 内仍可完成一次
+     * 真实准入，而 fence 发布后新的用户 Turn 必须立即拒绝，避免侧聊取消失去 Turn owner。
+     */
+    @Test
+    void normalCloseRunsPreShutdownHookBeforeStoppingAdmission() throws Exception {
+        RecordingStore store = new RecordingStore();
+        CancellationProbeModel model = new CancellationProbeModel();
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            AtomicReference<TurnUseCase.Accepted> hookAdmission = new AtomicReference<>();
+            AtomicBoolean hookRan = new AtomicBoolean();
+            service.bindPreShutdownHook(deadline -> {
+                // 隐式 try-with-resources close 会再次调用 closeAt；只在首次 hook 中制造真实准入。
+                if (hookRan.compareAndSet(false, true)) {
+                    hookAdmission.set(service.start(request("turn_hook"),
+                            event -> CompletableFuture.completedFuture(null)));
+                    try {
+                        if (!model.firstStarted.await(1, TimeUnit.SECONDS)) {
+                            throw new AssertionError("pre-shutdown admission did not start");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("pre-shutdown test was interrupted", interrupted);
+                    }
+                }
+            });
+
+            service.closeAt(System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
+
+            assertTrue(hookRan.get());
+            assertNotNull(hookAdmission.get());
+            assertTrue(hookAdmission.get().completion().toCompletableFuture().isDone());
+            assertThrows(java.util.concurrent.RejectedExecutionException.class,
+                    () -> service.start(request("turn_after_shutdown"),
+                            event -> CompletableFuture.completedFuture(null)));
+        }
+    }
+
     /** 创建 transport-free 启动意图，使测试也必须经过真实 RuntimeResolver 边界。 */
     private static TurnStartRequest request(String turnId) {
         return request(turnId, "test");
@@ -1451,7 +1495,8 @@ final class TurnServiceTest {
             TurnExecutionState.Common common = new TurnExecutionState.Common(
                     0, 0, 1, promptSummary.isEmpty() ? null : "cp_prompt",
                     activeSkills, CLOCK.instant().plus(TurnLimits.defaults().wallTimeout()),
-                    io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
+                    io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER,
+                    TurnLimits.defaults().wallTimeout());
             if (messages.isEmpty()) {
                 messages.add(new StoredMessage("item_user_resume", "turn_resume", 1,
                         new ModelMessage(ModelRole.USER, List.of(new TextContent("resume"))), CLOCK.instant()));

@@ -39,7 +39,8 @@ test("历史兼容实现不得重新进入生产源码", () => {
   }
 });
 
-test("真实目录检查拒绝多代迁移和旧合同，同时允许当前首版", async () => {
+/** 固定已审定的策略初始化例外，避免放宽为任意迁移均可打包。 */
+test("真实目录检查允许子智能体策略初始化，拒绝额外迁移和旧合同", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ja-baseline-policy-"));
   try {
     for (const directory of [
@@ -56,8 +57,11 @@ test("真实目录检查拒绝多代迁移和旧合同，同时允许当前首�
       path.join(migrations, "V1__kernel.sql"),
       "CREATE TABLE current_state(id TEXT);",
     );
+    assert.equal((await checkInitialBaseline(root)).length, 1);
+    await writeFile(path.join(migrations, "V2__thread_subagent_policies.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V3__subagent_reasoning.sql"), "SELECT 1;");
     assert.deepEqual(await checkInitialBaseline(root), []);
-    await writeFile(path.join(migrations, "V2__history.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V4__history.sql"), "SELECT 1;");
     await mkdir(path.join(root, "contracts/ja-rpc/v2"));
     assert.equal((await checkInitialBaseline(root)).length, 2);
   } finally {

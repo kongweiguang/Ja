@@ -16,7 +16,7 @@ public interface TaskMapper {
     /** origin Turn 必须属于父 Thread，根 Turn 只能从既有因果列继承。 */
     TaskRecords.TurnCausalityRow selectTurnCausality(@Param("turnId") String turnId);
 
-    /** 通信发送方与目标通过同一查询解析根树，不接受跨根 Mailbox。 */
+    /** 通信发送方与目标通过同一查询解析根树，MESSAGE/Follow-up 的根关系由 repository 显式校验。 */
     TaskRecords.TaskRouteRow selectTaskRoute(@Param("threadId") String threadId);
 
     /** 有效上下文只读取 checkpoint retained 边界之后的消息，并用 limit+1 暴露超限。 */
@@ -104,6 +104,9 @@ public interface TaskMapper {
 
     /** Activity 与状态投影共享 expected revision CAS。 */
     int compareAndSetProjection(TaskRecords.ProjectionCas values);
+
+    /** 内部 Goal/Plan Turn 可重新激活已终态 Task，避免隐藏执行绕过 TaskCoordinator。 */
+    int compareAndSetInternalProjection(TaskRecords.ProjectionCas values);
 
     /** QueueOnly 通信只推进 Activity/未读，不改变运行或终态。 */
     int compareAndSetProjectionActivity(TaskRecords.ProjectionActivityCas values);

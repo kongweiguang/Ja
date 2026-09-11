@@ -42,12 +42,15 @@ METHODS = [
     "workspace/path/search", "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list", "thread/search",
     "thread/read", "thread/rename", "thread/pin", "thread/seen", "thread/preferences/update", "thread/archive",
     "thread/restore", "thread/delete", "thread/compact",
+    "interaction/read", "interaction/observe", "interaction/unobserve", "interaction/draft/save",
+    "interaction/respond", "interaction/cancel",
     "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read", "plan/revisions/list",
+    "plan/current/read", "plan/events/read", "plan/observe", "plan/unobserve", "plan/evidence/list",
     "goal/evidence/list", "goal/create", "goal/plan/attach", "goal/plan/detach", "goal/pause", "goal/resume",
-    "goal/stop", "goal/input/respond", "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose",
-    "plan/approve", "plan/execute", "plan/reject",
+    "goal/stop", "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/execute",
+    "plan/reject", "plan/pause", "plan/resume", "plan/stop",
     "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
-    "task/message/send", "task/followup", "task/cancel", "task/tree/delete",
+    "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
     "attachment/import", "attachment/discard", "attachment/preview/open", "attachment/preview/read",
     "attachment/preview/close", "turn/start", "turn/resume", "turn/cancel", "turn/input/enqueue",
     "turn/input/prioritize", "turn/input/update", "turn/input/delete", "turn/change-set/read",
@@ -57,6 +60,7 @@ METHODS = [
 ]
 EVENTS = [
     "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",
+    "turn/messages_received",
     "assistant/model-step-committed",
     "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",
     "approval/requested", "approval/resolved", "context/compaction-started", "context/compacted",
@@ -64,7 +68,7 @@ EVENTS = [
     "workspace/dirty", "turn/terminal",
     "thread/metadata-changed", "configuration/changed",
     "task/activity", "task/progress", "task/mailbox-changed",
-    "goal/changed", "goal/activity", "goal/input-requested",
+    "goal/changed", "goal/activity", "interaction/changed", "plan/changed",
 ]
 SECRET_NAME_PARTS = (
     "API_KEY",
@@ -220,7 +224,7 @@ def initialize_frame() -> dict[str, Any]:
                 "events": EVENTS,
                 "accessModes": ["approval_required", "full_access"],
                 "collaborationModes": ["default", "plan"],
-                "features": ["task_threads_v1", "plan_goal_v1"],
+                "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
             },
             "limits": {
                 "maxFrameBytes": 4194304,
@@ -373,6 +377,7 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
             "enabled": True,
             "description": SKILL_DESCRIPTION,
         }],
+        "subagents": {"enabled": False, "provider_id": None, "model_id": None, "reasoning_level": None},
     }
 
 
@@ -418,6 +423,7 @@ def configuration_replace_frame(
             "providers": [],
             "mcp_servers": [],
             "skills": [],
+            "subagents": {"enabled": False, "provider_id": None, "model_id": None, "reasoning_level": None},
         }
 
     return {
@@ -1004,6 +1010,7 @@ def sidecar_command(
         f"--data-dir-base64={encoded_path(runtime_data_directory)}",
         f"--run-dir-base64={encoded_path(run_directory)}",
         f"--log-dir-base64={encoded_path(log_directory)}",
+        "--ja-runtime-generation=1",
     ]
 
 

@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.Provid
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import org.junit.jupiter.api.Test;
@@ -26,6 +27,55 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 锁定 Responses 原生图片/PDF 的官方 wire 形态与 Codec 能力闭集。 */
 final class OpenAiResponsesCodecTest {
+    /** 两种 OpenAI 协议的探测都只能发送 hi，不能注入空 system 消息或 instructions。 */
+    @Test
+    void omitsSystemPromptForUserOnlyProbe() {
+        ModelPort.ModelRequest base = request(ModelRole.USER, List.of(new TextContent("hi")));
+        ModelPort.ModelRequest probe = new ModelPort.ModelRequest(base.configuration(),
+                new ModelPort.PromptPayload("", "prompt_probe"), base.messages(), List.of(), null, 1);
+        JsonNode responses = OpenAiResponsesCodec.encodeRequest(probe);
+        assertFalse(responses.has("instructions"));
+        assertFalse(responses.path("store").booleanValue());
+        assertEquals("reasoning.encrypted_content", responses.path("include").path(0).textValue());
+        assertEquals(1, responses.path("input").size());
+        assertEquals("hi", responses.path("input").path(0).path("content").path(0).path("text").asText());
+        JsonNode chat = OpenAiChatCompletionsCodec.encodeRequest(probe);
+        assertEquals(1, chat.path("messages").size());
+        assertEquals("user", chat.path("messages").path(0).path("role").asText());
+        assertEquals("hi", chat.path("messages").path(0).path("content").asText());
+    }
+
+    /** Responses 下一轮只回放同身份原生 reasoning item，并在跨来源时丢弃 opaque 块。 */
+    @Test
+    void replaysMatchingReasoningItemInAssistantHistoryAndSkipsOtherOrigins() {
+        ModelPort.ModelRequest base = request(ModelRole.USER, List.of(new TextContent("hi")));
+        ModelPort.ModelConfiguration configuration = base.configuration();
+        String endpoint = ReasoningContent.endpointFingerprint(configuration.baseUri());
+        ReasoningContent matching = new ReasoningContent(
+                configuration.providerId(), configuration.modelId(), "openai_responses", configuration.model(),
+                endpoint, "reasoning",
+                "{\"type\":\"reasoning\",\"id\":\"reason_1\","
+                        + "\"summary\":[],\"encrypted_content\":\"opaque\"}");
+        ReasoningContent mismatched = new ReasoningContent(
+                "provider_other", configuration.modelId(), "openai_responses", configuration.model(),
+                endpoint, "reasoning",
+                "{\"type\":\"reasoning\",\"id\":\"wrong\",\"encrypted_content\":\"bad\"}");
+        ModelPort.ModelRequest withHistory = new ModelPort.ModelRequest(
+                configuration, base.prompt(), List.of(base.messages().getFirst(),
+                new ModelMessage(ModelRole.ASSISTANT, List.of(
+                        new TextContent("before"), matching, mismatched, new TextContent("after")))),
+                List.of(), null, 2);
+
+        JsonNode input = OpenAiResponsesCodec.encodeRequest(withHistory).path("input");
+        assertEquals(4, input.size());
+        assertEquals("assistant", input.path(1).path("role").asText());
+        assertEquals("before", input.path(1).path("content").asText());
+        assertEquals("reasoning", input.path(2).path("type").asText());
+        assertEquals("opaque", input.path(2).path("encrypted_content").asText());
+        assertEquals("after", input.path(3).path("content").asText());
+        assertFalse(input.toString().contains("wrong"));
+    }
+
     /** 用户附件必须编码为带媒体类型的 data URL，PDF 还必须保留安全显示名。 */
     @Test
     void encodesNativeImageAndPdfAsResponsesInputBlocks() {

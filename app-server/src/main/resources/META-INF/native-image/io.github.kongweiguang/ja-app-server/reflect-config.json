@@ -1,4 +1,33 @@
 [
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatPurgeMapper","allDeclaredMethods":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatMapper","allDeclaredMethods":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$SideChatMarkerRow","allDeclaredConstructors":true,"allDeclaredMethods":true},
+  { "name": "io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestionType", "allDeclaredMethods": true, "allDeclaredFields": true },
+  { "name": "io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus", "allDeclaredMethods": true, "allDeclaredFields": true },
+  { "name": "io.github.kongweiguang.ja.conversation.domain.interaction.InteractionResumeState", "allDeclaredMethods": true, "allDeclaredFields": true },
+  { "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SubagentPolicyRow", "allDeclaredConstructors": true, "allDeclaredMethods": true },
+  { "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SubagentPolicyInsert", "allDeclaredConstructors": true, "allDeclaredMethods": true },
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionEventInsert","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationIntentInsert","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationUsageUpdate","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationPriorRow","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionRow","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionDraftRow","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionEventRow","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionKey","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionInsert","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionAnswerCas","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionCloseCas","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionDraftCas","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionAnswer","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionOption","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestion","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionDraft","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionEvent","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.conversation.domain.interaction.InteractionSnapshot","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper",
     "allDeclaredMethods": true
@@ -202,12 +231,21 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadDiscoveryMapper",
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceRow",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadDiscoveryRow",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
@@ -563,6 +601,11 @@
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadSearch",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadDiscoveryPage",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },

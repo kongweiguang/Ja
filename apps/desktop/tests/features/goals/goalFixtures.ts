@@ -107,10 +107,6 @@ export function goalModel(
     planEventSequence: 3,
     plan: planRevision,
     draft: null,
-    inputRequest:
-      phase === "waiting_input"
-        ? { requestId: "goalinput_1", prompt: "请选择恢复策略", expiresAt: null }
-        : null,
     evaluation:
       phase === "needs_attention"
         ? {

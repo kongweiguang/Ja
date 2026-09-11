@@ -4,6 +4,7 @@ package io.github.kongweiguang.ja.conversation.application.loop;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
@@ -141,6 +142,19 @@ final class AgentRound implements ModelEventSink {
                 appendReasoningSummary(delta.text());
                 return deltas.append(StreamingDeltaBatcher.Kind.REASONING_SUMMARY, delta.text());
             }
+            if (event instanceof ModelPort.ReasoningBlockReady reasoning) {
+                /*
+                 * 原生块没有公开事件，但它仍是 assistant 内容顺序的一部分；先冻结前一个文本块，
+                 * 再写入完整 opaque block，保证 text -> reasoning -> Tool 的顺序在历史中不变。
+                 */
+                freezeActiveTextBlock();
+                assistantContent.add(reasoning.content());
+                return deltas.flush();
+            }
+            if (event instanceof ModelPort.ReasoningBlockReplaced replacement) {
+                replaceReasoningBlock(replacement);
+                return deltas.flush();
+            }
             if (event instanceof ModelPort.ToolCallReady ready) {
                 freezeActiveTextBlock();
                 recordToolCall(ready);
@@ -270,6 +284,47 @@ final class AgentRound implements ModelEventSink {
                 new AgentTool.Invocation(ready.callId(), ready.name(), ready.arguments(), ready.ordinal()));
         assistantContent.add(
                 new ToolCallContent(ready.callId(), ready.name(), ready.arguments()));
+    }
+
+    /**
+     * 将终态补全块原位替换到历史，避免旧 opaque JSON 被追加成第二个 reasoning 块或改变 Tool 顺序。
+     * 旧块按完整 equals 唯一定位，新旧块身份必须一致；任何歧义都按协议错误关闭本轮。
+     */
+    private void replaceReasoningBlock(ModelPort.ReasoningBlockReplaced replacement) {
+        ReasoningContent previous = replacement.previous();
+        ReasoningContent next = replacement.replacement();
+        if (!sameReasoningIdentity(previous, next)) {
+            throw new AgentLoop.LoopFailure(
+                    "MODEL_PROTOCOL_ERROR", "reasoning replacement identity changed");
+        }
+        int match = -1;
+        for (int index = 0; index < assistantContent.size(); index++) {
+            ModelContent content = assistantContent.get(index);
+            if (content instanceof ReasoningContent reasoning && reasoning.equals(previous)) {
+                if (match >= 0) {
+                    throw new AgentLoop.LoopFailure(
+                            "MODEL_PROTOCOL_ERROR", "reasoning replacement is ambiguous");
+                }
+                match = index;
+            }
+        }
+        if (match < 0) {
+            throw new AgentLoop.LoopFailure(
+                    "MODEL_PROTOCOL_ERROR", "reasoning replacement target is missing");
+        }
+        assistantContent.set(match, next);
+    }
+
+    /**
+     * opaque 载荷可以变化，但继续回传的 Provider 身份和字段协议必须与已记录块完全相同。
+     */
+    private static boolean sameReasoningIdentity(ReasoningContent left, ReasoningContent right) {
+        return left.providerId().equals(right.providerId())
+                && left.modelId().equals(right.modelId())
+                && left.api().equals(right.api())
+                && left.upstreamModel().equals(right.upstreamModel())
+                && left.endpointFingerprint().equals(right.endpointFingerprint())
+                && left.wireField().equals(right.wireField());
     }
 
     /**

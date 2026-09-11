@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -33,8 +34,17 @@ public interface AgentCapability {
 
     /** 能力绑定只接收当前请求已经解析出的稳定身份，不反向读取配置或 Turn 聚合。 */
     record Request(String threadId, String turnId, Path workspaceRoot, String workspaceId,
-                   ThreadPreferences preferences, String configGeneration, Instant deadline,
-                   TurnOrigin origin) {
+                   ThreadPreferences preferences, String configGeneration, boolean clarificationEnabled,
+                   Instant deadline, TurnOrigin origin,
+                   Optional<TaskCapabilityCeilingPort.Kind> taskKind) {
+        /** 保持既有能力调用面的默认身份；只有 Child lineage 解析出 Kind 时才收紧子代理边界。 */
+        public Request(String threadId, String turnId, Path workspaceRoot, String workspaceId,
+                       ThreadPreferences preferences, String configGeneration, boolean clarificationEnabled,
+                       Instant deadline, TurnOrigin origin) {
+            this(threadId, turnId, workspaceRoot, workspaceId, preferences, configGeneration,
+                    clarificationEnabled, deadline, origin, Optional.empty());
+        }
+
         /** 防御性冻结请求安全点，允许无 turnId 的模型目录预解析自然得到空 Tool。 */
         public Request {
             threadId = ContractChecks.identifier(threadId, "threadId");
@@ -45,6 +55,7 @@ public interface AgentCapability {
             configGeneration = ContractChecks.configurationGeneration(configGeneration);
             deadline = Objects.requireNonNull(deadline, "deadline");
             origin = Objects.requireNonNull(origin, "origin");
+            taskKind = Objects.requireNonNull(taskKind, "taskKind");
         }
     }
 
@@ -73,13 +84,36 @@ public interface AgentCapability {
     record ToolContribution(ToolSpec spec, ToolSideEffect sideEffect,
                             AgentTool.WorkspaceMutationMode workspaceMutationMode,
                             AgentTool.ToolBindingDescriptor bindingDescriptor,
+                            AgentTool.PlanAccess planAccess,
+                            AgentTool.ApprovalRequirement approvalRequirement,
                             Function<CatalogIdentity, AgentTool> binder) {
+        /** 保持普通能力的默认闭锁，只有明确标记的内部能力可进入 Plan 目录。 */
+        public ToolContribution(ToolSpec spec, ToolSideEffect sideEffect,
+                                AgentTool.WorkspaceMutationMode workspaceMutationMode,
+                                AgentTool.ToolBindingDescriptor bindingDescriptor,
+                                Function<CatalogIdentity, AgentTool> binder) {
+            this(spec, sideEffect, workspaceMutationMode, bindingDescriptor,
+                    AgentTool.PlanAccess.DISALLOWED, AgentTool.ApprovalRequirement.USER_REQUIRED, binder);
+        }
+
+        /** 为已有的 PlanAccess 调用面保留构造重载；新审批边界默认收紧为必须用户确认。 */
+        public ToolContribution(ToolSpec spec, ToolSideEffect sideEffect,
+                                AgentTool.WorkspaceMutationMode workspaceMutationMode,
+                                AgentTool.ToolBindingDescriptor bindingDescriptor,
+                                AgentTool.PlanAccess planAccess,
+                                Function<CatalogIdentity, AgentTool> binder) {
+            this(spec, sideEffect, workspaceMutationMode, bindingDescriptor,
+                    planAccess, AgentTool.ApprovalRequirement.USER_REQUIRED, binder);
+        }
+
         /** 冻结全部安全描述，Catalog 会在物化后逐项复核而不是信任工厂。 */
         public ToolContribution {
             spec = Objects.requireNonNull(spec, "spec");
             sideEffect = Objects.requireNonNull(sideEffect, "sideEffect");
             workspaceMutationMode = Objects.requireNonNull(workspaceMutationMode, "workspaceMutationMode");
             bindingDescriptor = Objects.requireNonNull(bindingDescriptor, "bindingDescriptor");
+            planAccess = Objects.requireNonNull(planAccess, "planAccess");
+            approvalRequirement = Objects.requireNonNull(approvalRequirement, "approvalRequirement");
             binder = Objects.requireNonNull(binder, "binder");
             if (!spec.name().equals(bindingDescriptor.localName())) {
                 throw new IllegalArgumentException("capability Tool binding name mismatch");

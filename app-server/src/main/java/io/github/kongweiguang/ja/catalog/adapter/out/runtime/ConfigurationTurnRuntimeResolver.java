@@ -10,9 +10,12 @@ import io.github.kongweiguang.ja.catalog.adapter.out.skills.JaSkillSources;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.BuiltInTools;
+import io.github.kongweiguang.ja.conversation.adapter.out.tools.PlanReadOnlyToolCatalog;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
 import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
+import io.github.kongweiguang.ja.conversation.application.policy.PlanToolPolicy;
 import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
+import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
@@ -30,6 +33,8 @@ import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.RuntimeLease;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
 import io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort;
+import io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort.Kind;
+import io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort.RuntimeIdentity;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.conversation.port.out.TurnToolSessionFactory;
@@ -113,6 +118,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     public RuntimeLease resolve(TurnRuntimeRequest request) {
         Objects.requireNonNull(request, "request");
         Optional<JsonObject> inheritedCeiling = taskCeilings.read(request.threadId());
+        Optional<RuntimeIdentity> taskIdentity = taskCeilings.readIdentity(request.threadId());
         ConfigurationGenerationPort.Lease lease = configurations.acquire(request.workspaceRoot());
         boolean transferred = false;
         try {
@@ -135,31 +141,44 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             Instant requestDeadline = request.requestedAt().plus(limits.wallTimeout());
             AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities = capabilities.prepare(
                     new AgentCapability.Request(request.threadId(), request.turnId(), request.workspaceRoot(),
-                            request.workspaceId(), requestPreferences, lease.generationId(), requestDeadline,
-                            request.origin()));
+                            request.workspaceId(), requestPreferences, lease.generationId(),
+                            isClarificationEnabled(request, lease.snapshot().clarificationEnabled()), requestDeadline,
+                            request.origin(), taskIdentity.map(RuntimeIdentity::kind)));
             AgentPromptSession promptSession = promptSessions.open(new AgentPromptSessionFactory.SessionRequest(
                     request.threadId(), request.workspaceRoot(), jaHome, lease.snapshot().trusted(),
-                    promptEnvironment(request, preparedCapabilities), contextBudget, skills,
+                    promptEnvironment(request, preparedCapabilities, taskIdentity), contextBudget, skills,
                     skillResolution.catalog(), skillResolution.skillNamesById()));
             List<AgentTool> builtInTools = BuiltInTools.create(
                     request.workspaceRoot(), skills, skillResolution.catalog(), shellCapability, promptSession,
                     attachments).snapshot();
+            boolean planning = PlanToolPolicy.isReadOnlyPlanning(request.origin(), request.collaborationMode());
+            if (planning) builtInTools = PlanReadOnlyToolCatalog.filter(builtInTools);
             TurnMcpSessionFactory.Context toolContext = new TurnMcpSessionFactory.Context(
                     provider.providerId(), selectedModel.modelId(), request.workspaceRoot(),
                     requestDeadline);
-            GenerationTurnMcpSessionFactory.CatalogSnapshot mcpCatalog =
-                    mcpSessions.catalog(toolContext, lease);
-            String catalogDigest = toolCatalogDigest(builtInTools, preparedCapabilities.toolContributions(),
+            GenerationTurnMcpSessionFactory.CatalogSnapshot mcpCatalog = planning
+                    ? GenerationTurnMcpSessionFactory.CatalogSnapshot.planningEmpty()
+                    : mcpSessions.catalog(toolContext, lease);
+            List<AgentCapability.ToolContribution> catalogCapabilities = planning
+                    ? preparedCapabilities.toolContributions().stream()
+                        .filter(contribution -> contribution.planAccess() != AgentTool.PlanAccess.DISALLOWED
+                                || (contribution.sideEffect() == ToolSideEffect.READ_ONLY
+                                && contribution.workspaceMutationMode() == AgentTool.WorkspaceMutationMode.NONE))
+                        .toList()
+                    : preparedCapabilities.toolContributions();
+            String catalogDigest = toolCatalogDigest(builtInTools, catalogCapabilities,
                     mcpCatalog.snapshot(), mcpCatalog.routeIdentities());
             validateInheritedCeiling(inheritedCeiling, requestPreferences, catalogDigest,
-                    mcpCatalog.snapshot().revision());
+                    mcpCatalog.snapshot().revision(), taskIdentity.map(RuntimeIdentity::kind).orElse(null));
             AgentCapability.CatalogIdentity catalogIdentity = new AgentCapability.CatalogIdentity(
                     catalogDigest, mcpCatalog.snapshot().revision(), skillResolution.skillNamesById().keySet());
             AgentCapability.Binding capabilityBinding = preparedCapabilities.bind(catalogIdentity);
-            List<AgentTool> requestTools = new ArrayList<>(builtInTools.size() + capabilityBinding.tools().size());
+            List<AgentTool> capabilityTools = planning
+                    ? PlanReadOnlyToolCatalog.filter(capabilityBinding.tools()) : capabilityBinding.tools();
+            List<AgentTool> requestTools = new ArrayList<>(builtInTools.size() + capabilityTools.size());
             requestTools.addAll(builtInTools);
-            requestTools.addAll(capabilityBinding.tools());
-            TurnToolSessionFactory toolSessions = toolSessions(mcpCatalog);
+            requestTools.addAll(capabilityTools);
+            TurnToolSessionFactory toolSessions = toolSessions(mcpCatalog, planning);
             ToolProjectionLimits outputLimits = new ToolProjectionLimits(20_000, 20_000);
             RuntimeLease runtimeLease = new RuntimeLease(lease.generationId(), model,
                     resolvedAccessMode, request.collaborationMode(), limits,
@@ -176,12 +195,69 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         }
     }
 
-    /** 能力说明来自同一次 prepare 并自然进入 Prompt revision；Tool 安全身份由独立目录摘要负责。 */
+    /**
+     * Plan-owned 执行和只读规划都必须能补齐影响结果的决策；前者不能因 Thread 保留的默认模式或
+     * 用户关闭普通模式反问而失去提问能力，后者也不能只依赖 collaborationMode 的表面值放行。
+     */
+    static boolean isClarificationEnabled(TurnRuntimeRequest request, boolean configured) {
+        Objects.requireNonNull(request, "request");
+        return request.origin() == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.PLAN_EXECUTION
+                || PlanToolPolicy.isReadOnlyPlanning(request.origin(), request.collaborationMode())
+                || configured;
+    }
+
+    /**
+     * 能力说明与 Side Task 身份在同一次 resolve 中进入 System environment；身份不进入 UserContent、历史
+     * 或 summary，且每个请求都重新读取持久投影，保证后续 continuation 不依赖首轮缓存。
+     */
     private String promptEnvironment(
-            TurnRuntimeRequest request, AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities) {
+            TurnRuntimeRequest request, AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities,
+            Optional<RuntimeIdentity> taskIdentity) {
         String environment = shellCapability.executionEnvironment(request.workspaceRoot());
         String fragment = preparedCapabilities.promptFragment();
-        return fragment.isBlank() ? environment : environment + "\n\n" + fragment;
+        String taskFragment = taskIdentity.filter(identity -> identity.kind() == Kind.SIDE_TASK)
+                .map(ConfigurationTurnRuntimeResolver::sideTaskIdentityPrompt).orElse("");
+        StringBuilder result = new StringBuilder(environment);
+        if (!fragment.isBlank()) result.append("\n\n").append(fragment);
+        if (!taskFragment.isBlank()) result.append("\n\n").append(taskFragment);
+        return result.toString();
+    }
+
+    /**
+     * 侧聊只继承背景而不继承委派义务；每次请求重申临时身份和纯投递边界，压缩不能把它变成主任务。
+     * 名称按数据转义，来源关系不能被模型误解成自动汇报或执行来源任务的授权。
+     */
+    static String sideTaskIdentityPrompt(RuntimeIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        if (identity.kind() != Kind.SIDE_TASK) {
+            throw new IllegalArgumentException("not a Side Task identity");
+        }
+        return "<side-task-identity>\n"
+                + "role: SIDE_TASK\n"
+                + "taskThreadId: " + identity.taskThreadId() + "\n"
+                + "parentThreadId: " + identity.parentThreadId() + "\n"
+                + "rootThreadId: " + identity.rootThreadId() + "\n"
+                + "taskName: " + quoted(identity.taskName()) + "\n"
+                + "parentTaskName: " + quoted(identity.parentTaskName()) + "\n"
+                + "mainTaskName: " + quoted(identity.rootTaskName()) + "\n"
+                + "This is an independent, temporary side chat. Closing it ends this conversation and its work;"
+                + " it is not restored after application restart. Inherited history is background context only."
+                + " Follow the user's instructions in this side chat; do not continue the source task merely"
+                + " because it appears in inherited history. Do not send periodic progress or automatic results"
+                + " to the source conversation.\n"
+                + "Use list_threads to discover other conversations when communication is needed."
+                + " The real send_message Tool takes targetThreadId and message and only queues that text."
+                + " It does not wake, interrupt, or request a reply from the recipient. A running recipient"
+                + " receives it before its next model request; an idle recipient waits for its next normal run."
+                + " Replies, when useful, are separate explicit send_message calls.\n"
+                + "</side-task-identity>";
+    }
+
+    /** Thread 标题是数据而非 system 标记；只转义结构化边界字符，不改写标题语义。 */
+    private static String quoted(String value) {
+        return '"' + value.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+                .replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;") + '"';
     }
 
     /** Child 只能看见 seed 允许的 Skill ID；配置新增 Skill 不会扩大已创建任务的能力。 */
@@ -217,11 +293,36 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         return Set.copyOf(ids);
     }
 
-    /** 模型与 Tool/MCP 身份必须保持父上限；AccessMode 与 Skill 只可收窄，配置代际仅用于审计。 */
+    /** 未携带持久 Kind 时按保守完整 ceiling 校验，避免未知 Child 身份借 Side Task 规则放宽权限。 */
     static void validateInheritedCeiling(Optional<JsonObject> inherited,
                                          ThreadPreferences current, String toolDigest, String mcpRevision) {
-        if (inherited.isEmpty()) return;
+        validateInheritedCeiling(inherited, current, toolDigest, mcpRevision, null);
+    }
+
+    /**
+     * Side Task 的 access ceiling 只校验 seed 格式，不限制用户后续明确选择的 access；Subagent 则必须
+     * 保持完整 task_capability_v1 上限。缺少持久 Kind 时沿用严格旧路径，绝不把未知身份当独立任务放行。
+     */
+    static void validateInheritedCeiling(Optional<JsonObject> inherited,
+                                         ThreadPreferences current, String toolDigest, String mcpRevision,
+                                         Kind kind) {
+        if (inherited.isEmpty()) {
+            if (kind != null) {
+                throw new TurnRuntimeResolver.RuntimeMismatchException("Task capability ceiling is unavailable");
+            }
+            return;
+        }
         JsonObject ceiling = inherited.orElseThrow();
+        if (kind == Kind.SIDE_TASK) {
+            if (!"task_access_v1".equals(ceilingVersion(ceiling))) {
+                throw new TurnRuntimeResolver.RuntimeMismatchException("Side Task access ceiling is invalid");
+            }
+            accessCeiling(ceiling);
+            return;
+        }
+        if (kind == Kind.SUBAGENT && "task_access_v1".equals(ceilingVersion(ceiling))) {
+            throw new TurnRuntimeResolver.RuntimeMismatchException("Subagent capability ceiling is invalid");
+        }
         if ("task_access_v1".equals(ceilingVersion(ceiling))) {
             AccessMode allowed = accessCeiling(ceiling);
             if (allowed == AccessMode.APPROVAL_REQUIRED
@@ -299,7 +400,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
 
     /**
      * 在物化能力 Tool 前汇总模型可见的完整安全目录并拒绝跨来源重名；目录摘要直接覆盖每个 Tool 的
-     * Schema、副作用、工作区可观察性与固定路由，不借能力 catalog hash 间接代表这些事实。
+     * Schema、副作用、工作区可观察性、审批要求与固定路由，不借能力 catalog hash 间接代表这些事实。
      */
     static String toolCatalogDigest(
             List<AgentTool> builtInTools,
@@ -317,9 +418,14 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         List<ToolCatalogEntry> entries = new ArrayList<>(
                 builtInTools.size() + capabilityTools.size() + mcpSnapshot.tools().size());
         builtInTools.forEach(tool -> entries.add(new ToolCatalogEntry(
-                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.bindingDescriptor())));
-        capabilityTools.forEach(tool -> entries.add(new ToolCatalogEntry(
-                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.bindingDescriptor())));
+                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.approvalRequirement(),
+                tool.bindingDescriptor())));
+        // request_user_input 是随角色显隐的用户交互入口，Subagent 必须向委派方询问而不直接弹卡。
+        // 它不授予工作区/外部能力，不能因子任务正常隐藏该入口而使继承的执行能力指纹失配。
+        capabilityTools.stream().filter(tool -> !"request_user_input".equals(tool.spec().name()))
+                .forEach(tool -> entries.add(new ToolCatalogEntry(
+                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.approvalRequirement(),
+                tool.bindingDescriptor())));
         for (McpGateway.McpTool tool : mcpSnapshot.tools()) {
             McpGateway.RouteIdentity route = Objects.requireNonNull(
                     routes.get(tool.spec().name()), "MCP route identity");
@@ -333,7 +439,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                     route.schemaHash(), route.routeHash());
             entries.add(new ToolCatalogEntry(tool.spec(),
                     ToolSideEffect.EXTERNAL,
-                    AgentTool.WorkspaceMutationMode.UNOBSERVABLE, descriptor));
+                    AgentTool.WorkspaceMutationMode.UNOBSERVABLE,
+                    AgentTool.ApprovalRequirement.USER_REQUIRED, descriptor));
         }
         Set<String> names = new HashSet<>();
         for (ToolCatalogEntry entry : entries) {
@@ -342,7 +449,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             }
         }
         StringBuilder canonical = new StringBuilder();
-        appendToken(canonical, 'v', "tool_catalog_v2");
+        appendToken(canonical, 'v', "tool_catalog_v3");
         entries.stream().sorted(Comparator.comparing(entry -> entry.spec().name())).forEach(entry -> {
             ToolSpec spec = entry.spec();
             AgentTool.ToolBindingDescriptor descriptor = entry.bindingDescriptor();
@@ -351,6 +458,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             appendToken(canonical, 's', AgentTool.canonicalSchema(spec.inputSchema()));
             appendToken(canonical, 'e', entry.sideEffect().name());
             appendToken(canonical, 'w', entry.workspaceMutationMode().name());
+            appendToken(canonical, 'a', entry.approvalRequirement().name());
             appendToken(canonical, 'k', descriptor.routeKind().name());
             appendToken(canonical, 'l', descriptor.localName());
             appendToken(canonical, 'i', descriptor.serverId());
@@ -371,12 +479,14 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             ToolSpec spec,
             ToolSideEffect sideEffect,
             AgentTool.WorkspaceMutationMode workspaceMutationMode,
+            AgentTool.ApprovalRequirement approvalRequirement,
             AgentTool.ToolBindingDescriptor bindingDescriptor) {
         /** 目录项拒绝空安全字段，避免摘要阶段把不完整声明降级为默认值。 */
         private ToolCatalogEntry {
             Objects.requireNonNull(spec, "spec");
             Objects.requireNonNull(sideEffect, "sideEffect");
             Objects.requireNonNull(workspaceMutationMode, "workspaceMutationMode");
+            Objects.requireNonNull(approvalRequirement, "approvalRequirement");
             Objects.requireNonNull(bindingDescriptor, "bindingDescriptor");
             if (!spec.name().equals(bindingDescriptor.localName())) {
                 throw new IllegalArgumentException("Tool binding name does not match catalog entry");
@@ -428,9 +538,19 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         if (value != null && !value.isEmpty()) values.add(value);
     }
 
-    /**
-     * Workspace 生命周期只登记配置与定义 revision；短租约结束前不得启动 MCP 或读取 Tool schema。
-     */
+    /** 预算预检只租用配置代际，不解析尚未准入的 Plan Turn 身份或生成可执行工具。 */
+    @Override
+    public TurnLimits resolveLimits(TurnRuntimeRequest request) {
+        Objects.requireNonNull(request, "request");
+        try (ConfigurationGenerationPort.Lease lease = configurations.acquire(request.workspaceRoot())) {
+            var provider = lease.snapshot().requireProvider(request.providerId());
+            var selectedModel = lease.snapshot().requireModel(request.providerId(), request.modelId());
+            validateReasoning(request.reasoningLevel(), selectedModel);
+            return limits(request, provider, selectedModel);
+        }
+    }
+
+    /** Workspace 生命周期只登记配置与定义 revision；短租约结束前不得启动 MCP 或读取 Tool schema。 */
     @Override
     public void prepareWorkspace(Path workspaceRoot) {
         Path root = Objects.requireNonNull(workspaceRoot, "workspaceRoot")
@@ -570,8 +690,16 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
      * 延迟到 AgentLoop 准备 Provider 请求时 pin 同一个不透明目录句柄；通知刷新只影响下一请求。
      */
     private TurnToolSessionFactory toolSessions(
-            GenerationTurnMcpSessionFactory.CatalogSnapshot catalogSnapshot) {
+            GenerationTurnMcpSessionFactory.CatalogSnapshot catalogSnapshot, boolean disabled) {
         Objects.requireNonNull(catalogSnapshot, "catalogSnapshot");
+        if (disabled) {
+            return cancellation -> new TurnToolSessionFactory.Session() {
+                /** 规划阶段显式返回空 MCP 集合，保证远端工具不会进入模型目录。 */
+                @Override public List<AgentTool> tools() { return List.of(); }
+                /** 空会话没有外部资源，关闭保持幂等以统一生命周期协议。 */
+                @Override public void close() { }
+            };
+        }
         return cancellation -> {
             TurnMcpSessionFactory.Session opened = mcpSessions.open(catalogSnapshot, cancellation);
             try {

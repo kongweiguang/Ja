@@ -4,10 +4,20 @@
 
 import * as Label from "@radix-ui/react-label";
 import * as Switch from "@radix-ui/react-switch";
-import { CircleAlert, Cloud, Info, Laptop, Server, Shield, Sparkles } from "lucide-react";
+import {
+  CircleAlert,
+  Bot,
+  Cloud,
+  Info,
+  Laptop,
+  Server,
+  Settings2,
+  Shield,
+  Sparkles,
+} from "lucide-react";
 import { cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { type UseFormSetError } from "react-hook-form";
-import { Select } from "@/shared/ui/primitives";
+import { GroupedSelect, Select } from "@/shared/ui/primitives";
 import type {
   McpServerDraft,
   ProviderDraft,
@@ -21,11 +31,13 @@ export { CREDENTIAL_REF_PATTERN } from "../domain/validation";
 export type { McpServerSave } from "../domain/validation";
 
 export const sections: ReadonlyArray<{ id: SettingsSection; label: string; icon: ReactElement }> = [
+  { id: "general", label: "通用", icon: <Settings2 size={16} aria-hidden="true" /> },
+  { id: "appearance", label: "外观", icon: <Laptop size={16} aria-hidden="true" /> },
   { id: "models", label: "模型", icon: <Cloud size={16} aria-hidden="true" /> },
+  { id: "subagents", label: "子智能体", icon: <Bot size={16} aria-hidden="true" /> },
+  { id: "permissions", label: "执行确认", icon: <Shield size={16} aria-hidden="true" /> },
   { id: "skills", label: "Skills", icon: <Sparkles size={16} aria-hidden="true" /> },
   { id: "mcp", label: "MCP", icon: <Server size={16} aria-hidden="true" /> },
-  { id: "permissions", label: "执行确认", icon: <Shield size={16} aria-hidden="true" /> },
-  { id: "appearance", label: "外观", icon: <Laptop size={16} aria-hidden="true" /> },
   { id: "about", label: "关于", icon: <Info size={16} aria-hidden="true" /> },
 ];
 
@@ -60,6 +72,12 @@ export const sourceLabels: Record<SkillSource, string> = {
 export function settingsMutationErrorMessage(error: unknown, fallback: string): string {
   const value =
     error !== null && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+  if (error instanceof Error && error.message.includes("subagent model replacement is required")) {
+    return "该模型正用于子智能体，请先在“子智能体”设置中更改模型。";
+  }
+  if (error instanceof Error && error.message.includes("subagent reasoning level unavailable")) {
+    return "子智能体所选模型不支持该思考等级，请重新选择。";
+  }
   return value?.["code"] === "revision_conflict" ||
     (error instanceof Error && error.message.includes("其他窗口修改"))
     ? "设置已被其他窗口修改，当前值已刷新，请重新提交"
@@ -216,18 +234,54 @@ export function SettingsSelect({
   );
 }
 
+/** 设置页的 Provider 分组选择复用公共 Select，避免模型目录在不同页面出现不同键盘语义。 */
+export function SettingsGroupedSelect({
+  id,
+  value,
+  groups,
+  onValueChange,
+  ariaLabel,
+  ariaDescribedBy,
+  disabled,
+}: {
+  id: string;
+  value: string;
+  groups: ReadonlyArray<{
+    label: ReactNode;
+    options: ReadonlyArray<{ value: string; label: ReactNode; disabled?: boolean }>;
+  }>;
+  onValueChange: (value: string) => void;
+  ariaLabel?: string;
+  ariaDescribedBy?: string;
+  disabled?: boolean;
+}): ReactElement {
+  return (
+    <GroupedSelect
+      id={id}
+      value={value}
+      groups={groups}
+      onValueChange={onValueChange}
+      ariaLabel={ariaLabel}
+      ariaDescribedBy={ariaDescribedBy}
+      disabled={disabled}
+    />
+  );
+}
+
 /** 将 Label、Hint 与 Error 绑定为一个可访问字段单元，使校验结果不只依赖颜色。 */
 export function Field({
   id,
   label,
   hint,
   error,
+  layout = "stack",
   children,
 }: {
   id: string;
   label: string;
   hint?: string;
   error?: string;
+  layout?: "stack" | "row";
   children: ReactNode;
 }): ReactElement {
   const describedBy =
@@ -241,7 +295,11 @@ export function Field({
       )
     : children;
   return (
-    <div className="ja-settings-field" data-setting-search={`${label} ${hint ?? ""}`} tabIndex={-1}>
+    <div
+      className={`ja-settings-field${layout === "row" ? " is-row" : ""}`}
+      data-setting-search={`${label} ${hint ?? ""}`}
+      tabIndex={-1}
+    >
       <Label.Root htmlFor={id} className="ja-settings-label">
         {label}
       </Label.Root>
@@ -258,6 +316,34 @@ export function Field({
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * 将相关偏好收进单层实色面板，统一标题、行间距和边界；分组本身不拥有业务状态，
+ * 因此不会把保存逻辑或权威快照复制到视觉组件中。
+ */
+export function SettingsGroup({
+  title,
+  description,
+  children,
+  className,
+}: {
+  title?: string;
+  description?: string;
+  children: ReactNode;
+  className?: string;
+}): ReactElement {
+  return (
+    <section className={`ja-settings-group${className === undefined ? "" : ` ${className}`}`}>
+      {title === undefined ? null : (
+        <header className="ja-settings-group-header">
+          <h3>{title}</h3>
+          {description === undefined ? null : <p>{description}</p>}
+        </header>
+      )}
+      <div className="ja-settings-group-content">{children}</div>
+    </section>
   );
 }
 
@@ -286,7 +372,7 @@ export function SectionHeader({
   );
 }
 
-/** Radix Switch 配合可见 Label，使 Accent Color 不可用或启用高对比度时仍可识别选中状态。 */
+/** Radix Switch 配合可访问 Label（默认可见），使 Accent Color 不可用时仍能识别选中状态。 */
 export function SwitchField({
   id,
   label,
@@ -294,6 +380,8 @@ export function SwitchField({
   onCheckedChange,
   hint,
   disabled = false,
+  hideLabel = false,
+  settingId,
 }: {
   id: string;
   label: string;
@@ -301,13 +389,29 @@ export function SwitchField({
   onCheckedChange: (checked: boolean) => void;
   hint?: string;
   disabled?: boolean;
+  hideLabel?: boolean;
+  settingId?: string;
 }): ReactElement {
   return (
     <div
       className="ja-settings-switch-field"
+      data-setting-id={settingId}
       data-setting-search={`${label} ${hint ?? ""}`}
       tabIndex={-1}
     >
+      <div>
+        <Label.Root
+          htmlFor={id}
+          className={`ja-settings-switch-label${hideLabel ? " ja-visually-hidden" : ""}`}
+        >
+          {label}
+        </Label.Root>
+        {hint === undefined ? null : (
+          <p className="ja-settings-hint" id={`${id}-hint`}>
+            {hint}
+          </p>
+        )}
+      </div>
       <Switch.Root
         id={id}
         className="ja-settings-switch"
@@ -319,16 +423,6 @@ export function SwitchField({
       >
         <Switch.Thumb className="ja-settings-switch-thumb" />
       </Switch.Root>
-      <div>
-        <Label.Root htmlFor={id} className="ja-settings-switch-label">
-          {label}
-        </Label.Root>
-        {hint === undefined ? null : (
-          <p className="ja-settings-hint" id={`${id}-hint`}>
-            {hint}
-          </p>
-        )}
-      </div>
     </div>
   );
 }

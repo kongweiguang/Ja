@@ -4,7 +4,7 @@
 //! `app_server_process` 公共 façade 合同；测试只使用 crate 外部可见 API。
 
 use ja_runtime::app_server_process::{
-    AppServerProcessError, LifecycleState, SidecarConfig, SidecarSupervisor,
+    AppServerProcessError, LifecycleState, SessionEvent, SidecarConfig, SidecarSupervisor,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -67,7 +67,10 @@ fn facade_owns_real_sidecar_process_lifecycle() {
     let script_path = root.join("public-fixture.ps1");
     let script = r#"
 $ErrorActionPreference = 'Stop'
-$initializeResult = '{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}'
+$generationArgument = $args | Where-Object { $_ -like '--ja-runtime-generation=*' } | Select-Object -First 1
+if ($null -eq $generationArgument) { exit 42 }
+$runtimeGeneration = $generationArgument.Substring('--ja-runtime-generation='.Length)
+$initializeResult = '{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}'
 function Write-Lf([string]$Text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -82,11 +85,12 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     }
     if ($request.method -eq 'runtime/initialized') {
         $token = $request.params.readyToken
-        Write-Lf ('{"jsonrpc":"2.0","method":"runtime/status-changed","params":{"serverInstanceId":"srv_public_fixture","eventId":"evt_public_ready","occurredAt":"2099-01-01T00:00:00Z","status":"ready","readyToken":"' + $token + '"}}')
+        Write-Lf ('{"jsonrpc":"2.0","method":"runtime/status-changed","params":{"serverInstanceId":"srv_public_fixture","eventId":"evt_public_ready","occurredAt":"2099-01-01T00:00:00Z","generation":' + $runtimeGeneration + ',"status":"ready","readyToken":"' + $token + '"}}')
         continue
     }
     if ($request.method -eq 'runtime/health') {
         Write-Lf ('{"jsonrpc":"2.0","id":"' + $request.id + '","result":{"status":"ready"}}')
+        Write-Lf ('{"jsonrpc":"2.0","method":"runtime/status-changed","params":{"serverInstanceId":"srv_public_fixture","eventId":"evt_public_generation","occurredAt":"2099-01-01T00:00:00Z","generation":' + $runtimeGeneration + ',"status":"busy"}}')
         continue
     }
     if ($request.method -eq 'runtime/shutdown') {
@@ -105,7 +109,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     ];
     config.ready_timeout = Duration::from_secs(5);
     config.shutdown_timeout = Duration::from_secs(2);
-    let mut supervisor = SidecarSupervisor::new(config).unwrap();
+    let mut supervisor = SidecarSupervisor::new_with_host_generation(config, 7).unwrap();
     supervisor.start_with_session_hook(None).unwrap();
     assert_eq!(supervisor.state(), LifecycleState::Ready);
     let response = supervisor
@@ -118,6 +122,13 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             .and_then(|value| value.get("status")),
         Some(&json!("ready"))
     );
+    let mut events = supervisor.take_event_pump().unwrap();
+    let event = events
+        .next_event(Duration::from_secs(2))
+        .expect("generation notification must be delivered");
+    assert!(matches!(event, SessionEvent::Notification(frame)
+        if frame.params().and_then(|params| params.get("generation")).and_then(serde_json::Value::as_u64)
+            == Some(7)));
     supervisor
         .shutdown_until(Instant::now() + Duration::from_secs(2))
         .unwrap();

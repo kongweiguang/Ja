@@ -11,3 +11,9 @@ it("侧边任务沿用主 Composer 焦点边框而不增加内部框", () => {
   expect(css).not.toMatch(/\.ja-task-composer\s+(?:textarea|input)/u);
   expect(css).not.toContain(".ja-task-composer-status");
 });
+
+/** 模型与权限由共享组件决定可见性，侧边样式不能把已接通的真实能力再次隐藏。 */
+it("侧边样式不屏蔽共享 Composer 的模型与访问选择", () => {
+  const css = readFileSync(resolve("apps/desktop/src/features/tasks/ui/tasks.css"), "utf8");
+  expect(css).not.toMatch(/\.ja-composer__(?:model-trigger|access-select|reasoning-select)/u);
+});

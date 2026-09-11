@@ -92,6 +92,9 @@ public final class ToolOutputProjector {
             } else if (block instanceof ContextMessage.ToolResultBlock result) {
                 characters += result.output().content().codePointCount(0,
                         result.output().content().length());
+            } else if (block instanceof ContextMessage.ReasoningBlock reasoning) {
+                /* 预算要覆盖同身份请求实际会发送的原生块，但不把其正文投影为 Tool 文本。 */
+                characters += reasoning.content().nativeJson().length();
             }
         }
         return (int) Math.min(Integer.MAX_VALUE, Math.max(1L, (characters + 3L) / 4L));

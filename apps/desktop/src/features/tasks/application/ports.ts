@@ -1,6 +1,14 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import type {
+  ConversationAccessMode,
+  ConversationCollaborationMode,
+  ConversationModelSelection,
+  ConversationThreadPreferences,
+  ReasoningLevel,
+  TimelineSnapshot,
+} from "@/features/conversation";
 import type { TaskContentBlock, TaskReadModel, TaskSummary } from "../domain/taskModel";
 
 export interface TaskPort {
@@ -9,8 +17,12 @@ export interface TaskPort {
     parentTurnId: string | null;
     expectedParentRevision: number;
     taskName: string;
-    content: TaskContentBlock[];
-  }): Promise<{ accepted: true; task: TaskSummary; turnId: string }>;
+    /** 首轮创建时冻结 child 的模型、推理、权限和协作模式，避免先创建后补写的竞态。 */
+    preferences?: ConversationModelSelection & {
+      accessMode: ConversationAccessMode;
+      collaborationMode: ConversationCollaborationMode;
+    };
+  }): Promise<{ accepted: true; task: TaskSummary }>;
   list(input: { rootThreadId: string }): Promise<{ items: TaskSummary[] }>;
   read(input: { taskThreadId: string; cursor?: string; limit?: number }): Promise<TaskReadModel>;
   observe(input: {
@@ -23,6 +35,8 @@ export interface TaskPort {
     expectedTaskRevision: number;
     throughActivitySequence: number;
   }): Promise<{ accepted: true; task: TaskSummary }>;
+  /** 侧聊关闭由服务端统一取消执行、释放资源并清除临时数据，ACK 前不得移除 Tab。 */
+  close(input: { taskThreadId: string }): Promise<{ closed: true }>;
   messageSend(input: {
     senderThreadId: string;
     targetThreadId: string;
@@ -47,20 +61,21 @@ export interface TaskPort {
   }): Promise<{ accepted: true; deletedTaskCount: number }>;
 }
 
-export interface TaskTranscriptSnapshot {
-  threadId: string;
-  revision: number;
-  turns: Array<{
-    turnId: string;
-    status: string;
-    requestedAt: string;
-    updatedAt: string;
-    completedAt: string | null;
-    errorCode: string | null;
-  }>;
-  items: Array<Record<string, unknown>>;
-  nextCursor: string | null;
+/** Child Thread 的偏好更新必须带自身 revision，不能借用父 Thread 的 CAS。 */
+export interface TaskPreferencesPort {
+  update(input: {
+    threadId: string;
+    expectedThreadRevision: number;
+    providerId: string;
+    modelId: string;
+    reasoningLevel: ReasoningLevel | null;
+    accessMode: ConversationAccessMode;
+    collaborationMode: ConversationCollaborationMode;
+  }): Promise<ConversationThreadPreferences>;
 }
+
+/** Child Transcript 直接承接 thread/read 的完整 Timeline 投影，避免丢失队列、Usage 与活动。 */
+export type TaskTranscriptSnapshot = TimelineSnapshot;
 
 /** Child transcript 复用 thread/read，但应用层只依赖窄读取端口，不知道 History adapter。 */
 export interface TaskTranscriptPort {

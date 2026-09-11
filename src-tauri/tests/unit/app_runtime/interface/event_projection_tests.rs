@@ -16,14 +16,14 @@ fn ready_projection_consumes_the_validated_echo() {
             "occurredAt": "2026-08-18T00:00:00Z",
             "status": "ready",
             "generation": 1,
-            "features": ["task_threads_v1", "plan_goal_v1"],
+            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
             "readyToken": "0123456789abcdef0123456789abcdef"
         }
     });
     let sanitized = sanitize_webview_value(value).expect("ready projection is safe");
     assert_eq!(
         sanitized["params"]["features"],
-        json!(["task_threads_v1", "plan_goal_v1"])
+        json!(["task_threads_v1", "plan_goal_v1", "interaction_v1"])
     );
     assert!(sanitized["params"].get("readyToken").is_none());
 }
@@ -147,6 +147,50 @@ fn turn_input_events_enforce_queue_and_thread_revision_boundaries() {
     let mut mismatched_user = consumed;
     mismatched_user["params"]["userItem"]["content"][0]["text"] = json!("其它文本");
     assert!(sanitize_webview_value(mismatched_user).is_err());
+}
+
+/// Mailbox 消费只把结构化跨会话消息放入目标 Turn；错 Turn 或普通历史 item 不得伪装成通信事件。
+#[test]
+fn messages_received_event_requires_bound_thread_messages() {
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "turn/messages_received",
+        "params": {
+            "serverInstanceId": "srv_1",
+            "eventId": "evt_messages_1",
+            "sequence": 6,
+            "occurredAt": "2026-09-05T00:00:01Z",
+            "generation": 1,
+            "workspaceId": "ws_target",
+            "threadId": "thr_target",
+            "turnId": "turn_target",
+            "threadRevision": 3,
+            "items": [{
+                "itemId": "item_message_1",
+                "createdAt": "2026-09-05T00:00:00Z",
+                "turnId": "turn_target",
+                "kind": "thread_message",
+                "sourceThreadId": "thr_source",
+                "sourceTitle": "临时侧聊",
+                "content": "来自侧聊的结果"
+            }]
+        }
+    });
+    assert!(sanitize_webview_value(value.clone()).is_ok());
+
+    let mut wrong_turn = value.clone();
+    wrong_turn["params"]["items"][0]["turnId"] = json!("turn_other");
+    assert!(sanitize_webview_value(wrong_turn).is_err());
+
+    let mut ordinary_item = value;
+    ordinary_item["params"]["items"][0] = json!({
+        "itemId": "item_assistant_1",
+        "createdAt": "2026-09-05T00:00:00Z",
+        "turnId": "turn_target",
+        "kind": "final_answer",
+        "text": "不得作为消息事件"
+    });
+    assert!(sanitize_webview_value(ordinary_item).is_err());
 }
 
 /// 三类 Context 生命周期接受显式 nullable turnId，并按状态绑定 after/checkpoint/error 字段。
@@ -296,7 +340,8 @@ fn task_events_are_strictly_projected_without_transcript_materialization() {
     });
     let mut activity = base.clone();
     activity["activity"] = json!({
-        "activitySequence": 3, "activityId": "activity_3", "taskThreadId": "thr_child",
+        "activitySequence": 3, "activityId": "activity_3", "rootThreadId": "thr_parent",
+        "taskThreadId": "thr_child",
         "actorThreadId": "thr_parent", "causalTurnId": "turn_parent", "kind": "progress",
         "summary": {"text": "正在检查"}, "createdAt": "2026-09-03T08:00:01Z"
     });
@@ -355,7 +400,7 @@ fn goal_changed_projection_accepts_discovery_and_rejects_cross_goal_payload() {
                 "acceptanceCriteria": [], "status": "active", "phase": "working",
                 "revision": 1, "planLink": null,
                 "currentRunId": "run_demo", "currentStepId": null, "completedRequiredSteps": 0,
-                "totalRequiredSteps": 0, "pendingInput": null, "attentionReason": null,
+                "totalRequiredSteps": 0, "attentionReason": null,
                 "latestEvaluation": null,
                 "createdAt": "2026-09-04T08:00:00Z", "updatedAt": "2026-09-04T08:00:00Z",
                 "achievedAt": null, "stoppedAt": null
@@ -372,7 +417,7 @@ fn goal_changed_projection_accepts_discovery_and_rejects_cross_goal_payload() {
     );
 }
 
-/// Goal activity/input 使用独立 revision 流且保持严格闭集；未知字段不能借助非 Turn
+/// Goal activity 使用独立 revision 流且保持严格闭集；未知字段不能借助非 Turn
 /// notification 绕过 WebView 投影边界。
 #[test]
 fn goal_activity_and_input_projection_enforce_closed_payloads() {
@@ -387,21 +432,6 @@ fn goal_activity_and_input_projection_enforce_closed_payloads() {
         }
     });
     assert!(sanitize_webview_value(activity).is_ok());
-
-    let input = json!({
-        "jsonrpc": "2.0", "method": "goal/input-requested",
-        "params": {
-            "serverInstanceId": "srv_1", "eventId": "evt_goal_3", "sequence": 8,
-            "occurredAt": "2026-09-04T08:00:03Z", "generation": 1,
-            "goalId": "goal_demo", "goalRevision": 3, "eventSequence": 4,
-            "input": {"inputRequestId": "goalinput_demo", "prompt": "是否继续？",
-                "expiresAt": "2026-09-04T09:00:00Z", "createdAt": "2026-09-04T08:00:03Z"}
-        }
-    });
-    assert!(sanitize_webview_value(input.clone()).is_ok());
-    let mut unknown = input;
-    unknown["params"]["input"]["response"] = json!("继续");
-    assert!(sanitize_webview_value(unknown).is_err());
 }
 
 /// Activity 内嵌 Task 与外层 taskRevision 必须一致，防止跨任务或陈旧投影拼接。
@@ -414,7 +444,8 @@ fn task_activity_rejects_cross_task_projection() {
             "occurredAt": "2026-09-03T08:00:02Z", "generation": 1,
             "rootThreadId": "thr_parent", "taskThreadId": "thr_child", "taskRevision": 2,
             "activity": {
-                "activitySequence": 4, "activityId": "activity_4", "taskThreadId": "thr_other",
+                "activitySequence": 4, "activityId": "activity_4", "rootThreadId": "thr_parent",
+                "taskThreadId": "thr_other",
                 "actorThreadId": "thr_parent", "causalTurnId": null, "kind": "completed",
                 "summary": {"text": "完成"}, "createdAt": "2026-09-03T08:00:02Z"
             },
@@ -449,7 +480,7 @@ fn runtime_status_projection_matches_v1_lifecycle_union() {
             "occurredAt": "2026-08-25T12:00:04Z",
             "status": "failed",
             "generation": 1,
-            "features": ["task_threads_v1", "plan_goal_v1"],
+            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
             "reason": "runtime_lifecycle"
         }
     });
@@ -509,7 +540,7 @@ fn status_emitter_uses_the_v1_feature_set() {
     };
     assert_eq!(
         emitted["params"]["features"],
-        json!(["task_threads_v1", "plan_goal_v1"])
+        json!(["task_threads_v1", "plan_goal_v1", "interaction_v1"])
     );
     assert_eq!(emitted["params"]["status"], "ready");
     assert_eq!(emitted["params"]["generation"], 7);

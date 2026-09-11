@@ -3,6 +3,20 @@
 
 use super::*;
 
+/// Java 的恢复状态是必需字段，真实快照不得因 DTO 漏字段被转换成运行时不可用。
+#[test]
+fn interaction_snapshot_retains_resume_state() {
+    let value = json!({"threadId":"thr_demo","eventSequence":0,"request":null,"draft":null,"resumeState":"none"});
+    let parsed: InteractionSnapshotDto = serde_json::from_value(value.clone()).expect("server snapshot");
+    assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    let mut invalid = value.clone();
+    invalid["resumeState"] = json!("approved");
+    assert!(serde_json::from_value::<InteractionSnapshotDto>(invalid).is_err());
+    let mut missing = value;
+    missing.as_object_mut().unwrap().remove("resumeState");
+    assert!(serde_json::from_value::<InteractionSnapshotDto>(missing).is_err());
+}
+
 /// mutation DTO 必须拒绝旧 revision 别名与额外控制字段，防止绕过 Goal CAS。
 #[test]
 fn goal_mutation_input_is_closed() {
@@ -70,7 +84,7 @@ fn goal_projection_result_is_strict() {
             "objective":"完成","goalDefinitionRevision":1,"acceptanceCriteria":[],
             "status":"active","phase":"working","revision":1,"planLink":null,
             "currentRunId":"run_demo","currentStepId":null,
-            "completedRequiredSteps":0,"totalRequiredSteps":0,"pendingInput":null,
+            "completedRequiredSteps":0,"totalRequiredSteps":0,
             "attentionReason":null,"latestEvaluation":null,"createdAt":"2026-09-04T00:00:00Z",
             "updatedAt":"2026-09-04T00:00:00Z","achievedAt":null,"stoppedAt":null
         },

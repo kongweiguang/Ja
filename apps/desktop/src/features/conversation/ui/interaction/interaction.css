@@ -1,0 +1,306 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-interaction-card {
+  display: grid;
+  gap: 16px;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin-bottom: 10px;
+  padding: 16px;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-pane);
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-surface-raised) 94%, var(--ja-surface-muted));
+  box-shadow: var(--ja-shadow-sm);
+  animation: ja-interaction-enter 180ms var(--ja-ease-native);
+}
+
+/* 只有展开中的待回答卡需要把题头、可滚动正文和操作栏锁成三条轨道。 */
+.ja-interaction-card[data-interaction-status="pending"] {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.ja-interaction-card__header,
+.ja-interaction-card__footer,
+.ja-interaction-card__summary-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.ja-interaction-card__header > div,
+.ja-interaction-card__option-copy {
+  min-width: 0;
+}
+
+.ja-interaction-card__header h2,
+.ja-interaction-card__body h3,
+.ja-interaction-card__summary-heading strong,
+.ja-interaction-card__option-copy strong {
+  margin: 0;
+  font-weight: var(--ja-weight-semibold);
+}
+
+.ja-interaction-card__header h2 {
+  font-size: var(--ja-text-title-size);
+  line-height: var(--ja-line-title);
+}
+.ja-interaction-card__body h3 {
+  font-size: var(--ja-text-body-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-body);
+}
+.ja-interaction-card__eyebrow {
+  margin: 0 0 4px;
+  color: color-mix(in srgb, var(--ja-accent-emphasis) 80%, var(--ja-foreground));
+  font-size: var(--ja-text-caption-size);
+}
+.ja-interaction-card__description,
+.ja-interaction-card__question-description,
+.ja-interaction-card__muted {
+  margin: 5px 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+}
+.ja-interaction-card__body {
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+  max-height: min(320px, 35dvh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+.ja-conversation-composer-dock > .ja-interaction-card .ja-interaction-card__body {
+  max-height: none;
+}
+.ja-interaction-card__options {
+  display: grid;
+  gap: 8px;
+}
+
+.ja-interaction-card__option {
+  display: grid;
+  min-height: 52px;
+  grid-template-columns: 18px 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-selection);
+  background: var(--ja-surface);
+  cursor: pointer;
+  transition:
+    border-color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native);
+}
+.ja-interaction-card__option:hover {
+  border-color: var(--ja-border-strong);
+  background: var(--ja-control-hover);
+}
+.ja-interaction-card__option[data-selected="true"] {
+  border-color: var(--ja-accent);
+  background: color-mix(in srgb, var(--ja-accent) 10%, var(--ja-surface-raised));
+}
+.ja-interaction-card__option input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--ja-accent);
+}
+.ja-interaction-card__option-index {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid var(--ja-border);
+  border-radius: 50%;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-interaction-card__option-copy {
+  display: grid;
+  gap: 2px;
+}
+.ja-interaction-card__option-copy small {
+  color: var(--ja-foreground-muted);
+  line-height: var(--ja-line-caption);
+}
+.ja-interaction-card__recommended {
+  align-self: start;
+  color: color-mix(in srgb, var(--ja-accent-emphasis) 80%, var(--ja-foreground));
+  font-size: var(--ja-text-caption-size);
+}
+.ja-interaction-card__other-input,
+.ja-interaction-card__text-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 11px;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-selection);
+  color: var(--ja-foreground);
+  background: var(--ja-surface-raised);
+  font: inherit;
+  resize: vertical;
+}
+.ja-interaction-card__text-input {
+  min-height: 86px;
+}
+.ja-interaction-card:focus-visible,
+.ja-interaction-card__other-input:focus-visible,
+.ja-interaction-card__text-input:focus-visible,
+.ja-interaction-card button:focus-visible,
+.ja-interaction-card input:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+.ja-interaction-card__validation,
+.ja-interaction-card__error {
+  margin: 0;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-control-size);
+}
+.ja-interaction-card__footer {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.ja-interaction-card__footer-spacer {
+  flex: 1;
+}
+.ja-interaction-card__text-button,
+.ja-interaction-card__primary-button,
+.ja-interaction-card__icon-button,
+.ja-interaction-card__retry-button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: var(--ja-radius-selection);
+  color: var(--ja-foreground);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.ja-interaction-card__text-button {
+  padding: 0 8px;
+}
+.ja-interaction-card__text-button:hover:not(:disabled),
+.ja-interaction-card__icon-button:hover:not(:disabled),
+.ja-interaction-card__retry-button:hover:not(:disabled) {
+  background: var(--ja-control-hover);
+}
+.ja-interaction-card__primary-button {
+  min-width: 100px;
+  padding: 0 15px;
+  color: var(--ja-accent-foreground);
+  background: var(--ja-accent-emphasis);
+}
+.ja-interaction-card__primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+.ja-interaction-card__icon-button,
+.ja-interaction-card__retry-button {
+  width: 44px;
+  padding: 0;
+}
+.ja-interaction-card__icon-button {
+  margin-left: auto;
+}
+.ja-interaction-card__spin {
+  width: 16px;
+  height: 16px;
+  animation: ja-interaction-spin 800ms linear infinite;
+}
+.ja-interaction-card__summary-heading {
+  align-items: center;
+}
+.ja-interaction-card__summary-heading > svg {
+  color: var(--ja-success);
+}
+.ja-interaction-card__pending-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border: 2px solid var(--ja-accent);
+  border-radius: 50%;
+}
+.ja-interaction-card__summary-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: min(320px, 35dvh);
+  overflow: auto;
+}
+.ja-interaction-card__summary-list li {
+  display: flex;
+  min-width: 0;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--ja-border);
+}
+.ja-interaction-card__summary-list strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@keyframes ja-interaction-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes ja-interaction-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (max-width: 520px) {
+  .ja-interaction-card__option {
+    grid-template-columns: 18px 24px minmax(0, 1fr);
+  }
+  .ja-interaction-card__recommended {
+    grid-column: 3;
+  }
+  .ja-interaction-card__summary-list li {
+    display: grid;
+    gap: 2px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ja-interaction-card,
+  .ja-interaction-card__spin {
+    animation: none;
+  }
+}
+@media (prefers-contrast: more), (forced-colors: active) {
+  .ja-interaction-card,
+  .ja-interaction-card__option,
+  .ja-interaction-card__other-input,
+  .ja-interaction-card__text-input {
+    border-color: CanvasText;
+    background: Canvas;
+  }
+  .ja-interaction-card__option[data-selected="true"] {
+    outline: 2px solid Highlight;
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .ja-interaction-card {
+    background: var(--ja-surface-raised);
+  }
+}

@@ -4,10 +4,12 @@
 package io.github.kongweiguang.ja.conversation.adapter.out.provider.openai;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.OpenAiChatSseReader;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderReasoningSupport;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderStreamResult;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
@@ -24,12 +26,25 @@ import java.util.function.Function;
 /** 归约 ChatCompletionChunk 的 choice、文本、Tool delta、usage 与可选 [DONE] 终态。 */
 final class OpenAiChatCompletionsState {
     private static final int MAX_ARGUMENT_CHARACTERS = 4_000_000;
+    private static final List<String> REASONING_FIELDS = List.of(
+            "reasoning_content", "reasoning", "reasoning_text");
     private final TreeMap<Integer, ToolAccumulator> tools = new TreeMap<>();
+    private final ModelPort.ModelConfiguration configuration;
+    private final StringBuilder reasoning = new StringBuilder();
+    private String reasoningField;
+    private boolean reasoningBlockEmitted;
     private String completionId;
     private String model;
     private ModelPort.FinishReason finishReason;
     private ModelUsage usage;
     private boolean done;
+
+    /**
+     * 绑定本次 Chat 请求的 Provider 身份，令完成后的 reasoning opaque 块只能回到同一端点。
+     */
+    OpenAiChatCompletionsState(ModelPort.ModelConfiguration configuration) {
+        this.configuration = java.util.Objects.requireNonNull(configuration, "configuration");
+    }
 
     /** 在单个 chunk 内先校验身份和 choice 形状，再产生待提交的 Provider 中立效果。 */
     List<ModelPort.ModelEvent> reduce(
@@ -69,8 +84,9 @@ final class OpenAiChatCompletionsState {
             throw new ProviderProtocolException(
                     "STREAM_TRUNCATED", "OpenAI Chat stream ended without explicit completion", true);
         }
-        List<ModelPort.ModelEvent> effects = usage == null
-                ? List.of() : List.of(new ModelPort.UsageEvent(usage));
+        List<ModelPort.ModelEvent> effects = new ArrayList<>();
+        appendReasoningBlock(effects);
+        if (usage != null) effects.add(new ModelPort.UsageEvent(usage));
         return new ProviderStreamResult(
                 new ModelPort.ModelOutcome(finishReason, null, usage), effects);
     }
@@ -96,12 +112,56 @@ final class OpenAiChatCompletionsState {
             && !"assistant".equals(requiredText(delta, "role", false))) {
             throw field("OpenAI Chat delta role is invalid");
         }
+        acceptReasoning(delta, effects);
         appendText(delta, "content", effects);
         appendText(delta, "refusal", effects);
         JsonNode calls = delta.get("tool_calls");
         if (calls == null || calls.isNull()) return;
         if (!calls.isArray()) throw field("OpenAI Chat tool_calls are invalid");
         for (JsonNode call : calls) acceptToolDelta(call);
+    }
+
+    /**
+     * Chat 兼容接口没有统一 reasoning 字段；同一 delta 只接纳首个非空字段，避免网关同时填充别名
+     * 时把同一段推理重复展示，同时记录原字段供下一轮 assistant 历史精确回传。
+     */
+    private void acceptReasoning(JsonNode delta, List<ModelPort.ModelEvent> effects) {
+        for (String wireField : REASONING_FIELDS) {
+            JsonNode value = delta.get(wireField);
+            if (value == null || value.isNull()) continue;
+            if (!value.isTextual()) throw field("OpenAI Chat reasoning field is invalid");
+            String text = value.textValue();
+            if (text.isEmpty()) continue;
+            if (reasoningField == null) reasoningField = wireField;
+            if (!reasoningField.equals(wireField)) continue;
+            if ((long) reasoning.length() + text.length() > MAX_ARGUMENT_CHARACTERS) {
+                throw new ProviderProtocolException(
+                        "REASONING_LIMIT", "OpenAI Chat reasoning exceeds the limit", false);
+            }
+            reasoning.append(text);
+            effects.add(new ModelPort.ReasoningSummaryDelta(text));
+            break;
+        }
+    }
+
+    /**
+     * 在 Chat 流完成且 reasoning 已有正文时冻结一个最小原生 assistant 字段对象；空推理不制造
+     * 占位块，避免把模型没有返回的思考伪造成历史事实。
+     */
+    private void appendReasoningBlock(List<ModelPort.ModelEvent> effects) {
+        if (reasoningBlockEmitted || reasoningField == null || reasoning.isEmpty()) return;
+        ObjectNode nativeValue = AbstractStreamingModelAdapter.JSON.createObjectNode()
+                .put(reasoningField, reasoning.toString());
+        String nativeJson;
+        try {
+            nativeJson = AbstractStreamingModelAdapter.JSON.writeValueAsString(nativeValue);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException | RuntimeException failure) {
+            throw new ProviderProtocolException(
+                    "PROVIDER_JSON", "OpenAI Chat reasoning could not be captured", false);
+        }
+        effects.add(new ModelPort.ReasoningBlockReady(
+                ProviderReasoningSupport.capture(configuration, reasoningField, nativeJson)));
+        reasoningBlockEmitted = true;
     }
 
     /** 发布非空文本字段；null 表示当前 chunk 没有该通道。 */
@@ -136,6 +196,7 @@ final class OpenAiChatCompletionsState {
     private void finish(String reason, Function<String, ToolSpec> toolLookup,
                         List<ModelPort.ModelEvent> effects) {
         if (finishReason != null) throw protocol("OpenAI Chat repeated finish_reason");
+        appendReasoningBlock(effects);
         switch (reason) {
             case "stop" -> {
                 /* OpenAI-compatible 网关可能用 stop 结束已经完整发送的 Tool delta；完整性仍由

@@ -16,7 +16,7 @@ import type { SettingsPorts } from "../application/ports";
 
 interface CredentialVaultEditorProps {
   reference: string;
-  configured: boolean;
+  configured?: boolean;
   onReplaceCredential: SettingsPorts["onReplaceCredential"];
   onClearCredential: SettingsPorts["onClearCredential"];
 }
@@ -50,6 +50,7 @@ export function CredentialVaultEditor({
   const [pending, setPending] = useState<"save" | "delete">();
   const [feedback, setFeedback] = useState<string>();
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
+  const deleteOpenerRef = useRef<HTMLButtonElement | null>(null);
   const normalizedReference = reference.trim();
   const referenceValid = CREDENTIAL_REF_PATTERN.test(normalizedReference);
 
@@ -77,27 +78,30 @@ export function CredentialVaultEditor({
     }
   };
 
-  /** 删除唯一原生 Secret 可能让 Provider 失效，因此必须经过显式确认。 */
-  const deleteCredential = async (): Promise<void> => {
+  /** 删除唯一原生 Secret 可能让 Provider 失效；返回结果供确认框只在成功后关闭。 */
+  const deleteCredential = async (): Promise<boolean> => {
     setFeedback(undefined);
     if (!referenceValid) {
       setFeedback("请先填写有效的 credential ref。");
-      return;
+      return false;
     }
     setPending("delete");
     try {
       await onClearCredential(normalizedReference);
       setFeedback("系统凭据已删除；credential ref 仍保留在配置中。");
+      return true;
     } catch {
       setFeedback("删除失败，请确认该凭据存在并重试。");
+      return false;
     } finally {
       setPending(undefined);
     }
   };
 
-  /** 使用可访问的 Radix 确认框，避免依赖 WebView2 中无法统一主题且焦点不可靠的浏览器 confirm。 */
-  const requestDelete = (): void => {
+  /** 删除确认取消或完成后回到原入口，保证嵌套在 sheet 中的键盘路径连续。 */
+  const requestDelete = (trigger: HTMLButtonElement): void => {
     setFeedback(undefined);
+    deleteOpenerRef.current = trigger;
     if (referenceValid) setDeleteConfirmationOpen(true);
   };
 
@@ -113,7 +117,13 @@ export function CredentialVaultEditor({
         </span>
         <div>
           <strong>系统凭据库</strong>
-          <p id={statusId}>{configured ? "已配置 · 密钥不会回显" : "未配置"}</p>
+          <p id={statusId}>
+            {configured === undefined
+              ? "密钥不会回显"
+              : configured
+                ? "已配置 · 密钥不会回显"
+                : "未配置"}
+          </p>
         </div>
       </div>
       <div className="ja-settings-credential-controls">
@@ -146,24 +156,38 @@ export function CredentialVaultEditor({
             type="button"
             variant="ghost"
             size="sm"
-            disabled={pending !== undefined || !referenceValid || !configured}
-            onClick={requestDelete}
+            disabled={pending !== undefined || !referenceValid || configured === false}
+            onClick={(event) => requestDelete(event.currentTarget)}
           >
             <Trash2 aria-hidden="true" />
             删除凭据
           </Button>
         </div>
       </div>
-      {feedback === undefined ? null : (
+      {feedback === undefined || deleteConfirmationOpen ? null : (
         <p className="ja-settings-feedback" role="status">
           {feedback}
         </p>
       )}
-      <Dialog modal open={deleteConfirmationOpen} onOpenChange={setDeleteConfirmationOpen}>
+      <Dialog
+        modal
+        open={deleteConfirmationOpen}
+        onOpenChange={(open) => {
+          if (!open && pending === "delete") return;
+          setDeleteConfirmationOpen(open);
+        }}
+      >
         <DialogContent
-          className="ja-settings-confirm-dialog"
-          overlayClassName="ja-settings-dialog-overlay"
+          className="ja-settings-confirm-dialog ja-settings-credential-confirm-dialog"
+          overlayClassName="ja-settings-dialog-overlay ja-settings-credential-dialog-overlay"
           aria-describedby={deleteDescriptionId}
+          onCloseAutoFocus={(event) => {
+            const opener = deleteOpenerRef.current;
+            if (opener?.isConnected) {
+              event.preventDefault();
+              opener.focus();
+            }
+          }}
         >
           <div className="ja-settings-dialog-header">
             <div>
@@ -176,14 +200,25 @@ export function CredentialVaultEditor({
               </DialogDescription>
             </div>
             <DialogClose asChild>
-              <Button type="button" variant="ghost" size="sm" aria-label="关闭删除确认">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label="关闭删除确认"
+                disabled={pending === "delete"}
+              >
                 <X aria-hidden="true" />
               </Button>
             </DialogClose>
           </div>
+          {feedback === undefined ? null : (
+            <p className="ja-settings-error" role="alert">
+              {feedback}
+            </p>
+          )}
           <div className="ja-settings-confirm-actions">
             <DialogClose asChild>
-              <Button type="button" variant="secondary" size="sm">
+              <Button type="button" variant="secondary" size="sm" disabled={pending === "delete"}>
                 取消
               </Button>
             </DialogClose>
@@ -193,9 +228,8 @@ export function CredentialVaultEditor({
               size="sm"
               loading={pending === "delete"}
               disabled={pending !== undefined}
-              onClick={() => {
-                setDeleteConfirmationOpen(false);
-                void deleteCredential();
+              onClick={async () => {
+                if (await deleteCredential()) setDeleteConfirmationOpen(false);
               }}
             >
               确认删除

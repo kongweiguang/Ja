@@ -30,7 +30,7 @@ final class HandshakeCapabilitiesTest {
         assertEquals(MAPPER.valueToTree(List.of("approval_required", "full_access")),
                 capabilities.path("accessModes"));
         assertEquals(MAPPER.valueToTree(List.of("default", "plan")), capabilities.path("collaborationModes"));
-        assertEquals(MAPPER.valueToTree(List.of("task_threads_v1", "plan_goal_v1")),
+        assertEquals(MAPPER.valueToTree(List.of("task_threads_v1", "plan_goal_v1", "interaction_v1")),
                 capabilities.path("features"));
         assertTrue(methods.contains("goal/read"));
         assertTrue(methods.contains("plan/draft/discard"));
@@ -39,6 +39,7 @@ final class HandshakeCapabilitiesTest {
         List<String> events = MAPPER.convertValue(capabilities.path("events"),
                 MAPPER.getTypeFactory().constructCollectionType(List.class, String.class));
         assertTrue(events.contains("goal/changed"));
-        assertTrue(events.contains("goal/input-requested"));
+        assertTrue(events.contains("interaction/changed"));
+        assertTrue(events.contains("plan/changed"));
     }
 }

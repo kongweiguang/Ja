@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:mcp-invalid-result","method":"mcp/test","params":{"mcpId":"mcp_demo"}}
+{"jsonrpc":"2.0","id":"c:mcp-invalid-result","result":{"mcpId":"mcp_demo","status":"available","toolCount":1}}

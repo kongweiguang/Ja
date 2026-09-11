@@ -61,11 +61,30 @@ final class SidecarConfigurationTest {
         Path logs = absolute("logs");
         SidecarConfiguration configuration = SidecarConfiguration.fromArgs(new String[]{
                 "--home-dir-base64=" + encode(home), "--data-dir-base64=" + encode(data),
-                "--run-dir-base64=" + encode(run), "--log-dir-base64=" + encode(logs)});
+                "--run-dir-base64=" + encode(run), "--log-dir-base64=" + encode(logs),
+                "--ja-runtime-generation=7"});
         assertEquals(home.normalize(), configuration.homeDirectory());
         assertEquals(data.normalize(), configuration.dataDirectory());
         assertEquals(run.normalize(), configuration.runDirectory());
         assertEquals(logs.normalize(), configuration.logDirectory());
+        assertEquals(7L, configuration.runtimeGeneration());
+    }
+
+    /** Host generation 必须存在且只能声明一次，避免 Java 进程自行选择或接受伪造代际。 */
+    @Test
+    void rejectsMissingOrDuplicateRuntimeGeneration() {
+        String[] directories = new String[]{
+                "--home-dir-base64=" + encode(absolute("home")),
+                "--data-dir-base64=" + encode(absolute("data")),
+                "--run-dir-base64=" + encode(absolute("run")),
+                "--log-dir-base64=" + encode(absolute("logs"))};
+        assertThrows(IllegalArgumentException.class,
+                () -> SidecarConfiguration.fromArgs(directories));
+        String[] duplicate = java.util.Arrays.copyOf(directories, directories.length + 2);
+        duplicate[directories.length] = "--ja-runtime-generation=2";
+        duplicate[directories.length + 1] = "--ja-runtime-generation=3";
+        assertThrows(IllegalArgumentException.class,
+                () -> SidecarConfiguration.fromArgs(duplicate));
     }
 
     /** 为每个案例生成不会触碰文件系统的绝对目录身份。 */

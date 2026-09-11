@@ -100,6 +100,7 @@ describe("timeline Zustand seam", () => {
       activity: {
         activitySequence: 3,
         activityId: "activity_store",
+        rootThreadId: "thr_store",
         taskThreadId: "thr_child",
         actorThreadId: "thr_store",
         causalTurnId: "turn_store",
@@ -235,13 +236,74 @@ describe("timeline Zustand seam", () => {
     const secondSelection = selectItemsForThread("thr_store")(useTimelineStore.getState());
     expect(firstSelection).toContainEqual(
       expect.objectContaining({
-        itemId: "draft:turn_store",
+        itemId: "draft:turn_store:1",
         kind: "agent_message",
         status: "in_progress",
         text: "终态前可见",
       }),
     );
     expect(secondSelection.at(-1)).toBe(firstSelection.at(-1));
+  });
+
+  /** Store selector 必须把跨 reasoning/text 的每个 live segment 映射为独立且稳定的时间线 Item。 */
+  it("projects interleaved reasoning segments with semantic kinds", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applyHostEvent({ kind: "timeline", event: event(1, "queued", "running") })).toBe(
+      "applied",
+    );
+    const reasoning = (streamSeq: number, text: string): TimelineEvent => ({
+      jsonrpc: "2.0",
+      method: "assistant/reasoning-summary-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: `evt_reasoning_${streamSeq}`,
+        sequence: 1,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: `2026-08-18T00:00:0${streamSeq}Z`,
+        streamSeq,
+        text,
+      },
+    });
+    const assistant: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/text-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_text_2",
+        sequence: 1,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: "2026-08-18T00:00:02Z",
+        streamSeq: 2,
+        text: "公开内容",
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: reasoning(1, "先想一下") })).toBe(
+      "applied",
+    );
+    expect(store.applyHostEvent({ kind: "timeline", event: assistant })).toBe("applied");
+    expect(store.applyHostEvent({ kind: "timeline", event: reasoning(3, "再核对") })).toBe(
+      "applied",
+    );
+
+    const selected = selectItemsForThread("thr_store")(useTimelineStore.getState());
+    expect(selected.map((item) => item.kind)).toEqual(["reasoning", "agent_message", "reasoning"]);
+    expect(selected.filter((item) => item.kind === "reasoning")).toEqual([
+      expect.objectContaining({ itemId: "draft:turn_store:1", text: "先想一下" }),
+      expect.objectContaining({ itemId: "draft:turn_store:3", text: "再核对" }),
+    ]);
+    expect(selected.filter((item) => item.kind === "agent_message")).toEqual([
+      expect.objectContaining({ itemId: "draft:turn_store:2", text: "公开内容" }),
+    ]);
+    expect(selectItemsForThread("thr_store")(useTimelineStore.getState())).toEqual(selected);
   });
 
   it("marks the active thread for authoritative resync after a projection fault", () => {

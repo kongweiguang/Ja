@@ -1,11 +1,13 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { act, cleanup, render, waitFor } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { Profiler, type ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkbenchHost } from "@/app/composition/WorkbenchHost";
 import type { GoalController } from "@/features/goals";
+import { useTimelineStore, type TimelineSnapshot } from "@/features/conversation";
+import type { TaskReadModel, TaskSummary } from "@/features/tasks";
 
 const mocks = vi.hoisted(() => ({
   useReviewController: vi.fn(),
@@ -14,9 +16,15 @@ const mocks = vi.hoisted(() => ({
   useJaWorkbench: vi.fn(),
   useTerminalWorkspaceLifecycle: vi.fn(),
   useTaskController: vi.fn(),
+  TaskDetailPanel: vi.fn(() => null),
   Workbench: vi.fn((props: unknown) => {
-    void props;
-    return null;
+    const workbenchProps = props as {
+      selectedTab?: { kind: string };
+      renderTaskView?: (tab: unknown) => unknown;
+    };
+    if (workbenchProps.selectedTab?.kind !== "task" || workbenchProps.renderTaskView === undefined)
+      return null;
+    return workbenchProps.renderTaskView(workbenchProps.selectedTab);
   }),
   FilesWorkspace: vi.fn((props: unknown) => {
     void props;
@@ -31,11 +39,12 @@ vi.mock("@/features/workbench", async (importOriginal) => ({
 }));
 vi.mock("@/features/tasks", () => ({
   SubagentOverview: () => null,
-  TaskDetailPanel: () => null,
+  TaskDetailPanel: mocks.TaskDetailPanel,
   useTaskController: mocks.useTaskController,
 }));
 vi.mock("@/app/RuntimeProvider", () => ({
   useRuntimeLifecycle: () => ({ queryRuntime: vi.fn() }),
+  useRuntimeState: () => ({ boot: { status: "ready" }, turnAdmissionReady: true }),
   useRuntimeTurns: () => ({ approvalRespond: vi.fn(), resumeTurn: vi.fn() }),
 }));
 vi.mock("@/features/workbench/files", () => ({
@@ -72,6 +81,7 @@ vi.mock("@/app/composition/filesBrowserControllerPorts", () => ({
 
 afterEach(() => {
   cleanup();
+  useTimelineStore.getState().reset();
   vi.clearAllMocks();
 });
 
@@ -166,6 +176,26 @@ function makeProps(
   };
 }
 
+/** 真实 Timeline store 订阅 probe：用稳定字符串选择器和提交回调验证 snapshot 更新确实提交了重渲染。 */
+function TimelineSubscriptionProbe({
+  threadId,
+  onCommit,
+}: {
+  threadId: string;
+  onCommit: () => void;
+}) {
+  const signature = useTimelineStore((state) => {
+    const itemId = state.itemIdsByThread[threadId]?.at(-1);
+    const item = itemId === undefined ? undefined : state.items[itemId];
+    return `${state.threadRevisionByThread[threadId] ?? "none"}|${item?.text ?? ""}`;
+  });
+  return (
+    <Profiler id={`timeline-probe-${threadId}`} onRender={onCommit}>
+      <output data-testid={`timeline-probe-${threadId}`}>{signature}</output>
+    </Profiler>
+  );
+}
+
 /** 构造完整 Goal controller，composition 测试只替换需要断言的恢复动作。 */
 function makeGoalController(overrides: Partial<GoalController> = {}): GoalController {
   return {
@@ -191,7 +221,6 @@ function makeGoalController(overrides: Partial<GoalController> = {}): GoalContro
       planState: null,
       plan: null,
       draft: null,
-      inputRequest: null,
       evaluation: null,
     },
     planModel: undefined,
@@ -206,11 +235,13 @@ function makeGoalController(overrides: Partial<GoalController> = {}): GoalContro
     pause: vi.fn(async () => true),
     resume: vi.fn(async () => true),
     stop: vi.fn(async () => true),
-    respondInput: vi.fn(async () => true),
     saveDraft: vi.fn(async () => true),
     discardDraft: vi.fn(async () => true),
     propose: vi.fn(async () => true),
-    approve: vi.fn(async () => true),
+    finalizePlan: vi.fn(async () => true),
+    pausePlan: vi.fn(async () => true),
+    resumePlan: vi.fn(async () => true),
+    stopPlan: vi.fn(async () => true),
     execute: vi.fn(async () => true),
     attachPlan: vi.fn(async () => true),
     detachPlan: vi.fn(async () => true),
@@ -636,6 +667,343 @@ describe("WorkbenchHost capability activation", () => {
     expect(onTabChange).not.toHaveBeenCalled();
   });
 
+  it("selected Subagent 的真实 snapshot 只应用一次并驱动 Timeline 订阅，不创建 Composer", async () => {
+    const subagentTask: TaskSummary = {
+      taskThreadId: "thr_subagent",
+      parentThreadId: "thr_root",
+      rootThreadId: "thr_root",
+      originTurnId: "turn_parent",
+      taskName: "检查合同",
+      depth: 1,
+      taskKind: "subagent",
+      lifecycle: "attached",
+      state: "completed",
+      revision: 12,
+      latestActivitySequence: 4,
+      unreadCount: 0,
+      descendantCount: 0,
+      runningDescendantCount: 0,
+      needsAttentionCount: 0,
+      latestSafeSummary: "已完成",
+      startedAt: "2026-09-10T10:00:00Z",
+      completedAt: "2026-09-10T10:00:05Z",
+      updatedAt: "2026-09-10T10:00:05Z",
+    };
+    const subagentSnapshot: TimelineSnapshot = {
+      threadId: subagentTask.taskThreadId,
+      revision: 12,
+      turns: [
+        {
+          turnId: "turn_subagent",
+          status: "completed",
+          requestedAt: "2026-09-10T10:00:00Z",
+          updatedAt: "2026-09-10T10:00:05Z",
+          completedAt: "2026-09-10T10:00:05Z",
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [
+        {
+          itemId: "item_subagent_answer",
+          createdAt: "2026-09-10T10:00:05Z",
+          turnId: "turn_subagent",
+          kind: "final_answer",
+          text: "Subagent 真实正文",
+        },
+      ],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    };
+    const subagentDetail: TaskReadModel = {
+      task: subagentTask,
+      thread: {
+        threadId: subagentTask.taskThreadId,
+        workspaceId: "ws_demo",
+        activeGoalId: null,
+        preferences: {
+          providerId: "provider_test",
+          modelId: "model_test",
+          reasoningLevel: "medium",
+          accessMode: "approval_required",
+          collaborationMode: "default",
+          titleSource: "manual",
+        },
+        title: subagentTask.taskName,
+        status: "active",
+        pinned: false,
+        latestTurnStatus: "completed",
+        latestTurnSeen: true,
+        revision: 12,
+        createdAt: "2026-09-10T10:00:00Z",
+        updatedAt: "2026-09-10T10:00:05Z",
+      },
+      contextSeed: {
+        contextSeedId: "seed_subagent",
+        parentRevision: 8,
+        inheritanceMode: "brief_only",
+        taskBrief: [{ type: "text", text: "检查合同" }],
+        inheritedContextSummary: null,
+        inheritedContextPreview: [],
+        fingerprint: "b".repeat(64),
+        createdAt: "2026-09-10T10:00:00Z",
+      },
+      activities: [],
+      mailbox: [],
+      nextCursor: null,
+    };
+    mocks.useTaskController.mockReturnValue({
+      tasks: [subagentTask],
+      detail: subagentDetail,
+      transcript: subagentSnapshot,
+      loading: false,
+      detailLoading: false,
+      refresh: vi.fn(),
+      refreshDetail: vi.fn(),
+      followupTurn: vi.fn(),
+      cancel: vi.fn(),
+    });
+    const applySnapshot = vi.spyOn(useTimelineStore.getState(), "applySnapshot");
+    let timelineCommitCount = 0;
+    const onTimelineCommit = () => {
+      timelineCommitCount += 1;
+    };
+    expect(
+      useTimelineStore.getState().applyRuntimeStatus({
+        status: "ready",
+        generation: 1,
+        serverInstanceId: "srv_workbench_test",
+      }),
+    ).toBe("applied");
+
+    const props = makeProps({
+      active: true,
+      rootThreadId: "thr_root",
+      parentThreadRevision: 8,
+      selectedTab: "subagent:thr_subagent",
+      openTabs: ["subagent:thr_subagent"],
+      taskPreferencesPort: {
+        update: vi.fn(async () => subagentDetail.thread.preferences!),
+      },
+    });
+    const view = render(
+      <>
+        <WorkbenchHost {...props} />
+        <TimelineSubscriptionProbe
+          threadId={subagentTask.taskThreadId}
+          onCommit={onTimelineCommit}
+        />
+      </>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("timeline-probe-thr_subagent").textContent).toBe(
+        "12|Subagent 真实正文",
+      ),
+    );
+    expect(applySnapshot).toHaveBeenCalledTimes(1);
+    expect(timelineCommitCount).toBe(2);
+    const taskPanelProps = (mocks.TaskDetailPanel.mock.calls as unknown as unknown[][]).at(
+      -1,
+    )?.[0] as {
+      tab?: { taskKind?: string; taskThreadId?: string };
+      conversation?: unknown;
+    };
+    expect(taskPanelProps.tab).toEqual(
+      expect.objectContaining({ taskKind: "subagent", taskThreadId: "thr_subagent" }),
+    );
+    expect(taskPanelProps.conversation).toBeUndefined();
+
+    view.rerender(
+      <>
+        <WorkbenchHost {...props} />
+        <TimelineSubscriptionProbe
+          threadId={subagentTask.taskThreadId}
+          onCommit={onTimelineCommit}
+        />
+      </>,
+    );
+    expect(applySnapshot).toHaveBeenCalledTimes(1);
+    applySnapshot.mockRestore();
+  });
+
+  it("侧聊 Composer 的 /btw 绑定当前 child 来源而不是主 root", async () => {
+    const sideTask: TaskSummary = {
+      taskThreadId: "thr_side",
+      parentThreadId: "thr_root",
+      rootThreadId: "thr_root",
+      originTurnId: null,
+      taskName: "侧聊",
+      depth: 1,
+      taskKind: "side_task",
+      lifecycle: "independent",
+      state: "idle",
+      revision: 6,
+      latestActivitySequence: 1,
+      unreadCount: 0,
+      descendantCount: 0,
+      runningDescendantCount: 0,
+      needsAttentionCount: 0,
+      latestSafeSummary: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: "2026-09-10T10:00:00Z",
+    };
+    const preferences = {
+      providerId: "provider_side",
+      modelId: "model_side",
+      reasoningLevel: "high" as const,
+      accessMode: "full_access" as const,
+      collaborationMode: "default" as const,
+      titleSource: "manual" as const,
+    };
+    const detail: TaskReadModel = {
+      task: sideTask,
+      thread: {
+        threadId: sideTask.taskThreadId,
+        workspaceId: "ws_demo",
+        preferences,
+        title: sideTask.taskName,
+        status: "active",
+        pinned: false,
+        latestTurnStatus: null,
+        latestTurnSeen: true,
+        activeGoalId: null,
+        revision: sideTask.revision,
+        createdAt: "2026-09-10T10:00:00Z",
+        updatedAt: sideTask.updatedAt,
+      },
+      contextSeed: {
+        contextSeedId: "seed_side",
+        parentRevision: 4,
+        inheritanceMode: "brief_only",
+        taskBrief: [{ type: "text", text: "侧聊" }],
+        inheritedContextSummary: null,
+        inheritedContextPreview: [],
+        fingerprint: "c".repeat(64),
+        createdAt: "2026-09-10T10:00:00Z",
+      },
+      activities: [],
+      mailbox: [],
+      nextCursor: null,
+    };
+    const transcript: TimelineSnapshot = {
+      threadId: sideTask.taskThreadId,
+      revision: sideTask.revision,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    };
+    const nestedTask = {
+      ...sideTask,
+      taskThreadId: "thr_nested",
+      parentThreadId: sideTask.taskThreadId,
+    };
+    let releaseReady!: () => void;
+    const taskReady = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    const createSideTask = vi.fn(async () => nestedTask);
+    const waitForTaskReady = vi.fn(() => taskReady);
+    const followup = vi.fn(async () => nestedTask);
+    const followupTurn = vi.fn(async () => ({
+      accepted: true as const,
+      turnId: "turn_side_input",
+      queued: true,
+      threadRevision: sideTask.revision + 1,
+    }));
+    mocks.useTaskController.mockReturnValue({
+      tasks: [sideTask],
+      detail,
+      transcript,
+      loading: false,
+      detailLoading: false,
+      refresh: vi.fn(),
+      refreshDetail: vi.fn(),
+      createSideTask,
+      waitForTaskReady,
+      followup,
+      followupTurn,
+      close: vi.fn(),
+    });
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_root",
+          parentThreadRevision: 8,
+          selectedTab: "side-task:thr_side",
+          openTabs: ["side-task:thr_side"],
+          taskPreferencesPort: {
+            update: vi.fn(async () => preferences),
+          },
+        })}
+      />,
+    );
+
+    const panelProps = (mocks.TaskDetailPanel.mock.calls as unknown as unknown[][]).at(-1)?.[0] as {
+      composerEnvironment?: {
+        slashCommands?: readonly {
+          id: string;
+          execute: (context: { argument: string }) => void | Promise<void>;
+        }[];
+      };
+      conversation?: {
+        send: (request: { text: string }) => Promise<void>;
+      };
+    };
+    const btw = panelProps.composerEnvironment?.slashCommands?.find(
+      (command) => command.id === "btw",
+    );
+    expect(btw).toBeDefined();
+    let pendingBtw!: Promise<void>;
+    await act(async () => {
+      pendingBtw = btw?.execute({ argument: "从侧聊继续" }) as Promise<void>;
+      await Promise.resolve();
+    });
+    expect(followup).not.toHaveBeenCalled();
+    releaseReady();
+    await act(async () => {
+      await pendingBtw;
+    });
+
+    expect(createSideTask).toHaveBeenCalledWith({
+      taskName: "侧聊",
+      sourceThreadId: sideTask.taskThreadId,
+      sourceThreadRevision: sideTask.revision,
+      preferences: {
+        providerId: preferences.providerId,
+        modelId: preferences.modelId,
+        reasoningLevel: preferences.reasoningLevel,
+        accessMode: preferences.accessMode,
+        collaborationMode: preferences.collaborationMode,
+      },
+    });
+    expect(waitForTaskReady).toHaveBeenCalledWith(nestedTask.taskThreadId);
+    expect(followup).toHaveBeenCalledWith(
+      nestedTask,
+      [{ type: "text", text: "从侧聊继续" }],
+      sideTask.taskThreadId,
+    );
+
+    await act(async () => {
+      await panelProps.conversation?.send({ text: "侧聊普通输入" });
+    });
+    expect(followupTurn).toHaveBeenCalledWith(
+      sideTask,
+      [{ type: "text", text: "侧聊普通输入" }],
+      sideTask.taskThreadId,
+    );
+  });
+
   it("关闭 Task 实例只提交 Tab teardown，不调用 task cancel", () => {
     const cancel = vi.fn();
     mocks.useTaskController.mockReturnValue({
@@ -660,14 +1028,93 @@ describe("WorkbenchHost capability activation", () => {
     expect(cancel).not.toHaveBeenCalled();
   });
 
-  it("keeps a draft name in its stable tab descriptor without calling persistent rename", async () => {
-    const rename = vi.fn();
+  /** 侧聊 Tab 关闭必须等待 Task controller 的真实销毁 ACK，不能退化为仅释放观察。 */
+  it("routes side-chat tab close through task controller close", async () => {
+    const close = vi.fn(async () => undefined);
+    const sideTask: TaskSummary = {
+      taskThreadId: "thr_side",
+      parentThreadId: "thr_root",
+      rootThreadId: "thr_root",
+      originTurnId: null,
+      taskName: "侧聊",
+      depth: 1,
+      taskKind: "side_task",
+      lifecycle: "independent",
+      state: "idle",
+      revision: 1,
+      latestActivitySequence: 1,
+      unreadCount: 0,
+      descendantCount: 0,
+      runningDescendantCount: 0,
+      needsAttentionCount: 0,
+      latestSafeSummary: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: "2026-09-10T10:00:00Z",
+    };
+    mocks.useTaskController.mockReturnValue({
+      tasks: [sideTask],
+      loading: false,
+      detailLoading: false,
+      refresh: vi.fn(),
+      close,
+    });
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          rootThreadId: "thr_root",
+          selectedTab: "side-task:thr_side",
+          openTabs: ["side-task:thr_side"],
+        })}
+      />,
+    );
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
+      onTabClose: (tab: unknown) => Promise<void> | void;
+    };
+
+    await act(async () => {
+      await workbenchProps.onTabClose({
+        kind: "task",
+        key: "side-task:thr_side",
+        taskKind: "side_task",
+        taskThreadId: "thr_side",
+        rootThreadId: "thr_root",
+        label: "侧聊",
+      });
+    });
+    expect(close).toHaveBeenCalledExactlyOnceWith(sideTask);
+  });
+
+  it("creates an idle side task before opening its stable tab", async () => {
+    const createSideTask = vi.fn(async () => ({
+      taskThreadId: "thr_child",
+      parentThreadId: "thr_root",
+      rootThreadId: "thr_root",
+      originTurnId: null,
+      taskName: "侧边任务",
+      depth: 1,
+      taskKind: "side_task" as const,
+      lifecycle: "independent" as const,
+      state: "idle" as const,
+      revision: 1,
+      latestActivitySequence: 1,
+      unreadCount: 0,
+      descendantCount: 0,
+      runningDescendantCount: 0,
+      needsAttentionCount: 0,
+      latestSafeSummary: "已创建",
+      startedAt: null,
+      completedAt: null,
+      updatedAt: "2026-09-07T10:00:00Z",
+    }));
+    const onOpenTabsChange = vi.fn();
+    const onTabChange = vi.fn();
     mocks.useTaskController.mockReturnValue({
       tasks: [],
       loading: false,
       detailLoading: false,
       refresh: vi.fn(),
-      rename,
+      createSideTask,
       cancel: vi.fn(),
     });
     render(
@@ -675,26 +1122,28 @@ describe("WorkbenchHost capability activation", () => {
         {...makeProps({
           rootThreadId: "thr_root",
           parentThreadRevision: 4,
-          selectedTab: "side-task:draft_12345678",
-          openTabs: ["side-task:draft_12345678"],
+          selectedTab: "agents",
+          openTabs: ["agents"],
+          onOpenTabsChange,
+          onTabChange,
         })}
       />,
     );
-    let workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
-      selectedTab: { label: string; key: string };
-      onTaskTabRename: (tab: unknown, label: string) => Promise<void>;
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
+      onCreateSideTask: () => undefined;
     };
 
-    await act(async () => {
-      await workbenchProps.onTaskTabRename(workbenchProps.selectedTab, "资料核对");
+    expect(workbenchProps.onCreateSideTask()).toBeUndefined();
+    expect(createSideTask).toHaveBeenCalledWith({
+      taskName: "侧聊",
+      sourceThreadId: "thr_root",
+      sourceThreadRevision: undefined,
+      preferences: undefined,
     });
-
-    workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as typeof workbenchProps;
-    expect(workbenchProps.selectedTab).toMatchObject({
-      key: "side-task:draft_12345678",
-      label: "资料核对",
+    await waitFor(() => {
+      expect(onOpenTabsChange).toHaveBeenCalledWith(["agents", "side-task:thr_child"]);
+      expect(onTabChange).toHaveBeenCalledWith("side-task:thr_child");
     });
-    expect(rename).not.toHaveBeenCalled();
   });
 
   it("routes an existing side-task tab rename through the task controller", async () => {

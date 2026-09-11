@@ -1,34 +1,43 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Bot, ChevronDown, CircleAlert, LoaderCircle, Play, X } from "lucide-react";
-import { useCallback, useMemo, useState, type ReactElement } from "react";
+import { Bot, ChevronDown, CircleAlert, LoaderCircle } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactElement } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   ChatTimeline,
   Composer,
-  type ComposerSubmit,
+  InteractionCard,
+  resolveContextUsage,
+  selectApprovalClosedAt,
+  selectApprovalDecisions,
+  selectApprovals,
+  selectGoalActivitiesForOwner,
+  selectItemsForThread,
+  useTimelineStore,
+  type ComposerSlashCommand,
+  type ComposerNativeDropEvent,
   type ComposerWorkspaceSearchResult,
   type ConversationAttachment,
   type ConversationAttachmentPort,
   type ConversationContextReference,
-  type TimelineApproval,
-  type TimelineItemAdapter,
-  type TimelineTurn,
+  type ConversationInteractionController,
+  type InteractionController,
+  type TimelineGoalActivity,
 } from "@/features/conversation";
+import {
+  ComposerGoalStatus,
+  GoalActivityCard,
+  GoalStatusBar,
+  PlanTimelineBlock,
+  PlanWorkbench,
+  type GoalController,
+} from "@/features/goals";
 import { Button, ErrorState } from "@/shared/ui/primitives";
 import type { WorkbenchTaskTab } from "@/features/workbench";
 import type { TaskController } from "../application/useTaskController";
-import { readyTaskAttachments, useTaskComposerDraft } from "../application/useTaskComposerDraft";
-import type { TaskContentBlock, TaskSummary } from "../domain/taskModel";
 import { propagatingTaskDescendantCount, taskStateLabel } from "../domain/taskModel";
 import "./tasks.css";
-
-interface TaskTimelineProjection {
-  readonly items: TimelineItemAdapter[];
-  readonly turns: TimelineTurn[];
-  readonly approvals: TimelineApproval[];
-  readonly approvalDecisions: Readonly<Record<string, "approve" | "deny" | undefined>>;
-}
 
 export interface TaskComposerSkillSuggestion {
   readonly skillId: string;
@@ -40,15 +49,25 @@ export interface TaskComposerSkillSuggestion {
 export interface TaskComposerEnvironment {
   readonly workspaceId: string;
   readonly runtimeGeneration?: number;
+  readonly nativeDropEvent?: ComposerNativeDropEvent;
+  readonly dropZoneRef?: (element: HTMLFormElement | null) => void;
   readonly skills?: readonly TaskComposerSkillSuggestion[];
   readonly attachmentPort?: ConversationAttachmentPort;
+  readonly slashCommands?: readonly ComposerSlashCommand[];
   readonly onSearchWorkspacePaths?: (query: string) => Promise<ComposerWorkspaceSearchResult>;
   readonly onOpenAttachmentPreview?: (
     attachment: ConversationAttachment,
     source: HTMLButtonElement,
   ) => void;
-  readonly onAttachmentRemoved?: (attachmentId: string) => void;
-  readonly onAttachmentsBound?: (threadId: string, attachmentIds: readonly string[]) => void;
+  readonly onOpenQueuedAttachmentPreview?: (
+    attachment: ConversationAttachment,
+    source: HTMLButtonElement,
+  ) => void;
+  readonly onRestoreDefaults?: () => void | Promise<void>;
+  readonly onOpenWorkspaceReference?: (
+    reference: Extract<ConversationContextReference, { type: "workspace_reference" }>,
+    source: HTMLButtonElement,
+  ) => void;
 }
 
 export interface TaskTranscriptActions {
@@ -71,344 +90,7 @@ export interface TaskTranscriptActions {
   ) => void;
 }
 
-/** Snapshot 已过严格 Schema；此处只读取明确字符串字段，不为未知历史格式建立兼容通道。 */
-function stringField(item: Record<string, unknown>, field: string): string | undefined {
-  const value = item[field];
-  return typeof value === "string" ? value : undefined;
-}
-
-/** Tool 状态映射到现有 Timeline 闭集，保留失败、取消与审批等待的可视语义。 */
-function toolItemStatus(presentation: Record<string, unknown>): TimelineItemAdapter["status"] {
-  switch (presentation["status"]) {
-    case "pending":
-      return "started";
-    case "running":
-    case "waiting_approval":
-      return "in_progress";
-    case "success":
-      return "completed";
-    case "error":
-      return "failed";
-    case "cancelled":
-      return "cancelled";
-    default:
-      return "started";
-  }
-}
-
-/** User content 只转换协议闭集中的正文与引用，Skill 展示元数据仍由当前 catalog 补齐。 */
-function userItem(
-  item: Record<string, unknown>,
-  threadId: string,
-  itemId: string,
-  turnId: string,
-): TimelineItemAdapter {
-  const content = Array.isArray(item["content"]) ? (item["content"] as TaskContentBlock[]) : [];
-  const text = content
-    .filter((block): block is Extract<TaskContentBlock, { type: "text" }> => block.type === "text")
-    .map((block) => block.text)
-    .join("\n\n");
-  const contextReferences = content.filter(
-    (block): block is ConversationContextReference =>
-      block.type === "workspace_reference" || block.type === "skill_reference",
-  );
-  const attachments = Array.isArray(item["attachments"])
-    ? (item["attachments"] as NonNullable<TimelineItemAdapter["attachments"]>)
-    : [];
-  return {
-    itemId,
-    threadId,
-    turnId,
-    kind: "user_message",
-    status: "completed",
-    text,
-    contextReferences,
-    attachments,
-    createdAt: stringField(item, "createdAt"),
-  };
-}
-
-/**
- * Child thread/read 投影成现有 ChatTimeline 输入，复用安全 Markdown、ToolPresentation、Approval
- * 和 Turn error renderer；原始隐藏推理与未知 item kind 没有兜底展示路径。
- */
-function projectTaskTranscript(controller: TaskController): TaskTimelineProjection {
-  const snapshot = controller.transcript;
-  if (snapshot === undefined) return { items: [], turns: [], approvals: [], approvalDecisions: {} };
-  const items: TimelineItemAdapter[] = [];
-  const approvals: TimelineApproval[] = [];
-  const approvalDecisions: Record<string, "approve" | "deny" | undefined> = {};
-  for (const [index, item] of snapshot.items.entries()) {
-    const kind = stringField(item, "kind");
-    const itemId = stringField(item, "itemId") ?? `task-item-${index}`;
-    const turnId = stringField(item, "turnId");
-    if (turnId === undefined) continue;
-    if (kind === "user_input") {
-      items.push(userItem(item, snapshot.threadId, itemId, turnId));
-      continue;
-    }
-    if (kind === "assistant_progress" || kind === "reasoning_summary") {
-      items.push({
-        itemId,
-        threadId: snapshot.threadId,
-        turnId,
-        kind: "commentary",
-        status: "completed",
-        title: kind === "reasoning_summary" ? "思考摘要" : "进度",
-        text: stringField(item, "text"),
-        summary: stringField(item, "text"),
-        createdAt: stringField(item, "createdAt"),
-      });
-      continue;
-    }
-    if (kind === "final_answer") {
-      items.push({
-        itemId,
-        threadId: snapshot.threadId,
-        turnId,
-        kind: "agent_message",
-        status: "completed",
-        text: stringField(item, "text"),
-        final: true,
-        createdAt: stringField(item, "createdAt"),
-      });
-      continue;
-    }
-    if (kind === "tool_call") {
-      const presentation = item["presentation"] as Record<string, unknown>;
-      items.push({
-        itemId,
-        threadId: snapshot.threadId,
-        turnId,
-        kind: "tool_call",
-        status: toolItemStatus(presentation),
-        title: stringField(presentation, "title"),
-        metadata: {
-          callId: stringField(item, "callId"),
-          toolName: stringField(item, "toolName"),
-          presentation: presentation as unknown as NonNullable<
-            NonNullable<TimelineItemAdapter["metadata"]>["presentation"]
-          >,
-        },
-        createdAt: stringField(item, "createdAt"),
-      });
-      continue;
-    }
-    if (kind === "approval") {
-      const approvalId = stringField(item, "approvalId");
-      const callId = stringField(item, "callId");
-      const toolName = stringField(item, "toolName");
-      const reason = stringField(item, "reason");
-      const expiresAt = stringField(item, "expiresAt");
-      if (
-        approvalId === undefined ||
-        callId === undefined ||
-        toolName === undefined ||
-        reason === undefined ||
-        expiresAt === undefined
-      )
-        continue;
-      approvals.push({
-        approvalId,
-        threadId: snapshot.threadId,
-        turnId,
-        threadRevision: snapshot.revision,
-        callId,
-        toolName,
-        reason,
-        expiresAt,
-      });
-      const decision = item["decision"];
-      if (decision === "approve" || decision === "deny") approvalDecisions[approvalId] = decision;
-    }
-  }
-  return {
-    items,
-    approvals,
-    approvalDecisions,
-    turns: snapshot.turns.map((turn) => ({
-      turnId: turn.turnId,
-      threadId: snapshot.threadId,
-      status: turn.status as TimelineTurn["status"],
-      threadRevision: snapshot.revision,
-      startedAt: turn.requestedAt,
-      completedAt: turn.completedAt ?? undefined,
-      error: turn.errorCode === null ? undefined : { code: turn.errorCode, retryable: false },
-    })),
-  };
-}
-
-/** Task Transcript 只做严格投影，具体文本、Tool 与 Approval 展示完全复用主 Timeline。 */
-function TaskTranscript({
-  controller,
-  actions,
-}: {
-  controller: TaskController;
-  actions?: TaskTranscriptActions;
-}): ReactElement {
-  const projection = useMemo(() => projectTaskTranscript(controller), [controller]);
-  return (
-    <ChatTimeline
-      className="ja-task-chat-timeline"
-      items={projection.items}
-      turns={projection.turns}
-      approvals={projection.approvals}
-      approvalDecisions={projection.approvalDecisions}
-      onApprovalDecision={(approval, decision) =>
-        controller.approvalRespond(
-          approval.approvalId,
-          approval.turnId,
-          approval.threadRevision,
-          decision,
-        )
-      }
-      onOpenLink={actions?.onOpenLink}
-      onCopyText={actions?.onCopyText}
-      onReadToolArtifact={actions?.onReadToolArtifact}
-      onOpenAttachmentPreview={actions?.onOpenAttachmentPreview}
-      emptyText="尚无回复"
-    />
-  );
-}
-
-/**
- * Composer submit 按 Java UserContent 的 canonical 顺序冻结：引用、附件、唯一正文。该顺序
- * 让 task/create、task/followup 与普通 turn/start 共用同一严格校验，不携带展示元数据。
- */
-function taskContent(request: ComposerSubmit): TaskContentBlock[] {
-  return [
-    ...(request.contextReferences ?? []).map(
-      (reference): TaskContentBlock =>
-        reference.type === "workspace_reference"
-          ? reference
-          : { type: "skill_reference", skillId: reference.skillId },
-    ),
-    ...(request.attachmentIds ?? []).map((attachmentId) => ({
-      type: "attachment" as const,
-      attachmentId,
-    })),
-    ...(request.text.trim() === "" ? [] : [{ type: "text" as const, text: request.text.trim() }]),
-  ];
-}
-
-/**
- * Side Task 复用生产 Composer 的附件、Workspace 与 Skill 交互；Task controller 只替换最终
- * submit use case。名称由 Tab 唯一编辑；ACK 前保留全部草稿，ACK 后才清除并升级附件预览授权。
- */
-function SideTaskComposer({
-  task,
-  draft,
-  label,
-  onCreated,
-  controller,
-  environment,
-}: {
-  task?: TaskSummary;
-  draft: boolean;
-  label: string;
-  onCreated: (task: TaskSummary) => void;
-  controller: TaskController;
-  environment?: TaskComposerEnvironment;
-}): ReactElement {
-  const [sending, setSending] = useState(false);
-  const [submitError, setSubmitError] = useState<string>();
-  const composer = useTaskComposerDraft(
-    environment?.attachmentPort,
-    environment?.onAttachmentRemoved,
-  );
-  const composerThreadId = task?.taskThreadId ?? `draft:${environment?.workspaceId ?? "unknown"}`;
-  /**
-   * Workspace 搜索仍由根 Thread 完成服务端授权；通过后的有界结果重新绑定到当前 Child/Draft
-   * Composer identity，才能沿用通用 Composer 的迟到响应隔离而不伪造新的读取权限。
-   */
-  const searchWorkspacePaths = useCallback(
-    async (query: string): Promise<ComposerWorkspaceSearchResult> => {
-      if (environment?.onSearchWorkspacePaths === undefined)
-        throw new Error("task workspace search unavailable");
-      const result = await environment.onSearchWorkspacePaths(query);
-      return { ...result, threadId: composerThreadId };
-    },
-    [composerThreadId, environment],
-  );
-  const readyAttachments = readyTaskAttachments(composer.attachmentDraftItems);
-  const active =
-    task !== undefined && ["queued", "running", "waiting_approval"].includes(task.state);
-
-  /** 同一个 submit handler 同时承载首次创建与后续排队，服务端 ACK 决定何时清空。 */
-  const submit = async (request: ComposerSubmit): Promise<void> => {
-    if (sending) return;
-    const content = taskContent(request);
-    if (content.length === 0) return;
-    setSending(true);
-    setSubmitError(undefined);
-    try {
-      let target = task;
-      if (draft) {
-        const normalized =
-          (label === "新侧边任务" ? "" : label.trim()) ||
-          request.text.trim().split(/\r?\n/u)[0]?.slice(0, 96);
-        target = await controller.createSideTask({
-          taskName: normalized || readyAttachments[0]?.fileName.slice(0, 96) || "侧边任务",
-          content,
-        });
-        onCreated(target);
-      } else if (task !== undefined) target = await controller.followup(task, content);
-      const attachmentIds = request.attachmentIds ?? [];
-      composer.clearSubmitted(attachmentIds);
-      if (target !== undefined && attachmentIds.length > 0)
-        environment?.onAttachmentsBound?.(target.taskThreadId, attachmentIds);
-    } catch (failure) {
-      setSubmitError(failure instanceof Error ? failure.message : "消息未发送，请重试。");
-    } finally {
-      setSending(false);
-    }
-  };
-
-  return (
-    <div
-      className="ja-task-composer ja-conversation-content-rail"
-      data-task-state={task?.state ?? "draft"}
-    >
-      <Composer
-        className="ja-task-structured-composer"
-        text={composer.text}
-        onTextChange={composer.updateText}
-        contextReferences={composer.contextReferences}
-        onContextReferencesChange={composer.updateContextReferences}
-        threadId={composerThreadId}
-        workspaceId={environment?.workspaceId}
-        runtimeGeneration={environment?.runtimeGeneration}
-        skills={environment?.skills}
-        onSearchWorkspacePaths={
-          environment?.onSearchWorkspacePaths === undefined ? undefined : searchWorkspacePaths
-        }
-        attachments={readyAttachments}
-        attachmentDraftItems={composer.attachmentDraftItems}
-        activeTurn={active}
-        sending={sending}
-        importingAttachments={composer.importingAttachments}
-        error={submitError ?? composer.error}
-        onAddAttachments={
-          environment?.attachmentPort === undefined ? undefined : composer.importAttachments
-        }
-        onRetryAttachment={
-          environment?.attachmentPort === undefined ? undefined : composer.retryAttachment
-        }
-        onRemoveAttachment={
-          environment?.attachmentPort === undefined ? undefined : composer.removeAttachment
-        }
-        onPasteAttachments={
-          environment?.attachmentPort === undefined ? undefined : composer.importClipboard
-        }
-        onOpenAttachmentPreview={environment?.onOpenAttachmentPreview}
-        onSend={submit}
-        onEnqueue={submit}
-      />
-    </div>
-  );
-}
-
-/** 详情读取失败保留现有投影，并提供同一实例的权威重试入口。 */
+/** 读失败保留原会话和草稿；重试只重读当前 Task，不重新发送任何内容。 */
 function DetailReadAlert({
   message,
   onRetry,
@@ -428,60 +110,135 @@ function DetailReadAlert({
 }
 
 /**
- * 侧边任务与 Subagent 共享详情壳和安全 Timeline；只有侧边任务拥有 Composer。关闭视图只
- * unobserve，取消和 suspended resume 都是独立、明确且可失败重试的用户动作。
- * 侧边任务的标题只在 Tab 呈现，正文不再叠加第二套会话抬头。
+ * 侧聊拥有真实 Thread，和主任务使用相同的交互 controller、Timeline、Composer 与 Plan/Goal
+ * 组件。视图不再创建精简版草稿或解析历史格式；Subagent 保持只读正文和显式控制入口。
  */
 export function TaskDetailPanel({
   tab,
   controller,
-  onCreated,
-  composerEnvironment,
+  composerEnvironment: environment,
   transcriptActions,
+  conversation,
+  goal,
+  clarification,
+  planDetailsOpen = false,
+  onPlanDetailsChange,
+  focusRequest,
 }: {
   tab: WorkbenchTaskTab;
   controller: TaskController;
-  onCreated: (task: TaskSummary) => void;
   composerEnvironment?: TaskComposerEnvironment;
   transcriptActions?: TaskTranscriptActions;
+  conversation?: ConversationInteractionController;
+  goal?: GoalController;
+  clarification?: InteractionController;
+  planDetailsOpen?: boolean;
+  onPlanDetailsChange?: (open: boolean) => void;
+  /** 空侧聊创建完成后由 Host 发出一次性焦点 token，避免查询全局 DOM 抢走主 Composer 焦点。 */
+  focusRequest?: number;
 }): ReactElement {
+  const threadId = tab.taskThreadId ?? "";
   const task =
-    controller.detail?.task ??
-    controller.tasks.find((item) => item.taskThreadId === tab.taskThreadId);
-  const draft = tab.taskThreadId === undefined;
+    controller.detail?.task.taskThreadId === threadId
+      ? controller.detail.task
+      : controller.tasks.find((candidate) => candidate.taskThreadId === threadId);
   const [confirmCancel, setConfirmCancel] = useState(false);
-  const [cancelError, setCancelError] = useState<string>();
-  const [resumeBusy, setResumeBusy] = useState(false);
-  const [resumeError, setResumeError] = useState<string>();
-  const terminal =
-    !draft && (task === undefined || ["completed", "failed", "cancelled"].includes(task.state));
-  const propagatingDescendants =
-    task === undefined ? 0 : propagatingTaskDescendantCount(controller.tasks, task);
-  const contextText = useMemo(() => {
-    const context = controller.detail?.contextSeed;
-    if (context === undefined) return undefined;
-    return context.inheritanceMode === "effective_context"
-      ? `继承自主任务 revision ${context.parentRevision}`
-      : `仅使用任务简报 · revision ${context.parentRevision}`;
-  }, [controller.detail]);
-
-  /** Resume 保持 single-flight；失败不改变权威 suspended 状态，按钮可直接重试。 */
-  const resume = async (): Promise<void> => {
-    if (task === undefined || resumeBusy) return;
-    setResumeBusy(true);
-    setResumeError(undefined);
+  const [controlBusy, setControlBusy] = useState(false);
+  const [controlError, setControlError] = useState<string>();
+  /** Subagent 的递归取消保持显式确认；失败不会把 Task 状态乐观改成终态。 */
+  const controlSubagent = async (resume: boolean): Promise<void> => {
+    if (task === undefined || controlBusy) return;
+    setControlBusy(true);
+    setControlError(undefined);
     try {
-      await controller.resume(task);
-    } catch (failure) {
-      setResumeError(
-        failure instanceof Error ? failure.message : "任务恢复失败，请确认当前状态后重试。",
-      );
+      if (resume) await controller.resume(task);
+      else await controller.cancel(task);
+      setConfirmCancel(false);
+    } catch {
+      setControlError(resume ? "任务恢复失败，请重试。" : "取消请求未完成，请重试。");
     } finally {
-      setResumeBusy(false);
+      setControlBusy(false);
     }
   };
+  const items = useTimelineStore(useShallow(selectItemsForThread(threadId)));
+  const turns = useTimelineStore(
+    useShallow((state) => Object.values(state.turns).filter((turn) => turn.threadId === threadId)),
+  );
+  const approvals = useTimelineStore(
+    useShallow((state) =>
+      selectApprovals(state).filter((approval) => approval.threadId === threadId),
+    ),
+  );
+  const approvalDecisions = useTimelineStore(useShallow(selectApprovalDecisions));
+  const approvalClosedAt = useTimelineStore(useShallow(selectApprovalClosedAt));
+  const persistedGoalActivities = useTimelineStore(selectGoalActivitiesForOwner(threadId));
+  /** 与主会话一样以 mutation ACK 补齐终态卡片，下一次持久快照再按 Goal identity 去重接管。 */
+  const goalActivities = useMemo<readonly TimelineGoalActivity[]>(() => {
+    const current = goal?.model?.goal;
+    if (
+      current === undefined ||
+      current.ownerThreadId !== threadId ||
+      (current.status !== "achieved" && current.status !== "stopped") ||
+      persistedGoalActivities.some((activity) => activity.goalId === current.goalId)
+    )
+      return persistedGoalActivities;
+    return [
+      ...persistedGoalActivities,
+      {
+        goalId: current.goalId,
+        objective: current.objective,
+        status: current.status,
+        goalRevision: current.revision,
+        eventSequence: goal?.model?.eventSequence ?? current.revision,
+        occurredAt: current.updatedAt,
+      },
+    ];
+  }, [goal?.model, persistedGoalActivities, threadId]);
+  const usage = useTimelineStore((state) => state.contextUsageByThread[threadId]);
+  const compaction = useTimelineStore((state) => state.contextCompactionByThread[threadId]);
+  const contextUsage = useMemo(
+    () => resolveContextUsage({ usage, compaction }),
+    [usage, compaction],
+  );
+  const context =
+    controller.detail?.task.taskThreadId === threadId ? controller.detail.contextSeed : undefined;
+  const closing = controller.closingTaskThreadId === threadId;
+  const currentStepTitle = goal?.model?.plan?.steps.find(
+    (step) => step.stepId === goal.model?.goal.currentStepId,
+  )?.title;
+  const latestTerminalTurnId = turns
+    .filter((turn) => ["completed", "failed", "cancelled"].includes(turn.status))
+    .sort((left, right) => (left.completedAt ?? "").localeCompare(right.completedAt ?? ""))
+    .at(-1)?.turnId;
+  const currentPlanId = goal?.planModel?.plan.planId;
+  const refreshGoal = goal?.refresh;
+  /** 独立 Plan 不一定产生 Goal 事件；与主会话一样在 Turn 终态重读一次权威 Plan。 */
+  useEffect(() => {
+    if (currentPlanId !== undefined && latestTerminalTurnId !== undefined) void refreshGoal?.();
+  }, [currentPlanId, latestTerminalTurnId, refreshGoal]);
+  const externalRows = goalActivities.map((activity) => ({
+    rowId: `goal-terminal:${activity.goalId}`,
+    occurredAt: activity.occurredAt,
+    revision: `${activity.goalRevision}:${activity.eventSequence}`,
+    content: <GoalActivityCard activity={activity} />,
+  }));
+  if (goal?.planModel !== undefined)
+    externalRows.push({
+      rowId: `plan:${goal.planModel.plan.planId}`,
+      occurredAt: goal.planModel.plan.updatedAt,
+      revision: String(goal.planModel.plan.revision),
+      content: (
+        <PlanTimelineBlock
+          model={goal.model}
+          planModel={goal.planModel}
+          busy={goal.busyAction !== undefined}
+          onOpenDetails={() => onPlanDetailsChange?.(true)}
+          onExecute={goal.execute}
+        />
+      ),
+    });
 
-  if (!draft && controller.detailError !== undefined && task === undefined)
+  if (controller.detailError !== undefined && task === undefined)
     return (
       <ErrorState
         title="任务详情暂不可用"
@@ -490,72 +247,60 @@ export function TaskDetailPanel({
       />
     );
   return (
-    <section
-      className="ja-task-detail"
-      aria-label={draft ? "新建侧边任务" : (task?.taskName ?? tab.label)}
-    >
-      {tab.taskKind === "subagent" || (task !== undefined && !terminal) ? (
+    <section className="ja-task-detail" aria-label={task?.taskName ?? tab.label}>
+      {tab.taskKind === "subagent" ? (
         <header className="ja-task-detail-header">
-          {tab.taskKind === "subagent" ? (
-            <div>
-              <span>
-                <Bot aria-hidden="true" />
-                Subagent
-              </span>
-              <h2>{task?.taskName ?? tab.label}</h2>
-              {task === undefined ? null : <small>{taskStateLabel(task.state)}</small>}
-            </div>
-          ) : null}
+          <div>
+            <span>
+              <Bot aria-hidden="true" />
+              Subagent
+            </span>
+            <h2>{task?.taskName ?? tab.label}</h2>
+            {task === undefined ? null : <small>{taskStateLabel(task.state)}</small>}
+          </div>
           {task?.state === "suspended" ? (
-            <Button size="sm" disabled={resumeBusy} onClick={() => void resume()}>
-              {resumeBusy ? (
-                <LoaderCircle className="ja-task-spin" aria-hidden="true" />
-              ) : (
-                <Play aria-hidden="true" />
-              )}
+            <Button size="sm" disabled={controlBusy} onClick={() => void controlSubagent(true)}>
               继续运行
             </Button>
-          ) : task === undefined || terminal ? null : confirmCancel ? (
-            <div className="ja-task-cancel-confirm" role="group" aria-label="确认取消任务">
-              <span>
-                {task.lifecycle === "attached"
-                  ? `将同时取消 ${propagatingDescendants} 个未结束后代`
-                  : "仅取消此侧边任务"}
-              </span>
-              <Button
-                variant="danger"
-                size="sm"
-                onClick={() => {
-                  setCancelError(undefined);
-                  void controller.cancel(task).catch((failure: unknown) => {
-                    setCancelError(
-                      failure instanceof Error ? failure.message : "取消请求未完成，请重试。",
-                    );
-                  });
-                  setConfirmCancel(false);
-                }}
-              >
-                确认取消
+          ) : task !== undefined &&
+            ["queued", "running", "waiting_approval"].includes(task.state) ? (
+            confirmCancel ? (
+              <div className="ja-task-cancel-confirm" role="group" aria-label="确认取消任务">
+                <span>
+                  将同时取消 {propagatingTaskDescendantCount(controller.tasks, task)} 个未结束后代
+                </span>
+                <Button
+                  variant="danger"
+                  size="sm"
+                  disabled={controlBusy}
+                  onClick={() => void controlSubagent(false)}
+                >
+                  确认取消
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={controlBusy}
+                  onClick={() => setConfirmCancel(false)}
+                >
+                  返回
+                </Button>
+              </div>
+            ) : (
+              <Button variant="ghost" size="sm" onClick={() => setConfirmCancel(true)}>
+                取消任务
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => setConfirmCancel(false)}>
-                返回
-              </Button>
-            </div>
-          ) : (
-            <Button variant="ghost" size="sm" onClick={() => setConfirmCancel(true)}>
-              <X aria-hidden="true" />
-              取消任务
-            </Button>
-          )}
+            )
+          ) : null}
         </header>
       ) : null}
-      {cancelError === undefined ? null : (
-        <DetailReadAlert message={cancelError} onRetry={() => setCancelError(undefined)} />
+      {controlError === undefined ? null : (
+        <DetailReadAlert
+          message={controlError}
+          onRetry={() => void controlSubagent(task?.state === "suspended")}
+        />
       )}
-      {resumeError === undefined ? null : (
-        <DetailReadAlert message={resumeError} onRetry={() => void resume()} />
-      )}
-      {controller.detailError === undefined || task === undefined ? null : (
+      {controller.detailError === undefined ? null : (
         <DetailReadAlert
           message={controller.detailError}
           onRetry={() => void controller.refreshDetail()}
@@ -567,16 +312,17 @@ export function TaskDetailPanel({
           onRetry={() => void controller.refreshDetail()}
         />
       )}
-      {contextText === undefined ? null : (
+      {tab.taskKind === "subagent" && context !== undefined ? (
         <details className="ja-task-context">
           <summary>
-            {contextText}
+            {context.inheritanceMode === "effective_context" ? "继承自主任务" : "仅使用任务简报"}{" "}
+            revision {context.parentRevision}
             <ChevronDown aria-hidden="true" />
           </summary>
-          <p>{controller.detail?.contextSeed.inheritedContextSummary ?? "没有额外的继承摘要。"}</p>
-          {(controller.detail?.contextSeed.inheritedContextPreview.length ?? 0) === 0 ? null : (
+          <p>{context.inheritedContextSummary ?? "没有额外的继承摘要。"}</p>
+          {context.inheritedContextPreview.length === 0 ? null : (
             <ol aria-label="创建时继承的上下文">
-              {controller.detail?.contextSeed.inheritedContextPreview.map((item, index) => (
+              {context.inheritedContextPreview.map((item, index) => (
                 <li key={`${item.role}-${index}`}>
                   {item.text === null ? null : <span>{item.text}</span>}
                   {item.attachmentIds.length === 0 ? null : (
@@ -586,40 +332,197 @@ export function TaskDetailPanel({
               ))}
             </ol>
           )}
-          <code>SHA-256 {controller.detail?.contextSeed.fingerprint.slice(0, 12)}…</code>
         </details>
-      )}
-      {draft ? (
-        <div className="ja-task-draft-spacer" aria-hidden="true" />
-      ) : controller.detailLoading && controller.transcript === undefined ? (
+      ) : null}
+      {planDetailsOpen ? null : controller.detailLoading && controller.transcript === undefined ? (
         <div className="ja-task-loading" role="status">
           <LoaderCircle className="ja-task-spin" aria-hidden="true" />
           正在读取任务…
         </div>
       ) : (
-        <TaskTranscript controller={controller} actions={transcriptActions} />
-      )}
-      {controller.progressSummary === undefined ? null : (
-        <p className="ja-task-live-progress" aria-live="polite">
-          {controller.progressSummary}
-        </p>
-      )}
-      {tab.taskKind === "side_task" &&
-      (draft ||
-        (task !== undefined && task.state !== "cancelled" && task.state !== "suspended")) ? (
-        <SideTaskComposer
-          task={task}
-          draft={draft}
-          label={tab.label}
-          onCreated={onCreated}
-          controller={controller}
-          environment={composerEnvironment}
+        <ChatTimeline
+          className="ja-task-chat-timeline"
+          items={items}
+          turns={turns}
+          approvals={approvals}
+          skills={environment?.skills}
+          approvalDecisions={approvalDecisions}
+          approvalClosedAt={approvalClosedAt}
+          localSubmissions={conversation?.localSubmissions}
+          externalRows={externalRows}
+          onApprovalDecision={(approval, decision) =>
+            conversation !== undefined
+              ? conversation.approve(approval, decision)
+              : controller.approvalRespond(
+                  approval.approvalId,
+                  approval.turnId,
+                  approval.threadRevision,
+                  decision,
+                )
+          }
+          onPrepareRetry={
+            conversation === undefined
+              ? undefined
+              : (_turnId, text) => conversation.updateDraft(text)
+          }
+          onOpenLink={transcriptActions?.onOpenLink}
+          onCopyText={transcriptActions?.onCopyText}
+          onReadToolArtifact={transcriptActions?.onReadToolArtifact}
+          onOpenAttachmentPreview={transcriptActions?.onOpenAttachmentPreview}
+          emptyText="随时开始新的任务"
         />
+      )}
+      {planDetailsOpen && goal !== undefined ? (
+        <div className="ja-task-plan-details">
+          <Button variant="ghost" size="sm" onClick={() => onPlanDetailsChange?.(false)}>
+            返回对话
+          </Button>
+          <PlanWorkbench
+            model={goal.model}
+            planModel={goal.planModel}
+            revisions={goal.revisions}
+            evidence={goal.evidence}
+            loading={goal.loading}
+            error={goal.error}
+            busyAction={goal.busyAction}
+            onRetry={goal.refresh}
+            onSaveDraft={goal.saveDraft}
+            onDiscardDraft={goal.discardDraft}
+            onPropose={goal.propose}
+            onFinalizePlan={goal.finalizePlan}
+            onExecute={goal.execute}
+            onPausePlan={goal.pausePlan}
+            onResumePlan={goal.resumePlan}
+            onStopPlan={goal.stopPlan}
+            onAttachPlan={
+              goal.model === undefined ||
+              goal.planModel === undefined ||
+              (goal.model.goal.status !== "active" && goal.model.goal.status !== "paused") ||
+              goal.model.goal.activePlanId === goal.planModel.plan.planId
+                ? undefined
+                : goal.attachPlan
+            }
+            onDetachPlan={goal.model?.goal.activePlanId == null ? undefined : goal.detachPlan}
+            onReject={goal.reject}
+            onPause={goal.pause}
+            onResume={goal.resume}
+            onContinue={goal.resume}
+          />
+        </div>
       ) : null}
-      {task?.state === "cancelled" ? (
-        <p className="ja-task-closed-note" role="status">
-          此任务已取消，不能在界面中伪恢复。
-        </p>
+      {tab.taskKind === "side_task" && conversation !== undefined ? (
+        <div
+          className="ja-task-composer ja-conversation-content-rail"
+          data-task-state={task?.state}
+        >
+          <Composer
+            focusRequest={focusRequest}
+            interactionSlot={
+              clarification === undefined ? undefined : (
+                <InteractionCard controller={clarification} />
+              )
+            }
+            className="ja-task-structured-composer"
+            text={conversation.draft}
+            onTextChange={conversation.updateDraft}
+            threadId={threadId}
+            workspaceId={environment?.workspaceId}
+            runtimeGeneration={environment?.runtimeGeneration}
+            nativeDropEvent={environment?.nativeDropEvent}
+            dropZoneRef={environment?.dropZoneRef}
+            contextReferences={conversation.contextReferences}
+            onContextReferencesChange={conversation.updateContextReferences}
+            preferences={conversation.preferences}
+            models={conversation.models}
+            skills={environment?.skills}
+            slashCommands={environment?.slashCommands}
+            onSearchWorkspacePaths={environment?.onSearchWorkspacePaths}
+            attachments={conversation.attachments}
+            attachmentDraftItems={conversation.attachmentDraftItems}
+            activeTurn={conversation.activeTurn}
+            suspendedTurn={conversation.suspendedTurn}
+            awaitingUserInput={clarification?.request?.status === "pending"}
+            disabled={conversation.disabled || closing}
+            sending={conversation.sending}
+            preferenceBusy={conversation.preferenceBusy}
+            draftRecoveryRevision={conversation.draftRecoveryRevision}
+            importingAttachments={conversation.importingAttachments}
+            cancelling={conversation.cancelling}
+            resuming={conversation.resuming}
+            error={conversation.error ?? goal?.error}
+            queuedInputs={conversation.queuedInputs}
+            queueAccepting={conversation.queueAccepting}
+            contextUsage={contextUsage}
+            placeholder={
+              conversation.preferences?.collaborationMode === "plan"
+                ? "描述需要制定计划的任务…"
+                : "随心输入"
+            }
+            modeStatus={
+              conversation.preferences === undefined ? undefined : (
+                <ComposerGoalStatus
+                  mode={conversation.preferences.collaborationMode}
+                  goal={goal?.model?.goal}
+                  currentStepTitle={currentStepTitle}
+                  busy={conversation.preferenceBusy}
+                  onOpenGoal={() => onPlanDetailsChange?.(true)}
+                  onOpenPlan={
+                    goal?.planModel === undefined ? undefined : () => onPlanDetailsChange?.(true)
+                  }
+                  onDisablePlan={() => conversation.changeCollaborationMode("default")}
+                />
+              )
+            }
+            goalStatus={
+              goal?.model === undefined ? undefined : (
+                <GoalStatusBar
+                  goal={goal.model.goal}
+                  evaluation={goal.model.evaluation}
+                  currentStepTitle={currentStepTitle}
+                  busy={goal.busyAction !== undefined}
+                  onOpen={() => onPlanDetailsChange?.(true)}
+                  onPause={() => void goal.pause()}
+                  onResume={() => void goal.resume()}
+                  onResolve={() => onPlanDetailsChange?.(true)}
+                  onContinue={() => void goal.resume()}
+                  hasPendingQuestion={clarification?.request?.status === "pending"}
+                  onAnswerQuestion={() => clarification?.setCollapsed(false)}
+                />
+              )
+            }
+            onModelChange={(value) => void conversation.changeModel(value)}
+            onReasoningChange={(value) => void conversation.changeReasoning(value)}
+            onAccessModeChange={(value) => void conversation.changeAccessMode(value)}
+            onRestoreDefaults={environment?.onRestoreDefaults}
+            onAddAttachments={
+              environment?.attachmentPort === undefined ? undefined : conversation.importAttachments
+            }
+            onRetryAttachment={
+              environment?.attachmentPort === undefined ? undefined : conversation.retryAttachment
+            }
+            onRemoveAttachment={
+              environment?.attachmentPort === undefined ? undefined : conversation.removeAttachment
+            }
+            onPasteAttachments={
+              environment?.attachmentPort === undefined ? undefined : conversation.importClipboard
+            }
+            onDropAttachments={
+              environment?.attachmentPort === undefined
+                ? undefined
+                : conversation.importDroppedAttachments
+            }
+            onOpenAttachmentPreview={environment?.onOpenAttachmentPreview}
+            onOpenQueuedAttachmentPreview={environment?.onOpenQueuedAttachmentPreview}
+            onOpenWorkspaceReference={environment?.onOpenWorkspaceReference}
+            onSend={conversation.send}
+            onEnqueue={conversation.enqueue}
+            onPrioritizeQueuedInput={conversation.prioritizeQueuedInput}
+            onUpdateQueuedInput={conversation.updateQueuedInput}
+            onDeleteQueuedInput={conversation.deleteQueuedInput}
+            onResume={conversation.resume}
+            onCancel={conversation.cancel}
+          />
+        </div>
       ) : null}
     </section>
   );

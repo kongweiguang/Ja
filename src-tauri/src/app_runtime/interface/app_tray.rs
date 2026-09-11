@@ -12,6 +12,8 @@ use tauri::{
 };
 
 #[cfg(desktop)]
+use super::desktop_preferences::{CloseBehavior, DesktopPreferences};
+#[cfg(desktop)]
 use crate::MAIN_WINDOW_LABEL;
 
 pub(crate) const APP_EXIT_REQUESTED_EVENT: &str = "ja://app-exit-requested";
@@ -95,16 +97,22 @@ impl AppExitCoordinator {
     }
 }
 
-/// 安装关闭到托盘语义；所有主窗口系统关闭入口只隐藏，不销毁 WebView 或 runtime。
+/// 安装主窗口关闭语义；后台偏好隐藏窗口，退出偏好进入统一完整清理握手。
 #[cfg(desktop)]
 pub(crate) fn setup_close_to_tray<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let window_to_hide = window.clone();
+        let app_handle = app.handle().clone();
         window.on_window_event(move |event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                if window_to_hide.hide().is_err() {
-                    tracing::error!("main window could not hide after close request");
+                match app_handle.state::<DesktopPreferences>().read() {
+                    CloseBehavior::Background => {
+                        if window_to_hide.hide().is_err() {
+                            tracing::error!("main window could not hide after close request");
+                        }
+                    }
+                    CloseBehavior::Exit => request_exit(&app_handle, false),
                 }
             }
         });
@@ -206,12 +214,20 @@ fn should_show_window(event: &TrayIconEvent) -> bool {
 /// 托盘退出优先发给已 ACK 的 renderer；投递失败或未就绪时仍执行同一原生完整清理。
 #[cfg(desktop)]
 fn request_exit_from_tray<R: Runtime>(app: &AppHandle<R>) {
+    request_exit(app, true);
+}
+
+/// 将系统关闭和托盘退出统一送入现有 renderer 清理握手，避免任一入口绕过 owner 清理。
+#[cfg(desktop)]
+fn request_exit<R: Runtime>(app: &AppHandle<R>, restore_window: bool) {
     let coordinator = app.state::<AppExitCoordinator>();
     match coordinator.begin_exit() {
         ExitDispatch::AlreadyPending => show_main_window(app),
         ExitDispatch::Native => crate::request_full_exit(app),
         ExitDispatch::Renderer => {
-            show_main_window(app);
+            if restore_window {
+                show_main_window(app);
+            }
             if app
                 .emit_to(MAIN_WINDOW_LABEL, APP_EXIT_REQUESTED_EVENT, ())
                 .is_err()

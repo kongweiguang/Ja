@@ -23,7 +23,7 @@ final class GoalWireMapperTest {
     /** Goal 只公开冻结 link，Plan 的完整 revision 必须经独立聚合查询，避免两个 CAS 边界混合。 */
     @Test
     void projectsLinkedGoalAndFrozenPlanAsSeparateAggregates() {
-        GoalModels.GoalSnapshot goalSnapshot = snapshot(GoalModels.GoalPhase.WORKING, null);
+        GoalModels.GoalSnapshot goalSnapshot = snapshot(GoalModels.GoalPhase.WORKING);
         GoalModels.PlanSnapshot planSnapshot = planSnapshot();
 
         ObjectNode goalResult = wire.snapshot(goalSnapshot);
@@ -39,24 +39,18 @@ final class GoalWireMapperTest {
                 .path("planRevisionId").asText());
     }
 
-    /** input 事件只携带公开提示与期限，不包含响应或 canonical plan。 */
+    /** Goal 只保留等待阶段，问题与回答由公共 Interaction 读取，避免双重权威。 */
     @Test
-    void projectsPendingInputWithoutResponseContent() {
-        GoalModels.GoalInput input = new GoalModels.GoalInput(
-                "goalinput_test", "选择目标环境", NOW.plusSeconds(3600), NOW);
-        GoalModels.GoalSnapshot snapshot = snapshot(GoalModels.GoalPhase.WAITING_INPUT, input);
-
-        ObjectNode result = wire.input(snapshot);
-
-        assertEquals("goalinput_test", result.path("input").path("inputRequestId").asText());
-        assertEquals("选择目标环境", result.path("input").path("prompt").asText());
-        assertTrue(result.path("input").get("response") == null);
+    void projectsWaitingInputWithoutInteractionContent() {
+        ObjectNode result = wire.snapshot(snapshot(GoalModels.GoalPhase.WAITING_INPUT));
+        assertEquals("waiting_input", result.path("goal").path("phase").asText());
+        assertFalse(result.path("goal").has("pendingInput"));
     }
 
     /** Activity 的 stepId 只在当前步骤可证明时出现，状态使用公开小写词汇。 */
     @Test
     void projectsStepActivityFromCommittedSnapshot() {
-        GoalModels.GoalSnapshot snapshot = snapshot(GoalModels.GoalPhase.WORKING, null);
+        GoalModels.GoalSnapshot snapshot = snapshot(GoalModels.GoalPhase.WORKING);
         GoalModels.PublicEvent event = new GoalModels.PublicEvent(
                 9, 3, "step_changed", "正在验证合同", NOW);
 
@@ -68,8 +62,8 @@ final class GoalWireMapperTest {
         assertEquals(9, result.path("eventSequence").asLong());
     }
 
-    /** 构造冻结 Goal definition 与批准版本 link，测试只改变服务端 phase 和 pending input。 */
-    private static GoalModels.GoalSnapshot snapshot(GoalModels.GoalPhase phase, GoalModels.GoalInput input) {
+    /** 构造冻结 Goal definition 与版本 link，问答正文不属于 Goal 投影。 */
+    private static GoalModels.GoalSnapshot snapshot(GoalModels.GoalPhase phase) {
         GoalModels.AcceptanceCriterion criterion = new GoalModels.AcceptanceCriterion(
                 "criterion_test", "合同 Gate 通过", true);
         GoalModels.Goal goal = new GoalModels.Goal("goal_test", "thr_test", GoalModels.OwnerKind.ROOT_THREAD,
@@ -80,7 +74,7 @@ final class GoalWireMapperTest {
         GoalModels.GoalPlanLink link = new GoalModels.GoalPlanLink(
                 "goal_test", "plan_test", "planrev_test", "a".repeat(64), 1, NOW);
         return new GoalModels.GoalSnapshot(goal, definition, link, "step_test",
-                0, 1, input, null, null, null, null, 9);
+                0, 1, null, null, null, null, 9);
     }
 
     /** 构造独立 Plan 投影，证明冻结 revision、批准与步骤执行不再嵌入 Goal 响应。 */

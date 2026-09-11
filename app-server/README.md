@@ -11,6 +11,12 @@
 
 ## 运行边界
 
+子智能体的全局默认开关和模型选择由 `config.toml` 的 `subagents` 管理，设置只影响之后新建的独立
+会话。指定子模型还可选择它支持的思考等级；默认值沿用模型默认，跟随父任务时沿用父 Turn 的档位。
+Java 将策略在会话创建事务中持久化，派生任务继承父会话策略；后续设置和进程重启不改写
+已有会话。数据库 V2 初始化开启/跟随父任务，V3 为策略添加 nullable 思考档位，完整行为与当前验证边界见
+[侧聊、子任务与会话通信](../.updeng/docs/business/task-threads/README.md)。
+
 Ja App Server 作为本地 sidecar 运行，只通过 stdin/stdout 与 Tauri/Rust host 通信，边界协议是受版本约束的
 JSONL/JSON-RPC。stdout 仅用于协议帧；日志、诊断和异常必须走 stderr 或日志
 文件。Java Kernel 是 Turn、Tool、Skill、MCP、Permission、Approval、Cancellation
@@ -21,11 +27,32 @@ Provider 是用户自定义连接；名称不参与路由，每条配置按所�
 自己的凭据引用取得 API Key。每次模型请求前解析最新环境并在本地估算最终 envelope 的 Token 上界，实际 Usage 只取正式
 响应并由 Java 持久化。
 
+## Reasoning 展示与续轮
+
+界面中的 reasoning 区块只展示 Provider 明确返回的公开摘要或公开 reasoning 文本，不是 Ja 根据答案自行生成的“思维链”。
+公开展示事件和原生 opaque 块是两条独立链路：前者进入 Timeline，后者只进入助手历史，绝不会把签名、加密载荷或
+`redacted_thinking.data` 下发到 UI。
+
+- OpenAI Responses 请求固定 `store:false` 并声明 `include:["reasoning.encrypted_content"]`。公开 summary 用于流式展示；只有
+  非空 `encrypted_content` 才会持久化为可回放的 `reasoning` output item。
+- Anthropic Messages 的 `thinking` 使用公开 `thinking` 文本和 `signature` 原样保存，`redacted_thinking` 保存其原生 `data`；
+  两者都只在同一 Provider、模型、API、上游模型和端点身份下回放。
+- OpenAI Chat Completions 按上游实际返回的 `reasoning_content`、`reasoning` 或 `reasoning_text` 字段保存，字段名不由 Ja
+  擅自改写；公开增量仍单独投影为 reasoning 摘要。
+- 切换上述任一身份时，opaque 内容不会发送给新模型；若 Provider 返回了明确公开文本，Context mapper 只保留该安全文本。
+  如果响应没有可回放的原生载荷，Ja 只展示摘要，不伪造一个下一轮可能被拒绝的 reasoning 块。
+
+思考档位是配置层的逻辑 `off|minimal|low|medium|high|xhigh|max`，由模型能力表映射成上游值。Anthropic 当前自适应思考
+使用 `thinking.type=adaptive` 和 `output_config.effort`；Codec 对旧版 `budget_tokens` 仍做防御性解析，但任意数字预算不是当前
+桌面设置的公开档位，不能绕过配置合同直接写入请求。
+
 ## 日志目录
 
 Rust Host 在启动 Ja App Server sidecar 前创建并校验 `home/data/run/log` 四个独立目录，再通过
 Base64URL 参数传给 JVM 或 Native Image；Java 从 `home` 自行读取配置和凭据，并把日志
 固定写入 `logs/java`，不依赖 cwd 推断生产路径。
+Host 同时通过必填 `--ja-runtime-generation=<安全正整数>` 传入本次启动代际；Java 通知沿用该值。
+该参数由进程 owner 注入，不属于用户配置，也不能由 WebView 覆盖，重启后仍严格隔离旧进程事件。
 `app-server.log` 保存 INFO 以上运行日志，`app-server-error.log` 单独保存 ERROR，二者按日
 及 20 MiB 分片滚动并保留 30 天。stdout 始终只承载 JSONL/JSON-RPC，WARN 以上
 诊断才同时写入 stderr。
@@ -74,11 +101,11 @@ revision CAS 和幂等键，批准及显式 Plan 执行必须绑定精确 revisi
 
 当前源码已经具备独立 Goal/Plan domain、V1 persistence、repository、完成门、recovery/lease 基础，以及
 编译期注册的 `PlanGoalAgentCapability`。计划模式会在请求 profile 中加入 `plan_propose`、`plan_step_update`；
-活动 Goal 上下文按需加入 `goal_request_input`、`goal_request_evaluation`。这些 Agent Tool 仍经过现有权限和
+活动 Goal 上下文按需加入公共 `request_user_input`、`goal_request_evaluation`。这些 Agent Tool 仍经过现有权限和
 内核审批，standalone Plan 的内部 Turn 事件只返回发起连接，Goal continuation 事件继续按 Goal observation 路由。
 
 截至 2026-09-05，`RpcServer` 已注册 Goal/Plan Handler 并发布 `goal/changed`、`goal/activity`、
-`goal/input-requested`；`GoalContinuationCoordinator`、独立无 Tool evaluator、启动恢复、Rust typed proxy 与
+`interaction/changed`、`plan/changed`；`GoalContinuationCoordinator`、独立无 Tool evaluator、启动恢复、Rust typed proxy 与
 React 权威投影均已进入生产 composition。桌面入口仍以握手的 `plan_goal_v1` capability 为上限；Native Image、
 隔离 Windows Tauri/WebView2 真窗矩阵和 120 分钟 mock soak 是发布前 Gate，不得由局部单测替代。
 

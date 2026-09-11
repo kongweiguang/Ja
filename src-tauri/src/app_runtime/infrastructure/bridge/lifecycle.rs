@@ -309,9 +309,14 @@ pub(super) fn start_runtime(
     }
     emit_status(sink, RuntimeStatusKind::Starting, 0, None, "starting", None)?;
     runtime_control.record("start_supervisor_new");
-    let mut supervisor = runtime_control.create_supervisor(config).inspect_err(|_| {
-        runtime_control.record("start_supervisor_new_error");
-    })?;
+    // 先捕获本次 Host 代际，再把同一值交给 Supervisor 注入 Java；失败启动不发布该代际，
+    // 成功后才推进 next_generation，避免事件 fence 与运行状态脱节。
+    let generation = *next_generation;
+    let mut supervisor = runtime_control
+        .create_supervisor(config, generation)
+        .inspect_err(|_| {
+            runtime_control.record("start_supervisor_new_error");
+        })?;
     /* process spawn 后、阻塞 initialize 请求前立即注册 session。这样应用退出请求可以关闭
      * writer/session 并唤醒缓慢握手；若等到 start() 返回才注册，会使高优先级 shutdown lane 失效。 */
     let attach_session = |session| exit_control.attach_session(session);
@@ -385,7 +390,6 @@ pub(super) fn start_runtime(
             return Err(RuntimeCommandError::from_process(&error));
         }
     };
-    let generation = *next_generation;
     *next_generation = next_generation.saturating_add(1);
     current_generation.store(generation, Ordering::Release);
     terminal_fault.clear();

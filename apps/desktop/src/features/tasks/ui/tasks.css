@@ -10,6 +10,15 @@
   color: var(--ja-foreground);
 }
 
+/* Plan 详情占据当前会话阅读区，关闭后返回同一个 Composer，不挤出侧栏底部输入。 */
+.ja-task-plan-details {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  overflow: auto;
+}
+
 .ja-task-overview-header,
 .ja-task-detail-header {
   display: flex;
@@ -269,10 +278,6 @@
 
 .ja-task-structured-composer {
   margin: 0;
-}
-
-.ja-task-structured-composer .ja-composer__model-trigger {
-  display: none;
 }
 
 .ja-task-live-progress,

@@ -27,9 +27,10 @@ pub use commands::{
     WorkspacePathSearchResult,
 };
 pub use tasks::{
-    TaskActivity, TaskContextPreviewItem, TaskContextSeed, TaskCreateInput, TaskCreateResult,
-    TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMailboxMessage,
-    TaskMessageInput, TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult,
-    TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput,
-    TaskTreeDeleteResult, TaskUnobserveInput,
+    TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextPreviewItem, TaskContextSeed,
+    TaskCreateInput, TaskCreatePreferences, TaskCreateResult, TaskFollowupInput,
+    TaskFollowupResult, TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput,
+    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
+    TaskReadResult, TaskSeenInput, TaskSummary, TaskThreadPreferences, TaskThreadSummary,
+    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput,
 };

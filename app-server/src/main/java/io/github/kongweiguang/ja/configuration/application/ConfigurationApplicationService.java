@@ -169,6 +169,12 @@ public final class ConfigurationApplicationService implements ConfigurationUseCa
             return delegate.trusted();
         }
 
+        /** 透传用户级澄清开关，避免应用层复制或按项目层重新推导设置。 */
+        @Override
+        public boolean clarificationEnabled() {
+            return delegate.clarificationEnabled();
+        }
+
         /** 按稳定标识委托领域投影解析 MCP。 */
         @Override
         public McpServer requireMcp(String mcpId) {
@@ -191,6 +197,12 @@ public final class ConfigurationApplicationService implements ConfigurationUseCa
         @Override
         public java.util.Optional<ReasoningLevel> defaultReasoningLevel() {
             return delegate.defaultReasoningLevel();
+        }
+
+        /** 透传配置 Owner 冻结的子智能体策略，应用层不创建第二份开关状态。 */
+        @Override
+        public SubagentPolicy subagentPolicy() {
+            return delegate.subagentPolicy();
         }
 
         /** 按稳定标识委托领域投影解析 Provider。 */

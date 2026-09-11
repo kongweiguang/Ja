@@ -15,6 +15,7 @@ export type TaskContentBlock =
 export type TaskKind = "side_task" | "subagent";
 export type TaskLifecycle = "independent" | "attached";
 export type TaskState =
+  | "idle"
   | "queued"
   | "running"
   | "waiting_approval"
@@ -46,6 +47,7 @@ export interface TaskSummary {
 }
 
 export type TaskActivityKind =
+  | "created"
   | "dispatched"
   | "message_sent"
   | "follow_up_queued"
@@ -60,6 +62,7 @@ export type TaskActivityKind =
 export interface TaskActivity {
   activitySequence: number;
   activityId: string;
+  rootThreadId: string;
   taskThreadId: string;
   actorThreadId: string;
   causalTurnId: string | null;
@@ -83,13 +86,45 @@ export interface TaskMailboxMessage {
   consumedAt: string | null;
 }
 
+/** Child Thread 详情携带主任务同构的设置快照，供侧边栏直接驱动对话控制。 */
+export interface TaskThreadSummary {
+  threadId: string;
+  workspaceId: string;
+  activeGoalId: string | null;
+  preferences: {
+    providerId: string;
+    modelId: string;
+    reasoningLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+    accessMode: "approval_required" | "full_access";
+    collaborationMode: "default" | "plan";
+    titleSource: "placeholder" | "auto" | "manual";
+  } | null;
+  title: string;
+  status: "active" | "archived" | "deleted";
+  pinned: boolean;
+  latestTurnStatus:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "suspended"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | null;
+  latestTurnSeen: boolean;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TaskReadModel {
   task: TaskSummary;
+  thread: TaskThreadSummary;
   contextSeed: {
     contextSeedId: string;
     parentRevision: number;
     inheritanceMode: "effective_context" | "brief_only";
-    taskBrief: TaskContentBlock[];
+    taskBrief: TaskContentBlock[] | null;
     inheritedContextSummary: string | null;
     inheritedContextPreview: Array<{
       role: "user" | "assistant";
@@ -140,13 +175,15 @@ export type TaskHostEvent =
 /** 右栏分组把“需要人工处理”置于终态之前，失败与挂起不会被完成列表掩盖。 */
 export function taskSection(summary: TaskSummary): "running" | "attention" | "completed" {
   if (["waiting_approval", "suspended", "failed"].includes(summary.state)) return "attention";
-  if (["queued", "running"].includes(summary.state)) return "running";
+  if (["idle", "queued", "running"].includes(summary.state)) return "running";
   return "completed";
 }
 
 /** 状态文案保持短促且不推断 Provider 或 Tool 细节。 */
 export function taskStateLabel(state: TaskState): string {
   switch (state) {
+    case "idle":
+      return "未开始";
     case "queued":
       return "排队中";
     case "running":

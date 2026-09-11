@@ -8,6 +8,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.task.domain.TaskModels;
 import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import io.github.kongweiguang.ja.task.port.out.TaskRepositoryException;
+import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcException;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
@@ -33,13 +35,13 @@ public final class TaskHandler implements RpcHandler {
         this.session = Objects.requireNonNull(session, "session");
     }
 
-    /** 返回用户 Task API 的精确十方法闭集。 */
+    /** 返回用户 Task API 的精确十一方法闭集。 */
     @Override
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.TASK_CREATE, RpcMethod.TASK_LIST, RpcMethod.TASK_READ,
                 RpcMethod.TASK_OBSERVE, RpcMethod.TASK_UNOBSERVE, RpcMethod.TASK_SEEN,
-                RpcMethod.TASK_MESSAGE_SEND, RpcMethod.TASK_FOLLOWUP, RpcMethod.TASK_CANCEL,
-                RpcMethod.TASK_TREE_DELETE);
+                RpcMethod.THREAD_MESSAGE_SEND, RpcMethod.TASK_FOLLOWUP, RpcMethod.TASK_CANCEL,
+                RpcMethod.TASK_TREE_DELETE, RpcMethod.TASK_CLOSE);
     }
 
     /** 所有领域错误只按稳定分类映射，SQLite 消息不会进入协议。 */
@@ -54,10 +56,11 @@ public final class TaskHandler implements RpcHandler {
                 case TASK_OBSERVE -> observe(command.params());
                 case TASK_UNOBSERVE -> unobserve(command.params());
                 case TASK_SEEN -> seen(command.params());
-                case TASK_MESSAGE_SEND -> message(command.params());
+                case THREAD_MESSAGE_SEND -> message(command.params());
                 case TASK_FOLLOWUP -> followUp(command.params());
                 case TASK_CANCEL -> cancel(command.params());
                 case TASK_TREE_DELETE -> deleteTree(command.params());
+                case TASK_CLOSE -> close(command.params());
                 default -> throw JaRpcException.methodNotFound();
             });
         } catch (TaskRepositoryException failure) {
@@ -65,19 +68,47 @@ public final class TaskHandler implements RpcHandler {
         }
     }
 
-    /** 草稿首次发送才进入此方法，空白 Tab 不产生数据库对象。 */
+    /** 创建独立 idle Thread；此入口不接收内容，也不启动 Turn/provider。 */
     private ObjectNode create(ObjectNode params) {
-        RpcParams.requireExact(params, "parentThreadId", "parentTurnId", "expectedParentRevision",
-                "taskName", "content");
+        if (params.has("preferences")) {
+            RpcParams.requireExact(params, "parentThreadId", "parentTurnId", "expectedParentRevision",
+                    "taskName", "preferences");
+        } else {
+            RpcParams.requireExact(params, "parentThreadId", "parentTurnId", "expectedParentRevision",
+                    "taskName");
+        }
         String parentTurnId = params.get("parentTurnId").isNull() ? null
                 : RpcParams.identifier(params, "parentTurnId", "turn_", 128);
-        TaskUseCase.StartResult result = session.tasks().createSideTask(new TaskUseCase.CreateCommand(
+        TaskUseCase.CreatePreferences preferences = createPreferences(params);
+        TaskModels.Summary result = session.tasks().createSideTask(new TaskUseCase.CreateCommand(
                 RpcParams.identifier(params, "parentThreadId", "thr_", 128), parentTurnId,
                 RpcParams.revision(params, "expectedParentRevision"),
-                RpcParams.text(params, "taskName", 96, false), RpcUserContent.parse(params.get("content")),
-                DEFAULT_TASK_DEADLINE));
-        return session.mapper().createObjectNode().put("accepted", true).put("turnId", result.turnId())
-                .set("task", RpcResults.task(session.mapper(), result.task()));
+                RpcParams.text(params, "taskName", 96, false), preferences));
+        return session.mapper().createObjectNode().put("accepted", true)
+                .set("task", RpcResults.task(session.mapper(), result));
+    }
+
+    /** 侧边任务偏好保持完整对象语义；缺省继承父 Thread，显式值由 runtime resolver 再做真实校验。 */
+    private static TaskUseCase.CreatePreferences createPreferences(ObjectNode params) {
+        if (!params.has("preferences")) return null;
+        ObjectNode preferences = RpcParams.object(params, "preferences");
+        RpcParams.requireExact(preferences, "providerId", "modelId", "reasoningLevel", "accessMode",
+                "collaborationMode");
+        String access = RpcParams.text(preferences, "accessMode", 32, false);
+        AccessMode accessMode = switch (access) {
+            case "approval_required" -> AccessMode.APPROVAL_REQUIRED;
+            case "full_access" -> AccessMode.FULL_ACCESS;
+            default -> throw JaRpcException.invalidParams();
+        };
+        CollaborationMode collaborationMode = switch (RpcParams.text(preferences, "collaborationMode", 16, false)) {
+            case "default" -> CollaborationMode.DEFAULT;
+            case "plan" -> CollaborationMode.PLAN;
+            default -> throw JaRpcException.invalidParams();
+        };
+        return new TaskUseCase.CreatePreferences(
+                RpcParams.identifier(preferences, "providerId", "provider_", 128),
+                RpcParams.identifier(preferences, "modelId", "model_", 128),
+                RpcParams.optionalText(preferences, "reasoningLevel", 16), accessMode, collaborationMode);
     }
 
     /** 总览只读取当前根下 projection 树。 */
@@ -101,6 +132,7 @@ public final class TaskHandler implements RpcHandler {
                 RpcParams.identifier(params, "taskThreadId", "thr_", 128), cursor[0], cursor[1], limit);
         ObjectNode result = session.mapper().createObjectNode()
                 .set("task", RpcResults.task(session.mapper(), detail.task()));
+        result.set("thread", RpcResults.thread(session.mapper(), detail.thread()));
         result.set("contextSeed", RpcResults.taskSeed(session.mapper(), detail.contextSeed()));
         ArrayNode activities = result.putArray("activities");
         detail.activities().forEach(value -> activities.add(RpcResults.taskActivity(session.mapper(), value)));
@@ -177,6 +209,13 @@ public final class TaskHandler implements RpcHandler {
                 RpcParams.revision(params, "expectedTaskRevision"),
                 RpcParams.identifier(params, "confirmTaskThreadId", "thr_", 128));
         return session.mapper().createObjectNode().put("accepted", true).put("deletedTaskCount", deleted);
+    }
+
+    /** 关闭只接受侧聊 Thread 身份；资源收口由 TaskCoordinator 保证，重复调用保持成功。 */
+    private ObjectNode close(ObjectNode params) {
+        RpcParams.requireExact(params, "taskThreadId");
+        session.tasks().closeSideChat(RpcParams.identifier(params, "taskThreadId", "thr_", 128));
+        return session.mapper().createObjectNode().put("closed", true);
     }
 
     /** 构造两类 Mailbox 共用的严格命令；RPC 不猜测 causal Turn。 */

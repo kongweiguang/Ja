@@ -9,6 +9,8 @@ import {
   CircleDot,
   Lightbulb,
   LoaderCircle,
+  Pencil,
+  Play,
   type LucideIcon,
 } from "lucide-react";
 import type { ReactElement } from "react";
@@ -26,6 +28,11 @@ export interface PlanTimelineBlockProps {
   readonly model?: GoalReadModel;
   readonly planModel?: PlanReadModel;
   readonly onOpenDetails?: () => void;
+  /** 将用户带回 Composer 以自然语言修改当前计划。 */
+  readonly onModifyPlan?: () => void;
+  /** 服务端原子 execute；卡片不再串联 approve。 */
+  readonly onExecute?: () => void | boolean | Promise<void | boolean>;
+  readonly busy?: boolean;
 }
 
 /** 当前步骤越过首屏摘要时保留前三项并补入当前项，避免长计划隐藏正在发生的工作。 */
@@ -68,14 +75,24 @@ export function PlanTimelineBlock({
   model,
   planModel,
   onOpenDetails,
+  onModifyPlan,
+  onExecute,
+  busy = false,
 }: PlanTimelineBlockProps): ReactElement | null {
-  const plan = planModel?.revision ?? model?.plan ?? null;
+  // Plan summary 前进而正文尚未回读时，不能用 Goal 内嵌的旧 revision 配当前状态展示。
+  const plan = planModel === undefined ? (model?.plan ?? null) : planModel.revision;
   if (plan === null) return null;
   const planState = planModel?.plan ?? model?.planState ?? null;
   const visibleSteps = visiblePlanSteps(plan, model?.goal.currentStepId);
   const metCriteria = plan.acceptanceCriteria.filter(
     (criterion) => criterion.status === "met",
   ).length;
+  const canExecute =
+    onExecute !== undefined &&
+    planState !== null &&
+    planModel?.revision !== null &&
+    planModel?.revision !== undefined &&
+    (planState.status === "awaiting_approval" || planState.status === "approved");
 
   return (
     <article
@@ -103,6 +120,20 @@ export function PlanTimelineBlock({
         </div>
       </header>
       <h3 title={plan.objective}>{plan.objective}</h3>
+      <dl className="ja-plan-timeline__summary">
+        <div>
+          <dt>约束</dt>
+          <dd>{plan.constraints.length === 0 ? "无" : plan.constraints.slice(0, 2).join("、")}</dd>
+        </div>
+        <div>
+          <dt>验收</dt>
+          <dd>
+            {plan.acceptanceCriteria.length === 0
+              ? "未设置"
+              : `${metCriteria}/${plan.acceptanceCriteria.length} 项已满足`}
+          </dd>
+        </div>
+      </dl>
       <ol className="ja-plan-timeline__steps">
         {visibleSteps.map((step) => {
           const StepIcon = stepIcon(step.status);
@@ -128,12 +159,32 @@ export function PlanTimelineBlock({
             ? `${metCriteria}/${plan.acceptanceCriteria.length} 项验收`
             : ""}
         </span>
-        {onOpenDetails === undefined ? null : (
-          <button type="button" onClick={onOpenDetails}>
-            查看详情
-            <ChevronRight aria-hidden="true" />
-          </button>
-        )}
+        <div className="ja-plan-timeline__actions">
+          {onModifyPlan === undefined ? null : (
+            <button type="button" onClick={onModifyPlan}>
+              <Pencil aria-hidden="true" />
+              修改计划
+            </button>
+          )}
+          {onOpenDetails === undefined ? null : (
+            <button type="button" onClick={onOpenDetails}>
+              查看详情
+              <ChevronRight aria-hidden="true" />
+            </button>
+          )}
+          {canExecute ? (
+            <button
+              type="button"
+              className="is-primary"
+              disabled={busy}
+              aria-busy={busy || undefined}
+              onClick={() => void onExecute?.()}
+            >
+              <Play aria-hidden="true" />
+              执行
+            </button>
+          ) : null}
+        </div>
       </footer>
     </article>
   );

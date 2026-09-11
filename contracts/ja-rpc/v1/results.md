@@ -81,14 +81,25 @@ Each item is `{relativePath,kind}`; no absolute root, file body, match excerpt, 
 `{outcome,compactionId,checkpointId,threadRevision,inputTokensBefore,inputTokensAfter}` and always emits both nullable identity fields. `outcome="compacted"` requires non-null `compactionId` and `checkpointId`, a committed `threadRevision`, and `inputTokensAfter < inputTokensBefore`. `outcome="unchanged"` requires both identities to be null and equal before/after counts; it means no new durable facts needed another Checkpoint.
 
 Task Thread results are method-specific and strict. `task/create` returns
-`{accepted:true,task,turnId}`; `task/list` returns `{items}` with at most 64 complete Task summaries;
-`task/read` returns `{task,contextSeed,activities,mailbox,nextCursor}` without materializing the Child
+`{accepted:true,task}` for an idle Child Thread; `task/list` returns `{items}` with at most 64 complete Task summaries;
+`task/read` returns `{task,thread,contextSeed,activities,mailbox,nextCursor}` without materializing the Child
 transcript. `task/observe` returns `{observationId,taskThreadId,revision}` and `task/unobserve`
-returns only `{accepted:true}`. `task/message/send` returns
+returns only `{accepted:true}`. `thread/message/send` returns
 `{accepted:true,messageId,mailboxSequence}` without starting an idle Agent, while `task/followup`
 returns `{accepted:true,messageId,turnId,task}` after durable Turn admission. `task/seen` and
 `task/cancel` return `{accepted:true,task}`; `task/tree/delete` returns
-`{accepted:true,deletedTaskCount}`.
+`{accepted:true,deletedTaskCount}`. `task/close` returns exactly `{closed:true}` after the
+temporary task lifecycle has been stopped and its resources released.
+
+`thread/list` in explicit `scope:"all"` returns `{items,nextCursor}` with lightweight
+`{threadId,title,kind,workspaceId,status}` items. `kind` is `main | side_chat | subagent`;
+status is the latest run state or `idle`. A page contains at most 200 items and no transcript or preferences.
+Workspace navigation retains its complete Thread metadata shape; mixed discovery/navigation items are invalid.
+
+`thread/read.items` may contain `thread_message` with
+`{kind,itemId,turnId,createdAt,sourceThreadId,sourceTitle,content}`. Source identity and title are immutable
+snapshots, so messages survive deletion of their temporary sender. Content is the original plain text,
+not the separate external-data envelope used in Provider context.
 
 Every Task summary carries lineage, kind/lifecycle, current Turn state, revision, unread and descendant
 statistics, safe summary, and timestamps. The only valid pairs are `side_task + independent` and
@@ -109,7 +120,9 @@ Goal mutation results return the same strict `{goal,eventSequence}` projection a
 `goal` always includes the frozen objective and acceptance criteria plus required nullable link/run/step/input/attention/evaluation/terminal fields. A null `planLink` is the normal standalone Goal state, not missing data.
 `goal/observe` adds only its connection-scoped `observationId`; `goal/unobserve` returns `{accepted:true}`.
 
-Plan reads and mutations return the independent strict `{plan,draft,currentRevision,approval,stepExecutions,eventSequence}` projection. `plan/approve` changes approval/status only and therefore cannot introduce an active Run or step execution; `plan/execute` is the explicit boundary that creates a standalone Plan-owned Run.
+Plan reads and mutations return the independent strict `{plan,draft,currentRevision,approval,stepExecutions,eventSequence}` projection. `plan/propose` only freezes a revision and cannot introduce an active Run; `plan/execute` atomically records the user approval audit fact and creates a standalone Plan-owned Run for that exact revision.
+
+Interaction reads and mutations return `{threadId,eventSequence,request,draft,resumeState}`. `resumeState` is authoritative and distinguishes `waiting_for_answer` from `waiting_to_resume` after an answer has been committed but before the original Turn is safely resumed; clients must not infer execution from the request status alone.
 
 `plan/revisions/list`, `goal/events/read`, and `goal/evidence/list` return method-specific pages with a required
 nullable `nextCursor`. Plan revisions freeze the complete structured definition and canonical SHA-256 hash.

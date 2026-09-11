@@ -99,6 +99,16 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
             this.services = Map.copyOf(services);
         }
 
+        /**
+         * 规划阶段使用的空目录证明；它不触发 MCP 配置解析、进程启动或远端发现，执行阶段仍须
+         * 通过 {@link GenerationTurnMcpSessionFactory#catalog} 获取真实目录。
+         */
+        public static CatalogSnapshot planningEmpty() {
+            return new CatalogSnapshot(
+                    new McpGateway.McpSnapshot("mcp_plan_disabled", java.util.List.of(),
+                            java.time.Instant.EPOCH), Map.of(), Map.of());
+        }
+
         /** 返回当前 Provider 请求看到的不可变 Tool 目录。 */
         public McpGateway.McpSnapshot snapshot() {
             return snapshot;

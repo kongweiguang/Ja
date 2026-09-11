@@ -253,6 +253,8 @@ export function ReviewFileTree({
   // TanStack Virtual 的 imperative helpers 不可安全 memoize，仅留在当前纯视图中。
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
+    // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
+    useFlushSync: false,
     count: rows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 32,

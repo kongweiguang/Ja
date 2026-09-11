@@ -35,6 +35,12 @@ pub struct PlanIdInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanCurrentReadInput {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanPageInput {
     pub thread_id: String,
     pub plan_id: String,
@@ -77,6 +83,90 @@ pub struct PlanMutationInput {
     pub thread_id: String,
     pub plan_id: String,
     pub expected_plan_revision: u64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanControlInput {
+    pub thread_id: String,
+    pub plan_id: String,
+    pub expected_plan_revision: u64,
+    pub run_id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanEvidenceListInput {
+    pub thread_id: String,
+    pub plan_id: String,
+    pub plan_revision_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionReadInput {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionObserveInput {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionUnobserveInput {
+    pub observation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionAnswerDto {
+    pub question_id: String,
+    pub option_ids: Vec<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub free_text: Option<String>,
+    pub skipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionDraftSaveInput {
+    pub thread_id: String,
+    pub request_id: String,
+    pub expected_draft_revision: u64,
+    pub idempotency_key: String,
+    pub answers: Vec<InteractionAnswerDto>,
+    pub page: u32,
+    pub collapsed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionRespondInput {
+    pub thread_id: String,
+    pub request_id: String,
+    pub expected_revision: u64,
+    pub idempotency_key: String,
+    pub answers: Vec<InteractionAnswerDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionCancelInput {
+    pub thread_id: String,
+    pub request_id: String,
+    pub expected_revision: u64,
     pub idempotency_key: String,
 }
 
@@ -137,16 +227,6 @@ pub struct PlanCreateInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GoalInputRespondInput {
-    pub goal_id: String,
-    pub expected_goal_revision: u64,
-    pub idempotency_key: String,
-    pub input_request_id: String,
-    pub response: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AcceptanceCriterionDto {
     pub criterion_id: String,
     pub description: String,
@@ -189,7 +269,7 @@ pub struct PlanDraftSaveInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PlanApproveInput {
+pub struct PlanExecuteInput {
     pub thread_id: String,
     pub plan_id: String,
     pub expected_plan_revision: u64,
@@ -210,11 +290,90 @@ pub struct PlanRejectInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GoalInputRequestDto {
-    pub input_request_id: String,
+pub struct InteractionOptionDto {
+    pub option_id: String,
+    pub label: String,
+    pub description: String,
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionQuestionDto {
+    pub question_id: String,
     pub prompt: String,
-    pub expires_at: String,
+    #[serde(rename = "type")]
+    pub question_type: String,
+    pub required: bool,
+    pub allow_free_text: bool,
+    pub options: Vec<InteractionOptionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionRequestDto {
+    pub request_id: String,
+    pub thread_id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub turn_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub tool_call_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub plan_revision_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub run_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub goal_id: Option<String>,
+    pub status: String,
+    pub revision: u64,
+    pub questions: Vec<InteractionQuestionDto>,
+    pub answers: Vec<InteractionAnswerDto>,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionDraftDto {
+    pub thread_id: String,
+    pub request_id: String,
+    pub answers: Vec<InteractionAnswerDto>,
+    pub page: u32,
+    pub collapsed: bool,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionSnapshotDto {
+    pub thread_id: String,
+    pub event_sequence: u64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub request: Option<InteractionRequestDto>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub draft: Option<InteractionDraftDto>,
+    pub resume_state: InteractionResumeStateDto,
+}
+
+/// 恢复状态来自 Java 同事务投影，不能把已回答误认为模型已继续执行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionResumeStateDto {
+    None,
+    WaitingForAnswer,
+    WaitingToResume,
+    Resuming,
+    Settled,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionObserveResultDto {
+    #[serde(flatten)]
+    pub snapshot: InteractionSnapshotDto,
+    pub observation_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,8 +418,6 @@ pub struct GoalDto {
     pub completed_required_steps: u64,
     pub total_required_steps: u64,
     #[serde(deserialize_with = "required_nullable")]
-    pub pending_input: Option<GoalInputRequestDto>,
-    #[serde(deserialize_with = "required_nullable")]
     pub attention_reason: Option<String>,
     #[serde(deserialize_with = "required_nullable")]
     pub latest_evaluation: Option<GoalEvaluationDto>,
@@ -289,6 +446,8 @@ pub enum PlanStatusDto {
     AwaitingApproval,
     Approved,
     Executing,
+    Verifying,
+    Paused,
     Completed,
     Stopped,
 }
@@ -428,6 +587,21 @@ pub struct PlanProjectionDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanCurrentReadResultDto {
+    #[serde(deserialize_with = "required_nullable")]
+    pub current: Option<PlanProjectionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanObserveResultDto {
+    #[serde(flatten)]
+    pub projection: PlanProjectionDto,
+    pub observation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GoalProjectionResultDto {
     pub goal: GoalDto,
     pub event_sequence: u64,
@@ -459,8 +633,6 @@ pub enum GoalEventKindDto {
     StepChanged,
     EvidenceAdded,
     ContinuationNoProgress,
-    InputRequested,
-    InputReceived,
     EvaluationStarted,
     EvaluationCompleted,
     Paused,
@@ -546,6 +718,19 @@ pub struct GoalEvidenceResultDto {
     #[serde(deserialize_with = "required_nullable")]
     pub plan_revision_id: Option<String>,
     pub event_sequence: u64,
+    pub items: Vec<AcceptanceEvidenceDto>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanEvidenceResultDto {
+    pub plan_id: String,
+    pub plan_revision: u64,
+    pub event_sequence: u64,
+    pub plan_revision_id: String,
+    pub run_id: String,
     pub items: Vec<AcceptanceEvidenceDto>,
     #[serde(deserialize_with = "required_nullable")]
     pub next_cursor: Option<String>,
@@ -730,6 +915,14 @@ fn validate_page(input: &GoalPageInput) -> Result<(), RuntimeCommandError> {
 fn validate_plan_id_input(input: &PlanIdInput) -> Result<(), RuntimeCommandError> {
     validate_plan_identity(&input.thread_id, &input.plan_id)
 }
+/// 线程级恢复只验证 Thread identity；Plan 是否存在由 Java owner 以 nullable projection 表达。
+fn validate_plan_current_read(input: &PlanCurrentReadInput) -> Result<(), RuntimeCommandError> {
+    if valid_id(&input.thread_id, "thr_", 100) {
+        Ok(())
+    } else {
+        Err(RuntimeCommandError::invalid_params())
+    }
+}
 /// Plan revision 分页沿用查询 identity 与统一 200 项预算。
 fn validate_plan_page(input: &PlanPageInput) -> Result<(), RuntimeCommandError> {
     validate_plan_identity(&input.thread_id, &input.plan_id)?;
@@ -777,8 +970,68 @@ fn validate_plan_mutation(input: &PlanMutationInput) -> Result<(), RuntimeComman
     validate_mutation_boundary(input.expected_plan_revision, &input.idempotency_key)
 }
 
+/// Plan 控制绑定执行中的 run identity；陈旧窗口不能暂停或恢复新一轮执行。
+fn validate_plan_control(input: &PlanControlInput) -> Result<(), RuntimeCommandError> {
+    validate_plan_identity(&input.thread_id, &input.plan_id)?;
+    if !valid_id(&input.run_id, "run_", 100) {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    validate_mutation_boundary(input.expected_plan_revision, &input.idempotency_key)
+}
+
+/// Plan evidence 查询固定 revision/run，避免把其它执行轮的验收事实拼入当前计划。
+fn validate_plan_evidence(input: &PlanEvidenceListInput) -> Result<(), RuntimeCommandError> {
+    validate_plan_identity(&input.thread_id, &input.plan_id)?;
+    if !valid_id(&input.plan_revision_id, "planrev_", 104) || !valid_id(&input.run_id, "run_", 100)
+    {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    validate_page_limit(input.limit)
+}
+
+/// Interaction read/observe 只接受线程归属，requestId 缺省表示读取当前活动问题。
+fn validate_interaction_identity(
+    thread_id: &str,
+    request_id: Option<&str>,
+) -> Result<(), RuntimeCommandError> {
+    if !valid_id(thread_id, "thr_", 100)
+        || request_id.is_some_and(|value| !valid_id(value, "interaction_", 128))
+    {
+        Err(RuntimeCommandError::invalid_params())
+    } else {
+        Ok(())
+    }
+}
+
+/// Interaction 答案只允许有限题数、页码和文本容量，避免 WebView 伪造超大恢复载荷。
+fn validate_interaction_answers(
+    answers: &[InteractionAnswerDto],
+    page: Option<u32>,
+) -> Result<(), RuntimeCommandError> {
+    if answers.len() > 3
+        || page.is_some_and(|value| value > 2)
+        || answers.iter().any(|answer| {
+            !valid_id(&answer.question_id, "question_", 128)
+                || answer.option_ids.len() > 32
+                || answer
+                    .option_ids
+                    .iter()
+                    .any(|value| !valid_id(value, "option_", 128))
+                || answer
+                    .free_text
+                    .as_deref()
+                    .is_some_and(|value| value.len() > 16_000)
+                || (answer.skipped && (!answer.option_ids.is_empty() || answer.free_text.is_some()))
+        })
+    {
+        Err(RuntimeCommandError::invalid_params())
+    } else {
+        Ok(())
+    }
+}
+
 /// 批准与执行共享精确 revision/hash 绑定；full_access 也不能绕过这条独立门禁。
-fn validate_plan_approval(input: &PlanApproveInput) -> Result<(), RuntimeCommandError> {
+fn validate_plan_execution(input: &PlanExecuteInput) -> Result<(), RuntimeCommandError> {
     validate_plan_identity(&input.thread_id, &input.plan_id)?;
     validate_mutation_boundary(input.expected_plan_revision, &input.idempotency_key)?;
     if valid_id(&input.plan_revision_id, "planrev_", 104)
@@ -828,6 +1081,13 @@ goal_query!(
     PlanProjectionDto,
     GoalMethod::PlanRead,
     validate_plan_id_input
+);
+goal_query!(
+    ja_runtime_plan_current_read,
+    PlanCurrentReadInput,
+    PlanCurrentReadResultDto,
+    GoalMethod::PlanCurrentRead,
+    validate_plan_current_read
 );
 goal_query!(
     ja_runtime_plan_revisions_list,
@@ -884,6 +1144,55 @@ goal_query!(
     PlanProjectionDto,
     GoalMethod::PlanPropose,
     validate_plan_mutation
+);
+goal_query!(
+    ja_runtime_plan_observe,
+    PlanIdInput,
+    PlanObserveResultDto,
+    GoalMethod::PlanObserve,
+    validate_plan_id_input
+);
+goal_query!(
+    ja_runtime_plan_unobserve,
+    GoalUnobserveInput,
+    AcceptedResultDto,
+    GoalMethod::PlanUnobserve,
+    validate_unobserve
+);
+goal_query!(
+    ja_runtime_plan_events_read,
+    PlanPageInput,
+    PlanRevisionsResultDto,
+    GoalMethod::PlanEventsRead,
+    validate_plan_page
+);
+goal_query!(
+    ja_runtime_plan_evidence_list,
+    PlanEvidenceListInput,
+    PlanEvidenceResultDto,
+    GoalMethod::PlanEvidenceList,
+    validate_plan_evidence
+);
+goal_query!(
+    ja_runtime_plan_pause,
+    PlanControlInput,
+    PlanProjectionDto,
+    GoalMethod::PlanPause,
+    validate_plan_control
+);
+goal_query!(
+    ja_runtime_plan_resume,
+    PlanControlInput,
+    PlanProjectionDto,
+    GoalMethod::PlanResume,
+    validate_plan_control
+);
+goal_query!(
+    ja_runtime_plan_stop,
+    PlanControlInput,
+    PlanProjectionDto,
+    GoalMethod::PlanStop,
+    validate_plan_control
 );
 
 /// create 必须从 revision 0 开始，Goal owner identity 不在 Rust 转换成另一种拥有者。
@@ -952,19 +1261,86 @@ pub async fn ja_runtime_plan_create(
     super::runtime::run_blocking(move || request_goal(&host, GoalMethod::PlanCreate, input)).await
 }
 
-/// input response 保留请求 identity 和 Goal CAS，过期判断由 Java 同一事务完成。
+/// Interaction read 允许 requestId 省略，以恢复线程当前活动问题。
 #[tauri::command]
-pub async fn ja_runtime_goal_input_respond(
-    input: GoalInputRespondInput,
+pub async fn ja_runtime_interaction_read(
+    input: InteractionReadInput,
     state: tauri::State<'_, RuntimeHost>,
-) -> Result<GoalProjectionResultDto, RuntimeCommandError> {
-    validate_goal_identity(&input.goal_id)?;
-    validate_mutation_boundary(input.expected_goal_revision, &input.idempotency_key)?;
-    if !valid_id(&input.input_request_id, "goalinput_", 106) || input.response.is_empty() {
+) -> Result<InteractionSnapshotDto, RuntimeCommandError> {
+    validate_interaction_identity(&input.thread_id, input.request_id.as_deref())?;
+    let host = state.inner().clone();
+    super::runtime::run_blocking(move || request_goal(&host, GoalMethod::InteractionRead, input))
+        .await
+}
+
+/// observe 建立服务端订阅并返回初始快照，不能用轮询代替 observation 生命周期。
+#[tauri::command]
+pub async fn ja_runtime_interaction_observe(
+    input: InteractionObserveInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<InteractionObserveResultDto, RuntimeCommandError> {
+    validate_interaction_identity(&input.thread_id, None)?;
+    let host = state.inner().clone();
+    super::runtime::run_blocking(move || request_goal(&host, GoalMethod::InteractionObserve, input))
+        .await
+}
+
+/// unobserve 只释放 observation handle，不取消或改变待回答问题。
+#[tauri::command]
+pub async fn ja_runtime_interaction_unobserve(
+    input: InteractionUnobserveInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<AcceptedResultDto, RuntimeCommandError> {
+    if !valid_id(&input.observation_id, "observe_", 103) {
         return Err(RuntimeCommandError::invalid_params());
     }
     let host = state.inner().clone();
-    super::runtime::run_blocking(move || request_goal(&host, GoalMethod::GoalInputRespond, input))
+    super::runtime::run_blocking(move || {
+        request_goal(&host, GoalMethod::InteractionUnobserve, input)
+    })
+    .await
+}
+
+/// 草稿保存只提交可恢复 UI 状态，答案真正生效仍须经过 interaction/respond。
+#[tauri::command]
+pub async fn ja_runtime_interaction_draft_save(
+    input: InteractionDraftSaveInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<InteractionSnapshotDto, RuntimeCommandError> {
+    validate_interaction_identity(&input.thread_id, Some(&input.request_id))?;
+    validate_mutation_boundary(input.expected_draft_revision, &input.idempotency_key)?;
+    validate_interaction_answers(&input.answers, Some(input.page))?;
+    let host = state.inner().clone();
+    super::runtime::run_blocking(move || {
+        request_goal(&host, GoalMethod::InteractionDraftSave, input)
+    })
+    .await
+}
+
+/// respond 由 Java 同一事务完成 CAS、ToolResult 结算和恢复调度，迟到回答不会复活旧请求。
+#[tauri::command]
+pub async fn ja_runtime_interaction_respond(
+    input: InteractionRespondInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<InteractionSnapshotDto, RuntimeCommandError> {
+    validate_interaction_identity(&input.thread_id, Some(&input.request_id))?;
+    validate_mutation_boundary(input.expected_revision, &input.idempotency_key)?;
+    validate_interaction_answers(&input.answers, None)?;
+    let host = state.inner().clone();
+    super::runtime::run_blocking(move || request_goal(&host, GoalMethod::InteractionRespond, input))
+        .await
+}
+
+/// cancel 只取消当前问题，不将用户未答内容解释为默认同意或答案。
+#[tauri::command]
+pub async fn ja_runtime_interaction_cancel(
+    input: InteractionCancelInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<InteractionSnapshotDto, RuntimeCommandError> {
+    validate_interaction_identity(&input.thread_id, Some(&input.request_id))?;
+    validate_mutation_boundary(input.expected_revision, &input.idempotency_key)?;
+    let host = state.inner().clone();
+    super::runtime::run_blocking(move || request_goal(&host, GoalMethod::InteractionCancel, input))
         .await
 }
 
@@ -982,24 +1358,13 @@ pub async fn ja_runtime_plan_draft_save(
         .await
 }
 
-/// approve 同时绑定 revision 与 hash；full_access 也必须提供这两个字段。
-#[tauri::command]
-pub async fn ja_runtime_plan_approve(
-    input: PlanApproveInput,
-    state: tauri::State<'_, RuntimeHost>,
-) -> Result<PlanProjectionDto, RuntimeCommandError> {
-    validate_plan_approval(&input)?;
-    let host = state.inner().clone();
-    super::runtime::run_blocking(move || request_goal(&host, GoalMethod::PlanApprove, input)).await
-}
-
-/// execute 启动一次 PLAN_EXECUTION Turn；它与批准分离且不会进入 Goal continuation。
+/// execute 同时校验 revision/hash、记录用户意图并创建唯一 Plan-owned Run。
 #[tauri::command]
 pub async fn ja_runtime_plan_execute(
-    input: PlanApproveInput,
+    input: PlanExecuteInput,
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<PlanProjectionDto, RuntimeCommandError> {
-    validate_plan_approval(&input)?;
+    validate_plan_execution(&input)?;
     let host = state.inner().clone();
     super::runtime::run_blocking(move || request_goal(&host, GoalMethod::PlanExecute, input)).await
 }

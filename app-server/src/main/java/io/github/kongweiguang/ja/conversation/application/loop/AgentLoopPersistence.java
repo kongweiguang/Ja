@@ -12,6 +12,8 @@ import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.TurnResult;
@@ -20,12 +22,14 @@ import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
 import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.function.BiConsumer;
 
 /**
  * 统一 Agent Loop 的 CAS 提交、修订号推进与事件发布顺序，确保只发布已经持久化的事实。
@@ -35,23 +39,35 @@ final class AgentLoopPersistence {
     private final Clock clock;
     private final ExecutionObservers observers;
     private final TaskMailboxInbox taskMailboxInbox;
+    private final BiConsumer<InteractionRequest, Long> interactionPublisher;
 
     /**
      * 固定 Repository 与时钟，使一次 Turn 的提交语义和事件时间源保持一致。
      */
     AgentLoopPersistence(ConversationRepository store, Clock clock, ExecutionObservers observers,
                          TaskMailboxInbox taskMailboxInbox) {
+        this(store, clock, observers, taskMailboxInbox, (request, sequence) -> { });
+    }
+
+    /** 生产组合根在事务提交后发布 Interaction CREATED；测试默认不依赖进程内订阅。 */
+    AgentLoopPersistence(ConversationRepository store, Clock clock, ExecutionObservers observers,
+                         TaskMailboxInbox taskMailboxInbox,
+                         BiConsumer<InteractionRequest, Long> interactionPublisher) {
         this.store = Objects.requireNonNull(store, "store");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.observers = Objects.requireNonNull(observers, "observers");
         this.taskMailboxInbox = Objects.requireNonNull(taskMailboxInbox, "taskMailboxInbox");
+        this.interactionPublisher = Objects.requireNonNull(interactionPublisher, "interactionPublisher");
     }
 
     /**
      * 在运行 Turn 的安全点 claim Mailbox，再通过 Conversation 专用事务同时追加 USER messages、
-     * 消费全部 BOUND 行并推进 execution/CAS；空批次不写数据库也不改变 continuation。
+     * 消费全部 BOUND 行并推进 execution/CAS；空批次不写数据库也不改变 continuation。事务回执后发布
+     * 来源快照事件；FOLLOW_UP 若已由 admission 写入 USER_INPUT，只有实际
+     * 新增的 THREAD_MESSAGE 才进入事件，避免同一消息在客户端出现两种语义。
      */
-    boolean consumeTaskMailbox(TurnExecutionPlan request, AgentLoop.RuntimeState state) {
+    boolean consumeTaskMailbox(TurnExecutionPlan request, AgentLoop.RuntimeState state, TurnEventSink sink) {
+        Objects.requireNonNull(sink, "sink");
         Instant now = clock.instant();
         TaskMailboxPort.ClaimBatch claimed = taskMailboxInbox.claim(
                 request.threadId(), request.turnId(), now);
@@ -66,6 +82,11 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = receipt.executionState();
+        if (!receipt.messageItems().isEmpty()) {
+            TurnEvent.Context context = new TurnEvent.Context("evt_" + UUID.randomUUID(),
+                    request.threadId(), request.turnId(), receipt.threadRevision(), now);
+            publishCommitted(sink, new TurnEvent.MessagesReceived(context, receipt.messageItems()));
+        }
         return true;
     }
 
@@ -264,7 +285,8 @@ final class AgentLoopPersistence {
         TurnExecutionState.Common current = ready.common();
         TurnExecutionState.Common updated = new TurnExecutionState.Common(
                 current.modelRound(), current.usedToolCalls(), current.nextProviderOrdinal(),
-                current.promptCheckpointId(), boundary.activeSkills(), current.deadlineAt(), current.origin());
+                current.promptCheckpointId(), boundary.activeSkills(), current.deadlineAt(), current.origin(),
+                current.activeBudget());
         return new TurnExecutionState.Ready(updated, ready.next(), ready.summary());
     }
 
@@ -435,7 +457,65 @@ final class AgentLoopPersistence {
     }
 
     /**
-     * 通过终态协调器竞争唯一提交权，并显式区分 Usage 的终态投影与首次持久化责任。
+     * request_user_input 的唯一暂停入口；Interaction、cursor 和 Turn 状态必须先由 Repository 原子提交，
+     * 随后才更新内存与发布两个观察面，防止用户在半提交窗口回答。
+     */
+    void suspendForInteraction(TurnExecutionPlan request, AgentLoop.RuntimeState state,
+                               InteractionSuspendedException suspended, TurnEventSink sink) {
+        Objects.requireNonNull(suspended, "suspended");
+        InteractionRequest interaction = suspended.request();
+        if (!request.threadId().equals(interaction.threadId()) || !request.turnId().equals(interaction.turnId())) {
+            throw new AgentLoop.LoopFailure("INVALID_STATE", "interaction identity does not match Turn");
+        }
+        TurnEvent.StateChanged draft = new TurnEvent.StateChanged(
+                draftContext(request, state), state.state, TurnState.SUSPENDED);
+        /* 将挂起瞬间的剩余活动预算写入同一事务；绝对 deadline 只服务当前运行，不能让用户等待消耗额度。 */
+        Instant suspendedAt = clock.instant();
+        Duration remaining = Duration.between(suspendedAt, state.execution.common().deadlineAt());
+        TurnExecutionState pausedExecution = state.execution.withActiveBudget(
+                remaining.isNegative() ? Duration.ZERO : remaining);
+        ConversationRepository.InteractionSuspensionReceipt receipt = store.suspendForInteraction(
+                new ConversationRepository.InteractionSuspensionRequest(
+                        interaction, pausedExecution, state.turnMutationVersion, suspendedAt));
+        requireAdvanced(new ConversationRepository.CommitReceipt(receipt.threadRevision(),
+                receipt.turnMutationVersion()), state.threadRevision, state.turnMutationVersion);
+        state.state = TurnState.SUSPENDED;
+        state.threadRevision = receipt.threadRevision();
+        state.turnMutationVersion = receipt.turnMutationVersion();
+        interactionPublisher.accept(interaction, receipt.interactionEventSequence());
+        publishCommitted(sink, rebind(draft, receipt.threadRevision()));
+    }
+
+    /**
+     * Plan pause 的取消在 Loop 安全点收口；Repository 只保留已经写入的 execution cursor，
+     * 因而正在 Provider/Tool 边界的未知副作用不会被伪装成成功，也不会被自动重做。
+     */
+    boolean suspendAfterPlanPause(TurnExecutionPlan request, AgentLoop.RuntimeState state,
+                                  TurnEventSink sink) {
+        ConversationRepository.TurnSnapshot current = store.findTurn(request.threadId(), request.turnId())
+                .orElse(null);
+        if (current == null || current.state().terminal()) return false;
+        /* 取消 claim 只表示停止新调用；这里再把暂停瞬间的剩余活动预算写入 cursor，
+         * 使用户等待和应用重启都不会消耗 Plan 的执行时长。 */
+        Instant suspendedAt = clock.instant();
+        Duration remaining = Duration.between(suspendedAt, state.execution.common().deadlineAt());
+        TurnExecutionState pausedExecution = state.execution.withActiveBudget(
+                remaining.isNegative() ? Duration.ZERO : remaining);
+        if (!store.suspendCancelled(request.threadId(), request.turnId(), current.threadRevision(),
+                current.turnMutationVersion(), pausedExecution, suspendedAt)) return false;
+        state.execution = pausedExecution;
+        TurnEvent.StateChanged suspended = new TurnEvent.StateChanged(
+                draftContext(request, state), state.state, TurnState.SUSPENDED);
+        state.state = TurnState.SUSPENDED;
+        state.threadRevision = current.threadRevision() + 1;
+        state.turnMutationVersion = current.turnMutationVersion() + 1;
+        publishCommitted(sink, rebind(suspended, state.threadRevision));
+        return true;
+    }
+
+    /**
+     * 通过终态协调器竞争唯一提交权，并显式区分 Usage 的终态投影与首次持久化责任；公开 reasoning
+     * 摘要作为独立事实写入，opaque 原生块仍只由成功模型消息提交。
      */
     TurnResult terminal(
             TurnExecutionPlan request,
@@ -473,10 +553,13 @@ final class AgentLoopPersistence {
             // UNKNOWN 已在 Provider dispatch 前落库；失败终态绝不能重复插入或把未知伪装成零。
             facts = List.of();
         }
-        if (target == TurnState.COMPLETED && reasoningSummary != null && !reasoningSummary.isBlank()) {
+        if (reasoningSummary != null && !reasoningSummary.isBlank()) {
             java.util.ArrayList<ConversationRepository.Fact> terminalFacts = new java.util.ArrayList<>(facts);
+            /* 取消没有 final Assistant 时仍需独立 Timeline identity，不能伪造一个空的 final message。 */
+            String summaryAnchor = messageId == null
+                    ? "item_reasoning_" + UUID.randomUUID().toString().replace("-", "") : messageId;
             terminalFacts.add(new ConversationRepository.ReasoningSummaryFact(
-                    Objects.requireNonNull(messageId, "messageId"), reasoningSummary, modelRound));
+                    summaryAnchor, reasoningSummary, modelRound));
             facts = List.copyOf(terminalFacts);
         }
         List<ConversationRepository.Fact> committedFacts = facts;

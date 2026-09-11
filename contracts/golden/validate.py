@@ -1,4 +1,5 @@
 # @author kongweiguang
+# @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Validate the breaking JA RPC v1 schema, golden frames, and Secret boundary."""
 
@@ -123,16 +124,22 @@ PARAM_DEFS = {
     "thread/read": "threadReadParams", "thread/seen": "threadMutationParams",
     "thread/archive": "threadMutationParams", "thread/restore": "threadMutationParams",
     "thread/delete": "threadMutationParams", "thread/compact": "threadCompactParams",
-    "goal/read": "goalReadParams", "plan/read": "planReadParams",
+    "interaction/read": "interactionReadParams", "interaction/observe": "interactionObserveParams",
+    "interaction/unobserve": "interactionUnobserveParams", "interaction/draft/save": "interactionDraftSaveParams",
+    "interaction/respond": "interactionRespondParams", "interaction/cancel": "interactionCancelParams",
+    "goal/read": "goalReadParams", "plan/read": "planReadParams", "plan/current/read": "planCurrentReadParams",
     "goal/events/read": "goalPageParams", "plan/revisions/list": "planPageParams",
     "goal/observe": "goalObserveParams", "goal/unobserve": "goalUnobserveParams",
     "goal/evidence/list": "goalEvidenceListParams", "goal/create": "goalCreateParams",
     "goal/plan/attach": "goalPlanAttachParams", "goal/plan/detach": "goalMutationParams",
     "goal/pause": "goalMutationParams", "goal/resume": "goalMutationParams",
-    "goal/stop": "goalMutationParams", "goal/input/respond": "goalInputRespondParams",
+    "goal/stop": "goalMutationParams",
     "plan/create": "planCreateParams", "plan/draft/save": "planDraftSaveParams",
     "plan/draft/discard": "planMutationParams", "plan/propose": "planMutationParams",
-    "plan/approve": "planApprovalBindingParams", "plan/execute": "planApprovalBindingParams",
+    "plan/execute": "planExecuteParams", "plan/observe": "planReadParams",
+    "plan/unobserve": "goalUnobserveParams", "plan/events/read": "planPageParams",
+    "plan/evidence/list": "planEvidenceListParams", "plan/pause": "planControlParams",
+    "plan/resume": "planControlParams", "plan/stop": "planControlParams",
     "plan/reject": "planRejectParams",
     "attachment/import": "attachmentImportParams", "attachment/discard": "attachmentDiscardParams",
     "turn/start": "turnStartParams", "turn/resume": "turnResumeParams",
@@ -148,6 +155,7 @@ EVENT_PARAM_DEFS: dict[str, str] = {
     "turn/state-changed": "turnStateChangedParams",
     "turn/input-queue-changed": "turnInputQueueChangedParams",
     "turn/input-consumed": "turnInputConsumedParams",
+    "turn/messages_received": "turnMessagesReceivedParams",
     "tool/started": "toolStartedParams",
     "context/compaction-started": "contextCompactionStartedParams",
     "context/compacted": "contextCompactedParams",
@@ -158,13 +166,14 @@ EVENT_PARAM_DEFS: dict[str, str] = {
     "task/mailbox-changed": "taskMailboxChangedParams",
     "goal/changed": "goalChangedParams",
     "goal/activity": "goalActivityParams",
-    "goal/input-requested": "goalInputRequestedParams",
+    "interaction/changed": "interactionChangedParams",
+    "plan/changed": "planChangedParams",
 }
 
 RESULT_DEFS = {
     "workspace/list": "workspacePageResult",
     "workspace/path/search": "workspacePathSearchResult",
-    "thread/list": "threadPageResult", "thread/search": "threadPageResult",
+    "thread/list": "threadListResult", "thread/search": "threadPageResult",
     "thread/create": "threadResult", "thread/rename": "threadResult",
     "thread/preferences/update": "threadResult", "thread/pin": "threadResult",
     "thread/seen": "threadResult", "thread/archive": "threadResult",
@@ -174,28 +183,35 @@ RESULT_DEFS = {
     "goal/events/read": "goalEventsResult",
     "goal/observe": "goalObserveResult",
     "goal/unobserve": "taskAcceptedResult",
-    "plan/read": "planProjection",
+    "plan/read": "planProjection", "plan/current/read": "planCurrentReadResult",
     "plan/revisions/list": "planRevisionsResult",
     "goal/evidence/list": "goalEvidenceResult",
     "goal/create": "goalProjectionResult", "goal/plan/attach": "goalProjectionResult",
     "goal/plan/detach": "goalProjectionResult", "goal/pause": "goalProjectionResult",
     "goal/resume": "goalProjectionResult", "goal/stop": "goalProjectionResult",
-    "goal/input/respond": "goalProjectionResult", "plan/create": "planProjection",
+    "interaction/read": "interactionSnapshot", "interaction/observe": "interactionObserveResult",
+    "interaction/unobserve": "interactionAcceptedResult", "interaction/draft/save": "interactionSnapshot",
+    "interaction/respond": "interactionSnapshot", "interaction/cancel": "interactionSnapshot",
+    "plan/create": "planProjection",
     "plan/draft/save": "planProjection", "plan/draft/discard": "planProjection",
-    "plan/propose": "planProjection", "plan/approve": "planProjection",
-    "plan/execute": "planProjection", "plan/reject": "planProjection",
+    "plan/propose": "planProjection", "plan/execute": "planProjection", "plan/reject": "planProjection",
+    "plan/observe": "planObserveResult", "plan/unobserve": "taskAcceptedResult",
+    "plan/events/read": "planEventsResult", "plan/evidence/list": "planEvidenceResult",
+    "plan/pause": "planProjection", "plan/resume": "planProjection", "plan/stop": "planProjection",
     "task/create": "taskCreateResult",
     "task/list": "taskListResult",
     "task/read": "taskReadResult",
     "task/observe": "taskObserveResult",
     "task/unobserve": "taskAcceptedResult",
     "task/seen": "taskMutationResult",
-    "task/message/send": "taskMessageResult",
+    "thread/message/send": "taskMessageResult",
     "task/followup": "taskFollowupResult",
     "task/cancel": "taskMutationResult",
     "task/tree/delete": "taskTreeDeleteResult",
+    "task/close": "taskCloseResult",
     "skill/list": "skillPageResult",
     "mcp/list": "mcpPageResult",
+    "mcp/test": "mcpTestResult",
     "mcp/list-tools": "mcpToolsResult",
     "workspace/open-general": "workspaceResult",
     "thread/compact": "threadCompactResult",
@@ -282,6 +298,8 @@ def validate_frame(frame: dict[str, Any], schema: dict[str, Any],
             raise CorpusError("task tree confirmation identity mismatch")
         if method in {"turn/input-queue-changed", "turn/input-consumed"}:
             validate_input_event(method, params)
+        if method == "turn/messages_received":
+            validate_thread_messages_received(params)
         if method == "runtime/initialize" and (
             params.get("protocolMajor") != 1 or params.get("protocolMinor") != 0
         ):
@@ -401,6 +419,52 @@ def validate_input_event(method: str, params: dict[str, Any]) -> None:
         raise CorpusError("consumed input remained queued")
 
 
+def validate_thread_messages_received(params: dict[str, Any]) -> None:
+    """锁定通信事件的 Turn 归属、来源快照和批次去重，避免消息伪装成当前输入。"""
+    occurred_at = params.get("occurredAt")
+    if not isinstance(occurred_at, str) or not 20 <= len(occurred_at) <= 64 \
+            or "T" not in occurred_at \
+            or not (occurred_at.endswith("Z") or re.search(r"[+-][0-9]{2}:[0-9]{2}$", occurred_at)) \
+            or any(ord(character) < 32 for character in occurred_at):
+        raise CorpusError("thread message event timestamp is invalid")
+    turn_id = params.get("turnId")
+    if not isinstance(turn_id, str) or re.fullmatch(r"^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", turn_id) is None:
+        raise CorpusError("thread message event turn identity is invalid")
+    items = params.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= 256:
+        raise CorpusError("thread message event items are invalid")
+    item_ids: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise CorpusError("thread message item is invalid")
+        if item.get("turnId") != turn_id or item.get("kind") != "thread_message":
+            raise CorpusError("thread message item turn or kind is invalid")
+        item_id = item.get("itemId")
+        source_thread_id = item.get("sourceThreadId")
+        source_title = item.get("sourceTitle")
+        if not isinstance(item_id, str) \
+                or re.fullmatch(r"^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", item_id) is None \
+                or item_id in item_ids:
+            raise CorpusError("thread message item identity is invalid")
+        if not isinstance(source_thread_id, str) \
+                or re.fullmatch(r"^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", source_thread_id) is None:
+            raise CorpusError("thread message source identity is invalid")
+        if not isinstance(source_title, str) or not 1 <= len(source_title) <= 512 \
+                or not source_title.strip() \
+                or any(character in source_title for character in "\x00\r\n"):
+            raise CorpusError("thread message source title is invalid")
+        created_at = item.get("createdAt")
+        content = item.get("content")
+        if not isinstance(created_at, str) or not 20 <= len(created_at) <= 64 \
+                or "T" not in created_at \
+                or not (created_at.endswith("Z") or re.search(r"[+-][0-9]{2}:[0-9]{2}$", created_at)) \
+                or any(ord(character) < 32 for character in created_at) \
+                or not isinstance(content, str) or len(content) > 1_048_576 \
+                or "\x00" in content:
+            raise CorpusError("thread message item content is invalid")
+        item_ids.add(item_id)
+
+
 def validate_attachment_summaries(content: Any, summaries: Any) -> None:
     """摘要数量与顺序必须精确对应 attachment block，避免授权另一附件的预览。"""
     if not isinstance(content, list) or not isinstance(summaries, list):
@@ -515,6 +579,8 @@ def main() -> int:
     observed_task_events: set[str] = set()
     observed_goal_methods: set[str] = set()
     observed_goal_events: set[str] = set()
+    observed_interaction_methods: set[str] = set()
+    observed_interaction_events: set[str] = set()
     for path in valid_paths:
         pending: dict[str, str] = {}
         for frame in raw_documents(path):
@@ -524,12 +590,16 @@ def main() -> int:
             saw_config_changed |= frame.get("method") == "configuration/changed"
             if isinstance(frame.get("method"), str) and frame["method"].startswith("turn/input"):
                 observed_input_contract.add(frame["method"])
-            if isinstance(frame.get("method"), str) and frame["method"].startswith("task/"):
+            if isinstance(frame.get("method"), str) \
+                    and (frame["method"].startswith("task/") or frame["method"] == "thread/message/send"):
                 target = observed_task_methods if "id" in frame else observed_task_events
                 target.add(frame["method"])
             if isinstance(frame.get("method"), str) \
                     and (frame["method"].startswith("goal/") or frame["method"].startswith("plan/")):
                 target = observed_goal_methods if "id" in frame else observed_goal_events
+                target.add(frame["method"])
+            if isinstance(frame.get("method"), str) and frame["method"].startswith("interaction/"):
+                target = observed_interaction_methods if "id" in frame else observed_interaction_events
                 target.add(frame["method"])
             if "method" in frame and "id" in frame:
                 pending[frame["id"]] = frame["method"]
@@ -542,20 +612,26 @@ def main() -> int:
     if not required_input_contract <= observed_input_contract:
         raise CorpusError("positive corpus lacks input queue coverage")
     required_task_methods = {"task/create", "task/list", "task/read", "task/observe", "task/unobserve",
-                             "task/seen", "task/message/send", "task/followup", "task/cancel",
-                             "task/tree/delete"}
+                             "task/seen", "thread/message/send", "task/followup", "task/cancel",
+                             "task/tree/delete", "task/close"}
     required_task_events = {"task/activity", "task/progress", "task/mailbox-changed"}
     if not required_task_methods <= observed_task_methods or not required_task_events <= observed_task_events:
         raise CorpusError("positive corpus lacks task thread coverage")
     required_goal_methods = {"goal/read", "goal/events/read", "goal/observe", "goal/unobserve",
                              "plan/read", "plan/revisions/list", "goal/evidence/list", "goal/create",
                              "goal/plan/attach", "goal/plan/detach", "goal/pause", "goal/resume",
-                             "goal/stop", "goal/input/respond", "plan/create", "plan/draft/save",
-                             "plan/draft/discard", "plan/propose", "plan/approve", "plan/execute",
-                             "plan/reject"}
-    required_goal_events = {"goal/changed", "goal/activity", "goal/input-requested"}
+                             "goal/stop", "plan/create", "plan/draft/save", "plan/draft/discard",
+                             "plan/propose", "plan/execute", "plan/observe", "plan/unobserve",
+                             "plan/events/read", "plan/evidence/list", "plan/pause", "plan/resume",
+                             "plan/stop", "plan/reject"}
+    required_goal_events = {"goal/changed", "goal/activity", "plan/changed"}
     if not required_goal_methods <= observed_goal_methods or not required_goal_events <= observed_goal_events:
         raise CorpusError("positive corpus lacks plan goal coverage")
+    required_interaction_methods = {"interaction/read", "interaction/observe", "interaction/unobserve",
+                                   "interaction/draft/save", "interaction/respond", "interaction/cancel"}
+    if not required_interaction_methods <= observed_interaction_methods \
+            or "interaction/changed" not in observed_interaction_events:
+        raise CorpusError("positive corpus lacks interaction coverage")
     invalid_frames = 0
     illegal_methods_path = V1_GOLDEN / "invalid" / "illegal-methods.jsonl"
     if illegal_methods_path not in invalid_paths:

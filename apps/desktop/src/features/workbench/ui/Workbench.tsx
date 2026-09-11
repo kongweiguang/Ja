@@ -311,7 +311,7 @@ export function Workbench({
     renameInputRef.current?.select();
   }, [taskTabRenameKey]);
 
-  /** 只允许侧边任务进入原位命名；选择与编辑共用同一稳定 Tab identity。 */
+  /** 只允许侧聊进入原位命名；选择与编辑共用同一稳定 Tab identity。 */
   const beginTaskTabRename = (tab: WorkbenchTaskTab): void => {
     if (
       tab.taskKind !== "side_task" ||
@@ -381,7 +381,7 @@ export function Workbench({
 
   /**
    * 启动占位只在没有实际 Tab 时存在；首次选择会结束该状态，后续选择才追加实例。
-   * 这里统一能力与侧边任务入口，避免不同入口留下不可交互的“新标签页”。
+   * 这里统一能力与侧聊入口，避免不同入口留下不可交互的“新标签页”。
    */
   const openTab = (tab: WorkbenchTab): void => {
     const actualTabs = openTabs.filter((openTab) => openTab.key !== "new");
@@ -402,8 +402,8 @@ export function Workbench({
     openTab(capabilityWorkbenchTab(capability));
   };
 
-  /** 草稿实例由上层签发进程期 identity；Shell 只打开且聚焦，不触发 task/create。 */
-  const addSideTaskDraft = (): void => {
+  /** 创建由组合层交给服务端；Shell 只接纳已确认的任务描述符，不制造会话身份。 */
+  const addSideTask = (): void => {
     const tab = onCreateSideTask?.();
     if (tab === undefined) return;
     openTab(tab);
@@ -624,7 +624,7 @@ export function Workbench({
                       ref={renameInputRef}
                       data-tab-rename="true"
                       className="ja-workbench-tab-rename-input"
-                      aria-label="侧边任务名称"
+                      aria-label="侧聊名称"
                       aria-invalid={renameSession.failed || undefined}
                       title={renameSession.failed ? "重命名失败，请重试。" : undefined}
                       value={renameSession.value}
@@ -703,7 +703,7 @@ export function Workbench({
           conversationShortcut={conversationShortcut}
           onSelect={addTab}
           onFocusConversation={focusConversation}
-          onCreateSideTask={onCreateSideTask === undefined ? undefined : addSideTaskDraft}
+          onCreateSideTask={onCreateSideTask === undefined ? undefined : addSideTask}
         />
         {onClose === undefined ? null : (
           <IconButton className="ja-workbench-drawer-toggle" label="收起右侧栏" onClick={onClose}>
@@ -798,7 +798,7 @@ export function Workbench({
             onSelect={addTab}
             focusConversation={focusConversation}
             conversationShortcut={conversationShortcut}
-            onCreateSideTask={onCreateSideTask === undefined ? undefined : addSideTaskDraft}
+            onCreateSideTask={onCreateSideTask === undefined ? undefined : addSideTask}
           />
         </div>
       ) : null}
@@ -809,7 +809,7 @@ export function Workbench({
   );
 }
 
-/** 启动器只列出有真实投影的 feature；新建侧边任务只创建本地草稿描述符。 */
+/** 启动器只列出真实 feature，侧聊创建由组合层处理服务端 ACK。 */
 function NewTabLauncher({
   definitions,
   shortcuts,
@@ -856,7 +856,7 @@ function NewTabLauncher({
         {onCreateSideTask === undefined ? null : (
           <button type="button" className="ja-workbench-launcher-action" onClick={onCreateSideTask}>
             <MessageCircle aria-hidden="true" />
-            <span>新建侧边任务</span>
+            <span>新建侧聊</span>
             <kbd />
           </button>
         )}
@@ -883,7 +883,7 @@ function capabilityMenuDefinitions(
   return definitions.filter(({ value }) => value !== "new");
 }
 
-/** `+` 统一承载可用 Tab 菜单；侧边任务创建仍由 composition root 签发实例身份。 */
+/** `+` 统一承载可用 Tab 菜单；侧聊创建仍由 composition root 签发实例身份。 */
 function WorkbenchCapabilityMenu({
   definitions,
   activeTab,
@@ -934,7 +934,7 @@ function WorkbenchCapabilityMenu({
             {onCreateSideTask === undefined ? null : (
               <MenuItem className="ja-workbench-add-menu-item" onSelect={onCreateSideTask}>
                 <MessageCircle aria-hidden="true" />
-                <span>新建侧边任务</span>
+                <span>新建侧聊</span>
               </MenuItem>
             )}
             {onFocusConversation === undefined ? null : (

@@ -31,6 +31,7 @@ const tauriWindow = vi.hoisted(() => ({
   minimize: vi.fn(() => Promise.resolve()),
   toggleMaximize: vi.fn(() => Promise.resolve()),
   hide: vi.fn(() => Promise.resolve()),
+  close: vi.fn(() => Promise.resolve()),
   isMaximized: vi.fn(() => Promise.resolve(false)),
   isFullscreen: vi.fn(() => Promise.resolve(false)),
   isMinimized: vi.fn(() => Promise.resolve(false)),
@@ -65,6 +66,7 @@ describe("window adapter", () => {
     nativeWindowListener.resize = undefined;
     nativeWindowListener.focus = undefined;
     tauriWindow.hide.mockReset().mockResolvedValue(undefined);
+    tauriWindow.close.mockReset().mockResolvedValue(undefined);
     tauriWindow.isMaximized.mockResolvedValue(false);
     tauriWindow.isFullscreen.mockResolvedValue(false);
     tauriWindow.isMinimized.mockResolvedValue(false);
@@ -76,9 +78,11 @@ describe("window adapter", () => {
     await invokeWindowAction("minimize");
     await invokeWindowAction("toggle-maximize");
     await invokeWindowAction("hide");
+    await invokeWindowAction("close");
     expect(tauriWindow.minimize).toHaveBeenCalledOnce();
     expect(tauriWindow.toggleMaximize).toHaveBeenCalledOnce();
     expect(tauriWindow.hide).toHaveBeenCalledOnce();
+    expect(tauriWindow.close).toHaveBeenCalledOnce();
   });
 
   it("redacts native lookup and asynchronous operation failures", async () => {

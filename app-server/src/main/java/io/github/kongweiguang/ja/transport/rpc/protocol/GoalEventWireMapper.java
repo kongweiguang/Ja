@@ -9,7 +9,7 @@ import io.github.kongweiguang.ja.goal.port.in.GoalEvent;
 
 import java.util.Objects;
 
-/** 将已提交 GoalEvent 映射到冻结的三事件闭集，公共连接元数据由 RpcSession 统一添加。 */
+/** Goal 事件只投影聚合状态与活动，结构化问答由独立 Interaction 事件承接。 */
 public final class GoalEventWireMapper {
     private final GoalWireMapper wire;
 
@@ -18,13 +18,10 @@ public final class GoalEventWireMapper {
         this.wire = new GoalWireMapper(Objects.requireNonNull(mapper, "mapper"));
     }
 
-    /** input 使用专用提示事件，步骤/evaluator/recovery 使用活动事件，其余发布完整状态。 */
+    /** 步骤与验收发布活动，问答等待只改变 Goal 阶段而不复制问题载荷。 */
     public WireEvent map(GoalEvent event) {
         Objects.requireNonNull(event, "event");
         String kind = event.activity().kind();
-        if ("input_requested".equals(kind) && event.snapshot().pendingInput() != null) {
-            return new WireEvent("goal/input-requested", wire.input(event.snapshot()));
-        }
         if ("step_changed".equals(kind) || kind.startsWith("evaluation_")
                 || "recovery_required".equals(kind)) {
             return new WireEvent("goal/activity", wire.activity(event.snapshot(), event.activity()));

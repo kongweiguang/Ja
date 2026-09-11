@@ -98,7 +98,7 @@ public final class OpenAiResponsesAdapter extends AbstractStreamingModelAdapter 
      */
     private ModelPort.ModelOutcome executeEncoded(
             byte[] encoded, StreamContext context, RequestController controller) {
-        OpenAiResponsesState state = new OpenAiResponsesState();
+        OpenAiResponsesState state = new OpenAiResponsesState(configuration());
         Request request = request(encoded);
         executeSse(httpClient(), request, ALLOWED_EVENTS, "OPENAI_EVENT", controller,
                 OpenAiProviderSupport::serviceFailure,

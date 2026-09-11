@@ -23,6 +23,14 @@ public interface GoalToolExecutionPort {
     /** 真实结果只以摘要和 digest 进入 Goal 聚合，不复制原始 Tool output。 */
     void settle(Attempt attempt, Settlement settlement);
 
+    /**
+     * 读取当前内部 Turn 的不可变 Plan/Goal 身份；Interaction 绑定需要它跨暂停、恢复和重启保持一致。
+     * 普通 USER/CHILD_TASK Turn 返回空，不能因为同一 Thread 存在活动聚合而猜测身份。
+     */
+    default Optional<ExecutionIdentity> executionIdentity(String threadId, String turnId, TurnOrigin origin) {
+        return Optional.empty();
+    }
+
     /** 默认空实现保持非 Goal Turn 与聚焦 Loop 测试不产生持久副作用。 */
     static GoalToolExecutionPort disabled() {
         return new GoalToolExecutionPort() {
@@ -55,6 +63,17 @@ public interface GoalToolExecutionPort {
     record Attempt(String attemptId) {
         /** identity 必须来自 Goal adapter，Loop 不自行构造。 */
         public Attempt { Objects.requireNonNull(attemptId, "attemptId"); }
+    }
+
+    /** Interaction 与 Tool ledger 共用的内部执行身份；Plan 与 Goal 字段按 origin 互斥。 */
+    record ExecutionIdentity(String planRevisionId, String runId, String goalId) {
+        /** 至少绑定 Run，并拒绝把 Plan revision 与 Goal identity 交叉拼接。 */
+        public ExecutionIdentity {
+            if (runId == null || runId.isBlank()
+                    || (goalId == null && planRevisionId == null)) {
+                throw new IllegalArgumentException("invalid internal execution identity");
+            }
+        }
     }
 
     /** settlement 明确区分 outcome、错误码与经过投影的安全摘要。 */

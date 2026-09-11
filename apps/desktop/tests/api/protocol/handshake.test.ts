@@ -20,7 +20,7 @@ function readyEvent() {
       occurredAt: "2026-08-25T12:00:00Z",
       status: "ready" as const,
       generation: 1,
-      features: ["task_threads_v1", "plan_goal_v1"] as const,
+      features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"] as const,
       readyToken: READY_TOKEN,
     },
   };
@@ -93,7 +93,7 @@ describe("Ja ready-token handshake", () => {
         occurredAt: "2026-08-25T12:00:00Z",
         status: "failed",
         generation: 1,
-        features: ["task_threads_v1", "plan_goal_v1"],
+        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
         reason: "runtime_lifecycle",
       },
     });
@@ -110,7 +110,7 @@ describe("Ja ready-token handshake", () => {
           occurredAt: "2026-08-25T12:00:00Z",
           status: "failed",
           generation: 1,
-          features: ["task_threads_v1", "plan_goal_v1"],
+          features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
         },
       }),
     ).toThrow();

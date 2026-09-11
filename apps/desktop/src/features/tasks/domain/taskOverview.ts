@@ -10,6 +10,29 @@ const SECTIONS = [
   { key: "completed", label: "已完成" },
 ] as const;
 
+/** 总览只沿当前会话的委派边展开；来源树仍可用于管理侧聊标签，但不能当作子任务列表。 */
+export function selectDelegatedTasks(
+  tasks: readonly TaskSummary[],
+  ownerThreadId: string | undefined,
+): TaskSummary[] {
+  if (ownerThreadId === undefined) return [];
+  const owners = new Set([ownerThreadId]);
+  const selected = new Map<string, TaskSummary>();
+  for (let depth = 0; depth < 4; depth += 1) {
+    for (const task of tasks) {
+      if (
+        task.taskKind !== "subagent" ||
+        task.lifecycle !== "attached" ||
+        !owners.has(task.parentThreadId)
+      )
+        continue;
+      selected.set(task.taskThreadId, task);
+      owners.add(task.taskThreadId);
+    }
+  }
+  return [...selected.values()];
+}
+
 type TaskSectionKey = (typeof SECTIONS)[number]["key"];
 
 export interface TaskTreeNode {

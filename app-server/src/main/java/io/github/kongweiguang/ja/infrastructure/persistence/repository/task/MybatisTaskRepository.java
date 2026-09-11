@@ -8,9 +8,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
+import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
-import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
 import io.github.kongweiguang.ja.conversation.port.out.WorkspaceWriteClaimPort;
@@ -27,6 +27,7 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRe
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnExecutionStateCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.ThreadPersistenceMapping;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.PersistenceRowProjections;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
 import io.github.kongweiguang.ja.task.domain.TaskModels;
 import io.github.kongweiguang.ja.task.port.out.TaskRepository;
@@ -106,7 +107,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
             ArrayNode references = objectMapper.createArrayNode();
             Set<String> referenceKeys = new HashSet<>();
             long totalBytes = 0;
-            for (PersistenceRecords.MessageRow row : rows) {
+            for (PersistenceRecords.MessageRow row : settledContextRows(rows, checkpoint)) {
                 totalBytes = Math.addExact(totalBytes, row.blocksJson().getBytes(StandardCharsets.UTF_8).length);
                 if (totalBytes > MAX_EFFECTIVE_BYTES) {
                     throw invalidState("effective context requires compaction before forking");
@@ -128,6 +129,47 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
             return new TaskModels.EffectiveContextSnapshot(parentThreadId, expectedParentRevision,
                     requireObject(context), requireArray(references), permissionCeiling);
         });
+    }
+
+    /**
+     * 来源会话可能正在执行工具批次；只冻结最后一个调用/结果配对完整的前缀，避免侧聊向
+     * Provider 发送悬空 tool_call，也不把父任务尚未完成的工具工作当作自己的待执行动作。
+     */
+    private List<PersistenceRecords.MessageRow> settledContextRows(
+            List<PersistenceRecords.MessageRow> rows, PersistenceRecords.CheckpointRow checkpoint) {
+        Set<String> pendingCalls = new HashSet<>();
+        int settledThrough = 0;
+        for (int index = 0; index < rows.size(); index++) {
+            PersistenceRecords.MessageRow row = rows.get(index);
+            JsonNode blocks = parseArray(row.blocksJson(), "effective message blocks");
+            if (checkpoint != null && checkpoint.retainedSplitJson() != null) {
+                blocks = applyRetainedSplit(row, blocks, checkpoint.retainedSplitJson());
+            }
+            for (JsonNode block : blocks) {
+                if ("tool_call".equals(block.path("kind").asText())) {
+                    pendingCalls.add(block.path("callId").asText());
+                } else if ("tool_result".equals(block.path("kind").asText())) {
+                    pendingCalls.remove(block.path("callId").asText());
+                }
+            }
+            if (pendingCalls.isEmpty()) settledThrough = index + 1;
+        }
+        return rows.subList(0, settledThrough);
+    }
+
+    /**
+     * 侧边任务先落成可继续交互的 idle Thread；不创建 Turn、execution 或 USER fact，
+     * 这样创建结果不会被运行时误判为已经调用 provider。
+     */
+    @Override
+    public TaskModels.Summary admitIdleChild(TaskModels.ChildAdmission child) {
+        ensureOpen();
+        Objects.requireNonNull(child, "child");
+        if (child.kind() != TaskModels.Kind.SIDE_TASK
+                || child.lifecycle() != TaskModels.Lifecycle.INDEPENDENT) {
+            throw relation("only independent side tasks may be idle");
+        }
+        return transactions.required(mapper -> admitIdleChild(mapper, child));
     }
 
     /** Child Thread 的全部关系、上下文、首 Turn 和投影在单一 write transaction 内提交。 */
@@ -163,13 +205,34 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         });
     }
 
-    /** 根 Timeline 使用单条 SQL 截取最近活动并校验联结身份，避免读取 Child transcript 或全树正文。 */
+    /** 会话只观察自己直接委派的子任务；先在 SQL 限定 owner 再分页，侧聊及其后代不会挤掉主会话活动。 */
     @Override
     public List<TaskModels.ActivityProjection> listRootActivities(String rootThreadId, int limit) {
         ensureOpen();
         if (limit < 1 || limit > 128) throw new IllegalArgumentException("invalid root activity limit");
         return transactions.required(mapper -> mapper.tasks().selectRootActivityProjections(rootThreadId, limit)
                 .stream().map(row -> rootActivityProjection(rootThreadId, row)).toList());
+    }
+
+    /** 临时标记与准入共用此仓储的事务 owner，关闭重试返回仍需取消的真实子树。 */
+    @Override
+    public List<String> beginSideChatClose(String taskThreadId) {
+        ensureOpen();
+        return transactions.required(mapper -> SideChatPersistence.beginClose(mapper, taskThreadId));
+    }
+
+    /** 仅关闭闸门和真实终态屏障都满足时清理，任何 FK 或运行竞争失败均整事务回滚。 */
+    @Override
+    public int deleteClosedSideChat(String taskThreadId) {
+        ensureOpen();
+        return transactions.required(mapper -> SideChatPurger.purge(mapper, taskThreadId, true));
+    }
+
+    /** 退出枚举只读取临时标记，不物化正文，也不把旧持久侧任务推断为可删除对象。 */
+    @Override
+    public List<TaskRepository.TemporarySideChat> listTemporarySideChats() {
+        ensureOpen();
+        return transactions.required(SideChatPersistence::listMarkers);
     }
 
     /** 详情的两个增量游标独立推进，避免全局 sequence 的空洞造成错误截断。 */
@@ -189,51 +252,73 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
                     taskThreadId, afterActivitySequence, limit).stream().map(this::activity).toList();
             List<TaskModels.MailboxMessage> mailbox = mapper.tasks().selectMailbox(
                     taskThreadId, afterMailboxSequence, limit).stream().map(this::mailbox).toList();
-            return Optional.of(new TaskModels.Detail(summary(row), seed(seed), activities, mailbox));
+            PersistenceRecords.ThreadRow threadRow = mapper.history().selectThread(taskThreadId);
+            if (threadRow == null) throw invalidState("task thread is unavailable");
+            return Optional.of(new TaskModels.Detail(summary(row), thread(threadRow), seed(seed), activities, mailbox));
         });
     }
 
-    /** QueueOnly 写入先做根树与容量校验，幂等重试不重复追加 Activity。 */
+    /** 将 Child Thread 的权威行投影为与主会话相同的元数据，保证任务设置读取不漂移。 */
+    private static ThreadSummary thread(PersistenceRecords.ThreadRow row) {
+        ThreadSummary.Status status = row.archivedAt() == null
+                ? ThreadSummary.Status.ACTIVE : ThreadSummary.Status.ARCHIVED;
+        return new ThreadSummary(requiredText(row.threadId(), "thread_id"),
+                requiredText(row.workspaceId(), "workspace_id"), requiredText(row.title(), "title"),
+                PersistenceRowProjections.threadPreferences(row), status, row.pinnedAt() != null,
+                row.latestTurnStatus() == null ? null : TurnState.valueOf(requiredText(
+                        row.latestTurnStatus(), "latest_turn_status")), row.latestTurnSeen(), row.activeGoalId(),
+                row.revision(), Instant.parse(requiredText(row.createdAt(), "created_at")),
+                Instant.parse(requiredText(row.updatedAt(), "updated_at")));
+    }
+
+    /** 普通 MESSAGE 只写入有界 Mailbox；它是跨会话投递事实，不应制造 Task Activity 或未读投影。 */
     @Override
-    public TaskModels.MessageEnqueueReceipt enqueueMessage(TaskModels.MailboxEnvelope mailbox,
-                                                            String activityId, JsonObject summary) {
+    public TaskModels.MessageEnqueueReceipt enqueueMessage(TaskModels.MailboxEnvelope mailbox) {
         ensureOpen();
         Objects.requireNonNull(mailbox, "mailbox");
         if (mailbox.kind() != TaskModels.MailboxKind.MESSAGE) {
             throw new IllegalArgumentException("QueueOnly requires MESSAGE kind");
         }
         return transactions.required(mapper -> {
-            RoutedTask route = route(mapper, mailbox.senderThreadId(), mailbox.targetThreadId());
+            RoutedTask route = route(mapper, mailbox.senderThreadId(), mailbox.targetThreadId(), false, false);
+            requireCrossWorkspaceMessageContent(mapper, mailbox);
             TaskRecords.MailboxRow existing = mapper.tasks().selectMailboxByIdempotency(
                     mailbox.senderThreadId(), mailbox.idempotencyKey());
             if (existing != null) {
-                return messageReceipt(mapper, route, identicalMailbox(existing, mailbox), false);
+                return messageReceipt(identicalMailbox(existing, mailbox), false);
             }
             String contentJson = json.writeContent(mailbox.content());
             requireMailboxCapacity(mapper, mailbox.targetThreadId(), contentJson);
             Long sequence = mapper.tasks().insertMailbox(mailboxInsert(mailbox, route.rootThreadId(),
                     contentJson, "PENDING", null));
             if (sequence == null) {
-                return messageReceipt(mapper, route,
-                        identicalMailbox(requireExistingMailbox(mapper, mailbox), mailbox), false);
+                return messageReceipt(identicalMailbox(requireExistingMailbox(mapper, mailbox), mailbox), false);
             }
-            TaskModels.Summary current = requireTask(mapper, route.taskThreadId());
-            long activitySequence = insertActivity(mapper, activityId, route.rootThreadId(),
-                    route.taskThreadId(), mailbox.senderThreadId(), mailbox.causalTurnId(),
-                    TaskModels.ActivityKind.MESSAGE_SENT, summary, mailbox.createdAt());
-            requireChanged(mapper.tasks().compareAndSetProjectionActivity(new TaskRecords.ProjectionActivityCas(
-                    route.taskThreadId(), current.projection().revision(), activitySequence,
-                    safeSummary(summary), instant(mailbox.createdAt()))), "task projection changed concurrently");
-            return messageReceipt(mapper, route, mailbox(mapper.tasks().selectMailboxByIdempotency(
+            return messageReceipt(mailbox(mapper.tasks().selectMailboxByIdempotency(
                     mailbox.senderThreadId(), mailbox.idempotencyKey())), true);
         });
     }
 
-    /** 回执始终使用路由事务内解析出的 Child 投影 owner，root 端点不需要伪造 Task lineage。 */
-    private TaskModels.MessageEnqueueReceipt messageReceipt(PersistenceMappers mapper, RoutedTask route,
-                                                            TaskModels.MailboxMessage mailbox,
+    /**
+     * 跨 Workspace 的普通消息只传递用户明确写出的文本；附件、Skill 和路径引用不能随 Mailbox
+     * 穿越 Workspace，因为接收方没有发送方资源的授权上下文。该检查放在同一事务快照内，避免
+     * 应用层预读 Thread 后再入队导致 workspace 关系漂移；同 Workspace 消息保留原有内容语义。
+     */
+    private static void requireCrossWorkspaceMessageContent(PersistenceMappers mapper,
+                                                             TaskModels.MailboxEnvelope mailbox) {
+        PersistenceRecords.ThreadRow sender = mapper.history().selectThread(mailbox.senderThreadId());
+        PersistenceRecords.ThreadRow target = mapper.history().selectThread(mailbox.targetThreadId());
+        if (sender == null || target == null) throw notFound("mailbox route");
+        if (sender.workspaceId().equals(target.workspaceId())) return;
+        if (mailbox.content().blocks().stream().anyMatch(block -> !(block instanceof TextContent))) {
+            throw relation("cross-workspace messages require text-only content");
+        }
+    }
+
+    /** 回执只返回 Mailbox 事实；普通消息可能没有 Child projection owner。 */
+    private TaskModels.MessageEnqueueReceipt messageReceipt(TaskModels.MailboxMessage mailbox,
                                                             boolean inserted) {
-        return new TaskModels.MessageEnqueueReceipt(mailbox, requireTask(mapper, route.taskThreadId()), inserted);
+        return new TaskModels.MessageEnqueueReceipt(mailbox, inserted);
     }
 
     /**
@@ -248,7 +333,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
             throw new IllegalArgumentException("idempotency lookup requires FOLLOW_UP kind");
         }
         return transactions.required(mapper -> {
-            RoutedTask route = route(mapper, envelope.senderThreadId(), envelope.targetThreadId());
+            RoutedTask route = route(mapper, envelope.senderThreadId(), envelope.targetThreadId(), true, true);
             if (!route.taskThreadId().equals(envelope.targetThreadId())) {
                 throw relation("follow-up target must be a Child Task");
             }
@@ -265,7 +350,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         Objects.requireNonNull(admission, "admission");
         return transactions.required(mapper -> {
             TaskModels.MailboxEnvelope envelope = admission.mailbox();
-            RoutedTask route = route(mapper, envelope.senderThreadId(), envelope.targetThreadId());
+            RoutedTask route = route(mapper, envelope.senderThreadId(), envelope.targetThreadId(), true, true);
             if (!route.taskThreadId().equals(envelope.targetThreadId())) {
                 throw relation("follow-up target must be a Child Task");
             }
@@ -517,6 +602,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     private ConversationRepository.AdmissionReceipt admitChild(PersistenceMappers mapper,
                                                                 TaskModels.ChildAdmission child,
                                                                 ConversationRepository.TurnAdmission turn) {
+        SideChatPersistence.requireTaskAdmissionOpen(mapper, child.parentThreadId());
         TaskRecords.ParentRow parent = requireParent(mapper, child.parentThreadId());
         requireParentRevision(parent, child.expectedParentRevision());
         if (!parent.workspaceId().equals(child.childThread().workspaceId())) {
@@ -533,7 +619,13 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         String rootTurnId = causalRootTurn(mapper, child.parentThreadId(), child.originTurnId(),
                 child.lifecycle() == TaskModels.Lifecycle.ATTACHED);
         requireSeedMode(child);
+        PersistenceRecords.SubagentPolicyRow parentPolicy = mapper.subagentPolicies().select(parent.threadId());
+        if (parentPolicy == null) throw invalidState("parent subagent policy is unavailable");
         insertThread(mapper, child.childThread());
+        requireChanged(mapper.subagentPolicies().insert(new PersistenceRecords.SubagentPolicyInsert(
+                child.childThread().threadId(), parentPolicy.enabled(), parentPolicy.providerId(),
+                parentPolicy.modelId(), parentPolicy.reasoningLevel(), instant(child.contextSeed().createdAt()))),
+                "child subagent policy insert lost");
         String fingerprint = insertSeed(mapper, child.contextSeed());
         requireChanged(mapper.tasks().insertLineage(new TaskRecords.LineageInsert(
                 child.childThread().threadId(), child.parentThreadId(), rootThreadId, child.originTurnId(),
@@ -544,10 +636,14 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
                 "child Turn insert lost");
         requireChanged(mapper.agent().insertTurnExecution(executionWrite(turn.turnId(), turn.initialExecution())),
                 "child execution insert lost");
-        long ordinal = 1;
-        if (child.kind() == TaskModels.Kind.SIDE_TASK) {
-            ordinal = injectEffectiveContext(mapper, child, turn, fingerprint);
-        }
+        long ordinal = TaskContextInheritancePersistence.injectIfFirstTurn(mapper, objectMapper,
+                new TaskModels.ContextSeed(child.contextSeed().contextSeedId(), child.contextSeed().parentThreadId(),
+                        child.contextSeed().parentTurnId(), child.contextSeed().parentRevision(),
+                        child.contextSeed().inheritanceMode(), child.contextSeed().taskBrief(),
+                        child.contextSeed().effectiveContext(), child.contextSeed().references(),
+                        child.contextSeed().permissionCeiling(), fingerprint, child.contextSeed().createdAt()),
+                turn.threadId(), turn.turnId(), turn.requestedAt(), 1,
+                child.parentThreadId(), child.expectedParentRevision(), fingerprint);
         insertUserMessage(mapper, child.childThread().workspaceId(), turn, ordinal, true);
         var preferences = child.childThread().preferences();
         requireChanged(mapper.history().compareAndSetThreadAdmission(new PersistenceRecords.ThreadAdmissionCas(
@@ -562,14 +658,67 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
                 child.childThread().threadId(), rootThreadId, TaskModels.State.QUEUED.name(),
                 activitySequence, safeSummary(child.activitySummary()), null,
                 instant(child.contextSeed().createdAt()))), "task projection insert lost");
-        mapper.tasks().incrementAncestorDescendants(child.parentThreadId());
+        if (child.kind() == TaskModels.Kind.SIDE_TASK) {
+            SideChatPersistence.insertOpen(mapper, child.childThread().threadId());
+        }
+        // 上下文来源不是委派关系，创建侧聊不能增加来源任务的后代运行统计。
+        if (child.lifecycle() == TaskModels.Lifecycle.ATTACHED) {
+            mapper.tasks().incrementAncestorDescendants(child.parentThreadId());
+        }
         return new ConversationRepository.AdmissionReceipt(turn.threadId(), turn.turnId(), 1, 0, null);
+    }
+
+    /** idle admission 与首 Turn admission 共享关系校验和元数据写入，但刻意没有任何 Turn 写入。 */
+    private TaskModels.Summary admitIdleChild(PersistenceMappers mapper, TaskModels.ChildAdmission child) {
+        SideChatPersistence.requireTaskAdmissionOpen(mapper, child.parentThreadId());
+        TaskRecords.ParentRow parent = requireParent(mapper, child.parentThreadId());
+        requireParentRevision(parent, child.expectedParentRevision());
+        if (!parent.workspaceId().equals(child.childThread().workspaceId())) {
+            throw relation("child and parent must share one Workspace");
+        }
+        int depth = parent.depth() == null ? 1 : parent.depth() + 1;
+        if (depth > 4) throw new TaskRepositoryException(TaskRepositoryException.Code.DEPTH_LIMIT,
+                "task depth exceeds limit");
+        String rootThreadId = parent.rootThreadId() == null ? parent.threadId() : parent.rootThreadId();
+        if (mapper.tasks().countRootDescendants(rootThreadId) >= MAX_TREE_SIZE) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.TREE_LIMIT,
+                    "task tree exceeds limit");
+        }
+        causalRootTurn(mapper, child.parentThreadId(), child.originTurnId(), false);
+        requireSeedMode(child);
+        PersistenceRecords.SubagentPolicyRow parentPolicy = mapper.subagentPolicies().select(parent.threadId());
+        if (parentPolicy == null) throw invalidState("parent subagent policy is unavailable");
+        insertThread(mapper, child.childThread());
+        requireChanged(mapper.subagentPolicies().insert(new PersistenceRecords.SubagentPolicyInsert(
+                child.childThread().threadId(), parentPolicy.enabled(), parentPolicy.providerId(),
+                parentPolicy.modelId(), parentPolicy.reasoningLevel(), instant(child.contextSeed().createdAt()))),
+                "child subagent policy insert lost");
+        insertSeed(mapper, child.contextSeed());
+        requireChanged(mapper.tasks().insertLineage(new TaskRecords.LineageInsert(
+                child.childThread().threadId(), child.parentThreadId(), rootThreadId, child.originTurnId(),
+                child.taskName(), depth, child.kind().name(), child.lifecycle().name(),
+                child.contextSeed().contextSeedId(), instant(child.contextSeed().createdAt()))),
+                "task lineage insert lost");
+        long activitySequence = insertActivity(mapper, child.activityId(), rootThreadId,
+                child.childThread().threadId(), child.parentThreadId(), child.originTurnId(),
+                TaskModels.ActivityKind.CREATED, child.activitySummary(), child.contextSeed().createdAt());
+        requireChanged(mapper.tasks().insertProjection(new TaskRecords.ProjectionInsert(
+                child.childThread().threadId(), rootThreadId, TaskModels.State.IDLE.name(),
+                activitySequence, safeSummary(child.activitySummary()), null,
+                instant(child.contextSeed().createdAt()))), "task projection insert lost");
+        SideChatPersistence.insertOpen(mapper, child.childThread().threadId());
+        // 独立侧聊只拥有自己的工作面，不让创建操作改变来源任务的投影版本。
+        if (child.lifecycle() == TaskModels.Lifecycle.ATTACHED) {
+            mapper.tasks().incrementAncestorDescendants(child.parentThreadId());
+        }
+        return requireTask(mapper, child.childThread().threadId());
     }
 
     /** 已存在 Task 的后续 Turn 复用普通 admission 约束，并继承 causal root Turn。 */
     private ConversationRepository.AdmissionReceipt admitExistingTaskTurn(PersistenceMappers mapper,
                                                                            ConversationRepository.TurnAdmission turn,
                                                                            String parentTurnId) {
+        SideChatPersistence.requireTaskAdmissionOpen(mapper, turn.threadId());
         PersistenceRecords.ThreadRow thread = requireThread(mapper, turn.threadId());
         if (thread.revision() != turn.expectedThreadRevision()) {
             throw concurrent("child Thread revision is stale");
@@ -579,8 +728,10 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
                 "follow-up Turn insert lost");
         requireChanged(mapper.agent().insertTurnExecution(executionWrite(turn.turnId(), turn.initialExecution())),
                 "follow-up execution insert lost");
-        insertUserMessage(mapper, thread.workspaceId(), turn,
-                mapper.agent().selectNextMessageOrdinal(turn.threadId()), true);
+        long ordinal = mapper.agent().selectNextMessageOrdinal(turn.threadId());
+        ordinal = TaskContextInheritancePersistence.injectSeedIfFirstTurn(mapper, objectMapper,
+                turn.threadId(), turn.turnId(), turn.requestedAt(), ordinal);
+        insertUserMessage(mapper, thread.workspaceId(), turn, ordinal, true);
         requireChanged(mapper.history().compareAndSetThreadAdmission(new PersistenceRecords.ThreadAdmissionCas(
                 turn.threadId(), thread.providerId(), thread.modelId(),
                 thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(), null,
@@ -588,48 +739,6 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
                 "follow-up Thread admission revision lost");
         return new ConversationRepository.AdmissionReceipt(turn.threadId(), turn.turnId(),
                 turn.expectedThreadRevision() + 1, 0, null);
-    }
-
-    /** effective context 消息只进入模型历史；Timeline 不展示继承内容，也不伪装成 Child 对话。 */
-    private long injectEffectiveContext(PersistenceMappers mapper, TaskModels.ChildAdmission child,
-                                        ConversationRepository.TurnAdmission turn, String fingerprint) {
-        JsonNode context = JacksonJsonValues.toNode(objectMapper, child.contextSeed().effectiveContext());
-        if (!context.isObject() || context.path("schemaVersion").asInt(-1) != 1
-                || !context.path("parentThreadId").asText().equals(child.parentThreadId())
-                || context.path("parentRevision").asLong(-1) != child.expectedParentRevision()
-                || !context.path("messages").isArray()) {
-            throw relation("effective context does not match frozen parent revision");
-        }
-        long ordinal = 1;
-        for (JsonNode inherited : context.path("messages")) {
-            String role = inherited.path("role").asText();
-            JsonNode blocks = inherited.path("blocks");
-            if (!("USER".equals(role) || "ASSISTANT".equals(role) || "TOOL".equals(role)) || !blocks.isArray()) {
-                throw invalidState("effective context message has an invalid shape");
-            }
-            String messageId = inheritedMessageId(child.contextSeed().contextSeedId(), ordinal);
-            requireChanged(mapper.agent().insertMessage(new PersistenceRecords.MessageInsert(
-                    messageId, turn.threadId(), turn.turnId(), ordinal, role,
-                    compact(blocks), instant(turn.requestedAt()))), "effective context message insert lost");
-            ordinal++;
-        }
-        JsonNode checkpoint = context.path("checkpoint");
-        if (checkpoint.isObject()) {
-            JsonNode summary = checkpoint.path("summary");
-            JsonNode usage = checkpoint.path("usage");
-            if (!summary.isObject() || !usage.isObject()) {
-                throw invalidState("effective context checkpoint has an invalid shape");
-            }
-            requireChanged(mapper.checkpoint().insertCheckpoint(new PersistenceRecords.CheckpointInsert(
-                    inheritedCheckpointId(child.contextSeed().contextSeedId()), turn.threadId(), 1,
-                    0, ordinal == 1 ? 0 : 1, null, compact(summary),
-                    checkpoint.path("estimatedTokens").asInt(0), fingerprint,
-                    ContextCompactionEvent.STRATEGY_VERSION,
-                    compact(usage), instant(turn.requestedAt()))), "effective context checkpoint insert lost");
-        } else if (!checkpoint.isNull()) {
-            throw invalidState("effective context checkpoint has an invalid shape");
-        }
-        return ordinal;
     }
 
     /** task brief 是 Child 第一条可见 USER_INPUT，继承内容刻意不写 Timeline。 */
@@ -644,7 +753,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         if (timeline) {
             requireChanged(mapper.agent().insertTimelineMessage(new PersistenceRecords.TimelineMessageInsert(
                     turn.messageId(), turn.threadId(), turn.turnId(), "USER_INPUT",
-                    visibleText(turn), null, instant(turn.requestedAt()))), "task Timeline insert lost");
+                    visibleText(turn), null, null, null, instant(turn.requestedAt()))), "task Timeline insert lost");
         }
         return ordinal;
     }
@@ -696,7 +805,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
 
     /** Seed JSON 先 canonical encode 再统一计算 fingerprint，调用方不能注入自定义签名。 */
     private String insertSeed(PersistenceMappers mapper, TaskModels.ContextSeedDraft seed) {
-        String brief = json.writeContent(seed.taskBrief());
+        String brief = seed.taskBrief() == null ? null : json.writeContent(seed.taskBrief());
         String effective = seed.effectiveContext() == null ? null : json.write(seed.effectiveContext());
         String references = json.write(seed.references());
         String permission = json.write(seed.permissionCeiling());
@@ -719,18 +828,23 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         }
     }
 
-    /** Mailbox 路由只能位于同一根树，且至少一端必须是 Child Task。 */
-    private static RoutedTask route(PersistenceMappers mapper, String senderThreadId, String targetThreadId) {
+    /**
+     * MESSAGE 允许任意现存 Thread 间投递；Follow-up 仍要求同一任务树且至少一端为 Child。
+     * 目标关闭标记由独立临时侧聊表在查询层拦截，避免关闭竞态下继续接纳消息。
+     */
+    private static RoutedTask route(PersistenceMappers mapper, String senderThreadId, String targetThreadId,
+                                    boolean requireSameRoot, boolean requireChild) {
         TaskRecords.TaskRouteRow sender = mapper.tasks().selectTaskRoute(senderThreadId);
         TaskRecords.TaskRouteRow target = mapper.tasks().selectTaskRoute(targetThreadId);
         if (sender == null || target == null) throw notFound("mailbox route");
+        SideChatPersistence.requireTaskAdmissionOpen(mapper, targetThreadId);
         String senderRoot = sender.rootThreadId() == null ? sender.threadId() : sender.rootThreadId();
         String targetRoot = target.rootThreadId() == null ? target.threadId() : target.rootThreadId();
-        if (!senderRoot.equals(targetRoot)) throw relation("mailbox cannot cross task roots");
+        if (requireSameRoot && !senderRoot.equals(targetRoot)) throw relation("mailbox cannot cross task roots");
         String taskThreadId = target.depth() != null ? target.threadId()
                 : sender.depth() != null ? sender.threadId() : null;
-        if (taskThreadId == null) throw relation("mailbox requires a Child Task endpoint");
-        return new RoutedTask(senderRoot, taskThreadId);
+        if (requireChild && taskThreadId == null) throw relation("mailbox requires a Child Task endpoint");
+        return new RoutedTask(targetRoot, taskThreadId);
     }
 
     /** Message count 与 UTF-8 bytes 在同一 write transaction 校验，FINAL_ANSWER 走终态不可丢路径。 */
@@ -839,7 +953,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     private TaskModels.ContextSeed seed(TaskRecords.ContextSeedRow row) {
         return new TaskModels.ContextSeed(row.contextSeedId(), row.parentThreadId(), row.parentTurnId(),
                 row.parentRevision(), TaskModels.InheritanceMode.valueOf(row.inheritanceMode()),
-                json.readContent(row.taskBriefJson()), row.effectiveContextJson() == null ? null
+                row.taskBriefJson() == null ? null : json.readContent(row.taskBriefJson()), row.effectiveContextJson() == null ? null
                 : json.readObject(row.effectiveContextJson()), json.readArray(row.referencesJson()),
                 json.readObject(row.permissionCeilingJson()), row.fingerprint(), Instant.parse(row.createdAt()));
     }
@@ -855,7 +969,8 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     /** LEFT JOIN 行先做完整关系校验再构造领域值，任何缺失或错配均失败关闭。 */
     private TaskModels.ActivityProjection rootActivityProjection(
             String requestedRootThreadId, TaskRecords.RootActivityProjectionRow row) {
-        if (!requestedRootThreadId.equals(row.activityRootThreadId())
+        if (!requestedRootThreadId.equals(row.parentThreadId())
+                || !"SUBAGENT".equals(row.taskKind()) || !"ATTACHED".equals(row.lifecycle())
                 || !row.activityTaskThreadId().equals(row.lineageTaskThreadId())
                 || !row.activityRootThreadId().equals(row.lineageRootThreadId())
                 || !row.activityTaskThreadId().equals(row.projectionTaskThreadId())
@@ -882,7 +997,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     /** Mailbox 行复用 UserContent codec，确保 Tool blocks 不能混入任务通信。 */
     private TaskModels.MailboxMessage mailbox(TaskRecords.MailboxRow row) {
         return new TaskModels.MailboxMessage(row.mailboxSequence(), row.messageId(), row.rootThreadId(),
-                row.senderThreadId(), row.targetThreadId(), row.causalTurnId(),
+                row.senderThreadId(), row.senderTitle(), row.targetThreadId(), row.causalTurnId(),
                 TaskModels.MailboxKind.valueOf(row.kind()), json.readContent(row.contentJson()),
                 row.idempotencyKey(), TaskModels.MailboxState.valueOf(row.state()), row.boundTurnId(),
                 Instant.parse(row.createdAt()), Instant.parse(row.updatedAt()), optionalInstant(row.consumedAt()));
@@ -891,7 +1006,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     /** Loop Mailbox 投影只携带模型安全点消费所需字段，不把 Task UI 状态反向泄漏到 Conversation。 */
     private TaskMailboxPort.ClaimedMessage claimedMailbox(TaskRecords.MailboxRow row) {
         return new TaskMailboxPort.ClaimedMessage(row.mailboxSequence(), row.messageId(), row.rootThreadId(),
-                row.senderThreadId(), row.targetThreadId(), row.causalTurnId(),
+                row.senderThreadId(), row.senderTitle(), row.targetThreadId(), row.causalTurnId(),
                 TaskMailboxPort.MessageKind.valueOf(row.kind()), json.readContent(row.contentJson()),
                 row.idempotencyKey(), row.boundTurnId());
     }
@@ -945,16 +1060,6 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         }
     }
 
-    /** inherited message ID 由唯一 seed 和局部 ordinal 派生，重试得到完全相同身份。 */
-    private static String inheritedMessageId(String seedId, long ordinal) {
-        return "item_ctx_" + seedId.substring("seed_".length()) + '_' + ordinal;
-    }
-
-    /** inherited checkpoint ID 同样由 seed 唯一派生，事务重试不会生成第二份 checkpoint。 */
-    private static String inheritedCheckpointId(String seedId) {
-        return "checkpoint_task_" + seedId.substring("seed_".length());
-    }
-
     /** Activity summary 的 text 成员是唯一列表预览；缺失时不从其它 JSON 猜测。 */
     private static String safeSummary(JsonObject summary) {
         return summary.get("text") instanceof JsonText text ? text.value() : null;
@@ -997,15 +1102,6 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     /** Jackson 树复制到 foundation 数组，领域记录不暴露可变节点。 */
     private static JsonArray requireArray(JsonNode node) {
         return (JsonArray) JacksonJsonValues.fromNode(node);
-    }
-
-    /** compact JSON 用于 Child 注入，避免缩进差异污染 byte budget 和 fingerprint。 */
-    private String compact(JsonNode node) {
-        try {
-            return objectMapper.writeValueAsString(node);
-        } catch (Exception failure) {
-            throw new StorageException(StorageException.Code.INVALID_STATE, "cannot encode task context", failure);
-        }
     }
 
     /** parent revision 冲突有独立错误分类，Coordinator 可映射 TASK_CONTEXT_REVISION_CONFLICT。 */
@@ -1058,6 +1154,12 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     /** 所有时刻保存 ISO-8601 UTC/offset 文本，不读取本机时区。 */
     private static String instant(Instant value) {
         return Objects.requireNonNull(value, "instant").toString();
+    }
+
+    /** 损坏的必填数据库列不能被投影成有效任务身份，也不向调用方泄露原始列内容。 */
+    private static String requiredText(String value, String column) {
+        if (value == null || value.isBlank()) throw invalidState("required task field is unavailable: " + column);
+        return value;
     }
 
     /** 可空持久时刻只由 null 表达缺失。 */

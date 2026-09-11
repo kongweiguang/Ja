@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.conversation.port.out;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
@@ -281,10 +282,10 @@ public interface ModelPort {
     record PromptPayload(String systemPrompt, String revision) {
         /**
          * 限制 Provider 原生 system，并用稳定 revision 关联续传状态；这里不写死 Ja Persona，
-         * 以免摘要等内部模型请求被迫伪装成 Agent 请求。
+         * 以免摘要等内部模型请求被迫伪装成 Agent 请求。空字符串表示不发送系统提示，供纯用户消息探测使用。
          */
         public PromptPayload {
-            systemPrompt = ContractChecks.text(systemPrompt, "systemPrompt", 4_000_000, false);
+            systemPrompt = ContractChecks.text(systemPrompt, "systemPrompt", 4_000_000, true);
             revision = ContractChecks.identifier(revision, "prompt revision");
         }
 
@@ -368,7 +369,8 @@ public interface ModelPort {
     /**
      * Provider 流式响应归一化后的事件闭集。
      */
-    sealed interface ModelEvent permits TextDelta, ReasoningSummaryDelta, ToolCallReady, UsageEvent {
+    sealed interface ModelEvent permits TextDelta, ReasoningSummaryDelta, ReasoningBlockReady,
+            ReasoningBlockReplaced, ToolCallReady, UsageEvent {
     }
 
     /**
@@ -392,6 +394,40 @@ public interface ModelPort {
          */
         public ReasoningSummaryDelta {
             text = ContractChecks.text(text, "text", 1_000_000, false);
+        }
+    }
+
+    /**
+     * Provider 已完整关闭的原生 reasoning block，仅供 Java 历史和同身份后续请求使用。
+     */
+    record ReasoningBlockReady(ReasoningContent content) implements ModelEvent {
+        /**
+         * 要求状态机只发布完整块，避免签名或 encrypted_content 在流失败后进入历史。
+         */
+        public ReasoningBlockReady {
+            Objects.requireNonNull(content, "content");
+        }
+
+        /**
+         * 隐藏事件中携带的 opaque 原文，阻止受控日志意外打印 Provider 私有状态。
+         */
+        @Override
+        public String toString() {
+            return "ReasoningBlockReady[content=" + content + "]";
+        }
+    }
+
+    /**
+     * 用终态确认的完整原生块替换已提前关闭的同一 reasoning 块，不产生新的可见消息。
+     */
+    record ReasoningBlockReplaced(ReasoningContent previous, ReasoningContent replacement)
+            implements ModelEvent {
+        /**
+         * replacement 只允许携带非空完整块；具体身份和历史唯一性由 AgentRound 校验。
+         */
+        public ReasoningBlockReplaced {
+            Objects.requireNonNull(previous, "previous");
+            Objects.requireNonNull(replacement, "replacement");
         }
     }
 

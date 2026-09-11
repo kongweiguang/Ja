@@ -336,7 +336,7 @@ fn production_command_handler_registers_task_create() {
                 "parentTurnId": null,
                 "expectedParentRevision": 0,
                 "taskName": "检查边界",
-                "content": [{"type": "text", "text": "检查"}]
+                "preferences": null
             }
         })),
         headers: Default::default(),

@@ -16,6 +16,8 @@ export function ThemeProvider({ children }: PropsWithChildren): ReactElement {
   const highContrast = useUiPreferencesStore((state) => state.highContrast);
   const reduceMotion = useUiPreferencesStore((state) => state.reduceMotion);
   const reducedTransparency = useUiPreferencesStore((state) => state.reducedTransparency);
+  const uiFontSize = useUiPreferencesStore((state) => state.uiFontSize);
+  const codeFontSize = useUiPreferencesStore((state) => state.codeFontSize);
   const resolvedTheme = useResolvedTheme();
 
   useLayoutEffect(() => {
@@ -28,7 +30,20 @@ export function ThemeProvider({ children }: PropsWithChildren): ReactElement {
       reducedTransparency,
       prefersDark: resolvedTheme === "dark",
     });
-  }, [highContrast, mode, palette, reduceMotion, reducedTransparency, resolvedTheme]);
+    // 根字号只缩放 rem 语义的界面，不使用 transform/zoom，避免破坏命中区域与窗口布局。
+    document.documentElement.style.fontSize = `${uiFontSize}px`;
+    document.documentElement.style.setProperty("--ja-ui-font-size", `${uiFontSize}px`);
+    document.documentElement.style.setProperty("--ja-code-font-size", `${codeFontSize}px`);
+  }, [
+    codeFontSize,
+    highContrast,
+    mode,
+    palette,
+    reduceMotion,
+    reducedTransparency,
+    resolvedTheme,
+    uiFontSize,
+  ]);
 
   return <>{children}</>;
 }

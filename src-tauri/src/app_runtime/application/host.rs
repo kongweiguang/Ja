@@ -11,14 +11,15 @@ use crate::app_runtime::domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
     GeneralWorkspace, GoalRequest, GoalResponse, ManualRecoveryConfirmation,
     RuntimeConfigurationStatus, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind,
-    RuntimeStorageInfo, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
-    TaskListInput, TaskListResult, TaskMessageInput, TaskMessageResult, TaskMutationInput,
-    TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
-    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput,
-    ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
-    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
-    WorkspaceDto, WorkspaceOpenInput, WorkspacePathSearchInput, WorkspacePathSearchResult,
+    RuntimeStorageInfo, TaskCloseInput, TaskCloseResult, TaskCreateInput, TaskCreateResult,
+    TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput,
+    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
+    TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
+    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted,
+    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
+    TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate,
+    TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspaceOpenInput, WorkspacePathSearchInput,
+    WorkspacePathSearchResult,
 };
 use crate::workspace::{WorkspaceHandle, WorkspaceRegistry};
 use ja_runtime::app_server_process::{
@@ -364,6 +365,17 @@ impl RuntimeHost {
             .validate()
             .map_err(|_| RuntimeCommandError::invalid_params())?;
         self.ready_bridge()?.task_tree_delete(input)
+    }
+
+    /// 侧聊关闭只在 Java 确认 `{closed:true}` 后向 UI 返回成功，避免本地状态先行消失。
+    pub fn task_close(
+        &self,
+        input: TaskCloseInput,
+    ) -> Result<TaskCloseResult, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.ready_bridge()?.task_close(input)
     }
 
     /// `@` 查询先验证 active Workspace binding，再由 Java 对 Thread 归属与路径 confinement 复核。

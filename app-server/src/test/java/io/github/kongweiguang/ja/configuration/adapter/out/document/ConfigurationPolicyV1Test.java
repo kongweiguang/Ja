@@ -121,6 +121,18 @@ final class ConfigurationPolicyV1Test {
         assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
     }
 
+    /** 完整用户文档缺失子智能体策略时必须失败，不能由代际读取路径补齐旧形状。 */
+    @Test
+    void userDocumentRejectsMissingSubagentPolicy() {
+        ObjectNode document = userDocument();
+        document.remove("subagents");
+
+        ConfigurationError failure = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER));
+
+        assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+    }
+
     /** Provider 的独立凭据引用是当前结构必填项，缺失时不得退化成共享或匿名凭据。 */
     @Test
     void providerRejectsMissingCredentialIdentity() {
@@ -131,6 +143,89 @@ final class ConfigurationPolicyV1Test {
                 () -> ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER));
 
         assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+    }
+
+    /** 子智能体模型必须引用现有 Provider/Model，删除被引用模型时整份配置拒绝保存。 */
+    @Test
+    void subagentSelectionMustReferenceExistingModel() {
+        ObjectNode document = userDocument();
+        document.with("subagents").put("provider_id", "provider_missing").put("model_id", "model_missing");
+
+        ConfigurationError failure = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER));
+
+        assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+    }
+
+    /** 子智能体 Provider/Model 不能只配置一半，避免运行时猜测路由。 */
+    @Test
+    void subagentSelectionMustBePaired() {
+        ObjectNode document = userDocument();
+        document.with("subagents").put("provider_id", "provider_fixture");
+
+        ConfigurationError failure = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER));
+
+        assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+    }
+
+    /** 指定模型允许显式支持的 reasoning 档位，并将其保留为全局策略字段。 */
+    @Test
+    void subagentReasoningMustBeSupportedBySelectedModel() {
+        ObjectNode document = userDocument();
+        ((ObjectNode) document.withArray("providers").get(0).withArray("models").get(0))
+                .withObject("reasoning_level_map").put("high", "high");
+        document.with("subagents").put("provider_id", "provider_fixture")
+                .put("model_id", "model_fixture").put("reasoning_level", "high");
+
+        ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER);
+    }
+
+    /** 已配置模型不支持的 reasoning 档位必须拒绝，不能在运行时静默回落默认值。 */
+    @Test
+    void subagentReasoningRejectsUnsupportedModelLevel() {
+        ObjectNode document = userDocument();
+        document.with("subagents").put("provider_id", "provider_fixture")
+                .put("model_id", "model_fixture").put("reasoning_level", "high");
+
+        ConfigurationError failure = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER));
+
+        assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+    }
+
+    /** 项目 overlay 不得覆盖全局子智能体开关或模型选择。 */
+    @Test
+    void projectCannotOverrideSubagentPolicy() {
+        ObjectNode project = projectOverlay();
+        project.putObject("subagents").put("enabled", false).putNull("provider_id").putNull("model_id")
+                .putNull("reasoning_level");
+
+        ConfigurationError failure = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.enforceNoEscalation(userDocument(), project));
+
+        assertEquals(ConfigurationError.Code.LIMIT_ESCALATION, failure.code());
+    }
+
+    /** 交互澄清是用户级策略，项目层显式写入必须失败而不能改变其它 effective 字段。 */
+    @Test
+    void projectCannotOverrideClarificationPolicy() {
+        ObjectNode project = projectOverlay();
+        project.putObject("interaction").put("clarification_enabled", false);
+
+        ConfigurationError failure = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.validateDocument(project, ConfigurationScope.PROJECT));
+
+        assertEquals(ConfigurationError.Code.LIMIT_ESCALATION, failure.code());
+    }
+
+    /** 用户文档缺失新开关时保持旧 v1 可读，并由代际读取按默认开启处理。 */
+    @Test
+    void userClarificationPolicyMayUseSafeDefault() {
+        ObjectNode document = userDocument();
+        document.remove("interaction");
+
+        ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER);
     }
 
     /** 两个 Provider 不得共享同一个 credential ID，避免保存或删除 Secret 时跨供应商串线。 */
@@ -199,6 +294,7 @@ final class ConfigurationPolicyV1Test {
     /** 创建稀疏项目 overlay，只引用用户 Provider/Model 并降低能力。 */
     private static ObjectNode projectOverlay() {
         ObjectNode root = baseRoot();
+        root.remove("subagents");
         root.put("default_provider_id", "provider_fixture");
         root.put("default_model_id", "model_fixture");
         root.put("default_reasoning_level", "medium");
@@ -220,6 +316,8 @@ final class ConfigurationPolicyV1Test {
         root.put("schema_version", 1);
         root.put("config_revision", 1);
         root.put("default_access_mode", "approval_required");
+        root.putObject("subagents").put("enabled", true).putNull("provider_id").putNull("model_id")
+                .putNull("reasoning_level");
         root.set("providers", MAPPER.createArrayNode());
         root.set("mcp_servers", MAPPER.createArrayNode());
         root.set("skills", MAPPER.createArrayNode());

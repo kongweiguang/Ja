@@ -19,7 +19,18 @@ import java.util.Set;
 public record SidecarConfiguration(Path homeDirectory,
                                    Path dataDirectory,
                                    Path runDirectory,
-                                   Path logDirectory) {
+                                   Path logDirectory,
+                                   long runtimeGeneration) {
+    private static final long MAX_SAFE_INTEGER = 9_007_199_254_740_991L;
+
+    /**
+     * 为未接入 host generation 的纯 Java 测试适配器提供明确的第一代默认值；生产 sidecar
+     * 必须通过 {@link #fromArgs(String[])} 接收 Rust Host 注入的真实代际。
+     */
+    public SidecarConfiguration(Path homeDirectory, Path dataDirectory, Path runDirectory,
+                                Path logDirectory) {
+        this(homeDirectory, dataDirectory, runDirectory, logDirectory, 1L);
+    }
     /**
      * 固定全部绝对目录，禁止 worker 根据 cwd、环境变量或测试模式重新解释启动边界。
      */
@@ -30,6 +41,9 @@ public record SidecarConfiguration(Path homeDirectory,
         logDirectory = normalizeDirectory(logDirectory, "log directory");
         if (homeDirectory == null || dataDirectory == null || runDirectory == null || logDirectory == null) {
             throw new IllegalArgumentException("sidecar directories are required");
+        }
+        if (runtimeGeneration < 1 || runtimeGeneration > MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("runtime generation is invalid");
         }
     }
 
@@ -51,6 +65,7 @@ public record SidecarConfiguration(Path homeDirectory,
         Path dataDirectory = null;
         Path runDirectory = null;
         Path logDirectory = null;
+        long runtimeGeneration = 0L;
         Set<String> seen = new HashSet<>();
         for (int index = 0; index < args.length; index++) {
             String arg = Objects.requireNonNull(args[index], "args[" + index + "]");
@@ -66,11 +81,41 @@ public record SidecarConfiguration(Path homeDirectory,
             } else if (arg.startsWith("--log-dir-base64=")) {
                 rejectDuplicate(seen, "log");
                 logDirectory = parseBase64Directory(arg.substring("--log-dir-base64=".length()), "log");
+            } else if (arg.startsWith("--ja-runtime-generation=")) {
+                rejectDuplicate(seen, "runtime-generation");
+                runtimeGeneration = parseRuntimeGeneration(
+                        arg.substring("--ja-runtime-generation=".length()));
             } else {
                 throw new IllegalArgumentException("unsupported sidecar argument");
             }
         }
-        return new SidecarConfiguration(homeDirectory, dataDirectory, runDirectory, logDirectory);
+        if (runtimeGeneration == 0L) {
+            throw new IllegalArgumentException("runtime generation is required");
+        }
+        return new SidecarConfiguration(homeDirectory, dataDirectory, runDirectory, logDirectory,
+                runtimeGeneration);
+    }
+
+    /**
+     * 严格解析 Rust Host 注入的安全整数，拒绝空值、符号变体和超过 JavaScript 精度边界的代际。
+     */
+    private static long parseRuntimeGeneration(String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("runtime generation is required");
+        }
+        if (value.chars().anyMatch(character -> character < '0' || character > '9')) {
+            throw new IllegalArgumentException("runtime generation is invalid");
+        }
+        final long generation;
+        try {
+            generation = Long.parseLong(value);
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("runtime generation is invalid", exception);
+        }
+        if (generation < 1 || generation > MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("runtime generation is invalid");
+        }
+        return generation;
     }
 
     /**

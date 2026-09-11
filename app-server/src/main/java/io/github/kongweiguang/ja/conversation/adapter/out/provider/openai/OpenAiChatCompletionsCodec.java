@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.Provid
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
@@ -23,11 +24,13 @@ import java.util.List;
 
 /** 将 Ja Provider 中立消息映射为 OpenAI Chat Completions 当前 wire contract。 */
 final class OpenAiChatCompletionsCodec {
+    private static final java.util.Set<String> REASONING_FIELDS = java.util.Set.of(
+            "reasoning_content", "reasoning", "reasoning_text");
     /** 禁止创建有状态 Codec，确保预算估算和每次重试使用相同映射。 */
     private OpenAiChatCompletionsCodec() {
     }
 
-    /** 构造单 choice 流请求；Chat 没有 continuation，因此显式拒绝其它协议的不透明状态。 */
+    /** 构造单 choice 流请求，空系统提示不生成消息；Chat 不接受其它协议的不透明续传状态。 */
     static ObjectNode encodeRequest(ModelPort.ModelRequest request) {
         if (request.continuation() != null) {
             throw new ProviderProtocolException(
@@ -36,8 +39,10 @@ final class OpenAiChatCompletionsCodec {
         ObjectNode root = AbstractStreamingModelAdapter.JSON.createObjectNode();
         root.put("model", request.configuration().model());
         ArrayNode messages = root.putArray("messages");
-        messages.addObject().put("role", "system").put("content", request.prompt().systemPrompt());
-        request.messages().forEach(message -> encodeMessage(messages, message));
+        if (!request.prompt().systemPrompt().isEmpty()) {
+            messages.addObject().put("role", "system").put("content", request.prompt().systemPrompt());
+        }
+        request.messages().forEach(message -> encodeMessage(messages, message, request.configuration()));
         applyGeneration(root, request.configuration().generation());
         if (!request.tools().isEmpty()) {
             ArrayNode tools = root.putArray("tools");
@@ -51,7 +56,8 @@ final class OpenAiChatCompletionsCodec {
     }
 
     /** 按 role 保持消息与 Tool 配对，不把 Tool 结果折叠为普通 assistant/user 文本。 */
-    private static void encodeMessage(ArrayNode messages, ModelMessage message) {
+    private static void encodeMessage(
+            ArrayNode messages, ModelMessage message, ModelPort.ModelConfiguration configuration) {
         if (message.role() == ModelRole.USER) {
             messages.addObject().put("role", "user").put("content", textOnly(message));
             return;
@@ -70,6 +76,9 @@ final class OpenAiChatCompletionsCodec {
         for (ModelContent block : message.content()) {
             if (block instanceof TextContent content) {
                 text.add(content.text());
+            } else if (block instanceof ReasoningContent reasoning) {
+                if (!matches(reasoning, configuration)) continue;
+                putReasoning(assistant, reasoning);
             } else if (block instanceof ToolCallContent call) {
                 if (calls == null) calls = assistant.putArray("tool_calls");
                 ObjectNode functionCall = calls.addObject();
@@ -82,6 +91,40 @@ final class OpenAiChatCompletionsCodec {
         }
         if (text.isEmpty()) assistant.putNull("content");
         else assistant.put("content", String.join("", text));
+    }
+
+    /**
+     * 仅回传当前 Provider 身份产生的 Chat reasoning；身份不匹配的 opaque 块已由上下文层过滤，
+     * Codec 再次检查可防止直接调用方把其它模型的签名材料混入请求。
+     */
+    private static boolean matches(
+            ReasoningContent reasoning, ModelPort.ModelConfiguration configuration) {
+        return reasoning.matches(configuration.providerId(), configuration.modelId(),
+                configuration.api().name().toLowerCase(java.util.Locale.ROOT), configuration.model(),
+                ReasoningContent.endpointFingerprint(configuration.baseUri()));
+    }
+
+    /**
+     * 从受控 native JSON 恢复原字段值，保留 reasoning_content/reasoning/reasoning_text 的供应商拼写。
+     */
+    private static void putReasoning(ObjectNode assistant, ReasoningContent reasoning) {
+        try {
+            if (!REASONING_FIELDS.contains(reasoning.wireField())) throw requestEncoding();
+            JsonNode nativeValue = AbstractStreamingModelAdapter.JSON.readTree(reasoning.nativeJson());
+            if (nativeValue == null || !nativeValue.isObject()
+                    || !nativeValue.has(reasoning.wireField())) {
+                throw requestEncoding();
+            }
+            JsonNode value = nativeValue.get(reasoning.wireField());
+            if (!value.isTextual() || value.textValue().isEmpty()) throw requestEncoding();
+            JsonNode existing = assistant.get(reasoning.wireField());
+            if (existing != null && !existing.equals(value)) throw requestEncoding();
+            assistant.set(reasoning.wireField(), value.deepCopy());
+        } catch (ProviderProtocolException failure) {
+            throw failure;
+        } catch (com.fasterxml.jackson.core.JsonProcessingException | RuntimeException failure) {
+            throw requestEncoding();
+        }
     }
 
     /** 用户消息只接纳文本；原生附件能力为空时附件应在更早的双门中转为 Tool。 */

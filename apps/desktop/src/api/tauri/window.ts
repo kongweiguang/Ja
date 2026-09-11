@@ -487,7 +487,7 @@ export class TauriNativeShortcutAdapter implements NativeShortcutPort {
   }
 }
 
-export type WindowAction = "minimize" | "toggle-maximize" | "hide";
+export type WindowAction = "minimize" | "toggle-maximize" | "hide" | "close";
 
 export interface WindowFrameState {
   /** 表示原生窗口当前是否占满其 maximized work area。 */
@@ -537,7 +537,7 @@ const defaultAppExitBridge: AppExitNativeBridge = {
 
 /**
  * 监听唯一托盘退出事件，并在 listener 真正建立后 ACK Rust；普通窗口关闭由原生层
- * 直接隐藏，不进入 Files/Preview 清理，避免“收起”和“退出”混用生命周期。
+ * 按用户偏好隐藏或进入同一 Files/Preview 清理握手，避免 renderer 自行决定生命周期。
  */
 export function observeAppExitRequested(
   onRequest: (request: AppExitRequest) => void | Promise<void>,
@@ -750,7 +750,9 @@ export async function invokeWindowAction(action: WindowAction): Promise<void> {
         ? appWindow.minimize()
         : action === "toggle-maximize"
           ? appWindow.toggleMaximize()
-          : appWindow.hide();
+          : action === "hide"
+            ? appWindow.hide()
+            : appWindow.close();
     await operation;
   } catch {
     throw new Error("native window action failed");

@@ -34,6 +34,7 @@ import {
   type ComposerSlashCommand,
   type ConversationSummary,
 } from "@/features/conversation";
+import type { ConversationModelOption, ConversationModelSelection } from "@/features/conversation";
 import {
   AppTitlebar,
   ConversationSearchDialog,
@@ -56,6 +57,7 @@ import type {
   TaskSummary,
   TaskThreadRenamePort,
   TaskTranscriptPort,
+  TaskPreferencesPort,
 } from "@/features/tasks";
 import type { AttachmentPreviewPort, AttachmentPreviewTarget } from "@/features/workbench/preview";
 import type { TurnReviewPort, TurnReviewTarget } from "@/features/workbench/review";
@@ -71,6 +73,7 @@ import {
 import type { DesktopIntegrationAdapters } from "@/api/tauri/desktop";
 import { observeAppExitRequested } from "@/api/tauri/window";
 import { useDesktopNotifications } from "../useDesktopNotifications";
+import { useInterfacePreferences } from "../application/useInterfacePreferences";
 import {
   useWorkspaceController,
   type WorkspacePickerPort,
@@ -108,6 +111,7 @@ import {
   DEFAULT_CONVERSATION_ARTIFACT_PORT,
   DEFAULT_HISTORY_ADAPTER,
   DEFAULT_GOAL_PORT,
+  DEFAULT_INTERACTION_PORT,
   DEFAULT_SETTINGS_ADAPTER,
   DEFAULT_TURN_REVIEW_PORT,
   DEFAULT_NATIVE_DROP_PORT,
@@ -238,6 +242,21 @@ export function JaApplication({
   const workspaceReferenceTargetRef = useRef<
     ((reference: ComposerWorkspaceReferenceTarget) => void) | undefined
   >(undefined);
+  type SideChatLauncher = (content?: string) => Promise<void>;
+  const sideChatLauncherRef = useRef<SideChatLauncher | undefined>(undefined);
+  const [sideChatLauncherReady, setSideChatLauncherReady] = useState(false);
+  /** 当前 Thread 的侧聊入口由 WorkbenchHost 注册；主 Composer 只转发 slash 参数，不复制创建逻辑。 */
+  const registerSideChatLauncher = useCallback((launcher: SideChatLauncher | undefined): void => {
+    sideChatLauncherRef.current = launcher;
+    setSideChatLauncherReady(launcher !== undefined);
+  }, []);
+  /** `/btw` 不自动唤醒目标外会话；没有当前 Host 时以可重试错误结束命令。 */
+  const requestSideChat = useCallback((content?: string): Promise<void> => {
+    const launcher = sideChatLauncherRef.current;
+    return launcher === undefined
+      ? Promise.reject(new Error("侧聊暂不可用，请稍后重试。"))
+      : launcher(content);
+  }, []);
   const {
     boot,
     runtimeState,
@@ -262,23 +281,18 @@ export function JaApplication({
   }, []);
   const taskTranscriptPort = useMemo<TaskTranscriptPort>(
     () => ({
-      /** Child Transcript 复用严格 thread/read adapter，但只投影 Task UI 所需字段。 */
-      read: async (input) => {
-        const snapshot = await resolvedHistoryAdapter.threadRead(input);
-        return {
-          threadId: snapshot.threadId,
-          revision: snapshot.revision,
-          turns: snapshot.turns.map((turn) => ({
-            turnId: turn.turnId,
-            status: turn.status,
-            requestedAt: turn.requestedAt,
-            updatedAt: turn.updatedAt,
-            completedAt: turn.completedAt,
-            errorCode: turn.errorCode,
-          })),
-          items: snapshot.items.map((item) => ({ ...item })),
-          nextCursor: snapshot.nextCursor,
-        };
+      /** Child Transcript 原样复用完整 thread/read 快照，确保 Timeline reducer 不丢队列与 Usage。 */
+      read: (input) => resolvedHistoryAdapter.threadRead(input),
+    }),
+    [resolvedHistoryAdapter],
+  );
+  const taskPreferencesPort = useMemo<TaskPreferencesPort>(
+    () => ({
+      /** child 偏好直接复用唯一 History owner；调用方必须提供 child thread revision。 */
+      update: async (input) => {
+        const updated = await resolvedHistoryAdapter.threadPreferencesUpdate(input);
+        if (updated.preferences === null) throw new Error("child preferences unavailable");
+        return updated.preferences;
       },
     }),
     [resolvedHistoryAdapter],
@@ -406,6 +420,23 @@ export function JaApplication({
     const model = provider?.models.find((candidate) => candidate.modelId === selection.modelId);
     return provider === undefined || model === undefined ? undefined : { provider, model };
   }, [settings.snapshot.defaultSelection, settings.snapshot.providers]);
+  const taskModels = useMemo<readonly ConversationModelOption[]>(
+    () =>
+      settings.snapshot.providers.flatMap((provider) =>
+        provider.models.map((model) => ({
+          value: `${provider.providerId}:${model.modelId}`,
+          providerId: provider.providerId,
+          providerLabel: provider.name,
+          modelId: model.modelId,
+          modelIdentifier: model.model,
+          modelLabel: model.name,
+          contextWindowTokens: model.capabilities.contextWindowTokens,
+          reasoningLevelMap: model.reasoningLevelMap,
+          defaultReasoningLevel: model.defaultReasoningLevel,
+        })),
+      ),
+    [settings.snapshot.providers],
+  );
   const workspace = useWorkspaceController({
     history: resolvedHistoryAdapter,
     picker: projectPicker ?? DEFAULT_WORKSPACE_PICKER,
@@ -837,6 +868,7 @@ export function JaApplication({
     (state) => state.setHistorySectionCollapsed,
   );
   const desktopNotificationsEnabled = useUiPreferencesStore((state) => state.desktopNotifications);
+  const interfacePreferences = useInterfacePreferences();
   const setDesktopNotifications = useUiPreferencesStore((state) => state.setDesktopNotifications);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const platform = useMemo(() => detectDesktopPlatform(), []);
@@ -1299,6 +1331,22 @@ export function JaApplication({
         execute: createConversation,
       },
       {
+        id: "btw",
+        name: "btw",
+        aliases: ["侧聊"],
+        label: "新建侧聊",
+        description: "从当前对话打开一个临时侧聊",
+        available: !required && conversationScopeReady && sideChatLauncherReady,
+        unavailableReason: required
+          ? "完成必要设置后可新建侧聊"
+          : !conversationScopeReady
+            ? "当前会话范围尚未就绪"
+            : "侧聊正在准备",
+        argument: { mode: "optional", label: "内容", placeholder: "描述要在侧聊处理的事情" },
+        /** 空参数只打开并聚焦侧聊；有参数由同一 launcher 创建后显式发送首条 follow-up。 */
+        execute: ({ argument }) => requestSideChat(argument),
+      },
+      {
         id: "project",
         name: "project",
         aliases: ["workspace", "项目"],
@@ -1439,7 +1487,9 @@ export function JaApplication({
       pageNavigation.canGoForward,
       platform,
       required,
+      requestSideChat,
       settingsVisible,
+      sideChatLauncherReady,
       showWorkbenchCapability,
       toggleSidebar,
       workspace.busy,
@@ -1502,6 +1552,17 @@ export function JaApplication({
   ) : (
     <SettingsView
       settings={settings}
+      interfacePreferences={interfacePreferences}
+      executionScope={{
+        scopedDefault: settings.snapshot.defaultAccessMode,
+        projectOverride: settings.loaded?.projectOverrides.accessMode ?? false,
+        scopeReady: settingsScopeReady,
+        workspaceKind: workspace.workspace?.kind,
+        threadAccessMode:
+          currentThread?.workspaceId === workspace.workspace?.workspaceId
+            ? currentThread?.preferences?.accessMode
+            : undefined,
+      }}
       required={required}
       section={settingsSection}
       onSectionChange={setSettingsSection}
@@ -1512,6 +1573,7 @@ export function JaApplication({
   );
   const workspaceMainView = (
     <ConversationWorkspace
+      interactionPort={DEFAULT_INTERACTION_PORT}
       workspace={workspace}
       conversation={conversation}
       settings={settings}
@@ -1552,9 +1614,26 @@ export function JaApplication({
         active={workbenchVisible}
         rootThreadId={workbenchThreadId}
         parentThreadRevision={currentParentThreadRevision}
+        onRegisterSideChatLauncher={registerSideChatLauncher}
         taskPort={taskAdapter}
         taskTranscriptPort={taskTranscriptPort}
         taskThreadRenamePort={taskThreadRenamePort}
+        taskNativeDropPort={nativeDropPort}
+        taskPreferencesPort={taskPreferencesPort}
+        taskGoalPort={goalPort}
+        taskInteractionPort={DEFAULT_INTERACTION_PORT}
+        taskModels={taskModels}
+        taskParentPreferences={
+          currentThread?.preferences === null ? undefined : currentThread?.preferences
+        }
+        taskDefaultPreferences={
+          settings.snapshot.defaultSelection === null
+            ? undefined
+            : {
+                selection: settings.snapshot.defaultSelection satisfies ConversationModelSelection,
+                accessMode: settings.snapshot.defaultAccessMode,
+              }
+        }
         taskAttachmentPort={attachmentPort}
         taskArtifactPort={conversationArtifactPort}
         taskComposerSkills={taskComposerSkills}
@@ -1572,6 +1651,7 @@ export function JaApplication({
         onCloseFilesCapability={closeFilesCapability}
         onFilesCapabilityClosed={closeFilesCapability}
         onAddWorkspaceReference={addWorkspaceReference}
+        onOpenWorkspaceReference={openWorkspaceReferencePreview}
         workspaceReferencePreviewRequest={workspaceReferencePreviewRequest}
         onWorkspaceReferencePreviewSettled={settleWorkspaceReferencePreview}
         onGitBranchChange={publishGitBranch}

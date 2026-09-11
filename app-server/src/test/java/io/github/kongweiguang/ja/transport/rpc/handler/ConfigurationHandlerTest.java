@@ -219,7 +219,8 @@ final class ConfigurationHandlerTest {
                     unusedPort(io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.class),
                         unusedPort(io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase.class),
                         io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveTasks(),
-                        io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveInteractions(),
                         noOpLifecycle());
             Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-configuration-handler-test")
                     .toAbsolutePath();

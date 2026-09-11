@@ -2,6 +2,12 @@
 
 # JA RPC v1 notifications
 
+`turn/messages_received` publishes a non-empty `items` batch only after mailbox consumption commits.
+It uses the common Turn event envelope; each item is the same `thread_message` shape returned by
+`thread/read`. Items are ordered by mailbox sequence and belong to the event's Turn. Receiving a message
+does not wake an idle Thread, interrupt an in-flight Provider request, or create a Task activity card.
+The next normal Provider request consumes pending messages and receives their explicit source context.
+
 Runtime, Turn, Tool, approval, context, workspace, and configuration notifications are transactional and redacted. `assistant/model-step-committed` publishes durable progress text, optional public reasoning summary, model round, usage, and ordered Tool calls. Each Tool call contains only a strict `ToolPresentation`; raw arguments and byte-count placeholders are invalid.
 
 Request-level Usage has one shape across `assistant/model-step-committed`, `assistantSettlement`, `turn/terminal`,
@@ -47,4 +53,4 @@ Consumers must apply the event atomically so a queue row cannot coexist with its
 
 Task Threads publish exactly three additional notifications. `task/activity` is the durable ordered fact used by the parent Timeline and overview. Its envelope, activity and embedded Task summary name the same root/task identity and revision; the activity sequence and safe summary equal the embedded projection's latest values. `task/mailbox-changed` is a durable low-frequency invalidation carrying a positive latest mailbox sequence and unread count. `task/progress` is emitted only for an active connection-scoped `task/observe` handle in the current sidecar generation, may be coalesced by task identity, and never substitutes for approval, error, mailbox, or terminal activity. Reload, disconnect, stop and shutdown revoke local observation routing and compensate server handles. A renderer that detects a revision gap discards progress and reloads `task/read`.
 
-Goal publishes exactly three notifications, each carrying `goalId`, `goalRevision`, durable `eventSequence`, runtime generation and occurrence time. `goal/changed` carries the complete authoritative Goal projection, including its nullable Plan link. `goal/activity` carries one bounded `run | step | evaluation | recovery` activity with required nullable `stepId`. `goal/input-requested` carries the complete durable input request. Consumers reject gaps or regressions and reload `goal/read`; events never replace persisted state, create a Plan link, or grant approval. Independent Plan mutations return authoritative command results and are not inferred from Goal notifications.
+Goal 发布 `goal/changed` 与 `goal/activity`，仍携带自己的身份、revision 与持久序列。Plan 通过 `plan/changed` 发布独立状态及 `progress`（当前步骤、必要步骤总数与完成数），不携带完整计划正文或证据。公共 `interaction/changed` 仅携带 Thread、请求、revision、事件序列和变化类型；客户端注册观察后读取快照对账，草稿和答案不在事件中广播。缺口、重连与迟到事件通过权威 read 和单调水位修复，事件本身不批准或启动执行。

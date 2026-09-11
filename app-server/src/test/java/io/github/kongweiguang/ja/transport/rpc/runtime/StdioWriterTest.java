@@ -25,6 +25,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证唯一 stdout 写入所有者同时强制帧大小与控制队列上限。 */
 final class StdioWriterTest {
+    /** 已协商的来源消息通知必须能真正写出 stdout，不能只通过 mapper/schema 的静态校验。 */
+    @Test
+    void flushesNegotiatedThreadMessagesNotification() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024)) {
+            writer.notification("turn/messages_received", mapper.createObjectNode()
+                    .put("threadId", "thr_target").put("turnId", "turn_target")).join();
+        }
+        assertEquals("turn/messages_received", mapper.readTree(output.toByteArray()).path("method").asText());
+    }
+
     /** 错误 Wire 必须包含完整 typed data、每实例唯一 ID，并仅在显式退避时输出正整数。 */
     @Test
     void writesStrictTypedErrorData() throws Exception {

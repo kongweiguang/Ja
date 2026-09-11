@@ -15,6 +15,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.recovery.StartupRecoveryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisCheckpointStore;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisConversationRepository;
+import io.github.kongweiguang.ja.conversation.domain.SubagentPolicy;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -86,7 +87,8 @@ final class SolonPersistenceCompositionTest {
             MybatisConversationRepository store = new SolonPersistenceComposition(() -> {
                 throw new AssertionError("AOT must not query the runtime MyBatis registry");
             })
-                    .agentStore(null, new ObjectMapper(), new RuntimeResourceLifecycle());
+                    .agentStore(null, new ObjectMapper(), new RuntimeResourceLifecycle(),
+                            SubagentPolicy::defaultPolicy);
             assertNotNull(store);
         } finally {
             if (previousAot == null) System.clearProperty("solon.aot.processing");

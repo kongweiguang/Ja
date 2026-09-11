@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.support.Model
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
@@ -374,6 +375,88 @@ final class OpenAiChatCompletionsAdapterTest {
             assertEquals(1, server.calls());
             assertEquals("Bearer " + "deepseek-secret", authorization.get());
         }
+    }
+
+    /** Chat 兼容字段为空时继续探测后续别名，并在同一 delta 只展示一个 reasoning 来源。 */
+    @Test
+    void selectsFirstNonEmptyReasoningAliasAndPreservesItsWireField() throws Exception {
+        String stream = chunk(
+                "[{\"index\":0,\"delta\":{"
+                        + "\"reasoning_content\":\"\",\"reasoning\":\"plan\","
+                        + "\"reasoning_text\":\"duplicate\"},\"finish_reason\":\"stop\"}]", null)
+                + "data: [DONE]\n\n";
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 3))) {
+            ModelPort.ModelConfiguration configuration = configuration(server);
+            try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(configuration)) {
+                adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
+                            events.add(event);
+                            return CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
+            }
+        }
+        assertEquals(2, events.size());
+        assertEquals("plan", assertInstanceOf(ModelPort.ReasoningSummaryDelta.class, events.get(0)).text());
+        ReasoningContent content = assertInstanceOf(ModelPort.ReasoningBlockReady.class, events.get(1))
+                .content();
+        assertEquals("reasoning", content.wireField());
+        assertEquals("plan", AbstractStreamingModelAdapter.JSON.readTree(content.nativeJson())
+                .path("reasoning").textValue());
+        assertFalse(content.nativeJson().contains("duplicate"));
+    }
+
+    /** 即使本轮没有普通正文，Chat reasoning 也必须形成完整历史块，供下一轮原生回传。 */
+    @Test
+    void persistsReasoningOnlyChatTurnWithoutAssistantText() throws Exception {
+        String stream = chunk(
+                "[{\"index\":0,\"delta\":{\"reasoning_content\":\"inspect files\"},"
+                        + "\"finish_reason\":\"stop\"}]", null)
+                + "data: [DONE]\n\n";
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 5))) {
+            ModelPort.ModelConfiguration configuration = configuration(server);
+            try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(configuration)) {
+                adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
+                            events.add(event);
+                            return CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
+            }
+        }
+        assertEquals(1, events.stream().filter(ModelPort.ReasoningSummaryDelta.class::isInstance).count());
+        ReasoningContent content = assertInstanceOf(ModelPort.ReasoningBlockReady.class,
+                events.stream().filter(ModelPort.ReasoningBlockReady.class::isInstance)
+                        .findFirst().orElseThrow()).content();
+        assertEquals("reasoning_content", content.wireField());
+        assertEquals("inspect files", AbstractStreamingModelAdapter.JSON.readTree(content.nativeJson())
+                .path("reasoning_content").textValue());
+    }
+
+    /** Chat 下一轮按当前配置恢复原始 reasoning 字段，不把历史 opaque 内容改写成普通文本。 */
+    @Test
+    void replaysMatchingChatReasoningFieldInAssistantHistory() throws Exception {
+        ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                java.net.URI.create("http://127.0.0.1:9"),
+                ModelPort.Api.OPENAI_CHAT_COMPLETIONS, Duration.ofSeconds(1));
+        ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+        ReasoningContent reasoning = new ReasoningContent(
+                configuration.providerId(), configuration.modelId(), "openai_chat_completions",
+                configuration.model(), ReasoningContent.endpointFingerprint(configuration.baseUri()),
+                "reasoning_content", "{\"reasoning_content\":\"prior plan\"}");
+        ModelPort.ModelRequest next = new ModelPort.ModelRequest(
+                configuration, base.prompt(), List.of(base.messages().getFirst(),
+                new ModelMessage(ModelRole.ASSISTANT, List.of(reasoning,
+                        new io.github.kongweiguang.ja.conversation.domain.model.TextContent("answer")))),
+                List.of(), null, 2);
+
+        var assistant = OpenAiChatCompletionsCodec.encodeRequest(next).path("messages").path(2);
+        assertEquals("prior plan", assistant.path("reasoning_content").textValue());
+        assertEquals("answer", assistant.path("content").textValue());
+        assertFalse(assistant.has("reasoning"));
+        assertFalse(assistant.has("reasoning_text"));
     }
 
     /** 通过最小 loopback 请求复用统一异步执行与错误解包。 */

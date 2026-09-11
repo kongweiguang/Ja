@@ -53,6 +53,7 @@ type ModelStepCommittedEvent = Extract<
 type ToolStartedEvent = Extract<ThreadSemanticEvent, { method: "tool/started" }>;
 type ToolBatchCommittedEvent = Extract<ThreadSemanticEvent, { method: "tool/batch-committed" }>;
 type InputConsumedEvent = Extract<ThreadSemanticEvent, { method: "turn/input-consumed" }>;
+type MessagesReceivedEvent = Extract<ThreadSemanticEvent, { method: "turn/messages_received" }>;
 type InputQueueChangedEvent = Extract<TimelineEvent, { method: "turn/input-queue-changed" }>;
 
 const EVENT_DEDUP_WINDOW = 1024;
@@ -161,6 +162,19 @@ export interface AcceptedTurnProjection {
   submittedAt: string;
 }
 
+/**
+ * 一个 live stream segment 只覆盖相邻且同语义的 delta；跨 reasoning/text 切换必须保留为新段，
+ * 否则 Renderer 会在收到下一种 delta 时覆盖已经展示过的公开推理或回复。segmentStartSeq
+ * 只作为 Renderer 的瞬态 identity，不进入 JA-RPC 或持久化协议。
+ */
+export interface TimelineDraftProjection {
+  kind: "assistant" | "reasoning";
+  text: string;
+  streamSeq: number;
+  segmentStartSeq: number;
+  occurredAt?: string;
+}
+
 /** Zustand 只保存这份状态；Draft 与 Stream Cursor 明确属于瞬态。 */
 export interface TimelineState {
   handshake: HostProjection;
@@ -183,8 +197,8 @@ export interface TimelineState {
   inputQueueByTurn: Record<string, InputQueue>;
   threadRevisionByThread: Record<string, number>;
   streamSeqByTurn: Record<string, number>;
-  /** 未提交的 Assistant/Reasoning 文本；发生重连或 Gap 时必须丢弃。 */
-  draftByTurn: Record<string, { kind: "assistant" | "reasoning"; text: string; streamSeq: number }>;
+  /** 未提交的 Assistant/Reasoning segments；发生重连或 Gap 时必须整体丢弃。 */
+  draftByTurn: Record<string, readonly TimelineDraftProjection[]>;
   seenEventIds: Record<string, true>;
   seenEventOrder: string[];
   resyncRequired: Record<string, ResyncReason>;
@@ -483,7 +497,7 @@ function isTerminalToolPresentation(presentation: ToolPresentation): boolean {
 function projectSnapshotItem(
   item: TimelineSnapshotItem,
   threadId: string,
-  failureReply: boolean,
+  failureReply = false,
 ): TimelineItemAdapter {
   const base = {
     itemId: item.itemId,
@@ -501,6 +515,14 @@ function projectSnapshotItem(
         contextReferences: contextReferencesFromUserContent(item.content),
         attachments: item.attachments,
       };
+    case "thread_message":
+      return {
+        ...base,
+        kind: "thread_message",
+        text: item.content,
+        sourceThreadId: item.sourceThreadId,
+        sourceTitle: item.sourceTitle,
+      };
     case "assistant_progress":
       return {
         ...base,
@@ -512,7 +534,7 @@ function projectSnapshotItem(
     case "reasoning_summary":
       return {
         ...base,
-        kind: "commentary",
+        kind: "reasoning",
         text: item.text,
         title: "思考摘要",
         metadata: { phase: "reasoning_summary", modelRound: item.modelRound },
@@ -1042,6 +1064,27 @@ function applyModelStepCommitted(
     if (recorded === undefined) return undefined;
     next = recorded;
   }
+  // Snapshot 的稳定语义排序把同一模型提交的公开 reasoning 放在正文前；live 也按该顺序插入，
+  // 这样刷新前后的 itemIdsByThread 不会因持久化排序规则而跳变。没有公共 segment DTO 时，
+  // 这里只保证常见的 reasoning -> text -> tool 提交顺序，不推断更细粒度的 Provider 交错位置。
+  if (params.reasoningSummary?.trim()) {
+    next = putItem(
+      next,
+      projectItem(
+        next,
+        `${params.messageId}_reasoning`,
+        params.threadId,
+        params.turnId,
+        "reasoning",
+        "completed",
+        params.reasoningSummary,
+        {
+          title: "思考摘要",
+          metadata: { phase: "reasoning_summary", modelRound: params.modelRound },
+        },
+      ),
+    );
+  }
   if (params.text.trim() !== "") {
     next = putItem(
       next,
@@ -1060,24 +1103,6 @@ function applyModelStepCommitted(
             modelRound: params.modelRound,
             ...usageMetadata(params.usage),
           },
-        },
-      ),
-    );
-  }
-  if (params.reasoningSummary?.trim()) {
-    next = putItem(
-      next,
-      projectItem(
-        next,
-        `${params.messageId}_reasoning`,
-        params.threadId,
-        params.turnId,
-        "commentary",
-        "completed",
-        params.reasoningSummary,
-        {
-          title: "思考摘要",
-          metadata: { phase: "reasoning_summary", modelRound: params.modelRound },
         },
       ),
     );
@@ -1366,7 +1391,7 @@ function applyInputConsumed(
         itemId: `${settlement.messageId}_reasoning`,
         threadId: params.threadId,
         turnId: params.turnId,
-        kind: "commentary",
+        kind: "reasoning",
         status: "completed",
         text: settlement.reasoningSummary,
         title: "思考摘要",
@@ -1405,6 +1430,28 @@ function applyInputConsumed(
   return merged.lastOutcome === "invalid" || merged.lastOutcome === "resync_required"
     ? undefined
     : merged;
+}
+
+/**
+ * 将 Mailbox 消费事件中的每条消息直接投影为独立 Timeline item；它不创建用户输入、活动或
+ * 额外状态卡片。事件 identity 负责幂等，item identity 再做一次冲突校验，防止不同事件覆盖
+ * 已提交正文。
+ */
+function applyMessagesReceived(
+  state: TimelineState,
+  event: MessagesReceivedEvent,
+): TimelineState | undefined {
+  const params = event.params;
+  const turn = state.turns[params.turnId];
+  if (turn === undefined || isTerminalState(turn.status)) return undefined;
+  const itemIds = new Set<string>();
+  let next = state;
+  for (const item of params.items) {
+    if (itemIds.has(item.itemId) || next.items[item.itemId] !== undefined) return undefined;
+    itemIds.add(item.itemId);
+    next = putItem(next, projectSnapshotItem(item, params.threadId));
+  }
+  return next;
 }
 
 /** 应用持久事件；终态保留已确认回答，并通过一次权威快照补齐未随 terminal 发送的最终轮摘要。 */
@@ -1467,6 +1514,12 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
     }
     case "turn/input-consumed": {
       const projected = applyInputConsumed(next, event);
+      if (projected === undefined) return resync(state, event.params.threadId, "invalid_event");
+      next = projected;
+      break;
+    }
+    case "turn/messages_received": {
+      const projected = applyMessagesReceived(next, event);
       if (projected === undefined) return resync(state, event.params.threadId, "invalid_event");
       next = projected;
       break;
@@ -1711,13 +1764,17 @@ function closePendingApprovals(
   return { ...state, approvalsById };
 }
 
-/** 应用仅 Stream 的 Assistant/Reasoning Delta，并在 Gap 时丢弃 Draft。 */
+/**
+ * 应用仅 Stream 的 Assistant/Reasoning Delta，并按连续语义保存 segment；Gap 时整体丢弃 Draft。
+ * streamSeq 是 Turn 内全局顺序，因此跨语义切换仍能保留 reasoning 与 text 的真实交错关系。
+ */
 function applyDelta(
   state: TimelineState,
   turnId: string,
   streamSeq: number,
   text: string,
   kind: "assistant" | "reasoning",
+  occurredAt: string,
 ): TimelineState {
   const turn = turnForStream(state, turnId);
   if (turn === undefined || isTerminalState(turn.status))
@@ -1725,16 +1782,34 @@ function applyDelta(
   const previous = state.streamSeqByTurn[turnId] ?? 0;
   if (streamSeq <= previous) return outcome(state, "duplicate");
   if (streamSeq !== previous + 1) return resync(state, turn.threadId, "gap", "gap");
-  const prior = state.draftByTurn[turnId];
-  const draft =
+  const priorSegments = state.draftByTurn[turnId] ?? [];
+  const prior = priorSegments.at(-1);
+  const segments =
     prior === undefined || prior.kind !== kind
-      ? { kind, text, streamSeq }
-      : { kind, text: prior.text + text, streamSeq };
+      ? [
+          ...priorSegments,
+          {
+            kind,
+            text,
+            streamSeq,
+            segmentStartSeq: streamSeq,
+            occurredAt,
+          },
+        ]
+      : [
+          ...priorSegments.slice(0, -1),
+          {
+            ...prior,
+            text: prior.text + text,
+            streamSeq,
+            occurredAt: prior.occurredAt ?? occurredAt,
+          },
+        ];
   return outcome(
     {
       ...state,
       streamSeqByTurn: { ...state.streamSeqByTurn, [turnId]: streamSeq },
-      draftByTurn: { ...state.draftByTurn, [turnId]: draft },
+      draftByTurn: { ...state.draftByTurn, [turnId]: segments },
     },
     "applied",
   );
@@ -1755,6 +1830,7 @@ export function applyLiveEvent(state: TimelineState, event: TimelineEvent): Time
       event.params.streamSeq,
       event.params.text,
       event.method === "assistant/text-delta" ? "assistant" : "reasoning",
+      event.params.occurredAt,
     );
   if (state.seenEventIds[event.params.eventId] === true) return outcome(state, "duplicate");
   if (event.method === "turn/input-queue-changed") return applyInputQueueChanged(state, event);

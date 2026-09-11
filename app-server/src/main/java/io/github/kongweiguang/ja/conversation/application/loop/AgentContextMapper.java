@@ -6,23 +6,28 @@ package io.github.kongweiguang.ja.conversation.application.loop;
 import io.github.kongweiguang.ja.conversation.application.context.ContextMessage;
 import io.github.kongweiguang.ja.conversation.application.context.ContextOrchestrator;
 import io.github.kongweiguang.ja.conversation.application.context.ModelContinuation;
+import io.github.kongweiguang.ja.conversation.application.discovery.McpToolExposure;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
 import io.github.kongweiguang.ja.conversation.domain.model.SkillReferenceContent;
 import io.github.kongweiguang.ja.conversation.domain.model.WorkspaceReferenceContent;
 import io.github.kongweiguang.ja.conversation.domain.prompt.AgentPromptSnapshot;
-import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
+import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
+import io.github.kongweiguang.ja.foundation.json.JsonValue;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -30,11 +35,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * 在持久化消息、上下文预算模型与 Provider 请求之间转换，避免 Wire 或存储表示进入 Agent Loop。
  */
 final class AgentContextMapper {
+    private static final int MAX_CROSS_PROVIDER_REASONING = 1_048_576;
     private final JsonValueCodec argumentsCodec;
 
     /**
@@ -99,13 +107,14 @@ final class AgentContextMapper {
 
     /**
      * 把动态 System snapshot 与预算裁剪后的持久上下文组装成不可变 Provider 请求；summary
-     * 已由 Prompt Session 放入 System，禁止再次生成普通 Message。
+     * 已由 Prompt Session 放入 System，禁止再次生成普通 Message。工具声明从同一份保留历史派生，
+     * 因而压缩估算、实际发送和重启恢复不会分别维护容易失步的 MCP 激活集合。
      */
     ModelPort.ModelRequest toModelRequest(
             ContextOrchestrator.PreparedPrompt prompt,
             ModelPort.ModelConfiguration configuration,
             AgentPromptSnapshot snapshot,
-            List<ToolSpec> tools,
+            List<AgentTool> tools,
             ModelPort.Continuation continuation,
             int round,
             String threadId,
@@ -117,10 +126,16 @@ final class AgentContextMapper {
                 configuration,
                 new ModelPort.PromptPayload(snapshot.systemPrompt(), snapshot.revision()),
                 prompt.messages().stream().map(message -> toModelMessage(message, configuration,
-                        threadId, attachments, nativeSupport, nativeBudget)).toList(),
-                tools,
+                        threadId, attachments, nativeSupport, nativeBudget))
+                        .filter(Objects::nonNull).toList(),
+                McpToolExposure.modelTools(tools, prompt.messages(), argumentsCodec),
                 continuation,
                 round);
+    }
+
+    /** 本地搜索与完整执行目录一起建立，模型暴露筛选不能移除真实调用的权限与路由检查。 */
+    List<AgentTool> toolCatalog(List<AgentTool> tools) {
+        return McpToolExposure.catalog(tools, argumentsCodec);
     }
 
     /**
@@ -147,6 +162,10 @@ final class AgentContextMapper {
             } else if (content instanceof TextContent text) {
                 blocks.add(new ContextMessage.TextBlock(text.text()));
                 characters = Math.addExact(characters, text.text().length());
+            } else if (content instanceof ReasoningContent reasoning) {
+                /* opaque 原文参与同身份请求的预算，但不进入摘要文本或普通日志。 */
+                blocks.add(new ContextMessage.ReasoningBlock(reasoning));
+                characters = Math.addExact(characters, reasoning.nativeJson().length());
             } else if (content instanceof WorkspaceReferenceContent reference) {
                 String manifest = workspaceReferenceManifest(reference);
                 blocks.add(new ContextMessage.TextBlock(manifest));
@@ -197,6 +216,7 @@ final class AgentContextMapper {
             ModelPort.NativeAttachmentSupport nativeSupport,
             NativeAttachmentBudget nativeBudget) {
         List<ModelContent> blocks = new ArrayList<>();
+        String endpointFingerprint = ReasoningContent.endpointFingerprint(configuration.baseUri());
         for (ContextMessage.Block block : message.blocks()) {
             if (block instanceof ContextMessage.TextBlock text) {
                 blocks.add(new TextContent(text.value()));
@@ -208,9 +228,82 @@ final class AgentContextMapper {
             } else if (block instanceof ContextMessage.ToolResultBlock result) {
                 blocks.add(new ToolResultContent(result.callId(), result.output().content(),
                         result.output().error() != null));
+            } else if (block instanceof ContextMessage.ReasoningBlock reasoning) {
+                if (reasoning.content().matches(configuration.providerId(), configuration.modelId(),
+                        configuration.api().name().toLowerCase(Locale.ROOT), configuration.model(),
+                        endpointFingerprint)) {
+                    blocks.add(reasoning.content());
+                } else {
+                    /*
+                     * Provider 签名/encrypted_content 只能同身份回放；跨身份仍保留 Provider 明确公开的
+                     * thinking/summary 文本，避免切换模型时上下文出现静默断层。解码失败或 redacted
+                     * 块没有公开文本时安全丢弃，绝不把 opaque JSON 当普通提示词发送。
+                     */
+                    String publicReasoning = crossProviderReasoningText(reasoning.content());
+                    if (publicReasoning != null) blocks.add(new TextContent(publicReasoning));
+                }
             }
         }
-        return new ModelMessage(modelRole(message.role()), blocks);
+        /* 模型或端点切换时丢弃不匹配的 opaque 块，绝不把签名材料发送给新身份。 */
+        return blocks.isEmpty() ? null : new ModelMessage(modelRole(message.role()), blocks);
+    }
+
+    /**
+     * 从 Provider 原生块提取已经公开给调用方的 thinking/summary 文本，供跨身份 assistant 历史降级。
+     * 该路径只读取明确的文本字段和 Responses summary_text，永远不读取 signature、data 或
+     * encrypted_content；异常按“没有可安全降级的文本”处理，避免损坏历史扩大为请求失败。
+     */
+    private String crossProviderReasoningText(ReasoningContent reasoning) {
+        try {
+            JsonValue decoded = argumentsCodec.decode(reasoning.nativeJson());
+            if (!(decoded instanceof JsonObject object)) return null;
+            String direct = directReasoningText(object, reasoning.wireField());
+            if (!direct.isBlank()) return boundCrossProviderReasoning(direct);
+            String summary = responsesSummaryText(object.get("summary"));
+            return summary.isBlank() ? null : boundCrossProviderReasoning(summary);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 只接受协议中可公开展示的文本字段；redacted_thinking/data 等 opaque 字段不进入降级路径。
+     */
+    private static String directReasoningText(JsonObject object, String wireField) {
+        if (!Set.of("thinking", "reasoning_content", "reasoning", "reasoning_text").contains(wireField)) {
+            return "";
+        }
+        JsonValue value = object.get(wireField);
+        return value instanceof JsonText text ? text.value() : "";
+    }
+
+    /**
+     * Responses 的公开摘要由多个 summary_text part 组成，按 Provider 顺序用空行恢复段落边界。
+     */
+    private static String responsesSummaryText(JsonValue value) {
+        if (!(value instanceof JsonArray summary)) return "";
+        StringBuilder result = new StringBuilder();
+        for (JsonValue member : summary.values()) {
+            if (!(member instanceof JsonObject part)
+                    || !(part.get("type") instanceof JsonText type)
+                    || !"summary_text".equals(type.value())) {
+                continue;
+            }
+            if (!(part.get("text") instanceof JsonText text) || text.value().isEmpty()) continue;
+            if (!result.isEmpty()) result.append("\n\n");
+            result.append(text.value());
+        }
+        return result.toString();
+    }
+
+    /**
+     * 跨身份文本复用与 Timeline 摘要相同的 1 MiB 上限，并避免在 UTF-16 surrogate 中间截断。
+     */
+    private static String boundCrossProviderReasoning(String value) {
+        if (value.length() <= MAX_CROSS_PROVIDER_REASONING) return value;
+        int end = MAX_CROSS_PROVIDER_REASONING;
+        if (Character.isHighSurrogate(value.charAt(end - 1))) end--;
+        return value.substring(0, end);
     }
 
     /**

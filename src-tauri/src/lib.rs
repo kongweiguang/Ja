@@ -27,11 +27,13 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_runtime_task_followup,
         crate::app_runtime::ja_runtime_task_cancel,
         crate::app_runtime::ja_runtime_task_tree_delete,
+        crate::app_runtime::ja_runtime_task_close,
         crate::app_runtime::ja_runtime_goal_read,
         crate::app_runtime::ja_runtime_goal_events_read,
         crate::app_runtime::ja_runtime_goal_observe,
         crate::app_runtime::ja_runtime_goal_unobserve,
         crate::app_runtime::ja_runtime_plan_read,
+        crate::app_runtime::ja_runtime_plan_current_read,
         crate::app_runtime::ja_runtime_plan_revisions_list,
         crate::app_runtime::ja_runtime_goal_evidence_list,
         crate::app_runtime::ja_runtime_goal_create,
@@ -40,13 +42,24 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_runtime_goal_pause,
         crate::app_runtime::ja_runtime_goal_resume,
         crate::app_runtime::ja_runtime_goal_stop,
-        crate::app_runtime::ja_runtime_goal_input_respond,
+        crate::app_runtime::ja_runtime_interaction_read,
+        crate::app_runtime::ja_runtime_interaction_observe,
+        crate::app_runtime::ja_runtime_interaction_unobserve,
+        crate::app_runtime::ja_runtime_interaction_draft_save,
+        crate::app_runtime::ja_runtime_interaction_respond,
+        crate::app_runtime::ja_runtime_interaction_cancel,
         crate::app_runtime::ja_runtime_plan_create,
         crate::app_runtime::ja_runtime_plan_draft_save,
         crate::app_runtime::ja_runtime_plan_draft_discard,
         crate::app_runtime::ja_runtime_plan_propose,
-        crate::app_runtime::ja_runtime_plan_approve,
         crate::app_runtime::ja_runtime_plan_execute,
+        crate::app_runtime::ja_runtime_plan_observe,
+        crate::app_runtime::ja_runtime_plan_unobserve,
+        crate::app_runtime::ja_runtime_plan_events_read,
+        crate::app_runtime::ja_runtime_plan_evidence_list,
+        crate::app_runtime::ja_runtime_plan_pause,
+        crate::app_runtime::ja_runtime_plan_resume,
+        crate::app_runtime::ja_runtime_plan_stop,
         crate::app_runtime::ja_runtime_plan_reject,
         crate::app_runtime::ja_approval_respond,
         crate::app_runtime::ja_turn_start,
@@ -65,6 +78,7 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_credential_delete,
         crate::app_runtime::ja_workspace_list,
         crate::app_runtime::ja_thread_create,
+        crate::app_runtime::ja_thread_discover,
         crate::app_runtime::ja_thread_list,
         crate::app_runtime::ja_thread_search,
         crate::app_runtime::ja_thread_read,
@@ -538,6 +552,19 @@ pub fn run() {
         let home = HomeLayout::new().map_err(|error| {
             tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
         })?;
+        #[cfg(desktop)]
+        {
+            let preferences_path =
+                app_runtime::interface::desktop_preferences::DesktopPreferences::file_path(
+                    home.paths().root(),
+                );
+            // HomeLayout 是 Ja 唯一目录 owner；先完成隔离 root 初始化，再注册 CloseRequested。
+            app.manage(
+                app_runtime::interface::desktop_preferences::DesktopPreferences::load(
+                    preferences_path,
+                ),
+            );
+        }
         // 原生日志与 runtime 数据共用已验证的 Ja home，同时让隔离 Windows profile
         // 不依赖 shell Known Folder 注册状态。
         let tracing_guard = diagnostics::initialize_native_tracing(home.paths().logs_dir())
@@ -640,6 +667,8 @@ pub fn run() {
             crate::app_runtime::interface::app_tray::ja_app_exit_listener_unready,
             crate::app_runtime::interface::app_tray::ja_app_exit_commit,
             crate::app_runtime::interface::app_tray::ja_app_exit_cancel,
+            crate::app_runtime::interface::desktop_preferences::ja_desktop_close_behavior_read,
+            crate::app_runtime::interface::desktop_preferences::ja_desktop_close_behavior_save,
             crate::workspace::interface::watch::ja_workspace_watch_start,
             crate::workspace::interface::watch::ja_workspace_watch_rescan,
             crate::workspace::interface::watch::ja_workspace_watch_stop,

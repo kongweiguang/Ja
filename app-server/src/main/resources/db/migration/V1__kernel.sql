@@ -146,14 +146,18 @@ CREATE TABLE timeline_messages (
     thread_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
     message_kind TEXT NOT NULL CHECK (message_kind IN (
-        'USER_INPUT','ASSISTANT_PROGRESS','REASONING_SUMMARY','FINAL_ANSWER'
+        'USER_INPUT','THREAD_MESSAGE','ASSISTANT_PROGRESS','REASONING_SUMMARY','FINAL_ANSWER'
     )),
     public_text TEXT NOT NULL,
     model_round INTEGER CHECK (model_round BETWEEN 1 AND 128),
     created_at TEXT NOT NULL,
+    source_thread_id TEXT,
+    source_title TEXT,
     FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
     FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT,
-    CHECK ((message_kind IN ('ASSISTANT_PROGRESS','REASONING_SUMMARY')) = (model_round IS NOT NULL))
+    CHECK ((message_kind IN ('ASSISTANT_PROGRESS','REASONING_SUMMARY')) = (model_round IS NOT NULL)),
+    CHECK ((message_kind='THREAD_MESSAGE') = (source_thread_id IS NOT NULL AND source_title IS NOT NULL)),
+    CHECK (message_kind!='THREAD_MESSAGE' OR length(source_title) BETWEEN 1 AND 512)
 );
 
 CREATE TABLE approvals (
@@ -235,8 +239,9 @@ CREATE TABLE task_context_seeds (
     parent_turn_id TEXT,
     parent_revision INTEGER NOT NULL CHECK (parent_revision >= 0),
     inheritance_mode TEXT NOT NULL CHECK (inheritance_mode IN ('EFFECTIVE_CONTEXT','BRIEF_ONLY')),
-    task_brief_json TEXT NOT NULL CHECK (
+    task_brief_json TEXT CHECK (
         json_valid(task_brief_json) AND json_type(task_brief_json)='array'
+        OR task_brief_json IS NULL
     ),
     effective_context_json TEXT CHECK (
         effective_context_json IS NULL OR
@@ -275,8 +280,18 @@ CREATE TABLE thread_lineage (
     FOREIGN KEY (context_seed_id) REFERENCES task_context_seeds(context_seed_id) ON DELETE RESTRICT,
     CHECK (child_thread_id<>parent_thread_id AND child_thread_id<>root_thread_id),
     CHECK ((task_kind='SIDE_TASK' AND lifecycle='INDEPENDENT') OR
-           (task_kind='SUBAGENT' AND lifecycle='ATTACHED')),
-    UNIQUE (parent_thread_id, task_name)
+           (task_kind='SUBAGENT' AND lifecycle='ATTACHED'))
+);
+
+-- 用户侧边会话以 Thread ID 区分，默认同名合法；模型派发的子智能体仍维持兄弟名称唯一。
+CREATE UNIQUE INDEX ux_thread_lineage_agent_name
+    ON thread_lineage(parent_thread_id,task_name) WHERE task_kind='SUBAGENT';
+
+-- 只有新临时侧聊登记此标记；旧持久侧任务不因启动恢复而被推断成可删除数据。
+CREATE TABLE temporary_side_chats (
+    thread_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('OPEN','CLOSING')),
+    FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
 );
 
 CREATE TABLE task_mailbox (
@@ -284,6 +299,7 @@ CREATE TABLE task_mailbox (
     message_id TEXT UNIQUE NOT NULL,
     root_thread_id TEXT NOT NULL,
     sender_thread_id TEXT NOT NULL,
+    sender_title TEXT NOT NULL,
     target_thread_id TEXT NOT NULL,
     causal_turn_id TEXT,
     kind TEXT NOT NULL CHECK (kind IN ('MESSAGE','FOLLOW_UP','FINAL_ANSWER')),
@@ -297,12 +313,10 @@ CREATE TABLE task_mailbox (
     updated_at TEXT NOT NULL,
     consumed_at TEXT,
     FOREIGN KEY (root_thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
-    FOREIGN KEY (sender_thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
     FOREIGN KEY (target_thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
-    FOREIGN KEY (causal_turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT,
     FOREIGN KEY (bound_turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT,
     UNIQUE (sender_thread_id, idempotency_key),
-    CHECK (sender_thread_id<>target_thread_id),
+    CHECK (kind='FOLLOW_UP' OR sender_thread_id<>target_thread_id),
     CHECK ((state='BOUND') = (bound_turn_id IS NOT NULL AND consumed_at IS NULL)),
     CHECK ((state='CONSUMED') = (consumed_at IS NOT NULL)),
     CHECK (state!='PENDING' OR (bound_turn_id IS NULL AND consumed_at IS NULL)),
@@ -317,7 +331,7 @@ CREATE TABLE task_activities (
     actor_thread_id TEXT NOT NULL,
     causal_turn_id TEXT,
     kind TEXT NOT NULL CHECK (kind IN (
-        'DISPATCHED','MESSAGE_SENT','FOLLOW_UP_QUEUED','PROGRESS','WAITING_APPROVAL',
+        'CREATED','DISPATCHED','MESSAGE_SENT','FOLLOW_UP_QUEUED','PROGRESS','WAITING_APPROVAL',
         'RESUMED','COMPLETED','FAILED','CANCELLED','SUSPENDED'
     )),
     summary_json TEXT NOT NULL CHECK (
@@ -335,7 +349,7 @@ CREATE TABLE task_projections (
     root_thread_id TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
     state TEXT NOT NULL CHECK (state IN (
-        'QUEUED','RUNNING','WAITING_APPROVAL','SUSPENDED','COMPLETED','FAILED','CANCELLED'
+        'IDLE','QUEUED','RUNNING','WAITING_APPROVAL','SUSPENDED','COMPLETED','FAILED','CANCELLED'
     )),
     latest_activity_sequence INTEGER NOT NULL CHECK (latest_activity_sequence > 0),
     last_seen_activity_sequence INTEGER CHECK (
@@ -591,7 +605,7 @@ CREATE TABLE plans (
     owner_thread_id TEXT NOT NULL,
     objective TEXT NOT NULL CHECK (length(objective) BETWEEN 1 AND 32768),
     create_idempotency_key TEXT NOT NULL CHECK (length(create_idempotency_key) BETWEEN 8 AND 128),
-    status TEXT NOT NULL CHECK (status IN ('DRAFT','AWAITING_APPROVAL','APPROVED','EXECUTING','COMPLETED','STOPPED')),
+    status TEXT NOT NULL CHECK (status IN ('DRAFT','AWAITING_APPROVAL','APPROVED','EXECUTING','VERIFYING','PAUSED','COMPLETED','STOPPED')),
     revision INTEGER NOT NULL CHECK (revision>=0),
     active_plan_revision_id TEXT,
     active_run_id TEXT,
@@ -600,11 +614,84 @@ CREATE TABLE plans (
     FOREIGN KEY (owner_thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
     FOREIGN KEY (active_plan_revision_id) REFERENCES plan_revisions(plan_revision_id) DEFERRABLE INITIALLY DEFERRED,
     FOREIGN KEY (active_run_id) REFERENCES execution_runs(run_id) DEFERRABLE INITIALLY DEFERRED,
-    CHECK (status NOT IN ('APPROVED','EXECUTING','COMPLETED') OR active_plan_revision_id IS NOT NULL),
-    CHECK (status NOT IN ('EXECUTING','COMPLETED') OR active_run_id IS NOT NULL),
+    CHECK (status NOT IN ('APPROVED','EXECUTING','VERIFYING','PAUSED','COMPLETED') OR active_plan_revision_id IS NOT NULL),
+    CHECK (status NOT IN ('EXECUTING','VERIFYING','PAUSED','COMPLETED') OR active_run_id IS NOT NULL),
     CHECK (status NOT IN ('DRAFT','AWAITING_APPROVAL','APPROVED') OR active_run_id IS NULL),
     UNIQUE (owner_thread_id,create_idempotency_key)
 );
+
+-- 问答与 Tool 游标共享 SQLite 权威事务，关闭界面不得删除待回答请求。
+CREATE TABLE interaction_requests (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    plan_revision_id TEXT,
+    run_id TEXT,
+    goal_id TEXT,
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 256),
+    questions_json TEXT NOT NULL CHECK (json_valid(questions_json) AND json_type(questions_json)='array'
+        AND json_array_length(questions_json) BETWEEN 1 AND 3),
+    answers_json TEXT NOT NULL CHECK (json_valid(answers_json) AND json_type(answers_json)='array'
+        AND json_array_length(answers_json)<=3),
+    status TEXT NOT NULL CHECK (status IN ('PENDING','ANSWERED','CANCELLED','SUPERSEDED')),
+    revision INTEGER NOT NULL CHECK (revision>=0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
+    FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT,
+    FOREIGN KEY (plan_revision_id) REFERENCES plan_revisions(plan_revision_id) ON DELETE RESTRICT,
+    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id) ON DELETE RESTRICT,
+    FOREIGN KEY (goal_id) REFERENCES goals(goal_id) ON DELETE RESTRICT,
+    UNIQUE (thread_id,idempotency_key),
+    UNIQUE (turn_id,tool_call_id)
+);
+
+CREATE TABLE interaction_drafts (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    thread_id TEXT NOT NULL,
+    answers_json TEXT NOT NULL CHECK (json_valid(answers_json) AND json_type(answers_json)='array'
+        AND json_array_length(answers_json)<=3),
+    page INTEGER NOT NULL CHECK (page BETWEEN 0 AND 2),
+    collapsed INTEGER NOT NULL CHECK (collapsed IN (0,1)),
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 256),
+    revision INTEGER NOT NULL CHECK (revision>=0),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (request_id) REFERENCES interaction_requests(request_id) ON DELETE RESTRICT,
+    FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE interaction_events (
+    event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    request_revision INTEGER NOT NULL CHECK (request_revision>=0),
+    kind TEXT NOT NULL CHECK (kind IN ('CREATED','DRAFT_CHANGED','ANSWERED','CANCELLED','SUPERSEDED')),
+    occurred_at TEXT NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
+    FOREIGN KEY (request_id) REFERENCES interaction_requests(request_id) ON DELETE RESTRICT
+);
+
+CREATE UNIQUE INDEX uq_interaction_thread_pending ON interaction_requests(thread_id) WHERE status='PENDING';
+CREATE INDEX idx_interaction_events_thread ON interaction_events(thread_id,event_sequence);
+
+-- 问题可关联独立 Plan 或 Goal，但关联必须属于同一真实 Turn owner 与冻结 Run。
+CREATE TRIGGER interaction_request_owner_insert BEFORE INSERT ON interaction_requests
+WHEN NOT EXISTS(SELECT 1 FROM turns t WHERE t.turn_id=NEW.turn_id AND t.thread_id=NEW.thread_id)
+ OR (NEW.run_id IS NOT NULL AND NOT EXISTS(
+    SELECT 1 FROM execution_runs r WHERE r.run_id=NEW.run_id
+      AND r.goal_id IS NEW.goal_id AND r.plan_revision_id IS NEW.plan_revision_id))
+BEGIN SELECT RAISE(ABORT,'Interaction owner is invalid'); END;
+
+CREATE TRIGGER interaction_draft_owner_insert BEFORE INSERT ON interaction_drafts
+WHEN NOT EXISTS(SELECT 1 FROM interaction_requests r
+    WHERE r.request_id=NEW.request_id AND r.thread_id=NEW.thread_id)
+BEGIN SELECT RAISE(ABORT,'Interaction draft owner is invalid'); END;
+
+CREATE TRIGGER interaction_request_identity_update
+BEFORE UPDATE OF request_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,goal_id,questions_json,created_at
+ON interaction_requests
+BEGIN SELECT RAISE(ABORT,'Interaction identity is immutable'); END;
 
 CREATE TABLE plan_drafts (
     plan_draft_id TEXT PRIMARY KEY NOT NULL,
@@ -675,6 +762,15 @@ CREATE TABLE execution_runs (
     plan_hash TEXT,
     status TEXT NOT NULL CHECK (status IN ('PREPARED','RUNNING','VERIFYING','PAUSED','COMPLETED','STOPPED')),
     process_generation INTEGER NOT NULL CHECK (process_generation>=1),
+    turn_budget INTEGER NOT NULL DEFAULT 32 CHECK (turn_budget BETWEEN 1 AND 256),
+    turns_used INTEGER NOT NULL DEFAULT 0 CHECK (turns_used BETWEEN 0 AND turn_budget),
+    pause_requested INTEGER NOT NULL DEFAULT 0 CHECK (pause_requested IN (0,1)),
+    max_model_rounds INTEGER CHECK (max_model_rounds>0),
+    max_tool_calls INTEGER CHECK (max_tool_calls>=0),
+    wall_budget_millis INTEGER CHECK (wall_budget_millis>0),
+    used_model_rounds INTEGER NOT NULL DEFAULT 0 CHECK (used_model_rounds>=0),
+    used_tool_calls INTEGER NOT NULL DEFAULT 0 CHECK (used_tool_calls>=0),
+    used_active_millis INTEGER NOT NULL DEFAULT 0 CHECK (used_active_millis>=0),
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL,
@@ -686,6 +782,55 @@ CREATE TABLE execution_runs (
     CHECK ((plan_id IS NULL)=(plan_revision_id IS NULL AND plan_hash IS NULL)),
     CHECK ((status IN ('COMPLETED','STOPPED'))=(completed_at IS NOT NULL))
 );
+
+
+-- admission intent 先于 Turn 创建，turn_id 不建立即时 FK，以便崩溃后判定未派发意图。
+CREATE TABLE plan_turn_claims (
+    run_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL UNIQUE,
+    ordinal INTEGER NOT NULL CHECK (ordinal>=1),
+    claimed_at TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'CLAIMED' CHECK (state IN ('CLAIMED','SETTLED','ABANDONED')),
+    PRIMARY KEY (run_id,ordinal),
+    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id) ON DELETE RESTRICT
+);
+
+CREATE UNIQUE INDEX uq_plan_turn_claim_live ON plan_turn_claims(run_id) WHERE state='CLAIMED';
+
+-- 同一证据输入只允许一次验收请求；证据改变后允许新的验收，UNKNOWN 不自动重试。
+CREATE TABLE plan_evaluation_requests (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    plan_id TEXT NOT NULL,
+    plan_revision_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    owner_thread_id TEXT NOT NULL,
+    input_digest TEXT NOT NULL CHECK (length(input_digest)=64 AND input_digest NOT GLOB '*[^0-9a-f]*'),
+    profile_json TEXT NOT NULL CHECK (json_valid(profile_json) AND json_type(profile_json)='object'),
+    outcome TEXT NOT NULL CHECK (outcome IN ('RUNNING','SUCCEEDED','FAILED','UNKNOWN')),
+    certainty TEXT NOT NULL CHECK (certainty IN ('UNKNOWN','KNOWN')),
+    verdict TEXT CHECK (verdict IS NULL OR verdict IN ('MET','NOT_MET','INCONCLUSIVE')),
+    criteria_json TEXT CHECK (criteria_json IS NULL OR (json_valid(criteria_json) AND json_type(criteria_json)='array')),
+    summary TEXT CHECK (summary IS NULL OR length(summary) BETWEEN 1 AND 4000),
+    input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens>=0),
+    output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens>=0),
+    total_tokens INTEGER CHECK (total_tokens IS NULL OR total_tokens>=input_tokens+output_tokens),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (plan_id) REFERENCES plans(plan_id) ON DELETE RESTRICT,
+    FOREIGN KEY (plan_revision_id) REFERENCES plan_revisions(plan_revision_id) ON DELETE RESTRICT,
+    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_thread_id) REFERENCES threads(thread_id) ON DELETE RESTRICT,
+    UNIQUE (plan_id,plan_revision_id,run_id,input_digest),
+    CHECK ((certainty='UNKNOWN')=(input_tokens IS NULL AND output_tokens IS NULL AND total_tokens IS NULL)),
+    CHECK ((certainty='KNOWN')=(input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND total_tokens IS NOT NULL)),
+    CHECK ((outcome='RUNNING')=(completed_at IS NULL)),
+    CHECK ((outcome='SUCCEEDED')=(verdict IS NOT NULL AND criteria_json IS NOT NULL AND summary IS NOT NULL))
+);
+CREATE INDEX idx_plan_evaluation_requests_run ON plan_evaluation_requests(plan_id,run_id,outcome);
+CREATE TRIGGER plan_evaluation_requests_immutable_identity
+BEFORE UPDATE OF request_id,plan_id,plan_revision_id,run_id,owner_thread_id,input_digest,profile_json,started_at
+ON plan_evaluation_requests
+BEGIN SELECT RAISE(ABORT,'Plan evaluator request identity is immutable'); END;
 
 CREATE TABLE goal_plan_links (
     goal_id TEXT NOT NULL,
@@ -792,23 +937,6 @@ CREATE TABLE goal_evaluations (
     CHECK ((status IN ('COMPLETED','FAILED'))=(completed_at IS NOT NULL)),
     CHECK ((status='COMPLETED')=(verdict IS NOT NULL)),
     CHECK ((status='COMPLETED')=(summary IS NOT NULL))
-);
-
-CREATE TABLE goal_input_requests (
-    input_request_id TEXT PRIMARY KEY NOT NULL,
-    goal_id TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    prompt TEXT NOT NULL CHECK (length(prompt) BETWEEN 1 AND 4000),
-    state TEXT NOT NULL CHECK (state IN ('PENDING','RESPONDED','EXPIRED')),
-    response_json TEXT CHECK (response_json IS NULL OR json_valid(response_json)),
-    expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    resolved_at TEXT,
-    FOREIGN KEY (goal_id) REFERENCES goals(goal_id) ON DELETE RESTRICT,
-    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id) ON DELETE RESTRICT,
-    CHECK ((state='PENDING')=(response_json IS NULL AND resolved_at IS NULL)),
-    CHECK ((state='RESPONDED')=(response_json IS NOT NULL AND resolved_at IS NOT NULL)),
-    CHECK (state!='EXPIRED' OR resolved_at IS NOT NULL)
 );
 
 CREATE TABLE goal_events (
@@ -929,11 +1057,11 @@ CREATE INDEX idx_goals_owner_terminal ON goals(owner_thread_id,updated_at,goal_i
 CREATE INDEX idx_plans_owner ON plans(owner_thread_id,updated_at,plan_id);
 
 CREATE UNIQUE INDEX uq_plans_owner_nonterminal ON plans(owner_thread_id)
-  WHERE status IN ('DRAFT','AWAITING_APPROVAL','APPROVED','EXECUTING');
+    WHERE status IN ('DRAFT','AWAITING_APPROVAL','APPROVED','EXECUTING','VERIFYING','PAUSED');
 
 CREATE UNIQUE INDEX uq_execution_runs_goal_live ON execution_runs(goal_id) WHERE goal_id IS NOT NULL AND status IN ('PREPARED','RUNNING','VERIFYING');
 
-CREATE UNIQUE INDEX uq_execution_runs_plan_live ON execution_runs(plan_id) WHERE goal_id IS NULL AND status IN ('PREPARED','RUNNING','VERIFYING');
+CREATE UNIQUE INDEX uq_execution_runs_plan_live ON execution_runs(plan_id) WHERE goal_id IS NULL AND status IN ('PREPARED','RUNNING','VERIFYING','PAUSED');
 
 CREATE UNIQUE INDEX uq_goal_plan_link_active ON goal_plan_links(goal_id) WHERE detached_at IS NULL;
 
@@ -944,8 +1072,6 @@ CREATE INDEX idx_goal_tool_attempts_recovery ON goal_tool_attempts(state,process
 
 CREATE UNIQUE INDEX uq_goal_evaluations_run_live ON goal_evaluations(run_id) WHERE status IN ('REQUESTED','RUNNING');
 
-CREATE UNIQUE INDEX uq_goal_input_pending ON goal_input_requests(goal_id) WHERE state='PENDING';
-
 CREATE INDEX idx_goal_events_page ON goal_events(goal_id,event_sequence);
 
 CREATE UNIQUE INDEX uq_goal_continuation_held ON goal_continuation_leases(goal_id) WHERE state='HELD';
@@ -953,12 +1079,20 @@ CREATE UNIQUE INDEX uq_goal_continuation_held ON goal_continuation_leases(goal_i
 -- TRIGGERS
 
 CREATE TRIGGER messages_immutable_delete BEFORE DELETE ON messages
+WHEN NOT EXISTS(
+    SELECT 1 FROM temporary_side_chats c
+    WHERE c.thread_id=OLD.thread_id AND c.state='CLOSING'
+)
 BEGIN SELECT RAISE(ABORT, 'messages are immutable'); END;
 
 CREATE TRIGGER context_checkpoints_immutable_update BEFORE UPDATE ON context_checkpoints
 BEGIN SELECT RAISE(ABORT, 'context checkpoints are immutable'); END;
 
 CREATE TRIGGER context_checkpoints_immutable_delete BEFORE DELETE ON context_checkpoints
+WHEN NOT EXISTS(
+    SELECT 1 FROM temporary_side_chats c
+    WHERE c.thread_id=OLD.thread_id AND c.state='CLOSING'
+)
 BEGIN SELECT RAISE(ABORT, 'context checkpoints are immutable'); END;
 
 CREATE TRIGGER messages_immutable_update BEFORE UPDATE ON messages
@@ -992,12 +1126,21 @@ WHEN NOT (
 BEGIN SELECT RAISE(ABORT,'usage update is not a request settlement'); END;
 
 CREATE TRIGGER usage_immutable_delete BEFORE DELETE ON usage
+WHEN NOT EXISTS(
+    SELECT 1 FROM temporary_side_chats c
+    WHERE c.thread_id=OLD.thread_id AND c.state='CLOSING'
+)
 BEGIN SELECT RAISE(ABORT,'usage is immutable'); END;
 
 CREATE TRIGGER tool_bindings_immutable_update BEFORE UPDATE ON tool_bindings
 BEGIN SELECT RAISE(ABORT,'Tool bindings are immutable'); END;
 
 CREATE TRIGGER tool_bindings_immutable_delete BEFORE DELETE ON tool_bindings
+WHEN NOT EXISTS(
+    SELECT 1 FROM turns t
+    JOIN temporary_side_chats c ON c.thread_id=t.thread_id
+    WHERE t.turn_id=OLD.turn_id AND c.state='CLOSING'
+)
 BEGIN SELECT RAISE(ABORT,'Tool bindings are immutable'); END;
 
 CREATE TRIGGER turn_internal_context_immutable BEFORE UPDATE ON turn_internal_context
@@ -1041,16 +1184,6 @@ BEGIN SELECT RAISE(ABORT,'Pending input Turn owner is invalid'); END;
 CREATE TRIGGER pending_inputs_owner_update
 BEFORE UPDATE OF thread_id,turn_id ON pending_inputs
 BEGIN SELECT RAISE(ABORT,'Pending input owner is immutable'); END;
-
-CREATE TRIGGER goal_input_requests_run_owner_insert BEFORE INSERT ON goal_input_requests
-WHEN NOT EXISTS(
-  SELECT 1 FROM execution_runs r WHERE r.run_id=NEW.run_id AND r.goal_id=NEW.goal_id
-)
-BEGIN SELECT RAISE(ABORT,'Goal input request run owner is invalid'); END;
-
-CREATE TRIGGER goal_input_requests_identity_update
-BEFORE UPDATE OF goal_id,run_id ON goal_input_requests
-BEGIN SELECT RAISE(ABORT,'Goal input request identity is immutable'); END;
 
 CREATE TRIGGER goal_tool_attempts_run_owner_insert BEFORE INSERT ON goal_tool_attempts
 WHEN NOT EXISTS(

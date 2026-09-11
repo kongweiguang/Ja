@@ -123,6 +123,11 @@ public final class TurnEventWireMapper {
                     }
                 }
             }
+            case TurnEvent.MessagesReceived value -> {
+                method = "turn/messages_received";
+                ArrayNode items = params.putArray("items");
+                value.items().forEach(item -> items.add(RpcResults.snapshotItem(mapper, item)));
+            }
             case TurnEvent.Terminal value -> {
                 method = "turn/terminal";
                 params.put("state", wire(value.state()));

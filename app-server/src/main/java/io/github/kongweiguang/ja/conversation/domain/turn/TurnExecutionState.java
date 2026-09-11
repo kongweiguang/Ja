@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.conversation.domain.turn;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 
@@ -19,6 +20,34 @@ public sealed interface TurnExecutionState permits TurnExecutionState.Ready,
 
     /** 所有状态共享的不可变恢复基线和累计游标。 */
     Common common();
+
+    /**
+     * 在挂起边界冻结剩余活动预算；恢复会重新生成绝对截止线，但不会重置累计游标。
+     */
+    default TurnExecutionState withActiveBudget(Duration budget) {
+        Common updated = common().withActiveBudget(budget);
+        return switch (this) {
+            case Ready ready -> new Ready(updated, ready.next(), ready.summary());
+            case ProviderPending pending -> new ProviderPending(updated, pending.requestId(), pending.messageId(),
+                    pending.purpose(), pending.profile(), pending.envelopeFingerprint(),
+                    new Ready(updated, pending.resume().next(), pending.resume().summary()));
+            case Tools tools -> new Tools(updated, tools.batchId(), tools.assistantMessageId(),
+                    tools.firstOrdinal(), tools.lastOrdinal(), tools.nextOrdinal());
+        };
+    }
+
+    /** 恢复时只替换本轮活动截止线，保留已冻结的剩余预算和其它执行事实。 */
+    default TurnExecutionState withDeadline(Instant deadline) {
+        Common updated = common().withDeadline(deadline);
+        return switch (this) {
+            case Ready ready -> new Ready(updated, ready.next(), ready.summary());
+            case ProviderPending pending -> new ProviderPending(updated, pending.requestId(), pending.messageId(),
+                    pending.purpose(), pending.profile(), pending.envelopeFingerprint(),
+                    new Ready(updated, pending.resume().next(), pending.resume().summary()));
+            case Tools tools -> new Tools(updated, tools.batchId(), tools.assistantMessageId(),
+                    tools.firstOrdinal(), tools.lastOrdinal(), tools.nextOrdinal());
+        };
+    }
 
     /** READY 的下一步只能是普通 Assistant Provider 调用或自动 Summary。 */
     record Ready(Common common, Next next, SummaryProgress summary) implements TurnExecutionState {
@@ -35,7 +64,7 @@ public sealed interface TurnExecutionState permits TurnExecutionState.Ready,
         public Ready advanceProviderOrdinal() {
             Common advanced = new Common(common.modelRound(), common.usedToolCalls(),
                     Math.addExact(common.nextProviderOrdinal(), 1), common.promptCheckpointId(),
-                    common.activeSkills(), common.deadlineAt(), common.origin());
+                    common.activeSkills(), common.deadlineAt(), common.origin(), common.activeBudget());
             return new Ready(advanced, next, summary);
         }
     }
@@ -74,10 +103,17 @@ public sealed interface TurnExecutionState permits TurnExecutionState.Ready,
         }
     }
 
-    /** Operation 只保存累计游标、Skill 身份与 admission 时确定的绝对 Deadline。 */
+    /** Operation 保存累计游标、Skill 身份、当前绝对 Deadline 及暂停时冻结的活动预算。 */
     record Common(int modelRound, int usedToolCalls, int nextProviderOrdinal,
                   String promptCheckpointId, List<ActiveSkill> activeSkills, Instant deadlineAt,
-                  TurnOrigin origin) {
+                  TurnOrigin origin, Duration activeBudget) {
+        /** 保留旧的进程内构造便利形式；持久化前会把当前绝对截止线折算为活动预算。 */
+        public Common(int modelRound, int usedToolCalls, int nextProviderOrdinal,
+                      String promptCheckpointId, List<ActiveSkill> activeSkills, Instant deadlineAt,
+                      TurnOrigin origin) {
+            this(modelRound, usedToolCalls, nextProviderOrdinal, promptCheckpointId, activeSkills, deadlineAt,
+                    origin, remainingFromNow(deadlineAt));
+        }
         /**
          * 计数只前进；来源属于恢复所需的 Operation 事实，运行环境仍由下一 Provider 安全点重新解析。
          */
@@ -95,6 +131,27 @@ public sealed interface TurnExecutionState permits TurnExecutionState.Ready,
             }
             Objects.requireNonNull(deadlineAt, "deadlineAt");
             Objects.requireNonNull(origin, "origin");
+            if (activeBudget == null || activeBudget.isNegative() || activeBudget.toMillis() > 86_400_000L) {
+                throw new IllegalArgumentException("invalid active budget");
+            }
+        }
+
+        /** 只在挂起时改变预算，避免用 wall-clock 等待时间消耗执行额度。 */
+        public Common withActiveBudget(Duration budget) {
+            return new Common(modelRound, usedToolCalls, nextProviderOrdinal, promptCheckpointId,
+                    activeSkills, deadlineAt, origin, budget);
+        }
+
+        /** 恢复时重建 wall-clock 截止线，activeBudget 仍是同一份持久事实。 */
+        public Common withDeadline(Instant deadline) {
+            return new Common(modelRound, usedToolCalls, nextProviderOrdinal, promptCheckpointId,
+                    activeSkills, deadline, origin, activeBudget);
+        }
+
+        /** 旧构造只用于非生产 fixture；按当前系统时钟计算兼容默认预算，生产恢复传显式 activeBudget。 */
+        private static Duration remainingFromNow(Instant deadline) {
+            long millis = Math.max(0L, Duration.between(Instant.now(), deadline).toMillis());
+            return Duration.ofMillis(Math.min(millis, 86_400_000L));
         }
     }
 

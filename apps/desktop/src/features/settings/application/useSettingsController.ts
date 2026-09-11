@@ -17,6 +17,7 @@ import type {
   SettingsConfigurationChange,
   SettingsMcpServer,
   SettingsSnapshot,
+  SubagentSettings,
   SkillProjection,
 } from "../domain/types";
 import {
@@ -111,7 +112,7 @@ function projectMcpServers(
       auth: saved?.auth ?? { kind: "none" },
       enabled: saved?.enabled ?? server.status !== "disabled",
       status:
-        server.status === "healthy"
+        server.status === "healthy" || server.status === "available"
           ? ("connected" as const)
           : server.status === "disabled"
             ? ("disabled" as const)
@@ -121,6 +122,11 @@ function projectMcpServers(
       tools: [],
     };
   });
+}
+
+/** Java 的 available/healthy 都表示 probe 成功；configured 只表示已配置，不能提升为 connected。 */
+function mcpProbeHealthy(status: "healthy" | "available" | "degraded" | "unavailable"): boolean {
+  return status === "healthy" || status === "available";
 }
 
 /** MCP Tool 只投影名称和交互策略，避免在 UI store 长期保存任意输入 Schema。 */
@@ -141,6 +147,12 @@ function toSettingsSnapshot(
   return {
     revision: document.revision,
     defaultSelection: document.defaultSelection === null ? null : { ...document.defaultSelection },
+    subagents: {
+      enabled: document.subagents.enabled,
+      providerId: document.subagents.providerId,
+      modelId: document.subagents.modelId,
+      reasoningLevel: document.subagents.reasoningLevel,
+    },
     providers: document.providers.map((provider) => ({
       ...provider,
       networkTimeouts: { ...provider.networkTimeouts },
@@ -156,6 +168,7 @@ function toSettingsSnapshot(
     })),
     mcpServers: document.mcpServers.map((server) => {
       const observed = runtimeMcpServers.find((item) => item.id === server.mcpRevision);
+      const enabledObservation = server.enabled ? observed : undefined;
       return {
         id: server.mcpRevision,
         mcpRevision: server.mcpRevision,
@@ -168,9 +181,13 @@ function toSettingsSnapshot(
         headers: { ...server.headers },
         auth: { ...server.auth },
         enabled: server.enabled,
-        status: observed?.status ?? (server.enabled ? ("unknown" as const) : ("disabled" as const)),
-        tools: observed?.tools ?? [],
-        ...(observed?.lastError === undefined ? {} : { lastError: observed.lastError }),
+        status:
+          enabledObservation?.status ??
+          (server.enabled ? ("unknown" as const) : ("disabled" as const)),
+        tools: enabledObservation?.tools ?? [],
+        ...(enabledObservation?.lastError === undefined
+          ? {}
+          : { lastError: enabledObservation.lastError }),
       };
     }),
     skills: runtimeSkills.map((skill) => {
@@ -178,6 +195,7 @@ function toSettingsSnapshot(
       return { ...skill, enabled, status: enabled ? skill.status : ("disabled" as const) };
     }),
     defaultAccessMode: document.defaultAccessMode,
+    clarificationEnabled: document.clarificationEnabled,
     appearance: {
       theme: appearance.theme,
       palette: appearance.palette,
@@ -193,10 +211,12 @@ function emptySettingsSnapshot(appearance: AppearanceSettings): SettingsSnapshot
   return {
     revision: 0,
     defaultSelection: null,
+    subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
     providers: [],
     skills: [],
     mcpServers: [],
     defaultAccessMode: "full_access",
+    clarificationEnabled: true,
     appearance,
   };
 }
@@ -301,6 +321,8 @@ export function useSettingsController({
   const configurationScopeKey = queryWorkspaceId ?? "general";
   const handledConfigurationVersionsRef = useRef<Map<string, string>>(new Map());
   const credentialMutationTailRef = useRef<Promise<void>>(Promise.resolve());
+  /** MCP 配置保存会推进观测序号；晚到的旧 probe 不得重新写入新定义的健康状态。 */
+  const mcpObservationEpochRef = useRef<Map<string, number>>(new Map());
   // User 变更影响全部有效配置，Project 变更只允许推进匹配 workspace 的 key；其它项目的
   // timeline 事件不能让当前项目产生一次无意义的 configuration/read。
   const configurationMatchesScope =
@@ -459,7 +481,10 @@ export function useSettingsController({
     [adapter, currentLoaded, reload, updateLoadedQuery],
   );
 
-  /** 保存 Provider 固定以 userDocument 为读写基线，项目 effective 值不得进入全局表单。 */
+  /**
+   * 整组模型与连接共用 user CAS；能力编辑同步收敛根思考档位，删除默认模型仍须走显式替代流程。
+   * 项目 effective 值不得进入全局表单，供应商改名或新增模型也不得改变当前模型选择。
+   */
   const saveProvider = useCallback(
     async (provider: ProviderSave): Promise<void> => {
       const current = currentLoaded();
@@ -470,14 +495,44 @@ export function useSettingsController({
       const merged = { ...provider, credentialConfigured: existing?.credentialConfigured ?? false };
       const firstModel = merged.models[0];
       if (firstModel === undefined) throw new Error("provider requires model");
+      const selected = current.userDocument.defaultSelection;
+      const selectedModel = merged.models.find((model) => model.modelId === selected?.modelId);
+      if (selected?.providerId === provider.providerId && selectedModel === undefined)
+        throw new Error("replacement model is required");
+      const subagentModel = merged.models.find(
+        (model) => model.modelId === current.userDocument.subagents.modelId,
+      );
+      if (
+        current.userDocument.subagents.providerId === provider.providerId &&
+        current.userDocument.subagents.modelId !== null &&
+        subagentModel === undefined
+      )
+        throw new Error("subagent model replacement is required");
+      const subagents =
+        current.userDocument.subagents.providerId === provider.providerId &&
+        current.userDocument.subagents.modelId === subagentModel?.modelId &&
+        current.userDocument.subagents.reasoningLevel !== null &&
+        subagentModel.reasoningLevelMap[current.userDocument.subagents.reasoningLevel] === undefined
+          ? { ...current.userDocument.subagents, reasoningLevel: null }
+          : current.userDocument.subagents;
+      const defaultSelection =
+        selected === null
+          ? {
+              providerId: provider.providerId,
+              modelId: firstModel.modelId,
+              reasoningLevel: firstModel.defaultReasoningLevel,
+            }
+          : selected.providerId === provider.providerId &&
+              selectedModel !== undefined &&
+              selected.reasoningLevel !== null &&
+              selectedModel.reasoningLevelMap[selected.reasoningLevel] === undefined
+            ? { ...selected, reasoningLevel: selectedModel.defaultReasoningLevel }
+            : selected;
       await saveDocument({
         ...current.userDocument,
         revision: current.userDocument.revision + 1,
-        defaultSelection: current.userDocument.defaultSelection ?? {
-          providerId: provider.providerId,
-          modelId: firstModel.modelId,
-          reasoningLevel: firstModel.defaultReasoningLevel,
-        },
+        defaultSelection,
+        subagents,
         providers:
           existing === undefined
             ? [...current.userDocument.providers, merged]
@@ -500,6 +555,7 @@ export function useSettingsController({
       if (providers.length === current.userDocument.providers.length)
         throw new Error("provider unavailable");
       const deletesDefault = current.userDocument.defaultSelection?.providerId === providerId;
+      const deletesSubagent = current.userDocument.subagents.providerId === providerId;
       const replacementModel =
         replacement === null
           ? undefined
@@ -509,6 +565,7 @@ export function useSettingsController({
       const replacementReasoningLevel = replacement?.reasoningLevel ?? null;
       if (deletesDefault && providers.length > 0 && replacementModel === undefined)
         throw new Error("replacement model is required");
+      if (deletesSubagent) throw new Error("subagent model replacement is required");
       if (
         replacementModel !== undefined &&
         replacementReasoningLevel !== null &&
@@ -578,10 +635,18 @@ export function useSettingsController({
               savedModel.reasoningLevelMap[selected.reasoningLevel] === undefined
             ? { ...selected, reasoningLevel: savedModel.defaultReasoningLevel }
             : selected;
+      const subagents =
+        current.userDocument.subagents.providerId === providerId &&
+        current.userDocument.subagents.modelId === savedModel.modelId &&
+        current.userDocument.subagents.reasoningLevel !== null &&
+        savedModel.reasoningLevelMap[current.userDocument.subagents.reasoningLevel] === undefined
+          ? { ...current.userDocument.subagents, reasoningLevel: null }
+          : current.userDocument.subagents;
       await saveDocument({
         ...current.userDocument,
         revision: current.userDocument.revision + 1,
         defaultSelection,
+        subagents,
         providers: current.userDocument.providers.map((candidate) =>
           candidate.providerId === providerId ? { ...candidate, models } : candidate,
         ),
@@ -609,6 +674,9 @@ export function useSettingsController({
       const deletesDefault =
         current.userDocument.defaultSelection?.providerId === providerId &&
         current.userDocument.defaultSelection.modelId === modelId;
+      const deletesSubagent =
+        current.userDocument.subagents.providerId === providerId &&
+        current.userDocument.subagents.modelId === modelId;
       const remainingProviders = current.userDocument.providers.map((candidate) =>
         candidate.providerId === providerId ? { ...candidate, models } : candidate,
       );
@@ -621,6 +689,7 @@ export function useSettingsController({
       const replacementReasoningLevel = replacement?.reasoningLevel ?? null;
       if (deletesDefault && replacementModel === undefined)
         throw new Error("replacement model is required");
+      if (deletesSubagent) throw new Error("subagent model replacement is required");
       if (
         replacementModel !== undefined &&
         replacementReasoningLevel !== null &&
@@ -697,6 +766,35 @@ export function useSettingsController({
     [currentLoaded, saveDocument],
   );
 
+  /** 子智能体引用必须同时命中已保存目录，防止删除模型后静默改派到其它上游。 */
+  const saveSubagentSettings = useCallback(
+    async (settings: SubagentSettings): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      if ((settings.providerId === null) !== (settings.modelId === null))
+        throw new Error("subagent selection incomplete");
+      if (settings.providerId === null && settings.reasoningLevel !== null)
+        throw new Error("subagent reasoning level requires model");
+      if (settings.providerId !== null && settings.modelId !== null) {
+        const model = current.userDocument.providers
+          .find((provider) => provider.providerId === settings.providerId)
+          ?.models.find((candidate) => candidate.modelId === settings.modelId);
+        if (model === undefined) throw new Error("subagent model unavailable");
+        if (
+          settings.reasoningLevel !== null &&
+          model.reasoningLevelMap[settings.reasoningLevel] === undefined
+        )
+          throw new Error("subagent reasoning level unavailable");
+      }
+      await saveDocument({
+        ...current.userDocument,
+        revision: current.userDocument.revision + 1,
+        subagents: { ...settings },
+      });
+    },
+    [currentLoaded, saveDocument],
+  );
+
   /** 持久化根默认访问模式；Thread 的请求级实际值仍由 App Server 在安全点解析。 */
   const saveAccessMode = useCallback(
     async (mode: AccessMode): Promise<void> => {
@@ -706,6 +804,22 @@ export function useSettingsController({
         ...current.userDocument,
         revision: current.userDocument.revision + 1,
         defaultAccessMode: mode,
+      });
+    },
+    [currentLoaded, saveDocument],
+  );
+
+  /**
+   * 仅更新用户层澄清开关并复用完整文档 CAS；项目 effective 快照不能成为写入基线。
+   */
+  const saveClarificationEnabled = useCallback(
+    async (enabled: boolean): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveDocument({
+        ...current.userDocument,
+        revision: current.userDocument.revision + 1,
+        clarificationEnabled: enabled,
       });
     },
     [currentLoaded, saveDocument],
@@ -726,7 +840,11 @@ export function useSettingsController({
     [setHighContrast, setPalette, setReduceMotion, setReducedTransparency, setThemeMode],
   );
 
-  /** 保存 MCP 定义时保留高级非敏感 map，并通过同一 CAS replace 路径提交。 */
+  /**
+   * 保存 MCP 定义时保留高级非敏感 map，并通过同一 CAS replace 路径提交；成功后失效当前
+   * generation 的观测 cache，因为 endpoint、认证引用和 enabled 都可能已改变，而旧观测
+   * 不能代表新定义。序号同时为在途 probe 提供晚到结果屏障，不改变后端 Turn 的 lease 语义。
+   */
   const saveMcp = useCallback(
     async (server: McpServerSave): Promise<void> => {
       const current = currentLoaded();
@@ -748,11 +866,20 @@ export function useSettingsController({
                 item.mcpRevision === server.mcpRevision ? merged : item,
               ),
       });
+      mcpObservationEpochRef.current.set(
+        server.mcpRevision,
+        (mcpObservationEpochRef.current.get(server.mcpRevision) ?? 0) + 1,
+      );
+      await queryClient.invalidateQueries({ queryKey: mcpKey, exact: true });
     },
-    [currentLoaded, saveDocument],
+    [currentLoaded, mcpKey, queryClient, saveDocument],
   );
 
-  /** 运行一次真实 MCP probe 并只更新对应 server 的健康投影。 */
+  /**
+   * 运行一次真实 MCP probe 并只更新对应 server 的健康投影；probe 可能早于 catalog 列表
+   * 看见新保存的 Server，因此按配置定义补齐 cache；写入前取消仍在途的旧 catalog 读取，
+   * 避免其晚到空结果覆盖 probe。保存边界后的晚到结果会被 epoch 丢弃。
+   */
   const testMcp = useCallback(
     async (
       mcpRevision: string,
@@ -761,21 +888,38 @@ export function useSettingsController({
         (item) => item.mcpRevision === mcpRevision,
       );
       if (server === undefined || !server.enabled) return "disabled";
+      const observationEpoch = mcpObservationEpochRef.current.get(mcpRevision) ?? 0;
       const result = await runtimePort.testMcp(mcpRevision);
       const tools = projectMcpTools(await runtimePort.listMcpTools(mcpRevision));
+      if ((mcpObservationEpochRef.current.get(mcpRevision) ?? 0) !== observationEpoch) {
+        return mcpProbeHealthy(result.status) ? "connected" : "error";
+      }
+      const status = mcpProbeHealthy(result.status) ? "connected" : "error";
+      await queryClient.cancelQueries({ queryKey: mcpKey, exact: true });
       queryClient.setQueryData<McpServerProjection[]>(mcpKey, (items = []) =>
-        items.map((item) =>
-          item.id === mcpRevision
-            ? {
-                ...item,
-                status: result.status === "healthy" ? "connected" : "error",
+        items.some((item) => item.id === mcpRevision)
+          ? items.map((item) =>
+              item.id === mcpRevision
+                ? {
+                    ...item,
+                    status,
+                    tools,
+                    lastError: mcpProbeHealthy(result.status) ? undefined : "MCP Server 不可用。",
+                  }
+                : item,
+            )
+          : [
+              ...items,
+              {
+                ...server,
+                id: server.mcpRevision,
+                status,
                 tools,
-                lastError: result.status === "healthy" ? undefined : "MCP Server 不可用。",
-              }
-            : item,
-        ),
+                lastError: mcpProbeHealthy(result.status) ? undefined : "MCP Server 不可用。",
+              },
+            ],
       );
-      return result.status === "healthy" ? "connected" : "error";
+      return mcpProbeHealthy(result.status) ? "connected" : "error";
     },
     [currentLoaded, mcpKey, queryClient, runtimePort],
   );
@@ -992,6 +1136,7 @@ export function useSettingsController({
       onDeleteModel: deleteModel,
       onMoveModel: moveModel,
       onDefaultSelectionChange: saveDefaultSelection,
+      onSubagentSettingsChange: saveSubagentSettings,
       onReplaceCredential: setCredential,
       onClearCredential: deleteCredential,
       onSaveMcp: saveMcp,
@@ -1000,6 +1145,7 @@ export function useSettingsController({
       onCloseMcp: closeMcp,
       onToggleSkill: toggleSkill,
       onAccessModeChange: saveAccessMode,
+      onClarificationEnabledChange: saveClarificationEnabled,
       onAppearanceChange: saveAppearance,
     }),
     [
@@ -1013,7 +1159,9 @@ export function useSettingsController({
       moveProvider,
       saveAppearance,
       saveAccessMode,
+      saveClarificationEnabled,
       saveDefaultSelection,
+      saveSubagentSettings,
       saveMcp,
       saveModel,
       saveProvider,

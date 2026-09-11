@@ -12,6 +12,7 @@ import {
   type ReactElement,
   type ReactNode,
 } from "react";
+import { useUiFontSize } from "@/shared/hooks/useInterfacePreferencesValue";
 import { CopyTextButton } from "@/shared/ui/CopyTextButton";
 import { IconButton } from "@/shared/ui/primitives";
 import {
@@ -92,9 +93,17 @@ type DiffRow =
     };
 
 const CONTEXT_RADIUS = 3;
-const LINE_ROW_HEIGHT = 22;
-const META_ROW_HEIGHT = 28;
+const LINE_ROW_HEIGHT_REM = 1.375;
+const META_ROW_HEIGHT_REM = 1.75;
 const EMPTY_SET = new Set<string>();
+
+/** 虚拟器估算与 ReviewUnifiedDiff.css 的 rem 行高共用 UI 根字号，避免缩放后行重叠。 */
+function estimateDiffRowHeight(row: DiffRow, uiFontSize: number): number {
+  return (
+    uiFontSize *
+    (row.kind === "line" || row.kind === "split-line" ? LINE_ROW_HEIGHT_REM : META_ROW_HEIGHT_REM)
+  );
+}
 
 /**
  * 原生 hunk 的 old/new 行数是权威边界；只有全部行恰好被消费时才采用该投影，
@@ -430,6 +439,7 @@ export function ReviewUnifiedDiff({
     readonly status: "loading" | "ready";
     readonly lines?: ReviewSyntaxResult;
   }>();
+  const uiFontSize = useUiFontSize();
   const expanded = expandedState.fileIdentity === fileIdentity ? expandedState.keys : EMPTY_SET;
   const hunks = useMemo(() => projectHunks(file), [file]);
   const syntaxInput = useMemo(
@@ -452,21 +462,26 @@ export function ReviewUnifiedDiff({
   // TanStack Virtual 的命令式测量/滚动 API 不可安全 memoize，限制在只读 Diff 视图内部。
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
+    // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
+    useFlushSync: false,
     count: rows.length,
     getScrollElement: () => viewportRef.current,
     estimateSize: (index) =>
-      rows[index]?.kind === "line" || rows[index]?.kind === "split-line"
-        ? LINE_ROW_HEIGHT
-        : META_ROW_HEIGHT,
+      rows[index] === undefined
+        ? uiFontSize * META_ROW_HEIGHT_REM
+        : estimateDiffRowHeight(rows[index], uiFontSize),
     getItemKey: (index) => rows[index]?.key ?? index,
     overscan: 18,
     initialRect: { width: 800, height: 500 },
   });
+  /** 根 rem 字号变化时丢弃旧测量，保证虚拟偏移与 CSS 实际行盒同步。 */
+  useEffect(() => {
+    virtualizer.measure();
+  }, [uiFontSize, virtualizer]);
   const measuredRows = virtualizer.getVirtualItems();
   let fallbackStart = 0;
   const fallbackRows = rows.slice(0, 50).map((row, index) => {
-    const size =
-      row.kind === "line" || row.kind === "split-line" ? LINE_ROW_HEIGHT : META_ROW_HEIGHT;
+    const size = estimateDiffRowHeight(row, uiFontSize);
     const virtualRow = {
       index,
       start: fallbackStart,

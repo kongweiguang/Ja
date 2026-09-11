@@ -15,6 +15,12 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMa
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.RecoveryMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SchemaMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SubagentPolicyMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadDiscoveryMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatPurgeMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.recovery.StartupRecoveryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisCheckpointStore;
 import io.github.kongweiguang.ja.attachment.adapter.out.persistence.MybatisAttachmentRepository;
@@ -23,6 +29,8 @@ import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisCo
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInstructionScopeRepository;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
+import io.github.kongweiguang.ja.conversation.domain.SubagentPolicy;
+import io.github.kongweiguang.ja.conversation.port.out.SubagentPolicySource;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Path;
@@ -87,6 +95,12 @@ public abstract class PersistenceTestSupport {
         configuration.addMapper(RecoveryMapper.class);
         configuration.addMapper(InstructionScopeMapper.class);
         configuration.addMapper(TaskMapper.class);
+        configuration.addMapper(SubagentPolicyMapper.class);
+        configuration.addMapper(InteractionMapper.class);
+        configuration.addMapper(PlanEvaluationMapper.class);
+        configuration.addMapper(ThreadDiscoveryMapper.class);
+        configuration.addMapper(SideChatMapper.class);
+        configuration.addMapper(SideChatPurgeMapper.class);
         SqlSessionFactory sessions = new SqlSessionFactoryBuilder().build(configuration);
         database.bindWalCheckpoint(sessions);
         return new TestDatabase(database, sessions, new ObjectMapper());
@@ -95,8 +109,21 @@ public abstract class PersistenceTestSupport {
     /** fixture 按 composition 相反顺序释放 store 使用者和数据库 lease。 */
     protected record TestDatabase(JaDatabase database, SqlSessionFactory sessions, ObjectMapper mapper)
             implements AutoCloseable {
+        /** 交互取消与 Conversation 共享真实 SQLite 事务，覆盖下一轮模型上下文而非仅状态列。 */
+        public io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInteractionRepository interactions() {
+            return new io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInteractionRepository(
+                    sessions, mapper, TEST_TRANSACTIONS);
+        }
         /** 使用显式测试事务 owner 创建 ConversationRepository，确保提交和回滚真实发生。 */
-        public MybatisConversationRepository agentStore() { return new MybatisConversationRepository(sessions, mapper, TEST_TRANSACTIONS); }
+        public MybatisConversationRepository agentStore() {
+            return new MybatisConversationRepository(sessions, mapper, TEST_TRANSACTIONS,
+                    SubagentPolicy::defaultPolicy);
+        }
+
+        /** 使用可变测试源模拟全局设置变化，验证已创建 Thread 不会被回写。 */
+        public MybatisConversationRepository agentStore(SubagentPolicySource policySource) {
+            return new MybatisConversationRepository(sessions, mapper, TEST_TRANSACTIONS, policySource);
+        }
 
         /** 保留容量边界测试的调用形状，但 V1 存储不接受旧容量参数。 */
         public MybatisConversationRepository agentStore(long ignoredTurnBytes, long ignoredDatabaseBytes) {

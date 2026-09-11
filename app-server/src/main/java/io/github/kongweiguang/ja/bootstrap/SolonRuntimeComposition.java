@@ -25,6 +25,7 @@ import io.github.kongweiguang.ja.conversation.port.out.AutomaticTitleUsagePort;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnCancellationListener;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
+import io.github.kongweiguang.ja.conversation.application.policy.PlanToolPolicy;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
@@ -45,6 +46,7 @@ import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
 import io.github.kongweiguang.ja.conversation.port.out.ToolPolicy;
 import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.application.prompt.DefaultAgentPromptSessionFactory;
 import io.github.kongweiguang.ja.conversation.instruction.AgentInstructionCatalog;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSessionFactory;
@@ -57,6 +59,7 @@ import io.github.kongweiguang.ja.goal.adapter.out.persistence.MybatisGoalReposit
 import io.github.kongweiguang.ja.goal.application.GoalService;
 import io.github.kongweiguang.ja.goal.application.GoalToolExecutionLedger;
 import io.github.kongweiguang.ja.goal.application.GoalStartupRecovery;
+import io.github.kongweiguang.ja.goal.application.GoalContinuationRecoveryHook;
 import io.github.kongweiguang.ja.goal.application.GoalContinuationCoordinator;
 import io.github.kongweiguang.ja.goal.application.GoalContinuationSubscription;
 import io.github.kongweiguang.ja.goal.application.GoalContinuationTurnAdapter;
@@ -65,6 +68,10 @@ import io.github.kongweiguang.ja.goal.application.GoalEventRegistry;
 import io.github.kongweiguang.ja.goal.application.GoalEvaluationDispatcher;
 import io.github.kongweiguang.ja.goal.application.PlanExecutionCoordinator;
 import io.github.kongweiguang.ja.goal.application.PlanExecutionTurnAdapter;
+import io.github.kongweiguang.ja.goal.application.PlanEventRegistry;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionService;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionCapability;
+import io.github.kongweiguang.ja.conversation.port.out.InteractionRepository;
 import io.github.kongweiguang.ja.goal.application.GoalEvaluator;
 import io.github.kongweiguang.ja.goal.application.RuntimeGoalEvaluatorAdapter;
 import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
@@ -87,6 +94,7 @@ import io.github.kongweiguang.ja.workspace.port.out.WorkspaceTrustPort;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.MybatisTaskRepository;
 import io.github.kongweiguang.ja.task.adapter.in.tools.TaskAgentToolGateway;
 import io.github.kongweiguang.ja.task.application.TaskCoordinator;
+import io.github.kongweiguang.ja.conversation.port.out.SubagentPolicyRepository;
 import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import org.noear.solon.annotation.Bean;
 import org.noear.solon.annotation.Component;
@@ -270,8 +278,8 @@ public final class SolonRuntimeComposition {
      * Task Tool 在 Coordinator 绑定前被调用会失败关闭，不提供临时 no-op 实现。
      */
     @Bean(value = "jaTaskAgentToolGateway", typed = true)
-    public TaskAgentToolGateway taskAgentToolGateway() {
-        return new TaskAgentToolGateway();
+    public TaskAgentToolGateway taskAgentToolGateway(SubagentPolicyRepository subagentPolicies) {
+        return new TaskAgentToolGateway(subagentPolicies);
     }
 
     /**
@@ -413,11 +421,13 @@ public final class SolonRuntimeComposition {
                                JsonValueCodec argumentsCodec,
                                Clock clock,
                                MybatisTaskRepository taskRepository,
-                               RuntimeProcessGeneration processGeneration) {
+                               RuntimeProcessGeneration processGeneration,
+                               InteractionService interactions) {
         AgentLoop loop = new AgentLoop(
                 model, approvals, store, contexts, argumentsCodec,
                 new NetworkntToolArgumentValidation(argumentsCodec),
-                List.<ToolPolicy>of(), List.<ExecutionObserver>of(), clock);
+                List.<ToolPolicy>of(), List.<ExecutionObserver>of(), clock,
+                interactions::publishCreated);
         loop.bindTaskMailbox(taskRepository);
         if (!AotSideEffectGuard.processing()) {
             loop.bindWorkspaceWriteClaims(taskRepository, processGeneration.value());
@@ -429,10 +439,18 @@ public final class SolonRuntimeComposition {
     @Bean(value = "jaGoalToolExecutionLedger", typed = true)
     public GoalToolExecutionLedger goalToolExecutionLedger(MybatisGoalRepository goals, Clock clock,
                                                            RuntimeProcessGeneration generation,
-                                                           AgentLoop loop, GoalService service) {
+                                                           AgentLoop loop, GoalService service, TurnService turns) {
         GoalToolExecutionLedger ledger = new GoalToolExecutionLedger(
                 goals, clock, generation.value(), service::publishCommitted);
-        if (!AotSideEffectGuard.processing()) loop.bindGoalToolExecution(ledger);
+        if (!AotSideEffectGuard.processing()) {
+            loop.bindGoalToolExecution(ledger);
+            turns.bindPlanResumeBudget(turnId -> goals.findInternalTurnBinding(turnId)
+                    .filter(binding -> "PLAN_EXECUTION".equals(binding.origin()))
+                    .flatMap(binding -> goals.readPlanRunBudget(binding.planId(), binding.runId()))
+                    .map(budget -> new io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits(
+                            budget.remainingModelRounds(), budget.remainingToolCalls(), 4_000_000, 1_000_000,
+                            Duration.ofMillis(budget.remainingWallBudgetMillis()))));
+        }
         return ledger;
     }
 
@@ -440,8 +458,11 @@ public final class SolonRuntimeComposition {
     @Bean(value = "jaGoalStartupRecovery", typed = true)
     public GoalStartupRecovery goalStartupRecovery(MybatisGoalRepository goals, Clock clock,
                                                    RuntimeProcessGeneration generation,
-                                                   StartupRecoveryService startupRecovery) {
-        GoalStartupRecovery recovery = new GoalStartupRecovery(goals, clock, generation.value());
+                                                   StartupRecoveryService startupRecovery,
+                                                   GoalContinuationTurnAdapter continuationTurns) {
+        GoalStartupRecovery recovery = new GoalStartupRecovery(goals, clock, generation.value(),
+                new GoalContinuationRecoveryHook(goals, continuationTurns, clock, generation.value(),
+                        continuationTurns::projectRecoveryPhase));
         if (!AotSideEffectGuard.processing()) recovery.recover();
         return recovery;
     }
@@ -450,6 +471,27 @@ public final class SolonRuntimeComposition {
     @Bean(value = "jaGoalEventRegistry", typed = true)
     public GoalEventRegistry goalEventRegistry() {
         return new GoalEventRegistry();
+    }
+
+    /** Plan 事件独立于 Goal 观察，避免以 Goal 存在作为独立计划刷新的前提。 */
+    @Bean(value = "jaPlanEventRegistry", typed = true)
+    public PlanEventRegistry planEventRegistry() {
+        return new PlanEventRegistry();
+    }
+
+    /** 问答服务独占持久问题与草稿，Rust 和 React 只消费其投影。 */
+    @Bean(value = "jaInteractionUseCase", typed = true)
+    public InteractionService interactionService(InteractionRepository repository,
+                                                 ConversationRepository conversations, Clock clock) {
+        return new InteractionService(repository, conversations, clock);
+    }
+
+    /** 使用同一请求冻结的设置，不能在 Tool 执行时另读最新配置改变准入。 */
+    @Bean(value = "jaInteractionCapability", typed = true)
+    public InteractionCapability interactionCapability(InteractionService interactions) {
+        return new InteractionCapability(interactions, request -> request.origin() == TurnOrigin.PLAN_EXECUTION
+                || PlanToolPolicy.isReadOnlyPlanning(request.origin(), request.preferences().collaborationMode())
+                || request.clarificationEnabled());
     }
 
     /** 固定条带 gate 关闭控制命令与 continuation admission 的本地竞态窗口。 */
@@ -461,11 +503,15 @@ public final class SolonRuntimeComposition {
     /** continuation adapter 只桥接既有 Turn/Workspace/Repository owner，不保存第二份运行状态。 */
     @Bean(value = "jaGoalContinuationTurnAdapter", typed = true)
     public GoalContinuationTurnAdapter goalContinuationTurnAdapter(
-            TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
-            MybatisGoalRepository goals, GoalService service, ObjectMapper mapper, Clock clock,
-            GoalEventRegistry events, GoalContinuationGate gate) {
-        return new GoalContinuationTurnAdapter(turns, conversations, workspaces, goals, service, mapper, clock,
-                events, gate);
+             TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
+             MybatisGoalRepository goals, GoalService service, ObjectMapper mapper, Clock clock,
+             GoalEventRegistry events, GoalContinuationGate gate, TaskCoordinator tasks,
+             InteractionService interactions) {
+        GoalContinuationTurnAdapter adapter = new GoalContinuationTurnAdapter(turns, conversations, workspaces,
+                goals, service, mapper, clock, events, gate, tasks, interactions);
+        // late binding 只登记真实 owner 控制器，不触发 AOT/启动期数据库查询。
+        tasks.bindSideChatOwnerController(service::stopOwners);
+        return adapter;
     }
 
     /** SQLite lease 与当前 process generation 共同保证每个 Goal 只有一个自动续跑 Turn。 */
@@ -489,16 +535,32 @@ public final class SolonRuntimeComposition {
     /** standalone Plan 使用一次性 hidden Turn adapter，不借用 Goal lease 或自动续跑资格。 */
     @Bean(value = "jaPlanExecutionTurnAdapter", typed = true)
     public PlanExecutionTurnAdapter planExecutionTurnAdapter(
-            TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
-            MybatisGoalRepository plans, ObjectMapper mapper, Clock clock) {
-        return new PlanExecutionTurnAdapter(turns, conversations, workspaces, plans, mapper, clock);
+             TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
+             MybatisGoalRepository plans, ObjectMapper mapper, Clock clock, TaskCoordinator tasks,
+             TurnRuntimeResolver runtimes) {
+        return new PlanExecutionTurnAdapter(turns, conversations, workspaces, plans, mapper, clock, tasks, runtimes);
     }
 
-    /** Plan execute 在 run 提交后启动一次 Turn，未完成时恢复 APPROVED 供显式重试。 */
+    /** 独立 Plan 只使用真实无工具模型验收，确定性前置门不能代替最终完成判断。 */
     @Bean(value = "jaPlanExecutionCoordinator", typed = true)
     public PlanExecutionCoordinator planExecutionCoordinator(MybatisGoalRepository plans,
-            PlanExecutionTurnAdapter turns, Clock clock) {
-        return new PlanExecutionCoordinator(plans, turns, clock);
+            PlanExecutionTurnAdapter turns, Clock clock,
+            io.github.kongweiguang.ja.goal.application.RuntimePlanEvaluatorAdapter evaluator) {
+        return new PlanExecutionCoordinator(plans, turns, clock, evaluator, turns);
+    }
+
+    /** Plan 验收绑定真实审计端口，失败不能降级为无账本的默认实现。 */
+    @Bean(value = "jaRuntimePlanEvaluatorAdapter", typed = true)
+    public io.github.kongweiguang.ja.goal.application.RuntimePlanEvaluatorAdapter runtimePlanEvaluatorAdapter(
+            ModelPort models, TurnRuntimeResolver runtimes, ConversationRepository conversations,
+            WorkspaceUseCase workspaces, ObjectMapper mapper, Clock clock,
+            io.github.kongweiguang.ja.goal.application.PlanEvaluationAuditPort audit) {
+        java.util.concurrent.ScheduledThreadPoolExecutor deadlines = new java.util.concurrent.ScheduledThreadPoolExecutor(
+                1, Thread.ofPlatform().daemon().name("ja-plan-evaluation-deadline-", 0).factory());
+        deadlines.setRemoveOnCancelPolicy(true);
+        lifecycle.own((AutoCloseable) deadlines::shutdownNow);
+        return new io.github.kongweiguang.ja.goal.application.RuntimePlanEvaluatorAdapter(
+                models, runtimes, conversations, workspaces, mapper, clock, audit, deadlines);
     }
 
     /** evaluator 复用当前配置模型，但强制无 Tool、无执行历史与 SINGLE_ATTEMPT。 */
@@ -553,9 +615,11 @@ public final class SolonRuntimeComposition {
                                    CancellationCoordinator cancellations,
                                    TurnRuntimeResolver runtimeResolver, Clock clock,
                                    AutomaticThreadTitleScheduler automaticTitles,
-                                   WorkspaceReferenceValidator workspaceReferences) {
+                                   WorkspaceReferenceValidator workspaceReferences,
+                                   InteractionService interactions) {
         TurnService service = new TurnService(
                 store, loop, queue, cancellations, runtimeResolver, clock, automaticTitles, workspaceReferences);
+        service.bindInteractionResumeScheduler(interactions);
         return AotSideEffectGuard.processing() ? service : lifecycle.ownShutdownFence(service);
     }
 
@@ -567,9 +631,12 @@ public final class SolonRuntimeComposition {
     public GoalUseCase goalService(MybatisGoalRepository repository, ObjectMapper mapper, Clock clock,
                                    RuntimeProcessGeneration generation, GoalEventRegistry events,
                                    GoalContinuationGate continuations,
-                                   PlanExecutionCoordinator planExecutions) {
-        return new GoalService(repository, mapper, clock, generation.value(), events, continuations,
-                planExecutions);
+                                   PlanExecutionCoordinator planExecutions, PlanEventRegistry planEvents,
+                                   PlanExecutionTurnAdapter planBudgets) {
+        GoalService service = new GoalService(repository, mapper, clock, generation.value(), events, continuations,
+                planExecutions, planEvents, planBudgets);
+        planExecutions.bindPlanCommitObserver(planId -> service.publishPlanCommittedAfterExecution(planId));
+        return service;
     }
 
     /** 只适配既有 Plan/Goal 用例，能力装配不得建立另一套状态机或执行器。 */
@@ -581,8 +648,10 @@ public final class SolonRuntimeComposition {
     /** 显式注册能力身份，逐请求绑定仍交给原 RuntimeLease，避免固定过期权限与领域状态。 */
     @Bean(value = "jaAgentCapabilityCatalog", typed = true)
     public AgentCapabilityCatalog agentCapabilityCatalog(
-            PlanGoalAgentCapability planGoal, TaskAgentToolGateway taskTools) {
-        return new AgentCapabilityCatalog(List.of(planGoal, taskTools));
+            PlanGoalAgentCapability planGoal, TaskAgentToolGateway taskTools, InteractionCapability interactions) {
+        return new AgentCapabilityCatalog(List.of(
+                new io.github.kongweiguang.ja.conversation.application.capability.CollaborationModeCapability(),
+                planGoal, taskTools, interactions));
     }
 
     /**
@@ -592,14 +661,21 @@ public final class SolonRuntimeComposition {
     public TaskCoordinator taskCoordinator(MybatisTaskRepository repository, MybatisHistoryService threads,
                                            TurnService turns, WorkspaceUseCase workspaces, Clock clock,
                                            TaskAgentToolGateway taskTools,
-                                           StartupRecoveryService startupRecovery) {
-        TaskCoordinator coordinator = new TaskCoordinator(repository, threads, turns, turns, workspaces, clock);
+                                           StartupRecoveryService startupRecovery,
+                                           SubagentPolicyRepository subagentPolicies) {
+        TaskCoordinator coordinator = new TaskCoordinator(repository, threads, turns, turns, workspaces, clock,
+                subagentPolicies);
         // Solon AOT 只分析 Bean 图，此时 MyBatis environment 尚未装配，禁止通过 late binding
         // 触发恢复查询；真实运行时仍在接收 RPC 前完成同一恢复边界。
         turns.bindCancellationListener(AotSideEffectGuard.processing()
                 ? TurnCancellationListener.noop()
                 : coordinator);
+        if (!AotSideEffectGuard.processing()) {
+            // TurnService 是 shutdown fence，必须在其停止接纳前先收口临时侧聊。
+            turns.bindPreShutdownHook(coordinator::closeTemporarySideChats);
+        }
         taskTools.bind(coordinator);
+        taskTools.bindThreads(threads);
         if (!AotSideEffectGuard.processing()) {
             coordinator.resumeRecoveredQueued(startupRecovery.queuedTurns().stream()
                     .map(turn -> new TaskCoordinator.RecoveredQueuedTurn(turn.threadId(), turn.turnId()))
@@ -667,11 +743,12 @@ public final class SolonRuntimeComposition {
             @Inject(value = "jaAttachmentUseCase", required = true)
             io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase attachmentPreviews,
             TaskUseCase tasks,
-            GoalUseCase goals) {
+            GoalUseCase goals,
+            io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase interactions) {
         if (AotSideEffectGuard.processing()) return null;
         return new RuntimeServicesFactory(
                 workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog, attachments,
-                attachmentPreviews, tasks, goals, lifecycle::close);
+                attachmentPreviews, tasks, goals, interactions, lifecycle::close);
     }
 
     /** 即使前序资源关闭失败也继续逆序关闭已成功创建的 Bean，以尽可能释放全部资源。 */
@@ -750,6 +827,13 @@ public final class SolonRuntimeComposition {
         @Override
         public void prepareWorkspace(Path workspaceRoot) {
             requireDelegate().prepareWorkspace(workspaceRoot);
+        }
+
+        /** 延迟绑定同样转发准入前预算读取，不能回退到完整工具环境解析。 */
+        @Override
+        public io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits resolveLimits(
+                io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest request) {
+            return requireDelegate().resolveLimits(request);
         }
 
         /** 默认模型投影与 Turn 解析共用委托，避免组合代际不一致。 */

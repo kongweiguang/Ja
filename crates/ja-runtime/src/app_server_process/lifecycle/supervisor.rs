@@ -28,6 +28,7 @@ use crate::app_server_process::process::{
 /// 唯一控制真实 sidecar 的宿主状态；所有状态变更回到 lifecycle 单线程对象。
 pub struct SidecarSupervisor {
     config: SidecarConfig,
+    host_generation: u64,
     pub(crate) lifecycle: LifecycleMachine,
     process: Option<Arc<RunningProcess>>,
     pub(crate) session: Option<Session>,
@@ -68,10 +69,23 @@ impl TurnChangeSetReadLease {
 impl SidecarSupervisor {
     /// 校验边界后才创建生命周期 owner，避免无效配置进入 crash-loop。
     pub fn new(config: SidecarConfig) -> Result<Self, AppServerProcessError> {
+        Self::new_with_host_generation(config, 1)
+    }
+
+    /// 绑定 Runtime Bridge 分配的 host generation；它独立于 Supervisor 内部的重启代际，
+    /// 使 Java notification 与 WebView event drain 使用同一个跨进程身份 fence。
+    pub fn new_with_host_generation(
+        config: SidecarConfig,
+        host_generation: u64,
+    ) -> Result<Self, AppServerProcessError> {
+        if !(1..=9_007_199_254_740_991).contains(&host_generation) {
+            return Err(AppServerProcessError::InvalidConfig);
+        }
         config.validate()?;
         let lifecycle = LifecycleMachine::new(config.restart)?;
         Ok(Self {
             config,
+            host_generation,
             lifecycle,
             process: None,
             session: None,
@@ -154,14 +168,18 @@ impl SidecarSupervisor {
         let generation = self.lifecycle.begin_start()?;
         self.expected_server_instance = None;
         self.ready_token_echo = None;
-        let (process, session) =
-            match spawn_process(&self.config, generation, Arc::clone(&self.terminal_signals)) {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = self.lifecycle.mark_faulted(generation);
-                    return Err(error);
-                }
-            };
+        let (process, session) = match spawn_process(
+            &self.config,
+            generation,
+            self.host_generation,
+            Arc::clone(&self.terminal_signals),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.lifecycle.mark_faulted(generation);
+                return Err(error);
+            }
+        };
         // 先把 process/session 交给 supervisor，再通知 host hook，确保取消方始终能找到唯一资源 owner。
         self.process = Some(process);
         self.session = Some(session.clone());
@@ -409,6 +427,28 @@ impl SidecarSupervisor {
         deadline: Instant,
     ) -> Result<(), AppServerProcessError> {
         session.close_until(deadline)
+    }
+
+    /// 在宿主取消管道前完成唯一 shutdown 协议请求，不向上层暴露可任意发送的 Session API。
+    pub fn request_session_shutdown_until(
+        session: &Session,
+        deadline: Instant,
+    ) -> Result<(), AppServerProcessError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AppServerProcessError::ShutdownTimeout);
+        }
+        let response = session.request("runtime/shutdown", serde_json::json!({}), remaining)?;
+        let result = response
+            .result()
+            .value()
+            .ok_or(AppServerProcessError::ProtocolFault)?;
+        if result.get("accepted").and_then(Value::as_bool) != Some(true)
+            || result.get("status").and_then(Value::as_str) != Some("shutting_down")
+        {
+            return Err(AppServerProcessError::ProtocolFault);
+        }
+        Ok(())
     }
 
     /// 一次性移交唯一事件 pump；移交后 supervisor 不再提供 next_event 消费路径。
@@ -683,6 +723,23 @@ pub(crate) fn validate_turn_identity(
                 && valid_turn_content(object.get("content"))
                 && queued_content_within_budget(object.get("content"))
         }
+        "thread/message/send" => {
+            exact_keys(&[
+                "senderThreadId",
+                "targetThreadId",
+                "content",
+                "idempotencyKey",
+            ]) && valid_id("senderThreadId", "thr_", 100)
+                && valid_id("targetThreadId", "thr_", 100)
+                && valid_turn_content(object.get("content"))
+                && object
+                    .get("idempotencyKey")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| {
+                        !key.is_empty() && key.len() <= 128 && !key.chars().any(char::is_control)
+                    })
+        }
+        "task/close" => exact_keys(&["taskThreadId"]) && valid_id("taskThreadId", "thr_", 100),
         "approval/respond" => {
             exact_keys(&["approvalId", "turnId", "decision", "expectedThreadRevision"])
                 && valid_id("approvalId", "appr_", 101)

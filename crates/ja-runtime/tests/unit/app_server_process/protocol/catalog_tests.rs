@@ -78,7 +78,8 @@ fn turn_input_queue_errors_are_catalogued() {
     );
 }
 
-/// Task Threads 使用十个互不别名的方法，防止 QueueOnly message 被误路由为会启动 Turn 的 follow-up。
+/// Task Threads 的生命周期方法保持固定，普通消息使用独立 Thread 方法，防止 QueueOnly
+/// message 被误路由为会启动 Turn 的 follow-up。
 #[test]
 fn task_thread_methods_are_canonical() {
     let expected = [
@@ -88,10 +89,10 @@ fn task_thread_methods_are_canonical() {
         "task/observe",
         "task/unobserve",
         "task/seen",
-        "task/message/send",
         "task/followup",
         "task/cancel",
         "task/tree/delete",
+        "task/close",
     ];
     for method in expected {
         assert_eq!(
@@ -103,6 +104,13 @@ fn task_thread_methods_are_canonical() {
             "task method must appear exactly once: {method}"
         );
     }
+    assert_eq!(
+        V1_CLIENT_METHODS
+            .iter()
+            .filter(|candidate| **candidate == "thread/message/send")
+            .count(),
+        1
+    );
 }
 
 /// Task 与写租约错误逐项锁定 category/retryable，确保桌面端只对安全的 CAS、容量和超时重试。

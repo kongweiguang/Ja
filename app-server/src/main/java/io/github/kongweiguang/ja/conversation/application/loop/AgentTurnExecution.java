@@ -15,6 +15,7 @@ import io.github.kongweiguang.ja.conversation.application.context.checkpoint.Che
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
 import io.github.kongweiguang.ja.conversation.application.observation.ExecutionObservers;
 import io.github.kongweiguang.ja.conversation.application.presentation.ToolPresentationProjector;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
@@ -110,6 +111,9 @@ final class AgentTurnExecution {
         } catch (AgentLoop.InputNeedsAttentionException suspended) {
             /* SUSPENDED 不是 Turn 终态；恢复会作为新的执行尝试进入，不能在此伪造 completed。 */
             throw suspended;
+        } catch (InteractionSuspendedException suspended) {
+            /* Interaction 的 SUSPENDED 也不是失败终态，完成观察必须等待答案后的恢复链。 */
+            throw suspended;
         } catch (RuntimeException failure) {
             observers.observe(new ExecutionObserver.TurnCompleted(
                     request.threadId(), request.turnId(), failureStatus(failure), failureCode(failure)));
@@ -119,6 +123,7 @@ final class AgentTurnExecution {
 
     /**
      * 保持原有单一 Turn 状态机主体，外围只增加不参与决策的开始/完成观察，避免各失败分支重复通知。
+     * 搜索目录、预算估算与发送在各自安全点使用同一暴露策略，执行目录始终保留完整路由校验。
      */
     @SuppressWarnings("PMD.CloseResource")
     private TurnResult executeObserved(
@@ -145,7 +150,7 @@ final class AgentTurnExecution {
                  * 否则当前轮会拿到旧 Prompt/Skill catalog，直到再下一轮才生效。 */
                 boolean contextChanged = consumeQueuedInput(
                         request, state, ConversationRepository.InputKind.STEERING, sink);
-                contextChanged |= persistence.consumeTaskMailbox(request, state);
+                contextChanged |= persistence.consumeTaskMailbox(request, state, sink);
                 if (contextChanged) {
                     continuation = null;
                     continuationProfile = null;
@@ -178,8 +183,9 @@ final class AgentTurnExecution {
                     }, new DurableSummaryOperation(request, state, sink));
                     List<AgentTool> planningTools = new ArrayList<>(planningCommand.tools());
                     planningTools.addAll(planningMcp.tools());
+                    List<AgentTool> planningCatalog = contextMapper.toolCatalog(planningTools);
                     List<io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec> planningToolSpecs =
-                            planningTools.stream().map(AgentTool::spec).toList();
+                            planningCatalog.stream().map(AgentTool::spec).toList();
                     ModelPort.NativeAttachmentSupport planningNativeAttachments =
                             model.nativeAttachmentSupport(planningCommand.model());
                 ensureActive(cancellation);
@@ -255,7 +261,7 @@ final class AgentTurnExecution {
                     }
                     ModelPort.ModelRequest modelRequest = contextMapper.toModelRequest(
                             candidate, planningCommand.model(), prepared.snapshot(),
-                            planningToolSpecs,
+                            planningCatalog,
                             providerContinuation, modelRound, planningCommand.threadId(),
                             planningCommand.attachments(), planningNativeAttachments);
                     try {
@@ -312,10 +318,11 @@ final class AgentTurnExecution {
                                             dispatchMcp.open(dispatchCommand.toolSessions(), cancellation);
                                             List<AgentTool> dispatchTools = new ArrayList<>(dispatchCommand.tools());
                                             dispatchTools.addAll(dispatchMcp.tools());
+                                            List<AgentTool> dispatchCatalog = contextMapper.toolCatalog(dispatchTools);
                                             Map<String, AgentTool> dispatchToolCatalog =
-                                                    TurnExecutionPlan.createToolCatalog(dispatchTools);
+                                                    TurnExecutionPlan.createToolCatalog(dispatchCatalog);
                                             List<io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec>
-                                                    dispatchToolSpecs = dispatchTools.stream()
+                                                    dispatchToolSpecs = dispatchCatalog.stream()
                                                             .map(AgentTool::spec).toList();
                                             AgentPromptSession.PreparedPrompt dispatchPrompt =
                                                     dispatchCommand.promptSession().prepare(
@@ -333,7 +340,7 @@ final class AgentTurnExecution {
                                                     model.nativeAttachmentSupport(dispatchCommand.model());
                                             ModelPort.ModelRequest modelRequest = contextMapper.toModelRequest(
                                                     prompt, dispatchCommand.model(), dispatchPrompt.snapshot(),
-                                                    dispatchToolSpecs,
+                                                    dispatchCatalog,
                                                     dispatchContinuation, modelRound, dispatchCommand.threadId(),
                                                     dispatchCommand.attachments(), dispatchNativeAttachments);
                                             ModelPort.InputTokenEstimate dispatchEstimate =
@@ -427,14 +434,20 @@ final class AgentTurnExecution {
                 List<AgentTool.Invocation> calls = collector.orderedCalls();
                 if (outcome.finishReason() == ModelPort.FinishReason.STOP && calls.isEmpty()) {
                     long mutationVersionBeforeModelStep = state.turnMutationVersion;
-                    boolean continued = commitModelStep(request, command, state, sink,
-                            new ModelMessage(ModelRole.ASSISTANT, collector.assistantContent()),
-                            collector.reasoningSummary(), collector.usage(), round, List.of(), toolCatalog,
-                            promptCheckpointId, pending(state.execution), true);
-                    if (continued) {
+                    boolean continued;
+                    try {
+                        continued = commitModelStep(request, command, state, sink,
+                                new ModelMessage(ModelRole.ASSISTANT, collector.assistantContent()),
+                                collector.reasoningSummary(), collector.usage(), round, List.of(), toolCatalog,
+                                promptCheckpointId, pending(state.execution), true);
+                    } finally {
+                        /* emitWithNextInput 可能先提交 AssistantFact、再在事件投影或队首挂起处失败；
+                         * 只看异常会把已持久化的 reasoning 摘要误判为草稿，终态随后重复写入。 */
                         if (state.turnMutationVersion > mutationVersionBeforeModelStep) {
                             currentUsageDurability = UsageDurability.COMMITTED;
                         }
+                    }
+                    if (continued) {
                         continuation = null;
                         continue;
                     }
@@ -501,7 +514,7 @@ final class AgentTurnExecution {
                  * 直到全部 Tool 结果提交。崩溃恢复才会通过持久 binding 重新解析目录。 */
                 dispatched.closeRuntime();
                 executeTools(command, state, sink, cancellation, toolCatalog,
-                        (TurnExecutionState.Tools) state.execution);
+                        (TurnExecutionState.Tools) state.execution, dispatched.profile().collaborationMode());
                 // Tool batch 是已发生副作用的权威事实，必须先提交再响应取消；提交后立即终止，
                 // 禁止带着已发布取消位进入下一轮 Provider 并等待远端自行观察。
                 if (cancellation.isCancellationRequested()) {
@@ -554,6 +567,10 @@ final class AgentTurnExecution {
             } else if (!loopClosed.getAsBoolean() && !cancellation.isCancellationRequested()) {
                 throw new IllegalStateException("cleanup boundary reached without cancellation");
             }
+            if ("plan paused".equals(cancellation.reason().orElse(null))
+                    && persistence.suspendAfterPlanPause(request, state, sink)) {
+                throw new AgentLoop.PlanPauseSuspendedException();
+            }
             return terminal(
                     request,
                     sink,
@@ -563,7 +580,7 @@ final class AgentTurnExecution {
                     TurnState.CANCELLED,
                     current == null ? "" : current.terminalText(),
                     null,
-                    null,
+                    draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
                     current == null ? 0 : current.round(),
                     currentUsageDurability == UsageDurability.NOT_COMMITTED,
@@ -593,7 +610,7 @@ final class AgentTurnExecution {
                     TurnState.FAILED,
                     current == null ? "" : current.terminalText(),
                     null,
-                    null,
+                    draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
                     current == null ? 0 : current.round(),
                     currentUsageDurability == UsageDurability.NOT_COMMITTED,
@@ -610,7 +627,7 @@ final class AgentTurnExecution {
                     TurnState.FAILED,
                     current == null ? "" : current.terminalText(),
                     null,
-                    null,
+                    draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
                     current == null ? 0 : current.round(),
                     currentUsageDurability == UsageDurability.NOT_COMMITTED,
@@ -629,7 +646,7 @@ final class AgentTurnExecution {
                     TurnState.FAILED,
                     current == null ? "" : current.terminalText(),
                     null,
-                    null,
+                    draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
                     current == null ? 0 : current.round(),
                     currentUsageDurability == UsageDurability.NOT_COMMITTED,
@@ -641,6 +658,10 @@ final class AgentTurnExecution {
         } catch (AgentLoop.InputNeedsAttentionException attention) {
             /* 队首问题与 SUSPENDED 已先持久化；继续交给 TurnService 清理 Scope，禁止二次提交 FAILED。 */
             throw attention;
+        } catch (InteractionSuspendedException suspended) {
+            /* Interaction 请求与 cursor/Turn 状态在一个事务内提交，再释放 Provider/Tool 资源。 */
+            persistence.suspendForInteraction(request, state, suspended, sink);
+            throw suspended;
         } catch (RuntimeException failure) {
             logInternalFailure(failure);
             return terminal(
@@ -652,7 +673,7 @@ final class AgentTurnExecution {
                     TurnState.FAILED,
                     current == null ? "" : current.terminalText(),
                     null,
-                    null,
+                    draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
                     current == null ? 0 : current.round(),
                     currentUsageDurability == UsageDurability.NOT_COMMITTED,
@@ -922,7 +943,8 @@ final class AgentTurnExecution {
      */
     private void executeTools(TurnExecutionPlan request, AgentLoop.RuntimeState state, TurnEventSink sink,
                                CancellationToken cancellation, Map<String, AgentTool> catalog,
-                               TurnExecutionState.Tools tools) {
+                               TurnExecutionState.Tools tools,
+                               io.github.kongweiguang.ja.conversation.domain.CollaborationMode collaborationMode) {
         ConversationRepository.ThreadSnapshot snapshot = store.readThread(request.threadId())
                 .orElseThrow(() -> new AgentLoop.LoopFailure("INVALID_STATE", "Thread history is unavailable"));
         ModelMessage assistant = snapshot.messages().stream()
@@ -971,12 +993,14 @@ final class AgentTurnExecution {
                 () -> persistence.refreshExternalAuthority(request, state),
                 (approvalId, decision) -> persistence.publishExternalAuthorityEvent(
                         request, state, new TurnEvent.ApprovalResolved(
-                                persistence.draftContext(request, state), approvalId, decision), sink));
+                                persistence.draftContext(request, state), approvalId, decision), sink),
+                collaborationMode, toolRunner.goalTools());
         toolRunner.execute(execution, calls);
     }
 
     /**
-     * Tool batch 在 Provider 请求租约释放后重新解析当前目录，并只执行与持久 binding 精确相等的路由。
+     * Tool batch 在 Provider 请求租约释放后重新解析当前目录，并只执行与持久 binding 精确相等的路由；
+     * 恢复时也创建同一派生搜索工具，但不恢复旧 Gateway 或扩大 MCP 权限。
      */
     private void executeToolsWithLatestRuntime(TurnExecutionPlan request, AgentLoop.RuntimeState state,
                                                TurnEventSink sink, CancellationToken cancellation,
@@ -989,7 +1013,8 @@ final class AgentTurnExecution {
                 List<AgentTool> tools = new ArrayList<>(runtime.plan().tools());
                 tools.addAll(mcp.tools());
                 executeTools(runtime.plan(), state, sink, cancellation,
-                        TurnExecutionPlan.createToolCatalog(tools), toolsState);
+                        TurnExecutionPlan.createToolCatalog(contextMapper.toolCatalog(tools)), toolsState,
+                        runtime.profile().collaborationMode());
             } finally {
                 mcp.close();
             }
@@ -997,7 +1022,8 @@ final class AgentTurnExecution {
     }
 
     /**
-     * 先关闭 Turn 级 MCP 会话，再让最新取消声明覆盖候选结果，最后竞争唯一终态提交。
+     * 先关闭 Turn 级 MCP 会话，再让最新取消声明覆盖候选结果，最后竞争唯一终态提交；已公开的
+     * reasoning 摘要随终态事实保留，未闭合的原生 reasoning 不在此路径进入持久化。
      */
     private TurnResult terminal(
             TurnExecutionPlan request,
@@ -1019,7 +1045,6 @@ final class AgentTurnExecution {
         if (cancellation.isCancellationRequested()) {
             target = TurnState.CANCELLED;
             finalMessage = null;
-            reasoningSummary = null;
             errorCode = null;
             errorMessage = null;
         }
@@ -1027,7 +1052,6 @@ final class AgentTurnExecution {
             String failureReply = failureReplyPolicy.replyFor(errorCode);
             summary = failureReply;
             finalMessage = new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(failureReply)));
-            reasoningSummary = null;
         }
         return persistence.terminal(
                 request,
@@ -1046,6 +1070,15 @@ final class AgentTurnExecution {
                 committedUsage,
                 errorCode,
                 errorMessage);
+    }
+
+    /**
+     * 提取尚未随 AssistantFact 提交的公开 reasoning 摘要；完整模型块仍只在成功流中进入历史。
+     * Tool 轮次已经提交时由 {@link UsageDurability} 去重，避免终态再次生成相同摘要事实。
+     */
+    private static String draftReasoningSummary(AgentRound current, UsageDurability durability) {
+        if (current == null || durability == UsageDurability.COMMITTED) return null;
+        return current.reasoningSummary();
     }
 
     /**
@@ -1089,7 +1122,8 @@ final class AgentTurnExecution {
         return new TurnExecutionState.Common(modelRound,
                 Math.addExact(common.usedToolCalls(), toolCalls),
                 Math.addExact(common.nextProviderOrdinal(), 1),
-                promptCheckpointId, common.activeSkills(), common.deadlineAt(), common.origin());
+                promptCheckpointId, common.activeSkills(), common.deadlineAt(), common.origin(),
+                common.activeBudget());
     }
 
     /** 只有 READY 可以产生新的 Provider intent，避免一次崩溃窗口叠加两个可能计费请求。 */
@@ -1244,7 +1278,7 @@ final class AgentTurnExecution {
         private TurnExecutionState.Common advanceProviderOrdinal(TurnExecutionState.Common common) {
             return new TurnExecutionState.Common(common.modelRound(), common.usedToolCalls(),
                     Math.addExact(common.nextProviderOrdinal(), 1), common.promptCheckpointId(),
-                    common.activeSkills(), common.deadlineAt(), common.origin());
+                    common.activeSkills(), common.deadlineAt(), common.origin(), common.activeBudget());
         }
     }
 

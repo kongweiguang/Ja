@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.port.in.ApprovalUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
@@ -92,6 +93,7 @@ public final class RpcTestBindings {
                         (AttachmentPreviewUseCase) NO_ATTACHMENTS,
                 NO_TASKS,
                 NO_GOALS,
+                passiveInteractions(),
                 lifecycle);
     }
 
@@ -102,6 +104,7 @@ public final class RpcTestBindings {
     public static TaskUseCase passiveTasks() {
         return (TaskUseCase) Proxy.newProxyInstance(RpcTestBindings.class.getClassLoader(),
                 new Class<?>[]{TaskUseCase.class}, (proxy, method, arguments) -> {
+                    if ("closeTemporarySideChats".equals(method.getName())) return null;
                     if ("subscribe".equals(method.getName()) && method.getParameterCount() == 1) {
                         return (AutoCloseable) () -> { };
                     }
@@ -113,10 +116,20 @@ public final class RpcTestBindings {
     public static GoalUseCase passiveGoals() {
         return (GoalUseCase) Proxy.newProxyInstance(RpcTestBindings.class.getClassLoader(),
                 new Class<?>[]{GoalUseCase.class}, (proxy, method, arguments) -> {
-                    if ("subscribe".equals(method.getName()) && method.getParameterCount() == 1) {
+                    if (("subscribe".equals(method.getName()) || "subscribePlan".equals(method.getName()))
+                            && method.getParameterCount() == 1) {
                         return (AutoCloseable) () -> { };
                     }
                     if ("listTerminalActivities".equals(method.getName())) return java.util.List.of();
+                    throw unsupported();
+                });
+    }
+
+    /** 无问答场景只允许建立连接订阅，业务调用仍明确失败，避免假实现掩盖接线缺失。 */
+    public static InteractionUseCase passiveInteractions() {
+        return (InteractionUseCase) Proxy.newProxyInstance(RpcTestBindings.class.getClassLoader(),
+                new Class<?>[]{InteractionUseCase.class}, (proxy, method, arguments) -> {
+                    if ("subscribe".equals(method.getName())) return (AutoCloseable) () -> { };
                     throw unsupported();
                 });
     }

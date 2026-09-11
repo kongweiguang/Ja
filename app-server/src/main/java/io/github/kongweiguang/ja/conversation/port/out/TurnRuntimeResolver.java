@@ -15,6 +15,11 @@ public interface TurnRuntimeResolver {
      */
     RuntimeLease resolve(TurnRuntimeRequest request);
 
+    /** Run 准入前只解析配置预算；此时尚无 Turn binding，禁止提前组装工具与 Prompt。 */
+    default io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits resolveLimits(TurnRuntimeRequest request) {
+        throw new UnsupportedOperationException("runtime budget resolution is unavailable");
+    }
+
     /**
      * 在准入外预热工作区的非敏感 Schema，凭据仍只能在 Turn 租约内短时借用。
      */

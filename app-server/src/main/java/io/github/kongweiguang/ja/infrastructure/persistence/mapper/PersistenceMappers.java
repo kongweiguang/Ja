@@ -10,7 +10,10 @@ import org.apache.ibatis.session.SqlSession;
 public record PersistenceMappers(HistoryMapper history, AgentMapper agent, CheckpointMapper checkpoint,
                                  RecoveryMapper recovery, SchemaMapper schema,
                                  InstructionScopeMapper instructionScopes, AttachmentMapper attachments,
-                                 TaskMapper tasks) {
+                                 TaskMapper tasks, SubagentPolicyMapper subagentPolicies,
+                                 InteractionMapper interactions, PlanEvaluationMapper planEvaluations,
+                                 ThreadDiscoveryMapper threadDiscoveries, SideChatMapper sideChats,
+                                 SideChatPurgeMapper sideChatPurges) {
     /**
      * 从同一 SqlSession 创建所有职责 Mapper，保证跨表事实仍共享一个事务。
      */
@@ -21,6 +24,11 @@ public record PersistenceMappers(HistoryMapper history, AgentMapper agent, Check
                 session.getMapper(SchemaMapper.class),
                 session.getMapper(InstructionScopeMapper.class),
                 session.getMapper(AttachmentMapper.class),
-                session.getMapper(TaskMapper.class));
+                session.getMapper(TaskMapper.class),
+                session.getMapper(SubagentPolicyMapper.class),
+                session.getMapper(InteractionMapper.class),
+                session.getMapper(PlanEvaluationMapper.class),
+                session.getMapper(ThreadDiscoveryMapper.class), session.getMapper(SideChatMapper.class),
+                session.getMapper(SideChatPurgeMapper.class));
     }
 }

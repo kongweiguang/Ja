@@ -81,16 +81,16 @@ final class JaSkillSourcesTest {
         JaSkillSources catalog = new JaSkillSources();
         SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
 
-        assertEquals(List.of("large-assets", "coding"), discovered.skills().stream()
+        assertEquals(List.of("large-assets"), discovered.skills().stream()
                 .map(SkillCatalog.SkillDescriptor::name).toList());
         assertEquals("small body", read(catalog, discovered, "large-assets", "SKILL.md", 100).content());
         assertThrows(UncheckedIOException.class,
                 () -> read(catalog, discovered, "large-assets", "huge.txt", 100));
     }
 
-    /** 四级来源按高优先级到低优先级稳定展示，Ja user 覆盖通用 user 同名包。 */
+    /** 文件来源按高优先级到低优先级稳定展示，空内置来源不补入默认 Skill。 */
     @Test
-    void resolvesFourSourcesByPriorityThenName() throws Exception {
+    void resolvesFilesystemSourcesByPriorityThenName() throws Exception {
         Path agents = Files.createDirectories(temporary.resolve("agents-skills"));
         Path ja = Files.createDirectories(temporary.resolve("ja-skills"));
         Path workspace = Files.createDirectories(temporary.resolve("project"));
@@ -105,7 +105,7 @@ final class JaSkillSourcesTest {
         JaSkillSources catalog = new JaSkillSources();
         SkillCatalog.Catalog discovered = catalog.discover(request(workspace, agents, ja, true));
 
-        assertEquals(List.of("workspace-only", "ja-only", "shared", "user-only", "coding"),
+        assertEquals(List.of("workspace-only", "ja-only", "shared", "user-only"),
                 discovered.skills().stream().map(SkillCatalog.SkillDescriptor::name).toList());
         assertEquals(SkillCatalog.Source.JA_USER, descriptor(discovered, "shared").source());
         assertEquals("ja", read(catalog, discovered, "shared", "SKILL.md", 100).content());
@@ -359,19 +359,17 @@ final class JaSkillSourcesTest {
                 () -> read(catalog, discovered, "junction", "alias/outside.txt", 100));
     }
 
-    /** 内置 coding 只在目录公开元数据，正文仍由显式 read 按需加载而不在发现阶段冻结。 */
+    /** 没有用户或项目 Skill 时目录必须为空，显式读取也不能恢复已移除的默认 coding。 */
     @Test
-    void discoversBuiltinCodingSkillAndReadsItsDocumentOnDemand() throws Exception {
+    void discoversNoDefaultSkillsWithoutFilesystemPackages() throws Exception {
         Path user = temporary.resolve("absent-user");
         Path workspace = Files.createDirectories(temporary.resolve("workspace"));
         JaSkillSources catalog = new JaSkillSources();
         SkillCatalog.Catalog discovered = catalog.discover(request(workspace, user));
 
-        assertEquals(List.of("coding"), discovered.skills().stream()
-                .map(SkillCatalog.SkillDescriptor::name).toList());
-        assertEquals(SkillCatalog.Source.BUNDLED, descriptor(discovered, "coding").source());
-        assertTrue(read(catalog, discovered, "coding", "SKILL.md", 2_000).content()
-                .contains("# Ja coding skill"));
+        assertTrue(discovered.skills().isEmpty());
+        assertThrows(IllegalArgumentException.class,
+                () -> read(catalog, discovered, "coding", "SKILL.md", 2_000));
     }
 
     /** 创建公开 Kernel API 所要求的绝对发现请求，避免测试夹具隐含路径语义。 */

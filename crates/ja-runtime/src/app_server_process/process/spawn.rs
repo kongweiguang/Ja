@@ -104,12 +104,15 @@ impl RunningProcess {
 pub(crate) fn spawn_process(
     config: &SidecarConfig,
     generation: u64,
+    host_generation: u64,
     terminal_signals: Arc<Mutex<VecDeque<TerminalSignal>>>,
 ) -> Result<(Arc<RunningProcess>, Session), AppServerProcessError> {
     config.verify_executable_identity()?;
     let mut command = Command::new(config.canonical_executable());
     command
         .args(&config.args)
+        // Host generation 是事件投影的唯一 fence，必须由 Rust owner 注入，不能由配置或 Java 自行猜测。
+        .arg(format!("--ja-runtime-generation={host_generation}"))
         .current_dir(config.canonical_run_dir())
         .env_clear()
         .envs(config.env.iter())

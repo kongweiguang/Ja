@@ -74,7 +74,7 @@ final class LogbackFilePersistenceTest {
         Path run = temporaryDirectory.resolve("run").toAbsolutePath().normalize();
         SidecarConfiguration configuration = SidecarConfiguration.fromArgs(
                 new String[]{argument("home", home), argument("data", data), argument("run", run),
-                        argument("log", logDirectory)});
+                        argument("log", logDirectory), "--ja-runtime-generation=1"});
         assertEquals(logDirectory, configuration.logDirectory());
     }
 

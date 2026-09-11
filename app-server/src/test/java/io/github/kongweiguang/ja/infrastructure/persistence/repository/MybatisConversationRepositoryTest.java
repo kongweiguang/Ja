@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
+import io.github.kongweiguang.ja.conversation.domain.SubagentPolicy;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
@@ -17,6 +18,7 @@ import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 
@@ -72,10 +74,51 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /** 真实临时 SQLite 覆盖 V1 schema、事务原子性、恢复、CAS 与完整 blocks。 */
 final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
+    /** Thread 创建只读取当时的全局策略；设置源变化与仓储重开都不能改写旧会话快照。 */
+    @Test
+    void freezesSubagentPolicyPerThreadAndAcrossRepositoryRestart() throws Exception {
+        AtomicReference<SubagentPolicy> current = new AtomicReference<>(
+                new SubagentPolicy(false, "provider_child", "model_child", "high"));
+        try (TestDatabase database = database("thread-subagent-snapshot")) {
+            MybatisConversationRepository first = database.agentStore(current::get);
+            database.history(first).register(new Workspace.Registration("ws_policy",
+                    database.path().getParent(), "policy", Workspace.Trust.TRUSTED, START));
+            first.createThread(new ConversationRepository.ThreadDefinition(
+                    "thr_policy_old", "ws_policy", "old", preferences("provider_1", "model_1"), START));
+
+            current.set(SubagentPolicy.defaultPolicy());
+            first.createThread(new ConversationRepository.ThreadDefinition(
+                    "thr_policy_new", "ws_policy", "new", preferences("provider_1", "model_1"),
+                    START.plusSeconds(1)));
+
+            assertPolicy(database, "thr_policy_old", false, "provider_child", "model_child", "high");
+            assertPolicy(database, "thr_policy_new", true, null, null, null);
+        }
+
+        try (TestDatabase reopened = database("thread-subagent-snapshot")) {
+            assertPolicy(reopened, "thr_policy_old", false, "provider_child", "model_child", "high");
+            assertPolicy(reopened, "thr_policy_new", true, null, null, null);
+        }
+    }
+
+    /** 直接读取 SQLite 快照行，避免通过可变全局设置伪造重启后的断言。 */
+    private static void assertPolicy(TestDatabase database, String threadId, boolean enabled,
+                                     String providerId, String modelId, String reasoningLevel) throws Exception {
+        try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession()) {
+            PersistenceRecords.SubagentPolicyRow row = PersistenceMappers.open(session)
+                    .subagentPolicies().select(threadId);
+            assertNotNull(row);
+            assertEquals(enabled, row.enabled());
+            assertEquals(providerId, row.providerId());
+            assertEquals(modelId, row.modelId());
+            assertEquals(reasoningLevel, row.reasoningLevel());
+        }
+    }
     /**
      * CRUD 只能推进队列 revision；提升按点击先后移到普通消息之前，重复提升保持幂等，
      * 而编辑/删除必须以条目 revision 拒绝过期操作。
@@ -272,28 +315,81 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
         }
     }
 
-    /** 失败和取消终态拒绝 reasoning 事实，避免调用方错误传值污染历史时间线。 */
+    /** 原生 reasoning 不是只存在于 Codec：真实 SQLite 提交、关闭、重开后仍须保留完整 opaque block。 */
     @Test
-    void rejectsReasoningSummaryForNonSuccessfulTerminal() throws Exception {
+    void persistsNativeReasoningAcrossRepositoryRestart() throws Exception {
+        String databaseName = "native-reasoning-restart";
+        ReasoningContent reasoning = new ReasoningContent(
+                "provider_1", "model_1", "openai_responses", "test-model",
+                ReasoningContent.endpointFingerprint(java.net.URI.create("https://api.example/v1")),
+                "reasoning", "{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}");
+        ModelMessage assistant = new ModelMessage(ModelRole.ASSISTANT,
+                List.of(new TextContent("visible"), reasoning, new TextContent("answer")));
+
+        try (TestDatabase database = database(databaseName)) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            ConversationRepository.CommitReceipt running = store.commit(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING, List.of(),
+                    admission.turnMutationVersion(), START.plusSeconds(1)));
+            store.commitTerminal(new ConversationRepository.TerminalCommit(
+                    "thr_1", "turn_1", TurnState.COMPLETED, "visibleanswer", null, null,
+                    "item_native_reasoning", assistant, List.of(), running.turnMutationVersion(),
+                    START.plusSeconds(2)));
+        }
+
+        try (TestDatabase reopened = database(databaseName)) {
+            ModelMessage restored = reopened.agentStore().readThread("thr_1").orElseThrow().messages().stream()
+                    .filter(message -> message.messageId().equals("item_native_reasoning"))
+                    .findFirst().orElseThrow().message();
+            assertEquals(assistantBlocks(assistant), assistantBlocks(restored));
+            ReasoningContent restoredReasoning = assertInstanceOf(ReasoningContent.class,
+                    restored.content().get(1));
+            assertEquals(reasoning, restoredReasoning);
+        }
+    }
+
+    /** 只比较块的有序类型和值，避免重启测试依赖 record 的内部实现细节。 */
+    private static List<String> assistantBlocks(ModelMessage message) {
+        return message.content().stream().map(block -> switch (block) {
+            case TextContent text -> "text:" + text.text();
+            case ReasoningContent reasoning -> "reasoning:" + reasoning.nativeJson();
+            default -> block.getClass().getSimpleName();
+        }).toList();
+    }
+
+
+    /** 失败和取消终态保留已公开 reasoning 摘要，但不创建最终 Assistant 消息。 */
+    @Test
+    void persistsReasoningSummaryForNonSuccessfulTerminal() throws Exception {
         for (TurnState target : List.of(TurnState.FAILED, TurnState.CANCELLED)) {
-            try (TestDatabase database = database("terminal-reasoning-reject-" + target.name().toLowerCase())) {
+            try (TestDatabase database = database("terminal-reasoning-non-success-" + target.name().toLowerCase())) {
                 MybatisConversationRepository store = initialized(database);
                 ConversationRepository.AdmissionReceipt admission = admit(store);
                 ConversationRepository.CommitReceipt running = store.commit(commitRequest(
                         "thr_1", "turn_1", TurnState.RUNNING, List.of(),
                         admission.turnMutationVersion(), START.plusSeconds(1)));
 
-                StorageException failure = assertThrows(StorageException.class, () -> store.commitTerminal(
-                        new ConversationRepository.TerminalCommit(
-                                "thr_1", "turn_1", target, "terminal", "TEST", "terminal",
-                                null, null,
-                                List.of(new ConversationRepository.ReasoningSummaryFact(
-                                        "item_rejected", "must not persist", 1)),
-                                running.turnMutationVersion(), START.plusSeconds(2))));
-                assertInstanceOf(IllegalArgumentException.class, failure.getCause());
-                assertTrue(database.history(store).readThread("thr_1", null, 20).orElseThrow().items().stream()
-                        .noneMatch(item -> item instanceof ThreadSnapshot.TextItem text
-                                && text.kind() == ThreadSnapshot.TextKind.REASONING_SUMMARY));
+                store.commitTerminal(new ConversationRepository.TerminalCommit(
+                        "thr_1", "turn_1", target, "terminal", "TEST", "terminal",
+                        null, null,
+                        List.of(new ConversationRepository.ReasoningSummaryFact(
+                                "item_reasoning_non_success", "already displayed", 1)),
+                        running.turnMutationVersion(), START.plusSeconds(2)));
+                List<ThreadSnapshot.Item> items = database.history(store)
+                        .readThread("thr_1", null, 20).orElseThrow().items();
+                List<ThreadSnapshot.TextItem> textItems = items.stream()
+                        .filter(ThreadSnapshot.TextItem.class::isInstance)
+                        .map(ThreadSnapshot.TextItem.class::cast)
+                        .toList();
+                assertEquals(1, textItems.stream().filter(item -> item.kind()
+                        == ThreadSnapshot.TextKind.REASONING_SUMMARY).count());
+                assertEquals(0, textItems.stream().filter(item -> item.kind()
+                        == ThreadSnapshot.TextKind.FINAL_ANSWER).count());
+                ThreadSnapshot.TextItem reasoning = textItems.stream().filter(item -> item.kind()
+                        == ThreadSnapshot.TextKind.REASONING_SUMMARY).findFirst().orElseThrow();
+                assertEquals(ThreadSnapshot.TextKind.REASONING_SUMMARY, reasoning.kind());
+                assertEquals("already displayed", reasoning.text());
             }
         }
     }
@@ -819,7 +915,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                 }
             };
             MybatisConversationRepository failing = new MybatisConversationRepository(database.sessions(), database.mapper(),
-                    rollbackOwner);
+                    rollbackOwner, SubagentPolicy::defaultPolicy);
             assertThrows(StorageException.class, () -> failing.claimCancellation("thr_1", "turn_1",
                     admission.threadRevision(), "rollback", START.plusSeconds(1)));
 
@@ -1330,6 +1426,77 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         }
     }
 
+    /** 新需求在挂起期间替代问题必须同时结算原 Tool 与进入 steering 队列，不能伪造选项答案。 */
+    @Test void supersedesPendingInteractionAtomicallyWithSteering() throws Exception {
+        try (TestDatabase database = database("interaction-steering")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            TurnExecutionState.Tools tools = new TurnExecutionState.Tools(
+                    execution("cfg_1").common(), "batch_fixture", "item_interaction", 0, 0, 0);
+            var committed = store.commit(commitRequest("thr_1", "turn_1", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolPreparedFact("call_question", "request_user_input",
+                            JsonObjects.builder().build(), 0, ToolSideEffect.READ_ONLY,
+                            presentation(ToolPresentation.Status.PENDING), binding("batch_fixture", "call_question", "request_user_input")),
+                            new ConversationRepository.ToolStartedFact("call_question")), admission.turnMutationVersion(), START.plusSeconds(1), tools));
+            var question = new io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestion(
+                    "question_target", "选择目标", io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestionType.TEXT,
+                    List.of(), true, true);
+            var interaction = new io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest(
+                    "interaction_steering", "thr_1", "turn_1", "call_question", null, null, null,
+                    "interaction-steering", List.of(question), io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus.PENDING,
+                    List.of(), 0, START.plusSeconds(2), START.plusSeconds(2));
+            store.suspendForInteraction(new ConversationRepository.InteractionSuspensionRequest(interaction, tools,
+                    committed.turnMutationVersion(), START.plusSeconds(2)));
+            var queued = store.enqueueInput(pending("input_revised", ConversationRepository.InputKind.FOLLOW_UP,
+                    "换一种方案", START.plusSeconds(3)));
+            assertEquals(InputQueue.Kind.STEERING, queued.inputQueue().items().getFirst().kind());
+            assertInstanceOf(TurnExecutionState.Ready.class, store.findResumeCandidate("turn_1").orElseThrow().execution());
+            try (var session = database.sessions().openSession()) {
+                assertEquals("SUPERSEDED", session.getMapper(io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper.class)
+                        .selectInteraction(new PersistenceRecords.InteractionKey("thr_1", "interaction_steering")).status());
+            }
+        }
+    }
+
+    /** 取消问答必须留下配对 ToolResult，并关闭工具游标，下一轮不能读到悬空工具消息。 */
+    @Test void cancellingInteractionSettlesToolTranscriptOnce() throws Exception {
+        try (TestDatabase database = database("interaction-cancel-transcript")) {
+            MybatisConversationRepository store = initialized(database);
+            var admission = admit(store);
+            var tools = new TurnExecutionState.Tools(execution("cfg_1").common(),
+                    "batch_fixture", "item_interaction", 0, 0, 0);
+            var committed = store.commit(commitRequest("thr_1", "turn_1", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolPreparedFact("call_question", "request_user_input",
+                            JsonObjects.builder().build(), 0, ToolSideEffect.READ_ONLY,
+                            presentation(ToolPresentation.Status.PENDING), binding("batch_fixture", "call_question", "request_user_input")),
+                            new ConversationRepository.ToolStartedFact("call_question")),
+                    admission.turnMutationVersion(), START.plusSeconds(1), tools));
+            var question = new io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestion(
+                    "question_target", "选择目标", io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestionType.TEXT,
+                    List.of(), true, true);
+            var request = new io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest(
+                    "interaction_cancel", "thr_1", "turn_1", "call_question", null, null, null,
+                    "question-key", List.of(question), io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus.PENDING,
+                    List.of(), 0, START.plusSeconds(2), START.plusSeconds(2));
+            store.suspendForInteraction(new ConversationRepository.InteractionSuspensionRequest(request, tools,
+                    committed.turnMutationVersion(), START.plusSeconds(2)));
+            var interactions = database.interactions();
+            var cancelled = interactions.close("thr_1", "interaction_cancel", 0,
+                    io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus.CANCELLED, "cancel-key", START.plusSeconds(3));
+            assertEquals(cancelled, interactions.close("thr_1", "interaction_cancel", 0,
+                    io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus.CANCELLED, "cancel-key", START.plusSeconds(3)));
+            assertEquals(TurnState.CANCELLED, store.findTurn("thr_1", "turn_1").orElseThrow().state());
+            assertTrue(store.findResumeCandidate("turn_1").isEmpty());
+            var results = toolResults(store.readThread("thr_1").orElseThrow());
+            assertEquals(1, results.size());
+            assertEquals("call_question", results.getFirst().callId());
+            assertTrue(results.getFirst().error());
+            try (var session = database.sessions().openSession()) {
+                assertEquals(0, session.getMapper(AgentMapper.class).countUnfinishedTools("turn_1"));
+            }
+        }
+    }
+
     /** RUNNING READ_ONLY 也必须写入标准绑定失效结果，避免恢复路径以只读为由重放调用。 */
     @Test
     void settlesRunningReadOnlyToolWithoutReplay() throws Exception {
@@ -1746,6 +1913,35 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
     }
 
     /** 审批决定提交后的强杀窗口保留决定，但关闭未执行 Tool 并继续到下一次 Assistant 请求。 */
+    /** 已提交取消后仍须持久拒绝审批来唤醒 Broker，但不能复活 RUNNING 或放行 APPROVE。 */
+    @Test void cancellationCanSettleApprovalWithoutRevivingTurn() throws Exception {
+        try (TestDatabase database = database("cancel-approval-waiter")) {
+            MybatisConversationRepository store = initialized(database);
+            var admission = admit(store);
+            var tools = new TurnExecutionState.Tools(execution("cfg_1").common(),
+                    "batch_fixture", "item_assistant", 0, 0, 0);
+            var prepared = store.commit(commitRequest("thr_1", "turn_1", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolPreparedFact("call_approval", "edit",
+                            textArguments("path", "README.md"), 0, ToolSideEffect.EXTERNAL,
+                            presentation(ToolPresentation.Status.PENDING), binding("batch_fixture", "call_approval", "edit"))),
+                    admission.turnMutationVersion(), START.plusSeconds(1), tools));
+            var waiting = store.commit(commitRequest("thr_1", "turn_1", TurnState.WAITING_APPROVAL,
+                    List.of(new ConversationRepository.ApprovalFact("appr_cancel", "call_approval", null,
+                            START.plusSeconds(60), presentation(ToolPresentation.Status.WAITING_APPROVAL))),
+                    prepared.turnMutationVersion(), START.plusSeconds(2), tools));
+            store.claimCancellation("thr_1", "turn_1", waiting.threadRevision(), "stop", START.plusSeconds(3));
+            assertFalse(store.resolveApproval("appr_cancel", ApprovalDecision.APPROVE, START.plusSeconds(4)));
+            assertTrue(store.resolveApproval("appr_cancel", ApprovalDecision.DENY, START.plusSeconds(4)));
+            assertFalse(store.resolveApproval("appr_cancel", ApprovalDecision.DENY, START.plusSeconds(4)));
+            assertEquals(TurnState.WAITING_APPROVAL, store.findTurn("thr_1", "turn_1").orElseThrow().state());
+            try (var session = database.sessions().openSession()) {
+                assertNotNull(session.getMapper(AgentMapper.class)
+                        .selectTurn(new PersistenceRecords.TurnKey("thr_1", "turn_1")).cancelRequestedAt());
+            }
+        }
+    }
+
+    /** 启动恢复必须保留已落库的审批与 Tool 执行游标，避免重放未知副作用或丢失待处理审批。 */
     @Test
     void approvalDecisionPreservesToolsExecutionAcrossStartupRecovery() throws Exception {
         try (TestDatabase database = database("approval-decision-recovery")) {

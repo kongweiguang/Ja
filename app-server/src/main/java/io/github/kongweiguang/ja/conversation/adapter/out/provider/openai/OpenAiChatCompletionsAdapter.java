@@ -65,7 +65,7 @@ public final class OpenAiChatCompletionsAdapter extends AbstractStreamingModelAd
     /** 通过唯一共享传输路径执行预编码的普通或 Summary Chat 请求。 */
     public ModelPort.ModelOutcome executeEncoded(
             ProviderRequestEnvelope envelope, StreamContext context, RequestController controller) {
-        OpenAiChatCompletionsState state = new OpenAiChatCompletionsState();
+        OpenAiChatCompletionsState state = new OpenAiChatCompletionsState(configuration());
         Request request = OpenAiProviderSupport.ssePost(
                 configuration(), envelope.sendBody(), "/v1/chat/completions");
         executeChatSse(httpClient(), request, controller, OpenAiProviderSupport::serviceFailure,

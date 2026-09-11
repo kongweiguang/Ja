@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-type Palette = "xcode" | "fleet" | "obsidian" | "claude";
+type Palette = "xcode" | "ja" | "jetbrains" | "obsidian" | "claude";
 type Mode = "light" | "dark";
 
 const TOKENS_FILE = join(process.cwd(), "apps", "desktop", "src", "shared", "styles", "tokens.css");
@@ -22,7 +22,7 @@ const APP_STYLES_FILE = join(process.cwd(), "apps", "desktop", "src", "app", "Ap
 const TOKENS_SOURCE = readFileSync(TOKENS_FILE, "utf8").toLowerCase();
 const PRIMITIVES_SOURCE = readFileSync(PRIMITIVES_FILE, "utf8").toLowerCase();
 const APP_STYLES_SOURCE = readFileSync(APP_STYLES_FILE, "utf8").toLowerCase();
-const PALETTES: readonly Palette[] = ["xcode", "fleet", "obsidian", "claude"];
+const PALETTES: readonly Palette[] = ["xcode", "ja", "jetbrains", "obsidian", "claude"];
 const MODES: readonly Mode[] = ["light", "dark"];
 
 const REQUIRED_COLOR_TOKENS = [
@@ -97,10 +97,12 @@ const REQUIRED_COLOR_TOKENS = [
 ] as const;
 
 const ANCHORS: Readonly<Record<`${Palette}-${Mode}`, readonly [string, string, string]>> = {
+  "jetbrains-light": ["#e9eaee", "#ffffff", "#3871e1"],
+  "jetbrains-dark": ["#26282c", "#191a1c", "#3871e1"],
   "xcode-light": ["#f5f5f5", "#ffffff", "#007aff"],
   "xcode-dark": ["#1c1d2b", "#292a30", "#0a84ff"],
-  "fleet-light": ["#f2f2f2", "#ffffff", "#726cf9"],
-  "fleet-dark": ["#090909", "#18191b", "#726cf9"],
+  "ja-light": ["#f2f2f2", "#ffffff", "#726cf9"],
+  "ja-dark": ["#090909", "#18191b", "#726cf9"],
   "obsidian-light": ["#f6f6f6", "#ffffff", "#9873f7"],
   "obsidian-dark": ["#1e1e1e", "#242424", "#8a5cf5"],
   "claude-light": ["#f5f4ed", "#faf9f5", "#d97757"],
@@ -151,7 +153,7 @@ function parseHex(value: string): readonly [number, number, number] {
   ) as unknown as readonly [number, number, number];
 }
 
-/** WCAG 相对亮度在 sRGB 线性空间计算，确保八组合使用同一客观阈值。 */
+/** WCAG 相对亮度在 sRGB 线性空间计算，确保十组合使用同一客观阈值。 */
 function relativeLuminance(value: string): number {
   const channels = parseHex(value).map((channel) => {
     const normalized = channel / 255;
@@ -170,7 +172,7 @@ function contrastRatio(first: string, second: string): number {
   );
 }
 
-describe("four-palette semantic token contract", () => {
+describe("five-palette semantic token contract", () => {
   it("resolves every required role for all eight palette and mode combinations", () => {
     for (const palette of PALETTES) {
       for (const mode of MODES) {

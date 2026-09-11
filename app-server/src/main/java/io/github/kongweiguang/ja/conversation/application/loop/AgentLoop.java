@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.conversation.application.observation.ExecutionO
 import io.github.kongweiguang.ja.conversation.application.policy.ToolPolicyChain;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.TurnResult;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
@@ -63,7 +64,7 @@ public final class AgentLoop implements DeadlineCloseable {
             List<? extends ToolPolicy> policies,
             List<? extends ExecutionObserver> observers) {
         this(model, approvalBroker, store, contextFactory,
-                argumentsCodec, argumentValidator, policies, observers, Clock.systemUTC());
+                argumentsCodec, argumentValidator, policies, observers, Clock.systemUTC(), (request, sequence) -> { });
     }
 
     /**
@@ -100,6 +101,22 @@ public final class AgentLoop implements DeadlineCloseable {
             List<? extends ToolPolicy> policies,
             List<? extends ExecutionObserver> observers,
             Clock clock) {
+        this(model, approvalBroker, store, contextFactory, argumentsCodec, argumentValidator,
+                policies, observers, clock, (request, sequence) -> { });
+    }
+
+    /** 生产组合根注入 Interaction 提交后通知器；其它调用方保持无订阅依赖。 */
+    public AgentLoop(
+            ModelPort model,
+            ApprovalBroker approvalBroker,
+            ConversationRepository store,
+            ContextOrchestratorFactory contextFactory,
+            JsonValueCodec argumentsCodec,
+            ToolArgumentValidator argumentValidator,
+            List<? extends ToolPolicy> policies,
+            List<? extends ExecutionObserver> observers,
+            Clock clock,
+            java.util.function.BiConsumer<InteractionRequest, Long> interactionPublisher) {
         ModelPort requiredModel = Objects.requireNonNull(model, "model");
         ConversationRepository requiredStore = Objects.requireNonNull(store, "store");
         approvalBroker.bindDecisionStore(requiredStore::resolveApproval);
@@ -112,7 +129,8 @@ public final class AgentLoop implements DeadlineCloseable {
         ExecutionObservers executionObservers = new ExecutionObservers(observers);
         this.taskMailboxInbox = new TaskMailboxInbox();
         AgentLoopPersistence persistence = new AgentLoopPersistence(
-                requiredStore, requiredClock, executionObservers, taskMailboxInbox);
+                requiredStore, requiredClock, executionObservers, taskMailboxInbox,
+                Objects.requireNonNull(interactionPublisher, "interactionPublisher"));
         this.deltaTimers = new DeltaTimerScheduler();
         this.toolRunner =
                 new AgentToolRunner(Objects.requireNonNull(approvalBroker, "approvalBroker"),
@@ -413,6 +431,17 @@ public final class AgentLoop implements DeadlineCloseable {
         /** 返回队列问题闭集中的稳定错误码。 */
         public String errorCode() {
             return errorCode;
+        }
+    }
+
+    /** Plan pause 在安全点保留 execution cursor 后结束当前 owner，等待用户显式 Resume。 */
+    public static final class PlanPauseSuspendedException extends IllegalStateException {
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        /** 固定控制流消息，不把 Provider 或工具细节带到 RPC。 */
+        public PlanPauseSuspendedException() {
+            super("plan turn suspended");
         }
     }
 

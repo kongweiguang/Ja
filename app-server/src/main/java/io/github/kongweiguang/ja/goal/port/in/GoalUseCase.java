@@ -26,11 +26,17 @@ public interface GoalUseCase {
     /** 注册唯一运行连接的事件出口；关闭句柄只取消进程内订阅。 */
     AutoCloseable subscribe(GoalEventSink sink);
 
+    /** Plan observation 与 Goal observation 分离，连接关闭只撤销自身计划订阅。 */
+    AutoCloseable subscribePlan(PlanEventSink sink);
+
     /** 返回同一事务边界内的 Goal、可选 link 与 Goal 验收投影。 */
     GoalSnapshot read(String goalId);
 
     /** 返回独立 Plan aggregate 的草稿、冻结版本、批准与 run 投影。 */
     PlanSnapshot readPlan(String planId);
+
+    /** 重启后按 owner 恢复最近计划，不要求前端提前知道 Plan identity 或存在 Goal。 */
+    Optional<PlanSnapshot> findCurrentPlan(String ownerThreadId);
 
     /** 为 Extension 冻结 owner 当前 Goal identity；缺失时返回空而不暴露 Repository。 */
     default Optional<GoalTurnContext> currentGoalContext(String ownerThreadId) { return Optional.empty(); }
@@ -51,6 +57,9 @@ public interface GoalUseCase {
     /** 按 opaque cursor 分页读取用户可见历史。 */
     Page<PublicEvent> readEvents(String goalId, String cursor, int limit);
 
+    /** 独立 Plan 事件查询使用自己的水位，供 Workbench 增量对账。 */
+    Page<PublicEvent> readPlanEvents(String planId, String cursor, int limit);
+
     /** 为 owner Thread 恢复有界 Goal 终态时间线，不读取计划正文或运行期事件。 */
     List<TerminalActivity> listTerminalActivities(String ownerThreadId, int limit);
 
@@ -60,6 +69,10 @@ public interface GoalUseCase {
     /** 按 Goal definition revision 分页读取验收证据；Plan revision 可为空。 */
     Page<Evidence> listEvidence(String goalId, long goalDefinitionRevision,
                                 String planRevisionId, String cursor, int limit);
+
+    /** Plan evidence 必须精确绑定当前冻结 revision 与 run。 */
+    Page<Evidence> listPlanEvidence(String planId, String planRevisionId, String runId,
+                                    String cursor, int limit);
 
     /** 创建 ACTIVE/WORKING Goal，并冻结初始 definition 与 Goal-only run。 */
     Goal create(Create command);
@@ -88,6 +101,22 @@ public interface GoalUseCase {
      */
     Plan executePlan(ExecutePlan command, PlanExecutionEventSink events);
 
+    /** Plan 执行控制与 Goal 控制分离；每个动作只作用于精确的 run identity。 */
+    Plan pausePlan(PlanControl command);
+
+    /** 从 PAUSED 恢复原 run，不重新批准或创建第二个 run。 */
+    Plan resumePlan(PlanControl command);
+
+    /**
+     * 由发起恢复动作的连接提供 Plan Turn 事件出口；默认实现仅兼容无连接的内部调用。
+     */
+    default Plan resumePlan(PlanControl command, PlanExecutionEventSink events) {
+        return resumePlan(command);
+    }
+
+    /** 停止 Plan run 并保留审计事实，不自动回滚工作区。 */
+    Plan stopPlan(PlanControl command);
+
     /** UI 拒绝当前待批准 revision 并回到 planning。 */
     Plan reject(Reject command);
 
@@ -106,14 +135,8 @@ public interface GoalUseCase {
     /** Agent 推进独立 Plan run；Goal run 与 Plan run 的 CAS 不得混用。 */
     Plan updatePlanStep(PlanStepUpdate command);
 
-    /** Agent 显式请求用户输入，不能伪造 USER 消息。 */
-    Goal requestInput(InputRequest command);
-
     /** Agent 请求独立 evaluator intent。 */
     Goal requestEvaluation(EvaluationRequest command);
-
-    /** UI 回答当前未决输入，响应作为 JSON string 持久化。 */
-    Goal respondInput(InputResponse command);
 
     /** 创建命令保留 owner Thread revision。 */
     record Create(String ownerThreadId, boolean independentTask, String objective,
@@ -146,7 +169,10 @@ public interface GoalUseCase {
                        String planHash, long processGeneration, String idempotencyKey, Instant at) { }
     /** 拒绝原因进入事件摘要边界，revision/hash 由服务端从当前快照锁定。 */
     record Reject(String planId, long expectedPlanRevision, String reason,
-                  String idempotencyKey, Instant at) { }
+                       String idempotencyKey, Instant at) { }
+    /** Plan 控制使用 active run 作为第二道 fencing，防止旧窗口误操作新执行。 */
+    record PlanControl(String planId, long expectedPlanRevision, String runId,
+                       String idempotencyKey, Instant at) { }
     /** attach 不跟随最新版本，精确批准 identity 是 Goal 执行资格的一部分。 */
     record AttachPlan(String goalId, long expectedGoalRevision, String planId,
                       String planRevisionId, String planHash,
@@ -174,9 +200,6 @@ public interface GoalUseCase {
     }
     /** Agent 只能引用当前步骤已成功 Tool call，并显式说明它证明的 criterion。 */
     record ToolEvidenceClaim(String criterionId, String callId, String summary) { }
-    /** 输入请求使用服务端到期时刻。 */
-    record InputRequest(String goalId, long expectedGoalRevision, String runId,
-                        String prompt, Instant expiresAt, String idempotencyKey, Instant at) { }
     /** evaluator 请求冻结当前 thread 模型。 */
     record EvaluationRequest(String goalId, long expectedGoalRevision, String runId,
                              String planRevisionId, List<ToolEvidenceClaim> evidenceClaims,
@@ -184,9 +207,6 @@ public interface GoalUseCase {
         /** evaluator intent 与证据 claim 共用同一 mutation，避免请求提交后再补证据的竞态。 */
         public EvaluationRequest { evidenceClaims = List.copyOf(evidenceClaims); }
     }
-    /** 响应只接受公开文本，JSON 编码由 application owner 统一完成。 */
-    record InputResponse(String goalId, long expectedGoalRevision, String inputRequestId,
-                         String response, String idempotencyKey, Instant at) { }
     /** Goal continuation 只暴露 Tool 所需 identity，不泄漏 objective、证据或数据库行。 */
     record GoalTurnContext(String goalId, long goalRevision, String runId,
                            io.github.kongweiguang.ja.goal.domain.GoalModels.GoalStatus status,

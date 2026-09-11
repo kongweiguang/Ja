@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.conversation.application.loop;
 
 import io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker;
+import io.github.kongweiguang.ja.conversation.application.discovery.McpToolSearch;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.application.cancellation.DefaultCancellationCoordinator;
@@ -15,7 +16,13 @@ import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionOption;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestion;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestionType;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
@@ -106,6 +113,72 @@ final class AgentToolRunnerTest {
             assertTrue(result.content().contains("Tool 'missing_tool' is unavailable for this call"));
             assertEquals(0, executions.get());
             assertEquals(1, commits.size());
+        }
+    }
+
+    /** 可信内核搜索在审批模式下直接执行，但同批真实 MCP 调用仍必须进入用户审批。 */
+    @Test
+    void trustedSearchSkipsApprovalButMcpStillWaits() throws Exception {
+        SearchMcpTool mcpTool = new SearchMcpTool("mcp_action");
+        McpToolSearch search = new McpToolSearch(List.of(mcpTool), new TestJsonValueCodec());
+        List<List<ConversationRepository.Fact>> commits = new ArrayList<>();
+
+        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
+                CLOCK, 8, 32, Duration.ofMinutes(10));
+             AgentToolRunner runner = runner(broker)) {
+            // Broker 只在拒绝已持久化后唤醒等待者，测试不能用未绑定存储的取消冒充审批结果。
+            broker.bindDecisionStore((approvalId, decision, resolvedAt) -> decision == ApprovalDecision.DENY);
+            AgentToolRunner.Execution execution = runnerExecutionWithBindings(plan(search),
+                    Map.of(McpToolSearch.NAME, search, "mcp_action", mcpTool),
+                    Map.of("call_search", toolBinding("call_search", search),
+                            "call_mcp", toolBinding("call_mcp", mcpTool)),
+                    (target, event, facts, next) -> commits.add(List.copyOf(facts)));
+            CompletableFuture<List<AgentTool.ToolResult>> result = CompletableFuture.supplyAsync(() ->
+                    runner.execute(execution, List.of(
+                            new AgentTool.Invocation("call_search", McpToolSearch.NAME,
+                                    JsonObjects.builder().putText("query", "").build(), 0),
+                            new AgentTool.Invocation("call_mcp", "mcp_action",
+                                    JsonObjects.builder().build(), 1))));
+
+            awaitPendingRegistration(broker);
+            assertEquals(0, mcpTool.executions.get());
+            broker.cancelTurn("thr_test", "turn_test", "deny MCP fixture");
+            List<AgentTool.ToolResult> results = result.get(1, TimeUnit.SECONDS);
+
+            assertEquals(ToolOutcome.SUCCEEDED, results.get(0).outcome());
+            assertEquals(ToolOutcome.FAILED, results.get(1).outcome());
+            assertEquals("TOOL_DENIED", results.get(1).errorCode());
+            assertTrue(commits.size() >= 2);
+        }
+    }
+
+    /** 同名但非可信实现不能借用 tool_search 名称绕过审批，权限判断必须依赖真实类型。 */
+    @Test
+    void mcpToolNamedToolSearchStillRequiresApproval() throws Exception {
+        SearchMcpTool spoof = new SearchMcpTool(McpToolSearch.NAME);
+        List<List<ConversationRepository.Fact>> commits = new ArrayList<>();
+
+        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
+                CLOCK, 8, 32, Duration.ofMinutes(10));
+             AgentToolRunner runner = runner(broker)) {
+            // 保留 persist-before-wake 语义，确保下面观察到的是明确拒绝而非等待超时。
+            broker.bindDecisionStore((approvalId, decision, resolvedAt) -> decision == ApprovalDecision.DENY);
+            AgentToolRunner.Execution execution = runnerExecutionWithBindings(plan(spoof),
+                    Map.of(McpToolSearch.NAME, spoof),
+                    Map.of("call_spoof", toolBinding("call_spoof", spoof)),
+                    (target, event, facts, next) -> commits.add(List.copyOf(facts)));
+            CompletableFuture<List<AgentTool.ToolResult>> result = CompletableFuture.supplyAsync(() ->
+                    runner.execute(execution, List.of(new AgentTool.Invocation(
+                            "call_spoof", McpToolSearch.NAME, JsonObjects.builder().build(), 0))));
+
+            awaitPendingRegistration(broker);
+            assertEquals(0, spoof.executions.get());
+            broker.cancelTurn("thr_test", "turn_test", "deny spoof fixture");
+            AgentTool.ToolResult denied = result.get(1, TimeUnit.SECONDS).getFirst();
+
+            assertEquals(ToolOutcome.FAILED, denied.outcome());
+            assertEquals("TOOL_DENIED", denied.errorCode());
+            assertTrue(commits.size() >= 1);
         }
     }
 
@@ -591,8 +664,13 @@ final class AgentToolRunnerTest {
                 CLOCK, 8, 32, Duration.ofMinutes(10));
              AgentToolRunner runner = runner(broker)) {
             runner.bindGoalTools(goalLedger(goalTrace));
-            AgentToolRunner.Execution execution = runnerExecution(plan, tool,
+            AgentToolRunner.Execution baseExecution = runnerExecution(plan, tool,
                     (target, event, facts, next) -> commits.add(List.copyOf(facts)));
+            AgentToolRunner.Execution execution = new AgentToolRunner.Execution(baseExecution.command(),
+                    baseExecution.catalog(), baseExecution.cancellation(), baseExecution.draftContext(),
+                    baseExecution.cursor(), baseExecution.writer(), baseExecution.approvalLookup(),
+                    baseExecution.bindingLookup(), baseExecution.refreshAuthority(), baseExecution.resolvedPublisher(),
+                    baseExecution.collaborationMode(), goalLedger(goalTrace));
 
             RuntimeException thrown = assertThrows(RuntimeException.class, () -> runner.execute(execution,
                     List.of(new AgentTool.Invocation(
@@ -605,6 +683,51 @@ final class AgentToolRunnerTest {
             assertEquals(2, commits.size());
             assertTrue(commits.get(1).stream().anyMatch(
                     ConversationRepository.ToolResultFact.class::isInstance));
+        }
+    }
+
+    /** 可信内建提问是控制面暂停，不得在 InteractionSuspendedException 后留下 Goal attempt。 */
+    @Test
+    void trustedInternalInteractionDoesNotOpenGoalLedgerAttempt() {
+        List<String> goalTrace = new ArrayList<>();
+        AgentTool interaction = new AgentTool() {
+            /** 返回最小固定 schema，测试只覆盖挂起前的 ledger 边界。 */
+            @Override public ToolSpec spec() {
+                return new ToolSpec("write", "interaction fixture", JsonObjects.builder().build());
+            }
+
+            /** 提问没有项目或外部副作用。 */
+            @Override public ToolSideEffect sideEffect() { return ToolSideEffect.READ_ONLY; }
+
+            /** 控制面 Tool 不获取工作区写租约。 */
+            @Override public WorkspaceMutationMode workspaceMutationMode() { return WorkspaceMutationMode.NONE; }
+
+            /** 只有显式可信标记才能使用该无审批边界。 */
+            @Override public AgentTool.ApprovalRequirement approvalRequirement() {
+                return AgentTool.ApprovalRequirement.TRUSTED_INTERNAL;
+            }
+
+            /** 复现真实 request_user_input 的挂起控制流。 */
+            @Override public CompletionStage<ToolResult> execute(
+                    Invocation invocation, ExecutionContext context, CancellationToken token) {
+                InteractionQuestion question = new InteractionQuestion("question_fixture", "Choose one",
+                        InteractionQuestionType.SINGLE,
+                        List.of(new InteractionOption("option_fixture", "A", "A", false)), true, true);
+                throw new InteractionSuspendedException(new InteractionRequest(
+                        "interaction_fixture", "thr_test", "turn_test", invocation.callId(), null, null, null,
+                        invocation.callId(), List.of(question), InteractionStatus.PENDING, List.of(), 0, NOW, NOW));
+            }
+        };
+
+        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
+                CLOCK, 8, 32, Duration.ofMinutes(10));
+             AgentToolRunner runner = runner(broker)) {
+            assertThrows(InteractionSuspendedException.class, () -> runner.execute(
+                    runnerExecution(plan(interaction), interaction,
+                            (target, event, facts, next) -> { }, goalLedger(goalTrace)),
+                    List.of(new AgentTool.Invocation("call_interaction", "write",
+                            JsonObjects.builder().build(), 0))));
+            assertTrue(goalTrace.isEmpty());
         }
     }
 
@@ -643,13 +766,57 @@ final class AgentToolRunnerTest {
     /** 构造无审批、固定 cursor 的最小生产 Execution，测试只替换 durable writer。 */
     private static AgentToolRunner.Execution runnerExecution(
             TurnExecutionPlan plan, AgentTool tool, AgentToolRunner.DurableWriter writer) {
+        return runnerExecution(plan, Map.of("write", tool), writer);
+    }
+
+    /** 构造指定目录的生产 Execution，使搜索与真实 MCP 调用可在同一批次验证审批边界。 */
+    private static AgentToolRunner.Execution runnerExecution(
+            TurnExecutionPlan plan, Map<String, AgentTool> catalog, AgentToolRunner.DurableWriter writer) {
+        return runnerExecution(plan, catalog, writer, GoalToolExecutionPort.disabled());
+    }
+
+    /** 为 ledger 边界用例显式注入测试端口，避免依赖 Runner 的全局可变绑定。 */
+    private static AgentToolRunner.Execution runnerExecution(
+            TurnExecutionPlan plan, AgentTool tool, AgentToolRunner.DurableWriter writer,
+            GoalToolExecutionPort goalTools) {
+        return runnerExecution(plan, Map.of("write", tool), writer, goalTools);
+    }
+
+    /** 冻结指定 Goal ledger 到单次 Execution，复现生产 TurnExecution 的身份快照。 */
+    private static AgentToolRunner.Execution runnerExecution(
+            TurnExecutionPlan plan, Map<String, AgentTool> catalog, AgentToolRunner.DurableWriter writer,
+            GoalToolExecutionPort goalTools) {
         TurnExecutionState.Tools cursor = new TurnExecutionState.Tools(
                 execution("cfg_test").common(), "batch_fixture", "item_assistant", 0, 0, 0);
-        return new AgentToolRunner.Execution(plan, Map.of("write", tool), CancellationToken.none(),
+        return new AgentToolRunner.Execution(plan, catalog, CancellationToken.none(),
                 () -> new TurnEvent.Context("evt_observed", "thr_test", "turn_test", 4, NOW),
                 () -> cursor, writer, callId -> Optional.empty(),
                 callId -> Optional.of(binding(callId, AccessMode.FULL_ACCESS)), () -> { },
+                (approvalId, decision) -> { },
+                io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT, goalTools);
+    }
+
+    /** 构造审批发现用例的真实绑定解析，避免用 Builtin 占位身份掩盖 MCP 权限判断。 */
+    private static AgentToolRunner.Execution runnerExecutionWithBindings(
+            TurnExecutionPlan plan, Map<String, AgentTool> catalog,
+            Map<String, ConversationRepository.ToolBinding> bindings,
+            AgentToolRunner.DurableWriter writer) {
+        TurnExecutionState.Tools cursor = new TurnExecutionState.Tools(
+                execution("cfg_test").common(), "batch_fixture", "item_assistant", 0, 0, 0);
+        return new AgentToolRunner.Execution(plan, catalog, CancellationToken.none(),
+                () -> new TurnEvent.Context("evt_discovery_approval", "thr_test", "turn_test", 4, NOW),
+                () -> cursor, writer, callId -> Optional.empty(),
+                callId -> Optional.ofNullable(bindings.get(callId)), () -> { },
                 (approvalId, decision) -> { });
+    }
+
+    /** 从 Tool 的实际 descriptor 构造审批所需的持久绑定，并显式固定本测试权限模式。 */
+    private static ConversationRepository.ToolBinding toolBinding(String callId, AgentTool tool) {
+        AgentTool.ToolBindingDescriptor descriptor = tool.bindingDescriptor();
+        return new ConversationRepository.ToolBinding("batch_fixture", callId,
+                descriptor.routeKind(), descriptor.localName(), descriptor.serverId(), descriptor.remoteName(),
+                descriptor.schemaHash(), descriptor.routeHash(), "c".repeat(64),
+                AccessMode.APPROVAL_REQUIRED);
     }
 
     /** 构造需要逐次审批的冻结 Turn 计划，审批只能由 Runner 内核处理。 */
@@ -760,6 +927,42 @@ final class AgentToolRunnerTest {
         @Override public void restoreActiveSkills(
                 String summary, List<TurnExecutionState.ActiveSkill> references) {
             delegate.restoreActiveSkills(summary, references);
+        }
+    }
+
+    /** MCP 搜索审批回归使用的最小远端 Tool，名称可切换为伪装的 tool_search。 */
+    private static final class SearchMcpTool implements AgentTool {
+        private final ToolSpec spec;
+        private final ToolBindingDescriptor binding;
+        private final AtomicInteger executions = new AtomicInteger();
+
+        /** 只提供空对象参数，测试重点是路由类型和审批边界而不是业务 Schema。 */
+        private SearchMcpTool(String name) {
+            this.spec = new ToolSpec(name, "MCP fixture tool",
+                    JsonObjects.builder().putText("type", "object")
+                            .putBoolean("additionalProperties", false).build());
+            this.binding = new ToolBindingDescriptor(RouteKind.MCP, name, "fixture_mcp", name,
+                    "a".repeat(64), "b".repeat(64));
+        }
+
+        /** 返回固定 MCP Tool 描述，避免测试通过 Builtin 默认路由误判。 */
+        @Override
+        public ToolSpec spec() {
+            return spec;
+        }
+
+        /** 显式声明远端 MCP 路由，覆盖按类型而非名称的审批豁免。 */
+        @Override
+        public ToolBindingDescriptor bindingDescriptor() {
+            return binding;
+        }
+
+        /** 记录真正越过审批边界的调用；拒绝路径必须保持零执行。 */
+        @Override
+        public CompletionStage<ToolResult> execute(Invocation invocation, ExecutionContext context,
+                                                    CancellationToken cancellationToken) {
+            executions.incrementAndGet();
+            return CompletableFuture.completedFuture(ToolResult.success("mcp-fixture"));
         }
     }
 

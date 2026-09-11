@@ -444,6 +444,13 @@ public final class HttpSummaryModel implements SummaryModel {
             else node.put("exitCode", output.exitCode());
             if (output.error() == null) node.putNull("error");
             else node.put("error", output.error());
+        } else if (block instanceof ContextMessage.ReasoningBlock reasoning) {
+            /* 摘要模型只知道有一个原生 reasoning block；opaque 签名/encrypted JSON 不得进 prompt。 */
+            node.put("type", "reasoning").put("providerId", reasoning.content().providerId())
+                    .put("modelId", reasoning.content().modelId())
+                    .put("api", reasoning.content().api())
+                    .put("upstreamModel", reasoning.content().upstreamModel())
+                    .put("wireField", reasoning.content().wireField());
         } else {
             throw failure("summary prompt contained an unsupported context block");
         }

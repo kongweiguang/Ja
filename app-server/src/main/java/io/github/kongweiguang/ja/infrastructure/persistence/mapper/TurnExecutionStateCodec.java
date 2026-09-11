@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -113,12 +114,13 @@ public final class TurnExecutionStateCodec {
         else node.set("summary", summary(ready.summary()));
     }
 
-    /** Common 只保存 Operation 游标和原始绝对 Deadline，运行环境事实仅属于 ProviderPending。 */
+    /** Common 同时保存绝对截止线与暂停期间不消耗的剩余活动预算。 */
     private ObjectNode common(TurnExecutionState.Common value) {
         ObjectNode node = mapper.createObjectNode().put("modelRound", value.modelRound())
                 .put("usedToolCalls", value.usedToolCalls())
                 .put("nextProviderOrdinal", value.nextProviderOrdinal())
                 .put("deadlineAt", value.deadlineAt().toString())
+                .put("activeBudgetMillis", value.activeBudget().toMillis())
                 .put("origin", value.origin().name());
         if (value.promptCheckpointId() == null) node.putNull("promptCheckpointId");
         else node.put("promptCheckpointId", value.promptCheckpointId());
@@ -130,7 +132,7 @@ public final class TurnExecutionStateCodec {
     /** Common 的每个计数和 Skill 引用都无损读取，禁止 Jackson 数字/字符串 coercion。 */
     private TurnExecutionState.Common common(ObjectNode node) {
         exact(node, Set.of("modelRound", "usedToolCalls", "nextProviderOrdinal", "promptCheckpointId",
-                "activeSkills", "deadlineAt", "origin"));
+                "activeSkills", "deadlineAt", "activeBudgetMillis", "origin"));
         JsonNode array = node.required("activeSkills");
         if (!array.isArray()) throw corrupt("activeSkills must be an array", null);
         List<TurnExecutionState.ActiveSkill> skills = new ArrayList<>();
@@ -146,7 +148,8 @@ public final class TurnExecutionStateCodec {
         return new TurnExecutionState.Common(integer(node, "modelRound"), integer(node, "usedToolCalls"),
                 integer(node, "nextProviderOrdinal"),
                 promptCheckpointId.isNull() ? null : promptCheckpointId.textValue(), skills,
-                Instant.parse(text(node, "deadlineAt")), enumValue(TurnOrigin.class, text(node, "origin")));
+                Instant.parse(text(node, "deadlineAt")), enumValue(TurnOrigin.class, text(node, "origin")),
+                Duration.ofMillis(integer(node, "activeBudgetMillis")));
     }
 
     /** Profile 显式编码全部等价键；凭据、URL 与请求正文永不进入 execution JSON。 */

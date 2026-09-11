@@ -150,6 +150,16 @@ public final class ConfigGeneration implements AutoCloseable {
     }
 
     /**
+     * 读取用户级澄清策略；effective 文档不含项目覆盖字段，旧文档缺失时保持默认开启。
+     */
+    public boolean clarificationEnabled() {
+        JsonNode interaction = effectiveConfig.get("interaction");
+        if (interaction == null || interaction.isNull()) return true;
+        JsonNode value = interaction.get("clarification_enabled");
+        return value == null || value.isBoolean() && value.booleanValue();
+    }
+
+    /**
      * skills 集中维护 secret 与 credential 的脱敏边界，并确保敏感缓冲区按所有权生命周期清理。
      */
     public List<JsonNode> skills() {
@@ -278,6 +288,41 @@ public final class ConfigGeneration implements AutoCloseable {
         if (defaultProviderId().isEmpty() || defaultModelId().isEmpty()) return Optional.empty();
         return Optional.ofNullable(requireModel(defaultProviderId().get(), defaultModelId().get())
                 .defaultReasoningLevel());
+    }
+
+    /** 返回代际内冻结的子智能体策略，避免 Turn 期间读取可变全局配置。 */
+    public ConfigurationGenerationSnapshot.SubagentPolicy subagentPolicy() {
+        JsonNode value = effectiveConfig.get("subagents");
+        if (!(value instanceof ObjectNode subagents)) {
+            throw new IllegalArgumentException("subagent policy is missing");
+        }
+        JsonNode enabled = subagents.get("enabled");
+        if (enabled == null || !enabled.isBoolean()) {
+            throw new IllegalArgumentException("subagent enabled state is invalid");
+        }
+        JsonNode provider = subagents.get("provider_id");
+        JsonNode model = subagents.get("model_id");
+        JsonNode reasoning = subagents.get("reasoning_level");
+        return new ConfigurationGenerationSnapshot.SubagentPolicy(enabled.booleanValue(),
+                optionalText(provider), optionalText(model), optionalReasoning(reasoning));
+    }
+
+    /** 把 optional 文本引用收敛为稳定空值语义，调用方不接触 Jackson 节点。 */
+    private static Optional<String> optionalText(JsonNode value) {
+        if (value == null || value.isNull()) return Optional.empty();
+        if (!value.isTextual() || value.textValue().isBlank()) {
+            throw new IllegalArgumentException("subagent reference is invalid");
+        }
+        return Optional.of(value.textValue());
+    }
+
+    /** 读取子智能体显式思考档位；跟随父任务必须通过 null 表达，避免代际自行猜测。 */
+    private static Optional<ConfigurationGenerationSnapshot.ReasoningLevel> optionalReasoning(JsonNode value) {
+        if (value == null) throw new IllegalArgumentException("subagent reasoning level is missing");
+        if (value.isNull()) return Optional.empty();
+        if (!value.isTextual()) throw new IllegalArgumentException("subagent reasoning level is invalid");
+        return Optional.of(ConfigurationGenerationSnapshot.ReasoningLevel.valueOf(
+                value.textValue().toUpperCase(java.util.Locale.ROOT)));
     }
 
     /**
@@ -747,6 +792,12 @@ public final class ConfigGeneration implements AutoCloseable {
             return source.trusted();
         }
 
+        /** 透传用户级澄清策略；Plan 仍由其自身阶段策略强制启用。 */
+        @Override
+        public boolean clarificationEnabled() {
+            return source.clarificationEnabled();
+        }
+
         /** 复用配置 Owner 已校验的默认 Provider，禁止调用方自行排序。 */
         @Override
         public Optional<String> defaultProviderId() {
@@ -763,6 +814,12 @@ public final class ConfigGeneration implements AutoCloseable {
         @Override
         public Optional<ConfigurationGenerationSnapshot.ReasoningLevel> defaultReasoningLevel() {
             return source.defaultReasoningLevel().map(GenerationView::projectReasoning);
+        }
+
+        /** 透传代际冻结的子智能体开关与成对模型引用，不读取当前配置文件。 */
+        @Override
+        public ConfigurationGenerationSnapshot.SubagentPolicy subagentPolicy() {
+            return source.subagentPolicy();
         }
 
         /**

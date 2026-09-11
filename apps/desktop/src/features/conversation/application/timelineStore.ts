@@ -39,32 +39,33 @@ type TimelineStoreRegistry = typeof globalThis & {
 };
 
 const draftItemByProjection = new WeakMap<
-  TimelineState["draftByTurn"][string],
+  NonNullable<TimelineState["draftByTurn"][string]>[number],
   TimelineItemAdapter
 >();
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
- * 把同一份 Draft Projection 映射为稳定的 Item 引用；公开回复 delta 直接占用 Agent Message
- * 的最终阅读位置，避免终态到达时从“过程”突跳成答案。Reasoning Summary 仍属于可折叠工作过程。
- * WeakMap 让重复 Selector 保持引用稳定，并在终态清理 Draft 后自动释放缓存。
+ * 把同一份 Draft Segment 映射为稳定的 Item 引用；Assistant 与 Reasoning 只在同一语义的
+ * 相邻 delta 中合并，跨语义段保留各自的阅读位置。WeakMap 让重复 Selector 保持引用稳定，
+ * 并在终态清理 Draft 后自动释放缓存。
  */
 function draftItemForTurn(
   threadId: string,
   turnId: string,
-  draft: TimelineState["draftByTurn"][string],
+  draft: NonNullable<TimelineState["draftByTurn"][string]>[number],
 ): TimelineItemAdapter {
   const cached = draftItemByProjection.get(draft);
   if (cached !== undefined) return cached;
   const item: TimelineItemAdapter = {
-    itemId: `draft:${turnId}`,
+    itemId: `draft:${turnId}:${draft.segmentStartSeq}`,
     threadId,
     turnId,
-    kind: draft.kind === "reasoning" ? "commentary" : "agent_message",
+    kind: draft.kind === "reasoning" ? "reasoning" : "agent_message",
     status: "in_progress",
     text: draft.text,
     title: draft.kind === "reasoning" ? "思考摘要" : undefined,
     metadata: { phase: draft.kind === "reasoning" ? "reasoning_summary" : "assistant_progress" },
+    createdAt: draft.occurredAt,
   };
   draftItemByProjection.set(draft, item);
   return item;
@@ -166,17 +167,19 @@ export const useTimelineStore =
 timelineStoreRegistry[TIMELINE_STORE_GLOBAL_KEY] = useTimelineStore;
 
 /**
- * 按 Thread 组装持久 Item，并把当前 Assistant delta 作为唯一瞬态答复附在对应 Turn；终态事件会在
- * Reducer 中原子移除 Draft，因此 UI 原位切换到持久最终答复，不会重复展示或把草稿反写给 Java。
+ * 按 Thread 组装持久 Item，并把尚未结算的 Assistant/Reasoning segments 附在对应 Turn；终态
+ * 事件会在 Reducer 中原子移除 Draft，因此 UI 原位切换到持久最终答复，不会重复展示或反写 Java。
  */
 export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {
   const committed = (state.itemIdsByThread[threadId] ?? [])
     .map((itemId) => state.items[itemId])
     .filter((item) => item !== undefined);
   const drafts = Object.values(state.turns).flatMap((turn) => {
-    const draft = state.draftByTurn[turn.turnId];
-    if (turn.threadId !== threadId || draft === undefined) return [];
-    return [draftItemForTurn(threadId, turn.turnId, draft)];
+    const drafts = state.draftByTurn[turn.turnId];
+    if (turn.threadId !== threadId || drafts === undefined) return [];
+    return drafts
+      .filter((draft) => draft.text.trim() !== "")
+      .map((draft) => draftItemForTurn(threadId, turn.turnId, draft));
   });
   return [...committed, ...drafts];
 };

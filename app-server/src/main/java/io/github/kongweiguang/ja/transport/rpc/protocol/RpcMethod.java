@@ -85,6 +85,18 @@ public enum RpcMethod {
      * 在空闲 Thread 上显式压缩上下文。
      */
     THREAD_COMPACT("thread/compact"),
+    /** 读取当前 Thread 的待回答请求或指定历史问答。 */
+    INTERACTION_READ("interaction/read"),
+    /** 先建立连接过滤再对账快照，避免提问创建与 UI 订阅竞态丢失。 */
+    INTERACTION_OBSERVE("interaction/observe"),
+    /** 收起或切换会话只释放观察，不取消权威问题。 */
+    INTERACTION_UNOBSERVE("interaction/unobserve"),
+    /** 保存未提交答案以支持窗口刷新与重启恢复。 */
+    INTERACTION_DRAFT_SAVE("interaction/draft/save"),
+    /** 原子结算答案及原 Tool 调用，不能以普通用户消息冒充回答。 */
+    INTERACTION_RESPOND("interaction/respond"),
+    /** 显式取消问答，关闭卡片不走此入口。 */
+    INTERACTION_CANCEL("interaction/cancel"),
     /** 读取一个 Goal 的完整权威投影。 */
     GOAL_READ("goal/read"),
     /** 分页读取 Goal 的持久事件流。 */
@@ -95,6 +107,16 @@ public enum RpcMethod {
     GOAL_UNOBSERVE("goal/unobserve"),
     /** 读取 Thread 所有的独立 Plan 投影。 */
     PLAN_READ("plan/read"),
+    /** 当前 Thread 首次显示时恢复最近计划，不依赖 Goal identity。 */
+    PLAN_CURRENT_READ("plan/current/read"),
+    /** 独立 Plan 事件不能借用 Goal 水位。 */
+    PLAN_EVENTS_READ("plan/events/read"),
+    /** 订阅当前连接可见的独立 Plan。 */
+    PLAN_OBSERVE("plan/observe"),
+    /** 关闭详情不停止 Plan 执行。 */
+    PLAN_UNOBSERVE("plan/unobserve"),
+    /** 证据精确绑定 Plan revision 与 Run。 */
+    PLAN_EVIDENCE_LIST("plan/evidence/list"),
     /** 分页读取独立 Plan 的不可变 revision 历史。 */
     PLAN_REVISIONS_LIST("plan/revisions/list"),
     /** 分页读取当前 Plan revision 的可信验收证据。 */
@@ -111,8 +133,6 @@ public enum RpcMethod {
     GOAL_RESUME("goal/resume"),
     /** 把 Goal 终结为 stopped，且不把错误误报为失败终态。 */
     GOAL_STOP("goal/stop"),
-    /** 回答一个持久化且尚未过期的 Goal 输入请求。 */
-    GOAL_INPUT_RESPOND("goal/input/respond"),
     /** 创建由 Thread 所有、与 Goal 正交的 Plan。 */
     PLAN_CREATE("plan/create"),
     /** 保存结构化 Plan draft，不把 Markdown 当权威数据。 */
@@ -121,10 +141,14 @@ public enum RpcMethod {
     PLAN_DRAFT_DISCARD("plan/draft/discard"),
     /** 将 draft 冻结为不可变、可批准的 Plan revision。 */
     PLAN_PROPOSE("plan/propose"),
-    /** 以 revision ID 和 canonical hash 批准一个精确 Plan 版本。 */
-    PLAN_APPROVE("plan/approve"),
     /** 从已批准的精确版本显式启动 standalone Plan run。 */
     PLAN_EXECUTE("plan/execute"),
+    /** 停止领取新 Tool 并在安全结算后保留原 Run。 */
+    PLAN_PAUSE("plan/pause"),
+    /** 恢复原 Run 剩余工作，不重置预算或重复执行成功步骤。 */
+    PLAN_RESUME("plan/resume"),
+    /** 保留结果与审计历史，不隐式回滚工作区。 */
+    PLAN_STOP("plan/stop"),
     /** 拒绝当前待批准版本并返回可编辑规划状态。 */
     PLAN_REJECT("plan/reject"),
     /** 用户首次发送时原子创建独立侧边任务及首个 Turn。 */
@@ -139,14 +163,16 @@ public enum RpcMethod {
     TASK_UNOBSERVE("task/unobserve"),
     /** 以服务端 activity sequence CAS 推进已读边界。 */
     TASK_SEEN("task/seen"),
-    /** 只向目标 Mailbox 入队，不唤醒空闲任务。 */
-    TASK_MESSAGE_SEND("task/message/send"),
+    /** 向任意当前实例中的 Thread Mailbox 入队，不唤醒目标或打断其当前 Turn。 */
+    THREAD_MESSAGE_SEND("thread/message/send"),
     /** 持久化跟进并启动或排队新的 Child Turn。 */
     TASK_FOLLOWUP("task/followup"),
     /** 取消目标任务，ATTACHED 子树按生命周期递归传播。 */
     TASK_CANCEL("task/cancel"),
     /** 经过显式确认后原子删除一棵完整任务树。 */
     TASK_TREE_DELETE("task/tree/delete"),
+    /** 关闭临时独立侧聊并释放其运行资源，不删除已投递到其它 Thread 的消息。 */
+    TASK_CLOSE("task/close"),
     /** 一次读取冻结 change-set 的完整单文件 Diff。 */
     TURN_CHANGE_SET_READ("turn/change-set/read"),
     /** 分页读取已脱敏 Tool 输出。 */

@@ -8,8 +8,10 @@
 
 export type TimelineItemKind =
   | "user_message"
+  | "thread_message"
   | "agent_message"
   | "commentary"
+  | "reasoning"
   | "tool_call"
   | "command"
   | "approval";
@@ -112,6 +114,9 @@ export interface TimelineItemAdapter {
   text?: string;
   /** 用户消息的结构化引用与正文并列展示，永远不包含预读文件或 Skill 正文。 */
   contextReferences?: import("./userContent").ConversationContextReference[];
+  /** 跨会话消息保留服务端冻结的来源事实，不能被渲染层降级成用户或系统身份。 */
+  sourceThreadId?: string;
+  sourceTitle?: string;
   /** 附件摘要与所属用户消息共同投影，避免按 Turn 聚合后失去精确消息归属。 */
   attachments?: import("./timelineContracts").AttachmentSummary[];
   title?: string;
@@ -212,10 +217,19 @@ export type ApprovalDecision = "approve" | "deny";
 export function isWorkItem(item: TimelineItemAdapter): boolean {
   return (
     item.kind === "commentary" ||
+    item.kind === "reasoning" ||
     item.kind === "tool_call" ||
     item.kind === "command" ||
     item.kind === "approval"
   );
+}
+
+/**
+ * 只识别 Provider 明确提供的公开推理摘要，不把普通助手进度文字误标成模型思考。
+ * 该判别依赖内部投影 kind，避免 UI 通过可变标题或正文猜测协议语义。
+ */
+export function isReasoningItem(item: TimelineItemAdapter): boolean {
+  return item.kind === "reasoning";
 }
 
 /** 返回稳定的用户可见 Label，避免重复 Role Chrome。 */
@@ -223,10 +237,14 @@ function itemKindLabel(item: TimelineItemAdapter): string {
   switch (item.kind) {
     case "user_message":
       return "用户问题";
+    case "thread_message":
+      return "来源消息";
     case "agent_message":
       return "最终答复";
     case "commentary":
       return "进度";
+    case "reasoning":
+      return "模型思考";
     case "tool_call":
       return "工具";
     case "command":
@@ -249,6 +267,8 @@ export function workStepLabel(step: WorkStepAdapter): string {
       return "执行命令";
     case "commentary":
       return "记录进度";
+    case "reasoning":
+      return "模型思考";
     default:
       return itemKindLabel(step);
   }
@@ -328,7 +348,7 @@ export function turnStatusLabel(status: TimelineTurnState): string {
     case "waiting_approval":
       return "等待确认";
     case "suspended":
-      return "运行被中断";
+      return "已暂停";
     case "completed":
       return "已完成";
     case "cancelled":

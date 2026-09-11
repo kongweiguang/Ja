@@ -3,22 +3,23 @@
 
 export type ThemeMode = "system" | "light" | "dark";
 /** Palette 顺序是无状态主题合同，由持久化、Settings 与渲染器共同消费而不反向依赖 store。 */
-export const UI_PALETTE_ORDER = ["xcode", "fleet", "obsidian", "claude"] as const;
+export const UI_PALETTE_ORDER = ["ja", "jetbrains", "xcode", "obsidian", "claude"] as const;
 export type UiPalette = (typeof UI_PALETTE_ORDER)[number];
 
-/** 中文标签只描述配色气质来源，不暗示 Ja 复制对应产品的布局或品牌资源。 */
+/** 默认配色使用 Ja 品牌，其余名称仅描述配色气质来源。 */
 export const UI_PALETTE_LABELS: Readonly<Record<UiPalette, string>> = {
   xcode: "Xcode",
-  fleet: "Fleet",
+  ja: "Ja",
+  jetbrains: "JetBrains",
   obsidian: "Obsidian",
   claude: "Claude",
 };
 
-/** 只接受当前四套 Palette；损坏或未知介质统一回到 Xcode，不解释旧别名。 */
+/** 只接受当前 Palette 闭集；损坏或未知介质统一回到 Ja，不解释旧别名。 */
 export function normalizeUiPalette(value: unknown): UiPalette {
   return typeof value === "string" && UI_PALETTE_ORDER.includes(value as UiPalette)
     ? (value as UiPalette)
-    : "xcode";
+    : "ja";
 }
 
 export type ResolvedTheme = "light" | "dark";

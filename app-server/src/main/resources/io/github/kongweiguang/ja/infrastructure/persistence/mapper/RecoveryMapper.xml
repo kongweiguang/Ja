@@ -49,6 +49,10 @@
     SELECT call_id,state,revision,ordinal,tool_name,side_effect FROM tools
     WHERE turn_id=#{turnId} AND ordinal=#{ordinal}
   </select>
+  <select id="hasPendingInteraction" resultType="boolean">
+    SELECT EXISTS(SELECT 1 FROM interaction_requests
+      WHERE turn_id=#{turnId} AND tool_call_id=#{callId} AND status='PENDING')
+  </select>
   <update id="failUnsettledTool">
     UPDATE tools SET state='FAILED',
       presentation_json=json_set(presentation_json,'$.status','error','$.outputPreview',

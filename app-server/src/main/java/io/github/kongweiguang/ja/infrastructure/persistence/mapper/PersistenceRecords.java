@@ -7,6 +7,61 @@ package io.github.kongweiguang.ja.infrastructure.persistence.mapper;
  * 集中声明 MyBatis 的行形状与具名参数对象；这些 record 只描述 SQL 边界，不承载业务行为。
  */
 public final class PersistenceRecords {
+    /** Interaction request 以 JSON 快照保存题目/答案，状态与 revision 仍由列做 CAS。 */
+    public record InteractionRow(String requestId, String threadId, String turnId, String toolCallId,
+                                 String planRevisionId, String runId, String goalId, String idempotencyKey,
+                                 String questionsJson, String status, String answersJson, long revision,
+                                 String createdAt, String updatedAt) { }
+
+    /** Interaction 草稿只保存 UI 选择，不改变请求答案状态。 */
+    public record InteractionDraftRow(String threadId, String requestId, String answersJson, int page,
+                                      boolean collapsed, String idempotencyKey, long revision, String updatedAt) { }
+
+    /** Interaction 事件序列由 SQLite 分配，客户端据此发现事件缺口后重新 read。 */
+    public record InteractionEventRow(long eventSequence, String threadId, String requestId,
+                                     long requestRevision, String kind, String occurredAt) { }
+    /** Interaction 事件写入参数，事件序列由数据库事务分配。 */
+    public record InteractionEventInsert(String threadId, String requestId, long requestRevision,
+                                         String kind, String occurredAt) { }
+
+    /** SQL 查询使用的 Thread/request 复合身份，防止跨 Thread 读取。 */
+    public record InteractionKey(String threadId, String requestId) { }
+    /** 待回答请求的结构化持久载荷，答案初始为空且状态必须为 PENDING。 */
+    public record InteractionInsert(String requestId, String threadId, String turnId, String toolCallId,
+                                    String planRevisionId, String runId, String goalId, String idempotencyKey,
+                                    String questionsJson, String status, String answersJson, long revision,
+                                    String createdAt, String updatedAt) { }
+    /** 答案更新的 CAS 参数，所有题目在一笔事务内结算。 */
+    public record InteractionAnswerCas(String threadId, String requestId, long expectedRevision,
+                                       String answersJson, String status, String idempotencyKey, String occurredAt) { }
+    /** 取消或替代请求的 CAS 参数，迟到答案不能越过该状态。 */
+    public record InteractionCloseCas(String threadId, String requestId, long expectedRevision,
+                                      String status, String idempotencyKey, String occurredAt) { }
+    /** 草稿保存的 CAS 参数，草稿 revision 与请求状态互不混淆。 */
+    public record InteractionDraftCas(String threadId, String requestId, long expectedRevision,
+                                      String answersJson, int page, boolean collapsed,
+                                      String idempotencyKey, String occurredAt) { }
+    /** Plan evaluator intent 只保存非敏感 Profile 和冻结 identity，Provider 凭据永不落库。 */
+    public record PlanEvaluationIntentInsert(String requestId, String planId, String planRevisionId,
+                                             String runId, String ownerThreadId, String inputDigest,
+                                             String profileJson, String startedAt) { }
+      /** Plan evaluator usage 终态使用 identity/CAS 更新，UNKNOWN 不伪造 token 数值。 */
+      public record PlanEvaluationUsageUpdate(String requestId, String planId, String planRevisionId,
+                                              String runId, String outcome, String certainty,
+                                              Long inputTokens, Long outputTokens, Long totalTokens,
+                                              String verdict, String criteriaJson, String summary,
+                                              String completedAt) { }
+      /** 重试门只需读取 request identity 与当前终态。 */
+      public record PlanEvaluationPriorRow(String requestId, String outcome, String verdict,
+                                           String criteriaJson, String summary) { }
+    /** Thread 创建时冻结的子智能体策略；空 provider/model 表示跟随父 Turn。 */
+    public record SubagentPolicyRow(String threadId, boolean enabled, String providerId, String modelId,
+                                    String reasoningLevel, String createdAt) { }
+
+    /** 子智能体策略插入参数，禁止更新既有 Thread 的历史快照。 */
+    public record SubagentPolicyInsert(String threadId, boolean enabled, String providerId, String modelId,
+                                       String reasoningLevel, String createdAt) { }
+
     /** Workspace 查询的固定列集合。 */
     public record WorkspaceRow(String workspaceId, String rootPath, String displayName, String trust,
                         long revision, String updatedAt) { }
@@ -17,6 +72,10 @@ public final class PersistenceRecords {
                      String titleSource,
                      long revision, String createdAt, String updatedAt, String pinnedAt, String archivedAt,
                      String deletedAt, String latestTurnStatus, boolean latestTurnSeen, String activeGoalId) { }
+
+    /** 全局 Thread 发现只返回展示字段和 keyset 排序时间，不物化正文或偏好。 */
+    public record ThreadDiscoveryRow(String threadId, String title, String kind, String workspaceId,
+                                     String status, String updatedAt) { }
 
     /** Turn 查询只承载 Operation 状态；请求环境由 usage/profile 独立追踪。 */
     public record TurnRow(String turnId, String threadId, String state,
@@ -68,7 +127,8 @@ public final class PersistenceRecords {
                            String messageKind, String publicText, String blocksJson,
                              Long modelRound, String presentationJson,
                              String approvalId, String decision,
-                             String expiresAt, String attachmentsJson) { }
+                             String expiresAt, String attachmentsJson,
+                             String sourceThreadId, String sourceTitle) { }
 
     /** Thread 最近一次 Provider Usage 的恢复行；不把模型凭据或请求正文带入历史快照。 */
     public record ContextUsageRow(String turnId, String requestId, long modelRound,
@@ -140,7 +200,8 @@ public final class PersistenceRecords {
                                  String outputPreview, String occurredAt) { }
     /** 面向历史 UI 的分阶段文本，与模型上下文 messages 表物理隔离。 */
     public record TimelineMessageInsert(String itemId, String threadId, String turnId, String messageKind,
-                                        String publicText, Integer modelRound, String occurredAt) { }
+                                        String publicText, Integer modelRound, String sourceThreadId,
+                                        String sourceTitle, String occurredAt) { }
     /** 已脱敏 Tool artifact 只通过四元身份读取。 */
     public record ToolArtifactInsert(String artifactId, String threadId, String turnId, String callId,
                                      String content, long characterLength, String occurredAt) { }
@@ -223,6 +284,9 @@ public final class PersistenceRecords {
     /** Thread 标题搜索沿用更新时间 keyset，并把查询词固定为服务层归一化小写。 */
     public record ThreadSearch(String workspaceId, String normalizedQuery,
                                String cursorTime, String cursorId, int limit) { }
+    /** 全局发现使用统一更新时间/身份 keyset，可选 Workspace 与标题 contains 过滤。 */
+    public record ThreadDiscoveryPage(String workspaceId, String normalizedQuery,
+                                      String cursorTime, String cursorId, int limit) { }
     /**
      * 用户重命名与自动标题共享 SQL 形状；placeholderOnly 为自动路径启用来源所有权 CAS，
      * expectedRevision 在该路径作为首次成功 Turn 的 revision 下界，而不是精确相等条件。

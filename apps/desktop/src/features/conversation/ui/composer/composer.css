@@ -11,6 +11,13 @@
   width: 100%;
 }
 
+/* Dock 已为 Composer 预留真实空间，sticky 在短窗口会把输入吸附到卡片上方。 */
+.ja-conversation-composer-dock > .ja-composer {
+  position: relative;
+  bottom: auto;
+  flex: 0 0 auto;
+}
+
 .ja-composer {
   --ja-composer-padding-block-start: 13px;
   --ja-composer-padding-inline: 14px;
@@ -1187,10 +1194,17 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
 
 .ja-composer__toolbar {
   display: flex;
+  flex-wrap: wrap;
   min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+/* 侧栏宽度不等于窗口宽度；保留前导控件的真实宽度，让模型区换行而不是遮挡 Plan/Goal。 */
+.ja-composer__leading {
+  flex: 0 0 auto;
+  max-width: 100%;
 }
 
 .ja-composer__leading,
@@ -1203,6 +1217,8 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
 
 .ja-composer__trailing {
   justify-content: flex-end;
+  max-width: 100%;
+  margin-inline-start: auto;
 }
 
 .ja-context-usage {

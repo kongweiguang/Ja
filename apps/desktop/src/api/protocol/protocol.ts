@@ -14,10 +14,15 @@ import {
   GoalIdSchema,
   GoalActivityParamsSchema,
   GoalChangedParamsSchema,
-  GoalInputRequestedParamsSchema,
   GoalParamsSchemaByMethod,
   GoalResultSchemaByMethod,
+  PlanChangedParamsSchema,
 } from "./goal";
+import {
+  InteractionChangedParamsSchema,
+  InteractionParamsSchemaByMethod,
+  InteractionResultSchemaByMethod,
+} from "./interaction";
 
 /** 首个版本刻意只接受一个精确 wire revision，禁止隐式兼容分支。 */
 /** Ja v1 的配置归 app-server 所有；客户端只交换意图和投影。 */
@@ -91,7 +96,11 @@ const TaskCursorSchema = z
   .string()
   .regex(/^task:[0-9]+:[0-9]+$/)
   .max(256);
-const RuntimeFeaturesSchema = z.tuple([z.literal("task_threads_v1"), z.literal("plan_goal_v1")]);
+const RuntimeFeaturesSchema = z.tuple([
+  z.literal("task_threads_v1"),
+  z.literal("plan_goal_v1"),
+  z.literal("interaction_v1"),
+]);
 export const ServerInstanceIdSchema = prefixedId("srv_", 100);
 export const RevisionSchema = z.number().int().min(0).max(MAX_SAFE_INTEGER);
 export const CursorSchema = z
@@ -157,11 +166,18 @@ export const ClientMethodSchema = z.enum([
   "thread/restore",
   "thread/delete",
   "thread/compact",
+  "interaction/read",
+  "interaction/observe",
+  "interaction/unobserve",
+  "interaction/draft/save",
+  "interaction/respond",
+  "interaction/cancel",
   "goal/read",
   "goal/events/read",
   "goal/observe",
   "goal/unobserve",
   "plan/read",
+  "plan/current/read",
   "plan/revisions/list",
   "goal/evidence/list",
   "goal/create",
@@ -170,13 +186,18 @@ export const ClientMethodSchema = z.enum([
   "goal/pause",
   "goal/resume",
   "goal/stop",
-  "goal/input/respond",
   "plan/create",
   "plan/draft/save",
   "plan/draft/discard",
   "plan/propose",
-  "plan/approve",
   "plan/execute",
+  "plan/observe",
+  "plan/unobserve",
+  "plan/events/read",
+  "plan/evidence/list",
+  "plan/pause",
+  "plan/resume",
+  "plan/stop",
   "plan/reject",
   "task/create",
   "task/list",
@@ -184,7 +205,8 @@ export const ClientMethodSchema = z.enum([
   "task/observe",
   "task/unobserve",
   "task/seen",
-  "task/message/send",
+  "task/close",
+  "thread/message/send",
   "task/followup",
   "task/cancel",
   "task/tree/delete",
@@ -220,6 +242,7 @@ const EventMethodSchema = z.enum([
   "configuration/changed",
   "turn/input-queue-changed",
   "turn/input-consumed",
+  "turn/messages_received",
   "turn/state-changed",
   "assistant/model-step-committed",
   "assistant/text-delta",
@@ -239,7 +262,8 @@ const EventMethodSchema = z.enum([
   "task/mailbox-changed",
   "goal/changed",
   "goal/activity",
-  "goal/input-requested",
+  "interaction/changed",
+  "plan/changed",
 ]);
 
 /** capability 数组影响分派语义前先拒绝重复值，避免同一能力被重复解释。 */
@@ -616,6 +640,15 @@ const ThreadItemSchema = z.discriminatedUnion("kind", [
     .strict()
     .superRefine(requireMatchingAttachmentSummaries),
   SnapshotItemBaseSchema.extend({
+    kind: z.literal("thread_message"),
+    sourceThreadId: ThreadIdSchema,
+    sourceTitle: SafeNameSchema.refine(
+      (value) => value.trim().length > 0,
+      "source title must not be blank",
+    ),
+    content: BoundedTextSchema,
+  }).strict(),
+  SnapshotItemBaseSchema.extend({
     kind: z.literal("assistant_progress"),
     text: BoundedTextSchema,
     modelRound: z.number().int().min(1).max(128),
@@ -907,7 +940,22 @@ const ThreadCreateParamsSchema = z
     collaborationMode: CollaborationModeSchema,
   })
   .strict();
-const ThreadListParamsSchema = z.object({ workspaceId: WorkspaceIdSchema, ...pageParams }).strict();
+const ThreadListWorkspaceParamsSchema = z
+  .object({ workspaceId: WorkspaceIdSchema, ...pageParams })
+  .strict();
+/** 全局 Thread 发现与 Workspace 列表共用 `thread/list` wire lane，但以 scope 明确区分语义。 */
+export const ThreadDiscoveryParamsSchema = z
+  .object({
+    scope: z.literal("all"),
+    query: z.string().max(256).refine(noIsoControlCharacters).optional(),
+    ...pageParams,
+    workspaceId: WorkspaceIdSchema.optional(),
+  })
+  .strict();
+const ThreadListParamsSchema = z.union([
+  ThreadListWorkspaceParamsSchema,
+  ThreadDiscoveryParamsSchema,
+]);
 const ThreadSearchParamsSchema = z
   .object({ workspaceId: WorkspaceIdSchema, query: z.string().max(256), ...pageParams })
   .strict();
@@ -991,13 +1039,23 @@ const TurnInputUpdateParamsSchema = TurnInputMutationParamsSchema.extend({
 }).strict();
 const TaskNameSchema = z.string().trim().min(1).max(96).refine(noIsoControlCharacters);
 const TaskIdempotencyKeySchema = z.string().min(1).max(128).refine(noIsoControlCharacters);
+/** 侧边任务可选完整执行偏好；缺省对象时由 App Server 冻结父 Thread 偏好。 */
+const TaskCreatePreferencesSchema = z
+  .object({
+    providerId: ProviderIdSchema,
+    modelId: ModelIdSchema,
+    reasoningLevel: ReasoningLevelSchema.nullable(),
+    accessMode: AccessModeSchema,
+    collaborationMode: CollaborationModeSchema,
+  })
+  .strict();
 const TaskCreateParamsSchema = z
   .object({
     parentThreadId: ThreadIdSchema,
     parentTurnId: TurnIdSchema.nullable(),
     expectedParentRevision: RevisionSchema,
     taskName: TaskNameSchema,
-    content: TurnContentSchema,
+    preferences: TaskCreatePreferencesSchema.optional(),
   })
   .strict();
 const TaskListParamsSchema = z.object({ rootThreadId: ThreadIdSchema }).strict();
@@ -1019,6 +1077,8 @@ const TaskSeenParamsSchema = z
     throughActivitySequence: z.number().int().min(1).max(MAX_SAFE_INTEGER),
   })
   .strict();
+/** 侧聊关闭只携带临时 Thread identity；取消、观察释放与数据清理由服务端原子裁决。 */
+const TaskCloseParamsSchema = z.object({ taskThreadId: ThreadIdSchema }).strict();
 const TaskMessageParamsSchema = z
   .object({
     senderThreadId: ThreadIdSchema,
@@ -1140,13 +1200,15 @@ export const ParamsSchemaByMethod = {
   "thread/delete": threadMutationParams,
   "thread/compact": ThreadCompactParamsSchema,
   ...GoalParamsSchemaByMethod,
+  ...InteractionParamsSchemaByMethod,
   "task/create": TaskCreateParamsSchema,
   "task/list": TaskListParamsSchema,
   "task/read": TaskReadParamsSchema,
   "task/observe": TaskObserveParamsSchema,
   "task/unobserve": TaskUnobserveParamsSchema,
   "task/seen": TaskSeenParamsSchema,
-  "task/message/send": TaskMessageParamsSchema,
+  "task/close": TaskCloseParamsSchema,
+  "thread/message/send": TaskMessageParamsSchema,
   "task/followup": TaskFollowupParamsSchema,
   "task/cancel": TaskMutationParamsSchema,
   "task/tree/delete": TaskTreeDeleteParamsSchema,
@@ -1239,6 +1301,22 @@ const threadResultSchema = ThreadSchema;
 const threadPageResultSchema = z
   .object({ items: z.array(threadResultSchema).max(200), nextCursor: CursorSchema.nullable() })
   .strict();
+export const ThreadDiscoveryItemSchema = z
+  .object({
+    threadId: ThreadIdSchema,
+    title: SafeNameSchema,
+    kind: z.enum(["main", "side_chat", "subagent"]),
+    workspaceId: WorkspaceIdSchema,
+    status: z.union([z.literal("idle"), TurnStateSchema]),
+  })
+  .strict();
+export const ThreadDiscoveryResultSchema = z
+  .object({
+    items: z.array(ThreadDiscoveryItemSchema).max(200),
+    nextCursor: CursorSchema.nullable(),
+  })
+  .strict();
+const threadListResultSchema = z.union([threadPageResultSchema, ThreadDiscoveryResultSchema]);
 const AttachmentResultSchema = z
   .object({
     attachmentId: AttachmentIdSchema,
@@ -1362,7 +1440,8 @@ const mcpProjectionSchema = z
     mcpId: McpIdSchema,
     name: SafeNameSchema,
     transport: z.enum(["stdio", "streamable_http"]),
-    status: z.enum(["healthy", "degraded", "unavailable", "disabled"]),
+    // Java catalog 用 configured 表示尚未探测，必须与 healthy 保持区分。
+    status: z.enum(["healthy", "degraded", "unavailable", "disabled", "configured"]),
     toolCount: z.number().int().min(0).max(2_000),
   })
   .strict();
@@ -1372,7 +1451,10 @@ const mcpPageResultSchema = z
 const mcpTestResultSchema = z
   .object({
     mcpId: McpIdSchema,
-    status: z.enum(["healthy", "degraded", "unavailable"]),
+    name: SafeNameSchema,
+    transport: z.enum(["stdio", "streamable_http"]),
+    // MCP probe 在 initialize/tools 成功后返回 available，界面再映射为 connected。
+    status: z.enum(["healthy", "available", "degraded", "unavailable"]),
     toolCount: z.number().int().min(0).max(2_000),
   })
   .strict();
@@ -1503,6 +1585,17 @@ const threadCompactResultSchema = z
     }
   });
 
+const TaskStateSchema = z.enum([
+  "idle",
+  "queued",
+  "running",
+  "waiting_approval",
+  "suspended",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
 export const TaskSummarySchema = z
   .object({
     taskThreadId: ThreadIdSchema,
@@ -1513,7 +1606,7 @@ export const TaskSummarySchema = z
     depth: z.number().int().min(1).max(4),
     taskKind: z.enum(["side_task", "subagent"]),
     lifecycle: z.enum(["independent", "attached"]),
-    state: TurnStateSchema,
+    state: TaskStateSchema,
     revision: RevisionSchema,
     latestActivitySequence: z.number().int().min(1).max(MAX_SAFE_INTEGER),
     unreadCount: z.number().int().min(0).max(MAX_SAFE_INTEGER),
@@ -1549,10 +1642,12 @@ const TaskActivitySchema = z
   .object({
     activitySequence: z.number().int().min(1).max(MAX_SAFE_INTEGER),
     activityId: prefixedId("activity_", 105),
+    rootThreadId: ThreadIdSchema,
     taskThreadId: ThreadIdSchema,
     actorThreadId: ThreadIdSchema,
     causalTurnId: TurnIdSchema.nullable(),
     kind: z.enum([
+      "created",
       "dispatched",
       "message_sent",
       "follow_up_queued",
@@ -1585,7 +1680,7 @@ const TaskMailboxMessageSchema = z
   })
   .strict();
 const TaskCreateResultSchema = z
-  .object({ accepted: z.literal(true), task: TaskSummarySchema, turnId: TurnIdSchema })
+  .object({ accepted: z.literal(true), task: TaskSummarySchema })
   .strict();
 /** 列表必须组成一棵完整连根树；客户端拒绝断链、重复 identity 和伪造 depth。 */
 function validateTaskTree(
@@ -1656,7 +1751,7 @@ const TaskContextSeedSchema = z
     contextSeedId: TaskSeedIdSchema,
     parentRevision: RevisionSchema,
     inheritanceMode: z.enum(["effective_context", "brief_only"]),
-    taskBrief: TurnContentSchema,
+    taskBrief: TurnContentSchema.nullable(),
     inheritedContextSummary: PreviewTextSchema.nullable(),
     inheritedContextPreview: z.array(TaskContextPreviewItemSchema).max(24),
     fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
@@ -1677,9 +1772,12 @@ const TaskContextSeedSchema = z
     }
     const validInheritance =
       (value.inheritanceMode === "brief_only" &&
+        value.taskBrief !== null &&
         value.inheritedContextSummary === null &&
         value.inheritedContextPreview.length === 0) ||
-      (value.inheritanceMode === "effective_context" && value.inheritedContextSummary !== null);
+      (value.inheritanceMode === "effective_context" &&
+        value.taskBrief === null &&
+        value.inheritedContextSummary !== null);
     if (!validInheritance) {
       context.addIssue({
         code: "custom",
@@ -1691,6 +1789,7 @@ const TaskContextSeedSchema = z
 const TaskReadResultSchema = z
   .object({
     task: TaskSummarySchema,
+    thread: ThreadSchema,
     contextSeed: TaskContextSeedSchema,
     activities: z.array(TaskActivitySchema).max(200),
     mailbox: z.array(TaskMailboxMessageSchema).max(200),
@@ -1698,6 +1797,13 @@ const TaskReadResultSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (value.thread.threadId !== value.task.taskThreadId) {
+      context.addIssue({
+        code: "custom",
+        path: ["thread", "threadId"],
+        message: "task thread metadata identity does not match task summary",
+      });
+    }
     for (let index = 0; index < value.activities.length; index += 1) {
       const activity = value.activities[index];
       const previous = value.activities[index - 1];
@@ -1765,6 +1871,8 @@ const TaskFollowupResultSchema = z
 const TaskMutationResultSchema = z
   .object({ accepted: z.literal(true), task: TaskSummarySchema })
   .strict();
+/** 关闭回执没有 revision，只有 true 才允许前端移除临时 Tab。 */
+const TaskCloseResultSchema = z.object({ closed: z.literal(true) }).strict();
 const TaskTreeDeleteResultSchema = z
   .object({ accepted: z.literal(true), deletedTaskCount: z.number().int().min(1).max(64) })
   .strict();
@@ -1809,7 +1917,9 @@ export const ThreadReadResultSchema = z
       if (entry === undefined) continue;
       if (
         entry.activity.taskThreadId !== entry.task.taskThreadId ||
-        entry.task.rootThreadId !== value.threadId ||
+        entry.activity.rootThreadId !== entry.task.rootThreadId ||
+        entry.task.taskKind !== "subagent" ||
+        entry.task.parentThreadId !== value.threadId ||
         entry.activity.activitySequence > entry.task.latestActivitySequence ||
         (previous !== undefined &&
           entry.activity.activitySequence <= previous.activity.activitySequence) ||
@@ -1853,7 +1963,7 @@ export const ResultSchemaByMethod = {
   "workspace/set-trust": acceptedResultSchema,
   "workspace/unregister": acceptedResultSchema,
   "thread/create": threadResultSchema,
-  "thread/list": threadPageResultSchema,
+  "thread/list": threadListResultSchema,
   "thread/search": threadPageResultSchema,
   "thread/read": ThreadReadResultSchema,
   "thread/rename": threadResultSchema,
@@ -1865,13 +1975,15 @@ export const ResultSchemaByMethod = {
   "thread/delete": acceptedResultSchema,
   "thread/compact": threadCompactResultSchema,
   ...GoalResultSchemaByMethod,
+  ...InteractionResultSchemaByMethod,
   "task/create": TaskCreateResultSchema,
   "task/list": TaskListResultSchema,
   "task/read": TaskReadResultSchema,
   "task/observe": TaskObserveResultSchema,
   "task/unobserve": acceptedResultSchema,
   "task/seen": TaskMutationResultSchema,
-  "task/message/send": TaskMessageResultSchema,
+  "task/close": TaskCloseResultSchema,
+  "thread/message/send": TaskMessageResultSchema,
   "task/followup": TaskFollowupResultSchema,
   "task/cancel": TaskMutationResultSchema,
   "task/tree/delete": TaskTreeDeleteResultSchema,
@@ -2111,6 +2223,45 @@ const inputConsumedParamsSchema = semanticBaseSchema
         path: ["userItem", "attachments"],
         message: "consumed user item must preserve queued attachment summaries",
       });
+  });
+/** Mailbox 消费一次提交一批跨会话消息；消息作为独立历史事实，不伪造用户输入或 Task Activity。 */
+const messagesReceivedParamsSchema = semanticBaseSchema
+  .extend({
+    items: z
+      .array(
+        SnapshotItemBaseSchema.extend({
+          kind: z.literal("thread_message"),
+          sourceThreadId: ThreadIdSchema,
+          sourceTitle: SafeNameSchema.refine(
+            (value) => value.trim().length > 0,
+            "source title must not be blank",
+          ),
+          content: BoundedTextSchema,
+        }).strict(),
+      )
+      .min(1)
+      .max(256),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const itemIds = new Set<string>();
+    value.items.forEach((item, index) => {
+      if (item.turnId !== value.turnId) {
+        context.addIssue({
+          code: "custom",
+          path: ["items", index, "turnId"],
+          message: "received message must reference the event turn",
+        });
+      }
+      if (itemIds.has(item.itemId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["items", index, "itemId"],
+          message: "received message item ids must be unique",
+        });
+      }
+      itemIds.add(item.itemId);
+    });
   });
 const committedToolCallSchema = z
   .object({
@@ -2402,6 +2553,7 @@ const taskActivityParamsSchema = taskEventBaseSchema
   .superRefine((value, context) => {
     if (
       value.activity.taskThreadId !== value.taskThreadId ||
+      value.activity.rootThreadId !== value.task.rootThreadId ||
       value.task.taskThreadId !== value.taskThreadId ||
       value.task.rootThreadId !== value.rootThreadId ||
       value.task.revision !== value.taskRevision ||
@@ -2440,6 +2592,7 @@ export const JaEventSchema = z.discriminatedUnion("method", [
   notification("configuration/changed", configChangedParamsSchema),
   notification("turn/input-queue-changed", inputQueueChangedParamsSchema),
   notification("turn/input-consumed", inputConsumedParamsSchema),
+  notification("turn/messages_received", messagesReceivedParamsSchema),
   notification("turn/state-changed", stateChangedParamsSchema),
   notification("assistant/model-step-committed", modelStepCommittedParamsSchema),
   notification("assistant/text-delta", deltaParamsSchema),
@@ -2458,7 +2611,8 @@ export const JaEventSchema = z.discriminatedUnion("method", [
   notification("task/mailbox-changed", taskMailboxChangedParamsSchema),
   notification("goal/changed", GoalChangedParamsSchema),
   notification("goal/activity", GoalActivityParamsSchema),
-  notification("goal/input-requested", GoalInputRequestedParamsSchema),
+  notification("interaction/changed", InteractionChangedParamsSchema),
+  notification("plan/changed", PlanChangedParamsSchema),
 ]);
 export type Thread = z.infer<typeof ThreadSchema>;
 export type UserContentBlock = z.infer<typeof UserContentBlockSchema>;

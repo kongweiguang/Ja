@@ -71,6 +71,9 @@ public final class GoalContinuationCoordinator implements AutoCloseable {
             throw new ContinuationStartFailure(failure);
         }
         CompletionStage<Void> completion = started.whenComplete((ignored, failure) -> {
+            // SUSPENDED 是可恢复的中间态：TurnService 已释放 Provider/运行租约，但 Goal fencing
+            // lease 必须保留到原 Turn 真正终态，否则回答到达后 Tool ledger 无法验证身份。
+            if (isSuspended(failure)) return;
             releaseAndSettle(request, leaseId, failure != null);
             recordNoProgress(goalId, goal.revision(), leaseId);
             scheduleRetry(goalId);
@@ -85,6 +88,20 @@ public final class GoalContinuationCoordinator implements AutoCloseable {
     private void releaseAndSettle(ContinuationRequest request, String leaseId, boolean abandoned) {
         goals.releaseLease(request.goalId(), leaseId, request.fencingToken(), abandoned, clock.instant());
         turns.settled(request);
+    }
+
+    /** 识别 TurnService 的可恢复挂起信号，避免把等待回答当作执行失败收口。 */
+    private static boolean isSuspended(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException
+                    || current instanceof io.github.kongweiguang.ja.conversation.application.loop.AgentLoop.InputNeedsAttentionException
+                    || current instanceof io.github.kongweiguang.ja.conversation.application.service.TurnService.PlanSuspendedException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     /** 只有整个 Turn 期间 Goal revision 完全未变才计数，并用当前 revision 再做 CAS。 */
@@ -122,6 +139,13 @@ public final class GoalContinuationCoordinator implements AutoCloseable {
 
         /** settled 仅在 coordinator 已提交 lease 终态后调用，adapter 用它开放 Goal 恢复。 */
         default void settled(ContinuationRequest request) { }
+
+        /** 同一隐藏 Turn 的 Interaction 恢复仍归原 lease；每次暂停后都必须重新登记回调。 */
+        default void registerResumeContinuation(ContinuationRequest request,
+                                                 Consumer<CompletionStage<?>> continuation) { }
+
+        /** admission 失败或 Turn 终态时清理尚未消费的恢复回调。 */
+        default void clearResumeContinuation(ContinuationRequest request) { }
     }
 
     /** continuation 携带唯一 Turn 与 lease identity，不携带伪用户正文。 */

@@ -1,6 +1,9 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import type { InterfacePreferences } from "./interfacePreferences";
+import type { CloseBehavior } from "@/shared/settings/closeBehavior";
+
 import type {
   DefaultModelSelection,
   McpServerSave,
@@ -14,6 +17,7 @@ import type {
   McpStatus,
   AccessMode,
   SettingsDocument,
+  SubagentSettings,
   ThemeMode,
   UiPalette,
 } from "../domain/types";
@@ -39,6 +43,8 @@ export interface SettingsPorts {
   ) => Promise<void>;
   onMoveModel: (providerId: string, modelId: string, direction: -1 | 1) => Promise<void>;
   onDefaultSelectionChange: (selection: DefaultModelSelection) => Promise<void>;
+  /** 子智能体只保存用户级策略；空模型引用表示在新会话中跟随父任务。 */
+  onSubagentSettingsChange: (settings: SubagentSettings) => Promise<void>;
   /** 通过原生一次性 Command 替换 Credential，且绝不把它返回状态层。 */
   onReplaceCredential: (credentialId: string, secret: string) => Promise<void>;
   /** 清除 Credential 时保留不含 Secret 的 Model 或 MCP Selector。 */
@@ -49,6 +55,8 @@ export interface SettingsPorts {
   onCloseMcp: (id: string) => Promise<void>;
   onToggleSkill: (id: string, enabled: boolean) => Promise<void>;
   onAccessModeChange: (mode: AccessMode) => Promise<void>;
+  /** 普通模式是否允许模型发起结构化澄清；Plan 不受该开关影响。 */
+  onClarificationEnabledChange: (enabled: boolean) => Promise<void>;
   onAppearanceChange: (
     appearance: AppearanceSettings,
     changed: keyof AppearanceSettings,
@@ -105,8 +113,18 @@ export interface SettingsUpdateProgress {
   readonly percent?: number;
 }
 
-/** 桌面设置只消费外链与更新四个窄动作，不感知 Tauri plugin、Resource 或 command 名称。 */
+/** 本地界面偏好在 composition 连接唯一 store，设置组件只接收值和字段级保存动作。 */
+export interface SettingsInterfacePreferences extends InterfacePreferences {
+  onChange: <K extends keyof InterfacePreferences>(
+    key: K,
+    value: InterfacePreferences[K],
+  ) => Promise<void>;
+}
+
+/** 设置页消费窄原生动作，不感知 Tauri plugin、持久化文件或 command 名称。 */
 export interface SettingsDesktopPort {
+  readCloseBehavior(): Promise<CloseBehavior>;
+  saveCloseBehavior(value: CloseBehavior): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
   checkForUpdate(): Promise<SettingsUpdateCheckResult>;
   installUpdate(onProgress: (progress: SettingsUpdateProgress) => void): Promise<void>;
@@ -147,7 +165,7 @@ export interface McpListResult {
     mcpId: string;
     name: string;
     transport: McpTransport;
-    status: "healthy" | "degraded" | "unavailable" | "disabled";
+    status: "healthy" | "available" | "degraded" | "unavailable" | "disabled" | "configured";
     toolCount: number;
   }>;
   nextCursor: string | null;
@@ -155,7 +173,7 @@ export interface McpListResult {
 
 interface McpTestResult {
   mcpId: string;
-  status: "healthy" | "degraded" | "unavailable";
+  status: "healthy" | "available" | "degraded" | "unavailable";
   toolCount: number;
 }
 

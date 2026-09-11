@@ -55,6 +55,20 @@ final class RpcResultsTest {
         assertEquals("turn_second", RpcResults.snapshotItem(mapper, tool).path("turnId").textValue());
     }
 
+    /** 跨会话消息必须保留来源 Thread 标题快照，并使用独立 kind，不能退化成 user_input。 */
+    @Test
+    void mapsThreadMessageWithFrozenSourceIdentity() {
+        ThreadSnapshot.ThreadMessageItem item = new ThreadSnapshot.ThreadMessageItem(
+                "item_message", Instant.EPOCH, "turn_target", "thr_sender", "发送方标题", "阶段结果");
+
+        var result = RpcResults.snapshotItem(new ObjectMapper(), item);
+
+        assertEquals("thread_message", result.path("kind").textValue());
+        assertEquals("thr_sender", result.path("sourceThreadId").textValue());
+        assertEquals("发送方标题", result.path("sourceTitle").textValue());
+        assertEquals("阶段结果", result.path("content").textValue());
+    }
+
     /** USER item 内联精确摘要且不再产生独立 attachment snapshot item。 */
     @Test
     void mapsAttachmentSummaryInsideOwningUserItem() {

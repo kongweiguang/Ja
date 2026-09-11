@@ -284,8 +284,18 @@ public enum JaErrorCatalog {
     GOAL_EVIDENCE_INCOMPLETE(-32091, ErrorCategory.CONFLICT, false),
     /** 未知外部副作用或进程代际变化要求用户显式恢复。 */
     GOAL_RECOVERY_REQUIRED(-32092, ErrorCategory.CONFLICT, false),
-    /** 输入请求已过期，旧回复不能推动 Goal。 */
-    GOAL_INPUT_EXPIRED(-32093, ErrorCategory.TIMEOUT, false);
+    /** 问答不存在或不属于调用 Thread，不公开其它会话的请求身份。 */
+    INTERACTION_NOT_FOUND(-32094, ErrorCategory.NOT_FOUND, false),
+    /** 问答草稿或提交版本已变化，调用方须保留输入并重新对账。 */
+    INTERACTION_REVISION_CONFLICT(-32095, ErrorCategory.CONFLICT, true),
+    /** 已结算、已替代或已取消的问题不能再次改变答案。 */
+    INTERACTION_INVALID_STATE(-32096, ErrorCategory.CONFLICT, false),
+    /** 回答必须满足原问题的选项和必答约束，不能信任 Renderer 预检。 */
+    INTERACTION_INVALID(-32097, ErrorCategory.VALIDATION, false),
+    /** 执行和编辑必须绑定用户实际看到的 Plan revision。 */
+    PLAN_REVISION_CONFLICT(-32098, ErrorCategory.CONFLICT, true),
+    /** Plan 控制请求不能越过仍在结算的执行或未知副作用。 */
+    PLAN_INVALID_STATE(-32099, ErrorCategory.CONFLICT, false);
 
     private static final Map<Integer, JaErrorCatalog> BY_CODE = Arrays.stream(values())
             .collect(Collectors.toUnmodifiableMap(JaErrorCatalog::code, Function.identity()));

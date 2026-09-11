@@ -46,7 +46,7 @@ final class GoalToolExecutionLedgerTest {
                 standalone, "revision_standalone", "run_plan");
         GoalModels.GoalSnapshot goalSnapshot = new GoalModels.GoalSnapshot(goal,
                 new GoalModels.GoalDefinition("goal_one", 1, "持续目标", List.of(), NOW),
-                link, "step_one", 0, 1, null, null, null, null, null, 7);
+                link, "step_one", 0, 1, null, null, null, null, 7);
         List<GoalModels.ToolAttempt> prepared = new ArrayList<>();
         List<GoalModels.ToolAttemptState> settled = new ArrayList<>();
         GoalRepository repository = repository((proxy, method, args) -> switch (method.getName()) {
@@ -130,6 +130,32 @@ final class GoalToolExecutionLedgerTest {
                 new GoalToolExecutionPort.Settlement(ToolOutcome.SUCCEEDED, "ok", null, NOW));
 
         assertEquals(List.of("goal_one"), notifications);
+    }
+
+    /** 步骤已成功但独立验收未通过时，修正 Tool 仍必须保留原 Run 的副作用账本。 */
+    @Test void recordsRepairToolAfterAllStepsSucceeded() {
+        var plan = plan("plan_standalone", GoalModels.PlanStatus.EXECUTING, "revision_standalone", "run_plan");
+        var original = snapshot(plan, "revision_standalone", "run_plan");
+        var succeeded = new GoalModels.PlanSnapshot(plan, null, original.currentRevision(), original.approval(),
+                List.of(new GoalModels.StepExecution("step_one", "run_plan", GoalModels.StepStatus.SUCCEEDED,
+                        1, null, null, NOW, NOW)), 4);
+        List<GoalModels.ToolAttempt> attempts = new ArrayList<>();
+        var repository = repository((proxy, method, args) -> switch (method.getName()) {
+            case "findInternalTurnBinding" -> Optional.of(new GoalRepository.InternalTurnBinding("turn_plan",
+                    "PLAN_EXECUTION", null, "plan_standalone", "run_plan", null, "revision_standalone", "a".repeat(64), null));
+            case "readPlanSnapshot" -> succeeded;
+            case "prepareToolAttempt" -> {
+                var attempt = ((GoalRepository.PrepareToolAttempt) args[0]).attempt();
+                attempts.add(attempt);
+                yield attempt;
+            }
+            default -> throw new AssertionError(method.getName());
+        });
+        var ledger = new GoalToolExecutionLedger(repository, Clock.fixed(NOW, ZoneOffset.UTC), 9);
+        assertTrue(ledger.prepare(request(TurnOrigin.PLAN_EXECUTION, "call_repair")).isPresent());
+        assertEquals("run_plan", attempts.getFirst().runId());
+        assertNull(attempts.getFirst().stepId());
+        assertTrue(attempts.getFirst().sideEffect());
     }
 
     /** Tool prepare 请求只携带调用已冻结事实，测试不会依赖 ambient Thread 状态。 */

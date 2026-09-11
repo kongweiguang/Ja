@@ -8,6 +8,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.application.service.TurnService;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionService;
+import io.github.kongweiguang.ja.conversation.application.loop.AgentLoop;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionEvent;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.port.in.InternalTurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
@@ -15,12 +20,15 @@ import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepository;
+import io.github.kongweiguang.ja.task.application.TaskCoordinator;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 
 import java.time.Clock;
 import java.util.Objects;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
 /** 把 Goal continuation 适配到唯一 TurnService，隐藏上下文不进入 USER 消息历史。 */
 public final class GoalContinuationTurnAdapter implements GoalContinuationCoordinator.ContinuationTurnPort {
@@ -33,13 +41,16 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
     private final Clock clock;
     private final GoalEventRegistry events;
     private final GoalContinuationGate gate;
+    private final TaskCoordinator tasks;
+    private final InteractionService interactions;
 
     /** adapter 只组合现有 owner，不保存第二份 Goal 或 Thread 状态。 */
     public GoalContinuationTurnAdapter(TurnService turns, ConversationRepository conversations,
                                        WorkspaceUseCase workspaces, GoalRepository goals,
-                                       GoalService goalService,
-                                       ObjectMapper json, Clock clock, GoalEventRegistry events,
-                                       GoalContinuationGate gate) {
+                                        GoalService goalService,
+                                        ObjectMapper json, Clock clock, GoalEventRegistry events,
+                                        GoalContinuationGate gate, TaskCoordinator tasks,
+                                        InteractionService interactions) {
         this.turns = Objects.requireNonNull(turns, "turns");
         this.conversations = Objects.requireNonNull(conversations, "conversations");
         this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
@@ -49,6 +60,8 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
         this.clock = Objects.requireNonNull(clock, "clock");
         this.events = Objects.requireNonNull(events, "events");
         this.gate = Objects.requireNonNull(gate, "gate");
+        this.tasks = Objects.requireNonNull(tasks, "tasks");
+        this.interactions = Objects.requireNonNull(interactions, "interactions");
     }
 
     /** idle 判定委托 TurnService 的持久快照，避免 adapter 复制 FIFO 规则。 */
@@ -58,6 +71,17 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
     @Override
     public CompletionStage<Void> start(GoalContinuationCoordinator.ContinuationRequest request) {
         return gate.serialized(request.goalId(), () -> startSerialized(request));
+    }
+
+    /** Interaction 恢复仍使用原 Goal lease 与 Turn identity，避免答案后另起一条竞争 continuation。 */
+    @Override public void registerResumeContinuation(GoalContinuationCoordinator.ContinuationRequest request,
+                                                      Consumer<CompletionStage<?>> continuation) {
+        turns.registerResumeContinuation(request.turnId(), continuation);
+    }
+
+    /** admission 或终态收口时移除未消费的恢复回调，防止旧 Goal 引用跨 Run 存活。 */
+    @Override public void clearResumeContinuation(GoalContinuationCoordinator.ContinuationRequest request) {
+        turns.clearResumeContinuation(request.turnId());
     }
 
     /**
@@ -82,31 +106,115 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
                 thread, workspace, turnId, clock.instant(), TurnOrigin.GOAL_CONTINUATION);
         GoalEventRegistry.RoutedTurn route = events.registerTurn(request.goalId(), turnId,
                 workspace.workspaceId(), thread.threadId(), thread.revision());
+        AutoCloseable interactionWatch = watchInteraction(request);
         try (route) {
+            CompletableFuture<Void> completion = new CompletableFuture<>();
+            registerResumeContinuation(request,
+                    resumed -> observeResumed(request, route, completion, resumed, true, interactionWatch));
             TurnUseCase.Accepted accepted = turns.startContinuation(
-                    command, hiddenContext(goal, request.fencingToken()), phaseAwareSink(request.goalId(), route.sink()));
+                    command, hiddenContext(goal, request.fencingToken()),
+                    tasks.projectContinuationEvents(thread.threadId(),
+                            phaseAwareSink(request.goalId(), route.sink())));
             gate.activate(request.goalId(), turnId, request.fencingToken(),
                     () -> cancelCurrent(turnId, thread.threadId()));
             route.retain();
-            return accepted.completion().handle((ignored, failure) -> {
-                Throwable terminalFailure = failure;
-                try {
-                    route.abandon();
-                } catch (RuntimeException cleanupFailure) {
-                    if (terminalFailure == null) terminalFailure = cleanupFailure;
-                    else terminalFailure.addSuppressed(cleanupFailure);
-                }
-                if (terminalFailure != null) {
-                    throw new java.util.concurrent.CompletionException(terminalFailure);
-                }
-                return null;
-            });
+            observeResumed(request, route, completion, accepted.completion(), false, interactionWatch);
+            return completion;
+        } catch (RuntimeException failure) {
+            clearResumeContinuation(request);
+            closeInteractionWatch(interactionWatch, failure);
+            try {
+                route.abandon();
+            } catch (RuntimeException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
         }
     }
 
     /**
-     * 只有已提交的 Turn 审批事件能改变 Goal phase；先更新 Goal 再转发同一 Turn 事件，确保状态行
-     * 不会在审批卡片已经可操作时仍显示“执行中”。
+     * 统一观察初次 admission 与后续恢复；挂起是可继续的中间态，只有真实终态才释放 Goal lease。
+     */
+    private void observeResumed(GoalContinuationCoordinator.ContinuationRequest request,
+                                GoalEventRegistry.RoutedTurn route, CompletableFuture<Void> completion,
+                                CompletionStage<?> observed, boolean registerNext,
+                                AutoCloseable interactionWatch) {
+        observed.whenComplete((ignored, failure) -> {
+            if (isSuspended(failure) && registerNext) {
+                registerResumeContinuation(request,
+                        resumed -> observeResumed(request, route, completion, resumed, true, interactionWatch));
+                return;
+            }
+            if (isSuspended(failure)) return;
+            Throwable terminalFailure = failure;
+            try {
+                clearResumeContinuation(request);
+                route.abandon();
+                closeInteractionWatch(interactionWatch, terminalFailure);
+            } catch (RuntimeException cleanupFailure) {
+                if (terminalFailure == null) terminalFailure = cleanupFailure;
+                else terminalFailure.addSuppressed(cleanupFailure);
+            }
+            if (terminalFailure != null) completion.completeExceptionally(terminalFailure);
+            else completion.complete(null);
+        });
+    }
+
+    /** 监听已提交 Interaction 事件，把 Goal phase 与问答恢复事实保持同一顺序。 */
+    private AutoCloseable watchInteraction(GoalContinuationCoordinator.ContinuationRequest continuation) {
+        return interactions.subscribe(continuation.ownerThreadId(), event -> {
+            InteractionSnapshot snapshot = interactions.read(event.threadId(), event.requestId()).orElse(null);
+            if (snapshot == null || snapshot.request().isEmpty()) return;
+            io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest interaction =
+                    snapshot.request().orElseThrow();
+            if (!continuation.turnId().equals(interaction.turnId())
+                    || !continuation.goalId().equals(interaction.goalId())
+                    || (continuation.runId() != null && !continuation.runId().equals(interaction.runId()))) return;
+            if (event.kind() == InteractionEvent.Kind.CREATED) {
+                goalService.projectContinuationPhase(continuation.goalId(), GoalModels.GoalPhase.WORKING,
+                        GoalModels.GoalPhase.WAITING_INPUT, "interaction-created:" + event.requestId(),
+                        event.occurredAt());
+            } else if (event.kind() == InteractionEvent.Kind.ANSWERED || event.kind() == InteractionEvent.Kind.SUPERSEDED) {
+                goalService.projectContinuationPhase(continuation.goalId(), GoalModels.GoalPhase.WAITING_INPUT,
+                        GoalModels.GoalPhase.WORKING, "interaction-answered:" + event.requestId(),
+                        event.occurredAt());
+            }
+        });
+    }
+
+    /** 关闭当前 continuation 的观察句柄；清理故障附着到主异常，不能覆盖状态结算。 */
+    private static void closeInteractionWatch(AutoCloseable watch, Throwable primary) {
+        try {
+            watch.close();
+        } catch (Exception cleanupFailure) {
+            if (primary != null) primary.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /** 重启恢复回调复用 Goal 的阶段投影，不用过期事件订阅推断用户是否已回答。 */
+    public void projectRecoveryPhase(GoalContinuationCoordinator.ContinuationRequest request, boolean waiting) {
+        goalService.projectContinuationPhase(request.goalId(),
+                waiting ? GoalModels.GoalPhase.WORKING : GoalModels.GoalPhase.WAITING_INPUT,
+                waiting ? GoalModels.GoalPhase.WAITING_INPUT : GoalModels.GoalPhase.WORKING,
+                "recovery-phase:" + request.turnId() + ":" + request.fencingToken() + ":" + waiting + ":" + clock.instant(),
+                clock.instant());
+    }
+
+    /** 当前 Turn 仍保留持久 cursor 时，不能让 Goal coordinator 把等待态当成失败终态。 */
+    private static boolean isSuspended(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof InteractionSuspendedException
+                    || current instanceof AgentLoop.InputNeedsAttentionException
+                    || current instanceof TurnService.PlanSuspendedException) return true;
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * 只有已提交的 Turn 审批事件能改变 Goal phase；Interaction 由独立持久事件观察器投影，确保
+     * 状态行不会在审批或提问卡片已经可操作时仍显示“执行中”。
      */
     private TurnEventSink phaseAwareSink(String goalId, TurnEventSink delegate) {
         return event -> {

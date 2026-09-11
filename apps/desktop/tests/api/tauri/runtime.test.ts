@@ -919,7 +919,14 @@ describe("RuntimeHost v1 typed adapter", () => {
         const method = (args?.["input"] as { method?: string } | undefined)?.method;
         if (method === "skill/list") return { items: [], nextCursor: null };
         if (method === "mcp/list") return { items: [], nextCursor: null };
-        if (method === "mcp/test") return { mcpId: "mcp_fixture", status: "healthy", toolCount: 0 };
+        if (method === "mcp/test")
+          return {
+            mcpId: "mcp_fixture",
+            name: "Fixture",
+            transport: "stdio",
+            status: "healthy",
+            toolCount: 0,
+          };
         return { items: [], nextCursor: null };
       },
     );

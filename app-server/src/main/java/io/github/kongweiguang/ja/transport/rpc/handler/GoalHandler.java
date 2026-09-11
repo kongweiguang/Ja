@@ -43,10 +43,13 @@ public final class GoalHandler implements RpcHandler {
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.GOAL_READ, RpcMethod.GOAL_EVENTS_READ, RpcMethod.GOAL_OBSERVE,
                 RpcMethod.GOAL_UNOBSERVE, RpcMethod.PLAN_READ, RpcMethod.PLAN_REVISIONS_LIST,
+                RpcMethod.PLAN_CURRENT_READ, RpcMethod.PLAN_EVENTS_READ, RpcMethod.PLAN_EVIDENCE_LIST,
+                RpcMethod.PLAN_OBSERVE, RpcMethod.PLAN_UNOBSERVE,
+                RpcMethod.PLAN_PAUSE, RpcMethod.PLAN_RESUME, RpcMethod.PLAN_STOP,
                 RpcMethod.GOAL_EVIDENCE_LIST, RpcMethod.GOAL_CREATE, RpcMethod.GOAL_PAUSE,
-                RpcMethod.GOAL_RESUME, RpcMethod.GOAL_STOP, RpcMethod.GOAL_INPUT_RESPOND,
+                RpcMethod.GOAL_RESUME, RpcMethod.GOAL_STOP,
                 RpcMethod.PLAN_CREATE, RpcMethod.PLAN_DRAFT_SAVE, RpcMethod.PLAN_DRAFT_DISCARD,
-                RpcMethod.PLAN_PROPOSE, RpcMethod.PLAN_APPROVE, RpcMethod.PLAN_EXECUTE, RpcMethod.PLAN_REJECT,
+                RpcMethod.PLAN_PROPOSE, RpcMethod.PLAN_EXECUTE, RpcMethod.PLAN_REJECT,
                 RpcMethod.GOAL_PLAN_ATTACH, RpcMethod.GOAL_PLAN_DETACH);
     }
 
@@ -61,6 +64,14 @@ public final class GoalHandler implements RpcHandler {
                 case GOAL_OBSERVE -> observe(command.params());
                 case GOAL_UNOBSERVE -> unobserve(command.params());
                 case PLAN_READ -> readPlan(command.params());
+                case PLAN_CURRENT_READ -> currentPlan(command.params());
+                case PLAN_EVENTS_READ -> planEvents(command.params());
+                case PLAN_OBSERVE -> observePlan(command.params());
+                case PLAN_UNOBSERVE -> unobservePlan(command.params());
+                case PLAN_EVIDENCE_LIST -> planEvidence(command.params());
+                case PLAN_PAUSE -> controlPlan(command.params(), GoalUseCase.Action.PAUSE);
+                case PLAN_RESUME -> controlPlan(command.params(), GoalUseCase.Action.RESUME);
+                case PLAN_STOP -> controlPlan(command.params(), GoalUseCase.Action.STOP);
                 case PLAN_REVISIONS_LIST -> revisions(command.params());
                 case GOAL_EVIDENCE_LIST -> evidence(command.params());
                 case GOAL_CREATE -> create(command.params());
@@ -68,11 +79,9 @@ public final class GoalHandler implements RpcHandler {
                 case GOAL_PAUSE -> control(command.params(), GoalUseCase.Action.PAUSE);
                 case GOAL_RESUME -> control(command.params(), GoalUseCase.Action.RESUME);
                 case GOAL_STOP -> control(command.params(), GoalUseCase.Action.STOP);
-                case GOAL_INPUT_RESPOND -> respondInput(command.params());
                 case PLAN_DRAFT_SAVE -> saveDraft(command.params());
                 case PLAN_DRAFT_DISCARD -> discardDraft(command.params());
                 case PLAN_PROPOSE -> propose(command.params());
-                case PLAN_APPROVE -> approve(command.params());
                 case PLAN_EXECUTE -> execute(command.params());
                 case PLAN_REJECT -> reject(command.params());
                 case GOAL_PLAN_ATTACH -> attachPlan(command.params());
@@ -119,6 +128,63 @@ public final class GoalHandler implements RpcHandler {
         return wire.planSnapshot(readOwnedPlan(params));
     }
 
+    /** 仅按已存在的 Thread 查找其最新计划，空结果不是协议错误。 */
+    private ObjectNode currentPlan(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId");
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 128);
+        if (session.threads().readThread(threadId, null, 1).isEmpty()) {
+            throw JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND, "会话不存在");
+        }
+        ObjectNode result = session.mapper().createObjectNode();
+        result.set("current", session.goals().findCurrentPlan(threadId).map(wire::planSnapshot).orElse(null));
+        return result;
+    }
+
+    /** Plan 的历史只按 owner 与 opaque cursor 查询，不读取工作区文件。 */
+    private ObjectNode planEvents(ObjectNode params) {
+        RpcParams.requireOnly(params, "threadId", "planId", "cursor", "limit");
+        GoalModels.PlanSnapshot plan = readOwnedPlan(params);
+        return wire.planEvents(session.goals().readPlanEvents(plan.plan().planId(), cursor(params), pageLimit(params)));
+    }
+
+    /** Plan 观察身份归当前连接，先验证 Thread 归属后开放事件。 */
+    private ObjectNode observePlan(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId", "planId");
+        return session.observePlan(RpcParams.identifier(params, "threadId", "thr_", 128), planId(params));
+    }
+
+    /** 隐藏详情只撤销观察，不取消计划，也不借用 Goal 的关闭入口。 */
+    private ObjectNode unobservePlan(ObjectNode params) {
+        RpcParams.requireExact(params, "observationId");
+        session.unobservePlan(RpcParams.identifier(params, "observationId", "observe_", 128));
+        return session.mapper().createObjectNode().put("accepted", true);
+    }
+
+    /** 证据查询必须明确版本与 Run，后续执行不能改变旧结果入口。 */
+    private ObjectNode planEvidence(ObjectNode params) {
+        RpcParams.requireOnly(params, "threadId", "planId", "planRevisionId", "runId", "cursor", "limit");
+        GoalModels.PlanSnapshot plan = readOwnedPlan(params);
+        String revisionId = RpcParams.identifier(params, "planRevisionId", "planrev_", 128);
+        String runId = RpcParams.identifier(params, "runId", "run_", 128);
+        return wire.planEvidence(session.goals().listPlanEvidence(plan.plan().planId(), revisionId, runId,
+                cursor(params), pageLimit(params)), revisionId, runId);
+    }
+
+    /** 独立 Plan 控制只作用于原 Run，不路由到 Goal continuation。 */
+    private ObjectNode controlPlan(ObjectNode params, GoalUseCase.Action action) {
+        RpcParams.requireExact(params, "threadId", "planId", "expectedPlanRevision", "runId", "idempotencyKey");
+        GoalModels.PlanSnapshot plan = readOwnedPlan(params);
+        GoalUseCase.PlanControl command = new GoalUseCase.PlanControl(plan.plan().planId(),
+                RpcParams.revision(params, "expectedPlanRevision"),
+                RpcParams.identifier(params, "runId", "run_", 128), idempotencyKey(params), session.clock().instant());
+        switch (action) {
+            case PAUSE -> session.goals().pausePlan(command);
+            case RESUME -> session.goals().resumePlan(command, session.planExecutionEvents());
+            case STOP -> session.goals().stopPlan(command);
+        }
+        return wire.planSnapshot(session.goals().readPlan(plan.plan().planId()));
+    }
+
     /** PlanRevision 分页按服务端 revision keyset 前进，并沿用 plan owner 边界。 */
     private ObjectNode revisions(ObjectNode params) {
         RpcParams.requireOnly(params, "threadId", "planId", "cursor", "limit");
@@ -140,7 +206,7 @@ public final class GoalHandler implements RpcHandler {
 
     /**
      * create 的 expectedGoalRevision 固定为 0；owner Thread revision 在同一请求内读取并交给
-     * Goal owner 校验，避免让 WebView 再维护一份 Thread CAS 字段。
+     * Goal owner 校验，独立侧边任务必须显式使用 taskThreadId，避免 WebView 误写主 Thread。
      */
     private ObjectNode create(ObjectNode params) {
         RpcParams.requireExact(params, "owner", "objective", "acceptanceCriteria",
@@ -170,7 +236,7 @@ public final class GoalHandler implements RpcHandler {
         return wire.snapshot(session.goals().read(created.goalId()));
     }
 
-    /** Plan create 只允许普通 Thread owner，并显式携带 Thread CAS，避免隐式挂接 Goal。 */
+    /** Plan create 绑定已存在的 owner Thread（包括独立侧边任务），并显式携带 Thread CAS。 */
     private ObjectNode createPlan(ObjectNode params) {
         RpcParams.requireExact(params, "owner", "objective", "expectedThreadRevision", "idempotencyKey");
         JsonNode ownerNode = params.get("owner");
@@ -194,19 +260,6 @@ public final class GoalHandler implements RpcHandler {
         session.goals().control(new GoalUseCase.Control(goalId,
                 RpcParams.revision(params, "expectedGoalRevision"), action,
                 idempotencyKey(params), session.clock().instant()));
-        return wire.snapshot(session.goals().read(goalId));
-    }
-
-    /** 用户输入响应只提交可见文本，Handler 不制造 USER timeline message。 */
-    private ObjectNode respondInput(ObjectNode params) {
-        RpcParams.requireExact(params, "goalId", "expectedGoalRevision", "idempotencyKey",
-                "inputRequestId", "response");
-        String goalId = goalId(params);
-        session.goals().respondInput(new GoalUseCase.InputResponse(goalId,
-                RpcParams.revision(params, "expectedGoalRevision"),
-                RpcParams.identifier(params, "inputRequestId", "goalinput_", 128),
-                RpcParams.text(params, "response", 32_768, false), idempotencyKey(params),
-                session.clock().instant()));
         return wire.snapshot(session.goals().read(goalId));
     }
 
@@ -248,20 +301,7 @@ public final class GoalHandler implements RpcHandler {
         return wire.planSnapshot(session.goals().readPlan(current.plan().planId()));
     }
 
-    /** 批准仅绑定精确 revision/hash；执行必须通过独立 plan/execute 显式启动。 */
-    private ObjectNode approve(ObjectNode params) {
-        RpcParams.requireExact(params, "threadId", "planId", "expectedPlanRevision", "idempotencyKey",
-                "planRevisionId", "planHash");
-        GoalModels.PlanSnapshot current = readOwnedPlan(params);
-        session.goals().approve(new GoalUseCase.Approve(current.plan().planId(),
-                RpcParams.revision(params, "expectedPlanRevision"),
-                RpcParams.identifier(params, "planRevisionId", "planrev_", 128),
-                digest(params, "planHash"), idempotencyKey(params),
-                session.clock().instant()));
-        return wire.planSnapshot(session.goals().readPlan(current.plan().planId()));
-    }
-
-    /** execute 只消费当前批准版本，并使用 App Server process generation 创建 standalone run。 */
+    /** execute 在单个服务端事务中批准精确版本并登记唯一 Run，前端无需串联两次调用。 */
     private ObjectNode execute(ObjectNode params) {
         RpcParams.requireExact(params, "threadId", "planId", "expectedPlanRevision", "idempotencyKey",
                 "planRevisionId", "planHash");
@@ -480,7 +520,6 @@ public final class GoalHandler implements RpcHandler {
             case PLAN_APPROVAL_STALE -> JaErrorCatalog.PLAN_APPROVAL_STALE;
             case GOAL_EVIDENCE_INCOMPLETE -> JaErrorCatalog.GOAL_EVIDENCE_INCOMPLETE;
             case GOAL_RECOVERY_REQUIRED -> JaErrorCatalog.GOAL_RECOVERY_REQUIRED;
-            case GOAL_INPUT_EXPIRED -> JaErrorCatalog.GOAL_INPUT_EXPIRED;
         };
         return JaRpcException.of(code, "goal operation could not be completed");
     }

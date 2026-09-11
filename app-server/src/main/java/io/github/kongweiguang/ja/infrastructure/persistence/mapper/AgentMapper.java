@@ -32,6 +32,9 @@ public interface AgentMapper {
      */
     int insertTurn(PersistenceRecords.TurnInsert values);
 
+    /** 当前 admission 已插入 Turn 后，以存在性判断是否已有其它真实 Turn，避免历史累计扫描。 */
+    boolean hasOtherTurns(@Param("threadId") String threadId, @Param("turnId") String turnId);
+
     /** admission 在 Turn 可见前同时写入初始 READY 游标。 */
     int insertTurnExecution(PersistenceRecords.TurnExecutionWrite values);
 
@@ -49,6 +52,9 @@ public interface AgentMapper {
 
     /** SUSPENDED Turn 无内存 owner，取消直接进入终态并删除 execution。 */
     int cancelSuspendedTurn(PersistenceRecords.ResumeTurnCas values);
+
+    /** Plan pause 的取消收口保留 execution cursor，并清除取消 fence 供显式 Resume 使用。 */
+    int suspendCancelledTurn(PersistenceRecords.ResumeTurnCas values);
 
     /** 仅判断指定 Thread 是否存在 SUSPENDED head，供新执行准入 fail fast。 */
     int countSuspendedTurns(@Param("threadId") String threadId);
@@ -92,6 +98,10 @@ public interface AgentMapper {
      */
     List<PersistenceRecords.MessageRow> selectMessages(@Param("threadId") String threadId);
 
+    /** 只取 admission 对应的可见 USER_INPUT，排除同 Turn 内先注入的继承 USER 历史。 */
+    PersistenceRecords.MessageRow selectAdmissionUserMessage(@Param("threadId") String threadId,
+                                                             @Param("turnId") String turnId);
+
     /**
      * 按 Turn 与调用身份读取 Tool 状态，供状态迁移校验。
      */
@@ -127,6 +137,9 @@ public interface AgentMapper {
 
     /** 统计仍未完成的 Tool，成功终态必须以此证明不存在悬空执行。 */
     int countUnfinishedTools(@Param("turnId") String turnId);
+
+    /** 取消挂起交互前按原顺序补齐模型 ToolResult，不允许悬空调用污染下一轮上下文。 */
+    List<String> selectUnfinishedToolCallIds(@Param("turnId") String turnId);
 
     /** 失败或取消终态把所有未完成 Tool 一次性收敛，避免历史继续显示等待审批或运行中。 */
     int settleUnfinishedTools(PersistenceRecords.ToolSettlement values);

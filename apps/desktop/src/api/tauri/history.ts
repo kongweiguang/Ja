@@ -13,6 +13,9 @@ import {
   ModelIdSchema,
   ReasoningLevelSchema,
   AccessModeSchema,
+  ThreadDiscoveryItemSchema,
+  ThreadDiscoveryParamsSchema,
+  ThreadDiscoveryResultSchema,
   type Thread,
   type ThreadReadResult,
 } from "../protocol/protocol";
@@ -30,6 +33,7 @@ export const JA_HISTORY_COMMANDS = {
   workspaceOpen: "ja_runtime_workspace_open",
   workspaceList: "ja_workspace_list",
   threadCreate: "ja_thread_create",
+  threadDiscover: "ja_thread_discover",
   threadList: "ja_thread_list",
   threadSearch: "ja_thread_search",
   threadRead: "ja_thread_read",
@@ -71,6 +75,8 @@ const ThreadCreateInputSchema = z
   })
   .strict();
 const ThreadListInputSchema = PageInputSchema.extend({ workspaceId: WorkspaceIdSchema }).strict();
+/** 全局会话发现保持独立输入形状；scope 是与普通 Workspace 列表互斥的语义判别字段。 */
+const ThreadDiscoverInputSchema = ThreadDiscoveryParamsSchema;
 const ThreadSearchInputSchema = PageInputSchema.extend({
   workspaceId: WorkspaceIdSchema,
   query: z.string().max(256),
@@ -156,6 +162,7 @@ export type HistoryThread = Thread;
 export type HistoryWorkspaceListInput = z.infer<typeof PageInputSchema>;
 export type HistoryThreadCreateInput = z.infer<typeof ThreadCreateInputSchema>;
 export type HistoryThreadListInput = z.infer<typeof ThreadListInputSchema>;
+export type HistoryThreadDiscoverInput = z.infer<typeof ThreadDiscoverInputSchema>;
 export type HistoryThreadSearchInput = z.infer<typeof ThreadSearchInputSchema>;
 export type HistoryThreadReadInput = z.infer<typeof ThreadReadInputSchema>;
 export type HistoryThreadRenameInput = z.infer<typeof ThreadRenameInputSchema>;
@@ -167,6 +174,11 @@ export type HistoryThreadPinInput = z.infer<typeof ThreadPinInputSchema>;
 export type HistoryThreadCompactResult = z.infer<typeof ThreadCompactResultSchema>;
 export interface HistoryThreadListResult {
   items: HistoryThread[];
+  nextCursor?: string | null;
+}
+export type HistoryThreadDiscoveryItem = z.infer<typeof ThreadDiscoveryItemSchema>;
+export interface HistoryThreadDiscoverResult {
+  items: HistoryThreadDiscoveryItem[];
   nextCursor?: string | null;
 }
 export type HistoryThreadReadResult = ThreadReadResult;
@@ -184,6 +196,8 @@ export interface HistoryAdapter {
   workspaceOpen?: (input: HistoryWorkspaceOpenInput) => Promise<HistoryWorkspace>;
   workspaceList(input?: HistoryWorkspaceListInput): Promise<HistoryWorkspaceListResult>;
   threadCreate(input: HistoryThreadCreateInput): Promise<HistoryThread>;
+  /** 全局发现是只读目录能力，保持可选以兼容不需要会话发现的注入式测试 adapter。 */
+  threadDiscover?: (input: HistoryThreadDiscoverInput) => Promise<HistoryThreadDiscoverResult>;
   threadList(input: HistoryThreadListInput): Promise<HistoryThreadListResult>;
   threadSearch(input: HistoryThreadSearchInput): Promise<HistoryThreadListResult>;
   threadRead(input: HistoryThreadReadInput): Promise<HistoryThreadReadResult>;
@@ -263,6 +277,17 @@ export class TauriHistoryAdapter implements HistoryAdapter {
       input,
       ThreadCreateInputSchema,
       ThreadSchema,
+    );
+  }
+
+  /** 只读取跨 Workspace 的最小会话目录，不触发目标 Thread、正文读取或状态同步。 */
+  threadDiscover(input: HistoryThreadDiscoverInput): Promise<HistoryThreadDiscoverResult> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadDiscover,
+      input,
+      ThreadDiscoverInputSchema,
+      ThreadDiscoveryResultSchema,
     );
   }
 

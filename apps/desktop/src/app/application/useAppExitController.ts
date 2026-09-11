@@ -24,7 +24,7 @@ export interface AppExitObserverPort {
 }
 
 /**
- * 托盘退出先取得 Files flush lease，再等待 Preview child close ACK，最后提交原生退出；
+ * 托盘退出与“关闭窗口时退出”共用 Files flush lease、Preview close ACK 和原生退出提交；
  * 普通窗口隐藏不经过这里，single-flight 只约束真正会销毁进程的动作。
  */
 export function useAppExitController(

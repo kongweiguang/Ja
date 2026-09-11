@@ -61,6 +61,8 @@ final class ConfigurationRuntimeAdapterTest {
             ConfigurationUseCase.ReadResult read = service.read(null);
             assertEquals(ConfigurationUseCase.LayerStatus.MISSING, read.user().status());
             assertNotNull(read.effective());
+            assertTrue(node(read.effective()).path("subagents").path("enabled").asBoolean());
+            assertTrue(node(read.effective()).path("subagents").path("provider_id").isNull());
             ConfigGeneration generation = service.resolveGeneration(null);
             assertFalse(generation.ready());
             assertTrue(generation.diagnostics().stream()
@@ -208,6 +210,67 @@ final class ConfigurationRuntimeAdapterTest {
 
             assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
             assertFalse(Files.exists(homeDirectory().resolve("config.toml")));
+        }
+    }
+
+    /** 验证子智能体策略经过 TOML 持久化、服务重建和 CAS 更新后仍保持严格快照语义。 */
+    @Test
+    void subagentPolicyPersistsAcrossRestartAndRejectsStaleOrDeletedReferences() {
+        ObjectNode configured = userDocument("provider_subagent", "model_subagent", "subagent-model");
+        ObjectNode provider = (ObjectNode) configured.withArray("providers").get(0);
+        ObjectNode fallback = provider.withArray("models").get(0).deepCopy();
+        fallback.put("model_id", "model_default");
+        provider.withArray("models").add(fallback);
+        configured.put("default_model_id", "model_default");
+        configured.with("subagents").put("enabled", false)
+                .put("provider_id", "provider_subagent").put("model_id", "model_subagent")
+                .put("reasoning_level", "medium");
+
+        String configuredVersion;
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.MutationResult result = service.replace(
+                    ConfigurationScope.USER, null, document(configured), "cfg_missing");
+            configuredVersion = result.version();
+        }
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult persisted = service.read(null);
+            JsonNode policy = node(persisted.effective()).path("subagents");
+            assertFalse(policy.path("enabled").asBoolean());
+            assertEquals("provider_subagent", policy.path("provider_id").asText());
+            assertEquals("model_subagent", policy.path("model_id").asText());
+            assertEquals("medium", policy.path("reasoning_level").asText());
+            assertEquals(configuredVersion, persisted.user().version());
+
+            ObjectNode followParent = configured.deepCopy();
+            followParent.with("subagents").put("enabled", true).putNull("provider_id").putNull("model_id")
+                    .putNull("reasoning_level");
+            ConfigurationUseCase.MutationResult switched = service.replace(
+                    ConfigurationScope.USER, null, document(followParent), configuredVersion);
+
+            ObjectNode stale = followParent.deepCopy();
+            stale.with("subagents").put("enabled", false)
+                    .put("provider_id", "provider_subagent").put("model_id", "model_subagent");
+            ConfigurationError conflict = assertThrows(ConfigurationError.class, () -> service.replace(
+                    ConfigurationScope.USER, null, document(stale), configuredVersion));
+            assertEquals(ConfigurationError.Code.CAS_CONFLICT, conflict.code());
+            assertEquals(switched.version(), service.read(null).user().version());
+
+            ObjectNode deletedModel = followParent.deepCopy();
+            deletedModel.with("subagents").put("enabled", false)
+                    .put("provider_id", "provider_subagent").put("model_id", "model_subagent");
+            ((ArrayNode) deletedModel.withArray("providers").get(0).get("models")).remove(0);
+            ConfigurationError missingReference = assertThrows(ConfigurationError.class, () -> service.replace(
+                    ConfigurationScope.USER, null, document(deletedModel), switched.version()));
+            assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, missingReference.code());
+            assertEquals(switched.version(), service.read(null).user().version());
+        }
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            JsonNode policy = node(service.read(null).effective()).path("subagents");
+            assertTrue(policy.path("enabled").asBoolean());
+            assertTrue(policy.path("provider_id").isNull());
+            assertTrue(policy.path("model_id").isNull());
         }
     }
 
@@ -634,6 +697,7 @@ final class ConfigurationRuntimeAdapterTest {
                 + "default_model_id = \"model_model\"\n"
                 + "default_reasoning_level = \"medium\"\n"
                 + "mcp_servers = []\nskills = []\n"
+                + "[subagents]\nenabled = true\nprovider_id = { __ja_null = true }\nmodel_id = { __ja_null = true }\nreasoning_level = { __ja_null = true }\n"
                 + "[[providers]]\n"
                 + "provider_id = \"provider_model\"\n"
                 + "name = \"Test\"\n"
@@ -668,6 +732,7 @@ final class ConfigurationRuntimeAdapterTest {
         return "schema_version = 1\nconfig_revision = 1\ndefault_access_mode = \"full_access\"\n"
                 + "default_provider_id = \"provider_catalog\"\ndefault_model_id = \"model_catalog\"\n"
                 + "default_reasoning_level = \"medium\"\n"
+                + "[subagents]\nenabled = true\nprovider_id = { __ja_null = true }\nmodel_id = { __ja_null = true }\nreasoning_level = { __ja_null = true }\n"
                 + "[[providers]]\nprovider_id = \"provider_catalog\"\nname = \"Catalog\"\napi = \"openai_responses\"\nbase_url = \"http://127.0.0.1\"\ncredential_id = \"cred_model\"\n"
                 + "[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n"
                 + "[providers.agent_defaults]\n"
@@ -694,6 +759,8 @@ final class ConfigurationRuntimeAdapterTest {
                 .put("default_access_mode", "approval_required")
                 .put("default_provider_id", providerId).put("default_model_id", modelId)
                 .put("default_reasoning_level", "medium");
+        root.putObject("subagents").put("enabled", true).put("provider_id", providerId).put("model_id", modelId)
+                .put("reasoning_level", "medium");
         root.putArray("mcp_servers");
         root.putArray("skills");
         ObjectNode provider = root.putArray("providers").addObject();

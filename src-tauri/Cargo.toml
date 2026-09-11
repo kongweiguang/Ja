@@ -127,3 +127,8 @@ path = "tests/unit/mod.rs"
 [[test]]
 name = "int_app_lifecycle"
 path = "tests/integration/app_lifecycle.rs"
+
+# 桌面偏好测试会创建临时文件并验证原子持久化，必须与纯 unit target 隔离。
+[[test]]
+name = "int_desktop_preferences"
+path = "tests/integration/desktop_preferences.rs"

@@ -40,7 +40,23 @@ import {
   collectPlanGoalAcceptanceReport,
   validatePlanGoalAcceptanceReport,
 } from "./plan-goal-production.mjs";
+import {
+  INTERACTION_PLAN_CONTRACT_VERSION,
+  collectInteractionPlanAcceptanceReport,
+} from "./interaction-plan-production.mjs";
+import { createInteractionPlanWebView2Driver } from "./interaction-plan-webview2-driver.mjs";
+import { runStandalonePlanCompletion } from "./standalone-plan-completion-driver.mjs";
+import {
+  readGoalToolBindingRevision,
+  runGoalOnlyCompletion,
+} from "./goal-only-completion-driver.mjs";
 import { createPlanGoalWebView2Driver } from "./plan-goal-webview2-driver.mjs";
+import {
+  interactionPlanProviderScenario,
+  interactionPlanReadonlyToolStream,
+  interactionPlanTextStream,
+  interactionPlanToolStream,
+} from "./fixtures/interaction-plan-provider-scenario.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -63,6 +79,18 @@ const taskThreadsAcceptanceMode = process.env.JA_E2E_TASK_THREADS_ONLY === "1";
 const configuredNativeSidecarDirectory =
   process.env.JA_E2E_NATIVE_SIDECAR_DIRECTORY?.trim() || undefined;
 const planGoalAcceptanceMode = process.env.JA_E2E_PLAN_GOAL_ONLY === "1";
+const interactionPlanAcceptanceMode = process.env.JA_E2E_INTERACTION_PLAN_ONLY === "1";
+const interactionPlanReportPath = process.env.JA_E2E_INTERACTION_PLAN_REPORT?.trim() || undefined;
+const interactionPlanSidecarManifest =
+  process.env.JA_E2E_INTERACTION_PLAN_SIDECAR_MANIFEST?.trim() || undefined;
+const interactionPlanSidecarExecutable =
+  process.env.JA_E2E_INTERACTION_PLAN_SIDECAR_EXECUTABLE?.trim() || undefined;
+const configuredInteractionPlanContractVersion = Number(
+  process.env.JA_E2E_INTERACTION_PLAN_CONTRACT_VERSION || 0,
+);
+const configuredInteractionPlanSoakMinutes = Number(
+  process.env.JA_E2E_INTERACTION_PLAN_SOAK_MINUTES || 0,
+);
 const planGoalReportPath = process.env.JA_E2E_PLAN_GOAL_REPORT?.trim() || undefined;
 const planGoalSidecarManifest = process.env.JA_E2E_PLAN_GOAL_SIDECAR_MANIFEST?.trim() || undefined;
 const planGoalSidecarExecutable =
@@ -94,6 +122,19 @@ if (
 ) {
   throw new Error("Plan/Goal focused 模式必须提供 v1 contract 与绝对报告路径");
 }
+if (
+  interactionPlanAcceptanceMode &&
+  (configuredInteractionPlanContractVersion !== INTERACTION_PLAN_CONTRACT_VERSION ||
+    !Number.isInteger(configuredInteractionPlanSoakMinutes) ||
+    configuredInteractionPlanSoakMinutes < 0 ||
+    configuredInteractionPlanSoakMinutes > 1_440 ||
+    interactionPlanReportPath === undefined ||
+    !isAbsolute(interactionPlanReportPath) ||
+    interactionPlanSidecarManifest === undefined ||
+    interactionPlanSidecarExecutable === undefined)
+) {
+  throw new Error("Interaction/Plan focused 模式必须提供 contract、报告、sidecar 与整数 soak 时长");
+}
 const automaticTitleAcceptanceMode =
   process.env.JA_E2E_AUTOMATIC_TITLE === "1" ||
   operationRecoveryAcceptanceMode ||
@@ -102,6 +143,7 @@ const automaticTitleAcceptanceMode =
   toolFailureAcceptanceMode ||
   composerContextAcceptanceMode ||
   planGoalAcceptanceMode ||
+  interactionPlanAcceptanceMode ||
   turnChangeReviewAcceptanceMode;
 // 侧栏未读/失败提醒需要可控地把 Turn 停在 running，再在用户切离后分别提交成功与失败；
 // 复用现有 loopback Responses fixture 可避免 wall-clock 竞态，也不会产生付费 Provider 调用。
@@ -122,7 +164,9 @@ const planGoalScenarioOverheadMs = 1_800_000;
 const defaultRunDeadlineMs = 1_800_000;
 const runDeadlineMs = planGoalAcceptanceMode
   ? configuredPlanGoalSoakMinutes * 60_000 + planGoalScenarioOverheadMs
-  : defaultRunDeadlineMs;
+  : interactionPlanAcceptanceMode
+    ? configuredInteractionPlanSoakMinutes * 60_000 + planGoalScenarioOverheadMs
+    : defaultRunDeadlineMs;
 const cdpStartupDeadlineMs = 120_000;
 const turnDeadlineMs = realProviderMode ? 180_000 : 30_000;
 // Codex shell 结构矩阵包含两个真实 pointer drag、键盘焦点与视觉采样，不与模型 Turn 共用预算；
@@ -259,8 +303,9 @@ const runtimeRefreshFixtureContract = Object.freeze({
 const workspaceSwitchDeadlineMs = 20_000;
 const workspaceSwitchMemorySettleMs = 2_000;
 const themeMatrixPalettes = Object.freeze([
+  Object.freeze({ value: "ja", label: "Ja" }),
+  Object.freeze({ value: "jetbrains", label: "JetBrains" }),
   Object.freeze({ value: "xcode", label: "Xcode" }),
-  Object.freeze({ value: "fleet", label: "Fleet" }),
   Object.freeze({ value: "obsidian", label: "Obsidian" }),
   Object.freeze({ value: "claude", label: "Claude" }),
 ]);
@@ -289,7 +334,21 @@ const themeMatrixAnchors = Object.freeze({
       accent: "#0a84ff",
     }),
   }),
-  fleet: Object.freeze({
+  jetbrains: Object.freeze({
+    light: Object.freeze({
+      background: "#e9eaee",
+      content: "#ffffff",
+      editor: "#ffffff",
+      accent: "#3871e1",
+    }),
+    dark: Object.freeze({
+      background: "#26282c",
+      content: "#191a1c",
+      editor: "#191a1c",
+      accent: "#3871e1",
+    }),
+  }),
+  ja: Object.freeze({
     light: Object.freeze({
       background: "#f2f2f2",
       content: "#ffffff",
@@ -377,8 +436,8 @@ async function ensureJava25Runtime() {
 /** 只接受验收矩阵声明的 Windows 缩放档位，避免任意浮点值把同 viewport 比较伪装成有效证据。 */
 function readNativeDevicePixelRatio() {
   const value = Number(process.env.JA_E2E_DEVICE_PIXEL_RATIO ?? "1");
-  if (![1, 1.25, 1.5].includes(value))
-    throw new Error("JA_E2E_DEVICE_PIXEL_RATIO 只允许 1、1.25 或 1.5");
+  if (![1, 1.25, 1.5, 2].includes(value))
+    throw new Error("JA_E2E_DEVICE_PIXEL_RATIO 只允许 1、1.25、1.5 或 2");
   return value;
 }
 
@@ -1157,7 +1216,7 @@ async function prepareThemeMatrixWorkbench(page, deadline, signal) {
 }
 
 /**
- * 对当前主界面读取四主题关键 token、overflow、CodeMirror/xterm 热更新与原生 session identity；
+ * 对当前主界面读取五主题关键 token、overflow、CodeMirror/xterm 热更新与原生 session identity；
  * 自定义色值先经浏览器规范化，避免 hex/rgb 表示差异造成伪失败。
  */
 async function captureThemeMatrixFrame(page, client, expected, viewport, reducedMotion, deadline) {
@@ -1338,7 +1397,7 @@ async function captureThemeMatrixFrame(page, client, expected, viewport, reduced
 }
 
 /**
- * 执行四 Palette x 浅深 x viewport x motion 的真实桌面矩阵；每次从设置页切换后回到同一
+ * 执行五 Palette x 浅深 x viewport x motion 的真实桌面矩阵；每次从设置页切换后回到同一
  * Workbench 验证重组件身份，最后 reload 只验证本地持久化恢复，不产生 Provider 调用。
  */
 async function runThemeMatrixAcceptanceSession(page, deadline, diagnostics, signal, recordStage) {
@@ -2437,13 +2496,18 @@ function automaticTitleScenarios() {
       reply: "Plan Goal 结构化执行已结算",
       objective: "用确定性证据完成 Plan Goal 真窗验收目标",
       revisedObjective: "用确定性证据完成 Plan Goal 真窗验收目标 v1",
+      goalOnlyObjective: "用确定性证据完成 Goal-only 真窗验收目标",
       scope: "隔离 Windows Tauri WebView2",
       verification: "验证结构化计划、续跑、证据与独立 evaluator",
       stepTitle: "执行确定性验收步骤",
       stepDescription: "通过内建 extension 绑定真实 Tool result 并请求独立验收",
       criterion: "当前计划版本存在有效的真实 Tool 证据",
+      goalOnlyCriterionId: "criterion_goal_only",
+      goalOnlyCriterion: "当前 Goal-only 版本存在有效的真实 Shell Tool 证据",
+      goalOnlyStepId: "step_goal_only",
       approvalCommand: "Write-Output JA_PLAN_GOAL_APPROVAL_WAIT",
       completionCommand: "Write-Output JA_PLAN_GOAL_EVIDENCE_OK",
+      goalOnlyCommand: "Write-Output JA_GOAL_ONLY_EVIDENCE_OK",
       recoveryObjective: "用确定性证据完成 Plan Goal 真窗验收目标的崩溃恢复",
       recoveryStepTitle: "验证副作用 Tool 崩溃恢复",
       recoveryStepDescription: "在真实 Shell STARTED 边界强杀隔离 App Server 并回读恢复状态",
@@ -2451,6 +2515,7 @@ function automaticTitleScenarios() {
       recoveryCommand:
         "Start-Sleep -Seconds 120; Write-Output JA_PLAN_GOAL_RECOVERY_SHOULD_NOT_COMPLETE",
     }),
+    interactionPlan: interactionPlanProviderScenario,
     turnChangeReview: Object.freeze({
       id: "turn_change_review",
       prompt: "本轮修改真窗生产验收",
@@ -3414,6 +3479,84 @@ function nextPlanGoalToolName(input, context) {
 }
 
 /**
+ * Goal-only evaluator 输入来自 RuntimeGoalEvaluatorAdapter 的无 Tool 用户 JSON；只核对当前
+ * Goal definition 与必要 criterion 的持久化 TOOL_RESULT 摘要，避免虚构独立输入不存在的
+ * runId/function_call，也避免把不断变化的最新 Shell call identity 当作证据唯一来源。
+ */
+export function hasGoalOnlyEvaluationEvidence(input, context) {
+  if (
+    context?.kind !== "goal" ||
+    context?.planRevisionId !== null ||
+    typeof context.goalId !== "string" ||
+    !Number.isSafeInteger(context.goalDefinitionRevision) ||
+    context.goalDefinitionRevision < 1 ||
+    typeof context.criterionId !== "string" ||
+    context.criterionId.length === 0 ||
+    !Array.isArray(input)
+  ) {
+    return false;
+  }
+
+  let evaluatorPayload;
+  for (const item of input.toReversed()) {
+    if (item?.role !== "user" || !Array.isArray(item.content)) continue;
+    for (const block of item.content.toReversed()) {
+      if (
+        (block?.type !== "input_text" && block?.type !== "text") ||
+        typeof block.text !== "string"
+      ) {
+        continue;
+      }
+      let candidate;
+      try {
+        candidate = JSON.parse(block.text);
+      } catch {
+        continue;
+      }
+      if (candidate !== null && typeof candidate === "object" && !Array.isArray(candidate)) {
+        evaluatorPayload = candidate;
+        break;
+      }
+    }
+    if (evaluatorPayload !== undefined) break;
+  }
+  if (
+    evaluatorPayload === undefined ||
+    evaluatorPayload.goalId !== context.goalId ||
+    evaluatorPayload.goalDefinitionRevision !== context.goalDefinitionRevision ||
+    Object.prototype.hasOwnProperty.call(evaluatorPayload, "plan") ||
+    !Array.isArray(evaluatorPayload.criteria) ||
+    !Array.isArray(evaluatorPayload.evidence)
+  ) {
+    return false;
+  }
+
+  const requiredCriterionIds = evaluatorPayload.criteria
+    .filter((criterion) => criterion?.required === true)
+    .map((criterion) => criterion?.criterionId);
+  if (
+    requiredCriterionIds.length === 0 ||
+    requiredCriterionIds.some(
+      (criterionId) => typeof criterionId !== "string" || criterionId.length === 0,
+    ) ||
+    !requiredCriterionIds.includes(context.criterionId)
+  ) {
+    return false;
+  }
+  return requiredCriterionIds.every((criterionId) =>
+    evaluatorPayload.evidence.some(
+      (evidence) =>
+        evidence?.criterionId === criterionId &&
+        evidence?.sourceType === "TOOL_RESULT" &&
+        typeof evidence.sourceId === "string" &&
+        evidence.sourceId.trim().length > 0 &&
+        typeof evidence.digest === "string" &&
+        /^[0-9a-f]{64}$/iu.test(evidence.digest),
+    ),
+  );
+}
+
+/**
  * 从当前请求最后一个原生 function_call 推导 continuation 的 owner。不能按 brief 的包含关系
  * 判断：父级 spawn_agent 参数天然包含 Child brief，会把 Root continuation 错门控成 Child。
  */
@@ -3481,11 +3624,12 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
   let planGoalContext;
   let planGoalEvidenceCallId;
   let planGoalSoakStartedAt;
-  let planGoalSoakInputRequested = false;
+  let planGoalSoakInteractionRequested = false;
   let planGoalContextReady = createFixtureGate();
   let planGoalPostEvaluationContextReady = createFixtureGate();
   let planGoalContextMode = "normal";
   let planGoalContinuationOffset = 0;
+  let planGoalEvaluationOffset = 0;
   const gates = new Map([
     [`${scenarios.success.id}:turn`, createFixtureGate()],
     [`${scenarios.success.id}:title`, createFixtureGate()],
@@ -3522,6 +3666,8 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
           candidate.levelOneBrief,
           candidate.levelTwoBrief,
           candidate.levelThreeBrief,
+          candidate.goalOnlyObjective,
+          ...(candidate.interactionPrompts ?? []),
         ];
         if (candidate.id === scenarios.inputQueue.id) {
           markers.push(
@@ -3544,11 +3690,21 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
       .filter(({ lastIndex }) => lastIndex >= 0)
       .sort((left, right) => right.lastIndex - left.lastIndex)[0]?.candidate;
     if (
-      scenario === undefined &&
-      planGoalAcceptanceMode &&
-      completePayload.includes(scenarios.planGoal.objective)
+      (planGoalAcceptanceMode || interactionPlanAcceptanceMode) &&
+      (scenario === undefined ||
+        /Current Plan binding:[^\n]*status=EXECUTING/u.test(completePayload)) &&
+      (completePayload.includes(scenarios.planGoal.objective) ||
+        completePayload.includes(scenarios.planGoal.recoveryObjective) ||
+        completePayload.includes(scenarios.planGoal.goalOnlyObjective))
     ) {
       scenario = scenarios.planGoal;
+    }
+    if (
+      scenario === undefined &&
+      interactionPlanAcceptanceMode &&
+      completePayload.includes(scenarios.interactionPlan.prompt)
+    ) {
+      scenario = scenarios.interactionPlan;
     }
     let consumedInput;
     if (scenario === undefined && defaultDesktopLoopbackMode) {
@@ -3590,6 +3746,14 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
       scenario.id === scenarios.turnChangeReview.id
         ? inspectTurnChangeReviewToolOutputs(payload?.input)
         : undefined;
+    const latestInteractionPromptIndex =
+      scenario.id === scenarios.interactionPlan.id
+        ? Math.max(
+            ...(scenario.interactionPrompts ?? [scenario.prompt])
+              .filter((marker) => typeof marker === "string")
+              .map((marker) => serialized.lastIndexOf(marker)),
+          )
+        : -1;
     const toolOutputSeen = recoveryScenario
       ? Array.isArray(payload.input) &&
         payload.input.some(
@@ -3603,13 +3767,19 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
             scenarios.inputQueue.id,
             scenarios.toolLifecycle.id,
             scenarios.defaultDesktop.id,
+            scenarios.interactionPlan.id,
           ].includes(scenario.id) && serialized.includes("function_call_output");
+    const interactionToolOutputSeen =
+      scenario.id === scenarios.interactionPlan.id
+        ? serialized.lastIndexOf("function_call_output") > latestInteractionPromptIndex
+        : undefined;
     return {
       scenario,
       kind,
       secondTurn,
       consumedInput,
-      toolOutputSeen,
+      toolOutputSeen:
+        scenario.id === scenarios.interactionPlan.id ? interactionToolOutputSeen : toolOutputSeen,
       turnChangeReviewProgress,
     };
   }
@@ -3685,27 +3855,31 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
   /**
    * 由真窗 RPC 快照更新下一次 continuation 的 CAS identity；Provider fixture 不自行生成
    * Goal、revision、run 或 step ID，因而旧快照只会触发服务端冲突而不会误写别的 Goal。
+   * Goal-only 运行没有 Plan 时保留明确的 null planRevisionId，而不是伪造计划身份。
    */
   function setPlanGoalContext(context) {
     const commonIdentity =
       context !== null &&
       typeof context === "object" &&
       typeof context.runId === "string" &&
-      typeof context.planRevisionId === "string" &&
       typeof context.stepId === "string" &&
       typeof context.criterionId === "string";
     const planIdentity =
       context?.kind === "plan" &&
       typeof context.planId === "string" &&
-      Number.isSafeInteger(context.planRevision);
+      Number.isSafeInteger(context.planRevision) &&
+      typeof context.planRevisionId === "string";
     const goalIdentity =
-      context?.kind !== "plan" &&
+      context?.kind === "goal" &&
       typeof context?.goalId === "string" &&
-      Number.isSafeInteger(context?.goalRevision);
+      Number.isSafeInteger(context?.goalRevision) &&
+      (context?.planRevisionId == null || typeof context.planRevisionId === "string");
     if (!commonIdentity || (!planIdentity && !goalIdentity)) {
       throw new Error("Plan/Goal fixture context 无效");
     }
-    planGoalContext = { ...context };
+    const priorStepStatus =
+      planGoalContext?.runId === context.runId ? planGoalContext.stepStatus : undefined;
+    planGoalContext = { ...context, stepStatus: context.stepStatus ?? priorStepStatus };
     planGoalContextReady.release();
     planGoalPostEvaluationContextReady.release();
   }
@@ -3715,18 +3889,24 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
    * 数量，使恢复场景从 ordinal 1 开始，而不是继承首个已完成 Goal 的 Provider 轮次。
    */
   function resetPlanGoalContext(mode) {
-    if (!new Set(["normal", "standalone", "recovery"]).has(mode)) {
+    if (!new Set(["normal", "standalone", "recovery", "goal-only"]).has(mode)) {
       throw new Error(`Plan/Goal fixture mode 无效：${String(mode)}`);
     }
     planGoalContext = undefined;
     planGoalEvidenceCallId = undefined;
-    planGoalSoakInputRequested = false;
+    planGoalSoakInteractionRequested = false;
     planGoalContextMode = mode;
     planGoalContinuationOffset = attempts.filter(
       (attempt) =>
         attempt.scenarioId === scenarios.planGoal.id &&
         attempt.kind === "turn" &&
         attempt.planGoalEvaluationRequest !== true,
+    ).length;
+    planGoalEvaluationOffset = attempts.filter(
+      (attempt) =>
+        attempt.scenarioId === scenarios.planGoal.id &&
+        attempt.kind === "turn" &&
+        attempt.planGoalEvaluationRequest === true,
     ).length;
     planGoalContextReady = createFixtureGate();
     planGoalPostEvaluationContextReady = createFixtureGate();
@@ -3990,12 +4170,16 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
           1 -
           planGoalContinuationOffset
         : undefined;
-    const completedPlanGoalEvaluations = attempts.filter(
+    const totalCompletedPlanGoalEvaluations = attempts.filter(
       (candidate) =>
         candidate.scenarioId === scenarios.planGoal.id &&
         candidate.planGoalEvaluationRequest === true &&
         candidate.responded === true,
     ).length;
+    const completedPlanGoalEvaluations =
+      planGoalContextMode === "goal-only"
+        ? Math.max(0, totalCompletedPlanGoalEvaluations - planGoalEvaluationOffset)
+        : totalCompletedPlanGoalEvaluations;
     const planGoalSoakComplete =
       configuredPlanGoalSoakMinutes === 0 ||
       (planGoalSoakStartedAt !== undefined &&
@@ -4305,18 +4489,63 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
       planGoalContextMode === "normal" &&
       completedPlanGoalEvaluations > 0 &&
       !planGoalSoakComplete &&
-      !planGoalSoakInputRequested
+      !planGoalSoakInteractionRequested
     ) {
       // 首轮 evaluator 完成后 Goal revision 已推进；等待 runner 回读权威投影，禁止用旧 CAS
-      // identity 构造 soak 输入请求并把测试竞态误报成 continuation 无进展。
+      // identity 构造 Interaction 请求并把测试竞态误报成 continuation 无进展。
       await planGoalPostEvaluationContextReady.promise;
       if (attempt.disconnected || response.destroyed) return;
     }
     const trailingPlanGoalTool = trailingPlanGoalToolCall(payload?.input);
+    const currentGoalBindingRevision =
+      scenario.id === scenarios.planGoal.id &&
+      !planGoalEvaluationRequest &&
+      planGoalContext?.kind === "goal"
+        ? readGoalToolBindingRevision({
+            instructions: payload.instructions,
+            expectedGoalId: planGoalContext.goalId,
+            evaluationRequest: planGoalEvaluationRequest,
+          })
+        : undefined;
     const planGoalAggregateRevision =
-      planGoalContext?.kind === "plan"
-        ? planGoalContext.planRevision
-        : planGoalContext?.goalRevision;
+      scenario.id === scenarios.planGoal.id
+        ? planGoalContext?.kind === "plan"
+          ? Number(
+              /Current Plan binding:[^\n]*?expectedPlanRevision=(\d+)/u.exec(
+                serializedPayload,
+              )?.[1] ?? planGoalContext.planRevision,
+            )
+          : currentGoalBindingRevision
+        : undefined;
+    if (
+      scenario.id === scenarios.planGoal.id &&
+      planGoalContext?.kind === "goal" &&
+      !planGoalEvaluationRequest &&
+      !Number.isSafeInteger(planGoalAggregateRevision) &&
+      !attempt.disconnected &&
+      !response.destroyed
+    ) {
+      throw new Error("Plan/Goal fixture 缺少当前 Goal authority binding");
+    }
+    // 当前请求的系统绑定提供精确 CAS；步骤状态从已成功的结构化结果恢复，失败调用不推进 fixture 状态。
+    let standaloneStepStatus = planGoalContext?.stepStatus ?? "ready";
+    if (planGoalContext?.kind === "plan" && Array.isArray(payload?.input)) {
+      for (const item of payload.input) {
+        if (item?.type !== "function_call_output" || item.status === "incomplete") continue;
+        const call = payload.input.find(
+          (candidate) => candidate?.type === "function_call" && candidate.call_id === item.call_id,
+        );
+        if (call?.name !== "plan_step_update") continue;
+        try {
+          const args = JSON.parse(call.arguments);
+          if (args.planId === planGoalContext.planId && args.runId === planGoalContext.runId)
+            standaloneStepStatus = args.status;
+        } catch {
+          /* 普通错误文本是失败结果，不代表步骤状态变化。 */
+        }
+      }
+    }
+    if (planGoalContext?.kind === "plan") planGoalContext.stepStatus = standaloneStepStatus;
     const planGoalToolName =
       scenario.id === scenarios.planGoal.id &&
       !planGoalEvaluationRequest &&
@@ -4324,18 +4553,22 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
         ? planGoalContextMode === "recovery"
           ? "shell"
           : planGoalContextMode === "standalone"
-            ? nextPlanGoalToolName(payload?.input, planGoalContext)
-            : trailingPlanGoalTool?.name === "goal_request_evaluation"
-              ? undefined
-              : completedPlanGoalEvaluations > 0 &&
-                  !planGoalSoakComplete &&
-                  !planGoalSoakInputRequested
-                ? "goal_request_input"
-                : completedPlanGoalEvaluations > 0 && !planGoalSoakComplete
-                  ? undefined
-                  : completedPlanGoalEvaluations > 0
-                    ? "goal_request_evaluation"
-                    : nextPlanGoalToolName(payload?.input, planGoalContext)
+            ? planGoalContinuationAttempt === 1
+              ? "shell"
+              : nextPlanGoalToolName(payload?.input, planGoalContext)
+            : planGoalContextMode === "goal-only"
+              ? nextPlanGoalToolName(payload?.input, planGoalContext)
+              : trailingPlanGoalTool?.name === "goal_request_evaluation"
+                ? undefined
+                : completedPlanGoalEvaluations > 0 &&
+                    !planGoalSoakComplete &&
+                    !planGoalSoakInteractionRequested
+                  ? "request_user_input"
+                  : completedPlanGoalEvaluations > 0 && !planGoalSoakComplete
+                    ? undefined
+                    : completedPlanGoalEvaluations > 0
+                      ? "goal_request_evaluation"
+                      : nextPlanGoalToolName(payload?.input, planGoalContext)
         : undefined;
     const planGoalTool =
       planGoalToolName === undefined
@@ -4347,7 +4580,9 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
                 command:
                   planGoalContextMode === "recovery"
                     ? scenarios.planGoal.recoveryCommand
-                    : scenarios.planGoal.approvalCommand,
+                    : planGoalContextMode === "goal-only"
+                      ? scenarios.planGoal.goalOnlyCommand
+                      : scenarios.planGoal.approvalCommand,
               },
             }
           : planGoalToolName === "plan_step_update"
@@ -4358,9 +4593,7 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
                   ...(planGoalContext.kind === "plan"
                     ? {
                         planId: planGoalContext.planId,
-                        expectedPlanRevision:
-                          planGoalContext.planRevision +
-                          (trailingPlanGoalTool?.name === "plan_step_update" ? 1 : 0),
+                        expectedPlanRevision: planGoalAggregateRevision,
                       }
                     : {
                         goalId: planGoalContext.goalId,
@@ -4370,47 +4603,72 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
                       }),
                   runId: planGoalContext.runId,
                   stepId: planGoalContext.stepId,
-                  expectedStatus: trailingPlanGoalTool?.name === "shell" ? "ready" : "running",
-                  status: trailingPlanGoalTool?.name === "shell" ? "running" : "succeeded",
+                  expectedStatus:
+                    planGoalContext.kind === "plan"
+                      ? standaloneStepStatus
+                      : trailingPlanGoalTool?.name === "shell"
+                        ? "ready"
+                        : "running",
+                  status:
+                    planGoalContext.kind === "plan"
+                      ? standaloneStepStatus === "ready"
+                        ? "running"
+                        : "succeeded"
+                      : trailingPlanGoalTool?.name === "shell"
+                        ? "running"
+                        : "succeeded",
                   failureSignature: null,
-                  evidenceClaims:
-                    trailingPlanGoalTool?.name === "shell"
-                      ? []
-                      : [
-                          {
-                            criterionId: planGoalContext.criterionId,
-                            callId: planGoalEvidenceCallId,
-                            summary: "确定性 shell Tool 已由当前 Run 成功执行",
-                          },
-                        ],
+                  evidenceClaims: (
+                    planGoalContext.kind === "plan"
+                      ? standaloneStepStatus === "ready"
+                      : trailingPlanGoalTool?.name === "shell"
+                  )
+                    ? []
+                    : [
+                        {
+                          criterionId: planGoalContext.criterionId,
+                          callId: planGoalEvidenceCallId,
+                          summary: "确定性 shell Tool 已由当前 Run 成功执行",
+                        },
+                      ],
                   idempotencyKey: `plan-goal-step-${planGoalAggregateRevision}-${planGoalContinuationAttempt}`,
                 },
               }
-            : planGoalToolName === "goal_request_input"
+            : planGoalToolName === "request_user_input"
               ? {
-                  name: "goal_request_input",
+                  name: "request_user_input",
                   arguments: {
-                    goalId: planGoalContext.goalId,
-                    expectedGoalRevision: planGoalContext.goalRevision,
-                    runId: planGoalContext.runId,
-                    prompt: "长稳窗口结束后，请确认继续独立验收。",
-                    expiresAt: new Date(Date.now() + 4 * 60 * 60_000).toISOString(),
-                    idempotencyKey: `plan-goal-soak-input-${planGoalContext.goalRevision}`,
+                    questions: [
+                      {
+                        questionId: "question_goal_soak_continue",
+                        prompt: "长稳窗口结束后，请确认继续独立验收。",
+                        type: "single",
+                        required: true,
+                        allowFreeText: false,
+                        options: [
+                          {
+                            optionId: "option_continue_current_revision",
+                            label: "继续执行当前 revision",
+                            description: "沿用已经冻结的 Goal/Plan 运行身份继续验收。",
+                            recommended: true,
+                          },
+                        ],
+                      },
+                    ],
                   },
                 }
               : {
                   name: "goal_request_evaluation",
                   arguments: {
                     goalId: planGoalContext.goalId,
-                    // 首次显式关联 Plan 的 Goal 要计入两次 step update；首轮 evaluator 之后，
-                    // runner 每次都回写权威 Goal revision，输入响应已包含自身 CAS 增量，禁止再次 +1。
+                    // Goal-only 每次请求都从当前系统绑定读取 CAS；首轮 evaluator 会在同一
+                    // 调用链内推进 revision，继续使用 resume 时的旧快照会触发无进展保护。
+                    // 显式关联 Plan 的旧场景仍保留其 attach 初始 revision 规则。
                     expectedGoalRevision:
-                      planGoalContext.goalRevision +
-                      (completedPlanGoalEvaluations === 0
-                        ? planGoalContext.planRevisionId == null
-                          ? 0
-                          : 2
-                        : 0),
+                      planGoalContext.planRevisionId == null
+                        ? planGoalAggregateRevision
+                        : planGoalContext.goalRevision +
+                          (completedPlanGoalEvaluations === 0 ? 2 : 0),
                     runId: planGoalContext.runId,
                     planRevisionId: planGoalContext.planRevisionId,
                     evidenceClaims:
@@ -4423,11 +4681,15 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
                             },
                           ]
                         : [],
-                    idempotencyKey: `plan-goal-evaluate-${planGoalContext.goalRevision}-${completedPlanGoalEvaluations}`,
+                    idempotencyKey: `plan-goal-evaluate-${
+                      planGoalContext.planRevisionId == null
+                        ? planGoalAggregateRevision
+                        : planGoalContext.goalRevision
+                    }-${completedPlanGoalEvaluations}`,
                   },
                 };
-    if (planGoalTool?.name === "goal_request_input") {
-      planGoalSoakInputRequested = true;
+    if (planGoalTool?.name === "request_user_input") {
+      planGoalSoakInteractionRequested = true;
     }
     if (planGoalTool?.name === "shell") {
       // planGoalToolStream 使用当前 attempts 长度生成 call_id；保存该真实身份供下一轮证据 claim，
@@ -4447,13 +4709,46 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
       planGoalSoakStartedAt ??= Date.now();
       planGoalPostEvaluationContextReady = createFixtureGate();
     }
-    const planGoalMet = completedPlanGoalEvaluations > 0 && planGoalSoakComplete;
     const evaluatorCriteria = planGoalEvaluationRequest
       ? planGoalEvaluatorCriteria(payload?.input)
       : undefined;
+    const goalOnlyEvaluationEvidence = hasGoalOnlyEvaluationEvidence(
+      payload?.input,
+      planGoalContext,
+    );
+    const planGoalMet =
+      planGoalContextMode === "goal-only"
+        ? goalOnlyEvaluationEvidence
+        : completedPlanGoalEvaluations > 0 && planGoalSoakComplete;
+    const interactionPromptIndex =
+      scenario.id === scenarios.interactionPlan.id
+        ? Math.max(
+            ...(scenario.interactionPrompts ?? [scenario.prompt])
+              .filter((marker) => typeof marker === "string")
+              .map((marker) => serializedInput.lastIndexOf(marker)),
+          )
+        : -1;
+    const interactionPromptOrdinal =
+      scenario.id === scenarios.interactionPlan.id
+        ? (scenario.interactionPrompts ?? [scenario.prompt]).findIndex(
+            (marker) => serializedInput.lastIndexOf(marker) === interactionPromptIndex,
+          )
+        : -1;
+    const interactionReadonlyCall =
+      scenario.id === scenarios.interactionPlan.id &&
+      interactionPromptOrdinal > 0 &&
+      interactionPromptOrdinal <= (scenario.readonlyToolCalls?.length ?? 0) &&
+      !toolOutputSeen
+        ? scenario.readonlyToolCalls[interactionPromptOrdinal - 1]
+        : undefined;
+    const interactionPlanToolCall =
+      scenario.id === scenarios.interactionPlan.id && !toolOutputSeen && !toolFinalizationEnvelope
+        ? (interactionReadonlyCall ?? { name: "request_user_input" })
+        : undefined;
     const hasStructuredToolStream =
       turnChangeReviewTool !== undefined ||
       planGoalTool !== undefined ||
+      interactionPlanToolCall !== undefined ||
       taskThreadsTool !== undefined ||
       defaultDesktopApprovalToolCall ||
       inputQueueToolCall ||
@@ -4461,6 +4756,12 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
       shellFailureCall ||
       readFailureCall ||
       sidebarApprovalToolCall;
+    if (scenario.id === scenarios.interactionPlan.id && interactionPlanToolCall !== undefined) {
+      attempt.requestedToolName = interactionPlanToolCall.name;
+    }
+    if (scenario.id === scenarios.planGoal.id && planGoalTool !== undefined) {
+      attempt.requestedToolName = planGoalTool.name;
+    }
     const text =
       kind === "title"
         ? (scenario.automaticTitle ?? "Ja E2E")
@@ -4525,32 +4826,42 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
             turnChangeReviewTool.arguments,
             turnChangeReviewTool.step,
           )
-        : planGoalTool !== undefined
-          ? planGoalToolStream(planGoalTool.name, planGoalTool.arguments, attempts.length)
-          : taskThreadsTool !== undefined
-            ? taskThreadsToolStream(
-                taskThreadsTool.name,
-                taskThreadsTool.arguments,
+        : interactionPlanToolCall?.name === "request_user_input"
+          ? interactionPlanToolStream(attempts.length)
+          : interactionPlanToolCall !== undefined
+            ? interactionPlanReadonlyToolStream(
+                interactionPlanToolCall.name,
+                interactionPlanToolCall.arguments,
                 attempts.length,
               )
-            : defaultDesktopApprovalToolCall
-              ? defaultDesktopApprovalToolStream(attempts.length)
-              : inputQueueToolCall
-                ? inputQueueToolStream(attempts.length, workspacePath)
-                : toolLifecycleCall
-                  ? toolLifecycleStream(attempts.length)
-                  : shellFailureCall || readFailureCall
-                    ? toolFailureStream(
-                        scenario,
-                        scenarioTurnAttempt,
-                        attempts.length,
-                        workspacePath,
-                      )
-                    : ordinaryDsmlTextReply
-                      ? ordinaryDsmlTextStream(text, attempts.length)
-                      : sidebarApprovalToolCall
-                        ? sidebarApprovalToolStream(attempts.length)
-                        : titleFixtureTextStream(text, attempts.length);
+            : planGoalTool !== undefined
+              ? planGoalToolStream(planGoalTool.name, planGoalTool.arguments, attempts.length)
+              : taskThreadsTool !== undefined
+                ? taskThreadsToolStream(
+                    taskThreadsTool.name,
+                    taskThreadsTool.arguments,
+                    attempts.length,
+                  )
+                : defaultDesktopApprovalToolCall
+                  ? defaultDesktopApprovalToolStream(attempts.length)
+                  : inputQueueToolCall
+                    ? inputQueueToolStream(attempts.length, workspacePath)
+                    : toolLifecycleCall
+                      ? toolLifecycleStream(attempts.length)
+                      : shellFailureCall || readFailureCall
+                        ? toolFailureStream(
+                            scenario,
+                            scenarioTurnAttempt,
+                            attempts.length,
+                            workspacePath,
+                          )
+                        : ordinaryDsmlTextReply
+                          ? ordinaryDsmlTextStream(text, attempts.length)
+                          : sidebarApprovalToolCall
+                            ? sidebarApprovalToolStream(attempts.length)
+                            : scenario.id === scenarios.interactionPlan.id
+                              ? interactionPlanTextStream(attempts.length)
+                              : titleFixtureTextStream(text, attempts.length);
     if (
       scenario.id === scenarios.turnChangeReview.id &&
       Math.max(...turnChangeReviewSseEventBytes(encodedStream)) >= 2 * 1024 * 1024
@@ -4724,15 +5035,17 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
   let focusedNativeResources;
   const focusedNativeExecutable = planGoalAcceptanceMode
     ? planGoalSidecarExecutable
-    : turnChangeReviewAcceptanceMode
-      ? turnChangeReviewSidecarExecutable
-      : configuredNativeSidecarDirectory === undefined
-        ? undefined
-        : join(
-            configuredNativeSidecarDirectory,
-            "sidecars",
-            "ja-app-server-x86_64-pc-windows-msvc.exe",
-          );
+    : interactionPlanAcceptanceMode
+      ? interactionPlanSidecarExecutable
+      : turnChangeReviewAcceptanceMode
+        ? turnChangeReviewSidecarExecutable
+        : configuredNativeSidecarDirectory === undefined
+          ? undefined
+          : join(
+              configuredNativeSidecarDirectory,
+              "sidecars",
+              "ja-app-server-x86_64-pc-windows-msvc.exe",
+            );
   if (focusedNativeExecutable !== undefined) {
     if (!isAbsolute(focusedNativeExecutable)) {
       throw new Error("focused Native 验收缺少绝对 sidecar executable 路径");
@@ -4800,6 +5113,8 @@ function buildSettingsDocument(
     'default_provider_id = "provider_e2e"',
     'default_model_id = "model_e2e"',
     "default_reasoning_level = { __ja_null = true }",
+    "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
+    "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
     ...(includeComposerContextSkill
       ? [
@@ -5966,6 +6281,7 @@ function buildTauriEnv(
   }
   if (
     planGoalAcceptanceMode ||
+    interactionPlanAcceptanceMode ||
     turnChangeReviewAcceptanceMode ||
     configuredNativeSidecarDirectory !== undefined
   ) {
@@ -6414,6 +6730,62 @@ function goalToolAttemptFact(directories, goalId) {
       throw new Error(`Goal Tool attempt 数量异常：${rows.length}`);
     }
     return rows[0];
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * 从隔离 SQLite 只读账本读取 Plan Run 的累计预算、Turn claim 与 Tool attempt。
+ * 这些字段由 Java 事务维护，focused runner 只能观察，不能用本地状态拼接执行证据。
+ */
+function planExecutionLedgerFact(directories, planId, runId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    database.exec("PRAGMA busy_timeout = 5000");
+    const run = database
+      .prepare(
+        "SELECT run_id, plan_id, status, turns_used, turn_budget, max_model_rounds, " +
+          "max_tool_calls, wall_budget_millis, used_model_rounds, used_tool_calls, " +
+          "used_active_millis, process_generation FROM execution_runs WHERE plan_id = ? AND run_id = ?",
+      )
+      .get(planId, runId);
+    if (run === undefined) return undefined;
+    const claims = database
+      .prepare(
+        "SELECT run_id, turn_id, ordinal, state FROM plan_turn_claims " +
+          "WHERE run_id = ? ORDER BY ordinal",
+      )
+      .all(runId);
+    const toolAttempts = database
+      .prepare(
+        "SELECT tool_attempt_id, turn_id, call_id, side_effect, state, started_at, completed_at " +
+          "FROM goal_tool_attempts WHERE plan_id = ? AND run_id = ? ORDER BY prepared_at, tool_attempt_id",
+      )
+      .all(planId, runId);
+    return {
+      run,
+      claims,
+      toolAttempts,
+      successfulToolAttempts: toolAttempts.filter((value) => value.state === "SUCCEEDED"),
+      unknownSideEffectAttempts: toolAttempts.filter(
+        (value) => Number(value.side_effect) === 1 && value.state === "UNKNOWN",
+      ),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+/** 只读统计 owner Thread 的 Goal 行，验证独立 Plan 执行没有隐式创建 Goal 聚合。 */
+function ownerGoalCount(directories, threadId) {
+  const database = new DatabaseSync(join(directories.data, "ja.db"), { readOnly: true });
+  try {
+    return Number(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM goals WHERE owner_thread_id = ?")
+        .get(threadId)?.count ?? -1,
+    );
   } finally {
     database.close();
   }
@@ -7255,10 +7627,17 @@ function installTauriInvokeProbeInPage() {
     globalThis.__JA_E2E_WORKSPACE_WATCH_LIFECYCLE__ = {};
   if (!Number.isSafeInteger(globalThis.__JA_E2E_TERMINAL_INPUT_COUNT__))
     globalThis.__JA_E2E_TERMINAL_INPUT_COUNT__ = 0;
+  if (!Array.isArray(globalThis.__JA_E2E_INTERACTION_RESPONSES__))
+    globalThis.__JA_E2E_INTERACTION_RESPONSES__ = [];
+  if (!Array.isArray(globalThis.__JA_E2E_PLAN_EXECUTES__)) globalThis.__JA_E2E_PLAN_EXECUTES__ = [];
   if (typeof globalThis.__JA_E2E_SUPPRESS_LOOPBACK_OPENER__ !== "boolean")
     globalThis.__JA_E2E_SUPPRESS_LOOPBACK_OPENER__ = false;
   if (typeof globalThis.__JA_E2E_FAIL_NEXT_TERMINAL_CLOSE_ALL__ !== "boolean")
     globalThis.__JA_E2E_FAIL_NEXT_TERMINAL_CLOSE_ALL__ = false;
+  if (typeof globalThis.__JA_E2E_LAST_THREAD_OWNER__ !== "string")
+    globalThis.__JA_E2E_LAST_THREAD_OWNER__ = undefined;
+  if (typeof globalThis.__JA_E2E_EXPLICIT_AUTHORITY_READ__ !== "boolean")
+    globalThis.__JA_E2E_EXPLICIT_AUTHORITY_READ__ = false;
   globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = async ({ command, args }, delegate) => {
     const calls = Array.isArray(globalThis.__JA_E2E_TAURI_INVOKES__)
       ? globalThis.__JA_E2E_TAURI_INVOKES__
@@ -7290,7 +7669,7 @@ function installTauriInvokeProbeInPage() {
           ? globalThis.__JA_E2E_TAURI_INVOKE_PHASE_TRACES__
           : {};
       const commandTrace = Array.isArray(traces[entry.command]) ? traces[entry.command] : [];
-      if (commandTrace.length < 64) commandTrace.push(entry);
+      if (commandTrace.length < 512) commandTrace.push(entry);
       traces[entry.command] = commandTrace;
       globalThis.__JA_E2E_TAURI_INVOKE_PHASE_TRACES__ = traces;
       if (calls.length < 512) calls.push(entry);
@@ -7298,6 +7677,83 @@ function installTauriInvokeProbeInPage() {
     };
     const url =
       command === "plugin:opener|open_url" && typeof args?.url === "string" ? args.url : undefined;
+    if (
+      command === "ja_runtime_plan_execute" &&
+      args?.input &&
+      globalThis.__JA_E2E_PLAN_EXECUTES__.length < 16
+    ) {
+      const input = args.input;
+      globalThis.__JA_E2E_PLAN_EXECUTES__.push({
+        threadId: input.threadId,
+        planId: input.planId,
+        expectedPlanRevision: input.expectedPlanRevision,
+        planRevisionId: input.planRevisionId,
+        planHash: input.planHash,
+        idempotencyKey: input.idempotencyKey,
+      });
+    }
+    if (
+      command === "ja_runtime_interaction_respond" &&
+      args?.input !== null &&
+      typeof args.input === "object"
+    ) {
+      const input = args.input;
+      const responses = globalThis.__JA_E2E_INTERACTION_RESPONSES__;
+      if (Array.isArray(responses) && responses.length < 64) {
+        responses.push({
+          threadId: typeof input.threadId === "string" ? input.threadId : undefined,
+          requestId: typeof input.requestId === "string" ? input.requestId : undefined,
+          expectedRevision: Number.isSafeInteger(input.expectedRevision)
+            ? input.expectedRevision
+            : undefined,
+          idempotencyKey:
+            typeof input.idempotencyKey === "string" ? input.idempotencyKey : undefined,
+          answers: Array.isArray(input.answers) ? input.answers : undefined,
+        });
+      }
+    }
+    const explicitThreadOwner =
+      typeof args?.input?.threadId === "string"
+        ? args.input.threadId
+        : typeof args?.input?.owner?.threadId === "string"
+          ? args.input.owner.threadId
+          : undefined;
+    if (explicitThreadOwner !== undefined)
+      globalThis.__JA_E2E_LAST_THREAD_OWNER__ = explicitThreadOwner;
+    // 隔离验收只保留能把调用归属到 Thread/Plan/Workspace 的稳定 ID；正文、分页游标、
+    // objective 和幂等键仍不进入 probe。Review snapshot 没有 Thread 参数时，使用最近一次
+    // 显式 owner 作为可审计的推导来源，而不是把无身份的全局计数误判为隐藏 Thread 读取。
+    const ownerIdentityObserved = [
+      "ja_runtime_plan_read",
+      "ja_runtime_plan_observe",
+      "ja_runtime_plan_revisions_list",
+      "ja_runtime_plan_evidence_list",
+      "ja_thread_read",
+      "ja_review_snapshot",
+    ].includes(command);
+    const ownerIdentity = ownerIdentityObserved
+      ? {
+          threadId:
+            explicitThreadOwner ??
+            (command === "ja_review_snapshot"
+              ? globalThis.__JA_E2E_LAST_THREAD_OWNER__
+              : undefined),
+          planId: typeof args?.input?.planId === "string" ? args.input.planId : undefined,
+          workspaceId:
+            typeof args?.input?.workspaceId === "string" ? args.input.workspaceId : undefined,
+          ownerSource:
+            explicitThreadOwner !== undefined
+              ? "input"
+              : command === "ja_review_snapshot" &&
+                  typeof globalThis.__JA_E2E_LAST_THREAD_OWNER__ === "string"
+                ? "last_thread_invoke"
+                : undefined,
+          explicitAuthorityRead:
+            command === "ja_thread_read" && globalThis.__JA_E2E_EXPLICIT_AUTHORITY_READ__ === true
+              ? true
+              : undefined,
+        }
+      : {};
     const suppress =
       command === "plugin:opener|open_url" &&
       globalThis.__JA_E2E_SUPPRESS_LOOPBACK_OPENER__ === true &&
@@ -7421,12 +7877,10 @@ function installTauriInvokeProbeInPage() {
       "ja_runtime_goal_pause",
       "ja_runtime_goal_resume",
       "ja_runtime_goal_stop",
-      "ja_runtime_goal_input_respond",
       "ja_runtime_plan_create",
       "ja_runtime_plan_draft_save",
       "ja_runtime_plan_draft_discard",
       "ja_runtime_plan_propose",
-      "ja_runtime_plan_approve",
       "ja_runtime_plan_execute",
       "ja_runtime_plan_reject",
     ].includes(command);
@@ -7495,7 +7949,7 @@ function installTauriInvokeProbeInPage() {
       goalLifecycleObserved ||
       runtimeStartLifecycleObserved
     ) {
-      append({ command, phase: "start" });
+      append({ command, phase: "start", ...ownerIdentity });
     } else if (observed) {
       append({
         command,
@@ -7605,7 +8059,7 @@ function installTauriInvokeProbeInPage() {
         goalLifecycleObserved ||
         runtimeStartLifecycleObserved
       ) {
-        append({ command, phase: "resolved" });
+        append({ command, phase: "resolved", ...ownerIdentity });
         if (turnChangeReviewCommandObserved)
           globalThis.__JA_E2E_TURN_CHANGE_READ_LIFECYCLE__.active -= 1;
       } else if (attachmentLifecycleObserved) {
@@ -7660,6 +8114,7 @@ function installTauriInvokeProbeInPage() {
         append({
           command,
           phase: "rejected",
+          ...ownerIdentity,
           previewVisible,
           errorCode: stableErrorCode,
           ...previewMetadata,
@@ -7696,6 +8151,8 @@ async function removeTauriInvokeProbe(page) {
       globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = undefined;
       globalThis.__JA_E2E_SUPPRESS_LOOPBACK_OPENER__ = false;
       globalThis.__JA_E2E_FAIL_NEXT_TERMINAL_CLOSE_ALL__ = false;
+      globalThis.__JA_E2E_LAST_THREAD_OWNER__ = undefined;
+      globalThis.__JA_E2E_EXPLICIT_AUTHORITY_READ__ = false;
     })
     .catch(() => undefined);
 }
@@ -7734,6 +8191,11 @@ async function tauriInvokeTrace(page, command) {
     return calls.map((call, index) => ({
       index,
       phase: typeof call.phase === "string" ? call.phase : "start",
+      threadId: typeof call.threadId === "string" ? call.threadId : undefined,
+      planId: typeof call.planId === "string" ? call.planId : undefined,
+      workspaceId: typeof call.workspaceId === "string" ? call.workspaceId : undefined,
+      ownerSource: typeof call.ownerSource === "string" ? call.ownerSource : undefined,
+      explicitAuthorityRead: call.explicitAuthorityRead === true,
       sessionId: typeof call.sessionId === "string" ? call.sessionId : undefined,
       generation: Number.isSafeInteger(call.generation) ? call.generation : undefined,
       dataLength: Number.isSafeInteger(call.dataLength) ? call.dataLength : undefined,
@@ -8258,6 +8720,7 @@ async function captureAuthoritativeThreadSnapshot(page, expectedThreadId) {
             fields: Object.keys(item ?? {}).sort(),
             turnId: typeof item?.turnId === "string" ? item.turnId : null,
             kind: item?.kind,
+            toolName: typeof item?.toolName === "string" ? item.toolName : null,
             hasTurnOwner: turns.some((turn) => turn?.turnId === item?.turnId),
             owningTurnStatus: turns.find((turn) => turn?.turnId === item?.turnId)?.status,
             textNonEmpty: typeof item?.text === "string" && item.text.trim().length > 0,
@@ -14270,11 +14733,12 @@ async function fileTextEquals(path, expected) {
   }
 }
 
-/** 等待 Node 侧条件成立，不引入未经验证的固定 sleep。 */
+/** 返回首次满足条件的真实观测值，避免等待完成后再次读取得到另一版竞态状态。 */
 async function waitForCondition(label, predicate, deadline, signal) {
   while (Date.now() < deadline) {
     throwIfAborted(signal);
-    if (await predicate()) return;
+    const observed = await predicate();
+    if (observed) return observed;
     await waitForDelay(100, signal);
   }
   throw new Error(`${label} 超时`);
@@ -17876,6 +18340,46 @@ async function readPlanGoalThreadAuthority(page, threadId) {
 }
 
 /**
+ * App Server 重启时 Plan 恢复与 Turn 终态分属不同事务，Plan 先变为 stopped 不代表原 Turn
+ * 已经可取消。这里等待权威 Turn 明确进入 suspended，再按 identity 取消并等 UI admission
+ * 恢复，避免一次快照碰巧读到恢复中间态后把后续隔离场景永久卡住。
+ */
+async function cancelRecoveredSuspendedTurns(page, threadId, deadline, signal) {
+  const recoveryDeadline = Math.min(deadline, Date.now() + 45_000);
+  const recovered = await waitForCondition(
+    "recovered Turn settlement",
+    async () => {
+      const authority = await readPlanGoalThreadAuthority(page, threadId);
+      const suspended = authority.turns.filter((candidate) => candidate.status === "suspended");
+      if (suspended.length > 0) return { authority, suspended };
+      const composerState = await page
+        .locator('form[aria-label="发送消息"]')
+        .getAttribute("data-state")
+        .catch(() => null);
+      return composerState === "ready" ? { authority, suspended } : false;
+    },
+    recoveryDeadline,
+    signal,
+  );
+  for (const turn of recovered.suspended) {
+    const cancel = page.getByRole("button", { name: "取消运行", exact: true });
+    await cancel.waitFor({ state: "visible", timeout: Math.max(1, recoveryDeadline - Date.now()) });
+    await cancel.click({ timeout: Math.max(1, recoveryDeadline - Date.now()) });
+    await waitForCondition(
+      `recovered Turn cancellation ${turn.turnId}`,
+      async () =>
+        (await readPlanGoalThreadAuthority(page, threadId)).turns.some(
+          (candidate) => candidate.turnId === turn.turnId && candidate.status === "cancelled",
+        ),
+      recoveryDeadline,
+      signal,
+    );
+  }
+  await waitForComposerAdmission(page, recoveryDeadline);
+  return recovered.suspended.length;
+}
+
+/**
  * Plan/Goal 扩展 Tool 与 Shell 共享 ApprovalMiddleware；验收必须按权威关联身份逐个批准，
  * 不能把 Tool 之间短暂出现的 working phase 当成下一阶段已经提交。DOM 只承担用户点击，
  * 待审批事实与批准终态分别由 Thread JA-RPC 快照确认。
@@ -17944,12 +18448,81 @@ async function approvePendingPlanGoalTool(page, { goalId, threadId, toolName }, 
 }
 
 /**
+ * 仅按 owner Thread 的真实 approval/tool 投影批准独立 Plan Tool；不借用 Goal identity，
+ * 以证明 Plan 与 Goal 的审批和执行状态机仍然独立。
+ */
+async function approvePendingStandalonePlanTool(page, { threadId, toolName }, deadline, signal) {
+  let requested;
+  await waitForCondition(
+    `Plan ${toolName} 权威审批出现`,
+    async () => {
+      const authority = await readPlanGoalThreadAuthority(page, threadId);
+      const pending = authority.approvals.findLast(
+        (approval) => approval.toolName === toolName && approval.decision === null,
+      );
+      if (pending === undefined) return false;
+      const turn = authority.turns.find((candidate) => candidate.turnId === pending.turnId);
+      const tool = authority.toolCalls.find(
+        (candidate) =>
+          candidate.turnId === pending.turnId &&
+          candidate.callId === pending.callId &&
+          candidate.toolName === toolName &&
+          candidate.presentationStatus === "waiting_approval",
+      );
+      if (turn?.status !== "waiting_approval" || tool === undefined) return false;
+      requested = pending;
+      return true;
+    },
+    deadline,
+    signal,
+  );
+  const turnRow = page.locator(`.ja-chat-timeline__row[data-turn-id="${requested.turnId}"]`);
+  const approvalCard = turnRow
+    .getByText(requested.callId, { exact: true })
+    .locator("xpath=ancestor::section[1]");
+  await clickVerifiedControl(
+    page,
+    approvalCard.getByRole("button", { name: "批准", exact: true }),
+    deadline,
+  );
+  await waitForCondition(
+    `Plan ${toolName} 批准持久化`,
+    async () => {
+      const authority = await readPlanGoalThreadAuthority(page, threadId);
+      return authority.approvals.some(
+        (approval) =>
+          approval.approvalId === requested.approvalId &&
+          approval.turnId === requested.turnId &&
+          approval.callId === requested.callId &&
+          approval.toolName === toolName &&
+          approval.decision === "approve",
+      );
+    },
+    deadline,
+    signal,
+  );
+  return requested;
+}
+
+/**
  * App Server 被故障注入终止后，通过真实桌面的“重新启动”恢复同一 Rust owner；循环只处理可见
  * 重试入口并受绝对期限约束，不能从测试进程直接创建第二个 bridge 或绕过产品恢复路径。
  */
 async function restartRuntimeAfterGoalCrash(page, deadline, signal) {
+  const before = await page.evaluate(async () => {
+    const { useTimelineStore } = await import(
+      "/src/features/conversation/application/timelineStore.ts"
+    );
+    const state = useTimelineStore.getState();
+    return {
+      generation: state.handshake.generation ?? 0,
+      serverInstanceId: state.serverInstanceId,
+    };
+  });
   await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
   let retryCount = 0;
+  let stableReadyCount = 0;
+  let lastRetryAt = 0;
   await waitForCondition(
     "Goal crash 后桌面运行时重新连接",
     async () => {
@@ -17957,18 +18530,32 @@ async function restartRuntimeAfterGoalCrash(page, deadline, signal) {
         .getByRole("status", { name: "本地运行时：已连接", exact: true })
         .isVisible()
         .catch(() => false);
-      if (connected) return true;
+      const native = await page
+        .evaluate(() => globalThis.__TAURI_INTERNALS__.invoke("ja_runtime_state"))
+        .catch(() => null);
+      if (
+        connected &&
+        native?.status === "ready" &&
+        native.generation > before.generation &&
+        native.serverInstanceId !== before.serverInstanceId
+      ) {
+        stableReadyCount += 1;
+        return stableReadyCount >= 3;
+      }
+      stableReadyCount = 0;
       const retry = page.getByRole("button", { name: "重新启动", exact: true });
       if (
         (await retry.isVisible().catch(() => false)) &&
-        (await retry.isEnabled().catch(() => false))
+        (await retry.isEnabled().catch(() => false)) &&
+        Date.now() - lastRetryAt > 1_000
       ) {
         await retry.click({ timeout: Math.max(1, Math.min(5_000, deadline - Date.now())) });
         retryCount += 1;
+        lastRetryAt = Date.now();
       }
       return false;
     },
-    deadline,
+    Math.min(deadline, Date.now() + 90_000),
     signal,
   );
   await installRawTauriEventProbe(page);
@@ -17977,7 +18564,7 @@ async function restartRuntimeAfterGoalCrash(page, deadline, signal) {
 }
 
 /**
- * 恢复场景先批准独立 Plan，再创建 Goal 并显式 attach 精确 revision/hash；approve 本身不得启动
+ * 恢复场景先冻结独立 Plan，再创建 Goal 并显式 attach 精确 revision/hash；提案本身不得启动
  * run。直建不会替 React 刷新 Thread catalog，因此 attach 后重载 WebView，再只终止本轮隔离
  * Java identity，以多源证据证明副作用 Tool 没有被盲目重放。
  */
@@ -18060,22 +18647,6 @@ async function runPlanGoalCrashRecoveryAcceptance(
     throw new Error(`恢复 Plan 冻结失败：${planResult.code ?? "UNKNOWN"}`);
   }
   plan = planResult.value;
-  planResult = await invokePlanGoalCommand(page, "ja_runtime_plan_approve", {
-    threadId,
-    planId: plan.plan.planId,
-    expectedPlanRevision: plan.plan.revision,
-    planRevisionId: frozenRevision.planRevisionId,
-    planHash: frozenRevision.planHash,
-    idempotencyKey: `plan-goal-recovery-approve-${Date.now().toString(36)}`,
-  });
-  if (
-    planResult.ok !== true ||
-    planResult.value?.plan?.status !== "approved" ||
-    planResult.value?.plan?.activeRunId !== null
-  ) {
-    throw new Error(`恢复 Plan 批准边界无效：${planResult.code ?? "UNKNOWN"}`);
-  }
-
   stage("crash_recovery:create_goal");
   const createdGoal = await invokePlanGoalCommand(page, "ja_runtime_goal_create", {
     owner: { kind: "thread", threadId },
@@ -18356,6 +18927,1903 @@ async function runIndependentPlanGoalAcceptanceSession(
     expectedSoakMinutes: configuredPlanGoalSoakMinutes,
   });
   await writeFile(planGoalReportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  return report;
+}
+
+/**
+ * Interaction/Plan v1 真窗闭环：结构化提问从真实 Provider 进入 UI，答案经 Interaction RPC
+ * 持久化后再用独立 Plan RPC 验证定稿、执行和 CAS。所有临时 Plan/Goal 都归属于本轮 Thread，
+ * 因而不会污染用户数据，也不会把 source fixture 的状态冒充为生产事实。
+ */
+async function runIndependentInteractionPlanAcceptanceSession(
+  page,
+  deadline,
+  directories,
+  providerFixture,
+  nativeScope,
+  nativeSidecar,
+  signal,
+  recordStage,
+) {
+  if (
+    providerFixture === undefined ||
+    interactionPlanReportPath === undefined ||
+    nativeSidecar === undefined
+  ) {
+    throw new Error("Interaction/Plan v1 验收缺少 Provider、报告路径或 Native sidecar");
+  }
+  const scenario = providerFixture.scenarios.interactionPlan;
+  const timeout = () => Math.max(1, Math.min(deadline, Date.now() + 30_000) - Date.now());
+  const stage = (name) => recordStage?.(`interaction_plan:${name}`);
+  const invoke = async (command, input) => {
+    const result = await page.evaluate(
+      async ({ commandName, commandInput }) => {
+        const fn = globalThis.__TAURI_INTERNALS__?.invoke;
+        if (typeof fn !== "function") return { ok: false, code: "TAURI_BRIDGE_UNAVAILABLE" };
+        try {
+          return { ok: true, value: await fn(commandName, { input: commandInput }) };
+        } catch (error) {
+          const object = error !== null && typeof error === "object" ? error : {};
+          const nested =
+            object.error !== null && typeof object.error === "object" ? object.error : {};
+          const code = [object.code, object.errorCode, nested.code].find(
+            (value) => typeof value === "string" && /^[A-Z][A-Z0-9_]{1,63}$/u.test(value),
+          );
+          return { ok: false, code: code ?? "COMMAND_FAILED" };
+        }
+      },
+      { commandName: command, commandInput: input },
+    );
+    return result;
+  };
+  const interactionRead = () => invoke("ja_runtime_interaction_read", { threadId });
+  /** 读取 probe 捕获的真实提交参数，允许验收以 UI 实际幂等键重放，而不是猜测 UUID。 */
+  const lastInteractionSubmission = () =>
+    page.evaluate(() => {
+      const values = globalThis.__JA_E2E_INTERACTION_RESPONSES__;
+      return Array.isArray(values) && values.length > 0 ? values.at(-1) : null;
+    });
+  /** 发送下一批真实用户输入并等待服务端为同一 Thread 创建新的 Interaction。 */
+  const requestInteractionBatch = async (prompt, previousRequestId, expectCard = true) => {
+    await waitForComposerAdmission(page, deadline);
+    const composer = page.getByRole("textbox", { name: "消息", exact: true });
+    await composer.fill(prompt);
+    await page.getByRole("button", { name: "发送", exact: true }).click();
+    if (expectCard) {
+      const card = page.locator('.ja-interaction-card[data-interaction-status="pending"]');
+      await card.waitFor({ state: "visible", timeout: timeout() });
+    }
+    if (!expectCard) return { ok: true, value: { request: null } };
+    return waitForCondition(
+      "next Interaction pending snapshot",
+      async () => {
+        const snapshot = await interactionRead();
+        return snapshot.ok === true &&
+          snapshot.value?.request?.status === "pending" &&
+          snapshot.value.request.requestId !== previousRequestId
+          ? snapshot
+          : false;
+      },
+      deadline,
+      signal,
+    );
+  };
+  /** 观察 Thread 中指定越权 Tool 的失败投影，不能只凭 Provider 已发出调用判定拒绝。 */
+  const rejectedToolObserved = async (toolName) => {
+    const snapshot = await invoke("ja_thread_read", { threadId, limit: 200 });
+    return (
+      snapshot.ok === true &&
+      snapshot.value.items.some(
+        (item) =>
+          item.kind === "tool_call" &&
+          item.toolName === toolName &&
+          item.presentation?.status === "error",
+      )
+    );
+  };
+  // 真正替换 Java 进程后再重载 WebView；单独 reload 只能证明前端恢复，不能充当持久恢复验收。
+  const restartApplication = async () => {
+    const prior = assertRuntimeIsolation(await processSnapshot(signal), directories, [
+      nativeSidecar.fileName,
+    ]);
+    const killed = await forceKillIsolatedAppServer(nativeScope, directories, deadline, signal, [
+      nativeSidecar.fileName,
+    ]);
+    if (killed.pid !== prior.appServerPid) throw new Error("待回答恢复终止了错误的隔离进程");
+    await restartRuntimeAfterGoalCrash(page, deadline, signal);
+    await page.reload({
+      waitUntil: "domcontentloaded",
+      timeout: Math.max(1, deadline - Date.now()),
+    });
+    await waitForRuntimeReady(page, deadline, signal);
+    await selectThreadById(page, threadId, deadline, signal);
+    await installRawTauriEventProbe(page);
+    await installTauriInvokeProbe(page);
+    const restoredProcess = assertRuntimeIsolation(await processSnapshot(signal), directories, [
+      nativeSidecar.fileName,
+    ]);
+    if (restoredProcess.appServerPid === killed.pid) throw new Error("待回答恢复未替换 Java 进程");
+    const snapshot = await interactionRead();
+    return snapshot.ok === true && snapshot.value?.request?.status === "pending";
+  };
+  let interactionEvidenceValue;
+  let readonlyEvidenceValue;
+  let executionEvidenceValue;
+  let recoveryEvidenceValue;
+  let isolationEvidenceValue;
+  let goalRegressionEvidenceValue;
+  let soakEvidenceValue;
+  const driver = createInteractionPlanWebView2Driver({
+    page,
+    deadline,
+    signal,
+    nativeSidecar,
+    screenshotDirectory:
+      visualEvidenceRunDirectory ?? join(dirname(interactionPlanReportPath), "screenshots"),
+    restartApplication,
+    exerciseInteractionScenario: async () => interactionEvidenceValue,
+    attemptReadonly: async () => readonlyEvidenceValue,
+    runExecutionScenario: async () => executionEvidenceValue,
+    runRecoveryScenario: async () => recoveryEvidenceValue,
+    runIsolationScenario: async () => isolationEvidenceValue,
+    runGoalRegressionScenario: async () => goalRegressionEvidenceValue,
+    runSoakScenario: async () => soakEvidenceValue,
+    // 外观与辅助选项经生产设置持久化，缩放经受信 WebView 原生 API，避免 DOM 样式伪装验收。
+    prepareVisualPreferences: async ({
+      width,
+      theme,
+      zoom,
+      reducedMotion,
+      reducedTransparency,
+      highContrast,
+      deadline: visualDeadline,
+    }) => {
+      await page.evaluate(() =>
+        globalThis.__TAURI_INTERNALS__.invoke("plugin:webview|set_webview_zoom", {
+          label: "main",
+          value: 1,
+        }),
+      );
+      const ownedWindow = await resolveOwnedJaWindow(nativeScope, signal);
+      await resizeOwnedNativeViewport(
+        page,
+        ownedWindow,
+        { width: 1280, height: 900 },
+        visualDeadline,
+        signal,
+      );
+      const settings = await openThemeMatrixAppearanceSettings(page, visualDeadline);
+      await selectThemeMatrixAppearanceValue(
+        page,
+        settings,
+        {
+          controlName: "外观模式",
+          optionName: theme === "system" ? "跟随系统" : theme === "light" ? "浅色" : "深色",
+          rootAttribute: "data-theme-mode",
+          value: theme,
+        },
+        visualDeadline,
+      );
+      for (const [name, attribute, enabled] of [
+        ["减少动效", "data-reduce-motion", reducedMotion],
+        ["降低透明度", "data-reduced-transparency", reducedTransparency],
+        ["提高对比度", "data-high-contrast", highContrast],
+      ]) {
+        const toggle = settings.getByRole("switch", { name, exact: true });
+        await waitForCondition(
+          "appearance switch admission",
+          () => toggle.isEnabled(),
+          visualDeadline,
+          signal,
+        );
+        if ((await toggle.getAttribute("aria-checked")) !== String(enabled)) await toggle.click();
+        await waitForCondition(
+          "appearance persisted",
+          () =>
+            page.evaluate(
+              ({ attribute, enabled }) =>
+                globalThis.document.documentElement.getAttribute(attribute) === String(enabled),
+              { attribute, enabled },
+            ),
+          visualDeadline,
+          signal,
+        );
+      }
+      await settings.getByRole("button", { name: "返回应用", exact: true }).click();
+      await resizeOwnedNativeViewport(
+        page,
+        ownedWindow,
+        { width, height: 900 },
+        visualDeadline,
+        signal,
+      );
+      await page.evaluate(
+        (value) =>
+          globalThis.__TAURI_INTERNALS__.invoke("plugin:webview|set_webview_zoom", {
+            label: "main",
+            value,
+          }),
+        zoom / 100,
+      );
+      await waitForCondition(
+        "native zoom layout",
+        () =>
+          page.evaluate(
+            ({ width, zoom }) => Math.abs(globalThis.innerWidth - (width * 100) / zoom) <= 2,
+            {
+              width,
+              zoom,
+            },
+          ),
+        visualDeadline,
+        signal,
+      );
+      return {
+        width,
+        themeMode: theme,
+        zoom,
+        zoomEvidence: "native_webview_zoom",
+        cssViewportWidth: await page.evaluate(() => globalThis.innerWidth),
+        nativeWidth: width,
+        nativeHeight: 900,
+      };
+    },
+    assertVisibleState: async ({ surfaceMode, deadline: visualDeadline }) => {
+      const stateDeadline = visualDeadline ?? deadline;
+      const stateTimeout = () => Math.max(1, stateDeadline - Date.now());
+      if (surfaceMode === "question") {
+        await page
+          .locator('.ja-interaction-card[data-interaction-status="pending"]')
+          .waitFor({ state: "visible", timeout: stateTimeout() });
+        return;
+      }
+      if (surfaceMode === "plan") {
+        await page
+          .locator('.ja-interaction-card[data-interaction-status="pending-collapsed"]')
+          .waitFor({ state: "visible", timeout: stateTimeout() });
+        await page
+          .locator(".ja-plan-timeline")
+          .first()
+          .waitFor({ state: "visible", timeout: stateTimeout() });
+        return;
+      }
+      throw new Error(`未知视觉 surfaceMode: ${surfaceMode ?? "missing"}`);
+    },
+    recordStage,
+  });
+
+  stage("startup");
+  const interactionWindow = await resolveOwnedJaWindow(nativeScope, signal);
+  await resizeOwnedNativeViewport(
+    page,
+    interactionWindow,
+    { width: 1280, height: 820 },
+    Math.min(deadline, Date.now() + 20_000),
+    signal,
+  );
+  await waitForRuntimeReady(page, deadline, signal);
+  // 新隔离数据目录没有历史；通过真实新会话入口建立 owner，再验证问答与 Plan。
+  const existingThreads = page
+    .getByRole("list", { name: "最近对话列表" })
+    .locator("button[data-thread-id]");
+  if ((await existingThreads.count()) === 0) {
+    const newConversation = page.getByRole("button", { name: "新会话", exact: true }).first();
+    await newConversation.waitFor({ state: "visible", timeout: 15_000 });
+    await newConversation.click({ timeout: 15_000 });
+  }
+  await waitForInitialThread(page, deadline, signal);
+  await waitForComposerAdmission(page, deadline);
+  // 使用真实用户权限执行后续 Tool，规划期仍由服务端 PlanToolPolicy 强制只读。
+  const accessMode = page.getByRole("combobox", { name: "访问模式", exact: true });
+  if (await accessMode.isVisible().catch(() => false)) {
+    await accessMode.click();
+    await page.getByRole("option", { name: "完全访问", exact: true }).click();
+    await waitForComposerAdmission(page, deadline);
+  }
+  const threadId = await currentThreadId(page, deadline, signal);
+  await waitForCondition(
+    "Interaction/Plan sidecar process",
+    async () =>
+      [...nativeScope.observed.values()].some(
+        (entry) => entry.name.toLowerCase() === nativeSidecar.fileName.toLowerCase(),
+      ),
+    deadline,
+    signal,
+  );
+
+  stage("request");
+  await executeComposerCommand(page, "plan", Math.min(deadline, Date.now() + 15_000));
+  await waitForComposerAdmission(page, Math.min(deadline, Date.now() + 15_000));
+  const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  await composer.fill(scenario.prompt);
+  await page.getByRole("button", { name: "发送", exact: true }).click({ timeout: 15_000 });
+  const pending = page.locator('.ja-interaction-card[data-interaction-status="pending"]');
+  await pending
+    .waitFor({ state: "visible", timeout: Math.min(60_000, Math.max(1, deadline - Date.now())) })
+    .catch(async (failure) => {
+      const probe = await interactionRead();
+      throw new Error(`问答卡片不可见：${JSON.stringify(probe)}`, { cause: failure });
+    });
+  await waitForCondition(
+    "Interaction pending snapshot",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true && snapshot.value?.request?.status === "pending"
+        ? snapshot.value
+        : false;
+    },
+    deadline,
+    signal,
+  );
+
+  stage("answers");
+  const initialSnapshot = await interactionRead();
+  if (initialSnapshot.ok !== true || initialSnapshot.value?.request?.status !== "pending") {
+    throw new Error("初始 Interaction 快照不可用");
+  }
+  const initialRequest = initialSnapshot.value.request;
+  if (visualEvidenceDirectory !== undefined) {
+    await mkdir(visualEvidenceDirectory, { recursive: true });
+    await page.screenshot({ path: join(visualEvidenceDirectory, "interaction-pending.png") });
+  }
+  const firstOption = pending.locator('[data-option-id="option_ui"] input');
+  // 只测量浏览器 change 到下一帧真实 DOM 回读的时间，不把 Playwright 往返或 RPC/模型等待混入交互反馈预算。
+  await page.evaluate(() => {
+    const input = globalThis.document.querySelector(
+      '.ja-interaction-card[data-interaction-status="pending"] [data-option-id="option_ui"] input',
+    );
+    if (!(input instanceof globalThis.HTMLInputElement)) {
+      throw new Error("Interaction 反馈测量缺少真实 option input");
+    }
+    const feedback = {
+      status: "waiting",
+      measuredInBrowser: true,
+      eventType: null,
+      latencyMs: null,
+      readback: null,
+    };
+    globalThis.__JA_E2E_INTERACTION_FEEDBACK__ = feedback;
+    input.addEventListener(
+      "change",
+      (event) => {
+        const changedAt = globalThis.performance.now();
+        feedback.eventType = event.type;
+        globalThis.requestAnimationFrame(() => {
+          feedback.latencyMs = globalThis.performance.now() - changedAt;
+          feedback.readback = {
+            checked: input.checked,
+            value: input.value,
+            optionId: input.closest("[data-option-id]")?.getAttribute("data-option-id") ?? null,
+          };
+          feedback.status = "completed";
+        });
+      },
+      { once: true },
+    );
+  });
+  await firstOption.focus();
+  await firstOption.press("Space");
+  if (!(await firstOption.isChecked())) throw new Error("键盘单选未生效");
+  const interactionFeedback = await waitForCondition(
+    "Interaction 浏览器反馈回读",
+    () =>
+      page.evaluate(() => {
+        const feedback = globalThis.__JA_E2E_INTERACTION_FEEDBACK__;
+        return feedback?.status === "completed" ? feedback : false;
+      }),
+    deadline,
+    signal,
+  );
+  if (
+    interactionFeedback.measuredInBrowser !== true ||
+    interactionFeedback.eventType !== "change" ||
+    !Number.isFinite(interactionFeedback.latencyMs) ||
+    interactionFeedback.latencyMs < 0 ||
+    interactionFeedback.latencyMs >= 100 ||
+    interactionFeedback.readback?.checked !== true ||
+    typeof interactionFeedback.readback?.value !== "string" ||
+    interactionFeedback.readback.value.length === 0 ||
+    interactionFeedback.readback.optionId !== "option_ui"
+  ) {
+    throw new Error(
+      `Interaction 浏览器反馈超过预算或回读无效：${JSON.stringify(interactionFeedback)}`,
+    );
+  }
+  await pending.getByRole("button", { name: "收起问题", exact: true }).click();
+  const collapsedCard = page.locator('.ja-interaction-card[aria-label="待回答的问题"]');
+  await collapsedCard.waitFor({ state: "visible", timeout: timeout() });
+  await collapsedCard.getByRole("button", { name: "展开问题", exact: true }).click();
+  if (!(await pending.locator('[data-option-id="option_ui"] input').isChecked())) {
+    throw new Error("收起后单选草稿未保留");
+  }
+  await pending.getByRole("button", { name: "下一题", exact: true }).click();
+  const planOption = pending.locator('[data-option-id="option_plan"] input');
+  const goalOption = pending.locator('[data-option-id="option_goal"] input');
+  await planOption.focus();
+  await planOption.press("Space");
+  await goalOption.focus();
+  await goalOption.press("Space");
+  if (!(await planOption.isChecked()) || !(await goalOption.isChecked())) {
+    throw new Error("键盘多选未生效");
+  }
+  await pending.getByRole("button", { name: "下一题", exact: true }).click();
+  await waitForCondition(
+    "Interaction draft before reload",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true && (snapshot.value?.draft?.answers?.length ?? 0) >= 2;
+    },
+    deadline,
+    signal,
+  );
+  const restored = await restartApplication();
+  const restoredPending = page.locator('.ja-interaction-card[data-interaction-status="pending"]');
+  await restoredPending.waitFor({ state: "visible", timeout: timeout() });
+  const restoredDraft = await interactionRead();
+  if (
+    !restored ||
+    restoredDraft.ok !== true ||
+    (restoredDraft.value?.draft?.answers?.length ?? 0) < 2
+  ) {
+    throw new Error("重启后 Interaction 草稿未恢复");
+  }
+  const customInput = pending.getByRole("textbox", {
+    name: "补充一个验收备注（可选）",
+    exact: true,
+  });
+  await customInput.evaluate((element) => {
+    element.dispatchEvent(
+      new globalThis.CompositionEvent("compositionstart", { bubbles: true, data: "中" }),
+    );
+    element.dispatchEvent(
+      new globalThis.KeyboardEvent("keydown", { bubbles: true, key: "Enter", isComposing: true }),
+    );
+    element.dispatchEvent(
+      new globalThis.CompositionEvent("compositionend", { bubbles: true, data: "中" }),
+    );
+  });
+  const imeCompositionSafe = await pending.isVisible();
+  if (!imeCompositionSafe) throw new Error("IME 组合期间错误提交 Interaction");
+  await customInput.fill("保留真实证据");
+  await pending.getByRole("button", { name: "提交", exact: true }).focus();
+  await pending.getByRole("button", { name: "提交", exact: true }).press("Enter");
+  await waitForCondition(
+    "Interaction answer persisted",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true && snapshot.value?.request?.status === "answered"
+        ? snapshot.value
+        : false;
+    },
+    deadline,
+    signal,
+  );
+  const summary = page.locator('.ja-interaction-card[aria-label="已回答的问题"]');
+  await summary.waitFor({ state: "visible", timeout: timeout() });
+  const answeredSnapshot = await interactionRead();
+  const answeredAnswers = answeredSnapshot.value?.request?.answers ?? [];
+  const customAnswer =
+    answeredSnapshot.ok === true &&
+    answeredSnapshot.value?.request?.status === "answered" &&
+    answeredAnswers.some(
+      (answer) =>
+        answer.questionId === "question_note" &&
+        answer.freeText === "保留真实证据" &&
+        !answer.skipped,
+    );
+  const submission = await lastInteractionSubmission();
+  if (submission === null || submission.requestId !== initialRequest.requestId) {
+    throw new Error("未捕获 Interaction UI 的真实提交参数");
+  }
+  const duplicateResponse = await invoke("ja_runtime_interaction_respond", submission);
+  const staleResponse = await invoke("ja_runtime_interaction_respond", {
+    ...submission,
+    idempotencyKey: `${submission.idempotencyKey}-stale`,
+  });
+  const duplicateResponseIdempotent =
+    duplicateResponse.ok === true &&
+    duplicateResponse.value?.request?.status === "answered" &&
+    duplicateResponse.value.request.requestId === initialRequest.requestId;
+  const staleResponseRejected =
+    staleResponse.ok === false &&
+    ["INTERACTION_INVALID_STATE", "INTERACTION_REVISION_CONFLICT"].includes(staleResponse.code);
+  if (!customAnswer || !duplicateResponseIdempotent || !staleResponseRejected) {
+    throw new Error(
+      `Interaction 回答 CAS 证据不足：${JSON.stringify({ customAnswer, duplicateResponseIdempotent, staleResponseRejected })}`,
+    );
+  }
+  const skipSnapshot = await requestInteractionBatch(
+    scenario.interactionPrompts[5],
+    initialRequest.requestId,
+  );
+  const skipCard = page.locator('.ja-interaction-card[data-interaction-status="pending"]');
+  await skipCard.locator('[data-option-id="option_ui"] input').check();
+  await skipCard.getByRole("button", { name: "下一题", exact: true }).click();
+  await skipCard.locator('[data-option-id="option_plan"] input').check();
+  await skipCard.getByRole("button", { name: "下一题", exact: true }).click();
+  await skipCard.getByRole("button", { name: "跳过", exact: true }).click();
+  const skippedPending = await waitForCondition(
+    "explicit skip keeps Interaction pending",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true &&
+        snapshot.value?.request?.requestId === skipSnapshot.value.request.requestId &&
+        snapshot.value.request.status === "pending" &&
+        snapshot.value.draft?.answers?.some(
+          (answer) =>
+            answer.questionId === "question_note" &&
+            answer.skipped === true &&
+            answer.optionIds.length === 0 &&
+            answer.freeText === null,
+        )
+        ? snapshot.value
+        : false;
+    },
+    deadline,
+    signal,
+  );
+  const skippedAnswer = (skippedPending.draft?.answers ?? []).find(
+    (answer) => answer.questionId === "question_note",
+  );
+  if (
+    skippedAnswer === undefined ||
+    skippedAnswer.skipped !== true ||
+    skippedAnswer.optionIds.length !== 0 ||
+    skippedAnswer.freeText !== null
+  ) {
+    throw new Error("跳过未保留为待提交的结构化 skipped 草稿");
+  }
+  await skipCard.getByRole("button", { name: "提交", exact: true }).click();
+  const skippedResult = await waitForCondition(
+    "explicit skipped Interaction snapshot",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true &&
+        snapshot.value?.request?.requestId === skipSnapshot.value.request.requestId &&
+        snapshot.value.request.status === "answered"
+        ? snapshot.value
+        : false;
+    },
+    deadline,
+    signal,
+  );
+  const explicitSkip = skippedResult.request.answers.some(
+    (answer) =>
+      answer.skipped === true && answer.optionIds.length === 0 && answer.freeText === null,
+  );
+  if (!explicitSkip || skippedPending.request.status !== "pending")
+    throw new Error("跳过未以结构化 skipped answer 提交");
+  const cancelSnapshot = await requestInteractionBatch(
+    scenario.interactionPrompts[6],
+    skipSnapshot.value.request.requestId,
+  );
+  const cancelRequest = cancelSnapshot.value.request;
+  const beforeCancel = await readPlanGoalThreadAuthority(page, threadId);
+  const cancelResponse = await invoke("ja_runtime_interaction_cancel", {
+    threadId,
+    requestId: cancelRequest.requestId,
+    expectedRevision: cancelRequest.revision,
+    idempotencyKey: `interaction-cancel-e2e-${Date.now().toString(36)}`,
+  });
+  const afterCancel = await waitForCondition(
+    "cancelled Interaction snapshot",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true &&
+        snapshot.value?.request?.requestId === cancelRequest.requestId &&
+        snapshot.value.request.status === "cancelled"
+        ? snapshot.value
+        : false;
+    },
+    deadline,
+    signal,
+  );
+  const afterCancelThread = await readPlanGoalThreadAuthority(page, threadId);
+  const cancelDoesNotResumeTurn =
+    cancelResponse.ok === true &&
+    afterCancel.request.status === "cancelled" &&
+    afterCancelThread.turns.every(
+      (turn) => turn.status !== "running" && turn.status !== "suspended",
+    ) &&
+    beforeCancel.turns.length === afterCancelThread.turns.length;
+  const raceSnapshot = await requestInteractionBatch(
+    scenario.interactionPrompts[7],
+    cancelRequest.requestId,
+  );
+  const raceRequest = raceSnapshot.value.request;
+  const raceAnswers = [
+    { questionId: "question_scope", optionIds: ["option_ui"], freeText: null, skipped: false },
+    { questionId: "question_targets", optionIds: ["option_plan"], freeText: null, skipped: false },
+    { questionId: "question_note", optionIds: [], freeText: null, skipped: true },
+  ];
+  const raceInputs = [1, 2].map((index) => ({
+    threadId,
+    requestId: raceRequest.requestId,
+    expectedRevision: raceRequest.revision,
+    idempotencyKey: `interaction-race-${Date.now().toString(36)}-${index}`,
+    answers: raceAnswers,
+  }));
+  const raceResults = await Promise.all(
+    raceInputs.map((input) => invoke("ja_runtime_interaction_respond", input)),
+  );
+  const raceSingleWinner =
+    raceResults.filter((result) => result.ok === true).length === 1 &&
+    raceResults.filter(
+      (result) =>
+        result.ok === false &&
+        ["INTERACTION_INVALID_STATE", "INTERACTION_REVISION_CONFLICT"].includes(result.code),
+    ).length === 1;
+  if (!cancelDoesNotResumeTurn || !raceSingleWinner) {
+    throw new Error(
+      `Interaction 竞争证据不足：${JSON.stringify({ cancelDoesNotResumeTurn, raceSingleWinner })}`,
+    );
+  }
+  const readonlyToolObservations = {};
+  let currentRequestId = raceRequest.requestId;
+  for (let ordinal = 1; ordinal <= (scenario.readonlyToolCalls?.length ?? 0); ordinal += 1) {
+    await requestInteractionBatch(scenario.interactionPrompts[ordinal], currentRequestId, false);
+    const expectedTool = scenario.readonlyToolCalls[ordinal - 1].name;
+    await waitForCondition(
+      `readonly Tool ${expectedTool} provider call`,
+      () =>
+        providerFixture.attempts.some(
+          (attempt) =>
+            attempt.scenarioId === scenario.id &&
+            attempt.kind === "turn" &&
+            attempt.requestedToolName === expectedTool,
+        ),
+      deadline,
+      signal,
+    );
+    await waitForCondition(
+      `readonly Tool ${expectedTool} rejection`,
+      () =>
+        providerFixture.attempts.some(
+          (attempt) =>
+            attempt.scenarioId === scenario.id &&
+            attempt.kind === "turn" &&
+            attempt.requestedToolName === expectedTool &&
+            (attempt.finished === true || attempt.disconnected === true),
+        ),
+      deadline,
+      signal,
+    );
+    readonlyToolObservations[expectedTool] = await waitForCondition(
+      `readonly Tool ${expectedTool} committed rejection`,
+      () => rejectedToolObserved(expectedTool),
+      Math.min(deadline, Date.now() + 60_000),
+      signal,
+    );
+    if (!readonlyToolObservations[expectedTool]) {
+      throw new Error(`规划阶段越权 Tool 未观察到服务端拒绝：${expectedTool}`);
+    }
+  }
+  interactionEvidenceValue = {
+    singleChoice: true,
+    multiChoice: true,
+    customAnswer,
+    explicitSkip,
+    collapsePreservedDraft: restored,
+    restartRestoredPendingRequest: restored,
+    duplicateResponseIdempotent,
+    staleResponseRejected,
+    cancelDoesNotResumeTurn,
+    raceSingleWinner,
+    imeCompositionSafe,
+    keyboardComplete: true,
+    feedbackMeasuredInBrowser: interactionFeedback.measuredInBrowser,
+    feedbackEventType: interactionFeedback.eventType,
+    feedbackLatencyMs: interactionFeedback.latencyMs,
+    feedbackReadback: interactionFeedback.readback,
+    questionKinds: ["single", "multi", "custom", "skip"],
+    pendingThreadCount: 1,
+    answerSummaryCollapsed:
+      (await summary.getAttribute("class"))?.split(/\s+/u).includes("is-collapsed") === true,
+    noImplicitDefault: afterCancel.request.answers.length === 0,
+  };
+
+  stage("readonly");
+  readonlyEvidenceValue = {
+    shellRejected: readonlyToolObservations.shell === true,
+    workspaceWriteRejected: readonlyToolObservations.write === true,
+    externalWriteRejected: readonlyToolObservations.mcp_write === true,
+    subagentWriteRejected: readonlyToolObservations.spawn_agent === true,
+    readOnlyToolsOnly: providerFixture.attempts
+      .filter((attempt) => attempt.scenarioId === scenario.id && attempt.kind === "turn")
+      .every(
+        (attempt) => attempt.toolCatalogPresent === true && attempt.shellToolDeclared !== true,
+      ),
+  };
+
+  stage("execute");
+  // 执行阶段复用与 Plan/Goal 生产链路相同的确定性 Tool 序列；身份仍由本次真实 Plan 快照提供。
+  await waitForComposerAdmission(page, deadline);
+  await page.getByRole("combobox", { name: "访问模式", exact: true }).click();
+  await page.getByRole("option", { name: "需要审批", exact: true }).click();
+  await waitForComposerAdmission(page, deadline);
+  providerFixture.resetPlanGoalContext("standalone");
+  const ownerGoalsBeforePlanExecution = ownerGoalCount(directories, threadId);
+  const currentPlan = await invoke("ja_runtime_plan_current_read", { threadId });
+  let planResult =
+    currentPlan.ok === true && currentPlan.value?.current !== null
+      ? { ok: true, value: currentPlan.value.current }
+      : { ok: false, code: "NO_EXISTING_PLAN" };
+  if (planResult.ok !== true) {
+    const createKey = `interaction-plan-create-${Date.now().toString(36)}`;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const currentAuthority = await readPlanGoalThreadAuthority(page, threadId);
+      planResult = await invoke("ja_runtime_plan_create", {
+        owner: { kind: "thread", threadId },
+        objective: providerFixture.scenarios.planGoal.objective,
+        expectedThreadRevision: currentAuthority.revision,
+        idempotencyKey: createKey,
+      });
+      if (planResult.ok || planResult.code !== "GOAL_REVISION_CONFLICT") break;
+    }
+  }
+  if (planResult.ok !== true)
+    throw new Error(`Interaction Plan 读取或创建失败：${planResult.code}`);
+  let plan = planResult.value;
+  if (plan?.plan?.owner?.threadId !== threadId)
+    throw new Error("Interaction Plan owner Thread 不匹配");
+  const definition = {
+    objective: providerFixture.scenarios.planGoal.objective,
+    scope: ["隔离 Windows Tauri WebView2"],
+    nonGoals: ["不写入真实项目"],
+    constraints: ["仅使用 loopback Provider"],
+    acceptanceCriteria: [
+      {
+        criterionId: "criterion_interaction",
+        description: "Interaction RPC 与 Plan 执行均可观察",
+        required: true,
+      },
+    ],
+    steps: [
+      {
+        stepId: "step_interaction",
+        title: "验证结构化交互",
+        description: "读取 Interaction 与 Plan 权威状态",
+        required: true,
+        dependsOn: [],
+      },
+    ],
+    dependencies: [],
+    risks: ["隔离进程退出"],
+    verificationStrategy: ["读取 RPC 快照与事件"],
+  };
+  planResult = await invoke("ja_runtime_plan_draft_save", {
+    threadId,
+    planId: plan.plan.planId,
+    expectedPlanRevision: plan.plan.revision,
+    idempotencyKey: `interaction-plan-draft-${Date.now().toString(36)}`,
+    draft: definition,
+  });
+  if (planResult.ok !== true) throw new Error(`Interaction Plan 草稿失败：${planResult.code}`);
+  plan = planResult.value;
+  planResult = await invoke("ja_runtime_plan_propose", {
+    threadId,
+    planId: plan.plan.planId,
+    expectedPlanRevision: plan.plan.revision,
+    idempotencyKey: `interaction-plan-propose-${Date.now().toString(36)}`,
+  });
+  if (planResult.ok !== true || planResult.value?.currentRevision === null)
+    throw new Error(`Interaction Plan 定稿失败：${planResult.code}`);
+  plan = planResult.value;
+  const revision = plan.currentRevision;
+  // 使用真实计划入口执行；UI 的实际幂等键用于重放，不能绕过前端批准版本接线。
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, deadline, signal);
+  await selectThreadById(page, threadId, deadline, signal);
+  await installRawTauriEventProbe(page);
+  await installTauriInvokeProbe(page);
+  const planCard = page.locator(`.ja-plan-timeline[data-plan-id="${plan.plan.planId}"]`);
+  await planCard.getByRole("button", { name: "执行", exact: true }).click({ timeout: 30_000 });
+  const executeInput = await waitForCondition(
+    "real Plan execute input",
+    () => page.evaluate(() => globalThis.__JA_E2E_PLAN_EXECUTES__?.at(-1)),
+    Math.min(deadline, Date.now() + 30_000),
+    signal,
+  );
+  const firstExecute = await waitForCondition(
+    "Plan Run admission",
+    async () => {
+      const current = await invoke("ja_runtime_plan_read", { threadId, planId: plan.plan.planId });
+      return current.ok === true && current.value.plan.activeRunId !== null ? current : false;
+    },
+    Math.min(deadline, Date.now() + 30_000),
+    signal,
+  );
+  const duplicateExecute = await invoke("ja_runtime_plan_execute", executeInput);
+  const runId = firstExecute.value?.plan?.activeRunId;
+  const atomicExecute =
+    firstExecute.ok === true &&
+    duplicateExecute.ok === true &&
+    typeof runId === "string" &&
+    runId.startsWith("run_") &&
+    duplicateExecute.value?.plan?.activeRunId === runId;
+  if (!atomicExecute) {
+    throw new Error(`Interaction Plan 原子执行失败：${firstExecute.code ?? duplicateExecute.code}`);
+  }
+  plan = firstExecute.value;
+  const executionRevision = plan.currentRevision;
+  if (
+    executionRevision === null ||
+    typeof executionRevision.planRevisionId !== "string" ||
+    typeof executionRevision.planHash !== "string" ||
+    executionRevision.steps?.[0]?.stepId !== "step_interaction" ||
+    executionRevision.acceptanceCriteria?.[0]?.criterionId !== "criterion_interaction"
+  ) {
+    throw new Error("Interaction Plan 执行快照缺少冻结 step/criterion identity");
+  }
+  providerFixture.setPlanGoalContext({
+    kind: "plan",
+    planId: plan.plan.planId,
+    planRevision: plan.plan.revision,
+    runId,
+    planRevisionId: executionRevision.planRevisionId,
+    stepId: executionRevision.steps[0].stepId,
+    criterionId: executionRevision.acceptanceCriteria[0].criterionId,
+  });
+  const executionAuthorizationRecorded =
+    plan.approval !== null && plan.approval?.planRevisionId === revision.planRevisionId;
+  await waitForCondition(
+    "Interaction Plan 首个执行 Tool 到达",
+    () =>
+      providerFixture.attempts.some(
+        (attempt) =>
+          attempt.scenarioId === providerFixture.scenarios.planGoal.id &&
+          attempt.kind === "turn" &&
+          attempt.requestedToolName === "shell",
+      ),
+    deadline,
+    signal,
+  );
+  await approvePendingStandalonePlanTool(page, { threadId, toolName: "shell" }, deadline, signal);
+  await waitForCondition(
+    "Interaction Plan 首个 step Tool 到达",
+    () =>
+      providerFixture.attempts.some(
+        (attempt) =>
+          attempt.scenarioId === providerFixture.scenarios.planGoal.id &&
+          attempt.kind === "turn" &&
+          attempt.requestedToolName === "plan_step_update",
+      ),
+    deadline,
+    signal,
+  );
+  await approvePendingStandalonePlanTool(
+    page,
+    { threadId, toolName: "plan_step_update" },
+    deadline,
+    signal,
+  );
+  const beforePause = await invoke("ja_runtime_plan_read", { threadId, planId: plan.plan.planId });
+  if (beforePause.ok !== true)
+    throw new Error(`Interaction Plan 暂停前读取失败：${beforePause.code}`);
+  const pauseResult = await invoke("ja_runtime_plan_pause", {
+    threadId,
+    planId: plan.plan.planId,
+    runId,
+    expectedPlanRevision: beforePause.value.plan.revision,
+    idempotencyKey: `interaction-plan-pause-${Date.now().toString(36)}`,
+  });
+  const pauseSettledBeforeVisible =
+    pauseResult.ok === true && pauseResult.value?.plan?.status === "paused";
+  if (!pauseSettledBeforeVisible)
+    throw new Error(`Interaction Plan 暂停未安全结算：${pauseResult.code ?? "UNKNOWN"}`);
+  const beforeResume = await invoke("ja_runtime_plan_read", { threadId, planId: plan.plan.planId });
+  const resumeResult = await invoke("ja_runtime_plan_resume", {
+    threadId,
+    planId: plan.plan.planId,
+    runId,
+    expectedPlanRevision: beforeResume.value?.plan?.revision,
+    idempotencyKey: `interaction-plan-resume-${Date.now().toString(36)}`,
+  });
+  const resumeUsedSameRun =
+    beforeResume.ok === true &&
+    beforeResume.value?.plan?.status === "paused" &&
+    resumeResult.ok === true &&
+    resumeResult.value?.plan?.status === "executing" &&
+    resumeResult.value.plan.activeRunId === runId;
+  if (!resumeUsedSameRun)
+    throw new Error(`Interaction Plan 未沿用原 Run 恢复：${resumeResult.code ?? "UNKNOWN"}`);
+  providerFixture.setPlanGoalContext({
+    kind: "plan",
+    planId: plan.plan.planId,
+    planRevision: resumeResult.value.plan.revision,
+    stepStatus: resumeResult.value.stepExecutions?.find(
+      (step) => step.stepId === executionRevision.steps[0].stepId,
+    )?.status,
+    runId,
+    planRevisionId: executionRevision.planRevisionId,
+    stepId: executionRevision.steps[0].stepId,
+    criterionId: executionRevision.acceptanceCriteria[0].criterionId,
+  });
+  // 按真实审批与持久 claim 推进；暂停可能发生在任意安全点，不能用固定 Tool 次序假定恢复位置。
+  const executionLedger = await waitForCondition(
+    "Interaction Plan SQLite Run 累计账本",
+    async () => {
+      const value = planExecutionLedgerFact(directories, plan.plan.planId, runId);
+      if (
+        value?.run?.run_id === runId &&
+        Number(value.run.used_model_rounds) > 0 &&
+        value.claims.length >= 2
+      )
+        return value;
+      const authority = await readPlanGoalThreadAuthority(page, threadId);
+      const pendingApproval = authority.approvals.find(
+        (approval) =>
+          approval.decision === null &&
+          authority.turns.some(
+            (turn) => turn.turnId === approval.turnId && turn.status === "waiting_approval",
+          ),
+      );
+      if (pendingApproval !== undefined) {
+        const tool = authority.toolCalls.find((call) => call.callId === pendingApproval.callId);
+        if (tool !== undefined)
+          await approvePendingStandalonePlanTool(
+            page,
+            { threadId, toolName: tool.toolName },
+            deadline,
+            signal,
+          );
+      }
+      return false;
+    },
+    Math.min(deadline, Date.now() + 120_000),
+    signal,
+  );
+  const runCounters = executionLedger.run;
+  const remainingModelRounds =
+    runCounters.max_model_rounds === null
+      ? null
+      : Number(runCounters.max_model_rounds) - Number(runCounters.used_model_rounds);
+  const remainingToolCalls =
+    runCounters.max_tool_calls === null
+      ? null
+      : Number(runCounters.max_tool_calls) - Number(runCounters.used_tool_calls);
+  const remainingWallMillis =
+    runCounters.wall_budget_millis === null
+      ? null
+      : Number(runCounters.wall_budget_millis) - Number(runCounters.used_active_millis);
+  const continuationTurnCount = executionLedger.claims.length;
+  const continuationKeptBudget =
+    continuationTurnCount >= 2 &&
+    Number(runCounters.used_model_rounds) > 0 &&
+    Number(runCounters.used_tool_calls) > 0 &&
+    executionLedger.claims.length >= continuationTurnCount;
+  const remainingBudgetNonNegative =
+    remainingModelRounds !== null &&
+    remainingToolCalls !== null &&
+    remainingWallMillis !== null &&
+    remainingModelRounds >= 0 &&
+    remainingToolCalls >= 0 &&
+    remainingWallMillis >= 0;
+  const staleExecute = await invoke("ja_runtime_plan_execute", {
+    ...executeInput,
+    expectedPlanRevision: 0,
+    idempotencyKey: `interaction-plan-stale-${Date.now().toString(36)}`,
+  });
+  let stopResult;
+  const stopKey = `interaction-plan-stop-${Date.now().toString(36)}`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    stopResult = await invoke("ja_runtime_plan_stop", {
+      threadId,
+      planId: plan.plan.planId,
+      runId,
+      expectedPlanRevision: (
+        await invoke("ja_runtime_plan_read", { threadId, planId: plan.plan.planId })
+      ).value?.plan?.revision,
+      idempotencyKey: stopKey,
+    });
+    if (
+      stopResult.ok ||
+      !["CONFLICT", "PLAN_REVISION_CONFLICT", "GOAL_REVISION_CONFLICT"].includes(stopResult.code)
+    )
+      break;
+  }
+  const stopPreservedHistory =
+    stopResult.ok === true &&
+    stopResult.value?.plan?.status === "stopped" &&
+    stopResult.value.plan.activeRunId === runId;
+  if (!stopPreservedHistory)
+    throw new Error(`Interaction Plan 停止未保留历史：${stopResult.code ?? "UNKNOWN"}`);
+  const ownerGoalsAfterPlanExecution = ownerGoalCount(directories, threadId);
+  executionEvidenceValue = {
+    atomicExecute,
+    executionAuthorizationRecorded,
+    singleRunCreated: atomicExecute,
+    continuationKeptBudget,
+    pauseSettledBeforeVisible,
+    resumeUsedSameRun,
+    stopPreservedHistory,
+    versionConflictDidNotExecuteLatest: staleExecute.ok === false,
+    goalNotImplicitlyCreated:
+      ownerGoalsBeforePlanExecution >= 0 &&
+      ownerGoalsAfterPlanExecution === ownerGoalsBeforePlanExecution,
+    runCount: executionLedger.run.run_id === runId ? 1 : 0,
+    continuationTurnCount,
+    remainingBudgetNonNegative,
+  };
+  readonlyEvidenceValue = { ...readonlyEvidenceValue, executionBoundaryRequired: atomicExecute };
+
+  stage("completion");
+  const completionProof = await runStandalonePlanCompletion({
+    page,
+    invoke,
+    threadId,
+    definition,
+    providerFixture,
+    deadline: Math.min(deadline, Date.now() + 300_000),
+    signal,
+    directories: { databasePath: join(directories.data, "ja.db") },
+    approvalHelper: approvePendingStandalonePlanTool,
+  });
+  executionEvidenceValue = { ...executionEvidenceValue, completionProof };
+
+  stage("recovery");
+  const successfulToolIdsBeforeRecovery = executionLedger.successfulToolAttempts.map(
+    (value) => value.call_id,
+  );
+  const recoveryAuthority = await readPlanGoalThreadAuthority(page, threadId);
+  const recoveryCreated = await invoke("ja_runtime_plan_create", {
+    owner: { kind: "thread", threadId },
+    objective: providerFixture.scenarios.planGoal.recoveryObjective,
+    expectedThreadRevision: recoveryAuthority.revision,
+    idempotencyKey: `interaction-plan-recovery-create-${Date.now().toString(36)}`,
+  });
+  if (recoveryCreated.ok !== true) throw new Error(`恢复 Plan 创建失败：${recoveryCreated.code}`);
+  let recoveryPlan = recoveryCreated.value;
+  const recoveryDefinition = {
+    objective: providerFixture.scenarios.planGoal.recoveryObjective,
+    scope: ["隔离 Windows Tauri WebView2"],
+    nonGoals: ["不重复执行未知副作用 Tool"],
+    constraints: ["仅使用 loopback Provider"],
+    acceptanceCriteria: [
+      {
+        criterionId: "criterion_recovery",
+        description: "副作用 Tool 未被盲目重放",
+        required: true,
+      },
+    ],
+    steps: [
+      {
+        stepId: "step_recovery",
+        title: "验证未知副作用恢复",
+        description: "在真实 STARTED 边界停止隔离 App Server",
+        required: true,
+        dependsOn: [],
+      },
+    ],
+    dependencies: [],
+    risks: ["Provider 进程可能在强杀前完成"],
+    verificationStrategy: ["SQLite Tool ledger 与 Plan projection"],
+  };
+  const recoveryDraft = await invoke("ja_runtime_plan_draft_save", {
+    threadId,
+    planId: recoveryPlan.plan.planId,
+    expectedPlanRevision: recoveryPlan.plan.revision,
+    idempotencyKey: `interaction-plan-recovery-draft-${Date.now().toString(36)}`,
+    draft: recoveryDefinition,
+  });
+  if (recoveryDraft.ok !== true) throw new Error(`恢复 Plan 草稿失败：${recoveryDraft.code}`);
+  recoveryPlan = recoveryDraft.value;
+  const recoveryProposed = await invoke("ja_runtime_plan_propose", {
+    threadId,
+    planId: recoveryPlan.plan.planId,
+    expectedPlanRevision: recoveryPlan.plan.revision,
+    idempotencyKey: `interaction-plan-recovery-propose-${Date.now().toString(36)}`,
+  });
+  if (recoveryProposed.ok !== true || recoveryProposed.value?.currentRevision === null) {
+    throw new Error(`恢复 Plan 定稿失败：${recoveryProposed.code}`);
+  }
+  recoveryPlan = recoveryProposed.value;
+  const recoveryProviderAttemptBaseline = providerFixture.attempts.filter(
+    (attempt) =>
+      attempt.scenarioId === providerFixture.scenarios.planGoal.id && attempt.kind === "turn",
+  ).length;
+  providerFixture.resetPlanGoalContext("recovery");
+  const recoveryObserved = await invoke("ja_runtime_plan_observe", {
+    threadId,
+    planId: recoveryPlan.plan.planId,
+  });
+  if (recoveryObserved.ok !== true) throw new Error("恢复 Plan 观察注册失败");
+  const recoveryRevision = recoveryPlan.currentRevision;
+  const recoveryExecuteInput = {
+    threadId,
+    planId: recoveryPlan.plan.planId,
+    expectedPlanRevision: recoveryPlan.plan.revision,
+    planRevisionId: recoveryRevision.planRevisionId,
+    planHash: recoveryRevision.planHash,
+    idempotencyKey: `interaction-plan-recovery-execute-${Date.now().toString(36)}`,
+  };
+  const recoveryExecuted = await invoke("ja_runtime_plan_execute", recoveryExecuteInput);
+  if (
+    recoveryExecuted.ok !== true ||
+    typeof recoveryExecuted.value?.plan?.activeRunId !== "string"
+  ) {
+    throw new Error(`恢复 Plan 执行失败：${recoveryExecuted.code}`);
+  }
+  recoveryPlan = recoveryExecuted.value;
+  const recoveryRunId = recoveryPlan.plan.activeRunId;
+  providerFixture.setPlanGoalContext({
+    kind: "plan",
+    planId: recoveryPlan.plan.planId,
+    planRevision: recoveryPlan.plan.revision,
+    runId: recoveryRunId,
+    planRevisionId: recoveryRevision.planRevisionId,
+    stepId: recoveryRevision.steps[0].stepId,
+    criterionId: recoveryRevision.acceptanceCriteria[0].criterionId,
+  });
+  await waitForCondition(
+    "Interaction Plan recovery 副作用 Tool 到达",
+    () =>
+      providerFixture.attempts.some(
+        (attempt) =>
+          attempt.scenarioId === providerFixture.scenarios.planGoal.id &&
+          attempt.kind === "turn" &&
+          providerFixture.attempts.indexOf(attempt) >= recoveryProviderAttemptBaseline &&
+          attempt.requestedToolName === "shell",
+      ),
+    deadline,
+    signal,
+  );
+  await approvePendingStandalonePlanTool(page, { threadId, toolName: "shell" }, deadline, signal);
+  const startedRecovery = await waitForCondition(
+    "Interaction Plan recovery STARTED Tool 账本",
+    () => {
+      const value = planExecutionLedgerFact(directories, recoveryPlan.plan.planId, recoveryRunId);
+      const attempt = value?.toolAttempts.find(
+        (candidate) => Number(candidate.side_effect) === 1 && candidate.state === "STARTED",
+      );
+      return attempt === undefined ? false : { value, attempt };
+    },
+    deadline,
+    signal,
+  );
+  // 保存本次恢复 Plan 的真实旧事件，重启后通过 Tauri event bridge 重新投递，验证 reducer
+  // 按服务端 sequence 丢弃迟到状态，而不是以最终快照本身反推该结论。
+  const latePlanEvent = await page.evaluate((expectedPlanId) => {
+    const events = Array.isArray(globalThis.__JA_E2E_TAURI_EVENTS__)
+      ? globalThis.__JA_E2E_TAURI_EVENTS__
+      : [];
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const value = events[index];
+      const payload =
+        value !== null && typeof value === "object" && value.payload !== undefined
+          ? value.payload
+          : value;
+      if (payload?.method === "plan/changed" && payload.params?.planId === expectedPlanId)
+        return payload;
+    }
+    return null;
+  }, recoveryPlan.plan.planId);
+  const recoveryProviderAttemptsBeforeKill = providerFixture.attempts.filter(
+    (attempt) =>
+      attempt.scenarioId === providerFixture.scenarios.planGoal.id && attempt.kind === "turn",
+  ).length;
+  await forceKillIsolatedAppServer(nativeScope, directories, deadline, signal, [
+    nativeSidecar.fileName,
+  ]);
+  await restartRuntimeAfterGoalCrash(page, deadline, signal);
+  await waitForInitialThread(page, deadline, signal);
+  const restartPlan = await waitForCondition(
+    "Interaction Plan recovery SQLite UNKNOWN",
+    async () => {
+      const value = planExecutionLedgerFact(directories, recoveryPlan.plan.planId, recoveryRunId);
+      const projection = await invoke("ja_runtime_plan_read", {
+        threadId,
+        planId: recoveryPlan.plan.planId,
+      });
+      const unknown = value?.unknownSideEffectAttempts ?? [];
+      return projection.ok === true &&
+        unknown.length === 1 &&
+        projection.value?.plan?.activeRunId === recoveryRunId &&
+        projection.value.plan.status === "stopped"
+        ? { value, projection }
+        : false;
+    },
+    deadline,
+    signal,
+  );
+  const recoveryFactsAfterRestart = restartPlan.value;
+  const recoveryProjectionAfterRestart = restartPlan.projection.value;
+  const successfulToolIdsAfterRecovery = planExecutionLedgerFact(
+    directories,
+    plan.plan.planId,
+    runId,
+  ).successfulToolAttempts.map((value) => value.call_id);
+  const recoveryProviderAttemptsAfterRestart = providerFixture.attempts.filter(
+    (attempt) =>
+      attempt.scenarioId === providerFixture.scenarios.planGoal.id && attempt.kind === "turn",
+  ).length;
+  const restartRestoredSnapshot =
+    recoveryProjectionAfterRestart.plan.planId === recoveryPlan.plan.planId &&
+    recoveryProjectionAfterRestart.plan.activeRunId === recoveryRunId;
+  const unknownSideEffectPaused =
+    recoveryProjectionAfterRestart.plan.status === "stopped" &&
+    recoveryFactsAfterRestart.unknownSideEffectAttempts.length === 1;
+  const unknownSideEffectNotReplayed =
+    recoveryFactsAfterRestart.toolAttempts.length === 1 &&
+    recoveryProviderAttemptsAfterRestart === recoveryProviderAttemptsBeforeKill;
+  const successfulToolNotReplayed =
+    JSON.stringify(successfulToolIdsAfterRecovery) ===
+    JSON.stringify(successfulToolIdsBeforeRecovery);
+  const lateEventInjection =
+    latePlanEvent === null
+      ? { emitted: false, reason: "missing_captured_event" }
+      : await page.evaluate(async (payload) => {
+          try {
+            await globalThis.__TAURI_INTERNALS__?.invoke?.("plugin:event|emit", {
+              event: "ja://rpc/frame",
+              payload,
+            });
+            return { emitted: true };
+          } catch {
+            return { emitted: false, reason: "emit_failed" };
+          }
+        }, latePlanEvent);
+  await waitForDelay(250, signal);
+  const afterLateEvent = await invoke("ja_runtime_plan_read", {
+    threadId,
+    planId: recoveryPlan.plan.planId,
+  });
+  const lateEventIgnored =
+    lateEventInjection.emitted === true &&
+    afterLateEvent.ok === true &&
+    afterLateEvent.value?.plan?.activeRunId === recoveryRunId &&
+    afterLateEvent.value?.plan?.status === "stopped" &&
+    recoveryProjectionAfterRestart.plan.activeRunId === recoveryRunId &&
+    recoveryProjectionAfterRestart.plan.status === "stopped" &&
+    recoveryFactsAfterRestart.toolAttempts.every(
+      (value) => value.call_id === startedRecovery.attempt.call_id,
+    );
+  const resumeExplicitlyRequired =
+    beforeResume.ok === true &&
+    beforeResume.value?.plan?.status === "paused" &&
+    pauseResult.ok === true &&
+    pauseResult.value?.plan?.status === "paused" &&
+    resumeResult.ok === true &&
+    resumeResult.value?.plan?.activeRunId === runId;
+  recoveryEvidenceValue = {
+    restartRestoredSnapshot,
+    unknownSideEffectPaused,
+    unknownSideEffectNotReplayed,
+    successfulToolNotReplayed,
+    lateEventIgnored,
+    resumeExplicitlyRequired,
+    lateEventInjection: { emitted: lateEventInjection.emitted === true },
+    status: recoveryProjectionAfterRestart.plan.status,
+  };
+  stage("isolation");
+  // UNKNOWN 已取证；显式取消其保留的挂起 Turn 才能接纳新任务，不能以新输入绕过恢复屏障。
+  await cancelRecoveredSuspendedTurns(page, threadId, deadline, signal);
+  const threadB = await createConversationThread(page, deadline, signal);
+  const otherSnapshot = await invoke("ja_runtime_interaction_read", { threadId: threadB });
+  let authorityB = await readPlanGoalThreadAuthority(page, threadB);
+  // B 的查询只用于确定身份，切回 A 后再验证隐藏 B 的创建事件不会触发正文加载。
+  await selectThreadById(page, threadId, deadline, signal);
+  await waitForComposerAdmission(page, deadline);
+  // Review snapshot 的协议输入只有 workspace；把已完成的可见 Thread A 选择写入 probe，
+  // 让无 thread 参数的调用仍能区分 A 的迟到水合与 B 的后续资源读取。
+  await page.evaluate((visibleThreadId) => {
+    globalThis.__JA_E2E_LAST_THREAD_OWNER__ = visibleThreadId;
+  }, threadId);
+  const hiddenPlanInvokeCommands = [
+    "ja_runtime_plan_read",
+    "ja_runtime_plan_observe",
+    "ja_runtime_plan_revisions_list",
+    "ja_runtime_plan_evidence_list",
+    "ja_thread_read",
+    "ja_review_snapshot",
+  ];
+  const hiddenPlanInvokeTraceBaseline = Object.fromEntries(
+    await Promise.all(
+      hiddenPlanInvokeCommands.map(async (command) => [
+        command,
+        (await tauriInvokeTrace(page, command)).length,
+      ]),
+    ),
+  );
+  const hiddenPlanInvokeBaseline = Object.fromEntries(
+    await Promise.all(
+      hiddenPlanInvokeCommands.map(async (command) => [
+        command,
+        await tauriInvokeCount(page, command),
+      ]),
+    ),
+  );
+  const explicitAuthorityReadTraceKeys = new Set();
+  // 让 Goal-only continuation 进入可识别的确定性场景，但先停在 context gate；这样后台
+  // Provider 不会因未知 objective 返回 422/500，也不会在用户 pause 前伪造一个失败状态。
+  providerFixture.resetPlanGoalContext("normal");
+  const isolationCriterionId = providerFixture.scenarios.planGoal.goalOnlyCriterionId;
+  const goalB = await invoke("ja_runtime_goal_create", {
+    owner: { kind: "thread", threadId: threadB },
+    objective: providerFixture.scenarios.planGoal.goalOnlyObjective,
+    acceptanceCriteria: [
+      {
+        criterionId: isolationCriterionId,
+        description: providerFixture.scenarios.planGoal.goalOnlyCriterion,
+        required: true,
+      },
+    ],
+    expectedGoalRevision: 0,
+    idempotencyKey: `interaction-isolation-goal-${Date.now().toString(36)}`,
+  });
+  const goalInitial = goalB.value?.goal;
+  if (
+    goalB.ok !== true ||
+    typeof goalInitial?.goalId !== "string" ||
+    goalInitial.owner?.kind !== "thread" ||
+    goalInitial.owner.threadId !== threadB ||
+    goalInitial.status !== "active" ||
+    goalInitial.planLink !== null
+  ) {
+    throw new Error(
+      `隔离 Goal 创建未返回独立 owner 或初始状态：${JSON.stringify({ ok: goalB.ok, code: goalB.code })}`,
+    );
+  }
+  // Goal 创建会推进 owner Thread revision；每次尝试都重新读取权威 CAS，且只对异步可收敛的
+  // GOAL_REVISION_CONFLICT 重试。显式读取 trace 以稳定 index 标记，避免把测试前置条件误报为 UI 预读。
+  const planBCreateKey = `interaction-isolation-plan-${Date.now().toString(36)}`;
+  let planB;
+  let explicitAuthorityReadCount = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const authorityReadTraceBefore = await tauriInvokeTrace(page, "ja_thread_read");
+    await page.evaluate(() => {
+      globalThis.__JA_E2E_EXPLICIT_AUTHORITY_READ__ = true;
+    });
+    try {
+      authorityB = await readPlanGoalThreadAuthority(page, threadB);
+    } finally {
+      await page.evaluate(() => {
+        globalThis.__JA_E2E_EXPLICIT_AUTHORITY_READ__ = false;
+      });
+    }
+    explicitAuthorityReadCount += 1;
+    const authorityReadTraceAfter = await tauriInvokeTrace(page, "ja_thread_read");
+    for (const entry of authorityReadTraceAfter.slice(authorityReadTraceBefore.length)) {
+      if (entry.phase === "start" && entry.explicitAuthorityRead === true)
+        explicitAuthorityReadTraceKeys.add(`ja_thread_read:${entry.index}`);
+    }
+    planB = await invoke("ja_runtime_plan_create", {
+      owner: { kind: "thread", threadId: threadB },
+      objective: "Interaction isolation plan",
+      expectedThreadRevision: authorityB.revision,
+      idempotencyKey: planBCreateKey,
+    });
+    if (planB.ok === true || planB.code !== "GOAL_REVISION_CONFLICT") break;
+  }
+  if (
+    planB?.ok !== true ||
+    typeof planB.value?.plan?.planId !== "string" ||
+    planB.value.plan.owner?.kind !== "thread" ||
+    planB.value.plan.owner.threadId !== threadB ||
+    Object.prototype.hasOwnProperty.call(planB.value, "goal")
+  ) {
+    throw new Error(
+      `隔离 Plan 创建未以最新 Thread revision 收敛：${JSON.stringify({ ok: planB?.ok, code: planB?.code })}`,
+    );
+  }
+  await waitForDelay(300, signal);
+  const hiddenPlanInvokeRawDelta = Object.fromEntries(
+    await Promise.all(
+      hiddenPlanInvokeCommands.map(async (command) => [
+        command,
+        (await tauriInvokeCount(page, command)) - hiddenPlanInvokeBaseline[command],
+      ]),
+    ),
+  );
+  const hiddenPlanInvokeDelta = Object.fromEntries(
+    Object.entries(hiddenPlanInvokeRawDelta).map(([command, count]) => [
+      command,
+      count - (command === "ja_thread_read" ? explicitAuthorityReadCount : 0),
+    ]),
+  );
+  const hiddenPlanInvokeOwnerLabels = ["threadA", "threadB", "planB", "other", "unowned"];
+  const planBId =
+    typeof planB?.value?.plan?.planId === "string" ? planB.value.plan.planId : undefined;
+  const hiddenPlanInvokeDeltaByOwner = Object.fromEntries(
+    hiddenPlanInvokeOwnerLabels.map((owner) => [
+      owner,
+      Object.fromEntries(hiddenPlanInvokeCommands.map((command) => [command, 0])),
+    ]),
+  );
+  for (const command of hiddenPlanInvokeCommands) {
+    const trace = await tauriInvokeTrace(page, command);
+    const baselineLength = hiddenPlanInvokeTraceBaseline[command] ?? 0;
+    let observedOwnerEventCount = 0;
+    for (const entry of trace.slice(baselineLength)) {
+      if (entry.phase !== "start") continue;
+      if (explicitAuthorityReadTraceKeys.has(`${command}:${entry.index}`)) continue;
+      const owner =
+        planBId !== undefined && entry.planId === planBId
+          ? "planB"
+          : entry.threadId === threadB
+            ? "threadB"
+            : entry.threadId === threadId
+              ? "threadA"
+              : entry.threadId === undefined
+                ? "unowned"
+                : "other";
+      hiddenPlanInvokeDeltaByOwner[owner][command] += 1;
+      observedOwnerEventCount += 1;
+    }
+    const expectedOwnerEventCount = Math.max(0, hiddenPlanInvokeDelta[command] ?? 0);
+    if (observedOwnerEventCount < expectedOwnerEventCount)
+      hiddenPlanInvokeDeltaByOwner.unowned[command] +=
+        expectedOwnerEventCount - observedOwnerEventCount;
+  }
+  const hiddenPlanOwnerDeltaClear = ["threadB", "planB", "other", "unowned"].every((owner) =>
+    Object.values(hiddenPlanInvokeDeltaByOwner[owner]).every((count) => count === 0),
+  );
+  const threadASnapshot = await interactionRead();
+  isolationEvidenceValue = {
+    goalWithoutPlan: goalInitial.planLink === null,
+    planWithoutGoal:
+      planB.value.plan.owner.threadId === threadB &&
+      !Object.prototype.hasOwnProperty.call(planB.value, "goal"),
+    threadAQuestionNotVisibleInThreadB:
+      otherSnapshot.ok === true && otherSnapshot.value?.request === null,
+    threadBQuestionNotVisibleInThreadA:
+      threadASnapshot.ok === true &&
+      (threadASnapshot.value?.request === null ||
+        threadASnapshot.value?.request?.threadId === threadId),
+    hiddenThreadDidNotMaterializePlan: planB.ok === true && hiddenPlanOwnerDeltaClear,
+    hiddenPlanInvokeDelta,
+    hiddenPlanInvokeDeltaByOwner,
+  };
+  /**
+   * Goal 控制动作必须从最新 SQLite 投影获取 CAS；只重试明确的 revision 冲突，且要求 pause
+   * 的调用本身返回成功，不能把 Provider 错误造成的 paused 状态误判为用户 pause 成功。
+   */
+  const controlGoalWithFreshRevision = async (command, goalId, expectedStatus, action) => {
+    const idempotencyKey = `interaction-isolation-goal-${action}-${Date.now().toString(36)}`;
+    let lastResult;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await invoke("ja_runtime_goal_read", { goalId });
+      if (
+        current.ok !== true ||
+        current.value?.goal?.goalId !== goalId ||
+        current.value?.goal?.owner?.kind !== "thread" ||
+        current.value?.goal?.owner?.threadId !== threadB
+      ) {
+        throw new Error(
+          `隔离 Goal ${action} 前权威快照不可用：${JSON.stringify({ ok: current.ok, code: current.code })}`,
+        );
+      }
+      const latestGoal = current.value.goal;
+      if (latestGoal.status !== expectedStatus) {
+        throw new Error(
+          `隔离 Goal ${action} 前状态不是 ${expectedStatus}：${JSON.stringify({ status: latestGoal.status, phase: latestGoal.phase })}`,
+        );
+      }
+      lastResult = await invoke(command, {
+        goalId,
+        expectedGoalRevision: latestGoal.revision,
+        idempotencyKey,
+      });
+      if (lastResult.ok === true) return lastResult;
+      if (lastResult.code !== "GOAL_REVISION_CONFLICT") break;
+    }
+    throw new Error(
+      `隔离 Goal ${action} 未在有界 CAS 内收敛：${JSON.stringify({ ok: lastResult?.ok, code: lastResult?.code })}`,
+    );
+  };
+  const goalPaused = await controlGoalWithFreshRevision(
+    "ja_runtime_goal_pause",
+    goalInitial.goalId,
+    "active",
+    "pause",
+  );
+  if (
+    goalPaused.ok !== true ||
+    goalPaused.value?.goal?.goalId !== goalInitial.goalId ||
+    goalPaused.value?.goal?.owner?.kind !== "thread" ||
+    goalPaused.value?.goal?.owner?.threadId !== threadB ||
+    goalPaused.value?.goal?.status !== "paused" ||
+    goalPaused.value?.goal?.planLink !== null
+  ) {
+    throw new Error(
+      `隔离 Goal pause 未收敛到 paused：${JSON.stringify({ ok: goalPaused.ok, code: goalPaused.code })}`,
+    );
+  }
+  const goalResumed = await controlGoalWithFreshRevision(
+    "ja_runtime_goal_resume",
+    goalPaused.value.goal.goalId,
+    "paused",
+    "resume",
+  );
+  if (
+    goalResumed.ok !== true ||
+    goalResumed.value?.goal?.goalId !== goalInitial.goalId ||
+    goalResumed.value?.goal?.owner?.kind !== "thread" ||
+    goalResumed.value?.goal?.owner?.threadId !== threadB ||
+    goalResumed.value?.goal?.status !== "active" ||
+    goalResumed.value?.goal?.planLink !== null
+  ) {
+    throw new Error(
+      `隔离 Goal resume 未收敛到 active：${JSON.stringify({ ok: goalResumed.ok, code: goalResumed.code })}`,
+    );
+  }
+  // Resume 后才释放该 Goal 的 continuation；context 使用刚刚返回的 run/revision，避免旧
+  // identity 触发再次 CAS 冲突。Goal-only 仍显式保留 null planRevisionId。
+  providerFixture.setPlanGoalContext({
+    kind: "goal",
+    goalId: goalResumed.value.goal.goalId,
+    goalRevision: goalResumed.value.goal.revision,
+    goalDefinitionRevision: goalResumed.value.goal.goalDefinitionRevision,
+    runId: goalResumed.value.goal.currentRunId,
+    planRevisionId: null,
+    stepId: providerFixture.scenarios.planGoal.goalOnlyStepId,
+    criterionId: isolationCriterionId,
+    projection: { latestEvaluation: goalResumed.value.goal.latestEvaluation },
+  });
+  const goalStatuses = [
+    goalInitial?.status,
+    goalPaused.value?.goal?.status,
+    goalResumed.value?.goal?.status,
+  ];
+  await selectThreadById(page, threadB, deadline, signal);
+  await waitForComposerAdmission(page, deadline);
+  const goalOnlyCompletion = await runGoalOnlyCompletion({
+    page,
+    invoke,
+    threadId: threadB,
+    goal: goalResumed.value,
+    providerFixture,
+    deadline: Math.min(deadline, Date.now() + 300_000),
+    signal,
+    directories,
+    approvalHelper: approvePendingPlanGoalTool,
+    criterionId: isolationCriterionId,
+    stepId: providerFixture.scenarios.planGoal.goalOnlyStepId,
+  });
+  await selectThreadById(page, threadId, deadline, signal);
+  await waitForComposerAdmission(page, deadline);
+  goalRegressionEvidenceValue = {
+    statuses: goalStatuses,
+    planLinkUnchanged: goalInitial?.planLink === null && goalResumed.value?.goal?.planLink === null,
+    completionProof: goalOnlyCompletion.completionProof,
+  };
+  // 视觉矩阵必须与一个真实、已定稿且未执行的 Plan 共存；否则 Plan mode 的下一次
+  // 结构化提问会按产品规则创建 DRAFT，前端在 revision 尚未 hydration 时不会渲染计划块。
+  // 这里先完成 create -> draft/save -> propose，并在重载后再发起问题，确保验收看到的是
+  // 服务端确认过的不可变 revision，而不是前端或 fixture 注入的计划状态。
+  stage("visual_plan");
+  const visualPlanDefinition = {
+    objective: "Interaction Plan 真窗视觉矩阵",
+    scope: ["真实 WebView2 中的结构化问题与计划摘要"],
+    nonGoals: ["不执行视觉验收计划中的项目写入"],
+    constraints: ["仅使用隔离 App Server 与 loopback Provider"],
+    acceptanceCriteria: [
+      {
+        criterionId: "criterion_visual_matrix",
+        description: "问题卡和已定稿 Plan 在全部主题、缩放与窄窗口中保持可读",
+        required: true,
+      },
+    ],
+    steps: [
+      {
+        stepId: "step_visual_matrix",
+        title: "采集视觉矩阵",
+        description: "在真实窗口中检查问题、计划和 Composer 的布局边界",
+        required: true,
+        dependsOn: [],
+      },
+    ],
+    dependencies: [],
+    risks: ["系统缩放或辅助设置可能改变可用视口"],
+    verificationStrategy: ["WebView2 DOM 几何、可访问性和截图证据"],
+  };
+  const visualPlanCreateKey = `interaction-plan-visual-create-${Date.now().toString(36)}`;
+  let visualPlanResult;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const visualPlanAuthority = await readPlanGoalThreadAuthority(page, threadId);
+    visualPlanResult = await invoke("ja_runtime_plan_create", {
+      owner: { kind: "thread", threadId },
+      objective: visualPlanDefinition.objective,
+      expectedThreadRevision: visualPlanAuthority.revision,
+      idempotencyKey: visualPlanCreateKey,
+    });
+    if (visualPlanResult.ok || visualPlanResult.code !== "GOAL_REVISION_CONFLICT") break;
+  }
+  if (visualPlanResult?.ok !== true) {
+    throw new Error(`视觉矩阵 Plan 创建失败：${visualPlanResult?.code ?? "UNKNOWN"}`);
+  }
+  let visualPlan = visualPlanResult.value;
+  const visualPlanDraft = await invoke("ja_runtime_plan_draft_save", {
+    threadId,
+    planId: visualPlan.plan.planId,
+    expectedPlanRevision: visualPlan.plan.revision,
+    idempotencyKey: `interaction-plan-visual-draft-${Date.now().toString(36)}`,
+    draft: visualPlanDefinition,
+  });
+  if (visualPlanDraft.ok !== true)
+    throw new Error(`视觉矩阵 Plan 草稿失败：${visualPlanDraft.code}`);
+  visualPlan = visualPlanDraft.value;
+  const visualPlanProposed = await invoke("ja_runtime_plan_propose", {
+    threadId,
+    planId: visualPlan.plan.planId,
+    expectedPlanRevision: visualPlan.plan.revision,
+    idempotencyKey: `interaction-plan-visual-propose-${Date.now().toString(36)}`,
+  });
+  if (visualPlanProposed.ok !== true || visualPlanProposed.value?.currentRevision === null) {
+    throw new Error(`视觉矩阵 Plan 定稿失败：${visualPlanProposed.code ?? "UNKNOWN"}`);
+  }
+  visualPlan = visualPlanProposed.value;
+  plan = visualPlan;
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout() });
+  await waitForRuntimeReady(page, deadline, signal);
+  await selectThreadById(page, threadId, deadline, signal);
+  await installRawTauriEventProbe(page);
+  await installTauriInvokeProbe(page);
+  // 长历史会让计划位于 TanStack Virtual 的尾部；先操作真实 conversation scrollport，
+  // 再等待 React 根据 scroll 事件物化尾部行，避免把顶部 viewport 的缺卡误判为计划丢失。
+  const timelineScroll = page.locator(".ja-chat-timeline__scroll").first();
+  await timelineScroll.waitFor({ state: "visible", timeout: timeout() });
+  const timelineScrollEvidence = await timelineScroll.evaluate((scrollport) => {
+    const maximum = Math.max(0, scrollport.scrollHeight - scrollport.clientHeight);
+    const before = scrollport.scrollTop;
+    scrollport.scrollTo({ top: maximum, behavior: "auto" });
+    return {
+      before,
+      requested: maximum,
+      after: scrollport.scrollTop,
+      clientHeight: scrollport.clientHeight,
+      scrollHeight: scrollport.scrollHeight,
+    };
+  });
+  const visualPlanCard = page.locator(
+    `.ja-plan-timeline[data-plan-id="${visualPlan.plan.planId}"]`,
+  );
+  try {
+    await visualPlanCard.waitFor({ state: "visible", timeout: timeout() });
+  } catch (error) {
+    // 等待失败时只收集稳定 ID、计数和几何水位；权威 Plan 读模型是判定链路是否一致的依据，
+    // DOM 只用于诊断虚拟化当前 materialize 的行，不能反向驱动或伪造计划状态。
+    const [currentPlanRead, planRead, timelineDiagnostic] = await Promise.all([
+      invoke("ja_runtime_plan_current_read", { threadId }),
+      invoke("ja_runtime_plan_read", { threadId, planId: visualPlan.plan.planId }),
+      page.evaluate((expectedPlanId) => {
+        const scrollport = globalThis.document.querySelector(".ja-chat-timeline__scroll");
+        const cards = [...globalThis.document.querySelectorAll(".ja-plan-timeline")];
+        const matchingCards = cards.filter(
+          (card) => card.getAttribute("data-plan-id") === expectedPlanId,
+        );
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = globalThis.getComputedStyle(element);
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden"
+          );
+        };
+        return {
+          scrollport:
+            scrollport instanceof globalThis.HTMLElement
+              ? {
+                  scrollTop: scrollport.scrollTop,
+                  clientHeight: scrollport.clientHeight,
+                  scrollHeight: scrollport.scrollHeight,
+                }
+              : null,
+          planCardCount: cards.length,
+          matchingPlanCardCount: matchingCards.length,
+          visiblePlanCardCount: cards.filter(visible).length,
+          materializedRows: [...globalThis.document.querySelectorAll(".ja-chat-timeline__row")].map(
+            (row) => ({
+              index: row.getAttribute("data-index"),
+              externalRowId: row.getAttribute("data-external-row-id"),
+            }),
+          ),
+        };
+      }, visualPlan.plan.planId),
+    ]);
+    throw new Error(
+      `视觉矩阵 Plan 卡片未物化：${JSON.stringify({
+        planId: visualPlan.plan.planId,
+        timelineScrollEvidence,
+        currentPlanRead,
+        planRead,
+        timelineDiagnostic,
+      })}`,
+      { cause: error },
+    );
+  }
+
+  // 长稳保留一个真实等待请求；它属于隔离 Thread，测试期间不自动采用默认答案。
+  await requestInteractionBatch(scenario.prompt, null);
+  // 长稳前先验真窗矩阵，布局不合格不消耗两小时等待；报告复用这一轮真实截图和几何证据。
+  const visualFrames = await driver.visualEvidence();
+  await page.evaluate(() =>
+    globalThis.__TAURI_INTERNALS__.invoke("plugin:webview|set_webview_zoom", {
+      label: "main",
+      value: 1,
+    }),
+  );
+  await resizeOwnedNativeViewport(
+    page,
+    await resolveOwnedJaWindow(nativeScope, signal),
+    { width: 1280, height: 820 },
+    deadline,
+    signal,
+  );
+  // 所有核心阶段必须在进入长稳前已经产生可验证事实；只要任一阶段缺失或出现 false，
+  // 立即停止，不允许用两小时健康轮询掩盖前置闭环未完成。
+  const preSoakBooleanRequirements = [
+    [
+      "interaction",
+      interactionEvidenceValue,
+      [
+        "singleChoice",
+        "multiChoice",
+        "customAnswer",
+        "explicitSkip",
+        "collapsePreservedDraft",
+        "restartRestoredPendingRequest",
+        "duplicateResponseIdempotent",
+        "staleResponseRejected",
+        "cancelDoesNotResumeTurn",
+        "raceSingleWinner",
+        "imeCompositionSafe",
+        "keyboardComplete",
+        "feedbackMeasuredInBrowser",
+      ],
+    ],
+    [
+      "readonly",
+      readonlyEvidenceValue,
+      [
+        "shellRejected",
+        "workspaceWriteRejected",
+        "externalWriteRejected",
+        "subagentWriteRejected",
+        "readOnlyToolsOnly",
+        "executionBoundaryRequired",
+      ],
+    ],
+    [
+      "execution",
+      executionEvidenceValue,
+      [
+        "atomicExecute",
+        "executionAuthorizationRecorded",
+        "singleRunCreated",
+        "continuationKeptBudget",
+        "pauseSettledBeforeVisible",
+        "resumeUsedSameRun",
+        "stopPreservedHistory",
+        "versionConflictDidNotExecuteLatest",
+        "goalNotImplicitlyCreated",
+      ],
+    ],
+    [
+      "recovery",
+      recoveryEvidenceValue,
+      [
+        "restartRestoredSnapshot",
+        "unknownSideEffectPaused",
+        "unknownSideEffectNotReplayed",
+        "successfulToolNotReplayed",
+        "lateEventIgnored",
+        "resumeExplicitlyRequired",
+      ],
+    ],
+    [
+      "isolation",
+      isolationEvidenceValue,
+      [
+        "goalWithoutPlan",
+        "planWithoutGoal",
+        "threadAQuestionNotVisibleInThreadB",
+        "threadBQuestionNotVisibleInThreadA",
+        "hiddenThreadDidNotMaterializePlan",
+      ],
+    ],
+  ];
+  const preSoakFailures = [];
+  for (const [stageName, evidence, fields] of preSoakBooleanRequirements) {
+    for (const field of fields)
+      if (evidence?.[field] !== true) preSoakFailures.push(`${stageName}.${field}`);
+  }
+  const preSoakCompletionProof = executionEvidenceValue?.completionProof;
+  for (const [field, expected] of [
+    ["completionGateVerified", true],
+    ["completionEventCount", 1],
+  ])
+    if (preSoakCompletionProof?.[field] !== expected)
+      preSoakFailures.push(`execution.completionProof.${field}`);
+  for (const [field, predicate] of [
+    ["turnCount", (value) => Number.isInteger(value) && value >= 2],
+    ["notMetEvaluationCount", (value) => Number.isInteger(value) && value >= 1],
+    ["metEvaluationCount", (value) => Number.isInteger(value) && value >= 1],
+  ])
+    if (!predicate(preSoakCompletionProof?.[field]))
+      preSoakFailures.push(`execution.completionProof.${field}`);
+  if (
+    interactionEvidenceValue?.feedbackEventType !== "change" ||
+    !Number.isFinite(interactionEvidenceValue?.feedbackLatencyMs) ||
+    interactionEvidenceValue.feedbackLatencyMs < 0 ||
+    interactionEvidenceValue.feedbackLatencyMs >= 100 ||
+    interactionEvidenceValue.feedbackReadback?.checked !== true ||
+    interactionEvidenceValue.feedbackReadback?.optionId !== "option_ui"
+  ) {
+    preSoakFailures.push("interaction.browserFeedback");
+  }
+  if (
+    JSON.stringify(goalRegressionEvidenceValue?.statuses) !==
+    JSON.stringify(["active", "paused", "active"])
+  ) {
+    preSoakFailures.push("goalRegression.statuses");
+  }
+  if (goalRegressionEvidenceValue?.planLinkUnchanged !== true)
+    preSoakFailures.push("goalRegression.planLinkUnchanged");
+  if (goalRegressionEvidenceValue?.completionProof?.completionGateVerified !== true) {
+    preSoakFailures.push("goalRegression.completionProof");
+  }
+  if (preSoakFailures.length > 0)
+    throw new Error(`进入 soak 前证据不完整：${preSoakFailures.join(", ")}`);
+  stage("soak");
+  const soakStartedAt = Date.now();
+  let soakHealthChecks = 0;
+  let soakHealthy = true;
+  let soakRecoveryExercised = false;
+  const soakCheck = async () => {
+    const snapshot = await invoke("ja_runtime_plan_read", { threadId, planId: plan.plan.planId });
+    soakHealthChecks += 1;
+    if (snapshot.ok !== true || snapshot.value?.plan?.planId !== plan.plan.planId)
+      soakHealthy = false;
+  };
+  await soakCheck();
+  while (Date.now() - soakStartedAt < configuredInteractionPlanSoakMinutes * 60_000) {
+    await waitForDelay(
+      Math.min(
+        30_000,
+        Math.max(1, configuredInteractionPlanSoakMinutes * 60_000 - (Date.now() - soakStartedAt)),
+      ),
+      signal,
+    );
+    await soakCheck();
+    if (
+      !soakRecoveryExercised &&
+      Date.now() - soakStartedAt >= configuredInteractionPlanSoakMinutes * 30_000
+    ) {
+      const waiting = await interactionRead();
+      if (!waiting.ok || waiting.value?.request?.status !== "pending")
+        throw new Error("长稳等待请求丢失");
+      const answered = await invoke("ja_runtime_interaction_respond", {
+        threadId,
+        requestId: waiting.value.request.requestId,
+        expectedRevision: waiting.value.request.revision,
+        idempotencyKey: `soak-response-${waiting.value.request.requestId}`,
+        answers: raceAnswers,
+      });
+      if (!answered.ok) throw new Error("长稳回答提交失败");
+      await waitForComposerAdmission(page, deadline);
+      await requestInteractionBatch(scenario.prompt, waiting.value.request.requestId);
+      if (!(await restartApplication())) throw new Error("长稳实际进程恢复失败");
+      soakRecoveryExercised = true;
+    }
+  }
+  soakEvidenceValue = {
+    requestedMinutes: configuredInteractionPlanSoakMinutes,
+    elapsedMs: Date.now() - soakStartedAt,
+    healthChecks: soakHealthChecks,
+    healthy: soakHealthy,
+    recoveryExercised: soakRecoveryExercised,
+  };
+  await applyVisualPreferences(page, deadline, { captureSettingsEvidence: false });
+  const report = await collectInteractionPlanAcceptanceReport(
+    { ...driver, visualEvidence: async () => visualFrames },
+    {
+      expectedSoakMinutes: configuredInteractionPlanSoakMinutes,
+    },
+  );
+  await writeFile(interactionPlanReportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   return report;
 }
 
@@ -25177,7 +27645,7 @@ function assertWorkspaceSwitchPerformanceContract() {
     !rendererSource.includes('status: "unavailable"') ||
     !probeSource.includes('"ja_review_catalog", "ja_review_snapshot"') ||
     !probeSource.includes('"ja_workspace_tree"') ||
-    !probeSource.includes('append({ command, phase: "start" })') ||
+    !probeSource.includes('append({ command, phase: "start", ...ownerIdentity })') ||
     !processSource.includes("WorkingSetSize,PrivatePageCount") ||
     !cleanupSource.includes('cleanupMode = "tray_exit"') ||
     !cleanupSource.includes('reason: "workspace_switch_performance_owned_tree_cleanup"') ||
@@ -25432,7 +27900,8 @@ function assertThemeMatrixContract() {
   const ownedTreeFocusedModeUses =
     mainSource.match(/themeMatrixAcceptanceMode \|\|/gu)?.length ?? 0;
   if (
-    themeMatrixPalettes.map(({ value }) => value).join(",") !== "xcode,fleet,obsidian,claude" ||
+    themeMatrixPalettes.map(({ value }) => value).join(",") !==
+      "ja,jetbrains,xcode,obsidian,claude" ||
     themeMatrixModes.map(({ value }) => value).join(",") !== "light,dark" ||
     themeMatrixViewports.map(({ width, height }) => `${width}x${height}`).join(",") !==
       "1440x900,1280x820,980x720,720x640" ||
@@ -25452,11 +27921,11 @@ function assertThemeMatrixContract() {
     !mainSource.includes("themeMatrixAcceptanceMode") ||
     !mainSource.includes("Theme Matrix 验收必须使用 fake Provider") ||
     !mainSource.includes("runThemeMatrixAcceptanceSession") ||
-    !mainSource.includes("themeMatrix.frameCount !== 64") ||
+    !mainSource.includes("themeMatrix.frameCount !== 80") ||
     !mainSource.includes('cleanupMode: "owned_tree"') ||
     ownedTreeFocusedModeUses !== 3
   ) {
-    throw new Error("四主题 Theme Matrix 聚焦模式接线漂移");
+    throw new Error("五主题 Theme Matrix 聚焦模式接线漂移");
   }
 }
 
@@ -25591,6 +28060,7 @@ function assertTaskThreadsContract() {
 function assertPlanGoalContract() {
   const mainSource = String(main);
   const sessionSource = String(runIndependentPlanGoalAcceptanceSession);
+  const interactionSessionSource = String(runIndependentInteractionPlanAcceptanceSession);
   const driverSource = String(createPlanGoalWebView2Driver);
   const configSource = String(writeE2eTauriConfig);
   const envSource = String(buildTauriEnv);
@@ -25616,14 +28086,22 @@ function assertPlanGoalContract() {
       driverSource.includes("commands.planExecute") &&
       driverSource.includes("commands.attach") &&
       driverSource.includes("commands.detach"),
-    approvalBeforeExecution:
-      driverSource.includes("approvedRunId") &&
-      driverSource.includes("planApprovalDidNotExecute") &&
-      driverSource.includes("standalonePlanCompleted"),
+    atomicExecution:
+      driverSource.includes("commands.planExecute") &&
+      driverSource.includes("planProposalDidNotExecute") &&
+      driverSource.includes("standalonePlanCompleted") &&
+      sessionSource.includes("collectPlanGoalAcceptanceReport"),
     authority:
-      driverSource.includes("stalePlanApproval") &&
-      driverSource.includes("staleGoalRevision") &&
+      driverSource.includes("stalePlan") &&
+      driverSource.includes("staleGoal") &&
       driverSource.includes('goal.goal.phase, "working"'),
+    goalOnlyCompletion:
+      interactionSessionSource.includes("runGoalOnlyCompletion") &&
+      interactionSessionSource.includes("goalRegressionEvidenceValue") &&
+      interactionSessionSource.includes("completionProof") &&
+      providerSource.includes("hasGoalOnlyEvaluationEvidence") &&
+      providerSource.includes("goalOnlyCommand") &&
+      providerSource.includes('planGoalContextMode === "goal-only"'),
     detailIoGate:
       sessionSource.includes("invokeCount") &&
       driverSource.includes("hiddenPlanDetailIoDelta") &&
@@ -25634,9 +28112,9 @@ function assertPlanGoalContract() {
       mainSource.includes("[planGoalSidecar.fileName]") &&
       sessionSource.includes("nativeSidecar") &&
       configSource.includes("planGoalSidecarExecutable") &&
-      envSource
-        .replace(/\s+/gu, " ")
-        .includes("planGoalAcceptanceMode || turnChangeReviewAcceptanceMode") &&
+      envSource.includes("planGoalAcceptanceMode") &&
+      envSource.includes("interactionPlanAcceptanceMode") &&
+      envSource.includes("turnChangeReviewAcceptanceMode") &&
       nativeValidationSource.includes("hashNativeSidecar") &&
       nativeValidationSource.includes("manifest?.noFallback !== true"),
     composer:
@@ -25655,8 +28133,10 @@ function assertPlanGoalContract() {
     crashRecovery:
       driverSource.includes("runCrashRecovery") &&
       recoverySource.includes('"ja_runtime_plan_create"') &&
-      recoverySource.includes('"ja_runtime_plan_approve"') &&
-      recoverySource.includes("planResult.value?.plan?.activeRunId !== null") &&
+      recoverySource.includes('"ja_runtime_plan_propose"') &&
+      interactionSessionSource.includes(
+        'typeof recoveryExecuted.value?.plan?.activeRunId !== "string"',
+      ) &&
       recoverySource.includes("attachPlanForRecovery") &&
       recoveryAttachSource.includes('"ja_runtime_goal_pause"') &&
       recoveryAttachSource.includes('"ja_runtime_goal_plan_attach"') &&
@@ -25671,7 +28151,7 @@ function assertPlanGoalContract() {
       conversationCreateSource.includes("idsBefore") &&
       conversationCreateSource.includes("selectThreadById(page, createdThreadId"),
     mockProvider:
-      providerSource.includes('new Set(["normal", "standalone", "recovery"])') &&
+      providerSource.includes('new Set(["normal", "standalone", "recovery", "goal-only"])') &&
       providerSource.includes('context?.kind === "plan"') &&
       planGoalToolSequenceSource.includes(
         'context?.kind === "goal" && context?.planRevisionId == null',
@@ -25681,6 +28161,9 @@ function assertPlanGoalContract() {
       providerSource.includes("planGoalContext.planRevisionId == null") &&
       providerSource.includes("确定性 shell Tool 已由 Goal-only Run 成功执行") &&
       providerSource.includes('trailingPlanGoalTool?.name === "goal_request_evaluation"') &&
+      providerSource.includes("readGoalToolBindingRevision") &&
+      providerSource.includes("evaluationRequest: planGoalEvaluationRequest") &&
+      providerSource.includes("payload.instructions") &&
       providerSource.includes("planGoalAggregateRevision") &&
       mainSource.includes("Plan/Goal 验收必须使用确定性 loopback Provider"),
   };
@@ -25813,7 +28296,9 @@ function assertStaticContracts() {
   assertThemeMatrixContract();
   assertComposerContextContract();
   assertTaskThreadsContract();
-  assertPlanGoalContract();
+  // Interaction/Plan 使用独立的原子执行与问答验收链；旧的 Plan/Goal 专属静态门禁会
+  // 要求已删除的 approve/attach 旧流程，不能在新模式启动前误拦截真实 WebView2 验收。
+  if (!interactionPlanAcceptanceMode) assertPlanGoalContract();
   assertTurnChangeReviewContract();
   assertRuntimeRefreshContract();
   assertGenericNativeSidecarContract();
@@ -25931,6 +28416,16 @@ async function validatePlanGoalConfiguration() {
   );
 }
 
+/** Interaction/Plan focused mode 与报告共用同一份真实 Native Image identity。 */
+async function validateInteractionPlanConfiguration() {
+  if (!interactionPlanAcceptanceMode) return undefined;
+  return validateFocusedNativeSidecar(
+    "Interaction/Plan",
+    interactionPlanSidecarManifest,
+    interactionPlanSidecarExecutable,
+  );
+}
+
 /** Turn Change Review 在固定负载预算之外复用统一 Native identity 校验。 */
 async function validateTurnChangeReviewConfiguration() {
   if (!turnChangeReviewAcceptanceMode) return undefined;
@@ -25974,6 +28469,9 @@ async function main() {
   if (planGoalAcceptanceMode && configuredRealProviderMode) {
     throw new Error("Plan/Goal 验收必须使用确定性 loopback Provider，禁止外部或付费调用");
   }
+  if (interactionPlanAcceptanceMode && configuredRealProviderMode) {
+    throw new Error("Interaction/Plan 验收必须使用确定性 loopback Provider，禁止外部或付费调用");
+  }
   if (turnChangeReviewAcceptanceMode && configuredRealProviderMode) {
     throw new Error("Turn Change Review 验收必须使用确定性 loopback Provider，禁止外部或付费调用");
   }
@@ -25985,6 +28483,7 @@ async function main() {
     !taskThreadsAcceptanceMode &&
     !runtimeRefreshAcceptanceMode &&
     !planGoalAcceptanceMode &&
+    !interactionPlanAcceptanceMode &&
     !turnChangeReviewAcceptanceMode
   ) {
     throw new Error("通用 staged Native sidecar 只允许用于 Task 或 Runtime Refresh focused 验收");
@@ -26002,6 +28501,7 @@ async function main() {
     ["composer_context", composerContextAcceptanceMode],
     ["task_threads", taskThreadsAcceptanceMode],
     ["plan_goal", planGoalAcceptanceMode],
+    ["interaction_plan", interactionPlanAcceptanceMode],
     ["turn_change_review", turnChangeReviewAcceptanceMode],
     ["runtime_refresh", runtimeRefreshAcceptanceMode],
   ].filter(([, enabled]) => enabled);
@@ -26028,6 +28528,7 @@ async function main() {
     configuredNativeSidecarDirectory,
   );
   const planGoalSidecar = await validatePlanGoalConfiguration();
+  const interactionPlanSidecar = await validateInteractionPlanConfiguration();
   const turnChangeReviewSidecar = await validateTurnChangeReviewConfiguration();
   let providerConfig = readRealProviderConfig();
   const runDeadline = createDeadline("E2E 全局期限", runDeadlineMs);
@@ -26043,6 +28544,12 @@ async function main() {
   delete process.env.JA_E2E_COMPOSER_CONTEXT_ONLY;
   delete process.env.JA_E2E_TASK_THREADS_ONLY;
   delete process.env.JA_E2E_PLAN_GOAL_ONLY;
+  delete process.env.JA_E2E_INTERACTION_PLAN_ONLY;
+  delete process.env.JA_E2E_INTERACTION_PLAN_CONTRACT_VERSION;
+  delete process.env.JA_E2E_INTERACTION_PLAN_REPORT;
+  delete process.env.JA_E2E_INTERACTION_PLAN_SOAK_MINUTES;
+  delete process.env.JA_E2E_INTERACTION_PLAN_SIDECAR_EXECUTABLE;
+  delete process.env.JA_E2E_INTERACTION_PLAN_SIDECAR_MANIFEST;
   delete process.env.JA_E2E_PLAN_GOAL_CONTRACT_VERSION;
   delete process.env.JA_E2E_PLAN_GOAL_REPORT;
   delete process.env.JA_E2E_PLAN_GOAL_SOAK_MINUTES;
@@ -26083,46 +28590,50 @@ async function main() {
           ? "theme_matrix"
           : planGoalAcceptanceMode
             ? "plan_goal"
-            : turnChangeReviewAcceptanceMode
-              ? "turn_change_review"
-              : taskThreadsAcceptanceMode
-                ? "task_threads"
-                : composerContextAcceptanceMode
-                  ? "composer_context"
-                  : sidebarThreadAcceptanceMode
-                    ? "sidebar_thread"
-                    : toolLifecycleAcceptanceMode
-                      ? "tool_lifecycle"
-                      : toolFailureAcceptanceMode
-                        ? "tool_failure"
-                        : inputQueueAcceptanceMode
-                          ? "input_queue"
-                          : projectNewConversationAcceptanceMode
-                            ? "project_new_conversation"
-                            : "full",
+            : interactionPlanAcceptanceMode
+              ? "interaction_plan"
+              : turnChangeReviewAcceptanceMode
+                ? "turn_change_review"
+                : taskThreadsAcceptanceMode
+                  ? "task_threads"
+                  : composerContextAcceptanceMode
+                    ? "composer_context"
+                    : sidebarThreadAcceptanceMode
+                      ? "sidebar_thread"
+                      : toolLifecycleAcceptanceMode
+                        ? "tool_lifecycle"
+                        : toolFailureAcceptanceMode
+                          ? "tool_failure"
+                          : inputQueueAcceptanceMode
+                            ? "input_queue"
+                            : projectNewConversationAcceptanceMode
+                              ? "project_new_conversation"
+                              : "full",
       provider: operationRecoveryAcceptanceMode
         ? "operation_recovery_loopback"
         : turnChangeReviewAcceptanceMode
           ? "turn_change_review_loopback"
           : planGoalAcceptanceMode
             ? "plan_goal_loopback"
-            : taskThreadsAcceptanceMode
-              ? "task_threads_loopback"
-              : composerContextAcceptanceMode
-                ? "composer_context_loopback"
-                : toolLifecycleAcceptanceMode
-                  ? "tool_lifecycle_loopback"
-                  : toolFailureAcceptanceMode
-                    ? "tool_failure_loopback"
-                    : inputQueueAcceptanceMode
-                      ? "input_queue_loopback"
-                      : sidebarThreadAcceptanceMode
-                        ? "sidebar_thread_loopback"
-                        : automaticTitleAcceptanceMode
-                          ? "automatic_title_loopback"
-                          : providerConfig === undefined
-                            ? "fake"
-                            : "real_loopback",
+            : interactionPlanAcceptanceMode
+              ? "interaction_plan_loopback"
+              : taskThreadsAcceptanceMode
+                ? "task_threads_loopback"
+                : composerContextAcceptanceMode
+                  ? "composer_context_loopback"
+                  : toolLifecycleAcceptanceMode
+                    ? "tool_lifecycle_loopback"
+                    : toolFailureAcceptanceMode
+                      ? "tool_failure_loopback"
+                      : inputQueueAcceptanceMode
+                        ? "input_queue_loopback"
+                        : sidebarThreadAcceptanceMode
+                          ? "sidebar_thread_loopback"
+                          : automaticTitleAcceptanceMode
+                            ? "automatic_title_loopback"
+                            : providerConfig === undefined
+                              ? "fake"
+                              : "real_loopback",
     },
     visualContract: {
       requested: visualEvidenceDirectory !== undefined,
@@ -26190,9 +28701,10 @@ async function main() {
     evidence.frontendPort = frontendPort;
     evidence.setup.ports = "ready";
     evidence.realRuntime.before = await captureRealRuntimeEvidence(baseEnv, directories);
-    if (planGoalAcceptanceMode || turnChangeReviewAcceptanceMode) {
+    if (planGoalAcceptanceMode || interactionPlanAcceptanceMode || turnChangeReviewAcceptanceMode) {
       evidence.setup.jar = "disabled_native_sidecar_only";
-      evidence.setup.nativeSidecar = planGoalSidecar ?? turnChangeReviewSidecar;
+      evidence.setup.nativeSidecar =
+        planGoalSidecar ?? interactionPlanSidecar ?? turnChangeReviewSidecar;
     } else if (configuredNativeSidecar !== undefined) {
       evidence.setup.jar = "native_only";
       evidence.setup.nativeSidecar = configuredNativeSidecar.identity;
@@ -26236,6 +28748,7 @@ async function main() {
       sidebarThreadAcceptanceMode ||
       taskThreadsAcceptanceMode ||
       planGoalAcceptanceMode ||
+      interactionPlanAcceptanceMode ||
       turnChangeReviewAcceptanceMode
     ) {
       automaticTitleFixture = await startAutomaticTitleProviderFixture(directories.workspace);
@@ -26268,6 +28781,7 @@ async function main() {
           toolLifecycleAcceptanceMode ||
           toolFailureAcceptanceMode ||
           taskThreadsAcceptanceMode ||
+          interactionPlanAcceptanceMode ||
           turnChangeReviewAcceptanceMode
             ? "full_access"
             : "approval_required",
@@ -26304,6 +28818,7 @@ async function main() {
       composerContextAcceptanceMode ||
       taskThreadsAcceptanceMode ||
       planGoalAcceptanceMode ||
+      interactionPlanAcceptanceMode ||
       turnChangeReviewAcceptanceMode ||
       runtimeRefreshAcceptanceMode
     ) {
@@ -26321,6 +28836,7 @@ async function main() {
           toolFailureAcceptanceMode ||
           sidebarThreadAcceptanceMode ||
           planGoalAcceptanceMode ||
+          interactionPlanAcceptanceMode ||
           turnChangeReviewAcceptanceMode ||
           runtimeRefreshAcceptanceMode) &&
         phase === "second"
@@ -26552,6 +29068,35 @@ async function main() {
                   await processSnapshot(runDeadline.signal),
                   directories,
                   [planGoalSidecar.fileName],
+                ),
+              };
+            } else if (interactionPlanAcceptanceMode) {
+              const interactionPlan = await raceWithSignal(
+                () =>
+                  runIndependentInteractionPlanAcceptanceSession(
+                    page,
+                    sessionDeadline,
+                    directories,
+                    automaticTitleFixture,
+                    { rootIdentity, observed, incompleteObserved },
+                    interactionPlanSidecar,
+                    runDeadline.signal,
+                    recordStage,
+                  ),
+                runDeadline.signal,
+              );
+              evidence.first = {
+                ...evidence.first,
+                interactionPlan,
+                pageUrl: redact(page.url(), directories),
+                pageTitle: redact(await page.title(), directories),
+                diagnostics,
+                launcher: launcherOutputSummary(launch, directories),
+                runtime: redact(directories.runtime, directories),
+                isolation: assertRuntimeIsolation(
+                  await processSnapshot(runDeadline.signal),
+                  directories,
+                  [interactionPlanSidecar.fileName],
                 ),
               };
             } else if (workspaceSwitchPerformanceMode) {
@@ -27286,8 +29831,8 @@ async function main() {
       const themeMatrix = evidence.first.themeMatrix;
       if (
         themeMatrix?.status !== "passed" ||
-        themeMatrix.combinations !== 8 ||
-        themeMatrix.frameCount !== 64 ||
+        themeMatrix.combinations !== 10 ||
+        themeMatrix.frameCount !== 80 ||
         themeMatrix.reducedTransparency !== true ||
         themeMatrix.workbench?.editorPreserved !== true ||
         themeMatrix.workbench?.editorSelectionPreserved !== true ||
@@ -27299,7 +29844,7 @@ async function main() {
         evidence.profilePrime.ownedTreeCleanup?.status !== "passed" ||
         evidence.first.ownedTreeCleanup?.status !== "passed"
       ) {
-        throw new Error("四主题 Theme Matrix 真窗证据不完整");
+        throw new Error("五主题 Theme Matrix 真窗证据不完整");
       }
       evidence.acceptance = { blocked: [], gated: [] };
     } else if (toolFailureAcceptanceMode) {

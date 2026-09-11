@@ -583,6 +583,15 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
                     "default_provider_id": "provider_host",
                     "default_model_id": "model_host",
                     "default_reasoning_level": "medium",
+                    "interaction": {
+                        "clarification_enabled": true
+                    },
+                    "subagents": {
+                        "enabled": true,
+                        "provider_id": null,
+                        "model_id": null,
+                        "reasoning_level": null
+                    },
                     "providers": [{
                         "provider_id": "provider_host",
                         "name": "Fixture",

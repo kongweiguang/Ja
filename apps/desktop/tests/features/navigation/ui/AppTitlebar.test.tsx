@@ -56,7 +56,7 @@ describe("AppTitlebar", () => {
     expect(invokeWindowActionMock.mock.calls).toEqual([
       ["minimize"],
       ["toggle-maximize"],
-      ["hide"],
+      ["close"],
     ]);
     for (const button of screen.getAllByRole("button")) {
       expect(button).toHaveAttribute("aria-label");
@@ -140,7 +140,7 @@ describe("AppTitlebar", () => {
   });
 
   it("locks all native controls while one window action is pending", () => {
-    render(<AppTitlebar {...titlebarProps("windows")} windowActionPending="hide" />);
+    render(<AppTitlebar {...titlebarProps("windows")} windowActionPending="close" />);
 
     expect(screen.getByRole("button", { name: "最小化" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "最大化" })).toBeDisabled();

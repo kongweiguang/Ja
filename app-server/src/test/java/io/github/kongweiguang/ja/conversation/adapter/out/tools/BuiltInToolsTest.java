@@ -41,14 +41,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BuiltInToolsTest {
     @TempDir Path temporary;
 
-    /** Shell 可用时四个内置名称固定，write/read/edit 可通过绝对路径和 .. 访问隔离外部目录。 */
+    /** Shell 可用时内置名称固定；write/read/edit 可通过绝对路径和 .. 访问隔离外部目录。 */
     @Test
     void exposesFourToolsAndAllowsPathsOutsideWorkspace() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("workspace"));
         Path outside = Files.createDirectory(temporary.resolve("outside"));
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
-        assertEquals(List.of("edit", "read", "read_attachment", "shell", "write"),
+        assertEquals(List.of("edit", "read", "read_attachment", "shell", "workspace_search", "write"),
                 registry.snapshot().stream().map(tool -> tool.spec().name()).toList());
 
         execute(registry, "write", JsonObjects.builder()
@@ -59,6 +59,24 @@ class BuiltInToolsTest {
                 .putText("path", "../outside/note.txt").putText("oldText", "one").putText("newText", "two")
                 .build());
         assertEquals("two", Files.readString(outside.resolve("note.txt")));
+    }
+
+    /** 受控搜索提供规划所需的真实文件定位，但不接受绝对路径或执行命令。 */
+    @Test
+    void searchesWorkspaceFilesWithBoundedResults() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("search-workspace"));
+        Files.writeString(workspace.resolve("Plan.java"), "class Plan {\n  // marker\n}\n", StandardCharsets.UTF_8);
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "workspace_search", JsonObjects.builder()
+                .putText("query", "marker").putText("filePattern", "*.java").build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertTrue(result.content().contains("Plan.java:2"));
+        assertEquals(AgentTool.WorkspaceMutationMode.NONE,
+                registry.snapshot().stream().filter(tool -> "workspace_search".equals(tool.spec().name()))
+                        .findFirst().orElseThrow().workspaceMutationMode());
     }
 
     /**
@@ -330,7 +348,7 @@ class BuiltInToolsTest {
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(),
                 ShellCapability.unavailable(ShellProfile.OperatingSystem.WINDOWS, "windows"), promptSession(),
                 unusedAttachments());
-        assertEquals(List.of("edit", "read", "read_attachment", "write"),
+        assertEquals(List.of("edit", "read", "read_attachment", "workspace_search", "write"),
                 registry.snapshot().stream().map(tool -> tool.spec().name()).toList());
     }
 

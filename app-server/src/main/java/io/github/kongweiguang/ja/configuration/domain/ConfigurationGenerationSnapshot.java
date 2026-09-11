@@ -31,6 +31,14 @@ public interface ConfigurationGenerationSnapshot {
     /** 返回本代际创建时的工作区信任结果；后续请求通过新代际观察变更。 */
     boolean trusted();
 
+    /**
+     * 返回用户级交互澄清开关；该值只控制普通模式是否主动提问，Plan 与权限审批不受影响。
+     * 缺失配置按 true 处理，保证旧的 v1 文档安全地获得可发现的澄清能力。
+     */
+    default boolean clarificationEnabled() {
+        return true;
+    }
+
     /** 返回成对校验后的默认 Provider；空 catalog 明确返回 empty。 */
     Optional<String> defaultProviderId();
 
@@ -39,6 +47,9 @@ public interface ConfigurationGenerationSnapshot {
 
     /** 返回选中模型支持的默认思考档位；模型不支持时明确返回 empty。 */
     Optional<ReasoningLevel> defaultReasoningLevel();
+
+    /** 返回当前配置代际冻结的子智能体策略；其引用只来自用户 Provider/Model catalog。 */
+    SubagentPolicy subagentPolicy();
 
     /** 按稳定标识解析 MCP；缺失时必须失败关闭。 */
     McpServer requireMcp(String mcpId);
@@ -82,6 +93,23 @@ public interface ConfigurationGenerationSnapshot {
             reasoningLevelMap = Map.copyOf(reasoningLevelMap);
             if (defaultReasoningLevel != null && !reasoningLevelMap.containsKey(defaultReasoningLevel)) {
                 throw new IllegalArgumentException("default reasoning level is unsupported");
+            }
+        }
+    }
+
+    /** 子智能体全局策略；Provider 与 Model 引用必须同时存在或同时缺失。 */
+    record SubagentPolicy(boolean enabled, Optional<String> providerId, Optional<String> modelId,
+                           Optional<ReasoningLevel> reasoningLevel) {
+        /** 冻结引用并拒绝半成对选择，避免运行时猜测缺失路由。 */
+        public SubagentPolicy {
+            Objects.requireNonNull(providerId, "providerId");
+            Objects.requireNonNull(modelId, "modelId");
+            Objects.requireNonNull(reasoningLevel, "reasoningLevel");
+            if (providerId.isPresent() != modelId.isPresent()) {
+                throw new IllegalArgumentException("subagent provider and model must be paired");
+            }
+            if (providerId.isEmpty() && reasoningLevel.isPresent()) {
+                throw new IllegalArgumentException("follow-parent subagent policy cannot set reasoning level");
             }
         }
     }

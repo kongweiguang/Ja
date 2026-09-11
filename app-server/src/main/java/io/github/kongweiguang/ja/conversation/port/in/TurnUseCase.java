@@ -36,6 +36,11 @@ public interface TurnUseCase extends DeadlineCloseable {
         throw new UnsupportedOperationException("input queue is unavailable");
     }
 
+    /** 问答期间的新指令可携带当前连接出口，替代旧问题后继续原 Turn。 */
+    default InputMutation enqueueInput(String turnId, UserContent content, TurnEventSink sink) {
+        return enqueueInput(turnId, content);
+    }
+
     /** 把指定条目按点击顺序提升为下一个安全点的 Steering。 */
     default InputMutation prioritizeInput(String turnId, String inputId, long expectedInputRevision) {
         throw new UnsupportedOperationException("input queue prioritization is unavailable");

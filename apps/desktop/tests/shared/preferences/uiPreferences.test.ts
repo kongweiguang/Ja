@@ -3,6 +3,8 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_CODE_FONT_SIZE,
+  DEFAULT_UI_FONT_SIZE,
   SIDEBAR_RATIO_DEFAULT,
   SIDEBAR_WIDTH_DEFAULT,
   SIDEBAR_WIDTH_MAX,
@@ -25,7 +27,7 @@ function resetPreferences(): void {
   localStorage.clear();
   useUiPreferencesStore.setState({
     themeMode: "system",
-    palette: "xcode",
+    palette: "ja",
     highContrast: false,
     reduceMotion: false,
     reducedTransparency: false,
@@ -36,6 +38,9 @@ function resetPreferences(): void {
     sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
     sidebarRatio: SIDEBAR_RATIO_DEFAULT,
     workbenchSize: WORKBENCH_SIZE_DEFAULT,
+    sendShortcut: "enter",
+    uiFontSize: DEFAULT_UI_FONT_SIZE,
+    codeFontSize: DEFAULT_CODE_FONT_SIZE,
   });
   useRightPanelSessionStore.setState({ scopes: new Map() });
 }
@@ -61,6 +66,9 @@ describe("ui navigation preferences", () => {
     useUiPreferencesStore.getState().setDesktopNotifications(true);
     useUiPreferencesStore.getState().setPalette("claude");
     useUiPreferencesStore.getState().setReducedTransparency(true);
+    useUiPreferencesStore.getState().setSendShortcut("modifier-enter");
+    useUiPreferencesStore.getState().setUiFontSize(18);
+    useUiPreferencesStore.getState().setCodeFontSize(16);
     const raw = localStorage.getItem("ja-ui-preferences-v1") ?? "";
     expect(raw).toContain('"sidebarCollapsed":true');
     expect(raw).toContain('"desktopNotifications":true');
@@ -69,6 +77,9 @@ describe("ui navigation preferences", () => {
     expect(raw).toContain('"workbenchSize":44.5');
     expect(raw).toContain('"palette":"claude"');
     expect(raw).toContain('"reducedTransparency":true');
+    expect(raw).toContain('"sendShortcut":"modifier-enter"');
+    expect(raw).toContain('"uiFontSize":18');
+    expect(raw).toContain('"codeFontSize":16');
     expect(raw).toContain('"version":1');
     expect(raw).not.toContain("inspectorOpen");
     expect(raw).not.toContain("rightPanelTab");
@@ -85,7 +96,7 @@ describe("ui navigation preferences", () => {
       JSON.stringify({ version: 14, state: { palette: "obsidian", rightPanelTab: "terminal" } }),
     );
     await useUiPreferencesStore.persist.rehydrate();
-    expect(useUiPreferencesStore.getState()).toMatchObject({ palette: "xcode" });
+    expect(useUiPreferencesStore.getState()).toMatchObject({ palette: "ja" });
     expect(useUiPreferencesStore.getState()).not.toHaveProperty("rightPanelTab");
 
     localStorage.setItem(
@@ -94,7 +105,7 @@ describe("ui navigation preferences", () => {
     );
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     await useUiPreferencesStore.persist.rehydrate();
-    expect(useUiPreferencesStore.getState()).toMatchObject({ palette: "xcode" });
+    expect(useUiPreferencesStore.getState()).toMatchObject({ palette: "ja" });
     expect(useUiPreferencesStore.getState()).not.toHaveProperty("rightPanelTab");
     expect(error).toHaveBeenCalled();
     error.mockRestore();
@@ -137,14 +148,33 @@ describe("ui navigation preferences", () => {
   });
 
   it("rejects values outside the current enum closures", () => {
-    expect(normalizeUiPalette("legacy" as never)).toBe("xcode");
-    expect(["xcode", "fleet", "obsidian", "claude"].map(normalizeUiPalette)).toEqual([
+    expect(useUiPreferencesStore.getInitialState()).toMatchObject({
+      palette: "ja",
+      themeMode: "system",
+    });
+    expect(normalizeUiPalette("legacy" as never)).toBe("ja");
+    expect(["xcode", "ja", "jetbrains", "obsidian", "claude"].map(normalizeUiPalette)).toEqual([
       "xcode",
-      "fleet",
+      "ja",
+      "jetbrains",
       "obsidian",
       "claude",
     ]);
     expect(normalizeRightPanelTab("git" as never)).toBe("files");
+  });
+
+  it("normalizes interface preferences to the small public setting set", () => {
+    useUiPreferencesStore.getState().setSendShortcut("invalid" as never);
+    expect(useUiPreferencesStore.getState().sendShortcut).toBe("enter");
+    useUiPreferencesStore.getState().setUiFontSize(18);
+    useUiPreferencesStore.getState().setCodeFontSize(12);
+    expect(useUiPreferencesStore.getState()).toMatchObject({ uiFontSize: 18, codeFontSize: 12 });
+    useUiPreferencesStore.getState().setUiFontSize(15);
+    useUiPreferencesStore.getState().setCodeFontSize(15);
+    expect(useUiPreferencesStore.getState()).toMatchObject({
+      uiFontSize: DEFAULT_UI_FONT_SIZE,
+      codeFontSize: DEFAULT_CODE_FONT_SIZE,
+    });
   });
 
   it("restores palette and transparency while normalizing a damaged palette", async () => {
@@ -166,7 +196,7 @@ describe("ui navigation preferences", () => {
       JSON.stringify({ version: 1, state: { palette: "damaged" } }),
     );
     await useUiPreferencesStore.persist.rehydrate();
-    expect(useUiPreferencesStore.getState().palette).toBe("xcode");
+    expect(useUiPreferencesStore.getState().palette).toBe("ja");
   });
 
   it("keeps the applied session value when localStorage persistence fails", () => {
@@ -174,8 +204,8 @@ describe("ui navigation preferences", () => {
       throw new DOMException("quota", "QuotaExceededError");
     });
 
-    expect(() => useUiPreferencesStore.getState().setPalette("fleet")).toThrow();
-    expect(useUiPreferencesStore.getState().palette).toBe("fleet");
+    expect(() => useUiPreferencesStore.getState().setPalette("ja")).toThrow();
+    expect(useUiPreferencesStore.getState().palette).toBe("ja");
     setItem.mockRestore();
   });
 });

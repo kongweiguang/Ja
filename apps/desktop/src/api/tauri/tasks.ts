@@ -22,6 +22,7 @@ export const JA_TASK_COMMANDS = {
   observe: "ja_runtime_task_observe",
   unobserve: "ja_runtime_task_unobserve",
   seen: "ja_runtime_task_seen",
+  close: "ja_runtime_task_close",
   messageSend: "ja_runtime_task_message_send",
   followup: "ja_runtime_task_followup",
   cancel: "ja_runtime_task_cancel",
@@ -38,8 +39,10 @@ export type TaskObserveInput = MethodParams<"task/observe">;
 export type TaskObserveResult = MethodResult<"task/observe">;
 export type TaskUnobserveInput = MethodParams<"task/unobserve">;
 export type TaskSeenInput = MethodParams<"task/seen">;
-export type TaskMessageInput = MethodParams<"task/message/send">;
-export type TaskMessageResult = MethodResult<"task/message/send">;
+export type TaskCloseInput = MethodParams<"task/close">;
+export type TaskCloseResult = MethodResult<"task/close">;
+export type TaskMessageInput = MethodParams<"thread/message/send">;
+export type TaskMessageResult = MethodResult<"thread/message/send">;
 export type TaskFollowupInput = MethodParams<"task/followup">;
 export type TaskFollowupResult = MethodResult<"task/followup">;
 export type TaskMutationInput = MethodParams<"task/cancel">;
@@ -54,7 +57,8 @@ type TaskMethod =
   | "task/observe"
   | "task/unobserve"
   | "task/seen"
-  | "task/message/send"
+  | "task/close"
+  | "thread/message/send"
   | "task/followup"
   | "task/cancel"
   | "task/tree/delete";
@@ -66,6 +70,7 @@ export interface TaskAdapter {
   observe(input: TaskObserveInput): Promise<TaskObserveResult>;
   unobserve(input: TaskUnobserveInput): Promise<void>;
   seen(input: TaskSeenInput): Promise<TaskMutationResult>;
+  close(input: TaskCloseInput): Promise<TaskCloseResult>;
   messageSend(input: TaskMessageInput): Promise<TaskMessageResult>;
   followup(input: TaskFollowupInput): Promise<TaskFollowupResult>;
   cancel(input: TaskMutationInput): Promise<TaskMutationResult>;
@@ -134,9 +139,16 @@ export class TauriTaskAdapter implements TaskAdapter {
     return invokeTask(this.bridge, JA_TASK_COMMANDS.seen, "task/seen", input);
   }
 
+  /**
+   * 侧聊关闭必须等待服务端原子清理 ACK；不能用 unobserve 或 treeDelete 伪装临时会话终止。
+   */
+  close(input: TaskCloseInput): Promise<TaskCloseResult> {
+    return invokeTask(this.bridge, JA_TASK_COMMANDS.close, "task/close", input);
+  }
+
   /** QueueOnly 消息不会在目标空闲时隐式启动新 Turn。 */
   messageSend(input: TaskMessageInput): Promise<TaskMessageResult> {
-    return invokeTask(this.bridge, JA_TASK_COMMANDS.messageSend, "task/message/send", input);
+    return invokeTask(this.bridge, JA_TASK_COMMANDS.messageSend, "thread/message/send", input);
   }
 
   /** follow-up 是唯一允许从详情显式启动或排队 Child Turn 的交互。 */

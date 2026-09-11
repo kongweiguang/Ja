@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { FolderOpen } from "lucide-react";
-import { useCallback, useEffect, useMemo, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   ChatTimeline,
   Composer,
+  InteractionCard,
+  useInteractionController,
+  type InteractionPort,
   ConversationSummaryPopover,
   isWorkItem,
   itemChangedFiles,
@@ -44,7 +47,7 @@ import {
   GoalActivityCard,
   GoalStatusBar,
   PlanTimelineBlock,
-  type CollaborationMode,
+  PlanStatusBar,
   type GoalController,
 } from "@/features/goals";
 import { RightPanelIcon } from "@/shared/ui/RightPanelIcon";
@@ -53,6 +56,7 @@ import { useRuntimeLifecycle, useRuntimeState, useRuntimeTurns } from "../Runtim
 import { IconButton } from "@/shared/ui/primitives";
 import { modelSelectionId } from "@/shared/settings/types";
 import { useLatestTurnReviewPublisher } from "../application/useLatestTurnReviewPublisher";
+import { conversationModeCommands } from "../application/conversationModeCommands";
 
 export interface ConversationWorkspaceProps {
   readonly workspace: WorkspaceController;
@@ -93,6 +97,7 @@ export interface ConversationWorkspaceProps {
   readonly onOpenTask: (task: TaskSummary) => void;
   readonly planGoalAvailable: boolean;
   readonly goal: GoalController;
+  readonly interactionPort?: InteractionPort;
   readonly onOpenGoal: () => void;
 }
 
@@ -109,15 +114,6 @@ export interface WorkspaceReferencePreviewRequest {
 
 /** Workbench 只回传稳定结果，原生读取错误细节继续由 Files 的脱敏通知边界拥有。 */
 export type WorkspaceReferencePreviewOutcome = "opened" | "failed" | "closed";
-
-/** `/plan` 无参数时切换，on/off 参数提供可脚本化的确定结果；其它参数失败关闭。 */
-function planModeFromArgument(current: CollaborationMode, argument: string): CollaborationMode {
-  const normalized = argument.normalize("NFKC").trim().toLocaleLowerCase();
-  if (normalized === "" || normalized === "toggle") return current === "plan" ? "default" : "plan";
-  if (["on", "plan", "开启", "打开", "计划"].includes(normalized)) return "plan";
-  if (["off", "default", "关闭", "执行"].includes(normalized)) return "default";
-  throw new Error("unsupported plan mode argument");
-}
 
 /**
  * 对话工作区只负责组合 Conversation、Workspace、Settings 与 Runtime 窄端口，并把 application
@@ -151,12 +147,28 @@ export function ConversationWorkspace({
   onOpenTask,
   planGoalAvailable,
   goal,
+  interactionPort,
   onOpenGoal,
 }: ConversationWorkspaceProps): ReactElement {
   const { boot, turnAdmissionReady, runtimeState } = useRuntimeState();
   const { queryRuntime } = useRuntimeLifecycle();
   const turnPort = useRuntimeTurns();
   const threadId = conversation.currentThreadId ?? "";
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
+  const clarification = useInteractionController({
+    threadId: conversation.currentThreadId,
+    visible: turnAdmissionReady && runtimeState?.features.includes("interaction_v1") === true,
+    port: interactionPort,
+  });
+  /** 运行中修改先等待原 Run 暂停，再聚焦 Composer，不能让新需求偷偷替换已授权版本。 */
+  const modifyPlan = useCallback(() => {
+    const status = goal.planModel?.plan.status;
+    if (status === "executing" || status === "verifying") {
+      void goal.pausePlan().then((paused) => {
+        if (paused) setComposerFocusRequest((value) => value + 1);
+      });
+    } else setComposerFocusRequest((value) => value + 1);
+  }, [goal]);
   const taskActivities = useTaskActivityTimeline(
     threadId === "" ? undefined : threadId,
     runtimeState?.generation,
@@ -167,9 +179,10 @@ export function ConversationWorkspace({
    */
   const taskTimelineRows = useMemo(
     () =>
-      taskActivities.map(({ activity, task }) => ({
-        rowId: activity.activityId,
-        occurredAt: activity.createdAt,
+      taskActivities.map(({ activity, task, firstOccurredAt }) => ({
+        // Task 状态在原位更新；row identity 与位置锚定任务，而不是最新 Activity。
+        rowId: task.taskThreadId,
+        occurredAt: firstOccurredAt,
         revision: `${activity.activitySequence}:${task.revision}`,
         content: <TaskActivityCard activity={activity} task={task} onOpen={onOpenTask} />,
       })),
@@ -225,11 +238,18 @@ export function ConversationWorkspace({
         occurredAt: planModel.revision?.createdAt ?? planModel.plan.createdAt,
         revision: `${planModel.plan.revision}:${planModel.eventSequence}`,
         content: (
-          <PlanTimelineBlock model={model} planModel={planModel} onOpenDetails={onOpenGoal} />
+          <PlanTimelineBlock
+            model={model}
+            planModel={planModel}
+            onOpenDetails={onOpenGoal}
+            onModifyPlan={modifyPlan}
+            onExecute={() => void goal.execute()}
+            busy={goal.busyAction !== undefined}
+          />
         ),
       },
     ];
-  }, [goal.model, goal.planModel, onOpenGoal, threadId]);
+  }, [goal, onOpenGoal, modifyPlan, threadId]);
   const items = useTimelineStore(
     useShallow((state) => (threadId === "" ? [] : selectItemsForThread(threadId)(state))),
   );
@@ -443,7 +463,20 @@ export function ConversationWorkspace({
     ready,
     blocked: workspace.busy || conversation.busy,
     turnPort,
-    planCreationPort: planGoalAvailable ? { create: goal.createPlan } : undefined,
+    planCreationPort: planGoalAvailable
+      ? {
+          // 模式切换 ACK 可能先于 Timeline 快照；采用同 Thread 已确认的最高 revision 创建计划。
+          create: (ownerThreadId, objective, revision) =>
+            goal.createPlan(
+              ownerThreadId,
+              objective,
+              Math.max(
+                revision,
+                currentThread?.threadId === ownerThreadId ? currentThread.revision : revision,
+              ),
+            ),
+        }
+      : undefined,
     preferencesPort: { updatePreferences: conversation.updatePreferences },
     attachmentPort,
     onAttachmentRemoved,
@@ -500,65 +533,12 @@ export function ConversationWorkspace({
    * Goal/Plan slash actions 绑定当前 Thread 的真实 controller：Plan 只改协作模板，Goal 只创建
    * 持久聚合；两者都不读写 AccessMode，也不会把命令文本提交给模型。
    */
-  const goalPlanSlashCommands: ComposerSlashCommand[] = [
-    {
-      id: "plan",
-      name: "plan",
-      aliases: ["计划"],
-      group: "添加",
-      icon: "plan",
-      label: "计划",
-      description: "先制定计划再决定是否执行",
-      available:
-        planGoalAvailable &&
-        interaction.preferences !== undefined &&
-        !interaction.preferenceBusy &&
-        !interaction.activeTurn,
-      unavailableReason: interaction.activeTurn ? "当前运行结束后可切换" : "当前会话偏好尚未就绪",
-      argument: {
-        mode: "optional",
-        label: "计划模式",
-        placeholder: "输入 on 或 off",
-      },
-      execute: async ({ argument }) => {
-        const preferences = interaction.preferences;
-        if (preferences === undefined) throw new Error("thread preferences unavailable");
-        await interaction.changeCollaborationMode(
-          planModeFromArgument(preferences.collaborationMode, argument),
-        );
-      },
-    },
-    {
-      id: "goal",
-      name: "goal",
-      aliases: ["目标"],
-      group: "添加",
-      icon: "goal",
-      label: "目标",
-      description: "设置要持续追求的目标",
-      available:
-        planGoalAvailable &&
-        threadId !== "" &&
-        goal.model === undefined &&
-        !interaction.activeTurn &&
-        goal.busyAction === undefined,
-      unavailableReason:
-        goal.model !== undefined
-          ? "当前会话已有活跃目标"
-          : interaction.activeTurn
-            ? "当前运行结束后可创建目标"
-            : "当前会话尚未就绪",
-      argument: {
-        mode: "required",
-        label: "目标",
-        placeholder: "描述目标",
-      },
-      execute: async ({ argument }) => {
-        if (threadId === "" || !(await goal.create(threadId, argument)))
-          throw new Error("goal creation was not acknowledged");
-      },
-    },
-  ];
+  const goalPlanSlashCommands = conversationModeCommands({
+    available: planGoalAvailable,
+    threadId,
+    interaction,
+    goal,
+  });
   const hasConversationContent =
     items.length > 0 ||
     turns.length > 0 ||
@@ -584,6 +564,8 @@ export function ConversationWorkspace({
   // 空 Thread 与有内容 Thread 共用同一受控 Composer，视觉 dock 迁移不会丢失 Thread draft。
   const composer = (
     <Composer
+      focusRequest={composerFocusRequest}
+      interactionSlot={<InteractionCard controller={clarification} />}
       text={interaction.draft}
       onTextChange={interaction.updateDraft}
       contextReferences={interaction.contextReferences}
@@ -600,6 +582,7 @@ export function ConversationWorkspace({
       attachmentDraftItems={interaction.attachmentDraftItems}
       activeTurn={interaction.activeTurn}
       suspendedTurn={interaction.suspendedTurn}
+      awaitingUserInput={clarification.request?.status === "pending"}
       disabled={interaction.disabled}
       sending={interaction.sending}
       draftRecoveryRevision={interaction.draftRecoveryRevision}
@@ -627,6 +610,7 @@ export function ConversationWorkspace({
             }
             busy={interaction.preferenceBusy}
             onOpenGoal={onOpenGoal}
+            onOpenPlan={goal.planModel === undefined ? undefined : onOpenGoal}
             onDisablePlan={() => interaction.changeCollaborationMode("default")}
           />
         ) : undefined
@@ -646,6 +630,21 @@ export function ConversationWorkspace({
             onResume={() => void goal.resume()}
             onResolve={onOpenGoal}
             onContinue={() => void goal.resume()}
+            hasPendingQuestion={clarification.request?.status === "pending"}
+            onAnswerQuestion={() => clarification.setCollapsed(false)}
+          />
+        ) : planGoalAvailable &&
+          goal.planModel !== undefined &&
+          goal.planModel.plan.activeRunId !== null ? (
+          <PlanStatusBar
+            planModel={goal.planModel}
+            busy={goal.busyAction !== undefined}
+            onOpen={onOpenGoal}
+            onPause={() => void goal.pausePlan()}
+            onResume={() => void goal.resumePlan()}
+            onStop={() => void goal.stopPlan()}
+            hasPendingQuestion={clarification.request?.status === "pending"}
+            onAnswerQuestion={() => clarification.setCollapsed(false)}
           />
         ) : undefined
       }

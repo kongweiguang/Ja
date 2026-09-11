@@ -121,6 +121,7 @@ final class ThreadCompactionHandlerTest {
                     unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase.class),
                     io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveTasks(),
                     io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveInteractions(),
                     new DeadlineCloseable() {
                         /** 测试组合没有外部资源，deadline close 保持无副作用。 */
                         @Override public void closeAt(long shutdownDeadlineNanos) { }

@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
+import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
@@ -204,6 +205,20 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                         workspaceId, key == null ? null : key.pinned(),
                         key == null ? null : key.sortTime(), key == null ? null : key.updatedAt(),
                         key == null ? null : key.id(), limit + 1)), limit));
+    }
+
+    /**
+     * 全局发现由一次 SQL 合并主 Thread 与两种 Child，使用同一更新时间/身份游标避免内存拼接漂移。
+     */
+    @Override
+    public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+        Objects.requireNonNull(query, "query");
+        String normalized = query.query() == null ? "" : query.query().strip().toLowerCase(Locale.ROOT);
+        Cursor key = decode(query.cursor());
+        return transactions.required(mapper -> discoveryPage(mapper.threadDiscoveries().selectPage(
+                new PersistenceRecords.ThreadDiscoveryPage(query.workspaceId(), normalized,
+                        key == null ? null : key.time(), key == null ? null : key.id(), query.limit() + 1)),
+                query.limit()));
     }
 
     /** 查询词在应用层使用 Locale.ROOT 归一化；SQLite 只执行有界 contains 与既有 keyset。 */
@@ -626,7 +641,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     private ThreadSnapshot.Item snapshotItem(PersistenceRecords.SnapshotItemRow row) {
         String kind = requiredText(row.itemKind(), "item_kind");
         Instant createdAt = Instant.parse(requiredText(row.createdAt(), "created_at"));
-        String itemId = snapshotItemId(kind, requiredText(row.itemId(), "item_id"));
+        String persistedItemId = requiredText(row.itemId(), "item_id");
+        String itemId = "message".equals(kind) && "THREAD_MESSAGE".equals(row.messageKind())
+                ? persistedItemId : snapshotItemId(kind, persistedItemId);
         return switch (kind) {
             case "message" -> messageItem(row, createdAt, itemId);
             case "tool_call" -> new ThreadSnapshot.ToolItem(itemId, createdAt,
@@ -656,6 +673,11 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     requiredText(row.turnId(), "turn_id"), codec.readUserContent(
                             requiredText(row.blocksJson(), "blocks_json")),
                     codec.readAttachmentSummaries(requiredText(row.attachmentsJson(), "attachments_json")));
+        }
+        if ("THREAD_MESSAGE".equals(messageKind)) {
+            return new ThreadSnapshot.ThreadMessageItem(itemId, createdAt,
+                    requiredText(row.turnId(), "turn_id"), requiredText(row.sourceThreadId(), "source_thread_id"),
+                    requiredText(row.sourceTitle(), "source_title"), requiredText(row.publicText(), "public_text"));
         }
         ThreadSnapshot.TextKind kind;
         try {
@@ -785,6 +807,32 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     requiredText(last.threadId(), "thread_id"));
         }
         return new CursorPage<>(rows.stream().map(MybatisHistoryService::thread).toList(), next);
+    }
+
+    /**
+     * 发现页只根据 SQL 返回的排序列生成 opaque cursor，并在返回前完成领域投影校验。
+     */
+    private static CursorPage<ThreadDiscovery> discoveryPage(
+            List<PersistenceRecords.ThreadDiscoveryRow> rows, int limit) {
+        String next = null;
+        if (rows.size() > limit) {
+            rows = new ArrayList<>(rows.subList(0, limit));
+            PersistenceRecords.ThreadDiscoveryRow last = rows.getLast();
+            next = encode(requiredText(last.updatedAt(), "updated_at"),
+                    requiredText(last.threadId(), "thread_id"));
+        }
+        return new CursorPage<>(rows.stream().map(MybatisHistoryService::threadDiscovery).toList(), next);
+    }
+
+    /**
+     * 将 discovery SQL 行转为不含正文和配置的可见最小投影，未知状态立即失败关闭。
+     */
+    private static ThreadDiscovery threadDiscovery(PersistenceRecords.ThreadDiscoveryRow row) {
+        return new ThreadDiscovery(requiredText(row.threadId(), "thread_id"),
+                requiredText(row.title(), "title"),
+                ThreadDiscovery.Kind.valueOf(requiredText(row.kind(), "kind")),
+                requiredText(row.workspaceId(), "workspace_id"),
+                ThreadDiscovery.Status.valueOf(requiredText(row.status(), "status")));
     }
 
     /** active Thread 游标冻结完整排序元组，跨置顶/普通分组翻页不会重复或遗漏。 */

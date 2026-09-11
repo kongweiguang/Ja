@@ -25,7 +25,14 @@ public final class ConfigurationPolicy {
             Pattern.compile("cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}");
     private static final Set<String> ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
-            "default_model_id", "default_reasoning_level", "providers", "mcp_servers", "skills");
+            "default_model_id", "default_reasoning_level", "interaction", "subagents",
+            "providers", "mcp_servers", "skills");
+    private static final Set<String> USER_REQUIRED_ROOT_KEYS = Set.of(
+            "schema_version", "config_revision", "default_access_mode", "default_provider_id",
+            "default_model_id", "default_reasoning_level", "subagents", "providers", "mcp_servers", "skills");
+    private static final Set<String> SUBAGENT_KEYS = Set.of("enabled", "provider_id", "model_id",
+            "reasoning_level");
+    private static final Set<String> INTERACTION_KEYS = Set.of("clarification_enabled");
     private static final Set<String> PROVIDER_KEYS = Set.of(
             "provider_id", "name", "api", "base_url", "credential_id",
             "network_timeouts", "agent_defaults", "models");
@@ -71,8 +78,9 @@ public final class ConfigurationPolicy {
         }
         rejectUnknown(document, ROOT_KEYS);
         requireCurrentSchema(document);
-        if (scope == ConfigurationScope.USER) requireKeys(document, ROOT_KEYS);
+        if (scope == ConfigurationScope.USER) requireKeys(document, USER_REQUIRED_ROOT_KEYS);
         else requireKeys(document, Set.of("schema_version", "config_revision"));
+        validateClarification(document, scope);
         validateRevision(document.get("config_revision"));
         validateAccessMode(document.get("default_access_mode"));
         validateArray(document.get("providers"), PROVIDER_KEYS, "provider_id");
@@ -90,7 +98,30 @@ public final class ConfigurationPolicy {
         validateCatalogEnabled(document.get("skills"), scope);
         validateSkillScopes(document.get("skills"), scope);
         validateDefaultSelection(document, scope == ConfigurationScope.USER);
+        validateSubagents(document, scope);
         scanForLiteralSecrets(document);
+    }
+
+    /**
+     * 澄清开关只属于用户级 interaction 对象；项目层拒绝整个对象，避免项目配置静默改变
+     * 用户对话行为。缺失用户对象按默认开启处理，读取不会把旧根级别名重新带回文档。
+     */
+    private static void validateClarification(ObjectNode document, ConfigurationScope scope) {
+        JsonNode interaction = document.get("interaction");
+        if (scope == ConfigurationScope.PROJECT && interaction != null) {
+            throw error(ConfigurationError.Code.LIMIT_ESCALATION,
+                    "project clarification policy is not allowed");
+        }
+        if (interaction == null) return;
+        if (!(interaction instanceof ObjectNode object)) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "interaction policy is invalid");
+        }
+        rejectUnknown(object, INTERACTION_KEYS);
+        JsonNode value = object.get("clarification_enabled");
+        if (value != null && !value.isBoolean()) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                    "clarification enabled state is invalid");
+        }
     }
 
     /** 只接受当前 schema v1；其它版本一律失败关闭，不执行迁移或兼容读取。 */
@@ -378,6 +409,51 @@ public final class ConfigurationPolicy {
             || !(selectedModel.get("reasoning_level_map") instanceof ObjectNode levels)
             || !levels.has(rootEffort.textValue())) {
             throw error(ConfigurationError.Code.INVALID_DOCUMENT, "default reasoning level is invalid");
+        }
+    }
+
+    /** 子智能体策略只属于用户层全局配置，引用必须成对且解析到当前 Provider/Model catalog。 */
+    private static void validateSubagents(ObjectNode document, ConfigurationScope scope) {
+        JsonNode value = document.get("subagents");
+        if (scope != ConfigurationScope.USER || !(value instanceof ObjectNode subagents)) {
+            if (scope == ConfigurationScope.USER) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "subagent policy is missing");
+            }
+            if (value != null) {
+                throw error(ConfigurationError.Code.LIMIT_ESCALATION,
+                        "project subagent policy is not allowed");
+            }
+            return;
+        }
+        rejectUnknown(subagents, SUBAGENT_KEYS);
+        requireKeys(subagents, SUBAGENT_KEYS);
+        requireBoolean(subagents, "enabled");
+        JsonNode provider = subagents.get("provider_id");
+        JsonNode model = subagents.get("model_id");
+        JsonNode reasoning = subagents.get("reasoning_level");
+        boolean hasProvider = provider != null && !provider.isNull();
+        boolean hasModel = model != null && !model.isNull();
+        if (hasProvider != hasModel || hasProvider && (!provider.isTextual() || !model.isTextual())) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                    "subagent provider and model are invalid");
+        }
+        if (hasProvider && findModel(document, provider.textValue(), model.textValue()) == null) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "subagent provider or model is unavailable");
+        }
+        if (reasoning != null && !reasoning.isNull()) {
+            if (!reasoning.isTextual() || !REASONING_LEVELS.contains(reasoning.textValue())) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "subagent reasoning level is invalid");
+            }
+            if (!hasProvider) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                        "follow-parent subagent policy cannot set reasoning level");
+            }
+            ObjectNode selected = findModel(document, provider.textValue(), model.textValue());
+            JsonNode map = selected == null ? null : selected.get("reasoning_level_map");
+            if (!(map instanceof ObjectNode levels) || !levels.has(reasoning.textValue())) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT,
+                        "subagent reasoning level is unsupported by model");
+            }
         }
     }
 

@@ -14,6 +14,7 @@ import {
   type ReactElement,
 } from "react";
 import { useResolvedTheme, useUiPalette } from "@/shared/hooks/useResolvedTheme";
+import { useCodeFontSize } from "@/shared/hooks/useInterfacePreferencesValue";
 import { IconButton } from "@/shared/ui/primitives";
 import type { TerminalOutputChunk } from "../application";
 import "@xterm/xterm/css/xterm.css";
@@ -326,13 +327,16 @@ export function TerminalPanel({
 }: TerminalPanelProps): ReactElement {
   const resolvedTheme = useResolvedTheme();
   const palette = useUiPalette();
+  const codeFontSize = useCodeFontSize();
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const lastOpenedLinkRef = useRef<{ url: string; at: number } | undefined>(undefined);
   const initialTextRef = useRef(initialText);
   const initialDataRef = useRef(initialData);
   const initialThemeRef = useRef(theme);
+  const initialCodeFontSizeRef = useRef(codeFontSize);
   const consumedOutputSequencesRef = useRef(new Set<string>());
   const restoreFocusAfterSearchRef = useRef(false);
   const callbacks = useRef({
@@ -385,11 +389,12 @@ export function TerminalPanel({
       convertEol: true,
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace",
-      fontSize: 12,
+      fontSize: initialCodeFontSizeRef.current,
       theme: initialThemeRef.current ?? readTerminalTheme(),
     });
     terminalRef.current = terminal;
     const fitAddon = new FitAddon();
+    fitAddonRef.current = fitAddon;
     const searchAddon = new SearchAddon();
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(searchAddon);
@@ -490,6 +495,7 @@ export function TerminalPanel({
       linkProvider?.dispose();
       callbacks.current.onDetach?.();
       fitAddon.dispose();
+      if (fitAddonRef.current === fitAddon) fitAddonRef.current = null;
       searchAddon.dispose();
       terminal.dispose();
       if (terminalRef.current === terminal) {
@@ -499,6 +505,19 @@ export function TerminalPanel({
       }
     };
   }, [openExternalUrlOnce]);
+
+  /** 字号变化只更新 xterm option 并重新拟合网格，保留同一 PTY、scrollback、选区和订阅。 */
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (terminal === null) return;
+    terminal.options.fontSize = codeFontSize;
+    try {
+      fitAddonRef.current?.fit();
+      callbacks.current.onResize?.({ cols: terminal.cols, rows: terminal.rows });
+    } catch {
+      terminal.refresh(0, Math.max(0, terminal.rows - 1));
+    }
+  }, [codeFontSize]);
 
   /**
    * 仅更新 xterm 暴露的可变 theme option；resolvedTheme 与 palette 只作为根 token 已切换的

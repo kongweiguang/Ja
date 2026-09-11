@@ -30,12 +30,16 @@ public final class HandshakeHandler implements RpcHandler {
             "workspace/set-trust", "workspace/unregister",
             "thread/create", "thread/list", "thread/search", "thread/read", "thread/rename", "thread/pin", "thread/seen",
             "thread/preferences/update", "thread/archive", "thread/restore", "thread/delete", "thread/compact",
+            "interaction/read", "interaction/observe", "interaction/unobserve",
+            "interaction/draft/save", "interaction/respond", "interaction/cancel",
             "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read", "plan/revisions/list",
+            "plan/current/read", "plan/events/read", "plan/observe", "plan/unobserve", "plan/evidence/list",
             "goal/evidence/list", "goal/create", "goal/plan/attach", "goal/plan/detach",
-            "goal/pause", "goal/resume", "goal/stop", "goal/input/respond",
-            "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/approve", "plan/execute", "plan/reject",
+            "goal/pause", "goal/resume", "goal/stop",
+            "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/execute", "plan/reject",
+            "plan/pause", "plan/resume", "plan/stop",
             "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
-            "task/message/send", "task/followup", "task/cancel", "task/tree/delete",
+            "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
             "attachment/import", "attachment/discard", "attachment/preview/open",
             "attachment/preview/read", "attachment/preview/close",
             "turn/start", "turn/resume", "turn/cancel", "turn/input/enqueue", "turn/input/prioritize",
@@ -47,6 +51,7 @@ public final class HandshakeHandler implements RpcHandler {
             "mcp/list-tools", "tool/artifact/read");
     static final List<String> EVENTS = List.of(
             "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",
+            "turn/messages_received",
             "assistant/model-step-committed",
             "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",
             "approval/requested", "approval/resolved", "context/compaction-started", "context/compacted",
@@ -54,10 +59,10 @@ public final class HandshakeHandler implements RpcHandler {
             "workspace/dirty", "turn/terminal",
             "thread/metadata-changed", "configuration/changed",
             "task/activity", "task/progress", "task/mailbox-changed",
-            "goal/changed", "goal/activity", "goal/input-requested");
+            "goal/changed", "goal/activity", "interaction/changed", "plan/changed");
     static final List<String> ACCESS_MODES = List.of("approval_required", "full_access");
     static final List<String> COLLABORATION_MODES = List.of("default", "plan");
-    static final List<String> FEATURES = List.of("task_threads_v1", "plan_goal_v1");
+    static final List<String> FEATURES = List.of("task_threads_v1", "plan_goal_v1", "interaction_v1");
     private final RpcSession session;
 
     /**

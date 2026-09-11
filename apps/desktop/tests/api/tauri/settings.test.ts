@@ -16,9 +16,11 @@ const CONFIG = {
   schema_version: 1,
   config_revision: 7,
   default_access_mode: "approval_required",
+  interaction: { clarification_enabled: true },
   default_provider_id: "provider_openai",
   default_model_id: "model_gpt",
   default_reasoning_level: "high",
+  subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
   providers: [
     {
       provider_id: "provider_openai",
@@ -71,11 +73,13 @@ function uiDocument(): SettingsDocument {
     revision: 7,
     theme: "system",
     defaultAccessMode: "approval_required",
+    clarificationEnabled: true,
     defaultSelection: {
       providerId: "provider_openai",
       modelId: "model_gpt",
       reasoningLevel: "high",
     },
+    subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
     providers: [
       {
         providerId: "provider_openai",
@@ -122,6 +126,12 @@ describe("TauriSettingsAdapter v1", () => {
     });
     expect(loaded.document.providers[0]?.models[0]?.capabilities.contextWindowTokens).toBe(256_000);
     expect(loaded.document.providers[0]?.credentialConfigured).toBe(true);
+    expect(loaded.document.subagents).toEqual({
+      enabled: true,
+      providerId: null,
+      modelId: null,
+      reasoningLevel: null,
+    });
     expect(loaded.userDocument.providers[0]?.models[0]?.model).toBe("gpt-5.6-sol");
     expect(JSON.stringify(loaded)).not.toMatch(/apiKey|secret/i);
   });
@@ -308,6 +318,22 @@ describe("TauriSettingsAdapter v1", () => {
     const document = uiDocument();
     document.defaultSelection = { ...document.defaultSelection!, reasoningLevel: "low" };
     document.providers[0]!.models[0]!.reasoningLevelMap = { high: "high" };
+
+    await expect(new TauriSettingsAdapter({ invoke }).save(document, "cfg_user")).rejects.toEqual(
+      expect.objectContaining<Partial<SettingsAdapterError>>({ code: "invalid_input" }),
+    );
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unsupported subagent reasoning selection before invoke", async () => {
+    const invoke = vi.fn();
+    const document = uiDocument();
+    document.subagents = {
+      enabled: true,
+      providerId: "provider_openai",
+      modelId: "model_gpt",
+      reasoningLevel: "off",
+    };
 
     await expect(new TauriSettingsAdapter({ invoke }).save(document, "cfg_user")).rejects.toEqual(
       expect.objectContaining<Partial<SettingsAdapterError>>({ code: "invalid_input" }),

@@ -164,9 +164,17 @@ pub(crate) fn validate_result(
         if rows.len() > max_rows {
             return Err(RuntimeCommandError::unavailable());
         }
+        if method == SettingsQueryMethod::McpList {
+            rows.iter()
+                .try_for_each(validate_mcp_projection)
+                .map_err(|_| RuntimeCommandError::unavailable())?;
+        }
         if !object.contains_key("nextCursor") {
             return Err(RuntimeCommandError::unavailable());
         }
+    }
+    if method == SettingsQueryMethod::McpTest {
+        validate_mcp_test_result(object).map_err(|_| RuntimeCommandError::unavailable())?;
     }
     if method == SettingsQueryMethod::ModelTest
         && (object.len() != 2
@@ -188,6 +196,96 @@ pub(crate) fn validate_result(
         return Err(RuntimeCommandError::unavailable());
     }
     Ok(value)
+}
+
+/// MCP 列表只返回脱敏的连接摘要；`configured` 代表已保存定义，不能伪装成探测成功。
+fn validate_mcp_projection(value: &Value) -> Result<(), &'static str> {
+    ensure_mcp_result_keys(value)?;
+    if !valid_mcp_id(value.get("mcpId"))
+        || !valid_safe_name(value.get("name"))
+        || !valid_mcp_transport(value.get("transport"))
+        || !matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("healthy" | "degraded" | "unavailable" | "disabled" | "configured")
+        )
+        || !valid_tool_count(value.get("toolCount"))
+    {
+        return Err("MCP projection is invalid");
+    }
+    Ok(())
+}
+
+/// MCP test 必须回显完整脱敏 descriptor，并用 `available` 表示 initialize/tools 已成功。
+fn validate_mcp_test_result(value: &Map<String, Value>) -> Result<(), &'static str> {
+    ensure_mcp_result_keys(&Value::Object(value.clone()))?;
+    if !valid_mcp_id(value.get("mcpId"))
+        || !valid_safe_name(value.get("name"))
+        || !valid_mcp_transport(value.get("transport"))
+        || !matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("healthy" | "available" | "degraded" | "unavailable")
+        )
+        || !valid_tool_count(value.get("toolCount"))
+    {
+        return Err("MCP test result is invalid");
+    }
+    Ok(())
+}
+
+/// MCP list/test 共用严格字段闭集，防止 endpoint、参数或认证信息穿过 Native boundary。
+fn ensure_mcp_result_keys(value: &Value) -> Result<(), &'static str> {
+    let object = value.as_object().ok_or("MCP result is not an object")?;
+    if object.len() != 5
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "mcpId" | "name" | "transport" | "status" | "toolCount"
+            )
+        })
+    {
+        return Err("MCP result has unknown fields");
+    }
+    Ok(())
+}
+
+/// MCP identity 使用 schema 的独立字符集，不能复用允许冒号的通用 Native identifier。
+fn valid_mcp_id(value: Option<&Value>) -> bool {
+    let Some(id) = value.and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(suffix) = id.strip_prefix("mcp_") else {
+        return false;
+    };
+    suffix
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && suffix.chars().count() <= 96
+        && suffix.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
+/// SafeName 与前端 schema 一样拒绝空值和控制字符，保留 Unicode 名称的可读性。
+fn valid_safe_name(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|name| {
+        (1..=512).contains(&name.chars().count()) && !name.chars().any(char::is_control)
+    })
+}
+
+/// MCP transport 是跨端固定闭集，拒绝供应商私有别名。
+fn valid_mcp_transport(value: Option<&Value>) -> bool {
+    matches!(
+        value.and_then(Value::as_str),
+        Some("stdio" | "streamable_http")
+    )
+}
+
+/// Tool 数量保持非负整数和服务端目录上限，避免 JSON number 发生浮点语义漂移。
+fn valid_tool_count(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count <= 2_000)
 }
 
 /// 设计原因：该函数维护封闭查询 allowlist 与结果上限，不允许演化为任意 RPC 通道。

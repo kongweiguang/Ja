@@ -101,10 +101,10 @@ describe("desktop capability manifest", () => {
   }
 
   /**
-   * 标题栏的“关闭”语义是隐藏到托盘，因此显式窗口权限必须与真实动作一致；
-   * 不保留未使用的 WebView close 权限，避免后续绕过应用拥有的退出握手。
+   * 关闭偏好允许隐藏到托盘或退出，显式窗口权限必须覆盖当前真实操作；
+   * 测试保留应用现有退出握手，不通过删除并行功能权限来消除陈旧断言。
    */
-  it("grants the titlebar hide action instead of a destructive close action", () => {
+  it("grants both configured window-close behaviors through native window commands", () => {
     const identifiers = capability()
       .permissions.map((permission) =>
         typeof permission === "string" ? permission : permission.identifier,
@@ -114,6 +114,7 @@ describe("desktop capability manifest", () => {
 
     expect(identifiers).toEqual(
       [
+        "core:window:allow-close",
         "core:window:allow-hide",
         "core:window:allow-minimize",
         "core:window:allow-start-dragging",

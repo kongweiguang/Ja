@@ -73,6 +73,31 @@ final class AgentCapabilityCatalogUnitTest {
         assertThrows(IllegalStateException.class, () -> prepared.bind(identity()));
     }
 
+    /** Binder 若丢失可信内核审批标记必须 fail-closed，避免物化阶段意外重新打开用户审批边界。 */
+    @Test
+    void rejectsToolThatChangesApprovalRequirementAfterPrepare() {
+        ToolSpec spec = spec("internal_tool");
+        AgentTool.ToolBindingDescriptor descriptor = AgentTool.builtinBindingDescriptor(
+                spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE);
+        AgentCapability capability = new AgentCapability() {
+            /** 稳定 fixture ID。 */
+            @Override public String id() { return "fixture.approval_drift"; }
+            /** 单能力无需额外排序。 */
+            @Override public int order() { return 1; }
+            /** prepare 声明可信内核操作，但 binder 返回默认要求用户审批的 Tool。 */
+            @Override public Prepared prepare(Request request) {
+                return new Prepared("", List.of(new ToolContribution(spec, ToolSideEffect.READ_ONLY,
+                        AgentTool.WorkspaceMutationMode.NONE, descriptor, AgentTool.PlanAccess.DISALLOWED,
+                        AgentTool.ApprovalRequirement.TRUSTED_INTERNAL,
+                        ignored -> tool(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE))));
+            }
+        };
+        AgentCapabilityCatalog.PreparedCapabilities prepared =
+                new AgentCapabilityCatalog(List.of(capability)).prepare(request());
+
+        assertThrows(IllegalStateException.class, () -> prepared.bind(identity()));
+    }
+
     /** 构造一个 schema 与执行实现同源的能力 fixture。 */
     private static AgentCapability capability(String id, int order, String toolName, String prompt) {
         ToolSpec spec = spec(toolName);
@@ -120,7 +145,7 @@ final class AgentCapabilityCatalogUnitTest {
                 AccessMode.APPROVAL_REQUIRED, CollaborationMode.DEFAULT,
                 ThreadPreferences.TitleSource.MANUAL);
         return new AgentCapability.Request("thr_test", "turn_test", Path.of("C:\\ja-capability").toAbsolutePath(),
-                "ws_test", preferences, "cfg_test", Instant.parse("2026-09-08T12:00:00Z"), TurnOrigin.USER);
+                "ws_test", preferences, "cfg_test", true, Instant.parse("2026-09-08T12:00:00Z"), TurnOrigin.USER);
     }
 
     /** 构造最终摘要身份，binder 不应观察任何可变集合。 */

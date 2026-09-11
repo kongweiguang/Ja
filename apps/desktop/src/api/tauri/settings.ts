@@ -194,6 +194,7 @@ const SettingsDocumentSchema = z
     revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     theme: z.enum(["system", "light", "dark"]),
     defaultAccessMode: z.enum(["approval_required", "full_access"]),
+    clarificationEnabled: z.boolean().default(true),
     defaultSelection: z
       .object({
         providerId: ConfigProviderIdSchema,
@@ -202,6 +203,14 @@ const SettingsDocumentSchema = z
       })
       .strict()
       .nullable(),
+    subagents: z
+      .object({
+        enabled: z.boolean(),
+        providerId: ConfigProviderIdSchema.nullable(),
+        modelId: ConfigModelIdSchema.nullable(),
+        reasoningLevel: UiReasoningLevelSchema.nullable(),
+      })
+      .strict(),
     providers: z.array(UiProviderSchema).max(MAX_ENTRIES),
     mcpServers: z.array(UiMcpSchema).max(MAX_ENTRIES),
     skills: z.array(UiSkillSchema),
@@ -449,6 +458,7 @@ function toUiDocument(
     revision: config.config_revision,
     theme: "system",
     defaultAccessMode: config.default_access_mode,
+    clarificationEnabled: config.interaction?.clarification_enabled ?? true,
     defaultSelection: hasDefault
       ? {
           providerId: config.default_provider_id!,
@@ -456,6 +466,12 @@ function toUiDocument(
           reasoningLevel: config.default_reasoning_level,
         }
       : null,
+    subagents: {
+      enabled: config.subagents.enabled,
+      providerId: config.subagents.provider_id,
+      modelId: config.subagents.model_id,
+      reasoningLevel: config.subagents.reasoning_level,
+    },
     providers: config.providers.map((provider) => toUiProvider(provider, credentials)),
     mcpServers: config.mcp_servers.map((server) => ({
       mcpRevision: server.mcp_id,
@@ -486,7 +502,9 @@ function emptySettingsDocument(): SettingsDocument {
     revision: 0,
     theme: "system",
     defaultAccessMode: "full_access",
+    clarificationEnabled: true,
     defaultSelection: null,
+    subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
     providers: [],
     mcpServers: [],
     skills: [],
@@ -564,9 +582,16 @@ function settingsDocumentValue(document: SettingsDocument): z.infer<typeof Confi
     schema_version: 1,
     config_revision: document.revision,
     default_access_mode: document.defaultAccessMode,
+    interaction: { clarification_enabled: document.clarificationEnabled ?? true },
     default_provider_id: document.defaultSelection?.providerId ?? null,
     default_model_id: document.defaultSelection?.modelId ?? null,
     default_reasoning_level: document.defaultSelection?.reasoningLevel ?? null,
+    subagents: {
+      enabled: document.subagents.enabled,
+      provider_id: document.subagents.providerId,
+      model_id: document.subagents.modelId,
+      reasoning_level: document.subagents.reasoningLevel,
+    },
     providers: document.providers.map(toNativeProvider),
     mcp_servers: document.mcpServers.map(toNativeMcp),
     skills: document.skills.map((skill) => ({

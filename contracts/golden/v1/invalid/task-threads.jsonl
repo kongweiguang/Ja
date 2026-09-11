@@ -8,8 +8,10 @@
 {"jsonrpc":"2.0","id":"c:task-observe-revision","method":"task/observe","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":-1}}
 {"jsonrpc":"2.0","id":"c:task-unobserve-id","method":"task/unobserve","params":{"observationId":"observation_side_1"}}
 {"jsonrpc":"2.0","id":"c:task-seen-sequence","method":"task/seen","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":3,"throughActivitySequence":0}}
-{"jsonrpc":"2.0","id":"c:task-message-wake","method":"task/message/send","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"message-1","wake":true}}
-{"jsonrpc":"2.0","id":"c:task-message-control-key","method":"task/message/send","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"message-1"}}
+{"jsonrpc":"2.0","id":"c:task-close-missing-id","method":"task/close","params":{}}
+{"jsonrpc":"2.0","id":"c:task-close-extra-field","method":"task/close","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":3}}
+{"jsonrpc":"2.0","id":"c:task-message-wake","method":"thread/message/send","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"message-1","wake":true}}
+{"jsonrpc":"2.0","id":"c:task-message-control-key","method":"thread/message/send","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"message-1"}}
 {"jsonrpc":"2.0","id":"c:task-followup-revision","method":"task/followup","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"followup-1"}}
 {"jsonrpc":"2.0","id":"c:task-cancel-mode","method":"task/cancel","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":3,"recursive":false}}
 {"jsonrpc":"2.0","id":"c:task-delete-confirm","method":"task/tree/delete","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":3}}

@@ -33,6 +33,8 @@ export interface GoalStatusBarProps {
   readonly onResume?: () => void;
   readonly onResolve?: () => void;
   readonly onContinue?: () => void;
+  readonly hasPendingQuestion?: boolean;
+  readonly onAnswerQuestion?: () => void;
 }
 
 /**
@@ -69,6 +71,9 @@ export function goalPrimaryAction(
 function actionPresentation(
   props: GoalStatusBarProps,
 ): { label: string; icon: typeof ArrowRight; run: () => void } | undefined {
+  if (props.hasPendingQuestion && props.onAnswerQuestion !== undefined) {
+    return { label: "回答问题", icon: ArrowRight, run: props.onAnswerQuestion };
+  }
   const action = goalPrimaryAction(props.goal, props.evaluation);
   if (action === "pause" && props.onPause !== undefined)
     return { label: "暂停目标", icon: CirclePause, run: props.onPause };
@@ -91,7 +96,9 @@ export function GoalStatusBar(props: GoalStatusBarProps): ReactElement | null {
   const progress = goalProgress(goal);
   const action = actionPresentation(props);
   const ActionIcon = action?.icon;
-  const statusText = goal.attentionSummary ?? currentStepTitle ?? goalPhaseLabel(goal.phase);
+  const statusText = props.hasPendingQuestion
+    ? "等待回答"
+    : (goal.attentionSummary ?? currentStepTitle ?? goalPhaseLabel(goal.phase));
   const hasStepProgress = goal.totalRequiredSteps > 0;
 
   return (

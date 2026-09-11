@@ -22,7 +22,6 @@ const goal = {
   currentStepId: null,
   completedRequiredSteps: 0,
   totalRequiredSteps: 0,
-  pendingInput: null,
   attentionReason: null,
   latestEvaluation: null,
   createdAt: timestamp,
@@ -68,20 +67,102 @@ function bridgeWithResult(result: unknown): {
 }
 
 describe("TauriGoalAdapter", () => {
-  it("approve 绑定精确 revision/hash/CAS/idempotency 且走专用 command", async () => {
+  it("maps current Plan recovery and its independent observation handle", async () => {
+    const currentNative = bridgeWithResult({ current: plan });
+    const currentPort = createGoalPort(new TauriGoalAdapter(currentNative.bridge), {
+      subscribe: () => () => undefined,
+    });
+
+    await expect(currentPort.currentPlan("thr_root")).resolves.toMatchObject({
+      plan: { planId: "plan_demo" },
+    });
+    expect(currentNative.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.currentPlanRead, {
+      input: { threadId: "thr_root" },
+    });
+
+    const observationId = "observe_plan_12345678";
+    const observeNative = bridgeWithResult({ ...plan, observationId });
+    observeNative.invoke.mockImplementation(async (command) =>
+      command === JA_GOAL_COMMANDS.unobservePlan ? { accepted: true } : { ...plan, observationId },
+    );
+    const adapter = new TauriGoalAdapter(observeNative.bridge);
+    const observedPort = createGoalPort(adapter, { subscribe: () => () => undefined });
+    await expect(
+      observedPort.observePlan({ ownerThreadId: "thr_root", planId: "plan_demo" }),
+    ).resolves.toMatchObject({ observationId });
+    expect(observeNative.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.observePlan, {
+      input: { threadId: "thr_root", planId: "plan_demo" },
+    });
+    await observedPort.unobservePlan({ observationId });
+    expect(observeNative.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.unobservePlan, {
+      input: { observationId },
+    });
+  });
+
+  it("pausePlan 绑定 run/CAS/idempotency 且走专用 command", async () => {
     const native = bridgeWithResult(plan);
     const adapter = new TauriGoalAdapter(native.bridge);
     const input = {
       threadId: "thr_root",
       planId: "plan_demo",
       expectedPlanRevision: 1,
-      idempotencyKey: "approve:demo:1",
-      planRevisionId: "planrev_demo",
-      planHash: "a".repeat(64),
+      idempotencyKey: "pause-plan:demo:1",
+      runId: "run_demo",
     };
-    await expect(adapter.approve(input)).resolves.toMatchObject({ plan: { planId: "plan_demo" } });
-    expect(native.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.approve, { input });
-    expect(native.invoke).not.toHaveBeenCalledWith(JA_GOAL_COMMANDS.execute, expect.anything());
+    await expect(adapter.pausePlan(input)).resolves.toMatchObject({
+      plan: { planId: "plan_demo" },
+    });
+    expect(native.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.pausePlan, { input });
+  });
+
+  it("reads standalone Plan evidence with the frozen revision and run identity", async () => {
+    const native = bridgeWithResult({
+      planId: "plan_demo",
+      planRevision: 1,
+      eventSequence: 2,
+      planRevisionId: "planrev_demo",
+      runId: "run_demo",
+      nextCursor: null,
+      items: [
+        {
+          evidenceId: "evidence_demo",
+          goalId: null,
+          planId: "plan_demo",
+          goalDefinitionRevision: null,
+          runId: "run_demo",
+          planRevisionId: "planrev_demo",
+          criterionId: "criterion_demo",
+          stepId: null,
+          sourceType: "test_report",
+          sourceId: "report:demo",
+          summary: "standalone Plan evidence",
+          digest: "b".repeat(64),
+          observedAt: timestamp,
+          createdAt: timestamp,
+        },
+      ],
+    });
+    const port = createGoalPort(new TauriGoalAdapter(native.bridge), {
+      subscribe: () => () => undefined,
+    });
+
+    await expect(
+      port.readPlanEvidence({
+        ownerThreadId: "thr_root",
+        planId: "plan_demo",
+        planRevisionId: "planrev_demo",
+        runId: "run_demo",
+      }),
+    ).resolves.toMatchObject({ items: [{ evidenceId: "evidence_demo", runId: "run_demo" }] });
+    expect(native.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.planEvidenceList, {
+      input: {
+        threadId: "thr_root",
+        planId: "plan_demo",
+        planRevisionId: "planrev_demo",
+        runId: "run_demo",
+        limit: 200,
+      },
+    });
   });
 
   /** execute 是批准后的独立用户意图，必须走专用 command 才能创建 standalone run。 */
@@ -135,6 +216,36 @@ describe("TauriGoalAdapter", () => {
       adapter.pause({ goalId: "bad", expectedGoalRevision: 1, idempotencyKey: "pause:demo:1" }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect(native.invoke).not.toHaveBeenCalled();
+  });
+
+  /** 独立 Goal 必须把 child Thread 映射为 independent_task，不能退化成父 Thread owner。 */
+  it("maps an independent side-task Goal owner without changing its task identity", async () => {
+    const sideGoal = {
+      ...goal,
+      owner: { kind: "independent_task", taskThreadId: "thr_side" },
+    } as const;
+    const native = bridgeWithResult({ goal: sideGoal, eventSequence: 2 });
+    const port = createGoalPort(new TauriGoalAdapter(native.bridge), {
+      subscribe: () => () => undefined,
+    });
+
+    await port.create({
+      ownerThreadId: "thr_side",
+      ownerKind: "independent_task",
+      objective: "侧边任务目标",
+      expectedGoalRevision: 0,
+      idempotencyKey: "goal:create:side",
+    });
+
+    expect(native.invoke).toHaveBeenCalledWith(JA_GOAL_COMMANDS.goalCreate, {
+      input: {
+        owner: { kind: "independent_task", taskThreadId: "thr_side" },
+        objective: "侧边任务目标",
+        acceptanceCriteria: [],
+        expectedGoalRevision: 0,
+        idempotencyKey: "goal:create:side",
+      },
+    });
   });
 
   it("unobserve 只释放观察句柄且要求 accepted ACK", async () => {

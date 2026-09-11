@@ -13,16 +13,20 @@ import {
   Pencil,
   Plus,
   Save,
+  Play,
+  RotateCcw,
+  Square,
   ShieldCheck,
   Target,
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import type { GoalMutationAction } from "../application/ports";
 import {
   goalPhaseLabel,
   planStatusLabel,
+  planProgressFromRevision,
   planStepStatusLabel,
   type AcceptanceEvidence,
   type GoalReadModel,
@@ -49,17 +53,20 @@ export interface PlanWorkbenchProps {
   readonly onSaveDraft?: (draft: PlanDraft) => void | boolean | Promise<void | boolean>;
   readonly onDiscardDraft?: () => void | boolean | Promise<void | boolean>;
   readonly onPropose?: () => void | boolean | Promise<void | boolean>;
-  readonly onApprove?: () => void | boolean | Promise<void | boolean>;
+  /** 完成编辑后生成不可变 revision；不代表已经授权执行。 */
+  readonly onFinalizePlan?: () => void | boolean | Promise<void | boolean>;
   readonly onExecute?: () => void | boolean | Promise<void | boolean>;
   readonly onAttachPlan?: () => void | boolean | Promise<void | boolean>;
   readonly onDetachPlan?: () => void | boolean | Promise<void | boolean>;
   readonly onReject?: () => void | boolean | Promise<void | boolean>;
   readonly onPause?: () => void | boolean | Promise<void | boolean>;
   readonly onResume?: () => void | boolean | Promise<void | boolean>;
+  readonly onPausePlan?: () => void | boolean | Promise<void | boolean>;
+  readonly onResumePlan?: () => void | boolean | Promise<void | boolean>;
+  readonly onStopPlan?: () => void | boolean | Promise<void | boolean>;
   readonly onBeginEdit?: () => void | boolean | Promise<void | boolean>;
   readonly onCancelEdit?: () => void | boolean | Promise<void | boolean>;
   readonly onContinue?: () => void | boolean | Promise<void | boolean>;
-  readonly onRespondInput?: (response: string) => void | boolean | Promise<void | boolean>;
 }
 
 /** 直接编辑从服务端 draft 或冻结 revision 复制值，稳定 ID 在保存前后都保持不变。 */
@@ -106,6 +113,8 @@ function linkedPlanView(model: GoalReadModel): PlanReadModel | undefined {
     plan: model.planState,
     revision: model.plan,
     draft: model.draft,
+    revisionHydrationRequired: false,
+    progress: planProgressFromRevision(model.plan),
     approvedPlanRevisionId:
       model.plan?.approvedAt === null ? null : (model.plan?.planRevisionId ?? null),
     eventSequence: model.planEventSequence ?? model.planState.revision,
@@ -126,20 +135,96 @@ function localId(prefix: "step" | "criterion"): string {
   return `${prefix}_draft_${random}`;
 }
 
-/** Diff 只比较结构化字段，不把计划回退为 Markdown 文本差异。 */
+/** 比较 draft 定义而忽略服务端更新时间，避免同一 ACK 被误报为外部冲突。 */
+function draftContentKey(draft: PlanDraft): string {
+  return JSON.stringify(draft, (key, value: unknown) => (key === "updatedAt" ? undefined : value));
+}
+
+type DraftSaveOperation = NonNullable<PlanWorkbenchProps["onSaveDraft"]>;
+
+interface DraftSaveJob {
+  readonly scopeKey: string;
+  readonly draft: PlanDraft;
+  readonly editRevision: number;
+  readonly save: DraftSaveOperation;
+  readonly promise: Promise<boolean>;
+  readonly resolve: (accepted: boolean) => void;
+}
+
+interface DraftSaveQueue {
+  active: DraftSaveJob | null;
+  queued: DraftSaveJob | null;
+  worker: Promise<void> | null;
+}
+
+interface RetainedLocalDraft {
+  readonly draft: PlanDraft;
+  readonly dirty: boolean;
+}
+
+/**
+ * 跨 Workbench 卸载保留仍未确认的本地草稿；只按 Thread/Plan identity 隔离，绝不作为服务端真相。
+ * 保存成功或用户明确丢弃后会删除，避免把旧版本重新注入新 Plan。
+ */
+const retainedDraftsBySave = new WeakMap<DraftSaveOperation, Map<string, RetainedLocalDraft>>();
+
+/** 为同一个真实保存回调建立弱引用注册表，卸载重挂载可恢复草稿且不会污染其他会话。 */
+function retainedDraftMap(save: DraftSaveOperation): Map<string, RetainedLocalDraft> {
+  const existing = retainedDraftsBySave.get(save);
+  if (existing !== undefined) return existing;
+  const created = new Map<string, RetainedLocalDraft>();
+  retainedDraftsBySave.set(save, created);
+  return created;
+}
+
+/** Diff 给出字段和具体增删内容，便于用户在执行前识别真实变化而非只看到“版本不同”。 */
 export function revisionDiff(current: PlanRevision, prior: PlanRevision): readonly string[] {
   const changes: string[] = [];
-  if (current.objective !== prior.objective) changes.push("目标");
-  if (JSON.stringify(current.scope) !== JSON.stringify(prior.scope)) changes.push("范围");
-  if (JSON.stringify(current.nonGoals) !== JSON.stringify(prior.nonGoals)) changes.push("非目标");
-  if (JSON.stringify(current.constraints) !== JSON.stringify(prior.constraints))
-    changes.push("约束");
-  if (JSON.stringify(current.steps) !== JSON.stringify(prior.steps)) changes.push("步骤与依赖");
-  if (JSON.stringify(current.acceptanceCriteria) !== JSON.stringify(prior.acceptanceCriteria))
-    changes.push("验收条件");
-  if (JSON.stringify(current.risks) !== JSON.stringify(prior.risks)) changes.push("风险");
-  if (JSON.stringify(current.verificationStrategy) !== JSON.stringify(prior.verificationStrategy))
-    changes.push("验证策略");
+  if (current.objective !== prior.objective)
+    changes.push(`目标：${prior.objective} → ${current.objective}`);
+  const compareList = (label: string, next: readonly string[], before: readonly string[]): void => {
+    const added = next.filter((item) => !before.includes(item));
+    const removed = before.filter((item) => !next.includes(item));
+    if (added.length > 0) changes.push(`${label}：新增「${added.join("、")}」`);
+    if (removed.length > 0) changes.push(`${label}：移除「${removed.join("、")}」`);
+  };
+  compareList("范围", current.scope, prior.scope);
+  compareList("非目标", current.nonGoals, prior.nonGoals);
+  compareList("约束", current.constraints, prior.constraints);
+  compareList("风险", current.risks, prior.risks);
+  compareList("验证策略", current.verificationStrategy, prior.verificationStrategy);
+  const priorSteps = new Map(prior.steps.map((step) => [step.stepId, step]));
+  const currentSteps = new Map(current.steps.map((step) => [step.stepId, step]));
+  current.steps.forEach((step) => {
+    const before = priorSteps.get(step.stepId);
+    if (before === undefined) changes.push(`步骤：新增「${step.title}」`);
+    else if (
+      before.title !== step.title ||
+      before.description !== step.description ||
+      before.required !== step.required ||
+      JSON.stringify(before.dependencyStepIds) !== JSON.stringify(step.dependencyStepIds)
+    )
+      changes.push(`步骤：更新「${before.title}」为「${step.title}」`);
+  });
+  prior.steps.forEach((step) => {
+    if (!currentSteps.has(step.stepId)) changes.push(`步骤：移除「${step.title}」`);
+  });
+  const priorCriteria = new Map(
+    prior.acceptanceCriteria.map((criterion) => [criterion.criterionId, criterion]),
+  );
+  const currentCriteria = new Map(
+    current.acceptanceCriteria.map((criterion) => [criterion.criterionId, criterion]),
+  );
+  current.acceptanceCriteria.forEach((criterion) => {
+    const before = priorCriteria.get(criterion.criterionId);
+    if (before === undefined) changes.push(`验收条件：新增「${criterion.description}」`);
+    else if (before.description !== criterion.description || before.required !== criterion.required)
+      changes.push(`验收条件：更新「${before.description}」`);
+  });
+  prior.acceptanceCriteria.forEach((criterion) => {
+    if (!currentCriteria.has(criterion.criterionId))
+      changes.push(`验收条件：移除「${criterion.description}」`);
+  });
   return changes;
 }
 
@@ -156,30 +241,235 @@ export function PlanWorkbench({
   onSaveDraft,
   onDiscardDraft,
   onPropose,
-  onApprove,
+  onFinalizePlan,
   onExecute,
   onAttachPlan,
   onDetachPlan,
-  onReject,
   onPause,
   onResume,
+  onPausePlan,
+  onResumePlan,
+  onStopPlan,
   onBeginEdit,
   onCancelEdit,
   onContinue,
-  onRespondInput,
 }: PlanWorkbenchProps): ReactElement {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<PlanDraft>();
   const [compareRevisionId, setCompareRevisionId] = useState<string>();
-  const [inputResponse, setInputResponse] = useState("");
+  const [draftDirty, setDraftDirty] = useState(false);
+  const [draftSaveState, setDraftSaveState] = useState<"idle" | "saving" | "saved" | "error">(
+    "idle",
+  );
   const [startingEdit, setStartingEdit] = useState(false);
+  const localEditRevisionRef = useRef(0);
+  const draftChangedRef = useRef(false);
+  const draftRef = useRef<PlanDraft | undefined>(undefined);
+  const draftDirtyRef = useRef(false);
+  const localDraftsRef = useRef(
+    new Map<string, { readonly draft: PlanDraft; readonly dirty: boolean }>(),
+  );
+  const draftSaveQueueRef = useRef<DraftSaveQueue>({ active: null, queued: null, worker: null });
+  const currentPlanKeyRef = useRef<string | undefined>(undefined);
+  const unmountedPlanKeyRef = useRef<string | undefined>(undefined);
+  const mountedRef = useRef(false);
+  const onSaveDraftRef = useRef<PlanWorkbenchProps["onSaveDraft"]>(onSaveDraft);
+  const saveOperationByPlanRef = useRef(new Map<string, DraftSaveOperation>());
+  const enqueueDraftSaveRef = useRef<
+    (
+      draft: PlanDraft,
+      scopeKey: string,
+      editRevision: number,
+      saveOverride?: DraftSaveOperation,
+    ) => Promise<boolean>
+  >(() => Promise.resolve(true));
   const editButtonRef = useRef<HTMLButtonElement>(null);
   const resumeAfterEditRef = useRef(false);
-  const renderedPlanIdRef = useRef<string | undefined>(undefined);
+  const renderedPlanKeyRef = useRef<string | undefined>(undefined);
   const resolvedPlanModel = useMemo(
     () => planModel ?? (model === undefined ? undefined : linkedPlanView(model)),
     [model, planModel],
   );
+  const resolvedPlanKey =
+    resolvedPlanModel === undefined
+      ? undefined
+      : `${resolvedPlanModel.plan.ownerThreadId}:${resolvedPlanModel.plan.planId}`;
+  currentPlanKeyRef.current = resolvedPlanKey;
+
+  useEffect(() => {
+    draftRef.current = draft;
+    draftDirtyRef.current = draftDirty;
+  }, [draft, draftDirty]);
+
+  useEffect(() => {
+    onSaveDraftRef.current = onSaveDraft;
+  }, [onSaveDraft]);
+
+  useEffect(() => {
+    if (resolvedPlanKey === undefined || onSaveDraft === undefined) return;
+    saveOperationByPlanRef.current.set(resolvedPlanKey, onSaveDraft);
+  }, [onSaveDraft, resolvedPlanKey]);
+
+  /** 保存队列只允许一个真实回调在途；旧 ACK 不能清理新代次的 dirty/error 状态。 */
+  const drainDraftSaveQueue = useCallback((): void => {
+    const queue = draftSaveQueueRef.current;
+    if (queue.worker !== null) return;
+    queue.worker = (async () => {
+      while (queue.queued !== null) {
+        const job = queue.queued;
+        queue.queued = null;
+        queue.active = job;
+        let accepted = false;
+        try {
+          accepted = (await Promise.resolve(job.save(job.draft))) !== false;
+        } catch {
+          accepted = false;
+        }
+        if (queue.active === job) queue.active = null;
+
+        const currentScope = currentPlanKeyRef.current;
+        const sameScope =
+          currentScope === job.scopeKey ||
+          (!mountedRef.current &&
+            currentScope === undefined &&
+            unmountedPlanKeyRef.current === job.scopeKey);
+        const newerQueued = (queue.queued as DraftSaveJob | null)?.scopeKey === job.scopeKey;
+        const newerEdit = sameScope && localEditRevisionRef.current > job.editRevision;
+        const superseded = newerQueued || newerEdit;
+        const currentDraftIsUnconfirmed =
+          sameScope && (draftDirtyRef.current || draftChangedRef.current);
+        const retainLocalDraft =
+          (!accepted && (!sameScope || currentDraftIsUnconfirmed)) ||
+          (superseded && (newerQueued || currentDraftIsUnconfirmed));
+        if (retainLocalDraft) {
+          const latestDraft =
+            sameScope && draftRef.current !== undefined ? draftRef.current : job.draft;
+          const retained = { draft: latestDraft, dirty: true };
+          localDraftsRef.current.set(job.scopeKey, retained);
+          retainedDraftMap(job.save).set(job.scopeKey, retained);
+        }
+
+        if (accepted && !superseded) {
+          localDraftsRef.current.delete(job.scopeKey);
+          retainedDraftMap(job.save).delete(job.scopeKey);
+          if (mountedRef.current && sameScope) {
+            draftDirtyRef.current = false;
+            setDraftDirty(false);
+            draftChangedRef.current = false;
+            setDraftSaveState("saved");
+          }
+        } else if (!accepted && !superseded) {
+          if (mountedRef.current && sameScope) setDraftSaveState("error");
+        } else if (mountedRef.current && sameScope) {
+          setDraftSaveState(newerQueued ? "saving" : "idle");
+        }
+        job.resolve(accepted);
+      }
+      queue.worker = null;
+    })();
+  }, []);
+
+  /** 将新内容合并为最新待保存项，避免同一 Plan 的保存请求并发或旧请求覆盖新输入。 */
+  const enqueueDraftSave = useCallback(
+    (
+      nextDraft: PlanDraft,
+      scopeKey: string,
+      editRevision: number,
+      saveOverride?: DraftSaveOperation,
+    ): Promise<boolean> => {
+      const save = saveOverride ?? onSaveDraftRef.current;
+      if (save === undefined) return Promise.resolve(true);
+      const queue = draftSaveQueueRef.current;
+      const contentKey = draftContentKey(nextDraft);
+      const existing = [queue.active, queue.queued].find(
+        (job) =>
+          job !== null && job.scopeKey === scopeKey && draftContentKey(job.draft) === contentKey,
+      );
+      if (existing !== undefined && existing !== null) return existing.promise;
+
+      if (queue.queued !== null) queue.queued.resolve(false);
+      let resolveJob!: (accepted: boolean) => void;
+      const promise = new Promise<boolean>((resolve) => {
+        resolveJob = resolve;
+      });
+      queue.queued = {
+        scopeKey,
+        draft: nextDraft,
+        editRevision,
+        save,
+        promise,
+        resolve: resolveJob,
+      };
+      if (mountedRef.current && currentPlanKeyRef.current === scopeKey) setDraftSaveState("saving");
+      drainDraftSaveQueue();
+      return promise;
+    },
+    [drainDraftSaveQueue],
+  );
+  enqueueDraftSaveRef.current = enqueueDraftSave;
+
+  /** 自动保存使用当前 scope 与编辑代次；无 scope 时不向服务端发出无主请求。 */
+  const persistDraft = useCallback(
+    (nextDraft: PlanDraft): Promise<boolean> => {
+      const scopeKey = currentPlanKeyRef.current;
+      if (scopeKey === undefined) return Promise.resolve(false);
+      return enqueueDraftSave(nextDraft, scopeKey, localEditRevisionRef.current);
+    },
+    [enqueueDraftSave],
+  );
+
+  /** 用户明确取消或放弃后清理该 scope 的本地保留，避免已丢弃内容在下一次挂载时复活。 */
+  const clearRetainedDraft = useCallback((scopeKey: string): void => {
+    localDraftsRef.current.delete(scopeKey);
+    const save = saveOperationByPlanRef.current.get(scopeKey) ?? onSaveDraftRef.current;
+    if (save !== undefined) retainedDraftMap(save).delete(scopeKey);
+  }, []);
+
+  /** 取消编辑时只丢弃尚未启动的 queued save；在途请求无法撤销，靠新编辑代次隔离迟到 ACK。 */
+  const invalidateQueuedDraftSave = useCallback((scopeKey: string): void => {
+    const queue = draftSaveQueueRef.current;
+    if (queue.queued?.scopeKey !== scopeKey) return;
+    queue.queued.resolve(false);
+    queue.queued = null;
+  }, []);
+
+  /** 定稿前持续 flush 最新本地代次，只有当前内容得到服务端确认后才可生成 revision。 */
+  const flushLatestDraft = useCallback(
+    async (scopeKey: string): Promise<boolean> => {
+      while (true) {
+        if (currentPlanKeyRef.current !== scopeKey) return false;
+        const latestDraft = draftRef.current;
+        if (latestDraft === undefined) return false;
+        const editRevision = localEditRevisionRef.current;
+        const contentKey = draftContentKey(latestDraft);
+        const needsSave =
+          draftDirtyRef.current ||
+          draftChangedRef.current ||
+          draftSaveQueueRef.current.active?.scopeKey === scopeKey ||
+          draftSaveQueueRef.current.queued?.scopeKey === scopeKey;
+        if (needsSave && !(await enqueueDraftSave(latestDraft, scopeKey, editRevision)))
+          return false;
+        if (currentPlanKeyRef.current !== scopeKey) return false;
+        const currentDraft = draftRef.current;
+        if (
+          currentDraft !== undefined &&
+          localEditRevisionRef.current === editRevision &&
+          draftContentKey(currentDraft) === contentKey
+        )
+          return true;
+      }
+    },
+    [enqueueDraftSave],
+  );
+
+  /** 输入稳定后自动落 draft；卸载前的清理逻辑会把尚未触发的 debounce 立即入队。 */
+  useEffect(() => {
+    if (!editing || !draftDirty || draft === undefined || onSaveDraft === undefined) return;
+    const timer = globalThis.setTimeout(() => {
+      void persistDraft(draft);
+    }, 500);
+    return () => globalThis.clearTimeout(timer);
+  }, [draft, draftDirty, editing, onSaveDraft, persistDraft]);
 
   /**
    * 同一 Plan 的 read/observe 可能在用户点击编辑后迟到；服务端尚无 draft 时保留本地编辑，
@@ -187,11 +477,81 @@ export function PlanWorkbench({
    */
   useEffect(() => {
     if (resolvedPlanModel === undefined) return;
-    const planChanged = renderedPlanIdRef.current !== resolvedPlanModel.plan.planId;
-    renderedPlanIdRef.current = resolvedPlanModel.plan.planId;
-    if (planChanged || resolvedPlanModel.draft !== null) {
-      setDraft(editableDraft(resolvedPlanModel));
-      setEditing(resolvedPlanModel.draft !== null);
+    const planKey = `${resolvedPlanModel.plan.ownerThreadId}:${resolvedPlanModel.plan.planId}`;
+    const planChanged = renderedPlanKeyRef.current !== planKey;
+    const previousPlanKey = renderedPlanKeyRef.current;
+    if (
+      planChanged &&
+      previousPlanKey !== undefined &&
+      draftRef.current !== undefined &&
+      (draftDirtyRef.current ||
+        draftChangedRef.current ||
+        draftSaveQueueRef.current.active?.scopeKey === previousPlanKey ||
+        draftSaveQueueRef.current.queued?.scopeKey === previousPlanKey)
+    ) {
+      const latestDraft = draftRef.current;
+      if (latestDraft !== undefined) {
+        const retained = { draft: latestDraft, dirty: true };
+        localDraftsRef.current.set(previousPlanKey, retained);
+        const save = saveOperationByPlanRef.current.get(previousPlanKey) ?? onSaveDraftRef.current;
+        if (save !== undefined) {
+          retainedDraftMap(save).set(previousPlanKey, retained);
+          // 切换 Thread 会清理 debounce；立即入队，确保最后一次输入不会只存在内存中。
+          void enqueueDraftSaveRef.current(
+            latestDraft,
+            previousPlanKey,
+            localEditRevisionRef.current,
+            save,
+          );
+        }
+      }
+    }
+    renderedPlanKeyRef.current = planKey;
+    if (planChanged) {
+      const save = onSaveDraftRef.current;
+      const retained =
+        localDraftsRef.current.get(planKey) ??
+        (save === undefined ? undefined : retainedDraftMap(save).get(planKey));
+      const nextDraft = retained?.draft ?? editableDraft(resolvedPlanModel);
+      setDraft(nextDraft);
+      draftRef.current = nextDraft;
+      draftDirtyRef.current = retained?.dirty ?? false;
+      setDraftDirty(retained?.dirty ?? false);
+      draftChangedRef.current = retained?.dirty ?? false;
+      setDraftSaveState(
+        retained === undefined
+          ? "idle"
+          : draftSaveQueueRef.current.active?.scopeKey === planKey ||
+              draftSaveQueueRef.current.queued?.scopeKey === planKey
+            ? "saving"
+            : "error",
+      );
+      setEditing(retained?.dirty ?? resolvedPlanModel.draft !== null);
+      return;
+    }
+    if (resolvedPlanModel.draft !== null) {
+      // 同一 Plan 的服务端 ACK 不能覆盖用户在请求期间继续输入的本地版本。
+      if (
+        draftDirtyRef.current ||
+        draftChangedRef.current ||
+        draftSaveQueueRef.current.active?.scopeKey === planKey ||
+        draftSaveQueueRef.current.queued?.scopeKey === planKey
+      ) {
+        if (
+          draftRef.current === undefined ||
+          draftContentKey(draftRef.current) !== draftContentKey(resolvedPlanModel.draft)
+        )
+          setDraftSaveState("error");
+        return;
+      }
+      const nextDraft = editableDraft(resolvedPlanModel);
+      setDraft(nextDraft);
+      draftRef.current = nextDraft;
+      draftDirtyRef.current = false;
+      setDraftDirty(false);
+      draftChangedRef.current = false;
+      setDraftSaveState("idle");
+      setEditing(true);
       return;
     }
     setDraft((current) => current ?? editableDraft(resolvedPlanModel));
@@ -199,7 +559,36 @@ export function PlanWorkbench({
 
   useEffect(() => {
     resumeAfterEditRef.current = false;
-  }, [resolvedPlanModel?.plan.planId]);
+  }, [resolvedPlanModel?.plan.ownerThreadId, resolvedPlanModel?.plan.planId]);
+
+  /** 组件卸载时立即提交最后一个本地代次；即使 ACK 迟到也只能更新原 scope 的保留记录。 */
+  useEffect(() => {
+    mountedRef.current = true;
+    const saveQueue = draftSaveQueueRef.current;
+    const localDrafts = localDraftsRef.current;
+    const saveOperations = saveOperationByPlanRef.current;
+    return () => {
+      mountedRef.current = false;
+      const scopeKey = currentPlanKeyRef.current;
+      const latestDraft = draftRef.current;
+      if (
+        scopeKey !== undefined &&
+        latestDraft !== undefined &&
+        (draftDirtyRef.current ||
+          draftChangedRef.current ||
+          saveQueue.active?.scopeKey === scopeKey ||
+          saveQueue.queued?.scopeKey === scopeKey)
+      ) {
+        const retained = { draft: latestDraft, dirty: true };
+        localDrafts.set(scopeKey, retained);
+        const save = saveOperations.get(scopeKey) ?? onSaveDraftRef.current;
+        if (save !== undefined) retainedDraftMap(save).set(scopeKey, retained);
+        unmountedPlanKeyRef.current = scopeKey;
+        void enqueueDraftSaveRef.current(latestDraft, scopeKey, localEditRevisionRef.current, save);
+      }
+      currentPlanKeyRef.current = undefined;
+    };
+  }, []);
 
   const compareRevision = revisions.find(
     (revision) => revision.planRevisionId === compareRevisionId,
@@ -217,9 +606,20 @@ export function PlanWorkbench({
   /** 取消只丢弃局部编辑，服务端已有 draft 必须通过显式“放弃草稿”命令处理。 */
   const cancelLocalEdit = async (): Promise<void> => {
     if (resolvedPlanModel === undefined) return;
-    setDraft(editableDraft(resolvedPlanModel));
+    const scopeKey = `${resolvedPlanModel.plan.ownerThreadId}:${resolvedPlanModel.plan.planId}`;
+    const shouldResume = resumeAfterEditRef.current && !draftChangedRef.current;
+    localEditRevisionRef.current += 1;
+    invalidateQueuedDraftSave(scopeKey);
+    clearRetainedDraft(scopeKey);
+    const nextDraft = editableDraft(resolvedPlanModel);
+    setDraft(nextDraft);
+    draftRef.current = nextDraft;
+    draftDirtyRef.current = false;
+    setDraftDirty(false);
+    draftChangedRef.current = false;
+    setDraftSaveState("idle");
     setEditing(false);
-    if (resumeAfterEditRef.current && onCancelEdit !== undefined) {
+    if (shouldResume && onCancelEdit !== undefined) {
       await onCancelEdit();
       resumeAfterEditRef.current = false;
     }
@@ -230,14 +630,20 @@ export function PlanWorkbench({
   const beginEdit = async (): Promise<void> => {
     if (resolvedPlanModel === undefined || startingEdit) return;
     // 用户可能在首次同步 effect 执行前立即点击；先锁定当前 identity，避免该 effect 反向关闭编辑态。
-    renderedPlanIdRef.current = resolvedPlanModel.plan.planId;
+    renderedPlanKeyRef.current = `${resolvedPlanModel.plan.ownerThreadId}:${resolvedPlanModel.plan.planId}`;
     setStartingEdit(true);
     try {
       if (onBeginEdit !== undefined) {
         if ((await onBeginEdit()) === false) return;
         resumeAfterEditRef.current = true;
       }
-      setDraft(editableDraft(resolvedPlanModel));
+      const nextDraft = editableDraft(resolvedPlanModel);
+      setDraft(nextDraft);
+      draftRef.current = nextDraft;
+      draftDirtyRef.current = false;
+      setDraftDirty(false);
+      draftChangedRef.current = false;
+      setDraftSaveState("idle");
       setEditing(true);
     } finally {
       setStartingEdit(false);
@@ -270,7 +676,6 @@ export function PlanWorkbench({
   const planState = resolvedPlanModel.plan;
   const plan = resolvedPlanModel.revision;
   const linkedToGoal = goal?.activePlanId === planState.planId;
-  const inputRequest = linkedToGoal ? (model?.inputRequest ?? null) : null;
   const evaluation = linkedToGoal ? (model?.evaluation ?? null) : null;
   const isBusy = busyAction !== undefined;
   const currentStep = plan?.steps.find(
@@ -279,6 +684,19 @@ export function PlanWorkbench({
   const selectedDraft = draft ?? editableDraft(resolvedPlanModel);
   const primaryAction =
     linkedToGoal && goal !== undefined ? goalPrimaryAction(goal, evaluation) : undefined;
+
+  const finishEditing = async (): Promise<void> => {
+    const scopeKey = currentPlanKeyRef.current;
+    if (draft === undefined || onSaveDraft === undefined || scopeKey === undefined) return;
+    if (!(await flushLatestDraft(scopeKey))) return;
+    const finalize = onFinalizePlan ?? onPropose;
+    if (finalize !== undefined && (await finalize()) === false) return;
+    setEditing(false);
+    draftDirtyRef.current = false;
+    setDraftDirty(false);
+    draftChangedRef.current = false;
+    resumeAfterEditRef.current = false;
+  };
 
   return (
     <main
@@ -294,11 +712,7 @@ export function PlanWorkbench({
         <div className="ja-plan-header__copy">
           <span>{planStatusLabel(planState.status)}</span>
           <h2 title={planState.objective}>{planState.objective}</h2>
-          <small>
-            {plan === null
-              ? "尚无已确认版本"
-              : `版本 ${plan.revisionNumber} · ${plan.planHash.slice(0, 10)}`}
-          </small>
+          <small>{plan === null ? "尚无已确认版本" : `第 ${plan.revisionNumber} 版`}</small>
         </div>
         <div className="ja-plan-header__actions">
           {!editing &&
@@ -321,21 +735,9 @@ export function PlanWorkbench({
             </button>
           ) : null}
           {!editing &&
-          planState.status === "awaiting_approval" &&
-          plan !== null &&
-          onApprove !== undefined ? (
-            <button
-              type="button"
-              className="ja-plan-button is-primary"
-              disabled={isBusy}
-              onClick={() => void onApprove()}
-            >
-              <ShieldCheck aria-hidden="true" />
-              批准
-            </button>
-          ) : null}
-          {!editing &&
-          planState.status === "approved" &&
+          (planState.status === "draft" ||
+            planState.status === "awaiting_approval" ||
+            planState.status === "approved") &&
           plan !== null &&
           (onAttachPlan !== undefined || onExecute !== undefined) ? (
             <button
@@ -344,8 +746,8 @@ export function PlanWorkbench({
               disabled={isBusy}
               onClick={() => void (onAttachPlan ?? onExecute)?.()}
             >
-              <ShieldCheck aria-hidden="true" />
-              {onAttachPlan !== undefined ? "用于当前目标" : "执行计划"}
+              <Play aria-hidden="true" />
+              {onAttachPlan !== undefined ? "用于当前目标" : "执行"}
             </button>
           ) : null}
           {!editing && goal?.activePlanId === planState.planId && onDetachPlan !== undefined ? (
@@ -392,6 +794,43 @@ export function PlanWorkbench({
               继续处理
             </button>
           ) : null}
+          {!editing && planState.status === "paused" && onResumePlan !== undefined ? (
+            <button
+              type="button"
+              className="ja-plan-button is-primary"
+              disabled={isBusy}
+              onClick={() => void onResumePlan()}
+            >
+              <RotateCcw aria-hidden="true" />
+              继续
+            </button>
+          ) : null}
+          {!editing && planState.status === "executing" && onPausePlan !== undefined ? (
+            <button
+              type="button"
+              className="ja-plan-icon-button"
+              aria-label="暂停计划"
+              title="暂停计划"
+              disabled={isBusy}
+              onClick={() => void onPausePlan()}
+            >
+              <CirclePause aria-hidden="true" />
+            </button>
+          ) : null}
+          {!editing &&
+          (planState.status === "executing" || planState.status === "paused") &&
+          onStopPlan !== undefined ? (
+            <button
+              type="button"
+              className="ja-plan-icon-button is-danger"
+              aria-label="停止计划"
+              title="停止计划"
+              disabled={isBusy}
+              onClick={() => void onStopPlan()}
+            >
+              <Square aria-hidden="true" />
+            </button>
+          ) : null}
         </div>
       </header>
 
@@ -407,46 +846,28 @@ export function PlanWorkbench({
         </div>
       )}
 
-      {inputRequest === null ? null : (
-        <section className="ja-plan-input-request" aria-labelledby="ja-plan-input-title">
-          <h3 id="ja-plan-input-title">需要你的输入</h3>
-          <p>{inputRequest.prompt}</p>
-          {onRespondInput === undefined ? null : (
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                const response = inputResponse.trim();
-                if (response !== "") void onRespondInput(response);
-              }}
-            >
-              <textarea
-                aria-label="目标所需输入"
-                value={inputResponse}
-                onChange={(event) => setInputResponse(event.currentTarget.value)}
-              />
-              <button
-                type="submit"
-                className="ja-plan-button is-primary"
-                disabled={isBusy || inputResponse.trim() === ""}
-              >
-                提交输入
-              </button>
-            </form>
-          )}
-        </section>
-      )}
-
       {editing ? (
         <PlanDraftEditor
           draft={selectedDraft}
           busy={isBusy}
-          onChange={setDraft}
+          saveState={draftSaveState}
+          onChange={(next) => {
+            setDraft(next);
+            draftRef.current = next;
+            setDraftDirty(true);
+            draftDirtyRef.current = true;
+            draftChangedRef.current = true;
+            localEditRevisionRef.current += 1;
+            setDraftSaveState("idle");
+          }}
           onCancel={cancelLocalEdit}
           onSave={
             onSaveDraft === undefined
               ? undefined
               : async () => {
-                  await onSaveDraft({ ...selectedDraft, updatedAt: new Date().toISOString() });
+                  const scopeKey = currentPlanKeyRef.current;
+                  if (scopeKey === undefined) return false;
+                  return flushLatestDraft(scopeKey);
                 }
           }
           onDiscard={
@@ -454,22 +875,26 @@ export function PlanWorkbench({
               ? undefined
               : async () => {
                   if ((await onDiscardDraft()) === false) return;
+                  const scopeKey = `${resolvedPlanModel.plan.ownerThreadId}:${resolvedPlanModel.plan.planId}`;
+                  localEditRevisionRef.current += 1;
+                  invalidateQueuedDraftSave(scopeKey);
+                  clearRetainedDraft(scopeKey);
+                  const nextDraft = editableDraft(resolvedPlanModel);
+                  setDraft(nextDraft);
+                  draftRef.current = nextDraft;
                   setEditing(false);
-                  if (resumeAfterEditRef.current && onCancelEdit !== undefined) {
+                  draftDirtyRef.current = false;
+                  setDraftDirty(false);
+                  const shouldResume = resumeAfterEditRef.current && !draftChangedRef.current;
+                  draftChangedRef.current = false;
+                  setDraftDirty(false);
+                  if (shouldResume && onCancelEdit !== undefined) {
                     await onCancelEdit();
                     resumeAfterEditRef.current = false;
                   }
                 }
           }
-          onPropose={
-            resolvedPlanModel.draft === null || onPropose === undefined
-              ? undefined
-              : async () => {
-                  if ((await onPropose()) === false) return;
-                  setEditing(false);
-                  resumeAfterEditRef.current = false;
-                }
-          }
+          onFinalize={(onFinalizePlan ?? onPropose) === undefined ? undefined : finishEditing}
         />
       ) : plan === null ? (
         <div className="ja-plan-state" role="status">
@@ -520,22 +945,6 @@ export function PlanWorkbench({
           )}
         </section>
       )}
-
-      {!editing &&
-      planState.status === "awaiting_approval" &&
-      plan !== null &&
-      onReject !== undefined ? (
-        <footer className="ja-plan-footer">
-          <button
-            type="button"
-            className="ja-plan-button is-danger"
-            disabled={isBusy}
-            onClick={() => void onReject()}
-          >
-            拒绝此版本
-          </button>
-        </footer>
-      ) : null}
     </main>
   );
 }
@@ -544,19 +953,21 @@ export function PlanWorkbench({
 function PlanDraftEditor({
   draft,
   busy,
+  saveState,
   onChange,
   onCancel,
   onSave,
   onDiscard,
-  onPropose,
+  onFinalize,
 }: {
   draft: PlanDraft;
   busy: boolean;
+  saveState: "idle" | "saving" | "saved" | "error";
   onChange: (draft: PlanDraft) => void;
   onCancel: () => void;
   onSave?: () => void | boolean | Promise<void | boolean>;
   onDiscard?: () => void | boolean | Promise<void | boolean>;
-  onPropose?: () => void | boolean | Promise<void | boolean>;
+  onFinalize?: () => void | boolean | Promise<void | boolean>;
 }): ReactElement {
   /** 更新 draft 保留其服务端身份和 base revision，避免编辑过程制造新版本。 */
   const patch = (next: Partial<PlanDraft>): void => onChange({ ...draft, ...next });
@@ -597,6 +1008,15 @@ function PlanDraftEditor({
         onChange={(verificationStrategy) => patch({ verificationStrategy })}
       />
       <footer className="ja-plan-editor__actions">
+        <span className="ja-plan-save-state" role="status" data-state={saveState}>
+          {saveState === "saving"
+            ? "正在保存…"
+            : saveState === "saved"
+              ? "已保存"
+              : saveState === "error"
+                ? "版本已变化，保留本地修改"
+                : "自动保存已开启"}
+        </span>
         {onDiscard === undefined ? (
           <button type="button" className="ja-plan-button is-secondary" onClick={onCancel}>
             <X aria-hidden="true" />
@@ -624,15 +1044,15 @@ function PlanDraftEditor({
             保存草稿
           </button>
         )}
-        {onPropose === undefined ? null : (
+        {onFinalize === undefined ? null : (
           <button
             type="button"
             className="ja-plan-button is-primary"
             disabled={busy || !valid}
-            onClick={() => void onPropose()}
+            onClick={() => void onFinalize()}
           >
-            <ShieldCheck aria-hidden="true" />
-            提交审批
+            <Check aria-hidden="true" />
+            完成编辑
           </button>
         )}
       </footer>
@@ -909,7 +1329,7 @@ function EvidenceList({ items }: { items: readonly AcceptanceEvidence[] }): Reac
         <li key={item.evidenceId}>
           <Target aria-hidden="true" />
           <span>{item.summary}</span>
-          <code title={item.digest}>{item.digest.slice(0, 10)}</code>
+          <small>{new Date(item.recordedAt).toLocaleString()}</small>
         </li>
       ))}
     </ul>
@@ -995,7 +1415,7 @@ function PlanRevisionView({
                     {attached.map((item) => (
                       <li key={item.evidenceId}>
                         <span>{item.summary}</span>
-                        <code title={item.digest}>{item.digest.slice(0, 10)}</code>
+                        <small>{new Date(item.recordedAt).toLocaleString()}</small>
                       </li>
                     ))}
                   </ul>

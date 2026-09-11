@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证 Plan/Goal 能力在一个适配器内保持可见目录、CAS 身份与真实 UseCase 调用一致。 */
 final class PlanGoalAgentCapabilityTest {
@@ -44,12 +44,24 @@ final class PlanGoalAgentCapabilityTest {
     void exposesToolsForExactTurnOrigin() {
         Fixture fixture = fixture();
 
-        assertEquals(List.of("plan_propose"), names(fixture.capability(), CollaborationMode.PLAN, TurnOrigin.USER));
-        assertEquals(List.of("plan_step_update", "goal_request_input", "goal_request_evaluation"),
+        assertEquals(List.of("plan_propose", "plan_draft_update"),
+                names(fixture.capability(), CollaborationMode.PLAN, TurnOrigin.USER));
+        assertEquals(List.of("plan_step_update", "goal_request_evaluation"),
                 names(fixture.capability(), CollaborationMode.DEFAULT, TurnOrigin.GOAL_CONTINUATION));
         assertEquals(List.of("plan_step_update"),
                 names(fixture.capability(), CollaborationMode.DEFAULT, TurnOrigin.PLAN_EXECUTION));
         assertEquals(List.of(), names(fixture.capability(), CollaborationMode.DEFAULT, TurnOrigin.USER));
+
+        AgentTool proposal = tool(fixture.capability(), "plan_propose", CollaborationMode.PLAN, TurnOrigin.USER);
+        assertEquals(AgentTool.PlanAccess.INTERNAL_MUTATION, proposal.planAccess());
+        AgentTool stepUpdate = tool(fixture.capability(), "plan_step_update",
+                CollaborationMode.DEFAULT, TurnOrigin.PLAN_EXECUTION);
+        assertEquals(AgentTool.PlanAccess.DISALLOWED, stepUpdate.planAccess());
+        AgentTool draftUpdate = tool(fixture.capability(), "plan_draft_update",
+                CollaborationMode.PLAN, TurnOrigin.USER);
+        assertEquals(AgentTool.PlanAccess.INTERNAL_MUTATION, draftUpdate.planAccess());
+        assertTrue(((io.github.kongweiguang.ja.foundation.json.JsonObject)
+                draftUpdate.spec().inputSchema().get("properties")).containsKey("expectedDraftRevision"));
     }
 
     /** plan_propose 的 schema 和执行命令只使用 standalone Plan identity。 */
@@ -76,49 +88,8 @@ final class PlanGoalAgentCapabilityTest {
         assertEquals("plan_test", fixture.propose().get().planId());
     }
 
-    /** Tool 不能跨 Turn 复用，拒绝必须发生在 GoalUseCase mutation 之前。 */
-    @Test
-    void rejectsCrossTurnReuseBeforeMutation() {
-        Fixture fixture = fixture();
-        AgentTool tool = tool(fixture.capability(), "goal_request_input",
-                CollaborationMode.DEFAULT, TurnOrigin.GOAL_CONTINUATION);
-        AgentTool.Invocation invocation = new AgentTool.Invocation("call_input", "goal_request_input",
-                JsonObjects.builder().putText("goalId", "goal_test").putNumber("expectedGoalRevision", 7)
-                        .putText("runId", "run_test").putText("prompt", "请选择区域")
-                        .putText("expiresAt", "2026-09-04T08:30:00Z")
-                        .putText("idempotencyKey", "idem_input").build(), 0);
-
-        AgentTool.ToolResult result = tool.execute(invocation, context("turn_other"), CancellationToken.none())
-                .toCompletableFuture().join();
-
-        assertEquals(ToolOutcome.FAILED, result.outcome());
-        assertEquals("GOAL_INVALID_STATE", result.errorCode());
-        assertNull(fixture.input().get());
-    }
-
-    /** 合法 Goal 请求只把冻结 CAS 和结构化参数交给受限 UseCase。 */
-    @Test
-    void requestsInputThroughGoalUseCase() {
-        Fixture fixture = fixture();
-        AgentTool tool = tool(fixture.capability(), "goal_request_input",
-                CollaborationMode.DEFAULT, TurnOrigin.GOAL_CONTINUATION);
-        AgentTool.Invocation invocation = new AgentTool.Invocation("call_input", "goal_request_input",
-                JsonObjects.builder().putText("goalId", "goal_test").putNumber("expectedGoalRevision", 7)
-                        .putText("runId", "run_test").putText("prompt", "请选择区域")
-                        .putText("expiresAt", "2026-09-04T08:30:00Z")
-                        .putText("idempotencyKey", "idem_input").build(), 0);
-
-        AgentTool.ToolResult result = tool.execute(invocation, context("turn_test"), CancellationToken.none())
-                .toCompletableFuture().join();
-
-        assertEquals(ToolOutcome.SUCCEEDED, result.outcome(), result::toString);
-        assertEquals(7, fixture.input().get().expectedGoalRevision());
-        assertEquals(NOW, fixture.input().get().at());
-    }
-
     /** 动态代理只实现本测试的最窄 GoalUseCase 路径。 */
     private static Fixture fixture() {
-        AtomicReference<GoalUseCase.InputRequest> input = new AtomicReference<>();
         AtomicReference<GoalUseCase.Propose> propose = new AtomicReference<>();
         GoalUseCase goals = (GoalUseCase) Proxy.newProxyInstance(GoalUseCase.class.getClassLoader(),
                 new Class<?>[]{GoalUseCase.class}, (proxy, method, arguments) -> switch (method.getName()) {
@@ -129,10 +100,6 @@ final class PlanGoalAgentCapabilityTest {
                     case "goalContinuationContext" -> Optional.of(new GoalUseCase.GoalTurnContext(
                             "goal_test", 7, "run_test", GoalModels.GoalStatus.ACTIVE,
                             GoalModels.GoalPhase.WORKING, "plan_test", "planrev_test"));
-                    case "requestInput" -> {
-                        input.set((GoalUseCase.InputRequest) arguments[0]);
-                        yield goal();
-                    }
                     case "propose" -> {
                         GoalUseCase.Propose captured = (GoalUseCase.Propose) arguments[0];
                         propose.set(captured);
@@ -145,14 +112,7 @@ final class PlanGoalAgentCapabilityTest {
                     default -> throw new AssertionError("unexpected GoalUseCase call: " + method.getName());
                 });
         return new Fixture(new PlanGoalAgentCapability(goals, new ObjectMapper(),
-                Clock.fixed(NOW, ZoneOffset.UTC)), input, propose);
-    }
-
-    /** 构造可安全投影的最小 Goal 结果。 */
-    private static GoalModels.Goal goal() {
-        return new GoalModels.Goal("goal_test", "thr_test", GoalModels.OwnerKind.ROOT_THREAD,
-                "完成验收", 1, GoalModels.GoalStatus.ACTIVE, GoalModels.GoalPhase.WAITING_INPUT,
-                8, "run_test", 0, 0, null, false, NOW, NOW);
+                Clock.fixed(NOW, ZoneOffset.UTC)), propose);
     }
 
     /** 通过标准 AgentCapability prepare/binder 取得唯一 Tool。 */
@@ -185,7 +145,7 @@ final class PlanGoalAgentCapabilityTest {
                 AccessMode.APPROVAL_REQUIRED, mode, ThreadPreferences.TitleSource.MANUAL);
         return new AgentCapability.Request("thr_test", "turn_test",
                 Path.of("C:\\ja-plan-goal-tools").toAbsolutePath(), "ws_test", preferences,
-                "cfg_test", DEADLINE, origin);
+                "cfg_test", true, DEADLINE, origin);
     }
 
     /** 构造与 prepare 完全一致的执行上下文。 */
@@ -197,7 +157,6 @@ final class PlanGoalAgentCapabilityTest {
 
     /** 聚合能力和唯一被观察的领域命令。 */
     private record Fixture(PlanGoalAgentCapability capability,
-                           AtomicReference<GoalUseCase.InputRequest> input,
                            AtomicReference<GoalUseCase.Propose> propose) {
     }
 }

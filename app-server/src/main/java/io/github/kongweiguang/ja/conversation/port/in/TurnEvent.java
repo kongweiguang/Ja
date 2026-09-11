@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
+import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import java.time.Instant;
@@ -23,7 +24,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
         TurnEvent.TextDelta, TurnEvent.ReasoningSummaryDelta, TurnEvent.ToolStarted,
         TurnEvent.ToolBatchCommitted,
         TurnEvent.ApprovalRequested, TurnEvent.ApprovalResolved, TurnEvent.InputQueueChanged,
-        TurnEvent.InputConsumed, TurnEvent.Terminal {
+        TurnEvent.InputConsumed, TurnEvent.MessagesReceived, TurnEvent.Terminal {
     /**
      * 返回已提交事件的持久化上下文；一次性流式草稿没有事务上下文。
      */
@@ -49,6 +50,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
             case InputQueueChanged value -> new InputQueueChanged(replacement, value.inputQueue());
             case InputConsumed value -> new InputConsumed(replacement, value.input(), value.userItem(),
                     value.inputQueue(), value.assistantSettlement());
+            case MessagesReceived value -> new MessagesReceived(replacement, value.items());
             case Terminal value -> new Terminal(replacement, value.state(), value.summary(), value.errorCode(),
                     value.errorMessage(), value.finalMessage(), value.usage(), value.changeSet());
         };
@@ -113,6 +115,26 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
             if (!context.turnId().equals(input.turnId()) || !context.turnId().equals(userItem.turnId())
                 || !context.turnId().equals(inputQueue.turnId())) {
                 throw new IllegalArgumentException("consumed input turn mismatch");
+            }
+        }
+    }
+
+    /**
+     * Mailbox 消费事务提交后的真实跨会话消息；不创建 InputConsumed 或 Activity，避免伪造用户动作。
+     */
+    record MessagesReceived(Context context, List<ThreadSnapshot.ThreadMessageItem> items)
+            implements TurnEvent {
+        /**
+         * 批次必须非空且全部属于当前目标 Turn，顺序沿用 Mailbox sequence 的提交顺序。
+         */
+        public MessagesReceived {
+            Objects.requireNonNull(context, "context");
+            items = List.copyOf(Objects.requireNonNull(items, "items"));
+            if (items.isEmpty() || items.size() > 256) {
+                throw new IllegalArgumentException("invalid received message batch");
+            }
+            if (items.stream().anyMatch(item -> !context.turnId().equals(item.turnId()))) {
+                throw new IllegalArgumentException("received message turn mismatch");
             }
         }
     }

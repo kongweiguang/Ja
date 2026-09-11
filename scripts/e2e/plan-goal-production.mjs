@@ -25,7 +25,6 @@ export const PLAN_GOAL_RPC_CONTRACT = Object.freeze({
     planRead: "plan/read",
     planDraftSave: "plan/draft/save",
     planPropose: "plan/propose",
-    planApprove: "plan/approve",
     planExecute: "plan/execute",
     goalCreate: "goal/create",
     goalRead: "goal/read",
@@ -39,7 +38,6 @@ export const PLAN_GOAL_RPC_CONTRACT = Object.freeze({
     planRead: "ja_runtime_plan_read",
     planDraftSave: "ja_runtime_plan_draft_save",
     planPropose: "ja_runtime_plan_propose",
-    planApprove: "ja_runtime_plan_approve",
     planExecute: "ja_runtime_plan_execute",
     goalCreate: "ja_runtime_goal_create",
     goalRead: "ja_runtime_goal_read",
@@ -50,7 +48,7 @@ export const PLAN_GOAL_RPC_CONTRACT = Object.freeze({
   }),
   errors: Object.freeze({
     staleGoalRevision: "GOAL_REVISION_CONFLICT",
-    stalePlanApproval: "PLAN_APPROVAL_STALE",
+    stalePlanRevision: "PLAN_APPROVAL_STALE",
   }),
 });
 
@@ -142,7 +140,7 @@ export function validatePlanGoalAcceptanceReport(report, { expectedSoakMinutes =
   assert.equal(isObject(authority), true);
   assert.equal(authority.planCreatedWithoutGoal, true);
   assert.equal(authority.standalonePlanCompleted, true);
-  assert.equal(authority.planApprovalDidNotExecute, true);
+  assert.equal(authority.planProposalDidNotExecute, true);
   assert.equal(authority.goalCreatedWithoutPlan, true);
   assert.equal(authority.attachApprovedPlan, true);
   assert.equal(authority.attachedGoalOwnedRunStarted, true);
@@ -152,7 +150,7 @@ export function validatePlanGoalAcceptanceReport(report, { expectedSoakMinutes =
   assert.equal(authority.detachGoalRevisionAdvancedBy, 1);
   assert.equal(authority.detachGoalContinued, true);
   assert.equal(authority.staleGoalRevisionCode, "GOAL_REVISION_CONFLICT");
-  assert.equal(authority.stalePlanApprovalCode, "PLAN_APPROVAL_STALE");
+  assert.equal(authority.stalePlanRevisionCode, "PLAN_APPROVAL_STALE");
   assert.deepEqual(authority.hiddenPlanDetailIoDelta, {
     planRead: 0,
     revisionList: 0,
@@ -372,7 +370,6 @@ export async function findMissingPlanGoalHooks(root = repoRoot, desktopRunner) {
         "ja_runtime_plan_read",
         "ja_runtime_plan_draft_save",
         "ja_runtime_plan_propose",
-        "ja_runtime_plan_approve",
         "ja_runtime_plan_execute",
         "ja_runtime_goal_plan_attach",
         "ja_runtime_goal_plan_detach",

@@ -264,6 +264,15 @@ fn native_only_config_rejects_jre_fallback_and_secret_environment() {
         Err(AppServerProcessError::InvalidConfig)
     );
 
+    let mut reserved_generation = sidecar_config(&executable, &run_dir);
+    reserved_generation
+        .args
+        .push(OsString::from("--ja-runtime-generation=99"));
+    assert_eq!(
+        reserved_generation.validate(),
+        Err(AppServerProcessError::InvalidConfig)
+    );
+
     let mut contained = sidecar_config(&executable, &run_dir);
     contained.workspace_root = Some(run_dir.clone());
     assert_eq!(

@@ -287,6 +287,47 @@ describe("TauriHistoryAdapter v1", () => {
     ]);
   });
 
+  it("discovers minimal cross-workspace thread identities without reading a transcript", async () => {
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      expect(command).toBe(JA_HISTORY_COMMANDS.threadDiscover);
+      return {
+        items: [
+          {
+            threadId: "thr_side",
+            title: "临时旁支",
+            kind: "side_chat",
+            workspaceId: "ws_other",
+            status: "running",
+          },
+        ],
+        nextCursor: null,
+      };
+    }) as unknown as HistoryNativeBridge["invoke"];
+    const adapter = new TauriHistoryAdapter({ invoke });
+
+    await expect(
+      adapter.threadDiscover({ scope: "all", query: "旁支", limit: 20 }),
+    ).resolves.toEqual({
+      items: [
+        {
+          threadId: "thr_side",
+          title: "临时旁支",
+          kind: "side_chat",
+          workspaceId: "ws_other",
+          status: "running",
+        },
+      ],
+      nextCursor: null,
+    });
+    await expect(
+      adapter.threadDiscover({ scope: "workspace", query: "旁支" } as never),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(
+      adapter.threadDiscover({ scope: "all", query: "旁\u0003支" } as never),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects client-owned workspace ids, revisions, and legacy replay fields before invoke", async () => {
     const invoke = vi.fn(
       async (): Promise<unknown> => snapshot(),

@@ -31,9 +31,11 @@ const completeConfigDocument = {
   schema_version: 1,
   config_revision: 0,
   default_access_mode: "full_access",
+  interaction: { clarification_enabled: true },
   default_provider_id: "provider_demo",
   default_model_id: "model_demo",
   default_reasoning_level: "medium",
+  subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
   providers: [
     {
       provider_id: "provider_demo",
@@ -76,7 +78,7 @@ describe("JA RPC v1 protocol", () => {
         events: ["runtime/status-changed"],
         accessModes: ["approval_required", "full_access"],
         collaborationModes: ["default", "plan"],
-        features: ["task_threads_v1", "plan_goal_v1"],
+        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
       },
       limits,
     } as const;
@@ -105,7 +107,7 @@ describe("JA RPC v1 protocol", () => {
         occurredAt: "2026-09-04T00:00:00Z",
         status: "ready",
         generation: 1,
-        features: ["task_threads_v1", "plan_goal_v1"],
+        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
         readyToken: "0123456789abcdef0123456789abcdef",
       },
     } as const;
@@ -119,7 +121,7 @@ describe("JA RPC v1 protocol", () => {
         ...ready,
         params: {
           ...ready.params,
-          features: ["plan_goal_v1", "task_threads_v1"],
+          features: ["plan_goal_v1", "task_threads_v1", "interaction_v1"],
         },
       }),
     ).toThrow();
@@ -620,7 +622,7 @@ describe("JA RPC v1 protocol", () => {
         events: [],
         accessModes: ["approval_required", "full_access"],
         collaborationModes: ["default", "plan"],
-        features: ["task_threads_v1", "plan_goal_v1"],
+        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
       },
       limits,
     };

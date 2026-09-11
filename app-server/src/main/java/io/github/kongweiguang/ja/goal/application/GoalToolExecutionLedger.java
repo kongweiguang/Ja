@@ -53,6 +53,37 @@ public final class GoalToolExecutionLedger implements GoalToolExecutionPort {
         };
     }
 
+    /**
+     * Interaction 创建前从不可变 Turn binding 读取身份；同时核对聚合 owner，防止错误 Thread 复用同一
+     * turnId 的迟到请求。恢复与重启都走这条 SQLite 查询，不依赖进程内缓存。
+     */
+    @Override
+    public Optional<ExecutionIdentity> executionIdentity(String threadId, String turnId, io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin origin) {
+        return goals.findInternalTurnBinding(turnId)
+                .filter(binding -> origin.name().equals(binding.origin()))
+                .flatMap(binding -> {
+                    if (origin == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.GOAL_CONTINUATION
+                            && binding.goalId() != null) {
+                        return goals.findGoal(binding.goalId())
+                                .filter(goal -> goal.ownerThreadId().equals(threadId))
+                                .map(ignored -> new ExecutionIdentity(binding.planRevisionId(), binding.runId(),
+                                        binding.goalId()));
+                    }
+                    if (origin == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.PLAN_EXECUTION
+                            && binding.planId() != null) {
+                        try {
+                            return Optional.of(goals.readPlanSnapshot(binding.planId()))
+                                    .filter(snapshot -> snapshot.plan().ownerThreadId().equals(threadId))
+                                    .map(ignored -> new ExecutionIdentity(binding.planRevisionId(), binding.runId(),
+                                            null));
+                        } catch (RuntimeException missing) {
+                            return Optional.empty();
+                        }
+                    }
+                    return Optional.empty();
+                });
+    }
+
     /** GOAL_CONTINUATION 必须同时匹配不可变 context、当前 Goal run/link 与仍持有的 fencing lease。 */
     private Optional<Attempt> prepareGoal(Prepare request, GoalRepository.InternalTurnBinding binding) {
         GoalModels.Goal goal = goals.findGoal(binding.goalId()).orElse(null);
@@ -106,11 +137,12 @@ public final class GoalToolExecutionLedger implements GoalToolExecutionPort {
                 .filter(item -> item.status() == GoalModels.StepStatus.RUNNING
                         || item.status() == GoalModels.StepStatus.READY)
                 .findFirst().orElse(null);
-        if (step == null) return Optional.empty();
         String attemptId = id("toolattempt_");
         goals.prepareToolAttempt(new GoalRepository.PrepareToolAttempt(new GoalModels.ToolAttempt(
                 attemptId, null, plan.planId(), null, plan.activeRunId(), plan.activePlanRevisionId(),
-                step.stepId(), Math.max(1, step.attempt()), request.turnId(), request.callId(), processGeneration,
+                // 独立验收 NOT_MET 后步骤可能均为成功；修正调用仍必须入原 Run 账本，不能因无活动步骤漏记副作用。
+                step == null ? null : step.stepId(), step == null ? 1 : Math.max(1, step.attempt()),
+                request.turnId(), request.callId(), processGeneration,
                 request.sideEffect() != ToolSideEffect.READ_ONLY, GoalModels.ToolAttemptState.PREPARED,
                 GoalDigest.sha256(request.toolName() + '\n' + request.arguments()), null,
                 request.at(), null, null)));

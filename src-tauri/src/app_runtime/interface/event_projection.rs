@@ -13,7 +13,7 @@ pub const RPC_FRAME_EVENT: &str = "ja://rpc/frame";
 const STATUS_EVENT_PREFIX: &str = "evt_host_";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// Host emitter 与 Java event validator 共享唯一 2.1 feature 顺序，避免两条 Ready 来源漂移。
-const RUNTIME_STATUS_FEATURES: [&str; 2] = ["task_threads_v1", "plan_goal_v1"];
+const RUNTIME_STATUS_FEATURES: [&str; 3] = ["task_threads_v1", "plan_goal_v1", "interaction_v1"];
 const NOTIFICATION_COMMON_FIELDS: [&str; 5] = [
     "serverInstanceId",
     "eventId",
@@ -261,8 +261,14 @@ fn validate_kernel_event(
     method: &str,
     params: &serde_json::Map<String, Value>,
 ) -> Result<(), RuntimeCommandError> {
+    if method == "plan/changed" {
+        return validate_plan_event(params);
+    }
     if method.starts_with("goal/") {
         return validate_goal_event(method, params);
+    }
+    if method == "interaction/changed" {
+        return validate_interaction_event(params);
     }
     if method.starts_with("task/") {
         return validate_task_event(method, params);
@@ -397,6 +403,13 @@ fn validate_kernel_event(
                 return Err(invalid_projection());
             }
         }
+        "turn/messages_received" => {
+            if !exact(&["items"], &[])
+                || !valid_thread_message_items(params.get("items"), params.get("turnId"))
+            {
+                return Err(invalid_projection());
+            }
+        }
         "turn/terminal" => {
             if !exact(
                 &["state", "summary", "changeSet"],
@@ -494,25 +507,152 @@ fn validate_goal_event(
                             })
                     })
         }
-        "goal/input-requested" => {
-            exact(&["input"])
-                && params
-                    .get("input")
-                    .and_then(Value::as_object)
-                    .is_some_and(|input| {
-                        exact_keys(
-                            input,
-                            &["inputRequestId", "prompt", "expiresAt", "createdAt"],
-                            &[],
-                        ) && valid_prefixed(input.get("inputRequestId"), "goalinput_", 106)
-                            && bounded_text(input.get("prompt"), 1, 32_768)
-                            && valid_timestamp(input.get("expiresAt"))
-                            && valid_timestamp(input.get("createdAt"))
-                    })
-        }
         _ => false,
     };
     valid.then_some(()).ok_or_else(invalid_projection)
+}
+
+/// Interaction 事件只携带轻量 revision/kind，不把问题正文或答案作为通知重复发送。
+fn validate_interaction_event(
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), RuntimeCommandError> {
+    if !valid_notification_common(params)
+        || !valid_prefixed(params.get("threadId"), "thr_", 100)
+        || !valid_prefixed(params.get("requestId"), "interaction_", 128)
+        || !non_negative_integer(params.get("requestRevision"))
+        || !non_negative_integer(params.get("eventSequence"))
+        || !params
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                matches!(
+                    value,
+                    "created" | "draft_changed" | "answered" | "cancelled" | "superseded"
+                )
+            })
+        || !exact_keys_with_common(
+            params,
+            &NOTIFICATION_COMMON_FIELDS,
+            &[
+                "threadId",
+                "requestId",
+                "requestRevision",
+                "eventSequence",
+                "kind",
+            ],
+            &[],
+        )
+    {
+        return Err(invalid_projection());
+    }
+    Ok(())
+}
+
+/// Plan 事件同时携带完整计划摘要与独立进度投影；两者共用同一事件水位，避免 UI 将旧步骤进度拼到新计划上。
+fn validate_plan_event(params: &serde_json::Map<String, Value>) -> Result<(), RuntimeCommandError> {
+    if !valid_notification_common(params)
+        || !valid_prefixed(params.get("ownerThreadId"), "thr_", 100)
+        || !valid_prefixed(params.get("planId"), "plan_", 101)
+        || !non_negative_integer(params.get("planRevision"))
+        || !non_negative_integer(params.get("eventSequence"))
+        || !exact_keys_with_common(
+            params,
+            &NOTIFICATION_COMMON_FIELDS,
+            &[
+                "ownerThreadId",
+                "planId",
+                "planRevision",
+                "eventSequence",
+                "plan",
+                "progress",
+            ],
+            &[],
+        )
+    {
+        return Err(invalid_projection());
+    }
+    let plan = params.get("plan").and_then(Value::as_object);
+    let progress = params.get("progress").and_then(Value::as_object);
+    let valid_plan = plan.is_some_and(|value| {
+        exact_keys(
+            value,
+            &[
+                "planId",
+                "owner",
+                "objective",
+                "status",
+                "revision",
+                "activePlanRevisionId",
+                "activeRunId",
+                "createdAt",
+                "updatedAt",
+            ],
+            &[],
+        ) && valid_prefixed(value.get("planId"), "plan_", 101)
+            && valid_timestamp(value.get("createdAt"))
+            && valid_timestamp(value.get("updatedAt"))
+            && value
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    matches!(
+                        status,
+                        "draft"
+                            | "awaiting_approval"
+                            | "approved"
+                            | "executing"
+                            | "verifying"
+                            | "paused"
+                            | "completed"
+                            | "stopped"
+                    )
+                })
+            && value
+                .get("owner")
+                .and_then(Value::as_object)
+                .is_some_and(|owner| {
+                    exact_keys(owner, &["kind", "threadId"], &[])
+                        && owner.get("kind").and_then(Value::as_str) == Some("thread")
+                        && valid_prefixed(owner.get("threadId"), "thr_", 100)
+                })
+            && value
+                .get("activePlanRevisionId")
+                .is_some_and(|id| id.is_null() || valid_prefixed(Some(id), "planrev_", 104))
+            && value
+                .get("activeRunId")
+                .is_some_and(|id| id.is_null() || valid_prefixed(Some(id), "run_", 100))
+    });
+    let valid_progress = progress.is_some_and(|value| {
+        exact_keys(
+            value,
+            &[
+                "currentStepId",
+                "currentStepTitle",
+                "completedRequiredSteps",
+                "totalRequiredSteps",
+            ],
+            &[],
+        ) && value
+            .get("currentStepId")
+            .is_some_and(|id| id.is_null() || valid_prefixed(Some(id), "step_", 101))
+            && value
+                .get("currentStepTitle")
+                .is_some_and(|title| title.is_null() || bounded_text(Some(title), 1, 240))
+            && integer_in_range(value.get("completedRequiredSteps"), 0, 256)
+            && integer_in_range(value.get("totalRequiredSteps"), 0, 256)
+            && value.get("completedRequiredSteps").and_then(Value::as_u64)
+                <= value.get("totalRequiredSteps").and_then(Value::as_u64)
+    });
+    let identity_matches = plan.is_some_and(|value| {
+        value.get("planId") == params.get("planId")
+            && value.get("revision").and_then(Value::as_u64)
+                == params.get("planRevision").and_then(Value::as_u64)
+    });
+    if valid_plan && valid_progress && identity_matches {
+        Ok(())
+    } else {
+        Err(invalid_projection())
+    }
 }
 
 /// 三类 Task notification 使用独立 task revision 流；activity/mailbox 是不可丢事实，
@@ -688,6 +828,22 @@ fn valid_assistant_settlement(value: &Value) -> bool {
             && optional_usage(settlement.get("usage"))
             && usage_matches_model_round(settlement.get("usage"), settlement.get("modelRound"))
             && optional_bounded_text(settlement.get("reasoningSummary"), 0, 1_048_576)
+    })
+}
+
+/// Mailbox 消费事件只接收非空 `thread_message` item 批次，并把每条消息绑定到当前 Turn。
+fn valid_thread_message_items(value: Option<&Value>, turn_id: Option<&Value>) -> bool {
+    let Some(turn_id) = turn_id.and_then(Value::as_str) else {
+        return false;
+    };
+    value.and_then(Value::as_array).is_some_and(|items| {
+        !items.is_empty()
+            && items.len() <= 256
+            && items.iter().all(|item| {
+                item.as_object().is_some_and(|item| {
+                    super::history_model::valid_thread_message_item_wire(item, Some(turn_id))
+                })
+            })
     })
 }
 

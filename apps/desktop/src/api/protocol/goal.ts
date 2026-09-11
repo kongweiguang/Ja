@@ -52,10 +52,6 @@ const EvaluationIdSchema = z
   .string()
   .regex(/^evaluation_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
   .max(107);
-const GoalInputIdSchema = z
-  .string()
-  .regex(/^goalinput_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
-  .max(106);
 const ObservationIdSchema = z
   .string()
   .regex(/^observe_[A-Za-z0-9][A-Za-z0-9._-]{7,95}$/)
@@ -104,6 +100,8 @@ export const PlanStatusSchema = z.enum([
   "awaiting_approval",
   "approved",
   "executing",
+  "verifying",
+  "paused",
   "completed",
   "stopped",
 ]);
@@ -234,34 +232,26 @@ export const PlanSchema = z
   })
   .strict()
   .superRefine((value, context) => {
-    const running = value.status === "executing" || value.status === "completed";
-    if (running !== (value.activePlanRevisionId !== null && value.activeRunId !== null)) {
-      context.addIssue({
-        code: "custom",
-        path: ["activeRunId"],
-        message: "plan execution identity is invalid",
-      });
-    }
-    if (
-      value.status === "approved" &&
-      (value.activePlanRevisionId === null || value.activeRunId !== null)
-    ) {
+    // 停止保留冻结版本与 Run 供历史审阅；不能因终态拒绝真实服务端投影。
+    const requiresRevision = new Set(["approved", "executing", "verifying", "paused", "completed"]);
+    const requiresRun = new Set(["executing", "verifying", "paused", "completed"]);
+    const hasRevision = value.activePlanRevisionId !== null;
+    const hasRun = value.activeRunId !== null;
+    if (value.status !== "stopped" && requiresRevision.has(value.status) !== hasRevision) {
       context.addIssue({
         code: "custom",
         path: ["activePlanRevisionId"],
-        message: "approved plan identity is invalid",
+        message: "plan revision identity is invalid",
+      });
+    }
+    if (value.status !== "stopped" && requiresRun.has(value.status) !== hasRun) {
+      context.addIssue({
+        code: "custom",
+        path: ["activeRunId"],
+        message: "plan run identity is invalid",
       });
     }
   });
-
-export const GoalInputRequestSchema = z
-  .object({
-    inputRequestId: GoalInputIdSchema,
-    prompt: SafeTextSchema,
-    expiresAt: TimestampSchema,
-    createdAt: TimestampSchema,
-  })
-  .strict();
 
 export const GoalEvaluationSchema = z
   .object({
@@ -302,7 +292,6 @@ export const GoalSchema = z
     currentStepId: PlanStepIdSchema.nullable(),
     completedRequiredSteps: RevisionSchema,
     totalRequiredSteps: RevisionSchema,
-    pendingInput: GoalInputRequestSchema.nullable(),
     attentionReason: ShortTextSchema.nullable(),
     latestEvaluation: GoalEvaluationSchema.nullable(),
     createdAt: TimestampSchema,
@@ -462,6 +451,7 @@ const GoalPageParamsSchema = z
   })
   .strict();
 const PlanReadParamsSchema = z.object({ threadId: ThreadIdSchema, planId: PlanIdSchema }).strict();
+const PlanCurrentReadParamsSchema = z.object({ threadId: ThreadIdSchema }).strict();
 const PlanPageParamsSchema = PlanReadParamsSchema.extend({
   cursor: CursorSchema.optional(),
   limit: z.number().int().min(1).max(200).optional(),
@@ -469,6 +459,15 @@ const PlanPageParamsSchema = PlanReadParamsSchema.extend({
 const PlanMutationParamsSchema = PlanReadParamsSchema.extend({
   expectedPlanRevision: RevisionSchema,
   idempotencyKey: IdempotencyKeySchema,
+}).strict();
+const PlanControlParamsSchema = PlanMutationParamsSchema.extend({
+  runId: RunIdSchema,
+}).strict();
+const PlanEvidenceListParamsSchema = PlanReadParamsSchema.extend({
+  planRevisionId: PlanRevisionIdSchema,
+  runId: RunIdSchema,
+  cursor: CursorSchema.optional(),
+  limit: z.number().int().min(1).max(200).optional(),
 }).strict();
 
 const GoalCreateParamsSchema = z
@@ -490,10 +489,6 @@ const PlanCreateParamsSchema = z
   .strict();
 const GoalObserveParamsSchema = GoalReadParamsSchema;
 const GoalUnobserveParamsSchema = z.object({ observationId: ObservationIdSchema }).strict();
-const GoalInputRespondParamsSchema = GoalMutationParamsSchema.extend({
-  inputRequestId: GoalInputIdSchema,
-  response: SafeTextSchema,
-}).strict();
 const PlanDraftSaveParamsSchema = PlanMutationParamsSchema.extend({
   draft: PlanDefinitionSchema,
 }).strict();
@@ -532,8 +527,6 @@ const GoalEventsResultSchema = z
               "step_changed",
               "evidence_added",
               "continuation_no_progress",
-              "input_requested",
-              "input_received",
               "evaluation_started",
               "evaluation_completed",
               "paused",
@@ -560,6 +553,54 @@ const PlanRevisionsResultSchema = z
     nextCursor: CursorSchema.nullable(),
   })
   .strict();
+const PlanEventsResultSchema = z
+  .object({
+    planId: PlanIdSchema,
+    planRevision: RevisionSchema,
+    eventSequence: RevisionSchema,
+    items: z
+      .array(
+        z
+          .object({
+            eventSequence: RevisionSchema,
+            kind: z.enum([
+              "created",
+              "plan_attached",
+              "plan_detached",
+              "run_started",
+              "tool_approval_requested",
+              "tool_approval_resolved",
+              "step_changed",
+              "evidence_added",
+              "continuation_no_progress",
+              "evaluation_started",
+              "evaluation_completed",
+              "paused",
+              "resumed",
+              "stopped",
+              "achieved",
+              "recovery_required",
+            ]),
+            summary: SafeTextSchema,
+            occurredAt: TimestampSchema,
+          })
+          .strict(),
+      )
+      .max(200),
+    nextCursor: CursorSchema.nullable(),
+  })
+  .strict();
+const PlanEvidenceResultSchema = z
+  .object({
+    planId: PlanIdSchema,
+    planRevision: RevisionSchema,
+    eventSequence: RevisionSchema,
+    planRevisionId: PlanRevisionIdSchema,
+    runId: RunIdSchema,
+    items: z.array(AcceptanceEvidenceSchema).max(200),
+    nextCursor: CursorSchema.nullable(),
+  })
+  .strict();
 const GoalEvidenceResultSchema = z
   .object({
     goalId: GoalIdSchema,
@@ -574,6 +615,7 @@ const GoalEvidenceResultSchema = z
 const GoalObserveResultSchema = GoalProjectionResultSchema.extend({
   observationId: ObservationIdSchema,
 }).strict();
+const PlanCurrentReadResultSchema = z.object({ current: PlanProjectionSchema.nullable() }).strict();
 const AcceptedResultSchema = z.object({ accepted: z.literal(true) }).strict();
 
 /** WebView 的 Goal/Plan 请求闭集与 Java、Rust method catalog 保持一一对应。 */
@@ -583,6 +625,7 @@ export const GoalParamsSchemaByMethod = {
   "goal/observe": GoalObserveParamsSchema,
   "goal/unobserve": GoalUnobserveParamsSchema,
   "plan/read": PlanReadParamsSchema,
+  "plan/current/read": PlanCurrentReadParamsSchema,
   "plan/revisions/list": PlanPageParamsSchema,
   "goal/evidence/list": GoalEvidenceListParamsSchema,
   "goal/create": GoalCreateParamsSchema,
@@ -591,13 +634,18 @@ export const GoalParamsSchemaByMethod = {
   "goal/pause": GoalMutationParamsSchema,
   "goal/resume": GoalMutationParamsSchema,
   "goal/stop": GoalMutationParamsSchema,
-  "goal/input/respond": GoalInputRespondParamsSchema,
   "plan/create": PlanCreateParamsSchema,
   "plan/draft/save": PlanDraftSaveParamsSchema,
   "plan/draft/discard": PlanMutationParamsSchema,
   "plan/propose": PlanMutationParamsSchema,
-  "plan/approve": PlanApprovalBindingParamsSchema,
   "plan/execute": PlanApprovalBindingParamsSchema,
+  "plan/observe": PlanReadParamsSchema,
+  "plan/unobserve": GoalUnobserveParamsSchema,
+  "plan/events/read": PlanPageParamsSchema,
+  "plan/evidence/list": PlanEvidenceListParamsSchema,
+  "plan/pause": PlanControlParamsSchema,
+  "plan/resume": PlanControlParamsSchema,
+  "plan/stop": PlanControlParamsSchema,
   "plan/reject": PlanRejectParamsSchema,
 } as const;
 
@@ -608,6 +656,7 @@ export const GoalResultSchemaByMethod = {
   "goal/observe": GoalObserveResultSchema,
   "goal/unobserve": AcceptedResultSchema,
   "plan/read": PlanProjectionSchema,
+  "plan/current/read": PlanCurrentReadResultSchema,
   "plan/revisions/list": PlanRevisionsResultSchema,
   "goal/evidence/list": GoalEvidenceResultSchema,
   "goal/create": GoalProjectionResultSchema,
@@ -616,13 +665,18 @@ export const GoalResultSchemaByMethod = {
   "goal/pause": GoalProjectionResultSchema,
   "goal/resume": GoalProjectionResultSchema,
   "goal/stop": GoalProjectionResultSchema,
-  "goal/input/respond": GoalProjectionResultSchema,
   "plan/create": PlanProjectionSchema,
   "plan/draft/save": PlanProjectionSchema,
   "plan/draft/discard": PlanProjectionSchema,
   "plan/propose": PlanProjectionSchema,
-  "plan/approve": PlanProjectionSchema,
   "plan/execute": PlanProjectionSchema,
+  "plan/observe": PlanProjectionSchema.extend({ observationId: ObservationIdSchema }).strict(),
+  "plan/unobserve": AcceptedResultSchema,
+  "plan/events/read": PlanEventsResultSchema,
+  "plan/evidence/list": PlanEvidenceResultSchema,
+  "plan/pause": PlanProjectionSchema,
+  "plan/resume": PlanProjectionSchema,
+  "plan/stop": PlanProjectionSchema,
   "plan/reject": PlanProjectionSchema,
 } as const;
 
@@ -650,9 +704,39 @@ export const GoalActivityParamsSchema = GoalEventBaseSchema.extend({
     })
     .strict(),
 }).strict();
-export const GoalInputRequestedParamsSchema = GoalEventBaseSchema.extend({
-  input: GoalInputRequestSchema,
-}).strict();
+/** Plan 状态事件只携带摘要和序列，正文 revision 仍由 plan/read 按需读取。 */
+export const PlanChangedParamsSchema = z
+  .object({
+    serverInstanceId: z
+      .string()
+      .regex(/^srv_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(100),
+    eventId: z
+      .string()
+      .regex(/^evt_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(100),
+    sequence: z.number().int().min(1).max(MAX_SAFE_INTEGER),
+    occurredAt: TimestampSchema,
+    generation: PositiveRevisionSchema,
+    ownerThreadId: ThreadIdSchema,
+    planId: PlanIdSchema,
+    planRevision: RevisionSchema,
+    eventSequence: RevisionSchema,
+    plan: PlanSchema,
+    progress: z
+      .object({
+        currentStepId: PlanStepIdSchema.nullable(),
+        currentStepTitle: z.string().min(1).max(240).nullable(),
+        completedRequiredSteps: z.number().int().min(0).max(256),
+        totalRequiredSteps: z.number().int().min(0).max(256),
+      })
+      .strict(),
+  })
+  .strict()
+  .refine((value) => value.plan.planId === value.planId, { message: "plan identity mismatch" })
+  .refine((value) => value.plan.owner.threadId === value.ownerThreadId, {
+    message: "plan owner mismatch",
+  });
 
 export type Goal = z.infer<typeof GoalSchema>;
 export type Plan = z.infer<typeof PlanSchema>;
@@ -665,7 +749,6 @@ export type PlanStepExecution = z.infer<typeof PlanStepExecutionSchema>;
 export type AcceptanceCriterion = z.infer<typeof AcceptanceCriterionSchema>;
 export type AcceptanceEvidence = z.infer<typeof AcceptanceEvidenceSchema>;
 export type GoalEvaluation = z.infer<typeof GoalEvaluationSchema>;
-export type GoalInputRequest = z.infer<typeof GoalInputRequestSchema>;
 export type GoalMethod = keyof typeof GoalParamsSchemaByMethod;
 export type GoalMethodParams<M extends GoalMethod> = z.infer<(typeof GoalParamsSchemaByMethod)[M]>;
 export type GoalMethodResult<M extends GoalMethod> = z.infer<(typeof GoalResultSchemaByMethod)[M]>;

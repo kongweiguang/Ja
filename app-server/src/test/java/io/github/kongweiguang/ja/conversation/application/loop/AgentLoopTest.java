@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 package io.github.kongweiguang.ja.conversation.application.loop;
 
@@ -61,7 +62,9 @@ import io.github.kongweiguang.ja.conversation.application.context.ContextOrchest
 import io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryDocument;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryGenerator;
+import io.github.kongweiguang.ja.conversation.application.discovery.McpToolSearch;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
@@ -106,7 +109,7 @@ final class AgentLoopTest {
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         UserContent content = new UserContent(List.of(new TextContent("child update")));
         TaskMailboxPort.ClaimedMessage message = new TaskMailboxPort.ClaimedMessage(
-                1, "msg_mailbox", "thr_test", "thr_parent", "thr_test", "turn_parent",
+                1, "msg_mailbox", "thr_test", "thr_parent", "父会话", "thr_test", "turn_parent",
                 TaskMailboxPort.MessageKind.MESSAGE, content, "tool:turn_parent:call_send", "turn_test");
         store.mailbox = List.of(message);
         AtomicInteger requests = new AtomicInteger();
@@ -121,14 +124,23 @@ final class AgentLoopTest {
                     ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
         };
 
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
         try (AgentLoop loop = loop(model, store, mcp)) {
             loop.bindTaskMailbox(taskMailbox(message));
             TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
-                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+                    event -> {
+                        events.add(event);
+                        return CompletableFuture.completedFuture(null);
+                    }).toCompletableFuture().join();
 
             assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
             assertEquals(1, requests.get());
             assertTrue(store.mailboxConsumed);
+            TurnEvent.MessagesReceived received = events.stream()
+                    .filter(TurnEvent.MessagesReceived.class::isInstance)
+                    .map(TurnEvent.MessagesReceived.class::cast).findFirst().orElseThrow();
+            assertEquals("thr_parent", received.items().getFirst().sourceThreadId());
+            assertEquals("child update", received.items().getFirst().content());
             assertEquals(List.of("hello", "child update", "acknowledged"), store.messages.stream()
                     .map(ConversationRepository.StoredMessage::message)
                     .flatMap(value -> value.content().stream())
@@ -180,6 +192,45 @@ final class AgentLoopTest {
             assertEquals(List.of("hello", "assistant-1", "steer-1", "steer-2", "assistant-2",
                             "follow-1", "assistant-3", "follow-2", "assistant-4"),
                     store.messages.stream().map(message -> text(message.message())).toList());
+        }
+    }
+
+    /** STOP 已随排队输入原子提交后，InputConsumed 发布失败不能让 FAILED 终态重复写 reasoning 摘要。 */
+    @Test
+    void doesNotDuplicateReasoningWhenQueuedStopProjectionFails() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicBoolean projectionRejected = new AtomicBoolean();
+        RuntimeException rejection = new IllegalStateException("input projection failed");
+        ModelPort model = (request, sink, cancellation) -> {
+            store.queue(pending("input_after_projection_failure", ConversationRepository.InputKind.FOLLOW_UP,
+                    "continue after failure", CLOCK.instant().plusSeconds(1)));
+            sink.onEvent(new ModelPort.TextDelta("answer")).toCompletableFuture().join();
+            sink.onEvent(new ModelPort.ReasoningSummaryDelta("public reasoning"))
+                    .toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(), event -> {
+                if (event instanceof TurnEvent.InputConsumed
+                        && projectionRejected.compareAndSet(false, true)) {
+                    return CompletableFuture.failedFuture(rejection);
+                }
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(1, store.terminalCommits);
+            assertEquals(1, store.facts.stream()
+                    .filter(ConversationRepository.AssistantFact.class::isInstance)
+                    .map(ConversationRepository.AssistantFact.class::cast)
+                    .filter(fact -> "public reasoning".equals(fact.reasoningSummary()))
+                    .count());
+            assertEquals(0, store.facts.stream()
+                    .filter(ConversationRepository.ReasoningSummaryFact.class::isInstance)
+                    .count());
         }
     }
 
@@ -1469,6 +1520,49 @@ final class AgentLoopTest {
         assertEquals(store.committedRevision, terminal.context().threadRevision());
     }
 
+    /**
+     * 真实 Agent Loop 必须把大型 MCP 目录分成发现、恢复和执行三轮：首轮只暴露搜索入口，
+     * 搜索结果经 ToolOutputProjector 尾注后仍能恢复精确绑定，下一轮只暴露命中的定义并执行真实假 Tool。
+     */
+    @Test
+    void discoversLargeMcpCatalogThenExecutesOnlyMatchedTool() {
+        RecordingStore store = new RecordingStore();
+        AtomicReference<JsonObject> executedArguments = new AtomicReference<>();
+        List<AgentTool> mcpTools = new ArrayList<>();
+        mcpTools.add(new DiscoveryMcpTool("target_tool", "target tool", true, executedArguments));
+        for (int index = 0; index < 19; index++) {
+            mcpTools.add(new DiscoveryMcpTool("decoy_tool_" + index, "unrelated tool " + index,
+                    false, executedArguments));
+        }
+        DiscoveryMcpFactory mcp = new DiscoveryMcpFactory(mcpTools);
+        DiscoveryLoopModel model = new DiscoveryLoopModel();
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+        }
+
+        assertEquals(3, model.requests.size());
+        assertEquals("payload", ((JsonText) executedArguments.get().get("value")).value());
+        assertEquals(1, mcpTools.stream().filter(tool -> tool instanceof DiscoveryMcpTool discovery
+                && discovery.executions.get() > 0).count());
+        long fullCatalogBytes = mcpTools.stream().mapToLong(tool -> tool.spec().name()
+                .getBytes(StandardCharsets.UTF_8).length
+                + tool.spec().description().getBytes(StandardCharsets.UTF_8).length
+                + AgentTool.canonicalSchema(tool.spec().inputSchema())
+                .getBytes(StandardCharsets.UTF_8).length).sum();
+        long firstRequestBytes = model.requests.getFirst().tools().stream().mapToLong(spec -> spec.name()
+                .getBytes(StandardCharsets.UTF_8).length
+                + spec.description().getBytes(StandardCharsets.UTF_8).length
+                + AgentTool.canonicalSchema(spec.inputSchema()).getBytes(StandardCharsets.UTF_8).length).sum();
+        assertTrue(firstRequestBytes * 2 < fullCatalogBytes,
+                "first request must materially reduce the MCP schema envelope");
+        assertTrue(model.searchResultHadProjectionFooter,
+                "the search result must pass through the normal bounded Tool output projector");
+    }
+
     /** 组合真实 Agent Loop 与隔离端口假实现，保持用例集中验证编排顺序。 */
     private static AgentLoop loop(ModelPort model, RecordingStore store, TurnToolSessionFactory mcp) {
         return new AgentLoop(withTokenCounting(model), new NoopApprovalBroker(), store,
@@ -1955,6 +2049,122 @@ final class AgentLoopTest {
         }
     }
 
+    /** 逐轮核对真实模型请求的可见工具集合，并以搜索、目标调用、终态文本驱动 Agent Loop。 */
+    private static final class DiscoveryLoopModel implements ModelPort {
+        private final List<ModelRequest> requests = new ArrayList<>();
+        private boolean searchResultHadProjectionFooter;
+
+        /** 搜索结果必须先经过正常 Tool 消息投影，再由下一轮请求恢复命中的 MCP 定义。 */
+        @Override
+        public CompletionStage<ModelOutcome> start(ModelRequest request, ModelEventSink sink,
+                                                   CancellationToken cancellationToken) {
+            requests.add(request);
+            List<String> names = request.tools().stream().map(ToolSpec::name).toList();
+            if (request.round() == 1) {
+                assertEquals(List.of(McpToolSearch.NAME), names);
+                sink.onEvent(new TextDelta("discover"));
+                sink.onEvent(new ToolCallReady("call_search", McpToolSearch.NAME,
+                        JsonObjects.builder().putText("query", "target_tool").build(), 0));
+                return CompletableFuture.completedFuture(new ModelOutcome(FinishReason.TOOL_CALLS,
+                        new Continuation("test", "target"), new ModelUsage(1, 1, 2)));
+            }
+            if (request.round() == 2) {
+                ToolResultContent searchResult = latestToolResult(request);
+                searchResultHadProjectionFooter = searchResult.content().contains("\n[characters=");
+                assertTrue(names.contains(McpToolSearch.NAME));
+                assertTrue(names.contains("target_tool"));
+                assertTrue(names.stream().noneMatch(name -> name.startsWith("decoy_tool_")));
+                sink.onEvent(new TextDelta("execute"));
+                sink.onEvent(new ToolCallReady("call_target", "target_tool",
+                        JsonObjects.builder().putText("value", "payload").build(), 0));
+                return CompletableFuture.completedFuture(new ModelOutcome(FinishReason.TOOL_CALLS,
+                        new Continuation("test", "done"), new ModelUsage(1, 1, 2)));
+            }
+            assertEquals(3, request.round());
+            assertTrue(names.contains("target_tool"));
+            sink.onEvent(new TextDelta("complete"));
+            return CompletableFuture.completedFuture(new ModelOutcome(FinishReason.STOP, null,
+                    new ModelUsage(1, 1, 2)));
+        }
+    }
+
+    /** 将冻结 MCP 假工具作为每轮独占会话返回，覆盖真实 Loop 的发现与执行资源生命周期。 */
+    private static final class DiscoveryMcpFactory implements TurnToolSessionFactory {
+        private final List<AgentTool> tools;
+
+        /** 保留不可变 Tool 快照，使测试不会因会话重开而隐式改变目录。 */
+        private DiscoveryMcpFactory(List<AgentTool> tools) {
+            this.tools = List.copyOf(tools);
+        }
+
+        /** 每轮都返回同一代 MCP 目录，保证搜索摘要可与执行路由精确配对。 */
+        @Override
+        public Session open(CancellationToken cancellationToken) {
+            return new Session() {
+                /** 返回固定 MCP 快照，保证每轮发现与执行使用同一组路由身份。 */
+                @Override
+                public List<AgentTool> tools() {
+                    return tools;
+                }
+
+                /** 测试快照没有外部句柄，但保留真实 Session 的关闭边界。 */
+                @Override
+                public void close() {
+                    // 测试快照无外部资源，保留空关闭实现以覆盖 Session 生命周期。
+                }
+            };
+        }
+    }
+
+    /** 具备严格必填参数 Schema 的 MCP 假工具，记录唯一真实目标调用以防止误执行未命中工具。 */
+    private static final class DiscoveryMcpTool implements AgentTool {
+        private final ToolSpec spec;
+        private final boolean target;
+        private final AtomicReference<JsonObject> executedArguments;
+        private final AtomicInteger executions = new AtomicInteger();
+        private final ToolBindingDescriptor binding;
+
+        /** 目标工具要求 value 字符串，借此让 AgentToolRunner 的生产参数校验参与集成测试。 */
+        private DiscoveryMcpTool(String name, String description, boolean target,
+                                 AtomicReference<JsonObject> executedArguments) {
+            this.spec = new ToolSpec(name, description,
+                    JsonObjects.builder().putText("type", "object")
+                            .put("properties", JsonObjects.builder()
+                                    .put("value", JsonObjects.builder().putText("type", "string").build())
+                                    .build())
+                            .put("required", new JsonArray(List.of(new JsonText("value"))))
+                            .putBoolean("additionalProperties", false).build());
+            this.target = target;
+            this.executedArguments = executedArguments;
+            this.binding = new ToolBindingDescriptor(RouteKind.MCP, name, "test_mcp", name,
+                    "a".repeat(64), "b".repeat(64));
+        }
+
+        /** 暴露与搜索摘要相同的不可变 MCP 定义。 */
+        @Override
+        public ToolSpec spec() {
+            return spec;
+        }
+
+        /** 固定 MCP 路由身份，确保搜索恢复不是仅凭工具名称的宽松匹配。 */
+        @Override
+        public ToolBindingDescriptor bindingDescriptor() {
+            return binding;
+        }
+
+        /** 记录通过生产参数校验的目标调用，未命中的扩展工具不应产生执行事实。 */
+        @Override
+        public CompletionStage<ToolResult> execute(Invocation invocation, ExecutionContext context,
+                                                    CancellationToken cancellationToken) {
+            executions.incrementAndGet();
+            if (target) {
+                executedArguments.set(invocation.arguments());
+                return CompletableFuture.completedFuture(ToolResult.success("target-result"));
+            }
+            return CompletableFuture.completedFuture(ToolResult.success("decoy-result"));
+        }
+    }
+
     /** 在模型执行中触发后续准入的假实现，用于复现同 Thread revision 竞争。 */
     private static final class LaterAdmissionToolModel implements ModelPort {
         private final RecordingStore store;
@@ -2282,7 +2492,11 @@ final class AgentLoopTest {
                 added.add(stored);
             }
             mailboxConsumed = true;
-            return new TaskMailboxConsumption(added, ++committedRevision, ++turnMutationVersion,
+            List<io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.ThreadMessageItem> messageItems =
+                    mailbox.stream().map(value -> new io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.ThreadMessageItem(
+                            "item_task_" + value.messageId(), request.occurredAt(), request.turnId(),
+                            value.senderThreadId(), value.senderTitle(), value.content().text())).toList();
+            return new TaskMailboxConsumption(added, messageItems, ++committedRevision, ++turnMutationVersion,
                     request.executionState());
         }
         private long committedRevision;

@@ -78,7 +78,7 @@ export function createPlanGoalStateFixture({ threadId = "thr_plan_goal_fixture" 
     const planRevisionId = `${planId}_revision_${revisionNumber}`;
     const canonical = { ...plan.draft, revisionNumber };
     plan.revision = revisionNumber;
-    plan.status = "proposed";
+    plan.status = "awaiting_approval";
     plan.currentRevision = {
       planRevisionId,
       planHash: fixtureHash(canonical),
@@ -88,21 +88,21 @@ export function createPlanGoalStateFixture({ threadId = "thr_plan_goal_fixture" 
     return snapshot(plan);
   }
 
-  /** 批准只改变 Plan 状态；standalone run 必须由 execute 明确创建。 */
-  function approvePlan(planId) {
+  /** 显式 execute 同时确认当前 revision 并创建 standalone run，防止双调用竞态。 */
+  function executePlan(planId, { planRevisionId, planHash } = {}) {
     const plan = requirePlan(planId);
-    if (plan.status !== "proposed" || plan.currentRevision === null) {
-      throw new PlanGoalFixtureError("PLAN_INVALID_STATE", "Plan revision is not proposed");
-    }
-    plan.status = "approved";
-    return snapshot(plan);
-  }
-
-  /** 仅显式 execute 为独立 Plan 创建 standalone run，防止批准产生隐藏副作用。 */
-  function executePlan(planId) {
-    const plan = requirePlan(planId);
-    if (plan.status !== "approved" || plan.activeRunId !== null) {
+    if (
+      (plan.status !== "awaiting_approval" && plan.status !== "approved") ||
+      plan.activeRunId !== null
+    ) {
       throw new PlanGoalFixtureError("PLAN_INVALID_STATE", "Plan cannot be executed");
+    }
+    if (
+      planRevisionId !== undefined &&
+      (plan.currentRevision?.planRevisionId !== planRevisionId ||
+        plan.currentRevision?.planHash !== planHash)
+    ) {
+      throw new PlanGoalFixtureError("PLAN_APPROVAL_STALE", "Plan revision is stale");
     }
     plan.status = "running";
     plan.activeRunId = `plan_run_fixture_${++runSequence}`;
@@ -141,20 +141,20 @@ export function createPlanGoalStateFixture({ threadId = "thr_plan_goal_fixture" 
   }
 
   /**
-   * 只把当前已批准 Plan revision 连接到 Goal；Goal CAS 和 Plan identity 任一过期都必须失败关闭。
+   * 只把当前待确认或历史已批准 Plan revision 连接到 Goal；Goal CAS 和 Plan identity 任一过期都必须失败关闭。
    */
   function attachPlan({ goalId, expectedGoalRevision, planId, planRevisionId, planHash }) {
     const goal = requireGoal(goalId);
     requireGoalRevision(goal, expectedGoalRevision);
     const plan = requirePlan(planId);
     if (
-      plan.status !== "approved" ||
+      (plan.status !== "awaiting_approval" && plan.status !== "approved") ||
       plan.currentRevision?.planRevisionId !== planRevisionId ||
       plan.currentRevision?.planHash !== planHash
     ) {
       throw new PlanGoalFixtureError(
         "PLAN_APPROVAL_STALE",
-        "attached Plan revision is not the current approved revision",
+        "attached Plan revision is not the current revision",
       );
     }
     goal.revision += 1;
@@ -220,7 +220,6 @@ export function createPlanGoalStateFixture({ threadId = "thr_plan_goal_fixture" 
     createPlan,
     savePlanDraft,
     proposePlan,
-    approvePlan,
     executePlan,
     completePlan,
     createGoal,

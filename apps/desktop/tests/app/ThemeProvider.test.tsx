@@ -41,6 +41,8 @@ describe("ThemeProvider", () => {
       highContrast: false,
       reduceMotion: false,
       reducedTransparency: false,
+      uiFontSize: 16,
+      codeFontSize: 13,
     });
   });
 
@@ -54,6 +56,7 @@ describe("ThemeProvider", () => {
       </ThemeProvider>,
     );
     expect(document.documentElement.dataset["theme"]).toBe("light");
+    expect(document.documentElement.style.fontSize).toBe("16px");
 
     act(() => media.setMatches(true));
 

@@ -16,7 +16,6 @@ import {
   Workbench,
   capabilityWorkbenchTab,
   parseTaskWorkbenchTabKey,
-  sideTaskDraftWorkbenchTab,
   taskWorkbenchTab,
   type WorkbenchCapability,
   type WorkbenchTab,
@@ -36,8 +35,26 @@ import {
   type TaskThreadRenamePort,
   type TaskTranscriptActions,
   type TaskTranscriptPort,
+  type TaskPreferencesPort,
+  type TaskContentBlock,
 } from "@/features/tasks";
-import type { ConversationArtifactPort, ConversationAttachmentPort } from "@/features/conversation";
+import {
+  useConversationInteractionController,
+  useInteractionController,
+  useTimelineStore,
+  type ConversationArtifactPort,
+  type ConversationAttachmentPort,
+  type ConversationPlanCreationPort,
+  type ConversationTurnPort,
+  type InteractionPort,
+} from "@/features/conversation";
+import type {
+  ConversationAccessMode,
+  ConversationModelOption,
+  ConversationModelSelection,
+  ConversationPreferencesPort,
+  ConversationThreadPreferences,
+} from "@/features/conversation";
 import {
   FilesWorkspace,
   useFilesController,
@@ -77,8 +94,10 @@ import {
   type PreviewWorkspaceLifecycle,
 } from "../useJaWorkbench";
 import { filesBrowserControllerPorts } from "./filesBrowserControllerPorts";
-import { useRuntimeLifecycle, useRuntimeTurns } from "../RuntimeProvider";
+import { useRuntimeLifecycle, useRuntimeState, useRuntimeTurns } from "../RuntimeProvider";
 import { PlanWorkbench, type GoalController } from "@/features/goals";
+import { useGoalController, type GoalPort } from "@/features/goals";
+import type { ComposerSlashCommand } from "@/features/conversation";
 import type {
   ComposerWorkspaceReferenceTarget,
   WorkspaceReferencePreviewOutcome,
@@ -86,6 +105,11 @@ import type {
 } from "./ConversationWorkspace";
 import { ReviewSourceNavigation } from "./ReviewSourceNavigation";
 import { threadWorkbenchStorage } from "./threadWorkbenchStorage";
+import { conversationModeCommands } from "../application/conversationModeCommands";
+import {
+  useComposerNativeDropRouter,
+  type NativeDropSubscriptionPort,
+} from "../application/useComposerNativeDropRouter";
 
 /** Terminal controller 与 xterm renderer 只在能力首次激活后加载。 */
 const LazyTerminalWorkbenchSlot = lazy(async () => {
@@ -94,6 +118,22 @@ const LazyTerminalWorkbenchSlot = lazy(async () => {
 });
 
 const MAX_REVIEW_NAVIGATION_SCOPES = 16;
+
+interface SideChatSource {
+  readonly threadId: string;
+  readonly revision?: number;
+  readonly preferences?: ConversationThreadPreferences;
+}
+
+/** 测试或能力未启用时只作为 hook 的不可见占位；任何误用都会失败关闭，不提供伪造 Goal 能力。 */
+const UNAVAILABLE_GOAL_PORT = new Proxy({} as GoalPort, {
+  get: (_target, property: string) =>
+    property === "subscribe"
+      ? () => () => undefined
+      : async () => {
+          throw new Error("plan and goal capability unavailable");
+        },
+});
 
 /** UI hint 的 Git key 包含 Thread、source 与 layer，避免同 Workspace 的会话互相继承浏览状态。 */
 function gitReviewNavigationKey(
@@ -176,6 +216,18 @@ export interface WorkbenchHostProps {
   readonly taskAttachmentPort?: ConversationAttachmentPort;
   readonly taskArtifactPort?: ConversationArtifactPort;
   readonly taskComposerSkills?: readonly TaskComposerSkillSuggestion[];
+  /** 共享 child Composer 的真实模型目录与父 Thread 一次性默认值。 */
+  readonly taskModels?: readonly ConversationModelOption[];
+  readonly taskParentPreferences?: ConversationThreadPreferences;
+  /** 恢复默认必须读取设置 owner 的全局默认值，不能把当前父 Thread 偏好当作默认值。 */
+  readonly taskDefaultPreferences?: {
+    selection: ConversationModelSelection;
+    accessMode: ConversationAccessMode;
+  };
+  readonly taskPreferencesPort?: TaskPreferencesPort;
+  readonly taskGoalPort?: GoalPort;
+  readonly taskNativeDropPort?: NativeDropSubscriptionPort;
+  readonly taskInteractionPort?: InteractionPort;
   readonly selectedTab: WorkbenchTabKey;
   readonly onTabChange: (tab: WorkbenchTabKey) => void;
   readonly openTabs: readonly WorkbenchTabKey[];
@@ -184,11 +236,19 @@ export interface WorkbenchHostProps {
   readonly onCopyText: (text: string) => Promise<void>;
   readonly onOpenExternalUrl: (url: string) => Promise<void>;
   readonly onClose: () => void;
+  /** 当前 Thread 的侧聊创建入口；隐藏 Workbench 仍可接收 slash 命令，但非当前会话不注册。 */
+  readonly onRegisterSideChatLauncher?: (
+    launcher: ((content?: string) => Promise<void>) | undefined,
+  ) => void;
   readonly onRegisterFilesLifecycle: (lifecycle: FilesWorkspaceLifecycle | undefined) => void;
   readonly onRegisterTerminalLifecycle: (lifecycle: TerminalWorkspaceLifecycle | undefined) => void;
   readonly onRegisterPreviewLifecycle: (lifecycle: PreviewWorkspaceLifecycle | undefined) => void;
   readonly onCloseFilesCapability: (workspaceId: string) => Promise<void>;
   readonly onAddWorkspaceReference: (reference: ComposerWorkspaceReferenceTarget) => void;
+  readonly onOpenWorkspaceReference?: (
+    reference: ComposerWorkspaceReferenceTarget,
+    source: HTMLButtonElement,
+  ) => void;
   readonly workspaceReferencePreviewRequest?: WorkspaceReferencePreviewRequest;
   readonly onWorkspaceReferencePreviewSettled: (
     requestId: number,
@@ -221,7 +281,7 @@ export interface WorkbenchHostProps {
 /**
  * WorkbenchHost 持续挂载 feature controller 以保留编辑器、PTY 与 WebView 状态，但只在
  * Inspector 可见且 Review Tab 已打开并被选中时激活重型 Git snapshot。它只组合 view model
- * 与 lifecycle port；侧边任务也只在此处签发本地草稿身份，首次发送才进入持久化用例。
+ * 与 lifecycle port；侧聊 identity 由服务端创建 ACK 签发，不在前端制造临时草稿。
  * Tab 菜单或其它会话暂时遮挡原生网页时只暂停 viewport 可见性，不释放网页会话；
  * 布局与恢复 hint 使用根 Thread 命名空间，真实目录授权仍只由 Workspace 决定。
  */
@@ -238,6 +298,13 @@ export function WorkbenchHost({
   taskAttachmentPort,
   taskArtifactPort,
   taskComposerSkills,
+  taskModels = [],
+  taskParentPreferences,
+  taskDefaultPreferences,
+  taskPreferencesPort,
+  taskGoalPort,
+  taskNativeDropPort,
+  taskInteractionPort,
   selectedTab,
   onTabChange,
   openTabs,
@@ -246,11 +313,13 @@ export function WorkbenchHost({
   onCopyText,
   onOpenExternalUrl,
   onClose,
+  onRegisterSideChatLauncher,
   onRegisterFilesLifecycle,
   onRegisterTerminalLifecycle,
   onRegisterPreviewLifecycle,
   onCloseFilesCapability,
   onAddWorkspaceReference,
+  onOpenWorkspaceReference,
   workspaceReferencePreviewRequest,
   onWorkspaceReferencePreviewSettled,
   onGitBranchChange,
@@ -295,6 +364,7 @@ export function WorkbenchHost({
   >({});
   const projection = useJaWorkbench(workspace, adapters, previewSessionHintStorage);
   const runtimeTurns = useRuntimeTurns();
+  const { boot, turnAdmissionReady } = useRuntimeState();
   const { queryRuntime } = useRuntimeLifecycle();
   const workspaceReferencePreviewRequestRef = useRef(workspaceReferencePreviewRequest);
   const handledWorkspaceReferenceRequestRef = useRef<number | undefined>(undefined);
@@ -346,27 +416,317 @@ export function WorkbenchHost({
     resumePort,
     onSubagentDiscovered: ensureAgentsTab,
   });
-  const [draftTaskLabels, setDraftTaskLabels] = useState<Readonly<Record<string, string>>>({});
+  const selectedTask =
+    parsedSelectedTask === undefined
+      ? undefined
+      : tasks.tasks.find((task) => task.taskThreadId === parsedSelectedTask.taskThreadId);
+  const childThreadId = selectedTask?.taskThreadId;
+  const childTaskIsSideTask = parsedSelectedTask?.taskKind === "side_task";
+  const childClarification = useInteractionController({
+    threadId: childThreadId,
+    visible: active && childTaskIsSideTask && childThreadId !== undefined,
+    port: taskInteractionPort,
+  });
+  const [childPlanDetailsByThread, setChildPlanDetailsByThread] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
+  const [childComposerFocusByThread, setChildComposerFocusByThread] = useState<
+    Readonly<Record<string, number>>
+  >({});
+  const childPlanDetailsOpen =
+    childThreadId === undefined ? false : childPlanDetailsByThread[childThreadId] === true;
+  const childComposerFocusRequest =
+    childThreadId === undefined ? undefined : childComposerFocusByThread[childThreadId];
+  const childTranscript =
+    childThreadId !== undefined && tasks.transcript?.threadId === childThreadId
+      ? tasks.transcript
+      : undefined;
+  const taskDetail = tasks.detail;
+  const childThread =
+    taskDetail === undefined || taskDetail.thread.threadId !== childThreadId
+      ? undefined
+      : taskDetail.thread;
+  // task/read 用 null 表示服务端尚未生成偏好；交互 controller 以 undefined 表示同一缺省态。
+  const childPreferences = childThread?.preferences ?? undefined;
+  /** 仅按稳定 Thread identity 和新快照投影；Tab 解析对象每次 render 都新建，不能作为 effect 依赖。 */
+  useEffect(() => {
+    if (childTranscript === undefined || childTranscript.threadId !== childThreadId || !active)
+      return;
+    // Store 是 interaction controller 与 ChatTimeline 的唯一事实来源，workspace identity 由宿主注入。
+    useTimelineStore.getState().applySnapshot(childTranscript, workspace.workspaceId);
+  }, [active, childThreadId, childTranscript, workspace.workspaceId]);
+  const childTaskRef = useRef(selectedTask);
+  childTaskRef.current = selectedTask;
+  const followupTurn = tasks.followupTurn;
+  const refreshTaskDetail = tasks.refreshDetail;
+  const childTurnPort = useMemo<ConversationTurnPort>(
+    () => ({
+      /** 发送必须进入 TaskCoordinator，并把当前 child 作为发送者，避免默认回落到 root。 */
+      submitTurn: async (input) => {
+        const task = childTaskRef.current;
+        if (task === undefined || input.threadId !== task.taskThreadId)
+          throw new Error("side task unavailable");
+        return followupTurn(task, input.content as TaskContentBlock[], task.taskThreadId);
+      },
+      resumeTurn: runtimeTurns.resumeTurn,
+      cancelTurn: runtimeTurns.cancelTurn,
+      enqueueTurnInput: runtimeTurns.enqueueTurnInput,
+      prioritizeTurnInput: runtimeTurns.prioritizeTurnInput,
+      updateTurnInput: runtimeTurns.updateTurnInput,
+      deleteTurnInput: runtimeTurns.deleteTurnInput,
+      approvalRespond: runtimeTurns.approvalRespond,
+    }),
+    [runtimeTurns, followupTurn],
+  );
+  const childPreferencesPort = useMemo<ConversationPreferencesPort | undefined>(() => {
+    if (taskPreferencesPort === undefined) return undefined;
+    return {
+      /** 与主会话一样只在明确 CAS 冲突时重试一次；使用实时 Thread revision，不借 Task revision。 */
+      updatePreferences: async (next) => {
+        const task = childTaskRef.current;
+        const thread = childThread;
+        if (task === undefined || thread?.threadId !== task.taskThreadId)
+          throw new Error("side task preferences unavailable");
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const snapshot = await taskTranscriptPort.read({ threadId: task.taskThreadId, limit: 1 });
+          if (
+            snapshot.threadId !== task.taskThreadId ||
+            childTaskRef.current?.taskThreadId !== task.taskThreadId
+          )
+            throw new Error("side task preferences scope changed");
+          try {
+            await taskPreferencesPort.update({
+              threadId: task.taskThreadId,
+              expectedThreadRevision: snapshot.revision,
+              ...next,
+            });
+            break;
+          } catch (failure) {
+            if (
+              attempt !== 0 ||
+              failure === null ||
+              typeof failure !== "object" ||
+              !("code" in failure) ||
+              failure.code !== "CONFLICT"
+            )
+              throw failure;
+          }
+        }
+        await refreshTaskDetail();
+      },
+    };
+  }, [childThread, taskPreferencesPort, taskTranscriptPort, refreshTaskDetail]);
+  const childGoal = useGoalController({
+    goalId: childThread?.activeGoalId ?? undefined,
+    ownerThreadId: childThreadId,
+    ownerKind: "independent_task",
+    visible:
+      active && childTaskIsSideTask && childThreadId !== undefined && taskGoalPort !== undefined,
+    // Plan 详情嵌入 child task，不能依赖全局 plan tab，否则切换到该 tab 会丢失 child identity。
+    detailsVisible:
+      active &&
+      childTaskIsSideTask &&
+      childPlanDetailsOpen &&
+      childThreadId !== undefined &&
+      taskGoalPort !== undefined,
+    port: taskGoalPort ?? UNAVAILABLE_GOAL_PORT,
+  });
+  const childPlanCreationPort = useMemo<ConversationPlanCreationPort | undefined>(() => {
+    if (taskGoalPort === undefined || !childTaskIsSideTask) return undefined;
+    return {
+      /** Plan 首轮仍由 Goal controller 建立独立 artifact，CAS 只使用 child thread/read revision。 */
+      create: async (threadId, objective, expectedThreadRevision) => {
+        const task = childTaskRef.current;
+        if (task === undefined || task.taskThreadId !== threadId) return false;
+        return childGoal.createPlan(threadId, objective, expectedThreadRevision);
+      },
+    };
+  }, [childGoal, childTaskIsSideTask, taskGoalPort]);
+  const childInteraction = useConversationInteractionController({
+    threadId: childThreadId,
+    workspaceId: workspace.workspaceId,
+    preferences: childPreferences,
+    models: taskModels,
+    ready:
+      active &&
+      turnAdmissionReady &&
+      (boot.status === "ready" || boot.status === "busy") &&
+      childPreferencesPort !== undefined &&
+      childThread !== undefined &&
+      childTranscript !== undefined &&
+      childTranscript.threadId === childThreadId,
+    blocked: !active,
+    turnPort: childTurnPort,
+    planCreationPort: childPlanCreationPort,
+    preferencesPort: childPreferencesPort ?? {
+      updatePreferences: async () => {
+        throw new Error("side task preferences unavailable");
+      },
+    },
+    attachmentPort: taskAttachmentPort,
+    onAttachmentRemoved,
+    onAttachmentsBound,
+  });
+  const childNativeDrop = useComposerNativeDropRouter(
+    taskNativeDropPort,
+    active && childTaskIsSideTask && childThreadId !== undefined,
+  );
+  const creatingSideTaskRef = useRef(false);
+  const createSideChatRef = useRef<((content?: string) => Promise<void>) | undefined>(undefined);
+  const currentRootThreadRef = useRef(rootThreadId);
+  const currentOpenTabsRef = useRef(openTabs);
+  // 直接更新 opaque identity ref，使 render 后立即到达的 ACK 也能识别根会话切换。
+  currentRootThreadRef.current = rootThreadId;
+  currentOpenTabsRef.current = openTabs;
 
-  /** Task 的 @ 搜索仍以当前根 Thread 做 Workspace 授权，返回值保留迟到响应 identity。 */
+  /**
+   * 侧聊创建必须携带发起它的 Thread 身份；主入口传 root，侧聊 Composer 传当前 child。
+   * root 只用于校验新 Task 仍属于当前树，避免异步 ACK 在会话切换后留下孤儿会话。
+   */
+  const createSideChatFromSource = useCallback(
+    async (source: SideChatSource, content?: string): Promise<void> => {
+      const expectedRootThreadId = rootThreadId;
+      if (
+        expectedRootThreadId === undefined ||
+        source.threadId === "" ||
+        creatingSideTaskRef.current
+      )
+        throw new Error("侧聊暂不可用，请稍后重试。");
+      creatingSideTaskRef.current = true;
+      try {
+        const task = await tasks.createSideTask({
+          taskName: "侧聊",
+          sourceThreadId: source.threadId,
+          sourceThreadRevision: source.revision,
+          preferences:
+            source.preferences === undefined
+              ? undefined
+              : {
+                  providerId: source.preferences.providerId,
+                  modelId: source.preferences.modelId,
+                  reasoningLevel: source.preferences.reasoningLevel,
+                  accessMode: source.preferences.accessMode,
+                  collaborationMode: source.preferences.collaborationMode,
+                },
+        });
+        const sourceStillActive =
+          source.threadId === expectedRootThreadId ||
+          childTaskRef.current?.taskThreadId === source.threadId;
+        if (
+          currentRootThreadRef.current !== expectedRootThreadId ||
+          task.rootThreadId !== expectedRootThreadId ||
+          !sourceStillActive
+        ) {
+          // ACK 已创建但来源 Host 已失效时必须先关闭临时 Thread，不能只丢弃 Tab 留下孤儿侧聊。
+          try {
+            await tasks.close(task);
+          } catch {
+            // 关闭失败时保留服务端错误边界；用户仍需获知清理未完成，不能伪装创建已回滚。
+            toast.error("侧聊来源已切换，但临时会话未能清理，请稍后重试。", {
+              id: "ja-task:create-cleanup",
+            });
+          }
+          throw new Error("侧聊来源会话已切换，请重试。");
+        }
+        const tab = taskWorkbenchTab({ ...task, label: task.taskName });
+        const retained = currentOpenTabsRef.current.filter((candidate) => candidate !== "new");
+        if (!retained.includes(tab.key)) onOpenTabsChange([...retained, tab.key]);
+        const normalizedContent = content?.trim() ?? "";
+        if (normalizedContent === "") {
+          onTabChange(tab.key);
+          setChildComposerFocusByThread((current) => ({
+            ...current,
+            [task.taskThreadId]: (current[task.taskThreadId] ?? 0) + 1,
+          }));
+          return;
+        }
+        // 在切换 Tab 前登记 ready waiter；Controller 会等目标 Thread 的首屏 read、observe
+        // 和 ACK 后权威重读完成，避免 follow-up 落入创建前仍 active 的旧会话。
+        const taskReady = tasks.waitForTaskReady?.(task.taskThreadId) ?? Promise.resolve();
+        onTabChange(tab.key);
+        await taskReady;
+        await tasks.followup(task, [{ type: "text", text: normalizedContent }], source.threadId);
+      } finally {
+        creatingSideTaskRef.current = false;
+      }
+    },
+    [onOpenTabsChange, onTabChange, rootThreadId, tasks],
+  );
+
+  const childSlashCommands = useMemo<readonly ComposerSlashCommand[]>(() => {
+    if (childThreadId === undefined || !childTaskIsSideTask || childThread === undefined) return [];
+    const sideChatCommand: ComposerSlashCommand = {
+      id: "btw",
+      name: "btw",
+      aliases: ["侧聊"],
+      label: "新建侧聊",
+      description: "从当前侧聊打开一个临时侧聊",
+      available: true,
+      argument: { mode: "optional", label: "内容", placeholder: "描述要在侧聊处理的事情" },
+      /** 当前 child 是唯一来源；命令不会读取或修改主 Thread 的偏好。 */
+      execute: ({ argument }) =>
+        createSideChatFromSource(
+          {
+            threadId: childThread.threadId,
+            revision: childThread.revision,
+            preferences: childPreferences,
+          },
+          argument,
+        ),
+    };
+    return [
+      sideChatCommand,
+      ...(taskGoalPort === undefined
+        ? []
+        : conversationModeCommands({
+            available: true,
+            threadId: childThreadId,
+            interaction: childInteraction,
+            goal: childGoal,
+          })),
+    ];
+  }, [
+    childGoal,
+    childInteraction,
+    childPreferences,
+    childTaskIsSideTask,
+    childThread,
+    childThreadId,
+    createSideChatFromSource,
+    taskGoalPort,
+  ]);
+
+  /** Task 的 @ 搜索使用当前 child Thread 的 Workspace 授权，避免把子会话请求伪装成根会话。 */
   const searchTaskWorkspacePaths = useCallback(
     (query: string) => {
-      if (rootThreadId === undefined) return Promise.reject(new Error("task context unavailable"));
+      if (childThreadId === undefined) return Promise.reject(new Error("task context unavailable"));
       return queryRuntime("workspace/path/search", {
-        threadId: rootThreadId,
+        threadId: childThreadId,
         workspaceId: workspace.workspaceId,
         query,
         limit: 50,
       });
     },
-    [queryRuntime, rootThreadId, workspace.workspaceId],
+    [childThreadId, queryRuntime, workspace.workspaceId],
   );
-  /** Side Task Composer 只获得结构化草稿所需能力，不能访问模型偏好或通用 Runtime tunnel。 */
+  /** Side Task Composer 只获得当前 child scope 的结构化草稿、模型目录与安全 Workspace 查询。 */
   const taskComposerEnvironment = useMemo<TaskComposerEnvironment>(
     () => ({
       workspaceId: workspace.workspaceId,
       runtimeGeneration: generation,
+      nativeDropEvent: childNativeDrop.event,
+      dropZoneRef: childNativeDrop.registerDropZone,
       skills: taskComposerSkills,
+      slashCommands: childSlashCommands,
+      onRestoreDefaults:
+        taskDefaultPreferences === undefined
+          ? undefined
+          : () =>
+              childInteraction.resetPreferences(
+                taskDefaultPreferences.selection,
+                taskDefaultPreferences.accessMode,
+              ),
+      onOpenWorkspaceReference,
       attachmentPort: taskAttachmentPort,
       onSearchWorkspacePaths: searchTaskWorkspacePaths,
       onOpenAttachmentPreview:
@@ -385,17 +745,35 @@ export function WorkbenchHost({
                 source,
               );
             },
-      onAttachmentRemoved,
-      onAttachmentsBound,
+      onOpenQueuedAttachmentPreview:
+        childThreadId === undefined || onOpenAttachmentPreview === undefined
+          ? undefined
+          : (attachment, source) => {
+              if (attachment.mediaKind !== "text" && attachment.mediaKind !== "image") return;
+              onOpenAttachmentPreview(
+                {
+                  attachmentId: attachment.attachmentId,
+                  displayName: attachment.fileName,
+                  mediaKind: attachment.mediaKind,
+                  authorization: { kind: "thread", threadId: childThreadId },
+                },
+                source,
+              );
+            },
     }),
     [
       generation,
-      onAttachmentRemoved,
-      onAttachmentsBound,
       onOpenAttachmentPreview,
       searchTaskWorkspacePaths,
       taskAttachmentPort,
       taskComposerSkills,
+      taskDefaultPreferences,
+      onOpenWorkspaceReference,
+      childSlashCommands,
+      childNativeDrop.event,
+      childNativeDrop.registerDropZone,
+      childThreadId,
+      childInteraction,
       workspace.workspaceId,
     ],
   );
@@ -437,7 +815,7 @@ export function WorkbenchHost({
   useEffect(() => {
     if (previousRootThreadRef.current === rootThreadId) return;
     previousRootThreadRef.current = rootThreadId;
-    setDraftTaskLabels({});
+    setChildPlanDetailsByThread({});
     const retained = openTabs.filter((tab) => parseTaskWorkbenchTabKey(tab) === undefined);
     if (retained.length !== openTabs.length) {
       if (parseTaskWorkbenchTabKey(selectedTab) !== undefined) onTabChange(retained[0] ?? "agents");
@@ -455,56 +833,67 @@ export function WorkbenchHost({
       const summary = tasks.tasks.find((task) => task.taskThreadId === parsed.taskThreadId);
       if (summary !== undefined) return taskWorkbenchTab({ ...summary, label: summary.taskName });
       if (rootThreadId === undefined) return capabilityWorkbenchTab("agents");
-      if (parsed.taskThreadId === undefined) {
-        const draftId = key.slice("side-task:draft_".length);
-        const draft = sideTaskDraftWorkbenchTab(rootThreadId, draftId);
-        return { ...draft, label: draftTaskLabels[key] ?? draft.label };
-      }
+      if (parsed.taskThreadId === undefined) return capabilityWorkbenchTab("agents");
       return taskWorkbenchTab({
         taskThreadId: parsed.taskThreadId,
         taskKind: parsed.taskKind,
         rootThreadId,
-        label: parsed.taskKind === "subagent" ? "Subagent" : "侧边任务",
+        label: parsed.taskKind === "subagent" ? "Subagent" : "侧聊",
       });
     },
-    [draftTaskLabels, rootThreadId, tasks.tasks],
+    [rootThreadId, tasks.tasks],
   );
   const openTabDescriptors = useMemo(() => openTabs.map(describeTab), [describeTab, openTabs]);
   const selectedTabDescriptor = useMemo(() => describeTab(selectedTab), [describeTab, selectedTab]);
 
-  /** 新建只签发本地草稿 identity；task/create 留到详情首次发送。 */
-  const createSideTaskDraft = useCallback((): WorkbenchTaskTab | undefined => {
-    if (rootThreadId === undefined || parentThreadRevision === undefined) return undefined;
-    const draftId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-    return sideTaskDraftWorkbenchTab(rootThreadId, draftId);
-  }, [parentThreadRevision, rootThreadId]);
-
-  /** 创建 ACK 后先选择稳定 Child key，再替换草稿，避免偏好归一化把活动草稿回插。 */
-  const replaceDraft = useCallback(
-    (draft: WorkbenchTaskTab, task: TaskSummary): void => {
-      const created = taskWorkbenchTab({ ...task, label: task.taskName });
-      setDraftTaskLabels((current) => {
-        if (current[draft.key] === undefined) return current;
-        const next = { ...current };
-        delete next[draft.key];
-        return next;
-      });
-      onTabChange(created.key);
-      onOpenTabsChange(openTabs.map((key) => (key === draft.key ? created.key : key)));
+  /** 主 Composer 与右栏入口固定以当前 root 为来源，保留原有主任务控制语义。 */
+  const createSideChat = useCallback(
+    (content?: string): Promise<void> => {
+      if (rootThreadId === undefined || parentThreadRevision === undefined)
+        return Promise.reject(new Error("侧聊暂不可用，请稍后重试。"));
+      return createSideChatFromSource(
+        {
+          threadId: rootThreadId,
+          preferences: taskParentPreferences,
+        },
+        content,
+      );
     },
-    [onOpenTabsChange, onTabChange, openTabs],
+    [createSideChatFromSource, parentThreadRevision, rootThreadId, taskParentPreferences],
   );
 
-  /** 草稿只更新当前进程 label；持久 Task 交给 controller 复用 Thread rename CAS。 */
+  createSideChatRef.current = createSideChat;
+
+  /** 新建入口沿用统一侧聊流程；Workbench 的同步 callback 只负责启动并展示失败反馈。 */
+  const createSideTask = useCallback((): WorkbenchTaskTab | undefined => {
+    const expectedRootThreadId = rootThreadId;
+    if (expectedRootThreadId === undefined || parentThreadRevision === undefined) return undefined;
+    void createSideChat().catch(() => {
+      toast.error("新建侧聊失败，请重试。", { id: "ja-task:create" });
+    });
+    return undefined;
+  }, [createSideChat, parentThreadRevision, rootThreadId]);
+
+  /** 只向当前会话注册最新闭包；宿主切换到其它 Thread 时由 SessionHost 清除旧入口。 */
+  useEffect(() => {
+    if (onRegisterSideChatLauncher === undefined) return undefined;
+    const launcher = (content?: string): Promise<void> => {
+      const current = createSideChatRef.current;
+      return current === undefined
+        ? Promise.reject(new Error("侧聊暂不可用，请稍后重试。"))
+        : current(content);
+    };
+    onRegisterSideChatLauncher(launcher);
+    return () => onRegisterSideChatLauncher(undefined);
+  }, [onRegisterSideChatLauncher]);
+
+  /** 持久 Task 标题复用 Thread rename CAS；创建入口不保留未持久化 Tab。 */
   const renameTaskTab = useCallback(
     async (tab: WorkbenchTaskTab, label: string): Promise<void> => {
       const normalized = label.trim();
       if (tab.taskKind !== "side_task" || normalized === "" || normalized.length > 96)
         throw new Error("invalid side task title");
-      if (tab.taskThreadId === undefined) {
-        setDraftTaskLabels((current) => ({ ...current, [tab.key]: normalized }));
-        return;
-      }
+      if (tab.taskThreadId === undefined) throw new Error("side task is unavailable");
       const task = tasks.tasks.find((candidate) => candidate.taskThreadId === tab.taskThreadId);
       if (task === undefined) throw new Error("side task is unavailable");
       await tasks.rename(task, normalized);
@@ -788,18 +1177,22 @@ export function WorkbenchHost({
     workspaceReferencePreviewRequest,
   ]);
 
-  /** 显式 capability 关闭执行 teardown；关闭未持久草稿同时释放其进程期标签。 */
+  /**
+   * 能力 Tab 关闭执行各自 teardown；只有临时侧聊需要服务端 close ACK，Subagent 仅关闭观察界面。
+   * 这样用户收起子任务不会改变委派关系，而侧聊关闭才会进入临时生命周期终止流程。
+   */
   const closeCapabilityTab = useCallback(
     (tab: WorkbenchTab): void | Promise<void> => {
       if (tab.kind === "task") {
-        if (tab.taskThreadId === undefined)
-          setDraftTaskLabels((current) => {
-            if (current[tab.key] === undefined) return current;
-            const next = { ...current };
-            delete next[tab.key];
-            return next;
-          });
-        return;
+        if (tab.taskKind !== "side_task") return;
+        const detailTask = tasks.detail?.task;
+        const task =
+          (tab.taskThreadId === undefined
+            ? undefined
+            : tasks.tasks.find((candidate) => candidate.taskThreadId === tab.taskThreadId)) ??
+          (detailTask?.taskThreadId === tab.taskThreadId ? detailTask : undefined);
+        if (task === undefined) throw new Error("侧聊关闭失败，请重试。");
+        return tasks.close(task);
       }
       if (tab.capability === "review") onDismissTurnReview();
       if (tab.capability === "files") return onCloseFilesCapability(workspace.workspaceId);
@@ -814,6 +1207,7 @@ export function WorkbenchHost({
       onDismissTurnReview,
       previewController.actions.attachment,
       projection,
+      tasks,
       terminal,
       workspace.workspaceId,
     ],
@@ -904,6 +1298,7 @@ export function WorkbenchHost({
           agents: (
             <SubagentOverview
               tasks={tasks.tasks}
+              ownerThreadId={rootThreadId}
               loading={tasks.loading}
               error={tasks.error}
               onRefresh={tasks.refresh}
@@ -923,9 +1318,11 @@ export function WorkbenchHost({
                 onRetry={goal.refresh}
                 onSaveDraft={goal.saveDraft}
                 onDiscardDraft={goal.discardDraft}
-                onPropose={goal.propose}
-                onApprove={goal.approve}
+                onFinalizePlan={goal.finalizePlan}
                 onExecute={goal.execute}
+                onPausePlan={goal.pausePlan}
+                onResumePlan={goal.resumePlan}
+                onStopPlan={goal.stopPlan}
                 onAttachPlan={
                   goal.model === undefined ||
                   goal.planModel === undefined ||
@@ -946,7 +1343,6 @@ export function WorkbenchHost({
                 }
                 onCancelEdit={goal.resume}
                 onContinue={goal.resume}
-                onRespondInput={goal.respondInput}
               />
             ) : undefined,
         }}
@@ -954,12 +1350,35 @@ export function WorkbenchHost({
           <TaskDetailPanel
             tab={tab}
             controller={tasks}
-            onCreated={(task) => replaceDraft(tab, task)}
             composerEnvironment={taskComposerEnvironment}
             transcriptActions={taskTranscriptActions}
+            goal={parsedSelectedTask?.taskKind === "side_task" ? childGoal : undefined}
+            clarification={
+              parsedSelectedTask?.taskKind === "side_task" ? childClarification : undefined
+            }
+            planDetailsOpen={childPlanDetailsOpen}
+            focusRequest={
+              parsedSelectedTask?.taskKind === "side_task" ? childComposerFocusRequest : undefined
+            }
+            onPlanDetailsChange={
+              parsedSelectedTask?.taskKind !== "side_task" || childThreadId === undefined
+                ? undefined
+                : (open) =>
+                    setChildPlanDetailsByThread((current) => ({
+                      ...current,
+                      [childThreadId]: open,
+                    }))
+            }
+            conversation={
+              parsedSelectedTask?.taskKind === "side_task" ? childInteraction : undefined
+            }
           />
         )}
-        onCreateSideTask={createSideTaskDraft}
+        onCreateSideTask={
+          rootThreadId !== undefined && parentThreadRevision !== undefined
+            ? createSideTask
+            : undefined
+        }
         capabilityShortcuts={capabilityShortcuts}
         onClose={onClose}
       />

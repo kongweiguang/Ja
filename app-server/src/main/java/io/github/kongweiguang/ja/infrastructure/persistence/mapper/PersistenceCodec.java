@@ -17,6 +17,7 @@ import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
@@ -41,7 +42,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * 持久化 JSON 边界，只编码公开结构，不保留 provider raw payload。
+ * 持久化 JSON 边界；普通内容保持公开结构，原生 reasoning 仅作为同身份请求所需的 opaque 历史保存。
  */
 public final class PersistenceCodec {
     private final ObjectMapper mapper;
@@ -66,6 +67,14 @@ public final class PersistenceCodec {
                         .put("attachmentId", attachment.attachmentId());
                 case NativeAttachmentContent ignored -> throw new IllegalArgumentException(
                         "native attachment payload is request-scoped and cannot be persisted");
+                case ReasoningContent reasoning -> node.put("kind", "reasoning")
+                        .put("providerId", reasoning.providerId())
+                        .put("modelId", reasoning.modelId())
+                        .put("api", reasoning.api())
+                        .put("upstreamModel", reasoning.upstreamModel())
+                        .put("endpointFingerprint", reasoning.endpointFingerprint())
+                        .put("wireField", reasoning.wireField())
+                        .put("nativeJson", reasoning.nativeJson());
                 case TextContent text -> node.put("kind", "text").put("text", text.text());
                 case WorkspaceReferenceContent reference -> node.put("kind", "workspace_reference")
                         .put("workspaceId", reference.workspaceId())
@@ -95,6 +104,11 @@ public final class PersistenceCodec {
             for (JsonNode node : root) {
                 blocks.add(switch (required(node, "kind")) {
                     case "attachment" -> new AttachmentContent(required(node, "attachmentId"));
+                    case "reasoning" -> new ReasoningContent(
+                            required(node, "providerId"), required(node, "modelId"),
+                            required(node, "api"), required(node, "upstreamModel"),
+                            required(node, "endpointFingerprint"), required(node, "wireField"),
+                            required(node, "nativeJson"));
                     case "text" -> new TextContent(required(node, "text"));
                     case "workspace_reference" -> new WorkspaceReferenceContent(
                             required(node, "workspaceId"), required(node, "relativePath"),

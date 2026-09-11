@@ -397,7 +397,6 @@ fn goal_errors_map_to_stable_retry_semantics() {
         ("PLAN_APPROVAL_STALE", false),
         ("GOAL_EVIDENCE_INCOMPLETE", false),
         ("GOAL_RECOVERY_REQUIRED", false),
-        ("GOAL_INPUT_EXPIRED", false),
     ] {
         let error = command_error_from_rpc(&json!({
             "message": "private goal persistence detail",

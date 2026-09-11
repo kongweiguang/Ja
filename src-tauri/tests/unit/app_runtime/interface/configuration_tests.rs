@@ -4,6 +4,26 @@
 use super::*;
 use serde::de::DeserializeOwned;
 
+/// 原生代理必须保留关闭时的模型及思考档位，也不能把显式 null 跟随语义变成缺失字段。
+#[test]
+fn subagent_policy_survives_native_configuration_serialization() {
+    for policy in [
+        json!({"enabled": false, "provider_id": "provider_child", "model_id": "model_child", "reasoning_level": "high"}),
+        json!({"enabled": true, "provider_id": null, "model_id": null, "reasoning_level": null}),
+    ] {
+        let input: ConfigReplaceInput = serde_json::from_value(json!({
+            "scope": "user",
+            "document": {"subagents": policy},
+            "expectedVersion": "cfg_subagents"
+        }))
+        .expect("typed replace input");
+        let wire = serde_json::to_value(input).expect("native wire");
+        assert_eq!(wire["document"]["subagents"], policy);
+        assert_eq!(wire["expectedVersion"], "cfg_subagents");
+        assert!(wire.get("workspaceId").is_none());
+    }
+}
+
 /// 统一验证所有 CAS DTO 的版本字段都不能缺失或为 null，避免凭据写入被序列化成无版本请求。
 fn assert_expected_version_is_required<T>(mut input: Value)
 where

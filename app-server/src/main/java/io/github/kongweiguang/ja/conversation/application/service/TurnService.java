@@ -5,6 +5,8 @@ package io.github.kongweiguang.ja.conversation.application.service;
 
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.application.loop.AgentLoop;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionService;
 import io.github.kongweiguang.ja.conversation.application.loop.QueuedInputBoundary;
 import io.github.kongweiguang.ja.conversation.application.loop.TerminalCoordinator;
 import io.github.kongweiguang.ja.conversation.application.loop.TurnExecutionPlan;
@@ -16,6 +18,7 @@ import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
@@ -64,6 +67,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,6 +99,18 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     private final AtomicReference<TurnCancellationListener> cancellationListener =
             new AtomicReference<>(TurnCancellationListener.noop());
     private final AtomicBoolean cancellationListenerBound = new AtomicBoolean();
+    private final AtomicReference<LongConsumer> preShutdownHook = new AtomicReference<>(ignored -> { });
+    private final AtomicBoolean preShutdownHookBound = new AtomicBoolean();
+    private final Map<Key, PendingInteractionResume> pendingInteractionResumes = new ConcurrentHashMap<>();
+    private final Map<String, Consumer<CompletionStage<?>>> resumeContinuations = new ConcurrentHashMap<>();
+    private volatile java.util.function.Function<String, java.util.Optional<TurnLimits>> planResumeBudget;
+    private volatile InteractionService interactionOwner;
+
+    /** Plan 预算由其唯一 Run owner 读取，Conversation 不依赖 Goal 仓储或重置配置额度。 */
+    public void bindPlanResumeBudget(java.util.function.Function<String, java.util.Optional<TurnLimits>> budgets) {
+        if (planResumeBudget != null) throw new IllegalStateException("Plan resume budget already bound");
+        planResumeBudget = Objects.requireNonNull(budgets, "budgets");
+    }
 
     /** 生产组合根注入 Workspace owner 的唯一引用校验端口，禁止 conversation 复制路径规则。 */
     public TurnService(ConversationRepository store, AgentLoop loop, TurnQueue queue,
@@ -150,6 +167,29 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /**
+     * 绑定唯一的关闭前置动作；该动作在 TurnShutdown 停止准入前执行，供临时侧聊先取消自己的
+     * Child/Goal/Plan，避免 shutdown fence 先释放 Turn owner 后再留下无法收口的临时树。
+     */
+    public void bindPreShutdownHook(LongConsumer hook) {
+        Objects.requireNonNull(hook, "hook");
+        if (!preShutdownHookBound.compareAndSet(false, true)) {
+            throw new IllegalStateException("turn pre-shutdown hook is already bound");
+        }
+        preShutdownHook.set(hook);
+    }
+
+    /**
+     * 将回答 ACK 与 Turn owner 解耦；InteractionService 只负责提交事实，TurnService 负责等待旧 owner
+     * 释放后以同一 turnId 恢复，避免 RPC 线程持有 Provider 或运行租约。
+     */
+    public void bindInteractionResumeScheduler(InteractionService interactions) {
+        interactionOwner = Objects.requireNonNull(interactions, "interactions");
+        Objects.requireNonNull(interactions, "interactions").bindResumeScheduler(
+                (threadId, turnId, threadRevision, sink) -> scheduleInteractionResume(
+                        threadId, turnId, threadRevision, sink, 0));
+    }
+
+    /**
      * 准入只用短租约验证首条输入并确定 Operation 预算；租约在 SQLite admission 后立即释放，
      * 后续每次 Provider 请求都从 ThreadPreferences 重新解析。
      */
@@ -162,6 +202,15 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /** Goal/Plan 内部 Turn 复用完整生命周期，但类型和 admission 都不提供 USER message。 */
     public TurnUseCase.Accepted startContinuation(InternalTurnStartRequest request, String hiddenSummary,
                                                   TurnEventSink sink) {
+        return startContinuation(request, hiddenSummary, sink, null);
+    }
+
+    /**
+     * Plan continuation 的显式单 Turn ceiling；只收紧 model/tool/wall 预算，Provider 的 token 与权限
+     * 仍由当前 RuntimeLease 决定，防止跨 Turn Run 通过反复 admission 绕过累计上限。
+     */
+    public TurnUseCase.Accepted startContinuation(InternalTurnStartRequest request, String hiddenSummary,
+                                                  TurnEventSink sink, TurnLimits ceiling) {
         if (hiddenSummary == null || hiddenSummary.isBlank() || hiddenSummary.length() > 1_000_000) {
             throw new IllegalArgumentException("invalid Goal continuation context");
         }
@@ -170,13 +219,33 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                 new ConversationRepository.ContinuationAdmission(admission.threadId(), admission.turnId(),
                         admission.expectedThreadRevision(), admission.requestedAt(), admission.initialExecution(),
                         hiddenSummary))),
-                hiddenSummary);
+                hiddenSummary, ceiling);
     }
 
     /** idle 来自持久 Turn 终态，UI store 与单一进程内 Map 都不能作为恢复依据。 */
     public boolean ownerIdle(String threadId) {
         return store.readThread(threadId).map(snapshot -> snapshot.turns().stream()
                 .allMatch(turn -> turn.state().terminal())).orElse(false);
+    }
+
+    /**
+     * 注册内部执行器在交互回答恢复后继续推进的回调。回调按全局 Turn identity 幂等消费，
+     * 这样重启或 RPC 重试只会恢复原 cursor，不会启动第二条 Plan/Goal 执行链。
+     */
+    public void registerResumeContinuation(String turnId, Consumer<CompletionStage<?>> continuation) {
+        if (turnId == null || !turnId.startsWith("turn_") || continuation == null) {
+            throw new IllegalArgumentException("invalid resume continuation");
+        }
+        Consumer<CompletionStage<?>> previous = resumeContinuations.putIfAbsent(turnId, continuation);
+        if (previous != null && previous != continuation) {
+            throw new IllegalStateException("resume continuation is already registered");
+        }
+    }
+
+    /** admission 失败或终态完成时移除尚未使用的恢复回调，避免跨 Run 保留连接与 coordinator 引用。 */
+    public void clearResumeContinuation(String turnId) {
+        if (turnId == null) throw new IllegalArgumentException("turnId is required");
+        resumeContinuations.remove(turnId);
     }
 
     /**
@@ -199,6 +268,13 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     private TurnUseCase.Accepted startWithAdmission(StartCommand request, TurnEventSink sink,
                                                     StartAdmission admission,
                                                     String initialSummary) {
+        return startWithAdmission(request, sink, admission, initialSummary, null);
+    }
+
+    /** 统一 admission 实现，ceiling 只在 Plan continuation 入口显式传入。 */
+    private TurnUseCase.Accepted startWithAdmission(StartCommand request, TurnEventSink sink,
+                                                    StartAdmission admission,
+                                                    String initialSummary, TurnLimits ceiling) {
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(sink, "sink");
         Objects.requireNonNull(admission, "admission");
@@ -206,25 +282,32 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
             throw TurnUseCase.TurnResumeException.of(
                     TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT);
         }
-        TurnRuntimeRequest runtimeRequest = new TurnRuntimeRequest(request.threadId(), request.turnId(), request.workspaceRoot(),
+        // 新 Child 的 Thread/策略行在 reserve 后才原子写入。准入期只解析配置与预算，不准备依赖
+        // 已持久 Thread 身份的 Agent 工具；首个 Provider 请求由 runtimeFactory 在提交后重新绑定。
+        boolean pendingChildAdmission = request.origin() == TurnOrigin.CHILD_TASK
+                && store.readThread(request.threadId()).isEmpty();
+        TurnRuntimeRequest runtimeRequest = new TurnRuntimeRequest(request.threadId(),
+                pendingChildAdmission ? null : request.turnId(), request.workspaceRoot(),
                 request.workspaceId(), request.providerId(), request.modelId(), request.reasoningLevel(),
                 request.accessMode(), request.collaborationMode(), request.origin(),
                 request.deadline(), request.requestedAt());
         RuntimeLease runtimeLease = Objects.requireNonNull(runtimeResolver.resolve(runtimeRequest), "runtimeLease");
         try {
             validateResolvedRuntime(request, runtimeLease);
+            TurnLimits effectiveLimits = capLimits(runtimeLease.limits(), ceiling);
             UserContent validatedContent = request.origin().internal()
                     ? null : validateWorkspaceReferences(request.workspaceId(), request.content());
             if (validatedContent != null) replaceMessageSkills(runtimeLease, validatedContent);
-            Instant deadlineAt = request.requestedAt().plus(runtimeLease.limits().wallTimeout());
+            /* ceiling 必须进入持久 execution deadline，否则一次交互挂起/恢复会绕过 Plan wall budget。 */
+            Instant deadlineAt = request.requestedAt().plus(effectiveLimits.wallTimeout());
             TurnExecutionPlan.RequestRuntimeFactory runtimeFactory = requestRuntimeFactory(
                     request.threadId(), request.turnId(), request.workspaceRoot(), validatedContent,
-                    request.origin(), request.requestedAt(), request.workspaceId(), deadlineAt);
+                    request.origin(), request.requestedAt(), request.workspaceId(), deadlineAt, ceiling);
             TurnChangeTracker changeTracker = TurnChangeTracker.fresh(request.workspaceRoot());
             TurnExecutionPlan executionRequest = new TurnExecutionPlan(request.threadId(), request.turnId(),
                     request.workspaceRoot(), validatedContent, request.origin(),
                     runtimeLease.model(), runtimeLease.accessMode(),
-                    runtimeLease.limits(), request.requestedAt(), request.workspaceId(),
+                    effectiveLimits, request.requestedAt(), request.workspaceId(),
                     request.expectedThreadRevision(), request.initialTurnMutationVersion(),
                     initialSummary, runtimeLease.promptSession(), queuedInputBoundary(request.threadId(), request.workspaceRoot(),
                             request.workspaceId(), deadlineAt),
@@ -312,7 +395,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 把最早 SUSPENDED Turn 放回现有 FIFO；恢复不比较旧运行环境，READY 在下一请求安全点读取最新偏好，
-     * TOOLS 只按已持久化 binding 结算，禁止同名重路由。
+     * TOOLS 只按已持久化 binding 结算，禁止同名重路由。交互答案也通过此唯一入口恢复。
      */
     @Override
     @SuppressWarnings("PMD.CloseResource")
@@ -328,10 +411,27 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         }
         Instant resumedAt = clock.instant();
         TurnExecutionState.Common common = candidate.execution().common();
+        InteractionService interactions = interactionOwner;
+        if (interactions != null && interactions.read(candidate.threadId(), null)
+                .flatMap(io.github.kongweiguang.ja.conversation.domain.interaction.InteractionSnapshot::request)
+                .filter(request -> request.turnId().equals(turnId)
+                        && request.status() == io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus.PENDING).isPresent()) {
+            throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE);
+        }
         TurnOrigin origin = common.origin();
         UserContent content = origin.internal() ? null : candidate.originalContent();
+        TurnLimits resumeCeiling = null;
+        if (origin == TurnOrigin.PLAN_EXECUTION) {
+            var budgets = planResumeBudget;
+            if (budgets == null) throw new IllegalStateException("Plan resume budget is unavailable");
+            resumeCeiling = budgets.apply(turnId).orElseThrow(() -> new IllegalStateException("Plan run budget is unavailable"));
+        }
+        Duration activeBudget = resumeCeiling == null || common.activeBudget().compareTo(resumeCeiling.wallTimeout()) <= 0
+                ? common.activeBudget() : resumeCeiling.wallTimeout();
+        Instant resumedDeadline = resumedAt.plus(activeBudget);
+        TurnExecutionState resumedExecution = candidate.execution().withDeadline(resumedDeadline);
         RuntimeLease lease = openCurrentLease(candidate.threadId(), candidate.turnId(), candidate.workspaceRoot(),
-                candidate.workspaceId(), common.deadlineAt(), origin);
+                candidate.workspaceId(), resumedDeadline, origin);
         try {
             restoreRequestPrompt(common, candidate.promptSummary(), lease);
             TurnQueue.Reservation reservation;
@@ -370,22 +470,22 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                 }
                 TurnExecutionPlan plan = new TurnExecutionPlan(candidate.threadId(), candidate.turnId(),
                         candidate.workspaceRoot(), content, origin, lease.model(), lease.accessMode(),
-                        lease.limits(), resumedAt,
+                        capLimits(lease.limits(), resumeCeiling), resumedAt,
                         candidate.workspaceId(), receipt.threadRevision(),
                         receipt.turnMutationVersion(), candidate.initialSummary(),
                         lease.promptSession(), queuedInputBoundary(candidate.threadId(), candidate.workspaceRoot(),
-                                candidate.workspaceId(), common.deadlineAt()),
+                                candidate.workspaceId(), resumedDeadline),
                         lease.attachments(), lease.tools(),
                         lease.generationId(), lease.toolSessions(), lease.outputLimits(), lease.presentationSecrets(),
-                        common.deadlineAt(), requestRuntimeFactory(candidate.threadId(), candidate.turnId(),
+                        resumedDeadline, requestRuntimeFactory(candidate.threadId(), candidate.turnId(),
                                 candidate.workspaceRoot(), content, origin, resumedAt,
-                                candidate.workspaceId(), common.deadlineAt()),
+                                candidate.workspaceId(), resumedDeadline, resumeCeiling),
                         TurnChangeTracker.resumed(candidate.workspaceRoot()));
                 Key key = new Key(candidate.threadId(), candidate.turnId());
-                Instant deadlineAt = common.deadlineAt();
+                Instant deadlineAt = resumedDeadline;
                 TurnOwnership owner = new TurnOwnership(plan, sink, cancellation, new TerminalCoordinator(),
                         new CompletableFuture<>(), candidate.provisionalTitleEligible(), deadlineAt,
-                        candidate.execution());
+                        resumedExecution);
                 if (active.putIfAbsent(key, owner) != null) {
                     reservation.fail(new IllegalArgumentException("turn identity is already active"));
                     cancellation.close();
@@ -398,6 +498,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                     owner.deadline = deadlines.schedule(
                             () -> cancelFromRuntime(key, owner, "turn deadline exceeded"),
                             delayNanos, TimeUnit.NANOSECONDS);
+                    Consumer<CompletionStage<?>> continuation = resumeContinuations.remove(candidate.turnId());
+                    if (continuation != null) continuation.accept(owner.completion);
                     reservation.submit(() -> run(key, owner));
                 } catch (RuntimeException failure) {
                     active.remove(key, owner);
@@ -439,6 +541,35 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                 throw absent;
             }
         }
+    }
+
+    /**
+     * Plan pause 的窄入口：活动 Turn 先完成取消清理，再尝试保留 execution cursor；已有
+     * SUSPENDED Turn 不重复写状态，避免把暂停误收敛为 CANCELLED。
+     */
+    public CompletionStage<Void> suspendPlanRun(String turnId, long expectedThreadRevision) {
+        String threadId = cancellationThreadId(turnId);
+        if (threadId == null) return CompletableFuture.completedFuture(null);
+        TurnOwnership owner = active.get(new Key(threadId, turnId));
+        if (owner == null) {
+            return store.findResumeCandidate(turnId).isPresent()
+                    ? CompletableFuture.completedFuture(null)
+                    : CompletableFuture.failedFuture(TurnUseCase.TurnResumeException.of(
+                            TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE));
+        }
+        owner.planPauseRequested.set(true);
+        try {
+            cancellationLifecycle.cancel(turnId, expectedThreadRevision, "plan paused");
+        } catch (RuntimeException failure) {
+            owner.planPauseRequested.set(false);
+            return CompletableFuture.failedFuture(failure);
+        }
+        return owner.completion.handle((ignored, failure) -> {
+            if (failure != null && !isPlanSuspended(failure)) {
+                throw new CompletionException(failure);
+            }
+            return null;
+        });
     }
 
     /**
@@ -491,12 +622,31 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /** 普通提交固定为 FOLLOW_UP；“调整方向”只能对已入队 identity 做显式提升。 */
     @Override
     public TurnUseCase.InputMutation enqueueInput(String turnId, UserContent content) {
-        return mutateInput(turnId, false, authority -> {
+        return enqueueInput(turnId, content, TurnEventSink.noop());
+    }
+
+    /** 只有原子替代了未决问题才自动恢复，普通运行中的队列仍等待原安全点。 */
+    @Override public TurnUseCase.InputMutation enqueueInput(String turnId, UserContent content, TurnEventSink sink) {
+        TurnUseCase.InputMutation result = mutateInput(turnId, false, authority -> {
             UserContent validated = validateQueuedContent(authority, content);
             return store.enqueueInput(new ConversationRepository.PendingInput(
                 "input_" + UUID.randomUUID(), authority.key().threadId(), turnId,
                 ConversationRepository.InputKind.FOLLOW_UP, validated, clock.instant()));
         });
+        var candidate = store.findResumeCandidate(turnId);
+        InteractionService interactions = interactionOwner;
+        if (candidate.isPresent() && interactions != null) {
+            var suspended = candidate.orElseThrow();
+            boolean superseded = interactions.read(suspended.threadId(), null)
+                    .flatMap(io.github.kongweiguang.ja.conversation.domain.interaction.InteractionSnapshot::request)
+                    .filter(request -> request.turnId().equals(turnId)
+                            && request.status() == io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus.SUPERSEDED).isPresent();
+            if (superseded) {
+                interactions.publishLatest(suspended.threadId());
+                scheduleInteractionResume(suspended.threadId(), turnId, suspended.threadRevision(), sink, 0);
+            }
+        }
+        return result;
     }
 
     /** 提升按 SQLite 分配的点击序列移动到普通 FIFO 之前，不中断当前 Provider 或 Tool。 */
@@ -566,7 +716,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                             TurnUseCase.InputMutationFailure.TURN_NOT_FOUND));
             return new InputMutationAuthority(new Key(suspended.threadId(), suspended.turnId()),
                     suspended.workspaceId(), suspended.workspaceRoot(),
-                    suspended.execution().common().deadlineAt());
+                    clock.instant().plus(suspended.execution().common().activeBudget()));
         } catch (ConversationRepository.InputQueueException failure) {
             throw mapInputFailure(failure);
         }
@@ -729,15 +879,22 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /**
-     * 使用调用方单调截止线执行幂等关闭，并发调用共享首次关闭结果。
+     * 使用调用方单调截止线执行幂等关闭；先运行侧聊前置 hook，再停止 Turn 准入，
+     * 保证临时 owner 仍能通过同一 TurnService 完成取消。
      */
     @Override
     public void closeAt(long shutdownDeadlineNanos) {
         RuntimeException failure = null;
         try {
+            preShutdownHook.get().accept(shutdownDeadlineNanos);
+        } catch (RuntimeException hookFailure) {
+            failure = hookFailure;
+        }
+        try {
             shutdown.closeAt(shutdownDeadlineNanos);
         } catch (RuntimeException shutdownFailure) {
-            failure = shutdownFailure;
+            if (failure == null) failure = shutdownFailure;
+            else failure.addSuppressed(shutdownFailure);
         }
         try {
             automaticTitles.closeAt(shutdownDeadlineNanos);
@@ -768,10 +925,20 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         } catch (AgentLoop.InputNeedsAttentionException attention) {
             // Loop 已持久化 needs_attention 与 SUSPENDED；这里只结束运行 owner，禁止再写失败终态。
             turn.completion.completeExceptionally(attention);
+        } catch (InteractionSuspendedException suspended) {
+            // Interaction 已在 Loop 内原子持久化为 SUSPENDED；答案到达后由调度器复用同一 Resume CAS。
+            turn.completion.completeExceptionally(suspended);
+        } catch (AgentLoop.PlanPauseSuspendedException suspended) {
+            // Plan pause 已在 Loop 安全点保留 cursor；不能再进入 CANCELLED/FAILED 终态。
+            turn.completion.completeExceptionally(new PlanSuspendedException());
         } catch (CancellationException cancelled) {
             cancellationLifecycle.awaitBarrier(key, turn);
-            terminalSettlement.settleEmergency(turn, TurnState.CANCELLED, "CANCELLED",
-                    "turn cancelled", turn.cancellationDebt.get());
+            if (turn.planPauseRequested.get() && suspendCancelledTurn(key, turn)) {
+                turn.completion.completeExceptionally(new PlanSuspendedException());
+            } else {
+                terminalSettlement.settleEmergency(turn, TurnState.CANCELLED, "CANCELLED",
+                        "turn cancelled", turn.cancellationDebt.get());
+            }
         } catch (TerminalCoordinator.CommitFailure failure) {
             cancellationLifecycle.awaitBarrier(key, turn);
             terminalSettlement.settleEmergency(turn, TurnState.FAILED, "INTERNAL_ERROR",
@@ -794,6 +961,9 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
             cancellations.complete(key.threadId(), key.turnId());
             cancellationLifecycle.clearBarrier(key);
             active.remove(key, turn);
+            store.findTurn(key.threadId(), key.turnId()).ifPresent(snapshot -> {
+                if (snapshot.state().terminal()) resumeContinuations.remove(key.turnId());
+            });
         }
     }
 
@@ -896,6 +1066,15 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         }
     }
 
+    /** RuntimeLease 是权限/配置 owner，Plan ceiling 只能取交集而不能放宽它。 */
+    private static TurnLimits capLimits(TurnLimits actual, TurnLimits ceiling) {
+        if (ceiling == null) return actual;
+        return new TurnLimits(Math.min(actual.maxModelRounds(), ceiling.maxModelRounds()),
+                Math.min(actual.maxToolCalls(), ceiling.maxToolCalls()), actual.maxInputTokens(),
+                actual.maxOutputTokens(), actual.wallTimeout().compareTo(ceiling.wallTimeout()) <= 0
+                        ? actual.wallTimeout() : ceiling.wallTimeout());
+    }
+
     /** 每个请求安全点按稳定 Skill ID 重读正文；缺失或无效作为本次请求失败而非旧环境恢复。 */
     private static void restoreRequestPrompt(TurnExecutionState.Common common, String promptSummary,
                                              RuntimeLease runtime) {
@@ -916,7 +1095,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     private static TurnExecutionState.Ready initialExecution(RuntimeLease lease, Instant deadlineAt,
                                                               TurnOrigin origin) {
         TurnExecutionState.Common common = new TurnExecutionState.Common(
-                0, 0, 1, null, lease.promptSession().activeSkillReferences(), deadlineAt, origin);
+                0, 0, 1, null, lease.promptSession().activeSkillReferences(), deadlineAt, origin,
+                lease.limits().wallTimeout());
         return new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null);
     }
 
@@ -941,20 +1121,21 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /** 创建生产请求 factory；每次调用都重新走配置 Owner，且返回值关闭即释放 Provider/MCP 凭据。 */
     private TurnExecutionPlan.RequestRuntimeFactory requestRuntimeFactory(
             String threadId, String turnId, java.nio.file.Path workspaceRoot, UserContent content,
-            TurnOrigin origin, Instant requestedAt, String workspaceId, Instant deadlineAt) {
+            TurnOrigin origin, Instant requestedAt, String workspaceId, Instant deadlineAt, TurnLimits ceiling) {
         return (common, promptSummary) -> {
             RuntimeLease lease = openCurrentLease(threadId, turnId, workspaceRoot, workspaceId, deadlineAt, origin);
             boolean transferred = false;
             try {
                 restoreRequestPrompt(common, promptSummary, lease);
+                TurnLimits effectiveLimits = capLimits(lease.limits(), ceiling);
                 TurnExecutionPlan plan = new TurnExecutionPlan(threadId, turnId, workspaceRoot, content, origin,
-                        lease.model(), lease.accessMode(), lease.limits(), requestedAt, workspaceId,
+                        lease.model(), lease.accessMode(), effectiveLimits, requestedAt, workspaceId,
                         0, 0, promptSummary, lease.promptSession(),
                         queuedInputBoundary(threadId, workspaceRoot, workspaceId, deadlineAt),
                         lease.attachments(), lease.tools(), lease.generationId(), lease.toolSessions(),
                         lease.outputLimits(), lease.presentationSecrets(), deadlineAt,
                         requestRuntimeFactory(threadId, turnId, workspaceRoot, content, origin, requestedAt,
-                                workspaceId, deadlineAt), TurnChangeTracker.fresh(workspaceRoot));
+                                workspaceId, deadlineAt, ceiling), TurnChangeTracker.fresh(workspaceRoot));
                 TurnExecutionPlan.RequestRuntime result = new TurnExecutionPlan.RequestRuntime(
                         plan, lease.requestProfile(lease.promptSession().currentRevision()), lease);
                 transferred = true;
@@ -970,6 +1151,95 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
      */
     private void cancelFromRuntime(Key key, TurnOwnership turn, String reason) {
         cancellationLifecycle.requestCancellation(key, turn, reason);
+    }
+
+    /**
+     * 回答事务提交后只排队恢复意图；旧 Loop 尚未执行 finally 时保持等待，避免同一 Turn 出现两个 owner。
+     */
+    private void scheduleInteractionResume(String threadId, String turnId, long threadRevision,
+                                            TurnEventSink sink, int attempt) {
+        if (!accepting.get() || shutdown.isClosed()) return;
+        Key key = new Key(threadId, turnId);
+        PendingInteractionResume pending = new PendingInteractionResume(threadRevision, sink, attempt);
+        if (pendingInteractionResumes.putIfAbsent(key, pending) != null) return;
+        try {
+            long delay = attempt == 0 ? 0L : Math.min(2_000L, 25L << Math.min(6, attempt - 1));
+            deadlines.schedule(() -> tryInteractionResume(key, pending), delay, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            pendingInteractionResumes.remove(key, pending);
+        }
+    }
+
+    /** 取消收口只在持久 execution 仍存在且双 CAS 未被其它终态赢走时保留暂停事实。 */
+    private boolean suspendCancelledTurn(Key key, TurnOwnership turn) {
+        ConversationRepository.TurnSnapshot current = store.findTurn(key.threadId(), key.turnId()).orElse(null);
+        if (current == null || current.state().terminal()) return false;
+        return store.suspendCancelled(key.threadId(), key.turnId(), current.threadRevision(),
+                current.turnMutationVersion(), clock.instant());
+    }
+
+    /** Plan pause 的可恢复控制流异常不应被 Plan coordinator 结算为失败。 */
+    private static boolean isPlanSuspended(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof PlanSuspendedException) return true;
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    /** 仅在暂停 cursor 已由 SQLite 保留后向上层传播，禁止携带内部执行细节。 */
+    public static final class PlanSuspendedException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+
+        /** 固定消息避免暂停控制流把 Provider 或数据库细节带出边界。 */
+        /** 构造无内部细节的控制流异常，供 Plan adapter 识别可恢复暂停。 */
+        public PlanSuspendedException() {
+            super("plan turn suspended");
+        }
+    }
+
+    /**
+     * 恢复只重试有限次数；若 owner 长时间未释放或应用正在关闭，保留 SUSPENDED 权威事实供显式 Resume。
+     */
+    private void tryInteractionResume(Key key, PendingInteractionResume pending) {
+        if (!accepting.get() || shutdown.isClosed()) {
+            pendingInteractionResumes.remove(key, pending);
+            return;
+        }
+        if (active.containsKey(key)) {
+            retryInteractionResume(key, pending);
+            return;
+        }
+        try {
+            resume(key.turnId(), pending.threadRevision(), pending.sink());
+        } catch (TurnUseCase.TurnResumeException failure) {
+            if (failure.failure() == TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE) {
+                pendingInteractionResumes.remove(key, pending);
+                LOGGER.warn("Interaction answer was persisted but Turn is no longer resumable threadId={} turnId={}",
+                        key.threadId(), key.turnId());
+                return;
+            }
+            retryInteractionResume(key, pending);
+            return;
+        } catch (RuntimeException failure) {
+            retryInteractionResume(key, pending);
+            return;
+        }
+        pendingInteractionResumes.remove(key, pending);
+    }
+
+    /** 有界指数退避避免网络重试或旧 owner 卡住时创建无限后台任务。 */
+    private void retryInteractionResume(Key key, PendingInteractionResume pending) {
+        if (pending.attempt() >= 8) {
+            pendingInteractionResumes.remove(key, pending);
+            LOGGER.warn("Interaction resume remains pending for explicit recovery threadId={} turnId={}",
+                    key.threadId(), key.turnId());
+            return;
+        }
+        pendingInteractionResumes.remove(key, pending);
+        scheduleInteractionResume(key.threadId(), key.turnId(), pending.threadRevision(), pending.sink(),
+                pending.attempt() + 1);
     }
 
     /**
@@ -1002,6 +1272,16 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         Key {
             Objects.requireNonNull(threadId, "threadId");
             Objects.requireNonNull(turnId, "turnId");
+        }
+    }
+
+    /** Interaction resume 的内存去重门；答案与 Turn 状态仍以 SQLite 为最终权威。 */
+    private record PendingInteractionResume(long threadRevision, TurnEventSink sink, int attempt) {
+        /** 重试只携带已提交的版本与当前连接出口，不能扩大执行预算。 */
+        private PendingInteractionResume {
+            if (threadRevision < 0 || attempt < 0 || attempt > 8 || sink == null) {
+                throw new IllegalArgumentException("invalid interaction resume schedule");
+            }
         }
     }
 

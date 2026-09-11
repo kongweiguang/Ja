@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
+import io.github.kongweiguang.ja.foundation.runtime.ProductVersion;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
@@ -65,6 +66,31 @@ final class RpcServerTest {
                 root.resolve("run"), root.resolve("logs"));
     }
 
+    /** 通过生产构造器观察配置中的 host generation，确保默认入口不再硬编码事件代际。 */
+    @Test
+    void productionConstructorPublishesConfiguredRuntimeGeneration() {
+        SidecarConfiguration configuration = new SidecarConfiguration(
+                java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-server-test", "home"),
+                java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-server-test", "data"),
+                java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-server-test", "run"),
+                java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-server-test", "logs"),
+                7L);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        RpcServer server = new RpcServer(new ByteArrayInputStream(new byte[0]), output, configuration,
+                ignored -> new EmptyServices(new AtomicBoolean()).bindings(),
+                TestConfigurationPorts.unavailable());
+        try {
+            java.lang.reflect.Field session = RpcServer.class.getDeclaredField("session");
+            session.setAccessible(true);
+            RpcSession value = (RpcSession) session.get(server);
+            assertEquals(7L, value.runtimeGeneration());
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("runtime generation must be inspectable in the server session", failure);
+        } finally {
+            server.close(ShutdownDeadline.start());
+        }
+    }
+
     /** 验证 initialize、ready 与 EOF 关闭只写出公开帧，任何凭据均不会回显。 */
     @Test
     void handshakePublishesIdentityAndRedactsConfig() throws Exception {
@@ -86,10 +112,10 @@ final class RpcServerTest {
         assertEquals(0, server.run());
         String wire = output.toString(StandardCharsets.UTF_8);
         assertTrue(wire.contains("\"engine\":\"ja-kernel\""));
-        assertTrue(wire.contains("\"engineVersion\":\"0.1.0\""));
+        assertTrue(wire.contains("\"engineVersion\":\"" + ProductVersion.current() + "\""));
         assertTrue(wire.contains("\"status\":\"ready\""));
         assertTrue(wire.contains("\"status\":\"stopped\""));
-        assertTrue(wire.contains("\"features\":[\"task_threads_v1\",\"plan_goal_v1\"]"));
+        assertTrue(wire.contains("\"features\":[\"task_threads_v1\",\"plan_goal_v1\",\"interaction_v1\"]"));
         assertFalse(wire.contains("provider-secret"));
         assertTrue(closed.get());
     }
@@ -112,12 +138,13 @@ final class RpcServerTest {
                         yield (AutoCloseable) () -> subscribed.set(null);
                     }
                     case "read" -> snapshot;
+                    case "subscribePlan" -> (AutoCloseable) () -> { };
                     default -> throw new UnsupportedOperationException("unexpected Goal call: " + method.getName());
                 });
         RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, () -> { });
         RpcServiceBindings bindings = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
                 base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
-                base.attachments(), base.attachmentPreviews(), base.tasks(), goalOwner, base.lifecycle());
+                base.attachments(), base.attachmentPreviews(), base.tasks(), goalOwner, base.interactions(), base.lifecycle());
 
         try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
              RpcSession session = new RpcSession(testConfiguration(), mapper, CLOCK, writer,
@@ -196,7 +223,7 @@ final class RpcServerTest {
         RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, () -> { });
         RpcServiceBindings bindings = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
                 base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
-                base.attachments(), base.attachmentPreviews(), taskOwner, base.goals(), lifecycle);
+                base.attachments(), base.attachmentPreviews(), taskOwner, base.goals(), base.interactions(), lifecycle);
         try (StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024)) {
             RpcSession session = new RpcSession(testConfiguration(), mapper, CLOCK, writer,
                     ignored -> bindings, TestConfigurationPorts.unavailable(), 71);
@@ -539,7 +566,7 @@ final class RpcServerTest {
         GoalModels.GoalDefinition definition = new GoalModels.GoalDefinition(
                 goal.goalId(), 1, goal.objective(), List.of(), CLOCK.instant());
         return new GoalModels.GoalSnapshot(goal, definition, null, null, 0, 0,
-                null, null, null, null, null, 1);
+                null, null, null, null, 1);
     }
 
     /** 按 ID 读取唯一响应结果，避免断言把输入请求误认为标准输出帧。 */

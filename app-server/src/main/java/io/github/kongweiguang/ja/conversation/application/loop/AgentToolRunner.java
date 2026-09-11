@@ -5,7 +5,9 @@ package io.github.kongweiguang.ja.conversation.application.loop;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.observation.ExecutionObservers;
 import io.github.kongweiguang.ja.conversation.application.policy.ToolPolicyChain;
+import io.github.kongweiguang.ja.conversation.application.policy.PlanToolPolicy;
 import io.github.kongweiguang.ja.conversation.application.presentation.ToolPresentationProjector;
+import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
@@ -81,9 +83,15 @@ final class AgentToolRunner implements AutoCloseable {
         this.goalTools = Objects.requireNonNull(port, "port");
     }
 
+    /** 为每个 Tool batch 冻结当前 Goal ledger，防止执行中热替换 owner 造成身份不一致。 */
+    GoalToolExecutionPort goalTools() {
+        return goalTools;
+    }
+
     /**
      * 每个调用先单独提交 RUNNING intent，再把单一结果、单元素 TOOL Message 和下一游标原子结算；
      * 后一个调用因此只能观察到前一个调用已持久完成的真实状态。
+     * 只有内建 Tool 显式声明的可信内核操作免去外部动作审批，实际 MCP 与其它工具仍遵守原权限策略。
      */
     List<AgentTool.ToolResult> execute(Execution execution, List<AgentTool.Invocation> calls) {
         Objects.requireNonNull(execution, "execution");
@@ -123,10 +131,18 @@ final class AgentToolRunner implements AutoCloseable {
                     if (result == null && !Objects.requireNonNull(decision, "Tool policy decision").proceed()) {
                         result = failed(decision.code(), decision.message());
                     } else if (result == null) {
+                        ToolPolicy.Decision planDecision = PlanToolPolicy.validate(tool,
+                                execution.command().origin(), execution.collaborationMode());
+                        if (!planDecision.proceed()) {
+                            result = failed(planDecision.code(), planDecision.message());
+                        }
+                    }
+                    if (result == null) {
                         try {
                             if (toolExecution.accessMode()
                                     == io.github.kongweiguang.ja.conversation.domain.permission.AccessMode
                                     .APPROVAL_REQUIRED
+                                    && requiresExternalApproval(tool)
                                     && !awaitApproval(execution, call)) {
                                 result = failed("TOOL_DENIED", "Tool denied by user");
                             }
@@ -136,11 +152,15 @@ final class AgentToolRunner implements AutoCloseable {
                         }
                     }
                     if (result == null) {
-                        Optional<GoalToolExecutionPort.Attempt> goalAttempt = goalTools.prepare(
-                                new GoalToolExecutionPort.Prepare(execution.command().threadId(),
-                                        execution.command().turnId(), execution.command().origin(),
-                                        call.callId(), call.toolName(),
-                                        call.arguments(), sideEffect, clock.instant()));
+                        /* 可信内建 Tool 只改变 Ja 的控制面；跳过 Goal attempt，避免 request_user_input
+                         * 抛出挂起信号时留下 STARTED 的伪执行记录。真正的 Plan/Goal 工作 Tool 仍走 ledger。 */
+                        Optional<GoalToolExecutionPort.Attempt> goalAttempt = isTrustedInternal(tool)
+                                ? Optional.empty()
+                                : execution.goalTools().prepare(
+                                        new GoalToolExecutionPort.Prepare(execution.command().threadId(),
+                                                execution.command().turnId(), execution.command().origin(),
+                                                call.callId(), call.toolName(),
+                                                call.arguments(), sideEffect, clock.instant()));
                         execution.writer().commit(TurnState.RUNNING,
                                 new TurnEvent.ToolStarted(execution.draftContext().get(),
                                         call.callId(), call.ordinal()),
@@ -151,7 +171,7 @@ final class AgentToolRunner implements AutoCloseable {
                                     .markIncomplete(io.github.kongweiguang.ja.conversation.domain.TurnChangeSet
                                             .IncompleteReason.UNKNOWN_MUTATOR);
                         }
-                        goalAttempt.ifPresent(attempt -> goalTools.start(attempt, clock.instant()));
+                        goalAttempt.ifPresent(attempt -> execution.goalTools().start(attempt, clock.instant()));
                         observers.observe(new ExecutionObserver.ToolStarted(
                                 execution.command().threadId(), execution.command().turnId(), call.callId(),
                                 call.toolName(), call.ordinal(), sideEffect));
@@ -161,7 +181,7 @@ final class AgentToolRunner implements AutoCloseable {
                         duration = Math.max(0L,
                                 java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt));
                         AgentTool.ToolResult settledResult = result;
-                        goalAttempt.ifPresent(attempt -> goalTools.settle(attempt,
+                        goalAttempt.ifPresent(attempt -> execution.goalTools().settle(attempt,
                                 new GoalToolExecutionPort.Settlement(settledResult.outcome(),
                                         settledResult.content(), settledResult.errorCode(), clock.instant())));
                         try {
@@ -179,6 +199,19 @@ final class AgentToolRunner implements AutoCloseable {
             if (promptRefreshFailure != null) throw promptRefreshFailure;
         }
         return List.copyOf(results);
+    }
+
+    /**
+     * 审批豁免必须同时满足内建路由和显式内核标记；路由检查防止 MCP 适配器伪造内部审批语义。
+     */
+    private static boolean requiresExternalApproval(AgentTool tool) {
+        return !isTrustedInternal(tool);
+    }
+
+    /** 可信控制面身份必须同时来自内建路由与审批元数据，外部 Tool 不能借标记逃避 Goal 记录。 */
+    private static boolean isTrustedInternal(AgentTool tool) {
+        return tool.bindingDescriptor().routeKind() == AgentTool.RouteKind.BUILTIN
+                && tool.approvalRequirement() == AgentTool.ApprovalRequirement.TRUSTED_INTERNAL;
     }
 
     /**
@@ -312,6 +345,9 @@ final class AgentToolRunner implements AutoCloseable {
                             ? "WORKSPACE_WRITE_LEASE_TIMEOUT" : "WORKSPACE_WRITE_LEASE_LOST");
         } catch (CancellationException cancelled) {
             return new AgentTool.ToolResult(ToolOutcome.CANCELLED, "", Optional.empty(), "CANCELLED");
+        } catch (InteractionSuspendedException suspended) {
+            /* 请求已先落 SQLite；向 Turn 状态机透传，不能把用户等待伪装成 Tool 失败。 */
+            throw suspended;
         } catch (RuntimeException failure) {
             boolean external = tool.sideEffect() == ToolSideEffect.EXTERNAL;
             return new AgentTool.ToolResult(ToolOutcome.FAILED,
@@ -434,8 +470,13 @@ final class AgentToolRunner implements AutoCloseable {
                 .orElseThrow(() -> new AgentLoop.LoopFailure(
                         "TOOL_BINDING_UNAVAILABLE", "Tool binding is unavailable"));
         TurnExecutionPlan command = execution.command();
+        Optional<GoalToolExecutionPort.ExecutionIdentity> identity = execution.goalTools()
+                .executionIdentity(command.threadId(), command.turnId(), command.origin());
         return new AgentTool.ExecutionContext(command.threadId(), command.turnId(), command.workspaceRoot(),
-                binding.accessMode(), command.model().configGeneration(), deadline(command), command.workspaceId());
+                binding.accessMode(), command.model().configGeneration(), deadline(command), command.workspaceId(),
+                identity.map(GoalToolExecutionPort.ExecutionIdentity::planRevisionId).orElse(null),
+                identity.map(GoalToolExecutionPort.ExecutionIdentity::runId).orElse(null),
+                identity.map(GoalToolExecutionPort.ExecutionIdentity::goalId).orElse(null), command.origin());
     }
 
     /** 从 Turn 请求时刻计算所有 Tool 与审批共享的固定 Deadline。 */
@@ -467,7 +508,8 @@ final class AgentToolRunner implements AutoCloseable {
             TurnExecutionState.Common current, AgentPromptSession promptSession) {
         return new TurnExecutionState.Common(current.modelRound(), current.usedToolCalls(),
                 current.nextProviderOrdinal(), current.promptCheckpointId(),
-                promptSession.activeSkillReferences(), current.deadlineAt(), current.origin());
+                promptSession.activeSkillReferences(), current.deadlineAt(), current.origin(),
+                current.activeBudget());
     }
 
     /** 同步取得异步端口结果并保留运行时异常类型。 */
@@ -485,7 +527,32 @@ final class AgentToolRunner implements AutoCloseable {
                      CancellationToken cancellation, Supplier<TurnEvent.Context> draftContext,
                      Supplier<TurnExecutionState.Tools> cursor, DurableWriter writer,
                      ApprovalLookup approvalLookup, BindingLookup bindingLookup, Runnable refreshAuthority,
-                     ResolvedPublisher resolvedPublisher) {
+                     ResolvedPublisher resolvedPublisher,
+                     io.github.kongweiguang.ja.conversation.domain.CollaborationMode collaborationMode,
+                     GoalToolExecutionPort goalTools) {
+        /** 保持测试与非 Provider 直接调用方的构造面；生产执行必须传入冻结的实际模式。 */
+        Execution(TurnExecutionPlan command, Map<String, AgentTool> catalog,
+                  CancellationToken cancellation, Supplier<TurnEvent.Context> draftContext,
+                  Supplier<TurnExecutionState.Tools> cursor, DurableWriter writer,
+                  ApprovalLookup approvalLookup, BindingLookup bindingLookup, Runnable refreshAuthority,
+                  ResolvedPublisher resolvedPublisher) {
+            this(command, catalog, cancellation, draftContext, cursor, writer, approvalLookup, bindingLookup,
+                    refreshAuthority, resolvedPublisher,
+                    io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
+                    GoalToolExecutionPort.disabled());
+        }
+
+        /** 带模式的测试/适配器构造仍使用空 Goal ledger，避免隐藏 identity 查询改变旧夹具。 */
+        Execution(TurnExecutionPlan command, Map<String, AgentTool> catalog,
+                  CancellationToken cancellation, Supplier<TurnEvent.Context> draftContext,
+                  Supplier<TurnExecutionState.Tools> cursor, DurableWriter writer,
+                  ApprovalLookup approvalLookup, BindingLookup bindingLookup, Runnable refreshAuthority,
+                  ResolvedPublisher resolvedPublisher,
+                  io.github.kongweiguang.ja.conversation.domain.CollaborationMode collaborationMode) {
+            this(command, catalog, cancellation, draftContext, cursor, writer, approvalLookup, bindingLookup,
+                    refreshAuthority, resolvedPublisher, collaborationMode, GoalToolExecutionPort.disabled());
+        }
+
         /** 复制 Tool 目录并校验回调，避免执行期间观察到注册变化。 */
         Execution {
             Objects.requireNonNull(command, "command");
@@ -498,7 +565,12 @@ final class AgentToolRunner implements AutoCloseable {
             Objects.requireNonNull(bindingLookup, "bindingLookup");
             Objects.requireNonNull(refreshAuthority, "refreshAuthority");
             Objects.requireNonNull(resolvedPublisher, "resolvedPublisher");
+            Objects.requireNonNull(collaborationMode, "collaborationMode");
+            Objects.requireNonNull(goalTools, "goalTools");
         }
+
+        /** Runner 从同一个 Execution 读取 ledger，防止被全局可变字段替换。 */
+        public GoalToolExecutionPort goalTools() { return goalTools; }
     }
 
     /** 原子提交 Tool 事实后再发布事件。 */

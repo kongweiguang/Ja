@@ -32,7 +32,7 @@ try {
   await handle.waitFor();
   for (const width of [1000, 760]) {
     await page.setViewportSize({ width, height: 700 });
-    for (const palette of ["xcode", "fleet", "obsidian", "claude"]) {
+    for (const palette of ["xcode", "ja", "jetbrains", "obsidian", "claude"]) {
       for (const mode of ["light", "dark"]) {
         await page.evaluate(
           ({ palette, mode }) => {
@@ -81,7 +81,7 @@ try {
   await page.keyboard.press("ArrowRight");
   assert.equal(Number(await handle.getAttribute("aria-valuenow")), dragged + 0.5);
   console.log(
-    "PASS: 16 viewport/theme combinations, 64 contour pixel probes, pointer and keyboard resize",
+    "PASS: 20 viewport/theme combinations, 80 contour pixel probes, pointer and keyboard resize",
   );
 } finally {
   await browser.close();

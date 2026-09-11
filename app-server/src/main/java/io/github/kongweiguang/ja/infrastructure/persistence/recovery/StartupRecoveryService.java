@@ -167,6 +167,13 @@ public final class StartupRecoveryService {
             switch (tool.state()) {
                 case "SUCCEEDED", "FAILED", "CANCELLED" -> next++;
                 case "PREPARED", "RUNNING" -> {
+                    /* request_user_input 已在同一事务写入 Interaction 后才可保留；未写入的
+                     * RUNNING Tool 仍按未知执行边界失败，避免恢复时凭名称猜测可安全重放。 */
+                    if ("request_user_input".equals(tool.toolName())
+                            && mapper.hasPendingInteraction(row.turnId(), tool.callId())
+                            && next == tools.nextOrdinal()) {
+                        return new ExecutionRecovery(tools, changed);
+                    }
                     requireChanged(mapper.failUnsettledTool(
                             row.turnId(), tool.callId(), occurredAt.toString()),
                             "startup recovery lost unsettled Tool");

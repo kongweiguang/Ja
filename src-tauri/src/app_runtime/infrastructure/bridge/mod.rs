@@ -14,15 +14,16 @@ use crate::app_runtime::{
     HistoryRequest, HistoryResponse, InputQueue, LaunchConfig, McpListResultData,
     McpTestResultData, McpToolsReadResultData, ModelTestResultData, QueuedInput, QueuedInputIssue,
     RuntimeBridgePort, RuntimeCommandError, RuntimeStatus, RuntimeStatusKind, SettingsRequest,
-    SettingsResponse, SkillListResultData, TaskActivity, TaskContextSeed, TaskCreateInput,
-    TaskCreateResult, TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult,
-    TaskMailboxMessage, TaskMessageInput, TaskMessageResult, TaskMutationInput, TaskObserveInput,
-    TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
-    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ThreadArchiveResultData,
-    ThreadCompactResultData, ThreadCreateResultData, ThreadDeleteResultData, ThreadListResultData,
-    ThreadPinResultData, ThreadPreferencesUpdateResultData, ThreadReadResultData,
-    ThreadRenameResultData, ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData,
-    ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
+    SettingsResponse, SkillListResultData, TaskActivity, TaskCloseInput, TaskCloseResult,
+    TaskContextSeed, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
+    TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput, TaskMessageResult,
+    TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult,
+    TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput,
+    ThreadArchiveResultData, ThreadCompactResultData, ThreadCreateResultData,
+    ThreadDeleteResultData, ThreadDiscoverResultData, ThreadListResultData, ThreadPinResultData,
+    ThreadPreferencesUpdateResultData, ThreadReadResultData, ThreadRenameResultData,
+    ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData, ToolArtifactReadInput,
+    ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
     TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
     TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
     WorkspaceDto, WorkspaceListResultData, WorkspacePathSearchInput, WorkspacePathSearchItem,
@@ -64,6 +65,7 @@ const MAX_TURN_CHANGE_SET_READS_IN_FLIGHT: usize = 2;
 pub(crate) enum HistoryMethod {
     WorkspaceList,
     ThreadCreate,
+    ThreadDiscover,
     ThreadList,
     ThreadSearch,
     ThreadRead,
@@ -83,6 +85,7 @@ impl HistoryMethod {
         match self {
             Self::WorkspaceList => "workspace/list",
             Self::ThreadCreate => "thread/create",
+            Self::ThreadDiscover => "thread/list",
             Self::ThreadList => "thread/list",
             Self::ThreadSearch => "thread/search",
             Self::ThreadRead => "thread/read",
@@ -901,7 +904,7 @@ impl RuntimeBridgePort for RuntimeBridge {
         RuntimeBridge::task_seen(self, input)
     }
 
-    /// QueueOnly message 通过固定 task/message/send 方法代理。
+    /// QueueOnly message 通过固定 thread/message/send 方法代理。
     fn task_message_send(
         &self,
         input: TaskMessageInput,
@@ -928,6 +931,11 @@ impl RuntimeBridgePort for RuntimeBridge {
         input: TaskTreeDeleteInput,
     ) -> Result<TaskTreeDeleteResult, RuntimeCommandError> {
         RuntimeBridge::task_tree_delete(self, input)
+    }
+
+    /// production task/close 只接受 App Server 幂等终态，不在 Rust actor 保存侧聊生命周期。
+    fn task_close(&self, input: TaskCloseInput) -> Result<TaskCloseResult, RuntimeCommandError> {
+        RuntimeBridge::task_close(self, input)
     }
 
     /// production Goal lane 只搬运 nominal payload，并保留 request/result method 身份。
@@ -1020,6 +1028,12 @@ impl RuntimeBridgePort for RuntimeBridge {
                 HistoryMethod::ThreadCreate,
                 HistoryResponse::ThreadCreate,
                 ThreadCreateResultData
+            ),
+            HistoryRequest::ThreadDiscover(params) => dispatch_history!(
+                params,
+                HistoryMethod::ThreadDiscover,
+                HistoryResponse::ThreadDiscover,
+                ThreadDiscoverResultData
             ),
             HistoryRequest::ThreadList(params) => dispatch_history!(
                 params,

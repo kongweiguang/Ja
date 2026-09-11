@@ -24,7 +24,7 @@ public interface AttachmentMapper {
     /** 只读取指定 Workspace 中尚未被队列预留的 Composer 草稿。 */
     AttachmentRecords.AttachmentRow selectUnreservedDraft(@Param("attachmentId") String attachmentId,
                                                            @Param("workspaceId") String workspaceId);
-    /** 从指定 Thread 读取排队预留或已绑定消息附件。 */
+    /** 原绑定或同 Workspace 冻结 Side Task 祖先链授权读取；排队草稿只允许当前 Thread。 */
     AttachmentRecords.AttachmentRow selectThreadAttachment(@Param("attachmentId") String attachmentId,
                                                            @Param("threadId") String threadId);
     /** DRAFT 单向丢弃。 */

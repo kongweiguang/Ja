@@ -41,8 +41,8 @@ final class SkillPackageFactory {
     private static final Set<String> REQUIRED_FRONTMATTER_FIELDS = Set.of("name", "description");
     private static final Set<String> OPTIONAL_FRONTMATTER_FIELDS = Set.of(
             "version", "license", "compatibility", "metadata", "allowed-tools");
-    private static final List<BuiltinRegistration> BUILTINS = List.of(
-            new BuiltinRegistration("coding", Map.of(SKILL_DOCUMENT, "/skills/coding/SKILL.md")));
+    // 当前不随应用分发默认 Skill；保留目录来源槽位，与设置中的来源分类一致。
+    private static final List<BuiltinRegistration> BUILTINS = List.of();
 
     /**
      * 禁止实例化无状态 Factory，避免它演变为第二个目录或正文缓存所有者。

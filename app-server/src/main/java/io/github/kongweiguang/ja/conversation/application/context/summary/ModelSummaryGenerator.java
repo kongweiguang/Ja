@@ -566,6 +566,9 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
             else if (block instanceof ContextMessage.ToolResultBlock result) {
                 characters += result.output().content().length();
             }
+            else if (block instanceof ContextMessage.ReasoningBlock reasoning) {
+                characters += reasoning.content().nativeJson().length();
+            }
         }
         return characters;
     }

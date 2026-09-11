@@ -110,3 +110,13 @@ pub async fn ja_runtime_task_tree_delete(
     let host = state.inner().clone();
     run_blocking(move || host.task_tree_delete(input.into()).map(Into::into)).await
 }
+
+/// 关闭一个临时侧聊；只有 App Server 确认幂等终态后 command 才返回成功。
+#[tauri::command]
+pub async fn ja_runtime_task_close(
+    input: TaskCloseInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TaskCloseResultDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.task_close(input.into()).map(Into::into)).await
+}

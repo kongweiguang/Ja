@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.goal.port.in.GoalUseCase;
@@ -37,6 +38,7 @@ public final class RuntimeServicesFactory {
     private final AttachmentPreviewUseCase attachmentPreviews;
     private final TaskUseCase tasks;
     private final GoalUseCase goals;
+    private final InteractionUseCase interactions;
     private final Consumer<ShutdownDeadline> closeAction;
     private final AtomicReference<RuntimeServices> opened = new AtomicReference<>();
 
@@ -51,6 +53,7 @@ public final class RuntimeServicesFactory {
                                   AttachmentUseCase attachments, AttachmentPreviewUseCase attachmentPreviews,
                                   TaskUseCase tasks,
                                   GoalUseCase goals,
+                                  InteractionUseCase interactions,
                                   Consumer<ShutdownDeadline> closeAction) {
         this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
         this.workspacePathSearch = Objects.requireNonNull(workspacePathSearch, "workspacePathSearch");
@@ -63,6 +66,7 @@ public final class RuntimeServicesFactory {
         this.attachmentPreviews = Objects.requireNonNull(attachmentPreviews, "attachmentPreviews");
         this.tasks = Objects.requireNonNull(tasks, "tasks");
         this.goals = Objects.requireNonNull(goals, "goals");
+        this.interactions = Objects.requireNonNull(interactions, "interactions");
         if (attachments != attachmentPreviews) {
             throw new IllegalArgumentException("attachment and preview ports must share one owner");
         }
@@ -81,7 +85,7 @@ public final class RuntimeServicesFactory {
         }
         RuntimeServices services = new RuntimeServices(
                 workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog, attachments,
-                attachmentPreviews, tasks, goals, closeAction);
+                attachmentPreviews, tasks, goals, interactions, closeAction);
         opened.set(services);
         return services.bindings();
     }

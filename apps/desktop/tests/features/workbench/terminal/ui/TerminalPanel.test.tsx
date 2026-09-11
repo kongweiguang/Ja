@@ -52,7 +52,7 @@ const XCODE_DARK_TERMINAL_THEME = {
   brightWhite: "#ffffff",
 } as const;
 
-const FLEET_LIGHT_TERMINAL_THEME = {
+const JA_LIGHT_TERMINAL_THEME = {
   ...LIGHT_TERMINAL_THEME,
   background: "#ffffff",
   foreground: "#202124",
@@ -144,7 +144,7 @@ const mocks = vi.hoisted(() => {
   const searchAddons: SearchAddonMock[] = [];
   const observers: Array<{ observeCount: number; disconnectCount: number }> = [];
   let resolvedTheme: "light" | "dark" = "light";
-  let palette: "xcode" | "fleet" | "obsidian" | "claude" = "xcode";
+  let palette: "xcode" | "ja" | "jetbrains" | "obsidian" | "claude" = "xcode";
   class HoistedMockTerminal implements TerminalMock {
     cols = 80;
     rows = 24;
@@ -348,10 +348,10 @@ const mocks = vi.hoisted(() => {
     set resolvedTheme(value: "light" | "dark") {
       resolvedTheme = value;
     },
-    get palette(): "xcode" | "fleet" | "obsidian" | "claude" {
+    get palette(): "xcode" | "ja" | "jetbrains" | "obsidian" | "claude" {
       return palette;
     },
-    set palette(value: "xcode" | "fleet" | "obsidian" | "claude") {
+    set palette(value: "xcode" | "ja" | "jetbrains" | "obsidian" | "claude") {
       palette = value;
     },
     HoistedMockTerminal,
@@ -419,11 +419,11 @@ describe("TerminalPanel", () => {
     terminal?.select(4, 2, 6);
 
     expect(terminal?.options.theme).toEqual(LIGHT_TERMINAL_THEME);
-    applyTerminalThemeTokens(FLEET_LIGHT_TERMINAL_THEME);
-    mocks.palette = "fleet";
+    applyTerminalThemeTokens(JA_LIGHT_TERMINAL_THEME);
+    mocks.palette = "ja";
     rendered.rerender(<TerminalPanel onAttach={onAttach} onDetach={onDetach} onData={onData} />);
 
-    expect(terminal?.options.theme).toEqual(FLEET_LIGHT_TERMINAL_THEME);
+    expect(terminal?.options.theme).toEqual(JA_LIGHT_TERMINAL_THEME);
     applyTerminalThemeTokens(XCODE_DARK_TERMINAL_THEME);
     mocks.palette = "xcode";
     mocks.resolvedTheme = "dark";

@@ -36,6 +36,7 @@
       <arg column="approval_id" javaType="string"/><arg column="decision" javaType="string"/>
       <arg column="expires_at" javaType="string"/>
       <arg column="attachments_json" javaType="string"/>
+      <arg column="source_thread_id" javaType="string"/><arg column="source_title" javaType="string"/>
     </constructor>
   </resultMap>
   <resultMap id="contextUsageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ContextUsageRow">
@@ -217,13 +218,14 @@
           FROM (SELECT ma.attachment_id,a.display_name,a.size_bytes,a.media_kind,a.media_type
                 FROM message_attachments ma JOIN attachments a ON a.attachment_id=ma.attachment_id
                 WHERE ma.message_id=tm.item_id ORDER BY ma.ordinal) ordered
-        ),json_array()) ELSE NULL END AS attachments_json
+        ),json_array()) ELSE NULL END AS attachments_json,
+        tm.source_thread_id,tm.source_title
       FROM timeline_messages tm LEFT JOIN messages m ON m.message_id=tm.item_id
       WHERE tm.thread_id=#{threadId}
       UNION ALL SELECT call_id||'_call','tool_call',created_at,turn_id,call_id,tool_name,ordinal,state,
-        NULL,NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL FROM tools WHERE thread_id=#{threadId}
+        NULL,NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL,NULL,NULL FROM tools WHERE thread_id=#{threadId}
       UNION ALL SELECT a.approval_id,'approval',a.requested_at,a.turn_id,a.call_id,t.tool_name,NULL,NULL,
-        NULL,NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at,NULL
+        NULL,NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at,NULL,NULL,NULL
         FROM approvals a JOIN tools t ON t.turn_id=a.turn_id AND t.call_id=a.call_id
         WHERE a.thread_id=#{threadId}
     ), ordered_items AS (

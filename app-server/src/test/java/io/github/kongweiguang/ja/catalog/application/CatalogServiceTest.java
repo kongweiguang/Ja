@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.catalog.application;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.kongweiguang.ja.catalog.domain.McpServerDescriptor;
@@ -15,6 +16,9 @@ import io.github.kongweiguang.ja.catalog.port.out.CatalogQueryPort;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
+import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
@@ -58,7 +62,7 @@ final class CatalogServiceTest {
         assertEquals(4, queries.calls.get());
     }
 
-    /** 模型探测固定为 text-only 单轮请求，并让配置租约覆盖整个异步 Provider 生命周期。 */
+    /** 用任意正文证明可对话，不要求 OK；固定 hi 且无系统提示，租约覆盖完整异步生命周期。 */
     @Test
     void modelTestUsesBoundedRequestAndClosesLeaseAfterCompletion() {
         ModelGenerationPort generations = new ModelGenerationPort("secret");
@@ -77,6 +81,9 @@ final class CatalogServiceTest {
         assertFalse(generations.lease.closed());
         ModelPort.ModelRequest request = captured.get();
         assertEquals(1, request.messages().size());
+        assertEquals("", request.prompt().systemPrompt());
+        assertEquals(List.of(new ModelMessage(ModelRole.USER, List.of(new TextContent("hi")))),
+                request.messages());
         assertTrue(request.tools().isEmpty());
         assertNull(request.continuation());
         assertEquals(Set.of(ModelPort.InputModality.TEXT), request.configuration().inputModalities());
@@ -88,7 +95,7 @@ final class CatalogServiceTest {
         assertTrue(generations.lease.closed());
     }
 
-    /** Catalog 模型探测按三种显式协议路由，并逐个读取自定义供应商自己的凭据引用。 */
+    /** Catalog 模型探测按三种显式协议路由，收到正文后通过，并读取供应商自己的凭据引用。 */
     @Test
     void deepSeekModelTestsKeepApiAndCredentialIdentity() {
         Map<ConfigurationGenerationSnapshot.Api, ModelPort.Api> routes = Map.of(
@@ -106,6 +113,7 @@ final class CatalogServiceTest {
             AtomicReference<ModelPort.ModelRequest> captured = new AtomicReference<>();
             ModelPort modelPort = (request, sink, cancellation) -> {
                 captured.set(request);
+                sink.onEvent(new ModelPort.TextDelta("Hello!"));
                 return CompletableFuture.completedFuture(
                         new ModelPort.ModelOutcome(ModelPort.FinishReason.STOP, null, null));
             };
@@ -120,6 +128,29 @@ final class CatalogServiceTest {
             assertEquals(secret, configuration.apiKey());
             assertTrue(generations.lease.closed());
         });
+    }
+
+    /** 空流、空白正文和仅思考均不能证明可对话，失败也必须释放租约。 */
+    @Test
+    void rejectsResponsesWithoutReplyText() {
+        List<List<ModelPort.ModelEvent>> responses = List.of(
+                List.of(), List.of(new ModelPort.TextDelta(" \n\t")),
+                List.of(new ModelPort.ReasoningSummaryDelta("thinking")));
+        for (List<ModelPort.ModelEvent> events : responses) {
+            ModelGenerationPort generations = new ModelGenerationPort("secret");
+            ModelPort modelPort = (request, sink, cancellation) -> {
+                events.forEach(sink::onEvent);
+                return CompletableFuture.completedFuture(
+                        new ModelPort.ModelOutcome(ModelPort.FinishReason.STOP, null, null));
+            };
+            CatalogService service = new CatalogService(
+                    new RecordingQueryPort(), generations, modelPort, unsupportedWorkspaces());
+            var failure = assertThrows(java.util.concurrent.CompletionException.class,
+                    () -> service.testModel("provider_fixture", "model_fixture", CancellationToken.none())
+                            .toCompletableFuture().join());
+            assertEquals("model returned no reply text", failure.getCause().getMessage());
+            assertTrue(generations.lease.closed());
+        }
     }
 
     /** 本用例只验证查询租约；任何意外模型探测都必须显式失败而不是访问外部 Provider。 */

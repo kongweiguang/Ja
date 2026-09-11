@@ -11,6 +11,8 @@ import { WorkbenchHost, type WorkbenchHostProps } from "./WorkbenchHost";
 
 export interface ThreadWorkbenchSessionsProps extends WorkbenchHostProps {
   readonly scopeKey: string;
+  /** 只向当前缓存会话暴露侧聊 slash launcher；隐藏会话不得覆盖当前入口。 */
+  readonly onRegisterSideChatLauncher?: WorkbenchHostProps["onRegisterSideChatLauncher"];
   /** Files 已由当前会话完成 flush 后，只通知壳层恢复焦点，不得再次触发 workspace 级关闭。 */
   readonly onFilesCapabilityClosed?: (workspaceId: string) => void;
 }
@@ -51,6 +53,7 @@ interface ThreadSessionHostProps {
 interface ThreadSessionInput {
   readonly hostProps: WorkbenchHostProps;
   readonly onFilesCapabilityClosed?: (workspaceId: string) => void;
+  readonly onRegisterSideChatLauncher?: WorkbenchHostProps["onRegisterSideChatLauncher"];
 }
 
 /** 卸载已无法回滚 UI，只发布稳定脱敏反馈；底层 rejection 不得进入用户消息或日志。 */
@@ -279,7 +282,7 @@ function ThreadSessionHost({
     });
   }
   const effectiveInput = input ?? retained.cached;
-  const { hostProps, onFilesCapabilityClosed } = effectiveInput;
+  const { hostProps, onFilesCapabilityClosed, onRegisterSideChatLauncher } = effectiveInput;
   const [adapters] = useState(() => createThreadWorkbenchAdapters(hostProps.adapters));
   const closeFilesTaskRef = useRef<Promise<void> | undefined>(undefined);
 
@@ -347,6 +350,7 @@ function ThreadSessionHost({
         onRegisterTerminalLifecycle={registerTerminal}
         onRegisterPreviewLifecycle={registerPreview}
         onCloseFilesCapability={closeFilesCapability}
+        onRegisterSideChatLauncher={current ? onRegisterSideChatLauncher : undefined}
       />
     </div>
   );
@@ -358,6 +362,7 @@ function ThreadSessionHost({
  */
 export function ThreadWorkbenchSessions({
   scopeKey,
+  onRegisterSideChatLauncher,
   onFilesCapabilityClosed,
   onRegisterFilesLifecycle,
   onRegisterTerminalLifecycle,
@@ -404,6 +409,7 @@ export function ThreadWorkbenchSessions({
                       onRegisterPreviewLifecycle,
                     },
                     onFilesCapabilityClosed,
+                    onRegisterSideChatLauncher,
                   }
                 : undefined
             }

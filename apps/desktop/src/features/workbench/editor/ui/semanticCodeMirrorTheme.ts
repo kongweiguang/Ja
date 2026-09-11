@@ -65,7 +65,7 @@ function createEditorTheme(resolvedTheme: ResolvedTheme): Extension {
 }
 
 /**
- * 明暗两套高亮都消费相同的语义角色，使四套 Palette 能完整覆盖语法色；不依赖
+ * 明暗两套高亮都消费相同的语义角色，使所有 Palette 能完整覆盖语法色；不依赖
  * CodeMirror 默认浅色，从而避免浅色与深色切换时出现厂商气质断层。
  */
 function createHighlightStyle(resolvedTheme: ResolvedTheme): Extension {

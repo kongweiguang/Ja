@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.filesystem.PathIdentities;
 import io.github.kongweiguang.ja.foundation.json.JsonArray;
@@ -47,6 +48,23 @@ public interface AgentTool {
      */
     default WorkspaceMutationMode workspaceMutationMode() {
         return WorkspaceMutationMode.UNOBSERVABLE;
+    }
+
+    /**
+     * 规划阶段的准入证明；默认拒绝，只有明确受信的 Plan 内部持久化能力才能提升为内部写入。
+     */
+    default PlanAccess planAccess() {
+        return PlanAccess.DISALLOWED;
+    }
+
+    /**
+     * 返回审批边界；只有内核明确标记的内建操作才可跳过用户权限审批，不能由 Tool 名称推导。
+     *
+     * <p>该标记与 {@link #planAccess()} 分离：计划阶段的准入证明和执行阶段的权限确认是两条
+     * 独立边界。调用方仍会校验绑定路由必须为 BUILTIN，防止外部 MCP 自述为可信内核操作。</p>
+     */
+    default ApprovalRequirement approvalRequirement() {
+        return ApprovalRequirement.USER_REQUIRED;
     }
 
     /**
@@ -115,7 +133,19 @@ public interface AgentTool {
             AccessMode accessMode,
             String configGeneration,
             Instant deadline,
-            String workspaceId) {
+            String workspaceId,
+            String planRevisionId,
+            String runId,
+            String goalId,
+            TurnOrigin origin) {
+        /** 保持普通 Tool 测试与非内部 Turn 的构造面；内部执行必须由 Runner 注入持久身份。 */
+        public ExecutionContext(String threadId, String turnId, Path workspaceRoot,
+                                AccessMode accessMode, String configGeneration, Instant deadline,
+                                String workspaceId) {
+            this(threadId, turnId, workspaceRoot, accessMode, configGeneration, deadline,
+                    workspaceId, null, null, null, TurnOrigin.USER);
+        }
+
         /**
          * 固化权限判断和路径约束所需的最小上下文，避免 Tool 反向读取全局运行时。
          */
@@ -128,6 +158,16 @@ public interface AgentTool {
             Objects.requireNonNull(deadline, "deadline");
             workspaceId = ContractChecks.identifier(workspaceId, "workspaceId");
             if (!workspaceId.startsWith("ws_")) throw new IllegalArgumentException("invalid workspaceId");
+            if (runId == null && (planRevisionId != null || goalId != null)) {
+                throw new IllegalArgumentException("invalid execution identity shape");
+            }
+            origin = Objects.requireNonNull(origin, "origin");
+            if (origin == TurnOrigin.PLAN_EXECUTION && (runId == null || planRevisionId == null)) {
+                throw new IllegalArgumentException("Plan execution identity is required");
+            }
+            if (origin == TurnOrigin.GOAL_CONTINUATION && (runId == null || goalId == null)) {
+                throw new IllegalArgumentException("Goal execution identity is required");
+            }
         }
     }
 
@@ -208,6 +248,24 @@ public interface AgentTool {
         EXACT_TEXT,
         /** 无法可靠观察，执行前永久降低本轮完整性。 */
         UNOBSERVABLE
+    }
+
+    /** 规划阶段允许的 Tool 来源；该标记不能由模型参数或 Tool 名称推导。 */
+    enum PlanAccess {
+        /** 不允许在只读规划上下文出现。 */
+        DISALLOWED,
+        /** 只读调研能力。 */
+        READ_ONLY,
+        /** 仅限服务端受信的计划草稿/提案持久化能力。 */
+        INTERNAL_MUTATION
+    }
+
+    /** 内核 Tool 的用户审批要求；默认收紧为必须审批，避免新 Tool 意外扩大权限。 */
+    enum ApprovalRequirement {
+        /** 可能触及用户或外部系统，必须走当前 Turn 的权限审批。 */
+        USER_REQUIRED,
+        /** 仅限受信内建状态操作；不代表获得工作区或外部系统权限。 */
+        TRUSTED_INTERNAL
     }
 
     /**

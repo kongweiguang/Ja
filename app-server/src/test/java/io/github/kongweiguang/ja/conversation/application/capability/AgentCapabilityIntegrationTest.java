@@ -349,7 +349,7 @@ final class AgentCapabilityIntegrationTest extends PersistenceTestSupport {
     /** 构造能力请求的完整稳定身份，1000 次 prepare 使用同一安全点事实。 */
     private static AgentCapability.Request capabilityRequest(String threadId, String turnId) {
         return new AgentCapability.Request(threadId, turnId, Path.of("C:/capability-fixture"),
-                "ws_capability", preferences(), "cfg_capability", START.plusSeconds(30), TurnOrigin.USER);
+                "ws_capability", preferences(), "cfg_capability", true, START.plusSeconds(30), TurnOrigin.USER);
     }
 
     /** 派生变换只增加一个带身份片段，不接触权威消息、AGENTS、Skills 或权限。 */

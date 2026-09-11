@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
@@ -39,11 +40,12 @@ public final class RuntimeServices implements DeadlineCloseable {
                            AttachmentUseCase attachments, AttachmentPreviewUseCase attachmentPreviews,
                            TaskUseCase tasks,
                            GoalUseCase goals,
+                           InteractionUseCase interactions,
                            Consumer<ShutdownDeadline> closeAction) {
         this.closeAction = Objects.requireNonNull(closeAction, "closeAction");
         this.bindings = new RpcServiceBindings(
                 workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog,
-                attachments, attachmentPreviews, tasks, goals, this);
+                attachments, attachmentPreviews, tasks, goals, interactions, this);
     }
 
     /**

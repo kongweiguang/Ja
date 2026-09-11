@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.transport.rpc.handler.AttachmentPreviewHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.HandshakeHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.HealthShutdownHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.GoalHandler;
+import io.github.kongweiguang.ja.transport.rpc.handler.InteractionHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.SettingsCatalogHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.TaskHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.ThreadHistoryHandler;
@@ -81,7 +82,8 @@ public final class RpcServer implements AutoCloseable {
      */
     public RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration,
                      RpcServicesFactory factory, ConfigurationUseCase configurationUseCase) {
-        this(input, output, configuration, Clock.systemUTC(), factory, configurationUseCase);
+        this(input, output, configuration, Clock.systemUTC(), factory, configurationUseCase,
+                () -> { }, configuration.runtimeGeneration());
     }
 
     /**
@@ -90,7 +92,7 @@ public final class RpcServer implements AutoCloseable {
     RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
               RpcServicesFactory factory, ConfigurationUseCase configurationUseCase) {
         this(input, output, configuration, clock, factory, configurationUseCase, () -> {
-        });
+        }, configuration.runtimeGeneration());
     }
 
     /**
@@ -118,6 +120,7 @@ public final class RpcServer implements AutoCloseable {
                 threadHistory, new ThreadCompactionHandler(session),
                 new AttachmentHandler(session), new AttachmentPreviewHandler(session),
                 new TurnApprovalHandler(session), new TaskHandler(session), new GoalHandler(session),
+                new InteractionHandler(session),
                 new SettingsCatalogHandler(session), new ConfigurationHandler(session),
                 new HealthShutdownHandler(session)));
         this.requests = new BoundedVirtualExecutor(
@@ -297,6 +300,15 @@ public final class RpcServer implements AutoCloseable {
             };
         }
         if (failure instanceof StorageException persistence) {
+            // 只记录异常类型与编译期位置，定位 Native 持久化映射失败而不输出 SQL、路径或用户载荷。
+            Throwable root = persistence;
+            while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+            String origin = java.util.Arrays.stream(root.getStackTrace())
+                    .filter(frame -> frame.getClassName().startsWith("io.github.kongweiguang.ja."))
+                    .findFirst().map(frame -> frame.getClassName() + "#" + frame.getMethodName() + ":" + frame.getLineNumber())
+                    .orElse("unknown");
+            LOGGER.warn("JA-RPC storage rejected category={} causeType={} origin={}",
+                    persistence.code(), root.getClass().getName(), origin);
             return mapPersistenceFailure(persistence.code());
         }
         if (failure instanceof ConfigurationError configuration) {
@@ -312,13 +324,26 @@ public final class RpcServer implements AutoCloseable {
             }
             return JaRpcException.of(JaErrorCatalog.QUEUE_FULL, "turn queue is full");
         }
-        if (failure instanceof IllegalArgumentException) return JaRpcException.invalidParams();
+        if (failure instanceof IllegalArgumentException) {
+            JaRpcException invalid = JaRpcException.invalidParams();
+            // 准入不变量也可能抛参数异常；仅记录编译期代码位置，既能定位真实故障，又不泄露请求正文。
+            String origin = java.util.Arrays.stream(failure.getStackTrace())
+                    .filter(frame -> frame.getClassName().startsWith("io.github.kongweiguang.ja."))
+                    .findFirst().map(frame -> frame.getClassName() + "#" + frame.getMethodName() + ":" + frame.getLineNumber())
+                    .orElse("unknown");
+            LOGGER.warn("JA-RPC validation rejected errorId={} origin={}", invalid.errorId(), origin);
+            return invalid;
+        }
         JaRpcException mapped = JaRpcException.of(JaErrorCatalog.INTERNAL_ERROR, "runtime request failed");
         // 只记录关联 ID 与异常类型，既能定位真实环境故障，也不让异常消息中的路径、SQL 或 Secret 落盘。
         Throwable cause = failure.getCause();
-        LOGGER.error("Unexpected JA-RPC failure errorId={} type={} causeType={}",
+        String origin = java.util.Arrays.stream(failure.getStackTrace())
+                .filter(frame -> frame.getClassName().startsWith("io.github.kongweiguang.ja."))
+                .findFirst().map(frame -> frame.getClassName() + "#" + frame.getMethodName() + ":" + frame.getLineNumber())
+                .orElse("unknown");
+        LOGGER.error("Unexpected JA-RPC failure errorId={} type={} causeType={} origin={}",
                 mapped.errorId(), failure.getClass().getName(),
-                cause == null ? "none" : cause.getClass().getName());
+                cause == null ? "none" : cause.getClass().getName(), origin);
         return mapped;
     }
 

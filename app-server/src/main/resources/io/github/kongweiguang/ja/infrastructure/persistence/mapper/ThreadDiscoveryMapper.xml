@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadDiscoveryMapper">
+  <select id="selectPage" resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadDiscoveryRow">
+    WITH RECURSIVE closing_side_chats(thread_id) AS (
+      SELECT thread_id FROM temporary_side_chats WHERE state='CLOSING'
+      UNION
+      SELECT l.child_thread_id
+      FROM thread_lineage l
+      JOIN closing_side_chats c ON c.thread_id=l.parent_thread_id
+    ), discovered AS (
+      SELECT t.thread_id AS threadId,t.title,'MAIN' AS kind,t.workspace_id AS workspaceId,
+        COALESCE((SELECT state FROM turns x WHERE x.thread_id=t.thread_id
+          ORDER BY x.turn_sequence DESC LIMIT 1),'IDLE') AS status,t.updated_at AS updatedAt
+      FROM threads t
+      WHERE t.deleted_at IS NULL AND t.archived_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=t.thread_id)
+      UNION ALL
+      SELECT t.thread_id AS threadId,t.title,
+        CASE l.task_kind WHEN 'SIDE_TASK' THEN 'SIDE_CHAT' ELSE 'SUBAGENT' END AS kind,
+        t.workspace_id AS workspaceId,COALESCE(p.state,'IDLE') AS status,
+        COALESCE(p.updated_at,t.updated_at) AS updatedAt
+      FROM threads t
+      JOIN thread_lineage l ON l.child_thread_id=t.thread_id
+      LEFT JOIN task_projections p ON p.task_thread_id=l.child_thread_id
+      WHERE t.deleted_at IS NULL AND t.archived_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM closing_side_chats c WHERE c.thread_id=l.child_thread_id
+        )
+    )
+    SELECT threadId,title,kind,workspaceId,status,updatedAt FROM discovered
+    <where>
+      <if test="workspaceId != null">workspaceId=#{workspaceId}</if>
+      <if test="normalizedQuery != null and normalizedQuery != ''">
+        AND instr(lower(title),#{normalizedQuery})&gt;0
+      </if>
+      <if test="cursorTime != null">
+        AND (updatedAt&lt;#{cursorTime} OR (updatedAt=#{cursorTime} AND threadId&lt;#{cursorId}))
+      </if>
+    </where>
+    ORDER BY updatedAt DESC,threadId DESC LIMIT #{limit}
+  </select>
+</mapper>

@@ -150,6 +150,10 @@ public final class RpcResults {
                 result.set("content", userContent(mapper, value.content()));
                 result.set("attachments", attachmentSummaries(mapper, value.attachments()));
             }
+            case ThreadSnapshot.ThreadMessageItem value -> {
+                result.put("kind", "thread_message").put("sourceThreadId", value.sourceThreadId())
+                        .put("sourceTitle", value.sourceTitle()).put("content", value.content());
+            }
             case ThreadSnapshot.TextItem value -> {
                 result.put("kind", value.kind().name().toLowerCase(Locale.ROOT));
                 result.put("text", value.text());
@@ -264,7 +268,8 @@ public final class RpcResults {
     /** Activity summary 直接转换不可变 JsonValue，且已由领域限制为安全低频投影。 */
     public static ObjectNode taskActivity(ObjectMapper mapper, TaskModels.Activity value) {
         ObjectNode result = mapper.createObjectNode().put("activitySequence", value.sequence())
-                .put("activityId", value.activityId()).put("taskThreadId", value.taskThreadId())
+                .put("activityId", value.activityId()).put("rootThreadId", value.rootThreadId())
+                .put("taskThreadId", value.taskThreadId())
                 .put("actorThreadId", value.actorThreadId())
                 .put("kind", value.kind().name().toLowerCase(Locale.ROOT))
                 .put("createdAt", value.createdAt().toString());
@@ -298,7 +303,8 @@ public final class RpcResults {
                 .put("parentRevision", value.parentRevision())
                 .put("inheritanceMode", value.inheritanceMode().name().toLowerCase(Locale.ROOT))
                 .put("fingerprint", value.fingerprint()).put("createdAt", value.createdAt().toString());
-        result.set("taskBrief", userContent(mapper, value.taskBrief()));
+        if (value.taskBrief() == null) result.putNull("taskBrief");
+        else result.set("taskBrief", userContent(mapper, value.taskBrief()));
         if (value.effectiveContext() == null) {
             result.putNull("inheritedContextSummary");
             result.putArray("inheritedContextPreview");

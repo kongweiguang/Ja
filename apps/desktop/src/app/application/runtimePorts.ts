@@ -23,7 +23,7 @@ export interface RuntimeStatus {
   status: RuntimeStatusKind;
   generation: number;
   serverInstanceId?: string | null;
-  features: readonly ("task_threads_v1" | "plan_goal_v1")[];
+  features: readonly ("task_threads_v1" | "plan_goal_v1" | "interaction_v1")[];
 }
 
 /** 恢复投影携带人工确认所需 CAS，不暴露 recovery 文件或原生诊断。 */
@@ -173,7 +173,7 @@ interface RuntimeMcpListResult {
     mcpId: string;
     name: string;
     transport: "stdio" | "streamable_http";
-    status: "healthy" | "degraded" | "unavailable" | "disabled";
+    status: "healthy" | "available" | "degraded" | "unavailable" | "disabled" | "configured";
     toolCount: number;
   }>;
   nextCursor: string | null;
@@ -181,7 +181,9 @@ interface RuntimeMcpListResult {
 
 interface RuntimeMcpTestResult {
   mcpId: string;
-  status: "healthy" | "degraded" | "unavailable";
+  name: string;
+  transport: "stdio" | "streamable_http";
+  status: "healthy" | "available" | "degraded" | "unavailable";
   toolCount: number;
 }
 

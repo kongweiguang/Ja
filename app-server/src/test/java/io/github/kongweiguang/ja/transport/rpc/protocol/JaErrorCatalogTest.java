@@ -61,7 +61,7 @@ final class JaErrorCatalogTest {
         assertEquals(false, JaErrorCatalog.PLAN_APPROVAL_STALE.retryable());
         assertEquals(false, JaErrorCatalog.GOAL_EVIDENCE_INCOMPLETE.retryable());
         assertEquals("conflict", JaErrorCatalog.GOAL_RECOVERY_REQUIRED.category().wireName());
-        assertEquals("timeout", JaErrorCatalog.GOAL_INPUT_EXPIRED.category().wireName());
+        assertEquals("conflict", JaErrorCatalog.INTERACTION_INVALID_STATE.category().wireName());
     }
 
     /** 兼容模块与工作区两种执行目录，但始终只读取仓库内冻结的错误合同。 */

@@ -3,7 +3,19 @@
 
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import {
+  CODE_FONT_SIZE_OPTIONS,
+  DEFAULT_CODE_FONT_SIZE,
+  DEFAULT_UI_FONT_SIZE,
+  UI_FONT_SIZE_OPTIONS,
+  type SendShortcut,
+} from "@/shared/settings/interfacePreferences";
 import { normalizeUiPalette, type ThemeMode, type UiPalette } from "@/shared/styles/theme";
+export {
+  DEFAULT_CODE_FONT_SIZE,
+  DEFAULT_UI_FONT_SIZE,
+} from "@/shared/settings/interfacePreferences";
+export type { SendShortcut } from "@/shared/settings/interfacePreferences";
 export { normalizeUiPalette } from "@/shared/styles/theme";
 export type { ThemeMode, UiPalette } from "@/shared/styles/theme";
 
@@ -58,6 +70,9 @@ export interface UiPreferences {
   sidebarWidth: number;
   sidebarRatio: number;
   workbenchSize: number;
+  sendShortcut: SendShortcut;
+  uiFontSize: number;
+  codeFontSize: number;
 }
 
 export interface UiPreferencesStore extends UiPreferences {
@@ -73,6 +88,9 @@ export interface UiPreferencesStore extends UiPreferences {
   setSidebarWidth: (sidebarWidth: number) => void;
   setSidebarRatio: (sidebarRatio: number) => void;
   setWorkbenchSize: (workbenchSize: number) => void;
+  setSendShortcut: (sendShortcut: SendShortcut) => void;
+  setUiFontSize: (uiFontSize: number) => void;
+  setCodeFontSize: (codeFontSize: number) => void;
 }
 
 export interface RightPanelSessionState {
@@ -94,7 +112,7 @@ export interface RightPanelSessionStore {
 
 const initialPreferences: UiPreferences = {
   themeMode: "system",
-  palette: "xcode",
+  palette: "ja",
   highContrast: false,
   reduceMotion: false,
   reducedTransparency: false,
@@ -105,6 +123,9 @@ const initialPreferences: UiPreferences = {
   sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
   sidebarRatio: SIDEBAR_RATIO_DEFAULT,
   workbenchSize: WORKBENCH_SIZE_DEFAULT,
+  sendShortcut: "enter",
+  uiFontSize: DEFAULT_UI_FONT_SIZE,
+  codeFontSize: DEFAULT_CODE_FONT_SIZE,
 };
 
 /**
@@ -113,6 +134,27 @@ const initialPreferences: UiPreferences = {
  */
 function normalizeThemeMode(value: unknown): ThemeMode {
   return value === "light" || value === "dark" || value === "system" ? value : "system";
+}
+
+/** 快捷键只接受设置页公开的两档，损坏或历史值回到默认 Enter 发送。 */
+export function normalizeSendShortcut(value: unknown): SendShortcut {
+  return value === "modifier-enter" ? "modifier-enter" : "enter";
+}
+
+/** 字号采用离散档位，避免任意持久值改变布局比例或造成不可读的 UI。 */
+export function normalizeUiFontSize(value: unknown, fallback = DEFAULT_UI_FONT_SIZE): number {
+  return typeof value === "number" &&
+    UI_FONT_SIZE_OPTIONS.includes(value as (typeof UI_FONT_SIZE_OPTIONS)[number])
+    ? value
+    : fallback;
+}
+
+/** 代码与终端字号共享有限档位，确保 CodeMirror 与 xterm 的网格仍可稳定拟合。 */
+export function normalizeCodeFontSize(value: unknown, fallback = DEFAULT_CODE_FONT_SIZE): number {
+  return typeof value === "number" &&
+    CODE_FONT_SIZE_OPTIONS.includes(value as (typeof CODE_FONT_SIZE_OPTIONS)[number])
+    ? value
+    : fallback;
 }
 
 /** 只接受当前可见 Tab；非法介质值回到 Files，绝不推断旧能力别名。 */
@@ -286,6 +328,9 @@ function normalizePersistedPreferences(
     sidebarWidth: clampSidebarWidth(stored.sidebarWidth ?? fallback.sidebarWidth),
     sidebarRatio: clampSidebarRatio(stored.sidebarRatio ?? fallback.sidebarRatio),
     workbenchSize: clampWorkbenchSize(stored.workbenchSize ?? fallback.workbenchSize),
+    sendShortcut: normalizeSendShortcut(stored.sendShortcut ?? fallback.sendShortcut),
+    uiFontSize: normalizeUiFontSize(stored.uiFontSize, fallback.uiFontSize),
+    codeFontSize: normalizeCodeFontSize(stored.codeFontSize, fallback.codeFontSize),
   };
 }
 
@@ -307,6 +352,9 @@ function projectUiPreferencesForStorage(state: UiPreferences): UiPreferences {
     sidebarWidth: state.sidebarWidth,
     sidebarRatio: state.sidebarRatio,
     workbenchSize: state.workbenchSize,
+    sendShortcut: normalizeSendShortcut(state.sendShortcut),
+    uiFontSize: normalizeUiFontSize(state.uiFontSize),
+    codeFontSize: normalizeCodeFontSize(state.codeFontSize),
   };
 }
 
@@ -330,6 +378,9 @@ export const useUiPreferencesStore = create<UiPreferencesStore>()(
       setSidebarRatio: (sidebarRatio) => set({ sidebarRatio: clampSidebarRatio(sidebarRatio) }),
       setWorkbenchSize: (workbenchSize) =>
         set({ workbenchSize: clampWorkbenchSize(workbenchSize) }),
+      setSendShortcut: (sendShortcut) => set({ sendShortcut: normalizeSendShortcut(sendShortcut) }),
+      setUiFontSize: (uiFontSize) => set({ uiFontSize: normalizeUiFontSize(uiFontSize) }),
+      setCodeFontSize: (codeFontSize) => set({ codeFontSize: normalizeCodeFontSize(codeFontSize) }),
     }),
     {
       name: "ja-ui-preferences-v1",
@@ -355,6 +406,9 @@ export const useUiPreferencesStore = create<UiPreferencesStore>()(
           sidebarWidth: stored.sidebarWidth ?? current.sidebarWidth,
           sidebarRatio: stored.sidebarRatio ?? current.sidebarRatio,
           workbenchSize: stored.workbenchSize ?? current.workbenchSize,
+          sendShortcut: stored.sendShortcut ?? current.sendShortcut,
+          uiFontSize: stored.uiFontSize ?? current.uiFontSize,
+          codeFontSize: stored.codeFontSize ?? current.codeFontSize,
         };
       },
     },

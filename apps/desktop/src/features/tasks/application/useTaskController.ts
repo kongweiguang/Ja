@@ -1,7 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import type {
   TaskApprovalPort,
   TaskPort,
@@ -10,8 +18,14 @@ import type {
   TaskTranscriptPort,
   TaskTranscriptSnapshot,
 } from "./ports";
+import type {
+  ConversationAcceptedTurn,
+  ConversationAccessMode,
+  ConversationCollaborationMode,
+  ConversationModelSelection,
+} from "@/features/conversation";
 import { subscribeTaskHostEvents } from "./taskEventBus";
-import type { TaskContentBlock, TaskReadModel, TaskSummary } from "../domain/taskModel";
+import type { TaskContentBlock, TaskReadModel, TaskState, TaskSummary } from "../domain/taskModel";
 
 const TASK_SEEN_SETTLE_MS = 75;
 const TASK_OBSERVE_MAX_ATTEMPTS = 3;
@@ -26,14 +40,35 @@ export interface TaskController {
   readonly detailError?: string;
   readonly transcriptError?: string;
   readonly progressSummary?: string;
+  readonly closingTaskThreadId?: string;
   readonly refresh: () => Promise<void>;
   readonly refreshDetail: () => Promise<void>;
+  /** 等待指定侧聊的当前详情、正文和 observe 都完成，避免创建后立即发送落入旧 Thread。 */
+  readonly waitForTaskReady: (taskThreadId: string) => Promise<void>;
   readonly createSideTask: (input: {
     taskName: string;
-    content: TaskContentBlock[];
+    /** 默认使用当前根 Thread；侧聊 Composer 必须显式绑定它所在的 child Thread。 */
+    sourceThreadId?: string;
+    /** 侧聊 Composer 可携带已读到的来源 revision，CAS 冲突时仍由 controller 重读。 */
+    sourceThreadRevision?: number;
+    preferences?: ConversationModelSelection & {
+      accessMode: ConversationAccessMode;
+      collaborationMode: ConversationCollaborationMode;
+    };
   }) => Promise<TaskSummary>;
   readonly rename: (task: TaskSummary, title: string) => Promise<TaskSummary>;
-  readonly followup: (task: TaskSummary, content: TaskContentBlock[]) => Promise<TaskSummary>;
+  readonly followup: (
+    task: TaskSummary,
+    content: TaskContentBlock[],
+    senderThreadId?: string,
+  ) => Promise<TaskSummary>;
+  /** 将 TaskCoordinator 的 follow-up ACK 适配为共享 Conversation interaction 的 Turn ACK。 */
+  readonly followupTurn: (
+    task: TaskSummary,
+    content: TaskContentBlock[],
+    senderThreadId?: string,
+  ) => Promise<ConversationAcceptedTurn>;
+  readonly close: (task: TaskSummary) => Promise<void>;
   readonly cancel: (task: TaskSummary) => Promise<TaskSummary>;
   readonly resume: (task: TaskSummary) => Promise<void>;
   readonly approvalRespond: (
@@ -57,6 +92,11 @@ interface TaskControllerOptions {
   readonly onSubagentDiscovered?: () => void;
 }
 
+interface TaskReadyWaiter {
+  readonly resolve: () => void;
+  readonly reject: (reason?: unknown) => void;
+}
+
 /** 安全错误文案不读取 native message/stack，避免绝对路径或 Provider 诊断进入 UI。 */
 function taskErrorMessage(
   operation:
@@ -66,6 +106,7 @@ function taskErrorMessage(
     | "create"
     | "rename"
     | "followup"
+    | "close"
     | "cancel"
     | "resume"
     | "approval",
@@ -78,11 +119,13 @@ function taskErrorMessage(
     case "transcript":
       return "任务对话记录暂时无法读取，请重试。";
     case "create":
-      return "侧边任务创建失败，请保留草稿后重试。";
+      return "侧聊创建失败，请重试。";
     case "rename":
-      return "侧边任务重命名失败，请重试。";
+      return "侧聊重命名失败，请重试。";
     case "followup":
       return "消息未发送，请重试。";
+    case "close":
+      return "侧聊关闭失败，请重试。";
     case "cancel":
       return "取消请求未完成，请重试。";
     case "resume":
@@ -102,14 +145,83 @@ function isTaskRevisionConflict(error: unknown): boolean {
   );
 }
 
+/** 同一 revision 下终态优先，避免详情与摘要分别接纳旧 running 投影。 */
+function preferTaskSummary(existing: TaskSummary, incoming: TaskSummary): TaskSummary {
+  if (
+    existing.revision > incoming.revision ||
+    (existing.revision === incoming.revision &&
+      isTerminalTaskState(existing.state) &&
+      !isTerminalTaskState(incoming.state))
+  )
+    return existing;
+  return incoming;
+}
+
 /** ACK 与事件都按 revision 单调合并，晚响应不能覆盖更新后的服务端投影。 */
 function mergeTask(current: readonly TaskSummary[], incoming: TaskSummary): TaskSummary[] {
   const index = current.findIndex((task) => task.taskThreadId === incoming.taskThreadId);
   if (index < 0) return [...current, incoming];
-  if ((current[index]?.revision ?? 0) > incoming.revision) return [...current];
+  const existing = current[index];
+  if (existing === undefined) return [...current];
+  if (preferTaskSummary(existing, incoming) === existing) return [...current];
   const next = [...current];
   next[index] = incoming;
   return next;
+}
+
+/** 同一 revision 下终态优先，防止 observe 前后迟到的 running 摘要覆盖已确认结果。 */
+function isTerminalTaskState(state: TaskState): boolean {
+  return state === "completed" || state === "failed" || state === "cancelled";
+}
+
+/**
+ * 侧聊关闭是生命周期边界，已知后代必须一起从本地摘要投影中抑制；仅删除侧聊自身会让
+ * 迟到的子任务事件重新出现在原主会话里。集合同时包含根，便于统一处理后续事件与 read。
+ */
+function collectTaskTreeIds(tasks: readonly TaskSummary[], rootTaskThreadId: string): Set<string> {
+  const childrenByParent = new Map<string, string[]>();
+  for (const task of tasks) {
+    const children = childrenByParent.get(task.parentThreadId) ?? [];
+    children.push(task.taskThreadId);
+    childrenByParent.set(task.parentThreadId, children);
+  }
+  const result = new Set<string>([rootTaskThreadId]);
+  const queue = [rootTaskThreadId];
+  while (queue.length > 0) {
+    const parentThreadId = queue.shift();
+    if (parentThreadId === undefined) break;
+    for (const childThreadId of childrenByParent.get(parentThreadId) ?? []) {
+      if (result.has(childThreadId)) continue;
+      result.add(childThreadId);
+      queue.push(childThreadId);
+    }
+  }
+  return result;
+}
+
+/**
+ * 事件可能晚于关闭抵达，且新事件未必已进入摘要列表；沿已知 parentThreadId 链并结合事件
+ * 自带的父身份判断其是否属于已销毁侧聊子树，避免只按 taskThreadId 做浅层过滤。
+ */
+function belongsToClosedTaskTree(
+  tasks: readonly TaskSummary[],
+  taskThreadId: string,
+  closedTaskIds: ReadonlySet<string>,
+  eventParentThreadId?: string,
+): boolean {
+  let currentThreadId = taskThreadId;
+  let parentThreadId = eventParentThreadId;
+  const visited = new Set<string>();
+  while (!visited.has(currentThreadId)) {
+    visited.add(currentThreadId);
+    if (closedTaskIds.has(currentThreadId)) return true;
+    const known = tasks.find((task) => task.taskThreadId === currentThreadId);
+    const nextParentThreadId = known?.parentThreadId ?? parentThreadId;
+    if (nextParentThreadId === undefined || nextParentThreadId === currentThreadId) return false;
+    currentThreadId = nextParentThreadId;
+    parentThreadId = undefined;
+  }
+  return false;
 }
 
 /** 幂等键只承担当前显式动作去重，不保存正文或用户身份。 */
@@ -140,12 +252,53 @@ function taskContentIdentity(content: readonly TaskContentBlock[]): string {
 }
 
 /**
+ * Transcript 是按 Thread revision 单调收敛的投影；激活读取、事件重读和 follow-up ACK
+ * 可能交错完成，迟到的旧快照不能把已显示的终态正文退回运行中。相同 revision 仍接受
+ * 新快照，因为服务端可能在不改变 Task revision 的情况下补齐正文页内字段。
+ */
+function mergeTranscriptSnapshots(
+  current: TaskTranscriptSnapshot | undefined,
+  incoming: TaskTranscriptSnapshot,
+): TaskTranscriptSnapshot {
+  if (current?.threadId !== incoming.threadId) return incoming;
+  if (current.revision > incoming.revision) return current;
+  if (
+    current.revision === incoming.revision &&
+    isTerminalTranscript(current) &&
+    !isTerminalTranscript(incoming)
+  )
+    return current;
+  return incoming;
+}
+
+/** 将正文写入 React projection 前先更新同步 authority，避免同一事件循环内发生回滚。 */
+function acceptTranscriptSnapshot(
+  setTranscript: Dispatch<SetStateAction<TaskTranscriptSnapshot | undefined>>,
+  current: TaskTranscriptSnapshot | undefined,
+  incoming: TaskTranscriptSnapshot,
+): TaskTranscriptSnapshot {
+  const authoritative = mergeTranscriptSnapshots(current, incoming);
+  setTranscript((rendered) => mergeTranscriptSnapshots(rendered, authoritative));
+  return authoritative;
+}
+
+/** 只比较当前快照最后一个 Turn；同 revision 的旧 running 快照不能抹掉终态正文。 */
+function isTerminalTranscript(snapshot: TaskTranscriptSnapshot): boolean {
+  const latestTurn = snapshot.turns.at(-1);
+  return (
+    latestTurn !== undefined &&
+    (latestTurn.status === "completed" ||
+      latestTurn.status === "failed" ||
+      latestTurn.status === "cancelled")
+  );
+}
+
+/**
  * Controller 常驻消费低频摘要事件，但只有详情可见时才读取 task/read、thread/read 并建立
  * observe；隐藏 Workbench 或切换 Tab 会立即释放观察句柄，不缓存其它 Child Transcript。
  */
 export function useTaskController({
   rootThreadId,
-  parentRevision,
   activeTaskThreadId,
   visible,
   port,
@@ -164,8 +317,13 @@ export function useTaskController({
   const [detailError, setDetailError] = useState<string>();
   const [transcriptError, setTranscriptError] = useState<string>();
   const [progressSummary, setProgressSummary] = useState<string>();
+  const [closingTaskThreadId, setClosingTaskThreadId] = useState<string>();
   const detailEpochRef = useRef(0);
   const observationRef = useRef<string | undefined>(undefined);
+  const transcriptRef = useRef<TaskTranscriptSnapshot | undefined>(undefined);
+  const pendingTranscriptByTaskRef = useRef<Map<string, TaskTranscriptSnapshot>>(new Map());
+  const readyTaskRef = useRef<{ taskThreadId: string; epoch: number } | undefined>(undefined);
+  const taskReadyWaitersRef = useRef<Map<string, Set<TaskReadyWaiter>>>(new Map());
   const tasksRef = useRef<readonly TaskSummary[]>(tasks);
   const taskEpochRef = useRef(0);
   const seenTargetByTaskRef = useRef<Map<string, number>>(new Map());
@@ -178,10 +336,61 @@ export function useTaskController({
   const followupRetryRef = useRef<
     Map<string, { readonly contentIdentity: string; readonly idempotencyKey: string }>
   >(new Map());
+  const closedTaskIdsRef = useRef<Set<string>>(new Set());
+  const closingTaskThreadRef = useRef<string | undefined>(undefined);
   visibleRef.current = visible;
   activeTaskRef.current = activeTaskThreadId;
   rootThreadRef.current = rootThreadId;
   onSubagentDiscoveredRef.current = onSubagentDiscovered;
+
+  /** 创建侧聊后的 follow-up 只等待对应实例，不把任意其它 Child 的 ready 当作完成信号。 */
+  const waitForTaskReady = useCallback((taskThreadId: string): Promise<void> => {
+    if (
+      readyTaskRef.current?.taskThreadId === taskThreadId &&
+      readyTaskRef.current.epoch === detailEpochRef.current &&
+      activeTaskRef.current === taskThreadId &&
+      visibleRef.current &&
+      !closedTaskIdsRef.current.has(taskThreadId)
+    )
+      return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const waiters = taskReadyWaitersRef.current.get(taskThreadId) ?? new Set<TaskReadyWaiter>();
+      waiters.add({ resolve, reject });
+      taskReadyWaitersRef.current.set(taskThreadId, waiters);
+    });
+  }, []);
+
+  /** 只兑现相同 active epoch 的 waiter；切换 Tab 后旧 setup 无权让新侧聊提前发送。 */
+  const resolveTaskReady = useCallback((taskThreadId: string, epoch: number): void => {
+    if (epoch !== detailEpochRef.current || activeTaskRef.current !== taskThreadId) return;
+    readyTaskRef.current = { taskThreadId, epoch };
+    const waiters = taskReadyWaitersRef.current.get(taskThreadId);
+    if (waiters === undefined) return;
+    taskReadyWaitersRef.current.delete(taskThreadId);
+    for (const waiter of waiters) waiter.resolve();
+  }, []);
+
+  /** 失败或生命周期切换时结束 waiter，避免创建流程永远等待一个已失效的 Tab。 */
+  const rejectTaskReady = useCallback((taskThreadId: string, reason: unknown): void => {
+    const waiters = taskReadyWaitersRef.current.get(taskThreadId);
+    if (waiters === undefined) return;
+    taskReadyWaitersRef.current.delete(taskThreadId);
+    for (const waiter of waiters) waiter.reject(reason);
+  }, []);
+
+  /** 只允许当前 active Thread 更新正文 authority；follow-up 的非 active 快照另存待激活缓存。 */
+  const acceptVisibleTranscript = useCallback(
+    (incoming: TaskTranscriptSnapshot): TaskTranscriptSnapshot => {
+      const authoritative = acceptTranscriptSnapshot(
+        setTranscript,
+        transcriptRef.current,
+        incoming,
+      );
+      transcriptRef.current = authoritative;
+      return authoritative;
+    },
+    [],
+  );
 
   /**
    * 所有 read、event 与 mutation ACK 先进入同步 revision authority，再投影 React state；这样
@@ -191,8 +400,16 @@ export function useTaskController({
     const current = tasksRef.current.find(
       (taskSummary) => taskSummary.taskThreadId === incoming.taskThreadId,
     );
-    const authoritative =
-      current !== undefined && current.revision > incoming.revision ? current : incoming;
+    if (
+      belongsToClosedTaskTree(
+        tasksRef.current,
+        incoming.taskThreadId,
+        closedTaskIdsRef.current,
+        incoming.parentThreadId,
+      )
+    )
+      return current ?? incoming;
+    const authoritative = current === undefined ? incoming : preferTaskSummary(current, incoming);
     const nextTasks = mergeTask(tasksRef.current, authoritative);
     tasksRef.current = nextTasks;
     setTasks(nextTasks);
@@ -206,18 +423,21 @@ export function useTaskController({
   }, []);
 
   /**
-   * 详情正文只接受不早于当前详情的 task/read；摘要仍替换为全局 authority，避免迟到 read
-   * 抹掉 seen/terminal 已提交的 revision，同时保留最后一份完整 activities/mailbox。
+   * Task 与 Thread 使用独立 revision：已读事件可以先推进 Task，不能因此丢弃新模型/权限。
+   * 正文、摘要和 Thread metadata 分别单调合并，迟到响应不能回滚任一权威状态。
    */
   const acceptTaskDetail = useCallback(
     (incoming: TaskReadModel): TaskSummary => {
       const authoritative = acceptTaskSummary(incoming.task);
-      setDetail((current) =>
-        current?.task.taskThreadId === incoming.task.taskThreadId &&
-        current.task.revision > incoming.task.revision
-          ? current
-          : { ...incoming, task: authoritative },
-      );
+      setDetail((current) => {
+        if (current?.task.taskThreadId !== incoming.task.taskThreadId)
+          return { ...incoming, task: authoritative };
+        const content =
+          preferTaskSummary(current.task, incoming.task) === current.task ? current : incoming;
+        const thread =
+          current.thread.revision > incoming.thread.revision ? current.thread : incoming.thread;
+        return { ...content, task: authoritative, thread };
+      });
       return authoritative;
     },
     [acceptTaskSummary],
@@ -233,6 +453,7 @@ export function useTaskController({
         tasksRef.current.find(
           (taskSummary) => taskSummary.taskThreadId === candidate.taskThreadId,
         ) ?? candidate;
+      if (closedTaskIdsRef.current.has(authoritative.taskThreadId)) return;
       const taskThreadId = authoritative.taskThreadId;
       const priorTimer = seenTimerByTaskRef.current.get(taskThreadId);
       if (priorTimer !== undefined) clearTimeout(priorTimer);
@@ -256,6 +477,7 @@ export function useTaskController({
           .catch(() => undefined)
           .then(async () => {
             if (epoch !== taskEpochRef.current) return;
+            if (closedTaskIdsRef.current.has(taskThreadId)) return;
             const throughActivitySequence = seenTargetByTaskRef.current.get(taskThreadId);
             const latest = tasksRef.current.find(
               (taskSummary) => taskSummary.taskThreadId === taskThreadId,
@@ -313,6 +535,15 @@ export function useTaskController({
     seenTimers.clear();
     seenTargets.clear();
     seenChainByTaskRef.current.clear();
+    closedTaskIdsRef.current.clear();
+    closingTaskThreadRef.current = undefined;
+    readyTaskRef.current = undefined;
+    transcriptRef.current = undefined;
+    pendingTranscriptByTaskRef.current.clear();
+    for (const waiters of taskReadyWaitersRef.current.values())
+      for (const waiter of waiters) waiter.reject(new Error("task root was changed"));
+    taskReadyWaitersRef.current.clear();
+    setClosingTaskThreadId(undefined);
     const retainedTasks = tasksRef.current.filter((task) => task.rootThreadId === rootThreadId);
     tasksRef.current = retainedTasks;
     setTasks(retainedTasks);
@@ -373,11 +604,15 @@ export function useTaskController({
         setDetailError(taskErrorMessage("detail"));
       }
       if (transcriptResult.status === "fulfilled") {
-        setTranscript(transcriptResult.value);
-        setTranscriptError(undefined);
+        if (transcriptResult.value.threadId !== taskThreadId) {
+          setTranscriptError(taskErrorMessage("transcript"));
+        } else {
+          acceptVisibleTranscript(transcriptResult.value);
+          setTranscriptError(undefined);
+        }
       } else setTranscriptError(taskErrorMessage("transcript"));
     },
-    [acceptTaskDetail, port, scheduleTaskSeen, transcriptPort],
+    [acceptTaskDetail, acceptVisibleTranscript, port, scheduleTaskSeen, transcriptPort],
   );
 
   /** 显式重试只针对当前可见实例，并以当前 epoch 拒绝切换后迟到结果。 */
@@ -400,6 +635,8 @@ export function useTaskController({
     const epoch = detailEpochRef.current + 1;
     detailEpochRef.current = epoch;
     observationRef.current = undefined;
+    readyTaskRef.current = undefined;
+    transcriptRef.current = undefined;
     setDetail(undefined);
     setTranscript(undefined);
     setProgressSummary(undefined);
@@ -413,6 +650,7 @@ export function useTaskController({
     let observationId: string | undefined;
     setDetailLoading(true);
     const setup = async (): Promise<void> => {
+      let initialTranscriptReady = false;
       try {
         const [detailResult, transcriptResult] = await Promise.allSettled([
           port.read({ taskThreadId: activeTaskThreadId, limit: 200 }),
@@ -420,11 +658,23 @@ export function useTaskController({
         ]);
         if (!active || epoch !== detailEpochRef.current) return;
         if (transcriptResult.status === "fulfilled") {
-          setTranscript(transcriptResult.value);
-          setTranscriptError(undefined);
+          if (transcriptResult.value.threadId !== activeTaskThreadId) {
+            setTranscriptError(taskErrorMessage("transcript"));
+          } else {
+            const pending = pendingTranscriptByTaskRef.current.get(activeTaskThreadId);
+            pendingTranscriptByTaskRef.current.delete(activeTaskThreadId);
+            acceptVisibleTranscript(
+              pending === undefined
+                ? transcriptResult.value
+                : mergeTranscriptSnapshots(pending, transcriptResult.value),
+            );
+            initialTranscriptReady = true;
+            setTranscriptError(undefined);
+          }
         } else setTranscriptError(taskErrorMessage("transcript"));
         if (detailResult.status === "rejected") {
           setDetailError(taskErrorMessage("detail"));
+          rejectTaskReady(activeTaskThreadId, new Error(taskErrorMessage("detail")));
           return;
         }
         let authoritative = acceptTaskDetail(detailResult.value);
@@ -449,6 +699,11 @@ export function useTaskController({
                 (taskSummary) => taskSummary.taskThreadId === activeTaskThreadId,
               ) ?? authoritative;
             scheduleTaskSeen(latest);
+            // 初始 read 与 observe ACK 之间可能错过一次快速终态事件；ACK 后权威重读补齐
+            // 该窗口，且由单调 Transcript 投影拒绝迟到的旧 running 快照。
+            await refreshDetailFor(activeTaskThreadId, epoch);
+            if (initialTranscriptReady) resolveTaskReady(activeTaskThreadId, epoch);
+            else rejectTaskReady(activeTaskThreadId, new Error(taskErrorMessage("transcript")));
             return;
           } catch (error) {
             if (!active || epoch !== detailEpochRef.current) return;
@@ -460,7 +715,10 @@ export function useTaskController({
           }
         }
       } catch {
-        if (active && epoch === detailEpochRef.current) setDetailError(taskErrorMessage("detail"));
+        if (active && epoch === detailEpochRef.current) {
+          setDetailError(taskErrorMessage("detail"));
+          rejectTaskReady(activeTaskThreadId, new Error(taskErrorMessage("detail")));
+        }
       } finally {
         if (active && epoch === detailEpochRef.current) setDetailLoading(false);
       }
@@ -469,17 +727,40 @@ export function useTaskController({
     return () => {
       active = false;
       detailEpochRef.current += 1;
+      rejectTaskReady(activeTaskThreadId, new Error("task activation was superseded"));
       if (observationRef.current === observationId) observationRef.current = undefined;
       if (observationId !== undefined)
         void port.unobserve({ observationId }).catch(() => undefined);
     };
-  }, [activeTaskThreadId, acceptTaskDetail, port, scheduleTaskSeen, transcriptPort, visible]);
+  }, [
+    activeTaskThreadId,
+    acceptTaskDetail,
+    acceptVisibleTranscript,
+    port,
+    rejectTaskReady,
+    refreshDetailFor,
+    resolveTaskReady,
+    scheduleTaskSeen,
+    transcriptPort,
+    visible,
+  ]);
 
   /** Runtime 已完成严格 Schema 校验；这里仅按 root/observation identity 更新局部投影。 */
   useEffect(
     () =>
       subscribeTaskHostEvents((event) => {
         if (rootThreadId === undefined || event.params.rootThreadId !== rootThreadId) return;
+        const eventParentThreadId =
+          event.method === "task/activity" ? event.params.task.parentThreadId : undefined;
+        if (
+          belongsToClosedTaskTree(
+            tasksRef.current,
+            event.params.taskThreadId,
+            closedTaskIdsRef.current,
+            eventParentThreadId,
+          )
+        )
+          return;
         if (event.method === "task/activity") {
           const wasKnown = tasksRef.current.some(
             (task) => task.taskThreadId === event.params.task.taskThreadId,
@@ -514,25 +795,83 @@ export function useTaskController({
     [acceptTaskSummary, refreshDetailFor, rootThreadId, scheduleTaskSeen],
   );
 
-  /** 首次发送才调用 create；失败保持调用方草稿，成功后返回服务端稳定实例。 */
+  /**
+   * 创建空闲 child thread 并冻结首轮偏好；CAS 必须取点击时根 Thread 的权威 revision，
+   * 不能复用可能在主任务更新后过期的父级摘要。重读只在明确的 CAS 冲突后发生一次，
+   * 其它错误不重试，避免 ACK 不确定时意外创建重复 child。
+   */
   const createSideTask = useCallback(
-    async (input: { taskName: string; content: TaskContentBlock[] }): Promise<TaskSummary> => {
-      if (rootThreadId === undefined || parentRevision === undefined)
-        throw new Error(taskErrorMessage("create"));
-      try {
-        const result = await port.create({
-          parentThreadId: rootThreadId,
-          parentTurnId: null,
-          expectedParentRevision: parentRevision,
-          taskName: input.taskName,
-          content: input.content,
+    async (input: {
+      taskName: string;
+      sourceThreadId?: string;
+      sourceThreadRevision?: number;
+      preferences?: ConversationModelSelection & {
+        accessMode: ConversationAccessMode;
+        collaborationMode: ConversationCollaborationMode;
+      };
+    }): Promise<TaskSummary> => {
+      if (rootThreadId === undefined) throw new Error(taskErrorMessage("create"));
+      const epoch = taskEpochRef.current;
+      const expectedRootThreadId = rootThreadId;
+      const expectedSourceThreadId = input.sourceThreadId ?? expectedRootThreadId;
+      const suppliedSourceRevision = input.sourceThreadRevision;
+
+      /** 来源必须属于当前根树；具体 parent 关系仍由 App Server 在 create CAS 中裁决。 */
+      const sourceIsOwned = (): boolean =>
+        expectedSourceThreadId === expectedRootThreadId ||
+        tasksRef.current.some(
+          (task) =>
+            task.taskThreadId === expectedSourceThreadId &&
+            task.rootThreadId === expectedRootThreadId &&
+            !closedTaskIdsRef.current.has(task.taskThreadId),
+        );
+
+      /** 来源快照只承担创建 CAS，不投影到当前 child transcript。 */
+      const readSourceSnapshot = async (): Promise<TaskTranscriptSnapshot> => {
+        if (!sourceIsOwned()) throw new Error("side task source thread is unavailable");
+        const snapshot = await transcriptPort.read({
+          threadId: expectedSourceThreadId,
+          limit: 1,
         });
+        if (
+          epoch !== taskEpochRef.current ||
+          rootThreadRef.current !== expectedRootThreadId ||
+          snapshot.threadId !== expectedSourceThreadId
+        )
+          throw new Error("side task source thread identity mismatch");
+        return snapshot;
+      };
+
+      try {
+        if (!sourceIsOwned()) throw new Error("side task source thread is unavailable");
+        let expectedParentRevision =
+          suppliedSourceRevision ?? (await readSourceSnapshot()).revision;
+        let result;
+        try {
+          result = await port.create({
+            parentThreadId: expectedSourceThreadId,
+            parentTurnId: null,
+            expectedParentRevision: expectedParentRevision,
+            taskName: input.taskName,
+            preferences: input.preferences,
+          });
+        } catch (error) {
+          if (!isTaskRevisionConflict(error)) throw error;
+          expectedParentRevision = (await readSourceSnapshot()).revision;
+          result = await port.create({
+            parentThreadId: expectedSourceThreadId,
+            parentTurnId: null,
+            expectedParentRevision,
+            taskName: input.taskName,
+            preferences: input.preferences,
+          });
+        }
         return acceptTaskSummary(result.task);
       } catch {
         throw new Error(taskErrorMessage("create"));
       }
     },
-    [acceptTaskSummary, parentRevision, port, rootThreadId],
+    [acceptTaskSummary, port, rootThreadId, transcriptPort],
   );
 
   /**
@@ -547,6 +886,7 @@ export function useTaskController({
       const epoch = taskEpochRef.current;
       const expectedRootThreadId = rootThreadId;
       try {
+        // ACK 后必须读取完整首屏快照；limit=1 会留下 nextCursor，无法准入共享 reducer。
         const snapshot = await transcriptPort.read({ threadId: task.taskThreadId, limit: 1 });
         if (
           epoch !== taskEpochRef.current ||
@@ -587,12 +927,38 @@ export function useTaskController({
   );
 
   /**
-   * 已存在侧边任务发送使用 follow-up；同 Task 的相同失败内容保留幂等键以覆盖 ACK 丢失，
-   * 成功后或内容变化后释放旧身份，使用户下一次明确发送仍可创建新 Turn。
+   * followup 与 followupTurn 共用一次 TaskCoordinator 调用和一次 child thread/read；只有 ACK
+   * 与 Thread revision 都确认后才释放幂等键，避免 ACK 后 read 失败时重试制造第二个 Turn。
    */
-  const followup = useCallback(
-    async (task: TaskSummary, content: TaskContentBlock[]): Promise<TaskSummary> => {
+  const executeFollowup = useCallback(
+    async (
+      task: TaskSummary,
+      content: TaskContentBlock[],
+      senderThreadId?: string,
+    ): Promise<{
+      readonly task: TaskSummary;
+      readonly turnId: string;
+      readonly threadRevision: number;
+    }> => {
       if (rootThreadId === undefined) throw new Error(taskErrorMessage("followup"));
+      const expectedSenderThreadId = senderThreadId ?? rootThreadId;
+      if (
+        expectedSenderThreadId !== rootThreadId &&
+        !tasksRef.current.some(
+          (candidate) =>
+            candidate.taskThreadId === expectedSenderThreadId &&
+            candidate.rootThreadId === rootThreadId &&
+            !closedTaskIdsRef.current.has(candidate.taskThreadId),
+        )
+      )
+        throw new Error(taskErrorMessage("followup"));
+      if (
+        closingTaskThreadRef.current === task.taskThreadId ||
+        closingTaskThreadId === task.taskThreadId ||
+        closedTaskIdsRef.current.has(task.taskThreadId)
+      )
+        throw new Error(taskErrorMessage("followup"));
+      const epoch = taskEpochRef.current;
       const authoritative = taskForMutation(task);
       const contentIdentity = taskContentIdentity(content);
       const retained = followupRetryRef.current.get(task.taskThreadId);
@@ -605,7 +971,7 @@ export function useTaskController({
         let result;
         try {
           result = await port.followup({
-            senderThreadId: rootThreadId,
+            senderThreadId: expectedSenderThreadId,
             targetThreadId: task.taskThreadId,
             content,
             idempotencyKey,
@@ -617,21 +983,127 @@ export function useTaskController({
           );
           if (refreshed.revision <= authoritative.revision) throw firstError;
           result = await port.followup({
-            senderThreadId: rootThreadId,
+            senderThreadId: expectedSenderThreadId,
             targetThreadId: task.taskThreadId,
             content,
             idempotencyKey,
             expectedTaskRevision: refreshed.revision,
           });
         }
+        // ACK 后必须读取完整首屏快照；limit=1 会留下 nextCursor，无法准入共享 reducer。
+        const snapshot = await transcriptPort.read({ threadId: task.taskThreadId });
+        if (snapshot.threadId !== task.taskThreadId)
+          throw new Error("task transcript identity mismatch");
+        if (epoch === taskEpochRef.current && !closedTaskIdsRef.current.has(task.taskThreadId)) {
+          if (activeTaskRef.current === snapshot.threadId) acceptVisibleTranscript(snapshot);
+          else {
+            const pending = pendingTranscriptByTaskRef.current.get(snapshot.threadId);
+            pendingTranscriptByTaskRef.current.set(
+              snapshot.threadId,
+              mergeTranscriptSnapshots(pending, snapshot),
+            );
+          }
+        }
+        const acceptedTask = acceptTaskSummary(result.task);
         if (followupRetryRef.current.get(task.taskThreadId)?.idempotencyKey === idempotencyKey)
           followupRetryRef.current.delete(task.taskThreadId);
-        return acceptTaskSummary(result.task);
+        return { task: acceptedTask, turnId: result.turnId, threadRevision: snapshot.revision };
       } catch {
         throw new Error(taskErrorMessage("followup"));
       }
     },
-    [acceptTaskSummary, port, rootThreadId, taskForMutation],
+    [
+      acceptTaskSummary,
+      acceptVisibleTranscript,
+      closingTaskThreadId,
+      port,
+      rootThreadId,
+      taskForMutation,
+      transcriptPort,
+    ],
+  );
+
+  const followup = useCallback(
+    async (
+      task: TaskSummary,
+      content: TaskContentBlock[],
+      senderThreadId?: string,
+    ): Promise<TaskSummary> => (await executeFollowup(task, content, senderThreadId)).task,
+    [executeFollowup],
+  );
+
+  /** TaskCoordinator ACK 适配为共享 interaction 的 Turn identity，禁止直接走 turn/start。 */
+  const followupTurn = useCallback(
+    async (
+      task: TaskSummary,
+      content: TaskContentBlock[],
+      senderThreadId?: string,
+    ): Promise<ConversationAcceptedTurn> => {
+      const accepted = await executeFollowup(task, content, senderThreadId);
+      return {
+        accepted: true,
+        turnId: accepted.turnId,
+        queued: !["completed", "failed", "cancelled"].includes(accepted.task.state),
+        threadRevision: accepted.threadRevision,
+      };
+    },
+    [executeFollowup],
+  );
+
+  /**
+   * 关闭只允许独立侧聊使用，并以服务端 ACK 作为唯一清理闸门；本地 projection 在 ACK 后移除，
+   * 同时使迟到的 read、seen、follow-up 和事件失效，避免失败重试或竞态重新显示已销毁会话。
+   */
+  const close = useCallback(
+    async (task: TaskSummary): Promise<void> => {
+      if (task.taskKind !== "side_task") throw new Error(taskErrorMessage("close"));
+      if (closingTaskThreadRef.current !== undefined || closingTaskThreadId !== undefined)
+        throw new Error(taskErrorMessage("close"));
+      if (closedTaskIdsRef.current.has(task.taskThreadId)) return;
+      closingTaskThreadRef.current = task.taskThreadId;
+      setClosingTaskThreadId(task.taskThreadId);
+      try {
+        const result = await port.close({ taskThreadId: task.taskThreadId });
+        if (result.closed !== true) throw new Error("side task close was not acknowledged");
+        const closedTaskIds = collectTaskTreeIds(tasksRef.current, task.taskThreadId);
+        for (const taskThreadId of closedTaskIds) closedTaskIdsRef.current.add(taskThreadId);
+        const isActiveTask =
+          activeTaskRef.current !== undefined && closedTaskIds.has(activeTaskRef.current);
+        if (isActiveTask) detailEpochRef.current += 1;
+        const timer = seenTimerByTaskRef.current.get(task.taskThreadId);
+        if (timer !== undefined) clearTimeout(timer);
+        seenTimerByTaskRef.current.delete(task.taskThreadId);
+        seenTargetByTaskRef.current.delete(task.taskThreadId);
+        seenChainByTaskRef.current.delete(task.taskThreadId);
+        followupRetryRef.current.delete(task.taskThreadId);
+        pendingTranscriptByTaskRef.current.delete(task.taskThreadId);
+        if (readyTaskRef.current?.taskThreadId === task.taskThreadId) {
+          readyTaskRef.current = undefined;
+          transcriptRef.current = undefined;
+        }
+        rejectTaskReady(task.taskThreadId, new Error("side task was closed"));
+        tasksRef.current = tasksRef.current.filter(
+          (candidate) => !closedTaskIds.has(candidate.taskThreadId),
+        );
+        setTasks([...tasksRef.current]);
+        if (isActiveTask) {
+          observationRef.current = undefined;
+          setDetail(undefined);
+          setTranscript(undefined);
+          setDetailLoading(false);
+          setDetailError(undefined);
+          setTranscriptError(undefined);
+          setProgressSummary(undefined);
+        }
+      } catch {
+        throw new Error(taskErrorMessage("close"));
+      } finally {
+        if (closingTaskThreadRef.current === task.taskThreadId)
+          closingTaskThreadRef.current = undefined;
+        setClosingTaskThreadId((current) => (current === task.taskThreadId ? undefined : current));
+      }
+    },
+    [closingTaskThreadId, port, rejectTaskReady],
   );
 
   /** 取消只发生在显式按钮，Subagent 的递归传播范围由服务端 attached 规则决定。 */
@@ -707,11 +1179,15 @@ export function useTaskController({
       detailError,
       transcriptError,
       progressSummary,
+      closingTaskThreadId,
       refresh,
       refreshDetail,
+      waitForTaskReady,
       createSideTask,
       rename,
       followup,
+      followupTurn,
+      close,
       cancel,
       resume,
       approvalRespond,
@@ -719,18 +1195,22 @@ export function useTaskController({
     [
       approvalRespond,
       cancel,
+      close,
+      closingTaskThreadId,
       createSideTask,
       detail,
       detailError,
       detailLoading,
       error,
       followup,
+      followupTurn,
       loading,
       progressSummary,
       refresh,
       refreshDetail,
       rename,
       resume,
+      waitForTaskReady,
       tasks,
       transcript,
       transcriptError,

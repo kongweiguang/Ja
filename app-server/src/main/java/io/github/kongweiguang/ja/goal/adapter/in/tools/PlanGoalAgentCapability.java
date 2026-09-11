@@ -52,10 +52,10 @@ public final class PlanGoalAgentCapability implements AgentCapability {
         this.toolSpecs = List.of(
                 tool("plan_propose", "Freeze a structured revision for an existing standalone Plan.",
                         schema("planId,expectedPlanRevision,definition,idempotencyKey")),
+                tool("plan_draft_update", "Save a structured Plan draft with optimistic revision checks.",
+                        draftUpdateSchema()),
                 tool("plan_step_update", "Update one stable step execution with optimistic state checks.",
                         stepUpdateSchema()),
-                tool("goal_request_input", "Pause continuation until the user supplies required input.",
-                        schema("goalId,expectedGoalRevision,runId,prompt,expiresAt,idempotencyKey")),
                 tool("goal_request_evaluation", "Persist an independent no-tool evaluation request.",
                         evaluationSchema()));
     }
@@ -90,6 +90,12 @@ public final class PlanGoalAgentCapability implements AgentCapability {
                     spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE);
             contributions.add(new ToolContribution(spec, ToolSideEffect.EXTERNAL,
                     AgentTool.WorkspaceMutationMode.UNOBSERVABLE, descriptor,
+                    isPlanMutationTool(spec.name())
+                            ? AgentTool.PlanAccess.INTERNAL_MUTATION
+                            : AgentTool.PlanAccess.DISALLOWED,
+                    isPlanMutationTool(spec.name())
+                            ? AgentTool.ApprovalRequirement.TRUSTED_INTERNAL
+                            : AgentTool.ApprovalRequirement.USER_REQUIRED,
                     ignored -> new GoalAgentTool(spec, binding)));
         }
         return new Prepared(promptFragment(binding), contributions);
@@ -150,6 +156,23 @@ public final class PlanGoalAgentCapability implements AgentCapability {
             return spec;
         }
 
+        /** 规划提案是唯一受信的内部持久化 Tool；执行步骤仍保持普通外部副作用标记。 */
+        @Override
+        public PlanAccess planAccess() {
+            return isPlanMutationTool(spec.name())
+                    ? PlanAccess.INTERNAL_MUTATION : PlanAccess.DISALLOWED;
+        }
+
+        /**
+         * 计划草稿和提案只更新服务端 Plan 聚合；它们仍受 Plan 身份/CAS 约束，但不应再次请求外部
+         * 工具权限审批。计划执行步骤不带此标记，继续沿用默认的用户审批边界。
+         */
+        @Override
+        public ApprovalRequirement approvalRequirement() {
+            return isPlanMutationTool(spec.name())
+                    ? ApprovalRequirement.TRUSTED_INTERNAL : ApprovalRequirement.USER_REQUIRED;
+        }
+
         /**
          * Tool runner 仍负责审批与持久结算；适配器只复核因果身份并调用受限 GoalUseCase。
          */
@@ -193,7 +216,7 @@ public final class PlanGoalAgentCapability implements AgentCapability {
 
         /** 模型参数只能重复冻结 identity/CAS，不能把 Tool 重定向到同进程其它 Goal/Plan。 */
         private void validateAuthority(String toolName, JsonNode arguments) {
-            if ("plan_propose".equals(toolName)) {
+            if ("plan_propose".equals(toolName) || "plan_draft_update".equals(toolName)) {
                 requirePlan(arguments, "planId", "expectedPlanRevision");
             } else if ("plan_step_update".equals(toolName)) {
                 if (binding.origin() == TurnOrigin.GOAL_CONTINUATION) {
@@ -253,11 +276,10 @@ public final class PlanGoalAgentCapability implements AgentCapability {
         private boolean allows(String toolName) {
             return switch (origin) {
                 case USER, CHILD_TASK -> collaborationMode == CollaborationMode.PLAN
-                        && "plan_propose".equals(toolName);
+                        && isPlanMutationTool(toolName);
                 case GOAL_CONTINUATION -> goalContext.status() == GoalModels.GoalStatus.ACTIVE
                         && goalContext.phase() == GoalModels.GoalPhase.WORKING
-                        && ("goal_request_input".equals(toolName)
-                        || "goal_request_evaluation".equals(toolName)
+                        && ("goal_request_evaluation".equals(toolName)
                         || (goalContext.planId() != null && "plan_step_update".equals(toolName)));
                 case PLAN_EXECUTION -> planContext.status() == GoalModels.PlanStatus.EXECUTING
                         && "plan_step_update".equals(toolName);
@@ -275,11 +297,11 @@ public final class PlanGoalAgentCapability implements AgentCapability {
                     text(arguments, "planId"), integer(arguments, "expectedPlanRevision"),
                     definition(arguments.required("definition")), false,
                     text(arguments, "idempotencyKey"), now));
+            case "plan_draft_update" -> goals.saveDraft(new GoalUseCase.SaveDraft(
+                    text(arguments, "planId"), integer(arguments, "expectedPlanRevision"),
+                    integer(arguments, "expectedDraftRevision"), definition(arguments.required("definition")),
+                    optionalText(arguments, "basedOnPlanRevisionId"), text(arguments, "idempotencyKey"), now));
             case "plan_step_update" -> updateStep(arguments, now);
-            case "goal_request_input" -> goals.requestInput(new GoalUseCase.InputRequest(
-                    text(arguments, "goalId"), integer(arguments, "expectedGoalRevision"),
-                    text(arguments, "runId"), text(arguments, "prompt"),
-                    Instant.parse(text(arguments, "expiresAt")), text(arguments, "idempotencyKey"), now));
             case "goal_request_evaluation" -> goals.requestEvaluation(new GoalUseCase.EvaluationRequest(
                     text(arguments, "goalId"), integer(arguments, "expectedGoalRevision"),
                     text(arguments, "runId"), optionalText(arguments, "planRevisionId"),
@@ -313,6 +335,22 @@ public final class PlanGoalAgentCapability implements AgentCapability {
         }
         return "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" + properties
                 + "},\"required\":[" + required + "]}";
+    }
+
+    /** 草稿更新保留可为空的批准基线，因此使用独立的闭集 schema。 */
+    private static String draftUpdateSchema() {
+        return "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
+                + "\"planId\":{\"type\":\"string\"},\"expectedPlanRevision\":{\"type\":\"integer\"},"
+                + "\"expectedDraftRevision\":{\"type\":\"integer\"},\"definition\":{\"type\":\"object\"},"
+                + "\"basedOnPlanRevisionId\":{\"type\":[\"string\",\"null\"]},"
+                + "\"idempotencyKey\":{\"type\":\"string\"}},\"required\":[\"planId\","
+                + "\"expectedPlanRevision\",\"expectedDraftRevision\",\"definition\","
+                + "\"basedOnPlanRevisionId\",\"idempotencyKey\"]}";
+    }
+
+    /** 规划期唯一允许的内部持久化 Tool；其副作用仅影响计划草稿或冻结版本。 */
+    private static boolean isPlanMutationTool(String toolName) {
+        return "plan_propose".equals(toolName) || "plan_draft_update".equals(toolName);
     }
 
     /** 步骤更新以 target 判别两个聚合，细粒度互斥继续由执行端硬校验。 */

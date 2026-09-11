@@ -124,6 +124,9 @@
     INSERT INTO turns(turn_id,thread_id,state,requested_at,updated_at)
     VALUES(#{turnId},#{threadId},'QUEUED',#{occurredAt},#{occurredAt})
   </insert>
+  <select id="hasOtherTurns" resultType="boolean">
+    SELECT EXISTS(SELECT 1 FROM turns WHERE thread_id=#{threadId} AND turn_id&lt;&gt;#{turnId} LIMIT 1)
+  </select>
   <insert id="insertTurnExecution">
     INSERT INTO turn_execution(turn_id,schema_version,state_json)
     VALUES(#{turnId},#{schemaVersion},#{stateJson})
@@ -170,6 +173,14 @@
       AND mutation_version=#{expectedTurnMutationVersion}
       AND EXISTS(SELECT 1 FROM threads t WHERE t.thread_id=#{threadId} AND t.revision=#{expectedThreadRevision})
   </update>
+  <update id="suspendCancelledTurn">
+    UPDATE turns SET state='SUSPENDED',mutation_version=mutation_version+1,updated_at=#{occurredAt},
+      cancel_requested_at=NULL,completed_at=NULL,error_code=NULL,error_message=NULL
+    WHERE turn_id=#{turnId} AND thread_id=#{threadId} AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL')
+      AND mutation_version=#{expectedTurnMutationVersion} AND cancel_requested_at IS NOT NULL
+      AND EXISTS(SELECT 1 FROM threads t WHERE t.thread_id=#{threadId} AND t.revision=#{expectedThreadRevision})
+      AND EXISTS(SELECT 1 FROM turn_execution e WHERE e.turn_id=#{turnId})
+  </update>
   <select id="countSuspendedTurns" resultType="int">
     SELECT COUNT(*) FROM turns WHERE thread_id=#{threadId} AND state='SUSPENDED'
   </select>
@@ -214,12 +225,22 @@
     VALUES(#{messageId},#{threadId},#{turnId},#{ordinal},#{role},#{blocksJson},#{occurredAt})
   </insert>
   <insert id="insertTimelineMessage">
-    INSERT INTO timeline_messages(item_id,thread_id,turn_id,message_kind,public_text,model_round,created_at)
-    VALUES(#{itemId},#{threadId},#{turnId},#{messageKind},#{publicText},#{modelRound},#{occurredAt})
+    INSERT INTO timeline_messages(item_id,thread_id,turn_id,message_kind,public_text,model_round,
+      source_thread_id,source_title,created_at)
+    VALUES(#{itemId},#{threadId},#{turnId},#{messageKind},#{publicText},#{modelRound},
+      #{sourceThreadId},#{sourceTitle},#{occurredAt})
   </insert>
   <select id="selectMessages" resultMap="messageRow">
     SELECT message_id,turn_id,ordinal,role,blocks_json,created_at FROM messages
     WHERE thread_id=#{threadId} ORDER BY ordinal
+  </select>
+  <select id="selectAdmissionUserMessage" resultMap="messageRow">
+    SELECT m.message_id,m.turn_id,m.ordinal,m.role,m.blocks_json,m.created_at
+    FROM messages m JOIN timeline_messages t ON t.item_id=m.message_id
+      AND t.thread_id=m.thread_id AND t.turn_id=m.turn_id
+    WHERE m.thread_id=#{threadId} AND m.turn_id=#{turnId}
+      AND m.role='USER' AND t.message_kind='USER_INPUT'
+    ORDER BY m.ordinal LIMIT 1
   </select>
   <select id="selectTool" resultMap="toolRow">
     SELECT call_id,state,revision,ordinal,tool_name,side_effect FROM tools WHERE turn_id=#{turnId} AND call_id=#{callId}
@@ -254,6 +275,9 @@
   </update>
   <select id="countUnfinishedTools" resultType="int">
     SELECT COUNT(*) FROM tools WHERE turn_id=#{turnId} AND state IN ('PREPARED','RUNNING')
+  </select>
+  <select id="selectUnfinishedToolCallIds" resultType="string">
+    SELECT call_id FROM tools WHERE turn_id=#{turnId} AND state IN ('PREPARED','RUNNING') ORDER BY ordinal
   </select>
   <update id="settleUnfinishedTools">
     UPDATE tools SET state=#{state},

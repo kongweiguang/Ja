@@ -146,7 +146,8 @@ final class SettingsCatalogHandlerTest {
                 unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.class),
                 unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase.class),
                 io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveTasks(),
-                io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveInteractions(),
                 unsupported(DeadlineCloseable.class));
     }
 

@@ -98,6 +98,7 @@ final class ThreadHistoryTaskActivityTest {
                     unsupported(ApprovalUseCase.class), unsupported(CatalogUseCase.class),
                     unsupported(AttachmentUseCase.class), unsupported(AttachmentPreviewUseCase.class),
                     tasks.proxy(), goals.proxy(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveInteractions(),
                     new NoopLifecycle());
             Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-thread-task-activity-test")
                     .toAbsolutePath();
@@ -131,7 +132,7 @@ final class ThreadHistoryTaskActivityTest {
         private GoalUseCase proxy() {
             return (GoalUseCase) Proxy.newProxyInstance(GoalUseCase.class.getClassLoader(),
                     new Class<?>[]{GoalUseCase.class}, (proxy, method, arguments) -> switch (method.getName()) {
-                        case "subscribe" -> (AutoCloseable) () -> { };
+                        case "subscribe", "subscribePlan" -> (AutoCloseable) () -> { };
                         case "listTerminalActivities" -> {
                             String ownerThreadId = (String) arguments[0];
                             ownerThreadIds.add(ownerThreadId);

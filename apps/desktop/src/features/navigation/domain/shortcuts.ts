@@ -134,7 +134,7 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
 }
 
 /**
- * 编辑区保留普通输入语义，但五个公开 Workbench 动作必须能在 xterm/CodeMirror
+ * 编辑区保留普通输入语义，但新建会话和五个公开 Workbench 动作必须能在 xterm/CodeMirror
  * 的 textarea 上先到达壳层；AltGraph 仍优先属于字符输入而不是 Side Chat。
  */
 export function shouldPreserveEditableShortcut(
@@ -143,6 +143,7 @@ export function shouldPreserveEditableShortcut(
 ): boolean {
   if (!isEditableShortcutTarget(event.target)) return false;
   switch (command) {
+    case "new-conversation":
     case "search-conversations":
     case "command-palette":
     case "open-review":

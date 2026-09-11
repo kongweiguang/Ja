@@ -1,0 +1,416 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-settings-dialog-overlay.ja-settings-credential-dialog-overlay {
+  z-index: 1300;
+}
+.ja-settings-confirm-dialog.ja-settings-credential-confirm-dialog {
+  z-index: 1301;
+}
+
+/* MCP uses solid, scannable rows; only the editor and controls receive elevation. */
+.ja-mcp-section {
+  gap: 20px;
+}
+
+.ja-mcp-list {
+  display: grid;
+  min-width: 0;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--ja-border);
+  border-radius: 14px;
+  background: var(--ja-surface-raised);
+}
+
+.ja-mcp-row {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--ja-border);
+  transition: background-color 140ms var(--ja-ease-native);
+}
+
+.ja-mcp-row:last-child {
+  border-bottom: 0;
+}
+
+.ja-mcp-row:hover {
+  background: color-mix(in srgb, var(--ja-control) 45%, transparent);
+}
+
+.ja-mcp-row-main {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.ja-mcp-row-icon,
+.ja-mcp-empty-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--ja-accent);
+  background: var(--ja-accent-soft);
+}
+
+.ja-mcp-row-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.ja-mcp-row-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.ja-mcp-row-title h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-control);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-mcp-status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  white-space: nowrap;
+}
+
+.ja-mcp-status.is-connected {
+  color: var(--ja-success);
+}
+
+.ja-mcp-status.is-error {
+  color: var(--ja-danger);
+}
+
+.ja-mcp-status.is-testing {
+  color: var(--ja-warning);
+}
+
+.ja-mcp-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.ja-mcp-row-details {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-mcp-row-details > span:last-child {
+  flex: 0 0 auto;
+}
+
+.ja-mcp-row-details code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground-tertiary);
+  font-family: var(--ja-font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-mcp-row-details code::before,
+.ja-mcp-row-details > span + code::before {
+  margin-right: 7px;
+  color: var(--ja-border-strong);
+  content: "·";
+}
+
+.ja-mcp-row-toggle {
+  align-self: start;
+}
+
+.ja-mcp-row-toggle .ja-settings-switch-field {
+  align-items: center;
+}
+
+.ja-mcp-row-toggle .ja-settings-switch-field > div {
+  display: none;
+}
+
+.ja-mcp-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  padding-left: 44px;
+}
+
+.ja-mcp-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-left: 44px;
+}
+
+.ja-mcp-chip {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 3px 7px;
+  border: 1px solid var(--ja-border);
+  border-radius: 6px;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-control);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-mcp-error {
+  padding-left: 44px;
+}
+
+.ja-mcp-empty {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 20px;
+}
+
+.ja-mcp-empty strong {
+  display: block;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+}
+
+.ja-mcp-empty p {
+  margin: 3px 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-settings-dialog.ja-mcp-dialog {
+  display: grid;
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 32px));
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  padding: 0;
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--ja-dialog) 96%, var(--ja-accent-soft));
+}
+
+.ja-mcp-dialog-header {
+  padding: 22px 24px 18px;
+}
+
+.ja-mcp-dialog-title {
+  font-size: 20px;
+  letter-spacing: 0;
+}
+
+.ja-mcp-dialog-description {
+  max-width: 460px;
+  line-height: 1.45;
+}
+
+.ja-mcp-form {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+.ja-mcp-form-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px 24px;
+}
+
+.ja-mcp-form-body > * + * {
+  margin-top: 14px;
+}
+
+.ja-mcp-basic-fields,
+.ja-mcp-advanced-fields {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+}
+
+.ja-mcp-basic-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ja-mcp-basic-fields .ja-settings-input,
+.ja-mcp-advanced-fields .ja-settings-input {
+  min-height: 36px;
+  border-radius: 10px;
+  background: var(--ja-control);
+}
+
+.ja-mcp-transport {
+  display: grid;
+  min-height: 40px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 3px;
+  border: 1px solid var(--ja-border);
+  border-radius: 11px;
+  background: var(--ja-control);
+}
+
+.ja-mcp-transport-option {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 12px;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  transition:
+    color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native),
+    box-shadow 120ms var(--ja-ease-native);
+}
+
+.ja-mcp-transport-option:hover {
+  color: var(--ja-foreground);
+}
+
+.ja-mcp-transport-option.is-selected {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-raised);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--ja-border-strong) 18%, transparent);
+}
+
+.ja-mcp-transport-option:focus-visible,
+.ja-mcp-advanced-toggle:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-mcp-advanced-toggle {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+  border: 0;
+  border-top: 1px solid var(--ja-border);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+}
+
+.ja-mcp-advanced-toggle:hover {
+  color: var(--ja-foreground);
+}
+
+.ja-mcp-advanced-toggle > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.ja-mcp-advanced-toggle > svg {
+  transition: transform 160ms var(--ja-ease-native);
+}
+
+.ja-mcp-advanced-toggle[aria-expanded="true"] > svg {
+  transform: rotate(180deg);
+}
+
+.ja-mcp-advanced-fields {
+  padding: 14px;
+  border: 1px solid var(--ja-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ja-control) 48%, transparent);
+}
+
+.ja-mcp-native-select {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--ja-border);
+  border-radius: 10px;
+  outline: 0;
+  color: var(--ja-foreground);
+  font: inherit;
+}
+
+.ja-mcp-native-select:focus {
+  border-color: var(--ja-focus);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ja-focus) 14%, transparent);
+}
+
+.ja-mcp-form-actions {
+  justify-content: flex-end;
+  min-height: 68px;
+  padding: 14px 24px 18px;
+  border-top: 1px solid var(--ja-border);
+  background: var(--ja-dialog);
+}
+
+.ja-mcp-form-actions .ja-settings-feedback {
+  margin-right: auto;
+}
+
+.ja-mcp-dialog .ja-settings-credential-vault {
+  margin-top: 2px;
+  padding: 14px 0 0;
+}
+
+.ja-mcp-dialog .ja-settings-credential-controls {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ja-mcp-dialog .ja-settings-credential-actions {
+  justify-content: flex-start;
+}
+
+@media (max-width: 640px) {
+  .ja-mcp-empty {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-mcp-row,
+  .ja-mcp-transport-option,
+  .ja-mcp-advanced-toggle > svg {
+    transition: none;
+  }
+}

@@ -5,12 +5,13 @@
 
 use super::history_model::{
     AcceptedResult, HistoryMethod, PageInput, ThreadCompactInput, ThreadCompactResult,
-    ThreadCreateInput, ThreadDto, ThreadListInput, ThreadListResult, ThreadMutationInput,
-    ThreadPinInput, ThreadPreferencesUpdateInput, ThreadReadInput, ThreadReadResult,
-    ThreadRenameInput, ThreadSearchInput, WorkspaceListResult, dispatch_compaction,
-    dispatch_mutation, dispatch_pin, dispatch_thread_lifecycle, parse_thread, parse_thread_page,
-    parse_thread_read, parse_workspace_page, request_history, validate_page,
-    validate_thread_create, validate_thread_list, validate_thread_preferences_update,
+    ThreadCreateInput, ThreadDiscoverInput, ThreadDiscoverResult, ThreadDto, ThreadListInput,
+    ThreadListResult, ThreadMutationInput, ThreadPinInput, ThreadPreferencesUpdateInput,
+    ThreadReadInput, ThreadReadResult, ThreadRenameInput, ThreadSearchInput, WorkspaceListResult,
+    dispatch_compaction, dispatch_mutation, dispatch_pin, dispatch_thread_lifecycle, parse_thread,
+    parse_thread_discovery, parse_thread_page, parse_thread_read, parse_workspace_page,
+    request_history, request_thread_discover, validate_page, validate_thread_create,
+    validate_thread_discover, validate_thread_list, validate_thread_preferences_update,
     validate_thread_read, validate_thread_rename, validate_thread_search,
 };
 use crate::app_runtime::{RuntimeCommandError, RuntimeHost};
@@ -58,6 +59,20 @@ pub fn ja_thread_list(
         serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
     )?;
     parse_thread_page(result)
+}
+
+/// 在当前 Ja 实例内发现可通信 Thread；只返回最小身份目录，不物化任何会话正文。
+#[tauri::command]
+pub fn ja_thread_discover(
+    input: ThreadDiscoverInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ThreadDiscoverResult, RuntimeCommandError> {
+    validate_thread_discover(&input)?;
+    let result = request_thread_discover(
+        &state,
+        serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
+    )?;
+    parse_thread_discovery(result)
 }
 
 /// 仅在指定 Workspace 内搜索标题；空查询返回最近 Thread，排序与分页由 Java/SQLite 拥有。

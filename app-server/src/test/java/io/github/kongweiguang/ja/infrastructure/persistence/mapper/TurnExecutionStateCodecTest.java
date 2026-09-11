@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.foundation.error.StorageException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -61,6 +62,18 @@ final class TurnExecutionStateCodecTest {
 
         assertThrows(StorageException.class, () -> codec.read(valid.replaceFirst("\\{", "{\"extra\":1,")));
         assertThrows(StorageException.class, () -> codec.read(valid.replace("\"schemaVersion\":1", "\"schemaVersion\":2")));
+    }
+
+    /** 挂起时冻结的活动预算必须独立于 wall-clock deadline 无损恢复。 */
+    @Test
+    void preservesPausedActiveBudget() {
+        TurnExecutionState.Common common = new TurnExecutionState.Common(1, 2, 3, null, List.of(),
+                Instant.parse("2026-09-10T00:20:00Z"),
+                io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.PLAN_EXECUTION,
+                Duration.ofSeconds(17));
+        TurnExecutionState.Ready state = new TurnExecutionState.Ready(
+                common, TurnExecutionState.Next.ASSISTANT, null);
+        assertEquals(state, codec.read(codec.write(state)));
     }
 
     /** ProviderPending 冻结完整非敏感请求画像，恢复时不依赖可变的 Turn 级 runtime。 */

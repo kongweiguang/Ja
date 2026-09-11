@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.conversation.port.in;
 
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
@@ -24,6 +25,13 @@ public interface ThreadUseCase {
      * 在一个 Java 权威 Workspace 内使用稳定键集游标列出 Thread，避免跨项目分页污染。
      */
     CursorPage<ThreadSummary> listThreads(String workspaceId, String cursor, int limit);
+
+    /**
+     * 读取全局 Thread 发现投影；默认失败保持窄测试夹具显式声明未提供该能力。
+     */
+    default CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+        throw new UnsupportedOperationException("thread discovery is unavailable");
+    }
 
     /** 在一个 Workspace 内按归一化标题包含关系搜索，并保持最近更新时间 keyset 顺序。 */
     CursorPage<ThreadSummary> searchThreads(String workspaceId, String query, String cursor, int limit);

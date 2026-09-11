@@ -10,6 +10,7 @@ import type {
 } from "@/features/settings";
 import { useRuntimeState } from "../RuntimeProvider";
 import { RecoveryPanel } from "./RecoveryPanel";
+import type { SettingsInterfacePreferences, ExecutionScope } from "@/features/settings";
 
 /** Settings editor 及 Radix/form 依赖只在专属页面进入 bundle。 */
 const LazySettings = lazy(async () => {
@@ -19,6 +20,8 @@ const LazySettings = lazy(async () => {
 
 export interface SettingsViewProps {
   readonly settings: SettingsController;
+  readonly interfacePreferences: SettingsInterfacePreferences;
+  readonly executionScope: ExecutionScope;
   readonly required: boolean;
   readonly section: SettingsSection;
   readonly onSectionChange: (section: SettingsSection) => void;
@@ -33,6 +36,8 @@ export interface SettingsViewProps {
  */
 export function SettingsView({
   settings,
+  interfacePreferences,
+  executionScope,
   required,
   section,
   onSectionChange,
@@ -53,6 +58,8 @@ export function SettingsView({
       >
         <LazySettings
           snapshot={settings.globalSnapshot}
+          interfacePreferences={interfacePreferences}
+          executionScope={executionScope}
           ports={settings.ports}
           section={section}
           onSectionChange={onSectionChange}

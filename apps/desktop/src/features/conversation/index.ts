@@ -4,11 +4,41 @@
 export { useConversationController } from "./application/useConversationController";
 export type { ConversationController } from "./application/useConversationController";
 export { useConversationInteractionController } from "./application/useConversationInteractionController";
+export { useInteractionController } from "./application/useInteractionController";
+export { useClarificationController } from "./application/useInteractionController";
 export type {
+  InteractionController,
+  InteractionControllerOptions,
+} from "./application/useInteractionController";
+export { InteractionCard } from "./ui/interaction/InteractionCard";
+export {
+  publishInteractionHostEvent,
+  subscribeInteractionHostEvents,
+} from "./application/interactionEventBus";
+export { createInteractionPort } from "./application/interactionAdapterPort";
+export type {
+  InteractionAnswer,
+  InteractionEvent,
+  InteractionOption,
+  InteractionPort,
+  InteractionQuestion,
+  InteractionQuestionKind,
+  InteractionRequest,
+  InteractionRevisionConflict,
+  InteractionSnapshot,
+} from "./application/interactionPort";
+export type {
+  ConversationInteractionController,
   ConversationInteractionOptions,
   ConversationQueuedInputView,
 } from "./application/useConversationInteractionController";
 export type {
+  ConversationAccessMode,
+  ConversationCollaborationMode,
+  ConversationModelOption,
+  ConversationModelSelection,
+  ConversationThreadPreferences,
+  ReasoningLevel,
   ConversationArtifactPort,
   ConversationAcceptedTurn,
   ConversationAttachment,
@@ -23,7 +53,7 @@ export type {
   ConversationTurnPort,
 } from "./application/ports";
 export { Composer } from "./ui/composer/Composer";
-export type { ComposerSubmit } from "./ui/composer/Composer";
+export type { ComposerSubmit, ComposerNativeDropEvent } from "./ui/composer/Composer";
 export type {
   ComposerSlashCommand,
   ComposerSlashCommandContext,
@@ -56,4 +86,8 @@ export {
   turnStatusLabel,
 } from "./domain/timelineTypes";
 export type { TimelineApproval, TimelineItemAdapter, TimelineTurn } from "./domain/timelineTypes";
-export type { AttachmentSummary, TimelineGoalActivity } from "./domain/timelineContracts";
+export type {
+  AttachmentSummary,
+  TimelineGoalActivity,
+  TimelineSnapshot,
+} from "./domain/timelineContracts";

@@ -76,6 +76,38 @@ function ShortcutProbe({ port, context, dispatch }: ShortcutProbeProps): ReactEl
 afterEach(() => cleanup());
 
 describe("useNativeNavigationShortcuts", () => {
+  /** 输入焦点不能屏蔽新建会话；重复 keydown 不得重复创建。 */
+  it("Ctrl+N 在 Composer 输入框内只分发一次新建会话", () => {
+    const fake = fakeShortcutPort();
+    const dispatch = vi.fn(() => true);
+    render(
+      <ShortcutProbe
+        port={fake.port}
+        context={{ projectCapabilitiesEnabled: false, conversationFocusEnabled: true }}
+        dispatch={dispatch}
+      />,
+    );
+    const input = document.createElement("textarea");
+    document.body.append(input);
+    try {
+      const event = new KeyboardEvent("keydown", {
+        key: "n",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      input.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+      expect(dispatch).toHaveBeenCalledExactlyOnceWith("new-conversation");
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "n", ctrlKey: true, repeat: true, bubbles: true }),
+      );
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      input.remove();
+    }
+  });
+
   it("等待 listener 就绪后才发布当前 context，并映射封闭 native command", async () => {
     const fake = fakeShortcutPort();
     const dispatch = vi.fn(() => true);

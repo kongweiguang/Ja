@@ -7,9 +7,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderReasoningSupport;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderSseReader;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderStreamResult;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort.FinishReason;
@@ -22,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Function;
 
 /**
@@ -32,13 +35,25 @@ final class OpenAiResponsesState {
     private final Map<String, EmittedTool> emittedItems = new LinkedHashMap<>();
     private final Map<String, EmittedTool> emittedCalls = new LinkedHashMap<>();
     private final Map<TextKey, TextAccumulator> texts = new LinkedHashMap<>();
+    private final Map<String, ReasoningAccumulator> reasoning = new LinkedHashMap<>();
+    private final Map<Integer, ItemSlot> itemSlots = new TreeMap<>();
+    private final Map<Integer, List<ModelPort.ModelEvent>> pendingEffects = new TreeMap<>();
+    private final ModelPort.ModelConfiguration configuration;
     private final Set<String> doneItems = new HashSet<>();
     private String responseId;
     private FinishReason finishReason;
     private ModelUsage usage;
     private long lastSequence = -1;
     private int nextOrdinal;
+    private int nextOutputIndex;
     private boolean terminal;
+
+    /**
+     * 绑定本次 Responses 请求身份，令 reasoning 原生块只能回传给同一 provider/model/endpoint。
+     */
+    OpenAiResponsesState(ModelPort.ModelConfiguration configuration) {
+        this.configuration = java.util.Objects.requireNonNull(configuration, "configuration");
+    }
 
     /**
      * SSE 完成名称和类型校验后归约事件，并返回待提交效果而不执行外部 IO。
@@ -55,15 +70,20 @@ final class OpenAiResponsesState {
         switch (event.name()) {
             case "response.created", "response.queued", "response.in_progress" ->
                     capture(requiredObject(data, "response"));
-            case "response.output_text.delta" -> textDelta(data, TextKind.OUTPUT_TEXT, effects);
+            case "response.output_text.delta" -> textDelta(data, TextKind.OUTPUT_TEXT);
             case "response.output_text.done" -> textDone(data, TextKind.OUTPUT_TEXT);
-            case "response.refusal.delta" -> textDelta(data, TextKind.REFUSAL, effects);
+            case "response.refusal.delta" -> textDelta(data, TextKind.REFUSAL);
             case "response.refusal.done" -> textDone(data, TextKind.REFUSAL);
-            case "response.reasoning_summary_text.delta" -> effects.add(
-                    new ModelPort.ReasoningSummaryDelta(requiredText(data, "delta", false)));
-            case "response.output_item.added" -> itemAdded(requiredObject(data, "item"));
-            case "response.function_call_arguments.delta" -> tool(requiredText(data, "item_id", false))
-                    .append(requiredText(data, "delta", true));
+            case "response.reasoning_summary_text.delta" -> reasoningSummaryDelta(data, effects);
+            case "response.reasoning_summary_text.done" -> reasoningSummaryDone(data, effects);
+            case "response.reasoning_summary_part.added" -> reasoningSummaryPartAdded(data, effects);
+            case "response.reasoning_summary_part.done" -> reasoningSummaryPartDone(data, effects);
+            case "response.reasoning_text.delta" -> reasoningTextDelta(data, effects);
+            case "response.reasoning_text.done" -> reasoningTextDone(data, effects);
+            case "response.output_item.added" -> itemAdded(
+                    requiredObject(data, "item"), requiredIndex(data, "output_index"));
+            case "response.function_call_arguments.delta" -> tool(
+                    requiredText(data, "item_id", false)).append(requiredText(data, "delta", true));
             case "response.function_call_arguments.done" -> {
                 ToolAccumulator tool = tool(requiredText(data, "item_id", false));
                 String name = optionalText(data, "name");
@@ -73,21 +93,19 @@ final class OpenAiResponsesState {
                     throw protocol("OpenAI changed a function-call name");
                 }
                 tool.finish(requiredText(data, "arguments", true));
-                emitTool(tool, toolLookup, effects);
+                emitTool(tool, requiredIndex(data, "output_index"), toolLookup);
             }
             case "response.output_item.done" -> itemDone(
-                    requiredObject(data, "item"), toolLookup, effects);
-            case "response.completed" -> completed(requiredObject(data, "response"));
-            case "response.incomplete" -> incomplete(requiredObject(data, "response"));
+                    requiredObject(data, "item"), requiredIndex(data, "output_index"), toolLookup);
+            case "response.completed" -> completed(requiredObject(data, "response"), effects);
+            case "response.incomplete" -> incomplete(requiredObject(data, "response"), effects);
             case "response.failed", "error" -> providerError(data);
-            case "response.reasoning_summary_text.done", "response.reasoning_summary_part.added",
-                 "response.reasoning_summary_part.done", "response.reasoning_text.delta",
-                 "response.reasoning_text.done", "response.content_part.added",
-                 "response.content_part.done" -> {
-                // 协议记载的非语义事件不携带 Ja 状态；私有推理直接丢弃。
+            case "response.content_part.added", "response.content_part.done" -> {
+                // content part 本身只宣布结构；文本和 refusal 的 delta/done 承担语义校验。
             }
             default -> throw protocol("OpenAI emitted an unsupported Responses event");
         }
+        effects.addAll(flushOrderedEffects());
         return List.copyOf(effects);
     }
 
@@ -96,7 +114,8 @@ final class OpenAiResponsesState {
      * 状态，下一轮必须从 Ja 的权威历史重建完整原生 input。
      */
     ProviderStreamResult finish() {
-        if (!terminal || finishReason == null || !tools.isEmpty()) {
+        if (!terminal || finishReason == null || !tools.isEmpty()
+                || !pendingEffects.isEmpty() || !itemSlots.isEmpty()) {
             throw new ProviderProtocolException(
                     "STREAM_TRUNCATED", "OpenAI stream ended without explicit completion", true);
         }
@@ -128,9 +147,15 @@ final class OpenAiResponsesState {
     /**
      * 按 item id 登记函数元数据，并忽略已支持的消息及推理输出条目。
      */
-    private void itemAdded(JsonNode item) {
+    private void itemAdded(JsonNode item, int outputIndex) {
+        observeIndex(outputIndex);
+        itemSlots.get(outputIndex).explicitItem = true;
         String type = requiredText(item, "type", false);
-        if ("message".equals(type) || "reasoning".equals(type)) return;
+        if ("message".equals(type)) return;
+        if ("reasoning".equals(type)) {
+            reasoningFor(requiredText(item, "id", false), outputIndex).acceptAdded(item);
+            return;
+        }
         if (!"function_call".equals(type)) {
             throw new ProviderProtocolException(
                     "OPENAI_ITEM", "OpenAI emitted an unsupported output item", false);
@@ -150,10 +175,23 @@ final class OpenAiResponsesState {
     /**
      * 冗余 arguments-done 缺失时，以权威 completed item 完成 Tool 对账。
      */
-    private void itemDone(JsonNode item, Function<String, ToolSpec> toolLookup,
-                          List<ModelPort.ModelEvent> effects) {
+    private void itemDone(JsonNode item, int outputIndex,
+                          Function<String, ToolSpec> toolLookup) {
+        observeIndex(outputIndex);
         String type = requiredText(item, "type", false);
-        if ("message".equals(type) || "reasoning".equals(type)) return;
+        if ("message".equals(type)) {
+            completeIndex(outputIndex);
+            return;
+        }
+        if ("reasoning".equals(type)) {
+            ReasoningAccumulator accumulator = reasoningFor(requiredText(item, "id", false), outputIndex);
+            accumulator.acceptDone(item);
+            if (accumulator.readyForHistory()) {
+                queueEffect(outputIndex, accumulator.emitBlock());
+                completeIndex(outputIndex);
+            }
+            return;
+        }
         if (!"function_call".equals(type)) {
             throw new ProviderProtocolException(
                     "OPENAI_ITEM", "OpenAI emitted an unsupported output item", false);
@@ -165,6 +203,7 @@ final class OpenAiResponsesState {
             if (emitted == null) throw protocol("OpenAI completed a function call without metadata");
             verifyCompletedCall(emitted, item);
             markItemDone(itemId);
+            completeIndex(outputIndex);
             return;
         }
         if (!accumulator.callId().equals(requiredText(item, "call_id", false))
@@ -173,15 +212,16 @@ final class OpenAiResponsesState {
         }
         String arguments = optionalText(item, "arguments");
         if (arguments != null && !arguments.isEmpty()) accumulator.finish(arguments);
-        emitTool(accumulator, toolLookup, effects);
+        emitTool(accumulator, outputIndex, toolLookup);
         markItemDone(itemId);
+        completeIndex(outputIndex);
     }
 
     /**
      * Tool 调用可观察前只恢复已知 strict 参数；未知 Tool 与参数错误交给 Runner 回传 ToolResult。
      */
-    private void emitTool(ToolAccumulator tool, Function<String, ToolSpec> toolLookup,
-                          List<ModelPort.ModelEvent> effects) {
+    private void emitTool(ToolAccumulator tool, int outputIndex,
+                          Function<String, ToolSpec> toolLookup) {
         if (tool.emitted()) return;
         JsonNode wireArguments = parseArguments(tool.arguments());
         ToolSpec spec = toolLookup.apply(tool.name());
@@ -199,7 +239,7 @@ final class OpenAiResponsesState {
             throw new ProviderProtocolException(
                     "TOOL_DUPLICATE", "OpenAI repeated a function-call identity", false);
         }
-        effects.add(new ModelPort.ToolCallReady(
+        queueEffect(outputIndex, new ModelPort.ToolCallReady(
                 tool.callId(), tool.name(), values, tool.ordinal()));
         EmittedTool emitted = new EmittedTool(
                 tool.itemId(), tool.callId(), tool.name(), wireArguments);
@@ -212,7 +252,7 @@ final class OpenAiResponsesState {
     /**
      * 映射完整响应，同时执行严格 usage 计量和 Tool 状态迁移。
      */
-    private void completed(JsonNode response) {
+    private void completed(JsonNode response, List<ModelPort.ModelEvent> effects) {
         requireFirstTerminal();
         capture(response);
         String status = optionalText(response, "status");
@@ -220,16 +260,20 @@ final class OpenAiResponsesState {
             throw new ProviderProtocolException(
                     "RESPONSE_STATUS", "OpenAI response status is not completed", false);
         }
-        validateFinalOutput(response, true);
+        validateFinalOutput(response, true, effects);
         usage = response.hasNonNull("usage") ? usage(requiredObject(response, "usage")) : null;
         finishReason = emittedCalls.isEmpty() ? FinishReason.STOP : FinishReason.TOOL_CALLS;
+        effects.addAll(flushOrderedEffects());
+        if (!itemSlots.isEmpty() || !pendingEffects.isEmpty()) {
+            throw protocol("OpenAI final output item order is incomplete");
+        }
         terminal = true;
     }
 
     /**
      * 只把达到最大输出 Token 导致的未完成接纳为正常 Agent Loop 结果。
      */
-    private void incomplete(JsonNode response) {
+    private void incomplete(JsonNode response, List<ModelPort.ModelEvent> effects) {
         requireFirstTerminal();
         capture(response);
         JsonNode details = response.path("incomplete_details");
@@ -241,9 +285,13 @@ final class OpenAiResponsesState {
             throw new ProviderProtocolException(
                     "RESPONSE_STATUS", "OpenAI response status is not incomplete", false);
         }
-        validateFinalOutput(response, false);
+        validateFinalOutput(response, false, effects);
         usage = response.hasNonNull("usage") ? usage(requiredObject(response, "usage")) : null;
         finishReason = FinishReason.MAX_OUTPUT_TOKENS;
+        effects.addAll(flushOrderedEffects());
+        if (!itemSlots.isEmpty() || !pendingEffects.isEmpty()) {
+            throw protocol("OpenAI final output item order is incomplete");
+        }
         terminal = true;
     }
 
@@ -328,7 +376,8 @@ final class OpenAiResponsesState {
     /**
      * 将权威最终响应与每个流式文本及 Tool 条目逐一对账。
      */
-    private void validateFinalOutput(JsonNode response, boolean allowTools) {
+    private void validateFinalOutput(
+            JsonNode response, boolean allowTools, List<ModelPort.ModelEvent> effects) {
         if (!tools.isEmpty() || doneItems.size() != emittedItems.size()) {
             throw new ProviderProtocolException(
                     "TOOL_SEQUENCE", "OpenAI ended before completing function-call items", false);
@@ -342,12 +391,17 @@ final class OpenAiResponsesState {
         Set<TextKey> finalTexts = new HashSet<>();
         for (int outputIndex = 0; outputIndex < output.size(); outputIndex++) {
             JsonNode item = output.get(outputIndex);
+            observeIndex(outputIndex);
             String type = requiredText(item, "type", false);
             if ("message".equals(type)) {
                 validateFinalMessage(item, outputIndex, finalTexts);
+                completeIndex(outputIndex);
                 continue;
             }
-            if ("reasoning".equals(type)) continue;
+            if ("reasoning".equals(type)) {
+                reconcileTerminalReasoning(item, outputIndex, effects);
+                continue;
+            }
             if (!"function_call".equals(type)) {
                 throw new ProviderProtocolException(
                         "OPENAI_ITEM", "OpenAI completed with an unsupported output item", false);
@@ -359,6 +413,7 @@ final class OpenAiResponsesState {
                         "TOOL_SEQUENCE", "OpenAI final Tool output disagrees with its stream", false);
             }
             verifyCompletedCall(emitted, item);
+            completeIndex(outputIndex);
         }
         if (finalCalls.size() != emittedCalls.size()) {
             throw new ProviderProtocolException(
@@ -372,11 +427,13 @@ final class OpenAiResponsesState {
     /**
      * 按不可变 output/content 坐标聚合公开文本，并返回对应语义效果。
      */
-    private void textDelta(JsonNode event, TextKind kind, List<ModelPort.ModelEvent> effects) {
+    private void textDelta(JsonNode event, TextKind kind) {
         TextKey key = textKey(event, kind);
         String delta = requiredText(event, "delta", false);
         texts.computeIfAbsent(key, ignored -> new TextAccumulator()).append(delta);
-        effects.add(new ModelPort.TextDelta(delta));
+        int outputIndex = key.outputIndex();
+        observeIndex(outputIndex);
+        queueEffect(outputIndex, new ModelPort.TextDelta(delta));
     }
 
     /**
@@ -387,6 +444,10 @@ final class OpenAiResponsesState {
         String field = kind == TextKind.OUTPUT_TEXT ? "text" : "refusal";
         texts.computeIfAbsent(key, ignored -> new TextAccumulator())
                 .finish(requiredText(event, field, true));
+        int outputIndex = key.outputIndex();
+        observeIndex(outputIndex);
+        ItemSlot slot = itemSlots.get(outputIndex);
+        if (slot != null && !slot.explicitItem()) completeIndex(outputIndex);
     }
 
     /**
@@ -430,6 +491,416 @@ final class OpenAiResponsesState {
                 throw protocol("OpenAI final text output disagrees with its stream");
             }
         }
+    }
+
+    /**
+     * 累积公开 summary delta，并按原生 output slot 排队；同一 item 的私有 reasoning_text 由累加器去重。
+     */
+    private void reasoningSummaryDelta(
+            JsonNode event, List<ModelPort.ModelEvent> effects) {
+        int outputIndex = requiredIndex(event, "output_index");
+        ReasoningAccumulator accumulator = reasoningFor(
+                requiredText(event, "item_id", false), outputIndex);
+        accumulator.appendSummary(requiredIndex(event, "summary_index"),
+                requiredText(event, "delta", true));
+        queuePublicReasoning(outputIndex, accumulator, effects);
+    }
+
+    /**
+     * 用 summary_text.done 补齐未到达的 delta；已完整拼接的内容不会再次发布。
+     */
+    private void reasoningSummaryDone(
+            JsonNode event, List<ModelPort.ModelEvent> effects) {
+        int outputIndex = requiredIndex(event, "output_index");
+        ReasoningAccumulator accumulator = reasoningFor(
+                requiredText(event, "item_id", false), outputIndex);
+        accumulator.finishSummary(requiredIndex(event, "summary_index"),
+                requiredText(event, "text", true));
+        queuePublicReasoning(outputIndex, accumulator, effects);
+    }
+
+    /**
+     * 登记 summary part 的段落边界；文本在 done 或 terminal item 中确认后才进入公开事件。
+     */
+    private void reasoningSummaryPartAdded(
+            JsonNode event, List<ModelPort.ModelEvent> effects) {
+        int outputIndex = requiredIndex(event, "output_index");
+        ReasoningAccumulator accumulator = reasoningFor(
+                requiredText(event, "item_id", false), outputIndex);
+        JsonNode part = requiredObject(event, "part");
+        accumulator.acceptSummaryPart(requiredIndex(event, "summary_index"), part);
+    }
+
+    /**
+     * 处理 part.done 携带的最终文本；兼容仅在 part.done 提供文本的网关实现。
+     */
+    private void reasoningSummaryPartDone(
+            JsonNode event, List<ModelPort.ModelEvent> effects) {
+        int outputIndex = requiredIndex(event, "output_index");
+        ReasoningAccumulator accumulator = reasoningFor(
+                requiredText(event, "item_id", false), outputIndex);
+        int summaryIndex = requiredIndex(event, "summary_index");
+        JsonNode part = event.get("part");
+        String text = part != null && part.isObject()
+                ? optionalText(part, "text") : optionalText(event, "text");
+        if (text != null) accumulator.finishSummary(summaryIndex, text);
+        queuePublicReasoning(outputIndex, accumulator, effects);
+    }
+
+    /**
+     * 接纳兼容接口公开的 reasoning_text 增量；其 canonical candidate 与 summary 共用展示账本。
+     */
+    private void reasoningTextDelta(
+            JsonNode event, List<ModelPort.ModelEvent> effects) {
+        int outputIndex = requiredIndex(event, "output_index");
+        ReasoningAccumulator accumulator = reasoningFor(
+                requiredText(event, "item_id", false), outputIndex);
+        accumulator.appendReasoningText(requiredText(event, "delta", true));
+        queuePublicReasoning(outputIndex, accumulator, effects);
+    }
+
+    /**
+     * 用 reasoning_text.done 补齐兼容端遗漏的增量，但不把同一段内容和 summary 重复展示。
+     */
+    private void reasoningTextDone(
+            JsonNode event, List<ModelPort.ModelEvent> effects) {
+        int outputIndex = requiredIndex(event, "output_index");
+        ReasoningAccumulator accumulator = reasoningFor(
+                requiredText(event, "item_id", false), outputIndex);
+        String text = requiredText(event, "text", true);
+        accumulator.finishReasoningText(text);
+        queuePublicReasoning(outputIndex, accumulator, effects);
+    }
+
+    /**
+     * 把 summary/公开 reasoning text 的 canonical candidate 只追加未展示后缀，并保持段落分隔。
+     */
+    private void queuePublicReasoning(
+            int outputIndex, ReasoningAccumulator accumulator,
+            List<ModelPort.ModelEvent> immediateEffects) {
+        String suffix = accumulator.nextPublicSuffix();
+        if (!suffix.isEmpty()) {
+            ModelPort.ReasoningSummaryDelta effect = new ModelPort.ReasoningSummaryDelta(suffix);
+            if (outputIndex < nextOutputIndex) immediateEffects.add(effect);
+            else queueEffect(outputIndex, effect);
+        }
+    }
+
+    /**
+     * 以 item id 关联交错事件，并拒绝同一原生 item 改写 output_index。
+     */
+    private ReasoningAccumulator reasoningFor(String itemId, int outputIndex) {
+        ReasoningAccumulator accumulator = reasoning.get(itemId);
+        if (accumulator == null) {
+            accumulator = new ReasoningAccumulator(itemId, outputIndex);
+            reasoning.put(itemId, accumulator);
+        } else if (accumulator.outputIndex() != outputIndex) {
+            throw protocol("OpenAI reasoning item changed output index");
+        }
+        observeIndex(outputIndex);
+        return accumulator;
+    }
+
+    /**
+     * 在 response.completed/incomplete 的权威 output 中回补完整 reasoning item 和 summary。
+     */
+    private void reconcileTerminalReasoning(
+            JsonNode item, int outputIndex, List<ModelPort.ModelEvent> immediateEffects) {
+        String itemId = requiredText(item, "id", false);
+        ReasoningAccumulator accumulator = reasoningFor(itemId, outputIndex);
+        accumulator.acceptTerminal(item);
+        JsonNode summary = item.get("summary");
+        if (summary != null && !summary.isNull()) {
+            if (!summary.isArray()) throw protocol("OpenAI reasoning summary is invalid");
+            for (int summaryIndex = 0; summaryIndex < summary.size(); summaryIndex++) {
+                JsonNode part = summary.get(summaryIndex);
+                if (!part.isObject() || !"summary_text".equals(requiredText(part, "type", false))) {
+                    throw protocol("OpenAI reasoning summary part is invalid");
+                }
+                accumulator.finishSummary(summaryIndex, requiredText(part, "text", true));
+            }
+        }
+        queuePublicReasoning(outputIndex, accumulator, immediateEffects);
+        ModelPort.ModelEvent blockEffect = accumulator.terminalBlockEffect();
+        if (blockEffect != null) {
+            if (outputIndex < nextOutputIndex) immediateEffects.add(blockEffect);
+            else queueEffect(outputIndex, blockEffect);
+        }
+        completeIndex(outputIndex);
+    }
+
+    /**
+     * 标记一个 output slot 已出现；缺失的前序 slot会在 terminal output 中创建后再释放后续事件。
+     */
+    private void observeIndex(int outputIndex) {
+        if (outputIndex < nextOutputIndex) return;
+        itemSlots.computeIfAbsent(outputIndex, ignored -> new ItemSlot()).seen = true;
+    }
+
+    /**
+     * 关闭 output slot，只有前序 slot 已关闭时才允许 effects 越过顺序屏障。
+     */
+    private void completeIndex(int outputIndex) {
+        if (outputIndex < nextOutputIndex) return;
+        observeIndex(outputIndex);
+        itemSlots.get(outputIndex).complete = true;
+    }
+
+    /**
+     * 将文本、摘要或 Tool 事件绑定到其 output_index，避免 terminal 回补把事件插到错误 item 后面。
+     */
+    private void queueEffect(int outputIndex, ModelPort.ModelEvent effect) {
+        observeIndex(outputIndex);
+        pendingEffects.computeIfAbsent(outputIndex, ignored -> new ArrayList<>()).add(effect);
+    }
+
+    /**
+     * 仅释放当前连续 item 的待提交事件；未出现的前序 item 会阻止后续事件提前可见。
+     */
+    private List<ModelPort.ModelEvent> flushOrderedEffects() {
+        List<ModelPort.ModelEvent> effects = new ArrayList<>();
+        while (true) {
+            ItemSlot slot = itemSlots.get(nextOutputIndex);
+            if (slot == null) break;
+            List<ModelPort.ModelEvent> pending = pendingEffects.remove(nextOutputIndex);
+            if (pending != null) effects.addAll(pending);
+            if (!slot.complete) break;
+            itemSlots.remove(nextOutputIndex++);
+        }
+        return effects;
+    }
+
+    /**
+     * 记录 output slot 的显式条目状态；文本事件没有 output_item.added 时仍可在 done 处关闭 slot。
+     */
+    private static final class ItemSlot {
+        private boolean seen;
+        private boolean explicitItem;
+        private boolean complete;
+
+        /** 返回是否收到 output_item.added，决定 text.done 能否独立关闭该 slot。 */
+        boolean explicitItem() {
+            return explicitItem;
+        }
+    }
+
+    /**
+     * 以稳定坐标累积 Responses reasoning summary 与原生 item，并把展示文本和 opaque 历史严格分开。
+     */
+    private final class ReasoningAccumulator {
+        private final String itemId;
+        private final int outputIndex;
+        private final Map<Integer, StringBuilder> summaryParts = new TreeMap<>();
+        private final StringBuilder reasoningText = new StringBuilder();
+        private String publicDisplayed = "";
+        private DisplaySource displaySource = DisplaySource.UNSELECTED;
+        private JsonNode nativeItem;
+        private boolean summaryObserved;
+        private boolean emitted;
+        private ReasoningContent emittedContent;
+
+        /** 绑定上游 item 身份与 output 顺序，防止交错事件串到其它 reasoning 块。 */
+        private ReasoningAccumulator(String itemId, int outputIndex) {
+            this.itemId = itemId;
+            this.outputIndex = outputIndex;
+        }
+
+        /** 登记 output_item.added 的初始原生对象，但不把未关闭 encrypted 状态写入历史。 */
+        private void acceptAdded(JsonNode item) {
+            if (nativeItem != null && !nativeItem.equals(item)) {
+                throw protocol("OpenAI reasoning item metadata changed");
+            }
+            nativeItem = item.deepCopy();
+        }
+
+        /** 接受 output_item.done 的完整对象，并复用其 summary 作为无 delta 时的回补来源。 */
+        private void acceptDone(JsonNode item) {
+            nativeItem = item.deepCopy();
+            acceptSummaryArray(item.get("summary"));
+        }
+
+        /** 用 response terminal output 覆盖早期不完整对象，确保 encrypted_content 只在完整时持久化。 */
+        private void acceptTerminal(JsonNode item) {
+            nativeItem = item.deepCopy();
+            acceptSummaryArray(item.get("summary"));
+        }
+
+        /** 累积一个 summary_text delta，段落编号只由外层严格索引校验后传入。 */
+        private void appendSummary(int summaryIndex, String value) {
+            summaryObserved = true;
+            summaryParts.computeIfAbsent(summaryIndex, ignored -> new StringBuilder()).append(value);
+        }
+
+        /** 用 done/terminal 的最终 part 文本补齐缺失 delta，禁止非前缀的内容篡改。 */
+        private void finishSummary(int summaryIndex, String value) {
+            summaryObserved = true;
+            StringBuilder current = summaryParts.computeIfAbsent(summaryIndex, ignored -> new StringBuilder());
+            String existing = current.toString();
+            if (existing.equals(value)) return;
+            if (existing.isEmpty()) {
+                current.append(value);
+            } else if (value.startsWith(existing)) {
+                current.append(value.substring(existing.length()));
+            } else {
+                throw protocol("OpenAI reasoning summary disagrees with its deltas");
+            }
+        }
+
+        /** 登记 summary part 的类型和可选初始文本，保留多 part 段落结构。 */
+        private void acceptSummaryPart(int summaryIndex, JsonNode part) {
+            if (!"summary_text".equals(requiredText(part, "type", false))) {
+                throw protocol("OpenAI reasoning summary part type is invalid");
+            }
+            summaryObserved = true;
+            String text = optionalText(part, "text");
+            if (text != null && !text.isEmpty()) {
+                summaryParts.computeIfAbsent(summaryIndex, ignored -> new StringBuilder()).append(text);
+            }
+        }
+
+        /** 收集兼容网关的公开 reasoning_text，后续与 summary 共用展示去重账本。 */
+        private void appendReasoningText(String value) {
+            if ((long) reasoningText.length() + value.length() > 4_000_000L) {
+                throw new ProviderProtocolException(
+                        "REASONING_LIMIT", "OpenAI reasoning exceeds the limit", false);
+            }
+            reasoningText.append(value);
+        }
+
+        /** 用 reasoning_text.done 补齐缺失分片，并拒绝内容回退或篡改。 */
+        private void finishReasoningText(String value) {
+            String existing = reasoningText.toString();
+            if (existing.equals(value)) return;
+            if (existing.isEmpty()) {
+                reasoningText.append(value);
+            } else if (value.startsWith(existing)) {
+                reasoningText.append(value.substring(existing.length()));
+            } else {
+                throw protocol("OpenAI reasoning text disagrees with its deltas");
+            }
+        }
+
+        /** 从完整 reasoning item 中回补全部 summary part，encrypted_content 不参与公开展示。 */
+        private void acceptSummaryArray(JsonNode summary) {
+            if (summary == null || summary.isNull()) return;
+            if (!summary.isArray()) throw protocol("OpenAI reasoning summary is invalid");
+            for (int index = 0; index < summary.size(); index++) {
+                JsonNode part = summary.get(index);
+                if (!part.isObject() || !"summary_text".equals(requiredText(part, "type", false))) {
+                    throw protocol("OpenAI reasoning summary part is invalid");
+                }
+                finishSummary(index, requiredText(part, "text", true));
+            }
+        }
+
+        /** 首个非空公开通道即成为该 item 的稳定展示来源，避免另一通道迟到时重复拼接。 */
+        private String nextPublicSuffix() {
+            String summary = summaryText();
+            if (displaySource == DisplaySource.UNSELECTED) {
+                if (!summary.isEmpty()) displaySource = DisplaySource.SUMMARY;
+                else if (!reasoningText.isEmpty()) displaySource = DisplaySource.REASONING_TEXT;
+                else return "";
+            }
+            String candidate = displaySource == DisplaySource.SUMMARY
+                    ? summary : reasoningText.toString();
+            if (candidate.isEmpty()) return "";
+            if (candidate.startsWith(publicDisplayed)) {
+                String suffix = candidate.substring(publicDisplayed.length());
+                publicDisplayed = candidate;
+                return suffix;
+            }
+            if (publicDisplayed.startsWith(candidate)) return "";
+            throw protocol("OpenAI reasoning display source regressed");
+        }
+
+        /** 将多个 summary part 拼接成带段落分隔的公开文本，避免 part 边界被 UI 吞掉。 */
+        private String summaryText() {
+            StringBuilder result = new StringBuilder();
+            for (StringBuilder part : summaryParts.values()) {
+                if (part.isEmpty()) continue;
+                if (!result.isEmpty()) result.append("\n\n");
+                result.append(part);
+            }
+            return result.toString();
+        }
+
+        /** 只有 Provider 返回非空 encrypted_content 时才允许把 reasoning 当作可回放历史。 */
+        private boolean readyForHistory() {
+            if (nativeItem == null || !nativeItem.isObject()
+                    || !"reasoning".equals(nativeItem.path("type").textValue())
+                    || !itemId.equals(nativeItem.path("id").textValue())) {
+                return false;
+            }
+            JsonNode encrypted = nativeItem.get("encrypted_content");
+            return encrypted != null && encrypted.isTextual() && !encrypted.textValue().isEmpty();
+        }
+
+        /** 将完整原生 item 封装为 identity-bound ReasoningBlockReady，不把 JSON 投影到 UI。 */
+        private ModelPort.ReasoningBlockReady block() {
+            if (nativeItem == null || !nativeItem.isObject()
+                    || !"reasoning".equals(nativeItem.path("type").textValue())
+                    || !itemId.equals(nativeItem.path("id").textValue())) {
+                throw protocol("OpenAI reasoning item is incomplete");
+            }
+            try {
+                String nativeJson = AbstractStreamingModelAdapter.JSON.writeValueAsString(nativeItem);
+                ReasoningContent content = ProviderReasoningSupport.capture(
+                        configuration, "reasoning", nativeJson);
+                return new ModelPort.ReasoningBlockReady(content);
+            } catch (com.fasterxml.jackson.core.JsonProcessingException | RuntimeException failure) {
+                if (failure instanceof ProviderProtocolException protocol) throw protocol;
+                throw new ProviderProtocolException(
+                        "PROVIDER_JSON", "OpenAI reasoning item could not be captured", false);
+            }
+        }
+
+        /**
+         * 首次发布完整 reasoning block 并记录其 identity-bound 内容，供 terminal 对账识别原位更新。
+         * replacement 不能重新追加 block，否则会改变 assistant content 顺序并产生重复历史。
+         */
+        private ModelPort.ReasoningBlockReady emitBlock() {
+            ModelPort.ReasoningBlockReady block = block();
+            if (emitted) throw protocol("OpenAI reasoning block was emitted twice");
+            emitted = true;
+            emittedContent = block.content();
+            return block;
+        }
+
+        /**
+         * terminal output 到达后生成一次性 block 或原位 replacement；未变化时不产生噪声事件。
+         */
+        private ModelPort.ModelEvent terminalBlockEffect() {
+            // Responses 的 terminal item 可能只有公开 summary。此时它不能覆盖此前有效的
+            // opaque block，也不能凭空创建一个下一轮无法被 Provider 接受的 reasoning input。
+            if (!readyForHistory()) return null;
+            ModelPort.ReasoningBlockReady terminalBlock = block();
+            if (!emitted) {
+                emitted = true;
+                emittedContent = terminalBlock.content();
+                return terminalBlock;
+            }
+            if (emittedContent.equals(terminalBlock.content())) return null;
+            ModelPort.ReasoningBlockReplaced replacement =
+                    new ModelPort.ReasoningBlockReplaced(emittedContent, terminalBlock.content());
+            emittedContent = terminalBlock.content();
+            return replacement;
+        }
+
+        /** 返回 item 在 output 中的稳定坐标，供外层顺序屏障校验。 */
+        private int outputIndex() {
+            return outputIndex;
+        }
+
+    }
+
+    /** 公开 reasoning 只从一个上游通道投影，防止 summary 和兼容全文重复展示。 */
+    private enum DisplaySource {
+        /** 尚未收到可展示的 reasoning 摘要或兼容文本，等待首个非空来源锁定。 */
+        UNSELECTED,
+        /** 已锁定 Provider 的公开 summary 通道，后续只追加该通道的增量。 */
+        SUMMARY,
+        /** 已锁定兼容 reasoning_text 通道，忽略迟到的另一公开来源以避免重复。 */
+        REASONING_TEXT
     }
 
     /**

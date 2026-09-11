@@ -35,8 +35,9 @@ pub(crate) trait RuntimeControlPort: Send + Sync {
     fn create_supervisor(
         &self,
         config: &LaunchConfig,
+        host_generation: u64,
     ) -> Result<SidecarSupervisor, RuntimeCommandError> {
-        SidecarSupervisor::new(config.sidecar.clone())
+        SidecarSupervisor::new_with_host_generation(config.sidecar.clone(), host_generation)
             .map_err(|error| RuntimeCommandError::from_process(&error))
     }
 

@@ -83,7 +83,8 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn("goal/plan/detach", methods)
         self.assertIn("plan/create", methods)
         self.assertIn("plan/draft/save", methods)
-        self.assertIn("plan/approve", methods)
+        self.assertNotIn("plan/approve", methods)
+        self.assertIn("interaction/respond", methods)
         self.assertIn("plan/execute", methods)
         self.assertIn("attachment/import", methods)
         self.assertIn("attachment/preview/open", methods)
@@ -94,7 +95,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn("turn/change-set/read", methods)
         self.assertNotIn("turn/change-preview/open", methods)
         self.assertNotIn("turn/change-set/commit", methods)
-        self.assertEqual(78, len(methods))
+        self.assertEqual(len(golden_params["capabilities"]["methods"]), len(methods))
         self.assertEqual(len(methods), len(set(methods)))
         self.assertIn("context/compaction-started", params["capabilities"]["events"])
         self.assertIn("context/compaction-failed", params["capabilities"]["events"])
@@ -102,11 +103,13 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn("task/activity", params["capabilities"]["events"])
         self.assertIn("goal/changed", params["capabilities"]["events"])
         self.assertIn("goal/activity", params["capabilities"]["events"])
-        self.assertIn("goal/input-requested", params["capabilities"]["events"])
+        self.assertNotIn("goal/input-requested", params["capabilities"]["events"])
+        self.assertIn("interaction/changed", params["capabilities"]["events"])
+        self.assertIn("plan/changed", params["capabilities"]["events"])
         self.assertNotIn("turn/change-preview-updated", params["capabilities"]["events"])
         self.assertEqual(["default", "plan"], params["capabilities"]["collaborationModes"])
         self.assertEqual(
-            ["task_threads_v1", "plan_goal_v1"],
+            ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
             params["capabilities"]["features"],
         )
         self.assertEqual(["approval_required", "full_access"], params["capabilities"]["accessModes"])
@@ -116,7 +119,9 @@ class NativeSmokeV1Test(unittest.TestCase):
     def test_initialize_identity_requires_current_product_version(self) -> None:
         """真实 Native 门从根版本源校验 Kernel 身份，避免过期 sidecar 通过启动级探针。"""
 
-        result = {"runtime": {"engine": "ja-kernel", "engineVersion": "0.1.0"}}
+        result = {
+            "runtime": {"engine": "ja-kernel", "engineVersion": SMOKE.EXPECTED_ENGINE_VERSION}
+        }
         self.assertIs(result, SMOKE.require_initialize_identity(result, SMOKE.EXPECTED_ENGINE_VERSION))
         with self.assertRaisesRegex(RuntimeError, "expected Kernel engine version"):
             SMOKE.require_initialize_identity(
@@ -173,10 +178,11 @@ class NativeSmokeV1Test(unittest.TestCase):
         )
         self.assertEqual(["ja-app-server", "fixture.mjs"], command[:2])
         self.assertEqual(
-            ["--home-dir-base64", "--data-dir-base64", "--run-dir-base64", "--log-dir-base64"],
+            ["--home-dir-base64", "--data-dir-base64", "--run-dir-base64", "--log-dir-base64", "--ja-runtime-generation"],
             [argument.split("=", 1)[0] for argument in command[2:]],
         )
-        self.assertEqual(6, len(command))
+        self.assertEqual(7, len(command))
+        self.assertEqual("--ja-runtime-generation=1", command[-1])
 
     def test_emitted_requests_validate_against_the_current_v1_schema(self) -> None:
         """Checks the authoritative schema directly so handler-aligned builders cannot drift silently."""

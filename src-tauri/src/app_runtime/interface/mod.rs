@@ -5,6 +5,7 @@
 
 pub(crate) mod app_tray;
 pub(crate) mod configuration;
+pub(crate) mod desktop_preferences;
 pub(crate) mod event_projection;
 pub(crate) mod goal;
 pub(crate) mod history;

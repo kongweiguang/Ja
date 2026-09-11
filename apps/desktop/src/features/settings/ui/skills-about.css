@@ -1,0 +1,289 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+/* Skills 与关于页共享一套偏好页表面，直接消费设置页已有 token，避免颜色漂移。 */
+.ja-skill-groups,
+.ja-about-list,
+.ja-about-identity {
+  --surface-settings-group: var(--ja-surface-raised);
+  --surface-settings-control: var(--ja-control);
+  --border-settings-group: var(--ja-border);
+  --text-settings-primary: var(--ja-foreground);
+  --text-settings-secondary: var(--ja-foreground-muted);
+  --text-settings-tertiary: var(--ja-foreground-tertiary);
+  --accent-settings-primary: var(--ja-accent);
+  --focus-settings-ring: var(--ja-focus);
+  --ja-preference-radius: 14px;
+  --ja-preference-control-radius: 10px;
+}
+
+.ja-skill-groups {
+  display: grid;
+  gap: 14px;
+}
+
+.ja-skill-group {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-settings-group);
+  border-radius: var(--ja-preference-radius);
+  background: var(--surface-settings-group);
+}
+
+.ja-skill-group-heading {
+  min-height: 52px;
+  margin: 0;
+  padding: 12px 16px;
+  border: 0;
+  background: var(--surface-settings-group);
+}
+
+.ja-skill-group-heading .ja-settings-skill-source-title {
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.ja-skill-group .ja-skill-group-heading h3 {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.ja-skill-source-location {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground-tertiary);
+  font-family: var(--ja-font-mono);
+  font-size: var(--ja-text-caption-size);
+  opacity: 0.82;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-skill-group-heading .ja-settings-skill-count {
+  min-width: 22px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-control);
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.3;
+  text-align: center;
+}
+
+.ja-skill-empty-inline {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.35;
+}
+
+.ja-skill-list {
+  display: grid;
+}
+
+.ja-skill-card {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 64px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--ja-border);
+  background: var(--ja-surface-raised);
+  transition: background-color 140ms var(--ja-ease-native);
+}
+
+.ja-skill-card:hover {
+  background: var(--ja-control-hover);
+}
+
+.ja-skill-main {
+  min-width: 0;
+  gap: 10px;
+}
+
+.ja-skill-main > div {
+  gap: 3px;
+}
+
+.ja-skill-card .ja-skill-main h4 {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.ja-skill-main .ja-settings-file-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  color: var(--ja-accent);
+  background: color-mix(in srgb, var(--ja-accent) 11%, transparent);
+}
+
+.ja-skill-description {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.ja-skill-description.is-expanded {
+  display: block;
+  overflow: visible;
+}
+
+.ja-skill-description-toggle {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 1.5rem;
+  align-items: center;
+  gap: 3px;
+  margin-top: 2px;
+  padding: 1px 0;
+  border: 0;
+  border-radius: 5px;
+  color: var(--ja-accent);
+  background: transparent;
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  cursor: pointer;
+}
+
+.ja-skill-description-toggle:hover {
+  color: var(--ja-accent-hover);
+}
+
+.ja-skill-description-toggle:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-skill-description-toggle svg {
+  transition: transform 140ms var(--ja-ease-native);
+}
+
+.ja-skill-description-toggle svg.is-expanded {
+  transform: rotate(180deg);
+}
+
+.ja-skill-actions {
+  justify-content: flex-end;
+  padding-left: 16px;
+}
+
+.ja-about-identity {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 76px;
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-preference-radius);
+  background: var(--ja-surface-raised);
+}
+
+.ja-about-identity .ja-settings-about-mark {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  border: 1px solid color-mix(in srgb, var(--ja-accent) 20%, var(--ja-border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ja-accent) 10%, var(--ja-surface-raised));
+}
+
+.ja-about-identity .ja-settings-about-mark img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+}
+
+.ja-settings-about-identity.ja-about-identity h3 {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-heading-size);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.ja-settings-about-identity.ja-about-identity p {
+  margin-top: 4px;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.5;
+}
+
+.ja-about-list {
+  overflow: hidden;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-preference-radius);
+  background: var(--ja-surface-raised);
+}
+
+.ja-settings-about-list.ja-about-list .ja-settings-about-row {
+  min-height: 64px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--ja-border);
+}
+
+.ja-settings-about-list.ja-about-list .ja-settings-about-row:last-child {
+  border-bottom: 0;
+}
+
+.ja-settings-about-list.ja-about-list .ja-settings-about-row-icon {
+  color: var(--ja-foreground-tertiary);
+}
+
+.ja-settings-about-list.ja-about-list .ja-settings-about-row-copy > strong {
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  font-weight: 600;
+}
+
+.ja-settings-about-list.ja-about-list .ja-settings-about-row-copy > span {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.45;
+}
+
+.ja-about-list .ja-settings-about-row-action .ja-button,
+.ja-about-list .ja-settings-about-update-actions .ja-button {
+  min-height: var(--ja-control-height-compact);
+  border-radius: var(--ja-preference-control-radius);
+}
+
+.ja-about-list .ja-settings-update-status {
+  margin-right: 6px;
+  font-weight: 600;
+}
+
+@media (max-width: 620px) {
+  .ja-skill-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 13px 14px;
+  }
+
+  .ja-skill-actions {
+    padding-left: 10px;
+  }
+
+  .ja-about-identity {
+    align-items: flex-start;
+  }
+
+  .ja-about-list .ja-settings-about-row {
+    padding: 12px 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-skill-card,
+  .ja-skill-description-toggle svg {
+    transition: none;
+  }
+}

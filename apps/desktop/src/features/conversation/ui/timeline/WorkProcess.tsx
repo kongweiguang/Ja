@@ -16,6 +16,7 @@ import {
 } from "../approval/ApprovalCard";
 import type { TimelineApproval as ApprovalSummary } from "../../domain/timelineTypes";
 import {
+  isReasoningItem,
   itemDurationMs,
   turnDurationMs,
   workStepLabel,
@@ -110,7 +111,7 @@ function processStatusLabel(state: WorkProcessState): string {
     case "waiting":
       return "等待确认";
     case "suspended":
-      return "运行被中断";
+      return "已暂停";
     case "completed":
       return "已完成";
     case "failed":
@@ -196,16 +197,22 @@ function presentedStepStatusLabel(step: WorkStepAdapter): string {
 }
 
 /**
- * Detail 只渲染 Commentary Text 与显式 Item Summary。Item Kind 已在 Protocol 边界列入 Allowlist，
- * 因此 Hidden Reasoning Record 不能借由兜底展示通道进入组件。
+ * Detail 只渲染公开 Commentary/Reasoning Text 与显式 Item Summary。Item Kind 已在 Protocol
+ * 边界列入 Allowlist，因此 Hidden Reasoning Record 不能借由兜底展示通道进入组件；公开
+ * reasoning 已由 App Server 做有界投影，不能在这里再次截断，否则用户展开后仍会静默丢正文。
  */
 function stepDetail(step: WorkStepAdapter): string | undefined {
   const summary = step.summary?.trim();
   // Tool/Command/File 文本可能含 Path、Argument 或 Provider Output；
-  // 只有 Commentary Text 与显式 Adapter Summary 可以安全渲染。
-  const text = summary || (step.kind === "commentary" ? step.text?.trim() : undefined);
+  // 只有公开 Commentary/Reasoning Text 与显式 Adapter Summary 可以安全渲染。
+  const text =
+    summary ||
+    (step.kind === "commentary" || isReasoningItem(step) ? step.text?.trim() : undefined);
   if (!text) {
     return undefined;
+  }
+  if (isReasoningItem(step)) {
+    return text;
   }
   return text.length > 2_048 ? `${text.slice(0, 2_048)}…` : text;
 }
@@ -240,11 +247,14 @@ export function WorkProcess({
   onReadToolArtifact,
   className,
 }: WorkProcessProps): ReactElement | null {
-  // 安全 Commentary 保留为无标签叙事；空摘要不创建占位行，Tool 继续承担可操作步骤身份。
+  // 安全 Commentary 与公开 Reasoning 保留为正文；空摘要不创建占位行，Tool 继续承担可操作步骤身份。
   const visibleSteps = steps.filter(
-    (step) => step.kind !== "commentary" || stepDetail(step) !== undefined,
+    (step) =>
+      (step.kind !== "commentary" && !isReasoningItem(step)) || stepDetail(step) !== undefined,
   );
-  const actionableSteps = visibleSteps.filter((step) => step.kind !== "commentary");
+  const actionableSteps = visibleSteps.filter(
+    (step) => step.kind !== "commentary" && !isReasoningItem(step),
+  );
   const approvalPending =
     turn?.status !== "suspended" &&
     approvals.some(
@@ -377,9 +387,30 @@ export function WorkProcess({
               <ol className="ja-work-process__steps">
                 {visibleSteps.map((step) => {
                   const detail = stepDetail(step);
+                  if (isReasoningItem(step) && detail !== undefined) {
+                    return (
+                      <li
+                        key={step.itemId}
+                        className="ja-work-step--reasoning"
+                        data-role="reasoning"
+                        aria-label="模型思考"
+                      >
+                        <MarkdownMessage
+                          content={detail}
+                          onOpenLink={onOpenLink}
+                          onCopyText={onCopyText}
+                        />
+                      </li>
+                    );
+                  }
                   if (step.kind === "commentary" && detail !== undefined) {
                     return (
-                      <li key={step.itemId} className="ja-work-step--commentary">
+                      <li
+                        key={step.itemId}
+                        className="ja-work-step--commentary"
+                        data-role="commentary"
+                        aria-label="助手进展"
+                      >
                         <MarkdownMessage
                           content={detail}
                           onOpenLink={onOpenLink}

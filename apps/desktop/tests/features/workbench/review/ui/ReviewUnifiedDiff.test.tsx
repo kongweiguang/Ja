@@ -11,8 +11,15 @@ import {
   type ReviewUnifiedDiffLine,
 } from "@/features/workbench/review/ui/ReviewUnifiedDiff";
 
+const uiFontSizeState = vi.hoisted(() => ({ value: 16 }));
+
+vi.mock("@/shared/hooks/useInterfacePreferencesValue", () => ({
+  useUiFontSize: () => uiFontSizeState.value,
+}));
+
 afterEach(() => {
   cleanup();
+  uiFontSizeState.value = 16;
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -402,5 +409,23 @@ describe("ReviewUnifiedDiff", () => {
     expect(viewport).not.toBeNull();
     fireEvent.scroll(viewport!, { target: { scrollTop: 4_000 } });
     expect(container.querySelectorAll(".ja-review-unified-diff-row").length).toBeLessThan(150);
+  });
+
+  it("界面字号变化时同步虚拟 Diff 行高，避免 CSS 行盒与滚动偏移不一致", async () => {
+    const file: ReviewUnifiedDiffFile = {
+      path: "scaled.ts",
+      lines: [{ kind: "addition", oldLine: null, newLine: 1, text: "const scaled = true;" }],
+    };
+    const rendered = render(<ReviewUnifiedDiff file={file} revision="scaled" />);
+    const { container } = rendered;
+    const spacer = container.querySelector<HTMLElement>(".ja-review-unified-diff-spacer");
+    expect(spacer).not.toBeNull();
+    const defaultHeight = Number.parseFloat(spacer!.style.height);
+
+    uiFontSizeState.value = 18;
+    rendered.rerender(<ReviewUnifiedDiff file={file} revision="scaled" />);
+    await waitFor(() =>
+      expect(Number.parseFloat(spacer!.style.height)).toBeCloseTo((defaultHeight * 18) / 16, 4),
+    );
   });
 });

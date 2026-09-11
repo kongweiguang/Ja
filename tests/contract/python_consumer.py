@@ -33,7 +33,7 @@ GOAL_VALID = GOLDEN / "v1" / "valid" / "plan-goals.jsonl"
 GOAL_INVALID = GOLDEN / "v1" / "invalid" / "plan-goals.jsonl"
 GOAL_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "plan-goal-results.jsonl"
 RESULT_DEFS = {
-    "thread/list": "threadPageResult",
+    "thread/list": "threadListResult",
     "thread/search": "threadPageResult",
     "thread/rename": "threadResult",
     "thread/preferences/update": "threadResult",
@@ -55,10 +55,11 @@ RESULT_DEFS = {
     "task/observe": "taskObserveResult",
     "task/unobserve": "taskAcceptedResult",
     "task/seen": "taskMutationResult",
-    "task/message/send": "taskMessageResult",
+    "thread/message/send": "taskMessageResult",
     "task/followup": "taskFollowupResult",
     "task/cancel": "taskMutationResult",
     "task/tree/delete": "taskTreeDeleteResult",
+    "task/close": "taskCloseResult",
     "goal/read": "goalProjectionResult",
     "goal/events/read": "goalEventsResult",
     "goal/observe": "goalObserveResult",
@@ -72,13 +73,24 @@ RESULT_DEFS = {
     "goal/pause": "goalProjectionResult",
     "goal/resume": "goalProjectionResult",
     "goal/stop": "goalProjectionResult",
-    "goal/input/respond": "goalProjectionResult",
     "plan/create": "planProjection",
     "plan/draft/save": "planProjection",
     "plan/draft/discard": "planProjection",
     "plan/propose": "planProjection",
-    "plan/approve": "planProjection",
     "plan/execute": "planProjection",
+    "interaction/read": "interactionSnapshot",
+    "interaction/observe": "interactionObserveResult",
+    "interaction/unobserve": "interactionAcceptedResult",
+    "interaction/draft/save": "interactionSnapshot",
+    "interaction/respond": "interactionSnapshot",
+    "interaction/cancel": "interactionSnapshot",
+    "plan/observe": "planObserveResult",
+    "plan/unobserve": "taskAcceptedResult",
+    "plan/events/read": "planEventsResult",
+    "plan/evidence/list": "planEvidenceResult",
+    "plan/pause": "planProjection",
+    "plan/resume": "planProjection",
+    "plan/stop": "planProjection",
     "plan/reject": "planProjection",
 }
 INVALID_RESULT_DEFS = {
@@ -336,7 +348,7 @@ def validate_task_threads_contract(schema: dict[str, Any], root: Draft202012Vali
             require_valid(definition_validator(schema, RESULT_DEFS[correlated]), frame["result"], correlated)
     expected_methods = {
         "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
-        "task/message/send", "task/followup", "task/cancel", "task/tree/delete",
+        "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
     }
     expected_events = {"task/activity", "task/progress", "task/mailbox-changed"}
     if observed_methods != expected_methods or observed_events != expected_events or pending:
@@ -386,11 +398,13 @@ def validate_plan_goal_contract(schema: dict[str, Any], root: Draft202012Validat
     expected_methods = {
         "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read",
         "plan/revisions/list", "goal/evidence/list", "goal/create", "goal/plan/attach",
-        "goal/plan/detach", "goal/pause", "goal/resume", "goal/stop", "goal/input/respond",
-        "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/approve",
-        "plan/execute", "plan/reject",
+        "goal/plan/detach", "goal/pause", "goal/resume", "goal/stop",
+        "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/execute",
+        "plan/observe", "plan/unobserve", "plan/events/read", "plan/evidence/list", "plan/pause",
+        "plan/resume", "plan/stop", "plan/reject", "interaction/read", "interaction/observe",
+        "interaction/unobserve", "interaction/draft/save", "interaction/respond", "interaction/cancel",
     }
-    expected_events = {"goal/changed", "goal/activity", "goal/input-requested"}
+    expected_events = {"goal/changed", "goal/activity", "interaction/changed", "plan/changed"}
     if observed_methods != expected_methods or observed_events != expected_events or pending:
         raise RuntimeError("plan goal corpus does not cover the exact v1 surface")
 

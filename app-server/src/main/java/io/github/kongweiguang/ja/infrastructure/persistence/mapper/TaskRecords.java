@@ -14,8 +14,12 @@ public final class TaskRecords {
     public record TurnCausalityRow(String threadId, String rootTurnId, String state,
                                    String cancelRequestedAt) { }
 
-    /** 通信路由把普通 root Thread 与 Child lineage 投影为统一根身份。 */
-    public record TaskRouteRow(String threadId, String rootThreadId, Integer depth) { }
+    /** 通信路由同时冻结发送方标题，并携带目标临时侧聊的关闭闸门状态。 */
+    public record TaskRouteRow(String threadId, String rootThreadId, Integer depth,
+                               String title, boolean closing) { }
+
+    /** 临时侧聊 marker 的最小 SQL 行形状；状态闭集在 repository 端口边界再次校验。 */
+    public record SideChatMarkerRow(String threadId, String state) { }
 
     /** 父取消事实与仍存活 ATTACHED 直接子 Turn 联结后的去重恢复行。 */
     public record CancellationPropagationRow(String parentThreadId, String parentTurnId) { }
@@ -57,12 +61,12 @@ public final class TaskRecords {
             String completedAt, String projectionUpdatedAt, String persistedThreadId,
             String threadDeletedAt) { }
 
-    /** Mailbox 的完整恢复行，idempotency key 只在 Java 内部使用而不进入 RPC。 */
+    /** Mailbox 的完整恢复行；senderTitle 是独立快照，sender/causal id 不依赖发送方 FK。 */
     public record MailboxRow(long mailboxSequence, String messageId, String rootThreadId,
-                             String senderThreadId, String targetThreadId, String causalTurnId,
-                             String kind, String contentJson, String idempotencyKey, String state,
-                             String boundTurnId, String createdAt, String updatedAt,
-                             String consumedAt) { }
+                             String senderThreadId, String senderTitle, String targetThreadId,
+                             String causalTurnId, String kind, String contentJson,
+                             String idempotencyKey, String state, String boundTurnId,
+                             String createdAt, String updatedAt, String consumedAt) { }
 
     /** 单目标 Mailbox 当前容量统计，UTF-8 bytes 由 SQLite BLOB 长度计算。 */
     public record MailboxStats(int pendingCount, long pendingBytes) { }
@@ -139,7 +143,7 @@ public final class TaskRecords {
 
     /** 终态集成按 Turn 找到 Child lineage 与当前 projection revision。 */
     public record TerminalTaskRow(String taskThreadId, String parentThreadId, String rootThreadId,
-                                  long taskRevision, String taskState) { }
+                                  String taskKind, long taskRevision, String taskState) { }
 
     /** Workspace FIFO 声明写入参数；fencing token 在同事务内由 Mapper 分配。 */
     public record WriteClaimInsert(String claimId, String workspaceId, String threadId,

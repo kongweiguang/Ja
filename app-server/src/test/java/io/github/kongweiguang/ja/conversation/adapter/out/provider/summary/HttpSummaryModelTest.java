@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.ModelAdapterF
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.support.ModelAdapterTestSupport;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -321,6 +322,29 @@ final class HttpSummaryModelTest {
         }
     }
 
+    /** 摘要模型只接收 reasoning 身份元数据，不能把签名或 encrypted_content 当作普通证据发送。 */
+    @Test
+    void summaryRedactsOpaqueReasoningPayload() throws Exception {
+        AtomicReference<String> requestBody = new AtomicReference<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
+            requestBody.set(new String(exchange.getRequestBody().readAllBytes(),
+                    java.nio.charset.StandardCharsets.UTF_8));
+            ModelAdapterTestSupport.sse(exchange, openAiSummary(DOCUMENT, new ModelUsage(12, 5, 17)), 7);
+        }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
+            ModelPort.ModelConfiguration configuration = configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
+
+            countedSummary(factory.bind(binding(configuration, CancellationToken.none())), promptWithReasoning());
+
+            JsonNode root = AbstractStreamingModelAdapter.JSON.readTree(requestBody.get());
+            String encoded = root.path("input").asText();
+            assertTrue(encoded.contains("\"type\":\"reasoning\""));
+            assertTrue(encoded.contains("\"wireField\":\"reasoning\""));
+            assertFalse(encoded.contains("encrypted_content"));
+            assertFalse(encoded.contains("opaque-secret"));
+        }
+    }
+
     /** 先执行纯本地保守估算再发送同一冻结提示，匹配生产 Summary 的预算准入顺序。 */
     private static SummaryGenerator.SummaryResult countedSummary(
             SummaryModel model, SummaryModel.SummaryPrompt prompt) {
@@ -344,6 +368,23 @@ final class HttpSummaryModelTest {
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of());
         ContextMessage message = ContextMessage.text(
                 "message-1", "turn-1", 1, ContextMessage.Role.USER, "source evidence", 4);
+        return new SummaryModel.SummaryPrompt(
+                "ja-context-summary-v1", "strategy-v1", "thread-1",
+                Optional.of(previous), List.of(message), Optional.empty(), 500, List.of());
+    }
+
+    /** 为摘要隔离测试加入一条含 opaque 载荷的历史块，验证只保留可公开身份字段。 */
+    private static SummaryModel.SummaryPrompt promptWithReasoning() {
+        SummaryDocument previous = new SummaryDocument(
+                List.of(new SummaryDocument.Fact("prior", 1)), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of());
+        ReasoningContent reasoning = new ReasoningContent(
+                "provider_test", "model_test", "openai_responses", "test-model",
+                ReasoningContent.endpointFingerprint(URI.create("https://provider.example/v1")), "reasoning",
+                "{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-secret\"}");
+        ContextMessage message = new ContextMessage("message-reasoning", "turn-1", 1,
+                ContextMessage.Role.ASSISTANT,
+                List.of(new ContextMessage.TextBlock("visible"), new ContextMessage.ReasoningBlock(reasoning)), 8);
         return new SummaryModel.SummaryPrompt(
                 "ja-context-summary-v1", "strategy-v1", "thread-1",
                 Optional.of(previous), List.of(message), Optional.empty(), 500, List.of());

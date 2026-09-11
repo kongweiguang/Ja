@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.goal.application;
 
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.Goal;
+import io.github.kongweiguang.ja.conversation.application.service.TurnService;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepository;
 import org.junit.jupiter.api.Test;
 
@@ -122,6 +123,31 @@ final class GoalContinuationCoordinatorTest {
         coordinator.close();
     }
 
+    /** 等待 Interaction 时只释放 Turn 运行资源，Goal lease 必须保留到回答后的原 Turn 终态。 */
+    @Test
+    void keepsLeaseWhileContinuationIsSuspended() {
+        FakeRepository repository = new FakeRepository();
+        CompletableFuture<Void> suspended = CompletableFuture.failedFuture(
+                new TurnService.PlanSuspendedException());
+        GoalContinuationCoordinator.ContinuationTurnPort turns = new GoalContinuationCoordinator.ContinuationTurnPort() {
+            /** fixture 始终模拟 owner idle。 */
+            @Override public boolean ownerIdle(String threadId) { return true; }
+            /** 以可恢复控制流异常模拟 request_user_input 后 Turn 的 SUSPENDED。 */
+            @Override public CompletionStage<Void> start(GoalContinuationCoordinator.ContinuationRequest request) {
+                return suspended;
+            }
+        };
+        GoalContinuationCoordinator coordinator = new GoalContinuationCoordinator(repository, turns,
+                Clock.fixed(NOW, ZoneOffset.UTC), 3);
+
+        CompletionStage<Void> completion = coordinator.continueIfEligible("goal_one").orElseThrow();
+
+        assertThrows(java.util.concurrent.CompletionException.class,
+                () -> completion.toCompletableFuture().join());
+        assertEquals(0, repository.releases.get());
+        coordinator.close();
+    }
+
     /**
      * 同步启动失败必须先把已获得的 lease 标为 abandoned 并清理 gate，再通过稳定内部异常上抛；
      * 否则后续恢复会被一个不存在的 Turn 永久阻塞。
@@ -211,6 +237,14 @@ final class GoalContinuationCoordinatorTest {
         @Override public GoalModels.Plan executePlan(ExecutePlan command) { throw unsupported(); }
         /** 未使用的 standalone settle 明确失败。 */
         @Override public GoalModels.Plan settlePlanExecution(SettlePlanExecution command) { throw unsupported(); }
+        /** coordinator 的 Plan observation 必须由真实仓储提供，Goal-only fake 不伪造空快照。 */
+        @Override public PlanObservation readPlanObservation(String planId) { throw unsupported(); }
+        /** coordinator 的 Plan turn admission 必须由真实仓储提供，Goal-only fake 不返回空资格。 */
+        @Override public Optional<PlanTurnClaim> claimPlanTurn(ClaimPlanTurn command) { throw unsupported(); }
+        /** 执行预算必须冻结，Goal-only fake 不接受隐式预算。 */
+        @Override public Optional<PlanRunBudget> readPlanRunBudget(String planId, String runId) { throw unsupported(); }
+        /** 验收边界必须由真实仓储 CAS，Goal-only fake 不伪造当前状态。 */
+        @Override public GoalModels.Plan beginPlanVerification(BeginPlanVerification command) { throw unsupported(); }
         /** 未使用的 reject 明确失败。 */
         @Override public GoalModels.Plan reject(RejectPlan command) { throw unsupported(); }
         /** 未使用的 Goal link 明确失败。 */
@@ -229,21 +263,36 @@ final class GoalContinuationCoordinatorTest {
         @Override public Goal requestEvaluation(RequestEvaluation command) { throw unsupported(); }
         /** 未使用的 evaluator settlement 明确失败。 */
         @Override public Goal completeEvaluation(CompleteEvaluation command) { throw unsupported(); }
-        /** 未使用的 input request 明确失败。 */
-        @Override public Goal requestInput(RequestInput command) { throw unsupported(); }
-        /** 未使用的 input response 明确失败。 */
-        @Override public Goal respondInput(RespondInput command) { throw unsupported(); }
+        /** evaluator 领取必须有真实持久事实，Goal-only fake 不返回空结果。 */
+        @Override public Optional<EvaluationIntent> claimRequestedEvaluation(String goalId, String runId) { throw unsupported(); }
+        /** 启动恢复必须读取真实 evaluator ledger，Goal-only fake 不伪造空列表。 */
+        @Override public List<EvaluationIntent> listUnsettledEvaluations(long generation, int limit) { throw unsupported(); }
+        /** evaluator 恢复必须更新真实状态，Goal-only fake 不伪造可恢复结果。 */
+        @Override public Optional<Goal> recoverEvaluation(EvaluationIntent intent, long generation, Instant at) { throw unsupported(); }
         /** 未使用的 Tool prepare 明确失败。 */
         @Override public GoalModels.ToolAttempt prepareToolAttempt(PrepareToolAttempt command) { throw unsupported(); }
         /** 未使用的 Tool start 明确失败。 */
         @Override public GoalModels.ToolAttempt startToolAttempt(String toolAttemptId, Instant at) { throw unsupported(); }
         /** 未使用的 Tool settle 明确失败。 */
         @Override public GoalModels.ToolAttempt settleToolAttempt(SettleToolAttempt command) { throw unsupported(); }
+        /** 启动恢复必须读取真实 lease ledger，Goal-only fake 不伪造空列表。 */
+        @Override public List<ContinuationLease> listHeldLeases(long generation, int limit) { throw unsupported(); }
+        /** 内部 Turn identity 必须来自真实持久上下文。 */
+        @Override public Optional<InternalTurnBinding> findInternalTurnBinding(String turnId) { throw unsupported(); }
+        /** Plan Turn identity 必须来自真实持久上下文。 */
+        @Override public Optional<InternalTurnBinding> findPlanTurnBinding(String planId, String runId) { throw unsupported(); }
         /** 未使用的恢复列表为空。 */
         @Override public List<GoalModels.ToolAttempt> listUnsettledToolAttempts(long generation, int limit) { return List.of(); }
         /** 未使用的 events 返回空页。 */
         @Override public ReadPage<Event> listEvents(String goalId, long afterSequence, int limit) {
             return new ReadPage<>(0, 0, List.of());
+        }
+        /** Plan 事件必须从真实事件流读取，Goal-only fake 不伪造空水位。 */
+        @Override public ReadPage<PlanEvent> listPlanEvents(String planId, long afterSequence, int limit) { throw unsupported(); }
+        /** Plan evidence 必须从真实账本读取，Goal-only fake 不伪造空证据。 */
+        @Override public List<GoalModels.Evidence> listPlanEvidence(String planId, String runId,
+                                                                      String planRevisionId, int limit) {
+            throw unsupported();
         }
         /** coordinator 只需要可选 Plan link；fake 返回同一 Goal revision 的无 Plan 快照。 */
         @Override public GoalModels.GoalSnapshot readSnapshot(String goalId) {
@@ -251,7 +300,7 @@ final class GoalContinuationCoordinatorTest {
             GoalModels.GoalDefinition definition = new GoalModels.GoalDefinition(
                     goal.goalId(), 1, goal.objective(), List.of(), NOW);
             return new GoalModels.GoalSnapshot(goal, definition, null, null,
-                    0, 0, null, null, null, null, null, 1);
+                    0, 0, null, null, null, null, 1);
         }
         /** 未使用的 Goal definition 明确失败。 */
         @Override public GoalModels.GoalDefinition readGoalDefinition(String goalId, long revision) { throw unsupported(); }
@@ -276,6 +325,8 @@ final class GoalContinuationCoordinatorTest {
         @Override public Optional<GoalModels.Plan> findExecutingPlanByOwner(String ownerThreadId) { return Optional.empty(); }
         /** 未使用的动态 Plan lookup 返回空。 */
         @Override public Optional<GoalModels.Plan> findActivePlanByOwner(String ownerThreadId) { return Optional.empty(); }
+        /** 本 fixture 仅验证 Goal 调度，明确不存在独立 Plan。 */
+        @Override public Optional<GoalModels.PlanSnapshot> findCurrentPlan(String ownerThreadId) { return Optional.empty(); }
         /** 未使用的 heartbeat 返回空。 */
         @Override public Optional<ContinuationLease> heartbeatLease(String goalId, String leaseId,
                                                                      long fencingToken, Instant at) { return Optional.empty(); }

@@ -115,6 +115,7 @@ final class TaskHandlerObservationTest {
                     unsupported(CatalogUseCase.class), unsupported(AttachmentUseCase.class),
                     unsupported(AttachmentPreviewUseCase.class), tasks.proxy(),
                     io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveGoals(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.passiveInteractions(),
                     new NoopLifecycle());
             Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-task-observation-test").toAbsolutePath();
             SidecarConfiguration sidecar = new SidecarConfiguration(root.resolve("home"), root.resolve("data"),

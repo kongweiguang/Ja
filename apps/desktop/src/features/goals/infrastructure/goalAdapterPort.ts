@@ -21,6 +21,7 @@ import type {
   PlanRevision,
   PlanSummary,
 } from "../domain/goalModel";
+import { planProgressFromRevision } from "../domain/goalModel";
 import type { GoalEvent, GoalPort } from "../application/ports";
 
 export interface GoalEventSource {
@@ -177,12 +178,15 @@ function planModelFromWire(
   projection: PlanProjection,
   evaluation: WireEvaluation | null = null,
 ): PlanReadModel {
+  const revision =
+    projection.currentRevision === null
+      ? null
+      : revisionFromWire(projection.currentRevision, projection, evaluation);
   return {
     plan: planSummaryFromWire(projection),
-    revision:
-      projection.currentRevision === null
-        ? null
-        : revisionFromWire(projection.currentRevision, projection, evaluation),
+    progress: planProgressFromRevision(revision),
+    revision,
+    revisionHydrationRequired: false,
     draft: projection.draft === null ? null : draftFromWire(projection.draft),
     approvedPlanRevisionId: projection.approval?.planRevisionId ?? null,
     eventSequence: projection.eventSequence,
@@ -233,14 +237,6 @@ function goalModelFromWire(result: GoalMutationResult, linkedPlan?: PlanProjecti
     planEventSequence: planModel?.eventSequence,
     plan: planModel?.revision ?? null,
     draft: planModel?.draft ?? null,
-    inputRequest:
-      result.goal.pendingInput === null
-        ? null
-        : {
-            requestId: result.goal.pendingInput.inputRequestId,
-            prompt: result.goal.pendingInput.prompt,
-            expiresAt: result.goal.pendingInput.expiresAt,
-          },
     evaluation,
   };
 }
@@ -270,6 +266,20 @@ export function createGoalPort(adapter: GoalAdapter, events: GoalEventSource): G
     read: async ({ goalId }) => goalModelFromWire(await adapter.read({ goalId })),
     readPlan: async ({ ownerThreadId, planId }) =>
       planModelFromWire(await adapter.planRead({ threadId: ownerThreadId, planId })),
+    currentPlan: async (ownerThreadId) => {
+      const result = await adapter.currentPlanRead({ threadId: ownerThreadId });
+      return result.current === null ? undefined : planModelFromWire(result.current);
+    },
+    observePlan: async ({ ownerThreadId, planId }) => {
+      const result = await adapter.observePlan({ threadId: ownerThreadId, planId });
+      return {
+        observationId: result.observationId,
+        plan: planModelFromWire(result),
+      };
+    },
+    unobservePlan: async ({ observationId }) => {
+      await adapter.unobservePlan({ observationId });
+    },
     observe: async ({ goalId }) => {
       const result = await adapter.observe({ goalId });
       return { observationId: result.observationId, goalRevision: result.goal.revision };
@@ -311,11 +321,30 @@ export function createGoalPort(adapter: GoalAdapter, events: GoalEventSource): G
       });
       return { items: result.items.map(evidenceFromWire) };
     },
-    create: async ({ ownerThreadId, objective, expectedGoalRevision, idempotencyKey }) => {
+    readPlanEvidence: async ({ ownerThreadId, planId, planRevisionId, runId }) => {
+      const result = await adapter.planEvidenceList({
+        threadId: ownerThreadId,
+        planId,
+        planRevisionId,
+        runId,
+        limit: 200,
+      });
+      return { items: result.items.map(evidenceFromWire) };
+    },
+    create: async ({
+      ownerThreadId,
+      ownerKind,
+      objective,
+      expectedGoalRevision,
+      idempotencyKey,
+    }) => {
       if (expectedGoalRevision !== 0) throw new Error("goal create revision must be zero");
       return goalModelFromWire(
         await adapter.create({
-          owner: { kind: "thread", threadId: ownerThreadId },
+          owner:
+            ownerKind === "independent_task"
+              ? { kind: "independent_task", taskThreadId: ownerThreadId }
+              : { kind: "thread", threadId: ownerThreadId },
           objective,
           acceptanceCriteria: [],
           expectedGoalRevision,
@@ -337,8 +366,6 @@ export function createGoalPort(adapter: GoalAdapter, events: GoalEventSource): G
     pause: async (input) => goalModelFromWire(await adapter.pause(input)),
     resume: async (input) => goalModelFromWire(await adapter.resume(input)),
     stop: async (input) => goalModelFromWire(await adapter.stop(input)),
-    respondInput: async ({ requestId, ...input }) =>
-      goalModelFromWire(await adapter.inputRespond({ ...input, inputRequestId: requestId })),
     saveDraft: async ({ ownerThreadId, planId, expectedPlanRevision, draft, idempotencyKey }) =>
       planModelFromWire(
         await adapter.draftSave({
@@ -353,10 +380,14 @@ export function createGoalPort(adapter: GoalAdapter, events: GoalEventSource): G
       planModelFromWire(await adapter.draftDiscard({ threadId: ownerThreadId, ...input })),
     propose: async ({ ownerThreadId, ...input }) =>
       planModelFromWire(await adapter.propose({ threadId: ownerThreadId, ...input })),
-    approve: async ({ ownerThreadId, ...input }) =>
-      planModelFromWire(await adapter.approve({ threadId: ownerThreadId, ...input })),
     execute: async ({ ownerThreadId, ...input }) =>
       planModelFromWire(await adapter.execute({ threadId: ownerThreadId, ...input })),
+    pausePlan: async ({ ownerThreadId, ...input }) =>
+      planModelFromWire(await adapter.pausePlan({ threadId: ownerThreadId, ...input })),
+    resumePlan: async ({ ownerThreadId, ...input }) =>
+      planModelFromWire(await adapter.resumePlan({ threadId: ownerThreadId, ...input })),
+    stopPlan: async ({ ownerThreadId, ...input }) =>
+      planModelFromWire(await adapter.stopPlan({ threadId: ownerThreadId, ...input })),
     reject: async ({ ownerThreadId, ...input }) =>
       planModelFromWire(
         await adapter.reject({

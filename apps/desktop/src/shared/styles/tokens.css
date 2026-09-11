@@ -3,7 +3,7 @@
 
 /*
  * 主题目录只拥有色彩气质；字体、密度、圆角、动效和组件语言保持跨 Palette 稳定。
- * 八套色板均由 root 语义角色完整解析，避免组件补默认色或在热切换时短暂串色。
+ * 所有色板均由 root 语义角色完整解析，避免组件补默认色或在热切换时短暂串色。
  */
 :root {
   color-scheme: light;
@@ -19,6 +19,8 @@
   letter-spacing: 0;
   --ja-font-mono:
     "Cascadia Code", "Cascadia Mono", "SF Mono", "SFMono-Regular", Consolas, monospace;
+  --ja-ui-font-size: 16px;
+  --ja-code-font-size: 13px;
 
   /* Codex 平衡密度刻意使用小型字号阶梯；Caption 是有意义 UI 文案的下限，
    * editor 与 Terminal 内容保留各自 mono 尺寸契约。 */
@@ -215,8 +217,8 @@
   color-scheme: light;
 }
 
-/* Fleet Light：紫色只承担交互重点，紧凑科技感不改变 Ja 的组件语言。 */
-:root[data-theme="light"][data-palette="fleet"] {
+/* Ja Light：紫色只承担交互重点，紧凑科技感不改变 Ja 的组件语言。 */
+:root[data-theme="light"][data-palette="ja"] {
   --ja-background: #f2f2f2;
   --ja-content: #ffffff;
   --ja-surface: #f8f8f9;
@@ -295,6 +297,88 @@
   --ja-terminal-ansi-bright-magenta: #d7a9ff;
   --ja-terminal-ansi-bright-cyan: #b0f4ff;
   --ja-terminal-ansi-bright-white: #ffffff;
+}
+
+/* JetBrains Islands Light：官方灰阶与蓝色映射到 Ja 语义角色；保留实色工作面。 */
+:root[data-theme="light"][data-palette="jetbrains"] {
+  --ja-background: #e9eaee;
+  --ja-content: #ffffff;
+  --ja-surface: #f7f8f9;
+  --ja-surface-raised: #ffffff;
+  --ja-surface-muted: #dddfe4;
+  --ja-control: #ffffff;
+  --ja-control-hover: #e9eaee;
+  --ja-control-active: #dddfe4;
+  --ja-selected: #d0dffe;
+  --ja-titlebar: #e9eaee;
+  --ja-sidebar: #e9eaee;
+  --ja-inspector: #ffffff;
+  --ja-editor-background: #ffffff;
+  --ja-floating: #ffffff;
+  --ja-composer: #ffffff;
+  --ja-menu: #ffffff;
+  --ja-dialog: #f7f8f9;
+  --ja-command-overlay: rgb(25 26 28 / 44%);
+  --ja-modal-overlay: rgb(25 26 28 / 30%);
+  --ja-navigation-overlay: rgb(25 26 28 / 38%);
+  --ja-glass: #f7f8f9;
+  --ja-glass-strong: #ffffff;
+  --ja-glass-border: #d1d3d9;
+  --ja-border: #d1d3d9;
+  --ja-border-strong: #b5b7bd;
+  --ja-foreground: #000000;
+  --ja-foreground-muted: #5f6269;
+  --ja-foreground-tertiary: #73767c;
+  --ja-accent: #3871e1;
+  --ja-accent-emphasis: #3871e1;
+  --ja-accent-hover: #2f5eb9;
+  --ja-accent-soft: #e3ebfe;
+  --ja-on-accent: #ffffff;
+  --ja-accent-foreground: #ffffff;
+  --ja-focus: #2f5eb9;
+  --ja-syntax-plain: #080808;
+  --ja-syntax-comment: #5f6269;
+  --ja-syntax-keyword: #0033b3;
+  --ja-syntax-type: #336ecc;
+  --ja-syntax-attribute: #9e880d;
+  --ja-syntax-symbol: #00627a;
+  --ja-syntax-property: #871094;
+  --ja-syntax-string: #067d17;
+  --ja-syntax-number: #1750eb;
+  --ja-syntax-url: #2f5eb9;
+  --ja-diff-inserted: rgb(127 199 132 / 20%);
+  --ja-diff-deleted: rgb(228 101 110 / 16%);
+  --ja-diff-changed: rgb(136 173 247 / 22%);
+  --ja-window-backdrop: #e9eaee;
+  --ja-window-surface: #ffffff;
+  --ja-window-surface-muted: #f7f8f9;
+  --ja-window-border: #d1d3d9;
+  --ja-shadow-sm: 0 1px 2px rgb(20 18 32 / 7%);
+  --ja-shadow-md: 0 10px 30px rgb(20 18 32 / 13%);
+  --ja-shadow-floating: 0 22px 65px rgb(14 12 28 / 21%), 0 4px 14px rgb(14 12 28 / 11%);
+  --ja-scrollbar-thumb: rgb(115 118 124 / 36%);
+  --ja-scrollbar-thumb-hover: rgb(95 98 105 / 58%);
+  --ja-scrollbar-thumb-active: rgb(64 67 74 / 72%);
+  --ja-terminal-background: #191a1c;
+  --ja-terminal-foreground: #bcbec4;
+  --ja-terminal-cursor: #d1d3d9;
+  --ja-terminal-selection: #2a4371;
+  --ja-terminal-ansi-black: #191a1c;
+  --ja-terminal-ansi-red: #e4656e;
+  --ja-terminal-ansi-green: #4e9d6c;
+  --ja-terminal-ansi-yellow: #c28013;
+  --ja-terminal-ansi-blue: #538af9;
+  --ja-terminal-ansi-magenta: #967bef;
+  --ja-terminal-ansi-cyan: #4b9b93;
+  --ja-terminal-ansi-white: #d1d3d9;
+  --ja-terminal-ansi-bright-black: #8b8e94;
+  --ja-terminal-ansi-bright-red: #f57e84;
+  --ja-terminal-ansi-bright-green: #6db083;
+  --ja-terminal-ansi-bright-yellow: #e4ad5f;
+  --ja-terminal-ansi-bright-blue: #71a1fe;
+  --ja-terminal-ansi-bright-magenta: #a894f6;
+  --ja-terminal-ansi-bright-cyan: #6aaea6;
+  --ja-terminal-ansi-bright-white: #f7f8f9;
 }
 
 /* Obsidian Light：柔和紫色与安静实色内容面服务长时间知识工作。 */
@@ -572,8 +656,8 @@
   --ja-terminal-invalid: #ff453a;
 }
 
-/* Fleet Dark：深黑基础上用紫青点亮选中和代码语义，避免大面积霓虹。 */
-:root[data-theme="dark"][data-palette="fleet"] {
+/* Ja Dark：深黑基础上用紫青点亮选中和代码语义，避免大面积霓虹。 */
+:root[data-theme="dark"][data-palette="ja"] {
   --ja-background: #090909;
   --ja-content: #18191b;
   --ja-surface: #111214;
@@ -652,6 +736,88 @@
   --ja-terminal-ansi-bright-magenta: #d7a9ff;
   --ja-terminal-ansi-bright-cyan: #b0f4ff;
   --ja-terminal-ansi-bright-white: #ffffff;
+}
+
+/* JetBrains Islands Dark：官方 Islands 层级与代码色；次要文本按 Ja 对比度要求提亮。 */
+:root[data-theme="dark"][data-palette="jetbrains"] {
+  --ja-background: #26282c;
+  --ja-content: #191a1c;
+  --ja-surface: #212326;
+  --ja-surface-raised: #26282c;
+  --ja-surface-muted: #33353b;
+  --ja-control: #191a1c;
+  --ja-control-hover: #33353b;
+  --ja-control-active: #40434a;
+  --ja-selected: #2a4371;
+  --ja-titlebar: #26282c;
+  --ja-sidebar: #26282c;
+  --ja-inspector: #191a1c;
+  --ja-editor-background: #191a1c;
+  --ja-floating: #26282c;
+  --ja-composer: #26282c;
+  --ja-menu: #26282c;
+  --ja-dialog: #191a1c;
+  --ja-command-overlay: rgb(0 0 0 / 60%);
+  --ja-modal-overlay: rgb(0 0 0 / 50%);
+  --ja-navigation-overlay: rgb(0 0 0 / 56%);
+  --ja-glass: #212326;
+  --ja-glass-strong: #26282c;
+  --ja-glass-border: #40434a;
+  --ja-border: #33353b;
+  --ja-border-strong: #40434a;
+  --ja-foreground: #d1d3d9;
+  --ja-foreground-muted: #9fa2a8;
+  --ja-foreground-tertiary: #8b8e94;
+  --ja-accent: #3871e1;
+  --ja-accent-emphasis: #3871e1;
+  --ja-accent-hover: #538af9;
+  --ja-accent-soft: #233558;
+  --ja-on-accent: #ffffff;
+  --ja-accent-foreground: #ffffff;
+  --ja-focus: #71a1fe;
+  --ja-syntax-plain: #bcbec4;
+  --ja-syntax-comment: #8b8e94;
+  --ja-syntax-keyword: #cf8e6d;
+  --ja-syntax-type: #bcbec4;
+  --ja-syntax-attribute: #b3ae60;
+  --ja-syntax-symbol: #56a8f5;
+  --ja-syntax-property: #c77dbb;
+  --ja-syntax-string: #6aab73;
+  --ja-syntax-number: #2aacb8;
+  --ja-syntax-url: #71a1fe;
+  --ja-diff-inserted: rgb(78 157 108 / 20%);
+  --ja-diff-deleted: rgb(228 101 110 / 20%);
+  --ja-diff-changed: rgb(83 138 249 / 20%);
+  --ja-window-backdrop: #26282c;
+  --ja-window-surface: #191a1c;
+  --ja-window-surface-muted: #212326;
+  --ja-window-border: #33353b;
+  --ja-shadow-sm: 0 1px 2px rgb(0 0 0 / 30%);
+  --ja-shadow-md: 0 12px 32px rgb(0 0 0 / 42%);
+  --ja-shadow-floating: 0 24px 70px rgb(0 0 0 / 58%), 0 4px 16px rgb(0 0 0 / 38%);
+  --ja-scrollbar-thumb: rgb(139 142 148 / 43%);
+  --ja-scrollbar-thumb-hover: rgb(159 162 168 / 64%);
+  --ja-scrollbar-thumb-active: rgb(209 211 217 / 76%);
+  --ja-terminal-background: #191a1c;
+  --ja-terminal-foreground: #bcbec4;
+  --ja-terminal-cursor: #d1d3d9;
+  --ja-terminal-selection: #2a4371;
+  --ja-terminal-ansi-black: #191a1c;
+  --ja-terminal-ansi-red: #e4656e;
+  --ja-terminal-ansi-green: #4e9d6c;
+  --ja-terminal-ansi-yellow: #c28013;
+  --ja-terminal-ansi-blue: #538af9;
+  --ja-terminal-ansi-magenta: #967bef;
+  --ja-terminal-ansi-cyan: #4b9b93;
+  --ja-terminal-ansi-white: #d1d3d9;
+  --ja-terminal-ansi-bright-black: #8b8e94;
+  --ja-terminal-ansi-bright-red: #f57e84;
+  --ja-terminal-ansi-bright-green: #6db083;
+  --ja-terminal-ansi-bright-yellow: #e4ad5f;
+  --ja-terminal-ansi-bright-blue: #71a1fe;
+  --ja-terminal-ansi-bright-magenta: #a894f6;
+  --ja-terminal-ansi-bright-cyan: #6aaea6;
+  --ja-terminal-ansi-bright-white: #f7f8f9;
 }
 
 /* Obsidian Dark：中性炭灰稳定阅读，紫色只用于动作、选中和焦点。 */

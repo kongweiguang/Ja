@@ -159,14 +159,14 @@ fn valid_initialize_result() -> Value {
         "serverInstanceId": "srv_fixture",
         "runtime": {
             "engine": "ja-kernel",
-            "engineVersion": "0.1.0"
+            "engineVersion": "0.1.1"
         },
         "capabilities": {
             "methods": [],
             "events": [],
             "accessModes": ["approval_required", "full_access"],
             "collaborationModes": ["default", "plan"],
-            "features": ["task_threads_v1", "plan_goal_v1"]
+            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"]
         },
         "limits": Limits::default().to_value()
     })
@@ -255,7 +255,7 @@ fn real_child_invalid_ready_tokens_return_handshake_failed() {
         let script = r#"
 param([string]$Mode)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
     $businessRequests = 0
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
@@ -349,7 +349,7 @@ fn real_child_shutdown_retries_retained_owner_after_reap_timeout() {
     let script_path = fixture_dir.path.join("retry-shutdown.ps1");
     let script = r#"
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -463,7 +463,7 @@ fn real_child_handshake_concurrency_and_job_cleanup() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + "`n")
     $stdout = [Console]::OpenStandardOutput()
@@ -594,7 +594,7 @@ fn real_child_stdout_eof_kills_tree_without_event_consumer() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + "`n")
     $stdout = [Console]::OpenStandardOutput()
@@ -697,7 +697,7 @@ fn real_child_blocked_stdin_watchdog_joins_and_reaps_tree() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.0"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
+    $init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()

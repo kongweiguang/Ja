@@ -39,6 +39,9 @@ public interface RecoveryMapper {
     /** 精确读取 Tool 游标当前 ordinal，不扫描历史推断位置。 */
     PersistenceRecords.ToolRow selectRecoveryTool(String turnId, int ordinal);
 
+    /** 只有已原子落库的 request_user_input 才允许恢复时保留 RUNNING Tool 游标。 */
+    boolean hasPendingInteraction(String turnId, String callId);
+
     /** 启动恢复关闭当前 batch 的未结算 Tool，禁止任何副作用分类在 Resume 时被重放。 */
     int failUnsettledTool(String turnId, String callId, String occurredAt);
 

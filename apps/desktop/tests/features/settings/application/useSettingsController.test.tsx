@@ -22,7 +22,9 @@ const DOCUMENT: SettingsDocument = {
   revision: 1,
   theme: "system",
   defaultAccessMode: "full_access",
+  clarificationEnabled: true,
   defaultSelection: { providerId: "provider_one", modelId: "model_one", reasoningLevel: "high" },
+  subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
   providers: [
     {
       providerId: "provider_one",
@@ -915,6 +917,56 @@ describe("useSettingsController v1", () => {
     expect(userDocument.defaultSelection?.reasoningLevel).toBe("low");
   });
 
+  it("saves multiple models together and reconciles root reasoning without losing identities", async () => {
+    let userDocument = structuredClone(DOCUMENT);
+    const save = vi.fn(async (next: SettingsDocument) => {
+      userDocument = structuredClone(next);
+      return "cfg_next";
+    });
+    const snapshot = vi.fn(
+      async (): Promise<LoadedSettings> => ({
+        document: structuredClone(userDocument),
+        userDocument: structuredClone(userDocument),
+        projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
+        cas: {
+          userVersion: "cfg_user",
+          projectVersion: "cfg_missing",
+          credentialVersion: "cfg_auth",
+        },
+      }),
+    );
+    const { result } = renderController(snapshot, save);
+    await waitFor(() => expect(result.current.snapshot.providers).toHaveLength(1));
+    const provider = structuredClone(userDocument.providers[0]!);
+    const model = provider.models[0]!;
+    provider.models = [
+      { ...model, reasoningLevelMap: { low: "low" }, defaultReasoningLevel: "low" },
+      { ...model, modelId: "model_two", model: "custom-second", name: "Second" },
+    ];
+    await act(async () => result.current.ports.onSaveProvider(provider));
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(userDocument.providers[0]?.models.map((item) => item.modelId)).toEqual([
+      "model_one",
+      "model_two",
+    ]);
+    expect(userDocument.defaultSelection).toEqual({
+      providerId: "provider_one",
+      modelId: "model_one",
+      reasoningLevel: "low",
+    });
+    expect(userDocument.providers[0]?.credentialConfigured).toBe(true);
+    expect(userDocument.providers[0]?.agentDefaults).toEqual(DOCUMENT.providers[0]?.agentDefaults);
+    await act(async () => {
+      await expect(
+        result.current.ports.onSaveProvider({
+          ...provider,
+          models: [provider.models[1]!],
+        }),
+      ).rejects.toThrow("replacement model is required");
+    });
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps project-effective conversation settings while every settings write targets user CAS", async () => {
     let loaded = loadedSettings("Project B");
     loaded.userDocument.providers[0]!.name = "Global A";
@@ -1002,5 +1054,123 @@ describe("useSettingsController v1", () => {
     expect(save).toHaveBeenCalledTimes(4);
     expect(patch).not.toHaveBeenCalled();
     expect(reset).not.toHaveBeenCalled();
+  });
+
+  /** 子智能体策略复用用户 CAS，并拒绝不存在的模型引用，避免删除模型后静默改派。 */
+  it("saves user-scoped subagent settings only for known models", async () => {
+    const save = vi.fn(async () => "cfg_subagents");
+    const snapshot = vi.fn(async () => credentialSnapshot(true, "cfg_auth"));
+    const { result } = renderController(snapshot, save);
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+
+    await act(async () => {
+      await result.current.ports.onSubagentSettingsChange({
+        enabled: false,
+        providerId: "provider_one",
+        modelId: "model_one",
+        reasoningLevel: null,
+      });
+    });
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subagents: {
+          enabled: false,
+          providerId: "provider_one",
+          modelId: "model_one",
+          reasoningLevel: null,
+        },
+      }),
+      "cfg_user",
+    );
+
+    await expect(
+      result.current.ports.onSubagentSettingsChange({
+        enabled: true,
+        providerId: "provider_one",
+        modelId: "model_missing",
+        reasoningLevel: null,
+      }),
+    ).rejects.toThrow("subagent model unavailable");
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires supported reasoning levels and clears invalid levels after model edits", async () => {
+    let userDocument = structuredClone(DOCUMENT);
+    const save = vi.fn(async (next: SettingsDocument) => {
+      userDocument = structuredClone(next);
+      return "cfg_subagents";
+    });
+    const snapshot = vi.fn(
+      async (): Promise<LoadedSettings> => ({
+        document: structuredClone(userDocument),
+        userDocument: structuredClone(userDocument),
+        projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
+        cas: {
+          userVersion: "cfg_user",
+          projectVersion: "cfg_missing",
+          credentialVersion: "cfg_auth",
+        },
+      }),
+    );
+    const { result } = renderController(snapshot, save);
+    await waitFor(() => expect(result.current.snapshot.providers).toHaveLength(1));
+
+    await act(async () =>
+      result.current.ports.onSubagentSettingsChange({
+        enabled: true,
+        providerId: "provider_one",
+        modelId: "model_one",
+        reasoningLevel: "high",
+      }),
+    );
+    expect(userDocument.subagents.reasoningLevel).toBe("high");
+    await expect(
+      result.current.ports.onSubagentSettingsChange({
+        enabled: true,
+        providerId: "provider_one",
+        modelId: "model_one",
+        reasoningLevel: "medium",
+      }),
+    ).rejects.toThrow("subagent reasoning level unavailable");
+    await expect(
+      result.current.ports.onSubagentSettingsChange({
+        enabled: true,
+        providerId: null,
+        modelId: null,
+        reasoningLevel: "high",
+      }),
+    ).rejects.toThrow("subagent reasoning level requires model");
+
+    await act(async () =>
+      result.current.ports.onSaveModel("provider_one", {
+        ...structuredClone(userDocument.providers[0]!.models[0]!),
+        reasoningLevelMap: { low: "low" },
+        defaultReasoningLevel: "low",
+      }),
+    );
+    expect(userDocument.subagents.reasoningLevel).toBeNull();
+  });
+
+  /** 被全局子智能体策略引用的 Provider 只能在先改策略后删除，不能生成悬空引用。 */
+  it("does not delete a Provider referenced by the subagent policy", async () => {
+    const loaded = credentialSnapshot(true, "cfg_auth");
+    loaded.userDocument.subagents = {
+      enabled: true,
+      providerId: "provider_one",
+      modelId: "model_one",
+      reasoningLevel: null,
+    };
+    loaded.document.subagents = structuredClone(loaded.userDocument.subagents);
+    const save = vi.fn(async () => "cfg_unused");
+    const { result } = renderController(
+      vi.fn(async () => loaded),
+      save,
+    );
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+
+    await expect(result.current.ports.onDeleteProvider("provider_one", null)).rejects.toThrow(
+      "subagent model replacement is required",
+    );
+    expect(save).not.toHaveBeenCalled();
   });
 });

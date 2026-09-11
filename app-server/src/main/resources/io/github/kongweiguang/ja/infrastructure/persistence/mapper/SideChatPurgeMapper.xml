@@ -1,0 +1,849 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatPurgeMapper">
+    <!-- Every mapper method below contains exactly one SQL statement. The Java caller snapshots all
+         IDs before the first delete, so no delete re-expands thread_lineage after it starts. -->
+
+    <select id="countClosingRoot" resultType="int">
+        SELECT COUNT(*)
+        FROM temporary_side_chats c
+        JOIN threads t ON t.thread_id=c.thread_id
+        WHERE c.thread_id=#{rootThreadId}
+          AND c.state='CLOSING'
+          AND t.deleted_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM thread_lineage l
+              WHERE l.child_thread_id=c.thread_id
+                AND l.task_kind='SIDE_TASK' AND l.lifecycle='INDEPENDENT'
+          )
+    </select>
+
+    <select id="selectPurgeThreadIds" resultType="string">
+        WITH RECURSIVE tree(thread_id,depth) AS (
+            SELECT thread_id,0
+            FROM temporary_side_chats
+            WHERE thread_id=#{rootThreadId} AND state='CLOSING'
+            UNION ALL
+            SELECT l.child_thread_id,t.depth+1
+            FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        SELECT thread_id FROM tree ORDER BY depth,thread_id
+    </select>
+
+    <insert id="markPurgeThreadsClosing">
+        INSERT INTO temporary_side_chats(thread_id,state)
+        SELECT thread_id,'CLOSING' FROM threads
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ON CONFLICT(thread_id) DO UPDATE SET state='CLOSING'
+    </insert>
+
+    <select id="countNonTerminalTurns" resultType="int">
+        SELECT COUNT(*) FROM turns
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR (thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            AND state NOT IN ('COMPLETED','FAILED','CANCELLED'))
+        </if>
+    </select>
+
+    <select id="selectPurgeTurnIds" resultType="string">
+        SELECT turn_id FROM turns
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY turn_sequence
+    </select>
+
+    <select id="selectPurgeGoalIds" resultType="string">
+        SELECT goal_id FROM goals
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR owner_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY goal_id
+    </select>
+
+    <select id="selectPurgePlanIds" resultType="string">
+        SELECT plan_id FROM plans
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR owner_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY plan_id
+    </select>
+
+    <select id="selectPurgeRunIds" resultType="string">
+        SELECT run_id FROM execution_runs
+        <where>
+            0
+            <if test="goalIds != null and goalIds.size() > 0">
+                OR goal_id IN
+                <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+            </if>
+            <if test="planIds != null and planIds.size() > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+        </where>
+        ORDER BY run_id
+    </select>
+
+    <select id="selectPurgeSeedIds" resultType="string">
+        SELECT context_seed_id FROM thread_lineage
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR child_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY context_seed_id
+    </select>
+
+    <select id="selectPurgePlanRevisionIds" resultType="string">
+        SELECT plan_revision_id FROM plan_revisions
+        WHERE 0
+        <if test="planIds != null and planIds.size() > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+        ORDER BY plan_revision_id
+    </select>
+
+    <delete id="deleteMessageAttachments">
+        DELETE FROM message_attachments
+        WHERE message_id IN (
+            SELECT message_id FROM messages
+            WHERE 0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+        )
+    </delete>
+
+    <delete id="deletePendingInputAttachments">
+        DELETE FROM pending_input_attachments
+        WHERE input_id IN (
+            SELECT input_id FROM pending_inputs
+            <where>
+                0
+                <if test="threadIds != null and threadIds.size() > 0">
+                    OR thread_id IN
+                    <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                </if>
+                <if test="turnIds != null and turnIds.size() > 0">
+                    OR turn_id IN
+                    <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+                </if>
+            </where>
+        )
+    </delete>
+
+    <select id="selectPurgeAttachmentIds" resultType="string">
+        SELECT attachment_id FROM message_attachments
+        WHERE message_id IN (
+            SELECT message_id FROM messages
+            <where>
+                0
+                <if test="threadIds != null and threadIds.size() > 0">
+                    OR thread_id IN
+                    <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                </if>
+            </where>
+        )
+        UNION
+        SELECT attachment_id FROM pending_input_attachments
+        WHERE input_id IN (
+            SELECT input_id FROM pending_inputs
+            <where>
+                0
+                <if test="threadIds != null and threadIds.size() > 0">
+                    OR thread_id IN
+                    <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                </if>
+                <if test="turnIds != null and turnIds.size() > 0">
+                    OR turn_id IN
+                    <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+                </if>
+            </where>
+        )
+        ORDER BY attachment_id
+    </select>
+
+    <update id="discardPurgeAttachments">
+        UPDATE attachments
+        SET status='DISCARDED', discarded_at=#{discardedAt}, blob_sha256=NULL, bound_at=NULL
+        WHERE 0
+        <if test="attachmentIds != null and attachmentIds.size() > 0">
+            OR (
+                status IN ('DRAFT','BOUND')
+                AND attachment_id IN
+                <foreach item="attachmentId" collection="attachmentIds" open="(" separator="," close=")">#{attachmentId}</foreach>
+                AND NOT EXISTS (
+                    SELECT 1 FROM message_attachments ma WHERE ma.attachment_id=attachments.attachment_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM pending_input_attachments pia WHERE pia.attachment_id=attachments.attachment_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM task_context_seeds s, json_each(s.references_json) ref
+                    WHERE json_extract(ref.value,'$.kind')='attachment'
+                      AND json_extract(ref.value,'$.attachmentId')=attachments.attachment_id
+                )
+            )
+        </if>
+    </update>
+
+    <delete id="deleteInteractionDrafts">
+        DELETE FROM interaction_drafts
+        WHERE request_id IN (
+            SELECT request_id FROM interaction_requests
+            <where>
+                0
+                <if test="threadIds != null and threadIds.size() > 0">
+                    OR thread_id IN
+                    <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                </if>
+                <if test="turnIds != null and turnIds.size() > 0">
+                    OR turn_id IN
+                    <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+                </if>
+                <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                    OR plan_revision_id IN
+                    <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+                </if>
+                <if test="runIds != null and runIds.size() > 0">
+                    OR run_id IN
+                    <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+                </if>
+                <if test="goalIds != null and goalIds.size() > 0">
+                    OR goal_id IN
+                    <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+                </if>
+            </where>
+        )
+    </delete>
+
+    <delete id="deleteInteractionEvents">
+        DELETE FROM interaction_events
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            OR request_id IN (
+                SELECT request_id FROM interaction_requests
+                <where>
+                    0
+                    <if test="threadIds != null and threadIds.size() > 0">
+                        OR thread_id IN
+                        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                    </if>
+                    <if test="turnIds != null and turnIds.size() > 0">
+                        OR turn_id IN
+                        <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+                    </if>
+                    <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                        OR plan_revision_id IN
+                        <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+                    </if>
+                    <if test="runIds != null and runIds.size() > 0">
+                        OR run_id IN
+                        <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+                    </if>
+                    <if test="goalIds != null and goalIds.size() > 0">
+                        OR goal_id IN
+                        <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+                    </if>
+                </where>
+            )
+        </where>
+    </delete>
+
+    <delete id="deleteInteractionRequests">
+        DELETE FROM interaction_requests
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+            </if>
+            <if test="runIds != null and runIds.size() > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+            <if test="goalIds != null and goalIds.size() > 0">
+                OR goal_id IN
+                <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanEvaluationRequests">
+        DELETE FROM plan_evaluation_requests
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR owner_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="planIds != null and planIds.size() > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+            </if>
+            <if test="runIds != null and runIds.size() > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteGoalToolAttempts">
+        DELETE FROM goal_tool_attempts
+        <where>
+            0
+            <if test="goalIds != null and goalIds.size() > 0">
+                OR goal_id IN
+                <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+            </if>
+            <if test="runIds != null and runIds.size() > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteGoalEvaluations">
+        DELETE FROM goal_evaluations
+        <where>
+            0
+            <if test="goalIds != null and goalIds.size() > 0">
+                OR goal_id IN
+                <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+            </if>
+            <if test="runIds != null and runIds.size() > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteAcceptanceEvidence">
+        DELETE FROM acceptance_evidence
+        <where>
+            0
+            <if test="goalIds != null and goalIds.size() > 0">
+                OR goal_id IN
+                <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+            </if>
+            <if test="planIds != null and planIds.size() > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+            </if>
+            <if test="runIds != null and runIds.size() > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanStepExecutions">
+        DELETE FROM plan_step_executions
+        <where>
+            0
+            <if test="runIds != null and runIds.size() > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanTurnClaims">
+        DELETE FROM plan_turn_claims
+        WHERE 0
+        <if test="runIds != null and runIds.size() > 0">
+            OR run_id IN
+            <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteGoalContinuationLeases">
+        DELETE FROM goal_continuation_leases
+        WHERE 0
+        <if test="goalIds != null and goalIds.size() > 0">
+            OR goal_id IN
+            <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteGoalEvents">
+        DELETE FROM goal_events
+        WHERE 0
+        <if test="goalIds != null and goalIds.size() > 0">
+            OR goal_id IN
+            <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanEvents">
+        DELETE FROM plan_events
+        WHERE 0
+        <if test="planIds != null and planIds.size() > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteGoalPlanLinks">
+        DELETE FROM goal_plan_links
+        <where>
+            0
+            <if test="goalIds != null and goalIds.size() > 0">
+                OR goal_id IN
+                <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+            </if>
+            <if test="planIds != null and planIds.size() > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanApprovals">
+        DELETE FROM plan_approvals
+        <where>
+            0
+            <if test="planIds != null and planIds.size() > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteExecutionRuns">
+        DELETE FROM execution_runs
+        WHERE 0
+        <if test="runIds != null and runIds.size() > 0">
+            OR run_id IN
+            <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteGoalAcceptanceCriteria">
+        DELETE FROM goal_acceptance_criteria
+        WHERE 0
+        <if test="goalIds != null and goalIds.size() > 0">
+            OR goal_id IN
+            <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteGoalDefinitionRevisions">
+        DELETE FROM goal_definition_revisions
+        WHERE 0
+        <if test="goalIds != null and goalIds.size() > 0">
+            OR goal_id IN
+            <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteGoals">
+        DELETE FROM goals
+        WHERE 0
+        <if test="goalIds != null and goalIds.size() > 0">
+            OR goal_id IN
+            <foreach item="goalId" collection="goalIds" open="(" separator="," close=")">#{goalId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanSteps">
+        DELETE FROM plan_steps
+        WHERE 0
+        <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+            OR plan_revision_id IN
+            <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteAcceptanceCriteria">
+        DELETE FROM acceptance_criteria
+        WHERE 0
+        <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+            OR plan_revision_id IN
+            <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanDrafts">
+        DELETE FROM plan_drafts
+        WHERE 0
+        <if test="planIds != null and planIds.size() > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanRevisions">
+        DELETE FROM plan_revisions
+        WHERE 0
+        <if test="planRevisionIds != null and planRevisionIds.size() > 0">
+            OR plan_revision_id IN
+            <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">#{planRevisionId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlans">
+        DELETE FROM plans
+        WHERE 0
+        <if test="planIds != null and planIds.size() > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteMessages">
+        DELETE FROM messages
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteContextCheckpoints">
+        DELETE FROM context_checkpoints
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteUsage">
+        DELETE FROM usage
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteToolBindings">
+        DELETE FROM tool_bindings
+        WHERE 0
+        <if test="turnIds != null and turnIds.size() > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteApprovals">
+        DELETE FROM approvals
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteToolArtifacts">
+        DELETE FROM tool_artifacts
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteTurnChangeSets">
+        DELETE FROM turn_change_sets
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteChangeSetArtifacts">
+        DELETE FROM change_set_artifacts
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteTimelineMessages">
+        DELETE FROM timeline_messages
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteThreadTitleGenerations">
+        DELETE FROM thread_title_generations
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteTurnExecution">
+        DELETE FROM turn_execution
+        WHERE 0
+        <if test="turnIds != null and turnIds.size() > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTurnInternalContext">
+        DELETE FROM turn_internal_context
+        WHERE 0
+        <if test="turnIds != null and turnIds.size() > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTools">
+        DELETE FROM tools
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePendingInputs">
+        DELETE FROM pending_inputs
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteLeafTurns">
+        DELETE FROM turns
+        WHERE 0
+        <if test="turnIds != null and turnIds.size() > 0">
+            OR (turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            AND NOT EXISTS (
+                SELECT 1 FROM turns child
+                WHERE child.turn_id&lt;&gt;turns.turn_id
+                  AND (child.parent_turn_id=turns.turn_id OR child.root_turn_id=turns.turn_id)
+            ))
+        </if>
+    </delete>
+
+    <delete id="deleteWorkspaceWriteClaims">
+        DELETE FROM workspace_write_claims
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteInboundMailbox">
+        DELETE FROM task_mailbox
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR target_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTaskProjections">
+        DELETE FROM task_projections
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR task_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            OR root_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTaskActivities">
+        DELETE FROM task_activities
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size() > 0">
+                OR root_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                OR task_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                OR actor_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size() > 0">
+                OR causal_turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteThreadInstructionScopes">
+        DELETE FROM thread_instruction_scopes
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteSubagentPolicies">
+        DELETE FROM thread_subagent_policies
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteLineage">
+        DELETE FROM thread_lineage
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR child_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteContextSeeds">
+        DELETE FROM task_context_seeds
+        WHERE 0
+        <if test="seedIds != null and seedIds.size() > 0">
+            OR context_seed_id IN
+            <foreach item="seedId" collection="seedIds" open="(" separator="," close=")">#{seedId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteThreads">
+        DELETE FROM threads
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteMarkers">
+        DELETE FROM temporary_side_chats
+        WHERE 0
+        <if test="threadIds != null and threadIds.size() > 0">
+            OR (thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            AND state='CLOSING')
+        </if>
+    </delete>
+</mapper>

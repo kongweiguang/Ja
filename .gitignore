@@ -86,14 +86,12 @@ release/
 *.userosscache
 *.sln.docstates
 
-# Updeng/Codex/Claude machine-local state. These paths are intentionally not
+# Updeng/Codex machine-local state. These paths are intentionally not
 # source documentation and must not leak local plans, prompts, or credentials.
 /.agents/
-/.claude/
 /.codex/
 /.updeng/
 /AGENTS.md
-/CLAUDE.md
 
 # A previously interpolated Windows environment token may create this literal machine-cache mirror.
 # Keep it out of Git and Turn baselines without deleting the user's recoverable files.
@@ -122,3 +120,14 @@ credentials.*
 /.codegraph
 
 .soloncode/
+
+# BEGIN UPDENG
+# @author kongweiguang
+/.agents/
+/.codex/
+/.updeng/
+/AGENTS.md
+.env
+.env.*
+!.env.example
+# END UPDENG

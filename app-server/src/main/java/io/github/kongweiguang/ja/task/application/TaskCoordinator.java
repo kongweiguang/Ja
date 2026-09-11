@@ -4,20 +4,24 @@
 package io.github.kongweiguang.ja.task.application;
 
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
+import io.github.kongweiguang.ja.conversation.domain.SubagentPolicy;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
 import io.github.kongweiguang.ja.conversation.domain.model.SkillReferenceContent;
-import io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock;
 import io.github.kongweiguang.ja.conversation.domain.model.WorkspaceReferenceContent;
+import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.domain.model.UserContentBlock;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.ChildTurnScheduler;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnCancellationListener;
+import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
+import io.github.kongweiguang.ja.conversation.port.out.SubagentPolicyRepository;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
@@ -39,6 +43,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +61,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Child Thread 的唯一应用层协调器；持久化、Turn 调度与 UI 观察通过窄端口组合而不建立第二运行时。
@@ -63,16 +69,37 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class TaskCoordinator implements TaskUseCase, TurnCancellationListener {
     private static final Logger LOGGER = LoggerFactory.getLogger(TaskCoordinator.class);
     private static final int MAX_TREE_TASKS = 64;
+    private static final Duration SIDE_CHAT_CLOSE_TIMEOUT = Duration.ofSeconds(10);
+    private static final long SIDE_CHAT_CLOSE_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+    /** Plan/Goal 的取消由其权威 owner 执行，Task 不能仅删除数据伪装异步运行已经结束。 */
+    @FunctionalInterface
+    public interface SideChatOwnerController {
+        /** 关闭前停止这些 Thread 的全部独立执行及 evaluator，失败必须向关闭调用方传播。 */
+        void stopOwners(Set<String> threadIds);
+    }
+
+    private static final SideChatOwnerController NO_SIDE_CHAT_OWNER_CONTROLLER = ignored -> {
+        throw new IllegalStateException("side chat execution owner is not bound");
+    };
     private final TaskRepository tasks;
     private final ThreadUseCase threads;
     private final TurnUseCase turns;
     private final ChildTurnScheduler scheduler;
     private final WorkspaceUseCase workspaces;
     private final Clock clock;
+    private final SubagentPolicyRepository subagentPolicies;
     private final AtomicReference<TaskEventSink> subscriber = new AtomicReference<>();
     private final Map<String, ObservationState> observations = new ConcurrentHashMap<>();
     private final Map<String, Waiter> waiters = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> acceptedTaskTurns = new ConcurrentHashMap<>();
+    private final Map<String, CompletableFuture<Void>> sideChatClosures = new ConcurrentHashMap<>();
+    private final Set<String> closingSideChats = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean shutdownRequested = new AtomicBoolean();
+    private final AtomicBoolean sideChatShutdownAttempted = new AtomicBoolean();
+    private final AtomicBoolean closeStarted = new AtomicBoolean();
+    private volatile RuntimeException sideChatShutdownFailure;
+    private final AtomicReference<SideChatOwnerController> sideChatOwnerController =
+            new AtomicReference<>(NO_SIDE_CHAT_OWNER_CONTROLLER);
     private final ScheduledExecutorService timeouts = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().daemon().name("ja-task-wait-timeout-", 0).factory());
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -80,8 +107,10 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     /**
      * TurnUseCase 与 ChildTurnScheduler 必须指向同一 TurnService，避免 Task 绕过普通取消和关闭闸门。
      */
+    /** 生产组合根注入冻结策略读取端口；没有策略 Owner 时禁止启动，避免默认放行。 */
     public TaskCoordinator(TaskRepository tasks, ThreadUseCase threads, TurnUseCase turns,
-                           ChildTurnScheduler scheduler, WorkspaceUseCase workspaces, Clock clock) {
+                           ChildTurnScheduler scheduler, WorkspaceUseCase workspaces, Clock clock,
+                           SubagentPolicyRepository subagentPolicies) {
         this.tasks = Objects.requireNonNull(tasks, "tasks");
         this.threads = Objects.requireNonNull(threads, "threads");
         this.turns = Objects.requireNonNull(turns, "turns");
@@ -89,20 +118,78 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         if (turns != scheduler) throw new IllegalArgumentException("Task scheduler must share Turn owner");
         this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.subagentPolicies = Objects.requireNonNull(subagentPolicies, "subagentPolicies");
     }
 
-    /** 创建时先冻结 parent revision 的真实有效上下文，admission 事务会再次校验该 revision。 */
+    /**
+     * 绑定 Goal/Plan owner 的停止协调器；采用一次性 late binding 打破 Task、Goal 与 Plan 组合环，
+     * 同时让单元测试可以继续使用不带 Goal/Plan 运行时的窄构造器。
+     */
+    public void bindSideChatOwnerController(SideChatOwnerController controller) {
+        Objects.requireNonNull(controller, "controller");
+        if (!sideChatOwnerController.compareAndSet(NO_SIDE_CHAT_OWNER_CONTROLLER, controller)) {
+            throw new IllegalStateException("side chat owner controller is already bound");
+        }
+    }
+
+    /**
+     * 供 Goal/Plan continuation adapter 在 admission 前检查临时生命周期闸门；关闭失败时保留该闸门，
+     * 使重试不会重新接纳一个已经取消的侧聊。
+     */
+    public boolean isSideChatClosing(String taskThreadId) {
+        Objects.requireNonNull(taskThreadId, "taskThreadId");
+        return closingSideChats.contains(taskThreadId);
+    }
+
+    /**
+     * 创建时先冻结 parent revision 的真实有效上下文，admission 事务会再次校验该 revision。
+     * admission 提交后通知失败不能改写已落库的创建结果，否则客户端会把通知故障误判为创建失败并重试。
+     */
     @Override
-    public StartResult createSideTask(CreateCommand command) {
+    public TaskModels.Summary createSideTask(CreateCommand command) {
         requireOpen();
         Objects.requireNonNull(command, "command");
         ThreadSummary parent = requireParent(command.parentThreadId(), command.expectedParentRevision());
         TaskModels.EffectiveContextSnapshot context = tasks.freezeEffectiveContext(
                 command.parentThreadId(), command.expectedParentRevision());
-        return startNew(command.parentThreadId(), command.parentTurnId(), command.taskName(), command.content(),
-                command.deadline(), parent, TaskModels.Kind.SIDE_TASK, TaskModels.Lifecycle.INDEPENDENT,
-                TaskModels.InheritanceMode.EFFECTIVE_CONTEXT, context.context(), context.references(),
-                context.permissionCeiling());
+        ThreadPreferences preferences = sideTaskPreferences(parent.preferences(), command.preferences());
+        Instant now = clock.instant();
+        String childThreadId = id("thr_task_");
+        TaskModels.ContextSeedDraft seed = new TaskModels.ContextSeedDraft(id("seed_"),
+                command.parentThreadId(), command.parentTurnId(), parent.revision(),
+                TaskModels.InheritanceMode.EFFECTIVE_CONTEXT, null, context.context(),
+                context.references(), accessCeiling(preferences.accessMode()), now);
+        ConversationRepository.ThreadDefinition childThread = new ConversationRepository.ThreadDefinition(
+                childThreadId, parent.workspaceId(), command.taskName(),
+                preferences.withTitleSource(ThreadPreferences.TitleSource.MANUAL), now);
+        TaskModels.ChildAdmission admission = new TaskModels.ChildAdmission(childThread,
+                command.parentThreadId(), parent.revision(), command.parentTurnId(), command.taskName(),
+                TaskModels.Kind.SIDE_TASK, TaskModels.Lifecycle.INDEPENDENT, seed, id("activity_"),
+                summary("已创建 " + command.taskName()));
+        TaskModels.Summary created = tasks.admitIdleChild(admission);
+        try {
+            publishLatest(created);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("event=task_activity_publish_failed task_thread_id={}",
+                    created.lineage().taskThreadId(), failure);
+        }
+        return created;
+    }
+
+    /** 用户侧边任务可独立选择完整执行偏好；titleSource 仍由服务端固定为人工来源。 */
+    private static ThreadPreferences sideTaskPreferences(ThreadPreferences parent,
+                                                         TaskUseCase.CreatePreferences override) {
+        Objects.requireNonNull(parent, "parent preferences");
+        if (override == null) return parent.withTitleSource(ThreadPreferences.TitleSource.MANUAL);
+        return new ThreadPreferences(override.providerId(), override.modelId(), override.reasoningLevel(),
+                override.accessMode(), override.collaborationMode(), ThreadPreferences.TitleSource.MANUAL);
+    }
+
+    /** Side Task 将用户本次选择记录进冻结 seed，供后续 Turn 解析其创建时执行偏好。 */
+    private static JsonObject accessCeiling(AccessMode accessMode) {
+        return JsonObjects.builder().putText("version", "task_access_v1")
+                .putText("accessMode", accessMode == AccessMode.APPROVAL_REQUIRED
+                        ? "approval_required" : "full_access").build();
     }
 
     /** Subagent 只保存 brief 与显式引用，运行偏好取创建它的父 Turn 冻结值而不是父 Thread 后续值。 */
@@ -110,6 +197,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     public StartResult spawnAgent(SpawnCommand command) {
         requireOpen();
         Objects.requireNonNull(command, "command");
+        requireSubagentsEnabled(command.parentThreadId());
         ThreadSummary parent = requireParent(command.parentThreadId(), null);
         parent = new ThreadSummary(parent.threadId(), parent.workspaceId(), parent.title(),
                 command.frozenPreferences(), parent.status(), parent.pinned(), parent.latestTurnStatus(),
@@ -119,6 +207,17 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 command.deadline(), parent, TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED,
                 TaskModels.InheritanceMode.BRIEF_ONLY, null, references(command.brief()),
                 command.capabilityCeiling());
+    }
+
+    /** Java Task 入口再次校验冻结策略，防止隐藏调用绕过 Tool 列表直接创建 Subagent。 */
+    private void requireSubagentsEnabled(String threadId) {
+        SubagentPolicy policy = subagentPolicies.find(threadId).orElseThrow(() ->
+                new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                        "subagent policy is unavailable"));
+        if (!policy.enabled()) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.PERMISSION_DENIED,
+                    "subagents are disabled for this Thread");
+        }
     }
 
     /** Child 创建严格遵循 reserve → 单事务 admission → submit，完成回调只读取已提交终态。 */
@@ -279,6 +378,25 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                         "task is unavailable"));
     }
 
+    /**
+     * 在每次 Runtime resolve 安全点从 SQLite 重读 Child lineage 与父/主 Thread 标题；不缓存身份，
+     * 从而让重启、压缩和 Goal/Plan continuation 都不会继续使用已过期的任务关系。
+     */
+    @Override
+    public Optional<TaskModels.RuntimeIdentity> readRuntimeIdentity(String taskThreadId) {
+        requireOpen();
+        Objects.requireNonNull(taskThreadId, "taskThreadId");
+        return tasks.findTask(taskThreadId)
+                .map(task -> {
+                    TaskModels.Lineage lineage = task.lineage();
+                    String parentName = requireThread(lineage.parentThreadId()).thread().title();
+                    String rootName = lineage.rootThreadId().equals(lineage.parentThreadId())
+                            ? parentName : requireThread(lineage.rootThreadId()).thread().title();
+                    return new TaskModels.RuntimeIdentity(lineage.taskThreadId(), lineage.parentThreadId(),
+                            lineage.rootThreadId(), lineage.taskName(), parentName, rootName, lineage.kind());
+                });
+    }
+
     /** Observation 只保存在当前进程且按 Task 唯一，重复打开复用句柄以避免高频订阅翻倍。 */
     @Override
     public Observation observe(String taskThreadId, long expectedTaskRevision) {
@@ -308,21 +426,14 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return tasks.markSeen(taskThreadId, expectedTaskRevision, throughActivitySequence, clock.instant());
     }
 
-    /** QueueOnly 只写 Mailbox；不存在任何 Turn start 调用。 */
+    /** QueueOnly 只写跨会话 Mailbox；不存在 Turn、Task Activity 或父未读投影副作用。 */
     @Override
     public MessageReceipt sendMessage(MessageCommand command) {
         requireOpen();
         Objects.requireNonNull(command, "command");
         Instant now = clock.instant();
         TaskModels.MailboxEnvelope envelope = envelope(command, TaskModels.MailboxKind.MESSAGE, now);
-        TaskModels.MessageEnqueueReceipt receipt = tasks.enqueueMessage(
-                envelope, id("activity_"), summary("收到新消息"));
-        if (receipt.inserted()) {
-            TaskModels.Summary owner = receipt.projectionOwner();
-            publish(new TaskEvent.MailboxChanged(context(owner, now), receipt.mailbox().sequence(),
-                    owner.projection().unreadCount()));
-            publishLatest(owner);
-        }
+        TaskModels.MessageEnqueueReceipt receipt = tasks.enqueueMessage(envelope);
         return new MessageReceipt(receipt.mailbox().messageId(), receipt.mailbox().sequence());
     }
 
@@ -373,6 +484,29 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return new FollowUpResult(task, receipt.admission().turnId(), receipt.mailbox().messageId());
     }
 
+    /**
+     * Agent continuation 比用户侧 FOLLOW_UP 更窄：只有目标 ATTACHED/SUBAGENT 委派链中的真实请求者
+     * 才能启动下一 Turn，不能因为共享 root Thread 就把独立侧聊当成 Agent 控制目标。
+     */
+    @Override
+    public FollowUpResult continueAgentFrom(String requesterThreadId, FollowUpCommand command) {
+        requireOpen();
+        Objects.requireNonNull(requesterThreadId, "requesterThreadId");
+        Objects.requireNonNull(command, "command");
+        if (!requesterThreadId.equals(command.message().senderThreadId())) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.PERMISSION_DENIED,
+                    "agent continuation sender does not match requester");
+        }
+        TaskModels.Summary target = requireTask(command.message().targetThreadId());
+        if (target.lineage().kind() != TaskModels.Kind.SUBAGENT
+                || target.lineage().lifecycle() != TaskModels.Lifecycle.ATTACHED) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.PERMISSION_DENIED,
+                    "only attached subagents can be continued by an agent");
+        }
+        requireDelegatedTargets(requesterThreadId, Set.of(target.lineage().taskThreadId()));
+        return followUp(command);
+    }
+
     /** 取消先校验 Task CAS，再使用 Child Thread 自身 revision 请求 Turn 取消。 */
     @Override
     public TaskModels.Summary cancel(String taskThreadId, long expectedTaskRevision) {
@@ -384,11 +518,248 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return requireTask(taskThreadId);
     }
 
-    /** Agent 入口先证明请求者与目标同根，再复用用户取消的完整状态机。 */
+    /**
+     * 关闭只适用于独立侧聊：先以持久闸门拒绝迟到准入，再取消整棵临时树并停止 owner 的
+     * Goal/Plan，确认所有 Turn 终态后才 purge；失败保留 closing 事实供原标签重试。
+     */
+    @Override
+    public void closeSideChat(String taskThreadId) {
+        requireOpen();
+        Objects.requireNonNull(taskThreadId, "taskThreadId");
+        runSideChatClose(taskThreadId);
+    }
+
+    /**
+     * 在 TurnService 停止接纳前收口全部临时侧聊；该前置阶段不关闭 TaskCoordinator，
+     * 因为 Turn 取消回调仍需通过本协调器传播已提交的 Child 取消事实。
+     */
+    @Override
+    public void closeTemporarySideChats(long shutdownDeadlineNanos) {
+        if (shutdownDeadlineNanos == Long.MIN_VALUE) {
+            throw new IllegalArgumentException("invalid side chat shutdown deadline");
+        }
+        shutdownRequested.set(true);
+        if (!sideChatShutdownAttempted.compareAndSet(false, true)) {
+            RuntimeException previous = sideChatShutdownFailure;
+            if (previous != null) throw previous;
+            return;
+        }
+        RuntimeException failure = null;
+        try {
+            for (String taskThreadId : tasks.listTemporarySideChats().stream()
+                    .map(TaskRepository.TemporarySideChat::threadId).toList()) {
+                try {
+                    runSideChatClose(taskThreadId, shutdownDeadlineNanos);
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
+            }
+        } catch (RuntimeException listFailure) {
+            failure = listFailure;
+        }
+        sideChatShutdownFailure = failure;
+        if (failure != null) throw failure;
+    }
+
+    /**
+     * 同一侧聊的并发关闭共享一个 Future，避免两个调用者分别取消、purge 或清理同一组租约；
+     * 失败只解除内存中的 single-flight，让后续显式重试重新读取持久 closing 状态。
+     */
+    private void runSideChatClose(String taskThreadId) {
+        runSideChatClose(taskThreadId, System.nanoTime() + SIDE_CHAT_CLOSE_TIMEOUT.toNanos());
+    }
+
+    /**
+     * 关闭单棵临时树时沿用调用方的绝对截止线，保证应用退出的全局预算不会被每个侧聊重复放大。
+     */
+    private void runSideChatClose(String taskThreadId, long shutdownDeadlineNanos) {
+        CompletableFuture<Void> candidate = new CompletableFuture<>();
+        CompletableFuture<Void> current = sideChatClosures.putIfAbsent(taskThreadId, candidate);
+        if (current != null) {
+            awaitClose(current);
+            return;
+        }
+        closingSideChats.add(taskThreadId);
+        try {
+            closeSideChatOnce(taskThreadId, shutdownDeadlineNanos);
+            closingSideChats.remove(taskThreadId);
+            candidate.complete(null);
+        } catch (RuntimeException failure) {
+            // 持久 closing 标记刻意不回滚；它是拒绝迟到输入和后续重试的安全边界。
+            candidate.completeExceptionally(failure);
+            throw failure;
+        } finally {
+            sideChatClosures.remove(taskThreadId, candidate);
+        }
+    }
+
+    /**
+     * 单次关闭严格遵循 begin -> cancel -> owner stop -> terminal barrier -> purge -> memory cleanup，
+     * 因而 purge 成功回执不会掩盖仍运行的 Provider、交互恢复或子任务。
+     */
+    private void closeSideChatOnce(String taskThreadId, long shutdownDeadlineNanos) {
+        TaskModels.Summary root = tasks.findTask(taskThreadId).orElse(null);
+        if (root == null) {
+            if (threads.readThread(taskThreadId, null, 1).isPresent()) {
+                throw new TaskRepositoryException(TaskRepositoryException.Code.RELATION_INVALID,
+                        "only independent side chats can be closed");
+            }
+            List<String> returned = beginSideChatClose(taskThreadId);
+            if (!returned.isEmpty()) {
+                throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                        "side chat close returned a tree without a root task");
+            }
+            cleanupClosedSideChat(Set.of(taskThreadId));
+            return;
+        }
+        if (root.lineage().kind() != TaskModels.Kind.SIDE_TASK
+                || root.lineage().lifecycle() != TaskModels.Lifecycle.INDEPENDENT) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.RELATION_INVALID,
+                    "only independent side chats can be closed");
+        }
+        List<String> returned = beginSideChatClose(taskThreadId);
+        if (returned.isEmpty()) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.RELATION_INVALID,
+                    "temporary side chat marker is unavailable");
+        }
+        Set<String> subtree = sideChatTree(taskThreadId, returned);
+        long deadline = Math.min(shutdownDeadlineNanos,
+                System.nanoTime() + SIDE_CHAT_CLOSE_TIMEOUT.toNanos());
+        // 先停止续跑 owner，再等待其 Turn 终态；反向顺序会让取消与 Goal 的推进/挂起争夺同一轮次。
+        sideChatOwnerController.get().stopOwners(subtree);
+        cancelSideChatTurns(subtree, deadline);
+        awaitSideChatTurns(subtree, deadline);
+        tasks.deleteClosedSideChat(taskThreadId);
+        cleanupClosedSideChat(subtree);
+    }
+
+    /**
+     * 仓储返回的树身份是关闭事务的权威结果；本地补入根 ID 只为确保根自身的 Turn、观察和 waiter
+     * 不会因实现漏返而遗留，所有外部身份仍由仓储校验。
+     */
+    private static Set<String> sideChatTree(String taskThreadId, List<String> returned) {
+        Set<String> result = new LinkedHashSet<>();
+        result.add(taskThreadId);
+        for (String value : List.copyOf(Objects.requireNonNull(returned, "side chat subtree"))) {
+            if (value == null || value.isBlank() || !value.startsWith("thr_")) {
+                throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                        "side chat close returned invalid task identity");
+            }
+            result.add(value);
+        }
+        return Set.copyOf(result);
+    }
+
+    /**
+     * 关闭闸门提交后逐个刷新 Thread revision 取消所有已存在 Turn；每次只使用新快照，避免两个
+     * 取消请求共享过期 revision，超过有界预算则保留 closing 状态而不伪造成功。
+     */
+    private void cancelSideChatTurns(Set<String> subtree, long deadlineNanos) {
+        while (true) {
+            boolean found = false;
+            for (String threadId : subtree) {
+                ThreadSnapshot snapshot = threads.readThread(threadId, null, 1).orElse(null);
+                if (snapshot == null) continue;
+                Optional<ThreadSnapshot.Turn> pending = snapshot.turns().stream()
+                        .filter(turn -> !terminal(turn.status())).findFirst();
+                if (pending.isEmpty()) continue;
+                found = true;
+                try {
+                    turns.cancel(pending.orElseThrow().turnId(), snapshot.thread().revision());
+                } catch (TurnUseCase.TurnCancellationException race) {
+                    if (race.failure() != TurnUseCase.CancelFailure.CONFLICT
+                            && race.failure() != TurnUseCase.CancelFailure.TURN_NOT_FOUND) throw race;
+                }
+                if (expired(deadlineNanos)) throw closeTimeout();
+            }
+            if (!found) return;
+            if (expired(deadlineNanos)) throw closeTimeout();
+            LockSupport.parkNanos(SIDE_CHAT_CLOSE_POLL_NANOS);
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.currentThread().interrupt();
+                throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                        "side chat close was interrupted");
+            }
+        }
+    }
+
+    /**
+     * 取消请求只是意图，不能作为 purge 条件；这里重新读取每个 Thread，等待 TurnService 的异步
+     * 终态结算和恢复回调清理真正完成。
+     */
+    private void awaitSideChatTurns(Set<String> subtree, long deadlineNanos) {
+        while (true) {
+            boolean pending = false;
+            for (String threadId : subtree) {
+                ThreadSnapshot snapshot = threads.readThread(threadId, null, 1).orElse(null);
+                if (snapshot != null && snapshot.turns().stream().anyMatch(turn -> !terminal(turn.status()))) {
+                    pending = true;
+                    break;
+                }
+            }
+            if (!pending) return;
+            if (expired(deadlineNanos)) throw closeTimeout();
+            LockSupport.parkNanos(SIDE_CHAT_CLOSE_POLL_NANOS);
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.currentThread().interrupt();
+                throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                        "side chat close was interrupted");
+            }
+        }
+    }
+
+    /** 关闭成功后才释放观察、活动计数和 waiter；失败重试仍可读取原标签所需的本地状态。 */
+    private void cleanupClosedSideChat(Set<String> subtree) {
+        subtree.forEach(id -> {
+            observations.remove(id);
+            acceptedTaskTurns.remove(id);
+        });
+        waiters.entrySet().removeIf(entry -> {
+            if (entry.getValue().targets().stream().noneMatch(subtree::contains)) return false;
+            entry.getValue().completion().completeExceptionally(
+                    new CancellationException("side chat closed"));
+            return true;
+        });
+    }
+
+    /** begin 的默认失败必须明确传播，防止没有持久 closing 闸门时误删临时树。 */
+    private List<String> beginSideChatClose(String taskThreadId) {
+        try {
+            return List.copyOf(tasks.beginSideChatClose(taskThreadId));
+        } catch (TaskRepositoryException missing) {
+            if (missing.code() == TaskRepositoryException.Code.NOT_FOUND) return List.of();
+            throw missing;
+        }
+    }
+
+    /** 并发调用复用相同错误；调用方显式再次点击关闭时才会重新尝试。 */
+    private static void awaitClose(CompletableFuture<Void> completion) {
+        try {
+            completion.join();
+        } catch (java.util.concurrent.CompletionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            throw failure;
+        }
+    }
+
+    /** 单调时间只用于关闭预算，不受 Clock.fixed 测试时钟或系统校时影响。 */
+    private static boolean expired(long deadlineNanos) {
+        return System.nanoTime() - deadlineNanos >= 0;
+    }
+
+    /** 超时保留持久 closing 闸门，调用者可安全重试而不会再次接纳输入。 */
+    private static TaskRepositoryException closeTimeout() {
+        return new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                "side chat turns did not settle before close deadline");
+    }
+
+    /** Agent 入口先证明真实委派关系，再复用用户取消的完整状态机。 */
     @Override
     public TaskModels.Summary cancelFrom(String requesterThreadId, String taskThreadId,
                                          long expectedTaskRevision) {
-        requireSameRoot(requesterThreadId, Set.of(taskThreadId));
+        requireDelegatedTargets(requesterThreadId, Set.of(taskThreadId));
         return cancel(taskThreadId, expectedTaskRevision);
     }
 
@@ -435,7 +806,9 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
      */
     @Override
     public void cancellationClaimed(String parentThreadId, String parentTurnId) {
-        requireOpen();
+        // 关闭前置阶段仍需消费 TurnService 的已提交取消回调；TaskCoordinator 完全关闭后，
+        // closeTemporarySideChats 已冻结并逐个处理完整侧聊子树，迟到传播只会制造无效重试。
+        if (closed.get()) return;
         tasks.attachedDescendants(parentThreadId).stream()
                 .filter(task -> task.lineage().parentThreadId().equals(parentThreadId))
                 .filter(task -> Objects.equals(task.lineage().originTurnId(), parentTurnId))
@@ -500,11 +873,11 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return completion;
     }
 
-    /** Agent 入口对全部等待目标做同根校验，之后才登记 waiter，避免越权目标留下内存句柄。 */
+    /** 先验证所有目标都属于调用者的委派链，再登记 waiter，避免旁支目标留下观察句柄。 */
     @Override
     public CompletionStage<WaitResult> waitAgentsFrom(String requesterThreadId, Set<String> taskThreadIds,
                                                       Duration timeout, CancellationToken cancellation) {
-        requireSameRoot(requesterThreadId, taskThreadIds);
+        requireDelegatedTargets(requesterThreadId, taskThreadIds);
         return waitAgents(taskThreadIds, timeout, cancellation);
     }
 
@@ -517,22 +890,44 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return () -> subscriber.compareAndSet(sink, null);
     }
 
-    /** 关闭只释放内存观察资源和 waiters，持久 Task 由恢复服务接管。 */
+    /**
+     * 进程退出先枚举并收口全部临时侧聊，再释放本地观察资源；失败继续清理其它侧聊并向生命周期
+     * owner 报错，避免把未 purge 的临时会话误报为正常关闭。
+     */
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) return;
-        observations.clear();
-        acceptedTaskTurns.clear();
-        logActiveTaskCount();
-        waiters.values().forEach(waiter -> waiter.completion().completeExceptionally(
-                new CancellationException("task coordinator closed")));
-        waiters.clear();
-        subscriber.set(null);
-        timeouts.shutdownNow();
+        if (!closeStarted.compareAndSet(false, true)) return;
+        shutdownRequested.set(true);
+        RuntimeException failure = null;
+        try {
+            if (!sideChatShutdownAttempted.get()) {
+                closeTemporarySideChats(System.nanoTime() + SIDE_CHAT_CLOSE_TIMEOUT.toNanos());
+            } else {
+                failure = sideChatShutdownFailure;
+            }
+        } catch (RuntimeException listFailure) {
+            failure = listFailure;
+        } finally {
+            closed.set(true);
+            closingSideChats.clear();
+            observations.clear();
+            acceptedTaskTurns.clear();
+            logActiveTaskCount();
+            waiters.values().forEach(waiter -> waiter.completion().completeExceptionally(
+                    new CancellationException("task coordinator closed")));
+            waiters.clear();
+            subscriber.set(null);
+            timeouts.shutdownNow();
+        }
+        if (failure != null) throw failure;
     }
 
-    /** 从最新 projection sequence 精确读取刚提交的 Activity，避免扫描整份详情。 */
+    /** 侧聊状态仅服务自身可见详情；没有观察者时不向来源会话广播活动，子任务等待仍独立结算。 */
     private void publishLatest(TaskModels.Summary task) {
+        if (task.lineage().kind() == TaskModels.Kind.SIDE_TASK
+                && !observations.containsKey(task.lineage().taskThreadId())) {
+            return;
+        }
         long sequence = task.projection().latestActivitySequence();
         tasks.readTask(task.lineage().taskThreadId(), sequence - 1, 0, 1).ifPresent(detail -> {
             if (!detail.activities().isEmpty()) {
@@ -614,6 +1009,31 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 progressRevision, safe));
     }
 
+    /**
+     * 为不经过 Child scheduler 的 Goal/Plan hidden Turn 复用同一 Task 投影入口；下游 sink 先收到
+     * 原始事件，保证既有 Timeline/审批路由顺序不变，Terminal 再回读已提交的最新 Activity。
+     */
+    public TurnEventSink projectContinuationEvents(String taskThreadId, TurnEventSink downstream) {
+        requireOpen();
+        Objects.requireNonNull(taskThreadId, "taskThreadId");
+        Objects.requireNonNull(downstream, "downstream");
+        AtomicReference<Boolean> taskProjection = new AtomicReference<>();
+        return event -> {
+            downstream.publish(event).toCompletableFuture().join();
+            Boolean shouldProject = taskProjection.get();
+            if (shouldProject == null) {
+                shouldProject = tasks.findTask(taskThreadId).isPresent();
+                taskProjection.compareAndSet(null, shouldProject);
+            }
+            if (!shouldProject) return CompletableFuture.completedFuture(null);
+            projectTurnEvent(taskThreadId, event);
+            if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.Terminal) {
+                tasks.findTask(taskThreadId).ifPresent(this::publishLatest);
+            }
+            return CompletableFuture.completedFuture(null);
+        };
+    }
+
     /** 只有匹配目标进入终态或 needs-attention 时完成 wait，普通 progress 不唤醒父模型。 */
     private void notifyWaiters(TaskModels.Summary task) {
         if (!ready(task)) return;
@@ -634,10 +1054,10 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return List.copyOf(ready);
     }
 
-    /** WAITING_APPROVAL/SUSPENDED 与三个终态均需要父 Agent 或用户处理。 */
+    /** 空闲任务没有待完成的 Turn；与等待人工处理及终态一起立即交还控制，避免无谓等待。 */
     private static boolean ready(TaskModels.Summary task) {
         return switch (task.projection().state()) {
-            case WAITING_APPROVAL, SUSPENDED, COMPLETED, FAILED, CANCELLED -> true;
+            case IDLE, WAITING_APPROVAL, SUSPENDED, COMPLETED, FAILED, CANCELLED -> true;
             case QUEUED, RUNNING -> false;
         };
     }
@@ -666,16 +1086,27 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                         "task is unavailable"));
     }
 
-    /** Agent 控制面只允许访问调用者所在根树；Root Thread 与任意层 Child 使用同一比较规则。 */
-    private void requireSameRoot(String requesterThreadId, Set<String> targetThreadIds) {
+    /** 通信可跨所有会话，控制权只沿真实委派边向下；共享上下文来源不能赋予取消或等待旁支的权限。 */
+    private void requireDelegatedTargets(String requesterThreadId, Set<String> targetThreadIds) {
         Objects.requireNonNull(requesterThreadId, "requesterThreadId");
         Set<String> targets = Set.copyOf(Objects.requireNonNull(targetThreadIds, "targetThreadIds"));
-        String requesterRoot = rootThread(requesterThreadId);
         for (String targetThreadId : targets) {
-            TaskModels.Summary target = requireTask(targetThreadId);
-            if (!requesterRoot.equals(target.lineage().rootThreadId())) {
+            TaskModels.Summary current = requireTask(targetThreadId);
+            boolean delegated = false;
+            for (int depth = 0; current != null && depth < 4; depth++) {
+                TaskModels.Lineage lineage = current.lineage();
+                if (lineage.kind() != TaskModels.Kind.SUBAGENT
+                        || lineage.lifecycle() != TaskModels.Lifecycle.ATTACHED) break;
+                if (requesterThreadId.equals(lineage.parentThreadId())) {
+                    delegated = true;
+                    break;
+                }
+                if (lineage.parentThreadId().equals(lineage.rootThreadId())) break;
+                current = tasks.findTask(lineage.parentThreadId()).orElse(null);
+            }
+            if (!delegated) {
                 throw new TaskRepositoryException(TaskRepositoryException.Code.PERMISSION_DENIED,
-                        "task target is outside the requester root");
+                        "task target is not delegated by the requester");
             }
         }
     }
@@ -731,9 +1162,9 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 task.projection().revision(), occurredAt);
     }
 
-    /** Turn status 来自持久闭集，未知值失败关闭。 */
+    /** History 的状态投影使用小写 wire 拼写；在领域边界显式归一后再使用终态闭集。 */
     private static boolean terminal(String status) {
-        return TurnState.valueOf(status).terminal();
+        return TurnState.valueOf(status.toUpperCase(java.util.Locale.ROOT)).terminal();
     }
 
     /** Task 投影终态判断与持久状态闭集保持显式，不把需处理状态误判为完成。 */
@@ -767,9 +1198,12 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 "task revision changed");
     }
 
-    /** close 后拒绝新调用，但不改变数据库中的 Task。 */
+    /** 关闭请求一旦发布就拒绝新调用，但允许 Turn cancellation callback 继续消费持久事实。 */
     private void requireOpen() {
-        if (closed.get()) throw new IllegalStateException("task coordinator is closed");
+        if (closed.get() || shutdownRequested.get()) {
+            throw new IllegalStateException(closed.get()
+                    ? "task coordinator is closed" : "task coordinator is shutting down");
+        }
     }
 
     /** 当前进程 observation 不持有 transcript 或 UI 组件引用。 */

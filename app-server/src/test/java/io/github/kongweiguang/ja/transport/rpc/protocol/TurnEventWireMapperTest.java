@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.AttachmentSummary;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.model.AttachmentContent;
@@ -175,6 +176,25 @@ final class TurnEventWireMapperTest {
         assertEquals("capture.png", wire.params().path("userItem").path("attachments")
                 .get(0).path("displayName").textValue());
         assertFalse(wire.params().path("userItem").path("attachments").get(0).has("state"));
+    }
+
+    /** mailbox 提交事件只投影已落库的来源快照条目，并保留事件上下文的权威 revision。 */
+    @Test
+    void mapsReceivedMessagesWithCommittedContext() {
+        TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
+        Instant occurredAt = Instant.parse("2026-09-03T00:00:00Z");
+        TurnEvent.Context context = new TurnEvent.Context(
+                "evt_received", "thr_target", "turn_target", 9, occurredAt);
+        ThreadSnapshot.ThreadMessageItem item = new ThreadSnapshot.ThreadMessageItem(
+                "item_message", occurredAt, "turn_target", "thr_sender", "发送方标题", "阶段结果");
+
+        TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.MessagesReceived(context, List.of(item)));
+
+        assertEquals("turn/messages_received", wire.method());
+        assertEquals("srv_test", wire.params().path("serverInstanceId").textValue());
+        assertEquals(9, wire.params().path("threadRevision").longValue());
+        assertEquals("thread_message", wire.params().path("items").get(0).path("kind").textValue());
+        assertEquals("thr_sender", wire.params().path("items").get(0).path("sourceThreadId").textValue());
     }
 
     /** 实时事件测试使用与历史相同的安全展示 DTO。 */

@@ -6,8 +6,10 @@
   "platforms": ["windows", "macOS"],
   "permissions": [
     "core:default",
+    "core:webview:allow-set-webview-zoom",
     "core:window:allow-minimize",
     "core:window:allow-hide",
+    "core:window:allow-close",
     "core:window:allow-toggle-maximize",
     "core:window:allow-start-dragging",
     "dialog:allow-open",

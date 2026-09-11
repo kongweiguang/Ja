@@ -25,6 +25,11 @@ const GOALS_SOURCE = readFileSync(
 );
 
 describe("Composer toolbar layout policy", () => {
+  /** 宽窗口内的窄侧栏同样需要换行，不能仅依赖 viewport media query。 */
+  it("wraps shared controls before they overlap in a narrow conversation", () => {
+    expect(COMPOSER_SOURCE).toMatch(/\.ja-composer__toolbar\s*\{[^}]*flex-wrap:\s*wrap;/u);
+    expect(COMPOSER_SOURCE).toMatch(/\.ja-composer__leading\s*\{[^}]*flex:\s*0 0 auto;/u);
+  });
   it("keeps access disclosure compact and preserves the Plan or Goal label", () => {
     expect(COMPOSER_SOURCE).toMatch(
       /\.ja-composer__access-select\s*\{[^}]*width:\s*fit-content;[^}]*flex:\s*0 0 auto;[^}]*gap:\s*4px;/u,

@@ -21,6 +21,7 @@ function ActivityIcon({ activity }: { activity: TaskActivity }): ReactElement {
       return <MessageSquare aria-hidden="true" />;
     case "waiting_approval":
       return <Clock3 aria-hidden="true" />;
+    case "created":
     case "dispatched":
     case "resumed":
       return <Play aria-hidden="true" />;

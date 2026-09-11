@@ -1,6 +1,12 @@
 {
   "comment": "@author kongweiguang；MyBatis 与 Solon 的 JDK Proxy 使用 GraalVM 25 统一反射元数据，避免继续依赖已废弃的 proxy-config.json。",
   "reflection": [
+    {"type":{"proxy":["io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadDiscoveryMapper"]}},
+    {"type":{"proxy":["io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatMapper"]}},
+    {"type":{"proxy":["io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatPurgeMapper"]}},
+    { "type": { "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper"] } },
+    { "type": { "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper"] } },
+    { "type": { "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.SubagentPolicyMapper"] } },
     {
       "type": {
         "proxy": ["org.apache.ibatis.executor.Executor"]

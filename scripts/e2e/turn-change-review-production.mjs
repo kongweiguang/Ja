@@ -458,7 +458,7 @@ export async function findMissingIntegrationHooks(root = repoRoot, desktopRunner
     {
       path: join(root, "contracts", "golden", "v1", "valid", "core.jsonl"),
       label: "initialize-1.0-fixture",
-      tokens: ['"protocolMinor":0', '"engineVersion":"0.1.0"', "turn/change-set/read"],
+      tokens: ['"protocolMinor":0', '"engineVersion":"0.1.1"', "turn/change-set/read"],
       forbiddenTokens: ["turn_change_preview_v1", "turn/change-preview"],
     },
   ];

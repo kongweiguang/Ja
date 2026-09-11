@@ -26,6 +26,8 @@ export type PlanStatus =
   | "draft"
   | "awaiting_approval"
   | "approved"
+  | "verifying"
+  | "paused"
   | "executing"
   | "completed"
   | "stopped";
@@ -152,12 +154,6 @@ export interface GoalEvaluation {
   readonly evaluatedAt: string;
 }
 
-export interface GoalInputRequest {
-  readonly requestId: string;
-  readonly prompt: string;
-  readonly expiresAt: string | null;
-}
-
 export interface GoalReadModel {
   readonly goal: GoalSummary;
   /** JA-RPC adapter 提供单调事件序号；不经过传输边界的纯展示模型可不携带。 */
@@ -166,7 +162,6 @@ export interface GoalReadModel {
   readonly planEventSequence?: number;
   readonly plan: PlanRevision | null;
   readonly draft: PlanDraft | null;
-  readonly inputRequest: GoalInputRequest | null;
   readonly evaluation: GoalEvaluation | null;
 }
 
@@ -182,12 +177,35 @@ export interface PlanSummary {
   readonly updatedAt: string;
 }
 
+export interface PlanProgress {
+  readonly currentStepId: string | null;
+  readonly currentStepTitle: string | null;
+  readonly completedRequiredSteps: number;
+  readonly totalRequiredSteps: number;
+}
+
 export interface PlanReadModel {
   readonly plan: PlanSummary;
+  readonly progress: PlanProgress;
   readonly revision: PlanRevision | null;
+  /** Plan 摘要已前进但新 immutable revision 尚未回读时禁止展示旧正文。 */
+  readonly revisionHydrationRequired: boolean;
   readonly draft: PlanDraft | null;
   readonly approvedPlanRevisionId: string | null;
   readonly eventSequence: number;
+}
+
+/** 从完整 revision 派生首次读取所需的轻量摘要；后续高频状态由 plan/changed.progress 更新。 */
+export function planProgressFromRevision(revision: PlanRevision | null): PlanProgress {
+  const steps = revision?.steps ?? [];
+  const current = steps.find((step) => step.status === "running" || step.status === "blocked");
+  const required = steps.filter((step) => step.required);
+  return {
+    currentStepId: current?.stepId ?? null,
+    currentStepTitle: current?.title ?? null,
+    completedRequiredSteps: required.filter((step) => step.status === "succeeded").length,
+    totalRequiredSteps: required.length,
+  };
 }
 
 /** 终态 Goal 进入时间线后释放常驻区域，Composer 只保留可继续处理的目标。 */
@@ -229,9 +247,13 @@ export function planStatusLabel(status: PlanStatus): string {
     case "draft":
       return "草稿";
     case "awaiting_approval":
-      return "待批准";
+      return "待执行";
     case "approved":
-      return "已批准";
+      return "已准备";
+    case "verifying":
+      return "验证中";
+    case "paused":
+      return "已暂停";
     case "executing":
       return "执行中";
     case "completed":

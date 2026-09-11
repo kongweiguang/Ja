@@ -21,6 +21,7 @@ import {
   PlanGoalFixtureError,
   createPlanGoalStateFixture,
 } from "./fixtures/plan-goal-state-fixture.mjs";
+import { hasGoalOnlyEvaluationEvidence } from "./windows-desktop-smoke.mjs";
 
 /** 构造覆盖全部生产维度的最小有效报告，供反例逐字段破坏。 */
 function validReport() {
@@ -56,7 +57,7 @@ function validReport() {
     authority: {
       planCreatedWithoutGoal: true,
       standalonePlanCompleted: true,
-      planApprovalDidNotExecute: true,
+      planProposalDidNotExecute: true,
       goalCreatedWithoutPlan: true,
       attachApprovedPlan: true,
       attachedGoalOwnedRunStarted: true,
@@ -66,7 +67,7 @@ function validReport() {
       detachGoalRevisionAdvancedBy: 1,
       detachGoalContinued: true,
       staleGoalRevisionCode: "GOAL_REVISION_CONFLICT",
-      stalePlanApprovalCode: "PLAN_APPROVAL_STALE",
+      stalePlanRevisionCode: "PLAN_APPROVAL_STALE",
       hiddenPlanDetailIoDelta: { planRead: 0, revisionList: 0, evidenceList: 0 },
     },
     composer: {
@@ -124,9 +125,8 @@ test("Plan 与 Goal 独立创建，只有显式 attach 才建立关联", () => {
   const standalonePlan = fixture.createPlan({ objective: "独立执行计划" });
   assert.deepEqual(fixture.inventory(), { plans: 1, goals: 0 });
   fixture.savePlanDraft(standalonePlan.planId, { steps: ["step_one"] });
-  fixture.proposePlan(standalonePlan.planId);
-  const standaloneApproved = fixture.approvePlan(standalonePlan.planId);
-  assert.equal(standaloneApproved.activeRunId, null);
+  const standaloneProposed = fixture.proposePlan(standalonePlan.planId);
+  assert.equal(standaloneProposed.activeRunId, null);
   const standaloneRunning = fixture.executePlan(standalonePlan.planId);
   assert.notEqual(standaloneRunning.activeRunId, null);
   const standaloneCompleted = fixture.completePlan(standalonePlan.planId);
@@ -135,9 +135,8 @@ test("Plan 与 Goal 独立创建，只有显式 attach 才建立关联", () => {
 
   const attachablePlan = fixture.createPlan({ objective: "只批准后附加" });
   fixture.savePlanDraft(attachablePlan.planId, { steps: ["step_attach"] });
-  fixture.proposePlan(attachablePlan.planId);
-  const approved = fixture.approvePlan(attachablePlan.planId);
-  assert.equal(approved.activeRunId, null);
+  const attachableProposed = fixture.proposePlan(attachablePlan.planId);
+  assert.equal(attachableProposed.activeRunId, null);
 
   const goal = fixture.createGoal({ objective: "独立持续推进目标" });
   assert.deepEqual(fixture.inventory(), { plans: 2, goals: 1 });
@@ -146,14 +145,14 @@ test("Plan 与 Goal 独立创建，只有显式 attach 才建立关联", () => {
   const attached = fixture.attachPlan({
     goalId: goal.goalId,
     expectedGoalRevision: goal.revision,
-    planId: approved.planId,
-    planRevisionId: approved.currentRevision.planRevisionId,
-    planHash: approved.currentRevision.planHash,
+    planId: attachablePlan.planId,
+    planRevisionId: attachableProposed.currentRevision.planRevisionId,
+    planHash: attachableProposed.currentRevision.planHash,
   });
-  assert.equal(attached.planLink.planId, approved.planId);
+  assert.equal(attached.planLink.planId, attachablePlan.planId);
   assert.equal(attached.revision, goal.revision + 1);
   assert.match(attached.activeRunId, /^goal_plan_run_fixture_/u);
-  assert.equal(fixture.readPlan(approved.planId).activeRunId, null);
+  assert.equal(fixture.readPlan(attachablePlan.planId).activeRunId, null);
 
   const detached = fixture.detachPlan({
     goalId: goal.goalId,
@@ -165,17 +164,16 @@ test("Plan 与 Goal 独立创建，只有显式 attach 才建立关联", () => {
   assert.equal(detached.revision, attached.revision + 1);
   assert.match(detached.activeRunId, /^goal_only_run_fixture_/u);
   assert.notEqual(detached.activeRunId, attached.activeRunId);
-  assert.equal(fixture.readPlan(approved.planId).activeRunId, null);
+  assert.equal(fixture.readPlan(attachablePlan.planId).activeRunId, null);
 });
 
 test("attach/detach 拒绝过期 Goal CAS 与非当前批准 Plan identity", () => {
   const fixture = createPlanGoalStateFixture();
   const plan = fixture.createPlan({ objective: "versioned plan" });
   fixture.savePlanDraft(plan.planId, { steps: ["v1"] });
-  const firstProposed = fixture.proposePlan(plan.planId);
-  const first = fixture.approvePlan(plan.planId);
+  const first = fixture.proposePlan(plan.planId);
   const goal = fixture.createGoal({ objective: "versioned goal" });
-  const attached = fixture.attachPlan({
+  fixture.attachPlan({
     goalId: goal.goalId,
     expectedGoalRevision: 0,
     planId: first.planId,
@@ -188,16 +186,13 @@ test("attach/detach 拒绝过期 Goal CAS 与非当前批准 Plan identity", () 
   );
 
   fixture.savePlanDraft(plan.planId, { steps: ["v1"] });
-  fixture.proposePlan(plan.planId);
-  const second = fixture.approvePlan(plan.planId);
+  const second = fixture.proposePlan(plan.planId);
   expectFixtureCode(
     () =>
-      fixture.attachPlan({
+      fixture.executePlan(plan.planId, {
         goalId: goal.goalId,
-        expectedGoalRevision: attached.revision,
-        planId: first.planId,
-        planRevisionId: firstProposed.currentRevision.planRevisionId,
-        planHash: firstProposed.currentRevision.planHash,
+        planRevisionId: first.currentRevision.planRevisionId,
+        planHash: first.currentRevision.planHash,
       }),
     "PLAN_APPROVAL_STALE",
   );
@@ -317,6 +312,60 @@ test("focused 环境强制 mock Provider 并绑定 v1 报告路径", () => {
   }
 });
 
+/** RuntimeGoalEvaluatorAdapter 的独立 user JSON 不含 Tool call/runId，正例仍须凭持久证据通过。 */
+test("Goal-only evaluator fixture 解析独立 payload 并拒绝错误身份或证据", () => {
+  const goalId = "goal_fixture_current";
+  const criterionId = "criterion_goal_only";
+  const context = {
+    kind: "goal",
+    goalId,
+    goalDefinitionRevision: 42,
+    planRevisionId: null,
+    criterionId,
+    runId: "run_fixture_current",
+  };
+  const evidence = {
+    criterionId,
+    sourceType: "TOOL_RESULT",
+    sourceId: "call_plan_goal_29",
+    summary: "已持久化的 Shell 证据",
+    digest: "a".repeat(64),
+  };
+  const payload = {
+    goalId,
+    goalDefinitionRevision: 42,
+    objective: "独立 Goal evaluator fixture",
+    criteria: [{ criterionId, description: "真实证据存在", required: true }],
+    evidence: [evidence],
+  };
+  const input = [
+    {
+      role: "user",
+      content: [{ type: "input_text", text: JSON.stringify(payload) }],
+    },
+  ];
+
+  assert.doesNotMatch(JSON.stringify(input), /function_call/u);
+  assert.equal(hasGoalOnlyEvaluationEvidence(input, context), true);
+  input[0].content[0].type = "text";
+  assert.equal(hasGoalOnlyEvaluationEvidence(input, context), true);
+
+  const invalidPayloads = [
+    ["跨 Goal", { ...payload, goalId: "goal_fixture_other" }],
+    ["旧 definition", { ...payload, goalDefinitionRevision: 41 }],
+    ["带 Plan", { ...payload, plan: {} }],
+    ["缺证据", { ...payload, evidence: [] }],
+    ["非必要 criterion", { ...payload, criteria: [{ ...payload.criteria[0], required: false }] }],
+    ["错误 source type", { ...payload, evidence: [{ ...evidence, sourceType: "TEST_REPORT" }] }],
+    ["空 sourceId", { ...payload, evidence: [{ ...evidence, sourceId: "  " }] }],
+    ["错误 digest", { ...payload, evidence: [{ ...evidence, digest: "a" }] }],
+  ];
+  for (const [label, invalidPayload] of invalidPayloads) {
+    input[0].content[0].text = JSON.stringify(invalidPayload);
+    assert.equal(hasGoalOnlyEvaluationEvidence(input, context), false, label);
+  }
+});
+
 /**
  * 锁定 Native Responses strict schema 的必需占位字段，避免 fixture 在真实窗口中被协议层拒绝后
  * 只能等待全局期限；同时要求 standalone Plan 使用自己的 revision 生成幂等键。
@@ -338,13 +387,44 @@ test("Plan Goal Provider fixture 满足严格 Tool 参数并区分 aggregate rev
   );
   assert.match(runner, /trailingPlanGoalTool\?\.name === "goal_request_evaluation"/u);
   assert.doesNotMatch(runner, /planGoalSoakInputRequested\s*\?\s*1/u);
+  assert.match(runner, /planGoalToolName === "request_user_input"/u);
+  assert.match(runner, /questionId: "question_goal_soak_continue"/u);
+  assert.doesNotMatch(runner, /goal_request_input|goal_input_respond|pendingInput/u);
   assert.match(runner, /selectThreadById\(page, createdThreadId, deadline, signal\)/u);
   assert.match(driver, /attempt < 3/u);
   assert.match(driver, /result\.code !== "GOAL_REVISION_CONFLICT"/u);
   assert.match(driver, /idempotencyKey: createIdempotencyKey/u);
   assert.match(driver, /expectedGoalRevision: Number\.MAX_SAFE_INTEGER/u);
   assert.match(driver, /recordStage\("plan_goal_v1:soak_resume"\)/u);
+  assert.match(driver, /ja_runtime_interaction_read/u);
+  assert.match(driver, /ja_runtime_interaction_respond/u);
+  assert.match(
+    driver,
+    /questions\?\.some\(\(question\) => question\.questionId === "question_goal_soak_continue"\)/u,
+  );
+  assert.doesNotMatch(driver, /goal_request_input|goal_input_respond|pendingInput/u);
   assert.match(driver, /recordStage\("plan_goal_v1:evaluator_met"\)/u);
+});
+
+/** 锁定 Plan/Goal Gate 对当前独立 session source 的归属，防止静态预检误报缺失接线。 */
+test("Plan/Goal Gate 使用真实独立 session 的 Goal-only 与恢复断言", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /goalOnlyCompletion:\s*\n\s*interactionSessionSource\.includes\("runGoalOnlyCompletion"\)/u,
+  );
+  assert.match(
+    source,
+    /crashRecovery:[\s\S]*?interactionSessionSource\.includes\(\s*'typeof recoveryExecuted\.value\?\.plan\?\.activeRunId !== "string"'/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /goalOnlyCompletion:\s*\n\s*mainSource\.includes\("runGoalOnlyCompletion"\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /recoverySource\.includes\(\s*'typeof recoveryExecuted\.value\?\.plan\?\.activeRunId !== "string"'/u,
+  );
 });
 
 test("preflight 明确拒绝旧强绑定 session，并接受独立 v1 hooks", async () => {
@@ -425,7 +505,7 @@ test("preflight 明确拒绝旧强绑定 session，并接受独立 v1 hooks", as
       join(apiDir, "goals.ts"),
       "ja_runtime_plan_create ja_runtime_plan_read " +
         "ja_runtime_plan_draft_save ja_runtime_plan_propose " +
-        "ja_runtime_plan_approve ja_runtime_plan_execute " +
+        "ja_runtime_plan_execute " +
         "ja_runtime_goal_plan_attach ja_runtime_goal_plan_detach",
       "utf8",
     );

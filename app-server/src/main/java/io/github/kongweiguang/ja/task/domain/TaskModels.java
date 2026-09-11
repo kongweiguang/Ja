@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.task.domain;
 
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
+import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
@@ -42,6 +43,8 @@ public final class TaskModels {
 
     /** Task 投影的稳定状态闭集；终态不可逆，暂停态只能通过显式恢复离开。 */
     public enum State {
+        /** 侧边任务创建事实已提交但尚未发送首个 follow-up，因此不存在 Turn/provider。 */
+        IDLE,
         /** 创建事实已提交但尚未取得执行所有权。 */
         QUEUED,
         /** Child Turn 已被运行时接纳并正在推进。 */
@@ -60,6 +63,8 @@ public final class TaskModels {
 
     /** Activity 描述投影变化的低频事实，供父 Timeline 和任务详情共享同一审计来源。 */
     public enum ActivityKind {
+        /** 独立侧边 Thread 已创建；该活动不绑定 Turn，不能被解释为已执行。 */
+        CREATED,
         /** Child Task 与首次 Turn 已原子创建。 */
         DISPATCHED,
         /** 普通 Mailbox 消息已进入目标任务队列。 */
@@ -116,7 +121,9 @@ public final class TaskModels {
             parentTurnId = optionalIdentifier(parentTurnId, "turn_", "parentTurnId");
             if (parentRevision < 0) throw new IllegalArgumentException("invalid parentRevision");
             Objects.requireNonNull(inheritanceMode, "inheritanceMode");
-            Objects.requireNonNull(taskBrief, "taskBrief");
+            if (inheritanceMode == InheritanceMode.BRIEF_ONLY) {
+                Objects.requireNonNull(taskBrief, "taskBrief");
+            }
             if ((inheritanceMode == InheritanceMode.EFFECTIVE_CONTEXT) != (effectiveContext != null)) {
                 throw new IllegalArgumentException("inheritance mode does not match effective context");
             }
@@ -209,6 +216,32 @@ public final class TaskModels {
         }
     }
 
+    /**
+     * Child 每次运行时需要的最小身份投影；名称来自对应 Thread 快照，避免把可变运行状态或正文
+     * 复制进 System prompt，也让重启、压缩和后续 Turn 都重新读取同一份持久事实。
+     */
+    public record RuntimeIdentity(String taskThreadId, String parentThreadId, String rootThreadId,
+                                  String taskName, String parentTaskName, String rootTaskName, Kind kind) {
+        /** 身份必须携带持久 lineage 的 Kind，标题保留原值但拒绝空值与 NUL。 */
+        public RuntimeIdentity {
+            taskThreadId = identifier(taskThreadId, "thr_", "taskThreadId");
+            parentThreadId = identifier(parentThreadId, "thr_", "parentThreadId");
+            rootThreadId = identifier(rootThreadId, "thr_", "rootThreadId");
+            taskName = TaskModels.taskName(taskName);
+            parentTaskName = threadName(parentTaskName, "parentTaskName");
+            rootTaskName = threadName(rootTaskName, "rootTaskName");
+            Objects.requireNonNull(kind, "kind");
+        }
+
+        /** Thread 标题允许自然语言但不能让结构化身份携带 NUL 或无界文本。 */
+        private static String threadName(String value, String field) {
+            if (value == null || value.isBlank() || value.length() > 512 || value.indexOf('\0') >= 0) {
+                throw new IllegalArgumentException("invalid " + field);
+            }
+            return value;
+        }
+    }
+
     /** 右栏常量级读取的权威投影，不以扫描完整 Child Timeline 计算状态。 */
     public record Projection(String taskThreadId, String rootThreadId, long revision, State state,
                              long latestActivitySequence, Long lastSeenActivitySequence, int unreadCount,
@@ -283,12 +316,14 @@ public final class TaskModels {
     public record MailboxEnvelope(String messageId, String senderThreadId, String targetThreadId,
                                   String causalTurnId, MailboxKind kind, UserContent content,
                                   String idempotencyKey, Instant createdAt) {
-        /** 自发消息和控制字符幂等键在进入数据库前失败，避免依赖约束异常分类。 */
+        /** 普通通信拒绝自投递；FOLLOW_UP 是用户在当前会话的输入，必须允许自身作为接纳来源。 */
         public MailboxEnvelope {
             messageId = identifier(messageId, "msg_", "messageId");
             senderThreadId = identifier(senderThreadId, "thr_", "senderThreadId");
             targetThreadId = identifier(targetThreadId, "thr_", "targetThreadId");
-            if (senderThreadId.equals(targetThreadId)) throw new IllegalArgumentException("self message is invalid");
+            if (senderThreadId.equals(targetThreadId) && kind != MailboxKind.FOLLOW_UP) {
+                throw new IllegalArgumentException("self message is invalid");
+            }
             causalTurnId = optionalIdentifier(causalTurnId, "turn_", "causalTurnId");
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(content, "content");
@@ -297,12 +332,12 @@ public final class TaskModels {
         }
     }
 
-    /** 已持久化 Mailbox 行保留绑定 Turn 和消费时间，供恢复时 exactly-once 判断。 */
+    /** 已持久化 Mailbox 行保留发送方标题快照，供发送方被删除后仍能显示外发来源。 */
     public record MailboxMessage(long sequence, String messageId, String rootThreadId,
-                                 String senderThreadId, String targetThreadId, String causalTurnId,
-                                 MailboxKind kind, UserContent content, String idempotencyKey,
-                                 MailboxState state, String boundTurnId, Instant createdAt,
-                                 Instant updatedAt, Instant consumedAt) {
+                                 String senderThreadId, String senderTitle, String targetThreadId,
+                                 String causalTurnId, MailboxKind kind, UserContent content,
+                                 String idempotencyKey, MailboxState state, String boundTurnId,
+                                 Instant createdAt, Instant updatedAt, Instant consumedAt) {
         /** PENDING/BOUND/CONSUMED/CANCELLED 的空值组合必须与 V1 CHECK 保持一致。 */
         public MailboxMessage {
             if (sequence < 1) throw new IllegalArgumentException("invalid mailbox sequence");
@@ -319,16 +354,11 @@ public final class TaskModels {
         }
     }
 
-    /** QueueOnly 事务回执同时携带实际 Activity 投影 owner，避免 root 目标被误当作 Child Task。 */
-    public record MessageEnqueueReceipt(MailboxMessage mailbox, Summary projectionOwner,
-                                        boolean inserted) {
-        /** Mailbox 与投影必须属于同一根；是否首次插入由事务 winner 决定而非应用层猜测。 */
+    /** QueueOnly 事务回执只携带 Mailbox 事实，不把跨会话投递伪装成 Task Activity。 */
+    public record MessageEnqueueReceipt(MailboxMessage mailbox, boolean inserted) {
+        /** 是否首次插入由 SQLite 唯一键竞争的事务 winner 决定，而非应用层猜测。 */
         public MessageEnqueueReceipt {
             Objects.requireNonNull(mailbox, "mailbox");
-            Objects.requireNonNull(projectionOwner, "projectionOwner");
-            if (!mailbox.rootThreadId().equals(projectionOwner.lineage().rootThreadId())) {
-                throw new IllegalArgumentException("mailbox projection owner root mismatch");
-            }
         }
     }
 
@@ -416,11 +446,12 @@ public final class TaskModels {
     }
 
     /** Task 详情分页把三类低频事实绑定到同一个投影 revision。 */
-    public record Detail(Summary task, ContextSeed contextSeed, List<Activity> activities,
+    public record Detail(Summary task, ThreadSummary thread, ContextSeed contextSeed, List<Activity> activities,
                          List<MailboxMessage> mailbox) {
         /** 集合在离开 SqlSession 前冻结，禁止延迟加载逃逸事务快照。 */
         public Detail {
             Objects.requireNonNull(task, "task");
+            Objects.requireNonNull(thread, "thread");
             Objects.requireNonNull(contextSeed, "contextSeed");
             activities = List.copyOf(Objects.requireNonNull(activities, "activities"));
             mailbox = List.copyOf(Objects.requireNonNull(mailbox, "mailbox"));

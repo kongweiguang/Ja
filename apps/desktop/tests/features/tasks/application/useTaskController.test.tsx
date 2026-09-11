@@ -15,7 +15,8 @@ import type {
   TaskResumePort,
   TaskThreadRenamePort,
   TaskTranscriptPort,
-} from "@/features/tasks";
+  TaskTranscriptSnapshot,
+} from "@/features/tasks/application/ports";
 
 const task: TaskSummary = {
   taskThreadId: "thr_child",
@@ -43,6 +44,27 @@ const task: TaskSummary = {
 function taskRead(summary: TaskSummary = task): TaskReadModel {
   return {
     task: summary,
+    thread: {
+      threadId: summary.taskThreadId,
+      workspaceId: "ws_root",
+      activeGoalId: null,
+      preferences: {
+        providerId: "provider_test",
+        modelId: "model_test",
+        reasoningLevel: "medium",
+        accessMode: "approval_required",
+        collaborationMode: "default",
+        titleSource: "manual",
+      },
+      title: summary.taskName,
+      status: "active",
+      pinned: false,
+      latestTurnStatus: summary.state === "idle" ? null : summary.state,
+      latestTurnSeen: true,
+      revision: summary.revision,
+      createdAt: "2026-09-03T08:00:00Z",
+      updatedAt: summary.updatedAt,
+    },
     contextSeed: {
       contextSeedId: "seed_child",
       parentRevision: 4,
@@ -79,6 +101,71 @@ function taskRevisionConflict(): { readonly code: "TASK_CONTEXT_REVISION_CONFLIC
   return { code: "TASK_CONTEXT_REVISION_CONFLICT" };
 }
 
+/** 创建 CAS 场景使用根 Thread 的最小合法快照，避免把读取结果写入 child transcript 投影。 */
+function rootThreadSnapshot(threadId: string, revision: number) {
+  return {
+    threadId,
+    revision,
+    turns: [],
+    items: [],
+    inputQueue: null,
+    contextUsage: null,
+    taskActivities: [],
+    goalActivities: [],
+    nextCursor: null,
+  };
+}
+
+/** 构造可区分 running/terminal 的正文快照，验证迟到旧读取不会覆盖终态答案。 */
+function taskTranscriptSnapshot(
+  threadId: string,
+  revision: number,
+  status: "running" | "completed",
+  text: string,
+): TaskTranscriptSnapshot {
+  return {
+    threadId,
+    revision,
+    turns: [
+      {
+        turnId: "turn_child",
+        status,
+        requestedAt: "2026-09-10T10:00:00Z",
+        updatedAt: "2026-09-10T10:00:01Z",
+        completedAt: status === "completed" ? "2026-09-10T10:00:01Z" : null,
+        errorCode: null,
+        changeSet: null,
+      },
+    ],
+    items:
+      status === "completed"
+        ? [
+            {
+              itemId: "item_final",
+              createdAt: "2026-09-10T10:00:01Z",
+              turnId: "turn_child",
+              kind: "final_answer",
+              text,
+            },
+          ]
+        : [
+            {
+              itemId: "item_progress",
+              createdAt: "2026-09-10T10:00:00Z",
+              turnId: "turn_child",
+              kind: "assistant_progress",
+              text,
+              modelRound: 1,
+            },
+          ],
+    inputQueue: null,
+    contextUsage: null,
+    taskActivities: [],
+    goalActivities: [],
+    nextCursor: null,
+  };
+}
+
 /** 端口 mock 返回同一 revision，测试只关注观察生命周期和摘要/正文 IO 边界。 */
 function createPorts(): {
   port: TaskPort;
@@ -88,7 +175,7 @@ function createPorts(): {
   resume: TaskResumePort;
 } {
   const port: TaskPort = {
-    create: vi.fn(async () => ({ accepted: true as const, task, turnId: "turn_child" })),
+    create: vi.fn(async () => ({ accepted: true as const, task })),
     list: vi.fn(async () => ({ items: [task] })),
     read: vi.fn(async () => taskRead()),
     observe: vi.fn(async () => ({
@@ -98,6 +185,7 @@ function createPorts(): {
     })),
     unobserve: vi.fn(async () => undefined),
     seen: vi.fn(async () => ({ accepted: true as const, task })),
+    close: vi.fn(async () => ({ closed: true as const })),
     messageSend: vi.fn(async () => ({
       accepted: true as const,
       messageId: "msg_1",
@@ -123,6 +211,10 @@ function createPorts(): {
         revision: task.revision,
         turns: [],
         items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
         nextCursor: null,
       })),
     },
@@ -138,12 +230,80 @@ function createPorts(): {
   };
 }
 
+/** 侧聊 fixture 明确使用 independent 生命周期，测试不会把 Subagent 取消语义混入关闭路径。 */
+function sideTaskSummary(overrides: Partial<TaskSummary> = {}): TaskSummary {
+  return {
+    ...task,
+    taskKind: "side_task",
+    lifecycle: "independent",
+    ...overrides,
+  };
+}
+
+/** 通过公开 Task activity 总线注入摘要，模拟隐藏 Workbench 仍可收到的低频事件。 */
+function publishTaskActivity(summary: TaskSummary): void {
+  publishTaskHostEvent({
+    method: "task/activity",
+    params: {
+      rootThreadId: summary.rootThreadId,
+      taskThreadId: summary.taskThreadId,
+      taskRevision: summary.revision,
+      activity: {
+        activitySequence: summary.latestActivitySequence,
+        activityId: `activity_${summary.taskThreadId}`,
+        rootThreadId: summary.rootThreadId,
+        taskThreadId: summary.taskThreadId,
+        actorThreadId: summary.parentThreadId,
+        causalTurnId: summary.originTurnId,
+        kind: "progress",
+        summary: { text: summary.latestSafeSummary ?? "更新" },
+        createdAt: summary.updatedAt,
+      },
+      task: summary,
+    },
+  });
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
 });
 
 describe("useTaskController", () => {
+  it("Task 已读版本前进时仍接纳更新的 Thread 偏好，并拒绝旧 Thread metadata 回滚", async () => {
+    const ports = createPorts();
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        activeTaskThreadId: "thr_child",
+        visible: true,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+    await waitFor(() => expect(result.current.detail?.thread.revision).toBe(2));
+    const newerThread = taskRead({ ...task, revision: 1 });
+    newerThread.thread = {
+      ...newerThread.thread,
+      revision: 8,
+      preferences: { ...newerThread.thread.preferences!, modelId: "model_new" },
+    };
+    vi.mocked(ports.port.read).mockResolvedValue(newerThread);
+    await act(async () => result.current.refreshDetail());
+    expect(result.current.detail?.task.revision).toBe(2);
+    expect(result.current.detail?.thread.preferences?.modelId).toBe("model_new");
+    const newerTask = taskRead({ ...task, revision: 4 });
+    newerTask.thread.revision = 3;
+    vi.mocked(ports.port.read).mockResolvedValue(newerTask);
+    await act(async () => result.current.refreshDetail());
+    expect(result.current.detail?.task.revision).toBe(4);
+    expect(result.current.detail?.thread.revision).toBe(8);
+    expect(result.current.detail?.thread.preferences?.modelId).toBe("model_new");
+  });
+
   it("隐藏详情只消费摘要事件且不读取列表、正文或建立观察", async () => {
     const ports = createPorts();
     const discovered = vi.fn();
@@ -172,6 +332,7 @@ describe("useTaskController", () => {
           activity: {
             activitySequence: 3,
             activityId: "activity_child",
+            rootThreadId: "thr_root",
             taskThreadId: "thr_child",
             actorThreadId: "thr_root",
             causalTurnId: "turn_parent",
@@ -210,7 +371,7 @@ describe("useTaskController", () => {
       { initialProps: { visible: true } },
     );
     await waitFor(() => expect(ports.port.observe).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(ports.transcript.read).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(ports.transcript.read).toHaveBeenCalledTimes(2));
 
     rerender({ visible: false });
     await waitFor(() =>
@@ -256,7 +417,7 @@ describe("useTaskController", () => {
       taskThreadId: "thr_child",
       expectedTaskRevision: 4,
     });
-    expect(ports.port.read).toHaveBeenCalledTimes(2);
+    expect(ports.port.read).toHaveBeenCalledTimes(3);
     expect(result.current.detail?.task.revision).toBe(4);
     expect(result.current.detailError).toBeUndefined();
   });
@@ -332,6 +493,7 @@ describe("useTaskController", () => {
 
   it("首次创建与后续 follow-up 使用不同原生用例并保留显式 revision", async () => {
     const ports = createPorts();
+    vi.mocked(ports.transcript.read).mockResolvedValueOnce(rootThreadSnapshot("thr_root", 9));
     const { result } = renderHook(() =>
       useTaskController({
         rootThreadId: "thr_root",
@@ -347,7 +509,6 @@ describe("useTaskController", () => {
     await act(() =>
       result.current.createSideTask({
         taskName: "检查测试",
-        content: [{ type: "text", text: "开始" }],
       }),
     );
     await act(() => result.current.followup(task, [{ type: "text", text: "继续" }]));
@@ -355,10 +516,14 @@ describe("useTaskController", () => {
     expect(ports.port.create).toHaveBeenCalledWith(
       expect.objectContaining({
         parentThreadId: "thr_root",
-        expectedParentRevision: 4,
+        expectedParentRevision: 9,
         parentTurnId: null,
       }),
     );
+    expect(ports.transcript.read).toHaveBeenNthCalledWith(1, {
+      threadId: "thr_root",
+      limit: 1,
+    });
     expect(ports.port.followup).toHaveBeenCalledWith(
       expect.objectContaining({
         senderThreadId: "thr_root",
@@ -367,6 +532,368 @@ describe("useTaskController", () => {
       }),
     );
     expect(ports.port.messageSend).not.toHaveBeenCalled();
+  });
+
+  it("侧聊激活等待 observe 后再发送，终态 ACK 不被迟到 running 投影覆盖", async () => {
+    const ports = createPorts();
+    const initialDetail = deferred<TaskReadModel>();
+    const postObserveDetail = deferred<TaskReadModel>();
+    const initialTranscript = deferred<TaskTranscriptSnapshot>();
+    const postObserveTranscript = deferred<TaskTranscriptSnapshot>();
+    const observed = deferred<{
+      observationId: string;
+      taskThreadId: string;
+      revision: number;
+    }>();
+    const completed = sideTaskSummary({
+      state: "completed",
+      revision: 4,
+      latestSafeSummary: "已完成",
+      completedAt: "2026-09-10T10:00:01Z",
+      updatedAt: "2026-09-10T10:00:01Z",
+    });
+    const lateRunning = { ...completed, state: "running" as const, completedAt: null };
+    const runningSnapshot = taskTranscriptSnapshot(
+      task.taskThreadId,
+      task.revision,
+      "running",
+      "正在处理",
+    );
+    const completedSnapshot = taskTranscriptSnapshot(
+      task.taskThreadId,
+      completed.revision,
+      "completed",
+      "JA_SIDE_CHAT_BTW_DONE",
+    );
+    const lateRunningSnapshot = taskTranscriptSnapshot(
+      task.taskThreadId,
+      completed.revision,
+      "running",
+      "旧的运行中投影",
+    );
+    vi.mocked(ports.port.read)
+      .mockReturnValueOnce(initialDetail.promise)
+      .mockReturnValueOnce(postObserveDetail.promise)
+      .mockResolvedValue(taskRead(lateRunning));
+    vi.mocked(ports.transcript.read)
+      .mockReturnValueOnce(initialTranscript.promise)
+      .mockReturnValueOnce(postObserveTranscript.promise)
+      .mockResolvedValueOnce(completedSnapshot)
+      .mockResolvedValue(lateRunningSnapshot);
+    vi.mocked(ports.port.observe).mockReturnValueOnce(observed.promise);
+    vi.mocked(ports.port.followup).mockResolvedValue({
+      accepted: true,
+      messageId: "msg_btw",
+      turnId: "turn_btw",
+      task: completed,
+    });
+
+    const { result, rerender } = renderHook(
+      ({ activeTaskThreadId }: { activeTaskThreadId?: string }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          activeTaskThreadId,
+          visible: true,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+        }),
+      { initialProps: { activeTaskThreadId: undefined as string | undefined } },
+    );
+    let readySettled = false;
+    const ready = result.current.waitForTaskReady(task.taskThreadId).then(() => {
+      readySettled = true;
+    });
+
+    rerender({ activeTaskThreadId: task.taskThreadId });
+    await waitFor(() => expect(ports.port.read).toHaveBeenCalledTimes(1));
+    initialDetail.resolve(taskRead(task));
+    initialTranscript.resolve(runningSnapshot);
+    await waitFor(() => expect(ports.port.observe).toHaveBeenCalledTimes(1));
+    expect(readySettled).toBe(false);
+
+    observed.resolve({
+      observationId: "observation_btw",
+      taskThreadId: task.taskThreadId,
+      revision: task.revision,
+    });
+    await waitFor(() => expect(ports.port.read).toHaveBeenCalledTimes(2));
+    expect(readySettled).toBe(false);
+    postObserveDetail.resolve(taskRead(task));
+    postObserveTranscript.resolve(runningSnapshot);
+    await ready;
+    expect(readySettled).toBe(true);
+
+    await act(() => result.current.followup(task, [{ type: "text", text: "/btw" }]));
+    expect(result.current.detail?.task.state).toBe("completed");
+    expect(result.current.transcript?.items.at(-1)).toEqual(
+      expect.objectContaining({ kind: "final_answer", text: "JA_SIDE_CHAT_BTW_DONE" }),
+    );
+
+    act(() => publishTaskActivity(lateRunning));
+    await waitFor(() => expect(ports.port.read).toHaveBeenCalledTimes(3));
+    expect(result.current.detail?.task.state).toBe("completed");
+    expect(result.current.transcript?.items.at(-1)).toEqual(
+      expect.objectContaining({ kind: "final_answer", text: "JA_SIDE_CHAT_BTW_DONE" }),
+    );
+  });
+
+  it("侧聊 Composer 创建时使用当前 child 的来源、revision、偏好，并以该来源 follow-up", async () => {
+    const ports = createPorts();
+    const source = sideTaskSummary({
+      taskThreadId: "thr_side_source",
+      parentThreadId: "thr_root",
+      rootThreadId: "thr_root",
+      revision: 7,
+    });
+    const preferences = {
+      providerId: "provider_side",
+      modelId: "model_side",
+      reasoningLevel: "high" as const,
+      accessMode: "full_access" as const,
+      collaborationMode: "plan" as const,
+    };
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+    act(() => publishTaskActivity(source));
+
+    await act(() =>
+      result.current.createSideTask({
+        taskName: "侧聊",
+        sourceThreadId: source.taskThreadId,
+        sourceThreadRevision: source.revision,
+        preferences,
+      }),
+    );
+    await act(() =>
+      result.current.followup(task, [{ type: "text", text: "来自侧聊" }], source.taskThreadId),
+    );
+
+    expect(ports.port.create).toHaveBeenCalledWith({
+      parentThreadId: source.taskThreadId,
+      parentTurnId: null,
+      expectedParentRevision: source.revision,
+      taskName: "侧聊",
+      preferences,
+    });
+    expect(ports.port.followup).toHaveBeenCalledWith(
+      expect.objectContaining({ senderThreadId: source.taskThreadId }),
+    );
+    expect(ports.transcript.read).toHaveBeenCalledExactlyOnceWith({
+      threadId: task.taskThreadId,
+    });
+  });
+
+  it("创建 CAS 冲突后只重读根 revision 一次并重试创建", async () => {
+    const ports = createPorts();
+    vi.mocked(ports.transcript.read)
+      .mockResolvedValueOnce(rootThreadSnapshot("thr_root", 9))
+      .mockResolvedValueOnce(rootThreadSnapshot("thr_root", 10));
+    vi.mocked(ports.port.create)
+      .mockRejectedValueOnce(taskRevisionConflict())
+      .mockResolvedValueOnce({ accepted: true, task });
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        parentRevision: 4,
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+
+    await act(() => result.current.createSideTask({ taskName: "检查测试" }));
+
+    expect(ports.transcript.read).toHaveBeenCalledTimes(2);
+    expect(ports.port.create).toHaveBeenCalledTimes(2);
+    expect(ports.port.create).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ expectedParentRevision: 9 }),
+    );
+    expect(ports.port.create).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ expectedParentRevision: 10 }),
+    );
+  });
+
+  it("根 Thread 切换期间根快照迟到时不创建 child", async () => {
+    const ports = createPorts();
+    const pendingRootRead = deferred<ReturnType<typeof rootThreadSnapshot>>();
+    vi.mocked(ports.transcript.read).mockReturnValueOnce(pendingRootRead.promise);
+    const { result, rerender } = renderHook(
+      ({ rootThreadId }) =>
+        useTaskController({
+          rootThreadId,
+          parentRevision: 4,
+          visible: false,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+        }),
+      { initialProps: { rootThreadId: "thr_root" } },
+    );
+
+    const pending = result.current
+      .createSideTask({ taskName: "切换期间创建" })
+      .catch((error: unknown) => error);
+    await waitFor(() => expect(ports.transcript.read).toHaveBeenCalledTimes(1));
+    rerender({ rootThreadId: "thr_other" });
+    pendingRootRead.resolve(rootThreadSnapshot("thr_root", 9));
+
+    await expect(pending).resolves.toEqual(new Error("侧聊创建失败，请重试。"));
+    expect(ports.port.create).not.toHaveBeenCalled();
+  });
+
+  it("非 CAS 创建错误不重试，避免创建结果不确定时重复 child", async () => {
+    const ports = createPorts();
+    vi.mocked(ports.transcript.read).mockResolvedValueOnce(rootThreadSnapshot("thr_root", 9));
+    vi.mocked(ports.port.create).mockRejectedValueOnce(new Error("STORAGE_UNAVAILABLE"));
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        parentRevision: 4,
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+
+    await expect(result.current.createSideTask({ taskName: "不重复创建" })).rejects.toEqual(
+      new Error("侧聊创建失败，请重试。"),
+    );
+    expect(ports.transcript.read).toHaveBeenCalledTimes(1);
+    expect(ports.port.create).toHaveBeenCalledTimes(1);
+  });
+
+  /** 关闭 ACK 前保留可重试投影，ACK 后连同已知后代一起从本地任务树移除。 */
+  it("侧聊关闭等待 ACK，成功后移除整棵已知子树并压制迟到事件", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const childTask: TaskSummary = {
+      ...task,
+      taskThreadId: "thr_side_child",
+      parentThreadId: sideTask.taskThreadId,
+      rootThreadId: sideTask.rootThreadId,
+      taskName: "侧聊子任务",
+      depth: sideTask.depth + 1,
+      taskKind: "subagent",
+      lifecycle: "attached",
+    };
+    const closeAck = deferred<{ closed: true }>();
+    vi.mocked(ports.port.close).mockReturnValueOnce(closeAck.promise);
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        activeTaskThreadId: undefined,
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+
+    act(() => {
+      publishTaskActivity(sideTask);
+      publishTaskActivity(childTask);
+    });
+    expect(result.current.tasks).toEqual(expect.arrayContaining([sideTask, childTask]));
+
+    let pendingClose!: Promise<void>;
+    act(() => {
+      pendingClose = result.current.close(sideTask);
+    });
+    await waitFor(() => expect(result.current.closingTaskThreadId).toBe(sideTask.taskThreadId));
+    expect(result.current.tasks).toEqual(expect.arrayContaining([sideTask, childTask]));
+
+    await act(async () => {
+      closeAck.resolve({ closed: true });
+      await pendingClose;
+    });
+    expect(result.current.tasks).toEqual([]);
+    expect(result.current.closingTaskThreadId).toBeUndefined();
+
+    act(() => publishTaskActivity({ ...childTask, revision: childTask.revision + 1 }));
+    expect(result.current.tasks).toEqual([]);
+  });
+
+  /** 关闭拒绝不能清掉 Tab 所依赖的投影，用户可在原位重试。 */
+  it("侧聊关闭失败保留投影并返回稳定错误", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    vi.mocked(ports.port.close).mockRejectedValueOnce(new Error("CLOSE_FAILED"));
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+    act(() => publishTaskActivity(sideTask));
+
+    await expect(result.current.close(sideTask)).rejects.toEqual(
+      new Error("侧聊关闭失败，请重试。"),
+    );
+    expect(result.current.tasks).toEqual([sideTask]);
+    expect(result.current.closingTaskThreadId).toBeUndefined();
+  });
+
+  /** 关闭进入服务端 ACK 等待后立即拒绝新的 follow-up，避免向待销毁目标排队输入。 */
+  it("侧聊关闭期间拒绝 follow-up 且不调用发送端口", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const closeAck = deferred<{ closed: true }>();
+    vi.mocked(ports.port.close).mockReturnValueOnce(closeAck.promise);
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+
+    let pendingClose!: Promise<void>;
+    act(() => {
+      pendingClose = result.current.close(sideTask);
+    });
+    await waitFor(() => expect(result.current.closingTaskThreadId).toBe(sideTask.taskThreadId));
+    await expect(
+      result.current.followup(sideTask, [{ type: "text", text: "不要发送" }]),
+    ).rejects.toEqual(new Error("消息未发送，请重试。"));
+    expect(ports.port.followup).not.toHaveBeenCalled();
+
+    await act(async () => {
+      closeAck.resolve({ closed: true });
+      await pendingClose;
+    });
   });
 
   it("uses thread rename CAS then accepts the advanced task projection over a stale summary", async () => {
@@ -387,6 +914,10 @@ describe("useTaskController", () => {
       revision: 9,
       turns: [],
       items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
       nextCursor: null,
     });
     vi.mocked(ports.rename.rename).mockResolvedValue({
@@ -430,6 +961,7 @@ describe("useTaskController", () => {
           activity: {
             activitySequence: 3,
             activityId: "activity_stale_title",
+            rootThreadId: "thr_root",
             taskThreadId: sideTask.taskThreadId,
             actorThreadId: "thr_root",
             causalTurnId: "turn_parent",
@@ -481,7 +1013,7 @@ describe("useTaskController", () => {
     renameAck.resolve({ threadId: sideTask.taskThreadId, title: "切换后名称", revision: 3 });
     const failure = await pending;
 
-    expect(failure).toEqual(new Error("侧边任务重命名失败，请重试。"));
+    expect(failure).toEqual(new Error("侧聊重命名失败，请重试。"));
     expect(result.current.tasks).toEqual([]);
   });
 
@@ -554,6 +1086,7 @@ describe("useTaskController", () => {
           updatedAt: "2026-09-03T07:01:00Z",
           completedAt: null,
           errorCode: null,
+          changeSet: null,
         },
         {
           turnId: "turn_latest",
@@ -562,9 +1095,14 @@ describe("useTaskController", () => {
           updatedAt: "2026-09-03T08:01:00Z",
           completedAt: null,
           errorCode: null,
+          changeSet: null,
         },
       ],
       items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
       nextCursor: null,
     });
     const { result } = renderHook(() =>
@@ -588,8 +1126,8 @@ describe("useTaskController", () => {
       turnId: "turn_old",
       expectedThreadRevision: 11,
     });
-    expect(ports.port.read).toHaveBeenCalledTimes(2);
-    expect(ports.transcript.read).toHaveBeenCalledTimes(2);
+    expect(ports.port.read).toHaveBeenCalledTimes(3);
+    expect(ports.transcript.read).toHaveBeenCalledTimes(3);
   });
 
   it("task/seen 提升 revision 后同步详情，后续 follow-up 不提交旧 CAS", async () => {
@@ -645,6 +1183,7 @@ describe("useTaskController", () => {
     const firstSeen = deferred<{ accepted: true; task: TaskSummary }>();
     vi.mocked(ports.port.read)
       .mockResolvedValueOnce(taskRead(unread))
+      .mockResolvedValueOnce(taskRead(unread))
       .mockResolvedValueOnce(taskRead(terminal));
     vi.mocked(ports.port.seen)
       .mockImplementationOnce(() => firstSeen.promise)
@@ -691,6 +1230,7 @@ describe("useTaskController", () => {
           activity: {
             activitySequence: terminal.latestActivitySequence,
             activityId: "activity_terminal",
+            rootThreadId: "thr_root",
             taskThreadId: "thr_child",
             actorThreadId: "thr_child",
             causalTurnId: "turn_child",

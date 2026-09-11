@@ -30,6 +30,8 @@ final class TurnOwnership {
     final CompletableFuture<TurnResult> completion;
     final boolean provisionalTitleCreated;
     final AtomicBoolean cancelRequested = new AtomicBoolean();
+    /** Plan pause 与用户取消共用协作式 Token，但只有前者允许保留 execution cursor。 */
+    final AtomicBoolean planPauseRequested = new AtomicBoolean();
     final AtomicReference<ConversationRepository.CancellationClaim> cancellationClaim = new AtomicReference<>();
     final AtomicReference<Throwable> cancellationDebt = new AtomicReference<>();
     final AtomicBoolean queuedSettlement = new AtomicBoolean();

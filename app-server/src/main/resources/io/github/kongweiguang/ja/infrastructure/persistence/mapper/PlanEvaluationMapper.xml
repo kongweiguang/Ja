@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper">
+    <resultMap id="prior" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationPriorRow">
+        <constructor>
+            <idArg column="request_id" javaType="String"/>
+            <arg column="outcome" javaType="String"/>
+            <arg column="verdict" javaType="String"/>
+            <arg column="criteria_json" javaType="String"/>
+            <arg column="summary" javaType="String"/>
+        </constructor>
+    </resultMap>
+    <select id="selectPrior" resultMap="prior">
+        SELECT request_id,outcome,verdict,criteria_json,summary
+        FROM plan_evaluation_requests WHERE request_id=#{requestId}
+    </select>
+    <insert id="insertIntent">
+        INSERT INTO plan_evaluation_requests(request_id,plan_id,plan_revision_id,run_id,owner_thread_id,
+            input_digest,profile_json,outcome,certainty,started_at)
+        VALUES(#{requestId},#{planId},#{planRevisionId},#{runId},#{ownerThreadId},#{inputDigest},#{profileJson},
+            'RUNNING','UNKNOWN',#{startedAt})
+    </insert>
+    <update id="reserveModelRound">
+        UPDATE execution_runs
+        SET used_model_rounds=used_model_rounds+1,updated_at=#{startedAt}
+        WHERE run_id=#{runId} AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+          AND status IN ('RUNNING','VERIFYING')
+          AND pause_requested=0
+          AND max_model_rounds IS NOT NULL AND used_model_rounds &lt; max_model_rounds
+          AND wall_budget_millis IS NOT NULL AND used_active_millis &lt; wall_budget_millis
+          AND EXISTS (
+                SELECT 1 FROM plans p
+                WHERE p.plan_id=execution_runs.plan_id
+                  AND p.plan_id=#{planId}
+                  AND p.owner_thread_id=#{ownerThreadId}
+                  AND p.status='VERIFYING'
+                  AND p.active_run_id=execution_runs.run_id
+                  AND p.active_plan_revision_id=execution_runs.plan_revision_id
+          )
+    </update>
+    <update id="settleActiveMillis">
+        UPDATE execution_runs
+        SET used_active_millis=used_active_millis + (
+                SELECT CAST(MAX(0,ROUND((julianday(#{completedAt}) - julianday(started_at)) * 86400000.0)) AS INTEGER)
+                FROM plan_evaluation_requests
+                WHERE request_id=#{requestId} AND plan_id=#{planId}
+                  AND plan_revision_id=#{planRevisionId} AND run_id=#{runId}
+                  AND outcome='RUNNING'
+            ),
+            updated_at=#{completedAt}
+        WHERE run_id=#{runId} AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+          AND status IN ('RUNNING','VERIFYING','PAUSED','STOPPED')
+          AND EXISTS (
+                SELECT 1 FROM plan_evaluation_requests
+                WHERE request_id=#{requestId} AND plan_id=#{planId}
+                  AND plan_revision_id=#{planRevisionId} AND run_id=#{runId}
+                  AND outcome='RUNNING'
+          )
+    </update>
+    <update id="settleUsage">
+        UPDATE plan_evaluation_requests SET outcome=#{outcome},certainty=#{certainty},
+            input_tokens=#{inputTokens},output_tokens=#{outputTokens},total_tokens=#{totalTokens},
+            verdict=#{verdict},criteria_json=#{criteriaJson},summary=#{summary},
+            completed_at=#{completedAt}
+        WHERE request_id=#{requestId} AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+          AND run_id=#{runId} AND outcome='RUNNING'
+    </update>
+</mapper>

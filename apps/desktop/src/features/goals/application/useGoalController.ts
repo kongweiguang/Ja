@@ -9,7 +9,8 @@ import type {
   PlanReadModel,
   PlanRevision,
 } from "../domain/goalModel";
-import type { GoalMutationAction, GoalPort, GoalPortError } from "./ports";
+import { planProgressFromRevision } from "../domain/goalModel";
+import type { GoalMutationAction, GoalOwnerKind, GoalPort, GoalPortError } from "./ports";
 
 export interface GoalController {
   readonly model: GoalReadModel | undefined;
@@ -29,12 +30,15 @@ export interface GoalController {
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
   stop(): Promise<boolean>;
-  respondInput(response: string): Promise<boolean>;
   saveDraft(draft: PlanDraft): Promise<boolean>;
   discardDraft(): Promise<boolean>;
   propose(): Promise<boolean>;
-  approve(): Promise<boolean>;
+  /** 编辑器完成编辑时定稿，执行授权仍只由 execute 提交。 */
+  finalizePlan(): Promise<boolean>;
   execute(): Promise<boolean>;
+  pausePlan(): Promise<boolean>;
+  resumePlan(): Promise<boolean>;
+  stopPlan(): Promise<boolean>;
   attachPlan(): Promise<boolean>;
   detachPlan(): Promise<boolean>;
   reject(): Promise<boolean>;
@@ -43,6 +47,8 @@ export interface GoalController {
 interface UseGoalControllerOptions {
   readonly goalId?: string;
   readonly ownerThreadId?: string;
+  /** 侧边任务使用 independent_task，主任务默认 thread。 */
+  readonly ownerKind?: GoalOwnerKind;
   readonly visible: boolean;
   readonly detailsVisible?: boolean;
   readonly port: GoalPort;
@@ -60,16 +66,12 @@ function actionErrorMessage(action: GoalMutationAction | "read"): string {
   switch (action) {
     case "read":
       return "目标暂时不可用，请重试。";
-    case "approve":
-      return "计划版本已变化，请刷新后重新批准。";
     case "execute":
-      return "计划未能启动，请确认批准版本后重试。";
-    case "attach_plan":
-      return "计划未能用于当前目标，请确认计划仍已批准。";
-    case "respond_input":
-      return "输入未提交，请检查目标状态后重试。";
+      return "计划未能启动，请确认当前版本后重试。";
     case "save_draft":
-      return "计划草稿未保存，请重试。";
+      return "草稿保存失败，本地修改仍保留，请重试。";
+    case "attach_plan":
+      return "计划未能用于当前目标，请确认当前版本仍可用。";
     default:
       return "操作未完成，请重试。";
   }
@@ -89,7 +91,9 @@ function linkedPlanModel(model: GoalReadModel): PlanReadModel | undefined {
   return {
     plan: model.planState,
     revision: model.plan,
+    revisionHydrationRequired: false,
     draft: model.draft,
+    progress: planProgressFromRevision(model.plan),
     approvedPlanRevisionId:
       model.plan?.approvedAt === null ? null : (model.plan?.planRevisionId ?? null),
     eventSequence: model.planEventSequence ?? model.planState.revision,
@@ -135,6 +139,7 @@ async function retrySettlingGoalMutation(
 export function useGoalController({
   goalId,
   ownerThreadId,
+  ownerKind = "thread",
   visible,
   detailsVisible = false,
   port,
@@ -156,6 +161,7 @@ export function useGoalController({
   const mutationInFlightRef = useRef(false);
   const modelRef = useRef<GoalReadModel | undefined>(undefined);
   const planModelRef = useRef<PlanReadModel | undefined>(undefined);
+  const planDiscoveryKeyRef = useRef<string | undefined>(undefined);
   const refreshRef = useRef<() => Promise<void>>(async () => undefined);
   const retainedKeysRef = useRef(
     new Map<GoalMutationAction, { readonly signature: string; readonly key: string }>(),
@@ -191,8 +197,16 @@ export function useGoalController({
       setModel(next);
       const linked = linkedPlanModel(next);
       if (linked !== undefined) {
-        planModelRef.current = linked;
-        setPlanModel(linked);
+        const currentPlan = planModelRef.current;
+        if (
+          currentPlan === undefined ||
+          currentPlan.plan.planId !== linked.plan.planId ||
+          (currentPlan.plan.revision <= linked.plan.revision &&
+            currentPlan.eventSequence <= linked.eventSequence)
+        ) {
+          planModelRef.current = linked;
+          setPlanModel(linked);
+        }
       }
       return true;
     },
@@ -216,8 +230,13 @@ export function useGoalController({
       current !== undefined &&
       current.plan.revision === next.plan.revision &&
       current.eventSequence === next.eventSequence
-    )
+    ) {
+      if (current.revisionHydrationRequired && !next.revisionHydrationRequired) {
+        planModelRef.current = next;
+        setPlanModel(next);
+      }
       return true;
+    }
     planModelRef.current = next;
     setPlanModel(next);
     return true;
@@ -276,7 +295,19 @@ export function useGoalController({
                 selectedPlan.revision.planRevisionId === nextGoal.goal.activePlanRevisionId
               ? selectedPlan.revision.planRevisionId
               : undefined;
-      const [revisionResult, evidenceResult] = await Promise.all([
+      const standaloneEvidenceTarget =
+        nextGoal === undefined &&
+        selectedPlan?.revision !== null &&
+        selectedPlan?.revision !== undefined &&
+        selectedPlan.plan.activeRunId !== null
+          ? {
+              ownerThreadId: selectedPlan.plan.ownerThreadId,
+              planId: selectedPlan.plan.planId,
+              planRevisionId: selectedPlan.revision.planRevisionId,
+              runId: selectedPlan.plan.activeRunId,
+            }
+          : undefined;
+      const [revisionResult, evidenceResult, planEvidenceResult] = await Promise.all([
         selectedPlan === undefined
           ? Promise.resolve({ items: [] as PlanRevision[] })
           : port.planRevisions({
@@ -290,17 +321,24 @@ export function useGoalController({
               goalDefinitionRevision: nextGoal.goal.goalDefinitionRevision,
               planRevisionId: evidencePlanRevisionId,
             }),
+        standaloneEvidenceTarget === undefined
+          ? Promise.resolve({ items: [] as AcceptanceEvidence[] })
+          : port.readPlanEvidence(standaloneEvidenceTarget),
       ]);
       if (epoch !== epochRef.current || refreshSequence !== refreshSequenceRef.current) return;
       setRevisions(revisionResult.items);
       setEvidence(
-        nextGoal === undefined || evidencePlanRevisionId === undefined
-          ? []
-          : evidenceResult.items.filter(
-              (item) =>
-                item.goalDefinitionRevision === nextGoal.goal.goalDefinitionRevision &&
-                item.planRevisionId === evidencePlanRevisionId,
-            ),
+        nextGoal === undefined
+          ? planEvidenceResult.items.filter(
+              (item) => item.planRevisionId === standaloneEvidenceTarget?.planRevisionId,
+            )
+          : evidencePlanRevisionId === undefined
+            ? []
+            : evidenceResult.items.filter(
+                (item) =>
+                  item.goalDefinitionRevision === nextGoal.goal.goalDefinitionRevision &&
+                  item.planRevisionId === evidencePlanRevisionId,
+              ),
       );
     } catch {
       if (epoch === epochRef.current && refreshSequence === refreshSequenceRef.current)
@@ -311,6 +349,21 @@ export function useGoalController({
     }
   }, [acceptModel, acceptPlanModel, detailsVisible, effectiveGoalId, port, visible]);
 
+  /** 事件只提示正文可能变化；回读仍受当前 Plan identity 保护，避免旧请求覆盖新计划。 */
+  const refreshPlan = useCallback(
+    async (ownerThreadId: string, planId: string): Promise<void> => {
+      try {
+        const next = await port.readPlan({ ownerThreadId, planId });
+        const current = planModelRef.current;
+        if (current?.plan.planId === planId && current.plan.ownerThreadId === ownerThreadId)
+          acceptPlanModel(next);
+      } catch {
+        // 计划事件仍保留轻量摘要；正文失败由详情入口的下一次刷新重试。
+      }
+    },
+    [acceptPlanModel, port],
+  );
+
   /**
    * 详情显隐只替换最新 refresh 实现并按需读取重型投影，不能进入 Goal observation 的依赖。
    * 否则展开 Plan sheet 会制造 unobserve 间隙，恰在此时启动的 continuation 将永久失去 Turn 流。
@@ -320,9 +373,56 @@ export function useGoalController({
     if (modelRef.current !== undefined) void refresh();
   }, [refresh]);
 
+  /** 可见 Thread 启动时恢复其唯一当前 Plan；该查询只执行一次且不要求 Goal 已存在。 */
+  useEffect(() => {
+    const discoveryKey = `${visible ? "visible" : "hidden"}:${ownerThreadId ?? ""}`;
+    if (planDiscoveryKeyRef.current === discoveryKey) return;
+    planDiscoveryKeyRef.current = discoveryKey;
+    if (!visible || ownerThreadId === undefined) return;
+    let cancelled = false;
+    void port
+      .currentPlan(ownerThreadId)
+      .then((current) => {
+        if (cancelled || current === undefined) return;
+        acceptPlanModel(current);
+        if (detailsVisible) void refresh();
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [acceptPlanModel, detailsVisible, ownerThreadId, port, refresh, visible]);
+
+  /** Plan observation 与 Goal observation 分离，关闭详情只释放自己的 Plan 句柄。 */
+  useEffect(() => {
+    const current = planModelRef.current;
+    if (!visible || current === undefined) return;
+    const owner = current.plan.ownerThreadId;
+    if (ownerThreadId !== undefined && owner !== ownerThreadId) return;
+    const planId = current.plan.planId;
+    let disposed = false;
+    let observationId: string | undefined;
+    void port
+      .observePlan({ ownerThreadId: owner, planId })
+      .then((observed) => {
+        if (disposed) {
+          void port.unobservePlan({ observationId: observed.observationId }).catch(() => undefined);
+          return;
+        }
+        observationId = observed.observationId;
+        acceptPlanModel(observed.plan);
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      if (observationId !== undefined)
+        void port.unobservePlan({ observationId }).catch(() => undefined);
+    };
+  }, [acceptPlanModel, ownerThreadId, planModel?.plan.planId, port, visible]);
+
   /**
-   * `/goal` 显式创建才建立 Goal，并把 ACK identity 暂存在当前 owner Thread；该 identity 只用于
-   * 立刻读取服务端聚合，Thread catalog 回读后仍由 activeGoalId 接管，不生成第二份 Goal 状态。
+   * `/goal` 显式创建才建立 Goal，并把 ACK identity 暂存在 UI 明确传入的 owner Thread；独立侧边
+   * 任务必须同时声明 independent_task，防止创建请求误落到主任务，不生成第二份 Goal 状态。
    */
   const create = useCallback(
     async (requestedOwnerThreadId: string, objective: string): Promise<boolean> => {
@@ -347,6 +447,7 @@ export function useGoalController({
       try {
         const next = await port.create({
           ownerThreadId: requestedOwnerThreadId,
+          ownerKind,
           objective: normalizedObjective,
           expectedGoalRevision: 0,
           idempotencyKey: key,
@@ -372,7 +473,7 @@ export function useGoalController({
         }
       }
     },
-    [effectiveGoalId, ownerThreadId, port, visible],
+    [effectiveGoalId, ownerKind, ownerThreadId, port, visible],
   );
 
   /**
@@ -386,6 +487,13 @@ export function useGoalController({
       expectedThreadRevision: number,
     ): Promise<boolean> => {
       if (!visible || mutationInFlightRef.current || expectedThreadRevision < 0) return false;
+      const existing = planModelRef.current?.plan;
+      if (
+        existing?.ownerThreadId === requestedOwnerThreadId &&
+        existing.status !== "completed" &&
+        existing.status !== "stopped"
+      )
+        return true;
       const normalizedObjective = objective.trim();
       if (normalizedObjective === "") return false;
       const epoch = epochRef.current;
@@ -588,13 +696,48 @@ export function useGoalController({
   }, [ownerThreadId]);
 
   /**
-   * 事件只携带 identity：落后或已包含在当前权威快照中的事件直接丢弃；前进或 gap 均统一回读，
-   * 不从事件正文推导状态，也不允许旧通知把较新的 mutation ACK 拉回历史投影。
+   * Plan 事件携带轻量摘要时直接推进当前 Plan 投影，避免每个状态变化都重新读取完整 revision；
+   * 草稿和待批准提案尚无 active identity，必须同样标记正文待补齐，才能接纳先于 ACK 到达的事件。
    */
   useEffect(
     () =>
       port.subscribe((event) => {
         if (!visible) return;
+        if (event.method === "plan/changed") {
+          const currentPlan = planModelRef.current;
+          if (
+            currentPlan === undefined ||
+            event.planId !== currentPlan.plan.planId ||
+            (event.ownerThreadId !== undefined &&
+              event.ownerThreadId !== currentPlan.plan.ownerThreadId)
+          )
+            return;
+          if (
+            event.planEventSequence !== undefined &&
+            event.planEventSequence <= currentPlan.eventSequence
+          )
+            return;
+          if (event.plan === undefined) {
+            void refresh();
+            return;
+          }
+          const revisionChanged =
+            event.plan.activePlanRevisionId !== currentPlan.plan.activePlanRevisionId ||
+            (event.plan.revision !== currentPlan.plan.revision &&
+              (event.plan.status === "draft" || event.plan.status === "awaiting_approval"));
+          const nextPlan: PlanReadModel = {
+            ...currentPlan,
+            plan: event.plan,
+            revision: revisionChanged ? null : currentPlan.revision,
+            draft: revisionChanged ? null : currentPlan.draft,
+            revisionHydrationRequired: revisionChanged || currentPlan.revisionHydrationRequired,
+            progress: event.progress ?? currentPlan.progress,
+            eventSequence: event.planEventSequence ?? event.plan.revision,
+          };
+          if (!acceptPlanModel(nextPlan)) return;
+          if (revisionChanged) void refreshPlan(event.plan.ownerThreadId, event.plan.planId);
+          return;
+        }
         if (event.goalId === effectiveGoalId) {
           const current = modelRef.current;
           if (
@@ -615,10 +758,11 @@ export function useGoalController({
           event.goalRevision === 0 &&
           event.ownerThreadId === ownerThreadId
         ) {
-          setProvisionalGoal({ goalId: event.goalId, ownerThreadId });
+          if (event.goalId !== undefined)
+            setProvisionalGoal({ goalId: event.goalId, ownerThreadId });
         }
       }),
-    [effectiveGoalId, ownerThreadId, port, refresh, visible],
+    [acceptPlanModel, effectiveGoalId, ownerThreadId, port, refresh, refreshPlan, visible],
   );
 
   return useMemo(
@@ -663,18 +807,6 @@ export function useGoalController({
             idempotencyKey: key,
           }),
         ),
-      respondInput: (response) =>
-        mutate("respond_input", response, (key, current) => {
-          if (current.inputRequest === null)
-            return Promise.reject(new Error("input request missing"));
-          return port.respondInput({
-            goalId: current.goal.goalId,
-            requestId: current.inputRequest.requestId,
-            response,
-            expectedGoalRevision: current.goal.revision,
-            idempotencyKey: key,
-          });
-        }),
       saveDraft: (draft) =>
         mutatePlan("save_draft", JSON.stringify(draft), (key, current) =>
           port.saveDraft({
@@ -703,18 +835,15 @@ export function useGoalController({
             idempotencyKey: key,
           }),
         ),
-      approve: () =>
-        mutatePlan("approve", planModel?.revision?.planRevisionId ?? "missing", (key, current) => {
-          if (current.revision === null) return Promise.reject(new Error("plan revision missing"));
-          return port.approve({
+      finalizePlan: () =>
+        mutatePlan("propose", "propose", (key, current) =>
+          port.propose({
             ownerThreadId: current.plan.ownerThreadId,
             planId: current.plan.planId,
-            planRevisionId: current.revision.planRevisionId,
-            planHash: current.revision.planHash,
             expectedPlanRevision: current.plan.revision,
             idempotencyKey: key,
-          });
-        }),
+          }),
+        ),
       execute: () =>
         mutatePlan("execute", planModel?.revision?.planRevisionId ?? "missing", (key, current) => {
           if (current.revision === null) return Promise.reject(new Error("plan revision missing"));
@@ -727,15 +856,51 @@ export function useGoalController({
             idempotencyKey: key,
           });
         }),
+      pausePlan: () =>
+        mutatePlan("pause", planModel?.plan.activeRunId ?? "missing", (key, current) => {
+          if (current.plan.activeRunId === null)
+            return Promise.reject(new Error("plan run missing"));
+          return port.pausePlan({
+            ownerThreadId: current.plan.ownerThreadId,
+            planId: current.plan.planId,
+            runId: current.plan.activeRunId,
+            expectedPlanRevision: current.plan.revision,
+            idempotencyKey: key,
+          });
+        }),
+      resumePlan: () =>
+        mutatePlan("resume", planModel?.plan.activeRunId ?? "missing", (key, current) => {
+          if (current.plan.activeRunId === null)
+            return Promise.reject(new Error("plan run missing"));
+          return port.resumePlan({
+            ownerThreadId: current.plan.ownerThreadId,
+            planId: current.plan.planId,
+            runId: current.plan.activeRunId,
+            expectedPlanRevision: current.plan.revision,
+            idempotencyKey: key,
+          });
+        }),
+      stopPlan: () =>
+        mutatePlan("stop", planModel?.plan.activeRunId ?? "missing", (key, current) => {
+          if (current.plan.activeRunId === null)
+            return Promise.reject(new Error("plan run missing"));
+          return port.stopPlan({
+            ownerThreadId: current.plan.ownerThreadId,
+            planId: current.plan.planId,
+            runId: current.plan.activeRunId,
+            expectedPlanRevision: current.plan.revision,
+            idempotencyKey: key,
+          });
+        }),
       attachPlan: () =>
         mutate("attach_plan", planModel?.revision?.planRevisionId ?? "missing", (key, current) => {
           const selectedPlan = planModelRef.current;
           if (
             selectedPlan?.revision === null ||
             selectedPlan?.revision === undefined ||
-            selectedPlan.plan.status !== "approved"
+            !["approved", "awaiting_approval"].includes(selectedPlan.plan.status)
           )
-            return Promise.reject(new Error("approved plan revision missing"));
+            return Promise.reject(new Error("attachable plan revision missing"));
           return replaceGoalPlanBinding(key, current, (mutationKey, settled) =>
             port.attachPlan({
               goalId: settled.goal.goalId,

@@ -150,10 +150,14 @@ impl ExitControl {
     }
 
     /// 设计原因：该函数复用调用方绝对 deadline，并保留未确认 cleanup 债务供恢复或重试。
-    /// 把当前 session 安装为直接 cancellation target，使 shutdown 能唤醒 in-flight
-    /// 握手或请求等待。
+    /// 先在仍可写入的 session 上确认服务端业务清理，再关闭管道唤醒剩余等待；
+    /// 直接先关 session 会使 supervisor 的 shutdown RPC 永远无法发送，临时侧聊只能遗留到下次启动。
     pub(super) fn attach_session(&self, session: Session) {
         let hook: ExitCancellationHook = Arc::new(move |deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = SidecarSupervisor::request_session_shutdown_until(&session, deadline);
+            }
             if let Err(error) = SidecarSupervisor::close_session_until(&session, deadline) {
                 tracing::debug!(
                     ?error,

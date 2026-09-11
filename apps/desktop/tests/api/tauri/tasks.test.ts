@@ -47,7 +47,7 @@ function bridgeWithResult(result: unknown): {
 
 describe("TauriTaskAdapter", () => {
   it("task/create 使用专用 command 且只发送固定 input envelope", async () => {
-    const native = bridgeWithResult({ accepted: true, task, turnId: "turn_child" });
+    const native = bridgeWithResult({ accepted: true, task });
     const adapter = new TauriTaskAdapter(native.bridge);
     await expect(
       adapter.create({
@@ -55,16 +55,14 @@ describe("TauriTaskAdapter", () => {
         parentTurnId: null,
         expectedParentRevision: 4,
         taskName: "检查测试",
-        content: [{ type: "text", text: "开始" }],
       }),
-    ).resolves.toMatchObject({ task: { taskThreadId: "thr_child" } });
+    ).resolves.toEqual({ accepted: true, task });
     expect(native.invoke).toHaveBeenCalledWith(JA_TASK_COMMANDS.create, {
       input: {
         parentThreadId: "thr_root",
         parentTurnId: null,
         expectedParentRevision: 4,
         taskName: "检查测试",
-        content: [{ type: "text", text: "开始" }],
       },
     });
   });
@@ -85,6 +83,21 @@ describe("TauriTaskAdapter", () => {
     expect(native.invoke).toHaveBeenCalledWith(JA_TASK_COMMANDS.unobserve, {
       input: { observationId: "observe_12345678" },
     });
+    expect(native.invoke).not.toHaveBeenCalledWith(JA_TASK_COMMANDS.cancel, expect.anything());
+  });
+
+  /** 关闭必须走独立 command 并返回服务端 closed ACK，避免前端把 unobserve 当作销毁。 */
+  it("task/close 使用专用 command、固定 input envelope 并校验 closed ACK", async () => {
+    const native = bridgeWithResult({ closed: true });
+    const adapter = new TauriTaskAdapter(native.bridge);
+
+    await expect(adapter.close({ taskThreadId: task.taskThreadId })).resolves.toEqual({
+      closed: true,
+    });
+    expect(native.invoke).toHaveBeenCalledWith(JA_TASK_COMMANDS.close, {
+      input: { taskThreadId: task.taskThreadId },
+    });
+    expect(native.invoke).not.toHaveBeenCalledWith(JA_TASK_COMMANDS.unobserve, expect.anything());
     expect(native.invoke).not.toHaveBeenCalledWith(JA_TASK_COMMANDS.cancel, expect.anything());
   });
 });

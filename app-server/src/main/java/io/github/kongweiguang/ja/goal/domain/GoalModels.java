@@ -33,6 +33,8 @@ public final class GoalModels {
         /** 冻结 revision 等待用户批准。 */ AWAITING_APPROVAL,
         /** 用户已批准精确 revision/hash，但尚未选择独立执行或挂接 Goal。 */ APPROVED,
         /** 已批准 revision 的独立 run 正在执行。 */ EXECUTING,
+        /** 步骤已收口，正在进行无 Tool 的独立验收。 */ VERIFYING,
+        /** 用户暂停或验收证据不足；保留当前 run 供显式恢复。 */ PAUSED,
         /** 计划自己的完成门已通过。 */ COMPLETED,
         /** 用户明确停止计划。 */ STOPPED
     }
@@ -142,7 +144,8 @@ public final class GoalModels {
             Objects.requireNonNull(status, "status");
             if (revision < 0) throw new IllegalArgumentException("invalid Plan revision");
             boolean runningIdentity = activePlanRevisionId != null && activeRunId != null;
-            if ((status == PlanStatus.EXECUTING || status == PlanStatus.COMPLETED) && !runningIdentity) {
+            if ((status == PlanStatus.EXECUTING || status == PlanStatus.VERIFYING
+                    || status == PlanStatus.PAUSED || status == PlanStatus.COMPLETED) && !runningIdentity) {
                 throw new IllegalArgumentException("invalid Plan active identity");
             }
             if (status == PlanStatus.APPROVED
@@ -206,9 +209,6 @@ public final class GoalModels {
                                 String failureSignature, String summary,
                                 Instant startedAt, Instant completedAt) { }
 
-    /** 当前未决输入只公开提示和期限，不公开响应正文。 */
-    public record GoalInput(String inputRequestId, String prompt, Instant expiresAt, Instant createdAt) { }
-
     /** 已完成 evaluator 的公开投影只包含结构化 verdict 与逐条件结论。 */
     public record GoalEvaluation(String evaluationId, String goalId, long goalDefinitionRevision,
                                  String planRevisionId, String runId,
@@ -248,10 +248,24 @@ public final class GoalModels {
         }
     }
 
-    /** 公开 Goal 快照补齐进度、当前步骤和输入事实，基础 Goal 仍是状态机唯一实体。 */
+    /** Plan 实时观察只携带步骤计数与当前动作，不物化正文、证据或内部运行 identity。 */
+    public record PlanProgress(String currentStepId, String currentStepTitle,
+                               int completedRequiredSteps, int totalRequiredSteps) {
+        /** 当前步骤允许为空，计数必须保持有界且完成数不能超过总数。 */
+        public PlanProgress {
+            if (currentStepId != null) requireId(currentStepId, "currentStepId");
+            if (currentStepTitle != null) requireText(currentStepTitle, "currentStepTitle", 1, 240);
+            if (completedRequiredSteps < 0 || totalRequiredSteps < 0
+                    || completedRequiredSteps > totalRequiredSteps) {
+                throw new IllegalArgumentException("invalid Plan progress");
+            }
+        }
+    }
+
+    /** 公开 Goal 快照补齐进度与验收事实；公共 Interaction 聚合独立承载未决输入。 */
     public record GoalSnapshot(Goal goal, GoalDefinition definition, GoalPlanLink planLink, String currentStepId,
                                int completedRequiredSteps, int totalRequiredSteps,
-                               GoalInput pendingInput, String attentionReason,
+                               String attentionReason,
                                Instant achievedAt, Instant stoppedAt,
                                GoalEvaluation latestEvaluation, long eventSequence) {
         /** 进度与序号在 Repository 事务内冻结，防止返回自相矛盾的计数。 */

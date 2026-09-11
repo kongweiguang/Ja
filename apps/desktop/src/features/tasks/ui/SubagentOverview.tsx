@@ -6,7 +6,11 @@ import type { CSSProperties, ReactElement } from "react";
 import { Button, EmptyState, ErrorState } from "@/shared/ui/primitives";
 import type { TaskSummary } from "../domain/taskModel";
 import { taskElapsedLabel, taskStateLabel } from "../domain/taskModel";
-import { buildTaskOverviewSections, type TaskTreeNode } from "../domain/taskOverview";
+import {
+  buildTaskOverviewSections,
+  selectDelegatedTasks,
+  type TaskTreeNode,
+} from "../domain/taskOverview";
 import "./tasks.css";
 
 /** 递归列表使用 treeitem 后紧邻 group 的标准结构，键盘焦点只落在可点击行。 */
@@ -43,7 +47,7 @@ function TaskTreeItems({
               <span className="ja-task-tree-main">
                 <span className="ja-task-tree-title">
                   <strong>{task.taskName}</strong>
-                  <small>{task.taskKind === "subagent" ? "Subagent" : "侧边任务"}</small>
+                  <small>{task.taskKind === "subagent" ? "Subagent" : "侧聊"}</small>
                 </span>
                 <span className="ja-task-tree-summary">
                   {task.latestSafeSummary ?? "等待首次安全进度…"}
@@ -76,12 +80,14 @@ function TaskTreeItems({
 /** 树形总览只投影服务端摘要，绝不为未选中实例读取正文或建立 observe。 */
 export function SubagentOverview({
   tasks,
+  ownerThreadId,
   loading,
   error,
   onRefresh,
   onOpenTask,
 }: {
   tasks: readonly TaskSummary[];
+  ownerThreadId: string | undefined;
   loading: boolean;
   error?: string;
   onRefresh: () => Promise<void>;
@@ -89,7 +95,7 @@ export function SubagentOverview({
 }): ReactElement {
   if (error !== undefined && tasks.length === 0)
     return <ErrorState title="子智能体暂不可用" message={error} onRetry={() => void onRefresh()} />;
-  const sections = buildTaskOverviewSections(tasks);
+  const sections = buildTaskOverviewSections(selectDelegatedTasks(tasks, ownerThreadId));
   return (
     <section className="ja-task-overview" aria-label="子智能体总览" aria-busy={loading}>
       <header className="ja-task-overview-header">

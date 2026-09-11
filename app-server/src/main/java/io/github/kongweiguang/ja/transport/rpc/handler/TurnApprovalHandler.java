@@ -220,7 +220,7 @@ public final class TurnApprovalHandler implements RpcHandler {
     private ObjectNode enqueueInput(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "content");
         String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
-        return inputResult(() -> session.turns().enqueueInput(turnId, content(params.get("content"))));
+        return inputResult(() -> session.turns().enqueueInput(turnId, content(params.get("content")), session.eventSink()));
     }
 
     /** “调整方向”按条目 revision 提升，重复点击已提升条目保持幂等。 */

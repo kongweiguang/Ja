@@ -9,11 +9,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   capabilityWorkbenchTab,
   parseTaskWorkbenchTabKey,
-  sideTaskDraftWorkbenchTab,
+  taskWorkbenchTab,
   Workbench,
   WorkbenchResizeHandle,
   type WorkbenchCapability,
   type WorkbenchTab,
+  type WorkbenchTaskTab,
 } from "@/features/workbench";
 import {
   getRightPanelSessionState,
@@ -36,13 +37,23 @@ function capabilityTabs(...capabilities: WorkbenchCapability[]): WorkbenchTab[] 
   return capabilities.map(capabilityWorkbenchTab);
 }
 
+/** 即使空白侧边任务也使用服务端 Thread 格式，测试不再制造未持久化草稿 Tab。 */
+function sideTaskTab(rootThreadId: string, suffix: string): WorkbenchTaskTab {
+  return taskWorkbenchTab({
+    rootThreadId,
+    taskThreadId: `thr_${suffix}`,
+    taskKind: "side_task",
+    label: "新侧聊",
+  });
+}
+
 /** 用真实受控状态承接 Shell 意图，避免测试依赖已删除的未受控兼容模式。 */
 function Harness({
   initialTab = capabilityWorkbenchTab("files"),
   initialOpenTabs = capabilityTabs("review", "files", "preview"),
   onTabClose,
   onClose,
-  onCreateSideTask = () => sideTaskDraftWorkbenchTab("thr_root", "12345678"),
+  onCreateSideTask = () => sideTaskTab("thr_root", "12345678"),
   onTaskTabRename,
   onTabContextMenuOpenChange,
 }: {
@@ -190,9 +201,7 @@ describe("Workbench controlled shell", () => {
   });
 
   it("rejects impossible Subagent draft identities", () => {
-    expect(parseTaskWorkbenchTabKey("side-task:draft_12345678")).toEqual({
-      taskKind: "side_task",
-    });
+    expect(parseTaskWorkbenchTabKey("side-task:draft_12345678")).toBeUndefined();
     expect(parseTaskWorkbenchTabKey("subagent:draft_12345678")).toBeUndefined();
   });
 
@@ -265,29 +274,26 @@ describe("Workbench controlled shell", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "新建侧边任务" }));
-    expect(screen.getByRole("tab", { name: "新侧边任务" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    await user.click(screen.getByRole("button", { name: "新建侧聊" }));
+    expect(screen.getByRole("tab", { name: "新侧聊" })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByRole("tab", { name: "新标签页" })).not.toBeInTheDocument();
     unmount();
 
     render(<Harness initialOpenTabs={capabilityTabs("files")} onClose={onClose} />);
     await user.click(screen.getByRole("button", { name: "新建标签页" }));
-    expect(screen.getByRole("menuitem", { name: "新建侧边任务" })).toBeEnabled();
+    expect(screen.getByRole("menuitem", { name: "新建侧聊" })).toBeEnabled();
     expect(onClose).not.toHaveBeenCalled();
   });
 
   it("renames a side-task inline exactly once across Enter and blur without changing identity", async () => {
     const rename = vi.fn(async () => undefined);
-    const draft = sideTaskDraftWorkbenchTab("thr_root", "12345678");
+    const draft = sideTaskTab("thr_root", "12345678");
     const user = userEvent.setup();
     render(<Harness initialTab={draft} initialOpenTabs={[draft]} onTaskTabRename={rename} />);
 
-    const tab = screen.getByRole("tab", { name: "新侧边任务" });
+    const tab = screen.getByRole("tab", { name: "新侧聊" });
     await user.dblClick(tab);
-    const input = screen.getByRole("textbox", { name: "侧边任务名称" });
+    const input = screen.getByRole("textbox", { name: "侧聊名称" });
     await user.clear(input);
     await user.type(input, "排查启动问题{Enter}");
     fireEvent.blur(input);
@@ -305,13 +311,13 @@ describe("Workbench controlled shell", () => {
       .fn()
       .mockRejectedValueOnce(new Error("native detail"))
       .mockResolvedValue(undefined);
-    const draft = sideTaskDraftWorkbenchTab("thr_root", "87654321");
+    const draft = sideTaskTab("thr_root", "87654321");
     const user = userEvent.setup();
     render(<Harness initialTab={draft} initialOpenTabs={[draft]} onTaskTabRename={rename} />);
 
-    screen.getByRole("tab", { name: "新侧边任务" }).focus();
+    screen.getByRole("tab", { name: "新侧聊" }).focus();
     await user.keyboard("{F2}");
-    const input = screen.getByRole("textbox", { name: "侧边任务名称" });
+    const input = screen.getByRole("textbox", { name: "侧聊名称" });
     await user.clear(input);
     await user.type(input, "新的名称{Enter}");
     await waitFor(() =>
@@ -321,21 +327,21 @@ describe("Workbench controlled shell", () => {
     await user.type(input, "{Enter}");
     await waitFor(() => expect(rename).toHaveBeenCalledTimes(2));
     await waitFor(() =>
-      expect(screen.queryByRole("textbox", { name: "侧边任务名称" })).not.toBeInTheDocument(),
+      expect(screen.queryByRole("textbox", { name: "侧聊名称" })).not.toBeInTheDocument(),
     );
 
     screen.getByRole("tab").focus();
     await user.keyboard("{F2}");
-    await user.type(screen.getByRole("textbox", { name: "侧边任务名称" }), "取消{Escape}");
+    await user.type(screen.getByRole("textbox", { name: "侧聊名称" }), "取消{Escape}");
     expect(rename).toHaveBeenCalledTimes(2);
   });
 
   it("does not submit Enter while a side-task name is in IME composition", () => {
     const rename = vi.fn(async () => undefined);
-    const draft = sideTaskDraftWorkbenchTab("thr_root", "12344321");
+    const draft = sideTaskTab("thr_root", "12344321");
     render(<Harness initialTab={draft} initialOpenTabs={[draft]} onTaskTabRename={rename} />);
-    fireEvent.doubleClick(screen.getByRole("tab", { name: "新侧边任务" }));
-    const input = screen.getByRole("textbox", { name: "侧边任务名称" });
+    fireEvent.doubleClick(screen.getByRole("tab", { name: "新侧聊" }));
+    const input = screen.getByRole("textbox", { name: "侧聊名称" });
     fireEvent.change(input, { target: { value: "输入中" } });
     fireEvent.compositionStart(input);
     fireEvent.keyDown(input, { key: "Enter", isComposing: true });
@@ -394,7 +400,7 @@ describe("Workbench controlled shell", () => {
 
   it("offers a real rename action only for side-task tabs", async () => {
     const rename = vi.fn(async () => undefined);
-    const draft = sideTaskDraftWorkbenchTab("thr_root", "12121212");
+    const draft = sideTaskTab("thr_root", "12121212");
     const user = userEvent.setup();
     render(
       <Harness
@@ -403,10 +409,10 @@ describe("Workbench controlled shell", () => {
         onTaskTabRename={rename}
       />,
     );
-    const taskTab = screen.getByRole("tab", { name: "新侧边任务" });
+    const taskTab = screen.getByRole("tab", { name: "新侧聊" });
     fireEvent.contextMenu(taskTab.closest(".ja-workbench-tab-shell")!);
     await user.click(await screen.findByRole("menuitem", { name: "重命名" }));
-    expect(screen.getByRole("textbox", { name: "侧边任务名称" })).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "侧聊名称" })).toHaveFocus();
 
     await user.keyboard("{Escape}");
     fireEvent.contextMenu(

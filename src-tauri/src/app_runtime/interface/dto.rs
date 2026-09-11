@@ -4,6 +4,7 @@
 // Tauri command DTO 与纯领域模型的显式映射。
 
 use crate::app_runtime::domain;
+use crate::app_runtime::interface::history_model::{ThreadDto, ThreadPreferencesDto};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -378,7 +379,11 @@ impl From<domain::RuntimeStatus> for RuntimeStatusDto {
             },
             generation: value.generation,
             server_instance_id: value.server_instance_id,
-            features: vec!["task_threads_v1".to_owned(), "plan_goal_v1".to_owned()],
+            features: vec![
+                "task_threads_v1".to_owned(),
+                "plan_goal_v1".to_owned(),
+                "interaction_v1".to_owned(),
+            ],
         }
     }
 }
@@ -790,7 +795,17 @@ pub struct TaskCreateInputDto {
     pub parent_turn_id: Option<String>,
     pub expected_parent_revision: u64,
     pub task_name: String,
-    pub content: Vec<TurnContentPartDto>,
+    pub preferences: Option<TaskCreatePreferencesDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TaskCreatePreferencesDto {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_level: Option<String>,
+    pub access_mode: String,
+    pub collaboration_mode: String,
 }
 
 /// required nullable 字段必须显式出现在 wire object 中；`Option` 默认接受缺失会破坏严格 schema。
@@ -810,7 +825,15 @@ impl From<TaskCreateInputDto> for domain::TaskCreateInput {
             parent_turn_id: value.parent_turn_id,
             expected_parent_revision: value.expected_parent_revision,
             task_name: value.task_name,
-            content: value.content.into_iter().map(task_content_part).collect(),
+            preferences: value
+                .preferences
+                .map(|preferences| domain::TaskCreatePreferences {
+                    provider_id: preferences.provider_id,
+                    model_id: preferences.model_id,
+                    reasoning_level: preferences.reasoning_level,
+                    access_mode: preferences.access_mode,
+                    collaboration_mode: preferences.collaboration_mode,
+                }),
         }
     }
 }
@@ -976,6 +999,21 @@ impl From<TaskMutationInputDto> for domain::TaskMutationInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TaskCloseInputDto {
+    pub task_thread_id: String,
+}
+
+impl From<TaskCloseInputDto> for domain::TaskCloseInput {
+    /// 关闭 DTO 不携带 revision 或控制字段，避免把临时生命周期误接到任务 CAS。
+    fn from(value: TaskCloseInputDto) -> Self {
+        Self {
+            task_thread_id: value.task_thread_id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TaskTreeDeleteInputDto {
     pub task_thread_id: String,
     pub expected_task_revision: u64,
@@ -1073,6 +1111,7 @@ impl From<domain::TaskSummary> for TaskSummaryDto {
 pub struct TaskActivityDto {
     pub activity_sequence: u64,
     pub activity_id: String,
+    pub root_thread_id: String,
     pub task_thread_id: String,
     pub actor_thread_id: String,
     pub causal_turn_id: Option<String>,
@@ -1088,11 +1127,12 @@ pub struct TaskActivitySummaryDto {
 }
 
 impl From<domain::TaskActivity> for TaskActivityDto {
-    /// activity 只投影 Java 已脱敏的 summary text，不接受 raw reasoning 或 Tool payload。
+    /// 保留来源树身份供前端校验委派活动，不丢失 domain 已验证的关联字段。
     fn from(value: domain::TaskActivity) -> Self {
         Self {
             activity_sequence: value.activity_sequence,
             activity_id: value.activity_id,
+            root_thread_id: value.root_thread_id,
             task_thread_id: value.task_thread_id,
             actor_thread_id: value.actor_thread_id,
             causal_turn_id: value.causal_turn_id,
@@ -1148,7 +1188,7 @@ pub struct TaskContextSeedDto {
     pub context_seed_id: String,
     pub parent_revision: u64,
     pub inheritance_mode: String,
-    pub task_brief: Vec<TurnContentPartDto>,
+    pub task_brief: Option<Vec<TurnContentPartDto>>,
     pub inherited_context_summary: Option<String>,
     pub inherited_context_preview: Vec<TaskContextPreviewItemDto>,
     pub fingerprint: String,
@@ -1181,7 +1221,9 @@ impl From<domain::TaskContextSeed> for TaskContextSeedDto {
             context_seed_id: value.context_seed_id,
             parent_revision: value.parent_revision,
             inheritance_mode: value.inheritance_mode,
-            task_brief: value.task_brief.into_iter().map(Into::into).collect(),
+            task_brief: value
+                .task_brief
+                .map(|parts| parts.into_iter().map(Into::into).collect()),
             inherited_context_summary: value.inherited_context_summary,
             inherited_context_preview: value
                 .inherited_context_preview
@@ -1199,7 +1241,6 @@ impl From<domain::TaskContextSeed> for TaskContextSeedDto {
 pub struct TaskCreateResultDto {
     pub accepted: bool,
     pub task: TaskSummaryDto,
-    pub turn_id: String,
 }
 
 impl From<domain::TaskCreateResult> for TaskCreateResultDto {
@@ -1208,7 +1249,6 @@ impl From<domain::TaskCreateResult> for TaskCreateResultDto {
         Self {
             accepted: true,
             task: value.task.into(),
-            turn_id: value.turn_id,
         }
     }
 }
@@ -1228,10 +1268,45 @@ impl From<domain::TaskListResult> for TaskListResultDto {
     }
 }
 
+impl From<domain::TaskThreadPreferences> for ThreadPreferencesDto {
+    /// task/read 的偏好投影转换复用 History 的 wire DTO，保证公开字段完整且不携带凭据。
+    fn from(value: domain::TaskThreadPreferences) -> Self {
+        Self {
+            provider_id: value.provider_id,
+            model_id: value.model_id,
+            reasoning_level: value.reasoning_level,
+            access_mode: value.access_mode,
+            collaboration_mode: value.collaboration_mode,
+            title_source: value.title_source,
+        }
+    }
+}
+
+impl From<domain::TaskThreadSummary> for ThreadDto {
+    /// task/read 的 Thread 元数据逐字段回到既有 History DTO，防止任务详情丢失真实偏好和状态。
+    fn from(value: domain::TaskThreadSummary) -> Self {
+        Self {
+            thread_id: value.thread_id,
+            workspace_id: value.workspace_id,
+            preferences: value.preferences.map(Into::into),
+            title: value.title,
+            status: value.status,
+            pinned: value.pinned,
+            latest_turn_status: value.latest_turn_status,
+            latest_turn_seen: value.latest_turn_seen,
+            active_goal_id: value.active_goal_id,
+            revision: value.revision,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskReadResultDto {
     pub task: TaskSummaryDto,
+    pub thread: ThreadDto,
     pub context_seed: TaskContextSeedDto,
     pub activities: Vec<TaskActivityDto>,
     pub mailbox: Vec<TaskMailboxMessageDto>,
@@ -1243,6 +1318,7 @@ impl From<domain::TaskReadResult> for TaskReadResultDto {
     fn from(value: domain::TaskReadResult) -> Self {
         Self {
             task: value.task.into(),
+            thread: value.thread.into(),
             context_seed: value.context_seed.into(),
             activities: value.activities.into_iter().map(Into::into).collect(),
             mailbox: value.mailbox.into_iter().map(Into::into).collect(),
@@ -1353,6 +1429,21 @@ impl From<domain::TaskTreeDeleteResult> for TaskTreeDeleteResultDto {
         Self {
             accepted: true,
             deleted_task_count: value.deleted_task_count,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCloseResultDto {
+    pub closed: bool,
+}
+
+impl From<domain::TaskCloseResult> for TaskCloseResultDto {
+    /// 关闭回执只映射 Java 幂等终态，不把 `accepted` 等旧 mutation 语义带入侧聊。
+    fn from(value: domain::TaskCloseResult) -> Self {
+        Self {
+            closed: value.closed,
         }
     }
 }

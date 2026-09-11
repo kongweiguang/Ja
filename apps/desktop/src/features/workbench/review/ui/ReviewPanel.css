@@ -87,7 +87,7 @@
 }
 .ja-review-diff .ja-editor-diff .cm-editor {
   min-height: 0;
-  font: 0.8125rem/1.55 var(--ja-font-mono);
+  font: var(--ja-code-font-size) / 1.55 var(--ja-font-mono);
 }
 .ja-review-diff-header {
   display: flex;

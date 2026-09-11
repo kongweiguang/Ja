@@ -8,7 +8,6 @@
 
 use super::commands::{DomainValidationError, TurnContentPart, validate_turn_content};
 use super::{valid_frozen_turn_id, valid_protocol_id};
-
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone)]
@@ -17,7 +16,39 @@ pub struct TaskCreateInput {
     pub parent_turn_id: Option<String>,
     pub expected_parent_revision: u64,
     pub task_name: String,
-    pub content: Vec<TurnContentPart>,
+    pub preferences: Option<TaskCreatePreferences>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskCreatePreferences {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_level: Option<String>,
+    pub access_mode: String,
+    pub collaboration_mode: String,
+}
+
+impl TaskCreatePreferences {
+    /// 偏好只做协议闭集校验；模型是否存在及权限上限仍由 Java 在父快照事务中裁决。
+    pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
+        if !valid_protocol_id(&self.provider_id, "provider_", 128)
+            || !valid_protocol_id(&self.model_id, "model_", 128)
+            || self.reasoning_level.as_deref().is_some_and(|value| {
+                !matches!(
+                    value,
+                    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                )
+            })
+            || !matches!(
+                self.access_mode.as_str(),
+                "approval_required" | "full_access"
+            )
+            || !matches!(self.collaboration_mode.as_str(), "default" | "plan")
+        {
+            return Err(DomainValidationError);
+        }
+        Ok(())
+    }
 }
 
 impl TaskCreateInput {
@@ -37,7 +68,9 @@ impl TaskCreateInput {
         {
             return Err(DomainValidationError);
         }
-        validate_turn_content(&self.content, 4_000_000)
+        self.preferences
+            .as_ref()
+            .map_or(Ok(()), TaskCreatePreferences::validate)
     }
 }
 
@@ -198,6 +231,20 @@ impl TaskMutationInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct TaskCloseInput {
+    pub task_thread_id: String,
+}
+
+impl TaskCloseInput {
+    /// 侧聊关闭只接受目标 Thread identity；幂等终态和取消/资源清理由 Java 原子裁决。
+    pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
+        valid_protocol_id(&self.task_thread_id, "thr_", 100)
+            .then_some(())
+            .ok_or(DomainValidationError)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TaskTreeDeleteInput {
     pub mutation: TaskMutationInput,
     pub confirm_task_thread_id: String,
@@ -254,6 +301,7 @@ pub struct TaskSummary {
 pub struct TaskActivity {
     pub activity_sequence: u64,
     pub activity_id: String,
+    pub root_thread_id: String,
     pub task_thread_id: String,
     pub actor_thread_id: String,
     pub causal_turn_id: Option<String>,
@@ -283,7 +331,7 @@ pub struct TaskContextSeed {
     pub context_seed_id: String,
     pub parent_revision: u64,
     pub inheritance_mode: String,
-    pub task_brief: Vec<TurnContentPart>,
+    pub task_brief: Option<Vec<TurnContentPart>>,
     pub inherited_context_summary: Option<String>,
     pub inherited_context_preview: Vec<TaskContextPreviewItem>,
     pub fingerprint: String,
@@ -297,10 +345,37 @@ pub struct TaskContextPreviewItem {
     pub attachment_ids: Vec<String>,
 }
 
+/// task/read 携带的 Thread 元数据属于任务领域投影；它与 History wire DTO 解耦，避免领域层反向依赖 interface。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskThreadSummary {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub active_goal_id: Option<String>,
+    pub preferences: Option<TaskThreadPreferences>,
+    pub title: String,
+    pub status: String,
+    pub pinned: bool,
+    pub latest_turn_status: Option<String>,
+    pub latest_turn_seen: bool,
+    pub revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Thread 偏好只保留可公开投影的选择器和执行模式，不包含凭据或 Provider 连接信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskThreadPreferences {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_level: Option<String>,
+    pub access_mode: String,
+    pub collaboration_mode: String,
+    pub title_source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCreateResult {
     pub task: TaskSummary,
-    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +386,7 @@ pub struct TaskListResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReadResult {
     pub task: TaskSummary,
+    pub thread: TaskThreadSummary,
     pub context_seed: TaskContextSeed,
     pub activities: Vec<TaskActivity>,
     pub mailbox: Vec<TaskMailboxMessage>,
@@ -340,4 +416,9 @@ pub struct TaskFollowupResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTreeDeleteResult {
     pub deleted_task_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCloseResult {
+    pub closed: bool,
 }

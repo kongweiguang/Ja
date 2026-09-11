@@ -17,6 +17,19 @@ import { goalModel } from "./goalFixtures";
 describe("Goal composer controls", () => {
   afterEach(cleanup);
 
+  /** 独立 Plan 没有 Goal 时仍可打开真实编辑面板，不能把两者的入口条件绑定。 */
+  it("opens an existing standalone Plan without creating a Goal", async () => {
+    const openPlan = vi.fn();
+    const openGoal = vi.fn();
+    const user = userEvent.setup();
+    render(<ComposerGoalStatus mode="plan" onOpenPlan={openPlan} onOpenGoal={openGoal} />);
+    await user.click(screen.getByRole("button", { name: "计划状态：已开启" }));
+    await user.click(screen.getByRole("button", { name: "查看计划" }));
+    expect(openPlan).toHaveBeenCalledOnce();
+    expect(openGoal).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("hides the default mode and returns focus after closing the Plan status popover", async () => {
     const disablePlan = vi.fn();
     const user = userEvent.setup();

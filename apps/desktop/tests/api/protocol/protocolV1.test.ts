@@ -352,7 +352,7 @@ describe("JA RPC v1 configuration ownership", () => {
       mcpId: "mcp_demo",
       name: "Demo",
       transport: "stdio" as const,
-      status: "healthy" as const,
+      status: "configured" as const,
       toolCount: 1,
     };
     const tool = { name: "read_file", description: "read", inputSchema: { type: "object" } };
@@ -368,6 +368,15 @@ describe("JA RPC v1 configuration ownership", () => {
     expect(parseMethodResult("mcp/list", { items: [server], nextCursor: null })).toMatchObject({
       items: [server],
     });
+    expect(
+      parseMethodResult("mcp/test", {
+        mcpId: "mcp_demo",
+        name: "Demo",
+        transport: "stdio",
+        status: "available",
+        toolCount: 1,
+      }),
+    ).toMatchObject({ status: "available" });
     expect(parseMethodResult("mcp/list-tools", { items: [tool], nextCursor: null })).toMatchObject({
       items: [tool],
     });
@@ -381,6 +390,29 @@ describe("JA RPC v1 configuration ownership", () => {
     expect(() => parseMethodResult("mcp/list", { servers: [server], nextCursor: null })).toThrow();
     expect(() =>
       parseMethodResult("mcp/list-tools", { mcpId: "mcp_demo", tools: [tool], nextCursor: null }),
+    ).toThrow();
+  });
+
+  it("accepts the minimal cross-workspace thread discovery projection", () => {
+    const params = { scope: "all" as const, query: "侧聊", limit: 20 };
+    const result = {
+      items: [
+        {
+          threadId: "thr_discovered",
+          title: "临时侧聊",
+          kind: "side_chat" as const,
+          workspaceId: "ws_other",
+          status: "idle" as const,
+        },
+      ],
+      nextCursor: null,
+    };
+
+    expect(parseMethodParams("thread/list", params)).toEqual(params);
+    expect(parseMethodResult("thread/list", result)).toEqual(result);
+    expect(() => parseMethodParams("thread/list", { ...params, scope: "workspace" })).toThrow();
+    expect(() =>
+      parseMethodResult("thread/list", { ...result, items: [{ ...result.items[0], revision: 1 }] }),
     ).toThrow();
   });
 

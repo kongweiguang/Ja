@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
+import io.github.kongweiguang.ja.goal.port.in.PlanEvent;
 
 import java.time.Instant;
 import java.util.List;
@@ -44,6 +45,20 @@ public final class GoalWireMapper {
         return result.put("eventSequence", snapshot.eventSequence());
     }
 
+    /** 执行进度仅发送 Plan 行，不把完整版本和证据广播给隐藏工作面。 */
+    public ObjectNode planChanged(PlanEvent event) {
+        ObjectNode result = mapper.createObjectNode().put("ownerThreadId", event.plan().ownerThreadId())
+                .put("planId", event.plan().planId()).put("planRevision", event.plan().revision())
+                .put("eventSequence", event.eventSequence());
+        result.set("plan", plan(event.plan()));
+        result.set("progress", mapper.createObjectNode()
+                .put("currentStepId", event.progress().currentStepId())
+                .put("currentStepTitle", event.progress().currentStepTitle())
+                .put("completedRequiredSteps", event.progress().completedRequiredSteps())
+                .put("totalRequiredSteps", event.progress().totalRequiredSteps()));
+        return result;
+    }
+
     /** Goal 事件页只公开持久 sequence，cursor 保持 opaque。 */
     public ObjectNode events(GoalModels.Page<GoalModels.PublicEvent> page) {
         ObjectNode result = goalPageBase(page);
@@ -51,6 +66,29 @@ public final class GoalWireMapper {
         page.items().forEach(event -> items.add(mapper.createObjectNode()
                 .put("eventSequence", event.eventSequence()).put("kind", event.kind())
                 .put("summary", event.summary()).put("occurredAt", event.occurredAt().toString())));
+        cursor(result, page.nextCursor());
+        return result;
+    }
+
+    /** Plan 页使用独立聚合 revision，避免客户端误用 Goal CAS。 */
+    public ObjectNode planEvents(GoalModels.Page<GoalModels.PublicEvent> page) {
+        ObjectNode result = mapper.createObjectNode().put("planId", page.aggregateId())
+                .put("planRevision", page.aggregateRevision()).put("eventSequence", page.eventSequence());
+        ArrayNode items = result.putArray("items");
+        page.items().forEach(event -> items.add(mapper.createObjectNode()
+                .put("eventSequence", event.eventSequence()).put("kind", event.kind())
+                .put("summary", event.summary()).put("occurredAt", event.occurredAt().toString())));
+        cursor(result, page.nextCursor());
+        return result;
+    }
+
+    /** 相同计划可有多个历史 Run，证据页必须保持调用方选择的冻结身份。 */
+    public ObjectNode planEvidence(GoalModels.Page<GoalModels.Evidence> page, String planRevisionId, String runId) {
+        ObjectNode result = mapper.createObjectNode().put("planId", page.aggregateId())
+                .put("planRevision", page.aggregateRevision()).put("eventSequence", page.eventSequence())
+                .put("planRevisionId", planRevisionId).put("runId", runId);
+        ArrayNode items = result.putArray("items");
+        page.items().forEach(value -> items.add(evidence(value)));
         cursor(result, page.nextCursor());
         return result;
     }
@@ -86,15 +124,6 @@ public final class GoalWireMapper {
                 .put("eventSequence", snapshot.eventSequence());
         result.set("goal", goal(snapshot));
         return result;
-    }
-
-    /** input-requested 只公开当前未决请求，不包含回答正文。 */
-    public ObjectNode input(GoalModels.GoalSnapshot snapshot) {
-        GoalModels.GoalInput input = Objects.requireNonNull(snapshot.pendingInput(), "pending input");
-        ObjectNode result = mapper.createObjectNode().put("goalId", snapshot.goal().goalId())
-                .put("goalRevision", snapshot.goal().revision())
-                .put("eventSequence", snapshot.eventSequence());
-        return result.set("input", input(input));
     }
 
     /** activity 仅投影状态行所需的小型事实，不把持久 payload 直接透传到 WebView。 */
@@ -144,8 +173,6 @@ public final class GoalWireMapper {
         nullable(result, "currentStepId", snapshot.currentStepId());
         result.put("completedRequiredSteps", snapshot.completedRequiredSteps())
                 .put("totalRequiredSteps", snapshot.totalRequiredSteps());
-        if (snapshot.pendingInput() == null) result.putNull("pendingInput");
-        else result.set("pendingInput", input(snapshot.pendingInput()));
         nullable(result, "attentionReason", snapshot.attentionReason());
         if (snapshot.latestEvaluation() == null) result.putNull("latestEvaluation");
         else result.set("latestEvaluation", evaluation(snapshot.latestEvaluation()));
@@ -263,13 +290,6 @@ public final class GoalWireMapper {
         return result.put("sourceType", lower(value.sourceType())).put("sourceId", value.sourceId())
                 .put("summary", value.summary()).put("digest", value.digest())
                 .put("observedAt", value.observedAt().toString()).put("createdAt", value.createdAt().toString());
-    }
-
-    /** Pending input 只包含提示、期限与创建时间。 */
-    private ObjectNode input(GoalModels.GoalInput value) {
-        return mapper.createObjectNode().put("inputRequestId", value.inputRequestId())
-                .put("prompt", value.prompt()).put("expiresAt", value.expiresAt().toString())
-                .put("createdAt", value.createdAt().toString());
     }
 
     /** Goal 分页字段只用于 Goal-owned 查询。 */

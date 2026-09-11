@@ -34,11 +34,7 @@
   min-height: 100%;
   color: var(--ja-foreground);
   background: var(--ja-background);
-  font:
-    0.75rem/1.55 ui-monospace,
-    SFMono-Regular,
-    Consolas,
-    monospace;
+  font: var(--ja-code-font-size) / 1.55 var(--ja-font-mono);
 }
 .ja-editor-viewer .cm-scroller,
 .ja-editor-diff .cm-scroller {
@@ -95,11 +91,7 @@
   min-height: 100%;
   color: var(--ja-foreground);
   background: var(--ja-background);
-  font:
-    0.76rem/1.55 ui-monospace,
-    SFMono-Regular,
-    Consolas,
-    monospace;
+  font: var(--ja-code-font-size) / 1.55 var(--ja-font-mono);
 }
 .ja-code-editor .cm-scroller {
   min-height: 100%;

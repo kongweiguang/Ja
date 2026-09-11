@@ -63,6 +63,81 @@ final class MybatisGoalRepositoryTest {
     private static final Instant NOW = Instant.parse("2026-09-04T10:00:00Z");
     @TempDir Path temp;
 
+    /** 真实 Mapper 必须匹配 record 的 primitive 构造参数，不能只验证空快照绕过反射映射。 */
+    @Test void readsPersistedInteractionAndDraftThroughRealMapper() throws Exception {
+        try (Fixture fixture = fixture("interaction-mapper")) {
+            try (SqlSession session = fixture.sessions.openSession(); Statement sql = session.getConnection().createStatement()) {
+                sql.executeUpdate("INSERT INTO turns(turn_id,thread_id,state,requested_at,updated_at) "
+                        + "VALUES('turn_mapper','thr_one','SUSPENDED','2026-09-04T10:00:00Z','2026-09-04T10:00:00Z')");
+                sql.executeUpdate("INSERT INTO interaction_requests(request_id,thread_id,turn_id,tool_call_id,idempotency_key,"
+                        + "questions_json,answers_json,status,revision,created_at,updated_at) VALUES("
+                        + "'interaction_mapper','thr_one','turn_mapper','call_mapper','mapper-key',"
+                        + "'[{\"questionId\":\"question_one\",\"prompt\":\"补充说明\",\"type\":\"TEXT\",\"options\":[],\"required\":false,\"allowFreeText\":true}]',"
+                        + "'[]','PENDING',0,'2026-09-04T10:00:00Z','2026-09-04T10:00:00Z')");
+                session.commit();
+            }
+            var owner = new io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork.SessionOwner() {
+                /** 测试保持实际 SQL 与原子提交，只替换 Solon 事务生命周期。 */
+                @Override public <T> T execute(org.apache.ibatis.session.SqlSessionFactory sessions,
+                        io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork.Work<T> work) {
+                    try (SqlSession session = sessions.openSession()) {
+                        try {
+                            T value = work.apply(io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers.open(session));
+                            session.commit();
+                            return value;
+                        } catch (Exception failure) { session.rollback(); throw new IllegalStateException(failure); }
+                    }
+                }
+            };
+            for (var component : io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers.class.getRecordComponents()) {
+                if (!fixture.sessions.getConfiguration().hasMapper(component.getType())) {
+                    fixture.sessions.getConfiguration().addMapper(component.getType());
+                }
+            }
+            var interactions = new io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInteractionRepository(
+                    fixture.sessions, new ObjectMapper(), owner);
+            var snapshot = interactions.read("thr_one", null).orElseThrow();
+            assertEquals("补充说明", snapshot.request().orElseThrow().questions().getFirst().prompt());
+            interactions.saveDraft(new io.github.kongweiguang.ja.conversation.domain.interaction.InteractionDraft(
+                    "thr_one", "interaction_mapper", List.of(), 0, true, "draft-mapper", 0, NOW), 0, "draft-mapper");
+            var saved = interactions.read("thr_one", "interaction_mapper").orElseThrow();
+            assertTrue(saved.draft().orElseThrow().collapsed());
+            assertEquals(1, saved.draft().orElseThrow().revision());
+        }
+    }
+
+    /** 真实 SQLite 查询必须从 Thread 读取 revision，并为待答的原 Turn 重建可验证的新 fence。 */
+    @Test void restoresWaitingInteractionLeaseWithoutChangingFrozenContext() throws Exception {
+        try (Fixture fixture = fixture("interaction-lease-recovery")) {
+            MybatisGoalRepository goals = fixture.repository();
+            Goal goal = createGoal(goals, "goal_waiting", "run_waiting", "create:waiting");
+            GoalRepository.ContinuationLease old = goals.tryAcquireLease(new GoalRepository.AcquireLease(
+                    goal.goalId(), "lease_original", 1, NOW)).orElseThrow();
+            try (SqlSession session = fixture.sessions.openSession(); Statement sql = session.getConnection().createStatement()) {
+                sql.executeUpdate("INSERT INTO turns(turn_id,thread_id,state,requested_at,updated_at) "
+                        + "VALUES('turn_waiting','thr_one','SUSPENDED','2026-09-04T10:00:00Z','2026-09-04T10:00:00Z')");
+                sql.executeUpdate("INSERT INTO turn_internal_context(turn_id,origin,context_json,created_at) VALUES("
+                        + "'turn_waiting','GOAL_CONTINUATION','{\"kind\":\"GOAL_CONTINUATION\",\"goalId\":\"goal_waiting\","
+                        + "\"runId\":\"run_waiting\",\"goalDefinitionRevision\":1,\"fencingToken\":1}',"
+                        + "'2026-09-04T10:00:00Z')");
+                sql.executeUpdate("INSERT INTO interaction_requests(request_id,thread_id,turn_id,tool_call_id,run_id,goal_id,"
+                        + "idempotency_key,questions_json,answers_json,status,revision,created_at,updated_at) VALUES("
+                        + "'interaction_waiting','thr_one','turn_waiting','call_waiting','run_waiting','goal_waiting',"
+                        + "'waiting-key','[{\"questionId\":\"question_one\",\"required\":true}]','[]','PENDING',0,"
+                        + "'2026-09-04T10:00:00Z','2026-09-04T10:00:00Z')");
+                sql.executeUpdate("UPDATE goals SET phase='WAITING_INPUT' WHERE goal_id='goal_waiting'");
+                session.commit();
+            }
+            goals.releaseLease(old.goalId(), old.leaseId(), old.fencingToken(), true, NOW.plusSeconds(1));
+            GoalRepository.ContinuationRecoveryCandidate candidate = goals.findContinuationRecovery(goal.goalId(), goal.activeRunId()).orElseThrow();
+            assertEquals("turn_waiting", candidate.turnId());
+            GoalRepository.ContinuationLease restored = goals.tryAcquireLease(new GoalRepository.AcquireLease(
+                    goal.goalId(), "lease_restored", 2, NOW.plusSeconds(2))).orElseThrow();
+            assertEquals(2, restored.fencingToken());
+            assertEquals(restored.fencingToken(), goals.findInternalTurnBinding("turn_waiting").orElseThrow().fencingToken());
+        }
+    }
+
     /** 从创建到 MET 完成的全部事实使用同一 repository transaction，并拒绝旧 hash。 */
     @Test
     void persistsGoalApprovalEvidenceAndCompletion() throws Exception {
@@ -153,6 +228,32 @@ final class MybatisGoalRepositoryTest {
         }
     }
 
+    /** 独立 Side Task 的 Goal 与 Plan 都以 child Thread 为 owner，读取和活动索引不得串到父 Thread。 */
+    @Test
+    void persistsIndependentSideTaskGoalAndPlanUnderChildOwner() throws Exception {
+        try (Fixture fixture = fixture("side-task-owner")) {
+            fixture.insertIndependentSideTask();
+            MybatisGoalRepository goals = fixture.repository();
+
+            Goal parentGoal = createGoal(goals, "goal_parent", "run_parent", "create:parent");
+            Goal sideGoal = goals.create(new GoalRepository.CreateGoal("goal_side", "thr_side",
+                    GoalModels.OwnerKind.INDEPENDENT_TASK, "侧边任务目标", goalCriteria(), "run_side", 1,
+                    0, "create:side", NOW));
+            Plan sidePlan = goals.createPlan(new GoalRepository.CreatePlan(
+                    "plan_side", "thr_side", "侧边任务计划", 0, "plan:create:side", NOW));
+
+            assertEquals(GoalModels.OwnerKind.ROOT_THREAD,
+                    goals.readSnapshot(parentGoal.goalId()).goal().ownerKind());
+            assertEquals(GoalModels.OwnerKind.INDEPENDENT_TASK,
+                    goals.readSnapshot(sideGoal.goalId()).goal().ownerKind());
+            assertEquals("thr_side", sideGoal.ownerThreadId());
+            assertEquals("thr_side", sidePlan.ownerThreadId());
+            assertEquals(parentGoal.goalId(), goals.findActiveGoalByOwner("thr_one").orElseThrow().goalId());
+            assertEquals(sideGoal.goalId(), goals.findActiveGoalByOwner("thr_side").orElseThrow().goalId());
+            assertTrue(goals.readPlanSnapshot(sidePlan.planId()).plan().ownerThreadId().equals("thr_side"));
+        }
+    }
+
     /** 默认 Solon transaction owner 的唯一失败分类必须保留 Goal 稳定异常，避免旧批准被误报成存储故障。 */
     @Test
     void productionTransactionPreservesStaleApprovalFailure() {
@@ -175,6 +276,126 @@ final class MybatisGoalRepositoryTest {
             GoalRepository.ContinuationLease second = goals.tryAcquireLease(
                     new GoalRepository.AcquireLease(active.goalId(), "goallease_three", 3, NOW)).orElseThrow();
             assertTrue(second.fencingToken() > first.fencingToken());
+        }
+    }
+
+    /**
+     * Interaction 挂起仍处于真实 Turn 状态时，Plan execution claim 必须保持 CLAIMED；恢复读模型
+     * 只能沿用原 turn identity，不能把一次用户回答误当作新的 Turn admission。
+     */
+    @Test
+    void preservesClaimAndTurnBindingWhileInteractionIsSuspended() throws Exception {
+        try (Fixture fixture = fixture("plan-claim-suspended")) {
+            MybatisGoalRepository goals = fixture.repository();
+            Plan executing = executeStandalonePlan(goals, "plan_suspend", "planrev_suspend", "run_suspend");
+            GoalRepository.ClaimPlanTurn command = new GoalRepository.ClaimPlanTurn(
+                    executing.planId(), executing.revision(), executing.activeRunId(),
+                    executing.activePlanRevisionId(), "turn_suspend", "evt_claim_suspend",
+                    "claim:suspend", NOW);
+            GoalRepository.PlanTurnClaim claim = goals.claimPlanTurn(command).orElseThrow();
+            fixture.insertPlanTurn("turn_suspend", "SUSPENDED", executing.planId(),
+                    executing.activePlanRevisionId(), executing.activeRunId());
+
+            Plan paused = goals.settlePlanExecution(new GoalRepository.SettlePlanExecution(
+                    executing.planId(), executing.revision(), executing.activeRunId(),
+                    "evt_pause_suspend", "settle:suspend", NOW.plusSeconds(1)));
+
+            assertEquals(GoalModels.PlanStatus.PAUSED, paused.status());
+            assertEquals("CLAIMED", fixture.planTurnClaimState(executing.activeRunId(), "turn_suspend"));
+            assertEquals("turn_suspend", goals.findPlanTurnBinding(executing.planId(), executing.activeRunId())
+                    .orElseThrow().turnId());
+            Plan resumed = goals.resumePlan(new GoalRepository.ResumePlan(
+                    paused.planId(), paused.revision(), paused.activeRunId(),
+                    "evt_resume_suspend", "resume:suspend", NOW.plusSeconds(2)));
+            assertEquals(GoalModels.PlanStatus.EXECUTING, resumed.status());
+            assertEquals("turn_suspend", goals.findPlanTurnBinding(resumed.planId(), resumed.activeRunId())
+                    .orElseThrow().turnId());
+            assertEquals(claim.ordinal(), fixture.planTurnOrdinal(executing.activeRunId(), "turn_suspend"));
+        }
+    }
+
+    /**
+     * admission 已领取但尚未创建 Turn 时属于可安全放弃的 intent；结算后旧 turnId 永不重启，
+     * 同一 Run 恢复后仍允许领取下一 ordinal，避免一次启动异常永久卡死执行器。
+     */
+    @Test
+    void abandonsOrphanedClaimAndAllowsNextTurnInSameRun() throws Exception {
+        try (Fixture fixture = fixture("plan-claim-orphan")) {
+            MybatisGoalRepository goals = fixture.repository();
+            Plan executing = executeStandalonePlan(goals, "plan_orphan", "planrev_orphan", "run_orphan");
+            GoalRepository.ClaimPlanTurn first = new GoalRepository.ClaimPlanTurn(
+                    executing.planId(), executing.revision(), executing.activeRunId(),
+                    executing.activePlanRevisionId(), "turn_orphan", "evt_claim_orphan",
+                    "claim:orphan", NOW);
+            goals.claimPlanTurn(first).orElseThrow();
+
+            Plan paused = goals.settlePlanExecution(new GoalRepository.SettlePlanExecution(
+                    executing.planId(), executing.revision(), executing.activeRunId(),
+                    "evt_pause_orphan", "settle:orphan", NOW.plusSeconds(1)));
+            assertEquals("ABANDONED", fixture.planTurnClaimState(executing.activeRunId(), "turn_orphan"));
+
+            Plan resumed = goals.resumePlan(new GoalRepository.ResumePlan(
+                    paused.planId(), paused.revision(), paused.activeRunId(),
+                    "evt_resume_orphan", "resume:orphan", NOW.plusSeconds(2)));
+            GoalRepository.ClaimPlanTurn second = new GoalRepository.ClaimPlanTurn(
+                    resumed.planId(), resumed.revision(), resumed.activeRunId(), resumed.activePlanRevisionId(),
+                    "turn_next", "evt_claim_next", "claim:next", NOW.plusSeconds(3));
+            GoalRepository.PlanTurnClaim next = goals.claimPlanTurn(second).orElseThrow();
+
+            assertEquals(2, next.ordinal());
+            GoalRepository.ClaimPlanTurn replay = new GoalRepository.ClaimPlanTurn(
+                    resumed.planId(), resumed.revision(), resumed.activeRunId(), resumed.activePlanRevisionId(),
+                    first.turnId(), "evt_claim_orphan_retry", "claim:orphan:retry", NOW.plusSeconds(4));
+            assertTrue(goals.claimPlanTurn(replay).isEmpty(), "abandoned turn must not be replayed");
+        }
+    }
+
+    /** 活动 Goal 与 standalone Plan 共享 owner 时，执行事务必须在创建 Run 前拒绝并发执行。 */
+    @Test
+    void activeGoalBlocksStandalonePlanExecution() throws Exception {
+        try (Fixture fixture = fixture("plan-goal-exclusive-execute")) {
+            MybatisGoalRepository goals = fixture.repository();
+            createGoal(goals, "goal_exclusive", "run_goal_exclusive", "create:exclusive");
+            Plan awaiting = createAwaitingPlan(goals, "plan_exclusive", "planrev_exclusive");
+            PlanRevision revision = goals.readPlanSnapshot(awaiting.planId()).currentRevision();
+
+            GoalRepositoryException blocked = assertThrows(GoalRepositoryException.class, () ->
+                    goals.executePlan(new GoalRepository.ExecutePlan(awaiting.planId(), awaiting.revision(),
+                            revision.planRevisionId(), revision.planHash(), "approval:exclusive", "run_plan_exclusive", 1,
+                            "evt_execute_exclusive", "execute:exclusive", NOW,
+                            10, 10, 60_000L, 4)));
+            assertEquals(GoalRepositoryException.Code.GOAL_INVALID_STATE, blocked.code());
+            assertTrue(goals.readPlanSnapshot(awaiting.planId()).plan().activeRunId() == null);
+        }
+    }
+
+    /** standalone executing/paused Run 都属于可恢复活动事实，Goal attach 不能绕过 owner 互斥边界。 */
+    @Test
+    void activeStandaloneRunBlocksGoalAttachForExecutingAndPausedRuns() throws Exception {
+        try (Fixture executingFixture = fixture("attach-blocked-by-executing-plan")) {
+            MybatisGoalRepository goals = executingFixture.repository();
+            Plan executing = executeStandalonePlan(goals, "plan_attach_running", "planrev_attach_running", "run_attach_running");
+            executingFixture.insertActiveGoal("goal_attach_running", "run_goal_attach_running", "RUNNING");
+            GoalRepositoryException blocked = assertThrows(GoalRepositoryException.class, () ->
+                    goals.attachPlan(new GoalRepository.AttachPlan("goal_attach_running", 0,
+                            executing.planId(), executing.activePlanRevisionId(),
+                            goals.readPlanSnapshot(executing.planId()).currentRevision().planHash(),
+                            "run_link_running", 1, "evt_attach_running", "attach:running", NOW)));
+            assertEquals(GoalRepositoryException.Code.GOAL_INVALID_STATE, blocked.code());
+        }
+        try (Fixture pausedFixture = fixture("attach-blocked-by-paused-plan")) {
+            MybatisGoalRepository goals = pausedFixture.repository();
+            Plan executing = executeStandalonePlan(goals, "plan_attach_paused", "planrev_attach_paused", "run_attach_paused");
+            Plan paused = goals.settlePlanExecution(new GoalRepository.SettlePlanExecution(
+                    executing.planId(), executing.revision(), executing.activeRunId(),
+                    "evt_pause_attach", "settle:attach", NOW.plusSeconds(1)));
+            pausedFixture.insertActiveGoal("goal_attach_paused", "run_goal_attach_paused", "RUNNING");
+            GoalRepositoryException blocked = assertThrows(GoalRepositoryException.class, () ->
+                    goals.attachPlan(new GoalRepository.AttachPlan("goal_attach_paused", 0,
+                            paused.planId(), paused.activePlanRevisionId(),
+                            goals.readPlanSnapshot(paused.planId()).currentRevision().planHash(),
+                            "run_link_paused", 1, "evt_attach_paused", "attach:paused", NOW.plusSeconds(2))));
+            assertEquals(GoalRepositoryException.Code.GOAL_INVALID_STATE, blocked.code());
         }
     }
 
@@ -226,7 +447,7 @@ final class MybatisGoalRepositoryTest {
      */
     @Test
     void blocksAttachAndDetachWhileCurrentRunHasUnresolvedWork() throws Exception {
-        List<String> blockers = List.of("PENDING_INPUT", "PENDING_EVALUATOR", "TOOL_PREPARED",
+        List<String> blockers = List.of("PENDING_EVALUATOR", "TOOL_PREPARED",
                 "TOOL_STARTED", "HELD_LEASE", "TOOL_UNKNOWN");
         for (String operation : List.of("attach", "detach")) {
             for (String blocker : blockers) {
@@ -563,7 +784,7 @@ final class MybatisGoalRepositoryTest {
         }
     }
 
-    /** 完整快照、输入结算和 evidence/event keyset 页都来自同一权威 SQLite 事实。 */
+    /** 完整快照、evidence 与 event keyset 页都来自同一权威 SQLite 事实。 */
     @Test
     void readsCompleteSnapshotAndStablePages() throws Exception {
         try (Fixture fixture = fixture("goal-read-model")) {
@@ -579,19 +800,11 @@ final class MybatisGoalRepositoryTest {
             assertEquals(0, initial.completedRequiredSteps());
             assertEquals(1, initial.totalRequiredSteps());
 
-            Goal waiting = goals.requestInput(new GoalRepository.RequestInput("goal_one", active.revision(),
-                    "goalinput_one", "run_one", "请选择策略", NOW.plusSeconds(60), "evt_input",
-                    "input:request", NOW));
-            assertNotNull(goals.readSnapshot("goal_one").pendingInput());
-            Goal resumed = goals.respondInput(new GoalRepository.RespondInput("goal_one", waiting.revision(),
-                    "goalinput_one", "\"继续\"", "evt_response", "input:response", NOW.plusSeconds(1)));
-            assertNull(goals.readSnapshot("goal_one").pendingInput());
-
             Evidence firstEvidence = new Evidence("evidence_a", "goal_one", "plan_one", 1L,
                     "run_one", "planrev_one", "criterion_goal", "step_work",
                     EvidenceSource.TEST_REPORT, "report_a", "报告 A",
                     "a".repeat(64), NOW.plusSeconds(2), NOW.plusSeconds(2));
-            goals.appendEvidence(new GoalRepository.AppendEvidence("goal_one", resumed.revision(), firstEvidence,
+            goals.appendEvidence(new GoalRepository.AppendEvidence("goal_one", active.revision(), firstEvidence,
                     "evt_evidence_a", "evidence:a", NOW.plusSeconds(2)));
             Goal afterFirst = goals.findGoal("goal_one").orElseThrow();
             Evidence secondEvidence = new Evidence("evidence_b", "goal_one", "plan_one", 1L,
@@ -642,10 +855,10 @@ final class MybatisGoalRepositoryTest {
         }
     }
 
-    /** 最新 revision 可被拒绝；过期 input 不接受迟到响应且保留稳定错误码。 */
+    /** 最新 revision 可被拒绝，并保留新版本的分页事实。 */
     @Test
-    void rejectsLatestRevisionAndExpiredInput() throws Exception {
-        try (Fixture fixture = fixture("goal-reject-expired")) {
+    void rejectsLatestRevision() throws Exception {
+        try (Fixture fixture = fixture("goal-reject-latest")) {
             MybatisGoalRepository goals = fixture.repository();
             Goal created = createGoal(goals, "goal_one", "run_goal_initial", "create:key1");
             goals.createPlan(new GoalRepository.CreatePlan(
@@ -666,16 +879,9 @@ final class MybatisGoalRepositoryTest {
             goals.approve(new GoalRepository.ApprovePlan("plan_one", awaitingApproval.revision(),
                     "planrev_two", encoded.sha256(), "appr_two",
                     "evt_approve", "approve:key2", NOW.plusSeconds(2)));
-            Goal active = goals.attachPlan(new GoalRepository.AttachPlan("goal_one", created.revision(),
+            goals.attachPlan(new GoalRepository.AttachPlan("goal_one", created.revision(),
                     "plan_one", "planrev_two", encoded.sha256(), "run_two", 1,
                     "evt_attach", "attach:key2", NOW.plusSeconds(2)));
-            Goal waiting = goals.requestInput(new GoalRepository.RequestInput("goal_one", active.revision(),
-                    "goalinput_expired", "run_two", "请输入", NOW.plusSeconds(2), "evt_input",
-                    "input:expired", NOW.plusSeconds(1)));
-            GoalRepositoryException expired = assertThrows(GoalRepositoryException.class, () ->
-                    goals.respondInput(new GoalRepository.RespondInput("goal_one", waiting.revision(),
-                            "goalinput_expired", "\"迟到\"", "evt_late", "input:late", NOW.plusSeconds(2))));
-            assertEquals(GoalRepositoryException.Code.GOAL_INPUT_EXPIRED, expired.code());
         }
     }
 
@@ -700,6 +906,11 @@ final class MybatisGoalRepositoryTest {
             assertEquals("created", service.readEvents(created.goalId(), null, 20)
                     .items().getFirst().kind());
 
+            List<io.github.kongweiguang.ja.goal.port.in.PlanEvent> planPublished = new ArrayList<>();
+            AutoCloseable planSubscription = service.subscribePlan(event -> {
+                planPublished.add(event);
+                return CompletableFuture.completedFuture(null);
+            });
             Plan plan = service.createPlan(new GoalUseCase.CreatePlan(
                     "thr_one", "交付目标", 0, "plan:create:service", NOW));
             service.saveDraft(new GoalUseCase.SaveDraft(plan.planId(), plan.revision(), 0,
@@ -709,6 +920,12 @@ final class MybatisGoalRepositoryTest {
             Plan approved = service.approve(new GoalUseCase.Approve(
                     plan.planId(), 2, proposed.planRevisionId(), proposed.planHash(),
                     "approve:service", NOW.plusSeconds(3)));
+            assertEquals(List.of("created", "plan_draft_saved", "plan_proposed", "plan_approved"),
+                    planPublished.stream().map(event -> event.activity().kind()).toList());
+            assertEquals("plan_proposed", fixture.repository().listPlanEvents(plan.planId(), 0, 20)
+                    .items().get(2).activity());
+            assertEquals(proposed.planRevisionId(), service.readPlan(plan.planId()).currentRevision().planRevisionId());
+            planSubscription.close();
             Goal attached = service.attachPlan(new GoalUseCase.AttachPlan(
                     created.goalId(), created.revision(), approved.planId(), proposed.planRevisionId(),
                     proposed.planHash(), "attach:service", NOW.plusSeconds(4)));
@@ -947,6 +1164,28 @@ final class MybatisGoalRepositoryTest {
                 "交付目标", goalCriteria(), runId, 1, 0, key, NOW));
     }
 
+    /** 创建一个未批准但已冻结不可变 revision 的 Plan，供 execute 原子授权路径复用。 */
+    private static Plan createAwaitingPlan(MybatisGoalRepository goals, String planId, String revisionId) {
+        Plan created = goals.createPlan(new GoalRepository.CreatePlan(
+                planId, "thr_one", "交付目标", 0, "plan:create:" + planId, NOW));
+        PlanDefinition definition = definition();
+        CanonicalPlanJson.Encoded canonical = new CanonicalPlanJson(new ObjectMapper()).encode(definition);
+        goals.propose(new GoalRepository.ProposePlan(planId, created.revision(),
+                new PlanRevision(revisionId, planId, 1, definition, canonical.json(), canonical.sha256(), "AGENT", NOW),
+                "evt_propose:" + planId, "propose:" + planId, NOW));
+        return goals.readPlanSnapshot(planId).plan();
+    }
+
+    /** 在同一 owner 下创建可执行 standalone Run，并把模型、Tool、墙钟和 Turn 预算冻结到 Run。 */
+    private static Plan executeStandalonePlan(MybatisGoalRepository goals, String planId,
+                                              String revisionId, String runId) {
+        Plan awaiting = createAwaitingPlan(goals, planId, revisionId);
+        PlanRevision revision = goals.readPlanSnapshot(planId).currentRevision();
+        return goals.executePlan(new GoalRepository.ExecutePlan(planId, awaiting.revision(),
+                revision.planRevisionId(), revision.planHash(), "approval:" + planId, runId, 1,
+                "evt_execute:" + planId, "execute:" + planId, NOW, 10, 10, 60_000L, 4));
+    }
+
     /** 测试 evaluator 固定返回结构化 MET，完成资格仍完全由 repository 的真实事实决定。 */
     private static GoalEvaluator evaluator(MybatisGoalRepository goals) {
         GoalEvaluatorPort port = request -> CompletableFuture.completedFuture(new GoalEvaluatorPort.Result(
@@ -1051,11 +1290,122 @@ final class MybatisGoalRepositoryTest {
                 session.commit();
             }
         }
+
+        /** 插入真实 SUSPENDED/终态 Turn 与 PLAN_EXECUTION context，覆盖 admission 后的恢复游标。 */
+        private void insertPlanTurn(String turnId, String state, String planId,
+                                    String planRevisionId, String runId) throws Exception {
+            try (SqlSession session = sessions.openSession()) {
+                try (java.sql.PreparedStatement turn = session.getConnection().prepareStatement(
+                        "INSERT INTO turns(turn_id,thread_id,state,requested_at,updated_at,parent_turn_id,root_turn_id) "
+                                + "VALUES(?,'thr_one',?,?,?,NULL,NULL)")) {
+                    turn.setString(1, turnId);
+                    turn.setString(2, state);
+                    turn.setString(3, NOW.toString());
+                    turn.setString(4, NOW.toString());
+                    turn.executeUpdate();
+                }
+                try (java.sql.PreparedStatement context = session.getConnection().prepareStatement(
+                        "INSERT INTO turn_internal_context(turn_id,origin,context_json,created_at) "
+                                + "VALUES(?,'PLAN_EXECUTION',?,?)")) {
+                    context.setString(1, turnId);
+                    context.setString(2, "{\"kind\":\"PLAN_EXECUTION\",\"planId\":\"" + planId
+                            + "\",\"runId\":\"" + runId + "\",\"planRevisionId\":\""
+                            + planRevisionId + "\",\"planHash\":\"" + "e".repeat(64) + "\"}");
+                    context.setString(3, NOW.toString());
+                    context.executeUpdate();
+                }
+                session.commit();
+            }
+        }
+
+        /** 读取 claim 的持久状态，避免只通过 coordinator 内存回调推断恢复资格。 */
+        private String planTurnClaimState(String runId, String turnId) throws Exception {
+            try (SqlSession session = sessions.openSession();
+                 java.sql.PreparedStatement query = session.getConnection().prepareStatement(
+                         "SELECT state FROM plan_turn_claims WHERE run_id=? AND turn_id=?")) {
+                query.setString(1, runId);
+                query.setString(2, turnId);
+                try (java.sql.ResultSet rows = query.executeQuery()) {
+                    return rows.next() ? rows.getString(1) : null;
+                }
+            }
+        }
+
+        /** 读取不可变 ordinal，确认恢复没有以新的 admission 次数替代原 Turn。 */
+        private int planTurnOrdinal(String runId, String turnId) throws Exception {
+            try (SqlSession session = sessions.openSession();
+                 java.sql.PreparedStatement query = session.getConnection().prepareStatement(
+                         "SELECT ordinal FROM plan_turn_claims WHERE run_id=? AND turn_id=?")) {
+                query.setString(1, runId);
+                query.setString(2, turnId);
+                try (java.sql.ResultSet rows = query.executeQuery()) {
+                    if (!rows.next()) throw new AssertionError("missing Plan Turn claim");
+                    return rows.getInt(1);
+                }
+            }
+        }
+
+        /** 直接构造同 owner 的活动 Goal，仅用于验证 attach 在已有 standalone Run 下的服务端拒绝。 */
+        private void insertActiveGoal(String goalId, String runId, String runStatus) throws Exception {
+            try (SqlSession session = sessions.openSession();
+                 java.sql.PreparedStatement sql = session.getConnection().prepareStatement(
+                         "INSERT INTO goals(goal_id,owner_thread_id,owner_kind,objective,goal_definition_revision,"
+                                 + "create_idempotency_key,status,phase,revision,active_run_id,created_at,updated_at) "
+                                 + "VALUES(?,'thr_one','ROOT_THREAD','附加目标',1,?,'ACTIVE','WORKING',0,?,?,?)")) {
+                sql.setString(1, goalId);
+                sql.setString(2, "create:" + goalId);
+                sql.setString(3, runId);
+                sql.setString(4, NOW.toString());
+                sql.setString(5, NOW.toString());
+                sql.executeUpdate();
+                try (java.sql.PreparedStatement definition = session.getConnection().prepareStatement(
+                        "INSERT INTO goal_definition_revisions(goal_id,revision_number,objective,created_at) VALUES(?,1,?,?)")) {
+                    definition.setString(1, goalId);
+                    definition.setString(2, "附加目标");
+                    definition.setString(3, NOW.toString());
+                    definition.executeUpdate();
+                }
+                try (java.sql.PreparedStatement criterion = session.getConnection().prepareStatement(
+                        "INSERT INTO goal_acceptance_criteria(goal_id,goal_definition_revision,criterion_id,ordinal,description,required) VALUES(?,1,'criterion_goal',0,'目标验收通过',1)")) {
+                    criterion.setString(1, goalId);
+                    criterion.executeUpdate();
+                }
+                try (java.sql.PreparedStatement run = session.getConnection().prepareStatement(
+                        "INSERT INTO execution_runs(run_id,goal_id,goal_definition_revision,status,process_generation,started_at,created_at,updated_at) VALUES(?,?,1,?,1,?,?,?)")) {
+                    run.setString(1, runId);
+                    run.setString(2, goalId);
+                    run.setString(3, runStatus);
+                    run.setString(4, NOW.toString());
+                    run.setString(5, NOW.toString());
+                    run.setString(6, NOW.toString());
+                    run.executeUpdate();
+                }
+                session.commit();
+            }
+        }
         /** attempt 数量用于证明拒绝路径没有在 SQLite 留下半提交 ledger。 */
         private int toolAttemptCount() throws Exception {
             try (SqlSession session = sessions.openSession(); Statement sql = session.getConnection().createStatement();
                  java.sql.ResultSet rows = sql.executeQuery("SELECT COUNT(*) FROM goal_tool_attempts")) {
                 return rows.next() ? rows.getInt(1) : -1;
+            }
+        }
+        /** 为 owner 隔离测试建立真实 SIDE_TASK/INDEPENDENT lineage，避免绕过仓储校验。 */
+        private void insertIndependentSideTask() throws Exception {
+            try (SqlSession session = sessions.openSession(); Statement sql = session.getConnection().createStatement()) {
+                sql.executeUpdate("INSERT INTO task_context_seeds(context_seed_id,parent_thread_id,parent_revision,"
+                        + "inheritance_mode,task_brief_json,references_json,permission_ceiling_json,fingerprint,created_at)"
+                        + " VALUES('seed_side','thr_one',0,'BRIEF_ONLY','[]','[]','{}','"
+                        + "a".repeat(64) + "','2026-09-04T10:00:00Z')");
+                sql.executeUpdate("INSERT INTO threads(thread_id,workspace_id,title,revision,created_at,updated_at,"
+                        + "provider_id,model_id,access_mode,title_source,collaboration_mode) VALUES("
+                        + "'thr_side','ws_one','Side Task',0,'2026-09-04T10:00:00Z',"
+                        + "'2026-09-04T10:00:00Z','provider','model','APPROVAL_REQUIRED','MANUAL','PLAN')");
+                sql.executeUpdate("INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,"
+                        + "task_name,depth,task_kind,lifecycle,context_seed_id,created_at) VALUES("
+                        + "'thr_side','thr_one','thr_one','side-task',1,'SIDE_TASK','INDEPENDENT','seed_side',"
+                        + "'2026-09-04T10:00:00Z')");
+                session.commit();
             }
         }
         /**
@@ -1065,10 +1415,6 @@ final class MybatisGoalRepositoryTest {
         private void insertRunReplacementBlocker(String blocker) throws Exception {
             try (SqlSession session = sessions.openSession(); Statement sql = session.getConnection().createStatement()) {
                 switch (blocker) {
-                    case "PENDING_INPUT" -> sql.executeUpdate("INSERT INTO goal_input_requests("
-                            + "input_request_id,goal_id,run_id,prompt,state,expires_at,created_at) VALUES("
-                            + "'input_blocker','goal_one','run_one','等待输入','PENDING',"
-                            + "'2026-09-05T10:00:01Z','2026-09-04T10:00:01Z')");
                     case "PENDING_EVALUATOR" -> sql.executeUpdate("INSERT INTO goal_evaluations("
                             + "evaluation_id,goal_id,goal_definition_revision,run_id,plan_revision_id,status,"
                             + "process_generation,model_id,provider_id,requested_at) VALUES("

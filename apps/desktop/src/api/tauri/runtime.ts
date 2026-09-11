@@ -77,7 +77,7 @@ const RuntimeStatusKindSchema = z.enum([
   "faulted",
 ]);
 
-const RuntimeFeatureSchema = z.enum(["task_threads_v1", "plan_goal_v1"]);
+const RuntimeFeatureSchema = z.enum(["task_threads_v1", "plan_goal_v1", "interaction_v1"]);
 
 const RuntimeStatusWireKindSchema = z.enum([
   "starting",
@@ -433,6 +433,8 @@ export type RuntimeHostEvent =
   | { kind: "timeline"; event: RuntimeTimelineEvent }
   | { kind: "task"; event: RuntimeTaskEvent }
   | { kind: "goal"; event: RuntimeGoalEvent }
+  | { kind: "plan"; event: RuntimePlanEvent }
+  | { kind: "interaction"; event: RuntimeInteractionEvent }
   | { kind: "projection_fault"; reason: "invalid_native_event" };
 
 export type RuntimeHostUnsubscribe = () => void | Promise<void>;
@@ -498,6 +500,12 @@ const SAFE_RUNTIME_ERRORS: Record<string, { message: string; retryable: boolean 
   TASK_TREE_DELETE_REQUIRED: { message: "请使用整树删除并再次确认", retryable: false },
   TASK_OBSERVATION_INVALID: { message: "任务观察已失效，请重新打开", retryable: true },
   WORKSPACE_WRITE_LEASE_TIMEOUT: { message: "工作区写入繁忙，请稍后重试", retryable: true },
+  INTERACTION_NOT_FOUND: { message: "交互问题不存在或已被替代", retryable: false },
+  INTERACTION_REVISION_CONFLICT: { message: "交互内容已变化，请重新查看后重试", retryable: true },
+  INTERACTION_INVALID_STATE: { message: "当前交互状态不允许此操作", retryable: false },
+  INTERACTION_INVALID: { message: "交互请求无效", retryable: false },
+  PLAN_REVISION_CONFLICT: { message: "计划已被其他修改，请重新查看后重试", retryable: true },
+  PLAN_INVALID_STATE: { message: "当前计划状态不允许此操作", retryable: false },
   THREAD_NOT_FOUND: { message: "对话不存在或已删除", retryable: false },
   CONFLICT: { message: "对话状态已变化，请刷新后重试", retryable: true },
   SUMMARY_FAILURE: { message: "上下文摘要生成失败", retryable: true },
@@ -641,11 +649,13 @@ type RuntimeTaskEvent = Extract<
   JaEvent,
   { method: "task/activity" | "task/progress" | "task/mailbox-changed" }
 >;
-type RuntimeGoalEvent = Extract<
+type RuntimeGoalEvent = Extract<JaEvent, { method: "goal/changed" | "goal/activity" }>;
+type RuntimePlanEvent = Extract<JaEvent, { method: "plan/changed" }>;
+type RuntimeInteractionEvent = Extract<JaEvent, { method: "interaction/changed" }>;
+type RuntimeTimelineEvent = Exclude<
   JaEvent,
-  { method: "goal/changed" | "goal/activity" | "goal/input-requested" }
+  RuntimeTaskEvent | RuntimeGoalEvent | RuntimePlanEvent | RuntimeInteractionEvent
 >;
-type RuntimeTimelineEvent = Exclude<JaEvent, RuntimeTaskEvent | RuntimeGoalEvent>;
 
 /** Task notification 在 IPC 边缘与主 Timeline 分流，避免 Child 事件被 Conversation reducer 误收。 */
 function isRuntimeTaskEvent(event: JaEvent): event is RuntimeTaskEvent {
@@ -658,11 +668,17 @@ function isRuntimeTaskEvent(event: JaEvent): event is RuntimeTaskEvent {
 
 /** Goal notification 从 Timeline 独立分流，事件仅唤醒权威查询，不能写入 Conversation reducer。 */
 function isRuntimeGoalEvent(event: JaEvent): event is RuntimeGoalEvent {
-  return (
-    event.method === "goal/changed" ||
-    event.method === "goal/activity" ||
-    event.method === "goal/input-requested"
-  );
+  return event.method === "goal/changed" || event.method === "goal/activity";
+}
+
+/** Plan 事件独立分流，避免把计划进度误归入 Goal 或普通对话时间线。 */
+function isRuntimePlanEvent(event: JaEvent): event is RuntimePlanEvent {
+  return event.method === "plan/changed";
+}
+
+/** Interaction 事件只驱动当前 Thread 的询问卡片，不进入普通 Timeline。 */
+function isRuntimeInteractionEvent(event: JaEvent): event is RuntimeInteractionEvent {
+  return event.method === "interaction/changed";
 }
 
 /** Java 只在 ToolPresentation 中发布工作区相对路径；其它 path/cwd 字段仍应拒绝。 */
@@ -764,6 +780,8 @@ export function parseRuntimeHostEvent(value: unknown): RuntimeHostEvent {
   const event = parseEvent(value);
   if (isRuntimeTaskEvent(event)) return { kind: "task", event };
   if (isRuntimeGoalEvent(event)) return { kind: "goal", event };
+  if (isRuntimePlanEvent(event)) return { kind: "plan", event };
+  if (isRuntimeInteractionEvent(event)) return { kind: "interaction", event };
   return { kind: "timeline", event };
 }
 

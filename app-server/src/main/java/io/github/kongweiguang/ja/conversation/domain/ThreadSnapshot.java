@@ -56,7 +56,7 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
     /**
      * 历史项闭集只包含当前公开合同允许回放的持久化事实。
      */
-    public sealed interface Item permits UserInputItem, TextItem, ToolItem, ApprovalItem {
+    public sealed interface Item permits UserInputItem, ThreadMessageItem, TextItem, ToolItem, ApprovalItem {
         /**
          * 返回追加写入时生成的不透明条目身份。
          */
@@ -84,6 +84,24 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
                     .map(AttachmentSummary::attachmentId).toList())) {
                 throw new IllegalArgumentException("attachment summaries do not match content order");
             }
+        }
+    }
+
+    /**
+     * 跨会话消息的独立可见投影；来源快照与正文分开保存，避免把传入消息伪装成当前用户输入。
+     */
+    public record ThreadMessageItem(String itemId, Instant createdAt, String turnId,
+                                    String sourceThreadId, String sourceTitle, String content) implements Item {
+        /**
+         * 消息必须保留发送时的 Thread 标识和标题快照；正文允许为空以覆盖纯资源消息。
+         */
+        public ThreadMessageItem {
+            requireIdentifier(itemId, "item_", "itemId");
+            Objects.requireNonNull(createdAt, "createdAt");
+            requireIdentifier(turnId, "turn_", "turnId");
+            requireIdentifier(sourceThreadId, "thr_", "sourceThreadId");
+            sourceTitle = boundedText(sourceTitle, "sourceTitle", 512, false);
+            content = boundedText(content, "content", 1_048_576, true);
         }
     }
 
@@ -185,5 +203,16 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
             || !value.substring(prefix.length()).matches("[A-Za-z0-9][A-Za-z0-9._-]*")) {
             throw new IllegalArgumentException("invalid " + field);
         }
+    }
+
+    /**
+     * 在历史投影边界限制来源标题和消息正文，防止损坏或无界 Mailbox 数据进入快照。
+     */
+    private static String boundedText(String value, String field, int maximum, boolean allowEmpty) {
+        if (value == null || value.length() > maximum || value.indexOf('\0') >= 0
+                || (!allowEmpty && value.isBlank())) {
+            throw new IllegalArgumentException("invalid " + field);
+        }
+        return value;
     }
 }

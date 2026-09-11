@@ -1,4 +1,4 @@
-{"jsonrpc":"2.0","id":"c:bad-task-create","method":"task/create","params":{"parentThreadId":"thr_root","parentTurnId":null,"expectedParentRevision":7,"taskName":"Parser","content":[{"type":"text","text":"Inspect."}]}}
+{"jsonrpc":"2.0","id":"c:bad-task-create","method":"task/create","params":{"parentThreadId":"thr_root","parentTurnId":null,"expectedParentRevision":7,"taskName":"Parser"}}
 {"jsonrpc":"2.0","id":"c:bad-task-create","result":{"accepted":true,"turnId":"turn_side_1"}}
 {"jsonrpc":"2.0","id":"c:bad-task-list","method":"task/list","params":{"rootThreadId":"thr_root"}}
 {"jsonrpc":"2.0","id":"c:bad-task-list","result":{"items":[{"taskThreadId":"thr_side_1","parentThreadId":"thr_root","rootThreadId":"thr_root","originTurnId":null,"taskName":"Parser","depth":1,"taskKind":"side_task","lifecycle":"independent","state":"paused","revision":1,"latestActivitySequence":1,"unreadCount":0,"descendantCount":0,"runningDescendantCount":0,"needsAttentionCount":0,"latestSafeSummary":null,"startedAt":null,"completedAt":null,"updatedAt":"2026-09-03T08:00:00Z"}]}}
@@ -10,8 +10,12 @@
 {"jsonrpc":"2.0","id":"c:bad-task-unobserve","result":{"accepted":false}}
 {"jsonrpc":"2.0","id":"c:bad-task-seen","method":"task/seen","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":1,"throughActivitySequence":1}}
 {"jsonrpc":"2.0","id":"c:bad-task-seen","result":{"accepted":true,"task":{"state":"running"}}}
-{"jsonrpc":"2.0","id":"c:bad-task-message","method":"task/message/send","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"message-1"}}
+{"jsonrpc":"2.0","id":"c:bad-task-message","method":"thread/message/send","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"message-1"}}
 {"jsonrpc":"2.0","id":"c:bad-task-message","result":{"accepted":true,"messageId":"msg_note","mailboxSequence":-1}}
+{"jsonrpc":"2.0","id":"c:bad-task-close","method":"task/close","params":{"taskThreadId":"thr_side_1"}}
+{"jsonrpc":"2.0","id":"c:bad-task-close","result":{"closed":false}}
+{"jsonrpc":"2.0","id":"c:bad-task-close-extra","method":"task/close","params":{"taskThreadId":"thr_side_1"}}
+{"jsonrpc":"2.0","id":"c:bad-task-close-extra","result":{"closed":true,"taskThreadId":"thr_side_1"}}
 {"jsonrpc":"2.0","id":"c:bad-task-followup","method":"task/followup","params":{"senderThreadId":"thr_root","targetThreadId":"thr_side_1","content":[{"type":"text","text":"Inspect."}],"idempotencyKey":"followup-1","expectedTaskRevision":1}}
 {"jsonrpc":"2.0","id":"c:bad-task-followup","result":{"accepted":true,"messageId":"msg_followup","turnId":"side_2","task":{}}}
 {"jsonrpc":"2.0","id":"c:bad-task-cancel","method":"task/cancel","params":{"taskThreadId":"thr_side_1","expectedTaskRevision":1}}

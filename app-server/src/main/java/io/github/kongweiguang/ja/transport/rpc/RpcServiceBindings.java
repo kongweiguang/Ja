@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ApprovalUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
@@ -31,6 +32,7 @@ public record RpcServiceBindings(WorkspaceUseCase workspaces, WorkspacePathSearc
                                  AttachmentPreviewUseCase attachmentPreviews,
                                  TaskUseCase tasks,
                                  GoalUseCase goals,
+                                 InteractionUseCase interactions,
                                  DeadlineCloseable lifecycle) {
     /**
      * 在握手发布服务图前一次性验证所有必需端口，禁止运行中降级为空实现。
@@ -47,6 +49,7 @@ public record RpcServiceBindings(WorkspaceUseCase workspaces, WorkspacePathSearc
         Objects.requireNonNull(attachmentPreviews, "attachmentPreviews");
         Objects.requireNonNull(tasks, "tasks");
         Objects.requireNonNull(goals, "goals");
+        Objects.requireNonNull(interactions, "interactions");
         Objects.requireNonNull(lifecycle, "lifecycle");
     }
 }

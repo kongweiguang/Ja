@@ -29,15 +29,16 @@ public interface TaskMailboxPort {
 
     /** 已绑定消息冻结数据库逐字段复核所需事实，不携带 Task 投影或 UI 状态。 */
     record ClaimedMessage(long sequence, String messageId, String rootThreadId,
-                          String senderThreadId, String targetThreadId, String causalTurnId,
-                          MessageKind kind, UserContent content, String idempotencyKey,
-                          String boundTurnId) {
+                          String senderThreadId, String senderTitle, String targetThreadId,
+                          String causalTurnId, MessageKind kind, UserContent content,
+                          String idempotencyKey, String boundTurnId) {
         /** BOUND 快照必须拥有正序号、具体 Turn 与不可变结构化内容。 */
         public ClaimedMessage {
             if (sequence < 1) throw new IllegalArgumentException("invalid mailbox sequence");
             Objects.requireNonNull(messageId, "messageId");
             Objects.requireNonNull(rootThreadId, "rootThreadId");
             Objects.requireNonNull(senderThreadId, "senderThreadId");
+            Objects.requireNonNull(senderTitle, "senderTitle");
             Objects.requireNonNull(targetThreadId, "targetThreadId");
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(content, "content");

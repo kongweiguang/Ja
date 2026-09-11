@@ -1,8 +1,8 @@
 {"jsonrpc":"2.0","id":"c:goal-pause-no-cas","method":"goal/pause","params":{"goalId":"goal_demo","idempotencyKey":"goal:pause:demo"}}
 {"jsonrpc":"2.0","id":"c:goal-pause-no-key","method":"goal/pause","params":{"goalId":"goal_demo","expectedGoalRevision":1}}
 {"jsonrpc":"2.0","id":"c:attach-no-hash","method":"goal/plan/attach","params":{"goalId":"goal_demo","expectedGoalRevision":2,"idempotencyKey":"goal:attach:demo","planId":"plan_demo","planRevisionId":"planrev_demo"}}
-{"jsonrpc":"2.0","id":"c:approve-goal-cas","method":"plan/approve","params":{"goalId":"goal_demo","expectedGoalRevision":2,"idempotencyKey":"plan:approve:demo","planRevisionId":"planrev_demo","planHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 {"jsonrpc":"2.0","id":"c:execute-no-hash","method":"plan/execute","params":{"threadId":"thr_root","planId":"plan_demo","expectedPlanRevision":5,"idempotencyKey":"plan:execute:demo","planRevisionId":"planrev_demo"}}
 {"jsonrpc":"2.0","id":"c:draft-markdown","method":"plan/draft/save","params":{"threadId":"thr_root","planId":"plan_demo","expectedPlanRevision":1,"idempotencyKey":"plan:draft:save","draft":"- [ ] Markdown"}}
 {"jsonrpc":"2.0","id":"c:plan-independent-owner","method":"plan/create","params":{"owner":{"kind":"independent_task","taskThreadId":"thr_task"},"objective":"invalid owner","expectedThreadRevision":0,"idempotencyKey":"plan:create:invalid"}}
+{"jsonrpc":"2.0","id":"c:plan-current-read-unknown","method":"plan/current/read","params":{"threadId":"thr_root","planId":"plan_demo"}}
 {"jsonrpc":"2.0","method":"goal/changed","params":{"serverInstanceId":"srv_demo","eventId":"evt_goal_changed","sequence":10,"generation":1,"occurredAt":"2026-09-04T08:00:01Z","goalId":"goal_demo","goalRevision":1,"eventSequence":1,"goal":{"goalId":"goal_demo"},"plan":{"draft":null,"currentRevision":null,"approval":null,"stepExecutions":[],"latestEvaluation":null}}}

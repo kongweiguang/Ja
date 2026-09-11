@@ -30,13 +30,21 @@ async function sourceFiles(directory) {
   return files;
 }
 
-/** 首版仅有一份建库资源和一套协议目录，历史转换不能作为隐含备用链路打包。 */
+/** 只允许当前建库与已确认的会话策略初始化资源，禁止引入未审定的历史转换或备用协议。 */
 export async function checkInitialBaseline(root) {
   const violations = [];
   const migrationRoot = path.join(root, "app-server/src/main/resources/db/migration");
   const migrations = await readdir(migrationRoot);
-  if (migrations.length !== 1 || migrations[0] !== "V1__kernel.sql") {
-    violations.push("数据库首版只能包含 V1__kernel.sql，禁止历史迁移和专用配置");
+  const expectedMigrations = [
+    "V1__kernel.sql",
+    "V2__thread_subagent_policies.sql",
+    "V3__subagent_reasoning.sql",
+  ];
+  if (
+    migrations.length !== expectedMigrations.length ||
+    expectedMigrations.some((name) => !migrations.includes(name))
+  ) {
+    violations.push("数据库只允许 V1 建库、V2 子智能体会话策略与 V3 思考等级资源");
   }
   const protocolEntries = await readdir(path.join(root, "contracts/ja-rpc"), {
     withFileTypes: true,

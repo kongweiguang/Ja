@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * catalog 入站用例实现，只负责编排并把外部 IO 委派给出站端口。
@@ -49,7 +50,8 @@ public final class CatalogService implements CatalogUseCase {
     }
 
     /**
-     * 模型验证只冻结指定保存身份并发送固定短请求；Sink 丢弃所有流式正文，租约覆盖完整异步 IO。
+     * 只用 hi 探测基本对话；仅记录是否收到非空白正文，避免空流误报成功或保留回答内容。
+     * 配置租约覆盖完整异步 IO，思考摘要和用量事件不能替代对话回复。
      */
     @Override
     @SuppressWarnings("PMD.CloseResource")
@@ -62,13 +64,24 @@ public final class CatalogService implements CatalogUseCase {
             ModelPort.ModelConfiguration configuration = modelConfiguration(provider, model, lease);
             ModelPort.ModelRequest request = new ModelPort.ModelRequest(
                     configuration,
-                    new ModelPort.PromptPayload("Return exactly OK.", "prompt_model_test_v1"),
-                    List.of(new ModelMessage(ModelRole.USER, List.of(new TextContent("Reply with OK.")))),
+                    new ModelPort.PromptPayload("", "prompt_model_test_v2"),
+                    List.of(new ModelMessage(ModelRole.USER, List.of(new TextContent("hi")))),
                     List.of(), null, 1);
             long started = System.nanoTime();
-            return models.start(request, ignored -> CompletableFuture.completedFuture(null), cancellationToken)
-                    .thenApply(ignored -> new ModelTestResult(model.model(),
-                            Duration.ofNanos(System.nanoTime() - started).toMillis()))
+            AtomicBoolean receivedText = new AtomicBoolean();
+            return models.start(request, event -> {
+                        if (event instanceof ModelPort.TextDelta delta && !delta.text().isBlank()) {
+                            receivedText.set(true);
+                        }
+                        return CompletableFuture.completedFuture(null);
+                    }, cancellationToken)
+                    .thenApply(ignored -> {
+                        if (!receivedText.get()) {
+                            throw new IllegalStateException("model returned no reply text");
+                        }
+                        return new ModelTestResult(model.model(),
+                                Duration.ofNanos(System.nanoTime() - started).toMillis());
+                    })
                     .whenComplete((ignored, failure) -> lease.close());
         } catch (RuntimeException | Error failure) {
             lease.close();

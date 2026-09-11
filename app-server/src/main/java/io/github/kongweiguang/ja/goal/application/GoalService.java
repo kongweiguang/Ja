@@ -14,6 +14,8 @@ import io.github.kongweiguang.ja.goal.port.in.GoalEvent;
 import io.github.kongweiguang.ja.goal.port.in.GoalEventSink;
 import io.github.kongweiguang.ja.goal.port.in.GoalUseCase;
 import io.github.kongweiguang.ja.goal.port.in.PlanExecutionEventSink;
+import io.github.kongweiguang.ja.goal.port.in.PlanEvent;
+import io.github.kongweiguang.ja.goal.port.in.PlanEventSink;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepository;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepositoryException;
 
@@ -24,10 +26,12 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /** Goal application service 只分配 identity、canonical hash 并调用事务端口。 */
 public final class GoalService implements GoalUseCase {
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(GoalService.class);
     private final GoalRepository goals;
     private final CanonicalPlanJson canonical;
     private final ObjectMapper json;
@@ -36,6 +40,8 @@ public final class GoalService implements GoalUseCase {
     private final GoalEventRegistry events;
     private final GoalContinuationGate continuations;
     private final PlanExecutionCoordinator planExecutions;
+    private final PlanEventRegistry planEvents;
+    private final PlanExecutionCoordinator.PlanExecutionBudgetPort planBudgets;
 
     /** 所有 identity 仅由服务端生成，调用方只携带幂等 key。 */
     public GoalService(GoalRepository goals, ObjectMapper json, Clock clock) {
@@ -57,6 +63,22 @@ public final class GoalService implements GoalUseCase {
     public GoalService(GoalRepository goals, ObjectMapper json, Clock clock, long processGeneration,
                        GoalEventRegistry events, GoalContinuationGate continuations,
                        PlanExecutionCoordinator planExecutions) {
+        this(goals, json, clock, processGeneration, events, continuations, planExecutions,
+                new PlanEventRegistry(), null);
+    }
+
+    /** 生产组合注入独立 Plan registry；Goal registry 与 Plan registry 不共享关闭和背压。 */
+    public GoalService(GoalRepository goals, ObjectMapper json, Clock clock, long processGeneration,
+                       GoalEventRegistry events, GoalContinuationGate continuations,
+                       PlanExecutionCoordinator planExecutions, PlanEventRegistry planEvents) {
+        this(goals, json, clock, processGeneration, events, continuations, planExecutions, planEvents, null);
+    }
+
+    /** 生产组合注入预算解析器，使 execute 事务冻结真实 RuntimeLease limits。 */
+    public GoalService(GoalRepository goals, ObjectMapper json, Clock clock, long processGeneration,
+                       GoalEventRegistry events, GoalContinuationGate continuations,
+                       PlanExecutionCoordinator planExecutions, PlanEventRegistry planEvents,
+                       PlanExecutionCoordinator.PlanExecutionBudgetPort planBudgets) {
         this.goals = Objects.requireNonNull(goals, "goals");
         this.json = Objects.requireNonNull(json, "json");
         this.canonical = new CanonicalPlanJson(json);
@@ -64,6 +86,8 @@ public final class GoalService implements GoalUseCase {
         this.events = Objects.requireNonNull(events, "events");
         this.continuations = Objects.requireNonNull(continuations, "continuations");
         this.planExecutions = planExecutions;
+        this.planEvents = Objects.requireNonNull(planEvents, "planEvents");
+        this.planBudgets = planBudgets;
         if (processGeneration < 1) throw new IllegalArgumentException("invalid process generation");
         this.processGeneration = processGeneration;
     }
@@ -72,6 +96,12 @@ public final class GoalService implements GoalUseCase {
     @Override
     public AutoCloseable subscribe(GoalEventSink sink) {
         return events.subscribe(sink);
+    }
+
+    /** Plan 观察使用独立 registry，关闭一个连接不会影响 Goal 或其它 Plan 观察者。 */
+    @Override
+    public AutoCloseable subscribePlan(PlanEventSink sink) {
+        return planEvents.subscribe(sink);
     }
 
     /** 读取由 repository 单事务组装的完整投影，application 不缓存派生状态。 */
@@ -84,6 +114,11 @@ public final class GoalService implements GoalUseCase {
     @Override
     public GoalModels.PlanSnapshot readPlan(String planId) {
         return goals.readPlanSnapshot(planId);
+    }
+
+    /** 初次显示 Thread 时的一次性查询，后续更新使用轻量 Plan 观察。 */
+    @Override public Optional<GoalModels.PlanSnapshot> findCurrentPlan(String ownerThreadId) {
+        return goals.findCurrentPlan(ownerThreadId);
     }
 
     /** Extension 只取得当前 Goal 的稳定 mutation/run identity，Plan link 由同一快照冻结。 */
@@ -184,6 +219,40 @@ public final class GoalService implements GoalUseCase {
         return new GoalModels.Page<>(goalId, page.goalRevision(), page.eventSequence(), items, next);
     }
 
+    /** Plan observation 使用独立事件序列，避免 UI 将 Goal 和 Plan 的 revision 混为一谈。 */
+    @Override
+    public GoalModels.Page<GoalModels.PublicEvent> readPlanEvents(String planId, String cursor, int limit) {
+        long afterSequence = numericCursor(cursor, "pev~");
+        GoalRepository.ReadPage<GoalRepository.PlanEvent> page = goals.listPlanEvents(
+                planId, afterSequence, pageFetch(limit));
+        List<GoalRepository.PlanEvent> rows = page.items();
+        boolean more = rows.size() > limit;
+        List<GoalModels.PublicEvent> items = rows.stream().limit(limit).map(this::planPublicEvent).toList();
+        String next = more && !items.isEmpty() ? "pev~" + items.getLast().eventSequence() : null;
+        return new GoalModels.Page<>(planId, page.goalRevision(), page.eventSequence(), items, next);
+    }
+
+    /** Plan evidence 查询按冻结 revision/run 过滤，旧版本证据不可进入当前 UI 完成门。 */
+    @Override
+    public GoalModels.Page<GoalModels.Evidence> listPlanEvidence(String planId, String planRevisionId,
+                                                                  String runId, String cursor, int limit) {
+        GoalModels.PlanSnapshot snapshot = goals.readPlanSnapshot(planId);
+        if (snapshot.currentRevision() == null
+                || !snapshot.currentRevision().planRevisionId().equals(planRevisionId)) {
+            throw new GoalRepositoryException(GoalRepositoryException.Code.PLAN_APPROVAL_STALE,
+                    "Plan revision is stale");
+        }
+        EvidenceCursor after = evidenceCursor(cursor);
+        GoalRepository.ReadPage<GoalModels.Evidence> page = goals.listPlanEvidencePage(planId, runId,
+                planRevisionId, after == null ? null : after.createdAt(), after == null ? null : after.evidenceId(),
+                pageFetch(limit));
+        List<GoalModels.Evidence> all = page.items();
+        boolean more = all.size() > limit;
+        List<GoalModels.Evidence> items = all.stream().limit(limit).toList();
+        String next = more && !items.isEmpty() ? evidenceCursor(items.getLast()) : null;
+        return new GoalModels.Page<>(planId, page.goalRevision(), page.eventSequence(), items, next);
+    }
+
     /** 终态时间线直接使用仓储已绑定的不可逆事实，不缓存或重建 Goal 状态。 */
     @Override
     public List<GoalModels.TerminalActivity> listTerminalActivities(String ownerThreadId, int limit) {
@@ -235,25 +304,32 @@ public final class GoalService implements GoalUseCase {
     /** Plan create 分配独立 identity，不写 Goal event 或依赖当前活动 Goal。 */
     @Override
     public GoalModels.Plan createPlan(CreatePlan command) {
-        return goals.createPlan(new GoalRepository.CreatePlan(id("plan_"), command.ownerThreadId(),
+        GoalModels.Plan result = goals.createPlan(new GoalRepository.CreatePlan(id("plan_"), command.ownerThreadId(),
                 command.objective(), command.expectedThreadRevision(), command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
     }
 
     /** 草稿 JSON 使用和 revision 相同字段名，但不产生 hash 权威性。 */
     @Override
     public GoalModels.Plan saveDraft(SaveDraft command) {
+        preparePlanEdit(command.planId(), command.expectedPlanRevision());
         String definitionJson = canonical.encode(command.definition()).json();
-        return goals.saveDraft(new GoalRepository.SaveDraft(
+        GoalModels.Plan result = goals.saveDraft(new GoalRepository.SaveDraft(
                 command.planId(), command.expectedPlanRevision(),
                 command.expectedDraftRevision(), definitionJson, command.basedOnPlanRevisionId(), id("evt_"),
                 command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
     }
 
     /** 草稿丢弃保留 Goal CAS 与幂等事件，重复动作回读当前状态。 */
     @Override
     public GoalModels.Plan discardDraft(DiscardDraft command) {
-        return goals.discardDraft(new GoalRepository.DiscardDraft(command.planId(), command.expectedPlanRevision(),
+        GoalModels.Plan result = goals.discardDraft(new GoalRepository.DiscardDraft(command.planId(), command.expectedPlanRevision(),
                 id("evt_"), command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
     }
 
     /** UI propose 只冻结当前已保存草稿，不能从请求携带另一份未保存定义。 */
@@ -269,19 +345,37 @@ public final class GoalService implements GoalUseCase {
     /** revision number 从仓储 writer transaction 分配，service 提供候选 1 供仓储替换校验。 */
     @Override
     public PlanRevision propose(Propose command) {
+        preparePlanEdit(command.planId(), command.expectedPlanRevision());
         CanonicalPlanJson.Encoded encoded = canonical.encode(command.definition());
         PlanRevision revision = new PlanRevision(id("planrev_"), command.planId(), 1, command.definition(),
                 encoded.json(), encoded.sha256(), command.userAuthored() ? "USER_UI" : "AGENT", at(command.at()));
-        return goals.propose(new GoalRepository.ProposePlan(command.planId(), command.expectedPlanRevision(),
+        PlanRevision result = goals.propose(new GoalRepository.ProposePlan(command.planId(), command.expectedPlanRevision(),
                 revision, id("evt_"), command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
+    }
+
+    /** 修改冻结方案前收口原暂停 Turn，防止换版清空 Plan 指针却遗留可执行的旧 Run。 */
+    private void preparePlanEdit(String planId, long expectedRevision) {
+        GoalModels.Plan current = goals.readPlanSnapshot(planId).plan();
+        if (current.revision() != expectedRevision) return;
+        if (current.status() == GoalModels.PlanStatus.EXECUTING || current.status() == GoalModels.PlanStatus.VERIFYING) {
+            throw new GoalRepositoryException(GoalRepositoryException.Code.GOAL_INVALID_STATE, "Pause the Plan before editing");
+        }
+        if (current.status() == GoalModels.PlanStatus.PAUSED && current.activeRunId() != null) {
+            if (planExecutions == null) throw new IllegalStateException("Plan execution runtime is unavailable");
+            awaitPlanControl(planExecutions.stop(current));
+        }
     }
 
     /** 批准 action 分配 approval/run identity，仓储再次核对 hash。 */
     @Override
     public GoalModels.Plan approve(Approve command) {
-        return goals.approve(new GoalRepository.ApprovePlan(command.planId(), command.expectedPlanRevision(),
+        GoalModels.Plan result = goals.approve(new GoalRepository.ApprovePlan(command.planId(), command.expectedPlanRevision(),
                 command.planRevisionId(), command.planHash(), id("appr_"), id("evt_"),
                 command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
     }
 
     /**
@@ -291,12 +385,143 @@ public final class GoalService implements GoalUseCase {
     @Override
     public GoalModels.Plan executePlan(ExecutePlan command, PlanExecutionEventSink events) {
         Objects.requireNonNull(events, "events");
+        if (planBudgets == null) throw new IllegalStateException("Plan execution budget provider is unavailable");
+        GoalModels.PlanSnapshot before = goals.readPlanSnapshot(command.planId());
+        String runId = id("run_");
+        String turnId = id("turn_");
+        PlanExecutionCoordinator.EffectiveBudget budget = Objects.requireNonNull(planBudgets.resolve(
+                new PlanExecutionCoordinator.ExecutionRequest(command.planId(), before.plan().ownerThreadId(),
+                        command.planRevisionId(), runId, turnId)), "resolved Plan execution budget");
         GoalModels.Plan result = goals.executePlan(new GoalRepository.ExecutePlan(command.planId(), command.expectedPlanRevision(),
-                command.planRevisionId(), command.planHash(), id("run_"), command.processGeneration(), id("evt_"),
-                command.idempotencyKey(), at(command.at())));
+                command.planRevisionId(), command.planHash(), id("appr_"), runId, command.processGeneration(), id("evt_"),
+                command.idempotencyKey(), at(command.at()), budget == null ? null : budget.maxModelRounds(),
+                budget == null ? null : budget.maxToolCalls(), budget == null ? null : budget.wallBudgetMillis(),
+                budget == null ? null : budget.antiLoopTurnBudget()));
+        publishPlanCommitted(result.planId());
         if (planExecutions == null) throw new IllegalStateException("Plan execution runtime is unavailable");
         planExecutions.start(result, events);
         return result;
+    }
+
+    /** Plan pause 只停止后续 admission，不能借用 Goal control 或清除当前 run 身份。 */
+    @Override
+    public GoalModels.Plan pausePlan(PlanControl command) {
+        quiescePlanTurn(command, false);
+        GoalModels.Plan result = goals.pausePlan(new GoalRepository.PausePlan(command.planId(), command.expectedPlanRevision(),
+                command.runId(), id("evt_"), command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
+    }
+
+    /** Plan resume 由仓储 CAS 恢复原 run，避免重复点击创建新的 execution_runs 行。 */
+    @Override
+    public GoalModels.Plan resumePlan(PlanControl command) {
+        return resumePlan(command, PlanExecutionEventSink.noop());
+    }
+
+    /** 恢复入口保留发起连接的事件 sink，重启后恢复的 Plan Turn 仍能实时投影到当前窗口。 */
+    @Override
+    public GoalModels.Plan resumePlan(PlanControl command, PlanExecutionEventSink events) {
+        GoalModels.Plan result = goals.resumePlan(new GoalRepository.ResumePlan(command.planId(), command.expectedPlanRevision(),
+                command.runId(), id("evt_"), command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        if (planExecutions == null) throw new IllegalStateException("Plan execution runtime is unavailable");
+        // RPC 只等待 resume admission；Turn 的模型/Tool 工作由 coordinator 异步持续推进。
+        planExecutions.resume(result, Objects.requireNonNull(events, "events")).whenComplete((ignored, failure) -> {
+            if (failure != null) {
+                // coordinator 已按同一 run fencing 结算失败；这里不能阻塞或再次写 Plan 状态。
+                LOGGER.warn("Plan resume admission failed type={}", failure.getClass().getSimpleName());
+            }
+        });
+        return result;
+    }
+
+    /** Plan stop 是不可逆控制动作，保留冻结 revision 和 run identity 供历史审阅。 */
+    @Override
+    public GoalModels.Plan stopPlan(PlanControl command) {
+        quiescePlanTurn(command, true);
+        GoalModels.Plan result = goals.stopPlan(new GoalRepository.StopPlan(command.planId(), command.expectedPlanRevision(),
+                command.runId(), id("evt_"), command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
+    }
+
+    /**
+     * 侧聊关闭按实际 owner 收口 Goal 与独立 Plan；Plan 先停止真实 evaluator/Turn，Goal 再
+     * 取消 continuation gate。目标已被并发路径终结时幂等忽略，运行时缺失则对活动 Plan 失败关闭。
+     */
+    public void stopOwners(Set<String> ownerThreadIds) {
+        Objects.requireNonNull(ownerThreadIds, "ownerThreadIds");
+        for (String ownerThreadId : ownerThreadIds) {
+            if (ownerThreadId == null || ownerThreadId.isBlank()) {
+                throw new IllegalArgumentException("invalid Goal owner identity");
+            }
+        }
+        Set<String> owners = Set.copyOf(ownerThreadIds);
+        if (planExecutions == null) {
+            for (String ownerThreadId : owners) {
+                GoalModels.Plan plan = goals.findActivePlanByOwner(ownerThreadId).orElse(null);
+                if (isStoppablePlan(plan)) {
+                    throw new IllegalStateException("Plan execution runtime is unavailable");
+                }
+            }
+        } else {
+            planExecutions.stopOwners(owners);
+        }
+        for (String ownerThreadId : owners) {
+            Goal goal = goals.findActiveGoalByOwner(ownerThreadId).orElse(null);
+            if (!isStoppableGoal(goal)) continue;
+            try {
+                control(new Control(goal.goalId(), goal.revision(), Action.STOP,
+                        "side-chat-owner-stop:" + goal.goalId() + ":" + goal.revision(), clock.instant()));
+            } catch (GoalRepositoryException failure) {
+                if (stoppableGoalStillOwned(goal)) throw failure;
+                // 另一条关闭/控制路径已把同一 owner 终结，继续处理其它 owner。
+            }
+        }
+    }
+
+    /** 活动 Goal 只有 ACTIVE/PAUSED 仍可通过 STOP 控制收口。 */
+    private static boolean isStoppableGoal(Goal goal) {
+        return goal != null && (goal.status() == GoalStatus.ACTIVE || goal.status() == GoalStatus.PAUSED);
+    }
+
+    /** Plan 只在持有活动 run 时需要真实执行协调器参与关闭。 */
+    private static boolean isStoppablePlan(GoalModels.Plan plan) {
+        return plan != null && plan.activeRunId() != null
+                && (plan.status() == GoalModels.PlanStatus.EXECUTING
+                || plan.status() == GoalModels.PlanStatus.VERIFYING
+                || plan.status() == GoalModels.PlanStatus.PAUSED);
+    }
+
+    /** 重新读取 owner 区分已终结竞态与仍需暴露的 Goal CAS/state 故障。 */
+    private boolean stoppableGoalStillOwned(Goal expected) {
+        Goal current = goals.findActiveGoalByOwner(expected.ownerThreadId()).orElse(null);
+        return isStoppableGoal(current) && current.goalId().equals(expected.goalId());
+    }
+
+    /** 控制 mutation 前先读取精确 run 并等待真实 Turn 安全结算，避免仅投影 Plan 状态。 */
+    private void quiescePlanTurn(PlanControl command, boolean stop) {
+        if (planExecutions == null) throw new IllegalStateException("Plan execution runtime is unavailable");
+        GoalModels.Plan current = goals.readPlanSnapshot(command.planId()).plan();
+        if (current.revision() != command.expectedPlanRevision()
+                || !Objects.equals(current.activeRunId(), command.runId())) return;
+        goals.requestPlanPause(new GoalRepository.RequestPlanPause(command.planId(),
+                command.expectedPlanRevision(), command.runId(), id("evt_"),
+                "plan-pause-fence:" + command.idempotencyKey(), at(command.at())));
+        if (stop) awaitPlanControl(planExecutions.stop(current));
+        else awaitPlanControl(planExecutions.pause(current));
+    }
+
+    /** 同步用例保持既有 RPC 契约；异步 Turn 控制异常统一还原为领域失败。 */
+    private static void awaitPlanControl(java.util.concurrent.CompletionStage<Void> control) {
+        try {
+            control.toCompletableFuture().join();
+        } catch (java.util.concurrent.CompletionException failure) {
+            Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            throw new IllegalStateException("Plan Turn control failed", cause);
+        }
     }
 
     /** 拒绝当前最新提案；精确 revision/hash 从同一权威读模型取得并由 mutation CAS 再校验。 */
@@ -305,9 +530,11 @@ public final class GoalService implements GoalUseCase {
         GoalModels.PlanSnapshot snapshot = goals.readPlanSnapshot(command.planId());
         PlanRevision revision = snapshot.currentRevision();
         if (revision == null) throw new IllegalArgumentException("Plan revision is unavailable");
-        return goals.reject(new GoalRepository.RejectPlan(command.planId(), command.expectedPlanRevision(),
+        GoalModels.Plan result = goals.reject(new GoalRepository.RejectPlan(command.planId(), command.expectedPlanRevision(),
                 revision.planRevisionId(), revision.planHash(), id("appr_"), command.reason(), id("evt_"),
                 command.idempotencyKey(), at(command.at())));
+        publishPlanCommitted(result.planId());
+        return result;
     }
 
     /** attach 由仓储原子校验 owner、批准事实与精确 hash，并切换 Goal run。 */
@@ -375,19 +602,12 @@ public final class GoalService implements GoalUseCase {
     @Override
     public GoalModels.Plan updatePlanStep(PlanStepUpdate command) {
         List<GoalRepository.ToolEvidenceClaim> claims = evidenceClaims(command.evidenceClaims(), command.at());
-        return goals.updatePlanStep(new GoalRepository.UpdatePlanStep(command.planId(),
+        GoalModels.Plan result = goals.updatePlanStep(new GoalRepository.UpdatePlanStep(command.planId(),
                 command.expectedPlanRevision(), command.runId(), command.stepId(), command.expectedStatus(),
                 command.status(), command.failureSignature(), claims, id("evt_"), command.idempotencyKey(),
                 at(command.at())));
-    }
-
-    /** 输入 request identity 由服务端分配，避免 Agent 复用别的 Goal 请求。 */
-    @Override
-    public Goal requestInput(InputRequest command) {
-        return mutateAndPublish(command.goalId(), () -> goals.requestInput(new GoalRepository.RequestInput(
-                command.goalId(), command.expectedGoalRevision(),
-                id("goalinput_"), command.runId(), command.prompt(), command.expiresAt(), id("evt_"),
-                command.idempotencyKey(), at(command.at()))));
+        publishPlanCommitted(result.planId());
+        return result;
     }
 
     /** evaluator intent 提交成功后才允许 coordinator 调用 Provider。 */
@@ -397,20 +617,6 @@ public final class GoalService implements GoalUseCase {
         return mutateAndPublish(command.goalId(), () -> goals.requestEvaluation(new GoalRepository.RequestEvaluation(command.goalId(),
                 command.expectedGoalRevision(), id("evaluation_"), command.runId(), command.planRevisionId(),
                 processGeneration, claims, id("evt_"), command.idempotencyKey(), at(command.at()))));
-    }
-
-    /** 输入响应由 ObjectMapper 编码为 JSON string，避免手工转义改变持久语义。 */
-    @Override
-    public Goal respondInput(InputResponse command) {
-        try {
-            String responseJson = json.writeValueAsString(command.response());
-            return mutateAndPublish(command.goalId(), () -> goals.respondInput(new GoalRepository.RespondInput(command.goalId(),
-                    command.expectedGoalRevision(), command.inputRequestId(),
-                    responseJson, id("evt_"), command.idempotencyKey(),
-                    at(command.at()))));
-        } catch (com.fasterxml.jackson.core.JsonProcessingException failure) {
-            throw new IllegalArgumentException("cannot encode Goal input response", failure);
-        }
     }
 
     /** 所有 Agent evidence claim 在服务端分配 identity 并规范时间，三个 mutation 不得产生不同规则。 */
@@ -453,6 +659,21 @@ public final class GoalService implements GoalUseCase {
 
     /** 内部 evaluator/恢复在持久 mutation 成功后复用同一公开事件映射与订阅背压。 */
     public void publishCommitted(String goalId) { publishLatest(goalId); }
+
+    /** Plan mutation 提交后只读取最新一条 event 和轻量 Plan row，观察不会物化 revision/evidence。 */
+    private void publishPlanCommitted(String planId) {
+        if (planEvents.isEmpty()) return;
+        GoalRepository.PlanObservation observation = goals.readPlanObservation(planId);
+        GoalRepository.PlanEvent activity = observation.latestEvent();
+        if (activity == null) return;
+        planEvents.publish(new PlanEvent(observation.plan(), activity.sequence(), planPublicEvent(activity),
+                observation.progress()));
+    }
+
+    /** evaluator 事务提交后由 coordinator 调用，确保 UI 只观察到已落库的 Plan 终态。 */
+    public void publishPlanCommittedAfterExecution(String planId) {
+        publishPlanCommitted(planId);
+    }
 
     /**
      * continuation Turn 的审批事件使用事件 identity 做幂等 CAS；用户暂停或停止先提交时不重试，
@@ -526,6 +747,12 @@ public final class GoalService implements GoalUseCase {
         }
     }
 
+    /** Plan event 已由 SQLite 限制 activity 闭集，映射后仍不把内部 payload 暴露给 UI。 */
+    private GoalModels.PublicEvent planPublicEvent(GoalRepository.PlanEvent value) {
+        return new GoalModels.PublicEvent(value.sequence(), value.planRevision(),
+                publicKind(value.activity()), publicSummary(value.activity()), value.createdAt());
+    }
+
     /** 映射冻结事件词汇，内部细节不会成为可扩展的 Wire 字符串。 */
     private static String publicKind(String activity) {
         return switch (activity.toLowerCase(java.util.Locale.ROOT)) {
@@ -533,6 +760,18 @@ public final class GoalService implements GoalUseCase {
             case "draft_saved" -> "plan_draft_saved";
             case "draft_discarded" -> "plan_draft_saved";
             case "plan_proposed" -> "plan_proposed";
+            case "plan_execution_started" -> "plan_execution_started";
+            case "plan_verifying" -> "plan_verifying";
+            case "plan_completed" -> "plan_completed";
+            case "plan_verification_failed" -> "plan_verification_failed";
+            case "plan_verification_inconclusive" -> "plan_verification_inconclusive";
+            case "plan_paused" -> "plan_paused";
+            case "plan_resumed" -> "plan_resumed";
+            case "plan_stopped" -> "plan_stopped";
+            case "plan_execution_incomplete" -> "plan_execution_incomplete";
+            case "plan_budget_exhausted" -> "plan_budget_exhausted";
+            case "plan_recovery_required" -> "plan_recovery_required";
+            case "plan_execution_recovered" -> "plan_execution_recovered";
             case "plan_approved" -> "plan_approved";
             case "plan_rejected" -> "plan_rejected";
             case "plan_attached" -> "plan_attached";
@@ -542,8 +781,6 @@ public final class GoalService implements GoalUseCase {
             case "continuation_no_progress" -> "continuation_no_progress";
             case "tool_approval_requested" -> "tool_approval_requested";
             case "tool_approval_resolved" -> "tool_approval_resolved";
-            case "input_requested" -> "input_requested";
-            case "input_responded" -> "input_received";
             case "evaluation_requested" -> "evaluation_started";
             case "evaluation_completed" -> "evaluation_completed";
             case "paused" -> "paused";
@@ -563,6 +800,18 @@ public final class GoalService implements GoalUseCase {
             case "plan_proposed" -> "计划等待批准";
             case "plan_approved" -> "计划已批准";
             case "plan_rejected" -> "计划已退回";
+            case "plan_execution_started" -> "计划执行已开始";
+            case "plan_verifying" -> "计划正在独立验收";
+            case "plan_completed" -> "计划已完成";
+            case "plan_verification_failed" -> "计划验收未通过";
+            case "plan_verification_inconclusive" -> "计划验收证据不足，已暂停";
+            case "plan_paused" -> "计划已暂停";
+            case "plan_resumed" -> "计划已恢复";
+            case "plan_stopped" -> "计划已停止";
+            case "plan_execution_incomplete" -> "计划执行未完成";
+            case "plan_budget_exhausted" -> "计划执行预算已耗尽，已暂停";
+            case "plan_recovery_required" -> "计划需要人工恢复";
+            case "plan_execution_recovered" -> "计划已恢复为可执行状态";
             case "plan_attached" -> "计划已关联到 Goal";
             case "plan_detached" -> "计划已从 Goal 解除关联";
             case "step_changed" -> "计划步骤已更新";
@@ -570,8 +819,6 @@ public final class GoalService implements GoalUseCase {
             case "continuation_no_progress" -> "本轮未取得新进展";
             case "tool_approval_requested" -> "Goal 正在等待工具批准";
             case "tool_approval_resolved" -> "工具审批已处理";
-            case "input_requested" -> "Goal 正在等待输入";
-            case "input_received" -> "输入已提交";
             case "evaluation_started" -> "独立验收已开始";
             case "evaluation_completed" -> "独立验收已完成";
             case "paused" -> "Goal 已暂停";

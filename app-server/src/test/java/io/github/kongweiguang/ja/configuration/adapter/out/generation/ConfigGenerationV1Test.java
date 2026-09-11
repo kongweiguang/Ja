@@ -6,12 +6,15 @@ package io.github.kongweiguang.ja.configuration.adapter.out.generation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** Provider/Model v1 代际投影测试。 */
 final class ConfigGenerationV1Test {
@@ -28,6 +31,8 @@ final class ConfigGenerationV1Test {
             ConfigurationGenerationSnapshot snapshot = lease.snapshot();
             assertEquals("provider_fixture", snapshot.defaultProviderId().orElseThrow());
             assertEquals("model_fixture", snapshot.defaultModelId().orElseThrow());
+            assertTrue(snapshot.subagentPolicy().enabled());
+            assertTrue(snapshot.subagentPolicy().providerId().isEmpty());
             assertEquals(ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM,
                     snapshot.defaultReasoningLevel().orElseThrow());
             ConfigurationGenerationSnapshot.Provider provider =
@@ -72,6 +77,65 @@ final class ConfigGenerationV1Test {
         });
     }
 
+    /** 代际快照保留指定子智能体 Provider/Model，运行时无需重新读取可变配置文件。 */
+    @Test
+    void subagentSelectionProjectsAsFrozenPair() {
+        ObjectNode source = document();
+        source.with("subagents").put("provider_id", "provider_fixture").put("model_id", "model_second")
+                .put("reasoning_level", "medium");
+        ConfigGeneration generation = new ConfigGeneration("generation_subagent", null,
+                "cfg_user", "cfg_missing", source, Map.of(), List.of(), false,
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+        try (ConfigGeneration.Lease lease = generation.acquire()) {
+            assertEquals("provider_fixture", lease.snapshot().subagentPolicy().providerId().orElseThrow());
+            assertEquals("model_second", lease.snapshot().subagentPolicy().modelId().orElseThrow());
+            assertEquals(ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM,
+                    lease.snapshot().subagentPolicy().reasoningLevel().orElseThrow());
+        } finally {
+            generation.close();
+        }
+    }
+
+    /** 指定模型从目录消失时必须返回明确配置错误，不能静默切换到同 Provider 的其它模型。 */
+    @Test
+    void unavailableSubagentModelFailsWithoutFallback() {
+        ConfigGeneration generation = new ConfigGeneration("generation_missing_subagent_model", null,
+                "cfg_user", "cfg_missing", document(), Map.of(), List.of(), false,
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+        try (ConfigGeneration.Lease lease = generation.acquire()) {
+            ConfigurationError failure = assertThrows(ConfigurationError.class,
+                    () -> lease.snapshot().requireModel("provider_fixture", "model_missing"));
+            assertEquals(ConfigurationError.Code.MISSING_PROVIDER_OR_MODEL, failure.code());
+            assertEquals("model is unavailable", failure.getMessage());
+        } finally {
+            generation.close();
+        }
+    }
+
+    /** 新开关缺失保持默认开启，显式 false 才关闭普通模式澄清。 */
+    @Test
+    void clarificationPolicyDefaultsOnAndFreezesFalse() {
+        ConfigGeneration enabledGeneration = new ConfigGeneration("generation_clarification_default", null,
+                "cfg_user", "cfg_missing", document(), Map.of(), List.of(), false,
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+        try (ConfigGeneration.Lease lease = enabledGeneration.acquire()) {
+            assertTrue(lease.snapshot().clarificationEnabled());
+        } finally {
+            enabledGeneration.close();
+        }
+
+        ObjectNode disabledDocument = document();
+        disabledDocument.putObject("interaction").put("clarification_enabled", false);
+        ConfigGeneration disabledGeneration = new ConfigGeneration("generation_clarification_disabled", null,
+                "cfg_user", "cfg_missing", disabledDocument, Map.of(), List.of(), false,
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+        try (ConfigGeneration.Lease lease = disabledGeneration.acquire()) {
+            assertTrue(!lease.snapshot().clarificationEnabled());
+        } finally {
+            disabledGeneration.close();
+        }
+    }
+
     /** 构造含两个模型的完整 effective v1 文档，验证同 Provider 多模型目录。 */
     private static ObjectNode document() {
         ObjectNode root = MAPPER.createObjectNode();
@@ -81,6 +145,8 @@ final class ConfigGenerationV1Test {
         root.put("default_provider_id", "provider_fixture");
         root.put("default_model_id", "model_fixture");
         root.put("default_reasoning_level", "medium");
+        root.putObject("subagents").put("enabled", true).putNull("provider_id").putNull("model_id")
+                .putNull("reasoning_level");
         root.putArray("mcp_servers");
         root.putArray("skills");
         ObjectNode provider = root.putArray("providers").addObject();

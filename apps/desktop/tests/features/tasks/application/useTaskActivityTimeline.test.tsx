@@ -38,6 +38,7 @@ function activity(overrides: Partial<TaskActivity> = {}): TaskActivity {
   return {
     activitySequence: 3,
     activityId: "activity_child",
+    rootThreadId: "thr_root",
     taskThreadId: "thr_child",
     actorThreadId: "thr_root",
     causalTurnId: "turn_parent",
@@ -50,14 +51,18 @@ function activity(overrides: Partial<TaskActivity> = {}): TaskActivity {
 
 /** 发布路径与生产 Runtime composition 一致，测试不直接改写 hook 内部状态。 */
 function publish(rootThreadId: string, nextActivity: TaskActivity, nextTask = task): void {
+  const taskProjection =
+    nextTask.rootThreadId === rootThreadId
+      ? nextTask
+      : { ...nextTask, rootThreadId, parentThreadId: rootThreadId };
   publishTaskHostEvent({
     method: "task/activity",
     params: {
       rootThreadId,
-      taskThreadId: nextTask.taskThreadId,
-      taskRevision: nextTask.revision,
-      activity: nextActivity,
-      task: { ...nextTask, rootThreadId },
+      taskThreadId: taskProjection.taskThreadId,
+      taskRevision: taskProjection.revision,
+      activity: { ...nextActivity, rootThreadId },
+      task: taskProjection,
     },
   });
 }
@@ -108,17 +113,29 @@ describe("useTaskActivityTimeline", () => {
     );
 
     expect(result.current.map((entry) => entry.activity.activityId)).toEqual(["activity_child"]);
+    expect(result.current[0]?.firstOccurredAt).toBe(task.startedAt);
 
     act(() => publish("thr_other", activity({ activityId: "activity_other" })));
     expect(result.current).toHaveLength(1);
 
-    act(() => publish("thr_root", activity({ summary: { text: "已更新" }, activitySequence: 4 })));
+    act(() =>
+      publish(
+        "thr_root",
+        activity({
+          summary: { text: "已更新" },
+          activitySequence: 4,
+          createdAt: "2026-09-03T08:00:10Z",
+        }),
+        { ...task, startedAt: "2026-09-03T08:00:09Z", revision: 4 },
+      ),
+    );
     expect(result.current).toHaveLength(1);
     expect(result.current[0]?.activity.summary.text).toBe("已更新");
+    expect(result.current[0]?.firstOccurredAt).toBe(task.startedAt);
     act(() =>
       publish("thr_root", activity({ activityId: "activity_earlier", activitySequence: 2 })),
     );
-    expect(result.current.map((entry) => entry.activity.activitySequence)).toEqual([2, 4]);
+    expect(result.current.map((entry) => entry.activity.activitySequence)).toEqual([4]);
 
     rerender({ rootThreadId: "thr_other", generation: 1 });
     expect(result.current).toEqual([]);
@@ -151,5 +168,90 @@ describe("useTaskActivityTimeline", () => {
       });
     });
     expect(result.current).toEqual([]);
+  });
+
+  /** 侧聊与嵌套子任务共享 lineage root，但都不能回流到当前主会话 Timeline。 */
+  it("只展示当前会话直接委派的 Subagent 活动", () => {
+    prepareSnapshot("thr_root", [{ activity: activity(), task }]);
+    const { result } = renderHook(() => useTaskActivityTimeline("thr_root", 1));
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual(["activity_child"]);
+
+    const sideTask: TaskSummary = {
+      ...task,
+      taskThreadId: "thr_side",
+      parentThreadId: "thr_root",
+      originTurnId: null,
+      taskKind: "side_task",
+      lifecycle: "independent",
+      taskName: "侧聊",
+    };
+    const nestedTask: TaskSummary = {
+      ...task,
+      taskThreadId: "thr_nested",
+      parentThreadId: task.taskThreadId,
+      depth: 2,
+      taskName: "嵌套子任务",
+    };
+    act(() => {
+      publish(
+        "thr_root",
+        activity({ activityId: "activity_side", taskThreadId: sideTask.taskThreadId }),
+        sideTask,
+      );
+      publish(
+        "thr_root",
+        activity({ activityId: "activity_nested", taskThreadId: nestedTask.taskThreadId }),
+        nestedTask,
+      );
+    });
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual(["activity_child"]);
+
+    act(() =>
+      publish("thr_root", activity({ activityId: "activity_direct_new", activitySequence: 4 }), {
+        ...task,
+        revision: 3,
+        latestActivitySequence: 4,
+      }),
+    );
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual([
+      "activity_direct_new",
+    ]);
+  });
+
+  /** 侧聊 child 的全局 lineage root 可不同于当前 owner，仍须在侧聊自己的 Timeline 内可见。 */
+  it("按 owner Thread 接纳侧聊直接子任务而不误用全局 root", () => {
+    const sideChild: TaskSummary = {
+      ...task,
+      taskThreadId: "thr_side_child",
+      parentThreadId: "thr_side",
+      rootThreadId: "thr_root",
+      taskName: "侧聊子任务",
+    };
+    const sideActivity = activity({
+      activityId: "activity_side_child",
+      rootThreadId: "thr_root",
+      taskThreadId: sideChild.taskThreadId,
+    });
+    prepareSnapshot("thr_side", [{ activity: sideActivity, task: sideChild }]);
+    const { result } = renderHook(() => useTaskActivityTimeline("thr_side", 1));
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual([
+      "activity_side_child",
+    ]);
+
+    act(() =>
+      publish(
+        "thr_root",
+        activity({
+          activityId: "activity_side_child_live",
+          rootThreadId: "thr_root",
+          taskThreadId: sideChild.taskThreadId,
+          activitySequence: 4,
+        }),
+        { ...sideChild, revision: 3, latestActivitySequence: 4 },
+      ),
+    );
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual([
+      "activity_side_child_live",
+    ]);
   });
 });

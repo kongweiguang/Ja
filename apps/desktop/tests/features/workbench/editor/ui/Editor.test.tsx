@@ -10,7 +10,7 @@ import { CodeEditor, CodeViewer, DiffViewer } from "@/features/workbench/editor"
 
 const themeMock = vi.hoisted(() => ({
   resolvedTheme: "light" as "light" | "dark",
-  palette: "xcode" as "xcode" | "fleet" | "obsidian" | "claude",
+  palette: "xcode" as "xcode" | "ja" | "jetbrains" | "obsidian" | "claude",
 }));
 
 vi.mock("@/shared/hooks/useResolvedTheme", () => ({
@@ -74,7 +74,7 @@ describe("CodeMirror semantic theme", () => {
     }
   });
 
-  /** 八种视觉组合都只能重配 extension，不得重建 View、文档或 selection。 */
+  /** 十种视觉组合都只能重配 extension，不得重建 View、文档或 selection。 */
   it("hot-switches every palette and mode while preserving editor state", () => {
     const rendered = render(<ThemeEditorsFixture />);
     const editorElements = Array.from(
@@ -90,7 +90,7 @@ describe("CodeMirror semantic theme", () => {
     expect(editorViews).toHaveLength(4);
     expect(editorViews.every((view) => view !== null)).toBe(true);
 
-    for (const palette of ["xcode", "fleet", "obsidian", "claude"] as const) {
+    for (const palette of ["xcode", "ja", "jetbrains", "obsidian", "claude"] as const) {
       for (const mode of ["light", "dark"] as const) {
         themeMock.palette = palette;
         themeMock.resolvedTheme = mode;

@@ -5,8 +5,31 @@ import { describe, expect, it, vi } from "vitest";
 import type { RuntimeHostAdapter } from "@/api/tauri/runtime";
 import { createRuntimeHostPort } from "@/app/composition/runtimeHostAdapter";
 import { subscribeGoalHostEvents, type GoalEvent } from "@/features/goals";
+import { useTimelineStore } from "@/features/conversation";
 
 describe("runtimeHostAdapter Goal routing", () => {
+  /** 取消只使对应 Thread 的投影失效；不制造模型事件，也不对其它隐藏会话发起读取。 */
+  it("invalidates only the cancelled interaction owner", async () => {
+    let emitNative!: Parameters<RuntimeHostAdapter["subscribe"]>[0];
+    const adapter = {
+      subscribe: vi.fn(async (listener) => {
+        emitNative = listener;
+        return () => undefined;
+      }),
+    } as unknown as RuntimeHostAdapter;
+    useTimelineStore.getState().reset();
+    const listener = vi.fn();
+    const unsubscribe = await createRuntimeHostPort(adapter).subscribe(listener);
+    emitNative({
+      kind: "interaction",
+      event: { params: { kind: "cancelled", threadId: "thr_question", eventSequence: 3 } },
+    } as never);
+    expect(Object.keys(useTimelineStore.getState().resyncRequired)).toEqual(["thr_question"]);
+    expect(listener).not.toHaveBeenCalled();
+    await unsubscribe();
+    useTimelineStore.getState().reset();
+  });
+
   it("routes all Goal events only to the Goal bus", async () => {
     let emitNative!: Parameters<RuntimeHostAdapter["subscribe"]>[0];
     const adapter = {
@@ -35,7 +58,7 @@ describe("runtimeHostAdapter Goal routing", () => {
         },
       },
     } as never);
-    for (const method of ["goal/activity", "goal/input-requested"] as const) {
+    for (const method of ["goal/activity"] as const) {
       emitNative({
         kind: "goal",
         event: {
@@ -52,11 +75,7 @@ describe("runtimeHostAdapter Goal routing", () => {
     }
 
     expect(conversationListener).not.toHaveBeenCalled();
-    expect(goalEvents.map((event) => event.method)).toEqual([
-      "goal/changed",
-      "goal/activity",
-      "goal/input-requested",
-    ]);
+    expect(goalEvents.map((event) => event.method)).toEqual(["goal/changed", "goal/activity"]);
     expect(goalEvents[0]).toMatchObject({ ownerThreadId: "thr_root", goalRevision: 3 });
 
     unsubscribeGoal();

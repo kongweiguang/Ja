@@ -49,6 +49,22 @@
         WHERE p.attachment_id=a.attachment_id)
   </select>
   <select id="selectThreadAttachment" resultMap="attachmentRow">
+    <!-- 冻结引用逐层授权 Side Task，最多沿四层同 Workspace 父链；原附件唯一绑定保持不变。 -->
+    WITH RECURSIVE readable_threads(thread_id,workspace_id,depth) AS (
+      SELECT thread_id,workspace_id,0 FROM threads
+      WHERE thread_id=#{threadId} AND deleted_at IS NULL
+      UNION ALL
+      SELECT l.parent_thread_id,r.workspace_id,r.depth+1
+      FROM readable_threads r
+      JOIN thread_lineage l ON l.child_thread_id=r.thread_id
+      JOIN task_context_seeds s ON s.context_seed_id=l.context_seed_id
+      JOIN threads p ON p.thread_id=l.parent_thread_id AND p.workspace_id=r.workspace_id
+      WHERE r.depth&lt;4 AND p.deleted_at IS NULL AND l.task_kind='SIDE_TASK'
+        AND s.inheritance_mode='EFFECTIVE_CONTEXT' AND s.parent_thread_id=l.parent_thread_id
+        AND EXISTS(SELECT 1 FROM json_each(s.references_json) ref
+          WHERE json_extract(ref.value,'$.kind')='attachment'
+            AND json_extract(ref.value,'$.attachmentId')=#{attachmentId})
+    )
     SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
       a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ma.message_id AS bound_message_id
     FROM attachments a
@@ -57,7 +73,8 @@
     LEFT JOIN pending_input_attachments pia ON pia.attachment_id=a.attachment_id
     LEFT JOIN pending_inputs pi ON pi.input_id=pia.input_id AND pi.state='PENDING'
     WHERE a.attachment_id=#{attachmentId}
-      AND ((a.status='BOUND' AND m.thread_id=#{threadId})
+      AND a.workspace_id IN (SELECT workspace_id FROM readable_threads WHERE thread_id=#{threadId})
+      AND ((a.status='BOUND' AND m.thread_id IN (SELECT thread_id FROM readable_threads))
         OR (a.status='DRAFT' AND pi.thread_id=#{threadId}))
   </select>
   <update id="discardDraft">

@@ -7,7 +7,9 @@ package io.github.kongweiguang.ja.conversation.port.out;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
+import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
@@ -52,6 +54,22 @@ public interface ConversationRepository extends AutoCloseable {
      * 用 Thread revision CAS 原子提交非终态及其全部事实。
      */
     CommitReceipt commit(CommitRequest request);
+
+    /** 回答 request_user_input 后在同一 Turn CAS 内完成 ToolResult/消息/cursor 结算，仍保留 SUSPENDED。 */
+    default CommitReceipt settleInteractionAnswer(InteractionAnswerSettlement request) {
+        throw new UnsupportedOperationException("interaction settlement is unavailable");
+    }
+
+    /** 将未持久化的 Interaction、Tools cursor 与 SUSPENDED Turn 放入一个 SQLite 事务。 */
+    default InteractionSuspensionReceipt suspendForInteraction(InteractionSuspensionRequest request) {
+        throw new UnsupportedOperationException("interaction suspension is unavailable");
+    }
+
+    /** 原子回答 Interaction 并结算内部 Tool；重复幂等提交只返回已落库请求，不再次推进 cursor。 */
+    default InteractionAnswerReceipt respondInteraction(InteractionRequest answered, long expectedRevision,
+                                                         String idempotencyKey, Instant occurredAt) {
+        throw new UnsupportedOperationException("interaction response is unavailable");
+    }
 
     /**
      * 将已经形成独立回复边界的 STOP Assistant 作为 Final 提交，但不消费或关闭输入队列；
@@ -102,6 +120,23 @@ public interface ConversationRepository extends AutoCloseable {
     /** 没有进程内 owner 的 SUSPENDED Turn 由存储直接收敛取消终态。 */
     default CancelResult cancelSuspended(String turnId, long expectedThreadRevision, Instant occurredAt) {
         throw new UnsupportedOperationException("suspended cancellation is unavailable");
+    }
+
+    /**
+     * 将已登记取消的活动 Turn 安全转为 SUSPENDED；execution cursor 保留给显式 Resume 对账。
+     * 该入口只用于受控 Plan pause，不能被普通用户取消路径复用。
+     */
+    default boolean suspendCancelled(String threadId, String turnId, long expectedThreadRevision,
+                                     long expectedTurnMutationVersion, Instant occurredAt) {
+        return false;
+    }
+
+    /** Plan pause 可同时替换剩余活动预算；旧实现默认退回仅保留游标的窄兼容入口。 */
+    default boolean suspendCancelled(String threadId, String turnId, long expectedThreadRevision,
+                                     long expectedTurnMutationVersion, TurnExecutionState execution,
+                                     Instant occurredAt) {
+        return suspendCancelled(threadId, turnId, expectedThreadRevision,
+                expectedTurnMutationVersion, occurredAt);
     }
 
     /** 新 Turn 可以持久排队，但进程内执行准入不得跨过遗留 SUSPENDED head。 */
@@ -377,14 +412,20 @@ public interface ConversationRepository extends AutoCloseable {
     }
 
     /** 已提交 Mailbox USER messages 与两套权威版本；列表顺序与 claim sequence 完全一致。 */
-    record TaskMailboxConsumption(List<StoredMessage> userMessages, long threadRevision,
-                                  long turnMutationVersion, TurnExecutionState executionState) {
+    record TaskMailboxConsumption(List<StoredMessage> userMessages,
+                                  List<io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.ThreadMessageItem> messageItems,
+                                  long threadRevision, long turnMutationVersion,
+                                  TurnExecutionState executionState) {
         /** Loop 只使用事务回执推进本地上下文与 CAS，不从请求自行推导新版本。 */
         public TaskMailboxConsumption {
             userMessages = List.copyOf(Objects.requireNonNull(userMessages, "userMessages"));
+            messageItems = List.copyOf(Objects.requireNonNull(messageItems, "messageItems"));
             if (userMessages.isEmpty() || userMessages.stream().anyMatch(value ->
                     value.message().role() != ModelRole.USER)) {
                 throw new IllegalArgumentException("invalid mailbox USER messages");
+            }
+            if (messageItems.size() > userMessages.size()) {
+                throw new IllegalArgumentException("invalid mailbox message item count");
             }
             if (threadRevision < 0 || turnMutationVersion < 0) {
                 throw new IllegalArgumentException("invalid mailbox consumption revision");
@@ -578,6 +619,23 @@ public interface ConversationRepository extends AutoCloseable {
         }
     }
 
+    /** Interaction 回答的恢复结算输入；调用方随后再以正常 Resume CAS 获得执行资格。 */
+    record InteractionAnswerSettlement(String threadId, String turnId, String callId,
+                                       String content, long expectedTurnMutationVersion,
+                                       Instant occurredAt, TurnExecutionState executionState) {
+        /** 回答结算必须绑定同一个持久 Tool cursor，版本冲突由事务拒绝。 */
+        public InteractionAnswerSettlement {
+            // 该输入绑定原 Tool 调用与持久游标，不能由后端猜测缺失的调用身份。
+            threadId = identifier(threadId, "thr_", "threadId");
+            turnId = identifier(turnId, "turn_", "turnId");
+            callId = identifier(callId, "call_", "callId");
+            content = text(content == null ? "" : content, "content", 4_000_000, true);
+            if (expectedTurnMutationVersion < 0) throw new IllegalArgumentException("invalid turn mutation version");
+            occurredAt = Objects.requireNonNull(occurredAt, "occurredAt");
+            executionState = Objects.requireNonNull(executionState, "executionState");
+        }
+    }
+
     /**
      * 取消声明后的 Tool batch 专用事务输入；强类型闭集避免模型、用量或审批事实穿过取消门。
      */
@@ -699,6 +757,41 @@ public interface ConversationRepository extends AutoCloseable {
         }
     }
 
+    /** request_user_input 原子挂起提交后的双版本及 Interaction 事件游标。 */
+    record InteractionSuspensionReceipt(long threadRevision, long turnMutationVersion,
+                                        long interactionEventSequence) {
+        /** 三个水位必须一起提交，调用方不能用零事件号冒充问题已经持久化。 */
+        public InteractionSuspensionReceipt {
+            if (threadRevision < 0 || turnMutationVersion < 0 || interactionEventSequence < 1) {
+                throw new IllegalArgumentException("invalid interaction suspension receipt");
+            }
+        }
+    }
+
+    /** Interaction Tool 将自身控制流交给持久化层时的完整事务输入。 */
+    record InteractionSuspensionRequest(InteractionRequest interaction, TurnExecutionState execution,
+                                        long expectedTurnMutationVersion, Instant occurredAt) {
+        /** 快照与游标必须同事务归属，拒绝部分初始化的挂起输入。 */
+        public InteractionSuspensionRequest {
+            Objects.requireNonNull(interaction, "interaction");
+            Objects.requireNonNull(execution, "execution");
+            Objects.requireNonNull(occurredAt, "occurredAt");
+            if (expectedTurnMutationVersion < 0) throw new IllegalArgumentException("invalid turn mutation version");
+        }
+    }
+
+    /** Interaction 回答事务的结果；newlySettled=false 表示幂等重试没有产生第二次 Tool 结算。 */
+    record InteractionAnswerReceipt(InteractionRequest request, CommitReceipt turnReceipt,
+                                    boolean newlySettled) {
+        /** 幂等回执保持原请求与 Turn 双版本，避免第二次提交触发新恢复。 */
+        public InteractionAnswerReceipt {
+            Objects.requireNonNull(request, "request");
+            if (newlySettled != (turnReceipt != null)) {
+                throw new IllegalArgumentException("interaction answer receipt mismatch");
+            }
+        }
+    }
+
     /**
      * 取消、审批和恢复门禁读取的权威 Turn 投影。
      */
@@ -745,10 +838,10 @@ public interface ConversationRepository extends AutoCloseable {
             ToolResultFact, ApprovalFact, UsageFact, ReasoningSummaryFact {
     }
 
-    /** 成功终态单独保存的公开 reasoning 摘要；不创建 Assistant 消息或推进模型轮次。 */
+    /** 已公开的 reasoning 摘要独立保存；失败/取消也可保留它，但不创建或冒充 Assistant 消息。 */
     record ReasoningSummaryFact(String messageId, String text, int modelRound) implements Fact {
         /**
-         * 绑定最终 Assistant identity，使摘要在无排队输入的终态路径也能与回复同事务落库。
+         * 绑定最终或独立的 Timeline identity，使摘要与回复或无回复终态在同一事务落库。
          */
         public ReasoningSummaryFact {
             messageId = identifier(messageId, "item_", "messageId");

@@ -31,9 +31,12 @@ final class ConfigurationDocumentFactory {
         root.put("schema_version", CURRENT_SCHEMA_VERSION);
         root.put("config_revision", 0);
         root.put("default_access_mode", "full_access");
+        root.putObject("interaction").put("clarification_enabled", true);
         root.putNull("default_provider_id");
         root.putNull("default_model_id");
         root.putNull("default_reasoning_level");
+        root.putObject("subagents").put("enabled", true).putNull("provider_id").putNull("model_id")
+                .putNull("reasoning_level");
         root.putArray("providers");
         root.putArray("mcp_servers");
         root.putArray("skills");

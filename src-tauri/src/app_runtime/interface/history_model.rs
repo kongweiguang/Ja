@@ -6,9 +6,10 @@
 use super::dto::{InputQueueDto, TaskActivityDto, TaskSummaryDto};
 use crate::app_runtime::{
     HistoryRequest, HistoryResponse, RuntimeCommandError, RuntimeHost, ThreadArchiveParams,
-    ThreadCompactParams, ThreadCreateParams, ThreadDeleteParams, ThreadListParams, ThreadPinParams,
-    ThreadPreferencesUpdateParams, ThreadReadParams, ThreadRenameParams, ThreadRestoreParams,
-    ThreadSearchParams, ThreadSeenParams, WorkspaceListParams,
+    ThreadCompactParams, ThreadCreateParams, ThreadDeleteParams, ThreadDiscoverParams,
+    ThreadListParams, ThreadPinParams, ThreadPreferencesUpdateParams, ThreadReadParams,
+    ThreadRenameParams, ThreadRestoreParams, ThreadSearchParams, ThreadSeenParams,
+    WorkspaceListParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -104,6 +105,22 @@ pub(crate) fn request_history(
     serde_json::from_slice(&bytes).map_err(|_| history_response_rejected("history_json"))
 }
 
+/// 通过现有 `thread/list` wire lane 发送全局发现，但保留独立的 application payload 和响应
+/// variant；这样同一个 JA-RPC 方法的两种语义不会在 Rust 侧被错误地按完整 Thread 解析。
+pub(crate) fn request_thread_discover(
+    state: &RuntimeHost,
+    params: Value,
+) -> Result<Value, RuntimeCommandError> {
+    let bytes = serde_json::to_vec(&params).map_err(|_| RuntimeCommandError::invalid_params())?;
+    let request = HistoryRequest::ThreadDiscover(ThreadDiscoverParams::try_new(bytes)?);
+    let response = state.history_request(request)?;
+    let bytes = match response {
+        HistoryResponse::ThreadDiscover(value) => value.into_bytes(),
+        _ => return Err(history_response_rejected("history_variant")),
+    };
+    serde_json::from_slice(&bytes).map_err(|_| history_response_rejected("history_json"))
+}
+
 /// 共享 keyset page 输入；显式 null 与 unknown field 在 serde 边界关闭失败。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -124,6 +141,21 @@ pub struct ThreadListInput {
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// 全局会话发现只提交显式 `all` scope 与可选过滤条件；它不携带 Thread page 的完整元数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadDiscoverInput {
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// 搜索只限定当前 Workspace 的标题；空 query 由 Java 解释为最近会话，Rust 不扩展到正文或文件。
@@ -268,6 +300,25 @@ where
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadListResult {
     pub items: Vec<ThreadDto>,
+    pub next_cursor: Option<String>,
+}
+
+/// 全局发现的最小会话目录项；不带偏好、revision、时间戳或正文，避免发现入口物化历史。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadDiscoveryItem {
+    pub thread_id: String,
+    pub title: String,
+    pub kind: String,
+    pub workspace_id: String,
+    pub status: String,
+}
+
+/// 全局发现结果使用独立 page DTO，虽然底层仍复用 `thread/list` 的 cursor wire envelope。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadDiscoverResult {
+    pub items: Vec<ThreadDiscoveryItem>,
     pub next_cursor: Option<String>,
 }
 
@@ -493,6 +544,28 @@ pub(crate) fn validate_thread_list(input: &ThreadListInput) -> Result<(), Runtim
     validate_pagination(&input.cursor, input.limit)
 }
 
+/// 全局发现只允许 `all` scope，过滤字段保持单行、有界并在 native 边界验证，防止其成为
+/// 任意 history 查询通道或把 Workspace 身份交给 renderer 推导。
+pub(crate) fn validate_thread_discover(
+    input: &ThreadDiscoverInput,
+) -> Result<(), RuntimeCommandError> {
+    if input.scope != "all" {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    validate_pagination(&input.cursor, input.limit)?;
+    if input
+        .query
+        .as_deref()
+        .is_some_and(|query| query.len() > 256 || query.chars().any(char::is_control))
+    {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    if let Some(workspace_id) = input.workspace_id.as_deref() {
+        validate_prefixed(workspace_id, "ws_", 99)?;
+    }
+    Ok(())
+}
+
 /// 搜索沿用 Thread page 的 Workspace/cursor 约束，并把 query 限制为有界单行标题片段。
 pub(crate) fn validate_thread_search(input: &ThreadSearchInput) -> Result<(), RuntimeCommandError> {
     validate_prefixed(&input.workspace_id, "ws_", 100)?;
@@ -622,6 +695,38 @@ pub(crate) fn parse_thread_page(value: Value) -> Result<ThreadListResult, Runtim
         return Err(RuntimeCommandError::unavailable());
     }
     page.items.iter().try_for_each(validate_thread)?;
+    validate_cursor(&page.next_cursor)?;
+    Ok(page)
+}
+
+/// 解析全局发现的最小目录页；任意完整 Thread 字段、错误 kind/status 或越界项都会失败关闭。
+pub(crate) fn parse_thread_discovery(
+    value: Value,
+) -> Result<ThreadDiscoverResult, RuntimeCommandError> {
+    let page: ThreadDiscoverResult = parse_exact(value, &["items", "nextCursor"])?;
+    if page.items.len() > MAX_PAGE as usize
+        || page.items.iter().any(|item| {
+            validate_prefixed(&item.thread_id, "thr_", 100).is_err()
+                || validate_prefixed(&item.workspace_id, "ws_", 99).is_err()
+                || item.title.is_empty()
+                || item.title.len() > MAX_TITLE
+                || item.title.chars().any(char::is_control)
+                || !matches!(item.kind.as_str(), "main" | "side_chat" | "subagent")
+                || !matches!(
+                    item.status.as_str(),
+                    "idle"
+                        | "queued"
+                        | "running"
+                        | "waiting_approval"
+                        | "suspended"
+                        | "completed"
+                        | "failed"
+                        | "cancelled"
+                )
+        })
+    {
+        return Err(RuntimeCommandError::unavailable());
+    }
     validate_cursor(&page.next_cursor)?;
     Ok(page)
 }
@@ -801,7 +906,9 @@ fn validate_thread_task_activities(
         )?;
         let sequence = activity.activity_sequence;
         if activity.task_thread_id != task.task_thread_id
-            || task.root_thread_id != thread_id
+            || activity.root_thread_id != task.root_thread_id
+            || task.parent_thread_id != thread_id
+            || task.task_kind != "subagent"
             || sequence > task.latest_activity_sequence
             || previous_sequence.is_some_and(|previous| sequence <= previous)
             || !activity_ids.insert(activity.activity_id)
@@ -972,7 +1079,7 @@ fn valid_provider_request_profile_wire(value: &Value) -> bool {
 }
 
 /// 首版 item 是封闭判别联合；按 kind 检查精确 key，避免 serde `Value` 接受残缺 Tool、审批或
-///附件记录，同时只验证安全展示 DTO，不允许 raw arguments/result 回到 WebView。
+/// 跨会话消息记录，同时只验证安全展示 DTO，不允许 raw arguments/result 回到 WebView。
 fn valid_snapshot_item_wire(value: &Value) -> bool {
     let Some(item) = value.as_object() else {
         return false;
@@ -996,6 +1103,7 @@ fn valid_snapshot_item_wire(value: &Value) -> bool {
                     }).is_ok()
                 })
         }
+        Some("thread_message") => valid_thread_message_item_wire(item, None),
         Some("final_answer") => {
             exact_keys(item, &["itemId", "createdAt", "turnId", "kind", "text"])
                 && item
@@ -1069,6 +1177,34 @@ fn valid_snapshot_item_wire(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// 跨会话消息只投影发送方快照和正文；事件路径可额外绑定当前 Turn，防止消息落入错误历史。
+pub(crate) fn valid_thread_message_item_wire(
+    item: &Map<String, Value>,
+    expected_turn_id: Option<&str>,
+) -> bool {
+    exact_keys(
+        item,
+        &[
+            "itemId",
+            "createdAt",
+            "turnId",
+            "kind",
+            "sourceThreadId",
+            "sourceTitle",
+            "content",
+        ],
+    ) && item.get("kind").and_then(Value::as_str) == Some("thread_message")
+        && item
+            .get("turnId")
+            .and_then(Value::as_str)
+            .is_some_and(|turn_id| expected_turn_id.is_none_or(|expected| expected == turn_id))
+        && validate_prefixed_value(item.get("sourceThreadId"), "thr_", 100)
+        && item.get("sourceTitle").is_some_and(valid_safe_name)
+        && item
+            .get("content")
+            .is_some_and(|content| valid_text(content, 1_048_576))
 }
 
 /// ToolPresentation 只接受 Java 已脱敏的闭集字段、相对路径和有界预览；optional 字段缺失

@@ -115,6 +115,12 @@ final class TurnMcpSessionFactoryTest {
                 + "default_model_id = \"model_turn_mcp\"\n"
                 + "default_reasoning_level = \"medium\"\n"
                 + "skills = []\n"
+                + "interaction = { clarification_enabled = true }\n"
+                + "[subagents]\n"
+                + "enabled = true\n"
+                + "provider_id = { __ja_null = true }\n"
+                + "model_id = { __ja_null = true }\n"
+                + "reasoning_level = { __ja_null = true }\n"
                 + "[[providers]]\n"
                 + "provider_id = \"provider_turn_mcp\"\n"
                 + "name = \"Turn MCP\"\n"
@@ -140,11 +146,8 @@ final class TurnMcpSessionFactoryTest {
                 + toml(report.toString()) + "\"]\n"
                 + "env = { JA_ALLOWED = \"yes\" }\n"
                 + "headers = {}\n"
-                + "enabled = true\n"
-                + "[mcp_servers.auth]\n"
-                + "kind = \"env\"\n"
-                + "name = \"JA_SECRET\"\n"
-                + "credential_id = \"cred_mcp\"\n";
+                + "auth = { kind = \"env\", name = \"JA_SECRET\", credential_id = \"cred_mcp\" }\n"
+                + "enabled = true\n";
     }
 
     /** 转义 Windows 路径分隔符，以满足严格 TOML 字符串边界。 */

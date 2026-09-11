@@ -1675,9 +1675,34 @@ pub(crate) fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
             message: "goal recovery requires user action",
             retryable: false,
         },
-        Some("GOAL_INPUT_EXPIRED") => RuntimeCommandError {
-            code: "GOAL_INPUT_EXPIRED",
-            message: "goal input request expired",
+        Some("INTERACTION_NOT_FOUND") => RuntimeCommandError {
+            code: "INTERACTION_NOT_FOUND",
+            message: "interaction was not found",
+            retryable: false,
+        },
+        Some("INTERACTION_REVISION_CONFLICT") => RuntimeCommandError {
+            code: "INTERACTION_REVISION_CONFLICT",
+            message: "interaction revision changed",
+            retryable: true,
+        },
+        Some("INTERACTION_INVALID_STATE") => RuntimeCommandError {
+            code: "INTERACTION_INVALID_STATE",
+            message: "interaction state does not allow this operation",
+            retryable: false,
+        },
+        Some("INTERACTION_INVALID") => RuntimeCommandError {
+            code: "INTERACTION_INVALID",
+            message: "interaction is invalid",
+            retryable: false,
+        },
+        Some("PLAN_REVISION_CONFLICT") => RuntimeCommandError {
+            code: "PLAN_REVISION_CONFLICT",
+            message: "plan revision changed",
+            retryable: true,
+        },
+        Some("PLAN_INVALID_STATE") => RuntimeCommandError {
+            code: "PLAN_INVALID_STATE",
+            message: "plan state does not allow this operation",
             retryable: false,
         },
         Some("CONFLICT") => RuntimeCommandError {

@@ -18,7 +18,12 @@ import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisCo
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.MybatisTaskRepository;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInstructionScopeRepository;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisSubagentPolicyRepository;
+import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisInteractionRepository;
+import io.github.kongweiguang.ja.configuration.port.in.ConfigurationGenerationUseCase;
+import io.github.kongweiguang.ja.conversation.port.out.SubagentPolicySource;
 import io.github.kongweiguang.ja.goal.adapter.out.persistence.MybatisGoalRepository;
+import io.github.kongweiguang.ja.goal.adapter.out.persistence.MybatisPlanEvaluationAuditRepository;
 import io.github.kongweiguang.ja.conversation.port.out.InstructionScopeRepository;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.SqlSessionFactory;
@@ -67,9 +72,38 @@ public final class SolonPersistenceComposition {
     @Bean(value = "jaConversationRepository", typed = true)
     public MybatisConversationRepository agentStore(@Inject(value = "ja", required = true) DataSource dataSource,
                                                     ObjectMapper mapper,
-                                                    RuntimeResourceLifecycle lifecycle) {
-        MybatisConversationRepository store = new MybatisConversationRepository(requireNamedSessions(), mapper);
+                                                    RuntimeResourceLifecycle lifecycle,
+                                                    @Inject(required = true) SubagentPolicySource policySource) {
+        MybatisConversationRepository store = new MybatisConversationRepository(requireNamedSessions(), mapper,
+                policySource);
         return AotSideEffectGuard.processing() ? store : lifecycle.own(store);
+    }
+
+    /** 将全局配置 Owner 适配为 Thread 创建所需的只读策略端口；不产生第二条配置存储链路。 */
+    @Bean(value = "jaSubagentPolicySource", typed = true)
+    public SubagentPolicySource subagentPolicySource(ConfigurationGenerationUseCase configurations) {
+        return new ConfigurationSubagentPolicySource(configurations);
+    }
+
+    /** Runtime Tool 与 Task admission 共用同一 SQLite 策略事实读取边界。 */
+    @Bean(value = "jaSubagentPolicyRepository", typed = true)
+    public MybatisSubagentPolicyRepository subagentPolicyRepository(
+            @Inject(value = "ja", required = true) DataSource dataSource) {
+        return new MybatisSubagentPolicyRepository(requireNamedSessions());
+    }
+
+    /** 问答与 Conversation 使用同一具名 Factory，回答才能与 Tool 游标原子结算。 */
+    @Bean(value = "jaInteractionRepository", typed = true)
+    public MybatisInteractionRepository interactionRepository(
+            @Inject(value = "ja", required = true) DataSource dataSource, ObjectMapper mapper) {
+        return new MybatisInteractionRepository(requireNamedSessions(), mapper);
+    }
+
+    /** 验收模型请求在同一数据库持久记录 intent 与真实用量，启动不能回退为内存审计。 */
+    @Bean(value = "jaPlanEvaluationAudit", typed = true)
+    public MybatisPlanEvaluationAuditRepository planEvaluationAuditRepository(
+            @Inject(value = "ja", required = true) DataSource dataSource, ObjectMapper mapper) {
+        return new MybatisPlanEvaluationAuditRepository(requireNamedSessions(), mapper);
     }
 
     /**
@@ -185,6 +219,10 @@ public final class SolonPersistenceComposition {
         JaDatabase database = Solon.context() == null ? null : Solon.context().getBean(JaDatabase.class);
         if (database == null) throw new IllegalStateException("Ja database bean is unavailable");
         database.bindWalCheckpoint(sessions);
+        // 临时会话在新进程没有恢复资格；必须先清理，不能让普通 recovery 接纳它们的排队 Turn。
+        try (var sideChats = new io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence(sessions)) {
+            sideChats.purgeRecoveredSideChats();
+        }
         recovery.recover();
         return recovery;
     }

@@ -68,7 +68,15 @@ public final class ToolPresentationProjector {
             case WRITE -> mutationInput("write", invocation.arguments(), paths, "content");
             case MCP -> boundedJson(invocation.arguments(), root, knownSecrets);
         };
-        return new ToolPresentation(kind, title(kind, invocation.toolName()), ToolPresentation.Status.PENDING,
+        String actionTitle = title(kind, invocation.toolName());
+        if ("request_user_input".equals(invocation.toolName())) {
+            actionTitle = "询问偏好";
+            JsonValue questions = invocation.arguments().get("questions");
+            input = questions instanceof JsonArray array && !array.values().isEmpty()
+                    && array.values().getFirst() instanceof JsonObject question
+                    ? sanitize(text(question, "prompt"), root, knownSecrets) : "等待用户回答";
+        }
+        return new ToolPresentation(kind, actionTitle, ToolPresentation.Status.PENDING,
                 input, null, paths, command, ".", null, null, null, null, false, null);
     }
 

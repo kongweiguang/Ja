@@ -145,6 +145,28 @@ export const ConfigProviderSchema = z
     }
   });
 
+/** 子智能体策略只允许用户级模型引用；独立 Provider/Model 身份由配置目录持有。 */
+export const ConfigSubagentsSchema = z
+  .object({
+    enabled: z.boolean(),
+    provider_id: ConfigProviderIdSchema.nullable(),
+    model_id: ConfigModelIdSchema.nullable(),
+    reasoning_level: ConfigReasoningLevelSchema.nullable(),
+  })
+  .strict()
+  .superRefine((selection, context) => {
+    if ((selection.provider_id === null) !== (selection.model_id === null)) {
+      context.addIssue({ code: "custom", path: ["model_id"], message: "incomplete selection" });
+    }
+    if (selection.provider_id === null && selection.reasoning_level !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["reasoning_level"],
+        message: "follow parent cannot override reasoning level",
+      });
+    }
+  });
+
 const ConfigMcpAuthSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("none") }).strict(),
   z
@@ -194,9 +216,11 @@ export const ConfigDocumentSchema = z
     schema_version: z.literal(1),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
     default_access_mode: z.enum(["approval_required", "full_access"]),
+    interaction: z.object({ clarification_enabled: z.boolean().optional() }).strict().optional(),
     default_provider_id: ConfigProviderIdSchema.nullable(),
     default_model_id: ConfigModelIdSchema.nullable(),
     default_reasoning_level: ConfigReasoningLevelSchema.nullable(),
+    subagents: ConfigSubagentsSchema,
     providers: z.array(ConfigProviderSchema).max(MAX_CATALOG_ITEMS),
     mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS),
     skills: z.array(ConfigSkillSchema).max(MAX_CATALOG_ITEMS),
@@ -218,6 +242,30 @@ export const ConfigDocumentSchema = z
         path: ["providers"],
         message: "duplicate provider credential id",
       });
+    }
+    if (document.subagents.provider_id !== null && document.subagents.model_id !== null) {
+      const provider = document.providers.find(
+        (candidate) => candidate.provider_id === document.subagents.provider_id,
+      );
+      const model = provider?.models.find(
+        (candidate) => candidate.model_id === document.subagents.model_id,
+      );
+      if (model === undefined) {
+        context.addIssue({
+          path: ["subagents", "model_id"],
+          code: "custom",
+          message: "unknown selection",
+        });
+      } else if (
+        document.subagents.reasoning_level !== null &&
+        model.reasoning_level_map[document.subagents.reasoning_level] === undefined
+      ) {
+        context.addIssue({
+          path: ["subagents", "reasoning_level"],
+          code: "custom",
+          message: "unsupported reasoning level",
+        });
+      }
     }
     const hasProvider = document.default_provider_id !== null;
     const hasModel = document.default_model_id !== null;

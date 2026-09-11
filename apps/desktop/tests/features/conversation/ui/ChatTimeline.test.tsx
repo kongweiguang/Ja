@@ -51,6 +51,33 @@ describe("ChatTimeline", () => {
     expect(document.querySelector("script")).toBeNull();
   });
 
+  /** 同一 Turn 的多个 assistant fragment 必须合并为一个答复块，但不能丢失任一段正文。 */
+  it("保留同一 Turn 的多段 assistant 正文", () => {
+    render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_final_first",
+            text: "第一段答复",
+            final: true,
+            createdAt: "2026-09-11T00:00:01Z",
+          }),
+          baseItem({
+            itemId: "item_final_second",
+            text: "第二段答复",
+            final: true,
+            createdAt: "2026-09-11T00:00:02Z",
+          }),
+        ]}
+      />,
+    );
+
+    const response = screen.getByRole("article", { name: "最终答复" });
+    expect(document.querySelectorAll('[data-role="final"]')).toHaveLength(1);
+    expect(response).toHaveTextContent("第一段答复");
+    expect(response).toHaveTextContent("第二段答复");
+  });
+
   /** 同一 Turn 消费后续输入时必须形成新 exchange，附件和回复不能回流到首条用户气泡。 */
   it("renders every consumed user input as an independent exchange", () => {
     render(
@@ -486,6 +513,60 @@ describe("ChatTimeline", () => {
     expect(screen.getByRole("button", { name: /失败/ })).toHaveAttribute("data-state", "open");
   });
 
+  /** 已完成的公开 reasoning 遵循工作过程默认折叠规则，但用户仍可手动展开查看。 */
+  it("折叠已完成的 reasoning 并允许手动查看", async () => {
+    const user = userEvent.setup();
+    render(
+      <WorkProcess
+        steps={[
+          baseItem({
+            itemId: "item_completed_reasoning",
+            kind: "reasoning",
+            text: "已完成的思考摘要",
+            status: "completed",
+            metadata: { phase: "reasoning_summary" },
+          }),
+        ]}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: /工作过程/ });
+    expect(trigger).toHaveAttribute("data-state", "closed");
+    await user.click(trigger);
+    expect(screen.getByText("已完成的思考摘要")).toBeVisible();
+  });
+
+  /** 公开 reasoning 已由服务端有界化，流式和完成后展开都不能静默截断 Markdown 尾部。 */
+  it("保留长 reasoning 的代码与尾部内容", async () => {
+    const user = userEvent.setup();
+    const code = "const reasoningCode = true;";
+    const tail = "reasoning-tail-sentinel";
+    const longReasoning = `${"公开摘要".repeat(600)}\n\n\`\`\`ts\n${code}\n\`\`\`\n\n${tail}`;
+    const streamingReasoning = baseItem({
+      itemId: "item_long_reasoning",
+      kind: "reasoning",
+      title: "思考摘要",
+      text: longReasoning,
+      status: "in_progress",
+      metadata: { phase: "reasoning_summary", modelRound: 1 },
+    });
+    const { rerender } = render(<WorkProcess steps={[streamingReasoning]} />);
+
+    const streamingRow = screen.getByRole("listitem", { name: "模型思考" });
+    expect(streamingRow).toBeVisible();
+    expect(streamingRow).toHaveTextContent(code);
+    expect(streamingRow).toHaveTextContent(tail);
+
+    rerender(<WorkProcess steps={[{ ...streamingReasoning, status: "completed" as const }]} />);
+    const trigger = screen.getByRole("button", { name: /工作过程/ });
+    expect(trigger).toHaveAttribute("data-state", "closed");
+    await user.click(trigger);
+    const completedRow = screen.getByRole("listitem", { name: "模型思考" });
+    expect(completedRow).toBeVisible();
+    expect(completedRow).toHaveTextContent(code);
+    expect(completedRow).toHaveTextContent(tail);
+  });
+
   /** Turn 是整轮状态 owner，覆盖七态并锁定局部失败不能抢占运行态。 */
   it("完整映射七种权威 Turn 状态且始终使用稳定标题", () => {
     const step = baseItem({
@@ -507,7 +588,7 @@ describe("ChatTimeline", () => {
       { status: "queued" as const, state: "queued", label: "排队中" },
       { status: "running" as const, state: "active", label: "进行中…" },
       { status: "waiting_approval" as const, state: "waiting", label: "等待确认" },
-      { status: "suspended" as const, state: "suspended", label: "运行被中断" },
+      { status: "suspended" as const, state: "suspended", label: "已暂停" },
       { status: "completed" as const, state: "completed", label: "已完成" },
       { status: "failed" as const, state: "failed", label: "失败" },
       { status: "cancelled" as const, state: "cancelled", label: "已取消" },
@@ -707,21 +788,41 @@ describe("ChatTimeline", () => {
       itemId: "item_progress_follow_up",
       text: "正在验证读取结果",
     });
-    const { rerender } = render(<WorkProcess steps={[commentary, tool, followUpCommentary]} />);
+    const reasoning = baseItem({
+      itemId: "item_reasoning",
+      kind: "reasoning",
+      title: "思考摘要",
+      text: "模型正在核对读取结果",
+      status: "in_progress",
+      metadata: { phase: "reasoning_summary", modelRound: 2 },
+    });
+    const { rerender } = render(
+      <WorkProcess steps={[commentary, tool, reasoning, followUpCommentary]} />,
+    );
 
     expect(screen.getByRole("button", { name: /工作过程.*1 步/u })).toBeVisible();
     expect(screen.queryByText("回复过程")).not.toBeInTheDocument();
     const firstCommentary = screen.getByText("正在分析公开上下文");
     const toolRow = screen.getByRole("button", { name: /读取，src\/main\.ts，完成/u });
+    const reasoningRow = screen.getByRole("listitem", { name: "模型思考" });
     const followUp = screen.getByText("正在验证读取结果");
     expect(firstCommentary).toBeVisible();
     expect(followUp).toBeVisible();
+    expect(reasoningRow).toHaveAttribute("data-role", "reasoning");
+    expect(reasoningRow).toHaveTextContent("模型正在核对读取结果");
+    expect(screen.getAllByLabelText("助手进展")).toHaveLength(2);
     expect(
       firstCommentary.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
     expect(toolRow.compareDocumentPosition(followUp) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
       0,
     );
+    expect(
+      toolRow.compareDocumentPosition(reasoningRow) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(
+      reasoningRow.compareDocumentPosition(followUp) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
     expect(screen.queryByText("模型第 2 轮")).not.toBeInTheDocument();
     expect(screen.queryByText("仅显示部分文件")).not.toBeInTheDocument();
     expect(screen.queryByText("assistant_progress")).not.toBeInTheDocument();
@@ -1921,5 +2022,72 @@ describe("ChatTimeline", () => {
     expect(replyCopy).toHaveFocus();
     await user.keyboard("{Enter}");
     expect(onCopyText).toHaveBeenCalledWith("结果\n\n```ts\nconst ready = true;\n```");
+  });
+
+  /** 会话消息是外部纯文本事实：展示来源 identity，但不能落入用户气泡或 Markdown 语义。 */
+  it("renders received thread messages as ordered plain-text source blocks", () => {
+    render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_user_message",
+            kind: "user_message",
+            text: "当前问题",
+            createdAt: "2026-09-10T00:00:00Z",
+          }),
+          baseItem({
+            itemId: "item_thread_message_one",
+            kind: "thread_message",
+            sourceThreadId: "thr_side_one",
+            sourceTitle: "临时侧聊",
+            text: "第一条 **不解析**\n# 仍是原文",
+            createdAt: "2026-09-10T00:00:01Z",
+          }),
+          baseItem({
+            itemId: "item_thread_message_two",
+            kind: "thread_message",
+            sourceThreadId: "thr_side_two",
+            sourceTitle: "另一个会话",
+            text: "第二条",
+            // 同一时间戳仍必须按服务端批次顺序展示。
+            createdAt: "2026-09-10T00:00:01Z",
+          }),
+          baseItem({
+            itemId: "item_agent_message",
+            kind: "agent_message",
+            final: true,
+            text: "当前回复",
+            createdAt: "2026-09-10T00:00:02Z",
+          }),
+        ]}
+      />,
+    );
+
+    const row = document.querySelector(".ja-chat-timeline__row");
+    expect(row).not.toBeNull();
+    if (row === null) return;
+    const sourceMessages = row.querySelectorAll('[data-role="thread-message"]');
+    expect(sourceMessages).toHaveLength(2);
+    expect(sourceMessages[0]).toHaveAttribute("aria-label", "来自会话：临时侧聊");
+    expect(sourceMessages[1]).toHaveAttribute("aria-label", "来自会话：另一个会话");
+    expect(sourceMessages[0]).toHaveAttribute("data-source-thread-id", "thr_side_one");
+    expect(sourceMessages[0]?.querySelector("strong")).toHaveAttribute("title", "thr_side_one");
+    expect(sourceMessages[0]).toHaveTextContent("第一条 **不解析**");
+    expect(sourceMessages[0]).toHaveTextContent("# 仍是原文");
+    expect(sourceMessages[0]?.querySelector(".ja-thread-message__content strong")).toBeNull();
+    expect(sourceMessages[0]?.querySelector("h1")).toBeNull();
+    expect(sourceMessages[0]).not.toHaveClass("ja-chat-message-user");
+    expect(sourceMessages[0]).not.toHaveClass("ja-chat-message-final");
+    expect(row.querySelector('[aria-label="用户问题"]')).not.toBeNull();
+    expect(row.querySelector('[aria-label="最终答复"]')).not.toBeNull();
+    expect(
+      sourceMessages[0]!.compareDocumentPosition(sourceMessages[1]!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      sourceMessages[1]!.compareDocumentPosition(row.querySelector('[aria-label="最终答复"]')!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("收到消息")).not.toBeInTheDocument();
   });
 });

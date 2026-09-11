@@ -231,10 +231,10 @@ export function AppTitlebar({
             onInvoke={handleWindowAction}
           />
           <WindowControl
-            action="hide"
+            action="close"
             icon={X}
             label="关闭"
-            tooltip="隐藏到系统托盘"
+            tooltip="关闭窗口"
             close
             disabled={windowActionPending !== undefined}
             onInvoke={handleWindowAction}

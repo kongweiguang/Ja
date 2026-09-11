@@ -98,3 +98,44 @@ fn rejects_private_result_fields_recursively() {
     let value = json!({"items": [], "nextCursor": null, "extension": {"apiKey": "must-not-cross"}});
     assert!(validate_result(SettingsQueryMethod::McpList, value).is_err());
 }
+
+/// MCP 列表与探测必须接受 Java 的 configured/available 状态，并拒绝缺 descriptor 字段的旧响应。
+#[test]
+fn validates_mcp_projection_and_test_result() {
+    assert!(validate_result(
+        SettingsQueryMethod::McpList,
+        json!({
+            "items": [{"mcpId": "mcp_demo", "name": "Demo", "transport": "stdio", "status": "configured", "toolCount": 0}],
+            "nextCursor": null
+        })
+    )
+    .is_ok());
+    assert!(validate_result(
+        SettingsQueryMethod::McpTest,
+        json!({"mcpId": "mcp_demo", "name": "Demo", "transport": "stdio", "status": "available", "toolCount": 1})
+    )
+    .is_ok());
+    assert!(
+        validate_result(
+            SettingsQueryMethod::McpTest,
+            json!({"mcpId": "mcp_demo", "status": "available", "toolCount": 1})
+        )
+        .is_err()
+    );
+}
+
+/// 与合同中的首字符和长度上限一致，避免 Native 拒绝合法长 ID 或接纳标点开头的 ID。
+#[test]
+fn preserves_mcp_identity_contract_boundaries() {
+    for (id, expected) in [
+        (format!("mcp_{}", "a".repeat(96)), true),
+        ("mcp_.bad".to_owned(), false),
+        (format!("mcp_{}", "a".repeat(97)), false),
+    ] {
+        let result = validate_result(
+            SettingsQueryMethod::McpTest,
+            json!({"mcpId": id, "name": "Demo", "transport": "stdio", "status": "available", "toolCount": 1}),
+        );
+        assert_eq!(result.is_ok(), expected);
+    }
+}

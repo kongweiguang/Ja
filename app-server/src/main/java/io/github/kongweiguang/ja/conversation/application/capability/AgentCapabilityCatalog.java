@@ -91,6 +91,8 @@ public final class AgentCapabilityCatalog {
                 if (!contribution.spec().equals(tool.spec())
                         || contribution.sideEffect() != tool.sideEffect()
                         || contribution.workspaceMutationMode() != tool.workspaceMutationMode()
+                        || contribution.planAccess() != tool.planAccess()
+                        || contribution.approvalRequirement() != tool.approvalRequirement()
                         || !contribution.bindingDescriptor().equals(tool.bindingDescriptor())) {
                     throw new IllegalStateException("Agent capability Tool changed after prepare");
                 }

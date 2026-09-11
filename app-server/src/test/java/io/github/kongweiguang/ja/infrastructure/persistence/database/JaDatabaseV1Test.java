@@ -33,36 +33,38 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 验证 Ja 0.1.0 只接受事务化 V1 以及严格的 Flyway/SQLite 启动准入。 */
+/** 验证 Ja 0.1.0 只接受事务化 V1/V2/V3 以及严格的 Flyway/SQLite 启动准入。 */
 final class JaDatabaseV1Test {
     private static final Set<String> DOMAIN_TABLES = Set.of(
             "acceptance_criteria", "acceptance_evidence", "approvals", "attachment_blobs", "attachments",
             "change_set_artifacts", "context_checkpoints", "execution_runs", "goal_acceptance_criteria",
             "goal_continuation_leases", "goal_definition_revisions", "goal_evaluations", "goal_events",
-            "goal_input_requests", "goal_plan_links", "goal_tool_attempts", "goals", "message_attachments",
+            "goal_plan_links", "goal_tool_attempts", "goals", "message_attachments",
             "messages", "pending_input_attachments", "pending_inputs", "plan_approvals", "plan_drafts",
             "plan_events", "plan_revisions", "plan_step_executions", "plan_steps", "plans",
             "task_activities", "task_context_seeds", "task_mailbox", "task_process_generation",
             "task_projections", "thread_instruction_scopes", "thread_lineage", "thread_title_generations",
-            "threads", "timeline_messages", "tool_artifacts", "tool_bindings", "tools", "turn_change_sets",
-            "turn_execution", "turn_internal_context", "turns", "usage", "workspace_write_claims",
+            "threads", "temporary_side_chats", "timeline_messages", "tool_artifacts", "tool_bindings", "tools", "turn_change_sets",
+            "thread_subagent_policies", "turn_execution", "turn_internal_context", "turns", "usage",
+            "workspace_write_claims", "interaction_requests", "interaction_drafts", "interaction_events",
+            "plan_turn_claims", "plan_evaluation_requests",
             "workspaces");
 
     @TempDir Path temp;
 
-    /** 空库一次创建完整领域结构；再次启动只能验证同一 V1，不会产生第二条 history。 */
+    /** 空库一次创建完整领域结构；再次启动只能验证同一 V3，不会产生第二条 history。 */
     @Test
-    void initializesCompleteV1AndReopensWithoutMigration() throws Exception {
+    void initializesCompleteV2AndReopensWithoutMigration() throws Exception {
         Path databasePath = temp.resolve("fresh").resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
             // 首次 close 同样走生产 WAL checkpoint，确保 lease 在完整生命周期后释放。
         }
 
-        assertCurrentV1(databasePath);
+        assertCurrentV2(databasePath);
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 当前 V1 只做 checksum 和完整性验证。
+            // 当前 V2 只做 checksum 和完整性验证。
         }
-        assertCurrentV1(databasePath);
+        assertCurrentV2(databasePath);
     }
 
     /** 未带 Flyway history 的非空 schema 明确拒绝，原表保留且失败后 lease 可重新获取。 */
@@ -111,8 +113,8 @@ final class JaDatabaseV1Test {
         Path databasePath = initialized("future");
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            statement.executeUpdate("UPDATE flyway_schema_history SET version='2',description='future' "
-                    + "WHERE version='1'");
+            statement.executeUpdate("UPDATE flyway_schema_history SET version='4',description='future' "
+                    + "WHERE version='3'");
         }
 
         StorageException failure = assertThrows(StorageException.class,
@@ -121,8 +123,8 @@ final class JaDatabaseV1Test {
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals("2", text(statement,
-                    "SELECT version FROM flyway_schema_history WHERE success=1"));
+            assertEquals("4", text(statement,
+                    "SELECT version FROM flyway_schema_history WHERE version='4' AND success=1"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -162,7 +164,8 @@ final class JaDatabaseV1Test {
                         installed_rank,version,description,type,script,checksum,
                         installed_by,execution_time,success
                     )
-                    SELECT installed_rank+1,'1','duplicate V1','SQL','V1__duplicate.sql',checksum,
+                    SELECT (SELECT MAX(installed_rank) FROM flyway_schema_history)+1,
+                        '1','duplicate V1','SQL','V1__duplicate.sql',checksum,
                         installed_by,0,1
                     FROM flyway_schema_history WHERE version='1' AND success=1
                     """);
@@ -174,7 +177,7 @@ final class JaDatabaseV1Test {
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals(2, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(4, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -190,7 +193,8 @@ final class JaDatabaseV1Test {
                         installed_rank,version,description,type,script,checksum,
                         installed_by,execution_time,success
                     )
-                    SELECT installed_rank+1,'1.1','failed unresolved','SQL','V1_1__failed.sql',checksum+1,
+                    SELECT (SELECT MAX(installed_rank) FROM flyway_schema_history)+1,
+                        '1.1','failed unresolved','SQL','V1_1__failed.sql',checksum+1,
                         installed_by,0,0
                     FROM flyway_schema_history WHERE version='1' AND success=1
                     """);
@@ -237,7 +241,7 @@ final class JaDatabaseV1Test {
         assertLeaseReleased(databasePath);
     }
 
-    /** 首版 schema 在绕过 Repository 时仍拒绝跨 Thread/Goal/Run 错绑和半写入诊断状态。 */
+    /** 当前 schema 在绕过 Repository 时仍拒绝跨 Thread/Goal/Run 错绑和半写入诊断状态。 */
     @Test
     void rejectsInvalidOwnersAndPartialIssueTuplesAtDatabaseBoundary() throws Exception {
         Path databasePath = initialized("domain-constraints");
@@ -260,10 +264,12 @@ final class JaDatabaseV1Test {
                         'PENDING','CONTENT_TOO_LARGE',1,'2026-09-07T00:00:00Z','2026-09-07T00:00:00Z')
                     """));
             assertThrows(java.sql.SQLException.class, () -> statement.executeUpdate("""
-                    INSERT INTO goal_input_requests(
-                        input_request_id,goal_id,run_id,prompt,state,expires_at,created_at
-                    ) VALUES('goalinput_wrong_owner','goal_1','run_2','continue?','PENDING',
-                        '2026-09-08T00:00:00Z','2026-09-07T00:00:00Z')
+                    INSERT INTO interaction_requests(
+                        request_id,thread_id,turn_id,tool_call_id,goal_id,run_id,idempotency_key,
+                        questions_json,answers_json,status,revision,created_at,updated_at
+                    ) VALUES('interaction_wrong_owner','thread_2','turn_1','call_1','goal_1','run_2','wrong-owner',
+                        '[{"questionId":"question_one"}]','[]','PENDING',0,
+                        '2026-09-07T00:00:00Z','2026-09-07T00:00:00Z')
                     """));
 
             insertToolAttemptFixture(statement);
@@ -280,7 +286,7 @@ final class JaDatabaseV1Test {
         }
     }
 
-    /** V1 中途失败必须回滚全部领域 DDL；同一文件随后可用正式 V1 完成初始化。 */
+    /** V1 中途失败必须回滚全部领域 DDL；同一文件随后可用正式 V3 完成初始化。 */
     @Test
     void rollsBackInterruptedV1AndAllowsRetry() throws Exception {
         Path databasePath = temp.resolve("retry").resolve("ja.db");
@@ -299,12 +305,12 @@ final class JaDatabaseV1Test {
         }
 
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 失败 migration 没有发布领域表或占住 lease，正式 V1 可以原位重试。
+            // 失败 migration 没有发布领域表或占住 lease，正式 V3 可以原位重试。
         }
-        assertCurrentV1(databasePath);
+        assertCurrentV2(databasePath);
     }
 
-    /** 创建并完整关闭一个真实 V1，所有后续漂移测试都从同一生产路径出发。 */
+    /** 创建并完整关闭一个真实 V3，所有后续漂移测试都从同一生产路径出发。 */
     private Path initialized(String name) {
         Path databasePath = temp.resolve(name).resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
@@ -323,14 +329,18 @@ final class JaDatabaseV1Test {
         return database;
     }
 
-    /** 当前 schema 由一条成功 history、完整领域表集和首版格式约束共同定义。 */
-    private static void assertCurrentV1(Path databasePath) throws Exception {
+    /** 当前 schema 由 V1/V2/V3 成功 history、完整领域表集和格式约束共同定义。 */
+    private static void assertCurrentV2(Path databasePath) throws Exception {
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
             assertEquals(DOMAIN_TABLES, tableNames(statement));
             assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
                     + "WHERE version='1' AND success=1"));
-            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='2' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='3' AND success=1"));
+            assertEquals(3, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
             assertEquals("ok", text(statement, "PRAGMA integrity_check"));
             assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
             assertEquals(0, number(statement, "SELECT last_generation FROM task_process_generation "
@@ -340,8 +350,8 @@ final class JaDatabaseV1Test {
             assertRequired(connection, "threads", "access_mode");
             assertRequired(connection, "threads", "title_source");
             assertRequired(connection, "usage", "profile_json");
-            assertRequired(connection, "goal_input_requests", "run_id");
-            assertRequired(connection, "goal_input_requests", "expires_at");
+            assertRequired(connection, "interaction_requests", "thread_id");
+            assertRequired(connection, "interaction_requests", "tool_call_id");
             assertFalse(columnNames(connection, "usage").contains("profile_origin"));
             Set<String> indexes = indexNames(statement);
             assertFalse(indexes.contains("idx_messages_thread_ordinal"));
@@ -380,7 +390,7 @@ final class JaDatabaseV1Test {
         throw new AssertionError("missing column " + table + "." + column);
     }
 
-    /** 读取列集合只用于证明已删除的历史 Usage 维度没有留在首版 schema。 */
+    /** 读取列集合只用于证明已删除的历史 Usage 维度没有留在当前 schema。 */
     private static Set<String> columnNames(java.sql.Connection connection, String table) throws Exception {
         Set<String> names = new HashSet<>();
         try (java.sql.Statement statement = connection.createStatement();
@@ -390,7 +400,7 @@ final class JaDatabaseV1Test {
         return names;
     }
 
-    /** 显式索引名只用于防止与 SQLite 自动唯一索引等价的历史结构重新进入首版。 */
+    /** 显式索引名只用于防止与 SQLite 自动唯一索引等价的历史结构重新进入当前 schema。 */
     private static Set<String> indexNames(java.sql.Statement statement) throws Exception {
         Set<String> names = new HashSet<>();
         try (java.sql.ResultSet rows = statement.executeQuery(

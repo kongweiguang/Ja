@@ -7,6 +7,8 @@ import type {
   PlanDraft,
   PlanReadModel,
   PlanRevision,
+  PlanProgress,
+  PlanSummary,
 } from "../domain/goalModel";
 
 export type GoalMutationAction =
@@ -15,23 +17,29 @@ export type GoalMutationAction =
   | "pause"
   | "resume"
   | "stop"
-  | "respond_input"
   | "save_draft"
   | "discard_draft"
   | "propose"
-  | "approve"
   | "execute"
   | "attach_plan"
   | "detach_plan"
   | "reject";
 
+/** Goal owner 的 wire kind；独立侧边任务复用其真实 task Thread identity。 */
+export type GoalOwnerKind = "thread" | "independent_task";
+
 export interface GoalEvent {
-  readonly method: "goal/changed" | "goal/activity" | "goal/input-requested";
-  readonly goalId: string;
+  readonly method: "goal/changed" | "goal/activity" | "plan/changed";
+  readonly goalId?: string;
+  readonly planId?: string;
+  readonly ownerThreadId?: string;
+  readonly planRevision?: number;
+  readonly planEventSequence?: number;
+  readonly plan?: PlanSummary;
+  readonly progress?: PlanProgress;
   readonly goalRevision: number;
   readonly eventSequence: number;
   readonly occurredAt: string;
-  readonly ownerThreadId?: string;
 }
 
 export interface GoalPortError extends Error {
@@ -50,6 +58,12 @@ export interface GoalPortError extends Error {
 export interface GoalPort {
   read(input: { goalId: string }): Promise<GoalReadModel>;
   readPlan(input: { ownerThreadId: string; planId: string }): Promise<PlanReadModel>;
+  currentPlan(ownerThreadId: string): Promise<PlanReadModel | undefined>;
+  observePlan(input: {
+    ownerThreadId: string;
+    planId: string;
+  }): Promise<{ observationId: string; plan: PlanReadModel }>;
+  unobservePlan(input: { observationId: string }): Promise<void>;
   observe(input: {
     goalId: string;
     expectedGoalRevision: number;
@@ -60,6 +74,12 @@ export interface GoalPort {
     ownerThreadId: string;
     planId: string;
   }): Promise<{ items: PlanRevision[] }>;
+  readPlanEvidence(input: {
+    ownerThreadId: string;
+    planId: string;
+    planRevisionId: string;
+    runId: string;
+  }): Promise<{ items: AcceptanceEvidence[] }>;
   evidence(input: {
     goalId: string;
     goalDefinitionRevision: number;
@@ -67,6 +87,7 @@ export interface GoalPort {
   }): Promise<{ items: AcceptanceEvidence[] }>;
   create(input: {
     ownerThreadId: string;
+    ownerKind: GoalOwnerKind;
     objective: string;
     expectedGoalRevision: number;
     idempotencyKey: string;
@@ -105,13 +126,6 @@ export interface GoalPort {
     expectedGoalRevision: number;
     idempotencyKey: string;
   }): Promise<GoalReadModel>;
-  respondInput(input: {
-    goalId: string;
-    requestId: string;
-    response: string;
-    expectedGoalRevision: number;
-    idempotencyKey: string;
-  }): Promise<GoalReadModel>;
   saveDraft(input: {
     ownerThreadId: string;
     planId: string;
@@ -131,11 +145,24 @@ export interface GoalPort {
     expectedPlanRevision: number;
     idempotencyKey: string;
   }): Promise<PlanReadModel>;
-  approve(input: {
+  pausePlan(input: {
     ownerThreadId: string;
     planId: string;
-    planRevisionId: string;
-    planHash: string;
+    runId: string;
+    expectedPlanRevision: number;
+    idempotencyKey: string;
+  }): Promise<PlanReadModel>;
+  resumePlan(input: {
+    ownerThreadId: string;
+    planId: string;
+    runId: string;
+    expectedPlanRevision: number;
+    idempotencyKey: string;
+  }): Promise<PlanReadModel>;
+  stopPlan(input: {
+    ownerThreadId: string;
+    planId: string;
+    runId: string;
     expectedPlanRevision: number;
     idempotencyKey: string;
   }): Promise<PlanReadModel>;

@@ -86,6 +86,13 @@ final class TaskJsonCodec {
 
     /** 长度前缀使相邻字段即使包含分隔字符也不能形成相同 fingerprint 输入。 */
     private static void add(MessageDigest digest, String value) {
+        if (value == null) {
+            digest.update((byte) 0xff);
+            digest.update((byte) 0xff);
+            digest.update((byte) 0xff);
+            digest.update((byte) 0xff);
+            return;
+        }
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         digest.update((byte) (bytes.length >>> 24));
         digest.update((byte) (bytes.length >>> 16));

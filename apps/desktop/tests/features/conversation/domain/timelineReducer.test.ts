@@ -91,6 +91,7 @@ function taskActivityEntry(activitySequence = 3) {
     activity: {
       activitySequence,
       activityId: `activity_${activitySequence}`,
+      rootThreadId: threadId,
       taskThreadId: "thr_child",
       actorThreadId: threadId,
       causalTurnId: turnId,
@@ -203,6 +204,46 @@ describe("timeline reducer", () => {
       serverInstanceId: "srv_two",
     });
     expect(nextGeneration.taskActivitiesByRootThread).toEqual({});
+  });
+
+  /** Snapshot owner 必须是直接父会话的 attached Subagent，侧聊和错误 root 均拒绝入 Timeline。 */
+  it("拒绝侧聊、嵌套任务和 Activity root 不一致的主 Timeline 投影", () => {
+    const snapshot = (entry: unknown) => ({
+      threadId,
+      revision: 4,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [entry],
+      goalActivities: [],
+      nextCursor: null,
+    });
+    expect(timelineSnapshotValidationReason(snapshot(taskActivityEntry()))).toBeUndefined();
+
+    const baseTaskActivity = taskActivityEntry();
+    const sideTask = {
+      ...baseTaskActivity,
+      task: {
+        ...baseTaskActivity.task,
+        taskKind: "side_task" as const,
+        lifecycle: "independent" as const,
+        originTurnId: null,
+      },
+    };
+    expect(timelineSnapshotValidationReason(snapshot(sideTask))).toBe("task_activity:0");
+
+    const nestedTask = {
+      ...baseTaskActivity,
+      task: { ...baseTaskActivity.task, parentThreadId: "thr_other", depth: 2 },
+    };
+    expect(timelineSnapshotValidationReason(snapshot(nestedTask))).toBe("task_activity:0");
+
+    const mismatchedRoot = {
+      ...baseTaskActivity,
+      activity: { ...baseTaskActivity.activity, rootThreadId: "thr_other" },
+    };
+    expect(timelineSnapshotValidationReason(snapshot(mismatchedRoot))).toBe("task_activity:0");
   });
 
   it("拒绝缺失权威 Workspace owner 的 Snapshot 与 turn/start，不生成假身份", () => {
@@ -566,6 +607,94 @@ describe("timeline reducer", () => {
     expect(state.items["item_final"]?.metadata?.failureReply).toBeUndefined();
     expect(state.lastOutcome).toBe("applied");
     expect(state.resyncRequired[threadId]).toBe("terminal_snapshot");
+  });
+
+  /** 同一模型提交的 live 与 snapshot 都必须保持 reasoning、正文、Tool 的稳定阅读顺序。 */
+  it("keeps model-step reasoning before text and tools across reload", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 2, {
+        messageId: "item_ordered_text",
+        text: "准备执行读取",
+        reasoningSummary: "先核对读取范围",
+        modelRound: 1,
+        toolCalls: [
+          {
+            callId: "call_ordered_read",
+            toolName: "read",
+            ordinal: 0,
+            presentation: presentation("read", "pending", { relativePaths: ["README.md"] }),
+          },
+        ],
+      }),
+    );
+
+    const liveItems = state.itemIdsByThread[threadId]?.map((itemId) => state.items[itemId]);
+    expect(liveItems?.map((item) => item?.kind)).toEqual(["reasoning", "commentary", "tool_call"]);
+
+    const reloaded = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 2,
+        turns: [
+          {
+            turnId,
+            status: "running" as const,
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_ordered_text_reasoning",
+            turnId,
+            kind: "reasoning_summary" as const,
+            text: "先核对读取范围",
+            modelRound: 1,
+            createdAt: "2026-08-18T00:00:01Z",
+          },
+          {
+            itemId: "item_ordered_text",
+            turnId,
+            kind: "assistant_progress" as const,
+            text: "准备执行读取",
+            modelRound: 1,
+            createdAt: "2026-08-18T00:00:01Z",
+          },
+          {
+            itemId: "call_ordered_read_call",
+            turnId,
+            kind: "tool_call" as const,
+            callId: "call_ordered_read",
+            toolName: "read",
+            ordinal: 0,
+            presentation: presentation("read", "pending", { relativePaths: ["README.md"] }),
+            createdAt: "2026-08-18T00:00:01Z",
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const reloadedItems = reloaded.itemIdsByThread[threadId]?.map(
+      (itemId) => reloaded.items[itemId],
+    );
+    expect(reloadedItems?.map((item) => item?.kind)).toEqual([
+      "reasoning",
+      "commentary",
+      "tool_call",
+    ]);
+    expect(reloadedItems?.map((item) => item?.kind)).toEqual(liveItems?.map((item) => item?.kind));
   });
 
   /** Failed Terminal 的固定正文是运行时安全回复，不得被后续 UI 当成 Provider 半截输出。 */
@@ -1098,7 +1227,7 @@ describe("timeline reducer", () => {
         text: "先",
       }),
     );
-    expect(state.draftByTurn[turnId]?.text).toBe("先");
+    expect(state.draftByTurn[turnId]?.[0]?.text).toBe("先");
 
     state = apply(
       state,
@@ -1112,6 +1241,122 @@ describe("timeline reducer", () => {
     expect(state.lastOutcome).toBe("gap");
     expect(state.draftByTurn[turnId]).toBeUndefined();
     expect(state.resyncRequired[threadId]).toBe("gap");
+  });
+
+  /**
+   * reasoning 与公开回复共用 Turn streamSeq，但跨语义时必须保留为不同 segment；随后结算只留下
+   * 一份持久 reasoning/item，不得把上一段 reasoning 覆盖成回复或重复展示。
+   */
+  it("preserves interleaved reasoning and assistant segments until model settlement", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/reasoning-summary-delta", 1, {
+        eventId: "evt_reasoning_1",
+        streamSeq: 1,
+        text: "先判断上下文。",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_text_2",
+        streamSeq: 2,
+        text: "公开回复的一部分。",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/reasoning-summary-delta", 1, {
+        eventId: "evt_reasoning_3",
+        streamSeq: 3,
+        text: "再核对一个约束。",
+      }),
+    );
+
+    expect(state.draftByTurn[turnId]).toEqual([
+      expect.objectContaining({ kind: "reasoning", text: "先判断上下文。", segmentStartSeq: 1 }),
+      expect.objectContaining({
+        kind: "assistant",
+        text: "公开回复的一部分。",
+        segmentStartSeq: 2,
+      }),
+      expect.objectContaining({ kind: "reasoning", text: "再核对一个约束。", segmentStartSeq: 3 }),
+    ]);
+
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 2, {
+        eventId: "evt_model_settled",
+        messageId: "item_model_settled",
+        text: "公开回复的一部分。",
+        reasoningSummary: "先判断上下文。再核对一个约束。",
+        modelRound: 1,
+        toolCalls: [],
+      }),
+    );
+
+    expect(state.draftByTurn[turnId]).toBeUndefined();
+    expect(
+      Object.values(state.items).filter(
+        (item) => item.turnId === turnId && item.kind === "reasoning",
+      ),
+    ).toHaveLength(1);
+    expect(
+      Object.values(state.items).filter(
+        (item) => item.turnId === turnId && item.kind === "commentary",
+      ),
+    ).toHaveLength(1);
+    expect(
+      Object.values(state.items)
+        .filter((item) => item.turnId === turnId && item.kind === "reasoning")
+        .map((item) => item.text),
+    ).toEqual(["先判断上下文。再核对一个约束。"]);
+  });
+
+  /** Reload 后的 reasoning_summary 仍保留独立语义，不能因恢复投影退化成普通 Commentary。 */
+  it("restores persisted reasoning summaries as reasoning items", () => {
+    const restored = applySnapshot(
+      readyState(),
+      {
+        threadId,
+        revision: 1,
+        turns: [
+          {
+            turnId,
+            status: "completed" as const,
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:02Z",
+            completedAt: "2026-08-18T00:00:02Z",
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_persisted_reasoning",
+            turnId,
+            kind: "reasoning_summary" as const,
+            text: "刷新后仍可见的公开摘要",
+            modelRound: 1,
+            createdAt: "2026-08-18T00:00:01Z",
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+
+    expect(restored.items["item_persisted_reasoning"]).toMatchObject({
+      kind: "reasoning",
+      text: "刷新后仍可见的公开摘要",
+      metadata: { phase: "reasoning_summary", modelRound: 1 },
+    });
   });
 
   /** Event ID 负责幂等；未见旧事实必须重读，但内部 revision 跳跃本身不是事件丢失。 */
@@ -2158,5 +2403,103 @@ describe("timeline reducer", () => {
         (itemId) => state.items[itemId]?.kind === "user_message",
       ),
     ).toEqual(["item_persisted_user"]);
+  });
+
+  /** Mailbox 批次只进入目标 Timeline 的独立消息事实，不能伪造用户输入、Task Activity 或额外卡片。 */
+  it("projects received thread messages in batch order and deduplicates event identity", () => {
+    const messages = [
+      {
+        itemId: "item_message_first",
+        createdAt: "2026-09-09T00:00:01Z",
+        turnId,
+        kind: "thread_message" as const,
+        sourceThreadId: "thr_source_one",
+        sourceTitle: "来源会话",
+        content: "第一条 **原文**",
+      },
+      {
+        itemId: "item_message_second",
+        createdAt: "2026-09-09T00:00:01Z",
+        turnId,
+        kind: "thread_message" as const,
+        sourceThreadId: "thr_source_two",
+        sourceTitle: "另一个来源",
+        content: "第二条",
+      },
+    ];
+    const firstMessage = messages[0];
+    if (firstMessage === undefined) throw new Error("消息 fixture 缺少首项");
+    let state = applySnapshot(
+      readyState(),
+      {
+        threadId,
+        revision: 1,
+        turns: [
+          {
+            turnId,
+            status: "running" as const,
+            requestedAt: "2026-09-09T00:00:00Z",
+            updatedAt: "2026-09-09T00:00:00Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    state = apply(
+      state,
+      event("turn/messages_received", 2, {
+        sequence: 12,
+        items: messages,
+      }),
+    );
+
+    expect(state.lastOutcome).toBe("applied");
+    expect(state.itemIdsByThread[threadId]).toEqual(messages.map((message) => message.itemId));
+    expect(state.items[firstMessage.itemId]).toMatchObject({
+      kind: "thread_message",
+      text: firstMessage.content,
+      sourceThreadId: firstMessage.sourceThreadId,
+      sourceTitle: firstMessage.sourceTitle,
+    });
+    expect(Object.values(state.items).filter((item) => item.kind === "user_message")).toHaveLength(
+      0,
+    );
+    expect(state.taskActivitiesByRootThread[threadId]).toEqual([]);
+    expect(state.inputQueueByTurn[turnId]).toBeUndefined();
+
+    const malformed = applyEventValue(
+      state,
+      event("turn/messages_received", 3, {
+        sequence: 13,
+        items: [{ ...firstMessage, sourceThreadId: "thr_../escape" }],
+      }),
+    );
+    expect(malformed.lastOutcome).toBe("invalid");
+
+    const duplicate = apply(
+      state,
+      event("turn/messages_received", 2, { sequence: 12, items: messages }),
+    );
+    expect(duplicate.lastOutcome).toBe("duplicate");
+    expect(duplicate.itemIdsByThread[threadId]).toEqual(messages.map((message) => message.itemId));
+
+    const conflicting = apply(
+      state,
+      event("turn/messages_received", 3, {
+        sequence: 13,
+        items: [{ ...firstMessage, content: "不应覆盖原文" }],
+      }),
+    );
+    expect(conflicting.lastOutcome).toBe("resync_required");
+    expect(conflicting.items[firstMessage.itemId]?.text).toBe(firstMessage.content);
   });
 });

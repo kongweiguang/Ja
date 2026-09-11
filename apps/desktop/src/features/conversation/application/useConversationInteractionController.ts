@@ -668,7 +668,7 @@ export function useConversationInteractionController({
   const enqueue = useCallback(
     async ({ text, attachmentIds, contextReferences = [] }: ConversationSubmit): Promise<void> => {
       const requestThreadId = threadId;
-      const requestTurnId = executingTurnId;
+      const requestTurnId = blockingTurnId;
       const submittedText = text.trim();
       const submittedReferences = [...contextReferences];
       const observedAttachmentDrafts =
@@ -823,7 +823,7 @@ export function useConversationInteractionController({
     [
       attachmentDraftsByThread,
       draftsByThread,
-      executingTurnId,
+      blockingTurnId,
       inputQueue?.accepting,
       onAttachmentsBound,
       threadId,
@@ -988,7 +988,14 @@ export function useConversationInteractionController({
       return next;
     });
     try {
-      await turnPort.cancelTurn({ turnId: requestTurnId, expectedThreadRevision: requestRevision });
+      const cancellation = await turnPort.cancelTurn({
+        turnId: requestTurnId,
+        expectedThreadRevision: requestRevision,
+      });
+      if (TERMINAL_TURN_STATES.has(cancellation.status)) {
+        // 重启后 Java 可能只落库终态而不再发送 live terminal；失效原 Thread 投影，等待权威读取补齐事实。
+        useTimelineStore.getState().requestThreadResync(requestThreadId);
+      }
     } catch {
       if (mountedRef.current) {
         setErrorsByThread((current) => ({

@@ -11,6 +11,7 @@ export type {
   TaskResumePort,
   TaskThreadRenamePort,
   TaskTranscriptPort,
+  TaskPreferencesPort,
 } from "./application/ports";
 export { publishTaskHostEvent, subscribeTaskHostEvents } from "./application/taskEventBus";
 export type {
@@ -19,6 +20,7 @@ export type {
   TaskHostEvent,
   TaskKind,
   TaskReadModel,
+  TaskThreadSummary,
   TaskSummary,
 } from "./domain/taskModel";
 export {

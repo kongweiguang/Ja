@@ -115,9 +115,10 @@ public final class ManualContextCompactionService implements ContextCompactionUs
              TurnToolSessionFactory.Session mcp = runtime.toolSessions().open(cancellation)) {
             List<AgentTool> tools = new ArrayList<>(runtime.tools());
             tools.addAll(mcp.tools());
-            List<ToolSpec> specs = tools.stream().map(AgentTool::spec).toList();
+            List<AgentTool> catalog = mapper.toolCatalog(tools);
+            List<ToolSpec> specs = catalog.stream().map(AgentTool::spec).toList();
             AgentPromptSession.PreparedPrompt initial = runtime.promptSession().prepare("", specs);
-            ContextTokenMeter meter = meter(runtime, specs, cancellation, snapshot.threadId());
+            ContextTokenMeter meter = meter(runtime, catalog, cancellation, snapshot.threadId());
             ContextOrchestrator orchestrator = contexts.create(new SummaryModel.TurnBinding(
                     snapshot.threadId(), runtime.model(), requestedAt.plus(runtime.limits().wallTimeout()),
                     cancellation));
@@ -154,13 +155,14 @@ public final class ManualContextCompactionService implements ContextCompactionUs
     }
 
     /**
-     * 构造用于纯本地预算估算的完整 Provider envelope，并复用真实发送的附件双门。
+     * 构造用于纯本地预算估算的 Provider envelope，复用真实发送的附件双门和按需工具投影，
+     * 避免手动压缩把从未暴露的 MCP Schema 误算成上下文占用。
      */
-    private ContextTokenMeter meter(RuntimeLease runtime, List<ToolSpec> tools,
+    private ContextTokenMeter meter(RuntimeLease runtime, List<AgentTool> tools,
                                     CancellationToken cancellation, String threadId) {
         return (messages, summary, continuation, localCompaction) -> {
             AgentPromptSession.PreparedPrompt prepared = runtime.promptSession()
-                    .prepare(summary.toPromptText(), tools);
+                    .prepare(summary.toPromptText(), tools.stream().map(AgentTool::spec).toList());
             ContextOrchestrator.PreparedPrompt context = new ContextOrchestrator.PreparedPrompt(
                     messages, summary, 0, continuation, localCompaction);
             ModelPort.ModelRequest request = mapper.toModelRequest(

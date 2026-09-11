@@ -64,27 +64,12 @@ export function taskWorkbenchTab(input: {
   };
 }
 
-/** 草稿获得进程期 identity，但没有 taskThreadId，因此空白 Tab 不可能触发后端持久化。 */
-export function sideTaskDraftWorkbenchTab(rootThreadId: string, draftId: string): WorkbenchTaskTab {
-  return {
-    kind: "task",
-    key: `side-task:draft_${draftId}`,
-    taskKind: "side_task",
-    rootThreadId,
-    label: "新侧边任务",
-  };
-}
-
-/** Task key 解析只接受协议 Thread ID 或本地 draft ID，损坏偏好不会生成可调用后端的身份。 */
+/** Task key 只接受已创建的 Thread identity，空白侧边会话也必须由服务端持久化。 */
 export function parseTaskWorkbenchTabKey(
   key: string,
 ): { taskKind: WorkbenchTaskKind; taskThreadId?: string } | undefined {
-  const match =
-    /^(side-task|subagent):(thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}|draft_[A-Za-z0-9-]{8,64})$/u.exec(
-      key,
-    );
+  const match = /^(side-task|subagent):(thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95})$/u.exec(key);
   if (match === null) return undefined;
-  if (match[1] === "subagent" && match[2]?.startsWith("draft_")) return undefined;
   return {
     taskKind: match[1] === "side-task" ? "side_task" : "subagent",
     ...(match[2]?.startsWith("thr_") ? { taskThreadId: match[2] } : {}),

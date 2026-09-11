@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SubagentPolicyMapper">
+  <resultMap id="policyRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SubagentPolicyRow">
+    <constructor>
+      <arg column="thread_id" javaType="string"/><arg column="enabled" javaType="_boolean"/>
+      <arg column="provider_id" javaType="string"/><arg column="model_id" javaType="string"/>
+      <arg column="reasoning_level" javaType="string"/>
+      <arg column="created_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <select id="select" resultMap="policyRow">
+    SELECT thread_id,enabled,provider_id,model_id,reasoning_level,created_at
+    FROM thread_subagent_policies WHERE thread_id=#{threadId}
+  </select>
+  <insert id="insert">
+    INSERT INTO thread_subagent_policies(thread_id,enabled,provider_id,model_id,reasoning_level,created_at)
+    VALUES(#{threadId},#{enabled},#{providerId},#{modelId},#{reasoningLevel},#{createdAt})
+  </insert>
+</mapper>

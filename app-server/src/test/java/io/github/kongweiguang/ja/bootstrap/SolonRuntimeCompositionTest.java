@@ -50,6 +50,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证 Bean 实例身份、AOT 隔离、部分启动清理和幂等逆序关闭。 */
 final class SolonRuntimeCompositionTest {
+    /** 准入前预算穿过真实延迟代理，但不得触发尚无 Plan binding 的完整租约解析。 */
+    @Test
+    void deferredResolverForwardsBudgetWithoutPreparingTools() {
+        var deferred = new SolonRuntimeComposition.DeferredTurnRuntimeResolver();
+        var expected = io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits.defaults();
+        deferred.bind(new TurnRuntimeResolver() {
+            /** 工具解析若被调用即重现 Plan execute 的循环准入依赖。 */
+            @Override public io.github.kongweiguang.ja.conversation.port.out.RuntimeLease resolve(
+                    io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest request) {
+                throw new AssertionError("pre-admission must not prepare tools");
+            }
+            /** 本场景只验证预算委派，绝不启动工作区预热。 */
+            @Override public void prepareWorkspace(Path root) { throw new AssertionError("unexpected warmup"); }
+            /** 配置预算作为已冻结值原样返回，不能经完整租约构造。 */
+            @Override public io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits resolveLimits(
+                    io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest request) { return expected; }
+        });
+        assertSame(expected, deferred.resolveLimits(null));
+    }
+
     /** 启动真实组合根，锁定唯一核心实例与显式能力装配，避免仅测试局部工厂而漏掉生产接线。 */
     @Test
     void solonPublishesOneCoreRuntimeGeneration() throws Exception {

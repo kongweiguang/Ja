@@ -58,33 +58,50 @@ const methods = [
   "thread/restore",
   "thread/delete",
   "thread/compact",
+  "interaction/read",
+  "interaction/observe",
+  "interaction/unobserve",
+  "interaction/draft/save",
+  "interaction/respond",
+  "interaction/cancel",
   "goal/read",
   "goal/events/read",
   "goal/observe",
   "goal/unobserve",
   "plan/read",
   "plan/revisions/list",
+  "plan/current/read",
+  "plan/events/read",
+  "plan/observe",
+  "plan/unobserve",
+  "plan/evidence/list",
   "goal/evidence/list",
   "goal/create",
+  "goal/plan/attach",
+  "goal/plan/detach",
   "goal/pause",
   "goal/resume",
   "goal/stop",
-  "goal/input/respond",
+  "plan/create",
   "plan/draft/save",
   "plan/draft/discard",
   "plan/propose",
-  "plan/approve",
+  "plan/execute",
   "plan/reject",
+  "plan/pause",
+  "plan/resume",
+  "plan/stop",
   "task/create",
   "task/list",
   "task/read",
   "task/observe",
   "task/unobserve",
   "task/seen",
-  "task/message/send",
+  "thread/message/send",
   "task/followup",
   "task/cancel",
   "task/tree/delete",
+  "task/close",
   "attachment/import",
   "attachment/discard",
   "attachment/preview/open",
@@ -117,6 +134,7 @@ const events = [
   "turn/state-changed",
   "turn/input-queue-changed",
   "turn/input-consumed",
+  "turn/messages_received",
   "assistant/model-step-committed",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",
@@ -136,7 +154,8 @@ const events = [
   "task/mailbox-changed",
   "goal/changed",
   "goal/activity",
-  "goal/input-requested",
+  "interaction/changed",
+  "plan/changed",
 ];
 
 /** Reads one mandatory environment value without ever including its value in an error. */
@@ -480,6 +499,7 @@ export class JsonlSession {
       `--data-dir-base64=${encodedDirectory(directories.data)}`,
       `--run-dir-base64=${encodedDirectory(directories.run)}`,
       `--log-dir-base64=${encodedDirectory(directories.logs)}`,
+      "--ja-runtime-generation=1",
     ];
     this.apiKey = apiKey;
     this.endpoint = endpoint;
@@ -716,7 +736,8 @@ export function assertDirectProviderCapabilities(capabilities) {
     JSON.stringify(capabilities.accessModes) !==
       JSON.stringify(["approval_required", "full_access"]) ||
     JSON.stringify(capabilities.collaborationModes) !== JSON.stringify(["default", "plan"]) ||
-    JSON.stringify(capabilities.features) !== JSON.stringify(["task_threads_v1", "plan_goal_v1"])
+    JSON.stringify(capabilities.features) !==
+      JSON.stringify(["task_threads_v1", "plan_goal_v1", "interaction_v1"])
   ) {
     throw new Error("direct provider capabilities do not match JA-RPC v1");
   }
@@ -730,7 +751,7 @@ export function initializeParams() {
     events: [...events],
     accessModes: ["approval_required", "full_access"],
     collaborationModes: ["default", "plan"],
-    features: ["task_threads_v1", "plan_goal_v1"],
+    features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
   });
   return {
     protocolMajor: 1,

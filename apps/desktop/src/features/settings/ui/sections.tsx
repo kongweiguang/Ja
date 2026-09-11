@@ -1,9 +1,9 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Shield } from "lucide-react";
 import { useState, type CSSProperties } from "react";
 import { toast } from "sonner";
+import { Button } from "@/shared/ui/primitives";
 import {
   UI_PALETTE_LABELS,
   UI_PALETTE_ORDER,
@@ -13,10 +13,17 @@ import {
   type UiPalette,
 } from "../domain/types";
 import type { SettingsPorts } from "../application/ports";
+import type { SettingsDesktopPort } from "../application/ports";
+import type { SettingsInterfacePreferences } from "../application/ports";
+import { SendShortcutField, TypographyFields } from "./InterfacePreferencesFields";
+import { WindowCloseField } from "./WindowCloseField";
+import { ExecutionScopeDetails } from "./ExecutionScopeDetails";
+import type { ExecutionScope } from "../domain/executionScope";
 import {
   Field,
   SectionHeader,
   settingsMutationErrorMessage,
+  SettingsGroup,
   SettingsSelect,
   SwitchField,
   themeOptions,
@@ -29,7 +36,8 @@ export interface DesktopNotificationPreference {
 
 const PALETTE_SWATCHES: Readonly<Record<UiPalette, readonly [string, string, string]>> = {
   xcode: ["#f5f5f5", "#292a30", "#007aff"],
-  fleet: ["#f2f2f2", "#18191b", "#726cf9"],
+  ja: ["#f2f2f2", "#18191b", "#726cf9"],
+  jetbrains: ["#e9eaee", "#191a1c", "#3871e1"],
   obsidian: ["#f6f6f6", "#242424", "#9873f7"],
   claude: ["#f5f4ed", "#1a1918", "#d97757"],
 };
@@ -65,11 +73,16 @@ const paletteOptions = UI_PALETTE_ORDER.map((palette) => ({
 export function PermissionsSection({
   mode: initialMode,
   onChange,
+  scope,
 }: {
   mode: AccessMode;
   onChange: SettingsPorts["onAccessModeChange"];
+  scope: ExecutionScope;
 }): React.ReactElement {
   const mode = initialMode;
+  const [pending, setPending] = useState(false);
+  const [failedMode, setFailedMode] = useState<AccessMode>();
+  const [feedback, setFeedback] = useState<string>();
   const choices: ReadonlyArray<{ value: AccessMode; label: string; description: string }> = [
     {
       value: "full_access",
@@ -85,11 +98,20 @@ export function PermissionsSection({
 
   /** 直接等待 Java owner 保存后由父级快照刷新，避免局部乐观状态与配置代际分叉。 */
   const change = async (next: AccessMode): Promise<void> => {
+    if (pending || next === mode) return;
+    setPending(true);
+    setFailedMode(undefined);
+    setFeedback(undefined);
     try {
       await onChange(next);
       toast.success("权限模式已保存");
     } catch (error) {
-      toast.error(settingsMutationErrorMessage(error, "权限模式保存失败"));
+      const message = settingsMutationErrorMessage(error, "权限模式保存失败，请重试。");
+      setFailedMode(next);
+      setFeedback(message);
+      toast.error(message);
+    } finally {
+      setPending(false);
     }
   };
 
@@ -101,74 +123,76 @@ export function PermissionsSection({
       tabIndex={-1}
     >
       <SectionHeader title="执行确认" />
-      <fieldset className="ja-settings-permission-group">
-        <legend>工具执行方式</legend>
-        {choices.map((choice) => (
-          <label
-            className={`ja-settings-permission-card${mode === choice.value ? " is-selected" : ""}`}
-            data-setting-search={`${choice.label} ${choice.description} ${choice.value}`}
-            tabIndex={-1}
-            key={choice.value}
-          >
-            <input
-              type="radio"
-              name="ja-permission-mode"
-              value={choice.value}
-              checked={mode === choice.value}
-              onChange={() => void change(choice.value)}
-            />
-            <span className="ja-settings-radio" aria-hidden="true" />
-            <span>
-              <strong>{choice.label}</strong>
-              <small>{choice.description}</small>
-            </span>
-          </label>
-        ))}
-      </fieldset>
-      <div className="ja-settings-callout">
-        <Shield size={16} aria-hidden="true" />
-        <span>
-          <strong>“全部执行”会跳过确认。</strong>Agent 将继承 Ja 桌面进程当前账户的文件和命令权限。
-        </span>
-      </div>
+      <SettingsGroup title="工具执行方式">
+        <fieldset
+          className="ja-settings-permission-group"
+          aria-label="工具执行方式"
+          aria-busy={pending}
+        >
+          {choices.map((choice) => (
+            <label
+              className={`ja-settings-permission-card${mode === choice.value ? " is-selected" : ""}`}
+              data-setting-search={`${choice.label} ${choice.description} ${choice.value}`}
+              tabIndex={-1}
+              key={choice.value}
+            >
+              <input
+                type="radio"
+                name="ja-permission-mode"
+                value={choice.value}
+                checked={mode === choice.value}
+                disabled={pending}
+                onChange={() => void change(choice.value)}
+              />
+              <span className="ja-settings-radio" aria-hidden="true" />
+              <span>
+                <strong>{choice.label}</strong>
+                <small>{choice.description}</small>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      </SettingsGroup>
+      {feedback === undefined ? null : (
+        <div className="ja-settings-form-actions">
+          <p className="ja-settings-feedback" role="status">
+            {feedback}
+          </p>
+          {failedMode === undefined ? null : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void change(failedMode)}
+              disabled={pending}
+            >
+              重试
+            </Button>
+          )}
+        </div>
+      )}
+      <ExecutionScopeDetails scope={scope} />
     </div>
   );
 }
 
-/** Appearance 值只属于本地 UI preference；类型化回调不会进入 App Server 配置保存链。 */
-export function AppearanceSection({
-  appearance,
-  onChange,
+/** 通用页承接应用行为；通知继续通过既有原生权限端口保存，不混入外观或 Agent 配置。 */
+export function GeneralSection({
   desktopNotifications,
+  desktop,
+  interfacePreferences,
+  clarificationEnabled,
+  onClarificationEnabledChange,
 }: {
-  appearance: AppearanceSettings;
-  onChange: SettingsPorts["onAppearanceChange"];
   desktopNotifications?: DesktopNotificationPreference;
+  desktop: SettingsDesktopPort;
+  interfacePreferences: SettingsInterfacePreferences;
+  clarificationEnabled: boolean;
+  onClarificationEnabledChange: SettingsPorts["onClarificationEnabledChange"];
 }): React.ReactElement {
-  const [pending, setPending] = useState<keyof AppearanceSettings>();
   const [notificationPending, setNotificationPending] = useState(false);
   const [feedback, setFeedback] = useState<string>();
-
-  /**
-   * 更新单个字段时仍向 Host 提交完整 Snapshot；持久化失败不会回滚已经生效的会话主题，
-   * 因而错误反馈必须如实区分“未保存”与“未应用”。
-   */
-  const update = async <K extends keyof AppearanceSettings>(
-    key: K,
-    value: AppearanceSettings[K],
-  ): Promise<void> => {
-    const next = { ...appearance, [key]: value };
-    setPending(key);
-    setFeedback(undefined);
-    try {
-      await onChange(next, key);
-    } catch {
-      setFeedback("已应用但未保存，请检查本地存储后重试。");
-      toast.error("外观已应用但未保存");
-    } finally {
-      setPending(undefined);
-    }
-  };
+  const [clarificationPending, setClarificationPending] = useState(false);
 
   /** 仅在 OS 接受显式启用请求后持久化偏好；关闭属于本地动作，不重复提示或打开系统设置。 */
   const updateDesktopNotifications = async (enabled: boolean): Promise<void> => {
@@ -194,19 +218,113 @@ export function AppearanceSection({
     }
   };
 
+  /** 保存失败保留服务端快照，由 controller 重读恢复真实状态，避免开关与权限状态漂移。 */
+  const updateClarification = async (enabled: boolean): Promise<void> => {
+    setClarificationPending(true);
+    try {
+      await onClarificationEnabledChange(enabled);
+      toast.success(enabled ? "交互澄清已开启" : "交互澄清已关闭");
+    } catch {
+      toast.error("交互澄清设置保存失败");
+    } finally {
+      setClarificationPending(false);
+    }
+  };
+
+  return (
+    <div className="ja-settings-section">
+      <SectionHeader title="通用" />
+      <SettingsGroup title="应用行为">
+        <WindowCloseField desktop={desktop} />
+        <SendShortcutField
+          interfacePreferences={interfacePreferences}
+          onChange={interfacePreferences.onChange}
+        />
+      </SettingsGroup>
+      <SettingsGroup title="助手交互">
+        <SwitchField
+          id="general-clarification"
+          label="交互澄清"
+          checked={clarificationEnabled ?? true}
+          onCheckedChange={(checked) => void updateClarification(checked)}
+          hint="普通模式下确认关键偏好。Plan 始终可澄清，执行审批不受影响。"
+          disabled={clarificationPending}
+          settingId="general-clarification"
+        />
+      </SettingsGroup>
+      {desktopNotifications === undefined ? null : (
+        <SettingsGroup title="通知">
+          <SwitchField
+            id="general-notifications"
+            label="桌面通知"
+            checked={desktopNotifications.enabled}
+            onCheckedChange={(checked) => void updateDesktopNotifications(checked)}
+            hint="默认关闭；窗口失焦或后台时提示完成、失败和待确认，不包含对话正文。"
+            disabled={notificationPending}
+            settingId="general-notifications"
+          />
+        </SettingsGroup>
+      )}
+      {feedback === undefined ? null : (
+        <p className="ja-settings-feedback" role="status">
+          {feedback}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Appearance 值只属于本地 UI preference；类型化回调不会进入 App Server 配置保存链。 */
+export function AppearanceSection({
+  appearance,
+  onChange,
+  interfacePreferences,
+}: {
+  appearance: AppearanceSettings;
+  onChange: SettingsPorts["onAppearanceChange"];
+  interfacePreferences: SettingsInterfacePreferences;
+}): React.ReactElement {
+  const [pending, setPending] = useState<keyof AppearanceSettings>();
+  const [feedback, setFeedback] = useState<string>();
+  const [failedUpdate, setFailedUpdate] = useState<{
+    key: keyof AppearanceSettings;
+    value: AppearanceSettings[keyof AppearanceSettings];
+  }>();
+
+  /** 保存失败不回滚已应用的会话外观，反馈必须区分未保存与未应用。 */
+  const update = async <K extends keyof AppearanceSettings>(
+    key: K,
+    value: AppearanceSettings[K],
+  ): Promise<void> => {
+    const next = { ...appearance, [key]: value };
+    setPending(key);
+    setFeedback(undefined);
+    setFailedUpdate(undefined);
+    try {
+      await onChange(next, key);
+    } catch {
+      setFeedback("已应用但未保存，请检查本地存储后重试。");
+      setFailedUpdate({ key, value });
+      toast.error("外观已应用但未保存");
+    } finally {
+      setPending(undefined);
+    }
+  };
+
   return (
     <div
       className="ja-settings-section"
       data-setting-id="appearance-theme"
-      data-setting-search="主题 配色 外观 动效 透明度 对比度 桌面通知 Xcode Fleet Obsidian Claude"
+      data-setting-search="主题 配色 外观 动效 透明度 对比度 Xcode Ja JetBrains Obsidian Claude"
       tabIndex={-1}
     >
       <SectionHeader title="外观" />
-      <div className="ja-settings-form-grid">
+      <SettingsGroup title="主题">
         <Field
           id="appearance-theme"
           label="外观模式"
           hint="跟随系统会随 Windows 的浅色或深色外观自动切换。"
+          layout="row"
         >
           <SettingsSelect
             id="appearance-theme"
@@ -217,7 +335,12 @@ export function AppearanceSection({
             disabled={pending !== undefined}
           />
         </Field>
-        <Field id="appearance-palette" label="配色主题" hint="只改变色彩气质，明暗由外观模式控制。">
+        <Field
+          id="appearance-palette"
+          label="配色主题"
+          hint="只改变色彩气质，明暗由外观模式控制。"
+          layout="row"
+        >
           <SettingsSelect
             id="appearance-palette"
             value={appearance.palette}
@@ -227,8 +350,14 @@ export function AppearanceSection({
             disabled={pending !== undefined}
           />
         </Field>
-      </div>
-      <div className="ja-settings-switch-list">
+      </SettingsGroup>
+      <SettingsGroup title="文字">
+        <TypographyFields
+          interfacePreferences={interfacePreferences}
+          onChange={interfacePreferences.onChange}
+        />
+      </SettingsGroup>
+      <SettingsGroup title="辅助功能">
         <SwitchField
           id="appearance-motion"
           label="减少动效"
@@ -236,6 +365,7 @@ export function AppearanceSection({
           onCheckedChange={(checked) => void update("reducedMotion", checked)}
           hint="保留状态变化，同时减少位移与过渡。"
           disabled={pending !== undefined}
+          settingId="appearance-motion"
         />
         <SwitchField
           id="appearance-transparency"
@@ -244,6 +374,7 @@ export function AppearanceSection({
           onCheckedChange={(checked) => void update("reducedTransparency", checked)}
           hint="使用不透明材质和更清晰的边界。"
           disabled={pending !== undefined}
+          settingId="appearance-transparency"
         />
         <SwitchField
           id="appearance-contrast"
@@ -252,22 +383,29 @@ export function AppearanceSection({
           onCheckedChange={(checked) => void update("highContrast", checked)}
           hint="增强边框和焦点提示。"
           disabled={pending !== undefined}
+          settingId="appearance-contrast"
         />
-        {desktopNotifications === undefined ? null : (
-          <SwitchField
-            id="appearance-notifications"
-            label="桌面通知"
-            checked={desktopNotifications.enabled}
-            onCheckedChange={(checked) => void updateDesktopNotifications(checked)}
-            hint="默认关闭；只在窗口失焦或后台时提示完成、失败和待确认，不包含对话内容。"
-            disabled={notificationPending}
-          />
-        )}
-      </div>
+      </SettingsGroup>
       {feedback === undefined ? null : (
-        <p className="ja-settings-feedback" role="status">
-          {feedback}
-        </p>
+        <div className="ja-settings-form-actions">
+          <p className="ja-settings-feedback" role="status">
+            {feedback}
+          </p>
+          {failedUpdate === undefined ? null : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                const retry = failedUpdate;
+                void update(retry.key, retry.value as never);
+              }}
+              disabled={pending !== undefined}
+            >
+              重试
+            </Button>
+          )}
+        </div>
       )}
     </div>
   );

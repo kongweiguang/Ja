@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper">
+    <resultMap id="interaction" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionRow">
+        <constructor>
+            <idArg column="request_id" javaType="String"/>
+            <arg column="thread_id" javaType="String"/>
+            <arg column="turn_id" javaType="String"/>
+            <arg column="tool_call_id" javaType="String"/>
+            <arg column="plan_revision_id" javaType="String"/>
+            <arg column="run_id" javaType="String"/>
+            <arg column="goal_id" javaType="String"/>
+            <arg column="idempotency_key" javaType="String"/>
+            <arg column="questions_json" javaType="String"/>
+            <arg column="status" javaType="String"/>
+            <arg column="answers_json" javaType="String"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="created_at" javaType="String"/>
+            <arg column="updated_at" javaType="String"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="draft" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionDraftRow">
+        <constructor>
+            <idArg column="thread_id" javaType="String"/>
+            <arg column="request_id" javaType="String"/>
+            <arg column="answers_json" javaType="String"/>
+            <arg column="page" javaType="_int"/>
+            <arg column="collapsed" javaType="_boolean"/>
+            <arg column="idempotency_key" javaType="String"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="updated_at" javaType="String"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="event" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionEventRow">
+        <constructor>
+            <idArg column="event_sequence" javaType="_long"/>
+            <arg column="thread_id" javaType="String"/>
+            <arg column="request_id" javaType="String"/>
+            <arg column="request_revision" javaType="_long"/>
+            <arg column="kind" javaType="String"/>
+            <arg column="occurred_at" javaType="String"/>
+        </constructor>
+    </resultMap>
+
+    <select id="selectInteraction" resultMap="interaction">
+        SELECT request_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,goal_id,idempotency_key,
+               questions_json,status,answers_json,revision,created_at,updated_at
+        FROM interaction_requests WHERE thread_id=#{threadId} AND request_id=#{requestId}
+    </select>
+    <select id="selectActiveInteraction" resultMap="interaction">
+        SELECT request_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,goal_id,idempotency_key,
+               questions_json,status,answers_json,revision,created_at,updated_at
+        FROM interaction_requests
+        WHERE thread_id=#{threadId}
+        ORDER BY CASE WHEN status='PENDING' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1
+    </select>
+    <select id="selectTurnState" resultType="String">
+        SELECT state FROM turns WHERE turn_id=#{turnId}
+    </select>
+    <insert id="insertInteraction">
+        INSERT INTO interaction_requests(request_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,goal_id,
+            idempotency_key,questions_json,status,answers_json,revision,created_at,updated_at)
+        VALUES(#{requestId},#{threadId},#{turnId},#{toolCallId},#{planRevisionId},#{runId},#{goalId},#{idempotencyKey},
+            #{questionsJson},#{status},#{answersJson},#{revision},#{createdAt},#{updatedAt})
+    </insert>
+    <update id="answerInteraction">
+        UPDATE interaction_requests SET answers_json=#{answersJson},status=#{status},revision=revision+1,
+               idempotency_key=#{idempotencyKey},updated_at=#{occurredAt}
+        WHERE thread_id=#{threadId} AND request_id=#{requestId} AND status='PENDING' AND revision=#{expectedRevision}
+    </update>
+    <update id="closeInteraction">
+        UPDATE interaction_requests SET status=#{status},revision=revision+1,idempotency_key=#{idempotencyKey},
+               updated_at=#{occurredAt}
+        WHERE thread_id=#{threadId} AND request_id=#{requestId} AND status='PENDING' AND revision=#{expectedRevision}
+    </update>
+    <insert id="insertEvent">
+        INSERT INTO interaction_events(thread_id,request_id,request_revision,kind,occurred_at)
+        VALUES(#{threadId},#{requestId},#{requestRevision},#{kind},#{occurredAt})
+    </insert>
+    <select id="selectDraft" resultMap="draft">
+        SELECT thread_id,request_id,answers_json,page,collapsed,idempotency_key,revision,updated_at
+        FROM interaction_drafts WHERE thread_id=#{threadId} AND request_id=#{requestId}
+    </select>
+    <insert id="saveDraft">
+        INSERT INTO interaction_drafts(thread_id,request_id,answers_json,page,collapsed,idempotency_key,revision,updated_at)
+        VALUES(#{threadId},#{requestId},#{answersJson},#{page},#{collapsed},#{idempotencyKey},#{expectedRevision}+1,#{occurredAt})
+        ON CONFLICT(request_id) DO UPDATE SET answers_json=excluded.answers_json,page=excluded.page,
+            collapsed=excluded.collapsed,idempotency_key=excluded.idempotency_key,revision=excluded.revision,
+            updated_at=excluded.updated_at
+        WHERE interaction_drafts.revision=#{expectedRevision}
+    </insert>
+    <select id="selectCurrentEventSequence" resultType="long">
+        SELECT MAX(event_sequence) FROM interaction_events WHERE thread_id=#{threadId}
+    </select>
+    <select id="selectEvents" resultMap="event">
+        SELECT event_sequence,thread_id,request_id,request_revision,kind,occurred_at
+        FROM interaction_events WHERE thread_id=#{threadId} AND event_sequence&gt;#{afterSequence}
+        ORDER BY event_sequence ASC
+    </select>
+</mapper>

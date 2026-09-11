@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatMapper">
+    <resultMap id="marker" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$SideChatMarkerRow">
+        <constructor>
+            <idArg column="thread_id" javaType="String"/>
+            <arg column="state" javaType="String"/>
+        </constructor>
+    </resultMap>
+
+    <insert id="insertOpen">
+        INSERT INTO temporary_side_chats(thread_id,state)
+        VALUES(#{threadId},'OPEN')
+    </insert>
+
+    <select id="selectMarker" resultMap="marker">
+        SELECT thread_id,state FROM temporary_side_chats WHERE thread_id=#{threadId}
+    </select>
+
+    <select id="selectMarkers" resultMap="marker">
+        SELECT c.thread_id,c.state
+        FROM temporary_side_chats c
+        JOIN thread_lineage l ON l.child_thread_id=c.thread_id
+        WHERE l.task_kind='SIDE_TASK' AND l.lifecycle='INDEPENDENT'
+        ORDER BY c.thread_id
+    </select>
+
+    <select id="selectSubtreeThreadIds" resultType="string">
+        WITH RECURSIVE tree(thread_id,depth) AS (
+            SELECT thread_id,0 FROM temporary_side_chats WHERE thread_id=#{threadId}
+            UNION ALL
+            SELECT l.child_thread_id,t.depth+1
+            FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        SELECT thread_id FROM tree ORDER BY depth,thread_id
+    </select>
+
+    <update id="markSubtreeClosing">
+        WITH RECURSIVE tree(thread_id) AS (
+            SELECT thread_id FROM temporary_side_chats WHERE thread_id=#{threadId}
+            UNION ALL
+            SELECT l.child_thread_id FROM thread_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        UPDATE temporary_side_chats SET state='CLOSING'
+        WHERE thread_id IN (SELECT thread_id FROM tree) AND state='OPEN'
+    </update>
+
+    <select id="selectClosingOwner" resultType="string">
+        WITH RECURSIVE ancestors(thread_id) AS (
+            SELECT #{threadId}
+            UNION ALL
+            SELECT l.parent_thread_id
+            FROM thread_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id
+        )
+        SELECT c.thread_id FROM temporary_side_chats c JOIN ancestors a ON a.thread_id=c.thread_id
+        WHERE c.state='CLOSING' ORDER BY c.thread_id LIMIT 1
+    </select>
+
+    <delete id="deleteOrphanMarkers">
+        DELETE FROM temporary_side_chats
+        WHERE NOT EXISTS (SELECT 1 FROM threads WHERE threads.thread_id=temporary_side_chats.thread_id)
+    </delete>
+
+    <delete id="deleteClosedMarker">
+        DELETE FROM temporary_side_chats
+        WHERE thread_id=#{threadId} AND state='CLOSING'
+    </delete>
+</mapper>

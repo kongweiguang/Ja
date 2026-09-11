@@ -14,6 +14,7 @@
 .ja-terminal-panel .xterm {
   height: 100%;
   padding: 0.3rem;
+  font-size: var(--ja-code-font-size);
 }
 .ja-terminal-panel .xterm-screen {
   min-width: 0;

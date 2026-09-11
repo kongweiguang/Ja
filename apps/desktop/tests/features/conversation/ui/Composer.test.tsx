@@ -114,6 +114,32 @@ async function chooseReasoning(user: ReturnType<typeof userEvent.setup>, option:
 describe("Composer", () => {
   afterEach(() => cleanup());
 
+  /** 原始草稿身份由 controller 比对后清空；UI 提前 trim 会让尾换行草稿永远留在输入框。 */
+  it.each(["enter", "modifier-enter"] as const)(
+    "%s 发送保留原始草稿供精确清空",
+    async (sendShortcut) => {
+      const user = userEvent.setup();
+      const onSend = vi.fn();
+      render(
+        <ControlledComposerHarness
+          preferences={PREFERENCES}
+          models={MODELS}
+          initialText={"  保留原始草稿\n"}
+          sendShortcut={sendShortcut}
+          onSend={onSend}
+        />,
+      );
+      const input = screen.getByRole("textbox", { name: "消息" });
+      await user.click(input);
+      await user.keyboard(sendShortcut === "enter" ? "{Enter}" : "{Control>}{Enter}{/Control}");
+      expect(onSend).toHaveBeenCalledWith({
+        text: "  保留原始草稿\n",
+        attachmentIds: [],
+        contextReferences: [],
+      });
+    },
+  );
+
   it("按 Provider 分组选择模型并只提交文本与受管附件 identity", async () => {
     const user = userEvent.setup();
     const submit = vi.fn<(request: ComposerSubmit) => void>();
@@ -171,7 +197,7 @@ describe("Composer", () => {
     );
 
     expect(screen.getByRole("button", { name: /claude-sonnet-4-5/ })).toBeEnabled();
-    await chooseReasoning(user, "高");
+    await chooseReasoning(user, "高 (high)");
     expect(reasoningChange).toHaveBeenCalledWith("high");
     await chooseModel(user, "gpt-5.6-sol");
     expect(modelChange).toHaveBeenCalledWith("openai-gpt");
@@ -296,6 +322,24 @@ describe("Composer", () => {
     expect(submit).not.toHaveBeenCalled();
     fireEvent.compositionEnd(input);
     fireEvent.keyDown(input, { key: "Enter" });
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
+  it("modifier-enter 模式保留 Enter 换行，并让 Ctrl+Enter 发送普通与排队消息", () => {
+    const submit = vi.fn<(request: ComposerSubmit) => void>();
+    render(
+      <ControlledComposerHarness
+        initialText="第一行"
+        sendShortcut="modifier-enter"
+        preferences={PREFERENCES}
+        models={MODELS}
+        onSend={submit}
+      />,
+    );
+    const input = screen.getByRole("textbox", { name: "消息" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(submit).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
     expect(submit).toHaveBeenCalledOnce();
   });
 
@@ -1534,7 +1578,7 @@ describe("Composer", () => {
       />,
     );
 
-    expect(screen.getByText("运行被中断")).toBeVisible();
+    expect(screen.getByText("已暂停")).toBeVisible();
     expect(screen.queryByRole("combobox", { name: "消息队列" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "发送" })).not.toBeInTheDocument();
     const input = screen.getByRole("textbox", { name: "消息" });

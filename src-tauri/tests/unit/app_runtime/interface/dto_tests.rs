@@ -3,6 +3,25 @@
 
 use super::*;
 
+/// IPC 序列化必须保留活动根身份，否则前端严格校验会使真实侧聊 Composer 永久不可用。
+#[test]
+fn task_activity_dto_preserves_root_identity() {
+    let dto = TaskActivityDto::from(crate::app_runtime::domain::TaskActivity {
+        activity_sequence: 1,
+        activity_id: "activity_created".into(),
+        root_thread_id: "thr_source".into(),
+        task_thread_id: "thr_side".into(),
+        actor_thread_id: "thr_source".into(),
+        causal_turn_id: None,
+        kind: "created".into(),
+        summary: "已创建侧聊".into(),
+        created_at: "2026-09-10T00:00:00Z".into(),
+    });
+    let value = serde_json::to_value(dto).expect("activity DTO must serialize");
+    assert_eq!(value["rootThreadId"], "thr_source");
+    assert_eq!(value["taskThreadId"], "thr_side");
+}
+
 /// Interface DTO 必须拒绝已删除的 cancel 字段，不能把兼容输入带入纯领域模型。
 #[test]
 fn cancel_dto_rejects_unknown_and_legacy_fields() {
@@ -134,8 +153,7 @@ fn task_create_dto_is_exact_and_requires_nullable_parent_turn() {
         "parentThreadId": "thr_parent",
         "parentTurnId": null,
         "expectedParentRevision": 2,
-        "taskName": "检查测试",
-        "content": [{"type":"text","text":"检查"}]
+        "taskName": "检查测试"
     });
     assert!(serde_json::from_value::<TaskCreateInputDto>(valid.clone()).is_ok());
     let mut missing = valid.clone();

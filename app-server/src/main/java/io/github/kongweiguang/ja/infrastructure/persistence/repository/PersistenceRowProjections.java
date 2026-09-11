@@ -14,7 +14,7 @@ import java.util.Objects;
 /**
  * 集中恢复由多个仓储共同消费的持久化行值，避免同一 SQLite 事实在不同读取入口产生语义漂移。
  */
-final class PersistenceRowProjections {
+public final class PersistenceRowProjections {
     /** 纯投影器不允许实例化，确保它不持有 session、mapper 或可变事务状态。 */
     private PersistenceRowProjections() {
     }
@@ -22,7 +22,7 @@ final class PersistenceRowProjections {
     /**
      * 从 Thread 行恢复完整下一轮偏好；首版 schema 的必需列缺失即属于存储损坏。
      */
-    static ThreadPreferences threadPreferences(PersistenceRecords.ThreadRow row) {
+    public static ThreadPreferences threadPreferences(PersistenceRecords.ThreadRow row) {
         Objects.requireNonNull(row, "row");
         return new ThreadPreferences(requiredText(row.providerId(), "provider_id"),
                 requiredText(row.modelId(), "model_id"), row.reasoningLevel(),

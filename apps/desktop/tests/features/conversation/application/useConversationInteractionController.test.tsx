@@ -986,6 +986,154 @@ describe("useConversationInteractionController", () => {
       await pending;
     });
     expect(turnPort.cancelTurn).toHaveBeenCalledTimes(1);
+    expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+  });
+
+  /** 取消 ACK 已确认终态但没有 live event 时，只请求权威重读，不伪造 Timeline 终态。 */
+  it("终态取消 ACK 无事件时请求原 Thread 重读并保留非乐观状态", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_cancel_terminal",
+            status: "suspended",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockResolvedValue({
+      accepted: true,
+      turnId: "turn_cancel_terminal",
+      status: "cancelled",
+      threadRevision: 5,
+    });
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, modelPort)),
+    );
+
+    await act(async () => result.current.cancel());
+
+    expect(turnPort.cancelTurn).toHaveBeenCalledWith({
+      turnId: "turn_cancel_terminal",
+      expectedThreadRevision: 4,
+    });
+    expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(useTimelineStore.getState().turns["turn_cancel_terminal"]?.status).toBe("suspended");
+    expect(result.current.suspendedTurn).toBe(true);
+  });
+
+  /** 迟到 ACK 仍携带原始 Thread 身份，切换会话后不得让当前 Thread 进入重读态。 */
+  it("切换 Thread 后的终态取消 ACK 只失效原 Thread", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_cancel_late",
+            status: "suspended",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const cancellation = deferred<ConversationCancelResult>();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockImplementation(() => cancellation.promise);
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const initial = options(turnPort, modelPort);
+    const { result, rerender } = renderHook(
+      (props: ConversationInteractionOptions) => useConversationInteractionController(props),
+      { initialProps: initial },
+    );
+
+    let pending!: Promise<void>;
+    act(() => {
+      pending = result.current.cancel();
+    });
+    rerender(options(turnPort, modelPort, { threadId: "thr_two", workspaceId: "ws_two" }));
+    await act(async () => {
+      cancellation.resolve({
+        accepted: true,
+        turnId: "turn_cancel_late",
+        status: "cancelled",
+        threadRevision: 5,
+      });
+      await pending;
+    });
+
+    expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(useTimelineStore.getState().resyncRequired["thr_two"]).toBeUndefined();
+  });
+
+  /** 取消 RPC 失败不能制造重读或终态，错误必须留在当前 Thread 供用户重试。 */
+  it("取消失败时不标记成功且保留可见错误", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_cancel_failure",
+            status: "suspended",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockRejectedValueOnce(new Error("cancel failed"));
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, modelPort)),
+    );
+
+    await act(async () => result.current.cancel());
+
+    expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+    expect(useTimelineStore.getState().turns["turn_cancel_failure"]?.status).toBe("suspended");
+    expect(result.current.error).toBe("取消失败，请稍后重试。");
   });
 
   /**

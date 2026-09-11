@@ -49,6 +49,14 @@ final class TurnCancellationLifecycle {
      * 以调用方 revision 认领持久取消 CAS，再发布进程内 Token；重复调用复用首次 claim。
      */
     TurnUseCase.CancelResult cancel(String turnId, long expectedThreadRevision) {
+        return cancel(turnId, expectedThreadRevision, "user cancelled");
+    }
+
+    /**
+     * 受控生命周期动作复用取消 CAS，但保留调用方原因，使 Plan pause 能在取消收口时
+     * 进入可恢复 SUSPENDED，而普通用户取消仍走不可逆 CANCELLED。
+     */
+    TurnUseCase.CancelResult cancel(String turnId, long expectedThreadRevision, String reason) {
         String normalized = requireTurnId(turnId);
         ActiveEntry entry = findActive(normalized);
         if (entry == null) {
@@ -57,10 +65,10 @@ final class TurnCancellationLifecycle {
         TurnOwnership turn = entry.turn();
         ConversationRepository.CancellationClaim claim = turn.cancellationClaim.get();
         if (claim == null || turn.cancellationExpectedThreadRevision != expectedThreadRevision) {
-            claim = claimCancellation(entry.key(), expectedThreadRevision, "user cancelled");
+            claim = claimCancellation(entry.key(), expectedThreadRevision, reason);
             rememberCancellation(turn, expectedThreadRevision, claim);
         }
-        dispatchCancellation(entry.key(), turn, "user cancelled");
+        dispatchCancellation(entry.key(), turn, reason);
         return new TurnUseCase.CancelResult(claim.accepted(), normalized, claim.status(),
                 claim.threadRevision());
     }

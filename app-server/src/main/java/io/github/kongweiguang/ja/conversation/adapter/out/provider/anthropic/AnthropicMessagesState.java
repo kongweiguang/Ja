@@ -8,9 +8,11 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderReasoningSupport;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderSseReader;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderStreamResult;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort.FinishReason;
@@ -26,11 +28,12 @@ import java.util.Map;
  * 负责事件顺序、usage 和 Tool 聚合的 Anthropic Messages 状态机。
  */
 final class AnthropicMessagesState {
+    private final ModelPort.ModelConfiguration configuration;
     private final Map<Long, ToolAccumulator> tools = new LinkedHashMap<>();
     private final Map<Long, BlockKind> openBlocks = new HashMap<>();
     private final List<ReadyTool> readyTools = new ArrayList<>();
     private final Map<Long, ThinkingAccumulator> thinking = new HashMap<>();
-    private final List<ObjectNode> privateBlocks = new ArrayList<>();
+    private final Map<Long, ObjectNode> redactedThinking = new HashMap<>();
     private long startInputTokens;
     private long startCacheCreationTokens;
     private long startCacheReadTokens;
@@ -41,6 +44,13 @@ final class AnthropicMessagesState {
     private boolean messageStarted;
     private boolean messageDeltaSeen;
     private boolean messageStopped;
+
+    /**
+     * 绑定不可变请求身份，使完整原生 thinking 只能被同一 Provider 配置回放。
+     */
+    AnthropicMessagesState(ModelPort.ModelConfiguration configuration) {
+        this.configuration = java.util.Objects.requireNonNull(configuration, "configuration");
+    }
 
     /**
      * 归约文档化的 Messages 事件并返回语义效果，不在状态迁移中执行外部 IO。
@@ -56,7 +66,7 @@ final class AnthropicMessagesState {
             case "message_start" -> messageStart(data);
             case "content_block_start" -> contentStart(data, effects);
             case "content_block_delta" -> contentDelta(data, effects);
-            case "content_block_stop" -> contentStop(requiredIndex(data));
+            case "content_block_stop" -> contentStop(requiredIndex(data), effects);
             case "message_delta" -> messageDelta(data);
             case "message_stop" -> messageStop();
             case "ping" -> {
@@ -95,7 +105,7 @@ final class AnthropicMessagesState {
     }
 
     /**
-     * 注册受限内容索引，并只把可公开的初始文本加入效果列表。
+     * 注册受限内容索引；thinking 的初始摘要可公开展示，但签名仍只留在状态机。
      */
     private void contentStart(JsonNode event, List<ModelPort.ModelEvent> effects) {
         requireStarted();
@@ -127,13 +137,17 @@ final class AnthropicMessagesState {
             if (!initial.isEmpty()) accumulator.setInitial(writeJson(initial));
             tools.put(index, accumulator);
         } else if (kind == BlockKind.THINKING) {
+            String initialThinking = optionalText(block, "thinking");
             thinking.put(index, new ThinkingAccumulator(
-                    optionalText(block, "thinking"), optionalText(block, "signature")));
+                    initialThinking, optionalText(block, "signature")));
+            if (!initialThinking.isEmpty()) {
+                effects.add(new ModelPort.ReasoningSummaryDelta(initialThinking));
+            }
         } else if (kind == BlockKind.REDACTED_THINKING) {
             ObjectNode value = AbstractStreamingModelAdapter.JSON.createObjectNode();
             value.put("type", "redacted_thinking");
             value.put("data", requiredText(block, "data", false));
-            privateBlocks.add(value);
+            redactedThinking.put(index, value);
         }
     }
 
@@ -176,7 +190,9 @@ final class AnthropicMessagesState {
                 ThinkingAccumulator accumulator = thinking.get(index);
                 if (accumulator == null) throw protocol("Anthropic omitted thinking metadata");
                 if ("thinking_delta".equals(type)) {
-                    accumulator.appendThinking(requiredText(delta, "thinking", true));
+                    String value = requiredText(delta, "thinking", true);
+                    accumulator.appendThinking(value);
+                    if (!value.isEmpty()) effects.add(new ModelPort.ReasoningSummaryDelta(value));
                 } else {
                     accumulator.appendSignature(requiredText(delta, "signature", true));
                 }
@@ -188,7 +204,7 @@ final class AnthropicMessagesState {
     /**
      * 完整组装 Tool 并私下保存；目录与 Schema 校验由 Runner 生成可恢复的 ToolResult。
      */
-    private void contentStop(long index) {
+    private void contentStop(long index, List<ModelPort.ModelEvent> effects) {
         requireStarted();
         BlockKind kind = openBlocks.remove(index);
         if (kind == null) {
@@ -197,20 +213,31 @@ final class AnthropicMessagesState {
         }
         ToolAccumulator tool = tools.remove(index);
         ThinkingAccumulator privateThinking = thinking.remove(index);
+        ObjectNode redacted = redactedThinking.remove(index);
         if (kind != BlockKind.TOOL) {
-            if (tool != null) throw protocol("Anthropic changed content block metadata");
+            if (tool != null || kind == BlockKind.REDACTED_THINKING && redacted == null) {
+                throw protocol("Anthropic changed content block metadata");
+            }
             if (kind == BlockKind.THINKING) {
                 if (privateThinking == null) throw protocol("Anthropic omitted thinking metadata");
-                privateBlocks.add(privateThinking.finish());
-            } else if (privateThinking != null) {
+                effects.add(reasoningBlockReady("thinking", privateThinking.finish()));
+            } else if (kind == BlockKind.REDACTED_THINKING) {
+                if (privateThinking != null) throw protocol("Anthropic changed thinking block metadata");
+                effects.add(reasoningBlockReady("redacted_thinking", redacted));
+            } else if (privateThinking != null || redacted != null) {
                 throw protocol("Anthropic changed thinking block metadata");
             }
             return;
         }
-        if (tool == null) throw protocol("Anthropic omitted Tool block metadata");
+        if (tool == null || privateThinking != null || redacted != null) {
+            throw protocol("Anthropic omitted Tool block metadata");
+        }
         JsonNode arguments = parseArguments(tool.arguments());
         JsonObject values = ProviderJsonValues.toObject(arguments);
-        readyTools.add(new ReadyTool(tool.id(), tool.name(), values, tool.ordinal()));
+        ReadyTool ready = new ReadyTool(tool.id(), tool.name(), values, tool.ordinal());
+        readyTools.add(ready);
+        effects.add(new ModelPort.ToolCallReady(
+                ready.id(), ready.name(), ready.arguments(), ready.ordinal()));
     }
 
     /**
@@ -228,7 +255,7 @@ final class AnthropicMessagesState {
         FinishReason reportedReason = mapFinishReason(reason);
         if (!readyTools.isEmpty() && reportedReason == FinishReason.STOP) {
             /* Anthropic-compatible 网关可能以 end_turn 结束完整 tool_use；块级元数据和 JSON 已在
-             * contentStop 验证，实际语义应由完整原生调用决定，并保留 thinking continuation。 */
+             * contentStop 验证，实际语义应由完整原生调用决定，reasoning 已随 assistant 内容块保存。 */
             finishReason = FinishReason.TOOL_CALLS;
         } else {
             finishReason = reportedReason;
@@ -267,20 +294,29 @@ final class AnthropicMessagesState {
      */
     ProviderStreamResult finish() {
         if (!messageStarted || !messageStopped || finishReason == null
-            || !openBlocks.isEmpty() || !tools.isEmpty() || !thinking.isEmpty()) {
+            || !openBlocks.isEmpty() || !tools.isEmpty() || !thinking.isEmpty()
+            || !redactedThinking.isEmpty()) {
             throw new ProviderProtocolException(
                     "STREAM_TRUNCATED", "Anthropic stream ended without explicit completion", true);
         }
         List<ModelPort.ModelEvent> effects = new ArrayList<>();
-        for (ReadyTool tool : readyTools) {
-            effects.add(new ModelPort.ToolCallReady(
-                    tool.id(), tool.name(), tool.arguments(), tool.ordinal()));
-        }
         if (usage != null) effects.add(new ModelPort.UsageEvent(usage));
-        ModelPort.Continuation continuation = !readyTools.isEmpty()
-                ? AnthropicMessagesContinuation.encode(privateBlocks) : null;
         return new ProviderStreamResult(
-                new ModelPort.ModelOutcome(finishReason, continuation, usage), effects);
+                new ModelPort.ModelOutcome(finishReason, null, usage), effects);
+    }
+
+    /**
+     * 只在原生内容块关闭后发布完整 opaque 块；签名和 redacted data 不进入公开文本或日志。
+     */
+    private ModelPort.ReasoningBlockReady reasoningBlockReady(String wireField, ObjectNode block) {
+        try {
+            String nativeJson = AbstractStreamingModelAdapter.JSON.writeValueAsString(block);
+            ReasoningContent content = ProviderReasoningSupport.capture(configuration, wireField, nativeJson);
+            return new ModelPort.ReasoningBlockReady(content);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException failure) {
+            throw new ProviderProtocolException(
+                    "PROVIDER_JSON", "Anthropic reasoning block could not be encoded", false);
+        }
     }
 
     /**
@@ -536,7 +572,7 @@ final class AnthropicMessagesState {
     }
 
     /**
-     * 有界累积普通 thinking 及其签名，既保证下一轮可原样续接，也阻止 Provider 无限占用内存。
+     * 有界累积原生 thinking 及其签名，既保证完整块可回放，也阻止 Provider 无限占用内存。
      */
     private static final class ThinkingAccumulator {
         private static final int MAX_PRIVATE_CHARACTERS = 4_000_000;
@@ -549,12 +585,12 @@ final class AnthropicMessagesState {
             append(this.signature, signature);
         }
 
-        /** 追加私有思考片段，但不生成任何公开 ModelEvent。 */
+        /** 累积 thinking 原文；公开展示由状态机以摘要增量事件单独发布。 */
         void appendThinking(String delta) {
             append(value, delta);
         }
 
-        /** 追加 Provider 签名片段，供下一轮 Messages 请求验证原生 thinking。 */
+        /** 追加 Provider 签名片段，供同身份下一次 Messages 请求验证原生 thinking。 */
         void appendSignature(String delta) {
             append(signature, delta);
         }
@@ -563,7 +599,7 @@ final class AnthropicMessagesState {
         ObjectNode finish() {
             if (signature.isEmpty()) {
                 throw new ProviderProtocolException(
-                        "ANTHROPIC_CONTINUATION", "Anthropic thinking signature is missing", false);
+                        "ANTHROPIC_REASONING", "Anthropic thinking signature is missing", false);
             }
             ObjectNode block = AbstractStreamingModelAdapter.JSON.createObjectNode();
             block.put("type", "thinking");
@@ -576,7 +612,7 @@ final class AnthropicMessagesState {
         private void append(StringBuilder target, String delta) {
             if ((long) value.length() + signature.length() + delta.length() > MAX_PRIVATE_CHARACTERS) {
                 throw new ProviderProtocolException(
-                        "ANTHROPIC_CONTINUATION", "Anthropic continuation state exceeds the limit", false);
+                        "ANTHROPIC_REASONING", "Anthropic reasoning state exceeds the limit", false);
             }
             target.append(delta);
         }
@@ -597,7 +633,7 @@ final class AnthropicMessagesState {
         TOOL,
 
         /**
-         * 仅用于 Provider 内部连续性的私有推理块。
+         * 仅以原生 opaque 块形式回放的 thinking 内容。
          */
         THINKING,
 

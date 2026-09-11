@@ -19,6 +19,7 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             "turn/state-changed",
             "turn/input-queue-changed",
             "turn/input-consumed",
+            "turn/messages_received",
             "assistant/model-step-committed",
             "assistant/text-delta",
             "assistant/reasoning-summary-delta",
@@ -38,7 +39,8 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             "task/mailbox-changed",
             "goal/changed",
             "goal/activity",
-            "goal/input-requested"
+            "interaction/changed",
+            "plan/changed"
         ]))
     );
     assert!(capabilities.get("itemKinds").is_none());
@@ -90,7 +92,7 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
     );
     assert_eq!(
         capabilities.get("features"),
-        Some(&serde_json::json!(["task_threads_v1", "plan_goal_v1"]))
+        Some(&serde_json::json!(["task_threads_v1", "plan_goal_v1", "interaction_v1"]))
     );
     assert_eq!(
         capabilities.get("collaborationModes"),
@@ -106,10 +108,11 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
         "task/observe",
         "task/unobserve",
         "task/seen",
-        "task/message/send",
+        "thread/message/send",
         "task/followup",
         "task/cancel",
         "task/tree/delete",
+        "task/close",
     ] {
         assert_eq!(
             methods

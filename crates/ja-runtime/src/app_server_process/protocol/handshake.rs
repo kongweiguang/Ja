@@ -33,7 +33,7 @@ pub(crate) fn default_initialize_params(limits: &Limits) -> Value {
             "events": V1_EVENT_METHODS,
             "accessModes": ["approval_required", "full_access"],
             "collaborationModes": ["default", "plan"],
-            "features": ["task_threads_v1", "plan_goal_v1"]
+            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"]
         },
         "limits": limits.to_value(),
     })
@@ -232,14 +232,14 @@ pub(crate) fn validate_capabilities(value: Option<&Value>) -> Result<(), AppServ
     }
     validate_string_array(
         object.get("features"),
-        2,
+        3,
         32,
-        Some(&["task_threads_v1", "plan_goal_v1"]),
+        Some(&["task_threads_v1", "plan_goal_v1", "interaction_v1"]),
     )?;
     if object
         .get("features")
         .and_then(Value::as_array)
-        .is_none_or(|items| items.len() != 2)
+        .is_none_or(|items| items.len() != 3)
     {
         return Err(AppServerProcessError::ProtocolFault);
     }

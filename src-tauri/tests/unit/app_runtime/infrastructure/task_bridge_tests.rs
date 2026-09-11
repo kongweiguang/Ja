@@ -18,7 +18,7 @@ fn task_summary(task_thread_id: &str, root_thread_id: &str) -> Value {
     })
 }
 
-/// Task method 枚举覆盖全部十个固定 JA-RPC 拼写，不提供 generic passthrough。
+/// Task method 枚举覆盖全部固定 JA-RPC 拼写，不提供 generic passthrough。
 #[test]
 fn task_method_is_a_closed_wire_catalog() {
     let methods = [
@@ -32,6 +32,7 @@ fn task_method_is_a_closed_wire_catalog() {
         TaskMethod::Followup,
         TaskMethod::Cancel,
         TaskMethod::TreeDelete,
+        TaskMethod::Close,
     ];
     assert_eq!(
         methods.map(TaskMethod::wire_name),
@@ -42,10 +43,11 @@ fn task_method_is_a_closed_wire_catalog() {
             "task/observe",
             "task/unobserve",
             "task/seen",
-            "task/message/send",
+            "thread/message/send",
             "task/followup",
             "task/cancel",
             "task/tree/delete",
+            "task/close",
         ]
     );
 }
@@ -99,7 +101,8 @@ fn task_summary_parser_requires_subagent_origin_turn() {
 #[test]
 fn task_activity_parser_requires_nullable_causal_turn_id() {
     let activity = json!({
-        "activitySequence": 1, "activityId": "activity_created", "taskThreadId": "thr_child",
+        "activitySequence": 1, "activityId": "activity_created", "rootThreadId": "thr_parent",
+        "taskThreadId": "thr_child",
         "actorThreadId": "thr_parent", "causalTurnId": null, "kind": "dispatched",
         "summary": {"text": "已派发"}, "createdAt": "2026-09-03T08:00:00Z"
     });
@@ -112,11 +115,14 @@ fn task_activity_parser_requires_nullable_causal_turn_id() {
     assert!(parse_task_activity_value(&missing).is_err());
 }
 
-/// create/list parser 必须把合法 projection 继续绑定到本次父任务与根任务请求。
+/// create/list parser 必须把 idle 创建结果绑定到本次父任务与根任务请求，且不携带 Turn。
 #[test]
 fn task_collection_results_reject_cross_tree_projection() {
     let task = task_summary("thr_child", "thr_root");
-    let create = json!({"accepted": true, "task": task, "turnId": "turn_child"});
+    let mut create_task = task.clone();
+    create_task["state"] = json!("idle");
+    create_task["startedAt"] = Value::Null;
+    let create = json!({"accepted": true, "task": create_task});
     assert!(
         parse_task_create_result(create.clone(), "thr_root", Some("turn_parent"), "检查测试")
             .is_ok()
@@ -169,6 +175,16 @@ fn task_identity_results_reject_request_mismatch() {
 fn task_read_result_rejects_cross_task_detail_rows() {
     let result = json!({
         "task": task_summary("thr_child", "thr_root"),
+        "thread": {
+            "threadId": "thr_child", "workspaceId": "ws_root", "activeGoalId": "goal_child",
+            "preferences": {
+                "providerId": "provider_side", "modelId": "model_side", "reasoningLevel": "high",
+                "accessMode": "full_access", "collaborationMode": "plan", "titleSource": "manual"
+            },
+            "title": "检查测试", "status": "active", "pinned": false,
+            "latestTurnStatus": "running", "latestTurnSeen": true, "revision": 2,
+            "createdAt": "2026-09-03T08:00:00Z", "updatedAt": "2026-09-03T08:00:01Z"
+        },
         "contextSeed": {
             "contextSeedId": "seed_child", "parentRevision": 1,
             "inheritanceMode": "effective_context",
@@ -182,7 +198,7 @@ fn task_read_result_rejects_cross_task_detail_rows() {
         },
         "activities": [{
             "activitySequence": 1, "activityId": "activity_created",
-            "taskThreadId": "thr_child", "actorThreadId": "thr_root",
+            "rootThreadId": "thr_root", "taskThreadId": "thr_child", "actorThreadId": "thr_root",
             "causalTurnId": null, "kind": "dispatched", "summary": {"text": "已派发"},
             "createdAt": "2026-09-03T08:00:00Z"
         }],
@@ -195,7 +211,36 @@ fn task_read_result_rejects_cross_task_detail_rows() {
         }],
         "nextCursor": null
     });
-    assert!(parse_task_read_result(result.clone(), "thr_child").is_ok());
+    let parsed = parse_task_read_result(result.clone(), "thr_child").expect("task read result");
+    assert_eq!(parsed.thread.thread_id, "thr_child");
+    assert_eq!(parsed.thread.workspace_id, "ws_root");
+    assert_eq!(parsed.thread.active_goal_id.as_deref(), Some("goal_child"));
+    assert_eq!(parsed.thread.title, "检查测试");
+    assert_eq!(parsed.thread.status, "active");
+    assert!(!parsed.thread.pinned);
+    assert_eq!(parsed.thread.latest_turn_status.as_deref(), Some("running"));
+    assert!(parsed.thread.latest_turn_seen);
+    assert_eq!(parsed.thread.revision, 2);
+    assert_eq!(parsed.thread.created_at, "2026-09-03T08:00:00Z");
+    assert_eq!(parsed.thread.updated_at, "2026-09-03T08:00:01Z");
+    let preferences = parsed.thread.preferences.expect("thread preferences");
+    assert_eq!(preferences.provider_id, "provider_side");
+    assert_eq!(preferences.model_id, "model_side");
+    assert_eq!(preferences.reasoning_level.as_deref(), Some("high"));
+    assert_eq!(preferences.access_mode, "full_access");
+    assert_eq!(preferences.collaboration_mode, "plan");
+    assert_eq!(preferences.title_source, "manual");
+
+    let mut idle = result.clone();
+    idle["task"]["state"] = json!("idle");
+    idle["task"]["startedAt"] = Value::Null;
+    idle["contextSeed"]["taskBrief"] = Value::Null;
+    idle["activities"][0]["kind"] = json!("created");
+    assert!(parse_task_read_result(idle, "thr_child").is_ok());
+
+    let mut mismatched_thread = result.clone();
+    mismatched_thread["thread"]["threadId"] = json!("thr_other");
+    assert!(parse_task_read_result(mismatched_thread, "thr_child").is_err());
 
     let mut foreign = result;
     foreign["mailbox"][0]["senderThreadId"] = json!("thr_other_parent");
@@ -208,6 +253,12 @@ fn task_read_result_rejects_cross_task_detail_rows() {
 fn task_read_rejects_invalid_cursor_and_non_monotonic_sequences() {
     let mut result = json!({
         "task": task_summary("thr_child", "thr_root"),
+        "thread": {
+            "threadId": "thr_child", "workspaceId": "ws_root", "activeGoalId": null,
+            "preferences": null, "title": "检查测试", "status": "active", "pinned": false,
+            "latestTurnStatus": "running", "latestTurnSeen": true, "revision": 2,
+            "createdAt": "2026-09-03T08:00:00Z", "updatedAt": "2026-09-03T08:00:01Z"
+        },
         "contextSeed": {
             "contextSeedId": "seed_child", "parentRevision": 1,
             "inheritanceMode": "effective_context",
@@ -218,10 +269,10 @@ fn task_read_rejects_invalid_cursor_and_non_monotonic_sequences() {
             "createdAt": "2026-09-03T08:00:00Z"
         },
         "activities": [
-            {"activitySequence": 1, "activityId": "activity_one", "taskThreadId": "thr_child",
+            {"activitySequence": 1, "activityId": "activity_one", "rootThreadId": "thr_root", "taskThreadId": "thr_child",
              "actorThreadId": "thr_root", "causalTurnId": null, "kind": "progress",
              "summary": {"text": "已派发"}, "createdAt": "2026-09-03T08:00:00Z"},
-            {"activitySequence": 1, "activityId": "activity_two", "taskThreadId": "thr_child",
+            {"activitySequence": 1, "activityId": "activity_two", "rootThreadId": "thr_root", "taskThreadId": "thr_child",
              "actorThreadId": "thr_root", "causalTurnId": null, "kind": "progress",
              "summary": {"text": "已派发"}, "createdAt": "2026-09-03T08:00:01Z"}
         ],
@@ -239,6 +290,20 @@ fn task_unobserve_requires_positive_exact_ack() {
     assert!(parse_accepted(json!({"accepted": true})).is_ok());
     assert!(parse_accepted(json!({"accepted": false})).is_err());
     assert!(parse_accepted(json!({"accepted": true, "observationId": "observe_child"})).is_err());
+}
+
+/// 侧聊关闭回执只有精确的 `closed=true` 才能释放本地生命周期资源。
+#[test]
+fn task_close_result_requires_strict_positive_ack() {
+    assert_eq!(
+        parse_task_close_result(json!({"closed": true})),
+        Ok(TaskCloseResult { closed: true })
+    );
+    assert!(parse_task_close_result(json!({})).is_err());
+    assert!(parse_task_close_result(json!({"closed": false})).is_err());
+    assert!(
+        parse_task_close_result(json!({"closed": true, "taskThreadId": "thr_side"})).is_err()
+    );
 }
 
 /// Registry 同时绑定 owner 与 sidecar generation；reload drain 后迟到 progress 立即失效。

@@ -241,11 +241,12 @@ impl SidecarConfig {
         let initialize = protocol::default_initialize_params(&self.limits);
         validate_initialize_params(&initialize, &self.limits)
             .map_err(|_| AppServerProcessError::InvalidConfig)?;
-        if self
-            .args
-            .iter()
-            .any(|arg| contains_secret_marker(&arg.to_string_lossy()))
-        {
+        if self.args.iter().any(|arg| {
+            let value = arg.to_string_lossy();
+            contains_secret_marker(&value)
+                || value == "--ja-runtime-generation"
+                || value.starts_with("--ja-runtime-generation=")
+        }) {
             return Err(AppServerProcessError::InvalidConfig);
         }
         for (name, value) in &self.env {

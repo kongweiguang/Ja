@@ -316,12 +316,12 @@ public final class StdioWriter implements AutoCloseable {
     }
 
     /**
-     * 只接受小写 kebab-case 的领域/动作名称；该规则与首版 v1 合同一致，并拒绝 camelCase、
-     * 空分段和未命名空间化的非法通知。
+     * 保留小写领域/动作边界，同时接受合同中 messages_received 的下划线；
+     * 方法闭集由协议目录约束，Writer 不能用更窄语法拒绝已协商的持久消息事件。
      */
     private static String requireMethod(String value) {
         if (value == null || value.length() > 128
-            || !value.matches("[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:/[a-z][a-z0-9]*(?:-[a-z0-9]+)*)*")) {
+            || !value.matches("[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*(?:/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*)*")) {
             throw new IllegalArgumentException("invalid method name");
         }
         return value;

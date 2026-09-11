@@ -75,6 +75,7 @@ final class GoalStartupRecoveryTest {
                 settled.put(command.toolAttemptId(), command.state());
                 yield pending.remove(command.toolAttemptId());
             }
+            case "listUnsettledPlanExecutions" -> List.of();
             case "readPlanSnapshot" -> planSnapshot((String) args[0]);
             case "recoverPlanExecution" -> {
                 GoalRepository.RecoverPlanExecution command = (GoalRepository.RecoverPlanExecution) args[0];
@@ -107,6 +108,40 @@ final class GoalStartupRecoveryTest {
         assertEquals(GoalModels.GoalStatus.PAUSED, goalTransition.get().status());
         assertEquals(GoalModels.GoalPhase.NEEDS_ATTENTION, goalTransition.get().phase());
         assertTrue(goalTransition.get().recoveryRequired());
+    }
+
+    /** 旧 EXECUTING/VERIFYING run 都只暂停保留 identity；未知副作用必须成为不可继续 blocker。 */
+    @Test
+    void pausesOldPlanRunsAndStopsUnknownRecovery() {
+        Map<String, GoalRepository.PlanExecutionRecovery> pending = new LinkedHashMap<>();
+        pending.put("plan_safe", new GoalRepository.PlanExecutionRecovery(
+                "plan_safe", 4, "run_safe", "revision_safe", false));
+        pending.put("plan_unknown", new GoalRepository.PlanExecutionRecovery(
+                "plan_unknown", 7, "run_unknown", "revision_unknown", true));
+        List<GoalRepository.RecoverPlanExecution> recovered = new ArrayList<>();
+        List<String> settledClaims = new ArrayList<>();
+        GoalRepository repository = repository((proxy, method, args) -> switch (method.getName()) {
+            case "listHeldLeases", "listUnsettledEvaluations", "listUnsettledToolAttempts" -> List.of();
+            case "listUnsettledPlanExecutions" -> List.copyOf(pending.values());
+            case "settleOrphanedPlanTurnClaims" -> {
+                settledClaims.add((String) args[0]);
+                yield null;
+            }
+            case "recoverPlanExecution" -> {
+                GoalRepository.RecoverPlanExecution command = (GoalRepository.RecoverPlanExecution) args[0];
+                recovered.add(command);
+                pending.remove(command.planId());
+                yield null;
+            }
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+
+        new GoalStartupRecovery(repository, Clock.fixed(NOW, ZoneOffset.UTC), 9).recover();
+
+        assertEquals(List.of("run_safe", "run_unknown"), settledClaims);
+        assertEquals(2, recovered.size());
+        assertFalse(recovered.get(0).unsafe());
+        assertTrue(recovered.get(1).unsafe());
     }
 
     /** Tool attempt fixture 显式冻结旧 generation，避免测试以当前 owner 误判恢复资格。 */

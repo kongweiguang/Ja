@@ -20,6 +20,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
+import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
@@ -30,6 +31,7 @@ import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -148,15 +150,33 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     }
 
     /**
-     * 按必需 Workspace 身份列出 Thread，分页边界不会混入其它项目的会话。
+     * 按请求形状选择旧的 Workspace 导航或全局 discovery；缺少 scope 时保留旧导航合同，
+     * 带 scope 时只允许显式 all，避免同一 RPC 方法在 transport 层悄然产生第三种语义。
      */
     private ObjectNode list(ObjectNode params) {
+        if (params.has("scope")) return discover(params);
         RpcParams.requireOnly(params, "workspaceId", "cursor", "limit");
         String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
         CursorPage<ThreadSummary> page = session.threads()
                 .listThreads(workspaceId, RpcParams.optionalText(params, "cursor", 512),
                         RpcParams.pageLimit(params));
         return threadPage(page);
+    }
+
+    /**
+     * 全局 discovery 只投影最小 Thread 目录；Workspace 过滤可选，cursor 与 limit 仍由 Java owner
+     * 校验并交给同一 SQL keyset 查询，避免 Handler 读取完整 Thread 或 Task transcript。
+     */
+    private ObjectNode discover(ObjectNode params) {
+        RpcParams.requireOnly(params, "scope", "query", "cursor", "limit", "workspaceId");
+        String scope = RpcParams.text(params, "scope", 16, false);
+        String query = params.has("query") ? RpcParams.text(params, "query", 256, true) : null;
+        String cursor = RpcParams.optionalText(params, "cursor", 512);
+        String workspaceId = params.has("workspaceId") && !params.get("workspaceId").isNull()
+                ? RpcParams.identifier(params, "workspaceId", "ws_", 100) : null;
+        CursorPage<ThreadDiscovery> page = session.threads().discoverThreads(
+                new ThreadDiscovery.Query(scope, query, cursor, RpcParams.pageLimit(params), workspaceId));
+        return discoveryPage(page);
     }
 
     /** 空查询返回最近 Thread；非空查询仅做当前 Workspace 标题 contains。 */
@@ -176,6 +196,25 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         page.items().forEach(value -> threads.add(RpcResults.thread(session.mapper(), value)));
         RpcResults.cursor(result, page.nextCursor());
         return result;
+    }
+
+    /** discovery 与旧 Thread page 共用 envelope，但条目固定为五个安全字段。 */
+    private ObjectNode discoveryPage(CursorPage<ThreadDiscovery> page) {
+        ObjectNode result = session.mapper().createObjectNode();
+        ArrayNode threads = result.putArray("items");
+        page.items().forEach(value -> threads.add(discovery(value)));
+        RpcResults.cursor(result, page.nextCursor());
+        return result;
+    }
+
+    /** 枚举使用 JA-RPC 小写 wire 值，领域投影不携带更新时间或配置正文。 */
+    private ObjectNode discovery(ThreadDiscovery value) {
+        return session.mapper().createObjectNode()
+                .put("threadId", value.threadId())
+                .put("title", value.title())
+                .put("kind", value.kind().name().toLowerCase(Locale.ROOT))
+                .put("workspaceId", value.workspaceId())
+                .put("status", value.status().name().toLowerCase(Locale.ROOT));
     }
 
     /**

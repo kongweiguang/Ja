@@ -47,7 +47,8 @@ public final class TaskTerminalPersistence {
                 : bounded(visible, MAX_SAFE_SUMMARY_CODE_POINTS);
         if (safeSummary.isBlank()) safeSummary = terminal.state().name();
         String stableSuffix = stableSuffix(terminal.turnId());
-        TaskModels.MailboxEnvelope answer = visible.isBlank() ? null : new TaskModels.MailboxEnvelope(
+        TaskModels.MailboxEnvelope answer = visible.isBlank() || !publishesFinalAnswer(task.taskKind())
+                ? null : new TaskModels.MailboxEnvelope(
                 "msg_task_final_" + stableSuffix, task.taskThreadId(), task.parentThreadId(),
                 terminal.turnId(), TaskModels.MailboxKind.FINAL_ANSWER,
                 new UserContent(List.of(new TextContent(visible))), terminalIdempotencyKey(terminal.turnId()),
@@ -60,7 +61,7 @@ public final class TaskTerminalPersistence {
         return settle(mapper, objectMapper, settlement);
     }
 
-    /** 非 Child Turn 安静返回 empty；Child terminal 只允许首个 projection CAS 胜者产生 FINAL_ANSWER。 */
+    /** 非 Task Turn 安静返回 empty；只有附属 Subagent 的首个 projection CAS 胜者产生 FINAL_ANSWER。 */
     static Optional<TaskRecords.TaskSummaryRow> settle(PersistenceMappers mapper,
                                                        ObjectMapper objectMapper,
                                                        TaskModels.TerminalSettlement settlement) {
@@ -78,7 +79,12 @@ public final class TaskTerminalPersistence {
         }
         TaskJsonCodec json = new TaskJsonCodec(objectMapper);
         TaskModels.MailboxEnvelope answer = settlement.finalAnswer();
-        if (answer != null) insertFinalAnswer(mapper, json, task, answer);
+        if (answer != null) {
+            if (!publishesFinalAnswer(task.taskKind())) {
+                throw relation("SIDE_TASK cannot publish FINAL_ANSWER to parent Thread");
+            }
+            insertFinalAnswer(mapper, json, task, answer);
+        }
         Long sequence = mapper.tasks().insertActivity(new TaskRecords.ActivityInsert(
                 settlement.activityId(), task.rootThreadId(), task.taskThreadId(), task.taskThreadId(),
                 settlement.turnId(), activityKind(settlement.state()).name(),
@@ -98,6 +104,14 @@ public final class TaskTerminalPersistence {
         TaskRecords.TaskSummaryRow result = mapper.tasks().selectTaskSummary(task.taskThreadId());
         if (result == null) throw invalidState("terminal task projection is unavailable");
         return Optional.of(result);
+    }
+
+    /** 只有 SUBAGENT 的终态需要回传父 Thread；SIDE_TASK 保持独立生命周期，不伪造父回复。 */
+    private static boolean publishesFinalAnswer(String taskKind) {
+        return switch (TaskModels.Kind.valueOf(taskKind)) {
+            case SIDE_TASK -> false;
+            case SUBAGENT -> true;
+        };
     }
 
     /** FINAL_ANSWER 不受普通 Mailbox 容量丢弃；唯一键重试必须与首个事实逐字段一致。 */

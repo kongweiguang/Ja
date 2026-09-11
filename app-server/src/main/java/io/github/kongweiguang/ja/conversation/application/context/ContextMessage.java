@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.conversation.application.context;
 
 import io.github.kongweiguang.ja.conversation.application.context.compaction.ToolOutputProjector;
+import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -177,7 +178,8 @@ public record ContextMessage(
     /**
      * 限定进入上下文预算与摘要流程的消息块闭集，避免 Adapter 私有结构泄漏。
      */
-    public sealed interface Block permits AttachmentBlock, TextBlock, ToolCallBlock, ToolResultBlock {
+    public sealed interface Block permits AttachmentBlock, ReasoningBlock, TextBlock, ToolCallBlock,
+            ToolResultBlock {
     }
 
     /**
@@ -188,6 +190,24 @@ public record ContextMessage(
         public AttachmentBlock {
             attachmentId = boundedIdentifier(attachmentId, "attachmentId", 256);
             if (!attachmentId.startsWith("att_")) throw new IllegalArgumentException("invalid attachmentId");
+        }
+    }
+
+    /**
+     * 保留原生 reasoning block 的身份和 opaque 载荷，但下游摘要/日志必须显式跳过其正文。
+     */
+    public record ReasoningBlock(ReasoningContent content) implements Block {
+        /**
+         * 以领域块整体冻结 Provider 资格，避免上下文阶段拆散签名与 encrypted_content。
+         */
+        public ReasoningBlock {
+            Objects.requireNonNull(content, "content");
+        }
+
+        /** 仅在内部计划指纹中区分 opaque 内容，不把原文写入摘要日志。 */
+        @Override
+        public String toString() {
+            return "ReasoningBlock[contentFingerprint=" + content.nativeJsonFingerprint() + "]";
         }
     }
 

@@ -232,7 +232,7 @@ function diffFor(file: ReviewFile, source: ReviewSource): ReviewFileDiff {
             ? "  <p>把想法变成清晰的下一步。</p>"
             : line === 4
               ? "  <HeroAction label={ctaLabel} />"
-                : `  <section data-block="${line}" />`,
+              : `  <section data-block="${line}" />`,
     };
   });
   return {

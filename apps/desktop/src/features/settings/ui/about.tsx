@@ -5,7 +5,6 @@ import {
   Download,
   ExternalLink,
   GitBranch,
-  Info,
   LoaderCircle,
   RefreshCw,
   RotateCw,
@@ -18,6 +17,7 @@ import type { AppUpdaterController, AppUpdaterState } from "../application/useAp
 import type { SettingsDesktopPort } from "../application/ports";
 import { Button } from "@/shared/ui/primitives";
 import { SectionHeader } from "./shared";
+import "./skills-about.css";
 
 const GITHUB_REPOSITORY_URL = "https://github.com/kongweiguang/Ja";
 
@@ -183,16 +183,16 @@ export function AboutSection({
       tabIndex={-1}
     >
       <SectionHeader title="关于" />
-      <div className="ja-settings-about-identity">
+      <div className="ja-settings-about-identity ja-about-identity">
         <div className="ja-settings-about-mark" aria-hidden="true">
-          <Info />
+          <img src="/favicon.png" alt="" />
         </div>
         <div>
           <h3>Ja</h3>
           <p>驾驭 Agent Harness，由 Java 25 驱动核心 Harness。</p>
         </div>
       </div>
-      <div className="ja-settings-about-list">
+      <div className="ja-settings-about-list ja-about-list">
         <AboutRow icon={<Tag />} label="版本" value={versionLabel(packageJson.version)} />
         <AboutRow icon={<Scale />} label="开源协议" value="GPL-3.0-or-later" />
         <AboutRow

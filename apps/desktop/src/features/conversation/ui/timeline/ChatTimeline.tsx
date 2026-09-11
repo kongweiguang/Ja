@@ -123,6 +123,7 @@ type TimelineRow = {
   attachmentAuthorization?: HistoryAttachmentAuthorization;
   attachmentThumbnailUrls?: Readonly<Record<string, string | undefined>>;
   user?: TimelineItemAdapter;
+  threadMessages: TimelineItemAdapter[];
   work: TimelineItemAdapter[];
   final?: TimelineItemAdapter;
   approvals: ApprovalSummary[];
@@ -138,6 +139,11 @@ type OrderedTimelineRow =
 
 type ConversationRenderBlock =
   | { readonly kind: "user"; readonly key: string }
+  | {
+      readonly kind: "thread_message";
+      readonly key: string;
+      readonly item: TimelineItemAdapter;
+    }
   | { readonly kind: "work"; readonly key: string }
   | { readonly kind: "assistant"; readonly key: string }
   | { readonly kind: "changes"; readonly key: string }
@@ -152,6 +158,7 @@ type MutableTurnGroup = {
   attachmentThumbnailUrls?: Readonly<Record<string, string | undefined>>;
   key: string;
   user?: TimelineItemAdapter;
+  threadMessages: TimelineItemAdapter[];
   work: TimelineItemAdapter[];
   final: TimelineItemAdapter[];
   approvals: ApprovalSummary[];
@@ -251,6 +258,7 @@ function buildRows(
     const created: MutableTurnGroup = {
       key: `${turnId}:initial`,
       turnId,
+      threadMessages: [],
       work: [],
       final: [],
       approvals: [],
@@ -265,12 +273,15 @@ function buildRows(
         key: `${item.turnId}:${item.itemId}`,
         turnId: item.turnId,
         user: item,
+        threadMessages: [],
         work: [],
         final: [],
         approvals: [],
       };
       rows.push(exchange);
       currentByTurn.set(item.turnId, exchange);
+    } else if (item.kind === "thread_message") {
+      currentFor(item.turnId).threadMessages.push(item);
     } else if (item.kind === "agent_message") {
       currentFor(item.turnId).final.push(item);
     } else {
@@ -314,6 +325,7 @@ function buildRows(
         ]),
       ),
       work: [],
+      threadMessages: [],
       final: [],
       approvals: [],
       user: {
@@ -340,6 +352,7 @@ function buildRows(
     attachmentAuthorization: group.attachmentAuthorization,
     attachmentThumbnailUrls: group.attachmentThumbnailUrls,
     user: group.user,
+    threadMessages: group.threadMessages,
     work: group.work,
     final: mergeMessages(group.final, "agent_message", true),
     approvals: group.approvals,
@@ -348,11 +361,13 @@ function buildRows(
   return projected.sort((left, right) => {
     const leftTime =
       left.user?.createdAt ??
+      left.threadMessages[0]?.createdAt ??
       left.work[0]?.createdAt ??
       left.final?.createdAt ??
       left.turn?.startedAt;
     const rightTime =
       right.user?.createdAt ??
+      right.threadMessages[0]?.createdAt ??
       right.work[0]?.createdAt ??
       right.final?.createdAt ??
       right.turn?.startedAt;
@@ -453,6 +468,16 @@ function orderConversationBlocks(
             value: { kind: "user" as const, key: `user:${row.key}` },
           },
         ]),
+    ...row.threadMessages.map((item, index) => ({
+      // 使用服务端批次顺序作为同一时间戳下的稳定次序；itemId 只负责 DOM identity。
+      identity: `conversation:${row.key}:thread_message:${String(index).padStart(4, "0")}:${item.itemId}`,
+      occurredAt: item.createdAt,
+      value: {
+        kind: "thread_message" as const,
+        key: `thread-message:${item.itemId}`,
+        item,
+      },
+    })),
     ...(row.work.length === 0 && row.approvals.length === 0
       ? []
       : [
@@ -698,6 +723,44 @@ function UserMessage({
 }
 
 /**
+ * 渲染跨会话投递的纯文本事实；来源标题与 Thread ID 始终同时可见，且不使用用户气泡、Markdown
+ * 或工作状态语义，避免消息在视觉和语义上冒充当前用户或当前 Agent 的发言。
+ */
+function ThreadMessage({
+  item,
+  onCopyText,
+}: {
+  item: TimelineItemAdapter;
+  onCopyText?: (text: string) => Promise<void>;
+}): ReactElement {
+  const sourceTitle = item.sourceTitle ?? "未知会话";
+  const sourceThreadId = item.sourceThreadId ?? "未知 Thread";
+  const content = item.text ?? "";
+  return (
+    <article
+      aria-label={`来自会话：${sourceTitle}`}
+      className={cn("ja-chat-message", "ja-chat-message-thread_message")}
+      data-item-id={item.itemId}
+      data-role="thread-message"
+      data-source-thread-id={sourceThreadId}
+    >
+      <div className="ja-thread-message__body">
+        <header className="ja-thread-message__source">
+          <span>来自会话</span>
+          <strong title={sourceThreadId}>{sourceTitle}</strong>
+        </header>
+        <p className="ja-thread-message__content">{content}</p>
+      </div>
+      {onCopyText === undefined ? null : (
+        <div className="ja-chat-message__actions" role="group" aria-label="会话消息操作">
+          <CopyTextButton text={content} label="复制会话消息" onCopyText={onCopyText} />
+        </div>
+      )}
+    </article>
+  );
+}
+
+/**
  * 只从 Turn 与公开 Agent Fragment 派生展示阶段，避免把 UI 动效状态写回 Store；公开文本一到达就
  * 直接进入 streaming，不设置计时器或缓冲队列。
  */
@@ -744,7 +807,7 @@ function AssistantResponse({
       : state === "waiting"
         ? "等待你的确认"
         : state === "suspended"
-          ? "运行被中断"
+          ? "已暂停"
           : state === "streaming"
             ? "正在回复"
             : state === "cancelled"
@@ -986,6 +1049,8 @@ export function ChatTimeline({
   // 因此该显式 Escape Hatch 只留在 Virtualization 边界内。
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
+    // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
+    useFlushSync: false,
     count: orderedRows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 280,
@@ -1088,6 +1153,10 @@ export function ChatTimeline({
                           onCopyText={onCopyText}
                           onOpenAttachmentPreview={onOpenAttachmentPreview}
                         />
+                      );
+                    case "thread_message":
+                      return (
+                        <ThreadMessage key={block.key} item={block.item} onCopyText={onCopyText} />
                       );
                     case "work":
                       return (

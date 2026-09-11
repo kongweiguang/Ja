@@ -57,6 +57,8 @@ import {
   Tooltip,
 } from "@/shared/ui/primitives";
 import { cn } from "@/shared/ui/primitives/cn";
+import { useSendShortcut } from "@/shared/hooks/useInterfacePreferencesValue";
+import type { SendShortcut } from "@/shared/settings/interfacePreferences";
 import type {
   ConversationAccessMode,
   ConversationAttachment,
@@ -119,6 +121,12 @@ export interface ComposerQueuedInputView {
 }
 
 export interface ComposerProps {
+  /** 非模态交互卡片由 composition 注入；Composer 只负责保持其与输入内容同一轨道。 */
+  interactionSlot?: ReactNode;
+  /** 由当前 Thread owner 单调递增；用于从计划动作恢复输入焦点，不查询全局 DOM。 */
+  focusRequest?: number;
+  /** 未由 composition 显式传入时读取全局界面偏好；测试和嵌入宿主可注入稳定快照。 */
+  sendShortcut?: SendShortcut;
   preferences?: ConversationThreadPreferences;
   /** 非默认 Plan/Goal 状态由 Goal feature 提供，默认态不占用工具栏空间。 */
   modeStatus?: ReactNode;
@@ -141,6 +149,7 @@ export interface ComposerProps {
   attachmentDraftItems?: readonly ConversationAttachmentDraftItem[];
   activeTurn?: boolean;
   suspendedTurn?: boolean;
+  awaitingUserInput?: boolean;
   disabled?: boolean;
   preferenceBusy?: boolean;
   importingAttachments?: boolean;
@@ -429,23 +438,23 @@ function modelGroups(models: readonly ConversationModelOption[]) {
   return [...groups.values()];
 }
 
-/** 推理档位只使用模型声明的闭集，并在紧凑入口中复用一致中文名称。 */
+/** 中文名称附带逻辑档位英文标识，便于对照配置；展示文案不改变提交值。 */
 function reasoningLabel(effort: ReasoningLevel): string {
   switch (effort) {
     case "off":
-      return "关闭";
+      return "关闭 (off)";
     case "minimal":
-      return "最少";
+      return "最少 (minimal)";
     case "low":
-      return "低";
+      return "低 (low)";
     case "medium":
-      return "中";
+      return "中 (medium)";
     case "high":
-      return "高";
+      return "高 (high)";
     case "xhigh":
-      return "极高";
+      return "极高 (xhigh)";
     case "max":
-      return "最大";
+      return "最大 (max)";
   }
 }
 
@@ -885,6 +894,9 @@ function QueuedInputRow({
  * 签发的 attachmentId。项目上下文由组合层放在表单上方，避免输入器承担非表单信息。
  */
 export function Composer({
+  sendShortcut: sendShortcutProp,
+  interactionSlot,
+  focusRequest,
   preferences,
   modeStatus,
   goalStatus,
@@ -904,6 +916,7 @@ export function Composer({
   attachmentDraftItems,
   activeTurn = false,
   suspendedTurn = false,
+  awaitingUserInput = false,
   disabled = false,
   preferenceBusy = false,
   importingAttachments = false,
@@ -938,6 +951,9 @@ export function Composer({
   onCancel,
   className,
 }: ComposerProps): ReactElement {
+  const storedSendShortcut = useSendShortcut();
+  const sendShortcut = sendShortcutProp ?? storedSendShortcut;
+  const sendShortcutHint = sendShortcut === "enter" ? "Enter" : "Ctrl/Cmd + Enter";
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastSelectionRef = useRef({ start: text.length, end: text.length });
   const observedRecoveryRevisionRef = useRef(draftRecoveryRevision);
@@ -969,6 +985,14 @@ export function Composer({
     ownedInlineCommand?.scopeIdentity === composerScopeIdentity
       ? ownedInlineCommand.command
       : undefined;
+
+  /** 仅响应 owner 的显式 focus token；不因问答卡出现而抢走用户正在编辑的焦点。 */
+  const observedFocusRequestRef = useRef(focusRequest);
+  useEffect(() => {
+    if (focusRequest === undefined || focusRequest === observedFocusRequestRef.current) return;
+    observedFocusRequestRef.current = focusRequest;
+    inputRef.current?.focus();
+  }, [focusRequest]);
 
   /** 在浏览器绘制前更新异步命令的 scope 栅栏，避免 render 期间写 ref，也不给旧会话结果留下可见窗口。 */
   useLayoutEffect(() => {
@@ -1258,17 +1282,22 @@ export function Composer({
     !cancelling &&
     !resuming &&
     !hasUnresolvedAttachments &&
-    !suspendedTurn &&
+    (!suspendedTurn || awaitingUserInput) &&
     (!activeTurn || (queueAccepting && onEnqueue !== undefined));
   const canCancel = blockedTurn && !disabled && !cancelling && !resuming && onCancel !== undefined;
   const canResume =
-    suspendedTurn && !disabled && !cancelling && !resuming && onResume !== undefined;
+    suspendedTurn &&
+    !awaitingUserInput &&
+    !disabled &&
+    !cancelling &&
+    !resuming &&
+    onResume !== undefined;
   const dropActive =
     (nativeDropEvent?.phase === "enter" || nativeDropEvent?.phase === "over") &&
     !disabled &&
     !sending;
 
-  /** 只把发送或排队意图上报给 application controller，组件不建立第二把并发锁。 */
+  /** 原样提交草稿供 application 精确清空/恢复；正文规范化和并发锁均由该 owner 负责。 */
   const submit = (): void => {
     if (!canSend) return;
     const input = inputRef.current;
@@ -1278,16 +1307,16 @@ export function Composer({
         end: input.selectionEnd ?? text.length,
       };
     }
-    if (activeTurn && onEnqueue !== undefined) {
+    if ((activeTurn || (suspendedTurn && awaitingUserInput)) && onEnqueue !== undefined) {
       void onEnqueue({
-        text: text.trim(),
+        text,
         attachmentIds: readyAttachments.map((attachment) => attachment.attachmentId),
         contextReferences,
       });
       return;
     }
     void onSend({
-      text: text.trim(),
+      text,
       attachmentIds: readyAttachments.map((attachment) => attachment.attachmentId),
       contextReferences,
     });
@@ -1605,7 +1634,11 @@ export function Composer({
         return;
       }
     }
-    if (event.key === "Enter" && !event.shiftKey && !composingRef.current) {
+    const shouldSubmit =
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      (sendShortcut === "enter" ? !event.altKey : event.ctrlKey || event.metaKey);
+    if (shouldSubmit && !composingRef.current) {
       const invocation = parseComposerSlashInvocation(text);
       const command =
         invocation === undefined
@@ -1652,418 +1685,425 @@ export function Composer({
   const activeTurnHasDraft = activeTurn && hasDraftContent;
 
   return (
-    <form
-      ref={dropZoneRef}
-      className={cn("ja-composer", className)}
-      onSubmit={handleSubmit}
-      aria-label="发送消息"
-      data-state={composerState}
-      data-has-queue={queuedInputs.length > 0 || undefined}
-      data-drop-active={dropActive || undefined}
-      aria-busy={activeTurn || sending || cancelling || resuming || undefined}
-    >
-      {goalStatus}
-      {dropActive ? (
-        <span className="ja-composer__drop-indicator" aria-hidden="true">
-          <Plus />
-        </span>
-      ) : null}
-      {queuedInputs.length === 0 ? null : (
-        <ol className="ja-composer-queue" aria-label="排队消息">
-          {queuedInputs.map((item, position) => (
-            <QueuedInputRow
-              key={item.inputId}
-              item={item}
-              position={position}
-              skills={skills}
-              onPrioritize={onPrioritizeQueuedInput}
-              onUpdate={onUpdateQueuedInput}
-              onDelete={onDeleteQueuedInput}
-              onOpenPreview={onOpenQueuedAttachmentPreview}
-            />
-          ))}
-        </ol>
-      )}
-      {draftItems.length === 0 ? null : (
-        <ul className="ja-composer__attachments" aria-label="待发送附件">
-          {draftItems.map((item) => (
-            <AttachmentDraftCard
-              key={item.itemId}
-              item={item}
-              sending={sending}
-              onRetry={onRetryAttachment}
-              onRemove={onRemoveAttachment}
-              onOpenPreview={onOpenAttachmentPreview}
-            />
-          ))}
-        </ul>
-      )}
-      <ComposerContextChips
-        references={contextReferences}
-        onOpenWorkspaceReference={onOpenWorkspaceReference}
-        onRemove={
-          onContextReferencesChange === undefined
-            ? undefined
-            : (reference) =>
-                onContextReferencesChange(
-                  contextReferences.filter(
-                    (candidate) =>
-                      contextReferenceIdentity(candidate) !== contextReferenceIdentity(reference),
-                  ),
-                )
-        }
-      />
-      {inlineCommand === undefined ? null : (
-        <div
-          className="ja-composer__inline-command"
-          data-command={inlineCommand.name}
-          role="status"
-        >
-          <Target aria-hidden="true" />
-          <span>{inlineCommand.argument?.label ?? inlineCommand.label}</span>
-          <button
-            type="button"
-            aria-label={`退出${inlineCommand.argument?.label ?? inlineCommand.label}编辑`}
-            title="退出编辑"
-            onClick={cancelInlineCommand}
-          >
-            <X aria-hidden="true" />
-          </button>
-        </div>
-      )}
-      {visibleTrigger === undefined ? null : (
-        <ComposerSuggestionPanel
-          id={suggestionListId}
-          kind={visibleTrigger.kind}
-          state={
-            visibleTrigger.kind === "workspace"
-              ? workspaceSuggestions.state === "idle"
-                ? "loading"
-                : workspaceSuggestions.state
-              : "ready"
-          }
-          items={suggestionItems}
-          activeId={activeSuggestionId}
-          error={workspaceSuggestions.error}
-          truncated={visibleTrigger.kind === "workspace" && workspaceSuggestions.truncated}
-          onActiveChange={setActiveSuggestionId}
-          onSelect={selectSuggestion}
-          onRetry={
-            visibleTrigger.kind === "workspace"
-              ? () => setSuggestionRetry((current) => current + 1)
-              : undefined
+    <>
+      {interactionSlot}
+      <form
+        ref={dropZoneRef}
+        className={cn("ja-composer", className)}
+        onSubmit={handleSubmit}
+        aria-label="发送消息"
+        data-state={composerState}
+        data-has-queue={queuedInputs.length > 0 || undefined}
+        data-drop-active={dropActive || undefined}
+        aria-busy={activeTurn || sending || cancelling || resuming || undefined}
+      >
+        {goalStatus}
+        {dropActive ? (
+          <span className="ja-composer__drop-indicator" aria-hidden="true">
+            <Plus />
+          </span>
+        ) : null}
+        {queuedInputs.length === 0 ? null : (
+          <ol className="ja-composer-queue" aria-label="排队消息">
+            {queuedInputs.map((item, position) => (
+              <QueuedInputRow
+                key={item.inputId}
+                item={item}
+                position={position}
+                skills={skills}
+                onPrioritize={onPrioritizeQueuedInput}
+                onUpdate={onUpdateQueuedInput}
+                onDelete={onDeleteQueuedInput}
+                onOpenPreview={onOpenQueuedAttachmentPreview}
+              />
+            ))}
+          </ol>
+        )}
+        {draftItems.length === 0 ? null : (
+          <ul className="ja-composer__attachments" aria-label="待发送附件">
+            {draftItems.map((item) => (
+              <AttachmentDraftCard
+                key={item.itemId}
+                item={item}
+                sending={sending}
+                onRetry={onRetryAttachment}
+                onRemove={onRemoveAttachment}
+                onOpenPreview={onOpenAttachmentPreview}
+              />
+            ))}
+          </ul>
+        )}
+        <ComposerContextChips
+          references={contextReferences}
+          onOpenWorkspaceReference={onOpenWorkspaceReference}
+          onRemove={
+            onContextReferencesChange === undefined
+              ? undefined
+              : (reference) =>
+                  onContextReferencesChange(
+                    contextReferences.filter(
+                      (candidate) =>
+                        contextReferenceIdentity(candidate) !== contextReferenceIdentity(reference),
+                    ),
+                  )
           }
         />
-      )}
-      <textarea
-        ref={inputRef}
-        className="ja-composer__input"
-        aria-label={inlineCommand?.argument?.placeholder ?? "消息"}
-        placeholder={inlineCommand?.argument?.placeholder ?? placeholder}
-        aria-describedby={error || commandError ? feedbackId : undefined}
-        aria-controls={visibleTrigger === undefined ? undefined : suggestionListId}
-        aria-expanded={visibleTrigger !== undefined}
-        aria-haspopup="listbox"
-        aria-autocomplete="list"
-        aria-activedescendant={visibleTrigger === undefined ? undefined : activeSuggestionId}
-        value={text}
-        maxLength={1_048_576}
-        rows={1}
-        disabled={disabled || cancelling || resuming}
-        onChange={handleTextChange}
-        onFocus={(event) => {
-          const start = event.currentTarget.selectionStart ?? event.currentTarget.value.length;
-          const end = event.currentTarget.selectionEnd ?? start;
-          setInputFocused(true);
-          lastSelectionRef.current = { start, end };
-          setCaretState({ text: event.currentTarget.value, position: start });
-        }}
-        onBlur={(event) => {
-          setInputFocused(false);
-          if (caretState.text === event.currentTarget.value) return;
-          const position = event.currentTarget.value.length;
-          lastSelectionRef.current = { start: position, end: position };
-          setCaretState({ text: event.currentTarget.value, position });
-        }}
-        onCompositionStart={() => {
-          composingRef.current = true;
-          setComposing(true);
-        }}
-        onCompositionEnd={(event) => {
-          composingRef.current = false;
-          setComposing(false);
-          setCaretState({
-            text: event.currentTarget.value,
-            position: event.currentTarget.selectionStart ?? event.currentTarget.value.length,
-          });
-        }}
-        onKeyDown={handleKeyDown}
-        onKeyUp={(event) => {
-          const start = event.currentTarget.selectionStart ?? text.length;
-          const end = event.currentTarget.selectionEnd ?? start;
-          lastSelectionRef.current = { start, end };
-          setCaretState({ text: event.currentTarget.value, position: start });
-        }}
-        onClick={(event) => {
-          const start = event.currentTarget.selectionStart ?? text.length;
-          const end = event.currentTarget.selectionEnd ?? start;
-          lastSelectionRef.current = { start, end };
-          setCaretState({ text: event.currentTarget.value, position: start });
-        }}
-        onSelect={(event) => {
-          const start = event.currentTarget.selectionStart ?? text.length;
-          const end = event.currentTarget.selectionEnd ?? start;
-          lastSelectionRef.current = { start, end };
-          setCaretState({ text: event.currentTarget.value, position: start });
-        }}
-        onPaste={handlePaste}
-      />
-      <div className="ja-composer__toolbar">
-        <div className="ja-composer__leading">
-          {onAddAttachments === undefined ? null : (
-            <IconButton
-              className="ja-composer__add-button"
-              label="添加附件"
-              tooltip="添加附件"
-              disabled={disabled || sending || importingAttachments}
-              aria-busy={importingAttachments || undefined}
-              onClick={() => void onAddAttachments()}
+        {inlineCommand === undefined ? null : (
+          <div
+            className="ja-composer__inline-command"
+            data-command={inlineCommand.name}
+            role="status"
+          >
+            <Target aria-hidden="true" />
+            <span>{inlineCommand.argument?.label ?? inlineCommand.label}</span>
+            <button
+              type="button"
+              aria-label={`退出${inlineCommand.argument?.label ?? inlineCommand.label}编辑`}
+              title="退出编辑"
+              onClick={cancelInlineCommand}
             >
-              {importingAttachments ? (
-                <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
-              ) : (
-                <Plus aria-hidden="true" />
-              )}
-            </IconButton>
-          )}
-          {preferences === undefined ? null : (
-            <Select
-              ariaLabel="访问模式"
-              size="compact"
-              className="ja-composer__access-select"
-              value={preferences.accessMode}
-              disabled={disabled || preferenceBusy || onAccessModeChange === undefined}
-              onValueChange={(value) => onAccessModeChange?.(value as ConversationAccessMode)}
-              options={[
-                { value: "approval_required", label: "需要审批" },
-                { value: "full_access", label: "完全访问" },
-              ]}
-            />
-          )}
-          {modeStatus}
-        </div>
-        <div className="ja-composer__trailing">
-          {contextUsage === undefined ? null : <ContextUsageIndicator usage={contextUsage} />}
-          <Menu modal={false}>
-            <MenuTrigger asChild>
-              <button
-                type="button"
-                className="ja-composer__model-trigger"
-                aria-label={selectionAccessibilityLabel}
-                title={selectionAccessibilityLabel}
-                disabled={disabled || preferenceBusy || models.length === 0}
+              <X aria-hidden="true" />
+            </button>
+          </div>
+        )}
+        {visibleTrigger === undefined ? null : (
+          <ComposerSuggestionPanel
+            id={suggestionListId}
+            kind={visibleTrigger.kind}
+            state={
+              visibleTrigger.kind === "workspace"
+                ? workspaceSuggestions.state === "idle"
+                  ? "loading"
+                  : workspaceSuggestions.state
+                : "ready"
+            }
+            items={suggestionItems}
+            activeId={activeSuggestionId}
+            error={workspaceSuggestions.error}
+            truncated={visibleTrigger.kind === "workspace" && workspaceSuggestions.truncated}
+            onActiveChange={setActiveSuggestionId}
+            onSelect={selectSuggestion}
+            onRetry={
+              visibleTrigger.kind === "workspace"
+                ? () => setSuggestionRetry((current) => current + 1)
+                : undefined
+            }
+          />
+        )}
+        <textarea
+          ref={inputRef}
+          className="ja-composer__input"
+          aria-label={inlineCommand?.argument?.placeholder ?? "消息"}
+          placeholder={inlineCommand?.argument?.placeholder ?? placeholder}
+          aria-describedby={error || commandError ? feedbackId : undefined}
+          aria-controls={visibleTrigger === undefined ? undefined : suggestionListId}
+          aria-expanded={visibleTrigger !== undefined}
+          aria-haspopup="listbox"
+          aria-autocomplete="list"
+          aria-activedescendant={visibleTrigger === undefined ? undefined : activeSuggestionId}
+          value={text}
+          maxLength={1_048_576}
+          rows={1}
+          disabled={disabled || cancelling || resuming}
+          onChange={handleTextChange}
+          onFocus={(event) => {
+            const start = event.currentTarget.selectionStart ?? event.currentTarget.value.length;
+            const end = event.currentTarget.selectionEnd ?? start;
+            setInputFocused(true);
+            lastSelectionRef.current = { start, end };
+            setCaretState({ text: event.currentTarget.value, position: start });
+          }}
+          onBlur={(event) => {
+            setInputFocused(false);
+            if (caretState.text === event.currentTarget.value) return;
+            const position = event.currentTarget.value.length;
+            lastSelectionRef.current = { start: position, end: position };
+            setCaretState({ text: event.currentTarget.value, position });
+          }}
+          onCompositionStart={() => {
+            composingRef.current = true;
+            setComposing(true);
+          }}
+          onCompositionEnd={(event) => {
+            composingRef.current = false;
+            setComposing(false);
+            setCaretState({
+              text: event.currentTarget.value,
+              position: event.currentTarget.selectionStart ?? event.currentTarget.value.length,
+            });
+          }}
+          onKeyDown={handleKeyDown}
+          onKeyUp={(event) => {
+            const start = event.currentTarget.selectionStart ?? text.length;
+            const end = event.currentTarget.selectionEnd ?? start;
+            lastSelectionRef.current = { start, end };
+            setCaretState({ text: event.currentTarget.value, position: start });
+          }}
+          onClick={(event) => {
+            const start = event.currentTarget.selectionStart ?? text.length;
+            const end = event.currentTarget.selectionEnd ?? start;
+            lastSelectionRef.current = { start, end };
+            setCaretState({ text: event.currentTarget.value, position: start });
+          }}
+          onSelect={(event) => {
+            const start = event.currentTarget.selectionStart ?? text.length;
+            const end = event.currentTarget.selectionEnd ?? start;
+            lastSelectionRef.current = { start, end };
+            setCaretState({ text: event.currentTarget.value, position: start });
+          }}
+          onPaste={handlePaste}
+        />
+        <div className="ja-composer__toolbar">
+          <div className="ja-composer__leading">
+            {onAddAttachments === undefined ? null : (
+              <IconButton
+                className="ja-composer__add-button"
+                label="添加附件"
+                tooltip="添加附件"
+                disabled={disabled || sending || importingAttachments}
+                aria-busy={importingAttachments || undefined}
+                onClick={() => void onAddAttachments()}
               >
-                <span>{selectionLabel}</span>
-                <ChevronDown aria-hidden="true" />
-              </button>
-            </MenuTrigger>
-            <MenuContent
-              className="ja-composer__selection-menu"
-              align="end"
-              aria-label="模型与推理设置"
-            >
-              <MenuRadioGroup
-                value={selectedModel?.value ?? ""}
-                onValueChange={(value) => onModelChange?.(value)}
-                aria-label="模型"
+                {importingAttachments ? (
+                  <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
+                ) : (
+                  <Plus aria-hidden="true" />
+                )}
+              </IconButton>
+            )}
+            {preferences === undefined ? null : (
+              <Select
+                ariaLabel="访问模式"
+                size="compact"
+                className="ja-composer__access-select"
+                value={preferences.accessMode}
+                disabled={disabled || preferenceBusy || onAccessModeChange === undefined}
+                onValueChange={(value) => onAccessModeChange?.(value as ConversationAccessMode)}
+                options={[
+                  { value: "approval_required", label: "需要审批" },
+                  { value: "full_access", label: "完全访问" },
+                ]}
+              />
+            )}
+            {modeStatus}
+          </div>
+          <div className="ja-composer__trailing">
+            {contextUsage === undefined ? null : <ContextUsageIndicator usage={contextUsage} />}
+            <Menu modal={false}>
+              <MenuTrigger asChild>
+                <button
+                  type="button"
+                  className="ja-composer__model-trigger"
+                  aria-label={selectionAccessibilityLabel}
+                  title={selectionAccessibilityLabel}
+                  disabled={disabled || preferenceBusy || models.length === 0}
+                >
+                  <span>{selectionLabel}</span>
+                  <ChevronDown aria-hidden="true" />
+                </button>
+              </MenuTrigger>
+              <MenuContent
+                className="ja-composer__selection-menu"
+                align="end"
+                aria-label="模型与推理设置"
               >
-                {groupedModels.map((group, groupIndex) => (
-                  <div key={group.providerId} className="ja-composer__provider-group">
-                    {groupIndex === 0 ? null : <MenuSeparator />}
-                    <MenuLabel className="ja-composer__provider-label" title={group.label}>
-                      {group.label}
-                    </MenuLabel>
-                    {group.options.map((option) => (
-                      <MenuRadioItem
-                        key={option.value}
-                        value={option.value}
-                        disabled={onModelChange === undefined}
-                        className="ja-composer__radio-item ja-composer__model-item"
-                        title={`${option.modelIdentifier} · ${group.label}`}
-                      >
-                        <span className="ja-composer__model-copy">
-                          <span>{option.modelIdentifier}</span>
-                          {option.alias === undefined ? null : <small>{option.alias}</small>}
-                        </span>
-                        <MenuItemIndicator className="ja-composer__radio-indicator">
-                          <Check aria-hidden="true" />
-                        </MenuItemIndicator>
-                      </MenuRadioItem>
-                    ))}
-                  </div>
-                ))}
-              </MenuRadioGroup>
-              {selectedModel !== undefined &&
-              Object.keys(selectedModel.reasoningLevelMap).length > 0 ? (
-                <>
-                  <MenuSeparator />
-                  <MenuSub>
-                    <MenuSubTrigger className="ja-composer__selection-row">
-                      <span>推理强度</span>
-                      <span className="ja-composer__selection-current">
-                        {preferences?.reasoningLevel === null
-                          ? "跟随模型"
-                          : selectedReasoning === null
-                            ? "默认"
-                            : reasoningLabel(selectedReasoning)}
-                      </span>
-                      <ChevronRight aria-hidden="true" />
-                    </MenuSubTrigger>
-                    <MenuSubContent alignOffset={-4} aria-label="选择推理强度">
-                      <MenuRadioGroup
-                        value={preferences?.reasoningLevel ?? MODEL_DEFAULT_REASONING_VALUE}
-                        onValueChange={(value) =>
-                          onReasoningChange?.(
-                            value === MODEL_DEFAULT_REASONING_VALUE
-                              ? null
-                              : (value as ReasoningLevel),
-                          )
-                        }
-                      >
+                <MenuRadioGroup
+                  value={selectedModel?.value ?? ""}
+                  onValueChange={(value) => onModelChange?.(value)}
+                  aria-label="模型"
+                >
+                  {groupedModels.map((group, groupIndex) => (
+                    <div key={group.providerId} className="ja-composer__provider-group">
+                      {groupIndex === 0 ? null : <MenuSeparator />}
+                      <MenuLabel className="ja-composer__provider-label" title={group.label}>
+                        {group.label}
+                      </MenuLabel>
+                      {group.options.map((option) => (
                         <MenuRadioItem
-                          value={MODEL_DEFAULT_REASONING_VALUE}
-                          disabled={onReasoningChange === undefined}
-                          className="ja-composer__radio-item"
+                          key={option.value}
+                          value={option.value}
+                          disabled={onModelChange === undefined}
+                          className="ja-composer__radio-item ja-composer__model-item"
+                          title={`${option.modelIdentifier} · ${group.label}`}
                         >
-                          <span>跟随模型默认</span>
+                          <span className="ja-composer__model-copy">
+                            <span>{option.modelIdentifier}</span>
+                            {option.alias === undefined ? null : <small>{option.alias}</small>}
+                          </span>
                           <MenuItemIndicator className="ja-composer__radio-indicator">
                             <Check aria-hidden="true" />
                           </MenuItemIndicator>
                         </MenuRadioItem>
-                        {(Object.keys(selectedModel.reasoningLevelMap) as ReasoningLevel[]).map(
-                          (effort) => (
-                            <MenuRadioItem
-                              key={effort}
-                              value={effort}
-                              disabled={onReasoningChange === undefined}
-                              className="ja-composer__radio-item"
-                            >
-                              <span>{reasoningLabel(effort)}</span>
-                              <MenuItemIndicator className="ja-composer__radio-indicator">
-                                <Check aria-hidden="true" />
-                              </MenuItemIndicator>
-                            </MenuRadioItem>
-                          ),
-                        )}
-                      </MenuRadioGroup>
-                    </MenuSubContent>
-                  </MenuSub>
-                </>
-              ) : null}
-              {onRestoreDefaults === undefined ? null : (
-                <>
-                  <MenuSeparator />
-                  <MenuItem onSelect={() => void onRestoreDefaults()}>恢复默认设置</MenuItem>
-                </>
-              )}
-            </MenuContent>
-          </Menu>
-          {suspendedTurn ? (
-            <>
-              <span className="ja-composer__interruption" role="status">
-                运行被中断
-              </span>
+                      ))}
+                    </div>
+                  ))}
+                </MenuRadioGroup>
+                {selectedModel !== undefined &&
+                Object.keys(selectedModel.reasoningLevelMap).length > 0 ? (
+                  <>
+                    <MenuSeparator />
+                    <MenuSub>
+                      <MenuSubTrigger className="ja-composer__selection-row">
+                        <span>推理强度</span>
+                        <span className="ja-composer__selection-current">
+                          {preferences?.reasoningLevel === null
+                            ? "跟随模型"
+                            : selectedReasoning === null
+                              ? "默认"
+                              : reasoningLabel(selectedReasoning)}
+                        </span>
+                        <ChevronRight aria-hidden="true" />
+                      </MenuSubTrigger>
+                      <MenuSubContent alignOffset={-4} aria-label="选择推理强度">
+                        <MenuRadioGroup
+                          value={preferences?.reasoningLevel ?? MODEL_DEFAULT_REASONING_VALUE}
+                          onValueChange={(value) =>
+                            onReasoningChange?.(
+                              value === MODEL_DEFAULT_REASONING_VALUE
+                                ? null
+                                : (value as ReasoningLevel),
+                            )
+                          }
+                        >
+                          <MenuRadioItem
+                            value={MODEL_DEFAULT_REASONING_VALUE}
+                            disabled={onReasoningChange === undefined}
+                            className="ja-composer__radio-item"
+                          >
+                            <span>跟随模型默认</span>
+                            <MenuItemIndicator className="ja-composer__radio-indicator">
+                              <Check aria-hidden="true" />
+                            </MenuItemIndicator>
+                          </MenuRadioItem>
+                          {(Object.keys(selectedModel.reasoningLevelMap) as ReasoningLevel[]).map(
+                            (effort) => (
+                              <MenuRadioItem
+                                key={effort}
+                                value={effort}
+                                disabled={onReasoningChange === undefined}
+                                className="ja-composer__radio-item"
+                              >
+                                <span>{reasoningLabel(effort)}</span>
+                                <MenuItemIndicator className="ja-composer__radio-indicator">
+                                  <Check aria-hidden="true" />
+                                </MenuItemIndicator>
+                              </MenuRadioItem>
+                            ),
+                          )}
+                        </MenuRadioGroup>
+                      </MenuSubContent>
+                    </MenuSub>
+                  </>
+                ) : null}
+                {onRestoreDefaults === undefined ? null : (
+                  <>
+                    <MenuSeparator />
+                    <MenuItem onSelect={() => void onRestoreDefaults()}>恢复默认设置</MenuItem>
+                  </>
+                )}
+              </MenuContent>
+            </Menu>
+            {suspendedTurn ? (
+              <>
+                <span className="ja-composer__interruption" role="status">
+                  已暂停
+                </span>
+                <IconButton
+                  type="button"
+                  className="ja-composer__action-button is-cancel"
+                  disabled={!canCancel}
+                  label="取消运行"
+                  tooltip="取消当前中断的运行"
+                  onClick={cancel}
+                >
+                  {cancelling ? (
+                    <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
+                  ) : (
+                    <Square aria-hidden="true" />
+                  )}
+                </IconButton>
+                {(!awaitingUserInput || hasDraftContent) && (
+                  <IconButton
+                    type="button"
+                    className="ja-composer__action-button is-send"
+                    disabled={awaitingUserInput ? !canSend : !canResume}
+                    label={awaitingUserInput ? "发送补充" : "继续运行"}
+                    aria-busy={resuming || undefined}
+                    tooltip={awaitingUserInput ? "以补充说明替代当前问题" : "从已保存的位置继续"}
+                    onClick={awaitingUserInput ? submit : resume}
+                  >
+                    {resuming ? (
+                      <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
+                    ) : (
+                      <Play aria-hidden="true" />
+                    )}
+                  </IconButton>
+                )}
+              </>
+            ) : (
               <IconButton
-                type="button"
-                className="ja-composer__action-button is-cancel"
-                disabled={!canCancel}
-                label="取消运行"
-                tooltip="取消当前中断的运行"
-                onClick={cancel}
+                type={
+                  inlineCommand === undefined && activeTurn && !activeTurnHasDraft
+                    ? "button"
+                    : "submit"
+                }
+                className={cn(
+                  "ja-composer__action-button",
+                  inlineCommand === undefined && activeTurn && !activeTurnHasDraft
+                    ? "is-cancel"
+                    : "is-send",
+                )}
+                disabled={
+                  inlineCommand === undefined && activeTurn && !activeTurnHasDraft
+                    ? !canCancel
+                    : !canSend
+                }
+                label={
+                  inlineCommand !== undefined
+                    ? `创建${inlineCommand.argument?.label ?? inlineCommand.label}`
+                    : activeTurn && !activeTurnHasDraft
+                      ? "停止生成"
+                      : activeTurn
+                        ? "排队发送"
+                        : "发送"
+                }
+                aria-busy={(activeTurn && !activeTurnHasDraft ? cancelling : sending) || undefined}
+                tooltip={
+                  inlineCommand !== undefined
+                    ? `创建${inlineCommand.argument?.label ?? inlineCommand.label}`
+                    : activeTurn && !activeTurnHasDraft
+                      ? "停止当前生成"
+                      : activeTurn
+                        ? `排队发送（${sendShortcutHint}）`
+                        : sendShortcut === "enter"
+                          ? "发送消息（Enter）"
+                          : "发送消息（Ctrl/Cmd + Enter）"
+                }
+                onClick={
+                  inlineCommand === undefined && activeTurn && !activeTurnHasDraft
+                    ? cancel
+                    : undefined
+                }
               >
-                {cancelling ? (
+                {(activeTurn && !activeTurnHasDraft ? cancelling : sending) ? (
                   <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
-                ) : (
+                ) : inlineCommand !== undefined ? (
+                  <Target aria-hidden="true" />
+                ) : activeTurn && !activeTurnHasDraft ? (
                   <Square aria-hidden="true" />
-                )}
-              </IconButton>
-              <IconButton
-                type="button"
-                className="ja-composer__action-button is-send"
-                disabled={!canResume}
-                label="继续运行"
-                aria-busy={resuming || undefined}
-                tooltip="从已保存的位置继续"
-                onClick={resume}
-              >
-                {resuming ? (
-                  <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
                 ) : (
-                  <Play aria-hidden="true" />
+                  <ArrowUp aria-hidden="true" />
                 )}
               </IconButton>
-            </>
-          ) : (
-            <IconButton
-              type={
-                inlineCommand === undefined && activeTurn && !activeTurnHasDraft
-                  ? "button"
-                  : "submit"
-              }
-              className={cn(
-                "ja-composer__action-button",
-                inlineCommand === undefined && activeTurn && !activeTurnHasDraft
-                  ? "is-cancel"
-                  : "is-send",
-              )}
-              disabled={
-                inlineCommand === undefined && activeTurn && !activeTurnHasDraft
-                  ? !canCancel
-                  : !canSend
-              }
-              label={
-                inlineCommand !== undefined
-                  ? `创建${inlineCommand.argument?.label ?? inlineCommand.label}`
-                  : activeTurn && !activeTurnHasDraft
-                    ? "停止生成"
-                    : activeTurn
-                      ? "排队发送"
-                      : "发送"
-              }
-              aria-busy={(activeTurn && !activeTurnHasDraft ? cancelling : sending) || undefined}
-              tooltip={
-                inlineCommand !== undefined
-                  ? `创建${inlineCommand.argument?.label ?? inlineCommand.label}`
-                  : activeTurn && !activeTurnHasDraft
-                    ? "停止当前生成"
-                    : activeTurn
-                      ? "排队发送"
-                      : "发送消息"
-              }
-              onClick={
-                inlineCommand === undefined && activeTurn && !activeTurnHasDraft
-                  ? cancel
-                  : undefined
-              }
-            >
-              {(activeTurn && !activeTurnHasDraft ? cancelling : sending) ? (
-                <LoaderCircle aria-hidden="true" className="ja-composer__spin" />
-              ) : inlineCommand !== undefined ? (
-                <Target aria-hidden="true" />
-              ) : activeTurn && !activeTurnHasDraft ? (
-                <Square aria-hidden="true" />
-              ) : (
-                <ArrowUp aria-hidden="true" />
-              )}
-            </IconButton>
-          )}
+            )}
+          </div>
         </div>
-      </div>
-      {error || commandError ? (
-        <p id={feedbackId} className="ja-composer__error" role="alert">
-          {error ?? commandError}
-        </p>
-      ) : null}
-    </form>
+        {error || commandError ? (
+          <p id={feedbackId} className="ja-composer__error" role="alert">
+            {error ?? commandError}
+          </p>
+        ) : null}
+      </form>
+    </>
   );
 }

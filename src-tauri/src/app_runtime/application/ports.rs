@@ -7,14 +7,15 @@ use super::error::RuntimeCommandError;
 use crate::app_runtime::domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
     GoalRequest, GoalResponse, ManualRecoveryConfirmation, RuntimeRecoveryState, RuntimeStatus,
-    RuntimeStorageInfo, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
-    TaskListInput, TaskListResult, TaskMessageInput, TaskMessageResult, TaskMutationInput,
-    TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
-    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput,
-    ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
-    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
-    WorkspaceDto, WorkspacePathSearchInput, WorkspacePathSearchResult,
+    RuntimeStorageInfo, TaskCloseInput, TaskCloseResult, TaskCreateInput, TaskCreateResult,
+    TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput,
+    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
+    TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
+    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted,
+    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
+    TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate,
+    TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspacePathSearchInput,
+    WorkspacePathSearchResult,
 };
 use ja_runtime::app_server_process::{
     AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
@@ -75,6 +76,8 @@ define_operation_payload!(
     WorkspaceListResultData,
     ThreadCreateParams,
     ThreadCreateResultData,
+    ThreadDiscoverParams,
+    ThreadDiscoverResultData,
     ThreadListParams,
     ThreadListResultData,
     ThreadSearchParams,
@@ -134,6 +137,7 @@ pub(crate) enum ConfigurationResponse {
 pub(crate) enum HistoryRequest {
     WorkspaceList(WorkspaceListParams),
     ThreadCreate(ThreadCreateParams),
+    ThreadDiscover(ThreadDiscoverParams),
     ThreadList(ThreadListParams),
     ThreadSearch(ThreadSearchParams),
     ThreadRead(ThreadReadParams),
@@ -151,6 +155,7 @@ pub(crate) enum HistoryRequest {
 pub(crate) enum HistoryResponse {
     WorkspaceList(WorkspaceListResultData),
     ThreadCreate(ThreadCreateResultData),
+    ThreadDiscover(ThreadDiscoverResultData),
     ThreadList(ThreadListResultData),
     ThreadSearch(ThreadSearchResultData),
     ThreadRead(ThreadReadResultData),
@@ -300,6 +305,10 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
         &self,
         _input: TaskTreeDeleteInput,
     ) -> Result<TaskTreeDeleteResult, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 侧聊关闭必须由 Java 返回幂等终态；fake 不在本地伪造资源清理成功。
+    fn task_close(&self, _input: TaskCloseInput) -> Result<TaskCloseResult, RuntimeCommandError> {
         Err(RuntimeCommandError::unavailable())
     }
     /// Goal/Plan 默认失败关闭；只有生产 Java owner 或显式协议 fixture 可实现持久状态变更。

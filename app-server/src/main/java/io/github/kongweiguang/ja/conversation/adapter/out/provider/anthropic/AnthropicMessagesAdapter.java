@@ -93,7 +93,7 @@ public final class AnthropicMessagesAdapter extends AbstractStreamingModelAdapte
     /** 发送冻结正文，主模型请求不再重复执行 JSON 序列化。 */
     private ModelPort.ModelOutcome executeEncoded(
             byte[] encoded, StreamContext context, RequestController controller) {
-        AnthropicMessagesState state = new AnthropicMessagesState();
+        AnthropicMessagesState state = new AnthropicMessagesState(configuration());
         Request request = request(encoded);
         executeSse(httpClient(), request, ALLOWED_EVENTS, "ANTHROPIC_EVENT", controller,
                 AnthropicMessagesAdapter::serviceFailure,
