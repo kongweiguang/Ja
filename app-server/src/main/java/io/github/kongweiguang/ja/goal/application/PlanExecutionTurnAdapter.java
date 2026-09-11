@@ -48,6 +48,8 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
     private final ConcurrentMap<String, CompletionStage<Void>> activeTurns = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, CompletionStage<?>> activeTurnSources = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ResumeRegistration> resumeRegistrations = new ConcurrentHashMap<>();
+    /** 保护 activeTurns 与 activeTurnSources 的复合身份更新，不把 ConcurrentHashMap 作为锁对象。 */
+    private final Object activeTurnLock = new Object();
 
     /** adapter 复用现有 Thread、Workspace 与连接路由 owner，不保存第二份 Plan 状态。 */
     public PlanExecutionTurnAdapter(TurnService turns, ConversationRepository conversations,
@@ -290,7 +292,7 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
                                                    CompletionStage<?> accepted, Instant startedAt,
                                                    String segment) {
         Objects.requireNonNull(accepted, "accepted");
-        synchronized (activeTurns) {
+        synchronized (activeTurnLock) {
             CompletionStage<?> source = activeTurnSources.get(request.turnId());
             CompletionStage<Void> existing = activeTurns.get(request.turnId());
             if (source == accepted && existing != null) return existing;
@@ -298,7 +300,7 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
             activeTurnSources.put(request.turnId(), accepted);
             activeTurns.put(request.turnId(), tracked);
             tracked.whenComplete((ignored, failure) -> {
-                synchronized (activeTurns) {
+                synchronized (activeTurnLock) {
                     activeTurns.remove(request.turnId(), tracked);
                     activeTurnSources.remove(request.turnId(), accepted);
                 }

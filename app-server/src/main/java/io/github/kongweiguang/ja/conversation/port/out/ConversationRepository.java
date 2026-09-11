@@ -7,7 +7,6 @@ package io.github.kongweiguang.ja.conversation.port.out;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
-import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;

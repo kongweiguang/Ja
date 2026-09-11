@@ -17,7 +17,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证重启恢复只重建 fence/回调，不自动启动模型或重复执行 Tool。 */
 final class GoalContinuationRecoveryHookTest {

@@ -54,10 +54,56 @@
         <Class name="io.github.kongweiguang.ja.configuration.adapter.out.document.ConfigurationWatcher"/>
     </Match>
 
-    <!-- 私有校验函数由同文件嵌套 record 的 compact constructor 或匿名实现调用，SpotBugs 未归因该字节码调用。 -->
+    <!-- 私有校验函数由同文件嵌套 record 的 compact constructor 或匿名实现调用，SpotBugs 未归因该字节码调用。
+         PlanEvaluationAuditPort 的三个校验器同样由接口内嵌套 record 调用。 -->
     <Match>
         <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
-        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.application\.context\.(checkpoint\.CheckpointStore|summary\.SummaryModel)|conversation\.domain\.turn\.TurnExecutionState|conversation\.port\.in\.(ContextCompactionEvent|TurnEvent)|conversation\.port\.out\.ConversationRepository)"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.application\.context\.(checkpoint\.CheckpointStore|summary\.SummaryModel)|conversation\.domain\.turn\.TurnExecutionState|conversation\.port\.in\.(ContextCompactionEvent|TurnEvent)|conversation\.port\.out\.ConversationRepository|goal\.application\.PlanEvaluationAuditPort)"/>
+    </Match>
+
+    <!-- InteractionSuspendedException 是进程内控制流信号；request 必须保留为同一事务提交的领域对象，
+         该异常不会跨进程序列化，继承 RuntimeException 的 Java 序列化契约不适用于此边界。 -->
+    <Match>
+        <Bug pattern="SE_BAD_FIELD"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException"/>
+    </Match>
+
+    <!-- 以下方法把异步控制、恢复注册和侧聊关闭失败按既有领域异常原样重抛；调用方依赖该身份完成
+         lease、Turn 和 closing 闸门的统一收口，不能改成吞错或包装成无分类异常。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.goal.application.GoalContinuationRecoveryHook"/>
+        <Method name="recover"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.goal.application.GoalContinuationTurnAdapter"/>
+        <Method name="startSerialized"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.goal.application.GoalService"/>
+        <Method name="awaitPlanControl"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.goal.application.PlanExecutionCoordinator"/>
+        <Method name="awaitControl"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.goal.application.PlanExecutionTurnAdapter"/>
+        <Method name="registerResumeContinuation"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.goal\.application\.PlanExecutionTurnAdapter\$ResumeRegistration"/>
+        <Method name="deliver"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.task.application.TaskCoordinator"/>
+        <Method name="~(awaitClose|close|closeTemporarySideChats|runSideChatClose)"/>
     </Match>
 
     <!-- 审批等待 API 在中断时按契约抛出已分类运行时异常，调用方必须在 Turn 边界统一收口。 -->

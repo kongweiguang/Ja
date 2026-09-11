@@ -744,17 +744,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      * 将删除标记排除后的 Thread 行投影为稳定列表摘要。
      */
     private static ThreadSummary thread(PersistenceRecords.ThreadRow row) {
-        ThreadSummary.Status status = row.archivedAt() == null
-                ? ThreadSummary.Status.ACTIVE : ThreadSummary.Status.ARCHIVED;
-        return new ThreadSummary(requiredText(row.threadId(), "thread_id"),
-                requiredText(row.workspaceId(), "workspace_id"), requiredText(row.title(), "title"),
-                PersistenceRowProjections.threadPreferences(row), status, row.pinnedAt() != null,
-                row.latestTurnStatus() == null ? null
-                        : TurnState.valueOf(requiredText(row.latestTurnStatus(), "latest_turn_status")),
-                row.latestTurnSeen(), row.activeGoalId(),
-                row.revision(),
-                Instant.parse(requiredText(row.createdAt(), "created_at")),
-                Instant.parse(requiredText(row.updatedAt(), "updated_at")));
+        return PersistenceRowProjections.threadSummary(row);
     }
 
     /** 历史 Turn 只投影 Operation 生命周期；请求级模型事实由 Context Usage 提供。 */

@@ -933,7 +933,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
             turn.completion.completeExceptionally(new PlanSuspendedException());
         } catch (CancellationException cancelled) {
             cancellationLifecycle.awaitBarrier(key, turn);
-            if (turn.planPauseRequested.get() && suspendCancelledTurn(key, turn)) {
+            if (turn.planPauseRequested.get() && suspendCancelledTurn(key)) {
                 turn.completion.completeExceptionally(new PlanSuspendedException());
             } else {
                 terminalSettlement.settleEmergency(turn, TurnState.CANCELLED, "CANCELLED",
@@ -1171,7 +1171,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /** 取消收口只在持久 execution 仍存在且双 CAS 未被其它终态赢走时保留暂停事实。 */
-    private boolean suspendCancelledTurn(Key key, TurnOwnership turn) {
+    private boolean suspendCancelledTurn(Key key) {
         ConversationRepository.TurnSnapshot current = store.findTurn(key.threadId(), key.turnId()).orElse(null);
         if (current == null || current.state().terminal()) return false;
         return store.suspendCancelled(key.threadId(), key.turnId(), current.threadRevision(),

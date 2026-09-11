@@ -80,7 +80,7 @@ public final class GoalContinuationRecoveryHook implements GoalStartupRecovery.C
                                CompletionStage<?> completion) {
         phase.accept(request, false);
         completion.whenComplete((ignored, failure) -> {
-            if (isSuspended(failure)) {
+            if (GoalContinuationCoordinator.isSuspended(failure)) {
                 phase.accept(request, true);
                 try {
                     turns.registerResumeContinuation(request, next -> observeResume(request, lease, next));
@@ -95,20 +95,6 @@ public final class GoalContinuationRecoveryHook implements GoalStartupRecovery.C
                     clock.instant());
             turns.settled(request);
         });
-    }
-
-    /** 恢复回调可能经过 CompletionException 包装，统一识别可继续的 SUSPENDED 中间态。 */
-    private static boolean isSuspended(Throwable failure) {
-        Throwable current = failure;
-        while (current != null) {
-            if (current instanceof io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException
-                    || current instanceof io.github.kongweiguang.ja.conversation.application.loop.AgentLoop.InputNeedsAttentionException
-                    || current instanceof io.github.kongweiguang.ja.conversation.application.service.TurnService.PlanSuspendedException) {
-                return true;
-            }
-            current = current.getCause();
-        }
-        return false;
     }
 
     /** 恢复 lease identity 使用随机值，单调 fencing 仍由 SQLite 分配。 */

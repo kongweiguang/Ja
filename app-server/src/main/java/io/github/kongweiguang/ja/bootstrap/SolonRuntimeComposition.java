@@ -546,7 +546,7 @@ public final class SolonRuntimeComposition {
     public PlanExecutionCoordinator planExecutionCoordinator(MybatisGoalRepository plans,
             PlanExecutionTurnAdapter turns, Clock clock,
             io.github.kongweiguang.ja.goal.application.RuntimePlanEvaluatorAdapter evaluator) {
-        return new PlanExecutionCoordinator(plans, turns, clock, evaluator, turns);
+        return new PlanExecutionCoordinator(plans, turns, clock, evaluator);
     }
 
     /** Plan 验收绑定真实审计端口，失败不能降级为无账本的默认实现。 */

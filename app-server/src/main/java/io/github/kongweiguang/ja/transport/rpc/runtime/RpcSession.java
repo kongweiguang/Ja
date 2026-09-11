@@ -412,6 +412,8 @@ public final class RpcSession implements AutoCloseable {
             throw JaRpcException.of(JaErrorCatalog.QUEUE_FULL, "问答观察数量已达上限");
         }
         String observationId = "observe_" + UUID.randomUUID().toString().replace("-", "");
+        // 订阅所有权转移到 interactionObservations，由 unobserveInteraction/close 统一释放。
+        @SuppressWarnings("PMD.CloseResource")
         AutoCloseable subscription = interactions.subscribe(threadId, event -> {
             if (!closing.get() && interactionObservations.containsKey(observationId)) {
                 publish(event);
@@ -431,6 +433,8 @@ public final class RpcSession implements AutoCloseable {
 
     /** 观察句柄只属于当前连接；重复释放安全，不能改变未决请求的持久状态。 */
     public synchronized void unobserveInteraction(String observationId) {
+        // 从 observation map 移除后由本方法关闭连接级订阅，不能在读取处使用 try-with-resources。
+        @SuppressWarnings("PMD.CloseResource")
         AutoCloseable subscription = interactionObservations.remove(observationId);
         if (subscription == null) return;
         try {

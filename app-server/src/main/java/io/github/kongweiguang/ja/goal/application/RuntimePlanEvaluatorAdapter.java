@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.goal.application;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.kongweiguang.ja.foundation.error.FailureDiagnostics;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
@@ -151,6 +152,8 @@ public final class RuntimePlanEvaluatorAdapter implements PlanEvaluatorPort {
                 List.of(new ModelMessage(ModelRole.USER, List.of(new TextContent(prepared.json())))),
                 List.of(), null, 1, ModelPort.RetryPolicy.SINGLE_ATTEMPT);
         CancellationSource providerCancellation = new CancellationSource();
+        // 注册跨越 Provider stage，由 cleanup/whenComplete 统一关闭，不能在此处 try-with-resources 提前释放。
+        @SuppressWarnings("PMD.CloseResource")
         CancellationToken.Registration cancellationRegistration = context.cancellation().onCancellation(
                 () -> providerCancellation.cancel("plan_cancelled"));
         long timeoutMillis = Math.max(1L, context.remainingBudget().toMillis());
@@ -263,6 +266,7 @@ public final class RuntimePlanEvaluatorAdapter implements PlanEvaluatorPort {
             recordUsage(requestId, snapshot, profile, usage, PlanEvaluationAuditPort.Outcome.UNKNOWN, null);
         } catch (RuntimeException auditFailure) {
             // 审计落库失败同样不能把 evaluator 结论提升为成功；稳定返回 INCONCLUSIVE 供恢复路径处理。
+            logFailure("audit-write", auditFailure);
         } finally {
             lease.close();
         }
@@ -291,12 +295,7 @@ public final class RuntimePlanEvaluatorAdapter implements PlanEvaluatorPort {
 
     /** 仅记录异常类型和编译期调用位置，保留 Native 诊断能力而不泄露 Provider 或数据库载荷。 */
     private static void logFailure(String stage, Throwable failure) {
-        Throwable root = failure;
-        while (root.getCause() != null && root.getCause() != root) root = root.getCause();
-        String origin = java.util.Arrays.stream(root.getStackTrace())
-                .filter(frame -> frame.getClassName().startsWith("io.github.kongweiguang.ja."))
-                .findFirst().map(frame -> frame.getClassName() + "#" + frame.getMethodName() + ":" + frame.getLineNumber())
-                .orElse("unknown");
-        LOGGER.warn("Plan evaluator failed stage={} type={} origin={}", stage, root.getClass().getName(), origin);
+        FailureDiagnostics.Summary summary = FailureDiagnostics.summarize(failure);
+        LOGGER.warn("Plan evaluator failed stage={} type={} origin={}", stage, summary.type(), summary.origin());
     }
 }

@@ -63,9 +63,7 @@ public final class GoalWireMapper {
     public ObjectNode events(GoalModels.Page<GoalModels.PublicEvent> page) {
         ObjectNode result = goalPageBase(page);
         ArrayNode items = result.putArray("items");
-        page.items().forEach(event -> items.add(mapper.createObjectNode()
-                .put("eventSequence", event.eventSequence()).put("kind", event.kind())
-                .put("summary", event.summary()).put("occurredAt", event.occurredAt().toString())));
+        appendEvents(items, page.items());
         cursor(result, page.nextCursor());
         return result;
     }
@@ -75,9 +73,7 @@ public final class GoalWireMapper {
         ObjectNode result = mapper.createObjectNode().put("planId", page.aggregateId())
                 .put("planRevision", page.aggregateRevision()).put("eventSequence", page.eventSequence());
         ArrayNode items = result.putArray("items");
-        page.items().forEach(event -> items.add(mapper.createObjectNode()
-                .put("eventSequence", event.eventSequence()).put("kind", event.kind())
-                .put("summary", event.summary()).put("occurredAt", event.occurredAt().toString())));
+        appendEvents(items, page.items());
         cursor(result, page.nextCursor());
         return result;
     }
@@ -296,6 +292,13 @@ public final class GoalWireMapper {
     private ObjectNode goalPageBase(GoalModels.Page<?> page) {
         return mapper.createObjectNode().put("goalId", page.aggregateId())
                 .put("goalRevision", page.aggregateRevision()).put("eventSequence", page.eventSequence());
+    }
+
+    /** Goal 与 Plan 页共享事件字段编码，但各自保留独立聚合头部，避免 wire 字段和排序语义漂移。 */
+    private void appendEvents(ArrayNode target, List<GoalModels.PublicEvent> events) {
+        events.forEach(event -> target.add(mapper.createObjectNode()
+                .put("eventSequence", event.eventSequence()).put("kind", event.kind())
+                .put("summary", event.summary()).put("occurredAt", event.occurredAt().toString())));
     }
 
     /** 数组逐项写入，避免领域集合反射序列化造成字段漂移。 */

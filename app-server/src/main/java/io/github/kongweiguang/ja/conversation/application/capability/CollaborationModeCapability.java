@@ -3,7 +3,6 @@
 
 package io.github.kongweiguang.ja.conversation.application.capability;
 
-import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.application.policy.PlanToolPolicy;
 import io.github.kongweiguang.ja.conversation.port.out.AgentCapability;

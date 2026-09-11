@@ -130,12 +130,10 @@ public final class MybatisConversationRepository implements ConversationReposito
         ensureOpen();
         Objects.requireNonNull(admission, "admission");
         return transactions.required(mapper -> {
-            io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence
-                    .requireConversationAdmissionOpen(mapper, admission.threadId());
-            PersistenceRecords.ThreadRow thread = requireThread(mapper, admission.threadId());
-            requireRevision(thread, admission.expectedThreadRevision());
-            insertTurnExecution(mapper, admission.turnId(), admission.threadId(),
-                    admission.initialExecution(), admission.requestedAt(), "");
+            ThreadAdmissionContext context = prepareAdmission(mapper, admission.threadId(),
+                    admission.expectedThreadRevision(), admission.turnId(), admission.initialExecution(),
+                    admission.requestedAt(), "");
+            PersistenceRecords.ThreadRow thread = context.thread();
             long ordinal = mapper.agent().selectNextMessageOrdinal(admission.threadId());
             ordinal = TaskContextInheritancePersistence.injectSeedIfFirstTurn(mapper, objectMapper,
                     admission.threadId(), admission.turnId(), admission.requestedAt(), ordinal);
@@ -169,12 +167,10 @@ public final class MybatisConversationRepository implements ConversationReposito
         ensureOpen();
         Objects.requireNonNull(admission, "admission");
         return transactions.required(mapper -> {
-            io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence
-                    .requireConversationAdmissionOpen(mapper, admission.threadId());
-            PersistenceRecords.ThreadRow thread = requireThread(mapper, admission.threadId());
-            requireRevision(thread, admission.expectedThreadRevision());
-            insertTurnExecution(mapper, admission.turnId(), admission.threadId(),
-                    admission.initialExecution(), admission.requestedAt(), "continuation ");
+            ThreadAdmissionContext context = prepareAdmission(mapper, admission.threadId(),
+                    admission.expectedThreadRevision(), admission.turnId(), admission.initialExecution(),
+                    admission.requestedAt(), "continuation ");
+            PersistenceRecords.ThreadRow thread = context.thread();
             TaskContextInheritancePersistence.injectSeedIfFirstTurn(mapper, objectMapper,
                     admission.threadId(), admission.turnId(), admission.requestedAt(),
                     mapper.agent().selectNextMessageOrdinal(admission.threadId()));
@@ -196,12 +192,31 @@ public final class MybatisConversationRepository implements ConversationReposito
 
     /** Turn 与执行游标必须在同一事务共同出现；label 仅区分故障诊断，不改变持久状态。 */
     private void insertTurnExecution(PersistenceMappers mapper, String turnId, String threadId,
-                                     TurnExecutionState initialExecution, Instant requestedAt,
-                                     String label) {
+                                      TurnExecutionState initialExecution, Instant requestedAt,
+                                      String label) {
         requireChanged(mapper.agent().insertTurn(new PersistenceRecords.TurnInsert(
                 turnId, threadId, instant(requestedAt))), label + "turn insert lost");
         requireChanged(mapper.agent().insertTurnExecution(executionWrite(
                 turnId, initialExecution)), label + "initial execution state insert lost");
+    }
+
+    /**
+     * 普通 Turn 与隐藏 continuation 共用 admission 前置校验和 execution 写入，确保关闭闸门与 revision CAS 不分叉。
+     */
+    private ThreadAdmissionContext prepareAdmission(PersistenceMappers mapper, String threadId,
+                                                    long expectedRevision, String turnId,
+                                                    TurnExecutionState initialExecution, Instant requestedAt,
+                                                    String label) {
+        io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence
+                .requireConversationAdmissionOpen(mapper, threadId);
+        PersistenceRecords.ThreadRow thread = requireThread(mapper, threadId);
+        requireRevision(thread, expectedRevision);
+        insertTurnExecution(mapper, turnId, threadId, initialExecution, requestedAt, label);
+        return new ThreadAdmissionContext(thread);
+    }
+
+    /** 首次准入上下文只暴露已校验的 Thread 行，避免调用方绕过共享的关系检查。 */
+    private record ThreadAdmissionContext(PersistenceRecords.ThreadRow thread) {
     }
 
     /**

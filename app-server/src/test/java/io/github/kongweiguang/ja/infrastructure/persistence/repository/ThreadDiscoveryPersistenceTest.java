@@ -5,13 +5,11 @@ package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
-import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.infrastructure.persistence.support.PersistenceTestSupport;
 import org.junit.jupiter.api.Test;
 
 import java.sql.PreparedStatement;
-import java.sql.Statement;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;

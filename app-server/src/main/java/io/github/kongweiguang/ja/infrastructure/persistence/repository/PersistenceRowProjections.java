@@ -5,10 +5,13 @@ package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
+import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords;
 
+import java.time.Instant;
 import java.util.Objects;
 
 /**
@@ -29,6 +32,23 @@ public final class PersistenceRowProjections {
                 AccessMode.valueOf(requiredText(row.accessMode(), "access_mode")),
                 CollaborationMode.valueOf(requiredText(row.collaborationMode(), "collaboration_mode")),
                 titleSource(requiredText(row.titleSource(), "title_source")));
+    }
+
+    /**
+     * 所有 Thread 读取入口共享同一摘要投影，避免主会话与 Child 会话对损坏行或状态枚举采取不同策略。
+     */
+    public static ThreadSummary threadSummary(PersistenceRecords.ThreadRow row) {
+        Objects.requireNonNull(row, "row");
+        ThreadSummary.Status status = row.archivedAt() == null
+                ? ThreadSummary.Status.ACTIVE : ThreadSummary.Status.ARCHIVED;
+        return new ThreadSummary(requiredText(row.threadId(), "thread_id"),
+                requiredText(row.workspaceId(), "workspace_id"), requiredText(row.title(), "title"),
+                threadPreferences(row), status, row.pinnedAt() != null,
+                row.latestTurnStatus() == null ? null
+                        : TurnState.valueOf(requiredText(row.latestTurnStatus(), "latest_turn_status")),
+                row.latestTurnSeen(), row.activeGoalId(), row.revision(),
+                Instant.parse(requiredText(row.createdAt(), "created_at")),
+                Instant.parse(requiredText(row.updatedAt(), "updated_at")));
     }
 
     /** SQLite 与产品共享唯一闭集，未知标题来源必须作为损坏状态失败关闭。 */

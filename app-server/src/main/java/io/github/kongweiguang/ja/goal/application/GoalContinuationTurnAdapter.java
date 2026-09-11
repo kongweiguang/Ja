@@ -106,6 +106,8 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
                 thread, workspace, turnId, clock.instant(), TurnOrigin.GOAL_CONTINUATION);
         GoalEventRegistry.RoutedTurn route = events.registerTurn(request.goalId(), turnId,
                 workspace.workspaceId(), thread.threadId(), thread.revision());
+        // Interaction watch 跨越当前 admission 栈帧，由 observeResumed 在真实终态统一关闭。
+        @SuppressWarnings("PMD.CloseResource")
         AutoCloseable interactionWatch = watchInteraction(request);
         try (route) {
             CompletableFuture<Void> completion = new CompletableFuture<>();

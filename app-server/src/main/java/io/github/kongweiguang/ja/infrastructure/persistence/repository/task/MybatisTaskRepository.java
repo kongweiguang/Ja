@@ -260,15 +260,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
 
     /** 将 Child Thread 的权威行投影为与主会话相同的元数据，保证任务设置读取不漂移。 */
     private static ThreadSummary thread(PersistenceRecords.ThreadRow row) {
-        ThreadSummary.Status status = row.archivedAt() == null
-                ? ThreadSummary.Status.ACTIVE : ThreadSummary.Status.ARCHIVED;
-        return new ThreadSummary(requiredText(row.threadId(), "thread_id"),
-                requiredText(row.workspaceId(), "workspace_id"), requiredText(row.title(), "title"),
-                PersistenceRowProjections.threadPreferences(row), status, row.pinnedAt() != null,
-                row.latestTurnStatus() == null ? null : TurnState.valueOf(requiredText(
-                        row.latestTurnStatus(), "latest_turn_status")), row.latestTurnSeen(), row.activeGoalId(),
-                row.revision(), Instant.parse(requiredText(row.createdAt(), "created_at")),
-                Instant.parse(requiredText(row.updatedAt(), "updated_at")));
+        return PersistenceRowProjections.threadSummary(row);
     }
 
     /** 普通 MESSAGE 只写入有界 Mailbox；它是跨会话投递事实，不应制造 Task Activity 或未读投影。 */
@@ -600,38 +592,13 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
      * 函数内部用于绑定附件，调用方不保留无后续语义的返回值。
      */
     private ConversationRepository.AdmissionReceipt admitChild(PersistenceMappers mapper,
-                                                                TaskModels.ChildAdmission child,
+        TaskModels.ChildAdmission child,
                                                                 ConversationRepository.TurnAdmission turn) {
-        SideChatPersistence.requireTaskAdmissionOpen(mapper, child.parentThreadId());
-        TaskRecords.ParentRow parent = requireParent(mapper, child.parentThreadId());
-        requireParentRevision(parent, child.expectedParentRevision());
-        if (!parent.workspaceId().equals(child.childThread().workspaceId())) {
-            throw relation("child and parent must share one Workspace");
-        }
-        int depth = parent.depth() == null ? 1 : parent.depth() + 1;
-        if (depth > 4) throw new TaskRepositoryException(TaskRepositoryException.Code.DEPTH_LIMIT,
-                "task depth exceeds limit");
-        String rootThreadId = parent.rootThreadId() == null ? parent.threadId() : parent.rootThreadId();
-        if (mapper.tasks().countRootDescendants(rootThreadId) >= MAX_TREE_SIZE) {
-            throw new TaskRepositoryException(TaskRepositoryException.Code.TREE_LIMIT,
-                    "task tree exceeds limit");
-        }
+        ChildAdmissionContext context = prepareChild(mapper, child);
+        String rootThreadId = context.rootThreadId();
         String rootTurnId = causalRootTurn(mapper, child.parentThreadId(), child.originTurnId(),
                 child.lifecycle() == TaskModels.Lifecycle.ATTACHED);
-        requireSeedMode(child);
-        PersistenceRecords.SubagentPolicyRow parentPolicy = mapper.subagentPolicies().select(parent.threadId());
-        if (parentPolicy == null) throw invalidState("parent subagent policy is unavailable");
-        insertThread(mapper, child.childThread());
-        requireChanged(mapper.subagentPolicies().insert(new PersistenceRecords.SubagentPolicyInsert(
-                child.childThread().threadId(), parentPolicy.enabled(), parentPolicy.providerId(),
-                parentPolicy.modelId(), parentPolicy.reasoningLevel(), instant(child.contextSeed().createdAt()))),
-                "child subagent policy insert lost");
-        String fingerprint = insertSeed(mapper, child.contextSeed());
-        requireChanged(mapper.tasks().insertLineage(new TaskRecords.LineageInsert(
-                child.childThread().threadId(), child.parentThreadId(), rootThreadId, child.originTurnId(),
-                child.taskName(), depth, child.kind().name(), child.lifecycle().name(),
-                child.contextSeed().contextSeedId(), instant(child.contextSeed().createdAt()))),
-                "task lineage insert lost");
+        String fingerprint = insertChildMetadata(mapper, context, child);
         requireChanged(mapper.tasks().insertChildTurn(childTurn(turn, child.originTurnId(), rootTurnId)),
                 "child Turn insert lost");
         requireChanged(mapper.agent().insertTurnExecution(executionWrite(turn.turnId(), turn.initialExecution())),
@@ -670,35 +637,10 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
 
     /** idle admission 与首 Turn admission 共享关系校验和元数据写入，但刻意没有任何 Turn 写入。 */
     private TaskModels.Summary admitIdleChild(PersistenceMappers mapper, TaskModels.ChildAdmission child) {
-        SideChatPersistence.requireTaskAdmissionOpen(mapper, child.parentThreadId());
-        TaskRecords.ParentRow parent = requireParent(mapper, child.parentThreadId());
-        requireParentRevision(parent, child.expectedParentRevision());
-        if (!parent.workspaceId().equals(child.childThread().workspaceId())) {
-            throw relation("child and parent must share one Workspace");
-        }
-        int depth = parent.depth() == null ? 1 : parent.depth() + 1;
-        if (depth > 4) throw new TaskRepositoryException(TaskRepositoryException.Code.DEPTH_LIMIT,
-                "task depth exceeds limit");
-        String rootThreadId = parent.rootThreadId() == null ? parent.threadId() : parent.rootThreadId();
-        if (mapper.tasks().countRootDescendants(rootThreadId) >= MAX_TREE_SIZE) {
-            throw new TaskRepositoryException(TaskRepositoryException.Code.TREE_LIMIT,
-                    "task tree exceeds limit");
-        }
+        ChildAdmissionContext context = prepareChild(mapper, child);
+        String rootThreadId = context.rootThreadId();
         causalRootTurn(mapper, child.parentThreadId(), child.originTurnId(), false);
-        requireSeedMode(child);
-        PersistenceRecords.SubagentPolicyRow parentPolicy = mapper.subagentPolicies().select(parent.threadId());
-        if (parentPolicy == null) throw invalidState("parent subagent policy is unavailable");
-        insertThread(mapper, child.childThread());
-        requireChanged(mapper.subagentPolicies().insert(new PersistenceRecords.SubagentPolicyInsert(
-                child.childThread().threadId(), parentPolicy.enabled(), parentPolicy.providerId(),
-                parentPolicy.modelId(), parentPolicy.reasoningLevel(), instant(child.contextSeed().createdAt()))),
-                "child subagent policy insert lost");
-        insertSeed(mapper, child.contextSeed());
-        requireChanged(mapper.tasks().insertLineage(new TaskRecords.LineageInsert(
-                child.childThread().threadId(), child.parentThreadId(), rootThreadId, child.originTurnId(),
-                child.taskName(), depth, child.kind().name(), child.lifecycle().name(),
-                child.contextSeed().contextSeedId(), instant(child.contextSeed().createdAt()))),
-                "task lineage insert lost");
+        insertChildMetadata(mapper, context, child);
         long activitySequence = insertActivity(mapper, child.activityId(), rootThreadId,
                 child.childThread().threadId(), child.parentThreadId(), child.originTurnId(),
                 TaskModels.ActivityKind.CREATED, child.activitySummary(), child.contextSeed().createdAt());
@@ -949,6 +891,54 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         return new TaskModels.Summary(lineage, projection);
     }
 
+    /**
+     * 两种 Child admission 共用同一关系快照；先冻结父 revision、树深度和根身份，再分别写入 Turn 或 idle 投影。
+     */
+    private ChildAdmissionContext prepareChild(PersistenceMappers mapper, TaskModels.ChildAdmission child) {
+        SideChatPersistence.requireTaskAdmissionOpen(mapper, child.parentThreadId());
+        TaskRecords.ParentRow parent = requireParent(mapper, child.parentThreadId());
+        requireParentRevision(parent, child.expectedParentRevision());
+        if (!parent.workspaceId().equals(child.childThread().workspaceId())) {
+            throw relation("child and parent must share one Workspace");
+        }
+        int depth = parent.depth() == null ? 1 : parent.depth() + 1;
+        if (depth > 4) throw new TaskRepositoryException(TaskRepositoryException.Code.DEPTH_LIMIT,
+                "task depth exceeds limit");
+        String rootThreadId = parent.rootThreadId() == null ? parent.threadId() : parent.rootThreadId();
+        if (mapper.tasks().countRootDescendants(rootThreadId) >= MAX_TREE_SIZE) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.TREE_LIMIT,
+                    "task tree exceeds limit");
+        }
+        return new ChildAdmissionContext(parent, depth, rootThreadId);
+    }
+
+    /**
+     * Child 的 seed、父策略、Thread 和 lineage 必须以相同顺序落库；返回 fingerprint 供首 Turn 上下文注入复用。
+     */
+    private String insertChildMetadata(PersistenceMappers mapper, ChildAdmissionContext context,
+                                       TaskModels.ChildAdmission child) {
+        requireSeedMode(child);
+        PersistenceRecords.SubagentPolicyRow parentPolicy = mapper.subagentPolicies().select(
+                context.parent().threadId());
+        if (parentPolicy == null) throw invalidState("parent subagent policy is unavailable");
+        insertThread(mapper, child.childThread());
+        requireChanged(mapper.subagentPolicies().insert(new PersistenceRecords.SubagentPolicyInsert(
+                child.childThread().threadId(), parentPolicy.enabled(), parentPolicy.providerId(),
+                parentPolicy.modelId(), parentPolicy.reasoningLevel(), instant(child.contextSeed().createdAt()))),
+                "child subagent policy insert lost");
+        String fingerprint = insertSeed(mapper, child.contextSeed());
+        requireChanged(mapper.tasks().insertLineage(new TaskRecords.LineageInsert(
+                child.childThread().threadId(), child.parentThreadId(), context.rootThreadId(), child.originTurnId(),
+                child.taskName(), context.depth(), child.kind().name(), child.lifecycle().name(),
+                child.contextSeed().contextSeedId(), instant(child.contextSeed().createdAt()))),
+                "task lineage insert lost");
+        return fingerprint;
+    }
+
+    /** relation 预检结果只在当前事务内使用，不能携带可变 mapper 或跨事务状态。 */
+    private record ChildAdmissionContext(TaskRecords.ParentRow parent, int depth, String rootThreadId) {
+    }
+
     /** Seed JSON 使用相同 codec 还原，不接受 null EFFECTIVE_CONTEXT 漂移。 */
     private TaskModels.ContextSeed seed(TaskRecords.ContextSeedRow row) {
         return new TaskModels.ContextSeed(row.contextSeedId(), row.parentThreadId(), row.parentTurnId(),
@@ -1154,12 +1144,6 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     /** 所有时刻保存 ISO-8601 UTC/offset 文本，不读取本机时区。 */
     private static String instant(Instant value) {
         return Objects.requireNonNull(value, "instant").toString();
-    }
-
-    /** 损坏的必填数据库列不能被投影成有效任务身份，也不向调用方泄露原始列内容。 */
-    private static String requiredText(String value, String column) {
-        if (value == null || value.isBlank()) throw invalidState("required task field is unavailable: " + column);
-        return value;
     }
 
     /** 可空持久时刻只由 null 表达缺失。 */

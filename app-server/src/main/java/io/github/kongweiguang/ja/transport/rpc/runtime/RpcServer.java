@@ -31,6 +31,7 @@ import io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
+import io.github.kongweiguang.ja.foundation.error.FailureDiagnostics;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -301,14 +302,9 @@ public final class RpcServer implements AutoCloseable {
         }
         if (failure instanceof StorageException persistence) {
             // 只记录异常类型与编译期位置，定位 Native 持久化映射失败而不输出 SQL、路径或用户载荷。
-            Throwable root = persistence;
-            while (root.getCause() != null && root.getCause() != root) root = root.getCause();
-            String origin = java.util.Arrays.stream(root.getStackTrace())
-                    .filter(frame -> frame.getClassName().startsWith("io.github.kongweiguang.ja."))
-                    .findFirst().map(frame -> frame.getClassName() + "#" + frame.getMethodName() + ":" + frame.getLineNumber())
-                    .orElse("unknown");
+            FailureDiagnostics.Summary summary = FailureDiagnostics.summarize(persistence);
             LOGGER.warn("JA-RPC storage rejected category={} causeType={} origin={}",
-                    persistence.code(), root.getClass().getName(), origin);
+                    persistence.code(), summary.type(), summary.origin());
             return mapPersistenceFailure(persistence.code());
         }
         if (failure instanceof ConfigurationError configuration) {

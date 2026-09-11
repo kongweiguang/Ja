@@ -15,7 +15,6 @@ import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
 import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
 import io.github.kongweiguang.ja.conversation.application.policy.PlanToolPolicy;
 import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
-import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
@@ -708,13 +707,13 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                 return new TurnToolSessionFactory.Session() {
                     private boolean closed;
 
-                    /** 返回本次 Provider 请求绑定的 MCP Tool；会话关闭后拒绝复用失效连接。 */
+                    /** 返回本次 Provider 请求绑定的不可变 MCP Tool 目录；会话关闭后拒绝复用失效连接。 */
                     @Override
                     public List<AgentTool> tools() {
                         if (closed) {
                             throw new IllegalStateException("Turn MCP session is closed");
                         }
-                        return adapted;
+                        return List.copyOf(adapted);
                     }
 
                     /** 幂等关闭底层 MCP 会话，使正常、取消和异常路径可以竞争释放。 */

@@ -32,7 +32,6 @@ public final class PlanExecutionCoordinator {
     private final PlanExecutionTurnPort turns;
     private final PlanEvaluatorPort evaluator;
     private final Clock clock;
-    private final PlanExecutionBudgetPort budgets;
     private final java.util.concurrent.ConcurrentMap<String, CancellationSource> activeEvaluations =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.ConcurrentMap<String, CompletionStage<Plan>> evaluationCompletions =
@@ -47,17 +46,10 @@ public final class PlanExecutionCoordinator {
     /** 生产可替换验收策略，默认策略只读取 SQLite 事实而不执行 Tool。 */
     public PlanExecutionCoordinator(GoalRepository plans, PlanExecutionTurnPort turns, Clock clock,
                                     PlanEvaluatorPort evaluator) {
-        this(plans, turns, clock, evaluator, null);
-    }
-
-    /** 生产组合注入 RuntimeLease budget provider；缺失 provider 不得伪造跨 Turn 累计上限。 */
-    public PlanExecutionCoordinator(GoalRepository plans, PlanExecutionTurnPort turns, Clock clock,
-                                    PlanEvaluatorPort evaluator, PlanExecutionBudgetPort budgets) {
         this.plans = Objects.requireNonNull(plans, "plans");
         this.turns = Objects.requireNonNull(turns, "turns");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.evaluator = Objects.requireNonNull(evaluator, "evaluator");
-        this.budgets = budgets;
     }
 
     /** 由组合根绑定提交后事件出口；验收结果已落库后才通知 Plan 观察者。 */

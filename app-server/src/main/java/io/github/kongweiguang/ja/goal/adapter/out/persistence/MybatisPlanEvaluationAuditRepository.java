@@ -113,16 +113,18 @@ public final class MybatisPlanEvaluationAuditRepository implements PlanEvaluatio
             List<GoalModels.CriterionEvaluation> result = new ArrayList<>();
             Set<String> seen = new HashSet<>();
             for (JsonNode item : root) {
-                if (!item.isObject() || item.size() != 3 || !item.has("criterionId")
-                        || !item.has("verdict") || !item.has("reason")
-                        || !item.get("criterionId").isTextual() || !item.get("verdict").isTextual()
-                        || !item.get("reason").isTextual()) {
+                JsonNode criterionIdNode = item == null ? null : item.path("criterionId");
+                JsonNode verdictNode = item == null ? null : item.path("verdict");
+                JsonNode reasonNode = item == null ? null : item.path("reason");
+                if (item == null || !item.isObject() || item.size() != 3
+                        || !criterionIdNode.isTextual() || !verdictNode.isTextual()
+                        || !reasonNode.isTextual()) {
                     throw new IllegalArgumentException("invalid persisted criterion");
                 }
-                String criterionId = item.get("criterionId").textValue();
+                String criterionId = criterionIdNode.textValue();
                 if (!seen.add(criterionId)) throw new IllegalArgumentException("duplicate persisted criterion");
                 result.add(new GoalModels.CriterionEvaluation(criterionId,
-                        verdict(item.get("verdict").textValue()), item.get("reason").textValue()));
+                        verdict(verdictNode.textValue()), reasonNode.textValue()));
             }
             return List.copyOf(result);
         } catch (JsonProcessingException | RuntimeException failure) {

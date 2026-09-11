@@ -91,7 +91,7 @@ public final class GoalContinuationCoordinator implements AutoCloseable {
     }
 
     /** 识别 TurnService 的可恢复挂起信号，避免把等待回答当作执行失败收口。 */
-    private static boolean isSuspended(Throwable failure) {
+    static boolean isSuspended(Throwable failure) {
         Throwable current = failure;
         while (current != null) {
             if (current instanceof io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException

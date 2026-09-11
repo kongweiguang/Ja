@@ -76,7 +76,7 @@ final class OpenAiResponsesState {
             case "response.refusal.done" -> textDone(data, TextKind.REFUSAL);
             case "response.reasoning_summary_text.delta" -> reasoningSummaryDelta(data, effects);
             case "response.reasoning_summary_text.done" -> reasoningSummaryDone(data, effects);
-            case "response.reasoning_summary_part.added" -> reasoningSummaryPartAdded(data, effects);
+            case "response.reasoning_summary_part.added" -> reasoningSummaryPartAdded(data);
             case "response.reasoning_summary_part.done" -> reasoningSummaryPartDone(data, effects);
             case "response.reasoning_text.delta" -> reasoningTextDelta(data, effects);
             case "response.reasoning_text.done" -> reasoningTextDone(data, effects);
@@ -522,8 +522,7 @@ final class OpenAiResponsesState {
     /**
      * 登记 summary part 的段落边界；文本在 done 或 terminal item 中确认后才进入公开事件。
      */
-    private void reasoningSummaryPartAdded(
-            JsonNode event, List<ModelPort.ModelEvent> effects) {
+    private void reasoningSummaryPartAdded(JsonNode event) {
         int outputIndex = requiredIndex(event, "output_index");
         ReasoningAccumulator accumulator = reasoningFor(
                 requiredText(event, "item_id", false), outputIndex);
@@ -630,11 +629,12 @@ final class OpenAiResponsesState {
     }
 
     /**
-     * 标记一个 output slot 已出现；缺失的前序 slot会在 terminal output 中创建后再释放后续事件。
+     * 标记一个 output slot 已出现；map 中的 slot 本身就是出现事实，缺失的前序 slot 会在
+     * terminal output 中创建后再释放后续事件。
      */
     private void observeIndex(int outputIndex) {
         if (outputIndex < nextOutputIndex) return;
-        itemSlots.computeIfAbsent(outputIndex, ignored -> new ItemSlot()).seen = true;
+        itemSlots.computeIfAbsent(outputIndex, ignored -> new ItemSlot());
     }
 
     /**
@@ -674,7 +674,6 @@ final class OpenAiResponsesState {
      * 记录 output slot 的显式条目状态；文本事件没有 output_item.added 时仍可在 done 处关闭 slot。
      */
     private static final class ItemSlot {
-        private boolean seen;
         private boolean explicitItem;
         private boolean complete;
 
@@ -695,7 +694,6 @@ final class OpenAiResponsesState {
         private String publicDisplayed = "";
         private DisplaySource displaySource = DisplaySource.UNSELECTED;
         private JsonNode nativeItem;
-        private boolean summaryObserved;
         private boolean emitted;
         private ReasoningContent emittedContent;
 
@@ -727,13 +725,11 @@ final class OpenAiResponsesState {
 
         /** 累积一个 summary_text delta，段落编号只由外层严格索引校验后传入。 */
         private void appendSummary(int summaryIndex, String value) {
-            summaryObserved = true;
             summaryParts.computeIfAbsent(summaryIndex, ignored -> new StringBuilder()).append(value);
         }
 
         /** 用 done/terminal 的最终 part 文本补齐缺失 delta，禁止非前缀的内容篡改。 */
         private void finishSummary(int summaryIndex, String value) {
-            summaryObserved = true;
             StringBuilder current = summaryParts.computeIfAbsent(summaryIndex, ignored -> new StringBuilder());
             String existing = current.toString();
             if (existing.equals(value)) return;
@@ -751,7 +747,6 @@ final class OpenAiResponsesState {
             if (!"summary_text".equals(requiredText(part, "type", false))) {
                 throw protocol("OpenAI reasoning summary part type is invalid");
             }
-            summaryObserved = true;
             String text = optionalText(part, "text");
             if (text != null && !text.isEmpty()) {
                 summaryParts.computeIfAbsent(summaryIndex, ignored -> new StringBuilder()).append(text);

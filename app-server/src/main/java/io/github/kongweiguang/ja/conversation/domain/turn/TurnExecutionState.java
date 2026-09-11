@@ -25,20 +25,18 @@ public sealed interface TurnExecutionState permits TurnExecutionState.Ready,
      * 在挂起边界冻结剩余活动预算；恢复会重新生成绝对截止线，但不会重置累计游标。
      */
     default TurnExecutionState withActiveBudget(Duration budget) {
-        Common updated = common().withActiveBudget(budget);
-        return switch (this) {
-            case Ready ready -> new Ready(updated, ready.next(), ready.summary());
-            case ProviderPending pending -> new ProviderPending(updated, pending.requestId(), pending.messageId(),
-                    pending.purpose(), pending.profile(), pending.envelopeFingerprint(),
-                    new Ready(updated, pending.resume().next(), pending.resume().summary()));
-            case Tools tools -> new Tools(updated, tools.batchId(), tools.assistantMessageId(),
-                    tools.firstOrdinal(), tools.lastOrdinal(), tools.nextOrdinal());
-        };
+        return withCommon(common().withActiveBudget(budget));
     }
 
     /** 恢复时只替换本轮活动截止线，保留已冻结的剩余预算和其它执行事实。 */
     default TurnExecutionState withDeadline(Instant deadline) {
-        Common updated = common().withDeadline(deadline);
+        return withCommon(common().withDeadline(deadline));
+    }
+
+    /**
+     * 所有游标状态只替换共享 Common，其余恢复字段必须原样保留；集中重建避免预算与 deadline 路径漂移。
+     */
+    private TurnExecutionState withCommon(Common updated) {
         return switch (this) {
             case Ready ready -> new Ready(updated, ready.next(), ready.summary());
             case ProviderPending pending -> new ProviderPending(updated, pending.requestId(), pending.messageId(),

@@ -33,11 +33,6 @@ public record InteractionQuestion(String questionId, String prompt, InteractionQ
         }
     }
 
-    /** 普通题面不允许控制字符，避免换行和终端控制序列污染卡片布局。 */
-    private static String text(String value, String field, int max) {
-        return text(value, field, max, false);
-    }
-
     /** 仅题目 prompt 允许自然多行文本，仍限制长度和控制字符集合。 */
     private static String text(String value, String field, int max, boolean allowWhitespace) {
         Objects.requireNonNull(value, field);

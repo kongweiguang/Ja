@@ -357,16 +357,11 @@ public final class MybatisGoalRepository implements GoalRepository {
      */
     @Override public void settlePlanTurn(SettlePlanTurn command) {
         transactions.required(c -> {
-            if (queryOne(c, "SELECT 1 FROM plan_events WHERE plan_id=? AND idempotency_key=?",
-                    r -> r.getInt(1), command.planId(), command.idempotencyKey()) != null) return null;
-            Plan before = requirePlan(c, command.planId());
-            RunBudget budget = queryOne(c,
-                    "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
-                            + "max_model_rounds,max_tool_calls,wall_budget_millis,"
-                            + "used_model_rounds,used_tool_calls,used_active_millis "
-                            + "FROM execution_runs WHERE run_id=?", this::mapRunBudget, command.runId());
-            if (budget == null || !Objects.equals(budget.planId(), command.planId())
-                    || !Objects.equals(budget.planRevision(), before.activePlanRevisionId())) return null;
+            PlanSettlementContext context = planSettlementContext(c, command.planId(), command.runId(),
+                    command.idempotencyKey());
+            if (context == null) return null;
+            Plan before = context.plan();
+            RunBudget budget = context.budget();
             Integer claimed = queryOne(c, "SELECT 1 FROM plan_turn_claims WHERE run_id=? AND turn_id=? AND state='CLAIMED'",
                     r -> r.getInt(1), command.runId(), command.turnId());
             if (claimed == null) return null;
@@ -412,16 +407,11 @@ public final class MybatisGoalRepository implements GoalRepository {
      */
     @Override public void settlePlanTurnActivity(SettlePlanTurnActivity command) {
         transactions.required(c -> {
-            if (queryOne(c, "SELECT 1 FROM plan_events WHERE plan_id=? AND idempotency_key=?",
-                    r -> r.getInt(1), command.planId(), command.idempotencyKey()) != null) return null;
-            Plan before = requirePlan(c, command.planId());
-            RunBudget budget = queryOne(c,
-                    "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
-                            + "max_model_rounds,max_tool_calls,wall_budget_millis,"
-                            + "used_model_rounds,used_tool_calls,used_active_millis "
-                            + "FROM execution_runs WHERE run_id=?", this::mapRunBudget, command.runId());
-            if (budget == null || !Objects.equals(budget.planId(), command.planId())
-                    || !Objects.equals(budget.planRevision(), before.activePlanRevisionId())) return null;
+            PlanSettlementContext context = planSettlementContext(c, command.planId(), command.runId(),
+                    command.idempotencyKey());
+            if (context == null) return null;
+            Plan before = context.plan();
+            RunBudget budget = context.budget();
             Integer claimed = queryOne(c, "SELECT 1 FROM plan_turn_claims WHERE run_id=? AND turn_id=?",
                     r -> r.getInt(1), command.runId(), command.turnId());
             if (claimed == null) return null;
@@ -1111,6 +1101,28 @@ public final class MybatisGoalRepository implements GoalRepository {
                              int turnsUsed,boolean pauseRequested,Integer maxModelRounds,
                              Integer maxToolCalls,Long wallBudgetMillis,int usedModelRounds,
                              int usedToolCalls,long usedActiveMillis){}
+
+    /**
+     * 两类 Turn 结算必须读取同一 Plan/Run 快照；幂等键或 revision 不匹配时统一返回无副作用的空结果。
+     */
+    private PlanSettlementContext planSettlementContext(Connection c, String planId, String runId,
+                                                        String idempotencyKey) throws SQLException {
+        if (queryOne(c, "SELECT 1 FROM plan_events WHERE plan_id=? AND idempotency_key=?",
+                r -> r.getInt(1), planId, idempotencyKey) != null) return null;
+        Plan plan = requirePlan(c, planId);
+        RunBudget budget = queryOne(c,
+                "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
+                        + "max_model_rounds,max_tool_calls,wall_budget_millis,"
+                        + "used_model_rounds,used_tool_calls,used_active_millis "
+                        + "FROM execution_runs WHERE run_id=?", this::mapRunBudget, runId);
+        if (budget == null || !Objects.equals(budget.planId(), planId)
+                || !Objects.equals(budget.planRevision(), plan.activePlanRevisionId())) return null;
+        return new PlanSettlementContext(plan, budget);
+    }
+
+    /** 结算上下文只在当前 JDBC 事务内有效，禁止跨事务保存可变 Run 状态。 */
+    private record PlanSettlementContext(Plan plan, RunBudget budget) {
+    }
     /** run budget 行严格读取列类型，损坏预算不能静默退化为默认值。 */
     private RunBudget mapRunBudget(ResultSet r) throws SQLException {
         return new RunBudget(r.getString("status"), r.getString("plan_id"),

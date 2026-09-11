@@ -394,9 +394,8 @@ public final class GoalService implements GoalUseCase {
                         command.planRevisionId(), runId, turnId)), "resolved Plan execution budget");
         GoalModels.Plan result = goals.executePlan(new GoalRepository.ExecutePlan(command.planId(), command.expectedPlanRevision(),
                 command.planRevisionId(), command.planHash(), id("appr_"), runId, command.processGeneration(), id("evt_"),
-                command.idempotencyKey(), at(command.at()), budget == null ? null : budget.maxModelRounds(),
-                budget == null ? null : budget.maxToolCalls(), budget == null ? null : budget.wallBudgetMillis(),
-                budget == null ? null : budget.antiLoopTurnBudget()));
+                command.idempotencyKey(), at(command.at()), budget.maxModelRounds(), budget.maxToolCalls(),
+                budget.wallBudgetMillis(), budget.antiLoopTurnBudget()));
         publishPlanCommitted(result.planId());
         if (planExecutions == null) throw new IllegalStateException("Plan execution runtime is unavailable");
         planExecutions.start(result, events);

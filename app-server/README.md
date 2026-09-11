@@ -43,7 +43,7 @@ Provider 是用户自定义连接；名称不参与路由，每条配置按所�
   如果响应没有可回放的原生载荷，Ja 只展示摘要，不伪造一个下一轮可能被拒绝的 reasoning 块。
 
 思考档位是配置层的逻辑 `off|minimal|low|medium|high|xhigh|max`，由模型能力表映射成上游值。Anthropic 当前自适应思考
-使用 `thinking.type=adaptive` 和 `output_config.effort`；Codec 对旧版 `budget_tokens` 仍做防御性解析，但任意数字预算不是当前
+使用 `thinking.type=adaptive` 和 `output_config.effort`；Codec 对旧版 `budget_tokens` 的数字形式仍做防御性解析，但任意数字预算不是当前
 桌面设置的公开档位，不能绕过配置合同直接写入请求。
 
 ## 日志目录
