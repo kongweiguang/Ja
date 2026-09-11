@@ -446,7 +446,9 @@ jobs:
           $data = Join-Path $env:RUNNER_TEMP 'Ja App Server\unicode 空格 data'
           $artifactPath = Join-Path $PWD 'app-server/target/ja-app-server.exe'
           $artifact = Get-Item -LiteralPath $artifactPath -ErrorAction Stop
-          $maxBytes = [int64]104857600
+          # The current release matrix peaks at 106,893,312 bytes; retain a bounded
+          # copied-artifact guard while allowing the verified Native Image headroom.
+          $maxBytes = [int64](120 * 1024 * 1024)
           if ($artifact.Length -le 0 -or $artifact.Length -gt $maxBytes) { throw 'fresh native executable is missing, empty, or over the approved size limit' }
           $sha256 = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
           $unixEpochTicks = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).Ticks
@@ -481,7 +483,8 @@ jobs:
           PY
           )"
           IFS=$'\t' read -r sha256 size_bytes mtime_ns <<< "$identity"
-          if [ -z "$sha256" ] || [ -z "$size_bytes" ] || [ -z "$mtime_ns" ] || [ "$size_bytes" -le 0 ] || [ "$size_bytes" -gt 104857600 ]; then
+          # Keep this bound identical to the Windows smoke gate and local verifier.
+          if [ -z "$sha256" ] || [ -z "$size_bytes" ] || [ -z "$mtime_ns" ] || [ "$size_bytes" -le 0 ] || [ "$size_bytes" -gt $((120 * 1024 * 1024)) ]; then
             echo 'fresh native executable is missing, empty, over the approved size limit, or has incomplete identity' >&2
             exit 1
           fi

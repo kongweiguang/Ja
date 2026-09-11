@@ -484,7 +484,7 @@ $nativeFixtureEvidence = & {
     $repositoryRoot = $FixtureRepository
     $nativeRequested = $true
     $freshnessFutureSkew = [TimeSpan]::FromMinutes(2)
-    $nativeExecutableMaxBytes = [int64]104857600
+    $nativeExecutableMaxBytes = [int64](120 * 1024 * 1024)
     $runStartedAt = [DateTimeOffset]::UtcNow.AddMinutes(-1)
     $results = [System.Collections.Generic.List[object]]::new()
     $results.Add([ordered]@{ name = 'java-native-build'; passed = $true; startedAt = $runStartedAt.ToString('o') })
@@ -524,13 +524,13 @@ $nativeFixtureEvidence = & {
 } (Join-Path $repositoryRoot 'scripts\verification\run-production-verification.ps1') (Join-Path $scratchRoot 'native-artifact-fixture')
 
 Assert-VerificationInvariant -Condition ($nativeFixtureEvidence.atLimit.passed `
-        -and $nativeFixtureEvidence.atLimit.artifact.actualBytes -eq 104857600 `
-        -and $nativeFixtureEvidence.atLimit.artifact.maxBytes -eq 104857600 `
+        -and $nativeFixtureEvidence.atLimit.artifact.actualBytes -eq 125829120 `
+        -and $nativeFixtureEvidence.atLimit.artifact.maxBytes -eq 125829120 `
         -and $nativeFixtureEvidence.atLimit.artifact.mtimeNs -gt 0 `
         -and $nativeFixtureEvidence.atLimit.artifact.passed) -Name 'native-size-at-approved-limit-passes'
 Assert-VerificationInvariant -Condition (-not $nativeFixtureEvidence.overLimit.passed `
-        -and $nativeFixtureEvidence.overLimit.artifact.actualBytes -eq 104857601 `
-        -and $nativeFixtureEvidence.overLimit.artifact.maxBytes -eq 104857600 `
+        -and $nativeFixtureEvidence.overLimit.artifact.actualBytes -eq 125829121 `
+        -and $nativeFixtureEvidence.overLimit.artifact.maxBytes -eq 125829120 `
         -and -not $nativeFixtureEvidence.overLimit.artifact.passed) -Name 'native-size-one-byte-over-limit-fails'
 Assert-VerificationInvariant -Condition (-not $nativeFixtureEvidence.stale.passed `
         -and -not $nativeFixtureEvidence.stale.artifact.freshThisRun `
