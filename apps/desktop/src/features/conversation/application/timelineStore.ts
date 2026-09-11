@@ -45,8 +45,9 @@ const draftItemByProjection = new WeakMap<
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
- * 把同一份 Draft Segment 映射为稳定的 Item 引用；Assistant 与 Reasoning 只在同一语义的
- * 相邻 delta 中合并，跨语义段保留各自的阅读位置。WeakMap 让重复 Selector 保持引用稳定，
+ * 把同一份 Draft Segment 映射为稳定的 Item 引用；公开回复草稿必须与结算后的
+ * assistant_progress 共享 commentary 语义，首个 delta 才能直接进入工作过程而不会先冒充最终答复。
+ * Reasoning 仍保留独立类型，跨语义段各自占据阅读位置。WeakMap 让重复 Selector 保持引用稳定，
  * 并在终态清理 Draft 后自动释放缓存。
  */
 function draftItemForTurn(
@@ -60,10 +61,11 @@ function draftItemForTurn(
     itemId: `draft:${turnId}:${draft.segmentStartSeq}`,
     threadId,
     turnId,
-    kind: draft.kind === "reasoning" ? "reasoning" : "agent_message",
+    // assistant 草稿对应中间模型步骤；只有 terminal 事件生成 agent_message，避免结算时改变 UI 语义。
+    kind: draft.kind === "reasoning" ? "reasoning" : "commentary",
     status: "in_progress",
     text: draft.text,
-    title: draft.kind === "reasoning" ? "思考摘要" : undefined,
+    title: draft.kind === "reasoning" ? "思考摘要" : "回复过程",
     metadata: { phase: draft.kind === "reasoning" ? "reasoning_summary" : "assistant_progress" },
     createdAt: draft.occurredAt,
   };
@@ -167,7 +169,7 @@ export const useTimelineStore =
 timelineStoreRegistry[TIMELINE_STORE_GLOBAL_KEY] = useTimelineStore;
 
 /**
- * 按 Thread 组装持久 Item，并把尚未结算的 Assistant/Reasoning segments 附在对应 Turn；终态
+ * 按 Thread 组装持久 Item，并把尚未结算的公开回复/Reasoning segments 附在对应 Turn；终态
  * 事件会在 Reducer 中原子移除 Draft，因此 UI 原位切换到持久最终答复，不会重复展示或反写 Java。
  */
 export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {

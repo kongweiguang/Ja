@@ -365,8 +365,8 @@ describe("ChatTimeline", () => {
     ]);
   });
 
-  /** 响应壳的 DOM identity 贯穿完整生命周期，防止首字和 terminal 各自挂载造成视觉跳变。 */
-  it("在同一响应节点内完成 working、streaming 与 completed 转换", () => {
+  /** 首个公开回复属于中间模型步骤，必须直接进入工作过程；terminal 才切换为最终答复。 */
+  it("首个公开回复直接进入工作过程并在 terminal 时显示最终答复", () => {
     const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
     const { rerender } = render(<ChatTimeline items={[]} turns={[runningTurn]} />);
 
@@ -381,19 +381,27 @@ describe("ChatTimeline", () => {
 
     rerender(
       <ChatTimeline
-        items={[baseItem({ itemId: "item_stream", status: "in_progress", text: "第一段" })]}
+        items={[
+          baseItem({
+            itemId: "item_stream",
+            kind: "commentary",
+            status: "in_progress",
+            text: "第一段",
+            title: "回复过程",
+          }),
+        ]}
         turns={[runningTurn]}
       />,
     );
+    const streamingProcess = screen.getByRole("region", { name: "工作过程" });
+    expect(streamingProcess).toBeVisible();
+    expect(streamingProcess).toHaveTextContent("第一段");
+    expect(streamingProcess).toHaveAttribute("data-state", "active");
+    expect(screen.queryByText("正在回复")).not.toBeInTheDocument();
     const streamingResponse = screen.getByRole("article", { name: "最终答复" });
     expect(streamingResponse).toBe(response);
-    expect(streamingResponse).toHaveAttribute("data-response-state", "streaming");
-    expect(streamingResponse).toHaveTextContent("第一段");
-    expect(streamingResponse).toHaveTextContent("正在回复");
-    expect(streamingResponse.querySelectorAll(".ja-chat-activity-dots > span")).toHaveLength(3);
-    expect(
-      streamingResponse.querySelector(".ja-chat-response__content")?.nextElementSibling,
-    ).toHaveClass("ja-chat-response__status");
+    expect(streamingResponse).toHaveAttribute("data-response-state", "working");
+    expect(streamingResponse).toHaveTextContent("正在工作");
 
     rerender(
       <ChatTimeline
@@ -1713,16 +1721,19 @@ describe("ChatTimeline", () => {
         items={[
           baseItem({
             itemId: "draft:turn_one",
+            kind: "commentary",
             status: "in_progress",
+            title: "回复过程",
             text: "正在流式生成",
           }),
         ]}
       />,
     );
 
-    const streamingAnswer = screen.getByRole("article", { name: "最终答复" });
-    expect(streamingAnswer).toHaveAttribute("aria-busy", "true");
-    expect(streamingAnswer).toHaveTextContent("正在流式生成");
+    const streamingProcess = screen.getByRole("region", { name: "工作过程" });
+    expect(streamingProcess).toHaveAttribute("data-state", "active");
+    expect(streamingProcess).toHaveTextContent("正在流式生成");
+    expect(screen.queryByText("正在回复")).not.toBeInTheDocument();
 
     rerender(
       <ChatTimeline

@@ -237,7 +237,7 @@ describe("timeline Zustand seam", () => {
     expect(firstSelection).toContainEqual(
       expect.objectContaining({
         itemId: "draft:turn_store:1",
-        kind: "agent_message",
+        kind: "commentary",
         status: "in_progress",
         text: "终态前可见",
       }),
@@ -295,12 +295,12 @@ describe("timeline Zustand seam", () => {
     );
 
     const selected = selectItemsForThread("thr_store")(useTimelineStore.getState());
-    expect(selected.map((item) => item.kind)).toEqual(["reasoning", "agent_message", "reasoning"]);
+    expect(selected.map((item) => item.kind)).toEqual(["reasoning", "commentary", "reasoning"]);
     expect(selected.filter((item) => item.kind === "reasoning")).toEqual([
       expect.objectContaining({ itemId: "draft:turn_store:1", text: "先想一下" }),
       expect.objectContaining({ itemId: "draft:turn_store:3", text: "再核对" }),
     ]);
-    expect(selected.filter((item) => item.kind === "agent_message")).toEqual([
+    expect(selected.filter((item) => item.kind === "commentary")).toEqual([
       expect.objectContaining({ itemId: "draft:turn_store:2", text: "公开内容" }),
     ]);
     expect(selectItemsForThread("thr_store")(useTimelineStore.getState())).toEqual(selected);

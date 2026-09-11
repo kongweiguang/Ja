@@ -123,8 +123,9 @@ describe("ChatTimeline external rows", () => {
     const draft: TimelineItemAdapter = {
       ...user,
       itemId: "draft:turn_stream",
-      kind: "agent_message",
+      kind: "commentary",
       status: "in_progress",
+      title: "回复过程",
       text: "正在处理",
       createdAt: "2026-09-04T08:00:00.500Z",
     };

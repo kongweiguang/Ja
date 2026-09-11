@@ -234,10 +234,16 @@ export async function runConversationProgressWebView2({
       timeout: timeout(deadline),
     });
 
-  const firstPublicText = page.locator(".ja-chat-message-final").filter({
+  const workProcess = page.locator("section.ja-work-process").last();
+  const firstPublicText = workProcess.locator(".ja-work-step--commentary").filter({
     hasText: conversationProgressFixtureMarkers.commentary1,
   });
   await firstPublicText.waitFor({ state: "visible", timeout: timeout(deadline) });
+  assert.equal(
+    await page.getByText("正在回复", { exact: true }).count(),
+    0,
+    "streamed public text must be represented by WorkProcess, not the final-answer status",
+  );
   assert.equal(
     await page.locator(".ja-tool-details").count(),
     0,
@@ -255,7 +261,6 @@ export async function runConversationProgressWebView2({
   );
   fixture.releaseFirstText();
 
-  const workProcess = page.locator("section.ja-work-process").last();
   await workProcess.locator('.ja-tool-details[data-tool-kind="read"]').waitFor({
     state: "visible",
     timeout: timeout(deadline),

@@ -15,7 +15,7 @@
 
     <groupId>io.github.kongweiguang</groupId>
     <artifactId>ja-app-server</artifactId>
-    <version>0.1.1</version>
+    <version>0.1.2</version>
     <packaging>jar</packaging>
 
     <name>Ja App Server</name>
