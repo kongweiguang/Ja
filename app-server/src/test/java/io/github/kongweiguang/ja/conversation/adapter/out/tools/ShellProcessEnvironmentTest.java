@@ -6,52 +6,64 @@ package io.github.kongweiguang.ja.conversation.adapter.out.tools;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.File;
 import java.nio.file.Path;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 锁定 Shell 子进程的环境白名单、PATH 边界和 Windows 扩展解析。 */
+/** 锁定 Shell 对父进程环境的完整继承与原生进程边界校验。 */
 final class ShellProcessEnvironmentTest {
     @TempDir Path temp;
 
     /**
-     * `env_clear` 输入缺 PATHEXT 时仍要构造 `.exe/.cmd` 解析能力，同时 secret 与相对 PATH
-     * 项不得进入冻结 Profile。
+     * 变量名、凭据标识、代理配置和相对 PATH 都必须逐项保留；Shell 边界不能替用户猜测哪些变量安全。
      */
     @Test
-    void constructsBoundedWindowsEnvironmentWithoutSecrets() {
-        Path bin = temp.resolve("node-bin").toAbsolutePath();
-        Map<String, String> source = new HashMap<>();
-        source.put("PATH", bin + File.pathSeparator + "." + File.pathSeparator + bin);
-        source.put("SystemRoot", temp.resolve("Windows").toAbsolutePath().toString());
-        source.put("ComSpec", temp.resolve("Windows/System32/cmd.exe").toAbsolutePath().toString());
-        source.put("TEMP", temp.toAbsolutePath().toString());
-        source.put("PSModuleAnalysisCachePath", temp.resolve("module-cache").toAbsolutePath().toString());
-        source.put("OPENAI_API_KEY", "must-not-cross-shell-boundary");
+    void capturesEveryParentEnvironmentEntryWithoutRewriting() {
+        Map<String, String> source = new LinkedHashMap<>();
+        source.put("PATH", ".;C:\\custom-bin;C:\\custom-bin");
+        source.put("ProgramFiles(x86)", "C:\\Program Files (x86)");
+        source.put("HTTPS_PROXY", "http://proxy.example.test:8080");
+        source.put("GH_CONFIG_DIR", "C:\\Users\\test\\AppData\\Roaming\\GitHub CLI");
+        source.put("JA_TEST_MARKER", "visible-to-shell");
 
         Map<String, String> captured = ShellProcessEnvironment.capture(
-                ShellProfile.OperatingSystem.WINDOWS, source::get);
+                ShellProfile.OperatingSystem.WINDOWS, source);
 
-        assertTrue(captured.get("PATH").contains(bin.toString()));
-        assertFalse(captured.get("PATH").contains(File.pathSeparator + "."));
-        assertTrue(captured.get("PATHEXT").contains(".EXE"));
-        assertTrue(captured.get("PATHEXT").contains(".CMD"));
-        assertTrue(captured.get("PSModuleAnalysisCachePath").endsWith("module-cache"));
-        assertFalse(captured.containsKey("OPENAI_API_KEY"));
-        assertFalse(captured.toString().contains("must-not-cross-shell-boundary"));
+        assertEquals(source, captured);
     }
 
-    /** Profile 拒绝测试或未来 composition 注入白名单外变量，不能只依赖生产 capture。 */
+    /** 只有 NUL 和 Windows 环境块无法表示的变量名被拒绝，普通括号和控制字符值仍可传递。 */
     @Test
-    void profileRejectsNonAllowlistedEnvironment() {
-        assertThrows(IllegalArgumentException.class, () -> new ShellProfile(
+    void rejectsOnlyUnrepresentableEnvironmentEntries() {
+        Map<String, String> newlineValue = Map.of("PROFILE_MARKER", "line-one\nline-two");
+        assertEquals(newlineValue, ShellProcessEnvironment.validate(
+                ShellProfile.OperatingSystem.WINDOWS, newlineValue));
+        assertEquals(Map.of("=C:", "C:\\workspace"), ShellProcessEnvironment.validate(
+                ShellProfile.OperatingSystem.WINDOWS, Map.of("=C:", "C:\\workspace")));
+        assertThrows(IllegalArgumentException.class, () -> ShellProcessEnvironment.validate(
+                ShellProfile.OperatingSystem.LINUX, Map.of("BAD=NAME", "value")));
+        assertThrows(IllegalArgumentException.class, () -> ShellProcessEnvironment.validate(
+                ShellProfile.OperatingSystem.WINDOWS, Map.of("BAD\0NAME", "value")));
+        assertThrows(IllegalArgumentException.class, () -> ShellProcessEnvironment.validate(
+                ShellProfile.OperatingSystem.WINDOWS, Map.of("BAD", "value\0")));
+    }
+
+    /** ShellProfile 也必须保留任意正常宿主变量，防止未来 composition 再引入秘密关键词白名单。 */
+    @Test
+    void profilePreservesArbitraryEnvironment() {
+        Map<String, String> environment = Map.of(
+                "PATHEXT", ".EXE;.CMD",
+                "AUTHORIZATION", "test-marker",
+                "ProgramFiles(x86)", temp.toString());
+
+        ShellProfile profile = new ShellProfile(
                 ShellProfile.OperatingSystem.WINDOWS, ShellProfile.Dialect.POWERSHELL,
-                temp.resolve("pwsh.exe"), java.util.List.of("-Command"), "windows",
-                Map.of("PATHEXT", ".EXE;.CMD", "AUTHORIZATION", "secret")));
+                temp.resolve("pwsh.exe"), java.util.List.of("-NonInteractive", "-Command"), "windows",
+                environment);
+
+        assertEquals(environment, profile.environment());
     }
 }

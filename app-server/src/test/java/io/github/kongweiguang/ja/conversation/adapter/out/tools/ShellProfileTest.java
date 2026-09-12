@@ -18,7 +18,7 @@ class ShellProfileTest {
     @Test
     void eachPlatformDeclaresOnlyItsNativeShell() {
         assertProfile(new ShellProfile(ShellProfile.OperatingSystem.WINDOWS, ShellProfile.Dialect.POWERSHELL,
-                Path.of("C:/tools/pwsh.exe"), List.of("-NoProfile", "-NonInteractive", "-Command"), "windows",
+                Path.of("C:/tools/pwsh.exe"), List.of("-NonInteractive", "-Command"), "windows",
                 Map.of("PATHEXT", ".EXE;.CMD")),
                 "os: windows", "shell: powershell", "Execute PowerShell 7 commands. This is not Bash: use "
                         + "Select-Object instead of head/tail and rg.exe instead of grep when available.",
@@ -26,7 +26,7 @@ class ShellProfileTest {
         assertProfile(new ShellProfile(ShellProfile.OperatingSystem.WINDOWS,
                 ShellProfile.Dialect.WINDOWS_POWERSHELL,
                 Path.of("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
-                List.of("-NoProfile", "-NonInteractive", "-Command"), "windows",
+                List.of("-NonInteractive", "-Command"), "windows",
                 Map.of("PATHEXT", ".EXE;.CMD")),
                 "os: windows", "shell: windows_powershell", "Execute Windows PowerShell 5.1 commands. This is "
                         + "not Bash: use Select-Object instead of head/tail and rg.exe instead of grep when available.",
@@ -44,7 +44,7 @@ class ShellProfileTest {
     void windowsProfilesDeclareConcretePowerShellAlternatives() {
         ShellProfile profile = new ShellProfile(ShellProfile.OperatingSystem.WINDOWS,
                 ShellProfile.Dialect.POWERSHELL, Path.of("C:/tools/pwsh.exe"),
-                List.of("-NoProfile", "-NonInteractive", "-Command"), "windows",
+                List.of("-NonInteractive", "-Command"), "windows",
                 Map.of("PATHEXT", ".EXE;.CMD"));
 
         String environment = profile.executionEnvironment(Path.of("workspace"));

@@ -13,9 +13,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.regex.Pattern;
+import java.util.TreeMap;
 
 /**
  * 在创建本地资源前校验并冻结不可信启动描述。
@@ -33,23 +31,6 @@ final class WindowsProcessLaunchPolicy {
      * 单个参数的字符上限。
      */
     private static final int MAX_ARGUMENT_LENGTH = 8_192;
-    /**
-     * 环境变量条目数量上限。
-     */
-    private static final int MAX_ENVIRONMENT_ENTRIES = 128;
-    /**
-     * 单个环境变量值的字符上限。
-     */
-    private static final int MAX_ENVIRONMENT_VALUE_LENGTH = 32_767;
-    /**
-     * CreateProcessW Unicode 环境块（含每项终止符与最终终止符）的硬字符上限。
-     */
-    private static final int MAX_ENVIRONMENT_BLOCK_CHARACTERS = 32_767;
-    /**
-     * 允许跨越进程边界的环境变量名称语法。
-     */
-    private static final Pattern ENVIRONMENT_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,127}");
-
     /**
      * 纯策略类型不允许实例化，避免产生无状态对象。
      */
@@ -114,36 +95,43 @@ final class WindowsProcessLaunchPolicy {
     }
 
     /**
-     * 构造本地环境块前按 Windows 大小写不敏感语义校验环境变量。
+     * 构造本地环境块前按 Windows 大小写不敏感语义校验环境变量；不增加条目、值或总块的
+     * 人工配额，只保留 CreateProcess 无法表示的 NUL、等号和整数溢出检查。
      */
     private static Map<String, String> validatedEnvironment(Map<String, String> environment)
             throws IOException {
-        if (environment.size() > MAX_ENVIRONMENT_ENTRIES) {
-            throw new IOException("windows_process_environment_invalid");
-        }
-        Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-        Map<String, String> copy = new java.util.LinkedHashMap<>();
-        int blockCharacters = 1;
+        Map<String, String> copy = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         for (Map.Entry<String, String> entry : environment.entrySet()) {
             String name = entry.getKey();
             String value = entry.getValue();
-            if (name == null || !ENVIRONMENT_NAME.matcher(name).matches() || !names.add(name)
-                || value == null || value.length() > MAX_ENVIRONMENT_VALUE_LENGTH
-                || value.indexOf('\0') >= 0) {
+            if (!isEnvironmentName(name) || value == null || value.indexOf('\0') >= 0) {
                 throw new IOException("windows_process_environment_invalid");
             }
+            copy.put(name, value);
+        }
+        int blockCharacters = 1;
+        for (Map.Entry<String, String> entry : copy.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
             try {
                 blockCharacters = Math.addExact(blockCharacters,
                         Math.addExact(name.length(), Math.addExact(value.length(), 2)));
             } catch (ArithmeticException overflow) {
                 throw new IOException("windows_process_environment_invalid");
             }
-            if (blockCharacters > MAX_ENVIRONMENT_BLOCK_CHARACTERS) {
-                throw new IOException("windows_process_environment_invalid");
-            }
-            copy.put(name, value);
         }
         return Map.copyOf(copy);
+    }
+
+    /**
+     * 接受普通 Windows 环境名和 Windows 的 `=EXITCODE`/按盘符变量，拒绝 NUL 及额外等号。
+     */
+    private static boolean isEnvironmentName(String name) {
+        if (name == null || name.isEmpty() || name.indexOf('\0') >= 0) {
+            return false;
+        }
+        int equals = name.indexOf('=');
+        return equals < 0 || (equals == 0 && name.length() > 1 && name.indexOf('=', 1) < 0);
     }
 
     /**
@@ -197,15 +185,21 @@ final class WindowsProcessLaunchPolicy {
     }
 
     /**
-     * 构造按 Windows 键语义排序且以双 NUL 结尾的 Unicode 环境块。
+     * 构造按 Windows 键语义排序且以单 NUL 结尾的 Unicode 环境块；UTF-16 编码器再追加最终 NUL。
      */
     static String environmentBlock(Map<String, String> values) {
-        return values.entrySet().stream()
-                       .sorted(Map.Entry.comparingByKey(
-                               String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder())))
-                       .map(entry -> entry.getKey() + "=" + entry.getValue())
-                       .reduce((left, right) -> left + "\0" + right)
-                       .orElse("") + "\0";
+        List<Map.Entry<String, String>> entries = values.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(
+                        String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder())))
+                .toList();
+        StringBuilder block = new StringBuilder();
+        for (Map.Entry<String, String> entry : entries) {
+            block.append(entry.getKey()).append('=').append(entry.getValue()).append('\0');
+        }
+        if (block.isEmpty()) {
+            block.append('\0');
+        }
+        return block.toString();
     }
 
     /**

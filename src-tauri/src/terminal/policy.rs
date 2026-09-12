@@ -18,9 +18,7 @@ pub(crate) mod env;
 #[path = "policy_paths.rs"]
 pub(crate) mod paths;
 
-use env::{
-    MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS, build_environment,
-};
+use env::build_environment;
 use paths::{absolute_path, canonical_directory, interactive_shell_directory, path_is_within};
 
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -36,10 +34,6 @@ pub struct TerminalLimits {
     pub max_output_queue_bytes: usize,
     pub max_event_count: usize,
     pub max_scrollback_bytes: usize,
-    pub max_env_vars: usize,
-    pub max_env_key_bytes: usize,
-    pub max_env_value_bytes: usize,
-    pub max_env_total_bytes: usize,
     pub operation_timeout: Duration,
 }
 
@@ -54,10 +48,6 @@ impl Default for TerminalLimits {
             max_output_queue_bytes: 8 * 1024 * 1024,
             max_event_count: 2_048,
             max_scrollback_bytes: 4 * 1024 * 1024,
-            max_env_vars: MAX_ENV_VARS,
-            max_env_key_bytes: MAX_ENV_KEY_BYTES,
-            max_env_value_bytes: MAX_ENV_VALUE_BYTES,
-            max_env_total_bytes: MAX_ENV_TOTAL_BYTES,
             operation_timeout: Duration::from_secs(30),
         }
     }
@@ -82,14 +72,6 @@ impl TerminalLimits {
             && self.max_event_count <= 65_536
             && self.max_scrollback_bytes >= self.max_output_batch_bytes
             && self.max_scrollback_bytes <= 256 * 1024 * 1024
-            && self.max_env_vars > 0
-            && self.max_env_vars <= MAX_ENV_VARS
-            && self.max_env_key_bytes > 0
-            && self.max_env_key_bytes <= MAX_ENV_KEY_BYTES
-            && self.max_env_value_bytes > 0
-            && self.max_env_value_bytes <= MAX_ENV_VALUE_BYTES
-            && self.max_env_total_bytes >= self.max_env_value_bytes
-            && self.max_env_total_bytes <= MAX_ENV_TOTAL_BYTES
             && !self.operation_timeout.is_zero()
             && self.operation_timeout <= MAX_OPERATION_TIMEOUT;
         if valid {
@@ -133,14 +115,15 @@ impl TerminalPolicy {
         self.limits
     }
 
-    /// 将 launch request 解析为受控 shell、canonical cwd 和最小环境。
+    /// 将 launch request 解析为受控 shell、canonical cwd 和显式 override；宿主环境由
+    /// `portable-pty` 原样继承，不能在此处重新拼成一份不完整的 allowlist。
     pub(crate) fn prepare(&self, request: &LaunchRequest) -> Result<PreparedLaunch, TerminalError> {
         if !request.size.validate() {
             return Err(TerminalError::new(TerminalErrorCode::InvalidSize));
         }
         let cwd = self.resolve_cwd(request.cwd.as_deref())?;
         let shell = resolve_shell(request.profile)?;
-        let environment = build_environment(&request.env, &shell.program)?;
+        let environment = build_environment(&request.env)?;
         Ok(PreparedLaunch {
             shell,
             cwd,
@@ -206,8 +189,8 @@ pub(crate) fn available_shell_profiles() -> Vec<ShellProfile> {
 
 /// 解析默认 profile，使不同桌面平台提供自然且启动行为确定的原生 shell。
 ///
-/// Windows 集成终端不加载宿主 PowerShell Profile：Profile 既会把任意用户启动逻辑带入受管
-/// PTY，也会显著延迟首屏；用户仍可在终端就绪后按需加载自己的配置。
+/// Windows 集成终端保留宿主 PowerShell Profile，让用户在普通终端中配置的命令、提示符
+/// 和工具初始化在 Ja 中保持一致；`-NoLogo` 只去掉重复 banner，不改变 profile 语义。
 pub(crate) fn resolve_shell(profile: ShellProfile) -> Result<ResolvedShell, TerminalError> {
     let profile = match profile {
         ShellProfile::Default => {
@@ -254,7 +237,7 @@ pub(crate) fn resolve_shell(profile: ShellProfile) -> Result<ResolvedShell, Term
                     let program = candidates.into_iter().find(|path| path.is_file());
                     (
                         program.ok_or(TerminalError::new(TerminalErrorCode::InvalidShell))?,
-                        vec!["-NoLogo".into(), "-NoProfile".into()],
+                        vec!["-NoLogo".into()],
                     )
                 }
                 ShellProfile::Cmd => {

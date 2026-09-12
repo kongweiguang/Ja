@@ -406,6 +406,135 @@ fn real_conpty_echo_and_exit() {
 }
 
 #[cfg(windows)]
+/// 真实 ConPTY 必须看到当前 Ja 进程已有的 APPDATA；该变量不在旧的最小环境中，
+/// 因此能回归“保留宿主环境”而不修改用户环境或把路径写进测试输出。子 PowerShell
+/// 只返回 APPDATA 的 Base64 marker，避免 Cmd 的 OEM 输出编码影响断言。
+#[test]
+fn real_conpty_inherits_host_appdata() {
+    let Some(expected) = std::env::var_os("APPDATA") else {
+        // Windows 桌面通常总有 APPDATA；极简服务账户没有时不制造伪失败。
+        return;
+    };
+    let expected = base64::engine::general_purpose::STANDARD
+        .encode(expected.to_string_lossy().as_bytes())
+        .into_bytes();
+    if expected.is_empty() {
+        return;
+    }
+    let root = test_root();
+    fs::create_dir_all(&root).unwrap();
+    let supervisor = TerminalSupervisor::new(TerminalPolicy::new(&root).unwrap());
+    let session = supervisor
+        .open(LaunchRequest {
+            profile: crate::terminal::model::ShellProfile::Cmd,
+            ..LaunchRequest::default()
+        })
+        .unwrap();
+    let mut output = Vec::new();
+    let query_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < query_deadline && !output.windows(4).any(|window| window == b"\x1b[6n") {
+        if let Some(event) = session.recv_until(query_deadline).unwrap()
+            && let TerminalEventKind::Output { data } = event.kind
+        {
+            output.extend(data);
+        }
+    }
+    assert!(
+        output.windows(4).any(|window| window == b"\x1b[6n"),
+        "ConPTY child did not request cursor position"
+    );
+    session
+        .send_input(b"\x1b[1;1R", Duration::from_secs(2))
+        .unwrap();
+    session
+        .send_input(
+            b"powershell.exe -NoLogo -NoProfile -Command \"[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($env:APPDATA))\"\r",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+    let appdata_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < appdata_deadline && !output.windows(expected.len()).any(|window| window == expected) {
+        if let Some(event) = session.recv_until(appdata_deadline).unwrap()
+            && let TerminalEventKind::Output { data } = event.kind
+        {
+            output.extend(data);
+        }
+    }
+    let inherited = output.windows(expected.len()).any(|window| window == expected);
+    session.close(CloseReason::User).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(inherited, "ConPTY child did not inherit the host APPDATA value");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a locally authenticated GitHub CLI; never a CI prerequisite"]
+/// 手工证明真实 ConPTY 与宿主 CLI 看到同一 GitHub 登录态；只判断固定状态短语，绝不打印
+/// `gh` 输出，避免 token、scope 或用户环境内容进入测试日志。
+fn real_conpty_gh_auth_status_matches_host() {
+    let host = Command::new("gh")
+        .args(["auth", "status", "--hostname", "github.com"])
+        .output()
+        .expect("gh CLI must be installed for the ignored environment check");
+    let mut host_output = host.stdout;
+    host_output.extend(host.stderr);
+    let marker = b"Logged in to github.com account";
+    let host_authenticated = host.status.success()
+        && host_output
+            .windows(marker.len())
+            .any(|window| window == marker);
+    assert!(host_authenticated, "host gh auth status is not authenticated");
+
+    let root = test_root();
+    fs::create_dir_all(&root).unwrap();
+    let supervisor = TerminalSupervisor::new(TerminalPolicy::new(&root).unwrap());
+    let session = supervisor
+        .open(LaunchRequest {
+            profile: crate::terminal::model::ShellProfile::Cmd,
+            ..LaunchRequest::default()
+        })
+        .unwrap();
+    let mut output = Vec::new();
+    let query_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < query_deadline && !output.windows(4).any(|window| window == b"\x1b[6n") {
+        if let Some(event) = session.recv_until(query_deadline).unwrap()
+            && let TerminalEventKind::Output { data } = event.kind
+        {
+            output.extend(data);
+        }
+    }
+    assert!(
+        output.windows(4).any(|window| window == b"\x1b[6n"),
+        "ConPTY child did not request cursor position"
+    );
+    session
+        .send_input(b"\x1b[1;1R", Duration::from_secs(2))
+        .unwrap();
+    session
+        .send_input(b"gh auth status --hostname github.com\r", Duration::from_secs(2))
+        .unwrap();
+    let gh_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < gh_deadline
+        && !output
+            .windows(marker.len())
+            .any(|window| window == marker)
+    {
+        if let Some(event) = session.recv_until(gh_deadline).unwrap()
+            && let TerminalEventKind::Output { data } = event.kind
+        {
+            output.extend(data);
+        }
+    }
+    let pty_authenticated = output
+        .windows(marker.len())
+        .any(|window| window == marker);
+    session.close(CloseReason::User).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert_eq!(pty_authenticated, host_authenticated);
+}
+
+#[cfg(windows)]
 /// 设计原因：连续真实 ConPTY 打开、缩放、输入、退出和关闭不能累积过期 owner，也不能让
 /// shell 逃出 Job Object 清理边界；30 轮复用同一 supervisor 才能暴露单轮测试看不到的泄漏。
 #[test]

@@ -114,7 +114,8 @@ pub(crate) fn spawn_process(
         // Host generation 是事件投影的唯一 fence，必须由 Rust owner 注入，不能由配置或 Java 自行猜测。
         .arg(format!("--ja-runtime-generation={host_generation}"))
         .current_dir(config.canonical_run_dir())
-        .env_clear()
+        // `Command` 默认继承当前 Rust Host 宿主环境；config.env 仅覆盖同名变量，保持
+        // gh、代理、用户 TEMP/TMP 等普通终端能力，不复制一份 secret 白名单。
         .envs(config.env.iter())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

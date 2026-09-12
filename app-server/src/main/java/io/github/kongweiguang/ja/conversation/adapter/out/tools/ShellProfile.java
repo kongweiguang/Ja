@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.platform.windows.WindowsJobObject;
 import io.github.kongweiguang.ja.platform.windows.WindowsProcessLauncher;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -116,10 +117,13 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
         try {
             String probe = dialect == Dialect.POWERSHELL || dialect == Dialect.WINDOWS_POWERSHELL
                     ? "$PSVersionTable.PSVersion.Major" : "exit 0";
-            ProcessBuilder builder = new ProcessBuilder(commandLine(probe)).redirectErrorStream(true);
+            ProcessBuilder builder = new ProcessBuilder(commandLine(probe))
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD);
             builder.environment().clear();
             builder.environment().putAll(environment);
             process = builder.start();
+            process.getOutputStream().close();
             if (!process.waitFor(PREFLIGHT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS) || process.exitValue() != 0) {
                 if (process.isAlive()) process.destroyForcibly();
                 return false;
@@ -141,21 +145,59 @@ public record ShellProfile(OperatingSystem os, Dialect dialect, Path executable,
      */
     private boolean preflightWindows() {
         Process process = null;
+        Thread stdoutDrain = null;
+        Thread stderrDrain = null;
         try {
             try (WindowsJobObject job = WindowsJobObject.create()) {
                 process = WindowsProcessLauncher.launch(commandLine("exit 0"),
                         executable.getParent(), environment, job);
+                stdoutDrain = startDrain(process.getInputStream());
+                stderrDrain = startDrain(process.getErrorStream());
                 process.getOutputStream().close();
-                return process.waitFor(PREFLIGHT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-                        && process.exitValue() == 0;
+                boolean completed = process.waitFor(PREFLIGHT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                if (!completed && process.isAlive()) {
+                    job.terminate();
+                }
+                return completed && process.exitValue() == 0;
             } finally {
-                if (process != null) WindowsProcessLauncher.close(process);
+                if (process != null) {
+                    try {
+                        WindowsProcessLauncher.close(process);
+                    } finally {
+                        awaitDrain(stdoutDrain);
+                        awaitDrain(stderrDrain);
+                    }
+                }
             }
         } catch (IOException failure) {
             return false;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             return false;
+        }
+    }
+
+    /** 预检只关心退出状态；并行消费两个管道，避免用户 profile 的输出阻塞 Shell 启动。 */
+    private static Thread startDrain(InputStream input) {
+        return Thread.startVirtualThread(() -> {
+            try (InputStream stream = input) {
+                stream.transferTo(java.io.OutputStream.nullOutputStream());
+            } catch (IOException ignored) {
+                // 预检输出不属于 Shell 结果，管道关闭或取消只影响候选是否可用。
+            }
+        });
+    }
+
+    /** 关闭原生进程句柄后给 profile 输出线程一个有界静默窗口，避免预检留下后台任务。 */
+    private static void awaitDrain(Thread drain) {
+        if (drain == null) {
+            return;
+        }
+        try {
+            drain.join(PREFLIGHT_TIMEOUT.toMillis());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            drain.interrupt();
         }
     }
 

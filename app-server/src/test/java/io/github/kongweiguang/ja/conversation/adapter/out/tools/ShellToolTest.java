@@ -48,19 +48,49 @@ final class ShellToolTest {
 
     @TempDir Path temp;
     private ShellProfile detected;
+    private Path isolatedProfileRoot;
 
-    /** 每个测试都要求真实 Windows PowerShell Profile，禁止平台跳过后把进程树契约误报为通过。 */
+    /** 每个测试都要求真实 Windows PowerShell，并把用户 Profile 重定向到临时目录。 */
     @BeforeEach
-    void requireWindowsShell() {
+    void requireWindowsShell() throws Exception {
         Assumptions.assumeTrue(System.getProperty("os.name", "").toLowerCase().contains("win"));
-        detected = ShellCapability.detectAndPreflight().profile().orElse(null);
+        isolatedProfileRoot = Files.createDirectories(temp.resolve("powershell-home"));
+        writeIsolatedProfiles(isolatedProfileRoot);
+        detected = ShellCapability.detectAndPreflight("Windows 11", isolatedWindowsEnvironment(
+                        isolatedProfileRoot), ShellProfile::preflight)
+                .profile().orElse(null);
         Assumptions.assumeTrue(detected != null && (detected.dialect() == ShellProfile.Dialect.POWERSHELL
                 || detected.dialect() == ShellProfile.Dialect.WINDOWS_POWERSHELL));
     }
 
+    /** 为真实 Profile 加载创建临时用户目录，测试不会读取或修改开发者的 PowerShell 配置。 */
+    private static void writeIsolatedProfiles(Path profileRoot) throws Exception {
+        String profile = "$env:JA_TEST_PROFILE_MARKER = 'ja-test-profile-loaded'\n";
+        Path documents = Files.createDirectories(profileRoot.resolve("Documents"));
+        Path powerShell = Files.createDirectories(documents.resolve("PowerShell"));
+        Path windowsPowerShell = Files.createDirectories(documents.resolve("WindowsPowerShell"));
+        Files.writeString(powerShell.resolve("Profile.ps1"), profile, StandardCharsets.UTF_8);
+        Files.writeString(powerShell.resolve("Microsoft.PowerShell_profile.ps1"), profile,
+                StandardCharsets.UTF_8);
+        Files.writeString(windowsPowerShell.resolve("Profile.ps1"), profile, StandardCharsets.UTF_8);
+        Files.writeString(windowsPowerShell.resolve("Microsoft.PowerShell_profile.ps1"), profile,
+                StandardCharsets.UTF_8);
+    }
+
+    /** 仅改变 PowerShell 用户目录相关变量，其余父进程环境完整传递给被测 Shell。 */
+    private static Map<String, String> isolatedWindowsEnvironment(Path profileRoot) {
+        Map<String, String> values = new HashMap<>(System.getenv());
+        String root = profileRoot.toAbsolutePath().toString();
+        values.put("USERPROFILE", root);
+        values.put("HOME", root);
+        values.put("APPDATA", profileRoot.resolve("AppData/Roaming").toString());
+        values.put("LOCALAPPDATA", profileRoot.resolve("AppData/Local").toString());
+        return Map.copyOf(values);
+    }
+
     /**
-     * 该用例复现 sidecar 缺 PATHEXT 时 `node` 不可发现的故障，并证明安全环境补全后可以
-     * 解析 `.cmd`，同时保留 stdout/stderr、非零退出码和调用方测得的 duration。
+     * 该用例证明完整父环境中的 PATHEXT 与用户 PATH 能被 `.cmd` 工具使用，同时保留
+     * stdout/stderr、非零退出码和调用方测得的 duration。
      */
     @Test
     void executesNodeLikeCommandWithBoundedWindowsEnvironment() throws Exception {
@@ -68,15 +98,13 @@ final class ShellToolTest {
         Files.writeString(bin.resolve("node.cmd"),
                 "@echo off\r\n@echo node-stdout\r\n@echo node-stderr 1>&2\r\n@exit /b 7\r\n",
                 StandardCharsets.UTF_8);
-        Map<String, String> source = new HashMap<>();
+        Map<String, String> source = new HashMap<>(isolatedWindowsEnvironment(isolatedProfileRoot));
         source.put("PATH", bin.toString());
-        copyHost(source, "SystemRoot");
-        copyHost(source, "ComSpec");
         source.put("TEMP", temp.toString());
         source.put("TMP", temp.toString());
         ShellProfile profile = new ShellProfile(detected.os(), detected.dialect(), detected.executable(),
                 detected.arguments(), detected.pathStyle(),
-                ShellProcessEnvironment.capture(ShellProfile.OperatingSystem.WINDOWS, source::get));
+                ShellProcessEnvironment.capture(ShellProfile.OperatingSystem.WINDOWS, source));
         AgentTool.Invocation invocation = invocation("node --probe; exit $LASTEXITCODE", null);
 
         AgentTool.ToolResult result = execute(profile, invocation, CancellationToken.none());
@@ -91,6 +119,16 @@ final class ShellToolTest {
         assertEquals(7, presentation.exitCode());
         assertEquals(25L, presentation.durationMs());
         assertNotNull(presentation.artifactId());
+    }
+
+    /** 真实用户 Profile 必须执行并可设置环境，证明 Agent Shell 与用户终端使用同一启动语义。 */
+    @Test
+    void loadsIsolatedPowerShellProfile() {
+        AgentTool.ToolResult result = execute(detected,
+                invocation("Write-Output $env:JA_TEST_PROFILE_MARKER", 2_000), CancellationToken.none());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome(), result.content());
+        assertTrue(result.content().contains("ja-test-profile-loaded"));
     }
 
     /** 用 junction 复现路径策略分歧；20 秒仅给功能探测的系统 Shell 冷启动，超时语义由独立用例验证。 */
@@ -123,13 +161,9 @@ final class ShellToolTest {
             acceptedByJvm.getOutputStream().close();
         }
         assertFalse(alias.preflight());
-        Map<String, String> source = new HashMap<>();
+        Map<String, String> source = new HashMap<>(isolatedWindowsEnvironment(isolatedProfileRoot));
         source.put("PATH", aliases.toString());
-        copyHost(source, "SystemRoot");
-        copyHost(source, "TEMP");
-        copyHost(source, "TMP");
-        copyHost(source, "PSModuleAnalysisCachePath");
-        ShellProfile profile = ShellCapability.detectAndPreflight("Windows 11", source::get,
+        ShellProfile profile = ShellCapability.detectAndPreflight("Windows 11", source,
                 ShellProfile::preflight).profile().orElseThrow();
         assertEquals(ShellProfile.Dialect.WINDOWS_POWERSHELL, profile.dialect());
 
@@ -172,10 +206,7 @@ final class ShellToolTest {
         assertEquals("tool_arguments_invalid", above.errorCode());
     }
 
-    /**
-     * Rust Host 会在 env_clear 后传入宿主 PATH；Windows 合法环境可超过旧的 8 KiB 人工上限，
-     * Shell 启动策略必须按 CreateProcess 环境块总预算接纳，否则所有命令都会在 1ms 级失败。
-     */
+    /** Shell 必须原样传递较长 PATH，不能为了所谓安全上限破坏用户安装的 CLI 搜索路径。 */
     @Test
     void executesWithWindowsRuntimePathAboveEightKilobytes() {
         Map<String, String> environment = new HashMap<>(detected.environment());
@@ -194,6 +225,7 @@ final class ShellToolTest {
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
         assertTrue(result.content().contains("long-path-ok"));
+        assertEquals(longPath, profile.environment().get("PATH"));
     }
 
     /** 启动前 cwd 校验失败必须返回可行动稳定码和非空诊断，不再伪装成 Shell 未安装。 */
@@ -224,22 +256,48 @@ final class ShellToolTest {
         assertTrue(result.content().contains("Shell failed: shell_executable_unavailable."));
     }
 
-    /** 超过 CreateProcess 总环境块预算时必须在分配句柄前拒绝，并给出 environment 专用码。 */
+    /** 环境条目数量和值长度不再使用 Ja 私有配额，完整快照只受平台可表示性约束。 */
     @Test
-    void reportsStableEnvironmentBudgetFailure() {
+    void acceptsLargeEnvironmentSnapshotWithoutArtificialBudget() {
         Map<String, String> environment = new HashMap<>(detected.environment());
-        environment.put("PATH", "C:\\" + "p".repeat(20_000));
-        environment.put("TEMP", "C:\\" + "t".repeat(20_000));
+        environment.put("JA_LARGE_VALUE", "v".repeat(40_000));
+        for (int index = 0; index < 256; index++) {
+            environment.put("JA_TEST_ENV_" + index, "marker-" + index);
+        }
         ShellProfile oversized = new ShellProfile(
                 detected.os(), detected.dialect(), detected.executable(), detected.arguments(),
                 detected.pathStyle(), environment);
 
-        AgentTool.ToolResult result = execute(
-                oversized, invocation("Write-Output ignored", 2_000), CancellationToken.none());
+        assertEquals("v".repeat(40_000), oversized.environment().get("JA_LARGE_VALUE"));
+        assertEquals(256, oversized.environment().keySet().stream()
+                .filter(key -> key.startsWith("JA_TEST_ENV_"))
+                .count());
+    }
 
-        assertEquals(ToolOutcome.FAILED, result.outcome());
-        assertEquals("shell_environment_invalid", result.errorCode());
-        assertTrue(result.content().contains("Shell failed: shell_environment_invalid."));
+    /**
+     * 真实 CreateProcess 边界必须接纳超过旧 128 条的环境、括号变量和多行值，避免只在快照层通过。
+     */
+    @Test
+    void launchesWithCompleteEnvironmentAtNativeBoundary() {
+        Map<String, String> environment = new HashMap<>(detected.environment());
+        environment.put("ProgramFiles(x86)", "C:\\Program Files (x86)");
+        environment.put("JA_MULTILINE", "line-one\nline-two");
+        for (int index = 0; index < 256; index++) {
+            environment.put("JA_NATIVE_ENV_" + index, "native-marker-" + index);
+        }
+        ShellProfile profile = new ShellProfile(
+                detected.os(), detected.dialect(), detected.executable(), detected.arguments(),
+                detected.pathStyle(), environment);
+
+        String command = "$pf=[Environment]::GetEnvironmentVariable('ProgramFiles(x86)'); "
+                + "$multi=[Environment]::GetEnvironmentVariable('JA_MULTILINE'); "
+                + "$last=[Environment]::GetEnvironmentVariable('JA_NATIVE_ENV_255'); "
+                + "if ($pf -eq 'C:\\Program Files (x86)' -and $multi -eq \"line-one`nline-two\" "
+                + "-and $last -eq 'native-marker-255') { Write-Output 'complete-environment-ok' } else { exit 9 }";
+        AgentTool.ToolResult result = execute(profile, invocation(command, 2_000), CancellationToken.none());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome(), result.content());
+        assertTrue(result.content().contains("complete-environment-ok"));
     }
 
     /** 独立 Tool timeout 必须早于宽松 Turn Deadline 返回，并在返回前确认根与后代均已消失。 */
@@ -305,13 +363,14 @@ final class ShellToolTest {
     @Test
     void executesPowerShellInsideHostedAppServerProcess() throws Exception {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
-        Map<String, String> environment = minimalWindowsEnvironment();
+        Map<String, String> environment = isolatedWindowsEnvironment(isolatedProfileRoot);
         List<String> appServerCommand = List.of(
                 java.toString(),
                 "-cp",
                 System.getProperty("java.class.path"),
                 HostedShellProbe.class.getName(),
-                temp.toAbsolutePath().toString());
+                temp.toAbsolutePath().toString(),
+                isolatedProfileRoot.toAbsolutePath().toString());
 
         try (WindowsJobObject hostJob = WindowsJobObject.create()) {
             Process appServer = WindowsProcessLauncher.launch(
@@ -334,7 +393,7 @@ final class ShellToolTest {
         }
     }
 
-    /** 使用同一冻结 Profile 和宽松 Turn Deadline执行，确保测试测到的是 Shell 独立 timeout。 */
+    /** 使用同一冻结 Profile 和宽松 Turn Deadline 执行，确保测试测到的是 Shell 独立 timeout。 */
     private AgentTool.ToolResult execute(
             ShellProfile profile, AgentTool.Invocation invocation, CancellationToken cancellation) {
         return execute(profile, invocation, cancellation, temp.toAbsolutePath());
@@ -408,21 +467,6 @@ final class ShellToolTest {
         return "'" + path.toAbsolutePath().toString().replace("'", "''") + "'";
     }
 
-    /** 复制 Rust Host env_clear 后保留的 Windows 运行变量，避免开发环境额外变量掩盖问题。 */
-    private static Map<String, String> minimalWindowsEnvironment() {
-        Map<String, String> values = new HashMap<>();
-        for (String name : List.of("SystemRoot", "PATH", "ComSpec", "TEMP", "TMP")) {
-            copyHost(values, name);
-        }
-        return Map.copyOf(values);
-    }
-
-    /** 测试只复制产品白名单中的非敏感宿主变量，不把完整环境注入 fixture。 */
-    private static void copyHost(Map<String, String> target, String key) {
-        String value = System.getenv(key);
-        if (value != null) target.put(key, value);
-    }
-
     /**
      * 独立 JVM 模拟 Rust/Tauri 托管的 Ja App Server，并把 ToolOutcome 变成进程退出事实，
      * 让父测试无需跨越私有 JA-RPC 会话也能验证 Shell 真实执行链。
@@ -432,7 +476,10 @@ final class ShellToolTest {
         public static void main(String[] arguments) {
             try {
                 Path workspace = Path.of(arguments[0]).toAbsolutePath().normalize();
-                ShellProfile profile = ShellCapability.detectAndPreflight().profile().orElseThrow(
+                Path profileRoot = Path.of(arguments[1]).toAbsolutePath().normalize();
+                ShellProfile profile = ShellCapability.detectAndPreflight("Windows 11",
+                                isolatedWindowsEnvironment(profileRoot), ShellProfile::preflight)
+                        .profile().orElseThrow(
                         () -> new IllegalStateException("shell_profile_unavailable"));
                 ShellTool tool = new ShellTool(profile);
                 AgentTool.Invocation invocation = invocation("Write-Output 'hosted-shell-ok'", 2_000);

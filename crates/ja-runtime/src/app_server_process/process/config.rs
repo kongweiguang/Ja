@@ -7,13 +7,13 @@ use crate::app_server_process::error::AppServerProcessError;
 use crate::app_server_process::lifecycle::RestartPolicy;
 use crate::app_server_process::protocol;
 use crate::app_server_process::protocol::{
-    Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, allowed_env_name, contains_secret_marker,
+    Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, contains_secret_marker,
     validate_initialize_params,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,8 +23,9 @@ use std::ffi::c_void;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-/// 启动参数只允许显式 run directory 与 allowlist 环境，不继承桌面进程环境。
-/// 不可变启动策略只保存进程路径、限制与传输策略；配置和凭据仍由 Java owner 持有。
+/// 启动配置保留宿主环境快照，并允许调用方显式覆盖；不在 Rust 侧筛选用户环境。
+/// 不可变启动策略只保存进程路径、限制与传输策略；配置和凭据的业务 owner 仍是 Java，
+/// Rust 只负责把宿主环境传入子进程，不读取或打印环境值。
 /// 四个目录角色保持独立，避免历史 `run`/`data` 别名重新变成持久数据库路径。
 #[derive(Clone)]
 pub struct SidecarConfig {
@@ -71,49 +72,23 @@ impl std::fmt::Debug for SidecarConfig {
     }
 }
 
-/// 只保留平台矩阵验证过的原生 sidecar 环境；`env_clear` 后继续排除凭据、代理和任意
-/// 用户环境。`PATH`、`ComSpec` 与 PowerShell 模块分析缓存是非 secret runtime 输入，
-/// 临时目录别名统一指向 sidecar 已拥有的 run directory，不能继承用户 temp。
-fn default_runtime_environment(run_dir: &Path) -> BTreeMap<OsString, OsString> {
-    default_runtime_environment_from(run_dir, |name| std::env::var_os(name))
+/// 捕获创建 sidecar 配置时的宿主环境；spawn 仍保持继承语义，快照只用于稳定显式覆盖。
+fn default_runtime_environment() -> BTreeMap<OsString, OsString> {
+    default_runtime_environment_from(std::env::vars_os())
 }
 
-/// 从只读 lookup 构造固定环境，使测试无需修改 host process 即可注入输入；生产仍只读取
-/// 当前进程，且所有输出必须通过同一 allowlist。
-pub(crate) fn default_runtime_environment_from<F>(
-    run_dir: &Path,
-    lookup: F,
-) -> BTreeMap<OsString, OsString>
+/// 将宿主环境原样收集为启动快照，使测试可以注入独立环境而不修改当前进程；不删除、
+/// 改名或重写任何变量，尤其保留用户的 `TEMP`/`TMP` 与 GitHub CLI 所需配置路径。
+pub(crate) fn default_runtime_environment_from<I>(environment: I) -> BTreeMap<OsString, OsString>
 where
-    F: for<'a> Fn(&'a str) -> Option<OsString>,
+    I: IntoIterator<Item = (OsString, OsString)>,
 {
-    let mut environment = BTreeMap::new();
-    #[cfg(windows)]
-    {
-        for name in ["SystemRoot", "PATH", "ComSpec", "PSModuleAnalysisCachePath"] {
-            if let Some(value) = lookup(name) {
-                environment.insert(OsString::from(name), value);
-            }
-        }
-        let temporary = run_dir.as_os_str().to_owned();
-        environment.insert(OsString::from("TEMP"), temporary.clone());
-        environment.insert(OsString::from("TMP"), temporary);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Java 的 macOS 临时目录属性来自 TMPDIR；在真实 native fixture 证明必要前，
-        // 不继承 HOME 与 locale，避免扩大 sidecar 环境能力。
-        if let Some(value) = lookup("PATH") {
-            environment.insert(OsString::from("PATH"), value);
-        }
-        environment.insert(OsString::from("TMPDIR"), run_dir.as_os_str().to_owned());
-    }
-    environment
+    environment.into_iter().collect()
 }
 
 impl SidecarConfig {
-    /// 创建 home/data/run/log 相互独立的 canonical 边界；本层不读取文件内容，也不接受
-    /// 凭据字节，避免进程策略复制 Java 配置事实。
+    /// 创建 home/data/run/log 相互独立的 canonical 边界，并冻结创建时的宿主环境快照；
+    /// Rust 不解析其内容，避免进程策略复制或改写 Java 配置事实。
     pub fn with_directories(
         executable: impl Into<PathBuf>,
         home_dir: impl Into<PathBuf>,
@@ -136,7 +111,7 @@ impl SidecarConfig {
             run_dir: canonical_run_dir.clone(),
             log_dir: fs::canonicalize(&log_dir).unwrap_or_else(|_| log_dir.clone()),
             workspace_root: None,
-            env: default_runtime_environment(&canonical_run_dir),
+            env: default_runtime_environment(),
             limits,
             ready_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(3),
@@ -171,7 +146,8 @@ impl SidecarConfig {
         &self.canonical_run_dir
     }
 
-    /// 在 spawn 前拒绝相对路径、继承环境和疑似 secret 参数，防止 sidecar 越界获得隐式权限。
+    /// 在 spawn 前拒绝相对路径和 Rust 保留参数；用户环境与普通终端保持一致，不在此处
+    /// 以变量名或值推断 secret，也不把环境内容写入诊断。
     pub fn validate(&self) -> Result<(), AppServerProcessError> {
         if !self.executable.is_absolute()
             || !self.run_dir.is_absolute()
@@ -248,18 +224,6 @@ impl SidecarConfig {
                 || value.starts_with("--ja-runtime-generation=")
         }) {
             return Err(AppServerProcessError::InvalidConfig);
-        }
-        for (name, value) in &self.env {
-            let name = name.to_string_lossy();
-            if !allowed_env_name(&name)
-                || contains_secret_marker(&name)
-                || (!matches!(
-                    name.as_ref(),
-                    "PATH" | "ComSpec" | "PSModuleAnalysisCachePath"
-                ) && contains_secret_marker(&value.to_string_lossy()))
-            {
-                return Err(AppServerProcessError::InvalidConfig);
-            }
         }
         Ok(())
     }

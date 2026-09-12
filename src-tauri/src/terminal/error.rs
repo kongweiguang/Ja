@@ -18,7 +18,6 @@ pub enum TerminalErrorCode {
     InvalidCwd = 3,
     CwdOutsideWorkspace = 4,
     EnvironmentNotAllowed = 5,
-    EnvironmentSecret = 6,
     InvalidSize = 7,
     SessionLimit = 8,
     SessionNotFound = 9,
@@ -37,8 +36,6 @@ pub enum TerminalErrorCode {
     UnsupportedPlatform = 22,
     DropTokenInvalid = 23,
     DropPathUnsupported = 24,
-    EnvironmentLimit = 26,
-    EnvironmentDangerous = 27,
 }
 
 /// 终端 API 的领域错误；不保存非脱敏平台字符串。
@@ -69,10 +66,7 @@ impl Display for TerminalError {
             TerminalErrorCode::CwdOutsideWorkspace => {
                 "terminal working directory is outside workspace"
             }
-            TerminalErrorCode::EnvironmentNotAllowed => {
-                "terminal environment variable is not allowed"
-            }
-            TerminalErrorCode::EnvironmentSecret => "terminal environment variable is sensitive",
+            TerminalErrorCode::EnvironmentNotAllowed => "terminal environment override is invalid",
             TerminalErrorCode::InvalidSize => "terminal size is invalid",
             TerminalErrorCode::SessionLimit => "terminal session limit reached",
             TerminalErrorCode::SessionNotFound => "terminal session was not found",
@@ -95,8 +89,6 @@ impl Display for TerminalError {
             TerminalErrorCode::DropPathUnsupported => {
                 "native drop path cannot be represented by this shell"
             }
-            TerminalErrorCode::EnvironmentLimit => "terminal environment exceeds its limits",
-            TerminalErrorCode::EnvironmentDangerous => "terminal environment variable is dangerous",
         })
     }
 }

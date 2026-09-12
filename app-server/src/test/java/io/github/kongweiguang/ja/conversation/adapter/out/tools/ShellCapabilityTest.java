@@ -22,9 +22,12 @@ class ShellCapabilityTest {
         Map<String, String> environment = Map.of(
                 "PATH", Path.of("tools", "powershell-seven") + File.pathSeparator + Path.of("tools", "other"),
                 "SystemRoot", Path.of("windows").toString());
-        ShellCapability capability = ShellCapability.detectAndPreflight("Windows 11", environment::get,
+        ShellCapability capability = ShellCapability.detectAndPreflight("Windows 11", environment,
                 candidate -> candidate.executable().getFileName().toString().equalsIgnoreCase("pwsh.exe"));
-        assertEquals(ShellProfile.Dialect.POWERSHELL, capability.profile().orElseThrow().dialect());
+        ShellProfile profile = capability.profile().orElseThrow();
+        assertEquals(ShellProfile.Dialect.POWERSHELL, profile.dialect());
+        assertFalse(profile.arguments().contains("-NoProfile"));
+        assertTrue(profile.arguments().contains("-NonInteractive"));
     }
 
     /** 所有 pwsh 候选失败后只回退一次 Windows PowerShell 5.1，不因缺少 PowerShell 7 终止服务。 */
@@ -33,7 +36,7 @@ class ShellCapabilityTest {
         Map<String, String> environment = Map.of(
                 "PATH", Path.of("missing", "one") + File.pathSeparator + Path.of("missing", "two"),
                 "SystemRoot", Path.of("windows").toString());
-        ShellCapability capability = ShellCapability.detectAndPreflight("Windows 11", environment::get,
+        ShellCapability capability = ShellCapability.detectAndPreflight("Windows 11", environment,
                 candidate -> candidate.dialect() == ShellProfile.Dialect.WINDOWS_POWERSHELL);
         ShellProfile profile = capability.profile().orElseThrow();
         assertEquals(ShellProfile.Dialect.WINDOWS_POWERSHELL, profile.dialect());
@@ -45,7 +48,7 @@ class ShellCapabilityTest {
     void missingShellProducesExplicitUnavailableCapability() {
         Map<String, String> environment = Map.of("PATH", Path.of("missing").toString(),
                 "SystemRoot", Path.of("windows").toString());
-        ShellCapability capability = ShellCapability.detectAndPreflight("Windows 11", environment::get,
+        ShellCapability capability = ShellCapability.detectAndPreflight("Windows 11", environment,
                 candidate -> false);
         assertTrue(capability.profile().isEmpty());
         String executionEnvironment = capability.executionEnvironment(Path.of("workspace"));

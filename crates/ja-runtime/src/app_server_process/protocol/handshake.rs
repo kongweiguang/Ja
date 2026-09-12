@@ -39,28 +39,7 @@ pub(crate) fn default_initialize_params(limits: &Limits) -> Value {
     })
 }
 
-/// 只允许 sidecar 运行所需的稳定环境变量，避免隐式继承凭据或用户状态。
-pub(crate) fn allowed_env_name(name: &str) -> bool {
-    matches!(
-        name,
-        "JA_LOG_LEVEL"
-            | "JA_DATA_DIR"
-            | "RUST_LOG"
-            | "LANG"
-            | "LC_ALL"
-            | "TMPDIR"
-            | "SystemRoot"
-            | "PATH"
-            | "ComSpec"
-            | "PSModuleAnalysisCachePath"
-            | "SystemDrive"
-            | "WINDIR"
-            | "TEMP"
-            | "TMP"
-    )
-}
-
-/// 检查参数/环境名中的凭据标记，防止 secret 通过不可审计启动边界泄露。
+/// 检查启动参数中的凭据标记；环境变量不经过此规则，避免把正常用户环境误判为非法。
 pub(crate) fn contains_secret_marker(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     [

@@ -369,7 +369,9 @@ impl TerminalRuntime {
         let mut command = CommandBuilder::new(&prepared.shell.program);
         command.args(&prepared.shell.args);
         command.cwd(&prepared.cwd);
-        command.env_clear();
+        // `CommandBuilder::new` 已经从 Ja 进程建立完整宿主环境（Windows 还会合并系统
+        // 与用户环境）。只应用显式 override；清空后重建会让 APPDATA、GH_CONFIG_DIR、
+        // 代理和用户安装工具等正常 CLI 依赖消失，造成“Ja 终端不像用户终端”。
         for (key, value) in &prepared.environment {
             command.env(key, value);
         }

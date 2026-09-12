@@ -7,7 +7,7 @@ use super::{SidecarConfig, default_runtime_environment_from};
 use crate::app_server_process::AppServerProcessError;
 use crate::unit_support_tests::poison_mutex;
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -28,93 +28,46 @@ fn sidecar_config(
     )
 }
 
-/// 锁定 Windows matrix 验证过的 OS/runtime 启动基线，防止 PATH 或无关用户变量成为
-/// sidecar 隐式能力。
+/// 锁定环境快照原样保留用户变量，防止 App Server 与普通终端出现隐式环境差异。
 #[test]
-fn default_runtime_environment_is_narrow() {
-    let run_dir = PathBuf::from("ja-owned-run-dir");
+fn default_runtime_environment_preserves_host_snapshot() {
     let process_env = BTreeMap::from([
-        ("SystemRoot".to_owned(), OsString::from("C:\\Windows")),
+        (OsString::from("SystemRoot"), OsString::from("C:\\Windows")),
         (
-            "PATH".to_owned(),
+            OsString::from("PATH"),
             OsString::from("C:\\secret-project\\bin;C:\\Windows\\System32"),
         ),
         (
-            "ComSpec".to_owned(),
+            OsString::from("ComSpec"),
             OsString::from("C:\\Windows\\System32\\cmd.exe"),
         ),
         (
-            "PSModuleAnalysisCachePath".to_owned(),
+            OsString::from("PSModuleAnalysisCachePath"),
             OsString::from("C:\\PSModuleAnalysisCachePath\\ModuleAnalysisCache"),
         ),
         (
-            "OPENAI_API_KEY".to_owned(),
+            OsString::from("TEMP"),
+            OsString::from("C:\\Users\\test\\AppData\\Local\\Temp"),
+        ),
+        (
+            OsString::from("TMP"),
+            OsString::from("C:\\Users\\test\\AppData\\Local\\Temp"),
+        ),
+        (
+            OsString::from("APPDATA"),
+            OsString::from("C:\\Users\\test\\AppData\\Roaming"),
+        ),
+        (
+            OsString::from("OPENAI_API_KEY"),
             OsString::from("should-not-cross"),
         ),
         (
-            "HTTP_PROXY".to_owned(),
+            OsString::from("HTTP_PROXY"),
             OsString::from("http://proxy.invalid"),
         ),
     ]);
-    let environment =
-        default_runtime_environment_from(&run_dir, |name| process_env.get(name).cloned());
-    let names = environment
-        .keys()
-        .map(|name| name.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    #[cfg(windows)]
-    assert!(names.iter().all(|name| matches!(
-        name.as_str(),
-        "SystemRoot" | "PATH" | "ComSpec" | "TEMP" | "TMP" | "PSModuleAnalysisCachePath"
-    )));
-    #[cfg(windows)]
-    assert_eq!(
-        environment.get(OsStr::new("PSModuleAnalysisCachePath")),
-        Some(&OsString::from("C:\\PSModuleAnalysisCachePath\\ModuleAnalysisCache"))
-    );
-    #[cfg(windows)]
-    assert_eq!(
-        environment.get(OsStr::new("PATH")),
-        Some(&OsString::from(
-            "C:\\secret-project\\bin;C:\\Windows\\System32"
-        ))
-    );
-    #[cfg(windows)]
-    assert_eq!(
-        environment.get(OsStr::new("ComSpec")),
-        Some(&OsString::from("C:\\Windows\\System32\\cmd.exe"))
-    );
-    #[cfg(windows)]
-    for name in ["TEMP", "TMP"] {
-        assert_eq!(
-            environment.get(OsStr::new(name)).map(OsString::as_os_str),
-            Some(run_dir.as_os_str())
-        );
-    }
-    #[cfg(target_os = "macos")]
-    assert!(
-        names
-            .iter()
-            .all(|name| matches!(name.as_str(), "PATH" | "TMPDIR"))
-    );
-    #[cfg(any(windows, target_os = "macos"))]
-    assert_eq!(
-        environment.get(OsStr::new("PATH")),
-        Some(&OsString::from(
-            "C:\\secret-project\\bin;C:\\Windows\\System32"
-        ))
-    );
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        environment
-            .get(OsStr::new("TMPDIR"))
-            .map(OsString::as_os_str),
-        Some(run_dir.as_os_str())
-    );
-    #[cfg(not(any(windows, target_os = "macos")))]
-    assert!(names.is_empty());
-    assert!(!names.iter().any(|name| name == "OPENAI_API_KEY"));
-    assert!(!names.iter().any(|name| name == "HTTP_PROXY"));
+    let environment = default_runtime_environment_from(process_env.clone());
+    assert_eq!(environment, process_env);
 }
 
 /// 保持 home/data/run/log 物理独立，防止未来启动变更把 SQLite 静默路由到短生命周期目录。
@@ -149,27 +102,24 @@ fn independent_directory_roles_are_validated() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// 允许 PATH 目录包含类似 marker 的名称，但仍拒绝任意 credential 变量；PATH/ComSpec
-/// 只是精确的非 secret runtime slot。
-#[cfg(windows)]
+/// 用户环境名和值不再由关键字推断权限；普通终端可用的变量可以原样传给 sidecar。
 #[test]
-fn coding_runtime_environment_validates_without_secret_value_false_positive() {
+fn user_environment_is_accepted_without_keyword_filter() {
     let executable = std::env::current_exe().expect("current test executable");
     let run_dir = std::env::temp_dir();
     let mut config = sidecar_config(&executable, &run_dir);
     config.env.insert(
-        OsString::from("PATH"),
-        OsString::from("C:\\secret-project\\bin;C:\\Windows\\System32"),
+        OsString::from("OPENAI_API_KEY"),
+        OsString::from("fixture-value"),
     );
     config.env.insert(
-        OsString::from("ComSpec"),
-        OsString::from("C:\\Windows\\System32\\cmd.exe"),
+        OsString::from("HTTP_PROXY"),
+        OsString::from("http://proxy.invalid"),
     );
-    assert!(config.validate().is_ok());
     config
         .env
-        .insert(OsString::from("OPENAI_API_KEY"), OsString::from("sk-test"));
-    assert_eq!(config.validate(), Err(AppServerProcessError::InvalidConfig));
+        .insert(OsString::from("GH_CONFIG_DIR"), OsString::from("C:\\gh"));
+    assert!(config.validate().is_ok());
 }
 
 /// 证明真实 Java 25 executable 可按 debug Tauri composition root 的同一四目录策略固定
@@ -218,19 +168,16 @@ fn poisoned_executable_identity_rejects_spawn_verification() {
     );
 }
 
-/// 证明 Native-only 启动边界允许固定 coding runtime，但不允许 JRE 回退或 secret 进入 argv。
+/// 证明 sidecar 接受完整用户环境，同时仍保留 argv secret 与 Rust generation 参数边界。
 #[test]
-fn native_only_config_rejects_jre_fallback_and_secret_environment() {
+fn runtime_config_accepts_user_environment_and_rejects_reserved_inputs() {
     let executable = std::env::current_exe().unwrap();
     let run_dir = std::env::temp_dir();
     let mut java_home = sidecar_config(&executable, &run_dir);
     java_home
         .env
         .insert(OsString::from("JAVA_HOME"), OsString::from("C:\\JDK"));
-    assert_eq!(
-        java_home.validate(),
-        Err(AppServerProcessError::InvalidConfig)
-    );
+    assert!(java_home.validate().is_ok());
 
     let mut path = sidecar_config(&executable, &run_dir);
     path.env.insert(
@@ -249,11 +196,8 @@ fn native_only_config_rejects_jre_fallback_and_secret_environment() {
     let mut secret_env = sidecar_config(&executable, &run_dir);
     secret_env
         .env
-        .insert(OsString::from("OPENAI_API_KEY"), OsString::from("sk-test"));
-    assert_eq!(
-        secret_env.validate(),
-        Err(AppServerProcessError::InvalidConfig)
-    );
+        .insert(OsString::from("OPENAI_API_KEY"), OsString::from("fixture-value"));
+    assert!(secret_env.validate().is_ok());
 
     let mut secret_arg = sidecar_config(&executable, &run_dir);
     secret_arg
@@ -295,11 +239,11 @@ fn native_only_config_rejects_jre_fallback_and_secret_environment() {
     );
 }
 
-/// 捕获真实 `env_clear/envs` child 边界，确保 Java shell adapter 收到 PATH/ComSpec，
-/// 同时 provider key 与 proxy 变量保持缺失。
+/// 捕获真实 Windows child 的继承边界，确保 PATH、用户配置路径、代理与临时目录都与
+/// 宿主一致；该测试刻意不调用 `env_clear`，覆盖生产侧“继承再覆盖”的实际语义。
 #[cfg(windows)]
 #[test]
-fn real_child_receives_coding_runtime_allowlist_without_secret_or_proxy() {
+fn real_child_receives_complete_host_environment_without_temp_rewrite() {
     let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
     let powershell = system_root
         .join("System32")
@@ -311,28 +255,15 @@ fn real_child_receives_coding_runtime_allowlist_without_secret_or_proxy() {
     }
     let run_dir = std::env::temp_dir();
     let config = sidecar_config(&powershell, &run_dir);
-    let path = config
-        .env
-        .get(&OsString::from("PATH"))
-        .expect("coding PATH must be captured")
-        .to_string_lossy()
-        .into_owned();
-    let comspec = config
-        .env
-        .get(&OsString::from("ComSpec"))
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // 在 runtime 构造敏感环境变量名，避免合同 fixture 形成 credential 形状源码 literal，
-    // 同时仍覆盖精确 child lookup 边界。
-    let api_key_name = ["OPENAI", "API", "KEY"].join("_");
-    let proxy_name = ["HTTP", "PROXY"].join("_");
-    let script = format!(
-        "[Console]::WriteLine(('PATH=' + $env:PATH)); [Console]::WriteLine(('ComSpec=' + $env:ComSpec)); [Console]::WriteLine(('{api_key_name}=' + [Environment]::GetEnvironmentVariable('{api_key_name}'))); [Console]::WriteLine(('{proxy_name}=' + [Environment]::GetEnvironmentVariable('{proxy_name}')))"
-    );
+    let path = std::env::var("PATH").expect("PATH");
+    let comspec = std::env::var("ComSpec").unwrap_or_default();
+    let temp = std::env::var("TEMP").expect("TEMP");
+    let tmp = std::env::var("TMP").expect("TMP");
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let script = "[Console]::WriteLine(('PATH=' + $env:PATH)); [Console]::WriteLine(('ComSpec=' + $env:ComSpec)); [Console]::WriteLine(('TEMP=' + $env:TEMP)); [Console]::WriteLine(('TMP=' + $env:TMP)); [Console]::WriteLine(('APPDATA=' + $env:APPDATA))".to_string();
     let output = Command::new(&powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .current_dir(&run_dir)
-        .env_clear()
         .envs(config.env.iter())
         .output()
         .expect("coding runtime child spawned");
@@ -340,10 +271,9 @@ fn real_child_receives_coding_runtime_allowlist_without_secret_or_proxy() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(&format!("PATH={path}")));
     assert!(stdout.contains(&format!("ComSpec={comspec}")));
-    assert!(stdout.contains("OPENAI_API_KEY="));
-    assert!(stdout.contains("HTTP_PROXY="));
-    assert!(!stdout.contains("sk-"));
-    assert!(!stdout.contains("proxy.invalid"));
+    assert!(stdout.contains(&format!("TEMP={temp}")));
+    assert!(stdout.contains(&format!("TMP={tmp}")));
+    assert!(stdout.contains(&format!("APPDATA={appdata}")));
 }
 
 /// config 固定 canonical identity 后不得跟随被替换的链接目标，避免校验与启动发生 TOCTOU 漂移。

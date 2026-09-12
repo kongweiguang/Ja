@@ -4,7 +4,7 @@
 //! `app_server_process` 公共 façade 合同；测试只使用 crate 外部可见 API。
 
 use ja_runtime::app_server_process::{
-    AppServerProcessError, LifecycleState, SessionEvent, SidecarConfig, SidecarSupervisor,
+    LifecycleState, SessionEvent, SidecarConfig, SidecarSupervisor,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 真实 filesystem 配置校验属于公开进程边界；fixture 使用独立临时目录并在断言后
-/// 清理，证明 secret 环境无法越过 `env_clear` allowlist，也不依赖私有 config 模块。
+/// 清理，证明用户环境名和值不再被旧的白名单/关键字策略误判，也不依赖私有 config 模块。
 #[test]
-fn facade_rejects_secret_sidecar_environment() {
+fn facade_accepts_user_sidecar_environment() {
     let root = std::env::temp_dir().join(format!(
         "ja-runtime-public-contract-{}-{}",
         std::process::id(),
@@ -31,15 +31,18 @@ fn facade_rejects_secret_sidecar_environment() {
     let mut config = SidecarConfig::with_directories(executable, &root, &root, &root, &root);
     config.env.insert(
         OsString::from("OPENAI_API_KEY"),
-        OsString::from("fixture-secret"),
+        OsString::from("fixture-value"),
     );
-    assert_eq!(config.validate(), Err(AppServerProcessError::InvalidConfig));
+    config
+        .env
+        .insert(OsString::from("GH_CONFIG_DIR"), OsString::from("C:\\gh"));
+    assert!(config.validate().is_ok());
     fs::remove_dir_all(root).unwrap();
 }
 
-/// 在真实 Windows child 上只经过公共 façade 完成 start、握手、request 与 shutdown，
-/// 证明进程行为已归属 crate integration test；fixture 固定当前唯一协议 minor，避免旧版本
-/// 被严格兼容门禁拒绝后掩盖生命周期验证，且不使用 Harness 或私有模块。
+/// 在真实 Windows child 上只经过公共 façade 完成 start、握手、request 与 shutdown，并由
+/// fixture 把 PATH/TEMP/TMP/APPDATA 写入独立文件，证明生产 spawn 保留宿主环境且不改写
+/// 临时目录；fixture 固定当前唯一协议 minor，且不使用 Harness 或私有模块。
 #[cfg(windows)]
 #[test]
 fn facade_owns_real_sidecar_process_lifecycle() {
@@ -65,11 +68,28 @@ fn facade_owns_real_sidecar_process_lifecycle() {
     ));
     fs::create_dir_all(&root).unwrap();
     let script_path = root.join("public-fixture.ps1");
+    let environment_path = root.join("inherited-environment.txt");
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $generationArgument = $args | Where-Object { $_ -like '--ja-runtime-generation=*' } | Select-Object -First 1
 if ($null -eq $generationArgument) { exit 42 }
 $runtimeGeneration = $generationArgument.Substring('--ja-runtime-generation='.Length)
+$environmentPath = $null
+for ($index = 0; $index -lt ($args.Count - 1); $index++) {
+    if ($args[$index] -eq '-EnvironmentPath') {
+        $environmentPath = $args[$index + 1]
+        break
+    }
+}
+if ($null -ne $environmentPath) {
+    $environmentLines = @(
+        ('PATH=' + $env:PATH),
+        ('TEMP=' + $env:TEMP),
+        ('TMP=' + $env:TMP),
+        ('APPDATA=' + $env:APPDATA)
+    ) -join [char]10
+    [IO.File]::WriteAllText($environmentPath, $environmentLines, [Text.UTF8Encoding]::new($false))
+}
 $initializeResult = '{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}'
 function Write-Lf([string]$Text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text + [char]10)
@@ -106,6 +126,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         OsString::from("-NonInteractive"),
         OsString::from("-File"),
         script_path.into_os_string(),
+        OsString::from("-EnvironmentPath"),
+        environment_path.clone().into_os_string(),
     ];
     config.ready_timeout = Duration::from_secs(5);
     config.shutdown_timeout = Duration::from_secs(2);
@@ -133,5 +155,13 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         .shutdown_until(Instant::now() + Duration::from_secs(2))
         .unwrap();
     drop(supervisor);
+    let inherited = fs::read_to_string(&environment_path).unwrap();
+    assert!(inherited.contains(&format!("PATH={}", std::env::var("PATH").expect("PATH"))));
+    assert!(inherited.contains(&format!("TEMP={}", std::env::var("TEMP").expect("TEMP"))));
+    assert!(inherited.contains(&format!("TMP={}", std::env::var("TMP").expect("TMP"))));
+    assert!(inherited.contains(&format!(
+        "APPDATA={}",
+        std::env::var("APPDATA").unwrap_or_default()
+    )));
     fs::remove_dir_all(root).unwrap();
 }

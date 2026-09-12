@@ -12,7 +12,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
@@ -37,7 +36,7 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
 
     /** 在生产启动时只探测一次，并把任何不可用结果收敛为显式空能力。 */
     public static ShellCapability detectAndPreflight() {
-        return detectAndPreflight(System.getProperty("os.name", ""), System::getenv,
+        return detectAndPreflight(System.getProperty("os.name", ""), System.getenv(),
                 ShellProfile::preflight);
     }
 
@@ -53,9 +52,9 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
     }
 
     /**
-     * 注入环境与预检 seam，使回退顺序可在任意测试平台验证，且测试不修改全局环境或启动 Shell。
+     * 注入完整环境与预检 seam，使回退顺序可在任意测试平台验证，且测试不修改全局环境或启动 Shell。
      */
-    static ShellCapability detectAndPreflight(String osName, Function<String, String> environment,
+    static ShellCapability detectAndPreflight(String osName, Map<String, String> environment,
                                                Predicate<ShellProfile> preflight) {
         Objects.requireNonNull(environment, "environment");
         Objects.requireNonNull(preflight, "preflight");
@@ -97,10 +96,10 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
     }
 
     /** PowerShell 7 优先；只有所有 pwsh 候选失败后才尝试 Windows PowerShell 5.1。 */
-    private static List<ShellProfile> windowsCandidates(Function<String, String> environment,
+    private static List<ShellProfile> windowsCandidates(Map<String, String> environment,
                                                          Map<String, String> processEnvironment) {
         List<ShellProfile> candidates = new ArrayList<>();
-        String path = environment.apply("PATH");
+        String path = environmentValue(environment, "PATH");
         if (path != null) {
             for (String directory : path.split(Pattern.quote(File.pathSeparator))) {
                 String normalized = stripOptionalQuotes(directory.trim());
@@ -108,21 +107,21 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
                 try {
                     candidates.add(new ShellProfile(ShellProfile.OperatingSystem.WINDOWS,
                             ShellProfile.Dialect.POWERSHELL, Path.of(normalized, "pwsh.exe"),
-                            List.of("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                            List.of("-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                     "-Command"), "windows", processEnvironment));
                 } catch (InvalidPathException ignored) {
                     // 畸形 PATH 项不能阻断后续候选或 App Server 启动。
                 }
             }
         }
-        String systemRoot = environment.apply("SystemRoot");
+        String systemRoot = environmentValue(environment, "SystemRoot");
         if (systemRoot != null && !systemRoot.isBlank()) {
             try {
                 candidates.add(new ShellProfile(ShellProfile.OperatingSystem.WINDOWS,
                         ShellProfile.Dialect.WINDOWS_POWERSHELL,
                         Path.of(stripOptionalQuotes(systemRoot.trim()), "System32", "WindowsPowerShell", "v1.0",
                                 "powershell.exe"),
-                        List.of("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                        List.of("-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                 "-Command"), "windows", processEnvironment));
             } catch (InvalidPathException ignored) {
                 // 缺失系统回退仍只是 Shell 能力缺失，不扩大为服务启动失败。
@@ -137,6 +136,15 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
             return value.substring(1, value.length() - 1);
         }
         return value;
+    }
+
+    /** Windows 环境名大小写不敏感；测试 Map 与 System.getenv() 都走相同的查找语义。 */
+    private static String environmentValue(Map<String, String> environment, String name) {
+        return environment.entrySet().stream()
+                .filter(entry -> name.equalsIgnoreCase(entry.getKey()))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(null);
     }
 
     /**

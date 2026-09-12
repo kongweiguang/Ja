@@ -83,6 +83,10 @@ Host 同时通过必填 `--ja-runtime-generation=<安全正整数>` 传入本次
 Windows PowerShell 5.1；两者都不可用时，执行环境明确标记 `shell: unavailable`，App Server
 仍保留配置、历史与 RPC 恢复面，不注册一个必然失败的 Shell Tool。Tool 在 Java App Server
 内执行，文件访问只受当前操作系统账户权限约束，Rust 不再提供 Host Tool 或 Sandbox RPC。
+App Server 的 Shell 与界面终端完整继承 Ja 的宿主环境，保留用户 PATH、代理、临时目录和
+已有 CLI 登录配置；不再设置环境白名单，也不要求在 Ja 重复登录。PowerShell 加载用户
+Profile，Agent Shell 仍按非交互命令执行并保留超时、取消和进程树清理。其他终端中临时
+设置的变量不会自动同步到已启动的 Ja；继承环境不投影到界面或普通日志。
 旧 Tool 别名、旧权限/审批枚举、`change/*`、`runtime/configure` 和
 `initialize.configSnapshot` 均已删除且 fail closed。活动 Turn 的权威输入队列由
 `turn/input/enqueue`、`turn/input/prioritize`、`turn/input/update` 与 `turn/input/delete`
