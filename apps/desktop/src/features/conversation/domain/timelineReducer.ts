@@ -15,6 +15,7 @@ import type {
   ItemMetadata,
   TimelineApproval,
   TimelineContextUsage,
+  TimelineThreadContextUsage,
   TimelineItemAdapter,
   TimelineItemKind,
   TimelineItemStatus,
@@ -191,7 +192,9 @@ export interface TimelineState {
   liveStartedToolCorrelations: Record<string, true>;
   approvalsById: Record<string, TimelineApprovalState>;
   contextCompactionByThread: Record<string, ContextCompactionProjection>;
-  contextUsageByThread: Record<string, TimelineContextUsage>;
+  /** 成功压缩边界独立于瞬态生命周期，后续重试不得恢复旧 Provider 计量。 */
+  contextUsageInvalidatedAtByThread: Record<string, string>;
+  contextUsageByThread: Record<string, TimelineThreadContextUsage>;
   taskActivitiesByRootThread: Record<string, readonly TimelineTaskActivityEntry[]>;
   goalActivitiesByOwnerThread: Record<string, readonly TimelineGoalActivity[]>;
   inputQueueByTurn: Record<string, InputQueue>;
@@ -222,6 +225,7 @@ export function createTimelineState(): TimelineState {
     liveStartedToolCorrelations: {},
     approvalsById: {},
     contextCompactionByThread: {},
+    contextUsageInvalidatedAtByThread: {},
     contextUsageByThread: {},
     taskActivitiesByRootThread: {},
     goalActivitiesByOwnerThread: {},
@@ -253,6 +257,7 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
     liveStartedToolCorrelations: {},
     approvalsById: {},
     contextCompactionByThread: {},
+    contextUsageInvalidatedAtByThread: {},
     contextUsageByThread: {},
     taskActivitiesByRootThread: {},
     goalActivitiesByOwnerThread: {},
@@ -691,11 +696,20 @@ export function applySnapshot(
     toolItemIdByCallId[correlation] = item.itemId;
     pendingToolOrdinalByCallId[correlation] = item.ordinal;
   }
+  // Snapshot 不携带压缩 lifecycle；只保留成功压缩的失效边界，started/failed 不得让 UI 永久卡在处理中。
   const contextCompactionByThread = { ...next.contextCompactionByThread };
-  delete contextCompactionByThread[snapshot.threadId];
+  if (contextCompactionByThread[snapshot.threadId]?.phase !== "compacted")
+    delete contextCompactionByThread[snapshot.threadId];
   const contextUsageByThread = { ...next.contextUsageByThread };
   if (snapshot.contextUsage === null) delete contextUsageByThread[snapshot.threadId];
-  else contextUsageByThread[snapshot.threadId] = snapshot.contextUsage;
+  else
+    contextUsageByThread[snapshot.threadId] = {
+      ...usageAfterCompaction(
+        snapshot.contextUsage,
+        next.contextUsageInvalidatedAtByThread[snapshot.threadId],
+      ),
+      turnId: snapshot.contextUsage.turnId,
+    };
   const inputQueueByTurn = Object.fromEntries(
     Object.entries(next.inputQueueByTurn).filter(([turnId]) => !threadTurnIds.has(turnId)),
   );
@@ -1012,33 +1026,79 @@ function usageMetadata(usage: TimelineContextUsage | undefined): ItemMetadata | 
       };
 }
 
+/** 时间边界来自服务端；不比较 Turn 内序号，避免跨 Turn 新请求被旧 UNKNOWN 阻塞。 */
+function usageAfterCompaction(
+  usage: TimelineContextUsage,
+  invalidatedAt: string | undefined,
+): TimelineContextUsage {
+  if (invalidatedAt === undefined || Date.parse(usage.measuredAt) > Date.parse(invalidatedAt))
+    return usage;
+  return {
+    ...usage,
+    certainty: "unknown",
+    inputTokens: null,
+    outputTokens: null,
+    totalTokens: null,
+  };
+}
+
+/** 压缩成功后冻结旧请求的可信度，防止后续 started/failed 或旧 Snapshot 重新启用旧计量。 */
+function invalidateContextUsage(state: TimelineState, threadId: string): TimelineState {
+  const usage = state.contextUsageByThread[threadId];
+  if (usage === undefined || usage.certainty === "unknown") return state;
+  return {
+    ...state,
+    contextUsageByThread: {
+      ...state.contextUsageByThread,
+      [threadId]: {
+        ...usageAfterCompaction(usage, state.contextUsageInvalidatedAtByThread[threadId]),
+        turnId: usage.turnId,
+      },
+    },
+  };
+}
+
 /**
- * 按 requestOrdinal 保存最新请求事实；同一 requestId 只允许 UNKNOWN 原位升级为相同画像的 KNOWN。
+ * 仅在同 Turn 内比较 requestOrdinal；跨 Turn 先检查已确认的开始时间，等时按已接纳的事件顺序推进。
+ * 同一 requestId 只允许 UNKNOWN 原位升级为相同画像的 KNOWN。
  * 迟到低序请求不覆盖，身份或画像冲突则拒绝事件，避免 UI 展示混合代际事实。
  */
 function recordContextUsage(
   state: TimelineState,
   threadId: string,
+  turnId: string,
   usage: TimelineContextUsage,
 ): TimelineState | undefined {
   const current = state.contextUsageByThread[threadId];
-  if (current !== undefined) {
+  if (current !== undefined && current.turnId !== turnId) {
+    const previousStartedAt = state.turns[current.turnId]?.startedAt;
+    const incomingStartedAt = state.turns[turnId]?.startedAt;
+    if (previousStartedAt === undefined || incomingStartedAt === undefined) return undefined;
+    if (Date.parse(incomingStartedAt) < Date.parse(previousStartedAt)) return state;
+  }
+  if (current !== undefined && current.turnId === turnId) {
+    const currentRequestUsage: TimelineContextUsage = { ...current };
+    // Turn 身份属于投影外壳，不参与同一请求 Usage 的幂等比较。
+    Reflect.deleteProperty(currentRequestUsage, "turnId");
     if (usage.requestOrdinal < current.requestOrdinal) return state;
     if (usage.requestOrdinal === current.requestOrdinal) {
       if (usage.requestId !== current.requestId) return undefined;
       const sameProfile = JSON.stringify(usage.profile) === JSON.stringify(current.profile);
       if (!sameProfile) return undefined;
       if (current.certainty === "known")
-        return JSON.stringify(usage) === JSON.stringify(current) ? state : undefined;
+        return JSON.stringify(usage) === JSON.stringify(currentRequestUsage) ? state : undefined;
       if (usage.certainty === "unknown")
-        return JSON.stringify(usage) === JSON.stringify(current) ? state : undefined;
+        return JSON.stringify(usage) === JSON.stringify(currentRequestUsage) ? state : undefined;
     }
   }
   return {
     ...state,
     contextUsageByThread: {
       ...state.contextUsageByThread,
-      [threadId]: usage,
+      [threadId]: {
+        ...usageAfterCompaction(usage, state.contextUsageInvalidatedAtByThread[threadId]),
+        turnId,
+      },
     },
   };
 }
@@ -1060,7 +1120,7 @@ function applyModelStepCommitted(
 
   let next = state;
   if (params.usage !== undefined) {
-    const recorded = recordContextUsage(next, params.threadId, params.usage);
+    const recorded = recordContextUsage(next, params.threadId, params.turnId, params.usage);
     if (recorded === undefined) return undefined;
     next = recorded;
   }
@@ -1311,6 +1371,16 @@ function applyContextCompactionEvent(
       [params.threadId]: projection,
     },
   };
+  if (phase === "compacted") {
+    next = {
+      ...next,
+      contextUsageInvalidatedAtByThread: {
+        ...next.contextUsageInvalidatedAtByThread,
+        [params.threadId]: params.occurredAt,
+      },
+    };
+    next = invalidateContextUsage(next, params.threadId);
+  }
   if (params.turnId !== null) {
     next = putItem(next, {
       itemId: `item_compaction_${params.compactionId.slice("cmp_".length)}`,
@@ -1382,7 +1452,7 @@ function applyInputConsumed(
   const settlement = params.assistantSettlement;
   if (settlement !== undefined) {
     if (settlement.usage !== undefined) {
-      const recorded = recordContextUsage(next, params.threadId, settlement.usage);
+      const recorded = recordContextUsage(next, params.threadId, params.turnId, settlement.usage);
       if (recorded === undefined) return undefined;
       next = recorded;
     }
@@ -1647,7 +1717,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
             ? "cancelled"
             : "failed";
       if (params.usage !== undefined) {
-        const recorded = recordContextUsage(next, params.threadId, params.usage);
+        const recorded = recordContextUsage(next, params.threadId, params.turnId, params.usage);
         if (recorded === undefined) return resync(state, params.threadId, "invalid_event");
         next = recorded;
       }

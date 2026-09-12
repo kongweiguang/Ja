@@ -4,6 +4,8 @@
 package io.github.kongweiguang.ja.conversation.application.context.compaction;
 
 import io.github.kongweiguang.ja.conversation.application.context.ContextException;
+import io.github.kongweiguang.ja.conversation.application.context.ContextCompactionLifecycle;
+import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.application.context.ContextMessage;
 import io.github.kongweiguang.ja.conversation.application.context.ContextPolicy;
 import io.github.kongweiguang.ja.conversation.application.context.ContextTokenMeter;
@@ -378,6 +380,92 @@ final class ContextCompactorTest {
                 () -> service.compact(request(store, evictingHistory(), true, Optional.empty())));
 
         assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
+        assertTrue(store.appended().isEmpty());
+    }
+
+    /** 自动摘要失败但原 prompt 仍可发送时继续原请求，且不把失败伪造成新的 Checkpoint。 */
+    @Test
+    void automaticSummaryFailureFallsBackWhenOriginalPromptFits() {
+        MemoryCheckpointStore store = new MemoryCheckpointStore("thread-ctx", INITIAL_REVISION);
+        ContextCompactionService service = service(store, request -> {
+            throw new IllegalStateException("summary provider unavailable");
+        });
+        List<ContextMessage> source = List.of(
+                ContextMessage.text("old", "turn-1", 1, ContextMessage.Role.USER,
+                        "old context", 30_000),
+                ContextMessage.text("latest", "turn-2", 2, ContextMessage.Role.USER,
+                        "latest", 2));
+
+        OverflowRecovery.Execution<String> execution = new OverflowRecovery(service).execute(
+                request(store, source, false, Optional.empty()), receipt -> { }, prompt -> "ok");
+
+        assertEquals("ok", execution.result());
+        assertFalse(execution.context().compacted());
+        assertTrue(execution.context().checkpoint().isEmpty());
+        assertFalse(execution.context().prompt().localCompaction());
+        assertEquals(List.of(1L, 2L), execution.context().prompt().messages().stream()
+                .map(ContextMessage::ordinal).toList());
+        assertTrue(store.appended().isEmpty());
+    }
+
+    /** 旧摘要不覆盖新尾部；自动失败后的真实溢出必须重新摘要并产生新回执，不能静默丢弃尚未归档事实。 */
+    @Test
+    void oldCheckpointFallbackMustSummarizeNewTailOnRealOverflow() {
+        MemoryCheckpointStore store = new MemoryCheckpointStore("thread-ctx", INITIAL_REVISION);
+        AtomicLong summaries = new AtomicLong();
+        ContextCompactionService service = service(store, summaryRequest -> {
+            long call = summaries.incrementAndGet();
+            if (call == 2) throw new IllegalStateException("automatic summary unavailable");
+            if (call == 3) {
+                assertTrue(summaryRequest.evictedMessages().stream().anyMatch(message -> message.ordinal() == 2));
+            }
+            return result(summary("goal", "progress-" + call), USAGE);
+        });
+        service.compact(request(store, evictingHistory(), true, Optional.empty()));
+        store.advanceSourceRevision(store.threadRevision() + 1);
+        List<ContextMessage> source = List.of(
+                ContextMessage.text("old", "turn-1", 1, ContextMessage.Role.USER, "old context", 20000),
+                ContextMessage.text("new", "turn-2", 2, ContextMessage.Role.USER, "new unsummarized fact", 30000),
+                ContextMessage.text("last", "turn-3", 3, ContextMessage.Role.USER, "latest", 2));
+        List<ContextCompactionEvent> events = new ArrayList<>();
+        ContextCompactionLifecycle lifecycle = new ContextCompactionLifecycle("ws_test", "thr_test", "turn_test",
+                store.threadRevision(), "cmp_test", event -> {
+                    events.add(event);
+                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                }, Clock.fixed(NOW, ZoneOffset.UTC));
+        AtomicLong sends = new AtomicLong();
+        OverflowRecovery.Execution<String> execution = new OverflowRecovery(service).execute(
+                request(store, source, false, Optional.empty()), receipt -> { }, prompt -> {
+                    if (sends.incrementAndGet() == 1) {
+                        assertTrue(prompt.messages().stream().anyMatch(message -> message.ordinal() == 2));
+                        throw new ContextException(ContextException.Code.CONTEXT_LIMIT, "real provider overflow");
+                    }
+                    return "ok";
+                }, lifecycle, ContextCompactionEvent.Trigger.AUTOMATIC);
+        assertEquals("ok", execution.result());
+        assertEquals(3, summaries.get());
+        assertEquals(2, store.appended().size());
+        assertEquals(2, sends.get());
+        assertEquals(1, events.stream().filter(ContextCompactionEvent.Failed.class::isInstance).count());
+        assertEquals(1, events.stream().filter(ContextCompactionEvent.Compacted.class::isInstance).count());
+        assertEquals("checkpoint_test_2", execution.committedReceipt().orElseThrow().checkpoint().checkpointId());
+    }
+
+    /** 自动压缩无法挽救硬超限时仍明确失败，不能发送已知不适配的原提示。 */
+    @Test
+    void automaticSummaryFailureAtHardLimitDoesNotSendOriginalPrompt() {
+        MemoryCheckpointStore store = new MemoryCheckpointStore("thread-ctx", INITIAL_REVISION);
+        ContextCompactionService service = service(store, request -> {
+            throw new IllegalStateException("summary unavailable");
+        });
+        AtomicBoolean sent = new AtomicBoolean();
+        ContextException failure = assertThrows(ContextException.class, () -> new OverflowRecovery(service).execute(
+                request(store, evictingHistory(), false, Optional.empty(), tinyBudget()), prompt -> {
+                    sent.set(true);
+                    return "bad";
+                }));
+        assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
+        assertFalse(sent.get());
         assertTrue(store.appended().isEmpty());
     }
 

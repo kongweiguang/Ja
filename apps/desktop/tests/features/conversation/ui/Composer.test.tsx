@@ -1638,8 +1638,8 @@ describe("Composer", () => {
     expect(indicator).toHaveFocus();
   });
 
-  /** 危险态保留 progressbar 语义并展示压缩来源，颜色只作为冗余信号。 */
-  it("为接近上限的压缩后计量投影危险状态", () => {
+  /** 真实 Provider Usage 接近上限时保留 progressbar 语义，颜色只作为冗余信号。 */
+  it("为接近上限的 Provider 计量投影危险状态", () => {
     render(
       <ControlledComposerHarness
         preferences={PREFERENCES}
@@ -1651,7 +1651,7 @@ describe("Composer", () => {
           percentage: 98,
           ringPercentage: 97.5,
           tone: "danger",
-          source: "compaction",
+          source: "provider",
           measuredAt: "2026-08-31T00:00:02Z",
         }}
         onSend={vi.fn()}
@@ -1661,7 +1661,7 @@ describe("Composer", () => {
     expect(indicator).toHaveAttribute("data-tone", "danger");
     expect(indicator).toHaveAttribute(
       "aria-valuetext",
-      "已使用 98%，195K / 200K tokens，压缩后计量",
+      "已使用 98%，195K / 200K tokens，最近模型请求",
     );
   });
 });

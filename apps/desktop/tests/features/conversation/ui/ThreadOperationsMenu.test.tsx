@@ -10,6 +10,30 @@ import { ThreadOperationsMenu } from "@/features/conversation";
 afterEach(() => cleanup());
 
 describe("ThreadOperationsMenu", () => {
+  /** 关闭反馈必须走真实 IconButton，鼠标与键盘均只关闭提示，不重复发起压缩。 */
+  it.each(["success", "error"] as const)("allows dismissing %s feedback", async (phase) => {
+    const user = userEvent.setup();
+    const onCompact = vi.fn();
+    const onDismissFeedback = vi.fn();
+    render(
+      <ThreadOperationsMenu
+        showCompactAction
+        compaction={{ phase, message: "压缩反馈", retryable: false }}
+        onCompact={onCompact}
+        onDismissFeedback={onDismissFeedback}
+      />,
+    );
+    const close = screen.getByRole("button", { name: "关闭上下文压缩提示" });
+    expect(close).toHaveClass("ja-icon-button");
+    expect(close.closest(".ja-thread-compaction-feedback")).not.toBeNull();
+    await user.click(close);
+    expect(onDismissFeedback).toHaveBeenCalledTimes(1);
+    close.focus();
+    await user.keyboard("{Enter}");
+    expect(onDismissFeedback).toHaveBeenCalledTimes(2);
+    expect(onCompact).not.toHaveBeenCalled();
+  });
+
   it("routes the real compact action from an accessible Thread menu", async () => {
     const user = userEvent.setup();
     const onCompact = vi.fn();
@@ -73,6 +97,7 @@ describe("ThreadOperationsMenu", () => {
     );
     expect(screen.getByRole("button", { name: "上下文压缩中" })).toBeDisabled();
     expect(screen.getByRole("status")).toHaveTextContent("正在压缩上下文");
+    expect(screen.queryByRole("button", { name: "关闭上下文压缩提示" })).not.toBeInTheDocument();
 
     rerender(
       <ThreadOperationsMenu

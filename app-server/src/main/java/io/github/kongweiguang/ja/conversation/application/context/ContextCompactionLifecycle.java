@@ -24,6 +24,7 @@ public final class ContextCompactionLifecycle {
     private Long before;
     private ContextCompactionEvent.Trigger activeTrigger;
     private boolean terminated;
+    private boolean automaticFallback;
 
     /** 固定一次压缩操作身份；同一操作的 started/terminal 事件不得跨 Thread 或 revision。 */
     public ContextCompactionLifecycle(String workspaceId, String threadId, String turnId,
@@ -40,7 +41,9 @@ public final class ContextCompactionLifecycle {
 
     /** 在已确认确需压缩且取得官方计量后发布 started；同一 attempt 只允许开始一次。 */
     public void started(ContextCompactionEvent.Trigger trigger, long inputTokensBefore) {
-        if (activeTrigger != null || terminated) throw new IllegalStateException("context compaction attempt already started");
+        if (activeTrigger != null || (terminated && !automaticFallback)) throw new IllegalStateException("context compaction attempt already started");
+        terminated = false;
+        automaticFallback = false;
         activeTrigger = Objects.requireNonNull(trigger, "trigger");
         before = inputTokensBefore;
         publish(new ContextCompactionEvent.Started(context(sourceRevision, trigger, before, null)));
@@ -65,9 +68,21 @@ public final class ContextCompactionLifecycle {
         clearAttempt();
     }
 
+    /**
+     * 当前 attempt 已发布终态，外层取消不得重复发失败；仅下一次真实压缩尝试可重新打开生命周期。
+     */
+    public void failedForAutomaticFallback(ContextException.Code code) {
+        ContextCompactionEvent.Trigger trigger = requireActive();
+        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, before, null), wire(code)));
+        terminated = true;
+        automaticFallback = true;
+        clearAttempt();
+    }
+
     /** 首次官方计量失败时仍发布可关联失败事件，但 Token before 合法为空。 */
     public void failBeforeStart(ContextCompactionEvent.Trigger trigger, ContextException.Code code) {
-        if (activeTrigger != null || terminated) throw new IllegalStateException("context compaction attempt already started");
+        if (activeTrigger != null || (terminated && !automaticFallback)) throw new IllegalStateException("context compaction attempt already started");
+        automaticFallback = false;
         publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, null, null), wire(code)));
         terminated = true;
     }

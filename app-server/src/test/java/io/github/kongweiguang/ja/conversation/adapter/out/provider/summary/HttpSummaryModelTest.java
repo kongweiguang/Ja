@@ -87,6 +87,24 @@ final class HttpSummaryModelTest {
         }
     }
 
+    /** 摘要连续失败只耗尽各自请求预算，不能阻止后续摘要恢复或累积跨请求熔断状态。 */
+    @Test
+    void summaryRequestsReachHttpAfterRepeatedFailures() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
+            if (call <= 9) ModelAdapterTestSupport.status(exchange, 503, "0");
+            else ModelAdapterTestSupport.sse(exchange, openAiSummary(DOCUMENT, new ModelUsage(12, 5, 17)), 7);
+        }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
+            ModelPort.ModelConfiguration configuration = configuration(server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
+            for (int index = 0; index < 3; index++) {
+                assertThrows(ContextException.class, () -> countedSummary(
+                        factory.bind(binding(configuration, CancellationToken.none())), prompt()));
+                assertEquals((index + 1) * 3, server.calls());
+            }
+            assertDocument(countedSummary(factory.bind(binding(configuration, CancellationToken.none())), prompt()).document());
+            assertEquals(10, server.calls());
+        }
+    }
+
     /** 校验 Chat Completions 使用原生 response_format.json_schema 并返回完整 usage。 */
     @Test
     void summarizesWithOpenAiChatStructuredResponse() throws Exception {

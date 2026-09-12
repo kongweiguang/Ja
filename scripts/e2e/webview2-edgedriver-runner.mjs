@@ -74,7 +74,7 @@ async function waitForDriver(driver, port) {
 
 /**
  * 仅投影 WebDriver 响应的结构与有界标量形状，便于定位当前官方驱动合同漂移；
- * 不回显任意错误正文、二进制路径或未经信任的 capability 值。
+ * 错误仅保留脱敏单行摘要，不回显二进制路径、堆栈或未经信任的 capability 值。
  */
 function sessionResponseShape(response, body) {
   const value = body?.value;
@@ -82,6 +82,8 @@ function sessionResponseShape(response, body) {
   const address = capabilities?.["ms:edgeOptions"]?.debuggerAddress;
   return {
     httpStatus: response.status,
+    error: safeSessionError(value?.error),
+    message: safeSessionError(value?.message),
     bodyKeys: Object.keys(body ?? {}).sort(),
     valueKeys: Object.keys(value ?? {}).sort(),
     capabilityKeys: Object.keys(capabilities ?? {}).sort(),
@@ -106,6 +108,16 @@ function sessionResponseShape(response, body) {
         : typeof address,
     processIdType: typeof capabilities?.["goog:processID"],
   };
+}
+
+/** 保留驱动拒绝 session 的具体原因，但移除路径、认证串和换行，避免诊断输出泄露宿主信息。 */
+function safeSessionError(value) {
+  if (typeof value !== "string") return undefined;
+  return value
+    .replace(/\b(?:Bearer|Basic)\s+\S+/giu, "<REDACTED_AUTH>")
+    .replace(/\b[A-Za-z]:[\\/][^\r\n"'<>)]*/gu, "<LOCAL_PATH>")
+    .replace(/[\r\n]+/gu, " ")
+    .slice(0, 1_000);
 }
 
 /**

@@ -67,7 +67,7 @@ final class ContextPolicyTest {
         assertEquals(9_750, budget.recentTailTokens());
     }
 
-    /** 覆盖主流 32K、200K、1M 与 4M 窗口，锁定提前压缩、目标占用和尾部预算的单调有界关系。 */
+    /** 覆盖主流 32K、200K、1M 与 4M 窗口，锁定显式 reserve、压缩目标和尾部预算的单调有界关系。 */
     @Test
     void productionWindowMatrixKeepsCompactionHeadroomBounded() {
         long[] windows = {32_768L, 200_000L, 1_000_000L, 4_000_000L};
@@ -75,16 +75,27 @@ final class ContextPolicyTest {
         for (int index = 0; index < windows.length; index++) {
             ContextBudget budget = ContextBudget.capabilities(windows[index], outputs[index], true);
             long ceiling = windows[index] - outputs[index];
-            long headroom = Math.min(30_000L, Math.max(4_096L, windows[index] / 10L));
+            long reserve = Math.min(16_384L, ceiling * 2L / 5L);
 
             assertEquals(ceiling, budget.sendCeilingTokens());
-            assertEquals(Math.max(0L, ceiling - headroom), budget.automaticCompactionThreshold());
+            assertEquals(reserve, budget.compactionReserveTokens());
+            assertEquals(Math.min(ceiling, windows[index] - reserve), budget.automaticCompactionThreshold());
             assertEquals(ceiling * 3L / 5L, budget.compactedTargetTokens());
-            assertTrue(budget.compactedTargetTokens() < budget.automaticCompactionThreshold());
+            assertTrue(budget.compactedTargetTokens() <= budget.automaticCompactionThreshold());
             assertTrue(budget.recentTailTokens() >= 8_000L);
             assertTrue(budget.recentTailTokens() <= 20_000L);
             assertTrue(budget.recentTailTokens() <= ceiling);
         }
+    }
+
+    /** 固定真实 256K 配置与极小窗口边界，防止输出预算和 reserve 再次双扣。 */
+    @Test
+    void reserveSharesOutputSpaceAndKeepsSmallWindowsSendable() {
+        assertEquals(239_616, ContextBudget.capabilities(256_000, 8_192, true)
+                .automaticCompactionThreshold());
+        assertEquals(90, ContextBudget.capabilities(100, 10, true).sendCeilingTokens());
+        assertEquals(64, ContextBudget.capabilities(100, 10, true).automaticCompactionThreshold());
+        assertEquals(1, ContextBudget.capabilities(2, 1, true).automaticCompactionThreshold());
     }
 
     /** 输出预算超过窗口时立即拒绝，避免压缩策略消费不可能的 Provider 能力。 */

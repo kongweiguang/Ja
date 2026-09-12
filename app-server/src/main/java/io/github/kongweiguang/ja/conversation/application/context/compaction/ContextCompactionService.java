@@ -102,7 +102,7 @@ public final class ContextCompactionService {
                     ? Optional.empty() : plan.continuation();
             return new CompactionResult(usesCheckpoint,
                     new PromptContext(plan.fullPrompt(), previous, plan.fullPromptTokens(),
-                            continuation, usesCheckpoint), snapshot.checkpoint(), plan, Optional.empty());
+                            continuation, usesCheckpoint), snapshot.checkpoint(), plan, Optional.empty(), false);
         }
         /*
          * Checkpoint 事务本身会推进 Thread revision。下一轮相同不可变消息源因此具有新 revision
@@ -122,9 +122,18 @@ public final class ContextCompactionService {
         observer.started(plan.fullPromptTokens());
         request.cancellation().throwIfCancellationRequested();
 
-        SummaryGenerator.SummaryResult generated = plan.summaryInput().isEmpty()
-                ? new SummaryGenerator.SummaryResult(SummaryDocument.empty(), CheckpointUsage.none())
-                : generateSummary(request.threadId(), previous, plan, request.budget());
+        SummaryGenerator.SummaryResult generated;
+        try {
+            generated = plan.summaryInput().isEmpty()
+                    ? new SummaryGenerator.SummaryResult(SummaryDocument.empty(), CheckpointUsage.none())
+                    : generateSummary(request.threadId(), previous, plan, request.budget());
+        } catch (ContextException failure) {
+            if (failure.code() == ContextException.Code.SUMMARY_FAILURE
+                    && !request.forceCompaction() && plan.fullPromptFits()) {
+                return fallbackPromptAfterAutomaticSummaryFailure(snapshot, plan, previous);
+            }
+            throw failure;
+        }
 
         SummaryDocument replacement = generated.document();
         request.cancellation().throwIfCancellationRequested();
@@ -166,7 +175,20 @@ public final class ContextCompactionService {
         return new CompactionResult(true,
                 new PromptContext(plan.retainedPrompt(), committed.checkpoint().summary(),
                         (int) Math.min(Integer.MAX_VALUE, compactedTokens), Optional.empty(), true),
-                Optional.of(committed.checkpoint()), plan, Optional.of(committed));
+                Optional.of(committed.checkpoint()), plan, Optional.of(committed), false);
+    }
+
+    /**
+     * 自动摘要失败时保留完整可发送 envelope；不伪造新 Checkpoint，并让恢复状态机知道本次只是跳过压缩。
+     */
+    private static CompactionResult fallbackPromptAfterAutomaticSummaryFailure(
+            CheckpointStore.Snapshot snapshot, ContextPolicy.Plan plan, SummaryDocument previous) {
+        boolean usesCheckpoint = snapshot.checkpoint().isPresent();
+        Optional<ModelContinuation> continuation = usesCheckpoint
+                ? Optional.empty() : plan.continuation();
+        return new CompactionResult(usesCheckpoint,
+                new PromptContext(plan.fullPrompt(), previous, plan.fullPromptTokens(),
+                        continuation, usesCheckpoint), snapshot.checkpoint(), plan, Optional.empty(), true);
     }
 
     /** 只暴露首次精确计量，生命周期终态仍由持久回执 owner 发布。 */
@@ -203,7 +225,7 @@ public final class ContextCompactionService {
         return new CompactionResult(true,
                 new PromptContext(plan.retainedPrompt(), checkpoint.summary(),
                         (int) Math.min(Integer.MAX_VALUE, tokens), Optional.empty(), true),
-                Optional.of(checkpoint), plan, receipt);
+                Optional.of(checkpoint), plan, receipt, false);
     }
 
     /**
@@ -286,7 +308,7 @@ public final class ContextCompactionService {
         return new CompactionResult(true,
                 new PromptContext(reprojected, checkpoint.summary(),
                         (int) Math.min(Integer.MAX_VALUE, tokens), Optional.empty(), true),
-                Optional.of(checkpoint), committed.plan(), Optional.empty());
+                Optional.of(checkpoint), committed.plan(), Optional.empty(), false);
     }
 
     /**
@@ -367,7 +389,8 @@ public final class ContextCompactionService {
             PromptContext prompt,
             Optional<CheckpointStore.ContextCheckpoint> checkpoint,
             ContextPolicy.Plan plan,
-            Optional<CheckpointStore.CommittedCheckpoint> committedReceipt) {
+            Optional<CheckpointStore.CommittedCheckpoint> committedReceipt,
+            boolean automaticSummaryFailed) {
         /**
          * 冻结全部结果数据，防止后续 Provider 调用改变 Checkpoint 证据。
          */
@@ -376,6 +399,9 @@ public final class ContextCompactionService {
             checkpoint = Objects.requireNonNull(checkpoint, "checkpoint");
             plan = Objects.requireNonNull(plan, "plan");
             committedReceipt = Objects.requireNonNull(committedReceipt, "committedReceipt");
+            if (automaticSummaryFailed && (committedReceipt.isPresent() || !plan.requiresCompaction())) {
+                throw new IllegalArgumentException("automatic summary fallback cannot contain a committed receipt");
+            }
             if (compacted != prompt.localCompaction() || (compacted != checkpoint.isPresent())) {
                 throw new IllegalArgumentException("compaction result state mismatch");
             }

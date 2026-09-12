@@ -58,6 +58,24 @@ final class ContextCompactionLifecycleTest {
         assertEquals(ContextCompactionEvent.ErrorCode.SUMMARY_FAILURE, failed.errorCode());
     }
 
+    /** 自动回退后只有新 attempt 可再发终态，外层取消不得为已结束的尝试补发第二次失败。 */
+    @Test
+    void automaticFallbackAllowsNewAttemptWithoutDuplicateTerminalFailures() {
+        List<ContextCompactionEvent> events = new ArrayList<>();
+        ContextCompactionLifecycle lifecycle = lifecycle(events);
+        lifecycle.started(ContextCompactionEvent.Trigger.AUTOMATIC, 30000);
+        lifecycle.failedForAutomaticFallback(ContextException.Code.SUMMARY_FAILURE);
+        lifecycle.cancelled(ContextCompactionEvent.Trigger.AUTOMATIC);
+        assertEquals(2, events.size());
+        lifecycle.started(ContextCompactionEvent.Trigger.OVERFLOW_RECOVERY, 30000);
+        lifecycle.failed(ContextException.Code.SUMMARY_FAILURE);
+        lifecycle.cancelled(ContextCompactionEvent.Trigger.OVERFLOW_RECOVERY);
+        assertEquals(4, events.size());
+        assertEquals(2, events.stream().filter(ContextCompactionEvent.Failed.class::isInstance).count());
+        assertThrows(IllegalStateException.class,
+                () -> lifecycle.started(ContextCompactionEvent.Trigger.AUTOMATIC, 30000));
+    }
+
     /** Failed 不能携带只属于成功 Checkpoint 的 after 计量，避免 phase 闭集被可选 before 一并放宽。 */
     @Test
     void rejectsFailureWithAfterTokenEvidence() {

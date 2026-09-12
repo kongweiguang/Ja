@@ -75,6 +75,32 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
+    /** 三次请求各耗尽三次重试后，第四次显式请求仍必须真正到达 HTTP，避免共享状态隐形封锁。 */
+    @Test
+    void explicitRequestsReachHttpAfterThreeFailedRequests() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
+            if (call <= 9) ModelAdapterTestSupport.status(exchange, 503, "0");
+            else ModelAdapterTestSupport.sse(exchange, COMPLETE, 9);
+        }); ModelAdapterFactory factory = new ModelAdapterFactory()) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            for (int index = 0; index < 3; index++) {
+                try (ModelAdapter adapter = factory.create(configuration)) {
+                    assertThrows(ExecutionException.class, () -> adapter.start(
+                            ModelAdapterTestSupport.request(configuration), event -> CompletableFuture.completedFuture(null),
+                            CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS));
+                }
+                assertEquals((index + 1) * 3, server.calls());
+            }
+            try (ModelAdapter adapter = factory.create(configuration)) {
+                assertEquals(ModelPort.FinishReason.STOP, adapter.start(ModelAdapterTestSupport.request(configuration),
+                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS).finishReason());
+            }
+            assertEquals(10, server.calls());
+        }
+    }
+
     /** 第一次 loopback 连接被拒绝后等待代理恢复，证明应用退避而非 OkHttp 隐式重放完成恢复。 */
     @Test
     void retriesAfterTransientConnectionRefusalWhenLoopbackRecovers() throws Exception {

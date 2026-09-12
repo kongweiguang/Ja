@@ -4,14 +4,13 @@
 import type { TimelineContextUsage } from "./timelineTypes";
 
 type ContextUsageTone = "neutral" | "warning" | "danger";
-type ContextUsageSource = "provider" | "compaction";
 
 /** Composer 只消费已经完成身份校验和阈值计算的展示模型，不接触事件或配置原始对象。 */
 export type ContextUsagePresentation =
   | KnownContextUsagePresentation
   | UnknownContextUsagePresentation;
 
-/** 精确 Provider/压缩计量可渲染百分比环。 */
+/** 只有真实 Provider 响应的输入计量可渲染百分比环。 */
 interface KnownContextUsagePresentation {
   certainty: "known";
   usedTokens: number;
@@ -19,7 +18,7 @@ interface KnownContextUsagePresentation {
   percentage: number;
   ringPercentage: number;
   tone: ContextUsageTone;
-  source: ContextUsageSource;
+  source: "provider";
   measuredAt: string;
 }
 
@@ -30,7 +29,7 @@ interface UnknownContextUsagePresentation {
   measuredAt: string;
 }
 
-/** 压缩投影只贡献比 Provider Usage 更新的输入计量，不能单独创造模型身份。 */
+/** 压缩投影只标记 Provider Usage 失效边界，不能单独创造新的上下文计量。 */
 interface ContextUsageCompactionFact {
   phase: "started" | "compacted" | "failed";
   inputTokensAfter: number | null;
@@ -57,7 +56,7 @@ function usageTone(percentage: number): ContextUsageTone {
 
 /**
  * 只按该请求已提交的画像计算上下文占用；非法窗口保持不可展示，绝不借当前偏好补造。
- * 压缩计量仅在更晚且完整时覆盖基准 inputTokens。
+ * 成功压缩会使压缩前的 Provider Usage 失效，必须等下一次真实 Provider 响应确认新上下文。
  */
 export function resolveContextUsage(
   input: ResolveContextUsageInput,
@@ -79,22 +78,13 @@ export function resolveContextUsage(
   if (usage.certainty === "unknown") {
     return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
   }
-  let usedTokens = usage.inputTokens;
-  let measuredAt = usage.measuredAt;
-  let source: ContextUsageSource = "provider";
-  if (
-    compaction?.phase === "compacted" &&
-    compaction.inputTokensAfter !== null &&
-    Number.isSafeInteger(compaction.inputTokensAfter) &&
-    compaction.inputTokensAfter >= 0
-  ) {
-    const compactionTimestamp = timestamp(compaction.occurredAt);
-    if (compactionTimestamp !== undefined && compactionTimestamp > providerTimestamp) {
-      usedTokens = compaction.inputTokensAfter;
-      measuredAt = compaction.occurredAt;
-      source = "compaction";
-    }
+  const compactionTimestamp =
+    compaction?.phase === "compacted" ? timestamp(compaction.occurredAt) : undefined;
+  if (compactionTimestamp !== undefined && compactionTimestamp > providerTimestamp) {
+    return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
   }
+  const usedTokens = usage.inputTokens;
+  const measuredAt = usage.measuredAt;
 
   const rawPercentage = (usedTokens / contextWindowTokens) * 100;
   if (!Number.isFinite(rawPercentage)) return undefined;
@@ -105,7 +95,7 @@ export function resolveContextUsage(
     percentage: Math.round(rawPercentage),
     ringPercentage: Math.min(100, Math.max(0, rawPercentage)),
     tone: usageTone(rawPercentage),
-    source,
+    source: "provider",
     measuredAt,
   };
 }

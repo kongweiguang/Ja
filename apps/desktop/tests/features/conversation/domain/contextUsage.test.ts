@@ -76,8 +76,8 @@ describe("context usage presentation", () => {
     });
   });
 
-  /** 压缩只在成功且晚于 Provider Usage 时覆盖输入量，旧事件或中间态不能倒退展示事实。 */
-  it("只采用更新的压缩后计量", () => {
+  /** 成功压缩会使此前 Provider Usage 失效，必须等下一次真实响应确认新的上下文。 */
+  it("压缩后在下一次 Provider Usage 前保持未知", () => {
     expect(
       resolve({
         compaction: {
@@ -86,11 +86,10 @@ describe("context usage presentation", () => {
           occurredAt: "2026-08-31T00:00:02Z",
         },
       }),
-    ).toMatchObject({
-      usedTokens: 12_000,
-      percentage: 9,
-      source: "compaction",
-      measuredAt: "2026-08-31T00:00:02Z",
+    ).toEqual({
+      certainty: "unknown",
+      source: "provider",
+      measuredAt: USAGE.measuredAt,
     });
     expect(
       resolve({
@@ -107,6 +106,36 @@ describe("context usage presentation", () => {
           phase: "started",
           inputTokensAfter: null,
           occurredAt: "2026-08-31T00:00:02Z",
+        },
+      }),
+    ).toMatchObject({ usedTokens: 42_000, source: "provider" });
+    expect(
+      resolve({
+        usage: {
+          ...USAGE,
+          inputTokens: 18_000,
+          outputTokens: 2_000,
+          totalTokens: 20_000,
+          measuredAt: "2026-08-31T00:00:03Z",
+        },
+        compaction: {
+          phase: "compacted",
+          inputTokensAfter: 12_000,
+          occurredAt: "2026-08-31T00:00:02Z",
+        },
+      }),
+    ).toMatchObject({
+      certainty: "known",
+      usedTokens: 18_000,
+      source: "provider",
+      measuredAt: "2026-08-31T00:00:03Z",
+    });
+    expect(
+      resolve({
+        compaction: {
+          phase: "failed",
+          inputTokensAfter: null,
+          occurredAt: "2026-08-31T00:00:03Z",
         },
       }),
     ).toMatchObject({ usedTokens: 42_000, source: "provider" });

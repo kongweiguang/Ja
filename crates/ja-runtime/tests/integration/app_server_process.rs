@@ -98,7 +98,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         break
     }
 }
-"#;
+    "# .replace("\"engineVersion\":\"0.1.1\"", &format!("\"engineVersion\":\"{}\"", env!("CARGO_PKG_VERSION")));
     fs::write(&script_path, script).unwrap();
     let mut config = SidecarConfig::with_directories(&powershell, &root, &root, &root, &root);
     config.args = vec![

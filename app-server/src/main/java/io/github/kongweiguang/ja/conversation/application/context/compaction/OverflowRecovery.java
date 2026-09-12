@@ -81,7 +81,9 @@ public final class OverflowRecovery {
                             "context overflow remained after the single recovery retry", failure);
                 }
                 request.cancellation().throwIfCancellationRequested();
-                ContextCompactionService.CompactionResult retry = attempt.context().compacted()
+                // 自动摘要失败可能仍引用旧 checkpoint，但新尾部尚未归入摘要，不能按本次已压缩重投影。
+                boolean automaticFallback = attempt.context().automaticSummaryFailed();
+                ContextCompactionService.CompactionResult retry = attempt.context().compacted() && !automaticFallback
                         ? compaction.reprojectCommittedForOverflow(request, attempt.context())
                         : compactAttempt(request.shrinkForOverflow(), lifecycle,
                                 ContextCompactionEvent.Trigger.OVERFLOW_RECOVERY);
@@ -112,8 +114,12 @@ public final class OverflowRecovery {
 
     /** 只有持久回执存在时结束 started；无压缩或复用同源 Checkpoint 不伪造完成事件。 */
     private static void completeLifecycle(ContextCompactionService.CompactionResult result,
-                                          ContextCompactionLifecycle lifecycle) {
+                                           ContextCompactionLifecycle lifecycle) {
         if (lifecycle == null || !lifecycle.active()) return;
+        if (result.automaticSummaryFailed()) {
+            lifecycle.failedForAutomaticFallback(ContextException.Code.SUMMARY_FAILURE);
+            return;
+        }
         CheckpointStore.CommittedCheckpoint receipt = result.committedReceipt()
                 .orElseThrow(() -> new ContextException(ContextException.Code.INVALID_STATE,
                         "started compaction did not produce a committed checkpoint"));

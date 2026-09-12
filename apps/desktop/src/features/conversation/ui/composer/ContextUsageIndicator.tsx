@@ -34,7 +34,9 @@ export function ContextUsageIndicator({ usage }: ContextUsageIndicatorProps): Re
         sideOffset={8}
         className="ja-context-usage-tooltip"
         content={
-          <div className="ja-context-usage-tooltip__content">最近一次模型请求的 Token 用量未知</div>
+          <div className="ja-context-usage-tooltip__content">
+            当前上下文用量尚未确认，等待下一次模型响应
+          </div>
         }
       >
         <span
@@ -52,7 +54,7 @@ export function ContextUsageIndicator({ usage }: ContextUsageIndicatorProps): Re
   const used = formatTokenCount(usage.usedTokens);
   const limit = formatTokenCount(usage.limitTokens);
   const valueNow = Math.min(100, Math.max(0, usage.percentage));
-  const sourceLabel = usage.source === "compaction" ? "压缩后计量" : "最近模型请求";
+  const sourceLabel = "最近模型请求";
   const valueText = `已使用 ${usage.percentage}%，${used} / ${limit} tokens，${sourceLabel}`;
 
   return (

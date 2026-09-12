@@ -11,7 +11,6 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAi
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiResponsesAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ModelTransport;
-import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderCircuitBreaker;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderJsonValues;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ProviderRequestEnvelope;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.RequestController;
@@ -109,7 +108,7 @@ public final class HttpSummaryModel implements SummaryModel {
         }
         Invocation invocation = current.invocation();
         return executeBounded(invocation.configuration().requestTimeout(),
-                controller -> executeGoverned(current, controller));
+                controller -> executeWithRetry(current, controller));
     }
 
     /**
@@ -174,24 +173,6 @@ public final class HttpSummaryModel implements SummaryModel {
         }
         throw new ProviderProtocolException(
                 "NETWORK_ERROR", "summary provider request failed before a response", true, last);
-    }
-
-    /** 将一次摘要及其内部重试作为一个独立熔断样本，取消不计入 Provider 连续失败。 */
-    private SummaryGenerator.SummaryResult executeGoverned(
-            PreparedInvocation invocation, RequestController controller) {
-        ProviderCircuitBreaker.Permit permit = transport.acquireCircuit(
-                invocation.invocation().configuration(), ProviderCircuitBreaker.Operation.SUMMARY);
-        try {
-            SummaryGenerator.SummaryResult result = executeWithRetry(invocation, controller);
-            permit.success();
-            return result;
-        } catch (CancellationException cancelled) {
-            permit.cancelled();
-            throw cancelled;
-        } catch (RuntimeException failure) {
-            permit.failure();
-            throw failure;
-        }
     }
 
     /**

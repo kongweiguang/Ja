@@ -1112,8 +1112,7 @@ final class OpenAiResponsesAdapterTest {
         }
     }
 
-    /** 查找一份函数参数文档，使断言比较完整 JSON 树。 */
-    /** 本地预算阶段不访问 Provider，且保守上界覆盖随后发送的完整冻结正文。 */
+    /** 本地预算不访问 Provider；指纹覆盖实际冻结正文，文本 Token 近似不再等同于传输字节数。 */
     @Test
     void localEstimateDoesNotCallProviderAndCoversFrozenEnvelope() throws Exception {
         AtomicReference<String> sendBody = new AtomicReference<>();
@@ -1131,8 +1130,10 @@ final class OpenAiResponsesAdapterTest {
                 assertEquals(0, server.calls());
                 adapter.start(request, ignored -> java.util.concurrent.CompletableFuture.completedFuture(null),
                         CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
-                assertEquals(sendBody.get().getBytes(StandardCharsets.UTF_8).length,
-                        estimate.conservativeUpperBound());
+                assertEquals(java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(sendBody.get().getBytes(StandardCharsets.UTF_8))), estimate.fingerprint());
+                assertTrue(estimate.conservativeUpperBound() > 0);
+                assertTrue(estimate.conservativeUpperBound() < sendBody.get().getBytes(StandardCharsets.UTF_8).length);
             }
             assertEquals(1, server.calls());
         }
@@ -1170,8 +1171,10 @@ final class OpenAiResponsesAdapterTest {
                 assertFalse(sent.has("previous_response_id"));
                 assertEquals("function_call", sent.path("input").path(1).path("type").textValue());
                 assertEquals("function_call_output", sent.path("input").path(2).path("type").textValue());
-                assertEquals(sentBody.get().getBytes(StandardCharsets.UTF_8).length,
-                        estimate.conservativeUpperBound());
+                assertEquals(java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(sentBody.get().getBytes(StandardCharsets.UTF_8))), estimate.fingerprint());
+                assertTrue(estimate.conservativeUpperBound() > 0);
+                assertTrue(estimate.conservativeUpperBound() < sentBody.get().getBytes(StandardCharsets.UTF_8).length);
             }
             assertEquals(1, server.calls());
         }

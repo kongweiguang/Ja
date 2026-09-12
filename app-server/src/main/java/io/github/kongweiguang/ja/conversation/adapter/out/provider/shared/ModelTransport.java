@@ -11,7 +11,6 @@ import okhttp3.OkHttpClient;
 import okhttp3.Response;
 
 import java.io.IOException;
-import java.time.Clock;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Set;
@@ -40,7 +39,6 @@ public final class ModelTransport implements AutoCloseable {
     private final OkHttpClient client;
     private final ExecutorService requests;
     private final ScheduledExecutorService deadlines;
-    private final ProviderCircuitBreaker circuits;
     private final Set<RequestController> activeControllers =
             ConcurrentHashMap.newKeySet();
     private final Object lifecycle = new Object();
@@ -54,11 +52,6 @@ public final class ModelTransport implements AutoCloseable {
      * 唯一重试决策点。
      */
     public ModelTransport() {
-        this(Clock.systemUTC());
-    }
-
-    /** 使用组合根时钟创建共享熔断器，Executor 与连接池仍保持唯一所有权。 */
-    public ModelTransport(Clock clock) {
         requests = Executors.newVirtualThreadPerTaskExecutor();
         deadlines = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "ja-model-deadline");
@@ -77,7 +70,6 @@ public final class ModelTransport implements AutoCloseable {
                 .followSslRedirects(false)
                 .addNetworkInterceptor(ModelTransport::preserveAdapterRetryOwnership)
                 .build();
-        circuits = new ProviderCircuitBreaker(Objects.requireNonNull(clock, "clock"));
     }
 
     /**
@@ -126,13 +118,6 @@ public final class ModelTransport implements AutoCloseable {
     public ScheduledExecutorService deadlineExecutor() {
         ensureOpen();
         return deadlines;
-    }
-
-    /** 在共享传输上取得 Provider 操作许可，使 count、send 与 summary 使用同一治理状态。 */
-    public ProviderCircuitBreaker.Permit acquireCircuit(
-            ModelPort.ModelConfiguration configuration, ProviderCircuitBreaker.Operation operation) {
-        ensureOpen();
-        return circuits.acquire(configuration, operation);
     }
 
     /**

@@ -159,7 +159,7 @@ fn valid_initialize_result() -> Value {
         "serverInstanceId": "srv_fixture",
         "runtime": {
             "engine": "ja-kernel",
-            "engineVersion": "0.1.1"
+            "engineVersion": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
             "methods": [],
@@ -288,7 +288,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         break
     }
 }
-"#;
+"#
+        .replace("0.1.1", env!("CARGO_PKG_VERSION"));
         let script_path = run_dir.join("fixture.ps1");
         fs::write(&script_path, script).unwrap();
         let mut config = sidecar_config(&powershell, &run_dir);
@@ -368,7 +369,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         break
     }
 }
-"#;
+"#
+    .replace("0.1.1", env!("CARGO_PKG_VERSION"));
     fs::write(&script_path, script).expect("retry fixture script");
     let mut config = sidecar_config(&powershell, &fixture_dir.path);
     config.args = vec![
@@ -492,7 +494,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         if ($businessRequests -ge 3) { break }
     }
 }
-"#;
+"#
+    .replace("0.1.1", env!("CARGO_PKG_VERSION"));
     let script_path = run_dir.join("fixture.ps1");
     fs::write(&script_path, script).unwrap();
     let mut config = sidecar_config(&powershell, &run_dir);
@@ -621,7 +624,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         continue
     }
 }
-"#;
+"#
+    .replace("0.1.1", env!("CARGO_PKG_VERSION"));
     let script_path = run_dir.join("fixture.ps1");
     fs::write(&script_path, script).unwrap();
     let mut config = sidecar_config(&powershell, &run_dir);
@@ -719,7 +723,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         break
     }
 }
-"#;
+"#
+    .replace("0.1.1", env!("CARGO_PKG_VERSION"));
     let script_path = run_dir.join("fixture.ps1");
     fs::write(&script_path, script).unwrap();
     let mut config = sidecar_config(&powershell, &run_dir);

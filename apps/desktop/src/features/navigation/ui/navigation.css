@@ -312,6 +312,9 @@
 .ja-navigation-thread-row {
   position: relative;
   display: grid;
+  /* 默认 auto 轨道会采用长标题的 min-content 宽度，把绝对定位状态推到侧栏裁剪区之外。 */
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   min-height: 2.16rem;
   align-items: center;
   border-radius: var(--ja-radius-selection);
@@ -333,6 +336,8 @@
 .ja-navigation-thread {
   display: flex;
   width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   min-height: 2.16rem;
   align-items: center;
   padding: 0 5.5rem 0 0.58rem;
@@ -358,6 +363,7 @@
   height: 28px;
   align-items: center;
   justify-content: flex-end;
+  line-height: 0;
   transform: translateY(-50%);
   transition: opacity 120ms ease;
 }
@@ -452,11 +458,18 @@
 
 .ja-navigation-thread-state,
 .ja-navigation-thread-pin {
-  display: grid;
+  display: inline-grid;
   width: 16px;
   height: 16px;
+  flex: 0 0 16px;
   place-items: center;
+  line-height: 0;
   color: var(--text-tertiary);
+}
+
+.ja-navigation-thread-state svg,
+.ja-navigation-thread-pin svg {
+  display: block;
 }
 
 .ja-navigation-thread-state.is-queued,

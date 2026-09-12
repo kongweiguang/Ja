@@ -4,6 +4,10 @@
 package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import io.github.kongweiguang.ja.conversation.domain.AttachmentSummary;
+import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
+import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointUsage;
+import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryDocument;
+import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
@@ -44,6 +48,55 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 真实 SQLite 重启覆盖阶段、Tool artifact、TurnChangeSet 与身份隔离。 */
 final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
+
+    /** 重建历史服务后以持久 checkpoint 失效旧占用，同时账本计量不变；后续真实 usage 恢复 KNOWN。 */
+    @Test
+    void checkpointInvalidatesUsageAcrossRestartWithoutRewritingLedger() throws Exception {
+        for (int offset : List.of(0, 1)) {
+            try (TestDatabase database = database("agent-checkpoint-usage-" + offset)) {
+                MybatisConversationRepository store = initialized(database);
+                ConversationRepository.AdmissionReceipt admission = store.admit(new ConversationRepository.TurnAdmission(
+                        "thr_agent", "turn_agent", "item_user",
+                        new ModelMessage(ModelRole.USER, List.of(new TextContent("run"))),
+                        List.of(), 0, START, execution("cfg_agent")));
+                ConversationRepository.CommitReceipt committed = store.commit(new ConversationRepository.CommitRequest(
+                        "thr_agent", "turn_agent", TurnState.RUNNING,
+                        List.of(usageFact(1, 1, null), usageFact(1, 1, new ModelUsage(42000, 8, 42008))),
+                        admission.turnMutationVersion(), START.plusSeconds(1), execution("cfg_agent")));
+                assertEquals(ProviderRequestUsage.Certainty.KNOWN, database.history(store)
+                        .readThread("thr_agent", null, 100).orElseThrow().contextUsage().request().certainty());
+                long revision = database.checkpoints().read("thr_agent").threadRevision();
+                CheckpointStore.ContextCheckpoint checkpoint = new CheckpointStore.ContextCheckpoint(
+                        "checkpoint_usage", "thr_agent", 1, 2, revision, java.util.Optional.empty(),
+                        SummaryDocument.empty(), 100, "0".repeat(64), ContextCompactionEvent.STRATEGY_VERSION,
+                        CheckpointUsage.none(), START.plusSeconds(1 + offset));
+                database.checkpoints().commit(new CheckpointStore.CommitRequest("thr_agent", revision, checkpoint));
+                store.close();
+                MybatisConversationRepository restored = database.agentStore();
+                ThreadSnapshot.ContextUsage unknown = database.history(restored)
+                        .readThread("thr_agent", null, 100).orElseThrow().contextUsage();
+                assertEquals(ProviderRequestUsage.Certainty.UNKNOWN, unknown.request().certainty());
+                assertNull(unknown.request().usage());
+                assertEquals("request_1", unknown.request().requestId());
+                try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession();
+                     Statement sql = session.getConnection().createStatement();
+                     java.sql.ResultSet rows = sql.executeQuery("SELECT certainty,input_tokens FROM usage WHERE request_id='request_1'")) {
+                    assertTrue(rows.next());
+                    assertEquals("KNOWN", rows.getString(1));
+                    assertEquals(42000, rows.getLong(2));
+                }
+                restored.commit(new ConversationRepository.CommitRequest(
+                        "thr_agent", "turn_agent", TurnState.RUNNING,
+                        List.of(usageFact(2, 2, null), usageFact(2, 2, new ModelUsage(100, 8, 108))),
+                        committed.turnMutationVersion(), START.plusSeconds(3), execution("cfg_agent")));
+                ThreadSnapshot.ContextUsage fresh = database.history(restored)
+                        .readThread("thr_agent", null, 100).orElseThrow().contextUsage();
+                assertEquals(ProviderRequestUsage.Certainty.KNOWN, fresh.request().certainty());
+                assertEquals(100, fresh.request().usage().inputTokens());
+                restored.close();
+            }
+        }
+    }
 
     /**
      * started 事务必须同时推进内部 Tool 状态与公开 presentation；重建 Repository 后的

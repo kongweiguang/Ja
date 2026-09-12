@@ -135,7 +135,7 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
                                                          CancellationToken cancellationToken) {
         Objects.requireNonNull(eventSink, "eventSink");
         return submit(request, cancellationToken,
-                controller -> executeGoverned(request, eventSink, controller));
+                controller -> executeWithRetry(request, eventSink, controller));
     }
 
     /**
@@ -215,25 +215,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             }
         }
         throw new ProviderProtocolException("NETWORK_ERROR", "provider request failed before a response", true, last);
-    }
-
-    /** 将一次完整发送（含内部重试）计为一个熔断样本，避免单请求三次重试立即开路。 */
-    private ModelPort.ModelOutcome executeGoverned(ModelPort.ModelRequest request,
-                                                   ModelEventSink eventSink,
-                                                   RequestController controller) {
-        ProviderCircuitBreaker.Permit permit = transport.acquireCircuit(
-                configuration, ProviderCircuitBreaker.Operation.SEND);
-        try {
-            ModelPort.ModelOutcome result = executeWithRetry(request, eventSink, controller);
-            permit.success();
-            return result;
-        } catch (CancellationException cancelled) {
-            permit.cancelled();
-            throw cancelled;
-        } catch (RuntimeException failure) {
-            permit.failure();
-            throw failure;
-        }
     }
 
     /**

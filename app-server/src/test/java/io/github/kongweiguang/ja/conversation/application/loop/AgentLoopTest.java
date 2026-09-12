@@ -1754,7 +1754,7 @@ final class AgentLoopTest {
                 base.model(), base.accessMode(), base.limits(), base.requestedAt(), base.workspaceId(),
                 base.initialThreadRevision(), base.initialTurnMutationVersion(),
                 base.initialSummary(), new FixedAgentPromptSession(
-                        ContextBudget.capabilities(300_000, 10_000, true)),
+                        ContextBudget.capabilities(275_000, 10_000, true)),
                 base.queuedInputBoundary(), base.attachments(), base.tools(),
                 base.configRevision(), base.toolSessions(), base.outputLimits(), base.presentationSecrets());
     }

@@ -262,7 +262,8 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     .map(this::snapshotTurn).toList();
             List<ThreadSnapshot.Item> items = rows.stream().map(this::snapshotItem).toList();
             PersistenceRecords.ContextUsageRow usageRow = mapper.history().selectLatestContextUsage(threadId);
-            ThreadSnapshot.ContextUsage contextUsage = usageRow == null ? null : contextUsage(usageRow);
+            ThreadSnapshot.ContextUsage contextUsage = usageRow == null ? null
+                    : contextUsage(usageRow, mapper.checkpoint().selectCheckpoint(threadId));
             PersistenceRecords.TurnRow queueTurn = turnRows.stream()
                     .filter(turn -> !io.github.kongweiguang.ja.conversation.domain.turn.TurnState
                             .valueOf(requiredText(turn.state(), "state")).terminal())
@@ -691,12 +692,19 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * 将不可变 Usage 行恢复为领域事实；任何越界或损坏值都关闭整个快照，避免显示伪造百分比。
+     * 从同一数据库快照恢复计量；新 checkpoint 使旧输入占用失效，但只投影 UNKNOWN，绝不改写计费账本。
      */
-    private ThreadSnapshot.ContextUsage contextUsage(PersistenceRecords.ContextUsageRow row) {
+    private ThreadSnapshot.ContextUsage contextUsage(PersistenceRecords.ContextUsageRow row,
+                                                     PersistenceRecords.CheckpointRow checkpoint) {
         try {
             ProviderRequestUsage.Certainty certainty = ProviderRequestUsage.Certainty.valueOf(
                     requiredText(row.certainty(), "certainty"));
+            Instant measuredAt = Instant.parse(requiredText(row.occurredAt(), "occurred_at"));
+            // 相同时间精度无法证明 usage 晚于 checkpoint，保守失效，等待下一次可靠计量恢复占用。
+            if (checkpoint != null && !Instant.parse(requiredText(checkpoint.createdAt(), "created_at"))
+                    .isBefore(measuredAt)) {
+                certainty = ProviderRequestUsage.Certainty.UNKNOWN;
+            }
             ProviderRequestProfile profile = codec.readProviderRequestProfile(
                     requiredText(row.profileJson(), "profile_json"));
             io.github.kongweiguang.ja.conversation.domain.model.ModelUsage usage =
@@ -708,7 +716,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     Math.toIntExact(row.modelRound()), ProviderRequestUsage.Purpose.valueOf(
                             requiredText(row.purpose(), "purpose")), certainty, profile, usage);
             return new ThreadSnapshot.ContextUsage(requiredText(row.turnId(), "turn_id"), request,
-                    Instant.parse(requiredText(row.occurredAt(), "occurred_at")));
+                    measuredAt);
         } catch (ArithmeticException | IllegalArgumentException failure) {
             throw new StorageException(StorageException.Code.INVALID_STATE, "invalid context usage");
         }

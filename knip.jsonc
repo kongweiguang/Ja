@@ -23,6 +23,7 @@
     // Runtime refresh smoke 通过动态生成的 MCP TOML args 启动该文件；删除条件是改为静态模块引用或移除该验收。
     "scripts/e2e/fixtures/runtime-refresh-mcp.mjs",
     "scripts/e2e/webview2-edgedriver-runner.mjs",
+    "scripts/e2e/conversation-recovery-webview2.mjs",
     "scripts/e2e/windows-desktop-smoke.mjs",
     // Settings/Workbench 真窗验收由维护者直接按 CLI 启动；fixture 由 MCP STDIO 参数再启动。
     "scripts/e2e/mcp-settings-webview2.mjs",

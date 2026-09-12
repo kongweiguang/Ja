@@ -10,6 +10,7 @@ public record ContextBudget(
         long contextWindowTokens,
         long maxOutputTokens,
         boolean autoCompact) {
+    private static final long DEFAULT_COMPACTION_RESERVE_TOKENS = 16_384L;
 
     /**
      * 在构造期拒绝不可能的 Provider 能力，避免负数或输出预算吞噬整个上下文窗口。
@@ -34,12 +35,19 @@ public record ContextBudget(
     }
 
     /**
-     * 在发送硬上限前保留 10% 提前量，并将其限制在 4K 到 30K 之间。
+     * 返回自动压缩专用的显式 reserve；最大 16K，且小窗口最多预留 40%，保证压缩目标仍可达。
+     */
+    public long compactionReserveTokens() {
+        long ceiling = sendCeilingTokens();
+        return Math.min(DEFAULT_COMPACTION_RESERVE_TOKENS, ceiling * 2L / 5L);
+    }
+
+    /**
+     * 输出预算和压缩 reserve 共享窗口尾部，取较严格上限而不双扣；小窗口仍有可发送输入空间。
      */
     public long automaticCompactionThreshold() {
         long ceiling = sendCeilingTokens();
-        long headroom = Math.min(30_000L, Math.max(4_096L, contextWindowTokens / 10L));
-        return Math.max(0L, ceiling - headroom);
+        return Math.min(ceiling, contextWindowTokens - compactionReserveTokens());
     }
 
     /** 压缩后优先降到可发送窗口 60%，为后续多轮 Tool 交互保留增长空间。 */

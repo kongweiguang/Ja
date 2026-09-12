@@ -110,7 +110,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
 
     /**
      * 先取得唯一配置租约，再完成全部派生；任一校验或适配失败都会在返回前释放 secret，
-     * 只有完整 RuntimeLease 才把释放权转移给 TurnService。
+     * 只有完整 RuntimeLease 才把释放权转移给 TurnService。权限来自已持久化 Thread 的显式偏好，
+     * default_access_mode 只用于创建时默认值；子任务能力上限仍由独立 inherited ceiling 校验。
      */
     @Override
     @SuppressWarnings("PMD.CloseResource")
@@ -133,7 +134,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             SkillResolution skillResolution = restrictSkills(availableSkills, inheritedCeiling);
             ContextBudget contextBudget = contextBudget(
                     selectedModel.capabilities(), provider.agentDefaults().context());
-            AccessMode resolvedAccessMode = accessMode(request.accessMode(), lease.snapshot().accessMode());
+            AccessMode resolvedAccessMode = request.accessMode();
             ThreadPreferences requestPreferences = new ThreadPreferences(provider.providerId(), selectedModel.modelId(),
                     request.reasoningLevel(), resolvedAccessMode, request.collaborationMode(),
                     ThreadPreferences.TitleSource.MANUAL);
@@ -757,14 +758,6 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
      */
     private static Duration minimum(Duration requested, Duration configured) {
         return requested.compareTo(configured) <= 0 ? requested : configured;
-    }
-
-    /** 请求只能继承或收紧根级权限，历史 Thread 不能在配置收紧后继续扩大执行范围。 */
-    private static AccessMode accessMode(
-            AccessMode requested, ConfigurationGenerationSnapshot.AccessMode configured) {
-        return requested == AccessMode.APPROVAL_REQUIRED
-                || configured == ConfigurationGenerationSnapshot.AccessMode.APPROVAL_REQUIRED
-                ? AccessMode.APPROVAL_REQUIRED : AccessMode.FULL_ACCESS;
     }
 
     /** reasoning 必须属于所选模型显式能力集合；null 继续使用模型默认。 */

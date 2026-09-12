@@ -37,7 +37,7 @@ public final class ModelAdapterFactory implements ModelPort, SummaryModel.Factor
      */
     public ModelAdapterFactory(Clock clock) {
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.transport = new ModelTransport(clock);
+        this.transport = new ModelTransport();
     }
 
     /**

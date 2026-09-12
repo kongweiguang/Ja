@@ -55,7 +55,7 @@ public final class ProviderRequestEnvelope {
     /**
      * 返回协议感知的本地输入 Token 保守估计。
      *
-     * <p>文本仍以冻结 JSON 的 UTF-8 字节数作为上界，协议原生图片则按公开的尺寸计量规则估算，
+     * <p>文本采用冻结 JSON 的 UTF-8 感知近似，协议原生图片则按公开的尺寸计量规则估算，
      * 避免把 Base64 传输膨胀误算为文本 Token。兼容端点可能采用不同 tokenizer，因此该值只用于
      * 请求前本地准入；响应后的 Provider usage 与真实 {@code CONTEXT_LIMIT} 仍是权威事实。</p>
      */

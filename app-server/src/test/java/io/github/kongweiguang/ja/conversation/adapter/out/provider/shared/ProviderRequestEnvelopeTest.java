@@ -63,7 +63,8 @@ class ProviderRequestEnvelopeTest {
                 request, ModelPort.Api.OPENAI_RESPONSES);
 
         long patchTokens = (60L * 34L * 120L + 99L) / 100L;
-        assertEquals(AbstractStreamingModelAdapter.serializeRequest(measured).length + patchTokens,
+        assertEquals(ProviderInputTokenEstimator.estimateTextTokens(
+                        AbstractStreamingModelAdapter.serializeRequest(measured)) + patchTokens,
                 envelope.inputTokenEstimate());
     }
 
@@ -79,7 +80,8 @@ class ProviderRequestEnvelopeTest {
         ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(
                 request, ModelPort.Api.OPENAI_RESPONSES);
 
-        assertEquals(AbstractStreamingModelAdapter.serializeRequest(measured).length + 3_000L,
+        assertEquals(ProviderInputTokenEstimator.estimateTextTokens(
+                        AbstractStreamingModelAdapter.serializeRequest(measured)) + 3_000L,
                 envelope.inputTokenEstimate());
     }
 
@@ -95,26 +97,43 @@ class ProviderRequestEnvelopeTest {
                 request, ModelPort.Api.ANTHROPIC_MESSAGES);
 
         long expectedPixels = (1_920L * 1_080L + 749L) / 750L;
-        assertEquals(AbstractStreamingModelAdapter.serializeRequest(measured).length + expectedPixels,
+        assertEquals(ProviderInputTokenEstimator.estimateTextTokens(
+                        AbstractStreamingModelAdapter.serializeRequest(measured)) + expectedPixels,
                 envelope.inputTokenEstimate());
         assertTrue(envelope.sendBody().length > 400_000);
     }
 
-    /** Chat 当前无原生附件能力，普通文本请求继续以完整发送 JSON 字节作为保守上界。 */
+    /** Chat 当前无原生附件能力，普通文本请求使用 UTF-8 感知估算而不是把每个字节当 Token。 */
     @Test
-    void keepsChatTextEstimateEqualToFrozenBodyBytes() {
+    void keepsChatTextEstimateBelowFrozenBodyBytes() {
         ObjectNode request = AbstractStreamingModelAdapter.JSON.createObjectNode();
         request.put("model", "test-model");
-        request.putArray("messages").addObject().put("role", "user").put("content", "hello");
+        request.putArray("messages").addObject().put("role", "user").put("content",
+                "hello, this is a deliberately longer English prompt so the ratio is observable");
         request.put("stream", true);
 
         ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(
                 request, ModelPort.Api.OPENAI_CHAT_COMPLETIONS);
 
-        assertEquals(envelope.sendBody().length, envelope.inputTokenEstimate());
+        assertTrue(envelope.inputTokenEstimate() > 0);
+        assertTrue(envelope.inputTokenEstimate() < envelope.sendBody().length);
     }
 
-    /** 用户正文和 Tool 参数中的 data URL 不属于原生图片块，必须继续按文本完整计量。 */
+    /** 中文正文按码点而非三倍 UTF-8 字节计量，防止短对话被错误放大到压缩门槛。 */
+    @Test
+    void countsNonAsciiTextByCodePoint() {
+        ObjectNode request = AbstractStreamingModelAdapter.JSON.createObjectNode();
+        request.put("model", "test-model");
+        request.putArray("messages").addObject().put("role", "user")
+                .put("content", "上下文检查 ".repeat(1_000));
+
+        ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(
+                request, ModelPort.Api.OPENAI_CHAT_COMPLETIONS);
+
+        assertTrue(envelope.inputTokenEstimate() < envelope.sendBody().length / 2);
+    }
+
+    /** 用户正文和 Tool 参数中的 data URL 不属于原生图片块，必须继续按文本估算。 */
     @Test
     void doesNotStripDataUrlsOutsideResponsesImageBlocks() {
         String dataUrl = "data:image/png;base64," + Base64.getEncoder().encodeToString(png(12, 10, 64));
@@ -128,7 +147,14 @@ class ProviderRequestEnvelopeTest {
         ProviderRequestEnvelope envelope = ProviderRequestEnvelope.freeze(
                 request, ModelPort.Api.OPENAI_RESPONSES);
 
-        assertEquals(envelope.sendBody().length, envelope.inputTokenEstimate());
+        ObjectNode withoutData = request.deepCopy();
+        ((ObjectNode) withoutData.path("input").path(0).path("content").path(0))
+                .put("text", "short");
+        ((ObjectNode) withoutData.path("input").path(1))
+                .put("arguments", "{\"image_url\":\"short\"}");
+        ProviderRequestEnvelope shortEnvelope = ProviderRequestEnvelope.freeze(
+                withoutData, ModelPort.Api.OPENAI_RESPONSES);
+        assertTrue(envelope.inputTokenEstimate() > shortEnvelope.inputTokenEstimate());
     }
 
     /** 畸形 Base64 或超出公开输入尺寸边界的 PNG 必须稳定失败，不能以零图片 Token 放行。 */

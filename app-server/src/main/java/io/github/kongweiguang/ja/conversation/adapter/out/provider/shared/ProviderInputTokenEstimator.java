@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 /**
@@ -39,8 +40,30 @@ final class ProviderInputTokenEstimator {
             case ANTHROPIC_MESSAGES -> stripAnthropicImages(request);
             case OPENAI_CHAT_COMPLETIONS -> 0L;
         };
-        long textTokens = AbstractStreamingModelAdapter.serializeRequest(request).length;
+        long textTokens = estimateTextTokens(AbstractStreamingModelAdapter.serializeRequest(request));
         return saturatedAdd(textTokens, imageTokens);
+    }
+
+    /**
+     * 使用 UTF-8 感知的保守近似替代“每字节一个 Token”，避免中文和工具 Schema 让自动压缩提前数倍触发。
+     * ASCII 按每三字符一个 Token，非 ASCII code point 按一或两个 Token 计，再保留 25% 安全余量；
+     * 该值只用于请求前准入，Provider 返回的实际 Usage 仍是唯一权威计量。
+     */
+    static long estimateTextTokens(byte[] serialized) {
+        String text = new String(serialized, StandardCharsets.UTF_8);
+        long asciiCharacters = 0L;
+        long nonAsciiTokens = 0L;
+        for (int offset = 0; offset < text.length();) {
+            int codePoint = text.codePointAt(offset);
+            if (codePoint <= 0x7f) {
+                asciiCharacters++;
+            } else {
+                nonAsciiTokens = saturatedAdd(nonAsciiTokens, codePoint > 0xffff ? 2L : 1L);
+            }
+            offset += Character.charCount(codePoint);
+        }
+        long baseTokens = saturatedAdd(divideCeiling(asciiCharacters, 3L), nonAsciiTokens);
+        return Math.max(1L, divideCeiling(saturatedMultiply(baseTokens, 5L), 4L));
     }
 
     /**

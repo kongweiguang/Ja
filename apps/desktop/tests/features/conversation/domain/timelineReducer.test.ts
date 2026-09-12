@@ -1212,7 +1212,7 @@ describe("timeline reducer", () => {
     );
 
     expect(conflict.lastOutcome).toBe("resync_required");
-    expect(conflict.contextUsageByThread[threadId]).toEqual(unknown);
+    expect(conflict.contextUsageByThread[threadId]).toEqual({ ...unknown, turnId });
   });
 
   it("treats deltas as transient and drops the draft when streamSeq has a gap", () => {
@@ -1727,6 +1727,129 @@ describe("timeline reducer", () => {
     expect(state.threadRevisionByThread[threadId]).toBe(5);
   });
 
+  /** 压缩后旧 Usage 进入 UNKNOWN；后续生命周期和旧 Snapshot 不得重新启用它，直到新响应到达。 */
+  it("在多次压缩生命周期中保持 Usage 未知并允许新响应恢复", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 2, {
+        messageId: "item_usage_before_compaction",
+        text: "",
+        modelRound: 1,
+        usage: requestUsage(1, 40_000, 1_000, 41_000),
+        toolCalls: [],
+      }),
+    );
+    expect(state.contextUsageByThread[threadId]?.certainty).toBe("known");
+
+    state = apply(
+      state,
+      event("context/compacted", 3, {
+        eventId: "evt_compaction_usage_boundary",
+        turnId: null,
+        compactionId: "cmp_usage_boundary",
+        trigger: "automatic",
+        sourceRevision: 2,
+        inputTokensBefore: 40_000,
+        inputTokensAfter: 12_000,
+        strategyVersion: "ja-context-v1",
+        occurredAt: "2026-08-18T00:00:03Z",
+      }),
+    );
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "unknown",
+      requestOrdinal: 1,
+      inputTokens: null,
+    });
+
+    state = apply(
+      state,
+      event("context/compaction-started", 4, {
+        eventId: "evt_compaction_usage_retry_started",
+        threadRevision: 3,
+        turnId: null,
+        compactionId: "cmp_usage_retry",
+        trigger: "automatic",
+        sourceRevision: 3,
+        inputTokensBefore: 41_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+        occurredAt: "2026-08-18T00:00:04Z",
+      }),
+    );
+    state = apply(
+      state,
+      event("context/compaction-failed", 5, {
+        eventId: "evt_compaction_usage_retry_failed",
+        threadRevision: 3,
+        turnId: null,
+        compactionId: "cmp_usage_retry",
+        trigger: "automatic",
+        sourceRevision: 3,
+        inputTokensBefore: 41_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+        errorCode: "SUMMARY_FAILURE",
+        occurredAt: "2026-08-18T00:00:05Z",
+      }),
+    );
+    expect(state.contextUsageByThread[threadId]?.certainty).toBe("unknown");
+
+    const recovered = apply(
+      state,
+      event("assistant/model-step-committed", 6, {
+        messageId: "item_usage_after_compaction",
+        text: "",
+        modelRound: 2,
+        usage: requestUsage(2, 12_000, 1_000, 13_000, {
+          measuredAt: "2026-08-18T00:00:06Z",
+        }),
+        toolCalls: [],
+      }),
+    );
+    expect(recovered.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "known",
+      requestOrdinal: 2,
+      inputTokens: 12_000,
+    });
+
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 5,
+        turns: [
+          {
+            turnId,
+            status: "running",
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:05Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: {
+          ...requestUsage(1, 40_000, 1_000, 41_000),
+          turnId,
+        },
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.contextCompactionByThread[threadId]).toBeUndefined();
+    expect(restored.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "unknown",
+      requestOrdinal: 1,
+      inputTokens: null,
+    });
+  });
+
   it("逐 ordinal 结算连续 Tool，首个结果不会刷新或串改仍在等待的第二行", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
@@ -1921,7 +2044,7 @@ describe("timeline reducer", () => {
     });
   });
 
-  /** 权威快照同时恢复最近 Usage，并清除该 Thread 的瞬态 Draft 与压缩投影。 */
+  /** 权威快照同时恢复最近 Usage，清除瞬态 Draft，但保留尚未被新 Provider Usage 覆盖的压缩边界。 */
   it("restores a flat authoritative snapshot and removes in-flight drafts", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
@@ -1981,6 +2104,166 @@ describe("timeline reducer", () => {
       requestId: "request_2",
       inputTokens: 52_000,
       totalTokens: 56_000,
+    });
+  });
+
+  /** Snapshot 本身没有压缩字段，重读不能让压缩前的计量重新变成可信上下文长度。 */
+  it("保留 Snapshot 前已提交的压缩边界", () => {
+    let state = applySnapshot(
+      readyState(),
+      {
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    state = apply(
+      state,
+      event("context/compacted", 1, {
+        turnId: null,
+        compactionId: "cmp_snapshot_boundary",
+        checkpointId: "checkpoint_snapshot_boundary",
+        trigger: "automatic",
+        sourceRevision: 0,
+        inputTokensBefore: 48_000,
+        inputTokensAfter: 12_000,
+        strategyVersion: "ja-context-v1",
+        occurredAt: "2026-08-18T00:00:02Z",
+      }),
+    );
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 1,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: {
+          ...requestUsage(1, 48_000, 1_000, 49_000),
+          turnId: turnId,
+          measuredAt: "2026-08-18T00:00:01Z",
+        },
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.lastOutcome).toBe("applied");
+    expect(restored.contextCompactionByThread[threadId]).toMatchObject({
+      phase: "compacted",
+      inputTokensAfter: 12_000,
+    });
+    expect(restored.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "unknown",
+      inputTokens: null,
+      measuredAt: "2026-08-18T00:00:01Z",
+    });
+  });
+
+  /** 实时请求序号会随 Turn 重置；旧 Turn 的晚到结算只能更新自身内容，不能倒退线程计量。 */
+  it.each([1, 10])("按 Turn 身份接纳重置序号并忽略旧计量，旧序号=%s", (oldOrdinal) => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 2, {
+        messageId: "item_old_usage",
+        text: "",
+        modelRound: 1,
+        usage: requestUsage(oldOrdinal, 40_000, 1_000, 41_000, { modelRound: 1 }),
+        toolCalls: [],
+      }),
+    );
+    state = apply(
+      state,
+      event("turn/state-changed", 3, {
+        turnId: "turn_new",
+        from: "queued",
+        to: "running",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 4, {
+        turnId: "turn_new",
+        messageId: "item_new_usage",
+        text: "",
+        modelRound: 1,
+        usage: requestUsage(1, 12_000, 1_000, 13_000, {
+          requestId: "request_new",
+          measuredAt: "2026-08-18T00:00:04Z",
+        }),
+        toolCalls: [],
+      }),
+    );
+    expect(state.lastOutcome).toBe("applied");
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      turnId: "turn_new",
+      requestId: "request_new",
+      inputTokens: 12_000,
+    });
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 5, {
+        messageId: "item_old_late_usage",
+        text: "",
+        modelRound: 2,
+        usage: requestUsage(oldOrdinal + 1, 42_000, 1_000, 43_000, { modelRound: 2 }),
+        toolCalls: [],
+      }),
+    );
+    expect(state.lastOutcome).toBe("applied");
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      turnId: "turn_new",
+      requestId: "request_new",
+      inputTokens: 12_000,
+    });
+  });
+
+  /** Snapshot 请求序号属于各 Turn；普通 UNKNOWN 同请求补齐与压缩后新 Turn 都必须恢复可信计量。 */
+  it.each([false, true])("允许新 Snapshot 恢复计量，成功压缩边界=%s", (compacted) => {
+    const state = readyState();
+    state.contextUsageByThread[threadId] = {
+      turnId,
+      ...requestUsage(compacted ? 10 : 1, 0, 0, 0),
+      certainty: "unknown",
+      inputTokens: null,
+      outputTokens: null,
+      totalTokens: null,
+    };
+    if (compacted) state.contextUsageInvalidatedAtByThread[threadId] = "2026-08-18T00:00:02Z";
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 1,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: {
+          ...requestUsage(1, 12_000, 1_000, 13_000),
+          turnId: compacted ? "turn_new" : turnId,
+          measuredAt: "2026-08-18T00:00:03Z",
+        },
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "known",
+      requestOrdinal: 1,
+      inputTokens: 12_000,
     });
   });
 

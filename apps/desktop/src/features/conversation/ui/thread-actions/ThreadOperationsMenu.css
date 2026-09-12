@@ -78,7 +78,34 @@
 }
 
 .ja-thread-compaction-feedback .ja-icon-button {
+  /* IconButton 只提供语义，不提供视觉；局部重置原生按钮，避免 WebView2 显示白色方块。 */
+  appearance: none;
+  display: inline-grid;
   width: 1.55rem;
   height: 1.55rem;
   flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  line-height: 0;
+  cursor: pointer;
+}
+
+.ja-thread-compaction-feedback .ja-icon-button:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+
+.ja-thread-compaction-feedback .ja-icon-button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-thread-compaction-feedback .ja-icon-button svg {
+  display: block;
+  width: 0.9rem;
+  height: 0.9rem;
 }

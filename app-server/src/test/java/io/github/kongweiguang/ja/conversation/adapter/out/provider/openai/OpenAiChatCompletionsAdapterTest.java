@@ -116,8 +116,10 @@ final class OpenAiChatCompletionsAdapterTest {
                 assertEquals(ModelPort.FinishReason.TOOL_CALLS, outcome.finishReason());
                 assertNull(outcome.continuation());
                 assertEquals(new ModelUsage(5, 9, 14), outcome.usage());
-                assertEquals(requestBody.get().getBytes(StandardCharsets.UTF_8).length,
-                        estimate.conservativeUpperBound());
+                assertEquals(java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(requestBody.get().getBytes(StandardCharsets.UTF_8))), estimate.fingerprint());
+                assertTrue(estimate.conservativeUpperBound() > 0);
+                assertTrue(estimate.conservativeUpperBound() < requestBody.get().getBytes(StandardCharsets.UTF_8).length);
             }
             assertEquals(1, server.calls());
         }

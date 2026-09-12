@@ -288,6 +288,8 @@ async function writeIsolatedSettings(home) {
     'default_provider_id = "provider_e2e"',
     'default_model_id = "model_e2e"',
     "default_reasoning_level = { __ja_null = true }",
+    "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
+    "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
     "skills = []",
     "",
@@ -608,6 +610,33 @@ async function terminateOwnedLauncher(launch) {
   }).catch(() => undefined);
 }
 
+/** fresh Windows UDF 首启先完成磁盘profile初始化，再由同一隔离profile开启CDP；不扩大等待期限。 */
+async function prewarmWebViewProfile(overlay, environment, directories) {
+  const primeEnvironment = { ...environment };
+  delete primeEnvironment.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
+  const prime = launchTauri({ overlay, environment: primeEnvironment });
+  const deadline = Date.now() + 120_000;
+  try {
+    while (Date.now() < deadline) {
+      if (prime.child.exitCode !== null)
+        throw new Error(`WebView2 profile prime exited: ${prime.output.stderr.slice(-1000)}`);
+      try {
+        const [localState, preferences] = await Promise.all([
+          stat(join(directories.webview, "EBWebView", "Local State")),
+          stat(join(directories.webview, "EBWebView", "Default", "Preferences")),
+        ]);
+        if (localState.size > 0 && preferences.size > 0) return;
+      } catch {
+        // Fresh profile 分阶段创建；必须看见两个持久文件才能进入第二次启动。
+      }
+      await new Promise((done) => setTimeout(done, 200));
+    }
+    throw new Error(`WebView2 profile prime timed out: ${prime.output.stderr.slice(-1000)}`);
+  } finally {
+    await terminateOwnedLauncher(prime);
+  }
+}
+
 /** 清理前再次解析真实路径，确保 recursive remove 仍局限于本轮随机 temp root。 */
 async function removeOwnedRunRoot(root) {
   const expected = assertOwnedTemporaryPath(root, "run root");
@@ -682,6 +711,14 @@ export async function runProduction(options) {
         edgeDriverSessionPath,
         cargo,
       });
+      if (options.prewarmWebview === true) {
+        assert.equal(
+          options.edgeDriver,
+          undefined,
+          "profile prewarm uses direct CDP, not EdgeDriver",
+        );
+        await prewarmWebViewProfile(overlay, environment, directories);
+      }
       launch = launchTauri({ overlay, environment });
       if (options.edgeDriver === undefined) {
         endpoint = `http://127.0.0.1:${automationPort}`;
@@ -737,6 +774,7 @@ export async function runProduction(options) {
     return report;
   } catch (error) {
     const failure = {
+      // 可选保留隔离失败现场只用于测试诊断，不改变owned进程的清理责任。
       contractVersion: 1,
       verdict: "FAIL",
       scope: options.scope,
@@ -744,6 +782,22 @@ export async function runProduction(options) {
       nativeImageVerified: false,
       error: safeFailure(error, directories?.root),
     };
+    if (options.preserveFailedProfile === true && directories?.root !== undefined) {
+      await writeFile(
+        join(options.evidenceDirectory, "failed-profile-path.txt"),
+        directories.root,
+        "utf8",
+      );
+      if (launch !== undefined)
+        await writeFile(
+          join(options.evidenceDirectory, "launch-diagnostic.log"),
+          `${launch.output.stdout}\n${launch.output.stderr}`.replaceAll(
+            directories.root,
+            "<RUN_ROOT>",
+          ),
+          "utf8",
+        );
+    }
     await writeFile(
       join(options.evidenceDirectory, reportFileName),
       `${JSON.stringify(failure, null, 2)}\n`,
@@ -753,7 +807,11 @@ export async function runProduction(options) {
   } finally {
     await browser?.close().catch(() => undefined);
     await terminateOwnedLauncher(launch);
-    if (launch !== undefined && directories?.root !== undefined) {
+    if (
+      launch !== undefined &&
+      directories?.root !== undefined &&
+      !(options.preserveFailedProfile === true && report === undefined)
+    ) {
       await removeOwnedRunRoot(directories.root).catch(() => undefined);
     }
   }
