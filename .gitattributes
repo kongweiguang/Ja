@@ -3,3 +3,8 @@
 
 # SQLite migrations are hashed from exact UTF-8 bytes; keep checkout bytes stable on Windows.
 *.sql text eol=lf
+
+# Prettier owns frontend line endings; keep Windows checkouts compatible with endOfLine=lf.
+apps/desktop/**/*.ts text eol=lf
+apps/desktop/**/*.tsx text eol=lf
+apps/desktop/**/*.css text eol=lf

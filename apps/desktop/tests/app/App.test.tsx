@@ -716,7 +716,8 @@ describe("Ja desktop shell v1", () => {
   /**
    * 普通对话打开真实 Workbench 并提交可持久宽度；进入设置时只隐藏同一 DOM 子树，
    * 返回后仍复用原节点，避免主题切换通过卸载重建 Editor、xterm 或 PTY owner；能力入口
-   * 采用真实 Radix 菜单交互，不再依赖已退出主流程的整页启动器。
+   * 采用真实 Radix 菜单交互，不再依赖已退出主流程的整页启动器。Windows CI 中该完整交互约
+   * 需 6 秒，因此使用局部 10 秒预算，不改变全局测试 deadline。
    */
   it("joins general conversation with a resizable workbench", async () => {
     const user = userEvent.setup();
@@ -773,10 +774,10 @@ describe("Ja desktop shell v1", () => {
     expect(workspacePanels).toHaveAttribute("hidden");
     expect(container.querySelector("#workbench")).toBe(workbenchPanel);
 
-    fireEvent.click(screen.getByRole("button", { name: "返回应用" }));
+    fireEvent.click(await screen.findByRole("button", { name: "返回应用" }));
     await waitFor(() => expect(workspacePanels).not.toHaveAttribute("hidden"));
     expect(container.querySelector("#workbench")).toBe(workbenchPanel);
-  });
+  }, 10_000);
 
   /**
    * 真实 App composition 必须把 Workspace 引用交给现有 Files 读取链；关闭单文件 Tab 后

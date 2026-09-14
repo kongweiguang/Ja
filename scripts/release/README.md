@@ -12,6 +12,8 @@ Ja 沿用 Kerminal/GMark 的分发策略：不要求 Windows Authenticode 或 ma
 
 JVM 常规验证与 Jazzer fuzz 使用独立 Maven/JVM 调用：常规 `verify` 排除 `ProviderInputFuzzTest`，紧随其后的两个必需 fuzz 步骤分别执行该类的全部两个方法，防止全局插桩状态传播到后续 FFM/Win32 测试。任何一步失败均阻止原生构建。
 
+多命令 PowerShell 验证步骤显式启用原生命令失败传播，非零退出码会立即中止，不允许后续成功命令覆盖失败结果。Rust 外层测试 worker 串行运行，隔离真实 JVM/Git/Shell 用例的宿主资源争用；测试内部的显式并发场景和产品 deadline 保持不变。前端源码通过 Git attributes 固定 LF，保证 Windows 干净检出与 Prettier 的检查规则一致。
+
 Windows Host 与 Shell 的环境白名单会转发宿主提供的绝对 `PSModuleAnalysisCachePath`。GitHub Windows 镜像预热此非敏感缓存来加速 cmdlet 发现；丢弃它会触发大型模块集合的重新分析。该项不允许配置、凭据或任意环境变量穿过 `env_clear` 边界。
 
 正式路径只接受 GitHub Secrets，不接受命令行参数、仓库文件或普通环境变量中的私钥：

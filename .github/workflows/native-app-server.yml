@@ -165,6 +165,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # PowerShell otherwise lets native failures continue until a later command overwrites LASTEXITCODE.
+          $PSNativeCommandUseErrorActionPreference = $true
           pnpm typecheck
           pnpm lint
           pnpm test
@@ -174,6 +176,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           pnpm check:architecture
           pnpm check:unused
 
@@ -181,17 +184,21 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $env:JA_TEST_JAVA = (Get-Command java).Source
           $env:JA_TEST_JAR = (Resolve-Path 'app-server/target/ja-app-server.jar').Path
           cargo install cargo-machete --version 0.9.2 --locked
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --all-targets --locked
+          # int_internal 含真实 JVM/Git/Shell 进程测试；foundation 自身的 JVM 锁无法隔离其它模块的
+          # 并行进程和 CPU 争用。这里只串行测试 worker，不删 workspace/all-targets、不跳过失败测试，
+          # 也不改变测试内部显式并发场景或产品 15s timeout。
+          cargo test --workspace --all-targets --locked -- --test-threads=1
           cargo machete --with-metadata --skip-target-dir
 
       - name: Run Node script tests
         shell: pwsh
-        run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs
+        run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs scripts/verification/powershell-fail-fast.test.mjs
 
       - name: Run Python script tests
         shell: pwsh
@@ -201,6 +208,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $scratch = ".tmp/verification/ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           pwsh -NoProfile -File scripts/verification/test-production-verification.ps1 -ScratchDirectory $scratch
           pwsh -NoProfile -File scripts/release/sbom/test-sbom-scripts.ps1

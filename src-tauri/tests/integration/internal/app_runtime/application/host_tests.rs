@@ -37,6 +37,8 @@ fn production_directory_args(home: &Path, data: &Path, run: &Path, log: &Path) -
 }
 
 /// 验证唯一构造入口完整保留四目录策略，防止宿主初始化再次引入旁路配置来源。
+/// Windows 可能用 8.3 短路径或长路径表示同一目录，因此按规范化后的文件身份比较，
+/// 不把路径字符串的显示形式误当成目录契约的一部分。
 #[test]
 fn constructor_preserves_four_directory_production_policy() {
     let root = std::env::temp_dir().join(format!(
@@ -64,13 +66,17 @@ fn constructor_preserves_four_directory_production_policy() {
     let host = RuntimeHost::new(config, sink);
 
     let info = host.storage_info();
-    assert_eq!(info.data_path, run_dir.to_string_lossy());
+    let canonical_run_dir = fs::canonicalize(&run_dir).expect("canonical runtime directory");
+    let reported_run_dir = fs::canonicalize(Path::new(&info.data_path))
+        .expect("canonical reported runtime directory");
+    assert_eq!(reported_run_dir, canonical_run_dir);
     assert!(info.native_image);
     fs::remove_dir_all(root).expect("remove constructor fixture");
 }
 
 /// Runtime storage 事实必须反映固定 launch policy 与既有 durable backup，且不暴露 executable
-/// 或 argument data。
+/// 或 argument data。Windows 的 8.3 短路径与长路径可能指向同一目录，断言按规范化后的
+/// 文件身份比较，保留真实目录契约而不锁定操作系统的字符串表示。
 #[test]
 fn storage_info_reports_jvm_run_directory_and_backup() {
     let root = std::env::temp_dir().join(format!("ja-runtime-storage-{}", uuid::Uuid::new_v4()));
@@ -89,7 +95,10 @@ fn storage_info_reports_jvm_run_directory_and_backup() {
     let info = host.storage_info();
 
     assert!(!info.native_image);
-    assert_eq!(info.data_path, root.to_string_lossy());
+    let canonical_root = fs::canonicalize(&root).expect("canonical runtime storage directory");
+    let reported_root =
+        fs::canonicalize(Path::new(&info.data_path)).expect("canonical reported storage directory");
+    assert_eq!(reported_root, canonical_root);
     assert_eq!(info.log_path, None);
     assert_eq!(info.cache_path, None);
     assert_eq!(info.last_backup.as_deref(), Some("已生成本地备份"));
