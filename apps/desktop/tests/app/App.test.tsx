@@ -294,8 +294,12 @@ function history(): HistoryAdapter {
   };
 }
 
-/** 首版壳层仍使用完整生产装配，不保留按历史版本分叉的测试入口。 */
-describe("Ja desktop shell v1", () => {
+/**
+ * 首版壳层仍使用完整生产装配，不保留按历史版本分叉的测试入口。App composition 的完整交互
+ * 在 Windows CI 中有多个用例超过默认 5 秒；仅提高本文件的 suite 预算到 10 秒，不扩大其它
+ * unit test 或产品运行时的 deadline。
+ */
+describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   beforeEach(() => {
     localStorage.clear();
     useUiPreferencesStore.setState({
@@ -711,7 +715,7 @@ describe("Ja desktop shell v1", () => {
     expect(await screen.findByRole("region", { name: "设置页面" })).toBeVisible();
     fireEvent.click(await screen.findByRole("button", { name: "返回应用" }));
     await waitFor(() => expect(screen.getByRole("textbox", { name: "消息" })).toHaveFocus());
-  }, 10_000);
+  });
 
   /**
    * 普通对话打开真实 Workbench 并提交可持久宽度；进入设置时只隐藏同一 DOM 子树，
@@ -777,7 +781,7 @@ describe("Ja desktop shell v1", () => {
     fireEvent.click(await screen.findByRole("button", { name: "返回应用" }));
     await waitFor(() => expect(workspacePanels).not.toHaveAttribute("hidden"));
     expect(container.querySelector("#workbench")).toBe(workbenchPanel);
-  }, 10_000);
+  });
 
   /**
    * 真实 App composition 必须把 Workspace 引用交给现有 Files 读取链；关闭单文件 Tab 后
@@ -879,5 +883,5 @@ describe("Ja desktop shell v1", () => {
     const closeFile = await screen.findByRole("button", { name: "关闭 main.ts" });
     fireEvent.click(closeFile);
     await waitFor(() => expect(source).toHaveFocus());
-  }, 10_000);
+  });
 });

@@ -169,7 +169,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           pnpm typecheck
           pnpm lint
-          pnpm test
+          # 完整 UI suite 共享 CI CPU；限制外层 Vitest worker，保留测试内部并发，不重试、不跳过测试。
+          pnpm exec vitest run --maxWorkers=2 --minWorkers=1
           pnpm build
 
       - name: Run repository architecture, attribution, and unused-code gates
