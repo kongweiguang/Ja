@@ -16,6 +16,8 @@ JVM 常规验证与 Jazzer fuzz 使用独立 Maven/JVM 调用：常规 `verify` 
 
 CI 前端测试限制为 2 个 Vitest worker，完整 App composition 测试组使用局部 10 秒预算；其它单元测试与产品超时不变。该配置保留全部断言和测试内部并发，不通过重试或跳过用例获得通过结果。
 
+Rust 编译器、Clippy 与 rustfmt 由根 `rust-toolchain.toml` 固定为 1.98.0，保证本地与 CI 使用相同检查基线；不依赖开发机的全局默认版本，也不随 runner 镜像自动漂移。
+
 Windows Host 与 Shell 的环境白名单会转发宿主提供的绝对 `PSModuleAnalysisCachePath`。GitHub Windows 镜像预热此非敏感缓存来加速 cmdlet 发现；丢弃它会触发大型模块集合的重新分析。该项不允许配置、凭据或任意环境变量穿过 `env_clear` 边界。
 
 正式路径只接受 GitHub Secrets，不接受命令行参数、仓库文件或普通环境变量中的私钥：

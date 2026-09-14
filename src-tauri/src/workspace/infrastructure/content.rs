@@ -167,16 +167,18 @@ pub(crate) fn decode_content(bytes: &[u8]) -> (ContentKind, Option<TextEncoding>
 }
 
 /// UTF-16 解码不引入第三方转码器；奇数字节与非法 surrogate sequence 直接拒绝，
-/// 不用替换字符静默损坏用户数据。
+/// 不用替换字符静默损坏用户数据。`as_chunks::<2>()` 的 remainder 保留奇数字节拒绝语义，
+/// 只有完整 UTF-16 code unit 才进入 surrogate 校验。
 fn decode_utf16(
     bytes: &[u8],
     little_endian: bool,
 ) -> (ContentKind, Option<TextEncoding>, Option<String>) {
-    if !bytes.len().is_multiple_of(2) {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
         return (ContentKind::UnknownEncoding, None, None);
     }
-    let units = bytes
-        .chunks_exact(2)
+    let units = chunks
+        .iter()
         .map(|pair| {
             if little_endian {
                 u16::from_le_bytes([pair[0], pair[1]])

@@ -428,11 +428,13 @@ fn valid_media_type(value: &str) -> bool {
 }
 
 /// 只计算标准 padded Base64 的解码长度；Rust host 不在协议 DTO 层复制或保存内容。
+/// Base64 的 wire quantum 固定为 4 字节，直接检查 `as_chunks::<4>()` 的余数可保持边界
+/// 校验在固定块语义下完成，避免用运行时 chunk iterator 表达这一不变量。
 fn decoded_base64_len(value: &str) -> Option<u64> {
     if value.is_empty() {
         return Some(0);
     }
-    if !value.as_bytes().chunks_exact(4).remainder().is_empty()
+    if !value.as_bytes().as_chunks::<4>().1.is_empty()
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))

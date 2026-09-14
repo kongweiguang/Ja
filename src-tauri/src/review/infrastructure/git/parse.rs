@@ -123,6 +123,7 @@ fn charge_status_records(
 }
 
 /// 解析由此 adapter 拥有的固定六字段、NUL 终止 log 格式；拒绝缺失记录终止符的非空输出。
+/// 通过 `as_chunks::<6>()` 显式拒绝不完整尾部，避免固定块遍历悄悄丢弃非法字段。
 pub(crate) fn parse_log(bytes: &[u8]) -> Result<Vec<GitLogEntry>, GitError> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -135,11 +136,12 @@ pub(crate) fn parse_log(bytes: &[u8]) -> Result<Vec<GitLogEntry>, GitError> {
         .map(text_field)
         .collect::<Result<Vec<_>, _>>()?;
     fields.pop();
-    if fields.len() % 6 != 0 {
+    let (chunks, remainder) = fields.as_chunks::<6>();
+    if !remainder.is_empty() {
         return Err(GitError::Parse);
     }
-    Ok(fields
-        .chunks_exact(6)
+    Ok(chunks
+        .iter()
         .map(|chunk| GitLogEntry {
             object_id: chunk[0].clone(),
             parents: chunk[1].split_whitespace().map(str::to_owned).collect(),

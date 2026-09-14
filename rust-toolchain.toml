@@ -1,0 +1,6 @@
+# @author kongweiguang
+# 固定 CI 已确认的 Rust 基线，避免本地 rustup 默认版本与 CI 漂移。
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
