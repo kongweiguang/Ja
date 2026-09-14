@@ -78,6 +78,8 @@
   "ignoreBinaries": [
     // Windows 真窗 runner 只在清理自己启动的进程树时调用系统 taskkill；删除条件是统一改用 Node 原生进程树终止。
     "taskkill.exe",
+    // Fail-fast 回归直接启动系统 PowerShell 7；它不是 npm 依赖，删除条件是改用 Node 原生 shell runner。
+    "pwsh",
   ],
   // Zod schema 与领域类型常在声明文件内部组合成公开根 schema；内部有真实引用时不按未使用出口处理。
   "ignoreExportsUsedInFile": true,
