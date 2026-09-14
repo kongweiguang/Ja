@@ -29,6 +29,7 @@ import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
 import io.github.kongweiguang.ja.conversation.port.out.ToolArgumentValidator;
 import io.github.kongweiguang.ja.conversation.port.out.ToolPolicy;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -111,8 +112,13 @@ final class AgentToolRunner implements AutoCloseable {
                         "Tool '" + call.toolName()
                                 + "' is unavailable for this call. Use a Tool from the current catalog.");
             } else if (argumentError.isPresent()) {
+                String diagnostic = argumentError.orElseThrow();
+                if (isBuiltinGrepEmptyQuery(tool, call, diagnostic)) {
+                    diagnostic = "Tool field 'query' must be non-empty for grep (minLength 1); "
+                            + "use find for file-name lookup";
+                }
                 result = failed("TOOL_ARGUMENTS_INVALID",
-                        argumentError.orElseThrow() + ". Correct the arguments and retry this Tool.");
+                        diagnostic + ". Correct the arguments and retry this Tool.");
             } else {
                 AgentTool.ExecutionContext toolExecution = executionContext(execution, call);
                 ToolSideEffect sideEffect = tool.sideEffect();
@@ -212,6 +218,24 @@ final class AgentToolRunner implements AutoCloseable {
     private static boolean isTrustedInternal(AgentTool tool) {
         return tool.bindingDescriptor().routeKind() == AgentTool.RouteKind.BUILTIN
                 && tool.approvalRequirement() == AgentTool.ApprovalRequirement.TRUSTED_INTERNAL;
+    }
+
+    /** 仅为真实 Builtin grep 的空 query 增加下一步提示；该判断不改变 MCP 路由或任何权限边界。 */
+    private static boolean isBuiltinGrepEmptyQuery(
+            AgentTool tool, AgentTool.Invocation call, String diagnostic) {
+        if (!isBuiltinTool(tool, "grep") || !diagnostic.contains("minLength")) return false;
+        return call.arguments().members().get("query") instanceof JsonText query
+                && query.value().isEmpty();
+    }
+
+    /** 通过完整 Builtin binding 身份确认工具来源，避免 MCP 同名工具获得内置诊断语义。 */
+    private static boolean isBuiltinTool(AgentTool tool, String name) {
+        AgentTool.ToolBindingDescriptor binding = tool.bindingDescriptor();
+        return binding.routeKind() == AgentTool.RouteKind.BUILTIN
+                && "builtin".equals(binding.serverId())
+                && name.equals(binding.localName())
+                && name.equals(binding.remoteName())
+                && name.equals(tool.spec().name());
     }
 
     /**
@@ -454,10 +478,10 @@ final class AgentToolRunner implements AutoCloseable {
                 List.of(), "shell".equals(call.toolName()) ? "shell command" : null);
     }
 
-    /** 将四个内置名称和其它 MCP 名称映射到旧审计字段，字段不再参与授权判断。 */
+    /** 将只读内置名称和其它 MCP 名称映射到旧审计字段，字段不再参与授权判断。 */
     private static PermissionAction actionKind(String name) {
         return switch (name) {
-            case "read" -> PermissionAction.READ;
+            case "read", "read_attachment", "grep", "find", "ls" -> PermissionAction.READ;
             case "edit", "write" -> PermissionAction.WRITE;
             case "shell" -> PermissionAction.SHELL;
             default -> PermissionAction.MCP;

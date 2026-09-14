@@ -941,7 +941,8 @@
 }
 
 .ja-tool-details__label,
-.ja-tool-details__summary {
+.ja-tool-details__summary,
+.ja-tool-details__identity code {
   color: var(--ja-foreground);
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
@@ -952,7 +953,23 @@
   font-weight: var(--ja-weight-semibold);
 }
 
-.ja-tool-details__trigger > code {
+.ja-tool-details__identity {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.38rem;
+  overflow: hidden;
+}
+
+.ja-tool-details__identity code {
+  min-width: 0;
+  max-width: 14rem;
+  overflow: hidden;
+  font: var(--ja-text-caption-size) / 1.45 var(--ja-font-mono);
+  text-overflow: ellipsis;
+}
+
+.ja-tool-details__target {
   min-width: 0;
   overflow: hidden;
   color: var(--ja-foreground);

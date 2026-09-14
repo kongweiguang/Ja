@@ -73,32 +73,36 @@ public final class PlanGoalAgentCapability implements AgentCapability {
     }
 
     /**
-     * 一次性冻结当前 Turn 可达的 Plan/Goal 身份；默认对话直接返回空贡献，不读取无关聚合。
+     * 一次性冻结当前 Turn 可达的 Plan/Goal 身份；完整 Tool 定义始终进入安全目录，实际可见集合仍
+     * 严格由当前 origin、Plan 状态和 Goal 状态决定，避免隐藏入口造成 Child ceiling 摘要漂移。
      */
     @Override
     public Prepared prepare(Request request) {
         Objects.requireNonNull(request, "request");
-        if (request.turnId() == null || (request.preferences().collaborationMode() != CollaborationMode.PLAN
-                && !request.origin().internal())) {
+        if (request.turnId() == null) {
             return Prepared.empty();
         }
         Binding binding = bind(request);
-        List<ToolContribution> contributions = new ArrayList<>();
-        for (ToolSpec spec : toolSpecs) {
-            if (!binding.allows(spec.name())) continue;
-            AgentTool.ToolBindingDescriptor descriptor = AgentTool.builtinBindingDescriptor(
-                    spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE);
-            contributions.add(new ToolContribution(spec, ToolSideEffect.EXTERNAL,
-                    AgentTool.WorkspaceMutationMode.UNOBSERVABLE, descriptor,
-                    isPlanMutationTool(spec.name())
-                            ? AgentTool.PlanAccess.INTERNAL_MUTATION
-                            : AgentTool.PlanAccess.DISALLOWED,
-                    isPlanMutationTool(spec.name())
-                            ? AgentTool.ApprovalRequirement.TRUSTED_INTERNAL
-                            : AgentTool.ApprovalRequirement.USER_REQUIRED,
-                    ignored -> new GoalAgentTool(spec, binding)));
-        }
-        return new Prepared(promptFragment(binding), contributions);
+        List<ToolContribution> catalogTools = toolSpecs.stream()
+                .map(spec -> toolContribution(spec, binding)).toList();
+        List<ToolContribution> exposedTools = catalogTools.stream()
+                .filter(contribution -> binding.allows(contribution.spec().name())).toList();
+        return new Prepared(exposedTools.isEmpty() ? "" : promptFragment(binding), exposedTools, catalogTools);
+    }
+
+    /** 为完整安全定义和可见目录复用同一绑定快照，禁止隐藏 Plan/Goal 入口产生第二套元数据。 */
+    private ToolContribution toolContribution(ToolSpec spec, Binding binding) {
+        AgentTool.ToolBindingDescriptor descriptor = AgentTool.builtinBindingDescriptor(
+                spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE);
+        return new ToolContribution(spec, ToolSideEffect.EXTERNAL,
+                AgentTool.WorkspaceMutationMode.UNOBSERVABLE, descriptor,
+                isPlanMutationTool(spec.name())
+                        ? AgentTool.PlanAccess.INTERNAL_MUTATION
+                        : AgentTool.PlanAccess.DISALLOWED,
+                isPlanMutationTool(spec.name())
+                        ? AgentTool.ApprovalRequirement.TRUSTED_INTERNAL
+                        : AgentTool.ApprovalRequirement.USER_REQUIRED,
+                ignored -> new GoalAgentTool(spec, binding));
     }
 
     /** 查询顺序由持久 origin 决定，不能用 collaboration mode 猜测内部 continuation 身份。 */
@@ -272,17 +276,37 @@ public final class PlanGoalAgentCapability implements AgentCapability {
             }
         }
 
-        /** Tool 闭集由持久 origin 决定；普通 Default Turn 永远不获得内部 Goal Tool。 */
+        /**
+         * Tool 闭集由持久 origin 与 Plan 状态共同决定；普通 Default Turn 永远不获得内部 Goal Tool。
+         * 提案只能从 DRAFT 冻结，草稿编辑则复用仓储允许的非执行状态，避免把一个“能调用但必然失败”的
+         * 内部 Tool 送入模型目录，也避免旧 prompt 在执行中或终态重新获得编辑入口。
+         */
         private boolean allows(String toolName) {
             return switch (origin) {
                 case USER, CHILD_TASK -> collaborationMode == CollaborationMode.PLAN
-                        && isPlanMutationTool(toolName);
+                        && allowsPlanMutation(planContext, toolName);
                 case GOAL_CONTINUATION -> goalContext.status() == GoalModels.GoalStatus.ACTIVE
                         && goalContext.phase() == GoalModels.GoalPhase.WORKING
                         && ("goal_request_evaluation".equals(toolName)
                         || (goalContext.planId() != null && "plan_step_update".equals(toolName)));
                 case PLAN_EXECUTION -> planContext.status() == GoalModels.PlanStatus.EXECUTING
                         && "plan_step_update".equals(toolName);
+            };
+        }
+
+        /**
+         * 将模型声明阶段与 GoalService/MybatisGoalRepository 的 Plan 编辑门保持一致；终态和运行态均收紧，
+         * 即使上游 projection 暂时返回了一个非空但不可编辑的 Plan，也不会把它伪装成可用 mutation。
+         */
+        private static boolean allowsPlanMutation(GoalUseCase.PlanTurnContext plan, String toolName) {
+            if (plan == null || !isPlanMutationTool(toolName)) return false;
+            return switch (toolName) {
+                case "plan_propose" -> plan.status() == GoalModels.PlanStatus.DRAFT;
+                case "plan_draft_update" -> switch (plan.status()) {
+                    case DRAFT, AWAITING_APPROVAL, APPROVED, PAUSED -> true;
+                    case EXECUTING, VERIFYING, COMPLETED, STOPPED -> false;
+                };
+                default -> false;
             };
         }
     }

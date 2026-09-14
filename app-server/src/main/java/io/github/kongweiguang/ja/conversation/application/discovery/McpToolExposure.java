@@ -23,6 +23,7 @@ import java.util.regex.Pattern;
 
 /** MCP 发现只缩小模型声明面；完整执行目录和权限仍由请求运行时拥有。 */
 public final class McpToolExposure {
+    private static final String READ_ATTACHMENT = "read_attachment";
     private static final int DIRECT_TOOLS = 8;
     private static final int DIRECT_BYTES = 12_000;
     private static final int RECENT_TOOLS = 10;
@@ -51,13 +52,17 @@ public final class McpToolExposure {
 
     /**
      * 计量与发送共用同一纯投影；只接受配对成功结果，普通文本不能伪造加载事实。
-     * 不持久化第二份激活集合，历史压缩后搜索入口仍在，模型可以重新发现。
+     * 不持久化第二份激活集合，历史压缩后搜索入口仍在，模型可以重新发现；附件入口只在
+     * 当前上下文保留结构化附件块时声明，避免把执行目录中的受管读取能力误报给无附件请求。
      */
     public static List<ToolSpec> modelTools(List<AgentTool> catalog,
                                             List<ContextMessage> messages, JsonValueCodec codec) {
         Objects.requireNonNull(codec, "codec");
+        boolean attachmentPresent = hasTypedAttachment(messages);
         if (catalog.stream().noneMatch(McpToolSearch.class::isInstance)) {
-            return catalog.stream().map(AgentTool::spec).toList();
+            return catalog.stream()
+                    .filter(tool -> exposeBuiltinReadAttachment(tool, attachmentPresent))
+                    .map(AgentTool::spec).toList();
         }
         Map<String, AgentTool> available = new HashMap<>();
         for (AgentTool tool : catalog) {
@@ -81,8 +86,29 @@ public final class McpToolExposure {
             }
         }
         Map<String, AgentTool> selected = boundedRecent(recent, latestPage);
-        return catalog.stream().filter(tool -> !isMcp(tool) || selected.containsKey(tool.spec().name()))
+        return catalog.stream()
+                .filter(tool -> exposeBuiltinReadAttachment(tool, attachmentPresent))
+                .filter(tool -> !isMcp(tool) || selected.containsKey(tool.spec().name()))
                 .map(AgentTool::spec).toList();
+    }
+
+    /**
+     * 只认当前上下文中的显式 AttachmentBlock；附件 ID 文本、Tool 输出或其它历史描述不能
+     * 伪造可读附件事实，且 ContextMessage 构造器已为该类型完成身份格式校验。
+     */
+    private static boolean hasTypedAttachment(List<ContextMessage> messages) {
+        return messages.stream().anyMatch(message -> message.blocks().stream()
+                .anyMatch(ContextMessage.AttachmentBlock.class::isInstance));
+    }
+
+    /**
+     * 过滤仅影响真实内建 read_attachment；MCP 路由即使使用相同本地名也继续遵循自身的
+     * 直通或搜索恢复策略，避免按名称误删外部能力。
+     */
+    private static boolean exposeBuiltinReadAttachment(AgentTool tool, boolean attachmentPresent) {
+        return attachmentPresent
+                || !READ_ATTACHMENT.equals(tool.spec().name())
+                || tool.bindingDescriptor().routeKind() != AgentTool.RouteKind.BUILTIN;
     }
 
     /** 只使用显式路由类型，不能把恰好带 mcp 前缀的内建工具误当扩展。 */

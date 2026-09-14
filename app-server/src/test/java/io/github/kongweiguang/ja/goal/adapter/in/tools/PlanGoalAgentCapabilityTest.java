@@ -64,6 +64,47 @@ final class PlanGoalAgentCapabilityTest {
                 draftUpdate.spec().inputSchema().get("properties")).containsKey("expectedDraftRevision"));
     }
 
+    /** Plan Tool 必须与真实状态机对齐：无 Plan、执行中、验证中和终态均不得暴露编辑入口。 */
+    @Test
+    void filtersPlanMutationToolsByPersistedPlanStage() {
+        assertEquals(List.of(), names(fixture(null).capability(), CollaborationMode.PLAN, TurnOrigin.USER));
+        assertEquals(List.of("plan_propose", "plan_draft_update"),
+                names(fixture(GoalModels.PlanStatus.DRAFT).capability(), CollaborationMode.PLAN, TurnOrigin.USER));
+        assertEquals(List.of("plan_draft_update"),
+                names(fixture(GoalModels.PlanStatus.AWAITING_APPROVAL).capability(),
+                        CollaborationMode.PLAN, TurnOrigin.USER));
+        assertEquals(List.of("plan_draft_update"),
+                names(fixture(GoalModels.PlanStatus.APPROVED).capability(), CollaborationMode.PLAN, TurnOrigin.USER));
+        assertEquals(List.of("plan_draft_update"),
+                names(fixture(GoalModels.PlanStatus.PAUSED).capability(), CollaborationMode.PLAN, TurnOrigin.USER));
+        for (GoalModels.PlanStatus status : List.of(GoalModels.PlanStatus.EXECUTING,
+                GoalModels.PlanStatus.VERIFYING, GoalModels.PlanStatus.COMPLETED,
+                GoalModels.PlanStatus.STOPPED)) {
+            assertEquals(List.of(), names(fixture(status).capability(), CollaborationMode.PLAN, TurnOrigin.USER),
+                    "unexpected Plan Tool exposure for " + status);
+        }
+    }
+
+    /** origin 或持久状态只改变暴露集合，四个 Plan/Goal 安全定义必须保持完整且稳定。 */
+    @Test
+    void keepsCompleteDefinitionsWhenVisibilityChanges() {
+        Fixture fixture = fixture();
+
+        AgentCapability.Prepared hidden = fixture.capability().prepare(
+                request(CollaborationMode.DEFAULT, TurnOrigin.USER));
+        AgentCapability.Prepared planning = fixture.capability().prepare(
+                request(CollaborationMode.PLAN, TurnOrigin.USER));
+
+        assertEquals(List.of(), hidden.tools().stream().map(value -> value.spec().name()).toList());
+        assertEquals(List.of("plan_propose", "plan_draft_update"),
+                planning.tools().stream().map(value -> value.spec().name()).toList());
+        assertEquals(List.of("plan_propose", "plan_draft_update", "plan_step_update",
+                        "goal_request_evaluation"),
+                hidden.catalogTools().stream().map(value -> value.spec().name()).toList());
+        assertEquals(hidden.catalogTools().stream().map(value -> value.spec().name()).toList(),
+                planning.catalogTools().stream().map(value -> value.spec().name()).toList());
+    }
+
     /** plan_propose 的 schema 和执行命令只使用 standalone Plan identity。 */
     @Test
     void proposesStandalonePlanThroughFrozenIdentity() throws Exception {
@@ -90,11 +131,27 @@ final class PlanGoalAgentCapabilityTest {
 
     /** 动态代理只实现本测试的最窄 GoalUseCase 路径。 */
     private static Fixture fixture() {
+        return fixture(GoalModels.PlanStatus.DRAFT);
+    }
+
+    /** 为阶段过滤测试替换当前 Plan projection；其它内部身份仍保持真实 origin 约束。 */
+    private static Fixture fixture(GoalModels.PlanStatus planStatus) {
         AtomicReference<GoalUseCase.Propose> propose = new AtomicReference<>();
         GoalUseCase goals = (GoalUseCase) Proxy.newProxyInstance(GoalUseCase.class.getClassLoader(),
                 new Class<?>[]{GoalUseCase.class}, (proxy, method, arguments) -> switch (method.getName()) {
-                    case "currentPlanContext" -> Optional.of(new GoalUseCase.PlanTurnContext(
-                            "plan_test", 4, GoalModels.PlanStatus.DRAFT, null, null));
+                    case "currentPlanContext" -> planStatus == null ? Optional.empty()
+                            : Optional.of(new GoalUseCase.PlanTurnContext(
+                                    "plan_test", 4, planStatus, planStatus == GoalModels.PlanStatus.APPROVED
+                                    || planStatus == GoalModels.PlanStatus.EXECUTING
+                                    || planStatus == GoalModels.PlanStatus.VERIFYING
+                                    || planStatus == GoalModels.PlanStatus.PAUSED
+                                    || planStatus == GoalModels.PlanStatus.COMPLETED
+                                    ? "planrev_test" : null,
+                                    planStatus == GoalModels.PlanStatus.PAUSED
+                                            || planStatus == GoalModels.PlanStatus.EXECUTING
+                                            || planStatus == GoalModels.PlanStatus.VERIFYING
+                                            || planStatus == GoalModels.PlanStatus.COMPLETED
+                                            ? "run_plan" : null));
                     case "planExecutionContext" -> Optional.of(new GoalUseCase.PlanTurnContext(
                             "plan_test", 5, GoalModels.PlanStatus.EXECUTING, "planrev_test", "run_plan"));
                     case "goalContinuationContext" -> Optional.of(new GoalUseCase.GoalTurnContext(

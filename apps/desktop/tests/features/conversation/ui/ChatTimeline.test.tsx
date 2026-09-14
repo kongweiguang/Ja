@@ -867,10 +867,9 @@ describe("ChatTimeline", () => {
     });
     const { rerender } = render(<WorkProcess steps={[pending]} />);
     const region = screen.getByRole("region", { name: "工作过程" });
-    expect(screen.getByRole("button", { name: /执行命令，pnpm test，等待执行/ })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    expect(
+      screen.getByRole("button", { name: /执行命令，shell，pnpm test，等待执行/ }),
+    ).toHaveAttribute("aria-expanded", "false");
 
     rerender(
       <WorkProcess
@@ -894,10 +893,9 @@ describe("ChatTimeline", () => {
       />,
     );
     expect(screen.getByRole("region", { name: "工作过程" })).toBe(region);
-    expect(screen.getByRole("button", { name: /执行命令，pnpm test，进行中/ })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    expect(
+      screen.getByRole("button", { name: /执行命令，shell，pnpm test，进行中/ }),
+    ).toHaveAttribute("aria-expanded", "false");
     expect(region).not.toHaveTextContent("状态：等待执行");
   });
 
@@ -1377,6 +1375,7 @@ describe("ChatTimeline", () => {
       kind: "tool_call",
       status: "in_progress",
       metadata: {
+        toolName: "read",
         presentation: {
           kind: "read",
           title: "读取文件",
@@ -1387,7 +1386,7 @@ describe("ChatTimeline", () => {
       },
     });
     const { rerender } = render(<WorkProcess steps={[readStep]} />);
-    expect(screen.getByRole("button", { name: /读取，src\/read\.ts，进行中/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /读取，read，src\/read\.ts，进行中/ })).toBeVisible();
     expect(document.querySelectorAll(".ja-work-step__header")).toHaveLength(0);
 
     rerender(
@@ -1397,6 +1396,7 @@ describe("ChatTimeline", () => {
             ...readStep,
             itemId: "item_edit_path",
             metadata: {
+              toolName: "edit",
               presentation: {
                 kind: "edit",
                 title: "编辑文件",
@@ -1409,7 +1409,7 @@ describe("ChatTimeline", () => {
         ]}
       />,
     );
-    expect(screen.getByRole("button", { name: /编辑，src\/edit\.ts，进行中/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /编辑，edit，src\/edit\.ts，进行中/ })).toBeVisible();
 
     rerender(
       <WorkProcess
@@ -1418,6 +1418,7 @@ describe("ChatTimeline", () => {
             ...readStep,
             itemId: "item_shell_path",
             metadata: {
+              toolName: "shell",
               presentation: {
                 kind: "shell",
                 title: "运行命令",
@@ -1430,7 +1431,9 @@ describe("ChatTimeline", () => {
         ]}
       />,
     );
-    expect(screen.getByRole("button", { name: /执行命令，package\.json，进行中/ })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: /执行命令，shell，package\.json，进行中/ }),
+    ).toBeVisible();
   });
 
   /** 成功命令默认只保留可扫描摘要，用户展开后再读取命令事实与十行输出预览。 */
@@ -1470,7 +1473,7 @@ describe("ChatTimeline", () => {
     expect(screen.queryByText("工作目录：workspace")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /工作过程/ }));
 
-    const detailsTrigger = screen.getByRole("button", { name: /执行命令，pnpm test，完成/ });
+    const detailsTrigger = screen.getByRole("button", { name: /执行命令，shell，pnpm test，完成/ });
     expect(detailsTrigger).toBeVisible();
     expect(detailsTrigger).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("工作目录：workspace")).not.toBeInTheDocument();
@@ -1522,10 +1525,9 @@ describe("ChatTimeline", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: /执行命令，pnpm test，失败/ })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
+    expect(
+      screen.getByRole("button", { name: /执行命令，shell，pnpm test，失败/ }),
+    ).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText(/测试失败/)).toBeVisible();
   });
 
@@ -1552,7 +1554,7 @@ describe("ChatTimeline", () => {
     });
     const { unmount } = render(<WorkProcess steps={[step]} onReadToolArtifact={readArtifact} />);
     await user.click(screen.getByRole("button", { name: /工作过程/ }));
-    await user.click(screen.getByRole("button", { name: /读取，src\/main\.ts，完成/ }));
+    await user.click(screen.getByRole("button", { name: /读取，read，src\/main\.ts，完成/ }));
     await user.click(screen.getByRole("button", { name: "加载完整输出" }));
     await waitFor(() => expect(screen.getByText(/完整第一行/)).toBeVisible());
     expect(readArtifact).toHaveBeenCalledWith({
@@ -1570,7 +1572,7 @@ describe("ChatTimeline", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: /工作过程/ }));
-    await user.click(screen.getByRole("button", { name: /读取，src\/main\.ts，完成/ }));
+    await user.click(screen.getByRole("button", { name: /读取，read，src\/main\.ts，完成/ }));
     await user.click(screen.getByRole("button", { name: "加载完整输出" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("无法读取完整输出");
     expect(screen.queryByText(/native secret/)).not.toBeInTheDocument();

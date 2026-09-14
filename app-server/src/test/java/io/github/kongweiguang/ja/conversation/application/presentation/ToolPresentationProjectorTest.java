@@ -118,6 +118,77 @@ final class ToolPresentationProjectorTest {
         assertEquals("[external-path]", external.inputPreview());
     }
 
+    /** 内容搜索、文件查找和目录列表共用 READ wire kind，但保留精确动作与首个目标。 */
+    @Test
+    void projectsDiscoveryToolsAsReadWithDistinctTargets() {
+        ToolPresentation grep = ToolPresentationProjector.prepared(
+                invocation("grep", Map.of(
+                        "query", new JsonText("needle"),
+                        "path", new JsonText("src"))),
+                WORKSPACE, List.of());
+        ToolPresentation whitespaceGrep = ToolPresentationProjector.prepared(
+                invocation("grep", Map.of("query", new JsonText("   "))), WORKSPACE, List.of());
+        ToolPresentation find = ToolPresentationProjector.prepared(
+                invocation("find", Map.of(
+                        "pattern", new JsonText("*.tsx"),
+                        "path", new JsonText("src"))),
+                WORKSPACE, List.of());
+        ToolPresentation ls = ToolPresentationProjector.prepared(
+                invocation("ls", Map.of("path", new JsonText("src"))), WORKSPACE, List.of());
+
+        assertEquals(ToolPresentation.Kind.READ, grep.kind());
+        assertEquals("搜索内容", grep.title());
+        assertEquals("query=\"needle\" · src", grep.inputPreview());
+        assertEquals("query=\"   \" · .", whitespaceGrep.inputPreview());
+        assertEquals(ToolPresentation.Kind.READ, find.kind());
+        assertEquals("查找文件", find.title());
+        assertEquals("pattern=\"*.tsx\" · src", find.inputPreview());
+        assertEquals(ToolPresentation.Kind.READ, ls.kind());
+        assertEquals("列出目录", ls.title());
+        assertEquals("src", ls.inputPreview());
+    }
+
+    /** 附件读取使用独立 opaque 身份，恢复或失败时不能退化为无法定位的 resource 占位。 */
+    @Test
+    void preservesAttachmentIdentityAndByteRangeInReadPresentation() {
+        ToolPresentation attachment = ToolPresentationProjector.prepared(
+                invocation("read_attachment", Map.of(
+                        "attachmentId", new JsonText("att_fixture"),
+                        "offsetBytes", new JsonNumber(BigDecimal.valueOf(8)),
+                        "maxBytes", new JsonNumber(BigDecimal.valueOf(64)))),
+                WORKSPACE, List.of());
+
+        assertEquals(ToolPresentation.Kind.READ, attachment.kind());
+        assertEquals("读取附件", attachment.title());
+        assertEquals("attachmentId=\"att_fixture\" · bytes 8:64", attachment.inputPreview());
+        assertTrue(attachment.relativePaths().isEmpty());
+    }
+
+    /** 完成与状态恢复只替换生命周期字段，搜索动作和首个目标必须继续来自同一安全投影。 */
+    @Test
+    void keepsDiscoveryPresentationIdentityAcrossCompletionAndResume() {
+        AgentTool.ToolResult result = new AgentTool.ToolResult(
+                ToolOutcome.SUCCEEDED, "src/App.tsx:1: needle", Optional.empty(), null);
+        ToolPresentation prepared = ToolPresentationProjector.prepared(
+                invocation("grep", Map.of(
+                        "query", new JsonText("needle"),
+                        "path", new JsonText("src"))),
+                WORKSPACE, List.of());
+        ToolPresentationProjector.Completed completed = ToolPresentationProjector.completed(
+                invocation("grep", Map.of(
+                        "query", new JsonText("needle"),
+                        "path", new JsonText("src"))),
+                result, WORKSPACE, List.of(), 12L);
+        ToolPresentation resumed = ToolPresentationProjector.withStatus(
+                completed.presentation(), ToolPresentation.Status.RUNNING);
+
+        assertEquals(prepared.kind(), completed.presentation().kind());
+        assertEquals(prepared.title(), completed.presentation().title());
+        assertEquals(prepared.inputPreview(), completed.presentation().inputPreview());
+        assertEquals(completed.presentation().inputPreview(), resumed.inputPreview());
+        assertEquals(completed.presentation().relativePaths(), resumed.relativePaths());
+    }
+
     /** Skill 只展示逻辑名称，既能诊断读取对象，也不会把资源子路径或物理 locator 写入历史。 */
     @Test
     void displaysOnlyValidatedSkillIdentity() {

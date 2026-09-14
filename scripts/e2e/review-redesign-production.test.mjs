@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,8 @@ import {
   buildLaunchEnvironment,
   createReviewGitFixture,
   parseArguments,
+  validateMaxModelRounds,
+  writeIsolatedSettings,
 } from "./review-redesign-production.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -57,6 +59,24 @@ test("parseArguments 接受显式 launch 参数", () => {
   assert.equal(parsed.scope, "git");
   assert.equal(parsed.fixture, "full");
   assert.equal(parsed.untrackedFiles, 1_800);
+});
+
+/** 隔离 runner 默认保持四轮，Tool 目录可显式增加到五轮，但不能越过产品配置边界。 */
+test("writeIsolatedSettings 使用有界 maxModelRounds 覆盖", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "ja-review-rounds-test-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  assert.equal(validateMaxModelRounds(), 4);
+  assert.equal(validateMaxModelRounds(5), 5);
+  assert.throws(() => validateMaxModelRounds(0), /between 1 and 128/u);
+  assert.throws(() => validateMaxModelRounds(129), /between 1 and 128/u);
+
+  await writeIsolatedSettings(join(root, "five"), "http://127.0.0.1:1234/v1", 5);
+  const fiveRounds = await readFile(join(root, "five", "config.toml"), "utf8");
+  assert.match(fiveRounds, /^max_model_rounds = 5$/mu);
+
+  await writeIsolatedSettings(join(root, "default"), "http://127.0.0.1:1234/v1");
+  const defaultRounds = await readFile(join(root, "default", "config.toml"), "utf8");
+  assert.match(defaultRounds, /^max_model_rounds = 4$/mu);
 });
 
 /** 官方 EdgeDriver 路径是显式 launch 选择，不能从 PATH 猜测或与 attach 混用。 */

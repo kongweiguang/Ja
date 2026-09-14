@@ -42,12 +42,18 @@ public final class AgentCapabilityCatalog {
         Objects.requireNonNull(request, "request");
         List<AgentCapability.Prepared> entries = new ArrayList<>(capabilities.size());
         Set<String> toolNames = new HashSet<>();
+        Set<String> catalogToolNames = new HashSet<>();
         for (Registration registration : capabilities) {
             AgentCapability.Prepared prepared = Objects.requireNonNull(
                     registration.capability().prepare(request), "prepared capability");
             for (AgentCapability.ToolContribution tool : prepared.tools()) {
                 if (!toolNames.add(tool.spec().name())) {
                     throw new IllegalArgumentException("duplicate capability Tool name");
+                }
+            }
+            for (AgentCapability.ToolContribution tool : prepared.catalogTools()) {
+                if (!catalogToolNames.add(tool.spec().name())) {
+                    throw new IllegalArgumentException("duplicate capability catalog Tool name");
                 }
             }
             entries.add(prepared);
@@ -60,12 +66,14 @@ public final class AgentCapabilityCatalog {
      */
     public static final class PreparedCapabilities {
         private final List<AgentCapability.ToolContribution> tools;
+        private final List<AgentCapability.ToolContribution> catalogTools;
         private final String promptFragment;
 
         /** 合并只使用已经冻结的 prepare 值，不执行 Tool 工厂或再次访问领域 owner。 */
         private PreparedCapabilities(List<AgentCapability.Prepared> entries) {
             List<AgentCapability.Prepared> frozen = List.copyOf(entries);
             this.tools = frozen.stream().flatMap(entry -> entry.tools().stream()).toList();
+            this.catalogTools = frozen.stream().flatMap(entry -> entry.catalogTools().stream()).toList();
             this.promptFragment = frozen.stream().map(AgentCapability.Prepared::promptFragment)
                     .filter(value -> !value.isBlank()).reduce((left, right) -> left + "\n" + right).orElse("");
         }
@@ -78,6 +86,11 @@ public final class AgentCapabilityCatalog {
         /** 返回最终 Tool 摘要计算所需的冻结安全描述，不触发实际 Tool 物化。 */
         public List<AgentCapability.ToolContribution> toolContributions() {
             return List.copyOf(tools);
+        }
+
+        /** 返回完整安全定义目录；该列表只用于 digest，不会直接暴露或物化隐藏 Tool。 */
+        public List<AgentCapability.ToolContribution> catalogToolContributions() {
+            return List.copyOf(catalogTools);
         }
 
         /**

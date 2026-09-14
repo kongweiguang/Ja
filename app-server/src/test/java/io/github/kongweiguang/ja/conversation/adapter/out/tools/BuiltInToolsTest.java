@@ -30,6 +30,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -37,7 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 验证极简 Tool 集及 Workspace 外路径语义。 */
+/** 验证基础文件 Tool 集、Workspace 外路径语义和有界发现行为。 */
 class BuiltInToolsTest {
     @TempDir Path temporary;
 
@@ -48,7 +50,7 @@ class BuiltInToolsTest {
         Path outside = Files.createDirectory(temporary.resolve("outside"));
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
-        assertEquals(List.of("edit", "read", "read_attachment", "shell", "workspace_search", "write"),
+        assertEquals(List.of("edit", "find", "grep", "ls", "read", "read_attachment", "shell", "write"),
                 registry.snapshot().stream().map(tool -> tool.spec().name()).toList());
 
         execute(registry, "write", JsonObjects.builder()
@@ -61,22 +63,226 @@ class BuiltInToolsTest {
         assertEquals("two", Files.readString(outside.resolve("note.txt")));
     }
 
-    /** 受控搜索提供规划所需的真实文件定位，但不接受绝对路径或执行命令。 */
+    /** grep 只做字面量内容匹配；省略 filePattern 时默认搜索所有文件。 */
     @Test
-    void searchesWorkspaceFilesWithBoundedResults() throws Exception {
+    void grepsWorkspaceFilesWithLiteralQueryAndDefaultPattern() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("search-workspace"));
-        Files.writeString(workspace.resolve("Plan.java"), "class Plan {\n  // marker\n}\n", StandardCharsets.UTF_8);
+        Path nested = Files.createDirectory(workspace.resolve("nested"));
+        Files.writeString(workspace.resolve("Plan.java"), "class Plan {\n  // a+b marker\n}\n", StandardCharsets.UTF_8);
+        Files.writeString(nested.resolve("notes.md"), "a+b marker in markdown\n", StandardCharsets.UTF_8);
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
 
-        AgentTool.ToolResult result = execute(registry, "workspace_search", JsonObjects.builder()
-                .putText("query", "marker").putText("filePattern", "*.java").build());
+        AgentTool.ToolResult result = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", "a+b").build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
         assertTrue(result.content().contains("Plan.java:2"));
+        assertTrue(result.content().contains("scannedFiles=2"));
+        assertTrue(result.content().contains("nested/notes.md:1"));
+
+        AgentTool.ToolResult javaOnly = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", "a+b").putText("filePattern", "*.java").build());
+        assertTrue(javaOnly.content().contains("Plan.java:2"));
+        assertFalse(javaOnly.content().contains("notes.md:1"));
         assertEquals(AgentTool.WorkspaceMutationMode.NONE,
-                registry.snapshot().stream().filter(tool -> "workspace_search".equals(tool.spec().name()))
+                registry.snapshot().stream().filter(tool -> "grep".equals(tool.spec().name()))
                         .findFirst().orElseThrow().workspaceMutationMode());
+    }
+
+    /** find 只返回相对文件名，不读取正文，因此 malformed UTF-8 和大文件仍可被定位。 */
+    @Test
+    void findsFilesByGlobWithoutReadingContents() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("find-workspace"));
+        Path nested = Files.createDirectory(workspace.resolve("src"));
+        Files.write(nested.resolve("Main.java"), new byte[]{(byte) 0xc3, 0x28});
+        Path large = workspace.resolve("large.jar");
+        try (RandomAccessFile file = new RandomAccessFile(large.toFile(), "rw")) {
+            file.setLength(32L * 1024 * 1024);
+        }
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "find", JsonObjects.builder()
+                .putText("pattern", "*.java").build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertTrue(result.content().contains("src/Main.java"));
+        assertFalse(result.content().contains("c3"));
+        assertTrue(result.content().contains("scannedBytes=0"));
+    }
+
+    /** ls 只列目标目录一层，并保留目录类型；子目录正文/后代不会被物化。 */
+    @Test
+    void listsOnlyOneDirectoryLevel() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("ls-workspace"));
+        Path child = Files.createDirectory(workspace.resolve("child"));
+        Files.writeString(child.resolve("nested.txt"), "nested");
+        Files.writeString(workspace.resolve("root.txt"), "root");
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "ls", JsonObjects.builder().build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertTrue(result.content().contains("child\tdirectory"));
+        assertTrue(result.content().contains("root.txt\tfile"));
+        assertFalse(result.content().contains("nested.txt"));
+        assertTrue(result.content().contains("scannedBytes=0"));
+    }
+
+    /** JSON Schema maxLength 按 Unicode code point 计数，代理项不应把合法 emoji 双重计数。 */
+    @Test
+    void validatesStringLimitsByUnicodeCodePoint() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("unicode-argument-workspace"));
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        String maximumQuery = "😀".repeat(512);
+        AgentTool.ToolResult accepted = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", maximumQuery).build());
+        AgentTool.ToolResult rejected = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", maximumQuery + "😀").build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, accepted.outcome());
+        assertEquals("tool_arguments_invalid", rejected.errorCode());
+        assertTrue(rejected.content().contains("query"));
+    }
+
+    /** grep 跳过非法 UTF-8 候选时必须显式报告 partial，不能把无匹配误报为完整扫描。 */
+    @Test
+    void reportsSkippedUnreadableFilesAsPartial() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("grep-unreadable-workspace"));
+        Files.write(workspace.resolve("malformed.txt"), new byte[]{(byte) 0xc3, 0x28});
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", "not-present").build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertTrue(result.content().contains("skippedEntries=1"));
+        assertTrue(result.content().contains("truncated=true"));
+        assertTrue(result.content().contains("termination=unreadable_file"));
+        assertTrue(result.content().contains("Results are partial"));
+    }
+
+    /** grep 的结果上限必须返回部分事实和明确原因，而不是静默丢弃后续命中。 */
+    @Test
+    void grepHonorsResultBudgetAndReportsTruncation() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("grep-budget-workspace"));
+        Files.writeString(workspace.resolve("markers.txt"), "marker\nmarker\nmarker\n");
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", "marker").putNumber("maxResults", 1).build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertEquals(1, result.content().lines().filter(line -> line.contains("markers.txt:")).count());
+        assertTrue(result.content().contains("truncated=true"));
+        assertTrue(result.content().contains("termination=result_limit"));
+    }
+
+    /** 空 query、非法 Glob 和普通文件 path 都在执行边界返回字段化、可纠正错误。 */
+    @Test
+    void rejectsInvalidDiscoveryArgumentsWithSpecificConstraints() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("discovery-arguments-workspace"));
+        Files.writeString(workspace.resolve("one.txt"), "one");
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult emptyQuery = execute(registry, "grep", JsonObjects.builder()
+                .putText("query", "").build());
+        AgentTool.ToolResult badGlob = execute(registry, "find", JsonObjects.builder()
+                .putText("pattern", "[").build());
+        AgentTool.ToolResult filePath = execute(registry, "ls", JsonObjects.builder()
+                .putText("path", "one.txt").build());
+
+        assertEquals("tool_arguments_invalid", emptyQuery.errorCode());
+        assertTrue(emptyQuery.content().contains("query"));
+        assertTrue(emptyQuery.content().contains("find"));
+        assertEquals("tool_arguments_invalid", badGlob.errorCode());
+        assertTrue(badGlob.content().contains("pattern"));
+        assertTrue(badGlob.content().contains("glob"));
+        assertEquals("path_not_directory", filePath.errorCode());
+    }
+
+    /** 已取消调用必须在 WorkspaceBoundary 和文件 IO 前结束，不产生任何结果正文。 */
+    @Test
+    void discoveryHonorsCancellationBeforeFilesystemAccess() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("discovery-cancel-workspace"));
+        Files.writeString(workspace.resolve("one.txt"), "one");
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "find", JsonObjects.builder()
+                .putText("pattern", "*.txt").build(), cancelled(), context());
+
+        assertEquals(ToolOutcome.CANCELLED, result.outcome());
+        assertEquals("tool_cancelled", result.errorCode());
+    }
+
+    /** 遍历中的取消必须在 collect 阶段生效，而不是等到首个结果投影后才发现。 */
+    @Test
+    void discoveryHonorsCancellationDuringDirectoryWalk() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("discovery-walk-cancel-workspace"));
+        for (int index = 0; index < 16; index++) {
+            Path directory = Files.createDirectory(workspace.resolve("dir-" + index));
+            Files.writeString(directory.resolve("file.txt"), "marker-" + index);
+        }
+        CountingCancellationToken token = cancelAfterChecks(8);
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "find", JsonObjects.builder()
+                .putText("pattern", "*.txt").putNumber("maxResults", 1).build(), token, context());
+
+        assertEquals(ToolOutcome.CANCELLED, result.outcome());
+        assertEquals("tool_cancelled", result.errorCode());
+        assertTrue(token.checks() > 8, "cancellation must be observed after entering directory traversal");
+    }
+
+    /** 过期 Deadline 返回 bounded 截断摘要，模型不会把未执行扫描误判成空目录。 */
+    @Test
+    void discoveryHonorsDeadlineWithExplicitTruncation() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("discovery-deadline-workspace"));
+        Files.writeString(workspace.resolve("one.txt"), "one");
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+        AgentTool.ExecutionContext expired = context(Instant.now().minusMillis(1));
+
+        AgentTool.ToolResult result = execute(registry, "find", JsonObjects.builder()
+                .putText("pattern", "*.txt").build(), CancellationToken.none(), expired);
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertTrue(result.content().contains("truncated=true"));
+        assertTrue(result.content().contains("termination=deadline"));
+        assertFalse(result.content().contains("one.txt\n"));
+    }
+
+    /** Workspace 内的无关 symlink 被跳过并记录，显式 symlink path 仍由 Boundary 拒绝。 */
+    @Test
+    void discoverySkipsUnrelatedSymbolicLinks() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("discovery-link-workspace"));
+        Path outside = Files.createDirectory(temporary.resolve("discovery-link-outside"));
+        Files.writeString(workspace.resolve("README.md"), "readme");
+        Path link = workspace.resolve("node_modules-link");
+        try {
+            Files.createSymbolicLink(link, outside);
+        } catch (IOException | UnsupportedOperationException unavailable) {
+            Assumptions.assumeTrue(false, "当前文件系统不能创建 symlink: "
+                    + unavailable.getClass().getSimpleName());
+        }
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "find", JsonObjects.builder()
+                .putText("pattern", "README.md").build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
+        assertTrue(result.content().contains("README.md"));
+        assertTrue(result.content().contains("skippedEntries=1"));
     }
 
     /**
@@ -348,7 +554,7 @@ class BuiltInToolsTest {
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(),
                 ShellCapability.unavailable(ShellProfile.OperatingSystem.WINDOWS, "windows"), promptSession(),
                 unusedAttachments());
-        assertEquals(List.of("edit", "read", "read_attachment", "workspace_search", "write"),
+        assertEquals(List.of("edit", "find", "grep", "ls", "read", "read_attachment", "write"),
                 registry.snapshot().stream().map(tool -> tool.spec().name()).toList());
     }
 
@@ -372,8 +578,14 @@ class BuiltInToolsTest {
 
     /** 通过真实 AgentTool 端口执行，避免测试私有实现细节。 */
     private AgentTool.ToolResult execute(ToolRegistry registry, String name, JsonObject arguments) {
+        return execute(registry, name, arguments, CancellationToken.none(), context());
+    }
+
+    /** 为取消与 Deadline 回归注入调用边界，仍通过真实 AgentTool 公共入口执行。 */
+    private AgentTool.ToolResult execute(ToolRegistry registry, String name, JsonObject arguments,
+                                         CancellationToken token, AgentTool.ExecutionContext executionContext) {
         AgentTool.Invocation invocation = invocation(name, arguments);
-        return registry.require(invocation).execute(invocation, context(), CancellationToken.none())
+        return registry.require(invocation).execute(invocation, executionContext, token)
                 .toCompletableFuture().join();
     }
 
@@ -407,8 +619,75 @@ class BuiltInToolsTest {
 
     /** Workspace 仅作为相对路径基准；权限值不改变文件 Tool 路径解析。 */
     private AgentTool.ExecutionContext context() {
+        return context(Instant.now().plusSeconds(30));
+    }
+
+    /** 构造带指定 Deadline 的合法执行上下文，测试只改变时间边界而不改变身份。 */
+    private AgentTool.ExecutionContext context(Instant deadline) {
         return new AgentTool.ExecutionContext("thr_fixture", "turn_fixture", temporary.toAbsolutePath(),
-                AccessMode.FULL_ACCESS, "cfg_fixture", Instant.now().plusSeconds(30), "ws_fixture");
+                AccessMode.FULL_ACCESS, "cfg_fixture", deadline, "ws_fixture");
+    }
+
+    /** 提供在首次检查即取消的令牌，验证发现 Tool 不会先构造或遍历文件快照。 */
+    private static CancellationToken cancelled() {
+        return new CancellationToken() {
+            /** 令牌始终报告已取消，覆盖 ToolSupport 的首个取消边界。 */
+            @Override
+            public boolean isCancellationRequested() {
+                return true;
+            }
+
+            /** 返回固定测试原因，避免把测试路径送入 Tool 结果。 */
+            @Override
+            public java.util.Optional<String> reason() {
+                return java.util.Optional.of("test");
+            }
+
+            /** 测试令牌不保留回调，避免临时目录测试结束后残留引用。 */
+            @Override
+            public Registration onCancellation(Runnable callback) {
+                return Registration.noop();
+            }
+        };
+    }
+
+    /** 返回在固定检查次数后取消的令牌，避免遍历取消测试依赖 sleep 或文件系统竞态。 */
+    private static CountingCancellationToken cancelAfterChecks(int checksBeforeCancellation) {
+        return new CountingCancellationToken(checksBeforeCancellation);
+    }
+
+    /** 计数令牌让回归测试确定性覆盖 collect 的逐项取消检查。 */
+    private static final class CountingCancellationToken implements CancellationToken {
+        private final int checksBeforeCancellation;
+        private final AtomicInteger checks = new AtomicInteger();
+
+        /** 冻结取消阈值，避免测试执行中改变取消时序。 */
+        private CountingCancellationToken(int checksBeforeCancellation) {
+            this.checksBeforeCancellation = checksBeforeCancellation;
+        }
+
+        /** 在第 N+1 次查询时发布取消，使前置检查可以完成并进入真实遍历。 */
+        @Override
+        public boolean isCancellationRequested() {
+            return checks.incrementAndGet() > checksBeforeCancellation;
+        }
+
+        /** 返回固定原因，不把测试夹具路径带入 Tool 结果。 */
+        @Override
+        public java.util.Optional<String> reason() {
+            return Optional.of("test_walk_cancelled");
+        }
+
+        /** 本测试不注册长期回调，避免把临时令牌生命周期延伸到用例结束之后。 */
+        @Override
+        public Registration onCancellation(Runnable callback) {
+            return Registration.noop();
+        }
+
+        /** 暴露检查总数，验证取消发生在进入遍历之后。 */
+        private int checks() {
+            return checks.get();
+        }
     }
 
     /** Shell 本测试不执行，仅需冻结一份合法 Profile 供注册表创建。 */

@@ -32,10 +32,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.PathMatcher;
 import java.util.Arrays;
-import java.time.Instant;
-import java.util.Comparator;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
@@ -71,115 +68,14 @@ public final class BuiltInTools {
         List<AgentTool> tools = new ArrayList<>();
         tools.add(new ReadTool(root, skillCatalog, skillCatalogView, promptSession));
         tools.add(new ReadAttachmentTool(attachments));
-        tools.add(new WorkspaceSearchTool(root));
+        tools.add(WorkspaceFileTools.grep(root));
+        tools.add(WorkspaceFileTools.find(root));
+        tools.add(WorkspaceFileTools.ls(root));
         Objects.requireNonNull(shellCapability, "shellCapability").profile()
                 .ifPresent(profile -> tools.add(new ShellTool(profile)));
         tools.add(new EditTool(root, writer));
         tools.add(new WriteTool(root, writer));
         return new ToolRegistry(tools);
-    }
-
-    /**
-     * 规划阶段的结构化文件检索适配器。它只遍历物理工作区、拒绝链接逃逸并施加文件数、字节、
-     * 结果数和截止时间上限，使关闭 Shell 后仍能完成真实仓库调研，同时不提供任意命令执行通道。
-     */
-    private static final class WorkspaceSearchTool extends ToolSupport {
-        private static final int MAX_FILES = 10_000;
-        private static final long MAX_BYTES = 16L * 1024 * 1024;
-
-        private final Path workspaceRoot;
-
-        /** 搜索只绑定工作区根，不把用户提交的绝对路径或脚本交给文件系统。 */
-        private WorkspaceSearchTool(Path workspaceRoot) {
-            super(new ToolSpec("workspace_search", "Search UTF-8 workspace files without executing commands",
-                    objectSchema(Map.of(
-                            "query", property("string", "Literal text to find."),
-                            "path", property("string", "Workspace-relative directory; defaults to ."),
-                            "filePattern", property("string", "Glob matched against file names; defaults to *"),
-                            "maxResults", property("integer", "Maximum matching lines; defaults to 50.")),
-                            List.of("query"))));
-            this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
-        }
-
-        /** 搜索不改变工作区或外部系统。 */
-        @Override
-        public ToolSideEffect sideEffect() {
-            return ToolSideEffect.READ_ONLY;
-        }
-
-        /** 搜索只读取受控文件，不产生工作区收据。 */
-        @Override
-        public WorkspaceMutationMode workspaceMutationMode() {
-            return WorkspaceMutationMode.NONE;
-        }
-
-        /** 在物理工作区内按稳定路径顺序搜索，达到任一预算即返回明确的 truncated 事实。 */
-        @Override
-        ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
-                throws IOException {
-            String query = string(invocation, "query", 512);
-            String rawPath = optionalString(invocation, "path", 4_096);
-            String rawPattern = optionalString(invocation, "filePattern", 256);
-            int maxResults = integer(invocation, "maxResults", 50, 1, 200);
-            String relativePath = rawPath == null || rawPath.isBlank() ? "." : rawPath;
-            String filePattern = rawPattern == null || rawPattern.isBlank() ? "*" : rawPattern;
-            WorkspaceBoundary boundary = new WorkspaceBoundary(workspaceRoot);
-            Path start = boundary.existing(relativePath);
-            PathMatcher matcher = workspaceRoot.getFileSystem().getPathMatcher("glob:" + filePattern);
-            WorkspaceBoundary.WalkResult walked = boundary.walkExisting(start, 32, MAX_FILES);
-            List<String> matches = new ArrayList<>();
-            long scannedBytes = 0L;
-            int scannedFiles = 0;
-            boolean truncated = walked.truncated();
-            for (Path path : walked.entries().stream()
-                    .filter(item -> Files.isRegularFile(item, LinkOption.NOFOLLOW_LINKS))
-                    .sorted(Comparator.comparing(item -> item.toString().toLowerCase(java.util.Locale.ROOT)))
-                    .toList()) {
-                token.throwIfCancellationRequested();
-                if (!Instant.now().isBefore(context.deadline())) {
-                    truncated = true;
-                    break;
-                }
-                if (!matcher.matches(path.getFileName())) continue;
-                BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class,
-                        LinkOption.NOFOLLOW_LINKS);
-                if (attributes.size() > MAX_TEXT_BYTES || scannedBytes + attributes.size() > MAX_BYTES) {
-                    truncated = true;
-                    continue;
-                }
-                scannedFiles++;
-                scannedBytes += attributes.size();
-                String content;
-                try {
-                    boundary.revalidateExisting(path);
-                    content = readUtf8File(path, token);
-                } catch (IOException unreadable) {
-                    continue;
-                }
-                String[] lines = content.split("\\R", -1);
-                for (int index = 0; index < lines.length; index++) {
-                    int match = lines[index].indexOf(query);
-                    if (match < 0) continue;
-                    String snippet = lines[index].length() > 400
-                            ? lines[index].substring(Math.max(0, match - 160),
-                            Math.min(lines[index].length(), match + query.length() + 160)) : lines[index];
-                    matches.add(boundary.relative(path) + ":" + (index + 1) + ": " + snippet);
-                    if (matches.size() == maxResults) {
-                        truncated = true;
-                        break;
-                    }
-                }
-                if (matches.size() == maxResults) break;
-            }
-            String content = String.join("\n", matches);
-            JsonObject metadata = JsonObjects.builder()
-                    .putNumber("resultCount", matches.size())
-                    .putNumber("scannedFiles", scannedFiles)
-                    .putNumber("scannedBytes", scannedBytes)
-                    .putBoolean("truncated", truncated)
-                    .build();
-            return new ToolResult(ToolOutcome.SUCCEEDED, content, Optional.of(metadata), null);
-        }
     }
 
     /** 从当前执行上下文可见的受管附件读取有界文本或 Base64 字节。 */
@@ -190,9 +86,10 @@ public final class BuiltInTools {
         private ReadAttachmentTool(ManagedAttachmentReader attachments) {
             super(new ToolSpec("read_attachment", "Read a bounded range from an attached file",
                     objectSchema(Map.of(
-                            "attachmentId", property("string", "Opaque attachment identity."),
-                            "offsetBytes", property("integer", "Zero-based byte offset; defaults to 0."),
-                            "maxBytes", property("integer", "Maximum bytes from 4 to 65536.")),
+                            "attachmentId", requiredStringProperty("Opaque attachment identity.", 128),
+                            "offsetBytes", integerProperty("Zero-based byte offset; defaults to 0.", 0,
+                                    100 * 1024 * 1024),
+                            "maxBytes", integerProperty("Maximum bytes from 4 to 65536.", 4, 64 * 1024)),
                             List.of("attachmentId"))));
             this.attachments = Objects.requireNonNull(attachments, "attachments");
         }
@@ -245,9 +142,11 @@ public final class BuiltInTools {
                           AgentPromptSession promptSession) {
             super(new ToolSpec("read", "Read a UTF-8 file or skill:// resource",
                     objectSchema(Map.of(
-                            "path", property("string", "Relative, absolute, parent, or skill:// path."),
-                            "offset", property("integer", "One-based first line; defaults to 1."),
-                            "limit", property("integer", "Maximum lines; defaults to 2000.")), List.of("path"))));
+                            "path", requiredStringProperty("Relative, absolute, parent, or skill:// path.", 8_192),
+                            "offset", integerProperty("One-based first line; defaults to 1.", 1,
+                                    Integer.MAX_VALUE),
+                            "limit", integerProperty("Maximum lines; defaults to 2000.", 1, 100_000)),
+                            List.of("path"))));
             this.workspaceRoot = workspaceRoot;
             this.skills = Objects.requireNonNull(skills, "skills");
             this.catalog = Objects.requireNonNull(catalog, "catalog");
@@ -300,7 +199,7 @@ public final class BuiltInTools {
                         .build();
             } else {
                 Path path = resolve(workspaceRoot, rawPath);
-                content = readUtf8File(path, token);
+                content = BuiltInTools.readUtf8File(path, token);
                 metadata = JsonObjects.builder().putText("path", path.toString()).build();
             }
             LineSlice slice = slice(content, offset, limit);
@@ -325,9 +224,10 @@ public final class BuiltInTools {
         private EditTool(Path workspaceRoot, MutationWriter mutationWriter) {
             super(new ToolSpec("edit", "Replace one unique text occurrence in a UTF-8 file",
                     objectSchema(Map.of(
-                            "path", property("string", "Relative, absolute, or parent path."),
-                            "oldText", property("string", "Text that must occur exactly once."),
-                            "newText", property("string", "Replacement text.")),
+                            "path", requiredStringProperty("Relative, absolute, or parent path.", 8_192),
+                            "oldText", requiredStringProperty("Text that must occur exactly once.",
+                                    MAX_TEXT_CHARACTERS),
+                            "newText", optionalStringProperty("Replacement text.", MAX_TEXT_CHARACTERS)),
                             List.of("path", "oldText", "newText"))));
             this.workspaceRoot = workspaceRoot;
             this.boundary = new WorkspaceBoundary(workspaceRoot);
@@ -349,7 +249,7 @@ public final class BuiltInTools {
             Path path = target.path();
             String oldText = string(invocation, "oldText", MAX_TEXT_CHARACTERS);
             String newText = optionalString(invocation, "newText", MAX_TEXT_CHARACTERS);
-            if (newText == null) throw new IllegalArgumentException("invalid argument: newText");
+            if (newText == null) throw argument("newText", "must be a string; empty text is allowed");
             String current = Files.readString(path, StandardCharsets.UTF_8);
             int first = current.indexOf(oldText);
             if (first < 0) throw new IOException("old_text_not_found");
@@ -373,8 +273,9 @@ public final class BuiltInTools {
         private WriteTool(Path workspaceRoot, MutationWriter mutationWriter) {
             super(new ToolSpec("write", "Atomically write a complete UTF-8 file",
                     objectSchema(Map.of(
-                            "path", property("string", "Relative, absolute, or parent path."),
-                            "content", property("string", "Complete UTF-8 file content.")),
+                            "path", requiredStringProperty("Relative, absolute, or parent path.", 8_192),
+                            "content", optionalStringProperty("Complete UTF-8 file content.",
+                                    MAX_TEXT_CHARACTERS)),
                             List.of("path", "content"))));
             this.workspaceRoot = workspaceRoot;
             this.boundary = new WorkspaceBoundary(workspaceRoot);
@@ -395,10 +296,10 @@ public final class BuiltInTools {
                     string(invocation, "path", 8_192), false);
             Path path = target.path();
             String content = optionalString(invocation, "content", MAX_TEXT_CHARACTERS);
-            if (content == null) throw new IllegalArgumentException("invalid argument: content");
+            if (content == null) throw argument("content", "must be a string; empty text is allowed");
             token.throwIfCancellationRequested();
             boolean beforeExists = Files.exists(path);
-            String before = beforeExists ? readUtf8File(path, token) : "";
+            String before = beforeExists ? BuiltInTools.readUtf8File(path, token) : "";
             writeObserved(target, content, mutationWriter);
             AgentTool.MutationReceipt receipt = target.receipt(beforeExists, before, content);
             return new ToolResult(ToolOutcome.SUCCEEDED, "File written successfully.",
@@ -491,7 +392,7 @@ public final class BuiltInTools {
         } catch (CharacterCodingException invalidEncoding) {
             throw ToolSupport.failure(ToolSupport.Failure.FILE_NOT_UTF8);
         }
-        if (content.length() > MAX_TEXT_CHARACTERS) {
+        if (content.codePointCount(0, content.length()) > MAX_TEXT_CHARACTERS) {
             throw ToolSupport.failure(ToolSupport.Failure.FILE_TOO_LARGE);
         }
         if (content.indexOf('\0') >= 0) throw ToolSupport.failure(ToolSupport.Failure.FILE_NOT_TEXT);

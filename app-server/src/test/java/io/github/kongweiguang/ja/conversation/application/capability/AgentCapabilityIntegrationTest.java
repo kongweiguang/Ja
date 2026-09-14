@@ -211,7 +211,7 @@ final class AgentCapabilityIntegrationTest extends PersistenceTestSupport {
             ToolContribution contribution = new ToolContribution(prototype.spec(), prototype.sideEffect(),
                     prototype.workspaceMutationMode(), prototype.bindingDescriptor(),
                     ignored -> new ReadFixtureTool(fixture));
-            return new Prepared(CAPABILITY_PROMPT, List.of(contribution));
+            return new Prepared(CAPABILITY_PROMPT, List.of(contribution), List.of(contribution));
         }
     }
 

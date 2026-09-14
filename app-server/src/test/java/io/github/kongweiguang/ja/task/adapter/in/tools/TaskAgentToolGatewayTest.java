@@ -13,6 +13,7 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.out.AgentCapability;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
+import io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
@@ -59,7 +60,7 @@ final class TaskAgentToolGatewayTest {
         return new TaskAgentToolGateway(threadId -> java.util.Optional.of(policy));
     }
 
-    /** Provider 可见目录必须保持七个稳定名称，避免 schema 漂移产生不可恢复的持久 Tool batch。 */
+    /** Root 没有实际子任务时只暴露委派准入与只读观察入口，不把通信能力伪装成默认工具。 */
     @Test
     void exposesExactNativeToolCatalog() {
         TaskAgentToolGateway gateway = gateway();
@@ -67,22 +68,45 @@ final class TaskAgentToolGatewayTest {
         List<String> names = tools(gateway, APPROVAL_PREFERENCES).stream()
                 .map(tool -> tool.spec().name()).toList();
 
-        assertEquals(List.of("spawn_agent", "send_message", "continue_agent",
-                "wait_agent", "list_agents", "list_threads", "cancel_agent"), names);
+        assertEquals(List.of("spawn_agent", "wait_agent", "list_agents"), names);
     }
 
-    /** 禁用只移除 spawn_agent；已有会话仍可通信、等待、枚举和取消子任务。 */
+    /** 禁用只移除创建入口；已有委派子任务仍保留通信、等待、枚举、续跑与取消能力。 */
     @Test
     void disabledPolicyKeepsExistingTaskCommunicationTools() {
         TaskAgentToolGateway gateway = gateway(new SubagentPolicy(false, null, null, null));
+        RecordingTasks tasks = new RecordingTasks();
+        tasks.delegatedAgents = true;
+        gateway.bind(tasks);
 
         List<String> names = tools(gateway, APPROVAL_PREFERENCES).stream()
                 .map(tool -> tool.spec().name()).toList();
 
-        assertTrue(!names.contains("spawn_agent"));
-        assertEquals(List.of("send_message", "continue_agent", "wait_agent", "list_agents", "list_threads",
-                "cancel_agent"),
-                names);
+        assertEquals(List.of("send_message", "continue_agent", "wait_agent", "list_agents", "cancel_agent"), names);
+    }
+
+    /** 侧聊显式拥有跨会话入口；它仍可按自身策略委派，但不会获得全局 Thread 发现以外的控制权。 */
+    @Test
+    void sideTaskGetsCrossSessionDiscoveryAndOwnDelegationTools() {
+        TaskAgentToolGateway gateway = gateway();
+
+        List<String> names = tools(gateway, APPROVAL_PREFERENCES,
+                TaskCapabilityCeilingPort.Kind.SIDE_TASK).stream()
+                .map(tool -> tool.spec().name()).toList();
+
+        assertEquals(List.of("spawn_agent", "send_message", "wait_agent", "list_agents", "list_threads"), names);
+    }
+
+    /** Subagent 可向外投递消息并按自身策略创建后代，但全局 Thread 发现只属于独立侧聊。 */
+    @Test
+    void subagentGetsCommunicationWithoutGlobalThreadDiscovery() {
+        TaskAgentToolGateway gateway = gateway();
+
+        List<String> names = tools(gateway, APPROVAL_PREFERENCES,
+                TaskCapabilityCeilingPort.Kind.SUBAGENT).stream()
+                .map(tool -> tool.spec().name()).toList();
+
+        assertEquals(List.of("spawn_agent", "send_message", "wait_agent", "list_agents"), names);
     }
 
     /** Thread discovery owner 与 Task owner 一样只允许同一实例幂等重入，防止请求中途切换数据库快照。 */
@@ -104,7 +128,8 @@ final class TaskAgentToolGatewayTest {
         TaskAgentToolGateway gateway = gateway();
         AtomicReference<ThreadDiscovery.Query> query = new AtomicReference<>();
         gateway.bindThreads(discoveryOwner(query));
-        AgentTool tool = tool(gateway, "list_threads");
+        AgentTool tool = tool(gateway, "list_threads", APPROVAL_PREFERENCES,
+                TaskCapabilityCeilingPort.Kind.SIDE_TASK);
         AgentTool.Invocation invocation = new AgentTool.Invocation("call_list", "list_threads",
                 JsonObjects.builder().putText("query", "review")
                         .putText("cursor", "opaque_cursor")
@@ -136,6 +161,7 @@ final class TaskAgentToolGatewayTest {
     void continuesAgentThroughBoundRequesterAwarePort() {
         TaskAgentToolGateway gateway = gateway();
         RecordingTasks tasks = new RecordingTasks();
+        tasks.delegatedAgents = true;
         gateway.bind(tasks);
         AgentTool tool = tool(gateway, "continue_agent");
         AgentTool.Invocation invocation = new AgentTool.Invocation("call_continue", "continue_agent",
@@ -159,6 +185,7 @@ final class TaskAgentToolGatewayTest {
     void listsOnlyDelegatedSubagentSubtree() {
         TaskAgentToolGateway gateway = gateway();
         RecordingTasks tasks = new RecordingTasks();
+        tasks.delegatedAgents = true;
         tasks.tree = List.of(
                 task("thr_agent_a", "thr_parent", TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED),
                 task("thr_agent_a_child", "thr_agent_a", TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED),
@@ -198,6 +225,7 @@ final class TaskAgentToolGatewayTest {
     void sendsQueueOnlyMessageWithFrozenCausality() {
         TaskAgentToolGateway gateway = gateway();
         RecordingTasks tasks = new RecordingTasks();
+        tasks.delegatedAgents = true;
         gateway.bind(tasks);
         AgentTool tool = tool(gateway, "send_message");
         AgentTool.Invocation invocation = new AgentTool.Invocation("call_send", "send_message",
@@ -220,6 +248,7 @@ final class TaskAgentToolGatewayTest {
     void rejectsExecutionFromAnotherTurn() {
         TaskAgentToolGateway gateway = gateway();
         RecordingTasks tasks = new RecordingTasks();
+        tasks.delegatedAgents = true;
         gateway.bind(tasks);
         AgentTool tool = tool(gateway, "send_message");
         AgentTool.Invocation invocation = new AgentTool.Invocation("call_send", "send_message",
@@ -329,6 +358,18 @@ final class TaskAgentToolGatewayTest {
         assertEquals(TaskRepositoryException.Code.INVALID_STATE, sideTask.code());
     }
 
+    /** 只沿 SUBAGENT/ATTACHED 链向上归属；跨过独立 Side Task 后 Root 不得取得其后代管理入口。 */
+    @Test
+    void delegatedAgentDetectionStopsAtIndependentSideTask() {
+        RecordingTasks tasks = new RecordingTasks();
+        tasks.tree = List.of(
+                task("thr_side", "thr_parent", TaskModels.Kind.SIDE_TASK, TaskModels.Lifecycle.INDEPENDENT),
+                task("thr_child", "thr_side", TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED));
+
+        assertTrue(tasks.hasDelegatedAgents("thr_side"));
+        assertTrue(!tasks.hasDelegatedAgents("thr_parent"));
+    }
+
     /** 按名称取唯一 Tool，使测试同时证明目录内没有重复名称。 */
     private static AgentTool tool(TaskAgentToolGateway gateway, String name) {
         return tool(gateway, name, APPROVAL_PREFERENCES);
@@ -337,7 +378,14 @@ final class TaskAgentToolGatewayTest {
     /** 按指定父偏好绑定 Tool，供权限收窄测试保持执行上下文一致。 */
     private static AgentTool tool(TaskAgentToolGateway gateway, String name,
                                   ThreadPreferences preferences) {
-        List<AgentTool> matches = tools(gateway, preferences).stream()
+        return tool(gateway, name, preferences, null);
+    }
+
+    /** 按真实 Task 身份选择目录，覆盖 Root、Side Task 与 Subagent 的公开边界。 */
+    private static AgentTool tool(TaskAgentToolGateway gateway, String name,
+                                  ThreadPreferences preferences,
+                                  TaskCapabilityCeilingPort.Kind taskKind) {
+        List<AgentTool> matches = tools(gateway, preferences, taskKind).stream()
                 .filter(candidate -> candidate.spec().name().equals(name)).toList();
         assertEquals(1, matches.size());
         return matches.getFirst();
@@ -357,16 +405,29 @@ final class TaskAgentToolGatewayTest {
 
     /** 通过标准能力端口物化请求级 Tool，测试不依赖 Gateway 私有绑定表示。 */
     private static List<AgentTool> tools(TaskAgentToolGateway gateway, ThreadPreferences preferences) {
-        AgentCapability.Prepared prepared = gateway.prepare(request(preferences));
+        return tools(gateway, preferences, null);
+    }
+
+    /** 通过标准能力端口物化指定 Task 身份的请求级 Tool。 */
+    private static List<AgentTool> tools(TaskAgentToolGateway gateway, ThreadPreferences preferences,
+                                         TaskCapabilityCeilingPort.Kind taskKind) {
+        AgentCapability.Prepared prepared = gateway.prepare(request(preferences, taskKind));
         return prepared.tools().stream().map(contribution -> contribution.binder().apply(catalogIdentity()))
                 .toList();
     }
 
     /** 请求冻结父身份、权限和 deadline，Task capability 不反向读取 runtime 全局状态。 */
     private static AgentCapability.Request request(ThreadPreferences preferences) {
+        return request(preferences, null);
+    }
+
+    /** 请求显式携带由 Task lineage 解析出的 Kind，避免测试通过自然语言模拟通信授权。 */
+    private static AgentCapability.Request request(ThreadPreferences preferences,
+                                                   TaskCapabilityCeilingPort.Kind taskKind) {
         return new AgentCapability.Request("thr_parent", "turn_parent",
                 Path.of("C:\\ja-task-tools").toAbsolutePath(), "ws_test", preferences,
-                "cfg_test", true, DEADLINE, TurnOrigin.USER);
+                "cfg_test", true, DEADLINE, TurnOrigin.USER,
+                java.util.Optional.ofNullable(taskKind));
     }
 
     /** 统一最终目录身份，Spawn ceiling 与测试断言共享相同安全摘要。 */
@@ -408,7 +469,14 @@ final class TaskAgentToolGatewayTest {
         private final AtomicReference<SpawnCommand> spawn = new AtomicReference<>();
         private final AtomicReference<FollowUpCommand> continuation = new AtomicReference<>();
         private final AtomicReference<String> continuationRequester = new AtomicReference<>();
+        private boolean delegatedAgents;
         private List<TaskModels.Summary> tree;
+
+        /** 目录测试显式决定是否存在请求者拥有的子任务，避免从调用文本推导控制范围。 */
+        @Override public boolean hasDelegatedAgents(String requesterThreadId) {
+            if (delegatedAgents || tree == null) return delegatedAgents;
+            return TaskUseCase.super.hasDelegatedAgents(requesterThreadId);
+        }
 
         /** 测试不覆盖用户侧边任务创建。 */
         @Override public TaskModels.Summary createSideTask(CreateCommand command) { throw unsupported(); }

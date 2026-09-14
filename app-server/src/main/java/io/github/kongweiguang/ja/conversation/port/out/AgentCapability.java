@@ -62,19 +62,49 @@ public interface AgentCapability {
     /**
      * prepare 的不可变结果同时持有说明与 Tool 安全描述，Schema 不再与真实执行实现分属两套目录。
      */
-    record Prepared(String promptFragment, List<ToolContribution> tools) {
-        /** 防御性复制请求级贡献，空说明表示该能力当前不需要模型指令。 */
+    record Prepared(String promptFragment, List<ToolContribution> tools,
+                    List<ToolContribution> catalogTools) {
+        /** 防御性复制请求级贡献，并验证暴露目录是完整安全定义目录的子集。 */
         public Prepared {
             promptFragment = promptFragment == null ? "" : promptFragment;
             if (promptFragment.length() > 65_536 || promptFragment.chars().anyMatch(ch -> ch == 0)) {
                 throw new IllegalArgumentException("invalid capability prompt fragment");
             }
             tools = List.copyOf(Objects.requireNonNull(tools, "tools"));
+            catalogTools = List.copyOf(Objects.requireNonNull(catalogTools, "catalogTools"));
+            validateToolDefinitions(tools, catalogTools);
         }
 
-        /** 无说明、无 Tool 的稳定空贡献避免具体能力自行返回 null。 */
+        /** 无说明、无 Tool 及无安全定义的稳定空贡献避免具体能力自行返回 null。 */
         public static Prepared empty() {
-            return new Prepared("", List.of());
+            return new Prepared("", List.of(), List.of());
+        }
+
+        /** 校验模型可见 Tool 没有脱离完整安全定义目录或改变其静态安全属性。 */
+        private static void validateToolDefinitions(List<ToolContribution> exposed,
+                                                    List<ToolContribution> definitions) {
+            java.util.Map<String, ToolContribution> byName = new java.util.HashMap<>();
+            for (ToolContribution definition : definitions) {
+                if (byName.put(definition.spec().name(), definition) != null) {
+                    throw new IllegalArgumentException("duplicate capability catalog Tool name");
+                }
+            }
+            for (ToolContribution tool : exposed) {
+                ToolContribution definition = byName.get(tool.spec().name());
+                if (definition == null || !sameSecurityDefinition(tool, definition)) {
+                    throw new IllegalArgumentException("exposed Tool is missing from capability catalog");
+                }
+            }
+        }
+
+        /** 比较不随请求绑定变化的安全字段，确保完整 digest 不会漏掉暴露 Tool 的真实能力。 */
+        private static boolean sameSecurityDefinition(ToolContribution left, ToolContribution right) {
+            return left.spec().equals(right.spec())
+                    && left.sideEffect() == right.sideEffect()
+                    && left.workspaceMutationMode() == right.workspaceMutationMode()
+                    && left.bindingDescriptor().equals(right.bindingDescriptor())
+                    && left.planAccess() == right.planAccess()
+                    && left.approvalRequirement() == right.approvalRequirement();
         }
     }
 

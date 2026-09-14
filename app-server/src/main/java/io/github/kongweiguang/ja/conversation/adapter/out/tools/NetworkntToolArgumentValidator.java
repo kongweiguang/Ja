@@ -69,24 +69,89 @@ public final class NetworkntToolArgumentValidator {
     }
 
     /**
-     * 只暴露首个失败的 Schema 字段、实例位置和约束类型；绝不使用第三方 message 或 instanceNode，
-     * 因为二者可能把命令、路径、正文或凭据值带回模型上下文。
+     * 只暴露首个失败的 Schema 字段、实例位置、约束类型和经过数值白名单过滤的约束值；绝不使用
+     * 第三方 message 或 instanceNode，因为二者可能把命令、路径、正文或凭据值带回模型上下文。
      */
     private static String safeDiagnostic(com.networknt.schema.Error error) {
         String location = safeLocation(error.getInstanceLocation() == null
                 ? null : error.getInstanceLocation().toString());
         String property = safeProperty(error.getProperty());
+        if (property == null) property = safeLocationProperty(location);
         String keyword = safeKeyword(error.getKeyword());
         return switch (keyword) {
-            case "required" -> property == null
+            case "required" -> safeProperty(error.getProperty()) == null
                     ? "a required Tool field is missing at " + location
-                    : "required Tool field '" + property + "' is missing at " + location;
+                    : "required Tool field '" + safeProperty(error.getProperty()) + "' is missing at " + location;
             case "type" -> "Tool field at " + location + " has the wrong JSON type";
             case "additionalProperties" -> property == null
                     ? "Tool arguments contain an unexpected field at " + location
                     : "Tool field '" + property + "' is not allowed at " + location;
+            case "minLength" -> constraintDiagnostic(property, location, keyword,
+                    "requires a minimum length of " + numericArgument(error, "the schema-defined minimum"));
+            case "maxLength" -> constraintDiagnostic(property, location, keyword,
+                    "requires a maximum length of " + numericArgument(error, "the schema-defined maximum"));
+            case "minItems" -> constraintDiagnostic(property, location, keyword,
+                    "requires at least " + numericArgument(error, "the schema-defined minimum") + " item(s)");
+            case "maxItems" -> constraintDiagnostic(property, location, keyword,
+                    "allows at most " + numericArgument(error, "the schema-defined maximum") + " item(s)");
+            case "minProperties" -> constraintDiagnostic(property, location, keyword,
+                    "requires at least " + numericArgument(error, "the schema-defined minimum")
+                            + " properties");
+            case "maxProperties" -> constraintDiagnostic(property, location, keyword,
+                    "allows at most " + numericArgument(error, "the schema-defined maximum")
+                            + " properties");
+            case "minimum" -> constraintDiagnostic(property, location, keyword,
+                    "must be at least " + numericArgument(error, "the schema-defined minimum"));
+            case "exclusiveMinimum" -> constraintDiagnostic(property, location, keyword,
+                    "must be greater than " + numericArgument(error, "the schema-defined minimum"));
+            case "maximum" -> constraintDiagnostic(property, location, keyword,
+                    "must be at most " + numericArgument(error, "the schema-defined maximum"));
+            case "exclusiveMaximum" -> constraintDiagnostic(property, location, keyword,
+                    "must be less than " + numericArgument(error, "the schema-defined maximum"));
+            case "multipleOf" -> constraintDiagnostic(property, location, keyword,
+                    "must be a multiple of " + numericArgument(error, "the schema-defined value"));
+            case "pattern", "format", "enum", "const", "uniqueItems" ->
+                    constraintDiagnostic(property, location, keyword, "does not satisfy the declared value constraint");
             default -> "Tool field at " + location + " violates the '" + keyword + "' constraint";
         };
+    }
+
+    /** 将已审计字段与固定约束说明拼接，保留修正方向但不把 Schema 正文带入诊断。 */
+    private static String constraintDiagnostic(String property, String location, String keyword, String detail) {
+        String field = property == null ? "Tool field at " + location : "Tool field '" + property + "' at " + location;
+        return field + " violates the '" + keyword + "' constraint: " + detail;
+    }
+
+    /** 只接受 networknt 首个约束参数中的有限数值；实际参数长度等第二个值永不进入公开诊断。 */
+    private static String numericArgument(com.networknt.schema.Error error, String fallback) {
+        try {
+            Object[] arguments = error.getArguments();
+            if (arguments != null && arguments.length > 0) {
+                String value = arguments[0] instanceof Number number ? number.toString()
+                        : arguments[0] instanceof String text ? text : null;
+                if (value == null) return fallback;
+                if (value.length() <= 64
+                        && value.matches("-?(?:0|[1-9][0-9]{0,63})(?:\\.[0-9]{1,63})?")) {
+                    return value;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // 第三方 Error 实例异常时回退到固定描述，不能让诊断路径改变执行结果。
+        }
+        return fallback;
+    }
+
+    /** 从安全的实例位置补出字段名，使 networknt 未提供 property 元数据时仍能指出修正字段。 */
+    private static String safeLocationProperty(String location) {
+        if (location == null || location.isBlank() || "$".equals(location) || "/".equals(location)) return null;
+        int separator = location.lastIndexOf('/');
+        String candidate = separator < 0 ? location : location.substring(separator + 1);
+        if (candidate.isBlank() && separator > 0) {
+            candidate = location.substring(0, separator);
+            separator = candidate.lastIndexOf('/');
+            candidate = separator < 0 ? candidate : candidate.substring(separator + 1);
+        }
+        return safeProperty(candidate);
     }
 
     /** 保留引擎返回的 JSON Pointer 位置，限制字符和长度，避免诊断包含参数值。 */

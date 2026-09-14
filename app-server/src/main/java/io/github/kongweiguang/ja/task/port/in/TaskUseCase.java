@@ -29,6 +29,37 @@ public interface TaskUseCase extends AutoCloseable {
     /** 返回当前根任务的完整 Child 树摘要，不读取任何 Child Transcript。 */
     List<TaskModels.Summary> listTree(String rootThreadId);
 
+    /**
+     * 判断请求者是否拥有实际的 ATTACHED/SUBAGENT 后代；实现只应读取有界 Task projection，
+     * 供运行时目录保留既有任务的管理入口，而不能用策略开关或自然语言猜测控制范围。
+     */
+    default boolean hasDelegatedAgents(String requesterThreadId) {
+        Objects.requireNonNull(requesterThreadId, "requesterThreadId");
+        String rootThreadId = readRuntimeIdentity(requesterThreadId)
+                .map(TaskModels.RuntimeIdentity::rootThreadId).orElse(requesterThreadId);
+        List<TaskModels.Summary> tree = List.copyOf(Objects.requireNonNull(
+                listTree(rootThreadId), "task tree"));
+        if (tree.size() > 64) throw new IllegalStateException("task tree exceeded hard limit");
+        java.util.Map<String, TaskModels.Summary> byId = new java.util.HashMap<>();
+        tree.forEach(task -> byId.put(task.lineage().taskThreadId(), task));
+        for (TaskModels.Summary task : tree) {
+            TaskModels.Lineage lineage = task.lineage();
+            if (lineage.kind() != TaskModels.Kind.SUBAGENT
+                    || lineage.lifecycle() != TaskModels.Lifecycle.ATTACHED) continue;
+            String ancestor = lineage.parentThreadId();
+            for (int depth = 0; ancestor != null && depth < 64; depth++) {
+                if (requesterThreadId.equals(ancestor)) return true;
+                TaskModels.Summary parent = byId.get(ancestor);
+                if (parent == null) break;
+                TaskModels.Lineage parentLineage = parent.lineage();
+                if (parentLineage.kind() != TaskModels.Kind.SUBAGENT
+                        || parentLineage.lifecycle() != TaskModels.Lifecycle.ATTACHED) break;
+                ancestor = parentLineage.parentThreadId();
+            }
+        }
+        return false;
+    }
+
     /** 返回根 Thread 主 Timeline 所需的最近持久活动，不读取任何 Child Transcript。 */
     List<TaskModels.ActivityProjection> listRootActivities(String rootThreadId, int limit);
 

@@ -42,9 +42,9 @@ public final class CollaborationModeCapability implements AgentCapability {
     @Override public Prepared prepare(Request request) {
         if (PlanToolPolicy.isReadOnlyPlanning(
                 request.origin(), request.preferences().collaborationMode())) {
-            return new Prepared(PLANNING, List.of());
+            return new Prepared(PLANNING, List.of(), List.of());
         }
         return request.origin() == TurnOrigin.PLAN_EXECUTION || request.clarificationEnabled() ? Prepared.empty()
-                : new Prepared(NO_CLARIFICATION, List.of());
+                : new Prepared(NO_CLARIFICATION, List.of(), List.of());
     }
 }

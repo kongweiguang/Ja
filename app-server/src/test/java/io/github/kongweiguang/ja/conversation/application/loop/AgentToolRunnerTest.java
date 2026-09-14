@@ -15,6 +15,7 @@ import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
 import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
@@ -67,6 +68,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -201,6 +203,78 @@ final class AgentToolRunnerTest {
             assertEquals("TOOL_ARGUMENTS_INVALID", result.errorCode());
             assertTrue(result.content().contains("required Tool field"));
             assertTrue(result.content().contains("Correct the arguments and retry this Tool"));
+            assertEquals(0, executions.get());
+            assertEquals(1, commits.size());
+        }
+    }
+
+    /** 可信内建 grep 的空 query 必须持久化为下一轮可见的可操作诊断，并且不得回显输入值。 */
+    @Test
+    void builtinGrepEmptyQueryPersistsActionableDiagnostic() {
+        AtomicInteger executions = new AtomicInteger();
+        AgentTool tool = new GrepTool(false, executions);
+        List<List<ConversationRepository.Fact>> commits = new ArrayList<>();
+
+        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
+                CLOCK, 8, 32, Duration.ofMinutes(10));
+             AgentToolRunner runner = runner(broker)) {
+            AgentTool.ToolResult result = runner.execute(
+                    runnerExecution(plan(tool), Map.of("grep", tool),
+                            (target, event, facts, next) -> commits.add(List.copyOf(facts))),
+                    List.of(new AgentTool.Invocation(
+                            "call_grep_invalid", "grep",
+                            JsonObjects.builder().putText("query", "")
+                                    .putText("path", "PRIVATE_VALUE").build(), 0))).getFirst();
+
+            assertEquals(ToolOutcome.FAILED, result.outcome());
+            assertEquals("TOOL_ARGUMENTS_INVALID", result.errorCode());
+            assertTrue(result.content().contains("'query'"));
+            assertTrue(result.content().contains("non-empty"));
+            assertTrue(result.content().contains("minLength 1"));
+            assertTrue(result.content().contains("find for file-name lookup"));
+            assertTrue(result.content().contains("Correct the arguments and retry this Tool"));
+            assertFalse(result.content().contains("PRIVATE_VALUE"));
+            assertEquals(0, executions.get());
+            assertEquals(1, commits.size());
+
+            ConversationRepository.ToolResultFact persisted = commits.getFirst().stream()
+                    .filter(ConversationRepository.ToolResultFact.class::isInstance)
+                    .map(ConversationRepository.ToolResultFact.class::cast)
+                    .findFirst().orElseThrow();
+            ConversationRepository.ToolResultMessageFact nextModel = commits.getFirst().stream()
+                    .filter(ConversationRepository.ToolResultMessageFact.class::isInstance)
+                    .map(ConversationRepository.ToolResultMessageFact.class::cast)
+                    .findFirst().orElseThrow();
+            ToolResultContent visible = (ToolResultContent) nextModel.message().content().getFirst();
+            assertEquals(result.content(), persisted.artifactContent());
+            assertEquals(result.content(), visible.content());
+            assertTrue(visible.error());
+        }
+    }
+
+    /** MCP 即使复用 grep 名称也只能获得通用 Schema 诊断，不能借用内建文件发现提示。 */
+    @Test
+    void mcpGrepNameDoesNotReceiveBuiltinDiagnosticHint() {
+        AtomicInteger executions = new AtomicInteger();
+        AgentTool tool = new GrepTool(true, executions);
+        List<List<ConversationRepository.Fact>> commits = new ArrayList<>();
+
+        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
+                CLOCK, 8, 32, Duration.ofMinutes(10));
+             AgentToolRunner runner = runner(broker)) {
+            AgentTool.ToolResult result = runner.execute(
+                    runnerExecution(plan(tool), Map.of("grep", tool),
+                            (target, event, facts, next) -> commits.add(List.copyOf(facts))),
+                    List.of(new AgentTool.Invocation(
+                            "call_mcp_grep_invalid", "grep",
+                            JsonObjects.builder().putText("query", "").build(), 0))).getFirst();
+
+            assertEquals(ToolOutcome.FAILED, result.outcome());
+            assertEquals("TOOL_ARGUMENTS_INVALID", result.errorCode());
+            assertTrue(result.content().contains("query"));
+            assertTrue(result.content().contains("minLength"));
+            assertTrue(result.content().contains("Correct the arguments and retry this Tool"));
+            assertFalse(result.content().contains("find for file-name lookup"));
             assertEquals(0, executions.get());
             assertEquals(1, commits.size());
         }
@@ -1016,6 +1090,52 @@ final class AgentToolRunnerTest {
                 Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
             executions.incrementAndGet();
             return CompletableFuture.completedFuture(ToolResult.success("unexpected"));
+        }
+    }
+
+    /** 使用与生产 grep 一致的 minLength/maxLength Schema 构造内建和 MCP 同名测试对象。 */
+    private static final class GrepTool implements AgentTool {
+        private final AtomicInteger executions;
+        private final ToolSpec spec;
+        private final ToolBindingDescriptor binding;
+
+        /** 仅 MCP 变体覆盖显式路由，内建变体使用 AgentTool 的稳定 Builtin binding 算法。 */
+        private GrepTool(boolean mcp, AtomicInteger executions) {
+            this.executions = executions;
+            this.spec = new ToolSpec("grep", "grep fixture", JsonObjects.builder()
+                    .putText("type", "object")
+                    .put("properties", JsonObjects.builder()
+                            .put("query", JsonObjects.builder().putText("type", "string")
+                                    .putNumber("minLength", 1).putNumber("maxLength", 512).build())
+                            .put("path", JsonObjects.builder().putText("type", "string").build())
+                            .build())
+                    .put("required", new JsonArray(List.of(new JsonText("query"))))
+                    .putBoolean("additionalProperties", false)
+                    .build());
+            this.binding = mcp
+                    ? new ToolBindingDescriptor(RouteKind.MCP, "grep", "fixture_mcp", "grep",
+                            "a".repeat(64), "b".repeat(64))
+                    : AgentTool.builtinBindingDescriptor(spec, ToolSideEffect.READ_ONLY, WorkspaceMutationMode.NONE);
+        }
+
+        /** 返回固定 Schema，确保两种路由共享同一个参数校验边界。 */
+        @Override public ToolSpec spec() { return spec; }
+
+        /** grep 只读，测试不应因诊断路径获得工作区写租约。 */
+        @Override public ToolSideEffect sideEffect() { return ToolSideEffect.READ_ONLY; }
+
+        /** grep 不产生 ChangeSet，失败路径也不应触及 mutation tracker。 */
+        @Override public WorkspaceMutationMode workspaceMutationMode() { return WorkspaceMutationMode.NONE; }
+
+        /** 返回显式路由身份，让 MCP 同名回归不能落入 Builtin 诊断分支。 */
+        @Override public ToolBindingDescriptor bindingDescriptor() { return binding; }
+
+        /** 记录越过参数校验的调用，空 query 回归必须保持零执行。 */
+        @Override
+        public CompletionStage<ToolResult> execute(
+                Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
+            executions.incrementAndGet();
+            return CompletableFuture.completedFuture(ToolResult.success("grep-fixture"));
         }
     }
 

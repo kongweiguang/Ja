@@ -49,24 +49,31 @@ public final class InteractionCapability implements AgentCapability {
     @Override
     public int order() { return 80; }
 
-    /** 按当前请求的 clarification 策略决定是否暴露提问能力。 */
+    /** 按当前请求的 clarification 策略决定暴露提问能力，但完整安全定义始终参与目录指纹。 */
     @Override
     public Prepared prepare(Request request) {
         /* SUBAGENT 必须把缺失信息汇总回父任务；公共卡片只能由 Root/Side Task 或 Plan/Goal owner 发出。 */
-        if (request.taskKind().orElse(null)
-                == io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort.Kind.SUBAGENT
-                || !clarificationEnabled(request)) {
+        if (request.turnId() == null) {
             return Prepared.empty();
         }
         ToolSpec spec = new ToolSpec("request_user_input",
                 "Ask the user one to three structured questions and wait for durable answers.", schema());
-        AgentCapability.ToolContribution contribution = new AgentCapability.ToolContribution(
+        AgentCapability.ToolContribution contribution = toolContribution(spec);
+        boolean exposed = request.taskKind().orElse(null)
+                != io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort.Kind.SUBAGENT
+                && clarificationEnabled(request);
+        return new Prepared(exposed ? "When a decision materially changes the plan, use request_user_input. "
+                        + "Do not infer missing answers; wait for the user's structured response." : "",
+                exposed ? List.of(contribution) : List.of(), List.of(contribution));
+    }
+
+    /** 为隐藏与暴露状态复用同一交互安全元数据，避免仅因角色显隐改变恢复指纹。 */
+    private AgentCapability.ToolContribution toolContribution(ToolSpec spec) {
+        return new AgentCapability.ToolContribution(
                 spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE,
                 AgentTool.builtinBindingDescriptor(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE),
                 AgentTool.PlanAccess.DISALLOWED, AgentTool.ApprovalRequirement.TRUSTED_INTERNAL,
                 identity -> new RequestUserInputTool(spec, interactions));
-        return new Prepared("When a decision materially changes the plan, use request_user_input. "
-                + "Do not infer missing answers; wait for the user's structured response.", List.of(contribution));
     }
 
     /** 配置 Owner 提供的纯策略边界；Plan 请求应返回 true，普通模式受 clarificationEnabled 控制。 */

@@ -903,7 +903,7 @@ describe("Task product panels", () => {
     expect(within(userMessage).getByText("合同", { selector: "strong" })).toBeVisible();
     expect(screen.getByText("正在核对契约")).toBeVisible();
     expect(
-      screen.getByRole("button", { name: /读取，contracts\/task\.json，失败/u }),
+      screen.getByRole("button", { name: /读取，read_file，contracts\/task\.json，失败/u }),
     ).toBeVisible();
     expect(screen.getByText("已生成安全收口结果")).toBeVisible();
     expect(screen.getByText("INTERNAL_ERROR")).toBeVisible();

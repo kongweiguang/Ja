@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 
@@ -26,6 +27,47 @@ final class NetworkntToolArgumentValidatorTest {
                 () -> validator.validate("{\"path\":7}"));
         assertEquals("Tool field at /path has the wrong JSON type", failure.getMessage());
         assertFalse(failure.getMessage().contains("7"));
+    }
+
+    /** 数值约束只展示 Schema 的静态边界和安全字段位置，不回显传入的秘密值。 */
+    @Test
+    void describesMinimumLengthWithoutEchoingArgument() {
+        String schema = """
+                {"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":512},
+                 "secret":{"type":"string"}},
+                 "required":["query"],"additionalProperties":false}
+                """;
+        NetworkntToolArgumentValidator validator = new NetworkntToolArgumentValidator(schema);
+
+        ToolSchemaException failure = assertThrows(ToolSchemaException.class,
+                () -> validator.validate("{\"query\":\"\",\"secret\":\"PRIVATE_VALUE\"}"));
+
+        assertTrue(failure.getMessage().contains("query"));
+        assertTrue(failure.getMessage().contains("minLength"));
+        assertTrue(failure.getMessage().contains("1"));
+        assertFalse(failure.getMessage().contains("PRIVATE_VALUE"));
+    }
+
+    /** exclusive 数值边界必须明确排除等值，避免错误诊断引导模型重复提交同一非法值。 */
+    @Test
+    void describesExclusiveNumericBoundaries() {
+        NetworkntToolArgumentValidator minimum = new NetworkntToolArgumentValidator("""
+                {"type":"object","properties":{"value":{"type":"number","exclusiveMinimum":3}},
+                 "required":["value"],"additionalProperties":false}
+                """);
+        ToolSchemaException lower = assertThrows(ToolSchemaException.class,
+                () -> minimum.validate("{\"value\":3}"));
+        assertTrue(lower.getMessage().contains("exclusiveMinimum"));
+        assertTrue(lower.getMessage().contains("greater than 3"));
+
+        NetworkntToolArgumentValidator maximum = new NetworkntToolArgumentValidator("""
+                {"type":"object","properties":{"value":{"type":"number","exclusiveMaximum":9}},
+                 "required":["value"],"additionalProperties":false}
+                """);
+        ToolSchemaException upper = assertThrows(ToolSchemaException.class,
+                () -> maximum.validate("{\"value\":9}"));
+        assertTrue(upper.getMessage().contains("exclusiveMaximum"));
+        assertTrue(upper.getMessage().contains("less than 9"));
     }
 
     /** 非法 Schema、参数内容和第三方异常不会进入公开诊断或 cause 链。 */

@@ -63,7 +63,7 @@ public final class ToolPresentationProjector {
                 ? sanitize(text(invocation.arguments(), "command"), root, knownSecrets) : null;
         String input = switch (kind) {
             case SHELL -> command;
-            case READ -> readInput(invocation.arguments(), paths);
+            case READ -> readInput(invocation.toolName(), invocation.arguments(), paths, root, knownSecrets);
             case EDIT -> mutationInput("edit", invocation.arguments(), paths, "oldText", "newText");
             case WRITE -> mutationInput("write", invocation.arguments(), paths, "content");
             case MCP -> boundedJson(invocation.arguments(), root, knownSecrets);
@@ -138,10 +138,10 @@ public final class ToolPresentationProjector {
         };
     }
 
-    /** 内置 Tool 使用专用展示，扩展能力统一标识为 MCP。 */
+    /** 内置只读 Tool 共用 READ wire kind，具体动作由真实 toolName 和安全标题区分；未知扩展才归 MCP。 */
     private static ToolPresentation.Kind kind(String name) {
         return switch (name) {
-            case "read", "read_attachment" -> ToolPresentation.Kind.READ;
+            case "read", "read_attachment", "grep", "find", "ls" -> ToolPresentation.Kind.READ;
             case "edit" -> ToolPresentation.Kind.EDIT;
             case "write" -> ToolPresentation.Kind.WRITE;
             case "shell" -> ToolPresentation.Kind.SHELL;
@@ -149,10 +149,16 @@ public final class ToolPresentationProjector {
         };
     }
 
-    /** 标题保持简短且未知 Tool 只显示其经过校验的名称。 */
+    /** 只读内置 Tool 使用精确动作标题，未知 Tool 只显示其经过校验的名称。 */
     private static String title(ToolPresentation.Kind kind, String name) {
         return switch (kind) {
-            case READ -> "读取";
+            case READ -> switch (name) {
+                case "grep" -> "搜索内容";
+                case "find" -> "查找文件";
+                case "ls" -> "列出目录";
+                case "read_attachment" -> "读取附件";
+                default -> "读取";
+            };
             case EDIT -> "编辑";
             case WRITE -> "写入";
             case SHELL -> "执行命令";
@@ -160,13 +166,48 @@ public final class ToolPresentationProjector {
         };
     }
 
-    /** 读取参数只展示相对路径与行范围。 */
-    private static String readInput(JsonObject arguments, List<String> paths) {
+    /** 按真实只读 Tool 保留最能说明动作的首个目标，并把敏感值限制在脱敏摘要内。 */
+    private static String readInput(String toolName, JsonObject arguments, List<String> paths,
+                                    Path root, List<String> knownSecrets) {
+        return switch (toolName) {
+            case "grep" -> searchInput("query", arguments, paths, root, knownSecrets);
+            case "find" -> searchInput("pattern", arguments, paths, root, knownSecrets);
+            case "ls" -> paths.isEmpty() ? "." : paths.getFirst();
+            case "read_attachment" -> attachmentInput(arguments, root, knownSecrets);
+            default -> fileReadInput(arguments, paths);
+        };
+    }
+
+    /** 普通 read 只展示相对路径与一基行范围，保持既有文件定位语义。 */
+    private static String fileReadInput(JsonObject arguments, List<String> paths) {
         String path = paths.isEmpty() ? "[resource]" : paths.getFirst();
         Long offset = number(arguments, "offset");
         Long limit = number(arguments, "limit");
         if (offset == null && limit == null) return path;
         return path + " · " + (offset == null ? 1 : offset) + ":" + (limit == null ? 2_000 : limit);
+    }
+
+    /** grep/find 的首个目标是 query/pattern，路径仅作为搜索范围附在摘要后。 */
+    private static String searchInput(String field, JsonObject arguments, List<String> paths,
+                                      Path root, List<String> knownSecrets) {
+        String rawTarget = text(arguments, field);
+        String target = rawTarget == null || rawTarget.isEmpty()
+                ? "[missing-" + field + "]"
+                : escapePreview(boundedScalar(sanitize(rawTarget, root, knownSecrets)));
+        String scope = paths.isEmpty() ? "." : paths.getFirst();
+        return field + "=\"" + target + "\" · " + scope;
+    }
+
+    /** read_attachment 保留受管 opaque ID 和字节窗口，避免退化成无法诊断的 resource 占位。 */
+    private static String attachmentInput(JsonObject arguments, Path root, List<String> knownSecrets) {
+        String rawAttachmentId = text(arguments, "attachmentId");
+        String attachmentId = rawAttachmentId == null || rawAttachmentId.isBlank()
+                ? "[missing-attachmentId]"
+                : escapePreview(boundedScalar(sanitize(rawAttachmentId, root, knownSecrets)));
+        Long offset = number(arguments, "offsetBytes");
+        Long maxBytes = number(arguments, "maxBytes");
+        return "attachmentId=\"" + attachmentId + "\" · bytes "
+                + (offset == null ? 0 : offset) + ":" + (maxBytes == null ? 64 * 1024 : maxBytes);
     }
 
     /** 写操作只发布字符计数，避免源代码、密钥或完整补丁复制进展示存储。 */

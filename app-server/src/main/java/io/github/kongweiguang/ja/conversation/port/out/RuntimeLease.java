@@ -150,7 +150,9 @@ public final class RuntimeLease implements AutoCloseable {
         return presentationSecrets;
     }
 
-    /** 返回模型可见 Tool schema 的确定性摘要，防止 Resume 在能力漂移后继续执行。 */
+    /**
+     * 返回完整安全 Tool 定义目录的确定性摘要；实际请求 Tool 声明由调用方按上下文另行投影，防止 Resume 在能力漂移后继续执行。
+     */
     public String toolCatalogDigest() {
         return toolCatalogDigest;
     }
@@ -161,7 +163,8 @@ public final class RuntimeLease implements AutoCloseable {
     }
 
     /**
-     * 以真正发送的 Prompt revision 构造请求级审计 Profile；调用方必须在请求发送前持久化该值。
+     * 以真正发送的 Prompt revision 构造请求级审计 Profile；Profile 中的 toolCatalogDigest 标识完整安全目录，
+     * 实际请求 Tool 声明由调用方按当前上下文另行投影，调用方必须在请求发送前持久化该值。
      */
     public ProviderRequestProfile requestProfile(String effectivePromptRevision) {
         String api = model.api().name().toLowerCase(java.util.Locale.ROOT);

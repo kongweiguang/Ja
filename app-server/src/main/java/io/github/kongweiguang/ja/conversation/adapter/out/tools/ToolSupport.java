@@ -16,10 +16,21 @@ import io.github.kongweiguang.ja.foundation.json.JsonValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.NotDirectoryException;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -64,6 +75,8 @@ abstract class ToolSupport implements AgentTool {
                     failure.failure(), failure, Optional.of(failure.observation())));
         } catch (ToolFailure failure) {
             return CompletableFuture.completedFuture(failed(ToolOutcome.FAILED, failure.failure()));
+        } catch (ArgumentFailure failure) {
+            return CompletableFuture.completedFuture(failedArgument(failure));
         } catch (java.util.concurrent.CancellationException failure) {
             return CompletableFuture.completedFuture(failed(ToolOutcome.CANCELLED, Failure.TOOL_CANCELLED));
         } catch (AccessDeniedException | SecurityException failure) {
@@ -85,6 +98,14 @@ abstract class ToolSupport implements AgentTool {
      */
     private static ToolResult failed(ToolOutcome outcome, Failure failure) {
         return new ToolResult(outcome, failure.safeContent(), Optional.empty(), failure.code());
+    }
+
+    /** 将已审计的字段和约束写入错误正文，使模型能修正参数而不会看到参数值或物理路径。 */
+    private static ToolResult failedArgument(ArgumentFailure failure) {
+        return new ToolResult(ToolOutcome.FAILED,
+                Failure.TOOL_ARGUMENTS_INVALID.safeContent() + " Argument '" + failure.field()
+                        + "' " + failure.constraint() + ".",
+                Optional.empty(), Failure.TOOL_ARGUMENTS_INVALID.code());
     }
 
     /**
@@ -128,6 +149,11 @@ abstract class ToolSupport implements AgentTool {
         return new ToolFailure(failure);
     }
 
+    /** 创建只携带固定字段名和约束的参数异常，避免底层异常 message 穿过 Tool 边界。 */
+    static ArgumentFailure argument(String field, String constraint) {
+        return new ArgumentFailure(field, constraint);
+    }
+
     /**
      * 写入开始后的 SecurityException 与 IOException 分别归为 outside_workspace 和 capture_failed；
      * 原始异常只保留为进程内 cause，公共边界不会复制其 message。
@@ -151,8 +177,20 @@ abstract class ToolSupport implements AgentTool {
     static String string(Invocation invocation, String name, int maxLength) {
         JsonValue value = invocation.arguments().members().get(name);
         if (!(value instanceof JsonText jsonText)
-            || jsonText.value().isBlank() || jsonText.value().length() > maxLength) {
-            throw new IllegalArgumentException("invalid argument: " + name);
+            || jsonText.value().isBlank()
+            || jsonText.value().codePointCount(0, jsonText.value().length()) > maxLength) {
+            throw argument(name, "must be a non-empty string within the published length limit");
+        }
+        return jsonText.value();
+    }
+
+    /** 读取允许空白字符但不允许空文本的字段，和 JSON Schema minLength=1 保持同一语义。 */
+    static String requiredString(Invocation invocation, String name, int maxLength, String constraint) {
+        JsonValue value = invocation.arguments().members().get(name);
+        if (!(value instanceof JsonText jsonText)
+                || jsonText.value().isEmpty()
+                || jsonText.value().codePointCount(0, jsonText.value().length()) > maxLength) {
+            throw argument(name, constraint);
         }
         return jsonText.value();
     }
@@ -165,8 +203,9 @@ abstract class ToolSupport implements AgentTool {
         if (value == null) {
             return null;
         }
-        if (!(value instanceof JsonText text) || text.value().length() > maxLength) {
-            throw new IllegalArgumentException("invalid argument: " + name);
+        if (!(value instanceof JsonText text)
+                || text.value().codePointCount(0, text.value().length()) > maxLength) {
+            throw argument(name, "must be omitted or be a string within the published length limit");
         }
         return text.value();
     }
@@ -178,7 +217,7 @@ abstract class ToolSupport implements AgentTool {
         JsonValue value = invocation.arguments().members().get(name);
         int result = value == null ? defaultValue : exactInteger(value, name);
         if (result < min || result > max) {
-            throw new IllegalArgumentException("invalid argument: " + name);
+            throw argument(name, "must be an integer between " + min + " and " + max);
         }
         return result;
     }
@@ -188,12 +227,12 @@ abstract class ToolSupport implements AgentTool {
      */
     private static int exactInteger(JsonValue value, String name) {
         if (!(value instanceof JsonNumber number)) {
-            throw new IllegalArgumentException("invalid argument: " + name);
+            throw argument(name, "must be an integer");
         }
         try {
             return number.value().intValueExact();
         } catch (ArithmeticException failure) {
-            throw new IllegalArgumentException("invalid argument: " + name);
+            throw argument(name, "must be an integer");
         }
     }
 
@@ -217,6 +256,87 @@ abstract class ToolSupport implements AgentTool {
         return JsonObjects.builder().putText("type", type).putText("description", description).build();
     }
 
+    /** 构造 Schema 与 requiredString 共用的非空有界字符串属性。 */
+    static JsonObject requiredStringProperty(String description, int maxLength) {
+        return JsonObjects.builder().putText("type", "string").putText("description", description)
+                .putNumber("minLength", 1).putNumber("maxLength", maxLength).build();
+    }
+
+    /** 构造 Schema 与 optionalString 共用的可空文本属性；字段是否必需由对象 required 决定。 */
+    static JsonObject optionalStringProperty(String description, int maxLength) {
+        return JsonObjects.builder().putText("type", "string").putText("description", description)
+                .putNumber("maxLength", maxLength).build();
+    }
+
+    /** 构造 Schema 与 integer 共用的精确整数属性，避免声明边界和运行时范围漂移。 */
+    static JsonObject integerProperty(String description, int min, int max) {
+        return JsonObjects.builder().putText("type", "integer").putText("description", description)
+                .putNumber("minimum", min).putNumber("maximum", max).build();
+    }
+
+    /** 读取有界普通文本并在每个 chunk 检查取消与 Deadline；NOFOLLOW 防止重解析点绕过准入。 */
+    static String readUtf8File(Path path, CancellationToken token, Instant deadline,
+                               long maxBytes, int maxCharacters) throws IOException {
+        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(token, "token");
+        Objects.requireNonNull(deadline, "deadline");
+        if (maxBytes < 1 || maxBytes > Integer.MAX_VALUE || maxCharacters < 1) {
+            throw new IllegalArgumentException("bounded reader limits are invalid");
+        }
+        token.throwIfCancellationRequested();
+        throwIfDeadlineExceeded(deadline);
+        BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class,
+                LinkOption.NOFOLLOW_LINKS);
+        if (attributes.isDirectory()) throw failure(Failure.PATH_IS_DIRECTORY);
+        if (!attributes.isRegularFile() || Files.isSymbolicLink(path)) {
+            throw failure(Failure.PATH_NOT_REGULAR_FILE);
+        }
+        if (attributes.size() > maxBytes) throw failure(Failure.FILE_TOO_LARGE);
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(
+                (int) Math.min(attributes.size(), 8_192L));
+        byte[] buffer = new byte[8_192];
+        try (InputStream input = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
+            long remainingBytes = maxBytes;
+            while (remainingBytes > 0) {
+                token.throwIfCancellationRequested();
+                throwIfDeadlineExceeded(deadline);
+                int read = input.read(buffer, 0, (int) Math.min(buffer.length, remainingBytes));
+                if (read < 0) break;
+                if (read == 0) continue;
+                bytes.write(buffer, 0, read);
+                remainingBytes -= read;
+            }
+        }
+        BasicFileAttributes finalAttributes = Files.readAttributes(path, BasicFileAttributes.class,
+                LinkOption.NOFOLLOW_LINKS);
+        if (finalAttributes.size() > maxBytes) throw failure(Failure.FILE_TOO_LARGE);
+        return decodeUtf8(bytes.toByteArray(), maxCharacters);
+    }
+
+    /** 将超时转换成文件工具可识别的局部截断信号，而不是泄露底层时间实现。 */
+    private static void throwIfDeadlineExceeded(Instant deadline) throws DeadlineExceededException {
+        if (!Instant.now().isBefore(deadline)) throw new DeadlineExceededException();
+    }
+
+    /** 使用 REPORT 解码并拒绝 NUL，避免二进制载荷伪装成搜索文本。 */
+    private static String decodeUtf8(byte[] bytes, int maxCharacters) throws IOException {
+        String content;
+        try {
+            content = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException invalidEncoding) {
+            throw failure(Failure.FILE_NOT_UTF8);
+        }
+        if (content.codePointCount(0, content.length()) > maxCharacters) {
+            throw failure(Failure.FILE_TOO_LARGE);
+        }
+        if (content.indexOf('\0') >= 0) throw failure(Failure.FILE_NOT_TEXT);
+        return content;
+    }
+
     /**
      * 冻结模型可操作的错误码与安全说明；说明包含下一步但不包含原始异常或物理路径。
      */
@@ -236,6 +356,9 @@ abstract class ToolSupport implements AgentTool {
         /** Read 收到目录而非文件，要求模型改用文件路径或目录专用能力。 */
         PATH_IS_DIRECTORY("path_is_directory",
                 "Tool failed: path_is_directory. The read tool accepts a file, not a directory; choose a file."),
+        /** 目录发现 Tool 收到普通文件，要求模型改用文件路径或省略 path。 */
+        PATH_NOT_DIRECTORY("path_not_directory",
+                "Tool failed: path_not_directory. The discovery tool accepts a directory; choose a directory."),
         /** Read 收到设备、管道等非普通文件，拒绝不可控或阻塞式读取。 */
         PATH_NOT_REGULAR_FILE("path_not_regular_file",
                 "Tool failed: path_not_regular_file. The read tool accepts regular files only; choose a regular file."),
@@ -290,6 +413,43 @@ abstract class ToolSupport implements AgentTool {
         /** 返回对应失败枚举，公共执行边界负责生成最终安全结果。 */
         Failure failure() {
             return failure;
+        }
+    }
+
+    /** 只保存已审计的字段和约束，供公共边界生成可行动但不回显输入的错误正文。 */
+    static final class ArgumentFailure extends IllegalArgumentException {
+        private final String field;
+        private final String constraint;
+
+        /** 校验诊断自身的字符集和长度，避免未来调用点把用户输入拼入公开错误。 */
+        private ArgumentFailure(String field, String constraint) {
+            super("tool_arguments_invalid");
+            if (field == null || !field.matches("[A-Za-z][A-Za-z0-9_]{0,63}")
+                    || constraint == null || constraint.isBlank()
+                    || constraint.codePointCount(0, constraint.length()) > 256
+                    || !constraint.matches("[A-Za-z0-9 .,;:/_\\-]+")) {
+                throw new IllegalArgumentException("argument diagnostic is not safe");
+            }
+            this.field = field;
+            this.constraint = constraint;
+        }
+
+        /** 返回 Schema 中的稳定字段名，不包含参数值。 */
+        String field() {
+            return field;
+        }
+
+        /** 返回固定约束说明，不包含底层异常文本。 */
+        String constraint() {
+            return constraint;
+        }
+    }
+
+    /** 有界文件读取在 Deadline 到达时中止当前候选，不把超时伪装成完整扫描。 */
+    static final class DeadlineExceededException extends IOException {
+        /** 使用固定 message，诊断只由调用方映射为截断元数据。 */
+        private DeadlineExceededException() {
+            super("tool_deadline_exceeded");
         }
     }
 

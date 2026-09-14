@@ -17,6 +17,7 @@ import java.lang.reflect.Proxy;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -50,6 +51,23 @@ final class InteractionCapabilityTest {
                 false, Optional.empty())).tools().size());
         assertEquals(0, capability.prepare(request(CollaborationMode.PLAN, TurnOrigin.CHILD_TASK,
                 false, Optional.of(TaskCapabilityCeilingPort.Kind.SUBAGENT))).tools().size());
+    }
+
+    /** 隐藏提问入口仍声明完整安全定义，避免角色显隐掩盖 Schema 或审批语义变化。 */
+    @Test
+    void keepsQuestionDefinitionWhenVisibilityChanges() {
+        InteractionCapability capability = new InteractionCapability(service(), ignored -> false);
+        AgentCapability.Prepared hidden = capability.prepare(request(CollaborationMode.DEFAULT, TurnOrigin.USER,
+                false, Optional.empty()));
+        AgentCapability.Prepared visible = capability.prepare(request(CollaborationMode.PLAN, TurnOrigin.USER,
+                false, Optional.empty()));
+
+        assertEquals(0, hidden.tools().size());
+        assertEquals(1, visible.tools().size());
+        assertEquals(List.of("request_user_input"), hidden.catalogTools().stream()
+                .map(value -> value.spec().name()).toList());
+        assertEquals(List.of("request_user_input"), visible.catalogTools().stream()
+                .map(value -> value.spec().name()).toList());
     }
 
     /** 构造真实服务对象但不提供可执行的外部端口，prepare 阶段不得触发任何 Repository 调用。 */

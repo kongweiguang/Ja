@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -62,9 +63,10 @@ final class AgentCapabilityCatalogUnitTest {
             /** 单能力无需额外排序。 */ @Override public int order() { return 1; }
             /** 声明只读但物化外部副作用，用于证明 Catalog 会复核。 */
             @Override public Prepared prepare(Request request) {
-                return new Prepared("", List.of(new ToolContribution(spec, ToolSideEffect.READ_ONLY,
+                ToolContribution contribution = new ToolContribution(spec, ToolSideEffect.READ_ONLY,
                         AgentTool.WorkspaceMutationMode.NONE, descriptor,
-                        ignored -> tool(spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.NONE))));
+                        ignored -> tool(spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.NONE));
+                return new Prepared("", List.of(contribution), List.of(contribution));
             }
         };
         AgentCapabilityCatalog.PreparedCapabilities prepared =
@@ -86,16 +88,77 @@ final class AgentCapabilityCatalogUnitTest {
             @Override public int order() { return 1; }
             /** prepare 声明可信内核操作，但 binder 返回默认要求用户审批的 Tool。 */
             @Override public Prepared prepare(Request request) {
-                return new Prepared("", List.of(new ToolContribution(spec, ToolSideEffect.READ_ONLY,
+                ToolContribution contribution = new ToolContribution(spec, ToolSideEffect.READ_ONLY,
                         AgentTool.WorkspaceMutationMode.NONE, descriptor, AgentTool.PlanAccess.DISALLOWED,
                         AgentTool.ApprovalRequirement.TRUSTED_INTERNAL,
-                        ignored -> tool(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE))));
+                        ignored -> tool(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE));
+                return new Prepared("", List.of(contribution), List.of(contribution));
             }
         };
         AgentCapabilityCatalog.PreparedCapabilities prepared =
                 new AgentCapabilityCatalog(List.of(capability)).prepare(request());
 
         assertThrows(IllegalStateException.class, () -> prepared.bind(identity()));
+    }
+
+    /** 完整定义可包含隐藏 Tool，但 bind 只能物化本轮暴露项，隐藏 binder 绝不能被触达。 */
+    @Test
+    void keepsHiddenDefinitionsOutOfBinding() {
+        ToolSpec visibleSpec = spec("visible_tool");
+        ToolSpec hiddenSpec = spec("hidden_tool");
+        AgentTool.ToolBindingDescriptor visibleDescriptor = AgentTool.builtinBindingDescriptor(
+                visibleSpec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE);
+        AgentTool.ToolBindingDescriptor hiddenDescriptor = AgentTool.builtinBindingDescriptor(
+                hiddenSpec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE);
+        AtomicInteger hiddenBinds = new AtomicInteger();
+        AgentCapability.ToolContribution visible = new AgentCapability.ToolContribution(
+                visibleSpec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE, visibleDescriptor,
+                ignored -> tool(visibleSpec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE));
+        AgentCapability.ToolContribution hidden = new AgentCapability.ToolContribution(
+                hiddenSpec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE, hiddenDescriptor,
+                ignored -> {
+                    hiddenBinds.incrementAndGet();
+                    throw new AssertionError("hidden Tool must not be bound");
+                });
+        AgentCapability capability = new AgentCapability() {
+            /** 返回固定 fixture 身份。 */
+            @Override public String id() { return "fixture.hidden"; }
+            /** 单能力 fixture 使用固定顺序。 */
+            @Override public int order() { return 1; }
+            /** 暴露一个 Tool，同时把完整安全定义保留给 digest。 */
+            @Override public Prepared prepare(Request request) {
+                return new Prepared("", List.of(visible), List.of(visible, hidden));
+            }
+        };
+
+        AgentCapabilityCatalog.PreparedCapabilities prepared =
+                new AgentCapabilityCatalog(List.of(capability)).prepare(request());
+
+        assertEquals(List.of("visible_tool"), prepared.toolContributions().stream()
+                .map(value -> value.spec().name()).toList());
+        assertEquals(List.of("visible_tool", "hidden_tool"), prepared.catalogToolContributions().stream()
+                .map(value -> value.spec().name()).toList());
+        prepared.bind(identity());
+        assertEquals(0, hiddenBinds.get());
+    }
+
+    /** 暴露项若未出现在完整定义或静态安全属性不一致，必须在 prepare 边界拒绝。 */
+    @Test
+    void rejectsExposedToolOutsideItsCatalogDefinition() {
+        ToolSpec spec = spec("mismatched_tool");
+        AgentTool.ToolBindingDescriptor readDescriptor = AgentTool.builtinBindingDescriptor(
+                spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE);
+        AgentTool.ToolBindingDescriptor externalDescriptor = AgentTool.builtinBindingDescriptor(
+                spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE);
+        AgentCapability.ToolContribution exposed = new AgentCapability.ToolContribution(
+                spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE, readDescriptor,
+                ignored -> tool(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE));
+        AgentCapability.ToolContribution definition = new AgentCapability.ToolContribution(
+                spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE, externalDescriptor,
+                ignored -> tool(spec, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.UNOBSERVABLE));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new AgentCapability.Prepared("", List.of(exposed), List.of(definition)));
     }
 
     /** 构造一个 schema 与执行实现同源的能力 fixture。 */
@@ -108,9 +171,10 @@ final class AgentCapabilityCatalogUnitTest {
             /** 返回冻结顺序。 */ @Override public int order() { return order; }
             /** 同一个 ToolSpec 同时服务目录与真实 Tool。 */
             @Override public Prepared prepare(Request request) {
-                return new Prepared(prompt, List.of(new ToolContribution(spec, ToolSideEffect.READ_ONLY,
+                ToolContribution contribution = new ToolContribution(spec, ToolSideEffect.READ_ONLY,
                         AgentTool.WorkspaceMutationMode.NONE, descriptor,
-                        ignored -> tool(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE))));
+                        ignored -> tool(spec, ToolSideEffect.READ_ONLY, AgentTool.WorkspaceMutationMode.NONE));
+                return new Prepared(prompt, List.of(contribution), List.of(contribution));
             }
         };
     }

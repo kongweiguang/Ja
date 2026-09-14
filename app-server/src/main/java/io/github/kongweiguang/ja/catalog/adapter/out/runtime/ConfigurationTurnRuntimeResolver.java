@@ -160,12 +160,12 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                     ? GenerationTurnMcpSessionFactory.CatalogSnapshot.planningEmpty()
                     : mcpSessions.catalog(toolContext, lease);
             List<AgentCapability.ToolContribution> catalogCapabilities = planning
-                    ? preparedCapabilities.toolContributions().stream()
+                    ? preparedCapabilities.catalogToolContributions().stream()
                         .filter(contribution -> contribution.planAccess() != AgentTool.PlanAccess.DISALLOWED
                                 || (contribution.sideEffect() == ToolSideEffect.READ_ONLY
                                 && contribution.workspaceMutationMode() == AgentTool.WorkspaceMutationMode.NONE))
                         .toList()
-                    : preparedCapabilities.toolContributions();
+                    : preparedCapabilities.catalogToolContributions();
             String catalogDigest = toolCatalogDigest(builtInTools, catalogCapabilities,
                     mcpCatalog.snapshot(), mcpCatalog.routeIdentities());
             validateInheritedCeiling(inheritedCeiling, requestPreferences, catalogDigest,
@@ -399,8 +399,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     }
 
     /**
-     * 在物化能力 Tool 前汇总模型可见的完整安全目录并拒绝跨来源重名；目录摘要直接覆盖每个 Tool 的
-     * Schema、副作用、工作区可观察性、审批要求与固定路由，不借能力 catalog hash 间接代表这些事实。
+     * 在物化能力 Tool 前汇总完整安全定义目录并拒绝跨来源重名；目录摘要直接覆盖每个 Tool 的
+     * Schema、副作用、工作区可观察性、Plan 准入、审批要求与固定路由，不借能力 catalog hash 间接代表这些事实。
      */
     static String toolCatalogDigest(
             List<AgentTool> builtInTools,
@@ -418,13 +418,12 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         List<ToolCatalogEntry> entries = new ArrayList<>(
                 builtInTools.size() + capabilityTools.size() + mcpSnapshot.tools().size());
         builtInTools.forEach(tool -> entries.add(new ToolCatalogEntry(
-                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.approvalRequirement(),
+                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.planAccess(),
+                tool.approvalRequirement(),
                 tool.bindingDescriptor())));
-        // request_user_input 是随角色显隐的用户交互入口，Subagent 必须向委派方询问而不直接弹卡。
-        // 它不授予工作区/外部能力，不能因子任务正常隐藏该入口而使继承的执行能力指纹失配。
-        capabilityTools.stream().filter(tool -> !"request_user_input".equals(tool.spec().name()))
-                .forEach(tool -> entries.add(new ToolCatalogEntry(
-                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.approvalRequirement(),
+        capabilityTools.forEach(tool -> entries.add(new ToolCatalogEntry(
+                tool.spec(), tool.sideEffect(), tool.workspaceMutationMode(), tool.planAccess(),
+                tool.approvalRequirement(),
                 tool.bindingDescriptor())));
         for (McpGateway.McpTool tool : mcpSnapshot.tools()) {
             McpGateway.RouteIdentity route = Objects.requireNonNull(
@@ -440,6 +439,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             entries.add(new ToolCatalogEntry(tool.spec(),
                     ToolSideEffect.EXTERNAL,
                     AgentTool.WorkspaceMutationMode.UNOBSERVABLE,
+                    AgentTool.PlanAccess.DISALLOWED,
                     AgentTool.ApprovalRequirement.USER_REQUIRED, descriptor));
         }
         Set<String> names = new HashSet<>();
@@ -458,6 +458,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             appendToken(canonical, 's', AgentTool.canonicalSchema(spec.inputSchema()));
             appendToken(canonical, 'e', entry.sideEffect().name());
             appendToken(canonical, 'w', entry.workspaceMutationMode().name());
+            appendToken(canonical, 'p', entry.planAccess().name());
             appendToken(canonical, 'a', entry.approvalRequirement().name());
             appendToken(canonical, 'k', descriptor.routeKind().name());
             appendToken(canonical, 'l', descriptor.localName());
@@ -479,6 +480,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             ToolSpec spec,
             ToolSideEffect sideEffect,
             AgentTool.WorkspaceMutationMode workspaceMutationMode,
+            AgentTool.PlanAccess planAccess,
             AgentTool.ApprovalRequirement approvalRequirement,
             AgentTool.ToolBindingDescriptor bindingDescriptor) {
         /** 目录项拒绝空安全字段，避免摘要阶段把不完整声明降级为默认值。 */
@@ -486,6 +488,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             Objects.requireNonNull(spec, "spec");
             Objects.requireNonNull(sideEffect, "sideEffect");
             Objects.requireNonNull(workspaceMutationMode, "workspaceMutationMode");
+            Objects.requireNonNull(planAccess, "planAccess");
             Objects.requireNonNull(approvalRequirement, "approvalRequirement");
             Objects.requireNonNull(bindingDescriptor, "bindingDescriptor");
             if (!spec.name().equals(bindingDescriptor.localName())) {

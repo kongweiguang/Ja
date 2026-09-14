@@ -112,26 +112,65 @@ public final class TaskAgentToolGateway implements AgentCapability, TaskCapabili
         Objects.requireNonNull(request, "request");
         if (request.turnId() == null) return Prepared.empty();
         SubagentPolicy policy = policy(request.threadId());
-        List<ToolContribution> contributions = TOOL_SPECS.stream()
-                .filter(spec -> policy.enabled() || !"spawn_agent".equals(spec.name())).map(spec -> {
-            ToolSideEffect sideEffect = readOnly(spec.name())
-                    ? ToolSideEffect.READ_ONLY : ToolSideEffect.EXTERNAL;
-            AgentTool.WorkspaceMutationMode mutationMode = readOnly(spec.name())
-                    ? AgentTool.WorkspaceMutationMode.NONE : AgentTool.WorkspaceMutationMode.UNOBSERVABLE;
-            AgentTool.ToolBindingDescriptor descriptor = AgentTool.builtinBindingDescriptor(
-                    spec, sideEffect, mutationMode);
-            return new ToolContribution(spec, sideEffect, mutationMode, descriptor, identity -> {
-                ThreadPreferences capabilityPreferences = policy.followsParent() ? request.preferences()
-                        : new ThreadPreferences(policy.providerId(), policy.modelId(), policy.reasoningLevel(),
-                        request.preferences().accessMode(), request.preferences().collaborationMode(),
-                        ThreadPreferences.TitleSource.MANUAL);
-                JsonObject ceiling = create(capabilityPreferences, request.configGeneration(), identity);
-                Binding binding = new Binding(request.threadId(), request.turnId(), request.preferences(),
-                        request.configGeneration(), request.deadline(), ceiling, policy);
-                return tool(spec, binding);
-            });
-        }).toList();
-        return new Prepared("", contributions);
+        boolean hasDelegatedAgents = hasDelegatedAgentsFor(request.threadId());
+        List<ToolContribution> catalogTools = TOOL_SPECS.stream()
+                .map(spec -> toolContribution(spec, request, policy)).toList();
+        List<ToolContribution> exposedTools = catalogTools.stream()
+                .filter(contribution -> exposed(contribution.spec().name(), policy,
+                        request.taskKind(), hasDelegatedAgents)).toList();
+        return new Prepared("", exposedTools, catalogTools);
+    }
+
+    /** 为完整安全定义和实际暴露目录复用同一个绑定工厂，避免两套 Tool 元数据发生漂移。 */
+    private ToolContribution toolContribution(ToolSpec spec, Request request, SubagentPolicy policy) {
+        ToolSideEffect sideEffect = readOnly(spec.name())
+                ? ToolSideEffect.READ_ONLY : ToolSideEffect.EXTERNAL;
+        AgentTool.WorkspaceMutationMode mutationMode = readOnly(spec.name())
+                ? AgentTool.WorkspaceMutationMode.NONE : AgentTool.WorkspaceMutationMode.UNOBSERVABLE;
+        AgentTool.ToolBindingDescriptor descriptor = AgentTool.builtinBindingDescriptor(
+                spec, sideEffect, mutationMode);
+        return new ToolContribution(spec, sideEffect, mutationMode, descriptor, identity -> {
+            ThreadPreferences capabilityPreferences = policy.followsParent() ? request.preferences()
+                    : new ThreadPreferences(policy.providerId(), policy.modelId(), policy.reasoningLevel(),
+                    request.preferences().accessMode(), request.preferences().collaborationMode(),
+                    ThreadPreferences.TitleSource.MANUAL);
+            JsonObject ceiling = create(capabilityPreferences, request.configGeneration(), identity);
+            Binding binding = new Binding(request.threadId(), request.turnId(), request.preferences(),
+                    request.configGeneration(), request.deadline(), ceiling, policy);
+            return tool(spec, binding);
+        });
+    }
+
+    /**
+     * 根据真实 Thread 身份、冻结委派策略和已有子任务决定目录，不把普通对话的文本意图当成授权；
+     * 管理入口在策略关闭后仍为已有子任务保留，确保用户可以完成收口。
+     */
+    private static boolean exposed(String toolName, SubagentPolicy policy,
+                                   java.util.Optional<TaskCapabilityCeilingPort.Kind> taskKind,
+                                   boolean hasDelegatedAgents) {
+        Objects.requireNonNull(toolName, "toolName");
+        Objects.requireNonNull(policy, "policy");
+        Objects.requireNonNull(taskKind, "taskKind");
+        boolean sideTask = taskKind.orElse(null) == TaskCapabilityCeilingPort.Kind.SIDE_TASK;
+        boolean subagent = taskKind.orElse(null) == TaskCapabilityCeilingPort.Kind.SUBAGENT;
+        boolean delegationTools = policy.enabled() || hasDelegatedAgents;
+        return switch (toolName) {
+            case "spawn_agent" -> policy.enabled();
+            case "wait_agent", "list_agents" -> delegationTools;
+            case "send_message" -> sideTask || subagent || hasDelegatedAgents;
+            case "continue_agent", "cancel_agent" -> hasDelegatedAgents;
+            case "list_threads" -> sideTask;
+            default -> false;
+        };
+    }
+
+    /**
+     * 在目录生成阶段最多读取一次有界 Task projection；owner 尚未完成 late binding 时收紧为空，
+     * 让组合期不会伪造管理授权，后续请求会在真实 owner 绑定后重新计算目录。
+     */
+    private boolean hasDelegatedAgentsFor(String requesterThreadId) {
+        TaskUseCase owner = tasks.get();
+        return owner != null && owner.hasDelegatedAgents(requesterThreadId);
     }
 
     /** 在分派前验证内部工厂输入，避免抽象父构造器抛错留下部分初始化实例。 */

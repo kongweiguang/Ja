@@ -72,6 +72,55 @@ final class McpToolExposureTest {
         assertTrue(catalog.stream().anyMatch(McpToolSearch.class::isInstance));
     }
 
+    /** 无附件时只隐藏真实内建入口；重新计算上下文后不能沿用上一次曾出现的附件状态。 */
+    @Test
+    void readAttachmentRequiresTypedAttachmentInCurrentContext() {
+        AgentTool readAttachment = builtin("read_attachment");
+        AgentTool read = builtin("read");
+        List<AgentTool> catalog = McpToolExposure.catalog(List.of(readAttachment, read), codec);
+        List<AgentTool> catalogSnapshot = List.copyOf(catalog);
+        ContextMessage historicalAttachment = attachmentMessage("att_historical", 1);
+        ContextMessage currentAttachment = attachmentMessage("att_current", 2);
+        ContextMessage textMention = ContextMessage.text("message_text", "turn_1", 3,
+                ContextMessage.Role.USER, "att_text_only", 1);
+
+        assertFalse(hasTool(McpToolExposure.modelTools(catalog, List.of(), codec), readAttachment));
+        assertFalse(hasTool(McpToolExposure.modelTools(catalog, List.of(textMention), codec), readAttachment));
+        assertTrue(hasTool(McpToolExposure.modelTools(catalog, List.of(historicalAttachment), codec), readAttachment));
+        assertTrue(hasTool(McpToolExposure.modelTools(catalog, List.of(currentAttachment), codec), readAttachment));
+        assertFalse(hasTool(McpToolExposure.modelTools(catalog, List.of(textMention), codec), readAttachment));
+        assertTrue(hasTool(McpToolExposure.modelTools(catalog, List.of(), codec), read));
+        assertEquals(catalogSnapshot, catalog);
+    }
+
+    /** 同名 MCP Tool 不属于附件入口；直通和搜索恢复都应保留其自身的目录策略与目录快照。 */
+    @Test
+    void sameNamedMcpRemainsIndependentOfBuiltinAttachmentVisibility() {
+        AgentTool builtinReadAttachment = builtin("read_attachment");
+        AgentTool mcpReadAttachment = mcp("read_attachment", 16);
+        List<AgentTool> directCatalog = McpToolExposure.catalog(
+                List.of(builtinReadAttachment, mcpReadAttachment), codec);
+        List<AgentTool> directSnapshot = List.copyOf(directCatalog);
+        List<ToolSpec> directTools = McpToolExposure.modelTools(directCatalog, List.of(), codec);
+
+        assertFalse(directTools.contains(builtinReadAttachment.spec()));
+        assertTrue(directTools.contains(mcpReadAttachment.spec()));
+        assertEquals(directSnapshot, directCatalog);
+
+        List<AgentTool> input = new ArrayList<>(tools(8, 16));
+        input.add(mcpReadAttachment);
+        input.addFirst(builtinReadAttachment);
+        List<AgentTool> searchCatalog = McpToolExposure.catalog(input, codec);
+        List<AgentTool> searchSnapshot = List.copyOf(searchCatalog);
+        List<ToolSpec> searchTools = McpToolExposure.modelTools(searchCatalog,
+                List.of(callMessage(), toolResult("call_search", McpToolSearch.NAME,
+                        searchContent(List.of(mcpReadAttachment), false))), codec);
+
+        assertFalse(searchTools.contains(builtinReadAttachment.spec()));
+        assertTrue(searchTools.contains(mcpReadAttachment.spec()));
+        assertEquals(searchSnapshot, searchCatalog);
+    }
+
     /** 完整搜索结果经 full 投影追加尾注后仍可恢复真实配对 Tool。 */
     @Test
     void completeSearchResultProjectedByFullRestoresRealTool() {
@@ -264,6 +313,13 @@ final class McpToolExposureTest {
                 return CompletableFuture.completedFuture(ToolResult.success("fixture"));
             }
         };
+    }
+
+    /** 构造通过 ContextMessage 类型系统表达的合法附件，避免测试从普通文本伪造可读事实。 */
+    private static ContextMessage attachmentMessage(String attachmentId, long ordinal) {
+        return new ContextMessage("message_" + attachmentId, "turn_1", ordinal,
+                ContextMessage.Role.USER,
+                List.of(new ContextMessage.AttachmentBlock(attachmentId)), 1);
     }
 
     /** 生成一条合法 search 结果，所有摘要字段来自测试 Tool 的真实绑定描述。 */

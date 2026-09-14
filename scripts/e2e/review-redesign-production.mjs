@@ -28,6 +28,8 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME = "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
 const DEFAULT_IGNORED_FILES = 4_500;
 const DEFAULT_UNTRACKED_FILES = 1_800;
+const DEFAULT_MAX_MODEL_ROUNDS = 4;
+const MAX_MODEL_ROUNDS = 128;
 const STABLE_PORT_RANGE = Object.freeze({ start: 41_000, size: 8_000 });
 
 /** 只接受命名参数，scope 必须显式声明，避免 Git-only 被误认为完整验收。 */
@@ -45,6 +47,7 @@ export function parseArguments(argv) {
     workspaceRoot: undefined,
     ownedProfileRoot: undefined,
     preflightOnly: false,
+    hiddenWindow: false,
     ignoredFiles: DEFAULT_IGNORED_FILES,
     untrackedFiles: DEFAULT_UNTRACKED_FILES,
   };
@@ -52,6 +55,10 @@ export function parseArguments(argv) {
     const argument = argv[index];
     if (argument === "--preflight-only") {
       parsed.preflightOnly = true;
+      continue;
+    }
+    if (argument === "--hidden-window") {
+      parsed.hiddenWindow = true;
       continue;
     }
     const value = argv[index + 1];
@@ -279,8 +286,30 @@ export async function createReviewGitFixture(
   };
 }
 
-/** 写入只供 runtime 启动的最小合法配置；Git 验收不会向 dummy Provider 发请求。 */
-async function writeIsolatedSettings(home) {
+/** 校验隔离验收专用模型轮次覆盖，沿用产品配置的 1..128 硬边界。 */
+export function validateMaxModelRounds(value = DEFAULT_MAX_MODEL_ROUNDS) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_MODEL_ROUNDS) {
+    throw new Error(`maxModelRounds must be an integer between 1 and ${MAX_MODEL_ROUNDS}`);
+  }
+  return value;
+}
+
+/**
+ * 写入只供 runtime 启动的最小合法配置；Provider endpoint 只允许 runner 自己的 loopback fixture，
+ * maxModelRounds 只为多轮 fixture 提供有界覆盖，默认保持 Review 原有 4 轮预算。
+ */
+export async function writeIsolatedSettings(
+  home,
+  providerBaseUrl = "http://127.0.0.1:9/v1",
+  maxModelRounds = DEFAULT_MAX_MODEL_ROUNDS,
+) {
+  validateMaxModelRounds(maxModelRounds);
+  if (
+    typeof providerBaseUrl !== "string" ||
+    !/^https?:\/\/(?:127\.0\.0\.1|localhost):[1-9]\d{0,4}\/v1$/u.test(providerBaseUrl)
+  ) {
+    throw new Error("isolated Provider endpoint must be an IPv4 loopback /v1 URL");
+  }
   const config = [
     "schema_version = 1",
     "config_revision = 1",
@@ -297,7 +326,7 @@ async function writeIsolatedSettings(home) {
     'provider_id = "provider_e2e"',
     'name = "Review E2E"',
     'api = "openai_responses"',
-    'base_url = "http://127.0.0.1:9/v1"',
+    `base_url = "${providerBaseUrl}"`,
     'credential_id = "cred_e2e"',
     "[providers.network_timeouts]",
     "connect_timeout_ms = 1000",
@@ -306,7 +335,7 @@ async function writeIsolatedSettings(home) {
     "[providers.agent_defaults.context]",
     "auto_compact = true",
     "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 4",
+    `max_model_rounds = ${maxModelRounds}`,
     "max_tool_calls = 8",
     "wall_timeout_ms = 30000",
     "[[providers.models]]",
@@ -372,8 +401,11 @@ async function readProductionMainWindowConfig() {
   return { ...baseWindow, ...(windowsWindow ?? {}) };
 }
 
-/** 生成唯一 identifier、生产窗口和 dev origin 的私有 overlay，不修改仓库配置。 */
-async function writeTauriOverlay(directories, frontendPort, useEdgeDriver) {
+/**
+ * 生成唯一 identifier、生产窗口和 dev origin 的私有 overlay，不修改仓库配置；隐藏窗口只在
+ * 显式验收选项开启时注入，保留默认 runner 的可见行为。
+ */
+async function writeTauriOverlay(directories, frontendPort, useEdgeDriver, hiddenWindow = false) {
   const origin = `http://localhost:${frontendPort}`;
   const websocket = `ws://localhost:${frontendPort}`;
   const path = join(directories.runtime, "tauri.review-redesign.conf.json");
@@ -387,7 +419,12 @@ async function writeTauriOverlay(directories, frontendPort, useEdgeDriver) {
         : {}),
     },
     app: {
-      windows: [{ ...mainWindow }],
+      windows: [
+        {
+          ...mainWindow,
+          ...(hiddenWindow ? { visible: false, focus: false, skipTaskbar: true } : {}),
+        },
+      ],
       security: {
         devCsp: `default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ${origin} ${websocket}; img-src 'self' data: blob: ja-attachment: http://ja-attachment.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
       },
@@ -689,7 +726,7 @@ export async function runProduction(options) {
       edgeDriverIdentity = validatedEdgeDriver;
       [fixtureFacts] = await Promise.all([
         createReviewGitFixture(directories.workspace, options),
-        writeIsolatedSettings(directories.home),
+        writeIsolatedSettings(directories.home, options.providerBaseUrl, options.maxModelRounds),
       ]);
       frontendPort = await reservePort();
       const automationPort = await reservePort(new Set([frontendPort]));
@@ -698,6 +735,7 @@ export async function runProduction(options) {
         directories,
         frontendPort,
         options.edgeDriver !== undefined,
+        options.hiddenWindow === true,
       );
       const environment = buildLaunchEnvironment({
         directories,

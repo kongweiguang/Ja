@@ -139,9 +139,9 @@ final class ConfigurationTurnRuntimeResolverTest {
                 List.of(tool(changed)), List.of(), mcp, Map.of()));
     }
 
-    /** 子任务隐藏用户问答入口属于角色约束，不应被误判为外部执行能力发生漂移。 */
+    /** 隐藏用户问答入口仍属于完整安全目录；角色显隐只能改变暴露集合，不能把定义从 digest 删除。 */
     @Test
-    void inheritedExecutionDigestDoesNotDependOnUserQuestionVisibility() {
+    void inheritedExecutionDigestIncludesHiddenUserQuestionDefinition() {
         JsonObject schema = object("type", new JsonText("object"), "description", new JsonText("fixture"));
         ToolSpec question = new ToolSpec("request_user_input", "Ask the user", schema);
         AgentCapability.ToolContribution contribution = new AgentCapability.ToolContribution(question,
@@ -149,8 +149,11 @@ final class ConfigurationTurnRuntimeResolverTest {
                 AgentTool.builtinBindingDescriptor(question, ToolSideEffect.EXTERNAL, AgentTool.WorkspaceMutationMode.NONE),
                 ignored -> { throw new AssertionError("digest must not bind tools"); });
         McpGateway.McpSnapshot mcp = new McpGateway.McpSnapshot("mcp-empty", List.of(), Instant.EPOCH);
-        assertEquals(ConfigurationTurnRuntimeResolver.toolCatalogDigest(List.of(tool(schema)), List.of(), mcp, Map.of()),
-                ConfigurationTurnRuntimeResolver.toolCatalogDigest(List.of(tool(schema)), List.of(contribution), mcp, Map.of()));
+        String withoutQuestion = ConfigurationTurnRuntimeResolver.toolCatalogDigest(
+                List.of(), List.of(), mcp, Map.of());
+        String withHiddenQuestion = ConfigurationTurnRuntimeResolver.toolCatalogDigest(
+                List.of(), List.of(contribution), mcp, Map.of());
+        assertNotEquals(withoutQuestion, withHiddenQuestion);
     }
 
     /** 目录摘要必须直接覆盖安全声明，不能让相同 Schema 的只读与外部副作用 Tool 共享身份。 */

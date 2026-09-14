@@ -40,8 +40,23 @@ function presentationStatusLabel(status: ToolPresentation["status"]): string {
   }
 }
 
-/** 使用稳定动词统一 Tool 首列，避免服务端标题与详情标签重复表达同一动作。 */
-function presentationActionLabel(presentation: ToolPresentation): string {
+/** 按真实 Tool 名称优先选择可辨识动作，未知 MCP 才回退到通用标签。 */
+function presentationActionLabel(
+  presentation: ToolPresentation,
+  toolName: string | undefined,
+): string {
+  switch (toolName) {
+    case "grep":
+      return "搜索内容";
+    case "find":
+      return "查找文件";
+    case "ls":
+      return "列出目录";
+    case "read_attachment":
+      return "读取附件";
+    default:
+      break;
+  }
   switch (presentation.kind) {
     case "shell":
       return "执行命令";
@@ -56,12 +71,29 @@ function presentationActionLabel(presentation: ToolPresentation): string {
   }
 }
 
-/** 摘要只取首个权威目标，完整输入和多路径信息留在展开内容中。 */
-function presentationTarget(presentation: ToolPresentation): string | undefined {
+/** 只接受 Reducer 从协议外层保留的真实 Tool 名称，缺失时不拿展示标题冒充身份。 */
+function presentationToolName(step: WorkStepAdapter): string | undefined {
+  const toolName = step.metadata?.toolName?.trim();
+  return toolName === undefined || toolName === "" ? undefined : toolName;
+}
+
+/** 摘要只取首个权威目标；grep/find 优先显示 query/pattern，完整输入和多路径信息留在展开内容中。 */
+function presentationTarget(
+  presentation: ToolPresentation,
+  toolName: string | undefined,
+): string | undefined {
+  const inputTarget = presentation.inputPreview?.trim().split(/\r?\n/u)[0];
+  if (toolName === "grep" || toolName === "find") {
+    return (
+      inputTarget ||
+      presentation.relativePaths.find((path) => path.trim() !== "")?.trim() ||
+      presentation.command?.trim()
+    );
+  }
   return (
     presentation.command?.trim() ||
     presentation.relativePaths.find((path) => path.trim() !== "")?.trim() ||
-    presentation.inputPreview?.trim().split(/\r?\n/u)[0]
+    inputTarget
   );
 }
 
@@ -77,7 +109,8 @@ function presentationOutput(presentation: ToolPresentation): string | undefined 
 
 /**
  * Tool 行自身就是唯一 Disclosure：常规步骤保持紧凑，失败步骤自动展开，
- * 且用户的手动选择只在同一状态内有效，避免运行态切换为失败时仍把诊断隐藏起来。
+ * 且用户的手动选择只在同一状态内有效；动作、真实 Tool 名称与首个目标留在同一行，
+ * 已脱敏结果留在展开区，避免用展示标题或原始参数猜测身份。
  */
 export function ToolStepDetails({
   step,
@@ -98,6 +131,7 @@ export function ToolStepDetails({
   const lines = useMemo(() => output?.split(/\r?\n/u) ?? [], [output]);
 
   if (presentation === undefined) return null;
+  const toolName = presentationToolName(step);
   const canLoad =
     presentation.artifactId !== undefined && callId !== undefined && onReadArtifact !== undefined;
   const locallyExpandable = lines.length > PREVIEW_LINES;
@@ -106,9 +140,14 @@ export function ToolStepDetails({
     manualDisclosure?.status === presentation.status
       ? manualDisclosure.open
       : presentation.status === "error";
-  const actionLabel = presentationActionLabel(presentation);
-  const target = presentationTarget(presentation);
-  const accessibleSummary = [actionLabel, target, presentationStatusLabel(presentation.status)]
+  const actionLabel = presentationActionLabel(presentation, toolName);
+  const target = presentationTarget(presentation, toolName);
+  const accessibleSummary = [
+    actionLabel,
+    toolName,
+    target,
+    presentationStatusLabel(presentation.status),
+  ]
     .filter((value): value is string => value !== undefined)
     .join("，");
 
@@ -147,8 +186,15 @@ export function ToolStepDetails({
         onOpenChange={(open) => setManualDisclosure({ status: presentation.status, open })}
       >
         <CollapsibleTrigger className="ja-tool-details__trigger" aria-label={accessibleSummary}>
-          <strong className="ja-tool-details__label">{actionLabel}</strong>
-          {target ? <code>{target}</code> : null}
+          <span className="ja-tool-details__identity">
+            <strong className="ja-tool-details__label">{actionLabel}</strong>
+            {toolName ? <code title={toolName}>{toolName}</code> : null}
+          </span>
+          {target ? (
+            <code className="ja-tool-details__target" title={target}>
+              {target}
+            </code>
+          ) : null}
           <span className="ja-tool-details__summary">
             <ChevronDown aria-hidden="true" />
           </span>
