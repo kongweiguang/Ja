@@ -28,6 +28,7 @@ FILES = {
     "cargo_lock": "Cargo.lock",
     "tauri_config": "src-tauri/tauri.conf.json",
     "maven_pom": "app-server/pom.xml",
+    "golden_core": "contracts/golden/v1/valid/core.jsonl",
     "java_version_resource": "app-server/src/main/version/ja-build.properties",
     "native_resource_config": (
         "app-server/src/main/resources/META-INF/native-image/"
@@ -184,10 +185,81 @@ def _update_json_version(source: str, version: str, label: str) -> str:
     return json.dumps(document, ensure_ascii=False, indent=2).replace("\n", newline) + newline
 
 
+def _read_jsonl_documents(source: str, label: str) -> list[tuple[int, dict[str, object]]]:
+    """Parse JSONL frames individually so a golden protocol fixture stays structurally validated."""
+    documents: list[tuple[int, dict[str, object]]] = []
+    for line_number, raw_line in enumerate(source.splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            document = json.loads(raw_line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} line {line_number} is not valid JSON") from error
+        if not isinstance(document, dict):
+            raise ValueError(f"{label} line {line_number} must contain a JSON object")
+        documents.append((line_number, document))
+    return documents
+
+
+def _find_golden_runtime_response(
+    source: str, label: str
+) -> tuple[int, dict[str, object]]:
+    """Locate the sole initialize response by request ID to avoid changing clientVersion examples."""
+    documents = _read_jsonl_documents(source, label)
+    initialize_ids = [
+        document.get("id")
+        for _, document in documents
+        if document.get("method") == "runtime/initialize"
+    ]
+    if len(initialize_ids) != 1 or initialize_ids[0] is None:
+        raise ValueError(f"{label} must contain one runtime/initialize request with an id")
+
+    request_id = initialize_ids[0]
+    matches: list[tuple[int, dict[str, object]]] = []
+    for line_number, document in documents:
+        if document.get("id") != request_id or "result" not in document:
+            continue
+        result = document["result"]
+        if not isinstance(result, dict):
+            continue
+        runtime = result.get("runtime")
+        if not isinstance(runtime, dict) or "engineVersion" not in runtime:
+            continue
+        if not isinstance(runtime["engineVersion"], str):
+            raise ValueError(f"{label} runtime.engineVersion must be a string")
+        matches.append((line_number, document))
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"{label} must contain one runtime/initialize response with runtime.engineVersion"
+        )
+    return matches[0]
+
+
+def _replace_golden_engine_version(source: str, version: str, label: str) -> str:
+    """Rewrite only the validated response frame while preserving JSONL order and line endings."""
+    line_number, document = _find_golden_runtime_response(source, label)
+    result = document["result"]
+    if not isinstance(result, dict) or not isinstance(result.get("runtime"), dict):
+        raise ValueError(f"{label} runtime response has an invalid shape")
+    result["runtime"]["engineVersion"] = version
+
+    lines = source.splitlines(keepends=True)
+    if line_number > len(lines):
+        raise ValueError(f"{label} response line is outside the source")
+    raw_line = lines[line_number - 1]
+    content = raw_line.rstrip("\r\n")
+    line_ending = raw_line[len(content) :]
+    lines[line_number - 1] = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")) + line_ending
+    )
+    return "".join(lines)
+
+
 def inspect_product_version_sources(
     sources: dict[str, str], tag: str | None = None
 ) -> tuple[str, list[str]]:
-    """Return all projection drift at once so CI exposes a complete remediation set."""
+    """Return all projection drift, including the executable golden response, in one report."""
     version = _authoritative_version(sources)
     drift: list[str] = []
 
@@ -229,6 +301,16 @@ def inspect_product_version_sources(
     expect(
         "app-server/pom.xml project.version",
         _maven_project_version(sources["maven_pom"]),
+        version,
+    )
+    _, golden_response = _find_golden_runtime_response(
+        sources["golden_core"], "contracts/golden/v1/valid/core.jsonl"
+    )
+    golden_result = golden_response["result"]
+    golden_runtime = golden_result["runtime"]
+    expect(
+        "contracts/golden/v1/valid/core.jsonl runtime.engineVersion",
+        golden_runtime["engineVersion"],
         version,
     )
     version_lines = {line.strip() for line in sources["java_version_resource"].splitlines()}
@@ -273,7 +355,7 @@ def inspect_product_version_sources(
 
 
 def synchronize_product_version_sources(sources: dict[str, str]) -> dict[str, str]:
-    """Build a fully validated in-memory synchronization result before any filesystem write."""
+    """Build a fully validated projection set before writing, including the JSONL response identity."""
     version = _authoritative_version(sources)
     updated = dict(sources)
     updated["tauri_config"] = _update_json_version(
@@ -284,6 +366,9 @@ def synchronize_product_version_sources(sources: dict[str, str]) -> dict[str, st
     )
     updated["cargo_lock"] = _replace_cargo_lock_versions(sources["cargo_lock"], version)
     updated["maven_pom"] = _replace_maven_project_version(sources["maven_pom"], version)
+    updated["golden_core"] = _replace_golden_engine_version(
+        sources["golden_core"], version, "contracts/golden/v1/valid/core.jsonl"
+    )
     _, drift = inspect_product_version_sources(updated)
     if drift:
         raise ValueError("synchronization remained incomplete:\n" + "\n".join(drift))

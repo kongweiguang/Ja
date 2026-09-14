@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { WorkspaceProjection } from "@/features/workspace";
 import { useTimelineStore } from "./timelineStore";
 import type {
@@ -17,6 +17,15 @@ import type {
 import type { TimelineEvent, TimelineSnapshot } from "../domain/timelineContracts";
 
 const MAX_RECENT_THREADS = 100;
+const MAX_WORKSPACE_HISTORY_CACHES = 8;
+const EMPTY_CONVERSATION_THREADS: ConversationThread[] = [];
+
+interface WorkspaceHistoryCache {
+  threads: ConversationThread[];
+  currentThreadId: string | undefined;
+  admission: string;
+  lastUsed: number;
+}
 
 interface ConversationControllerOptions {
   history: ConversationHistoryPort;
@@ -246,13 +255,19 @@ export function useConversationController({
   const directoryMutationEpochRef = useRef(0);
   const localCreationEpochsRef = useRef(new Map<string, { workspaceId: string; epoch: number }>());
   const threadMutationGuardsRef = useRef(new Set<string>());
+  const workspaceHistoryCacheRef = useRef(new Map<string, WorkspaceHistoryCache>());
+  const workspaceHistoryCacheClockRef = useRef(0);
   const workspaceRef = useRef(workspace);
-  const historyWorkspaceIdRef = useRef(workspace?.workspaceId);
+  const historyWorkspaceIdRef = useRef<string | undefined>(undefined);
+  const historyWorkspaceRevisionRef = useRef<number | undefined>(undefined);
+  const historyModelAvailableRef = useRef(false);
+  const historyRuntimeAdmissionRef = useRef<string | undefined>(undefined);
   const modelSelectionRef = useRef(modelSelection);
   const accessModeRef = useRef(accessMode);
   const runtimeStateRef = useRef(runtimeState);
   const automaticResyncAttemptRef = useRef<string | undefined>(undefined);
   const manualWorkspaceTargetRef = useRef<string | undefined>(undefined);
+  const manualThreadTargetRef = useRef<string | undefined>(undefined);
   const currentThreadIdRef = useRef(currentThreadId);
   const threadsRef = useRef(threads);
   const latestTurnProjectionRef = useRef(
@@ -343,6 +358,69 @@ export function useConversationController({
   );
 
   /**
+   * 保存当前 workspace 的目录和选择；条目带 runtime admission，服务端重启后不会复用旧快照。
+   * 淘汰目录缓存时只把本控制器曾持有的 Thread 候选交给 Timeline 的安全清理入口。
+   */
+  const rememberWorkspaceHistory = useCallback(
+    (
+      workspaceId: string | undefined,
+      sourceThreads: readonly ConversationThread[],
+      selectedThreadId: string | undefined,
+    ): void => {
+      const admission = historyRuntimeAdmissionRef.current;
+      if (workspaceId === undefined || admission === undefined) return;
+      const scopedThreads = workspaceThreads(workspaceId, sourceThreads);
+      const currentThreadId = scopedThreads.some((thread) => thread.threadId === selectedThreadId)
+        ? selectedThreadId
+        : undefined;
+      const cache = workspaceHistoryCacheRef.current;
+      cache.set(workspaceId, {
+        threads: scopedThreads,
+        currentThreadId,
+        admission,
+        lastUsed: ++workspaceHistoryCacheClockRef.current,
+      });
+      while (cache.size > MAX_WORKSPACE_HISTORY_CACHES) {
+        const oldest = [...cache.entries()].reduce<[string, WorkspaceHistoryCache] | undefined>(
+          (candidate, entry) => {
+            if (entry[0] === workspaceId) return candidate;
+            return candidate === undefined || entry[1].lastUsed < candidate[1].lastUsed
+              ? entry
+              : candidate;
+          },
+          undefined,
+        );
+        if (oldest === undefined) break;
+        cache.delete(oldest[0]);
+        useTimelineStore
+          .getState()
+          .pruneInactiveThreads(oldest[1].threads.map((thread) => thread.threadId));
+      }
+    },
+    [],
+  );
+
+  /**
+   * 读取同一 generation 下的 workspace 缓存并更新 LRU 顺序；不匹配的 admission 立即丢弃，
+   * 让恢复路径回到权威 thread/list 与 thread/read，而不是展示旧 server 的正文。
+   */
+  const cachedWorkspaceHistory = useCallback(
+    (workspaceId: string): WorkspaceHistoryCache | undefined => {
+      const cache = workspaceHistoryCacheRef.current;
+      const entry = cache.get(workspaceId);
+      const admission = historyRuntimeAdmissionRef.current;
+      if (entry === undefined) return undefined;
+      if (admission === undefined || entry.admission !== admission) {
+        cache.delete(workspaceId);
+        return undefined;
+      }
+      entry.lastUsed = ++workspaceHistoryCacheClockRef.current;
+      return entry;
+    },
+    [],
+  );
+
+  /**
    * 创建 durable Thread 后立即读取 authoritative snapshot；只有 snapshot 通过 generation
    * gate 才向 UI 暴露 threadId，避免出现目录有行但 timeline 不可用的半状态。
    */
@@ -389,6 +467,7 @@ export function useConversationController({
     async (
       selected: WorkspaceProjection,
       selection: ConversationModelSelection | undefined,
+      preferredThreadId: string | undefined,
     ): Promise<void> => {
       const request = requestRef.current + 1;
       requestRef.current = request;
@@ -401,21 +480,36 @@ export function useConversationController({
           setError("历史会话数据无法恢复，请重新选择项目。 ");
           return;
         }
-        const currentThread = currentThreadIdRef.current;
+        const scopedThreads = workspaceThreads(selected.workspaceId, listed.items);
+        threadsRef.current = scopedThreads;
+        setThreads(scopedThreads);
+        const currentThread = preferredThreadId ?? currentThreadIdRef.current;
         const first =
-          listed.items.find((thread) => thread.threadId === currentThread) ?? listed.items[0];
+          scopedThreads.find((thread) => thread.threadId === currentThread) ?? scopedThreads[0];
         if (first !== undefined) {
+          if (currentThreadIdRef.current !== first.threadId) {
+            currentThreadIdRef.current = first.threadId;
+            setCurrentThreadId(first.threadId);
+          }
+          const loadedRevision =
+            useTimelineStore.getState().threadRevisionByThread[first.threadId] ?? -1;
+          if (
+            canReuseLoadedThread(first.threadId, selected.workspaceId) &&
+            loadedRevision >= first.revision
+          )
+            return;
           const snapshot = await history.threadRead({ threadId: first.threadId });
           if (!isCurrentRequest(request, selected.workspaceId)) return;
           if (!applySnapshot(snapshot, selected.workspaceId, first.threadId)) {
             setError("最近的会话无法恢复，请重新选择项目。 ");
             return;
           }
-          setThreads(workspaceThreads(selected.workspaceId, listed.items));
           currentThreadIdRef.current = first.threadId;
           setCurrentThreadId(first.threadId);
           return;
         }
+        currentThreadIdRef.current = undefined;
+        setCurrentThreadId(undefined);
         const created = await createAndRestore(selected, selection, request);
         if (!isCurrentRequest(request, selected.workspaceId) || created === undefined) return;
         setThreads(workspaceThreads(selected.workspaceId, [created]));
@@ -509,9 +603,11 @@ export function useConversationController({
       const workspaceChanged = target.workspaceId !== selected.workspaceId;
       if (workspaceChanged) {
         manualWorkspaceTargetRef.current = target.workspaceId;
+        manualThreadTargetRef.current = threadId;
         selected = await activateWorkspace(target.workspaceId);
         if (selected === undefined) {
           manualWorkspaceTargetRef.current = undefined;
+          manualThreadTargetRef.current = undefined;
           setError("会话所属项目已不可用。 ");
           return;
         }
@@ -532,6 +628,7 @@ export function useConversationController({
           setCurrentThreadId(threadId);
         }
         manualWorkspaceTargetRef.current = undefined;
+        manualThreadTargetRef.current = undefined;
         return;
       }
       setBusy(true);
@@ -555,6 +652,7 @@ export function useConversationController({
           setError("会话暂时无法读取，请重试。 ");
       } finally {
         manualWorkspaceTargetRef.current = undefined;
+        manualThreadTargetRef.current = undefined;
         if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
       }
     },
@@ -1166,29 +1264,87 @@ export function useConversationController({
     setCompaction({ phase: "error", ...feedback });
   }, [observedCompaction]);
 
-  /**
-   * workspace commit、首次模型选择或新的 ready generation 到达后恢复历史；admission key 不含
-   * ready/busy 状态，避免 Turn 运行导致目录反复重载，同时允许迁移较慢的 sidecar 就绪后补跑。
-   * 手动跨项目 Thread 选择会自行恢复目标 snapshot，因此跳过默认 first-thread 加载。
-   */
+  /** 每次目录或选择提交后更新 workspace 缓存，保证切回项目时可直接恢复最后可见投影。 */
   useEffect(() => {
+    const currentWorkspaceId = workspaceRef.current?.workspaceId;
+    if (currentWorkspaceId === undefined || historyWorkspaceIdRef.current !== currentWorkspaceId)
+      return;
+    rememberWorkspaceHistory(currentWorkspaceId, threads, currentThreadId);
+  }, [currentThreadId, rememberWorkspaceHistory, threads]);
+
+  /**
+   * workspace commit、首次模型选择或新的 ready generation 到达后恢复历史；workspace 切换先在
+   * layout 阶段投影缓存，避免新 workspace 首帧暂时挂着旧 Thread，目录校验则在后台完成。
+   * admission key 不含 ready/busy 状态，避免 Turn 运行导致目录反复重载；手动跨项目 Thread 选择
+   * 复用同一缓存投影并自行恢复目标 snapshot，因此跳过默认 first-thread 加载。
+   */
+  useLayoutEffect(() => {
     const nextWorkspaceId = workspace?.workspaceId;
     if (
       creationInFlightRef.current !== undefined &&
       historyWorkspaceIdRef.current === nextWorkspaceId
     )
       return;
+
+    const previousWorkspaceId = historyWorkspaceIdRef.current;
+    const workspaceChanged = previousWorkspaceId !== nextWorkspaceId;
+    const firstWorkspaceAdmission = previousWorkspaceId === undefined;
+    const runtimeAdmissionChanged =
+      historyRuntimeAdmission !== undefined &&
+      historyRuntimeAdmissionRef.current !== undefined &&
+      historyRuntimeAdmission !== historyRuntimeAdmissionRef.current;
+    const runtimeBecameAvailable =
+      historyRuntimeAdmission !== undefined && historyRuntimeAdmissionRef.current === undefined;
+    const workspaceRevisionChanged = historyWorkspaceRevisionRef.current !== workspaceRevision;
+    const modelBecameAvailable = modelSelectionAvailable && !historyModelAvailableRef.current;
+    const shouldRefresh =
+      firstWorkspaceAdmission ||
+      workspaceChanged ||
+      runtimeAdmissionChanged ||
+      runtimeBecameAvailable ||
+      workspaceRevisionChanged ||
+      modelBecameAvailable;
+    historyWorkspaceRevisionRef.current = workspaceRevision;
+    historyModelAvailableRef.current = modelSelectionAvailable;
+    if (!shouldRefresh) return;
+
+    if (runtimeAdmissionChanged) {
+      workspaceHistoryCacheRef.current.clear();
+      useTimelineStore.getState().reset();
+    } else if (workspaceChanged && previousWorkspaceId !== undefined) {
+      rememberWorkspaceHistory(previousWorkspaceId, threadsRef.current, currentThreadIdRef.current);
+    }
+    if (historyRuntimeAdmission !== undefined)
+      historyRuntimeAdmissionRef.current = historyRuntimeAdmission;
     historyWorkspaceIdRef.current = nextWorkspaceId;
     requestRef.current += 1;
-    currentThreadIdRef.current = undefined;
-    setCurrentThreadId(undefined);
     setError(undefined);
-    setCompaction({ phase: "idle", retryable: false });
-    latestTurnProjectionRef.current.clear();
-    seenAttemptKeysRef.current.clear();
-    useTimelineStore.getState().reset();
+    if (workspaceChanged || firstWorkspaceAdmission || runtimeAdmissionChanged) {
+      setCompaction({ phase: "idle", retryable: false });
+      latestTurnProjectionRef.current.clear();
+      seenAttemptKeysRef.current.clear();
+      const cached =
+        nextWorkspaceId === undefined || runtimeAdmissionChanged
+          ? undefined
+          : cachedWorkspaceHistory(nextWorkspaceId);
+      const cachedThreads = cached?.threads ?? [];
+      const manualThreadId = manualThreadTargetRef.current;
+      const preferredThreadId =
+        manualThreadId !== undefined &&
+        cachedThreads.some((thread) => thread.threadId === manualThreadId)
+          ? manualThreadId
+          : cached?.currentThreadId;
+      threadsRef.current = cachedThreads;
+      currentThreadIdRef.current = preferredThreadId;
+      setThreads(cachedThreads);
+      setCurrentThreadId(preferredThreadId);
+    }
     const admittedRuntime = runtimeStateRef.current;
-    if (admittedRuntime !== undefined && ["ready", "busy"].includes(admittedRuntime.status)) {
+    if (
+      (firstWorkspaceAdmission || runtimeAdmissionChanged) &&
+      admittedRuntime !== undefined &&
+      ["ready", "busy"].includes(admittedRuntime.status)
+    ) {
       useTimelineStore.getState().applyRuntimeStatus(admittedRuntime);
     }
     const admittedSelection = modelSelectionRef.current;
@@ -1200,12 +1356,17 @@ export function useConversationController({
       setBusy(false);
       return;
     }
-    if (manualWorkspaceTargetRef.current === workspace.workspaceId) return;
-    void loadWorkspaceHistory(workspace, admittedSelection);
+    if (manualWorkspaceTargetRef.current === workspace.workspaceId) {
+      setBusy(false);
+      return;
+    }
+    void loadWorkspaceHistory(workspace, admittedSelection, currentThreadIdRef.current);
   }, [
+    cachedWorkspaceHistory,
     historyRuntimeAdmission,
     loadWorkspaceHistory,
     modelSelectionAvailable,
+    rememberWorkspaceHistory,
     workspace,
     workspaceRevision,
   ]);
@@ -1263,14 +1424,32 @@ export function useConversationController({
     runtimeState !== undefined &&
     ["ready", "busy"].includes(runtimeState.status);
 
+  /**
+   * workspace prop 变化到 layout effect 之间仍可能保留上一轮 React state；返回值先按当前
+   * scope 派生，避免子组件在新项目首帧看到旧 Thread 或沿用旧会话的操作能力。
+   */
+  const visibleWorkspaceId = workspace?.workspaceId;
+  const visibleThreads = useMemo(() => {
+    if (visibleWorkspaceId === undefined) return EMPTY_CONVERSATION_THREADS;
+    if (threads.every((thread) => thread.workspaceId === visibleWorkspaceId)) return threads;
+    return threads.filter((thread) => thread.workspaceId === visibleWorkspaceId);
+  }, [threads, visibleWorkspaceId]);
+  const visibleCurrentThreadId = visibleThreads.some(
+    (thread) => thread.threadId === currentThreadId,
+  )
+    ? currentThreadId
+    : undefined;
+  const scopeReady = historyWorkspaceIdRef.current === workspace?.workspaceId;
+
   return {
-    threads,
-    currentThreadId,
+    threads: visibleThreads,
+    currentThreadId: visibleCurrentThreadId,
     busy,
-    error,
+    error: scopeReady ? error : undefined,
     mutatingThreadIds,
-    compaction,
-    canCompact,
+    compaction:
+      visibleCurrentThreadId === undefined ? { phase: "idle", retryable: false } : compaction,
+    canCompact: visibleCurrentThreadId !== undefined && canCompact,
     create,
     select,
     search,

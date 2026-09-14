@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from scripts.version.product_version import (
@@ -14,7 +15,7 @@ from scripts.version.product_version import (
 
 
 def _fixture(**overrides: str) -> dict[str, str]:
-    """Cover Maven parent/dependency versions and registry packages that sync must preserve."""
+    """Cover preserved dependency projections and independent protocol client/engine examples."""
     sources = {
         "package_json": '{"name":"ja","version":"0.1.0"}\n',
         "tauri_config": '{\n  "productName": "Ja",\n  "version": "9.9.9"\n}\n',
@@ -33,6 +34,12 @@ def _fixture(**overrides: str) -> dict[str, str]:
             '<artifactId>ja-app-server</artifactId><version>9.9.9</version>'
             '<dependencies><dependency><version>7.0.0</version></dependency></dependencies>'
             "</project>\n"
+        ),
+        "golden_core": (
+            '{"jsonrpc":"2.0","id":"c:init","method":"runtime/initialize",'
+            '"params":{"clientVersion":"0.1.0"}}\n'
+            '{"jsonrpc":"2.0","id":"c:init","result":{"runtime":'
+            '{"engine":"ja-kernel","engineVersion":"9.9.9"}}}\n'
         ),
         "java_version_resource": (
             "# @author kongweiguang\nproduct.version=${project.version}\n"
@@ -68,6 +75,40 @@ class ProductVersionTest(unittest.TestCase):
         self.assertIn("<parent><version>4.0.6</version></parent>", updated["maven_pom"])
         self.assertIn("<dependency><version>7.0.0</version>", updated["maven_pom"])
         self.assertIn('name = "serde"\nversion = "1.0.229"', updated["cargo_lock"])
+
+    def test_sync_updates_golden_runtime_version_without_changing_client_version(self) -> None:
+        """Sync the response identity only so request examples retain their independent client version."""
+        updated = synchronize_product_version_sources(_fixture())
+        frames = [json.loads(line) for line in updated["golden_core"].splitlines()]
+
+        self.assertEqual(frames[0]["params"]["clientVersion"], "0.1.0")
+        self.assertEqual(frames[1]["result"]["runtime"]["engineVersion"], "0.1.0")
+
+    def test_check_reports_golden_runtime_version_drift(self) -> None:
+        """Check must fail on a stale executable response even when other identity sources are valid."""
+        sources = _fixture()
+        sources["tauri_config"] = sources["tauri_config"].replace(
+            '"version": "9.9.9"', '"version": "0.1.0"'
+        )
+        sources["cargo_workspace"] = sources["cargo_workspace"].replace(
+            'version = "9.9.9"', 'version = "0.1.0"'
+        )
+        sources["cargo_lock"] = sources["cargo_lock"].replace(
+            'version = "9.9.9"', 'version = "0.1.0"'
+        )
+        sources["maven_pom"] = sources["maven_pom"].replace(
+            '<version>9.9.9</version>', '<version>0.1.0</version>'
+        )
+        _, drift = inspect_product_version_sources(sources)
+
+        self.assertTrue(
+            any(
+                entry.startswith(
+                    "contracts/golden/v1/valid/core.jsonl runtime.engineVersion:"
+                )
+                for entry in drift
+            )
+        )
 
     def test_check_reports_all_drift_and_bad_tag(self) -> None:
         """Read-only checks aggregate ecosystem drift and immutable release-tag mismatch."""

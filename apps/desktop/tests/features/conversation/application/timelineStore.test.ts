@@ -7,7 +7,10 @@ import {
   selectTaskActivitiesForRoot,
   useTimelineStore,
 } from "@/features/conversation/application/timelineStore";
-import type { TimelineEvent } from "@/features/conversation/domain/timelineContracts";
+import type {
+  TimelineEvent,
+  TimelineTaskActivityEntry,
+} from "@/features/conversation/domain/timelineContracts";
 
 const status = {
   kind: "status" as const,
@@ -59,6 +62,17 @@ function prepareStore(): void {
       "ws_store",
     ),
   ).toBe("applied");
+}
+
+/** 构造只用于清理测试的 Thread 投影，避免把快照协议细节混入淘汰断言。 */
+function projectionThread(threadId: string) {
+  return {
+    threadId,
+    workspaceId: "ws_store",
+    title: threadId,
+    status: "active" as const,
+    revision: 0,
+  };
 }
 
 describe("timeline Zustand seam", () => {
@@ -458,5 +472,175 @@ describe("timeline Zustand seam", () => {
     } finally {
       unsubscribe();
     }
+  });
+
+  it("prunes owned inactive projections while retaining active, pending-approval, and side-task threads", () => {
+    prepareStore();
+    const sideTask: TimelineTaskActivityEntry = {
+      activity: {
+        activitySequence: 1,
+        activityId: "activity_side",
+        rootThreadId: "thr_side",
+        taskThreadId: "thr_side_child",
+        actorThreadId: "thr_side",
+        causalTurnId: null,
+        kind: "progress",
+        summary: { text: "side task" },
+        createdAt: "2026-09-05T00:00:00Z",
+      },
+      task: {
+        taskThreadId: "thr_side_child",
+        parentThreadId: "thr_side",
+        rootThreadId: "thr_side",
+        originTurnId: null,
+        taskName: "side task",
+        depth: 1,
+        taskKind: "side_task",
+        lifecycle: "independent",
+        state: "running",
+        revision: 1,
+        latestActivitySequence: 1,
+        unreadCount: 1,
+        descendantCount: 0,
+        runningDescendantCount: 0,
+        needsAttentionCount: 0,
+        latestSafeSummary: "side task",
+        startedAt: "2026-09-05T00:00:00Z",
+        completedAt: null,
+        updatedAt: "2026-09-05T00:00:00Z",
+      },
+    };
+    useTimelineStore.setState((state) => ({
+      ...state,
+      threads: {
+        ...state.threads,
+        thr_idle: projectionThread("thr_idle"),
+        thr_active: projectionThread("thr_active"),
+        thr_pending: projectionThread("thr_pending"),
+        thr_side: projectionThread("thr_side"),
+        thr_resolved: projectionThread("thr_resolved"),
+        thr_goal: projectionThread("thr_goal"),
+      },
+      turns: {
+        ...state.turns,
+        turn_idle: {
+          turnId: "turn_idle",
+          threadId: "thr_idle",
+          status: "completed" as const,
+        },
+        turn_active: {
+          turnId: "turn_active",
+          threadId: "thr_active",
+          status: "running" as const,
+        },
+      },
+      items: {
+        ...state.items,
+        item_idle: {
+          itemId: "item_idle",
+          threadId: "thr_idle",
+          turnId: "turn_idle",
+          kind: "agent_message" as const,
+          status: "completed" as const,
+          text: "done",
+        },
+      },
+      itemThreadById: { ...state.itemThreadById, item_idle: "thr_idle" },
+      itemUtf8BytesById: { ...state.itemUtf8BytesById, item_idle: 4 },
+      itemIdsByThread: { ...state.itemIdsByThread, thr_idle: ["item_idle"] },
+      toolItemIdByCallId: {
+        ...state.toolItemIdByCallId,
+        "thr_idle:turn_idle:call_idle": "item_idle",
+      },
+      pendingToolOrdinalByCallId: {
+        ...state.pendingToolOrdinalByCallId,
+        "thr_idle:turn_idle:call_idle": 0,
+      },
+      liveStartedToolCorrelations: {
+        ...state.liveStartedToolCorrelations,
+        "thr_idle:turn_idle:call_idle": true,
+      },
+      approvalsById: {
+        ...state.approvalsById,
+        approval_pending: {
+          threadId: "thr_pending",
+          approval: {
+            approvalId: "approval_pending",
+            threadId: "thr_pending",
+            turnId: "turn_pending",
+            threadRevision: 1,
+            callId: "call_pending",
+            toolName: "shell",
+            reason: "need approval",
+            expiresAt: "2026-09-05T00:01:00Z",
+          },
+        },
+        approval_resolved: {
+          threadId: "thr_resolved",
+          approval: {
+            approvalId: "approval_resolved",
+            threadId: "thr_resolved",
+            turnId: "turn_resolved",
+            threadRevision: 1,
+            callId: "call_resolved",
+            toolName: "shell",
+            reason: "already resolved",
+            expiresAt: "2026-09-05T00:01:00Z",
+          },
+          decision: "deny",
+        },
+      },
+      taskActivitiesByRootThread: {
+        ...state.taskActivitiesByRootThread,
+        thr_side: [sideTask],
+      },
+      goalActivitiesByOwnerThread: {
+        ...state.goalActivitiesByOwnerThread,
+        thr_goal: [
+          {
+            goalId: "goal_terminal",
+            objective: "terminal goal",
+            status: "achieved" as const,
+            goalRevision: 1,
+            eventSequence: 1,
+            occurredAt: "2026-09-05T00:00:00Z",
+          },
+        ],
+      },
+      threadRevisionByThread: {
+        ...state.threadRevisionByThread,
+        thr_idle: 1,
+      },
+      streamSeqByTurn: { ...state.streamSeqByTurn, turn_idle: 1 },
+      draftByTurn: { ...state.draftByTurn, turn_idle: [] },
+      resyncRequired: { ...state.resyncRequired, thr_idle: "invalid_event" },
+    }));
+
+    useTimelineStore
+      .getState()
+      .pruneInactiveThreads([
+        "thr_idle",
+        "thr_active",
+        "thr_pending",
+        "thr_side",
+        "thr_resolved",
+        "thr_goal",
+      ]);
+
+    const next = useTimelineStore.getState();
+    expect(next.threads["thr_idle"]).toBeUndefined();
+    expect(next.turns["turn_idle"]).toBeUndefined();
+    expect(next.items["item_idle"]).toBeUndefined();
+    expect(next.toolItemIdByCallId["thr_idle:turn_idle:call_idle"]).toBeUndefined();
+    expect(next.pendingToolOrdinalByCallId["thr_idle:turn_idle:call_idle"]).toBeUndefined();
+    expect(next.liveStartedToolCorrelations["thr_idle:turn_idle:call_idle"]).toBeUndefined();
+    expect(next.resyncRequired["thr_idle"]).toBeUndefined();
+    expect(next.threads["thr_active"]).toBeDefined();
+    expect(next.threads["thr_pending"]).toBeDefined();
+    expect(next.approvalsById["approval_pending"]).toBeDefined();
+    expect(next.threads["thr_side"]).toBeDefined();
+    expect(next.taskActivitiesByRootThread["thr_side"]).toEqual([sideTask]);
+    expect(next.threads["thr_resolved"]).toBeUndefined();
+    expect(next.threads["thr_goal"]).toBeUndefined();
   });
 });

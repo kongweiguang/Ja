@@ -1896,6 +1896,48 @@ describe("ChatTimeline", () => {
     await waitFor(() => expect(scroll).toHaveProperty("scrollTop", 100));
   });
 
+  /** 切换 Thread 时必须按稳定 row identity 恢复自己的锚点，不能继承另一个会话的 scrollTop。 */
+  it("隔离并恢复带 thread identity 的会话滚动位置", async () => {
+    const threadItems = (threadId: string): TimelineItemAdapter[] =>
+      Array.from({ length: 24 }, (_, index) =>
+        baseItem({
+          itemId: `${threadId}:item:${index}`,
+          threadId,
+          turnId: `${threadId}:turn:${index}`,
+          kind: "user_message",
+          text: `${threadId} 消息 ${index}`,
+          createdAt: `2026-09-12T00:00:${String(index).padStart(2, "0")}Z`,
+        }),
+      );
+    const { container, rerender } = render(
+      <ChatTimeline threadId="thread_a" items={threadItems("thread_a")} />,
+    );
+    expect(container.querySelector(".ja-chat-timeline")).toHaveAttribute(
+      "data-thread-id",
+      "thread_a",
+    );
+    const scroll = container.querySelector(".ja-chat-timeline__scroll");
+    expect(scroll).not.toBeNull();
+    if (scroll === null) return;
+
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 8_000 },
+      scrollTop: { configurable: true, writable: true, value: 124 },
+    });
+    fireEvent.scroll(scroll);
+
+    rerender(<ChatTimeline threadId="thread_b" items={threadItems("thread_b")} />);
+    expect(container.querySelector(".ja-chat-timeline")).toHaveAttribute(
+      "data-thread-id",
+      "thread_b",
+    );
+    await waitFor(() => expect(scroll).not.toHaveProperty("scrollTop", 124));
+
+    rerender(<ChatTimeline threadId="thread_a" items={threadItems("thread_a")} />);
+    await waitFor(() => expect(screen.getByText("thread_a 消息 0")).toBeInTheDocument());
+  });
+
   /** 回到底部入口必须悬浮在 Timeline Viewport 上，不能进入滚动内容并反向改变 scrollHeight。 */
   it("keeps the jump-to-latest control outside the scroll content", async () => {
     const { container } = render(

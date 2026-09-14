@@ -345,7 +345,9 @@ describe("NavigationSidebar", () => {
     const { rerender } = render(
       <NavigationSidebar {...sidebarProps({ projects: [], threads: [], historyBusy: true })} />,
     );
-    expect(screen.getByRole("status", { name: "" })).toHaveTextContent("正在读取会话");
+    expect(screen.getByRole("status", { name: "正在读取会话" })).toBeVisible();
+    expect(screen.queryByText("正在读取会话…")).not.toBeInTheDocument();
+    expect(screen.queryByText("还没有历史对话。")).not.toBeInTheDocument();
 
     rerender(
       <NavigationSidebar
@@ -363,6 +365,37 @@ describe("NavigationSidebar", () => {
       <NavigationSidebar {...sidebarProps({ projects: [], threads: [], historyBusy: false })} />,
     );
     expect(screen.getByText("还没有历史对话。")).toBeVisible();
+  });
+
+  /** 标题状态固定在分组头部，折叠时仍可感知且不会制造列表行高跳动。 */
+  it("keeps the history loading indicator in the recent-conversations heading", async () => {
+    const { rerender } = render(
+      <NavigationSidebar
+        {...sidebarProps({
+          historyBusy: true,
+          threads: [thread, { ...thread, threadId: "thread-2", title: "第二个对话" }],
+        })}
+      />,
+    );
+
+    const heading = screen.getByRole("heading", { name: "最近对话" });
+    const loading = screen.getByRole("status", { name: "正在读取会话" });
+    expect(heading.parentElement).toContainElement(loading);
+    expect(screen.getByRole("button", { name: "修复导航" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "第二个对话" })).toBeVisible();
+    expect(loading.querySelector(".lucide-loader-circle")).toBeInTheDocument();
+
+    rerender(
+      <NavigationSidebar
+        {...sidebarProps({
+          historyBusy: true,
+          historySectionCollapsed: true,
+          threads: [thread],
+        })}
+      />,
+    );
+    expect(screen.getByRole("status", { name: "正在读取会话" })).toBeVisible();
+    expect(screen.queryByRole("list", { name: "最近对话列表" })).not.toBeInTheDocument();
   });
 
   it("keeps an existing history list spatially stable while another thread snapshot loads", () => {
@@ -542,6 +575,17 @@ describe("NavigationSidebar", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("项目列表暂时不可用");
     await user.click(screen.getByRole("button", { name: "重试" }));
     expect(onRetryProjects).toHaveBeenCalledOnce();
+
+    rerender(
+      <NavigationSidebar
+        {...sidebarProps({
+          projectCatalogLoading: true,
+          projectCatalogError: undefined,
+        })}
+      />,
+    );
+    expect(screen.queryByText("正在读取项目…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "当前项目：ja" })).toBeVisible();
   });
 });
 

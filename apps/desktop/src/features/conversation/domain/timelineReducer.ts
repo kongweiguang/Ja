@@ -271,6 +271,133 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
   };
 }
 
+/**
+ * 清理控制器淘汰的非活动 Thread 投影；活跃 Turn、待审批和运行中的 Task 关联必须继续保留，
+ * 终态 Goal/Approval 历史则可随缓存淘汰。调用方只应传入自己拥有的缓存候选。
+ */
+export function pruneInactiveThreads(
+  state: TimelineState,
+  candidateThreadIds: readonly string[],
+): TimelineState {
+  const candidates = new Set(candidateThreadIds);
+  const removable = new Set<string>();
+  for (const threadId of candidates) {
+    if (state.threads[threadId] === undefined) continue;
+    if (
+      Object.values(state.turns).some(
+        (turn) =>
+          turn.threadId === threadId && !["completed", "failed", "cancelled"].includes(turn.status),
+      )
+    )
+      continue;
+    if (
+      Object.values(state.approvalsById).some(
+        (projection) =>
+          projection.threadId === threadId &&
+          projection.decision === undefined &&
+          projection.closedAt === undefined,
+      )
+    )
+      continue;
+    if (
+      Object.values(state.taskActivitiesByRootThread).some((entries) =>
+        entries.some((entry) => {
+          const activity = entry.activity;
+          const task = entry.task;
+          const ownsThread = [
+            activity.rootThreadId,
+            activity.taskThreadId,
+            activity.actorThreadId,
+            task.taskThreadId,
+            task.parentThreadId,
+            task.rootThreadId,
+          ].includes(threadId);
+          const taskIsActive = !["completed", "failed", "cancelled"].includes(task.state);
+          return ownsThread && taskIsActive;
+        }),
+      )
+    )
+      continue;
+    removable.add(threadId);
+  }
+  if (removable.size === 0) return state;
+
+  const turnIds = new Set(
+    Object.values(state.turns)
+      .filter((turn) => removable.has(turn.threadId))
+      .map((turn) => turn.turnId),
+  );
+  const itemIds = new Set(
+    [...removable].flatMap((threadId) => state.itemIdsByThread[threadId] ?? []),
+  );
+  const threadPrefixes = [...removable].map((threadId) => `${threadId}:`);
+  const filterThreadRecord = <T>(record: Record<string, T>): Record<string, T> =>
+    Object.fromEntries(Object.entries(record).filter(([threadId]) => !removable.has(threadId)));
+
+  return outcome(
+    {
+      ...state,
+      threads: filterThreadRecord(state.threads),
+      turns: Object.fromEntries(
+        Object.entries(state.turns).filter(([turnId]) => !turnIds.has(turnId)),
+      ),
+      items: Object.fromEntries(
+        Object.entries(state.items).filter(([itemId]) => !itemIds.has(itemId)),
+      ),
+      itemThreadById: Object.fromEntries(
+        Object.entries(state.itemThreadById).filter(([itemId]) => !itemIds.has(itemId)),
+      ),
+      itemUtf8BytesById: Object.fromEntries(
+        Object.entries(state.itemUtf8BytesById).filter(([itemId]) => !itemIds.has(itemId)),
+      ),
+      itemIdsByThread: Object.fromEntries(
+        Object.entries(state.itemIdsByThread).filter(([threadId]) => !removable.has(threadId)),
+      ),
+      toolItemIdByCallId: Object.fromEntries(
+        Object.entries(state.toolItemIdByCallId).filter(
+          ([correlation, itemId]) =>
+            !threadPrefixes.some((prefix) => correlation.startsWith(prefix)) &&
+            !itemIds.has(itemId),
+        ),
+      ),
+      pendingToolOrdinalByCallId: Object.fromEntries(
+        Object.entries(state.pendingToolOrdinalByCallId).filter(
+          ([correlation]) => !threadPrefixes.some((prefix) => correlation.startsWith(prefix)),
+        ),
+      ),
+      liveStartedToolCorrelations: Object.fromEntries(
+        Object.entries(state.liveStartedToolCorrelations).filter(
+          ([correlation]) => !threadPrefixes.some((prefix) => correlation.startsWith(prefix)),
+        ),
+      ),
+      approvalsById: Object.fromEntries(
+        Object.entries(state.approvalsById).filter(
+          ([, projection]) => !removable.has(projection.threadId),
+        ),
+      ),
+      contextCompactionByThread: filterThreadRecord(state.contextCompactionByThread),
+      contextUsageInvalidatedAtByThread: filterThreadRecord(
+        state.contextUsageInvalidatedAtByThread,
+      ),
+      contextUsageByThread: filterThreadRecord(state.contextUsageByThread),
+      taskActivitiesByRootThread: filterThreadRecord(state.taskActivitiesByRootThread),
+      goalActivitiesByOwnerThread: filterThreadRecord(state.goalActivitiesByOwnerThread),
+      inputQueueByTurn: Object.fromEntries(
+        Object.entries(state.inputQueueByTurn).filter(([turnId]) => !turnIds.has(turnId)),
+      ),
+      threadRevisionByThread: filterThreadRecord(state.threadRevisionByThread),
+      streamSeqByTurn: Object.fromEntries(
+        Object.entries(state.streamSeqByTurn).filter(([turnId]) => !turnIds.has(turnId)),
+      ),
+      draftByTurn: Object.fromEntries(
+        Object.entries(state.draftByTurn).filter(([turnId]) => !turnIds.has(turnId)),
+      ),
+      resyncRequired: filterThreadRecord(state.resyncRequired),
+    },
+    "applied",
+  );
+}
+
 /** 在不修改前一状态的前提下附加最新 Reducer 结果。 */
 function outcome(state: TimelineState, lastOutcome: ApplyOutcome): TimelineState {
   return { ...state, lastOutcome };

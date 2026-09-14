@@ -342,6 +342,7 @@ export function TaskDetailPanel({
       ) : (
         <ChatTimeline
           className="ja-task-chat-timeline"
+          threadId={threadId === "" ? undefined : threadId}
           items={items}
           turns={turns}
           approvals={approvals}

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactElement } from "re
 import { useShallow } from "zustand/react/shallow";
 import {
   ChatTimeline,
+  TimelineScrollCache,
   Composer,
   InteractionCard,
   useInteractionController,
@@ -154,7 +155,10 @@ export function ConversationWorkspace({
   const { queryRuntime } = useRuntimeLifecycle();
   const turnPort = useRuntimeTurns();
   const threadId = conversation.currentThreadId ?? "";
+  const timelineScrollCache = useMemo(() => new TimelineScrollCache(), []);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
+  /** ConversationWorkspace 是 Timeline 瞬态快照的 owner；卸载时释放，不把滚动位置写入用户文件。 */
+  useEffect(() => () => timelineScrollCache.clear(), [timelineScrollCache]);
   const clarification = useInteractionController({
     threadId: conversation.currentThreadId,
     visible: turnAdmissionReady && runtimeState?.features.includes("interaction_v1") === true,
@@ -776,6 +780,8 @@ export function ConversationWorkspace({
         </section>
       ) : (
         <ChatTimeline
+          threadId={threadId === "" ? undefined : threadId}
+          scrollCache={timelineScrollCache}
           items={items}
           skills={composerSkills}
           turns={turns as Turn[]}

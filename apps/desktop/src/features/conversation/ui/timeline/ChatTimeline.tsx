@@ -1,15 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactElement,
-  type ReactNode,
-  type RefObject,
-} from "react";
+import { useCallback, useMemo, useRef, type ReactElement, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDown, CircleAlert, Paperclip, RotateCcw } from "lucide-react";
 import { cn } from "@/shared/ui/primitives/cn";
@@ -38,6 +30,7 @@ import {
   type HistoryAttachmentAuthorization,
   type HistoryAttachmentThumbnailPort,
 } from "./HistoryAttachmentThumbnail";
+import { TimelineScrollCache, useTimelineScroll, type TimelineScrollKey } from "./timelineScroll";
 import "./timeline.css";
 
 export interface ChatTimelineExternalRow {
@@ -51,6 +44,10 @@ export interface ChatTimelineExternalRow {
 }
 
 export interface ChatTimelineProps {
+  /** 当前 Thread 的瞬态 viewport identity；缺失时保留 fixture/嵌入调用方的默认尾部语义。 */
+  threadId?: string;
+  /** 由稳定的 ConversationWorkspace owner 提供，使 Timeline 短暂卸载时仍能恢复滚动锚点。 */
+  scrollCache?: TimelineScrollCache;
   /** Item 必须直接来自规范化 Reducer 投影，视图不创建第二份业务状态。 */
   items: readonly TimelineItemAdapter[];
   /** Turn 只用于紧凑的当前工作状态，绝不能充当第二个 Store。 */
@@ -919,79 +916,12 @@ function AssistantResponse({
 }
 
 /**
- * 仅当用户已经跟随底部时让 Viewport 靠近最新 Stream Item。向上的 Wheel 意图必须先于
- * scrollTop 变化解除跟随，否则仍落在底部阈值内的第一格滚动会被下一帧 Stream 更新抢回。
- */
-function useFollowLatest(
-  scrollRef: RefObject<HTMLDivElement | null>,
-  rowCount: number,
-  revision: string,
-  scrollToLatest: () => void,
-  onFollowingChange: (following: boolean) => void,
-): void {
-  const followingRef = useRef(true);
-  const lastScrollHeightRef = useRef(0);
-
-  useEffect(() => {
-    const element = scrollRef.current;
-    if (element === null) {
-      return undefined;
-    }
-    const onScroll = (): void => {
-      const following = element.scrollHeight - element.scrollTop - element.clientHeight <= 64;
-      followingRef.current = following;
-      onFollowingChange(following);
-    };
-    /** 用户向上查看历史时立即让出 Viewport 所有权，不等待浏览器完成首个滚动步进。 */
-    const onWheel = (event: WheelEvent): void => {
-      if (event.deltaY >= 0 || !followingRef.current) {
-        return;
-      }
-      followingRef.current = false;
-      onFollowingChange(false);
-    };
-    element.addEventListener("scroll", onScroll, { passive: true });
-    element.addEventListener("wheel", onWheel, { passive: true });
-    onScroll();
-    return () => {
-      element.removeEventListener("scroll", onScroll);
-      element.removeEventListener("wheel", onWheel);
-    };
-  }, [onFollowingChange, scrollRef]);
-
-  useEffect(() => {
-    if (rowCount === 0 || !followingRef.current) {
-      return;
-    }
-    const element = scrollRef.current;
-    if (element === null) {
-      return;
-    }
-    const oldScrollHeight = lastScrollHeightRef.current;
-    lastScrollHeightRef.current = element.scrollHeight;
-    // 使用 requestAnimationFrame 等 Stream Text 稳定后再测量 Virtualizer，避免中间 DOM 高度引起滚动跳变。
-    const frame =
-      typeof window.requestAnimationFrame === "function"
-        ? window.requestAnimationFrame(scrollToLatest)
-        : window.setTimeout(scrollToLatest, 0);
-    if (oldScrollHeight === 0) {
-      followingRef.current = true;
-    }
-    return () => {
-      if (typeof window.cancelAnimationFrame === "function" && typeof frame === "number") {
-        window.cancelAnimationFrame(frame);
-      } else {
-        window.clearTimeout(frame);
-      }
-    };
-  }, [revision, rowCount, scrollRef, scrollToLatest]);
-}
-
-/**
  * 对长对话做 Virtualization，同时保留 Turn 级分组、本地 Stream 更新以及桌面端共用的
  * Disclosure/Approval 组件。
  */
 export function ChatTimeline({
+  threadId,
+  scrollCache,
   items,
   skills = [],
   turns = [],
@@ -1017,7 +947,6 @@ export function ChatTimeline({
   );
   const orderedRows = useMemo(() => orderTimelineRows(rows, externalRows), [externalRows, rows]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [followingLatest, setFollowingLatest] = useState(true);
   const revision = useMemo(
     () =>
       orderedRows
@@ -1072,7 +1001,22 @@ export function ChatTimeline({
     },
     [orderedRows.length, virtualizer],
   );
-  useFollowLatest(scrollRef, orderedRows.length, revision, scrollToLatest, setFollowingLatest);
+  const indexForKey = useCallback(
+    (key: TimelineScrollKey): number =>
+      orderedRows.findIndex((entry, index) => orderedRowKey(entry, index) === key),
+    [orderedRows],
+  );
+  const timelineScroll = useTimelineScroll({
+    cache: scrollCache,
+    threadId,
+    rowCount: orderedRows.length,
+    revision,
+    scrollRef,
+    virtualizer,
+    indexForKey,
+    scrollToLatest,
+  });
+  const followingLatest = timelineScroll.followingLatest;
   const virtualRows = virtualizer.getVirtualItems();
   const visibleRows =
     virtualRows.length > 0
@@ -1088,12 +1032,15 @@ export function ChatTimeline({
 
   /** 将用户带回 Live Tail，但不修改规范化 Timeline 投影。 */
   const handleScrollToLatest = (): void => {
-    setFollowingLatest(true);
-    scrollToLatest();
+    timelineScroll.scrollToLatest();
   };
 
   return (
-    <section className={cn("ja-chat-timeline", className)} aria-label="对话时间线">
+    <section
+      className={cn("ja-chat-timeline", className)}
+      aria-label="对话时间线"
+      data-thread-id={threadId}
+    >
       {orderedRows.length === 0 ? <p className="ja-chat-timeline__empty">{emptyText}</p> : null}
       <div className="ja-chat-timeline__scroll" ref={scrollRef}>
         <div

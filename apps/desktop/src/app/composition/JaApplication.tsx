@@ -1726,7 +1726,11 @@ export function JaApplication({
               runtimeIssueContent={runtimeIssue}
               currentThreadId={conversation.currentThreadId}
               threads={conversation.threads}
-              historyBusy={conversation.busy && conversation.threads.length === 0}
+              historyBusy={
+                // 项目切换先由 workspace controller 忙碌，随后由 conversation controller 接续历史恢复；
+                // 两者都只投影到“最近对话”标题行，避免旧列表被临时占位替换或因空列表闪现。
+                workspace.busy || conversation.busy
+              }
               historyError={conversation.error}
               newConversationDisabled={!conversationScopeReady}
               projectBusy={

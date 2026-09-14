@@ -188,6 +188,28 @@
   letter-spacing: 0;
 }
 
+.ja-navigation-history-loading {
+  display: inline-grid;
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 1rem;
+  place-items: center;
+  color: var(--text-tertiary);
+}
+
+.ja-navigation-history-loading svg {
+  width: 0.82rem;
+  height: 0.82rem;
+  stroke-width: 1.9;
+  animation: ja-navigation-history-spin 0.85s linear infinite;
+}
+
+@keyframes ja-navigation-history-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .ja-navigation-section-toggle {
   display: inline-flex;
   min-width: 0;
@@ -769,6 +791,7 @@
   .ja-navigation-action,
   .ja-navigation-section-action,
   .ja-navigation-section-toggle svg,
+  .ja-navigation-history-loading svg,
   .ja-navigation-section-content,
   .ja-navigation-thread-row,
   .ja-navigation-thread,

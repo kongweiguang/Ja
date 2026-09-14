@@ -13,6 +13,7 @@ import {
   applyTurnAccepted,
   applyRuntimeStatus,
   createTimelineState,
+  pruneInactiveThreads as pruneInactiveThreadProjection,
   requireActiveTurnResync,
   requireThreadResync,
   type AcceptedTurnProjection,
@@ -29,6 +30,7 @@ export interface TimelineStore extends TimelineState {
   ) => TimelineState["lastOutcome"];
   recordThreadMetadataRevision: (threadId: string, revision: number) => void;
   requestThreadResync: (threadId: string) => void;
+  pruneInactiveThreads: (threadIds: readonly string[]) => void;
   reset: () => void;
 }
 
@@ -153,6 +155,9 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       }),
     /** 队列 CAS 冲突只建立一次 authoritative read 意图，不在 Renderer 猜测条目现状。 */
     requestThreadResync: (threadId) => set((state) => requireThreadResync(state, threadId)),
+    /** 仅清理控制器淘汰的非活动缓存 Thread；Reducer 会再次保护实时任务与审批投影。 */
+    pruneInactiveThreads: (threadIds) =>
+      set((state) => pruneInactiveThreadProjection(state, threadIds)),
     reset: () => set(createTimelineState()),
   }));
 }

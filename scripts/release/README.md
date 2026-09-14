@@ -20,6 +20,8 @@ Windows Host 与 Shell 的环境白名单会转发宿主提供的绝对 `PSModul
 
 发布从指定提交手工触发 `release=true`。Native 矩阵通过后，汇总签名产物并生成 `latest.json`，从权威产品版本派生 `v<version>`，为该提交创建未公开的 GitHub draft Release。工作流不由 tag push 触发，不提前创建或移动发布 tag，也不会自动公开或覆盖同名 Release；公开时确认 tag 指向通过验收的提交。
 
+`package.json` 是产品版本的唯一来源。`pnpm version:sync` 和 `pnpm version:check` 同时覆盖 Cargo、Tauri、Maven 与协议 golden 中 `runtime/initialize` 响应的 `engineVersion`，不改写请求中的 `clientVersion` 示例。运行 JVM 桌面验收前还需重新打包并核对 JAR 内嵌版本，源码版本同步不会替换已有 JAR。
+
 公开发布须在更新签名验证、安装验收和完整平台矩阵通过后，由发布 owner 在用户授权范围内执行。产物清单必须如实标注系统未签名与未公证，不能将更新签名冒充系统签名。缺少更新密钥或产物时保持未公开；已经公开的版本不得移动 tag 或静默复用版本号，修复应使用新版本。
 
 CI 继续生成 Maven BOM、依赖许可证清单与供应链报告。当前仓库没有 `LICENSES/approved` 批准归档，报告会如实保留 `LICENSE_ARCHIVE_EMPTY` 等未完成事项；发布不调用遗留的 `-FailOnBlocker` 审批模式，也不把归档状态改写为 `approved/complete`。报告生成失败仍会阻止构建，报告中的审查未完成状态应随发布说明披露。

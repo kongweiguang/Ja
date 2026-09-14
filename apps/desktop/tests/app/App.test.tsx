@@ -597,10 +597,15 @@ describe("Ja desktop shell v1", () => {
       updatedAt: "2026-08-30T23:59:00Z",
     };
     const historyAdapter = history();
-    historyAdapter.workspaceList = vi.fn(async () => ({
-      items: [projectWorkspace],
-      nextCursor: null,
-    }));
+    let resolveWorkspaceList: (() => void) | undefined;
+    const workspaceListReady = new Promise<void>((resolve) => {
+      resolveWorkspaceList = resolve;
+    });
+    historyAdapter.workspaceList = vi.fn(async () => {
+      const result = { items: [projectWorkspace], nextCursor: null };
+      resolveWorkspaceList?.();
+      return result;
+    });
     historyAdapter.workspaceOpen = vi.fn(async () => projectWorkspace);
     historyAdapter.threadList = vi.fn(async ({ workspaceId }) => ({
       items:
@@ -650,7 +655,11 @@ describe("Ja desktop shell v1", () => {
       />,
     );
 
-    const projectButton = await screen.findByRole("button", { name: "切换到项目：ja" });
+    // 先等待真实目录 adapter 返回，再让 React 收口异步 catalog 状态，避免把并行负载误判为无项目。
+    await act(async () => {
+      await workspaceListReady;
+    });
+    const projectButton = screen.getByRole("button", { name: "切换到项目：ja" });
     await waitFor(() => expect(projectButton).toBeEnabled());
     fireEvent.click(projectButton);
     await waitFor(() =>
@@ -700,7 +709,7 @@ describe("Ja desktop shell v1", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(await screen.findByRole("region", { name: "设置页面" })).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "返回应用" }));
+    fireEvent.click(await screen.findByRole("button", { name: "返回应用" }));
     await waitFor(() => expect(screen.getByRole("textbox", { name: "消息" })).toHaveFocus());
   }, 10_000);
 

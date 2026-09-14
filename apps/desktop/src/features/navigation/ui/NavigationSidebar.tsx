@@ -498,7 +498,9 @@ function SectionToggle({ title, open }: { title: string; open: boolean }): React
 /**
  * 按 Codex 结构渲染侧栏，并用 props identity 隔离 Timeline 高频更新；真实目录、选择或状态变化
  * 仍正常提交，流式正文与 Tool metadata 不应让整个导航树重复渲染或重启动画。
- * 异常详情在状态旁按需打开并居中排版，悬停只解释原因，恢复操作仍由组合层持有。
+ * 历史读取只在“最近对话”标题行保留固定尺寸的状态指示器，避免用列表占位替换既有内容，
+ * 从而让跨项目恢复保持空间稳定；异常详情在状态旁按需打开并居中排版，悬停只解释原因，
+ * 恢复操作仍由组合层持有。
  */
 export const NavigationSidebar = memo(function NavigationSidebar(
   props: NavigationSidebarProps,
@@ -566,7 +568,7 @@ export const NavigationSidebar = memo(function NavigationSidebar(
                   </div>
                 ))}
               </div>
-              {props.projectCatalogLoading ? (
+              {props.projectCatalogLoading && props.projects.length === 0 ? (
                 <p className="ja-navigation-catalog-status" role="status">
                   正在读取项目…
                 </p>
@@ -602,14 +604,19 @@ export const NavigationSidebar = memo(function NavigationSidebar(
               <h2 id="ja-navigation-history-title" aria-label="最近对话">
                 <SectionToggle title="最近对话" open={!props.historySectionCollapsed} />
               </h2>
+              {props.historyBusy ? (
+                <span
+                  className="ja-navigation-history-loading"
+                  role="status"
+                  aria-label="正在读取会话"
+                  aria-live="polite"
+                >
+                  <LoaderCircle aria-hidden="true" focusable="false" />
+                </span>
+              ) : null}
             </div>
             <CollapsibleContent className="ja-navigation-section-content">
               <div className="ja-navigation-history-list" role="list" aria-label="最近对话列表">
-                {props.historyBusy && props.threads.length === 0 ? (
-                  <p className="ja-navigation-empty" role="status">
-                    正在读取会话…
-                  </p>
-                ) : null}
                 {props.historyError === undefined ? null : (
                   <p className="ja-navigation-error" role="alert">
                     {props.historyError}

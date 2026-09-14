@@ -68,6 +68,7 @@ export type { ConversationSummary } from "./ui/summary/ConversationSummaryPopove
 export { ReplyFileOpenMenu } from "./ui/reply-files/ReplyFileOpenMenu";
 export { useReplyFileOpen } from "./application/useReplyFileOpen";
 export { ChatTimeline } from "./ui/timeline/ChatTimeline";
+export { TimelineScrollCache } from "./ui/timeline/timelineScroll";
 export {
   selectApprovalClosedAt,
   selectApprovalDecisions,
