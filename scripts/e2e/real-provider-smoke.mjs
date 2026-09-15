@@ -522,7 +522,7 @@ export class JsonlSession {
       this.child.once("exit", (code, signal) => {
         this.exited = true;
         this.exitResult = { code, signal };
-        this.failOutstanding(new Error(`production sidecar exited with code ${code ?? "none"}`));
+        this.failOutstanding(new Error(this.exitDiagnostic(code)));
         resolveExit(this.exitResult);
       });
     });
@@ -533,6 +533,16 @@ export class JsonlSession {
     });
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.lines.on("line", (line) => this.acceptLine(line));
+  }
+
+  /**
+   * Returns a bounded, already-redacted stderr tail with the exit identity so native-only
+   * failures remain actionable in CI without exposing arbitrary child output or credentials.
+   */
+  exitDiagnostic(code) {
+    const diagnostic = this.stderr.trim();
+    const suffix = diagnostic.length === 0 ? "" : `: ${diagnostic.slice(-2_000)}`;
+    return `production sidecar exited with code ${code ?? "none"}${suffix}`;
   }
 
   /** Writes one complete JSONL frame and refuses requests after process exit. */
