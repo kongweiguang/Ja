@@ -626,8 +626,10 @@ jobs:
           set -euo pipefail
           stage="$RUNNER_TEMP/ja-native-stage"
           python3 -B scripts/native/stage-search-tools.py --output-dir "$stage" --platform macos --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit "$GITHUB_SHA"
-          "$stage/sidecars/tools/fd" --version
-          "$stage/sidecars/tools/rg" --version
+          tools="$stage/sidecars/tools"
+          printf '%s\n' "$tools" >> "$GITHUB_PATH"
+          "$tools/fd" --version
+          "$tools/rg" --version
 
       - name: Run file-search acceptance against Native App Server (macOS)
         if: matrix.platform == 'macos'
