@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
@@ -150,9 +151,28 @@ final class BoundedVirtualExecutorTest {
         assertThrows(java.util.concurrent.ExecutionException.class,
                 () -> failed.get(2, TimeUnit.SECONDS));
         awaitCount(executor, 0);
-        assertEquals(7, executor.submit(() -> 7).get(2, TimeUnit.SECONDS));
+        assertEquals(7, submitAfterPermitRelease(executor, () -> 7).get(2, TimeUnit.SECONDS));
         executor.shutdown();
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS));
+    }
+
+    /**
+     * 等待实际 Semaphore 许可可再次准入，而不把诊断计数归零误作释放屏障；计数递减与
+     * permit release 属于同一 finally 但不是一个原子操作，固定 sleep 会掩盖这一竞态。
+     */
+    private static <T> Future<T> submitAfterPermitRelease(
+            BoundedVirtualExecutor executor, Callable<T> task) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        RejectedExecutionException rejected = null;
+        do {
+            try {
+                return executor.submit(task);
+            } catch (RejectedExecutionException failure) {
+                rejected = failure;
+                Thread.sleep(1);
+            }
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("executor did not release capacity", rejected);
     }
 
     /**
