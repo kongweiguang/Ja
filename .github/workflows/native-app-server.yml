@@ -137,6 +137,21 @@ jobs:
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "Write-Output 'JA_SYSTEM_POWERSHELL_READY'; exit 0"
           if ($LASTEXITCODE -ne 0) { throw "System Windows PowerShell failed: exit=$LASTEXITCODE" }
 
+      - name: Stage pinned search tools for JVM tests (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-jvm-search-tools'
+          python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch x86_64 --target-triple x86_64-pc-windows-msvc --source-commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "search-tool staging failed with exit code $LASTEXITCODE" }
+          $tools = Join-Path $stage 'sidecars/tools'
+          if (-not (Test-Path -LiteralPath $tools -PathType Container)) { throw 'staged search-tool directory is missing' }
+          $tools | Add-Content -LiteralPath $env:GITHUB_PATH
+          & (Join-Path $tools 'fd.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'staged fd failed --version' }
+          & (Join-Path $tools 'rg.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'staged rg failed --version' }
+
       - name: Verify product version projections
         shell: pwsh
         run: uv run --python 3.13 python -B scripts/version/product_version.py check
@@ -150,6 +165,21 @@ jobs:
       - name: Run JVM verification and build the Rust test fixture
         shell: pwsh
         run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=!ProviderInputFuzzTest" verify
+
+      - name: Run file-search acceptance against JVM App Server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $evidence = Join-Path $env:RUNNER_TEMP 'ja-file-search-jvm-evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $jar = (Resolve-Path 'app-server/target/ja-app-server.jar').Path
+          $java = (Get-Command java).Source
+          node scripts/e2e/file-search-acceptance.mjs --jar $jar --java $java --evidence-directory $evidence --silent
+          if ($LASTEXITCODE -ne 0) { throw "JVM file-search acceptance failed with exit code $LASTEXITCODE" }
+          $report = Join-Path $evidence 'file-search-acceptance.json'
+          if (-not (Test-Path -LiteralPath $report -PathType Leaf)) { throw 'JVM file-search acceptance report is missing' }
+          Get-Content -Raw -LiteralPath $report | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
 
       - name: Fuzz Provider Retry-After parsing
         shell: pwsh
@@ -201,11 +231,11 @@ jobs:
 
       - name: Run Node script tests
         shell: pwsh
-        run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs scripts/verification/powershell-fail-fast.test.mjs
+        run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs scripts/e2e/file-search-acceptance.test.mjs scripts/verification/powershell-fail-fast.test.mjs
 
       - name: Run Python script tests
         shell: pwsh
-        run: uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar
+        run: uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar scripts.native.test_stage_search_tools
 
       - name: Run PowerShell script tests
         shell: pwsh
@@ -543,6 +573,36 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
           python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:GITHUB_SHA --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
 
+      - name: Stage pinned search tools (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
+          python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "search-tool staging failed with exit code $LASTEXITCODE" }
+          & (Join-Path $stage 'sidecars/tools/fd.exe') --version
+          & (Join-Path $stage 'sidecars/tools/rg.exe') --version
+
+      - name: Run file-search acceptance against Native App Server (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
+          $sidecars = Join-Path $stage 'sidecars'
+          $executable = Join-Path $sidecars 'ja-app-server-${{ matrix.targetTriple }}.exe'
+          $tools = Join-Path $sidecars 'tools'
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'staged Windows Native executable is missing' }
+          if (-not (Test-Path -LiteralPath $tools -PathType Container)) { throw 'staged Windows search-tool directory is missing' }
+          if ((Split-Path -Parent $executable) -ne (Split-Path -Parent $tools)) { throw 'Native executable and search tools are not siblings' }
+          node scripts/e2e/file-search-acceptance.mjs --executable $executable --evidence-directory $env:JA_NATIVE_EVIDENCE --stress-files 10000 --silent
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows file-search acceptance failed with exit code $LASTEXITCODE" }
+          $report = Join-Path $env:JA_NATIVE_EVIDENCE 'file-search-acceptance.json'
+          if (-not (Test-Path -LiteralPath $report -PathType Leaf)) { throw 'Native Windows file-search acceptance report is missing' }
+          Get-Content -Raw -LiteralPath $report | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
       - name: Validate sidecar staging contract (macOS dry-run)
         if: matrix.platform == 'macos'
         shell: bash
@@ -559,6 +619,32 @@ jobs:
           stage="$RUNNER_TEMP/ja-native-stage"
           python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
 
+      - name: Stage pinned search tools (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/ja-native-stage"
+          python3 -B scripts/native/stage-search-tools.py --output-dir "$stage" --platform macos --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit "$GITHUB_SHA"
+          "$stage/sidecars/tools/fd" --version
+          "$stage/sidecars/tools/rg" --version
+
+      - name: Run file-search acceptance against Native App Server (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/ja-native-stage"
+          sidecars="$stage/sidecars"
+          executable="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
+          tools="$sidecars/tools"
+          test -x "$executable"
+          test -d "$tools"
+          test "$(dirname "$executable")" = "$(dirname "$tools")"
+          node scripts/e2e/file-search-acceptance.mjs --executable "$executable" --evidence-directory "$JA_NATIVE_EVIDENCE" --stress-files 10000 --silent
+          test -f "$JA_NATIVE_EVIDENCE/file-search-acceptance.json"
+          cat "$JA_NATIVE_EVIDENCE/file-search-acceptance.json" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run unsigned Tauri NSIS bundle smoke (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
         shell: pwsh
@@ -567,26 +653,37 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
           $source = Join-Path $stage 'sidecars/ja-app-server-${{ matrix.targetTriple }}.exe'
           $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
+          $toolsSource = Join-Path $stage 'sidecars/tools'
+          $toolsManifest = Join-Path $toolsSource 'tools-manifest.json'
           $sidecars = Join-Path $PWD 'src-tauri/sidecars'
           $target = Join-Path $sidecars 'ja-app-server-${{ matrix.targetTriple }}.exe'
+          $toolsTarget = Join-Path $sidecars 'tools'
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
+          $targetCreated = $false
+          $toolsCreated = $false
           New-Item -ItemType Directory -Force -Path $sidecars,$evidence | Out-Null
           try {
             if (-not (Test-Path -LiteralPath $source)) { throw 'staged Windows sidecar is missing' }
             if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
+            if (-not (Test-Path -LiteralPath $toolsSource -PathType Container)) { throw 'staged search-tool directory is missing' }
+            if (-not (Test-Path -LiteralPath $toolsManifest -PathType Leaf)) { throw 'staged search-tool manifest is missing' }
             if (Test-Path -LiteralPath $target) { throw 'src-tauri/sidecars already contains the target sidecar' }
+            if (Test-Path -LiteralPath $toolsTarget) { throw 'src-tauri/sidecars/tools already exists' }
+            $targetCreated = $true
             Copy-Item -LiteralPath $source -Destination $target
+            $toolsCreated = $true
+            Copy-Item -LiteralPath $toolsSource -Destination $toolsTarget -Recurse
             '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
             pnpm exec tauri build --ci --no-sign --bundles nsis
             if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle failed with exit code $LASTEXITCODE" }
             python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:GITHUB_SHA --sidecar-manifest $sourceManifest --no-sign
             if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
           } finally {
-            foreach ($path in @($target)) {
-              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-            }
+            if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
+            if ($toolsCreated -and (Test-Path -LiteralPath $toolsTarget)) { Remove-Item -LiteralPath $toolsTarget -Recurse -Force }
           }
           if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
+          if (Test-Path -LiteralPath $toolsTarget) { throw 'generated Windows search-tool cleanup failed' }
 
       - name: Build Tauri NSIS bundle with updater signature (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
@@ -600,26 +697,37 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
           $source = Join-Path $stage 'sidecars/ja-app-server-${{ matrix.targetTriple }}.exe'
           $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
+          $toolsSource = Join-Path $stage 'sidecars/tools'
+          $toolsManifest = Join-Path $toolsSource 'tools-manifest.json'
           $sidecars = Join-Path $PWD 'src-tauri/sidecars'
           $target = Join-Path $sidecars 'ja-app-server-${{ matrix.targetTriple }}.exe'
+          $toolsTarget = Join-Path $sidecars 'tools'
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
+          $targetCreated = $false
+          $toolsCreated = $false
           New-Item -ItemType Directory -Force -Path $sidecars,$evidence | Out-Null
           try {
             if (-not (Test-Path -LiteralPath $source)) { throw 'staged Windows sidecar is missing' }
             if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
+            if (-not (Test-Path -LiteralPath $toolsSource -PathType Container)) { throw 'staged search-tool directory is missing' }
+            if (-not (Test-Path -LiteralPath $toolsManifest -PathType Leaf)) { throw 'staged search-tool manifest is missing' }
             if (Test-Path -LiteralPath $target) { throw 'src-tauri/sidecars already contains the target sidecar' }
+            if (Test-Path -LiteralPath $toolsTarget) { throw 'src-tauri/sidecars/tools already exists' }
+            $targetCreated = $true
             Copy-Item -LiteralPath $source -Destination $target
+            $toolsCreated = $true
+            Copy-Item -LiteralPath $toolsSource -Destination $toolsTarget -Recurse
             '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
             pnpm exec tauri build --ci --bundles nsis
             if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle with updater signature failed with exit code $LASTEXITCODE" }
             python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:GITHUB_SHA --sidecar-manifest $sourceManifest --updater-signed
             if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
           } finally {
-            foreach ($path in @($target)) {
-              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-            }
+            if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
+            if ($toolsCreated -and (Test-Path -LiteralPath $toolsTarget)) { Remove-Item -LiteralPath $toolsTarget -Recurse -Force }
           }
           if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
+          if (Test-Path -LiteralPath $toolsTarget) { throw 'generated Windows search-tool cleanup failed' }
 
       - name: Run unsigned-system Windows installer install/launch/uninstall smoke
         if: matrix.platform == 'windows'
@@ -647,24 +755,37 @@ jobs:
           stage="$RUNNER_TEMP/ja-native-stage"
           source="$stage/sidecars/ja-app-server-${{ matrix.targetTriple }}"
           source_manifest="$stage/sidecar-manifest.json"
+          tools_source="$stage/sidecars/tools"
+          tools_manifest="$tools_source/tools-manifest.json"
           sidecars="src-tauri/sidecars"
           target="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
+          tools_target="$sidecars/tools"
           evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
+          target_created=false
+          tools_created=false
           mkdir -p "$sidecars" "$evidence"
           cleanup() {
-            rm -f -- "$target"
+            if [[ "$target_created" == true ]]; then rm -f -- "$target"; fi
+            if [[ "$tools_created" == true ]]; then rm -rf -- "$tools_target"; fi
           }
           trap cleanup EXIT
           test -f "$source"
           test -f "$source_manifest"
+          test -d "$tools_source"
+          test -f "$tools_manifest"
           test ! -e "$target"
+          test ! -e "$tools_target"
+          target_created=true
           cp -- "$source" "$target"
+          tools_created=true
+          cp -R -- "$tools_source" "$tools_target"
           printf '%s\n' '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles dmg"}' > "$evidence/bundle-contract.json"
           pnpm exec tauri build --ci --no-sign --bundles dmg
           python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$GITHUB_SHA" --sidecar-manifest "$source_manifest" --no-sign
           cleanup
           trap - EXIT
           test ! -e "$target"
+          test ! -e "$tools_target"
 
       - name: Build Tauri app and DMG with updater signature (macOS)
         if: matrix.platform == 'macos' && env.JA_RELEASE == 'true'
@@ -678,22 +799,37 @@ jobs:
           stage="$RUNNER_TEMP/ja-native-stage"
           source="$stage/sidecars/ja-app-server-${{ matrix.targetTriple }}"
           source_manifest="$stage/sidecar-manifest.json"
+          tools_source="$stage/sidecars/tools"
+          tools_manifest="$tools_source/tools-manifest.json"
           sidecars="src-tauri/sidecars"
           target="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
+          tools_target="$sidecars/tools"
           evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
+          target_created=false
+          tools_created=false
           mkdir -p "$sidecars" "$evidence"
-          cleanup() { rm -f -- "$target"; }
+          cleanup() {
+            if [[ "$target_created" == true ]]; then rm -f -- "$target"; fi
+            if [[ "$tools_created" == true ]]; then rm -rf -- "$tools_target"; fi
+          }
           trap cleanup EXIT
           test -f "$source"
           test -f "$source_manifest"
+          test -d "$tools_source"
+          test -f "$tools_manifest"
           test ! -e "$target"
+          test ! -e "$tools_target"
+          target_created=true
           cp -- "$source" "$target"
+          tools_created=true
+          cp -R -- "$tools_source" "$tools_target"
           printf '%s\n' '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --bundles app,dmg"}' > "$evidence/bundle-contract.json"
           pnpm exec tauri build --ci --bundles app,dmg
           python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$GITHUB_SHA" --sidecar-manifest "$source_manifest" --updater-signed
           cleanup
           trap - EXIT
           test ! -e "$target"
+          test ! -e "$tools_target"
 
       - name: Collect release SBOM evidence (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'

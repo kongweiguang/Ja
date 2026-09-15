@@ -63,13 +63,26 @@ public final class BuiltInTools {
                                SkillCatalog.Catalog skillCatalogView, ShellCapability shellCapability,
                                AgentPromptSession promptSession, ManagedAttachmentReader attachments,
                                MutationWriter mutationWriter) {
+        return create(workspaceRoot, skillCatalog, skillCatalogView, shellCapability, promptSession,
+                attachments, mutationWriter, NativeSearchToolResolver.system());
+    }
+
+    /**
+     * JVM 行为测试可注入固定 fd/rg 路径；生产组合仍由系统 resolver 选择打包资源或宿主 PATH，
+     * 这样搜索进程生命周期测试不会通过修改全局环境伪造安装状态。
+     */
+    static ToolRegistry create(Path workspaceRoot, SkillCatalog skillCatalog,
+                               SkillCatalog.Catalog skillCatalogView, ShellCapability shellCapability,
+                               AgentPromptSession promptSession, ManagedAttachmentReader attachments,
+                               MutationWriter mutationWriter, NativeSearchToolResolver searchResolver) {
         Path root = Objects.requireNonNull(workspaceRoot, "workspaceRoot").toAbsolutePath().normalize();
         MutationWriter writer = Objects.requireNonNull(mutationWriter, "mutationWriter");
+        NativeSearchToolResolver resolver = Objects.requireNonNull(searchResolver, "searchResolver");
         List<AgentTool> tools = new ArrayList<>();
         tools.add(new ReadTool(root, skillCatalog, skillCatalogView, promptSession));
         tools.add(new ReadAttachmentTool(attachments));
-        tools.add(WorkspaceFileTools.grep(root));
-        tools.add(WorkspaceFileTools.find(root));
+        tools.add(WorkspaceFileTools.grep(root, resolver));
+        tools.add(WorkspaceFileTools.find(root, resolver));
         tools.add(WorkspaceFileTools.ls(root));
         Objects.requireNonNull(shellCapability, "shellCapability").profile()
                 .ifPresent(profile -> tools.add(new ShellTool(profile)));

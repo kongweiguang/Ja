@@ -30,8 +30,6 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -77,9 +75,9 @@ class BuiltInToolsTest {
                 .putText("query", "a+b").build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
-        assertTrue(result.content().contains("Plan.java:2"));
-        assertTrue(result.content().contains("scannedFiles=2"));
-        assertTrue(result.content().contains("nested/notes.md:1"));
+        assertTrue(result.content().contains("Plan.java:2"), result.content());
+        assertTrue(result.content().contains("searchTool=rg"), result.content());
+        assertTrue(result.content().contains("nested/notes.md:1"), result.content());
 
         AgentTool.ToolResult javaOnly = execute(registry, "grep", JsonObjects.builder()
                 .putText("query", "a+b").putText("filePattern", "*.java").build());
@@ -107,9 +105,9 @@ class BuiltInToolsTest {
                 .putText("pattern", "*.java").build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
-        assertTrue(result.content().contains("src/Main.java"));
+        assertTrue(result.content().contains("src/Main.java"), result.content());
         assertFalse(result.content().contains("c3"));
-        assertTrue(result.content().contains("scannedBytes=0"));
+        assertTrue(result.content().contains("searchTool=fd"), result.content());
     }
 
     /** ls 只列目标目录一层，并保留目录类型；子目录正文/后代不会被物化。 */
@@ -149,11 +147,12 @@ class BuiltInToolsTest {
         assertTrue(rejected.content().contains("query"));
     }
 
-    /** grep 跳过非法 UTF-8 候选时必须显式报告 partial，不能把无匹配误报为完整扫描。 */
+    /** rg 命中含非法 UTF-8 的候选时必须显式报告 partial，不能把二进制输出伪装成空文本。 */
     @Test
     void reportsSkippedUnreadableFilesAsPartial() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("grep-unreadable-workspace"));
-        Files.write(workspace.resolve("malformed.txt"), new byte[]{(byte) 0xc3, 0x28});
+        Files.write(workspace.resolve("malformed.txt"), new byte[]{(byte) 0xc3, 0x28,
+                ' ', 'n', 'o', 't', '-', 'p', 'r', 'e', 's', 'e', 'n', 't'});
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
 
@@ -161,9 +160,9 @@ class BuiltInToolsTest {
                 .putText("query", "not-present").build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
-        assertTrue(result.content().contains("skippedEntries=1"));
+        assertTrue(result.content().contains("skippedCandidates=1"), result.content());
         assertTrue(result.content().contains("truncated=true"));
-        assertTrue(result.content().contains("termination=unreadable_file"));
+        assertTrue(result.content().contains("termination=non_text_output"), result.content());
         assertTrue(result.content().contains("Results are partial"));
     }
 
@@ -223,26 +222,6 @@ class BuiltInToolsTest {
         assertEquals("tool_cancelled", result.errorCode());
     }
 
-    /** 遍历中的取消必须在 collect 阶段生效，而不是等到首个结果投影后才发现。 */
-    @Test
-    void discoveryHonorsCancellationDuringDirectoryWalk() throws Exception {
-        Path workspace = Files.createDirectory(temporary.resolve("discovery-walk-cancel-workspace"));
-        for (int index = 0; index < 16; index++) {
-            Path directory = Files.createDirectory(workspace.resolve("dir-" + index));
-            Files.writeString(directory.resolve("file.txt"), "marker-" + index);
-        }
-        CountingCancellationToken token = cancelAfterChecks(8);
-        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
-                promptSession(), unusedAttachments());
-
-        AgentTool.ToolResult result = execute(registry, "find", JsonObjects.builder()
-                .putText("pattern", "*.txt").putNumber("maxResults", 1).build(), token, context());
-
-        assertEquals(ToolOutcome.CANCELLED, result.outcome());
-        assertEquals("tool_cancelled", result.errorCode());
-        assertTrue(token.checks() > 8, "cancellation must be observed after entering directory traversal");
-    }
-
     /** 过期 Deadline 返回 bounded 截断摘要，模型不会把未执行扫描误判成空目录。 */
     @Test
     void discoveryHonorsDeadlineWithExplicitTruncation() throws Exception {
@@ -261,12 +240,13 @@ class BuiltInToolsTest {
         assertFalse(result.content().contains("one.txt\n"));
     }
 
-    /** Workspace 内的无关 symlink 被跳过并记录，显式 symlink path 仍由 Boundary 拒绝。 */
+    /** fd 默认不跟随 Workspace 内的 symlink，搜索结果不得暴露其外部目标内容。 */
     @Test
     void discoverySkipsUnrelatedSymbolicLinks() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("discovery-link-workspace"));
         Path outside = Files.createDirectory(temporary.resolve("discovery-link-outside"));
         Files.writeString(workspace.resolve("README.md"), "readme");
+        Files.writeString(outside.resolve("README.md"), "outside");
         Path link = workspace.resolve("node_modules-link");
         try {
             Files.createSymbolicLink(link, outside);
@@ -282,7 +262,8 @@ class BuiltInToolsTest {
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
         assertTrue(result.content().contains("README.md"));
-        assertTrue(result.content().contains("skippedEntries=1"));
+        assertTrue(result.content().contains("searchTool=fd"));
+        assertFalse(result.content().contains("node_modules-link"), result.content());
     }
 
     /**
@@ -649,45 +630,6 @@ class BuiltInToolsTest {
                 return Registration.noop();
             }
         };
-    }
-
-    /** 返回在固定检查次数后取消的令牌，避免遍历取消测试依赖 sleep 或文件系统竞态。 */
-    private static CountingCancellationToken cancelAfterChecks(int checksBeforeCancellation) {
-        return new CountingCancellationToken(checksBeforeCancellation);
-    }
-
-    /** 计数令牌让回归测试确定性覆盖 collect 的逐项取消检查。 */
-    private static final class CountingCancellationToken implements CancellationToken {
-        private final int checksBeforeCancellation;
-        private final AtomicInteger checks = new AtomicInteger();
-
-        /** 冻结取消阈值，避免测试执行中改变取消时序。 */
-        private CountingCancellationToken(int checksBeforeCancellation) {
-            this.checksBeforeCancellation = checksBeforeCancellation;
-        }
-
-        /** 在第 N+1 次查询时发布取消，使前置检查可以完成并进入真实遍历。 */
-        @Override
-        public boolean isCancellationRequested() {
-            return checks.incrementAndGet() > checksBeforeCancellation;
-        }
-
-        /** 返回固定原因，不把测试夹具路径带入 Tool 结果。 */
-        @Override
-        public java.util.Optional<String> reason() {
-            return Optional.of("test_walk_cancelled");
-        }
-
-        /** 本测试不注册长期回调，避免把临时令牌生命周期延伸到用例结束之后。 */
-        @Override
-        public Registration onCancellation(Runnable callback) {
-            return Registration.noop();
-        }
-
-        /** 暴露检查总数，验证取消发生在进入遍历之后。 */
-        private int checks() {
-            return checks.get();
-        }
     }
 
     /** Shell 本测试不执行，仅需冻结一份合法 Profile 供注册表创建。 */

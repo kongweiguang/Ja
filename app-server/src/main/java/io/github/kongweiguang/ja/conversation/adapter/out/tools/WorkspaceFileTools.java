@@ -3,12 +3,13 @@
 
 package io.github.kongweiguang.ja.conversation.adapter.out.tools;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
-import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjectBuilder;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.WorkspaceBoundary;
@@ -16,9 +17,9 @@ import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.WorkspaceBound
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.PathMatcher;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -27,15 +28,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Workspace 只读发现 Tool 的共同实现；所有候选路径先经过 WorkspaceBoundary 再进入后续 IO。
+ * Workspace 只读发现 Tool 的共同实现；find/grep 使用成熟 native 搜索器，候选路径仍经
+ * WorkspaceBoundary 复核后才进入模型可见结果或 Java 文件读取。
  */
 final class WorkspaceFileTools {
-    static final int MAX_SCAN_ENTRIES = 20_000;
-    static final int MAX_SCAN_DEPTH = 32;
-    static final int MAX_FILES = 10_000;
-    static final long MAX_BYTES = 16L * 1024 * 1024;
     static final int MAX_OUTPUT_CHARACTERS = 64_000;
     static final int MAX_RESULT_BODY_CHARACTERS = MAX_OUTPUT_CHARACTERS - 512;
     static final int MAX_QUERY_LENGTH = 512;
@@ -48,22 +49,25 @@ final class WorkspaceFileTools {
     static final int MAX_FIND_RESULTS = 2_000;
     static final int DEFAULT_MAX_ENTRIES = 200;
     static final int MAX_ENTRIES = 1_000;
+    private static final int MAX_NATIVE_STDOUT_BYTES = 512 * 1024;
+    private static final int MAX_NATIVE_STDERR_BYTES = 32 * 1024;
+    private static final ObjectMapper SEARCH_JSON = new ObjectMapper();
 
     /** 静态 Tool 工厂不持有 Workspace 状态，避免把一次调用的预算泄漏到下一次 Turn。 */
     private WorkspaceFileTools() {
     }
 
-    /** 创建字面量内容搜索 Tool；Workspace 根由调用方在工厂装配时固定。 */
-    static AgentTool grep(Path workspaceRoot) {
-        return new GrepTool(workspaceRoot);
+    /** 测试可注入 native executable，生产路径仍只使用 packaged resource 或宿主 PATH。 */
+    static AgentTool grep(Path workspaceRoot, NativeSearchToolResolver resolver) {
+        return new GrepTool(workspaceRoot, resolver);
     }
 
-    /** 创建文件名 Glob 搜索 Tool；它只返回路径摘要，不物化文件正文。 */
-    static AgentTool find(Path workspaceRoot) {
-        return new FindTool(workspaceRoot);
+    /** 测试可注入 native executable，避免通过改写 PATH 伪造缺失工具或取消行为。 */
+    static AgentTool find(Path workspaceRoot, NativeSearchToolResolver resolver) {
+        return new FindTool(workspaceRoot, resolver);
     }
 
-    /** 创建单层目录枚举 Tool；递归发现能力必须继续使用 find。 */
+    /** 创建单层目录枚举 Tool；递归发现能力继续交给 fd find。 */
     static AgentTool ls(Path workspaceRoot) {
         return new LsTool(workspaceRoot);
     }
@@ -77,16 +81,7 @@ final class WorkspaceFileTools {
         return path;
     }
 
-    /** 把模型提供的 Glob 编译为当前 Workspace 文件系统匹配器，并将非法模式映射到具体字段。 */
-    private static PathMatcher matcher(Path workspaceRoot, String field, String pattern) {
-        try {
-            return workspaceRoot.getFileSystem().getPathMatcher("glob:" + pattern);
-        } catch (IllegalArgumentException invalidPattern) {
-            throw ToolSupport.argument(field, "must be a valid glob pattern");
-        }
-    }
-
-    /** 逐项执行取消、Deadline 和目录项上限检查，未通过时只返回截断事实。 */
+    /** 逐项执行取消和 Deadline 检查；ls 的单层 DirectoryStream 仍使用同一 Turn 预算。 */
     private static boolean allowNext(ScanBudget budget) {
         budget.token().throwIfCancellationRequested();
         if (!Instant.now().isBefore(budget.deadline())) {
@@ -94,50 +89,6 @@ final class WorkspaceFileTools {
             return false;
         }
         return true;
-    }
-
-    /** 在有限深度和项数内遍历目录，同时对每个子项重新执行物理 containment 检查。 */
-    private static Walk collect(WorkspaceBoundary boundary, Path directory, ScanBudget budget)
-            throws IOException {
-        List<Path> entries = new ArrayList<>();
-        boolean truncated = collectDirectory(boundary, directory, 0, budget, entries);
-        entries.sort(Comparator.comparing(WorkspaceFileTools::stablePath));
-        return new Walk(entries, truncated || budget.termination() != null);
-    }
-
-    /** 递归实现只使用 bounded DirectoryStream，避免先构造无界全树快照再进行过滤。 */
-    private static boolean collectDirectory(WorkspaceBoundary boundary, Path directory, int depth,
-                                             ScanBudget budget, List<Path> entries) throws IOException {
-        if (!allowNext(budget)) return true;
-        if (depth >= MAX_SCAN_DEPTH) {
-            budget.mark("depth_limit");
-            return true;
-        }
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
-            for (Path child : stream) {
-                if (!allowNext(budget)) return true;
-                if (!budget.reserveEntry()) return true;
-                Path admitted;
-                try {
-                    admitted = boundary.revalidateExisting(child);
-                } catch (IOException | SecurityException skippedEntry) {
-                    // 扫描中的无关链接或瞬时消失项不应阻断同一 Workspace 的其它结果。
-                    budget.markSkipped();
-                    continue;
-                }
-                entries.add(admitted);
-                if (Files.isDirectory(admitted, LinkOption.NOFOLLOW_LINKS)
-                        && collectDirectory(boundary, admitted, depth + 1, budget, entries)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /** 返回不受本地路径分隔符影响的排序键，确保同一 Workspace 的结果稳定。 */
-    private static String stablePath(Path path) {
-        return path.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
     }
 
     /** 限制单条结果和总输出，截断时不让 ToolResult 超过模型上下文预算。 */
@@ -165,168 +116,165 @@ final class WorkspaceFileTools {
         return end;
     }
 
-    /** 生成发现 Tool 统一使用的有界统计元数据，不把物理路径或文件正文带入结构化结果。 */
-    private static JsonObject metadata(ScanBudget budget, int resultCount, boolean truncated) {
-        JsonObjectBuilder builder = JsonObjects.builder()
+    /** 将 native 输出路径解析到已准入搜索目录；非法路径只形成候选跳过事实。 */
+    private static Path nativePath(Path searchRoot, String rawPath) {
+        if (rawPath == null || rawPath.isBlank()) return null;
+        try {
+            Path parsed = Path.of(rawPath);
+            return (parsed.isAbsolute() ? parsed : searchRoot.resolve(parsed)).normalize();
+        } catch (InvalidPathException invalidPath) {
+            return null;
+        }
+    }
+
+    /** 删除 native 输出行尾，保留文件名内部的空白字符。 */
+    private static String lineText(String value) {
+        int end = value.length();
+        while (end > 0 && (value.charAt(end - 1) == '\r' || value.charAt(end - 1) == '\n')) end--;
+        return value.substring(0, end);
+    }
+
+    /** 判断指定目录及其祖先是否位于 Git 仓库，复用 fd 的 Git ignore 语义。 */
+    private static boolean insideGitRepository(Path directory) {
+        for (Path current = directory; current != null; current = current.getParent()) {
+            if (Files.exists(current.resolve(".git"), LinkOption.NOFOLLOW_LINKS)) return true;
+        }
+        return false;
+    }
+
+    /** 将 pi 的路径 Glob 参数转换为 fd 在 Windows 上的 full-path 匹配形式。 */
+    private static List<String> findArguments(String pattern, Path searchRoot, int maxResults) {
+        String normalized = pattern.replace('\\', '/');
+        List<String> arguments = new ArrayList<>();
+        arguments.add("--glob");
+        arguments.add("--color=never");
+        arguments.add("--hidden");
+        arguments.add("--no-follow");
+        if (!insideGitRepository(searchRoot)) arguments.add("--no-require-git");
+        arguments.add("--max-results");
+        arguments.add(Integer.toString(maxResults));
+        if (normalized.contains("/")) {
+            arguments.add("--full-path");
+            if (!normalized.startsWith("/") && !normalized.startsWith("**/") && !normalized.equals("**")) {
+                normalized = "**/" + normalized;
+            }
+            if (isWindows()) normalized = normalized.replace("/", "[/\\\\]");
+        }
+        arguments.add("--");
+        arguments.add(normalized);
+        arguments.add(searchRoot.toString());
+        return arguments;
+    }
+
+    /** 明确报告 fd/rg 缺失；不会退回 Java 递归扫描，避免把安装问题伪装成卡顿。 */
+    private static AgentTool.ToolResult unavailable(String toolName) {
+        String content = "Tool failed: search_tool_unavailable. The native " + toolName
+                + " executable is not installed; install the packaged search tools or make "
+                + toolName + " available on PATH.";
+        return new AgentTool.ToolResult(ToolOutcome.FAILED, content, Optional.empty(),
+                "search_tool_unavailable");
+    }
+
+    /** 只识别 fd/rg 的固定 glob 诊断，把 native 语法错误映射为可纠正字段错误而不泄露 stderr。 */
+    private static boolean isNativeGlobError(String stderr) {
+        String normalized = stderr == null ? "" : stderr.toLowerCase(Locale.ROOT);
+        return normalized.contains("error parsing glob")
+                || normalized.contains("invalid glob")
+                || normalized.contains("regex parse error");
+    }
+
+    /** native 搜索结果只报告工具能证明的结果、输出上限和候选复核，不伪造目录项扫描统计。 */
+    private static AgentTool.ToolResult nativeSuccess(String searchTool, int resultCount,
+                                                      boolean truncated, String termination,
+                                                      int skippedCandidates, String content) {
+        JsonObjectBuilder metadata = JsonObjects.builder()
+                .putText("searchTool", searchTool)
                 .putNumber("resultCount", resultCount)
-                .putNumber("scannedEntries", budget.scannedEntries())
-                .putNumber("skippedEntries", budget.skippedEntries())
-                .putNumber("scannedFiles", budget.scannedFiles())
-                .putNumber("scannedBytes", budget.scannedBytes())
+                .putNumber("skippedCandidates", skippedCandidates)
                 .putBoolean("truncated", truncated);
-        if (budget.termination() != null) builder.putText("termination", budget.termination());
-        return builder.build();
+        if (termination != null) metadata.putText("termination", termination);
+        String summary = "[workspace discovery] results=" + resultCount
+                + ", searchTool=" + searchTool
+                + ", skippedCandidates=" + skippedCandidates
+                + ", truncated=" + truncated
+                + (termination == null ? "" : ", termination=" + termination)
+                + (truncated || skippedCandidates > 0
+                ? ". Results are partial; native search or candidate validation stopped early."
+                : resultCount == 0 ? ". No matching entries were found."
+                : ". Results are complete. Directory-entry scan counts are not reported for native search.");
+        String visibleContent = content.isBlank() ? summary : content + "\n\n" + summary;
+        return new AgentTool.ToolResult(ToolOutcome.SUCCEEDED, visibleContent,
+                Optional.of(metadata.build()), null);
     }
 
-    /** 从相对路径和文件名两种常用写法匹配 find 的 Glob，避免模型必须猜平台分隔符。 */
-    private static boolean matches(PathMatcher matcher, Path root, Path path,
-                                   WorkspaceBoundary boundary) throws IOException {
-        String relative = boundary.relative(path);
-        return matcher.matches(path.getFileName()) || matcher.matches(root.getFileSystem().getPath(relative));
-    }
-
-    /** 搜索 Tool 的稳定有界扫描状态；取消由 token 抛出，Deadline 与资源上限转为截断原因。 */
-    private static final class ScanBudget {
-        private final CancellationToken token;
-        private final Instant deadline;
-        private final int maximumEntries;
-        private final int maximumFiles;
-        private final long maximumBytes;
-        private int scannedEntries;
-        private int scannedFiles;
-        private long scannedBytes;
-        private int skippedEntries;
-        private String termination;
-
-        /** 冻结一次调用的资源上限，防止递归过程动态扩大预算。 */
-        private ScanBudget(CancellationToken token, Instant deadline, int maximumEntries,
-                           int maximumFiles, long maximumBytes) {
-            this.token = Objects.requireNonNull(token, "token");
-            this.deadline = Objects.requireNonNull(deadline, "deadline");
-            this.maximumEntries = maximumEntries;
-            this.maximumFiles = maximumFiles;
-            this.maximumBytes = maximumBytes;
-        }
-
-        /** 返回取消令牌供每个目录项和正文 chunk 复用。 */
-        private CancellationToken token() {
-            return token;
-        }
-
-        /** 返回冻结 Deadline，避免调用方传入可变时钟或延长当前操作。 */
-        private Instant deadline() {
-            return deadline;
-        }
-
-        /** 预留一个目录项位置；超过硬上限后不再读取后续项。 */
-        private boolean reserveEntry() {
-            if (scannedEntries >= maximumEntries) {
-                mark("entry_limit");
-                return false;
-            }
-            scannedEntries++;
-            return true;
-        }
-
-        /** 记录候选普通文件的大小并返回不可扩大的正文读取预约。 */
-        private FileReservation accountFile(Path path) throws IOException {
-            if (scannedFiles >= maximumFiles) {
-                mark("file_limit");
-                return null;
-            }
-            long size = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class,
-                    LinkOption.NOFOLLOW_LINKS).size();
-            if (size > maximumBytes || scannedBytes > maximumBytes - size) {
-                mark("byte_limit");
-                return null;
-            }
-            scannedFiles++;
-            scannedBytes += size;
-            return new FileReservation(size);
-        }
-
-        /** 记录不读取正文的文件发现，保持 find/ls 的 scannedBytes 为零并仍限制文件计数。 */
-        private boolean accountMetadataFile() {
-            if (scannedFiles >= maximumFiles) {
-                mark("file_limit");
-                return false;
-            }
-            scannedFiles++;
-            return true;
-        }
-
-        /** 记录被安全跳过的链接或竞态项，帮助模型区分空结果和不完整发现。 */
-        private void markSkipped() {
-            skippedEntries++;
-        }
-
-        /** 记录正文无法安全读取，并将扫描标记为不完整而非“无匹配”。 */
-        private void markSkipped(String reason) {
-            skippedEntries++;
-            mark(reason);
-        }
-
-        /** 保存第一个终止原因，避免后续条件覆盖最先触发的资源边界。 */
-        private void mark(String reason) {
-            if (termination == null) termination = reason;
-        }
-
-        /** 返回已枚举目录项数，用于结构化预算诊断。 */
-        private int scannedEntries() {
-            return scannedEntries;
-        }
-
-        /** 返回已纳入正文扫描的文件数。 */
-        private int scannedFiles() {
-            return scannedFiles;
-        }
-
-        /** 返回遍历中被跳过的链接/竞态项数量，不暴露具体路径。 */
-        private int skippedEntries() {
-            return skippedEntries;
-        }
-
-        /** 返回已纳入正文扫描的字节数。 */
-        private long scannedBytes() {
-            return scannedBytes;
-        }
-
-        /** 返回首个有界终止原因；null 表示扫描自然完成。 */
-        private String termination() {
-            return termination;
+    /** 将 rg 的 JSONL match record 投影成稳定字段，拒绝把 native JSON 正文直接交给模型。 */
+    private static JsonNode parseSearchRecord(String line) throws IOException {
+        try {
+            JsonNode parsed = SEARCH_JSON.readTree(line);
+            if (parsed == null || parsed.isNull()) throw new IOException("empty native search record");
+            return parsed;
+        } catch (IOException invalidJson) {
+            throw new IOException("native_search_output_record_invalid", invalidJson);
         }
     }
 
-    /** 冻结 stat 时的文件大小，防止正文读取在同一次扫描中取得更大预算。 */
-    private record FileReservation(long maxBytes) {
+    /** rg JSON 的路径字段允许绝对或相对值，但必须存在且由候选边界重新准入。 */
+    private static String jsonPath(JsonNode match) {
+        JsonNode path = match.path("data").path("path").path("text");
+        return path.isTextual() ? path.textValue() : null;
     }
 
-    /** 递归收集的路径快照仅在固定上限内存在，供各 Tool 做不同的只读投影。 */
-    private record Walk(List<Path> entries, boolean truncated) {
-        /** 冻结遍历结果，防止投影阶段修改已完成物理准入的路径集合。 */
-        private Walk {
-            entries = List.copyOf(entries);
-        }
+    /** rg JSON 的 line number 缺失或非法时跳过非 match 诊断，match 则由调用方判定为失败。 */
+    private static int jsonLineNumber(JsonNode match) {
+        JsonNode line = match.path("data").path("line_number");
+        return line.canConvertToInt() ? line.intValue() : -1;
     }
 
-    /** grep 只做字面量匹配；正则表达式需求应由 shell 或外部 MCP 明确承担。 */
+    /** rg 的 lines.text 带换行，输出前先去除 native 行结束符。 */
+    private static String jsonLineText(JsonNode match) {
+        JsonNode lines = match.path("data").path("lines").path("text");
+        return lines.isTextual() ? lineText(lines.textValue()) : "";
+    }
+
+    /** 按匹配点保留有限上下文，避免 rg 返回的长单行占满结果预算。 */
+    private static String boundedSnippet(String line, int match, int queryLength) {
+        if (line.length() <= MAX_SNIPPET_CHARACTERS) return line;
+        int safeMatch = Math.max(0, match);
+        int start = Math.max(0, safeMatch - 160);
+        int end = Math.min(line.length(), safeMatch + queryLength + 160);
+        end = Math.min(end, start + MAX_SNIPPET_CHARACTERS);
+        if (start > 0 && start < line.length() && Character.isLowSurrogate(line.charAt(start))
+                && Character.isHighSurrogate(line.charAt(start - 1))) start++;
+        if (end > 0 && end < line.length() && Character.isHighSurrogate(line.charAt(end - 1))
+                && Character.isLowSurrogate(line.charAt(end))) end--;
+        return line.substring(start, end);
+    }
+
+    /** 统一判断当前进程是否在 Windows 上运行 native .exe。 */
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    /** native rg 只做字面量内容匹配；正则表达式需求仍由 shell 或外部 MCP 承担。 */
     private static final class GrepTool extends ToolSupport {
         private final Path workspaceRoot;
+        private final NativeSearchToolResolver resolver;
 
-        /** 冻结 grep 的字段长度和结果上限，使 Provider Schema 与执行端共享同一边界。 */
-        private GrepTool(Path workspaceRoot) {
-            super(new ToolSpec("grep", "Search literal text in bounded UTF-8 workspace files",
+        /** 冻结 grep 的字段长度、输出边界和 executable resolver，使每次调用互不污染。 */
+        private GrepTool(Path workspaceRoot, NativeSearchToolResolver resolver) {
+            super(new ToolSpec("grep", "Search literal text with ripgrep while respecting repository ignores",
                     objectSchema(Map.of(
                             "query", requiredStringProperty(
                                     "Non-empty literal text; use find for file-name lookup.", MAX_QUERY_LENGTH),
                             "filePattern", optionalStringProperty(
-                                    "Optional glob matched against file names; defaults to *.", MAX_PATTERN_LENGTH),
+                                    "Optional glob matched by ripgrep; defaults to all searchable files.", MAX_PATTERN_LENGTH),
                             "path", optionalStringProperty(
                                     "Optional workspace-relative directory; defaults to .", MAX_PATH_LENGTH),
                             "maxResults", integerProperty(
                                     "Maximum matching lines; defaults to 50.", 1, MAX_RESULTS)),
                             List.of("query"))));
             this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
+            this.resolver = Objects.requireNonNull(resolver, "resolver");
         }
 
         /** grep 不写工作区或外部系统。 */
@@ -335,124 +283,143 @@ final class WorkspaceFileTools {
             return ToolSideEffect.READ_ONLY;
         }
 
-        /** grep 只产生模型可见文本，不产生 Workspace ChangeSet。 */
+        /** grep 不产生 Workspace ChangeSet。 */
         @Override
         public WorkspaceMutationMode workspaceMutationMode() {
             return WorkspaceMutationMode.NONE;
         }
 
-        /** 在物理工作区内按稳定顺序执行字面量搜索，并报告每个硬预算的截断原因。 */
+        /** 通过 rg JSONL 流式处理匹配；rg 自己负责 ignore、隐藏项和 no-follow，Java 只复核返回候选。 */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
             String query = requiredString(invocation, "query", MAX_QUERY_LENGTH,
                     "must be a non-empty literal query; use find for file-name lookup");
             String rawPattern = optionalString(invocation, "filePattern", MAX_PATTERN_LENGTH);
-            String filePattern = rawPattern == null || rawPattern.isBlank() ? "*" : rawPattern;
-            String rawPath = optionalString(invocation, "path", MAX_PATH_LENGTH);
             int maxResults = integer(invocation, "maxResults", DEFAULT_MAX_RESULTS, 1, MAX_RESULTS);
             WorkspaceBoundary boundary = new WorkspaceBoundary(workspaceRoot);
-            Path start = directory(boundary, rawPath);
-            PathMatcher matcher = matcher(workspaceRoot, "filePattern", filePattern);
-            ScanBudget budget = new ScanBudget(token, context.deadline(), MAX_SCAN_ENTRIES,
-                    MAX_FILES, MAX_BYTES);
-            if (!allowNext(budget)) return successful(budget, 0, true, "");
-            Walk walked = collect(boundary, start, budget);
-            StringBuilder output = new StringBuilder();
-            int resultCount = 0;
-            boolean truncated = walked.truncated();
-            boolean projectionStopped = false;
-            for (Path path : walked.entries()) {
-                if (!allowNext(budget)) {
-                    truncated = true;
-                    projectionStopped = true;
-                    break;
-                }
-                if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
-                        || !matcher.matches(path.getFileName())) continue;
-                FileReservation reservation = budget.accountFile(path);
-                if (reservation == null) {
-                    truncated = true;
-                    if ("file_limit".equals(budget.termination())
-                            && budget.scannedFiles() >= MAX_FILES) break;
-                    continue;
-                }
-                if (reservation.maxBytes() == 0) continue;
-                boundary.revalidateExisting(path);
-                String content;
-                try {
-                    content = ToolSupport.readUtf8File(path, token, context.deadline(), reservation.maxBytes(),
-                            (int) (MAX_BYTES / 4));
-                } catch (ToolSupport.DeadlineExceededException deadline) {
-                    budget.mark("deadline");
-                    truncated = true;
-                    projectionStopped = true;
-                    break;
-                } catch (ToolSupport.ToolFailure ignoredUnreadable) {
-                    budget.markSkipped("unreadable_file");
-                    truncated = true;
-                    continue;
-                }
-                String[] lines = content.split("\\R", -1);
-                for (int index = 0; index < lines.length; index++) {
-                    if (!allowNext(budget)) {
-                        truncated = true;
-                        projectionStopped = true;
-                        break;
-                    }
-                    int match = lines[index].indexOf(query);
-                    if (match < 0) continue;
-                    String snippet = boundedSnippet(lines[index], match, query.length());
-                    String line = boundary.relative(path) + ":" + (index + 1) + ": " + snippet;
-                    if (!appendLine(output, line)) {
-                        budget.mark("output_limit");
-                        truncated = true;
-                        projectionStopped = true;
-                        break;
-                    }
-                    resultCount++;
-                    if (resultCount >= maxResults) {
-                        budget.mark("result_limit");
-                        truncated = true;
-                        projectionStopped = true;
-                        break;
-                    }
-                }
-                if (projectionStopped) break;
+            Path start = directory(boundary, optionalString(invocation, "path", MAX_PATH_LENGTH));
+            Path executable;
+            try {
+                executable = resolver.resolve("rg");
+            } catch (NativeSearchToolResolver.SearchToolUnavailableException missing) {
+                return unavailable(missing.toolName());
             }
-            return successful(budget, resultCount, truncated, output.toString());
-        }
+            List<String> arguments = new ArrayList<>();
+            arguments.add("--no-config");
+            arguments.add("--json");
+            arguments.add("--line-number");
+            arguments.add("--color=never");
+            arguments.add("--hidden");
+            arguments.add("--no-follow");
+            arguments.add("--fixed-strings");
+            if (rawPattern != null && !rawPattern.isBlank()) {
+                arguments.add("--glob");
+                arguments.add(rawPattern.replace('\\', '/'));
+            }
+            arguments.add("--");
+            arguments.add(query);
+            arguments.add(start.toString());
 
-        /** 按匹配点保留有限上下文，避免长单行占满结果预算。 */
-        private static String boundedSnippet(String line, int match, int queryLength) {
-            if (line.length() <= MAX_SNIPPET_CHARACTERS) return line;
-            int start = Math.max(0, match - 160);
-            int end = Math.min(line.length(), match + queryLength + 160);
-            end = Math.min(end, start + MAX_SNIPPET_CHARACTERS);
-            if (start > 0 && start < line.length() && Character.isLowSurrogate(line.charAt(start))
-                    && Character.isHighSurrogate(line.charAt(start - 1))) start++;
-            if (end > 0 && end < line.length() && Character.isHighSurrogate(line.charAt(end - 1))
-                    && Character.isLowSurrogate(line.charAt(end))) end--;
-            return line.substring(start, end);
+            StringBuilder output = new StringBuilder();
+            AtomicInteger resultCount = new AtomicInteger();
+            AtomicInteger skippedCandidates = new AtomicInteger();
+            AtomicBoolean resultLimit = new AtomicBoolean();
+            AtomicBoolean outputLimit = new AtomicBoolean();
+            AtomicBoolean nonTextRecord = new AtomicBoolean();
+            NativeSearchProcess.Result result = NativeSearchProcess.run(executable, arguments, start,
+                    token, context.deadline(), MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES, line -> {
+                        JsonNode record = parseSearchRecord(line);
+                        if (!"match".equals(record.path("type").asText())) return true;
+                        String rawPath = jsonPath(record);
+                        int lineNumber = jsonLineNumber(record);
+                        if (rawPath == null || lineNumber < 1) {
+                            throw new IOException("native_search_match_record_invalid");
+                        }
+                        Path candidate = nativePath(start, rawPath);
+                        if (candidate == null) {
+                            skippedCandidates.incrementAndGet();
+                            return true;
+                        }
+                        Path admitted;
+                        try {
+                            admitted = boundary.revalidateExisting(candidate);
+                            if (!Files.isRegularFile(admitted, LinkOption.NOFOLLOW_LINKS)) {
+                                skippedCandidates.incrementAndGet();
+                                return true;
+                            }
+                        } catch (IOException | SecurityException skipped) {
+                            skippedCandidates.incrementAndGet();
+                            return true;
+                        }
+                        JsonNode lineNode = record.path("data").path("lines");
+                        if (!lineNode.path("text").isTextual()) {
+                            nonTextRecord.set(true);
+                            skippedCandidates.incrementAndGet();
+                            return true;
+                        }
+                        String text = jsonLineText(record);
+                        int match = text.indexOf(query);
+                        String rendered = boundary.relative(admitted) + ":" + lineNumber + ": "
+                                + boundedSnippet(text, match, query.length());
+                        if (!appendLine(output, rendered)) {
+                            outputLimit.set(true);
+                            return false;
+                        }
+                        int count = resultCount.incrementAndGet();
+                        if (count >= maxResults) {
+                            resultLimit.set(true);
+                            return false;
+                        }
+                        return true;
+                    });
+            if (result.cancelled()) throw new CancellationException();
+            if (result.deadlineExceeded()) {
+                return nativeSuccess("rg", resultCount.get(), true, "deadline",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (result.outputTruncated() || outputLimit.get()) {
+                return nativeSuccess("rg", resultCount.get(), true, "output_limit",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (nonTextRecord.get()) {
+                return nativeSuccess("rg", resultCount.get(), true, "non_text_output",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (resultLimit.get() || result.stoppedByConsumer()) {
+                return nativeSuccess("rg", resultCount.get(), true, "result_limit",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (result.exitCode() != 0 && result.exitCode() != 1) {
+                if (rawPattern != null && isNativeGlobError(result.stderr())) {
+                    throw ToolSupport.argument("filePattern", "must be a valid ripgrep glob pattern");
+                }
+                throw new IOException("native_search_exit_nonzero");
+            }
+            return nativeSuccess("rg", resultCount.get(), skippedCandidates.get() > 0,
+                    skippedCandidates.get() > 0 ? "candidate_validation" : null,
+                    skippedCandidates.get(), output.toString());
         }
     }
 
-    /** find 只返回正则无关的文件名/相对路径命中，不读取正文，适合定位待 read 的文件。 */
+    /** find 通过 fd 返回文件和目录路径，不读取正文并完整复用 fd 的 ignore 规则。 */
     private static final class FindTool extends ToolSupport {
         private final Path workspaceRoot;
+        private final NativeSearchToolResolver resolver;
 
-        /** 冻结 find 的 Glob、目录、文件数和输出上限。 */
-        private FindTool(Path workspaceRoot) {
-            super(new ToolSpec("find", "Find workspace files by a bounded name glob without reading contents",
+        /** 冻结 find 的 Glob、路径、结果上限和 executable resolver。 */
+        private FindTool(Path workspaceRoot, NativeSearchToolResolver resolver) {
+            super(new ToolSpec("find", "Find workspace files and directories by glob with fd",
                     objectSchema(Map.of(
                             "pattern", requiredStringProperty(
                                     "Non-empty glob matched against file names or relative paths.", MAX_PATTERN_LENGTH),
                             "path", optionalStringProperty(
                                     "Optional workspace-relative directory; defaults to .", MAX_PATH_LENGTH),
                             "maxResults", integerProperty(
-                                    "Maximum matching files; defaults to 200.", 1, MAX_FIND_RESULTS)),
+                                    "Maximum matching files or directories; defaults to 200.", 1, MAX_FIND_RESULTS)),
                             List.of("pattern"))));
             this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
+            this.resolver = Objects.requireNonNull(resolver, "resolver");
         }
 
         /** find 不改变工作区或外部系统。 */
@@ -467,51 +434,77 @@ final class WorkspaceFileTools {
             return WorkspaceMutationMode.NONE;
         }
 
-        /** 在固定遍历预算内按 Glob 返回文件路径，绝不读取文件正文。 */
+        /** fd 负责 glob、hidden、gitignore 和结果上限；Java 只复核路径 containment。 */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
             String pattern = requiredString(invocation, "pattern", MAX_PATTERN_LENGTH,
                     "must be a non-empty glob pattern");
-            String rawPath = optionalString(invocation, "path", MAX_PATH_LENGTH);
             int maxResults = integer(invocation, "maxResults", DEFAULT_MAX_FIND_RESULTS, 1, MAX_FIND_RESULTS);
             WorkspaceBoundary boundary = new WorkspaceBoundary(workspaceRoot);
-            Path start = directory(boundary, rawPath);
-            PathMatcher matcher = matcher(workspaceRoot, "pattern", pattern);
-            ScanBudget budget = new ScanBudget(token, context.deadline(), MAX_SCAN_ENTRIES,
-                    MAX_FILES, MAX_BYTES);
-            if (!allowNext(budget)) return successful(budget, 0, true, "");
-            Walk walked = collect(boundary, start, budget);
-            StringBuilder output = new StringBuilder();
-            int resultCount = 0;
-            boolean truncated = walked.truncated();
-            for (Path path : walked.entries()) {
-                if (!allowNext(budget)) {
-                    truncated = true;
-                    break;
-                }
-                if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) continue;
-                if (!budget.accountMetadataFile()) {
-                    truncated = true;
-                    if ("file_limit".equals(budget.termination())
-                            && budget.scannedFiles() >= MAX_FILES) break;
-                    continue;
-                }
-                if (!matches(matcher, workspaceRoot, path, boundary)) continue;
-                String line = boundary.relative(path);
-                if (!appendLine(output, line)) {
-                    budget.mark("output_limit");
-                    truncated = true;
-                    break;
-                }
-                resultCount++;
-                if (resultCount >= maxResults) {
-                    budget.mark("result_limit");
-                    truncated = true;
-                    break;
-                }
+            Path start = directory(boundary, optionalString(invocation, "path", MAX_PATH_LENGTH));
+            Path executable;
+            try {
+                executable = resolver.resolve("fd");
+            } catch (NativeSearchToolResolver.SearchToolUnavailableException missing) {
+                return unavailable(missing.toolName());
             }
-            return successful(budget, resultCount, truncated, output.toString());
+            StringBuilder output = new StringBuilder();
+            AtomicInteger resultCount = new AtomicInteger();
+            AtomicInteger skippedCandidates = new AtomicInteger();
+            AtomicBoolean resultLimit = new AtomicBoolean();
+            AtomicBoolean outputLimit = new AtomicBoolean();
+            NativeSearchProcess.Result result = NativeSearchProcess.run(executable,
+                    findArguments(pattern, start, maxResults), start, token, context.deadline(),
+                    MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES, rawLine -> {
+                        String nativeLine = lineText(rawLine);
+                        Path candidate = nativePath(start, nativeLine);
+                        if (candidate == null) {
+                            skippedCandidates.incrementAndGet();
+                            return true;
+                        }
+                        Path admitted;
+                        try {
+                            admitted = boundary.revalidateExisting(candidate);
+                        } catch (IOException | SecurityException skipped) {
+                            skippedCandidates.incrementAndGet();
+                            return true;
+                        }
+                        String relative = boundary.relative(admitted);
+                        if (Files.isDirectory(admitted, LinkOption.NOFOLLOW_LINKS)) relative += "/";
+                        if (!appendLine(output, relative)) {
+                            outputLimit.set(true);
+                            return false;
+                        }
+                        int count = resultCount.incrementAndGet();
+                        if (count >= maxResults) {
+                            resultLimit.set(true);
+                            return false;
+                        }
+                        return true;
+                    });
+            if (result.cancelled()) throw new CancellationException();
+            if (result.deadlineExceeded()) {
+                return nativeSuccess("fd", resultCount.get(), true, "deadline",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (result.outputTruncated() || outputLimit.get()) {
+                return nativeSuccess("fd", resultCount.get(), true, "output_limit",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (resultLimit.get() || result.stoppedByConsumer()) {
+                return nativeSuccess("fd", resultCount.get(), true, "result_limit",
+                        skippedCandidates.get(), output.toString());
+            }
+            if (result.exitCode() != 0) {
+                if (isNativeGlobError(result.stderr())) {
+                    throw ToolSupport.argument("pattern", "must be a valid fd glob pattern");
+                }
+                throw new IOException("native_search_exit_nonzero");
+            }
+            return nativeSuccess("fd", resultCount.get(), skippedCandidates.get() > 0,
+                    skippedCandidates.get() > 0 ? "candidate_validation" : null,
+                    skippedCandidates.get(), output.toString());
         }
     }
 
@@ -543,26 +536,20 @@ final class WorkspaceFileTools {
             return WorkspaceMutationMode.NONE;
         }
 
-        /** 只读取一层目录并在 maxEntries+1 项处停止，避免全目录列表无界进入内存。 */
+        /** 只读取一层目录并在 maxEntries+1 项处停止，避免目录列表无界进入内存。 */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
-            String rawPath = optionalString(invocation, "path", MAX_PATH_LENGTH);
             int maxEntries = integer(invocation, "maxEntries", DEFAULT_MAX_ENTRIES, 1, MAX_ENTRIES);
             WorkspaceBoundary boundary = new WorkspaceBoundary(workspaceRoot);
-            Path start = directory(boundary, rawPath);
-            ScanBudget budget = new ScanBudget(token, context.deadline(), maxEntries + 1,
-                    MAX_FILES, MAX_BYTES);
+            Path start = directory(boundary, optionalString(invocation, "path", MAX_PATH_LENGTH));
+            ScanBudget budget = new ScanBudget(token, context.deadline(), maxEntries + 1);
             if (!allowNext(budget)) return successful(budget, 0, true, "");
             List<Path> entries = new ArrayList<>();
             boolean truncated = false;
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(start)) {
                 for (Path child : stream) {
-                    if (!allowNext(budget)) {
-                        truncated = true;
-                        break;
-                    }
-                    if (!budget.reserveEntry()) {
+                    if (!allowNext(budget) || !budget.reserveEntry()) {
                         truncated = true;
                         break;
                     }
@@ -570,15 +557,10 @@ final class WorkspaceFileTools {
                     try {
                         admitted = boundary.revalidateExisting(child);
                     } catch (IOException | SecurityException skippedEntry) {
-                        // ls 只跳过无关链接/竞态项，显式 path 的链接仍在 directory() 处失败关闭。
                         budget.markSkipped();
                         continue;
                     }
-                    if (Files.isRegularFile(admitted, LinkOption.NOFOLLOW_LINKS)
-                            && !budget.accountMetadataFile()) {
-                        truncated = true;
-                        break;
-                    }
+                    if (Files.isRegularFile(admitted, LinkOption.NOFOLLOW_LINKS)) budget.accountMetadataFile();
                     entries.add(admitted);
                     if (entries.size() > maxEntries) {
                         budget.mark("entry_limit");
@@ -605,23 +587,107 @@ final class WorkspaceFileTools {
         }
     }
 
-    /** 创建成功的纯文本结果并保留完整扫描统计，供模型区分空目录与预算截断。 */
+    /** ls 的单层扫描统计真实可知；find/grep 另用 nativeSuccess，避免伪造全树计数。 */
     private static AgentTool.ToolResult successful(ScanBudget budget, int resultCount, boolean truncated,
                                                    String content) {
         boolean partial = truncated || budget.skippedEntries() > 0;
+        JsonObjectBuilder metadata = JsonObjects.builder()
+                .putNumber("resultCount", resultCount)
+                .putNumber("scannedEntries", budget.scannedEntries())
+                .putNumber("skippedEntries", budget.skippedEntries())
+                .putNumber("scannedFiles", budget.scannedFiles())
+                .putNumber("scannedBytes", 0)
+                .putBoolean("truncated", partial);
+        if (budget.termination() != null) metadata.putText("termination", budget.termination());
         String summary = "[workspace discovery] results=" + resultCount
                 + ", scannedEntries=" + budget.scannedEntries()
                 + ", skippedEntries=" + budget.skippedEntries()
                 + ", scannedFiles=" + budget.scannedFiles()
-                + ", scannedBytes=" + budget.scannedBytes()
+                + ", scannedBytes=0"
                 + ", truncated=" + partial
                 + (budget.termination() == null ? "" : ", termination=" + budget.termination())
-                + (partial
-                ? ". Results are partial; some entries were skipped or the scan reached a limit."
-                : resultCount == 0 ? ". No matching entries were found."
-                : ". Results are complete.");
+                + (partial ? ". Results are partial; some entries were skipped or a limit was reached."
+                : resultCount == 0 ? ". No matching entries were found." : ". Results are complete.");
         String visibleContent = content.isBlank() ? summary : content + "\n\n" + summary;
         return new AgentTool.ToolResult(ToolOutcome.SUCCEEDED, visibleContent,
-                Optional.of(metadata(budget, resultCount, partial)), null);
+                Optional.of(metadata.build()), null);
+    }
+
+    /** 单层 ls 的有界统计；find/grep 不复用它，因此不会重新引入全树递归。 */
+    private static final class ScanBudget {
+        private final CancellationToken token;
+        private final Instant deadline;
+        private final int maximumEntries;
+        private int scannedEntries;
+        private int scannedFiles;
+        private int skippedEntries;
+        private String termination;
+
+        /** 冻结一次 ls 调用的目录项上限，防止目录枚举阶段动态扩大预算。 */
+        private ScanBudget(CancellationToken token, Instant deadline, int maximumEntries) {
+            this.token = Objects.requireNonNull(token, "token");
+            this.deadline = Objects.requireNonNull(deadline, "deadline");
+            this.maximumEntries = maximumEntries;
+        }
+
+        /** 返回取消令牌供每个目录项复用。 */
+        private CancellationToken token() {
+            return token;
+        }
+
+        /** 返回冻结 Deadline，避免目录枚举过程中延长当前操作。 */
+        private Instant deadline() {
+            return deadline;
+        }
+
+        /** 预留一个目录项位置；超过硬上限后不再读取后续项。 */
+        private boolean reserveEntry() {
+            if (scannedEntries >= maximumEntries) {
+                mark("entry_limit");
+                return false;
+            }
+            scannedEntries++;
+            return true;
+        }
+
+        /** 记录单层普通文件发现；ls 不读取正文，因此字节统计固定为零。 */
+        private void accountMetadataFile() {
+            scannedFiles++;
+        }
+
+        /** 记录被安全跳过的链接或竞态项，帮助模型区分空目录和部分发现。 */
+        private void markSkipped() {
+            skippedEntries++;
+        }
+
+        /** 保存第一个有界终止原因，避免后续条件覆盖最先触发的资源边界。 */
+        private void mark(String reason) {
+            if (termination == null) termination = reason;
+        }
+
+        /** 返回已枚举目录项数，仅用于 ls 的真实单层统计。 */
+        private int scannedEntries() {
+            return scannedEntries;
+        }
+
+        /** 返回已识别为普通文件的单层条目数。 */
+        private int scannedFiles() {
+            return scannedFiles;
+        }
+
+        /** 返回单层遍历中被跳过的链接或竞态项数量。 */
+        private int skippedEntries() {
+            return skippedEntries;
+        }
+
+        /** 返回首个有界终止原因；null 表示扫描自然完成。 */
+        private String termination() {
+            return termination;
+        }
+    }
+
+    /** 返回不受本地路径分隔符影响的排序键，确保 ls 结果稳定。 */
+    private static String stablePath(Path path) {
+        return path.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
     }
 }
