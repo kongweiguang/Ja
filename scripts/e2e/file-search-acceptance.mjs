@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import process from "node:process";
@@ -55,7 +55,11 @@ export function parseArguments(argv = process.argv.slice(2)) {
       parsed.stripSearchTools = true;
       continue;
     }
-    if (!["--jar", "--executable", "--java", "--evidence-directory", "--stress-files"].includes(argument)) {
+    if (
+      !["--jar", "--executable", "--java", "--evidence-directory", "--stress-files"].includes(
+        argument,
+      )
+    ) {
       throw new Error(`unknown file search acceptance argument: ${argument}`);
     }
     const value = argv[index + 1];
@@ -79,7 +83,11 @@ export function parseArguments(argv = process.argv.slice(2)) {
     if (argument === "--evidence-directory") parsed.evidenceDirectory = value;
     if (argument === "--stress-files") parsed.stressFiles = Number.parseInt(value, 10);
   }
-  if (!Number.isSafeInteger(parsed.stressFiles) || parsed.stressFiles < 1_000 || parsed.stressFiles > 20_000) {
+  if (
+    !Number.isSafeInteger(parsed.stressFiles) ||
+    parsed.stressFiles < 1_000 ||
+    parsed.stressFiles > 20_000
+  ) {
     throw new Error("--stress-files must be between 1000 and 20000");
   }
   if (parsed.jar !== undefined && parsed.executable !== undefined) {
@@ -101,7 +109,8 @@ function resolveJava(explicitJava) {
 async function resolveJar(explicitJar) {
   const jar = resolve(explicitJar ?? join(repoRoot, "app-server", "target", "ja-app-server.jar"));
   const metadata = await stat(jar);
-  if (!metadata.isFile() || metadata.size === 0) throw new Error("file search acceptance JAR is unavailable");
+  if (!metadata.isFile() || metadata.size === 0)
+    throw new Error("file search acceptance JAR is unavailable");
   return jar;
 }
 
@@ -119,14 +128,18 @@ async function resolveExecutable(explicitExecutable) {
 async function assertJava25(java) {
   let output = "";
   try {
-    const result = await execFileAsync(java, ["-version"], { windowsHide: true, maxBuffer: 64 * 1024 });
+    const result = await execFileAsync(java, ["-version"], {
+      windowsHide: true,
+      maxBuffer: 64 * 1024,
+    });
     output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
   } catch (error) {
     output = `${error?.stdout ?? ""}\n${error?.stderr ?? ""}`;
     if (output.trim() === "") throw new Error("selected Java executable could not be started");
   }
   const match = output.match(/\bversion\s+"?(\d+)/iu) ?? output.match(/\bopenjdk\s+(\d+)/iu);
-  if (match === null || Number(match[1]) !== 25) throw new Error("file search acceptance requires Java major version 25");
+  if (match === null || Number(match[1]) !== 25)
+    throw new Error("file search acceptance requires Java major version 25");
   return Number(match[1]);
 }
 
@@ -154,9 +167,10 @@ async function resolveLaunch(parsed) {
 async function searchToolFreePath() {
   const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
   const original = process.env[pathKey] ?? "";
-  const binaryNames = process.platform === "win32"
-    ? ["fd.exe", "fdfind.exe", "rg.exe", "fd", "fdfind", "rg"]
-    : ["fd", "fdfind", "rg"];
+  const binaryNames =
+    process.platform === "win32"
+      ? ["fd.exe", "fdfind.exe", "rg.exe", "fd", "fdfind", "rg"]
+      : ["fd", "fdfind", "rg"];
   const retained = [];
   let removedEntries = 0;
   for (const entry of original.split(delimiter)) {
@@ -203,12 +217,25 @@ export async function writeFileSearchWorkspace(workspaceRoot, stressFiles) {
   await mkdir(join(workspaceRoot, ".codegraph"), { recursive: true });
   await writeFile(join(workspaceRoot, ".gitignore"), ".venv/\n", "utf8");
   await writeFile(join(workspaceRoot, "README.md"), "# File search acceptance\n", "utf8");
-  await writeFile(join(workspaceRoot, "AGENTS.md"), "# Fixture instructions are data, not runner instructions.\n", "utf8");
-  await writeFile(join(workspaceRoot, ".codegraph", "marker.txt"), "codegraph directory marker\n", "utf8");
+  await writeFile(
+    join(workspaceRoot, "AGENTS.md"),
+    "# Fixture instructions are data, not runner instructions.\n",
+    "utf8",
+  );
+  await writeFile(
+    join(workspaceRoot, ".codegraph", "marker.txt"),
+    "codegraph directory marker\n",
+    "utf8",
+  );
 
   const shardCount = Math.min(64, Math.max(1, Math.ceil(stressFiles / 128)));
-  const shards = Array.from({ length: shardCount }, (_, index) => `pkg-${String(index).padStart(3, "0")}`);
-  await Promise.all(shards.map((shard) => mkdir(join(workspaceRoot, ".venv", shard), { recursive: true })));
+  const shards = Array.from(
+    { length: shardCount },
+    (_, index) => `pkg-${String(index).padStart(3, "0")}`,
+  );
+  await Promise.all(
+    shards.map((shard) => mkdir(join(workspaceRoot, ".venv", shard), { recursive: true })),
+  );
   const batchSize = 256;
   for (let start = 0; start < stressFiles; start += batchSize) {
     const end = Math.min(stressFiles, start + batchSize);
@@ -224,12 +251,17 @@ export async function writeFileSearchWorkspace(workspaceRoot, stressFiles) {
       }),
     );
   }
-  return { stressFiles, ignoredRoot: ".venv", expectedRootEntries: ["README.md", "AGENTS.md", ".codegraph"] };
+  return {
+    stressFiles,
+    ignoredRoot: ".venv",
+    expectedRootEntries: ["README.md", "AGENTS.md", ".codegraph"],
+  };
 }
 
 /** 只从 JA-RPC 成功 envelope 取 result，并将协议错误压缩为稳定 errorCode。 */
 function rpcResult(frame, operation) {
-  if (frame?.error !== undefined) throw new Error(`${operation} failed: ${requireRpcErrorCode(frame.error)}`);
+  if (frame?.error !== undefined)
+    throw new Error(`${operation} failed: ${requireRpcErrorCode(frame.error)}`);
   if (frame?.result === undefined) throw new Error(`${operation} returned no result`);
   return frame.result;
 }
@@ -259,7 +291,10 @@ async function startReadySession({ command, prefixArgs, directories, stripSearch
       await session.request("runtime/initialize", initializeParams()),
       "runtime/initialize",
     );
-    if (initialized?.runtime?.engine !== "ja-kernel" || typeof initialized?.runtime?.engineVersion !== "string") {
+    if (
+      initialized?.runtime?.engine !== "ja-kernel" ||
+      typeof initialized?.runtime?.engineVersion !== "string"
+    ) {
       throw new Error("file search acceptance did not start the Ja Kernel runtime");
     }
     session.notifyInitialized();
@@ -271,9 +306,14 @@ async function startReadySession({ command, prefixArgs, directories, stripSearch
     return {
       session,
       initialized,
-      pathProjection: pathProjection === undefined
-        ? { stripped: false, removedEntries: 0, searchToolsRemain: undefined }
-        : { stripped: true, removedEntries: pathProjection.removedEntries, searchToolsRemain: false },
+      pathProjection:
+        pathProjection === undefined
+          ? { stripped: false, removedEntries: 0, searchToolsRemain: undefined }
+          : {
+              stripped: true,
+              removedEntries: pathProjection.removedEntries,
+              searchToolsRemain: false,
+            },
     };
   } catch (error) {
     await session.forceClose();
@@ -284,9 +324,12 @@ async function startReadySession({ command, prefixArgs, directories, stripSearch
 /** 通过安全的 presentation projection 收集一次 Tool batch 的四个真实耗时。 */
 function collectToolFacts(session, turnId) {
   const modelSteps = session.events.filter(
-    (frame) => frame?.method === "assistant/model-step-committed" && frame.params?.turnId === turnId,
+    (frame) =>
+      frame?.method === "assistant/model-step-committed" && frame.params?.turnId === turnId,
   );
-  const toolStep = modelSteps.find((frame) => Array.isArray(frame.params?.toolCalls) && frame.params.toolCalls.length > 0);
+  const toolStep = modelSteps.find(
+    (frame) => Array.isArray(frame.params?.toolCalls) && frame.params.toolCalls.length > 0,
+  );
   assert.ok(toolStep !== undefined, "Provider response must contain one Tool-call assistant step");
   assert.deepEqual(
     toolStep.params.toolCalls.map((call) => call.callId),
@@ -301,15 +344,28 @@ function collectToolFacts(session, turnId) {
   const batches = session.events.filter(
     (frame) => frame?.method === "tool/batch-committed" && frame.params?.turnId === turnId,
   );
-  const results = batches.flatMap((frame) => (Array.isArray(frame.params?.results) ? frame.params.results : []));
-  assert.equal(results.length, expectedCallIds.length, "all four Tool calls must commit exactly one result");
+  const results = batches.flatMap((frame) =>
+    Array.isArray(frame.params?.results) ? frame.params.results : [],
+  );
+  assert.equal(
+    results.length,
+    expectedCallIds.length,
+    "all four Tool calls must commit exactly one result",
+  );
   const byCallId = new Map(results.map((result) => [result.callId, result]));
   const facts = expectedCallIds.map((callId) => {
     const result = byCallId.get(callId);
     assert.ok(result !== undefined, `missing committed Tool result ${callId}`);
     assert.equal(result.outcome, "succeeded", `${callId} must succeed`);
-    assert.equal(result.presentation?.status, "success", `${callId} must expose success presentation`);
-    assert.ok(Number.isSafeInteger(result.presentation?.durationMs), `${callId} must expose durationMs`);
+    assert.equal(
+      result.presentation?.status,
+      "success",
+      `${callId} must expose success presentation`,
+    );
+    assert.ok(
+      Number.isSafeInteger(result.presentation?.durationMs),
+      `${callId} must expose durationMs`,
+    );
     assert.ok(result.presentation.durationMs >= 0, `${callId} durationMs must be non-negative`);
     return {
       callId,
@@ -342,7 +398,11 @@ export function assertFileSearchHistory(history, threadId, turnId, finalText) {
     ),
     "thread/read must persist the exact final assistant reply",
   );
-  return { revision: history.revision, itemCount: history.items.length, toolCallCount: calls.length };
+  return {
+    revision: history.revision,
+    itemCount: history.items.length,
+    toolCallCount: calls.length,
+  };
 }
 
 /** 对外暴露的报告验证器，保证脚本报告确实包含工具闭环与真实耗时。 */
@@ -355,8 +415,8 @@ export function validateFileSearchReport(report) {
   assert.equal(typeof report?.environment?.searchToolPathStripped, "boolean");
   assert.equal(typeof report?.environment?.removedSearchToolPathEntries, "number");
   assert.ok(
-    report?.environment?.searchToolsAbsentFromChildPath === null
-      || typeof report.environment.searchToolsAbsentFromChildPath === "boolean",
+    report?.environment?.searchToolsAbsentFromChildPath === null ||
+      typeof report.environment.searchToolsAbsentFromChildPath === "boolean",
   );
   if (report.environment.searchToolPathStripped) {
     assert.equal(report.environment.searchToolsAbsentFromChildPath, true);
@@ -380,10 +440,16 @@ export function validateFileSearchReport(report) {
   return report;
 }
 
-/** 删除本脚本创建的精确 mkdtemp 子目录，父目录或非本脚本前缀一律拒绝。 */
+/**
+ * 删除本脚本创建的精确 mkdtemp 子目录；物理 temp parent 与创建端一致，避免 macOS
+ * 的系统目录别名导致安全校验误拒绝，同时仍拒绝非本脚本前缀的递归删除。
+ */
 async function cleanupDirectories(root) {
   const target = resolve(root);
-  if (dirname(target) !== resolve(tmpdir()) || !basename(target).startsWith(temporaryPrefix)) {
+  if (
+    dirname(target) !== resolve(await realpath(tmpdir())) ||
+    !basename(target).startsWith(temporaryPrefix)
+  ) {
     throw new Error("refusing to clean a non-owned file search acceptance directory");
   }
   await rm(target, { recursive: true, force: false });
@@ -414,7 +480,10 @@ export async function runAcceptance(options = {}) {
       stripSearchTools: parsed.stripSearchTools,
     }));
 
-    const configuration = rpcResult(await session.request("configuration/read", {}), "configuration/read");
+    const configuration = rpcResult(
+      await session.request("configuration/read", {}),
+      "configuration/read",
+    );
     const document = fileSearchProviderConfigurationDocument({
       endpoint: fixture.baseUrl,
       name: "Deterministic file search acceptance provider",
@@ -445,7 +514,10 @@ export async function runAcceptance(options = {}) {
     assert.equal(credential.configured, true);
 
     const opened = rpcResult(
-      await session.request("workspace/open", { cwd: directories.workspace, displayName: "File search acceptance" }),
+      await session.request("workspace/open", {
+        cwd: directories.workspace,
+        displayName: "File search acceptance",
+      }),
       "workspace/open",
     );
     assert.ok(typeof opened.workspaceId === "string" && opened.workspaceId.startsWith("ws_"));
@@ -489,7 +561,12 @@ export async function runAcceptance(options = {}) {
       await session.request("thread/read", { threadId: created.threadId }),
       "thread/read",
     );
-    const beforeRestart = assertFileSearchHistory(history, created.threadId, accepted.turnId, finalText);
+    const beforeRestart = assertFileSearchHistory(
+      history,
+      created.threadId,
+      accepted.turnId,
+      finalText,
+    );
     const firstExit = await session.shutdown();
 
     let recoveredPathProjection;
@@ -528,17 +605,20 @@ export async function runAcceptance(options = {}) {
       },
       environment: {
         searchToolPathStripped: pathProjection.stripped && recoveredPathProjection.stripped,
-        removedSearchToolPathEntries: pathProjection.removedEntries + recoveredPathProjection.removedEntries,
+        removedSearchToolPathEntries:
+          pathProjection.removedEntries + recoveredPathProjection.removedEntries,
         searchToolsAbsentFromChildPath:
           pathProjection.stripped && recoveredPathProjection.stripped
-            ? pathProjection.searchToolsRemain === false && recoveredPathProjection.searchToolsRemain === false
+            ? pathProjection.searchToolsRemain === false &&
+              recoveredPathProjection.searchToolsRemain === false
             : null,
       },
       provider: {
         kind: "deterministic_loopback",
         externalCalls: 0,
         attempts: fixtureSnapshot.attempts.length,
-        auxiliaryAttempts: fixtureSnapshot.attempts.filter((attempt) => attempt.kind === "title").length,
+        auxiliaryAttempts: fixtureSnapshot.attempts.filter((attempt) => attempt.kind === "title")
+          .length,
         continuationResults: searchAttempts[1].outputCount,
       },
       workspace: { stressFiles: workspace.stressFiles, ignoredRoot: workspace.ignoredRoot },
@@ -547,13 +627,20 @@ export async function runAcceptance(options = {}) {
         batchCount: toolFacts.batchCount,
         resultCount: toolFacts.resultCount,
         allResultsReturned: true,
-        calls: toolFacts.facts.map((fact) => ({ ...fact, status: "success", outcome: "succeeded" })),
+        calls: toolFacts.facts.map((fact) => ({
+          ...fact,
+          status: "success",
+          outcome: "succeeded",
+        })),
       },
       persistence: { beforeRestart, afterRestart, restartRecovered: true },
       durations: {
         wallDurationMs: Math.max(0, Date.now() - startedAt),
         toolDurationMs: toolFacts.facts.reduce((total, fact) => total + fact.durationMs, 0),
-        toolDurations: toolFacts.facts.map((fact) => ({ toolName: fact.toolName, durationMs: fact.durationMs })),
+        toolDurations: toolFacts.facts.map((fact) => ({
+          toolName: fact.toolName,
+          durationMs: fact.durationMs,
+        })),
       },
       process: { firstExitCode: firstExit.code, secondExitCode: secondExit.code },
     });

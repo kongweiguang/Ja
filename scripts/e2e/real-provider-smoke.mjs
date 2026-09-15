@@ -10,7 +10,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
@@ -239,9 +239,17 @@ async function assertJava25(command) {
   }
 }
 
-/** Creates four distinct Unicode roots so production argv exercises canonical UTF-8 ownership. */
+/**
+ * Resolve the OS temporary root before creating fixtures so macOS system aliases such as
+ * /var -> /private/var cannot be mistaken for a caller-supplied symlink by production path guards.
+ */
+async function physicalTemporaryDirectory() {
+  return resolve(await realpath(tmpdir()));
+}
+
+/** Creates four distinct Unicode roots under a physical temp parent for canonical UTF-8 ownership. */
 export async function createIsolatedDirectories() {
-  const root = await mkdtemp(join(tmpdir(), temporaryPrefix));
+  const root = await mkdtemp(join(await physicalTemporaryDirectory(), temporaryPrefix));
   const home = join(root, "home-家");
   const data = join(root, "data-数据");
   const run = join(root, "run-运行");
@@ -265,13 +273,13 @@ async function createPersistentDirectories() {
 }
 
 /**
- * Removes only the exact mkdtemp child created by this script. The resolved
- * parent/prefix checks make recursive cleanup fail closed if ownership drifts.
+ * Removes only the exact mkdtemp child created by this script. The physical-parent
+ * check matches fixture creation and keeps recursive cleanup fail closed if ownership drifts.
  */
 async function cleanupIsolatedDirectories(root) {
   const target = resolve(root);
   if (
-    dirname(target) !== resolve(tmpdir()) ||
+    dirname(target) !== (await physicalTemporaryDirectory()) ||
     !target.split(/[\\/]/).at(-1)?.startsWith(temporaryPrefix)
   ) {
     throw new Error("refusing to clean a non-owned smoke directory");
