@@ -632,6 +632,10 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
 
     /**
      * 依据配置中的稳定名称选择本 Turn 可发现目录；正文直到 read 激活时才访问对应资源。
+     *
+     * <p>项目 Skill 的配置身份来自全局文档，但资源身份属于当前工作区；工作区切换后，
+     * 之前启用的项目 Skill 可能自然消失，必须把它当作能力收窄而不是阻断所有模型请求。
+     * 用户、Ja 和内置 Skill 则仍要求安装目录完整，避免真正的运行时损坏被静默隐藏。</p>
      */
     private SkillResolution skillCatalog(
             Path workspaceRoot, ConfigurationGenerationPort.Lease lease) {
@@ -643,21 +647,43 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             // 未授权任何 Skill 时不扫描无关目录；严格格式错误只能阻断真正选择了 Skill 的 Turn。
             return new SkillResolution(skills.emptyCatalog(), Map.of());
         }
+        SkillCatalog.Catalog discovered = skills.discover(request);
+        List<String> availableNames = availableSkillNames(enabled, discovered);
+        return new SkillResolution(skills.select(discovered, availableNames),
+                skillNamesById(enabled, discovered));
+    }
+
+    /**
+     * 计算当前 Turn 可用的 Skill 名称，并只对非项目来源执行完整性校验；返回顺序沿用发现目录，
+     * 这样同名覆盖仍由 SkillCatalog 的来源优先级决定，而不是由配置数组顺序决定。
+     */
+    static List<String> availableSkillNames(
+            List<ConfigurationGenerationSnapshot.Skill> enabled,
+            SkillCatalog.Catalog discovered) {
+        Objects.requireNonNull(enabled, "enabled");
+        Objects.requireNonNull(discovered, "discovered");
         Set<String> allowedNames = new HashSet<>();
+        Set<String> missingRequired = new HashSet<>();
         for (ConfigurationGenerationSnapshot.Skill skill : enabled) {
+            Objects.requireNonNull(skill, "enabled skill");
             allowedNames.add(skill.name());
         }
-        SkillCatalog.Catalog discovered = skills.discover(request);
-        List<String> availableNames = discovered.skills().stream()
-                .filter(descriptor -> allowedNames.contains(descriptor.name()))
+        Set<String> discoveredNames = discovered.skills().stream()
                 .map(SkillCatalog.SkillDescriptor::name)
-                .toList();
-        if (availableNames.size() != allowedNames.size()) {
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        for (ConfigurationGenerationSnapshot.Skill skill : enabled) {
+            if (!discoveredNames.contains(skill.name()) && !"project".equals(skill.scope())) {
+                missingRequired.add(skill.name());
+            }
+        }
+        if (!missingRequired.isEmpty()) {
             throw new TurnRuntimeResolver.RuntimeMismatchException(
                     "configured Turn Skill is unavailable");
         }
-        return new SkillResolution(skills.select(discovered, availableNames),
-                skillNamesById(enabled, discovered));
+        return discovered.skills().stream()
+                .map(SkillCatalog.SkillDescriptor::name)
+                .filter(allowedNames::contains)
+                .toList();
     }
 
     /**

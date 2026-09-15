@@ -121,6 +121,43 @@ final class ConfigurationTurnRuntimeResolverTest {
                 ConfigurationTurnRuntimeResolver.skillNamesById(configured, discovered));
     }
 
+    /**
+     * 工作区切换后缺失的项目 Skill 只收窄当前能力；用户级 Skill 缺失仍必须阻断，防止安装损坏被隐藏。
+     */
+    @Test
+    void missingProjectSkillDoesNotBlockTurnButMissingUserSkillDoes() {
+        List<ConfigurationGenerationSnapshot.Skill> projectOnly = List.of(
+                new ConfigurationGenerationSnapshot.Skill(
+                        "skill_project", "project-only", "project", true, "Project skill"));
+        assertEquals(List.of(), ConfigurationTurnRuntimeResolver.availableSkillNames(
+                projectOnly, new SkillCatalog.Catalog(List.of())));
+
+        List<ConfigurationGenerationSnapshot.Skill> mixed = List.of(
+                new ConfigurationGenerationSnapshot.Skill(
+                        "skill_user", "review", "user", true, "Review changes"),
+                new ConfigurationGenerationSnapshot.Skill(
+                        "skill_project", "project-only", "project", true, "Project skill"));
+        SkillCatalog.Catalog discovered = new SkillCatalog.Catalog(List.of(
+                new SkillCatalog.SkillDescriptor("review", "Review changes", SkillCatalog.Source.JA_USER)));
+        assertEquals(List.of("review"), ConfigurationTurnRuntimeResolver.availableSkillNames(mixed, discovered));
+
+        List<ConfigurationGenerationSnapshot.Skill> missingUser = List.of(
+                new ConfigurationGenerationSnapshot.Skill(
+                        "skill_user", "missing", "user", true, "Missing skill"));
+        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
+                () -> ConfigurationTurnRuntimeResolver.availableSkillNames(
+                        missingUser, new SkillCatalog.Catalog(List.of())));
+
+        List<ConfigurationGenerationSnapshot.Skill> duplicateName = List.of(
+                new ConfigurationGenerationSnapshot.Skill(
+                        "skill_user", "same-name", "user", true, "User skill"),
+                new ConfigurationGenerationSnapshot.Skill(
+                        "skill_project", "same-name", "project", true, "Project skill"));
+        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
+                () -> ConfigurationTurnRuntimeResolver.availableSkillNames(
+                        duplicateName, new SkillCatalog.Catalog(List.of())));
+    }
+
     /** 对象键的注册顺序不得进入恢复指纹，但真实 Schema 内容变化必须改变摘要。 */
     @Test
     void toolCatalogDigestCanonicalizesNestedObjectOrder() {
