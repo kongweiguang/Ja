@@ -1,7 +1,18 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { ChevronDown, ChevronUp, LoaderCircle } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  File,
+  Folder,
+  ListTree,
+  LoaderCircle,
+  Search,
+} from "lucide-react";
 import { useMemo, useState, type ReactElement } from "react";
 import {
   Collapsible,
@@ -9,6 +20,12 @@ import {
   CollapsibleTrigger,
 } from "@/shared/ui/primitives/Collapsible";
 import type { ToolPresentation, WorkStepAdapter } from "../../domain/timelineTypes";
+import {
+  toolResultContent,
+  toolResultView,
+  type ToolResultRow,
+  type ToolResultView,
+} from "./toolResultView";
 
 export interface ToolStepDetailsProps {
   step: WorkStepAdapter;
@@ -108,6 +125,78 @@ function presentationOutput(presentation: ToolPresentation): string | undefined 
 }
 
 /**
+ * 结果图标只表达 Java 已确认的条目类型，不把静态装饰或伪交互加到高密度的工具结果列表中。
+ */
+function ToolResultIcon({ kind }: { kind: ToolResultRow["kind"] }): ReactElement {
+  switch (kind) {
+    case "directory":
+      return <Folder aria-hidden="true" />;
+    case "file":
+      return <File aria-hidden="true" />;
+    case "match":
+      return <Search aria-hidden="true" />;
+    case "context":
+      return <ListTree aria-hidden="true" />;
+  }
+}
+
+/**
+ * 摘要图标必须反映 Tool 的当前可恢复状态：仅真实执行中的步骤显示动态提示，终态不使用会造成误导的成功图标。
+ */
+function ToolOverviewIcon({ status }: { status: ToolPresentation["status"] }): ReactElement {
+  switch (status) {
+    case "success":
+      return <CircleCheck />;
+    case "error":
+    case "waiting_approval":
+      return <CircleAlert />;
+    case "cancelled":
+      return <CircleX />;
+    case "pending":
+    case "running":
+      return <LoaderCircle className="ja-tool-details__overview-spinner" />;
+  }
+}
+
+/**
+ * 结构化行仅改善扫描效率，行本身没有接通文件预览能力，因此保持为不可点击的真实结果文本。
+ */
+function ToolResultOutput({
+  view,
+  status,
+}: {
+  view: ToolResultView;
+  status: ToolPresentation["status"];
+}): ReactElement {
+  if (view.kind === "raw" || view.kind === "read") {
+    return (
+      <pre className="ja-tool-details__output" data-status={status}>
+        {view.content}
+      </pre>
+    );
+  }
+  return (
+    <ul
+      className="ja-tool-result-list"
+      aria-label={view.kind === "matches" ? "搜索结果" : "文件结果"}
+    >
+      {view.rows.map((row) => (
+        <li key={`${row.kind}:${row.path}:${row.line ?? ""}`} data-kind={row.kind}>
+          <ToolResultIcon kind={row.kind} />
+          <code title={row.path}>{row.path}</code>
+          {row.line === undefined ? null : <span>{row.line}</span>}
+          {row.detail === undefined || row.detail === "" ? null : (
+            <code className="ja-tool-result-list__detail" title={row.detail}>
+              {row.detail}
+            </code>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
  * Tool 行自身就是唯一 Disclosure：常规步骤保持紧凑，失败步骤自动展开，
  * 且用户的手动选择只在同一状态内有效；动作、真实 Tool 名称与首个目标留在同一行，
  * 已脱敏结果留在展开区，避免用展示标题或原始参数猜测身份。
@@ -126,16 +215,26 @@ export function ToolStepDetails({
   const [loadedOutput, setLoadedOutput] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  const toolName = presentationToolName(step);
+  const rawOutput =
+    presentation === undefined ? undefined : (loadedOutput ?? presentationOutput(presentation));
   const output =
-    loadedOutput ?? (presentation === undefined ? undefined : presentationOutput(presentation));
+    presentation === undefined ? undefined : toolResultContent(toolName, presentation, rawOutput);
   const lines = useMemo(() => output?.split(/\r?\n/u) ?? [], [output]);
 
   if (presentation === undefined) return null;
-  const toolName = presentationToolName(step);
   const canLoad =
     presentation.artifactId !== undefined && callId !== undefined && onReadArtifact !== undefined;
   const locallyExpandable = lines.length > PREVIEW_LINES;
   const shownOutput = outputExpanded ? output : lines.slice(0, PREVIEW_LINES).join("\n");
+  const hidesSuccessOutput =
+    presentation.status === "success" &&
+    presentation.summary !== undefined &&
+    (toolName === "edit" || toolName === "write");
+  const outputView = hidesSuccessOutput
+    ? undefined
+    : toolResultView(toolName, presentation, shownOutput);
+  const showsInput = presentation.kind === "mcp" && presentation.inputPreview?.trim() !== "";
   const detailsOpen =
     manualDisclosure?.status === presentation.status
       ? manualDisclosure.open
@@ -180,7 +279,12 @@ export function ToolStepDetails({
   };
 
   return (
-    <div className="ja-tool-details" data-tool-kind={presentation.kind}>
+    <div
+      className="ja-tool-details"
+      data-status={presentation.status}
+      data-tool-kind={presentation.kind}
+      data-tool-name={toolName}
+    >
       <Collapsible
         open={detailsOpen}
         onOpenChange={(open) => setManualDisclosure({ status: presentation.status, open })}
@@ -188,7 +292,6 @@ export function ToolStepDetails({
         <CollapsibleTrigger className="ja-tool-details__trigger" aria-label={accessibleSummary}>
           <span className="ja-tool-details__identity">
             <strong className="ja-tool-details__label">{actionLabel}</strong>
-            {toolName ? <code title={toolName}>{toolName}</code> : null}
           </span>
           {target ? (
             <code className="ja-tool-details__target" title={target}>
@@ -200,17 +303,23 @@ export function ToolStepDetails({
           </span>
         </CollapsibleTrigger>
         <CollapsibleContent className="ja-tool-details__content">
-          {presentation.kind !== "shell" && presentation.inputPreview?.trim() ? (
+          {presentation.summary === undefined ? null : (
+            <div className="ja-tool-details__overview" data-status={presentation.status}>
+              <span aria-hidden="true" className="ja-tool-details__overview-icon">
+                <ToolOverviewIcon status={presentation.status} />
+              </span>
+              <span>{presentation.summary}</span>
+            </div>
+          )}
+          {showsInput ? (
             <pre className="ja-tool-details__input">{presentation.inputPreview}</pre>
           ) : null}
           {presentation.relativeCwd ? (
             <span className="ja-tool-details__cwd">工作目录：{presentation.relativeCwd}</span>
           ) : null}
-          {shownOutput?.trim() ? (
-            <pre className="ja-tool-details__output" data-status={presentation.status}>
-              {shownOutput}
-            </pre>
-          ) : null}
+          {outputView === undefined ? null : (
+            <ToolResultOutput view={outputView} status={presentation.status} />
+          )}
           <div className="ja-tool-details__facts">
             <span>状态：{presentationStatusLabel(presentation.status)}</span>
             {presentation.exitCode === undefined ? null : (

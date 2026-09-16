@@ -152,7 +152,7 @@ final class RpcResultsTest {
     /** 构造历史 Wire 测试所需的最小安全展示 DTO。 */
     private static ToolPresentation presentation() {
         return new ToolPresentation(ToolPresentation.Kind.READ, "read", ToolPresentation.Status.SUCCESS,
-                null, "ok", List.of("a.txt"), null, null, null, null, null, 1L, false, null);
+                null, "ok", "读取完成", List.of("a.txt"), null, null, null, null, null, 1L, false, null);
     }
 
     /** 构造有效 seed，确保测试只聚焦 Wire 安全投影。 */

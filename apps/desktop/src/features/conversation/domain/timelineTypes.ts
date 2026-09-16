@@ -24,6 +24,8 @@ export interface ToolPresentation {
   status: "pending" | "running" | "waiting_approval" | "success" | "error" | "cancelled";
   inputPreview?: string;
   outputPreview?: string;
+  /** Java 仅从受控 metadata 生成的结果摘要；UI 不能以正文或参数自行补造。 */
+  summary?: string;
   relativePaths: string[];
   command?: string;
   relativeCwd?: string;
@@ -388,6 +390,7 @@ export function itemRevision(item: TimelineItemAdapter | undefined): string {
     metadata?.truncated === true ? "truncated" : "",
     metadata?.toolName ?? "",
     metadata?.toolKind ?? "",
+    metadata?.presentation?.summary ?? "",
     metadata?.phase ?? "",
     metadata?.inputBytes ?? "",
     metadata?.outputBytes ?? "",

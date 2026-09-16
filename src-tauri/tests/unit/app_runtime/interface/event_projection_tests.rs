@@ -694,7 +694,7 @@ fn event_projection_rejects_unknown_methods_and_sensitive_arguments() {
     );
 }
 
-/// Composite model/Tool commit 只接受 Java 已脱敏的 ToolPresentation，旧 raw result 与
+/// Composite model/Tool commit 只接受 Java 已脱敏且有界的 ToolPresentation 摘要，旧 raw result 与
 /// workspace dirty 字段均不得穿过 renderer 边界。
 #[test]
 fn composite_events_enforce_transaction_shapes() {
@@ -748,7 +748,7 @@ fn composite_events_enforce_transaction_shapes() {
             "results": [{"callId": "call_1", "outcome": "succeeded",
                 "presentation": {
                     "kind": "shell", "title": "运行命令", "status": "success",
-                    "outputPreview": "ok", "relativePaths": [],
+                    "outputPreview": "ok", "summary": "命令执行成功", "relativePaths": [],
                     "command": "git status --short", "relativeCwd": "workspace",
                     "stdout": "ok", "exitCode": 0, "durationMs": 12,
                     "truncated": false
@@ -756,6 +756,10 @@ fn composite_events_enforce_transaction_shapes() {
         }
     });
     assert!(sanitize_webview_value(batch.clone()).is_ok());
+    assert_eq!(
+        batch["params"]["results"][0]["presentation"]["summary"],
+        json!("命令执行成功")
+    );
     let mut unknown_outcome = batch.clone();
     unknown_outcome["params"]["results"][0]["outcome"] = json!("unknown");
     assert!(sanitize_webview_value(unknown_outcome).is_err());

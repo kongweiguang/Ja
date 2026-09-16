@@ -205,8 +205,8 @@ async function readBoundedJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-/** 分帧输出并在关键边界让 driver 观察 live DOM，避免“最终 DOM 顺序”冒充实时证据。 */
-async function writeDelayedStream(response, stream, stages, step, textGate) {
+/** 分帧输出并在公开正文或摘要边界暂停，让 driver 区分实时投影与终态历史。 */
+async function writeDelayedStream(response, stream, stages, step, textGate, summaryGate) {
   response.writeHead(200, {
     "cache-control": "no-store",
     "content-type": "text/event-stream; charset=utf-8",
@@ -218,6 +218,8 @@ async function writeDelayedStream(response, stream, stages, step, textGate) {
     if (frame.includes("reasoning_summary_text.delta")) stages.push(`summary_${step}`);
     if (frame.includes("output_text.delta")) stages.push(`text_${step}`);
     if (frame.includes("output_item.added")) stages.push(`tool_${step}`);
+    if (summaryGate !== undefined && frame.includes("reasoning_summary_text.delta"))
+      await summaryGate;
     if (textGate !== undefined && frame.includes("output_text.delta")) await textGate;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 90));
   }
@@ -231,6 +233,14 @@ export async function startConversationProgressFixture() {
   let releaseFirstText;
   const firstTextGate = new Promise((resolvePromise) => {
     releaseFirstText = resolvePromise;
+  });
+  let releaseSecondNarrative;
+  const secondNarrativeGate = new Promise((resolvePromise) => {
+    releaseSecondNarrative = resolvePromise;
+  });
+  let releaseFinalNarrative;
+  const finalNarrativeGate = new Promise((resolvePromise) => {
+    releaseFinalNarrative = resolvePromise;
   });
   const server = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/responses") {
@@ -291,11 +301,20 @@ export async function startConversationProgressFixture() {
           ),
           stages,
           "shell",
+          undefined,
+          secondNarrativeGate,
         );
         return;
       }
       if (step === 2) {
-        await writeDelayedStream(response, finalStream(), stages, "final");
+        await writeDelayedStream(
+          response,
+          finalStream(),
+          stages,
+          "final",
+          undefined,
+          finalNarrativeGate,
+        );
         return;
       }
       throw new Error("unexpected conversation progress continuation");
@@ -318,6 +337,14 @@ export async function startConversationProgressFixture() {
     releaseFirstText() {
       releaseFirstText();
     },
+    /** 公开摘要到达但后续 Tool 尚未开始时恢复第二轮流，证明实时叙事不依赖终态折叠。 */
+    releaseSecondNarrative() {
+      releaseSecondNarrative();
+    },
+    /** 最终摘要先于最终答复可见；恢复流后才允许写入最终正文和完成状态。 */
+    releaseFinalNarrative() {
+      releaseFinalNarrative();
+    },
     /** 仅返回低敏阶段与请求种类，报告不包含 Provider request body。 */
     snapshot() {
       return { attempts: attempts.map((attempt) => ({ ...attempt })), stages: [...stages] };
@@ -325,6 +352,8 @@ export async function startConversationProgressFixture() {
     /** 关闭唯一 loopback listener，保证 fixture 生命周期不越过 runner cleanup。 */
     async close() {
       releaseFirstText();
+      releaseSecondNarrative();
+      releaseFinalNarrative();
       server.closeAllConnections?.();
       await new Promise((resolvePromise) => server.close(resolvePromise));
     },

@@ -39,14 +39,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class WorkspaceFileTools {
     static final int MAX_OUTPUT_CHARACTERS = 64_000;
     static final int MAX_RESULT_BODY_CHARACTERS = MAX_OUTPUT_CHARACTERS - 512;
-    static final int MAX_QUERY_LENGTH = 512;
-    static final int MAX_PATTERN_LENGTH = 256;
+    static final int MAX_QUERY_LENGTH = 4_096;
+    static final int MAX_PATTERN_LENGTH = 4_096;
     static final int MAX_PATH_LENGTH = 8_192;
-    static final int MAX_SNIPPET_CHARACTERS = 400;
-    static final int DEFAULT_MAX_RESULTS = 50;
-    static final int MAX_RESULTS = 200;
-    static final int DEFAULT_MAX_FIND_RESULTS = 200;
-    static final int MAX_FIND_RESULTS = 2_000;
+    static final int MAX_SNIPPET_CHARACTERS = 500;
+    static final int DEFAULT_RESULT_LIMIT = 100;
     static final int DEFAULT_MAX_ENTRIES = 200;
     static final int MAX_ENTRIES = 1_000;
     private static final int MAX_NATIVE_STDOUT_BYTES = 512 * 1024;
@@ -183,6 +180,12 @@ final class WorkspaceFileTools {
                 || normalized.contains("regex parse error");
     }
 
+    /** 将 rg 的正则解析失败映射回 query 字段，使模型可修正模式而不是盲目重试整个搜索。 */
+    private static boolean isNativeRegexError(String stderr) {
+        String normalized = stderr == null ? "" : stderr.toLowerCase(Locale.ROOT);
+        return normalized.contains("regex parse error") || normalized.contains("error parsing regex");
+    }
+
     /** native 搜索结果只报告工具能证明的结果、输出上限和候选复核，不伪造目录项扫描统计。 */
     private static AgentTool.ToolResult nativeSuccess(String searchTool, int resultCount,
                                                       boolean truncated, String termination,
@@ -193,13 +196,17 @@ final class WorkspaceFileTools {
                 .putNumber("skippedCandidates", skippedCandidates)
                 .putBoolean("truncated", truncated);
         if (termination != null) metadata.putText("termination", termination);
+        String nextStep = "result_limit".equals(termination)
+                ? " Use limit=" + Math.min(Integer.MAX_VALUE, Math.max(2L, (long) resultCount * 2L))
+                        + " for more results, or refine the pattern."
+                : "";
         String summary = "[workspace discovery] results=" + resultCount
                 + ", searchTool=" + searchTool
                 + ", skippedCandidates=" + skippedCandidates
                 + ", truncated=" + truncated
                 + (termination == null ? "" : ", termination=" + termination)
                 + (truncated || skippedCandidates > 0
-                ? ". Results are partial; native search or candidate validation stopped early."
+                ? ". Results are partial; native search or candidate validation stopped early." + nextStep
                 : resultCount == 0 ? ". No matching entries were found."
                 : ". Results are complete. Directory-entry scan counts are not reported for native search.");
         String visibleContent = content.isBlank() ? summary : content + "\n\n" + summary;
@@ -250,29 +257,46 @@ final class WorkspaceFileTools {
         return line.substring(start, end);
     }
 
+    /**
+     * literal 且忽略大小写时仅为截取结果定位匹配点；真正的匹配语义仍完全由 rg 执行，避免复制搜索器。
+     */
+    private static int literalMatchOffset(String text, String pattern, boolean ignoreCase) {
+        if (!ignoreCase) return text.indexOf(pattern);
+        for (int index = 0, last = text.length() - pattern.length(); index <= last; index++) {
+            if (text.regionMatches(true, index, pattern, 0, pattern.length())) return index;
+        }
+        return -1;
+    }
+
     /** 统一判断当前进程是否在 Windows 上运行 native .exe。 */
     private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
-    /** native rg 只做字面量内容匹配；正则表达式需求仍由 shell 或外部 MCP 承担。 */
+    /** rg 采用 Pi 的正则默认值与少量可选开关，所有候选仍经过 WorkspaceBoundary 复核。 */
     private static final class GrepTool extends ToolSupport {
         private final Path workspaceRoot;
         private final NativeSearchToolResolver resolver;
 
         /** 冻结 grep 的字段长度、输出边界和 executable resolver，使每次调用互不污染。 */
         private GrepTool(Path workspaceRoot, NativeSearchToolResolver resolver) {
-            super(new ToolSpec("grep", "Search literal text with ripgrep while respecting repository ignores",
+            super(new ToolSpec("grep", "Search a regular expression or literal text with ripgrep while respecting repository ignores",
                     objectSchema(Map.of(
-                            "query", requiredStringProperty(
-                                    "Non-empty literal text; use find for file-name lookup.", MAX_QUERY_LENGTH),
-                            "filePattern", optionalStringProperty(
+                            "pattern", requiredStringProperty(
+                                    "Non-empty search pattern. Regular expressions are the default; set literal for exact text. Use find for file-name lookup.",
+                                    MAX_QUERY_LENGTH),
+                            "glob", optionalStringProperty(
                                     "Optional glob matched by ripgrep; defaults to all searchable files.", MAX_PATTERN_LENGTH),
                             "path", optionalStringProperty(
                                     "Optional workspace-relative directory; defaults to .", MAX_PATH_LENGTH),
-                            "maxResults", integerProperty(
-                                    "Maximum matching lines; defaults to 50.", 1, MAX_RESULTS)),
-                            List.of("query"))));
+                            "literal", booleanProperty(
+                                    "Treat pattern as literal text instead of a regular expression; defaults to false."),
+                            "ignoreCase", booleanProperty("Case-insensitive matching; defaults to false."),
+                            "context", integerProperty(
+                                    "Lines before and after each match; defaults to 0.", 0, Integer.MAX_VALUE),
+                            "limit", integerProperty(
+                                    "Maximum matching lines; defaults to 100.", 1, Integer.MAX_VALUE)),
+                            List.of("pattern"))));
             this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
             this.resolver = Objects.requireNonNull(resolver, "resolver");
         }
@@ -289,14 +313,19 @@ final class WorkspaceFileTools {
             return WorkspaceMutationMode.NONE;
         }
 
-        /** 通过 rg JSONL 流式处理匹配；rg 自己负责 ignore、隐藏项和 no-follow，Java 只复核返回候选。 */
+        /**
+         * 通过 rg JSONL 流式处理匹配和上下文；rg 负责 ignore、隐藏项和 no-follow，Java 只复核候选与输出预算。
+         */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
-            String query = requiredString(invocation, "query", MAX_QUERY_LENGTH,
-                    "must be a non-empty literal query; use find for file-name lookup");
-            String rawPattern = optionalString(invocation, "filePattern", MAX_PATTERN_LENGTH);
-            int maxResults = integer(invocation, "maxResults", DEFAULT_MAX_RESULTS, 1, MAX_RESULTS);
+            String pattern = requiredString(invocation, "pattern", MAX_QUERY_LENGTH,
+                    "must be a non-empty search pattern; use find for file-name lookup");
+            String glob = optionalString(invocation, "glob", MAX_PATTERN_LENGTH);
+            boolean literal = booleanValue(invocation, "literal", false);
+            boolean ignoreCase = booleanValue(invocation, "ignoreCase", false);
+            int contextLines = integer(invocation, "context", 0, 0, Integer.MAX_VALUE);
+            int maxResults = integer(invocation, "limit", DEFAULT_RESULT_LIMIT, 1, Integer.MAX_VALUE);
             WorkspaceBoundary boundary = new WorkspaceBoundary(workspaceRoot);
             Path start = directory(boundary, optionalString(invocation, "path", MAX_PATH_LENGTH));
             Path executable;
@@ -312,13 +341,18 @@ final class WorkspaceFileTools {
             arguments.add("--color=never");
             arguments.add("--hidden");
             arguments.add("--no-follow");
-            arguments.add("--fixed-strings");
-            if (rawPattern != null && !rawPattern.isBlank()) {
+            if (literal) arguments.add("--fixed-strings");
+            if (ignoreCase) arguments.add("--ignore-case");
+            if (contextLines > 0) {
+                arguments.add("--context");
+                arguments.add(Integer.toString(contextLines));
+            }
+            if (glob != null && !glob.isBlank()) {
                 arguments.add("--glob");
-                arguments.add(rawPattern.replace('\\', '/'));
+                arguments.add(glob.replace('\\', '/'));
             }
             arguments.add("--");
-            arguments.add(query);
+            arguments.add(pattern);
             arguments.add(start.toString());
 
             StringBuilder output = new StringBuilder();
@@ -330,7 +364,9 @@ final class WorkspaceFileTools {
             NativeSearchProcess.Result result = NativeSearchProcess.run(executable, arguments, start,
                     token, context.deadline(), MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES, line -> {
                         JsonNode record = parseSearchRecord(line);
-                        if (!"match".equals(record.path("type").asText())) return true;
+                        String type = record.path("type").asText();
+                        boolean matchRecord = "match".equals(type);
+                        if (!matchRecord && !"context".equals(type)) return true;
                         String rawPath = jsonPath(record);
                         int lineNumber = jsonLineNumber(record);
                         if (rawPath == null || lineNumber < 1) {
@@ -359,13 +395,15 @@ final class WorkspaceFileTools {
                             return true;
                         }
                         String text = jsonLineText(record);
-                        int match = text.indexOf(query);
-                        String rendered = boundary.relative(admitted) + ":" + lineNumber + ": "
-                                + boundedSnippet(text, match, query.length());
+                        int match = literal ? literalMatchOffset(text, pattern, ignoreCase) : 0;
+                        String rendered = boundary.relative(admitted) + (matchRecord ? ":" : "-") + lineNumber
+                                + (matchRecord ? ": " : "- ")
+                                + boundedSnippet(text, match, literal ? pattern.length() : 0);
                         if (!appendLine(output, rendered)) {
                             outputLimit.set(true);
                             return false;
                         }
+                        if (!matchRecord) return true;
                         int count = resultCount.incrementAndGet();
                         if (count >= maxResults) {
                             resultLimit.set(true);
@@ -391,8 +429,11 @@ final class WorkspaceFileTools {
                         skippedCandidates.get(), output.toString());
             }
             if (result.exitCode() != 0 && result.exitCode() != 1) {
-                if (rawPattern != null && isNativeGlobError(result.stderr())) {
-                    throw ToolSupport.argument("filePattern", "must be a valid ripgrep glob pattern");
+                if (glob != null && isNativeGlobError(result.stderr())) {
+                    throw ToolSupport.argument("glob", "must be a valid ripgrep glob pattern");
+                }
+                if (!literal && isNativeRegexError(result.stderr())) {
+                    throw ToolSupport.argument("pattern", "must be a valid ripgrep regular expression");
                 }
                 throw new IOException("native_search_exit_nonzero");
             }
@@ -415,8 +456,8 @@ final class WorkspaceFileTools {
                                     "Non-empty glob matched against file names or relative paths.", MAX_PATTERN_LENGTH),
                             "path", optionalStringProperty(
                                     "Optional workspace-relative directory; defaults to .", MAX_PATH_LENGTH),
-                            "maxResults", integerProperty(
-                                    "Maximum matching files or directories; defaults to 200.", 1, MAX_FIND_RESULTS)),
+                            "limit", integerProperty(
+                                    "Maximum matching files or directories; defaults to 100.", 1, Integer.MAX_VALUE)),
                             List.of("pattern"))));
             this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
             this.resolver = Objects.requireNonNull(resolver, "resolver");
@@ -440,7 +481,7 @@ final class WorkspaceFileTools {
                 throws IOException {
             String pattern = requiredString(invocation, "pattern", MAX_PATTERN_LENGTH,
                     "must be a non-empty glob pattern");
-            int maxResults = integer(invocation, "maxResults", DEFAULT_MAX_FIND_RESULTS, 1, MAX_FIND_RESULTS);
+            int maxResults = integer(invocation, "limit", DEFAULT_RESULT_LIMIT, 1, Integer.MAX_VALUE);
             WorkspaceBoundary boundary = new WorkspaceBoundary(workspaceRoot);
             Path start = directory(boundary, optionalString(invocation, "path", MAX_PATH_LENGTH));
             Path executable;

@@ -200,7 +200,7 @@ final class TurnEventWireMapperTest {
     /** 实时事件测试使用与历史相同的安全展示 DTO。 */
     private static ToolPresentation presentation(ToolPresentation.Status status) {
         return new ToolPresentation(ToolPresentation.Kind.READ, "read", status, "a.txt", "ok",
-                List.of("a.txt"), null, ".", null, null, null, 1L, false, null);
+                "读取完成", List.of("a.txt"), null, ".", null, null, null, 1L, false, null);
     }
 
     /** 事件测试使用完整请求级 Usage，避免旧的 Turn 级 runtime 或裸 Token 重新进入 Wire。 */

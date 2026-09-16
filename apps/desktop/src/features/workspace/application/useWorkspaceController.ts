@@ -188,6 +188,19 @@ export function useWorkspaceController({
         // “新 Workspace + 旧配置已就绪”的可交互组合。
         onWorkspaceCommitted(selected);
         setWorkspace(selected);
+        // workspace/open 已经返回 Java 签发的 durable identity；先投影到目录让刚添加的项目
+        // 立即可见，随后 list 结果仍是排序和完整目录的唯一校正来源。
+        if (selected.kind === "project") {
+          setProjects((current) => {
+            const index = current.findIndex(
+              (candidate) => candidate.workspaceId === selected.workspaceId,
+            );
+            if (index < 0) return [selected, ...current];
+            const next = [...current];
+            next[index] = selected;
+            return next;
+          });
+        }
         setRevision((current) => current + 1);
         void refreshCatalog(intent, true);
         return selected;
@@ -389,7 +402,8 @@ export function useWorkspaceController({
 
   /**
    * 首个有效 v1 配置自动打开 general workspace；key 只包含 runtime generation 与 ready，
-   * StrictMode 或失败重渲染不会重复创建 durable Thread，runtime 重启后则允许重新绑定。
+   * StrictMode 或失败重渲染不会重复创建 durable Thread；若 effect 在 commit 前被清理，
+   * 必须撤销本轮去重标记，让下一次挂载重新建立必要的默认 scope 与目录刷新。
    */
   useEffect(() => {
     if (
@@ -405,15 +419,26 @@ export function useWorkspaceController({
     if (automaticGeneralKeyRef.current === key) return;
     automaticGeneralKeyRef.current = key;
     const intent = beginIntent();
+    let committed = false;
     void (async (): Promise<void> => {
       try {
         const general = await generalWorkspace();
         generalWorkspaceIdRef.current = general.workspaceId;
-        if (isCurrentIntent(intent)) await commitWorkspace(workspaceFromGeneral(general), intent);
+        if (isCurrentIntent(intent)) {
+          committed = (await commitWorkspace(workspaceFromGeneral(general), intent)) !== undefined;
+        }
       } catch {
         if (isCurrentIntent(intent)) setError("默认对话未能打开，请检查设置和运行时状态后重试。 ");
       }
     })();
+    return () => {
+      if (
+        !committed &&
+        automaticGeneralKeyRef.current === key &&
+        workspaceRef.current === undefined
+      )
+        automaticGeneralKeyRef.current = undefined;
+    };
   }, [
     configurationReady,
     beginIntent,

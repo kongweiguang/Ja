@@ -379,7 +379,7 @@ public final class MybatisConversationRepository implements ConversationReposito
             TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
             if (current != TurnState.SUSPENDED) throw conflict("interaction turn is not suspended");
             ToolPresentation presentation = new ToolPresentation(ToolPresentation.Kind.READ,
-                    "User input", ToolPresentation.Status.SUCCESS, null, request.content(), List.of(),
+                    "User input", ToolPresentation.Status.SUCCESS, null, request.content(), "已收到用户输入", List.of(),
                     null, null, null, null, null, 0L, false, null);
             List<Fact> facts = List.of(
                     new ToolResultFact(request.callId(), ToolState.SUCCEEDED, request.content(), false,

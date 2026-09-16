@@ -1,6 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { StrictMode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceHistoryPort } from "@/features/workspace/application/ports";
@@ -111,5 +112,54 @@ describe("useWorkspaceController", () => {
     expect(order).toEqual(["fence", "general"]);
     expect(beforeWorkspaceChange).toHaveBeenLastCalledWith("ws_project", undefined);
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("目录查询尚未返回时，也立即展示 workspace/open 已确认的新项目", async () => {
+    const history = historyPort();
+    history.workspaceList = vi.fn(
+      () =>
+        new Promise<{ items: (typeof PROJECT)[]; nextCursor: null }>(() => {
+          // 保持列表请求悬挂，证明可见性来自 workspace/open 的权威返回而非侥幸快速轮询。
+        }),
+    );
+    const { result } = renderHook(() =>
+      useWorkspaceController({
+        history,
+        picker: { pick: async () => "C:\\demo" },
+        generalWorkspace: async () => GENERAL,
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        configurationReady: true,
+        beforeWorkspaceChange: async () => undefined,
+        onWorkspaceCommitted: vi.fn(),
+      }),
+    );
+    await waitFor(() => expect(result.current.workspace?.workspaceId).toBe("ws_general"));
+
+    await act(async () => result.current.choose());
+
+    expect(result.current.workspace?.workspaceId).toBe("ws_project");
+    expect(result.current.projects).toEqual([
+      expect.objectContaining({ workspaceId: "ws_project", kind: "project" }),
+    ]);
+  });
+
+  it("StrictMode 重放 effect 后仍恢复默认工作区并读取已登记项目", async () => {
+    const history = historyPort();
+    const { result } = renderHook(
+      () =>
+        useWorkspaceController({
+          history,
+          picker: { pick: async () => null },
+          generalWorkspace: async () => GENERAL,
+          runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+          configurationReady: true,
+          beforeWorkspaceChange: async () => undefined,
+          onWorkspaceCommitted: vi.fn(),
+        }),
+      { wrapper: ({ children }) => <StrictMode>{children}</StrictMode> },
+    );
+
+    await waitFor(() => expect(result.current.workspace?.workspaceId).toBe("ws_general"));
+    await waitFor(() => expect(result.current.projects).toHaveLength(1));
   });
 });

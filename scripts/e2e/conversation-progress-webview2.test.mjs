@@ -17,30 +17,23 @@ function validReport() {
   return {
     schemaVersion: 1,
     status: "passed",
-    runtime: { platform: "win32", surface: "tauri_webview2", boundary: "jvm_jar", nativeImageVerified: false },
+    runtime: {
+      platform: "win32",
+      surface: "tauri_webview2",
+      boundary: "jvm_jar",
+      nativeImageVerified: false,
+    },
     provider: { kind: "deterministic_loopback", externalCalls: 0, toolCalls: 2 },
     live: {
       commentaryBeforeFirstTool: true,
-      sequence: [
-        "commentary",
-        "tool:read",
-        "commentary",
-        "commentary",
-        "tool:shell",
-        "commentary",
-      ],
+      readSummaryVisible: true,
+      sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell", "commentary"],
       noDuplicateTools: true,
     },
     reload: {
       sameThread: true,
-      sequence: [
-        "commentary",
-        "tool:read",
-        "commentary",
-        "commentary",
-        "tool:shell",
-        "commentary",
-      ],
+      readSummaryVisible: true,
+      sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell", "commentary"],
     },
     finalVisible: true,
   };
@@ -92,22 +85,31 @@ test("loopback fixture 按 function_call_output 推进 read、shell、final 三�
     assert.match(first, /response\.output_text\.delta/u);
     assert.doesNotMatch(first, /response\.reasoning_summary_text\.delta/u);
     assert.match(first, /call_progress_read/u);
-    const second = await (
-      await post([
-        { type: "function_call", call_id: "call_progress_read", name: "read", arguments: "{}" },
-        { type: "function_call_output", call_id: "call_progress_read", output: "no head" },
-      ])
-    ).text();
+    const secondResponse = post([
+      { type: "function_call", call_id: "call_progress_read", name: "read", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_progress_read", output: "no head" },
+    ]);
+    await waitForFixtureStage(fixture, "summary_shell");
+    fixture.releaseSecondNarrative();
+    const second = await (await secondResponse).text();
     assert.match(second, /call_progress_shell/u);
-    const third = await (
-      await post([
-        { type: "function_call", call_id: "call_progress_shell", name: "shell", arguments: "{}" },
-        { type: "function_call_output", call_id: "call_progress_shell", output: "JA_PROGRESS_SHELL_OK" },
-      ])
-    ).text();
+    const thirdResponse = post([
+      { type: "function_call", call_id: "call_progress_shell", name: "shell", arguments: "{}" },
+      {
+        type: "function_call_output",
+        call_id: "call_progress_shell",
+        output: "JA_PROGRESS_SHELL_OK",
+      },
+    ]);
+    await waitForFixtureStage(fixture, "summary_final");
+    fixture.releaseFinalNarrative();
+    const third = await (await thirdResponse).text();
     assert.match(third, new RegExp(conversationProgressFixtureMarkers.final, "u"));
     assert.deepEqual(
-      fixture.snapshot().attempts.filter((attempt) => attempt.kind === "turn").map((attempt) => attempt.step),
+      fixture
+        .snapshot()
+        .attempts.filter((attempt) => attempt.kind === "turn")
+        .map((attempt) => attempt.step),
       [0, 1, 2],
     );
   } finally {

@@ -470,6 +470,8 @@ const RelativePathSchema = z
   )
   .refine(excludesIsoControls, "path must not contain control characters");
 const ArtifactIdSchema = prefixedId("artifact_", 110);
+/** Tool 摘要只供结果扫描，保持单行短文本，不为任意 Tool metadata 打开额外 wire 入口。 */
+const ToolSummarySchema = PreviewTextSchema.max(1_024);
 
 /** Java 已完成脱敏的唯一 Tool 展示合同；WebView 不接收 raw arguments 或 raw result。 */
 const ToolPresentationSchema = z
@@ -479,6 +481,7 @@ const ToolPresentationSchema = z
     status: z.enum(["pending", "running", "waiting_approval", "success", "error", "cancelled"]),
     inputPreview: PreviewTextSchema.optional(),
     outputPreview: PreviewTextSchema.optional(),
+    summary: ToolSummarySchema.optional(),
     relativePaths: z.array(RelativePathSchema).max(64).refine(unique, "paths must be unique"),
     command: PreviewTextSchema.optional(),
     relativeCwd: RelativePathSchema.optional(),

@@ -180,6 +180,6 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
     /** 历史仓储测试使用不含 raw 内容的最小安全展示对象。 */
     private static ToolPresentation presentation(ToolPresentation.Status status) {
         return new ToolPresentation(ToolPresentation.Kind.SHELL, "shell", status,
-                null, null, List.of(), null, null, null, null, null, null, false, null);
+                null, null, null, List.of(), null, null, null, null, null, null, false, null);
     }
 }

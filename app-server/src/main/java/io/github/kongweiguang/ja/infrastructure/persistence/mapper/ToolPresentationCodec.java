@@ -31,6 +31,7 @@ public final class ToolPresentationCodec {
                 .put("status", wire(value.status())).put("truncated", value.truncated());
         optional(node, "inputPreview", value.inputPreview());
         optional(node, "outputPreview", value.outputPreview());
+        optional(node, "summary", value.summary());
         ArrayNode paths = node.putArray("relativePaths");
         value.relativePaths().forEach(paths::add);
         optional(node, "command", value.command());
@@ -56,7 +57,8 @@ public final class ToolPresentationCodec {
                     ToolPresentation.Kind.valueOf(text(required(node, "kind")).toUpperCase(Locale.ROOT)),
                     text(required(node, "title")),
                     ToolPresentation.Status.valueOf(text(required(node, "status")).toUpperCase(Locale.ROOT)),
-                    optionalText(node, "inputPreview"), optionalText(node, "outputPreview"), paths,
+                    optionalText(node, "inputPreview"), optionalText(node, "outputPreview"),
+                    optionalText(node, "summary"), paths,
                     optionalText(node, "command"), optionalText(node, "relativeCwd"),
                     optionalText(node, "stdout"), optionalText(node, "stderr"),
                     optionalInteger(node, "exitCode"), optionalLong(node, "durationMs"),

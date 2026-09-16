@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { WorkStepAdapter } from "@/features/conversation/domain/timelineTypes";
 import { WorkProcess } from "@/features/conversation/ui/timeline/WorkProcess";
@@ -37,7 +37,7 @@ function toolStep(overrides: Partial<WorkStepAdapter> = {}): WorkStepAdapter {
 describe("ToolStepDetails", () => {
   afterEach(() => cleanup());
 
-  /** 未知 MCP 真实名称、首个目标和脱敏诊断正文必须在失败展开态同时可见。 */
+  /** 未知 MCP 的可访问身份、首个目标和脱敏诊断正文必须在失败展开态同时可见。 */
   it("显示动作、真实 Tool 名称、首个目标并自动展开具体失败", () => {
     render(<WorkProcess steps={[toolStep()]} />);
 
@@ -45,8 +45,8 @@ describe("ToolStepDetails", () => {
     expect(trigger).toBeVisible();
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(trigger).toHaveTextContent("调用工具");
-    expect(trigger).toHaveTextContent("custom_mcp");
     expect(trigger).toHaveTextContent('{"query":""}');
+    expect(trigger.closest(".ja-tool-details")).toHaveAttribute("data-status", "error");
     expect(screen.getByText("query 不能为空")).toBeVisible();
     expect(screen.queryByText("调用工具 .")).not.toBeInTheDocument();
   });
@@ -100,5 +100,76 @@ describe("ToolStepDetails", () => {
     expect(
       screen.getByRole("button", { name: `${action}，${toolName}，${target}，进行中` }),
     ).toBeVisible();
+  });
+
+  /** grep 的固定脱敏行格式应该成为可扫描的命中列表，服务器摘要取代重复的机器发现尾注。 */
+  it("将内容搜索结果渲染为紧凑命中列表", () => {
+    const step = toolStep();
+    const presentation = step.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    render(
+      <WorkProcess
+        steps={[
+          {
+            ...step,
+            metadata: {
+              ...step.metadata,
+              toolName: "grep",
+              presentation: {
+                ...presentation,
+                kind: "read",
+                summary: "找到 2 个匹配项",
+                outputPreview:
+                  "src/App.tsx:12: const needle = true;\nsrc/App.tsx-13- export default App;",
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("找到 2 个匹配项")).toBeVisible();
+    expect(screen.getByRole("list", { name: "搜索结果" })).toBeVisible();
+    expect(screen.getAllByText("src/App.tsx").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("12")).toBeVisible();
+    expect(screen.getByText("const needle = true;")).toBeVisible();
+  });
+
+  /** 成功 edit 只使用受控摘要说明结果规模，避免把执行端英文正文重复塞进工作过程。 */
+  it("为成功编辑显示摘要而不重复输出正文", () => {
+    const step = toolStep();
+    const presentation = step.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    render(
+      <WorkProcess
+        steps={[
+          {
+            ...step,
+            status: "completed",
+            metadata: {
+              ...step.metadata,
+              toolName: "edit",
+              presentation: {
+                ...presentation,
+                kind: "edit",
+                status: "success",
+                inputPreview: "edit src/App.tsx · 2 block(s)",
+                outputPreview: "Successfully replaced 2 block(s) in the file.",
+                summary: "已完成 2 处替换",
+                relativePaths: ["src/App.tsx"],
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "工作过程，已完成，1 步" }));
+    const trigger = screen.getByRole("button", { name: /编辑，edit，src\/App\.tsx，完成/u });
+    fireEvent.click(trigger);
+    expect(screen.getByText("已完成 2 处替换")).toBeVisible();
+    expect(
+      screen.queryByText("Successfully replaced 2 block(s) in the file."),
+    ).not.toBeInTheDocument();
   });
 });

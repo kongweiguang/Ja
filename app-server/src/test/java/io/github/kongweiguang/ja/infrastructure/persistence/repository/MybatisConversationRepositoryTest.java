@@ -2402,7 +2402,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
     /** 测试只构造不含 raw 内容的最小展示事实，避免 fixture 绕过生产安全投影。 */
     private static ToolPresentation presentation(ToolPresentation.Status status) {
         return new ToolPresentation(ToolPresentation.Kind.MCP, "fixture", status,
-                null, null, List.of(), null, null, null, null, null, null, false, null);
+                null, null, null, List.of(), null, null, null, null, null, null, false, null);
     }
 
     /** 构造字段完整且来源一致的 Checkpoint，供重启与并发事务测试共享同一持久契约。 */

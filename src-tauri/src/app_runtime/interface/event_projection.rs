@@ -1307,7 +1307,7 @@ fn valid_tool_result(value: &Value) -> bool {
     })
 }
 
-/// Tool 展示 DTO 是 Java 安全投影的唯一 WebView 边界；Rust 再次执行闭集、大小、路径与
+/// Tool 展示 DTO 是 Java 安全投影的唯一 WebView 边界；Rust 再次执行闭集、大小、路径、摘要与
 /// artifact identity 校验，确保 raw arguments/result 或绝对路径无法借事件透传。
 fn valid_tool_presentation(value: Option<&Value>) -> bool {
     let Some(presentation) = value.and_then(Value::as_object) else {
@@ -1319,6 +1319,7 @@ fn valid_tool_presentation(value: Option<&Value>) -> bool {
         &[
             "inputPreview",
             "outputPreview",
+            "summary",
             "command",
             "relativeCwd",
             "stdout",
@@ -1343,6 +1344,7 @@ fn valid_tool_presentation(value: Option<&Value>) -> bool {
             })
         || !optional_bounded_text(presentation.get("inputPreview"), 0, 32_768)
         || !optional_bounded_text(presentation.get("outputPreview"), 0, 32_768)
+        || !optional_bounded_text(presentation.get("summary"), 0, 1_024)
         || !optional_bounded_text(presentation.get("command"), 0, 32_768)
         || !optional_bounded_text(presentation.get("stdout"), 0, 32_768)
         || !optional_bounded_text(presentation.get("stderr"), 0, 32_768)

@@ -39,10 +39,11 @@ final class ToolPresentationWireMapper {
         return node;
     }
 
-    /** 展示摘要与 artifact identity 共用可选语义，缺失时不发送 JSON null。 */
+    /** 摘要、预览与 artifact identity 共用可选语义，缺失时不发送 JSON null。 */
     private static void appendPreviews(ObjectNode node, ToolPresentation value) {
         optional(node, "inputPreview", value.inputPreview());
         optional(node, "outputPreview", value.outputPreview());
+        optional(node, "summary", value.summary());
         optional(node, "artifactId", value.artifactId());
     }
 

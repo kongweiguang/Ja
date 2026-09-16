@@ -18,6 +18,7 @@ import {
   createReviewGitFixture,
   parseArguments,
   validateMaxModelRounds,
+  validateWallTimeoutMs,
   writeIsolatedSettings,
 } from "./review-redesign-production.mjs";
 
@@ -61,22 +62,28 @@ test("parseArguments 接受显式 launch 参数", () => {
   assert.equal(parsed.untrackedFiles, 1_800);
 });
 
-/** 隔离 runner 默认保持四轮，Tool 目录可显式增加到五轮，但不能越过产品配置边界。 */
-test("writeIsolatedSettings 使用有界 maxModelRounds 覆盖", async (context) => {
+/** 隔离 runner 的轮次和总时限覆盖必须有产品合同同源的有限边界。 */
+test("writeIsolatedSettings 使用有界轮次和总时限覆盖", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "ja-review-rounds-test-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   assert.equal(validateMaxModelRounds(), 4);
   assert.equal(validateMaxModelRounds(5), 5);
   assert.throws(() => validateMaxModelRounds(0), /between 1 and 128/u);
   assert.throws(() => validateMaxModelRounds(129), /between 1 and 128/u);
+  assert.equal(validateWallTimeoutMs(), 30_000);
+  assert.equal(validateWallTimeoutMs(120_000), 120_000);
+  assert.throws(() => validateWallTimeoutMs(999), /between 1000 and 86400000/u);
+  assert.throws(() => validateWallTimeoutMs(86_400_001), /between 1000 and 86400000/u);
 
-  await writeIsolatedSettings(join(root, "five"), "http://127.0.0.1:1234/v1", 5);
+  await writeIsolatedSettings(join(root, "five"), "http://127.0.0.1:1234/v1", 5, 120_000);
   const fiveRounds = await readFile(join(root, "five", "config.toml"), "utf8");
   assert.match(fiveRounds, /^max_model_rounds = 5$/mu);
+  assert.match(fiveRounds, /^wall_timeout_ms = 120000$/mu);
 
   await writeIsolatedSettings(join(root, "default"), "http://127.0.0.1:1234/v1");
   const defaultRounds = await readFile(join(root, "default", "config.toml"), "utf8");
   assert.match(defaultRounds, /^max_model_rounds = 4$/mu);
+  assert.match(defaultRounds, /^wall_timeout_ms = 30000$/mu);
 });
 
 /** 官方 EdgeDriver 路径是显式 launch 选择，不能从 PATH 猜测或与 attach 混用。 */
@@ -197,6 +204,11 @@ test("buildLaunchEnvironment 固定隔离目录和 JDK 25", () => {
   assert.equal(env.JAVA_TOOL_OPTIONS, undefined);
   assert.equal(env.JDK_JAVA_OPTIONS, undefined);
   assert.equal(env._JAVA_OPTIONS, undefined);
+  assert.match(
+    env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,
+    /--remote-debugging-address=127\.0\.0\.1/u,
+  );
+  assert.match(env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, /--remote-debugging-port=9227/u);
 });
 
 /** EdgeDriver 模式只发布 runner ACK 合同，不得同时注入 Direct CDP 浏览器参数。 */

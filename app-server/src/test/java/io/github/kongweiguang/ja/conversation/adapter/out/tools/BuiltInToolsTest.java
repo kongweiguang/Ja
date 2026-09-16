@@ -11,8 +11,13 @@ import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.foundation.json.JsonArray;
+import io.github.kongweiguang.ja.foundation.json.JsonBoolean;
+import io.github.kongweiguang.ja.foundation.json.JsonNumber;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
+import io.github.kongweiguang.ja.foundation.json.JsonValue;
 import io.github.kongweiguang.ja.conversation.domain.ContextBudget;
 import io.github.kongweiguang.ja.support.FixedAgentPromptSession;
 import org.junit.jupiter.api.Test;
@@ -56,14 +61,13 @@ class BuiltInToolsTest {
         assertEquals("one", execute(registry, "read",
                 JsonObjects.builder().putText("path", "../outside/note.txt").build()).content());
         execute(registry, "edit", JsonObjects.builder()
-                .putText("path", "../outside/note.txt").putText("oldText", "one").putText("newText", "two")
-                .build());
+                .putText("path", "../outside/note.txt").put("edits", edits(replacement("one", "two"))).build());
         assertEquals("two", Files.readString(outside.resolve("note.txt")));
     }
 
-    /** grep 只做字面量内容匹配；省略 filePattern 时默认搜索所有文件。 */
+    /** grep 默认正则，literal=true 可让常见标点按精确文本匹配；省略 glob 时搜索所有文件。 */
     @Test
-    void grepsWorkspaceFilesWithLiteralQueryAndDefaultPattern() throws Exception {
+    void grepsWorkspaceFilesWithLiteralPatternAndDefaultGlob() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("search-workspace"));
         Path nested = Files.createDirectory(workspace.resolve("nested"));
         Files.writeString(workspace.resolve("Plan.java"), "class Plan {\n  // a+b marker\n}\n", StandardCharsets.UTF_8);
@@ -72,7 +76,7 @@ class BuiltInToolsTest {
                 promptSession(), unusedAttachments());
 
         AgentTool.ToolResult result = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", "a+b").build());
+                .putText("pattern", "a+b").putBoolean("literal", true).build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
         assertTrue(result.content().contains("Plan.java:2"), result.content());
@@ -80,7 +84,7 @@ class BuiltInToolsTest {
         assertTrue(result.content().contains("nested/notes.md:1"), result.content());
 
         AgentTool.ToolResult javaOnly = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", "a+b").putText("filePattern", "*.java").build());
+                .putText("pattern", "a+b").putBoolean("literal", true).putText("glob", "*.java").build());
         assertTrue(javaOnly.content().contains("Plan.java:2"));
         assertFalse(javaOnly.content().contains("notes.md:1"));
         assertEquals(AgentTool.WorkspaceMutationMode.NONE,
@@ -136,15 +140,15 @@ class BuiltInToolsTest {
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
 
-        String maximumQuery = "😀".repeat(512);
+        String maximumPattern = "😀".repeat(4_096);
         AgentTool.ToolResult accepted = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", maximumQuery).build());
+                .putText("pattern", maximumPattern).build());
         AgentTool.ToolResult rejected = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", maximumQuery + "😀").build());
+                .putText("pattern", maximumPattern + "😀").build());
 
         assertEquals(ToolOutcome.SUCCEEDED, accepted.outcome());
         assertEquals("tool_arguments_invalid", rejected.errorCode());
-        assertTrue(rejected.content().contains("query"));
+        assertTrue(rejected.content().contains("pattern"));
     }
 
     /** rg 命中含非法 UTF-8 的候选时必须显式报告 partial，不能把二进制输出伪装成空文本。 */
@@ -157,7 +161,7 @@ class BuiltInToolsTest {
                 promptSession(), unusedAttachments());
 
         AgentTool.ToolResult result = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", "not-present").build());
+                .putText("pattern", "not-present").build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
         assertTrue(result.content().contains("skippedCandidates=1"), result.content());
@@ -175,7 +179,7 @@ class BuiltInToolsTest {
                 promptSession(), unusedAttachments());
 
         AgentTool.ToolResult result = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", "marker").putNumber("maxResults", 1).build());
+                .putText("pattern", "marker").putNumber("limit", 1).build());
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
         assertEquals(1, result.content().lines().filter(line -> line.contains("markers.txt:")).count());
@@ -183,7 +187,7 @@ class BuiltInToolsTest {
         assertTrue(result.content().contains("termination=result_limit"));
     }
 
-    /** 空 query、非法 Glob 和普通文件 path 都在执行边界返回字段化、可纠正错误。 */
+    /** 空 pattern、非法 Glob 和普通文件 path 都在执行边界返回字段化、可纠正错误。 */
     @Test
     void rejectsInvalidDiscoveryArgumentsWithSpecificConstraints() throws Exception {
         Path workspace = Files.createDirectory(temporary.resolve("discovery-arguments-workspace"));
@@ -191,16 +195,16 @@ class BuiltInToolsTest {
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
 
-        AgentTool.ToolResult emptyQuery = execute(registry, "grep", JsonObjects.builder()
-                .putText("query", "").build());
+        AgentTool.ToolResult emptyPattern = execute(registry, "grep", JsonObjects.builder()
+                .putText("pattern", "").build());
         AgentTool.ToolResult badGlob = execute(registry, "find", JsonObjects.builder()
                 .putText("pattern", "[").build());
         AgentTool.ToolResult filePath = execute(registry, "ls", JsonObjects.builder()
                 .putText("path", "one.txt").build());
 
-        assertEquals("tool_arguments_invalid", emptyQuery.errorCode());
-        assertTrue(emptyQuery.content().contains("query"));
-        assertTrue(emptyQuery.content().contains("find"));
+        assertEquals("tool_arguments_invalid", emptyPattern.errorCode());
+        assertTrue(emptyPattern.content().contains("pattern"));
+        assertTrue(emptyPattern.content().contains("find"));
         assertEquals("tool_arguments_invalid", badGlob.errorCode());
         assertTrue(badGlob.content().contains("pattern"));
         assertTrue(badGlob.content().contains("glob"));
@@ -281,8 +285,8 @@ class BuiltInToolsTest {
         AgentTool.ToolResult written = execute(registry, "write", JsonObjects.builder()
                 .putText("path", target.toString()).putText("content", "secret-before").build());
         AgentTool.ToolResult edited = execute(registry, "edit", JsonObjects.builder()
-                .putText("path", target.toString()).putText("oldText", "secret-before")
-                .putText("newText", "secret-after").build());
+                .putText("path", target.toString()).put("edits", edits(replacement("secret-before", "secret-after")))
+                .build());
 
         assertEquals(AgentTool.WorkspaceMutationMode.EXACT_TEXT,
                 registry.snapshot().stream().filter(tool -> "write".equals(tool.spec().name())).findFirst()
@@ -436,8 +440,8 @@ class BuiltInToolsTest {
         ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
                 promptSession(), unusedAttachments());
         AgentTool.ToolResult result = execute(registry, "edit",
-                JsonObjects.builder().putText("path", "duplicate.txt").putText("oldText", "same")
-                        .putText("newText", "next").build());
+                JsonObjects.builder().putText("path", "duplicate.txt")
+                        .put("edits", edits(replacement("same", "next"))).build());
         assertEquals("tool_io_failed", result.errorCode());
         assertTrue(result.content().startsWith(
                 "Tool failed: tool_io_failed. The operating system could not complete the operation; "));
@@ -445,6 +449,51 @@ class BuiltInToolsTest {
         assertEquals("same same", Files.readString(workspace.resolve("duplicate.txt")));
         assertThrows(IllegalArgumentException.class,
                 () -> registry.require(invocation("read_file", JsonObject.empty())));
+    }
+
+    /** 多个 edit 必须对同一 preimage 定位、拒绝重叠，并以一份精确收据原子提交。 */
+    @Test
+    void editsMultipleNonOverlappingBlocksAtomically() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("batch-edit-workspace"));
+        Path source = workspace.resolve("source.txt");
+        Files.writeString(source, "alpha\nunchanged\nomega\n");
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult success = execute(registry, "edit", JsonObjects.builder().putText("path", "source.txt")
+                .put("edits", edits(replacement("alpha", "ALPHA"), replacement("omega", "OMEGA"))).build());
+        AgentTool.ToolResult overlap = execute(registry, "edit", JsonObjects.builder().putText("path", "source.txt")
+                .put("edits", edits(replacement("ALPHA\nunchanged", "first"),
+                        replacement("ALPHA\nunchanged\nOMEGA", "second"))).build());
+
+        assertEquals(ToolOutcome.SUCCEEDED, success.outcome(), success::toString);
+        assertEquals("Successfully replaced 2 block(s) in the file.", success.content());
+        assertReceipt(success, source, true, "alpha\nunchanged\nomega\n", "ALPHA\nunchanged\nOMEGA\n");
+        assertEquals("tool_io_failed", overlap.errorCode());
+        assertEquals("ALPHA\nunchanged\nOMEGA\n", Files.readString(source));
+    }
+
+    /** read 的行请求再大也必须保持 Pi 风格的字节/行双预算，并向模型给出可用的后续 offset。 */
+    @Test
+    void readCapsVisibleBytesAndReturnsContinuationMetadata() throws Exception {
+        Path workspace = Files.createDirectory(temporary.resolve("read-budget-workspace"));
+        Path source = workspace.resolve("long-lines.txt");
+        StringBuilder content = new StringBuilder();
+        for (int index = 0; index < 200; index++) content.append("x".repeat(1_024)).append('\n');
+        Files.writeString(source, content);
+        ToolRegistry registry = BuiltInTools.create(workspace, new EmptySkills(), catalog(), shellCapability(),
+                promptSession(), unusedAttachments());
+
+        AgentTool.ToolResult result = execute(registry, "read", JsonObjects.builder()
+                .putText("path", "long-lines.txt").putNumber("limit", 100_000).build());
+        JsonObject metadata = (JsonObject) result.structuredContent().orElseThrow();
+
+        assertTrue(result.content().getBytes(StandardCharsets.UTF_8).length <= 64 * 1024,
+                () -> Integer.toString(result.content().length()));
+        assertEquals(new JsonText("byte_limit"), metadata.get("termination"));
+        assertTrue(metadata.get("nextOffset") instanceof JsonNumber, metadata::toString);
+        assertTrue(((JsonBoolean) metadata.get("truncated")).value(), metadata::toString);
+        assertTrue(result.content().contains("Use offset="), result::content);
     }
 
     /** read 只返回内容与范围元数据，文件字节和修改时间都不能形成任何修改事实。 */
@@ -591,6 +640,19 @@ class BuiltInToolsTest {
         if (!before.isEmpty()) assertFalse(publicProjection.contains(before));
         assertFalse(publicProjection.contains(after));
         assertFalse(publicProjection.contains(receipt.afterSha256()));
+    }
+
+    /** 构造严格 JSON 数组，使所有批量 edit 测试走 Provider 实际提交的嵌套对象形状。 */
+    private static JsonArray edits(JsonObject first, JsonObject... remaining) {
+        List<JsonValue> values = new java.util.ArrayList<>();
+        values.add(first);
+        for (JsonObject replacement : remaining) values.add(replacement);
+        return new JsonArray(values);
+    }
+
+    /** 保持 oldText/newText 成对出现，避免测试夹具无意绕开 edit 的封闭对象约束。 */
+    private static JsonObject replacement(String oldText, String newText) {
+        return JsonObjects.builder().putText("oldText", oldText).putText("newText", newText).build();
     }
 
     /** 每次调用使用合法稳定身份，测试只变化 Tool 名和参数。 */

@@ -30,6 +30,9 @@ const DEFAULT_IGNORED_FILES = 4_500;
 const DEFAULT_UNTRACKED_FILES = 1_800;
 const DEFAULT_MAX_MODEL_ROUNDS = 4;
 const MAX_MODEL_ROUNDS = 128;
+const DEFAULT_WALL_TIMEOUT_MS = 30_000;
+const MIN_WALL_TIMEOUT_MS = 1_000;
+const MAX_WALL_TIMEOUT_MS = 86_400_000;
 const STABLE_PORT_RANGE = Object.freeze({ start: 41_000, size: 8_000 });
 
 /** 只接受命名参数，scope 必须显式声明，避免 Git-only 被误认为完整验收。 */
@@ -295,15 +298,30 @@ export function validateMaxModelRounds(value = DEFAULT_MAX_MODEL_ROUNDS) {
 }
 
 /**
+ * 校验隔离 fixture 的总 Turn 预算；边界与 App Server 配置合同一致，避免测试为了等待问题而写入
+ * 无界超时，默认值仍保留 Review 场景原有的 30 秒。
+ */
+export function validateWallTimeoutMs(value = DEFAULT_WALL_TIMEOUT_MS) {
+  if (!Number.isSafeInteger(value) || value < MIN_WALL_TIMEOUT_MS || value > MAX_WALL_TIMEOUT_MS) {
+    throw new Error(
+      `wallTimeoutMs must be an integer between ${MIN_WALL_TIMEOUT_MS} and ${MAX_WALL_TIMEOUT_MS}`,
+    );
+  }
+  return value;
+}
+
+/**
  * 写入只供 runtime 启动的最小合法配置；Provider endpoint 只允许 runner 自己的 loopback fixture，
- * maxModelRounds 只为多轮 fixture 提供有界覆盖，默认保持 Review 原有 4 轮预算。
+ * 模型轮次和总 Turn 预算只可在调用方显式覆盖，默认保持 Review 原有的 4 轮/30 秒预算。
  */
 export async function writeIsolatedSettings(
   home,
   providerBaseUrl = "http://127.0.0.1:9/v1",
   maxModelRounds = DEFAULT_MAX_MODEL_ROUNDS,
+  wallTimeoutMs = DEFAULT_WALL_TIMEOUT_MS,
 ) {
   validateMaxModelRounds(maxModelRounds);
+  validateWallTimeoutMs(wallTimeoutMs);
   if (
     typeof providerBaseUrl !== "string" ||
     !/^https?:\/\/(?:127\.0\.0\.1|localhost):[1-9]\d{0,4}\/v1$/u.test(providerBaseUrl)
@@ -337,7 +355,7 @@ export async function writeIsolatedSettings(
     "[providers.agent_defaults.turn_limits]",
     `max_model_rounds = ${maxModelRounds}`,
     "max_tool_calls = 8",
-    "wall_timeout_ms = 30000",
+    `wall_timeout_ms = ${wallTimeoutMs}`,
     "[[providers.models]]",
     'model_id = "model_e2e"',
     'name = "Review E2E Model"',
@@ -528,7 +546,7 @@ export function buildLaunchEnvironment({
     ...(edgeDriver === undefined
       ? {
           WEBVIEW2_USER_DATA_FOLDER: directories.webview,
-          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-port=${cdpPort}`,
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-address=127.0.0.1 --remote-debugging-port=${cdpPort}`,
         }
       : {
           JA_E2E_CARGO_COMMAND: cargo,
@@ -726,7 +744,12 @@ export async function runProduction(options) {
       edgeDriverIdentity = validatedEdgeDriver;
       [fixtureFacts] = await Promise.all([
         createReviewGitFixture(directories.workspace, options),
-        writeIsolatedSettings(directories.home, options.providerBaseUrl, options.maxModelRounds),
+        writeIsolatedSettings(
+          directories.home,
+          options.providerBaseUrl,
+          options.maxModelRounds,
+          options.wallTimeoutMs,
+        ),
       ]);
       frontendPort = await reservePort();
       const automationPort = await reservePort(new Set([frontendPort]));
@@ -783,6 +806,7 @@ export async function runProduction(options) {
       workspaceRoot: directories.workspace,
       evidenceDirectory: join(options.evidenceDirectory, "screenshots"),
       scope: options.scope,
+      isolatedRuntimeHome: directories.home,
     });
     report.execution = {
       boundary: options.cdpEndpoint === undefined ? "debug_jar" : "external_cdp",

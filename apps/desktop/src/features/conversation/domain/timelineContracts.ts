@@ -862,6 +862,7 @@ function isToolPresentation(value: unknown): value is ToolPresentation {
       String(presentation["status"]),
     ) &&
     Array.isArray(presentation["relativePaths"]) &&
+    (presentation["summary"] === undefined || typeof presentation["summary"] === "string") &&
     typeof presentation["truncated"] === "boolean"
   );
 }

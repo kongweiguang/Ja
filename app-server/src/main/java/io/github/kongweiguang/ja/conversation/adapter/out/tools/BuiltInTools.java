@@ -12,9 +12,12 @@ import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.filesystem.PathIdentities;
+import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjectBuilder;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
+import io.github.kongweiguang.ja.foundation.json.JsonValue;
 import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.WorkspaceBoundary;
 
 import java.io.ByteArrayOutputStream;
@@ -33,6 +36,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
@@ -43,6 +47,11 @@ import java.util.Optional;
 public final class BuiltInTools {
     private static final int MAX_TEXT_CHARACTERS = 4_000_000;
     private static final int MAX_TEXT_BYTES = MAX_TEXT_CHARACTERS * 4;
+    private static final int MAX_READ_RESULT_BYTES = 64 * 1024;
+    private static final int MAX_READ_NOTICE_BYTES = 256;
+    private static final int MAX_READ_BODY_BYTES = MAX_READ_RESULT_BYTES - MAX_READ_NOTICE_BYTES;
+    private static final int MAX_READ_RESULT_LINES = 2_000;
+    private static final int MAX_EDIT_REPLACEMENTS = 128;
 
     /** 禁止绕过工厂拼装会漂移的内置 Tool 集。 */
     private BuiltInTools() {
@@ -158,7 +167,8 @@ public final class BuiltInTools {
                             "path", requiredStringProperty("Relative, absolute, parent, or skill:// path.", 8_192),
                             "offset", integerProperty("One-based first line; defaults to 1.", 1,
                                     Integer.MAX_VALUE),
-                            "limit", integerProperty("Maximum lines; defaults to 2000.", 1, 100_000)),
+                            "limit", integerProperty("Requested lines; defaults to 2000. Results stay capped at 2000 lines and 64KiB.",
+                                    1, 100_000)),
                             List.of("path"))));
             this.workspaceRoot = workspaceRoot;
             this.skills = Objects.requireNonNull(skills, "skills");
@@ -216,18 +226,22 @@ public final class BuiltInTools {
                 metadata = JsonObjects.builder().putText("path", path.toString()).build();
             }
             LineSlice slice = slice(content, offset, limit);
-            JsonObject rangeMetadata = JsonObjects.builder()
+            JsonObjectBuilder rangeMetadata = JsonObjects.builder()
                     .putNumber("offset", offset)
                     .putNumber("lines", slice.lines())
-                    .putBoolean("truncated", slice.truncated())
-                    .build();
-            return new ToolResult(ToolOutcome.SUCCEEDED, slice.content(),
-                    Optional.of(merge(metadata, rangeMetadata)), null);
+                    .putNumber("totalLines", slice.totalLines())
+                    .putBoolean("truncated", slice.truncated());
+            if (slice.nextOffset() > 0) rangeMetadata.putNumber("nextOffset", slice.nextOffset());
+            if (slice.termination() != null) rangeMetadata.putText("termination", slice.termination());
+            return new ToolResult(ToolOutcome.SUCCEEDED, withReadContinuation(slice, offset),
+                    Optional.of(merge(metadata, rangeMetadata.build())), null);
         }
 
     }
 
-    /** 精确替换唯一 oldText，避免模糊 Patch 猜测和多处静默修改。 */
+    /**
+     * 在同一原始版本上精确替换多个互不重叠的文本块，减少模型往返同时保留唯一匹配与原子提交约束。
+     */
     private static final class EditTool extends ToolSupport {
         private final Path workspaceRoot;
         private final WorkspaceBoundary boundary;
@@ -235,13 +249,12 @@ public final class BuiltInTools {
 
         /** Workspace 只提供相对路径起点，绝对路径与父级路径保持原生语义。 */
         private EditTool(Path workspaceRoot, MutationWriter mutationWriter) {
-            super(new ToolSpec("edit", "Replace one unique text occurrence in a UTF-8 file",
+            super(new ToolSpec("edit", "Replace unique, non-overlapping text occurrences in one UTF-8 file",
                     objectSchema(Map.of(
                             "path", requiredStringProperty("Relative, absolute, or parent path.", 8_192),
-                            "oldText", requiredStringProperty("Text that must occur exactly once.",
-                                    MAX_TEXT_CHARACTERS),
-                            "newText", optionalStringProperty("Replacement text.", MAX_TEXT_CHARACTERS)),
-                            List.of("path", "oldText", "newText"))));
+                            "edits", arrayProperty("One or more unique, non-overlapping replacements matched against the original file.",
+                                    replacementSchema(), 1, MAX_EDIT_REPLACEMENTS)),
+                            List.of("path", "edits"))));
             this.workspaceRoot = workspaceRoot;
             this.boundary = new WorkspaceBoundary(workspaceRoot);
             this.mutationWriter = Objects.requireNonNull(mutationWriter, "mutationWriter");
@@ -253,27 +266,115 @@ public final class BuiltInTools {
             return WorkspaceMutationMode.EXACT_TEXT;
         }
 
-        /** 先确认唯一匹配再原子替换，失败时绝不产生部分写入。 */
+        /**
+         * 所有 edit 都先在同一 preimage 中定位，重叠、重复或缺失任一目标即失败，避免增量替换改变后续匹配语义。
+         */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
             MutationTarget target = mutationTarget(workspaceRoot, boundary,
                     string(invocation, "path", 8_192), true);
             Path path = target.path();
-            String oldText = string(invocation, "oldText", MAX_TEXT_CHARACTERS);
-            String newText = optionalString(invocation, "newText", MAX_TEXT_CHARACTERS);
-            if (newText == null) throw argument("newText", "must be a string; empty text is allowed");
             String current = Files.readString(path, StandardCharsets.UTF_8);
-            int first = current.indexOf(oldText);
-            if (first < 0) throw new IOException("old_text_not_found");
-            if (current.indexOf(oldText, first + oldText.length()) >= 0) throw new IOException("old_text_not_unique");
+            List<ReplacementMatch> matches = locateReplacements(current, replacements(invocation));
             token.throwIfCancellationRequested();
-            String updated = current.substring(0, first) + newText + current.substring(first + oldText.length());
+            String updated = applyReplacements(current, matches);
             writeObserved(target, updated, mutationWriter);
             AgentTool.MutationReceipt receipt = target.receipt(true, current, updated);
-            return new ToolResult(ToolOutcome.SUCCEEDED, "File edited successfully.",
+            return new ToolResult(ToolOutcome.SUCCEEDED, "Successfully replaced " + matches.size()
+                    + " block(s) in the file.",
                     Optional.empty(), null, Optional.of(receipt));
         }
+
+        /** 让 Provider Schema 与执行端共享每项精确替换的字段、长度和封闭对象约束。 */
+        private static JsonObject replacementSchema() {
+            return objectSchema(Map.of(
+                    "oldText", requiredStringProperty("Text that must occur exactly once in the original file.",
+                            MAX_TEXT_CHARACTERS),
+                    "newText", optionalStringProperty("Replacement text; empty text removes the occurrence.",
+                            MAX_TEXT_CHARACTERS)), List.of("oldText", "newText"));
+        }
+
+        /**
+         * 在 Schema 校验被绕过时仍收紧 edit 数组形状和总文本预算，避免一次调用放大为无界内存或写入。
+         */
+        private static List<Replacement> replacements(Invocation invocation) {
+            JsonValue raw = invocation.arguments().members().get("edits");
+            if (!(raw instanceof JsonArray values) || values.values().isEmpty()
+                    || values.values().size() > MAX_EDIT_REPLACEMENTS) {
+                throw argument("edits", "must contain between 1 and " + MAX_EDIT_REPLACEMENTS + " replacements");
+            }
+            List<Replacement> replacements = new ArrayList<>(values.values().size());
+            long totalCharacters = 0;
+            for (JsonValue value : values.values()) {
+                if (!(value instanceof JsonObject edit) || edit.members().size() != 2
+                        || !edit.containsKey("oldText") || !edit.containsKey("newText")) {
+                    throw argument("edits", "must contain only oldText and newText objects");
+                }
+                String oldText = replacementText(edit, "oldText", false);
+                String newText = replacementText(edit, "newText", true);
+                totalCharacters += oldText.codePointCount(0, oldText.length())
+                        + newText.codePointCount(0, newText.length());
+                if (totalCharacters > MAX_TEXT_CHARACTERS) {
+                    throw argument("edits", "combined replacement text exceeds the published length limit");
+                }
+                replacements.add(new Replacement(oldText, newText));
+            }
+            return List.copyOf(replacements);
+        }
+
+        /** 读取 replacement 字段时保留 oldText 非空和 newText 可为空的不同语义。 */
+        private static String replacementText(JsonObject edit, String name, boolean allowEmpty) {
+            JsonValue raw = edit.members().get(name);
+            if (!(raw instanceof JsonText text)
+                    || text.value().codePointCount(0, text.value().length()) > MAX_TEXT_CHARACTERS
+                    || (!allowEmpty && text.value().isBlank())) {
+                throw argument("edits", name + " must be a " + (allowEmpty ? "string" : "non-empty string")
+                        + " within the published length limit");
+            }
+            return text.value();
+        }
+
+        /**
+         * 每个 oldText 必须在同一原始文本中恰好出现一次，并按位置排序后拒绝重叠而非猜测应用顺序。
+         */
+        private static List<ReplacementMatch> locateReplacements(String current, List<Replacement> replacements)
+                throws IOException {
+            List<ReplacementMatch> matches = new ArrayList<>(replacements.size());
+            for (Replacement replacement : replacements) {
+                int first = current.indexOf(replacement.oldText());
+                if (first < 0) throw new IOException("old_text_not_found");
+                if (current.indexOf(replacement.oldText(), first + 1) >= 0) {
+                    throw new IOException("old_text_not_unique");
+                }
+                matches.add(new ReplacementMatch(first, first + replacement.oldText().length(),
+                        replacement.newText()));
+            }
+            matches.sort(Comparator.comparingInt(ReplacementMatch::start));
+            for (int index = 1; index < matches.size(); index++) {
+                if (matches.get(index - 1).end() > matches.get(index).start()) {
+                    throw new IOException("old_text_overlaps");
+                }
+            }
+            return List.copyOf(matches);
+        }
+
+        /** 根据已排序且不重叠的原始范围一次性生成 postimage，避免每次替换改变后续匹配位置。 */
+        private static String applyReplacements(String current, List<ReplacementMatch> matches) {
+            StringBuilder updated = new StringBuilder(current.length());
+            int cursor = 0;
+            for (ReplacementMatch match : matches) {
+                updated.append(current, cursor, match.start()).append(match.newText());
+                cursor = match.end();
+            }
+            return updated.append(current, cursor, current.length()).toString();
+        }
+
+        /** 保留每项匹配前的原始文本和替换后文本，防止位置推导与内容替换耦合。 */
+        private record Replacement(String oldText, String newText) { }
+
+        /** 只保存已在原始文本中确认的范围，供排序、冲突判断和一次性 postimage 构造复用。 */
+        private record ReplacementMatch(int start, int end, String newText) { }
     }
 
     /** 完整写入一个 UTF-8 文件，并通过同目录临时文件避免半写入。 */
@@ -542,12 +643,55 @@ public final class BuiltInTools {
         }
     }
 
-    /** 生成固定行范围并报告剩余内容，避免 read 一次把无界文件塞进上下文。 */
+    /**
+     * 对 read 结果同时施加行数和 UTF-8 字节预算；优先保留完整行，超长单行则引导模型改用有界 Shell 查询。
+     */
     private static LineSlice slice(String content, int offset, int limit) {
         List<String> lines = content.lines().toList();
         int start = Math.min(lines.size(), offset - 1);
-        int end = Math.min(lines.size(), start + limit);
-        return new LineSlice(String.join("\n", lines.subList(start, end)), end - start, end < lines.size());
+        int requestedEnd = Math.min(lines.size(), start + limit);
+        int lineEnd = Math.min(requestedEnd, start + MAX_READ_RESULT_LINES);
+        StringBuilder result = new StringBuilder();
+        int retainedBytes = 0;
+        int cursor = start;
+        String termination = null;
+        while (cursor < lineEnd) {
+            String line = lines.get(cursor);
+            int lineBytes = line.getBytes(StandardCharsets.UTF_8).length;
+            int separatorBytes = result.isEmpty() ? 0 : 1;
+            if (retainedBytes + separatorBytes + lineBytes > MAX_READ_BODY_BYTES) {
+                if (result.isEmpty()) {
+                    return new LineSlice("[Line " + (cursor + 1) + " is " + lineBytes
+                            + " bytes and exceeds the 64KiB read result budget. Use shell to inspect a bounded range.]",
+                            0, 0, lines.size(), true, "line_too_long");
+                }
+                termination = "byte_limit";
+                break;
+            }
+            if (separatorBytes != 0) result.append('\n');
+            result.append(line);
+            retainedBytes += separatorBytes + lineBytes;
+            cursor++;
+        }
+        if (termination == null && cursor < requestedEnd) {
+            termination = "line_limit";
+        }
+        if (termination == null && cursor < lines.size()) {
+            termination = "requested_limit";
+        }
+        boolean truncated = cursor < lines.size();
+        int nextOffset = truncated && !"line_too_long".equals(termination) ? cursor + 1 : 0;
+        return new LineSlice(result.toString(), cursor - start, nextOffset, lines.size(), truncated, termination);
+    }
+
+    /**
+     * 将续读位置直接写入模型可见正文，避免调用方必须理解结构化 metadata 才能一次构造正确的下一次 read。
+     */
+    private static String withReadContinuation(LineSlice slice, int offset) {
+        if (slice.nextOffset() == 0) return slice.content();
+        int end = offset + slice.lines() - 1;
+        return slice.content() + "\n\n[Showing lines " + offset + "-" + end + " of " + slice.totalLines()
+                + ". Use offset=" + slice.nextOffset() + " to continue.]";
     }
 
     /** 合并少量强类型元数据，并由 Builder 拒绝冲突键，防止后写值静默覆盖原事实。 */
@@ -571,7 +715,8 @@ public final class BuiltInTools {
         }
     }
 
-    /** 保存 read 的有界投影，截断事实必须随内容一起返回。 */
-    private record LineSlice(String content, int lines, boolean truncated) {
+    /** 保存 read 的有界投影和续读位置，调用方无需从不可靠的正文长度反推截断原因。 */
+    private record LineSlice(String content, int lines, int nextOffset, int totalLines,
+                             boolean truncated, String termination) {
     }
 }

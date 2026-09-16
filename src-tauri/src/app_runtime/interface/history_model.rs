@@ -1219,6 +1219,7 @@ fn valid_tool_presentation_wire(value: &Value) -> bool {
         &[
             "inputPreview",
             "outputPreview",
+            "summary",
             "command",
             "relativeCwd",
             "stdout",
@@ -1246,6 +1247,9 @@ fn valid_tool_presentation_wire(value: &Value) -> bool {
         })
         || !optional_value(presentation.get("outputPreview"), |value| {
             valid_text(value, 32_768)
+        })
+        || !optional_value(presentation.get("summary"), |value| {
+            valid_text(value, 1_024)
         })
         || !optional_value(presentation.get("command"), |value| {
             valid_text(value, 32_768)

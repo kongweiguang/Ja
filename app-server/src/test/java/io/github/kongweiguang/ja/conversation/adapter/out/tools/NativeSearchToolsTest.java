@@ -65,11 +65,32 @@ class NativeSearchToolsTest {
         assertTrue(directory.content().contains("src/nested/visible/"), directory.content());
 
         AgentTool.ToolResult grep = execute(WorkspaceFileTools.grep(repository, resolver), "grep",
-                JsonObjects.builder().putText("query", "needle").putText("path", "src/nested")
-                        .putText("filePattern", "*.md").build(), repository);
+                JsonObjects.builder().putText("pattern", "needle").putText("path", "src/nested")
+                        .putText("glob", "*.md").build(), repository);
         assertEquals(ToolOutcome.SUCCEEDED, grep.outcome());
         assertTrue(grep.content().contains("src/nested/visible/README.md"), grep.content());
         assertFalse(grep.content().contains("src/nested/ignored/README.md"), grep.content());
+    }
+
+    /** Pi 风格正则、忽略大小写和上下文只扩展 rg 参数，不得绕过 ignore、边界或结果预算。 */
+    @Test
+    void supportsRegexCaseInsensitiveMatchingAndContext() throws Exception {
+        Path repository = Files.createDirectory(temporary.resolve("native-regex-repository"));
+        initializeGit(repository);
+        Files.writeString(repository.resolve("Notes.java"), "before\nTODO: fix\nafter\n");
+
+        AgentTool.ToolResult match = execute(WorkspaceFileTools.grep(repository, nativeResolver()), "grep",
+                JsonObjects.builder().putText("pattern", "^todo:\\s+fix$").putBoolean("ignoreCase", true)
+                        .putNumber("context", 1).build(), repository);
+        AgentTool.ToolResult invalid = execute(WorkspaceFileTools.grep(repository, nativeResolver()), "grep",
+                JsonObjects.builder().putText("pattern", "[").build(), repository);
+
+        assertEquals(ToolOutcome.SUCCEEDED, match.outcome(), match::content);
+        assertTrue(match.content().contains("Notes.java-1- before"), match.content());
+        assertTrue(match.content().contains("Notes.java:2: TODO: fix"), match.content());
+        assertTrue(match.content().contains("Notes.java-3- after"), match.content());
+        assertEquals("tool_arguments_invalid", invalid.errorCode());
+        assertTrue(invalid.content().contains("pattern"), invalid.content());
     }
 
     /** resolver 缺少 fd/rg 时返回明确安装错误，不退回耗时且语义不同的 Java 递归实现。 */
@@ -82,7 +103,7 @@ class NativeSearchToolsTest {
         AgentTool.ToolResult find = execute(WorkspaceFileTools.find(repository, missing), "find",
                 JsonObjects.builder().putText("pattern", "*.txt").build(), repository);
         AgentTool.ToolResult grep = execute(WorkspaceFileTools.grep(repository, missing), "grep",
-                JsonObjects.builder().putText("query", "needle").build(), repository);
+                JsonObjects.builder().putText("pattern", "needle").build(), repository);
 
         assertEquals(ToolOutcome.FAILED, find.outcome());
         assertEquals("search_tool_unavailable", find.errorCode());
@@ -112,7 +133,7 @@ class NativeSearchToolsTest {
         }
 
         AgentTool.ToolResult result = execute(WorkspaceFileTools.find(repository, nativeResolver()), "find",
-                JsonObjects.builder().putText("pattern", "*.txt").putNumber("maxResults", 1).build(),
+                JsonObjects.builder().putText("pattern", "*.txt").putNumber("limit", 1).build(),
                 repository);
 
         assertEquals(ToolOutcome.SUCCEEDED, result.outcome());
@@ -139,13 +160,13 @@ class NativeSearchToolsTest {
             assertFalse(find.content().contains("linked"), find.content());
 
             AgentTool.ToolResult outsideGrep = execute(WorkspaceFileTools.grep(repository, resolver), "grep",
-                    JsonObjects.builder().putText("query", "outside").build(), repository);
+                    JsonObjects.builder().putText("pattern", "outside").build(), repository);
             assertEquals(ToolOutcome.SUCCEEDED, outsideGrep.outcome());
             assertFalse(outsideGrep.content().contains("outside"), outsideGrep.content());
             assertFalse(outsideGrep.content().contains("linked"), outsideGrep.content());
 
             AgentTool.ToolResult insideGrep = execute(WorkspaceFileTools.grep(repository, resolver), "grep",
-                    JsonObjects.builder().putText("query", "inside").build(), repository);
+                    JsonObjects.builder().putText("pattern", "inside").build(), repository);
             assertTrue(insideGrep.content().contains("inside.md"), insideGrep.content());
 
             StringBuilder rawOutput = new StringBuilder();

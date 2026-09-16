@@ -277,7 +277,8 @@ pub(super) struct StartRuntimeContext<'a> {
 
 /// 设计原因：该函数维护 generation 生命周期转换，启动失败与停止都必须留下可确认的 owner 状态。
 /// 最多启动一个 Ja App Server sidecar generation；此边界返回不含 token 的 Host 状态前，
-/// handshake 必须已消费 ready-token echo。
+/// handshake 必须已消费 ready-token echo。WebView 在重载窗口内暂时不可达时，状态投影可由
+/// 后续 `state` snapshot 补回，因此不能将投递失败升级为 sidecar 启动失败并销毁用户会话。
 pub(super) fn start_runtime(
     context: StartRuntimeContext<'_>,
 ) -> Result<RuntimeStatus, RuntimeCommandError> {
@@ -307,7 +308,11 @@ pub(super) fn start_runtime(
     if let Some(current) = runtime.as_mut() {
         return Ok(current_status(current));
     }
-    emit_status(sink, RuntimeStatusKind::Starting, 0, None, "starting", None)?;
+    if let Err(error) = emit_status(sink, RuntimeStatusKind::Starting, 0, None, "starting", None)
+        && projection_failure_is_terminal(&error)
+    {
+        return Err(error);
+    }
     runtime_control.record("start_supervisor_new");
     // 先捕获本次 Host 代际，再把同一值交给 Supervisor 注入 Java；失败启动不发布该代际，
     // 成功后才推进 next_generation，避免事件 fence 与运行状态脱节。
@@ -432,24 +437,30 @@ pub(super) fn start_runtime(
         "ready",
         Some(&ready_token),
     ) {
-        current_generation.store(0, Ordering::Release);
-        let mut current = current;
-        if let Err(cleanup_error) = shutdown_components(
-            &mut current,
-            cleanup_deadline(exit_control, config.shutdown_timeout),
-            runtime_control.as_ref(),
-        ) {
-            cleanup_fault.mark(generation);
-            *runtime = Some(current);
-            tracing::error!(
-                ?cleanup_error,
-                generation,
-                "ready projection cleanup deferred"
-            );
-        } else {
-            cleanup_fault.clear(generation);
+        if projection_failure_is_terminal(&error) {
+            current_generation.store(0, Ordering::Release);
+            let mut current = current;
+            if let Err(cleanup_error) = shutdown_components(
+                &mut current,
+                cleanup_deadline(exit_control, config.shutdown_timeout),
+                runtime_control.as_ref(),
+            ) {
+                cleanup_fault.mark(generation);
+                *runtime = Some(current);
+                tracing::error!(
+                    ?cleanup_error,
+                    generation,
+                    "ready projection cleanup deferred"
+                );
+            } else {
+                cleanup_fault.clear(generation);
+            }
+            return Err(error);
         }
-        return Err(error);
+        tracing::warn!(
+            generation,
+            "runtime ready status delivery failed; sidecar remains active"
+        );
     }
     let status = RuntimeStatus {
         status: RuntimeStatusKind::Ready,

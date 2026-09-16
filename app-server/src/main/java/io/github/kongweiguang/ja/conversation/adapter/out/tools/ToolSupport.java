@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.json.JsonArray;
+import io.github.kongweiguang.ja.foundation.json.JsonBoolean;
 import io.github.kongweiguang.ja.foundation.json.JsonNumber;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
@@ -223,6 +224,16 @@ abstract class ToolSupport implements AgentTool {
     }
 
     /**
+     * 只接受 JSON 原生布尔值，避免字符串或数字在 Tool 边界被宽松转换为权限和搜索语义开关。
+     */
+    static boolean booleanValue(Invocation invocation, String name, boolean defaultValue) {
+        JsonValue value = invocation.arguments().members().get(name);
+        if (value == null) return defaultValue;
+        if (value instanceof JsonBoolean bool) return bool.value();
+        throw argument(name, "must be a boolean");
+    }
+
+    /**
      * 将 Number 通过十进制文本精确收窄，拒绝小数、溢出、NaN 和 Infinity。
      */
     private static int exactInteger(JsonValue value, String name) {
@@ -272,6 +283,23 @@ abstract class ToolSupport implements AgentTool {
     static JsonObject integerProperty(String description, int min, int max) {
         return JsonObjects.builder().putText("type", "integer").putText("description", description)
                 .putNumber("minimum", min).putNumber("maximum", max).build();
+    }
+
+    /** 构造可选布尔开关的 Schema，使模型端声明和执行端严格类型校验保持一致。 */
+    static JsonObject booleanProperty(String description) {
+        return JsonObjects.builder().putText("type", "boolean").putText("description", description).build();
+    }
+
+    /**
+     * 构造固定项目边界的数组 Schema；上限用于限制一次 Tool 调用的验证、内存和原子提交范围。
+     */
+    static JsonObject arrayProperty(String description, JsonObject items, int minItems, int maxItems) {
+        if (minItems < 0 || maxItems < minItems) {
+            throw new IllegalArgumentException("invalid array schema item bounds");
+        }
+        return JsonObjects.builder().putText("type", "array").putText("description", description)
+                .put("items", Objects.requireNonNull(items, "items"))
+                .putNumber("minItems", minItems).putNumber("maxItems", maxItems).build();
     }
 
     /** 读取有界普通文本并在每个 chunk 检查取消与 Deadline；NOFOLLOW 防止重解析点绕过准入。 */

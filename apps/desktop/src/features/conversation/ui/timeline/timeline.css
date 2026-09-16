@@ -908,31 +908,83 @@
 
 .ja-tool-details {
   min-width: 0;
+  --ja-tool-accent: color-mix(in srgb, var(--ja-accent) 60%, var(--ja-border));
+}
+
+.ja-tool-details[data-tool-kind="shell"] {
+  --ja-tool-accent: color-mix(in srgb, var(--ja-foreground-muted) 58%, var(--ja-border));
+}
+
+.ja-tool-details[data-tool-kind="mcp"] {
+  --ja-tool-accent: color-mix(in srgb, var(--ja-accent) 48%, var(--ja-border));
+}
+
+.ja-tool-details[data-status="running"] {
+  --ja-tool-accent: color-mix(in srgb, var(--ja-accent) 72%, var(--ja-border));
+}
+
+.ja-tool-details[data-status="waiting_approval"] {
+  --ja-tool-accent: color-mix(in srgb, var(--ja-warning) 68%, var(--ja-border));
+}
+
+.ja-tool-details[data-status="error"] {
+  --ja-tool-accent: color-mix(in srgb, var(--ja-danger) 68%, var(--ja-border));
 }
 
 /* Tool 行是唯一折叠入口；动作、目标和箭头保持在同一阅读轴。 */
 .ja-tool-details__trigger {
+  position: relative;
   display: grid;
   width: 100%;
-  min-height: 1.24rem;
+  min-height: 2rem;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.48rem;
-  padding: 0;
+  padding: 0.24rem 0.3rem 0.24rem 0.54rem;
   border: 0;
   border-radius: var(--ja-radius-sm);
   color: var(--ja-foreground-muted);
   background: transparent;
+  box-shadow: inset 0 0 0 1px transparent;
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background-color var(--ja-duration-fast) var(--ja-ease-native);
+  transition:
+    background-color var(--ja-duration-fast) var(--ja-ease-native),
+    box-shadow var(--ja-duration-fast) var(--ja-ease-native);
+}
+
+/* 色彩只作为工具行的定位锚点：正常结果保持安静，异常与等待状态在展开前即可扫见。 */
+.ja-tool-details__trigger::before {
+  position: absolute;
+  top: 0.52rem;
+  bottom: 0.52rem;
+  left: 0.18rem;
+  width: 2px;
+  border-radius: var(--ja-radius-sm);
+  background: var(--ja-tool-accent);
+  content: "";
+  opacity: 0.66;
+  transition:
+    opacity var(--ja-duration-fast) var(--ja-ease-native),
+    transform var(--ja-duration-fast) var(--ja-ease-native);
 }
 
 @media (hover: hover) {
   .ja-tool-details__trigger:hover {
-    background: color-mix(in srgb, var(--ja-foreground) 4.5%, transparent);
+    background: color-mix(in srgb, var(--ja-surface-control) 82%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ja-border) 68%, transparent);
   }
+
+  .ja-tool-details__trigger:hover::before {
+    opacity: 1;
+    transform: scaleY(1.12);
+  }
+}
+
+.ja-tool-details__trigger[data-state="open"] {
+  background: color-mix(in srgb, var(--ja-surface-control) 90%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ja-border) 74%, transparent);
 }
 
 .ja-tool-details__trigger:focus-visible {
@@ -941,8 +993,7 @@
 }
 
 .ja-tool-details__label,
-.ja-tool-details__summary,
-.ja-tool-details__identity code {
+.ja-tool-details__summary {
   color: var(--ja-foreground);
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
@@ -961,14 +1012,6 @@
   overflow: hidden;
 }
 
-.ja-tool-details__identity code {
-  min-width: 0;
-  max-width: 14rem;
-  overflow: hidden;
-  font: var(--ja-text-caption-size) / 1.45 var(--ja-font-mono);
-  text-overflow: ellipsis;
-}
-
 .ja-tool-details__target {
   min-width: 0;
   overflow: hidden;
@@ -980,8 +1023,13 @@
 
 .ja-tool-details__summary {
   display: inline-flex;
+  width: 1.25rem;
+  height: 1.25rem;
   align-items: center;
+  justify-content: center;
   gap: 0.28rem;
+  border-radius: var(--ja-radius-sm);
+  background: color-mix(in srgb, var(--ja-foreground) 4%, transparent);
 }
 
 .ja-tool-details__summary svg {
@@ -996,9 +1044,9 @@
 
 .ja-tool-details__content {
   display: grid;
-  gap: 0.36rem;
+  gap: 0.42rem;
   overflow: hidden;
-  padding: 0.36rem 0 0.08rem;
+  padding: 0.42rem 0 0.12rem;
 }
 
 .ja-tool-details__content[data-state="open"] {
@@ -1014,16 +1062,63 @@
   font-size: var(--ja-text-caption-size);
 }
 
+/* 摘要是展开态的轻量定位层；结果正文仍使用实底列表或等宽阅读面，避免玻璃压低开发内容的可读性。 */
+.ja-tool-details__overview {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.42rem;
+  padding: 0.36rem 0.48rem;
+  border: 1px solid color-mix(in srgb, var(--ja-tool-accent) 38%, var(--ja-border));
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: color-mix(in srgb, var(--ja-surface-control) 82%, transparent);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-tool-details__overview[data-status="error"] {
+  border-color: color-mix(in srgb, var(--ja-danger) 58%, var(--ja-border));
+  color: var(--ja-danger);
+}
+
+.ja-tool-details__overview[data-status="waiting_approval"] {
+  border-color: color-mix(in srgb, var(--ja-warning) 58%, var(--ja-border));
+}
+
+.ja-tool-details__overview-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.ja-tool-details__overview-icon svg {
+  width: 0.82rem;
+  height: 0.82rem;
+  stroke-width: 1.8;
+}
+
+/* 仅运行中的 Tool 使用短促旋转，静态结果不以装饰动画打断高密度阅读。 */
+.ja-tool-details__overview-spinner {
+  animation: ja-tool-overview-spin 900ms linear infinite;
+}
+
+@keyframes ja-tool-overview-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .ja-tool-details__input,
 .ja-tool-details__output {
   max-height: 20rem;
   overflow: auto;
   margin: 0;
   padding: 0.55rem 0.65rem;
-  border: 1px solid var(--ja-border);
+  border: 1px solid color-mix(in srgb, var(--ja-border) 88%, transparent);
   border-radius: var(--ja-radius-sm);
   color: var(--ja-foreground-muted);
-  background: var(--ja-background);
+  background: color-mix(in srgb, var(--ja-background) 92%, var(--ja-surface-control));
+  box-shadow: inset 0 1px color-mix(in srgb, var(--ja-foreground) 3%, transparent);
   font: var(--ja-code-font-size) / 1.55 var(--ja-font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -1038,6 +1133,87 @@
   border-color: color-mix(in srgb, var(--ja-warning) 48%, var(--ja-border));
 }
 
+/* 搜索与发现行是可扫描的数据表面，不套用浮层或按钮外观，避免把未接通的预览能力伪装成可点击操作。 */
+.ja-tool-result-list {
+  display: grid;
+  overflow: auto;
+  max-height: 20rem;
+  margin: 0;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--ja-border) 88%, transparent);
+  border-radius: var(--ja-radius-sm);
+  background: color-mix(in srgb, var(--ja-background) 92%, var(--ja-surface-control));
+  box-shadow: inset 0 1px color-mix(in srgb, var(--ja-foreground) 3%, transparent);
+  list-style: none;
+}
+
+.ja-tool-result-list li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(7rem, 0.8fr) auto minmax(6rem, 1fr);
+  align-items: center;
+  gap: 0.42rem;
+  min-height: 1.95rem;
+  padding: 0.24rem 0.5rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ja-border) 72%, transparent);
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-tool-result-list li:last-child {
+  border-bottom: 0;
+}
+
+.ja-tool-result-list li > svg {
+  width: 0.82rem;
+  height: 0.82rem;
+  color: var(--ja-foreground-tertiary);
+  stroke-width: 1.8;
+}
+
+.ja-tool-result-list li[data-kind="match"] > svg {
+  color: var(--ja-accent);
+}
+
+.ja-tool-result-list code,
+.ja-tool-result-list span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-tool-result-list > li > code:first-of-type {
+  color: var(--ja-foreground);
+  font: inherit;
+  font-family: var(--ja-font-mono);
+}
+
+.ja-tool-result-list span {
+  color: var(--ja-foreground-tertiary);
+  font-family: var(--ja-font-mono);
+  text-align: right;
+}
+
+.ja-tool-result-list__detail {
+  color: var(--ja-foreground-muted);
+  font: inherit;
+  font-family: var(--ja-font-mono);
+}
+
+@container ja-work-process (max-width: 452px) {
+  .ja-tool-result-list li {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .ja-tool-result-list__detail {
+    grid-column: 2 / -1;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+}
+
 .ja-tool-details__facts {
   display: flex;
   flex-wrap: wrap;
@@ -1049,15 +1225,28 @@
 .ja-tool-details__expand {
   display: inline-flex;
   width: max-content;
+  min-height: 1.75rem;
   align-items: center;
   gap: 0.28rem;
-  padding: 0.2rem 0;
-  border: 0;
+  padding: 0.2rem 0.48rem;
+  border: 1px solid color-mix(in srgb, var(--ja-accent) 28%, var(--ja-border));
+  border-radius: var(--ja-radius-sm);
   color: var(--ja-accent);
-  background: transparent;
+  background: color-mix(in srgb, var(--ja-surface-control) 82%, transparent);
   font: inherit;
   font-size: var(--ja-text-caption-size);
   cursor: pointer;
+  transition:
+    background-color var(--ja-duration-fast) var(--ja-ease-native),
+    border-color var(--ja-duration-fast) var(--ja-ease-native),
+    transform var(--ja-duration-fast) var(--ja-ease-native);
+}
+
+@media (hover: hover) {
+  .ja-tool-details__expand:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--ja-accent) 52%, var(--ja-border));
+    background: color-mix(in srgb, var(--ja-accent) 8%, var(--ja-surface-control));
+  }
 }
 
 .ja-tool-details__expand svg {
@@ -1068,6 +1257,15 @@
 .ja-tool-details__expand:disabled {
   cursor: wait;
   opacity: 0.6;
+}
+
+.ja-tool-details__expand:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-tool-details__expand:active:not(:disabled) {
+  transform: scale(0.98);
 }
 
 .ja-tool-details > p[role="alert"] {
@@ -1374,8 +1572,11 @@
   .ja-work-process__content,
   .ja-work-process__chevron,
   .ja-tool-details__trigger,
+  .ja-tool-details__trigger::before,
   .ja-tool-details__content,
   .ja-tool-details__summary svg,
+  .ja-tool-details__overview-spinner,
+  .ja-tool-details__expand,
   .ja-turn-changes,
   .ja-turn-changes__files li > button,
   .ja-chat-timeline__jump-latest {

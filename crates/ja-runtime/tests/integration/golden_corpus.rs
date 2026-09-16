@@ -5378,6 +5378,7 @@ fn validate_tool_presentation(value: &Value) -> Result<(), &'static str> {
             "status",
             "inputPreview",
             "outputPreview",
+            "summary",
             "relativePaths",
             "command",
             "relativeCwd",
@@ -5413,6 +5414,11 @@ fn validate_tool_presentation(value: &Value) -> Result<(), &'static str> {
         {
             return Err("tool presentation preview is invalid");
         }
+    }
+    if let Some(summary) = value.get("summary")
+        && !bounded_string(Some(summary), 1, 1_024)
+    {
+        return Err("tool presentation summary is invalid");
     }
     let paths = value
         .get("relativePaths")

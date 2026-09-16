@@ -123,11 +123,11 @@ final class ToolPresentationProjectorTest {
     void projectsDiscoveryToolsAsReadWithDistinctTargets() {
         ToolPresentation grep = ToolPresentationProjector.prepared(
                 invocation("grep", Map.of(
-                        "query", new JsonText("needle"),
+                        "pattern", new JsonText("needle"),
                         "path", new JsonText("src"))),
                 WORKSPACE, List.of());
         ToolPresentation whitespaceGrep = ToolPresentationProjector.prepared(
-                invocation("grep", Map.of("query", new JsonText("   "))), WORKSPACE, List.of());
+                invocation("grep", Map.of("pattern", new JsonText("   "))), WORKSPACE, List.of());
         ToolPresentation find = ToolPresentationProjector.prepared(
                 invocation("find", Map.of(
                         "pattern", new JsonText("*.tsx"),
@@ -138,8 +138,8 @@ final class ToolPresentationProjectorTest {
 
         assertEquals(ToolPresentation.Kind.READ, grep.kind());
         assertEquals("搜索内容", grep.title());
-        assertEquals("query=\"needle\" · src", grep.inputPreview());
-        assertEquals("query=\"   \" · .", whitespaceGrep.inputPreview());
+        assertEquals("pattern=\"needle\" · src", grep.inputPreview());
+        assertEquals("pattern=\"   \" · .", whitespaceGrep.inputPreview());
         assertEquals(ToolPresentation.Kind.READ, find.kind());
         assertEquals("查找文件", find.title());
         assertEquals("pattern=\"*.tsx\" · src", find.inputPreview());
@@ -171,12 +171,12 @@ final class ToolPresentationProjectorTest {
                 ToolOutcome.SUCCEEDED, "src/App.tsx:1: needle", Optional.empty(), null);
         ToolPresentation prepared = ToolPresentationProjector.prepared(
                 invocation("grep", Map.of(
-                        "query", new JsonText("needle"),
+                        "pattern", new JsonText("needle"),
                         "path", new JsonText("src"))),
                 WORKSPACE, List.of());
         ToolPresentationProjector.Completed completed = ToolPresentationProjector.completed(
                 invocation("grep", Map.of(
-                        "query", new JsonText("needle"),
+                        "pattern", new JsonText("needle"),
                         "path", new JsonText("src"))),
                 result, WORKSPACE, List.of(), 12L);
         ToolPresentation resumed = ToolPresentationProjector.withStatus(
@@ -187,6 +187,60 @@ final class ToolPresentationProjectorTest {
         assertEquals(prepared.inputPreview(), completed.presentation().inputPreview());
         assertEquals(completed.presentation().inputPreview(), resumed.inputPreview());
         assertEquals(completed.presentation().relativePaths(), resumed.relativePaths());
+    }
+
+    /**
+     * 文件工具摘要只能来自固定 metadata 或受 Schema 约束的 edit 数量；英文结果正文、路径和任意自由字段
+     * 都不能成为摘要来源，以便前端能安全地把它作为紧凑结果说明。
+     */
+    @Test
+    void projectsSafeCompactSummariesForFileTools() {
+        AgentTool.ToolResult readResult = new AgentTool.ToolResult(ToolOutcome.SUCCEEDED, "line", Optional.of(
+                new JsonObject(Map.of(
+                        "lines", new JsonNumber(BigDecimal.valueOf(20)),
+                        "totalLines", new JsonNumber(BigDecimal.valueOf(80)),
+                        "nextOffset", new JsonNumber(BigDecimal.valueOf(21)),
+                        "truncated", new JsonBoolean(true)))), null);
+        ToolPresentationProjector.Completed read = ToolPresentationProjector.completed(
+                invocation("read", Map.of("path", new JsonText("README.md"))),
+                readResult, WORKSPACE, List.of(), 1L);
+        AgentTool.ToolResult discoveryResult = new AgentTool.ToolResult(ToolOutcome.SUCCEEDED, "src/a.ts:1: needle",
+                Optional.of(new JsonObject(Map.of(
+                        "resultCount", new JsonNumber(BigDecimal.valueOf(12)),
+                        "truncated", new JsonBoolean(true)))), null);
+        ToolPresentationProjector.Completed grep = ToolPresentationProjector.completed(
+                invocation("grep", Map.of("pattern", new JsonText("needle"))),
+                discoveryResult, WORKSPACE, List.of(), 1L);
+        JsonObject replacement = new JsonObject(Map.of(
+                "oldText", new JsonText("before"), "newText", new JsonText("after")));
+        ToolPresentationProjector.Completed edit = ToolPresentationProjector.completed(
+                invocation("edit", Map.of("path", new JsonText("src/a.ts"),
+                        "edits", new JsonArray(List.of(replacement, replacement)))),
+                new AgentTool.ToolResult(ToolOutcome.SUCCEEDED, "Successfully replaced 2 block(s) in the file.",
+                        Optional.empty(), null), WORKSPACE, List.of(), 1L);
+
+        assertEquals("已读取 20 行，共 80 行；可从第 21 行继续", read.presentation().summary());
+        assertEquals("找到 12 个匹配项；部分结果未显示", grep.presentation().summary());
+        assertEquals("已完成 2 处替换", edit.presentation().summary());
+        assertFalse(edit.presentation().summary().contains("Successfully"));
+    }
+
+    /** 批量 edit 仅显示块数，避免原文和替换内容进入持久化的工具活动摘要。 */
+    @Test
+    void projectsBatchEditAsAContentFreeOperationSummary() {
+        JsonObject first = new JsonObject(Map.of(
+                "oldText", new JsonText("before-secret"), "newText", new JsonText("after-secret")));
+        JsonObject second = new JsonObject(Map.of(
+                "oldText", new JsonText("before-two"), "newText", new JsonText("after-two")));
+        ToolPresentation presentation = ToolPresentationProjector.prepared(
+                invocation("edit", Map.of(
+                        "path", new JsonText("src/App.tsx"),
+                        "edits", new JsonArray(List.of(first, second)))), WORKSPACE, List.of());
+
+        assertEquals(ToolPresentation.Kind.EDIT, presentation.kind());
+        assertEquals("edit src/App.tsx · 2 block(s)", presentation.inputPreview());
+        assertFalse(presentation.inputPreview().contains("before-secret"));
+        assertFalse(presentation.inputPreview().contains("after-secret"));
     }
 
     /** Skill 只展示逻辑名称，既能诊断读取对象，也不会把资源子路径或物理 locator 写入历史。 */

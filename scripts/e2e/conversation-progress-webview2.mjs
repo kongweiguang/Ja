@@ -10,7 +10,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -24,10 +24,178 @@ const DEFAULT_JAVA_HOME = "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const PROMPT = "请先读取隔离 fixture，再执行一次低影响 Shell 回显，最后总结结果。";
 const TITLE = "Conversation Progress E2E";
+const PROGRESS_TURN_WALL_TIMEOUT_MS = 120_000;
+const PROGRESS_INVOKE_LOG_KEY = "__JA_CONVERSATION_PROGRESS_INVOKES__";
 
 /** 将真窗阶段限制在统一 deadline 内，避免 selector 漂移隐藏真正失败阶段。 */
 function timeout(deadline) {
   return Math.max(1, Math.min(30_000, deadline - Date.now()));
+}
+
+/** 将真窗异常归入固定类别，避免失败报告携带易变的 selector 或路径细节。 */
+function runnerErrorCategory(error) {
+  const message = String(error?.message ?? error);
+  if (error?.name === "AssertionError" || error?.code === "ERR_ASSERTION") return "assertion";
+  if (/超时|timeout/u.test(message)) return "timeout";
+  if (/locator|selector/u.test(message)) return "selector";
+  if (/protocol|webview|cdp/u.test(message)) return "runtime_protocol";
+  return "runner";
+}
+
+/** 只保留 fixture 的阶段与已知回合，防止诊断意外记录 Provider 请求或 Tool 正文。 */
+function safeFixtureFailureSnapshot(snapshot) {
+  const stages = Array.isArray(snapshot?.stages) ? snapshot.stages.slice(-16) : [];
+  const attempts = Array.isArray(snapshot?.attempts)
+    ? snapshot.attempts.slice(-8).map((attempt) => ({
+        kind: attempt?.kind === "title" ? "title" : "turn",
+        step: Number.isSafeInteger(attempt?.step) ? attempt.step : null,
+        progressInstruction: attempt?.progressInstruction === true,
+      }))
+    : [];
+  return { stage: stages.at(-1) ?? "none", stages, attempts };
+}
+
+/**
+ * 在隔离 WebView2 内观测 native command 的生命周期顺序；代理完全透传原调用，且只保存命令名、
+ * 阶段和封闭 runtime 状态，避免诊断复制参数、路径、会话身份或 Tool 内容。
+ */
+async function instrumentRuntimeInvocations(page) {
+  // reload 后 WebView2 的 Tauri bridge 可能晚于 DOMContentLoaded 注入；先等待受信 bridge，
+  // 才能确保本轮诊断覆盖应用自动恢复与 driver 恢复的全部 native 调用。
+  await page.waitForFunction(
+    () => typeof globalThis.__TAURI_INTERNALS__?.invoke === "function",
+    undefined,
+    { timeout: 30_000 },
+  );
+  await page.evaluate((key) => {
+    const internals = globalThis.__TAURI_INTERNALS__;
+    if (internals === undefined || typeof internals.invoke !== "function") return;
+    if (globalThis[key] !== undefined) return;
+    const records = [];
+    const original = internals.invoke.bind(internals);
+    globalThis[key] = records;
+    internals.invoke = async (command, payload) => {
+      const watched = typeof command === "string" && command.startsWith("ja_");
+      if (watched) records.push({ command, phase: "start" });
+      try {
+        const result = await original(command, payload);
+        if (watched) {
+          const state = result !== null && typeof result === "object" ? result : {};
+          records.push({
+            command,
+            phase: "resolved",
+            status: typeof state.status === "string" ? state.status : undefined,
+          });
+        }
+        return result;
+      } catch (error) {
+        if (watched) {
+          const value = error !== null && typeof error === "object" ? error : {};
+          records.push({
+            command,
+            phase: "rejected",
+            errorCode: typeof value.code === "string" ? value.code.slice(0, 96) : undefined,
+          });
+        }
+        throw error;
+      }
+    };
+  }, PROGRESS_INVOKE_LOG_KEY);
+}
+
+/** 读取失败时的最小 Tauri 投影，确认 UI 受限是否由 native runtime 状态造成而非 DOM 选择器漂移。 */
+async function readConversationProgressRuntimeDiagnostics(page) {
+  if (page === undefined) return { status: "page_unavailable" };
+  return page
+    .evaluate(async () => {
+      const internals = globalThis.__TAURI_INTERNALS__;
+      const errorProjection = (error) => {
+        const value = error !== null && typeof error === "object" ? error : {};
+        return {
+          code: typeof value.code === "string" ? value.code.slice(0, 96) : undefined,
+          message: typeof value.message === "string" ? value.message.slice(0, 256) : undefined,
+          retryable: typeof value.retryable === "boolean" ? value.retryable : undefined,
+        };
+      };
+      const invoke = async (command, project) => {
+        if (internals === undefined || typeof internals.invoke !== "function") {
+          return { status: "invoke_unavailable" };
+        }
+        try {
+          return project(await internals.invoke(command, {}));
+        } catch (error) {
+          return { error: errorProjection(error) };
+        }
+      };
+      return {
+        appReady:
+          globalThis.document.querySelector(".ja-shell")?.getAttribute("data-app-ready") ?? null,
+        runtimeLabel:
+          globalThis.document
+            .querySelector('[aria-label^="本地运行时："]')
+            ?.getAttribute("aria-label") ?? null,
+        runtimeState: await invoke("ja_runtime_state", (value) => {
+          const state = value !== null && typeof value === "object" ? value : {};
+          return {
+            status: typeof state.status === "string" ? state.status : "invalid",
+            generation: Number.isSafeInteger(state.generation) ? state.generation : undefined,
+            serverInstanceIdPresent:
+              typeof state.serverInstanceId === "string" && state.serverInstanceId.length > 0,
+          };
+        }),
+        recoveryState: await invoke("ja_runtime_recovery_state", (value) => {
+          const recovery = value !== null && typeof value === "object" ? value : {};
+          return {
+            required: recovery.required === true,
+            acknowledgeable: recovery.acknowledgeable === true,
+            recoveryIdPresent:
+              typeof recovery.recoveryId === "string" && recovery.recoveryId.length > 0,
+            revision: Number.isSafeInteger(recovery.revision) ? recovery.revision : undefined,
+          };
+        }),
+        invocations: Array.isArray(globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"])
+          ? globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"].slice(-48)
+          : [],
+      };
+    })
+    .catch(() => ({ status: "evaluate_failed" }));
+}
+
+/** 读取隔离 Java 日志的有限尾部并脱敏 fixture 根与凭据样式字段，保留超时根因的异常类型。 */
+async function readIsolatedRuntimeLogs(home) {
+  if (typeof home !== "string") return { status: "unavailable" };
+  const logDirectory = join(home, "logs", "java");
+  const logs = {};
+  for (const name of ["app-server-error.log", "app-server.log"]) {
+    try {
+      const path = join(logDirectory, name);
+      const metadata = await stat(path);
+      if (!metadata.isFile() || metadata.size > 4 * 1024 * 1024) {
+        logs[name] = { status: "invalid_size" };
+        continue;
+      }
+      logs[name] = {
+        status: "available",
+        tail: (await readFile(path, "utf8"))
+          .split(/\r?\n/u)
+          .filter((line) => line.length > 0)
+          .slice(-120)
+          .map((line) =>
+            line
+              .replaceAll(home, "<JA_HOME>")
+              .replace(/https?:\/\/[^\s]+/gu, "<URL>")
+              .replace(
+                /\b(?:api[_-]?key|authorization|token|credential)\s*[=:]\s*\S+/giu,
+                "<REDACTED>",
+              )
+              .slice(0, 800),
+          ),
+      };
+    } catch {
+      logs[name] = { status: "unavailable" };
+    }
+  }
+  return logs;
 }
 
 /** 等待最终 DOM 条件，使用有界轮询而不是任意 sleep 掩盖事件丢失。 */
@@ -87,7 +255,7 @@ async function selectThread(page, threadId, deadline) {
   );
 }
 
-/** 等待真实应用 ready、运行时连接和消息 Composer，排除静态页面 preview。 */
+/** 等待真实应用 ready、运行时连接和消息 Composer；项目由后续 thread identity 恢复，避免隐藏窗口伪造目录选择。 */
 async function waitForApplication(page, deadline) {
   await page
     .locator('.ja-shell[data-app-ready="true"]')
@@ -100,30 +268,50 @@ async function waitForApplication(page, deadline) {
     state: "visible",
     timeout: timeout(deadline),
   });
-  const selectedProject = page.locator(
-    '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
-  );
-  if ((await selectedProject.count()) === 0) {
-    const existingProject = page
-      .locator('[aria-label="项目列表"] button[data-scope-kind="project"]')
-      .first();
-    if ((await existingProject.count()) > 0)
-      await existingProject.click({ timeout: timeout(deadline) });
-    else
-      await page
-        .getByRole("button", { name: "添加项目", exact: true })
-        .click({ timeout: timeout(deadline) });
-  }
-  await selectedProject.waitFor({ state: "visible", timeout: timeout(deadline) });
 }
 
-/** 读取当前工作过程的公开 DOM projection，只返回 commentary/tool kind 和安全文本摘要。 */
+/**
+ * E2E composition 的项目选择器只在“添加项目”动作后交付受控临时目录；这里只确认项目已登记，
+ * 不臆造当前选中状态，后续由 thread identity 触发真实 workspace activation。
+ */
+async function ensureProject(page, deadline) {
+  const project = page.locator('[aria-label="项目列表"] button[data-scope-kind="project"]').first();
+  if ((await project.count()) === 0) {
+    await page
+      .getByRole("button", { name: "添加项目", exact: true })
+      .click({ timeout: timeout(deadline) });
+  }
+  await page
+    .locator('[aria-label="项目列表"] button[data-scope-kind="project"]')
+    .first()
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+}
+
+/**
+ * reload 后只等待产品自身的 lifecycle controller 恢复原生连接，避免测试 adapter 与真实 renderer
+ * 并发争用 start/configure 时序；后续仍按同一持久 Thread 读取，不能用新窗口或新会话替代恢复。
+ */
+async function restoreRuntimeAfterReload(page, deadline) {
+  await waitForApplication(page, deadline);
+}
+
+/** 将公开 Commentary 与公开 Reasoning Summary 同等视为过程叙事，保持 Tool 交错顺序的用户语义。 */
+function publicNarrative(process, marker) {
+  return process
+    .locator(".ja-work-step--commentary, .ja-work-step--reasoning")
+    .filter({ hasText: marker });
+}
+
+/** 读取当前工作过程的公开 DOM projection，只返回叙事/tool kind 和安全文本摘要。 */
 async function processItems(page, deadline) {
   const process = page.locator("section.ja-work-process").last();
   await process.waitFor({ state: "visible", timeout: timeout(deadline) });
   return process.locator(".ja-work-process__steps > li").evaluateAll((items) =>
     items.map((item) => {
-      if (item.classList.contains("ja-work-step--commentary")) {
+      if (
+        item.classList.contains("ja-work-step--commentary") ||
+        item.classList.contains("ja-work-step--reasoning")
+      ) {
         return { kind: "commentary", text: item.textContent?.trim() ?? "" };
       }
       const tool = item.querySelector(".ja-tool-details");
@@ -150,6 +338,27 @@ async function expandProcess(page, deadline) {
     .locator(".ja-work-process__steps")
     .waitFor({ state: "visible", timeout: timeout(deadline) });
   return process;
+}
+
+/**
+ * 展开真实 read 步骤并确认 Java metadata 驱动的摘要与实底正文同时出现；这覆盖新结果视图的真实
+ * Tauri/WebView2 渲染，不以手写 DOM 或静态截图替代 Tool 执行链路。
+ */
+async function expandReadResult(process, deadline) {
+  const read = process.locator('.ja-tool-details[data-tool-kind="read"]');
+  await read.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const trigger = read.locator(".ja-tool-details__trigger");
+  if ((await trigger.getAttribute("aria-expanded")) !== "true") {
+    await trigger.click({ timeout: timeout(deadline) });
+  }
+  const summary = read.locator(".ja-tool-details__overview");
+  await summary.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const text = (await summary.textContent())?.trim() ?? "";
+  assert.match(text, /^已读取 \d+ 行，共 \d+ 行/u, "read summary must use authoritative metadata");
+  await read
+    .locator(".ja-tool-details__output")
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  return text;
 }
 
 /** 保留普通正文与公开摘要的独立条目，并确认两个真实工具成功且没有重复。 */
@@ -186,6 +395,7 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.provider?.toolCalls, 2);
   assert.equal(report?.live?.commentaryBeforeFirstTool, true);
+  assert.equal(report?.live?.readSummaryVisible, true);
   assert.deepEqual(report?.live?.sequence, [
     "commentary",
     "tool:read",
@@ -196,6 +406,7 @@ export function validateConversationProgressReport(report) {
   ]);
   assert.equal(report?.live?.noDuplicateTools, true);
   assert.deepEqual(report?.reload?.sequence, report?.live?.sequence);
+  assert.equal(report?.reload?.readSummaryVisible, true);
   assert.equal(report?.reload?.sameThread, true);
   assert.equal(report?.finalVisible, true);
   return report;
@@ -215,11 +426,16 @@ export async function runConversationProgressWebView2({
   const deadline = Date.now() + 5 * 60_000;
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(String(error?.message ?? error).slice(0, 500)));
-  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
+  await instrumentRuntimeInvocations(page);
+  // runner 已连接到新启动的真实窗口；这里额外 reload 会与旧 renderer 的 stop cleanup 竞争。
+  // 历史恢复阶段仍执行一次真实 reload，因而不会削弱 reload + persisted history 的验收边界。
   await waitForApplication(page, deadline);
+  await ensureProject(page, deadline);
   const created = await configureFixtureAndCreateThread(page, workspaceRoot, fixture.baseUrl);
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
-  await waitForApplication(page, deadline);
+  await instrumentRuntimeInvocations(page);
+  await restoreRuntimeAfterReload(page, deadline);
+  await ensureProject(page, deadline);
   await selectThread(page, created.threadId, deadline);
   const input = page.getByRole("textbox", { name: "消息", exact: true });
   await input.fill(PROMPT);
@@ -235,12 +451,14 @@ export async function runConversationProgressWebView2({
     });
 
   const workProcess = page.locator("section.ja-work-process").last();
-  const firstPublicText = workProcess.locator(".ja-work-step--commentary").filter({
-    hasText: conversationProgressFixtureMarkers.commentary1,
-  });
+  const firstPublicText = publicNarrative(
+    workProcess,
+    conversationProgressFixtureMarkers.commentary1,
+  );
   await firstPublicText.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const activeAnswer = page.getByRole("article", { name: "最终答复" }).last();
   assert.equal(
-    await page.getByText("正在回复", { exact: true }).count(),
+    await activeAnswer.getByText("正在回复", { exact: true }).count(),
     0,
     "streamed public text must be represented by WorkProcess, not the final-answer status",
   );
@@ -265,23 +483,23 @@ export async function runConversationProgressWebView2({
     state: "visible",
     timeout: timeout(deadline),
   });
-  await workProcess
-    .locator(".ja-work-step--commentary")
-    .filter({ hasText: conversationProgressFixtureMarkers.commentary1 })
-    .waitFor({
-      state: "visible",
-      timeout: timeout(deadline),
-    });
-  await workProcess
-    .locator(".ja-work-step--commentary")
-    .filter({ hasText: conversationProgressFixtureMarkers.commentary2 })
-    .waitFor({
-      state: "visible",
-      timeout: timeout(deadline),
-    });
+  await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary1).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary2).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  fixture.releaseSecondNarrative();
   await workProcess
     .locator('.ja-tool-details[data-tool-kind="shell"]')
     .waitFor({ state: "visible", timeout: timeout(deadline) });
+  await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary3).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  fixture.releaseFinalNarrative();
   await page
     .getByText(conversationProgressFixtureMarkers.final, { exact: false })
     .last()
@@ -298,14 +516,8 @@ export async function runConversationProgressWebView2({
         .then((count) => count > 0),
     deadline,
   );
-  await workProcess
-    .locator(".ja-work-step--commentary")
-    .filter({ hasText: conversationProgressFixtureMarkers.commentary3 })
-    .waitFor({
-      state: "attached",
-      timeout: timeout(deadline),
-    });
   await expandProcess(page, deadline);
+  const liveReadSummary = await expandReadResult(workProcess, deadline);
   const liveItems = await processItems(page, deadline);
   assertProcessSequence(liveItems, "live");
   const liveSequence = liveItems.map((item) =>
@@ -317,7 +529,8 @@ export async function runConversationProgressWebView2({
   });
 
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
-  await waitForApplication(page, deadline);
+  await restoreRuntimeAfterReload(page, deadline);
+  await ensureProject(page, deadline);
   await selectThread(page, created.threadId, deadline);
   await page
     .getByText(conversationProgressFixtureMarkers.final, { exact: false })
@@ -327,6 +540,7 @@ export async function runConversationProgressWebView2({
       timeout: timeout(deadline),
     });
   await expandProcess(page, deadline);
+  const reloadReadSummary = await expandReadResult(workProcess, deadline);
   const restoredItems = await processItems(page, deadline);
   assertProcessSequence(restoredItems, "reload");
   const restoredSequence = restoredItems.map((item) =>
@@ -368,10 +582,15 @@ export async function runConversationProgressWebView2({
     },
     live: {
       commentaryBeforeFirstTool: true,
+      readSummaryVisible: liveReadSummary.length > 0,
       sequence: liveSequence,
       noDuplicateTools: liveItems.filter((item) => item.kind === "tool").length === 2,
     },
-    reload: { sameThread: true, sequence: restoredSequence },
+    reload: {
+      sameThread: true,
+      readSummaryVisible: reloadReadSummary.length > 0,
+      sequence: restoredSequence,
+    },
     finalVisible: true,
     screenshots: ["conversation-progress-live.png", "conversation-progress-reload.png"],
     pageErrors,
@@ -410,8 +629,15 @@ async function main() {
     const report = await runProduction({
       ...options,
       providerBaseUrl: fixture.baseUrl,
+      // 三轮 Provider + 两次 Tool continuation 在慢速 Windows WebView2 上合法超过 Review 的单轮预算；
+      // 该值仅写入一次性 E2E profile，不能改变用户或生产 Provider 配置。
+      wallTimeoutMs: PROGRESS_TURN_WALL_TIMEOUT_MS,
       scope: "git",
       fixture: "no-head",
+      hiddenWindow: true,
+      preserveFailedProfile: true,
+      // Windows 新 UDF 先完成 profile 初始化，再由同一隔离 profile 开启回环 CDP，避免首启窗口已运行但调试端口尚未可附着。
+      prewarmWebview: true,
       ignoredFiles: 0,
       untrackedFiles: 0,
       // 失败截图必须在 runner 回收 WebView2 前保存，使等待超时仍保留可核验的真实界面。
@@ -419,6 +645,24 @@ async function main() {
         try {
           return await runConversationProgressWebView2({ ...driverOptions, fixture });
         } catch (error) {
+          const fixtureDiagnostic = safeFixtureFailureSnapshot(fixture.snapshot());
+          const runtimeDiagnostic = await readConversationProgressRuntimeDiagnostics(
+            driverOptions.page,
+          );
+          const diagnostic = {
+            errorCategory: runnerErrorCategory(error),
+            fixture: fixtureDiagnostic,
+            runtime: runtimeDiagnostic,
+            isolatedRuntimeLogs: await readIsolatedRuntimeLogs(driverOptions.isolatedRuntimeHome),
+          };
+          await writeFile(
+            join(options.evidenceDirectory, "conversation-progress-runtime-diagnostic.json"),
+            `${JSON.stringify(diagnostic, null, 2)}\n`,
+            "utf8",
+          ).catch(() => undefined);
+          console.error(
+            `JA_CONVERSATION_PROGRESS_RUNTIME_DIAGNOSTIC ${JSON.stringify(diagnostic)}`,
+          );
           await driverOptions.page
             .screenshot({
               path: join(options.evidenceDirectory, "failure.png"),

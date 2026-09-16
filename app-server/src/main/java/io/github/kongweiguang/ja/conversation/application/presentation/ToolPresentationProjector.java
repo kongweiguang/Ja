@@ -64,7 +64,7 @@ public final class ToolPresentationProjector {
         String input = switch (kind) {
             case SHELL -> command;
             case READ -> readInput(invocation.toolName(), invocation.arguments(), paths, root, knownSecrets);
-            case EDIT -> mutationInput("edit", invocation.arguments(), paths, "oldText", "newText");
+            case EDIT -> editInput(invocation.arguments(), paths);
             case WRITE -> mutationInput("write", invocation.arguments(), paths, "content");
             case MCP -> boundedJson(invocation.arguments(), root, knownSecrets);
         };
@@ -77,7 +77,7 @@ public final class ToolPresentationProjector {
                     ? sanitize(text(question, "prompt"), root, knownSecrets) : "等待用户回答";
         }
         return new ToolPresentation(kind, actionTitle, ToolPresentation.Status.PENDING,
-                input, null, paths, command, ".", null, null, null, null, false, null);
+                input, null, null, paths, command, ".", null, null, null, null, false, null);
     }
 
     /**
@@ -87,7 +87,7 @@ public final class ToolPresentationProjector {
         Objects.requireNonNull(value, "value");
         Objects.requireNonNull(status, "status");
         return new ToolPresentation(value.kind(), value.title(), status, value.inputPreview(), value.outputPreview(),
-                value.relativePaths(), value.command(), value.relativeCwd(), value.stdout(), value.stderr(),
+                value.summary(), value.relativePaths(), value.command(), value.relativeCwd(), value.stdout(), value.stderr(),
                 value.exitCode(), value.durationMs(), value.truncated(), value.artifactId());
     }
 
@@ -111,8 +111,9 @@ public final class ToolPresentationProjector {
             stderr = preview(streams.stderr());
         }
         Integer exitCode = integerMetadata(result, "exit_code");
+        String summary = completedSummary(invocation, result);
         ToolPresentation value = new ToolPresentation(base.kind(), base.title(), status(result.outcome()),
-                base.inputPreview(), preview, base.relativePaths(), base.command(), base.relativeCwd(), stdout, stderr,
+                base.inputPreview(), preview, summary, base.relativePaths(), base.command(), base.relativeCwd(), stdout, stderr,
                 exitCode, durationMs, sourceTruncated || previewTruncated, artifactId);
         return new Completed(value, sanitized);
     }
@@ -136,6 +137,56 @@ public final class ToolPresentationProjector {
             case FAILED -> ToolPresentation.Status.ERROR;
             case CANCELLED -> ToolPresentation.Status.CANCELLED;
         };
+    }
+
+    /**
+     * 只从内置 Tool 已声明的数字 metadata 生成一句结果摘要，既让展开视图能快速扫描，也不把正文、路径
+     * 或自由格式 metadata 带进持久化协议；失败仍以原有安全诊断为唯一事实来源。
+     */
+    private static String completedSummary(AgentTool.Invocation invocation, AgentTool.ToolResult result) {
+        if (result.outcome() != ToolOutcome.SUCCEEDED) return null;
+        return switch (invocation.toolName()) {
+            case "read" -> readSummary(result);
+            case "grep" -> discoverySummary(result, "个匹配项");
+            case "find" -> discoverySummary(result, "个文件或目录");
+            case "ls" -> discoverySummary(result, "个条目");
+            case "edit" -> editSummary(invocation.arguments());
+            case "write" -> "文件已写入";
+            default -> null;
+        };
+    }
+
+    /**
+     * read 的续读位置仅使用执行端精确计算的行号；缺失任一关键数字时宁可不显示摘要，也不让 UI 猜测
+     * 文件是否读取完毕。
+     */
+    private static String readSummary(AgentTool.ToolResult result) {
+        Long lines = nonNegativeLongMetadata(result, "lines");
+        Long totalLines = nonNegativeLongMetadata(result, "totalLines");
+        if (lines == null || totalLines == null) return null;
+        Long nextOffset = nonNegativeLongMetadata(result, "nextOffset");
+        String summary = "已读取 " + lines + " 行，共 " + totalLines + " 行";
+        if (nextOffset != null && nextOffset > 0) return summary + "；可从第 " + nextOffset + " 行继续";
+        return booleanMetadata(result, "truncated") ? summary + "；结果受上限限制" : summary + "；已到末尾";
+    }
+
+    /**
+     * 搜索与目录 Tool 的结果数和 partial 状态来自原生执行 metadata；预览自身的十行截断不等同于搜索不完整，
+     * 因此不会误导用户或模型认为需要重复搜索。
+     */
+    private static String discoverySummary(AgentTool.ToolResult result, String noun) {
+        Long count = nonNegativeLongMetadata(result, "resultCount");
+        if (count == null) return null;
+        String summary = count == 0 ? "未找到结果" : "找到 " + count + " " + noun;
+        return booleanMetadata(result, "truncated") ? summary + "；部分结果未显示" : summary;
+    }
+
+    /**
+     * edit 的替换数量从受 Schema 约束的调用参数读取，成功文案不再依赖英文执行输出，避免展示层解析正文。
+     */
+    private static String editSummary(JsonObject arguments) {
+        int count = editBlockCount(arguments);
+        return count == 0 ? "编辑完成" : "已完成 " + count + " 处替换";
     }
 
     /** 内置只读 Tool 共用 READ wire kind，具体动作由真实 toolName 和安全标题区分；未知扩展才归 MCP。 */
@@ -170,7 +221,7 @@ public final class ToolPresentationProjector {
     private static String readInput(String toolName, JsonObject arguments, List<String> paths,
                                     Path root, List<String> knownSecrets) {
         return switch (toolName) {
-            case "grep" -> searchInput("query", arguments, paths, root, knownSecrets);
+            case "grep" -> searchInput("pattern", arguments, paths, root, knownSecrets);
             case "find" -> searchInput("pattern", arguments, paths, root, knownSecrets);
             case "ls" -> paths.isEmpty() ? "." : paths.getFirst();
             case "read_attachment" -> attachmentInput(arguments, root, knownSecrets);
@@ -218,6 +269,23 @@ public final class ToolPresentationProjector {
             if (value != null) result.append(" · ").append(key).append('=').append(value.length()).append(" chars");
         }
         return operation + " " + result;
+    }
+
+    /**
+     * 批量 edit 仅显示目标文件和替换块数，既让用户判断操作规模，也不将任一原文或替换内容写入历史展示。
+     */
+    private static String editInput(JsonObject arguments, List<String> paths) {
+        int count = editBlockCount(arguments);
+        String path = paths.isEmpty() ? "[external-path]" : paths.getFirst();
+        return "edit " + path + " · " + (count == 0 ? "[missing-edits]" : count + " block(s)");
+    }
+
+    /**
+     * 编辑摘要与输入摘要共用同一数组计数规则，避免两处对缺失或畸形 edits 得出不同操作规模。
+     */
+    private static int editBlockCount(JsonObject arguments) {
+        JsonValue edits = arguments.get("edits");
+        return edits instanceof JsonArray array ? array.values().size() : 0;
     }
 
     /**
@@ -388,6 +456,22 @@ public final class ToolPresentationProjector {
             && object.members().get(key) instanceof JsonNumber value) {
             try {
                 return value.value().intValueExact();
+            } catch (ArithmeticException ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 结果摘要只接受精确、非负的长整型 metadata；执行端缺失、越界或负值都保持缺失而不是展示猜测值。
+     */
+    private static Long nonNegativeLongMetadata(AgentTool.ToolResult result, String key) {
+        if (result.structuredContent().orElse(null) instanceof JsonObject object
+            && object.members().get(key) instanceof JsonNumber value) {
+            try {
+                long number = value.value().longValueExact();
+                return number >= 0 ? number : null;
             } catch (ArithmeticException ignored) {
                 return null;
             }

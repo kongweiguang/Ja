@@ -291,6 +291,7 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
     private static ToolPresentation presentation(ToolPresentation.Status status, String artifactId) {
         return new ToolPresentation(ToolPresentation.Kind.SHELL, "shell", status,
                 "echo ok", status == ToolPresentation.Status.SUCCESS ? "ok" : null,
+                status == ToolPresentation.Status.SUCCESS ? "命令已完成" : null,
                 List.of(), "echo ok", ".", status == ToolPresentation.Status.SUCCESS ? "ok" : null,
                 null, status == ToolPresentation.Status.SUCCESS ? 0 : null,
                 status == ToolPresentation.Status.SUCCESS ? 10L : null, false, artifactId);

@@ -15,6 +15,7 @@ public record ToolPresentation(
         Status status,
         String inputPreview,
         String outputPreview,
+        String summary,
         List<String> relativePaths,
         String command,
         String relativeCwd,
@@ -25,6 +26,7 @@ public record ToolPresentation(
         boolean truncated,
         String artifactId) {
     private static final int MAX_PREVIEW = 32_768;
+    private static final int MAX_SUMMARY = 1_024;
 
     /**
      * 在领域边界限制所有可展示文本和路径数量，避免 transport 或历史读取重新接触无界 Tool 数据。
@@ -35,6 +37,7 @@ public record ToolPresentation(
         title = text(title, "title", 512, false);
         inputPreview = optionalText(inputPreview, "inputPreview", MAX_PREVIEW);
         outputPreview = optionalText(outputPreview, "outputPreview", MAX_PREVIEW);
+        summary = optionalText(summary, "summary", MAX_SUMMARY);
         command = optionalText(command, "command", MAX_PREVIEW);
         relativeCwd = optionalText(relativeCwd, "relativeCwd", 4_096);
         stdout = optionalText(stdout, "stdout", MAX_PREVIEW);
