@@ -91,10 +91,12 @@ pub(crate) const V1_CLIENT_METHODS: &[&str] = &[
     "configuration/reset",
     "credential/set",
     "credential/delete",
+    "credential/reveal-provider",
     "skill/list",
     "mcp/list",
     "mcp/test",
     "model/test",
+    "model/discover",
     "mcp/list-tools",
     "tool/artifact/read",
 ];

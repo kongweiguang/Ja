@@ -77,6 +77,24 @@ final class ConfigGenerationV1Test {
         });
     }
 
+    /** 代际投影保留用户自建远程 HTTP 网关，不把已验证的配置退化为 loopback 专用地址。 */
+    @Test
+    void remoteHttpProviderRouteRemainsAvailableInGeneration() {
+        ObjectNode source = document();
+        ((ObjectNode) source.withArray("providers").get(0))
+                .put("base_url", "http://198.51.100.22:8080/v1");
+        ConfigGeneration generation = new ConfigGeneration("generation_remote_http", null,
+                "cfg_user", "cfg_missing", source, Map.of(), List.of(), false,
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+
+        try (ConfigGeneration.Lease lease = generation.acquire()) {
+            assertEquals("http://198.51.100.22:8080/v1",
+                    lease.snapshot().requireProvider("provider_fixture").baseUrl().toString());
+        } finally {
+            generation.close();
+        }
+    }
+
     /** 代际快照保留指定子智能体 Provider/Model，运行时无需重新读取可变配置文件。 */
     @Test
     void subagentSelectionProjectsAsFrozenPair() {

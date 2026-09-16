@@ -8,6 +8,18 @@ import { subscribeGoalHostEvents, type GoalEvent } from "@/features/goals";
 import { useTimelineStore } from "@/features/conversation";
 
 describe("runtimeHostAdapter Goal routing", () => {
+  /** 目录发现经受限 settings query 转交，composition 不形成可注入 method 或 Provider 配置的通道。 */
+  it("routes saved provider model discovery through the fixed native method", async () => {
+    const query = vi.fn(async () => ({ items: ["gpt-5.6-sol"], truncated: false }));
+    const adapter = { query } as unknown as RuntimeHostAdapter;
+    const runtime = createRuntimeHostPort(adapter);
+
+    await expect(
+      runtime.query("model/discover", { providerId: "provider_openai" }),
+    ).resolves.toEqual({ items: ["gpt-5.6-sol"], truncated: false });
+    expect(query).toHaveBeenCalledWith("model/discover", { providerId: "provider_openai" });
+  });
+
   /** 取消只使对应 Thread 的投影失效；不制造模型事件，也不对其它隐藏会话发起读取。 */
   it("invalidates only the cancelled interaction owner", async () => {
     let emitNative!: Parameters<RuntimeHostAdapter["subscribe"]>[0];

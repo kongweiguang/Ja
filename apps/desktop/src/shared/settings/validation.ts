@@ -5,8 +5,8 @@
 export const CREDENTIAL_REF_PATTERN = /^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 
 /**
- * 在 shared 边界校验 URL，使原生 Settings 与表单使用相同 scheme、host
- * 以及 credential/query 限制。
+ * Provider 与 MCP 复用同一 URL 形状约束：允许任意 HTTP(S) 主机，同时禁止把凭据
+ * 或请求参数嵌入地址，确保 Secret 仍只能经独立凭据边界传递。
  */
 export function isSafeHttpUrl(value: string): boolean {
   try {
@@ -22,19 +22,4 @@ export function isSafeHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** Provider 流量必须使用 HTTPS，只有显式本地 loopback fixture 例外。 */
-export function isSafeProviderUrl(value: string): boolean {
-  if (!isSafeHttpUrl(value)) {
-    return false;
-  }
-  const url = new URL(value.trim());
-  if (url.protocol === "https:") {
-    return true;
-  }
-  return (
-    url.protocol === "http:" &&
-    (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]")
-  );
 }

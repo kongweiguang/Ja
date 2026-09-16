@@ -53,6 +53,11 @@ async function queryRuntime<M extends RuntimeSettingsMethod>(
         "model/test",
         params as NativeRuntimeSettingsParams<"model/test">,
       )) as RuntimeSettingsResult<M>;
+    case "model/discover":
+      return (await adapter.query(
+        "model/discover",
+        params as NativeRuntimeSettingsParams<"model/discover">,
+      )) as RuntimeSettingsResult<M>;
     case "mcp/list-tools":
       return (await adapter.query(
         "mcp/list-tools",

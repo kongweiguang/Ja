@@ -79,6 +79,7 @@ function controllerOptions(
       reset: vi.fn(async () => ({ version: "cfg_project" })),
       setCredential: vi.fn(async () => "cfg_auth"),
       deleteCredential: vi.fn(async () => "cfg_auth"),
+      revealProviderCredential: vi.fn(async () => null),
     },
     appearancePort: {
       themeMode: "system",
@@ -105,6 +106,7 @@ function controllerOptions(
         toolCount: 0,
       })),
       testModel: vi.fn(async () => ({ responseModel: "gpt-test", latencyMs: 12 })),
+      discoverModels: vi.fn(async () => ({ items: [], truncated: false })),
       listMcpTools: vi.fn(async () => ({ items: [], nextCursor: null })),
     },
   };
@@ -605,6 +607,7 @@ describe("useSettingsController v1", () => {
             reset: vi.fn(async () => ({ version: "cfg_project" })),
             setCredential: vi.fn(async () => "cfg_auth2"),
             deleteCredential: vi.fn(async () => "cfg_auth3"),
+            revealProviderCredential: vi.fn(async () => null),
           },
           appearancePort: {
             themeMode: "system",
@@ -631,6 +634,7 @@ describe("useSettingsController v1", () => {
               toolCount: 0,
             })),
             testModel: vi.fn(async () => ({ responseModel: "gpt-test", latencyMs: 12 })),
+            discoverModels: vi.fn(async () => ({ items: [], truncated: false })),
             listMcpTools: vi.fn(async () => ({ items: [], nextCursor: null })),
           },
         }),
@@ -666,6 +670,26 @@ describe("useSettingsController v1", () => {
     expect(document.defaultSelection?.modelId).toBe("model_two");
     expect(document.defaultAccessMode).toBe("approval_required");
     expect(save).toHaveBeenCalledTimes(3);
+  });
+
+  /** 目录查询只准许用户层已保存 Provider 身份，阻止 controller 被调用方当作任意连接代理。 */
+  it("reads the upstream catalog only for a saved provider identity", async () => {
+    const snapshot = vi.fn(async () => loadedSettings("OpenAI"));
+    const options = controllerOptions(snapshot);
+    const discoverModels = vi.fn(async () => ({ items: ["gpt-5.6-sol"], truncated: false }));
+    options.runtimePort.discoverModels = discoverModels;
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+
+    await expect(result.current.ports.onDiscoverModels("provider_missing")).rejects.toThrow(
+      "provider unavailable",
+    );
+    expect(discoverModels).not.toHaveBeenCalled();
+    await expect(result.current.ports.onDiscoverModels("provider_one")).resolves.toEqual({
+      items: ["gpt-5.6-sol"],
+      truncated: false,
+    });
+    expect(discoverModels).toHaveBeenCalledWith("provider_one");
   });
 
   it("keeps theme, palette, motion, transparency, and contrast in the UI preference owner", async () => {
@@ -802,6 +826,7 @@ describe("useSettingsController v1", () => {
             reset: vi.fn(async () => ({ version: "cfg_project" })),
             setCredential: vi.fn(async () => "cfg_auth"),
             deleteCredential: vi.fn(async () => "cfg_auth"),
+            revealProviderCredential: vi.fn(async () => null),
           },
           appearancePort: {
             themeMode: "system",
@@ -824,6 +849,7 @@ describe("useSettingsController v1", () => {
             listMcpServers: vi.fn(async () => ({ items: [], nextCursor: null })),
             testMcp: vi.fn(),
             testModel: vi.fn(async () => ({ responseModel: "gpt-test", latencyMs: 12 })),
+            discoverModels: vi.fn(async () => ({ items: [], truncated: false })),
             listMcpTools: vi.fn(async () => ({ items: [], nextCursor: null })),
           },
         }),

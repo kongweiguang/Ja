@@ -76,6 +76,7 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_configuration_reset,
         crate::app_runtime::ja_credential_set,
         crate::app_runtime::ja_credential_delete,
+        crate::app_runtime::ja_credential_reveal_provider,
         crate::app_runtime::ja_workspace_list,
         crate::app_runtime::ja_thread_create,
         crate::app_runtime::ja_thread_discover,

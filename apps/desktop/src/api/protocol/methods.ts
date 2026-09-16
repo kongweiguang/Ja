@@ -17,12 +17,12 @@ export function parseMethodParams<M extends ClientMethod>(
   method: M,
   params: unknown,
 ): MethodParams<M> {
-  const allowCredentialSecret = method === "credential/set";
+  const allowCredentialSecretPath = method === "credential/set" ? (["secret"] as const) : undefined;
   // attachment preview 的 authorization 是资源归属 tag；只在 params 根的精确键放行，
   // 其它方法或嵌套位置仍按潜在凭据泄漏拒绝。
   const allowAuthorizationPath =
     method === "attachment/preview/open" ? (["authorization"] as const) : undefined;
-  assertNoReadyTokenLeak(params, { allowCredentialSecret, allowAuthorizationPath });
+  assertNoReadyTokenLeak(params, { allowCredentialSecretPath, allowAuthorizationPath });
   return ParamsSchemaByMethod[method].parse(params) as MethodParams<M>;
 }
 
@@ -31,6 +31,10 @@ export function parseMethodResult<M extends ClientMethod>(
   method: M,
   result: unknown,
 ): MethodResult<M> {
-  assertNoReadyTokenLeak(result);
+  // API Key 回显仅有一个精确方法和严格结果 Schema，其他响应仍按默认 Secret 边界失败关闭。
+  assertNoReadyTokenLeak(result, {
+    allowCredentialSecretPath:
+      method === "credential/reveal-provider" ? (["secret"] as const) : undefined,
+  });
   return ResultSchemaByMethod[method].parse(result) as MethodResult<M>;
 }

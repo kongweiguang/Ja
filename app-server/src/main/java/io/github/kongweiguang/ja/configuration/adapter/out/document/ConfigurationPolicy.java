@@ -213,16 +213,15 @@ public final class ConfigurationPolicy {
         if (credential != null) validateCredentialId(credential);
     }
 
-    /** 连接地址只允许 HTTPS 或明确 loopback HTTP，拒绝用户信息、查询和片段。 */
+    /** 连接地址允许用户指定任意 HTTP(S) 主机，但拒绝 URL 内嵌凭据、查询和片段。 */
     private static void validateBaseUrl(String value) {
         try {
             URI uri = URI.create(value);
             String host = uri.getHost();
-            boolean loopback = "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host)
-                               || "::1".equals(host);
-            if (!uri.isAbsolute() || uri.getUserInfo() != null || uri.getQuery() != null
-                || uri.getFragment() != null || !("https".equalsIgnoreCase(uri.getScheme())
-                || ("http".equalsIgnoreCase(uri.getScheme()) && loopback))) {
+            if (!uri.isAbsolute() || host == null || host.isBlank() || uri.getUserInfo() != null
+                || uri.getQuery() != null || uri.getFragment() != null
+                || !("https".equalsIgnoreCase(uri.getScheme())
+                || "http".equalsIgnoreCase(uri.getScheme()))) {
                 throw new IllegalArgumentException("invalid base URL");
             }
         } catch (RuntimeException failure) {

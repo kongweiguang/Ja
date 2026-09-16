@@ -60,8 +60,11 @@
 | `approval/respond`       | approval id, turn id, `approve` or `deny`, revision                                            | resolves one Tool request only                                                                                                                         |
 | `skill/list`             | optional `workspaceId`, cursor and limit                                                       | discovers the effective built-in, user, Ja, and trusted project Skill catalog without exposing paths or document bodies                                |
 | `model/test`             | exact saved `providerId` and `modelId`                                                         | sends one bounded request without history, Tools, or attachments; returns only redacted response model and latency                                     |
+| `model/discover`         | exact saved `providerId`                                                                       | reads one bounded `/v1/models` directory page with the saved Provider endpoint and credential; returns model identifiers only and never writes config |
 
 Configuration, credential, workspace, history, catalog, health, and shutdown methods remain those listed by the schema. Unknown methods and fields fail closed.
+
+`credential/reveal-provider` accepts exactly `{providerId}` and is the sole read exception for an API Key: it returns the nullable Key bound to that Provider only while its edit form is open. It does not accept a `credentialId`, does not expose MCP credentials, and is not part of `configuration/read` or configuration events.
 
 The handshake capability object includes exact `collaborationModes=["default","plan"]` and the feature closure defined by the schema. Collaboration mode is orthogonal to AccessMode. Child Threads stay out of Workspace navigation; explicit `thread/list` with `scope:"all"` discovers them across the local instance without reading transcripts.
 

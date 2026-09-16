@@ -5,7 +5,7 @@ import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowLeft, Search, X } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button, IconButton, ScrollArea } from "@/shared/ui/primitives";
-import type { SettingsSection, SettingsSnapshot } from "../domain/types";
+import type { SettingsRecovery, SettingsSection, SettingsSnapshot } from "../domain/types";
 import type { SettingsDesktopPort, SettingsPorts } from "../application/ports";
 import type { SettingsInterfacePreferences } from "../application/ports";
 import type { ExecutionScope } from "../domain/executionScope";
@@ -206,6 +206,8 @@ function matchesQuery(query: string, text: string): boolean {
  */
 export interface SettingsProps {
   snapshot: SettingsSnapshot;
+  /** 恢复状态由 App Server 的脱敏读取结果派生，视图只能引导用户到合法编辑入口。 */
+  recovery?: SettingsRecovery;
   interfacePreferences: SettingsInterfacePreferences;
   executionScope: ExecutionScope;
   ports: SettingsPorts;
@@ -223,6 +225,7 @@ export interface SettingsProps {
  */
 export function Settings({
   snapshot,
+  recovery,
   interfacePreferences,
   executionScope,
   ports,
@@ -448,6 +451,17 @@ export function Settings({
             <strong>设置</strong>
             <SettingsUpdateAction updater={updater} />
           </header>
+          {recovery === "user_config_corrupt" ? (
+            <section className="ja-settings-recovery" role="status" aria-label="配置恢复模式">
+              <div>
+                <strong>已进入配置恢复模式</strong>
+                <p>部分本地设置无法读取。原文件尚未修改，保存有效设置即可完成修复。</p>
+              </div>
+              <Button type="button" variant="secondary" onClick={() => onSectionChange("models")}>
+                配置服务商
+              </Button>
+            </section>
+          ) : null}
           <ScrollArea className="ja-settings-content">
             <Tabs.Content forceMount value="general" className="ja-settings-panel">
               <GeneralSection

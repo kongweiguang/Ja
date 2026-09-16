@@ -95,12 +95,22 @@ public final class ModelTransport implements AutoCloseable {
      */
     OkHttpClient clientFor(ModelPort.ModelConfiguration configuration) {
         Objects.requireNonNull(configuration, "configuration");
+        return clientFor(configuration.connectTimeout(), configuration.requestTimeout());
+    }
+
+    /**
+     * 为不依赖已保存模型的目录请求派生同样受限的 Client 视图，避免发现功能绕开共享连接池、
+     * Dispatcher 或超时策略。
+     */
+    OkHttpClient clientFor(Duration connectTimeout, Duration requestTimeout) {
+        Objects.requireNonNull(connectTimeout, "connectTimeout");
+        Objects.requireNonNull(requestTimeout, "requestTimeout");
         ensureOpen();
         return client.newBuilder()
-                .connectTimeout(configuration.connectTimeout())
-                .readTimeout(configuration.requestTimeout())
-                .writeTimeout(configuration.requestTimeout())
-                .callTimeout(configuration.requestTimeout())
+                .connectTimeout(connectTimeout)
+                .readTimeout(requestTimeout)
+                .writeTimeout(requestTimeout)
+                .callTimeout(requestTimeout)
                 .build();
     }
 

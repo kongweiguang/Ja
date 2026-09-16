@@ -9,7 +9,7 @@
 use crate::app_runtime::{
     ConfigurationPatchParams, ConfigurationReadParams, ConfigurationReplaceParams,
     ConfigurationRequest, ConfigurationResetParams, ConfigurationResponse, CredentialDeleteParams,
-    CredentialSetParams, RuntimeCommandError, RuntimeHost,
+    CredentialRevealProviderParams, CredentialSetParams, RuntimeCommandError, RuntimeHost,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -105,6 +105,13 @@ impl Drop for CredentialSetInput {
 pub struct CredentialDeleteInput {
     pub credential_id: String,
     pub expected_version: String,
+}
+
+/// Provider 身份只在显式编辑时用于读取其绑定 API Key，不能接受自由 credentialId。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialRevealProviderInput {
+    pub provider_id: String,
 }
 
 /// 稳定且脱敏的 Tauri 错误；Java 细节与 Secret 值不得越过该边界。
@@ -280,6 +287,32 @@ pub async fn ja_credential_delete(
     .map_err(|_| SettingsCommandError::unavailable())?
 }
 
+///
+/// 只把指定 Provider 的 API Key 短时返回给设置编辑框；这个 command 不参与配置快照，
+/// 并在 Rust 侧重新校验 response 的唯一 `secret` 字段，防止普通响应意外携带凭据。
+#[tauri::command]
+pub async fn ja_credential_reveal_provider(
+    input: CredentialRevealProviderInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<Value, SettingsCommandError> {
+    validate_provider_id(&input.provider_id)?;
+    let host = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let params = serde_json::to_vec(&input).map_err(|_| SettingsCommandError::invalid())?;
+        let request = ConfigurationRequest::CredentialRevealProvider(
+            CredentialRevealProviderParams::try_new(params).map_err(SettingsCommandError::from)?,
+        );
+        let value = request_configuration!(
+            &host,
+            request,
+            ConfigurationResponse::CredentialRevealProvider
+        )?;
+        validate_revealed_provider_credential(value)
+    })
+    .await
+    .map_err(|_| SettingsCommandError::unavailable())?
+}
+
 /// 在 interface 边界只接受缺省值或 Java 签发的工作区身份，禁止把路径或自由文本带入配置查询。
 fn validate_optional_workspace(value: Option<&str>) -> Result<(), SettingsCommandError> {
     let Some(value) = value else {
@@ -394,6 +427,20 @@ fn validate_credential_id(value: &str) -> Result<(), SettingsCommandError> {
     Ok(())
 }
 
+/// Provider identity 使用固定不透明 token，避免回显 command 被路径或任意引用滥用。
+fn validate_provider_id(value: &str) -> Result<(), SettingsCommandError> {
+    if !value.starts_with("provider_")
+        || value.len() > 100
+        || value.len() == 9
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(SettingsCommandError::invalid());
+    }
+    Ok(())
+}
+
 /// 对配置读取结果执行失败关闭的脱敏合同检查，并只接受顶层 `cas` 三版本事实。
 fn validate_redacted_projection(value: Value) -> Result<Value, SettingsCommandError> {
     if contains_secret_field(&value) {
@@ -475,6 +522,25 @@ fn validate_credential_result(value: Value) -> Result<Value, SettingsCommandErro
         || contains_secret_field(&value)
     {
         return Err(SettingsCommandError::unavailable());
+    }
+    Ok(value)
+}
+
+/// 回显响应只能有 nullable `secret`，使白名单例外不能演化为通用敏感 JSON 转发通道。
+fn validate_revealed_provider_credential(value: Value) -> Result<Value, SettingsCommandError> {
+    let object = value
+        .as_object()
+        .ok_or_else(SettingsCommandError::unavailable)?;
+    if object.len() != 1
+        || !object.contains_key("secret")
+        || !matches!(object.get("secret"), Some(Value::Null | Value::String(_)))
+    {
+        return Err(SettingsCommandError::unavailable());
+    }
+    if let Some(secret) = object.get("secret").and_then(Value::as_str) {
+        if secret.is_empty() || secret.len() > 8192 || secret.chars().any(char::is_control) {
+            return Err(SettingsCommandError::unavailable());
+        }
     }
     Ok(value)
 }

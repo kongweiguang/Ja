@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 
+import java.util.List;
 import java.util.concurrent.CompletionStage;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
@@ -35,6 +36,12 @@ public interface CatalogUseCase {
             String providerId, String modelId, CancellationToken cancellationToken);
 
     /**
+     * 从已保存 Provider 的当前配置代际读取单页上游目录；结果不保存配置，调用方必须显式确认草稿。
+     */
+    CompletionStage<ModelDiscoveryResult> discoverModels(
+            String providerId, CancellationToken cancellationToken);
+
+    /**
      * 从当前通用配置代际读取 MCP Tool Schema 页面。
      */
     CursorPage<McpToolDescriptor> readMcpTools(String mcpId, String cursor, int limit);
@@ -46,6 +53,22 @@ public interface CatalogUseCase {
             if (responseModel == null || responseModel.isBlank() || responseModel.length() > 512
                     || latencyMs < 0 || latencyMs > 3_600_000) {
                 throw new IllegalArgumentException("invalid model test result");
+            }
+        }
+    }
+
+    /** 上游目录的脱敏投影，只保留安全模型标识和服务端截断事实。 */
+    record ModelDiscoveryResult(List<String> items, boolean truncated) {
+        /**
+         * 目录响应按单页 200 项封顶，并拒绝控制字符和重复值，使其能直接跨越固定 JA-RPC result
+         * schema，而不携带厂商对象或能力猜测。
+         */
+        public ModelDiscoveryResult {
+            items = List.copyOf(items);
+            if (items.size() > 200 || items.stream().anyMatch(item -> item == null || item.isBlank()
+                    || item.length() > 512 || item.chars().anyMatch(Character::isISOControl))
+                    || items.stream().distinct().count() != items.size()) {
+                throw new IllegalArgumentException("invalid model discovery result");
             }
         }
     }

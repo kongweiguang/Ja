@@ -30,7 +30,8 @@ import java.util.concurrent.CompletionStage;
  * 把严格 JA-RPC v1 配置命令映射到配置入站端口；Jackson 只存在于该 Wire 边界。
  *
  * <p>workspaceId 在此解析为进程内 Path 能力，配置域只接收纯 JDK 不可变文档；Secret 仅能
- * 通过 credential/set 进入配置用例，任何响应和通知都不会回显输入。</p>
+ * 通过 credential/set 进入配置用例；仅 credential/reveal-provider 可在编辑 Provider 时回显其
+ * 绑定 API Key，其它响应和通知保持脱敏。</p>
  */
 public final class ConfigurationHandler implements RpcHandler {
     private final RpcSession session;
@@ -40,12 +41,13 @@ public final class ConfigurationHandler implements RpcHandler {
         this.session = session;
     }
 
-    /** 只注册冻结后的六个首版 v1 配置与凭据方法，未知动作由关闭的注册表拒绝。 */
+    /** 只注册冻结后的配置与凭据方法；回显能力只绑定 Provider 身份，未知动作由关闭注册表拒绝。 */
     @Override
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.CONFIGURATION_READ, RpcMethod.CONFIGURATION_PATCH,
                 RpcMethod.CONFIGURATION_REPLACE, RpcMethod.CONFIGURATION_RESET,
-                RpcMethod.CREDENTIAL_SET, RpcMethod.CREDENTIAL_DELETE);
+                RpcMethod.CREDENTIAL_SET, RpcMethod.CREDENTIAL_DELETE,
+                RpcMethod.CREDENTIAL_REVEAL_PROVIDER);
     }
 
     /** 在握手就绪后分派一个同步、有界的配置命令，不把 Wire DTO 交给应用端口。 */
@@ -59,6 +61,7 @@ public final class ConfigurationHandler implements RpcHandler {
             case CONFIGURATION_RESET -> reset(command.params());
             case CREDENTIAL_SET -> setCredential(command.params());
             case CREDENTIAL_DELETE -> deleteCredential(command.params());
+            case CREDENTIAL_REVEAL_PROVIDER -> revealProviderCredential(command.params());
             default -> throw JaRpcException.methodNotFound();
         });
     }
@@ -131,6 +134,20 @@ public final class ConfigurationHandler implements RpcHandler {
         ConfigurationUseCase.CredentialResult result = session.configurationUseCase().deleteCredential(
                 credentialId, requireVersion(params));
         return credentialResult(result, credentialId, false);
+    }
+
+    /**
+     * 将用户显式选择的 Provider 映射为唯一允许回显的 Secret；Provider identity 由当前代际
+     * 重新解析，避免客户端把任意 credentialId 作为读取钥匙，且该值不进入配置事件或快照。
+     */
+    private ObjectNode revealProviderCredential(ObjectNode params) {
+        RpcParams.requireExact(params, "providerId");
+        String providerId = RpcParams.text(params, "providerId", 128, false);
+        String secret = session.configurationUseCase().revealProviderCredential(providerId);
+        ObjectNode result = session.mapper().createObjectNode();
+        if (secret == null) result.putNull("secret");
+        else result.put("secret", secret);
+        return result;
     }
 
     /** 在进入配置端口前把 Wire 字符串收敛为领域枚举。 */

@@ -5,10 +5,16 @@
 `configuration/read` returns one explicit `cas` object containing exactly `userVersion`,
 `projectVersion`, and `credentialVersion`; layer projections do not repeat these versions.
 Configuration and credential mutations require `expectedVersion` and return the newly committed
-`version`. No result echoes Secret material. List methods return `{items,nextCursor}`. Successful
+`version`. No result echoes Secret material except the strict `{secret:string|null}` response from
+`credential/reveal-provider`, which is limited to the API Key currently bound to an explicitly selected Provider.
+List methods return `{items,nextCursor}`. Successful
 `turn/start` and `turn/resume` return the same exact admission receipt field set
 `{accepted:true,queued:boolean,turnId,threadRevision}`. `turn/start` may report `queued:false` when execution starts immediately;
 `turn/resume` always reports `queued:true` because it transitions the existing Operation from `suspended` to `queued` and never creates or returns another Operation identity.
+
+`model/discover` returns exactly `{items:string[],truncated:boolean}`. It reads one upstream `/v1/models`
+page using the selected saved Provider configuration, caps `items` at 200, and returns no endpoint, Header,
+credential, model capability, or vendor metadata. The response is only a draft input: it never persists a model.
 
 Every Thread result contains required `pinned:boolean`, required nullable `latestTurnStatus`, and required
 `latestTurnSeen:boolean` in addition to identity, preferences, lifecycle status, revision, and timestamps.

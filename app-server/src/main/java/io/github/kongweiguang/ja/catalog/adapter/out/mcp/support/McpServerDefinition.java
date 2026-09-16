@@ -272,14 +272,14 @@ public record McpServerDefinition(
     }
 
     /**
-     * 构建请求前拒绝非 TLS 远端地址和 URI 内嵌凭据；loopback HTTP 是唯一例外。
+     * 构建请求前只允许用户配置的 HTTP(S) 地址并拒绝 URI 内嵌凭据；MCP 的认证仍须通过
+     * 显式 headers/auth 引用传递，不能借地址文本绕过凭据所有权。
      */
     private static URI requireHttpEndpoint(URI endpoint) {
         Objects.requireNonNull(endpoint, "endpoint");
-        boolean loopbackHttp = "http".equalsIgnoreCase(endpoint.getScheme())
-                               && ("127.0.0.1".equals(endpoint.getHost()) || "localhost".equalsIgnoreCase(endpoint.getHost()));
-        if (!("https".equalsIgnoreCase(endpoint.getScheme()) || loopbackHttp)
-            || endpoint.getHost() == null || endpoint.getUserInfo() != null || endpoint.getFragment() != null) {
+        if (!("https".equalsIgnoreCase(endpoint.getScheme()) || "http".equalsIgnoreCase(endpoint.getScheme()))
+            || endpoint.getHost() == null || endpoint.getHost().isBlank()
+            || endpoint.getUserInfo() != null || endpoint.getFragment() != null) {
             throw new IllegalArgumentException("mcp_http_endpoint_invalid");
         }
         String query = endpoint.getRawQuery();

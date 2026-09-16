@@ -94,12 +94,14 @@ function ports(overrides: Partial<SettingsPorts> = {}): SettingsPorts {
     onMoveProvider: vi.fn(async () => undefined),
     onSaveModel: vi.fn(async () => undefined),
     onTestModel: vi.fn(async () => ({ responseModel: "gpt-test", latencyMs: 12 })),
+    onDiscoverModels: vi.fn(async () => ({ items: [], truncated: false })),
     onDeleteModel: vi.fn(async () => undefined),
     onMoveModel: vi.fn(async () => undefined),
     onDefaultSelectionChange: vi.fn(async () => undefined),
     onSubagentSettingsChange: vi.fn(async () => undefined),
     onReplaceCredential: vi.fn(async () => undefined),
     onClearCredential: vi.fn(async () => undefined),
+    onRevealProviderCredential: vi.fn(async () => null),
     onSaveMcp: vi.fn(async () => undefined),
     onDeleteMcp: vi.fn(async () => undefined),
     onTestMcp: vi.fn(async () => "connected" as const),
@@ -144,6 +146,30 @@ function renderSettings(
 }
 
 describe("Settings v1 UI", () => {
+  /** 损坏文档不再把用户锁在错误页，恢复提示只引导到现有的完整模型编辑入口。 */
+  it("shows a non-blocking recovery notice and routes to models", async () => {
+    const user = userEvent.setup();
+    const onSectionChange = vi.fn();
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        recovery="user_config_corrupt"
+        ports={ports()}
+        desktop={desktop()}
+        section="general"
+        onSectionChange={onSectionChange}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={EXECUTION_SCOPE}
+      />,
+    );
+
+    expect(screen.getByRole("status", { name: "配置恢复模式" }).textContent).toContain(
+      "原文件尚未修改",
+    );
+    await user.click(screen.getByRole("button", { name: "配置服务商" }));
+    expect(onSectionChange).toHaveBeenCalledWith("models");
+  });
+
   /** 搜索需要先切换供应商再聚焦真实模型；同一搜索再次执行也必须生效。 */
   it("selects an unselected provider when opening its model search result", async () => {
     const user = userEvent.setup();

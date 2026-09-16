@@ -157,6 +157,24 @@ fn config_methods_are_closed() {
     assert!(!json!({"apiKey": "secret"}).to_string().is_empty());
 }
 
+/// Provider 编辑回显必须经过与执行端共享的窄 allowlist，避免新增方法只在入队或发送其中一端失配。
+#[test]
+fn configuration_request_methods_admit_only_the_provider_scoped_reveal() {
+    assert!(is_configuration_request_method(
+        "credential/reveal-provider"
+    ));
+    for method in [
+        "credential/reveal",
+        "credential/read",
+        "configuration/export",
+    ] {
+        assert!(
+            !is_configuration_request_method(method),
+            "unexpected configuration request method: {method}"
+        );
+    }
+}
+
 /// 重复 open 可能返回 Java 首次注册保存的名称；若拒绝该名称，renderer 建议不同本地 label 后，
 /// 合法持久 Workspace 将无法使用。
 #[test]

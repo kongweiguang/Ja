@@ -89,6 +89,40 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
+    /**
+     * 损坏用户层只能由携带原始字节版本的完整严格 replace 修复；patch 没有可靠的基线，不能
+     * 用局部内容覆盖未知损坏字段。该边界让设置页能提供恢复入口，同时保留并发修改保护。
+     */
+    @Test
+    void fullReplaceRepairsCorruptUserConfigurationWithOriginalCas() throws Exception {
+        Path config = homeDirectory().resolve("config.toml");
+        Files.writeString(config, "schema_version = 1\nproviders = [\n");
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult corrupt = service.read(null);
+            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, corrupt.user().status());
+            assertNull(corrupt.user().document());
+            assertNotEquals(ConfigurationStore.UNAVAILABLE_VERSION, corrupt.user().version());
+
+            ConfigurationError patchFailure = assertThrows(ConfigurationError.class, () -> service.patch(
+                    ConfigurationScope.USER, null, document(userDocument(
+                            "provider_recovered", "model_recovered", "recovered-model")),
+                    corrupt.user().version()));
+            assertEquals(ConfigurationError.Code.CORRUPT_CONFIG, patchFailure.code());
+
+            ConfigurationUseCase.MutationResult repaired = service.replace(
+                    ConfigurationScope.USER, null,
+                    document(userDocument("provider_recovered", "model_recovered", "recovered-model")),
+                    corrupt.user().version());
+            ConfigurationUseCase.ReadResult restored = service.read(null);
+
+            assertEquals(ConfigurationUseCase.LayerStatus.VALID, restored.user().status());
+            assertEquals(repaired.version(), restored.user().version());
+            assertEquals("provider_recovered", node(restored.effective())
+                    .path("default_provider_id").textValue());
+        }
+    }
+
     /** 固定不可读凭据文件的恢复边界，避免脱敏读取因空 CAS 版本崩溃并封死设置修复入口。 */
     @Test
     void unreadableCredentialStoreKeepsConfigurationRepairSnapshotAvailable() throws Exception {

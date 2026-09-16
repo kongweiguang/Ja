@@ -47,10 +47,23 @@ describe("settings v1 validation", () => {
     }
   });
 
-  it("rejects an unsafe URL", () => {
-    expect(
-      providerSchema.safeParse({ ...provider, baseUrl: "http://example.com/v1" }).success,
-    ).toBe(false);
+  /** Provider 可直接连接用户自建的远程 HTTP 网关，但 URL 不能成为凭据或请求参数的旁路。 */
+  it("accepts any HTTP(S) Provider host and rejects unsafe URL shapes", () => {
+    for (const baseUrl of [
+      "http://198.51.100.22:8080/v1",
+      "http://[2001:db8::22]:8080/v1",
+      "https://provider.example/v1",
+    ]) {
+      expect(providerSchema.safeParse({ ...provider, baseUrl }).success).toBe(true);
+    }
+    for (const baseUrl of [
+      "ftp://provider.example/v1",
+      "http://user:password@provider.example/v1",
+      "http://provider.example/v1?api_key=secret",
+      "http://provider.example/v1#fragment",
+    ]) {
+      expect(providerSchema.safeParse({ ...provider, baseUrl }).success).toBe(false);
+    }
   });
 
   it("requires model default reasoning to belong to the supported set", () => {

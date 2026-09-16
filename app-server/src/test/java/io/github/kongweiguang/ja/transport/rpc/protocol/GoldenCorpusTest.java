@@ -121,7 +121,8 @@ final class GoldenCorpusTest {
             Map.entry("configuration/replace", "configMutationResult"),
             Map.entry("configuration/reset", "configMutationResult"),
             Map.entry("credential/set", "credentialMutationResult"),
-            Map.entry("credential/delete", "credentialMutationResult"));
+            Map.entry("credential/delete", "credentialMutationResult"),
+            Map.entry("credential/reveal-provider", "credentialRevealProviderResult"));
 
     /** 遍历全部正向帧，防止协议主版本或配置事件边界在局部测试之外发生漂移。 */
     @Test

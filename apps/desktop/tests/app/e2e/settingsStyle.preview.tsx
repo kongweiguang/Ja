@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 /* eslint-disable react-refresh/only-export-components */
 
@@ -178,12 +179,14 @@ function createPreviewPorts(): SettingsPorts {
     onMoveProvider: async () => undefined,
     onSaveModel: async () => undefined,
     onTestModel: async () => ({ responseModel: "preview-model", latencyMs: 18 }),
+    onDiscoverModels: async () => ({ items: [], truncated: false }),
     onDeleteModel: async () => undefined,
     onMoveModel: async () => undefined,
     onDefaultSelectionChange: async () => undefined,
     onSubagentSettingsChange: async () => undefined,
     onReplaceCredential: async () => undefined,
     onClearCredential: async () => undefined,
+    onRevealProviderCredential: async () => null,
     onSaveMcp: async () => undefined,
     onDeleteMcp: async () => undefined,
     onTestMcp: async () => "error",

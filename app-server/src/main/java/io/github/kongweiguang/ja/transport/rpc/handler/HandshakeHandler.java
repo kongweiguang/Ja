@@ -47,7 +47,8 @@ public final class HandshakeHandler implements RpcHandler {
             "turn/change-set/read",
             "approval/respond", "configuration/read", "configuration/patch",
             "configuration/replace", "configuration/reset", "credential/set", "credential/delete",
-            "skill/list", "mcp/list", "mcp/test", "model/test",
+            "credential/reveal-provider",
+            "skill/list", "mcp/list", "mcp/test", "model/test", "model/discover",
             "mcp/list-tools", "tool/artifact/read");
     static final List<String> EVENTS = List.of(
             "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",

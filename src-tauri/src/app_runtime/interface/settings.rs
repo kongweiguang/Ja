@@ -5,7 +5,8 @@
 
 use super::settings_model::{SettingsQueryInput, validate_result};
 use crate::app_runtime::{
-    McpListParams, McpTestParams, McpToolsReadParams, ModelTestParams, RuntimeCommandError,
+    McpListParams, McpTestParams, McpToolsReadParams, ModelDiscoverParams, ModelTestParams,
+    RuntimeCommandError,
     RuntimeHost, SettingsRequest, SettingsResponse, SkillListParams,
 };
 use serde_json::Value;
@@ -32,6 +33,9 @@ pub fn ja_runtime_query(
         super::settings_model::SettingsQueryMethod::ModelTest => {
             SettingsRequest::ModelTest(ModelTestParams::try_new(bytes)?)
         }
+        super::settings_model::SettingsQueryMethod::ModelDiscover => {
+            SettingsRequest::ModelDiscover(ModelDiscoverParams::try_new(bytes)?)
+        }
         super::settings_model::SettingsQueryMethod::McpToolsRead => {
             SettingsRequest::McpToolsRead(McpToolsReadParams::try_new(bytes)?)
         }
@@ -52,6 +56,10 @@ pub fn ja_runtime_query(
         (
             super::settings_model::SettingsQueryMethod::ModelTest,
             SettingsResponse::ModelTest(value),
+        ) => value.into_bytes(),
+        (
+            super::settings_model::SettingsQueryMethod::ModelDiscover,
+            SettingsResponse::ModelDiscover(value),
         ) => value.into_bytes(),
         (
             super::settings_model::SettingsQueryMethod::McpToolsRead,

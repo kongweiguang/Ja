@@ -196,7 +196,10 @@ function runtimeWithEvents(): {
 }
 
 /** 返回指定 UI 文档的脱敏 Settings adapter，避免 Shell 测试绕过真实配置门禁。 */
-function settings(document: SettingsDocument = emptyDocument): SettingsAdapter {
+function settings(
+  document: SettingsDocument = emptyDocument,
+  recovery?: LoadedSettings["recovery"],
+): SettingsAdapter {
   const loaded: LoadedSettings = {
     document,
     userDocument: document,
@@ -211,6 +214,7 @@ function settings(document: SettingsDocument = emptyDocument): SettingsAdapter {
       projectVersion: "cfg_project_1",
       credentialVersion: "cfg_credential_1",
     },
+    ...(recovery === undefined ? {} : { recovery }),
   };
   return {
     snapshot: vi.fn(async () => loaded),
@@ -219,6 +223,7 @@ function settings(document: SettingsDocument = emptyDocument): SettingsAdapter {
     reset: vi.fn(async () => ({ version: "cfg_project_2" })),
     setCredential: vi.fn(async () => "cfg_credential_2"),
     deleteCredential: vi.fn(async () => "cfg_credential_2"),
+    revealProviderCredential: vi.fn(async () => null),
   };
 }
 
@@ -344,6 +349,26 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(workspacePanels).toHaveAttribute("hidden");
     expect(workspacePanels).toHaveAttribute("aria-hidden", "true");
     expect(container.querySelector(".ja-navigation-sidebar")).toBeNull();
+  });
+
+  /** 用户配置语义损坏时仍可进入实际设置页，不能退回不可操作的读取错误屏。 */
+  it("keeps settings usable when the adapter enters configuration recovery mode", async () => {
+    render(
+      <App
+        runtime={runtime()}
+        settingsAdapter={settings(emptyDocument, "user_config_corrupt")}
+        historyAdapter={history()}
+        projectPicker={{ pick: vi.fn(async () => null) }}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("region", { name: "设置页面" })).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "配置恢复模式" })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("heading", { name: "设置暂时不可用" })).not.toBeInTheDocument();
   });
 
   /** 启动失败不能替换对话，恢复动作必须由左下角状态提供。 */

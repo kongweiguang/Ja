@@ -203,10 +203,10 @@ function consumeFrame(frame: JsonObject, state: ConsumptionState): void {
     }
     return;
   }
-  const response = parseResponse(frame);
   if (id === undefined) throw new Error("response id is missing");
   const originatingMethod = state.pending.get(id);
   if (originatingMethod === undefined) throw new Error("response is not correlated");
+  const response = parseResponse(frame, originatingMethod as never);
   state.pending.delete(id);
   if ("result" in response) {
     const result = parseMethodResult(originatingMethod as never, response.result);

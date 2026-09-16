@@ -27,6 +27,7 @@ commands.allow = [
   "ja_configuration_replace",
   "ja_configuration_reset",
   "ja_credential_delete",
+  "ja_credential_reveal_provider",
   "ja_credential_set",
   "ja_native_shortcut_context_activate",
   "ja_native_shortcut_context_update",

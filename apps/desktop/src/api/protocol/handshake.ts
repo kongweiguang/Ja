@@ -256,7 +256,8 @@ export class ReadyHandshake {
     // 先识别协议唯一允许携带 challenge/credential 的精确字段路径，其他相似键仍按泄漏处理。
     const root =
       value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
-    const allowCredentialSecret = root?.["method"] === "credential/set";
+    const allowCredentialSecretPath =
+      root?.["method"] === "credential/set" ? (["params", "secret"] as const) : undefined;
     const allowChallengePath =
       root?.["method"] === "runtime/initialized" ||
       (root?.["method"] === "runtime/status-changed" &&
@@ -273,7 +274,7 @@ export class ReadyHandshake {
         }
         return usedFingerprints.includes(fingerprintReadyToken(candidate));
       },
-      allowCredentialSecret,
+      allowCredentialSecretPath,
     });
   }
 

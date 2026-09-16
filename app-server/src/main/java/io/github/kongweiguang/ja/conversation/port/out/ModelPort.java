@@ -43,6 +43,27 @@ public interface ModelPort {
     }
 
     /**
+     * 从已保存 Provider 的凭据和端点读取上游模型目录；默认实现刻意失败关闭，避免测试替身或
+     * 未支持的运行时把目录读取伪装成成功。
+     */
+    default CompletionStage<ModelDiscoveryResult> discoverModels(
+            ModelDiscoveryRequest request, CancellationToken cancellationToken) {
+        Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(cancellationToken, "cancellationToken");
+        cancellationToken.throwIfCancellationRequested();
+        throw new UnsupportedOperationException("upstream model discovery is not implemented");
+    }
+
+    /** 让普通模型调用和目录读取共享同一网络时限，避免任一入口放宽连接资源上限。 */
+    private static Duration boundedTimeout(Duration value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.isZero() || value.isNegative() || value.compareTo(Duration.ofHours(1)) > 0) {
+            throw new IllegalArgumentException(name + " must be in (0, 1h]");
+        }
+        return value;
+    }
+
+    /**
      * 启动一次有界模型响应，并通过 Sink 顺序发布规范事件。
      */
     CompletionStage<ModelOutcome> start(
@@ -145,7 +166,8 @@ public interface ModelPort {
             Set<InputModality> inputModalities,
             GenerationOptions generation) {
         /**
-         * 只接受显式 Wire API 和 HTTPS 端点；loopback HTTP 仅供隔离测试。
+         * Provider 可连接用户明确配置的任意 HTTP(S) 主机；仍拒绝内嵌凭据和查询片段，
+         * 使 API Key 只能沿专用凭据通道传递而非藏在 Base URL 中。
          */
         public ModelConfiguration {
             providerId = ContractChecks.identifier(providerId, "providerId");
@@ -154,10 +176,10 @@ public interface ModelPort {
             Objects.requireNonNull(api, "api");
             model = ContractChecks.text(model, "model", 512, false);
             Objects.requireNonNull(baseUri, "baseUri");
-            if (!baseUri.isAbsolute() || baseUri.getHost() == null
+            if (!baseUri.isAbsolute() || baseUri.getHost() == null || baseUri.getHost().isBlank()
                 || baseUri.getUserInfo() != null || baseUri.getQuery() != null || baseUri.getFragment() != null
-                || !("https".equalsIgnoreCase(baseUri.getScheme()) || isLoopbackHttp(baseUri))) {
-                throw new IllegalArgumentException("baseUri must be HTTPS or loopback HTTP");
+                || !("https".equalsIgnoreCase(baseUri.getScheme()) || "http".equalsIgnoreCase(baseUri.getScheme()))) {
+                throw new IllegalArgumentException("baseUri must be HTTP or HTTPS");
             }
             apiKey = ContractChecks.text(apiKey, "apiKey", 8_192, false);
             if (apiKey.chars().anyMatch(Character::isISOControl)) {
@@ -185,17 +207,55 @@ public interface ModelPort {
                    + ", generation=" + generation + "]";
         }
 
+    }
+
+    /**
+     * 一次模型目录读取所需的最小冻结 Provider 信封。它不借用 {@link ModelConfiguration}，因为
+     * 目录读取在模型尚未被保存前就有意义，强行构造虚假 modelId 会模糊配置所有权。
+     */
+    record ModelDiscoveryRequest(
+            String providerId,
+            String configGeneration,
+            Api api,
+            URI baseUri,
+            String apiKey,
+            Duration connectTimeout,
+            Duration requestTimeout) {
         /**
-         * 仅为本机测试允许明文 HTTP，生产远端端点必须使用 HTTPS。
+         * 与正式调用使用同一 URL、Secret 和超时边界，使发现结果只来自当前配置代际，且不会把
+         * 凭据藏进 URL 或放宽网络资源上限。
          */
-        private static boolean isLoopbackHttp(URI uri) {
-            String host = uri.getHost();
-            return "http".equalsIgnoreCase(uri.getScheme())
-                   && ("localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host) || "::1".equals(host));
+        public ModelDiscoveryRequest {
+            providerId = ContractChecks.identifier(providerId, "providerId");
+            configGeneration = ContractChecks.configurationGeneration(configGeneration);
+            Objects.requireNonNull(api, "api");
+            Objects.requireNonNull(baseUri, "baseUri");
+            if (!baseUri.isAbsolute() || baseUri.getHost() == null || baseUri.getHost().isBlank()
+                || baseUri.getUserInfo() != null || baseUri.getQuery() != null || baseUri.getFragment() != null
+                || !("https".equalsIgnoreCase(baseUri.getScheme()) || "http".equalsIgnoreCase(baseUri.getScheme()))) {
+                throw new IllegalArgumentException("baseUri must be HTTP or HTTPS");
+            }
+            apiKey = ContractChecks.text(apiKey, "apiKey", 8_192, false);
+            if (apiKey.chars().anyMatch(Character::isISOControl)) {
+                throw new IllegalArgumentException("apiKey contains control characters");
+            }
+            connectTimeout = boundedTimeout(connectTimeout, "connectTimeout");
+            requestTimeout = boundedTimeout(requestTimeout, "requestTimeout");
         }
 
         /**
-         * 限制网络超时，避免配置错误制造无限占用的 Provider 请求。
+         * 目录读取日志只保留可关联的非敏感身份，防止 record 默认输出泄露 API Key。
+         */
+        @Override
+        public String toString() {
+            return "ModelDiscoveryRequest[providerId=" + providerId + ", configGeneration="
+                    + configGeneration + ", api=" + api + ", baseUri=" + baseUri
+                    + ", apiKey=<redacted>, connectTimeout=" + connectTimeout
+                    + ", requestTimeout=" + requestTimeout + "]";
+        }
+
+        /**
+         * 与正式模型配置相同地限制网络时间，目录调用不能成为规避 Provider 资源上限的旁路。
          */
         private static Duration boundedTimeout(Duration value, String name) {
             Objects.requireNonNull(value, name);
@@ -203,6 +263,24 @@ public interface ModelPort {
                 throw new IllegalArgumentException(name + " must be in (0, 1h]");
             }
             return value;
+        }
+    }
+
+    /**
+     * 上游目录的最小投影；结果只含模型标识和截断事实，不携带厂商对象、能力推断或任意元数据。
+     */
+    record ModelDiscoveryResult(List<String> items, boolean truncated) {
+        /**
+         * 固定单次返回上限并拒绝控制字符、重复项与超长标识，让结果可以安全地进入 Rust/React
+         * 的受限 IPC 投影，且前端无需相信上游未经校验的字段。
+         */
+        public ModelDiscoveryResult {
+            items = List.copyOf(Objects.requireNonNull(items, "items"));
+            if (items.size() > 200 || items.stream().anyMatch(item -> item == null || item.isBlank()
+                    || item.length() > 512 || item.chars().anyMatch(Character::isISOControl))
+                    || items.stream().distinct().count() != items.size()) {
+                throw new IllegalArgumentException("invalid model discovery result");
+            }
         }
     }
 

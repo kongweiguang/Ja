@@ -229,11 +229,13 @@ export const ClientMethodSchema = z.enum([
   "configuration/reset",
   "credential/set",
   "credential/delete",
+  "credential/reveal-provider",
   "approval/respond",
   "skill/list",
   "mcp/list",
   "mcp/test",
   "model/test",
+  "model/discover",
   "mcp/list-tools",
   "tool/artifact/read",
 ]);
@@ -916,6 +918,10 @@ const CredentialDeleteResultSchema = z
     version: ConfigVersionSchema,
   })
   .strict();
+/** Provider 编辑场景唯一允许回显 Secret 的响应，不能复用到配置读取或 MCP 身份。 */
+const CredentialRevealProviderResultSchema = z
+  .object({ secret: SecretValueSchema.nullable() })
+  .strict();
 const WorkspaceOpenParamsSchema = z
   .object({ cwd: CwdSchema, displayName: SafeNameSchema.optional() })
   .strict();
@@ -1126,6 +1132,8 @@ const McpTestParamsSchema = z.object({ mcpId: McpIdSchema }).strict();
 const ModelTestParamsSchema = z
   .object({ providerId: ProviderIdSchema, modelId: ModelIdSchema })
   .strict();
+/** 模型目录只按已保存 Provider 身份查询，Base URL、协议和 API Key 不能从 WebView 透传。 */
+const ModelDiscoverParamsSchema = z.object({ providerId: ProviderIdSchema }).strict();
 const McpToolsReadParamsSchema = z.object({ mcpId: McpIdSchema, ...pageParams }).strict();
 const ToolArtifactReadParamsSchema = z
   .object({
@@ -1179,6 +1187,8 @@ const CredentialSetParamsSchema = z
 const CredentialDeleteParamsSchema = z
   .object({ credentialId: CredentialRefSchema, expectedVersion: ConfigVersionSchema })
   .strict();
+/** 只接受 Provider identity，服务端自行解析绑定凭据，客户端不得直接读取 credentialId。 */
+const CredentialRevealProviderParamsSchema = z.object({ providerId: ProviderIdSchema }).strict();
 
 export const ParamsSchemaByMethod = {
   "runtime/initialize": InitializeParamsSchema,
@@ -1234,11 +1244,13 @@ export const ParamsSchemaByMethod = {
   "configuration/reset": ConfigurationResetParamsSchema,
   "credential/set": CredentialSetParamsSchema,
   "credential/delete": CredentialDeleteParamsSchema,
+  "credential/reveal-provider": CredentialRevealProviderParamsSchema,
   "approval/respond": ApprovalRespondParamsSchema,
   "skill/list": SkillListParamsSchema,
   "mcp/list": McpListParamsSchema,
   "mcp/test": McpTestParamsSchema,
   "model/test": ModelTestParamsSchema,
+  "model/discover": ModelDiscoverParamsSchema,
   "mcp/list-tools": McpToolsReadParamsSchema,
   "tool/artifact/read": ToolArtifactReadParamsSchema,
 } satisfies Record<z.infer<typeof ClientMethodSchema>, z.ZodTypeAny>;
@@ -1465,6 +1477,15 @@ const modelTestResultSchema = z
   .object({
     responseModel: z.string().min(1).max(512).refine(noNulCharacters, "model contains NUL"),
     latencyMs: z.number().int().min(0).max(3_600_000),
+  })
+  .strict();
+/** 单页模型目录保留原始上游标识，允许 `/` 等非 Ja 内部 modelId 字符但拒绝空值和控制字符。 */
+const modelDiscoverResultSchema = z
+  .object({
+    items: z
+      .array(z.string().min(1).max(512).refine(noNulCharacters, "model contains NUL"))
+      .max(200),
+    truncated: z.boolean(),
   })
   .strict();
 const mcpToolSchema = z
@@ -2009,11 +2030,13 @@ export const ResultSchemaByMethod = {
   "configuration/reset": ConfigWriteResultSchema,
   "credential/set": CredentialSetResultSchema,
   "credential/delete": CredentialDeleteResultSchema,
+  "credential/reveal-provider": CredentialRevealProviderResultSchema,
   "approval/respond": approvalRespondResultSchema,
   "skill/list": skillPageResultSchema,
   "mcp/list": mcpPageResultSchema,
   "mcp/test": mcpTestResultSchema,
   "model/test": modelTestResultSchema,
+  "model/discover": modelDiscoverResultSchema,
   "mcp/list-tools": mcpToolsResultSchema,
   "tool/artifact/read": toolArtifactReadResultSchema,
 } satisfies Record<z.infer<typeof ClientMethodSchema>, z.ZodTypeAny>;
@@ -2639,7 +2662,7 @@ export type InitializedNotification = z.infer<typeof InitializedNotificationSche
 
 interface PayloadSafetyOptions {
   allowConfigSecrets?: boolean;
-  allowCredentialSecret?: boolean;
+  allowCredentialSecretPath?: readonly string[];
   allowAuthorizationPath?: readonly string[];
 }
 
@@ -2655,6 +2678,18 @@ const SENSITIVE_KEYS = new Set([
   "credential",
   "cookie",
 ]);
+
+/** 敏感字段只能出现在调用方声明的完整路径，避免方法级例外放宽到嵌套或旁路 payload。 */
+function matchesAllowedPath(
+  path: readonly string[],
+  expected: readonly string[] | undefined,
+): boolean {
+  return (
+    expected !== undefined &&
+    path.length === expected.length &&
+    path.every((part, index) => part === expected[index])
+  );
+}
 
 /** Schema 投影前拒绝环、prototype pollution、超大树和 secret 形状输出。 */
 export function assertSafePayload(value: unknown, options: PayloadSafetyOptions = {}): void {
@@ -2676,12 +2711,11 @@ export function assertSafePayload(value: unknown, options: PayloadSafetyOptions 
       const childPath = [...path, key];
       const allowedAuthorization =
         normalized === "authorization" &&
-        options.allowAuthorizationPath !== undefined &&
-        childPath.length === options.allowAuthorizationPath.length &&
-        childPath.every((part, index) => part === options.allowAuthorizationPath?.[index]);
+        matchesAllowedPath(childPath, options.allowAuthorizationPath);
       const allowedSecret =
         (options.allowConfigSecrets && (normalized === "apikey" || normalized === "secretvalue")) ||
-        (options.allowCredentialSecret && normalized === "secret") ||
+        (normalized === "secret" &&
+          matchesAllowedPath(childPath, options.allowCredentialSecretPath)) ||
         allowedAuthorization;
       if (
         key === "__proto__" ||
@@ -2704,7 +2738,7 @@ interface ReadyTokenLeakOptions {
   knownTokenFingerprints?: readonly string[];
   isKnownReadyToken?: (value: string) => boolean;
   allowConfigSecrets?: boolean;
-  allowCredentialSecret?: boolean;
+  allowCredentialSecretPath?: readonly string[];
   allowAuthorizationPath?: readonly string[];
 }
 
@@ -2712,7 +2746,7 @@ interface ReadyTokenLeakOptions {
 export function assertNoReadyTokenLeak(value: unknown, options: ReadyTokenLeakOptions = {}): void {
   assertSafePayload(value, {
     allowConfigSecrets: options.allowConfigSecrets,
-    allowCredentialSecret: options.allowCredentialSecret,
+    allowCredentialSecretPath: options.allowCredentialSecretPath,
     allowAuthorizationPath: options.allowAuthorizationPath,
   });
   const knownFingerprints = new Set(options.knownTokenFingerprints ?? []);
@@ -2742,7 +2776,7 @@ export function assertNoReadyTokenLeak(value: unknown, options: ReadyTokenLeakOp
       const childPath = [...path, key];
       const secretPath =
         (options.allowConfigSecrets && (key === "apiKey" || key === "secretValue")) ||
-        (options.allowCredentialSecret && key === "secret");
+        (key === "secret" && matchesAllowedPath(childPath, options.allowCredentialSecretPath));
       if (containsKnownToken(key) || (key === "readyToken" && !allowedPath(childPath)))
         throw new Error("readyToken key is not allowed");
       if (!secretPath) visit(child, childPath);
@@ -2762,10 +2796,11 @@ export function parseRequest(value: unknown): RequestEnvelope {
     typeof (value as Record<string, unknown>)["method"] === "string"
       ? (value as Record<string, unknown>)["method"]
       : undefined;
-  const allowCredentialSecret = method === "credential/set";
+  const allowCredentialSecretPath =
+    method === "credential/set" ? (["params", "secret"] as const) : undefined;
   const allowAuthorizationPath =
     method === "attachment/preview/open" ? (["params", "authorization"] as const) : undefined;
-  assertNoReadyTokenLeak(value, { allowCredentialSecret, allowAuthorizationPath });
+  assertNoReadyTokenLeak(value, { allowCredentialSecretPath, allowAuthorizationPath });
   const request = RequestEnvelopeSchema.parse(value);
   ParamsSchemaByMethod[request.method].parse(request.params);
   return request;
@@ -2777,9 +2812,14 @@ export function parseInitializedNotification(value: unknown): InitializedNotific
   return InitializedNotificationSchema.parse(value);
 }
 
-/** pending 关联或结果分派前先校验响应 envelope。 */
-export function parseResponse(value: unknown): ResponseEnvelope {
-  assertNoReadyTokenLeak(value);
+/** pending 关联后按原请求方法校验响应，确保 API Key 例外只对回显方法的顶层结果生效。 */
+export function parseResponse(
+  value: unknown,
+  requestMethod?: RequestEnvelope["method"],
+): ResponseEnvelope {
+  const allowCredentialSecretPath =
+    requestMethod === "credential/reveal-provider" ? (["result", "secret"] as const) : undefined;
+  assertNoReadyTokenLeak(value, { allowCredentialSecretPath });
   return ResponseEnvelopeSchema.parse(value);
 }
 

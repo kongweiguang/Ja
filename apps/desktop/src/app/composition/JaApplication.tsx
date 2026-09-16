@@ -397,6 +397,7 @@ export function JaApplication({
       listMcpServers: () => queryRuntime("mcp/list", {}),
       testMcp: (mcpRevision) => queryRuntime("mcp/test", { mcpId: mcpRevision }),
       testModel: (providerId, modelId) => queryRuntime("model/test", { providerId, modelId }),
+      discoverModels: (providerId) => queryRuntime("model/discover", { providerId }),
       listMcpTools: (mcpRevision) => queryRuntime("mcp/list-tools", { mcpId: mcpRevision }),
     }),
     [queryRuntime],

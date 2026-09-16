@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.anthropic.Ant
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiChatCompletionsAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.openai.OpenAiResponsesAdapter;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ModelTransport;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.ModelCatalogClient;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.summary.HttpSummaryModel;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryModel;
 import io.github.kongweiguang.ja.conversation.port.out.ModelEventSink;
@@ -63,6 +64,17 @@ public final class ModelAdapterFactory implements ModelPort, SummaryModel.Factor
             case OPENAI_RESPONSES -> OpenAiResponsesAdapter.nativeAttachmentSupport();
             case OPENAI_CHAT_COMPLETIONS -> OpenAiChatCompletionsAdapter.nativeAttachmentSupport();
         };
+    }
+
+    /**
+     * 模型目录读取复用唯一共享传输及其取消、超时与关闭门禁；Factory 不把 API Key 返回给调用方，
+     * 只把受限的模型标识投影交给 catalog 应用层。
+     */
+    @Override
+    public CompletionStage<ModelPort.ModelDiscoveryResult> discoverModels(
+            ModelPort.ModelDiscoveryRequest request, CancellationToken cancellationToken) {
+        return ModelCatalogClient.discover(transport, Objects.requireNonNull(request, "request"),
+                Objects.requireNonNull(cancellationToken, "cancellationToken"));
     }
 
     /**

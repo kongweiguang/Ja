@@ -10,17 +10,18 @@ use crate::app_runtime::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
     ConfigurationPatchResult, ConfigurationReadResult, ConfigurationReplaceResult,
     ConfigurationRequest, ConfigurationResetResult, ConfigurationResponse, CredentialDeleteResult,
-    CredentialSetResult, EventSink, GoalMethod, GoalPayload, GoalRequest, GoalResponse,
-    HistoryRequest, HistoryResponse, InputQueue, LaunchConfig, McpListResultData,
-    McpTestResultData, McpToolsReadResultData, ModelTestResultData, QueuedInput, QueuedInputIssue,
-    RuntimeBridgePort, RuntimeCommandError, RuntimeStatus, RuntimeStatusKind, SettingsRequest,
-    SettingsResponse, SkillListResultData, TaskActivity, TaskCloseInput, TaskCloseResult,
-    TaskContextSeed, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
-    TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput, TaskMessageResult,
-    TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult,
-    TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput,
-    ThreadArchiveResultData, ThreadCompactResultData, ThreadCreateResultData,
-    ThreadDeleteResultData, ThreadDiscoverResultData, ThreadListResultData, ThreadPinResultData,
+    CredentialRevealProviderResult, CredentialSetResult, EventSink, GoalMethod, GoalPayload,
+    GoalRequest, GoalResponse, HistoryRequest, HistoryResponse, InputQueue, LaunchConfig,
+    McpListResultData, McpTestResultData, McpToolsReadResultData, ModelDiscoverResultData,
+    ModelTestResultData, QueuedInput, QueuedInputIssue, RuntimeBridgePort, RuntimeCommandError,
+    RuntimeStatus, RuntimeStatusKind, SettingsRequest, SettingsResponse, SkillListResultData,
+    TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextSeed, TaskCreateInput,
+    TaskCreateResult, TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult,
+    TaskMailboxMessage, TaskMessageInput, TaskMessageResult, TaskMutationInput, TaskObserveInput,
+    TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
+    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ThreadArchiveResultData,
+    ThreadCompactResultData, ThreadCreateResultData, ThreadDeleteResultData,
+    ThreadDiscoverResultData, ThreadListResultData, ThreadPinResultData,
     ThreadPreferencesUpdateResultData, ThreadReadResultData, ThreadRenameResultData,
     ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData, ToolArtifactReadInput,
     ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
@@ -108,6 +109,7 @@ pub(crate) enum SettingsQueryMethod {
     McpList,
     McpTest,
     ModelTest,
+    ModelDiscover,
     McpToolsRead,
 }
 
@@ -119,9 +121,27 @@ impl SettingsQueryMethod {
             Self::McpList => "mcp/list",
             Self::McpTest => "mcp/test",
             Self::ModelTest => "model/test",
+            Self::ModelDiscover => "model/discover",
             Self::McpToolsRead => "mcp/list-tools",
         }
     }
+}
+
+/**
+ * 配置与凭据请求必须在 actor 入队前和实际 sidecar 发送前使用同一闭集，避免前者接纳、后者
+ * 拒绝导致调用方只能得到模糊的运行时错误。Provider 专用回显仍不允许自由 credentialId。
+ */
+pub(crate) fn is_configuration_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "configuration/read"
+            | "configuration/patch"
+            | "configuration/replace"
+            | "configuration/reset"
+            | "credential/set"
+            | "credential/delete"
+            | "credential/reveal-provider"
+    )
 }
 
 const TERMINAL_NONE: u8 = 0;
@@ -340,15 +360,7 @@ impl RuntimeBridge {
         method: &'static str,
         params: Value,
     ) -> Result<Value, RuntimeCommandError> {
-        if !matches!(
-            method,
-            "configuration/read"
-                | "configuration/patch"
-                | "configuration/replace"
-                | "configuration/reset"
-                | "credential/set"
-                | "credential/delete"
-        ) {
+        if !is_configuration_request_method(method) {
             return Err(RuntimeCommandError::invalid_params());
         }
         self.call(|reply| BridgeCommand::Config {
@@ -788,6 +800,14 @@ impl RuntimeBridgePort for RuntimeBridge {
                     )?)?)?,
                 ))
             }
+            ConfigurationRequest::CredentialRevealProvider(params) => {
+                Ok(ConfigurationResponse::CredentialRevealProvider(
+                    CredentialRevealProviderResult::try_new(encode_result(self.config_request(
+                        "credential/reveal-provider",
+                        decode_params(params.into_bytes())?,
+                    )?)?)?,
+                ))
+            }
         }
     }
 
@@ -1136,6 +1156,12 @@ impl RuntimeBridgePort for RuntimeBridge {
                 SettingsQueryMethod::ModelTest,
                 SettingsResponse::ModelTest,
                 ModelTestResultData
+            ),
+            SettingsRequest::ModelDiscover(params) => dispatch_settings!(
+                params,
+                SettingsQueryMethod::ModelDiscover,
+                SettingsResponse::ModelDiscover,
+                ModelDiscoverResultData
             ),
             SettingsRequest::McpToolsRead(params) => dispatch_settings!(
                 params,

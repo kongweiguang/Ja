@@ -67,6 +67,25 @@ fn cas_write_dtos_reject_missing_and_null_expected_version() {
     }));
 }
 
+/// 回显只按 Provider identity 路由，Rust 先拒绝缺失、null、未知字段和非不透明 Provider ID，
+/// 防止 renderer 将该窄通道扩展为按任意 credential 读取 Secret 的通道。
+#[test]
+fn provider_credential_reveal_input_rejects_malformed_provider_identity() {
+    let valid: CredentialRevealProviderInput = serde_json::from_value(json!({
+        "providerId": "provider_demo"
+    }))
+    .expect("provider reveal input");
+    assert_eq!(valid.provider_id, "provider_demo");
+
+    for input in [
+        json!({}),
+        json!({"providerId": null}),
+        json!({"providerId": "provider_demo", "credentialId": "cred_other"}),
+    ] {
+        assert!(serde_json::from_value::<CredentialRevealProviderInput>(input).is_err());
+    }
+}
+
 /// 用户级写入必须省略 workspaceId 而不是发送 null，因为严格 Java v1 handler 会把字段存在视为项目写入声明。
 #[test]
 fn user_scope_write_dtos_omit_workspace_identity() {

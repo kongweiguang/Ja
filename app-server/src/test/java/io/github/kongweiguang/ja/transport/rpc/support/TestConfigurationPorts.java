@@ -66,6 +66,12 @@ public class TestConfigurationPorts implements ConfigurationUseCase, Configurati
         throw unavailableFailure();
     }
 
+    /** 默认夹具不持有 API Key；只有明确覆盖的 Provider 编辑测试才能观察回显。 */
+    @Override
+    public String revealProviderCredential(String providerId) {
+        throw unavailableFailure();
+    }
+
     /** 返回稳定退化状态，使 runtime/health 测试无需打开真实配置文件。 */
     @Override
     public HealthResult health() {

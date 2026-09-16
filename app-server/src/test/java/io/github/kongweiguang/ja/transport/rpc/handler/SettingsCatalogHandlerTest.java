@@ -71,7 +71,8 @@ final class SettingsCatalogHandlerTest {
             SettingsCatalogHandler handler = new SettingsCatalogHandler(session);
 
             assertEquals(Set.of(RpcMethod.SKILL_LIST, RpcMethod.MCP_LIST,
-                    RpcMethod.MCP_TEST, RpcMethod.MODEL_TEST, RpcMethod.MCP_LIST_TOOLS), handler.methods());
+                    RpcMethod.MCP_TEST, RpcMethod.MODEL_TEST, RpcMethod.MODEL_DISCOVER,
+                    RpcMethod.MCP_LIST_TOOLS), handler.methods());
 
             ObjectNode skillPage = invoke(handler, RpcMethod.SKILL_LIST,
                     mapper.createObjectNode().put("workspaceId", "ws_fixture").put("limit", 1));
@@ -99,6 +100,12 @@ final class SettingsCatalogHandlerTest {
             assertEquals(Set.of("responseModel", "latencyMs"), fields(modelTest));
             assertEquals("fixture-model", modelTest.path("responseModel").asText());
 
+            ObjectNode discovered = invoke(handler, RpcMethod.MODEL_DISCOVER,
+                    mapper.createObjectNode().put("providerId", "provider_fixture"));
+            assertEquals(Set.of("items", "truncated"), fields(discovered));
+            assertEquals("fixture-model", discovered.path("items").path(0).asText());
+            assertEquals(false, discovered.path("truncated").asBoolean());
+
             ObjectNode toolPage = invoke(handler, RpcMethod.MCP_LIST_TOOLS,
                     mapper.createObjectNode().put("mcpId", MCP_ID).put("limit", 1));
             assertEquals(Set.of("items", "nextCursor"), fields(toolPage));
@@ -118,7 +125,9 @@ final class SettingsCatalogHandlerTest {
             assertThrows(JaRpcException.class, () -> invoke(handler, RpcMethod.MODEL_TEST,
                     mapper.createObjectNode().put("providerId", "provider_fixture")
                             .put("modelId", "../secret")));
-            assertEquals(5, catalog.calls.get());
+            assertThrows(JaRpcException.class, () -> invoke(handler, RpcMethod.MODEL_DISCOVER,
+                    mapper.createObjectNode().put("providerId", "../secret")));
+            assertEquals(6, catalog.calls.get());
         }
     }
 
@@ -201,6 +210,15 @@ final class SettingsCatalogHandlerTest {
             assertEquals("provider_fixture", providerId);
             assertEquals("model_fixture", modelId);
             return CompletableFuture.completedFuture(new ModelTestResult("fixture-model", 17));
+        }
+
+        /** 返回单页上游目录投影，确认 Handler 只透传 Provider 身份及连接取消令牌。 */
+        @Override
+        public CompletionStage<ModelDiscoveryResult> discoverModels(
+                String providerId, CancellationToken cancellationToken) {
+            admit();
+            assertEquals("provider_fixture", providerId);
+            return CompletableFuture.completedFuture(new ModelDiscoveryResult(List.of("fixture-model"), false));
         }
 
         /** 返回规范 JSON Schema 文本，Jackson 解析只允许发生在 Wire 边界。 */

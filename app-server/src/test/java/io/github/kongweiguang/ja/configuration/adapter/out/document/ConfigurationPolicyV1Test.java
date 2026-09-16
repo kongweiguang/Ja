@@ -84,6 +84,18 @@ final class ConfigurationPolicyV1Test {
         }
     }
 
+    /** 用户自建网关可使用任意 IPv4/IPv6 HTTP 地址，文件校验不再把它限制为 loopback。 */
+    @Test
+    void remoteHttpProviderRoutesAreAccepted() {
+        for (String baseUrl : java.util.List.of(
+                "http://198.51.100.22:8080/v1", "http://[2001:db8::22]:8080/v1")) {
+            ObjectNode document = userDocument();
+            ((ObjectNode) document.withArray("providers").get(0)).put("base_url", baseUrl);
+
+            ConfigurationPolicy.validateDocument(document, ConfigurationScope.USER);
+        }
+    }
+
     /** Provider 对象拒绝闭集外字段，路由只能来自当前 API 规范。 */
     @Test
     void providerRejectsUnknownField() {

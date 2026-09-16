@@ -23,6 +23,7 @@ pub(crate) enum SettingsQueryMethod {
     McpList,
     McpTest,
     ModelTest,
+    ModelDiscover,
     McpToolsRead,
 }
 
@@ -35,6 +36,7 @@ impl SettingsQueryMethod {
             "mcp/list" => Ok(Self::McpList),
             "mcp/test" => Ok(Self::McpTest),
             "model/test" => Ok(Self::ModelTest),
+            "model/discover" => Ok(Self::ModelDiscover),
             "mcp/list-tools" => Ok(Self::McpToolsRead),
             _ => Err(RuntimeCommandError::invalid_params()),
         }
@@ -77,6 +79,12 @@ impl SettingsQueryInput {
                 }
                 required_id(object, "providerId", "provider_")?;
                 required_id(object, "modelId", "model_")?;
+            }
+            SettingsQueryMethod::ModelDiscover => {
+                if object.len() != 1 {
+                    return Err(RuntimeCommandError::invalid_params());
+                }
+                required_id(object, "providerId", "provider_")?;
             }
             SettingsQueryMethod::McpToolsRead => {
                 if object
@@ -144,13 +152,16 @@ pub(crate) fn validate_result(
     let max_rows = match method {
         SettingsQueryMethod::SkillList | SettingsQueryMethod::McpList => MAX_ROWS,
         SettingsQueryMethod::McpTest | SettingsQueryMethod::ModelTest => 0,
+        SettingsQueryMethod::ModelDiscover => MAX_ROWS,
         SettingsQueryMethod::McpToolsRead => MAX_TOOLS,
     };
     let array_name = match method {
         SettingsQueryMethod::SkillList
         | SettingsQueryMethod::McpList
         | SettingsQueryMethod::McpToolsRead => Some("items"),
-        SettingsQueryMethod::McpTest | SettingsQueryMethod::ModelTest => None,
+        SettingsQueryMethod::McpTest
+        | SettingsQueryMethod::ModelTest
+        | SettingsQueryMethod::ModelDiscover => None,
     };
     if let Some(name) = array_name {
         if object.len() != 2 || !object.contains_key("items") || !object.contains_key("nextCursor")
@@ -188,6 +199,18 @@ pub(crate) fn validate_result(
                 .get("latencyMs")
                 .and_then(Value::as_u64)
                 .is_none_or(|value| value > 3_600_000))
+    {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    if method == SettingsQueryMethod::ModelDiscover
+        && (object.len() != 2
+            || !object
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.len() <= MAX_ROWS && items.iter().all(|item| valid_safe_name(Some(item)))
+                })
+            || object.get("truncated").and_then(Value::as_bool).is_none())
     {
         return Err(RuntimeCommandError::unavailable());
     }

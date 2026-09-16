@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { z } from "zod";
-import { isSafeProviderUrl } from "@/shared/settings/validation";
+import { isSafeHttpUrl } from "@/shared/settings/validation";
 
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const MAX_TEXT = 512;
@@ -132,7 +132,7 @@ export const ConfigProviderSchema = z
     provider_id: ConfigProviderIdSchema,
     name: z.string().trim().min(1).max(MAX_TEXT),
     api: z.enum(["openai_responses", "anthropic_messages", "openai_chat_completions"]),
-    base_url: z.string().min(1).max(2_048).refine(isSafeProviderUrl),
+    base_url: z.string().min(1).max(2_048).refine(isSafeHttpUrl),
     credential_id: ConfigCredentialRefSchema,
     network_timeouts: configNetworkTimeoutsSchema,
     agent_defaults: configAgentDefaultsSchema,

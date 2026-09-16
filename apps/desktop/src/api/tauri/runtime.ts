@@ -52,7 +52,13 @@ export const JA_RUNTIME_COMMANDS = {
 /** Runtime query 只公开受控目录查询；host health 与任意 RPC path 不进入 WebView。 */
 export type RuntimeSettingsMethod = Extract<
   ClientMethod,
-  "workspace/path/search" | "skill/list" | "mcp/list" | "mcp/test" | "model/test" | "mcp/list-tools"
+  | "workspace/path/search"
+  | "skill/list"
+  | "mcp/list"
+  | "mcp/test"
+  | "model/test"
+  | "model/discover"
+  | "mcp/list-tools"
 >;
 export type RuntimeSettingsParams<M extends RuntimeSettingsMethod> = MethodParams<M>;
 export type RuntimeSettingsResult<M extends RuntimeSettingsMethod> = MethodResult<M>;

@@ -233,6 +233,9 @@ public final class RpcTestBindings {
         /** 未声明的模型测试能力失败，避免 transport 夹具触发真实 Provider。 */
         @Override public CompletionStage<ModelTestResult> testModel(
                 String providerId, String modelId, CancellationToken cancellationToken) { throw unsupported(); }
+        /** 未声明的上游模型目录能力失败，避免测试夹具发起真实网络请求。 */
+        @Override public CompletionStage<ModelDiscoveryResult> discoverModels(
+                String providerId, CancellationToken cancellationToken) { throw unsupported(); }
         /** 未声明的 MCP Tool 列表能力失败。 */
         @Override public CursorPage<McpToolDescriptor> readMcpTools(String mcpId, String cursor, int limit) { throw unsupported(); }
     }

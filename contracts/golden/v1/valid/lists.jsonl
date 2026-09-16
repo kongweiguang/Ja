@@ -28,3 +28,5 @@
 {"jsonrpc":"2.0","id":"c:mcp-tools","result":{"items":[{"name":"read_file","description":"read file","inputSchema":{"type":"object"}}],"nextCursor":null}}
 {"jsonrpc":"2.0","id":"c:model-test","method":"model/test","params":{"providerId":"provider_demo","modelId":"model_demo"}}
 {"jsonrpc":"2.0","id":"c:model-test","result":{"responseModel":"gpt-test","latencyMs":17}}
+{"jsonrpc":"2.0","id":"c:model-discover","method":"model/discover","params":{"providerId":"provider_demo"}}
+{"jsonrpc":"2.0","id":"c:model-discover","result":{"items":["gpt-test","gpt-test-mini"],"truncated":false}}

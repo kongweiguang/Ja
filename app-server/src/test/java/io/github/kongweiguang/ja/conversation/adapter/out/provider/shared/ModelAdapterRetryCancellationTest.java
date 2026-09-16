@@ -11,6 +11,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.support.Model
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -23,6 +24,7 @@ import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
@@ -305,6 +307,34 @@ final class ModelAdapterRetryCancellationTest {
                 assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
                 assertEquals(1, server.calls());
             }
+        }
+    }
+
+    /**
+     * 目录读取必须保留反向代理路径、在已有 `/v1` 后只补 `models`，并按 Anthropic 协议使用
+     * x-api-key 而不把凭据误放入 Bearer Header。
+     */
+    @Test
+    void factoryDiscoversModelsThroughBoundedProviderCatalogEndpoint() throws Exception {
+        try (MockWebServer server = new MockWebServer(); ModelAdapterFactory factory = new ModelAdapterFactory()) {
+            server.enqueue(new MockResponse.Builder().code(200)
+                    .setHeader("Content-Type", "application/json")
+                    .body("{\"data\":[{\"id\":\"claude-fixture\"},{\"id\":\"claude-second\"}]}")
+                    .build());
+            server.start(InetAddress.getByName("127.0.0.1"), 0);
+            ModelPort.ModelDiscoveryRequest request = new ModelPort.ModelDiscoveryRequest(
+                    "provider_test", "cfg_test", ModelPort.Api.ANTHROPIC_MESSAGES,
+                    URI.create("http://127.0.0.1:" + server.getPort() + "/gateway/v1"),
+                    "test-secret", Duration.ofSeconds(2), Duration.ofSeconds(5));
+
+            ModelPort.ModelDiscoveryResult result = factory.discoverModels(request, CancellationToken.none())
+                    .toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertEquals(List.of("claude-fixture", "claude-second"), result.items());
+            assertFalse(result.truncated());
+            RecordedRequest recorded = server.takeRequest(1, TimeUnit.SECONDS);
+            assertEquals("/gateway/v1/models", recorded.getUrl().encodedPath());
+            assertEquals("test-secret", recorded.getHeaders().get("x-api-key"));
+            assertNull(recorded.getHeaders().get("Authorization"));
         }
     }
 

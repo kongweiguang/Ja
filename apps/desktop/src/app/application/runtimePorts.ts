@@ -197,6 +197,12 @@ interface RuntimeModelTestResult {
   latencyMs: number;
 }
 
+/** 上游模型目录只保留显示安全的标识与服务器截断事实，不能承载 Provider 配置或凭据。 */
+interface RuntimeModelDiscoveryResult {
+  items: string[];
+  truncated: boolean;
+}
+
 interface RuntimeSettingsOperations {
   "workspace/path/search": {
     params: { threadId: string; workspaceId: string; query: string; limit?: number };
@@ -218,6 +224,10 @@ interface RuntimeSettingsOperations {
   "model/test": {
     params: { providerId: string; modelId: string };
     result: RuntimeModelTestResult;
+  };
+  "model/discover": {
+    params: { providerId: string };
+    result: RuntimeModelDiscoveryResult;
   };
   "mcp/list-tools": {
     params: { mcpId: string; cursor?: string; limit?: number };

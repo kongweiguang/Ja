@@ -3,10 +3,8 @@
 
 package io.github.kongweiguang.ja.configuration.adapter.out.generation;
 
-import java.net.URI;
-
 /**
- * 统一约束 generation catalog 的稳定标识、有界文本、不变引用和 loopback URL。
+ * 统一约束 generation catalog 的稳定标识、有界文本与不变引用。
  */
 final class ConfigGenerationValueRules {
     /**
@@ -33,14 +31,6 @@ final class ConfigGenerationValueRules {
         if (value == null || value.length() > maximum || (!allowEmpty && value.isEmpty())
             || value.indexOf('\0') >= 0) throw new IllegalArgumentException(field + " is invalid");
         return value;
-    }
-
-    /**
-     * 只识别配置契约明确允许的 loopback 主机，不做 DNS 解析以避免校验期网络副作用。
-     */
-    static boolean isLoopback(URI uri) {
-        String host = uri.getHost();
-        return "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host) || "::1".equals(host);
     }
 
     /**

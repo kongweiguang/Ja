@@ -235,6 +235,8 @@ public enum RpcMethod {
      * 删除一个凭据。
      */
     CREDENTIAL_DELETE("credential/delete"),
+    /** 用户编辑 Provider 时短时回显其绑定 API Key。 */
+    CREDENTIAL_REVEAL_PROVIDER("credential/reveal-provider"),
     /**
      * 分页列出 Skill。
      */
@@ -249,6 +251,8 @@ public enum RpcMethod {
     MCP_TEST("mcp/test"),
     /** 对已保存 Provider/Model 执行一次严格限额真实验证。 */
     MODEL_TEST("model/test"),
+    /** 从已保存 Provider 的上游目录读取模型标识，不修改配置。 */
+    MODEL_DISCOVER("model/discover"),
     /**
      * 列出 MCP Server 暴露的 Tool。
      */

@@ -606,6 +606,16 @@ final class McpRuntimeTest {
                         List.of("2025-06-18"))).getMessage());
     }
 
+    /** 远程 Streamable HTTP MCP 不再要求 TLS；构造定义不发起网络请求，认证仍走独立 header。 */
+    @Test
+    void streamableHttpAcceptsRemoteHttpEndpoint() {
+        McpServerDefinition remote = McpServerDefinition.streamableHttp(
+                "remote-http", java.net.URI.create("http://203.0.113.9:8080/mcp"), Map.of(),
+                List.of("2025-06-18"));
+
+        assertEquals("http://203.0.113.9:8080/mcp", remote.endpoint().toString());
+    }
+
     /** 创建不含 Secret 的 stdio 定义；伪 Session 不会启动其中的夹具命令。 */
     private static McpServerDefinition definition(String id) {
         return McpServerDefinition.stdio(

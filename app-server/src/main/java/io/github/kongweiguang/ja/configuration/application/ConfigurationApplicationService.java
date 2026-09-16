@@ -69,6 +69,18 @@ public final class ConfigurationApplicationService implements ConfigurationUseCa
         return runtime.deleteCredential(credentialId, expectedVersion);
     }
 
+    /**
+     * API Key 回显只从当前 Provider 的配置代际借用，避免普通读取或其他凭据引用取得 Secret；
+     * lease 关闭后不在应用层保存该值，缺失凭据以 null 保持单一文本框的空值语义。
+     */
+    @Override
+    public String revealProviderCredential(String providerId) {
+        try (ConfigurationGenerationLease lease = acquire(null)) {
+            ConfigurationGenerationView.Provider provider = lease.view().requireProvider(providerId);
+            return lease.secretFor(provider.credentialId());
+        }
+    }
+
     /** 返回适配器从同一读取状态派生的有界健康投影，避免应用层重复执行文件 I/O。 */
     @Override
     public HealthResult health() {

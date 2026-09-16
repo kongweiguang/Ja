@@ -40,7 +40,7 @@ public final class SettingsCatalogHandler implements RpcHandler {
     @Override
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.SKILL_LIST, RpcMethod.MCP_LIST, RpcMethod.MCP_TEST, RpcMethod.MODEL_TEST,
-                RpcMethod.MCP_LIST_TOOLS);
+                RpcMethod.MODEL_DISCOVER, RpcMethod.MCP_LIST_TOOLS);
     }
 
     /**
@@ -54,6 +54,7 @@ public final class SettingsCatalogHandler implements RpcHandler {
             case MCP_LIST -> CompletableFuture.completedFuture(mcp(command.params()));
             case MCP_TEST -> test(command.params());
             case MODEL_TEST -> testModel(command.params());
+            case MODEL_DISCOVER -> discoverModels(command.params());
             case MCP_LIST_TOOLS -> CompletableFuture.completedFuture(tools(command.params()));
             default -> throw JaRpcException.methodNotFound();
         };
@@ -120,6 +121,33 @@ public final class SettingsCatalogHandler implements RpcHandler {
                     return session.mapper().createObjectNode()
                             .put("responseModel", result.responseModel())
                             .put("latencyMs", result.latencyMs());
+                });
+    }
+
+    /**
+     * 只接受已保存 Provider 身份，并将上游目录压缩成模型字符串与截断事实；HTTP 失败沿用模型
+     * 可用性错误，不公开 URL、Header、正文或凭据。
+     */
+    private CompletionStage<ObjectNode> discoverModels(ObjectNode params) {
+        RpcParams.requireExact(params, "providerId");
+        String providerId = RpcParams.identifier(params, "providerId", "provider_", 108);
+        return session.catalog().discoverModels(providerId, session.cancellationToken())
+                .handle((result, failure) -> {
+                    if (failure != null) {
+                        Throwable cause = failure instanceof java.util.concurrent.CompletionException
+                                && failure.getCause() != null ? failure.getCause() : failure;
+                        if (cause instanceof io.github.kongweiguang.ja.configuration.domain.ConfigurationError error) {
+                            throw error;
+                        }
+                        throw JaRpcException.of(
+                                io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog.MODEL_UNAVAILABLE,
+                                "model discovery is unavailable");
+                    }
+                    ObjectNode response = session.mapper().createObjectNode();
+                    ArrayNode items = response.putArray("items");
+                    result.items().forEach(items::add);
+                    response.put("truncated", result.truncated());
+                    return response;
                 });
     }
 

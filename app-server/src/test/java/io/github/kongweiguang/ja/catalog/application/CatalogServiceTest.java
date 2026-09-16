@@ -12,9 +12,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.kongweiguang.ja.catalog.domain.McpServerDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
+import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
 import io.github.kongweiguang.ja.catalog.port.out.CatalogQueryPort;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.conversation.port.out.ModelEventSink;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
@@ -92,6 +94,48 @@ final class CatalogServiceTest {
 
         providerResult.complete(new ModelPort.ModelOutcome(ModelPort.FinishReason.STOP, null, null));
         assertEquals("gpt-fixture", result.toCompletableFuture().join().responseModel());
+        assertTrue(generations.lease.closed());
+    }
+
+    /**
+     * 上游模型目录只使用已保存 Provider 的配置与 Secret，并在异步完成前保留配置租约；它不需要
+     * 或伪造已选模型身份，因此可在用户将目录写回草稿前独立工作。
+     */
+    @Test
+    void modelDiscoveryUsesSavedProviderAndClosesLeaseAfterCompletion() {
+        ModelGenerationPort generations = new ModelGenerationPort("secret");
+        CompletableFuture<ModelPort.ModelDiscoveryResult> providerResult = new CompletableFuture<>();
+        AtomicReference<ModelPort.ModelDiscoveryRequest> captured = new AtomicReference<>();
+        ModelPort modelPort = new ModelPort() {
+            /** 目录夹具不允许聊天测试跨越本用例边界。 */
+            @Override
+            public CompletionStage<ModelOutcome> start(
+                    ModelRequest request, ModelEventSink eventSink, CancellationToken cancellationToken) {
+                return CompletableFuture.failedFuture(new AssertionError("unexpected model start"));
+            }
+
+            /** 捕获冻结目录请求，验证 Provider/Secret 仍由配置代际 owner 提供。 */
+            @Override
+            public CompletionStage<ModelDiscoveryResult> discoverModels(
+                    ModelDiscoveryRequest request, CancellationToken cancellationToken) {
+                captured.set(request);
+                return providerResult;
+            }
+        };
+        CatalogService service = new CatalogService(
+                new RecordingQueryPort(), generations, modelPort, unsupportedWorkspaces());
+
+        CompletionStage<CatalogUseCase.ModelDiscoveryResult> result = service.discoverModels(
+                "provider_fixture", CancellationToken.none());
+        assertFalse(generations.lease.closed());
+        ModelPort.ModelDiscoveryRequest request = captured.get();
+        assertEquals("provider_fixture", request.providerId());
+        assertEquals(ModelPort.Api.OPENAI_RESPONSES, request.api());
+        assertEquals("secret", request.apiKey());
+        assertEquals(Duration.ofSeconds(30), request.requestTimeout());
+
+        providerResult.complete(new ModelPort.ModelDiscoveryResult(List.of("gpt-first", "gpt-second"), false));
+        assertEquals(List.of("gpt-first", "gpt-second"), result.toCompletableFuture().join().items());
         assertTrue(generations.lease.closed());
     }
 

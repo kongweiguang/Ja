@@ -271,6 +271,33 @@
   font-size: var(--ja-text-control-size);
   font-weight: var(--ja-weight-semibold);
 }
+.ja-settings-recovery {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 24px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--ja-warning, #bd7a00) 36%, var(--border-settings-subtle));
+  color: var(--text-settings-primary);
+  background: color-mix(in srgb, var(--ja-warning, #bd7a00) 10%, var(--surface-settings-elevated));
+}
+.ja-settings-recovery > div {
+  min-width: 0;
+}
+.ja-settings-recovery strong {
+  display: block;
+  font-size: var(--ja-text-control-size);
+  font-weight: var(--ja-weight-semibold);
+}
+.ja-settings-recovery p {
+  margin: 3px 0 0;
+  color: var(--text-settings-secondary);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-settings-recovery > button {
+  flex: 0 0 auto;
+}
 .ja-settings-update-button {
   position: relative;
   min-height: 32px;
@@ -1301,6 +1328,15 @@
     min-height: 46px;
     flex-basis: 46px;
     padding: 0 16px;
+  }
+  .ja-settings-recovery {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 16px;
+  }
+  .ja-settings-recovery > button {
+    align-self: flex-start;
   }
   .ja-settings-panel {
     padding: 24px 20px 40px;

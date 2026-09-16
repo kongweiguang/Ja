@@ -5,7 +5,6 @@ import { z } from "zod";
 import {
   CREDENTIAL_REF_PATTERN,
   isSafeHttpUrl,
-  isSafeProviderUrl,
 } from "@/shared/settings/validation";
 
 export { CREDENTIAL_REF_PATTERN } from "@/shared/settings/validation";
@@ -142,11 +141,11 @@ export const providerSchema = z
   })
   .strict()
   .superRefine((values, context) => {
-    if (values.baseUrl !== undefined && !isSafeProviderUrl(values.baseUrl)) {
+    if (values.baseUrl !== undefined && !isSafeHttpUrl(values.baseUrl)) {
       context.addIssue({
         code: "custom",
         path: ["baseUrl"],
-        message: "请输入无凭据参数的 HTTPS 地址，或本机回环 HTTP 地址。",
+        message: "请输入无凭据参数的 HTTP 或 HTTPS 地址。",
       });
     }
   });

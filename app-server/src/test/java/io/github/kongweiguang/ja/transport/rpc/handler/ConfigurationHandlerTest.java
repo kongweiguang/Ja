@@ -177,6 +177,25 @@ final class ConfigurationHandlerTest {
         }
     }
 
+    /** Provider 回显只能通过 Provider identity 读取其绑定 API Key，不能夹带 credentialId 或其它字段。 */
+    @Test
+    void revealsOnlyTheSelectedProviderCredential() {
+        try (Harness harness = new Harness(workspace(Workspace.Trust.TRUSTED))) {
+            ObjectNode params = harness.mapper.createObjectNode().put("providerId", "provider_demo");
+
+            ObjectNode result = harness.handler.handle(new RpcCommand(
+                    RpcMethod.CREDENTIAL_REVEAL_PROVIDER, params)).toCompletableFuture().join();
+
+            assertEquals("provider_demo", harness.configuration.revealedProviderId);
+            assertEquals("fixture-only", result.path("secret").textValue());
+            assertExactFields(result, "secret");
+            ObjectNode invalid = harness.mapper.createObjectNode().put("providerId", "provider_demo")
+                    .put("credentialId", "cred_demo");
+            assertThrows(JaRpcException.class, () -> harness.handler.handle(new RpcCommand(
+                    RpcMethod.CREDENTIAL_REVEAL_PROVIDER, invalid)));
+        }
+    }
+
     /** 构造统一的项目 Patch Wire 参数，避免测试在字段白名单上产生无关差异。 */
     private static ObjectNode projectPatch(ObjectMapper mapper, String workspaceId, String expectedVersion) {
         ObjectNode params = mapper.createObjectNode().put("scope", "project")
@@ -321,6 +340,7 @@ final class ConfigurationHandlerTest {
         private ConfigurationUseCase.Document patchDocument;
         private String expectedVersion;
         private int patchCount;
+        private String revealedProviderId;
         private boolean includeNullableRead;
 
         /** 返回满足 Wire 闭集的脱敏投影，并记录解析后的内部工作区根目录。 */
@@ -393,6 +413,13 @@ final class ConfigurationHandlerTest {
         public ConfigurationUseCase.CredentialResult deleteCredential(
                 String credentialId, String expectedVersion) {
             throw unsupported();
+        }
+
+        /** 夹具仅为 Provider 专用回显提供固定非生产值，以锁定 handler 的 identity 边界。 */
+        @Override
+        public String revealProviderCredential(String providerId) {
+            revealedProviderId = providerId;
+            return "fixture-only";
         }
 
         /** 构造严格单层投影，避免读取测试依赖真实配置文件。 */

@@ -58,6 +58,7 @@ export function SettingsView({
       >
         <LazySettings
           snapshot={settings.globalSnapshot}
+          recovery={settings.loaded?.recovery}
           interfacePreferences={interfacePreferences}
           executionScope={executionScope}
           ports={settings.ports}

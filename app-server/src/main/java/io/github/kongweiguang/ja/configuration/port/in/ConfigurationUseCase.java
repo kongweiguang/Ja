@@ -12,7 +12,7 @@ import java.nio.file.Path;
  * 定义配置与凭据的入站用例；端口继承配置域的纯 JDK 数据模型，不暴露文件或序列化实现。
  *
  * <p>工作区路径是 workspace 域在进程内解析后的能力，不属于 JA-RPC Wire 字段。Secret 只允许进入
- * {@link #setCredential(String, String, String)}，任何读取结果都只能返回 configured 状态。</p>
+ * {@link #setCredential(String, String, String)}，常规读取结果都只能返回 configured 状态。</p>
  */
 public interface ConfigurationUseCase extends ConfigurationData {
     /** 读取用户层与可选工作区层的脱敏快照，不返回规范路径或 Secret。 */
@@ -34,6 +34,12 @@ public interface ConfigurationUseCase extends ConfigurationData {
 
     /** 原子删除一个凭据，并且只返回脱敏状态和新的 CAS 版本。 */
     CredentialResult deleteCredential(String credentialId, String expectedVersion);
+
+    /**
+     * 仅在用户主动编辑一个已保存 Provider 时，短时返回其绑定 API Key；这条显式例外不能被
+     * configuration/read 或 MCP 凭据查询复用，调用方必须在关闭编辑面后清空该值。
+     */
+    String revealProviderCredential(String providerId);
 
     /** 返回配置子系统的有界健康状态，不暴露文档、路径或解析错误文本。 */
     HealthResult health();

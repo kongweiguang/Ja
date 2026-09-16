@@ -52,6 +52,19 @@ final class ModelPortTest {
                 valid.inputModalities(), null));
     }
 
+    /** 用户自建网关可使用远程 IPv4/IPv6 HTTP；该纯构造测试不建立任何外部网络连接。 */
+    @Test
+    void acceptsRemoteHttpProviderEndpoints() {
+        for (String endpoint : Set.of("http://203.0.113.7:8080/v1", "http://[2001:db8::7]:8080/v1")) {
+            ModelPort.ModelConfiguration configured = new ModelPort.ModelConfiguration(
+                    "provider_remote", "model_remote", "cfg_remote", ModelPort.Api.OPENAI_RESPONSES,
+                    "remote-model", URI.create(endpoint), "test-secret", Duration.ofSeconds(1),
+                    Duration.ofSeconds(1), Set.of(ModelPort.InputModality.TEXT),
+                    ModelPort.GenerationOptions.defaults());
+            assertEquals(endpoint, configured.baseUri().toString());
+        }
+    }
+
     /** 构造只用于配对校验的 loopback 快照，避免测试触发外部网络。 */
     private static ModelPort.ModelConfiguration configuration(ModelPort.Api api) {
         return new ModelPort.ModelConfiguration(

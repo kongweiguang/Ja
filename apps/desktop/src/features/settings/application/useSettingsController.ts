@@ -720,6 +720,22 @@ export function useSettingsController({
     [currentLoaded, runtimePort],
   );
 
+  /**
+   * 目录读取只接受当前用户文档中已保存的 Provider 身份，防止界面把未保存的 Base URL、协议或
+   * API Key 传入运行时；返回结果由编辑 sheet 明确决定是否合并和保存。
+   */
+  const discoverModels = useCallback(
+    async (providerId: string) => {
+      const current = currentLoaded();
+      const provider = current?.userDocument.providers.find(
+        (candidate) => candidate.providerId === providerId,
+      );
+      if (provider === undefined) throw new Error("provider unavailable");
+      return runtimePort.discoverModels(providerId);
+    },
+    [currentLoaded, runtimePort],
+  );
+
   /** 模型排序只交换同一 Provider 内相邻项，不能跨 Provider 移动身份。 */
   const moveModel = useCallback(
     async (providerId: string, modelId: string, direction: -1 | 1): Promise<void> => {
@@ -1064,6 +1080,13 @@ export function useSettingsController({
     [adapter, mutateCredential],
   );
 
+  /** 回显只允许经过 adapter 的 Provider 专用方法，避免控制器从设置快照或 MCP 身份推导 Secret。 */
+  const revealProviderCredential = useCallback(
+    async (providerId: string): Promise<string | null> =>
+      adapter.revealProviderCredential(providerId),
+    [adapter],
+  );
+
   /** 合并后的只读 snapshot 不缓存 Secret，也不把 runtime 健康状态写回设置文档。 */
   const snapshot = useMemo<SettingsSnapshot>(
     () =>
@@ -1133,12 +1156,14 @@ export function useSettingsController({
       onMoveProvider: moveProvider,
       onSaveModel: saveModel,
       onTestModel: testModel,
+      onDiscoverModels: discoverModels,
       onDeleteModel: deleteModel,
       onMoveModel: moveModel,
       onDefaultSelectionChange: saveDefaultSelection,
       onSubagentSettingsChange: saveSubagentSettings,
       onReplaceCredential: setCredential,
       onClearCredential: deleteCredential,
+      onRevealProviderCredential: revealProviderCredential,
       onSaveMcp: saveMcp,
       onDeleteMcp: deleteMcp,
       onTestMcp: testMcp,
@@ -1155,6 +1180,8 @@ export function useSettingsController({
       deleteMcp,
       deleteProvider,
       deleteCredential,
+      discoverModels,
+      revealProviderCredential,
       moveModel,
       moveProvider,
       saveAppearance,

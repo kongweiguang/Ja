@@ -357,17 +357,19 @@ public final class ConfigGeneration implements AutoCloseable {
                                      NetworkTimeoutConfig networkTimeouts,
                                      AgentDefaultsConfig agentDefaults,
                                      List<ModelDefinition> models) {
-        /** 固定 Provider 路由、预算和模型列表，防止代际内出现可变选择。 */
+        /**
+         * 固定 Provider 路由、预算和模型列表；路由允许任意 HTTP(S) 主机，但不接受
+         * URL 内嵌凭据或请求参数，防止冻结代际绕过配置文档的 Secret 边界。
+         */
         public ProviderDefinition {
             ConfigGenerationValueRules.requireIdentifier(providerId, "provider_");
             name = ConfigGenerationValueRules.boundedText(name, "name", 512, false);
             java.util.Objects.requireNonNull(api, "api");
             java.util.Objects.requireNonNull(baseUrl, "baseUrl");
-            if (!baseUrl.isAbsolute() || baseUrl.getUserInfo() != null
-                || baseUrl.getQuery() != null || baseUrl.getFragment() != null
-                || !("https".equalsIgnoreCase(baseUrl.getScheme())
-                || "http".equalsIgnoreCase(baseUrl.getScheme())
-                   && ConfigGenerationValueRules.isLoopback(baseUrl))) {
+            if (!baseUrl.isAbsolute() || baseUrl.getHost() == null || baseUrl.getHost().isBlank()
+                || baseUrl.getUserInfo() != null || baseUrl.getQuery() != null
+                || baseUrl.getFragment() != null || !("https".equalsIgnoreCase(baseUrl.getScheme())
+                || "http".equalsIgnoreCase(baseUrl.getScheme()))) {
                 throw new IllegalArgumentException("provider base URL is invalid");
             }
             ConfigGenerationValueRules.requireIdentifier(credentialId, "cred_");

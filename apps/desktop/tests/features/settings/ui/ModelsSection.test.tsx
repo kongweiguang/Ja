@@ -55,12 +55,14 @@ function renderModels(
     onMoveProvider: vi.fn(async () => undefined),
     onSaveModel: vi.fn(async () => undefined),
     onTestModel: vi.fn(async () => ({ responseModel: "fixture", latencyMs: 1 })),
+    onDiscoverModels: vi.fn(async () => ({ items: [], truncated: false })),
     onDeleteModel: vi.fn(async () => undefined),
     onMoveModel: vi.fn(async () => undefined),
     onDefaultSelectionChange: vi.fn(async () => undefined),
     onSubagentSettingsChange: vi.fn(async () => undefined),
     onReplaceCredential: vi.fn(async () => undefined),
     onClearCredential: vi.fn(async () => undefined),
+    onRevealProviderCredential: vi.fn(async () => "fixture-only"),
     onSaveMcp: vi.fn(async () => undefined),
     onDeleteMcp: vi.fn(async () => undefined),
     onTestMcp: vi.fn(async () => "connected" as const),
@@ -151,6 +153,62 @@ describe("ModelsSection", () => {
     const upstream = within(dialog).getByDisplayValue("gpt-5.6-sol");
     expect(upstream).toHaveValue("gpt-5.6-sol");
     expect(upstream).toHaveFocus();
+  });
+
+  /** Provider 编辑框始终保留一个 API Key 输入，不再使用已配置、替换或删除凭据的分支样式。 */
+  it("shows the recalled API Key in one toggleable input", async () => {
+    const user = userEvent.setup();
+    const onRevealProviderCredential = vi.fn(async () => "fixture-only");
+    renderModels({ onRevealProviderCredential });
+
+    await user.click(screen.getByRole("button", { name: "编辑供应商" }));
+    const dialog = screen.getByRole("dialog", { name: "编辑供应商" });
+    const apiKey = await within(dialog).findByDisplayValue("fixture-only");
+    expect(apiKey).toHaveAttribute("type", "password");
+    expect(within(dialog).queryByText("凭据已配置")).toBeNull();
+    expect(within(dialog).queryByText("替换凭据")).toBeNull();
+    expect(within(dialog).queryByText("删除凭据")).toBeNull();
+    await user.click(within(dialog).getByRole("button", { name: "显示 API Key" }));
+    expect(apiKey).toHaveAttribute("type", "text");
+    expect(onRevealProviderCredential).toHaveBeenCalledWith("provider_openai");
+  });
+
+  /** 上游目录只改变编辑草稿：已有行保持原样，新模型等待用户明确保存后才进入配置。 */
+  it("imports only new upstream models into the saved provider draft", async () => {
+    const user = userEvent.setup();
+    const onDiscoverModels = vi.fn(async () => ({
+      items: ["gpt-5.6-sol", "gpt-5.6-new"],
+      truncated: false,
+    }));
+    const onSaveProvider = vi.fn(async () => undefined);
+    renderModels({ onDiscoverModels, onSaveProvider });
+
+    await user.click(screen.getByRole("button", { name: "编辑供应商" }));
+    const dialog = screen.getByRole("dialog", { name: "编辑供应商" });
+    await user.click(within(dialog).getByRole("button", { name: "从上游获取" }));
+
+    await waitFor(() => expect(onDiscoverModels).toHaveBeenCalledWith("provider_openai"));
+    const upstreamIds = within(dialog)
+      .getAllByPlaceholderText("例如：gpt-5.6-sol")
+      .map((input) => (input as HTMLInputElement).value);
+    expect(upstreamIds).toEqual(["gpt-5.6-sol", "gpt-5.6-mini", "gpt-5.6-new"]);
+    expect(within(dialog).getByRole("status")).toHaveTextContent(
+      "已添加 1 个上游模型，保存后生效。",
+    );
+    expect(onSaveProvider).not.toHaveBeenCalled();
+  });
+
+  /** 新 Provider 或修改过连接的草稿都不能调用目录，避免把未保存的连接误当作已生效。 */
+  it("disables upstream discovery before a provider connection is saved", async () => {
+    const user = userEvent.setup();
+    renderModels();
+
+    await user.click(screen.getByRole("button", { name: "新增供应商" }));
+    const dialog = screen.getByRole("dialog", { name: "新增供应商" });
+    const discover = within(dialog).getByRole("button", { name: "从上游获取" });
+    expect(discover).toBeDisabled();
+    expect(discover).toHaveAttribute("title", "请先保存连接信息和 API Key 后再获取");
+    expect(within(dialog).getByRole("status")).toHaveTextContent("保存供应商后可从上游获取模型。");
   });
 
   it("routes a settings search request to the selected model edit entry", async () => {

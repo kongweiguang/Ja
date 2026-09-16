@@ -640,6 +640,23 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
         }),
     )
     .expect("typed credential command");
+    let revealed_credential = invoke(
+        "ja_credential_reveal_provider",
+        serde_json::json!({"input": {"providerId": "provider_host"}}),
+    )
+    .expect("typed provider credential reveal command");
+    assert_eq!(revealed_credential["secret"], "fixture-secret");
+    for input in [
+        serde_json::json!({"input": {}}),
+        serde_json::json!({"input": {"providerId": null}}),
+        serde_json::json!({"input": {"providerId": "provider_host", "credentialId": "cred_host"}}),
+        serde_json::json!({"input": {"providerId": "mcp_host"}}),
+    ] {
+        assert!(
+            invoke("ja_credential_reveal_provider", input).is_err(),
+            "malformed Provider credential reveal must fail"
+        );
+    }
     let workspaces = invoke(
         "ja_workspace_list",
         serde_json::json!({"input": {"limit": 10}}),

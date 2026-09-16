@@ -15,8 +15,8 @@ use crate::app_runtime::interface::history_model::{
 use crate::app_runtime::{
     ConfigurationPatchParams, ConfigurationReadParams, ConfigurationReplaceParams,
     ConfigurationRequest, ConfigurationResetParams, ConfigurationResponse, CredentialDeleteParams,
-    CredentialSetParams, EventSink, LaunchConfig, NativeRuntimePlatform, RuntimeCommandError,
-    RuntimeHost,
+    CredentialRevealProviderParams, CredentialSetParams, EventSink, LaunchConfig,
+    NativeRuntimePlatform, RuntimeCommandError, RuntimeHost,
 };
 use ja_runtime::app_server_process::{SidecarConfig, SidecarSupervisor};
 use serde_json::Value;
@@ -512,6 +512,12 @@ impl RuntimeHostHarness {
                         CredentialDeleteParams::try_new(bytes)?,
                     ))?
             }
+            "credential/reveal-provider" => {
+                self.host
+                    .config_request(ConfigurationRequest::CredentialRevealProvider(
+                        CredentialRevealProviderParams::try_new(bytes)?,
+                    ))?
+            }
             _ => return Err(RuntimeCommandError::invalid_params()),
         };
         let bytes = match response {
@@ -521,6 +527,7 @@ impl RuntimeHostHarness {
             ConfigurationResponse::Reset(value) => value.into_bytes(),
             ConfigurationResponse::CredentialSet(value) => value.into_bytes(),
             ConfigurationResponse::CredentialDelete(value) => value.into_bytes(),
+            ConfigurationResponse::CredentialRevealProvider(value) => value.into_bytes(),
         };
         serde_json::from_slice(&bytes).map_err(|_| RuntimeCommandError::unavailable())
     }

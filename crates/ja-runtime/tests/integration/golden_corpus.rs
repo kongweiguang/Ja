@@ -105,10 +105,12 @@ const REQUEST_METHODS: &[&str] = &[
     "configuration/reset",
     "credential/set",
     "credential/delete",
+    "credential/reveal-provider",
     "skill/list",
     "mcp/list",
     "mcp/test",
     "model/test",
+    "model/discover",
     "mcp/list-tools",
     "tool/artifact/read",
 ];
@@ -443,7 +445,15 @@ fn validate_contract(value: &Value) -> Result<(), &'static str> {
             .is_some_and(|secret| !secret.is_empty());
     let allow_preview_authorization =
         method == Some("attachment/preview/open") && value.get("id").is_some();
-    if contains_forbidden_secret_key(value, allow_credential_secret, allow_preview_authorization) {
+    // Response 的方法身份只能由同文件 pending 表恢复；在此过早拒绝会让唯一的 Provider
+    // 回显例外无法按方法精确校验，关联阶段会对所有其它 response 继续失败关闭。
+    if method.is_some()
+        && contains_forbidden_secret_key(
+            value,
+            allow_credential_secret,
+            allow_preview_authorization,
+        )
+    {
         return Err("secret-shaped field crossed the Rust consumer boundary");
     }
     if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -521,6 +531,11 @@ fn validate_correlated_contract(
         return Err("turn resume result is not queued");
     }
     if let Some(result) = value.get("result") {
+        if method == "credential/reveal-provider" {
+            validate_revealed_provider_credential_result(result)?;
+        } else if contains_forbidden_secret_key(result, false, false) {
+            return Err("response result leaked a secret-shaped field");
+        }
         match method.as_str() {
             "thread/list" => validate_thread_list_result(result)?,
             "thread/search" => validate_thread_page_result(result)?,
@@ -2798,8 +2813,10 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "configuration/reset" => ["scope", "workspaceId", "expectedVersion"].as_slice(),
         "credential/set" => ["credentialId", "secret", "expectedVersion"].as_slice(),
         "credential/delete" => ["credentialId", "expectedVersion"].as_slice(),
+        "credential/reveal-provider" => ["providerId"].as_slice(),
         "mcp/test" => ["mcpId"].as_slice(),
         "model/test" => ["providerId", "modelId"].as_slice(),
+        "model/discover" => ["providerId"].as_slice(),
         "mcp/list-tools" => ["mcpId", "cursor", "limit"].as_slice(),
         _ => return Err("request method is unknown"),
     };
@@ -3344,6 +3361,11 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 return Err("credential id is invalid");
             }
             validate_version(params.get("expectedVersion"))?;
+        }
+        "credential/reveal-provider" => {
+            if !valid_prefixed_id(params.get("providerId"), "provider_") {
+                return Err("provider id is invalid");
+            }
         }
         _ => {}
     }
@@ -5694,8 +5716,8 @@ fn string_array_equals(values: &[Value], expected: &[&str]) -> bool {
             .all(|(value, expected)| value.as_str() == Some(*expected))
 }
 
-/// 仅允许 credential/set 的 secret 与 preview/open 的判别式 authorization；
-/// 两者仍由方法专属闭集验证，Result 与 Notification 不能回显 Secret-shaped Key。
+/// 仅允许 credential/set 的 secret 与 preview/open 的判别式 authorization；关联验证中的
+/// credential/reveal-provider 另以精确 `{secret}` 结果处理，其它 Result 与 Notification 仍拒绝。
 fn contains_forbidden_secret_key(
     value: &Value,
     allow_credential_secret: bool,
@@ -5744,6 +5766,22 @@ fn contains_forbidden_secret_key(
         allow_preview_authorization,
         false,
     )
+}
+
+/// Provider API Key 回显必须保持单字段、nullable、有界形状，防止该显式例外扩展为通用凭据投影。
+fn validate_revealed_provider_credential_result(result: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(result, &["secret"])?;
+    match result.get("secret") {
+        Some(Value::Null) => Ok(()),
+        Some(Value::String(secret))
+            if !secret.is_empty()
+                && secret.len() <= 8192
+                && !secret.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        _ => Err("revealed provider credential result is invalid"),
+    }
 }
 
 /// 要求非空 String，且不把 Number 或 Boolean 强制转换为文本。

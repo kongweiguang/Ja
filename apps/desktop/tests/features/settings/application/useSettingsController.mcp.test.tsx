@@ -90,6 +90,7 @@ function optionsFor(
       reset: vi.fn(async () => ({ version: "cfg_project" })),
       setCredential: vi.fn(async () => "cfg_auth"),
       deleteCredential: vi.fn(async () => "cfg_auth"),
+      revealProviderCredential: vi.fn(async () => null),
     },
     appearancePort: {
       themeMode: "system",
@@ -117,6 +118,7 @@ function optionsFor(
       })),
       listMcpTools: vi.fn(async () => ({ items: [], nextCursor: null })),
       testModel: vi.fn(async () => ({ responseModel: "test", latencyMs: 1 })),
+      discoverModels: vi.fn(async () => ({ items: [], truncated: false })),
       ...runtime,
     },
   };

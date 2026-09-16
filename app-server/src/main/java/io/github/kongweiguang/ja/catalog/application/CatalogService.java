@@ -89,6 +89,26 @@ public final class CatalogService implements CatalogUseCase {
         }
     }
 
+    /**
+     * 目录读取只解析已保存 Provider 的当前代际与 Secret，并把异步租约持有到 HTTP 完成；不能接受
+     * WebView 传入的 Base URL、协议或 API Key，因此草稿中的未保存连接不会被意外使用。
+     */
+    @Override
+    public CompletionStage<ModelDiscoveryResult> discoverModels(
+            String providerId, CancellationToken cancellationToken) {
+        ConfigurationGenerationPort.Lease lease = generations.acquire(null);
+        try {
+            ConfigurationGenerationSnapshot.Provider provider = lease.snapshot().requireProvider(providerId);
+            ModelPort.ModelDiscoveryRequest request = modelDiscoveryRequest(provider, lease);
+            return models.discoverModels(request, cancellationToken)
+                    .thenApply(result -> new ModelDiscoveryResult(result.items(), result.truncated()))
+                    .whenComplete((ignored, failure) -> lease.close());
+        } catch (RuntimeException | Error failure) {
+            lease.close();
+            throw failure;
+        }
+    }
+
     /** 验证请求强制 text-only、16 token 和较短网络期限，不继承 Agent 默认生成预算。 */
     private static ModelPort.ModelConfiguration modelConfiguration(
             ConfigurationGenerationSnapshot.Provider provider,
@@ -111,6 +131,29 @@ public final class CatalogService implements CatalogUseCase {
                 provider.networkTimeouts().connectTimeout(), requestTimeout,
                 Set.of(ModelPort.InputModality.TEXT),
                 new ModelPort.GenerationOptions(null, null, 16, null));
+    }
+
+    /**
+     * 目录请求使用相同的已保存认证配置，但不构造虚假的已选模型；30 秒上限阻止设置页的单次点击
+     * 长时间占用配置租约与网络连接。
+     */
+    private static ModelPort.ModelDiscoveryRequest modelDiscoveryRequest(
+            ConfigurationGenerationSnapshot.Provider provider,
+            ConfigurationGenerationPort.Lease lease) {
+        String secret = lease.secretFor(provider.credentialId());
+        if (secret == null || secret.isBlank()) {
+            throw new ConfigurationError(ConfigurationError.Code.MISSING_CREDENTIAL,
+                    "provider credential is unavailable");
+        }
+        ModelPort.Api api = switch (provider.api()) {
+            case OPENAI_RESPONSES -> ModelPort.Api.OPENAI_RESPONSES;
+            case ANTHROPIC_MESSAGES -> ModelPort.Api.ANTHROPIC_MESSAGES;
+            case OPENAI_CHAT_COMPLETIONS -> ModelPort.Api.OPENAI_CHAT_COMPLETIONS;
+        };
+        Duration requestTimeout = provider.networkTimeouts().requestTimeout().compareTo(Duration.ofSeconds(30)) > 0
+                ? Duration.ofSeconds(30) : provider.networkTimeouts().requestTimeout();
+        return new ModelPort.ModelDiscoveryRequest(provider.providerId(), lease.generationId(), api,
+                provider.baseUrl(), secret, provider.networkTimeouts().connectTimeout(), requestTimeout);
     }
 
     /**

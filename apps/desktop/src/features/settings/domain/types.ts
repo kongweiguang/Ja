@@ -138,11 +138,16 @@ interface SettingsSkill {
   description: string;
 }
 
+/** 只标记可由完整用户设置保存修复的语义损坏，不弱化文件、凭据或运行时安全边界。 */
+export type SettingsRecovery = "user_config_corrupt";
+
 export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
   projectOverrides: ProjectSettingsOverrides;
   cas: { userVersion: string; projectVersion: string; credentialVersion: string };
+  /** 用户层无法安全投影时仍允许进入设置进行显式完整恢复，不把原文件视为可写空配置。 */
+  recovery?: SettingsRecovery;
 }
 
 /** 项目稀疏层只向 UI 暴露覆盖存在性，不泄漏或复制任意配置正文。 */

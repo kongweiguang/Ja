@@ -7,6 +7,9 @@ import {
   ArrowUp,
   Check,
   ChevronRight,
+  Download,
+  Eye,
+  EyeOff,
   MoreHorizontal,
   Pencil,
   Play,
@@ -15,7 +18,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useLayoutEffect, useRef, useState, type ReactElement } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactElement } from "react";
 import { toast } from "sonner";
 import {
   Button,
@@ -39,7 +42,7 @@ import type {
   ReasoningLevel,
 } from "@/shared/settings/types";
 import { modelSelectionId } from "@/shared/settings/types";
-import { isSafeProviderUrl } from "@/shared/settings/validation";
+import { isSafeHttpUrl } from "@/shared/settings/validation";
 import type { ProviderProjection, SettingsSnapshot } from "../domain/types";
 import type { SettingsPorts } from "../application/ports";
 import { getModelBudgetRecommendation } from "../domain/modelBudgetRecommendations";
@@ -53,7 +56,6 @@ import {
   settingsMutationErrorMessage,
   SettingsSelect,
 } from "./shared";
-import { CredentialVaultEditor } from "./CredentialVaultEditor";
 import "./provider-editor.css";
 import "./models-overview.css";
 
@@ -212,8 +214,7 @@ function parseInteger(value: string): number {
 function validateProviderDraft(draft: ProviderEditorDraft): string | undefined {
   if (draft.name.trim() === "") return "请填写供应商名称";
   if (draft.baseUrl.trim() === "") return "请填写 Base URL";
-  if (!isSafeProviderUrl(draft.baseUrl.trim()))
-    return "请输入无凭据参数的 HTTPS 地址，或本机回环 HTTP 地址";
+  if (!isSafeHttpUrl(draft.baseUrl.trim())) return "请输入无凭据参数的 HTTP 或 HTTPS 地址";
   if (draft.models.length === 0) return "至少保留一个模型";
   const seen = new Set<string>();
   for (const model of draft.models) {
@@ -774,7 +775,6 @@ function ProviderCard({
             <span>
               {apiOptions.find((option) => option.value === provider.api)?.label ?? provider.api}
             </span>
-            <span>{provider.credentialConfigured ? "凭据已配置" : "凭据未配置"}</span>
           </div>
         </div>
         <div className="ja-settings-card-actions">
@@ -929,9 +929,35 @@ function ProviderEditorSheet({
   );
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<string>();
-  const secretRef = useRef<HTMLInputElement>(null);
+  const [catalogFeedback, setCatalogFeedback] = useState<
+    { message: string; tone: "success" | "error" } | undefined
+  >();
+  const [secret, setSecret] = useState("");
+  const [secretVisible, setSecretVisible] = useState(false);
+  const [secretLoading, setSecretLoading] = useState(!isNew);
+  const savedSecretRef = useRef("");
   const openerRef = useRef(document.activeElement);
   const pendingModelFocusRef = useRef<string | null>(null);
+  /**
+   * 上游目录只可使用 App Server 已保存的连接，任何协议、端点或 API Key 草稿变化都必须先显式
+   * 保存，避免用户误以为本地草稿已经生效，且不把秘密作为目录请求参数。
+   */
+  const canDiscoverModels =
+    provider !== undefined &&
+    provider.credentialConfigured &&
+    !secretLoading &&
+    draft.api === provider.api &&
+    draft.baseUrl.trim() === provider.baseUrl.trim() &&
+    secret === savedSecretRef.current;
+  const catalogReadinessMessage = isNew
+    ? "保存供应商后可从上游获取模型。"
+    : secretLoading
+      ? "正在读取已保存的连接信息。"
+      : !provider?.credentialConfigured
+        ? "请先保存 API Key 后再从上游获取。"
+        : !canDiscoverModels
+          ? "连接信息已修改，保存后可再次从上游获取。"
+          : "上游模型会先加入草稿，保存后生效。";
   /** 新行挂载后直接定位真实模型输入，不让用户在长表单里寻找刚添加的项目。 */
   useLayoutEffect(() => {
     const modelId = pendingModelFocusRef.current;
@@ -947,10 +973,46 @@ function ProviderEditorSheet({
           : [],
       ),
   );
-  /** Secret 仅由密码 DOM 持有，关闭和请求结束后立即清空。 */
+  /** API Key 只留在当前编辑 sheet；关闭、卸载或切换 Provider 时不写入全局状态。 */
   const resetSecret = (): void => {
-    if (secretRef.current !== null) secretRef.current.value = "";
+    savedSecretRef.current = "";
+    setSecret("");
+    setSecretVisible(false);
   };
+  /**
+   * 编辑已有 Provider 时按身份短时读取已保存 API Key；加载完成前禁止保存，避免空输入被误判为
+   * 用户主动清空。返回值只保留在本组件，取消或切换编辑对象后丢弃迟到结果。
+   */
+  useEffect(() => {
+    if (isNew || provider === undefined) {
+      savedSecretRef.current = "";
+      setSecret("");
+      setSecretLoading(false);
+      return;
+    }
+    let active = true;
+    setSecretLoading(true);
+    void ports
+      .onRevealProviderCredential(provider.providerId)
+      .then((value) => {
+        if (!active) return;
+        const revealed = value ?? "";
+        savedSecretRef.current = revealed;
+        setSecret(revealed);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const message = settingsMutationErrorMessage(error, "API Key 读取失败");
+        setFeedback(message);
+        toast.error(message);
+      })
+      .finally(() => {
+        if (active) setSecretLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isNew, ports, provider]);
   /** 忙时禁止关闭和修改，失败时保留非敏感草稿供原地重试。 */
   const changeOpen = (nextOpen: boolean): void => {
     if (!nextOpen && busy) return;
@@ -983,7 +1045,6 @@ function ProviderEditorSheet({
       toast.error(validation);
       return;
     }
-    const secret = secretRef.current?.value ?? "";
     if (isNew && secret.length === 0) {
       const message = "请输入 API key / token";
       setFeedback(message);
@@ -994,8 +1055,24 @@ function ProviderEditorSheet({
     setBusy(true);
     try {
       const next = buildProvider();
-      if (isNew) await ports.onCreateProvider(next, secret);
-      else await ports.onSaveProvider(next);
+      if (isNew) {
+        await ports.onCreateProvider(next, secret);
+      } else {
+        await ports.onSaveProvider(next);
+        if (secret !== savedSecretRef.current) {
+          try {
+            if (secret === "") await ports.onClearCredential(next.credentialId);
+            else await ports.onReplaceCredential(next.credentialId, secret);
+          } catch (error) {
+            throw Object.assign(
+              error instanceof Error ? error : new Error("credential update failed"),
+              {
+                code: "provider_saved_credential_failed",
+              },
+            );
+          }
+        }
+      }
       onSaved(next.providerId);
       toast.success(isNew ? "供应商和模型已保存" : "供应商与模型已保存");
       resetSecret();
@@ -1017,24 +1094,6 @@ function ProviderEditorSheet({
       }
     } finally {
       resetSecret();
-      setBusy(false);
-    }
-  };
-  /** 凭据与配置共用表单忙状态，避免密钥尚在写入时关闭窗口或提交另一份模型草稿。 */
-  const replaceCredential: SettingsPorts["onReplaceCredential"] = async (reference, secret) => {
-    setBusy(true);
-    try {
-      await ports.onReplaceCredential(reference, secret);
-    } finally {
-      setBusy(false);
-    }
-  };
-  /** 清除凭据保留独立确认语义，但同样保护尚未保存的供应商草稿不被导航丢弃。 */
-  const clearCredential: SettingsPorts["onClearCredential"] = async (reference) => {
-    setBusy(true);
-    try {
-      await ports.onClearCredential(reference);
-    } finally {
       setBusy(false);
     }
   };
@@ -1066,6 +1125,57 @@ function ProviderEditorSheet({
       ...current,
       models: current.models.filter((item) => item.modelId !== model.modelId),
     }));
+  };
+  /**
+   * 将上游目录增量合并到当前草稿。已有模型的稳定 ID、预算与思考配置保持不变，新增项采用当前
+   * 推荐起始预算；请求和合并都不触发保存，用户仍可检查后再提交。
+   */
+  const discoverModels = async (): Promise<void> => {
+    if (provider === undefined || !canDiscoverModels || busy) return;
+    setBusy(true);
+    setCatalogFeedback(undefined);
+    try {
+      const result = await ports.onDiscoverModels(provider.providerId);
+      const existing = new Set(draft.models.map((model) => model.model.trim()));
+      const additions = result.items
+        .filter((upstream) => !existing.has(upstream))
+        .map((upstream) => {
+          const recommendation = getModelBudgetRecommendation(upstream, draft.baseUrl);
+          return {
+            ...createModelDraft(),
+            name: upstream,
+            model: upstream,
+            capabilities: {
+              contextWindowTokens: recommendation.contextWindowTokens,
+              maxOutputTokens: recommendation.maxOutputTokens,
+            },
+          };
+        });
+      if (additions.length > 0) {
+        setDraft((current) => ({ ...current, models: [...current.models, ...additions] }));
+        setRemovableModelIds(
+          (current) => new Set([...current, ...additions.map((model) => model.modelId)]),
+        );
+      }
+      const summary =
+        additions.length === 0
+          ? "上游目录没有新的模型标识。"
+          : `已添加 ${additions.length} 个上游模型，保存后生效。`;
+      setCatalogFeedback({
+        message: result.truncated ? `${summary} 当前结果已截断为前 200 项。` : summary,
+        tone: "success",
+      });
+      toast.success(additions.length === 0 ? "上游模型已是最新" : "上游模型已填入草稿");
+    } catch (error) {
+      const message = settingsMutationErrorMessage(
+        error,
+        "获取上游模型失败，请检查已保存的连接信息",
+      );
+      setCatalogFeedback({ message, tone: "error" });
+      toast.error(message);
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <Dialog modal open={open} onOpenChange={changeOpen}>
@@ -1123,7 +1233,7 @@ function ProviderEditorSheet({
                 <p>先连接供应商，再为它添加一个或多个模型。</p>
               </div>
             </div>
-            <fieldset disabled={busy} className="ja-provider-connection-fields">
+            <fieldset disabled={busy || secretLoading} className="ja-provider-connection-fields">
               <div className="ja-settings-form-grid">
                 <Field id="provider-name" label="供应商名称">
                   <input
@@ -1153,45 +1263,82 @@ function ProviderEditorSheet({
                     required
                   />
                 </Field>
-                {isNew ? (
-                  <Field id="provider-secret" label="API key / token">
+                <Field id="provider-secret" label="API Key">
+                  <div className="ja-provider-api-key-control">
                     <input
-                      ref={secretRef}
                       id="provider-secret"
                       className="ja-settings-input"
-                      type="password"
-                      autoComplete="new-password"
-                      placeholder="输入后保存，不会回显"
+                      type={secretVisible ? "text" : "password"}
+                      autoComplete={isNew ? "new-password" : "current-password"}
+                      value={secret}
+                      placeholder="输入 API Key"
+                      onChange={(event) => setSecret(event.target.value)}
                     />
-                  </Field>
-                ) : (
-                  <CredentialVaultEditor
-                    reference={draft.credentialId}
-                    configured={provider?.credentialConfigured ?? false}
-                    onReplaceCredential={replaceCredential}
-                    onClearCredential={clearCredential}
-                  />
-                )}
+                    <IconButton
+                      type="button"
+                      label={secretVisible ? "隐藏 API Key" : "显示 API Key"}
+                      className="ja-provider-api-key-toggle"
+                      disabled={secretLoading}
+                      onClick={() => setSecretVisible((visible) => !visible)}
+                    >
+                      {secretVisible ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
+                    </IconButton>
+                  </div>
+                </Field>
               </div>
             </fieldset>
           </section>
           <section className="ja-provider-models-section" aria-labelledby="provider-models-heading">
-            <div className="ja-provider-section-heading">
+            <div className="ja-provider-section-heading ja-provider-models-heading">
               <div>
-                <h3 id="provider-models-heading">模型</h3>
+                <div className="ja-provider-models-title-line">
+                  <h3 id="provider-models-heading">模型</h3>
+                  <span
+                    className="ja-provider-model-count"
+                    aria-label={`已配置 ${draft.models.length} 个模型`}
+                  >
+                    {draft.models.length}
+                  </span>
+                </div>
                 <p>使用供应商提供的模型标识，额度可分别调整。</p>
               </div>
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                onClick={addModel}
-                disabled={busy}
-              >
-                <Plus aria-hidden="true" />
-                添加模型
-              </Button>
+              <div className="ja-provider-model-actions" role="group" aria-label="模型操作">
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="sm"
+                  loading={busy}
+                  disabled={busy || !canDiscoverModels}
+                  title={
+                    canDiscoverModels
+                      ? "从已保存的上游供应商获取模型"
+                      : "请先保存连接信息和 API Key 后再获取"
+                  }
+                  onClick={() => void discoverModels()}
+                >
+                  <Download aria-hidden="true" />
+                  从上游获取
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={addModel}
+                  disabled={busy}
+                >
+                  <Plus aria-hidden="true" />
+                  手动添加
+                </Button>
+              </div>
             </div>
+            <p
+              className={`ja-provider-model-catalog-status${
+                catalogFeedback?.tone === "error" ? " is-error" : ""
+              }`}
+              role={catalogFeedback?.tone === "error" ? "alert" : "status"}
+            >
+              {catalogFeedback?.message ?? catalogReadinessMessage}
+            </p>
             <div className="ja-provider-model-list">
               {draft.models.map((model, index) => (
                 <ProviderModelDraftRow

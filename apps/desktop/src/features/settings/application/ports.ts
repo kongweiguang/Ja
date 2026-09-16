@@ -36,6 +36,8 @@ export interface SettingsPorts {
   onMoveProvider: (providerId: string, direction: -1 | 1) => Promise<void>;
   onSaveModel: (providerId: string, model: ProviderModelSave) => Promise<void>;
   onTestModel: (providerId: string, modelId: string) => Promise<ModelTestResult>;
+  /** 从已保存 Provider 读取上游模型目录；结果仅合并到编辑草稿，不能在这里隐式保存。 */
+  onDiscoverModels: (providerId: string) => Promise<ModelDiscoveryResult>;
   onDeleteModel: (
     providerId: string,
     modelId: string,
@@ -49,6 +51,8 @@ export interface SettingsPorts {
   onReplaceCredential: (credentialId: string, secret: string) => Promise<void>;
   /** 清除 Credential 时保留不含 Secret 的 Model 或 MCP Selector。 */
   onClearCredential: (credentialId: string) => Promise<void>;
+  /** Provider 编辑框短时读取其绑定 API Key，调用方关闭编辑框后不得保留返回值。 */
+  onRevealProviderCredential: (providerId: string) => Promise<string | null>;
   onSaveMcp: (server: McpServerSave) => Promise<void>;
   onDeleteMcp: (id: string) => Promise<void>;
   onTestMcp: (id: string) => Promise<McpStatus>;
@@ -83,6 +87,7 @@ export interface SettingsAdapter {
   }): Promise<{ version: string }>;
   setCredential(credentialId: string, secret: string, expectedVersion: string): Promise<string>;
   deleteCredential(credentialId: string, expectedVersion: string): Promise<string>;
+  revealProviderCredential(providerId: string): Promise<string | null>;
 }
 
 /**
@@ -187,6 +192,12 @@ interface ModelTestResult {
   latencyMs: number;
 }
 
+/** 上游目录只公开安全模型标识与单页截断事实，避免将厂商原始对象带入设置状态。 */
+export interface ModelDiscoveryResult {
+  items: string[];
+  truncated: boolean;
+}
+
 /** Settings runtime 端口只暴露领域能力，JA-RPC method 与 params envelope 留在 composition/infrastructure。 */
 export interface SettingsRuntimePort {
   listSkills(input?: { workspaceId?: string }): Promise<SkillListResult>;
@@ -194,4 +205,6 @@ export interface SettingsRuntimePort {
   testMcp(mcpRevision: string): Promise<McpTestResult>;
   listMcpTools(mcpRevision: string): Promise<McpToolsResult>;
   testModel(providerId: string, modelId: string): Promise<ModelTestResult>;
+  /** 目录读取走单独的受限 JA-RPC 方法，Provider endpoint 和 API Key 始终由 App Server 解析。 */
+  discoverModels(providerId: string): Promise<ModelDiscoveryResult>;
 }

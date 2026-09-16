@@ -72,6 +72,8 @@ define_operation_payload!(
     CredentialSetResult,
     CredentialDeleteParams,
     CredentialDeleteResult,
+    CredentialRevealProviderParams,
+    CredentialRevealProviderResult,
     WorkspaceListParams,
     WorkspaceListResultData,
     ThreadCreateParams,
@@ -108,6 +110,8 @@ define_operation_payload!(
     McpTestResultData,
     ModelTestParams,
     ModelTestResultData,
+    ModelDiscoverParams,
+    ModelDiscoverResultData,
     McpToolsReadParams,
     McpToolsReadResultData,
 );
@@ -121,6 +125,7 @@ pub(crate) enum ConfigurationRequest {
     Reset(ConfigurationResetParams),
     CredentialSet(CredentialSetParams),
     CredentialDelete(CredentialDeleteParams),
+    CredentialRevealProvider(CredentialRevealProviderParams),
 }
 
 /// 配置响应保持与请求同构的封闭 variant；Host 必须验证 operation 配对后才返回 interface。
@@ -131,6 +136,7 @@ pub(crate) enum ConfigurationResponse {
     Reset(ConfigurationResetResult),
     CredentialSet(CredentialSetResult),
     CredentialDelete(CredentialDeleteResult),
+    CredentialRevealProvider(CredentialRevealProviderResult),
 }
 
 /// History 用例闭集；不接受 method 字符串或可递归动态树。
@@ -175,6 +181,7 @@ pub(crate) enum SettingsRequest {
     McpList(McpListParams),
     McpTest(McpTestParams),
     ModelTest(ModelTestParams),
+    ModelDiscover(ModelDiscoverParams),
     McpToolsRead(McpToolsReadParams),
 }
 
@@ -184,6 +191,7 @@ pub(crate) enum SettingsResponse {
     McpList(McpListResultData),
     McpTest(McpTestResultData),
     ModelTest(ModelTestResultData),
+    ModelDiscover(ModelDiscoverResultData),
     McpToolsRead(McpToolsReadResultData),
 }
 

@@ -136,6 +136,21 @@ describe("TauriSettingsAdapter v1", () => {
     expect(JSON.stringify(loaded)).not.toMatch(/apiKey|secret/i);
   });
 
+  it("reads an API Key only through the Provider-specific native command", async () => {
+    const invoke = vi.fn(async (command: string) =>
+      command === JA_SETTINGS_COMMANDS.revealProviderCredential
+        ? { secret: "fixture-only" }
+        : readResult(),
+    );
+
+    await expect(
+      new TauriSettingsAdapter({ invoke }).revealProviderCredential("provider_openai"),
+    ).resolves.toBe("fixture-only");
+    expect(invoke).toHaveBeenCalledWith(JA_SETTINGS_COMMANDS.revealProviderCredential, {
+      input: { providerId: "provider_openai" },
+    });
+  });
+
   it("projects sparse project override identities without retaining the raw project document", async () => {
     const result: ConfigReadResult = {
       ...readResult(),
@@ -175,6 +190,44 @@ describe("TauriSettingsAdapter v1", () => {
     await expect(new TauriSettingsAdapter(bridge).snapshot()).rejects.toEqual(
       expect.objectContaining<Partial<SettingsAdapterError>>({ code: "invalid_response" }),
     );
+  });
+
+  /** 用户层语义损坏时保留原 CAS 并提供空白编辑投影，读取自身绝不改写磁盘配置。 */
+  it("enters recoverable settings mode for a corrupt user configuration layer", async () => {
+    const result: ConfigReadResult = {
+      ...readResult(),
+      effective: {
+        schema_version: 1,
+        config_revision: 0,
+        default_access_mode: "full_access",
+        default_provider_id: null,
+        default_model_id: null,
+        default_reasoning_level: null,
+        subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
+        providers: [],
+        mcp_servers: [],
+        skills: [],
+      },
+      user: { present: true, trusted: true, status: "corrupt", document: null },
+    };
+
+    const invoke = vi.fn(async (command: string) =>
+      command === JA_SETTINGS_COMMANDS.replace
+        ? { accepted: true, scope: "user", version: "cfg_repaired" }
+        : result,
+    );
+    const adapter = new TauriSettingsAdapter({ invoke });
+    const loaded = await adapter.snapshot();
+
+    expect(loaded.recovery).toBe("user_config_corrupt");
+    expect(loaded.userDocument.providers).toEqual([]);
+    expect(loaded.cas.userVersion).toBe("cfg_user");
+    await expect(adapter.save(loaded.userDocument, loaded.cas.userVersion)).resolves.toBe(
+      "cfg_repaired",
+    );
+    expect(invoke).toHaveBeenCalledWith(JA_SETTINGS_COMMANDS.replace, {
+      input: expect.objectContaining({ scope: "user", expectedVersion: "cfg_user" }),
+    });
   });
 
   it("saves only strict snake_case v1 and strips UI credential status", async () => {

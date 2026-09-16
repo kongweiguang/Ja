@@ -206,6 +206,18 @@ describe("JA RPC v1 protocol", () => {
         expectedVersion: "cfg_A",
       }),
     ).toMatchObject({ credentialId: "cred_demo" });
+    expect(
+      parseMethodParams("credential/reveal-provider", { providerId: "provider_demo" }),
+    ).toEqual({
+      providerId: "provider_demo",
+    });
+    expect(parseMethodResult("credential/reveal-provider", { secret: "fixture-only" })).toEqual({
+      secret: "fixture-only",
+    });
+    expect(() => parseMethodResult("credential/reveal-provider", { secret: "" })).toThrow();
+    expect(() =>
+      parseMethodResult("credential/reveal-provider", { secret: "fixture", extra: true }),
+    ).toThrow();
 
     expect(() =>
       parseMethodParams("configuration/patch", {
@@ -261,6 +273,24 @@ describe("JA RPC v1 protocol", () => {
         expectedVersion: "cfg_missing",
       }),
     ).toThrow();
+  });
+
+  /** JA-RPC 配置文档允许用户自建的远程 HTTP Provider，不把传输安全策略限定为 loopback。 */
+  it("accepts a remote HTTP Provider route", () => {
+    const document = {
+      ...completeConfigDocument,
+      providers: [
+        { ...completeConfigDocument.providers[0], base_url: "http://198.51.100.22:8080/v1" },
+      ],
+    };
+
+    expect(
+      parseMethodParams("configuration/replace", {
+        scope: "user",
+        document,
+        expectedVersion: "cfg_missing",
+      }),
+    ).toMatchObject({ document });
   });
 
   /** Provider 必须各自持有 credential ID，Renderer 不允许把共享 Secret 引用写入 v1。 */

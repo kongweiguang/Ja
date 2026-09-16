@@ -22,6 +22,7 @@ export const JA_SETTINGS_COMMANDS = {
   reset: "ja_configuration_reset",
   setCredential: "ja_credential_set",
   deleteCredential: "ja_credential_delete",
+  revealProviderCredential: "ja_credential_reveal_provider",
 } as const;
 type SettingsCommand = (typeof JA_SETTINGS_COMMANDS)[keyof typeof JA_SETTINGS_COMMANDS];
 
@@ -228,12 +229,23 @@ const CredentialSetInputSchema = z
 const CredentialDeleteInputSchema = z
   .object({ credentialId: CredentialRefSchema, expectedVersion: ConfigVersionSchema })
   .strict();
+const CredentialRevealProviderInputSchema = z
+  .object({ providerId: ConfigProviderIdSchema })
+  .strict();
+const CredentialRevealProviderResultSchema = z
+  .object({ secret: z.string().min(1).refine(secretFitsWireLimit).nullable() })
+  .strict();
 
 export type SettingsDocument = z.infer<typeof SettingsDocumentSchema>;
 type SettingsProvider = z.infer<typeof UiProviderSchema>;
 type SettingsMcpServer = z.infer<typeof UiMcpSchema>;
 export type ConfigReadInput = z.infer<typeof ConfigReadInputSchema>;
 export type ConfigReadResult = z.infer<typeof ConfigReadResultSchema>;
+/**
+ * 仅表示用户配置可读取但不满足当前严格语义；它允许设置页提供恢复入口，不能用于放宽
+ * 原生执行时的 Provider、凭据或文件安全校验。
+ */
+export type SettingsRecovery = "user_config_corrupt";
 export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
@@ -244,6 +256,8 @@ export interface LoadedSettings {
     disabledMcpIds: string[];
   };
   cas: ConfigReadResult["cas"];
+  /** 原始文档未被读取流程改写；下一次完整有效保存会在原 CAS 版本上显式恢复。 */
+  recovery?: SettingsRecovery;
 }
 
 /**
@@ -512,7 +526,7 @@ function emptySettingsDocument(): SettingsDocument {
   };
 }
 
-/** 配置读取必须完整命中严格 v1；其它版本或非法 effective/user 文档都 fail closed。 */
+/** 配置读取必须完整命中严格 v1；非法 effective 文档仍然失败关闭。 */
 function parseConfigResponse(value: unknown): z.infer<typeof ConfigDocumentSchema> {
   const parsed = ConfigDocumentSchema.safeParse(value);
   if (!parsed.success) throw new SettingsAdapterError("invalid_response");
@@ -611,6 +625,7 @@ interface SettingsWireAdapter {
   reset(input: ConfigResetInput): Promise<ConfigWriteResult>;
   setCredential(credentialId: string, secret: string, expectedVersion: string): Promise<string>;
   deleteCredential(credentialId: string, expectedVersion: string): Promise<string>;
+  revealProviderCredential(providerId: string): Promise<string | null>;
   snapshot(input?: ConfigReadInput): Promise<LoadedSettings>;
 }
 
@@ -655,28 +670,37 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
     );
   }
   /**
-   * effective 仅供展示，user layer 是后续 user CAS replace 的唯一基线；非法配置直接失败，
-   * 避免 renderer 以空文档覆盖仍可恢复的磁盘状态。
+   * effective 仅供展示，user layer 是后续 user CAS replace 的唯一基线。语义损坏的用户层
+   * 不会在读取时写回；而是用空白编辑投影开放恢复，下一次完整保存仍受原文件 CAS 保护。
+   * 文件 I/O、权限、协议响应或 effective 文档异常没有安全的恢复基线，继续失败关闭。
    */
   async snapshot(input?: ConfigReadInput): Promise<LoadedSettings> {
     const read = await this.read(input);
     const effective = parseConfigResponse(read.effective);
     const userMissing =
       !read.user.present && read.user.status === "missing" && read.user.document === null;
+    const userRecoverable =
+      read.user.present &&
+      read.user.trusted &&
+      read.user.status === "corrupt" &&
+      read.user.document === null;
     if (
       !userMissing &&
+      !userRecoverable &&
       (!read.user.present || read.user.status !== "valid" || !read.user.trusted)
     ) {
       throw new SettingsAdapterError("invalid_response");
     }
-    const userDocument = userMissing
-      ? emptySettingsDocument()
-      : toUiDocument(parseConfigResponse(read.user.document), read.credentials);
+    const userDocument =
+      userMissing || userRecoverable
+        ? emptySettingsDocument()
+        : toUiDocument(parseConfigResponse(read.user.document), read.credentials);
     return {
       document: toUiDocument(effective, read.credentials),
       userDocument,
       projectOverrides: projectOverrides(read.project),
       cas: read.cas,
+      ...(userRecoverable ? { recovery: "user_config_corrupt" as const } : {}),
     };
   }
   /** application 提交 camelCase 聚合，adapter 在唯一边界完成严格 wire 映射。 */
@@ -725,6 +749,15 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
       await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.deleteCredential, { input }),
     );
     return result.version;
+  }
+  /** 仅在编辑一个 Provider 时读取其绑定 API Key，绝不写入快照或 adapter 字段。 */
+  async revealProviderCredential(providerId: string): Promise<string | null> {
+    const input = parseInput(CredentialRevealProviderInputSchema, { providerId });
+    const result = parseResult(
+      CredentialRevealProviderResultSchema,
+      await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.revealProviderCredential, { input }),
+    );
+    return result.secret;
   }
 }
 

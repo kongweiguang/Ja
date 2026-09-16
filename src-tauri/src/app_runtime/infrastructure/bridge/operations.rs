@@ -794,15 +794,7 @@ pub(super) fn config_request_runtime(
     params: Value,
     exit_control: &ExitControl,
 ) -> Result<Value, RuntimeCommandError> {
-    if !matches!(
-        method.as_str(),
-        "configuration/read"
-            | "configuration/patch"
-            | "configuration/replace"
-            | "configuration/reset"
-            | "credential/set"
-            | "credential/delete"
-    ) {
+    if !is_configuration_request_method(&method) {
         return Err(RuntimeCommandError::invalid_params());
     }
     let current = runtime

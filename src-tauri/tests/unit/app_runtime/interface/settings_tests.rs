@@ -78,6 +78,42 @@ fn validates_model_test_boundary() {
     );
 }
 
+/// 模型目录只有保存后的 Provider identity 可穿过 Native，结果只能携带有界模型标识和截断事实。
+#[test]
+fn validates_model_discovery_boundary() {
+    let input = SettingsQueryInput {
+        method: "model/discover".to_owned(),
+        params: json!({"providerId": "provider_openai"}),
+    };
+    assert!(input.validate().is_ok());
+    let secret_injection = SettingsQueryInput {
+        method: "model/discover".to_owned(),
+        params: json!({"providerId": "provider_openai", "apiKey": "must-not-cross"}),
+    };
+    assert!(secret_injection.validate().is_err());
+    assert!(
+        validate_result(
+            SettingsQueryMethod::ModelDiscover,
+            json!({"items": ["gpt-5.6-sol", "provider/model"], "truncated": false})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_result(
+            SettingsQueryMethod::ModelDiscover,
+            json!({"items": ["gpt-test", 7], "truncated": false})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_result(
+            SettingsQueryMethod::ModelDiscover,
+            json!({"items": [], "truncated": false, "authorization": "must-not-cross"})
+        )
+        .is_err()
+    );
+}
+
 /// 统一 items 数组在序列化前受限，旧列表键不能绕过大小边界。
 #[test]
 fn bounds_projection_rows() {
