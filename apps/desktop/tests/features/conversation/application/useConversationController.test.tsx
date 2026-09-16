@@ -1727,87 +1727,20 @@ describe("useConversationController", () => {
     expect(threadRead).toHaveBeenCalledOnce();
   });
 
-  /** terminal 先保留可见回答，再只读取一次权威历史补齐最终轮摘要，避免丢摘要或刷新循环。 */
-  it("terminal 保留 Final 并通过一次快照补齐最终轮公开摘要", async () => {
+  /** terminal 自带完整终态事实；保留可见答复，但不得触发第二次历史读取。 */
+  it("terminal 在单个事件内保留 Final、ChangeSet 与终态，不发起第二次读取", async () => {
     const existing = thread("thr_terminal_refresh");
-    let releaseTerminalSnapshot!: () => void;
-    const terminalSnapshotGate = new Promise<void>((resolve) => {
-      releaseTerminalSnapshot = resolve;
-    });
-    const threadRead = vi
-      .fn<ConversationHistoryPort["threadRead"]>()
-      .mockResolvedValueOnce({
-        threadId: existing.threadId,
-        revision: 0,
-        turns: [],
-        items: [],
-        inputQueue: null,
-        contextUsage: null,
-        taskActivities: [],
-        goalActivities: [],
-        nextCursor: null,
-      })
-      .mockImplementation(async ({ threadId }) => {
-        await terminalSnapshotGate;
-        return {
-          threadId,
-          revision: 2,
-          turns: [
-            {
-              turnId: "turn_terminal",
-              status: "completed" as const,
-              requestedAt: "2026-08-30T12:00:00Z",
-              updatedAt: "2026-08-30T12:00:02Z",
-              completedAt: "2026-08-30T12:00:02Z",
-              errorCode: null,
-              changeSet: {
-                state: "complete" as const,
-                incompleteReasons: [],
-                files: [
-                  {
-                    path: "src/main.ts",
-                    status: "modified" as const,
-                    additions: 3,
-                    deletions: 1,
-                    binary: false,
-                    truncated: false,
-                  },
-                ],
-                stats: {
-                  files: 1,
-                  additions: 3,
-                  deletions: 1,
-                  binaryFiles: 0,
-                  truncated: false,
-                },
-                artifactId: "artifact_terminal_diff",
-              },
-            },
-          ],
-          items: [
-            {
-              itemId: "item_terminal_reasoning",
-              turnId: "turn_terminal",
-              kind: "reasoning_summary" as const,
-              modelRound: 3,
-              createdAt: "2026-08-30T12:00:01Z",
-              text: "两个工具均已完成，现在整理结果。",
-            },
-            {
-              itemId: "item_terminal_final",
-              turnId: "turn_terminal",
-              kind: "final_answer" as const,
-              createdAt: "2026-08-30T12:00:02Z",
-              text: "权威最终答复",
-            },
-          ],
-          inputQueue: null,
-          contextUsage: null,
-          taskActivities: [],
-          goalActivities: [],
-          nextCursor: null,
-        };
-      });
+    const threadRead = vi.fn<ConversationHistoryPort["threadRead"]>(async () => ({
+      threadId: existing.threadId,
+      revision: 0,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    }));
     const threadSeen = vi.fn<ConversationHistoryPort["threadSeen"]>(
       async ({ expectedThreadRevision }) => ({
         ...existing,
@@ -1905,7 +1838,12 @@ describe("useConversationController", () => {
     });
 
     expect(useTimelineStore.getState().items["item_terminal_final"]?.text).toBe("可见最终答复");
-    expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBe("terminal_snapshot");
+    expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+    expect(useTimelineStore.getState().turns["turn_terminal"]?.changeSet).toMatchObject({
+      state: "complete",
+      artifactId: "terminal_event",
+      stats: { files: 1, additions: 3, deletions: 1 },
+    });
     await waitFor(() =>
       expect(threadSeen).toHaveBeenCalledWith({
         threadId: existing.threadId,
@@ -1918,26 +1856,9 @@ describe("useConversationController", () => {
         latestTurnSeen: true,
       }),
     );
-    expect(threadRead).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      releaseTerminalSnapshot();
-      await terminalSnapshotGate;
-    });
-    await waitFor(() =>
-      expect(useTimelineStore.getState().turns["turn_terminal"]?.changeSet).toMatchObject({
-        state: "complete",
-        artifactId: "artifact_terminal_diff",
-        stats: { files: 1, additions: 3, deletions: 1 },
-      }),
-    );
-    expect(useTimelineStore.getState().items["item_terminal_final"]?.text).toBe("权威最终答复");
-    expect(useTimelineStore.getState().items["item_terminal_reasoning"]?.text).toBe(
-      "两个工具均已完成，现在整理结果。",
-    );
-    expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+    expect(threadRead).toHaveBeenCalledTimes(1);
     await act(async () => Promise.resolve());
-    expect(threadRead).toHaveBeenCalledTimes(2);
+    expect(threadRead).toHaveBeenCalledTimes(1);
   });
 
   it("keeps retryable compaction failures stable and redacted", async () => {

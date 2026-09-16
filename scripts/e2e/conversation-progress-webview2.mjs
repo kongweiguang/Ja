@@ -271,15 +271,22 @@ async function waitForApplication(page, deadline) {
 }
 
 /**
- * E2E composition 的项目选择器只在“添加项目”动作后交付受控临时目录；这里只确认项目已登记，
- * 不臆造当前选中状态，后续由 thread identity 触发真实 workspace activation。
+ * E2E composition 的项目选择器只在“添加项目”动作后交付受控临时目录；settings scope 在 runtime
+ * ready 后仍可能短暂同步，必须等真实按钮可用再点击，不能把一次被禁用的点击误判成 picker 失败。
+ *
+ * 这里只确认项目已登记，不臆造当前选中状态，后续由 thread identity 触发真实 workspace activation。
  */
 async function ensureProject(page, deadline) {
   const project = page.locator('[aria-label="项目列表"] button[data-scope-kind="project"]').first();
   if ((await project.count()) === 0) {
-    await page
-      .getByRole("button", { name: "添加项目", exact: true })
-      .click({ timeout: timeout(deadline) });
+    const addProject = page.getByRole("button", { name: "添加项目", exact: true });
+    await addProject.waitFor({ state: "visible", timeout: timeout(deadline) });
+    await waitForCondition(
+      "项目选择可用",
+      () => addProject.isDisabled().then((disabled) => !disabled),
+      deadline,
+    );
+    await addProject.click({ timeout: timeout(deadline) });
   }
   await page
     .locator('[aria-label="项目列表"] button[data-scope-kind="project"]')
@@ -295,7 +302,7 @@ async function restoreRuntimeAfterReload(page, deadline) {
   await waitForApplication(page, deadline);
 }
 
-/** 将公开 Commentary 与公开 Reasoning Summary 同等视为过程叙事，保持 Tool 交错顺序的用户语义。 */
+/** 从工作过程读取已经持久化的 Commentary/Reasoning，避免把正在输出的最终正文误计入过程。 */
 function publicNarrative(process, marker) {
   return process
     .locator(".ja-work-step--commentary, .ja-work-step--reasoning")
@@ -361,11 +368,16 @@ async function expandReadResult(process, deadline) {
   return text;
 }
 
-/** 保留普通正文与公开摘要的独立条目，并确认两个真实工具成功且没有重复。 */
+/**
+ * 断言已结算的过程仍按 Tool 交错，且最后一轮正文不回流到过程。
+ *
+ * 末尾 reasoning summary 仍可审计，但最终 output_text 只属于 AssistantResponse；少一个过程条目
+ * 正是防止 terminal 时正文从过程面板搬运出去的证据。
+ */
 function assertProcessSequence(items, label) {
   assert.deepEqual(
     items.map((item) => item.kind),
-    ["commentary", "tool", "commentary", "commentary", "tool", "commentary"],
+    ["commentary", "tool", "commentary", "commentary", "tool"],
     `${label} must interleave commentary and tools`,
   );
   assert.deepEqual(
@@ -383,7 +395,19 @@ function assertProcessSequence(items, label) {
   );
 }
 
-/** 对外报告执行闭集校验，防止仅凭退出码或截图宣称真实 WebView2 通过。 */
+/**
+ * 终态 reasoning summary 在实时 Draft 清理后会在历史 read 中恢复，所以 live/reload 的过程条数
+ * 可以不同；最终 output_text 则无论何时都不能进入过程。
+ */
+function assertFinalBodyOutsideProcess(items, label) {
+  assert.equal(
+    items.some((item) => item.text.includes(conversationProgressFixtureMarkers.final)),
+    false,
+    `${label} WorkProcess must not contain the final response body`,
+  );
+}
+
+/** 对外报告必须同时证明实时答复的稳定位置、终态折叠与 reload 后的历史过程，防止只验一个截图。 */
 export function validateConversationProgressReport(report) {
   assert.equal(report?.schemaVersion, 1);
   assert.equal(report?.status, "passed");
@@ -395,6 +419,10 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.provider?.toolCalls, 2);
   assert.equal(report?.live?.commentaryBeforeFirstTool, true);
+  assert.equal(report?.live?.streamingFinalResponse, true);
+  assert.equal(report?.live?.finalBodyOutsideProcess, true);
+  assert.equal(report?.live?.finalAnswerNodeStable, true);
+  assert.equal(report?.live?.completedProcessCollapsed, true);
   assert.equal(report?.live?.readSummaryVisible, true);
   assert.deepEqual(report?.live?.sequence, [
     "commentary",
@@ -402,17 +430,29 @@ export function validateConversationProgressReport(report) {
     "commentary",
     "commentary",
     "tool:shell",
-    "commentary",
   ]);
   assert.equal(report?.live?.noDuplicateTools, true);
-  assert.deepEqual(report?.reload?.sequence, report?.live?.sequence);
+  assert.equal(report?.reload?.finalBodyOutsideProcess, true);
+  assert.deepEqual(report?.reload?.sequence, [
+    "commentary",
+    "tool:read",
+    "commentary",
+    "commentary",
+    "tool:shell",
+    "commentary",
+  ]);
   assert.equal(report?.reload?.readSummaryVisible, true);
   assert.equal(report?.reload?.sameThread, true);
   assert.equal(report?.finalVisible, true);
   return report;
 }
 
-/** 在真实窗口提交 Turn；完成后先展开过程再断言，避免把成功态自动折叠误判为摘要丢失。 */
+/**
+ * 在真实窗口提交 Turn；最终正文先在答复节点流式显示，terminal 只收口状态并折叠工作过程。
+ *
+ * 前两轮随后继续调用 Tool，所以它们的已确认文本会归档到过程；最后一轮没有 Tool，必须始终留在
+ * 同一个最终答复节点。受控 fixture gate 使这两个状态可在真窗中分别观察，避免依赖任意等待时间。
+ */
 export async function runConversationProgressWebView2({
   page,
   workspaceRoot,
@@ -451,16 +491,21 @@ export async function runConversationProgressWebView2({
     });
 
   const workProcess = page.locator("section.ja-work-process").last();
-  const firstPublicText = publicNarrative(
-    workProcess,
-    conversationProgressFixtureMarkers.commentary1,
-  );
-  await firstPublicText.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const firstFinalDraft = page
+    .getByRole("article", { name: "最终答复" })
+    .last()
+    .getByText(conversationProgressFixtureMarkers.commentary1, { exact: false });
+  await firstFinalDraft.waitFor({ state: "visible", timeout: timeout(deadline) });
   const activeAnswer = page.getByRole("article", { name: "最终答复" }).last();
   assert.equal(
     await activeAnswer.getByText("正在回复", { exact: true }).count(),
+    1,
+    "the active final-answer surface must label a streamed response",
+  );
+  assert.equal(
+    await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary1).count(),
     0,
-    "streamed public text must be represented by WorkProcess, not the final-answer status",
+    "an active final draft must not also appear inside WorkProcess",
   );
   assert.equal(
     await page.locator(".ja-tool-details").count(),
@@ -500,13 +545,17 @@ export async function runConversationProgressWebView2({
     timeout: timeout(deadline),
   });
   fixture.releaseFinalNarrative();
-  await page
+  await activeAnswer
     .getByText(conversationProgressFixtureMarkers.final, { exact: false })
-    .last()
-    .waitFor({
-      state: "visible",
-      timeout: timeout(deadline),
-    });
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  const streamingAnswerHandle = await activeAnswer.elementHandle();
+  assert.ok(streamingAnswerHandle, "the streamed final answer must have a DOM node");
+  assert.equal(
+    await workProcess.getByText(conversationProgressFixtureMarkers.final, { exact: false }).count(),
+    0,
+    "the final body must remain outside WorkProcess while it streams",
+  );
+  fixture.releaseFinalText();
   await waitForCondition(
     "completed turn",
     () =>
@@ -516,10 +565,30 @@ export async function runConversationProgressWebView2({
         .then((count) => count > 0),
     deadline,
   );
+  const completedAnswer = page
+    .locator('.ja-chat-message-final[data-response-state="completed"]')
+    .last();
+  const completedAnswerHandle = await completedAnswer.elementHandle();
+  assert.ok(completedAnswerHandle, "the completed final answer must retain a DOM node");
+  const finalAnswerNodeStable = await streamingAnswerHandle.evaluate(
+    (streamingNode, completedNode) => streamingNode === completedNode,
+    completedAnswerHandle,
+  );
+  assert.equal(finalAnswerNodeStable, true, "terminal must not replace the streamed final-answer node");
+  await waitForCondition(
+    "completed WorkProcess collapse",
+    () =>
+      workProcess
+        .locator(".ja-work-process__trigger")
+        .getAttribute("aria-expanded")
+        .then((expanded) => expanded === "false"),
+    deadline,
+  );
   await expandProcess(page, deadline);
   const liveReadSummary = await expandReadResult(workProcess, deadline);
   const liveItems = await processItems(page, deadline);
   assertProcessSequence(liveItems, "live");
+  assertFinalBodyOutsideProcess(liveItems, "live");
   const liveSequence = liveItems.map((item) =>
     item.kind === "tool" ? `tool:${item.toolKind}` : item.kind,
   );
@@ -542,7 +611,12 @@ export async function runConversationProgressWebView2({
   await expandProcess(page, deadline);
   const reloadReadSummary = await expandReadResult(workProcess, deadline);
   const restoredItems = await processItems(page, deadline);
-  assertProcessSequence(restoredItems, "reload");
+  assert.deepEqual(
+    restoredItems.map((item) => item.kind),
+    ["commentary", "tool", "commentary", "commentary", "tool", "commentary"],
+    "reload must restore the persisted final-round reasoning summary",
+  );
+  assertFinalBodyOutsideProcess(restoredItems, "reload");
   const restoredSequence = restoredItems.map((item) =>
     item.kind === "tool" ? `tool:${item.toolKind}` : item.kind,
   );
@@ -582,6 +656,10 @@ export async function runConversationProgressWebView2({
     },
     live: {
       commentaryBeforeFirstTool: true,
+      streamingFinalResponse: true,
+      finalBodyOutsideProcess: true,
+      finalAnswerNodeStable,
+      completedProcessCollapsed: true,
       readSummaryVisible: liveReadSummary.length > 0,
       sequence: liveSequence,
       noDuplicateTools: liveItems.filter((item) => item.kind === "tool").length === 2,
@@ -589,6 +667,7 @@ export async function runConversationProgressWebView2({
     reload: {
       sameThread: true,
       readSummaryVisible: reloadReadSummary.length > 0,
+      finalBodyOutsideProcess: true,
       sequence: restoredSequence,
     },
     finalVisible: true,
@@ -636,7 +715,8 @@ async function main() {
       fixture: "no-head",
       hiddenWindow: true,
       preserveFailedProfile: true,
-      // Windows 新 UDF 先完成 profile 初始化，再由同一隔离 profile 开启回环 CDP，避免首启窗口已运行但调试端口尚未可附着。
+      // Windows 新 UDF 首次启动不会稳定接受远程调试参数；先只完成 profile 初始化，
+      // 再由同一隔离 profile 的受控实例承载 CDP 与业务验收，不会触及用户窗口或数据。
       prewarmWebview: true,
       ignoredFiles: 0,
       untrackedFiles: 0,

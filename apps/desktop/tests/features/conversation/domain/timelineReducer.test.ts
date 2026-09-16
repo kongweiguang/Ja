@@ -606,7 +606,7 @@ describe("timeline reducer", () => {
     expect(state.items["item_final"]?.metadata?.usageTotalTokens).toBe(15);
     expect(state.items["item_final"]?.metadata?.failureReply).toBeUndefined();
     expect(state.lastOutcome).toBe("applied");
-    expect(state.resyncRequired[threadId]).toBe("terminal_snapshot");
+    expect(state.resyncRequired[threadId]).toBeUndefined();
   });
 
   /** 同一模型提交的 live 与 snapshot 都必须保持 reasoning、正文、Tool 的稳定阅读顺序。 */
@@ -1578,7 +1578,7 @@ describe("timeline reducer", () => {
         .filter((item) => item?.kind === "agent_message" && item.final)
         .map((item) => item?.text),
     ).toEqual(["调整方向已处理", "编辑后的普通消息已处理", "最后一条普通消息已处理"]);
-    expect(state.resyncRequired[threadId]).toBe("terminal_snapshot");
+    expect(state.resyncRequired[threadId]).toBeUndefined();
   });
 
   it("closes unresolved approvals at a terminal boundary without fabricating a decision", () => {

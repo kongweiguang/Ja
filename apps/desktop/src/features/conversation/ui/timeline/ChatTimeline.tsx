@@ -239,8 +239,46 @@ function visibleTurnErrorCode(error: TimelineTurn["error"] | undefined): string 
 }
 
 /**
+ * 只有未结算的公开 assistant Draft 才预览为最终答复正文；已持久化的模型步骤仍是工作过程事实。
+ *
+ * 这让最终结果在首个 delta 到达时就占据稳定阅读位置，terminal 只替换其内容/状态而不搬运节点；
+ * 同时避免把随后携带 Tool 的中间模型文本误标成最终答复。
+ */
+function isLiveAssistantResponse(item: TimelineItemAdapter): boolean {
+  return (
+    item.kind === "commentary" &&
+    item.status === "in_progress" &&
+    item.metadata?.phase === "assistant_progress"
+  );
+}
+
+/**
+ * 历史 read 会同时返回本轮最后的 assistant_progress 与冻结 final_answer；两者正文相同且最终
+ * 答复已有独立阅读位置时，保留前者会让重载后的工作过程重复最终正文。
+ *
+ * 这里只剔除同一 exchange 内、文本完全相同的持久 progress，不影响 Tool 前的过程叙事或 reasoning，
+ * 也不触碰仍在流式中的 Draft。
+ */
+function isPersistedFinalProgressDuplicate(
+  item: TimelineItemAdapter,
+  finalTexts: ReadonlySet<string>,
+): boolean {
+  const text = item.text?.trim();
+  return (
+    item.kind === "commentary" &&
+    item.status !== "in_progress" &&
+    item.metadata?.phase === "assistant_progress" &&
+    text !== undefined &&
+    finalTexts.has(text)
+  );
+}
+
+/**
  * 将规范化投影按 USER Message 切为 exchange；同一 Turn 消费下一条队列输入时立即开始新行，
- * 后续工作与 Final 归入新 exchange，避免把多次用户意图压进同一气泡。
+ * 后续工作与最终答复归入新 exchange，避免把多次用户意图压进同一气泡。
+ *
+ * 未结算的公开答复 Draft 直接进入最终答复槽位，而已提交的 progress/reasoning 仍归入工作过程，
+ * 保证流式结果不会在 terminal 时跨 Surface 迁移，同时保留中间步骤的可审计顺序。
  */
 function buildRows(
   items: readonly TimelineItemAdapter[],
@@ -284,7 +322,7 @@ function buildRows(
       currentByTurn.set(item.turnId, exchange);
     } else if (item.kind === "thread_message") {
       currentFor(item.turnId).threadMessages.push(item);
-    } else if (item.kind === "agent_message") {
+    } else if (item.kind === "agent_message" || isLiveAssistantResponse(item)) {
       currentFor(item.turnId).final.push(item);
     } else {
       const group = currentFor(item.turnId);
@@ -292,6 +330,20 @@ function buildRows(
       if (item.metadata?.callId !== undefined) {
         exchangeByCall.set(callKey(item.turnId, item.metadata.callId), group);
       }
+    }
+  }
+  for (const group of rows) {
+    const finalTexts = new Set(
+      group.final.flatMap((item) =>
+        item.kind === "agent_message" && item.final === true && item.text?.trim()
+          ? [item.text.trim()]
+          : [],
+      ),
+    );
+    if (finalTexts.size > 0) {
+      group.work = group.work.filter(
+        (item) => !isPersistedFinalProgressDuplicate(item, finalTexts),
+      );
     }
   }
   for (const approval of approvals) {

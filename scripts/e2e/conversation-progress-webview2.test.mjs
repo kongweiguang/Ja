@@ -26,13 +26,18 @@ function validReport() {
     provider: { kind: "deterministic_loopback", externalCalls: 0, toolCalls: 2 },
     live: {
       commentaryBeforeFirstTool: true,
+      streamingFinalResponse: true,
+      finalBodyOutsideProcess: true,
+      finalAnswerNodeStable: true,
+      completedProcessCollapsed: true,
       readSummaryVisible: true,
-      sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell", "commentary"],
+      sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell"],
       noDuplicateTools: true,
     },
     reload: {
       sameThread: true,
       readSummaryVisible: true,
+      finalBodyOutsideProcess: true,
       sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell", "commentary"],
     },
     finalVisible: true,
@@ -60,9 +65,12 @@ test("CLI 默认使用 JDK25 与独立 conversation-progress Cargo target", () =
   assert.match(parsed.cargoTargetDirectory, /target[\\/]codex-conversation-progress$/u);
 });
 
-test("报告必须证明实时和 reload 后的公开交错顺序", () => {
+test("报告必须证明最终正文原位流式、终态折叠与 reload 后的公开交错顺序", () => {
   const report = validReport();
   assert.equal(validateConversationProgressReport(report), report);
+  report.live.finalAnswerNodeStable = false;
+  assert.throws(() => validateConversationProgressReport(report), /equal/u);
+  report.live.finalAnswerNodeStable = true;
   report.reload.sequence = ["commentary", "tool:read", "tool:shell", "commentary"];
   assert.throws(() => validateConversationProgressReport(report), /interleave|deep-equal|equal/u);
 });
@@ -103,6 +111,8 @@ test("loopback fixture 按 function_call_output 推进 read、shell、final 三�
     ]);
     await waitForFixtureStage(fixture, "summary_final");
     fixture.releaseFinalNarrative();
+    await waitForFixtureStage(fixture, "text_final");
+    fixture.releaseFinalText();
     const third = await (await thirdResponse).text();
     assert.match(third, new RegExp(conversationProgressFixtureMarkers.final, "u"));
     assert.deepEqual(

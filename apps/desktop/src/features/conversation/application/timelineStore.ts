@@ -47,8 +47,8 @@ const draftItemByProjection = new WeakMap<
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
- * 把同一份 Draft Segment 映射为稳定的 Item 引用；公开回复草稿必须与结算后的
- * assistant_progress 共享 commentary 语义，首个 delta 才能直接进入工作过程而不会先冒充最终答复。
+ * 把同一份 Draft Segment 映射为稳定的 Item 引用；公开回复草稿与结算后的
+ * assistant_progress 仍共享 commentary 语义，但 Renderer 只将未结算 Draft 预览在最终答复位置。
  * Reasoning 仍保留独立类型，跨语义段各自占据阅读位置。WeakMap 让重复 Selector 保持引用稳定，
  * 并在终态清理 Draft 后自动释放缓存。
  */
@@ -63,7 +63,7 @@ function draftItemForTurn(
     itemId: `draft:${turnId}:${draft.segmentStartSeq}`,
     threadId,
     turnId,
-    // assistant 草稿对应中间模型步骤；只有 terminal 事件生成 agent_message，避免结算时改变 UI 语义。
+    // assistant 草稿保留协议的 commentary 身份；Renderer 以 in_progress + phase 识别它并预览为最终答复。
     kind: draft.kind === "reasoning" ? "reasoning" : "commentary",
     status: "in_progress",
     text: draft.text,

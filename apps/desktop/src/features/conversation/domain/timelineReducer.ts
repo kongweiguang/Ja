@@ -76,7 +76,6 @@ type ResyncReason =
   | "invalid_event"
   | "projection_fault"
   | "terminal_missing"
-  | "terminal_snapshot"
   | "snapshot_invalid"
   | "handshake_required"
   | "handshake_failed";
@@ -1651,7 +1650,12 @@ function applyMessagesReceived(
   return next;
 }
 
-/** 应用持久事件；终态保留已确认回答，并通过一次权威快照补齐未随 terminal 发送的最终轮摘要。 */
+/**
+ * 应用持久事件；终态通知已携带冻结的最终答复、Usage 与 ChangeSet，因此在同一投影事务内收口。
+ *
+ * 只有 gap、缺失关联或非法事实才请求权威快照；每轮终态后再读历史会造成第二次可见重投影，
+ * 却不能补充 v1 terminal 合同之外的信息。
+ */
 function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): TimelineState {
   const currentRevision = state.threadRevisionByThread[event.params.threadId] ?? 0;
   if (event.params.threadRevision <= currentRevision) {
@@ -1898,11 +1902,8 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       next = closePendingApprovals(next, params.threadId, params.turnId, params.occurredAt);
       const inputQueueByTurn = { ...next.inputQueueByTurn };
       delete inputQueueByTurn[params.turnId];
-      next = {
-        ...next,
-        inputQueueByTurn,
-        resyncRequired: { ...next.resyncRequired, [params.threadId]: "terminal_snapshot" },
-      };
+      // terminal 已在合同层冻结答复、用量和 ChangeSet；只提交一次投影，避免终态后再次 thread/read。
+      next = { ...next, inputQueueByTurn };
       break;
     }
     default:

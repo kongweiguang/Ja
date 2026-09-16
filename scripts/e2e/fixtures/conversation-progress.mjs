@@ -242,6 +242,10 @@ export async function startConversationProgressFixture() {
   const finalNarrativeGate = new Promise((resolvePromise) => {
     releaseFinalNarrative = resolvePromise;
   });
+  let releaseFinalText;
+  const finalTextGate = new Promise((resolvePromise) => {
+    releaseFinalText = resolvePromise;
+  });
   const server = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/responses") {
       response.writeHead(404, { "content-type": "application/json" });
@@ -312,7 +316,7 @@ export async function startConversationProgressFixture() {
           finalStream(),
           stages,
           "final",
-          undefined,
+          finalTextGate,
           finalNarrativeGate,
         );
         return;
@@ -345,6 +349,10 @@ export async function startConversationProgressFixture() {
     releaseFinalNarrative() {
       releaseFinalNarrative();
     },
+    /** 最终正文已写入但 terminal 未发送时恢复流，供真窗断言正文的稳定渲染位置。 */
+    releaseFinalText() {
+      releaseFinalText();
+    },
     /** 仅返回低敏阶段与请求种类，报告不包含 Provider request body。 */
     snapshot() {
       return { attempts: attempts.map((attempt) => ({ ...attempt })), stages: [...stages] };
@@ -354,6 +362,7 @@ export async function startConversationProgressFixture() {
       releaseFirstText();
       releaseSecondNarrative();
       releaseFinalNarrative();
+      releaseFinalText();
       server.closeAllConnections?.();
       await new Promise((resolvePromise) => server.close(resolvePromise));
     },
