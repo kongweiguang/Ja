@@ -273,10 +273,37 @@ final class WorkspaceFileTools {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
+    /**
+     * 归并 native 搜索 Tool 的不变量，避免 grep/find 在只读权限和 Workspace 注入上随功能演进分叉。
+     */
+    private abstract static class NativeWorkspaceSearchTool extends ToolSupport {
+        protected final Path workspaceRoot;
+        protected final NativeSearchToolResolver resolver;
+
+        /**
+         * 接收子类在对象分配前已校验的依赖，避免抽象构造期间抛异常留下半初始化子类，同时保持 Turn 隔离。
+         */
+        private NativeWorkspaceSearchTool(ToolSpec spec, Path workspaceRoot, NativeSearchToolResolver resolver) {
+            super(spec);
+            this.workspaceRoot = workspaceRoot;
+            this.resolver = resolver;
+        }
+
+        /** native 发现能力只读取受边界保护的 Workspace，不能声明写副作用。 */
+        @Override
+        public final ToolSideEffect sideEffect() {
+            return ToolSideEffect.READ_ONLY;
+        }
+
+        /** native 搜索不会写入或发布 ChangeSet，统一固定为 NONE 以免子类契约漂移。 */
+        @Override
+        public final WorkspaceMutationMode workspaceMutationMode() {
+            return WorkspaceMutationMode.NONE;
+        }
+    }
+
     /** rg 采用 Pi 的正则默认值与少量可选开关，所有候选仍经过 WorkspaceBoundary 复核。 */
-    private static final class GrepTool extends ToolSupport {
-        private final Path workspaceRoot;
-        private final NativeSearchToolResolver resolver;
+    private static final class GrepTool extends NativeWorkspaceSearchTool {
 
         /** 冻结 grep 的字段长度、输出边界和 executable resolver，使每次调用互不污染。 */
         private GrepTool(Path workspaceRoot, NativeSearchToolResolver resolver) {
@@ -296,21 +323,8 @@ final class WorkspaceFileTools {
                                     "Lines before and after each match; defaults to 0.", 0, Integer.MAX_VALUE),
                             "limit", integerProperty(
                                     "Maximum matching lines; defaults to 100.", 1, Integer.MAX_VALUE)),
-                            List.of("pattern"))));
-            this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
-            this.resolver = Objects.requireNonNull(resolver, "resolver");
-        }
-
-        /** grep 不写工作区或外部系统。 */
-        @Override
-        public ToolSideEffect sideEffect() {
-            return ToolSideEffect.READ_ONLY;
-        }
-
-        /** grep 不产生 Workspace ChangeSet。 */
-        @Override
-        public WorkspaceMutationMode workspaceMutationMode() {
-            return WorkspaceMutationMode.NONE;
+                            List.of("pattern"))), Objects.requireNonNull(workspaceRoot, "workspaceRoot"),
+                    Objects.requireNonNull(resolver, "resolver"));
         }
 
         /**
@@ -444,9 +458,7 @@ final class WorkspaceFileTools {
     }
 
     /** find 通过 fd 返回文件和目录路径，不读取正文并完整复用 fd 的 ignore 规则。 */
-    private static final class FindTool extends ToolSupport {
-        private final Path workspaceRoot;
-        private final NativeSearchToolResolver resolver;
+    private static final class FindTool extends NativeWorkspaceSearchTool {
 
         /** 冻结 find 的 Glob、路径、结果上限和 executable resolver。 */
         private FindTool(Path workspaceRoot, NativeSearchToolResolver resolver) {
@@ -458,21 +470,8 @@ final class WorkspaceFileTools {
                                     "Optional workspace-relative directory; defaults to .", MAX_PATH_LENGTH),
                             "limit", integerProperty(
                                     "Maximum matching files or directories; defaults to 100.", 1, Integer.MAX_VALUE)),
-                            List.of("pattern"))));
-            this.workspaceRoot = Objects.requireNonNull(workspaceRoot, "workspaceRoot");
-            this.resolver = Objects.requireNonNull(resolver, "resolver");
-        }
-
-        /** find 不改变工作区或外部系统。 */
-        @Override
-        public ToolSideEffect sideEffect() {
-            return ToolSideEffect.READ_ONLY;
-        }
-
-        /** find 只投影路径事实，不产生 Workspace ChangeSet。 */
-        @Override
-        public WorkspaceMutationMode workspaceMutationMode() {
-            return WorkspaceMutationMode.NONE;
+                            List.of("pattern"))), Objects.requireNonNull(workspaceRoot, "workspaceRoot"),
+                    Objects.requireNonNull(resolver, "resolver"));
         }
 
         /** fd 负责 glob、hidden、gitignore 和结果上限；Java 只复核路径 containment。 */

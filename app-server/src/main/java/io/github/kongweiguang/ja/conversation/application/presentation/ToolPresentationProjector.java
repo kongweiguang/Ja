@@ -221,8 +221,7 @@ public final class ToolPresentationProjector {
     private static String readInput(String toolName, JsonObject arguments, List<String> paths,
                                     Path root, List<String> knownSecrets) {
         return switch (toolName) {
-            case "grep" -> searchInput("pattern", arguments, paths, root, knownSecrets);
-            case "find" -> searchInput("pattern", arguments, paths, root, knownSecrets);
+            case "grep", "find" -> searchInput("pattern", arguments, paths, root, knownSecrets);
             case "ls" -> paths.isEmpty() ? "." : paths.getFirst();
             case "read_attachment" -> attachmentInput(arguments, root, knownSecrets);
             default -> fileReadInput(arguments, paths);
