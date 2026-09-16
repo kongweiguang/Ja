@@ -9,17 +9,17 @@ const CALLS = Object.freeze([
   Object.freeze({
     callId: "call_file_search_readme",
     name: "find",
-    arguments: { pattern: "README*", path: ".", maxResults: 200 },
+    arguments: { pattern: "README*", path: ".", limit: 200 },
   }),
   Object.freeze({
     callId: "call_file_search_agents",
     name: "find",
-    arguments: { pattern: "AGENTS.md", path: ".", maxResults: 200 },
+    arguments: { pattern: "AGENTS.md", path: ".", limit: 200 },
   }),
   Object.freeze({
     callId: "call_file_search_codegraph",
     name: "find",
-    arguments: { pattern: ".codegraph", path: ".", maxResults: 200 },
+    arguments: { pattern: ".codegraph", path: ".", limit: 200 },
   }),
 ]);
 
