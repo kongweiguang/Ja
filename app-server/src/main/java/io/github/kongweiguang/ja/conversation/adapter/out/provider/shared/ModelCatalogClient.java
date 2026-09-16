@@ -35,6 +35,10 @@ public final class ModelCatalogClient {
     private static final int MAX_RESPONSE_BYTES = 1_024 * 1_024;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /**
+     * 静态目录客户端不拥有 HTTP、线程或凭据资源；禁止实例化以确保这些资源继续由
+     * {@link ModelTransport} 的 composition owner 统一管理和关闭。
+     */
     private ModelCatalogClient() {
         // 静态无状态客户端只复用由 composition owner 管理的 ModelTransport。
     }
