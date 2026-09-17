@@ -409,10 +409,10 @@ function terminalGoalController(
   };
 }
 
-/** 卸载后先排空 Virtualizer 的 0ms notify，避免环境销毁后仍访问 window。 */
+/** 卸载后排空 Virtualizer 默认 150ms 的 scroll-end debounce，避免环境销毁后仍访问 window。 */
 afterEach(async () => {
   cleanup();
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => setTimeout(resolve, 200));
   useTimelineStore.getState().reset();
 });
 
