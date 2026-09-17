@@ -70,6 +70,7 @@ interface TaskTabRenameSession {
 }
 
 interface TabContextMenuSession {
+  readonly id: number;
   readonly tabKey: string;
   readonly x: number;
   readonly y: number;
@@ -184,6 +185,7 @@ export function Workbench({
   const closingTabRef = useRef<string | undefined>(undefined);
   const closingSequenceRef = useRef(false);
   const tabContextMenuTriggerRef = useRef<HTMLButtonElement | undefined>(undefined);
+  const tabContextMenuSequenceRef = useRef(0);
   const contextMenuOpenRef = useRef(false);
   const mountedRef = useRef(false);
   const contextMenuOpenChangeRef = useRef(onTabContextMenuOpenChange);
@@ -518,6 +520,21 @@ export function Workbench({
     })();
   };
 
+  /**
+   * 每次请求都创建不可复用的 Radix 菜单会话，使卸载中的旧 Portal 回调不能关闭后续键盘
+   * 菜单；菜单根节点以该身份重建，避免重定向时复用含有旧焦点状态的 Dropdown Root。
+   */
+  const requestTabContextMenu = (
+    tab: WorkbenchTab,
+    trigger: HTMLButtonElement | undefined,
+    x: number,
+    y: number,
+  ): void => {
+    tabContextMenuTriggerRef.current = trigger;
+    tabContextMenuSequenceRef.current += 1;
+    setTabContextMenu({ id: tabContextMenuSequenceRef.current, tabKey: tab.key, x, y });
+  };
+
   /** 右键只建立菜单上下文，不选择 Tab；文本输入保留 WebView2 的原生编辑菜单。 */
   const openTabContextMenu = (event: MouseEvent<HTMLDivElement>, tab: WorkbenchTab): void => {
     const target = event.target instanceof Element ? event.target : undefined;
@@ -529,9 +546,12 @@ export function Workbench({
     event.preventDefault();
     event.stopPropagation();
     clearTabDrag();
-    tabContextMenuTriggerRef.current =
-      event.currentTarget.querySelector<HTMLButtonElement>("[data-workbench-tab]") ?? undefined;
-    setTabContextMenu({ tabKey: tab.key, x: event.clientX, y: event.clientY });
+    requestTabContextMenu(
+      tab,
+      event.currentTarget.querySelector<HTMLButtonElement>("[data-workbench-tab]") ?? undefined,
+      event.clientX,
+      event.clientY,
+    );
   };
 
   /** ContextMenu 与 Shift+F10 锚定 Tab 下缘，并保留原焦点供 Escape 恢复。 */
@@ -543,12 +563,12 @@ export function Workbench({
     event.preventDefault();
     event.stopPropagation();
     const bounds = event.currentTarget.getBoundingClientRect();
-    tabContextMenuTriggerRef.current = event.currentTarget;
-    setTabContextMenu({
-      tabKey: tab.key,
-      x: bounds.left + Math.min(24, Math.max(0, bounds.width)),
-      y: bounds.bottom,
-    });
+    requestTabContextMenu(
+      tab,
+      event.currentTarget,
+      bounds.left + Math.min(24, Math.max(0, bounds.width)),
+      bounds.bottom,
+    );
     return true;
   };
 
@@ -721,6 +741,7 @@ export function Workbench({
               closingSequence || closingTab !== undefined || renamingTaskTab !== undefined;
             return (
               <WorkbenchTabContextMenu
+                key={tabContextMenu.id}
                 label={tabDisplayLabel(contextTab, definitions)}
                 x={tabContextMenu.x}
                 y={tabContextMenu.y}
@@ -733,7 +754,10 @@ export function Workbench({
                 canCloseOthers={openTabs.length > 1}
                 canCloseRight={contextIndex >= 0 && contextIndex < openTabs.length - 1}
                 onOpenChange={(open) => {
-                  if (!open) setTabContextMenu(undefined);
+                  if (!open)
+                    setTabContextMenu((current) =>
+                      current?.id === tabContextMenu.id ? undefined : current,
+                    );
                 }}
                 onRestoreFocus={() => {
                   const trigger = tabContextMenuTriggerRef.current;
