@@ -3,7 +3,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TimelineItemAdapter } from "@/features/conversation/domain/timelineTypes";
 import { ChatTimeline } from "@/features/conversation/ui/timeline/ChatTimeline";
 
@@ -32,10 +32,22 @@ function expectBefore(leftText: string, rightText: string): void {
   expect(left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
 }
 
-/** 卸载后先排空 Virtualizer 的 0ms notify，避免环境销毁后仍访问 window。 */
+/**
+ * Virtualizer 的 scroll-end debounce 在取消订阅后仍会保留 150ms 回调；整个用例使用假时钟，
+ * 才能在 jsdom 销毁前确定性地排空它，而不把环境 teardown 竞态伪装成测试通过。
+ */
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+/** 卸载后推进 Virtualizer 默认的滚动结束延迟，并总是恢复后续用例的真实时钟。 */
 afterEach(async () => {
-  cleanup();
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  try {
+    cleanup();
+    await vi.advanceTimersByTimeAsync(200);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 describe("ChatTimeline external rows", () => {
