@@ -11,7 +11,7 @@ import {
   Settings2,
   X,
 } from "lucide-react";
-import { useRef, type KeyboardEvent, type ReactElement } from "react";
+import { useLayoutEffect, useRef, type KeyboardEvent, type ReactElement } from "react";
 import {
   Dialog,
   DialogClose,
@@ -65,10 +65,14 @@ export function CommandPalette({ open, viewModel, actions }: CommandPaletteProps
   const composingRef = useRef(false);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const activeCommandIdRef = useRef(viewModel.activeCommandId);
-  activeCommandIdRef.current = viewModel.activeCommandId;
   const activeCommand = viewModel.commands.find(
     (command) => command.id === viewModel.activeCommandId,
   );
+
+  /** 提交后的权威投影覆盖事件内暂存选择，避免 ref 在 render 中写入且不保留过滤后的旧 id。 */
+  useLayoutEffect(() => {
+    activeCommandIdRef.current = viewModel.activeCommandId;
+  }, [viewModel.activeCommandId]);
 
   /**
    * 连续键盘事件可能早于受控 viewModel 的下一次渲染到达；此 ref 只保存当前事件序列的
