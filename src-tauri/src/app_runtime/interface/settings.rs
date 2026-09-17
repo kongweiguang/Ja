@@ -6,8 +6,7 @@
 use super::settings_model::{SettingsQueryInput, validate_result};
 use crate::app_runtime::{
     McpListParams, McpTestParams, McpToolsReadParams, ModelDiscoverParams, ModelTestParams,
-    RuntimeCommandError,
-    RuntimeHost, SettingsRequest, SettingsResponse, SkillListParams,
+    RuntimeCommandError, RuntimeHost, SettingsRequest, SettingsResponse, SkillListParams,
 };
 use serde_json::Value;
 
