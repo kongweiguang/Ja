@@ -127,6 +127,7 @@ const methods = [
   "mcp/list",
   "mcp/test",
   "model/test",
+  "model/discover",
   "mcp/list-tools",
   "tool/artifact/read",
 ];
