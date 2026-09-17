@@ -122,6 +122,7 @@ const methods = [
   "configuration/reset",
   "credential/set",
   "credential/delete",
+  "credential/reveal-provider",
   "skill/list",
   "mcp/list",
   "mcp/test",
