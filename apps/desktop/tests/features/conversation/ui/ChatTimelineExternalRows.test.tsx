@@ -32,7 +32,11 @@ function expectBefore(leftText: string, rightText: string): void {
   expect(left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
 }
 
-afterEach(() => cleanup());
+/** 卸载后先排空 Virtualizer 的 0ms notify，避免环境销毁后仍访问 window。 */
+afterEach(async () => {
+  cleanup();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
 
 describe("ChatTimeline external rows", () => {
   it("让 Task Activity 按服务端时间与父 Timeline exchange 交错，而不是统一挂在尾部", () => {
