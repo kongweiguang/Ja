@@ -5,10 +5,12 @@
 
 Ja 沿用 Kerminal/GMark 的分发策略：不要求 Windows Authenticode 或 macOS Developer ID/公证证书，更新包仍必须使用应用内置公钥对应的 Tauri 密钥签名。系统可能显示 SmartScreen 或未识别开发者提示；这不代表更新签名被关闭。
 
-`.github/workflows/native-app-server.yml` 分为两条路径：
+`.github/workflows/native-app-server.yml` 与 `.github/workflows/release.yml` 分为两条路径：
 
-- `pull_request`、`main` 和普通手工运行：只构建 unsigned Native/NSIS/DMG smoke，不需要签名凭据，也不能作为发布证据。
-- 手工 `release=true`：使用 Tauri 更新签名构建 Windows x64 NSIS、macOS Intel/Apple Silicon DMG 和更新归档，继续执行 Native、安装 smoke 与供应链门禁，不要求系统证书。
+- `pull_request`、`main` 和普通 `native-app-server.yml` 手工运行：完整执行合同、JVM、前端、Rust、脚本和 unsigned Native/NSIS/DMG smoke；成功的 `main` run 是唯一可发布候选证据。
+- `release.yml` 手工输入该成功 `main` run 的完整 commit SHA：先重新确认该 SHA 仍是 `main` 且存在成功的完整 CI，再复用这一验证结论，只执行 Tauri 更新签名、Windows x64 NSIS、macOS Intel/Apple Silicon DMG、安装 smoke、供应链门禁与 Draft 汇总，不重复语言测试。
+
+候选已通过普通 CI 后，从 `main` 触发：`gh workflow run release.yml --ref main -f source_commit=<完整40位SHA>`。
 
 JVM 常规验证与 Jazzer fuzz 使用独立 Maven/JVM 调用：常规 `verify` 排除 `ProviderInputFuzzTest`，紧随其后的两个必需 fuzz 步骤分别执行该类的全部两个方法，防止全局插桩状态传播到后续 FFM/Win32 测试。任何一步失败均阻止原生构建。
 
@@ -24,7 +26,7 @@ Windows Host 与 Shell 的环境白名单会转发宿主提供的绝对 `PSModul
 
 桌面更新签名：`TAURI_SIGNING_PRIVATE_KEY`，以及密钥设有密码时所需的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥必须与应用内置 updater 公钥匹配，不得为通过构建而临时替换。
 
-发布从指定提交手工触发 `release=true`。Native 矩阵通过后，汇总签名产物并生成 `latest.json`，从权威产品版本派生 `v<version>`，为该提交创建未公开的 GitHub draft Release。工作流不由 tag push 触发，不提前创建或移动发布 tag，也不会自动公开或覆盖同名 Release；公开时确认 tag 指向通过验收的提交。
+发布通过 `release.yml` 从指定的完整 SHA 手工触发。调用前先确认该 SHA 是当前 `main`，并且已有成功的 `native-app-server.yml` push run；任何提交漂移、未通过或缺失验证都会在签名前失败。签名 Native 矩阵通过后，汇总产物并生成 `latest.json`，从权威产品版本派生 `v<version>`，为该提交创建未公开的 GitHub draft Release。工作流不由 tag push 触发，不提前创建或移动发布 tag，也不会自动公开或覆盖同名 Release；公开时确认 tag 指向通过验收的提交。
 
 `package.json` 是产品版本的唯一来源。`pnpm version:sync` 和 `pnpm version:check` 同时覆盖 Cargo、Tauri、Maven 与协议 golden 中 `runtime/initialize` 响应的 `engineVersion`，不改写请求中的 `clientVersion` 示例。运行 JVM 桌面验收前还需重新打包并核对 JAR 内嵌版本，源码版本同步不会替换已有 JAR。
 

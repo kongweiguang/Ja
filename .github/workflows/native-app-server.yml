@@ -52,15 +52,27 @@ on:
       - "tsconfig*.json"
       - "LICENSE"
   workflow_dispatch:
+  workflow_call:
     inputs:
       release:
-        description: "Build release bundles with Tauri updater signatures"
-        required: false
-        default: false
+        description: "Build updater-signed release bundles after the caller verifies the source"
+        required: true
         type: boolean
+      skip_verification:
+        description: "Reuse a successful main CI run for the exact source commit"
+        required: true
+        type: boolean
+      source_commit:
+        description: "Immutable source commit selected by the release caller"
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+env:
+  # Reusable release callers build an explicitly verified SHA; direct CI remains bound to its event SHA.
+  JA_SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
 
 concurrency:
   group: ja-native-app-server-${{ github.workflow }}-${{ github.ref }}
@@ -69,6 +81,7 @@ concurrency:
 jobs:
   fast-verification:
     name: Contracts and workspace verification
+    if: ${{ !(github.event_name == 'workflow_call' && inputs.skip_verification) }}
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -101,11 +114,17 @@ jobs:
       - name: Install uv for the contract and Python test runners
         uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
 
+      # Golden protocol and staging tests only require Python. Keep them ahead of heavyweight JVM,
+      # frontend and Rust work so contract drift fails in minutes instead of at the end of CI.
+      - name: Run Python script tests
+        shell: pwsh
+        run: uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar scripts.native.test_stage_search_tools
+
       - name: Verify pinned toolchains
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'checkout commit differs from event commit' }
+          if ((git rev-parse HEAD).Trim() -ne $env:JA_SOURCE_COMMIT) { throw 'checkout commit differs from event commit' }
           if ((node --version).Trim() -ne 'v24.10.0') { throw 'Node.js version drifted from the locked project toolchain' }
           if ((pnpm --version).Trim() -ne '10.33.0') { throw 'pnpm version drifted from the locked project toolchain' }
           $javaVersion = java -version 2>&1 | Out-String
@@ -142,7 +161,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-jvm-search-tools'
-          python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch x86_64 --target-triple x86_64-pc-windows-msvc --source-commit $env:GITHUB_SHA
+          python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch x86_64 --target-triple x86_64-pc-windows-msvc --source-commit $env:JA_SOURCE_COMMIT
           if ($LASTEXITCODE -ne 0) { throw "search-tool staging failed with exit code $LASTEXITCODE" }
           $tools = Join-Path $stage 'sidecars/tools'
           if (-not (Test-Path -LiteralPath $tools -PathType Container)) { throw 'staged search-tool directory is missing' }
@@ -233,10 +252,6 @@ jobs:
         shell: pwsh
         run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs scripts/e2e/file-search-acceptance.test.mjs scripts/verification/powershell-fail-fast.test.mjs
 
-      - name: Run Python script tests
-        shell: pwsh
-        run: uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar scripts.native.test_stage_search_tools
-
       - name: Run PowerShell script tests
         shell: pwsh
         run: |
@@ -249,6 +264,12 @@ jobs:
   native-app-server:
     name: App Server (${{ matrix.platform }} / ${{ matrix.arch }})
     needs: fast-verification
+    if: >-
+      ${{
+        always() &&
+        (needs.fast-verification.result == 'success' ||
+          (github.event_name == 'workflow_call' && inputs.skip_verification))
+      }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -280,9 +301,8 @@ jobs:
             nikSuffix: macos-aarch64
             nikSha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
     env:
-      # Only an explicitly requested release dispatch builds updater-signed bundles. Release
-      # bundles remain unsigned by the operating systems while updater signatures stay enabled.
-      JA_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.release == true }}
+      # Only the release caller can request updater-signed bundles. System bundles remain unsigned.
+      JA_RELEASE: ${{ github.event_name == 'workflow_call' && inputs.release == true }}
       NIK_VERSION: 25.0.3+2
       NIK_JAVA_VERSION: 25.0.3+12
       NIK_URL: https://download.bell-sw.com/vm/25.0.3/bellsoft-liberica-vm-openjdk25.0.3%2B12-25.0.3%2B2-${{ matrix.nikSuffix }}.zip
@@ -292,7 +312,7 @@ jobs:
       - name: Checkout exact event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_commit || github.sha }}
           fetch-depth: 1
 
       - name: Install uv for the native verifier
@@ -310,7 +330,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'checkout commit differs from event commit' }
+          if ((git rev-parse HEAD).Trim() -ne $env:JA_SOURCE_COMMIT) { throw 'checkout commit differs from selected source commit' }
           if (-not (Select-String -LiteralPath 'app-server/pom.xml' -Pattern '<buildArg>--no-fallback</buildArg>' -Quiet)) { throw 'Native Image fallback is not explicitly disabled' }
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-native-evidence'
           New-Item -ItemType Directory -Force -Path $evidence | Out-Null
@@ -322,7 +342,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$JA_SOURCE_COMMIT"
           grep -Fq '<buildArg>--no-fallback</buildArg>' app-server/pom.xml
           evidence="$RUNNER_TEMP/ja-native-evidence"
           mkdir -p "$evidence"
@@ -546,14 +566,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          python -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.exe.sha256') --platform windows --arch x86_64 --runner '${{ matrix.runner }}' --source-commit $env:GITHUB_SHA --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
+          python -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.exe.sha256') --platform windows --arch x86_64 --runner '${{ matrix.runner }}' --source-commit $env:JA_SOURCE_COMMIT --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
 
       - name: Write checksum and build report (macOS)
         if: matrix.platform == 'macos'
         shell: bash
         run: |
           set -euo pipefail
-          python3 -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server --sbom "$JA_NATIVE_EVIDENCE/ja-app-server.json" --smoke "$JA_NATIVE_EVIDENCE/smoke.json" --output "$JA_NATIVE_EVIDENCE/build-report.json" --checksum-output "$JA_NATIVE_EVIDENCE/ja-app-server.sha256" --platform macos --arch '${{ matrix.arch }}' --runner '${{ matrix.runner }}' --source-commit "$GITHUB_SHA" --nik-version "$NIK_VERSION" --nik-java-version "$NIK_JAVA_VERSION" --nik-sha256 "$NIK_SHA256" --no-fallback
+          python3 -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server --sbom "$JA_NATIVE_EVIDENCE/ja-app-server.json" --smoke "$JA_NATIVE_EVIDENCE/smoke.json" --output "$JA_NATIVE_EVIDENCE/build-report.json" --checksum-output "$JA_NATIVE_EVIDENCE/ja-app-server.sha256" --platform macos --arch '${{ matrix.arch }}' --runner '${{ matrix.runner }}' --source-commit "$JA_SOURCE_COMMIT" --nik-version "$NIK_VERSION" --nik-java-version "$NIK_JAVA_VERSION" --nik-sha256 "$NIK_SHA256" --no-fallback
 
       - name: Validate sidecar staging contract (Windows dry-run)
         if: matrix.platform == 'windows'
@@ -562,7 +582,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage-dry-run'
           $dryRun = Join-Path $env:JA_NATIVE_EVIDENCE 'sidecar-dry-run.json'
-          python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:GITHUB_SHA --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --dry-run | Tee-Object -FilePath $dryRun
+          python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:JA_SOURCE_COMMIT --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --dry-run | Tee-Object -FilePath $dryRun
           if ($LASTEXITCODE -ne 0) { throw "sidecar dry-run failed with exit code $LASTEXITCODE" }
 
       - name: Stage Tauri sidecar resource (Windows)
@@ -571,7 +591,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
-          python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:GITHUB_SHA --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
+          python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:JA_SOURCE_COMMIT --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
 
       - name: Stage pinned search tools (Windows)
         if: matrix.platform == 'windows'
@@ -579,7 +599,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
-          python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit $env:GITHUB_SHA
+          python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit $env:JA_SOURCE_COMMIT
           if ($LASTEXITCODE -ne 0) { throw "search-tool staging failed with exit code $LASTEXITCODE" }
           & (Join-Path $stage 'sidecars/tools/fd.exe') --version
           & (Join-Path $stage 'sidecars/tools/rg.exe') --version
@@ -609,7 +629,7 @@ jobs:
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/ja-native-stage-dry-run"
-          python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json" --dry-run | tee "$JA_NATIVE_EVIDENCE/sidecar-dry-run.json"
+          python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$JA_SOURCE_COMMIT" --build-report "$JA_NATIVE_EVIDENCE/build-report.json" --dry-run | tee "$JA_NATIVE_EVIDENCE/sidecar-dry-run.json"
 
       - name: Stage Tauri sidecar resource (macOS)
         if: matrix.platform == 'macos'
@@ -617,7 +637,7 @@ jobs:
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/ja-native-stage"
-          python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
+          python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$JA_SOURCE_COMMIT" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
 
       - name: Stage pinned search tools (macOS)
         if: matrix.platform == 'macos'
@@ -625,7 +645,7 @@ jobs:
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/ja-native-stage"
-          python3 -B scripts/native/stage-search-tools.py --output-dir "$stage" --platform macos --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit "$GITHUB_SHA"
+          python3 -B scripts/native/stage-search-tools.py --output-dir "$stage" --platform macos --arch '${{ matrix.arch }}' --target-triple '${{ matrix.targetTriple }}' --source-commit "$JA_SOURCE_COMMIT"
           tools="$stage/sidecars/tools"
           printf '%s\n' "$tools" >> "$GITHUB_PATH"
           "$tools/fd" --version
@@ -678,7 +698,7 @@ jobs:
             '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
             pnpm exec tauri build --ci --no-sign --bundles nsis
             if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle failed with exit code $LASTEXITCODE" }
-            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:GITHUB_SHA --sidecar-manifest $sourceManifest --no-sign
+            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --no-sign
             if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
           } finally {
             if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
@@ -722,7 +742,7 @@ jobs:
             '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
             pnpm exec tauri build --ci --bundles nsis
             if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle with updater signature failed with exit code $LASTEXITCODE" }
-            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:GITHUB_SHA --sidecar-manifest $sourceManifest --updater-signed
+            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --updater-signed
             if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
           } finally {
             if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
@@ -744,7 +764,7 @@ jobs:
           & pwsh -NoProfile -File 'scripts/native/run-windows-installer-smoke.ps1' `
             -Installer $installers[0].FullName `
             -Output $output `
-            -SourceCommit $env:GITHUB_SHA `
+            -SourceCommit $env:JA_SOURCE_COMMIT `
             -RequireUnsigned
           if ($LASTEXITCODE -ne 0) { throw "Windows installer smoke failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'installer smoke evidence is missing' }
@@ -783,7 +803,7 @@ jobs:
           cp -R -- "$tools_source" "$tools_target"
           printf '%s\n' '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles dmg"}' > "$evidence/bundle-contract.json"
           pnpm exec tauri build --ci --no-sign --bundles dmg
-          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$GITHUB_SHA" --sidecar-manifest "$source_manifest" --no-sign
+          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --no-sign
           cleanup
           trap - EXIT
           test ! -e "$target"
@@ -827,7 +847,7 @@ jobs:
           cp -R -- "$tools_source" "$tools_target"
           printf '%s\n' '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --bundles app,dmg"}' > "$evidence/bundle-contract.json"
           pnpm exec tauri build --ci --bundles app,dmg
-          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$GITHUB_SHA" --sidecar-manifest "$source_manifest" --updater-signed
+          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --updater-signed
           cleanup
           trap - EXIT
           test ! -e "$target"
@@ -962,7 +982,7 @@ jobs:
 
   updater-draft-release:
     name: Assemble updater draft
-    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    if: github.event_name == 'workflow_call' && inputs.release == true
     needs: native-app-server
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -972,7 +992,7 @@ jobs:
       - name: Checkout exact verified source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_commit }}
           fetch-depth: 1
 
       - name: Install pinned Node.js for release aggregation
@@ -989,7 +1009,7 @@ jobs:
       - name: Resolve release tag from the verified source version
         id: release
         env:
-          JA_SOURCE_COMMIT: ${{ github.sha }}
+          JA_SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$JA_SOURCE_COMMIT"
@@ -1004,7 +1024,7 @@ jobs:
         env:
           JA_RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
           JA_RELEASE_REPOSITORY: ${{ github.repository }}
-          JA_SOURCE_COMMIT: ${{ github.sha }}
+          JA_SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           set -euo pipefail
           published_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1021,7 +1041,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           JA_RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          JA_SOURCE_COMMIT: ${{ github.sha }}
+          JA_SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$JA_SOURCE_COMMIT"

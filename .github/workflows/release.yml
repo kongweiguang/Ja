@@ -1,0 +1,72 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Release Ja
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: "Exact successful main commit SHA to sign and release"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Different release candidates must never cancel each other after Draft creation has started.
+  group: ja-release-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release-candidate:
+    name: Verify release candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_commit: ${{ steps.candidate.outputs.source_commit }}
+    steps:
+      - name: Checkout the requested source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 1
+
+      - name: Require the current main commit and its successful full CI run
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'source_commit must be a full lowercase Git commit SHA' >&2
+            exit 1
+          fi
+          candidate="$(git rev-parse HEAD)"
+          test "$candidate" = "$REQUESTED_SOURCE_COMMIT"
+          git fetch origin main --depth=1
+          test "$candidate" = "$(git rev-parse origin/main)"
+          successful="$(gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/actions/workflows/native-app-server.yml/runs?event=push&head_sha=$candidate&status=completed&per_page=100" \
+            --jq '.workflow_runs[] | select(.conclusion == "success") | .head_sha' \
+            | grep -Fx "$candidate" | head -n 1 || true)"
+          if [[ "$successful" != "$candidate" ]]; then
+            echo 'the requested main commit has no successful native-app-server CI run' >&2
+            exit 1
+          fi
+          echo "source_commit=$candidate" >> "$GITHUB_OUTPUT"
+
+  signed-native-matrix:
+    name: Sign and assemble release candidate
+    needs: verify-release-candidate
+    uses: ./.github/workflows/native-app-server.yml
+    with:
+      release: true
+      skip_verification: true
+      source_commit: ${{ needs.verify-release-candidate.outputs.source_commit }}
+    secrets: inherit
+    permissions:
+      contents: write
