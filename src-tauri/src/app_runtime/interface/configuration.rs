@@ -537,10 +537,10 @@ fn validate_revealed_provider_credential(value: Value) -> Result<Value, Settings
     {
         return Err(SettingsCommandError::unavailable());
     }
-    if let Some(secret) = object.get("secret").and_then(Value::as_str) {
-        if secret.is_empty() || secret.len() > 8192 || secret.chars().any(char::is_control) {
-            return Err(SettingsCommandError::unavailable());
-        }
+    if let Some(secret) = object.get("secret").and_then(Value::as_str)
+        && (secret.is_empty() || secret.len() > 8192 || secret.chars().any(char::is_control))
+    {
+        return Err(SettingsCommandError::unavailable());
     }
     Ok(value)
 }

@@ -3362,10 +3362,10 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             }
             validate_version(params.get("expectedVersion"))?;
         }
-        "credential/reveal-provider" => {
-            if !valid_prefixed_id(params.get("providerId"), "provider_") {
-                return Err("provider id is invalid");
-            }
+        "credential/reveal-provider"
+            if !valid_prefixed_id(params.get("providerId"), "provider_") =>
+        {
+            return Err("provider id is invalid");
         }
         _ => {}
     }
