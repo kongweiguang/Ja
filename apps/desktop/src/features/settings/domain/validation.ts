@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { z } from "zod";
-import {
-  CREDENTIAL_REF_PATTERN,
-  isSafeHttpUrl,
-} from "@/shared/settings/validation";
+import { CREDENTIAL_REF_PATTERN, isSafeHttpUrl } from "@/shared/settings/validation";
 
 export { CREDENTIAL_REF_PATTERN } from "@/shared/settings/validation";
 export type { McpServerSave } from "@/shared/settings/types";
