@@ -46,6 +46,7 @@ public final class ModelCatalogClient {
      * 在共享传输资源上启动一次不重试的目录读取。用户的显式点击可以再次尝试，但单击期间不
      * 自动重放请求，避免目录端点的供应商限流被隐式放大。
      */
+    @SuppressWarnings("PMD.CloseResource") // Registration 延续到 completion；提前关闭会断开在途请求的取消链路。
     public static CompletionStage<ModelPort.ModelDiscoveryResult> discover(
             ModelTransport transport, ModelPort.ModelDiscoveryRequest request,
             CancellationToken cancellationToken) {

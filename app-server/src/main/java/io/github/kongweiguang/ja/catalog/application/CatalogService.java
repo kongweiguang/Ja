@@ -94,6 +94,7 @@ public final class CatalogService implements CatalogUseCase {
      * WebView 传入的 Base URL、协议或 API Key，因此草稿中的未保存连接不会被意外使用。
      */
     @Override
+    @SuppressWarnings("PMD.CloseResource") // Lease 在异步 stage 终态关闭；try-with-resources 会提前释放配置快照。
     public CompletionStage<ModelDiscoveryResult> discoverModels(
             String providerId, CancellationToken cancellationToken) {
         ConfigurationGenerationPort.Lease lease = generations.acquire(null);
