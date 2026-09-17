@@ -127,10 +127,8 @@ impl SettingsQueryMethod {
     }
 }
 
-/**
- * 配置与凭据请求必须在 actor 入队前和实际 sidecar 发送前使用同一闭集，避免前者接纳、后者
- * 拒绝导致调用方只能得到模糊的运行时错误。Provider 专用回显仍不允许自由 credentialId。
- */
+/// 配置与凭据请求必须在 actor 入队前和实际 sidecar 发送前使用同一闭集，避免前者接纳、后者
+/// 拒绝导致调用方只能得到模糊的运行时错误。Provider 专用回显仍不允许自由 credentialId。
 pub(crate) fn is_configuration_request_method(method: &str) -> bool {
     matches!(
         method,
