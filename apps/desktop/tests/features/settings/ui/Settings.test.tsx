@@ -419,14 +419,14 @@ describe("Settings v1 UI", () => {
     expect(screen.queryByLabelText("Base URL")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "编辑供应商" }));
-    expect(screen.getByRole("dialog", { name: "编辑供应商" })).toBeDefined();
+    const dialog = screen.getByRole("dialog", { name: "编辑供应商" });
+    expect(dialog).toBeDefined();
     expect(
-      within(screen.getByRole("dialog", { name: "编辑供应商" })).getAllByLabelText("上游模型标识"),
+      within(dialog).getAllByLabelText("上游模型标识"),
     ).toHaveLength(2);
-    expect(screen.getByText("已配置 · 密钥不会回显")).toBeDefined();
-    const credentialInput = screen.getByLabelText("API key / token");
-    expect(credentialInput.id).not.toBe("credential-vault-secret");
-    expect(credentialInput.getAttribute("aria-describedby")).toContain("credential-status");
+    const credentialInput = within(dialog).getByLabelText("API Key");
+    expect(credentialInput.id).toBe("provider-secret");
+    expect(credentialInput.getAttribute("autocomplete")).toBe("current-password");
   });
 
   it("calls the paid model probe only after explicit confirmation", async () => {
@@ -507,7 +507,7 @@ describe("Settings v1 UI", () => {
     renderSettings("models", ports({ onSaveProvider }));
     await user.click(screen.getByRole("button", { name: "编辑供应商" }));
     const dialog = screen.getByRole("dialog", { name: "编辑供应商" });
-    await user.click(within(dialog).getByRole("button", { name: "添加模型" }));
+    await user.click(within(dialog).getByRole("button", { name: "手动添加" }));
     const rows = within(dialog).getAllByRole("article");
     expect(rows).toHaveLength(3);
     const added = rows[2]!;
@@ -574,7 +574,7 @@ describe("Settings v1 UI", () => {
     renderSettings("models", ports({ onCreateProvider, onSaveProvider }));
     await user.click(screen.getByRole("button", { name: "新增供应商" }));
     const dialog = screen.getByRole("dialog", { name: "新增供应商" });
-    const secretInput = within(dialog).getByLabelText("API key / token");
+    const secretInput = within(dialog).getByLabelText("API Key");
     expect(secretInput.getAttribute("type")).toBe("password");
     expect(secretInput.getAttribute("autocomplete")).toBe("new-password");
     await user.type(within(dialog).getByLabelText("供应商名称"), "DeepSeek");
@@ -620,11 +620,11 @@ describe("Settings v1 UI", () => {
     await user.type(within(dialog).getByLabelText("Base URL"), "https://api.deepseek.com");
     await user.type(within(dialog).getByLabelText("显示名称"), "DeepSeek V4");
     await user.type(within(dialog).getByLabelText("上游模型标识"), "deepseek-v4-pro");
-    await user.click(within(dialog).getByRole("button", { name: "添加模型" }));
+    await user.click(within(dialog).getByRole("button", { name: "手动添加" }));
     const retryRows = within(dialog).getAllByRole("article");
     await user.type(within(retryRows[1]!).getByLabelText("显示名称"), "DeepSeek Flash");
     await user.type(within(retryRows[1]!).getByLabelText("上游模型标识"), "deepseek-v4-flash");
-    const secretInput = within(dialog).getByLabelText("API key / token");
+    const secretInput = within(dialog).getByLabelText("API Key");
     await user.type(secretInput, "first-secret");
     await user.click(within(dialog).getByRole("button", { name: "保存供应商" }));
 
@@ -655,11 +655,11 @@ describe("Settings v1 UI", () => {
     const dialog = screen.getByRole("dialog", { name: "新增供应商" });
     await user.type(within(dialog).getByLabelText("供应商名称"), "Gateway");
     await user.type(within(dialog).getByLabelText("Base URL"), "https://gateway.example.test/v1");
-    await user.type(within(dialog).getByLabelText("API key / token"), "test-secret");
+    await user.type(within(dialog).getByLabelText("API Key"), "test-secret");
     const first = within(dialog).getAllByRole("article")[0]!;
     await user.type(within(first).getByLabelText("显示名称"), "First");
     await user.type(within(first).getByLabelText("上游模型标识"), "same-model");
-    await user.click(within(dialog).getByRole("button", { name: "添加模型" }));
+    await user.click(within(dialog).getByRole("button", { name: "手动添加" }));
     const second = within(dialog).getAllByRole("article")[1]!;
     await user.type(within(second).getByLabelText("显示名称"), "Second");
     await user.type(within(second).getByLabelText("上游模型标识"), "same-model");
@@ -678,7 +678,7 @@ describe("Settings v1 UI", () => {
     const dialog = screen.getByRole("dialog", { name: "新增供应商" });
     await user.type(within(dialog).getByLabelText("供应商名称"), "Gateway");
     await user.type(within(dialog).getByLabelText("Base URL"), "https://gateway.example.test/v1");
-    await user.type(within(dialog).getByLabelText("API key / token"), "test-secret");
+    await user.type(within(dialog).getByLabelText("API Key"), "test-secret");
     const row = within(dialog).getAllByRole("article")[0]!;
     await user.type(within(row).getByLabelText("显示名称"), "Small Context");
     await user.type(within(row).getByLabelText("上游模型标识"), "small-context");
@@ -714,7 +714,7 @@ describe("Settings v1 UI", () => {
     expect(within(dialog).getByLabelText("上下文 Tokens")).toHaveProperty("value", "777777");
     await user.click(within(dialog).getByRole("button", { name: "使用推荐值" }));
     expect(within(dialog).getByLabelText("上下文 Tokens")).toHaveProperty("value", "1000000");
-    fireEvent.change(within(dialog).getByLabelText("API key / token"), {
+    fireEvent.change(within(dialog).getByLabelText("API Key"), {
       target: { value: "test-secret" },
     });
     await user.click(within(dialog).getByRole("button", { name: "保存供应商" }));
