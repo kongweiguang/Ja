@@ -67,7 +67,8 @@ public final class ModelCatalogClient {
         } catch (RuntimeException failure) {
             controller.shutdown();
             transport.unregister(controller);
-            throw failure;
+            throw new ProviderProtocolException("MODEL_DISCOVERY_SETUP",
+                    "provider model list is unavailable", true, failure);
         }
         return result.whenComplete((ignored, failure) -> {
             timeout.cancel(false);

@@ -185,8 +185,8 @@ public interface ModelPort {
             if (apiKey.chars().anyMatch(Character::isISOControl)) {
                 throw new IllegalArgumentException("apiKey contains control characters");
             }
-            connectTimeout = boundedTimeout(connectTimeout, "connectTimeout");
-            requestTimeout = boundedTimeout(requestTimeout, "requestTimeout");
+            connectTimeout = ModelPort.boundedTimeout(connectTimeout, "connectTimeout");
+            requestTimeout = ModelPort.boundedTimeout(requestTimeout, "requestTimeout");
             inputModalities = Set.copyOf(Objects.requireNonNull(inputModalities, "inputModalities"));
             if (!inputModalities.contains(InputModality.TEXT) || inputModalities.size() > InputModality.values().length) {
                 throw new IllegalArgumentException("model input modalities must contain text");
@@ -239,8 +239,8 @@ public interface ModelPort {
             if (apiKey.chars().anyMatch(Character::isISOControl)) {
                 throw new IllegalArgumentException("apiKey contains control characters");
             }
-            connectTimeout = boundedTimeout(connectTimeout, "connectTimeout");
-            requestTimeout = boundedTimeout(requestTimeout, "requestTimeout");
+            connectTimeout = ModelPort.boundedTimeout(connectTimeout, "connectTimeout");
+            requestTimeout = ModelPort.boundedTimeout(requestTimeout, "requestTimeout");
         }
 
         /**
@@ -254,16 +254,6 @@ public interface ModelPort {
                     + ", requestTimeout=" + requestTimeout + "]";
         }
 
-        /**
-         * 与正式模型配置相同地限制网络时间，目录调用不能成为规避 Provider 资源上限的旁路。
-         */
-        private static Duration boundedTimeout(Duration value, String name) {
-            Objects.requireNonNull(value, name);
-            if (value.isZero() || value.isNegative() || value.compareTo(Duration.ofHours(1)) > 0) {
-                throw new IllegalArgumentException(name + " must be in (0, 1h]");
-            }
-            return value;
-        }
     }
 
     /**
