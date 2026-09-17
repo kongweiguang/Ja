@@ -81,7 +81,7 @@ concurrency:
 jobs:
   fast-verification:
     name: Contracts and workspace verification
-    if: ${{ !(github.event_name == 'workflow_call' && inputs.skip_verification) }}
+    if: ${{ !inputs.skip_verification }}
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -267,8 +267,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        (needs.fast-verification.result == 'success' ||
-          (github.event_name == 'workflow_call' && inputs.skip_verification))
+        (needs.fast-verification.result == 'success' || inputs.skip_verification)
       }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -301,8 +300,8 @@ jobs:
             nikSuffix: macos-aarch64
             nikSha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
     env:
-      # Only the release caller can request updater-signed bundles. System bundles remain unsigned.
-      JA_RELEASE: ${{ github.event_name == 'workflow_call' && inputs.release == true }}
+      # Reusable workflows retain the caller's event name, so release behavior must depend on its explicit input.
+      JA_RELEASE: ${{ inputs.release == true }}
       NIK_VERSION: 25.0.3+2
       NIK_JAVA_VERSION: 25.0.3+12
       NIK_URL: https://download.bell-sw.com/vm/25.0.3/bellsoft-liberica-vm-openjdk25.0.3%2B12-25.0.3%2B2-${{ matrix.nikSuffix }}.zip
