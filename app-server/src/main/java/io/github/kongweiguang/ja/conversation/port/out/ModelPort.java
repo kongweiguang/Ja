@@ -54,8 +54,12 @@ public interface ModelPort {
         throw new UnsupportedOperationException("upstream model discovery is not implemented");
     }
 
-    /** 让普通模型调用和目录读取共享同一网络时限，避免任一入口放宽连接资源上限。 */
-    private static Duration boundedTimeout(Duration value, String name) {
+    /**
+     * 让普通模型调用和目录读取共享同一网络时限，避免任一入口放宽连接资源上限。该方法保持接口静态
+     * 工具而非嵌套 record 的 private helper，使两类冻结请求都能显式复用同一约束，且静态分析可
+     * 沿字节码调用关系验证这一点。
+     */
+    static Duration boundedTimeout(Duration value, String name) {
         Objects.requireNonNull(value, name);
         if (value.isZero() || value.isNegative() || value.compareTo(Duration.ofHours(1)) > 0) {
             throw new IllegalArgumentException(name + " must be in (0, 1h]");
