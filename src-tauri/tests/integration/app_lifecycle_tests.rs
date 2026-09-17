@@ -100,7 +100,7 @@ fn full_exit_fixture_config(run_dir: PathBuf) -> LaunchConfig {
     fs::create_dir_all(&java_logs_dir).expect("debug Java log directory");
     #[cfg(debug_assertions)]
     {
-        LaunchConfig::debug_java(
+        let mut config = LaunchConfig::debug_java(
             java,
             jar,
             home_dir,
@@ -108,7 +108,11 @@ fn full_exit_fixture_config(run_dir: PathBuf) -> LaunchConfig {
             sidecar_run_dir,
             java_logs_dir,
         )
-        .expect("debug Java25 config")
+        .expect("debug Java25 config");
+        // 完整退出夹具启动的是冷 JVM JAR，而生产分发只启动 Native Image；测试保留生产默认值
+        // 无法区分真实启动退化与字节码预热，故仅在该夹具内给受限的首次启动留出 30 秒预算。
+        config.sidecar.ready_timeout = Duration::from_secs(30);
+        config
     }
     #[cfg(not(debug_assertions))]
     {
