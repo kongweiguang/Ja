@@ -55,8 +55,9 @@ METHODS = [
     "attachment/preview/close", "turn/start", "turn/resume", "turn/cancel", "turn/input/enqueue",
     "turn/input/prioritize", "turn/input/update", "turn/input/delete", "turn/change-set/read",
     "approval/respond", "configuration/read", "configuration/patch", "configuration/replace",
-    "configuration/reset", "credential/set", "credential/delete", "skill/list", "mcp/list",
-    "mcp/test", "model/test", "mcp/list-tools", "tool/artifact/read",
+    "configuration/reset", "credential/set", "credential/delete", "credential/reveal-provider",
+    "skill/list", "mcp/list", "mcp/test", "model/test", "model/discover", "mcp/list-tools",
+    "tool/artifact/read",
 ]
 EVENTS = [
     "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",
