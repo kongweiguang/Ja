@@ -64,9 +64,20 @@ export function CommandPalette({ open, viewModel, actions }: CommandPaletteProps
   const inputRef = useRef<HTMLInputElement>(null);
   const composingRef = useRef(false);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const activeCommandIdRef = useRef(viewModel.activeCommandId);
+  activeCommandIdRef.current = viewModel.activeCommandId;
   const activeCommand = viewModel.commands.find(
     (command) => command.id === viewModel.activeCommandId,
   );
+
+  /**
+   * 连续键盘事件可能早于受控 viewModel 的下一次渲染到达；此 ref 只保存当前事件序列的
+   * 预期选择，实际列表状态仍由 application controller 提交，避免 ArrowDown 后 Enter 执行旧项。
+   */
+  const selectCommand = (commandId: string): void => {
+    activeCommandIdRef.current = commandId;
+    actions.selectCommand(commandId);
+  };
 
   /**
    * 输入框只翻译键盘意图；忽略 composition 与 keyCode 229，让 Enter 先提交 CJK IME，
@@ -79,8 +90,18 @@ export function CommandPalette({ open, viewModel, actions }: CommandPaletteProps
     if (composingRef.current || nativeEvent.isComposing || nativeEvent.keyCode === 229) return;
     if (viewModel.commands.length === 0) return;
 
+    /** 先推进事件序列选择，再交给 controller 使用其受控索引完成同一导航意图。 */
     const moveBy = (delta: number): void => {
       event.preventDefault();
+      const currentIndex = Math.max(
+        0,
+        viewModel.commands.findIndex((command) => command.id === activeCommandIdRef.current),
+      );
+      const nextIndex =
+        (currentIndex + delta + viewModel.commands.length) % viewModel.commands.length;
+      const nextCommand = viewModel.commands[nextIndex];
+      if (nextCommand === undefined) return;
+      activeCommandIdRef.current = nextCommand.id;
       actions.moveSelection(delta);
     };
 
@@ -93,17 +114,21 @@ export function CommandPalette({ open, viewModel, actions }: CommandPaletteProps
       moveBy(-1);
     } else if (event.key === "Home") {
       event.preventDefault();
-      actions.selectCommand(viewModel.commands[0]?.id ?? "");
+      selectCommand(viewModel.commands[0]?.id ?? "");
     } else if (event.key === "End") {
       event.preventDefault();
-      actions.selectCommand(viewModel.commands.at(-1)?.id ?? "");
+      selectCommand(viewModel.commands.at(-1)?.id ?? "");
     } else if (event.key === "PageDown") {
       moveBy(Math.max(1, Math.min(8, viewModel.commands.length - 1)));
     } else if (event.key === "PageUp") {
       moveBy(-Math.max(1, Math.min(8, viewModel.commands.length - 1)));
-    } else if (event.key === "Enter" && activeCommand !== undefined) {
+    } else if (event.key === "Enter") {
+      const selectedCommand = viewModel.commands.find(
+        (command) => command.id === activeCommandIdRef.current,
+      );
+      if (selectedCommand === undefined) return;
       event.preventDefault();
-      actions.executeCommand(activeCommand.id);
+      actions.executeCommand(selectedCommand.id);
     }
   };
 
@@ -203,7 +228,7 @@ export function CommandPalette({ open, viewModel, actions }: CommandPaletteProps
                 aria-busy={command.running}
                 disabled={command.running}
                 onPointerMove={() => {
-                  if (!command.running) actions.selectCommand(command.id);
+                  if (!command.running) selectCommand(command.id);
                 }}
                 onClick={() => {
                   if (!command.running) actions.executeCommand(command.id);
