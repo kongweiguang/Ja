@@ -72,4 +72,23 @@ public final class ContractChecks {
         return List.copyOf(values);
     }
 
+    /**
+     * 冻结来自外部目录的文本列表，同时限制总量、单项长度、控制字符和重复项；跨端口传递同一目录
+     * 投影时复用这条边界，避免 Provider、application 与 RPC 各自放宽结果契约。
+     */
+    public static List<String> boundedDistinctTextList(
+            List<String> values, String name, int maxItems, int maxItemLength) {
+        Objects.requireNonNull(name, "name");
+        if (maxItems < 1 || maxItemLength < 1) {
+            throw new IllegalArgumentException("text list bounds must be positive");
+        }
+        List<String> copied = List.copyOf(Objects.requireNonNull(values, name));
+        if (copied.size() > maxItems || copied.stream().anyMatch(value -> value.isBlank()
+                || value.length() > maxItemLength || value.chars().anyMatch(Character::isISOControl))
+                || copied.stream().distinct().count() != copied.size()) {
+            throw new IllegalArgumentException("invalid " + name);
+        }
+        return copied;
+    }
+
 }

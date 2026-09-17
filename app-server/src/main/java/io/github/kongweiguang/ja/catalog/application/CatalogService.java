@@ -115,21 +115,10 @@ public final class CatalogService implements CatalogUseCase {
             ConfigurationGenerationSnapshot.Provider provider,
             ConfigurationGenerationSnapshot.Model model,
             ConfigurationGenerationPort.Lease lease) {
-        String secret = lease.secretFor(provider.credentialId());
-        if (secret == null || secret.isBlank()) {
-            throw new ConfigurationError(ConfigurationError.Code.MISSING_CREDENTIAL,
-                    "provider credential is unavailable");
-        }
-        ModelPort.Api api = switch (provider.api()) {
-            case OPENAI_RESPONSES -> ModelPort.Api.OPENAI_RESPONSES;
-            case ANTHROPIC_MESSAGES -> ModelPort.Api.ANTHROPIC_MESSAGES;
-            case OPENAI_CHAT_COMPLETIONS -> ModelPort.Api.OPENAI_CHAT_COMPLETIONS;
-        };
-        Duration requestTimeout = provider.networkTimeouts().requestTimeout().compareTo(Duration.ofSeconds(30)) > 0
-                ? Duration.ofSeconds(30) : provider.networkTimeouts().requestTimeout();
+        ProviderConnection connection = providerConnection(provider, lease);
         return new ModelPort.ModelConfiguration(provider.providerId(), model.modelId(), lease.generationId(),
-                api, model.model(), provider.baseUrl(), secret,
-                provider.networkTimeouts().connectTimeout(), requestTimeout,
+                connection.api(), model.model(), provider.baseUrl(), connection.secret(),
+                provider.networkTimeouts().connectTimeout(), connection.requestTimeout(),
                 Set.of(ModelPort.InputModality.TEXT),
                 new ModelPort.GenerationOptions(null, null, 16, null));
     }
@@ -139,6 +128,19 @@ public final class CatalogService implements CatalogUseCase {
      * 长时间占用配置租约与网络连接。
      */
     private static ModelPort.ModelDiscoveryRequest modelDiscoveryRequest(
+            ConfigurationGenerationSnapshot.Provider provider,
+            ConfigurationGenerationPort.Lease lease) {
+        ProviderConnection connection = providerConnection(provider, lease);
+        return new ModelPort.ModelDiscoveryRequest(provider.providerId(), lease.generationId(), connection.api(),
+                provider.baseUrl(), connection.secret(), provider.networkTimeouts().connectTimeout(),
+                connection.requestTimeout());
+    }
+
+    /**
+     * 从单一配置代际冻结两类探测请求共享的认证、协议与短请求时限，防止模型测试和目录读取在
+     * Secret 解析或 Provider 映射上漂移；具体 modelId 仅保留给正式模型配置。
+     */
+    private static ProviderConnection providerConnection(
             ConfigurationGenerationSnapshot.Provider provider,
             ConfigurationGenerationPort.Lease lease) {
         String secret = lease.secretFor(provider.credentialId());
@@ -153,8 +155,11 @@ public final class CatalogService implements CatalogUseCase {
         };
         Duration requestTimeout = provider.networkTimeouts().requestTimeout().compareTo(Duration.ofSeconds(30)) > 0
                 ? Duration.ofSeconds(30) : provider.networkTimeouts().requestTimeout();
-        return new ModelPort.ModelDiscoveryRequest(provider.providerId(), lease.generationId(), api,
-                provider.baseUrl(), secret, provider.networkTimeouts().connectTimeout(), requestTimeout);
+        return new ProviderConnection(api, secret, requestTimeout);
+    }
+
+    /** 两类 Provider 探测共享的已解析连接字段，不承载模型选择或可见响应数据。 */
+    private record ProviderConnection(ModelPort.Api api, String secret, Duration requestTimeout) {
     }
 
     /**

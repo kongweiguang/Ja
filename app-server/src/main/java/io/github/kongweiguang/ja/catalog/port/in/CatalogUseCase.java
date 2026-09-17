@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.catalog.domain.McpServerDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
+import io.github.kongweiguang.ja.foundation.validation.ContractChecks;
 
 import java.util.List;
 import java.util.concurrent.CompletionStage;
@@ -64,12 +65,7 @@ public interface CatalogUseCase {
          * schema，而不携带厂商对象或能力猜测。
          */
         public ModelDiscoveryResult {
-            items = List.copyOf(items);
-            if (items.size() > 200 || items.stream().anyMatch(item -> item == null || item.isBlank()
-                    || item.length() > 512 || item.chars().anyMatch(Character::isISOControl))
-                    || items.stream().distinct().count() != items.size()) {
-                throw new IllegalArgumentException("invalid model discovery result");
-            }
+            items = ContractChecks.boundedDistinctTextList(items, "model discovery result", 200, 512);
         }
     }
 }

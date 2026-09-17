@@ -109,14 +109,7 @@ public final class SettingsCatalogHandler implements RpcHandler {
         return session.catalog().testModel(providerId, modelId, session.cancellationToken())
                 .handle((result, failure) -> {
                     if (failure != null) {
-                        Throwable cause = failure instanceof java.util.concurrent.CompletionException
-                                && failure.getCause() != null ? failure.getCause() : failure;
-                        if (cause instanceof io.github.kongweiguang.ja.configuration.domain.ConfigurationError error) {
-                            throw error;
-                        }
-                        throw JaRpcException.of(
-                                io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog.MODEL_UNAVAILABLE,
-                                "model is unavailable");
+                        throw modelUnavailable(failure, "model is unavailable");
                     }
                     return session.mapper().createObjectNode()
                             .put("responseModel", result.responseModel())
@@ -134,14 +127,7 @@ public final class SettingsCatalogHandler implements RpcHandler {
         return session.catalog().discoverModels(providerId, session.cancellationToken())
                 .handle((result, failure) -> {
                     if (failure != null) {
-                        Throwable cause = failure instanceof java.util.concurrent.CompletionException
-                                && failure.getCause() != null ? failure.getCause() : failure;
-                        if (cause instanceof io.github.kongweiguang.ja.configuration.domain.ConfigurationError error) {
-                            throw error;
-                        }
-                        throw JaRpcException.of(
-                                io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog.MODEL_UNAVAILABLE,
-                                "model discovery is unavailable");
+                        throw modelUnavailable(failure, "model discovery is unavailable");
                     }
                     ObjectNode response = session.mapper().createObjectNode();
                     ArrayNode items = response.putArray("items");
@@ -149,6 +135,20 @@ public final class SettingsCatalogHandler implements RpcHandler {
                     response.put("truncated", result.truncated());
                     return response;
                 });
+    }
+
+    /**
+     * 保留配置错误的固定 RPC 映射，同时将其余 Provider 失败收敛为模型不可用，避免同步异常和
+     * CompletionException 包装在模型验证、目录读取两条 Wire 路径中产生不同错误类别。
+     */
+    private static JaRpcException modelUnavailable(Throwable failure, String message) {
+        Throwable cause = failure instanceof java.util.concurrent.CompletionException
+                && failure.getCause() != null ? failure.getCause() : failure;
+        if (cause instanceof io.github.kongweiguang.ja.configuration.domain.ConfigurationError error) {
+            throw error;
+        }
+        return JaRpcException.of(
+                io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog.MODEL_UNAVAILABLE, message);
     }
 
     /**

@@ -68,6 +68,20 @@ public interface ModelPort {
     }
 
     /**
+     * 统一 Provider Base URL 的安全闭集，防止模型调用和目录读取对 scheme、凭据或路径附属片段形成
+     * 不同解释；调用方仍可保留反向代理路径，具体端点只能由 Adapter 派生。
+     */
+    static URI requireHttpBaseUri(URI value) {
+        Objects.requireNonNull(value, "baseUri");
+        if (!value.isAbsolute() || value.getHost() == null || value.getHost().isBlank()
+            || value.getUserInfo() != null || value.getQuery() != null || value.getFragment() != null
+            || !("https".equalsIgnoreCase(value.getScheme()) || "http".equalsIgnoreCase(value.getScheme()))) {
+            throw new IllegalArgumentException("baseUri must be HTTP or HTTPS");
+        }
+        return value;
+    }
+
+    /**
      * 启动一次有界模型响应，并通过 Sink 顺序发布规范事件。
      */
     CompletionStage<ModelOutcome> start(
@@ -179,12 +193,7 @@ public interface ModelPort {
             configGeneration = ContractChecks.configurationGeneration(configGeneration);
             Objects.requireNonNull(api, "api");
             model = ContractChecks.text(model, "model", 512, false);
-            Objects.requireNonNull(baseUri, "baseUri");
-            if (!baseUri.isAbsolute() || baseUri.getHost() == null || baseUri.getHost().isBlank()
-                || baseUri.getUserInfo() != null || baseUri.getQuery() != null || baseUri.getFragment() != null
-                || !("https".equalsIgnoreCase(baseUri.getScheme()) || "http".equalsIgnoreCase(baseUri.getScheme()))) {
-                throw new IllegalArgumentException("baseUri must be HTTP or HTTPS");
-            }
+            baseUri = ModelPort.requireHttpBaseUri(baseUri);
             apiKey = ContractChecks.text(apiKey, "apiKey", 8_192, false);
             if (apiKey.chars().anyMatch(Character::isISOControl)) {
                 throw new IllegalArgumentException("apiKey contains control characters");
@@ -233,12 +242,7 @@ public interface ModelPort {
             providerId = ContractChecks.identifier(providerId, "providerId");
             configGeneration = ContractChecks.configurationGeneration(configGeneration);
             Objects.requireNonNull(api, "api");
-            Objects.requireNonNull(baseUri, "baseUri");
-            if (!baseUri.isAbsolute() || baseUri.getHost() == null || baseUri.getHost().isBlank()
-                || baseUri.getUserInfo() != null || baseUri.getQuery() != null || baseUri.getFragment() != null
-                || !("https".equalsIgnoreCase(baseUri.getScheme()) || "http".equalsIgnoreCase(baseUri.getScheme()))) {
-                throw new IllegalArgumentException("baseUri must be HTTP or HTTPS");
-            }
+            baseUri = ModelPort.requireHttpBaseUri(baseUri);
             apiKey = ContractChecks.text(apiKey, "apiKey", 8_192, false);
             if (apiKey.chars().anyMatch(Character::isISOControl)) {
                 throw new IllegalArgumentException("apiKey contains control characters");
@@ -269,12 +273,7 @@ public interface ModelPort {
          * 的受限 IPC 投影，且前端无需相信上游未经校验的字段。
          */
         public ModelDiscoveryResult {
-            items = List.copyOf(Objects.requireNonNull(items, "items"));
-            if (items.size() > 200 || items.stream().anyMatch(item -> item == null || item.isBlank()
-                    || item.length() > 512 || item.chars().anyMatch(Character::isISOControl))
-                    || items.stream().distinct().count() != items.size()) {
-                throw new IllegalArgumentException("invalid model discovery result");
-            }
+            items = ContractChecks.boundedDistinctTextList(items, "model discovery result", 200, 512);
         }
     }
 
