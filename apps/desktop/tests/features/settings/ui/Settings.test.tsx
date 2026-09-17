@@ -421,9 +421,7 @@ describe("Settings v1 UI", () => {
     await user.click(screen.getByRole("button", { name: "编辑供应商" }));
     const dialog = screen.getByRole("dialog", { name: "编辑供应商" });
     expect(dialog).toBeDefined();
-    expect(
-      within(dialog).getAllByLabelText("上游模型标识"),
-    ).toHaveLength(2);
+    expect(within(dialog).getAllByLabelText("上游模型标识")).toHaveLength(2);
     const credentialInput = within(dialog).getByLabelText("API Key");
     expect(credentialInput.id).toBe("provider-secret");
     expect(credentialInput.getAttribute("autocomplete")).toBe("current-password");
