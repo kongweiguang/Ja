@@ -273,7 +273,8 @@ public interface ModelPort {
          * 的受限 IPC 投影，且前端无需相信上游未经校验的字段。
          */
         public ModelDiscoveryResult {
-            items = ContractChecks.boundedDistinctTextList(items, "model discovery result", 200, 512);
+            items = List.copyOf(ContractChecks.boundedDistinctTextList(
+                    items, "model discovery result", 200, 512));
         }
     }
 

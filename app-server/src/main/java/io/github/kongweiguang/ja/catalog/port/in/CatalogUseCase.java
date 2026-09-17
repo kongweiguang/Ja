@@ -65,7 +65,8 @@ public interface CatalogUseCase {
          * schema，而不携带厂商对象或能力猜测。
          */
         public ModelDiscoveryResult {
-            items = ContractChecks.boundedDistinctTextList(items, "model discovery result", 200, 512);
+            items = List.copyOf(ContractChecks.boundedDistinctTextList(
+                    items, "model discovery result", 200, 512));
         }
     }
 }
