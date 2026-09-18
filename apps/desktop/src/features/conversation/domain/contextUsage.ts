@@ -22,14 +22,14 @@ interface KnownContextUsagePresentation {
   measuredAt: string;
 }
 
-/** 崩溃窗口只声明计量未知，不伪造百分比或 Token 数。 */
+/** 没有历史可信计量时才声明未知；已有 KNOWN 由 Timeline reducer 保留到新计量覆盖。 */
 interface UnknownContextUsagePresentation {
   certainty: "unknown";
   source: "provider";
   measuredAt: string;
 }
 
-/** 压缩投影只标记 Provider Usage 失效边界，不能单独创造新的上下文计量。 */
+/** 压缩投影只记录生命周期事实，不能单独清空或创造新的上下文计量。 */
 interface ContextUsageCompactionFact {
   phase: "started" | "compacted" | "failed";
   inputTokensAfter: number | null;
@@ -55,13 +55,13 @@ function usageTone(percentage: number): ContextUsageTone {
 }
 
 /**
- * 只按该请求已提交的画像计算上下文占用；非法窗口保持不可展示，绝不借当前偏好补造。
- * 成功压缩会使压缩前的 Provider Usage 失效，必须等下一次真实 Provider 响应确认新上下文。
+ * 只按已提交的 Provider 画像计算上下文占用；非法窗口保持不可展示，绝不借当前偏好补造。
+ * 压缩期间继续展示最近一次 KNOWN，等下一次真实 Provider 响应到达后原位更新。
  */
 export function resolveContextUsage(
   input: ResolveContextUsageInput,
 ): ContextUsagePresentation | undefined {
-  const { usage, compaction } = input;
+  const { usage } = input;
   const contextWindowTokens = usage?.profile.contextWindowTokens;
   if (
     usage === undefined ||
@@ -76,11 +76,6 @@ export function resolveContextUsage(
   const providerTimestamp = timestamp(usage.measuredAt);
   if (providerTimestamp === undefined) return undefined;
   if (usage.certainty === "unknown") {
-    return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
-  }
-  const compactionTimestamp =
-    compaction?.phase === "compacted" ? timestamp(compaction.occurredAt) : undefined;
-  if (compactionTimestamp !== undefined && compactionTimestamp > providerTimestamp) {
     return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
   }
   const usedTokens = usage.inputTokens;

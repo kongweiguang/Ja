@@ -1,36 +1,14 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import {
-  Check,
-  ChevronLeft,
-  ChevronRight,
-  LoaderCircle,
-  Minimize2,
-  RotateCcw,
-  Send,
-} from "lucide-react";
+import { ChevronLeft, ChevronRight, LoaderCircle, Minimize2, RotateCcw, Send } from "lucide-react";
 import { useId, useMemo, type ChangeEvent, type ReactElement } from "react";
 import type { InteractionController } from "../../application/useInteractionController";
-import type {
-  InteractionAnswer,
-  InteractionOption,
-  InteractionQuestion,
-} from "../../application/interactionPort";
+import type { InteractionOption } from "../../application/interactionPort";
 import "./interaction.css";
 
 interface InteractionCardProps {
   controller: InteractionController;
-}
-
-/** 依据当前问题定义渲染摘要，避免把服务端不存在的展示字段当成协议事实。 */
-function answerLabel(question: InteractionQuestion, answer: InteractionAnswer | undefined): string {
-  if (answer === undefined || answer.skipped) return "未回答";
-  const labels = (question.options ?? [])
-    .filter((option) => answer.optionIds.includes(option.optionId))
-    .map((option) => option.label);
-  if (answer.freeText !== null && answer.freeText.trim() !== "") labels.push(answer.freeText);
-  return labels.join("、") || "未回答";
 }
 
 /** 将结构化问题投影为非模态卡片；状态、CAS、重试和 Thread 隔离全部由 controller 拥有。 */
@@ -66,46 +44,9 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
   }
   if (request === null || request.status === "cancelled" || request.status === "superseded")
     return null;
-  if (request.status === "answered" || controller.answered) {
-    return (
-      <section
-        className="ja-interaction-card is-collapsed"
-        data-interaction-card="true"
-        data-interaction-thread-id={request.threadId}
-        data-interaction-status="answered"
-        data-request-id={request.requestId}
-        aria-label="已回答的问题"
-      >
-        <div className="ja-interaction-card__summary-heading">
-          <Check aria-hidden="true" />
-          <strong>
-            {controller.resumeState === "waiting_to_resume" ? "回答已保存，等待继续" : "问题已回答"}
-          </strong>
-          <button
-            type="button"
-            className="ja-interaction-card__icon-button"
-            aria-label={collapsed ? "展开回答" : "收起回答"}
-            aria-expanded={!collapsed}
-            onClick={() => controller.setCollapsed(!collapsed)}
-          >
-            <ChevronRight aria-hidden="true" />
-          </button>
-        </div>
-        {!collapsed && request.questions.length ? (
-          <ul className="ja-interaction-card__summary-list">
-            {request.questions.map((item) => (
-              <li key={item.questionId}>
-                <span>{item.prompt}</span>
-                <strong>{answerLabel(item, controller.answers[item.questionId])}</strong>
-              </li>
-            ))}
-          </ul>
-        ) : !collapsed ? (
-          <p className="ja-interaction-card__muted">已提交回答。</p>
-        ) : null}
-      </section>
-    );
-  }
+  // 已回答事实已经由 request_user_input 的 ToolResult 进入 Timeline；Composer 只保留待回答卡，
+  // 避免恢复阶段的 resumeState 更新把历史记录重新挂回输入区并造成布局抖动。
+  if (request.status === "answered" || controller.answered) return null;
   if (collapsed) {
     return (
       <section

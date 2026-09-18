@@ -1021,6 +1021,19 @@
   white-space: nowrap;
 }
 
+/* 问答结果与题目共用 Tool 行的中间轨道，避免把答案挤到箭头之外或撑大整个时间线。 */
+.ja-tool-details__interaction-result {
+  min-width: 0;
+  grid-column: 2;
+  grid-row: 2;
+  overflow: hidden;
+  color: var(--ja-accent-emphasis);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .ja-tool-details__summary {
   display: inline-flex;
   width: 1.25rem;

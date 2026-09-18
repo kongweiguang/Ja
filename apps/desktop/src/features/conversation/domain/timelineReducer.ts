@@ -827,15 +827,23 @@ export function applySnapshot(
   if (contextCompactionByThread[snapshot.threadId]?.phase !== "compacted")
     delete contextCompactionByThread[snapshot.threadId];
   const contextUsageByThread = { ...next.contextUsageByThread };
-  if (snapshot.contextUsage === null) delete contextUsageByThread[snapshot.threadId];
-  else
-    contextUsageByThread[snapshot.threadId] = {
-      ...usageAfterCompaction(
-        snapshot.contextUsage,
-        next.contextUsageInvalidatedAtByThread[snapshot.threadId],
-      ),
-      turnId: snapshot.contextUsage.turnId,
-    };
+  if (snapshot.contextUsage !== null) {
+    const incoming = usageAfterCompaction(snapshot.contextUsage);
+    const currentUsage = contextUsageByThread[snapshot.threadId];
+    const currentTurnStartedAt =
+      currentUsage === undefined ? undefined : next.turns[currentUsage.turnId]?.startedAt;
+    const incomingTurnStartedAt = snapshot.turns.find(
+      (turn) => turn.turnId === snapshot.contextUsage?.turnId,
+    )?.requestedAt;
+    contextUsageByThread[snapshot.threadId] = retainKnownContextUsage(
+      currentUsage,
+      incoming,
+      snapshot.contextUsage.turnId,
+      currentTurnStartedAt,
+      incomingTurnStartedAt,
+      next.contextUsageInvalidatedAtByThread[snapshot.threadId],
+    );
+  }
   const inputQueueByTurn = Object.fromEntries(
     Object.entries(next.inputQueueByTurn).filter(([turnId]) => !threadTurnIds.has(turnId)),
   );
@@ -1152,36 +1160,86 @@ function usageMetadata(usage: TimelineContextUsage | undefined): ItemMetadata | 
       };
 }
 
-/** 时间边界来自服务端；不比较 Turn 内序号，避免跨 Turn 新请求被旧 UNKNOWN 阻塞。 */
-function usageAfterCompaction(
-  usage: TimelineContextUsage,
-  invalidatedAt: string | undefined,
-): TimelineContextUsage {
-  if (invalidatedAt === undefined || Date.parse(usage.measuredAt) > Date.parse(invalidatedAt))
-    return usage;
-  return {
-    ...usage,
-    certainty: "unknown",
-    inputTokens: null,
-    outputTokens: null,
-    totalTokens: null,
-  };
+/** 压缩只记录服务端边界；展示层继续保留最近一次可信 Usage，直到新 KNOWN 到达。 */
+function usageAfterCompaction(usage: TimelineContextUsage): TimelineContextUsage {
+  return usage;
 }
 
-/** 压缩成功后冻结旧请求的可信度，防止后续 started/failed 或旧 Snapshot 重新启用旧计量。 */
-function invalidateContextUsage(state: TimelineState, threadId: string): TimelineState {
-  const usage = state.contextUsageByThread[threadId];
-  if (usage === undefined || usage.certainty === "unknown") return state;
-  return {
-    ...state,
-    contextUsageByThread: {
-      ...state.contextUsageByThread,
-      [threadId]: {
-        ...usageAfterCompaction(usage, state.contextUsageInvalidatedAtByThread[threadId]),
-        turnId: usage.turnId,
-      },
-    },
-  };
+/** 对协议时间做有限比较；无法解析时返回 undefined，让调用方采取保守的保留策略。 */
+function compareUsageTimestamp(
+  left: string | undefined,
+  right: string | undefined,
+): number | undefined {
+  if (left === undefined || right === undefined) return undefined;
+  if (left === right) return 0;
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) return undefined;
+  return leftMs < rightMs ? -1 : 1;
+}
+
+/** 请求序号相同才允许使用 requestId/Profile 校验；跨 Turn 的 ordinal 会重新计数。 */
+function sameUsageRequestIdentity(
+  left: TimelineContextUsage,
+  right: TimelineContextUsage,
+): boolean {
+  return (
+    left.requestId === right.requestId &&
+    JSON.stringify(left.profile) === JSON.stringify(right.profile)
+  );
+}
+
+/** 比较完整 Usage 时去掉 Snapshot 额外携带的 turnId，避免身份外壳影响幂等判断。 */
+function sameUsageMeasurement(
+  left: TimelineContextUsage | TimelineThreadContextUsage,
+  right: TimelineContextUsage | TimelineThreadContextUsage,
+): boolean {
+  const leftValue = { ...left } as Record<string, unknown>;
+  const rightValue = { ...right } as Record<string, unknown>;
+  delete leftValue["turnId"];
+  delete rightValue["turnId"];
+  return JSON.stringify(leftValue) === JSON.stringify(rightValue);
+}
+
+/**
+ * 快照可能比事件晚到但携带更旧的请求级计量；只有能证明 incoming 更新时才替换，
+ * UNKNOWN 永远不能把已知环清空，无法判断先后时保留当前事实。
+ */
+function retainKnownContextUsage(
+  current: TimelineThreadContextUsage | undefined,
+  incoming: TimelineContextUsage,
+  turnId: string,
+  currentTurnStartedAt?: string,
+  incomingTurnStartedAt?: string,
+  contextInvalidatedAt?: string,
+): TimelineThreadContextUsage {
+  const next = (): TimelineThreadContextUsage => ({ ...incoming, turnId });
+  if (current === undefined) return next();
+
+  const currentKnown = current.certainty === "known";
+  const incomingKnown = incoming.certainty === "known";
+  const incomingAfterCompaction =
+    incomingKnown && compareUsageTimestamp(incoming.measuredAt, contextInvalidatedAt) === 1;
+  const currentAfterCompaction =
+    compareUsageTimestamp(current.measuredAt, contextInvalidatedAt) === 1;
+  if (current.turnId === turnId) {
+    if (incoming.requestOrdinal < current.requestOrdinal) return current;
+    if (incoming.requestOrdinal > current.requestOrdinal) return incomingKnown ? next() : current;
+    if (!sameUsageRequestIdentity(current, incoming)) return current;
+    if (!incomingKnown) return current;
+    if (!currentKnown) return next();
+    if (incomingAfterCompaction && !currentAfterCompaction) return next();
+    return compareUsageTimestamp(incoming.measuredAt, current.measuredAt) === 1 ? next() : current;
+  }
+
+  const turnOrder = compareUsageTimestamp(incomingTurnStartedAt, currentTurnStartedAt);
+  if (turnOrder === -1) return current;
+  if (turnOrder === 1) return incomingKnown ? next() : current;
+  if (incomingKnown && !currentKnown) return next();
+  const measuredOrder = compareUsageTimestamp(incoming.measuredAt, current.measuredAt);
+  if (measuredOrder === -1) return current;
+  if (incomingAfterCompaction && !currentAfterCompaction) return next();
+  return current;
 }
 
 /**
@@ -1199,30 +1257,39 @@ function recordContextUsage(
   if (current !== undefined && current.turnId !== turnId) {
     const previousStartedAt = state.turns[current.turnId]?.startedAt;
     const incomingStartedAt = state.turns[turnId]?.startedAt;
-    if (previousStartedAt === undefined || incomingStartedAt === undefined) return undefined;
-    if (Date.parse(incomingStartedAt) < Date.parse(previousStartedAt)) return state;
+    const turnOrder = compareUsageTimestamp(incomingStartedAt, previousStartedAt);
+    if (turnOrder === undefined) return undefined;
+    if (turnOrder === -1) return state;
+    // 新请求的 UNKNOWN 只能让排序边界前进，不能让 UI 暂时降级为空。
+    if (current.certainty === "known" && usage.certainty === "unknown") return state;
+    return {
+      ...state,
+      contextUsageByThread: {
+        ...state.contextUsageByThread,
+        [threadId]: { ...usageAfterCompaction(usage), turnId },
+      },
+    };
   }
   if (current !== undefined && current.turnId === turnId) {
-    const currentRequestUsage: TimelineContextUsage = { ...current };
-    // Turn 身份属于投影外壳，不参与同一请求 Usage 的幂等比较。
-    Reflect.deleteProperty(currentRequestUsage, "turnId");
     if (usage.requestOrdinal < current.requestOrdinal) return state;
     if (usage.requestOrdinal === current.requestOrdinal) {
-      if (usage.requestId !== current.requestId) return undefined;
-      const sameProfile = JSON.stringify(usage.profile) === JSON.stringify(current.profile);
-      if (!sameProfile) return undefined;
+      if (!sameUsageRequestIdentity(current, usage)) return undefined;
+      if (usage.certainty === "unknown") {
+        if (current.certainty === "known") return state;
+        return sameUsageMeasurement(current, usage) ? state : undefined;
+      }
       if (current.certainty === "known")
-        return JSON.stringify(usage) === JSON.stringify(currentRequestUsage) ? state : undefined;
-      if (usage.certainty === "unknown")
-        return JSON.stringify(usage) === JSON.stringify(currentRequestUsage) ? state : undefined;
+        return sameUsageMeasurement(current, usage) ? state : undefined;
     }
+    // 只有确认了请求身份和顺序之后，才允许 UNKNOWN 保留旧 KNOWN。
+    if (current.certainty === "known" && usage.certainty === "unknown") return state;
   }
   return {
     ...state,
     contextUsageByThread: {
       ...state.contextUsageByThread,
       [threadId]: {
-        ...usageAfterCompaction(usage, state.contextUsageInvalidatedAtByThread[threadId]),
+        ...usageAfterCompaction(usage),
         turnId,
       },
     },
@@ -1505,7 +1572,6 @@ function applyContextCompactionEvent(
         [params.threadId]: params.occurredAt,
       },
     };
-    next = invalidateContextUsage(next, params.threadId);
   }
   if (params.turnId !== null) {
     next = putItem(next, {

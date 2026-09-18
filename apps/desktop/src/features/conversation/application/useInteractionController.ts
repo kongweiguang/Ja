@@ -22,6 +22,9 @@ export const useClarificationController = useInteractionController;
 
 export interface InteractionController {
   request: InteractionRequest | null;
+  /** 最近一次已由服务端确认的回答；保留到规范 ToolResult 接管 Timeline，避免 ACK 与事件之间空窗。 */
+  answeredRequest: InteractionRequest | null;
+  answeredAnswers: Readonly<Record<string, InteractionAnswer>>;
   answers: Readonly<Record<string, InteractionAnswer>>;
   pageIndex: number;
   collapsed: boolean;
@@ -205,6 +208,9 @@ export function useInteractionController({
   port,
 }: InteractionControllerOptions): InteractionController {
   const [snapshot, setSnapshot] = useState<InteractionSnapshot>();
+  const [answeredRequest, setAnsweredRequest] = useState<InteractionRequest | null>(null);
+  const [answeredAnswers, setAnsweredAnswers] =
+    useState<Readonly<Record<string, InteractionAnswer>>>(EMPTY_ANSWERS);
   const [answers, setAnswers] =
     useState<Readonly<Record<string, InteractionAnswer>>>(EMPTY_ANSWERS);
   const [pageIndex, setPageIndex] = useState(0);
@@ -251,7 +257,10 @@ export function useInteractionController({
     collapsedRef.current = collapsed;
   }, [collapsed]);
 
-  /** 应用按事件水位校验过的服务端快照；已确认答案始终优先于本地草稿。 */
+  /**
+   * 应用按事件水位校验过的服务端快照；已确认答案始终优先于本地草稿。
+   * 已回答快照另存一份，直到 Timeline 的规范 ToolResult 出现，避免 ACK 先到时两处 UI 同时消失。
+   */
   const applySnapshot = useCallback(
     (next: InteractionSnapshot): void => {
       if (next.threadId !== threadId || next.eventSequence < readSequenceRef.current) return;
@@ -287,6 +296,10 @@ export function useInteractionController({
       // 让同一 tick 内的草稿 ACK 也能读取最新服务端 draft revision，而不等待 React effect。
       snapshotRef.current = next;
       setSnapshot(next);
+      if (next.request?.status === "answered") {
+        setAnsweredRequest(next.request);
+        setAnsweredAnswers(answersFromSnapshot(next));
+      }
       // 已回答请求是服务端确认事实，即使本地尚有未发送草稿，也不能把草稿显示成确认摘要。
       if (next.request?.status === "answered") dirtyRef.current = false;
       if (pendingLocalDraft !== undefined) {
@@ -350,6 +363,8 @@ export function useInteractionController({
     submitPromiseRef.current = undefined;
     pendingDraftRef.current = undefined;
     setSnapshot(undefined);
+    setAnsweredRequest(null);
+    setAnsweredAnswers(EMPTY_ANSWERS);
     setAnswers(EMPTY_ANSWERS);
     answersRef.current = EMPTY_ANSWERS;
     setPageIndex(0);
@@ -745,6 +760,8 @@ export function useInteractionController({
   return useMemo(
     () => ({
       request,
+      answeredRequest,
+      answeredAnswers,
       answers,
       pageIndex,
       collapsed,
@@ -770,6 +787,8 @@ export function useInteractionController({
     }),
     [
       answered,
+      answeredAnswers,
+      answeredRequest,
       resumeState,
       answers,
       cancel,

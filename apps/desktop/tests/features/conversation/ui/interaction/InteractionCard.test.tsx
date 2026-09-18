@@ -164,7 +164,7 @@ describe("InteractionCard", () => {
     );
   });
 
-  it("keeps an optional other answer and renders the answered summary", async () => {
+  it("keeps an optional other answer and removes the answered card from Composer", async () => {
     const user = userEvent.setup();
     const port = createPort();
     render(<Harness port={port} />);
@@ -185,7 +185,7 @@ describe("InteractionCard", () => {
     await user.click(screen.getByRole("button", { name: "跳过" }));
     await user.click(screen.getByRole("button", { name: "提交" }));
     await waitFor(() =>
-      expect(screen.getByRole("region", { name: "已回答的问题" })).toBeInTheDocument(),
+      expect(screen.queryByRole("region", { name: "已回答的问题" })).not.toBeInTheDocument(),
     );
     expect(port.submit).toHaveBeenCalledWith(
       expect.objectContaining({

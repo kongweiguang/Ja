@@ -1222,6 +1222,7 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
 }
 
 .ja-context-usage {
+  position: relative;
   display: inline-grid;
   width: 28px;
   height: 28px;
@@ -1255,6 +1256,11 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   color: var(--ja-danger);
 }
 
+/* 未确认计量仍保留固定环形占位，不用问号制造错误感或让工具栏在响应中跳变。 */
+.ja-context-usage[data-tone="unknown"] {
+  color: var(--ja-foreground-tertiary);
+}
+
 .ja-context-usage svg {
   width: 20px;
   height: 20px;
@@ -1275,6 +1281,17 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   transition: stroke-dashoffset 180ms var(--ja-ease-native);
+}
+
+.ja-context-usage__unknown-mark {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 7px;
+  height: 2px;
+  border-radius: var(--ja-radius-sm);
+  background: currentColor;
+  transform: translate(-50%, -50%);
 }
 
 .ja-context-usage-tooltip {

@@ -1041,8 +1041,8 @@ describe("timeline reducer", () => {
     });
   });
 
-  /** 最新请求即使尚无可靠计量也必须成为展示事实，不能回退到旧请求的 KNOWN 数值。 */
-  it("以较新 UNKNOWN 覆盖旧 KNOWN", () => {
+  /** 新请求尚无可靠计量时继续保留上一笔 KNOWN，直到新的可信 Usage 到达。 */
+  it("保留旧 KNOWN 直到新 Usage 到达", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
     state = apply(
@@ -1099,10 +1099,10 @@ describe("timeline reducer", () => {
     );
 
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_2",
-      requestOrdinal: 2,
-      certainty: "unknown",
-      inputTokens: null,
+      requestId: "request_1",
+      requestOrdinal: 1,
+      certainty: "known",
+      inputTokens: 10,
     });
   });
 
@@ -1213,6 +1213,46 @@ describe("timeline reducer", () => {
 
     expect(conflict.lastOutcome).toBe("resync_required");
     expect(conflict.contextUsageByThread[threadId]).toEqual({ ...unknown, turnId });
+  });
+
+  /** UNKNOWN 也必须先通过请求身份校验，不能用“保留旧 KNOWN”绕过串线或画像冲突。 */
+  it("在保留 KNOWN 前拒绝身份冲突的 UNKNOWN", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 2, {
+        messageId: "item_known_identity_guard",
+        text: "",
+        modelRound: 1,
+        usage: requestUsage(1, 10, 1, 11),
+        toolCalls: [],
+      }),
+    );
+    const conflictingUnknown = requestUsage(1, 0, 0, 0, {
+      requestId: "request_other",
+      certainty: "unknown",
+      inputTokens: null,
+      outputTokens: null,
+      totalTokens: null,
+    });
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 3, {
+        messageId: "item_unknown_identity_conflict",
+        text: "",
+        modelRound: 1,
+        usage: conflictingUnknown,
+        toolCalls: [],
+      }),
+    );
+
+    expect(state.lastOutcome).toBe("resync_required");
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      requestId: "request_1",
+      certainty: "known",
+      inputTokens: 10,
+    });
   });
 
   it("treats deltas as transient and drops the draft when streamSeq has a gap", () => {
@@ -1727,8 +1767,8 @@ describe("timeline reducer", () => {
     expect(state.threadRevisionByThread[threadId]).toBe(5);
   });
 
-  /** 压缩后旧 Usage 进入 UNKNOWN；后续生命周期和旧 Snapshot 不得重新启用它，直到新响应到达。 */
-  it("在多次压缩生命周期中保持 Usage 未知并允许新响应恢复", () => {
+  /** 压缩和恢复期间保留旧 Usage；新的 Provider KNOWN 到达后才更新环。 */
+  it("在多次压缩生命周期中保持旧 Usage 并允许新响应更新", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
     state = apply(
@@ -1758,9 +1798,9 @@ describe("timeline reducer", () => {
       }),
     );
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      certainty: "unknown",
+      certainty: "known",
       requestOrdinal: 1,
-      inputTokens: null,
+      inputTokens: 40_000,
     });
 
     state = apply(
@@ -1794,7 +1834,10 @@ describe("timeline reducer", () => {
         occurredAt: "2026-08-18T00:00:05Z",
       }),
     );
-    expect(state.contextUsageByThread[threadId]?.certainty).toBe("unknown");
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "known",
+      inputTokens: 40_000,
+    });
 
     const recovered = apply(
       state,
@@ -1844,9 +1887,96 @@ describe("timeline reducer", () => {
     );
     expect(restored.contextCompactionByThread[threadId]).toBeUndefined();
     expect(restored.contextUsageByThread[threadId]).toMatchObject({
-      certainty: "unknown",
+      certainty: "known",
       requestOrdinal: 1,
-      inputTokens: null,
+      inputTokens: 40_000,
+    });
+  });
+
+  /** 恢复快照缺少或暂时没有 Usage 时，不得把当前 Composer 环清空或降级成未知。 */
+  it("在恢复快照缺失计量时保留旧 KNOWN", () => {
+    const state = readyState();
+    state.contextUsageByThread[threadId] = { ...requestUsage(1, 40_000, 1_000, 41_000), turnId };
+    const baseSnapshot = {
+      threadId,
+      revision: 1,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    };
+    const withoutUsage = applySnapshot(state, { ...baseSnapshot, contextUsage: null }, "ws_one");
+    expect(withoutUsage.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "known",
+      inputTokens: 40_000,
+    });
+
+    const withUnknown = applySnapshot(
+      withoutUsage,
+      {
+        ...baseSnapshot,
+        revision: 2,
+        contextUsage: {
+          ...requestUsage(2, 0, 0, 0, {
+            certainty: "unknown",
+            inputTokens: null,
+            outputTokens: null,
+            totalTokens: null,
+          }),
+          turnId,
+        },
+      },
+      "ws_one",
+    );
+    expect(withUnknown.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "known",
+      inputTokens: 40_000,
+    });
+  });
+
+  /** thread/read 可能在新事件之后返回；旧快照不得把当前环回退到更早请求。 */
+  it("不让迟到快照回退较新的 KNOWN Usage", () => {
+    const state = readyState();
+    state.contextUsageByThread[threadId] = {
+      ...requestUsage(2, 20, 2, 22, { measuredAt: "2026-08-18T00:00:02Z" }),
+      turnId: "turn_old",
+    };
+
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 2,
+        turns: [
+          {
+            turnId: "turn_new",
+            status: "running",
+            requestedAt: "2026-08-18T00:00:03Z",
+            updatedAt: "2026-08-18T00:00:03Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: {
+          ...requestUsage(1, 10, 1, 11, { measuredAt: "2026-08-18T00:00:01Z" }),
+          turnId: "turn_new",
+        },
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+
+    expect(restored.contextUsageByThread[threadId]).toMatchObject({
+      turnId: "turn_old",
+      requestId: "request_2",
+      inputTokens: 20,
     });
   });
 
@@ -2163,8 +2293,8 @@ describe("timeline reducer", () => {
       inputTokensAfter: 12_000,
     });
     expect(restored.contextUsageByThread[threadId]).toMatchObject({
-      certainty: "unknown",
-      inputTokens: null,
+      certainty: "known",
+      inputTokens: 48_000,
       measuredAt: "2026-08-18T00:00:01Z",
     });
   });

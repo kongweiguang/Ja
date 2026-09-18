@@ -172,4 +172,40 @@ describe("ToolStepDetails", () => {
       screen.queryByText("Successfully replaced 2 block(s) in the file."),
     ).not.toBeInTheDocument();
   });
+
+  /** request_user_input 完成后只在工作时间线保留人类可读的选择结果，不让已回答卡占据 Composer。 */
+  it("在询问用户 Tool 行显示选择结果", () => {
+    const step = toolStep();
+    const presentation = step.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    render(
+      <WorkProcess
+        steps={[
+          {
+            ...step,
+            status: "completed",
+            metadata: {
+              ...step.metadata,
+              toolName: "request_user_input",
+              presentation: {
+                ...presentation,
+                kind: "read",
+                title: "User input",
+                status: "success",
+                inputPreview: "采用哪种配置范围？",
+                outputPreview:
+                  '[{"questionId":"question_scope","optionIds":["option_project"],"freeText":null,"skipped":false}]',
+                summary: "已选择：采用哪种配置范围？：按项目覆盖",
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "工作过程，已完成，1 步" }));
+    const trigger = screen.getByRole("button", { name: /询问用户，request_user_input/u });
+    expect(trigger).toHaveTextContent("询问用户");
+    expect(trigger).toHaveTextContent("已选择：采用哪种配置范围？：按项目覆盖");
+  });
 });

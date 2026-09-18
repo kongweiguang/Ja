@@ -61,6 +61,7 @@ export type {
   ComposerWorkspaceSearchResult,
 } from "./ui/composer/composerSuggestions";
 export { resolveContextUsage } from "./domain/contextUsage";
+export { projectAnsweredInteractionResult } from "./application/interactionTimeline";
 export type { ConversationContextReference, UserContentBlock } from "./domain/userContent";
 export { ConversationSummaryPopover } from "./ui/summary/ConversationSummaryPopover";
 export { ThreadOperationsMenu } from "./ui/thread-actions/ThreadOperationsMenu";

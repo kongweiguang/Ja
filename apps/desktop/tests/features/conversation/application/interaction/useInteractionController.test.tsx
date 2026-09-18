@@ -359,7 +359,13 @@ describe("useInteractionController", () => {
     });
     vi.mocked(port.read)
       .mockResolvedValueOnce(pendingSnapshot)
-      .mockResolvedValueOnce(answeredSnapshot);
+      .mockResolvedValueOnce(answeredSnapshot)
+      .mockResolvedValueOnce({
+        threadId: "thr_one",
+        eventSequence: 3,
+        request: null,
+        draft: null,
+      });
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
     await waitFor(() => expect(result.current.request?.status).toBe("pending"));
     act(() =>
@@ -373,6 +379,12 @@ describe("useInteractionController", () => {
     act(() => listener?.({ kind: "snapshot_changed", threadId: "thr_one", eventSequence: 2 }));
     await waitFor(() => expect(result.current.request?.status).toBe("answered"));
     expect(result.current.answers["question_one"]).toEqual(serverAnswer);
+    expect(result.current.answeredRequest?.requestId).toBe(answeredSnapshot.request?.requestId);
+    expect(result.current.answeredAnswers["question_one"]).toEqual(serverAnswer);
+    act(() => listener?.({ kind: "snapshot_changed", threadId: "thr_one", eventSequence: 3 }));
+    await waitFor(() => expect(result.current.request).toBeNull());
+    expect(result.current.answeredRequest?.requestId).toBe(answeredSnapshot.request?.requestId);
+    expect(result.current.answeredAnswers["question_one"]).toEqual(serverAnswer);
   });
 
   it("does not advance the event watermark when reconciliation fails", async () => {

@@ -63,6 +63,8 @@ function presentationActionLabel(
   toolName: string | undefined,
 ): string {
   switch (toolName) {
+    case "request_user_input":
+      return "询问用户";
     case "grep":
       return "搜索内容";
     case "find":
@@ -112,6 +114,14 @@ function presentationTarget(
     presentation.relativePaths.find((path) => path.trim() !== "")?.trim() ||
     inputTarget
   );
+}
+
+/** 问答 Tool 的摘要是 Java 根据题目与答案生成的安全展示事实，折叠态也应直接可见。 */
+function interactionSummary(
+  presentation: ToolPresentation,
+  toolName: string | undefined,
+): string | undefined {
+  return toolName === "request_user_input" ? presentation.summary?.trim() || undefined : undefined;
 }
 
 /** Shell 将 stdout/stderr 保持为不同事实，普通 Tool 只展示 Java 提供的安全 outputPreview。 */
@@ -241,10 +251,12 @@ export function ToolStepDetails({
       : presentation.status === "error";
   const actionLabel = presentationActionLabel(presentation, toolName);
   const target = presentationTarget(presentation, toolName);
+  const interactionResult = interactionSummary(presentation, toolName);
   const accessibleSummary = [
     actionLabel,
     toolName,
     target,
+    interactionResult,
     presentationStatusLabel(presentation.status),
   ]
     .filter((value): value is string => value !== undefined)
@@ -297,6 +309,11 @@ export function ToolStepDetails({
             <code className="ja-tool-details__target" title={target}>
               {target}
             </code>
+          ) : null}
+          {interactionResult ? (
+            <span className="ja-tool-details__interaction-result" title={interactionResult}>
+              {interactionResult}
+            </span>
           ) : null}
           <span className="ja-tool-details__summary">
             <ChevronDown aria-hidden="true" />

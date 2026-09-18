@@ -20,6 +20,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadTitlePolicy;
 import io.github.kongweiguang.ja.conversation.domain.SubagentPolicy;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionEvent;
+import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionAnswer;
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionQuestion;
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionStatus;
@@ -374,24 +375,34 @@ public final class MybatisConversationRepository implements ConversationReposito
     /** 同一 Unit of Work 内完成 Interaction Tool 事实与 cursor 替换，禁止嵌套开启事务。 */
     private CommitReceipt settleInteractionAnswer(PersistenceMappers mapper,
                                                    InteractionAnswerSettlement request) {
-            PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
-                    request.expectedTurnMutationVersion());
-            TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
-            if (current != TurnState.SUSPENDED) throw conflict("interaction turn is not suspended");
-            ToolPresentation presentation = new ToolPresentation(ToolPresentation.Kind.READ,
-                    "User input", ToolPresentation.Status.SUCCESS, null, request.content(), "已收到用户输入", List.of(),
-                    null, null, null, null, null, 0L, false, null);
-            List<Fact> facts = List.of(
-                    new ToolResultFact(request.callId(), ToolState.SUCCEEDED, request.content(), false,
-                            presentation, ""),
-                    new ToolResultMessageFact("item_" + UUID.randomUUID(),
-                            new ModelMessage(ModelRole.TOOL,
-                                    List.of(new ToolResultContent(request.callId(), request.content(), false)))));
-            CommitRequest commit = new CommitRequest(request.threadId(), request.turnId(), TurnState.SUSPENDED,
-                    facts, request.expectedTurnMutationVersion(), request.occurredAt(), request.executionState());
-            long threadRevision = applyCommitFacts(mapper, commit, current, false);
-            finishCommit(mapper, commit);
-            return new CommitReceipt(threadRevision, request.expectedTurnMutationVersion() + 1);
+        return settleInteractionAnswer(mapper, request, "已收到用户输入");
+    }
+
+    /**
+     * 结算仍把结构化答案原文交给模型，但把受控的人类可读摘要单独写入 Tool Presentation，
+     * 让历史时间线显示用户选择而不是内部 question/option ID；两者的安全边界保持分离。
+     */
+    private CommitReceipt settleInteractionAnswer(PersistenceMappers mapper,
+                                                   InteractionAnswerSettlement request,
+                                                   String presentationSummary) {
+        PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
+                request.expectedTurnMutationVersion());
+        TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
+        if (current != TurnState.SUSPENDED) throw conflict("interaction turn is not suspended");
+        ToolPresentation presentation = new ToolPresentation(ToolPresentation.Kind.READ,
+                "询问用户", ToolPresentation.Status.SUCCESS, null, request.content(), presentationSummary, List.of(),
+                null, null, null, null, null, 0L, false, null);
+        List<Fact> facts = List.of(
+                new ToolResultFact(request.callId(), ToolState.SUCCEEDED, request.content(), false,
+                        presentation, ""),
+                new ToolResultMessageFact("item_" + UUID.randomUUID(),
+                        new ModelMessage(ModelRole.TOOL,
+                                List.of(new ToolResultContent(request.callId(), request.content(), false)))));
+        CommitRequest commit = new CommitRequest(request.threadId(), request.turnId(), TurnState.SUSPENDED,
+                facts, request.expectedTurnMutationVersion(), request.occurredAt(), request.executionState());
+        long threadRevision = applyCommitFacts(mapper, commit, current, false);
+        finishCommit(mapper, commit);
+        return new CommitReceipt(threadRevision, request.expectedTurnMutationVersion() + 1);
     }
 
     /**
@@ -505,7 +516,7 @@ public final class MybatisConversationRepository implements ConversationReposito
                     tools.firstOrdinal(), tools.lastOrdinal(), tools.nextOrdinal() + 1);
             CommitReceipt receipt = settleInteractionAnswer(mapper, new InteractionAnswerSettlement(
                     answered.threadId(), answered.turnId(), answered.toolCallId(), encodeInteraction(answered.answers()),
-                    turn.mutationVersion(), occurredAt, next));
+                    turn.mutationVersion(), occurredAt, next), interactionAnswerSummary(answered));
             PersistenceRecords.InteractionRow settled = mapper.interactions().selectInteraction(
                     new PersistenceRecords.InteractionKey(answered.threadId(), answered.requestId()));
             return new InteractionAnswerReceipt(decodeInteraction(settled), receipt, true);
@@ -1575,6 +1586,38 @@ public final class MybatisConversationRepository implements ConversationReposito
         } catch (com.fasterxml.jackson.core.JsonProcessingException failure) {
             throw new StorageException(StorageException.Code.IO, "cannot encode interaction snapshot", failure);
         }
+    }
+
+    /**
+     * 把已确认答案投影为有界的人类可读摘要；问题/选项文案来自同一持久请求，不能让 Renderer 依据 ID 猜测。
+     */
+    private static String interactionAnswerSummary(InteractionRequest request) {
+        StringBuilder summary = new StringBuilder("已选择：");
+        for (InteractionQuestion question : request.questions()) {
+            InteractionAnswer answer = request.answers().stream()
+                    .filter(candidate -> candidate.questionId().equals(question.questionId()))
+                    .findFirst().orElse(null);
+            if (summary.length() > "已选择：".length()) summary.append("；");
+            summary.append(question.prompt()).append("：").append(answerLabel(question, answer));
+            if (summary.length() >= 980) {
+                summary.setLength(980);
+                summary.append('…');
+                break;
+            }
+        }
+        return summary.toString();
+    }
+
+    /** 单题摘要只使用服务端保存的选项 label 与用户自由文本，不把 optionId 暴露给时间线。 */
+    private static String answerLabel(InteractionQuestion question, InteractionAnswer answer) {
+        if (answer == null) return "未回答";
+        if (answer.skipped()) return "已跳过";
+        List<String> labels = question.options().stream()
+                .filter(option -> answer.optionIds().contains(option.optionId()))
+                .map(io.github.kongweiguang.ja.conversation.domain.interaction.InteractionOption::label)
+                .collect(java.util.stream.Collectors.toCollection(java.util.ArrayList::new));
+        if (answer.freeText() != null && !answer.freeText().isBlank()) labels.add(answer.freeText());
+        return labels.isEmpty() ? "未回答" : String.join("、", labels);
     }
 
     /** 仅用于幂等回答回执的严格行解码；损坏请求不得被当作已回答成功返回。 */

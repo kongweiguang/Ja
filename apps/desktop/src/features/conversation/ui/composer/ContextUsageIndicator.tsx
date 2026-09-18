@@ -27,35 +27,15 @@ function formatTokenCount(value: number): string {
  * 因而使用可聚焦 progressbar 语义，避免把纯信息伪装成按钮。
  */
 export function ContextUsageIndicator({ usage }: ContextUsageIndicatorProps): ReactElement {
-  if (usage.certainty === "unknown") {
-    return (
-      <Tooltip
-        delayDuration={220}
-        sideOffset={8}
-        className="ja-context-usage-tooltip"
-        content={
-          <div className="ja-context-usage-tooltip__content">
-            当前上下文用量尚未确认，等待下一次模型响应
-          </div>
-        }
-      >
-        <span
-          className="ja-context-usage"
-          data-tone="warning"
-          role="status"
-          aria-label="上下文使用量未知"
-          tabIndex={0}
-        >
-          <span aria-hidden="true">?</span>
-        </span>
-      </Tooltip>
-    );
-  }
-  const used = formatTokenCount(usage.usedTokens);
-  const limit = formatTokenCount(usage.limitTokens);
-  const valueNow = Math.min(100, Math.max(0, usage.percentage));
+  const known = usage.certainty === "known";
+  const used = known ? formatTokenCount(usage.usedTokens) : undefined;
+  const limit = known ? formatTokenCount(usage.limitTokens) : undefined;
+  const valueNow = known ? Math.min(100, Math.max(0, usage.percentage)) : undefined;
   const sourceLabel = "最近模型请求";
-  const valueText = `已使用 ${usage.percentage}%，${used} / ${limit} tokens，${sourceLabel}`;
+  const valueText =
+    known && used !== undefined && limit !== undefined
+      ? `已使用 ${usage.percentage}%，${used} / ${limit} tokens，${sourceLabel}`
+      : undefined;
 
   return (
     <Tooltip
@@ -63,42 +43,51 @@ export function ContextUsageIndicator({ usage }: ContextUsageIndicatorProps): Re
       sideOffset={8}
       className="ja-context-usage-tooltip"
       content={
-        <div className="ja-context-usage-tooltip__content">
-          <div className="ja-context-usage-tooltip__heading">
-            <span>上下文</span>
-            <strong>{usage.percentage}%</strong>
+        known ? (
+          <div className="ja-context-usage-tooltip__content">
+            <div className="ja-context-usage-tooltip__heading">
+              <span>上下文</span>
+              <strong>{usage.percentage}%</strong>
+            </div>
+            <p>
+              <strong>{used}</strong>
+              <span> / {limit} tokens</span>
+            </p>
+            <small>{sourceLabel}</small>
           </div>
-          <p>
-            <strong>{used}</strong>
-            <span> / {limit} tokens</span>
-          </p>
-          <small>{sourceLabel}</small>
-        </div>
+        ) : (
+          <div className="ja-context-usage-tooltip__content">
+            当前上下文用量尚未确认，等待下一次模型响应
+          </div>
+        )
       }
     >
       <span
         className="ja-context-usage"
-        data-tone={usage.tone}
-        role="progressbar"
-        aria-label="上下文使用量"
-        aria-valuemin={0}
-        aria-valuemax={100}
+        data-tone={known ? usage.tone : "unknown"}
+        role={known ? "progressbar" : "status"}
+        aria-label={known ? "上下文使用量" : "上下文使用量待确认"}
+        aria-valuemin={known ? 0 : undefined}
+        aria-valuemax={known ? 100 : undefined}
         aria-valuenow={valueNow}
         aria-valuetext={valueText}
         tabIndex={0}
       >
         <svg viewBox="0 0 20 20" aria-hidden="true">
           <circle className="ja-context-usage__track" cx="10" cy="10" r="7.5" />
-          <circle
-            className="ja-context-usage__value"
-            cx="10"
-            cy="10"
-            r="7.5"
-            pathLength="100"
-            strokeDasharray="100"
-            strokeDashoffset={100 - usage.ringPercentage}
-          />
+          {known ? (
+            <circle
+              className="ja-context-usage__value"
+              cx="10"
+              cy="10"
+              r="7.5"
+              pathLength="100"
+              strokeDasharray="100"
+              strokeDashoffset={100 - usage.ringPercentage}
+            />
+          ) : null}
         </svg>
+        {known ? null : <span className="ja-context-usage__unknown-mark" aria-hidden="true" />}
       </span>
     </Tooltip>
   );

@@ -9,6 +9,7 @@ import {
   TimelineScrollCache,
   Composer,
   InteractionCard,
+  projectAnsweredInteractionResult,
   useInteractionController,
   type InteractionPort,
   ConversationSummaryPopover,
@@ -161,7 +162,8 @@ export function ConversationWorkspace({
   useEffect(() => () => timelineScrollCache.clear(), [timelineScrollCache]);
   const clarification = useInteractionController({
     threadId: conversation.currentThreadId,
-    visible: turnAdmissionReady && runtimeState?.features.includes("interaction_v1") === true,
+    // Runtime 恢复/重连只撤销发送准入，不能卸载 Interaction 快照；否则待回答卡会在恢复轮次中闪退再出现。
+    visible: runtimeState?.features.includes("interaction_v1") === true,
     port: interactionPort,
   });
   /** 运行中修改先等待原 Run 暂停，再聚焦 Composer，不能让新需求偷偷替换已授权版本。 */
@@ -256,6 +258,15 @@ export function ConversationWorkspace({
   }, [goal, onOpenGoal, modifyPlan, threadId]);
   const items = useTimelineStore(
     useShallow((state) => (threadId === "" ? [] : selectItemsForThread(threadId)(state))),
+  );
+  const timelineItems = useMemo(
+    () =>
+      projectAnsweredInteractionResult(
+        items,
+        clarification.answeredRequest?.threadId === threadId ? clarification.answeredRequest : null,
+        clarification.answeredRequest?.threadId === threadId ? clarification.answeredAnswers : {},
+      ),
+    [clarification.answeredAnswers, clarification.answeredRequest, items, threadId],
   );
   const turns = useTimelineStore(
     useShallow((state) =>
@@ -544,7 +555,7 @@ export function ConversationWorkspace({
     goal,
   });
   const hasConversationContent =
-    items.length > 0 ||
+    timelineItems.length > 0 ||
     turns.length > 0 ||
     approvals.length > 0 ||
     interaction.localSubmissions.length > 0 ||
@@ -782,7 +793,7 @@ export function ConversationWorkspace({
         <ChatTimeline
           threadId={threadId === "" ? undefined : threadId}
           scrollCache={timelineScrollCache}
-          items={items}
+          items={timelineItems}
           skills={composerSkills}
           turns={turns as Turn[]}
           approvals={approvals}

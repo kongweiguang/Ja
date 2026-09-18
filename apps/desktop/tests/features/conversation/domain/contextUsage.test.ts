@@ -76,8 +76,8 @@ describe("context usage presentation", () => {
     });
   });
 
-  /** 成功压缩会使此前 Provider Usage 失效，必须等下一次真实响应确认新的上下文。 */
-  it("压缩后在下一次 Provider Usage 前保持未知", () => {
+  /** 压缩和恢复期间保留旧环，只有新 KNOWN Usage 到达后才更新展示。 */
+  it("压缩后保留上一笔可信 Usage 并接受新的计量", () => {
     expect(
       resolve({
         compaction: {
@@ -86,29 +86,12 @@ describe("context usage presentation", () => {
           occurredAt: "2026-08-31T00:00:02Z",
         },
       }),
-    ).toEqual({
-      certainty: "unknown",
+    ).toMatchObject({
+      certainty: "known",
+      usedTokens: 42_000,
       source: "provider",
       measuredAt: USAGE.measuredAt,
     });
-    expect(
-      resolve({
-        compaction: {
-          phase: "compacted",
-          inputTokensAfter: 12_000,
-          occurredAt: "2026-08-31T00:00:00Z",
-        },
-      }),
-    ).toMatchObject({ usedTokens: 42_000, source: "provider" });
-    expect(
-      resolve({
-        compaction: {
-          phase: "started",
-          inputTokensAfter: null,
-          occurredAt: "2026-08-31T00:00:02Z",
-        },
-      }),
-    ).toMatchObject({ usedTokens: 42_000, source: "provider" });
     expect(
       resolve({
         usage: {
@@ -138,7 +121,7 @@ describe("context usage presentation", () => {
           occurredAt: "2026-08-31T00:00:03Z",
         },
       }),
-    ).toMatchObject({ usedTokens: 42_000, source: "provider" });
+    ).toMatchObject({ certainty: "known", usedTokens: 42_000, source: "provider" });
   });
 
   /** 80% 与 95% 是完整窗口上的稳定阈值，环形进度在超限时仍约束在可绘制范围。 */

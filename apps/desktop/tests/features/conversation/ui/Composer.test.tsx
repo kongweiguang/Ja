@@ -1664,4 +1664,26 @@ describe("Composer", () => {
       "已使用 98%，195K / 200K tokens，最近模型请求",
     );
   });
+
+  /** UNKNOWN 仍保持固定环形占位和明确 Tooltip，不用问号制造错误感或触发工具栏布局跳变。 */
+  it("以中性占位呈现尚未确认的上下文计量", async () => {
+    const user = userEvent.setup();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        contextUsage={{
+          certainty: "unknown",
+          source: "provider",
+          measuredAt: "2026-08-31T00:00:03Z",
+        }}
+        onSend={vi.fn()}
+      />,
+    );
+    const indicator = screen.getByRole("status", { name: "上下文使用量待确认" });
+    expect(indicator).toHaveAttribute("data-tone", "unknown");
+    expect(indicator).not.toHaveTextContent("?");
+    await user.hover(indicator);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("当前上下文用量尚未确认");
+  });
 });
