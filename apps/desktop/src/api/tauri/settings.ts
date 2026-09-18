@@ -424,6 +424,19 @@ function authFromNative(server: z.infer<typeof ConfigMcpServerSchema>): Settings
     credentialRef: server.auth.credential_id,
   };
 }
+
+/** 根默认档位未指定时沿用默认模型的 medium，避免新 Thread 需要重复手动选择。 */
+function defaultSelectionReasoning(
+  config: z.infer<typeof ConfigDocumentSchema>,
+): z.infer<typeof UiReasoningLevelSchema> | null {
+  if (config.default_reasoning_level !== null) return config.default_reasoning_level;
+  if (config.default_provider_id === null || config.default_model_id === null) return null;
+  const model = config.providers
+    .find((provider) => provider.provider_id === config.default_provider_id)
+    ?.models.find((candidate) => candidate.model_id === config.default_model_id);
+  return model?.reasoning_level_map.medium === undefined ? null : "medium";
+}
+
 /** 将严格 snake_case Provider 映射为 Settings 使用的 camelCase 脱敏投影。 */
 function toUiProvider(
   provider: z.infer<typeof ConfigProviderSchema>,
@@ -457,7 +470,9 @@ function toUiProvider(
         maxOutputTokens: model.capabilities.max_output_tokens,
       },
       reasoningLevelMap: { ...model.reasoning_level_map },
-      defaultReasoningLevel: model.default_reasoning_level,
+      defaultReasoningLevel:
+        model.default_reasoning_level ??
+        (model.reasoning_level_map.medium === undefined ? null : "medium"),
     })),
   };
 }
@@ -477,7 +492,7 @@ function toUiDocument(
       ? {
           providerId: config.default_provider_id!,
           modelId: config.default_model_id!,
-          reasoningLevel: config.default_reasoning_level,
+          reasoningLevel: defaultSelectionReasoning(config),
         }
       : null,
     subagents: {

@@ -1550,6 +1550,25 @@ describe("useConversationInteractionController", () => {
     });
   });
 
+  it("选择 max 后把当前对话推理档位写入偏好", async () => {
+    prepareThread();
+    const turnPort = createTurnPort();
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, modelPort)),
+    );
+
+    await act(async () => result.current.changeReasoning("max"));
+
+    expect(modelPort.updatePreferences).toHaveBeenCalledWith({
+      providerId: "provider_one",
+      modelId: "model_one",
+      reasoningLevel: "max",
+      accessMode: "approval_required",
+      collaborationMode: "default",
+    });
+  });
+
   it("结构化准入失败恢复草稿与引用并发布恢复 revision", async () => {
     prepareThread();
     const turnPort = createTurnPort();

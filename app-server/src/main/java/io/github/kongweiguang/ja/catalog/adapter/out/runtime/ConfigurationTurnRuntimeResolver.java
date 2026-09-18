@@ -807,10 +807,13 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         }
     }
 
-    /** 将本次请求的逻辑档位解析为模型声明的上游值；null 保持 Provider 默认。 */
+    /** 将本次请求的逻辑档位解析为模型声明的上游值；null 跟随模型默认，模型未声明默认才省略字段。 */
     private static String upstreamReasoning(
             String requested, ConfigurationGenerationSnapshot.Model model) {
-        if (requested == null) return null;
+        if (requested == null) {
+            ConfigurationGenerationSnapshot.ReasoningLevel defaultLevel = model.defaultReasoningLevel();
+            return defaultLevel == null ? null : model.reasoningLevelMap().get(defaultLevel);
+        }
         ConfigurationGenerationSnapshot.ReasoningLevel level =
                 ConfigurationGenerationSnapshot.ReasoningLevel.valueOf(
                         requested.toUpperCase(java.util.Locale.ROOT));

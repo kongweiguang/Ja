@@ -45,6 +45,8 @@ final class ConfigGenerationV1Test {
             assertEquals(Map.of(ConfigurationGenerationSnapshot.ReasoningLevel.LOW, "low",
                     ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM, "medium"),
                     model.reasoningLevelMap());
+            assertEquals(ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM,
+                    snapshot.requireModel("provider_fixture", "model_second").defaultReasoningLevel());
             assertEquals(32, provider.agentDefaults().turnLimits().maxModelRounds());
         } finally {
             generation.close();

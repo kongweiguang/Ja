@@ -271,10 +271,12 @@ function ProviderModelDraftRow({
     update({
       reasoningLevelMap,
       defaultReasoningLevel:
-        model.defaultReasoningLevel !== null &&
-        reasoningLevelMap[model.defaultReasoningLevel] === undefined
-          ? null
-          : model.defaultReasoningLevel,
+        enabled && level === "medium" && model.defaultReasoningLevel === null
+          ? "medium"
+          : model.defaultReasoningLevel !== null &&
+              reasoningLevelMap[model.defaultReasoningLevel] === undefined
+            ? null
+            : model.defaultReasoningLevel,
     });
   };
   return (

@@ -136,6 +136,26 @@ describe("TauriSettingsAdapter v1", () => {
     expect(JSON.stringify(loaded)).not.toMatch(/apiKey|secret/i);
   });
 
+  it("defaults an unspecified reasoning selection to medium when the model supports it", async () => {
+    const native = structuredClone(CONFIG) as unknown as {
+      default_reasoning_level: "high" | null;
+      providers: Array<{ models: Array<{ default_reasoning_level: "high" | null }> }>;
+    };
+    native.default_reasoning_level = null;
+    native.providers[0]!.models[0]!.default_reasoning_level = null;
+    const result = {
+      ...readResult(),
+      effective: native,
+      user: { ...readResult().user, document: native },
+    } as ConfigReadResult;
+    const loaded = await new TauriSettingsAdapter({
+      invoke: vi.fn(async () => result),
+    }).snapshot();
+
+    expect(loaded.document.defaultSelection?.reasoningLevel).toBe("medium");
+    expect(loaded.document.providers[0]?.models[0]?.defaultReasoningLevel).toBe("medium");
+  });
+
   it("reads an API Key only through the Provider-specific native command", async () => {
     const invoke = vi.fn(async (command: string) =>
       command === JA_SETTINGS_COMMANDS.revealProviderCredential

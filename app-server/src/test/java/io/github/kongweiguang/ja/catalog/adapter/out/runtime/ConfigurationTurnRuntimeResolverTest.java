@@ -496,6 +496,43 @@ final class ConfigurationTurnRuntimeResolverTest {
         }
     }
 
+    /** Thread 偏好选择“跟随模型默认”时，Provider generation 仍必须冻结模型声明的上游档位。 */
+    @Test
+    void followsModelDefaultReasoningWhenThreadPreferenceIsNull() {
+        ConfigurationGenerationSnapshot.Model model = new ConfigurationGenerationSnapshot.Model(
+                "model_reasoning", "Reasoning", "gpt-reasoning",
+                new ConfigurationGenerationSnapshot.Capabilities(
+                        128_000, 8_192, List.of(ConfigurationGenerationSnapshot.InputModality.TEXT)),
+                Map.of(ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM, "medium"),
+                ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM);
+        ConfigurationGenerationSnapshot.Provider provider = provider(
+                ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES, "cred_reasoning", model);
+
+        ModelPort.ModelConfiguration resolved = ConfigurationTurnRuntimeResolver.model(
+                provider, model, null, lease(Map.of("cred_reasoning", "secret-reasoning")), 4_096);
+
+        assertEquals("medium", resolved.generation().reasoningLevel());
+    }
+
+    /** 显式选择 max 必须覆盖模型默认 medium，确保对话框当前档位进入真实 Provider 请求。 */
+    @Test
+    void explicitReasoningOverridesModelDefault() {
+        ConfigurationGenerationSnapshot.Model model = new ConfigurationGenerationSnapshot.Model(
+                "model_reasoning", "Reasoning", "gpt-reasoning",
+                new ConfigurationGenerationSnapshot.Capabilities(
+                        128_000, 8_192, List.of(ConfigurationGenerationSnapshot.InputModality.TEXT)),
+                Map.of(ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM, "medium",
+                        ConfigurationGenerationSnapshot.ReasoningLevel.MAX, "max"),
+                ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM);
+        ConfigurationGenerationSnapshot.Provider provider = provider(
+                ConfigurationGenerationSnapshot.Api.OPENAI_RESPONSES, "cred_reasoning", model);
+
+        ModelPort.ModelConfiguration resolved = ConfigurationTurnRuntimeResolver.model(
+                provider, model, "max", lease(Map.of("cred_reasoning", "secret-reasoning")), 4_096);
+
+        assertEquals("max", resolved.generation().reasoningLevel());
+    }
+
     /** 构造 text-only 模型，隔离 Provider/API/凭据路由行为。 */
     private static ConfigurationGenerationSnapshot.Model model() {
         return new ConfigurationGenerationSnapshot.Model(

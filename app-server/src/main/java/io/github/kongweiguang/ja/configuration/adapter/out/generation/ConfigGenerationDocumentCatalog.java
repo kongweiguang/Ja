@@ -97,6 +97,8 @@ final class ConfigGenerationDocumentCatalog {
         for (JsonNode value : array) {
             ObjectNode object = (ObjectNode) value;
             ObjectNode capabilities = requireObject(object, "capabilities");
+            Map<ConfigGeneration.ReasoningLevel, String> reasoningLevels = reasoningLevelMap(
+                    object.get("reasoning_level_map"));
             ConfigGeneration.ModelDefinition model = new ConfigGeneration.ModelDefinition(
                     requiredText(object, "model_id"), requiredText(object, "name"),
                     requiredText(object, "model"),
@@ -104,8 +106,8 @@ final class ConfigGenerationDocumentCatalog {
                             number(capabilities, "context_window_tokens"),
                             number(capabilities, "max_output_tokens"),
                             nativeModalities(provider, requiredText(object, "model"))),
-                    reasoningLevelMap(object.get("reasoning_level_map")),
-                    nullableReasoning(object, "default_reasoning_level"));
+                    reasoningLevels,
+                    nullableReasoning(object, "default_reasoning_level", reasoningLevels));
             if (values.stream().anyMatch(existing -> existing.modelId().equals(model.modelId()))) {
                 throw new IllegalArgumentException("duplicate model identity");
             }
@@ -143,11 +145,15 @@ final class ConfigGenerationDocumentCatalog {
         return Map.copyOf(result);
     }
 
-    /** 必填字段可显式为 null；缺失字段不能再被解释为未设置。 */
-    private static ConfigGeneration.ReasoningLevel nullableReasoning(ObjectNode object, String key) {
+    /** 模型支持 medium 时，未指定默认档位统一收敛到 medium；没有该能力的模型仍保持 null。 */
+    private static ConfigGeneration.ReasoningLevel nullableReasoning(
+            ObjectNode object, String key, Map<ConfigGeneration.ReasoningLevel, String> reasoningLevels) {
         JsonNode value = object.get(key);
         if (value == null) throw new IllegalArgumentException("reasoning level is missing");
-        return value.isNull() ? null : reasoning(requiredText(object, key));
+        return value.isNull()
+                ? (reasoningLevels.containsKey(ConfigGeneration.ReasoningLevel.MEDIUM)
+                        ? ConfigGeneration.ReasoningLevel.MEDIUM : null)
+                : reasoning(requiredText(object, key));
     }
 
     /** 只映射逻辑七档，不接受厂商私有别名。 */

@@ -99,7 +99,7 @@ export function emptyProviderDraft(): ProviderDraft {
   };
 }
 
-/** 新模型按未知自定义模型创建为 text-only；Renderer 只声明预算，不写输入能力。 */
+/** 新模型按未知自定义模型创建为 text-only，但默认开放七档推理选择并把 medium 作为默认档位。 */
 export function emptyProviderModelDraft(): ProviderModelDraft {
   return {
     name: "",
@@ -108,8 +108,16 @@ export function emptyProviderModelDraft(): ProviderModelDraft {
       contextWindowTokens: 128_000,
       maxOutputTokens: 8_192,
     },
-    reasoningLevelMap: {},
-    defaultReasoningLevel: null,
+    reasoningLevelMap: {
+      off: "off",
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "max",
+    },
+    defaultReasoningLevel: "medium",
   };
 }
 
