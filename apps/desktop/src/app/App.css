@@ -395,7 +395,14 @@ button {
   background: var(--ja-warning);
 }
 
-.ja-conversation > .ja-chat-timeline {
+.ja-conversation-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+}
+.ja-conversation-body > .ja-chat-timeline {
   min-height: 0;
   flex: 1;
   padding-top: 0;

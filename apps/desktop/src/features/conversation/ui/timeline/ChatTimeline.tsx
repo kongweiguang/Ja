@@ -1047,9 +1047,21 @@ export function ChatTimeline({
   });
   const scrollToLatest = useMemo(
     () => () => {
-      if (orderedRows.length > 0) {
-        virtualizer.scrollToIndex(orderedRows.length - 1, { align: "end" });
-      }
+      if (orderedRows.length === 0) return;
+      /**
+       * 文本 delta 会让 revision 高频变化；已经贴住尾部时不重复调用 Virtualizer 的命令式
+       * scrollToIndex，避免 WebView2 在每个片段上重新测量并产生可见布局抖动。内容高度真正增长
+       * 后 distance 会再次为正，仍会在下一帧追到最新位置；首次布局尚未测量时保留原调用。
+       */
+      const element = scrollRef.current;
+      if (
+        element !== null &&
+        element.clientHeight > 0 &&
+        element.scrollHeight > element.clientHeight + 1 &&
+        element.scrollHeight - element.scrollTop - element.clientHeight <= 1
+      )
+        return;
+      virtualizer.scrollToIndex(orderedRows.length - 1, { align: "end" });
     },
     [orderedRows.length, virtualizer],
   );

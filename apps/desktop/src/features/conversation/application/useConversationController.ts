@@ -18,6 +18,7 @@ import type { TimelineEvent, TimelineSnapshot } from "../domain/timelineContract
 
 const MAX_RECENT_THREADS = 100;
 const MAX_WORKSPACE_HISTORY_CACHES = 8;
+const MAX_THREAD_SNAPSHOT_PAGES = 128;
 const EMPTY_CONVERSATION_THREADS: ConversationThread[] = [];
 
 interface WorkspaceHistoryCache {
@@ -288,9 +289,6 @@ export function useConversationController({
   const currentResyncReason = useTimelineStore((state) =>
     currentThreadId === undefined ? undefined : state.resyncRequired[currentThreadId],
   );
-  const currentThreadRevision = useTimelineStore((state) =>
-    currentThreadId === undefined ? undefined : state.threadRevisionByThread[currentThreadId],
-  );
   const activeTurnPresent = useTimelineStore((state) =>
     currentThreadId === undefined
       ? false
@@ -355,6 +353,44 @@ export function useConversationController({
       return outcome === "applied" || outcome === "late";
     },
     [],
+  );
+
+  /**
+   * 将 thread/read 的 keyset 页面收敛成一个完整快照；恢复路径不能把带 nextCursor 的半页
+   * 当作失败，否则长对话在一次事件丢失后会永久停在“无法自动恢复”。页面数量有界，防止
+   * 服务端游标异常或历史规模失控把恢复请求变成无限 IO；每页的最新 Turn/Usage 元数据
+   * 作为最终投影，正文条目按服务端顺序保留并以 itemId 去重。
+   */
+  const readCompleteThreadSnapshot = useCallback(
+    async (threadId: string): Promise<TimelineSnapshot> => {
+      let cursor: string | undefined;
+      const items = new Map<
+        TimelineSnapshot["items"][number]["itemId"],
+        TimelineSnapshot["items"][number]
+      >();
+      const cursors = new Set<string>();
+      for (let page = 0; page < MAX_THREAD_SNAPSHOT_PAGES; page += 1) {
+        const snapshot = await history.threadRead({
+          threadId,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        if (snapshot.threadId !== threadId) throw new Error("thread snapshot identity changed");
+        for (const item of snapshot.items) {
+          const previous = items.get(item.itemId);
+          if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(item))
+            throw new Error("thread snapshot contains conflicting items");
+          items.set(item.itemId, item);
+        }
+        if (snapshot.nextCursor === null) {
+          return { ...snapshot, items: [...items.values()], nextCursor: null };
+        }
+        if (cursors.has(snapshot.nextCursor)) throw new Error("thread snapshot cursor repeated");
+        cursors.add(snapshot.nextCursor);
+        cursor = snapshot.nextCursor;
+      }
+      throw new Error("thread snapshot exceeds recovery page budget");
+    },
+    [history],
   );
 
   /**
@@ -449,14 +485,14 @@ export function useConversationController({
         created.preferences.modelId !== selection.modelId
       )
         throw new Error("created thread belongs to another model selection");
-      const snapshot = await history.threadRead({ threadId: created.threadId });
+      const snapshot = await readCompleteThreadSnapshot(created.threadId);
       if (!isCurrentRequest(request, selected.workspaceId)) return undefined;
       if (!applySnapshot(snapshot, selected.workspaceId, created.threadId)) {
         throw new Error("created thread snapshot was not applied");
       }
       return created;
     },
-    [applySnapshot, history, isCurrentRequest],
+    [applySnapshot, history, isCurrentRequest, readCompleteThreadSnapshot],
   );
 
   /**
@@ -498,7 +534,7 @@ export function useConversationController({
             loadedRevision >= first.revision
           )
             return;
-          const snapshot = await history.threadRead({ threadId: first.threadId });
+          const snapshot = await readCompleteThreadSnapshot(first.threadId);
           if (!isCurrentRequest(request, selected.workspaceId)) return;
           if (!applySnapshot(snapshot, selected.workspaceId, first.threadId)) {
             setError("最近的会话无法恢复，请重新选择项目。 ");
@@ -522,7 +558,7 @@ export function useConversationController({
         if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
       }
     },
-    [applySnapshot, createAndRestore, history, isCurrentRequest],
+    [applySnapshot, createAndRestore, history, isCurrentRequest, readCompleteThreadSnapshot],
   );
 
   /**
@@ -633,7 +669,7 @@ export function useConversationController({
       }
       setBusy(true);
       try {
-        const snapshot = await history.threadRead({ threadId });
+        const snapshot = await readCompleteThreadSnapshot(threadId);
         if (!isCurrentRequest(request, selected.workspaceId)) return;
         if (!applySnapshot(snapshot, selected.workspaceId, threadId)) {
           setError("会话无法恢复，请重新选择项目。 ");
@@ -656,7 +692,7 @@ export function useConversationController({
         if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
       }
     },
-    [activateWorkspace, applySnapshot, history, isCurrentRequest],
+    [activateWorkspace, applySnapshot, isCurrentRequest, readCompleteThreadSnapshot],
   );
 
   /**
@@ -958,7 +994,7 @@ export function useConversationController({
           if (compactionErrorCode(failure) !== "CONFLICT") throw failure;
           const selected = workspaceRef.current;
           if (selected === undefined || currentThreadIdRef.current !== threadId) throw failure;
-          const snapshot = await history.threadRead({ threadId });
+          const snapshot = await readCompleteThreadSnapshot(threadId);
           if (
             !mountedRef.current ||
             currentThreadIdRef.current !== threadId ||
@@ -981,7 +1017,7 @@ export function useConversationController({
         threadMutationGuardsRef.current.delete(guard);
       }
     },
-    [applySnapshot, history, threadRevision],
+    [applySnapshot, history, readCompleteThreadSnapshot, threadRevision],
   );
 
   /**
@@ -1039,7 +1075,7 @@ export function useConversationController({
         const selected = workspaceRef.current;
         if (selected !== undefined) {
           try {
-            const snapshot = await history.threadRead({ threadId });
+            const snapshot = await readCompleteThreadSnapshot(threadId);
             if (
               mountedRef.current &&
               compactionRequestRef.current === request &&
@@ -1056,7 +1092,14 @@ export function useConversationController({
     } finally {
       if (compactionRequestRef.current === request) compactionInFlightRef.current = false;
     }
-  }, [activeTurnPresent, applySnapshot, compaction.phase, history, threads]);
+  }, [
+    activeTurnPresent,
+    applySnapshot,
+    compaction.phase,
+    history,
+    readCompleteThreadSnapshot,
+    threads,
+  ]);
 
   /** 用户关闭的仅是 Renderer 反馈；不会取消或改写服务端压缩生命周期。 */
   const dismissCompactionFeedback = useCallback((): void => {
@@ -1401,7 +1444,7 @@ export function useConversationController({
     setError(undefined);
     void (async (): Promise<void> => {
       try {
-        const snapshot = await history.threadRead({ threadId: currentThreadId });
+        const snapshot = await readCompleteThreadSnapshot(currentThreadId);
         if (!isCurrentRequest(request, workspace.workspaceId)) return;
         if (!applySnapshot(snapshot, workspace.workspaceId, currentThreadId)) {
           setError("会话状态无法自动恢复，请重新选择该会话重试。 ");
@@ -1413,11 +1456,24 @@ export function useConversationController({
         if (isCurrentRequest(request, workspace.workspaceId)) setBusy(false);
       }
     })();
-  }, [applySnapshot, currentResyncReason, currentThreadId, history, isCurrentRequest, workspace]);
+  }, [
+    applySnapshot,
+    currentResyncReason,
+    currentThreadId,
+    history,
+    isCurrentRequest,
+    readCompleteThreadSnapshot,
+    workspace,
+  ]);
 
+  /**
+   * 目录项存在即可证明当前 Thread 已完成历史准入；具体 CAS revision 在点击操作时从
+   * Timeline/目录 ref 读取，避免把每个流式 delta 的 revision 投影提升到应用壳层。
+   */
+  const currentThreadLoaded =
+    currentThreadId !== undefined && threads.some((thread) => thread.threadId === currentThreadId);
   const canCompact =
-    currentThreadId !== undefined &&
-    currentThreadRevision !== undefined &&
+    currentThreadLoaded &&
     !activeTurnPresent &&
     !busy &&
     compaction.phase !== "running" &&

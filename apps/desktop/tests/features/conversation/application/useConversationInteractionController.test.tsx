@@ -1136,6 +1136,49 @@ describe("useConversationInteractionController", () => {
     expect(result.current.error).toBe("取消失败，请稍后重试。");
   });
 
+  /** 组合层提供 Portal 反馈时，取消失败不再占据 Composer 底部的持久错误行。 */
+  it("取消失败可交给组合层临时反馈而不写入 Composer 错误", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_cancel_portal",
+            status: "suspended",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockRejectedValueOnce(new Error("cancel failed"));
+    const reportTransientError = vi.fn();
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(
+        options(turnPort, modelPort, { onTransientError: reportTransientError }),
+      ),
+    );
+
+    await act(async () => result.current.cancel());
+
+    expect(reportTransientError).toHaveBeenCalledWith("取消失败，请稍后重试。");
+    expect(result.current.error).toBeUndefined();
+  });
+
   /**
    * Suspended 禁止接纳新输入，但瞬时权威重读不能锁住本地草稿和原队列修复；
    * submit/enqueue 仍由独立状态门拒绝，避免把可编辑误解为可提交。

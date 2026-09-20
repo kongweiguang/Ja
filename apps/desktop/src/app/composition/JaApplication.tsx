@@ -463,6 +463,16 @@ export function JaApplication({
     metadataEvent: lastThreadMetadataEvent,
     activateWorkspace: workspace.activateForConversation,
   });
+  /**
+   * Controller 会返回稳定的 action callbacks；先拆出具体函数，避免导航/命令回调把整个
+   * Conversation view model 当成依赖，从而让流式 Timeline 更新重建左侧导航入口。
+   */
+  const conversationCreate = conversation.create;
+  const conversationSelect = conversation.select;
+  const conversationPin = conversation.pin;
+  const conversationArchive = conversation.archive;
+  const conversationRestore = conversation.restore;
+  const conversationRename = conversation.rename;
   const currentThread = conversation.threads.find(
     (thread) => thread.threadId === conversation.currentThreadId,
   );
@@ -1069,10 +1079,10 @@ export function JaApplication({
    * 紧凑侧栏关闭和新 Thread 渲染先提交，避免按钮或 Dialog 的焦点归还覆盖输入起点。
    */
   const createConversation = useCallback(async (): Promise<void> => {
-    await conversation.create();
+    await conversationCreate();
     navigate("workspace");
     focusConversationComposerAfterNavigation();
-  }, [conversation, navigate]);
+  }, [conversationCreate, navigate]);
 
   /** Picker 取消由 Session 拥有；只有项目真实打开后才切换页面。 */
   const chooseProject = useCallback(async (): Promise<void> => {
@@ -1095,39 +1105,39 @@ export function JaApplication({
   /** 恢复持久 Thread 后再转交输入焦点，避免侧栏或搜索结果继续持有键盘落点。 */
   const selectConversation = useCallback(
     async (threadId: string): Promise<void> => {
-      await conversation.select(threadId);
+      await conversationSelect(threadId);
       navigate("workspace");
       focusConversationComposerAfterNavigation();
     },
-    [conversation, navigate],
+    [conversationSelect, navigate],
   );
 
   /** 行级置顶失败只显示固定产品文案，不把原生异常或路径带入 Toast。 */
   const pinConversation = useCallback(
     async (threadId: string, pinned: boolean): Promise<void> => {
       try {
-        await conversation.pin(threadId, pinned);
+        await conversationPin(threadId, pinned);
       } catch {
         toast.error(pinned ? "置顶失败，请重试。" : "取消置顶失败，请重试。");
       }
     },
-    [conversation],
+    [conversationPin],
   );
 
   /** 归档成功后提供 8 秒撤销；恢复始终调用服务端 restore，不复用本地旧行。 */
   const archiveConversation = useCallback(
     async (threadId: string): Promise<void> => {
       try {
-        const undo = await conversation.archive(threadId);
+        const undo = await conversationArchive(threadId);
         if (undo === undefined) return;
         toast.success("对话已归档", {
           duration: 8_000,
           action: {
             label: "撤销",
             onClick: () => {
-              void conversation
-                .restore(undo.archived.threadId, undo.restoreSelection)
-                .catch(() => toast.error("恢复失败，请从搜索中重试。"));
+              void conversationRestore(undo.archived.threadId, undo.restoreSelection).catch(() =>
+                toast.error("恢复失败，请从搜索中重试。"),
+              );
             },
           },
         });
@@ -1143,21 +1153,21 @@ export function JaApplication({
         );
       }
     },
-    [conversation],
+    [conversationArchive, conversationRestore],
   );
 
   /** 搜索中的归档结果先恢复再打开，并与普通会话切换共享 Composer 焦点终点。 */
   const restoreConversation = useCallback(
     async (threadId: string): Promise<void> => {
       try {
-        await conversation.restore(threadId, true);
+        await conversationRestore(threadId, true);
         navigate("workspace");
         focusConversationComposerAfterNavigation();
       } catch {
         toast.error("恢复失败，请重试。");
       }
     },
-    [conversation, navigate],
+    [conversationRestore, navigate],
   );
   /** 对话搜索开关保持稳定 identity，避免 Timeline 更新穿透 memoized NavigationSidebar。 */
   const openConversationSearch = useCallback((): void => {
@@ -1744,7 +1754,7 @@ export function JaApplication({
               onNewConversation={createConversation}
               onSelectConversation={selectConversation}
               onOpenConversationSearch={openConversationSearch}
-              onRenameConversation={conversation.rename}
+              onRenameConversation={conversationRename}
               onPinConversation={pinConversation}
               onArchiveConversation={archiveConversation}
               mutatingThreadIds={conversation.mutatingThreadIds}

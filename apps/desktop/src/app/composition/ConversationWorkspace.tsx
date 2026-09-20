@@ -3,6 +3,7 @@
 
 import { FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
 import {
   ChatTimeline,
@@ -470,6 +471,10 @@ export function ConversationWorkspace({
       (workspace.workspace?.kind === "project" ? workspace.workspace.workspaceId : undefined);
   const ready =
     settingsScopeReady && turnAdmissionReady && (boot.status === "ready" || boot.status === "busy");
+  /** 一次性取消失败使用全局 Portal 提示，避免在 Composer 下面留下不会自动消失的红字。 */
+  const reportConversationTransientError = useCallback((message: string): void => {
+    toast.error(message, { id: "ja-conversation-cancel-failed" });
+  }, []);
   const interaction = useConversationInteractionController({
     threadId: conversation.currentThreadId,
     workspaceId: workspace.workspace?.workspaceId,
@@ -496,6 +501,7 @@ export function ConversationWorkspace({
     attachmentPort,
     onAttachmentRemoved,
     onAttachmentsBound,
+    onTransientError: reportConversationTransientError,
   });
   const { contextReferences, updateContextReferences } = interaction;
   /** 右侧 Files 只投递相对路径引用；当前 Thread 的草稿 owner 负责去重与后续发送组装。 */
@@ -768,8 +774,11 @@ export function ConversationWorkspace({
           {conversation.error}
         </p>
       )}
-      {!hasConversationContent ? (
-        <section className="ja-conversation-empty" aria-labelledby="ja-conversation-empty-title">
+      <div
+        className={`ja-conversation-body${hasConversationContent ? "" : " ja-conversation-empty"}`}
+        data-state={hasConversationContent ? "content" : "empty"}
+      >
+        {!hasConversationContent ? (
           <div className="ja-conversation-empty-greeting">
             <img
               className="ja-conversation-empty-icon"
@@ -787,63 +796,67 @@ export function ConversationWorkspace({
               )}
             </h2>
           </div>
-          {composerDock}
-        </section>
-      ) : (
-        <ChatTimeline
-          threadId={threadId === "" ? undefined : threadId}
-          scrollCache={timelineScrollCache}
-          items={timelineItems}
-          skills={composerSkills}
-          turns={turns as Turn[]}
-          approvals={approvals}
-          approvalDecisions={approvalDecisions}
-          approvalClosedAt={approvalClosedAt}
-          localSubmissions={interaction.localSubmissions}
-          attachmentThumbnailPort={attachmentPreviewPort}
-          onApprovalDecision={(approval, decision) => void interaction.approve(approval, decision)}
-          onPrepareRetry={(_turnId, text) => interaction.updateDraft(text)}
-          onOpenLink={onOpenLink}
-          onCopyText={onCopyText}
-          onOpenAttachmentPreview={
-            onOpenAttachmentPreview === undefined
-              ? undefined
-              : (attachment, source) =>
-                  onOpenAttachmentPreview(
-                    {
-                      attachmentId: attachment.attachmentId,
-                      displayName: attachment.displayName,
-                      mediaKind: attachment.mediaKind,
-                      authorization: attachment.authorization,
-                    },
-                    source,
-                  )
-          }
-          onReadToolArtifact={
-            artifactPort === undefined || workspace.workspace === undefined
-              ? undefined
-              : ({ threadId, turnId, callId, artifactId }) =>
-                  artifactPort.readToolArtifact({
-                    workspaceId: workspace.workspace!.workspaceId,
-                    threadId,
-                    turnId,
-                    callId,
-                    artifactId,
-                  })
-          }
-          onReviewTurn={openFrozenTurnReview}
-          externalRows={[...taskTimelineRows, ...planTimelineRows, ...goalTimelineRows]}
-        />
-      )}
-      {interaction.sending ? (
-        <span className="ja-visually-hidden" role="status" aria-live="polite">
-          正在提交当前请求…
+        ) : (
+          <ChatTimeline
+            threadId={threadId === "" ? undefined : threadId}
+            scrollCache={timelineScrollCache}
+            items={timelineItems}
+            skills={composerSkills}
+            turns={turns as Turn[]}
+            approvals={approvals}
+            approvalDecisions={approvalDecisions}
+            approvalClosedAt={approvalClosedAt}
+            localSubmissions={interaction.localSubmissions}
+            attachmentThumbnailPort={attachmentPreviewPort}
+            onApprovalDecision={(approval, decision) =>
+              void interaction.approve(approval, decision)
+            }
+            onPrepareRetry={(_turnId, text) => interaction.updateDraft(text)}
+            onOpenLink={onOpenLink}
+            onCopyText={onCopyText}
+            onOpenAttachmentPreview={
+              onOpenAttachmentPreview === undefined
+                ? undefined
+                : (attachment, source) =>
+                    onOpenAttachmentPreview(
+                      {
+                        attachmentId: attachment.attachmentId,
+                        displayName: attachment.displayName,
+                        mediaKind: attachment.mediaKind,
+                        authorization: attachment.authorization,
+                      },
+                      source,
+                    )
+            }
+            onReadToolArtifact={
+              artifactPort === undefined || workspace.workspace === undefined
+                ? undefined
+                : ({ threadId, turnId, callId, artifactId }) =>
+                    artifactPort.readToolArtifact({
+                      workspaceId: workspace.workspace!.workspaceId,
+                      threadId,
+                      turnId,
+                      callId,
+                      artifactId,
+                    })
+            }
+            onReviewTurn={openFrozenTurnReview}
+            externalRows={[...taskTimelineRows, ...planTimelineRows, ...goalTimelineRows]}
+          />
+        )}
+      </div>
+      {/* Composer 始终位于同一父级和同一兄弟顺序；空态只切换 greeting，避免输入器 remount。 */}
+      {composerDock}
+      <div className="ja-visually-hidden">
+        {interaction.sending ? (
+          <span role="status" aria-live="polite">
+            正在提交当前请求…
+          </span>
+        ) : null}
+        <span role="status" aria-live="polite" aria-atomic="true">
+          {interaction.clipboardNotice ?? ""}
         </span>
-      ) : null}
-      <span className="ja-visually-hidden" role="status" aria-live="polite" aria-atomic="true">
-        {interaction.clipboardNotice ?? ""}
-      </span>
-      {hasConversationContent ? composerDock : null}
+      </div>
     </section>
   );
 }

@@ -264,6 +264,61 @@ describe("useConversationController", () => {
     expect(useTimelineStore.getState().threads["thr_created"]?.workspaceId).toBe("ws_project");
   });
 
+  /** 长历史的 thread/read 需要消费完整 keyset 页面，不能把首个 nextCursor 当成恢复失败。 */
+  it("自动恢复会合并分页 Thread 快照并清除 resync 错误", async () => {
+    const existing = thread("thr_paginated_recovery");
+    const first = contentSnapshot(existing.threadId, "running", 4);
+    const firstItem = first.items[0];
+    if (firstItem === undefined) throw new Error("test snapshot item missing");
+    const secondItem = {
+      ...firstItem,
+      itemId: "item_paginated_second",
+      text: "分页后的历史正文",
+    };
+    const threadRead = vi.fn<ConversationHistoryPort["threadRead"]>();
+    threadRead
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce({ ...first, items: [firstItem], nextCursor: "cursor_page_2" })
+      .mockResolvedValueOnce({ ...first, items: [secondItem], nextCursor: null });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(result.current.error).toBeUndefined());
+
+    expect(threadRead).toHaveBeenNthCalledWith(3, {
+      threadId: existing.threadId,
+      cursor: "cursor_page_2",
+    });
+    expect(useTimelineStore.getState().items[secondItem.itemId]?.text).toBe("分页后的历史正文");
+    expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+  });
+
   it("当前会话没有任何 Turn 时重复新建仍复用同一个 Thread", async () => {
     const existing = thread("thr_empty");
     const threadCreate = vi.fn(async () => thread("thr_duplicate"));
@@ -1598,6 +1653,77 @@ describe("useConversationController", () => {
     await waitFor(() => expect(result.current.canCompact).toBe(false));
     await act(async () => result.current.compact());
     expect(threadCompact).toHaveBeenCalledTimes(1);
+  });
+
+  /** 流式正文只应唤醒 Timeline owner；壳层 controller 不能因每个 delta 重投影导航。 */
+  it("does not rerender the shell controller for an assistant text delta", async () => {
+    const existing = thread("thr_stream_shell");
+    const turnId = `${existing.threadId}:turn`;
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead: vi.fn(async () => contentSnapshot(existing.threadId, "running", 1)),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    let renderCount = 0;
+    const { result } = renderHook(() => {
+      renderCount += 1;
+      return useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      });
+    });
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    await waitFor(() => expect(result.current.threads[0]?.latestTurnStatus).toBe("running"));
+    const settledRenderCount = renderCount;
+
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyHostEvent({
+          kind: "timeline",
+          event: {
+            jsonrpc: "2.0",
+            method: "assistant/text-delta",
+            params: {
+              serverInstanceId: "srv_1",
+              eventId: "evt_stream_shell_delta",
+              sequence: 2,
+              occurredAt: "2026-08-30T12:00:02Z",
+              generation: 1,
+              workspaceId: WORKSPACE.workspaceId,
+              threadId: existing.threadId,
+              threadRevision: 1,
+              turnId,
+              streamSeq: 1,
+              text: " 继续",
+            },
+          },
+        }),
+      ).toBe("applied");
+    });
+
+    expect(renderCount).toBe(settledRenderCount);
+
+    act(() => {
+      // metadata revision 变化仍必须留在命令读取边界，不能唤醒应用壳层导航。
+      useTimelineStore.getState().recordThreadMetadataRevision(existing.threadId, 2);
+    });
+
+    expect(renderCount).toBe(settledRenderCount);
   });
 
   it("等待 runtime ready 后只恢复一次历史，busy 切换不会重载当前会话", async () => {

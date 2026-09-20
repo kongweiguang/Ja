@@ -47,6 +47,8 @@ export interface ConversationInteractionOptions {
   attachmentPort?: ConversationAttachmentPort;
   onAttachmentRemoved?: (attachmentId: string) => void;
   onAttachmentsBound?: (threadId: string, attachmentIds: readonly string[]) => void;
+  /** 取消等短暂动作失败交给组合层的 Portal 反馈，避免把一次性错误钉在 Composer 下方。 */
+  onTransientError?: (message: string) => void;
 }
 
 /**
@@ -257,6 +259,7 @@ export function useConversationInteractionController({
   attachmentPort,
   onAttachmentRemoved,
   onAttachmentsBound,
+  onTransientError,
 }: ConversationInteractionOptions): ConversationInteractionController {
   const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>({});
   const [contextDraftsByThread, setContextDraftsByThread] = useState<
@@ -998,10 +1001,12 @@ export function useConversationInteractionController({
       }
     } catch {
       if (mountedRef.current) {
-        setErrorsByThread((current) => ({
-          ...current,
-          [requestThreadId]: "取消失败，请稍后重试。",
-        }));
+        const message = "取消失败，请稍后重试。";
+        if (onTransientError === undefined) {
+          setErrorsByThread((current) => ({ ...current, [requestThreadId]: message }));
+        } else {
+          onTransientError(message);
+        }
       }
     } finally {
       cancelGuardsRef.current.delete(requestTurnId);
@@ -1013,7 +1018,7 @@ export function useConversationInteractionController({
         });
       }
     }
-  }, [blockingTurnId, blockingTurnRevision, threadId, turnPort]);
+  }, [blockingTurnId, blockingTurnRevision, onTransientError, threadId, turnPort]);
 
   /** Approval 使用请求携带的 revision CAS，视图不能改写 identity，也不能重复提交同一审批。 */
   const approve = useCallback(
