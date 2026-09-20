@@ -981,7 +981,7 @@ jobs:
 
   updater-draft-release:
     name: Assemble updater draft
-    if: inputs.release == true
+    if: ${{ always() && inputs.release == true && needs.native-app-server.result == 'success' }}
     needs: native-app-server
     runs-on: ubuntu-24.04
     timeout-minutes: 15
