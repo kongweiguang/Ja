@@ -1649,23 +1649,25 @@ async function runThemeMatrixAcceptanceSession(page, deadline, diagnostics, sign
 }
 
 /**
- * 在发送前安装只观察可见 Draft 文本的 MutationObserver；不保留正文，只记录首次非空文本
- * 的单调时钟和长度，使门禁能证明 WebView2 在 terminal 事件之前已真实渲染增量。
+ * 在发送前安装只观察工作过程 Commentary 的 MutationObserver；不保留正文，只记录首次非空文本
+ * 的单调时钟和长度，使门禁能证明 WebView2 在 terminal 事件之前已把增量放进正确 Surface。
  */
-async function beginRealtimeDraftObservation(page) {
+async function beginRealtimeProcessObservation(page) {
   await page.evaluate(() => {
-    globalThis.__JA_E2E_DRAFT_OBSERVER__?.disconnect?.();
-    globalThis.__JA_E2E_DRAFT_OBSERVATIONS__ = [];
+    globalThis.__JA_E2E_PROCESS_OBSERVER__?.disconnect?.();
+    globalThis.__JA_E2E_PROCESS_OBSERVATIONS__ = [];
     const sample = () => {
-      const draft = globalThis.document.querySelector(".ja-chat-message-draft");
-      const length = draft?.textContent?.length ?? 0;
-      const samples = Array.isArray(globalThis.__JA_E2E_DRAFT_OBSERVATIONS__)
-        ? globalThis.__JA_E2E_DRAFT_OBSERVATIONS__
+      const process = globalThis.document.querySelector(
+        '.ja-work-step--commentary[data-role="commentary"]',
+      );
+      const length = process?.textContent?.length ?? 0;
+      const samples = Array.isArray(globalThis.__JA_E2E_PROCESS_OBSERVATIONS__)
+        ? globalThis.__JA_E2E_PROCESS_OBSERVATIONS__
         : [];
       if (length > 0 && samples.length === 0) {
         samples.push({ observedAt: globalThis.performance.now(), length });
       }
-      globalThis.__JA_E2E_DRAFT_OBSERVATIONS__ = samples;
+      globalThis.__JA_E2E_PROCESS_OBSERVATIONS__ = samples;
     };
     const observer = new globalThis.MutationObserver(sample);
     observer.observe(globalThis.document.body, {
@@ -1673,17 +1675,17 @@ async function beginRealtimeDraftObservation(page) {
       subtree: true,
       characterData: true,
     });
-    globalThis.__JA_E2E_DRAFT_OBSERVER__ = observer;
+    globalThis.__JA_E2E_PROCESS_OBSERVER__ = observer;
     sample();
   });
 }
 
 /**
- * 同时要求协议 delta 顺序和 Draft DOM 时序先于同 Turn terminal；只比较本地单调时钟和业务
+ * 同时要求协议 delta 顺序和 WorkProcess DOM 时序先于同 Turn terminal；只比较本地单调时钟和业务
  * identity，不复制 Provider 文本，从而可用于真实 OpenAI/Anthropic 流而不泄漏内容。终态跨
  * Rust event queue 异步到达，因此在同一 Turn deadline 内等待，不能用一次瞬时采样制造竞态。
  */
-async function assertRealtimeDeltaBeforeTerminal(page, deadline, signal) {
+async function assertRealtimeProcessBeforeTerminal(page, deadline, signal) {
   let events;
   let terminal;
   await waitForCondition(
@@ -1704,28 +1706,28 @@ async function assertRealtimeDeltaBeforeTerminal(page, deadline, signal) {
       event.turnId === terminal.turnId &&
       event.observedAt !== undefined,
   );
-  const draft = await page.evaluate(() =>
-    Array.isArray(globalThis.__JA_E2E_DRAFT_OBSERVATIONS__)
-      ? globalThis.__JA_E2E_DRAFT_OBSERVATIONS__[0]
+  const process = await page.evaluate(() =>
+    Array.isArray(globalThis.__JA_E2E_PROCESS_OBSERVATIONS__)
+      ? globalThis.__JA_E2E_PROCESS_OBSERVATIONS__[0]
       : undefined,
   );
   if (
     delta?.observedAt === undefined ||
     delta.observedAt >= terminal.observedAt ||
-    !Number.isFinite(draft?.observedAt) ||
-    draft.observedAt >= terminal.observedAt ||
-    !Number.isSafeInteger(draft?.length) ||
-    draft.length < 1
+    !Number.isFinite(process?.observedAt) ||
+    process.observedAt >= terminal.observedAt ||
+    !Number.isSafeInteger(process?.length) ||
+    process.length < 1
   ) {
     throw new Error(
-      `增量未在 terminal 前进入 WebView2 Draft：${JSON.stringify({ deltaAt: delta?.observedAt, draftAt: draft?.observedAt, terminalAt: terminal.observedAt })}`,
+      `增量未在 terminal 前进入 WebView2 工作过程：${JSON.stringify({ deltaAt: delta?.observedAt, processAt: process?.observedAt, terminalAt: terminal.observedAt })}`,
     );
   }
   return {
     status: "passed",
     turnId: terminal.turnId,
     deltaBeforeTerminal: true,
-    draftBeforeTerminal: true,
+    processBeforeTerminal: true,
   };
 }
 
@@ -3706,6 +3708,21 @@ async function startAutomaticTitleProviderFixture(workspacePath) {
     ) {
       scenario = scenarios.interactionPlan;
     }
+    // Interaction 结算后的续轮只携带 request_user_input 的 ToolResult，可能不再重复原始用户提示词。
+    // 仅在本隔离场景已经真实发出该 Tool 时恢复归属，避免把未知请求宽泛地路由到 Interaction fixture。
+    if (
+      scenario === undefined &&
+      interactionPlanAcceptanceMode &&
+      serialized.includes("function_call_output") &&
+      attempts.some(
+        (attempt) =>
+          attempt.scenarioId === scenarios.interactionPlan.id &&
+          attempt.kind === "turn" &&
+          attempt.requestedToolName === "request_user_input",
+      )
+    ) {
+      scenario = scenarios.interactionPlan;
+    }
     let consumedInput;
     if (scenario === undefined && defaultDesktopLoopbackMode) {
       const matches = serialized.match(
@@ -5061,6 +5078,9 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
   const config = {
     identifier: `io.github.kongweiguang.ja.e2e.run${frontendPort}`,
     build: {
+      // devUrl 固定为 IPv4 loopback；预热服务器也必须同址监听，避免 Windows 上 localhost
+      // 优先解析到仅 IPv6 的地址后 Tauri 永远等不到自己的 dev origin。
+      beforeDevCommand: "pnpm exec vite --config apps/desktop/vite.config.ts --host 127.0.0.1",
       devUrl: origin,
       ...(useEdgeDriver
         ? {
@@ -19021,7 +19041,11 @@ async function runIndependentInteractionPlanAcceptanceSession(
       )
     );
   };
-  // 真正替换 Java 进程后再重载 WebView；单独 reload 只能证明前端恢复，不能充当持久恢复验收。
+  /**
+   * 真正替换隔离 Java 进程后，再以同一 Tauri owner 的 reload、运行时 ready 和 Thread 回选恢复问答。
+   * Interaction 不承载 Goal 的 generation 连续性，复用 Goal 故障 helper 会在页面重载后等待已失效的
+   * 前一代 store 身份；这里保留真实 sidecar 替换和重新连接门禁，但不把无关状态机带入验收。
+   */
   const restartApplication = async () => {
     const prior = assertRuntimeIsolation(await processSnapshot(signal), directories, [
       nativeSidecar.fileName,
@@ -19030,7 +19054,6 @@ async function runIndependentInteractionPlanAcceptanceSession(
       nativeSidecar.fileName,
     ]);
     if (killed.pid !== prior.appServerPid) throw new Error("待回答恢复终止了错误的隔离进程");
-    await restartRuntimeAfterGoalCrash(page, deadline, signal);
     await page.reload({
       waitUntil: "domcontentloaded",
       timeout: Math.max(1, deadline - Date.now()),
@@ -19267,7 +19290,9 @@ async function runIndependentInteractionPlanAcceptanceSession(
     await page.screenshot({ path: join(visualEvidenceDirectory, "interaction-pending.png") });
   }
   const firstOption = pending.locator('[data-option-id="option_ui"] input');
-  // 只测量浏览器 change 到下一帧真实 DOM 回读的时间，不把 Playwright 往返或 RPC/模型等待混入交互反馈预算。
+  // 只测量浏览器原生激活到下一帧真实 DOM 回读的时间，不把 Playwright 往返或 RPC/模型等待
+  // 混入交互反馈预算。WebView2 可能由 keydown 驱动 React 受控切换而不向目标 input 重派
+  // input/change；三种事件都必须来自同一受控选项并通过后续选中与换题断言。
   await page.evaluate(() => {
     const input = globalThis.document.querySelector(
       '.ja-interaction-card[data-interaction-status="pending"] [data-option-id="option_ui"] input',
@@ -19283,27 +19308,49 @@ async function runIndependentInteractionPlanAcceptanceSession(
       readback: null,
     };
     globalThis.__JA_E2E_INTERACTION_FEEDBACK__ = feedback;
-    input.addEventListener(
-      "change",
-      (event) => {
-        const changedAt = globalThis.performance.now();
-        feedback.eventType = event.type;
-        globalThis.requestAnimationFrame(() => {
-          feedback.latencyMs = globalThis.performance.now() - changedAt;
-          feedback.readback = {
-            checked: input.checked,
-            value: input.value,
-            optionId: input.closest("[data-option-id]")?.getAttribute("data-option-id") ?? null,
-          };
-          feedback.status = "completed";
-        });
-      },
-      { once: true },
-    );
+    /** 首个原生激活事件封存为一次反馈，避免同一次激活的键盘和输入事件重复计时。 */
+    const recordFeedback = (event) => {
+      if (feedback.status !== "waiting") return;
+      feedback.status = "recording";
+      const changedAt = globalThis.performance.now();
+      feedback.eventType = event.type;
+      globalThis.requestAnimationFrame(() => {
+        feedback.latencyMs = globalThis.performance.now() - changedAt;
+        feedback.readback = {
+          checked: input.checked,
+          value: input.value,
+          optionId: input.closest("[data-option-id]")?.getAttribute("data-option-id") ?? null,
+          questionId:
+            globalThis.document
+              .querySelector('.ja-interaction-card[data-interaction-status="pending"]')
+              ?.getAttribute("data-question-id") ?? null,
+        };
+        feedback.status = "completed";
+      });
+    };
+    input.addEventListener("keydown", recordFeedback, { once: true });
+    input.addEventListener("input", recordFeedback, { once: true });
+    input.addEventListener("change", recordFeedback, { once: true });
   });
   await firstOption.focus();
   await firstOption.press("Space");
-  if (!(await firstOption.isChecked())) throw new Error("键盘单选未生效");
+  let renderedQuestionId;
+  try {
+    await waitForCondition(
+      "Interaction 单选自动推进",
+      async () => {
+        renderedQuestionId = await pending.getAttribute("data-question-id");
+        return renderedQuestionId === "question_targets";
+      },
+      Math.min(deadline, Date.now() + 15_000),
+      signal,
+    );
+  } catch (error) {
+    throw new Error(`Interaction 单选未推进到下一题：${renderedQuestionId ?? "无面板"}`, {
+      cause: error,
+    });
+  }
+  stage("answers_single_advanced");
   const interactionFeedback = await waitForCondition(
     "Interaction 浏览器反馈回读",
     () =>
@@ -19316,11 +19363,12 @@ async function runIndependentInteractionPlanAcceptanceSession(
   );
   if (
     interactionFeedback.measuredInBrowser !== true ||
-    interactionFeedback.eventType !== "change" ||
+    !["keydown", "input", "change"].includes(interactionFeedback.eventType) ||
     !Number.isFinite(interactionFeedback.latencyMs) ||
     interactionFeedback.latencyMs < 0 ||
     interactionFeedback.latencyMs >= 100 ||
-    interactionFeedback.readback?.checked !== true ||
+    (interactionFeedback.readback?.checked !== true &&
+      interactionFeedback.readback?.questionId !== "question_targets") ||
     typeof interactionFeedback.readback?.value !== "string" ||
     interactionFeedback.readback.value.length === 0 ||
     interactionFeedback.readback.optionId !== "option_ui"
@@ -19329,64 +19377,95 @@ async function runIndependentInteractionPlanAcceptanceSession(
       `Interaction 浏览器反馈超过预算或回读无效：${JSON.stringify(interactionFeedback)}`,
     );
   }
+  stage("answers_single_feedback");
   await pending.getByRole("button", { name: "收起问题", exact: true }).click();
   const collapsedCard = page.locator('.ja-interaction-card[aria-label="待回答的问题"]');
   await collapsedCard.waitFor({ state: "visible", timeout: timeout() });
+  stage("answers_collapsed");
   await collapsedCard.getByRole("button", { name: "展开问题", exact: true }).click();
-  if (!(await pending.locator('[data-option-id="option_ui"] input').isChecked())) {
-    throw new Error("收起后单选草稿未保留");
-  }
-  await pending.getByRole("button", { name: "下一题", exact: true }).click();
+  // 收起与立即展开会合并进同一个防抖保存；等待同一请求的权威 ACK，不能把尚未发送的本地
+  // 草稿误判为丢失，也不能仅因 UI 仍显示选择就跳过真实 CAS 持久化验证。
+  await waitForCondition(
+    "收起后单选草稿持久化",
+    async () => {
+      const snapshot = await interactionRead();
+      return snapshot.ok === true &&
+        snapshot.value?.request?.requestId === initialRequest.requestId &&
+        snapshot.value.draft?.collapsed === false &&
+        snapshot.value.draft.answers.some(
+          (answer) =>
+            answer.questionId === "question_scope" &&
+            answer.optionIds.includes("option_ui") &&
+            answer.skipped === false,
+        )
+        ? snapshot.value
+        : false;
+    },
+    Math.min(deadline, Date.now() + 15_000),
+    signal,
+  );
+  stage("answers_expanded");
+  // 展开操作与逐题过渡都由 React 异步提交；先在短窗口内确认当前题身份，再寻找选项，避免
+  // Locator 在卡片稳定外壳中无限等待不存在的旧题内容而掩盖真实的恢复或换题回退。
+  await waitForCondition(
+    "Interaction 多选题重展开",
+    async () =>
+      (await pending.getAttribute("data-question-id")) === "question_targets" ? true : false,
+    Math.min(deadline, Date.now() + 15_000),
+    signal,
+  );
+  stage("answers_multiple_ready");
   const planOption = pending.locator('[data-option-id="option_plan"] input');
   const goalOption = pending.locator('[data-option-id="option_goal"] input');
-  await planOption.focus();
-  await planOption.press("Space");
-  await goalOption.focus();
-  await goalOption.press("Space");
+  await planOption.focus({ timeout: timeout() });
+  await planOption.press("Space", { timeout: timeout() });
+  await goalOption.focus({ timeout: timeout() });
+  await goalOption.press("Space", { timeout: timeout() });
   if (!(await planOption.isChecked()) || !(await goalOption.isChecked())) {
     throw new Error("键盘多选未生效");
   }
-  await pending.getByRole("button", { name: "下一题", exact: true }).click();
+  stage("answers_multiple_selected");
   await waitForCondition(
     "Interaction draft before reload",
     async () => {
       const snapshot = await interactionRead();
-      return snapshot.ok === true && (snapshot.value?.draft?.answers?.length ?? 0) >= 2;
+      return snapshot.ok === true &&
+        (snapshot.value?.draft?.answers?.length ?? 0) >= 2 &&
+        snapshot.value?.draft?.page === 1
+        ? snapshot.value
+        : false;
     },
     deadline,
     signal,
   );
+  stage("answers_draft_confirmed");
+  stage("answers_restart_started");
   const restored = await restartApplication();
+  stage("answers_restart_finished");
   const restoredPending = page.locator('.ja-interaction-card[data-interaction-status="pending"]');
   await restoredPending.waitFor({ state: "visible", timeout: timeout() });
+  stage("answers_restored_pending");
   const restoredDraft = await interactionRead();
+  // 重启恢复必须同时确认持久草稿与渲染题目；只读 IPC 成功不足以证明新 controller 没有被晚到
+  // snapshot 回退，后续文本输入也只能绑定刚恢复的卡片，不能复用旧 Locator 隐藏该问题。
+  const restoredQuestionId = await restoredPending.getAttribute("data-question-id");
   if (
     !restored ||
     restoredDraft.ok !== true ||
-    (restoredDraft.value?.draft?.answers?.length ?? 0) < 2
+    (restoredDraft.value?.draft?.answers?.length ?? 0) < 2 ||
+    restoredDraft.value?.draft?.page !== 1 ||
+    restoredQuestionId !== "question_targets"
   ) {
-    throw new Error("重启后 Interaction 草稿未恢复");
+    throw new Error(
+      `重启后 Interaction 草稿或渲染页码未恢复：${JSON.stringify({
+        authorityDraftPage:
+          restoredDraft.ok === true ? restoredDraft.value?.draft?.page : undefined,
+        renderedQuestionId: restoredQuestionId,
+      })}`,
+    );
   }
-  const customInput = pending.getByRole("textbox", {
-    name: "补充一个验收备注（可选）",
-    exact: true,
-  });
-  await customInput.evaluate((element) => {
-    element.dispatchEvent(
-      new globalThis.CompositionEvent("compositionstart", { bubbles: true, data: "中" }),
-    );
-    element.dispatchEvent(
-      new globalThis.KeyboardEvent("keydown", { bubbles: true, key: "Enter", isComposing: true }),
-    );
-    element.dispatchEvent(
-      new globalThis.CompositionEvent("compositionend", { bubbles: true, data: "中" }),
-    );
-  });
-  const imeCompositionSafe = await pending.isVisible();
-  if (!imeCompositionSafe) throw new Error("IME 组合期间错误提交 Interaction");
-  await customInput.fill("保留真实证据");
-  await pending.getByRole("button", { name: "提交", exact: true }).focus();
-  await pending.getByRole("button", { name: "提交", exact: true }).press("Enter");
+  await restoredPending.getByRole("button", { name: "提交回答", exact: true }).focus();
+  await restoredPending.getByRole("button", { name: "提交回答", exact: true }).press("Enter");
   await waitForCondition(
     "Interaction answer persisted",
     async () => {
@@ -19398,17 +19477,27 @@ async function runIndependentInteractionPlanAcceptanceSession(
     deadline,
     signal,
   );
-  const summary = page.locator('.ja-interaction-card[aria-label="已回答的问题"]');
-  await summary.waitFor({ state: "visible", timeout: timeout() });
+  const historyToolResultVisible = await waitForCondition(
+    "Interaction ToolResult 历史投影",
+    async () =>
+      page.evaluate(() =>
+        [...globalThis.document.querySelectorAll(".ja-chat-timeline__row")].some(
+          (row) => row.textContent?.includes("询问用户") === true,
+        ),
+      ),
+    deadline,
+    signal,
+  );
   const answeredSnapshot = await interactionRead();
   const answeredAnswers = answeredSnapshot.value?.request?.answers ?? [];
-  const customAnswer =
+  const selectedTargets =
     answeredSnapshot.ok === true &&
     answeredSnapshot.value?.request?.status === "answered" &&
     answeredAnswers.some(
       (answer) =>
-        answer.questionId === "question_note" &&
-        answer.freeText === "保留真实证据" &&
+        answer.questionId === "question_targets" &&
+        answer.optionIds.includes("option_plan") &&
+        answer.optionIds.includes("option_goal") &&
         !answer.skipped,
     );
   const submission = await lastInteractionSubmission();
@@ -19427,9 +19516,9 @@ async function runIndependentInteractionPlanAcceptanceSession(
   const staleResponseRejected =
     staleResponse.ok === false &&
     ["INTERACTION_INVALID_STATE", "INTERACTION_REVISION_CONFLICT"].includes(staleResponse.code);
-  if (!customAnswer || !duplicateResponseIdempotent || !staleResponseRejected) {
+  if (!selectedTargets || !duplicateResponseIdempotent || !staleResponseRejected) {
     throw new Error(
-      `Interaction 回答 CAS 证据不足：${JSON.stringify({ customAnswer, duplicateResponseIdempotent, staleResponseRejected })}`,
+      `Interaction 回答 CAS 证据不足：${JSON.stringify({ selectedTargets, duplicateResponseIdempotent, staleResponseRejected })}`,
     );
   }
   const skipSnapshot = await requestInteractionBatch(
@@ -19438,44 +19527,35 @@ async function runIndependentInteractionPlanAcceptanceSession(
   );
   const skipCard = page.locator('.ja-interaction-card[data-interaction-status="pending"]');
   await skipCard.locator('[data-option-id="option_ui"] input').check();
-  await skipCard.getByRole("button", { name: "下一题", exact: true }).click();
-  await skipCard.locator('[data-option-id="option_plan"] input').check();
-  await skipCard.getByRole("button", { name: "下一题", exact: true }).click();
-  await skipCard.getByRole("button", { name: "跳过", exact: true }).click();
-  const skippedPending = await waitForCondition(
-    "explicit skip keeps Interaction pending",
+  await waitForCondition(
+    "Interaction 空白可选题已展示",
+    async () =>
+      (await skipCard.getAttribute("data-question-id")) === "question_targets" ? true : false,
+    Math.min(deadline, Date.now() + 15_000),
+    signal,
+  );
+  const blankOptionalPending = await waitForCondition(
+    "blank optional Interaction keeps pending draft empty",
     async () => {
       const snapshot = await interactionRead();
       return snapshot.ok === true &&
         snapshot.value?.request?.requestId === skipSnapshot.value.request.requestId &&
         snapshot.value.request.status === "pending" &&
-        snapshot.value.draft?.answers?.some(
-          (answer) =>
-            answer.questionId === "question_note" &&
-            answer.skipped === true &&
-            answer.optionIds.length === 0 &&
-            answer.freeText === null,
-        )
+        !snapshot.value.draft?.answers?.some((answer) => answer.questionId === "question_targets")
         ? snapshot.value
         : false;
     },
     deadline,
     signal,
   );
-  const skippedAnswer = (skippedPending.draft?.answers ?? []).find(
-    (answer) => answer.questionId === "question_note",
+  const blankOptionalAnswer = (blankOptionalPending.draft?.answers ?? []).find(
+    (answer) => answer.questionId === "question_targets",
   );
-  if (
-    skippedAnswer === undefined ||
-    skippedAnswer.skipped !== true ||
-    skippedAnswer.optionIds.length !== 0 ||
-    skippedAnswer.freeText !== null
-  ) {
-    throw new Error("跳过未保留为待提交的结构化 skipped 草稿");
-  }
-  await skipCard.getByRole("button", { name: "提交", exact: true }).click();
+  if (blankOptionalAnswer !== undefined)
+    throw new Error("空白可选题不应在草稿阶段伪造 skipped 答案");
+  await skipCard.getByRole("button", { name: "提交回答", exact: true }).click();
   const skippedResult = await waitForCondition(
-    "explicit skipped Interaction snapshot",
+    "blank optional Interaction snapshot",
     async () => {
       const snapshot = await interactionRead();
       return snapshot.ok === true &&
@@ -19487,12 +19567,15 @@ async function runIndependentInteractionPlanAcceptanceSession(
     deadline,
     signal,
   );
-  const explicitSkip = skippedResult.request.answers.some(
+  const implicitSkip = skippedResult.request.answers.some(
     (answer) =>
-      answer.skipped === true && answer.optionIds.length === 0 && answer.freeText === null,
+      answer.questionId === "question_targets" &&
+      answer.skipped === true &&
+      answer.optionIds.length === 0 &&
+      answer.freeText === null,
   );
-  if (!explicitSkip || skippedPending.request.status !== "pending")
-    throw new Error("跳过未以结构化 skipped answer 提交");
+  if (!implicitSkip || blankOptionalPending.request.status !== "pending")
+    throw new Error("空白可选题未在提交时结算为结构化 skipped answer");
   const cancelSnapshot = await requestInteractionBatch(
     scenario.interactionPrompts[6],
     skipSnapshot.value.request.requestId,
@@ -19534,7 +19617,6 @@ async function runIndependentInteractionPlanAcceptanceSession(
   const raceAnswers = [
     { questionId: "question_scope", optionIds: ["option_ui"], freeText: null, skipped: false },
     { questionId: "question_targets", optionIds: ["option_plan"], freeText: null, skipped: false },
-    { questionId: "question_note", optionIds: [], freeText: null, skipped: true },
   ];
   const raceInputs = [1, 2].map((index) => ({
     threadId,
@@ -19601,24 +19683,21 @@ async function runIndependentInteractionPlanAcceptanceSession(
   interactionEvidenceValue = {
     singleChoice: true,
     multiChoice: true,
-    customAnswer,
-    explicitSkip,
+    implicitSkip,
     collapsePreservedDraft: restored,
     restartRestoredPendingRequest: restored,
     duplicateResponseIdempotent,
     staleResponseRejected,
     cancelDoesNotResumeTurn,
     raceSingleWinner,
-    imeCompositionSafe,
     keyboardComplete: true,
     feedbackMeasuredInBrowser: interactionFeedback.measuredInBrowser,
     feedbackEventType: interactionFeedback.eventType,
     feedbackLatencyMs: interactionFeedback.latencyMs,
     feedbackReadback: interactionFeedback.readback,
-    questionKinds: ["single", "multi", "custom", "skip"],
+    questionKinds: ["single", "multi", "implicit-skip"],
     pendingThreadCount: 1,
-    answerSummaryCollapsed:
-      (await summary.getAttribute("class"))?.split(/\s+/u).includes("is-collapsed") === true,
+    historyToolResultVisible,
     noImplicitDefault: afterCancel.request.answers.length === 0,
   };
 
@@ -20661,15 +20740,13 @@ async function runIndependentInteractionPlanAcceptanceSession(
       [
         "singleChoice",
         "multiChoice",
-        "customAnswer",
-        "explicitSkip",
+        "implicitSkip",
         "collapsePreservedDraft",
         "restartRestoredPendingRequest",
         "duplicateResponseIdempotent",
         "staleResponseRejected",
         "cancelDoesNotResumeTurn",
         "raceSingleWinner",
-        "imeCompositionSafe",
         "keyboardComplete",
         "feedbackMeasuredInBrowser",
       ],
@@ -20745,11 +20822,12 @@ async function runIndependentInteractionPlanAcceptanceSession(
     if (!predicate(preSoakCompletionProof?.[field]))
       preSoakFailures.push(`execution.completionProof.${field}`);
   if (
-    interactionEvidenceValue?.feedbackEventType !== "change" ||
+    !["keydown", "input", "change"].includes(interactionEvidenceValue?.feedbackEventType) ||
     !Number.isFinite(interactionEvidenceValue?.feedbackLatencyMs) ||
     interactionEvidenceValue.feedbackLatencyMs < 0 ||
     interactionEvidenceValue.feedbackLatencyMs >= 100 ||
-    interactionEvidenceValue.feedbackReadback?.checked !== true ||
+    (interactionEvidenceValue.feedbackReadback?.checked !== true &&
+      interactionEvidenceValue.feedbackReadback?.questionId !== "question_targets") ||
     interactionEvidenceValue.feedbackReadback?.optionId !== "option_ui"
   ) {
     preSoakFailures.push("interaction.browserFeedback");
@@ -21564,12 +21642,12 @@ async function runSidebarThreadAcceptanceSession(
     deadline,
     signal,
   );
-  await firstRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+  await firstRow.getByRole("img", { name: "正在工作", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(),
   });
   const secondThreadId = await createConversationThread(page, deadline, signal);
-  await firstRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+  await firstRow.getByRole("img", { name: "正在工作", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(),
   });
@@ -21673,12 +21751,12 @@ async function runSidebarThreadAcceptanceSession(
     deadline,
     signal,
   );
-  await failedRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+  await failedRow.getByRole("img", { name: "正在工作", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(),
   });
   const neutralThreadId = await createConversationThread(page, deadline, signal);
-  await failedRow.getByRole("img", { name: "正在回复", exact: true }).waitFor({
+  await failedRow.getByRole("img", { name: "正在工作", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(),
   });
@@ -25498,7 +25576,7 @@ async function runToolFailureAcceptanceSession(
   stage("ordinary_dsml_text");
   const composer = page.getByRole("textbox", { name: "消息", exact: true });
   await composer.fill(scenarios.dsmlProtocolFailure.prompt);
-  await beginRealtimeDraftObservation(page);
+  await beginRealtimeProcessObservation(page);
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await waitForTitleFixtureAttempts(
     fixture,
@@ -26395,7 +26473,7 @@ async function runFirstSession(
     stage,
   );
   stage("ordinary_send");
-  await beginRealtimeDraftObservation(page);
+  await beginRealtimeProcessObservation(page);
   await page.getByRole("textbox", { name: "消息" }).fill(input);
   await page.getByRole("button", { name: "发送" }).click();
   await page
@@ -26423,7 +26501,7 @@ async function runFirstSession(
   }
   stage("ordinary_completed");
   await waitForTurnRowConvergence(page, input, expectedFinal, turnDeadline, signal);
-  const realtime = await assertRealtimeDeltaBeforeTerminal(page, turnDeadline, signal);
+  const realtime = await assertRealtimeProcessBeforeTerminal(page, turnDeadline, signal);
   const turnRow = page.locator(".ja-chat-timeline__row").filter({ hasText: input });
   const historyPreviewButton = await assertAttachmentHistoryVisible(
     turnRow,
@@ -27703,8 +27781,8 @@ function assertDesktopInteractionContract() {
   ].map(String);
   if (
     !firstSession.includes("applyVisualPreferences") ||
-    !firstSession.includes("beginRealtimeDraftObservation") ||
-    !firstSession.includes("assertRealtimeDeltaBeforeTerminal") ||
+    !firstSession.includes("beginRealtimeProcessObservation") ||
+    !firstSession.includes("assertRealtimeProcessBeforeTerminal") ||
     !firstSession.includes("exerciseAttachmentDraft") ||
     !firstSession.includes("exerciseTextAttachmentPreview") ||
     !workbench.includes("verifyJoinedInspectorLayout") ||
@@ -27749,8 +27827,8 @@ function assertDesktopInteractionContract() {
   ) {
     const requiredFragments = {
       firstVisual: firstSession.includes("applyVisualPreferences"),
-      firstDraft: firstSession.includes("beginRealtimeDraftObservation"),
-      firstRealtime: firstSession.includes("assertRealtimeDeltaBeforeTerminal"),
+      firstProcess: firstSession.includes("beginRealtimeProcessObservation"),
+      firstRealtime: firstSession.includes("assertRealtimeProcessBeforeTerminal"),
       firstAttachment: firstSession.includes("exerciseAttachmentDraft"),
       firstPreview: firstSession.includes("exerciseTextAttachmentPreview"),
       joinedInspector: workbench.includes("verifyJoinedInspectorLayout"),

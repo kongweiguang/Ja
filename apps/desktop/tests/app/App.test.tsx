@@ -140,7 +140,7 @@ function runtime(
       accepted: true as const,
       turnId: input.turnId,
       status: "cancelled" as const,
-      threadRevision: input.expectedThreadRevision + 1,
+      threadRevision: 2,
     })),
     turnInputEnqueue: vi.fn(async (input) => ({
       accepted: true as const,

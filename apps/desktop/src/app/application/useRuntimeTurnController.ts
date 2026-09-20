@@ -208,7 +208,7 @@ export function useRuntimeTurnController({
         );
       }
       const expectedGeneration = runtimeStateRef.current?.generation;
-      const key = `turnCancel:${input.turnId}:${input.expectedThreadRevision}`;
+      const key = `turnCancel:${input.turnId}`;
       const pending = enqueueOperation(key, () => {
         const currentGeneration = runtimeStateRef.current?.generation;
         if (

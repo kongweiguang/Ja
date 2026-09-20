@@ -26,9 +26,13 @@ import {
   type ToolResultRow,
   type ToolResultView,
 } from "./toolResultView";
+import type { TimelineDisclosureCache } from "./timelineDisclosure";
 
 export interface ToolStepDetailsProps {
   step: WorkStepAdapter;
+  disclosureCache?: TimelineDisclosureCache;
+  disclosureKey?: string;
+  disclosureThreadId?: string;
   onReadArtifact?: (input: {
     threadId: string;
     turnId: string;
@@ -208,19 +212,19 @@ function ToolResultOutput({
 
 /**
  * Tool 行自身就是唯一 Disclosure：常规步骤保持紧凑，失败步骤自动展开，
- * 且用户的手动选择只在同一状态内有效；动作、真实 Tool 名称与首个目标留在同一行，
+ * 且用户的手动选择按 Thread/Turn/Item identity 跨状态和虚拟卸载保留；动作、真实 Tool 名称与首个目标留在同一行，
  * 已脱敏结果留在展开区，避免用展示标题或原始参数猜测身份。
  */
 export function ToolStepDetails({
   step,
+  disclosureCache,
+  disclosureKey,
+  disclosureThreadId,
   onReadArtifact,
 }: ToolStepDetailsProps): ReactElement | null {
   const presentation = step.metadata?.presentation;
   const callId = step.metadata?.callId;
-  const [manualDisclosure, setManualDisclosure] = useState<{
-    status: ToolPresentation["status"];
-    open: boolean;
-  }>();
+  const [manualOpen, setManualOpen] = useState<boolean>();
   const [outputExpanded, setOutputExpanded] = useState(false);
   const [loadedOutput, setLoadedOutput] = useState<string>();
   const [loading, setLoading] = useState(false);
@@ -245,10 +249,11 @@ export function ToolStepDetails({
     ? undefined
     : toolResultView(toolName, presentation, shownOutput);
   const showsInput = presentation.kind === "mcp" && presentation.inputPreview?.trim() !== "";
-  const detailsOpen =
-    manualDisclosure?.status === presentation.status
-      ? manualDisclosure.open
-      : presentation.status === "error";
+  const cachedOpen =
+    disclosureCache !== undefined && disclosureThreadId !== undefined && disclosureKey !== undefined
+      ? disclosureCache.get(disclosureThreadId, "tool", disclosureKey)
+      : undefined;
+  const detailsOpen = cachedOpen ?? manualOpen ?? presentation.status === "error";
   const actionLabel = presentationActionLabel(presentation, toolName);
   const target = presentationTarget(presentation, toolName);
   const interactionResult = interactionSummary(presentation, toolName);
@@ -261,6 +266,18 @@ export function ToolStepDetails({
   ]
     .filter((value): value is string => value !== undefined)
     .join("，");
+
+  /** Tool identity 稳定时保存用户选择；状态变化只影响无人工选择时的失败自动展开策略。 */
+  const updateDetailsOpen = (open: boolean): void => {
+    if (
+      disclosureCache !== undefined &&
+      disclosureThreadId !== undefined &&
+      disclosureKey !== undefined
+    ) {
+      disclosureCache.set(disclosureThreadId, "tool", disclosureKey, open);
+    }
+    setManualOpen(open);
+  };
 
   /** 完整输出必须通过 thread/turn/call/artifact 四重身份读取，失败不回显原生诊断。 */
   const loadFullOutput = async (): Promise<void> => {
@@ -297,10 +314,7 @@ export function ToolStepDetails({
       data-tool-kind={presentation.kind}
       data-tool-name={toolName}
     >
-      <Collapsible
-        open={detailsOpen}
-        onOpenChange={(open) => setManualDisclosure({ status: presentation.status, open })}
-      >
+      <Collapsible open={detailsOpen} onOpenChange={updateDetailsOpen}>
         <CollapsibleTrigger className="ja-tool-details__trigger" aria-label={accessibleSummary}>
           <span className="ja-tool-details__identity">
             <strong className="ja-tool-details__label">{actionLabel}</strong>

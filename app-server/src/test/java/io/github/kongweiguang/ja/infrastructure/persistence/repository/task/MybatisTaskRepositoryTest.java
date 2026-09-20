@@ -724,8 +724,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
                     permission(), parentRevision, parentTurnId);
             tasks.admitChild(attached.child(), attached.turn());
             tasks.admitChild(independent.child(), independent.turn());
-            conversation.claimCancellation(ROOT, parentTurnId, parentRevision,
-                    "parent cancelled", START.plusSeconds(1));
+            conversation.claimCancellation(parentTurnId, "parent cancelled", START.plusSeconds(1));
 
             assertEquals(List.of(new TaskModels.CancellationPropagation(ROOT, parentTurnId)),
                     tasks.pendingCancellationPropagations());

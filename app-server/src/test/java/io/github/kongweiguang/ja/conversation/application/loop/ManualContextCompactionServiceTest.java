@@ -153,8 +153,8 @@ final class ManualContextCompactionServiceTest {
         /** 早期门禁测试不提交终态。 */
         @Override public CommitReceipt commitTerminal(TerminalCommit request) { throw unsupported(); }
         /** 早期门禁测试不声明取消。 */
-        @Override public CancellationClaim claimCancellation(String threadId, String turnId, long revision,
-                                                              String reason, Instant occurredAt) { throw unsupported(); }
+        @Override public CancellationClaim claimCancellation(String turnId, String reason,
+                                                              Instant occurredAt) { throw unsupported(); }
         /** 早期门禁测试不按 Turn 查找。 */
         @Override public Optional<TurnSnapshot> findTurn(String threadId, String turnId) { throw unsupported(); }
         /** fixture 不拥有资源，关闭保持幂等无副作用。 */

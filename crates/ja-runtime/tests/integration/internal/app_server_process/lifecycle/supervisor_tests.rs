@@ -126,6 +126,27 @@ fn turn_input_identity_validation_is_method_specific() {
     );
 }
 
+/// turn/cancel 只接受不可变 Turn identity；Thread revision 属于结果投影，不能阻断停止请求。
+#[test]
+fn turn_cancel_identity_is_revision_free() {
+    let max_turn_id = format!("turn_{}", "a".repeat(96));
+    let oversized_turn_id = format!("turn_{}", "a".repeat(97));
+    assert!(
+        validate_turn_identity("turn/cancel", &json!({"turnId": "turn_demo"})).is_ok()
+    );
+    assert_eq!(max_turn_id.len(), 101);
+    assert!(validate_turn_identity("turn/cancel", &json!({"turnId": max_turn_id})).is_ok());
+    assert_eq!(oversized_turn_id.len(), 102);
+    assert!(
+        validate_turn_identity("turn/cancel", &json!({"turnId": oversized_turn_id})).is_err()
+    );
+    assert!(validate_turn_identity(
+        "turn/cancel",
+        &json!({"turnId": "turn_demo", "expectedThreadRevision": 7}),
+    )
+    .is_err());
+}
+
 /// stopping gate 中毒后 client 准入必须返回稳定 Faulted 并终结 lifecycle，不能从
 /// poisoned bool 推断仍可接收请求。
 #[test]

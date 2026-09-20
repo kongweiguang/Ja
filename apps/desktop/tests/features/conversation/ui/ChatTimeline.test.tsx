@@ -13,6 +13,7 @@ import { ChatTimeline } from "@/features/conversation/ui/timeline/ChatTimeline";
 import { MarkdownMessage } from "@/features/conversation/ui/timeline/MarkdownMessage";
 import { WorkProcess } from "@/features/conversation/ui/timeline/WorkProcess";
 import { TurnChangesCard } from "@/features/conversation/ui/timeline/TurnChangesCard";
+import { TimelineDisclosureCache } from "@/features/conversation/ui/timeline/timelineDisclosure";
 
 const turnId = "turn_one";
 /** 构建一个 Renderer Item，同时让每个 UI 断言只关注自己持有的字段。 */
@@ -232,7 +233,7 @@ describe("ChatTimeline", () => {
     expect(question).not.toHaveTextContent("正在发送");
     expect(question).not.toHaveAttribute("aria-busy");
     expect(question.querySelector(".ja-chat-message__send-status")).toBeNull();
-    const response = screen.getByRole("article", { name: "最终答复" });
+    const response = screen.getByRole("article", { name: "回复状态" });
     expect(response).toHaveAttribute("data-response-state", "working");
     expect(response).toHaveTextContent("正在工作");
     expect(response.querySelectorAll(".ja-chat-activity-dots > span")).toHaveLength(3);
@@ -365,12 +366,12 @@ describe("ChatTimeline", () => {
     ]);
   });
 
-  /** 公开回复 Draft 在最终答复 Surface 原位流式；terminal 只收口状态并折叠独立工作过程。 */
-  it("首个公开回复在最终答复位置流式，并在 terminal 时保持同一节点", () => {
+  /** 当前回复从首个 delta 起占据稳定阅读位置，Tool 过程与 terminal 校准都不能移除生命信号。 */
+  it("流式展示当前回复并在 Tool 过程下持续显示运行状态，terminal 原位校准", () => {
     const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
     const { rerender } = render(<ChatTimeline items={[]} turns={[runningTurn]} />);
 
-    const response = screen.getByRole("article", { name: "最终答复" });
+    const response = screen.getByRole("article", { name: "回复状态" });
     expect(response).toHaveAttribute("data-response-state", "working");
     expect(response).toHaveClass("ja-chat-message-draft");
     expect(response.querySelectorAll(".ja-chat-activity-dots > span")).toHaveLength(3);
@@ -413,11 +414,44 @@ describe("ChatTimeline", () => {
     expect(streamingProcess).toBeVisible();
     expect(streamingProcess).toHaveAttribute("data-state", "active");
     expect(streamingProcess).not.toHaveTextContent("第一段");
-    const streamingResponse = screen.getByRole("article", { name: "最终答复" });
-    expect(streamingResponse).toBe(response);
-    expect(streamingResponse).toHaveAttribute("data-response-state", "streaming");
-    expect(streamingResponse).toHaveTextContent("第一段");
-    expect(streamingResponse).toHaveTextContent("正在回复");
+    expect(response).toHaveTextContent("第一段");
+    expect(response).toHaveAttribute("data-response-state", "streaming");
+    expect(response).toHaveTextContent("正在工作");
+    expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "回复状态" })).toBe(response);
+
+    rerender(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_stream_tool",
+            kind: "tool_call",
+            status: "completed",
+            title: "读取结果",
+            metadata: {
+              presentation: {
+                kind: "read",
+                title: "读取结果",
+                status: "success",
+                relativePaths: ["result.json"],
+                truncated: false,
+              },
+            },
+          }),
+          baseItem({
+            itemId: "draft:turn_one:2",
+            kind: "commentary",
+            status: "in_progress",
+            text: "第一段继续生成",
+            metadata: { phase: "assistant_progress" },
+          }),
+        ]}
+        turns={[runningTurn]}
+      />,
+    );
+    expect(screen.getByRole("article", { name: "回复状态" })).toBe(response);
+    expect(response).toHaveTextContent("第一段继续生成");
+    expect(response).toHaveTextContent("正在工作");
 
     rerender(
       <ChatTimeline
@@ -461,9 +495,10 @@ describe("ChatTimeline", () => {
     expect(completedResponse).toHaveAttribute("data-response-state", "completed");
     expect(completedResponse).not.toHaveClass("ja-chat-message-draft");
     expect(completedResponse).toHaveTextContent("第一段继续完成");
-    expect(screen.queryByText("正在回复")).not.toBeInTheDocument();
+    expect(screen.queryByText("正在工作")).not.toBeInTheDocument();
     expect(completedResponse.querySelector(".ja-chat-activity-dots")).toBeNull();
     const completedProcess = screen.getByRole("region", { name: "工作过程" });
+    expect(completedProcess).toBe(streamingProcess);
     expect(completedProcess).toHaveAttribute("data-state", "completed");
     expect(completedProcess).not.toHaveTextContent("第一段继续完成");
     expect(document.querySelectorAll('[data-role="final"]')).toHaveLength(1);
@@ -496,11 +531,13 @@ describe("ChatTimeline", () => {
     expect(
       document.querySelector(`.ja-chat-timeline__row[data-turn-id="${turnId}"]`),
     ).toBeVisible();
-    const response = screen.getByRole("article", { name: "最终答复" });
-    expect(response).toHaveAttribute("data-response-state", "waiting");
-    expect(response).toHaveTextContent("等待你的确认");
-    expect(response.querySelector(".ja-chat-activity-dots")).toBeNull();
-    expect(screen.getByRole("region", { name: "工作过程" })).toBeVisible();
+    const process = screen.getByRole("region", { name: "工作过程" });
+    expect(process).toHaveAttribute("data-state", "waiting");
+    expect(process).toHaveTextContent("等待确认");
+    const waitingResponse = screen.getByRole("article", { name: "回复状态" });
+    expect(waitingResponse).toHaveAttribute("data-response-state", "waiting");
+    expect(waitingResponse).toHaveTextContent("等待你的确认");
+    expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
     const approve = screen.getByRole("button", { name: /^批准$/ });
     expect(approve).toBeEnabled();
     await user.click(approve);
@@ -513,9 +550,11 @@ describe("ChatTimeline", () => {
         approvals={[approval]}
       />,
     );
-    expect(screen.getByRole("article", { name: "最终答复" })).toBe(response);
-    expect(response).toHaveAttribute("data-response-state", "working");
-    expect(response.querySelectorAll(".ja-chat-activity-dots > span")).toHaveLength(3);
+    expect(screen.getByRole("region", { name: "工作过程" })).toBe(process);
+    expect(process).toHaveAttribute("data-state", "active");
+    expect(process).toHaveTextContent("进行中");
+    expect(screen.getByRole("article", { name: "回复状态" })).toBe(waitingResponse);
+    expect(waitingResponse).toHaveTextContent("正在工作");
   });
 
   /** Terminal 状态只保留静态结论，失败绝不能继续伪装成最终答复。 */
@@ -533,9 +572,21 @@ describe("ChatTimeline", () => {
     expect(response.querySelector(".ja-chat-activity-dots")).toBeNull();
 
     rerender(
-      <ChatTimeline items={[]} turns={[{ turnId, threadId: "thr_one", status: "cancelled" }]} />,
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "draft:turn_one:cancelled",
+            kind: "commentary",
+            status: "in_progress",
+            text: "取消前已经生成的正文",
+            metadata: { phase: "assistant_progress" },
+          }),
+        ]}
+        turns={[{ turnId, threadId: "thr_one", status: "cancelled" }]}
+      />,
     );
     expect(response).toHaveAttribute("data-response-state", "cancelled");
+    expect(response).toHaveTextContent("取消前已经生成的正文");
     expect(response).toHaveTextContent("已取消");
     expect(response.querySelector(".ja-chat-activity-dots")).toBeNull();
 
@@ -590,8 +641,86 @@ describe("ChatTimeline", () => {
 
     const trigger = screen.getByRole("button", { name: /工作过程/ });
     expect(trigger).toHaveAttribute("data-state", "closed");
+    expect(trigger.querySelector(".ja-work-process__meta")?.textContent?.trim()).not.toMatch(/^·/u);
     await user.click(trigger);
     expect(screen.getByText("已完成的思考摘要")).toBeVisible();
+  });
+
+  /** 运行态默认展开不等于用户选择；用户显式重新展开后，完成收口不得覆盖该选择。 */
+  it("keeps a manually opened work process visible when the turn completes", async () => {
+    const user = userEvent.setup();
+    const step = baseItem({
+      itemId: "item_manual_process",
+      kind: "reasoning",
+      text: "用户选择继续查看的过程",
+      status: "in_progress",
+      metadata: { phase: "reasoning_summary" },
+    });
+    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const { rerender } = render(<WorkProcess steps={[step]} turn={runningTurn} />);
+    const trigger = screen.getByRole("button", { name: /工作过程/u });
+    expect(trigger).toHaveAttribute("data-state", "open");
+
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute("data-state", "closed");
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute("data-state", "open");
+
+    rerender(
+      <WorkProcess
+        steps={[{ ...step, status: "completed" }]}
+        turn={{ ...runningTurn, status: "completed" }}
+      />,
+    );
+    expect(trigger).toHaveAttribute("data-state", "open");
+    expect(screen.getByText("用户选择继续查看的过程")).toBeVisible();
+  });
+
+  /** 人工展开属于 Thread/Exchange 瞬态偏好，虚拟卸载后保留，但相同 identity 不得跨 Thread 串线。 */
+  it("跨虚拟卸载保留工作过程展开选择并按 Thread 隔离", async () => {
+    const user = userEvent.setup();
+    const cache = new TimelineDisclosureCache();
+    const step = baseItem({
+      itemId: "item_cached_process",
+      kind: "commentary",
+      text: "缓存中的过程正文",
+      status: "completed",
+    });
+    const first = render(
+      <WorkProcess
+        steps={[step]}
+        disclosureCache={cache}
+        disclosureKey="exchange:cached"
+        disclosureThreadId="thread:one"
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /查看工作过程/u }));
+    expect(screen.getByText("缓存中的过程正文")).toBeVisible();
+    first.unmount();
+
+    const second = render(
+      <WorkProcess
+        steps={[step]}
+        disclosureCache={cache}
+        disclosureKey="exchange:cached"
+        disclosureThreadId="thread:one"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /工作过程/u })).toHaveAttribute("data-state", "open");
+    second.unmount();
+
+    render(
+      <WorkProcess
+        steps={[{ ...step, threadId: "thread:two" }]}
+        disclosureCache={cache}
+        disclosureKey="exchange:cached"
+        disclosureThreadId="thread:two"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /查看工作过程/u })).toHaveAttribute(
+      "data-state",
+      "closed",
+    );
   });
 
   /** 公开 reasoning 已由服务端有界化，流式和完成后展开都不能静默截断 Markdown 尾部。 */
@@ -673,8 +802,15 @@ describe("ChatTimeline", () => {
       expect(trigger).not.toBeNull();
       expect(trigger).toHaveAccessibleName(new RegExp(entry.label, "u"));
       expect(trigger?.querySelector(".ja-work-process__heading")).toHaveTextContent("工作过程");
-      expect(trigger?.querySelector(".ja-work-process__summary")).toHaveTextContent(entry.label);
-      expect(trigger?.querySelectorAll(".ja-work-process__summary")).toHaveLength(1);
+      if (entry.status === "completed") {
+        expect(trigger?.querySelector(".ja-work-process__heading")).toHaveTextContent(
+          "查看工作过程",
+        );
+        expect(trigger?.querySelector(".ja-work-process__summary")).toBeNull();
+      } else {
+        expect(trigger?.querySelector(".ja-work-process__summary")).toHaveTextContent(entry.label);
+        expect(trigger?.querySelectorAll(".ja-work-process__summary")).toHaveLength(1);
+      }
       expect(trigger).not.toHaveTextContent("工作中");
       expect(trigger).not.toHaveTextContent("生成中");
     });
@@ -729,7 +865,7 @@ describe("ChatTimeline", () => {
     );
 
     const trigger = screen.getByRole("button", { name: /已完成.*1 步失败/u });
-    expect(trigger).toHaveAttribute("data-state", "closed");
+    expect(trigger).toHaveAttribute("data-state", "open");
     expect(trigger.querySelector(".ja-work-process__status-icon")).toBeNull();
     expect(trigger.querySelector(".ja-work-process__count")).toBeNull();
     expect(trigger.querySelector(".lucide-clock-3")).toBeNull();
@@ -761,9 +897,11 @@ describe("ChatTimeline", () => {
         }}
       />,
     );
-    expect(
-      screen.getByRole("button", { name: /工作过程/ }).querySelector(".ja-work-process__summary"),
-    ).toHaveTextContent("已完成");
+    expect(screen.getByRole("button", { name: /查看工作过程/ })).toHaveAttribute(
+      "data-state",
+      "closed",
+    );
+    expect(screen.getByRole("button", { name: /查看工作过程/ })).not.toHaveTextContent("已完成");
     expect(screen.queryByText(/个步骤/u)).not.toBeInTheDocument();
     expect(screen.queryByText(/步骤已完成/u)).not.toBeInTheDocument();
   });
@@ -1765,7 +1903,7 @@ describe("ChatTimeline", () => {
     );
   });
 
-  it("流式答复原位显示，并固定工作过程、答复与可靠非零变更的顺序", async () => {
+  it("固定流式工作过程、终态答复与可靠非零变更的顺序", async () => {
     const runningTurn = {
       turnId,
       threadId: "thr_one",
@@ -1825,10 +1963,10 @@ describe("ChatTimeline", () => {
     const streamingProcess = screen.getByRole("region", { name: "工作过程" });
     expect(streamingProcess).toHaveAttribute("data-state", "active");
     expect(streamingProcess).not.toHaveTextContent("正在流式生成");
-    const streamingAnswer = screen.getByRole("article", { name: "最终答复" });
-    expect(streamingAnswer).toHaveAttribute("data-response-state", "streaming");
-    expect(streamingAnswer).toHaveTextContent("正在流式生成");
-    expect(streamingAnswer).toHaveTextContent("正在回复");
+    const streamingResponse = screen.getByRole("article", { name: "回复状态" });
+    expect(streamingResponse).toHaveTextContent("正在流式生成");
+    expect(streamingResponse).toHaveTextContent("正在工作");
+    expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
 
     rerender(
       <ChatTimeline
@@ -1862,7 +2000,8 @@ describe("ChatTimeline", () => {
     const process = await screen.findByRole("region", { name: "工作过程" });
     const finalAnswer = screen.getByRole("article", { name: "最终答复" });
     const changes = screen.getByRole("region", { name: "修改记录" });
-    expect(finalAnswer).toBe(streamingAnswer);
+    expect(process).toBe(streamingProcess);
+    expect(finalAnswer).toBe(streamingResponse);
     expect(finalAnswer).toHaveTextContent("最终结果");
     expect(
       process.compareDocumentPosition(finalAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -2126,6 +2265,18 @@ describe("ChatTimeline", () => {
     );
     expect(container.querySelector("img")).toBeNull();
     expect(screen.getByText("远程图片")).toBeVisible();
+  });
+
+  /** GFM 宽表格必须拥有独立滚动容器，避免 Markdown 内容扩大整个对话视口。 */
+  it("wraps markdown tables in an independent overflow surface", () => {
+    const { container } = render(
+      <MarkdownMessage content={"| 列一 | 列二 |\n| --- | --- |\n| 值 | 很长的值 |"} />,
+    );
+
+    const wrapper = container.querySelector(".ja-markdown__table-wrap");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper?.querySelector("table")).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "列一" })).toBeVisible();
   });
 
   it("keeps message actions after content surfaces and copies both roles through the typed writer", async () => {

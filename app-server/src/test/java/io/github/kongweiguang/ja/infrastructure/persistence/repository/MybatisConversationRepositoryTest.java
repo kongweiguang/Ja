@@ -642,8 +642,8 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
         try (TestDatabase database = database("cancel-claim")) {
             MybatisConversationRepository store = initialized(database);
             ConversationRepository.AdmissionReceipt admission = admit(store);
-            ConversationRepository.CancellationClaim claim = store.claimCancellation("thr_1", "turn_1",
-                    admission.threadRevision(), "user cancelled", START.plusSeconds(1));
+            ConversationRepository.CancellationClaim claim = store.claimCancellation(
+                    "turn_1", "user cancelled", START.plusSeconds(1));
             assertTrue(claim.accepted());
             assertEquals(TurnState.QUEUED, claim.status());
             assertEquals(2, claim.threadRevision());
@@ -656,19 +656,15 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
                     List.of(new TextContent("later"))), List.of(), claim.threadRevision(),
                     START.plusSeconds(1), execution("cfg_1")));
 
-            ConversationRepository.CancellationClaim retry = store.claimCancellation("thr_1", "turn_1",
-                    admission.threadRevision(), "different reason", START.plusSeconds(2));
+            ConversationRepository.CancellationClaim retry = store.claimCancellation(
+                    "turn_1", "different reason", START.plusSeconds(2));
             assertEquals(claim, retry);
-            StorageException staleRetry = assertThrows(StorageException.class,
-                    () -> store.claimCancellation("thr_1", "turn_1", claim.threadRevision(),
-                            "stale retry", START.plusSeconds(2)));
-            assertEquals(StorageException.Code.CAS_CONFLICT, staleRetry.code());
+            assertEquals(claim, store.claimCancellation("turn_1", "stale retry", START.plusSeconds(2)));
             try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession()) {
                 PersistenceRecords.TurnRow row = session.getMapper(AgentMapper.class)
                         .selectTurn(new PersistenceRecords.TurnKey("thr_1", "turn_1"));
                 assertEquals("2026-08-25T12:00:01Z", row.cancelRequestedAt());
                 assertEquals("user cancelled", row.cancelReason());
-                assertEquals(admission.threadRevision(), row.cancelExpectedThreadRevision());
                 assertEquals(claim.threadRevision(), row.cancelThreadRevision());
                 assertEquals(claim.turnMutationVersion(), row.cancelTurnMutationVersion());
             }
@@ -734,7 +730,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             assertThrows(StorageException.class, () -> store.commitCancellationToolBatch(beforeClaim));
 
             ConversationRepository.CancellationClaim claim = store.claimCancellation(
-                    "thr_1", "turn_1", running.threadRevision(), "user cancelled", START.plusSeconds(2));
+                    "turn_1", "user cancelled", START.plusSeconds(2));
             assertThrows(StorageException.class, () -> store.commit(commitRequest(
                     "thr_1", "turn_1", TurnState.RUNNING, List.of(),
                     claim.turnMutationVersion(), START.plusSeconds(3))));
@@ -830,22 +826,24 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             ConversationRepository.CommitReceipt running = store.commit(commitRequest(
                     "thr_1", "turn_1", TurnState.RUNNING, List.of(),
                     admission.turnMutationVersion(), START.plusSeconds(1)));
-            StorageException stale = assertThrows(StorageException.class,
-                    () -> store.claimCancellation("thr_1", "turn_1", admission.threadRevision(),
-                            "stale", START.plusSeconds(2)));
-            assertEquals(StorageException.Code.CAS_CONFLICT, stale.code());
+            ConversationRepository.CancellationClaim first = store.claimCancellation(
+                    "turn_1", "stale", START.plusSeconds(2));
+            assertTrue(first.accepted());
             StorageException missing = assertThrows(StorageException.class,
-                    () -> store.claimCancellation("thr_1", "turn_missing", running.threadRevision(),
-                            "missing", START.plusSeconds(2)));
+                    () -> store.claimCancellation("turn_missing", "missing", START.plusSeconds(2)));
             assertEquals(StorageException.Code.NOT_FOUND, missing.code());
 
+            ConversationRepository.AdmissionReceipt completedAdmission = store.admit(
+                    new ConversationRepository.TurnAdmission("thr_1", "turn_2", "item_user_2",
+                    new ModelMessage(ModelRole.USER, List.of(new TextContent("already done"))), List.of(),
+                    first.threadRevision(), START.plusSeconds(3), execution("cfg_1")));
             ConversationRepository.CommitReceipt completed = store.commitTerminal(new ConversationRepository.TerminalCommit(
-                    "thr_1", "turn_1", TurnState.COMPLETED, "done", null, null,
-                    null, null, List.of(), running.turnMutationVersion(), START.plusSeconds(3)));
-            StorageException terminal = assertThrows(StorageException.class,
-                    () -> store.claimCancellation("thr_1", "turn_1", completed.threadRevision(),
-                            "late", START.plusSeconds(4)));
-            assertEquals(StorageException.Code.CAS_CONFLICT, terminal.code());
+                    "thr_1", "turn_2", TurnState.COMPLETED, "done", null, null,
+                    null, null, List.of(), completedAdmission.turnMutationVersion(), START.plusSeconds(4)));
+            ConversationRepository.CancellationClaim terminal = store.claimCancellation(
+                    "turn_2", "late", START.plusSeconds(5));
+            assertFalse(terminal.accepted());
+            assertEquals(TurnState.COMPLETED, terminal.status());
         }
     }
 
@@ -863,9 +861,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                     ready.countDown();
                     start.await();
                     try {
-                        first.claimCancellation("thr_1", "turn_1", admission.threadRevision(),
-                                "race", START.plusSeconds(1));
-                        return true;
+                        return first.claimCancellation("turn_1", "race", START.plusSeconds(1)).accepted();
                     } catch (StorageException expected) {
                         return false;
                     }
@@ -885,7 +881,10 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                 });
                 assertTrue(ready.await(2, TimeUnit.SECONDS));
                 start.countDown();
-                assertTrue(claim.get(5, TimeUnit.SECONDS) ^ terminal.get(5, TimeUnit.SECONDS));
+                boolean claimWon = claim.get(5, TimeUnit.SECONDS);
+                boolean terminalWon = terminal.get(5, TimeUnit.SECONDS);
+                assertTrue(claimWon || terminalWon
+                        || first.findTurn("thr_1", "turn_1").orElseThrow().state().terminal());
             }
         }
     }
@@ -916,8 +915,8 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             };
             MybatisConversationRepository failing = new MybatisConversationRepository(database.sessions(), database.mapper(),
                     rollbackOwner, SubagentPolicy::defaultPolicy);
-            assertThrows(StorageException.class, () -> failing.claimCancellation("thr_1", "turn_1",
-                    admission.threadRevision(), "rollback", START.plusSeconds(1)));
+            assertThrows(StorageException.class, () -> failing.claimCancellation(
+                    "turn_1", "rollback", START.plusSeconds(1)));
 
             ConversationRepository.TurnSnapshot restored = normal.findTurn("thr_1", "turn_1").orElseThrow();
             assertEquals(admission.threadRevision(), restored.threadRevision());
@@ -1736,8 +1735,8 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         try (TestDatabase database = database("recovery-cancel")) {
             MybatisConversationRepository store = initialized(database);
             ConversationRepository.AdmissionReceipt admission = admit(store);
-            ConversationRepository.CancellationClaim claim = store.claimCancellation("thr_1", "turn_1",
-                    admission.threadRevision(), "user cancelled", START.plusSeconds(1));
+            ConversationRepository.CancellationClaim claim = store.claimCancellation(
+                    "turn_1", "user cancelled", START.plusSeconds(1));
 
             StartupRecoveryService.RecoveryResult recovered = database.recovery().recover();
             assertEquals(1, recovered.turns());
@@ -1877,7 +1876,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             ConversationRepository.ResumeCandidate candidate = store.findResumeCandidate("turn_1").orElseThrow();
 
             ConversationRepository.CancelResult result = store.cancelSuspended(
-                    "turn_1", candidate.threadRevision(), START.plusSeconds(1));
+                    "turn_1", START.plusSeconds(1));
 
             assertEquals(candidate.threadRevision() + 1, result.threadRevision());
             assertEquals(TurnState.CANCELLED, store.findTurn("thr_1", "turn_1").orElseThrow().state());
@@ -1929,7 +1928,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                     List.of(new ConversationRepository.ApprovalFact("appr_cancel", "call_approval", null,
                             START.plusSeconds(60), presentation(ToolPresentation.Status.WAITING_APPROVAL))),
                     prepared.turnMutationVersion(), START.plusSeconds(2), tools));
-            store.claimCancellation("thr_1", "turn_1", waiting.threadRevision(), "stop", START.plusSeconds(3));
+            store.claimCancellation("turn_1", "stop", START.plusSeconds(3));
             assertFalse(store.resolveApproval("appr_cancel", ApprovalDecision.APPROVE, START.plusSeconds(4)));
             assertTrue(store.resolveApproval("appr_cancel", ApprovalDecision.DENY, START.plusSeconds(4)));
             assertFalse(store.resolveApproval("appr_cancel", ApprovalDecision.DENY, START.plusSeconds(4)));

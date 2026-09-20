@@ -665,12 +665,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                         .filter(turn -> !terminal(turn.status())).findFirst();
                 if (pending.isEmpty()) continue;
                 found = true;
-                try {
-                    turns.cancel(pending.orElseThrow().turnId(), snapshot.thread().revision());
-                } catch (TurnUseCase.TurnCancellationException race) {
-                    if (race.failure() != TurnUseCase.CancelFailure.CONFLICT
-                            && race.failure() != TurnUseCase.CancelFailure.TURN_NOT_FOUND) throw race;
-                }
+                turns.cancel(pending.orElseThrow().turnId());
                 if (expired(deadlineNanos)) throw closeTimeout();
             }
             if (!found) return;
@@ -770,12 +765,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             var pending = snapshot.turns().stream().filter(turn -> !terminal(turn.status()))
                     .reduce((left, right) -> right);
             if (pending.isEmpty()) return;
-            try {
-                turns.cancel(pending.orElseThrow().turnId(), snapshot.thread().revision());
-            } catch (TurnUseCase.TurnCancellationException race) {
-                if (race.failure() != TurnUseCase.CancelFailure.CONFLICT
-                        && race.failure() != TurnUseCase.CancelFailure.TURN_NOT_FOUND) throw race;
-            }
+            turns.cancel(pending.orElseThrow().turnId());
         }
     }
 

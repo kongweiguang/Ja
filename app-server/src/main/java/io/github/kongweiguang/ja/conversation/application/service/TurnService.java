@@ -520,34 +520,82 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /**
-     * 将客户端 revision 交给取消生命周期执行持久 CAS，拒绝未确认的本地取消。
+     * 仅按全局 Turn ID 认领最高优先级停止意图；Thread revision 与 Turn mutation version 由 SQLite owner
+     * 在同一事务中读取，避免客户端快照过期把基础取消动作错误地拒绝为冲突。
      */
-    public TurnUseCase.CancelResult cancel(String turnId, long expectedThreadRevision) {
+    public TurnUseCase.CancelResult cancel(String turnId) {
         String parentThreadId = cancellationThreadId(turnId);
         try {
-            TurnUseCase.CancelResult result = cancellationLifecycle.cancel(turnId, expectedThreadRevision);
-            publishCancellationClaim(parentThreadId, result);
+            TurnUseCase.CancelResult result = cancellationLifecycle.cancel(turnId);
+            publishCancellationClaim(parentThreadId, result, result.accepted() && !result.status().terminal());
             return result;
         } catch (TurnUseCase.TurnCancellationException absent) {
             if (absent.failure() != TurnUseCase.CancelFailure.TURN_NOT_FOUND) throw absent;
-            try {
-                ConversationRepository.CancelResult cancelled = store.cancelSuspended(
-                        turnId, expectedThreadRevision, clock.instant());
-                TurnUseCase.CancelResult result = new TurnUseCase.CancelResult(true, turnId, TurnState.CANCELLED,
-                        cancelled.threadRevision());
-                publishCancellationClaim(parentThreadId, result);
-                return result;
-            } catch (RuntimeException unavailable) {
-                throw absent;
-            }
+            return cancelWithoutRuntimeOwner(turnId, parentThreadId, absent);
         }
+    }
+
+    /**
+     * 活动 owner 短暂缺席时只对明确的状态竞态做一次权威重试；存储事务或完整性故障必须原样传播，
+     * 终态回读只生成 ACK，不取得 Task 取消传播资格。
+     */
+    private TurnUseCase.CancelResult cancelWithoutRuntimeOwner(
+            String turnId, String parentThreadId, TurnUseCase.TurnCancellationException notFound) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            TurnUseCase.CancelResult result;
+            boolean cancellationIntentClaimed;
+            String propagationThreadId;
+            synchronized (admissionLifecycle) {
+                ConversationRepository.TurnSnapshot current = store.findTurn(turnId).orElse(null);
+                if (current == null) throw notFound;
+                if (current.state().terminal()) return terminalCancelAck(turnId, current);
+                propagationThreadId = parentThreadId == null ? current.threadId() : parentThreadId;
+                if (current.state() == TurnState.SUSPENDED) {
+                    try {
+                        ConversationRepository.CancelResult cancelled = store.cancelSuspended(
+                                turnId, clock.instant());
+                        result = new TurnUseCase.CancelResult(
+                                true, turnId, TurnState.CANCELLED, cancelled.threadRevision());
+                        cancellationIntentClaimed = true;
+                    } catch (StorageException race) {
+                        if (!isCancellationStateRace(race) || attempt == 1) throw race;
+                        continue;
+                    }
+                } else {
+                    try {
+                        result = cancellationLifecycle.cancel(turnId);
+                        cancellationIntentClaimed = result.accepted() && !result.status().terminal();
+                    } catch (TurnUseCase.TurnCancellationException retryable) {
+                        if (retryable.failure() != TurnUseCase.CancelFailure.TURN_NOT_FOUND || attempt == 1) {
+                            throw retryable;
+                        }
+                        continue;
+                    }
+                }
+            }
+            publishCancellationClaim(propagationThreadId, result, cancellationIntentClaimed);
+            return result;
+        }
+        throw notFound;
+    }
+
+    /** 终态竞态只回传当前权威状态，禁止把自然完成解释为新的取消 intent。 */
+    private static TurnUseCase.CancelResult terminalCancelAck(
+            String turnId, ConversationRepository.TurnSnapshot current) {
+        return new TurnUseCase.CancelResult(true, turnId, current.state(), current.threadRevision());
+    }
+
+    /** 只有 CAS/缺失行代表可恢复状态竞态，其它 SQLite 故障必须保留原始分类与 cause。 */
+    private static boolean isCancellationStateRace(StorageException failure) {
+        return failure.code() == StorageException.Code.CAS_CONFLICT
+                || failure.code() == StorageException.Code.NOT_FOUND;
     }
 
     /**
      * Plan pause 的窄入口：活动 Turn 先完成取消清理，再尝试保留 execution cursor；已有
      * SUSPENDED Turn 不重复写状态，避免把暂停误收敛为 CANCELLED。
      */
-    public CompletionStage<Void> suspendPlanRun(String turnId, long expectedThreadRevision) {
+    public CompletionStage<Void> suspendPlanRun(String turnId) {
         String threadId = cancellationThreadId(turnId);
         if (threadId == null) return CompletableFuture.completedFuture(null);
         TurnOwnership owner = active.get(new Key(threadId, turnId));
@@ -559,7 +607,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         }
         owner.planPauseRequested.set(true);
         try {
-            cancellationLifecycle.cancel(turnId, expectedThreadRevision, "plan paused");
+            cancellationLifecycle.cancel(turnId, "plan paused");
         } catch (RuntimeException failure) {
             owner.planPauseRequested.set(false);
             return CompletableFuture.failedFuture(failure);
@@ -575,8 +623,9 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /**
      * 父取消已持久化后再通知 Task；传播失败只记录安全类型，不能把已提交的父取消伪装成失败。
      */
-    private void publishCancellationClaim(String parentThreadId, TurnUseCase.CancelResult result) {
-        if (!result.accepted() || parentThreadId == null) return;
+    private void publishCancellationClaim(String parentThreadId, TurnUseCase.CancelResult result,
+                                          boolean cancellationIntentClaimed) {
+        if (!cancellationIntentClaimed || parentThreadId == null) return;
         TurnOwnership owner = active.get(new Key(parentThreadId, result.turnId()));
         if (owner != null && !owner.claimCancellationPropagation()) return;
         deliverCancellationPropagation(parentThreadId, result.turnId(), 0);

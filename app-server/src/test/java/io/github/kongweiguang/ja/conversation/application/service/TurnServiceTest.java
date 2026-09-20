@@ -537,8 +537,8 @@ final class TurnServiceTest {
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
             long expectedRevision = store.revision();
             long before = System.nanoTime();
-            TurnUseCase.CancelResult result = service.cancel("turn_test", expectedRevision);
-            service.cancel("turn_test", expectedRevision);
+            TurnUseCase.CancelResult result = service.cancel("turn_test");
+            service.cancel("turn_test");
             long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - before);
             assertTrue(elapsedMillis < 100, "cancel ACK took " + elapsedMillis + "ms");
             assertEquals(TurnState.RUNNING, result.status());
@@ -555,6 +555,132 @@ final class TurnServiceTest {
             assertEquals(TurnState.CANCELLED,
                     accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
             assertEquals(1, store.terminals.get());
+        }
+    }
+
+    /** 自然 COMPLETED 终态的取消只返回幂等 ACK，不得把已完成父 Turn 传播为子树取消。 */
+    @Test
+    void naturalTerminalCancelAckDoesNotPropagateAttachedCancellation() throws Exception {
+        RecordingStore store = new RecordingStore();
+        ModelPort model = (request, sink, cancellation) -> {
+            sink.onEvent(new ModelPort.TextDelta("done"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        AtomicInteger propagated = new AtomicInteger();
+        CountDownLatch terminalPublishStarted = new CountDownLatch(1);
+        CountDownLatch terminalPublishRelease = new CountDownLatch(1);
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            service.bindCancellationListener((threadId, turnId) -> propagated.incrementAndGet());
+            TurnUseCase.Accepted accepted = service.start(request("turn_test", "already done"),
+                    event -> {
+                        if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.Terminal) {
+                            terminalPublishStarted.countDown();
+                            try {
+                                terminalPublishRelease.await(2, TimeUnit.SECONDS);
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                return CompletableFuture.failedFuture(interrupted);
+                            }
+                        }
+                        return CompletableFuture.completedFuture(null);
+                    });
+            assertTrue(terminalPublishStarted.await(1, TimeUnit.SECONDS));
+            assertEquals(TurnState.COMPLETED, store.state());
+
+            TurnUseCase.CancelResult result = service.cancel("turn_test");
+
+            assertTrue(result.accepted());
+            assertEquals(TurnState.COMPLETED, result.status());
+            assertEquals(0, propagated.get());
+            terminalPublishRelease.countDown();
+            assertEquals(TurnState.COMPLETED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+        }
+    }
+
+    /** SUSPENDED 取消遇到事务故障必须保留基础设施分类，不能伪装成 Turn 不存在。 */
+    @Test
+    void suspendedCancelPreservesUnexpectedStorageFailure() {
+        RecordingStore store = new RecordingStore();
+        store.prepareResumeCandidate();
+        store.failSuspendedCancellation(StorageException.Code.TRANSACTION);
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("suspended cancel must not run model"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            StorageException failure = assertThrows(StorageException.class,
+                    () -> service.cancel("turn_resume"));
+            assertEquals(StorageException.Code.TRANSACTION, failure.code());
+            assertEquals(1, store.suspendedCancellationAttempts);
+        }
+    }
+
+    /**
+     * Resume 与取消共享 admissionLifecycle：Repository 已提交 QUEUED、active owner 尚未登记的窗口内，
+     * 取消必须等待准入完成，再命中新 owner，不能把真实 Turn 误报为不存在。
+     */
+    @Test
+    void resumedTurnCancellationUsesActiveOwnerAfterSharedAdmissionBoundary() throws Exception {
+        RecordingStore store = new RecordingStore();
+        store.prepareResumeCandidate();
+        store.blockResumeReturnAfterCommit();
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("queued resumed turn must not start"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        CountDownLatch laneBlockerStarted = new CountDownLatch(1);
+        CountDownLatch laneBlockerRelease = new CountDownLatch(1);
+        TurnQueue.Reservation laneBlocker = queue.reserve("thr_test", "turn_blocker");
+        laneBlocker.submit(() -> {
+            laneBlockerStarted.countDown();
+            try {
+                laneBlockerRelease.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertTrue(laneBlockerStarted.await(1, TimeUnit.SECONDS));
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                      AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            try {
+                CompletableFuture<TurnUseCase.Accepted> resume = CompletableFuture.supplyAsync(() ->
+                        service.resume("turn_resume", 0, event -> CompletableFuture.completedFuture(null)));
+                assertTrue(store.awaitResumeCommit(1, TimeUnit.SECONDS));
+                assertEquals(TurnState.QUEUED, store.state());
+
+                CompletableFuture<TurnUseCase.CancelResult> cancel = CompletableFuture.supplyAsync(() ->
+                        service.cancel("turn_resume"));
+                assertThrows(java.util.concurrent.TimeoutException.class,
+                        () -> cancel.get(150, TimeUnit.MILLISECONDS));
+                assertEquals(0, store.suspendedCancellationAttempts);
+
+                store.releaseResumeReturn();
+                TurnUseCase.Accepted resumed = resume.get(2, TimeUnit.SECONDS);
+                TurnUseCase.CancelResult result = cancel.get(2, TimeUnit.SECONDS);
+                assertTrue(result.accepted());
+                assertEquals(TurnState.QUEUED, result.status());
+                assertEquals(0, store.suspendedCancellationAttempts);
+                assertEquals(TurnState.CANCELLED,
+                        resumed.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+            } finally {
+                store.releaseResumeReturn();
+                laneBlockerRelease.countDown();
+            }
         }
     }
 
@@ -585,8 +711,8 @@ final class TurnServiceTest {
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
             long expectedRevision = store.revision();
 
-            service.cancel("turn_test", expectedRevision);
-            service.cancel("turn_test", expectedRevision);
+            service.cancel("turn_test");
+            service.cancel("turn_test");
 
             assertTrue(propagated.await(2, TimeUnit.SECONDS));
             assertEquals(2, attempts.get());
@@ -625,7 +751,7 @@ final class TurnServiceTest {
             assertTrue(store.queuedInputs().stream().allMatch(input ->
                     input.threadId().equals("thr_test") && input.turnId().equals("turn_test")));
 
-            service.cancel("turn_test", store.revision());
+            service.cancel("turn_test");
             assertTrue(model.cleanupStarted.await(1, TimeUnit.SECONDS));
             model.modelRelease.countDown();
             model.cleanupRelease.countDown();
@@ -702,7 +828,7 @@ final class TurnServiceTest {
             });
             assertTrue(model.firstStarted.await(1, TimeUnit.SECONDS));
             assertEquals(TurnState.RUNNING,
-                    service.cancel("turn_test", store.revision()).status());
+                    service.cancel("turn_test").status());
             assertTrue(terminalPublishStarted.await(1, TimeUnit.SECONDS));
             assertFalse(cancelled.completion().toCompletableFuture().isDone());
             assertEquals(1, terminalPublications.get());
@@ -736,40 +862,10 @@ final class TurnServiceTest {
             TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel"),
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
-            TurnUseCase.TurnCancellationException failure = assertThrows(
-                    TurnUseCase.TurnCancellationException.class,
-                    () -> service.cancel("turn_test", store.revision()));
-            assertEquals(TurnUseCase.CancelFailure.CONFLICT, failure.failure());
-            assertFalse(model.cleanupStarted.await(150, TimeUnit.MILLISECONDS));
-            model.modelRelease.countDown();
-            assertEquals(TurnState.FAILED,
-                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
-        }
-    }
-
-    /** 生产 Repository 的稳定 CAS_CONFLICT 也必须映射为用例冲突，供 RPC 做有界单版重试。 */
-    @Test
-    void storageCancellationConflictMapsToUseCaseWithoutPublishingToken() throws Exception {
-        BlockingModel model = new BlockingModel();
-        RecordingStore store = new RecordingStore();
-        store.cancellationStorageFailure = new StorageException(
-                StorageException.Code.CAS_CONFLICT, "forced cancellation conflict");
-        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
-                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
-        TurnQueue queue = new TurnQueue(8, 4, 1);
-        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
-        try (queue; loop; cancellations;
-                TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
-                        AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
-            TurnUseCase.Accepted accepted = service.start(request("turn_test", "cancel"),
-                    event -> CompletableFuture.completedFuture(null));
-            assertTrue(model.started.await(1, TimeUnit.SECONDS));
-
-            TurnUseCase.TurnCancellationException failure = assertThrows(
-                    TurnUseCase.TurnCancellationException.class,
-                    () -> service.cancel("turn_test", store.revision()));
-
-            assertEquals(TurnUseCase.CancelFailure.CONFLICT, failure.failure());
+            ConversationRepository.CancellationClaimException failure = assertThrows(
+                    ConversationRepository.CancellationClaimException.class,
+                    () -> service.cancel("turn_test"));
+            assertEquals(ConversationRepository.CancellationFailure.UNAVAILABLE, failure.failure());
             assertFalse(model.cleanupStarted.await(150, TimeUnit.MILLISECONDS));
             model.modelRelease.countDown();
             assertEquals(TurnState.FAILED,
@@ -795,10 +891,10 @@ final class TurnServiceTest {
                     "completion=" + accepted.completion().toCompletableFuture()
                             .handle((value, failure) -> failure == null ? "pending" : failure).join());
             long expectedRevision = store.revision();
-            assertEquals(TurnState.RUNNING, service.cancel("turn_test", expectedRevision).status());
+            assertEquals(TurnState.RUNNING, service.cancel("turn_test").status());
             assertTrue(model.cleanupStarted.await(1, TimeUnit.SECONDS));
             // 相同原始 expected revision 复用持久回执，并重试本地分派。
-            assertEquals(TurnState.RUNNING, service.cancel("turn_test", expectedRevision).status());
+            assertEquals(TurnState.RUNNING, service.cancel("turn_test").status());
             model.cleanupRelease.countDown();
             model.modelRelease.countDown();
             ExecutionException failure = assertThrows(ExecutionException.class,
@@ -823,7 +919,7 @@ final class TurnServiceTest {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"),
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
-            assertEquals(TurnState.RUNNING, service.cancel("turn_test", store.revision()).status());
+            assertEquals(TurnState.RUNNING, service.cancel("turn_test").status());
             assertTrue(model.cleanupStarted.await(1, TimeUnit.SECONDS));
             model.modelRelease.countDown();
             assertThrows(java.util.concurrent.TimeoutException.class,
@@ -1014,7 +1110,7 @@ final class TurnServiceTest {
                         AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
             TurnUseCase.Accepted accepted = service.start(request("turn_test"),
                     event -> CompletableFuture.completedFuture(null));
-            TurnUseCase.CancelResult result = service.cancel("turn_test", store.revision());
+            TurnUseCase.CancelResult result = service.cancel("turn_test");
             assertEquals(TurnState.QUEUED, result.status());
             ExecutionException failure = assertThrows(ExecutionException.class,
                     () -> accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS));
@@ -1449,6 +1545,10 @@ final class TurnServiceTest {
         private TurnAdmission lastAdmission;
         private ResumeCandidate resumeCandidate;
         private StorageException resumeFailure;
+        private StorageException suspendedCancellationFailure;
+        private int suspendedCancellationAttempts;
+        private CountDownLatch resumeCommitted;
+        private CountDownLatch resumeReturnRelease;
 
         /** 回读当前 Thread revision，供测试验证每次持久化推进。 */
         synchronized long revision() { return revision; }
@@ -1477,6 +1577,39 @@ final class TurnServiceTest {
         synchronized void prepareResumeCandidate() {
             prepareResumeCandidate("", "", List.of());
         }
+
+        /** 注入 SUSPENDED 取消的存储故障，验证服务只重试状态竞态而传播事务故障。 */
+        synchronized void failSuspendedCancellation(StorageException.Code code) {
+            suspendedCancellationFailure = new StorageException(code, "forced suspended cancellation failure");
+        }
+
+        /**
+         * 在 QUEUED 已提交后暂停 Repository 返回，精确暴露持久状态与 active owner 登记之间的准入窗口；
+         * latch 等待必须放在 synchronized 区域外，测试才能并发读取已提交状态。
+         */
+        synchronized void blockResumeReturnAfterCommit() {
+            resumeCommitted = new CountDownLatch(1);
+            resumeReturnRelease = new CountDownLatch(1);
+        }
+
+        /** 等待 Resume 已提交 QUEUED，避免用 sleep 猜测并发时序。 */
+        boolean awaitResumeCommit(long timeout, TimeUnit unit) throws InterruptedException {
+            CountDownLatch committed;
+            synchronized (this) {
+                committed = resumeCommitted;
+            }
+            return committed != null && committed.await(timeout, unit);
+        }
+
+        /** 允许 Resume 返回并继续在同一 admissionLifecycle 临界区登记 active owner。 */
+        void releaseResumeReturn() {
+            CountDownLatch release;
+            synchronized (this) {
+                release = resumeReturnRelease;
+            }
+            if (release != null) release.countDown();
+        }
+
         /** 构造真窗故障对应的挂起队首：附件仍被预留，条目已因消费失败推进到 revision 2。 */
         synchronized void prepareSuspendedAttachmentInput() {
             prepareResumeCandidate();
@@ -1529,12 +1662,48 @@ final class TurnServiceTest {
         @Override public synchronized Optional<ResumeCandidate> findResumeCandidate(String turnId) {
             return Optional.ofNullable(resumeCandidate);
         }
+        /** 全局 Turn 查询供终态 ACK 与 suspended fallback 的权威重读使用。 */
+        @Override public synchronized Optional<TurnSnapshot> findTurn(String turnId) {
+            String threadId = resumeCandidate == null ? "thr_test" : resumeCandidate.threadId();
+            return Optional.of(new TurnSnapshot(threadId, turnId, state, CLOCK.instant(), CLOCK.instant(),
+                    state.terminal() ? CLOCK.instant() : null, revision, turnMutationVersion));
+        }
+        /** SUSPENDED fallback 只模拟明确状态竞争/存储故障，不把所有异常折叠成 NOT_FOUND。 */
+        @Override public synchronized ConversationRepository.CancelResult cancelSuspended(
+                String turnId, Instant occurredAt) {
+            suspendedCancellationAttempts++;
+            if (suspendedCancellationFailure != null) {
+                StorageException failure = suspendedCancellationFailure;
+                throw failure;
+            }
+            if (state != TurnState.SUSPENDED) {
+                throw new StorageException(StorageException.Code.CAS_CONFLICT, "suspended state changed");
+            }
+            state = TurnState.CANCELLED;
+            return new ConversationRepository.CancelResult(turnId, ++revision, ++turnMutationVersion);
+        }
         /** 注入精确存储失败，防止服务测试依赖异常文本映射。 */
-        @Override public synchronized ResumeReceipt resume(String turnId, long expectedThreadRevision,
-                                                            long expectedTurnMutationVersion,
-                                                            Instant occurredAt) {
-            if (resumeFailure != null) throw resumeFailure;
-            return new ResumeReceipt("thr_test", turnId, ++revision, ++turnMutationVersion);
+        @Override public ResumeReceipt resume(String turnId, long expectedThreadRevision,
+                                              long expectedTurnMutationVersion,
+                                              Instant occurredAt) {
+            ResumeReceipt receipt;
+            CountDownLatch release;
+            synchronized (this) {
+                if (resumeFailure != null) throw resumeFailure;
+                state = TurnState.QUEUED;
+                receipt = new ResumeReceipt("thr_test", turnId, ++revision, ++turnMutationVersion);
+                release = resumeReturnRelease;
+                if (resumeCommitted != null) resumeCommitted.countDown();
+            }
+            if (release != null) {
+                try {
+                    release.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("resume return barrier interrupted", interrupted);
+                }
+            }
+            return receipt;
         }
         /** 校验 mutation version 后记录中间态，防止测试绕过 CAS 语义。 */
         @Override public synchronized CommitReceipt commit(CommitRequest request) {
@@ -1651,23 +1820,18 @@ final class TurnServiceTest {
             return new CommitReceipt(++revision, ++turnMutationVersion);
         }
         /** 原子记录取消声明及新 revision，模拟生产存储的取消所有权边界。 */
-        @Override public synchronized CancellationClaim claimCancellation(String threadId, String turnId,
-                long expectedThreadRevision, String reason, Instant occurredAt) {
+        @Override public synchronized CancellationClaim claimCancellation(String turnId, String reason,
+                Instant occurredAt) {
             if (cancellationStorageFailure != null) throw cancellationStorageFailure;
-            if (rejectCancellationClaims) {
-                throw ConversationRepository.CancellationClaimException.of(
-                        ConversationRepository.CancellationFailure.CONFLICT);
-            }
             if (state.terminal()) {
-                throw ConversationRepository.CancellationClaimException.of(
-                        ConversationRepository.CancellationFailure.CONFLICT);
+                return new CancellationClaim(false, state, revision, turnMutationVersion);
             }
             if (cancellationClaimed) {
                 return new CancellationClaim(true, state, revision, turnMutationVersion);
             }
-            if (revision != expectedThreadRevision) {
+            if (rejectCancellationClaims) {
                 throw ConversationRepository.CancellationClaimException.of(
-                        ConversationRepository.CancellationFailure.CONFLICT);
+                        ConversationRepository.CancellationFailure.UNAVAILABLE);
             }
             cancellationClaimed = true;
             return new CancellationClaim(true, state, ++revision, ++turnMutationVersion);

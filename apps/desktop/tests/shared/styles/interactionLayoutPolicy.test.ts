@@ -28,7 +28,9 @@ describe("conversation interaction layout policy", () => {
     expect(INTERACTION_STYLE).toMatch(
       /\.ja-interaction-card\[data-interaction-status="pending"\]\s*\{[^}]*grid-template-rows:\s*auto\s+minmax\(0,\s*1fr\)\s+auto;/su,
     );
-    expect(INTERACTION_STYLE).toMatch(/\.ja-interaction-card\s*\{[^}]*min-height:\s*0;/su);
+    expect(INTERACTION_STYLE).toMatch(
+      /\.ja-interaction-card\s*\{[^}]*max-height:\s*min\(34rem,\s*62dvh\);/su,
+    );
     expect(INTERACTION_STYLE).toMatch(
       /\.ja-interaction-card__body\s*\{[^}]*min-height:\s*0;[^}]*overflow-x:\s*hidden;[^}]*overflow-y:\s*auto;/su,
     );
@@ -40,13 +42,13 @@ describe("conversation interaction layout policy", () => {
       /\.ja-conversation-composer-dock\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*max-height:\s*100%;/su,
     );
     expect(APP_STYLE).toMatch(
-      /\.ja-conversation-composer-dock\s*>\s*\.ja-interaction-card\s*\{[^}]*min-height:\s*0;[^}]*flex:\s*1\s+1\s+auto;/su,
+      /\.ja-conversation-composer-dock\s*>\s*\.ja-interaction-card\s*\{[^}]*min-height:\s*0;[^}]*flex:\s*0\s+1\s+auto;/su,
     );
     expect(APP_STYLE).toMatch(
       /\.ja-conversation-composer-dock\s*>\s*\.ja-interaction-card\.is-collapsed\s*\{[^}]*flex:\s*0\s+0\s+auto;/su,
     );
     expect(INTERACTION_STYLE).toMatch(
-      /\.ja-conversation-composer-dock\s*>\s*\.ja-interaction-card\s+\.ja-interaction-card__body\s*\{[^}]*max-height:\s*none;/su,
+      /\.ja-interaction-card__body\s*\{[^}]*min-height:\s*0;[^}]*overflow-x:\s*hidden;[^}]*overflow-y:\s*auto;/su,
     );
     expect(COMPOSER_STYLE).toMatch(
       /\.ja-conversation-composer-dock\s*>\s*\.ja-composer\s*\{[^}]*position:\s*relative;[^}]*bottom:\s*auto;[^}]*flex:\s*0\s+0\s+auto;/su,

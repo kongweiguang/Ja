@@ -54,6 +54,25 @@ type TimelineVirtualizer = Pick<
   "getOffsetForIndex" | "scrollToOffset" | "getVirtualItemForOffset"
 >;
 
+interface TimelineResizeVirtualizer {
+  readonly scrollOffset: number | null;
+  readonly scrollAdjustments: number;
+  readonly scrollDirection: "forward" | "backward" | null;
+}
+
+/**
+ * 仅补偿完全位于 viewport 上方的行高变化。流式正文常在当前可见 Turn 行尾增长，即使这是
+ * 首次测量也不能按整行 delta 推动 scrollTop；向上滚动期间同样让用户手势优先。
+ */
+export function shouldAdjustTimelineScrollPosition(
+  item: Pick<VirtualItem, "end">,
+  _delta: number,
+  instance: TimelineResizeVirtualizer,
+): boolean {
+  const scrollOffset = (instance.scrollOffset ?? 0) + instance.scrollAdjustments;
+  return item.end <= scrollOffset && instance.scrollDirection !== "backward";
+}
+
 interface PendingTimelineRestore {
   readonly threadId: string | undefined;
   readonly snapshot: TimelineScrollPosition | undefined;

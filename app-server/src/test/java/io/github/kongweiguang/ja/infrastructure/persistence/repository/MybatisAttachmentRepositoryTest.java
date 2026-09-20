@@ -209,7 +209,7 @@ final class MybatisAttachmentRepositoryTest extends PersistenceTestSupport {
                 session.commit();
             }
 
-            conversations.cancelSuspended("turn_attachment", 1, START.plusSeconds(3));
+            conversations.cancelSuspended("turn_attachment", START.plusSeconds(3));
 
             assertEquals("DISCARDED",
                     rawAttachment(database, "att_suspended").status());

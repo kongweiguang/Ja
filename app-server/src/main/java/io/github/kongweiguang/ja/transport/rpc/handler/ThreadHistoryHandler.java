@@ -353,7 +353,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 "offsetCharacters", "limitCharacters");
         var page = session.threads().readToolArtifact(
                 RpcParams.identifier(params, "threadId", "thr_", 128),
-                RpcParams.identifier(params, "turnId", "turn_", 128),
+                RpcParams.identifier(params, "turnId", "turn_", 101),
                 RpcParams.identifier(params, "callId", "call_", 128),
                 RpcParams.identifier(params, "artifactId", "artifact_", 128),
                 RpcParams.integer(params, "offsetCharacters"), RpcParams.integer(params, "limitCharacters"))
@@ -374,7 +374,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         RpcParams.requireExact(params, "threadId", "turnId", "artifactId", "filePath");
         ChangeSetReadRequest request = new ChangeSetReadRequest(
                 RpcParams.identifier(params, "threadId", "thr_", 128),
-                RpcParams.identifier(params, "turnId", "turn_", 128),
+                RpcParams.identifier(params, "turnId", "turn_", 101),
                 RpcParams.identifier(params, "artifactId", "artifact_", 128),
                 RpcParams.text(params, "filePath", 4_096, false));
         if (closed.get()) {

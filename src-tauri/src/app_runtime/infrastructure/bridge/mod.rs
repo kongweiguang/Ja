@@ -1260,14 +1260,14 @@ fn turn_start_params(input: &TurnStartInput) -> Result<Value, RuntimeCommandErro
     Ok(params)
 }
 
-/// infrastructure 构造固定取消 envelope，domain 已排除非法 identity 与超大 revision。
-fn turn_cancel_params(input: &TurnCancelInput) -> Result<Value, RuntimeCommandError> {
+/// infrastructure 构造固定取消 envelope，domain 已排除非法 Turn identity；取消不携带
+/// Thread revision，避免流式事件把客户端观察值误用为停止条件。
+pub(crate) fn turn_cancel_params(input: &TurnCancelInput) -> Result<Value, RuntimeCommandError> {
     input
         .validate()
         .map_err(|_| RuntimeCommandError::invalid_params())?;
     Ok(json!({
         "turnId": input.turn_id,
-        "expectedThreadRevision": input.expected_thread_revision,
     }))
 }
 

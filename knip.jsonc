@@ -48,6 +48,7 @@
     "apps/desktop/tests/app/e2e/smoothReviewBrowserFixture.tsx",
     "apps/desktop/tests/app/e2e/referencePreviewBrowserFixture.tsx",
     "apps/desktop/tests/app/e2e/readmeBrowserFixture.tsx",
+    "apps/desktop/tests/app/e2e/streamingStabilityBrowserFixture.tsx",
     // 设置和模型预览由独立浏览器入口直接加载真实组件，不能因无静态 import 被清理。
     "apps/desktop/tests/app/e2e/settingsStyle.preview.tsx",
     "apps/desktop/tests/features/settings/ui/modelsOverview.preview.tsx",

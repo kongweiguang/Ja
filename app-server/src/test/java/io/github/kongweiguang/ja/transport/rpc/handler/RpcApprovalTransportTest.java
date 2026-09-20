@@ -370,13 +370,14 @@ final class RpcApprovalTransportTest {
         }
     }
 
-    /** Operation 在审批回执后推进一版游标时，取消必须权威重读并只重试一次。 */
+    /** Java transport 必须接受合同上限 101 的 Turn ID，并在调用应用端口前拒绝 102 字符。 */
     @Test
-    void turnCancelRetriesSingleOperationCursorConflictAgainstFreshRevision() throws Exception {
+    void turnCancelEnforcesCanonicalTurnIdLengthBoundary() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
-        RetryingCancellationTurns turns = new RetryingCancellationTurns();
-        StartServices services = new StartServices(new CancellationThreads(12, "RUNNING", false), turns);
-        StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        BoundaryCancellationTurns turns = new BoundaryCancellationTurns();
+        StartServices services = new StartServices(new CancellationThreads(1, "RUNNING", false), turns);
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
         RpcSession session = null;
         try {
             RpcSession current = new RpcSession(
@@ -385,90 +386,22 @@ final class RpcApprovalTransportTest {
             session = current;
             current.initialize();
             markReady(current, "0123456789abcdef0123456789abcdef");
-            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_cancel")
-                    .put("expectedThreadRevision", 11);
+            String maximum = "turn_" + "a".repeat(96);
+            String oversized = "turn_" + "a".repeat(97);
 
             ObjectNode response = new TurnApprovalHandler(current)
-                    .handle(new RpcCommand(RpcMethod.TURN_CANCEL, params))
+                    .handle(new RpcCommand(RpcMethod.TURN_CANCEL,
+                            mapper.createObjectNode().put("turnId", maximum)))
                     .toCompletableFuture().get(2, TimeUnit.SECONDS);
+            JaRpcException failure = assertThrows(JaRpcException.class,
+                    () -> new TurnApprovalHandler(current).handle(new RpcCommand(
+                            RpcMethod.TURN_CANCEL, mapper.createObjectNode().put("turnId", oversized))));
 
-            assertEquals(2, turns.attempts.get());
-            assertEquals(12, turns.latestExpected.get());
-            assertTrue(response.path("accepted").booleanValue());
-            assertEquals("cancelled", response.path("status").textValue());
-            assertEquals(13, response.path("threadRevision").longValue());
-        } finally {
-            if (session != null) session.close();
-            writer.close();
-        }
-    }
-
-    /** 多版陈旧 cancellation 不是 Operation 单步竞态，必须保留原始 CONFLICT 且不重放。 */
-    @Test
-    void turnCancelDoesNotRetryAcrossMultipleRevisionAdvances() throws Exception {
-        ObjectMapper mapper = new ObjectMapper();
-        RetryingCancellationTurns turns = new RetryingCancellationTurns();
-        StartServices services = new StartServices(new CancellationThreads(13, "RUNNING", false), turns);
-        StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
-        RpcSession session = null;
-        try {
-            RpcSession current = new RpcSession(
-                    testConfiguration(), mapper, CLOCK, writer,
-                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
-            session = current;
-            current.initialize();
-            markReady(current, "0123456789abcdef0123456789abcdef");
-            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_cancel")
-                    .put("expectedThreadRevision", 11);
-
-            TurnUseCase.TurnCancellationException conflict = assertThrows(
-                    TurnUseCase.TurnCancellationException.class,
-                    () -> new TurnApprovalHandler(current)
-                            .handle(new RpcCommand(RpcMethod.TURN_CANCEL, params)));
-
-            assertEquals(TurnUseCase.CancelFailure.CONFLICT, conflict.failure());
-            assertEquals(1, turns.attempts.get());
-        } finally {
-            if (session != null) session.close();
-            writer.close();
-        }
-    }
-
-    /** 已进入终态的 Turn 不得借单版 revision 分支重新触发 cancellation。 */
-    @Test
-    void turnCancelDoesNotRetryTerminalTurn() throws Exception {
-        assertCancellationConflictNotRetried(new CancellationThreads(12, "COMPLETED", false));
-    }
-
-    /** 已提交 cancel intent 的 Turn 由首次 claim 独占，后续请求不得以新 revision 重放。 */
-    @Test
-    void turnCancelDoesNotRetryCommittedCancellationIntent() throws Exception {
-        assertCancellationConflictNotRetried(new CancellationThreads(12, "RUNNING", true));
-    }
-
-    /** 复用完整 RPC 会话断言拒绝路径只调用一次 Turn 用例，避免仅对白盒 helper 做假验证。 */
-    private static void assertCancellationConflictNotRetried(ThreadUseCase threads) throws Exception {
-        ObjectMapper mapper = new ObjectMapper();
-        RetryingCancellationTurns turns = new RetryingCancellationTurns();
-        StartServices services = new StartServices(threads, turns);
-        StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
-        RpcSession session = null;
-        try {
-            RpcSession current = new RpcSession(
-                    testConfiguration(), mapper, CLOCK, writer,
-                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
-            session = current;
-            current.initialize();
-            markReady(current, "0123456789abcdef0123456789abcdef");
-            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_cancel")
-                    .put("expectedThreadRevision", 11);
-
-            TurnUseCase.TurnCancellationException conflict = assertThrows(
-                    TurnUseCase.TurnCancellationException.class,
-                    () -> new TurnApprovalHandler(current)
-                            .handle(new RpcCommand(RpcMethod.TURN_CANCEL, params)));
-
-            assertEquals(TurnUseCase.CancelFailure.CONFLICT, conflict.failure());
+            assertEquals(101, maximum.length());
+            assertEquals(maximum, turns.cancelledTurn.get());
+            assertEquals(maximum, response.path("turnId").textValue());
+            assertEquals(102, oversized.length());
+            assertEquals("INVALID_PARAMS", failure.errorCode());
             assertEquals(1, turns.attempts.get());
         } finally {
             if (session != null) session.close();
@@ -669,7 +602,7 @@ final class RpcApprovalTransportTest {
         }
 
         /** 未声明取消能力。 */
-        @Override public CancelResult cancel(String turnId, long expectedThreadRevision) { throw unsupported(); }
+        @Override public CancelResult cancel(String turnId) { throw unsupported(); }
         /** 关闭测试会话时停止准入，无需改变已捕获请求。 */
         @Override public void stopAccepting() { }
         /** 测试没有执行中 Turn，因此立即满足静默等待。 */
@@ -755,29 +688,26 @@ final class RpcApprovalTransportTest {
         @Override public void deleteThread(String threadId, long expectedThreadRevision) { throw unsupported(); }
     }
 
-    /** 第一次模拟游标竞态冲突，第二次只接受权威重读后的 revision。 */
-    private static final class RetryingCancellationTurns implements TurnUseCase {
+    /** 只捕获一次合法取消调用，证明超长 identity 在 transport 层已被拒绝。 */
+    private static final class BoundaryCancellationTurns implements TurnUseCase {
         private final AtomicInteger attempts = new AtomicInteger();
-        private final AtomicReference<Long> latestExpected = new AtomicReference<>();
+        private final AtomicReference<String> cancelledTurn = new AtomicReference<>();
 
-        /** 取消测试不接纳新 Turn。 */
+        /** 边界测试不接纳新 Turn。 */
         @Override public Accepted start(TurnStartRequest request, TurnEventSink sink) { throw unsupported(); }
-        /** 首次返回稳定冲突，重试时验证使用了最新 revision。 */
-        @Override public CancelResult cancel(String turnId, long expectedThreadRevision) {
-            latestExpected.set(expectedThreadRevision);
-            if (attempts.incrementAndGet() == 1) {
-                throw TurnCancellationException.of(CancelFailure.CONFLICT);
-            }
-            if (expectedThreadRevision != 12) throw unsupported();
-            return new CancelResult(true, turnId, TurnState.CANCELLED, 13);
+        /** 记录 transport 已验证的唯一 Turn identity，并返回稳定终态 ACK。 */
+        @Override public CancelResult cancel(String turnId) {
+            attempts.incrementAndGet();
+            cancelledTurn.set(turnId);
+            return new CancelResult(true, turnId, TurnState.CANCELLED, 2);
         }
         /** 关闭测试会话时停止准入。 */
         @Override public void stopAccepting() { }
-        /** 测试没有真实执行，立即静默。 */
+        /** 测试没有执行中 Turn，因此立即满足静默等待。 */
         @Override public boolean awaitQuiescence(Duration timeout) { return true; }
-        /** 测试端口无资源。 */
+        /** 测试端口不持有资源。 */
         @Override public void closeAt(long shutdownDeadlineNanos) { }
-        /** 测试端口无资源。 */
+        /** 测试端口不持有资源。 */
         @Override public void close() { }
     }
 
@@ -796,7 +726,7 @@ final class RpcApprovalTransportTest {
                     candidate.expectedThreadRevision() + 1, true, new CompletableFuture<>());
         }
         /** 竞态夹具不取消 Turn。 */
-        @Override public CancelResult cancel(String turnId, long expectedThreadRevision) { throw unsupported(); }
+        @Override public CancelResult cancel(String turnId) { throw unsupported(); }
         /** 关闭测试会话时不再接纳。 */
         @Override public void stopAccepting() { }
         /** 没有执行中 Turn，立即静默。 */

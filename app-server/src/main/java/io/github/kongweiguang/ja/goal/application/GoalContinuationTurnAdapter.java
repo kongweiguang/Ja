@@ -118,7 +118,7 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
                     tasks.projectContinuationEvents(thread.threadId(),
                             phaseAwareSink(request.goalId(), route.sink())));
             gate.activate(request.goalId(), turnId, request.fencingToken(),
-                    () -> cancelCurrent(turnId, thread.threadId()));
+                    () -> cancelCurrent(turnId));
             route.retain();
             observeResumed(request, route, completion, accepted.completion(), false, interactionWatch);
             return completion;
@@ -239,24 +239,11 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
     }
 
     /**
-     * 取消前每次读取最新 Thread revision；并发持久事件导致 CAS 冲突时允许一次重新对账，已终态
-     * 或已离开活动表的 Turn 视为幂等完成。
+     * 取消只使用全局 Turn identity；版本读取与首次 claim 由 ConversationRepository 在事务内完成，
+     * 因而 Goal 进度事件不会把停止请求变成过期 CAS。
      */
-    private void cancelCurrent(String turnId, String threadId) {
-        for (int attempt = 0; attempt < 2; attempt++) {
-            ConversationRepository.ThreadSnapshot snapshot = conversations.readThread(threadId)
-                    .orElseThrow(() -> new IllegalStateException("Goal owner Thread is unavailable"));
-            boolean active = snapshot.turns().stream()
-                    .anyMatch(turn -> turn.turnId().equals(turnId) && !turn.state().terminal());
-            if (!active) return;
-            try {
-                turns.cancel(turnId, snapshot.revision());
-                return;
-            } catch (TurnUseCase.TurnCancellationException failure) {
-                if (failure.failure() == TurnUseCase.CancelFailure.TURN_NOT_FOUND) return;
-                if (failure.failure() != TurnUseCase.CancelFailure.CONFLICT || attempt > 0) throw failure;
-            }
-        }
+    private void cancelCurrent(String turnId) {
+        turns.cancel(turnId);
     }
 
     /** 隐藏上下文始终包含 Goal definition；Plan-only 字段仅在显式 link 存在时加入。 */

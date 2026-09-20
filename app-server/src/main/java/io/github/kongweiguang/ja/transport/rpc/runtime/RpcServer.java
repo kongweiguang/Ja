@@ -296,8 +296,6 @@ public final class RpcServer implements AutoCloseable {
             return switch (cancellation.failure()) {
                 case TURN_NOT_FOUND -> JaRpcException.of(JaErrorCatalog.TURN_NOT_FOUND,
                         "turn is unavailable");
-                case CONFLICT -> JaRpcException.of(JaErrorCatalog.CONFLICT,
-                        "thread revision changed");
             };
         }
         if (failure instanceof StorageException persistence) {

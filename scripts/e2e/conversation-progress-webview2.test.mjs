@@ -25,13 +25,16 @@ function validReport() {
     },
     provider: { kind: "deterministic_loopback", externalCalls: 0, toolCalls: 2 },
     live: {
-      commentaryBeforeFirstTool: true,
-      streamingFinalResponse: true,
+      responseBeforeFirstTool: true,
+      workingStatusWithProcess: true,
+      finalResponseBeforeTerminal: true,
       finalBodyOutsideProcess: true,
-      finalAnswerNodeStable: true,
+      processNodeStable: true,
+      responseNodeStable: true,
+      terminalCalibratedExistingResponse: true,
       completedProcessCollapsed: true,
       readSummaryVisible: true,
-      sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell"],
+      sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell", "commentary"],
       noDuplicateTools: true,
     },
     reload: {
@@ -65,12 +68,12 @@ test("CLI 默认使用 JDK25 与独立 conversation-progress Cargo target", () =
   assert.match(parsed.cargoTargetDirectory, /target[\\/]codex-conversation-progress$/u);
 });
 
-test("报告必须证明最终正文原位流式、终态折叠与 reload 后的公开交错顺序", () => {
+test("报告必须证明流式回复原位展示、过程持续状态与 reload 后的公开顺序", () => {
   const report = validReport();
   assert.equal(validateConversationProgressReport(report), report);
-  report.live.finalAnswerNodeStable = false;
+  report.live.processNodeStable = false;
   assert.throws(() => validateConversationProgressReport(report), /equal/u);
-  report.live.finalAnswerNodeStable = true;
+  report.live.processNodeStable = true;
   report.reload.sequence = ["commentary", "tool:read", "tool:shell", "commentary"];
   assert.throws(() => validateConversationProgressReport(report), /interleave|deep-equal|equal/u);
 });

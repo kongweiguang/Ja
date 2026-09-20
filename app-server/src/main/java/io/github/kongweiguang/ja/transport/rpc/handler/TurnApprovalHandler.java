@@ -17,7 +17,6 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
-import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
@@ -79,7 +78,7 @@ public final class TurnApprovalHandler implements RpcHandler {
      */
     private ObjectNode resume(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "expectedThreadRevision");
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         long expected = RpcParams.revision(params, "expectedThreadRevision");
         TurnSummary turn = session.threads().findTurn(turnId)
                 .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.TURN_NOT_RESUMABLE,
@@ -184,49 +183,26 @@ public final class TurnApprovalHandler implements RpcHandler {
      * 使用全局唯一 turnId 定位 Turn，并把取消请求直接委托给应用端口。
      */
     private CompletionStage<ObjectNode> cancel(ObjectNode params) {
-        RpcParams.requireExact(params, "turnId", "expectedThreadRevision");
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
-        long expected = RpcParams.revision(params, "expectedThreadRevision");
-        TurnUseCase.CancelResult cancelled = cancelCurrent(turnId, expected);
+        RpcParams.requireExact(params, "turnId");
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
+        TurnUseCase.CancelResult cancelled = session.turns().cancel(turnId);
         return CompletableFuture.completedFuture(session.mapper().createObjectNode()
                 .put("accepted", cancelled.accepted()).put("turnId", turnId)
                 .put("status", cancelled.status().name().toLowerCase(Locale.ROOT))
                 .put("threadRevision", cancelled.threadRevision()));
     }
 
-    /**
-     * approval 回执后 Operation 会立即持久化一次内部游标，因此只吸收同一非终态 Turn 恰好一版且
-     * 尚未登记 cancel intent 的竞态；这是单次内部 cursor race，不放宽通用 cancellation CAS。
-     */
-    private TurnUseCase.CancelResult cancelCurrent(String turnId, long expectedThreadRevision) {
-        try {
-            return session.turns().cancel(turnId, expectedThreadRevision);
-        } catch (TurnUseCase.TurnCancellationException conflict) {
-            if (conflict.failure() != TurnUseCase.CancelFailure.CONFLICT
-                    || expectedThreadRevision == Long.MAX_VALUE) {
-                throw conflict;
-            }
-            TurnSummary current = session.threads().findTurn(turnId).orElse(null);
-            if (current == null || !current.turnId().equals(turnId) || current.cancellationRequested()
-                    || TurnState.valueOf(current.status().toUpperCase(Locale.ROOT)).terminal()
-                    || current.threadRevision() != expectedThreadRevision + 1) {
-                throw conflict;
-            }
-            return session.turns().cancel(turnId, current.threadRevision());
-        }
-    }
-
     /** 默认入队为普通 FOLLOW_UP；返回全量投影让 ACK 与事件任意先后都可收敛。 */
     private ObjectNode enqueueInput(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "content");
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         return inputResult(() -> session.turns().enqueueInput(turnId, content(params.get("content")), session.eventSink()));
     }
 
     /** “调整方向”按条目 revision 提升，重复点击已提升条目保持幂等。 */
     private ObjectNode prioritizeInput(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "inputId", "expectedInputRevision");
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         String inputId = RpcParams.identifier(params, "inputId", "input_", 128);
         return inputResult(() -> session.turns().prioritizeInput(turnId, inputId,
                 inputRevision(params)));
@@ -235,7 +211,7 @@ public final class TurnApprovalHandler implements RpcHandler {
     /** 编辑正文保留原 identity、创建时间和处理顺序。 */
     private ObjectNode updateInput(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "inputId", "expectedInputRevision", "content");
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         String inputId = RpcParams.identifier(params, "inputId", "input_", 128);
         return inputResult(() -> session.turns().updateInput(turnId, inputId,
                 inputRevision(params), content(params.get("content"))));
@@ -244,7 +220,7 @@ public final class TurnApprovalHandler implements RpcHandler {
     /** 删除无需确认，但仍通过 item revision 拒绝消费竞态。 */
     private ObjectNode deleteInput(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "inputId", "expectedInputRevision");
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         String inputId = RpcParams.identifier(params, "inputId", "input_", 128);
         return inputResult(() -> session.turns().deleteInput(turnId, inputId,
                 inputRevision(params)));
@@ -307,7 +283,7 @@ public final class TurnApprovalHandler implements RpcHandler {
     private CompletionStage<ObjectNode> respond(ObjectNode params) {
         RpcParams.requireExact(params, "approvalId", "turnId", "decision", "expectedThreadRevision");
         String approvalId = RpcParams.identifier(params, "approvalId", "appr_", 108);
-        String turnId = RpcParams.identifier(params, "turnId", "turn_", 108);
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         long expected = RpcParams.revision(params, "expectedThreadRevision");
         /*
          * 在 begin() 改变响应门闩前解析封闭的决策词汇，使畸形输入不改变状态；

@@ -33,6 +33,26 @@ import type {
 const TERMINAL_TURN_STATES = new Set<TimelineTurn["status"]>(["completed", "failed", "cancelled"]);
 const MAX_DRAFT_ATTACHMENTS = 10;
 const MAX_DRAFT_ATTACHMENT_BYTES = 250 * 1024 * 1024;
+const RECONCILIATION_INITIAL_DELAY_MS = 500;
+const RECONCILIATION_MAX_DELAY_MS = 5_000;
+const RECOVERED_RECONCILIATION_TURN_STATES = new Set<TimelineTurn["status"]>(["queued", "running"]);
+
+/**
+ * 只有 queued/running 会在没有用户输入时自行推进；waiting_approval/suspended 是稳定等待态，
+ * 不能因为恢复快照缺少 terminal event 就持续制造 thread/read。
+ */
+function shouldReconcileRecoveredTurn(status: TimelineTurn["status"]): boolean {
+  return RECOVERED_RECONCILIATION_TURN_STATES.has(status);
+}
+
+/**
+ * 统一 reconciliation 退避阶梯，避免 500ms 后出现未约定的 4s 间隔；达到 5s 后保持封顶。
+ */
+function nextReconciliationDelay(delayMs: number): number {
+  if (delayMs <= 500) return 1_000;
+  if (delayMs <= 1_000) return 2_000;
+  return RECONCILIATION_MAX_DELAY_MS;
+}
 
 export interface ConversationInteractionOptions {
   threadId: string | undefined;
@@ -140,6 +160,51 @@ function isAcceptedTurnTerminal(threadId: string, accepted: ConversationAccepted
 /** operation identity 只关联当前进程中的 Channel，不承担服务端资源身份。 */
 function createAttachmentOperationId(): string {
   return `op_${crypto.randomUUID()}`;
+}
+
+/**
+ * 取消错误只读取稳定 code；原生 adapter 的 message 可能包含实现细节，不能成为 UI 状态机
+ * 的判断依据。TURN_NOT_FOUND 与状态冲突需要重新读取权威 Thread，其余错误只释放本地重试门。
+ */
+function cancellationErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * 取消目标可能已被终态事件或服务端清理；重读只失效对应 Thread，不在本地伪造 cancelled。
+ */
+function cancellationNeedsThreadResync(errorCode: string | undefined): boolean {
+  return (
+    errorCode === "TURN_NOT_FOUND" ||
+    errorCode === "THREAD_NOT_FOUND" ||
+    errorCode === "CONFLICT" ||
+    errorCode === "INVALID_STATE"
+  );
+}
+
+/**
+ * 将取消失败映射为短且准确的可见提示；运行时门禁与业务目标缺失不能都显示成泛化失败。
+ */
+function cancellationFailureMessage(errorCode: string | undefined): string {
+  switch (errorCode) {
+    case "TURN_NOT_FOUND":
+      return "运行已不存在，正在重新读取。";
+    case "THREAD_NOT_FOUND":
+      return "对话已不存在，正在重新读取。";
+    case "CONFLICT":
+    case "INVALID_STATE":
+      return "对话状态已变化，正在重新读取。";
+    case "RECOVERY_REQUIRED":
+      return "需要先完成运行时恢复。";
+    case "RUNTIME_NOT_READY":
+      return "运行时尚未就绪，请重试。";
+    case "RUNTIME_UNAVAILABLE":
+      return "运行时暂不可用，请稍后重试。";
+    default:
+      return "取消失败，请稍后重试。";
+  }
 }
 
 /**
@@ -298,6 +363,14 @@ export function useConversationInteractionController({
   const queueMutationLanesRef = useRef(new Map<string, Promise<void>>());
   const failedQueuedTextsRef = useRef<Record<string, string[]>>({});
   const cancelGuardsRef = useRef(new Set<string>());
+  const cancelThreadByTurnRef = useRef(new Map<string, string>());
+  const cancelReconciliationRef = useRef(
+    new Map<string, { threadId: string; delayMs: number; timer: ReturnType<typeof setTimeout> }>(),
+  );
+  const recoveredTurnReconciliationRef = useRef(
+    new Map<string, { threadId: string; delayMs: number; timer: ReturnType<typeof setTimeout> }>(),
+  );
+  const recoveredTurnReconciliationKeyRef = useRef<string | undefined>(undefined);
   const resumeGuardsRef = useRef(new Set<string>());
   const approvalGuardsRef = useRef(new Set<string>());
   const preferenceGuardsRef = useRef(new Set<string>());
@@ -306,8 +379,13 @@ export function useConversationInteractionController({
   const overflowDiscardGuardsRef = useRef(new Set<string>());
   const readyAttachmentSizesRef = useRef<Record<string, Map<string, number>>>({});
   const pendingTurnsRef = useRef<Record<string, ConversationAcceptedTurn>>({});
+  const currentThreadIdRef = useRef(threadId);
+  currentThreadIdRef.current = threadId;
   const currentTurns = useTimelineStore((state) => state.turns);
   const currentThreads = useTimelineStore((state) => state.threads);
+  const recoveredActiveTurnId = useTimelineStore((state) =>
+    threadId === undefined ? undefined : state.recoveredActiveTurnByThread?.[threadId],
+  );
   const blockingTurn =
     threadId === undefined
       ? undefined
@@ -322,18 +400,157 @@ export function useConversationInteractionController({
   const suspendedTurn = blockingTurn?.status === "suspended" ? blockingTurn : undefined;
   const executingTurn = blockingTurn?.status === "suspended" ? undefined : blockingTurn;
   const blockingTurnId = blockingTurn?.turnId ?? pendingTurn?.turnId;
-  const blockingTurnRevision = blockingTurn?.threadRevision ?? pendingTurn?.threadRevision;
   const executingTurnId = executingTurn?.turnId ?? pendingTurn?.turnId;
   const inputQueue = useTimelineStore((state) =>
     blockingTurnId === undefined ? undefined : state.inputQueueByTurn[blockingTurnId],
   );
   const preferenceBusy = threadId !== undefined && preferenceBusyByThread[threadId] === true;
 
+  /**
+   * 取消 guard 的释放必须同时清理 reconciliation timer；集中处理可避免失败、终态事件、
+   * 目标消失和超时四条路径互相遗漏，尤其不能让旧 Thread 的 timer 写入当前会话状态。
+   */
+  const releaseCancellation = useCallback((turnId: string): void => {
+    const reconciliation = cancelReconciliationRef.current.get(turnId);
+    if (reconciliation !== undefined) {
+      clearTimeout(reconciliation.timer);
+      cancelReconciliationRef.current.delete(turnId);
+    }
+    cancelGuardsRef.current.delete(turnId);
+    cancelThreadByTurnRef.current.delete(turnId);
+    if (mountedRef.current) {
+      setCancellingTurnIds((current) => {
+        if (current[turnId] === undefined) return current;
+        const next = { ...current };
+        delete next[turnId];
+        return next;
+      });
+    }
+  }, []);
+
+  /**
+   * ACK 后持续观察 authoritative read；每次读回仍为非终态时继续请求 resync，直到权威
+   * terminal/目标消失或会话被卸载，绝不把本地 projection 改写成 cancelled。
+   */
+  const scheduleCancelReconciliation = useCallback(
+    (
+      requestThreadId: string,
+      requestTurnId: string,
+      delayMs = RECONCILIATION_INITIAL_DELAY_MS,
+    ): void => {
+      if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+      const current = useTimelineStore.getState().turns[requestTurnId];
+      if (current === undefined || TERMINAL_TURN_STATES.has(current.status)) {
+        releaseCancellation(requestTurnId);
+        return;
+      }
+      const timer = setTimeout(() => {
+        cancelReconciliationRef.current.delete(requestTurnId);
+        if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+        const latest = useTimelineStore.getState().turns[requestTurnId];
+        if (latest === undefined || TERMINAL_TURN_STATES.has(latest.status)) {
+          releaseCancellation(requestTurnId);
+          return;
+        }
+        if (useTimelineStore.getState().resyncRequired[requestThreadId] === undefined)
+          useTimelineStore.getState().requestThreadResync(requestThreadId);
+        scheduleCancelReconciliation(
+          requestThreadId,
+          requestTurnId,
+          nextReconciliationDelay(delayMs),
+        );
+      }, delayMs);
+      cancelReconciliationRef.current.set(requestTurnId, {
+        threadId: requestThreadId,
+        delayMs,
+        timer,
+      });
+    },
+    [releaseCancellation],
+  );
+
+  /**
+   * 清理从 snapshot 恢复出的 active Turn 对账 timer 与启动 key；Thread 切换或显式 cancel
+   * 后必须允许同一可见 Turn 在后续状态变化时重新建立对账，避免 key 残留永久阻断恢复。
+   */
+  const releaseRecoveredTurnReconciliation = useCallback((turnId: string): void => {
+    const reconciliation = recoveredTurnReconciliationRef.current.get(turnId);
+    if (reconciliation === undefined) {
+      recoveredTurnReconciliationKeyRef.current = undefined;
+      return;
+    }
+    clearTimeout(reconciliation.timer);
+    recoveredTurnReconciliationRef.current.delete(turnId);
+    recoveredTurnReconciliationKeyRef.current = undefined;
+  }, []);
+
+  /**
+   * 对恢复快照中仍为 active 的 Turn 持续做 authoritative read；terminal/消失或 Thread
+   * 切换立即停止，重试只保留一个 timer，并以 0.5s→1s→2s→5s 退避且不在已有 resync
+   * pending 时叠加 read。
+   */
+  const scheduleRecoveredTurnReconciliation = useCallback(
+    (
+      requestThreadId: string,
+      requestTurnId: string,
+      delayMs = RECONCILIATION_INITIAL_DELAY_MS,
+    ): void => {
+      if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+      const current = useTimelineStore.getState().turns[requestTurnId];
+      if (
+        current === undefined ||
+        TERMINAL_TURN_STATES.has(current.status) ||
+        !shouldReconcileRecoveredTurn(current.status)
+      ) {
+        releaseRecoveredTurnReconciliation(requestTurnId);
+        return;
+      }
+      const timer = setTimeout(() => {
+        recoveredTurnReconciliationRef.current.delete(requestTurnId);
+        if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+        const latest = useTimelineStore.getState().turns[requestTurnId];
+        if (
+          latest === undefined ||
+          TERMINAL_TURN_STATES.has(latest.status) ||
+          !shouldReconcileRecoveredTurn(latest.status)
+        ) {
+          releaseRecoveredTurnReconciliation(requestTurnId);
+          return;
+        }
+        if (useTimelineStore.getState().resyncRequired[requestThreadId] === undefined)
+          useTimelineStore.getState().requestThreadResync(requestThreadId);
+        scheduleRecoveredTurnReconciliation(
+          requestThreadId,
+          requestTurnId,
+          nextReconciliationDelay(delayMs),
+        );
+      }, delayMs);
+      recoveredTurnReconciliationRef.current.set(requestTurnId, {
+        threadId: requestThreadId,
+        delayMs,
+        timer,
+      });
+    },
+    [releaseRecoveredTurnReconciliation],
+  );
+
   /** 卸载后所有异步 continuation 只释放 ref guard，不再写 React 状态。 */
   useEffect(() => {
+    const cancelReconciliation = cancelReconciliationRef.current;
+    const recoveredTurnReconciliation = recoveredTurnReconciliationRef.current;
+    const cancelThreadByTurn = cancelThreadByTurnRef.current;
+    const cancelGuards = cancelGuardsRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      currentThreadIdRef.current = undefined;
+      recoveredTurnReconciliationKeyRef.current = undefined;
+      for (const { timer } of cancelReconciliation.values()) clearTimeout(timer);
+      cancelReconciliation.clear();
+      for (const { timer } of recoveredTurnReconciliation.values()) clearTimeout(timer);
+      recoveredTurnReconciliation.clear();
+      cancelThreadByTurn.clear();
+      cancelGuards.clear();
     };
   }, []);
 
@@ -378,6 +595,86 @@ export function useConversationInteractionController({
       return changed ? next : current;
     });
   }, [currentTurns]);
+
+  /**
+   * Cancel ACK 只是接纳事实；只有 Timeline 权威终态或 Turn 从权威投影消失后，才能释放
+   * single-flight。这样 ACK 后到 terminal event 的窗口内，重复点击仍不会发出第二个请求。
+   */
+  useEffect(() => {
+    if (cancelGuardsRef.current.size === 0) return;
+    const completedTurnIds = Object.keys(cancellingTurnIds).filter((turnId) => {
+      const turn = currentTurns[turnId];
+      return turn === undefined || TERMINAL_TURN_STATES.has(turn.status);
+    });
+    for (const turnId of completedTurnIds) releaseCancellation(turnId);
+  }, [cancellingTurnIds, currentTurns, releaseCancellation]);
+
+  /**
+   * 取消中的 Turn 切出当前会话时暂停重读但保留 guard；切回且 Turn 仍非终态时恢复同一条
+   * 对账链，保证隐藏会话不占用 read，同时不会丢掉原取消意图。
+   */
+  useEffect(() => {
+    for (const [turnId, reconciliation] of cancelReconciliationRef.current) {
+      if (reconciliation.threadId !== threadId) {
+        clearTimeout(reconciliation.timer);
+        cancelReconciliationRef.current.delete(turnId);
+      }
+    }
+    if (threadId === undefined) return;
+    for (const [turnId, requestThreadId] of cancelThreadByTurnRef.current) {
+      if (requestThreadId !== threadId || cancelReconciliationRef.current.has(turnId)) continue;
+      const turn = currentTurns[turnId];
+      if (turn === undefined || TERMINAL_TURN_STATES.has(turn.status)) continue;
+      scheduleCancelReconciliation(requestThreadId, turnId);
+    }
+  }, [currentTurns, scheduleCancelReconciliation, threadId]);
+
+  /**
+   * 仅对当前可见 Conversation 的 snapshot active Turn 启动恢复对账；generation、Thread、Turn
+   * 组成 key，避免普通 live delta 或隐藏会话触发全局扫描。cancel 自己的对账优先级更高。
+   */
+  useEffect(() => {
+    let pausedForThreadSwitch = false;
+    for (const [turnId, reconciliation] of recoveredTurnReconciliationRef.current) {
+      if (reconciliation.threadId !== threadId) {
+        releaseRecoveredTurnReconciliation(turnId);
+        pausedForThreadSwitch = true;
+      }
+    }
+    if (pausedForThreadSwitch) recoveredTurnReconciliationKeyRef.current = undefined;
+    if (
+      threadId === undefined ||
+      recoveredActiveTurnId === undefined ||
+      cancelGuardsRef.current.has(recoveredActiveTurnId)
+    ) {
+      if (recoveredActiveTurnId === undefined)
+        recoveredTurnReconciliationKeyRef.current = undefined;
+      return;
+    }
+    const turn = currentTurns[recoveredActiveTurnId];
+    if (
+      turn === undefined ||
+      TERMINAL_TURN_STATES.has(turn.status) ||
+      !shouldReconcileRecoveredTurn(turn.status)
+    ) {
+      releaseRecoveredTurnReconciliation(recoveredActiveTurnId);
+      recoveredTurnReconciliationKeyRef.current = undefined;
+      return;
+    }
+    const generation = useTimelineStore.getState().handshake.generation;
+    if (generation <= 0) return;
+    const key = `${generation}:${threadId}:${recoveredActiveTurnId}`;
+    if (recoveredTurnReconciliationKeyRef.current === key) return;
+    recoveredTurnReconciliationKeyRef.current = key;
+    useTimelineStore.getState().requestThreadResync(threadId);
+    scheduleRecoveredTurnReconciliation(threadId, recoveredActiveTurnId);
+  }, [
+    currentTurns,
+    recoveredActiveTurnId,
+    releaseRecoveredTurnReconciliation,
+    scheduleRecoveredTurnReconciliation,
+    threadId,
+  ]);
 
   /** Draft 只写入当前有效 Thread，并在用户继续编辑时清除该 Thread 的旧反馈。 */
   const updateDraft = useCallback(
@@ -968,22 +1265,22 @@ export function useConversationInteractionController({
   }, [suspendedTurn, threadId, turnPort]);
 
   /**
-   * 取消操作冻结点击时的 Turn 与 revision CAS，并按 Turn single-flight；事件终态仍是唯一
-   * 完成事实，controller 不做 optimistic completion。
+   * 取消操作冻结点击时的 Turn identity 并按 Turn single-flight；ACK 后保持 guard，直到
+   * Timeline 给出权威终态或目标消失，controller 始终不做 optimistic completion。
    */
   const cancel = useCallback(async (): Promise<void> => {
     const requestThreadId = threadId;
     const requestTurnId = blockingTurnId;
-    const requestRevision = blockingTurnRevision;
     if (
       requestThreadId === undefined ||
       requestTurnId === undefined ||
-      requestRevision === undefined ||
       resumeGuardsRef.current.has(requestTurnId) ||
       cancelGuardsRef.current.has(requestTurnId)
     )
       return;
     cancelGuardsRef.current.add(requestTurnId);
+    cancelThreadByTurnRef.current.set(requestTurnId, requestThreadId);
+    releaseRecoveredTurnReconciliation(requestTurnId);
     setCancellingTurnIds((current) => ({ ...current, [requestTurnId]: true }));
     setErrorsByThread((current) => {
       const next = { ...current };
@@ -991,34 +1288,42 @@ export function useConversationInteractionController({
       return next;
     });
     try {
-      const cancellation = await turnPort.cancelTurn({
+      await turnPort.cancelTurn({
         turnId: requestTurnId,
-        expectedThreadRevision: requestRevision,
       });
-      if (TERMINAL_TURN_STATES.has(cancellation.status)) {
-        // 重启后 Java 可能只落库终态而不再发送 live terminal；失效原 Thread 投影，等待权威读取补齐事实。
+      if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+      // ACK 只代表服务端接纳；无论 ACK status 是否终态都重读一次，覆盖 terminal event 丢失。
+      useTimelineStore.getState().requestThreadResync(requestThreadId);
+      scheduleCancelReconciliation(requestThreadId, requestTurnId);
+    } catch (error: unknown) {
+      if (!mountedRef.current) return;
+      const errorCode = cancellationErrorCode(error);
+      if (currentThreadIdRef.current !== requestThreadId) {
+        releaseCancellation(requestTurnId);
+        return;
+      }
+      if (cancellationNeedsThreadResync(errorCode)) {
         useTimelineStore.getState().requestThreadResync(requestThreadId);
       }
-    } catch {
+      releaseCancellation(requestTurnId);
       if (mountedRef.current) {
-        const message = "取消失败，请稍后重试。";
+        const message = cancellationFailureMessage(errorCode);
         if (onTransientError === undefined) {
           setErrorsByThread((current) => ({ ...current, [requestThreadId]: message }));
-        } else {
+        } else if (currentThreadIdRef.current === requestThreadId) {
           onTransientError(message);
         }
       }
-    } finally {
-      cancelGuardsRef.current.delete(requestTurnId);
-      if (mountedRef.current) {
-        setCancellingTurnIds((current) => {
-          const next = { ...current };
-          delete next[requestTurnId];
-          return next;
-        });
-      }
     }
-  }, [blockingTurnId, blockingTurnRevision, onTransientError, threadId, turnPort]);
+  }, [
+    blockingTurnId,
+    onTransientError,
+    releaseCancellation,
+    releaseRecoveredTurnReconciliation,
+    scheduleCancelReconciliation,
+    threadId,
+    turnPort,
+  ]);
 
   /** Approval 使用请求携带的 revision CAS，视图不能改写 identity，也不能重复提交同一审批。 */
   const approve = useCallback(

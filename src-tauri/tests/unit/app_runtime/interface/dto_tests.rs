@@ -22,9 +22,15 @@ fn task_activity_dto_preserves_root_identity() {
     assert_eq!(value["taskThreadId"], "thr_side");
 }
 
-/// Interface DTO 必须拒绝已删除的 cancel 字段，不能把兼容输入带入纯领域模型。
+/// Interface DTO 必须只接受 turnId；旧 revision 或其它字段不能通过兼容输入带入领域模型。
 #[test]
 fn cancel_dto_rejects_unknown_and_legacy_fields() {
+    assert!(
+        serde_json::from_value::<TurnCancelInputDto>(serde_json::json!({
+            "turnId": "turn_fixture"
+        }))
+        .is_ok()
+    );
     assert!(
         serde_json::from_value::<TurnCancelInputDto>(
             serde_json::json!({"turnId":"turn_fixture","unknown":true})

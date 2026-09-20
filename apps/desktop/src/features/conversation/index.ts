@@ -70,10 +70,12 @@ export { ReplyFileOpenMenu } from "./ui/reply-files/ReplyFileOpenMenu";
 export { useReplyFileOpen } from "./application/useReplyFileOpen";
 export { ChatTimeline } from "./ui/timeline/ChatTimeline";
 export { TimelineScrollCache } from "./ui/timeline/timelineScroll";
+export { TimelineDisclosureCache } from "./ui/timeline/timelineDisclosure";
 export {
   selectApprovalClosedAt,
   selectApprovalDecisions,
   selectApprovals,
+  selectCommittedItemsForThread,
   selectItemsForThread,
   selectGoalActivitiesForOwner,
   selectTaskActivitiesForRoot,
@@ -90,6 +92,7 @@ export {
 export type { TimelineApproval, TimelineItemAdapter, TimelineTurn } from "./domain/timelineTypes";
 export type {
   AttachmentSummary,
+  TimelineEvent,
   TimelineGoalActivity,
   TimelineSnapshot,
 } from "./domain/timelineContracts";

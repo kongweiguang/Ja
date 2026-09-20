@@ -3,26 +3,17 @@
 
 use super::*;
 
-/// cancel request 消耗 bridge queue slot 前拒绝 wrong-domain ID、control text 与 unknown field。
+/// cancel request 消耗 bridge queue slot 前只拒绝 wrong-domain 或 control-text identity；
+/// Thread revision 不再作为取消条件，避免流式 revision 竞态阻断最高权限操作。
 #[test]
 fn cancel_input_is_strict_and_bounded() {
     let valid = TurnCancelInput {
         turn_id: "turn_fixture".to_owned(),
-        expected_thread_revision: 7,
     };
     assert!(valid.validate().is_ok());
     assert!(
         TurnCancelInput {
             turn_id: "turn_._fixture".to_owned(),
-            expected_thread_revision: 7,
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        TurnCancelInput {
-            turn_id: "turn_fixture".to_owned(),
-            expected_thread_revision: 9_007_199_254_740_992,
         }
         .validate()
         .is_err()

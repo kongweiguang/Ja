@@ -1,7 +1,14 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useMemo, useRef, type ReactElement, type ReactNode } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDown, CircleAlert, Paperclip, RotateCcw } from "lucide-react";
 import { cn } from "@/shared/ui/primitives/cn";
@@ -30,7 +37,13 @@ import {
   type HistoryAttachmentAuthorization,
   type HistoryAttachmentThumbnailPort,
 } from "./HistoryAttachmentThumbnail";
-import { TimelineScrollCache, useTimelineScroll, type TimelineScrollKey } from "./timelineScroll";
+import {
+  shouldAdjustTimelineScrollPosition,
+  TimelineScrollCache,
+  useTimelineScroll,
+  type TimelineScrollKey,
+} from "./timelineScroll";
+import type { TimelineDisclosureCache } from "./timelineDisclosure";
 import "./timeline.css";
 
 export interface ChatTimelineExternalRow {
@@ -48,6 +61,8 @@ export interface ChatTimelineProps {
   threadId?: string;
   /** 由稳定的 ConversationWorkspace owner 提供，使 Timeline 短暂卸载时仍能恢复滚动锚点。 */
   scrollCache?: TimelineScrollCache;
+  /** Thread 作用域的用户折叠选择；虚拟卸载与历史回读不得重置用户主动展开的内容。 */
+  disclosureCache?: TimelineDisclosureCache;
   /** Item 必须直接来自规范化 Reducer 投影，视图不创建第二份业务状态。 */
   items: readonly TimelineItemAdapter[];
   /** Turn 只用于紧凑的当前工作状态，绝不能充当第二个 Store。 */
@@ -157,6 +172,7 @@ type MutableTurnGroup = {
   user?: TimelineItemAdapter;
   threadMessages: TimelineItemAdapter[];
   work: TimelineItemAdapter[];
+  response: TimelineItemAdapter[];
   final: TimelineItemAdapter[];
   approvals: ApprovalSummary[];
 };
@@ -239,10 +255,8 @@ function visibleTurnErrorCode(error: TimelineTurn["error"] | undefined): string 
 }
 
 /**
- * 只有未结算的公开 assistant Draft 才预览为最终答复正文；已持久化的模型步骤仍是工作过程事实。
- *
- * 这让最终结果在首个 delta 到达时就占据稳定阅读位置，terminal 只替换其内容/状态而不搬运节点；
- * 同时避免把随后携带 Tool 的中间模型文本误标成最终答复。
+ * 当前 assistant Draft 先占据回复阅读位置；model step 若随后携带 Tool，会在提交时清理 Draft 并把
+ * 持久正文归档到 WorkProcess。这样首段回复无需等待 terminal，同时不靠可变文本猜测最终答案。
  */
 function isLiveAssistantResponse(item: TimelineItemAdapter): boolean {
   return (
@@ -277,8 +291,8 @@ function isPersistedFinalProgressDuplicate(
  * 将规范化投影按 USER Message 切为 exchange；同一 Turn 消费下一条队列输入时立即开始新行，
  * 后续工作与最终答复归入新 exchange，避免把多次用户意图压进同一气泡。
  *
- * 未结算的公开答复 Draft 直接进入最终答复槽位，而已提交的 progress/reasoning 仍归入工作过程，
- * 保证流式结果不会在 terminal 时跨 Surface 迁移，同时保留中间步骤的可审计顺序。
+ * Reasoning 与已经提交的 Tool 模型步正文归入工作过程；当前 assistant Draft 留在回复槽位，
+ * terminal finalMessage 只校准同一位置而不延迟首屏反馈。
  */
 function buildRows(
   items: readonly TimelineItemAdapter[],
@@ -300,6 +314,7 @@ function buildRows(
       turnId,
       threadMessages: [],
       work: [],
+      response: [],
       final: [],
       approvals: [],
     };
@@ -315,6 +330,7 @@ function buildRows(
         user: item,
         threadMessages: [],
         work: [],
+        response: [],
         final: [],
         approvals: [],
       };
@@ -322,8 +338,10 @@ function buildRows(
       currentByTurn.set(item.turnId, exchange);
     } else if (item.kind === "thread_message") {
       currentFor(item.turnId).threadMessages.push(item);
-    } else if (item.kind === "agent_message" || isLiveAssistantResponse(item)) {
+    } else if (item.kind === "agent_message") {
       currentFor(item.turnId).final.push(item);
+    } else if (isLiveAssistantResponse(item)) {
+      currentFor(item.turnId).response.push(item);
     } else {
       const group = currentFor(item.turnId);
       group.work.push(item);
@@ -379,6 +397,7 @@ function buildRows(
         ]),
       ),
       work: [],
+      response: [],
       threadMessages: [],
       final: [],
       approvals: [],
@@ -408,7 +427,11 @@ function buildRows(
     user: group.user,
     threadMessages: group.threadMessages,
     work: group.work,
-    final: mergeMessages(group.final, "agent_message", true),
+    // terminal 一旦存在就完全取代候选正文；内容差异属于权威校准，不能把两版拼接成一条回复。
+    final:
+      group.final.length > 0
+        ? mergeMessages(group.final, "agent_message", true)
+        : mergeMessages(group.response, "commentary"),
     approvals: group.approvals,
   }));
   /** 本地失败记录可能跨过后续成功 ACK；只在两行都有权威时间时排序，缺失时间继续保持事件顺序。 */
@@ -507,8 +530,9 @@ function orderConversationBlocks(
   externalRows: readonly ChatTimelineExternalRow[],
   includeChanges: boolean,
 ): readonly ConversationRenderBlock[] {
+  const turnNeedsStatus = row.turn !== undefined && row.turn.status !== "completed";
   const assistantVisible =
-    row.submissionStatus === "pending" || row.turn !== undefined || row.final !== undefined;
+    row.submissionStatus === "pending" || row.final !== undefined || turnNeedsStatus;
   const workTime = row.work[0]?.createdAt ?? row.turn?.startedAt ?? row.user?.createdAt;
   const assistantTime =
     row.final?.createdAt ?? row.turn?.completedAt ?? workTime ?? row.user?.createdAt;
@@ -826,7 +850,11 @@ function assistantResponseState(
   if (turn?.status === "suspended") return "suspended";
   if (turn?.status === "failed" || item?.status === "failed") return "failed";
   if (turn?.status === "cancelled" || item?.status === "cancelled") return "cancelled";
-  if (turn?.status === "completed" || item?.status === "completed") return "completed";
+  // Turn 仍在运行时只表达 working/streaming；终态语义必须来自权威 Turn，而不是 Item 的局部状态。
+  if (turn?.status === "running" || turn?.status === "queued")
+    return item?.text?.trim() ? "streaming" : "working";
+  if (turn?.status === "completed" || (turn === undefined && item?.status === "completed"))
+    return "completed";
   if (item?.text?.trim()) return "streaming";
   return "working";
 }
@@ -863,7 +891,7 @@ function AssistantResponse({
         : state === "suspended"
           ? "已暂停"
           : state === "streaming"
-            ? "正在回复"
+            ? "正在工作"
             : state === "cancelled"
               ? "已取消"
               : undefined;
@@ -879,7 +907,13 @@ function AssistantResponse({
       ? () => onPrepareRetry(retryTurnId, retryText)
       : undefined;
   const isFinalAnswer = state === "completed" && text !== undefined;
-  const articleLabel = isFailed ? "失败说明" : isCancelled ? "已取消的回复" : "最终答复";
+  const articleLabel = isFinalAnswer
+    ? "最终答复"
+    : isFailed
+      ? "失败说明"
+      : isCancelled
+        ? "已取消的回复"
+        : "回复状态";
 
   return (
     <article
@@ -974,6 +1008,7 @@ function AssistantResponse({
 export function ChatTimeline({
   threadId,
   scrollCache,
+  disclosureCache,
   items,
   skills = [],
   turns = [],
@@ -1045,6 +1080,21 @@ export function ChatTimeline({
       return orderedRowKey(orderedRows[index], index);
     },
   });
+  /**
+   * ResizeObserver 可能在首轮测量时看到正在流式增长的可见 Turn；在 paint 前安装 Ja 的
+   * 行级补偿边界，避免 Virtualizer 用整行高度差移动用户正在阅读的同一行内容。
+   */
+  useLayoutEffect(() => {
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldAdjustTimelineScrollPosition;
+    return () => {
+      if (
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange ===
+        shouldAdjustTimelineScrollPosition
+      ) {
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+    };
+  }, [virtualizer]);
   const scrollToLatest = useMemo(
     () => () => {
       if (orderedRows.length === 0) return;
@@ -1178,6 +1228,14 @@ export function ChatTimeline({
                       return (
                         <WorkProcess
                           key={block.key}
+                          disclosureCache={disclosureCache}
+                          disclosureKey={row.key}
+                          disclosureThreadId={
+                            threadId ??
+                            row.turn?.threadId ??
+                            row.user?.threadId ??
+                            row.work[0]?.threadId
+                          }
                           steps={row.work}
                           turn={row.turn}
                           approvals={row.approvals}

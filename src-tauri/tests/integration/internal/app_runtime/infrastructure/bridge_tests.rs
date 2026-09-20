@@ -4,7 +4,7 @@
 // 原生 bridge 单元测试与生产实现分文件，仍验证同一私有状态机。
 
 use super::*;
-use crate::app_runtime::WorkspacePathSearchInput;
+use crate::app_runtime::{TurnCancelInput, WorkspacePathSearchInput};
 use ja_runtime::app_server_process::TurnChangeSetReadResult as WireTurnChangeSetReadResult;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -346,6 +346,17 @@ fn approval_params_are_business_scoped() {
     assert!(value.get("requestId").is_none());
 }
 
+/// Cancel wire 只发送不可变 Turn identity；流式 Thread revision 不得进入 sidecar 参数。
+#[test]
+fn cancel_params_are_turn_id_only() {
+    let input = TurnCancelInput {
+        turn_id: "turn_demo".to_owned(),
+    };
+    let value = turn_cancel_params(&input).expect("cancel params");
+    assert_eq!(value, json!({"turnId": "turn_demo"}));
+    assert!(value.get("expectedThreadRevision").is_none());
+}
+
 /// 手动压缩错误必须保留稳定机器码与重试语义，且不得把 Java message 或 Provider 正文透传。
 #[test]
 fn context_compaction_errors_map_to_stable_command_failures() {
@@ -441,6 +452,18 @@ fn resume_errors_map_to_stable_retry_semantics() {
         assert_eq!(error.retryable, retryable);
         assert_ne!(error.message, "private execution state");
     }
+}
+
+/// 取消目标消失仍保留稳定 TURN_NOT_FOUND，前端才能触发权威重读而不是伪造终态。
+#[test]
+fn cancel_errors_map_turn_not_found() {
+    let error = command_error_from_rpc(&json!({
+        "message": "private turn detail",
+        "data": {"errorCode": "TURN_NOT_FOUND"}
+    }));
+    assert_eq!(error.code, "TURN_NOT_FOUND");
+    assert!(!error.retryable);
+    assert_ne!(error.message, "private turn detail");
 }
 
 /// Resume Accepted 必须精确回显请求 Turn，且 accepted/queued 都为 true、无额外状态字段。

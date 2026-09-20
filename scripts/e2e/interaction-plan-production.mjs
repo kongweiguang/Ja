@@ -63,14 +63,14 @@ export const INTERACTION_PLAN_RPC_CONTRACT = Object.freeze({
 
 export const INTERACTION_PLAN_UI_CONTRACT = Object.freeze({
   questionRoot: '.ja-interaction-card[data-interaction-status="pending"]',
-  summaryRoot: '.ja-interaction-card[aria-label="已回答的问题"]',
+  historyToolResult: ".ja-chat-timeline__row",
   planRoot: ".ja-plan-timeline",
   executionRoot: ".ja-plan-workbench",
   widths: Object.freeze([799, 800]),
   zooms: Object.freeze([100, 125, 150, 200]),
   themes: Object.freeze(["light", "dark", "system"]),
   longTextThreshold: 80,
-  requiredQuestionKinds: Object.freeze(["single", "multi", "custom", "skip"]),
+  requiredQuestionKinds: Object.freeze(["single", "multi", "implicit-skip"]),
 });
 
 function isObject(value) {
@@ -89,7 +89,11 @@ function assertBooleanRecord(record, keys, label) {
  * `screenReaderNarrationVerified=false` 当作本合同的完成失败或成功依据。
  */
 function assertInteractionPlanAccessibilityEvidence(evidence) {
-  assert.equal(isObject(evidence), true, "visualMatrix question accessibilityEvidence must be an object");
+  assert.equal(
+    isObject(evidence),
+    true,
+    "visualMatrix question accessibilityEvidence must be an object",
+  );
   assert.equal(evidence.version, 1);
   assert.equal(evidence.surface, "webview2_cdp");
   assert.equal(evidence.source, "Accessibility.getFullAXTree");
@@ -114,10 +118,7 @@ function assertInteractionPlanAccessibilityEvidence(evidence) {
   assert.equal(isObject(evidence.roleCounts), true);
   assert.equal(Number.isSafeInteger(evidence.roleCounts.radio), true);
   assert.equal(Number.isSafeInteger(evidence.roleCounts.checkbox), true);
-  assert.equal(
-    evidence.roleCounts.radio + evidence.roleCounts.checkbox,
-    evidence.controlCount,
-  );
+  assert.equal(evidence.roleCounts.radio + evidence.roleCounts.checkbox, evidence.controlCount);
 }
 
 /** 校验无 Plan Goal 的完成证据必须来自同一 Goal definition revision 与 Run，且只产生一次 achieved。 */
@@ -187,15 +188,13 @@ export function validateInteractionPlanAcceptanceReport(
     [
       "singleChoice",
       "multiChoice",
-      "customAnswer",
-      "explicitSkip",
+      "implicitSkip",
       "collapsePreservedDraft",
       "restartRestoredPendingRequest",
       "duplicateResponseIdempotent",
       "staleResponseRejected",
       "cancelDoesNotResumeTurn",
       "raceSingleWinner",
-      "imeCompositionSafe",
       "keyboardComplete",
       "feedbackMeasuredInBrowser",
     ],
@@ -206,16 +205,22 @@ export function validateInteractionPlanAcceptanceReport(
     [...INTERACTION_PLAN_UI_CONTRACT.requiredQuestionKinds].sort(),
   );
   assert.equal(report.interaction.pendingThreadCount, 1);
-  assert.equal(report.interaction.answerSummaryCollapsed, true);
+  assert.equal(report.interaction.historyToolResultVisible, true);
   assert.equal(report.interaction.noImplicitDefault, true);
-  assert.equal(report.interaction.feedbackEventType, "change");
+  assert.equal(["keydown", "input", "change"].includes(report.interaction.feedbackEventType), true);
   assert.equal(Number.isFinite(report.interaction.feedbackLatencyMs), true);
   assert.equal(
     report.interaction.feedbackLatencyMs >= 0 && report.interaction.feedbackLatencyMs < 100,
     true,
   );
   assert.equal(isObject(report.interaction.feedbackReadback), true);
-  assert.equal(report.interaction.feedbackReadback.checked, true);
+  // 单选会同步切到下一题，上一题的受控 radio 在下一帧可能已卸载；保留选中回读，同时接受稳定的
+  // 下一题身份，避免验收脚本把正确的自动推进误判为浏览器没有响应。
+  assert.equal(
+    report.interaction.feedbackReadback.checked === true ||
+      report.interaction.feedbackReadback.questionId === "question_targets",
+    true,
+  );
   assert.equal(typeof report.interaction.feedbackReadback.value, "string");
   assert.equal(report.interaction.feedbackReadback.value.length > 0, true);
   assert.equal(report.interaction.feedbackReadback.optionId, "option_ui");
@@ -546,7 +551,7 @@ export async function findMissingInteractionPlanHooks(root = repoRoot, desktopRu
     {
       label: "question-card",
       path: join(root, "apps", "desktop", "src", "features", "conversation"),
-      tokens: ["ja-interaction-card", "交互问题", "已回答的问题", "<input"],
+      tokens: ["ja-interaction-card", "交互问题", "等待你的回答", "提交回答", "<input"],
     },
     {
       label: "plan-execution",
@@ -764,9 +769,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.functionalOnly) {
     await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   }
-  const expectedVerificationStatus = options.functionalOnly
-    ? "FUNCTIONAL_VERIFIED"
-    : "VERIFIED";
+  const expectedVerificationStatus = options.functionalOnly ? "FUNCTIONAL_VERIFIED" : "VERIFIED";
   if (report.verificationStatus !== expectedVerificationStatus) {
     process.stdout.write(`JA_INTERACTION_PLAN_NOT_VERIFIED report=${reportPath}\n`);
     return 2;

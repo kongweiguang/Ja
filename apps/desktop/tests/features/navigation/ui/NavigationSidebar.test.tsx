@@ -420,7 +420,7 @@ describe("NavigationSidebar", () => {
   it("separates live Turn status from persisted unread reminders", () => {
     const statuses = [
       ["queued", "等待回复"],
-      ["running", "正在回复"],
+      ["running", "正在工作"],
       ["waiting_approval", "等待批准"],
       ["suspended", "回复已暂停"],
       ["completed", "有新回复"],
@@ -542,7 +542,7 @@ describe("NavigationSidebar", () => {
       />,
     );
 
-    const spinner = screen.getByRole("img", { name: "正在回复" });
+    const spinner = screen.getByRole("img", { name: "正在工作" });
     const threadButton = screen.getByRole("button", { name: "修复导航" });
     expect(spinner.closest(".ja-navigation-thread")).toBe(threadButton);
     expect(spinner).toHaveClass("ja-navigation-thread-state", "is-running");

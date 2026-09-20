@@ -158,6 +158,17 @@ describe("JA RPC v1 protocol", () => {
 
   it("requires the frozen v1 CAS wire shapes", () => {
     expect(
+      parseMethodParams("turn/cancel", {
+        turnId: "turn_demo",
+      }),
+    ).toEqual({ turnId: "turn_demo" });
+    expect(() =>
+      parseMethodParams("turn/cancel", {
+        turnId: "turn_demo",
+        expectedThreadRevision: 8,
+      }),
+    ).toThrow();
+    expect(
       parseMethodParams("turn/resume", {
         turnId: "turn_demo",
         expectedThreadRevision: 8,

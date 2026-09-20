@@ -35,6 +35,8 @@
   min-height: 0;
   flex: 1;
   overflow-y: auto;
+  /* Timeline 已按 Thread 与虚拟行身份显式恢复阅读锚点，禁用浏览器自动锚定以免流式增高被重复补偿。 */
+  overflow-anchor: none;
   overscroll-behavior: contain;
   /* 双侧预留让 800px Timeline rail 与滚动容器外的 Composer 共享同一中心线。 */
   scrollbar-gutter: stable both-edges;
@@ -105,6 +107,11 @@
   margin-bottom: 16px;
   padding-block: 0;
   transform-origin: left top;
+}
+
+/* 最终答复占据主要阅读轴，但不在宽窗口中拉成长行，便于连续扫描与代码说明阅读。 */
+.ja-chat-message-final .ja-chat-response__content {
+  width: min(100%, var(--ja-content-reading-width));
 }
 
 .ja-chat-message-failed {
@@ -632,6 +639,48 @@
   color: var(--ja-foreground-muted);
 }
 
+/* 宽表格只在自身容器横向滚动，不能把 Timeline、Workbench 或底部 Composer 推出视口。 */
+.ja-markdown__table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0.65rem 0;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-md);
+  background: var(--ja-surface-control);
+}
+
+.ja-markdown__table-wrap table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
+}
+
+.ja-markdown__table-wrap th,
+.ja-markdown__table-wrap td {
+  padding: 0.42rem 0.58rem;
+  border-right: 1px solid var(--ja-border);
+  border-bottom: 1px solid var(--ja-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.ja-markdown__table-wrap th:last-child,
+.ja-markdown__table-wrap td:last-child {
+  border-right: 0;
+}
+
+.ja-markdown__table-wrap tr:last-child td {
+  border-bottom: 0;
+}
+
+.ja-markdown__table-wrap th {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+  font-weight: var(--ja-weight-semibold);
+}
+
 /* 同一 Turn 的 Tool、File 与 Approval 共享单个紧凑 Disclosure Surface。 */
 .ja-work-process {
   container: ja-work-process / inline-size;
@@ -730,6 +779,10 @@
 }
 .ja-work-process__separator {
   color: var(--ja-foreground-tertiary);
+}
+/* 完成态会省略普通状态文案；第一个实际可见摘要不能留下悬空的前导分隔点。 */
+.ja-work-process__meta > span:first-of-type .ja-work-process__separator {
+  display: none;
 }
 .ja-work-process__duration,
 .ja-work-process__step-count {

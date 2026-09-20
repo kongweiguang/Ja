@@ -169,23 +169,21 @@ function validReport() {
     interaction: {
       singleChoice: true,
       multiChoice: true,
-      customAnswer: true,
-      explicitSkip: true,
+      implicitSkip: true,
       collapsePreservedDraft: true,
       restartRestoredPendingRequest: true,
       duplicateResponseIdempotent: true,
       staleResponseRejected: true,
       cancelDoesNotResumeTurn: true,
       raceSingleWinner: true,
-      imeCompositionSafe: true,
       keyboardComplete: true,
       feedbackMeasuredInBrowser: true,
       feedbackEventType: "change",
       feedbackLatencyMs: 8.25,
       feedbackReadback: { checked: true, value: "on", optionId: "option_ui" },
-      questionKinds: ["single", "multi", "custom", "skip"],
+      questionKinds: ["single", "multi", "implicit-skip"],
       pendingThreadCount: 1,
-      answerSummaryCollapsed: true,
+      historyToolResultVisible: true,
       noImplicitDefault: true,
     },
     readonly: {
@@ -361,7 +359,7 @@ test("driver 阶段按权威顺序采集，并拒绝缺失阶段", async () => {
   );
 });
 
-test("fixture 覆盖 single/multi/custom/skip、重启恢复与并发 CAS", () => {
+test("fixture 覆盖 single/multi/空白可选题、重启恢复与并发 CAS", () => {
   const fixture = createInteractionPlanStateFixture();
   const questions = [
     { id: "scope", kind: "single", required: true, options: [{ id: "safe", label: "安全" }] },
@@ -800,12 +798,14 @@ test("loopback Provider 场景只发结构化 Interaction Tool 且身份稳定",
   const questionIds = interactionPlanProviderScenario.questions.map(
     (question) => question.questionId,
   );
-  assert.deepEqual(questionIds, ["question_scope", "question_targets", "question_note"]);
+  assert.deepEqual(questionIds, ["question_scope", "question_targets"]);
   assert.match(interactionPlanToolStream(1), /request_user_input/u);
   assert.match(interactionPlanToolStream(1), /option_ui/u);
   assert.match(interactionPlanTextStream(2), /Interaction Plan/u);
   assert.equal(
     interactionPlanProviderScenario.questions.filter((question) => question.required).length,
-    2,
+    1,
   );
+  assert.equal(interactionPlanProviderScenario.questions[0]?.required, true);
+  assert.equal(interactionPlanProviderScenario.questions[1]?.required, false);
 });

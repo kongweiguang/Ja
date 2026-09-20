@@ -77,6 +77,21 @@ const pagedRequest = {
   ],
 };
 
+const threePageRequest = {
+  ...pagedRequest,
+  requestId: "input_three_pages",
+  questions: [
+    ...pagedRequest.questions,
+    {
+      ...request.questions[0]!,
+      questionId: "question_three",
+      prompt: "第三题",
+      type: "text" as const,
+      options: undefined,
+    },
+  ],
+};
+
 /** 创建可控异步边界，让测试确定性复现旧 Thread 结果晚到的竞态。 */
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -170,6 +185,30 @@ describe("useInteractionController", () => {
     expect(result.current.answers).toEqual({});
     expect(port.submit).not.toHaveBeenCalled();
     expect(port.read).not.toHaveBeenCalled();
+  });
+
+  it("提交时将未填写的可选题规范为 skipped，但不把它写入草稿", async () => {
+    const snapshot: InteractionSnapshot = {
+      threadId: "thr_one",
+      eventSequence: 1,
+      request,
+      draft: { revision: 1, answers: [] },
+    };
+    const port = portWith(snapshot);
+    const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
+    await waitFor(() => expect(result.current.request?.requestId).toBe("input_one"));
+
+    await act(async () => {
+      await result.current.submit();
+    });
+
+    expect(result.current.answers).toEqual({});
+    expect(port.saveDraft).not.toHaveBeenCalled();
+    expect(port.submit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        answers: [{ questionId: "question_one", optionIds: [], freeText: null, skipped: true }],
+      }),
+    );
   });
 
   it("多选数字快捷键只切换当前选项并保留其它选项", async () => {
@@ -274,16 +313,17 @@ describe("useInteractionController", () => {
     expect(port.submit).not.toHaveBeenCalled();
   });
 
-  it("restores draft page and collapsed state from snapshot without marking pending as answered", async () => {
+  it("restores the final draft page and collapsed state without marking pending as answered", async () => {
     const snapshot: InteractionSnapshot = {
       threadId: "thr_one",
       eventSequence: 9,
-      request,
-      draft: { revision: 4, answers: [], page: 0, collapsed: true },
+      request: threePageRequest,
+      draft: { revision: 4, answers: [], page: 2, collapsed: true },
     };
     const port = portWith(snapshot);
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
     await waitFor(() => expect(result.current.collapsed).toBe(true));
+    expect(result.current.pageIndex).toBe(2);
     expect(result.current.answered).toBe(false);
     expect(result.current.request?.status).toBe("pending");
   });

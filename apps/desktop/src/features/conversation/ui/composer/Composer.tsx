@@ -101,6 +101,7 @@ export type ComposerSubmit = ConversationSubmit;
 
 export type ComposerQueuedInputKind = "follow_up" | "steering";
 export type ComposerQueuedInputBusyAction = "prioritize" | "update" | "delete";
+export type ComposerInteractionPresentation = "none" | "expanded" | "collapsed";
 
 /**
  * Composer 只接收队列的可渲染投影；顺序、revision 与持久化仍由 application owner 决定，
@@ -123,6 +124,11 @@ export interface ComposerQueuedInputView {
 export interface ComposerProps {
   /** 非模态交互卡片由 composition 注入；Composer 只负责保持其与输入内容同一轨道。 */
   interactionSlot?: ReactNode;
+  /**
+   * pending Interaction 同时决定补充输入的提交语义与视觉密度；使用三态避免卡片已收起而
+   * Composer 仍被压缩，或待回答时错误恢复成普通新 Turn 输入。
+   */
+  interactionPresentation?: ComposerInteractionPresentation;
   /** 由当前 Thread owner 单调递增；用于从计划动作恢复输入焦点，不查询全局 DOM。 */
   focusRequest?: number;
   /** 未由 composition 显式传入时读取全局界面偏好；测试和嵌入宿主可注入稳定快照。 */
@@ -149,7 +155,6 @@ export interface ComposerProps {
   attachmentDraftItems?: readonly ConversationAttachmentDraftItem[];
   activeTurn?: boolean;
   suspendedTurn?: boolean;
-  awaitingUserInput?: boolean;
   disabled?: boolean;
   preferenceBusy?: boolean;
   importingAttachments?: boolean;
@@ -916,7 +921,7 @@ export function Composer({
   attachmentDraftItems,
   activeTurn = false,
   suspendedTurn = false,
-  awaitingUserInput = false,
+  interactionPresentation = "none",
   disabled = false,
   preferenceBusy = false,
   importingAttachments = false,
@@ -954,6 +959,8 @@ export function Composer({
   const storedSendShortcut = useSendShortcut();
   const sendShortcut = sendShortcutProp ?? storedSendShortcut;
   const sendShortcutHint = sendShortcut === "enter" ? "Enter" : "Ctrl/Cmd + Enter";
+  const awaitingUserInput = interactionPresentation !== "none";
+  const interactionPanelExpanded = interactionPresentation === "expanded";
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastSelectionRef = useRef({ start: text.length, end: text.length });
   const observedRecoveryRevisionRef = useRef(draftRecoveryRevision);
@@ -1693,11 +1700,12 @@ export function Composer({
         onSubmit={handleSubmit}
         aria-label="发送消息"
         data-state={composerState}
+        data-interaction-presentation={interactionPresentation}
         data-has-queue={queuedInputs.length > 0 || undefined}
         data-drop-active={dropActive || undefined}
         aria-busy={activeTurn || sending || cancelling || resuming || undefined}
       >
-        {goalStatus}
+        {interactionPanelExpanded ? null : goalStatus}
         {dropActive ? (
           <span className="ja-composer__drop-indicator" aria-hidden="true">
             <Plus />
@@ -1793,8 +1801,13 @@ export function Composer({
         <textarea
           ref={inputRef}
           className="ja-composer__input"
-          aria-label={inlineCommand?.argument?.placeholder ?? "消息"}
-          placeholder={inlineCommand?.argument?.placeholder ?? placeholder}
+          aria-label={
+            inlineCommand?.argument?.placeholder ?? (interactionPanelExpanded ? "补充要求" : "消息")
+          }
+          placeholder={
+            inlineCommand?.argument?.placeholder ??
+            (interactionPanelExpanded ? "都不合适？补充你的要求" : placeholder)
+          }
           aria-describedby={error || commandError ? feedbackId : undefined}
           aria-controls={visibleTrigger === undefined ? undefined : suggestionListId}
           aria-expanded={visibleTrigger !== undefined}
@@ -1871,7 +1884,7 @@ export function Composer({
                 )}
               </IconButton>
             )}
-            {preferences === undefined ? null : (
+            {interactionPanelExpanded || preferences === undefined ? null : (
               <Select
                 ariaLabel="访问模式"
                 size="compact"
@@ -1885,129 +1898,135 @@ export function Composer({
                 ]}
               />
             )}
-            {modeStatus}
+            {interactionPanelExpanded ? null : modeStatus}
           </div>
           <div className="ja-composer__trailing">
-            {contextUsage === undefined ? null : <ContextUsageIndicator usage={contextUsage} />}
-            <Menu modal={false}>
-              <MenuTrigger asChild>
-                <button
-                  type="button"
-                  className="ja-composer__model-trigger"
-                  aria-label={selectionAccessibilityLabel}
-                  title={selectionAccessibilityLabel}
-                  disabled={disabled || preferenceBusy || models.length === 0}
+            {interactionPanelExpanded || contextUsage === undefined ? null : (
+              <ContextUsageIndicator usage={contextUsage} />
+            )}
+            {interactionPanelExpanded ? null : (
+              <Menu modal={false}>
+                <MenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="ja-composer__model-trigger"
+                    aria-label={selectionAccessibilityLabel}
+                    title={selectionAccessibilityLabel}
+                    disabled={disabled || preferenceBusy || models.length === 0}
+                  >
+                    <span>{selectionLabel}</span>
+                    <ChevronDown aria-hidden="true" />
+                  </button>
+                </MenuTrigger>
+                <MenuContent
+                  className="ja-composer__selection-menu"
+                  align="end"
+                  aria-label="模型与推理设置"
                 >
-                  <span>{selectionLabel}</span>
-                  <ChevronDown aria-hidden="true" />
-                </button>
-              </MenuTrigger>
-              <MenuContent
-                className="ja-composer__selection-menu"
-                align="end"
-                aria-label="模型与推理设置"
-              >
-                <MenuRadioGroup
-                  value={selectedModel?.value ?? ""}
-                  onValueChange={(value) => onModelChange?.(value)}
-                  aria-label="模型"
-                >
-                  {groupedModels.map((group, groupIndex) => (
-                    <div key={group.providerId} className="ja-composer__provider-group">
-                      {groupIndex === 0 ? null : <MenuSeparator />}
-                      <MenuLabel className="ja-composer__provider-label" title={group.label}>
-                        {group.label}
-                      </MenuLabel>
-                      {group.options.map((option) => (
-                        <MenuRadioItem
-                          key={option.value}
-                          value={option.value}
-                          disabled={onModelChange === undefined}
-                          className="ja-composer__radio-item ja-composer__model-item"
-                          title={`${option.modelIdentifier} · ${group.label}`}
-                        >
-                          <span className="ja-composer__model-copy">
-                            <span>{option.modelIdentifier}</span>
-                            {option.alias === undefined ? null : <small>{option.alias}</small>}
-                          </span>
-                          <MenuItemIndicator className="ja-composer__radio-indicator">
-                            <Check aria-hidden="true" />
-                          </MenuItemIndicator>
-                        </MenuRadioItem>
-                      ))}
-                    </div>
-                  ))}
-                </MenuRadioGroup>
-                {selectedModel !== undefined &&
-                Object.keys(selectedModel.reasoningLevelMap).length > 0 ? (
-                  <>
-                    <MenuSeparator />
-                    <MenuSub>
-                      <MenuSubTrigger className="ja-composer__selection-row">
-                        <span>推理强度</span>
-                        <span className="ja-composer__selection-current">
-                          {preferences?.reasoningLevel === null
-                            ? "跟随模型"
-                            : selectedReasoning === null
-                              ? "默认"
-                              : reasoningLabel(selectedReasoning)}
-                        </span>
-                        <ChevronRight aria-hidden="true" />
-                      </MenuSubTrigger>
-                      <MenuSubContent alignOffset={-4} aria-label="选择推理强度">
-                        <MenuRadioGroup
-                          value={preferences?.reasoningLevel ?? MODEL_DEFAULT_REASONING_VALUE}
-                          onValueChange={(value) =>
-                            onReasoningChange?.(
-                              value === MODEL_DEFAULT_REASONING_VALUE
-                                ? null
-                                : (value as ReasoningLevel),
-                            )
-                          }
-                        >
+                  <MenuRadioGroup
+                    value={selectedModel?.value ?? ""}
+                    onValueChange={(value) => onModelChange?.(value)}
+                    aria-label="模型"
+                  >
+                    {groupedModels.map((group, groupIndex) => (
+                      <div key={group.providerId} className="ja-composer__provider-group">
+                        {groupIndex === 0 ? null : <MenuSeparator />}
+                        <MenuLabel className="ja-composer__provider-label" title={group.label}>
+                          {group.label}
+                        </MenuLabel>
+                        {group.options.map((option) => (
                           <MenuRadioItem
-                            value={MODEL_DEFAULT_REASONING_VALUE}
-                            disabled={onReasoningChange === undefined}
-                            className="ja-composer__radio-item"
+                            key={option.value}
+                            value={option.value}
+                            disabled={onModelChange === undefined}
+                            className="ja-composer__radio-item ja-composer__model-item"
+                            title={`${option.modelIdentifier} · ${group.label}`}
                           >
-                            <span>跟随模型默认</span>
+                            <span className="ja-composer__model-copy">
+                              <span>{option.modelIdentifier}</span>
+                              {option.alias === undefined ? null : <small>{option.alias}</small>}
+                            </span>
                             <MenuItemIndicator className="ja-composer__radio-indicator">
                               <Check aria-hidden="true" />
                             </MenuItemIndicator>
                           </MenuRadioItem>
-                          {(Object.keys(selectedModel.reasoningLevelMap) as ReasoningLevel[]).map(
-                            (effort) => (
-                              <MenuRadioItem
-                                key={effort}
-                                value={effort}
-                                disabled={onReasoningChange === undefined}
-                                className="ja-composer__radio-item"
-                              >
-                                <span>{reasoningLabel(effort)}</span>
-                                <MenuItemIndicator className="ja-composer__radio-indicator">
-                                  <Check aria-hidden="true" />
-                                </MenuItemIndicator>
-                              </MenuRadioItem>
-                            ),
-                          )}
-                        </MenuRadioGroup>
-                      </MenuSubContent>
-                    </MenuSub>
-                  </>
-                ) : null}
-                {onRestoreDefaults === undefined ? null : (
-                  <>
-                    <MenuSeparator />
-                    <MenuItem onSelect={() => void onRestoreDefaults()}>恢复默认设置</MenuItem>
-                  </>
-                )}
-              </MenuContent>
-            </Menu>
+                        ))}
+                      </div>
+                    ))}
+                  </MenuRadioGroup>
+                  {selectedModel !== undefined &&
+                  Object.keys(selectedModel.reasoningLevelMap).length > 0 ? (
+                    <>
+                      <MenuSeparator />
+                      <MenuSub>
+                        <MenuSubTrigger className="ja-composer__selection-row">
+                          <span>推理强度</span>
+                          <span className="ja-composer__selection-current">
+                            {preferences?.reasoningLevel === null
+                              ? "跟随模型"
+                              : selectedReasoning === null
+                                ? "默认"
+                                : reasoningLabel(selectedReasoning)}
+                          </span>
+                          <ChevronRight aria-hidden="true" />
+                        </MenuSubTrigger>
+                        <MenuSubContent alignOffset={-4} aria-label="选择推理强度">
+                          <MenuRadioGroup
+                            value={preferences?.reasoningLevel ?? MODEL_DEFAULT_REASONING_VALUE}
+                            onValueChange={(value) =>
+                              onReasoningChange?.(
+                                value === MODEL_DEFAULT_REASONING_VALUE
+                                  ? null
+                                  : (value as ReasoningLevel),
+                              )
+                            }
+                          >
+                            <MenuRadioItem
+                              value={MODEL_DEFAULT_REASONING_VALUE}
+                              disabled={onReasoningChange === undefined}
+                              className="ja-composer__radio-item"
+                            >
+                              <span>跟随模型默认</span>
+                              <MenuItemIndicator className="ja-composer__radio-indicator">
+                                <Check aria-hidden="true" />
+                              </MenuItemIndicator>
+                            </MenuRadioItem>
+                            {(Object.keys(selectedModel.reasoningLevelMap) as ReasoningLevel[]).map(
+                              (effort) => (
+                                <MenuRadioItem
+                                  key={effort}
+                                  value={effort}
+                                  disabled={onReasoningChange === undefined}
+                                  className="ja-composer__radio-item"
+                                >
+                                  <span>{reasoningLabel(effort)}</span>
+                                  <MenuItemIndicator className="ja-composer__radio-indicator">
+                                    <Check aria-hidden="true" />
+                                  </MenuItemIndicator>
+                                </MenuRadioItem>
+                              ),
+                            )}
+                          </MenuRadioGroup>
+                        </MenuSubContent>
+                      </MenuSub>
+                    </>
+                  ) : null}
+                  {onRestoreDefaults === undefined ? null : (
+                    <>
+                      <MenuSeparator />
+                      <MenuItem onSelect={() => void onRestoreDefaults()}>恢复默认设置</MenuItem>
+                    </>
+                  )}
+                </MenuContent>
+              </Menu>
+            )}
             {suspendedTurn ? (
               <>
-                <span className="ja-composer__interruption" role="status">
-                  已暂停
-                </span>
+                {interactionPanelExpanded ? null : (
+                  <span className="ja-composer__interruption" role="status">
+                    已暂停
+                  </span>
+                )}
                 <IconButton
                   type="button"
                   className="ja-composer__action-button is-cancel"

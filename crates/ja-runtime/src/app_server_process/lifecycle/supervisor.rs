@@ -696,11 +696,7 @@ pub(crate) fn validate_turn_identity(
                         .is_some_and(|millis| (1_000..=86_400_000).contains(&millis))
                 })
         }
-        "turn/cancel" => {
-            exact_keys(&["turnId", "expectedThreadRevision"])
-                && valid_id("turnId", "turn_", 101)
-                && valid_revision("expectedThreadRevision")
-        }
+        "turn/cancel" => exact_keys(&["turnId"]) && valid_id("turnId", "turn_", 101),
         "turn/input/enqueue" => {
             exact_keys(&["turnId", "content"])
                 && valid_id("turnId", "turn_", 101)

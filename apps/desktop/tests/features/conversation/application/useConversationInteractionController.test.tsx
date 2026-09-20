@@ -949,7 +949,7 @@ describe("useConversationInteractionController", () => {
     expect(result.current.activeTurn).toBe(false);
   });
 
-  it("取消冻结点击时的 Turn revision，切换 Thread 后不改变 CAS", async () => {
+  it("取消只冻结 Turn identity，切换 Thread 后迟到 ACK 不污染当前会话", async () => {
     prepareThread();
     useTimelineStore.getState().applyTurnAccepted({
       threadId: "thr_one",
@@ -973,7 +973,6 @@ describe("useConversationInteractionController", () => {
     });
     expect(turnPort.cancelTurn).toHaveBeenCalledWith({
       turnId: "turn_cancel",
-      expectedThreadRevision: 1,
     });
     rerender(options(turnPort, modelPort, { threadId: "thr_two", workspaceId: "ws_two" }));
     await act(async () => {
@@ -987,6 +986,501 @@ describe("useConversationInteractionController", () => {
     });
     expect(turnPort.cancelTurn).toHaveBeenCalledTimes(1);
     expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+    expect(useTimelineStore.getState().resyncRequired["thr_two"]).toBeUndefined();
+  });
+
+  /** 卸载发生在 cancel ACK 之前时，迟到 continuation 不能重新建立 resync 或 reconciliation timer。 */
+  it("卸载后迟到 cancel ACK 不重新建立对账", async () => {
+    vi.useFakeTimers();
+    try {
+      prepareThread();
+      useTimelineStore.getState().applyTurnAccepted({
+        threadId: "thr_one",
+        turnId: "turn_cancel_unmounted",
+        threadRevision: 1,
+        submittedText: "执行任务",
+        submittedAt: "2026-08-28T00:00:01Z",
+      });
+      const cancellation = deferred<ConversationCancelResult>();
+      const turnPort = createTurnPort();
+      vi.mocked(turnPort.cancelTurn).mockImplementation(() => cancellation.promise);
+      const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+      const { result, unmount } = renderHook(() =>
+        useConversationInteractionController(options(turnPort, modelPort)),
+      );
+
+      let pending!: Promise<void>;
+      act(() => {
+        pending = result.current.cancel();
+      });
+      unmount();
+      await act(async () => {
+        cancellation.resolve({
+          accepted: true,
+          turnId: "turn_cancel_unmounted",
+          status: "running",
+          threadRevision: 2,
+        });
+        await pending;
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** 非终态 ACK 只确认服务端已接纳；到 terminal 前再次点击必须保持 single-flight。 */
+  it("非终态取消 ACK 保持 guard，双击只发送一次并在终态事件后释放", async () => {
+    prepareThread();
+    useTimelineStore.getState().applyTurnAccepted({
+      threadId: "thr_one",
+      turnId: "turn_cancel_guard",
+      threadRevision: 1,
+      submittedText: "执行任务",
+      submittedAt: "2026-08-28T00:00:01Z",
+    });
+    const cancellation = deferred<ConversationCancelResult>();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockImplementation(() => cancellation.promise);
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, modelPort)),
+    );
+
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.cancel();
+      second = result.current.cancel();
+    });
+    expect(turnPort.cancelTurn).toHaveBeenCalledTimes(1);
+    expect(result.current.cancelling).toBe(true);
+    await act(async () => {
+      cancellation.resolve({
+        accepted: true,
+        turnId: "turn_cancel_guard",
+        status: "running",
+        threadRevision: 3,
+      });
+      await Promise.all([first, second]);
+    });
+    expect(result.current.cancelling).toBe(true);
+
+    act(() => {
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId: "thr_one",
+          revision: 4,
+          turns: [
+            {
+              turnId: "turn_cancel_guard",
+              status: "cancelled",
+              requestedAt: "2026-08-28T00:00:01Z",
+              updatedAt: "2026-08-28T00:00:04Z",
+              completedAt: "2026-08-28T00:00:04Z",
+              errorCode: null,
+              changeSet: null,
+            },
+          ],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          taskActivities: [],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+    });
+    await waitFor(() => expect(result.current.cancelling).toBe(false));
+    expect(useTimelineStore.getState().turns["turn_cancel_guard"]?.status).toBe("cancelled");
+  });
+
+  /** 恢复 active Turn 超过 2 秒仍不猜测终态，权威 terminal snapshot 到达后才解锁视图。 */
+  it("恢复 active Turn 持续对账，迟到 terminal 仍能解锁", async () => {
+    vi.useFakeTimers();
+    try {
+      prepareThread();
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId: "thr_one",
+          revision: 1,
+          turns: [
+            {
+              turnId: "turn_recovered_active",
+              status: "running",
+              requestedAt: "2026-08-28T00:00:01Z",
+              updatedAt: "2026-08-28T00:00:02Z",
+              completedAt: null,
+              errorCode: null,
+              changeSet: null,
+            },
+          ],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          taskActivities: [],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+      const turnPort = createTurnPort();
+      const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+      const { result } = renderHook(() =>
+        useConversationInteractionController(options(turnPort, modelPort)),
+      );
+
+      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+      expect(result.current.activeTurn).toBe(true);
+
+      act(() => {
+        useTimelineStore.getState().applySnapshot(
+          {
+            threadId: "thr_one",
+            revision: 2,
+            turns: [
+              {
+                turnId: "turn_recovered_active",
+                status: "completed",
+                requestedAt: "2026-08-28T00:00:01Z",
+                updatedAt: "2026-08-28T00:00:05Z",
+                completedAt: "2026-08-28T00:00:05Z",
+                errorCode: null,
+                changeSet: null,
+              },
+            ],
+            items: [],
+            inputQueue: null,
+            contextUsage: null,
+            taskActivities: [],
+            goalActivities: [],
+            nextCursor: null,
+          },
+          "ws_one",
+        );
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.activeTurn).toBe(false);
+      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** recovered active Turn 取消失败后必须清除旧 key 并恢复唯一 reconciliation 链。 */
+  it("恢复 active Turn 取消失败后可恢复对账并收敛 terminal", async () => {
+    vi.useFakeTimers();
+    try {
+      prepareThread();
+      const activeSnapshot = {
+        threadId: "thr_one",
+        revision: 1,
+        turns: [
+          {
+            turnId: "turn_recovered_cancel_reject",
+            status: "running" as const,
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      };
+      useTimelineStore.getState().applySnapshot(activeSnapshot, "ws_one");
+      const requestResync = vi.spyOn(useTimelineStore.getState(), "requestThreadResync");
+      const turnPort = createTurnPort();
+      vi.mocked(turnPort.cancelTurn).mockRejectedValueOnce({ code: "RUNTIME_UNAVAILABLE" });
+      const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+      const { result } = renderHook(() =>
+        useConversationInteractionController(options(turnPort, modelPort)),
+      );
+
+      expect(requestResync).toHaveBeenCalledTimes(1);
+      await act(async () => result.current.cancel());
+      expect(result.current.cancelling).toBe(false);
+
+      act(() => {
+        useTimelineStore.getState().applySnapshot({ ...activeSnapshot, revision: 2 }, "ws_one");
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(requestResync.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+      act(() => {
+        useTimelineStore.getState().applySnapshot(
+          {
+            ...activeSnapshot,
+            revision: 3,
+            turns: [
+              {
+                turnId: "turn_recovered_cancel_reject",
+                requestedAt: "2026-08-28T00:00:01Z",
+                updatedAt: "2026-08-28T00:00:04Z",
+                status: "completed",
+                completedAt: "2026-08-28T00:00:04Z",
+                errorCode: null,
+                changeSet: null,
+              },
+            ],
+          },
+          "ws_one",
+        );
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.activeTurn).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** recovered waiting states are user-driven and must not become a periodic read loop. */
+  it("waiting_approval 与 suspended 恢复态不启动持续对账", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const status of ["waiting_approval", "suspended"] as const) {
+        prepareThread();
+        useTimelineStore.getState().applySnapshot(
+          {
+            threadId: "thr_one",
+            revision: 1,
+            turns: [
+              {
+                turnId: `turn_waiting_${status}`,
+                status,
+                requestedAt: "2026-08-28T00:00:01Z",
+                updatedAt: "2026-08-28T00:00:02Z",
+                completedAt: null,
+                errorCode: null,
+                changeSet: null,
+              },
+            ],
+            items: [],
+            inputQueue: null,
+            contextUsage: null,
+            taskActivities: [],
+            goalActivities: [],
+            nextCursor: null,
+          },
+          "ws_one",
+        );
+        const requestResync = vi.spyOn(useTimelineStore.getState(), "requestThreadResync");
+        const turnPort = createTurnPort();
+        const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+        const { unmount } = renderHook(() =>
+          useConversationInteractionController(options(turnPort, modelPort)),
+        );
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(20_000);
+        });
+        expect(requestResync).not.toHaveBeenCalled();
+        unmount();
+        requestResync.mockRestore();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** 持续 reconciliation 只使用约定的 500ms、1s、2s、5s 退避阶梯，不出现 4s 间隔。 */
+  it("恢复 active Turn 使用精确退避阶梯", async () => {
+    vi.useFakeTimers();
+    try {
+      prepareThread();
+      const snapshot = {
+        threadId: "thr_one",
+        revision: 1,
+        turns: [
+          {
+            turnId: "turn_backoff",
+            status: "running" as const,
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      };
+      useTimelineStore.getState().applySnapshot(snapshot, "ws_one");
+      const requestResync = vi.spyOn(useTimelineStore.getState(), "requestThreadResync");
+      const turnPort = createTurnPort();
+      const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+      renderHook(() => useConversationInteractionController(options(turnPort, modelPort)));
+      expect(requestResync).toHaveBeenCalledTimes(1);
+
+      const clearResync = (revision: number): void => {
+        act(() => useTimelineStore.getState().applySnapshot({ ...snapshot, revision }, "ws_one"));
+      };
+      clearResync(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(499);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(2);
+      clearResync(3);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(999);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(3);
+      clearResync(4);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_999);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(3);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(4);
+      clearResync(5);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4_999);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(4);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(requestResync).toHaveBeenCalledTimes(5);
+      requestResync.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** 切换 Thread 只暂停取消重读；切回后继续同一 Turn 对账，隐藏会话不触发 IO。 */
+  it("切换 Thread 暂停并在切回后恢复取消对账", async () => {
+    vi.useFakeTimers();
+    try {
+      prepareThread();
+      useTimelineStore.getState().applyTurnAccepted({
+        threadId: "thr_one",
+        turnId: "turn_cancel_visibility",
+        threadRevision: 1,
+        submittedText: "执行任务",
+        submittedAt: "2026-08-28T00:00:01Z",
+      });
+      const cancellation = deferred<ConversationCancelResult>();
+      const turnPort = createTurnPort();
+      vi.mocked(turnPort.cancelTurn).mockImplementation(() => cancellation.promise);
+      const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+      const { result, rerender } = renderHook(
+        (props: ConversationInteractionOptions) => useConversationInteractionController(props),
+        { initialProps: options(turnPort, modelPort) },
+      );
+
+      let pending!: Promise<void>;
+      act(() => {
+        pending = result.current.cancel();
+      });
+      await act(async () => {
+        cancellation.resolve({
+          accepted: true,
+          turnId: "turn_cancel_visibility",
+          status: "running",
+          threadRevision: 2,
+        });
+        await pending;
+      });
+      act(() => {
+        useTimelineStore.getState().applySnapshot(
+          {
+            threadId: "thr_one",
+            revision: 2,
+            turns: [
+              {
+                turnId: "turn_cancel_visibility",
+                status: "running",
+                requestedAt: "2026-08-28T00:00:01Z",
+                updatedAt: "2026-08-28T00:00:03Z",
+                completedAt: null,
+                errorCode: null,
+                changeSet: null,
+              },
+            ],
+            items: [],
+            inputQueue: null,
+            contextUsage: null,
+            taskActivities: [],
+            goalActivities: [],
+            nextCursor: null,
+          },
+          "ws_one",
+        );
+      });
+      rerender(options(turnPort, modelPort, { threadId: "thr_two", workspaceId: "ws_two" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6_000);
+      });
+      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+
+      rerender(options(turnPort, modelPort));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
+
+      act(() => {
+        useTimelineStore.getState().applySnapshot(
+          {
+            threadId: "thr_one",
+            revision: 3,
+            turns: [
+              {
+                turnId: "turn_cancel_visibility",
+                status: "cancelled",
+                requestedAt: "2026-08-28T00:00:01Z",
+                updatedAt: "2026-08-28T00:00:04Z",
+                completedAt: "2026-08-28T00:00:04Z",
+                errorCode: null,
+                changeSet: null,
+              },
+            ],
+            items: [],
+            inputQueue: null,
+            contextUsage: null,
+            taskActivities: [],
+            goalActivities: [],
+            nextCursor: null,
+          },
+          "ws_one",
+        );
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.cancelling).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   /** 取消 ACK 已确认终态但没有 live event 时，只请求权威重读，不伪造 Timeline 终态。 */
@@ -1032,11 +1526,40 @@ describe("useConversationInteractionController", () => {
 
     expect(turnPort.cancelTurn).toHaveBeenCalledWith({
       turnId: "turn_cancel_terminal",
-      expectedThreadRevision: 4,
     });
+    expect(result.current.cancelling).toBe(true);
     expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
     expect(useTimelineStore.getState().turns["turn_cancel_terminal"]?.status).toBe("suspended");
     expect(result.current.suspendedTurn).toBe(true);
+
+    act(() => {
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId: "thr_one",
+          revision: 5,
+          turns: [
+            {
+              turnId: "turn_cancel_terminal",
+              status: "cancelled",
+              requestedAt: "2026-08-28T00:00:01Z",
+              updatedAt: "2026-08-28T00:00:05Z",
+              completedAt: "2026-08-28T00:00:05Z",
+              errorCode: null,
+              changeSet: null,
+            },
+          ],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          taskActivities: [],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+    });
+    await waitFor(() => expect(result.current.cancelling).toBe(false));
+    expect(result.current.suspendedTurn).toBe(false);
   });
 
   /** 迟到 ACK 仍携带原始 Thread 身份，切换会话后不得让当前 Thread 进入重读态。 */
@@ -1091,7 +1614,7 @@ describe("useConversationInteractionController", () => {
       await pending;
     });
 
-    expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
     expect(useTimelineStore.getState().resyncRequired["thr_two"]).toBeUndefined();
   });
 
@@ -1134,6 +1657,10 @@ describe("useConversationInteractionController", () => {
     expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
     expect(useTimelineStore.getState().turns["turn_cancel_failure"]?.status).toBe("suspended");
     expect(result.current.error).toBe("取消失败，请稍后重试。");
+    expect(result.current.cancelling).toBe(false);
+
+    await act(async () => result.current.cancel());
+    expect(turnPort.cancelTurn).toHaveBeenCalledTimes(2);
   });
 
   /** 组合层提供 Portal 反馈时，取消失败不再占据 Composer 底部的持久错误行。 */
@@ -1176,6 +1703,64 @@ describe("useConversationInteractionController", () => {
     await act(async () => result.current.cancel());
 
     expect(reportTransientError).toHaveBeenCalledWith("取消失败，请稍后重试。");
+    expect(result.current.error).toBeUndefined();
+  });
+
+  /** 失败 ACK 晚于会话切换时，旧 Thread 的错误不能通过 Portal 弹到当前 Thread。 */
+  it("切换 Thread 后迟到取消失败不弹当前会话 Toast", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_cancel_late_failure",
+            status: "suspended",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const cancellation = deferred<ConversationCancelResult>();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockImplementation(() => cancellation.promise);
+    const reportTransientError = vi.fn();
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const initial = options(turnPort, modelPort, { onTransientError: reportTransientError });
+    const { result, rerender } = renderHook(
+      (props: ConversationInteractionOptions) => useConversationInteractionController(props),
+      { initialProps: initial },
+    );
+
+    let pending!: Promise<void>;
+    act(() => {
+      pending = result.current.cancel();
+    });
+    rerender(
+      options(turnPort, modelPort, {
+        threadId: "thr_two",
+        workspaceId: "ws_two",
+        onTransientError: reportTransientError,
+      }),
+    );
+    await act(async () => {
+      cancellation.reject(new Error("late cancel failure"));
+      await pending;
+    });
+
+    expect(reportTransientError).not.toHaveBeenCalled();
     expect(result.current.error).toBeUndefined();
   });
 

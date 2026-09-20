@@ -86,7 +86,6 @@ export interface TurnResumeInput {
 
 export interface TurnCancelInput {
   turnId: string;
-  expectedThreadRevision: number;
 }
 
 export interface TurnCancelResult {
@@ -317,6 +316,7 @@ export type RuntimeApplicationErrorCode =
   | "RUNTIME_UNAVAILABLE"
   | "RECOVERY_REQUIRED"
   | "RUNTIME_NOT_READY"
+  | "TURN_NOT_FOUND"
   | "TURN_NOT_RESUMABLE"
   | "TURN_RESUME_ORDER_CONFLICT"
   | "TURN_INPUT_QUEUE_FULL"
@@ -332,6 +332,7 @@ const RUNTIME_ERROR_CATALOG: Record<
   RUNTIME_UNAVAILABLE: { message: "运行时暂不可用", retryable: true },
   RECOVERY_REQUIRED: { message: "需要先完成运行时恢复", retryable: false },
   RUNTIME_NOT_READY: { message: "运行时尚未就绪，请重试", retryable: true },
+  TURN_NOT_FOUND: { message: "运行不存在或已结束", retryable: false },
   TURN_NOT_RESUMABLE: { message: "当前运行无法继续", retryable: false },
   TURN_RESUME_ORDER_CONFLICT: { message: "请先处理更早中断的运行", retryable: true },
   TURN_INPUT_QUEUE_FULL: { message: "排队消息已满，请等待处理后再发送", retryable: true },

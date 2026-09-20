@@ -244,15 +244,13 @@ fn valid_relative_reference_path(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct TurnCancelInput {
     pub turn_id: String,
-    pub expected_thread_revision: u64,
 }
 
 impl TurnCancelInput {
-    /// 校验冻结 Turn identity 与 revision；wire envelope 只由 infrastructure 创建。
+    /// 校验冻结 Turn identity；自然终态与重复取消由 Java owner 幂等收敛，不能用流式 revision
+    /// 在 host 侧拒绝一个仍然存在的活动 Turn。
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
-        if !valid_frozen_turn_id(&self.turn_id)
-            || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
-        {
+        if !valid_frozen_turn_id(&self.turn_id) {
             return Err(DomainValidationError);
         }
         Ok(())

@@ -165,9 +165,9 @@ describe("RuntimeHost v1 typed adapter", () => {
     await expect(
       adapter.turnStart({ threadId: "thr_fixture", content: [{ type: "text", text: "hello" }] }),
     ).resolves.toMatchObject({ accepted: true });
-    await expect(
-      adapter.turnCancel({ turnId: "turn_fixture", expectedThreadRevision: 1 }),
-    ).resolves.toMatchObject({ status: "cancelled" });
+    await expect(adapter.turnCancel({ turnId: "turn_fixture" })).resolves.toMatchObject({
+      status: "cancelled",
+    });
     await expect(
       adapter.turnResume({ turnId: "turn_fixture", expectedThreadRevision: 1 }),
     ).resolves.toEqual({
@@ -218,6 +218,9 @@ describe("RuntimeHost v1 typed adapter", () => {
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnResume, {
       input: { turnId: "turn_fixture", expectedThreadRevision: 1 },
+    });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnCancel, {
+      input: { turnId: "turn_fixture" },
     });
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("configRevision");
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("profileId");
@@ -843,6 +846,11 @@ describe("RuntimeHost v1 typed adapter", () => {
       code: "TURN_RESUME_ORDER_CONFLICT",
       message: "请先处理更早中断的运行",
       retryable: true,
+    });
+    expect(normalizeRuntimeError({ code: "TURN_NOT_FOUND" })).toMatchObject({
+      code: "TURN_NOT_FOUND",
+      message: "运行不存在或已结束",
+      retryable: false,
     });
     const malformed = new TauriRuntimeHostAdapter(
       createBridge({

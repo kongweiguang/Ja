@@ -162,7 +162,6 @@ final class AgentTurnExecution {
                 AssistantRequestResources[] assistantRequest = new AssistantRequestResources[1];
                 try {
                     TurnExecutionPlan planningCommand = planningRuntime.plan();
-                    planningMcp.open(planningCommand.toolSessions(), cancellation);
                     String summaryAtRequestStart = lastSummary;
                     ContextOrchestrator contexts = contextFactory.create(planningCommand.threadId(), () -> {
                         TurnExecutionPlan.RequestRuntime latest = request.openRequestRuntime(
@@ -181,8 +180,15 @@ final class AgentTurnExecution {
                             if (!transferred) latest.close();
                         }
                     }, new DurableSummaryOperation(request, state, sink));
-                    List<AgentTool> planningTools = new ArrayList<>(planningCommand.tools());
-                    planningTools.addAll(planningMcp.tools());
+                    boolean toolsAvailable = toolsAvailable(request, state, round);
+                    List<AgentTool> planningTools;
+                    if (toolsAvailable) {
+                        planningMcp.open(planningCommand.toolSessions(), cancellation);
+                        planningTools = new ArrayList<>(planningCommand.tools());
+                        planningTools.addAll(planningMcp.tools());
+                    } else {
+                        planningTools = List.of();
+                    }
                     List<AgentTool> planningCatalog = contextMapper.toolCatalog(planningTools);
                     List<io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec> planningToolSpecs =
                             planningCatalog.stream().map(AgentTool::spec).toList();
@@ -315,9 +321,14 @@ final class AgentTurnExecution {
                                         boolean transferred = false;
                                         try {
                                             TurnExecutionPlan dispatchCommand = dispatchRuntime.plan();
-                                            dispatchMcp.open(dispatchCommand.toolSessions(), cancellation);
-                                            List<AgentTool> dispatchTools = new ArrayList<>(dispatchCommand.tools());
-                                            dispatchTools.addAll(dispatchMcp.tools());
+                                            List<AgentTool> dispatchTools;
+                                            if (toolsAvailable) {
+                                                dispatchMcp.open(dispatchCommand.toolSessions(), cancellation);
+                                                dispatchTools = new ArrayList<>(dispatchCommand.tools());
+                                                dispatchTools.addAll(dispatchMcp.tools());
+                                            } else {
+                                                dispatchTools = List.of();
+                                            }
                                             List<AgentTool> dispatchCatalog = contextMapper.toolCatalog(dispatchTools);
                                             Map<String, AgentTool> dispatchToolCatalog =
                                                     TurnExecutionPlan.createToolCatalog(dispatchCatalog);
@@ -439,7 +450,8 @@ final class AgentTurnExecution {
                         continued = commitModelStep(request, command, state, sink,
                                 new ModelMessage(ModelRole.ASSISTANT, collector.assistantContent()),
                                 collector.reasoningSummary(), collector.usage(), round, List.of(), toolCatalog,
-                                promptCheckpointId, pending(state.execution), true);
+                                promptCheckpointId, pending(state.execution),
+                                round < request.limits().maxModelRounds());
                     } finally {
                         /* emitWithNextInput 可能先提交 AssistantFact、再在事件投影或队首挂起处失败；
                          * 只看异常会把已持久化的 reasoning 摘要误判为草稿，终态随后重复写入。 */
@@ -840,7 +852,8 @@ final class AgentTurnExecution {
      * 将 Assistant、Usage 与可选 Tool batch 作为一次持久事实提交；稳定 Operation 提供 CAS 身份，
      * requestRuntime 提供实际生成该 batch 的脱敏边界，防止环境热更新后误用首轮 Secret 快照。
      * STOP continuation 还要求存储在同一事务追加下一条排队输入，避免纯文本 settlement 与 USER
-     * Message 跨事务倒序或断裂。
+     * Message 跨事务倒序或断裂。返回值只表示本次事务是否实际消费了下一条排队输入；普通提交
+     * 必须返回 false，避免调用方把已完成答复误判为仍需下一轮。
      */
     private boolean commitModelStep(
             TurnExecutionPlan request,
@@ -907,7 +920,7 @@ final class AgentTurnExecution {
                     requestUsage(pending, usage, round), sink);
         }
         persistence.emit(request, state, event, facts, nextExecution, sink);
-        return true;
+        return false;
     }
 
     /**
@@ -1108,6 +1121,16 @@ final class AgentTurnExecution {
             throw new AgentLoop.LoopFailure("BUDGET_EXCEEDED", "Tool call limit reached");
         }
         state.toolCalls += count;
+    }
+
+    /**
+     * 最后一个 Provider 名额必须保留给无副作用的最终答复；Tool 预算耗尽后也停止继续暴露能力，
+     * 避免已成功执行的工作因为缺少下一轮总结机会而被错误终止为预算失败。
+     */
+    private static boolean toolsAvailable(
+            TurnExecutionPlan request, AgentLoop.RuntimeState state, int round) {
+        return round < request.limits().maxModelRounds()
+                && state.toolCalls < request.limits().maxToolCalls();
     }
 
     /** Provider settlement 单调推进轮次、用量 ordinal 与已预留 Tool 数；Prompt revision 已归入请求审计。 */

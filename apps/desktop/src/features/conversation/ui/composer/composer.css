@@ -58,6 +58,48 @@
   opacity: 0.7;
 }
 
+/*
+ * pending Interaction 时，普通输入不是新建 Turn，而是替代当前问题的 steering。保留同一 form
+ * 以复用附件、粘贴和输入法边界，仅压缩无关的模型/权限 chrome，避免形成两个视觉输入器。
+ */
+.ja-composer[data-interaction-presentation="expanded"] {
+  display: grid;
+  max-height: min(15rem, 34dvh);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  background: color-mix(in srgb, var(--ja-composer) 96%, var(--ja-surface-muted));
+  box-shadow: var(--ja-shadow-sm);
+}
+
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer-queue,
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer__attachments,
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer-context-list,
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer__inline-command,
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer-suggestions,
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer__drop-indicator {
+  grid-column: 1 / -1;
+}
+
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer__input {
+  min-height: 34px;
+  grid-column: 2;
+  padding-block: 6px;
+}
+
+.ja-composer[data-interaction-presentation="expanded"] > .ja-composer__toolbar {
+  display: contents;
+}
+
+.ja-composer[data-interaction-presentation="expanded"] .ja-composer__leading {
+  grid-column: 1;
+}
+
+.ja-composer[data-interaction-presentation="expanded"] .ja-composer__trailing {
+  grid-column: 3;
+}
+
 /* Context 是消息内容而非全局设置；横向轻量 Chip 让正文仍保持唯一输入焦点。 */
 .ja-composer-context-list {
   display: flex;

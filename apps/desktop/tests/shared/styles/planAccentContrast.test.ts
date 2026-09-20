@@ -74,16 +74,16 @@ function mixSrgb(emphasis: string, foreground: string): string {
 describe("Plan and interaction accent contrast policy", () => {
   it("routes small accent text and primary action surfaces through emphasis", () => {
     expect(INTERACTION_SOURCE).toMatch(
-      /\.ja-interaction-card__eyebrow\s*\{[^}]*color:\s*color-mix\(in srgb,\s*var\(--ja-accent-emphasis\)\s+80%,\s*var\(--ja-foreground\)\);/u,
-    );
-    expect(INTERACTION_SOURCE).toMatch(
-      /\.ja-interaction-card__recommended\s*\{[^}]*color:\s*color-mix\(in srgb,\s*var\(--ja-accent-emphasis\)\s+80%,\s*var\(--ja-foreground\)\);/u,
+      /\.ja-interaction-card__recommended\s*\{[^}]*color:\s*var\(--ja-accent-emphasis\);[^}]*background:\s*var\(--ja-accent-soft\);/u,
     );
     expect(INTERACTION_SOURCE).toMatch(
       /\.ja-interaction-card__primary-button\s*\{[^}]*background:\s*var\(--ja-accent-emphasis\);/u,
     );
     expect(INTERACTION_SOURCE).toMatch(
-      /\.ja-interaction-card__option\[data-selected="true"\]\s*\{[^}]*border-color:\s*var\(--ja-accent\);[^}]*background:\s*color-mix\(in srgb,\s*var\(--ja-accent\)/u,
+      /\.ja-interaction-card__option\[data-selected="true"\]\s*\{[^}]*border-color:\s*color-mix\(in srgb,\s*var\(--ja-accent\)\s+62%,\s*var\(--ja-border-strong\)\);[^}]*background:\s*color-mix\(in srgb,\s*var\(--ja-accent\)\s+10%,\s*var\(--ja-surface-raised\)\);/u,
+    );
+    expect(INTERACTION_SOURCE).toMatch(
+      /\.ja-interaction-card__option-affordance\s*\{[^}]*color:\s*var\(--ja-accent-emphasis\);/u,
     );
     expect(GOALS_SOURCE).toMatch(
       /\.ja-plan-timeline__footer\s*>\s*button\s*\{[^}]*color:\s*color-mix\(in srgb,\s*var\(--ja-accent-emphasis\)\s+80%,\s*var\(--ja-foreground\)\);/u,

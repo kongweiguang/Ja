@@ -100,8 +100,9 @@ function requiredAnswerMissing(
   question: InteractionRequest["questions"][number],
   answer: InteractionAnswer | undefined,
 ): boolean {
+  if (!question.required) return false;
   if (answer === undefined) return true;
-  if (answer.skipped) return question.required;
+  if (answer.skipped) return true;
   if (question.type === "text") return !answer.freeText?.trim();
   return (
     (answer.optionIds.length === 0 && !answer.freeText?.trim()) ||
@@ -114,6 +115,27 @@ function answerList(answers: Readonly<Record<string, InteractionAnswer>>): Inter
   return Object.values(answers).sort((left, right) =>
     left.questionId.localeCompare(right.questionId),
   );
+}
+
+/**
+ * 提交时才将未填写的可选题结算为 skipped：草稿保留用户真实的空白状态，恢复时不会把未决定误绘制成
+ * 已跳过；提交数组则覆盖每个题目，满足服务端结构化答案和失败重试使用同一规范载荷的约束。
+ */
+function answersForSubmission(
+  request: InteractionRequest,
+  answers: Readonly<Record<string, InteractionAnswer>>,
+): InteractionAnswer[] {
+  return request.questions.flatMap((question) => {
+    const answer = answers[question.questionId];
+    const answerIsEmpty =
+      answer === undefined ||
+      answer.skipped ||
+      (answer.optionIds.length === 0 && !answer.freeText?.trim());
+    if (!question.required && answerIsEmpty) {
+      return [{ questionId: question.questionId, optionIds: [], freeText: null, skipped: true }];
+    }
+    return answer === undefined ? [] : [{ ...answer, optionIds: [...answer.optionIds] }];
+  });
 }
 
 /** 已回答摘要必须采用服务端确认答案；待回答状态才允许从本地草稿恢复答案。 */
@@ -575,10 +597,10 @@ export function useInteractionController({
     );
     if (missingIndex >= 0) {
       setPageIndex(missingIndex);
-      setError("请先完成问题，或明确跳过可选问题。");
+      setError("请先完成所有必答问题。");
       return;
     }
-    const submissionAnswers = answerList(answersRef.current);
+    const submissionAnswers = answersForSubmission(request, answersRef.current);
     const fingerprint = `${request.requestId}:${request.revision}:${JSON.stringify(submissionAnswers)}`;
     const idempotencyKey =
       submitKeyRef.current !== undefined && submitFingerprintRef.current === fingerprint

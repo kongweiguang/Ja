@@ -1,7 +1,7 @@
 {
   "name": "ja",
   "private": true,
-  "version": "0.1.13",
+  "version": "0.1.14",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "engines": {
@@ -30,6 +30,7 @@
     "format:frontend:check": "prettier --check \"apps/desktop/**/*.{ts,tsx,css}\"",
     "lint": "pnpm format:frontend:check && eslint . --max-warnings 0",
     "test": "vitest run",
+    "test:streaming-stability": "node scripts/e2e/streaming-stability-browser.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {

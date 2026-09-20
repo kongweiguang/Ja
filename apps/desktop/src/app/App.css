@@ -419,7 +419,8 @@ button {
 }
 .ja-conversation-composer-dock > .ja-interaction-card {
   min-height: 0;
-  flex: 1 1 auto;
+  /* 提问卡与补充输入组成紧凑操作面，正文自行滚动，不能再挤满 dock 令 Timeline 消失。 */
+  flex: 0 1 auto;
 }
 .ja-conversation-composer-dock > .ja-interaction-card.is-collapsed {
   flex: 0 0 auto;

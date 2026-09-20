@@ -99,11 +99,10 @@ public interface ConversationRepository extends AutoCloseable {
     CommitReceipt commitTerminal(TerminalCommit request);
 
     /**
-     * 在同一个 SQLite 事务内登记取消请求并推进 Thread/Turn 两个版本；返回成功即已提交。
+     * 在同一个 SQLite 事务内读取当前 Thread/Turn 双版本并登记取消请求；调用方不得携带过期版本。
      * 取消登记保持 Turn 非终态，终态提交必须随后通过 Turn mutation version 再赢一次门。
      */
-    CancellationClaim claimCancellation(String threadId, String turnId, long expectedThreadRevision,
-                                        String reason, Instant occurredAt);
+    CancellationClaim claimCancellation(String turnId, String reason, Instant occurredAt);
 
     /** 读取 Resume 所需的唯一权威投影；execution 必须经过严格 Codec 解码。 */
     default Optional<ResumeCandidate> findResumeCandidate(String turnId) {
@@ -116,8 +115,8 @@ public interface ConversationRepository extends AutoCloseable {
         throw new UnsupportedOperationException("turn resume is unavailable");
     }
 
-    /** 没有进程内 owner 的 SUSPENDED Turn 由存储直接收敛取消终态。 */
-    default CancelResult cancelSuspended(String turnId, long expectedThreadRevision, Instant occurredAt) {
+    /** 没有进程内 owner 的 SUSPENDED Turn 由存储读取当前版本并直接收敛取消终态。 */
+    default CancelResult cancelSuspended(String turnId, Instant occurredAt) {
         throw new UnsupportedOperationException("suspended cancellation is unavailable");
     }
 
@@ -248,11 +247,6 @@ public interface ConversationRepository extends AutoCloseable {
          * 指定 Turn 不存在或已不再允许登记取消。
          */
         NOT_FOUND,
-
-        /**
-         * 调用方持有的 Thread revision 已过期。
-         */
-        CONFLICT,
 
         /**
          * 存储暂时不可完成登记，调用方不得把它伪装成业务冲突。
@@ -480,6 +474,11 @@ public interface ConversationRepository extends AutoCloseable {
      * 读取取消、审批与迟到回调门禁使用的权威 Turn 状态。
      */
     Optional<TurnSnapshot> findTurn(String threadId, String turnId);
+
+    /** Turn ID 全局唯一；取消终态竞态必须通过此入口回读，而不能从过期 Thread 快照猜测。 */
+    default Optional<TurnSnapshot> findTurn(String turnId) {
+        return Optional.empty();
+    }
 
     /**
      * 在一个数据库快照中读取永久消息历史和当前 Turn 投影。

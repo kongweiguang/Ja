@@ -46,27 +46,37 @@ final class TurnCancellationLifecycle {
     }
 
     /**
-     * 以调用方 revision 认领持久取消 CAS，再发布进程内 Token；重复调用复用首次 claim。
+     * 以全局 Turn ID 认领持久取消意图，再发布进程内 Token；调用方版本漂移不会阻断最高优先级停止。
      */
-    TurnUseCase.CancelResult cancel(String turnId, long expectedThreadRevision) {
-        return cancel(turnId, expectedThreadRevision, "user cancelled");
+    TurnUseCase.CancelResult cancel(String turnId) {
+        return cancel(turnId, "user cancelled");
     }
 
     /**
      * 受控生命周期动作复用取消 CAS，但保留调用方原因，使 Plan pause 能在取消收口时
-     * 进入可恢复 SUSPENDED，而普通用户取消仍走不可逆 CANCELLED。
+     * 进入可恢复 SUSPENDED，而普通用户取消仍走不可逆 CANCELLED；Plan 自身 fencing 在上层负责。
      */
-    TurnUseCase.CancelResult cancel(String turnId, long expectedThreadRevision, String reason) {
+    TurnUseCase.CancelResult cancel(String turnId, String reason) {
         String normalized = requireTurnId(turnId);
         ActiveEntry entry = findActive(normalized);
         if (entry == null) {
+            ConversationRepository.TurnSnapshot current = store.findTurn(normalized).orElse(null);
+            if (current == null) {
+                throw TurnUseCase.TurnCancellationException.of(TurnUseCase.CancelFailure.TURN_NOT_FOUND);
+            }
+            if (current.state().terminal()) {
+                return new TurnUseCase.CancelResult(true, normalized, current.state(), current.threadRevision());
+            }
             throw TurnUseCase.TurnCancellationException.of(TurnUseCase.CancelFailure.TURN_NOT_FOUND);
         }
         TurnOwnership turn = entry.turn();
         ConversationRepository.CancellationClaim claim = turn.cancellationClaim.get();
-        if (claim == null || turn.cancellationExpectedThreadRevision != expectedThreadRevision) {
-            claim = claimCancellation(entry.key(), expectedThreadRevision, reason);
-            rememberCancellation(turn, expectedThreadRevision, claim);
+        if (claim == null) {
+            claim = claimCancellation(entry.key(), reason);
+            rememberCancellation(turn, claim);
+        }
+        if (!claim.accepted() || claim.status().terminal()) {
+            return new TurnUseCase.CancelResult(true, normalized, claim.status(), claim.threadRevision());
         }
         dispatchCancellation(entry.key(), turn, reason);
         return new TurnUseCase.CancelResult(claim.accepted(), normalized, claim.status(),
@@ -88,8 +98,8 @@ final class TurnCancellationLifecycle {
         try {
             ConversationRepository.CancellationClaim claim = turn.cancellationClaim.get();
             if (claim == null) {
-                claim = claimCancellation(key, snapshot.threadRevision(), reason);
-                rememberCancellation(turn, snapshot.threadRevision(), claim);
+                claim = claimCancellation(key, reason);
+                rememberCancellation(turn, claim);
             }
             if (claim.accepted()) dispatchCancellation(key, turn, reason);
         } catch (RuntimeException failure) {
@@ -120,11 +130,10 @@ final class TurnCancellationLifecycle {
     }
 
     /**
-     * 缓存首次 revision 与持久 claim，后续重试不得用不同 revision 覆盖已确认事实。
+     * 缓存首次持久 claim，后续重试不得重新计算版本或覆盖已确认事实。
      */
-    private static void rememberCancellation(TurnOwnership turn, long expectedThreadRevision,
+    private static void rememberCancellation(TurnOwnership turn,
                                              ConversationRepository.CancellationClaim claim) {
-        turn.cancellationExpectedThreadRevision = expectedThreadRevision;
         turn.cancellationClaim.compareAndSet(null, claim);
     }
 
@@ -244,23 +253,17 @@ final class TurnCancellationLifecycle {
      * 可以越过应用边界，其他存储故障保持原样，避免 transport 把不可用误判为用户竞争。
      */
     private ConversationRepository.CancellationClaim claimCancellation(TurnService.Key key,
-                                                                       long expectedThreadRevision,
                                                                        String reason) {
         try {
-            return Objects.requireNonNull(store.claimCancellation(key.threadId(), key.turnId(),
-                    expectedThreadRevision, reason, clock.instant()), "cancellation claim");
+            return Objects.requireNonNull(store.claimCancellation(key.turnId(), reason, clock.instant()),
+                    "cancellation claim");
         } catch (ConversationRepository.CancellationClaimException failure) {
             throw switch (failure.failure()) {
                 case NOT_FOUND -> TurnUseCase.TurnCancellationException.of(
                         TurnUseCase.CancelFailure.TURN_NOT_FOUND);
-                case CONFLICT -> TurnUseCase.TurnCancellationException.of(
-                        TurnUseCase.CancelFailure.CONFLICT);
                 case UNAVAILABLE -> failure;
             };
         } catch (StorageException failure) {
-            if (failure.code() == StorageException.Code.CAS_CONFLICT) {
-                throw TurnUseCase.TurnCancellationException.of(TurnUseCase.CancelFailure.CONFLICT);
-            }
             if (failure.code() == StorageException.Code.NOT_FOUND) {
                 throw TurnUseCase.TurnCancellationException.of(TurnUseCase.CancelFailure.TURN_NOT_FOUND);
             }
@@ -284,7 +287,7 @@ final class TurnCancellationLifecycle {
      * 校验公开取消入口的 Turn ID 形态，避免无界或模糊标识触发全表扫描。
      */
     private static String requireTurnId(String value) {
-        if (value == null || !value.startsWith("turn_") || value.length() > 128
+        if (value == null || !value.startsWith("turn_") || value.length() > 101
             || !value.substring(5).matches("[A-Za-z0-9][A-Za-z0-9._-]*")) {
             throw new IllegalArgumentException("invalid turnId");
         }

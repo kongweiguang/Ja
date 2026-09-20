@@ -319,6 +319,130 @@ describe("useConversationController", () => {
     expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
   });
 
+  /**
+   * active snapshot 没有 terminal event 时仍由可见 Thread controller 消费 resync；首次 read
+   * 失败后按 retry timer 重试，第二次权威 terminal snapshot 到达即可解除 active projection。
+   */
+  it("恢复 active Turn 的 read 失败后重试并以 terminal snapshot 解锁", async () => {
+    const existing = thread("thr_active_recovery");
+    const active = contentSnapshot(existing.threadId, "running", 4);
+    const terminal = contentSnapshot(existing.threadId, "completed", 5);
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(active)
+      .mockRejectedValueOnce(new Error("temporary read failure"))
+      .mockResolvedValueOnce(terminal);
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    expect(useTimelineStore.getState().turns[`${existing.threadId}:turn`]?.status).toBe("running");
+
+    vi.useFakeTimers();
+    try {
+      act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(threadRead).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(threadRead).toHaveBeenCalledTimes(3);
+      expect(useTimelineStore.getState().turns[`${existing.threadId}:turn`]?.status).toBe(
+        "completed",
+      );
+      expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** 同 Workspace 切换期间，旧 Thread 的在途 read 返回后不能写入 recovered 标记或 Timeline。 */
+  it("切换 Thread 后丢弃旧 Thread 的迟到 resync snapshot", async () => {
+    const first = thread("thr_resync_first");
+    const second = thread("thr_resync_second");
+    let releaseLateRead!: (snapshot: TimelineSnapshot) => void;
+    const lateRead = new Promise<TimelineSnapshot>((resolve) => {
+      releaseLateRead = resolve;
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(emptySnapshot(first.threadId))
+      .mockImplementationOnce(async () => lateRead);
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
+      threadCreate: vi.fn(async () => first),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(first.threadId));
+    act(() => {
+      useTimelineStore
+        .getState()
+        .applySnapshot(emptySnapshot(second.threadId), WORKSPACE.workspaceId);
+      useTimelineStore.getState().requestThreadResync(first.threadId);
+    });
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(2));
+
+    await act(async () => result.current.select(second.threadId));
+    releaseLateRead(contentSnapshot(first.threadId, "running", 4));
+    await act(async () => {
+      await lateRead;
+      await Promise.resolve();
+    });
+
+    expect(result.current.currentThreadId).toBe(second.threadId);
+    expect(useTimelineStore.getState().turns[`${first.threadId}:turn`]).toBeUndefined();
+    expect(useTimelineStore.getState().recoveredActiveTurnByThread[first.threadId]).toBeUndefined();
+  });
+
   it("当前会话没有任何 Turn 时重复新建仍复用同一个 Thread", async () => {
     const existing = thread("thr_empty");
     const threadCreate = vi.fn(async () => thread("thr_duplicate"));

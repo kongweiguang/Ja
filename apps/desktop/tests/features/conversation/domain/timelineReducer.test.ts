@@ -724,6 +724,67 @@ describe("timeline reducer", () => {
     });
   });
 
+  /** Terminal 不应抹掉仍有阅读价值的瞬态内容；历史快照到达后再由持久事实完整接管。 */
+  it("retains public reasoning at completion and visible response text after cancellation", () => {
+    let completed = readyState();
+    completed = apply(completed, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    completed = apply(
+      completed,
+      event("assistant/reasoning-summary-delta", 1, {
+        eventId: "evt_terminal_reasoning",
+        sequence: 2,
+        streamSeq: 1,
+        text: "终态前公开的思考摘要",
+      }),
+    );
+    completed = apply(
+      completed,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_text",
+        sequence: 3,
+        streamSeq: 2,
+        text: "终态前公开的正文",
+      }),
+    );
+    completed = apply(
+      completed,
+      event("turn/terminal", 2, {
+        eventId: "evt_terminal_completed",
+        sequence: 4,
+        state: "completed",
+        summary: "完成",
+        finalMessage: { messageId: "item_terminal_final", text: "权威最终答复" },
+      }),
+    );
+    expect(completed.draftByTurn[turnId]).toEqual([
+      expect.objectContaining({ kind: "reasoning", text: "终态前公开的思考摘要" }),
+    ]);
+
+    let cancelled = readyState();
+    cancelled = apply(cancelled, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    cancelled = apply(
+      cancelled,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_cancelled_text",
+        sequence: 2,
+        streamSeq: 1,
+        text: "取消前已经生成的正文",
+      }),
+    );
+    cancelled = apply(
+      cancelled,
+      event("turn/terminal", 2, {
+        eventId: "evt_terminal_cancelled",
+        sequence: 3,
+        state: "cancelled",
+        summary: "用户取消",
+      }),
+    );
+    expect(cancelled.draftByTurn[turnId]).toEqual([
+      expect.objectContaining({ kind: "assistant", text: "取消前已经生成的正文" }),
+    ]);
+  });
+
   /** 重启调和后的 Suspended 继续阻塞 Thread，且只能先回到队列再恢复执行。 */
   it("projects suspended as a resumable blocking state", () => {
     let state = readyState();
@@ -1333,7 +1394,14 @@ describe("timeline reducer", () => {
         text: "公开回复的一部分。",
         reasoningSummary: "先判断上下文。再核对一个约束。",
         modelRound: 1,
-        toolCalls: [],
+        toolCalls: [
+          {
+            callId: "call_interleaved_read",
+            toolName: "read",
+            ordinal: 0,
+            presentation: presentation("read", "pending", { relativePaths: ["README.md"] }),
+          },
+        ],
       }),
     );
 

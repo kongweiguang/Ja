@@ -21,6 +21,10 @@ import {
 } from "../domain/timelineReducer";
 
 export interface TimelineStore extends TimelineState {
+  /** 只标记由权威 snapshot 恢复出的 active Turn，供可见 Conversation 做有限对账。 */
+  recoveredActiveTurnByThread: Record<string, string>;
+  /** 每次重读意图的单调序号；相同 reason 的失败重试也必须重新触发 consumer。 */
+  resyncRequestSequenceByThread: Record<string, number>;
   applySnapshot: (snapshot: TimelineSnapshot, workspaceId: string) => TimelineState["lastOutcome"];
   applyHostEvent: (event: ConversationHostEvent) => TimelineState["lastOutcome"];
   applyTurnAccepted: (accepted: AcceptedTurnProjection) => TimelineState["lastOutcome"];
@@ -47,10 +51,9 @@ const draftItemByProjection = new WeakMap<
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
- * 把同一份 Draft Segment 映射为稳定的 Item 引用；公开回复草稿与结算后的
- * assistant_progress 仍共享 commentary 语义，但 Renderer 只将未结算 Draft 预览在最终答复位置。
- * Reasoning 仍保留独立类型，跨语义段各自占据阅读位置。WeakMap 让重复 Selector 保持引用稳定，
- * 并在终态清理 Draft 后自动释放缓存。
+ * 把同一份 Draft Segment 映射为稳定的 Item 引用；assistant Draft 保留 commentary wire 语义，
+ * Renderer 将当前未结算正文放入回复阅读位置，Reasoning 始终属于工作过程。WeakMap 让重复 Selector
+ * 保持引用稳定，并在模型步骤提交或完整历史快照接管后自动释放缓存。
  */
 function draftItemForTurn(
   threadId: string,
@@ -63,7 +66,7 @@ function draftItemForTurn(
     itemId: `draft:${turnId}:${draft.segmentStartSeq}`,
     threadId,
     turnId,
-    // assistant 草稿保留协议的 commentary 身份；Renderer 以 in_progress + phase 识别它并预览为最终答复。
+    // assistant 草稿保留协议身份；Tool 模型步提交后会由持久 commentary 原位接管工作过程。
     kind: draft.kind === "reasoning" ? "reasoning" : "commentary",
     status: "in_progress",
     text: draft.text,
@@ -82,12 +85,26 @@ function draftItemForTurn(
 function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
   return create<TimelineStore>((set) => ({
     ...createTimelineState(),
+    recoveredActiveTurnByThread: {},
+    resyncRequestSequenceByThread: {},
     applySnapshot: (snapshot, workspaceId) => {
       let nextOutcome: TimelineState["lastOutcome"] = "invalid";
       set((state) => {
         const next = applySnapshot(state, snapshot, workspaceId);
         nextOutcome = next.lastOutcome;
-        return next;
+        if (next.lastOutcome !== "applied")
+          return {
+            ...next,
+            recoveredActiveTurnByThread: state.recoveredActiveTurnByThread ?? {},
+          };
+        const recoveredActiveTurn = snapshot.turns.find(
+          (turn) => !["completed", "failed", "cancelled"].includes(turn.status),
+        )?.turnId;
+        const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
+        if (recoveredActiveTurn === undefined)
+          delete recoveredActiveTurnByThread[snapshot.threadId];
+        else recoveredActiveTurnByThread[snapshot.threadId] = recoveredActiveTurn;
+        return { ...next, recoveredActiveTurnByThread };
       });
       return nextOutcome ?? "invalid";
     },
@@ -105,6 +122,28 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
               ? applyLiveEvent(state, event.event)
               : requireActiveTurnResync(state, "projection_fault");
         nextOutcome = next.lastOutcome;
+        if (event.kind === "timeline") {
+          const threadId =
+            "threadId" in event.event.params ? event.event.params.threadId : undefined;
+          if (threadId === undefined) return next;
+          const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
+          const recoveredTurnId = recoveredActiveTurnByThread[threadId];
+          const projectedTurn =
+            recoveredTurnId === undefined ? undefined : next.turns[recoveredTurnId];
+          if (
+            recoveredTurnId !== undefined &&
+            (projectedTurn === undefined ||
+              ["completed", "failed", "cancelled"].includes(projectedTurn.status))
+          )
+            delete recoveredActiveTurnByThread[threadId];
+          return { ...next, recoveredActiveTurnByThread };
+        }
+        if (event.kind === "status" && next.handshake.generation !== state.handshake.generation)
+          return {
+            ...next,
+            recoveredActiveTurnByThread: {},
+            resyncRequestSequenceByThread: {},
+          };
         return next;
       });
       return nextOutcome;
@@ -115,7 +154,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       set((state) => {
         const next = applyTurnAccepted(state, accepted);
         nextOutcome = next.lastOutcome;
-        return next;
+        if (next.lastOutcome !== "applied") return next;
+        const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
+        delete recoveredActiveTurnByThread[accepted.threadId];
+        return { ...next, recoveredActiveTurnByThread };
       });
       return nextOutcome;
     },
@@ -134,6 +176,12 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       set((state) => {
         const next = applyRuntimeStatus(state, status);
         nextOutcome = next.lastOutcome;
+        if (next.handshake.generation !== state.handshake.generation)
+          return {
+            ...next,
+            recoveredActiveTurnByThread: {},
+            resyncRequestSequenceByThread: {},
+          };
         return next;
       });
       return nextOutcome;
@@ -154,11 +202,39 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
         };
       }),
     /** 队列 CAS 冲突只建立一次 authoritative read 意图，不在 Renderer 猜测条目现状。 */
-    requestThreadResync: (threadId) => set((state) => requireThreadResync(state, threadId)),
+    requestThreadResync: (threadId) =>
+      set((state) => ({
+        ...requireThreadResync(state, threadId),
+        resyncRequestSequenceByThread: {
+          ...(state.resyncRequestSequenceByThread ?? {}),
+          [threadId]: ((state.resyncRequestSequenceByThread ?? {})[threadId] ?? 0) + 1,
+        },
+      })),
     /** 仅清理控制器淘汰的非活动缓存 Thread；Reducer 会再次保护实时任务与审批投影。 */
     pruneInactiveThreads: (threadIds) =>
-      set((state) => pruneInactiveThreadProjection(state, threadIds)),
-    reset: () => set(createTimelineState()),
+      set((state) => {
+        const next = pruneInactiveThreadProjection(state, threadIds);
+        const removed = new Set(threadIds);
+        return {
+          ...next,
+          recoveredActiveTurnByThread: Object.fromEntries(
+            Object.entries(state.recoveredActiveTurnByThread ?? {}).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+          resyncRequestSequenceByThread: Object.fromEntries(
+            Object.entries(state.resyncRequestSequenceByThread ?? {}).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+        };
+      }),
+    reset: () =>
+      set({
+        ...createTimelineState(),
+        recoveredActiveTurnByThread: {},
+        resyncRequestSequenceByThread: {},
+      }),
   }));
 }
 
@@ -174,13 +250,20 @@ export const useTimelineStore =
 timelineStoreRegistry[TIMELINE_STORE_GLOBAL_KEY] = useTimelineStore;
 
 /**
- * 按 Thread 组装持久 Item，并把尚未结算的公开回复/Reasoning segments 附在对应 Turn；终态
- * 事件会在 Reducer 中原子移除 Draft，因此 UI 原位切换到持久最终答复，不会重复展示或反写 Java。
+ * 只选择已经进入权威 Thread 顺序的条目；页头摘要、文件入口和空态不读取逐段 Draft，
+ * 避免高频正文把 Timeline 之外的 Composer 与导航共同父级带入 React commit。
  */
-export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {
-  const committed = (state.itemIdsByThread[threadId] ?? [])
+export const selectCommittedItemsForThread = (threadId: string) => (state: TimelineStore) =>
+  (state.itemIdsByThread[threadId] ?? [])
     .map((itemId) => state.items[itemId])
     .filter((item) => item !== undefined);
+
+/**
+ * 按 Thread 组装持久 Item，并把尚未结算的公开回复/Reasoning segments 附在对应 Turn；Tool 模型步
+ * 将正文结算到工作过程，terminal 以 finalMessage 校准回复并保留取消前正文，整个过程不反写 Java。
+ */
+export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {
+  const committed = selectCommittedItemsForThread(threadId)(state);
   const drafts = Object.values(state.turns).flatMap((turn) => {
     const drafts = state.draftByTurn[turn.turnId];
     if (turn.threadId !== threadId || drafts === undefined) return [];

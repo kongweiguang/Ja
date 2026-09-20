@@ -25,11 +25,17 @@ import {
 } from "../../domain/timelineTypes";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { ToolStepDetails } from "./ToolStepDetails";
+import type { TimelineDisclosureCache } from "./timelineDisclosure";
 import "./timeline.css";
 
 export interface WorkProcessProps {
   steps: readonly WorkStepAdapter[];
   turn?: TimelineTurn;
+  /** Workspace 生命周期内的瞬态折叠选择，不进入协议或持久化。 */
+  disclosureCache?: TimelineDisclosureCache;
+  /** 当前 exchange 的稳定 identity；与 Thread 一起隔离多轮回复。 */
+  disclosureKey?: string;
+  disclosureThreadId?: string;
   approvals?: readonly ApprovalSummary[];
   approvalDecisions?: Readonly<Record<string, ApprovalDecision | undefined>>;
   approvalClosedAt?: Readonly<Record<string, string | undefined>>;
@@ -228,8 +234,8 @@ function sumOptional(values: readonly (number | undefined)[]): number | undefine
 }
 
 /**
- * 将相邻 Tool Work 分组到单个 Radix Disclosure，使繁忙 Turn 保持可读；
- * Active 与 Failed Work 保持展开，Completed Work 默认折叠。
+ * 将相邻 Tool Work 分组到单个 Radix Disclosure，使繁忙 Turn 保持可读；运行、失败和阻塞态展开，
+ * 纯成功完成态默认折叠，而 Workspace 缓存中的人工选择始终优先。
  *
  * 未决审批是继续执行的阻塞点，即使关联 command 已完成也必须保持展开，
  * 否则用户会看不到唯一可解除阻塞的审批按钮。
@@ -238,6 +244,9 @@ function sumOptional(values: readonly (number | undefined)[]): number | undefine
 export function WorkProcess({
   steps,
   turn,
+  disclosureCache,
+  disclosureKey,
+  disclosureThreadId,
   approvals = [],
   approvalDecisions = {},
   approvalClosedAt = {},
@@ -263,15 +272,7 @@ export function WorkProcess({
         approvalClosedAt[approval.approvalId] === undefined,
     );
   const state = processState(visibleSteps, turn, approvalPending);
-  const [manualDisclosure, setManualDisclosure] = useState<{
-    state: WorkProcessState;
-    open: boolean;
-  }>();
-  // 手动选择只属于同一 Status；Running Process 转为 Completed 时，状态变化自然将其重置为折叠。
-  const open =
-    manualDisclosure?.state === state
-      ? manualDisclosure.open
-      : state !== "completed" || approvalPending;
+  const [manualOpen, setManualOpen] = useState<boolean>();
 
   if (
     visibleSteps.length === 0 &&
@@ -306,11 +307,20 @@ export function WorkProcess({
     turn === undefined ? sumOptional(visibleSteps.map(itemDurationMs)) : turnDurationMs(turn);
   const duration = formatDuration(durationMs);
   const failedStepCount = actionableSteps.filter((step) => step.status === "failed").length;
+  const cachedOpen =
+    disclosureCache !== undefined && disclosureThreadId !== undefined && disclosureKey !== undefined
+      ? disclosureCache.get(disclosureThreadId, "process", disclosureKey)
+      : undefined;
+  // 失败、阻塞与运行态必须直接可见；纯成功完成态才自动收起，手动选择优先且跨虚拟卸载保留。
+  const open =
+    cachedOpen ?? manualOpen ?? (state !== "completed" || approvalPending || failedStepCount > 0);
   const statusLabel = processStatusLabel(state);
   const recoveredFailureCount = state === "completed" ? failedStepCount : 0;
   const hasDetails = visibleSteps.length > 0 || visibleApprovals.length > 0;
+  const completedCollapsed = state === "completed" && !open;
+  const headingLabel = completedCollapsed ? "查看工作过程" : "工作过程";
   const accessibleSummary = [
-    "工作过程",
+    headingLabel,
     statusLabel,
     recoveredFailureCount > 0 ? `${recoveredFailureCount} 步失败` : undefined,
     duration,
@@ -318,15 +328,29 @@ export function WorkProcess({
   ]
     .filter((label): label is string => label !== undefined)
     .join("，");
+  /** 将用户选择同时写入当前挂载与 Workspace 缓存，避免受控折叠等待下一次外部渲染才响应。 */
+  const updateOpen = (nextOpen: boolean): void => {
+    if (
+      disclosureCache !== undefined &&
+      disclosureThreadId !== undefined &&
+      disclosureKey !== undefined
+    ) {
+      disclosureCache.set(disclosureThreadId, "process", disclosureKey, nextOpen);
+    }
+    setManualOpen(nextOpen);
+  };
+
   const headerContent = (
     <>
       <span className="ja-work-process__heading">
-        <strong>工作过程</strong>
+        <strong>{headingLabel}</strong>
       </span>
       <span className="ja-work-process__meta">
-        <span className="ja-work-process__summary" aria-live="polite">
-          {statusLabel}
-        </span>
+        {completedCollapsed ? null : (
+          <span className="ja-work-process__summary" aria-live="polite">
+            {statusLabel}
+          </span>
+        )}
         {recoveredFailureCount > 0 ? (
           <span className="ja-work-process__failure">
             <span className="ja-work-process__separator" aria-hidden="true">
@@ -358,16 +382,22 @@ export function WorkProcess({
     </>
   );
 
+  /**
+   * 公开正文从 Draft 结算为持久 Item 时服务端 identity 会变化；语义位置才是同一可见段落的稳定身份。
+   * Tool 与审批仍使用服务端 ID，避免同一批次的可操作条目因位置变化错误复用 DOM。
+   */
+  const visibleStepKey = (step: WorkStepAdapter, index: number): string =>
+    step.kind === "commentary" || isReasoningItem(step)
+      ? `${step.turnId}:${step.metadata?.phase ?? step.kind}:${index}`
+      : step.itemId;
+
   return (
     <section
       className={cn("ja-work-process", `ja-work-process-${state}`, className)}
       aria-label="工作过程"
       data-state={state}
     >
-      <Collapsible
-        open={open}
-        onOpenChange={(nextOpen) => setManualDisclosure({ state, open: nextOpen })}
-      >
+      <Collapsible open={open} onOpenChange={updateOpen}>
         {hasDetails ? (
           <CollapsibleTrigger className="ja-work-process__trigger" aria-label={accessibleSummary}>
             {headerContent}
@@ -385,12 +415,12 @@ export function WorkProcess({
           <CollapsibleContent className="ja-work-process__content">
             {visibleSteps.length > 0 ? (
               <ol className="ja-work-process__steps">
-                {visibleSteps.map((step) => {
+                {visibleSteps.map((step, index) => {
                   const detail = stepDetail(step);
                   if (isReasoningItem(step) && detail !== undefined) {
                     return (
                       <li
-                        key={step.itemId}
+                        key={visibleStepKey(step, index)}
                         className="ja-work-step--reasoning"
                         data-role="reasoning"
                         aria-label="模型思考"
@@ -406,7 +436,7 @@ export function WorkProcess({
                   if (step.kind === "commentary" && detail !== undefined) {
                     return (
                       <li
-                        key={step.itemId}
+                        key={visibleStepKey(step, index)}
                         className="ja-work-step--commentary"
                         data-role="commentary"
                         aria-label="助手进展"
@@ -449,7 +479,13 @@ export function WorkProcess({
                           />
                         ) : null}
                         {step.metadata?.presentation === undefined ? null : (
-                          <ToolStepDetails step={step} onReadArtifact={onReadToolArtifact} />
+                          <ToolStepDetails
+                            step={step}
+                            disclosureCache={disclosureCache}
+                            disclosureKey={`${disclosureKey ?? step.turnId}:${step.itemId}`}
+                            disclosureThreadId={disclosureThreadId ?? step.threadId}
+                            onReadArtifact={onReadToolArtifact}
+                          />
                         )}
                         {stepDuration ? (
                           <span className="ja-work-step__duration">

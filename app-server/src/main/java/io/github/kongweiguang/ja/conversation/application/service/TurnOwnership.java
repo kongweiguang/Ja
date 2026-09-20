@@ -36,7 +36,6 @@ final class TurnOwnership {
     final AtomicReference<Throwable> cancellationDebt = new AtomicReference<>();
     final AtomicBoolean queuedSettlement = new AtomicBoolean();
     private final AtomicBoolean cancellationPropagationPublished = new AtomicBoolean();
-    volatile long cancellationExpectedThreadRevision = -1;
     final Instant deadlineAt;
     final TurnExecutionState execution;
     final TurnChangeTracker changeTracker;

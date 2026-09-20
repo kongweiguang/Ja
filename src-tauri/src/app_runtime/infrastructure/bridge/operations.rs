@@ -1577,6 +1577,11 @@ pub(crate) fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
             message: "thread was not found",
             retryable: false,
         },
+        Some("TURN_NOT_FOUND") => RuntimeCommandError {
+            code: "TURN_NOT_FOUND",
+            message: "turn was not found",
+            retryable: false,
+        },
         Some("THREAD_READ_ONLY") => RuntimeCommandError {
             code: "THREAD_READ_ONLY",
             message: "thread is read-only",

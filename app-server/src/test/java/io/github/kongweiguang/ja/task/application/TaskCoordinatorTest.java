@@ -530,10 +530,8 @@ final class TaskCoordinatorTest {
                 new Class<?>[]{TurnUseCase.class, ChildTurnScheduler.class}, (proxy, method, args) -> {
                     if (!"cancel".equals(method.getName())) throw new UnsupportedOperationException(method.getName());
                     String turnId = (String) args[0];
-                    long expectedRevision = (long) args[1];
                     ThreadSnapshot before = snapshot.get();
-                    assertEquals(before.thread().revision(), expectedRevision);
-                    long nextRevision = expectedRevision + 1;
+                    long nextRevision = before.thread().revision() + 1;
                     List<ThreadSnapshot.Turn> turns = before.turns().stream().map(value ->
                             new ThreadSnapshot.Turn(value.turnId(), value.turnId().equals(turnId)
                                     ? "CANCELLED" : value.status(), value.requestedAt(), NOW,

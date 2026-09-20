@@ -6,11 +6,10 @@ import { useCallback, useEffect, useMemo, useState, type ReactElement } from "re
 import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
 import {
-  ChatTimeline,
+  TimelineDisclosureCache,
   TimelineScrollCache,
   Composer,
   InteractionCard,
-  projectAnsweredInteractionResult,
   useInteractionController,
   type InteractionPort,
   ConversationSummaryPopover,
@@ -22,7 +21,7 @@ import {
   selectApprovalClosedAt,
   selectApprovalDecisions,
   selectApprovals,
-  selectItemsForThread,
+  selectCommittedItemsForThread,
   selectGoalActivitiesForOwner,
   turnDurationMs,
   turnStatusLabel,
@@ -60,6 +59,7 @@ import { IconButton } from "@/shared/ui/primitives";
 import { modelSelectionId } from "@/shared/settings/types";
 import { useLatestTurnReviewPublisher } from "../application/useLatestTurnReviewPublisher";
 import { conversationModeCommands } from "../application/conversationModeCommands";
+import { ConversationTimelineSurface } from "./ConversationTimelineSurface";
 
 export interface ConversationWorkspaceProps {
   readonly workspace: WorkspaceController;
@@ -158,9 +158,16 @@ export function ConversationWorkspace({
   const turnPort = useRuntimeTurns();
   const threadId = conversation.currentThreadId ?? "";
   const timelineScrollCache = useMemo(() => new TimelineScrollCache(), []);
+  const timelineDisclosureCache = useMemo(() => new TimelineDisclosureCache(), []);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
-  /** ConversationWorkspace 是 Timeline 瞬态快照的 owner；卸载时释放，不把滚动位置写入用户文件。 */
-  useEffect(() => () => timelineScrollCache.clear(), [timelineScrollCache]);
+  /** ConversationWorkspace 统一释放滚动和折叠快照，避免项目切换后复用旧 Thread 的瞬态 UI 状态。 */
+  useEffect(
+    () => () => {
+      timelineScrollCache.clear();
+      timelineDisclosureCache.clear();
+    },
+    [timelineDisclosureCache, timelineScrollCache],
+  );
   const clarification = useInteractionController({
     threadId: conversation.currentThreadId,
     // Runtime 恢复/重连只撤销发送准入，不能卸载 Interaction 快照；否则待回答卡会在恢复轮次中闪退再出现。
@@ -257,24 +264,15 @@ export function ConversationWorkspace({
       },
     ];
   }, [goal, onOpenGoal, modifyPlan, threadId]);
-  const items = useTimelineStore(
-    useShallow((state) => (threadId === "" ? [] : selectItemsForThread(threadId)(state))),
-  );
-  const timelineItems = useMemo(
-    () =>
-      projectAnsweredInteractionResult(
-        items,
-        clarification.answeredRequest?.threadId === threadId ? clarification.answeredRequest : null,
-        clarification.answeredRequest?.threadId === threadId ? clarification.answeredAnswers : {},
-      ),
-    [clarification.answeredAnswers, clarification.answeredRequest, items, threadId],
-  );
   const turns = useTimelineStore(
     useShallow((state) =>
       threadId === ""
         ? []
         : Object.values(state.turns).filter((turn) => turn.threadId === threadId),
     ),
+  );
+  const committedItems = useTimelineStore(
+    useShallow((state) => (threadId === "" ? [] : selectCommittedItemsForThread(threadId)(state))),
   );
   const latestTerminalPlanTurn = useMemo(
     () =>
@@ -376,14 +374,14 @@ export function ConversationWorkspace({
     publish: onLatestTurnReviewChange,
   });
   /**
-   * 在 Conversation 自身的 Timeline 订阅边界内归约摘要；缺失指标继续缺失，不能用零伪造证据，
-   * 也不能为了头部 Popover 让每个流式片段重新渲染 Navigation 与整个应用壳。
+   * 摘要只归约已提交的 Timeline 事实；缺失指标继续缺失，不能用零伪造证据，也不能让
+   * 逐段 Draft 为了头部 Popover 重新渲染 Composer 与 Navigation 的共同布局。
    */
   const summary = useMemo<ConversationSummary>(() => {
-    const changedFileMetrics = items
+    const changedFileMetrics = committedItems
       .map(itemChangedFiles)
       .filter((value): value is number => value !== undefined);
-    const diffMetrics = items
+    const diffMetrics = committedItems
       .map(itemDiffStat)
       .filter(
         (value): value is NonNullable<ReturnType<typeof itemDiffStat>> => value !== undefined,
@@ -398,7 +396,7 @@ export function ConversationWorkspace({
       ...summaryContext,
       status: activeStatus === undefined ? undefined : turnStatusLabel(activeStatus),
       turnCount: turns.length,
-      stepCount: items.filter(isWorkItem).length,
+      stepCount: committedItems.filter(isWorkItem).length,
       changedFiles:
         changedFileMetrics.length === 0
           ? undefined
@@ -412,7 +410,7 @@ export function ConversationWorkspace({
       durationMs:
         durations.length === 0 ? undefined : durations.reduce((total, value) => total + value, 0),
     };
-  }, [items, summaryContext, turns]);
+  }, [committedItems, summaryContext, turns]);
   const contextFacts = useTimelineStore(
     useShallow((state) => {
       if (threadId === "") return { usage: undefined, compaction: undefined };
@@ -438,7 +436,7 @@ export function ConversationWorkspace({
   const isProjectScope = workspace.workspace?.kind === "project";
   const replyFileOpen = useReplyFileOpen(
     isProjectScope ? workspace.workspace?.workspaceId : undefined,
-    items,
+    committedItems,
     workspaceAdapter,
   );
   /** 模型目录只投影 Thread 偏好需要的稳定身份和能力，不复制 Provider 连接配置。 */
@@ -561,7 +559,7 @@ export function ConversationWorkspace({
     goal,
   });
   const hasConversationContent =
-    timelineItems.length > 0 ||
+    committedItems.length > 0 ||
     turns.length > 0 ||
     approvals.length > 0 ||
     interaction.localSubmissions.length > 0 ||
@@ -603,7 +601,13 @@ export function ConversationWorkspace({
       attachmentDraftItems={interaction.attachmentDraftItems}
       activeTurn={interaction.activeTurn}
       suspendedTurn={interaction.suspendedTurn}
-      awaitingUserInput={clarification.request?.status === "pending"}
+      interactionPresentation={
+        clarification.request?.status !== "pending"
+          ? "none"
+          : clarification.collapsed
+            ? "collapsed"
+            : "expanded"
+      }
       disabled={interaction.disabled}
       sending={interaction.sending}
       draftRecoveryRevision={interaction.draftRecoveryRevision}
@@ -797,10 +801,12 @@ export function ConversationWorkspace({
             </h2>
           </div>
         ) : (
-          <ChatTimeline
+          <ConversationTimelineSurface
             threadId={threadId === "" ? undefined : threadId}
             scrollCache={timelineScrollCache}
-            items={timelineItems}
+            disclosureCache={timelineDisclosureCache}
+            answeredRequest={clarification.answeredRequest}
+            answeredAnswers={clarification.answeredAnswers}
             skills={composerSkills}
             turns={turns as Turn[]}
             approvals={approvals}

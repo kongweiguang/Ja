@@ -142,22 +142,25 @@ describe("InteractionCard", () => {
     expect(document.getElementById(describedBy ?? "")).toHaveAttribute("aria-label", "必填");
   });
 
-  it("does not preselect recommended answers and submits stable answer DTOs", async () => {
+  it("does not preselect recommended answers, allows blank optional questions to continue, and only submits explicitly", async () => {
     const user = userEvent.setup();
     const port = createPort();
     render(<Harness port={port} />);
     expect(await screen.findByRole("radio", { name: /全局统一/ })).not.toBeChecked();
     await user.click(screen.getByRole("radio", { name: /全局统一/ }));
+    expect(await screen.findByText("需要哪些角色？")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "跳过" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "下一题" }));
-    await user.click(screen.getByRole("button", { name: "跳过" }));
-    await user.click(screen.getByRole("button", { name: "跳过" }));
-    await user.click(screen.getByRole("button", { name: "提交" }));
+    expect(await screen.findByText("还有什么限制？")).toBeInTheDocument();
+    expect(port.submit).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "提交回答" }));
     await waitFor(() =>
       expect(port.submit).toHaveBeenCalledWith(
         expect.objectContaining({
           answers: expect.arrayContaining([
             { questionId: "scope", optionIds: ["global"], freeText: null, skipped: false },
             { questionId: "roles", optionIds: [], freeText: null, skipped: true },
+            { questionId: "notes", optionIds: [], freeText: null, skipped: true },
           ]),
         }),
       ),
@@ -169,7 +172,6 @@ describe("InteractionCard", () => {
     const port = createPort();
     render(<Harness port={port} />);
     await user.click(await screen.findByRole("radio", { name: /项目覆盖/ }));
-    await user.click(screen.getByRole("button", { name: "下一题" }));
     await user.click(screen.getByRole("checkbox", { name: /其他答案/ }));
     await user.type(screen.getByRole("textbox", { name: "其他答案" }), "仅当前仓库");
     await waitFor(() =>
@@ -182,8 +184,7 @@ describe("InteractionCard", () => {
       ),
     );
     await user.click(screen.getByRole("button", { name: "下一题" }));
-    await user.click(screen.getByRole("button", { name: "跳过" }));
-    await user.click(screen.getByRole("button", { name: "提交" }));
+    await user.click(screen.getByRole("button", { name: "提交回答" }));
     await waitFor(() =>
       expect(screen.queryByRole("region", { name: "已回答的问题" })).not.toBeInTheDocument(),
     );
@@ -201,7 +202,6 @@ describe("InteractionCard", () => {
     const port = createPort();
     render(<Harness port={port} />);
     await user.click(await screen.findByRole("radio", { name: /项目覆盖/ }));
-    await user.click(screen.getByRole("button", { name: "下一题" }));
     await user.click(screen.getByRole("checkbox", { name: /其他答案/ }));
     const otherInput = screen.getByRole("textbox", { name: "其他答案" });
     await user.type(otherInput, "需要兼容旧版");
@@ -234,17 +234,96 @@ describe("InteractionCard", () => {
     expect(screen.getByRole("region", { name: "待回答的问题" })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "已回答的问题" })).not.toBeInTheDocument();
     expect(port.cancel).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "展开问题" }));
+    expect(await screen.findByText("第一版采用哪种配置范围？")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(port.saveDraft).toHaveBeenCalledWith(expect.objectContaining({ collapsed: false })),
+    );
   });
 
-  it("按钮获得焦点时按 Enter 保留原生按钮行为，不触发全局分页提交", async () => {
+  it("下一题获得焦点时按 Enter 保留原生按钮行为，不触发全局分页提交", async () => {
     const user = userEvent.setup();
     const port = createPort();
     render(<Harness port={port} />);
-    await user.click(await screen.findByRole("button", { name: "下一题" }));
-    const skip = screen.getByRole("button", { name: "跳过" });
-    skip.focus();
+    await user.click(await screen.findByRole("radio", { name: /全局统一/ }));
+    const next = screen.getByRole("button", { name: "下一题" });
+    next.focus();
     await user.keyboard("{Enter}");
     expect(screen.getByText("还有什么限制？")).toBeInTheDocument();
     expect(port.submit).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit navigation for multiple choice and keeps prior answers when navigating backward", async () => {
+    const user = userEvent.setup();
+    render(<Harness port={createPort()} />);
+
+    await user.click(await screen.findByRole("radio", { name: /全局统一/ }));
+    await user.click(screen.getByRole("checkbox", { name: /审阅者/ }));
+    expect(screen.getByText("需要哪些角色？")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "下一题" }));
+    expect(await screen.findByText("还有什么限制？")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "前往上一题" }));
+    expect(await screen.findByRole("checkbox", { name: /审阅者/ })).toBeChecked();
+  });
+
+  it("keeps the last single-choice answer on screen until the user explicitly submits", async () => {
+    const user = userEvent.setup();
+    const port = createPort({ request: { ...REQUEST, questions: [REQUEST.questions[0]!] } });
+    render(<Harness port={port} />);
+
+    await user.click(await screen.findByRole("radio", { name: /全局统一/ }));
+    expect(port.submit).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "提交回答" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "提交回答" }));
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+  });
+
+  it("keeps a text response as a draft until the explicit final submission", async () => {
+    const user = userEvent.setup();
+    const port = createPort({
+      request: {
+        ...REQUEST,
+        questions: [{ ...REQUEST.questions[2]!, required: true as const }],
+      },
+    });
+    render(<Harness port={port} />);
+
+    await user.type(await screen.findByRole("textbox", { name: /还有什么限制？/ }), "必须离线可用");
+    expect(port.submit).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "提交回答" }));
+    await waitFor(() =>
+      expect(port.submit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          answers: [
+            { questionId: "notes", optionIds: [], freeText: "必须离线可用", skipped: false },
+          ],
+        }),
+      ),
+    );
+  });
+
+  it("shows a local required validation message when navigation would bypass an unanswered question", async () => {
+    const user = userEvent.setup();
+    render(<Harness port={createPort()} />);
+
+    await user.click(await screen.findByRole("button", { name: "前往下一题" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("请选择一项或填写答案。");
+    expect(screen.getByText("第一版采用哪种配置范围？")).toBeInTheDocument();
+  });
+
+  it("preserves answers and exposes a retry only after a failed final submission", async () => {
+    const user = userEvent.setup();
+    const port = createPort();
+    vi.mocked(port.submit).mockRejectedValueOnce(new Error("temporary failure"));
+    render(<Harness port={port} />);
+
+    await user.click(await screen.findByRole("radio", { name: /全局统一/ }));
+    await user.click(screen.getByRole("button", { name: "下一题" }));
+    await user.click(screen.getByRole("button", { name: "提交回答" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("提交失败，答案仍保留");
+    const retry = screen.getByRole("button", { name: "重试提交" });
+    await user.click(retry);
+    await waitFor(() => expect(port.submit).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "重试提交" })).not.toBeInTheDocument();
   });
 });

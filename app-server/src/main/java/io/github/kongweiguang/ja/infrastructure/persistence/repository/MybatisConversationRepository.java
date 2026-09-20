@@ -904,28 +904,31 @@ public final class MybatisConversationRepository implements ConversationReposito
     }
 
     /**
-     * 在唯一持久化事务中先验证 Thread CAS，再登记 Turn 取消事实；SQLite 写锁保证两次更新
-     * 不会被终态提交插入。已登记请求只回读原有版本，避免重试制造第二个 callback 资格。
+     * 在唯一持久化事务中读取 Turn 关联的当前 Thread revision 与 mutation version，再登记取消事实；
+     * SQLite 写锁保证两次更新不会被终态提交插入。已登记请求无条件回读原有 receipt，避免重试制造第二个 callback 资格。
      */
     @Override
-    public CancellationClaim claimCancellation(String threadId, String turnId,
-                                               long expectedThreadRevision, String reason,
-                                               Instant occurredAt) {
+    public CancellationClaim claimCancellation(String turnId, String reason, Instant occurredAt) {
         ensureOpen();
-        if (expectedThreadRevision < 0) throw new IllegalArgumentException("invalid thread revision");
         String boundedReason = cancellationReason(reason);
         Objects.requireNonNull(occurredAt, "occurredAt");
-        return transactions.required(mapper -> {
-            PersistenceRecords.ThreadRow thread = mapper.history().selectThread(threadId);
-            if (thread == null) notFound("thread");
-            PersistenceRecords.TurnRow turn = mapper.agent().selectTurn(new PersistenceRecords.TurnKey(threadId, turnId));
+        return claimCancellation(turnId, boundedReason, occurredAt, true);
+    }
+
+    /**
+     * 取消读写窗口若被正常终态赢走，只重读一次权威 Turn；终态转为 ACK，仍非终态才重新 claim，
+     * 不把 SQLite 默认 isolation 的 CAS 竞争暴露成客户端失败。
+     */
+    private CancellationClaim claimCancellation(String turnId, String reason, Instant occurredAt,
+                                                boolean retryAfterRace) {
+        try {
+            return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = mapper.agent().selectTurnById(turnId);
             if (turn == null) notFound("turn");
+            String threadId = requiredText(turn.threadId(), "thread_id");
+            long currentThreadRevision = requiredNumber(turn.threadRevision(), "thread_revision");
             TurnState state = TurnState.valueOf(requiredText(turn.state(), "state"));
-            Long claimedExpectedRevision = turn.cancelExpectedThreadRevision();
-            if (claimedExpectedRevision != null) {
-                if (expectedThreadRevision != claimedExpectedRevision) {
-                    throw conflict("thread revision is stale");
-                }
+            if (turn.cancelRequestedAt() != null) {
                 Long claimedThreadRevision = turn.cancelThreadRevision();
                 Long claimedTurnMutationVersion = turn.cancelTurnMutationVersion();
                 if (claimedThreadRevision == null || claimedTurnMutationVersion == null) {
@@ -935,20 +938,28 @@ public final class MybatisConversationRepository implements ConversationReposito
                 return new CancellationClaim(true, state, claimedThreadRevision,
                         claimedTurnMutationVersion);
             }
-            if (state.terminal()) throw conflict("turn is already terminal");
-            requireRevision(thread, expectedThreadRevision);
+            if (state.terminal()) {
+                return new CancellationClaim(false, state, currentThreadRevision, turn.mutationVersion());
+            }
             long expectedMutationVersion = turn.mutationVersion();
-            long claimedThreadRevision = expectedThreadRevision + 1;
+            long claimedThreadRevision = currentThreadRevision + 1;
             long claimedTurnMutationVersion = expectedMutationVersion + 1;
-            requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
-                    threadId, expectedThreadRevision, instant(occurredAt))), "thread revision is stale");
             requireChanged(mapper.agent().claimCancellation(new PersistenceRecords.CancellationClaim(
-                            threadId, turnId, expectedMutationVersion, instant(occurredAt), boundedReason,
-                            expectedThreadRevision, claimedThreadRevision, claimedTurnMutationVersion)),
+                            threadId, turnId, expectedMutationVersion, instant(occurredAt), reason,
+                            claimedThreadRevision, claimedTurnMutationVersion)),
                     "turn changed concurrently");
+            requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
+                    threadId, currentThreadRevision, instant(occurredAt))), "thread revision changed concurrently");
             return new CancellationClaim(true, state, claimedThreadRevision,
                     claimedTurnMutationVersion);
-        });
+            });
+        } catch (StorageException race) {
+            if (race.code() != StorageException.Code.CAS_CONFLICT || !retryAfterRace) throw race;
+            TurnSnapshot current = findTurn(turnId).orElse(null);
+            if (current == null) throw race;
+            // 二次事务重新读取 cancel_requested_at，已终态但已有 intent 时仍返回首次 receipt。
+            return claimCancellation(turnId, reason, occurredAt, false);
+        }
     }
 
     /** Resume 候选在一个 SQLite 快照内联表读取并严格解码 execution。 */
@@ -1031,29 +1042,52 @@ public final class MybatisConversationRepository implements ConversationReposito
         });
     }
 
-    /** SUSPENDED 没有进程内 owner，取消直接原子关闭输入、审批和 execution。 */
+    /**
+     * SUSPENDED 没有进程内 owner，取消事务先读取当前双版本并登记 intent，再原子关闭输入、审批和 execution。
+     * 重试若已看到 intent 或终态，只返回权威 receipt，不再次推进 Thread revision。
+     */
     @Override
-    public CancelResult cancelSuspended(String turnId, long expectedThreadRevision, Instant occurredAt) {
+    public CancelResult cancelSuspended(String turnId, Instant occurredAt) {
         ensureOpen();
         Objects.requireNonNull(occurredAt, "occurredAt");
         return transactions.required(mapper -> {
-            PersistenceRecords.ResumeTurnRow row = mapper.agent().selectResumeTurn(turnId);
-            if (row == null) notFound("suspended turn");
+            PersistenceRecords.TurnRow current = mapper.agent().selectTurnById(turnId);
+            if (current == null) notFound("turn");
+            TurnState state = TurnState.valueOf(requiredText(current.state(), "state"));
+            long threadRevision = requiredNumber(current.threadRevision(), "thread_revision");
+            if (state.terminal()) {
+                return new CancelResult(turnId, threadRevision, current.mutationVersion());
+            }
+            if (state != TurnState.SUSPENDED) {
+                throw new StorageException(StorageException.Code.CAS_CONFLICT,
+                        "turn still has an execution owner");
+            }
+            String threadId = requiredText(current.threadId(), "thread_id");
+            if (current.cancelRequestedAt() == null) {
+                long claimedThreadRevision = threadRevision + 1;
+                long claimedTurnMutationVersion = current.mutationVersion() + 1;
+                requireChanged(mapper.agent().claimCancellation(new PersistenceRecords.CancellationClaim(
+                        threadId, turnId, current.mutationVersion(), instant(occurredAt),
+                        cancellationReason("user cancelled"), claimedThreadRevision,
+                        claimedTurnMutationVersion)), "suspended turn changed concurrently");
+                requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
+                        threadId, threadRevision, instant(occurredAt))),
+                        "thread revision changed concurrently");
+                threadRevision = claimedThreadRevision;
+                current = mapper.agent().selectTurnById(turnId);
+            }
             requireChanged(mapper.agent().cancelSuspendedTurn(new PersistenceRecords.ResumeTurnCas(
-                    turnId, row.threadId(), expectedThreadRevision, row.turnMutationVersion(),
+                    turnId, threadId, threadRevision, current.mutationVersion(),
                     instant(occurredAt))), "suspended turn changed concurrently");
-            requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
-                    row.threadId(), expectedThreadRevision, instant(occurredAt))),
-                    "thread revision is stale");
             mapper.attachments().discardTurnPendingInputAttachments(turnId, instant(occurredAt));
             mapper.attachments().deleteTurnPendingInputAttachments(turnId);
             mapper.agent().cancelPendingInputs(new PersistenceRecords.PendingInputCancel(turnId, instant(occurredAt)));
             mapper.agent().closePendingApprovals(turnId, instant(occurredAt));
             requireChanged(mapper.agent().deleteTurnExecution(turnId), "suspended execution delete lost");
-            closeInteractionForCancelledTurn(mapper, row, occurredAt);
+            closeInteractionForCancelledTurn(mapper, threadId, turnId, occurredAt);
             TaskRecoveryPersistence.reconcileTerminal(
                     mapper, objectMapper, turnId, TurnState.CANCELLED, occurredAt);
-            return new CancelResult(turnId, expectedThreadRevision + 1, row.turnMutationVersion() + 1);
+            return new CancelResult(turnId, threadRevision, current.mutationVersion() + 1);
         });
     }
 
@@ -1092,13 +1126,13 @@ public final class MybatisConversationRepository implements ConversationReposito
 
     /** Turn 被用户停止时同步使未决问题失效，避免 UI 保留一个已经不可恢复的提问卡片。 */
     private void closeInteractionForCancelledTurn(PersistenceMappers mapper,
-                                                   PersistenceRecords.ResumeTurnRow turn,
+                                                   String threadId, String turnId,
                                                    Instant occurredAt) {
-        PersistenceRecords.InteractionRow interaction = mapper.interactions().selectActiveInteraction(turn.threadId());
-        if (interaction == null || !turn.turnId().equals(interaction.turnId())) return;
+        PersistenceRecords.InteractionRow interaction = mapper.interactions().selectActiveInteraction(threadId);
+        if (interaction == null || !turnId.equals(interaction.turnId())) return;
         requireChanged(mapper.interactions().closeInteraction(new PersistenceRecords.InteractionCloseCas(
                 interaction.threadId(), interaction.requestId(), interaction.revision(),
-                "CANCELLED", "turn-cancel-" + turn.turnId(), occurredAt.toString())),
+                "CANCELLED", "turn-cancel-" + turnId, occurredAt.toString())),
                 "interaction cancellation lost its pending row");
         requireChanged(mapper.interactions().insertEvent(new PersistenceRecords.InteractionEventInsert(
                 interaction.threadId(), interaction.requestId(), interaction.revision() + 1,
@@ -1430,6 +1464,20 @@ public final class MybatisConversationRepository implements ConversationReposito
             if (thread == null) return Optional.empty();
             PersistenceRecords.TurnRow turn = mapper.agent().selectTurn(new PersistenceRecords.TurnKey(threadId, turnId));
             return turn == null ? Optional.empty() : Optional.of(turnSnapshot(turn, thread.revision()));
+        });
+    }
+
+    /**
+     * 通过全局唯一 Turn ID 回读权威状态，供活动 owner 已释放后的重复取消和终态竞态 ACK 使用。
+     */
+    @Override
+    public Optional<TurnSnapshot> findTurn(String turnId) {
+        ensureOpen();
+        return transactions.required(mapper -> {
+            PersistenceRecords.TurnRow turn = mapper.agent().selectTurnById(turnId);
+            if (turn == null) return Optional.empty();
+            return Optional.of(turnSnapshot(turn,
+                    requiredNumber(turn.threadRevision(), "thread_revision")));
         });
     }
 
@@ -1820,6 +1868,12 @@ public final class MybatisConversationRepository implements ConversationReposito
      */
     private static String requiredText(String value, String column) {
         if (value == null || value.isBlank()) throw corrupted(column);
+        return value;
+    }
+
+    /** 必需数值列统一拒绝 NULL，取消 ACK 不允许用零值掩盖损坏的权威 revision。 */
+    private static long requiredNumber(Long value, String column) {
+        if (value == null || value < 0) throw corrupted(column);
         return value;
     }
 

@@ -2786,7 +2786,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "attachment/preview/close" => ["previewSessionId"].as_slice(),
         "turn/start" => ["threadId", "content", "deadlineMs"].as_slice(),
         "turn/resume" => ["turnId", "expectedThreadRevision"].as_slice(),
-        "turn/cancel" => ["turnId", "expectedThreadRevision"].as_slice(),
+        "turn/cancel" => ["turnId"].as_slice(),
         "turn/input/enqueue" => ["turnId", "content"].as_slice(),
         "turn/input/prioritize" | "turn/input/delete" => {
             ["turnId", "inputId", "expectedInputRevision"].as_slice()
@@ -3233,7 +3233,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         {
             return Err("attachment preview session id is invalid");
         }
-        "turn/resume" | "turn/cancel" => {
+        "turn/resume" => {
             require_text(params, "turnId")?;
             if !integer_in_bounds(
                 params.get("expectedThreadRevision"),
@@ -3241,6 +3241,11 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 9_007_199_254_740_991,
             ) {
                 return Err("turn revision is invalid");
+            }
+        }
+        "turn/cancel" => {
+            if !valid_prefixed_id(params.get("turnId"), "turn_") {
+                return Err("turn cancel identity is invalid");
             }
         }
         "turn/input/enqueue"
@@ -4123,7 +4128,8 @@ fn integer_in_bounds(value: Option<&Value>, minimum: u64, maximum: u64) -> bool 
         .is_some_and(|number| (minimum..=maximum).contains(&number))
 }
 
-/// 校验 v1 Wire Schema 使用的 Prefixed Identifier，保持各身份命名空间隔离。
+/// 校验 v1 Wire Schema 使用的 Prefixed Identifier，保持各身份命名空间隔离；Turn 的五字符
+/// 前缀对应合同总长 101，因此其 suffix 比通用 95 字符上限多保留一个字符。
 fn valid_prefixed_id(value: Option<&Value>, prefix: &str) -> bool {
     let Some(id) = value.and_then(Value::as_str) else {
         return false;
@@ -4131,8 +4137,9 @@ fn valid_prefixed_id(value: Option<&Value>, prefix: &str) -> bool {
     let Some(suffix) = id.strip_prefix(prefix) else {
         return false;
     };
+    let maximum_suffix = if prefix == "turn_" { 96 } else { 95 };
     !suffix.is_empty()
-        && suffix.len() <= 95
+        && suffix.len() <= maximum_suffix
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))

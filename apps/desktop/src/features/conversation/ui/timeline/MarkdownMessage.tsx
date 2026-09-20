@@ -76,6 +76,11 @@ function createSafeMarkdownComponents(
         </div>
       );
     },
+    table: ({ children }: { children?: ReactNode }) => (
+      <div className="ja-markdown__table-wrap">
+        <table>{children}</table>
+      </div>
+    ),
   };
 }
 

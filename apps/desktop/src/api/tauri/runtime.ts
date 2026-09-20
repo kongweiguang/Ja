@@ -164,8 +164,8 @@ const TurnStartInputSchema = z
   .strict();
 
 /**
- * 镜像 Rust cancel DTO；revision CAS 取代旧 thread/reason hint，
- * 陈旧点击不能取消同一 Turn 的更新状态。
+ * 镜像 Rust cancel DTO；取消只依赖不可变 Turn identity，服务端负责处理自然终态与重复请求
+ * 的竞态，避免流式 Thread revision 让一个仍在运行的 Turn 被客户端误判为过期。
  */
 const TurnCancelInputSchema = z
   .object({
@@ -173,7 +173,6 @@ const TurnCancelInputSchema = z
       .string()
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(101),
-    expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
 
@@ -492,6 +491,7 @@ const SAFE_RUNTIME_ERRORS: Record<string, { message: string; retryable: boolean 
   APPROVAL_ALREADY_RESOLVED: { message: "审批已处理", retryable: false },
   APPROVAL_NOT_FOUND: { message: "审批不存在", retryable: false },
   THREAD_BUSY: { message: "对话正在执行", retryable: true },
+  TURN_NOT_FOUND: { message: "运行不存在或已结束", retryable: false },
   TURN_NOT_RESUMABLE: { message: "当前运行无法继续", retryable: false },
   TURN_RESUME_ORDER_CONFLICT: { message: "请先处理更早中断的运行", retryable: true },
   TURN_INPUT_QUEUE_FULL: { message: "排队消息已满，请等待处理后再发送", retryable: true },
@@ -964,7 +964,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
    * 而不是由 UI 猜测状态。
    */
   async turnCancel(input: TurnCancelInput): Promise<TurnCancelResult> {
-    // 校验阶段固定 turn identity 与 revision CAS，陈旧 UI 不能取消更新后的 Turn。
+    // 校验阶段只固定不可变 Turn identity；自然终态与重复取消由服务端幂等收敛。
     const parsed = parseRuntimeInput(TurnCancelInputSchema, input);
     // 跨进程阶段使用专用 cancel command；终态仍由后续 Runtime 事件确认。
     const result = await this.invoke(

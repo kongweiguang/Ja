@@ -135,14 +135,12 @@ impl From<domain::TurnContentPart> for TurnContentPartDto {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TurnCancelInputDto {
     pub turn_id: String,
-    pub expected_thread_revision: u64,
 }
 impl From<TurnCancelInputDto> for domain::TurnCancelInput {
-    /// 取消 DTO 只映射业务 identity 与 CAS revision，不恢复已删除的 reason/thread 字段。
+    /// 取消 DTO 只映射不可变业务 identity；revision 属于结果信息，不是取消授权条件。
     fn from(value: TurnCancelInputDto) -> Self {
         Self {
             turn_id: value.turn_id,
-            expected_thread_revision: value.expected_thread_revision,
         }
     }
 }

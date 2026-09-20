@@ -224,8 +224,13 @@ async function configureFixtureAndCreateThread(page, workspaceRoot, baseUrl) {
       const modelId = current.models[0]?.modelId;
       if (modelId === undefined) throw new Error("isolated provider_e2e model is missing");
       if (current.baseUrl !== endpoint) throw new Error("fixture Provider endpoint was not staged");
-      const created = await createHistoryAdapter().threadCreate({
+      const history = createHistoryAdapter();
+      const workspace = await history.workspaceOpen({
         cwd,
+        displayName: "Conversation Progress E2E",
+      });
+      const created = await history.threadCreate({
+        cwd: workspace.root,
         title,
         providerId: "provider_e2e",
         modelId,
@@ -233,7 +238,12 @@ async function configureFixtureAndCreateThread(page, workspaceRoot, baseUrl) {
         accessMode: "full_access",
         collaborationMode: "default",
       });
-      return { threadId: created.threadId, modelId };
+      return {
+        threadId: created.threadId,
+        workspaceId: workspace.workspaceId,
+        workspaceName: workspace.displayName,
+        modelId,
+      };
     },
     { cwd: workspaceRoot, endpoint: baseUrl, title: TITLE },
   );
@@ -270,35 +280,47 @@ async function waitForApplication(page, deadline) {
   });
 }
 
-/**
- * E2E composition 的项目选择器只在“添加项目”动作后交付受控临时目录；settings scope 在 runtime
- * ready 后仍可能短暂同步，必须等真实按钮可用再点击，不能把一次被禁用的点击误判成 picker 失败。
- *
- * 这里只确认项目已登记，不臆造当前选中状态，后续由 thread identity 触发真实 workspace activation。
- */
-async function ensureProject(page, deadline) {
-  const project = page.locator('[aria-label="项目列表"] button[data-scope-kind="project"]').first();
-  if ((await project.count()) === 0) {
-    const addProject = page.getByRole("button", { name: "添加项目", exact: true });
-    await addProject.waitFor({ state: "visible", timeout: timeout(deadline) });
-    await waitForCondition(
-      "项目选择可用",
-      () => addProject.isDisabled().then((disabled) => !disabled),
-      deadline,
-    );
-    await addProject.click({ timeout: timeout(deadline) });
-  }
-  await page
+/** 选择已由 App Server `workspaceOpen` 建立的隔离项目，不把回复验收耦合到原生目录 picker。 */
+async function selectProject(page, workspaceName, deadline) {
+  const project = page
     .locator('[aria-label="项目列表"] button[data-scope-kind="project"]')
-    .first()
-    .waitFor({ state: "visible", timeout: timeout(deadline) });
+    .filter({ hasText: workspaceName });
+  await project.waitFor({ state: "visible", timeout: timeout(deadline) });
+  if ((await project.getAttribute("aria-current")) !== "page") {
+    await project.click({ timeout: timeout(deadline) });
+  }
 }
 
-/**
- * reload 后只等待产品自身的 lifecycle controller 恢复原生连接，避免测试 adapter 与真实 renderer
- * 并发争用 start/configure 时序；后续仍按同一持久 Thread 读取，不能用新窗口或新会话替代恢复。
- */
+/** reload 后经生产 typed adapter 恢复 stopped generation，并二次确认 ready identity。 */
 async function restoreRuntimeAfterReload(page, deadline) {
+  await page.waitForFunction(
+    () => typeof globalThis.__TAURI_INTERNALS__?.invoke === "function",
+    undefined,
+    { timeout: timeout(deadline) },
+  );
+  await page.evaluate(
+    async ({ timeoutMs }) => {
+      const { createRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+      const adapter = createRuntimeHostAdapter();
+      const deadlineAt = Date.now() + timeoutMs;
+      let state = await adapter.state();
+      while (state.status === "starting" || state.status === "stopping") {
+        if (Date.now() >= deadlineAt)
+          throw new Error(`runtime restore timed out in ${state.status}`);
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+        state = await adapter.state();
+      }
+      if (state.status === "stopped") state = await adapter.start();
+      if (state.status !== "ready" && state.status !== "busy") {
+        throw new Error(`runtime restore did not reach ready: ${state.status}`);
+      }
+      const confirmed = await adapter.state();
+      if (confirmed.status !== "ready" && confirmed.status !== "busy") {
+        throw new Error(`runtime restore confirmation failed: ${confirmed.status}`);
+      }
+    },
+    { timeoutMs: timeout(deadline) },
+  );
   await waitForApplication(page, deadline);
 }
 
@@ -371,13 +393,13 @@ async function expandReadResult(process, deadline) {
 /**
  * 断言已结算的过程仍按 Tool 交错，且最后一轮正文不回流到过程。
  *
- * 末尾 reasoning summary 仍可审计，但最终 output_text 只属于 AssistantResponse；少一个过程条目
- * 正是防止 terminal 时正文从过程面板搬运出去的证据。
+ * 末尾 reasoning summary 在 terminal 后继续可审计，但最终 output_text 只属于 AssistantResponse；
+ * live 与 reload 都必须保留相同的公开过程类型顺序。
  */
 function assertProcessSequence(items, label) {
   assert.deepEqual(
     items.map((item) => item.kind),
-    ["commentary", "tool", "commentary", "commentary", "tool"],
+    ["commentary", "tool", "commentary", "commentary", "tool", "commentary"],
     `${label} must interleave commentary and tools`,
   );
   assert.deepEqual(
@@ -396,8 +418,7 @@ function assertProcessSequence(items, label) {
 }
 
 /**
- * 终态 reasoning summary 在实时 Draft 清理后会在历史 read 中恢复，所以 live/reload 的过程条数
- * 可以不同；最终 output_text 则无论何时都不能进入过程。
+ * 终态 reasoning summary 由实时 Draft 保留到历史 read 接管；最终 output_text 无论何时都不能进入过程。
  */
 function assertFinalBodyOutsideProcess(items, label) {
   assert.equal(
@@ -407,7 +428,7 @@ function assertFinalBodyOutsideProcess(items, label) {
   );
 }
 
-/** 对外报告必须同时证明实时答复的稳定位置、终态折叠与 reload 后的历史过程，防止只验一个截图。 */
+/** 对外报告必须同时证明实时过程/回复分区、持续生命信号、terminal 原位校准与历史顺序。 */
 export function validateConversationProgressReport(report) {
   assert.equal(report?.schemaVersion, 1);
   assert.equal(report?.status, "passed");
@@ -418,10 +439,13 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.provider?.kind, "deterministic_loopback");
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.provider?.toolCalls, 2);
-  assert.equal(report?.live?.commentaryBeforeFirstTool, true);
-  assert.equal(report?.live?.streamingFinalResponse, true);
+  assert.equal(report?.live?.responseBeforeFirstTool, true);
+  assert.equal(report?.live?.workingStatusWithProcess, true);
+  assert.equal(report?.live?.finalResponseBeforeTerminal, true);
   assert.equal(report?.live?.finalBodyOutsideProcess, true);
-  assert.equal(report?.live?.finalAnswerNodeStable, true);
+  assert.equal(report?.live?.processNodeStable, true);
+  assert.equal(report?.live?.responseNodeStable, true);
+  assert.equal(report?.live?.terminalCalibratedExistingResponse, true);
   assert.equal(report?.live?.completedProcessCollapsed, true);
   assert.equal(report?.live?.readSummaryVisible, true);
   assert.deepEqual(report?.live?.sequence, [
@@ -430,6 +454,7 @@ export function validateConversationProgressReport(report) {
     "commentary",
     "commentary",
     "tool:shell",
+    "commentary",
   ]);
   assert.equal(report?.live?.noDuplicateTools, true);
   assert.equal(report?.reload?.finalBodyOutsideProcess, true);
@@ -448,10 +473,10 @@ export function validateConversationProgressReport(report) {
 }
 
 /**
- * 在真实窗口提交 Turn；最终正文先在答复节点流式显示，terminal 只收口状态并折叠工作过程。
+ * 在真实窗口提交 Turn；当前 text delta 先进入外部回复区，携带 Tool 的 model step 提交后归档过程，
+ * 无 Tool 的最后一轮则保持原位直到 terminal 权威校准。
  *
- * 前两轮随后继续调用 Tool，所以它们的已确认文本会归档到过程；最后一轮没有 Tool，必须始终留在
- * 同一个最终答复节点。受控 fixture gate 使这两个状态可在真窗中分别观察，避免依赖任意等待时间。
+ * 受控 fixture gate 让每个结构化边界都可单独观察，不依赖任意等待时间或最后一个 Tool 的位置猜测。
  */
 export async function runConversationProgressWebView2({
   page,
@@ -470,12 +495,11 @@ export async function runConversationProgressWebView2({
   // runner 已连接到新启动的真实窗口；这里额外 reload 会与旧 renderer 的 stop cleanup 竞争。
   // 历史恢复阶段仍执行一次真实 reload，因而不会削弱 reload + persisted history 的验收边界。
   await waitForApplication(page, deadline);
-  await ensureProject(page, deadline);
   const created = await configureFixtureAndCreateThread(page, workspaceRoot, fixture.baseUrl);
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await instrumentRuntimeInvocations(page);
   await restoreRuntimeAfterReload(page, deadline);
-  await ensureProject(page, deadline);
+  await selectProject(page, created.workspaceName, deadline);
   await selectThread(page, created.threadId, deadline);
   const input = page.getByRole("textbox", { name: "消息", exact: true });
   await input.fill(PROMPT);
@@ -490,22 +514,21 @@ export async function runConversationProgressWebView2({
       timeout: timeout(deadline),
     });
 
-  const workProcess = page.locator("section.ja-work-process").last();
-  const firstFinalDraft = page
-    .getByRole("article", { name: "最终答复" })
-    .last()
-    .getByText(conversationProgressFixtureMarkers.commentary1, { exact: false });
-  await firstFinalDraft.waitFor({ state: "visible", timeout: timeout(deadline) });
-  const activeAnswer = page.getByRole("article", { name: "最终答复" }).last();
+  const responseShell = page.locator('.ja-chat-message-final[data-role="response"]').last();
+  await responseShell.getByText("正在工作", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  await responseShell
+    .getByText(conversationProgressFixtureMarkers.commentary1, { exact: false })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  // 首个真实 delta 已归属权威 Turn；本地提交壳可能在 ACK 前存在，不能拿它冒充流式节点基线。
+  const responseShellHandle = await responseShell.elementHandle();
+  assert.ok(responseShellHandle, "the authoritative streaming response must have a DOM node");
   assert.equal(
-    await activeAnswer.getByText("正在回复", { exact: true }).count(),
-    1,
-    "the active final-answer surface must label a streamed response",
-  );
-  assert.equal(
-    await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary1).count(),
+    await page.locator("section.ja-work-process").count(),
     0,
-    "an active final draft must not also appear inside WorkProcess",
+    "text before the first Tool must start in the response surface",
   );
   assert.equal(
     await page.locator(".ja-tool-details").count(),
@@ -524,6 +547,7 @@ export async function runConversationProgressWebView2({
   );
   fixture.releaseFirstText();
 
+  const workProcess = page.locator("section.ja-work-process").last();
   await workProcess.locator('.ja-tool-details[data-tool-kind="read"]').waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -532,6 +556,22 @@ export async function runConversationProgressWebView2({
     state: "visible",
     timeout: timeout(deadline),
   });
+  await responseShell.getByText("正在工作", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  const responseWithProcessHandle = await responseShell.elementHandle();
+  assert.ok(responseWithProcessHandle, "the response below WorkProcess must have a DOM node");
+  assert.equal(
+    await responseShellHandle.evaluate(
+      (streamingNode, processNode) => streamingNode === processNode,
+      responseWithProcessHandle,
+    ),
+    true,
+    "Tool settlement must retain the authoritative response node",
+  );
+  const streamingProcessHandle = await workProcess.elementHandle();
+  assert.ok(streamingProcessHandle, "the streaming WorkProcess must have a DOM node");
   await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary2).waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -545,15 +585,20 @@ export async function runConversationProgressWebView2({
     timeout: timeout(deadline),
   });
   fixture.releaseFinalNarrative();
-  await activeAnswer
+  await responseShell
     .getByText(conversationProgressFixtureMarkers.final, { exact: false })
-    .waitFor({ state: "visible", timeout: timeout(deadline) });
-  const streamingAnswerHandle = await activeAnswer.elementHandle();
-  assert.ok(streamingAnswerHandle, "the streamed final answer must have a DOM node");
+    .waitFor({
+      state: "visible",
+      timeout: timeout(deadline),
+    });
+  await responseShell.getByText("正在工作", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
   assert.equal(
-    await workProcess.getByText(conversationProgressFixtureMarkers.final, { exact: false }).count(),
+    await publicNarrative(workProcess, conversationProgressFixtureMarkers.final).count(),
     0,
-    "the final body must remain outside WorkProcess while it streams",
+    "the final output body must remain outside WorkProcess before terminal",
   );
   fixture.releaseFinalText();
   await waitForCondition(
@@ -569,12 +614,19 @@ export async function runConversationProgressWebView2({
     .locator('.ja-chat-message-final[data-response-state="completed"]')
     .last();
   const completedAnswerHandle = await completedAnswer.elementHandle();
-  assert.ok(completedAnswerHandle, "the completed final answer must retain a DOM node");
-  const finalAnswerNodeStable = await streamingAnswerHandle.evaluate(
+  assert.ok(completedAnswerHandle, "terminal must expose a completed final-answer node");
+  const responseNodeStable = await responseShellHandle.evaluate(
     (streamingNode, completedNode) => streamingNode === completedNode,
     completedAnswerHandle,
   );
-  assert.equal(finalAnswerNodeStable, true, "terminal must not replace the streamed final-answer node");
+  assert.equal(responseNodeStable, true, "terminal must calibrate the existing response node");
+  const completedProcessHandle = await workProcess.elementHandle();
+  assert.ok(completedProcessHandle, "terminal must retain the WorkProcess node");
+  const processNodeStable = await streamingProcessHandle.evaluate(
+    (streamingNode, completedNode) => streamingNode === completedNode,
+    completedProcessHandle,
+  );
+  assert.equal(processNodeStable, true, "terminal must not replace the WorkProcess container");
   await waitForCondition(
     "completed WorkProcess collapse",
     () =>
@@ -599,7 +651,7 @@ export async function runConversationProgressWebView2({
 
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await restoreRuntimeAfterReload(page, deadline);
-  await ensureProject(page, deadline);
+  await selectProject(page, created.workspaceName, deadline);
   await selectThread(page, created.threadId, deadline);
   await page
     .getByText(conversationProgressFixtureMarkers.final, { exact: false })
@@ -655,10 +707,13 @@ export async function runConversationProgressWebView2({
       attempts: provider.attempts,
     },
     live: {
-      commentaryBeforeFirstTool: true,
-      streamingFinalResponse: true,
+      responseBeforeFirstTool: true,
+      workingStatusWithProcess: true,
+      finalResponseBeforeTerminal: true,
       finalBodyOutsideProcess: true,
-      finalAnswerNodeStable,
+      processNodeStable,
+      responseNodeStable,
+      terminalCalibratedExistingResponse: true,
       completedProcessCollapsed: true,
       readSummaryVisible: liveReadSummary.length > 0,
       sequence: liveSequence,

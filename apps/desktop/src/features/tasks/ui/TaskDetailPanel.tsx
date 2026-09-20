@@ -442,7 +442,13 @@ export function TaskDetailPanel({
             attachmentDraftItems={conversation.attachmentDraftItems}
             activeTurn={conversation.activeTurn}
             suspendedTurn={conversation.suspendedTurn}
-            awaitingUserInput={clarification?.request?.status === "pending"}
+            interactionPresentation={
+              clarification?.request?.status !== "pending"
+                ? "none"
+                : clarification.collapsed
+                  ? "collapsed"
+                  : "expanded"
+            }
             disabled={conversation.disabled || closing}
             sending={conversation.sending}
             preferenceBusy={conversation.preferenceBusy}

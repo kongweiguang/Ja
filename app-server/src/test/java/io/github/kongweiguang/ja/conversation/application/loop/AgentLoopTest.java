@@ -662,21 +662,28 @@ final class AgentLoopTest {
         }
     }
 
-    /** 持续失败只受公开的模型轮次预算约束，不再被等价参数或 Tool 副作用启发式提前截断。 */
+    /** 最后一个模型轮次不再暴露 Tool，使持续失败也能在硬预算内生成基于事实的最终答复。 */
     @Test
-    void repeatedToolFailuresStopOnlyAtConfiguredModelRoundLimit() {
+    void finalModelRoundClosesWithoutToolsAtConfiguredLimit() {
         RecordingStore store = new RecordingStore();
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         FailingReadTool tool = new FailingReadTool();
         AtomicInteger requests = new AtomicInteger();
         ModelPort model = (request, sink, cancellation) -> {
             int round = requests.incrementAndGet();
-            assertEquals(List.of(tool.spec()), request.tools());
-            if (round > 1) assertTrue(latestToolResult(request).error());
-            sink.onEvent(new ModelPort.ToolCallReady(
-                    "call_budget_" + round, "read", textArguments("same"), 0));
+            if (round < 4) {
+                assertEquals(List.of(tool.spec()), request.tools());
+                if (round > 1) assertTrue(latestToolResult(request).error());
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_budget_" + round, "read", textArguments("same"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertTrue(request.tools().isEmpty(), "最终轮不得继续开放会产生副作用的 Tool");
+            assertTrue(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("best effort result"));
             return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
-                    ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
         };
 
         try (AgentLoop loop = loop(model, store, mcp)) {
@@ -684,10 +691,45 @@ final class AgentLoopTest {
                     CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
                     .toCompletableFuture().join();
 
-            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
-            assertEquals("BUDGET_EXCEEDED", result.terminal().errorCode());
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("best effort result", text(store.terminal.finalMessage()));
             assertEquals(4, requests.get());
-            assertEquals(4, tool.executions.get());
+            assertEquals(3, tool.executions.get());
+        }
+    }
+
+    /** Tool 配额刚好耗尽后立即进入无 Tool 收口轮，既不越过硬上限也不丢失最终答复。 */
+    @Test
+    void exhaustedToolBudgetClosesWithoutAnotherToolCall() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        RecoveringTool tool = new RecoveringTool("echo", ToolSideEffect.READ_ONLY, 0);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            if (round == 1) {
+                assertEquals(List.of(tool.spec()), request.tools());
+                sink.onEvent(new ModelPort.ToolCallReady(
+                        "call_last_allowed", "echo", textArguments("same"), 0));
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertTrue(request.tools().isEmpty(), "Tool 配额耗尽后不得再次暴露 Tool");
+            assertFalse(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("tool budget summary"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, requestWithToolLimit(List.of(tool), mcp, 1),
+                    CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
+                    .toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("tool budget summary", text(store.terminal.finalMessage()));
+            assertEquals(2, requests.get());
+            assertEquals(1, tool.executions.get());
         }
     }
 
@@ -1135,8 +1177,7 @@ final class AgentLoopTest {
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         SelfCancellingToken cancellation = new SelfCancellingToken();
         ModelPort model = (request, sink, token) -> {
-            store.claimCancellation("thr_test", "turn_test", store.committedRevision,
-                    "test cancellation", CLOCK.instant());
+            store.claimCancellation("turn_test", "test cancellation", CLOCK.instant());
             cancellation.cancel();
             return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
                     ModelPort.FinishReason.STOP, null, null));
@@ -1232,8 +1273,7 @@ final class AgentLoopTest {
                     event -> {
                         events.add(event);
                         if (event instanceof TurnEvent.ToolBatchCommitted) {
-                            store.claimCancellation("thr_test", "turn_test", store.committedRevision,
-                                    "between rounds", CLOCK.instant());
+                            store.claimCancellation("turn_test", "between rounds", CLOCK.instant());
                             cancellation.armAfterCurrentCheck();
                         }
                         return CompletableFuture.completedFuture(null);
@@ -1333,8 +1373,7 @@ final class AgentLoopTest {
             while (broker.pendingCount() == 0 && System.nanoTime() < deadline) Thread.sleep(1);
             assertEquals(1, broker.pendingCount());
 
-            store.claimCancellation("thr_test", "turn_test", store.committedRevision,
-                    "test cancellation", CLOCK.instant());
+            store.claimCancellation("turn_test", "test cancellation", CLOCK.instant());
             assertEquals(CancellationCoordinator.CancelOutcome.REQUESTED,
                     coordinator.cancel("thr_test", "turn_test", "test cancellation")
                             .toCompletableFuture().get(1, TimeUnit.SECONDS));
@@ -2330,12 +2369,7 @@ final class AgentLoopTest {
                 Invocation invocation,
                 ExecutionContext context,
                 CancellationToken cancellationToken) {
-            store.claimCancellation(
-                    "thr_test",
-                    "turn_test",
-                    store.committedRevision,
-                    "test cancellation",
-                    CLOCK.instant());
+            store.claimCancellation("turn_test", "test cancellation", CLOCK.instant());
             cancellationPublisher.run();
             return CompletableFuture.completedFuture(new ToolResult(
                     io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome.CANCELLED,
@@ -2632,16 +2666,15 @@ final class AgentLoopTest {
             return new CommitReceipt(++committedRevision, ++turnMutationVersion);
         }
         /** 记录取消声明并推进版本，供终态提交刷新权威 CAS token。 */
-        @Override public synchronized CancellationClaim claimCancellation(String threadId, String turnId,
-                long expectedThreadRevision, String reason, Instant occurredAt) {
-            if (state.terminal()) throw new AssertionError("terminal cancellation claim");
+        @Override public synchronized CancellationClaim claimCancellation(String turnId, String reason,
+                Instant occurredAt) {
+            if (state.terminal()) {
+                return new CancellationClaim(false, state, committedRevision, turnMutationVersion);
+            }
             if (cancellationClaimed) {
-                assertEquals(cancellationExpectedRevision, expectedThreadRevision);
                 return cancellationReceipt;
             }
-            assertEquals(expectedThreadRevision, committedRevision);
             cancellationClaimed = true;
-            cancellationExpectedRevision = expectedThreadRevision;
             cancellationReceipt = new CancellationClaim(true, state, ++committedRevision, ++turnMutationVersion);
             return cancellationReceipt;
         }

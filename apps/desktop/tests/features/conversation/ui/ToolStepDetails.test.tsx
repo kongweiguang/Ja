@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { WorkStepAdapter } from "@/features/conversation/domain/timelineTypes";
 import { WorkProcess } from "@/features/conversation/ui/timeline/WorkProcess";
+import { TimelineDisclosureCache } from "@/features/conversation/ui/timeline/timelineDisclosure";
 
 const turnId = "turn_tool_presentation";
 
@@ -164,13 +165,63 @@ describe("ToolStepDetails", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "工作过程，已完成，1 步" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看工作过程，已完成，1 步" }));
     const trigger = screen.getByRole("button", { name: /编辑，edit，src\/App\.tsx，完成/u });
     fireEvent.click(trigger);
     expect(screen.getByText("已完成 2 处替换")).toBeVisible();
     expect(
       screen.queryByText("Successfully replaced 2 block(s) in the file."),
     ).not.toBeInTheDocument();
+  });
+
+  /** Tool 展开选择使用 Item identity，流式转历史引起的虚拟卸载不能把用户正在查看的详情收回。 */
+  it("跨工作过程卸载保留工具详情展开选择", () => {
+    const cache = new TimelineDisclosureCache();
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    const step = {
+      ...base,
+      status: "completed" as const,
+      metadata: {
+        ...base.metadata,
+        presentation: {
+          ...presentation,
+          status: "success" as const,
+          summary: "工具调用完成",
+          outputPreview: "稳定输出",
+        },
+      },
+    };
+    const first = render(
+      <WorkProcess
+        steps={[step]}
+        disclosureCache={cache}
+        disclosureKey="exchange:tool"
+        disclosureThreadId="thr_tool_presentation"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /查看工作过程/u }));
+    const trigger = screen.getByRole("button", { name: /调用工具，custom_mcp/u });
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("稳定输出")).toBeVisible();
+    first.unmount();
+
+    render(
+      <WorkProcess
+        steps={[step]}
+        disclosureCache={cache}
+        disclosureKey="exchange:tool"
+        disclosureThreadId="thr_tool_presentation"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /工作过程/u })).toHaveAttribute("data-state", "open");
+    expect(screen.getByRole("button", { name: /调用工具，custom_mcp/u })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("稳定输出")).toBeVisible();
   });
 
   /** request_user_input 完成后只在工作时间线保留人类可读的选择结果，不让已回答卡占据 Composer。 */
@@ -203,7 +254,7 @@ describe("ToolStepDetails", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "工作过程，已完成，1 步" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看工作过程，已完成，1 步" }));
     const trigger = screen.getByRole("button", { name: /询问用户，request_user_input/u });
     expect(trigger).toHaveTextContent("询问用户");
     expect(trigger).toHaveTextContent("已选择：采用哪种配置范围？：按项目覆盖");

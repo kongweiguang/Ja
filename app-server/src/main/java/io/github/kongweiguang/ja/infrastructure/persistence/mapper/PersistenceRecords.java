@@ -81,8 +81,8 @@ public final class PersistenceRecords {
     public record TurnRow(String turnId, String threadId, String state,
                    long mutationVersion, String requestedAt, String updatedAt, String completedAt,
                    String terminalSummary, String errorCode, String errorMessage, String cancelRequestedAt,
-                   String cancelReason, Long cancelExpectedThreadRevision, Long cancelThreadRevision,
-                   Long cancelTurnMutationVersion, long inputQueueRevision, boolean acceptingInputs,
+                   String cancelReason, Long cancelThreadRevision, Long cancelTurnMutationVersion,
+                   long inputQueueRevision, boolean acceptingInputs,
                    Long threadRevision, String changeSetJson) { }
 
     /** Message 查询行保留数据库分配的稳定 ordinal。 */
@@ -151,10 +151,10 @@ public final class PersistenceRecords {
     public record TurnKey(String threadId, String turnId) { }
     /** 新 Turn 只接纳 Operation 身份与时间，禁止把可热更新环境固化到 Turn。 */
     public record TurnInsert(String turnId, String threadId, String occurredAt) { }
-    /** 取消声明同时冻结 Thread/Turn 两级 CAS 事实。 */
+    /** 取消声明同时冻结当前 Thread/Turn 两级 CAS 事实。 */
     public record CancellationClaim(String threadId, String turnId, long expectedTurnMutationVersion,
-                             String occurredAt, String reason, long expectedThreadRevision,
-                             long cancelThreadRevision, long cancelTurnMutationVersion) { }
+                             String occurredAt, String reason, long cancelThreadRevision,
+                             long cancelTurnMutationVersion) { }
     /** Turn 状态迁移的完整 CAS 参数，终态字段按目标状态允许 null。 */
     public record TurnCas(String threadId, String turnId, String state, long expectedTurnMutationVersion,
                    String occurredAt, String completedAt, String summary, String errorCode,

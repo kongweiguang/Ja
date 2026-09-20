@@ -5,6 +5,7 @@ import { useMemo, useRef, type ReactElement } from "react";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  shouldAdjustTimelineScrollPosition,
   TimelineScrollCache,
   useTimelineScroll,
   type UseTimelineScrollOptions,
@@ -101,6 +102,24 @@ describe("TimelineScrollCache", () => {
     cache.clear();
 
     expect(cache.get("thread:one")).toBeUndefined();
+  });
+
+  /** 可见长行的尾部流式增长不能按整行 delta 推动 viewport；完全位于上方的行仍需补偿。 */
+  it("only adjusts resize changes for rows fully above the reading viewport", () => {
+    const instance = {
+      scrollOffset: 200,
+      scrollAdjustments: 0,
+      scrollDirection: "forward" as const,
+    };
+
+    expect(shouldAdjustTimelineScrollPosition({ end: 280 }, 48, instance)).toBe(false);
+    expect(shouldAdjustTimelineScrollPosition({ end: 180 }, 48, instance)).toBe(true);
+    expect(
+      shouldAdjustTimelineScrollPosition({ end: 180 }, 48, {
+        ...instance,
+        scrollDirection: "backward",
+      }),
+    ).toBe(false);
   });
 
   /** 目标 Thread 有缓存时应按 row anchor+offset 恢复，而不是沿用来源 Thread 的像素位置。 */

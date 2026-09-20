@@ -417,7 +417,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectTurnById(turnId)).map(row ->
                 new TurnSummary(requiredText(row.threadId(), "thread_id"), requiredText(row.turnId(), "turn_id"),
                         requiredText(row.state(), "state"), requiredNumber(row.threadRevision(), "thread_revision"),
-                        row.cancelExpectedThreadRevision() != null)));
+                        row.cancelRequestedAt() != null)));
     }
 
     /** Tool artifact 使用 code point 游标，因此任意 offset 都不会落在 surrogate pair 中间。 */

@@ -1906,7 +1906,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         !isLegalTransition(turn.status, params.state)
       )
         return resync(state, params.threadId, "invalid_event");
-      next = clearDraft(next, params.turnId);
+      next = settleTerminalDraft(next, params.turnId, params.state);
       const terminalStatus: TimelineItemStatus =
         params.state === "completed"
           ? "completed"
@@ -2002,10 +2002,32 @@ function projectItem(
   };
 }
 
-/** Assistant Message 提交或 Terminal Event 到达后移除对应瞬态 Draft。 */
+/** Tool 模型步已持久化全部公开片段，因此清理对应瞬态 Draft，防止同一正文重复出现。 */
 function clearDraft(state: TimelineState, turnId: string): TimelineState {
   const draftByTurn = { ...state.draftByTurn };
   delete draftByTurn[turnId];
+  return { ...state, draftByTurn };
+}
+
+/**
+ * Terminal 只清理由权威 finalMessage 替代的 assistant Draft；公开 reasoning 需要留到完整历史快照
+ * 接管，取消态还必须保留用户已经看到的半成品正文。失败终态有独立安全收口回复，因此不把未结算
+ * Provider 正文冒充失败答复。
+ */
+function settleTerminalDraft(
+  state: TimelineState,
+  turnId: string,
+  terminalState: TimelineTurnState,
+): TimelineState {
+  const current = state.draftByTurn[turnId];
+  if (current === undefined) return state;
+  const retained = current.filter(
+    (draft) =>
+      draft.kind === "reasoning" || (terminalState === "cancelled" && draft.kind === "assistant"),
+  );
+  const draftByTurn = { ...state.draftByTurn };
+  if (retained.length === 0) delete draftByTurn[turnId];
+  else draftByTurn[turnId] = retained;
   return { ...state, draftByTurn };
 }
 

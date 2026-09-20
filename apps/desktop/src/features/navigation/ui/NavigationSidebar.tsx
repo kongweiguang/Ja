@@ -54,7 +54,7 @@ interface NavigationProject {
 function turnStatusLabel(status: NonNullable<ThreadProjection["latestTurnStatus"]>): string {
   return {
     queued: "等待回复",
-    running: "正在回复",
+    running: "正在工作",
     waiting_approval: "等待批准",
     suspended: "回复已暂停",
     completed: "有新回复",

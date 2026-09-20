@@ -27,9 +27,9 @@ public interface TurnUseCase extends DeadlineCloseable {
     }
 
     /**
-     * 通过预期 Thread revision 请求取消一个全局唯一 Turn。
+     * 仅凭全局唯一 Turn ID 提交最高优先级停止意图；当前版本由持久化 owner 在事务内读取。
      */
-    CancelResult cancel(String turnId, long expectedThreadRevision);
+    CancelResult cancel(String turnId);
 
     /** 默认把消息作为普通后续输入加入活动 Turn 的权威队列。 */
     default InputMutation enqueueInput(String turnId, UserContent content) {
@@ -186,14 +186,8 @@ public interface TurnUseCase extends DeadlineCloseable {
      * 取消查找失败只保留入站错误映射需要的稳定类别。
      */
     enum CancelFailure {
-        /**
-         * 请求引用的 Turn 不存在或已不可取消。
-         */
-        TURN_NOT_FOUND,
-        /**
-         * 调用方提供的 Thread revision 已过期。
-         */
-        CONFLICT
+        /** 请求引用的 Turn 不存在或已无法归属到运行期 owner。 */
+        TURN_NOT_FOUND
     }
 
     /** Resume 的稳定失败闭集，Transport 只映射这些类别而不解析异常文本。 */

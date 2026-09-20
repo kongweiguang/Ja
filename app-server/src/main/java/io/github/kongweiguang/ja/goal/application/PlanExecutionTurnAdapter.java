@@ -216,9 +216,7 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
      * 因而 Plan CAS 不会先于实际安全暂停对外可见。
      */
     @Override public CompletionStage<Void> pause(PlanExecutionCoordinator.ExecutionRequest request) {
-        ConversationRepository.ThreadSnapshot thread = conversations.readThread(request.ownerThreadId())
-                .orElseThrow(() -> new IllegalStateException("Plan owner Thread is unavailable"));
-        return turns.suspendPlanRun(request.turnId(), thread.revision());
+        return turns.suspendPlanRun(request.turnId());
     }
 
     /** 停止真实 Turn；SUSPENDED 也必须进入取消终态，不保留可恢复的交互请求。 */
@@ -267,18 +265,13 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
         if (!stop && turn.state() == io.github.kongweiguang.ja.conversation.domain.turn.TurnState.SUSPENDED) {
             return CompletableFuture.completedFuture(null);
         }
-        for (int attempt = 0; ; attempt++) {
-            try {
-                turns.cancel(request.turnId(), thread.revision());
-                break;
-            } catch (io.github.kongweiguang.ja.conversation.port.in.TurnUseCase.TurnCancellationException conflict) {
-                if (conflict.failure() != io.github.kongweiguang.ja.conversation.port.in.TurnUseCase.CancelFailure.CONFLICT
-                        || attempt >= 2) throw conflict;
-                // Plan 已写 pause fence；只重读同一 Turn 的提交水位，不允许工具结算竞态撤销用户停止意图。
-                thread = conversations.readThread(request.ownerThreadId()).orElseThrow();
-                var current = thread.turns().stream().filter(value -> value.turnId().equals(request.turnId())).findFirst();
-                if (current.isEmpty() || current.get().state().terminal()) return CompletableFuture.completedFuture(null);
+        try {
+            turns.cancel(request.turnId());
+        } catch (io.github.kongweiguang.ja.conversation.port.in.TurnUseCase.TurnCancellationException missing) {
+            if (missing.failure() == io.github.kongweiguang.ja.conversation.port.in.TurnUseCase.CancelFailure.TURN_NOT_FOUND) {
+                return CompletableFuture.completedFuture(null);
             }
+            throw missing;
         }
         CompletionStage<Void> completion = activeTurns.get(request.turnId());
         return completion == null ? CompletableFuture.completedFuture(null) : completion;

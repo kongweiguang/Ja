@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"c:cancel-missing-turn","method":"turn/cancel","params":{}}
+{"jsonrpc":"2.0","id":"c:cancel-legacy-revision","method":"turn/cancel","params":{"turnId":"turn_demo","expectedThreadRevision":7}}
+{"jsonrpc":"2.0","id":"c:cancel-invalid-turn","method":"turn/cancel","params":{"turnId":"thread_demo"}}
+{"jsonrpc":"2.0","id":"c:cancel-oversized-turn","method":"turn/cancel","params":{"turnId":"turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}

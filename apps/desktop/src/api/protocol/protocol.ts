@@ -1025,14 +1025,11 @@ const AttachmentPreviewReadParamsSchema = z
 const AttachmentPreviewCloseParamsSchema = z
   .object({ previewSessionId: AttachmentPreviewSessionIdSchema })
   .strict();
-const TurnCancelParamsSchema = z
-  .object({
-    turnId: TurnIdSchema,
-    expectedThreadRevision: RevisionSchema,
-  })
+const TurnCancelParamsSchema = z.object({ turnId: TurnIdSchema }).strict();
+/** Resume 保留 Thread revision CAS；Cancel 只按 Turn identity 幂等收敛自然终态竞态。 */
+const TurnResumeParamsSchema = z
+  .object({ turnId: TurnIdSchema, expectedThreadRevision: RevisionSchema })
   .strict();
-/** Resume 与 Cancel 共用 Turn identity/revision CAS，但保持独立方法以避免混淆授权语义。 */
-const TurnResumeParamsSchema = TurnCancelParamsSchema;
 const TurnInputEnqueueParamsSchema = z
   .object({ turnId: TurnIdSchema, content: TurnContentSchema })
   .strict();

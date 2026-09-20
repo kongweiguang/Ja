@@ -114,6 +114,93 @@ async function chooseReasoning(user: ReturnType<typeof userEvent.setup>, option:
 describe("Composer", () => {
   afterEach(() => cleanup());
 
+  it("按 interactionPresentation 在完整与紧凑补充输入之间切换，不遗失同轨提问面板", () => {
+    const { rerender } = render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        interactionSlot={<section aria-label="待回答的问题">问题面板</section>}
+        interactionPresentation="none"
+        onSend={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("textbox", { name: "消息" })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "访问模式" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /当前模型/ })).toBeVisible();
+    expect(screen.getByRole("region", { name: "待回答的问题" })).toBeVisible();
+
+    rerender(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        interactionSlot={<section aria-label="待回答的问题">问题面板</section>}
+        interactionPresentation="expanded"
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("textbox", { name: "补充要求" })).toHaveAttribute(
+      "placeholder",
+      "都不合适？补充你的要求",
+    );
+    expect(screen.queryByRole("combobox", { name: "访问模式" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /当前模型/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("form", { name: "发送消息" })).toHaveAttribute(
+      "data-interaction-presentation",
+      "expanded",
+    );
+
+    rerender(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        interactionPresentation="collapsed"
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("textbox", { name: "消息" })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "访问模式" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /当前模型/ })).toBeVisible();
+    expect(screen.getByRole("form", { name: "发送消息" })).toHaveAttribute(
+      "data-interaction-presentation",
+      "collapsed",
+    );
+  });
+
+  it("展开提问时保留附件与取消能力，并将补充内容只入队到当前中断 Turn", async () => {
+    const user = userEvent.setup();
+    const enqueue = vi.fn();
+    const send = vi.fn();
+    const addAttachments = vi.fn();
+    const cancel = vi.fn();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        initialText="请直接给出适配方案"
+        suspendedTurn
+        interactionPresentation="expanded"
+        onSend={send}
+        onEnqueue={enqueue}
+        onAddAttachments={addAttachments}
+        onCancel={cancel}
+      />,
+    );
+
+    expect(screen.getByRole("textbox", { name: "补充要求" })).toHaveValue("请直接给出适配方案");
+    await user.click(screen.getByRole("button", { name: "添加附件" }));
+    await user.click(screen.getByRole("button", { name: "取消运行" }));
+    await user.click(screen.getByRole("button", { name: "发送补充" }));
+    expect(addAttachments).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(enqueue).toHaveBeenCalledWith({
+      text: "请直接给出适配方案",
+      attachmentIds: [],
+      contextReferences: [],
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
   /** 原始草稿身份由 controller 比对后清空；UI 提前 trim 会让尾换行草稿永远留在输入框。 */
   it.each(["enter", "modifier-enter"] as const)(
     "%s 发送保留原始草稿供精确清空",

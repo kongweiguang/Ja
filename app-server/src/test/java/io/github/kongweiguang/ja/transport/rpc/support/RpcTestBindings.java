@@ -203,7 +203,7 @@ public final class RpcTestBindings {
         /** 未声明的接纳能力失败。 */
         @Override public Accepted start(TurnStartRequest request, TurnEventSink sink) { throw unsupported(); }
         /** 未声明的取消能力失败。 */
-        @Override public CancelResult cancel(String turnId, long expectedThreadRevision) { throw unsupported(); }
+        @Override public CancelResult cancel(String turnId) { throw unsupported(); }
         /** 未声明的接纳关闭能力失败。 */
         @Override public void stopAccepting() { throw unsupported(); }
         /** 未声明的静默等待能力失败。 */

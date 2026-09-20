@@ -15,47 +15,72 @@ export const interactionPlanProviderScenario = Object.freeze({
     "Interaction Plan 真窗验收：验证规划阶段拒绝工作区写入。",
     "Interaction Plan 真窗验收：验证规划阶段拒绝外部写入。",
     "Interaction Plan 真窗验收：验证规划阶段拒绝子代理写入。",
-    "Interaction Plan 真窗验收：验证显式跳过不会采用推荐答案。",
+    "Interaction Plan 真窗验收：验证留空可选题不会采用推荐答案。",
     "Interaction Plan 真窗验收：验证取消不会恢复 Turn。",
     "Interaction Plan 真窗验收：验证并发回答只有一个胜者。",
   ]),
   readonlyToolCalls: Object.freeze([
-    Object.freeze({ name: "shell", arguments: Object.freeze({ command: "Write-Output JA_PLAN_READONLY_SHELL" }) }),
-    Object.freeze({ name: "write", arguments: Object.freeze({ path: "readonly-fixture.txt", content: "must-not-write" }) }),
-    Object.freeze({ name: "mcp_write", arguments: Object.freeze({ target: "external-fixture", content: "must-not-write" }) }),
-    Object.freeze({ name: "spawn_agent", arguments: Object.freeze({ taskName: "readonly-child", accessMode: "full_access" }) }),
+    Object.freeze({
+      name: "shell",
+      arguments: Object.freeze({ command: "Write-Output JA_PLAN_READONLY_SHELL" }),
+    }),
+    Object.freeze({
+      name: "write",
+      arguments: Object.freeze({ path: "readonly-fixture.txt", content: "must-not-write" }),
+    }),
+    Object.freeze({
+      name: "mcp_write",
+      arguments: Object.freeze({ target: "external-fixture", content: "must-not-write" }),
+    }),
+    Object.freeze({
+      name: "spawn_agent",
+      arguments: Object.freeze({ taskName: "readonly-child", accessMode: "full_access" }),
+    }),
   ]),
   reply: "Interaction Plan 结构化提问已完成。",
   questions: Object.freeze([
     Object.freeze({
       questionId: "question_scope",
-      prompt: "本次实施范围？请结合当前项目，选择优先覆盖的部分。界面与交互包含单选、多选、其他答案、键盘操作、输入法、草稿保存与恢复；接口与状态包含稳定身份、并发版本检查、重复提交和断线重试。请选择真正符合本次目标的范围，推荐选项不会自动替你确认。",
+      prompt:
+        "本次实施范围？请结合当前项目，选择优先覆盖的部分。界面与交互包含单选、多选、键盘操作、草稿保存与恢复；接口与状态包含稳定身份、并发版本检查、重复提交和断线重试。请选择真正符合本次目标的范围，推荐选项不会自动替你确认。",
       type: "single",
       required: true,
       allowFreeText: false,
       options: Object.freeze([
-        Object.freeze({ optionId: "option_ui", label: "界面与交互", description: "验证真实卡片、键盘和恢复。", recommended: true }),
-        Object.freeze({ optionId: "option_api", label: "接口与状态", description: "验证 RPC、CAS 和幂等。", recommended: false }),
+        Object.freeze({
+          optionId: "option_ui",
+          label: "界面与交互",
+          description: "验证真实卡片、键盘和恢复。",
+          recommended: true,
+        }),
+        Object.freeze({
+          optionId: "option_api",
+          label: "接口与状态",
+          description: "验证 RPC、CAS 和幂等。",
+          recommended: false,
+        }),
       ]),
     }),
     Object.freeze({
       questionId: "question_targets",
       prompt: "需要覆盖哪些目标？",
       type: "multiple",
-      required: true,
+      required: false,
       allowFreeText: false,
       options: Object.freeze([
-        Object.freeze({ optionId: "option_plan", label: "Plan", description: "覆盖计划版本与执行。", recommended: true }),
-        Object.freeze({ optionId: "option_goal", label: "Goal", description: "验证 Goal 保持独立。", recommended: false }),
+        Object.freeze({
+          optionId: "option_plan",
+          label: "Plan",
+          description: "覆盖计划版本与执行。",
+          recommended: true,
+        }),
+        Object.freeze({
+          optionId: "option_goal",
+          label: "Goal",
+          description: "验证 Goal 保持独立。",
+          recommended: false,
+        }),
       ]),
-    }),
-    Object.freeze({
-      questionId: "question_note",
-      prompt: "补充一个验收备注（可选）",
-      type: "text",
-      required: false,
-      allowFreeText: true,
-      options: Object.freeze([]),
     }),
   ]),
 });
@@ -143,9 +168,24 @@ export function interactionPlanTextStream(requestNumber) {
     content: [{ type: "output_text", text, annotations: [], logprobs: [] }],
   };
   return [
-    event("response.created", 0, { response: { ...responseEnvelope(`resp_interaction_plan_${requestNumber}`, []), status: "in_progress" } }),
-    event("response.output_text.delta", 1, { content_index: 0, delta: text, item_id: itemId, output_index: 0 }),
-    event("response.output_text.done", 2, { content_index: 0, item_id: itemId, output_index: 0, text }),
+    event("response.created", 0, {
+      response: {
+        ...responseEnvelope(`resp_interaction_plan_${requestNumber}`, []),
+        status: "in_progress",
+      },
+    }),
+    event("response.output_text.delta", 1, {
+      content_index: 0,
+      delta: text,
+      item_id: itemId,
+      output_index: 0,
+    }),
+    event("response.output_text.done", 2, {
+      content_index: 0,
+      item_id: itemId,
+      output_index: 0,
+      text,
+    }),
     event("response.completed", 3, {
       response: responseEnvelope(`resp_interaction_plan_${requestNumber}`, [item]),
     }),

@@ -367,10 +367,7 @@ export interface ConversationTurnPort {
     turnId: string;
     expectedThreadRevision: number;
   }): Promise<ConversationAcceptedTurn>;
-  cancelTurn(input: {
-    turnId: string;
-    expectedThreadRevision: number;
-  }): Promise<ConversationCancelResult>;
+  cancelTurn(input: { turnId: string }): Promise<ConversationCancelResult>;
   enqueueTurnInput(input: {
     turnId: string;
     content: UserContentBlock[];

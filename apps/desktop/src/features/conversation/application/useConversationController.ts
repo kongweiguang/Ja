@@ -267,6 +267,8 @@ export function useConversationController({
   const accessModeRef = useRef(accessMode);
   const runtimeStateRef = useRef(runtimeState);
   const automaticResyncAttemptRef = useRef<string | undefined>(undefined);
+  const automaticResyncInFlightRef = useRef(new Set<string>());
+  const automaticResyncRetryTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const manualWorkspaceTargetRef = useRef<string | undefined>(undefined);
   const manualThreadTargetRef = useRef<string | undefined>(undefined);
   const currentThreadIdRef = useRef(currentThreadId);
@@ -288,6 +290,11 @@ export function useConversationController({
   threadsRef.current = threads;
   const currentResyncReason = useTimelineStore((state) =>
     currentThreadId === undefined ? undefined : state.resyncRequired[currentThreadId],
+  );
+  const currentResyncSequence = useTimelineStore((state) =>
+    currentThreadId === undefined
+      ? 0
+      : (state.resyncRequestSequenceByThread?.[currentThreadId] ?? 0),
   );
   const activeTurnPresent = useTimelineStore((state) =>
     currentThreadId === undefined
@@ -1111,6 +1118,8 @@ export function useConversationController({
     const threadMutationGuards = threadMutationGuardsRef.current;
     const latestTurnProjections = latestTurnProjectionRef.current;
     const seenAttemptKeys = seenAttemptKeysRef.current;
+    const automaticResyncRetryTimers = automaticResyncRetryTimersRef.current;
+    const automaticResyncInFlight = automaticResyncInFlightRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
@@ -1120,6 +1129,9 @@ export function useConversationController({
       threadMutationGuards.clear();
       latestTurnProjections.clear();
       seenAttemptKeys.clear();
+      for (const timer of automaticResyncRetryTimers.values()) clearTimeout(timer);
+      automaticResyncRetryTimers.clear();
+      automaticResyncInFlight.clear();
     };
   }, []);
 
@@ -1415,10 +1427,16 @@ export function useConversationController({
   ]);
 
   /**
-   * timeline 出现 gap 或 terminal 需要补齐 ChangeSet 时，同一 generation/reason 只自动恢复一次；
-   * 失败保持可见，用户重新选择 Thread 是显式 bounded retry，避免 effect 重试环。
+   * timeline 出现 gap、恢复 active Turn 或 terminal 需要补齐 ChangeSet 时，同一 Thread 同时只
+   * 保留一个 thread/read；失败按固定短退避重新发起，成功仍由 snapshot 清除 resync 标记。
    */
   useEffect(() => {
+    for (const [threadId, timer] of automaticResyncRetryTimersRef.current) {
+      if (threadId !== currentThreadId) {
+        clearTimeout(timer);
+        automaticResyncRetryTimersRef.current.delete(threadId);
+      }
+    }
     if (
       creationInFlightRef.current !== undefined ||
       currentThreadId === undefined ||
@@ -1435,9 +1453,15 @@ export function useConversationController({
       workspace.workspaceId,
       currentThreadId,
       currentResyncReason,
+      currentResyncSequence,
     ].join(":");
+    if (automaticResyncInFlightRef.current.has(currentThreadId)) return;
     if (automaticResyncAttemptRef.current === key) return;
     automaticResyncAttemptRef.current = key;
+    automaticResyncInFlightRef.current.add(currentThreadId);
+    const resyncGeneration = timeline.handshake.generation;
+    const retryThreadId = currentThreadId;
+    const retryWorkspaceId = workspace.workspaceId;
     const request = requestRef.current + 1;
     requestRef.current = request;
     setBusy(true);
@@ -1445,20 +1469,57 @@ export function useConversationController({
     void (async (): Promise<void> => {
       try {
         const snapshot = await readCompleteThreadSnapshot(currentThreadId);
-        if (!isCurrentRequest(request, workspace.workspaceId)) return;
+        if (
+          !isCurrentRequest(request, workspace.workspaceId) ||
+          currentThreadIdRef.current !== currentThreadId
+        )
+          return;
         if (!applySnapshot(snapshot, workspace.workspaceId, currentThreadId)) {
           setError("会话状态无法自动恢复，请重新选择该会话重试。 ");
         }
       } catch {
-        if (isCurrentRequest(request, workspace.workspaceId))
+        if (
+          isCurrentRequest(request, workspace.workspaceId) &&
+          currentThreadIdRef.current === currentThreadId
+        ) {
           setError("会话状态暂时无法自动恢复，请重新选择该会话重试。 ");
+          const prior = automaticResyncRetryTimersRef.current.get(currentThreadId);
+          if (prior !== undefined) clearTimeout(prior);
+          if (activeTurnPresent) {
+            const retryTimer = setTimeout(() => {
+              automaticResyncRetryTimersRef.current.delete(currentThreadId);
+              const state = useTimelineStore.getState();
+              const active = Object.values(state.turns).some(
+                (turn) =>
+                  turn.threadId === retryThreadId &&
+                  !["completed", "failed", "cancelled"].includes(turn.status),
+              );
+              if (
+                isCurrentRequest(request, retryWorkspaceId) &&
+                currentThreadIdRef.current === retryThreadId &&
+                workspaceRef.current?.workspaceId === retryWorkspaceId &&
+                state.handshake.generation === resyncGeneration &&
+                active
+              )
+                useTimelineStore.getState().requestThreadResync(retryThreadId);
+            }, 1_000);
+            automaticResyncRetryTimersRef.current.set(currentThreadId, retryTimer);
+          }
+        }
       } finally {
-        if (isCurrentRequest(request, workspace.workspaceId)) setBusy(false);
+        automaticResyncInFlightRef.current.delete(currentThreadId);
+        if (
+          isCurrentRequest(request, workspace.workspaceId) &&
+          currentThreadIdRef.current === currentThreadId
+        )
+          setBusy(false);
       }
     })();
   }, [
     applySnapshot,
     currentResyncReason,
+    currentResyncSequence,
+    activeTurnPresent,
     currentThreadId,
     history,
     isCurrentRequest,

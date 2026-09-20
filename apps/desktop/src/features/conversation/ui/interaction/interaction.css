@@ -3,137 +3,204 @@
 
 .ja-interaction-card {
   display: grid;
-  gap: 16px;
   width: 100%;
   min-width: 0;
-  min-height: 0;
-  margin-bottom: 10px;
-  padding: 16px;
+  max-height: min(34rem, 62dvh);
+  gap: 16px;
+  padding: 18px;
   border: 1px solid var(--ja-border-strong);
   border-radius: var(--ja-radius-pane);
   color: var(--ja-foreground);
-  background: color-mix(in srgb, var(--ja-surface-raised) 94%, var(--ja-surface-muted));
+  background: color-mix(in srgb, var(--ja-surface-raised) 96%, var(--ja-surface-muted));
   box-shadow: var(--ja-shadow-sm);
   animation: ja-interaction-enter 180ms var(--ja-ease-native);
 }
 
-/* 只有展开中的待回答卡需要把题头、可滚动正文和操作栏锁成三条轨道。 */
+/* 展开态将题头、可滚动正文和动作固定为三条轨道，短窗口也不会把提交操作推到视口外。 */
 .ja-interaction-card[data-interaction-status="pending"] {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
 .ja-interaction-card__header,
 .ja-interaction-card__footer,
-.ja-interaction-card__summary-heading {
+.ja-interaction-card__summary-heading,
+.ja-interaction-card__navigation {
   display: flex;
   min-width: 0;
-  align-items: flex-start;
-  gap: 10px;
+  align-items: center;
 }
 
-.ja-interaction-card__header > div,
-.ja-interaction-card__option-copy {
-  min-width: 0;
-}
-
-.ja-interaction-card__header h2,
-.ja-interaction-card__body h3,
-.ja-interaction-card__summary-heading strong,
-.ja-interaction-card__option-copy strong {
-  margin: 0;
-  font-weight: var(--ja-weight-semibold);
+.ja-interaction-card__header {
+  justify-content: space-between;
+  gap: 14px;
 }
 
 .ja-interaction-card__header h2 {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
   font-size: var(--ja-text-title-size);
+  font-weight: var(--ja-weight-semibold);
   line-height: var(--ja-line-title);
 }
-.ja-interaction-card__body h3 {
-  font-size: var(--ja-text-body-size);
-  font-weight: var(--ja-weight-medium);
-  line-height: var(--ja-line-body);
-}
-.ja-interaction-card__eyebrow {
-  margin: 0 0 4px;
-  color: color-mix(in srgb, var(--ja-accent-emphasis) 80%, var(--ja-foreground));
+
+.ja-interaction-card__required,
+.ja-interaction-card__recommended {
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: var(--ja-radius-selection);
   font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-caption);
+  white-space: nowrap;
 }
-.ja-interaction-card__description,
-.ja-interaction-card__question-description {
-  margin: 5px 0 0;
+
+.ja-interaction-card__required {
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface-muted);
+}
+
+.ja-interaction-card__navigation {
+  flex: 0 0 auto;
+  gap: 2px;
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-control-size);
-  line-height: var(--ja-line-control);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
+
+.ja-interaction-card__navigation > span {
+  min-width: 42px;
+  text-align: center;
+}
+
 .ja-interaction-card__body {
   display: grid;
-  gap: 10px;
   min-height: 0;
-  max-height: min(320px, 35dvh);
+  gap: 10px;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   overflow-wrap: anywhere;
+  animation: ja-interaction-content-enter 140ms var(--ja-ease-native);
 }
-.ja-conversation-composer-dock > .ja-interaction-card .ja-interaction-card__body {
-  max-height: none;
-}
+
 .ja-interaction-card__options {
   display: grid;
   gap: 8px;
 }
 
 .ja-interaction-card__option {
+  position: relative;
   display: grid;
-  min-height: 52px;
-  grid-template-columns: 18px 24px minmax(0, 1fr) auto;
+  min-height: 62px;
+  grid-template-columns: 28px minmax(0, 1fr) auto 18px;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--ja-border);
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
   border-radius: var(--ja-radius-selection);
-  background: var(--ja-surface);
+  background: color-mix(in srgb, var(--ja-surface-muted) 58%, var(--ja-surface-raised));
   cursor: pointer;
   transition:
     border-color 120ms var(--ja-ease-native),
-    background-color 120ms var(--ja-ease-native);
+    background-color 120ms var(--ja-ease-native),
+    transform 120ms var(--ja-ease-native);
 }
+
 .ja-interaction-card__option:hover {
   border-color: var(--ja-border-strong);
   background: var(--ja-control-hover);
 }
+
+.ja-interaction-card__option:active {
+  transform: scale(0.995);
+}
+
 .ja-interaction-card__option[data-selected="true"] {
-  border-color: var(--ja-accent);
+  border-color: color-mix(in srgb, var(--ja-accent) 62%, var(--ja-border-strong));
   background: color-mix(in srgb, var(--ja-accent) 10%, var(--ja-surface-raised));
 }
+
+/* 原生输入保留给读屏器与键盘，但把视觉反馈统一收敛到整行，避免表单控件挤占决策信息。 */
 .ja-interaction-card__option input {
-  width: 16px;
-  height: 16px;
-  accent-color: var(--ja-accent);
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
+
+.ja-interaction-card__option:has(input:focus-visible) {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
 .ja-interaction-card__option-index {
   display: grid;
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   place-items: center;
-  border: 1px solid var(--ja-border);
+  border: 1px solid var(--ja-border-strong);
   border-radius: 50%;
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-caption-size);
+  font-variant-numeric: tabular-nums;
 }
+
+.ja-interaction-card__option[data-selected="true"] .ja-interaction-card__option-index {
+  border-color: color-mix(in srgb, var(--ja-accent) 70%, var(--ja-border));
+  color: var(--ja-accent-emphasis);
+}
+
 .ja-interaction-card__option-copy {
   display: grid;
-  gap: 2px;
+  min-width: 0;
+  gap: 3px;
 }
+
+.ja-interaction-card__option-copy strong,
+.ja-interaction-card__summary-heading strong {
+  margin: 0;
+  font-weight: var(--ja-weight-semibold);
+}
+
 .ja-interaction-card__option-copy small {
   color: var(--ja-foreground-muted);
-  line-height: var(--ja-line-caption);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
 }
+
 .ja-interaction-card__recommended {
   align-self: start;
-  color: color-mix(in srgb, var(--ja-accent-emphasis) 80%, var(--ja-foreground));
-  font-size: var(--ja-text-caption-size);
+  color: var(--ja-accent-emphasis);
+  background: var(--ja-accent-soft);
 }
+
+.ja-interaction-card__option-affordance {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  color: var(--ja-accent-emphasis);
+  place-items: center;
+}
+
+.ja-interaction-card__option-affordance svg {
+  width: 17px;
+  height: 17px;
+}
+
+.ja-interaction-card__option:not([data-selected="true"]) .ja-interaction-card__option-affordance {
+  color: var(--ja-foreground-tertiary);
+}
+
 .ja-interaction-card__other-input,
 .ja-interaction-card__text-input {
   box-sizing: border-box;
@@ -145,38 +212,47 @@
   color: var(--ja-foreground);
   background: var(--ja-surface-raised);
   font: inherit;
+}
+
+.ja-interaction-card__text-input {
+  min-height: 112px;
   resize: vertical;
 }
-.ja-interaction-card__text-input {
-  min-height: 86px;
-}
+
 .ja-interaction-card:focus-visible,
 .ja-interaction-card__other-input:focus-visible,
 .ja-interaction-card__text-input:focus-visible,
-.ja-interaction-card button:focus-visible,
-.ja-interaction-card input:focus-visible {
+.ja-interaction-card button:focus-visible {
   outline: 2px solid var(--ja-focus);
   outline-offset: 2px;
 }
+
 .ja-interaction-card__validation,
 .ja-interaction-card__error {
   margin: 0;
   color: var(--ja-danger);
   font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-control);
 }
+
 .ja-interaction-card__footer {
   flex-wrap: wrap;
-  align-items: center;
+  gap: 8px;
 }
+
 .ja-interaction-card__footer-spacer {
   flex: 1;
 }
-.ja-interaction-card__text-button,
+
+.ja-interaction-card__footer > .ja-interaction-card__error {
+  width: 100%;
+}
+
 .ja-interaction-card__primary-button,
 .ja-interaction-card__icon-button,
 .ja-interaction-card__retry-button {
   display: inline-flex;
-  min-height: 44px;
+  min-height: 36px;
   align-items: center;
   justify-content: center;
   gap: 6px;
@@ -186,41 +262,72 @@
   background: transparent;
   font: inherit;
   cursor: pointer;
+  transition:
+    color 120ms var(--ja-ease-native),
+    background-color 120ms var(--ja-ease-native),
+    transform 120ms var(--ja-ease-native);
 }
-.ja-interaction-card__text-button {
-  padding: 0 8px;
-}
-.ja-interaction-card__text-button:hover:not(:disabled),
+
 .ja-interaction-card__icon-button:hover:not(:disabled),
 .ja-interaction-card__retry-button:hover:not(:disabled) {
+  color: var(--ja-foreground);
   background: var(--ja-control-hover);
 }
+
 .ja-interaction-card__primary-button {
-  min-width: 100px;
-  padding: 0 15px;
+  min-width: 108px;
+  padding: 0 14px;
   color: var(--ja-accent-foreground);
   background: var(--ja-accent-emphasis);
 }
-.ja-interaction-card__primary-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.48;
+
+.ja-interaction-card__primary-button:hover:not(:disabled) {
+  background: var(--ja-accent-hover);
+  transform: translateY(-1px);
 }
+
+.ja-interaction-card__primary-button:disabled,
+.ja-interaction-card__icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .ja-interaction-card__icon-button,
 .ja-interaction-card__retry-button {
-  width: 44px;
+  width: 32px;
   padding: 0;
 }
-.ja-interaction-card__icon-button {
-  margin-left: auto;
+
+.ja-interaction-card__icon-button svg,
+.ja-interaction-card__retry-button svg {
+  width: 16px;
+  height: 16px;
 }
+
 .ja-interaction-card__spin {
   width: 16px;
   height: 16px;
   animation: ja-interaction-spin 800ms linear infinite;
 }
-.ja-interaction-card__summary-heading {
-  align-items: center;
+
+.ja-interaction-card.is-collapsed {
+  max-height: none;
+  padding: 10px 12px;
 }
+
+.ja-interaction-card__summary-heading {
+  gap: 8px;
+}
+
+.ja-interaction-card__summary-heading > span:not(.ja-interaction-card__pending-dot) {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-interaction-card__summary-heading .ja-interaction-card__icon-button {
+  margin-inline-start: auto;
+}
+
 .ja-interaction-card__pending-dot {
   width: 9px;
   height: 9px;
@@ -228,6 +335,26 @@
   border: 2px solid var(--ja-accent);
   border-radius: 50%;
 }
+
+/* 展开提问与补充输入是同一个操作面；card 不改写 Composer 状态，只通过相邻结构合并边界。 */
+.ja-interaction-card[data-interaction-status="pending"]:has(
+    + .ja-composer[data-interaction-presentation="expanded"]
+  ) {
+  margin-bottom: 0;
+  border-bottom: 0;
+  border-bottom-right-radius: 0;
+  border-bottom-left-radius: 0;
+  box-shadow: none;
+}
+
+.ja-interaction-card[data-interaction-status="pending"]
+  + .ja-composer[data-interaction-presentation="expanded"] {
+  margin-top: 0;
+  border-top-color: var(--ja-border-strong);
+  border-top-right-radius: 0;
+  border-top-left-radius: 0;
+}
+
 @keyframes ja-interaction-enter {
   from {
     opacity: 0;
@@ -238,25 +365,61 @@
     transform: translateY(0);
   }
 }
+
+@keyframes ja-interaction-content-enter {
+  from {
+    opacity: 0;
+    transform: translateX(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 @keyframes ja-interaction-spin {
   to {
     transform: rotate(360deg);
   }
 }
+
 @media (max-width: 520px) {
-  .ja-interaction-card__option {
-    grid-template-columns: 18px 24px minmax(0, 1fr);
+  .ja-interaction-card {
+    gap: 13px;
+    padding: 14px;
   }
+
+  .ja-interaction-card__header {
+    align-items: flex-start;
+  }
+
+  .ja-interaction-card__navigation {
+    gap: 0;
+  }
+
+  .ja-interaction-card__option {
+    grid-template-columns: 28px minmax(0, 1fr) 18px;
+  }
+
   .ja-interaction-card__recommended {
+    grid-column: 2;
+    width: fit-content;
+  }
+
+  .ja-interaction-card__option-affordance {
     grid-column: 3;
+    grid-row: 1;
   }
 }
+
 @media (prefers-reduced-motion: reduce) {
   .ja-interaction-card,
+  .ja-interaction-card__body,
   .ja-interaction-card__spin {
     animation: none;
   }
 }
+
 @media (prefers-contrast: more), (forced-colors: active) {
   .ja-interaction-card,
   .ja-interaction-card__option,
@@ -265,10 +428,12 @@
     border-color: CanvasText;
     background: Canvas;
   }
+
   .ja-interaction-card__option[data-selected="true"] {
     outline: 2px solid Highlight;
   }
 }
+
 @media (prefers-reduced-transparency: reduce) {
   .ja-interaction-card {
     background: var(--ja-surface-raised);
