@@ -18,6 +18,10 @@ use std::thread;
 use std::time::Duration;
 use tauri::Manager;
 
+// `handle_full_exit_requested` 在单次生产退出中可同步占满 20 秒 deadline；测试必须等待
+// 略高于该上限，才能断言 handler 返回后的事件顺序，而非把受载 CI 的正常清理误判为超时。
+const CLEAN_FULL_EXIT_EVENT_WAIT: Duration = Duration::from_secs(25);
+
 /// 创建完整退出测试独占的临时根，避免修改进程环境或接触真实 app data。
 fn test_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -252,8 +256,8 @@ fn run_full_exit_mock(
     (app_handle, window, receiver, runner)
 }
 
-/// 验证完整组合根共享同一绝对 deadline；Java、terminal、preview 与 workspace watcher
-/// 清理后，只经历一次清理和一次 programmatic exit 请求即可允许原生退出。
+/// 验证完整组合根共享同一绝对 deadline；事件在同步 cleanup 返回后才发出，故等待预算必须覆盖
+/// 生产 20 秒 deadline 加上有限调度余量，不能以更短的测试超时否定正常的资源清理。
 #[test]
 fn full_exit_request_allows_clean_runtime_cleanup() {
     let run_dir = full_exit_run_dir("full-exit-success");
@@ -267,15 +271,15 @@ fn full_exit_request_allows_clean_runtime_cleanup() {
     assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok("ready"));
     window.close().expect("full-exit close request");
     assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(5)),
+        receiver.recv_timeout(CLEAN_FULL_EXIT_EVENT_WAIT),
         Ok("exit-requested")
     );
     assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(5)),
+        receiver.recv_timeout(CLEAN_FULL_EXIT_EVENT_WAIT),
         Ok("exit-programmatic-requested")
     );
     assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(5)),
+        receiver.recv_timeout(CLEAN_FULL_EXIT_EVENT_WAIT),
         Ok("exit-ready")
     );
     runner.join().expect("mock full-exit runner");
