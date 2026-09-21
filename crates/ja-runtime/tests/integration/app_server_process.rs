@@ -129,7 +129,10 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         OsString::from("-EnvironmentPath"),
         environment_path.clone().into_os_string(),
     ];
-    config.ready_timeout = Duration::from_secs(5);
+    // Windows PowerShell cold start plus the two-frame handshake is environmental fixture work,
+    // not a product five-second latency SLO. Keep the real lifecycle assertion bounded while
+    // leaving the production default timeout and every request/cleanup deadline untouched.
+    config.ready_timeout = Duration::from_secs(15);
     config.shutdown_timeout = Duration::from_secs(2);
     let mut supervisor = SidecarSupervisor::new_with_host_generation(config, 7).unwrap();
     supervisor.start_with_session_hook(None).unwrap();
