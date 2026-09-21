@@ -298,11 +298,13 @@ try {
         if ($appProcess.HasExited) { throw "Installed app exited early: exit=$($appProcess.ExitCode)" }
         $result.launch.pid = [int] $appProcess.Id
 
-        # 第二次启动必须在首实例仍存活时有界退出；把断言留在同一安装生命周期，避免重复安装、
-        # 重复清理和两个证据文件对同一产物给出不一致结论。
+        # 第二次启动必须在首实例仍存活时有界退出；签名安装包在冷启动的 Windows Runner
+        # 上可能需要超过 10 秒才能完成 single-instance 转交。该等待只属于工程 smoke，
+        # 并始终受安装器的总 deadline 约束，避免把时序波动误判为产品实例策略失效。
+        $secondInstanceDeadlineMilliseconds = [Math]::Min($timeoutMilliseconds, 30000)
         $secondProcess = Start-Process -FilePath $app.FullName -WorkingDirectory $installPath -PassThru -WindowStyle Hidden
         try {
-            if (-not $secondProcess.WaitForExit([Math]::Min($timeoutMilliseconds, 10000))) {
+            if (-not $secondProcess.WaitForExit($secondInstanceDeadlineMilliseconds)) {
                 Stop-ProcessTree -ProcessId $secondProcess.Id
                 throw 'Second application instance remained alive past the single-instance deadline'
             }
