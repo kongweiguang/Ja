@@ -105,6 +105,24 @@ final class PlanGoalAgentCapabilityTest {
                 planning.catalogTools().stream().map(value -> value.spec().name()).toList());
     }
 
+    /** 动态提示跟随真实绑定，独立 Goal 不引入 Plan 审批，独立 Plan 不要求 Goal 验收。 */
+    @Test
+    void scopesInstructionsToBoundCapability() {
+        String goal = fixture(null).capability().prepare(
+                request(CollaborationMode.DEFAULT, TurnOrigin.GOAL_CONTINUATION)).promptFragment();
+        assertTrue(goal.contains("goal_request_evaluation"));
+        assertTrue(goal.contains("A Goal does not require a Plan"));
+        assertFalse(goal.contains("self-approve"));
+        assertFalse(goal.contains("Current Plan binding"));
+
+        String plan = fixture().capability().prepare(
+                request(CollaborationMode.PLAN, TurnOrigin.USER)).promptFragment();
+        assertTrue(plan.contains("Execute action"));
+        assertFalse(plan.contains("goal_request_evaluation"));
+        assertTrue(fixture().capability().prepare(
+                request(CollaborationMode.DEFAULT, TurnOrigin.USER)).promptFragment().isEmpty());
+    }
+
     /** plan_propose 的 schema 和执行命令只使用 standalone Plan identity。 */
     @Test
     void proposesStandalonePlanThroughFrozenIdentity() throws Exception {
@@ -134,7 +152,7 @@ final class PlanGoalAgentCapabilityTest {
         return fixture(GoalModels.PlanStatus.DRAFT);
     }
 
-    /** 为阶段过滤测试替换当前 Plan projection；其它内部身份仍保持真实 origin 约束。 */
+    /** 以可空 Plan 状态覆盖独立 Goal 和各规划阶段，内部执行身份仍保持真实 origin 约束。 */
     private static Fixture fixture(GoalModels.PlanStatus planStatus) {
         AtomicReference<GoalUseCase.Propose> propose = new AtomicReference<>();
         GoalUseCase goals = (GoalUseCase) Proxy.newProxyInstance(GoalUseCase.class.getClassLoader(),
@@ -156,7 +174,8 @@ final class PlanGoalAgentCapabilityTest {
                             "plan_test", 5, GoalModels.PlanStatus.EXECUTING, "planrev_test", "run_plan"));
                     case "goalContinuationContext" -> Optional.of(new GoalUseCase.GoalTurnContext(
                             "goal_test", 7, "run_test", GoalModels.GoalStatus.ACTIVE,
-                            GoalModels.GoalPhase.WORKING, "plan_test", "planrev_test"));
+                            GoalModels.GoalPhase.WORKING, planStatus == null ? null : "plan_test",
+                            planStatus == null ? null : "planrev_test"));
                     case "propose" -> {
                         GoalUseCase.Propose captured = (GoalUseCase.Propose) arguments[0];
                         propose.set(captured);

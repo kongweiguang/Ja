@@ -32,6 +32,15 @@ public final class ToolPresentationCodec {
         optional(node, "inputPreview", value.inputPreview());
         optional(node, "outputPreview", value.outputPreview());
         optional(node, "summary", value.summary());
+        if (!value.interactionAnswers().isEmpty()) {
+            ArrayNode interactionAnswers = node.putArray("interactionAnswers");
+            for (ToolPresentation.InteractionAnswerView answer : value.interactionAnswers()) {
+                ObjectNode item = interactionAnswers.addObject().put("question", answer.question())
+                        .put("skipped", answer.skipped());
+                ArrayNode labels = item.putArray("answers");
+                answer.answers().forEach(labels::add);
+            }
+        }
         ArrayNode paths = node.putArray("relativePaths");
         value.relativePaths().forEach(paths::add);
         optional(node, "command", value.command());
@@ -58,7 +67,7 @@ public final class ToolPresentationCodec {
                     text(required(node, "title")),
                     ToolPresentation.Status.valueOf(text(required(node, "status")).toUpperCase(Locale.ROOT)),
                     optionalText(node, "inputPreview"), optionalText(node, "outputPreview"),
-                    optionalText(node, "summary"), paths,
+                    optionalText(node, "summary"), interactionAnswers(node), paths,
                     optionalText(node, "command"), optionalText(node, "relativeCwd"),
                     optionalText(node, "stdout"), optionalText(node, "stderr"),
                     optionalInteger(node, "exitCode"), optionalLong(node, "durationMs"),
@@ -67,6 +76,26 @@ public final class ToolPresentationCodec {
             if (failure instanceof StorageException storage) throw storage;
             throw invalid();
         }
+    }
+
+    /** 历史记录可能早于结构化问答字段；缺失表示普通 Tool 或旧展示事实，而不是存储损坏。 */
+    private static List<ToolPresentation.InteractionAnswerView> interactionAnswers(JsonNode node) {
+        JsonNode values = node.get("interactionAnswers");
+        if (values == null) return List.of();
+        if (!values.isArray()) throw invalid();
+        List<ToolPresentation.InteractionAnswerView> result = new ArrayList<>();
+        for (JsonNode value : values) {
+            if (!value.isObject()) throw invalid();
+            JsonNode labels = required(value, "answers");
+            if (!labels.isArray()) throw invalid();
+            List<String> answers = new ArrayList<>();
+            labels.forEach(label -> answers.add(text(label)));
+            JsonNode skipped = required(value, "skipped");
+            if (!skipped.isBoolean()) throw invalid();
+            result.add(new ToolPresentation.InteractionAnswerView(
+                    text(required(value, "question")), answers, skipped.booleanValue()));
+        }
+        return result;
     }
 
     /** 提供持久化测试和迁移内部使用的结构化节点，不把数据库 codec 暴露给 transport。 */

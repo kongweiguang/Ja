@@ -33,10 +33,23 @@ final class ToolPresentationWireMapper {
         node.put("title", value.title());
         ArrayNode paths = node.putArray("relativePaths");
         value.relativePaths().forEach(paths::add);
+        appendInteractionAnswers(node, value);
         appendPreviews(node, value);
         appendShellFacts(node, value);
         node.put("truncated", value.truncated());
         return node;
+    }
+
+    /** 问答结果仅投影人类可见文案；稳定 ID 与模型原始结果不进入 Renderer。 */
+    private static void appendInteractionAnswers(ObjectNode node, ToolPresentation value) {
+        if (value.interactionAnswers().isEmpty()) return;
+        ArrayNode answers = node.putArray("interactionAnswers");
+        for (ToolPresentation.InteractionAnswerView answer : value.interactionAnswers()) {
+            ObjectNode item = answers.addObject().put("question", answer.question())
+                    .put("skipped", answer.skipped());
+            ArrayNode labels = item.putArray("answers");
+            answer.answers().forEach(labels::add);
+        }
     }
 
     /** 摘要、预览与 artifact identity 共用可选语义，缺失时不发送 JSON null。 */

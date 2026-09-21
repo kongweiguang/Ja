@@ -851,6 +851,30 @@ function isTurnChangeSet(value: unknown): boolean {
   );
 }
 
+/** 结构化问答展示必须保持三题上限，且只允许题目、答案文案和跳过事实。 */
+function isToolInteractionAnswers(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.length <= 3 &&
+      value.every(
+        (answer) =>
+          typeof answer === "object" &&
+          answer !== null &&
+          typeof (answer as Record<string, unknown>)["question"] === "string" &&
+          ((answer as Record<string, unknown>)["question"] as string).trim() !== "" &&
+          Array.isArray((answer as Record<string, unknown>)["answers"]) &&
+          ((answer as Record<string, unknown>)["answers"] as unknown[]).length <= 64 &&
+          ((answer as Record<string, unknown>)["answers"] as unknown[]).every(
+            (label) => typeof label === "string" && label.trim() !== "",
+          ) &&
+          typeof (answer as Record<string, unknown>)["skipped"] === "boolean" &&
+          ((answer as Record<string, unknown>)["skipped"] !== true ||
+            ((answer as Record<string, unknown>)["answers"] as unknown[]).length === 0),
+      ))
+  );
+}
+
 /** ToolPresentation 是唯一可进入 domain 的 Tool 内容，禁止 raw value 重新出现。 */
 function isToolPresentation(value: unknown): value is ToolPresentation {
   if (typeof value !== "object" || value === null) return false;
@@ -863,6 +887,7 @@ function isToolPresentation(value: unknown): value is ToolPresentation {
     ) &&
     Array.isArray(presentation["relativePaths"]) &&
     (presentation["summary"] === undefined || typeof presentation["summary"] === "string") &&
+    isToolInteractionAnswers(presentation["interactionAnswers"]) &&
     typeof presentation["truncated"] === "boolean"
   );
 }

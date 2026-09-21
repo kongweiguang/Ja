@@ -49,7 +49,7 @@ public final class InteractionCapability implements AgentCapability {
     @Override
     public int order() { return 80; }
 
-    /** 按当前请求的 clarification 策略决定暴露提问能力，但完整安全定义始终参与目录指纹。 */
+    /** 按冻结策略暴露提问工具；动态提示只补充交互协议，自主判断原则由核心提示统一维护。 */
     @Override
     public Prepared prepare(Request request) {
         /* SUBAGENT 必须把缺失信息汇总回父任务；公共卡片只能由 Root/Side Task 或 Plan/Goal owner 发出。 */
@@ -62,8 +62,9 @@ public final class InteractionCapability implements AgentCapability {
         boolean exposed = request.taskKind().orElse(null)
                 != io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort.Kind.SUBAGENT
                 && clarificationEnabled(request);
-        return new Prepared(exposed ? "When a decision materially changes the plan, use request_user_input. "
-                        + "Do not infer missing answers; wait for the user's structured response." : "",
+        return new Prepared(exposed ? "When essential clarification is needed, use request_user_input to ask "
+                        + "the minimum unanswered questions together, recommend an option when appropriate, "
+                        + "and wait for the structured response. Do not use clarification to duplicate tool approval." : "",
                 exposed ? List.of(contribution) : List.of(), List.of(contribution));
     }
 

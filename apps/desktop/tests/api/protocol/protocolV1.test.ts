@@ -203,6 +203,92 @@ describe("JA RPC v1 configuration ownership", () => {
     ).toThrow();
   });
 
+  /** 问答展示只接纳可见文案闭集，跳过状态与答案数组必须保持一致。 */
+  it("validates structured interaction answers in Tool presentations", () => {
+    const turn = {
+      turnId: "turn_interaction_answer",
+      status: "completed" as const,
+      requestedAt: "2026-09-21T00:00:00Z",
+      updatedAt: "2026-09-21T00:00:01Z",
+      completedAt: "2026-09-21T00:00:01Z",
+      errorCode: null,
+      changeSet: null,
+    };
+    const presentation = {
+      kind: "read" as const,
+      title: "询问用户",
+      status: "success" as const,
+      summary: "已回答 2 个问题",
+      interactionAnswers: [
+        { question: "如何同步？", answers: ["保留本地改动", "合并远程提交"], skipped: false },
+        { question: "是否立即推送？", answers: [], skipped: true },
+      ],
+      relativePaths: [],
+      truncated: false,
+    };
+    const snapshot = {
+      threadId: "thr_interaction_answer",
+      revision: 2,
+      turns: [turn],
+      items: [
+        {
+          itemId: "item_interaction_answer",
+          createdAt: "2026-09-21T00:00:01Z",
+          turnId: turn.turnId,
+          kind: "tool_call" as const,
+          callId: "call_interaction_answer",
+          toolName: "request_user_input",
+          ordinal: 0,
+          presentation,
+        },
+      ],
+      inputQueue: null,
+      taskActivities: [],
+      goalActivities: [],
+      contextUsage: null,
+      nextCursor: null,
+    };
+
+    expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        items: [
+          {
+            ...snapshot.items[0],
+            presentation: {
+              ...presentation,
+              interactionAnswers: [
+                { question: "是否立即推送？", answers: ["立即推送"], skipped: true },
+              ],
+            },
+          },
+        ],
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        items: [
+          {
+            ...snapshot.items[0],
+            presentation: {
+              ...presentation,
+              interactionAnswers: [
+                {
+                  question: "如何同步？",
+                  answers: ["保留本地改动"],
+                  skipped: false,
+                  questionId: "question_sync",
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
   it("freezes manual compaction results and nullable Thread-level lifecycle events", () => {
     expect(
       parseMethodParams("thread/compact", {

@@ -16,6 +16,7 @@ public record ToolPresentation(
         String inputPreview,
         String outputPreview,
         String summary,
+        List<InteractionAnswerView> interactionAnswers,
         List<String> relativePaths,
         String command,
         String relativeCwd,
@@ -38,6 +39,8 @@ public record ToolPresentation(
         inputPreview = optionalText(inputPreview, "inputPreview", MAX_PREVIEW);
         outputPreview = optionalText(outputPreview, "outputPreview", MAX_PREVIEW);
         summary = optionalText(summary, "summary", MAX_SUMMARY);
+        interactionAnswers = List.copyOf(Objects.requireNonNull(interactionAnswers, "interactionAnswers"));
+        if (interactionAnswers.size() > 3) throw new IllegalArgumentException("too many interaction answers");
         command = optionalText(command, "command", MAX_PREVIEW);
         relativeCwd = optionalText(relativeCwd, "relativeCwd", 4_096);
         stdout = optionalText(stdout, "stdout", MAX_PREVIEW);
@@ -47,6 +50,32 @@ public record ToolPresentation(
         for (String path : relativePaths) text(path, "relativePath", 4_096, false);
         if (durationMs != null && durationMs < 0) throw new IllegalArgumentException("invalid durationMs");
         if (artifactId != null) identifier(artifactId, "artifact_", "artifactId");
+    }
+
+    /** 普通 Tool 不携带问答展示事实；保留紧凑构造入口，避免每个投影器重复传入空集合。 */
+    public ToolPresentation(Kind kind, String title, Status status, String inputPreview,
+                            String outputPreview, String summary, List<String> relativePaths,
+                            String command, String relativeCwd, String stdout, String stderr,
+                            Integer exitCode, Long durationMs, boolean truncated, String artifactId) {
+        this(kind, title, status, inputPreview, outputPreview, summary, List.of(), relativePaths,
+                command, relativeCwd, stdout, stderr, exitCode, durationMs, truncated, artifactId);
+    }
+
+    /**
+     * 问答展示只保存用户可见的题目与答案文案，不携带 questionId、optionId 或模型原始结果。
+     * 多选答案保留独立条目，避免 UI 再次解析带分隔符的摘要文本。
+     */
+    public record InteractionAnswerView(String question, List<String> answers, boolean skipped) {
+        /** 文案与数量在领域边界有界，防止历史快照把任意 Tool 结果扩散到 WebView。 */
+        public InteractionAnswerView {
+            question = text(question, "interaction question", 4_096, false);
+            answers = List.copyOf(Objects.requireNonNull(answers, "answers"));
+            if (answers.size() > 64) throw new IllegalArgumentException("too many interaction answer labels");
+            for (String answer : answers) text(answer, "interaction answer", 4_096, false);
+            if (skipped && !answers.isEmpty()) {
+                throw new IllegalArgumentException("skipped interaction cannot contain answers");
+            }
+        }
     }
 
     /** Tool 类别使用固定公开词汇，未知扩展统一归为 MCP。 */

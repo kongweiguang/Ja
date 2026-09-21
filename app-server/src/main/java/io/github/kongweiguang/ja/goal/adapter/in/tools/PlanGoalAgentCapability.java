@@ -37,8 +37,6 @@ import java.util.concurrent.CompletionStage;
  * 将 Plan/Goal 用例适配为请求级 Agent 能力；领域状态机、CAS 与持久化仍完全由 GoalUseCase 拥有。
  */
 public final class PlanGoalAgentCapability implements AgentCapability {
-    private static final String INSTRUCTIONS = "Plan revision requires explicit user approval. "
-            + "Use structured Goal tools; never self-approve or self-achieve.";
     private final GoalUseCase goals;
     private final ObjectMapper json;
     private final Clock clock;
@@ -118,10 +116,13 @@ public final class PlanGoalAgentCapability implements AgentCapability {
                 request.deadline(), goal, plan);
     }
 
-    /** 动态说明只追加冻结 identity/CAS，不携带 objective、正文、证据或数据库结构。 */
+    /** 按实际绑定说明 Plan 或 Goal 边界，避免独立 Goal 被无关的 Plan 审批文案误导。 */
     private static String promptFragment(Binding binding) {
-        StringBuilder result = new StringBuilder(INSTRUCTIONS);
+        StringBuilder result = new StringBuilder();
         if (binding.goalContext() != null) {
+            result.append("Pursue the active Goal within its scope and budget. A Goal does not require a Plan. "
+                    + "When the acceptance criteria are supported by observed evidence, use goal_request_evaluation; "
+                    + "do not declare the Goal achieved yourself.");
             GoalUseCase.GoalTurnContext goal = binding.goalContext();
             result.append("\nCurrent Goal binding: goalId=").append(goal.goalId())
                     .append(", expectedGoalRevision=").append(goal.goalRevision())
@@ -132,6 +133,10 @@ public final class PlanGoalAgentCapability implements AgentCapability {
                     .append(", planRevisionId=").append(goal.planRevisionId());
         }
         if (binding.planContext() != null) {
+            if (!result.isEmpty()) result.append('\n');
+            result.append("Use the current Plan tools to maintain the bound Plan. Only the user's Execute action "
+                    + "authorizes a proposed revision; never self-approve. During execution, update steps with "
+                    + "observed evidence; step completion is not final acceptance.");
             GoalUseCase.PlanTurnContext plan = binding.planContext();
             result.append("\nCurrent Plan binding: planId=").append(plan.planId())
                     .append(", expectedPlanRevision=").append(plan.planRevision())

@@ -224,8 +224,8 @@ describe("ToolStepDetails", () => {
     expect(screen.getByText("稳定输出")).toBeVisible();
   });
 
-  /** request_user_input 完成后只在工作时间线保留人类可读的选择结果，不让已回答卡占据 Composer。 */
-  it("在询问用户 Tool 行显示选择结果", () => {
+  /** 已回答问答按题目成组展示，多选、自由输入和跳过都不能退化为内部结果 JSON。 */
+  it("逐题显示多个问题与用户回答", () => {
     const step = toolStep();
     const presentation = step.metadata?.presentation;
     if (presentation === undefined) throw new Error("test fixture presentation is missing");
@@ -246,7 +246,20 @@ describe("ToolStepDetails", () => {
                 inputPreview: "采用哪种配置范围？",
                 outputPreview:
                   '[{"questionId":"question_scope","optionIds":["option_project"],"freeText":null,"skipped":false}]',
-                summary: "已选择：采用哪种配置范围？：按项目覆盖",
+                summary: "已回答 3 个问题",
+                interactionAnswers: [
+                  {
+                    question: "采用哪种同步策略？",
+                    answers: ["保留本地改动", "合并远程提交"],
+                    skipped: false,
+                  },
+                  {
+                    question: "还需要注意什么？",
+                    answers: ["不要覆盖未提交文件"],
+                    skipped: false,
+                  },
+                  { question: "是否立即推送？", answers: [], skipped: true },
+                ],
               },
             },
           },
@@ -257,6 +270,15 @@ describe("ToolStepDetails", () => {
     fireEvent.click(screen.getByRole("button", { name: "查看工作过程，已完成，1 步" }));
     const trigger = screen.getByRole("button", { name: /询问用户，request_user_input/u });
     expect(trigger).toHaveTextContent("询问用户");
-    expect(trigger).toHaveTextContent("已选择：采用哪种配置范围？：按项目覆盖");
+    expect(trigger).toHaveTextContent("已回答 3 个问题");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("list", { name: "问答记录" })).toBeVisible();
+    expect(screen.getByText("采用哪种同步策略？")).toBeVisible();
+    expect(screen.getByText("保留本地改动")).toBeVisible();
+    expect(screen.getByText("合并远程提交")).toBeVisible();
+    expect(screen.getByText("不要覆盖未提交文件")).toBeVisible();
+    expect(screen.getByText("已跳过")).toBeVisible();
+    expect(screen.queryByText(/question_scope/u)).not.toBeInTheDocument();
+    expect(screen.queryByText("状态：完成")).not.toBeInTheDocument();
   });
 });

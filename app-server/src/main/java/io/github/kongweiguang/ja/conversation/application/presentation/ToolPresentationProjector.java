@@ -87,8 +87,8 @@ public final class ToolPresentationProjector {
         Objects.requireNonNull(value, "value");
         Objects.requireNonNull(status, "status");
         return new ToolPresentation(value.kind(), value.title(), status, value.inputPreview(), value.outputPreview(),
-                value.summary(), value.relativePaths(), value.command(), value.relativeCwd(), value.stdout(), value.stderr(),
-                value.exitCode(), value.durationMs(), value.truncated(), value.artifactId());
+                value.summary(), value.interactionAnswers(), value.relativePaths(), value.command(), value.relativeCwd(),
+                value.stdout(), value.stderr(), value.exitCode(), value.durationMs(), value.truncated(), value.artifactId());
     }
 
     /**

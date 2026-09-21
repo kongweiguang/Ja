@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证公共提问能力以 Turn 来源为硬边界，不把用户普通模式偏好误用于 Plan-owned 执行。 */
 final class InteractionCapabilityTest {
@@ -68,6 +69,21 @@ final class InteractionCapabilityTest {
                 .map(value -> value.spec().name()).toList());
         assertEquals(List.of("request_user_input"), visible.catalogTools().stream()
                 .map(value -> value.spec().name()).toList());
+    }
+
+    /** 可见能力只补充结构化问答与审批边界，不复制核心自主推进规则。 */
+    @Test
+    void visibleQuestionToolTreatsClarificationAsLastResort() {
+        InteractionCapability capability = new InteractionCapability(service(), ignored -> true);
+
+        String prompt = capability.prepare(request(CollaborationMode.DEFAULT, TurnOrigin.USER,
+                true, Optional.empty())).promptFragment();
+
+        assertTrue(prompt.contains("essential clarification"));
+        assertTrue(prompt.contains("request_user_input"));
+        assertTrue(prompt.contains("wait for the structured response"));
+        assertTrue(prompt.contains("Do not use clarification to duplicate tool approval"));
+        assertTrue(prompt.contains("minimum unanswered questions together"));
     }
 
     /** 构造真实服务对象但不提供可执行的外部端口，prepare 阶段不得触发任何 Repository 调用。 */

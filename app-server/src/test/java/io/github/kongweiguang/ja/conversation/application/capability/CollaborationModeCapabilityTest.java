@@ -22,6 +22,9 @@ class CollaborationModeCapabilityTest {
     @Test void planningUsesExplorationBeforeQuestionsAndRequiresExplicitExecution() {
         String prompt = new CollaborationModeCapability().prepare(request(CollaborationMode.PLAN, TurnOrigin.USER, false)).promptFragment();
         assertTrue(prompt.contains("First inspect"));
+        assertTrue(prompt.contains("Treat clarification as a last resort"));
+        assertTrue(prompt.contains("decide reversible implementation details"));
+        assertTrue(prompt.contains("do not repeat answered questions"));
         assertTrue(prompt.contains("clicks Execute"));
         assertTrue(prompt.contains("plan_propose"));
     }

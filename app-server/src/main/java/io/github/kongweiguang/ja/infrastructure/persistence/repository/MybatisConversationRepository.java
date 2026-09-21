@@ -375,7 +375,7 @@ public final class MybatisConversationRepository implements ConversationReposito
     /** 同一 Unit of Work 内完成 Interaction Tool 事实与 cursor 替换，禁止嵌套开启事务。 */
     private CommitReceipt settleInteractionAnswer(PersistenceMappers mapper,
                                                    InteractionAnswerSettlement request) {
-        return settleInteractionAnswer(mapper, request, "已收到用户输入");
+        return settleInteractionAnswer(mapper, request, "已收到用户输入", List.of());
     }
 
     /**
@@ -384,14 +384,15 @@ public final class MybatisConversationRepository implements ConversationReposito
      */
     private CommitReceipt settleInteractionAnswer(PersistenceMappers mapper,
                                                    InteractionAnswerSettlement request,
-                                                   String presentationSummary) {
+                                                   String presentationSummary,
+                                                   List<ToolPresentation.InteractionAnswerView> interactionAnswers) {
         PersistenceRecords.TurnRow turn = checkedTurn(mapper, request.threadId(), request.turnId(),
                 request.expectedTurnMutationVersion());
         TurnState current = TurnState.valueOf(requiredText(turn.state(), "state"));
         if (current != TurnState.SUSPENDED) throw conflict("interaction turn is not suspended");
         ToolPresentation presentation = new ToolPresentation(ToolPresentation.Kind.READ,
-                "询问用户", ToolPresentation.Status.SUCCESS, null, request.content(), presentationSummary, List.of(),
-                null, null, null, null, null, 0L, false, null);
+                "询问用户", ToolPresentation.Status.SUCCESS, null, null, presentationSummary,
+                interactionAnswers, List.of(), null, null, null, null, null, 0L, false, null);
         List<Fact> facts = List.of(
                 new ToolResultFact(request.callId(), ToolState.SUCCEEDED, request.content(), false,
                         presentation, ""),
@@ -516,7 +517,8 @@ public final class MybatisConversationRepository implements ConversationReposito
                     tools.firstOrdinal(), tools.lastOrdinal(), tools.nextOrdinal() + 1);
             CommitReceipt receipt = settleInteractionAnswer(mapper, new InteractionAnswerSettlement(
                     answered.threadId(), answered.turnId(), answered.toolCallId(), encodeInteraction(answered.answers()),
-                    turn.mutationVersion(), occurredAt, next), interactionAnswerSummary(answered));
+                    turn.mutationVersion(), occurredAt, next), interactionAnswerSummary(answered),
+                    interactionAnswerViews(answered));
             PersistenceRecords.InteractionRow settled = mapper.interactions().selectInteraction(
                     new PersistenceRecords.InteractionKey(answered.threadId(), answered.requestId()));
             return new InteractionAnswerReceipt(decodeInteraction(settled), receipt, true);
@@ -1636,36 +1638,37 @@ public final class MybatisConversationRepository implements ConversationReposito
         }
     }
 
-    /**
-     * 把已确认答案投影为有界的人类可读摘要；问题/选项文案来自同一持久请求，不能让 Renderer 依据 ID 猜测。
-     */
+    /** 摘要只表达问答规模，具体题目与回答通过结构化展示事实传输，避免折叠行被长文本撑满。 */
     private static String interactionAnswerSummary(InteractionRequest request) {
-        StringBuilder summary = new StringBuilder("已选择：");
+        return "已回答 " + request.questions().size() + " 个问题";
+    }
+
+    /**
+     * 从同一持久请求生成 Renderer 专用问答事实；只保留可见文案，不让客户端从稳定 ID 或分隔符猜测。
+     */
+    private static List<ToolPresentation.InteractionAnswerView> interactionAnswerViews(
+            InteractionRequest request) {
+        List<ToolPresentation.InteractionAnswerView> views = new java.util.ArrayList<>();
         for (InteractionQuestion question : request.questions()) {
             InteractionAnswer answer = request.answers().stream()
                     .filter(candidate -> candidate.questionId().equals(question.questionId()))
                     .findFirst().orElse(null);
-            if (summary.length() > "已选择：".length()) summary.append("；");
-            summary.append(question.prompt()).append("：").append(answerLabel(question, answer));
-            if (summary.length() >= 980) {
-                summary.setLength(980);
-                summary.append('…');
-                break;
-            }
+            views.add(new ToolPresentation.InteractionAnswerView(
+                    question.prompt(), answerLabels(question, answer), answer != null && answer.skipped()));
         }
-        return summary.toString();
+        return List.copyOf(views);
     }
 
-    /** 单题摘要只使用服务端保存的选项 label 与用户自由文本，不把 optionId 暴露给时间线。 */
-    private static String answerLabel(InteractionQuestion question, InteractionAnswer answer) {
-        if (answer == null) return "未回答";
-        if (answer.skipped()) return "已跳过";
+    /** 单题只使用服务端保存的选项 label 与用户自由文本；跳过由独立布尔事实表达。 */
+    private static List<String> answerLabels(InteractionQuestion question, InteractionAnswer answer) {
+        if (answer == null) return List.of("未回答");
+        if (answer.skipped()) return List.of();
         List<String> labels = question.options().stream()
                 .filter(option -> answer.optionIds().contains(option.optionId()))
                 .map(io.github.kongweiguang.ja.conversation.domain.interaction.InteractionOption::label)
                 .collect(java.util.stream.Collectors.toCollection(java.util.ArrayList::new));
         if (answer.freeText() != null && !answer.freeText().isBlank()) labels.add(answer.freeText());
-        return labels.isEmpty() ? "未回答" : String.join("、", labels);
+        return labels.isEmpty() ? List.of("未回答") : List.copyOf(labels);
     }
 
     /** 仅用于幂等回答回执的严格行解码；损坏请求不得被当作已回答成功返回。 */

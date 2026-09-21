@@ -474,6 +474,24 @@ const RelativePathSchema = z
 const ArtifactIdSchema = prefixedId("artifact_", 110);
 /** Tool 摘要只供结果扫描，保持单行短文本，不为任意 Tool metadata 打开额外 wire 入口。 */
 const ToolSummarySchema = PreviewTextSchema.max(1_024);
+const ToolInteractionAnswerSchema = z
+  .object({
+    question: PreviewTextSchema.min(1)
+      .max(4_096)
+      .refine((value) => value.trim() !== "", "question must not be blank"),
+    answers: z
+      .array(
+        PreviewTextSchema.min(1)
+          .max(4_096)
+          .refine((value) => value.trim() !== "", "answer must not be blank"),
+      )
+      .max(64),
+    skipped: z.boolean(),
+  })
+  .strict()
+  .refine((value) => !value.skipped || value.answers.length === 0, {
+    message: "skipped interaction must not contain answers",
+  });
 
 /** Java 已完成脱敏的唯一 Tool 展示合同；WebView 不接收 raw arguments 或 raw result。 */
 const ToolPresentationSchema = z
@@ -484,6 +502,7 @@ const ToolPresentationSchema = z
     inputPreview: PreviewTextSchema.optional(),
     outputPreview: PreviewTextSchema.optional(),
     summary: ToolSummarySchema.optional(),
+    interactionAnswers: z.array(ToolInteractionAnswerSchema).max(3).optional(),
     relativePaths: z.array(RelativePathSchema).max(64).refine(unique, "paths must be unique"),
     command: PreviewTextSchema.optional(),
     relativeCwd: RelativePathSchema.optional(),

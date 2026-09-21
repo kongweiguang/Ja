@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import {
+  Check,
   ChevronDown,
   ChevronUp,
   CircleAlert,
@@ -11,6 +12,7 @@ import {
   Folder,
   ListTree,
   LoaderCircle,
+  Minus,
   Search,
 } from "lucide-react";
 import { useMemo, useState, type ReactElement } from "react";
@@ -19,7 +21,11 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/shared/ui/primitives/Collapsible";
-import type { ToolPresentation, WorkStepAdapter } from "../../domain/timelineTypes";
+import type {
+  ToolInteractionAnswer,
+  ToolPresentation,
+  WorkStepAdapter,
+} from "../../domain/timelineTypes";
 import {
   toolResultContent,
   toolResultView,
@@ -120,12 +126,25 @@ function presentationTarget(
   );
 }
 
-/** 问答 Tool 的摘要是 Java 根据题目与答案生成的安全展示事实，折叠态也应直接可见。 */
+/** 只接受 JA-RPC 明确投影的结构化问答，避免从历史摘要猜测题目、答案或跳过状态。 */
+function interactionAnswers(
+  presentation: ToolPresentation,
+  toolName: string | undefined,
+): ToolInteractionAnswer[] {
+  if (toolName !== "request_user_input") return [];
+  return presentation.interactionAnswers ?? [];
+}
+
+/** 问答 Tool 折叠态只表达规模，避免再次把完整问题与答案挤成不可读的一行。 */
 function interactionSummary(
   presentation: ToolPresentation,
   toolName: string | undefined,
+  answers: readonly ToolInteractionAnswer[],
 ): string | undefined {
-  return toolName === "request_user_input" ? presentation.summary?.trim() || undefined : undefined;
+  if (toolName !== "request_user_input") return undefined;
+  return answers.length > 0
+    ? `已回答 ${answers.length} 个问题`
+    : presentation.summary?.trim() || undefined;
 }
 
 /** Shell 将 stdout/stderr 保持为不同事实，普通 Tool 只展示 Java 提供的安全 outputPreview。 */
@@ -210,6 +229,44 @@ function ToolResultOutput({
   );
 }
 
+/** 问答结果按题目分组，多选答案保留独立行，跳过与未回答不会伪装成已选择项。 */
+function InteractionAnswerList({
+  answers,
+}: {
+  answers: readonly ToolInteractionAnswer[];
+}): ReactElement {
+  return (
+    <ol className="ja-tool-interaction" aria-label="问答记录">
+      {answers.map((answer, questionIndex) => {
+        const values = answer.skipped
+          ? ["已跳过"]
+          : answer.answers.length > 0
+            ? answer.answers
+            : ["未回答"];
+        return (
+          <li key={`${questionIndex}:${answer.question}`}>
+            <div className="ja-tool-interaction__question">
+              <span>问题 {questionIndex + 1}</span>
+              <p>{answer.question}</p>
+            </div>
+            <div className="ja-tool-interaction__answer">
+              <span>你的回答</span>
+              <ul>
+                {values.map((value, answerIndex) => (
+                  <li key={`${answerIndex}:${value}`} data-skipped={answer.skipped || undefined}>
+                    {answer.skipped ? <Minus aria-hidden="true" /> : <Check aria-hidden="true" />}
+                    <span>{value}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 /**
  * Tool 行自身就是唯一 Disclosure：常规步骤保持紧凑，失败步骤自动展开，
  * 且用户的手动选择按 Thread/Turn/Item identity 跨状态和虚拟卸载保留；动作、真实 Tool 名称与首个目标留在同一行，
@@ -230,6 +287,9 @@ export function ToolStepDetails({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const toolName = presentationToolName(step);
+  const isInteractionTool = toolName === "request_user_input";
+  const answeredInteractions =
+    presentation === undefined ? [] : interactionAnswers(presentation, toolName);
   const rawOutput =
     presentation === undefined ? undefined : (loadedOutput ?? presentationOutput(presentation));
   const output =
@@ -242,21 +302,27 @@ export function ToolStepDetails({
   const locallyExpandable = lines.length > PREVIEW_LINES;
   const shownOutput = outputExpanded ? output : lines.slice(0, PREVIEW_LINES).join("\n");
   const hidesSuccessOutput =
-    presentation.status === "success" &&
-    presentation.summary !== undefined &&
-    (toolName === "edit" || toolName === "write");
+    isInteractionTool ||
+    (presentation.status === "success" &&
+      presentation.summary !== undefined &&
+      (toolName === "edit" || toolName === "write"));
   const outputView = hidesSuccessOutput
     ? undefined
     : toolResultView(toolName, presentation, shownOutput);
-  const showsInput = presentation.kind === "mcp" && presentation.inputPreview?.trim() !== "";
+  const showsInput =
+    !isInteractionTool && presentation.kind === "mcp" && presentation.inputPreview?.trim() !== "";
   const cachedOpen =
     disclosureCache !== undefined && disclosureThreadId !== undefined && disclosureKey !== undefined
       ? disclosureCache.get(disclosureThreadId, "tool", disclosureKey)
       : undefined;
-  const detailsOpen = cachedOpen ?? manualOpen ?? presentation.status === "error";
+  const detailsOpen =
+    cachedOpen ??
+    manualOpen ??
+    (presentation.status === "error" ||
+      (isInteractionTool && presentation.status === "success" && answeredInteractions.length > 0));
   const actionLabel = presentationActionLabel(presentation, toolName);
   const target = presentationTarget(presentation, toolName);
-  const interactionResult = interactionSummary(presentation, toolName);
+  const interactionResult = interactionSummary(presentation, toolName, answeredInteractions);
   const accessibleSummary = [
     actionLabel,
     toolName,
@@ -334,13 +400,16 @@ export function ToolStepDetails({
           </span>
         </CollapsibleTrigger>
         <CollapsibleContent className="ja-tool-details__content">
-          {presentation.summary === undefined ? null : (
+          {presentation.summary === undefined || isInteractionTool ? null : (
             <div className="ja-tool-details__overview" data-status={presentation.status}>
               <span aria-hidden="true" className="ja-tool-details__overview-icon">
                 <ToolOverviewIcon status={presentation.status} />
               </span>
               <span>{presentation.summary}</span>
             </div>
+          )}
+          {answeredInteractions.length === 0 ? null : (
+            <InteractionAnswerList answers={answeredInteractions} />
           )}
           {showsInput ? (
             <pre className="ja-tool-details__input">{presentation.inputPreview}</pre>
@@ -351,20 +420,22 @@ export function ToolStepDetails({
           {outputView === undefined ? null : (
             <ToolResultOutput view={outputView} status={presentation.status} />
           )}
-          <div className="ja-tool-details__facts">
-            <span>状态：{presentationStatusLabel(presentation.status)}</span>
-            {presentation.exitCode === undefined ? null : (
-              <span>退出码 {presentation.exitCode}</span>
-            )}
-            {presentation.durationMs === undefined ? null : (
-              <span>
-                {presentation.durationMs < 1_000
-                  ? `${presentation.durationMs} ms`
-                  : `${(presentation.durationMs / 1_000).toFixed(1)} s`}
-              </span>
-            )}
-            {presentation.truncated ? <span>预览已截断</span> : null}
-          </div>
+          {isInteractionTool ? null : (
+            <div className="ja-tool-details__facts">
+              <span>状态：{presentationStatusLabel(presentation.status)}</span>
+              {presentation.exitCode === undefined ? null : (
+                <span>退出码 {presentation.exitCode}</span>
+              )}
+              {presentation.durationMs === undefined ? null : (
+                <span>
+                  {presentation.durationMs < 1_000
+                    ? `${presentation.durationMs} ms`
+                    : `${(presentation.durationMs / 1_000).toFixed(1)} s`}
+                </span>
+              )}
+              {presentation.truncated ? <span>预览已截断</span> : null}
+            </div>
+          )}
           {locallyExpandable ? (
             <button
               type="button"

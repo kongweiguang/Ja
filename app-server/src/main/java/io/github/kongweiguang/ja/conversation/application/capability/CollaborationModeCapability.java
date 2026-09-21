@@ -13,9 +13,13 @@ import java.util.List;
 public final class CollaborationModeCapability implements AgentCapability {
     private static final String PLANNING = """
             You are planning, not implementing. First inspect the actual workspace using the available
-            controlled read-only tools. Do not ask the user for facts you can discover. Then clarify
-            only decisions that materially change the scope, behavior, constraints or acceptance.
-            Use request_user_input for those decisions when available; do not repeat answered questions.
+            controlled read-only tools. Work autonomously on the plan: discover facts, follow existing
+            architecture and conventions, and decide reversible implementation details using reasonable
+            project-consistent assumptions. Treat clarification as a last resort. Ask only when a missing
+            user-owned decision cannot be discovered, inferred or safely defaulted, blocks a decision-complete
+            plan, and the alternatives materially change scope, behavior, constraints or acceptance. Consolidate
+            the minimum unanswered decisions into one request_user_input call; do not repeat answered questions
+            or ask permission to keep planning.
             Finally produce a decision-complete structured Plan with objective, scope, non-goals,
             constraints, ordered dependent steps, risks, acceptance criteria and verification strategy.
             Save draft changes with the native Plan draft tool and freeze the final revision with

@@ -4,38 +4,34 @@
 import type { InteractionAnswer, InteractionRequest } from "./interactionPort";
 import type { TimelineItemAdapter, ToolPresentation } from "../domain/timelineTypes";
 
-/** 只把服务端问题快照中的稳定文案与已确认答案组合成有限长度的临时摘要。 */
-function interactionAnswerSummary(
+/** ACK 空窗的折叠摘要只表达规模，具体文案由结构化问答事实负责。 */
+function interactionAnswerSummary(request: InteractionRequest): string {
+  return `已回答 ${request.questions.length} 个问题`;
+}
+
+/** ACK 空窗复用请求快照生成可见问答，不把 questionId/optionId 或结果 JSON 暴露给 Renderer。 */
+function interactionAnswerViews(
   request: InteractionRequest,
   answers: Readonly<Record<string, InteractionAnswer>>,
-): string {
-  const prefix = "已选择：";
-  let summary = prefix;
-  for (const question of request.questions) {
+): NonNullable<ToolPresentation["interactionAnswers"]> {
+  return request.questions.map((question) => {
     const answer =
       answers[question.questionId] ??
       request.answers.find((candidate) => candidate.questionId === question.questionId);
-    const labels =
-      answer === undefined || answer.skipped
-        ? answer?.skipped === true
-          ? ["已跳过"]
-          : ["未回答"]
-        : [
-            ...(question.options ?? [])
-              .filter((option) => answer.optionIds.includes(option.optionId))
-              .map((option) => option.label),
-            ...(answer.freeText?.trim() ? [answer.freeText.trim()] : []),
-          ];
-    const value = labels.length === 0 ? "未回答" : labels.join("、");
-    const entry = question.prompt + "：" + value;
-    if (summary.length > prefix.length) summary += "；";
-    if (summary.length + entry.length > 980) {
-      summary += "…";
-      break;
-    }
-    summary += entry;
-  }
-  return summary;
+    const labels = answer?.skipped
+      ? []
+      : [
+          ...(question.options ?? [])
+            .filter((option) => answer?.optionIds.includes(option.optionId) === true)
+            .map((option) => option.label),
+          ...(answer?.freeText?.trim() ? [answer.freeText.trim()] : []),
+        ];
+    return {
+      question: question.prompt,
+      answers: labels.length === 0 && answer?.skipped !== true ? ["未回答"] : labels,
+      skipped: answer?.skipped === true,
+    };
+  });
 }
 
 /** 终态 ToolResult 已是权威事实；临时投影只能补 pending/running 的 ACK 空窗。 */
@@ -60,7 +56,8 @@ function answeredInteractionItem(
     status: "success",
     inputPreview: presentation?.inputPreview,
     outputPreview: presentation?.outputPreview,
-    summary: interactionAnswerSummary(request, answers),
+    summary: interactionAnswerSummary(request),
+    interactionAnswers: interactionAnswerViews(request, answers),
     relativePaths: presentation?.relativePaths ?? [],
     command: presentation?.command,
     relativeCwd: presentation?.relativeCwd,

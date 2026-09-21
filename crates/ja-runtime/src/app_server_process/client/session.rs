@@ -612,6 +612,11 @@ impl Session {
             Ok(result) => result,
             Err(RecvTimeoutError::Disconnected) => Err(AppServerProcessError::SessionClosed),
             Err(RecvTimeoutError::Timeout) => {
+                // EOF close can win immediately after recv_timeout observes its deadline;
+                // preserve the terminal session fact instead of reporting a retryable timeout.
+                if self.inner.closed.load(Ordering::Acquire) {
+                    return Err(AppServerProcessError::SessionClosed);
+                }
                 let pending = self.inner.pending.lock();
                 let mut pending = match pending {
                     Ok(pending) => pending,

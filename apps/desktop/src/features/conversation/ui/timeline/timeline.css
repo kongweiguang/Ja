@@ -1163,6 +1163,92 @@
   stroke-width: 1.8;
 }
 
+/* 问答记录使用连续阅读面而非原始 JSON；分隔线维持工作过程的紧凑密度，多题也能逐项扫描。 */
+.ja-tool-interaction {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  border-block: 1px solid color-mix(in srgb, var(--ja-border) 84%, transparent);
+  list-style: none;
+}
+
+.ja-tool-interaction > li {
+  display: grid;
+  min-width: 0;
+  gap: 0.48rem;
+  padding: 0.62rem 0.58rem 0.68rem;
+}
+
+.ja-tool-interaction > li + li {
+  border-top: 1px solid color-mix(in srgb, var(--ja-border) 68%, transparent);
+}
+
+.ja-tool-interaction__question,
+.ja-tool-interaction__answer {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 4.4rem minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: start;
+}
+
+.ja-tool-interaction__question > span,
+.ja-tool-interaction__answer > span {
+  color: var(--ja-foreground-tertiary);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-medium);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-tool-interaction__question p {
+  min-width: 0;
+  margin: 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.ja-tool-interaction__answer ul {
+  display: grid;
+  min-width: 0;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ja-tool-interaction__answer li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 0.9rem minmax(0, 1fr);
+  gap: 0.38rem;
+  align-items: start;
+  color: var(--ja-accent-emphasis);
+  font-size: var(--ja-text-control-size);
+  line-height: 1.5;
+}
+
+.ja-tool-interaction__answer li[data-skipped="true"] {
+  color: var(--ja-foreground-muted);
+}
+
+.ja-tool-interaction__answer svg {
+  width: 0.82rem;
+  height: 0.82rem;
+  margin-top: 0.22rem;
+  stroke-width: 2;
+}
+
+.ja-tool-interaction__answer li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 /* 仅运行中的 Tool 使用短促旋转，静态结果不以装饰动画打断高密度阅读。 */
 .ja-tool-details__overview-spinner {
   animation: ja-tool-overview-spin 900ms linear infinite;

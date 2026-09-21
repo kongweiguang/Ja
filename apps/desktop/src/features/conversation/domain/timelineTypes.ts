@@ -18,6 +18,13 @@ export type TimelineItemKind =
 
 export type TimelineItemStatus = "started" | "in_progress" | "completed" | "failed" | "cancelled";
 
+/** 问答 Tool 只向 UI 暴露可见文案；稳定 ID 与模型结果仍留在 App Server。 */
+export interface ToolInteractionAnswer {
+  question: string;
+  answers: string[];
+  skipped: boolean;
+}
+
 export interface ToolPresentation {
   kind: "read" | "edit" | "write" | "shell" | "mcp";
   title: string;
@@ -26,6 +33,7 @@ export interface ToolPresentation {
   outputPreview?: string;
   /** Java 仅从受控 metadata 生成的结果摘要；UI 不能以正文或参数自行补造。 */
   summary?: string;
+  interactionAnswers?: ToolInteractionAnswer[];
   relativePaths: string[];
   command?: string;
   relativeCwd?: string;

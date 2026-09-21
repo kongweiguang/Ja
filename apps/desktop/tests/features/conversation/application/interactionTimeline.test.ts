@@ -74,7 +74,10 @@ describe("projectAnsweredInteractionResult", () => {
         toolName: "request_user_input",
         presentation: {
           status: "success",
-          summary: "已选择：采用哪种范围？：按项目覆盖",
+          summary: "已回答 1 个问题",
+          interactionAnswers: [
+            { question: "采用哪种范围？", answers: ["按项目覆盖"], skipped: false },
+          ],
         },
       },
     });
