@@ -196,12 +196,19 @@ class NativeSmokeV1Test(unittest.TestCase):
             SMOKE.thread_rename_frame("thr_demo", 1),
             SMOKE.configuration_replace_frame("cfg_missing"),
             SMOKE.turn_start_frame("thr_demo", "current content contract"),
+            SMOKE.turn_cancel_frame("turn_demo"),
             SMOKE.skill_list_frame("ws_demo"),
             SMOKE.health_read_frame(),
             SMOKE.shutdown_frame(),
         ]
         for frame in frames:
             jsonschema.Draft202012Validator(schema).validate(frame)
+
+    def test_turn_cancellation_frame_uses_only_the_current_v1_identity(self) -> None:
+        """防止已移除的 CAS 字段重新进入生产取消请求并只在 Native CI 暴露。"""
+
+        frame = SMOKE.turn_cancel_frame("turn_demo")
+        self.assertEqual({"turnId": "turn_demo"}, frame["params"])
 
     def test_loopback_configuration_document_is_exact_v1(self) -> None:
         """Locks the production smoke fixture to v1 and rejects every removed configuration field."""

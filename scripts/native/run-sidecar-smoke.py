@@ -523,12 +523,17 @@ def turn_start_frame(thread_id: str, text: str) -> dict[str, Any]:
     }
 
 
-def turn_cancel_frame(turn_id: str, expected_revision: int) -> dict[str, Any]:
-    """Cancel one admitted Turn with its observed revision so cancellation remains CAS-bound."""
+def turn_cancel_frame(turn_id: str) -> dict[str, Any]:
+    """Cancel one admitted Turn using the v1 cancellation contract.
+
+    Cancellation is intentionally identity-bound but not CAS-bound: the Kernel owns the terminal
+    transition and accepts a late cancel idempotently, so carrying a UI-observed Thread revision
+    would turn a valid stop request into an invalid v1 frame.
+    """
 
     return {
         "jsonrpc": "2.0", "id": "c:turn-cancel", "method": "turn/cancel",
-        "params": {"turnId": turn_id, "expectedThreadRevision": expected_revision},
+        "params": {"turnId": turn_id},
     }
 
 
@@ -1692,7 +1697,7 @@ def run_smoke(
                         or started_params.get("ordinal") != 0 \
                         or not isinstance(cancel_revision, int):
                     raise RuntimeError("shell started projection is incomplete")
-                send(turn_cancel_frame(shell_turn_id, cancel_revision))
+                send(turn_cancel_frame(shell_turn_id))
                 cancel_result = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:turn-cancel"),
                     "shell cancellation",
