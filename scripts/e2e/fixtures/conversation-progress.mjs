@@ -337,7 +337,7 @@ export async function startConversationProgressFixture() {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     attempts,
     stages,
-    /** 由真实 DOM 确认首段正文后才释放 Tool，避免把机器负载造成的采样延迟误判为顺序错误。 */
+    /** 由真实 WorkProcess DOM 确认首段正文后才释放 Tool，避免把采样延迟误判为顺序错误。 */
     releaseFirstText() {
       releaseFirstText();
     },
@@ -349,7 +349,7 @@ export async function startConversationProgressFixture() {
     releaseFinalNarrative() {
       releaseFinalNarrative();
     },
-    /** 最终正文已写入但 terminal 未发送时恢复流，供真窗断言正文的稳定渲染位置。 */
+    /** 最终正文已写入但 terminal 未发送时恢复流，供真窗断言草稿仍受 WorkProcess 约束。 */
     releaseFinalText() {
       releaseFinalText();
     },

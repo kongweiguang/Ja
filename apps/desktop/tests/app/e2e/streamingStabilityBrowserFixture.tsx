@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useState, type ComponentProps } from "react";
+import { useEffect, useState, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { ConversationTimelineSurface } from "@/app/composition/ConversationTimelineSurface";
 import { NavigationSidebar, type ThreadProjection } from "@/features/navigation";
@@ -21,6 +21,7 @@ const TURN_ID = "turn_streaming_stability";
 const WORKSPACE_ID = "workspace_streaming_stability";
 type ComposerModel = NonNullable<ComponentProps<typeof Composer>["models"]>[number];
 type ComposerPreferences = NonNullable<ComponentProps<typeof Composer>["preferences"]>;
+type HistoryMode = "ready" | "background-busy" | "empty-busy";
 
 const MODEL: ComposerModel = {
   value: "fixture:gpt-stream",
@@ -53,6 +54,7 @@ const RUNNING_TURN: TimelineTurn = {
 let eventSequence = 1;
 let streamSequence = 0;
 let lastDelta: TimelineEvent | undefined;
+let updateHistoryMode: ((mode: HistoryMode) => void) | undefined;
 
 declare global {
   interface Window {
@@ -61,6 +63,7 @@ declare global {
       appendDelta(text: string): string;
       repeatLastDelta(): string;
       complete(finalText: string): string;
+      setHistoryMode(mode: HistoryMode): string;
     };
   }
 }
@@ -121,15 +124,25 @@ function prepareTimeline(): void {
 /** fixture 复用生产组件和全局样式，只把 native 端口替换为无副作用的展示回调。 */
 export function StreamingStabilityBrowserFixture() {
   const [draft, setDraft] = useState("");
+  const [historyMode, setHistoryMode] = useState<HistoryMode>("ready");
   const turn = useTimelineStore((state) => state.turns[TURN_ID] ?? RUNNING_TURN);
   const thread: ThreadProjection = {
     threadId: THREAD_ID,
     title: "流式回复稳定性",
     status: "active",
     pinned: false,
-    latestTurnStatus: "running",
+    latestTurnStatus: turn.status,
     latestTurnSeen: true,
   };
+  useEffect(() => {
+    // 浏览器验收只通过显式 fixture seam 改变历史投影，避免脚本触碰 React 私有状态。
+    updateHistoryMode = setHistoryMode;
+    return () => {
+      updateHistoryMode = undefined;
+    };
+  }, []);
+  const historyBusy = historyMode !== "ready";
+  const threads = historyMode === "empty-busy" ? [] : [thread];
   return (
     <main className="ja-shell">
       <div className="ja-layout">
@@ -144,8 +157,8 @@ export function StreamingStabilityBrowserFixture() {
             runtimeLabel="工作中"
             runtimeTone="busy"
             currentThreadId={THREAD_ID}
-            threads={[thread]}
-            historyBusy={false}
+            threads={threads}
+            historyBusy={historyBusy}
             newConversationDisabled={false}
             projectBusy={false}
             compact={false}
@@ -209,6 +222,12 @@ export function StreamingStabilityBrowserFixture() {
 
 prepareTimeline();
 window.__JA_STREAMING_STABILITY__ = {
+  /** 切换可观察的历史加载投影，用于证明后台刷新静默且首次短请求不会闪烁。 */
+  setHistoryMode(mode: HistoryMode): string {
+    if (updateHistoryMode === undefined) return "invalid";
+    updateHistoryMode(mode);
+    return "applied";
+  },
   /** Reasoning 使用独立协议事件建立真实 WorkProcess，不与回复正文共享展示槽。 */
   appendReasoning(text: string): string {
     streamSequence += 1;

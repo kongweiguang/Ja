@@ -195,6 +195,7 @@
   flex: 0 0 1rem;
   place-items: center;
   color: var(--text-tertiary);
+  animation: ja-navigation-history-reveal 120ms var(--ja-ease-native) 160ms both;
 }
 
 .ja-navigation-history-loading svg {
@@ -207,6 +208,16 @@
 @keyframes ja-navigation-history-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* 快速历史读取在延迟窗口内完成时保持不可见，避免加载圈只闪过一帧。 */
+@keyframes ja-navigation-history-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 
@@ -788,6 +799,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .ja-navigation-history-loading,
   .ja-navigation-action,
   .ja-navigation-section-action,
   .ja-navigation-section-toggle svg,
@@ -798,5 +810,14 @@
   .ja-navigation-runtime,
   .ja-navigation-settings {
     transition: none;
+  }
+
+  .ja-navigation-history-loading {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+  }
+
+  .ja-navigation-history-loading svg {
+    animation: none;
   }
 }

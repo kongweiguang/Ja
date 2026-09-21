@@ -147,8 +147,8 @@ describe("ConversationTimelineSurface", () => {
     expect(onComposerCommit).toHaveBeenCalledTimes(settledComposerCommits);
   });
 
-  /** Tool 提交会确认此前正文属于过程，但底部权威响应壳必须持续存在并回到 working。 */
-  it("archives a Tool-bound draft into WorkProcess without replacing the response shell", async () => {
+  /** Draft 从首个 delta 起属于工作过程，Tool 提交只能替换其权威身份，不能改变展示边界。 */
+  it("keeps a Tool-bound draft in WorkProcess without replacing the response shell", async () => {
     prepareStreamingTimeline();
     const runningTurn = useTimelineStore.getState().turns[TURN_ID];
     expect(runningTurn?.status).toBe("running");
@@ -184,8 +184,11 @@ describe("ConversationTimelineSurface", () => {
     });
     expect(await screen.findByText("保持原位的过程正文")).toBeDefined();
     const response = screen.getByRole("article", { name: "回复状态" });
-    expect(response.textContent).toContain("保持原位的过程正文");
+    expect(response.textContent).not.toContain("保持原位的过程正文");
     expect(response.textContent).toContain("正在工作");
+    expect(
+      screen.getByText("保持原位的过程正文").closest('[data-role="commentary"]'),
+    ).not.toBeNull();
 
     const committed: TimelineEvent = {
       jsonrpc: "2.0",

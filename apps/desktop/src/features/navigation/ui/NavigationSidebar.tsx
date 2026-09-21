@@ -508,6 +508,8 @@ export const NavigationSidebar = memo(function NavigationSidebar(
   const [renameThread, setRenameThread] = useState<ThreadProjection>();
   const topActions = buildTopActions(props);
   const settingsShortcut = navigationShortcut("open-settings", props.platform);
+  // 已有目录保持可读可操作时，后台校验不再反复挂载旋转图标；首次空目录恢复仍给出明确进度。
+  const showHistoryLoading = props.historyBusy && props.threads.length === 0;
 
   return (
     <aside
@@ -604,7 +606,7 @@ export const NavigationSidebar = memo(function NavigationSidebar(
               <h2 id="ja-navigation-history-title" aria-label="最近对话">
                 <SectionToggle title="最近对话" open={!props.historySectionCollapsed} />
               </h2>
-              {props.historyBusy ? (
+              {showHistoryLoading ? (
                 <span
                   className="ja-navigation-history-loading"
                   role="status"
@@ -616,7 +618,12 @@ export const NavigationSidebar = memo(function NavigationSidebar(
               ) : null}
             </div>
             <CollapsibleContent className="ja-navigation-section-content">
-              <div className="ja-navigation-history-list" role="list" aria-label="最近对话列表">
+              <div
+                className="ja-navigation-history-list"
+                role="list"
+                aria-label="最近对话列表"
+                aria-busy={props.historyBusy || undefined}
+              >
                 {props.historyError === undefined ? null : (
                   <p className="ja-navigation-error" role="alert">
                     {props.historyError}

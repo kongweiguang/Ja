@@ -172,7 +172,6 @@ type MutableTurnGroup = {
   user?: TimelineItemAdapter;
   threadMessages: TimelineItemAdapter[];
   work: TimelineItemAdapter[];
-  response: TimelineItemAdapter[];
   final: TimelineItemAdapter[];
   approvals: ApprovalSummary[];
 };
@@ -255,18 +254,6 @@ function visibleTurnErrorCode(error: TimelineTurn["error"] | undefined): string 
 }
 
 /**
- * 当前 assistant Draft 先占据回复阅读位置；model step 若随后携带 Tool，会在提交时清理 Draft 并把
- * 持久正文归档到 WorkProcess。这样首段回复无需等待 terminal，同时不靠可变文本猜测最终答案。
- */
-function isLiveAssistantResponse(item: TimelineItemAdapter): boolean {
-  return (
-    item.kind === "commentary" &&
-    item.status === "in_progress" &&
-    item.metadata?.phase === "assistant_progress"
-  );
-}
-
-/**
  * 历史 read 会同时返回本轮最后的 assistant_progress 与冻结 final_answer；两者正文相同且最终
  * 答复已有独立阅读位置时，保留前者会让重载后的工作过程重复最终正文。
  *
@@ -291,8 +278,8 @@ function isPersistedFinalProgressDuplicate(
  * 将规范化投影按 USER Message 切为 exchange；同一 Turn 消费下一条队列输入时立即开始新行，
  * 后续工作与最终答复归入新 exchange，避免把多次用户意图压进同一气泡。
  *
- * Reasoning 与已经提交的 Tool 模型步正文归入工作过程；当前 assistant Draft 留在回复槽位，
- * terminal finalMessage 只校准同一位置而不延迟首屏反馈。
+ * Reasoning、assistant Draft 与已经提交的 Tool 模型步正文都归入工作过程；只有 terminal
+ * 产生的 agent_message 能进入最终答复，避免运行中的模型正文提前越出 WorkProcess。
  */
 function buildRows(
   items: readonly TimelineItemAdapter[],
@@ -314,7 +301,6 @@ function buildRows(
       turnId,
       threadMessages: [],
       work: [],
-      response: [],
       final: [],
       approvals: [],
     };
@@ -330,7 +316,6 @@ function buildRows(
         user: item,
         threadMessages: [],
         work: [],
-        response: [],
         final: [],
         approvals: [],
       };
@@ -340,8 +325,6 @@ function buildRows(
       currentFor(item.turnId).threadMessages.push(item);
     } else if (item.kind === "agent_message") {
       currentFor(item.turnId).final.push(item);
-    } else if (isLiveAssistantResponse(item)) {
-      currentFor(item.turnId).response.push(item);
     } else {
       const group = currentFor(item.turnId);
       group.work.push(item);
@@ -397,7 +380,6 @@ function buildRows(
         ]),
       ),
       work: [],
-      response: [],
       threadMessages: [],
       final: [],
       approvals: [],
@@ -427,11 +409,8 @@ function buildRows(
     user: group.user,
     threadMessages: group.threadMessages,
     work: group.work,
-    // terminal 一旦存在就完全取代候选正文；内容差异属于权威校准，不能把两版拼接成一条回复。
-    final:
-      group.final.length > 0
-        ? mergeMessages(group.final, "agent_message", true)
-        : mergeMessages(group.response, "commentary"),
+    // 仅 terminal agent_message 拥有最终答复语义；运行中的公开正文始终由 WorkProcess 承载。
+    final: mergeMessages(group.final, "agent_message", true),
     approvals: group.approvals,
   }));
   /** 本地失败记录可能跨过后续成功 ACK；只在两行都有权威时间时排序，缺失时间继续保持事件顺序。 */

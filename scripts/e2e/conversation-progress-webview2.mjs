@@ -428,7 +428,7 @@ function assertFinalBodyOutsideProcess(items, label) {
   );
 }
 
-/** 对外报告必须同时证明实时过程/回复分区、持续生命信号、terminal 原位校准与历史顺序。 */
+/** 对外报告必须同时证明流式正文留在工作过程、持续生命信号、terminal 收口与历史顺序。 */
 export function validateConversationProgressReport(report) {
   assert.equal(report?.schemaVersion, 1);
   assert.equal(report?.status, "passed");
@@ -439,12 +439,15 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.provider?.kind, "deterministic_loopback");
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.provider?.toolCalls, 2);
-  assert.equal(report?.live?.responseBeforeFirstTool, true);
+  assert.equal(report?.live?.progressInsideProcessBeforeFirstTool, true);
   assert.equal(report?.live?.workingStatusWithProcess, true);
-  assert.equal(report?.live?.finalResponseBeforeTerminal, true);
+  assert.equal(report?.live?.finalDraftInsideProcessBeforeTerminal, true);
   assert.equal(report?.live?.finalBodyOutsideProcess, true);
   assert.equal(report?.live?.processNodeStable, true);
   assert.equal(report?.live?.responseNodeStable, true);
+  assert.equal(report?.live?.historyRunningStatusNodeStable, true);
+  assert.deepEqual(report?.live?.animationReplays, { response: 0, history: 0 });
+  assert.equal(report?.live?.historyLoadingIndicatorMounts, 0);
   assert.equal(report?.live?.terminalCalibratedExistingResponse, true);
   assert.equal(report?.live?.completedProcessCollapsed, true);
   assert.equal(report?.live?.readSummaryVisible, true);
@@ -473,8 +476,8 @@ export function validateConversationProgressReport(report) {
 }
 
 /**
- * 在真实窗口提交 Turn；当前 text delta 先进入外部回复区，携带 Tool 的 model step 提交后归档过程，
- * 无 Tool 的最后一轮则保持原位直到 terminal 权威校准。
+ * 在真实窗口提交 Turn；当前 text delta 始终留在 WorkProcess，terminal 到达后才校准为最终答复，
+ * 同时观测回复壳、侧栏进行中状态与历史加载圈，避免高频事件重挂载后重播入场动画。
  *
  * 受控 fixture gate 让每个结构化边界都可单独观察，不依赖任意等待时间或最后一个 Tool 的位置猜测。
  */
@@ -501,6 +504,39 @@ export async function runConversationProgressWebView2({
   await restoreRuntimeAfterReload(page, deadline);
   await selectProject(page, created.workspaceName, deadline);
   await selectThread(page, created.threadId, deadline);
+  const historyRow = page.locator(
+    `[aria-label="最近对话列表"] button[data-thread-id="${created.threadId}"]`,
+  );
+  await historyRow.waitFor({ state: "visible", timeout: timeout(deadline) });
+  assert.equal(
+    await page.locator(".ja-navigation-history-loading").count(),
+    0,
+    "an existing history projection must not expose the loading indicator before streaming",
+  );
+  await page.evaluate(() => {
+    const historySection = globalThis.document.querySelector(".ja-navigation-history");
+    if (historySection === null) throw new Error("history section is unavailable");
+    const evidence = {
+      historyLoadingIndicatorMounts: 0,
+      animationReplays: { response: 0, history: 0 },
+    };
+    const observer = new globalThis.MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof globalThis.Element)) continue;
+          if (
+            node.matches(".ja-navigation-history-loading") ||
+            node.querySelector(".ja-navigation-history-loading") !== null
+          ) {
+            evidence.historyLoadingIndicatorMounts += 1;
+          }
+        }
+      }
+    });
+    observer.observe(historySection, { childList: true, subtree: true });
+    globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__ = evidence;
+    globalThis.__JA_CONVERSATION_HISTORY_OBSERVER__ = observer;
+  });
   const input = page.getByRole("textbox", { name: "消息", exact: true });
   await input.fill(PROMPT);
   await page
@@ -519,16 +555,41 @@ export async function runConversationProgressWebView2({
     state: "visible",
     timeout: timeout(deadline),
   });
-  await responseShell
-    .getByText(conversationProgressFixtureMarkers.commentary1, { exact: false })
-    .waitFor({ state: "visible", timeout: timeout(deadline) });
-  // 首个真实 delta 已归属权威 Turn；本地提交壳可能在 ACK 前存在，不能拿它冒充流式节点基线。
+  const workProcess = page.locator("section.ja-work-process").last();
+  await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary1).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  // 首个真实 delta 已归属权威 Turn；响应壳与工作过程分别记录 terminal 和过程节点稳定性。
   const responseShellHandle = await responseShell.elementHandle();
-  assert.ok(responseShellHandle, "the authoritative streaming response must have a DOM node");
+  assert.ok(responseShellHandle, "the authoritative response shell must have a DOM node");
+  const streamingProcessHandle = await workProcess.elementHandle();
+  assert.ok(streamingProcessHandle, "the streaming WorkProcess must have a DOM node");
+  const runningHistoryState = historyRow.locator(".ja-navigation-thread-state.is-running");
+  await runningHistoryState.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const runningHistoryStateHandle = await runningHistoryState.elementHandle();
+  assert.ok(runningHistoryStateHandle, "the running history state must have a DOM node");
+  await page.evaluate(() => {
+    const evidence = globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__;
+    if (evidence === undefined) throw new Error("flicker evidence is unavailable");
+    globalThis.document.addEventListener(
+      "animationstart",
+      (event) => {
+        const target = event.target;
+        if (!(target instanceof globalThis.Element)) return;
+        if (target.matches(".ja-chat-message-draft")) evidence.animationReplays.response += 1;
+        if (target.matches(".ja-navigation-thread-state.is-running svg"))
+          evidence.animationReplays.history += 1;
+      },
+      true,
+    );
+  });
   assert.equal(
-    await page.locator("section.ja-work-process").count(),
+    await responseShell
+      .getByText(conversationProgressFixtureMarkers.commentary1, { exact: false })
+      .count(),
     0,
-    "text before the first Tool must start in the response surface",
+    "text before the first Tool must remain inside WorkProcess",
   );
   assert.equal(
     await page.locator(".ja-tool-details").count(),
@@ -547,7 +608,6 @@ export async function runConversationProgressWebView2({
   );
   fixture.releaseFirstText();
 
-  const workProcess = page.locator("section.ja-work-process").last();
   await workProcess.locator('.ja-tool-details[data-tool-kind="read"]').waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -570,8 +630,16 @@ export async function runConversationProgressWebView2({
     true,
     "Tool settlement must retain the authoritative response node",
   );
-  const streamingProcessHandle = await workProcess.elementHandle();
-  assert.ok(streamingProcessHandle, "the streaming WorkProcess must have a DOM node");
+  const processWithToolHandle = await workProcess.elementHandle();
+  assert.ok(processWithToolHandle, "the WorkProcess with Tool must have a DOM node");
+  assert.equal(
+    await streamingProcessHandle.evaluate(
+      (streamingNode, processNode) => streamingNode === processNode,
+      processWithToolHandle,
+    ),
+    true,
+    "Tool arrival must retain the WorkProcess node",
+  );
   await publicNarrative(workProcess, conversationProgressFixtureMarkers.commentary2).waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -585,20 +653,42 @@ export async function runConversationProgressWebView2({
     timeout: timeout(deadline),
   });
   fixture.releaseFinalNarrative();
-  await responseShell
-    .getByText(conversationProgressFixtureMarkers.final, { exact: false })
-    .waitFor({
-      state: "visible",
-      timeout: timeout(deadline),
-    });
+  await publicNarrative(workProcess, conversationProgressFixtureMarkers.final).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
   await responseShell.getByText("正在工作", { exact: true }).waitFor({
     state: "visible",
     timeout: timeout(deadline),
   });
   assert.equal(
-    await publicNarrative(workProcess, conversationProgressFixtureMarkers.final).count(),
+    await responseShell
+      .getByText(conversationProgressFixtureMarkers.final, { exact: false })
+      .count(),
     0,
-    "the final output body must remain outside WorkProcess before terminal",
+    "the final draft must remain inside WorkProcess before terminal",
+  );
+  const runningHistoryStateBeforeTerminalHandle = await runningHistoryState.elementHandle();
+  assert.ok(
+    runningHistoryStateBeforeTerminalHandle,
+    "the running history state must remain mounted before terminal",
+  );
+  const historyRunningStatusNodeStable = await runningHistoryStateHandle.evaluate(
+    (initialNode, currentNode) => initialNode === currentNode,
+    runningHistoryStateBeforeTerminalHandle,
+  );
+  assert.equal(
+    historyRunningStatusNodeStable,
+    true,
+    "streaming updates must retain the running history status node",
+  );
+  const animationReplays = await page.evaluate(
+    () => globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__?.animationReplays,
+  );
+  assert.deepEqual(
+    animationReplays,
+    { response: 0, history: 0 },
+    "streaming updates must not replay response or history entry animations",
   );
   fixture.releaseFinalText();
   await waitForCondition(
@@ -613,6 +703,9 @@ export async function runConversationProgressWebView2({
   const completedAnswer = page
     .locator('.ja-chat-message-final[data-response-state="completed"]')
     .last();
+  await completedAnswer
+    .getByText(conversationProgressFixtureMarkers.final, { exact: false })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
   const completedAnswerHandle = await completedAnswer.elementHandle();
   assert.ok(completedAnswerHandle, "terminal must expose a completed final-answer node");
   const responseNodeStable = await responseShellHandle.evaluate(
@@ -648,6 +741,15 @@ export async function runConversationProgressWebView2({
     path: join(evidenceDirectory, "conversation-progress-live.png"),
     animations: "disabled",
   });
+  const historyLoadingIndicatorMounts = await page.evaluate(() => {
+    globalThis.__JA_CONVERSATION_HISTORY_OBSERVER__?.disconnect();
+    return globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__?.historyLoadingIndicatorMounts;
+  });
+  assert.equal(
+    historyLoadingIndicatorMounts,
+    0,
+    "streaming and terminal settlement must not mount the history loading indicator",
+  );
 
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await restoreRuntimeAfterReload(page, deadline);
@@ -707,12 +809,15 @@ export async function runConversationProgressWebView2({
       attempts: provider.attempts,
     },
     live: {
-      responseBeforeFirstTool: true,
+      progressInsideProcessBeforeFirstTool: true,
       workingStatusWithProcess: true,
-      finalResponseBeforeTerminal: true,
+      finalDraftInsideProcessBeforeTerminal: true,
       finalBodyOutsideProcess: true,
       processNodeStable,
       responseNodeStable,
+      historyRunningStatusNodeStable,
+      animationReplays,
+      historyLoadingIndicatorMounts,
       terminalCalibratedExistingResponse: true,
       completedProcessCollapsed: true,
       readSummaryVisible: liveReadSummary.length > 0,

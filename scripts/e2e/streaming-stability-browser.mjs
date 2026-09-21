@@ -128,34 +128,185 @@ async function invokeFixture(page, method, argument) {
   );
 }
 
+/** 验证已有历史的后台刷新从不挂载加载圈，首次空列表的快速读取也不会产生可见帧。 */
+async function verifyHistoryLoadingIndicator(page) {
+  const history = page.getByRole("list", { name: "最近对话列表", exact: true });
+  const historyRow = history.locator('button[data-thread-id="thread_streaming_stability"]');
+  await historyRow.waitFor({ state: "visible" });
+  const historyRowHandle = await historyRow.elementHandle();
+  assert.ok(historyRowHandle);
+
+  await page.evaluate(() => {
+    globalThis.__JA_HISTORY_LOADING_MOUNTS__ = 0;
+    const historyHeading = globalThis.document.querySelector(".ja-navigation-history");
+    if (historyHeading === null) throw new Error("history section is unavailable");
+    const observer = new globalThis.MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof globalThis.Element)) continue;
+          if (
+            node.matches(".ja-navigation-history-loading") ||
+            node.querySelector(".ja-navigation-history-loading") !== null
+          ) {
+            globalThis.__JA_HISTORY_LOADING_MOUNTS__ += 1;
+          }
+        }
+      }
+    });
+    observer.observe(historyHeading, { childList: true, subtree: true });
+    globalThis.__JA_HISTORY_LOADING_OBSERVER__ = observer;
+  });
+  assert.equal(await invokeFixture(page, "setHistoryMode", "background-busy"), "applied");
+  await page.waitForFunction(() => {
+    const list = globalThis.document.querySelector('[aria-label="最近对话列表"]');
+    return list?.getAttribute("aria-busy") === "true";
+  });
+  await page.waitForTimeout(220);
+  assert.equal(await page.locator(".ja-navigation-history-loading").count(), 0);
+  assert.equal(await page.evaluate(() => globalThis.__JA_HISTORY_LOADING_MOUNTS__), 0);
+  const busyHistoryRowHandle = await historyRow.elementHandle();
+  assert.ok(busyHistoryRowHandle);
+  assert.equal(
+    await historyRowHandle.evaluate((before, after) => before === after, busyHistoryRowHandle),
+    true,
+    "background history refresh must retain the existing row",
+  );
+  assert.equal(await invokeFixture(page, "setHistoryMode", "ready"), "applied");
+
+  const quickLoad = await page.evaluate(async () => {
+    globalThis.__JA_HISTORY_LOADING_OBSERVER__?.disconnect();
+    const fixture = globalThis.__JA_STREAMING_STABILITY__;
+    if (fixture === undefined) throw new Error("streaming fixture is unavailable");
+    let animationStarts = 0;
+    const onAnimationStart = (event) => {
+      if (
+        event.target instanceof globalThis.Element &&
+        event.target.matches(".ja-navigation-history-loading")
+      )
+        animationStarts += 1;
+    };
+    globalThis.document.addEventListener("animationstart", onAnimationStart, true);
+    return new Promise((resolvePromise, reject) => {
+      let sampled = false;
+      let initialOpacity;
+      let animationDelay;
+      const deadline = globalThis.setTimeout(() => {
+        observer.disconnect();
+        globalThis.document.removeEventListener("animationstart", onAnimationStart, true);
+        reject(new Error("quick history loading projection did not settle"));
+      }, 1_000);
+      const observer = new globalThis.MutationObserver(() => {
+        const loading = globalThis.document.querySelector(".ja-navigation-history-loading");
+        if (!sampled && loading !== null) {
+          sampled = true;
+          const style = globalThis.getComputedStyle(loading);
+          initialOpacity = style.opacity;
+          animationDelay = style.animationDelay;
+          fixture.setHistoryMode("ready");
+          return;
+        }
+        if (sampled && loading === null) {
+          globalThis.clearTimeout(deadline);
+          observer.disconnect();
+          globalThis.document.removeEventListener("animationstart", onAnimationStart, true);
+          resolvePromise({
+            initialOpacity,
+            animationDelay,
+            animationStarts,
+          });
+        }
+      });
+      observer.observe(globalThis.document.body, { childList: true, subtree: true });
+      if (fixture.setHistoryMode("empty-busy") !== "applied") {
+        globalThis.clearTimeout(deadline);
+        observer.disconnect();
+        globalThis.document.removeEventListener("animationstart", onAnimationStart, true);
+        reject(new Error("history fixture rejected the empty loading state"));
+      }
+    });
+  });
+  assert.deepEqual(quickLoad, {
+    initialOpacity: "0",
+    animationDelay: "0.16s",
+    animationStarts: 0,
+  });
+  await historyRow.waitFor({ state: "visible" });
+  return {
+    backgroundIndicatorMounts: 0,
+    quickLoadInitialOpacity: 0,
+    quickLoadDelayMs: 160,
+    quickLoadAnimationStarts: 0,
+  };
+}
+
 /** 主场景验证过程/回复分区、生命信号、DOM identity、长 Markdown、阅读锚点及 terminal 收口。 */
 async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   await page.setViewportSize({ width: 1180, height: 760 });
   await page.emulateMedia({ reducedMotion: "no-preference", colorScheme: "light" });
   await page.goto(fixtureUrl, { waitUntil: "domcontentloaded" });
+  const historyLoading = await verifyHistoryLoadingIndicator(page);
 
   const initialResponse = page.getByRole("article", { name: "回复状态" });
   await initialResponse.getByText("正在工作", { exact: true }).waitFor({ state: "visible" });
   assert.equal(await initialResponse.locator(".ja-chat-activity-dots").count(), 1);
+  const runningHistoryState = page.locator(".ja-navigation-thread-state.is-running");
+  await runningHistoryState.waitFor({ state: "visible" });
+  const initialResponseHandle = await initialResponse.elementHandle();
+  const runningHistoryStateHandle = await runningHistoryState.elementHandle();
+  assert.ok(initialResponseHandle && runningHistoryStateHandle);
+  await page.evaluate(() => {
+    globalThis.__JA_STREAMING_ANIMATION_REPLAYS__ = { response: 0, history: 0 };
+    globalThis.document.addEventListener(
+      "animationstart",
+      (event) => {
+        const target = event.target;
+        if (!(target instanceof globalThis.Element)) return;
+        if (target.matches(".ja-chat-message-draft"))
+          globalThis.__JA_STREAMING_ANIMATION_REPLAYS__.response += 1;
+        if (target.matches(".ja-navigation-thread-state.is-running svg"))
+          globalThis.__JA_STREAMING_ANIMATION_REPLAYS__.history += 1;
+      },
+      true,
+    );
+  });
 
   const reasoning = "先核对现有状态，再逐步完成流式稳定性验证。";
-  const first = "当前回复从第一段开始就在过程区外持续生成。";
+  const first = "当前回复从第一段开始就在工作过程中持续生成。";
   assert.equal(await invokeFixture(page, "appendReasoning", reasoning), "applied");
   assert.equal(await invokeFixture(page, "appendDelta", first), "applied");
   const process = page.getByRole("region", { name: "工作过程" });
   await process.waitFor({ state: "visible" });
   const reasoningStep = process.locator('[data-role="reasoning"]').first();
   await reasoningStep.getByText(reasoning, { exact: false }).waitFor({ state: "visible" });
+  const progressStep = process.locator('[data-role="commentary"]').last();
+  await progressStep.getByText(first, { exact: false }).waitFor({ state: "visible" });
   const response = page.getByRole("article", { name: "回复状态" });
-  await response.getByText(first, { exact: false }).waitFor({ state: "visible" });
+  assert.equal(await response.getByText(first, { exact: false }).count(), 0);
   await response.getByText("正在工作", { exact: true }).waitFor({ state: "visible" });
   const processHandle = await process.elementHandle();
   const reasoningHandle = await reasoningStep.elementHandle();
+  const progressHandle = await progressStep.elementHandle();
   const responseHandle = await response.elementHandle();
-  assert.ok(processHandle && reasoningHandle && responseHandle);
+  const historyStateHandle = await runningHistoryState.elementHandle();
+  assert.ok(
+    processHandle && reasoningHandle && progressHandle && responseHandle && historyStateHandle,
+  );
+  assert.equal(
+    await initialResponseHandle.evaluate((before, after) => before === after, responseHandle),
+    true,
+    "first delta must retain the response shell",
+  );
+  assert.equal(
+    await runningHistoryStateHandle.evaluate(
+      (before, after) => before === after,
+      historyStateHandle,
+    ),
+    true,
+    "first delta must retain the history running indicator",
+  );
 
   assert.equal(await invokeFixture(page, "repeatLastDelta"), "duplicate");
-  assert.equal(await response.getByText(first, { exact: false }).count(), 1);
+  assert.equal(await progressStep.getByText(first, { exact: false }).count(), 1);
   const markdown = [
     "\n\n## 长内容验证",
     ...Array.from(
@@ -172,17 +323,26 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
     (processNode, handles) =>
       processNode === handles.process &&
       globalThis.document.querySelector('[data-role="reasoning"]') === handles.reasoning &&
-      globalThis.document.querySelector('[data-role="response"]') === handles.response,
-    { process: processHandle, reasoning: reasoningHandle, response: responseHandle },
+      globalThis.document.querySelector('[data-role="commentary"]') === handles.progress &&
+      globalThis.document.querySelector('[data-role="response"]') === handles.response &&
+      globalThis.document.querySelector(".ja-navigation-thread-state.is-running") ===
+        handles.history,
+    {
+      process: processHandle,
+      reasoning: reasoningHandle,
+      progress: progressHandle,
+      response: responseHandle,
+      history: historyStateHandle,
+    },
   );
   assert.equal(
     sameNodes,
     true,
-    "stream delta must retain process, reasoning, and response DOM identity",
+    "stream delta must retain process, progress, response, and history DOM identity",
   );
   assert.equal(await process.locator('[data-role="reasoning"]').count(), 1);
-  assert.equal(await process.getByText("长内容验证", { exact: true }).count(), 0);
-  const overflow = await response.evaluate((element) => {
+  assert.equal(await process.getByText("长内容验证", { exact: true }).count(), 1);
+  const overflow = await progressStep.evaluate((element) => {
     const code = element.querySelector("pre");
     const table = element.querySelector(".ja-markdown__table-wrap");
     return {
@@ -203,9 +363,10 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
     element.dispatchEvent(new Event("scroll"));
   });
   await page.getByRole("button", { name: "回到最新", exact: true }).waitFor({ state: "visible" });
-  const readingAnchor = response.getByText("第 6 段用于确认用户上滚后不会被新增内容抢回底部。", {
-    exact: true,
-  });
+  const readingAnchor = progressStep.getByText(
+    "第 6 段用于确认用户上滚后不会被新增内容抢回底部。",
+    { exact: true },
+  );
   const beforeAnchor = await readingAnchor.boundingBox();
   assert.ok(beforeAnchor, "reading anchor must be mounted before the next delta");
   assert.equal(
@@ -219,6 +380,11 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
     Math.abs(afterAnchor.y - beforeAnchor.y) <= 4,
     `stream stole reading anchor: before=${beforeAnchor.y} after=${afterAnchor.y}`,
   );
+  assert.deepEqual(
+    await page.evaluate(() => globalThis.__JA_STREAMING_ANIMATION_REPLAYS__),
+    { response: 0, history: 0 },
+    "stream deltas must not replay response or history entry animations",
+  );
   await page.getByRole("button", { name: "回到最新", exact: true }).click();
   await page.waitForFunction(() => {
     const element = globalThis.document.querySelector(".ja-chat-timeline__scroll");
@@ -231,7 +397,7 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
     path: join(evidenceDirectory, "streaming-live-light.png"),
     animations: "disabled",
   });
-  assert.equal(await response.getAttribute("data-response-state"), "streaming");
+  assert.equal(await response.getAttribute("data-response-state"), "working");
   const finalText = "最终答复只由 terminal 权威事实生成，并保持唯一阅读位置。";
   assert.equal(await invokeFixture(page, "complete", finalText), "applied");
   const finalResponse = page.getByRole("article", { name: "最终答复" });
@@ -256,10 +422,14 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   return {
     duplicateSuppressed: true,
     processNodeStable: true,
+    progressNodeStable: true,
     responseNodeStable: true,
+    historyStatusNodeStable: true,
+    animationReplays: { response: 0, history: 0 },
     workingStatusVisible: true,
-    liveResponseBeforeTerminal: true,
+    liveProgressBeforeTerminal: true,
     scrollAnchorStable: true,
+    historyLoading,
   };
 }
 

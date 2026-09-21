@@ -51,9 +51,9 @@ const draftItemByProjection = new WeakMap<
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
- * 把同一份 Draft Segment 映射为稳定的 Item 引用；assistant Draft 保留 commentary wire 语义，
- * Renderer 将当前未结算正文放入回复阅读位置，Reasoning 始终属于工作过程。WeakMap 让重复 Selector
- * 保持引用稳定，并在模型步骤提交或完整历史快照接管后自动释放缓存。
+ * 把同一份 Draft Segment 映射为稳定的 Item 引用；assistant Draft 与 Reasoning 都保留过程语义，
+ * Renderer 在 terminal 前将它们固定投影到 WorkProcess。WeakMap 让重复 Selector 保持引用稳定，
+ * 并在模型步骤提交或完整历史快照接管后自动释放缓存。
  */
 function draftItemForTurn(
   threadId: string,
@@ -66,7 +66,7 @@ function draftItemForTurn(
     itemId: `draft:${turnId}:${draft.segmentStartSeq}`,
     threadId,
     turnId,
-    // assistant 草稿保留协议身份；Tool 模型步提交后会由持久 commentary 原位接管工作过程。
+    // assistant 草稿保留协议身份，使流式 Draft 与持久 commentary 始终共享 WorkProcess 边界。
     kind: draft.kind === "reasoning" ? "reasoning" : "commentary",
     status: "in_progress",
     text: draft.text,

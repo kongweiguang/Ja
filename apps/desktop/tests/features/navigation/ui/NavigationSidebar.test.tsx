@@ -367,13 +367,13 @@ describe("NavigationSidebar", () => {
     expect(screen.getByText("还没有历史对话。")).toBeVisible();
   });
 
-  /** 标题状态固定在分组头部，折叠时仍可感知且不会制造列表行高跳动。 */
-  it("keeps the history loading indicator in the recent-conversations heading", async () => {
+  /** 首次空目录恢复显示进度；已有目录的后台校验保持静默，避免标题行反复闪出旋转图标。 */
+  it("shows history loading only before the first directory projection", async () => {
     const { rerender } = render(
       <NavigationSidebar
         {...sidebarProps({
           historyBusy: true,
-          threads: [thread, { ...thread, threadId: "thread-2", title: "第二个对话" }],
+          threads: [],
         })}
       />,
     );
@@ -381,21 +381,20 @@ describe("NavigationSidebar", () => {
     const heading = screen.getByRole("heading", { name: "最近对话" });
     const loading = screen.getByRole("status", { name: "正在读取会话" });
     expect(heading.parentElement).toContainElement(loading);
-    expect(screen.getByRole("button", { name: "修复导航" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "第二个对话" })).toBeVisible();
     expect(loading.querySelector(".lucide-loader-circle")).toBeInTheDocument();
 
     rerender(
       <NavigationSidebar
         {...sidebarProps({
           historyBusy: true,
-          historySectionCollapsed: true,
-          threads: [thread],
+          threads: [thread, { ...thread, threadId: "thread-2", title: "第二个对话" }],
         })}
       />,
     );
-    expect(screen.getByRole("status", { name: "正在读取会话" })).toBeVisible();
-    expect(screen.queryByRole("list", { name: "最近对话列表" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "正在读取会话" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "修复导航" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "第二个对话" })).toBeVisible();
+    expect(screen.getByRole("list", { name: "最近对话列表" })).toHaveAttribute("aria-busy", "true");
   });
 
   it("keeps an existing history list spatially stable while another thread snapshot loads", () => {

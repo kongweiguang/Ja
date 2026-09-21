@@ -366,8 +366,8 @@ describe("ChatTimeline", () => {
     ]);
   });
 
-  /** 当前回复从首个 delta 起占据稳定阅读位置，Tool 过程与 terminal 校准都不能移除生命信号。 */
-  it("流式展示当前回复并在 Tool 过程下持续显示运行状态，terminal 原位校准", () => {
+  /** 流式正文必须留在工作过程；只有 terminal 才能把权威结果放入最终答复阅读位置。 */
+  it("流式正文留在工作过程，并在 terminal 后显示最终答复", () => {
     const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
     const { rerender } = render(<ChatTimeline items={[]} turns={[runningTurn]} />);
 
@@ -413,9 +413,9 @@ describe("ChatTimeline", () => {
     const streamingProcess = screen.getByRole("region", { name: "工作过程" });
     expect(streamingProcess).toBeVisible();
     expect(streamingProcess).toHaveAttribute("data-state", "active");
-    expect(streamingProcess).not.toHaveTextContent("第一段");
-    expect(response).toHaveTextContent("第一段");
-    expect(response).toHaveAttribute("data-response-state", "streaming");
+    expect(streamingProcess).toHaveTextContent("第一段");
+    expect(response).not.toHaveTextContent("第一段");
+    expect(response).toHaveAttribute("data-response-state", "working");
     expect(response).toHaveTextContent("正在工作");
     expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
     expect(screen.getByRole("article", { name: "回复状态" })).toBe(response);
@@ -450,7 +450,8 @@ describe("ChatTimeline", () => {
       />,
     );
     expect(screen.getByRole("article", { name: "回复状态" })).toBe(response);
-    expect(response).toHaveTextContent("第一段继续生成");
+    expect(streamingProcess).toHaveTextContent("第一段继续生成");
+    expect(response).not.toHaveTextContent("第一段继续生成");
     expect(response).toHaveTextContent("正在工作");
 
     rerender(
@@ -586,9 +587,12 @@ describe("ChatTimeline", () => {
       />,
     );
     expect(response).toHaveAttribute("data-response-state", "cancelled");
-    expect(response).toHaveTextContent("取消前已经生成的正文");
+    expect(response).not.toHaveTextContent("取消前已经生成的正文");
     expect(response).toHaveTextContent("已取消");
     expect(response.querySelector(".ja-chat-activity-dots")).toBeNull();
+    expect(screen.getByRole("region", { name: "工作过程" })).toHaveTextContent(
+      "取消前已经生成的正文",
+    );
 
     rerender(<ChatTimeline items={[baseItem({ itemId: "item_history", text: "历史答复" })]} />);
     expect(response).toHaveAttribute("data-response-state", "completed");
@@ -1962,9 +1966,9 @@ describe("ChatTimeline", () => {
 
     const streamingProcess = screen.getByRole("region", { name: "工作过程" });
     expect(streamingProcess).toHaveAttribute("data-state", "active");
-    expect(streamingProcess).not.toHaveTextContent("正在流式生成");
+    expect(streamingProcess).toHaveTextContent("正在流式生成");
     const streamingResponse = screen.getByRole("article", { name: "回复状态" });
-    expect(streamingResponse).toHaveTextContent("正在流式生成");
+    expect(streamingResponse).not.toHaveTextContent("正在流式生成");
     expect(streamingResponse).toHaveTextContent("正在工作");
     expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
 
