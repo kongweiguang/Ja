@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.transport.JaBoundedHttpTransport;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.transport.JaBoundedStdioTransport;
+import io.github.kongweiguang.ja.platform.windows.WindowsProcessLauncher;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.json.McpJsonMapper;
@@ -19,6 +20,7 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonValue;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -58,19 +60,28 @@ public final class SdkMcpSessionFactory implements McpSessionFactory {
             McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged) {
         Objects.requireNonNull(deadline, "deadline");
         Objects.requireNonNull(toolsChanged, "toolsChanged");
-        McpClientTransport transport = definition.transport() == McpServerDefinition.Transport.STDIO
-                ? new JaBoundedStdioTransport(
-                definition.command(),
-                definition.workingDirectory(),
-                definition.environment(),
-                definition.protocolVersions(),
-                jsonMapper,
-                limits,
-                deadline,
-                toolsChanged)
-                : new JaBoundedHttpTransport(
-                definition.endpoint(), definition.headers(), definition.protocolVersions(), jsonMapper,
-                limits, deadline, toolsChanged);
+        McpClientTransport transport;
+        if (definition.transport() == McpServerDefinition.Transport.STDIO) {
+            try {
+                WindowsProcessLauncher.verifyExecutableAvailable(
+                        definition.command(), definition.workingDirectory(), definition.environment());
+            } catch (IOException failure) {
+                throw new IllegalStateException("mcp_stdio_start_failed", failure);
+            }
+            transport = new JaBoundedStdioTransport(
+                    definition.command(),
+                    definition.workingDirectory(),
+                    definition.environment(),
+                    definition.protocolVersions(),
+                    jsonMapper,
+                    limits,
+                    deadline,
+                    toolsChanged);
+        } else {
+            transport = new JaBoundedHttpTransport(
+                    definition.endpoint(), definition.headers(), definition.protocolVersions(), jsonMapper,
+                    limits, deadline, toolsChanged);
+        }
         McpSyncClient client = McpClient.sync(transport)
                 .requestTimeout(deadline.remaining(limits.requestTimeout(), "mcp_request_deadline_elapsed"))
                 .initializationTimeout(deadline.remaining(

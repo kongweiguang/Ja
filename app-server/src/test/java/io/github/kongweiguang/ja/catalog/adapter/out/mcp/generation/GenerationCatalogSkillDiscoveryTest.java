@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 
@@ -31,7 +32,7 @@ final class GenerationCatalogSkillDiscoveryTest {
     private Path temporary;
 
     /**
-     * 四来源只映射有效发现项；配置按名称沿用身份与授权，未登记项稳定展示但默认禁用。
+     * 可授权来源才映射到 Settings；授权必须同时匹配来源和名称，内置项和未登记项不能获得开关。
      */
     @Test
     void mapsFourDiscoveryScopesAndMergesConfiguredAuthorizationByName() {
@@ -41,9 +42,7 @@ final class GenerationCatalogSkillDiscoveryTest {
         Path project = temporary.resolve("project").toAbsolutePath().normalize();
         RecordingSkillCatalog skills = new RecordingSkillCatalog();
         ConfigurationGenerationSnapshot snapshot = snapshot(true, List.of(
-                configured("skill_saved-builtin", "builtin-tool", true, "配置描述不应覆盖发现"),
-                configured("skill_saved-ja", "ja-tool", false, "配置描述不应覆盖发现"),
-                configured("skill_missing", "missing-tool", true, "磁盘已缺失")));
+                configured("ja:ja-tool"), configured("user:missing-tool")));
 
         try (GenerationCatalog catalog = new GenerationCatalog(
                 home, new ObjectMapper(), McpLimits.DEFAULT, skills, agents, ja)) {
@@ -51,18 +50,15 @@ final class GenerationCatalogSkillDiscoveryTest {
             Map<String, SkillDescriptor> byName = page.items().stream()
                     .collect(Collectors.toMap(SkillDescriptor::name, Function.identity()));
 
-            assertEquals(Map.of("builtin-tool", "builtin", "agents-tool", "user",
-                    "ja-tool", "ja", "project-tool", "project"),
+            assertEquals(Map.of("agents-tool", "user", "ja-tool", "ja", "project-tool", "project"),
                     byName.entrySet().stream().collect(Collectors.toMap(
                             Map.Entry::getKey, entry -> entry.getValue().scope())));
-            assertEquals("skill_saved-builtin", byName.get("builtin-tool").skillId());
-            assertTrue(byName.get("builtin-tool").enabled());
-            assertEquals("来自 bundled 的描述", byName.get("builtin-tool").description());
-            assertEquals("skill_saved-ja", byName.get("ja-tool").skillId());
-            assertFalse(byName.get("ja-tool").enabled());
-            assertEquals("skill_agents-tool", byName.get("agents-tool").skillId());
+            assertFalse(byName.containsKey("builtin-tool"));
+            assertEquals("ja:ja-tool", byName.get("ja-tool").skillId());
+            assertTrue(byName.get("ja-tool").enabled());
+            assertEquals("user:agents-tool", byName.get("agents-tool").skillId());
             assertFalse(byName.get("agents-tool").enabled());
-            assertEquals("skill_project-tool", byName.get("project-tool").skillId());
+            assertEquals("project:project-tool", byName.get("project-tool").skillId());
             assertFalse(byName.containsKey("missing-tool"));
             assertTrue(page.items().stream().allMatch(item -> item.status().equals("healthy")));
             assertEquals(project, skills.lastRequest.get().workspaceDirectory());
@@ -81,7 +77,7 @@ final class GenerationCatalogSkillDiscoveryTest {
                 skills, temporary.resolve("agents"), temporary.resolve("ja"))) {
             CursorPage<SkillDescriptor> page = catalog.listSkills(lease(snapshot), null, false, null, 200);
 
-            assertEquals(List.of("agents-tool", "builtin-tool", "ja-tool"),
+            assertEquals(List.of("agents-tool", "ja-tool"),
                     page.items().stream().map(SkillDescriptor::name).sorted().toList());
             assertEquals(home, skills.lastRequest.get().workspaceDirectory());
             assertFalse(skills.lastRequest.get().workspaceTrusted());
@@ -105,10 +101,9 @@ final class GenerationCatalogSkillDiscoveryTest {
         }
     }
 
-    /** 构造当前配置中的持久 Skill 条目，测试只关心名称授权合并。 */
-    private static ConfigurationGenerationSnapshot.Skill configured(
-            String skillId, String name, boolean enabled, String description) {
-        return new ConfigurationGenerationSnapshot.Skill(skillId, name, "user", enabled, description);
+    /** 构造来源限定授权，测试不会再保存描述或布尔开关副本。 */
+    private static ConfigurationGenerationSnapshot.Skill configured(String reference) {
+        return new ConfigurationGenerationSnapshot.Skill(SkillReference.parse(reference));
     }
 
     /** 用最窄动态投影冻结 Skill 定义与信任，任何额外配置读取都视为越界。 */

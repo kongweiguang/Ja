@@ -47,6 +47,7 @@ public final class ConfigurationDocumentRuntime {
     private final ConfigurationDocumentFactory documentFactory;
     private final ConfigurationPathPolicy pathPolicy;
     private final CredentialStore credentialStore;
+    private final Path lastKnownGoodPath;
 
     /**
      * 绑定唯一 mapper、文档 Factory 与路径 Policy；运行时不缓存可变文档，防止读取结果在
@@ -59,6 +60,7 @@ public final class ConfigurationDocumentRuntime {
         this.documentFactory = new ConfigurationDocumentFactory(mapper);
         this.pathPolicy = new ConfigurationPathPolicy(homeDirectory);
         this.credentialStore = new CredentialStore(pathPolicy.credentialPath(), mapper);
+        this.lastKnownGoodPath = pathPolicy.userConfigPath().resolveSibling("config.toml.last-known-good");
     }
 
     /**
@@ -87,8 +89,8 @@ public final class ConfigurationDocumentRuntime {
         return ConfigurationMutationCoordinator.execute(target, () -> {
             LayerLoad current = loadWritableLayer(scope, canonical);
             checkExpectedVersion(current.version, expectedVersion);
-            ObjectNode base = current.document == null ? documentFactory.createEmpty() : current.document;
-            ObjectNode next = applyMergePatch(base, patch);
+            ObjectNode currentDocument = current.document == null ? documentFactory.createEmpty() : current.document;
+            ObjectNode next = applyMergePatch(currentDocument, patch);
             return publish(scope, target, current.document, next);
         });
     }
@@ -116,7 +118,7 @@ public final class ConfigurationDocumentRuntime {
      * 使每个 RPC 动作都只有一种明确结果。
      */
     public ConfigurationRuntimeState.WriteResult reset(ConfigurationScope scope, Path cwd,
-                                           String expectedVersion) {
+                                            String expectedVersion) {
         requireExpectedVersion(expectedVersion);
         Objects.requireNonNull(scope, "scope");
         Path canonical = canonicalizeCwd(cwd);
@@ -129,11 +131,47 @@ public final class ConfigurationDocumentRuntime {
     }
 
     /**
+     * 仅恢复 Java 管理的用户层最近完整快照，并在替换前保留当前原始文件副本。
+     *
+     * <p>语法损坏时不能让 renderer 拼一份空文档覆盖现场；恢复必须由 App Server 读取快照、
+     * 校验当前 CAS、备份可读原文后再原子发布。项目层没有共享快照，避免把一个工作区的信任或
+     * 限制意外带到另一个工作区。</p>
+     */
+    public ConfigurationRuntimeState.WriteResult restoreLastKnownGood(ConfigurationScope scope, Path cwd,
+                                                                        String expectedVersion) {
+        requireExpectedVersion(expectedVersion);
+        if (scope != ConfigurationScope.USER) {
+            throw error(ConfigurationError.Code.INVALID_ARGUMENT, "only user configuration can be restored");
+        }
+        Path canonical = canonicalizeCwd(cwd);
+        Path target = configPath(scope, canonical);
+        return ConfigurationMutationCoordinator.execute(target, () -> {
+            final byte[] current;
+            try {
+                current = readWithRetry(target);
+            } catch (IOException failure) {
+                throw error(ConfigurationError.Code.IO_FAILURE, "configuration storage is unavailable");
+            }
+            String currentVersion = current == null
+                    ? ConfigurationStore.MISSING_VERSION : ConfigurationStore.versionOf(current);
+            checkExpectedVersion(currentVersion, expectedVersion);
+            ObjectNode recovered = loadLastKnownGoodSource();
+            if (recovered == null) {
+                throw error(ConfigurationError.Code.CORRUPT_CONFIG, "no recoverable configuration snapshot exists");
+            }
+            if (current != null) backupUserConfiguration(current);
+            documentFactory.advanceRevision(recovered, recovered);
+            persistConfig(target, recovered);
+            return new ConfigurationRuntimeState.WriteResult(scope, ConfigurationStore.version(target));
+        });
+    }
+
+    /**
      * 在统一校验与原子发布路径上完成 revision 推进，确保 patch、replace、reset 不产生
      * 三套略有差异的安全和 CAS 行为。
      */
     private ConfigurationRuntimeState.WriteResult publish(ConfigurationScope scope, Path target,
-                                                     ObjectNode previous, ObjectNode next) {
+                                                      ObjectNode previous, ObjectNode next) {
         documentFactory.advanceRevision(next, previous);
         validateDocument(next, scope);
         enforceProjectWriteCeiling(scope, next);
@@ -237,40 +275,69 @@ public final class ConfigurationDocumentRuntime {
                 : loadLayer(canonical.resolve(".ja").resolve("config.toml"),
                 ConfigurationScope.PROJECT, trusted);
         List<ConfigGeneration.Diagnostic> diagnostics = new ArrayList<>();
+        List<ConfigurationData.Issue> issues = new ArrayList<>();
+        issues.addAll(user.issues);
+        issues.addAll(project.issues);
+        if (!issues.isEmpty()) {
+            diagnostics.add(new ConfigGeneration.Diagnostic("CONFIGURATION_ISSUES", false));
+        }
         if (user.status == ConfigurationData.LayerStatus.CORRUPT) {
-            diagnostics.add(new ConfigGeneration.Diagnostic("CORRUPT_CONFIG", true));
+            diagnostics.add(new ConfigGeneration.Diagnostic("CORRUPT_CONFIG", false));
+            issues.add(issue("user_file", "user", null, null, "TOML_PARSE_FAILED",
+                    "defaults_in_use", List.of("edit", "restore")));
         }
         if (user.status == ConfigurationData.LayerStatus.IO_ERROR) {
-            diagnostics.add(new ConfigGeneration.Diagnostic("CONFIG_IO_ERROR", true));
+            diagnostics.add(new ConfigGeneration.Diagnostic("CONFIG_IO_ERROR", false));
+            issues.add(issue("user_file", "user", null, null, "FILE_UNAVAILABLE",
+                    "defaults_in_use", List.of("retry")));
         }
         if (project.status == ConfigurationData.LayerStatus.CORRUPT && trusted) {
-            diagnostics.add(new ConfigGeneration.Diagnostic("CORRUPT_PROJECT_CONFIG", true));
+            diagnostics.add(new ConfigGeneration.Diagnostic("CORRUPT_PROJECT_CONFIG", false));
+            issues.add(issue("project_file", "project", null, null, "TOML_PARSE_FAILED",
+                    "project_ignored", List.of("edit", "restore")));
         }
         if (project.status == ConfigurationData.LayerStatus.IO_ERROR && trusted) {
-            diagnostics.add(new ConfigGeneration.Diagnostic("PROJECT_CONFIG_IO_ERROR", true));
+            diagnostics.add(new ConfigGeneration.Diagnostic("PROJECT_CONFIG_IO_ERROR", false));
+            issues.add(issue("project_file", "project", null, null, "FILE_UNAVAILABLE",
+                    "project_ignored", List.of("retry")));
         }
         if (project.status == ConfigurationData.LayerStatus.UNTRUSTED) {
             diagnostics.add(new ConfigGeneration.Diagnostic("PROJECT_UNTRUSTED", false));
         }
         if (auth.status() == ConfigurationData.LayerStatus.CORRUPT) {
-            diagnostics.add(new ConfigGeneration.Diagnostic("CORRUPT_AUTH", true));
+            diagnostics.add(new ConfigGeneration.Diagnostic("CORRUPT_AUTH", false));
+            issues.add(issue("credentials", "credential", null, null, "CREDENTIALS_UNAVAILABLE",
+                    "credential_connections_unavailable", List.of("retry")));
         }
         if (auth.status() == ConfigurationData.LayerStatus.IO_ERROR) {
-            diagnostics.add(new ConfigGeneration.Diagnostic("AUTH_IO_ERROR", true));
+            diagnostics.add(new ConfigGeneration.Diagnostic("AUTH_IO_ERROR", false));
+            issues.add(issue("credentials", "credential", null, null, "CREDENTIALS_UNAVAILABLE",
+                    "credential_connections_unavailable", List.of("retry")));
         }
         ObjectNode effective = documentFactory.createEmpty();
         if (user.document != null) effective = user.document.deepCopy();
+        else if (user.status == ConfigurationData.LayerStatus.CORRUPT
+                || user.status == ConfigurationData.LayerStatus.IO_ERROR) {
+            ObjectNode recovered = loadLastKnownGood();
+            if (recovered != null) {
+                effective = recovered;
+                issues.add(issue("last_known_good", "user", null, null, "LAST_KNOWN_GOOD_IN_USE",
+                        "snapshot_in_use", List.of("edit", "restore")));
+            }
+        }
         if (project.document != null && project.status == ConfigurationData.LayerStatus.VALID && trusted) {
             try {
                 enforceNoEscalation(user.document, project.document);
                 effective = mergeDocuments(effective, project.document);
             } catch (ConfigurationError escalation) {
-                diagnostics.add(new ConfigGeneration.Diagnostic("LIMIT_ESCALATION", true));
+                diagnostics.add(new ConfigGeneration.Diagnostic("LIMIT_ESCALATION", false));
+                issues.add(issue("project_limits", "project", null, null, "LIMIT_ESCALATION",
+                        "project_ignored", List.of("edit")));
             }
         }
         return new ConfigurationRuntimeState.ReadResult(trusted, user.view(), project.view(), effective,
                 credentialStatuses(auth.secretIds()),
-                auth.version(), diagnostics);
+                auth.version(), diagnostics, issues);
     }
 
     /**
@@ -299,18 +366,19 @@ public final class ConfigurationDocumentRuntime {
     }
 
     /**
-     * 读取单个权威配置层并区分缺失、未信任、损坏和有效状态，禁止损坏文档降级为默认配置。
+     * 读取单个权威配置层并区分缺失、未信任和 TOML 语法损坏。可解析文档先尝试严格路径以更新
+     * 最近有效快照；严格语义失败后只隔离坏字段或条目，绝不把整个用户层投影为空。
      */
     private LayerLoad loadLayer(Path path, ConfigurationScope scope, boolean trusted) {
         if (!trusted && scope == ConfigurationScope.PROJECT) {
             return new LayerLoad(scope, false, false, ConfigurationStore.version(path),
-                    ConfigurationData.LayerStatus.UNTRUSTED, null);
+                    ConfigurationData.LayerStatus.UNTRUSTED, null, null, List.of());
         }
         final byte[] bytes;
         try {
             bytes = ConfigurationMutationCoordinator.execute(path, () -> {
                 try {
-                    return ConfigurationStore.read(path);
+                    return readWithRetry(path);
                 } catch (IOException failure) {
                     throw new UncheckedIOException(failure);
                 }
@@ -318,27 +386,106 @@ public final class ConfigurationDocumentRuntime {
             if (bytes == null) return LayerLoad.missing(scope, trusted);
             if (bytes.length > MAX_CONFIG_BYTES) {
                 return new LayerLoad(scope, true, trusted, ConfigurationStore.versionOf(bytes),
-                        ConfigurationData.LayerStatus.CORRUPT, null);
+                        ConfigurationData.LayerStatus.CORRUPT, null, null, List.of());
             }
         } catch (UncheckedIOException failure) {
             return new LayerLoad(scope, true, trusted, ConfigurationStore.UNAVAILABLE_VERSION,
-                    ConfigurationData.LayerStatus.IO_ERROR, null);
+                    ConfigurationData.LayerStatus.IO_ERROR, null, null, List.of());
         } catch (ConfigurationError failure) {
             return new LayerLoad(scope, true, trusted, ConfigurationStore.version(path),
-                    ConfigurationData.LayerStatus.CORRUPT, null);
+                    ConfigurationData.LayerStatus.CORRUPT, null, null, List.of());
         }
         String version = ConfigurationStore.versionOf(bytes);
         try {
             ObjectNode document = toml.parse(new String(bytes, StandardCharsets.UTF_8));
-            validateDocument(document, scope);
-            return new LayerLoad(scope, true, trusted, version,
-                    ConfigurationData.LayerStatus.VALID, document);
-        } catch (ConfigurationError failure) {
-            return new LayerLoad(scope, true, trusted, version,
-                    ConfigurationData.LayerStatus.CORRUPT, null);
+            try {
+                validateDocument(document, scope);
+                if (scope == ConfigurationScope.USER) persistLastKnownGood(document);
+                return new LayerLoad(scope, true, trusted, version,
+                        ConfigurationData.LayerStatus.VALID, document, document, List.of());
+            } catch (ConfigurationError strictFailure) {
+                TolerantConfigurationDocumentReader.Result tolerant =
+                        TolerantConfigurationDocumentReader.normalize(document, scope);
+                return new LayerLoad(scope, true, trusted, version,
+                        ConfigurationData.LayerStatus.VALID, tolerant.document(), document, tolerant.issues());
+            }
         } catch (RuntimeException failure) {
             return new LayerLoad(scope, true, trusted, version,
-                    ConfigurationData.LayerStatus.CORRUPT, null);
+                    ConfigurationData.LayerStatus.CORRUPT, null, null, List.of());
+        }
+    }
+
+    /**
+     * 原子替换和病毒扫描会让 Windows 上的文件在很短窗口内不可读；三次有界重试避免把该瞬态转化为
+     * 空配置，而持续失败仍交给上层以可见问题呈现。
+     */
+    private static byte[] readWithRetry(Path path) throws IOException {
+        IOException last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                return ConfigurationStore.read(path);
+            } catch (IOException failure) {
+                last = failure;
+                if (attempt == 2) break;
+                try {
+                    Thread.sleep(80L * (attempt + 1));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("configuration_read_interrupted", interrupted);
+                }
+            }
+        }
+        throw last == null ? new IOException("configuration_read_failed") : last;
+    }
+
+    /**
+     * 写入无密钥、不可编辑的最近完整用户配置原文快照。快照失败不影响本次正常读取，因为它只是后续
+     * 语法或 I/O 故障的恢复资源，不能成为启动阻塞点。
+     */
+    private void persistLastKnownGood(ObjectNode document) {
+        try {
+            ConfigurationStore.writeAtomic(lastKnownGoodPath,
+                    toml.write(document).getBytes(StandardCharsets.UTF_8), false);
+        } catch (IOException | RuntimeException ignored) {
+            // 快照是增强恢复能力；原始用户配置已验证可用时不得因旁路存储失败失去服务能力。
+        }
+    }
+
+    /**
+     * 只在源文件整体不可用时读取已严格校验的快照；可解析文件永远以当前内容为准，避免回退复活
+     * 用户明确删除或停用的条目。无效、过大的或读失败的快照按不存在处理。
+     */
+    private ObjectNode loadLastKnownGood() {
+        return loadLastKnownGoodSource();
+    }
+
+    /**
+     * 返回完整通过当前 v2 校验的原始快照。快照是恢复资源而非兼容层，因此旧 schema、未知字段或
+     * 不完整文档与当前文件一样不可用。
+     */
+    private ObjectNode loadLastKnownGoodSource() {
+        try {
+            byte[] bytes = readWithRetry(lastKnownGoodPath);
+            if (bytes == null || bytes.length > MAX_CONFIG_BYTES) return null;
+            ObjectNode document = toml.parse(new String(bytes, StandardCharsets.UTF_8));
+            validateDocument(document, ConfigurationScope.USER);
+            return document;
+        } catch (IOException | RuntimeException unavailable) {
+            return null;
+        }
+    }
+
+    /**
+     * 在当前同目录创建一次性备份；备份失败必须中止恢复，避免用户同时失去损坏原文与上次快照之间
+     * 的手工改动。普通配置不含凭据，仍保持仅本机文件所有者可读的存储边界。
+     */
+    private void backupUserConfiguration(byte[] source) {
+        Path backup = pathPolicy.userConfigPath().resolveSibling(
+                "config.toml.backup-" + Long.toUnsignedString(System.nanoTime()) + ".toml");
+        try {
+            ConfigurationStore.writeAtomic(backup, source, false);
+        } catch (IOException failure) {
+            throw error(ConfigurationError.Code.IO_FAILURE, "configuration backup could not be created");
         }
     }
 
@@ -509,17 +656,27 @@ public final class ConfigurationDocumentRuntime {
     }
 
     /**
+     * 文档运行时只生成稳定、脱敏的问题对象；TOML 原文、异常消息与路径不得穿过该边界。
+     */
+    private static ConfigurationData.Issue issue(String id, String scope, String field, String entityId,
+                                                 String reason, String impact, List<String> actions) {
+        return new ConfigurationData.Issue("cfg_" + id, scope, field, entityId, null, null,
+                reason, impact, actions);
+    }
+
+    /**
      * 同时保留配置层的文件存在性、信任、版本和解析状态，避免用 null 混淆不同失败。
      */
     private record LayerLoad(ConfigurationScope scope, boolean present, boolean trusted,
                              String version, ConfigurationData.LayerStatus status,
-                             ObjectNode document) {
+                             ObjectNode document, ObjectNode sourceDocument,
+                             List<ConfigurationData.Issue> issues) {
         /**
          * 使用稳定 missing 版本表达未创建文件，从而允许第一次写入也参与 CAS。
          */
         static LayerLoad missing(ConfigurationScope scope, boolean trusted) {
             return new LayerLoad(scope, false, trusted, ConfigurationStore.MISSING_VERSION,
-                    ConfigurationData.LayerStatus.MISSING, null);
+                    ConfigurationData.LayerStatus.MISSING, null, null, List.of());
         }
 
         /**

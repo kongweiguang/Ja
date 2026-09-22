@@ -329,7 +329,7 @@ export async function writeIsolatedSettings(
     throw new Error("isolated Provider endpoint must be an IPv4 loopback /v1 URL");
   }
   const config = [
-    "schema_version = 1",
+    "schema_version = 2",
     "config_revision = 1",
     'default_access_mode = "approval_required"',
     'default_provider_id = "provider_e2e"',

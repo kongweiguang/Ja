@@ -281,7 +281,7 @@ const turnChangeReviewLargeP95BudgetMs = Number(
 const defaultE2eContextWindowTokens = 128_000;
 const turnChangeReviewContextWindowTokens = 2_000_000;
 const composerContextSkill = Object.freeze({
-  skillId: "skill_composer_context",
+  skillId: "user:composer-context",
   name: "composer-context",
   description: "Composer context acceptance Skill",
   bodyMarker: "JA_COMPOSER_CONTEXT_SKILL_ACTIVE",
@@ -5105,7 +5105,7 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
 }
 
 /**
- * 以纯函数生成 v1 Provider/Model 配置 fixture，使静态合同可以在不写盘、不接触凭据的前提下
+ * 以纯函数生成严格 v2 Provider/Model 配置 fixture，使静态合同可以在不写盘、不接触凭据的前提下
  * 覆盖每个显式 API 和场景所需的访问模式。访问模式必须由调用场景显式传入，避免
  * Thread 偏好与 App Server 配置不一致时把测试失败误判为回复链故障。Turn Change focused
  * 模式独占更大窗口以容纳 1 MiB 与 2 MiB Tool history，普通模式继续使用生产基准 fixture。
@@ -5127,7 +5127,7 @@ function buildSettingsDocument(
   const real = providerConfig !== undefined;
   const tomlString = (value) => JSON.stringify(String(value));
   return [
-    "schema_version = 1",
+    "schema_version = 2",
     "config_revision = 1",
     `default_access_mode = "${defaultAccessMode}"`,
     'default_provider_id = "provider_e2e"',
@@ -5137,9 +5137,7 @@ function buildSettingsDocument(
     "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
     ...(includeComposerContextSkill
-      ? [
-          `skills = [{ skill_id = "${composerContextSkill.skillId}", name = "${composerContextSkill.name}", scope = "user", enabled = true, description = "${composerContextSkill.description}" }]`,
-        ]
+      ? [`skills = [${tomlString(composerContextSkill.skillId)}]`]
       : ["skills = []"]),
     "",
     "[[providers]]",
@@ -5213,7 +5211,7 @@ function buildRuntimeRefreshSettingsDocument(baseUrl, controlPath, reportPath, r
     "",
   ];
   return [
-    "schema_version = 1",
+    "schema_version = 2",
     `config_revision = ${revision}`,
     'default_access_mode = "full_access"',
     'default_provider_id = "provider_e2e"',
@@ -5248,12 +5246,7 @@ function buildRuntimeRefreshSettingsDocument(baseUrl, controlPath, reportPath, r
     'auth = { kind = "none" }',
     "enabled = true",
     "",
-    "[[skills]]",
-    'skill_id = "skill_runtime_refresh"',
-    'name = "runtime-refresh"',
-    'scope = "user"',
-    "enabled = true",
-    'description = "Runtime refresh acceptance Skill"',
+    'skills = ["user:runtime-refresh"]',
     "",
   ].join("\n");
 }
@@ -23384,14 +23377,29 @@ async function selectComposerSuggestion(page, token, listName, optionText, metho
   );
 }
 
-/** 打开精确 slash command 并用 Enter 选择，所有动作都经过 Composer descriptor。 */
+/**
+ * 用稳定 command key 输入 slash，再用当前本地化显示名定位真实 descriptor；测试不能把展示语言
+ * 误当成协议身份，否则产品文案更新会阻断与 Skills 无关的后续真窗验收。
+ */
 async function executeComposerCommand(page, command, deadline) {
+  const commandLabels = {
+    chat: "返回对话",
+    files: "打开文件",
+    new: "新建对话",
+    plan: "计划",
+    project: "切换项目",
+    search: "搜索对话",
+    settings: "打开设置",
+    sidebar: "切换侧栏",
+    terminal: "打开终端",
+  };
+  const label = commandLabels[command] ?? `/${command}`;
   const composer = page.getByRole("textbox", { name: "消息", exact: true });
   await composer.fill(`/${command}`);
   const list = await waitForComposerSuggestionList(page, "指令", deadline);
   const option = list
     .getByRole("option")
-    .filter({ hasText: `/${command}` })
+    .filter({ hasText: label })
     .first();
   await option.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   if ((await option.getAttribute("aria-disabled")) === "true") {
@@ -23642,31 +23650,34 @@ async function runComposerContextAcceptanceSession(
     })),
   );
   const expectedNames = [
-    "/new",
-    "/project",
-    "/search",
-    "/files",
-    "/review",
-    "/terminal",
-    "/preview",
-    "/settings",
-    "/sidebar",
-    "/back",
-    "/forward",
-    "/chat",
+    "计划",
+    "目标",
+    "新建对话",
+    "新建侧聊",
+    "切换项目",
+    "搜索对话",
+    "打开文件",
+    "审查本轮修改",
+    "打开终端",
+    "打开预览",
+    "打开设置",
+    "切换侧栏",
+    "后退",
+    "前进",
+    "返回对话",
   ];
   if (commands.map(({ name }) => name).join(",") !== expectedNames.join(",")) {
-    throw new Error(`Composer 十二条指令展示不完整：${JSON.stringify(commands)}`);
+    throw new Error(`Composer 指令展示不完整：${JSON.stringify(commands)}`);
   }
   const disabledReasons = Object.fromEntries(
     commands.filter(({ disabled }) => disabled).map(({ name, detail }) => [name, detail]),
   );
   for (const [name, reason] of Object.entries({
-    "/review": "本轮没有可审查的修改",
-    "/preview": "当前没有可预览目标",
-    "/back": "没有更早的页面",
-    "/forward": "没有可前进的页面",
-    "/chat": "当前已在对话",
+    审查本轮修改: "本轮没有可审查的修改",
+    打开预览: "当前没有可预览目标",
+    后退: "没有更早的页面",
+    前进: "没有可前进的页面",
+    返回对话: "当前已在对话",
   })) {
     if (disabledReasons[name] !== reason) {
       throw new Error(`${name} 未展示真实不可用原因：${JSON.stringify(disabledReasons)}`);
@@ -27567,7 +27578,7 @@ function assertCdpDiscoveryContract() {
  * 让字符串源码检查误报。
  * 两个可空默认值必须使用可逆 null sentinel，省略任一处都会重新引入 Native round-trip 漂移。
  */
-function assertSettingsV1Contract() {
+function assertSettingsV2Contract() {
   const apis = ["anthropic_messages", "openai_chat_completions", "openai_responses"];
   const fixtures = apis.map((api) =>
     buildSettingsDocument({
@@ -27578,7 +27589,7 @@ function assertSettingsV1Contract() {
     }),
   );
   const required = [
-    "schema_version = 1",
+    "schema_version = 2",
     "[[providers]]",
     "[[providers.models]]",
     'default_provider_id = "provider_e2e"',
@@ -27586,20 +27597,20 @@ function assertSettingsV1Contract() {
   ];
   for (const fixture of fixtures) {
     if (required.some((token) => !fixture.split(/\r?\n/u).includes(token))) {
-      throw new Error("v1 Provider/Model 设置 fixture 缺少必填字段");
+      throw new Error("v2 Provider/Model 设置 fixture 缺少必填字段");
     }
     if (
       (fixture.match(/^default_reasoning_level = \{ __ja_null = true \}$/gmu)?.length ?? 0) !== 2
     ) {
-      throw new Error("v1 设置 fixture 的 reasoning null sentinel 不完整");
+      throw new Error("v2 设置 fixture 的 reasoning null sentinel 不完整");
     }
     if ((fixture.match(/^reasoning_level_map = \{\}$/gmu)?.length ?? 0) !== 1) {
-      throw new Error("v1 设置 fixture 的 reasoning level map 不完整");
+      throw new Error("v2 设置 fixture 的 reasoning level map 不完整");
     }
   }
   for (const [api, fixture] of apis.map((value, index) => [value, fixtures[index]])) {
     if (!fixture.includes(`api = "${api}"`)) {
-      throw new Error(`v1 设置 fixture 缺少 ${api} API`);
+      throw new Error(`v2 设置 fixture 缺少 ${api} API`);
     }
   }
   const accessModeFixtures = ["approval_required", "full_access"].map((defaultAccessMode) => ({
@@ -28016,13 +28027,14 @@ function assertComposerContextContract() {
   const restartSource = String(runComposerContextRestartSession);
   const providerSource = String(startAutomaticTitleProviderFixture);
   const invokeProbeSource = String(installTauriInvokeProbeInPage);
+  const skillFixtureSource = String(writeComposerContextSkill);
   const mainSource = String(main);
   const settingsFixture = buildSettingsDocument(undefined, {
     includeComposerContextSkill: true,
   });
   const checks = {
-    settingsSkillId: settingsFixture.includes(`skill_id = "${composerContextSkill.skillId}"`),
-    settingsSkillName: settingsFixture.includes(`name = "${composerContextSkill.name}"`),
+    settingsSkillId: settingsFixture.includes(`skills = ["${composerContextSkill.skillId}"]`),
+    settingsSkillName: skillFixtureSource.includes("composerContextSkill.name"),
     imeComposition: sessionSource.includes("Input.imeSetComposition"),
     workspaceSearch: sessionSource.includes("ja_runtime_workspace_path_search"),
     queueEnqueueProbe: invokeProbeSource.includes('command === "ja_turn_input_enqueue"'),
@@ -28367,7 +28379,7 @@ function assertStaticContracts() {
   assertExitTraceContract();
   assertNativeInputContract();
   assertCdpDiscoveryContract();
-  assertSettingsV1Contract();
+  assertSettingsV2Contract();
   assertAutomaticTitleFixtureLifecycleContract();
   assertWorkspaceSwitchPerformanceContract();
   assertDesktopInteractionContract();

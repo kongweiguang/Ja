@@ -18,6 +18,7 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SubagentPolicyMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ProjectionMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadDiscoveryMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatMapper;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatPurgeMapper;
@@ -92,6 +93,7 @@ public abstract class PersistenceTestSupport {
         configuration.addMapper(AgentMapper.class);
         configuration.addMapper(AttachmentMapper.class);
         configuration.addMapper(CheckpointMapper.class);
+        configuration.addMapper(ProjectionMapper.class);
         configuration.addMapper(RecoveryMapper.class);
         configuration.addMapper(InstructionScopeMapper.class);
         configuration.addMapper(TaskMapper.class);

@@ -13,7 +13,7 @@ import {
 } from "@/api/tauri/settings";
 
 const CONFIG = {
-  schema_version: 1,
+  schema_version: 2,
   config_revision: 7,
   default_access_mode: "approval_required",
   interaction: { clarification_enabled: true },
@@ -63,13 +63,14 @@ function readResult(): ConfigReadResult {
     credentials: { cred_openai: { configured: true } },
     cas: { userVersion: "cfg_user", projectVersion: "cfg_missing", credentialVersion: "cfg_auth" },
     diagnostics: [],
+    issues: [],
   };
 }
 
 /** 生成 UI 文档时只增加展示偏好和脱敏凭据状态。 */
 function uiDocument(): SettingsDocument {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 7,
     theme: "system",
     defaultAccessMode: "approval_required",
@@ -171,7 +172,7 @@ describe("TauriSettingsAdapter v1", () => {
     });
   });
 
-  it("projects sparse project override identities without retaining the raw project document", async () => {
+  it("projects the minimal trusted project Skill document without accepting legacy overlays", async () => {
     const result: ConfigReadResult = {
       ...readResult(),
       workspaceId: "ws_project",
@@ -180,12 +181,10 @@ describe("TauriSettingsAdapter v1", () => {
         trusted: true,
         status: "valid",
         document: {
-          default_provider_id: "provider_openai",
-          default_model_id: "model_gpt",
-          default_reasoning_level: null,
-          default_access_mode: "approval_required",
-          skills: [{ skill_id: "skill_one", enabled: false }],
-          mcp_servers: [{ mcp_id: "mcp_one", enabled: false }],
+          schema_version: 2,
+          config_revision: 3,
+          skills: ["project:one"],
+          disabled_skills: ["user:one"],
         },
       },
     };
@@ -194,12 +193,17 @@ describe("TauriSettingsAdapter v1", () => {
     const loaded = await new TauriSettingsAdapter(bridge).snapshot({ workspaceId: "ws_project" });
 
     expect(loaded.projectOverrides).toEqual({
-      defaultSelection: true,
-      accessMode: true,
-      disabledSkillIds: ["skill_one"],
-      disabledMcpIds: ["mcp_one"],
+      defaultSelection: false,
+      accessMode: false,
+      disabledSkillReferences: ["user:one"],
+      disabledMcpIds: [],
     });
-    expect(loaded).not.toHaveProperty("projectDocument");
+    expect(loaded.projectSkillDocument).toEqual({
+      schemaVersion: 2,
+      revision: 3,
+      skills: ["project:one"],
+      disabledSkills: ["user:one"],
+    });
   });
 
   it("fails closed when effective v1 is invalid instead of returning an empty recovery document", async () => {
@@ -212,67 +216,59 @@ describe("TauriSettingsAdapter v1", () => {
     );
   });
 
-  /** 用户层语义损坏时保留原 CAS 并提供空白编辑投影，读取自身绝不改写磁盘配置。 */
-  it("enters recoverable settings mode for a corrupt user configuration layer", async () => {
+  /** 原 TOML 整体不可读时仍投影 Java 已选定的有效设置，恢复入口由 issues 而非空白模式承载。 */
+  it("keeps effective settings available for a corrupt user configuration layer", async () => {
     const result: ConfigReadResult = {
       ...readResult(),
-      effective: {
-        schema_version: 1,
-        config_revision: 0,
-        default_access_mode: "full_access",
-        default_provider_id: null,
-        default_model_id: null,
-        default_reasoning_level: null,
-        subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
-        providers: [],
-        mcp_servers: [],
-        skills: [],
-      },
       user: { present: true, trusted: true, status: "corrupt", document: null },
+      issues: [
+        {
+          id: "cfg_user_file",
+          scope: "user",
+          field: null,
+          entityId: null,
+          line: null,
+          column: null,
+          reason: "TOML_PARSE_FAILED",
+          impact: "snapshot_in_use",
+          actions: ["restore"],
+        },
+      ],
     };
 
-    const invoke = vi.fn(async (command: string) =>
-      command === JA_SETTINGS_COMMANDS.replace
-        ? { accepted: true, scope: "user", version: "cfg_repaired" }
-        : result,
-    );
+    const invoke = vi.fn(async () => result);
     const adapter = new TauriSettingsAdapter({ invoke });
     const loaded = await adapter.snapshot();
 
-    expect(loaded.recovery).toBe("user_config_corrupt");
-    expect(loaded.userDocument.providers).toEqual([]);
+    expect(loaded.userDocument.providers).toHaveLength(1);
+    expect(loaded.document.defaultSelection?.modelId).toBe("model_gpt");
+    expect(loaded.issues[0]?.impact).toBe("snapshot_in_use");
     expect(loaded.cas.userVersion).toBe("cfg_user");
-    await expect(adapter.save(loaded.userDocument, loaded.cas.userVersion)).resolves.toBe(
-      "cfg_repaired",
-    );
-    expect(invoke).toHaveBeenCalledWith(JA_SETTINGS_COMMANDS.replace, {
-      input: expect.objectContaining({ scope: "user", expectedVersion: "cfg_user" }),
-    });
   });
 
-  it("saves only strict snake_case v1 and strips UI credential status", async () => {
+  it("saves only the changed snake_case patch and strips UI credential status", async () => {
     const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
       void args;
-      return command === JA_SETTINGS_COMMANDS.replace
+      return command === JA_SETTINGS_COMMANDS.patch
         ? { accepted: true, scope: "user", version: "cfg_next" }
         : readResult();
     });
     const adapter = new TauriSettingsAdapter({ invoke });
+    const baseline = uiDocument();
+    const changed = structuredClone(baseline);
+    changed.defaultAccessMode = "full_access";
 
-    await expect(adapter.save(uiDocument(), "cfg_user")).resolves.toBe("cfg_next");
-    const replace = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.replace);
-    expect(replace?.[1]).toMatchObject({
+    await expect(adapter.save(changed, "cfg_user", baseline)).resolves.toBe("cfg_next");
+    const patch = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.patch);
+    expect(patch?.[1]).toMatchObject({
       input: {
         scope: "user",
         expectedVersion: "cfg_user",
-        document: {
-          schema_version: 1,
-          providers: [{ provider_id: "provider_openai", models: [{ model_id: "model_gpt" }] }],
-        },
+        patch: { default_access_mode: "full_access" },
       },
     });
-    expect(JSON.stringify(replace?.[1])).not.toContain("credentialConfigured");
-    expect(JSON.stringify(replace?.[1])).not.toContain("profiles");
+    expect(JSON.stringify(patch?.[1])).not.toContain("credentialConfigured");
+    expect(JSON.stringify(patch?.[1])).not.toContain("profiles");
   });
 
   it("round-trips DeepSeek Chat with a Provider-owned credential reference", async () => {
@@ -298,7 +294,7 @@ describe("TauriSettingsAdapter v1", () => {
     const result = readResult();
     const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
       void args;
-      return command === JA_SETTINGS_COMMANDS.replace
+      return command === JA_SETTINGS_COMMANDS.patch
         ? { accepted: true, scope: "user", version: "cfg_next" }
         : {
             ...result,
@@ -320,10 +316,10 @@ describe("TauriSettingsAdapter v1", () => {
     });
     expect(loaded.document.providers[0]?.credentialId).toBe("cred_openai");
     await expect(adapter.save(loaded.userDocument, "cfg_user")).resolves.toBe("cfg_next");
-    const replace = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.replace);
-    expect(replace?.[1]).toMatchObject({
+    const patch = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.patch);
+    expect(patch?.[1]).toMatchObject({
       input: {
-        document: {
+        patch: {
           providers: [
             { credential_id: "cred_openai" },
             {
@@ -355,7 +351,7 @@ describe("TauriSettingsAdapter v1", () => {
     ];
     const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
       void args;
-      return command === JA_SETTINGS_COMMANDS.replace
+      return command === JA_SETTINGS_COMMANDS.patch
         ? { accepted: true, scope: "user", version: "cfg_next" }
         : { ...readResult(), effective: native, user: { ...readResult().user, document: native } };
     });
@@ -369,10 +365,10 @@ describe("TauriSettingsAdapter v1", () => {
       auth: { kind: "header", name: "X-API-Key", credentialRef: "cred_mcp_docs" },
     });
     await adapter.save(loaded.userDocument, "cfg_user");
-    const replace = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.replace);
-    expect(replace?.[1]).toMatchObject({
+    const patch = invoke.mock.calls.find(([command]) => command === JA_SETTINGS_COMMANDS.patch);
+    expect(patch?.[1]).toMatchObject({
       input: {
-        document: {
+        patch: {
           mcp_servers: [
             {
               args: [],

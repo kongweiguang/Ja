@@ -72,7 +72,7 @@ public final class ContextPolicy {
                 selection.splitTurn(), selection.retainedSplit(), fullPromptFits, requiresCompaction,
                 (int) Math.min(Integer.MAX_VALUE,
                         fullTokens), (int) Math.min(Integer.MAX_VALUE, compactedTokens), input.budget().recentTailTokens(),
-                input.continuation());
+                input.continuation(), promptProjection.choices());
     }
 
     /**
@@ -85,11 +85,23 @@ public final class ContextPolicy {
         ToolOutputProjector headTail = new ToolOutputProjector(input.outputLimits());
         ToolOutputProjector artifact = ToolOutputProjector.artifactOnly();
         Map<String, ToolOutputProjector> choices = new HashMap<>();
-        source.stream().filter(ContextMessage::hasToolResult)
-                .forEach(message -> choices.put(message.messageId(), artifact));
-        if (choices.isEmpty()) return new LayeredProjection(source, Map.of());
+        Map<String, ToolProjection> stages = new HashMap<>();
+        Set<String> frozen = new HashSet<>();
+        for (ContextMessage message : source) {
+            if (!message.hasToolResult()) continue;
+            ToolProjection selected = input.frozenProjectionChoices().get(message.messageId());
+            if (selected != null && !input.outputLimits().artifactOnly()) {
+                choices.put(message.messageId(), projector(selected, headTail));
+                stages.put(message.messageId(), selected);
+                frozen.add(message.messageId());
+            } else {
+                choices.put(message.messageId(), artifact);
+                stages.put(message.messageId(), ToolProjection.ARTIFACT);
+            }
+        }
+        if (choices.isEmpty()) return new LayeredProjection(source, Map.of(), Map.of());
         if (input.outputLimits().artifactOnly()) {
-            return new LayeredProjection(projectAll(source, choices), Map.copyOf(choices));
+            return new LayeredProjection(projectAll(source, choices), Map.copyOf(choices), Map.copyOf(stages));
         }
 
         List<ContextMessage> artifactBaseline = projectAll(source, choices);
@@ -101,11 +113,14 @@ public final class ContextPolicy {
         for (int index = source.size() - 1; index >= 0; index--) {
             ContextMessage message = source.get(index);
             if (!message.hasToolResult()) continue;
+            if (frozen.contains(message.messageId())) continue;
             choices.put(message.messageId(), full);
+            stages.put(message.messageId(), ToolProjection.FULL);
             long candidateTokens = meter.measure(projectAll(source, choices), input.previousSummary(),
                     input.continuation(), false).inputTokens();
             if (candidateTokens > saturatingAdd(baselineTokens, recentBudget)) {
                 choices.put(message.messageId(), artifact);
+                stages.put(message.messageId(), ToolProjection.ARTIFACT);
                 break;
             }
             protectedMessages.add(message.messageId());
@@ -113,8 +128,10 @@ public final class ContextPolicy {
 
         for (int index = source.size() - 1; index >= 0; index--) {
             ContextMessage message = source.get(index);
-            if (!message.hasToolResult() || protectedMessages.contains(message.messageId())) continue;
+            if (!message.hasToolResult() || protectedMessages.contains(message.messageId())
+                || frozen.contains(message.messageId())) continue;
             choices.put(message.messageId(), headTail);
+            stages.put(message.messageId(), ToolProjection.HEAD_TAIL);
             meter.measure(projectAll(source, choices), input.previousSummary(),
                     input.continuation(), false);
         }
@@ -125,12 +142,23 @@ public final class ContextPolicy {
                 input.continuation(), false).inputTokens();
         for (ContextMessage message : source) {
             if (currentTokens <= target) break;
-            if (!message.hasToolResult() || protectedMessages.contains(message.messageId())) continue;
+            if (!message.hasToolResult() || protectedMessages.contains(message.messageId())
+                || frozen.contains(message.messageId())) continue;
             choices.put(message.messageId(), artifact);
+            stages.put(message.messageId(), ToolProjection.ARTIFACT);
             currentTokens = meter.measure(projectAll(source, choices), input.previousSummary(),
                     input.continuation(), false).inputTokens();
         }
-        return new LayeredProjection(projectAll(source, choices), Map.copyOf(choices));
+        return new LayeredProjection(projectAll(source, choices), Map.copyOf(choices), Map.copyOf(stages));
+    }
+
+    /** 将持久化词汇映射回本轮 projector；调用方只能复用既有阶段，不能把旧输出升级为新正文。 */
+    private static ToolOutputProjector projector(ToolProjection stage, ToolOutputProjector headTail) {
+        return switch (stage) {
+            case FULL -> ToolOutputProjector.full();
+            case HEAD_TAIL -> headTail;
+            case ARTIFACT -> ToolOutputProjector.artifactOnly();
+        };
     }
 
     /** 使用当前阶段映射投影完整候选，禁止只计量孤立 Tool block。 */
@@ -410,7 +438,19 @@ public final class ContextPolicy {
             ContextBudget budget,
             boolean forceCompaction,
             Optional<ModelContinuation> continuation,
-            ToolProjectionLimits outputLimits) {
+            ToolProjectionLimits outputLimits,
+            Map<String, ToolProjection> frozenProjectionChoices) {
+        /** 纯策略调用默认尚未持有阶段；真实发送路径必须传入持久化 Adapter 回读的选择。 */
+        public PlanningInput(String threadId, List<ContextMessage> messages, SummaryDocument previousSummary,
+                             long sourceRevision, long baseThroughOrdinal, long baseRetainedFromOrdinal,
+                             Optional<RetainedSplit> previousRetainedSplit, ContextBudget budget,
+                             boolean forceCompaction, Optional<ModelContinuation> continuation,
+                             ToolProjectionLimits outputLimits) {
+            this(threadId, messages, previousSummary, sourceRevision, baseThroughOrdinal,
+                    baseRetainedFromOrdinal, previousRetainedSplit, budget, forceCompaction, continuation,
+                    outputLimits, Map.of());
+        }
+
         /**
          * 复制源列表，并保留这些消息所代表的 Thread revision。
          */
@@ -425,6 +465,8 @@ public final class ContextPolicy {
             budget = Objects.requireNonNull(budget, "budget");
             continuation = Objects.requireNonNull(continuation, "continuation");
             outputLimits = Objects.requireNonNull(outputLimits, "outputLimits");
+            frozenProjectionChoices = Map.copyOf(Objects.requireNonNull(frozenProjectionChoices,
+                    "frozenProjectionChoices"));
         }
     }
 
@@ -448,7 +490,8 @@ public final class ContextPolicy {
             int fullPromptTokens,
             int compactedPromptTokens,
             long recentTailTokens,
-            Optional<ModelContinuation> continuation) {
+            Optional<ModelContinuation> continuation,
+            Map<String, ToolProjection> projectionChoices) {
         /**
          * 冻结全部策略输出，防止慢生成器改变 Thread CAS 证据。
          */
@@ -467,6 +510,7 @@ public final class ContextPolicy {
             splitTurn = Objects.requireNonNull(splitTurn, "splitTurn");
             retainedSplit = Objects.requireNonNull(retainedSplit, "retainedSplit");
             continuation = Objects.requireNonNull(continuation, "continuation");
+            projectionChoices = Map.copyOf(Objects.requireNonNull(projectionChoices, "projectionChoices"));
         }
 
         /**
@@ -539,17 +583,29 @@ public final class ContextPolicy {
 
     /** 冻结本轮各 Tool 消息的降载阶段，使尾部选择和最终发送复用同一投影。 */
     private record LayeredProjection(List<ContextMessage> messages,
-                                     Map<String, ToolOutputProjector> choices) {
+                                     Map<String, ToolOutputProjector> projectors,
+                                     Map<String, ToolProjection> choices) {
         /** 复制投影与映射，避免规划期间候选 Map 后续变化。 */
         private LayeredProjection {
             messages = List.copyOf(messages);
+            projectors = Map.copyOf(projectors);
             choices = Map.copyOf(choices);
         }
 
         /** 按消息身份复用冻结阶段；非 Tool 消息保持原始事实。 */
         private ContextMessage project(ContextMessage message) {
-            ToolOutputProjector projector = choices.get(message.messageId());
+            ToolOutputProjector projector = projectors.get(message.messageId());
             return projector == null ? message : message.project(projector);
         }
+    }
+
+    /** 持久化阶段使用的最小闭集；正文、哈希和 Tool 参数继续只存在于原始历史。 */
+    public enum ToolProjection {
+        /** 完整保留新近结果，只有首次选择时的预算允许才可采用。 */
+        FULL,
+        /** 保留首尾证据并省去正文中段，兼顾诊断上下文与稳定输入预算。 */
+        HEAD_TAIL,
+        /** 仅保留结构化产物描述，作为预算不足时不可再降级的安全下限。 */
+        ARTIFACT
     }
 }

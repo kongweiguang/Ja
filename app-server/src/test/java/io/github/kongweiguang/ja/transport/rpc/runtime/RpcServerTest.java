@@ -121,6 +121,37 @@ final class RpcServerTest {
     }
 
     /**
+     * 外部文件变更仅在握手完成后进入当前连接，并在关闭前注销绑定，避免后台 Watcher 写入旧 stdout。
+     */
+    @Test
+    void externalConfigurationBindingPublishesAfterReadyAndClosesBeforeWriter() {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        AtomicReference<RpcSession> capturedSession = new AtomicReference<>();
+        AtomicBoolean bindingClosed = new AtomicBoolean();
+        RpcServer server = new RpcServer(new ByteArrayInputStream(new byte[0]), output,
+                testConfiguration(), CLOCK, ignored -> new EmptyServices(new AtomicBoolean()).bindings(),
+                TestConfigurationPorts.unavailable(), session -> {
+                    capturedSession.set(session);
+                    return () -> bindingClosed.set(true);
+                });
+        try {
+            RpcSession session = capturedSession.get();
+            assertTrue(session != null, "session binding must receive the constructed connection");
+            session.initialize();
+            session.ready("0123456789abcdef0123456789abcdef");
+            session.publishObservedConfigurationChange("user", null, "cfg_external");
+        } finally {
+            server.close(ShutdownDeadline.start());
+        }
+        String wire = output.toString(StandardCharsets.UTF_8);
+        assertTrue(wire.contains("\"method\":\"configuration/changed\""));
+        assertTrue(wire.contains("\"scope\":\"user\""));
+        assertTrue(wire.contains("\"version\":\"cfg_external\""));
+        assertFalse(wire.contains("\"path\""));
+        assertTrue(bindingClosed.get());
+    }
+
+    /**
      * Goal 创建发生前 UI 不可能持有 observation；created 必须作为唯一低频发现事件送达，
      * 后续未观察变更仍保持静默，避免关闭 Workbench 后产生无界状态流。
      */
@@ -523,7 +554,7 @@ final class RpcServerTest {
         }).toList();
         ObjectNode configResult = responseResult(frames, "c:config-read");
         assertExactFields(configResult, "workspaceId", "effective", "user", "project", "credentials",
-                "cas", "diagnostics", "trusted");
+                "cas", "diagnostics", "issues", "trusted");
         assertTrue(configResult.get("workspaceId").isNull());
         ObjectNode cas = (ObjectNode) configResult.path("cas");
         assertExactFields(cas, "userVersion", "projectVersion", "credentialVersion");

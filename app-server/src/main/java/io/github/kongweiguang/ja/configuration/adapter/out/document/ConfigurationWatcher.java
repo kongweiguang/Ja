@@ -16,10 +16,15 @@ import java.nio.file.WatchService;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -28,6 +33,7 @@ import java.util.function.Supplier;
  */
 public final class ConfigurationWatcher implements AutoCloseable {
     private static final int MAX_WATCHED_WORKSPACES = 1024;
+    private static final long CHANGE_SETTLE_MILLIS = 100L;
 
     private final Path homeDirectory;
     private final Path userConfigPath;
@@ -36,11 +42,17 @@ public final class ConfigurationWatcher implements AutoCloseable {
     private final Runnable invalidateAllGenerations;
     private final Consumer<Path> invalidateGeneration;
     private final Consumer<List<ConfigurationRuntimeState.ConfigChanged>> publishChanges;
+    private final ScheduledExecutorService changeExecutor = createChangeExecutor();
     private final Map<WatchKey, WatchRegistration> watchRegistrations = new HashMap<>();
     private final Map<Path, WatchKey> watchedDirectories = new HashMap<>();
+    private final Map<String, ConfigurationRuntimeState.ConfigChanged> pendingChanges = new LinkedHashMap<>();
+    private final Set<Path> pendingInvalidations = new HashSet<>();
     private WatchService watchService;
     private Thread watchThread;
+    private ScheduledFuture<?> pendingFlush;
     private int watchedWorkspaces;
+    private boolean pendingInvalidateAll;
+    private boolean pendingTrustRegistryChanged;
     private boolean closed;
 
     /**
@@ -231,10 +243,83 @@ public final class ConfigurationWatcher implements AutoCloseable {
             }
             if (!key.reset()) removeWatchRegistration(key);
         }
+        enqueueChanges(changes, invalidations, invalidateAll, trustRegistryChanged);
+    }
+
+    /**
+     * 合并一小段时间内的重复、乱序 Watch 事件。Windows 原子替换常将同一次保存拆成多条事件，
+     * 因此只在最后一条事件后失效一次 generation，并在锁外按最终文件状态发布一组变更。
+     */
+    private synchronized void enqueueChanges(List<ConfigurationRuntimeState.ConfigChanged> changes,
+                                             List<Path> invalidations, boolean invalidateAll,
+                                             boolean trustRegistryChanged) {
+        if (closed) return;
+        for (ConfigurationRuntimeState.ConfigChanged change : changes) {
+            String identity = change.scope() + "|"
+                    + (change.canonicalCwd() == null ? "general" : change.canonicalCwd());
+            pendingChanges.put(identity, change);
+        }
+        pendingInvalidations.addAll(invalidations);
+        pendingInvalidateAll |= invalidateAll;
+        pendingTrustRegistryChanged |= trustRegistryChanged;
+        if (pendingFlush != null) pendingFlush.cancel(false);
+        pendingFlush = changeExecutor.schedule(this::flushPendingChanges,
+                CHANGE_SETTLE_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 经过短暂静默窗口后才读取最终版本并失效缓存。文档运行时随后仍会执行自己的有界读取重试，
+     * 这两层分别处理事件抖动和文件句柄短暂占用，避免把瞬态状态发布给 renderer。
+     */
+    private void flushPendingChanges() {
+        List<ConfigurationRuntimeState.ConfigChanged> changes;
+        List<Path> invalidations;
+        boolean invalidateAll;
+        boolean trustRegistryChanged;
+        synchronized (this) {
+            if (closed) return;
+            changes = pendingChanges.values().stream().map(this::stabilizeChange).toList();
+            pendingChanges.clear();
+            invalidations = List.copyOf(pendingInvalidations);
+            pendingInvalidations.clear();
+            invalidateAll = pendingInvalidateAll;
+            pendingInvalidateAll = false;
+            trustRegistryChanged = pendingTrustRegistryChanged;
+            pendingTrustRegistryChanged = false;
+            pendingFlush = null;
+        }
         if (invalidateAll) invalidateAllGenerations.run();
-        invalidations.forEach(invalidateGeneration);
+        else invalidations.forEach(invalidateGeneration);
         if (trustRegistryChanged) registerExistingTrustedWorkspaceWatches();
-        publishChanges.accept(changes);
+        if (!changes.isEmpty()) publishChanges.accept(changes);
+    }
+
+    /**
+     * 事件携带的版本可能来自原子替换中间态，发布前重新取当前文件版本；读取失败只产出安全的
+     * unavailable 标识，真正配置解析仍由 App Server 的带重试读取路径负责。
+     */
+    private ConfigurationRuntimeState.ConfigChanged stabilizeChange(
+            ConfigurationRuntimeState.ConfigChanged change) {
+        String version = switch (change.scope()) {
+            case "user" -> ConfigurationStore.version(userConfigPath);
+            case "credential" -> ConfigurationStore.secretVersion(homeDirectory.resolve("auth.json"));
+            case "trust" -> ConfigurationStore.version(trustPath);
+            case "project" -> change.canonicalCwd() == null ? ConfigurationStore.MISSING_VERSION
+                    : ConfigurationStore.version(change.canonicalCwd().resolve(".ja").resolve("config.toml"));
+            default -> ConfigurationStore.MISSING_VERSION;
+        };
+        return new ConfigurationRuntimeState.ConfigChanged(change.scope(), change.canonicalCwd(), version);
+    }
+
+    /**
+     * 创建只服务于配置事件收敛的 daemon 线程；它不拥有配置文件，也不阻止 app-server 关闭。
+     */
+    private static ScheduledExecutorService createChangeExecutor() {
+        return Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "ja-config-settle");
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     /**
@@ -285,6 +370,7 @@ public final class ConfigurationWatcher implements AutoCloseable {
             closed = true;
         }
         closeWatchServiceQuietly();
+        changeExecutor.shutdownNow();
     }
 
     /**

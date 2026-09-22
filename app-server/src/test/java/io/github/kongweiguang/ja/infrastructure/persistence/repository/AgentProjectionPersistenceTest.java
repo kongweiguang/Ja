@@ -11,6 +11,7 @@ import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.ThreadUsageSummary;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.TurnChangeSet;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
@@ -39,6 +40,7 @@ import java.util.List;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.binding;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.execution;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
+import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.profile;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.usageFact;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -48,6 +50,51 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 真实 SQLite 重启覆盖阶段、Tool artifact、TurnChangeSet 与身份隔离。 */
 final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
+
+    /**
+     * 聚合以每条持久请求的 Provider 口径归一化新输入，并包含摘要和跨模型请求；UNKNOWN 不得变成零，
+     * 重启或历史分页也不能重复累计同一 settlement。
+     */
+    @Test
+    void readsThreadUsageSummaryAcrossCacheAccountingSummaryAndRestart() throws Exception {
+        try (TestDatabase database = database("agent-thread-usage-summary")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = store.admit(new ConversationRepository.TurnAdmission(
+                    "thr_agent", "turn_agent", "item_user",
+                    new ModelMessage(ModelRole.USER, List.of(new TextContent("run"))),
+                    List.of(), 0, START, execution("cfg_agent")));
+            List<List<ConversationRepository.Fact>> settlements = List.of(
+                    List.<ConversationRepository.Fact>of(usageFact(1, 1, null),
+                            usageFact(1, 1, new ModelUsage(100, 20, 120, 40L, 10L,
+                                    ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE))),
+                    usageSettlement("request_2", 2, 2, ConversationRepository.UsagePurpose.ASSISTANT,
+                            profile("provider_other", "model_other", "cfg_other"),
+                            new ModelUsage(180, 30, 210, 80L, 0L,
+                                    ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE)),
+                    usageSettlement("request_summary_3", 3, 3, ConversationRepository.UsagePurpose.SUMMARY,
+                            profile("provider_test", "model_test", "cfg_test"),
+                            new ModelUsage(90, 5, 95, 10L, 0L,
+                                    ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE)),
+                    List.<ConversationRepository.Fact>of(usageFact(4, 4, null)));
+            long mutationVersion = admission.turnMutationVersion();
+            for (int index = 0; index < settlements.size(); index++) {
+                ConversationRepository.CommitReceipt receipt = store.commit(new ConversationRepository.CommitRequest(
+                        "thr_agent", "turn_agent", TurnState.RUNNING, settlements.get(index),
+                        mutationVersion, START.plusSeconds(index + 1L), execution("cfg_agent")));
+                mutationVersion = receipt.turnMutationVersion();
+            }
+
+            MybatisHistoryService history = database.history(store);
+            assertUsageSummary(history.readThreadUsageSummary("thr_agent").orElseThrow());
+            history.readThread("thr_agent", null, 1).orElseThrow();
+            assertUsageSummary(history.readThreadUsageSummary("thr_agent").orElseThrow());
+
+            store.close();
+            MybatisConversationRepository restored = database.agentStore();
+            assertUsageSummary(database.history(restored).readThreadUsageSummary("thr_agent").orElseThrow());
+            restored.close();
+        }
+    }
 
     /** 重建历史服务后以持久 checkpoint 失效旧占用，同时账本计量不变；后续真实 usage 恢复 KNOWN。 */
     @Test
@@ -285,6 +332,40 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
         store.createThread(new ConversationRepository.ThreadDefinition(
                 "thr_agent", "ws_agent", "thread", preferences("provider_agent", "model_agent"), START));
         return store;
+    }
+
+    /**
+     * 真实结算先记录请求意图再原位填充计量；测试保持同一 Profile 与 purpose，确保聚合覆盖的是
+     * 正常持久化路径而非绕过 UNKNOWN 约束的手工数据。
+     */
+    private static List<ConversationRepository.Fact> usageSettlement(
+            String requestId, int modelRound, int requestOrdinal, ConversationRepository.UsagePurpose purpose,
+            io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile requestProfile,
+            ModelUsage usage) {
+        return List.of(
+                new ConversationRepository.UsageFact(requestId, null, modelRound, requestOrdinal, purpose,
+                        ConversationRepository.UsageCertainty.UNKNOWN, requestProfile),
+                new ConversationRepository.UsageFact(requestId, usage, modelRound, requestOrdinal, purpose,
+                        ConversationRepository.UsageCertainty.KNOWN, requestProfile));
+    }
+
+    /** 断言每个覆盖计数与累计值成对保持，防止未知计量、缓存口径或跨模型请求在重读时被重复解释。 */
+    private static void assertUsageSummary(ThreadUsageSummary summary) {
+        assertEquals(4, summary.requestCount());
+        assertEquals(3, summary.measuredRequestCount());
+        assertEquals(3, summary.newInputRequestCount());
+        assertEquals(280, summary.newInputTokens());
+        assertEquals(3, summary.outputRequestCount());
+        assertEquals(55, summary.outputTokens());
+        assertEquals(3, summary.totalRequestCount());
+        assertEquals(425, summary.totalTokens());
+        assertEquals(3, summary.cacheReadRequestCount());
+        assertEquals(130, summary.cacheReadTokens());
+        assertEquals(3, summary.cacheWriteRequestCount());
+        assertEquals(10, summary.cacheWriteTokens());
+        assertEquals(3, summary.cacheCompleteRequestCount());
+        assertEquals(420, summary.cacheCompleteInputTokens());
+        assertEquals(130, summary.cacheCompleteReadTokens());
     }
 
     /** 构造不含 raw 参数或结果的最小安全展示；正文只进入独立 artifact 表。 */

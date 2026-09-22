@@ -82,6 +82,8 @@ export interface SkillProjection {
   source: SkillSource;
   description: string;
   enabled: boolean;
+  /** 已登记但发现阶段未找到 `SKILL.md` 的记录仍可在设置中显式移除。 */
+  missing?: boolean;
   status: SkillStatus;
   lastGood?: string;
   error?: string;
@@ -102,9 +104,9 @@ export interface SubagentSettings {
   reasoningLevel: ReasoningLevel | null;
 }
 
-/** camelCase v1 聚合是 application 唯一可见的配置事实，不泄漏 JA-RPC wire 字段。 */
+/** camelCase v2 聚合是 application 唯一可见的用户配置事实，不泄漏 JA-RPC wire 字段。 */
 export interface SettingsDocument {
-  schemaVersion: 1;
+  schemaVersion: 2;
   revision: number;
   theme: ThemeMode;
   defaultAccessMode: AccessMode;
@@ -113,7 +115,8 @@ export interface SettingsDocument {
   subagents: SubagentSettings;
   providers: ProviderProjection[];
   mcpServers: SettingsMcpServer[];
-  skills: SettingsSkill[];
+  /** 只保存 `user:name` 或 `ja:name` 引用，描述、路径和开关均来自运行时发现。 */
+  skills: string[];
   window: { width: number; height: number; maximized: boolean };
 }
 
@@ -130,31 +133,42 @@ export interface SettingsMcpServer {
   enabled: boolean;
 }
 
-interface SettingsSkill {
-  skillId: string;
-  name: string;
-  scope: SkillSource;
-  enabled: boolean;
-  description: string;
+/** 项目 Skill 文档保持最小独立模型；首次项目操作才由 App Server 创建其持久化文件。 */
+export interface ProjectSkillSettingsDocument {
+  schemaVersion: 2;
+  revision: number;
+  skills: string[];
+  disabledSkills: string[];
 }
 
-/** 只标记可由完整用户设置保存修复的语义损坏，不弱化文件、凭据或运行时安全边界。 */
-export type SettingsRecovery = "user_config_corrupt";
+/** App Server 问题投影只描述当前影响与可执行动作，永不携带配置正文、路径或 Secret。 */
+export interface ConfigurationIssue {
+  id: string;
+  scope: "user" | "project" | "credential";
+  field: string | null;
+  entityId: string | null;
+  line: number | null;
+  column: number | null;
+  reason: string;
+  impact: string;
+  actions: Array<"edit" | "retry" | "restore">;
+}
 
 export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
+  projectSkillDocument?: ProjectSkillSettingsDocument;
   projectOverrides: ProjectSettingsOverrides;
   cas: { userVersion: string; projectVersion: string; credentialVersion: string };
-  /** 用户层无法安全投影时仍允许进入设置进行显式完整恢复，不把原文件视为可写空配置。 */
-  recovery?: SettingsRecovery;
+  /** 问题不改变可编辑 userDocument；保存路径必须只提交用户明确的变化。 */
+  issues: ConfigurationIssue[];
 }
 
 /** 项目稀疏层只向 UI 暴露覆盖存在性，不泄漏或复制任意配置正文。 */
 interface ProjectSettingsOverrides {
   defaultSelection: boolean;
   accessMode: boolean;
-  disabledSkillIds: string[];
+  disabledSkillReferences: string[];
   disabledMcpIds: string[];
 }
 export interface SettingsConfigurationChange {

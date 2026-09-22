@@ -43,7 +43,7 @@ async function writeSettings(home, catalogBaseUrl) {
   await writeFile(
     join(jaHome, "config.toml"),
     [
-      "schema_version = 1",
+      "schema_version = 2",
       "config_revision = 1",
       'default_access_mode = "approval_required"',
       'default_provider_id = "provider_models_e2e"',

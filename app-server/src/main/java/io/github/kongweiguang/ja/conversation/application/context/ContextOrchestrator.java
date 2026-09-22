@@ -78,6 +78,7 @@ public final class ContextOrchestrator {
             boolean forceCompaction,
             Optional<ModelContinuation> continuation,
             ToolProjectionLimits outputLimits,
+            CheckpointStore.ProjectionBinding projectionBinding,
             ContextTokenMeter meter,
             CancellationToken cancellation) {
         /**
@@ -88,7 +89,16 @@ public final class ContextOrchestrator {
                        Optional<ModelContinuation> continuation, ToolProjectionLimits outputLimits,
                        ContextTokenMeter meter) {
             this(threadId, sourceRevision, messages, budget, forceCompaction, continuation,
-                    outputLimits, meter, CancellationToken.none());
+                    outputLimits, CheckpointStore.ProjectionBinding.unbound(), meter, CancellationToken.none());
+        }
+
+        /** 手动压缩等内部调用仍可传取消令牌；没有请求级 Profile 时明确使用未绑定阶段。 */
+        public Request(String threadId, long sourceRevision, List<ContextMessage> messages,
+                       ContextBudget budget, boolean forceCompaction,
+                       Optional<ModelContinuation> continuation, ToolProjectionLimits outputLimits,
+                       ContextTokenMeter meter, CancellationToken cancellation) {
+            this(threadId, sourceRevision, messages, budget, forceCompaction, continuation,
+                    outputLimits, CheckpointStore.ProjectionBinding.unbound(), meter, cancellation);
         }
 
         /**
@@ -102,6 +112,7 @@ public final class ContextOrchestrator {
             budget = Objects.requireNonNull(budget, "budget");
             continuation = Objects.requireNonNull(continuation, "continuation");
             outputLimits = Objects.requireNonNull(outputLimits, "outputLimits");
+            projectionBinding = Objects.requireNonNull(projectionBinding, "projectionBinding");
             meter = Objects.requireNonNull(meter, "meter");
             cancellation = Objects.requireNonNull(cancellation, "cancellation");
         }
@@ -111,7 +122,7 @@ public final class ContextOrchestrator {
          */
         private ContextCompactionService.CompactionRequest toCompactionRequest() {
             return new ContextCompactionService.CompactionRequest(threadId, sourceRevision, messages, budget,
-                    forceCompaction, continuation, outputLimits, meter, cancellation);
+                    forceCompaction, continuation, outputLimits, projectionBinding, meter, cancellation);
         }
     }
 

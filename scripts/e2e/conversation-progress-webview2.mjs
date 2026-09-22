@@ -391,7 +391,8 @@ async function expandReadResult(process, deadline) {
 }
 
 /**
- * 断言已结算的过程仍按 Tool 交错，且最后一轮正文不回流到过程。
+ * 断言已结算的过程仍按 Tool 交错，且最后一轮正文不回流到过程。Tool 的终态不作为视觉摘要，
+ * 因此只验证真实 Tool identity 与可访问名称，不把“完成”等旧状态文案重新固定进界面契约。
  *
  * 末尾 reasoning summary 在 terminal 后继续可审计，但最终 output_text 只属于 AssistantResponse；
  * live 与 reload 都必须保留相同的公开过程类型顺序。
@@ -412,8 +413,11 @@ function assertProcessSequence(items, label) {
     2,
   );
   assert.equal(
-    items.filter((item) => item.kind === "tool").every((item) => item.toolLabel.endsWith("完成")),
+    items
+      .filter((item) => item.kind === "tool")
+      .every((item) => item.toolLabel.trim() !== "" && item.toolLabel.includes(item.toolKind)),
     true,
+    `${label} Tool controls must retain an accessible native identity`,
   );
 }
 
@@ -426,6 +430,163 @@ function assertFinalBodyOutsideProcess(items, label) {
     false,
     `${label} WorkProcess must not contain the final response body`,
   );
+}
+
+/**
+ * 在真实结算和重载后验收上下文浮层：账本数字必须来自 JVM 持久化回读，布局则以 WebView2
+ * 的实际碰撞结果为准。这里同时覆盖 hover 阅读、点击固定、外部/Escape 关闭和焦点回归，避免
+ * 组件测试中的 JSDOM Portal 行为替代桌面交互事实。
+ */
+async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
+  const trigger = page.getByRole("button", { name: "上下文用量详情", exact: true });
+  const popover = page.locator(".ja-context-usage-popover");
+  await trigger.waitFor({ state: "visible", timeout: timeout(deadline) });
+  /**
+   * UI 只把读取失败投影为“暂不可用”；真窗验收额外读取同一 typed command 的脱敏结果，
+   * 让 IPC 拒绝可定位而不把 Thread 正文、配置或 Provider 请求记录到证据文件。
+   */
+  const nativeUsage = await page.evaluate(async () => {
+    try {
+      const active = globalThis.document.querySelector(
+        '[aria-label="最近对话列表"] button[aria-current="page"]',
+      );
+      const threadId = active?.getAttribute("data-thread-id");
+      if (threadId === null || threadId === undefined) return { status: "missing_thread" };
+      const value = await globalThis.__TAURI_INTERNALS__?.invoke("ja_thread_usage_read", {
+        input: { threadId },
+      });
+      const record = value !== null && typeof value === "object" ? value : {};
+      return {
+        status: "ok",
+        requestCount: record.requestCount,
+        totalTokens: record.totalTokens,
+        outputTokens: record.outputTokens,
+      };
+    } catch (error) {
+      const record = error !== null && typeof error === "object" ? error : {};
+      return {
+        status: "error",
+        code: typeof record.code === "string" ? record.code.slice(0, 96) : undefined,
+        message: typeof record.message === "string" ? record.message.slice(0, 256) : undefined,
+        detail: String(error ?? "unknown").slice(0, 256),
+      };
+    }
+  });
+  assert.deepEqual(nativeUsage, {
+    status: "ok",
+    requestCount: 3,
+    totalTokens: 96,
+    outputTokens: 36,
+  });
+  await trigger.hover({ timeout: timeout(deadline) });
+  await popover.waitFor({ state: "visible", timeout: timeout(deadline) });
+  await popover.getByText("Token · 本会话", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+
+  const initialFacts = await popover.evaluate((element) => {
+    const valueFor = (label) => {
+      const row = [...element.querySelectorAll(".ja-context-usage-popover__row")].find(
+        (candidate) => candidate.firstElementChild?.textContent?.trim() === label,
+      );
+      return row?.lastElementChild?.textContent?.trim() ?? null;
+    };
+    const bounds = element.getBoundingClientRect();
+    return {
+      classNames: element.className,
+      userSelect: globalThis.getComputedStyle(element).userSelect,
+      width: Math.round(bounds.width),
+      left: Math.round(bounds.left),
+      right: Math.round(bounds.right),
+      viewportWidth: globalThis.innerWidth,
+      documentOverflows: globalThis.document.documentElement.scrollWidth > globalThis.innerWidth,
+      metrics: {
+        newInput: valueFor("输入（未缓存）"),
+        output: valueFor("输出"),
+        cacheRead: valueFor("缓存读取"),
+        total: valueFor("总计"),
+        cacheRate: valueFor("缓存命中率"),
+        context: valueFor("上下文"),
+        used: valueFor("已用"),
+      },
+    };
+  });
+  assert.equal(initialFacts.classNames.includes("ja-floating-surface"), true);
+  assert.equal(initialFacts.userSelect, "text");
+  // WebView2 在非整数 DPI 下会把 280px CSS 宽度投影为 279px 的布局边界；限定紧凑范围，
+  // 既锁住约 280px 的信息密度，也不把平台子像素取整误判为响应式回归。
+  assert.equal(
+    initialFacts.width >= 278 && initialFacts.width <= 280,
+    true,
+    "context usage popover must retain its compact width",
+  );
+  assert.equal(
+    initialFacts.left >= 12 && initialFacts.right <= initialFacts.viewportWidth - 12,
+    true,
+  );
+  assert.equal(initialFacts.documentOverflows, false);
+  assert.deepEqual(initialFacts.metrics, {
+    newInput: "60",
+    output: "36",
+    cacheRead: "0",
+    total: "96",
+    cacheRate: "—",
+    context: "0.0%",
+    used: "20 / 128K",
+  });
+  await page.screenshot({
+    path: join(evidenceDirectory, "context-usage-light-wide.png"),
+    animations: "disabled",
+  });
+
+  // Hover 展开后点击只固定阅读，不会因为入口和浮层之间的微小间隙关闭。
+  await trigger.click({ timeout: timeout(deadline) });
+  await popover.hover({ timeout: timeout(deadline) });
+  // 浮层可能与 Composer 输入框在垂直方向重叠；选择已可见的用户消息作为真实外部命中点，
+  // 避免测试为了关闭浮层去点击被浮层正确遮挡的元素。
+  await page
+    .locator('.ja-chat-message-user[data-role="user"]')
+    .last()
+    .click({ timeout: timeout(deadline) });
+  await popover.waitFor({ state: "hidden", timeout: timeout(deadline) });
+  await trigger.click({ timeout: timeout(deadline) });
+  await popover.waitFor({ state: "visible", timeout: timeout(deadline) });
+  await page.keyboard.press("Escape");
+  await popover.waitFor({ state: "hidden", timeout: timeout(deadline) });
+  assert.equal(
+    await trigger.evaluate((element) => globalThis.document.activeElement === element),
+    true,
+    "Escape must restore focus to the usage trigger",
+  );
+
+  await trigger.click({ timeout: timeout(deadline) });
+  await popover.waitFor({ state: "visible", timeout: timeout(deadline) });
+  await page.setViewportSize({ width: 360, height: 640 });
+  await page.waitForFunction(() => globalThis.innerWidth <= 360, undefined, {
+    timeout: timeout(deadline),
+  });
+  const narrowFacts = await popover.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return {
+      left: Math.round(bounds.left),
+      right: Math.round(bounds.right),
+      viewportWidth: globalThis.innerWidth,
+      documentOverflows: globalThis.document.documentElement.scrollWidth > globalThis.innerWidth,
+    };
+  });
+  assert.equal(narrowFacts.left >= 12 && narrowFacts.right <= narrowFacts.viewportWidth - 12, true);
+  assert.equal(narrowFacts.documentOverflows, false);
+  await page.screenshot({
+    path: join(evidenceDirectory, "context-usage-light-narrow.png"),
+    animations: "disabled",
+  });
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  await page.screenshot({
+    path: join(evidenceDirectory, "context-usage-dark-narrow.png"),
+    animations: "disabled",
+  });
+  return { ...initialFacts, narrow: narrowFacts };
 }
 
 /** 对外报告必须同时证明流式正文留在工作过程、持续生命信号、terminal 收口与历史顺序。 */
@@ -472,6 +633,22 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.reload?.readSummaryVisible, true);
   assert.equal(report?.reload?.sameThread, true);
   assert.equal(report?.finalVisible, true);
+  assert.equal(
+    report?.contextUsage?.width >= 278 && report?.contextUsage?.width <= 280,
+    true,
+    "context usage report must retain compact width across WebView2 DPI rounding",
+  );
+  assert.equal(report?.contextUsage?.userSelect, "text");
+  assert.deepEqual(report?.contextUsage?.metrics, {
+    newInput: "60",
+    output: "36",
+    cacheRead: "0",
+    total: "96",
+    cacheRate: "—",
+    context: "0.0%",
+    used: "20 / 128K",
+  });
+  assert.equal(report?.contextUsage?.narrow?.documentOverflows, false);
   return report;
 }
 
@@ -493,7 +670,13 @@ export async function runConversationProgressWebView2({
   await mkdir(evidenceDirectory, { recursive: true });
   const deadline = Date.now() + 5 * 60_000;
   const pageErrors = [];
+  const consoleErrors = [];
   page.on("pageerror", (error) => pageErrors.push(String(error?.message ?? error).slice(0, 500)));
+  // React Error Boundary 会把渲染异常投影为界面而非 pageerror；保留受限 console 摘要才能让
+  // 隔离真窗失败指向实际组件根因，而不是笼统归为 locator 超时。
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text().slice(0, 1_000));
+  });
   await instrumentRuntimeInvocations(page);
   // runner 已连接到新启动的真实窗口；这里额外 reload 会与旧 renderer 的 stop cleanup 竞争。
   // 历史恢复阶段仍执行一次真实 reload，因而不会削弱 reload + persisted history 的验收边界。
@@ -778,6 +961,18 @@ export async function runConversationProgressWebView2({
     path: join(evidenceDirectory, "conversation-progress-reload.png"),
     animations: "disabled",
   });
+  let contextUsage;
+  try {
+    contextUsage = await verifyContextUsagePopover(page, evidenceDirectory, deadline);
+  } catch (error) {
+    const consoleTail = consoleErrors.slice(-8).join(" | ");
+    throw new Error(
+      consoleTail === ""
+        ? String(error?.message ?? error)
+        : `${String(error?.message ?? error)}; WebView2 console: ${consoleTail}`,
+      { cause: error },
+    );
+  }
   assert.deepEqual(pageErrors, [], `WebView2 page errors: ${pageErrors.join(" | ")}`);
   const provider = fixture.snapshot();
   assert.equal(provider.attempts.filter((attempt) => attempt.kind === "turn").length, 3);
@@ -831,7 +1026,14 @@ export async function runConversationProgressWebView2({
       sequence: restoredSequence,
     },
     finalVisible: true,
-    screenshots: ["conversation-progress-live.png", "conversation-progress-reload.png"],
+    contextUsage,
+    screenshots: [
+      "conversation-progress-live.png",
+      "conversation-progress-reload.png",
+      "context-usage-light-wide.png",
+      "context-usage-light-narrow.png",
+      "context-usage-dark-narrow.png",
+    ],
     pageErrors,
   };
 }

@@ -67,12 +67,16 @@ import io.github.kongweiguang.ja.conversation.application.context.summary.Summar
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceReferenceValidator;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.net.URI;
+import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -88,6 +92,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -105,6 +110,9 @@ final class TurnServiceTest {
     private static final WorkspaceReferenceValidator WORKSPACE_REFERENCES = request ->
             new WorkspaceReferenceValidator.ValidatedReference(
                     request.workspaceId(), request.relativePath(), request.kind());
+
+    @TempDir
+    Path temporaryDirectory;
 
     /** 锁定准入接受 Base64URL generation 前缀字符，避免合法实例标识被误拒绝。 */
     @Test
@@ -229,6 +237,72 @@ final class TurnServiceTest {
                     prompt.restoredSummaries);
             assertEquals(activeSkills, prompt.restoredSkills.get());
             assertEquals("latest checkpoint summary", prompt.preparedSummaries.getFirst());
+        }
+    }
+
+    /**
+     * 自动核实只读取持久化证据锁定的精确文件；摘要、长度和真实工作区根都一致时，先落 VERIFIED
+     * 事实再恢复原 Turn，避免把当前文件条件错误写成崩溃前的成功回执。
+     */
+    @Test
+    void resumeVerifiesMatchingPersistedFileEvidenceBeforeContinuing() throws Exception {
+        Path workspace = Files.createDirectory(temporaryDirectory.resolve("recovery-workspace"));
+        byte[] expected = "已恢复的文件内容\n".getBytes(StandardCharsets.UTF_8);
+        Files.write(workspace.resolve("result.txt"), expected);
+        RecordingStore store = new RecordingStore();
+        store.prepareFileRecoveryCandidate(workspace, "result.txt", expected);
+        ModelPort model = (request, sink, cancellation) -> {
+            assertEquals(ConversationRepository.ToolRecoveryDisposition.VERIFIED,
+                    store.recoveryResolution().disposition());
+            sink.onEvent(new ModelPort.TextDelta("done"));
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.Accepted accepted = service.resume(
+                    "turn_resume", 0, event -> CompletableFuture.completedFuture(null));
+
+            assertEquals(TurnState.COMPLETED,
+                    accepted.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+            ConversationRepository.ToolRecoveryResolutionRequest resolution = store.recoveryResolution();
+            assertEquals("call_file", resolution.callId());
+            assertEquals("auto_verify_recovery_file_1", resolution.idempotencyKey());
+        }
+    }
+
+    /**
+     * 文件内容与保存证据不一致时，恢复必须停在原未知 Tool，而不是为了继续模型循环而重放或跳过
+     * 外部副作用；这同时覆盖匹配器在自动核实失败时的失败关闭语义。
+     */
+    @Test
+    void resumeKeepsMismatchedPersistedFileEvidencePending() throws Exception {
+        Path workspace = Files.createDirectory(temporaryDirectory.resolve("mismatched-recovery-workspace"));
+        byte[] expected = "执行前的预期结果\n".getBytes(StandardCharsets.UTF_8);
+        Files.writeString(workspace.resolve("result.txt"), "当前内容已变化\n", StandardCharsets.UTF_8);
+        RecordingStore store = new RecordingStore();
+        store.prepareFileRecoveryCandidate(workspace, "result.txt", expected);
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("mismatched evidence must not run the model"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, runtimeResolver(), CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.TurnResumeException failure = assertInstanceOf(TurnUseCase.TurnResumeException.class,
+                    assertThrows(RuntimeException.class, () -> service.resume(
+                            "turn_resume", 0, event -> CompletableFuture.completedFuture(null))));
+
+            assertEquals(TurnUseCase.ResumeFailure.RECOVERY_REQUIRED, failure.failure());
+            assertEquals(null, store.recoveryResolution());
+            assertEquals(TurnState.SUSPENDED, store.state());
         }
     }
 
@@ -1521,6 +1595,15 @@ final class TurnServiceTest {
         }
     }
 
+    /** 将测试字节转换为与生产恢复证据相同的小写 SHA-256，避免夹具依赖手工常量。 */
+    private static String sha256(byte[] bytes) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (java.security.NoSuchAlgorithmException unavailable) {
+            throw new AssertionError("SHA-256 must be available", unavailable);
+        }
+    }
+
     /** 记录 revision、Turn 状态与提交次数的存储假实现，用于断言生命周期顺序。 */
     private static final class RecordingStore implements ConversationRepository {
         /** 服务层夹具不注入 Child mailbox；执行器若误用必须显式失败。 */
@@ -1544,6 +1627,8 @@ final class TurnServiceTest {
         private long inputQueueRevision;
         private TurnAdmission lastAdmission;
         private ResumeCandidate resumeCandidate;
+        private PendingToolRecovery pendingToolRecovery;
+        private ToolRecoveryResolutionRequest recoveryResolution;
         private StorageException resumeFailure;
         private StorageException suspendedCancellationFailure;
         private int suspendedCancellationAttempts;
@@ -1639,6 +1724,26 @@ final class TurnServiceTest {
                     new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null),
                     promptSummary, latestSummary, content("resume"), null, false);
         }
+
+        /**
+         * 将真实临时工作区与严格的结果摘要写入恢复夹具，确保服务测试经过文件核实而不是直接
+         * 注入 VERIFIED 结论；候选仍保持 SUSPENDED，后续 resume 必须推进两个 revision。
+         */
+        synchronized void prepareFileRecoveryCandidate(Path workspaceRoot, String relativePath, byte[] expected) {
+            prepareResumeCandidate();
+            pendingToolRecovery = new PendingToolRecovery("recovery_file", "thr_test", "turn_resume", "call_file",
+                    1, EvidenceKind.FILE_TEXT, relativePath, sha256(expected), (long) expected.length);
+            resumeCandidate = new ResumeCandidate(resumeCandidate.threadId(), resumeCandidate.turnId(),
+                    resumeCandidate.workspaceId(), workspaceRoot, resumeCandidate.threadRevision(),
+                    resumeCandidate.turnMutationVersion(), resumeCandidate.execution(), resumeCandidate.promptSummary(),
+                    resumeCandidate.latestCheckpointSummary(), resumeCandidate.originalContent(),
+                    resumeCandidate.internalContext(), resumeCandidate.provisionalTitleEligible());
+        }
+
+        /** 返回自动核实已提交的唯一请求，供测试同时验证事实类别和稳定幂等身份。 */
+        synchronized ToolRecoveryResolutionRequest recoveryResolution() {
+            return recoveryResolution;
+        }
         /** 将已准备候选标记为首轮标题 owner，用于验证跨进程恢复不丢失一次性标题责任。 */
         synchronized void prepareTitleEligibleResumeCandidate(String originalUserInput) {
             prepareResumeCandidate();
@@ -1661,6 +1766,32 @@ final class TurnServiceTest {
         /** 返回预置恢复候选；普通服务测试没有配置时保持空。 */
         @Override public synchronized Optional<ResumeCandidate> findResumeCandidate(String turnId) {
             return Optional.ofNullable(resumeCandidate);
+        }
+        /** 仅在文件核实测试暴露当前 Tools cursor 的未知项，其余服务用例沿用空投影。 */
+        @Override public synchronized Optional<PendingToolRecovery> findPendingToolRecovery(String turnId) {
+            return Optional.ofNullable(pendingToolRecovery);
+        }
+        /**
+         * 模拟持久化事务先记录 VERIFIED 再推进 Thread/Turn revision，令下一轮 findResumeCandidate
+         * 必须重新读取新版本，避免测试替身掩盖真实恢复循环的 CAS 依赖。
+         */
+        @Override public synchronized ToolRecoveryResolution resolveToolRecovery(
+                ToolRecoveryResolutionRequest request) {
+            assertNotNull(pendingToolRecovery);
+            assertEquals(pendingToolRecovery.callId(), request.callId());
+            assertEquals(revision, request.expectedThreadRevision());
+            assertEquals(pendingToolRecovery.recoveryRevision(), request.expectedRecoveryRevision());
+            recoveryResolution = request;
+            pendingToolRecovery = null;
+            revision++;
+            turnMutationVersion++;
+            resumeCandidate = new ResumeCandidate(resumeCandidate.threadId(), resumeCandidate.turnId(),
+                    resumeCandidate.workspaceId(), resumeCandidate.workspaceRoot(), revision, turnMutationVersion,
+                    resumeCandidate.execution(), resumeCandidate.promptSummary(),
+                    resumeCandidate.latestCheckpointSummary(), resumeCandidate.originalContent(),
+                    resumeCandidate.internalContext(), resumeCandidate.provisionalTitleEligible());
+            return new ToolRecoveryResolution(resumeCandidate.threadId(), resumeCandidate.turnId(), revision,
+                    turnMutationVersion, request.disposition(), true);
         }
         /** 全局 Turn 查询供终态 ACK 与 suspended fallback 的权威重读使用。 */
         @Override public synchronized Optional<TurnSnapshot> findTurn(String turnId) {

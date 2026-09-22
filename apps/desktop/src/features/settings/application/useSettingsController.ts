@@ -61,6 +61,12 @@ export interface SettingsController {
   snapshot: SettingsSnapshot;
   /** 设置页唯一可编辑投影，始终来自用户级配置文档。 */
   globalSnapshot: SettingsSnapshot;
+  /** Skills 单独提供全局与当前项目投影，避免其它设置页误把项目 effective 值当成用户写入基线。 */
+  skillSettings: {
+    global: SkillProjection[];
+    project?: SkillProjection[];
+    projectAvailable: boolean;
+  };
   loading: boolean;
   synchronizing: boolean;
   scopeReady: boolean;
@@ -68,6 +74,8 @@ export interface SettingsController {
   scopeWorkspaceId: string | undefined;
   error: string | undefined;
   ports: SettingsPorts;
+  /** 由 App Server 备份当前原文并恢复最近完整用户配置后再触发权威重读。 */
+  restoreLastKnownGood(): Promise<void>;
   reload(): Promise<void>;
 }
 
@@ -89,6 +97,43 @@ function projectSkills(result: SkillListResult): SkillProjection[] {
     enabled: skill.enabled,
     status: skillStatus(skill.status, skill.enabled),
   }));
+}
+
+/**
+ * 把发现元数据与来源限定授权重新组合；缺失记录只供设置页移除，绝不伪造成可读 Skill。
+ */
+function skillSettingsProjection(
+  discovered: SkillProjection[],
+  activeReferences: readonly string[],
+  retainedReferences: readonly string[],
+  include: (skill: SkillProjection) => boolean,
+): SkillProjection[] {
+  const active = new Set(activeReferences);
+  const visible = discovered.filter(include).map((skill) => ({
+    ...skill,
+    enabled: active.has(skill.id),
+    status: active.has(skill.id) ? skill.status : ("disabled" as const),
+  }));
+  const known = new Set(discovered.map((skill) => skill.id));
+  for (const reference of retainedReferences) {
+    if (known.has(reference)) continue;
+    const delimiter = reference.indexOf(":");
+    const source = reference.slice(0, delimiter);
+    const name = reference.slice(delimiter + 1);
+    if ((source !== "user" && source !== "ja" && source !== "project") || name.length === 0)
+      continue;
+    visible.push({
+      id: reference,
+      name,
+      source,
+      description: "",
+      enabled: active.has(reference),
+      missing: true,
+      status: "error",
+      error: "文件已移除",
+    });
+  }
+  return visible.sort((left, right) => left.name.localeCompare(right.name, "zh-Hans-CN"));
 }
 
 /** 映射脱敏 MCP 摘要；configured 只补展示字段，不把 enabled 冒充连接成功。 */
@@ -190,10 +235,7 @@ function toSettingsSnapshot(
           : { lastError: enabledObservation.lastError }),
       };
     }),
-    skills: runtimeSkills.map((skill) => {
-      const enabled = document.skills.find((item) => item.skillId === skill.id)?.enabled ?? false;
-      return { ...skill, enabled, status: enabled ? skill.status : ("disabled" as const) };
-    }),
+    skills: skillSettingsProjection(runtimeSkills, document.skills, document.skills, () => true),
     defaultAccessMode: document.defaultAccessMode,
     clarificationEnabled: document.clarificationEnabled,
     appearance: {
@@ -234,6 +276,93 @@ function moveById<T>(
   const next = [...items];
   [next[index], next[target]] = [next[target]!, next[index]!];
   return next;
+}
+
+/** 用稳定条目身份在三份快照间检测是否是同一设置目标被并发修改。 */
+function rebaseEntries<T>(
+  baseline: readonly T[],
+  intended: readonly T[],
+  latest: readonly T[],
+  identify: (item: T) => string,
+): T[] | undefined {
+  const baselineById = new Map(baseline.map((item) => [identify(item), item]));
+  const intendedById = new Map(intended.map((item) => [identify(item), item]));
+  const latestById = new Map(latest.map((item) => [identify(item), item]));
+  const allIds = new Set([...baselineById.keys(), ...intendedById.keys(), ...latestById.keys()]);
+  const localChanges = new Set(
+    [...allIds].filter(
+      (id) => JSON.stringify(baselineById.get(id)) !== JSON.stringify(intendedById.get(id)),
+    ),
+  );
+  const externalChanges = new Set(
+    [...allIds].filter(
+      (id) => JSON.stringify(baselineById.get(id)) !== JSON.stringify(latestById.get(id)),
+    ),
+  );
+  if ([...localChanges].some((id) => externalChanges.has(id))) return undefined;
+
+  const merged = latest.flatMap((item) => {
+    const id = identify(item);
+    if (!localChanges.has(id)) return [structuredClone(item)];
+    const replacement = intendedById.get(id);
+    return replacement === undefined ? [] : [structuredClone(replacement)];
+  });
+  for (const item of intended) {
+    const id = identify(item);
+    if (localChanges.has(id) && !latestById.has(id)) merged.push(structuredClone(item));
+  }
+  return merged;
+}
+
+/**
+ * 仅在本地与外部改动指向不同根字段或不同 Provider/MCP/Skill 时自动 rebase 一次。相同目标
+ * 保留调用方表单草稿并报告冲突，不能猜测哪个值应覆盖另一个窗口的最新值。
+ */
+function rebaseSettingsDocument(
+  baseline: SettingsDocument,
+  intended: SettingsDocument,
+  latest: SettingsDocument,
+): SettingsDocument | undefined {
+  const rebased = structuredClone(latest);
+  const rebaseScalar = <
+    K extends keyof Pick<
+      SettingsDocument,
+      "defaultAccessMode" | "clarificationEnabled" | "defaultSelection" | "subagents"
+    >,
+  >(
+    field: K,
+  ): boolean => {
+    if (JSON.stringify(baseline[field]) === JSON.stringify(intended[field])) return true;
+    if (JSON.stringify(baseline[field]) !== JSON.stringify(latest[field])) return false;
+    rebased[field] = structuredClone(intended[field]);
+    return true;
+  };
+  if (
+    !rebaseScalar("defaultAccessMode") ||
+    !rebaseScalar("clarificationEnabled") ||
+    !rebaseScalar("defaultSelection") ||
+    !rebaseScalar("subagents")
+  ) {
+    return undefined;
+  }
+  const providers = rebaseEntries(
+    baseline.providers,
+    intended.providers,
+    latest.providers,
+    (provider) => provider.providerId,
+  );
+  const mcpServers = rebaseEntries(
+    baseline.mcpServers,
+    intended.mcpServers,
+    latest.mcpServers,
+    (server) => server.mcpRevision,
+  );
+  const skills = rebaseEntries(baseline.skills, intended.skills, latest.skills, (skill) => skill);
+  if (providers === undefined || mcpServers === undefined || skills === undefined) return undefined;
+  rebased.providers = providers;
+  rebased.mcpServers = mcpServers;
+  rebased.skills = skills;
+  return rebased;
 }
 
 /**
@@ -343,6 +472,10 @@ export function useSettingsController({
       ),
     [runtimeGeneration, runtimeServerInstanceId, skillWorkspaceId],
   );
+  const globalSkillsKey = useMemo(
+    () => runtimeProjectionKey("skills", runtimeServerInstanceId, runtimeGeneration, "global"),
+    [runtimeGeneration, runtimeServerInstanceId],
+  );
   const mcpKey = useMemo(
     () => runtimeProjectionKey("mcp", runtimeServerInstanceId, runtimeGeneration),
     [runtimeGeneration, runtimeServerInstanceId],
@@ -360,15 +493,16 @@ export function useSettingsController({
   });
 
   /**
-   * 每个 runtime/scope/version 事件只失效一次当前 Query。新 key 正在首次读取时，该读取
-   * 已覆盖事件后的权威状态，无需再排第二次；其它项目事件则完全不触碰当前 cache。
+   * 每个 runtime/scope/version 事件只失效一次当前 Query。事件可能落在首个读取开始之后、
+   * 返回之前；此时不能提前标记为已处理，否则旧读取会永久遮蔽外部修改。待 Query 结束后
+   * effect 会以同一事件再运行一次并只补发一次权威重读；其它项目事件仍完全不触碰当前 cache。
    */
   useEffect(() => {
     if (!configurationMatchesScope || configurationVersion === undefined) return;
     const eventKey = `${runtimeServerInstanceId ?? "unavailable"}:${runtimeGeneration ?? 0}:${configurationScopeKey}`;
     if (handledConfigurationVersionsRef.current.get(eventKey) === configurationVersion) return;
-    handledConfigurationVersionsRef.current.set(eventKey, configurationVersion);
     if (settingsQuery.isPending || settingsQuery.isPlaceholderData) return;
+    handledConfigurationVersionsRef.current.set(eventKey, configurationVersion);
     void queryClient.invalidateQueries({ queryKey: snapshotKey, exact: true });
   }, [
     configurationMatchesScope,
@@ -393,6 +527,12 @@ export function useSettingsController({
       ),
     enabled: runtimeReady,
   });
+  /** 全局列表永远不携带 workspace，保证项目同名覆盖不会污染全局授权编辑面。 */
+  const globalSkillsQuery = useQuery({
+    queryKey: globalSkillsKey,
+    queryFn: async () => projectSkills(await runtimePort.listSkills()),
+    enabled: runtimeReady,
+  });
 
   /** MCP catalog 与流式 timeline 分离；仅保存有界、脱敏的一次性查询投影。 */
   const mcpQuery = useQuery({
@@ -402,6 +542,7 @@ export function useSettingsController({
   });
   const loaded = settingsQuery.data;
   const runtimeSkills = useMemo(() => skillsQuery.data ?? [], [skillsQuery.data]);
+  const globalRuntimeSkills = useMemo(() => globalSkillsQuery.data ?? [], [globalSkillsQuery.data]);
   const runtimeMcpServers = useMemo(() => mcpQuery.data ?? [], [mcpQuery.data]);
 
   /** 从 Query cache 读取当前 workspace 的最新 CAS 快照，避免另建可变版本 owner。 */
@@ -452,34 +593,68 @@ export function useSettingsController({
         staleTime: 0,
       }),
       queryClient.fetchQuery({
+        queryKey: globalSkillsKey,
+        queryFn: async () => projectSkills(await runtimePort.listSkills()),
+        staleTime: 0,
+      }),
+      queryClient.fetchQuery({
         queryKey: mcpKey,
         queryFn: async () => projectMcpServers(await runtimePort.listMcpServers()),
         staleTime: 0,
       }),
     ]);
-  }, [mcpKey, queryClient, runtimePort, skillWorkspaceId, skillsKey]);
+  }, [globalSkillsKey, mcpKey, queryClient, runtimePort, skillWorkspaceId, skillsKey]);
 
-  /** user CAS replace 只接受已加载 user 文档，effective/project 投影永不成为写入基线。 */
+  /**
+   * 用户配置写入始终以读取到的 userDocument 为基线。不同条目发生的并发写入自动重放一次；同一
+   * 目标冲突则重读权威值并抛回错误，让现有表单保留草稿而不是用整份快照覆盖对方的修改。
+   */
   const saveDocument = useCallback(
     async (userDocument: SettingsDocument): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       let version: string;
+      let documentToSave = userDocument;
       try {
-        version = await adapter.save(userDocument, current.cas.userVersion);
+        version = await adapter.save(documentToSave, current.cas.userVersion, current.userDocument);
       } catch (error) {
-        if (settingsErrorCode(error) === "revision_conflict") await reload();
-        throw error;
+        if (settingsErrorCode(error) !== "revision_conflict") throw error;
+        await reload();
+        const latest = currentLoaded();
+        const rebased =
+          latest === undefined
+            ? undefined
+            : rebaseSettingsDocument(current.userDocument, userDocument, latest.userDocument);
+        if (latest === undefined || rebased === undefined) throw error;
+        documentToSave = rebased;
+        version = await adapter.save(documentToSave, latest.cas.userVersion, latest.userDocument);
       }
       updateLoadedQuery((snapshot) => ({
         ...snapshot,
-        userDocument,
+        userDocument: documentToSave,
         cas: { ...snapshot.cas, userVersion: version },
       }));
       await reload();
     },
     [adapter, currentLoaded, reload, updateLoadedQuery],
   );
+
+  /**
+   * 恢复仅在用户明确选择时发生，成功后丢弃页面旧投影并重新读取，避免把恢复前的草稿或 CAS
+   * 版本重新写回。冲突仍保留当前界面，用户可以看到外部修改后的最新状态再决定下一步。
+   */
+  const restoreLastKnownGood = useCallback(async (): Promise<void> => {
+    const current = currentLoaded();
+    if (current === undefined) throw new Error("settings unavailable");
+    try {
+      await adapter.restoreLastKnownGood(current.cas.userVersion);
+    } catch (error) {
+      if (settingsErrorCode(error) === "revision_conflict") await reload();
+      throw error;
+    }
+    await reload();
+    await refreshRuntimeSettings();
+  }, [adapter, currentLoaded, refreshRuntimeSettings, reload]);
 
   /**
    * 整组模型与连接共用 user CAS；能力编辑同步收敛根思考档位，删除默认模型仍须走显式替代流程。
@@ -981,38 +1156,62 @@ export function useSettingsController({
     [currentLoaded, saveMcp],
   );
 
-  /** Skill 开关只写根级 catalog 的唯一 enabled 事实，不再借用默认 Provider 作为隐含作用对象。 */
+  /**
+   * Skill 开关只提交来源限定引用：全局维护用户授权，项目只登记项目授权或收紧已启用的全局引用。
+   * 保存失败或 CAS 冲突会保留当前画面并权威重读，禁止乐观状态漂移到其它 workspace。
+   */
   const toggleSkill = useCallback(
-    async (skillRevision: string, enabled: boolean): Promise<void> => {
+    async (skillReference: string, enabled: boolean, scope: "user" | "project"): Promise<void> => {
       const current = currentLoaded();
-      const observed = runtimeSkills.find((skill) => skill.id === skillRevision);
-      const configured = current?.userDocument.skills.find(
-        (skill) => skill.skillId === skillRevision,
-      );
-      if (current === undefined || observed === undefined) throw new Error("skill unavailable");
-      const skills = current.userDocument.skills;
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        skills:
-          configured === undefined
-            ? [
-                ...skills,
-                {
-                  skillId: observed.id,
-                  name: observed.name,
-                  scope: observed.source,
-                  enabled,
-                  description: observed.description,
-                },
-              ]
-            : skills.map((skill) =>
-                skill.skillId === skillRevision ? { ...skill, enabled } : skill,
-              ),
-      });
+      if (current === undefined) throw new Error("settings unavailable");
+      if (scope === "user") {
+        if (!skillReference.startsWith("user:") && !skillReference.startsWith("ja:")) {
+          throw new Error("global skill unavailable");
+        }
+        const skills = enabled
+          ? Array.from(new Set([...current.userDocument.skills, skillReference]))
+          : current.userDocument.skills.filter((skill) => skill !== skillReference);
+        await saveDocument({
+          ...current.userDocument,
+          revision: current.userDocument.revision + 1,
+          skills,
+        });
+      } else {
+        const workspaceId = queryWorkspaceId;
+        const project = current.projectSkillDocument;
+        if (workspaceId === undefined || project === undefined) {
+          throw new Error("project settings unavailable");
+        }
+        const projectSkill = skillReference.startsWith("project:");
+        if (!projectSkill && !current.userDocument.skills.includes(skillReference)) {
+          throw new Error("project may only disable globally enabled skills");
+        }
+        const next = projectSkill
+          ? {
+              ...project,
+              revision: project.revision + 1,
+              skills: enabled
+                ? Array.from(new Set([...project.skills, skillReference]))
+                : project.skills.filter((skill) => skill !== skillReference),
+            }
+          : {
+              ...project,
+              revision: project.revision + 1,
+              disabledSkills: enabled
+                ? project.disabledSkills.filter((skill) => skill !== skillReference)
+                : Array.from(new Set([...project.disabledSkills, skillReference])),
+            };
+        try {
+          await adapter.saveProjectSkills(next, workspaceId, current.cas.projectVersion);
+        } catch (error) {
+          if (settingsErrorCode(error) === "revision_conflict") await reload();
+          throw error;
+        }
+        await reload();
+      }
       await refreshRuntimeSettings();
     },
-    [currentLoaded, refreshRuntimeSettings, runtimeSkills, saveDocument],
+    [adapter, currentLoaded, queryWorkspaceId, refreshRuntimeSettings, reload, saveDocument],
   );
 
   /**
@@ -1128,7 +1327,7 @@ export function useSettingsController({
             reducedTransparency,
             highContrast,
           })
-        : toSettingsSnapshot(loaded.userDocument, runtimeSkills, runtimeMcpServers, {
+        : toSettingsSnapshot(loaded.userDocument, globalRuntimeSkills, runtimeMcpServers, {
             theme: themeMode,
             palette,
             reducedMotion,
@@ -1142,10 +1341,42 @@ export function useSettingsController({
       reducedMotion,
       reducedTransparency,
       runtimeMcpServers,
-      runtimeSkills,
+      globalRuntimeSkills,
       themeMode,
     ],
   );
+
+  /**
+   * Skills 的全局/项目投影各自以所属文档为真相；项目页只暴露可操作的项目项和已全局启用项。
+   */
+  const skillSettings = useMemo<SettingsController["skillSettings"]>(() => {
+    if (loaded === undefined) return { global: [], projectAvailable: false };
+    const globalReferences = loaded.userDocument.skills;
+    const global = skillSettingsProjection(
+      globalRuntimeSkills,
+      globalReferences,
+      globalReferences,
+      (skill) => skill.source === "user" || skill.source === "ja",
+    );
+    const projectDocument = loaded.projectSkillDocument;
+    const projectAvailable = queryWorkspaceId !== undefined && projectDocument !== undefined;
+    if (!projectAvailable || projectDocument === undefined)
+      return { global, projectAvailable: false };
+    const disabled = new Set(projectDocument.disabledSkills);
+    const active = [
+      ...projectDocument.skills,
+      ...globalReferences.filter((reference) => !disabled.has(reference)),
+    ];
+    const project = skillSettingsProjection(
+      runtimeSkills,
+      active,
+      [...projectDocument.skills, ...projectDocument.disabledSkills],
+      (skill) =>
+        skill.source === "project" ||
+        ((skill.source === "user" || skill.source === "ja") && globalReferences.includes(skill.id)),
+    );
+    return { global, project, projectAvailable: true };
+  }, [globalRuntimeSkills, loaded, queryWorkspaceId, runtimeSkills]);
 
   /** 以稳定 action 集合作为 UI 边界，避免视图接触 adapter 或 CAS 文档。 */
   const ports = useMemo<SettingsPorts>(
@@ -1204,32 +1435,29 @@ export function useSettingsController({
     boot.status === "failed" || boot.status === "degraded" || boot.status === "recovery_required";
   const loading =
     !bootBlocksSettings && (!runtimeReady || (settingsQuery.isPending && loaded === undefined));
-  // 后台重读保留上一份只读投影，但在当前 key 获得权威结果前关闭写入与 Turn admission；
-  // 这让切换过程保持可见，同时绝不拿旧项目 Provider 配置启动新项目 Turn。
+  // 后台重读保留当前权威投影；刷新不应把整张设置页锁住，mutation 自身仍各自管理 pending。
   const synchronizing = runtimeReady && settingsQuery.isFetching;
-  const scopeReady =
-    runtimeReady &&
-    settingsQuery.isSuccess &&
-    !settingsQuery.isPlaceholderData &&
-    !settingsQuery.isFetching;
+  const scopeReady = runtimeReady && settingsQuery.isSuccess && !settingsQuery.isPlaceholderData;
   const error =
     boot.status === "failed" || boot.status === "degraded"
       ? `本地运行时启动失败：${boot.message}`
       : boot.status === "recovery_required"
         ? "本地运行时需要先完成恢复。"
         : settingsQuery.isError
-          ? "设置配置无效或无法读取，需要先完成恢复；当前已禁止保存。"
+          ? "设置暂时无法读取，请稍后重试。"
           : undefined;
   return {
     loaded,
     snapshot,
     globalSnapshot,
+    skillSettings,
     loading,
     synchronizing,
     scopeReady,
     scopeWorkspaceId: queryWorkspaceId,
     error,
     ports,
+    restoreLastKnownGood,
     reload,
   };
 }

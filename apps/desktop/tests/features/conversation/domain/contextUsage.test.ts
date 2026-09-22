@@ -48,7 +48,7 @@ describe("context usage presentation", () => {
       certainty: "known",
       usedTokens: 42_000,
       limitTokens: 128_000,
-      percentage: 33,
+      percentage: 32.8,
       ringPercentage: 32.8125,
       tone: "neutral",
       source: "provider",
@@ -76,8 +76,8 @@ describe("context usage presentation", () => {
     });
   });
 
-  /** 压缩和恢复期间保留旧环，只有新 KNOWN Usage 到达后才更新展示。 */
-  it("压缩后保留上一笔可信 Usage 并接受新的计量", () => {
+  /** 摘要成功开始新投影阶段，旧输入计量必须失效，失败摘要则继续保留原阶段的可信读数。 */
+  it("压缩后等待新的可信 Usage，并接受阶段后的计量", () => {
     expect(
       resolve({
         compaction: {
@@ -86,11 +86,10 @@ describe("context usage presentation", () => {
           occurredAt: "2026-08-31T00:00:02Z",
         },
       }),
-    ).toMatchObject({
-      certainty: "known",
-      usedTokens: 42_000,
+    ).toEqual({
+      certainty: "unknown",
       source: "provider",
-      measuredAt: USAGE.measuredAt,
+      measuredAt: "2026-08-31T00:00:02Z",
     });
     expect(
       resolve({
@@ -120,6 +119,21 @@ describe("context usage presentation", () => {
           inputTokensAfter: null,
           occurredAt: "2026-08-31T00:00:03Z",
         },
+      }),
+    ).toMatchObject({ certainty: "known", usedTokens: 42_000, source: "provider" });
+  });
+
+  /** 生命周期投影可在 snapshot 后收敛，但成功摘要的阶段边界必须继续阻断旧 Provider 读数。 */
+  it("持久压缩边界在没有 lifecycle 详情时仍使旧 Usage 失效", () => {
+    expect(resolve({ invalidatedAt: "2026-08-31T00:00:02Z" })).toEqual({
+      certainty: "unknown",
+      source: "provider",
+      measuredAt: "2026-08-31T00:00:02Z",
+    });
+    expect(
+      resolve({
+        invalidatedAt: "2026-08-31T00:00:02Z",
+        usage: { ...USAGE, measuredAt: "2026-08-31T00:00:03Z" },
       }),
     ).toMatchObject({ certainty: "known", usedTokens: 42_000, source: "provider" });
   });

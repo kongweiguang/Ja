@@ -49,11 +49,19 @@ import io.github.kongweiguang.ja.workspace.port.in.WorkspaceReferenceValidator;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.HexFormat;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -64,6 +72,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -78,6 +88,9 @@ import org.slf4j.LoggerFactory;
 public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     private static final Logger LOGGER = LoggerFactory.getLogger(TurnService.class);
     private static final long CANCELLATION_PROPAGATION_RETRY_MILLIS = 100L;
+    private static final long MAX_RECOVERY_FILE_BYTES = 4_000_000L;
+    private static final long RECOVERY_ITEM_TIMEOUT_MILLIS = 2_000L;
+    private static final long RECOVERY_TOTAL_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10L);
     private final ConversationRepository store;
     private final AgentLoop loop;
     private final TurnQueue queue;
@@ -401,14 +414,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     @SuppressWarnings("PMD.CloseResource")
     public TurnUseCase.Accepted resume(String turnId, long expectedThreadRevision, TurnEventSink sink) {
         Objects.requireNonNull(sink, "sink");
-        ConversationRepository.ResumeCandidate candidate = store.findResumeCandidate(turnId)
-                .orElseThrow(() -> TurnUseCase.TurnResumeException.of(
-                        TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE));
-        if (candidate.threadRevision() != expectedThreadRevision) {
-            throw TurnUseCase.TurnResumeException.of(candidate.threadRevision() != expectedThreadRevision
-                    ? TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT
-                    : TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE);
-        }
+        ConversationRepository.ResumeCandidate candidate = recoverBeforeResume(turnId, expectedThreadRevision);
+        expectedThreadRevision = candidate.threadRevision();
         Instant resumedAt = clock.instant();
         TurnExecutionState.Common common = candidate.execution().common();
         InteractionService interactions = interactionOwner;
@@ -516,6 +523,140 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
             }
         } finally {
             lease.close();
+        }
+    }
+
+    /**
+     * 前端的明确重试/跳过只映射成 Kernel 的封闭意图；真实的 Tool 结果、审计与版本 CAS 留在
+     * ConversationRepository 事务内，避免 transport 假定状态已变化。
+     */
+    @Override
+    public ToolRecoveryResponse respondToolRecovery(ToolRecoveryRequest request) {
+        Objects.requireNonNull(request, "request");
+        ConversationRepository.ToolRecoveryDisposition disposition = switch (request.disposition()) {
+            case RETRY -> ConversationRepository.ToolRecoveryDisposition.RETRY;
+            case SKIP -> ConversationRepository.ToolRecoveryDisposition.SKIP;
+        };
+        ConversationRepository.ToolRecoveryResolution resolution;
+        try {
+            resolution = store.resolveToolRecovery(new ConversationRepository.ToolRecoveryResolutionRequest(
+                    request.turnId(), request.callId(), request.expectedThreadRevision(),
+                    request.expectedRecoveryRevision(), disposition, request.idempotencyKey(), clock.instant()));
+        } catch (StorageException failure) {
+            if (failure.code() == StorageException.Code.CAS_CONFLICT) {
+                throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT);
+            }
+            if (failure.code() == StorageException.Code.NOT_FOUND) {
+                throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE);
+            }
+            throw failure;
+        }
+        return new ToolRecoveryResponse(resolution.threadId(), resolution.turnId(), resolution.threadRevision(),
+                request.disposition(), resolution.changed());
+    }
+
+    /**
+     * 在重新接纳前按顺序完成可信文件核实。每项仅比较已保存的精确相对路径、长度与摘要，Shell/MCP
+     * 和旧记录一律停在原 Tool 详情等待用户选择；匹配只证明当前条件成立，不伪造原执行成功回执。
+     */
+    private ConversationRepository.ResumeCandidate recoverBeforeResume(String turnId, long expectedThreadRevision) {
+        long startedNanos = System.nanoTime();
+        long expected = expectedThreadRevision;
+        while (true) {
+            ConversationRepository.ResumeCandidate candidate = store.findResumeCandidate(turnId)
+                    .orElseThrow(() -> TurnUseCase.TurnResumeException.of(
+                            TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE));
+            if (candidate.threadRevision() != expected) {
+                throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT);
+            }
+            java.util.Optional<ConversationRepository.PendingToolRecovery> pending =
+                    store.findPendingToolRecovery(turnId);
+            if (pending.isEmpty()) return candidate;
+            ConversationRepository.PendingToolRecovery recovery = pending.get();
+            if (recovery.evidenceKind() != ConversationRepository.EvidenceKind.FILE_TEXT
+                    || !fileRecoveryMatches(candidate.workspaceRoot(), recovery, startedNanos)) {
+                throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.RECOVERY_REQUIRED);
+            }
+            try {
+                ConversationRepository.ToolRecoveryResolution resolution = store.resolveToolRecovery(
+                        new ConversationRepository.ToolRecoveryResolutionRequest(turnId, recovery.callId(),
+                                candidate.threadRevision(), recovery.recoveryRevision(),
+                                ConversationRepository.ToolRecoveryDisposition.VERIFIED,
+                                automaticRecoveryKey(recovery), clock.instant()));
+                expected = resolution.threadRevision();
+            } catch (StorageException failure) {
+                if (failure.code() == StorageException.Code.CAS_CONFLICT) {
+                    throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT);
+                }
+                if (failure.code() == StorageException.Code.NOT_FOUND) {
+                    throw TurnUseCase.TurnResumeException.of(TurnUseCase.ResumeFailure.TURN_NOT_RESUMABLE);
+                }
+                throw failure;
+            }
+        }
+    }
+
+    /** 自动核实使用稳定幂等身份，进程在落库后崩溃时下一次 Resume 只重读原裁决，不会第二次推进游标。 */
+    private static String automaticRecoveryKey(ConversationRepository.PendingToolRecovery recovery) {
+        return "auto_verify_" + recovery.recoveryId() + "_" + recovery.recoveryRevision();
+    }
+
+    /**
+     * 在不阻塞 Resume 超过单项和总预算的前提下读取唯一目标。真实路径与大小先校验，随后才哈希字节；
+     * 任一超时、取消、符号链接逃逸或 IO 异常都归为无法确认，绝不把异常当作文件不匹配或执行成功。
+     */
+    private static boolean fileRecoveryMatches(Path workspaceRoot,
+                                               ConversationRepository.PendingToolRecovery recovery,
+                                               long startedNanos) {
+        long remainingNanos = RECOVERY_TOTAL_TIMEOUT_NANOS - (System.nanoTime() - startedNanos);
+        if (remainingNanos <= 0) return false;
+        long timeoutNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(RECOVERY_ITEM_TIMEOUT_MILLIS), remainingNanos);
+        FutureTask<Boolean> task = new FutureTask<>(() -> matchesExpectedFile(workspaceRoot, recovery));
+        Thread.ofVirtual().name("ja-recovery-verify-").start(task);
+        try {
+            return task.get(timeoutNanos, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            task.cancel(true);
+            return false;
+        } catch (TimeoutException timeout) {
+            task.cancel(true);
+            return false;
+        } catch (java.util.concurrent.ExecutionException failure) {
+            return false;
+        }
+    }
+
+    /**
+     * 只接受 workspace 真正根目录下的常规文件，避免相对路径虽然通过 schema 但经符号链接越界；
+     * 预期长度同时作为读入上限，防止恢复核实成为未受控的大文件读取。
+     */
+    private static boolean matchesExpectedFile(Path workspaceRoot,
+                                               ConversationRepository.PendingToolRecovery recovery) {
+        try {
+            Long expectedBytes = recovery.expectedAfterBytes();
+            if (expectedBytes == null || expectedBytes > MAX_RECOVERY_FILE_BYTES) return false;
+            Path root = workspaceRoot.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            Path target = root.resolve(recovery.targetRelativePath()).normalize();
+            if (!target.startsWith(root) || Files.isSymbolicLink(target)
+                    || !Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)
+                    || Files.size(target) != expectedBytes) return false;
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[8_192];
+            long remaining = expectedBytes;
+            try (InputStream input = Files.newInputStream(target, LinkOption.NOFOLLOW_LINKS)) {
+                while (remaining > 0) {
+                    int read = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (read < 0) return false;
+                    if (read == 0) continue;
+                    digest.update(buffer, 0, read);
+                    remaining -= read;
+                }
+                if (input.read() >= 0) return false;
+            }
+            return HexFormat.of().formatHex(digest.digest()).equals(recovery.expectedAfterSha256());
+        } catch (IOException | SecurityException | NoSuchAlgorithmException unavailable) {
+            return false;
         }
     }
 

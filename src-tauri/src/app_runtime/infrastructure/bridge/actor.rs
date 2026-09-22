@@ -50,6 +50,10 @@ pub(crate) enum BridgeCommand {
         params: Value,
         reply: Reply<TurnAccepted>,
     },
+    TurnRecoveryRespond {
+        params: Value,
+        reply: Reply<ToolRecoveryResponse>,
+    },
     TurnInput {
         method: &'static str,
         params: Value,
@@ -799,6 +803,14 @@ pub(super) fn actor_loop(
             }
             Ok(BridgeCommand::TurnResume { params, reply }) => {
                 let _ = reply.send(turn_resume_runtime(
+                    &context.config,
+                    &mut runtime,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TurnRecoveryRespond { params, reply }) => {
+                let _ = reply.send(turn_recovery_respond_runtime(
                     &context.config,
                     &mut runtime,
                     params,

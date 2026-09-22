@@ -19,6 +19,7 @@ import "./streamingStabilityBrowserFixture.css";
 const THREAD_ID = "thread_streaming_stability";
 const TURN_ID = "turn_streaming_stability";
 const WORKSPACE_ID = "workspace_streaming_stability";
+const STREAM_EVENT_EPOCH_MS = Date.parse("2026-09-20T00:00:01Z");
 type ComposerModel = NonNullable<ComponentProps<typeof Composer>["models"]>[number];
 type ComposerPreferences = NonNullable<ComponentProps<typeof Composer>["preferences"]>;
 type HistoryMode = "ready" | "background-busy" | "empty-busy";
@@ -60,6 +61,7 @@ declare global {
   interface Window {
     __JA_STREAMING_STABILITY__: {
       appendReasoning(text: string): string;
+      appendContextCompaction(): string;
       appendDelta(text: string): string;
       repeatLastDelta(): string;
       complete(finalText: string): string;
@@ -244,13 +246,72 @@ window.__JA_STREAMING_STABILITY__ = {
         threadId: THREAD_ID,
         turnId: TURN_ID,
         threadRevision: 2,
-        occurredAt: new Date(1_779_000_000_000 + streamSequence).toISOString(),
+        occurredAt: new Date(STREAM_EVENT_EPOCH_MS + eventSequence * 100).toISOString(),
         streamSeq: streamSequence,
         text,
       },
     };
     lastDelta = event;
     return useTimelineStore.getState().applyHostEvent({ kind: "timeline", event }) ?? "invalid";
+  },
+  /** 自动压缩沿真实 started/compacted 生命周期投影为过程中的一条 Tool，不借用右侧工作台状态。 */
+  appendContextCompaction(): string {
+    // 与正文共享 fixture 时钟，才能验证 Renderer 按权威 occurredAt 保持同一阅读顺序。
+    eventSequence += 1;
+    const currentRevision = useTimelineStore.getState().threadRevisionByThread[THREAD_ID] ?? 0;
+    const started: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "context/compaction-started",
+      params: {
+        serverInstanceId: "srv_streaming_stability",
+        eventId: "evt_streaming_stability_compaction_started",
+        sequence: eventSequence,
+        generation: 1,
+        workspaceId: WORKSPACE_ID,
+        threadId: THREAD_ID,
+        turnId: TURN_ID,
+        threadRevision: currentRevision,
+        occurredAt: new Date(STREAM_EVENT_EPOCH_MS + eventSequence * 100).toISOString(),
+        compactionId: "cmp_streaming_context",
+        trigger: "automatic",
+        sourceRevision: currentRevision,
+        inputTokensBefore: 12_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+      },
+    };
+    const startedResult = useTimelineStore
+      .getState()
+      .applyHostEvent({ kind: "timeline", event: started });
+    if (startedResult !== "applied") return startedResult ?? "invalid";
+
+    eventSequence += 1;
+    const compacted: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "context/compacted",
+      params: {
+        serverInstanceId: "srv_streaming_stability",
+        eventId: "evt_streaming_stability_compacted",
+        sequence: eventSequence,
+        generation: 1,
+        workspaceId: WORKSPACE_ID,
+        threadId: THREAD_ID,
+        turnId: TURN_ID,
+        threadRevision: currentRevision + 1,
+        occurredAt: new Date(STREAM_EVENT_EPOCH_MS + eventSequence * 100).toISOString(),
+        compactionId: "cmp_streaming_context",
+        checkpointId: "checkpoint_streaming_context",
+        trigger: "automatic",
+        sourceRevision: currentRevision,
+        inputTokensBefore: 12_000,
+        inputTokensAfter: 4_000,
+        strategyVersion: "ja-context-v1",
+      },
+    };
+    return (
+      useTimelineStore.getState().applyHostEvent({ kind: "timeline", event: compacted }) ??
+      "invalid"
+    );
   },
   /** CDP 每次只追加正文；返回 reducer 结果，便于验收脚本拒绝静默失败。 */
   appendDelta(text: string): string {
@@ -268,7 +329,7 @@ window.__JA_STREAMING_STABILITY__ = {
         threadId: THREAD_ID,
         turnId: TURN_ID,
         threadRevision: 2,
-        occurredAt: new Date(1_779_000_000_000 + streamSequence).toISOString(),
+        occurredAt: new Date(STREAM_EVENT_EPOCH_MS + eventSequence * 100).toISOString(),
         streamSeq: streamSequence,
         text,
       },
@@ -287,6 +348,7 @@ window.__JA_STREAMING_STABILITY__ = {
   /** terminal 直接校准流式正文并收口状态，不伪造协议禁止的无 Tool model-step 事件。 */
   complete(finalText: string): string {
     eventSequence += 1;
+    const currentRevision = useTimelineStore.getState().threadRevisionByThread[THREAD_ID] ?? 0;
     const terminal: TimelineEvent = {
       jsonrpc: "2.0",
       method: "turn/terminal",
@@ -298,7 +360,7 @@ window.__JA_STREAMING_STABILITY__ = {
         workspaceId: WORKSPACE_ID,
         threadId: THREAD_ID,
         turnId: TURN_ID,
-        threadRevision: 3,
+        threadRevision: currentRevision + 1,
         occurredAt: "2026-09-20T00:00:10Z",
         state: "completed",
         summary: "完成",

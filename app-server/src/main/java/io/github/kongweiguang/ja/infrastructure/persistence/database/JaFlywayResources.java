@@ -28,10 +28,11 @@ final class JaFlywayResources implements ResourceProvider {
     private static final String RESOURCE_ROOT = "db/migration/";
     private static final List<String> MIGRATIONS = List.of(RESOURCE_ROOT + "V1__kernel.sql",
             RESOURCE_ROOT + "V2__thread_subagent_policies.sql",
-            RESOURCE_ROOT + "V3__subagent_reasoning.sql");
+            RESOURCE_ROOT + "V3__subagent_reasoning.sql",
+            RESOURCE_ROOT + "V4__conversation_recovery_usage_projection.sql");
 
     /**
-     * 只暴露当前 V1/V2/V3 迁移；资源闭集不包含历史脚本，因此 Native Image 和 JVM 不可能走出不同升级链。
+     * 只暴露当前 V1 至 V4 迁移；资源闭集不包含历史脚本，因此 Native Image 和 JVM 不可能走出不同升级链。
      */
     static JaFlywayResources provider() {
         return new JaFlywayResources();

@@ -922,10 +922,12 @@ final class AnthropicMessagesAdapterTest {
                                     return java.util.concurrent.CompletableFuture.completedFuture(null);
                                 }, CancellationToken.none())
                         .toCompletableFuture().get(5, TimeUnit.SECONDS);
-                assertEquals(new ModelUsage(12, 4, 16), outcome.usage());
+                assertEquals(new ModelUsage(7, 4, 16, 2L, 3L,
+                        ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE), outcome.usage());
             }
         }
-        assertEquals(new ModelUsage(12, 4, 16),
+        assertEquals(new ModelUsage(7, 4, 16, 2L, 3L,
+                        ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE),
                 assertInstanceOf(ModelPort.UsageEvent.class, events.getFirst()).usage());
         assertEquals(1, events.size());
     }

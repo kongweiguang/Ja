@@ -26,6 +26,7 @@ PATH_SEARCH_VALID = GOLDEN / "v1" / "valid" / "workspace-path-search.jsonl"
 PATH_SEARCH_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "workspace-path-search-results.jsonl"
 THREAD_VALID = GOLDEN / "v1" / "valid" / "lists.jsonl"
 THREAD_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "thread-seen-results.jsonl"
+USAGE_VALID = GOLDEN / "v1" / "valid" / "thread-usage-summary.jsonl"
 TASK_VALID = GOLDEN / "v1" / "valid" / "task-threads.jsonl"
 TASK_INVALID = GOLDEN / "v1" / "invalid" / "task-threads.jsonl"
 TASK_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "task-thread-results.jsonl"
@@ -42,6 +43,7 @@ RESULT_DEFS = {
     "thread/archive": "threadResult",
     "thread/restore": "threadResult",
     "thread/read": "threadReadResult",
+    "thread/usage/read": "threadUsageSummary",
     "tool/artifact/read": "toolArtifactReadResult",
     "turn/change-set/read": "changeSetArtifactReadResult",
     "turn/input/enqueue": "turnInputMutationResult",
@@ -329,6 +331,41 @@ def validate_thread_seen_contract(schema: dict[str, Any], root: Draft202012Valid
     return len(frames) + len(invalid_frames)
 
 
+def validate_thread_usage_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
+    """独立消费计量汇总，冻结部分 Provider 报告的覆盖边界，缺失绝不伪装为零。"""
+    frames = documents(USAGE_VALID)
+    if len(frames) != 2:
+        raise RuntimeError("thread usage transcript is incomplete")
+    request, response = frames
+    require_valid(root, request, "thread/usage/read request")
+    require_valid(root, response, "thread/usage/read response")
+    if request.get("id") != response.get("id") or "result" not in response:
+        raise RuntimeError("thread usage response lost correlation")
+    result = response["result"]
+    require_valid(definition_validator(schema, "threadUsageSummary"), result, "thread/usage/read result")
+    if result["threadId"] != request["params"]["threadId"]:
+        raise RuntimeError("thread usage result identity mismatch")
+    request_count = result["requestCount"]
+    coverage_fields = (
+        "measuredRequestCount",
+        "newInputRequestCount",
+        "outputRequestCount",
+        "totalRequestCount",
+        "cacheReadRequestCount",
+        "cacheWriteRequestCount",
+        "cacheCompleteRequestCount",
+    )
+    if any(result[field] > request_count for field in coverage_fields):
+        raise RuntimeError("thread usage coverage exceeds the recorded request count")
+    if result["cacheCompleteRequestCount"] > min(
+        result["newInputRequestCount"], result["cacheReadRequestCount"]
+    ):
+        raise RuntimeError("complete cache coverage lacks matching input or read coverage")
+    if result["measuredRequestCount"] >= request_count:
+        raise RuntimeError("thread usage fixture no longer covers partially reported Provider usage")
+    return len(frames)
+
+
 def validate_task_threads_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
     """独立消费完整 Task Thread transcript，锁定十个方法、三个事件及严格结果闭集。"""
     pending: dict[str, str] = {}
@@ -529,12 +566,14 @@ def main() -> int:
             require_invalid(definition_validator(schema, definition), frame["result"], definition)
     queue_frames = validate_queue_contract(schema, root)
     thread_frames = validate_thread_seen_contract(schema, root)
+    usage_frames = validate_thread_usage_contract(schema, root)
     path_search_frames = validate_workspace_path_search_contract(schema, root)
     task_frames = validate_task_threads_contract(schema, root)
     goal_frames = validate_plan_goal_contract(schema, root)
     change_set_cases = validate_change_set_file_boundaries(schema)
     print(f"PYTHON_CONSUMER_OK positiveFrames={len(positive)} invalidFrames={len(negative)} "
-          f"queueFrames={queue_frames} threadFrames={thread_frames} pathSearchFrames={path_search_frames} "
+          f"queueFrames={queue_frames} threadFrames={thread_frames} usageFrames={usage_frames} "
+          f"pathSearchFrames={path_search_frames} "
           f"taskFrames={task_frames} goalFrames={goal_frames} changeSetCases={change_set_cases}")
     return 0
 

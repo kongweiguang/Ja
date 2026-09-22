@@ -47,7 +47,22 @@
       <arg column="profile_json" javaType="string"/>
       <arg column="input_tokens" javaType="java.lang.Long"/>
       <arg column="output_tokens" javaType="java.lang.Long"/><arg column="total_tokens" javaType="java.lang.Long"/>
+      <arg column="cache_read_tokens" javaType="java.lang.Long"/>
+      <arg column="cache_write_tokens" javaType="java.lang.Long"/>
+      <arg column="new_input_tokens" javaType="java.lang.Long"/><arg column="input_accounting" javaType="string"/>
       <arg column="occurred_at" javaType="string"/>
+    </constructor>
+  </resultMap>
+  <resultMap id="threadUsageSummaryRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadUsageSummaryRow">
+    <constructor>
+      <arg column="request_count" javaType="_long"/><arg column="measured_request_count" javaType="_long"/>
+      <arg column="new_input_request_count" javaType="_long"/><arg column="new_input_tokens" javaType="_long"/>
+      <arg column="output_request_count" javaType="_long"/><arg column="output_tokens" javaType="_long"/>
+      <arg column="total_request_count" javaType="_long"/><arg column="total_tokens" javaType="_long"/>
+      <arg column="cache_read_request_count" javaType="_long"/><arg column="cache_read_tokens" javaType="_long"/>
+      <arg column="cache_write_request_count" javaType="_long"/><arg column="cache_write_tokens" javaType="_long"/>
+      <arg column="cache_complete_request_count" javaType="_long"/><arg column="cache_complete_input_tokens" javaType="_long"/>
+      <arg column="cache_complete_read_tokens" javaType="_long"/>
     </constructor>
   </resultMap>
   <resultMap id="changeSetArtifactRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetArtifactRow">
@@ -251,10 +266,31 @@
   </select>
   <select id="selectLatestContextUsage" resultMap="contextUsageRow">
     SELECT u.turn_id,u.request_id,u.model_round,u.request_ordinal,u.purpose,u.certainty,
-      u.profile_json,u.input_tokens,u.output_tokens,u.total_tokens,u.created_at AS occurred_at
+      u.profile_json,u.input_tokens,u.output_tokens,u.total_tokens,u.cache_read_tokens,u.cache_write_tokens,
+      u.new_input_tokens,u.input_accounting,u.created_at AS occurred_at
     FROM usage u JOIN turns x ON x.turn_id=u.turn_id
     WHERE u.thread_id=#{threadId}
     ORDER BY x.turn_sequence DESC,u.request_ordinal DESC,u.usage_id DESC LIMIT 1
+  </select>
+  <select id="selectThreadUsageSummary" resultMap="threadUsageSummaryRow">
+    SELECT
+      COUNT(*) AS request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' THEN 1 ELSE 0 END), 0) AS measured_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS new_input_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL THEN new_input_tokens ELSE 0 END), 0) AS new_input_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND output_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS output_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND output_tokens IS NOT NULL THEN output_tokens ELSE 0 END), 0) AS output_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND total_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS total_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND total_tokens IS NOT NULL THEN total_tokens ELSE 0 END), 0) AS total_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_read_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS cache_read_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0) AS cache_read_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_write_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS cache_write_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_write_tokens IS NOT NULL THEN cache_write_tokens ELSE 0 END), 0) AS cache_write_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS cache_complete_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN new_input_tokens + cache_read_tokens + cache_write_tokens ELSE 0 END), 0) AS cache_complete_input_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0) AS cache_complete_read_tokens
+    FROM usage
+    WHERE thread_id=#{threadId} AND purpose IN ('ASSISTANT','SUMMARY')
   </select>
   <insert id="insertChangeSet">
     INSERT INTO turn_change_sets(thread_id,turn_id,workspace_id,change_set_json,artifact_id,committed_at)

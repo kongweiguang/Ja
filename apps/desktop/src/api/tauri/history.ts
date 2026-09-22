@@ -6,6 +6,7 @@ import {
   CursorSchema,
   ThreadIdSchema,
   ThreadReadResultSchema,
+  ThreadUsageSummarySchema,
   ThreadSchema,
   WorkspaceIdSchema,
   WorkspaceSchema,
@@ -18,6 +19,7 @@ import {
   ThreadDiscoveryResultSchema,
   type Thread,
   type ThreadReadResult,
+  type ThreadUsageSummary,
 } from "../protocol/protocol";
 import { CollaborationModeSchema } from "../protocol/goal";
 import {
@@ -37,6 +39,7 @@ export const JA_HISTORY_COMMANDS = {
   threadList: "ja_thread_list",
   threadSearch: "ja_thread_search",
   threadRead: "ja_thread_read",
+  threadUsageRead: "ja_thread_usage_read",
   threadRename: "ja_thread_rename",
   threadPin: "ja_thread_pin",
   threadSeen: "ja_thread_seen",
@@ -88,6 +91,8 @@ const ThreadReadInputSchema = z
     limit: z.number().int().min(1).max(200).optional(),
   })
   .strict();
+/** 累计账本只按 Thread 身份读取；React 不提交范围、过滤器或计价参数。 */
+const ThreadUsageReadInputSchema = z.object({ threadId: ThreadIdSchema }).strict();
 const ThreadMutationInputSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -165,6 +170,7 @@ export type HistoryThreadListInput = z.infer<typeof ThreadListInputSchema>;
 export type HistoryThreadDiscoverInput = z.infer<typeof ThreadDiscoverInputSchema>;
 export type HistoryThreadSearchInput = z.infer<typeof ThreadSearchInputSchema>;
 export type HistoryThreadReadInput = z.infer<typeof ThreadReadInputSchema>;
+export type HistoryThreadUsageReadInput = z.infer<typeof ThreadUsageReadInputSchema>;
 export type HistoryThreadRenameInput = z.infer<typeof ThreadRenameInputSchema>;
 export type HistoryThreadPreferencesUpdateInput = z.infer<
   typeof ThreadPreferencesUpdateInputSchema
@@ -182,6 +188,7 @@ export interface HistoryThreadDiscoverResult {
   nextCursor?: string | null;
 }
 export type HistoryThreadReadResult = ThreadReadResult;
+export type HistoryThreadUsageSummary = ThreadUsageSummary;
 
 export interface HistoryWorkspaceListResult {
   items: HistoryWorkspace[];
@@ -201,6 +208,8 @@ export interface HistoryAdapter {
   threadList(input: HistoryThreadListInput): Promise<HistoryThreadListResult>;
   threadSearch(input: HistoryThreadSearchInput): Promise<HistoryThreadListResult>;
   threadRead(input: HistoryThreadReadInput): Promise<HistoryThreadReadResult>;
+  /** 用量在旧注入式测试 adapter 中可缺席；生产 adapter 固定提供此只读能力。 */
+  threadUsageRead?: (input: HistoryThreadUsageReadInput) => Promise<HistoryThreadUsageSummary>;
   threadRename(input: HistoryThreadRenameInput): Promise<HistoryThread>;
   threadPreferencesUpdate(input: HistoryThreadPreferencesUpdateInput): Promise<HistoryThread>;
   threadPin(input: HistoryThreadPinInput): Promise<HistoryThread>;
@@ -321,6 +330,17 @@ export class TauriHistoryAdapter implements HistoryAdapter {
       input,
       ThreadReadInputSchema,
       ThreadReadResultSchema,
+    );
+  }
+
+  /** 读取完整账本时不加载 Timeline 页；原生边界会拒绝畸形或错配响应。 */
+  threadUsageRead(input: HistoryThreadUsageReadInput): Promise<HistoryThreadUsageSummary> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadUsageRead,
+      input,
+      ThreadUsageReadInputSchema,
+      ThreadUsageSummarySchema,
     );
   }
 

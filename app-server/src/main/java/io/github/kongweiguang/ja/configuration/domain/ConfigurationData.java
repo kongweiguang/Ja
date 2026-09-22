@@ -118,7 +118,7 @@ public interface ConfigurationData {
     /** 一次读取的不可变结果，不携带规范路径或任何 Secret。 */
     record ReadResult(boolean trusted, Layer user, Layer project, Document effective,
                       Map<String, CredentialStatus> credentials, String credentialVersion,
-                      List<String> diagnostics) {
+                      List<String> diagnostics, List<Issue> issues) {
         /** 冻结所有集合并校验必填值，避免消费者观察到并发修改。 */
         public ReadResult {
             Objects.requireNonNull(user, "user");
@@ -128,6 +128,35 @@ public interface ConfigurationData {
             credentials = Collections.unmodifiableMap(new LinkedHashMap<>(credentials));
             Objects.requireNonNull(credentialVersion, "credentialVersion");
             diagnostics = List.copyOf(diagnostics);
+            issues = List.copyOf(issues);
+        }
+
+        /**
+         * 保留内部测试夹具的旧构造入口，只为未携带问题投影的调用提供空列表；生产读取必须使用完整
+         * 构造器，避免在 transport 前悄然丢失用户可修复问题。
+         */
+        public ReadResult(boolean trusted, Layer user, Layer project, Document effective,
+                          Map<String, CredentialStatus> credentials, String credentialVersion,
+                          List<String> diagnostics) {
+            this(trusted, user, project, effective, credentials, credentialVersion, diagnostics, List.of());
+        }
+    }
+
+    /**
+     * 配置问题的脱敏、可定位投影；它把可用性降级解释交给界面，而不是把解析器异常或原文泄漏给
+     * WebView。字段、条目与位置均可为空，因为文件级 I/O 或 TOML 语法错误没有可靠的局部位置。
+     */
+    record Issue(String id, String scope, String field, String entityId, Integer line,
+                 Integer column, String reason, String impact, List<String> actions) {
+        /**
+         * 固定有限的问题元数据，避免存储路径、配置正文、凭据或异常消息作为诊断的一部分跨边界。
+         */
+        public Issue {
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(scope, "scope");
+            Objects.requireNonNull(reason, "reason");
+            Objects.requireNonNull(impact, "impact");
+            actions = List.copyOf(actions);
         }
     }
 

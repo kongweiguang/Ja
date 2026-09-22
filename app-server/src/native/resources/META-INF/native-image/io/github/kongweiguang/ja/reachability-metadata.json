@@ -34,6 +34,11 @@
     },
     {
       "type": {
+        "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.ProjectionMapper"]
+      }
+    },
+    {
+      "type": {
         "proxy": ["io.github.kongweiguang.ja.infrastructure.persistence.mapper.HistoryMapper"]
       }
     },

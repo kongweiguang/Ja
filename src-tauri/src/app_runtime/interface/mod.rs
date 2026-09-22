@@ -18,8 +18,8 @@ pub(crate) mod task;
 pub use configuration::*;
 pub use dto::{
     RuntimeRecoveryStateDto, RuntimeStatusDto, ToolArtifactReadInputDto, ToolArtifactReadResultDto,
-    TurnAcceptedDto, TurnCancelResultDto, TurnChangeSetReadInputDto, TurnChangeSetReadResultDto,
-    WorkspacePathSearchInputDto, WorkspacePathSearchResultDto,
+    ToolRecoveryResponseDto, TurnAcceptedDto, TurnCancelResultDto, TurnChangeSetReadInputDto,
+    TurnChangeSetReadResultDto, WorkspacePathSearchInputDto, WorkspacePathSearchResultDto,
 };
 pub use event_projection::RPC_FRAME_EVENT;
 pub use goal::*;

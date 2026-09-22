@@ -12,6 +12,7 @@ import type {
   SettingsPorts,
   SettingsSection,
   SettingsSnapshot,
+  SkillProjection,
 } from "@/features/settings";
 import { applyTheme } from "@/shared/styles/theme";
 import "@/shared/styles/tokens.css";
@@ -170,6 +171,65 @@ const EMPTY_SETTINGS_STYLE_SNAPSHOT: SettingsSnapshot = {
   mcpServers: [],
 };
 
+/**
+ * Skills 预览直接模拟 App Server 返回的两层投影，而非复用 effective 快照中的扁平列表；
+ * 这样长文本、缺失记录和项目作用域的布局验收不会掩盖真实配置边界。
+ */
+const SETTINGS_STYLE_SKILLS: {
+  global: SkillProjection[];
+  project: SkillProjection[];
+  projectAvailable: boolean;
+} = {
+  global: [
+    {
+      id: "user:release-checklist-with-a-very-long-name",
+      name: "release-checklist-with-a-very-long-name",
+      source: "user",
+      description: "验证发布前的构建、测试、产物和回滚条件，确保长描述在紧凑列表中仍可扫读。",
+      enabled: false,
+      status: "disabled",
+    },
+    {
+      id: "ja:ja-tools",
+      name: "ja-tools",
+      source: "ja",
+      description: "Ja 内置工具和桌面工作流能力。",
+      enabled: true,
+      status: "ready",
+    },
+    {
+      id: "user:removed-skill-record",
+      name: "removed-skill-record",
+      source: "user",
+      description: "",
+      enabled: true,
+      missing: true,
+      status: "error",
+      error: "文件已移除",
+    },
+  ],
+  project: [
+    {
+      id: "project:project-rules",
+      name: "project-rules",
+      source: "project",
+      description: "当前工作区的项目约束和团队规则。",
+      enabled: true,
+      status: "error",
+      error: "本次预览故意保留的恢复状态：规则加载失败，可重试。",
+    },
+    {
+      id: "ja:ja-tools",
+      name: "ja-tools",
+      source: "ja",
+      description: "Ja 内置工具和桌面工作流能力。",
+      enabled: true,
+      status: "ready",
+    },
+  ],
+  projectAvailable: true,
+};
+
 /** 返回不会触碰宿主或网络的设置动作，失败态由脚本通过真实页面反馈验证。 */
 function createPreviewPorts(): SettingsPorts {
   return {
@@ -265,6 +325,9 @@ function SettingsStylePreview(): React.ReactElement {
     <PreviewThemeBridge>
       <Settings
         snapshot={isEmptyState ? EMPTY_SETTINGS_STYLE_SNAPSHOT : SETTINGS_STYLE_SNAPSHOT}
+        skillSettings={
+          isEmptyState ? { global: [], projectAvailable: false } : SETTINGS_STYLE_SKILLS
+        }
         interfacePreferences={interfacePreferences}
         executionScope={{
           scopedDefault: "approval_required",

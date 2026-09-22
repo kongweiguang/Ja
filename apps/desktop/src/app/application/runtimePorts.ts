@@ -84,6 +84,25 @@ export interface TurnResumeInput {
   expectedThreadRevision: number;
 }
 
+/** 未知 Tool 只允许用户明确重试或跳过；双 revision 与幂等键防止旧详情和重复点击改变新状态。 */
+export interface ToolRecoveryResponseInput {
+  turnId: string;
+  callId: string;
+  expectedThreadRevision: number;
+  expectedRecoveryRevision: number;
+  decision: "retry" | "skip";
+  idempotencyKey: string;
+}
+
+/** 裁决 ACK 不声称 Tool 已成功，后续执行和最终状态仍必须等待权威事件。 */
+export interface ToolRecoveryResponse {
+  accepted: true;
+  turnId: string;
+  threadRevision: number;
+  decision: "retry" | "skip";
+  resumed: boolean;
+}
+
 export interface TurnCancelInput {
   turnId: string;
 }
@@ -302,6 +321,7 @@ export interface RuntimeHostPort {
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   turnResume(input: TurnResumeInput): Promise<TurnAccepted>;
+  turnRecoveryRespond(input: ToolRecoveryResponseInput): Promise<ToolRecoveryResponse>;
   turnCancel(input: TurnCancelInput): Promise<TurnCancelResult>;
   turnInputEnqueue(input: TurnInputEnqueue): Promise<InputQueueMutationResult>;
   turnInputPrioritize(input: TurnInputMutation): Promise<InputQueueMutationResult>;

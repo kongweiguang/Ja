@@ -158,6 +158,10 @@ final class AgentToolRunner implements AutoCloseable {
                         }
                     }
                     if (result == null) {
+                        /* 证据在 STARTED 事务之前准备但不越过工具副作用边界；不可准备时返回空，
+                         * 恢复会要求用户裁决，绝不为了自动恢复而阻断或猜测原调用。 */
+                        Optional<AgentTool.RecoveryEvidence> recoveryEvidence =
+                                tool.prepareRecoveryEvidence(call, toolExecution, execution.cancellation());
                         /* 可信内建 Tool 只改变 Ja 的控制面；跳过 Goal attempt，避免 request_user_input
                          * 抛出挂起信号时留下 STARTED 的伪执行记录。真正的 Plan/Goal 工作 Tool 仍走 ledger。 */
                         Optional<GoalToolExecutionPort.Attempt> goalAttempt = isTrustedInternal(tool)
@@ -167,10 +171,14 @@ final class AgentToolRunner implements AutoCloseable {
                                                 execution.command().turnId(), execution.command().origin(),
                                                 call.callId(), call.toolName(),
                                                 call.arguments(), sideEffect, clock.instant()));
+                        List<ConversationRepository.Fact> startedFacts = new ArrayList<>();
+                        recoveryEvidence.ifPresent(evidence -> startedFacts.add(
+                                new ConversationRepository.ToolRecoveryEvidenceFact(call.callId(), evidence)));
+                        startedFacts.add(new ConversationRepository.ToolStartedFact(call.callId()));
                         execution.writer().commit(TurnState.RUNNING,
                                 new TurnEvent.ToolStarted(execution.draftContext().get(),
                                         call.callId(), call.ordinal()),
-                                List.of(new ConversationRepository.ToolStartedFact(call.callId())),
+                                List.copyOf(startedFacts),
                                 execution.cursor().get());
                         if (tool.workspaceMutationMode() == AgentTool.WorkspaceMutationMode.UNOBSERVABLE) {
                             execution.command().changeTracker()

@@ -185,6 +185,7 @@ function conversation(
     retryAttachment: vi.fn(async () => undefined),
     removeAttachment: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
+    continueReply: vi.fn(async () => undefined),
     enqueue: vi.fn(async () => undefined),
     prioritizeQueuedInput: vi.fn(async () => undefined),
     updateQueuedInput: vi.fn(async () => undefined),
@@ -193,6 +194,7 @@ function conversation(
     cancel: vi.fn(async () => undefined),
     approve: vi.fn(async () => undefined),
     ...overrides,
+    continuationAvailable: overrides.continuationAvailable ?? false,
   };
 }
 
@@ -907,8 +909,9 @@ describe("Task product panels", () => {
     expect(
       screen.getByRole("button", { name: /读取，read_file，contracts\/task\.json，失败/u }),
     ).toBeVisible();
-    expect(screen.getByText("已生成安全收口结果")).toBeVisible();
-    expect(screen.getByText("INTERNAL_ERROR")).toBeVisible();
+    expect(screen.getByText("本次回复未能完成。")).toBeVisible();
+    expect(screen.queryByText("已生成安全收口结果")).not.toBeInTheDocument();
+    expect(screen.queryByText("INTERNAL_ERROR")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "批准" }));
     await waitFor(() => expect(approvalRespond).toHaveBeenCalledOnce());
   });

@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.TurnMcpSessionF
 import io.github.kongweiguang.ja.catalog.adapter.out.skills.JaSkillSources;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.BuiltInTools;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.PlanReadOnlyToolCatalog;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
@@ -641,8 +642,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             Path workspaceRoot, ConfigurationGenerationPort.Lease lease) {
         SkillCatalog.DiscoveryRequest request = new SkillCatalog.DiscoveryRequest(
                 workspaceRoot, agentsSkillRoot, jaSkillRoot, lease.snapshot().trusted());
-        List<ConfigurationGenerationSnapshot.Skill> enabled = lease.snapshot().skillDefinitions().stream()
-                .filter(ConfigurationGenerationSnapshot.Skill::enabled).toList();
+        List<ConfigurationGenerationSnapshot.Skill> enabled = lease.snapshot().skillDefinitions();
         if (enabled.isEmpty()) {
             // 未授权任何 Skill 时不扫描无关目录；严格格式错误只能阻断真正选择了 Skill 的 Turn。
             return new SkillResolution(skills.emptyCatalog(), Map.of());
@@ -654,35 +654,18 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     }
 
     /**
-     * 计算当前 Turn 可用的 Skill 名称，并只对非项目来源执行完整性校验；返回顺序沿用发现目录，
-     * 这样同名覆盖仍由 SkillCatalog 的来源优先级决定，而不是由配置数组顺序决定。
+     * 计算当前 Turn 可用的 Skill 名称，只有胜出发现来源与显式授权引用一致时才可用。
+     * 缺失记录是设置页可移除的历史事实，不能阻断未依赖它的 Turn。
      */
     static List<String> availableSkillNames(
             List<ConfigurationGenerationSnapshot.Skill> enabled,
             SkillCatalog.Catalog discovered) {
         Objects.requireNonNull(enabled, "enabled");
         Objects.requireNonNull(discovered, "discovered");
-        Set<String> allowedNames = new HashSet<>();
-        Set<String> missingRequired = new HashSet<>();
-        for (ConfigurationGenerationSnapshot.Skill skill : enabled) {
-            Objects.requireNonNull(skill, "enabled skill");
-            allowedNames.add(skill.name());
-        }
-        Set<String> discoveredNames = discovered.skills().stream()
-                .map(SkillCatalog.SkillDescriptor::name)
-                .collect(java.util.stream.Collectors.toUnmodifiableSet());
-        for (ConfigurationGenerationSnapshot.Skill skill : enabled) {
-            if (!discoveredNames.contains(skill.name()) && !"project".equals(skill.scope())) {
-                missingRequired.add(skill.name());
-            }
-        }
-        if (!missingRequired.isEmpty()) {
-            throw new TurnRuntimeResolver.RuntimeMismatchException(
-                    "configured Turn Skill is unavailable");
-        }
         return discovered.skills().stream()
+                .filter(discoveredSkill -> enabled.stream()
+                        .anyMatch(configured -> matches(configured.reference(), discoveredSkill)))
                 .map(SkillCatalog.SkillDescriptor::name)
-                .filter(allowedNames::contains)
                 .toList();
     }
 
@@ -693,15 +676,27 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     static Map<String, String> skillNamesById(
             List<ConfigurationGenerationSnapshot.Skill> definitions,
             SkillCatalog.Catalog discovered) {
-        Set<String> discoveredNames = discovered.skills().stream()
-                .map(SkillCatalog.SkillDescriptor::name)
-                .collect(java.util.stream.Collectors.toUnmodifiableSet());
         Map<String, String> identities = new java.util.LinkedHashMap<>();
         definitions.stream()
-                .filter(ConfigurationGenerationSnapshot.Skill::enabled)
-                .filter(skill -> discoveredNames.contains(skill.name()))
-                .forEach(skill -> identities.put(skill.skillId(), skill.name()));
+                .forEach(skill -> discovered.skills().stream()
+                        .filter(discoveredSkill -> matches(skill.reference(), discoveredSkill))
+                        .findFirst()
+                        .ifPresent(discoveredSkill -> identities.put(
+                                skill.reference().identifier(), discoveredSkill.name())));
         return java.util.Collections.unmodifiableMap(identities);
+    }
+
+    /**
+     * 将配置来源映射回发现来源；名称相同不足以授权，防止项目包覆盖后借用用户级许可。
+     */
+    private static boolean matches(
+            SkillReference configured, SkillCatalog.SkillDescriptor discovered) {
+        return configured.name().equals(discovered.name())
+                && switch (configured.source()) {
+                    case USER -> discovered.source() == SkillCatalog.Source.AGENTS_USER;
+                    case JA -> discovered.source() == SkillCatalog.Source.JA_USER;
+                    case PROJECT -> discovered.source() == SkillCatalog.Source.WORKSPACE;
+                };
     }
 
     /** 同步携带筛选后的目录与配置身份表，防止两个 Prompt 输入来自不同发现结果。 */

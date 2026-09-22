@@ -66,7 +66,8 @@
 }
 
 .ja-workspace-scope-status.is-ready {
-  background: var(--ja-success);
+  /* 当前项目的正常标记首先表达选中态，必须跟随 Palette；异常状态仍保留语义色。 */
+  background: var(--ja-accent);
 }
 
 .ja-workspace-scope-status.is-busy,

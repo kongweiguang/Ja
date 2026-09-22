@@ -49,6 +49,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.transport.rpc.runtime.RpcRuntimeTestAccess.markReady;
@@ -221,7 +222,7 @@ final class RpcApprovalTransportTest {
 
             ObjectNode params = mapper.createObjectNode().put("threadId", "thr_start");
             var content = params.putArray("content");
-            content.addObject().put("type", "skill_reference").put("skillId", "skill_composer_context");
+            content.addObject().put("type", "skill_reference").put("skillId", "user:composer-context");
             content.addObject().put("type", "workspace_reference").put("workspaceId", "ws_start")
                     .put("relativePath", "sample.ts").put("kind", "file");
             content.addObject().put("type", "workspace_reference").put("workspaceId", "ws_start")
@@ -246,7 +247,7 @@ final class RpcApprovalTransportTest {
                     .toCompletableFuture().get(2, TimeUnit.SECONDS);
 
             TurnStartRequest request = ((CapturingTurns) services.turns).request.get();
-            assertEquals(List.of("skill_composer_context"), request.content().skillIds());
+            assertEquals(List.of("user:composer-context"), request.content().skillIds());
             assertEquals(List.of("sample.ts", "folder-fixture"), request.content().workspaceReferences()
                     .stream().map(reference -> reference.relativePath()).toList());
             assertEquals("Composer 上下文首轮验收", request.input());
@@ -370,6 +371,89 @@ final class RpcApprovalTransportTest {
         }
     }
 
+    /**
+     * 提交最后一项未知 Tool 的裁决后，transport 必须使用提交所得的新 revision 立即复用唯一
+     * turn/resume 入口；React 只接收最终事件，不能自行猜测何时应重新启动 Turn。
+     */
+    @Test
+    void toolRecoveryDecisionResumesAfterLastPendingItem() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        CapturingTurns turns = new CapturingTurns();
+        StartServices services = new StartServices(
+                new StartThreads(recoveryThread(8), 8), turns);
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_resume")
+                    .put("callId", "call_recovery").put("expectedThreadRevision", 7)
+                    .put("expectedRecoveryRevision", 1).put("decision", "skip")
+                    .put("idempotencyKey", "recovery-skip-once");
+
+            ObjectNode response = new TurnApprovalHandler(current)
+                    .handle(new RpcCommand(RpcMethod.TURN_RECOVERY_RESPOND, params))
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            assertEquals("turn_resume", turns.recoveryRequest.get().turnId());
+            assertEquals(TurnUseCase.ToolRecoveryDisposition.SKIP, turns.recoveryRequest.get().disposition());
+            assertEquals("turn_resume", turns.resumedTurn.get());
+            assertEquals(8, turns.resumedRevision.get());
+            assertTrue(response.path("accepted").booleanValue());
+            assertTrue(response.path("resumed").booleanValue());
+            assertEquals(8, response.path("threadRevision").longValue());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
+    /**
+     * 多项未知 Tool 必须按原顺序逐项处理：当前裁决已经提交时，下一项仍未知只保留 suspended 状态，
+     * 不能把正常等待伪装成失败或要求用户再点击一次全局“继续运行”。
+     */
+    @Test
+    void toolRecoveryDecisionWaitsWhenAnotherItemRemainsUnknown() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        CapturingTurns turns = new CapturingTurns(true);
+        StartServices services = new StartServices(
+                new StartThreads(recoveryThread(8), 8), turns);
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
+        RpcSession session = null;
+        try {
+            RpcSession current = new RpcSession(
+                    testConfiguration(), mapper, CLOCK, writer,
+                    ignored -> services.bindings(), TestConfigurationPorts.unavailable());
+            session = current;
+            current.initialize();
+            markReady(current, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_resume")
+                    .put("callId", "call_first_recovery").put("expectedThreadRevision", 7)
+                    .put("expectedRecoveryRevision", 1).put("decision", "retry")
+                    .put("idempotencyKey", "recovery-retry-once");
+
+            ObjectNode response = new TurnApprovalHandler(current)
+                    .handle(new RpcCommand(RpcMethod.TURN_RECOVERY_RESPOND, params))
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            assertEquals(TurnUseCase.ToolRecoveryDisposition.RETRY, turns.recoveryRequest.get().disposition());
+            assertEquals("turn_resume", turns.resumedTurn.get());
+            assertEquals(8, turns.resumedRevision.get());
+            assertTrue(response.path("accepted").booleanValue());
+            assertFalse(response.path("resumed").booleanValue());
+            assertEquals(8, response.path("threadRevision").longValue());
+        } finally {
+            if (session != null) session.close();
+            writer.close();
+        }
+    }
+
     /** Java transport 必须接受合同上限 101 的 Turn ID，并在调用应用端口前拒绝 102 字符。 */
     @Test
     void turnCancelEnforcesCanonicalTurnIdLengthBoundary() throws Exception {
@@ -412,6 +496,13 @@ final class RpcApprovalTransportTest {
     /** 创建由审批请求与解决事实共享的不可变 revision 上下文。 */
     private static TurnEvent.Context context(String eventId, long revision) {
         return new TurnEvent.Context(eventId, "thr_test", "turn_test", revision, NOW);
+    }
+
+    /** 构造已提交恢复裁决后的同一 Thread 快照，确保 resume 预检读取的是新 revision。 */
+    private static ThreadSummary recoveryThread(long revision) {
+        return new ThreadSummary("thr_start", "ws_start", "启动测试",
+                preferences("provider_start", "model_start"), ThreadSummary.Status.ACTIVE,
+                false, null, true, null, revision, NOW.minusSeconds(60), NOW);
     }
 
     /** 仅提供 approval/respond 使用的应用投影，其余端口均以显式失败关闭。 */
@@ -583,6 +674,18 @@ final class RpcApprovalTransportTest {
         private final AtomicReference<TurnStartRequest> request = new AtomicReference<>();
         private final AtomicReference<String> resumedTurn = new AtomicReference<>();
         private final AtomicReference<Long> resumedRevision = new AtomicReference<>();
+        private final AtomicReference<ToolRecoveryRequest> recoveryRequest = new AtomicReference<>();
+        private final boolean recoveryRemainsPending;
+
+        /** 默认夹具模拟全部未知项已经处理完毕；专用分支才返回下一项仍待裁决。 */
+        private CapturingTurns() {
+            this(false);
+        }
+
+        /** 明确区分 handler 尝试续跑和真正接纳成功，避免测试把多项未知误判成失败。 */
+        private CapturingTurns(boolean recoveryRemainsPending) {
+            this.recoveryRemainsPending = recoveryRemainsPending;
+        }
 
         /** 保存唯一启动请求；未完成 Future 使测试专注准入边界而非执行生命周期。 */
         @Override
@@ -597,8 +700,19 @@ final class RpcApprovalTransportTest {
         public Accepted resume(String turnId, long expectedThreadRevision, TurnEventSink sink) {
             if (!resumedTurn.compareAndSet(null, turnId)) throw unsupported();
             resumedRevision.set(expectedThreadRevision);
+            if (recoveryRemainsPending) {
+                throw TurnResumeException.of(ResumeFailure.RECOVERY_REQUIRED);
+            }
             return new Accepted("thr_start", turnId, expectedThreadRevision + 1,
                     true, new CompletableFuture<>());
+        }
+
+        /** 返回与持久裁决匹配的新 revision；handler 是否继续 resume 由 changed 事实而非 UI 决定。 */
+        @Override
+        public ToolRecoveryResponse respondToolRecovery(ToolRecoveryRequest request) {
+            if (!recoveryRequest.compareAndSet(null, request)) throw unsupported();
+            return new ToolRecoveryResponse("thr_start", request.turnId(),
+                    request.expectedThreadRevision() + 1, request.disposition(), true);
         }
 
         /** 未声明取消能力。 */

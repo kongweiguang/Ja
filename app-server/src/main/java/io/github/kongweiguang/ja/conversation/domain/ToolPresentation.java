@@ -25,7 +25,8 @@ public record ToolPresentation(
         Integer exitCode,
         Long durationMs,
         boolean truncated,
-        String artifactId) {
+        String artifactId,
+        Recovery recovery) {
     private static final int MAX_PREVIEW = 32_768;
     private static final int MAX_SUMMARY = 1_024;
 
@@ -52,6 +53,18 @@ public record ToolPresentation(
         if (artifactId != null) identifier(artifactId, "artifact_", "artifactId");
     }
 
+    /**
+     * 兼容既有展示构造面；恢复动作是可选附属事实，普通历史和实时 Tool 不能因为没有该字段被误判为
+     * 待用户处理。
+     */
+    public ToolPresentation(Kind kind, String title, Status status, String inputPreview,
+                            String outputPreview, String summary, List<InteractionAnswerView> interactionAnswers,
+                            List<String> relativePaths, String command, String relativeCwd, String stdout,
+                            String stderr, Integer exitCode, Long durationMs, boolean truncated, String artifactId) {
+        this(kind, title, status, inputPreview, outputPreview, summary, interactionAnswers, relativePaths,
+                command, relativeCwd, stdout, stderr, exitCode, durationMs, truncated, artifactId, null);
+    }
+
     /** 普通 Tool 不携带问答展示事实；保留紧凑构造入口，避免每个投影器重复传入空集合。 */
     public ToolPresentation(Kind kind, String title, Status status, String inputPreview,
                             String outputPreview, String summary, List<String> relativePaths,
@@ -59,6 +72,17 @@ public record ToolPresentation(
                             Integer exitCode, Long durationMs, boolean truncated, String artifactId) {
         this(kind, title, status, inputPreview, outputPreview, summary, List.of(), relativePaths,
                 command, relativeCwd, stdout, stderr, exitCode, durationMs, truncated, artifactId);
+    }
+
+    /**
+     * 仅当崩溃后无法可靠取得 Tool 回执时才投影该动作。callId 仍由外层 Timeline item 持有，避免在
+     * presentation JSON 重复身份；revision 是 UI 提交裁决的 CAS，而不是展示用数据库细节。
+     */
+    public record Recovery(long revision) {
+        /** 恢复动作只对待裁决项开放，已核实、重试或跳过均通过普通结果摘要表达。 */
+        public Recovery {
+            if (revision < 1) throw new IllegalArgumentException("invalid recovery revision");
+        }
     }
 
     /**

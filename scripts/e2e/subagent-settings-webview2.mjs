@@ -263,7 +263,7 @@ async function startProvider() {
 /** 以生产 config.toml schema 写入两个同 Provider 模型，供设置选择器真实投影。 */
 async function writeSettings(directories, provider) {
   const toml = [
-    "schema_version = 1",
+    "schema_version = 2",
     "config_revision = 1",
     'default_access_mode = "full_access"',
     'default_provider_id = "provider_subagent_e2e"',

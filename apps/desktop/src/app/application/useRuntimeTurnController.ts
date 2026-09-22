@@ -11,6 +11,8 @@ import {
   type RuntimeProjectionPort,
   type RuntimeRecoveryState,
   type RuntimeStatus,
+  type ToolRecoveryResponse,
+  type ToolRecoveryResponseInput,
   type TurnAccepted,
   type TurnCancelInput,
   type TurnCancelResult,
@@ -32,6 +34,7 @@ export interface RuntimePendingOperation<T> {
 export interface RuntimeTurnController {
   readonly submitTurn: (input: RuntimeTurnSubmissionInput) => Promise<TurnAccepted>;
   readonly resumeTurn: (input: TurnResumeInput) => Promise<TurnAccepted>;
+  readonly respondToolRecovery: (input: ToolRecoveryResponseInput) => Promise<ToolRecoveryResponse>;
   readonly cancelTurn: (input: TurnCancelInput) => Promise<TurnCancelResult>;
   readonly enqueueTurnInput: (input: TurnInputEnqueue) => Promise<InputQueueMutationResult>;
   readonly prioritizeTurnInput: (input: TurnInputMutation) => Promise<InputQueueMutationResult>;
@@ -269,6 +272,43 @@ export function useRuntimeTurnController({
     [bootRef, enqueueOperation, lifecycleEpochRef, recoveryRef, runtime, runtimeStateRef],
   );
 
+  /**
+   * 恢复裁决沿用唯一串行 lane 与 generation fence；同一 Thread/call/revision/选择共享 key，
+   * 让双击或虚拟列表重挂载只形成一次持久请求，最终 Timeline 始终等待 Java 事件收敛。
+   */
+  const respondToolRecovery = useCallback(
+    (input: ToolRecoveryResponseInput): Promise<ToolRecoveryResponse> => {
+      const lifecycleEpoch = lifecycleEpochRef.current;
+      if (
+        recoveryRef.current?.required === true ||
+        bootRef.current.status === "recovery_required"
+      ) {
+        return Promise.reject(
+          new RuntimeHostError("RECOVERY_REQUIRED", "需要先完成运行时恢复", false),
+        );
+      }
+      const expectedGeneration = runtimeStateRef.current?.generation;
+      const pending = enqueueOperation(
+        `turnRecovery:${input.turnId}:${input.callId}:${input.expectedThreadRevision}:${input.expectedRecoveryRevision}:${input.decision}`,
+        () => {
+          const currentGeneration = runtimeStateRef.current?.generation;
+          if (
+            expectedGeneration === undefined ||
+            currentGeneration !== expectedGeneration ||
+            lifecycleEpochRef.current !== lifecycleEpoch
+          ) {
+            throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+          }
+          return runtime.turnRecoveryRespond(input);
+        },
+      );
+      return pending.promise.catch((error: unknown) => {
+        throw normalizeRuntimeError(error);
+      });
+    },
+    [bootRef, enqueueOperation, lifecycleEpochRef, recoveryRef, runtime, runtimeStateRef],
+  );
+
   /** 每个调用使用唯一 operation key；连续相同文本也必须成为不同持久队列条目。 */
   const mutateTurnInput = useCallback(
     <T extends TurnInputEnqueue | TurnInputMutation | TurnInputUpdate>(
@@ -390,6 +430,7 @@ export function useRuntimeTurnController({
   return {
     submitTurn,
     resumeTurn,
+    respondToolRecovery,
     cancelTurn,
     enqueueTurnInput,
     prioritizeTurnInput,

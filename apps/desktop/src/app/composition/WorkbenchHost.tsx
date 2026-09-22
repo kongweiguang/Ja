@@ -46,6 +46,7 @@ import {
   type ConversationAttachmentPort,
   type ConversationPlanCreationPort,
   type ConversationTurnPort,
+  type ConversationUsageReader,
   type InteractionPort,
 } from "@/features/conversation";
 import type {
@@ -215,6 +216,8 @@ export interface WorkbenchHostProps {
   readonly taskThreadRenamePort: TaskThreadRenamePort;
   readonly taskAttachmentPort?: ConversationAttachmentPort;
   readonly taskArtifactPort?: ConversationArtifactPort;
+  /** 侧聊沿用主会话的窄账本读取端口，但 Thread identity 只由子会话 Composer 提供。 */
+  readonly taskUsageReader?: ConversationUsageReader;
   readonly taskComposerSkills?: readonly TaskComposerSkillSuggestion[];
   /** 共享 child Composer 的真实模型目录与父 Thread 一次性默认值。 */
   readonly taskModels?: readonly ConversationModelOption[];
@@ -297,6 +300,7 @@ export function WorkbenchHost({
   taskThreadRenamePort,
   taskAttachmentPort,
   taskArtifactPort,
+  taskUsageReader,
   taskComposerSkills,
   taskModels = [],
   taskParentPreferences,
@@ -469,6 +473,7 @@ export function WorkbenchHost({
         return followupTurn(task, input.content as TaskContentBlock[], task.taskThreadId);
       },
       resumeTurn: runtimeTurns.resumeTurn,
+      respondToolRecovery: runtimeTurns.respondToolRecovery,
       cancelTurn: runtimeTurns.cancelTurn,
       enqueueTurnInput: runtimeTurns.enqueueTurnInput,
       prioritizeTurnInput: runtimeTurns.prioritizeTurnInput,
@@ -714,6 +719,7 @@ export function WorkbenchHost({
     () => ({
       workspaceId: workspace.workspaceId,
       runtimeGeneration: generation,
+      usageReader: taskUsageReader,
       nativeDropEvent: childNativeDrop.event,
       dropZoneRef: childNativeDrop.registerDropZone,
       skills: taskComposerSkills,
@@ -767,6 +773,7 @@ export function WorkbenchHost({
       searchTaskWorkspacePaths,
       taskAttachmentPort,
       taskComposerSkills,
+      taskUsageReader,
       taskDefaultPreferences,
       onOpenWorkspaceReference,
       childSlashCommands,
@@ -787,6 +794,13 @@ export function WorkbenchHost({
           ? undefined
           : (input) =>
               taskArtifactPort.readToolArtifact({ workspaceId: workspace.workspaceId, ...input }),
+      /** 侧边会话复用主 Runtime controller，但必须先核对点击目标仍属于当前 Task Thread。 */
+      onResolveToolRecovery: (input) => {
+        const task = childTaskRef.current;
+        if (task === undefined || input.threadId !== task.taskThreadId)
+          return Promise.reject(new Error("side task recovery target changed"));
+        return runtimeTurns.respondToolRecovery(input);
+      },
       onOpenAttachmentPreview:
         onOpenAttachmentPreview === undefined
           ? undefined
@@ -805,6 +819,7 @@ export function WorkbenchHost({
       onCopyText,
       onOpenAttachmentPreview,
       onOpenExternalUrl,
+      runtimeTurns,
       taskArtifactPort,
       workspace.workspaceId,
     ],

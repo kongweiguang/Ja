@@ -8,7 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/app/App";
 import type { SettingsAdapter } from "@/features/settings";
 import type { LoadedSettings, SettingsDocument } from "@/api/tauri/settings";
-import type { HistoryAdapter } from "@/api/tauri/history";
+import type {
+  HistoryAdapter,
+  HistoryThreadUsageReadInput,
+  HistoryThreadUsageSummary,
+} from "@/api/tauri/history";
 import { DEFAULT_WORKBENCH_ADAPTERS } from "@/app/composition/defaultAdapters";
 import {
   WORKBENCH_SIZE_DEFAULT,
@@ -23,7 +27,7 @@ import {
 } from "@/app/application/runtimePorts";
 
 const emptyDocument: SettingsDocument = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   revision: 0,
   theme: "system",
   defaultAccessMode: "full_access",
@@ -136,6 +140,14 @@ function runtime(
       queued: true,
       threadRevision: input.expectedThreadRevision + 1,
     })),
+    // 恢复裁决 mock 只回显 caller 已绑定的 Turn/选择，避免测试替身虚构 Tool 执行事实。
+    turnRecoveryRespond: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: input.turnId,
+      threadRevision: input.expectedThreadRevision + 1,
+      decision: input.decision,
+      resumed: false,
+    })),
     turnCancel: vi.fn(async (input) => ({
       accepted: true as const,
       turnId: input.turnId,
@@ -198,7 +210,7 @@ function runtimeWithEvents(): {
 /** 返回指定 UI 文档的脱敏 Settings adapter，避免 Shell 测试绕过真实配置门禁。 */
 function settings(
   document: SettingsDocument = emptyDocument,
-  recovery?: LoadedSettings["recovery"],
+  issues: LoadedSettings["issues"] = [],
 ): SettingsAdapter {
   const loaded: LoadedSettings = {
     document,
@@ -206,7 +218,7 @@ function settings(
     projectOverrides: {
       defaultSelection: false,
       accessMode: false,
-      disabledSkillIds: [],
+      disabledSkillReferences: [],
       disabledMcpIds: [],
     },
     cas: {
@@ -214,13 +226,15 @@ function settings(
       projectVersion: "cfg_project_1",
       credentialVersion: "cfg_credential_1",
     },
-    ...(recovery === undefined ? {} : { recovery }),
+    issues,
   };
   return {
     snapshot: vi.fn(async () => loaded),
     save: vi.fn(async () => "cfg_user_2"),
+    saveProjectSkills: vi.fn(async () => "cfg_project_2"),
     patch: vi.fn(async () => ({ version: "cfg_project_2" })),
     reset: vi.fn(async () => ({ version: "cfg_project_2" })),
+    restoreLastKnownGood: vi.fn(async () => "cfg_user_2"),
     setCredential: vi.fn(async () => "cfg_credential_2"),
     deleteCredential: vi.fn(async () => "cfg_credential_2"),
     revealProviderCredential: vi.fn(async () => null),
@@ -352,11 +366,23 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   });
 
   /** 用户配置语义损坏时仍可进入实际设置页，不能退回不可操作的读取错误屏。 */
-  it("keeps settings usable when the adapter enters configuration recovery mode", async () => {
+  it("keeps settings usable when a configuration issue uses the last known good snapshot", async () => {
     render(
       <App
         runtime={runtime()}
-        settingsAdapter={settings(emptyDocument, "user_config_corrupt")}
+        settingsAdapter={settings(emptyDocument, [
+          {
+            id: "cfg_last_known_good",
+            scope: "user",
+            field: null,
+            entityId: null,
+            line: null,
+            column: null,
+            reason: "LAST_KNOWN_GOOD_IN_USE",
+            impact: "snapshot_in_use",
+            actions: ["edit", "restore"],
+          },
+        ])}
         historyAdapter={history()}
         projectPicker={{ pick: vi.fn(async () => null) }}
       />,
@@ -365,9 +391,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     await waitFor(() =>
       expect(screen.getByRole("region", { name: "设置页面" })).toBeInTheDocument(),
     );
-    await waitFor(() =>
-      expect(screen.getByRole("status", { name: "配置恢复模式" })).toBeInTheDocument(),
-    );
+    expect(screen.getByText("配置有一处格式问题，正在使用上次可用设置。")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "设置暂时不可用" })).not.toBeInTheDocument();
   });
 
@@ -451,6 +475,68 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     const input = await screen.findByRole("textbox", { name: "消息" });
     fireEvent.change(input, { target: { value: "/" } });
     expect(screen.queryByRole("group", { name: "添加" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * 用量读取器只拿到 History 的窄能力，但不能丢失 class adapter 的 `this`；生产实现通过
+   * `this.bridge` 发起 typed IPC，本回归用同样的 receiver 约束阻止组合层解构方法后裸调用。
+   */
+  it("binds the History usage reader before handing it to the Composer", async () => {
+    const user = userEvent.setup();
+    const historyAdapter = history();
+    const usage: HistoryThreadUsageSummary = {
+      threadId: "thr_fixture",
+      snapshotRevision: 1,
+      requestCount: 1,
+      measuredRequestCount: 1,
+      newInputRequestCount: 1,
+      newInputTokens: 20,
+      outputRequestCount: 1,
+      outputTokens: 12,
+      totalRequestCount: 1,
+      totalTokens: 32,
+      cacheReadRequestCount: 1,
+      cacheReadTokens: 0,
+      cacheWriteRequestCount: 1,
+      cacheWriteTokens: 0,
+      cacheCompleteRequestCount: 1,
+      cacheCompleteInputTokens: 20,
+      cacheCompleteReadTokens: 0,
+    };
+    let receivedThis: unknown;
+    const readUsage = vi.fn(function (this: HistoryAdapter, input: HistoryThreadUsageReadInput) {
+      receivedThis = this;
+      return Promise.resolve({ ...usage, threadId: input.threadId });
+    });
+    historyAdapter.threadUsageRead = readUsage;
+    historyAdapter.threadList = vi.fn(async () => ({
+      items: [
+        {
+          ...threadFixture(),
+          preferences: {
+            ...threadFixture().preferences,
+            providerId: "provider_openai",
+            modelId: "model_gpt",
+            reasoningLevel: "high" as const,
+          },
+        },
+      ],
+      nextCursor: null,
+    }));
+    render(
+      <App
+        runtime={runtime()}
+        settingsAdapter={settings(configuredDocument)}
+        historyAdapter={historyAdapter}
+        projectPicker={{ pick: vi.fn(async () => null) }}
+      />,
+    );
+
+    const trigger = await screen.findByRole("button", { name: "上下文用量详情" });
+    await user.click(trigger);
+    await waitFor(() => expect(readUsage).toHaveBeenCalledWith({ threadId: "thr_fixture" }));
+    expect(receivedThis).toBe(historyAdapter);
+    expect(await screen.findByText("Token · 本会话")).toBeVisible();
   });
 
   /** Runtime 明确声明 Goal/Plan capability 后，Slash 面板才公开对应的真实操作入口。 */

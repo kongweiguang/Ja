@@ -9,8 +9,10 @@ import {
   ConfigMcpServerSchema,
   ConfigModelIdSchema,
   ConfigModelSchema,
+  ConfigProjectSkillDocumentSchema,
   ConfigProviderIdSchema,
   ConfigProviderSchema,
+  ConfigSkillReferenceSchema,
 } from "@/api/protocol/configDocument";
 import { invokeNativeCommand } from "./nativeInvoke";
 
@@ -20,6 +22,7 @@ export const JA_SETTINGS_COMMANDS = {
   patch: "ja_configuration_patch",
   replace: "ja_configuration_replace",
   reset: "ja_configuration_reset",
+  restore: "ja_configuration_restore",
   setCredential: "ja_credential_set",
   deleteCredential: "ja_credential_delete",
   revealProviderCredential: "ja_credential_reveal_provider",
@@ -56,6 +59,19 @@ const ConfigCasSchema = z
     credentialVersion: ConfigVersionSchema,
   })
   .strict();
+const ConfigIssueSchema = z
+  .object({
+    id: z.string().regex(/^cfg_[A-Za-z0-9_-]{1,64}$/),
+    scope: z.enum(["user", "project", "credential"]),
+    field: z.string().min(1).max(128).nullable(),
+    entityId: z.string().min(1).max(128).nullable(),
+    line: z.number().int().min(1).nullable(),
+    column: z.number().int().min(1).nullable(),
+    reason: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/),
+    impact: z.string().regex(/^[a-z_]{1,64}$/),
+    actions: z.array(z.enum(["edit", "retry", "restore"])).max(3),
+  })
+  .strict();
 const ConfigReadResultSchema = z
   .object({
     workspaceId: WorkspaceIdSchema.nullable(),
@@ -66,6 +82,7 @@ const ConfigReadResultSchema = z
     credentials: z.record(CredentialRefSchema, z.object({ configured: z.boolean() }).strict()),
     cas: ConfigCasSchema,
     diagnostics: z.array(z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/)).max(32),
+    issues: z.array(ConfigIssueSchema).max(64),
   })
   .strict();
 const ConfigWriteResultSchema = z
@@ -87,12 +104,13 @@ const ConfigPatchInputSchema = z.discriminatedUnion("scope", [
 ]);
 const ConfigReplaceInputSchema = z.discriminatedUnion("scope", [
   z.object({ ...userConfigTarget, document: ConfigDocumentSchema }).strict(),
-  z.object({ ...projectConfigTarget, document: ConfigDocumentSchema }).strict(),
+  z.object({ ...projectConfigTarget, document: ConfigProjectSkillDocumentSchema }).strict(),
 ]);
 const ConfigResetInputSchema = z.discriminatedUnion("scope", [
   z.object(userConfigTarget).strict(),
   z.object(projectConfigTarget).strict(),
 ]);
+const ConfigRestoreInputSchema = z.object({ expectedVersion: ConfigVersionSchema }).strict();
 
 const UiReasoningLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const UiReasoningLevelMapSchema = z
@@ -171,15 +189,6 @@ const UiMcpSchema = z
     enabled: z.boolean(),
   })
   .strict();
-const UiSkillSchema = z
-  .object({
-    skillId: z.string().regex(/^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/),
-    name: z.string(),
-    scope: z.enum(["builtin", "user", "ja", "project"]),
-    enabled: z.boolean(),
-    description: z.string(),
-  })
-  .strict();
 const WindowSettingsSchema = z
   .object({
     width: z.number().int().min(640).max(16_384),
@@ -191,7 +200,7 @@ const WindowSettingsSchema = z
 /** Renderer 聚合不含 Secret；credentialConfigured 只是 native read 的脱敏状态。 */
 const SettingsDocumentSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     theme: z.enum(["system", "light", "dark"]),
     defaultAccessMode: z.enum(["approval_required", "full_access"]),
@@ -214,7 +223,11 @@ const SettingsDocumentSchema = z
       .strict(),
     providers: z.array(UiProviderSchema).max(MAX_ENTRIES),
     mcpServers: z.array(UiMcpSchema).max(MAX_ENTRIES),
-    skills: z.array(UiSkillSchema),
+    skills: z
+      .array(ConfigSkillReferenceSchema)
+      .refine((skills) =>
+        skills.every((skill) => skill.startsWith("user:") || skill.startsWith("ja:")),
+      ),
     window: WindowSettingsSchema,
   })
   .strict();
@@ -239,58 +252,89 @@ const CredentialRevealProviderResultSchema = z
 export type SettingsDocument = z.infer<typeof SettingsDocumentSchema>;
 type SettingsProvider = z.infer<typeof UiProviderSchema>;
 type SettingsMcpServer = z.infer<typeof UiMcpSchema>;
+export interface ProjectSkillSettingsDocument {
+  schemaVersion: 2;
+  revision: number;
+  skills: string[];
+  disabledSkills: string[];
+}
 export type ConfigReadInput = z.infer<typeof ConfigReadInputSchema>;
 export type ConfigReadResult = z.infer<typeof ConfigReadResultSchema>;
 /**
  * 仅表示用户配置可读取但不满足当前严格语义；它允许设置页提供恢复入口，不能用于放宽
  * 原生执行时的 Provider、凭据或文件安全校验。
  */
-export type SettingsRecovery = "user_config_corrupt";
 export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
+  projectSkillDocument?: ProjectSkillSettingsDocument;
   projectOverrides: {
     defaultSelection: boolean;
     accessMode: boolean;
-    disabledSkillIds: string[];
+    disabledSkillReferences: string[];
     disabledMcpIds: string[];
   };
   cas: ConfigReadResult["cas"];
-  /** 原始文档未被读取流程改写；下一次完整有效保存会在原 CAS 版本上显式恢复。 */
-  recovery?: SettingsRecovery;
+  /** App Server 返回的脱敏问题只用于就地引导，不能作为任何写入配置的基线。 */
+  issues: ConfigReadResult["issues"];
 }
 
 /**
- * 从已脱敏的项目稀疏文档提取覆盖身份；Renderer 只需要恢复语义，不应长期持有任意
- * project document 或通过 effective 值猜测字段是否存在。
+ * 从已脱敏的项目稀疏文档提取覆盖身份；失配形状不会被当成可写基线。
  */
 function projectOverrides(layer: ConfigReadResult["project"]): LoadedSettings["projectOverrides"] {
   const document =
     layer.present && layer.trusted && layer.status === "valid" && layer.document !== null
       ? layer.document
       : {};
-  const disabledIds = (key: "skills" | "mcp_servers", idKey: "skill_id" | "mcp_id"): string[] => {
-    const value = document[key];
+  const disabledMcpIds = (): string[] => {
+    const value = document["mcp_servers"];
     if (!Array.isArray(value)) return [];
     return value.flatMap((item) => {
       if (item === null || typeof item !== "object" || Array.isArray(item)) return [];
       const entry = item as Record<string, unknown>;
-      return entry["enabled"] === false && typeof entry[idKey] === "string" ? [entry[idKey]] : [];
+      return entry["enabled"] === false && typeof entry["mcp_id"] === "string"
+        ? [entry["mcp_id"]]
+        : [];
     });
   };
+  const disabledSkills = Array.isArray(document["disabled_skills"])
+    ? document["disabled_skills"].filter((value): value is string => typeof value === "string")
+    : [];
   return {
     defaultSelection:
       Object.hasOwn(document, "default_provider_id") ||
       Object.hasOwn(document, "default_model_id") ||
       Object.hasOwn(document, "default_reasoning_level"),
     accessMode: Object.hasOwn(document, "default_access_mode"),
-    disabledSkillIds: disabledIds("skills", "skill_id"),
-    disabledMcpIds: disabledIds("mcp_servers", "mcp_id"),
+    disabledSkillReferences: disabledSkills,
+    disabledMcpIds: disabledMcpIds(),
+  };
+}
+
+/**
+ * 只有可信且完整回读的项目层才能成为保存基线；缺失层则延迟到首次项目操作由空文档创建。
+ */
+function projectSkillDocumentFrom(
+  layer: ConfigReadResult["project"],
+): ProjectSkillSettingsDocument | undefined {
+  if (!layer.present) {
+    return { schemaVersion: 2, revision: 0, skills: [], disabledSkills: [] };
+  }
+  if (!layer.trusted || layer.status !== "valid" || layer.document === null) return undefined;
+  const parsed = ConfigProjectSkillDocumentSchema.safeParse(layer.document);
+  if (!parsed.success) return undefined;
+  return {
+    schemaVersion: 2,
+    revision: parsed.data.config_revision,
+    skills: [...parsed.data.skills],
+    disabledSkills: [...parsed.data.disabled_skills],
   };
 }
 export type ConfigPatchInput = z.infer<typeof ConfigPatchInputSchema>;
 export type ConfigReplaceInput = z.infer<typeof ConfigReplaceInputSchema>;
 export type ConfigResetInput = z.infer<typeof ConfigResetInputSchema>;
+export type ConfigRestoreInput = z.infer<typeof ConfigRestoreInputSchema>;
 export type ConfigWriteResult = z.infer<typeof ConfigWriteResultSchema>;
 
 export interface SettingsConfigurationChangeProjection {
@@ -476,14 +520,14 @@ function toUiProvider(
     })),
   };
 }
-/** 完整 v1 native 文档只映射受信任字段，theme/window 留在 UI preference owner。 */
+/** 完整 v2 native 文档只映射受信任字段，theme/window 留在 UI preference owner。 */
 function toUiDocument(
   config: z.infer<typeof ConfigDocumentSchema>,
   credentials: Record<string, { configured: boolean }>,
 ): SettingsDocument {
   const hasDefault = config.default_provider_id !== null && config.default_model_id !== null;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: config.config_revision,
     theme: "system",
     defaultAccessMode: config.default_access_mode,
@@ -514,20 +558,14 @@ function toUiDocument(
       auth: authFromNative(server),
       enabled: server.enabled,
     })),
-    skills: config.skills.map((skill) => ({
-      skillId: skill.skill_id,
-      name: skill.name,
-      scope: skill.scope,
-      enabled: skill.enabled,
-      description: skill.description,
-    })),
+    skills: [...config.skills],
     window: { width: 1280, height: 800, maximized: false },
   };
 }
 /** 用户层确实缺失时建立合法空基线；该路径不用于损坏或无法解析的配置恢复。 */
 function emptySettingsDocument(): SettingsDocument {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     theme: "system",
     defaultAccessMode: "full_access",
@@ -541,7 +579,7 @@ function emptySettingsDocument(): SettingsDocument {
   };
 }
 
-/** 配置读取必须完整命中严格 v1；非法 effective 文档仍然失败关闭。 */
+/** 配置读取必须完整命中严格 v2；非法 effective 文档仍然失败关闭。 */
 function parseConfigResponse(value: unknown): z.infer<typeof ConfigDocumentSchema> {
   const parsed = ConfigDocumentSchema.safeParse(value);
   if (!parsed.success) throw new SettingsAdapterError("invalid_response");
@@ -582,7 +620,7 @@ function toNativeProvider(provider: SettingsProvider): z.infer<typeof ConfigProv
     ),
   });
 }
-/** UI MCP 投影按真实 v1 auth 判别联合写回，避免把认证类型降级成 transport 猜测。 */
+/** UI MCP 投影按真实 v2 auth 判别联合写回，避免把认证类型降级成 transport 猜测。 */
 function toNativeMcp(server: SettingsMcpServer): z.infer<typeof ConfigMcpServerSchema> {
   return {
     mcp_id: server.mcpRevision,
@@ -605,10 +643,10 @@ function toNativeMcp(server: SettingsMcpServer): z.infer<typeof ConfigMcpServerS
     enabled: server.enabled,
   };
 }
-/** UI 聚合生成完整 v1 文档，默认选择不变量由 ConfigDocumentSchema 再次验证。 */
+/** UI 聚合生成完整 v2 用户文档，默认选择不变量由 ConfigDocumentSchema 再次验证。 */
 function settingsDocumentValue(document: SettingsDocument): z.infer<typeof ConfigDocumentSchema> {
   return ConfigDocumentSchema.parse({
-    schema_version: 1,
+    schema_version: 2,
     config_revision: document.revision,
     default_access_mode: document.defaultAccessMode,
     interaction: { clarification_enabled: document.clarificationEnabled ?? true },
@@ -623,13 +661,54 @@ function settingsDocumentValue(document: SettingsDocument): z.infer<typeof Confi
     },
     providers: document.providers.map(toNativeProvider),
     mcp_servers: document.mcpServers.map(toNativeMcp),
-    skills: document.skills.map((skill) => ({
-      skill_id: skill.skillId,
-      name: skill.name,
-      scope: skill.scope,
-      enabled: skill.enabled,
-      description: skill.description,
-    })),
+    skills: [...document.skills],
+  });
+}
+
+const USER_PATCH_FIELDS = [
+  "default_access_mode",
+  "interaction",
+  "default_provider_id",
+  "default_model_id",
+  "default_reasoning_level",
+  "subagents",
+  "providers",
+  "mcp_servers",
+  "skills",
+] as const;
+
+/**
+ * 由两份严格 UI 文档生成最小用户层 patch。`config_revision` 是 Java 侧发布序号，不能被 renderer
+ * 当作写入意图；只发送真正改变的配置根字段，才能让后端保留原始 TOML 中未知或暂不可用的条目。
+ */
+export function settingsDocumentPatch(
+  baseline: SettingsDocument,
+  intended: SettingsDocument,
+): Record<string, unknown> {
+  const before = settingsDocumentValue(parseInput(SettingsDocumentSchema, baseline));
+  const after = settingsDocumentValue(parseInput(SettingsDocumentSchema, intended));
+  const patch: Record<string, unknown> = {};
+  for (const field of USER_PATCH_FIELDS) {
+    if (JSON.stringify(before[field]) !== JSON.stringify(after[field])) {
+      patch[field] = after[field];
+    }
+  }
+  return patch;
+}
+
+/**
+ * 项目写入只构造 v2 Skill 层；该文件由首次项目操作创建，避免全局保存触碰项目工作区。
+ */
+function projectSkillDocumentValue(
+  document: ProjectSkillSettingsDocument,
+): z.infer<typeof ConfigProjectSkillDocumentSchema> {
+  return ConfigProjectSkillDocumentSchema.parse({
+    schema_version: 2,
+    config_revision: document.revision,
+    skills: [...document.skills],
+    ...(document.disabledSkills.length === 0
+      ? {}
+      : { disabled_skills: [...document.disabledSkills] }),
   });
 }
 
@@ -638,10 +717,16 @@ interface SettingsWireAdapter {
   patch(input: ConfigPatchInput): Promise<ConfigWriteResult>;
   replace(input: ConfigReplaceInput): Promise<ConfigWriteResult>;
   reset(input: ConfigResetInput): Promise<ConfigWriteResult>;
+  restore(input: ConfigRestoreInput): Promise<ConfigWriteResult>;
   setCredential(credentialId: string, secret: string, expectedVersion: string): Promise<string>;
   deleteCredential(credentialId: string, expectedVersion: string): Promise<string>;
   revealProviderCredential(providerId: string): Promise<string | null>;
   snapshot(input?: ConfigReadInput): Promise<LoadedSettings>;
+  saveProjectSkills(
+    document: ProjectSkillSettingsDocument,
+    workspaceId: string,
+    expectedVersion: string,
+  ): Promise<string>;
 }
 
 export class TauriSettingsAdapter implements SettingsWireAdapter {
@@ -684,50 +769,89 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
       await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.reset, { input: parsed }),
     );
   }
+  /** 用户层恢复只发送当前 CAS；快照、备份和原子写入都由 Java 配置 owner 完成。 */
+  async restore(input: ConfigRestoreInput): Promise<ConfigWriteResult> {
+    const parsed = parseInput(ConfigRestoreInputSchema, input);
+    return parseResult(
+      ConfigWriteResultSchema,
+      await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.restore, { input: parsed }),
+    );
+  }
   /**
-   * effective 仅供展示，user layer 是后续 user CAS replace 的唯一基线。语义损坏的用户层
-   * 不会在读取时写回；而是用空白编辑投影开放恢复，下一次完整保存仍受原文件 CAS 保护。
-   * 文件 I/O、权限、协议响应或 effective 文档异常没有安全的恢复基线，继续失败关闭。
+   * effective 与 user layer 都是 App Server 的可用投影。读取绝不写回原文件；语义问题在
+   * `issues` 中就地解释，文件级故障则由后端选择最近有效快照或安全默认值。
    */
   async snapshot(input?: ConfigReadInput): Promise<LoadedSettings> {
     const read = await this.read(input);
     const effective = parseConfigResponse(read.effective);
     const userMissing =
       !read.user.present && read.user.status === "missing" && read.user.document === null;
-    const userRecoverable =
-      read.user.present &&
-      read.user.trusted &&
-      read.user.status === "corrupt" &&
-      read.user.document === null;
-    if (
-      !userMissing &&
-      !userRecoverable &&
-      (!read.user.present || read.user.status !== "valid" || !read.user.trusted)
-    ) {
+    if (!userMissing && (!read.user.present || !read.user.trusted)) {
       throw new SettingsAdapterError("invalid_response");
     }
-    const userDocument =
-      userMissing || userRecoverable
-        ? emptySettingsDocument()
+    const userDocument = userMissing
+      ? emptySettingsDocument()
+      : read.user.document === null
+        ? toUiDocument(effective, read.credentials)
         : toUiDocument(parseConfigResponse(read.user.document), read.credentials);
+    const projectSkillDocument = projectSkillDocumentFrom(read.project);
     return {
       document: toUiDocument(effective, read.credentials),
       userDocument,
+      ...(projectSkillDocument === undefined ? {} : { projectSkillDocument }),
       projectOverrides: projectOverrides(read.project),
       cas: read.cas,
-      ...(userRecoverable ? { recovery: "user_config_corrupt" as const } : {}),
+      issues: read.issues,
     };
   }
-  /** application 提交 camelCase 聚合，adapter 在唯一边界完成严格 wire 映射。 */
-  async save(document: SettingsDocument, expectedVersion: string): Promise<string> {
-    let nativeDocument: z.infer<typeof ConfigDocumentSchema>;
+  /**
+   * application 提交已验证的用户编辑结果，但写入改为 Java 侧以原始文档为底的 patch，避免
+   * renderer 的有效投影覆盖未知字段或尚未修复的局部条目。
+   */
+  async save(
+    document: SettingsDocument,
+    expectedVersion: string,
+    baseline?: SettingsDocument,
+  ): Promise<string> {
+    let patch: Record<string, unknown>;
     try {
-      nativeDocument = settingsDocumentValue(parseInput(SettingsDocumentSchema, document));
+      const intended = parseInput(SettingsDocumentSchema, document);
+      patch =
+        baseline === undefined
+          ? settingsDocumentValue(intended)
+          : settingsDocumentPatch(parseInput(SettingsDocumentSchema, baseline), intended);
     } catch {
       throw new SettingsAdapterError("invalid_input");
     }
-    return (await this.replace({ scope: "user", expectedVersion, document: nativeDocument }))
-      .version;
+    return (await this.patch({ scope: "user", expectedVersion, patch })).version;
+  }
+
+  /** 只用当前用户层 CAS 触发恢复，成功后由调用方权威重读而不是复用旧页面快照。 */
+  async restoreLastKnownGood(expectedVersion: string): Promise<string> {
+    return (await this.restore({ expectedVersion })).version;
+  }
+  /**
+   * 项目 Skills 复用配置 replace 的 CAS 语义；失败后不修改内存快照，由 controller 权威重读。
+   */
+  async saveProjectSkills(
+    document: ProjectSkillSettingsDocument,
+    workspaceId: string,
+    expectedVersion: string,
+  ): Promise<string> {
+    let nativeDocument: z.infer<typeof ConfigProjectSkillDocumentSchema>;
+    try {
+      nativeDocument = projectSkillDocumentValue(document);
+    } catch {
+      throw new SettingsAdapterError("invalid_input");
+    }
+    return (
+      await this.replace({
+        scope: "project",
+        workspaceId,
+        expectedVersion,
+        document: nativeDocument,
+      })
+    ).version;
   }
   /** Secret 仅通过专用 command 一次性发送，不进入 adapter 状态。 */
   async setCredential(

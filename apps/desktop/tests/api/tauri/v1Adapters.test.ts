@@ -117,7 +117,7 @@ describe("Ja v1 desktop adapters", () => {
     await adapter.replace({
       scope: "user",
       document: {
-        schema_version: 1,
+        schema_version: 2,
         config_revision: 0,
         default_access_mode: "full_access",
         interaction: { clarification_enabled: true },
@@ -144,7 +144,7 @@ describe("Ja v1 desktop adapters", () => {
       input: {
         scope: "user",
         document: {
-          schema_version: 1,
+          schema_version: 2,
           config_revision: 0,
           default_access_mode: "full_access",
           interaction: { clarification_enabled: true },

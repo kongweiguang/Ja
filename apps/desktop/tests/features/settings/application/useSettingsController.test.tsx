@@ -13,12 +13,12 @@ import type { ProviderSave } from "@/shared/settings/types";
 const NO_PROJECT_OVERRIDES = {
   defaultSelection: false,
   accessMode: false,
-  disabledSkillIds: [],
+  disabledSkillReferences: [],
   disabledMcpIds: [],
 };
 
 const DOCUMENT: SettingsDocument = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   revision: 1,
   theme: "system",
   defaultAccessMode: "full_access",
@@ -75,8 +75,10 @@ function controllerOptions(
     adapter: {
       snapshot,
       save,
+      saveProjectSkills: vi.fn(async () => "cfg_project"),
       patch: vi.fn(async () => ({ version: "cfg_project" })),
       reset: vi.fn(async () => ({ version: "cfg_project" })),
+      restoreLastKnownGood: vi.fn(async () => "cfg_user"),
       setCredential: vi.fn(async () => "cfg_auth"),
       deleteCredential: vi.fn(async () => "cfg_auth"),
       revealProviderCredential: vi.fn(async () => null),
@@ -143,6 +145,7 @@ function credentialSnapshot(configured: boolean, credentialVersion: string): Loa
       projectVersion: "cfg_missing",
       credentialVersion,
     },
+    issues: [],
   };
 }
 
@@ -181,6 +184,7 @@ function loadedSettings(providerName: string): LoadedSettings {
       projectVersion: `cfg_project_${providerName}`,
       credentialVersion: "cfg_auth",
     },
+    issues: [],
   };
 }
 
@@ -322,6 +326,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_missing",
           credentialVersion,
         },
+        issues: [],
       };
     });
     const save = vi.fn(async (next: SettingsDocument, expectedVersion: string) => {
@@ -380,6 +385,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_missing",
           credentialVersion: credentialAttempts === 0 ? "cfg_auth_1" : "cfg_auth_2",
         },
+        issues: [],
       };
     });
     const save = vi.fn(async (next: SettingsDocument) => {
@@ -530,6 +536,50 @@ describe("useSettingsController v1", () => {
     expect(snapshot).toHaveBeenCalledTimes(2);
   });
 
+  /** 外部配置事件晚于首个读取起点时，旧响应不能永久遮蔽后端已经观察到的问题。 */
+  it("refetches after a configuration event races the initial settings snapshot", async () => {
+    let resolveInitial: ((value: LoadedSettings) => void) | undefined;
+    const initial = new Promise<LoadedSettings>((resolve) => {
+      resolveInitial = resolve;
+    });
+    let calls = 0;
+    const snapshot = vi.fn(async (): Promise<LoadedSettings> => {
+      calls += 1;
+      return calls === 1 ? initial : loadedSettings("Refreshed after configuration change");
+    });
+    const base = controllerOptions(snapshot);
+    const { result, rerender } = renderHook(
+      ({ version }: { version?: string }) =>
+        useSettingsController({
+          ...base,
+          configurationChange:
+            version === undefined
+              ? undefined
+              : {
+                  serverInstanceId: "server",
+                  generation: 1,
+                  version,
+                  scope: "user",
+                },
+        }),
+      { wrapper: QueryWrapper, initialProps: {} as { version?: string } },
+    );
+
+    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(1));
+    rerender({ version: "cfg_user_external_2" });
+    await act(async () => {
+      resolveInitial?.(loadedSettings("Stale initial snapshot"));
+      await initial;
+    });
+
+    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(result.current.snapshot.providers[0]?.name).toBe(
+        "Refreshed after configuration change",
+      ),
+    );
+  });
+
   it("cancels an older same-scope refresh so its late result cannot overwrite a newer version", async () => {
     let call = 0;
     let resolveVersionTwo: ((value: LoadedSettings) => void) | undefined;
@@ -595,6 +645,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_missing",
           credentialVersion: "cfg_auth",
         },
+        issues: [],
       }),
     );
     const { result } = renderHook(
@@ -603,8 +654,10 @@ describe("useSettingsController v1", () => {
           adapter: {
             snapshot,
             save,
+            saveProjectSkills: vi.fn(async () => "cfg_project"),
             patch: vi.fn(async () => ({ version: "cfg_project" })),
             reset: vi.fn(async () => ({ version: "cfg_project" })),
+            restoreLastKnownGood: vi.fn(async () => "cfg_user"),
             setCredential: vi.fn(async () => "cfg_auth2"),
             deleteCredential: vi.fn(async () => "cfg_auth3"),
             revealProviderCredential: vi.fn(async () => null),
@@ -820,10 +873,13 @@ describe("useSettingsController v1", () => {
                 projectVersion: "cfg_missing",
                 credentialVersion: "cfg_auth",
               },
+              issues: [],
             })),
             save,
+            saveProjectSkills: vi.fn(async () => "cfg_project"),
             patch: vi.fn(async () => ({ version: "cfg_project" })),
             reset: vi.fn(async () => ({ version: "cfg_project" })),
+            restoreLastKnownGood: vi.fn(async () => "cfg_user"),
             setCredential: vi.fn(async () => "cfg_auth"),
             deleteCredential: vi.fn(async () => "cfg_auth"),
             revealProviderCredential: vi.fn(async () => null),
@@ -894,6 +950,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_project",
           credentialVersion: "cfg_auth",
         },
+        issues: [],
       }),
     );
     const { result } = renderController(snapshot, save, true);
@@ -927,6 +984,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_missing",
           credentialVersion: "cfg_auth",
         },
+        issues: [],
       }),
     );
     const { result } = renderController(snapshot, save);
@@ -959,6 +1017,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_missing",
           credentialVersion: "cfg_auth",
         },
+        issues: [],
       }),
     );
     const { result } = renderController(snapshot, save);
@@ -993,49 +1052,32 @@ describe("useSettingsController v1", () => {
     expect(save).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps project-effective conversation settings while every settings write targets user CAS", async () => {
+  it("separates global authorization from project tightening with source-qualified references", async () => {
     let loaded = loadedSettings("Project B");
-    loaded.userDocument.providers[0]!.name = "Global A";
-    loaded.userDocument.defaultAccessMode = "approval_required";
-    loaded.userDocument.skills = [
-      {
-        skillId: "skill_review",
-        name: "Review",
-        scope: "user",
-        enabled: true,
-        description: "Review changes",
-      },
-    ];
-    loaded.document.skills = [{ ...loaded.userDocument.skills[0]!, enabled: false }];
-    const globalMcp = {
-      mcpRevision: "mcp_local",
-      name: "Local Tools",
-      transport: "stdio" as const,
-      endpoint: "pwsh.exe",
-      protocolVersion: "2025-06-18" as const,
-      args: [],
-      env: {},
-      headers: {},
-      auth: { kind: "none" as const },
-      enabled: true,
+    loaded.userDocument.skills = ["user:review"];
+    loaded.projectSkillDocument = {
+      schemaVersion: 2,
+      revision: 1,
+      skills: [],
+      disabledSkills: ["user:review"],
     };
-    loaded.userDocument.mcpServers = [globalMcp];
-    loaded.document.mcpServers = [{ ...globalMcp, enabled: false }];
-    const patch = vi.fn(async () => ({ version: "cfg_project_next" }));
-    const reset = vi.fn(async () => ({ version: "cfg_project_next" }));
+    loaded.projectOverrides.disabledSkillReferences = ["user:review"];
     const save = vi.fn(async (document: SettingsDocument) => {
       loaded = { ...loaded, userDocument: structuredClone(document) };
       return "cfg_user_next";
     });
+    const saveProjectSkills = vi.fn(async (document) => {
+      loaded = { ...loaded, projectSkillDocument: structuredClone(document) };
+      return "cfg_project_next";
+    });
     const snapshot = vi.fn(async () => structuredClone(loaded));
     const options = controllerOptions(snapshot, save);
-    options.adapter.patch = patch;
-    options.adapter.reset = reset;
+    options.adapter.saveProjectSkills = saveProjectSkills;
     options.workspaceScope = { workspaceId: "ws_project", kind: "project" };
     options.runtimePort.listSkills = vi.fn(async () => ({
       items: [
         {
-          skillId: "skill_review",
+          skillId: "user:review",
           name: "Review",
           scope: "user" as const,
           enabled: false,
@@ -1045,41 +1087,26 @@ describe("useSettingsController v1", () => {
       ],
       nextCursor: null,
     }));
-    options.runtimePort.listMcpServers = vi.fn(async () => ({
-      items: [
-        {
-          mcpId: "mcp_local",
-          name: "Local Tools",
-          transport: "stdio" as const,
-          status: "disabled" as const,
-          toolCount: 0,
-        },
-      ],
-      nextCursor: null,
-    }));
     const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
 
-    await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("Project B"));
-    expect(result.current.globalSnapshot.providers[0]?.name).toBe("Global A");
-    expect(result.current.snapshot.skills[0]?.enabled).toBe(false);
-    expect(result.current.globalSnapshot.skills[0]?.enabled).toBe(true);
-    expect(result.current.globalSnapshot.mcpServers[0]?.enabled).toBe(true);
-    expect(result.current.scopeWorkspaceId).toBe("ws_project");
+    await waitFor(() => expect(result.current.skillSettings.projectAvailable).toBe(true));
+    expect(result.current.skillSettings.global[0]?.enabled).toBe(true);
+    expect(result.current.skillSettings.project?.[0]?.enabled).toBe(false);
 
-    await act(async () =>
-      result.current.ports.onDefaultSelectionChange({
-        providerId: "provider_one",
-        modelId: "model_one",
-        reasoningLevel: "low",
-      }),
+    await act(async () => result.current.ports.onToggleSkill("user:review", true, "project"));
+    expect(saveProjectSkills).toHaveBeenCalledWith(
+      expect.objectContaining({ disabledSkills: [] }),
+      "ws_project",
+      "cfg_project_Project B",
     );
-    await act(async () => result.current.ports.onAccessModeChange("full_access"));
-    await act(async () => result.current.ports.onToggleSkill("skill_review", false));
-    await act(async () => result.current.ports.onSaveMcp({ ...globalMcp, enabled: false }));
+    expect(save).not.toHaveBeenCalled();
 
-    expect(save).toHaveBeenCalledTimes(4);
-    expect(patch).not.toHaveBeenCalled();
-    expect(reset).not.toHaveBeenCalled();
+    await act(async () => result.current.ports.onToggleSkill("user:review", false, "user"));
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ skills: [] }),
+      "cfg_user_Project B",
+      expect.objectContaining({ skills: ["user:review"] }),
+    );
   });
 
   /** 子智能体策略复用用户 CAS，并拒绝不存在的模型引用，避免删除模型后静默改派。 */
@@ -1107,6 +1134,14 @@ describe("useSettingsController v1", () => {
         },
       }),
       "cfg_user",
+      expect.objectContaining({
+        subagents: {
+          enabled: true,
+          providerId: null,
+          modelId: null,
+          reasoningLevel: null,
+        },
+      }),
     );
 
     await expect(
@@ -1136,6 +1171,7 @@ describe("useSettingsController v1", () => {
           projectVersion: "cfg_missing",
           credentialVersion: "cfg_auth",
         },
+        issues: [],
       }),
     );
     const { result } = renderController(snapshot, save);

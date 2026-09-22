@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.configuration.adapter.out.generation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 
 import java.net.URI;
 import java.time.Duration;
@@ -14,7 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** 把严格 v1 文档投影为冻结 Provider/Model、Skill 与 MCP catalog。 */
+/** 把严格 v2 文档投影为冻结 Provider/Model、Skill 与 MCP catalog。 */
 final class ConfigGenerationDocumentCatalog {
     private final Map<String, ConfigGeneration.ProviderDefinition> providers;
     private final Map<String, ConfigGeneration.Skill> skillDefinitions;
@@ -30,7 +31,7 @@ final class ConfigGenerationDocumentCatalog {
         this.mcpDefinitions = Map.copyOf(mcpDefinitions);
     }
 
-    /** 从已通过 v1 Policy 的 effective 文档建立强类型 catalog。 */
+    /** 从已通过 v2 Policy 的 effective 文档建立强类型 catalog。 */
     static ConfigGenerationDocumentCatalog parse(ObjectNode root) {
         return new ConfigGenerationDocumentCatalog(parseProviders(root), parseSkills(root),
                 parseMcpServers(root));
@@ -170,17 +171,13 @@ final class ConfigGenerationDocumentCatalog {
         };
     }
 
-    /** 解析 Skill catalog，严格文档保证所有字段类型已闭集校验。 */
+    /** 解析来源限定的 Skill 引用，展示元数据不进入代际快照。 */
     private static Map<String, ConfigGeneration.Skill> parseSkills(ObjectNode root) {
         Map<String, ConfigGeneration.Skill> values = new LinkedHashMap<>();
         ArrayNode array = requireArray(root, "skills");
         for (JsonNode value : array) {
-            ObjectNode object = (ObjectNode) value;
-            ConfigGeneration.Skill skill = new ConfigGeneration.Skill(
-                    requiredText(object, "skill_id"), requiredText(object, "name"),
-                    requiredText(object, "scope"), requiredBoolean(object, "enabled"),
-                    requiredString(object, "description"));
-            values.put(skill.skillId(), skill);
+            ConfigGeneration.Skill skill = new ConfigGeneration.Skill(SkillReference.parse(value.textValue()));
+            values.put(skill.reference().identifier(), skill);
         }
         return Map.copyOf(values);
     }
@@ -239,7 +236,7 @@ final class ConfigGenerationDocumentCatalog {
         throw new IllegalArgumentException("object is missing");
     }
 
-    /** 要求当前 v1 的集合字段显式存在，禁止缺失集合被投影为空目录。 */
+    /** 要求当前 v2 的集合字段显式存在，禁止缺失集合被投影为空目录。 */
     private static ArrayNode requireArray(ObjectNode object, String key) {
         if (object.get(key) instanceof ArrayNode value) return value;
         throw new IllegalArgumentException("array is missing");

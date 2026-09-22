@@ -13,7 +13,7 @@ import java.util.Objects;
  * 为严格配置文档集中提供首次生成和 revision 推进规则。
  */
 final class ConfigurationDocumentFactory {
-    static final int CURRENT_SCHEMA_VERSION = 1;
+    static final int CURRENT_SCHEMA_VERSION = 2;
     private final ObjectMapper mapper;
 
     /**

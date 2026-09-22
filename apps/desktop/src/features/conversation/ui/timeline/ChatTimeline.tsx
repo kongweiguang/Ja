@@ -10,9 +10,8 @@ import {
   type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, CircleAlert, Paperclip, RotateCcw } from "lucide-react";
+import { ArrowDown, Paperclip } from "lucide-react";
 import { cn } from "@/shared/ui/primitives/cn";
-import { Button } from "@/shared/ui/primitives/Button";
 import type { UserApprovalDecision } from "../approval/ApprovalCard";
 import type {
   ApprovalDecision,
@@ -22,7 +21,7 @@ import type {
 import { itemRevision, type TimelineItemAdapter } from "../../domain/timelineTypes";
 import type { AttachmentSummary } from "../../domain/timelineContracts";
 import { MarkdownMessage } from "./MarkdownMessage";
-import { WorkProcess } from "./WorkProcess";
+import { WorkProcess, type WorkProcessDisplayMode } from "./WorkProcess";
 import { TurnChangesCard } from "./TurnChangesCard";
 import { CopyTextButton } from "@/shared/ui/CopyTextButton";
 import { ComposerContextChips } from "../composer/ComposerContextChips";
@@ -96,11 +95,15 @@ export interface ChatTimelineProps {
     callId: string;
     artifactId: string;
   }) => Promise<string>;
-  /**
-   * 只准备一次新的人工发送：调用方负责把原始用户文本放回 Composer，禁止在此回调中自动提交
-   * 或重放旧 Turn 的 Tool，避免失败后的外部副作用被静默执行两次。
-   */
-  onPrepareRetry?: (turnId: string, text: string) => void;
+  onResolveToolRecovery?: (input: {
+    threadId: string;
+    turnId: string;
+    callId: string;
+    expectedThreadRevision: number;
+    expectedRecoveryRevision: number;
+    decision: "retry" | "skip";
+    idempotencyKey: string;
+  }) => Promise<unknown>;
   /** 每个终态 Turn 的冻结修改由 Workbench 承载；可选路径只定位该 artifact 内的真实文件。 */
   onReviewTurn?: (
     turn: TimelineTurn,
@@ -185,72 +188,30 @@ type AssistantResponseState =
   | "failed"
   | "cancelled";
 
-interface TurnFailurePresentation {
-  summary: string;
-  recovery: string;
-}
-
 /**
- * 稳定错误码只解释已确认的运行失败，不把格式问题归因于安全威胁或用户配置；
- * 也不承诺自动重试已经可能产生 Tool 副作用的 Turn。
+ * 稳定错误码只提供一条可读原因；恢复动作已由 Composer 的新轮次续答承载，不能在 Timeline
+ * 重复展示技术诊断、操作建议或可能重放 Tool 的伪操作。
  */
-function turnFailurePresentation(
-  error: TimelineTurn["error"] | undefined,
-): TurnFailurePresentation {
+function turnFailurePresentation(error: TimelineTurn["error"] | undefined): string {
   switch (error?.code) {
     case "BUDGET_EXCEEDED":
-      return {
-        summary: "本轮在达到执行上限前没有完成回复。",
-        recovery: "请缩小任务范围或补充更明确的限制，然后重新编辑并发送。",
-      };
+      return "已达到本轮资源上限。";
     case "MODEL_UNAVAILABLE":
-      return {
-        summary: "模型服务暂时不可用，这次请求已经停止。",
-        recovery: "请稍后重新编辑并发送上一条消息。",
-      };
+      return "模型服务暂时不可用。";
     case "SUMMARY_FAILURE":
-      return {
-        summary: "上下文摘要生成失败，本轮回复已经停止。",
-        recovery: "请缩短当前对话后重新编辑并发送；若仍然失败，请新建会话。",
-      };
+      return "对话摘要生成失败。";
     case "MODEL_PROTOCOL_ERROR":
-      return {
-        summary: "模型响应格式有误或不完整，本轮未能完成。",
-        recovery: "请重新编辑并发送；若持续失败，请查看运行日志中的具体原因。",
-      };
+      return "模型响应格式有误或不完整。";
     case "REQUEST_DEADLINE_EXCEEDED":
-      return {
-        summary: "本次执行超过了允许的最长时间。",
-        recovery: "请缩小任务范围或稍后重新编辑并发送。",
-      };
+      return "本次执行超时。";
     case "APPROVAL_EXPIRED":
-      return {
-        summary: "等待确认已超过有效期，本次执行没有继续。",
-        recovery: "请重新编辑并发送上一条消息，再及时处理新的确认请求。",
-      };
+      return "工具授权已失效。";
     case "CONFLICT":
     case "INVALID_STATE":
-      return {
-        summary: "会话状态发生冲突，Ja 已停止当前回复以保护已保存的内容。",
-        recovery: "请重新打开此会话，确认内容同步后再重新编辑并发送。",
-      };
+      return "会话状态已变化。";
     default:
-      return error?.retryable
-        ? {
-            summary: "临时故障导致这次回复中止。",
-            recovery: "请稍后重新编辑并发送上一条消息。",
-          }
-        : {
-            summary: "Ja 无法安全完成这次回复，当前执行已经结束。",
-            recovery: "请根据错误代码检查运行时或模型配置，再重新编辑并发送。",
-          };
+      return error?.retryable ? "本次回复暂时中断。" : "本次回复未能完成。";
   }
-}
-
-/** 错误码只承担支持诊断，不作为主文案；异常值保持有界，避免损坏失败卡布局。 */
-function visibleTurnErrorCode(error: TimelineTurn["error"] | undefined): string {
-  const code = error?.code.trim();
-  return code ? code.slice(0, 128) : "UNKNOWN_FAILURE";
 }
 
 /**
@@ -839,22 +800,39 @@ function assistantResponseState(
 }
 
 /**
- * 从 Turn 接纳到终态始终复用同一个 Article；阶段提示与 Markdown 分层，使屏幕阅读器只播报阶段变化，
- * 而真实 delta 直接更新正文且不触发逐片段播报。Failed Turn 改用独立失败语义，并只允许把原问题
- * 恢复为草稿，避免未完成内容或可能已经发生的 Tool 副作用被当作成功结果重放。
+ * 仅当服务端已确认本轮 completed 且最终答复已到位，才自动收起过程；失败和取消也使用相同归档
+ * 入口但默认展开，保留已生成正文与诊断。局部 Tool 完成、短暂断流、缺失 Turn 或只有已完成的过程片段
+ * 都保持直出，避免用户在唯一可读正文尚未落点前看到空折叠栏。
+ */
+function workProcessDisplayMode(row: TimelineRow): WorkProcessDisplayMode | undefined {
+  const finalReady = row.final?.final === true && row.final.text?.trim() !== "";
+  if (row.turn?.status === "completed" && finalReady) return "archived";
+  if (row.turn?.status === "failed" || row.turn?.status === "cancelled") return "archived";
+  if (
+    row.turn === undefined ||
+    row.turn.status === "queued" ||
+    row.turn.status === "running" ||
+    row.turn.status === "waiting_approval" ||
+    row.turn.status === "suspended" ||
+    row.turn.status === "completed"
+  ) {
+    return "inline";
+  }
+  return undefined;
+}
+
+/**
+ * 从 Turn 接纳到终态始终复用同一个 Article；阶段提示与 Markdown 分层，使屏幕阅读器只播报阶段变化。
+ * 失败时隐藏持久化的系统收口正文，只留下由稳定错误码派生的一条原因；真实已生成内容仍照常保留。
  */
 function AssistantResponse({
   turn,
   item,
-  submittedText,
-  onPrepareRetry,
   onOpenLink,
   onCopyText,
 }: {
   turn?: TimelineTurn;
   item?: TimelineItemAdapter;
-  submittedText?: string;
-  onPrepareRetry?: ChatTimelineProps["onPrepareRetry"];
   onOpenLink?: (url: string) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
 }): ReactElement {
@@ -874,17 +852,9 @@ function AssistantResponse({
             : state === "cancelled"
               ? "已取消"
               : undefined;
-  const text = item?.text?.trim() ? item.text : undefined;
-  const failure = isFailed ? turnFailurePresentation(turn?.error) : undefined;
-  const errorCode = isFailed ? visibleTurnErrorCode(turn?.error) : undefined;
-  const retryText = submittedText?.trim() ? submittedText : undefined;
-  const retryTurnId = turn?.status === "failed" ? turn.turnId : undefined;
   const isFailureReply = isFailed && item?.metadata?.failureReply === true;
-  // 失败卡只负责恢复草稿；构造回调时冻结 Turn 与原文身份，绝不从点击时的活动会话反查或自动提交。
-  const prepareRetry =
-    retryTurnId !== undefined && retryText !== undefined && onPrepareRetry !== undefined
-      ? () => onPrepareRetry(retryTurnId, retryText)
-      : undefined;
+  const text = isFailureReply || !item?.text?.trim() ? undefined : item.text;
+  const failure = isFailed ? turnFailurePresentation(turn?.error) : undefined;
   const isFinalAnswer = state === "completed" && text !== undefined;
   const articleLabel = isFinalAnswer
     ? "最终答复"
@@ -912,49 +882,13 @@ function AssistantResponse({
       <div className="ja-chat-message__body">
         {text === undefined ? null : (
           <div className="ja-chat-response__content" aria-live="off">
-            {isFailed && !isFailureReply ? (
-              <p className="ja-chat-failure__partial-note">
-                以下内容在失败前生成，可能不完整，不能视为最终答复。
-              </p>
-            ) : null}
             <MarkdownMessage content={text} onOpenLink={onOpenLink} onCopyText={onCopyText} />
           </div>
         )}
         {failure === undefined ? null : (
-          <section
-            className="ja-chat-failure"
-            role="alert"
-            aria-labelledby={`failure-title-${turn?.turnId ?? item?.turnId ?? "unknown"}`}
-          >
-            <div className="ja-chat-failure__heading">
-              <CircleAlert aria-hidden="true" />
-              <strong id={`failure-title-${turn?.turnId ?? item?.turnId ?? "unknown"}`}>
-                任务未完成
-              </strong>
-            </div>
-            <p className="ja-chat-failure__completion">
-              {text === undefined
-                ? "本轮没有生成最终答复。"
-                : isFailureReply
-                  ? "本轮失败原因已保存。"
-                  : "上方内容是未完成的回复，请在重试前核对。"}
-            </p>
-            <p className="ja-chat-failure__summary">{failure.summary}</p>
-            <p className="ja-chat-failure__recovery">{failure.recovery}</p>
-            <p className="ja-chat-failure__code">
-              <span>错误代码</span>
-              <code>{errorCode}</code>
-            </p>
-            {prepareRetry ? (
-              <div className="ja-chat-failure__actions">
-                <Button type="button" variant="secondary" size="sm" onClick={prepareRetry}>
-                  <RotateCcw aria-hidden="true" />
-                  重新编辑
-                </Button>
-                <span>只恢复原问题，不会自动发送或重放已执行的工具。</span>
-              </div>
-            ) : null}
-          </section>
+          <p className="ja-chat-failure" role="alert">
+            {failure}
+          </p>
         )}
         {failure !== undefined || statusText === undefined ? null : (
           <div className="ja-chat-response__status" aria-live="polite" aria-atomic="true">
@@ -999,7 +933,7 @@ export function ChatTimeline({
   onOpenLink,
   onCopyText,
   onReadToolArtifact,
-  onPrepareRetry,
+  onResolveToolRecovery,
   onReviewTurn,
   onOpenAttachmentPreview,
   attachmentThumbnailPort,
@@ -1059,21 +993,6 @@ export function ChatTimeline({
       return orderedRowKey(orderedRows[index], index);
     },
   });
-  /**
-   * ResizeObserver 可能在首轮测量时看到正在流式增长的可见 Turn；在 paint 前安装 Ja 的
-   * 行级补偿边界，避免 Virtualizer 用整行高度差移动用户正在阅读的同一行内容。
-   */
-  useLayoutEffect(() => {
-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldAdjustTimelineScrollPosition;
-    return () => {
-      if (
-        virtualizer.shouldAdjustScrollPositionOnItemSizeChange ===
-        shouldAdjustTimelineScrollPosition
-      ) {
-        virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
-      }
-    };
-  }, [virtualizer]);
   const scrollToLatest = useMemo(
     () => () => {
       if (orderedRows.length === 0) return;
@@ -1110,6 +1029,29 @@ export function ChatTimeline({
     scrollToLatest,
   });
   const followingLatest = timelineScroll.followingLatest;
+  const isFollowingLatest = timelineScroll.isFollowingLatest;
+  /**
+   * 测量回调可能在 Wheel 事件与 React re-render 之间执行；即时读取 Hook ref，确保上滚阅读期间
+   * 连完全位于 viewport 上方的行也不触发自动 scrollTop 补偿。
+   */
+  const shouldAdjustForTimelineReading = useCallback(
+    (
+      item: Parameters<typeof shouldAdjustTimelineScrollPosition>[0],
+      delta: number,
+      instance: Parameters<typeof shouldAdjustTimelineScrollPosition>[2],
+    ) => shouldAdjustTimelineScrollPosition(item, delta, instance, isFollowingLatest()),
+    [isFollowingLatest],
+  );
+  useLayoutEffect(() => {
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldAdjustForTimelineReading;
+    return () => {
+      if (
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange === shouldAdjustForTimelineReading
+      ) {
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+    };
+  }, [shouldAdjustForTimelineReading, virtualizer]);
   const virtualRows = virtualizer.getVirtualItems();
   const visibleRows =
     virtualRows.length > 0
@@ -1168,6 +1110,7 @@ export function ChatTimeline({
               changeSet.stats.files > 0
                 ? changeSet
                 : undefined;
+            const workDisplayMode = workProcessDisplayMode(row);
             const blocks = orderConversationBlocks(
               row,
               entry.externalRows,
@@ -1217,6 +1160,8 @@ export function ChatTimeline({
                           }
                           steps={row.work}
                           turn={row.turn}
+                          displayMode={workDisplayMode}
+                          autoCollapse={followingLatest}
                           approvals={row.approvals}
                           approvalDecisions={approvalDecisions}
                           approvalClosedAt={approvalClosedAt}
@@ -1224,6 +1169,7 @@ export function ChatTimeline({
                           onOpenLink={onOpenLink}
                           onCopyText={onCopyText}
                           onReadToolArtifact={onReadToolArtifact}
+                          onResolveToolRecovery={onResolveToolRecovery}
                         />
                       );
                     case "assistant":
@@ -1232,8 +1178,6 @@ export function ChatTimeline({
                           key={block.key}
                           turn={row.turn}
                           item={row.final}
-                          submittedText={row.user?.text}
-                          onPrepareRetry={onPrepareRetry}
                           onOpenLink={onOpenLink}
                           onCopyText={onCopyText}
                         />

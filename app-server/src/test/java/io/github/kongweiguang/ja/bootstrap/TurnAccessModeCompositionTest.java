@@ -129,7 +129,7 @@ final class TurnAccessModeCompositionTest {
     /** 仅设置创建默认值与本地假 Provider，完全隔离用户凭据和真实付费请求。 */
     private static String configuration(AccessMode defaultMode, String endpoint) {
         return """
-                schema_version = 1
+                schema_version = 2
                 config_revision = 1
                 default_access_mode = "%s"
                 default_provider_id = "provider_mode"

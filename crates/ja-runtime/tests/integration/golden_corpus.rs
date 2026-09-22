@@ -33,6 +33,7 @@ const REQUEST_METHODS: &[&str] = &[
     "thread/list",
     "thread/search",
     "thread/read",
+    "thread/usage/read",
     "thread/rename",
     "thread/pin",
     "thread/seen",
@@ -92,6 +93,7 @@ const REQUEST_METHODS: &[&str] = &[
     "attachment/preview/close",
     "turn/start",
     "turn/resume",
+    "turn/recovery/respond",
     "turn/cancel",
     "turn/input/enqueue",
     "turn/input/prioritize",
@@ -103,6 +105,7 @@ const REQUEST_METHODS: &[&str] = &[
     "configuration/patch",
     "configuration/replace",
     "configuration/reset",
+    "configuration/restore",
     "credential/set",
     "credential/delete",
     "credential/reveal-provider",
@@ -1926,6 +1929,33 @@ fn validate_response_result(result: &Value) -> Result<(), &'static str> {
             return Err("turn accepted result is invalid");
         }
     }
+    if result.get("accepted").is_some()
+        && result.get("turnId").is_some()
+        && result.get("decision").is_some()
+        && result.get("resumed").is_some()
+    {
+        ensure_object_keys(
+            result,
+            &[
+                "accepted",
+                "turnId",
+                "threadRevision",
+                "decision",
+                "resumed",
+            ],
+        )?;
+        if result.get("accepted").and_then(Value::as_bool) != Some(true)
+            || !valid_prefixed_id(result.get("turnId"), "turn_")
+            || !integer_in_bounds(result.get("threadRevision"), 0, 9_007_199_254_740_991)
+            || !matches!(
+                result.get("decision").and_then(Value::as_str),
+                Some("retry" | "skip")
+            )
+            || result.get("resumed").and_then(Value::as_bool).is_none()
+        {
+            return Err("turn recovery result is invalid");
+        }
+    }
     if result.get("accepted").is_some() && result.get("inputId").is_some() {
         ensure_object_keys(result, &["accepted", "inputId", "inputQueue"])?;
         let expected_turn_id = result
@@ -2480,6 +2510,7 @@ fn validate_config_read_result(result: &Value) -> Result<(), &'static str> {
             "credentials",
             "cas",
             "diagnostics",
+            "issues",
             "trusted",
         ],
     )?;
@@ -2516,6 +2547,7 @@ fn validate_config_read_result(result: &Value) -> Result<(), &'static str> {
     {
         return Err("configuration read projection is invalid");
     }
+    validate_config_issues(result.get("issues"))?;
     Ok(())
 }
 
@@ -2594,6 +2626,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         ]
         .as_slice(),
         "thread/read" => ["threadId", "cursor", "limit"].as_slice(),
+        "thread/usage/read" => ["threadId"].as_slice(),
         "thread/rename" => ["threadId", "title", "expectedThreadRevision"].as_slice(),
         "thread/pin" => ["threadId", "pinned", "expectedThreadRevision"].as_slice(),
         "thread/preferences/update" => [
@@ -2786,6 +2819,15 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "attachment/preview/close" => ["previewSessionId"].as_slice(),
         "turn/start" => ["threadId", "content", "deadlineMs"].as_slice(),
         "turn/resume" => ["turnId", "expectedThreadRevision"].as_slice(),
+        "turn/recovery/respond" => [
+            "turnId",
+            "callId",
+            "expectedThreadRevision",
+            "expectedRecoveryRevision",
+            "decision",
+            "idempotencyKey",
+        ]
+        .as_slice(),
         "turn/cancel" => ["turnId"].as_slice(),
         "turn/input/enqueue" => ["turnId", "content"].as_slice(),
         "turn/input/prioritize" | "turn/input/delete" => {
@@ -2811,6 +2853,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             ["scope", "workspaceId", "document", "expectedVersion"].as_slice()
         }
         "configuration/reset" => ["scope", "workspaceId", "expectedVersion"].as_slice(),
+        "configuration/restore" => ["expectedVersion"].as_slice(),
         "credential/set" => ["credentialId", "secret", "expectedVersion"].as_slice(),
         "credential/delete" => ["credentialId", "expectedVersion"].as_slice(),
         "credential/reveal-provider" => ["providerId"].as_slice(),
@@ -3243,6 +3286,28 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 return Err("turn revision is invalid");
             }
         }
+        "turn/recovery/respond" => {
+            if !valid_prefixed_id(params.get("turnId"), "turn_")
+                || !valid_prefixed_id(params.get("callId"), "call_")
+                || !integer_in_bounds(
+                    params.get("expectedThreadRevision"),
+                    0,
+                    9_007_199_254_740_991,
+                )
+                || !integer_in_bounds(
+                    params.get("expectedRecoveryRevision"),
+                    1,
+                    9_007_199_254_740_991,
+                )
+                || !matches!(
+                    params.get("decision").and_then(Value::as_str),
+                    Some("retry" | "skip")
+                )
+                || !bounded_string(params.get("idempotencyKey"), 1, 128)
+            {
+                return Err("turn recovery response is invalid");
+            }
+        }
         "turn/cancel" => {
             if !valid_prefixed_id(params.get("turnId"), "turn_") {
                 return Err("turn cancel identity is invalid");
@@ -3344,12 +3409,17 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "configuration/replace" => {
             validate_config_scope(params)?;
             validate_version(params.get("expectedVersion"))?;
-            validate_config_document(params.get("document"))?;
+            match params.get("scope").and_then(Value::as_str) {
+                Some("user") => validate_config_document(params.get("document"))?,
+                Some("project") => validate_config_project_skill_document(params.get("document"))?,
+                _ => return Err("configuration scope is invalid"),
+            }
         }
         "configuration/reset" => {
             validate_config_scope(params)?;
             validate_version(params.get("expectedVersion"))?;
         }
+        "configuration/restore" => validate_version(params.get("expectedVersion"))?,
         "credential/set" => {
             if !valid_prefixed_id(params.get("credentialId"), "cred_")
                 || !params
@@ -3482,7 +3552,7 @@ fn validate_turn_content(value: Option<&Value>) -> Result<(), &'static str> {
                 let skill_id = item
                     .get("skillId")
                     .and_then(Value::as_str)
-                    .filter(|_| valid_prefixed_id(item.get("skillId"), "skill_"))
+                    .filter(|_| valid_skill_reference(item.get("skillId")))
                     .ok_or("turn skill id is invalid")?;
                 if !skill_ids.insert(skill_id) {
                     return Err("turn skill reference is duplicated");
@@ -3582,8 +3652,7 @@ fn is_valid_config_version(version: &str) -> bool {
     })
 }
 
-/// 完整 Replacement Document 必须在到达 Java Configuration Owner 前通过校验；
-/// 通用 JSON Object 被明确视为不充分，以保持配置闭集。
+/// 用户层完整替换仍使用严格 v2 DTO；宽松读取只发生在 Java 对原始 TOML 的受控边界，不能放宽 IPC 写入。
 fn validate_config_document(value: Option<&Value>) -> Result<(), &'static str> {
     let document = value.ok_or("repair document is missing")?;
     let object = document
@@ -3598,19 +3667,29 @@ fn validate_config_document(value: Option<&Value>) -> Result<(), &'static str> {
             "default_provider_id",
             "default_model_id",
             "default_reasoning_level",
+            "interaction",
             "providers",
             "mcp_servers",
             "skills",
             "subagents",
         ],
     )?;
-    if object.get("schema_version").and_then(Value::as_u64) != Some(1)
+    if object.get("schema_version").and_then(Value::as_u64) != Some(2)
         || object
             .get("config_revision")
             .and_then(Value::as_u64)
             .is_none()
     {
         return Err("repair document header is invalid");
+    }
+    if let Some(interaction) = object.get("interaction") {
+        ensure_object_keys(interaction, &["clarification_enabled"])?;
+        if interaction
+            .get("clarification_enabled")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("interaction settings are invalid");
+        }
     }
     if !matches!(
         object.get("default_access_mode").and_then(Value::as_str),
@@ -3639,6 +3718,150 @@ fn validate_config_document(value: Option<&Value>) -> Result<(), &'static str> {
     validate_config_mcp_servers(object.get("mcp_servers"))?;
     validate_config_skills(object.get("skills"))?;
     validate_config_value(Some(document))
+}
+
+/// 项目层只存自身 Skill 与对全局 Skill 的收紧项，不能借完整用户文档扩大项目权限。
+fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &'static str> {
+    let document = value.ok_or("project skill document is missing")?;
+    let object = document
+        .as_object()
+        .ok_or("project skill document is not an object")?;
+    ensure_object_keys(
+        document,
+        &[
+            "schema_version",
+            "config_revision",
+            "skills",
+            "disabled_skills",
+        ],
+    )?;
+    if object.get("schema_version").and_then(Value::as_u64) != Some(2)
+        || object
+            .get("config_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err("project skill document header is invalid");
+    }
+    let skills = object
+        .get("skills")
+        .and_then(Value::as_array)
+        .filter(|skills| skills.len() <= 512)
+        .ok_or("project skills are invalid")?;
+    let mut skill_ids = HashSet::with_capacity(skills.len());
+    for skill in skills {
+        if !skill.as_str().is_some_and(|reference| {
+            reference.starts_with("project:") && valid_skill_reference(Some(skill))
+        }) || !skill_ids.insert(skill.as_str().unwrap_or_default())
+        {
+            return Err("project skill reference is invalid");
+        }
+    }
+    let disabled = object
+        .get("disabled_skills")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or("disabled project skills are invalid")
+        })
+        .transpose()?;
+    if let Some(disabled) = disabled {
+        if disabled.len() > 512 {
+            return Err("disabled project skills are invalid");
+        }
+        let mut disabled_ids = HashSet::with_capacity(disabled.len());
+        for skill in disabled {
+            if !valid_global_skill_reference(Some(skill))
+                || !disabled_ids.insert(skill.as_str().unwrap_or_default())
+            {
+                return Err("disabled project skill reference is invalid");
+            }
+        }
+    }
+    validate_config_value(Some(document))
+}
+
+/// 配置问题只传达可执行的脱敏事实；此处固定字段、范围和动作闭集，防止问题列表成为任意文本通道。
+fn validate_config_issues(value: Option<&Value>) -> Result<(), &'static str> {
+    let issues = value
+        .and_then(Value::as_array)
+        .filter(|issues| issues.len() <= 64)
+        .ok_or("configuration issues are invalid")?;
+    let mut issue_ids = HashSet::with_capacity(issues.len());
+    for issue in issues {
+        ensure_object_keys(
+            issue,
+            &[
+                "id", "scope", "field", "entityId", "line", "column", "reason", "impact", "actions",
+            ],
+        )?;
+        let valid_nullable_text = |key: &str, maximum: usize| {
+            issue.get(key).is_some_and(|value| {
+                value.is_null()
+                    || value
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty() && text.len() <= maximum)
+            })
+        };
+        let valid_nullable_position = |key: &str| {
+            issue.get(key).is_some_and(|value| {
+                value.is_null()
+                    || value
+                        .as_u64()
+                        .is_some_and(|position| (1..=i32::MAX as u64).contains(&position))
+            })
+        };
+        let actions = issue
+            .get("actions")
+            .and_then(Value::as_array)
+            .filter(|actions| actions.len() <= 3)
+            .ok_or("configuration issue actions are invalid")?;
+        let mut action_names = HashSet::with_capacity(actions.len());
+        if !issue.get("id").and_then(Value::as_str).is_some_and(|id| {
+            id.starts_with("cfg_")
+                && id.len() <= 68
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        }) || !issue_ids.insert(issue.get("id").and_then(Value::as_str).unwrap_or_default())
+            || !matches!(
+                issue.get("scope").and_then(Value::as_str),
+                Some("user" | "project" | "credential")
+            )
+            || !valid_nullable_text("field", 128)
+            || !valid_nullable_text("entityId", 128)
+            || !valid_nullable_position("line")
+            || !valid_nullable_position("column")
+            || !issue
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    reason.len() <= 64
+                        && reason.chars().all(|character| {
+                            character.is_ascii_uppercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        })
+                })
+            || !issue
+                .get("impact")
+                .and_then(Value::as_str)
+                .is_some_and(|impact| {
+                    (1..=64).contains(&impact.len())
+                        && impact
+                            .chars()
+                            .all(|character| character.is_ascii_lowercase() || character == '_')
+                })
+            || actions.iter().any(|action| {
+                !action.as_str().is_some_and(|action| {
+                    matches!(action, "edit" | "retry" | "restore") && action_names.insert(action)
+                })
+            })
+        {
+            return Err("configuration issue is invalid");
+        }
+    }
+    Ok(())
 }
 
 /// 子智能体策略必须完整；跟随父任务时不得孤立覆盖思考等级，避免跨端产生不同的模型参数。
@@ -3984,7 +4207,7 @@ fn validate_config_mcp_auth(value: Option<&Value>) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 校验有界 Skill List 及其严格 Public Projection Field，禁止内部字段越过协议边界。
+/// 校验配置只保存全局来源限定引用，避免描述、路径或本项目授权副本进入用户文档。
 fn validate_config_skills(value: Option<&Value>) -> Result<(), &'static str> {
     let skills = value
         .and_then(Value::as_array)
@@ -3992,22 +4215,8 @@ fn validate_config_skills(value: Option<&Value>) -> Result<(), &'static str> {
         .ok_or("skills are invalid")?;
     let mut ids = HashSet::with_capacity(skills.len());
     for skill in skills {
-        let object = skill.as_object().ok_or("skill is not an object")?;
-        ensure_object_keys(
-            skill,
-            &["skill_id", "name", "scope", "enabled", "description"],
-        )?;
-        if !valid_prefixed_id(object.get("skill_id"), "skill_")
-            || !ids.insert(
-                object
-                    .get("skill_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
-            || !bounded_string(object.get("name"), 1, 512)
-            || !bounded_string(object.get("scope"), 1, 64)
-            || object.get("enabled").and_then(Value::as_bool).is_none()
-            || !bounded_string(object.get("description"), 0, 8_192)
+        if !valid_global_skill_reference(Some(skill))
+            || !ids.insert(skill.as_str().unwrap_or_default())
         {
             return Err("skill fields are invalid");
         }
@@ -4143,6 +4352,29 @@ fn valid_prefixed_id(value: Option<&Value>, prefix: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Skill 引用以来源和名称共同限定身份，名称禁止冒号与控制字符以保持三端解析一致。
+fn valid_skill_reference(value: Option<&Value>) -> bool {
+    let Some(reference) = value.and_then(Value::as_str) else {
+        return false;
+    };
+    let Some((source, name)) = reference.split_once(':') else {
+        return false;
+    };
+    matches!(source, "user" | "ja" | "project")
+        && !name.is_empty()
+        && name.len() <= 512
+        && !name.contains(':')
+        && name.chars().all(|character| !character.is_control())
+}
+
+/// 用户层只能登记可跨工作区使用的来源，项目来源必须留在受信任项目的独立文档。
+fn valid_global_skill_reference(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|reference| {
+        (reference.starts_with("user:") || reference.starts_with("ja:"))
+            && valid_skill_reference(value)
+    })
 }
 
 /// 校验所有服务端语义事件共享的实例身份、事件身份、全局序号、时间和 generation。

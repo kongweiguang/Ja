@@ -124,6 +124,12 @@ public interface AgentMapper {
      */
     int startTool(PersistenceRecords.ToolStart values);
 
+    /** 仅在 Tool 已 PREPARED 的同一事实事务内首次插入文件核实证据，重试不得覆盖原未知记录。 */
+    int insertToolRecoveryEvidence(PersistenceRecords.ToolRecoveryEvidenceInsert values);
+
+    /** 正常 Tool 终态只清理尚未进入恢复裁决的短暂证据，已裁决记录保留审计链。 */
+    int clearPendingToolRecovery(@Param("callId") String callId);
+
     /**
      * 仅完成尚未终结的 Tool，避免重复结果覆盖首个事实。
      */

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ProjectionMapper">
+  <resultMap id="projectionStageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ProjectionStageRow">
+    <constructor>
+      <idArg column="stage_id" javaType="string" />
+      <arg column="thread_id" javaType="string" />
+      <arg column="stage_number" javaType="_long" />
+      <arg column="source_revision" javaType="_long" />
+      <arg column="reason" javaType="string" />
+      <arg column="model_binding" javaType="string" />
+      <arg column="tool_binding" javaType="string" />
+      <arg column="created_at" javaType="string" />
+    </constructor>
+  </resultMap>
+  <resultMap id="projectionEntryRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ProjectionEntryRow">
+    <constructor><arg column="message_id" javaType="string" /><arg column="projection" javaType="string" /></constructor>
+  </resultMap>
+  <select id="selectLatestProjectionStage" resultMap="projectionStageRow">
+    SELECT stage_id,thread_id,stage_number,source_revision,reason,model_binding,tool_binding,created_at
+    FROM context_projection_stages WHERE thread_id=#{threadId} ORDER BY stage_number DESC LIMIT 1
+  </select>
+  <select id="selectProjectionStageIdentity" resultMap="projectionStageRow">
+    SELECT stage_id,thread_id,stage_number,source_revision,reason,model_binding,tool_binding,created_at
+    FROM context_projection_stages WHERE thread_id=#{threadId} AND source_revision=#{sourceRevision}
+      AND reason=#{reason} AND model_binding=#{modelBinding} AND tool_binding=#{toolBinding}
+    ORDER BY stage_number DESC LIMIT 1
+  </select>
+  <select id="selectProjectionEntries" resultMap="projectionEntryRow">
+    SELECT message_id,projection FROM context_projection_entries WHERE stage_id=#{stageId}
+  </select>
+  <select id="selectNextProjectionStageNumber" resultType="long">
+    SELECT COALESCE(MAX(stage_number), 0) + 1 FROM context_projection_stages WHERE thread_id=#{threadId}
+  </select>
+  <insert id="insertProjectionStage">
+    INSERT OR IGNORE INTO context_projection_stages(stage_id,thread_id,stage_number,source_revision,reason,model_binding,tool_binding,created_at)
+    VALUES(#{stageId},#{threadId},#{stageNumber},#{sourceRevision},#{reason},#{modelBinding},#{toolBinding},#{createdAt})
+  </insert>
+  <insert id="insertProjectionEntryIgnore">
+    INSERT OR IGNORE INTO context_projection_entries(stage_id,message_id,projection,created_at)
+    VALUES(#{stageId},#{messageId},#{projection},#{createdAt})
+  </insert>
+</mapper>

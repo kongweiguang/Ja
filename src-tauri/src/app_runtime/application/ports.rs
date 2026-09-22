@@ -11,11 +11,11 @@ use crate::app_runtime::domain::{
     TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput,
     TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
     TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
-    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted,
-    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
-    TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate,
-    TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspacePathSearchInput,
-    WorkspacePathSearchResult,
+    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
+    ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
+    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
+    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
+    WorkspaceDto, WorkspacePathSearchInput, WorkspacePathSearchResult,
 };
 use ja_runtime::app_server_process::{
     AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
@@ -68,6 +68,8 @@ define_operation_payload!(
     ConfigurationReplaceResult,
     ConfigurationResetParams,
     ConfigurationResetResult,
+    ConfigurationRestoreParams,
+    ConfigurationRestoreResult,
     CredentialSetParams,
     CredentialSetResult,
     CredentialDeleteParams,
@@ -86,6 +88,8 @@ define_operation_payload!(
     ThreadSearchResultData,
     ThreadReadParams,
     ThreadReadResultData,
+    ThreadUsageReadParams,
+    ThreadUsageReadResultData,
     ThreadRenameParams,
     ThreadRenameResultData,
     ThreadPinParams,
@@ -123,6 +127,7 @@ pub(crate) enum ConfigurationRequest {
     Patch(ConfigurationPatchParams),
     Replace(ConfigurationReplaceParams),
     Reset(ConfigurationResetParams),
+    Restore(ConfigurationRestoreParams),
     CredentialSet(CredentialSetParams),
     CredentialDelete(CredentialDeleteParams),
     CredentialRevealProvider(CredentialRevealProviderParams),
@@ -134,6 +139,7 @@ pub(crate) enum ConfigurationResponse {
     Patch(ConfigurationPatchResult),
     Replace(ConfigurationReplaceResult),
     Reset(ConfigurationResetResult),
+    Restore(ConfigurationRestoreResult),
     CredentialSet(CredentialSetResult),
     CredentialDelete(CredentialDeleteResult),
     CredentialRevealProvider(CredentialRevealProviderResult),
@@ -147,6 +153,7 @@ pub(crate) enum HistoryRequest {
     ThreadList(ThreadListParams),
     ThreadSearch(ThreadSearchParams),
     ThreadRead(ThreadReadParams),
+    ThreadUsageRead(ThreadUsageReadParams),
     ThreadRename(ThreadRenameParams),
     ThreadPin(ThreadPinParams),
     ThreadSeen(ThreadSeenParams),
@@ -165,6 +172,7 @@ pub(crate) enum HistoryResponse {
     ThreadList(ThreadListResultData),
     ThreadSearch(ThreadSearchResultData),
     ThreadRead(ThreadReadResultData),
+    ThreadUsageRead(ThreadUsageReadResultData),
     ThreadRename(ThreadRenameResultData),
     ThreadPin(ThreadPinResultData),
     ThreadSeen(ThreadSeenResultData),
@@ -223,6 +231,13 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
     fn turn_cancel(&self, input: TurnCancelInput) -> Result<TurnCancelResult, RuntimeCommandError>;
     /// 既有 fake 默认不声称支持持久恢复；生产 bridge 必须显式覆盖并路由到 Java owner。
     fn turn_resume(&self, _input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// fake 不得假装支持恢复裁决；生产 bridge 必须显式转发固定 JA-RPC method。
+    fn turn_recovery_respond(
+        &self,
+        _input: ToolRecoveryResponseInput,
+    ) -> Result<ToolRecoveryResponse, RuntimeCommandError> {
         Err(RuntimeCommandError::unavailable())
     }
     /// 旧 fake 默认失败关闭新队列能力；生产 bridge 必须显式覆盖四个固定 mutation。

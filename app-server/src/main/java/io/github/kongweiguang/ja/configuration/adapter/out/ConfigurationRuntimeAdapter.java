@@ -67,8 +67,14 @@ public final class ConfigurationRuntimeAdapter implements AutoCloseable, Configu
         this(homeOnlyConfiguration(homeDirectory), mapper);
     }
 
-    /** 注册脱敏变更监听并返回可幂等注销的窄生命周期句柄。 */
-    AutoCloseable addChangeListener(Consumer<ConfigurationRuntimeState.ConfigChanged> listener) {
+    /**
+     * 注册脱敏配置变更监听并返回可幂等注销句柄。
+     *
+     * <p>Watcher 自身只拥有文件与代际失效；启动组合通过这个窄入口把事件映射为连接通知，
+     * 从而不让 transport 依赖配置文档、路径或凭据实现。订阅者必须在连接关闭前注销，避免
+     * 已关闭 stdout 继续接收后台文件事件。</p>
+     */
+    public AutoCloseable addChangeListener(Consumer<ConfigurationRuntimeState.ConfigChanged> listener) {
         Objects.requireNonNull(listener, "listener");
         if (closed) throw error(ConfigurationError.Code.IO_FAILURE, "configuration service is closed");
         changeListeners.add(listener);
@@ -113,6 +119,15 @@ public final class ConfigurationRuntimeAdapter implements AutoCloseable, Configu
             ConfigurationScope scope, Path cwd, String expectedVersion) {
         ensureOpen();
         return toPortMutation(documents.reset(scope, cwd, expectedVersion));
+    }
+
+    /**
+     * 恢复只允许用户层最近完整快照，完成后由同一配置事件流促使所有窗口权威回读。
+     */
+    @Override
+    public synchronized ConfigurationData.MutationResult restoreLastKnownGood(String expectedVersion) {
+        ensureOpen();
+        return toPortMutation(documents.restoreLastKnownGood(ConfigurationScope.USER, null, expectedVersion));
     }
 
     /** 把唯一允许携带 Secret 的输入交给凭据文件所有者，结果只保留 configured 状态。 */
@@ -204,7 +219,7 @@ public final class ConfigurationRuntimeAdapter implements AutoCloseable, Configu
                 .map(ConfigGeneration.Diagnostic::code).toList();
         return new ConfigurationData.ReadResult(result.trusted(), toPortLayer(result.user()),
                 toPortLayer(result.project()), toDocument(result.effective()), credentials,
-                result.credentialVersion(), diagnostics);
+                result.credentialVersion(), diagnostics, result.issues());
     }
 
     /** 转换单个配置层；只有成功解析的文档才创建端口 Document。 */

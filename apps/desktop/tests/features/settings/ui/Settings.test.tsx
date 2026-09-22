@@ -1,6 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
@@ -146,14 +147,28 @@ function renderSettings(
 }
 
 describe("Settings v1 UI", () => {
-  /** 损坏文档不再把用户锁在错误页，恢复提示只引导到现有的完整模型编辑入口。 */
-  it("shows a non-blocking recovery notice and routes to models", async () => {
+  /** 历史快照只显示紧凑提示，问题在 Sheet 中处理并在关闭后还原入口焦点。 */
+  it("shows a non-blocking snapshot notice and returns focus from the issues sheet", async () => {
     const user = userEvent.setup();
     const onSectionChange = vi.fn();
+    const onIssuesRestore = vi.fn(async () => undefined);
     render(
       <Settings
         snapshot={SNAPSHOT}
-        recovery="user_config_corrupt"
+        issues={[
+          {
+            id: "cfg_last_known_good",
+            scope: "user",
+            field: null,
+            entityId: null,
+            line: null,
+            column: null,
+            reason: "LAST_KNOWN_GOOD_IN_USE",
+            impact: "snapshot_in_use",
+            actions: ["edit", "restore"],
+          },
+        ]}
+        onIssuesRestore={onIssuesRestore}
         ports={ports()}
         desktop={desktop()}
         section="general"
@@ -163,11 +178,55 @@ describe("Settings v1 UI", () => {
       />,
     );
 
-    expect(screen.getByRole("status", { name: "配置恢复模式" }).textContent).toContain(
-      "原文件尚未修改",
-    );
-    await user.click(screen.getByRole("button", { name: "配置服务商" }));
+    expect(screen.getByRole("status")).toHaveTextContent("正在使用上次可用设置");
+    const trigger = screen.getByRole("button", { name: "配置问题" });
+    await user.click(trigger);
+    const sheet = screen.getByRole("dialog", { name: "配置问题" });
+    expect(within(sheet).getByText("正在使用上次可用设置。")).toBeInTheDocument();
+    sheet.focus();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "配置问题" })).toBeNull());
+    expect(trigger).toHaveFocus();
+
+    await user.click(trigger);
+    await user.click(screen.getByRole("button", { name: "编辑" }));
     expect(onSectionChange).toHaveBeenCalledWith("models");
+  });
+
+  /** MCP 条目中的未知字段只影响该条目，详情与编辑必须按稳定 MCP 身份路由。 */
+  it("routes an MCP unknown-field issue to the MCP settings section", async () => {
+    const user = userEvent.setup();
+    const onSectionChange = vi.fn();
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        issues={[
+          {
+            id: "cfg_user_mcp_kerminal_unknown_schema_version",
+            scope: "user",
+            field: "schema_version",
+            entityId: "mcp_kerminal",
+            line: 18,
+            column: 1,
+            reason: "UNKNOWN_FIELD",
+            impact: "ignored",
+            actions: ["edit"],
+          },
+        ]}
+        ports={ports()}
+        desktop={desktop()}
+        section="general"
+        onSectionChange={onSectionChange}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={EXECUTION_SCOPE}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "配置问题" }));
+    const sheet = screen.getByRole("dialog", { name: "配置问题" });
+    expect(within(sheet).getByText("MCP 服务")).toBeInTheDocument();
+    await user.click(within(sheet).getByRole("button", { name: "编辑" }));
+    expect(onSectionChange).toHaveBeenCalledWith("mcp");
   });
 
   /** 搜索需要先切换供应商再聚焦真实模型；同一搜索再次执行也必须生效。 */
@@ -306,50 +365,95 @@ describe("Settings v1 UI", () => {
     expect(screen.getByText("没有匹配的设置")).toBeDefined();
   });
 
-  /** 四个真实来源始终占据稳定位置，空目录不会让页面结构在刷新时跳动。 */
-  it("groups discovered Skills by built-in, user, Ja, and project source", async () => {
+  /** 全局与项目 Skill 使用独立作用域，切换后操作必须携带实际写入边界。 */
+  it("separates global and project Skills while preserving source labels", async () => {
     const onToggleSkill = vi.fn(async () => undefined);
-    renderSettings("skills", ports({ onToggleSkill }), {
-      ...SNAPSHOT,
-      skills: [
-        {
-          id: "skill_review",
-          name: "review",
-          source: "user",
-          description: "Review changes",
-          enabled: false,
-          status: "disabled",
-        },
-        {
-          id: "skill_ja_tools",
-          name: "ja-tools",
-          source: "ja",
-          description: "Ja tools",
-          enabled: true,
-          status: "ready",
-        },
-        {
-          id: "skill_project_rules",
-          name: "project-rules",
-          source: "project",
-          description: "Project rules",
-          enabled: true,
-          status: "ready",
-        },
-      ],
-    });
+    const globalSkills = [
+      {
+        id: "builtin:review",
+        name: "builtin-review",
+        source: "builtin" as const,
+        description: "Bundled review",
+        enabled: true,
+        status: "ready" as const,
+      },
+      {
+        id: "user:review",
+        name: "review",
+        source: "user" as const,
+        description: "Review changes",
+        enabled: false,
+        status: "disabled" as const,
+      },
+      {
+        id: "ja:tools",
+        name: "ja-tools",
+        source: "ja" as const,
+        description: "Ja tools",
+        enabled: true,
+        status: "ready" as const,
+      },
+    ];
+    const projectSkills = [
+      {
+        id: "project:rules",
+        name: "project-rules",
+        source: "project" as const,
+        description: "Project rules",
+        enabled: true,
+        status: "ready" as const,
+      },
+    ];
+    render(
+      <Settings
+        snapshot={{ ...SNAPSHOT, skills: globalSkills }}
+        skillSettings={{ global: globalSkills, project: projectSkills, projectAvailable: true }}
+        ports={ports({ onToggleSkill })}
+        desktop={desktop()}
+        section="skills"
+        onSectionChange={vi.fn()}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={EXECUTION_SCOPE}
+      />,
+    );
 
-    for (const heading of ["内置", "用户", "Ja", "项目"]) {
-      expect(screen.getByRole("heading", { name: heading })).toBeDefined();
+    for (const label of ["内置", "用户", "Ja"]) {
+      expect(screen.getByText(label, { selector: ".ja-skill-row-title span" })).toBeInTheDocument();
     }
-    expect(screen.getByText("随 Ja 提供")).toBeDefined();
-    expect(screen.getByText("~/.agents/skills")).toBeDefined();
-    expect(screen.getByText("~/.ja/skills")).toBeDefined();
-    expect(screen.getByText(".agents/skills")).toBeDefined();
-    expect(screen.getByText("暂无 Skills")).toBeDefined();
+    expect(screen.getByRole("heading", { name: "builtin-review" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "review" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "ja-tools" })).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("switch", { name: "review：已停用" }));
-    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("skill_review", true));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("switch", { name: "review：已停用" }));
+    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("user:review", true, "user"));
+
+    await user.click(screen.getByRole("tab", { name: "当前项目" }));
+    expect(screen.getByText("项目")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "project-rules" })).toBeInTheDocument();
+    await user.click(screen.getByRole("switch", { name: "project-rules：已启用" }));
+    await waitFor(() =>
+      expect(onToggleSkill).toHaveBeenCalledWith("project:rules", false, "project"),
+    );
+  });
+
+  /** 项目侧没有可管理项时保留明确空状态，不复用全局列表误导用户。 */
+  it("shows an empty project scope without falling back to global Skills", async () => {
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        skillSettings={{ global: SNAPSHOT.skills, project: [], projectAvailable: true }}
+        ports={ports()}
+        desktop={desktop()}
+        section="skills"
+        onSectionChange={vi.fn()}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={EXECUTION_SCOPE}
+      />,
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "当前项目" }));
+    expect(screen.getByRole("status")).toHaveTextContent("暂无 Skills");
   });
 
   it("shows one return action without duplicate heading, scope, or conversation controls", async () => {
@@ -842,6 +946,38 @@ describe("Settings v1 UI", () => {
     await user.click(themeSelect);
     expect(document.querySelector(".ja-select-content") !== null).toBe(true);
     expect(document.querySelector(".ja-settings-select-content")).toBe(null);
+  });
+
+  /** 切换工作区的权威快照尚未返回时，Skills 不得沿用上一个项目的可编辑投影。 */
+  it("disables Skills controls until the current settings scope is ready", () => {
+    render(
+      <Settings
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={EXECUTION_SCOPE}
+        snapshot={SNAPSHOT}
+        skillSettings={{
+          global: [
+            {
+              id: "user:review",
+              name: "review",
+              source: "user",
+              description: "检查变更。",
+              enabled: false,
+              status: "disabled",
+            },
+          ],
+          projectAvailable: false,
+        }}
+        ports={ports()}
+        desktop={desktop()}
+        section="skills"
+        onSectionChange={vi.fn()}
+        disabled
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "全局" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "review：已停用" })).toBeDisabled();
   });
 
   it("offers five keyboard-selectable palettes with decorative color previews", async () => {

@@ -1,8 +1,8 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { ChevronDown, Clock3, Files, ShieldAlert, Terminal, Wrench } from "lucide-react";
-import { useState, type ReactElement } from "react";
+import { ChevronDown, Clock3, Files, ListTree, ShieldAlert, Terminal, Wrench } from "lucide-react";
+import { useLayoutEffect, useRef, useState, type ReactElement } from "react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -31,6 +31,13 @@ import "./timeline.css";
 export interface WorkProcessProps {
   steps: readonly WorkStepAdapter[];
   turn?: TimelineTurn;
+  /**
+   * Timeline 根据权威 Turn 和最终答复决定何时把过程归档；inline 保持正文直出，避免流式阶段
+   * 先出现一层无操作价值的总折叠栏。未传入时保留独立复用场景的既有折叠语义。
+   */
+  displayMode?: WorkProcessDisplayMode;
+  /** 用户没有跟随最新内容时不自动收口，避免完成事件改变正在阅读的历史位置。 */
+  autoCollapse?: boolean;
   /** Workspace 生命周期内的瞬态折叠选择，不进入协议或持久化。 */
   disclosureCache?: TimelineDisclosureCache;
   /** 当前 exchange 的稳定 identity；与 Thread 一起隔离多轮回复。 */
@@ -51,8 +58,19 @@ export interface WorkProcessProps {
     callId: string;
     artifactId: string;
   }) => Promise<string>;
+  onResolveToolRecovery?: (input: {
+    threadId: string;
+    turnId: string;
+    callId: string;
+    expectedThreadRevision: number;
+    expectedRecoveryRevision: number;
+    decision: "retry" | "skip";
+    idempotencyKey: string;
+  }) => Promise<unknown>;
   className?: string;
 }
+
+export type WorkProcessDisplayMode = "inline" | "archived";
 
 type WorkProcessState =
   | "queued"
@@ -129,6 +147,9 @@ function processStatusLabel(state: WorkProcessState): string {
 
 /** 使用熟悉的 Tool Icon，但不增加第二套前端 Item Taxonomy。 */
 function StepIcon({ step }: { step: WorkStepAdapter }): ReactElement {
+  if (step.metadata?.presentation?.kind === "context") {
+    return <ListTree aria-hidden="true" />;
+  }
   if (step.metadata?.presentation?.kind === "shell") {
     return <Terminal aria-hidden="true" />;
   }
@@ -234,16 +255,35 @@ function sumOptional(values: readonly (number | undefined)[]): number | undefine
 }
 
 /**
- * 将相邻 Tool Work 分组到单个 Radix Disclosure，使繁忙 Turn 保持可读；运行、失败和阻塞态展开，
- * 纯成功完成态默认折叠，而 Workspace 缓存中的人工选择始终优先。
- *
+ * 自动归档只在用户没有选择或聚焦过程内容时进行。该检查只在 layout effect 中读取上一轮已提交的
+ * DOM，恰好覆盖流式 Turn 切为 completed 的渲染边界；一旦保留展开，后续事件不会反复改写阅读决定。
+ */
+function processReadingIsActive(element: HTMLElement | null): boolean {
+  if (element === null || typeof document === "undefined" || typeof window === "undefined") {
+    return false;
+  }
+  if (document.activeElement !== null && element.contains(document.activeElement)) return true;
+  const selection = window.getSelection();
+  return (
+    selection !== null &&
+    selection.toString().trim() !== "" &&
+    (element.contains(selection.anchorNode) || element.contains(selection.focusNode))
+  );
+}
+
+/**
+ * 将相邻 Tool Work 保持在同一语义容器中：流式阶段直出正文和工具，只有权威最终答复已到位后才
+ * 自动归档为单个 Disclosure。失败与取消的归档默认展开，阻塞场景继续直出可操作内容；未传入
+ * displayMode 的独立复用场景沿用既有折叠策略。
  * 未决审批是继续执行的阻塞点，即使关联 command 已完成也必须保持展开，
  * 否则用户会看不到唯一可解除阻塞的审批按钮。
- * 标题左侧只保留过程名称，状态、局部失败、耗时与步骤数集中在右侧，避免重复图标和数字徽标抢占内容层级。
+ * 归档入口只保留处理概览，运行态不增加总标题、状态或步骤统计，避免与底部唯一的“正在工作”重复。
  */
 export function WorkProcess({
   steps,
   turn,
+  displayMode,
+  autoCollapse = true,
   disclosureCache,
   disclosureKey,
   disclosureThreadId,
@@ -254,6 +294,7 @@ export function WorkProcess({
   onOpenLink,
   onCopyText,
   onReadToolArtifact,
+  onResolveToolRecovery,
   className,
 }: WorkProcessProps): ReactElement | null {
   // 安全 Commentary 与公开 Reasoning 保留为正文；空摘要不创建占位行，Tool 继续承担可操作步骤身份。
@@ -273,6 +314,23 @@ export function WorkProcess({
     );
   const state = processState(visibleSteps, turn, approvalPending);
   const [manualOpen, setManualOpen] = useState<boolean>();
+  const rootRef = useRef<HTMLElement>(null);
+  const [archivedDefaultOpen, setArchivedDefaultOpen] = useState<boolean>();
+  const inline = displayMode === "inline";
+  const archived = displayMode === "archived";
+
+  useLayoutEffect(() => {
+    if (!archived) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- 切离归档需同步清除本地默认值，防止下一轮复用旧阅读决定。
+      setArchivedDefaultOpen(undefined);
+      return;
+    }
+    setArchivedDefaultOpen(
+      (previous) =>
+        previous ??
+        (state !== "completed" || !autoCollapse || processReadingIsActive(rootRef.current)),
+    );
+  }, [archived, autoCollapse, state]);
 
   if (
     visibleSteps.length === 0 &&
@@ -311,25 +369,48 @@ export function WorkProcess({
     disclosureCache !== undefined && disclosureThreadId !== undefined && disclosureKey !== undefined
       ? disclosureCache.get(disclosureThreadId, "process", disclosureKey)
       : undefined;
-  // 失败、阻塞与运行态必须直接可见；纯成功完成态才自动收起，手动选择优先且跨虚拟卸载保留。
-  const open =
-    cachedOpen ?? manualOpen ?? (state !== "completed" || approvalPending || failedStepCount > 0);
+  // 归档阶段仅在跟随最新内容且用户未阅读过程时默认收起；其余状态仍以可见性优先。
+  const open = inline
+    ? true
+    : (cachedOpen ??
+      manualOpen ??
+      (archived
+        ? (archivedDefaultOpen ?? (state !== "completed" || !autoCollapse))
+        : state !== "completed" || approvalPending || failedStepCount > 0));
   const statusLabel = processStatusLabel(state);
   const recoveredFailureCount = state === "completed" ? failedStepCount : 0;
   const hasDetails = visibleSteps.length > 0 || visibleApprovals.length > 0;
   const completedCollapsed = state === "completed" && !open;
-  const headingLabel = completedCollapsed ? "查看工作过程" : "工作过程";
-  const accessibleSummary = [
-    headingLabel,
-    statusLabel,
-    recoveredFailureCount > 0 ? `${recoveredFailureCount} 步失败` : undefined,
-    duration,
-    actionableSteps.length > 0 ? `${actionableSteps.length} 步` : undefined,
-  ]
-    .filter((label): label is string => label !== undefined)
-    .join("，");
+  const headingLabel = archived
+    ? open
+      ? "收起工作过程"
+      : "查看工作过程"
+    : completedCollapsed
+      ? "查看工作过程"
+      : "工作过程";
+  // 成功收口不重复步骤数量或状态；只有已恢复的 Tool 失败需要在折叠态保留可见提醒。
+  const archiveSummary = recoveredFailureCount > 0 ? [`${recoveredFailureCount} 步失败`] : [];
+  const accessibleSummary = archived
+    ? [headingLabel, ...archiveSummary].join("，")
+    : [
+        headingLabel,
+        statusLabel,
+        recoveredFailureCount > 0 ? `${recoveredFailureCount} 步失败` : undefined,
+        duration,
+        actionableSteps.length > 0 ? `${actionableSteps.length} 步` : undefined,
+      ]
+        .filter((label): label is string => label !== undefined)
+        .join("，");
   /** 将用户选择同时写入当前挂载与 Workspace 缓存，避免受控折叠等待下一次外部渲染才响应。 */
   const updateOpen = (nextOpen: boolean): void => {
+    const content = rootRef.current?.querySelector<HTMLElement>(".ja-work-process__content");
+    const activeElement = typeof document === "undefined" ? null : document.activeElement;
+    const handOffFocus =
+      !nextOpen &&
+      activeElement instanceof HTMLElement &&
+      content !== null &&
+      content !== undefined &&
+      content.contains(activeElement);
     if (
       disclosureCache !== undefined &&
       disclosureThreadId !== undefined &&
@@ -338,9 +419,26 @@ export function WorkProcess({
       disclosureCache.set(disclosureThreadId, "process", disclosureKey, nextOpen);
     }
     setManualOpen(nextOpen);
+    if (handOffFocus) {
+      // Radix 会保留关闭动画中的子树；主动交还焦点，避免键盘焦点留在即将隐藏的详情内。
+      queueMicrotask(() => {
+        rootRef.current?.querySelector<HTMLButtonElement>(".ja-work-process__trigger")?.focus();
+      });
+    }
   };
 
-  const headerContent = (
+  const headerContent = archived ? (
+    <span className="ja-work-process__heading ja-work-process__heading--archive">
+      <strong>{headingLabel}</strong>
+      <ChevronDown aria-hidden="true" className="ja-work-process__chevron" />
+      {archiveSummary.map((summary) => (
+        <span className="ja-work-process__archive-summary" key={summary}>
+          <span aria-hidden="true">·</span>
+          {summary}
+        </span>
+      ))}
+    </span>
+  ) : (
     <>
       <span className="ja-work-process__heading">
         <strong>{headingLabel}</strong>
@@ -391,130 +489,156 @@ export function WorkProcess({
       ? `${step.turnId}:${step.metadata?.phase ?? step.kind}:${index}`
       : step.itemId;
 
+  const processContent = (
+    <>
+      {visibleSteps.length > 0 ? (
+        <ol className="ja-work-process__steps">
+          {visibleSteps.map((step, index) => {
+            const detail = stepDetail(step);
+            if (isReasoningItem(step) && detail !== undefined) {
+              return (
+                <li
+                  key={visibleStepKey(step, index)}
+                  className="ja-work-step--reasoning"
+                  data-role="reasoning"
+                  aria-label="模型思考"
+                >
+                  <MarkdownMessage
+                    content={detail}
+                    onOpenLink={onOpenLink}
+                    onCopyText={onCopyText}
+                  />
+                </li>
+              );
+            }
+            if (step.kind === "commentary" && detail !== undefined) {
+              return (
+                <li
+                  key={visibleStepKey(step, index)}
+                  className="ja-work-step--commentary"
+                  data-role="commentary"
+                  aria-label="助手进展"
+                >
+                  <MarkdownMessage
+                    content={detail}
+                    onOpenLink={onOpenLink}
+                    onCopyText={onCopyText}
+                  />
+                </li>
+              );
+            }
+            // ToolPresentation 已在详情中显示自身耗时；通用步骤耗时只服务 commentary 等非 Tool 项，避免重复事实。
+            const stepDuration =
+              step.metadata?.presentation === undefined
+                ? formatDuration(itemDurationMs(step))
+                : undefined;
+            const hasPresentation = step.metadata?.presentation !== undefined;
+            return (
+              <li key={step.itemId} className={cn("ja-work-step", `ja-work-step-${step.status}`)}>
+                <span className="ja-work-step__icon" aria-hidden="true">
+                  <StepIcon step={step} />
+                </span>
+                <div className="ja-work-step__body">
+                  {hasPresentation ? null : (
+                    <div className="ja-work-step__header">
+                      <strong>{workStepLabel(step)}</strong>
+                      <span>{presentedStepStatusLabel(step)}</span>
+                    </div>
+                  )}
+                  {!hasPresentation && stepDetail(step) ? (
+                    <MarkdownMessage
+                      content={stepDetail(step) ?? ""}
+                      className="ja-work-step__detail"
+                      onOpenLink={onOpenLink}
+                      onCopyText={onCopyText}
+                    />
+                  ) : null}
+                  {step.metadata?.presentation === undefined ? null : (
+                    <ToolStepDetails
+                      step={step}
+                      disclosureCache={disclosureCache}
+                      disclosureKey={`${disclosureKey ?? step.turnId}:${step.itemId}`}
+                      disclosureThreadId={disclosureThreadId ?? step.threadId}
+                      onReadArtifact={onReadToolArtifact}
+                      recoveryThreadRevision={turn?.threadRevision}
+                      onResolveRecovery={onResolveToolRecovery}
+                    />
+                  )}
+                  {stepDuration ? (
+                    <span className="ja-work-step__duration">
+                      <Clock3 aria-hidden="true" />
+                      {stepDuration}
+                    </span>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+      {visibleApprovals.map((approval) => (
+        <ApprovalCard
+          key={approval.approvalId}
+          approval={approval}
+          resolvedDecision={approvalDecisions[approval.approvalId]}
+          closedAt={approvalClosedAt[approval.approvalId]}
+          onResolve={
+            onApprovalDecision === undefined
+              ? undefined
+              : (decision) => onApprovalDecision(approval, decision)
+          }
+        />
+      ))}
+    </>
+  );
+
+  if (inline && !hasDetails) return null;
+
   return (
     <section
-      className={cn("ja-work-process", `ja-work-process-${state}`, className)}
+      className={cn(
+        "ja-work-process",
+        `ja-work-process-${state}`,
+        inline && "ja-work-process--inline",
+        archived && "ja-work-process--archived",
+        className,
+      )}
       aria-label="工作过程"
       data-state={state}
+      ref={rootRef}
     >
-      <Collapsible open={open} onOpenChange={updateOpen}>
-        {hasDetails ? (
-          <CollapsibleTrigger className="ja-work-process__trigger" aria-label={accessibleSummary}>
-            {headerContent}
-          </CollapsibleTrigger>
-        ) : (
-          <div
-            className="ja-work-process__trigger ja-work-process__trigger--static"
-            role="status"
-            aria-label={accessibleSummary}
-          >
-            {headerContent}
-          </div>
-        )}
-        {hasDetails ? (
-          <CollapsibleContent className="ja-work-process__content">
-            {visibleSteps.length > 0 ? (
-              <ol className="ja-work-process__steps">
-                {visibleSteps.map((step, index) => {
-                  const detail = stepDetail(step);
-                  if (isReasoningItem(step) && detail !== undefined) {
-                    return (
-                      <li
-                        key={visibleStepKey(step, index)}
-                        className="ja-work-step--reasoning"
-                        data-role="reasoning"
-                        aria-label="模型思考"
-                      >
-                        <MarkdownMessage
-                          content={detail}
-                          onOpenLink={onOpenLink}
-                          onCopyText={onCopyText}
-                        />
-                      </li>
-                    );
-                  }
-                  if (step.kind === "commentary" && detail !== undefined) {
-                    return (
-                      <li
-                        key={visibleStepKey(step, index)}
-                        className="ja-work-step--commentary"
-                        data-role="commentary"
-                        aria-label="助手进展"
-                      >
-                        <MarkdownMessage
-                          content={detail}
-                          onOpenLink={onOpenLink}
-                          onCopyText={onCopyText}
-                        />
-                      </li>
-                    );
-                  }
-                  // ToolPresentation 已在详情中显示自身耗时；通用步骤耗时只服务 commentary 等非 Tool 项，避免重复事实。
-                  const stepDuration =
-                    step.metadata?.presentation === undefined
-                      ? formatDuration(itemDurationMs(step))
-                      : undefined;
-                  const hasPresentation = step.metadata?.presentation !== undefined;
-                  return (
-                    <li
-                      key={step.itemId}
-                      className={cn("ja-work-step", `ja-work-step-${step.status}`)}
-                    >
-                      <span className="ja-work-step__icon" aria-hidden="true">
-                        <StepIcon step={step} />
-                      </span>
-                      <div className="ja-work-step__body">
-                        {hasPresentation ? null : (
-                          <div className="ja-work-step__header">
-                            <strong>{workStepLabel(step)}</strong>
-                            <span>{presentedStepStatusLabel(step)}</span>
-                          </div>
-                        )}
-                        {!hasPresentation && stepDetail(step) ? (
-                          <MarkdownMessage
-                            content={stepDetail(step) ?? ""}
-                            className="ja-work-step__detail"
-                            onOpenLink={onOpenLink}
-                            onCopyText={onCopyText}
-                          />
-                        ) : null}
-                        {step.metadata?.presentation === undefined ? null : (
-                          <ToolStepDetails
-                            step={step}
-                            disclosureCache={disclosureCache}
-                            disclosureKey={`${disclosureKey ?? step.turnId}:${step.itemId}`}
-                            disclosureThreadId={disclosureThreadId ?? step.threadId}
-                            onReadArtifact={onReadToolArtifact}
-                          />
-                        )}
-                        {stepDuration ? (
-                          <span className="ja-work-step__duration">
-                            <Clock3 aria-hidden="true" />
-                            {stepDuration}
-                          </span>
-                        ) : null}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ol>
-            ) : null}
-            {visibleApprovals.map((approval) => (
-              <ApprovalCard
-                key={approval.approvalId}
-                approval={approval}
-                resolvedDecision={approvalDecisions[approval.approvalId]}
-                closedAt={approvalClosedAt[approval.approvalId]}
-                onResolve={
-                  onApprovalDecision === undefined
-                    ? undefined
-                    : (decision) => onApprovalDecision(approval, decision)
-                }
-              />
-            ))}
-          </CollapsibleContent>
-        ) : null}
-      </Collapsible>
+      {inline ? (
+        <div className="ja-work-process__content ja-work-process__content--inline">
+          {processContent}
+        </div>
+      ) : (
+        <Collapsible open={open} onOpenChange={updateOpen}>
+          {hasDetails ? (
+            <CollapsibleTrigger
+              className={cn(
+                "ja-work-process__trigger",
+                archived && "ja-work-process__trigger--archive",
+              )}
+              aria-label={accessibleSummary}
+            >
+              {headerContent}
+            </CollapsibleTrigger>
+          ) : (
+            <div
+              className="ja-work-process__trigger ja-work-process__trigger--static"
+              role="status"
+              aria-label={accessibleSummary}
+            >
+              {headerContent}
+            </div>
+          )}
+          {hasDetails ? (
+            <CollapsibleContent className="ja-work-process__content">
+              {processContent}
+            </CollapsibleContent>
+          ) : null}
+        </Collapsible>
+      )}
     </section>
   );
 }

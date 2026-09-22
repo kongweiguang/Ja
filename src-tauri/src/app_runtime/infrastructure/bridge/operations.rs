@@ -939,6 +939,85 @@ pub(crate) fn parse_turn_resume_result(
     parse_turn_accepted_result(value, Some(requested_turn_id), true)
 }
 
+/// 解析恢复裁决的紧凑 ACK；最终 Tool/Turn 状态仍由标准事件与重读快照投影，避免 ACK 伪造完成。
+pub(super) fn turn_recovery_respond_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<ToolRecoveryResponse, RuntimeCommandError> {
+    let current = runtime
+        .as_mut()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    if let Some(session) = current.supervisor.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    // 请求 body 会移交给 supervisor；先复制用于回执比对的窄身份，不能让解析结果借用已发送载荷。
+    let requested_turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|value| valid_frozen_turn_id(value))
+        .ok_or_else(RuntimeCommandError::invalid_params)?
+        .to_owned();
+    let requested_decision = params
+        .get("decision")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "retry" | "skip"))
+        .ok_or_else(RuntimeCommandError::invalid_params)?
+        .to_owned();
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let response = current
+        .supervisor
+        .request("turn/recovery/respond", params, timeout)
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    parse_turn_recovery_respond_result(&requested_turn_id, &requested_decision, &value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolRecoveryResponseWire {
+    accepted: bool,
+    turn_id: String,
+    thread_revision: u64,
+    decision: String,
+    resumed: bool,
+}
+
+/// 锁定原请求的 Turn 与选择，防止 sidecar 错配裁决回执被错误应用到另一条 Tool 详情。
+pub(crate) fn parse_turn_recovery_respond_result(
+    expected_turn_id: &str,
+    expected_decision: &str,
+    value: &Value,
+) -> Result<ToolRecoveryResponse, RuntimeCommandError> {
+    let result = value
+        .get("result")
+        .cloned()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    let result: ToolRecoveryResponseWire =
+        serde_json::from_value(result).map_err(|_| RuntimeCommandError::unavailable())?;
+    if !result.accepted
+        || !valid_frozen_turn_id(&result.turn_id)
+        || result.turn_id != expected_turn_id
+        || result.thread_revision > 9_007_199_254_740_991
+        || result.decision != expected_decision
+        || !matches!(result.decision.as_str(), "retry" | "skip")
+    {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    Ok(ToolRecoveryResponse {
+        accepted: result.accepted,
+        turn_id: result.turn_id,
+        thread_revision: result.thread_revision,
+        decision: result.decision,
+        resumed: result.resumed,
+    })
+}
+
 /// Actor 只签发当前 Ready generation 的窄读取 lease，正文等待由调用线程承担。
 pub(super) fn turn_change_set_read_lease_runtime(
     runtime: &mut Option<RunningRuntime>,

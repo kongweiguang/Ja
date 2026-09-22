@@ -11,6 +11,7 @@ import {
   type ComposerProps,
   type ComposerSubmit,
 } from "@/features/conversation/ui/composer/Composer";
+import type { ConversationUsageSummary } from "@/features/conversation/application/ports";
 import type { ConversationContextReference } from "@/features/conversation/domain/userContent";
 
 const PREFERENCES = {
@@ -46,6 +47,26 @@ const MODELS = [
     defaultReasoningLevel: null,
   },
 ];
+
+const USAGE_SUMMARY: ConversationUsageSummary = {
+  threadId: "thr_usage",
+  snapshotRevision: 6,
+  requestCount: 3,
+  measuredRequestCount: 3,
+  newInputRequestCount: 3,
+  newInputTokens: 12_400,
+  outputRequestCount: 3,
+  outputTokens: 2_100,
+  totalRequestCount: 3,
+  totalTokens: 14_500,
+  cacheReadRequestCount: 2,
+  cacheReadTokens: 6_200,
+  cacheWriteRequestCount: 1,
+  cacheWriteTokens: 900,
+  cacheCompleteRequestCount: 2,
+  cacheCompleteInputTokens: 12_400,
+  cacheCompleteReadTokens: 6_200,
+};
 
 interface ControlledComposerHarnessProps extends Omit<ComposerProps, "text" | "onTextChange"> {
   initialText?: string;
@@ -1313,6 +1334,88 @@ describe("Composer", () => {
     expect(cancel).toHaveBeenCalledOnce();
   });
 
+  it("最新失败轮次在空草稿时显示继续，输入或附件草稿后恢复发送语义", async () => {
+    const user = userEvent.setup();
+    const continueReply = vi.fn();
+    const send = vi.fn();
+    const { rerender } = render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        continuationAvailable
+        onContinue={continueReply}
+        onSend={send}
+      />,
+    );
+
+    const continueButton = screen.getByRole("button", { name: "继续回复" });
+    expect(continueButton).toBeEnabled();
+    await user.click(continueButton);
+    expect(continueReply).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "补充说明");
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "继续回复" })).not.toBeInTheDocument();
+
+    rerender(
+      <ControlledComposerHarness
+        key="attachment-draft"
+        preferences={PREFERENCES}
+        models={MODELS}
+        continuationAvailable
+        attachmentDraftItems={[
+          {
+            state: "importing",
+            operationId: "operation_importing",
+            attemptId: "attempt_importing",
+            itemId: "item_importing",
+            fileName: "正在导入.txt",
+            sizeBytes: 32,
+            mediaKind: "text",
+            phase: "copying",
+            bytesCopied: 0,
+          },
+        ]}
+        onContinue={continueReply}
+        onSend={send}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "继续回复" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+
+    rerender(
+      <ControlledComposerHarness
+        key="skill-draft"
+        preferences={PREFERENCES}
+        models={MODELS}
+        continuationAvailable
+        initialContextReferences={[{ type: "skill_reference", skillId: "skill_one" }]}
+        onContinue={continueReply}
+        onSend={send}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "继续回复" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+  });
+
+  it("空草稿的发送快捷键不触发续答", async () => {
+    const user = userEvent.setup();
+    const continueReply = vi.fn();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        continuationAvailable
+        onContinue={continueReply}
+        onSend={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("textbox", { name: "消息" }));
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    expect(continueReply).not.toHaveBeenCalled();
+  });
+
   /** ready 附件本身就是可提交内容，活动 Turn 不要求用户补一段占位正文。 */
   it("活动 Turn 可将仅附件草稿加入队列", async () => {
     const user = userEvent.setup();
@@ -1686,24 +1789,23 @@ describe("Composer", () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  /** 无真实 Usage 时底栏不占位；存在时 hover 与键盘焦点共享同一份精确 Tooltip。 */
-  it("按需显示可聚焦的上下文使用量与 Token 详情", async () => {
+  /** 浮层只在显式展开时读取服务端账本，并把累计值与最近请求窗口分区展示。 */
+  it("按需展示本会话累计用量、部分数据和最近请求窗口", async () => {
     const user = userEvent.setup();
-    const { rerender } = render(
-      <ControlledComposerHarness preferences={PREFERENCES} models={MODELS} onSend={vi.fn()} />,
-    );
-    expect(screen.queryByRole("progressbar", { name: "上下文使用量" })).not.toBeInTheDocument();
-
-    rerender(
+    const reader = { read: vi.fn().mockResolvedValue(USAGE_SUMMARY) };
+    render(
       <ControlledComposerHarness
         preferences={PREFERENCES}
         models={MODELS}
+        threadId="thr_usage"
+        runtimeGeneration={4}
+        usageReader={reader}
         contextUsage={{
           certainty: "known",
-          usedTokens: 179_000,
-          limitTokens: 258_000,
-          percentage: 69,
-          ringPercentage: 69.37984496124031,
+          usedTokens: 55_000,
+          limitTokens: 272_000,
+          percentage: 20.2,
+          ringPercentage: 20.220588235294116,
           tone: "neutral",
           source: "provider",
           measuredAt: "2026-08-31T00:00:00Z",
@@ -1712,65 +1814,200 @@ describe("Composer", () => {
       />,
     );
     const indicator = screen.getByRole("progressbar", { name: "上下文使用量" });
-    expect(indicator).toHaveAttribute("aria-valuenow", "69");
+    expect(indicator).toHaveAttribute("data-tone", "neutral");
+    expect(indicator).toHaveAttribute("aria-valuenow", "20.2");
     expect(indicator).toHaveAttribute(
       "aria-valuetext",
-      "已使用 69%，179K / 258K tokens，最近模型请求",
+      "已使用 20.2%，55K / 272K tokens，最近模型请求",
     );
-    await user.hover(indicator);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("上下文69%179K / 258K tokens");
-    await user.unhover(indicator);
-    indicator.focus();
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("最近模型请求");
-    expect(indicator).toHaveFocus();
+    const trigger = screen.getByRole("button", { name: "上下文用量详情" });
+    await user.click(trigger);
+    await waitFor(() => expect(reader.read).toHaveBeenCalledWith({ threadId: "thr_usage" }));
+    expect(await screen.findByText("Token · 本会话")).toBeVisible();
+    expect(screen.getByText("12,400")).toBeVisible();
+    expect(screen.getByText("2,100")).toBeVisible();
+    expect(screen.getByText("6,200")).toBeVisible();
+    expect(screen.getByText("900")).toBeVisible();
+    expect(screen.getByText("14,500")).toBeVisible();
+    expect(screen.getByText("50.0%")).toBeVisible();
+    expect(screen.getAllByText("部分数据")).toHaveLength(2);
+    expect(screen.getByText("上下文 · 最近请求")).toBeVisible();
+    expect(screen.getByText("20.2%")).toBeVisible();
+    expect(screen.getByText("55K / 272K")).toBeVisible();
   });
 
-  /** 真实 Provider Usage 接近上限时保留 progressbar 语义，颜色只作为冗余信号。 */
-  it("为接近上限的 Provider 计量投影危险状态", () => {
+  /** Provider 未报告计量时保持未知，账本为空也只引导发送消息，不能伪造成 0 Token。 */
+  it("以未知态保留固定圆环并在无请求时给出可恢复提示", async () => {
+    const user = userEvent.setup();
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        ...USAGE_SUMMARY,
+        threadId: "thr_usage_empty",
+        requestCount: 0,
+        measuredRequestCount: 0,
+        newInputRequestCount: 0,
+        outputRequestCount: 0,
+        totalRequestCount: 0,
+        cacheReadRequestCount: 0,
+        cacheWriteRequestCount: 0,
+        cacheCompleteRequestCount: 0,
+      }),
+    };
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_empty"
+        usageReader={reader}
+        contextUsage={{
+          certainty: "unknown",
+          source: "provider",
+          measuredAt: "2026-09-22T00:00:00Z",
+        }}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("progressbar", { name: "上下文使用量" })).toBeNull();
+    const indicator = screen.getByRole("img", { name: "上下文使用量待确认" });
+    expect(indicator).toHaveAttribute("data-tone", "unknown");
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+    expect(await screen.findByText("发送消息后显示用量")).toBeVisible();
+  });
+
+  /** 已确认快照在刷新失败时保留，避免请求结算中的瞬时故障把用户可读数据闪成空白。 */
+  it("刷新失败时保留旧值并提示暂未更新", async () => {
+    const user = userEvent.setup();
+    const reader = {
+      read: vi
+        .fn()
+        .mockResolvedValueOnce({ ...USAGE_SUMMARY, threadId: "thr_usage_stale" })
+        .mockRejectedValueOnce(new Error("offline")),
+    };
+    const { rerender } = render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_stale"
+        usageReader={reader}
+        usageRefreshRevision="usage-1"
+        onSend={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "上下文用量详情" });
+    await user.click(trigger);
+    expect(await screen.findByText("14,500")).toBeVisible();
+
+    rerender(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_stale"
+        usageReader={reader}
+        usageRefreshRevision="usage-2"
+        onSend={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("暂未更新")).toBeVisible();
+    expect(screen.getByText("14,500")).toBeVisible();
+  });
+
+  /** hover 读取后可点击固定；外部点击与 Escape 都关闭，Escape 必须归还圆环焦点。 */
+  it("支持悬停阅读、固定展开、外部关闭和 Escape 焦点回归", async () => {
+    const user = userEvent.setup();
+    const reader = {
+      read: vi
+        .fn()
+        .mockImplementation((input: { threadId: string }) =>
+          Promise.resolve({ ...USAGE_SUMMARY, threadId: input.threadId }),
+        ),
+    };
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_hover"
+        usageReader={reader}
+        onSend={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "上下文用量详情" });
+    await user.hover(trigger);
+    expect(await screen.findByText("Token · 本会话")).toBeVisible();
+    await user.click(trigger);
+    await user.click(document.body);
+    await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+
+    await user.click(trigger);
+    expect(await screen.findByText("Token · 本会话")).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+    expect(trigger).toHaveFocus();
+  });
+
+  /** 新 Thread 打开后拒绝旧账本的迟到返回，避免缓存和视觉摘要串到当前会话。 */
+  it("拒绝会话切换后的迟到用量响应", async () => {
+    const user = userEvent.setup();
+    let resolveFirst!: (summary: ConversationUsageSummary) => void;
+    const firstRead = new Promise<ConversationUsageSummary>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const reader = {
+      read: vi.fn((input: { threadId: string }) =>
+        input.threadId === "thr_usage_a"
+          ? firstRead
+          : Promise.resolve({ ...USAGE_SUMMARY, threadId: input.threadId, totalTokens: 25_000 }),
+      ),
+    };
+    const { rerender } = render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_a"
+        usageReader={reader}
+        onSend={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+    await waitFor(() => expect(reader.read).toHaveBeenCalledWith({ threadId: "thr_usage_a" }));
+
+    rerender(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_b"
+        usageReader={reader}
+        onSend={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+    expect(await screen.findByText("25,000")).toBeVisible();
+    resolveFirst({ ...USAGE_SUMMARY, threadId: "thr_usage_a" });
+    await waitFor(() => expect(screen.getByText("25,000")).toBeVisible());
+    expect(screen.queryByText("14,500")).toBeNull();
+  });
+
+  /** 临近窗口上限时只改变视觉风险级别，仍不升级为打断输入的弹层。 */
+  it("以危险态显示接近上限的最近请求", () => {
     render(
       <ControlledComposerHarness
         preferences={PREFERENCES}
         models={MODELS}
         contextUsage={{
           certainty: "known",
-          usedTokens: 195_000,
+          usedTokens: 184_000,
           limitTokens: 200_000,
-          percentage: 98,
-          ringPercentage: 97.5,
+          percentage: 92,
+          ringPercentage: 92,
           tone: "danger",
           source: "provider",
-          measuredAt: "2026-08-31T00:00:02Z",
+          measuredAt: "2026-09-22T00:00:00Z",
         }}
         onSend={vi.fn()}
       />,
     );
+
     const indicator = screen.getByRole("progressbar", { name: "上下文使用量" });
     expect(indicator).toHaveAttribute("data-tone", "danger");
-    expect(indicator).toHaveAttribute(
-      "aria-valuetext",
-      "已使用 98%，195K / 200K tokens，最近模型请求",
-    );
-  });
-
-  /** UNKNOWN 仍保持固定环形占位和明确 Tooltip，不用问号制造错误感或触发工具栏布局跳变。 */
-  it("以中性占位呈现尚未确认的上下文计量", async () => {
-    const user = userEvent.setup();
-    render(
-      <ControlledComposerHarness
-        preferences={PREFERENCES}
-        models={MODELS}
-        contextUsage={{
-          certainty: "unknown",
-          source: "provider",
-          measuredAt: "2026-08-31T00:00:03Z",
-        }}
-        onSend={vi.fn()}
-      />,
-    );
-    const indicator = screen.getByRole("status", { name: "上下文使用量待确认" });
-    expect(indicator).toHaveAttribute("data-tone", "unknown");
-    expect(indicator).not.toHaveTextContent("?");
-    await user.hover(indicator);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("当前上下文用量尚未确认");
+    expect(indicator).toHaveAttribute("aria-valuenow", "92");
   });
 });

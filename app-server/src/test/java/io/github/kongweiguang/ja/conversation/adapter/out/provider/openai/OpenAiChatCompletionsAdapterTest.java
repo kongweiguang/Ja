@@ -115,7 +115,8 @@ final class OpenAiChatCompletionsAdapterTest {
 
                 assertEquals(ModelPort.FinishReason.TOOL_CALLS, outcome.finishReason());
                 assertNull(outcome.continuation());
-                assertEquals(new ModelUsage(5, 9, 14), outcome.usage());
+                assertEquals(new ModelUsage(5, 9, 14, 4L, null,
+                        ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE), outcome.usage());
                 assertEquals(java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
                         .digest(requestBody.get().getBytes(StandardCharsets.UTF_8))), estimate.fingerprint());
                 assertTrue(estimate.conservativeUpperBound() > 0);
@@ -140,7 +141,8 @@ final class OpenAiChatCompletionsAdapterTest {
         assertEquals("call_1", tool.callId());
         assertEquals("README.md", assertInstanceOf(JsonText.class,
                 tool.arguments().get("path")).value());
-        assertEquals(new ModelUsage(5, 9, 14),
+        assertEquals(new ModelUsage(5, 9, 14, 4L, null,
+                        ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE),
                 assertInstanceOf(ModelPort.UsageEvent.class, events.get(2)).usage());
     }
 

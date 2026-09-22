@@ -363,6 +363,26 @@ final class McpRuntimeTest {
         }
     }
 
+    /**
+     * 验证 Windows 已确认不存在的 stdio 可执行文件只降级其自身目录；后续 Provider 安全点读取
+     * 空 MCP 快照而不是再次等待启动预算。显式 Settings 探测另建 Runtime，仍可在用户安装命令后重试。
+     */
+    @Test
+    void missingStdioExecutablePublishesUnavailableEmptyDirectoryWithoutRepeatedOpen() {
+        AtomicInteger opens = new AtomicInteger();
+        McpSessionFactory factory = (ignored, ignoredDeadline) -> {
+            opens.incrementAndGet();
+            throw new IllegalStateException("mcp_stdio_start_failed",
+                    new java.io.IOException("windows_process_launch_failed_2"));
+        };
+        try (McpRuntime runtime = runtime(List.of(definition("missing")), McpLimits.DEFAULT, factory)) {
+            assertTrue(runtime.snapshot().tools().isEmpty());
+            assertTrue(runtime.unavailableServerIds().contains("missing"));
+            assertTrue(runtime.snapshot().tools().isEmpty());
+            assertEquals(1, opens.get());
+        }
+    }
+
     /** 验证启动初始化的超时不会随配置服务数量倍增。 */
     @Test
     void initializeSessionsSharesAbsoluteDeadline() {

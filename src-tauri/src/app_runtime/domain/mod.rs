@@ -20,11 +20,11 @@ pub use runtime::{RuntimeStatus, RuntimeStatusKind};
 pub use commands::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentSummary,
     InputQueue, QueuedInput, QueuedInputIssue, RuntimeConfigurationStatus, ToolArtifactReadInput,
-    ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnContentPart, TurnInputDelete,
-    TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput,
-    TurnStartInput, WorkspaceOpenInput, WorkspacePathSearchInput, WorkspacePathSearchItem,
-    WorkspacePathSearchResult,
+    ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted,
+    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
+    TurnContentPart, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult,
+    TurnInputUpdate, TurnResumeInput, TurnStartInput, WorkspaceOpenInput, WorkspacePathSearchInput,
+    WorkspacePathSearchItem, WorkspacePathSearchResult,
 };
 pub use tasks::{
     TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextPreviewItem, TaskContextSeed,

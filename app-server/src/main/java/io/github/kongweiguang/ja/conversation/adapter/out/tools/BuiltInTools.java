@@ -100,6 +100,14 @@ public final class BuiltInTools {
         return new ToolRegistry(tools);
     }
 
+    /**
+     * edit 与 write 必须接受同一类工作区相对、绝对或父级路径，集中定义以避免两条写入路径的
+     * Provider Schema 在后续演进时漂移。
+     */
+    private static JsonObject workspaceMutationPathProperty() {
+        return ToolSupport.requiredStringProperty("Relative, absolute, or parent path.", 8_192);
+    }
+
     /** 从当前执行上下文可见的受管附件读取有界文本或 Base64 字节。 */
     private static final class ReadAttachmentTool extends ToolSupport {
         private final ManagedAttachmentReader attachments;
@@ -240,24 +248,32 @@ public final class BuiltInTools {
     }
 
     /**
+     * 聚合 edit/write 共同的受限工作区写入状态。使用不可继承值对象而非抽象 Tool 基类，既防止
+     * 写入边界漂移，也避免可抛异常的可继承构造器暴露部分初始化实例。
+     */
+    private record MutationSupport(Path workspaceRoot, WorkspaceBoundary boundary, MutationWriter writer) {
+        /** 在唯一创建点同时固定边界和 writer，调用方不能混配来自不同工作区的写入状态。 */
+        private MutationSupport(Path workspaceRoot, MutationWriter writer) {
+            this(workspaceRoot, new WorkspaceBoundary(workspaceRoot),
+                    Objects.requireNonNull(writer, "mutationWriter"));
+        }
+    }
+
+    /**
      * 在同一原始版本上精确替换多个互不重叠的文本块，减少模型往返同时保留唯一匹配与原子提交约束。
      */
     private static final class EditTool extends ToolSupport {
-        private final Path workspaceRoot;
-        private final WorkspaceBoundary boundary;
-        private final MutationWriter mutationWriter;
+        private final MutationSupport mutation;
 
         /** Workspace 只提供相对路径起点，绝对路径与父级路径保持原生语义。 */
         private EditTool(Path workspaceRoot, MutationWriter mutationWriter) {
             super(new ToolSpec("edit", "Replace unique, non-overlapping text occurrences in one UTF-8 file",
                     objectSchema(Map.of(
-                            "path", requiredStringProperty("Relative, absolute, or parent path.", 8_192),
+                            "path", workspaceMutationPathProperty(),
                             "edits", arrayProperty("One or more unique, non-overlapping replacements matched against the original file.",
                                     replacementSchema(), 1, MAX_EDIT_REPLACEMENTS)),
                             List.of("path", "edits"))));
-            this.workspaceRoot = workspaceRoot;
-            this.boundary = new WorkspaceBoundary(workspaceRoot);
-            this.mutationWriter = Objects.requireNonNull(mutationWriter, "mutationWriter");
+            this.mutation = new MutationSupport(workspaceRoot, mutationWriter);
         }
 
         /** edit 在成功后返回写前/写后 UTF-8 正文，因此可由 Java 精确归属。 */
@@ -267,19 +283,39 @@ public final class BuiltInTools {
         }
 
         /**
+         * edit 只在目标已被 Workspace boundary 证明且可从当前 preimage 确定唯一 postimage 时留下
+         * 恢复证据。预读取或匹配失败时宁可交给用户裁决，也不依据不完整信息自动重放。
+         */
+        @Override
+        public Optional<RecoveryEvidence> prepareRecoveryEvidence(
+                Invocation invocation, ExecutionContext context, CancellationToken token) {
+            try {
+                MutationTarget target = mutationTarget(mutation.workspaceRoot(), mutation.boundary(),
+                        string(invocation, "path", 8_192), true);
+                if (target.boundary() == null) return Optional.empty();
+                String current = Files.readString(target.path(), StandardCharsets.UTF_8);
+                token.throwIfCancellationRequested();
+                String updated = applyReplacements(current, locateReplacements(current, replacements(invocation)));
+                return Optional.of(RecoveryEvidence.expectedText(target.relativePath(), updated));
+            } catch (IOException | IllegalArgumentException unavailable) {
+                return Optional.empty();
+            }
+        }
+
+        /**
          * 所有 edit 都先在同一 preimage 中定位，重叠、重复或缺失任一目标即失败，避免增量替换改变后续匹配语义。
          */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
-            MutationTarget target = mutationTarget(workspaceRoot, boundary,
+            MutationTarget target = mutationTarget(mutation.workspaceRoot(), mutation.boundary(),
                     string(invocation, "path", 8_192), true);
             Path path = target.path();
             String current = Files.readString(path, StandardCharsets.UTF_8);
             List<ReplacementMatch> matches = locateReplacements(current, replacements(invocation));
             token.throwIfCancellationRequested();
             String updated = applyReplacements(current, matches);
-            writeObserved(target, updated, mutationWriter);
+            writeObserved(target, updated, mutation.writer());
             AgentTool.MutationReceipt receipt = target.receipt(true, current, updated);
             return new ToolResult(ToolOutcome.SUCCEEDED, "Successfully replaced " + matches.size()
                     + " block(s) in the file.",
@@ -379,21 +415,17 @@ public final class BuiltInTools {
 
     /** 完整写入一个 UTF-8 文件，并通过同目录临时文件避免半写入。 */
     private static final class WriteTool extends ToolSupport {
-        private final Path workspaceRoot;
-        private final WorkspaceBoundary boundary;
-        private final MutationWriter mutationWriter;
+        private final MutationSupport mutation;
 
         /** Workspace 只提供相对路径起点，不建立目录授权边界。 */
         private WriteTool(Path workspaceRoot, MutationWriter mutationWriter) {
             super(new ToolSpec("write", "Atomically write a complete UTF-8 file",
                     objectSchema(Map.of(
-                            "path", requiredStringProperty("Relative, absolute, or parent path.", 8_192),
+                            "path", workspaceMutationPathProperty(),
                             "content", optionalStringProperty("Complete UTF-8 file content.",
                                     MAX_TEXT_CHARACTERS)),
                             List.of("path", "content"))));
-            this.workspaceRoot = workspaceRoot;
-            this.boundary = new WorkspaceBoundary(workspaceRoot);
-            this.mutationWriter = Objects.requireNonNull(mutationWriter, "mutationWriter");
+            this.mutation = new MutationSupport(workspaceRoot, mutationWriter);
         }
 
         /** write 完整掌握目标 UTF-8 pre/postimage，因此不需要扫描 Git 或工作区。 */
@@ -402,11 +434,31 @@ public final class BuiltInTools {
             return WorkspaceMutationMode.EXACT_TEXT;
         }
 
+        /**
+         * write 的完整 postimage 已包含在受检参数中，因此无需额外读取文件；工作区外目标按计划保持
+         * 结果未知，避免把绝对路径写入恢复事实或扩大自动核实范围。
+         */
+        @Override
+        public Optional<RecoveryEvidence> prepareRecoveryEvidence(
+                Invocation invocation, ExecutionContext context, CancellationToken token) {
+            try {
+                MutationTarget target = mutationTarget(mutation.workspaceRoot(), mutation.boundary(),
+                        string(invocation, "path", 8_192), false);
+                if (target.boundary() == null) return Optional.empty();
+                String content = optionalString(invocation, "content", MAX_TEXT_CHARACTERS);
+                if (content == null) return Optional.empty();
+                token.throwIfCancellationRequested();
+                return Optional.of(RecoveryEvidence.expectedText(target.relativePath(), content));
+            } catch (IOException | IllegalArgumentException unavailable) {
+                return Optional.empty();
+            }
+        }
+
         /** 创建父目录并原子替换目标；不向模型暴露 CAS、revision 或文件锁协议。 */
         @Override
         ToolResult executeChecked(Invocation invocation, ExecutionContext context, CancellationToken token)
                 throws IOException {
-            MutationTarget target = mutationTarget(workspaceRoot, boundary,
+            MutationTarget target = mutationTarget(mutation.workspaceRoot(), mutation.boundary(),
                     string(invocation, "path", 8_192), false);
             Path path = target.path();
             String content = optionalString(invocation, "content", MAX_TEXT_CHARACTERS);
@@ -414,7 +466,7 @@ public final class BuiltInTools {
             token.throwIfCancellationRequested();
             boolean beforeExists = Files.exists(path);
             String before = beforeExists ? BuiltInTools.readUtf8File(path, token) : "";
-            writeObserved(target, content, mutationWriter);
+            writeObserved(target, content, mutation.writer());
             AgentTool.MutationReceipt receipt = target.receipt(beforeExists, before, content);
             return new ToolResult(ToolOutcome.SUCCEEDED, "File written successfully.",
                     Optional.empty(), null, Optional.of(receipt));

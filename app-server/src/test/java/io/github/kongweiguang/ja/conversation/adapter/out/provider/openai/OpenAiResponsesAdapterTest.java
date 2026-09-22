@@ -344,7 +344,8 @@ final class OpenAiResponsesAdapterTest {
             assertFalse(encodedRequest.has("revision"));
             assertEquals(ModelPort.FinishReason.TOOL_CALLS, outcome.finishReason());
             assertNull(outcome.continuation());
-            assertEquals(new ModelUsage(5, 9, 14), outcome.usage());
+            assertEquals(new ModelUsage(5, 9, 14, 0L, null,
+                    ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE), outcome.usage());
             assertEquals(4, events.size());
             assertEquals("Checked files", assertInstanceOf(ModelPort.ReasoningSummaryDelta.class, events.get(0)).text());
             assertEquals("I will read it.", assertInstanceOf(ModelPort.TextDelta.class, events.get(1)).text());
@@ -874,10 +875,12 @@ final class OpenAiResponsesAdapterTest {
                                     return java.util.concurrent.CompletableFuture.completedFuture(null);
                                 }, CancellationToken.none())
                         .toCompletableFuture().get(5, TimeUnit.SECONDS);
-                assertEquals(new ModelUsage(5, 9, 14), outcome.usage());
+                assertEquals(new ModelUsage(5, 9, 14, 4L, null,
+                        ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE), outcome.usage());
             }
         }
-        assertEquals(new ModelUsage(5, 9, 14),
+        assertEquals(new ModelUsage(5, 9, 14, 4L, null,
+                        ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE),
                 assertInstanceOf(ModelPort.UsageEvent.class, events.getFirst()).usage());
         assertEquals(1, events.size());
     }

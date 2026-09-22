@@ -36,6 +36,7 @@ final class ToolPresentationWireMapper {
         appendInteractionAnswers(node, value);
         appendPreviews(node, value);
         appendShellFacts(node, value);
+        appendRecovery(node, value);
         node.put("truncated", value.truncated());
         return node;
     }
@@ -66,6 +67,13 @@ final class ToolPresentationWireMapper {
                 "stdout", value.stdout(), "stderr", value.stderr());
         if (value.exitCode() != null) node.put("exitCode", value.exitCode());
         if (value.durationMs() != null) node.put("durationMs", value.durationMs());
+    }
+
+    /** 只把 UI 提交裁决所需的单调版本传给 Renderer，Tool identity 继续由 Timeline item 外层提供。 */
+    private static void appendRecovery(ObjectNode node, ToolPresentation value) {
+        if (value.recovery() != null) {
+            node.putObject("recovery").put("revision", value.recovery().revision());
+        }
     }
 
     /** 固定字段和值成对输入，只用于本类声明的 transport 白名单，避免自由 Map 成为协议入口。 */

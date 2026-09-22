@@ -39,12 +39,13 @@ export async function checkInitialBaseline(root) {
     "V1__kernel.sql",
     "V2__thread_subagent_policies.sql",
     "V3__subagent_reasoning.sql",
+    "V4__conversation_recovery_usage_projection.sql",
   ];
   if (
     migrations.length !== expectedMigrations.length ||
     expectedMigrations.some((name) => !migrations.includes(name))
   ) {
-    violations.push("数据库只允许 V1 建库、V2 子智能体会话策略与 V3 思考等级资源");
+    violations.push("数据库只允许 V1 建库、V2 子智能体会话策略、V3 思考等级与 V4 对话恢复资源");
   }
   const protocolEntries = await readdir(path.join(root, "contracts/ja-rpc"), {
     withFileTypes: true,

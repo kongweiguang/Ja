@@ -33,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -228,40 +229,41 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
         SkillCatalog.Catalog discovered = skillSources.discover(new SkillCatalog.DiscoveryRequest(
                 discoveryRoot, agentsSkillRoot, jaSkillRoot,
                 workspaceRoot != null && workspaceTrusted && generation.trusted()));
-        Map<String, ConfigurationGenerationSnapshot.Skill> configured = configuredByName(generation);
+        Set<String> configured = configuredReferences(generation);
         List<SkillDescriptor> values = discovered.skills().stream()
-                .map(skill -> skillDescriptor(skill, configured.get(skill.name())))
+                .filter(skill -> skill.source() != SkillCatalog.Source.BUNDLED)
+                .map(skill -> skillDescriptor(skill, configured))
                 .sorted(Comparator.comparing(SkillDescriptor::skillId)).toList();
         return page(values, cursor, limit, SkillDescriptor::skillId);
     }
 
     /**
-     * 配置名称是发现项与持久授权的稳定连接键；后出现项覆盖前项以沿用 effective 文档的最终顺序。
+     * 授权必须与发现项的来源和名称同时匹配；同名高优先级包不能继承低优先级包的许可。
      */
-    private static Map<String, ConfigurationGenerationSnapshot.Skill> configuredByName(
+    private static Set<String> configuredReferences(
             ConfigurationGenerationSnapshot generation) {
-        LinkedHashMap<String, ConfigurationGenerationSnapshot.Skill> configured = new LinkedHashMap<>();
-        generation.skillDefinitions().forEach(skill -> configured.put(skill.name(), skill));
-        return Map.copyOf(configured);
+        return generation.skillDefinitions().stream()
+                .map(skill -> skill.reference().identifier())
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
 
     /**
-     * 已登记项沿用持久 skillId/enabled；新发现项按受限目录名派生稳定身份且默认禁用。
+     * Settings 的稳定身份就是来源限定引用；未登记发现项默认关闭，不为磁盘内容写入配置副本。
      */
     private static SkillDescriptor skillDescriptor(
-            SkillCatalog.SkillDescriptor discovered, ConfigurationGenerationSnapshot.Skill configured) {
-        String skillId = configured == null ? "skill_" + discovered.name() : configured.skillId();
-        boolean enabled = configured != null && configured.enabled();
-        return new SkillDescriptor(skillId, discovered.name(), scope(discovered.source()), enabled,
+            SkillCatalog.SkillDescriptor discovered, Set<String> configured) {
+        String scope = scope(discovered.source());
+        String skillId = scope + ":" + discovered.name();
+        return new SkillDescriptor(skillId, discovered.name(), scope, configured.contains(skillId),
                 "healthy", discovered.description());
     }
 
     /**
-     * 将 Kernel 的来源枚举映射为 Settings 的四个产品分组，不泄露本地目录结构。
+     * 将可授权来源映射为 Settings 身份前缀；内置来源没有 v2 配置身份，已在调用方过滤。
      */
     private static String scope(SkillCatalog.Source source) {
         return switch (source) {
-            case BUNDLED -> "builtin";
+            case BUNDLED -> throw new IllegalArgumentException("bundled skills are not configurable");
             case AGENTS_USER -> "user";
             case JA_USER -> "ja";
             case WORKSPACE -> "project";

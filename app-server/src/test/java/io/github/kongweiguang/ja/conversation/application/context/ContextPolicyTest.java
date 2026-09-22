@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.conversation.domain.ToolProjectionLimits;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -237,5 +238,39 @@ final class ContextPolicyTest {
                 new ToolProjectionLimits(0, 1).shrinkOnce());
         assertEquals(new ToolProjectionLimits(2, 1),
                 new ToolProjectionLimits(4, 3).shrinkOnce());
+    }
+
+    /**
+     * 同一持久阶段中，已发送的旧 Tool result 必须严格复用其 artifact 选择；后续结果只能追加
+     * 自己的层级，不能借新预算把历史前缀改写回正文。
+     */
+    @Test
+    void frozenProjectionNeverRewritesEarlierToolResult() {
+        ContextMessage oldCall = new ContextMessage("m-call-old", "turn-1", 1,
+                ContextMessage.Role.ASSISTANT,
+                List.of(new ContextMessage.ToolCallBlock("call-old", "read", "{}")), 1);
+        ContextMessage oldResult = new ContextMessage("m-result-old", "turn-1", 2,
+                ContextMessage.Role.TOOL, List.of(new ContextMessage.ToolResultBlock("call-old", "read",
+                ContextMessage.ToolOutput.full("OLD_SECRET_BODY", "artifact://old", 0, null))), 2);
+        ContextMessage newCall = new ContextMessage("m-call-new", "turn-2", 3,
+                ContextMessage.Role.ASSISTANT,
+                List.of(new ContextMessage.ToolCallBlock("call-new", "read", "{}")), 1);
+        ContextMessage newResult = new ContextMessage("m-result-new", "turn-2", 4,
+                ContextMessage.Role.TOOL, List.of(new ContextMessage.ToolResultBlock("call-new", "read",
+                ContextMessage.ToolOutput.full("NEW_BODY", "artifact://new", 0, null))), 2);
+
+        ContextPolicy.Plan plan = new ContextPolicy().plan(new ContextPolicy.PlanningInput("thread-1",
+                List.of(oldCall, oldResult, newCall, newResult), SummaryDocument.empty(), 0, 0, 0,
+                Optional.empty(), ContextBudget.capabilities(100_000, 100, false), false, Optional.empty(),
+                new ToolProjectionLimits(128, 128),
+                Map.of("m-result-old", ContextPolicy.ToolProjection.ARTIFACT)), ESTIMATED_METER);
+
+        assertEquals(ContextPolicy.ToolProjection.ARTIFACT,
+                plan.projectionChoices().get("m-result-old"));
+        assertFalse(plan.fullPrompt().stream().flatMap(message -> message.blocks().stream())
+                .filter(ContextMessage.ToolResultBlock.class::isInstance)
+                .map(ContextMessage.ToolResultBlock.class::cast)
+                .anyMatch(block -> block.output().content().contains("OLD_SECRET_BODY")));
+        assertEquals(ContextPolicy.ToolProjection.FULL, plan.projectionChoices().get("m-result-new"));
     }
 }

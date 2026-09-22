@@ -293,6 +293,9 @@ final class AgentTurnExecution {
                                 false,
                                 contextMapper.continuation(contextContinuation),
                                 planningCommand.outputLimits(),
+                                new io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore
+                                        .ProjectionBinding(preliminaryProfile.modelBindingFingerprint(),
+                                        preliminaryProfile.toolCatalogRevision()),
                                 tokenMeter,
                                 cancellation);
                 ModelPort.ModelOutcome outcome;

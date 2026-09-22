@@ -163,6 +163,32 @@ impl From<TurnResumeInputDto> for domain::TurnResumeInput {
     }
 }
 
+/// Tool 恢复 DTO 不接受目标路径、哈希或执行参数；客户端只能提交原详情展示的 identity 与明确选择。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ToolRecoveryResponseInputDto {
+    pub turn_id: String,
+    pub call_id: String,
+    pub expected_thread_revision: u64,
+    pub expected_recovery_revision: u64,
+    pub decision: String,
+    pub idempotency_key: String,
+}
+
+impl From<ToolRecoveryResponseInputDto> for domain::ToolRecoveryResponseInput {
+    /// DTO 仅复制受限字段；合法性和一次性幂等边界在进入 Runtime bridge 前统一校验。
+    fn from(value: ToolRecoveryResponseInputDto) -> Self {
+        Self {
+            turn_id: value.turn_id,
+            call_id: value.call_id,
+            expected_thread_revision: value.expected_thread_revision,
+            expected_recovery_revision: value.expected_recovery_revision,
+            decision: value.decision,
+            idempotency_key: value.idempotency_key,
+        }
+    }
+}
+
 /// 普通后续消息入队 DTO 不暴露 kind 或 priority，避免 renderer 绕过独立提升命令。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -450,6 +476,30 @@ impl From<domain::TurnAccepted> for TurnAcceptedDto {
             turn_id: value.turn_id,
             queued: value.queued,
             thread_revision: value.thread_revision,
+        }
+    }
+}
+
+/// 恢复裁决 ACK 只反映已提交事实和是否已自动进入现有 Resume；不承诺 Tool 或 Turn 已完成。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolRecoveryResponseDto {
+    pub accepted: bool,
+    pub turn_id: String,
+    pub thread_revision: u64,
+    pub decision: String,
+    pub resumed: bool,
+}
+
+impl From<domain::ToolRecoveryResponse> for ToolRecoveryResponseDto {
+    /// 保留 Java 的公开确认字段，native DTO 不推导或缓存执行游标。
+    fn from(value: domain::ToolRecoveryResponse) -> Self {
+        Self {
+            accepted: value.accepted,
+            turn_id: value.turn_id,
+            thread_revision: value.thread_revision,
+            decision: value.decision,
+            resumed: value.resumed,
         }
     }
 }

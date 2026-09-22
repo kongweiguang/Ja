@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
+import io.github.kongweiguang.ja.conversation.domain.ThreadUsageSummary;
 import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
@@ -270,6 +271,27 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     .findFirst().orElse(null);
             InputQueue inputQueue = queueTurn == null ? null : inputQueue(mapper, queueTurn);
             return Optional.of(new ThreadSnapshot(thread(row), turns, items, contextUsage, inputQueue, next));
+        });
+    }
+
+    /**
+     * 汇总读取与 Thread 存在性检查置于同一 SQLite 事务，避免已删除 Thread 的迟到响应返回
+     * 看似有效的账本；它不读取消息、Tool 或 checkpoint 正文。
+     */
+    @Override
+    public Optional<ThreadUsageSummary> readThreadUsageSummary(String threadId) {
+        return transactions.required(mapper -> {
+            PersistenceRecords.ThreadRow thread = mapper.history().selectThread(threadId);
+            if (thread == null) return Optional.empty();
+            PersistenceRecords.ThreadUsageSummaryRow row = mapper.history().selectThreadUsageSummary(threadId);
+            if (row == null) throw new StorageException(StorageException.Code.INVALID_STATE,
+                    "usage summary aggregate is unavailable");
+            return Optional.of(new ThreadUsageSummary(thread.revision(), row.requestCount(),
+                    row.measuredRequestCount(), row.newInputRequestCount(), row.newInputTokens(),
+                    row.outputRequestCount(), row.outputTokens(), row.totalRequestCount(), row.totalTokens(),
+                    row.cacheReadRequestCount(), row.cacheReadTokens(), row.cacheWriteRequestCount(),
+                    row.cacheWriteTokens(), row.cacheCompleteRequestCount(), row.cacheCompleteInputTokens(),
+                    row.cacheCompleteReadTokens()));
         });
     }
 
@@ -710,7 +732,10 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
             io.github.kongweiguang.ja.conversation.domain.model.ModelUsage usage =
                     certainty == ProviderRequestUsage.Certainty.UNKNOWN ? null
                             : new io.github.kongweiguang.ja.conversation.domain.model.ModelUsage(
-                                    row.inputTokens(), row.outputTokens(), row.totalTokens());
+                                    row.inputTokens(), row.outputTokens(), row.totalTokens(),
+                                    row.cacheReadTokens(), row.cacheWriteTokens(),
+                                    io.github.kongweiguang.ja.conversation.domain.model.ModelUsage.InputAccounting
+                                            .valueOf(requiredText(row.inputAccounting(), "input_accounting")));
             ProviderRequestUsage request = new ProviderRequestUsage(
                     requiredText(row.requestId(), "request_id"), row.requestOrdinal(),
                     Math.toIntExact(row.modelRound()), ProviderRequestUsage.Purpose.valueOf(

@@ -34,7 +34,11 @@ import {
   type ComposerSlashCommand,
   type ConversationSummary,
 } from "@/features/conversation";
-import type { ConversationModelOption, ConversationModelSelection } from "@/features/conversation";
+import type {
+  ConversationModelOption,
+  ConversationModelSelection,
+  ConversationUsageReader,
+} from "@/features/conversation";
 import {
   AppTitlebar,
   ConversationSearchDialog,
@@ -267,6 +271,15 @@ export function JaApplication({
   const { startRuntime, generalWorkspace, queryRuntime } = useRuntimeLifecycle();
   const resolvedWorkbenchAdapters = workbenchAdapters ?? DEFAULT_WORKBENCH_ADAPTERS;
   const resolvedHistoryAdapter = historyAdapter ?? DEFAULT_HISTORY_ADAPTER;
+  /**
+   * 将 History owner 的单一只读方法收窄给 Composer，避免界面获得完整历史 adapter 或 raw IPC。
+   * TauriHistoryAdapter 的实现依赖 `this.bridge`，因此必须在组合边界绑定 owner，不能把 class
+   * method 解构为裸函数后交给浮层调用。
+   */
+  const conversationUsageReader = useMemo<ConversationUsageReader | undefined>(() => {
+    const read = resolvedHistoryAdapter.threadUsageRead;
+    return read === undefined ? undefined : { read: read.bind(resolvedHistoryAdapter) };
+  }, [resolvedHistoryAdapter]);
   /** Files 与当前 Composer 通过一次性 target port 连接，不把 Thread 草稿复制到壳层。 */
   const registerWorkspaceReferenceTarget = useCallback(
     (target: ((reference: ComposerWorkspaceReferenceTarget) => void) | undefined): void => {
@@ -1587,6 +1600,7 @@ export function JaApplication({
       interactionPort={DEFAULT_INTERACTION_PORT}
       workspace={workspace}
       conversation={conversation}
+      usageReader={conversationUsageReader}
       settings={settings}
       inspectorOpen={inspectorOpen}
       onToggleInspector={toggleInspector}
@@ -1647,6 +1661,7 @@ export function JaApplication({
         }
         taskAttachmentPort={attachmentPort}
         taskArtifactPort={conversationArtifactPort}
+        taskUsageReader={conversationUsageReader}
         taskComposerSkills={taskComposerSkills}
         selectedTab={workbenchTab}
         onTabChange={changeWorkbenchTab}

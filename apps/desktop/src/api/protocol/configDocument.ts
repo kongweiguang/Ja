@@ -11,7 +11,7 @@ const MAX_CATALOG_REFERENCES = 128;
 const MAX_MAP_ENTRIES = 64;
 const MAX_MAP_VALUE = 8_192;
 
-/** 配置身份保持不透明，并只接受 schema v1 的稳定命名空间。 */
+/** 配置身份保持不透明，并只接受 schema v2 的稳定命名空间。 */
 export const ConfigCredentialRefSchema = z
   .string()
   .regex(/^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
@@ -28,10 +28,19 @@ const configMcpIdSchema = z
   .string()
   .regex(/^mcp_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
   .max(100);
-const configSkillIdSchema = z
+/**
+ * Skill 授权以来源与名称共同标识；名称禁止分隔符，使同名项目包不能继承全局许可。
+ */
+export const ConfigSkillReferenceSchema = z
   .string()
-  .regex(/^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
-  .max(101);
+  .regex(/^(?:user|ja|project):[^:\u0000-\u001F]{1,512}$/)
+  .max(520);
+const ConfigUserSkillReferenceSchema = ConfigSkillReferenceSchema.refine(
+  (value) => value.startsWith("user:") || value.startsWith("ja:"),
+);
+const ConfigProjectSkillReferenceSchema = ConfigSkillReferenceSchema.refine((value) =>
+  value.startsWith("project:"),
+);
 
 /** 配置离开 renderer 前拒绝 Secret 形状键，避免高级 Map 成为凭据旁路。 */
 function safeConfigMap(value: Record<string, string>): boolean {
@@ -200,20 +209,10 @@ export const ConfigMcpServerSchema = z
   })
   .strict();
 
-const ConfigSkillSchema = z
-  .object({
-    skill_id: configSkillIdSchema,
-    name: z.string().min(1).max(MAX_TEXT),
-    scope: z.enum(["builtin", "user", "ja", "project"]),
-    enabled: z.boolean(),
-    description: z.string().max(8_192),
-  })
-  .strict();
-
-/** 只解析 app-server 返回的当前 v1 配置，并在 renderer 边界校验默认选择的真实引用。 */
+/** 只解析 app-server 返回的当前 v2 用户配置，并在 renderer 边界校验默认选择的真实引用。 */
 export const ConfigDocumentSchema = z
   .object({
-    schema_version: z.literal(1),
+    schema_version: z.literal(2),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
     default_access_mode: z.enum(["approval_required", "full_access"]),
     interaction: z.object({ clarification_enabled: z.boolean().optional() }).strict().optional(),
@@ -223,10 +222,13 @@ export const ConfigDocumentSchema = z
     subagents: ConfigSubagentsSchema,
     providers: z.array(ConfigProviderSchema).max(MAX_CATALOG_ITEMS),
     mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS),
-    skills: z.array(ConfigSkillSchema).max(MAX_CATALOG_ITEMS),
+    skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS),
   })
   .strict()
   .superRefine((document, context) => {
+    if (new Set(document.skills).size !== document.skills.length) {
+      context.addIssue({ code: "custom", path: ["skills"], message: "duplicate skill reference" });
+    }
     if (
       new Set(document.providers.map((provider) => provider.provider_id)).size !==
       document.providers.length
@@ -307,6 +309,30 @@ export const ConfigDocumentSchema = z
         code: "custom",
         path: ["default_reasoning_level"],
         message: "unsupported",
+      });
+    }
+  });
+
+/**
+ * 项目文档只开放当前设置页实际写入的 Skill 覆盖，避免 Renderer 承担 Provider/MCP 稀疏 overlay 的所有权。
+ */
+export const ConfigProjectSkillDocumentSchema = z
+  .object({
+    schema_version: z.literal(2),
+    config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
+    skills: z.array(ConfigProjectSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
+    disabled_skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
+  })
+  .strict()
+  .superRefine((document, context) => {
+    if (new Set(document.skills).size !== document.skills.length) {
+      context.addIssue({ code: "custom", path: ["skills"], message: "duplicate skill reference" });
+    }
+    if (new Set(document.disabled_skills).size !== document.disabled_skills.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["disabled_skills"],
+        message: "duplicate skill reference",
       });
     }
   });

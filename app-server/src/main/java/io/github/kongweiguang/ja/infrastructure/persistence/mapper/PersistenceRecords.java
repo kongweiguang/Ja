@@ -92,6 +92,9 @@ public final class PersistenceRecords {
     /** Tool 状态门所需的最小查询行。 */
     public record ToolRow(String callId, String state, long revision, int ordinal,
                    String toolName, String sideEffect) { }
+    /** 启动恢复额外读取受控 presentation JSON，以原 Tool 详情承载待裁决动作而不新建 Timeline 条目。 */
+    public record RecoveryToolRow(String callId, String state, long revision, int ordinal,
+                                  String toolName, String sideEffect, String presentationJson) { }
 
     /** Approval 状态门所需的最小查询行，decision 在待决时允许 null。 */
     public record ApprovalRow(String approvalId, String decision, String expiresAt) { }
@@ -134,7 +137,17 @@ public final class PersistenceRecords {
     public record ContextUsageRow(String turnId, String requestId, long modelRound,
                                   int requestOrdinal, String purpose, String certainty,
                                   String profileJson, Long inputTokens, Long outputTokens, Long totalTokens,
-                                  String occurredAt) { }
+                                  Long cacheReadTokens, Long cacheWriteTokens, Long newInputTokens,
+                                  String inputAccounting, String occurredAt) { }
+    /** Thread 级累计 Usage 的原始聚合行；覆盖计数让 presenter 区分零值与未报告。 */
+    public record ThreadUsageSummaryRow(long requestCount, long measuredRequestCount,
+                                        long newInputRequestCount, long newInputTokens,
+                                        long outputRequestCount, long outputTokens,
+                                        long totalRequestCount, long totalTokens,
+                                        long cacheReadRequestCount, long cacheReadTokens,
+                                        long cacheWriteRequestCount, long cacheWriteTokens,
+                                        long cacheCompleteRequestCount, long cacheCompleteInputTokens,
+                                        long cacheCompleteReadTokens) { }
     /** Turn execution 的版本化 JSON 行；解码只允许经过严格 Codec。 */
     public record TurnExecutionRow(String turnId, int schemaVersion, String stateJson) { }
 
@@ -143,6 +156,20 @@ public final class PersistenceRecords {
                          long retainedFromOrdinal, String retainedSplitJson, String summaryJson,
                          int estimatedTokens, String envelopeFingerprint, String strategyVersion,
                          String usageJson, String createdAt) { }
+
+    /** 稳定投影阶段只持有绑定摘要与边界，不复制模型 Prompt 或 Tool 原始输出。 */
+    public record ProjectionStageRow(String stageId, String threadId, long stageNumber, long sourceRevision,
+                                     String reason, String modelBinding, String toolBinding, String createdAt) { }
+    /** 每条 Tool result 的首次展示层级；没有正文列，原内容仍通过 agent_messages 回读。 */
+    public record ProjectionEntryRow(String messageId, String projection) { }
+    /** 阶段 identity 使恢复时能查找原 checkpoint/overflow 的获胜者。 */
+    public record ProjectionStageIdentity(String threadId, long sourceRevision, String reason,
+                                          String modelBinding, String toolBinding) { }
+    /** append-only 阶段写入参数，stageNumber 由同一 SQLite transaction 按 Thread 分配。 */
+    public record ProjectionStageInsert(String stageId, String threadId, long stageNumber, long sourceRevision,
+                                        String reason, String modelBinding, String toolBinding, String createdAt) { }
+    /** 相同 stage/message 的重复写入被 SQLite 忽略，选择不允许被后来预算改写。 */
+    public record ProjectionEntryInsert(String stageId, String messageId, String projection, String createdAt) { }
 
     /** SQLite WAL checkpoint 的三列状态，列名与 PRAGMA 输出保持一一对应。 */
     public record WalCheckpointRow(int busy, int log, int checkpointed) { }
@@ -187,6 +214,10 @@ public final class PersistenceRecords {
                                  String accessMode) { }
     /** Tool 启动状态门参数。 */
     public record ToolStart(String turnId, String callId, String occurredAt) { }
+    /** RUNNING 边界同事务保存的可选文件恢复证据，不保存原始参数或文件正文。 */
+    public record ToolRecoveryEvidenceInsert(String recoveryId, String threadId, String turnId, String callId,
+                                             String targetRelativePath, long expectedAfterBytes,
+                                             String expectedAfterSha256, String occurredAt) { }
     /** Tool 完成状态门参数。 */
     public record ToolFinish(String turnId, String callId, String state, String presentationJson,
                       String artifactId, String occurredAt) { }
@@ -229,12 +260,14 @@ public final class PersistenceRecords {
     public record UsageInsert(String usageId, String requestId, String threadId, String turnId,
                               int modelRound, int requestOrdinal, String purpose, String certainty,
                               String profileJson, Long inputTokens, Long outputTokens, Long totalTokens,
-                              String occurredAt) { }
+                              Long cacheReadTokens, Long cacheWriteTokens, Long newInputTokens,
+                              String inputAccounting, String occurredAt) { }
     /** UNKNOWN 行只允许由同 request/profile 的可靠计量原位升级为 KNOWN。 */
     public record UsageSettlement(String requestId, String turnId, int requestOrdinal,
                                   String purpose, String profileJson,
                                   long inputTokens, long outputTokens, long totalTokens,
-                                  String occurredAt) { }
+                                  Long cacheReadTokens, Long cacheWriteTokens, Long newInputTokens,
+                                  String inputAccounting, String occurredAt) { }
     /** Pending input 插入参数。 */
     public record PendingInputInsert(String inputId, String threadId, String turnId, String kind,
                                String contentJson, String occurredAt) { }
@@ -337,6 +370,24 @@ public final class PersistenceRecords {
     /** 启动恢复合成唯一绑定不可用 Tool 结果所需的稳定身份与 ordinal。 */
     public record RecoveryToolMessage(String messageId, String threadId, String turnId, String callId,
                                       String content, String occurredAt) { }
+    /** 启动恢复为无证据 Tool 建立未知边界；已有内建文件证据不得被该写入覆盖。 */
+    public record ToolRecoveryUnknownInsert(String recoveryId, String threadId, String turnId, String callId,
+                                            String occurredAt) { }
+    /** 只读取恢复裁决与确定性文件核实所需的最小字段，正文和原始调用参数不离开存储层。 */
+    public record ToolRecoveryRow(String recoveryId, String threadId, String turnId, String callId,
+                                  String evidenceKind, String state, long recoveryRevision,
+                                  String targetRelativePath, String expectedAfterSha256,
+                                  Long expectedAfterBytes, String idempotencyKey) { }
+    /** 将未知结果公开为待处理详情时只更新安全摘要与恢复 CAS，Tool 实际状态仍保持 RUNNING。 */
+    public record ToolRecoveryPending(String turnId, String callId, String occurredAt) { }
+    /** 首个待裁决恢复项按 Tool ordinal 排序读取，避免多项未知被用户跳序处理。 */
+    public record ToolRecoveryResolve(String recoveryId, long expectedRecoveryRevision, String state,
+                                      String idempotencyKey, String occurredAt) { }
+    /** 每次启动观察、自动核实或用户裁决都留一条 attempt，不把原未知操作改写成重试结果。 */
+    public record ToolRecoveryAttemptInsert(String attemptId, String recoveryId, int attemptNumber,
+                                            String disposition, String idempotencyKey, String occurredAt) { }
+    /** 用户选择重试后把同一调用恢复为 PREPARED，但原未知边界仍在 recovery 表与 attempts 中保留。 */
+    public record ToolRecoveryRetry(String turnId, String callId, String presentationJson, String occurredAt) { }
     /** Resume 联表只读取 Operation、Workspace 与 execution JSON；环境在下一请求安全点重新解析。 */
     public record ResumeTurnRow(String turnId, String threadId, String workspaceId, String rootPath,
                                 long turnMutationVersion, long threadRevision,

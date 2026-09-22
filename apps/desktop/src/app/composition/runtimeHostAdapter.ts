@@ -85,6 +85,7 @@ export function createRuntimeHostPort(
     approvalRespond: (input) => adapter.approvalRespond(input),
     turnStart: (input) => adapter.turnStart(input),
     turnResume: (input) => adapter.turnResume(input),
+    turnRecoveryRespond: (input) => adapter.turnRecoveryRespond(input),
     turnCancel: (input) => adapter.turnCancel(input),
     turnInputEnqueue: (input) => adapter.turnInputEnqueue(input),
     turnInputPrioritize: (input) => adapter.turnInputPrioritize(input),

@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:usage-read","method":"thread/usage/read","params":{"threadId":"thr_usage_demo"}}
+{"jsonrpc":"2.0","id":"c:usage-read","result":{"threadId":"thr_usage_demo","snapshotRevision":7,"requestCount":3,"measuredRequestCount":2,"newInputRequestCount":2,"newInputTokens":240,"outputRequestCount":2,"outputTokens":60,"totalRequestCount":2,"totalTokens":300,"cacheReadRequestCount":1,"cacheReadTokens":32,"cacheWriteRequestCount":1,"cacheWriteTokens":8,"cacheCompleteRequestCount":1,"cacheCompleteInputTokens":240,"cacheCompleteReadTokens":32}}

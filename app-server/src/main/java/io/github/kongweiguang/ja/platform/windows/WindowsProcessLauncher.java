@@ -38,6 +38,26 @@ public final class WindowsProcessLauncher {
     }
 
     /**
+     * 在调用方进入不具备失败传播能力的第三方初始化前，使用与真实启动完全相同的受限 PATH 规则
+     * 预检可执行文件。预检不创建进程、不授予启动权限，真实 launch 仍会重新校验以关闭 TOCTOU 窗口。
+     */
+    public static void verifyExecutableAvailable(
+            List<String> command,
+            Path workingDirectory,
+            Map<String, String> environment) throws IOException {
+        if (!WindowsJobObject.isSupported()) {
+            throw new IOException("windows_process_unsupported_platform");
+        }
+        WindowsProcessLaunchPolicy.LaunchSpec spec =
+                WindowsProcessLaunchPolicy.validate(command, workingDirectory, environment);
+        try {
+            WindowsProcessLaunchPolicy.resolveExecutable(spec.command().getFirst(), spec.environment());
+        } catch (WindowsProcessNativeApi.WindowsFailure failure) {
+            throw failure.asIoException("windows_process_launch_failed");
+        }
+    }
+
+    /**
      * 只释放由本适配器创建的进程句柄；拒绝外部 Process 实现，防止引入第二套清理所有权模型。
      */
     @SuppressWarnings("PMD.CloseResource")

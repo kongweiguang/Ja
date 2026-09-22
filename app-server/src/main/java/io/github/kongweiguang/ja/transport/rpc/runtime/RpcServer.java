@@ -76,7 +76,23 @@ public final class RpcServer implements AutoCloseable {
     private final DeadlineCloseCoordinator closeCoordinator = new DeadlineCloseCoordinator();
     private final Object ingressMonitor = new Object();
     private final Runnable beforeDispatch;
+    private final AutoCloseable sessionBinding;
     private int ingressInFlight;
+
+    /**
+     * 让 bootstrap 在不向 transport 泄露配置实现的前提下，为当前唯一会话绑定外部事件。
+     *
+     * <p>返回的句柄归 RpcServer 所有，并在 Writer 关闭前注销；这样文件 Watcher、生命周期和
+     * stdout 的释放顺序始终由连接边界统一控制。</p>
+     */
+    @FunctionalInterface
+    public interface SessionBinding {
+        /**
+         * 为唯一 RPC 会话安装外部事件绑定，并返回由连接边界统一关闭的句柄；绑定方不能自行
+         * 关闭 stdout 或替换会话，以保持 Watcher 与协议 writer 的释放顺序可推导。
+         */
+        AutoCloseable bind(RpcSession session);
+    }
 
     /**
      * 直接绑定 Java 配置所有者，避免 sidecar 依赖 Rust 生成的配置快照。
@@ -84,7 +100,20 @@ public final class RpcServer implements AutoCloseable {
     public RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration,
                      RpcServicesFactory factory, ConfigurationUseCase configurationUseCase) {
         this(input, output, configuration, Clock.systemUTC(), factory, configurationUseCase,
-                () -> { }, configuration.runtimeGeneration());
+                () -> { }, configuration.runtimeGeneration(), ignored -> () -> { });
+    }
+
+    /**
+     * 允许启动组合为唯一 stdio 会话接入已脱敏的外部状态事件，默认构造器仍保持无外部订阅。
+     *
+     * <p>该参数只定义生命周期绑定，事件内容仍由 bootstrap 规范化为协议允许的字段，故 transport
+     * 不需要认识配置 Watcher、文件路径或凭据来源。</p>
+     */
+    public RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration,
+                     RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
+                     SessionBinding sessionBinding) {
+        this(input, output, configuration, Clock.systemUTC(), factory, configurationUseCase,
+                () -> { }, configuration.runtimeGeneration(), sessionBinding);
     }
 
     /**
@@ -93,7 +122,7 @@ public final class RpcServer implements AutoCloseable {
     RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
               RpcServicesFactory factory, ConfigurationUseCase configurationUseCase) {
         this(input, output, configuration, clock, factory, configurationUseCase, () -> {
-        }, configuration.runtimeGeneration());
+        }, configuration.runtimeGeneration(), ignored -> () -> { });
     }
 
     /**
@@ -102,19 +131,40 @@ public final class RpcServer implements AutoCloseable {
     RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
               RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
               Runnable beforeDispatch) {
-        this(input, output, configuration, clock, factory, configurationUseCase, beforeDispatch, 1);
+        this(input, output, configuration, clock, factory, configurationUseCase, beforeDispatch, 1,
+                ignored -> () -> { });
+    }
+
+    /** 为连接级事件投影测试注入绑定，同时保留既有时钟和读取栅栏的可控性。 */
+    RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
+              RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
+              SessionBinding sessionBinding) {
+        this(input, output, configuration, clock, factory, configurationUseCase, () -> { },
+                configuration.runtimeGeneration(), sessionBinding);
     }
 
     /** 为事件投影测试固定非默认进程代际，使 generation 断言保持确定。 */
     RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
               RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
               Runnable beforeDispatch, long runtimeGeneration) {
+        this(input, output, configuration, clock, factory, configurationUseCase, beforeDispatch,
+                runtimeGeneration, ignored -> () -> { });
+    }
+
+    /**
+     * 在构造阶段固定 session 与外部订阅，避免运行中替换绑定使 Watcher 事件落入另一代连接。
+     */
+    RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
+              RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
+              Runnable beforeDispatch, long runtimeGeneration, SessionBinding binding) {
         this.input = Objects.requireNonNull(input, "input");
         this.writer = new StdioWriter(Objects.requireNonNull(output, "output"), codec.mapper(),
                 JaRpcCodec.DEFAULT_MAX_FRAME_BYTES);
         this.session = new RpcSession(configuration, codec.mapper(), clock, writer, factory,
                 configurationUseCase, runtimeGeneration);
         this.beforeDispatch = Objects.requireNonNull(beforeDispatch, "beforeDispatch");
+        this.sessionBinding = Objects.requireNonNull(binding, "binding").bind(session);
+        if (sessionBinding == null) throw new IllegalArgumentException("session binding must return a close handle");
         this.threadHistory = new ThreadHistoryHandler(session);
         this.router = new RpcRouter(List.of(new HandshakeHandler(session), new WorkspaceHandler(session),
                 new WorkspacePathSearchHandler(session),
@@ -290,6 +340,8 @@ public final class RpcServer implements AutoCloseable {
                 case TURN_RESUME_ORDER_CONFLICT -> JaRpcException.of(
                         JaErrorCatalog.TURN_RESUME_ORDER_CONFLICT,
                         "an earlier turn must be resolved first");
+                case RECOVERY_REQUIRED -> JaRpcException.of(JaErrorCatalog.RECOVERY_REQUIRED,
+                        "tool recovery requires an explicit decision");
             };
         }
         if (failure instanceof TurnUseCase.TurnCancellationException cancellation) {
@@ -448,6 +500,13 @@ public final class RpcServer implements AutoCloseable {
                 else failure.addSuppressed(closeFailure);
             }
             if (changeSetReadsQuiesced) {
+                try {
+                    sessionBinding.close();
+                } catch (Exception closeFailure) {
+                    if (failure == null) failure = new IllegalStateException(
+                            "rpc session binding cleanup failed", closeFailure);
+                    else failure.addSuppressed(closeFailure);
+                }
                 try {
                     session.close(deadline);
                 } catch (RuntimeException closeFailure) {

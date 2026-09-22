@@ -68,7 +68,10 @@ export function shouldAdjustTimelineScrollPosition(
   item: Pick<VirtualItem, "end">,
   _delta: number,
   instance: TimelineResizeVirtualizer,
+  followingLatest = true,
 ): boolean {
+  // 用户已离开最新消息时，任何自动尺寸补偿都可能改变正在阅读的文本位置；行几何只能在追随尾部时参与判断。
+  if (!followingLatest) return false;
   const scrollOffset = (instance.scrollOffset ?? 0) + instance.scrollAdjustments;
   return item.end <= scrollOffset && instance.scrollDirection !== "backward";
 }
@@ -91,6 +94,8 @@ export interface UseTimelineScrollOptions {
 
 export interface UseTimelineScrollResult {
   readonly followingLatest: boolean;
+  /** ResizeObserver 在 React commit 外触发，因此提供即时读取而不依赖异步的 state re-render。 */
+  readonly isFollowingLatest: () => boolean;
   readonly scrollToLatest: () => void;
 }
 
@@ -223,6 +228,16 @@ export function useTimelineScroll({
   }, [capturePosition, scrollRef, setFollowing]);
 
   /** stream/reload 后仅在当前会话仍跟随尾部时滚动；手动上滚和已恢复锚点都不会被抢回。 */
+  useLayoutEffect(() => {
+    if (rowCount === 0 || followingRef.current || threadId === undefined) return;
+    const snapshot = cache.get(threadId);
+    if (snapshot === undefined || snapshot.followingLatest) return;
+    // ResizeObserver 仍可能在 callback policy 外改写虚拟行的视觉起点；在 paint 前以同一行锚点收敛，
+    // 让长流式正文的尾部增长既不抢走阅读位置，也不闪出一次错误的 offset。
+    restorePosition(snapshot);
+  }, [cache, restorePosition, revision, rowCount, threadId]);
+
+  /** stream/reload 后仅在当前会话仍跟随尾部时滚动；手动上滚和已恢复锚点都不会被抢回。 */
   useEffect(() => {
     if (rowCount === 0) return undefined;
     const pending = pendingRestoreRef.current;
@@ -286,5 +301,8 @@ export function useTimelineScroll({
     scrollToLatest();
   }, [scrollToLatest, setFollowing]);
 
-  return { followingLatest, scrollToLatest: jumpToLatest };
+  /** 流式布局测量必须读取 ref，避免 Wheel 与下一次 React render 之间仍沿用旧的跟随状态。 */
+  const isFollowingLatest = useCallback((): boolean => followingRef.current, []);
+
+  return { followingLatest, isFollowingLatest, scrollToLatest: jumpToLatest };
 }

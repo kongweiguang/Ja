@@ -259,6 +259,103 @@ describe("timeline Zustand seam", () => {
     expect(secondSelection.at(-1)).toBe(firstSelection.at(-1));
   });
 
+  /** 持久压缩步骤到达时不能越过此前草稿，selector 必须按发生时间保留正文、Tool、正文的阅读顺序。 */
+  it("interleaves context compaction between surrounding live reply segments", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applyHostEvent({ kind: "timeline", event: event(1, "queued", "running") })).toBe(
+      "applied",
+    );
+    const reasoning: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/reasoning-summary-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_context_before",
+        sequence: 2,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: "2026-08-18T00:00:01Z",
+        streamSeq: 1,
+        text: "先确认当前上下文。",
+      },
+    };
+    const compactionStarted: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "context/compaction-started",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_context_started",
+        sequence: 3,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: "2026-08-18T00:00:02Z",
+        compactionId: "cmp_store_context",
+        trigger: "automatic",
+        sourceRevision: 1,
+        inputTokensBefore: 12_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+      },
+    };
+    const compacted: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "context/compacted",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_context_completed",
+        sequence: 4,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 2,
+        occurredAt: "2026-08-18T00:00:03Z",
+        compactionId: "cmp_store_context",
+        checkpointId: "checkpoint_store_context",
+        trigger: "automatic",
+        sourceRevision: 1,
+        inputTokensBefore: 12_000,
+        inputTokensAfter: 4_000,
+        strategyVersion: "ja-context-v1",
+      },
+    };
+    const commentary: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/text-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_context_after",
+        sequence: 5,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 2,
+        occurredAt: "2026-08-18T00:00:04Z",
+        streamSeq: 2,
+        text: "压缩后继续回复。",
+      },
+    };
+
+    for (const timelineEvent of [reasoning, compactionStarted, compacted, commentary]) {
+      expect(store.applyHostEvent({ kind: "timeline", event: timelineEvent })).toBe("applied");
+    }
+
+    const selected = selectItemsForThread("thr_store")(useTimelineStore.getState());
+    expect(selected.map((item) => item.kind)).toEqual(["reasoning", "tool_call", "commentary"]);
+    expect(selected[1]).toMatchObject({
+      title: "上下文自动压缩",
+      metadata: { presentation: { kind: "context", status: "success" } },
+    });
+  });
+
   /** Store selector 必须把跨 reasoning/text 的每个 live segment 映射为独立且稳定的时间线 Item。 */
   it("projects interleaved reasoning segments with semantic kinds", () => {
     prepareStore();

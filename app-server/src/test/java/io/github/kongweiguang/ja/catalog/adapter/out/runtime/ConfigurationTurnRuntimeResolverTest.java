@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpToolCatalog;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
@@ -97,18 +98,15 @@ final class ConfigurationTurnRuntimeResolverTest {
     }
 
     /**
-     * 消息引用必须保留配置中的稳定 ID，并只发布已启用且实际发现的交集；
-     * 发现目录里的同名元数据不能反向生成 ID，禁用项也不能进入本 Turn。
+     * 消息引用必须保留来源限定授权，并只发布与胜出发现来源一致的交集；
+     * 发现目录里的同名元数据不能反向生成跨来源许可。
      */
     @Test
     void skillIdentityMapUsesFrozenIdsForEnabledDiscoveredSkillsOnly() {
         List<ConfigurationGenerationSnapshot.Skill> configured = List.of(
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_review", "review", "user", true, "Review changes"),
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_disabled", "disabled", "user", false, "Disabled skill"),
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_missing", "missing", "workspace", true, "Missing skill"));
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("ja:review")),
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("ja:disabled")),
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("project:missing")));
         SkillCatalog.Catalog discovered = new SkillCatalog.Catalog(List.of(
                 new SkillCatalog.SkillDescriptor(
                         "review", "Review changes", SkillCatalog.Source.JA_USER),
@@ -117,45 +115,39 @@ final class ConfigurationTurnRuntimeResolverTest {
                 new SkillCatalog.SkillDescriptor(
                         "unconfigured", "Unconfigured skill", SkillCatalog.Source.WORKSPACE)));
 
-        assertEquals(Map.of("skill_review", "review"),
+        assertEquals(Map.of("ja:review", "review", "ja:disabled", "disabled"),
                 ConfigurationTurnRuntimeResolver.skillNamesById(configured, discovered));
     }
 
     /**
-     * 工作区切换后缺失的项目 Skill 只收窄当前能力；用户级 Skill 缺失仍必须阻断，防止安装损坏被隐藏。
+     * 文件删除和同名覆盖都只收窄当前能力；缺失记录留给设置页移除，不阻断其它 Turn。
      */
     @Test
-    void missingProjectSkillDoesNotBlockTurnButMissingUserSkillDoes() {
+    void missingOrShadowedSkillDoesNotBlockTurn() {
         List<ConfigurationGenerationSnapshot.Skill> projectOnly = List.of(
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_project", "project-only", "project", true, "Project skill"));
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("project:project-only")));
         assertEquals(List.of(), ConfigurationTurnRuntimeResolver.availableSkillNames(
                 projectOnly, new SkillCatalog.Catalog(List.of())));
 
         List<ConfigurationGenerationSnapshot.Skill> mixed = List.of(
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_user", "review", "user", true, "Review changes"),
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_project", "project-only", "project", true, "Project skill"));
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("ja:review")),
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("project:project-only")));
         SkillCatalog.Catalog discovered = new SkillCatalog.Catalog(List.of(
                 new SkillCatalog.SkillDescriptor("review", "Review changes", SkillCatalog.Source.JA_USER)));
         assertEquals(List.of("review"), ConfigurationTurnRuntimeResolver.availableSkillNames(mixed, discovered));
 
         List<ConfigurationGenerationSnapshot.Skill> missingUser = List.of(
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_user", "missing", "user", true, "Missing skill"));
-        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
-                () -> ConfigurationTurnRuntimeResolver.availableSkillNames(
-                        missingUser, new SkillCatalog.Catalog(List.of())));
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("user:missing")));
+        assertEquals(List.of(), ConfigurationTurnRuntimeResolver.availableSkillNames(
+                missingUser, new SkillCatalog.Catalog(List.of())));
 
         List<ConfigurationGenerationSnapshot.Skill> duplicateName = List.of(
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_user", "same-name", "user", true, "User skill"),
-                new ConfigurationGenerationSnapshot.Skill(
-                        "skill_project", "same-name", "project", true, "Project skill"));
-        assertThrows(io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver.RuntimeMismatchException.class,
-                () -> ConfigurationTurnRuntimeResolver.availableSkillNames(
-                        duplicateName, new SkillCatalog.Catalog(List.of())));
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("user:same-name")),
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("project:same-name")));
+        assertEquals(List.of("same-name"), ConfigurationTurnRuntimeResolver.availableSkillNames(
+                duplicateName, new SkillCatalog.Catalog(List.of(
+                        new SkillCatalog.SkillDescriptor(
+                                "same-name", "Project skill", SkillCatalog.Source.WORKSPACE)))));
     }
 
     /** 对象键的注册顺序不得进入恢复指纹，但真实 Schema 内容变化必须改变摘要。 */

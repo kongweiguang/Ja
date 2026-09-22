@@ -413,6 +413,7 @@ describe("ChatTimeline", () => {
     const streamingProcess = screen.getByRole("region", { name: "工作过程" });
     expect(streamingProcess).toBeVisible();
     expect(streamingProcess).toHaveAttribute("data-state", "active");
+    expect(streamingProcess.querySelector(".ja-work-process__trigger")).toBeNull();
     expect(streamingProcess).toHaveTextContent("第一段");
     expect(response).not.toHaveTextContent("第一段");
     expect(response).toHaveAttribute("data-response-state", "working");
@@ -505,6 +506,159 @@ describe("ChatTimeline", () => {
     expect(document.querySelectorAll('[data-role="final"]')).toHaveLength(1);
   });
 
+  /** 自动上下文压缩和普通 Tool 一样留在阅读顺序中，只有成功答复到位后才一并归档。 */
+  it("keeps automatic context compaction in the reply reading flow before archiving", async () => {
+    const user = userEvent.setup();
+    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const contextStep = baseItem({
+      itemId: "item_compaction",
+      kind: "tool_call",
+      status: "in_progress",
+      title: "上下文自动压缩",
+      metadata: {
+        toolName: "context_compaction",
+        presentation: {
+          kind: "context",
+          title: "上下文自动压缩",
+          status: "running",
+          summary: "正在整理已完成的对话内容。",
+          relativePaths: [],
+          truncated: false,
+        },
+      },
+    });
+    const { rerender } = render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_before_compaction",
+            kind: "commentary",
+            status: "in_progress",
+            text: "先完成第一段说明。",
+            metadata: { phase: "assistant_progress" },
+          }),
+          contextStep,
+          baseItem({
+            itemId: "item_after_compaction",
+            kind: "commentary",
+            status: "in_progress",
+            text: "压缩后继续生成回复。",
+            metadata: { phase: "assistant_progress" },
+          }),
+        ]}
+        turns={[runningTurn]}
+      />,
+    );
+
+    const process = screen.getByRole("region", { name: "工作过程" });
+    expect(process.querySelector(".ja-work-process__trigger")).toBeNull();
+    expect(process).toHaveTextContent("先完成第一段说明。");
+    expect(process).toHaveTextContent("压缩后继续生成回复。");
+    expect(
+      screen.getByRole("button", { name: /上下文自动压缩，context_compaction，进行中/ }),
+    ).toBeVisible();
+    expect(screen.getByRole("article", { name: "回复状态" })).toHaveTextContent("正在工作");
+
+    rerender(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_before_compaction",
+            kind: "commentary",
+            status: "completed",
+            text: "先完成第一段说明。",
+            metadata: { phase: "assistant_progress" },
+          }),
+          {
+            ...contextStep,
+            status: "completed",
+            metadata: {
+              ...contextStep.metadata,
+              presentation: {
+                ...contextStep.metadata!.presentation!,
+                status: "success",
+                summary: "上下文已从 12,000 Token 压缩至 4,000 Token。",
+              },
+            },
+          },
+          baseItem({
+            itemId: "item_after_compaction",
+            kind: "commentary",
+            status: "completed",
+            text: "压缩后继续生成回复。",
+            metadata: { phase: "assistant_progress" },
+          }),
+          baseItem({
+            itemId: "item_final_compaction",
+            kind: "agent_message",
+            final: true,
+            text: "最终答复保持在过程之外。",
+          }),
+        ]}
+        turns={[{ ...runningTurn, status: "completed" }]}
+      />,
+    );
+
+    const archive = screen.getByRole("button", { name: /查看工作过程/ });
+    expect(archive).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("article", { name: "最终答复" })).toHaveTextContent(
+      "最终答复保持在过程之外。",
+    );
+    await user.click(archive);
+    expect(screen.getByRole("button", { name: "收起工作过程" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    const contextDetails = screen.getByRole("button", {
+      name: /上下文自动压缩，context_compaction，完成/,
+    });
+    expect(contextDetails).toBeVisible();
+    await user.click(contextDetails);
+    expect(screen.getByText("上下文已从 12,000 Token 压缩至 4,000 Token。")).toBeVisible();
+  });
+
+  /** 终态失败没有最终答复可替代过程，归档入口必须默认展开以保留压缩诊断。 */
+  it("keeps failed context compaction expanded until the user collapses it", () => {
+    render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_compaction_failed",
+            kind: "tool_call",
+            status: "failed",
+            title: "上下文自动压缩",
+            metadata: {
+              toolName: "context_compaction",
+              presentation: {
+                kind: "context",
+                title: "上下文自动压缩",
+                status: "error",
+                summary: "自动压缩未完成：SUMMARY_FAILURE。",
+                relativePaths: [],
+                truncated: false,
+              },
+            },
+          }),
+        ]}
+        turns={[
+          {
+            turnId,
+            threadId: "thr_one",
+            status: "failed",
+            error: { code: "SUMMARY_FAILURE", retryable: true },
+          },
+        ]}
+      />,
+    );
+
+    const archive = screen.getByRole("button", { name: /收起工作过程/ });
+    expect(archive).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: /上下文自动压缩，context_compaction，失败/ }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("自动压缩未完成：SUMMARY_FAILURE。")).toBeVisible();
+  });
+
   /** 审批是权威暂停态，状态恢复后才重新出现工作呼吸点，且审批本身仍进入真实工作过程。 */
   it("无 USER item 的内部 Turn 仍提供稳定审批行并在恢复后继续工作态", async () => {
     const user = userEvent.setup();
@@ -534,7 +688,7 @@ describe("ChatTimeline", () => {
     ).toBeVisible();
     const process = screen.getByRole("region", { name: "工作过程" });
     expect(process).toHaveAttribute("data-state", "waiting");
-    expect(process).toHaveTextContent("等待确认");
+    expect(process.querySelector(".ja-work-process__trigger")).toBeNull();
     const waitingResponse = screen.getByRole("article", { name: "回复状态" });
     expect(waitingResponse).toHaveAttribute("data-response-state", "waiting");
     expect(waitingResponse).toHaveTextContent("等待你的确认");
@@ -551,9 +705,7 @@ describe("ChatTimeline", () => {
         approvals={[approval]}
       />,
     );
-    expect(screen.getByRole("region", { name: "工作过程" })).toBe(process);
-    expect(process).toHaveAttribute("data-state", "active");
-    expect(process).toHaveTextContent("进行中");
+    expect(screen.queryByRole("region", { name: "工作过程" })).not.toBeInTheDocument();
     expect(screen.getByRole("article", { name: "回复状态" })).toBe(waitingResponse);
     expect(waitingResponse).toHaveTextContent("正在工作");
   });
@@ -566,8 +718,7 @@ describe("ChatTimeline", () => {
     const response = screen.getByRole("article", { name: "失败说明" });
     expect(response).toHaveAttribute("data-response-state", "failed");
     expect(response).toHaveAttribute("data-role", "failure");
-    expect(response).toHaveTextContent("任务未完成");
-    expect(response).toHaveTextContent("本轮没有生成最终答复");
+    expect(response).toHaveTextContent("本次回复未能完成。");
     expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
     expect(response).not.toHaveClass("ja-chat-message-draft");
     expect(response.querySelector(".ja-chat-activity-dots")).toBeNull();
@@ -1257,7 +1408,7 @@ describe("ChatTimeline", () => {
     expect(screen.queryByRole("button", { name: "预览附件 只读图片.png" })).not.toBeInTheDocument();
   });
 
-  it("shows turn duration and explicit terminal failure without step metrics", () => {
+  it("shows explicit terminal failure without redundant process metrics", () => {
     render(
       <ChatTimeline
         turns={[
@@ -1292,16 +1443,14 @@ describe("ChatTimeline", () => {
       "data-state",
       "failed",
     );
-    expect(screen.getByText("1.3秒")).toBeVisible();
+    expect(document.querySelector(".ja-work-process__duration")).toBeNull();
     expect(
       screen.queryByText(/2 个文件|src\/Main\.tsx|docs\/readme\.md|\+7|−3/u),
     ).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("TURN_FAILED");
+    expect(screen.getByRole("alert")).toHaveTextContent("本次回复暂时中断。");
   });
 
-  it("将可重试故障显示为非自动重放的重新编辑入口", async () => {
-    const user = userEvent.setup();
-    const onPrepareRetry = vi.fn();
+  it("将可重试故障收敛为单行原因", () => {
     render(
       <ChatTimeline
         turns={[
@@ -1322,28 +1471,18 @@ describe("ChatTimeline", () => {
           }),
           baseItem({ itemId: "item_failed", status: "failed" }),
         ]}
-        onPrepareRetry={onPrepareRetry}
       />,
     );
 
     const failure = screen.getByRole("article", { name: "失败说明" });
     expect(failure).toHaveAttribute("data-role", "failure");
-    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
-    expect(screen.getByRole("alert")).toHaveTextContent("本轮没有生成最终答复");
-    expect(screen.getByRole("alert")).toHaveTextContent("MODEL_UNAVAILABLE");
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "只恢复原问题，不会自动发送或重放已执行的工具",
-    );
+    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用。");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("错误代码");
     expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "重新编辑" }));
-    expect(onPrepareRetry).toHaveBeenCalledTimes(1);
-    expect(onPrepareRetry).toHaveBeenCalledWith(turnId, "继续检查这个问题");
+    expect(screen.queryByRole("button", { name: "重新编辑" })).not.toBeInTheDocument();
   });
 
-  it("模型协议故障不武断归因且仍允许安全恢复原文", async () => {
-    const user = userEvent.setup();
-    const onPrepareRetry = vi.fn();
+  it("模型协议故障不武断归因且不重复展示恢复说明", () => {
     render(
       <ChatTimeline
         turns={[
@@ -1364,15 +1503,11 @@ describe("ChatTimeline", () => {
           }),
           baseItem({ itemId: "item_protocol_failed", status: "failed" }),
         ]}
-        onPrepareRetry={onPrepareRetry}
       />,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent("模型响应格式有误或不完整");
-    expect(screen.getByRole("alert")).toHaveTextContent("若持续失败，请查看运行日志中的具体原因");
-    expect(screen.getByRole("alert")).toHaveTextContent("MODEL_PROTOCOL_ERROR");
-    await user.click(screen.getByRole("button", { name: "重新编辑" }));
-    expect(onPrepareRetry).toHaveBeenCalledWith(turnId, "继续完成剩余工作");
+    expect(screen.getByRole("alert")).toHaveTextContent("模型响应格式有误或不完整。");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("MODEL_PROTOCOL_ERROR");
   });
 
   /** 摘要失败是上下文准备阶段的独立故障，不能沿用模型服务不可用的错误归因。 */
@@ -1392,13 +1527,11 @@ describe("ChatTimeline", () => {
     );
 
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent("上下文摘要生成失败");
-    expect(alert).toHaveTextContent("请缩短当前对话");
-    expect(alert).toHaveTextContent("SUMMARY_FAILURE");
+    expect(alert).toHaveTextContent("对话摘要生成失败。");
     expect(alert).not.toHaveTextContent("模型服务暂时不可用");
   });
 
-  it("将预算耗尽解释为未完成并给出调整范围后的恢复路径", () => {
+  it("将预算耗尽解释为单行原因", () => {
     render(
       <ChatTimeline
         turns={[
@@ -1413,12 +1546,10 @@ describe("ChatTimeline", () => {
       />,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent("达到执行上限前没有完成回复");
-    expect(screen.getByRole("alert")).toHaveTextContent("缩小任务范围");
-    expect(screen.getByRole("alert")).toHaveTextContent("BUDGET_EXCEEDED");
+    expect(screen.getByRole("alert")).toHaveTextContent("已达到本轮资源上限。");
   });
 
-  it("保留失败前的公开内容但明确标为不完整回复", () => {
+  it("保留失败前的公开内容并显示单行原因", () => {
     render(
       <ChatTimeline
         turns={[
@@ -1441,14 +1572,13 @@ describe("ChatTimeline", () => {
     );
 
     const failure = screen.getByRole("article", { name: "失败说明" });
-    expect(failure).toHaveTextContent("以下内容在失败前生成，可能不完整，不能视为最终答复");
     expect(failure).toHaveTextContent("已经生成但尚未完成的内容");
+    expect(failure).toHaveTextContent("模型服务暂时不可用。");
     expect(failure).toHaveAttribute("data-role", "failure");
     expect(document.querySelectorAll('[data-role="final"]')).toHaveLength(0);
   });
 
-  it("把运行时失败正文显示为已保存的失败回复，同时保留错误状态和恢复动作", () => {
-    const onPrepareRetry = vi.fn();
+  it("隐藏纯系统失败正文，仅显示错误原因且不提供复制动作", () => {
     render(
       <ChatTimeline
         turns={[
@@ -1469,22 +1599,19 @@ describe("ChatTimeline", () => {
             itemId: "item_failure_reply",
             status: "failed",
             final: true,
-            text: "本轮未能完成：模型服务暂时不可用。",
+            text: "模型服务暂时不可用。",
             metadata: { failureReply: true },
           }),
         ]}
-        onPrepareRetry={onPrepareRetry}
       />,
     );
 
     const failure = screen.getByRole("article", { name: "失败说明" });
-    expect(failure).toHaveTextContent("本轮未能完成：模型服务暂时不可用");
-    expect(failure).toHaveTextContent("本轮失败原因已保存");
-    expect(failure).not.toHaveTextContent("可能不完整");
-    expect(failure).toHaveTextContent("MODEL_UNAVAILABLE");
+    expect(failure).toHaveTextContent("模型服务暂时不可用。");
+    expect(failure).not.toHaveTextContent("本轮未能完成");
     expect(failure).toHaveAttribute("data-role", "failure");
     expect(document.querySelectorAll('[data-role="final"]')).toHaveLength(0);
-    expect(screen.getByRole("button", { name: "重新编辑" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "复制未完成内容" })).not.toBeInTheDocument();
   });
 
   it("工作过程成功摘要不夹带文件变更、同步状态或零修改占位", () => {

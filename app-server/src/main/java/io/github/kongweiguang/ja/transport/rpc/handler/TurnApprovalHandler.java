@@ -48,7 +48,7 @@ public final class TurnApprovalHandler implements RpcHandler {
      */
     @Override
     public Set<RpcMethod> methods() {
-        return Set.of(RpcMethod.TURN_START, RpcMethod.TURN_RESUME, RpcMethod.TURN_CANCEL,
+        return Set.of(RpcMethod.TURN_START, RpcMethod.TURN_RESUME, RpcMethod.TURN_RECOVERY_RESPOND, RpcMethod.TURN_CANCEL,
                 RpcMethod.TURN_INPUT_ENQUEUE, RpcMethod.TURN_INPUT_PRIORITIZE,
                 RpcMethod.TURN_INPUT_UPDATE, RpcMethod.TURN_INPUT_DELETE, RpcMethod.APPROVAL_RESPOND);
     }
@@ -62,6 +62,7 @@ public final class TurnApprovalHandler implements RpcHandler {
         return switch (command.method()) {
             case TURN_START -> CompletableFuture.completedFuture(start(command.params()));
             case TURN_RESUME -> CompletableFuture.completedFuture(resume(command.params()));
+            case TURN_RECOVERY_RESPOND -> CompletableFuture.completedFuture(respondToolRecovery(command.params()));
             case TURN_CANCEL -> cancel(command.params());
             case TURN_INPUT_ENQUEUE -> CompletableFuture.completedFuture(enqueueInput(command.params()));
             case TURN_INPUT_PRIORITIZE -> CompletableFuture.completedFuture(prioritizeInput(command.params()));
@@ -104,6 +105,50 @@ public final class TurnApprovalHandler implements RpcHandler {
             session.abandonTurnNotification(turnId);
             throw failure;
         }
+    }
+
+    /**
+     * 将原 Tool 详情里的用户选择作为一次有版本和幂等键保护的裁决提交。新裁决若已消除最后一项未知，
+     * 立即复用既有 Resume 编排；仍有下一项未知时返回已提交事实，不把正常等待伪装为 RPC 失败。
+     */
+    private ObjectNode respondToolRecovery(ObjectNode params) {
+        RpcParams.requireExact(params, "turnId", "callId", "expectedThreadRevision",
+                "expectedRecoveryRevision", "decision", "idempotencyKey");
+        String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
+        String callId = RpcParams.identifier(params, "callId", "call_", 128);
+        long expectedThreadRevision = RpcParams.revision(params, "expectedThreadRevision");
+        long expectedRecoveryRevision = RpcParams.revision(params, "expectedRecoveryRevision");
+        if (expectedRecoveryRevision < 1) throw JaRpcException.invalidParams();
+        TurnUseCase.ToolRecoveryDisposition decision = toolRecoveryDecision(
+                RpcParams.text(params, "decision", 16, false));
+        String idempotencyKey = RpcParams.text(params, "idempotencyKey", 128, false);
+        TurnUseCase.ToolRecoveryResponse response = session.turns().respondToolRecovery(
+                new TurnUseCase.ToolRecoveryRequest(turnId, callId, expectedThreadRevision,
+                        expectedRecoveryRevision, decision, idempotencyKey));
+        boolean resumed = false;
+        if (response.changed()) {
+            ObjectNode resumeParams = session.mapper().createObjectNode()
+                    .put("turnId", response.turnId())
+                    .put("expectedThreadRevision", response.threadRevision());
+            try {
+                resume(resumeParams);
+                resumed = true;
+            } catch (TurnUseCase.TurnResumeException pending) {
+                if (pending.failure() != TurnUseCase.ResumeFailure.RECOVERY_REQUIRED) throw pending;
+            }
+        }
+        return session.mapper().createObjectNode().put("accepted", true)
+                .put("turnId", response.turnId()).put("threadRevision", response.threadRevision())
+                .put("decision", decision.name().toLowerCase(Locale.ROOT)).put("resumed", resumed);
+    }
+
+    /** 只有两个用户可选词能进入持久化；文件核实是服务端内部结论，客户端永远不能提交 verified。 */
+    private static TurnUseCase.ToolRecoveryDisposition toolRecoveryDecision(String value) {
+        return switch (value) {
+            case "retry" -> TurnUseCase.ToolRecoveryDisposition.RETRY;
+            case "skip" -> TurnUseCase.ToolRecoveryDisposition.SKIP;
+            default -> throw JaRpcException.invalidParams();
+        };
     }
 
     /**

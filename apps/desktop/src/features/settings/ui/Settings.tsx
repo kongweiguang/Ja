@@ -2,10 +2,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as Tabs from "@radix-ui/react-tabs";
-import { ArrowLeft, Search, X } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Button, IconButton, ScrollArea } from "@/shared/ui/primitives";
-import type { SettingsRecovery, SettingsSection, SettingsSnapshot } from "../domain/types";
+import { ArrowLeft, CircleAlert, Search, X } from "lucide-react";
+import {
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import {
+  Button,
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  IconButton,
+  ScrollArea,
+} from "@/shared/ui/primitives";
+import type { ConfigurationIssue, SettingsSection, SettingsSnapshot } from "../domain/types";
 import type { SettingsDesktopPort, SettingsPorts } from "../application/ports";
 import type { SettingsInterfacePreferences } from "../application/ports";
 import type { ExecutionScope } from "../domain/executionScope";
@@ -200,14 +215,61 @@ function matchesQuery(query: string, text: string): boolean {
 }
 
 /**
+ * 以问题关联条目的稳定 ID 识别 MCP，而不是假定字段名总是 `mcp_servers`。
+ *
+ * 未知字段会保留其真实字段名，例如错位的 `schema_version`；实体身份仍是导航到正确设置区的
+ * 唯一可靠依据，避免“编辑”把用户带到模型页。
+ */
+function isMcpIssue(issue: ConfigurationIssue): boolean {
+  return issue.field === "mcp_servers" || issue.entityId?.startsWith("mcp_") === true;
+}
+
+/**
+ * 将脱敏的作用域与条目身份投影为用户能立即判断的设置区域，不暴露原始文档或内部诊断码。
+ */
+function issueTitle(issue: ConfigurationIssue): string {
+  if (isMcpIssue(issue)) return "MCP 服务";
+  if (issue.field === "providers" || issue.entityId?.startsWith("provider_") === true)
+    return "服务商";
+  if (issue.field === "models" || issue.entityId?.startsWith("model_") === true) return "模型";
+  if (issue.field === "skills") return "Skill";
+  if (issue.scope === "credential") return "凭据";
+  return "配置项";
+}
+
+/**
+ * 把稳定影响码转换为简短处理结果，保证局部未知字段不会被误述为整份配置损坏。
+ */
+function issueDescription(issue: ConfigurationIssue): string {
+  if (issue.impact === "snapshot_in_use") return "正在使用上次可用设置。";
+  if (issue.impact === "defaults_in_use") return "正在使用默认设置。";
+  if (issue.impact === "selection_required") return "需要选择一个可用模型。";
+  if (issue.impact === "provider_unavailable") return "此服务商暂不可用。";
+  if (issue.impact === "model_unavailable") return "此模型暂不可用。";
+  if (issue.impact === "mcp_unavailable") return "此 MCP 暂不可用。";
+  if (issue.impact === "skill_unavailable") return "此 Skill 暂不可用。";
+  if (issue.impact === "credential_connections_unavailable") return "依赖该凭据的连接暂不可用。";
+  if (issue.impact === "ignored") return "此字段暂不支持，已忽略。";
+  if (issue.impact === "entry_skipped") return "此条目暂不可用，其他设置不受影响。";
+  return "此设置正在使用安全降级。";
+}
+
+/**
  * 以 Codex 风格的紧凑分类布局承载设置内容；页面标题和恢复提示由外层
  * SettingsView 统一提供，避免同一屏重复渲染两套大标题，同时保持 snapshot
  * 和 ports 仍是唯一数据与副作用边界。
  */
 export interface SettingsProps {
   snapshot: SettingsSnapshot;
-  /** 恢复状态由 App Server 的脱敏读取结果派生，视图只能引导用户到合法编辑入口。 */
-  recovery?: SettingsRecovery;
+  skillSettings?: {
+    global: SettingsSnapshot["skills"];
+    project?: SettingsSnapshot["skills"];
+    projectAvailable: boolean;
+  };
+  /** 问题由 App Server 产生；页面只展示实际影响与允许操作，不从诊断代码猜配置内容。 */
+  issues?: readonly ConfigurationIssue[];
+  onIssuesRetry?: () => Promise<void>;
+  onIssuesRestore?: () => Promise<void>;
   interfacePreferences: SettingsInterfacePreferences;
   executionScope: ExecutionScope;
   ports: SettingsPorts;
@@ -225,7 +287,10 @@ export interface SettingsProps {
  */
 export function Settings({
   snapshot,
-  recovery,
+  skillSettings = { global: snapshot.skills, projectAvailable: false },
+  issues = [],
+  onIssuesRetry,
+  onIssuesRestore,
   interfacePreferences,
   executionScope,
   ports,
@@ -239,8 +304,12 @@ export function Settings({
 }: SettingsProps): React.ReactElement {
   const updater = useAppUpdater(desktop);
   const [query, setQuery] = useState("");
+  const [issuesOpen, setIssuesOpen] = useState(false);
+  const [issueAction, setIssueAction] = useState<"retry" | "restore">();
+  const [issueActionError, setIssueActionError] = useState<string>();
   const rootRef = useRef<HTMLElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const issuesTriggerRef = useRef<HTMLSpanElement>(null);
   const scrollPositions = useRef<Partial<Record<SettingsSection, number>>>({});
   const searchNavigation = useRef<SettingsSection | undefined>(undefined);
   const [modelFocusRequest, setModelFocusRequest] = useState<{
@@ -249,6 +318,7 @@ export function Settings({
     requestId: number;
   }>();
   const notificationsAvailable = desktopNotifications !== undefined;
+  const usingLastKnownGood = issues.some((issue) => issue.impact === "snapshot_in_use");
   const indexedResults = useMemo(
     () => settingsSearchResults(snapshot, notificationsAvailable),
     [snapshot, notificationsAvailable],
@@ -319,6 +389,48 @@ export function Settings({
       (focusable ?? target).focus({ preventScroll: true });
       window.setTimeout(() => target.classList.remove("is-search-match"), 1400);
     });
+  };
+
+  /**
+   * 配置问题操作只等待对应的权威回读，成功后关闭 Sheet；失败时保留当前问题与焦点，不能以局部
+   * 前端状态假装已恢复。按钮级 pending 避免阻断无关设置操作。
+   */
+  const runIssueAction = async (
+    action: "retry" | "restore",
+    operation: (() => Promise<void>) | undefined,
+  ): Promise<void> => {
+    if (operation === undefined || issueAction !== undefined) return;
+    setIssueActionError(undefined);
+    setIssueAction(action);
+    try {
+      await operation();
+      setIssuesOpen(false);
+    } catch {
+      setIssueActionError(
+        action === "restore" ? "恢复失败，请稍后重试。" : "重新读取配置失败，请稍后重试。",
+      );
+    } finally {
+      setIssueAction(undefined);
+    }
+  };
+
+  /**
+   * 运行中的恢复或重试必须阻止 Radix 默认 Escape 关闭，使完成或失败事实仍留在当前上下文；
+   * 非提交状态则由内容节点的键盘兜底与 Radix 关闭生命周期共同完成退出和焦点归还。
+   */
+  const handleIssuesEscape = (event: KeyboardEvent): void => {
+    if (issueAction !== undefined) event.preventDefault();
+  };
+
+  /**
+   * WebView2 的模态层偶尔会让 Radix 的 dismiss listener 看不到 Escape；内容节点捕获阶段
+   * 仍属于当前焦点域，因此在非提交状态直接关闭，避免诊断 Sheet 成为无法键盘退出的死角。
+   */
+  const handleIssuesKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+    if (event.key !== "Escape" || issueAction !== undefined) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setIssuesOpen(false);
   };
 
   return (
@@ -449,19 +561,128 @@ export function Settings({
         <div className="ja-settings-main">
           <header className="ja-settings-toolbar">
             <strong>设置</strong>
-            <SettingsUpdateAction updater={updater} />
+            <div className="ja-settings-toolbar-actions">
+              {issues.length === 0 ? null : (
+                <span ref={issuesTriggerRef}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    aria-haspopup="dialog"
+                    aria-expanded={issuesOpen}
+                    onClick={() => {
+                      setIssueActionError(undefined);
+                      setIssuesOpen(true);
+                    }}
+                  >
+                    <CircleAlert aria-hidden="true" />
+                    配置问题
+                  </Button>
+                </span>
+              )}
+              <SettingsUpdateAction updater={updater} />
+            </div>
           </header>
-          {recovery === "user_config_corrupt" ? (
-            <section className="ja-settings-recovery" role="status" aria-label="配置恢复模式">
-              <div>
-                <strong>已进入配置恢复模式</strong>
-                <p>部分本地设置无法读取。原文件尚未修改，保存有效设置即可完成修复。</p>
-              </div>
-              <Button type="button" variant="secondary" onClick={() => onSectionChange("models")}>
-                配置服务商
+          {usingLastKnownGood ? (
+            <div className="ja-settings-configuration-notice" role="status">
+              <span>配置有一处格式问题，正在使用上次可用设置。</span>
+              <Button type="button" size="sm" variant="ghost" onClick={() => setIssuesOpen(true)}>
+                查看问题
               </Button>
-            </section>
+            </div>
           ) : null}
+          <Dialog
+            modal
+            open={issuesOpen}
+            onOpenChange={(open) => {
+              if (!open && issueAction === undefined) setIssuesOpen(false);
+            }}
+          >
+            <DialogContent
+              className="ja-settings-sheet ja-settings-issues-sheet"
+              overlayClassName="ja-settings-dialog-overlay"
+              onKeyDownCapture={handleIssuesKeyDown}
+              onEscapeKeyDown={handleIssuesEscape}
+              onCloseAutoFocus={(event) => {
+                const trigger =
+                  issuesTriggerRef.current?.querySelector<HTMLButtonElement>("button");
+                if (trigger?.isConnected) {
+                  event.preventDefault();
+                  // Radix 已完成焦点域释放；同步归还可避免下一帧被设置页重渲染改写为 body。
+                  trigger.focus({ preventScroll: true });
+                }
+              }}
+            >
+              <div className="ja-settings-dialog-header">
+                <div>
+                  <DialogTitle className="ja-settings-dialog-title">配置问题</DialogTitle>
+                  <DialogDescription className="ja-settings-dialog-description">
+                    未受影响的模型、项目和历史仍可继续使用。
+                  </DialogDescription>
+                </div>
+                <DialogClose asChild>
+                  <IconButton label="关闭配置问题" disabled={issueAction !== undefined}>
+                    <X aria-hidden="true" />
+                  </IconButton>
+                </DialogClose>
+              </div>
+              <div className="ja-settings-sheet-body ja-settings-issues-list">
+                {issues.map((issue) => (
+                  <article key={issue.id} className="ja-settings-issue">
+                    <div>
+                      <strong>{issueTitle(issue)}</strong>
+                      <p>{issueDescription(issue)}</p>
+                    </div>
+                    <div>
+                      {issue.actions.includes("edit") ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          disabled={issueAction !== undefined}
+                          onClick={() => {
+                            setIssuesOpen(false);
+                            onSectionChange(isMcpIssue(issue) ? "mcp" : "models");
+                          }}
+                        >
+                          编辑
+                        </Button>
+                      ) : null}
+                      {issue.actions.includes("retry") && onIssuesRetry !== undefined ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          loading={issueAction === "retry"}
+                          disabled={issueAction !== undefined}
+                          onClick={() => void runIssueAction("retry", onIssuesRetry)}
+                        >
+                          重试
+                        </Button>
+                      ) : null}
+                      {issue.actions.includes("restore") && onIssuesRestore !== undefined ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          loading={issueAction === "restore"}
+                          disabled={issueAction !== undefined}
+                          onClick={() => void runIssueAction("restore", onIssuesRestore)}
+                        >
+                          恢复
+                        </Button>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+                {issueActionError === undefined ? null : (
+                  <p className="ja-settings-error" role="alert">
+                    {issueActionError}
+                  </p>
+                )}
+              </div>
+            </DialogContent>
+          </Dialog>
           <ScrollArea className="ja-settings-content">
             <Tabs.Content forceMount value="general" className="ja-settings-panel">
               <GeneralSection
@@ -490,7 +711,13 @@ export function Settings({
               />
             </Tabs.Content>
             <Tabs.Content forceMount value="skills" className="ja-settings-panel">
-              <SkillsSection skills={snapshot.skills} onToggleSkill={ports.onToggleSkill} />
+              <SkillsSection
+                globalSkills={skillSettings.global}
+                projectSkills={skillSettings.project}
+                projectAvailable={skillSettings.projectAvailable}
+                disabled={disabled}
+                onToggleSkill={ports.onToggleSkill}
+              />
             </Tabs.Content>
             <Tabs.Content forceMount value="mcp" className="ja-settings-panel">
               <McpSection

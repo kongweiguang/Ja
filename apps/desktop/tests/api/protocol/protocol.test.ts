@@ -28,7 +28,7 @@ const limits = {
 };
 
 const completeConfigDocument = {
-  schema_version: 1,
+  schema_version: 2,
   config_revision: 0,
   default_access_mode: "full_access",
   interaction: { clarification_enabled: true },
@@ -65,6 +65,13 @@ const completeConfigDocument = {
   ],
   mcp_servers: [],
   skills: [],
+} as const;
+
+const completeProjectSkillDocument = {
+  schema_version: 2,
+  config_revision: 0,
+  skills: ["project:demo-skill"],
+  disabled_skills: [],
 } as const;
 
 describe("JA RPC v1 protocol", () => {
@@ -156,7 +163,7 @@ describe("JA RPC v1 protocol", () => {
     ).toThrow();
   });
 
-  it("requires the frozen v1 CAS wire shapes", () => {
+  it("requires the frozen v2 CAS wire shapes", () => {
     expect(
       parseMethodParams("turn/cancel", {
         turnId: "turn_demo",
@@ -194,10 +201,10 @@ describe("JA RPC v1 protocol", () => {
       parseMethodParams("configuration/replace", {
         scope: "project",
         workspaceId: "ws_demo",
-        document: completeConfigDocument,
+        document: completeProjectSkillDocument,
         expectedVersion: "cfg_A",
       }),
-    ).toMatchObject({ workspaceId: "ws_demo", document: completeConfigDocument });
+    ).toMatchObject({ workspaceId: "ws_demo", document: completeProjectSkillDocument });
     expect(
       parseMethodParams("configuration/reset", { scope: "user", expectedVersion: "cfg_missing" }),
     ).toEqual({

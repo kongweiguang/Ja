@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorkStepAdapter } from "@/features/conversation/domain/timelineTypes";
 import { WorkProcess } from "@/features/conversation/ui/timeline/WorkProcess";
 import { TimelineDisclosureCache } from "@/features/conversation/ui/timeline/timelineDisclosure";
@@ -32,6 +32,32 @@ function toolStep(overrides: Partial<WorkStepAdapter> = {}): WorkStepAdapter {
       },
     },
     ...overrides,
+  };
+}
+
+/** 构造带恢复 CAS 的原工具详情；测试只经 WorkProcess 传入真实 Turn 投影，不伪造组件内部状态。 */
+function recoveryToolStep(callId = "call_recovery"): WorkStepAdapter {
+  const base = toolStep();
+  const presentation = base.metadata?.presentation;
+  if (presentation === undefined) throw new Error("test fixture presentation is missing");
+  return {
+    ...base,
+    itemId: `item_${callId}`,
+    turnId: "turn_recovery",
+    threadId: "thr_recovery",
+    metadata: {
+      ...base.metadata,
+      callId,
+      toolName: "write_file",
+      presentation: {
+        ...presentation,
+        kind: "write",
+        title: "写入文件",
+        status: "running",
+        command: "write_file retry.txt",
+        recovery: { revision: 7 },
+      },
+    },
   };
 }
 
@@ -280,5 +306,106 @@ describe("ToolStepDetails", () => {
     expect(screen.getByText("已跳过")).toBeVisible();
     expect(screen.queryByText(/question_scope/u)).not.toBeInTheDocument();
     expect(screen.queryByText("状态：完成")).not.toBeInTheDocument();
+  });
+
+  /**
+   * 裁决请求必须携带渲染时的双 revision 与稳定幂等键；重复点击在 Promise 未结算前只提交一次，
+   * 不让前端乐观修改 Timeline 或重复触发可能有副作用的重试。
+   */
+  it("冻结恢复 CAS 身份并阻止重新执行的重复点击", async () => {
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const resolveRecovery = vi.fn(async () => pending);
+    render(
+      <WorkProcess
+        steps={[recoveryToolStep()]}
+        turn={{
+          turnId: "turn_recovery",
+          threadId: "thr_recovery",
+          status: "suspended",
+          threadRevision: 19,
+        }}
+        onResolveToolRecovery={resolveRecovery}
+      />,
+    );
+
+    const retry = screen.getByRole("button", { name: "重新执行" });
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(resolveRecovery).toHaveBeenCalledTimes(1));
+    expect(resolveRecovery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: "thr_recovery",
+        turnId: "turn_recovery",
+        callId: "call_recovery",
+        expectedThreadRevision: 19,
+        expectedRecoveryRevision: 7,
+        decision: "retry",
+        idempotencyKey: expect.stringMatching(/^recovery-[0-9a-f]{8}$/u),
+      }),
+    );
+    expect(retry).toBeDisabled();
+    release?.();
+  });
+
+  /**
+   * 旧详情发起中的请求仍保留旧 Tool/revision 身份；随后切换到新 Thread 不会把它改写为新页面的
+   * 裁决。最终是否接受由 Runtime 与 Java 的 revision CAS 拒绝，组件不伪造成功状态。
+   */
+  it("任务切换后保留原恢复请求身份且不处理新工具", async () => {
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const resolveRecovery = vi.fn(async () => pending);
+    const rendered = render(
+      <WorkProcess
+        steps={[recoveryToolStep("call_old_recovery")]}
+        turn={{
+          turnId: "turn_recovery",
+          threadId: "thr_recovery",
+          status: "suspended",
+          threadRevision: 19,
+        }}
+        onResolveToolRecovery={resolveRecovery}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "跳过这一步" }));
+    await waitFor(() => expect(resolveRecovery).toHaveBeenCalledTimes(1));
+    rendered.rerender(
+      <WorkProcess
+        steps={[
+          {
+            ...recoveryToolStep("call_new_recovery"),
+            threadId: "thr_new_recovery",
+            turnId: "turn_new_recovery",
+          },
+        ]}
+        turn={{
+          turnId: "turn_new_recovery",
+          threadId: "thr_new_recovery",
+          status: "suspended",
+          threadRevision: 31,
+        }}
+        onResolveToolRecovery={resolveRecovery}
+      />,
+    );
+
+    expect(resolveRecovery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: "thr_recovery",
+        turnId: "turn_recovery",
+        callId: "call_old_recovery",
+        expectedThreadRevision: 19,
+        expectedRecoveryRevision: 7,
+        decision: "skip",
+      }),
+    );
+    expect(resolveRecovery).toHaveBeenCalledTimes(1);
+    release?.();
   });
 });

@@ -239,7 +239,11 @@ async function verifyHistoryLoadingIndicator(page) {
   };
 }
 
-/** 主场景验证过程/回复分区、生命信号、DOM identity、长 Markdown、阅读锚点及 terminal 收口。 */
+/**
+ * 主场景验证过程/回复分区、生命信号、DOM identity、长 Markdown、阅读锚点及 terminal 收口。
+ * 先确认侧栏本身的合法旋转已经开始，并比较同一动画实例的 startTime；这样不会把浏览器迟到派发的
+ * 首次 animationstart 误判为流式回归，同时仍能发现流式更新重建侧栏 Spinner 的真实问题。
+ */
 async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   await page.setViewportSize({ width: 1180, height: 760 });
   await page.emulateMedia({ reducedMotion: "no-preference", colorScheme: "light" });
@@ -253,9 +257,28 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   await runningHistoryState.waitFor({ state: "visible" });
   const initialResponseHandle = await initialResponse.elementHandle();
   const runningHistoryStateHandle = await runningHistoryState.elementHandle();
-  assert.ok(initialResponseHandle && runningHistoryStateHandle);
+  const runningHistorySpinnerHandle = await runningHistoryState.locator("svg").elementHandle();
+  assert.ok(initialResponseHandle && runningHistoryStateHandle && runningHistorySpinnerHandle);
+  await page.waitForFunction(() => {
+    const spinner = globalThis.document.querySelector(".ja-navigation-thread-state.is-running svg");
+    return spinner
+      ?.getAnimations()
+      .some(
+        (animation) =>
+          animation.animationName === "ja-navigation-thread-spin" &&
+          typeof animation.currentTime === "number" &&
+          animation.currentTime >= 120,
+      );
+  });
+  const historyAnimationStartTime = await runningHistoryState.locator("svg").evaluate((spinner) => {
+    const animation = spinner
+      .getAnimations()
+      .find((candidate) => candidate.animationName === "ja-navigation-thread-spin");
+    return animation?.startTime ?? null;
+  });
+  assert.equal(typeof historyAnimationStartTime, "number");
   await page.evaluate(() => {
-    globalThis.__JA_STREAMING_ANIMATION_REPLAYS__ = { response: 0, history: 0 };
+    globalThis.__JA_STREAMING_ANIMATION_REPLAYS__ = { response: 0 };
     globalThis.document.addEventListener(
       "animationstart",
       (event) => {
@@ -263,33 +286,64 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
         if (!(target instanceof globalThis.Element)) return;
         if (target.matches(".ja-chat-message-draft"))
           globalThis.__JA_STREAMING_ANIMATION_REPLAYS__.response += 1;
-        if (target.matches(".ja-navigation-thread-state.is-running svg"))
-          globalThis.__JA_STREAMING_ANIMATION_REPLAYS__.history += 1;
       },
       true,
     );
   });
 
   const reasoning = "先核对现有状态，再逐步完成流式稳定性验证。";
-  const first = "当前回复从第一段开始就在工作过程中持续生成。";
+  const first = "当前回复从第一段开始直接进入阅读区。";
   assert.equal(await invokeFixture(page, "appendReasoning", reasoning), "applied");
+  assert.equal(await invokeFixture(page, "appendContextCompaction"), "applied");
   assert.equal(await invokeFixture(page, "appendDelta", first), "applied");
   const process = page.getByRole("region", { name: "工作过程" });
   await process.waitFor({ state: "visible" });
+  assert.equal(
+    await process.locator(".ja-work-process__trigger").count(),
+    0,
+    "streaming content must not create a process disclosure",
+  );
   const reasoningStep = process.locator('[data-role="reasoning"]').first();
   await reasoningStep.getByText(reasoning, { exact: false }).waitFor({ state: "visible" });
+  const contextStep = process.getByRole("button", {
+    name: /上下文自动压缩，context_compaction，完成/u,
+  });
+  await contextStep.waitFor({ state: "visible" });
   const progressStep = process.locator('[data-role="commentary"]').last();
   await progressStep.getByText(first, { exact: false }).waitFor({ state: "visible" });
   const response = page.getByRole("article", { name: "回复状态" });
   assert.equal(await response.getByText(first, { exact: false }).count(), 0);
   await response.getByText("正在工作", { exact: true }).waitFor({ state: "visible" });
+  assert.deepEqual(
+    await process
+      .locator(".ja-work-process__steps > li")
+      .evaluateAll((steps) =>
+        steps.map(
+          (step) =>
+            step.dataset.role ?? (step.classList.contains("ja-work-step") ? "tool" : "unknown"),
+        ),
+      ),
+    ["reasoning", "tool", "commentary"],
+    "context compaction must stay between surrounding reply text in the reading flow",
+  );
+  await page.screenshot({
+    path: join(evidenceDirectory, "streaming-context-inline.png"),
+    // 该截图位于 Spinner 稳定性采样前，不能临时暂停并重建其无限旋转动画。
+    animations: "allow",
+  });
   const processHandle = await process.elementHandle();
   const reasoningHandle = await reasoningStep.elementHandle();
   const progressHandle = await progressStep.elementHandle();
   const responseHandle = await response.elementHandle();
   const historyStateHandle = await runningHistoryState.elementHandle();
+  const historySpinnerHandle = await runningHistoryState.locator("svg").elementHandle();
   assert.ok(
-    processHandle && reasoningHandle && progressHandle && responseHandle && historyStateHandle,
+    processHandle &&
+      reasoningHandle &&
+      progressHandle &&
+      responseHandle &&
+      historyStateHandle &&
+      historySpinnerHandle,
   );
   assert.equal(
     await initialResponseHandle.evaluate((before, after) => before === after, responseHandle),
@@ -303,6 +357,14 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
     ),
     true,
     "first delta must retain the history running indicator",
+  );
+  assert.equal(
+    await runningHistorySpinnerHandle.evaluate(
+      (before, after) => before === after,
+      historySpinnerHandle,
+    ),
+    true,
+    "first delta must retain the history spinner SVG",
   );
 
   assert.equal(await invokeFixture(page, "repeatLastDelta"), "duplicate");
@@ -326,13 +388,16 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
       globalThis.document.querySelector('[data-role="commentary"]') === handles.progress &&
       globalThis.document.querySelector('[data-role="response"]') === handles.response &&
       globalThis.document.querySelector(".ja-navigation-thread-state.is-running") ===
-        handles.history,
+        handles.history &&
+      globalThis.document.querySelector(".ja-navigation-thread-state.is-running svg") ===
+        handles.historySpinner,
     {
       process: processHandle,
       reasoning: reasoningHandle,
       progress: progressHandle,
       response: responseHandle,
       history: historyStateHandle,
+      historySpinner: historySpinnerHandle,
     },
   );
   assert.equal(
@@ -382,8 +447,18 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   );
   assert.deepEqual(
     await page.evaluate(() => globalThis.__JA_STREAMING_ANIMATION_REPLAYS__),
-    { response: 0, history: 0 },
-    "stream deltas must not replay response or history entry animations",
+    { response: 0 },
+    "stream deltas must not replay the response entry animation",
+  );
+  assert.deepEqual(
+    await runningHistoryState.locator("svg").evaluate((spinner) => {
+      const animations = spinner
+        .getAnimations()
+        .filter((animation) => animation.animationName === "ja-navigation-thread-spin");
+      return { count: animations.length, startTime: animations[0]?.startTime ?? null };
+    }),
+    { count: 1, startTime: historyAnimationStartTime },
+    "stream deltas must retain the existing history spinner animation",
   );
   await page.getByRole("button", { name: "回到最新", exact: true }).click();
   await page.waitForFunction(() => {
@@ -415,6 +490,7 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   assert.equal(await trigger.getAttribute("aria-expanded"), "false");
   await trigger.click();
   assert.equal(await trigger.getAttribute("aria-expanded"), "true");
+  await trigger.getByText("收起工作过程", { exact: true }).waitFor();
   await page.screenshot({
     path: join(evidenceDirectory, "streaming-complete-expanded.png"),
     animations: "disabled",

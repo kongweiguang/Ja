@@ -1,5 +1,4 @@
 // @author kongweiguang
-// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 package io.github.kongweiguang.ja.conversation.port.out;
@@ -113,6 +112,22 @@ public interface ConversationRepository extends AutoCloseable {
     default ResumeReceipt resume(String turnId, long expectedThreadRevision,
                                  long expectedTurnMutationVersion, Instant occurredAt) {
         throw new UnsupportedOperationException("turn resume is unavailable");
+    }
+
+    /**
+     * 返回当前 Tools 游标对应的首个未知操作。只有 SUSPENDED Turn 才会有该投影；正常运行中的短暂
+     * 证据行不能经由此端口暴露，避免 UI 把尚未完成的 Tool 误显示为恢复问题。
+     */
+    default Optional<PendingToolRecovery> findPendingToolRecovery(String turnId) {
+        return Optional.empty();
+    }
+
+    /**
+     * 原子提交确定性核实、用户重试或用户跳过的结论，并保留原未知记录及 attempt 审计链。调用方只能
+     * 使用返回的新双 revision 继续 Turn，不能在旧页面或重复点击下越过 CAS。
+     */
+    default ToolRecoveryResolution resolveToolRecovery(ToolRecoveryResolutionRequest request) {
+        throw new UnsupportedOperationException("tool recovery resolution is unavailable");
     }
 
     /** 没有进程内 owner 的 SUSPENDED Turn 由存储读取当前版本并直接收敛取消终态。 */
@@ -300,6 +315,80 @@ public interface ConversationRepository extends AutoCloseable {
 
     /** Resume CAS 返回两套新 revision，队列和执行器不得自行递增。 */
     record ResumeReceipt(String threadId, String turnId, long threadRevision, long turnMutationVersion) { }
+
+    /** 恢复读取不包含文件正文或绝对路径；FILE_TEXT 只携带由内建 Tool 预先保存的目标与摘要。 */
+    record PendingToolRecovery(String recoveryId, String threadId, String turnId, String callId,
+                               long recoveryRevision, EvidenceKind evidenceKind,
+                               String targetRelativePath, String expectedAfterSha256,
+                               Long expectedAfterBytes) {
+        /** 严格检查缺失证据的形状，避免恢复验证对任意路径或未测得 token 进行默认推断。 */
+        public PendingToolRecovery {
+            recoveryId = identifier(recoveryId, "recovery_", "recoveryId");
+            threadId = identifier(threadId, "thr_", "threadId");
+            turnId = identifier(turnId, "turn_", "turnId");
+            callId = identifier(callId, "call_", "callId");
+            if (recoveryRevision < 1) throw new IllegalArgumentException("invalid recovery revision");
+            Objects.requireNonNull(evidenceKind, "evidenceKind");
+            boolean file = evidenceKind == EvidenceKind.FILE_TEXT;
+            if (file != (targetRelativePath != null && expectedAfterSha256 != null && expectedAfterBytes != null)
+                    || file && (expectedAfterBytes < 0 || !expectedAfterSha256.matches("[0-9a-f]{64}"))) {
+                throw new IllegalArgumentException("invalid Tool recovery evidence");
+            }
+        }
+    }
+
+    /** 首批只对内建 UTF-8 文件修改启用自动核实；无证据分类包含 Shell、MCP、远端和旧历史。 */
+    enum EvidenceKind {
+        /** 没有可在恢复时安全重读的确定性证据，必须等待用户显式处理。 */
+        NONE,
+        /** 内建文件 Tool 保存了受路径边界保护的目标和预期 postimage 摘要，可作一次只读核实。 */
+        FILE_TEXT
+    }
+
+    /** VERIFIED 只允许服务端确定性核实，RETRY/SKIP 只允许由显式用户操作提交。 */
+    enum ToolRecoveryDisposition {
+        /** 当前文件满足已保存 postimage；这只确认现状，不伪造原始成功回执。 */
+        VERIFIED,
+        /** 用户接受重放风险，保留未知尝试并把执行游标置回可再次运行的位置。 */
+        RETRY,
+        /** 用户放弃执行此步骤，系统写入明确跳过结果而非成功结果。 */
+        SKIP
+    }
+
+    /** 恢复请求将 Thread/Tool/recovery 三个版本和幂等键绑定，防止旧详情处理新未知项。 */
+    record ToolRecoveryResolutionRequest(String turnId, String callId, long expectedThreadRevision,
+                                         long expectedRecoveryRevision, ToolRecoveryDisposition disposition,
+                                         String idempotencyKey, Instant occurredAt) {
+        /** 幂等键只在一次明确处理内有效，自动核实由服务生成稳定键而不是复用客户端行为。 */
+        public ToolRecoveryResolutionRequest {
+            turnId = identifier(turnId, "turn_", "turnId");
+            callId = identifier(callId, "call_", "callId");
+            if (expectedThreadRevision < 0 || expectedRecoveryRevision < 1) {
+                throw new IllegalArgumentException("invalid recovery revisions");
+            }
+            Objects.requireNonNull(disposition, "disposition");
+            idempotencyKey = text(idempotencyKey, "idempotencyKey", 128, false);
+            occurredAt = Objects.requireNonNull(occurredAt, "occurredAt");
+        }
+    }
+
+    /** 裁决事务返回新的 Thread/Turn 游标；RETRY 保持 Tools cursor，另外两种结算一个配对结果。 */
+    record ToolRecoveryResolution(String threadId, String turnId, long threadRevision,
+                                  long turnMutationVersion, ToolRecoveryDisposition disposition,
+                                  boolean changed) {
+        /**
+         * changed 区分本次事务真正消费待裁决项与幂等重放；transport 只在前者自动续跑，避免重复点击
+         * 在已运行 Turn 上再次排入执行队列。
+         */
+        public ToolRecoveryResolution {
+            threadId = identifier(threadId, "thr_", "threadId");
+            turnId = identifier(turnId, "turn_", "turnId");
+            if (threadRevision < 0 || turnMutationVersion < 0) {
+                throw new IllegalArgumentException("invalid recovery resolution revisions");
+            }
+            Objects.requireNonNull(disposition, "disposition");
+        }
+    }
 
     /** SUSPENDED 直接取消的原子回执。 */
     record CancelResult(String turnId, long threadRevision, long turnMutationVersion) { }
@@ -832,8 +921,8 @@ public interface ConversationRepository extends AutoCloseable {
     /**
      * 单次状态迁移可与状态一起原子持久化的事实闭集。
      */
-    sealed interface Fact permits AssistantFact, ToolResultMessageFact, ToolPreparedFact, ToolStartedFact,
-            ToolResultFact, ApprovalFact, UsageFact, ReasoningSummaryFact {
+    sealed interface Fact permits AssistantFact, ToolResultMessageFact, ToolPreparedFact, ToolRecoveryEvidenceFact,
+            ToolStartedFact, ToolResultFact, ApprovalFact, UsageFact, ReasoningSummaryFact {
     }
 
     /** 已公开的 reasoning 摘要独立保存；失败/取消也可保留它，但不创建或冒充 Assistant 消息。 */
@@ -945,6 +1034,18 @@ public interface ConversationRepository extends AutoCloseable {
         public AgentTool.ToolBindingDescriptor descriptor() {
             return new AgentTool.ToolBindingDescriptor(routeKind, localName, serverId, remoteName,
                     schemaHash, routeHash);
+        }
+    }
+
+    /**
+     * 内置文件 Tool 在 STARTED 事务中附带的最小恢复证据。它不表达“工具已成功”，仅让进程崩溃后
+     * 能读取同一工作区目标并比较当前条件；无法准备证据的 Tool 不产生该事实。
+     */
+    record ToolRecoveryEvidenceFact(String callId, AgentTool.RecoveryEvidence evidence) implements Fact {
+        /** 将 call 与既经严格校验的证据绑定，避免持久层从原始参数再次猜测路径或 postimage。 */
+        public ToolRecoveryEvidenceFact {
+            callId = identifier(callId, "call_", "callId");
+            Objects.requireNonNull(evidence, "evidence");
         }
     }
 

@@ -132,11 +132,11 @@ function tomlString(value) {
   return JSON.stringify(value);
 }
 
-/** 为每个协议写入只含 loopback Provider 的严格 v1 配置；credential 只保留不透明引用。 */
+/** 为每个协议写入只含 loopback Provider 的严格 v2 配置；credential 只保留不透明引用。 */
 async function writeIsolatedSettings(home, protocol, baseUrl) {
   const model = `reasoning-${protocol}`;
   const config = [
-    "schema_version = 1",
+    "schema_version = 2",
     "config_revision = 1",
     'default_access_mode = "full_access"',
     'default_provider_id = "provider_e2e"',

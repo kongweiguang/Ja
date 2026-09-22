@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"c:recovery-result-missing","method":"turn/recovery/respond","params":{"turnId":"turn_suspended","callId":"call_write_config","expectedThreadRevision":7,"expectedRecoveryRevision":1,"decision":"skip","idempotencyKey":"recovery-1a2b3c4d"}}
+{"jsonrpc":"2.0","id":"c:recovery-result-missing","result":{"accepted":true,"turnId":"turn_suspended","threadRevision":8,"decision":"skip"}}
+{"jsonrpc":"2.0","id":"c:recovery-result-invalid-decision","method":"turn/recovery/respond","params":{"turnId":"turn_suspended","callId":"call_write_config","expectedThreadRevision":7,"expectedRecoveryRevision":1,"decision":"retry","idempotencyKey":"recovery-5e6f7081"}}
+{"jsonrpc":"2.0","id":"c:recovery-result-invalid-decision","result":{"accepted":true,"turnId":"turn_suspended","threadRevision":8,"decision":"verified","resumed":false}}

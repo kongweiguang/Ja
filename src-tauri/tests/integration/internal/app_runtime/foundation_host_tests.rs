@@ -577,7 +577,7 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
                 "scope": "user",
                 "expectedVersion": user_version,
                 "document": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "config_revision": 1,
                     "default_access_mode": "full_access",
                     "default_provider_id": "provider_host",

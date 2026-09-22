@@ -29,6 +29,9 @@ public interface ConfigurationRuntimePort extends ConfigurationData {
     /** 原子重置指定配置层。 */
     MutationResult reset(ConfigurationScope scope, Path workspaceRoot, String expectedVersion);
 
+    /** 恢复用户层最近完整快照；适配器负责备份、CAS 和原子发布。 */
+    MutationResult restoreLastKnownGood(String expectedVersion);
+
     /** 写入 Secret 并只返回脱敏状态。 */
     CredentialResult setCredential(String credentialId, String secret, String expectedVersion);
 

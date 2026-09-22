@@ -7,12 +7,13 @@ use super::history_model::{
     AcceptedResult, HistoryMethod, PageInput, ThreadCompactInput, ThreadCompactResult,
     ThreadCreateInput, ThreadDiscoverInput, ThreadDiscoverResult, ThreadDto, ThreadListInput,
     ThreadListResult, ThreadMutationInput, ThreadPinInput, ThreadPreferencesUpdateInput,
-    ThreadReadInput, ThreadReadResult, ThreadRenameInput, ThreadSearchInput, WorkspaceListResult,
-    dispatch_compaction, dispatch_mutation, dispatch_pin, dispatch_thread_lifecycle, parse_thread,
-    parse_thread_discovery, parse_thread_page, parse_thread_read, parse_workspace_page,
-    request_history, request_thread_discover, validate_page, validate_thread_create,
-    validate_thread_discover, validate_thread_list, validate_thread_preferences_update,
-    validate_thread_read, validate_thread_rename, validate_thread_search,
+    ThreadReadInput, ThreadReadResult, ThreadRenameInput, ThreadSearchInput, ThreadUsageReadInput,
+    ThreadUsageSummary, WorkspaceListResult, dispatch_compaction, dispatch_mutation, dispatch_pin,
+    dispatch_thread_lifecycle, parse_thread, parse_thread_discovery, parse_thread_page,
+    parse_thread_read, parse_thread_usage_summary, parse_workspace_page, request_history,
+    request_thread_discover, validate_page, validate_thread_create, validate_thread_discover,
+    validate_thread_list, validate_thread_preferences_update, validate_thread_read,
+    validate_thread_rename, validate_thread_search, validate_thread_usage_read,
 };
 use crate::app_runtime::{RuntimeCommandError, RuntimeHost};
 
@@ -103,6 +104,21 @@ pub fn ja_thread_read(
         serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
     )?;
     parse_thread_read(result)
+}
+
+/// 读取只含覆盖范围和累计值的持久计量，不加载 Timeline 正文，也不参与用户界面渲染。
+#[tauri::command]
+pub fn ja_thread_usage_read(
+    input: ThreadUsageReadInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ThreadUsageSummary, RuntimeCommandError> {
+    validate_thread_usage_read(&input)?;
+    let result = request_history(
+        &state,
+        HistoryMethod::ThreadUsageRead,
+        serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
+    )?;
+    parse_thread_usage_summary(result)
 }
 
 /// 通过 revision CAS 设置人工标题；Java 同一事务内维护 titleSource，Rust 不推导竞争结果。

@@ -3,13 +3,20 @@
 
 package io.github.kongweiguang.ja.bootstrap;
 
+import io.github.kongweiguang.ja.configuration.adapter.out.ConfigurationRuntimeAdapter;
+import io.github.kongweiguang.ja.configuration.adapter.out.generation.ConfigurationRuntimeState;
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationUseCase;
+import io.github.kongweiguang.ja.configuration.port.out.ConfigurationRuntimePort;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
+import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import io.github.kongweiguang.ja.infrastructure.aot.AotSideEffectGuard;
 
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcServer;
+import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 import io.github.kongweiguang.ja.transport.rpc.RpcServicesFactory;
+import io.github.kongweiguang.ja.workspace.domain.Workspace;
+import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 import org.noear.solon.Solon;
 import org.noear.solon.SolonApp;
 import org.slf4j.Logger;
@@ -23,6 +30,9 @@ import java.util.concurrent.CompletableFuture;
  * 为传输层持有的原生 Kernel 组合提供 Solon 生命周期外壳，集中控制进程退出边界。
  */
 public final class StdioApplication {
+    private static final int WORKSPACE_LOOKUP_PAGE_SIZE = 128;
+    private static final int MAX_WORKSPACE_LOOKUP_PAGES = 8;
+
     /**
      * 以无 HTTP 模式启动 Solon，并让 Stdio 运行时持有阻塞式 sidecar 生命周期。
      * 只有在 Rust 持有的数据目录发布后才初始化日志，否则 Logback 会固化相对于安装目录
@@ -58,8 +68,16 @@ public final class StdioApplication {
                 if (configurationUseCase == null) {
                     throw new IllegalStateException("Ja configuration owner is unavailable");
                 }
+                ConfigurationRuntimePort configurationRuntime = Solon.context()
+                        .getBean(ConfigurationRuntimePort.class);
+                WorkspaceUseCase workspaces = Solon.context().getBean(WorkspaceUseCase.class);
+                if (!(configurationRuntime instanceof ConfigurationRuntimeAdapter) || workspaces == null) {
+                    throw new IllegalStateException("Ja configuration change bridge is unavailable");
+                }
                 runtime = new RpcServer(System.in, System.out, configuration,
-                        adaptRuntimeFactory(factory), configurationUseCase);
+                        adaptRuntimeFactory(factory), configurationUseCase,
+                        session -> bindConfigurationChangeNotifications(
+                                (ConfigurationRuntimeAdapter) configurationRuntime, workspaces, session));
                 exitCode = runtime.run();
             }
         } catch (RuntimeException failure) {
@@ -91,6 +109,51 @@ public final class StdioApplication {
     private static RpcServicesFactory adaptRuntimeFactory(RuntimeServicesFactory factory) {
         Objects.requireNonNull(factory, "factory");
         return factory::open;
+    }
+
+    /**
+     * 将配置适配器的内部文件事件投影为当前连接可见的脱敏协议事件。
+     *
+     * <p>只有用户和已登记项目配置属于 `configuration/changed`；Credential 与 trust 继续走各自
+     * 的权威读取语义，不能伪装为普通配置变更。项目事件在这里把进程内路径转换为 Workspace ID，
+     * 因而路径永远不会跨越 JA-RPC 边界。</p>
+     */
+    private static AutoCloseable bindConfigurationChangeNotifications(
+            ConfigurationRuntimeAdapter configurationRuntime, WorkspaceUseCase workspaces, RpcSession session) {
+        return configurationRuntime.addChangeListener(change -> {
+            if ("user".equals(change.scope())) {
+                session.publishObservedConfigurationChange("user", null, change.version());
+                return;
+            }
+            if (!"project".equals(change.scope())) return;
+            String workspaceId = workspaceIdForConfigurationChange(workspaces, change);
+            if (workspaceId != null) {
+                session.publishObservedConfigurationChange("project", workspaceId, change.version());
+            }
+        });
+    }
+
+    /**
+     * 以有限键集扫描将 Watcher 的私有规范路径映射为已登记工作区身份。
+     *
+     * <p>Watcher 仅监视已信任工作区，且 WorkspaceService 的生产上限为 128；仍保留固定页数
+     * 上限，以免损坏数据库游标或未来容量调整让后台 Watcher 无界占用数据库与 UI 通知线程。</p>
+     */
+    private static String workspaceIdForConfigurationChange(
+            WorkspaceUseCase workspaces, ConfigurationRuntimeState.ConfigChanged change) {
+        Path canonicalCwd = change.canonicalCwd();
+        if (canonicalCwd == null) return null;
+        Path expectedRoot = canonicalCwd.toAbsolutePath().normalize();
+        String cursor = null;
+        for (int pageIndex = 0; pageIndex < MAX_WORKSPACE_LOOKUP_PAGES; pageIndex++) {
+            CursorPage<Workspace> page = workspaces.listWorkspaces(cursor, WORKSPACE_LOOKUP_PAGE_SIZE);
+            for (Workspace workspace : page.items()) {
+                if (workspace.root().equals(expectedRoot)) return workspace.workspaceId();
+            }
+            cursor = page.nextCursor();
+            if (cursor == null) return null;
+        }
+        return null;
     }
 
     /**

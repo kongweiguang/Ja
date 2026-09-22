@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
+import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 import io.github.kongweiguang.ja.configuration.port.out.ConfigurationRuntimePort;
 
 import java.net.URI;
@@ -568,15 +569,12 @@ public final class ConfigGeneration implements AutoCloseable {
     /**
      * Skill 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。
      */
-    public record Skill(String skillId, String name, String scope, boolean enabled, String description) {
+    public record Skill(SkillReference reference) {
         /**
-         * 固定 Skill 标识和文本上限，使 catalog 投影始终是可安全共享的不变值。
+         * 只冻结来源限定授权，描述和正文保持发现时读取，避免代际保存会过期的元数据副本。
          */
         public Skill {
-            ConfigGenerationValueRules.requireIdentifier(skillId, "skill_");
-            name = ConfigGenerationValueRules.boundedText(name, "name", 512, false);
-            scope = ConfigGenerationValueRules.boundedText(scope, "scope", 64, false);
-            description = ConfigGenerationValueRules.boundedText(description, "description", 8_192, true);
+            java.util.Objects.requireNonNull(reference, "reference");
         }
     }
 
@@ -767,8 +765,8 @@ public final class ConfigGeneration implements AutoCloseable {
          */
         @Override
         public List<ConfigurationGenerationSnapshot.Skill> skillDefinitions() {
-            return source.skillDefinitions().stream().map(skill -> new ConfigurationGenerationSnapshot.Skill(
-                    skill.skillId(), skill.name(), skill.scope(), skill.enabled(), skill.description())).toList();
+            return source.skillDefinitions().stream()
+                    .map(skill -> new ConfigurationGenerationSnapshot.Skill(skill.reference())).toList();
         }
 
         /**

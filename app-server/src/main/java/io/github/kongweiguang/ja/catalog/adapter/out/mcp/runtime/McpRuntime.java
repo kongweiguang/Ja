@@ -191,13 +191,32 @@ public final class McpRuntime implements McpGateway {
                     tools.add(tool);
                 }
             } catch (RuntimeException isolatedFailure) {
-                // 单个远端目录失败不得关闭健康服务；失败服务保持 dirty，下一安全点可独立重试。
+                // 单个远端目录失败不得关闭健康服务；瞬态故障可在下一安全点独立重试。
                 holder.markDiscoveryFailed();
-                holder.markDirectoryDirty();
+                if (missingStdioExecutable(isolatedFailure)) {
+                    holder.publishUnavailableDirectory();
+                } else {
+                    holder.markDirectoryDirty();
+                }
                 tools.removeIf(tool -> tool.serverId().equals(definition.id()));
             }
         }
         return McpToolCatalog.snapshot(tools, definitionsById, objectMapper, Instant.now());
+    }
+
+    /**
+     * Windows 的进程边界将 ERROR_FILE_NOT_FOUND 规范为该稳定、无路径的 IOException；这是配置未
+     * 改变前不会自行恢复的本地事实。其余连接、协议和 Deadline 失败继续保持 dirty，以免把短暂
+     * 上游波动缓存成永久不可用。
+     */
+    private static boolean missingStdioExecutable(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof java.io.IOException
+                    && "windows_process_launch_failed_2".equals(current.getMessage())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

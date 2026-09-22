@@ -51,6 +51,41 @@ const draftItemByProjection = new WeakMap<
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
 /**
+ * 将暂态 Draft 插入同一 Turn 的已提交步骤之间。已提交列表的原始顺序仍是历史恢复的基线；只在双方都
+ * 有权威发生时间时调整 Draft，避免全量排序打乱缺失时间的旧记录，也避免每个流式片段重排整个 Timeline。
+ */
+function interleaveDraftsWithCommittedItems(
+  committed: readonly TimelineItemAdapter[],
+  drafts: readonly TimelineItemAdapter[],
+): TimelineItemAdapter[] {
+  const merged = [...committed];
+  for (const draft of drafts) {
+    const draftMillis = Date.parse(draft.createdAt ?? "");
+    if (!Number.isFinite(draftMillis)) {
+      merged.push(draft);
+      continue;
+    }
+    let insertionIndex = merged.length;
+    let lastSameTurnIndex = -1;
+    for (let index = 0; index < merged.length; index += 1) {
+      const candidate = merged[index];
+      if (candidate === undefined || candidate.turnId !== draft.turnId) continue;
+      lastSameTurnIndex = index;
+      const candidateMillis = Date.parse(candidate.createdAt ?? "");
+      if (Number.isFinite(candidateMillis) && candidateMillis > draftMillis) {
+        insertionIndex = index;
+        break;
+      }
+    }
+    if (insertionIndex === merged.length && lastSameTurnIndex >= 0) {
+      insertionIndex = lastSameTurnIndex + 1;
+    }
+    merged.splice(insertionIndex, 0, draft);
+  }
+  return merged;
+}
+
+/**
  * 把同一份 Draft Segment 映射为稳定的 Item 引用；assistant Draft 与 Reasoning 都保留过程语义，
  * Renderer 在 terminal 前将它们固定投影到 WorkProcess。WeakMap 让重复 Selector 保持引用稳定，
  * 并在模型步骤提交或完整历史快照接管后自动释放缓存。
@@ -262,6 +297,10 @@ export const selectCommittedItemsForThread = (threadId: string) => (state: Timel
  * 按 Thread 组装持久 Item，并把尚未结算的公开回复/Reasoning segments 附在对应 Turn；Tool 模型步
  * 将正文结算到工作过程，terminal 以 finalMessage 校准回复并保留取消前正文，整个过程不反写 Java。
  */
+/**
+ * 按同一 Turn 的权威发生时间交错暂态正文与持久步骤。不能简单把 Draft 追加到所有 Tool 后面，
+ * 否则自动上下文压缩等中途步骤会越过此前正文；无时间的恢复记录继续保留原有稳定顺序。
+ */
 export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {
   const committed = selectCommittedItemsForThread(threadId)(state);
   const drafts = Object.values(state.turns).flatMap((turn) => {
@@ -271,7 +310,7 @@ export const selectItemsForThread = (threadId: string) => (state: TimelineStore)
       .filter((draft) => draft.text.trim() !== "")
       .map((draft) => draftItemForTurn(threadId, turn.turnId, draft));
   });
-  return [...committed, ...drafts];
+  return interleaveDraftsWithCommittedItems(committed, drafts);
 };
 
 /** 主 Timeline 只读取当前 root 的持久活动切片；稳定空数组避免隐藏视图产生无效重渲染。 */

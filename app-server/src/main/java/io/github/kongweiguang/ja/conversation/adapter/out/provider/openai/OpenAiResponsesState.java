@@ -326,7 +326,12 @@ final class OpenAiResponsesState {
             long expectedTotal = Math.addExact(input, output);
             long total = requiredLong(value, "total_tokens");
             if (total != expectedTotal) throw new IllegalArgumentException("invalid usage");
-            return new ModelUsage(input, output, total);
+            JsonNode details = value.get("input_tokens_details");
+            Long cacheRead = details == null || details.isNull() ? null : optionalLong(details, "cached_tokens");
+            /* Responses 的 input_tokens 包含缓存读取；缺少细节时不虚构新输入计量。 */
+            return cacheRead == null ? new ModelUsage(input, output, total)
+                    : new ModelUsage(input, output, total, cacheRead, null,
+                            ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE);
         } catch (ArithmeticException | IllegalArgumentException failure) {
             throw new ProviderProtocolException("USAGE", "OpenAI usage is invalid", false);
         }
@@ -947,6 +952,17 @@ final class OpenAiResponsesState {
         if (value == null || !value.isIntegralNumber() || !value.canConvertToLong()
             || value.longValue() < 0) {
             throw new IllegalArgumentException("invalid usage");
+        }
+        return value.longValue();
+    }
+
+    /** 缓存明细是可选字段，但一旦出现必须保持与主 usage 相同的整型边界。 */
+    private static Long optionalLong(JsonNode root, String field) {
+        if (root == null || !root.isObject()) throw new IllegalArgumentException("invalid usage details");
+        JsonNode value = root.get(field);
+        if (value == null || value.isNull()) return null;
+        if (!value.isIntegralNumber() || !value.canConvertToLong() || value.longValue() < 0) {
+            throw new IllegalArgumentException("invalid usage detail");
         }
         return value.longValue();
     }

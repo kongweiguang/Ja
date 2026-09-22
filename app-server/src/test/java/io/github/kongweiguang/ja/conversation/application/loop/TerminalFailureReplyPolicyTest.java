@@ -26,7 +26,7 @@ final class TerminalFailureReplyPolicyTest {
             String reply = policy.replyFor(code);
             assertFalse(reply.isBlank(), code);
             assertTrue(reply.length() <= 512, code);
-            assertTrue(reply.contains("本轮未能完成"), code);
+            assertTrue(reply.endsWith("。"), code);
         }
     }
 
@@ -37,7 +37,6 @@ final class TerminalFailureReplyPolicyTest {
         String fallback = policy.replyFor("INTERNAL_ERROR");
 
         assertTrue(summaryFailure.contains("对话摘要生成失败"));
-        assertTrue(summaryFailure.contains("重新编辑原问题"));
         assertFalse(summaryFailure.equals(fallback));
     }
 

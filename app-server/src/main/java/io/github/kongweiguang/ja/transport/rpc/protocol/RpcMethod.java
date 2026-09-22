@@ -63,6 +63,8 @@ public enum RpcMethod {
      * 读取对话线程快照。
      */
     THREAD_READ("thread/read"),
+    /** 读取一个 Thread 的累计 Token 计量，不物化历史页。 */
+    THREAD_USAGE_READ("thread/usage/read"),
     /** 通过 CAS 设置人工标题。 */
     THREAD_RENAME("thread/rename"),
     /** 通过 revision CAS 更新 Thread 的置顶事实。 */
@@ -196,6 +198,10 @@ public enum RpcMethod {
      */
     TURN_RESUME("turn/resume"),
     /**
+     * 仅提交当前未知 Tool 的显式重试或跳过裁决；最后一项的自动续跑仍复用 turn/resume。
+     */
+    TURN_RECOVERY_RESPOND("turn/recovery/respond"),
+    /**
      * 取消一次 Turn。
      */
     TURN_CANCEL("turn/cancel"),
@@ -227,6 +233,10 @@ public enum RpcMethod {
      * 重置配置层。
      */
     CONFIGURATION_RESET("configuration/reset"),
+    /**
+     * 从最近完整用户快照恢复配置，并保留当前原始文件备份。
+     */
+    CONFIGURATION_RESTORE("configuration/restore"),
     /**
      * 设置一个凭据。
      */

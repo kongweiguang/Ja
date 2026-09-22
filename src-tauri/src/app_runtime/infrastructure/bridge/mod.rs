@@ -9,22 +9,23 @@
 use crate::app_runtime::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
     ConfigurationPatchResult, ConfigurationReadResult, ConfigurationReplaceResult,
-    ConfigurationRequest, ConfigurationResetResult, ConfigurationResponse, CredentialDeleteResult,
-    CredentialRevealProviderResult, CredentialSetResult, EventSink, GoalMethod, GoalPayload,
-    GoalRequest, GoalResponse, HistoryRequest, HistoryResponse, InputQueue, LaunchConfig,
-    McpListResultData, McpTestResultData, McpToolsReadResultData, ModelDiscoverResultData,
-    ModelTestResultData, QueuedInput, QueuedInputIssue, RuntimeBridgePort, RuntimeCommandError,
-    RuntimeStatus, RuntimeStatusKind, SettingsRequest, SettingsResponse, SkillListResultData,
-    TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextSeed, TaskCreateInput,
-    TaskCreateResult, TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult,
-    TaskMailboxMessage, TaskMessageInput, TaskMessageResult, TaskMutationInput, TaskObserveInput,
-    TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
-    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ThreadArchiveResultData,
-    ThreadCompactResultData, ThreadCreateResultData, ThreadDeleteResultData,
-    ThreadDiscoverResultData, ThreadListResultData, ThreadPinResultData,
-    ThreadPreferencesUpdateResultData, ThreadReadResultData, ThreadRenameResultData,
-    ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData, ToolArtifactReadInput,
-    ToolArtifactReadResult, TurnAccepted, TurnCancelInput, TurnCancelResult,
+    ConfigurationRequest, ConfigurationResetResult, ConfigurationResponse,
+    ConfigurationRestoreResult, CredentialDeleteResult, CredentialRevealProviderResult,
+    CredentialSetResult, EventSink, GoalMethod, GoalPayload, GoalRequest, GoalResponse,
+    HistoryRequest, HistoryResponse, InputQueue, LaunchConfig, McpListResultData,
+    McpTestResultData, McpToolsReadResultData, ModelDiscoverResultData, ModelTestResultData,
+    QueuedInput, QueuedInputIssue, RuntimeBridgePort, RuntimeCommandError, RuntimeStatus,
+    RuntimeStatusKind, SettingsRequest, SettingsResponse, SkillListResultData, TaskActivity,
+    TaskCloseInput, TaskCloseResult, TaskContextSeed, TaskCreateInput, TaskCreateResult,
+    TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMailboxMessage,
+    TaskMessageInput, TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult,
+    TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput,
+    TaskTreeDeleteResult, TaskUnobserveInput, ThreadArchiveResultData, ThreadCompactResultData,
+    ThreadCreateResultData, ThreadDeleteResultData, ThreadDiscoverResultData, ThreadListResultData,
+    ThreadPinResultData, ThreadPreferencesUpdateResultData, ThreadReadResultData,
+    ThreadRenameResultData, ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData,
+    ThreadUsageReadResultData, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
+    ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
     TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
     TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
     WorkspaceDto, WorkspaceListResultData, WorkspacePathSearchInput, WorkspacePathSearchItem,
@@ -70,6 +71,7 @@ pub(crate) enum HistoryMethod {
     ThreadList,
     ThreadSearch,
     ThreadRead,
+    ThreadUsageRead,
     ThreadRename,
     ThreadPin,
     ThreadSeen,
@@ -90,6 +92,7 @@ impl HistoryMethod {
             Self::ThreadList => "thread/list",
             Self::ThreadSearch => "thread/search",
             Self::ThreadRead => "thread/read",
+            Self::ThreadUsageRead => "thread/usage/read",
             Self::ThreadRename => "thread/rename",
             Self::ThreadPin => "thread/pin",
             Self::ThreadSeen => "thread/seen",
@@ -136,6 +139,7 @@ pub(crate) fn is_configuration_request_method(method: &str) -> bool {
             | "configuration/patch"
             | "configuration/replace"
             | "configuration/reset"
+            | "configuration/restore"
             | "credential/set"
             | "credential/delete"
             | "credential/reveal-provider"
@@ -454,6 +458,15 @@ impl RuntimeBridge {
     pub fn turn_resume(&self, input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {
         let params = turn_resume_params(&input)?;
         self.call(|reply| BridgeCommand::TurnResume { params, reply })
+    }
+
+    /// 原 Tool 详情裁决固定进入 actor，Rust 不读取文件、重新绑定工具或创建第二个 Resume 路径。
+    pub fn turn_recovery_respond(
+        &self,
+        input: ToolRecoveryResponseInput,
+    ) -> Result<ToolRecoveryResponse, RuntimeCommandError> {
+        let params = turn_recovery_respond_params(&input)?;
+        self.call(|reply| BridgeCommand::TurnRecoveryRespond { params, reply })
     }
 
     /// 默认入队普通 follow-up；renderer 不能通过输入字段指定 steering 或排序值。
@@ -785,6 +798,12 @@ impl RuntimeBridgePort for RuntimeBridge {
                     decode_params(params.into_bytes())?,
                 )?)?)?,
             )),
+            ConfigurationRequest::Restore(params) => Ok(ConfigurationResponse::Restore(
+                ConfigurationRestoreResult::try_new(encode_result(self.config_request(
+                    "configuration/restore",
+                    decode_params(params.into_bytes())?,
+                )?)?)?,
+            )),
             ConfigurationRequest::CredentialSet(params) => Ok(
                 ConfigurationResponse::CredentialSet(CredentialSetResult::try_new(encode_result(
                     self.config_request("credential/set", decode_params(params.into_bytes())?)?,
@@ -850,6 +869,14 @@ impl RuntimeBridgePort for RuntimeBridge {
     /// Resume 使用专用强类型方法，同时复用生产 actor 的 instance/generation fence。
     fn turn_resume(&self, input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {
         RuntimeBridge::turn_resume(self, input)
+    }
+
+    /// 恢复裁决走同一生产 actor 与 instance/generation fence，不建立 native side state。
+    fn turn_recovery_respond(
+        &self,
+        input: ToolRecoveryResponseInput,
+    ) -> Result<ToolRecoveryResponse, RuntimeCommandError> {
+        RuntimeBridge::turn_recovery_respond(self, input)
     }
 
     /// Enqueue 通过固定方法实现，调用方不能传 JA-RPC method 或初始 kind。
@@ -1071,6 +1098,12 @@ impl RuntimeBridgePort for RuntimeBridge {
                 HistoryResponse::ThreadRead,
                 ThreadReadResultData
             ),
+            HistoryRequest::ThreadUsageRead(params) => dispatch_history!(
+                params,
+                HistoryMethod::ThreadUsageRead,
+                HistoryResponse::ThreadUsageRead,
+                ThreadUsageReadResultData
+            ),
             HistoryRequest::ThreadRename(params) => dispatch_history!(
                 params,
                 HistoryMethod::ThreadRename,
@@ -1279,6 +1312,23 @@ fn turn_resume_params(input: &TurnResumeInput) -> Result<Value, RuntimeCommandEr
     Ok(json!({
         "turnId": input.turn_id,
         "expectedThreadRevision": input.expected_thread_revision,
+    }))
+}
+
+/// 构造唯一恢复裁决 envelope；选择是闭集，校验后没有路径、摘要或 Tool 参数离开 Java owner。
+fn turn_recovery_respond_params(
+    input: &ToolRecoveryResponseInput,
+) -> Result<Value, RuntimeCommandError> {
+    input
+        .validate()
+        .map_err(|_| RuntimeCommandError::invalid_params())?;
+    Ok(json!({
+        "turnId": input.turn_id,
+        "callId": input.call_id,
+        "expectedThreadRevision": input.expected_thread_revision,
+        "expectedRecoveryRevision": input.expected_recovery_revision,
+        "decision": input.decision,
+        "idempotencyKey": input.idempotency_key,
     }))
 }
 

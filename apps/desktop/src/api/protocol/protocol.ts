@@ -8,7 +8,7 @@ import {
   forEachReadyTokenCandidate,
   READY_TOKEN_PATTERN,
 } from "./readyToken";
-import { ConfigDocumentSchema } from "./configDocument";
+import { ConfigDocumentSchema, ConfigProjectSkillDocumentSchema } from "./configDocument";
 import {
   CollaborationModeSchema,
   GoalIdSchema,
@@ -85,7 +85,11 @@ export const ReasoningLevelSchema = z.enum([
 ]);
 export const AccessModeSchema = z.enum(["approval_required", "full_access"]);
 const McpIdSchema = prefixedId("mcp_", 100);
-const SkillIdSchema = prefixedId("skill_", 101);
+/** Skill 身份同时包含发现来源，避免高优先级同名项目包继承低优先级授权。 */
+const SkillIdSchema = z
+  .string()
+  .regex(/^(?:user|ja|project):[^:\u0000-\u001F]{1,512}$/)
+  .max(520);
 const EventIdSchema = prefixedId("evt_", 100);
 const CompactionIdSchema = prefixedId("cmp_", 100);
 const CheckpointIdSchema = prefixedId("checkpoint_", 107);
@@ -158,6 +162,7 @@ export const ClientMethodSchema = z.enum([
   "thread/list",
   "thread/search",
   "thread/read",
+  "thread/usage/read",
   "thread/rename",
   "thread/pin",
   "thread/seen",
@@ -217,6 +222,7 @@ export const ClientMethodSchema = z.enum([
   "attachment/preview/close",
   "turn/start",
   "turn/resume",
+  "turn/recovery/respond",
   "turn/cancel",
   "turn/input/enqueue",
   "turn/input/prioritize",
@@ -227,6 +233,7 @@ export const ClientMethodSchema = z.enum([
   "configuration/patch",
   "configuration/replace",
   "configuration/reset",
+  "configuration/restore",
   "credential/set",
   "credential/delete",
   "credential/reveal-provider",
@@ -494,6 +501,11 @@ const ToolInteractionAnswerSchema = z
   });
 
 /** Java 已完成脱敏的唯一 Tool 展示合同；WebView 不接收 raw arguments 或 raw result。 */
+const ToolRecoverySchema = z
+  .object({ revision: z.number().int().min(1).max(MAX_SAFE_INTEGER) })
+  .strict();
+
+/** Java 已完成脱敏的唯一 Tool 展示合同；WebView 不接收 raw arguments 或 raw result。 */
 const ToolPresentationSchema = z
   .object({
     kind: z.enum(["read", "edit", "write", "shell", "mcp"]),
@@ -512,6 +524,7 @@ const ToolPresentationSchema = z
     durationMs: z.number().int().min(0).max(MAX_SAFE_INTEGER).optional(),
     truncated: z.boolean(),
     artifactId: ArtifactIdSchema.optional(),
+    recovery: ToolRecoverySchema.optional(),
   })
   .strict();
 
@@ -902,6 +915,20 @@ const CredentialProjectionSchema = z.record(
     })
     .strict(),
 );
+/** 配置问题仅描述已脱敏的处理事实，不能成为配置原文或凭据进入 WebView 的旁路。 */
+const ConfigIssueSchema = z
+  .object({
+    id: z.string().regex(/^cfg_[A-Za-z0-9_-]{1,64}$/),
+    scope: z.enum(["user", "project", "credential"]),
+    field: z.string().min(1).max(128).nullable(),
+    entityId: z.string().min(1).max(128).nullable(),
+    line: z.number().int().min(1).nullable(),
+    column: z.number().int().min(1).nullable(),
+    reason: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/),
+    impact: z.string().regex(/^[a-z_]{1,64}$/),
+    actions: z.array(z.enum(["edit", "retry", "restore"])).max(3),
+  })
+  .strict();
 const ConfigReadResultSchema = z
   .object({
     workspaceId: WorkspaceIdSchema.nullable(),
@@ -912,6 +939,7 @@ const ConfigReadResultSchema = z
     credentials: CredentialProjectionSchema,
     cas: ConfigCasSchema,
     diagnostics: z.array(z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/)).max(32),
+    issues: z.array(ConfigIssueSchema).max(64),
   })
   .strict();
 const ConfigWriteResultSchema = z
@@ -988,6 +1016,8 @@ const ThreadSearchParamsSchema = z
   .object({ workspaceId: WorkspaceIdSchema, query: z.string().max(256), ...pageParams })
   .strict();
 const ThreadReadParamsSchema = z.object({ threadId: ThreadIdSchema, ...pageParams }).strict();
+/** 用量汇总只读当前 Thread，不接受分页、时间范围或客户端聚合参数。 */
+const ThreadUsageReadParamsSchema = z.object({ threadId: ThreadIdSchema }).strict();
 const ThreadRenameParamsSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -1048,6 +1078,21 @@ const TurnCancelParamsSchema = z.object({ turnId: TurnIdSchema }).strict();
 /** Resume 保留 Thread revision CAS；Cancel 只按 Turn identity 幂等收敛自然终态竞态。 */
 const TurnResumeParamsSchema = z
   .object({ turnId: TurnIdSchema, expectedThreadRevision: RevisionSchema })
+  .strict();
+/** 恢复裁决只能指向当前未知 Tool，并以两层 revision 和幂等键拒绝迟到/重复点击。 */
+const TurnRecoveryRespondParamsSchema = z
+  .object({
+    turnId: TurnIdSchema,
+    callId: CallIdSchema,
+    expectedThreadRevision: RevisionSchema,
+    expectedRecoveryRevision: z.number().int().min(1).max(MAX_SAFE_INTEGER),
+    decision: z.enum(["retry", "skip"]),
+    idempotencyKey: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+  })
   .strict();
 const TurnInputEnqueueParamsSchema = z
   .object({ turnId: TurnIdSchema, content: TurnContentSchema })
@@ -1183,16 +1228,20 @@ const ConfigurationPatchParamsSchema = z.discriminatedUnion("scope", [
   z.object({ ...userConfigurationTarget, patch: ConfigProjectionSchema }).strict(),
   z.object({ ...projectConfigurationTarget, patch: ConfigProjectionSchema }).strict(),
 ]);
-/** replace 只接受完整严格文档，不复用 patch 的部分文档语义。 */
+/** replace 按作用域接收完整严格文档，项目层不得借用户文档扩大 Provider 或 MCP 权限。 */
 const ConfigurationReplaceParamsSchema = z.discriminatedUnion("scope", [
   z.object({ ...userConfigurationTarget, document: ConfigDocumentSchema }).strict(),
-  z.object({ ...projectConfigurationTarget, document: ConfigDocumentSchema }).strict(),
+  z.object({ ...projectConfigurationTarget, document: ConfigProjectSkillDocumentSchema }).strict(),
 ]);
 /** reset 是独立命令，因此不存在旧 mode/document 组合分支。 */
 const ConfigurationResetParamsSchema = z.discriminatedUnion("scope", [
   z.object(userConfigurationTarget).strict(),
   z.object(projectConfigurationTarget).strict(),
 ]);
+/** 最近有效快照只恢复用户层，工作区隔离与当前信任状态仍由服务端重新判定。 */
+const ConfigurationRestoreParamsSchema = z
+  .object({ expectedVersion: ConfigVersionSchema })
+  .strict();
 const CredentialSetParamsSchema = z
   .object({
     credentialId: CredentialRefSchema,
@@ -1220,6 +1269,7 @@ export const ParamsSchemaByMethod = {
   "thread/list": ThreadListParamsSchema,
   "thread/search": ThreadSearchParamsSchema,
   "thread/read": ThreadReadParamsSchema,
+  "thread/usage/read": ThreadUsageReadParamsSchema,
   "thread/rename": ThreadRenameParamsSchema,
   "thread/pin": ThreadPinParamsSchema,
   "thread/seen": threadMutationParams,
@@ -1248,6 +1298,7 @@ export const ParamsSchemaByMethod = {
   "attachment/preview/close": AttachmentPreviewCloseParamsSchema,
   "turn/start": TurnStartParamsSchema,
   "turn/resume": TurnResumeParamsSchema,
+  "turn/recovery/respond": TurnRecoveryRespondParamsSchema,
   "turn/cancel": TurnCancelParamsSchema,
   "turn/input/enqueue": TurnInputEnqueueParamsSchema,
   "turn/input/prioritize": TurnInputMutationParamsSchema,
@@ -1258,6 +1309,7 @@ export const ParamsSchemaByMethod = {
   "configuration/patch": ConfigurationPatchParamsSchema,
   "configuration/replace": ConfigurationReplaceParamsSchema,
   "configuration/reset": ConfigurationResetParamsSchema,
+  "configuration/restore": ConfigurationRestoreParamsSchema,
   "credential/set": CredentialSetParamsSchema,
   "credential/delete": CredentialDeleteParamsSchema,
   "credential/reveal-provider": CredentialRevealProviderParamsSchema,
@@ -1429,6 +1481,16 @@ const turnResumeResultSchema = z
     threadRevision: RevisionSchema,
   })
   .strict();
+/** 裁决 ACK 仅确认持久结果及是否已自动续跑，Tool/Turn 最终状态仍由既有事件投影。 */
+const turnRecoveryRespondResultSchema = z
+  .object({
+    accepted: z.literal(true),
+    turnId: TurnIdSchema,
+    threadRevision: RevisionSchema,
+    decision: z.enum(["retry", "skip"]),
+    resumed: z.boolean(),
+  })
+  .strict();
 const turnCancelResultSchema = z
   .object({
     accepted: z.literal(true),
@@ -1457,7 +1519,7 @@ const skillProjectionSchema = z
   .object({
     skillId: SkillIdSchema,
     name: SafeNameSchema,
-    scope: z.enum(["builtin", "user", "ja", "project"]),
+    scope: z.enum(["user", "ja", "project"]),
     enabled: z.boolean(),
     status: z.enum(["healthy", "invalid", "unavailable"]),
     description: BoundedTextSchema,
@@ -1992,6 +2054,59 @@ export const ThreadReadResultSchema = z
     }
   });
 
+/**
+ * Thread 账本的每一项都附带覆盖请求数，使界面不能把 Provider 未报告的数据渲染为零。
+ * 累计值保持在 JSON 安全整数范围内，超过边界的原生响应在进入 React 前失败关闭。
+ */
+export const ThreadUsageSummarySchema = z
+  .object({
+    threadId: ThreadIdSchema,
+    snapshotRevision: RevisionSchema,
+    requestCount: RevisionSchema,
+    measuredRequestCount: RevisionSchema,
+    newInputRequestCount: RevisionSchema,
+    newInputTokens: RevisionSchema,
+    outputRequestCount: RevisionSchema,
+    outputTokens: RevisionSchema,
+    totalRequestCount: RevisionSchema,
+    totalTokens: RevisionSchema,
+    cacheReadRequestCount: RevisionSchema,
+    cacheReadTokens: RevisionSchema,
+    cacheWriteRequestCount: RevisionSchema,
+    cacheWriteTokens: RevisionSchema,
+    cacheCompleteRequestCount: RevisionSchema,
+    cacheCompleteInputTokens: RevisionSchema,
+    cacheCompleteReadTokens: RevisionSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const coverage = [
+      "newInputRequestCount",
+      "outputRequestCount",
+      "totalRequestCount",
+      "cacheReadRequestCount",
+      "cacheWriteRequestCount",
+      "cacheCompleteRequestCount",
+    ] as const;
+    for (const field of coverage) {
+      if (value[field] > value.measuredRequestCount)
+        context.addIssue({
+          code: "custom",
+          path: [field],
+          message: "usage coverage exceeds samples",
+        });
+    }
+    if (
+      value.measuredRequestCount > value.requestCount ||
+      value.cacheCompleteReadTokens > value.cacheCompleteInputTokens
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["requestCount"],
+        message: "usage summary is inconsistent",
+      });
+  });
+
 export const ResultSchemaByMethod = {
   "runtime/initialize": initializeResultSchema,
   "runtime/health": healthResultSchema,
@@ -2006,6 +2121,7 @@ export const ResultSchemaByMethod = {
   "thread/list": threadListResultSchema,
   "thread/search": threadPageResultSchema,
   "thread/read": ThreadReadResultSchema,
+  "thread/usage/read": ThreadUsageSummarySchema,
   "thread/rename": threadResultSchema,
   "thread/pin": threadResultSchema,
   "thread/seen": threadResultSchema,
@@ -2034,6 +2150,7 @@ export const ResultSchemaByMethod = {
   "attachment/preview/close": AttachmentPreviewCloseResultSchema,
   "turn/start": turnAcceptedResultSchema,
   "turn/resume": turnResumeResultSchema,
+  "turn/recovery/respond": turnRecoveryRespondResultSchema,
   "turn/cancel": turnCancelResultSchema,
   "turn/input/enqueue": InputQueueMutationResultSchema,
   "turn/input/prioritize": InputQueueMutationResultSchema,
@@ -2044,6 +2161,7 @@ export const ResultSchemaByMethod = {
   "configuration/patch": ConfigWriteResultSchema,
   "configuration/replace": ConfigWriteResultSchema,
   "configuration/reset": ConfigWriteResultSchema,
+  "configuration/restore": ConfigWriteResultSchema,
   "credential/set": CredentialSetResultSchema,
   "credential/delete": CredentialDeleteResultSchema,
   "credential/reveal-provider": CredentialRevealProviderResultSchema,
@@ -2663,6 +2781,7 @@ export type QueuedInput = z.infer<typeof QueuedInputSchema>;
 export type InputQueue = z.infer<typeof InputQueueSchema>;
 export type InputQueueMutationResult = z.infer<typeof InputQueueMutationResultSchema>;
 export type ThreadReadResult = z.infer<typeof ThreadReadResultSchema>;
+export type ThreadUsageSummary = z.infer<typeof ThreadUsageSummarySchema>;
 export type TaskSummary = z.infer<typeof TaskSummarySchema>;
 export type TaskActivity = z.infer<typeof TaskActivitySchema>;
 export type TaskMailboxMessage = z.infer<typeof TaskMailboxMessageSchema>;

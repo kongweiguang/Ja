@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -54,7 +55,7 @@ final class ConfigurationRuntimeAdapterTest {
     @TempDir
     Path temporaryRoot;
 
-    /** missingConfigurationIsDegradedButServiceReady 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。 */
+    /** 缺失配置只影响模型选择，运行时本身仍必须启动并让历史、项目与设置入口可用。 */
     @Test
     void missingConfigurationIsDegradedButServiceReady() {
         try (ConfigurationRuntimeAdapter service = service()) {
@@ -64,28 +65,27 @@ final class ConfigurationRuntimeAdapterTest {
             assertTrue(node(read.effective()).path("subagents").path("enabled").asBoolean());
             assertTrue(node(read.effective()).path("subagents").path("provider_id").isNull());
             ConfigGeneration generation = service.resolveGeneration(null);
-            assertFalse(generation.ready());
+            assertTrue(generation.ready());
             assertTrue(generation.diagnostics().stream()
                     .anyMatch(diagnostic -> "MISSING_PROVIDER".equals(diagnostic.code())));
         }
     }
 
-    /** 缺失必填 nullable 字段的 v1 文档必须失败关闭，读取层不得替旧形状补字段。 */
+    /** 缺失普通字段和旧 schema 只回退受影响字段，保留可调用的 Provider/Model 目录。 */
     @Test
-    void rejectsV1DocumentWithMissingNullableFields() throws Exception {
+    void missingFieldsAndLegacySchemaKeepUsableProviderProjection() throws Exception {
         String omittedNulls = profileConfig("nullable-model")
+                .replace("schema_version = 2", "schema_version = 1")
                 .replace("default_reasoning_level = \"medium\"\n", "")
                 .replace("reasoning_level_map = { medium = \"medium\" }", "reasoning_level_map = {}");
         Files.writeString(homeDirectory().resolve("config.toml"), omittedNulls);
 
         try (ConfigurationRuntimeAdapter service = service()) {
             ConfigurationUseCase.ReadResult read = service.read(null);
-            ObjectNode effective = node(read.effective());
-
-            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, read.user().status());
-            assertNull(read.user().document());
-            assertTrue(effective.get("default_reasoning_level").isNull());
-            assertTrue(effective.withArray("providers").isEmpty());
+            assertEquals(ConfigurationUseCase.LayerStatus.VALID, read.user().status());
+            assertEquals(1, node(read.effective()).withArray("providers").size());
+            assertEquals(1, node(read.effective()).withArray("providers").get(0).withArray("models").size());
+            assertEquals(omittedNulls, Files.readString(homeDirectory().resolve("config.toml")));
         }
     }
 
@@ -96,7 +96,7 @@ final class ConfigurationRuntimeAdapterTest {
     @Test
     void fullReplaceRepairsCorruptUserConfigurationWithOriginalCas() throws Exception {
         Path config = homeDirectory().resolve("config.toml");
-        Files.writeString(config, "schema_version = 1\nproviders = [\n");
+        Files.writeString(config, "schema_version = 2\nproviders = [\n");
 
         try (ConfigurationRuntimeAdapter service = service()) {
             ConfigurationUseCase.ReadResult corrupt = service.read(null);
@@ -308,9 +308,9 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** v1 只接受 Provider/Model 能力与自动压缩开关，并拒绝闭集外压缩阈值字段。 */
+    /** v2 只接受 Provider/Model 能力与自动压缩开关，并拒绝闭集外压缩阈值字段。 */
     @Test
-    void mergePatchAcceptsV1CapabilitiesAndRejectsUnknownContextFields() {
+    void mergePatchAcceptsV2CapabilitiesAndRejectsUnknownContextFields() {
         ObjectNode patch = userDocument("provider_budget", "model_budget", "budget-model");
         ObjectNode invalidDocument = patch.deepCopy();
         ((ObjectNode) invalidDocument.withArray("providers").get(0)
@@ -336,15 +336,15 @@ final class ConfigurationRuntimeAdapterTest {
     void projectConfigurationRequiresJavaTrust() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         Path workspace = Files.createDirectory(temporaryRoot.resolve("workspace"));
-        Files.writeString(homeDirectory().resolve("config.toml"), profileConfig("user-model"));
+        Files.writeString(homeDirectory().resolve("config.toml"), profileConfig("user-model")
+                .replace("skills = []", "skills = [\"user:global-fixture\"]"));
         Path projectJa = Files.createDirectories(workspace.resolve(".ja"));
-        Files.writeString(projectJa.resolve("config.toml"), projectOverlayConfig(4_096));
+        Files.writeString(projectJa.resolve("config.toml"), projectSkillConfig());
 
         try (ConfigurationRuntimeAdapter service = service()) {
             ConfigurationUseCase.ReadResult untrusted = service.read(workspace);
             assertEquals(ConfigurationUseCase.LayerStatus.UNTRUSTED, untrusted.project().status());
-            assertEquals(8_192, selectedModel(node(untrusted.effective()))
-                    .path("capabilities").path("max_output_tokens").intValue());
+            assertEquals("user:global-fixture", node(untrusted.effective()).withArray("skills").get(0).textValue());
             try (ConfigGeneration.Lease lease = service.acquire(workspace)) {
                 assertFalse(lease.snapshot().trusted());
             }
@@ -352,8 +352,10 @@ final class ConfigurationRuntimeAdapterTest {
             assertTrue(service.synchronizeWorkspaceTrust(workspace, true));
             ConfigurationUseCase.ReadResult trusted = service.read(workspace);
             assertEquals(ConfigurationUseCase.LayerStatus.VALID, trusted.project().status());
-            assertEquals(4_096, selectedModel(node(trusted.effective()))
-                    .path("capabilities").path("max_output_tokens").intValue());
+            assertEquals("project:workspace-fixture", node(trusted.project().document())
+                    .withArray("skills").get(0).textValue());
+            assertEquals("user:global-fixture", node(trusted.project().document())
+                    .withArray("disabled_skills").get(0).textValue());
             try (ConfigGeneration.Lease lease = service.acquire(workspace)) {
                 assertTrue(lease.snapshot().trusted());
             }
@@ -361,8 +363,8 @@ final class ConfigurationRuntimeAdapterTest {
             assertTrue(service.synchronizeWorkspaceTrust(workspace, false));
             assertEquals(ConfigurationUseCase.LayerStatus.UNTRUSTED,
                     service.read(workspace).project().status());
-            assertEquals(8_192, selectedModel(node(service.read(workspace).effective()))
-                    .path("capabilities").path("max_output_tokens").intValue());
+            assertEquals("user:global-fixture", node(service.read(workspace).effective())
+                    .withArray("skills").get(0).textValue());
         }
     }
 
@@ -554,9 +556,9 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** generationCatalogIsFrozenAndMissingReferencesBlockAdmission 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。 */
+    /** 有效配置代际冻结 MCP/Skill；外部文件失效后仅复用已严格校验的最近快照，并保留恢复诊断。 */
     @Test
-    void generationCatalogIsFrozenAndMissingEnabledStateBlocksAdmission() throws Exception {
+    void generationCatalogIsFrozenAndInvalidConfigurationUsesLastKnownGood() throws Exception {
         Files.writeString(homeDirectory().resolve("config.toml"), catalogConfig("http://127.0.0.1:1"));
         try (ConfigurationRuntimeAdapter service = service()) {
             service.setCredential("cred_model", "catalog-secret", "cfg_missing");
@@ -573,9 +575,10 @@ final class ConfigurationRuntimeAdapterTest {
             }
             Files.writeString(homeDirectory().resolve("config.toml"), catalogConfigWithMissingMcpEnabled());
             ConfigGeneration missing = service.resolveGeneration(null);
-            assertFalse(missing.ready());
+            assertTrue(missing.ready());
+            assertTrue(missing.mcpServers().isEmpty());
             assertTrue(missing.diagnostics().stream()
-                    .anyMatch(diagnostic -> "CORRUPT_CONFIG".equals(diagnostic.code())));
+                    .noneMatch(diagnostic -> "CORRUPT_CONFIG".equals(diagnostic.code())));
         }
     }
 
@@ -595,20 +598,171 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** 读取边界只接受当前 v1；其它版本不转换，也不改写调用方的原始字节。 */
+    /** 非当前 schema 使用当前读取规则和字段默认值，原文保持不变且不影响正常模型目录。 */
     @Test
-    void unsupportedConfigurationSchemaIsRejectedWithoutMigration() throws Exception {
+    void unsupportedConfigurationSchemaUsesCurrentReadDefaultsWithoutMigration() throws Exception {
         Path config = homeDirectory().resolve("config.toml");
         String unsupportedSchema = profileConfig("unsupported-schema-model")
-                .replace("schema_version = 1", "schema_version = 2");
+                .replace("schema_version = 2", "schema_version = 3");
         Files.writeString(config, unsupportedSchema);
 
         try (ConfigurationRuntimeAdapter service = service()) {
             ConfigurationUseCase.ReadResult read = service.read(null);
 
-            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, read.user().status());
-            assertTrue(read.diagnostics().contains("CORRUPT_CONFIG"));
+            assertEquals(ConfigurationUseCase.LayerStatus.VALID, read.user().status());
+            assertEquals(1, node(read.effective()).withArray("providers").size());
+            assertTrue(read.issues().stream().anyMatch(issue -> "schema_version".equals(issue.field())));
             assertEquals(unsupportedSchema, Files.readString(config));
+        }
+    }
+
+    /**
+     * 根层缺少 schema 时，MCP 内同名字段保持为未知字段；根层按当前格式读取且其它 Provider/Model
+     * 不会因该错位字段消失。
+     */
+    @Test
+    void misplacedSchemaVersionDoesNotDiscardRootProviders() throws Exception {
+        Path config = homeDirectory().resolve("config.toml");
+        String misplacedSchema = profileConfig("misplaced-schema-model")
+                .replace("schema_version = 2\n", "")
+                + "[metadata]\nschema_version = 2\n";
+        Files.writeString(config, misplacedSchema);
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult read = service.read(null);
+
+            assertEquals(ConfigurationUseCase.LayerStatus.VALID, read.user().status());
+            assertEquals(1, node(read.effective()).withArray("providers").size());
+            assertTrue(read.issues().stream().anyMatch(issue -> "metadata".equals(issue.field())
+                    && "ignored".equals(issue.impact())));
+            assertEquals(misplacedSchema, Files.readString(config));
+        }
+    }
+
+    /**
+     * 回归 Kerminal 表内错位 schema：根缺失元数据只按当前格式读取，MCP 的未知字段不应让 3 个
+     * Provider、5 个 Model 或正常默认选择全部消失。
+     */
+    @Test
+    void misplacedMcpSchemaKeepsThreeProvidersAndFiveModelsUsable() throws Exception {
+        Files.writeString(homeDirectory().resolve("config.toml"), availabilityRegressionConfig());
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult read = service.read(null);
+            ObjectNode effective = node(read.effective());
+
+            assertEquals(ConfigurationUseCase.LayerStatus.VALID, read.user().status());
+            assertEquals(3, effective.withArray("providers").size());
+            assertEquals(5, effective.withArray("providers").valueStream()
+                    .mapToInt(provider -> provider.path("models").size()).sum());
+            assertEquals(1, effective.withArray("mcp_servers").size());
+            assertTrue(read.issues().stream().anyMatch(issue -> "mcp_kerminal".equals(issue.entityId())
+                    && "schema_version".equals(issue.field()) && "ignored".equals(issue.impact())));
+            assertEquals(1, read.issues().size(),
+                    "正常的 nullable 子智能体配置不能与 MCP 的未知字段一起制造额外问题");
+            assertEquals(3, service.resolveGeneration(null).providers().size());
+        }
+    }
+
+    /**
+     * Provider 路由、单个模型、MCP 启用字段和 Skill 引用分别损坏时，只隔离关联实体；其余模型
+     * 仍必须可见，不能重新触发“配置全空、要求重配”的旧恢复分支。
+     */
+    @Test
+    void badCatalogEntriesAreIsolatedFromRemainingProviderAndModel() throws Exception {
+        String source = availabilityRegressionConfig()
+                .replace("skills = []", "skills = [\"user:valid\", \"project:invalid\"]")
+                .replace("https://beta.example.test/v1", "not-a-provider-url")
+                .replace("model = \"gamma-one\"", "model = \"\"")
+                .replace("enabled = true\nschema_version = 2", "enabled = \"yes\"\nschema_version = 2");
+        Path config = homeDirectory().resolve("config.toml");
+        Files.writeString(config, source);
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult read = service.read(null);
+            ObjectNode effective = node(read.effective());
+
+            assertEquals(ConfigurationUseCase.LayerStatus.VALID, read.user().status());
+            assertEquals(1, effective.withArray("providers").size());
+            assertEquals("provider_alpha", effective.withArray("providers").get(0).path("provider_id").textValue());
+            assertEquals(2, effective.withArray("providers").get(0).withArray("models").size());
+            assertEquals(List.of("user:valid"), effective.withArray("skills").valueStream()
+                    .map(JsonNode::textValue).toList());
+            assertTrue(effective.withArray("mcp_servers").isEmpty());
+            assertTrue(read.issues().stream().anyMatch(issue -> "provider_unavailable".equals(issue.impact())));
+            assertTrue(read.issues().stream().anyMatch(issue -> "entry_skipped".equals(issue.impact())));
+            assertEquals(source, Files.readString(config));
+        }
+    }
+
+    /**
+     * 语法损坏只能在完整有效读取后回退到 Java 保存的普通配置快照；恢复前必须保留坏原文，
+     * 防止用户为了重新打开 Ja 丢失最后一次手工编辑。
+     */
+    @Test
+    void syntaxFailureUsesLastKnownGoodWithoutOverwritingSourceAndCanBeRestored() throws Exception {
+        Path config = homeDirectory().resolve("config.toml");
+        Files.writeString(config, profileConfig("snapshot-model"));
+        try (ConfigurationRuntimeAdapter service = service()) {
+            service.read(null);
+        }
+        String damaged = "providers = [\n";
+        Files.writeString(config, damaged);
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult fallback = service.read(null);
+            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, fallback.user().status());
+            assertEquals(1, node(fallback.effective()).withArray("providers").size());
+            assertTrue(fallback.issues().stream()
+                    .anyMatch(issue -> "snapshot_in_use".equals(issue.impact())));
+            assertEquals(damaged, Files.readString(config));
+
+            service.restoreLastKnownGood(fallback.user().version());
+            assertEquals(1, node(service.read(null).effective()).withArray("providers").size());
+            try (Stream<Path> files = Files.list(homeDirectory())) {
+                assertTrue(files.anyMatch(path -> path.getFileName().toString().startsWith("config.toml.backup-")));
+            }
+        }
+    }
+
+    /** 无快照的首次语法失败仍保留应用和设置入口，但不凭空生成或覆盖用户的原始 TOML。 */
+    @Test
+    void firstSyntaxFailureUsesDefaultsWithoutCreatingAReplacementFile() throws Exception {
+        String damaged = "providers = [\n";
+        Path config = homeDirectory().resolve("config.toml");
+        Files.writeString(config, damaged);
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult read = service.read(null);
+            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, read.user().status());
+            assertTrue(node(read.effective()).withArray("providers").isEmpty());
+            assertEquals(damaged, Files.readString(config));
+            assertFalse(Files.exists(homeDirectory().resolve("config.toml.last-known-good")));
+        }
+    }
+
+    /**
+     * 普通 patch 不得以局部字段覆盖含未知根字段或坏 MCP 条目的损坏原文；用户必须显式提交完整
+     * 且严格 v2 的 replace，避免把错误数据悄然清空。
+     */
+    @Test
+    void patchRefusesCorruptTomlWithoutOverwritingOriginalBytes() throws Exception {
+        String source = profileConfig("preserve-model")
+                .replace("[[providers]]", "future_switch = \"keep\"\n[[providers]]")
+                + "\n[[mcp_servers]]\nmcp_id = \"broken\"\nname = \"Broken\"\n"
+                + "transport = \"stdio\"\nendpoint = \"cmd\"\nauth = { kind = \"none\" }\n";
+        Path config = homeDirectory().resolve("config.toml");
+        Files.writeString(config, source);
+
+        try (ConfigurationRuntimeAdapter service = service()) {
+            ConfigurationUseCase.ReadResult before = service.read(null);
+            ObjectNode patch = JSON.createObjectNode().put("default_access_mode", "full_access");
+            assertEquals(ConfigurationUseCase.LayerStatus.CORRUPT, before.user().status());
+            ConfigurationError failure = assertThrows(ConfigurationError.class,
+                    () -> service.patch(ConfigurationScope.USER, null, document(patch), before.user().version()));
+
+            assertEquals(ConfigurationError.Code.CORRUPT_CONFIG, failure.code());
+            assertEquals(source, Files.readString(config));
         }
     }
 
@@ -722,9 +876,9 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** 生成完整 v1 用户配置，使运行时代际测试只改变上游模型名称。 */
+    /** 生成完整 v2 用户配置，使运行时代际测试只改变上游模型名称。 */
     private static String profileConfig(String model) {
-        return "schema_version = 1\n"
+        return "schema_version = 2\n"
                 + "config_revision = 1\n"
                 + "default_access_mode = \"approval_required\"\n"
                 + "default_provider_id = \"provider_model\"\n"
@@ -749,23 +903,60 @@ final class ConfigurationRuntimeAdapterTest {
                 + "max_output_tokens = 8192\n";
     }
 
-    /** 生成只收紧模型输出上限的项目 overlay，项目层不复制 Provider 路由。 */
-    private static String projectOverlayConfig(int maxOutputTokens) {
-        return "schema_version = 1\nconfig_revision = 1\ndefault_access_mode = \"approval_required\"\n"
-                + "default_provider_id = \"provider_model\"\ndefault_model_id = \"model_model\"\n"
-                + "default_reasoning_level = \"medium\"\nmcp_servers = []\nskills = []\n"
-                + "[[providers]]\nprovider_id = \"provider_model\"\n"
-                + "[[providers.models]]\nmodel_id = \"model_model\"\nreasoning_level_map = { medium = \"medium\" }\n"
-                + "default_reasoning_level = \"medium\"\n"
-                + "[providers.models.capabilities]\ncontext_window_tokens = 128000\n"
-                + "max_output_tokens = " + maxOutputTokens + "\n";
+    /**
+     * 以真实 TOML table 归属固定本轮启动故障：最后一个 schema_version 故意位于 MCP 表内，
+     * 不是根元数据，帮助防止未来把局部未知字段重新升级成整份配置损坏。
+     */
+    private static String availabilityRegressionConfig() {
+        return profileConfig("alpha-one")
+                .replace("provider_model", "provider_alpha")
+                .replace("model_model", "model_alpha_one")
+                .replace("cred_model", "cred_alpha")
+                .replace("mcp_servers = []\n", "")
+                + "[[providers.models]]\nmodel_id = \"model_alpha_two\"\nname = \"Alpha Two\"\n"
+                + "model = \"alpha-two\"\nreasoning_level_map = { medium = \"medium\" }\n"
+                + "default_reasoning_level = \"medium\"\n[providers.models.capabilities]\n"
+                + "context_window_tokens = 128000\nmax_output_tokens = 8192\n"
+                + "[[providers]]\nprovider_id = \"provider_beta\"\nname = \"Beta\"\n"
+                + "api = \"openai_chat_completions\"\nbase_url = \"https://beta.example.test/v1\"\n"
+                + "credential_id = \"cred_beta\"\n[providers.network_timeouts]\n"
+                + "connect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n[providers.agent_defaults]\n"
+                + "[providers.agent_defaults.context]\nauto_compact = true\n[providers.agent_defaults.turn_limits]\n"
+                + "max_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+                + "[[providers.models]]\nmodel_id = \"model_beta_one\"\nname = \"Beta One\"\n"
+                + "model = \"beta-one\"\nreasoning_level_map = { medium = \"medium\" }\n"
+                + "default_reasoning_level = \"medium\"\n[providers.models.capabilities]\n"
+                + "context_window_tokens = 128000\nmax_output_tokens = 8192\n"
+                + "[[providers.models]]\nmodel_id = \"model_beta_two\"\nname = \"Beta Two\"\n"
+                + "model = \"beta-two\"\nreasoning_level_map = { medium = \"medium\" }\n"
+                + "default_reasoning_level = \"medium\"\n[providers.models.capabilities]\n"
+                + "context_window_tokens = 128000\nmax_output_tokens = 8192\n"
+                + "[[providers]]\nprovider_id = \"provider_gamma\"\nname = \"Gamma\"\n"
+                + "api = \"anthropic_messages\"\nbase_url = \"https://gamma.example.test\"\n"
+                + "credential_id = \"cred_gamma\"\n[providers.network_timeouts]\n"
+                + "connect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n[providers.agent_defaults]\n"
+                + "[providers.agent_defaults.context]\nauto_compact = true\n[providers.agent_defaults.turn_limits]\n"
+                + "max_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+                + "[[providers.models]]\nmodel_id = \"model_gamma_one\"\nname = \"Gamma One\"\n"
+                + "model = \"gamma-one\"\nreasoning_level_map = { medium = \"medium\" }\n"
+                + "default_reasoning_level = \"medium\"\n[providers.models.capabilities]\n"
+                + "context_window_tokens = 128000\nmax_output_tokens = 8192\n"
+                + "[[mcp_servers]]\nmcp_id = \"mcp_kerminal\"\nname = \"Kerminal\"\n"
+                + "transport = \"stdio\"\nendpoint = \"kerminal\"\nargs = []\nenv = {}\nheaders = {}\n"
+                + "auth = { kind = \"none\" }\nenabled = true\nschema_version = 2\n";
+    }
+
+    /** 项目层只持有其自身启用项和全局收紧项，禁止复制 Provider/MCP 或模型配置。 */
+    private static String projectSkillConfig() {
+        return "schema_version = 2\nconfig_revision = 1\nskills = [\"project:workspace-fixture\"]\n"
+                + "disabled_skills = [\"user:global-fixture\"]\n";
     }
 
     /** catalogConfig 固定 Provider/Model 与 Skill/MCP 引用闭包。 */
     private static String catalogConfig(String endpoint) {
-        return "schema_version = 1\nconfig_revision = 1\ndefault_access_mode = \"full_access\"\n"
+        return "schema_version = 2\nconfig_revision = 1\ndefault_access_mode = \"full_access\"\n"
                 + "default_provider_id = \"provider_catalog\"\ndefault_model_id = \"model_catalog\"\n"
-                + "default_reasoning_level = \"medium\"\n"
+                + "default_reasoning_level = \"medium\"\nskills = [\"user:catalog\"]\n"
                 + "[subagents]\nenabled = true\nprovider_id = { __ja_null = true }\nmodel_id = { __ja_null = true }\nreasoning_level = { __ja_null = true }\n"
                 + "[[providers]]\nprovider_id = \"provider_catalog\"\nname = \"Catalog\"\napi = \"openai_responses\"\nbase_url = \"http://127.0.0.1\"\ncredential_id = \"cred_model\"\n"
                 + "[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n"
@@ -776,20 +967,19 @@ final class ConfigurationRuntimeAdapterTest {
                 + "[providers.models.capabilities]\ncontext_window_tokens = 128000\nmax_output_tokens = 8192\n"
                 + "[[mcp_servers]]\nmcp_id = \"mcp_catalog\"\nname = \"MCP\"\ntransport = \"stdio\"\n"
                 + "endpoint = \"" + endpoint + "\"\nargs = []\nenv = {}\nheaders = {}\n"
-                + "auth = { kind = \"none\" }\nenabled = true\n"
-                + "[[skills]]\nskill_id = \"skill_catalog\"\nname = \"Skill\"\nscope = \"user\"\nenabled = true\ndescription = \"Catalog\"\n";
+                + "auth = { kind = \"none\" }\nenabled = true\n";
     }
 
     /** 生成仅缺失根级 MCP 启用事实的配置，避免其他 schema 错误干扰断言。 */
     private static String catalogConfigWithMissingMcpEnabled() {
         return catalogConfig("http://127.0.0.1:1")
-                .replace("enabled = true\n[[skills]]", "[[skills]]");
+                .replace("auth = { kind = \"none\" }\nenabled = true\n", "auth = { kind = \"none\" }\n");
     }
 
-    /** 构造可直接 merge-patch 到缺失配置的完整 v1 用户文档。 */
+    /** 构造可直接 merge-patch 到缺失配置的完整 v2 用户文档。 */
     private static ObjectNode userDocument(String providerId, String modelId, String upstreamModel) {
         ObjectNode root = JSON.createObjectNode();
-        root.put("schema_version", 1).put("config_revision", 1)
+        root.put("schema_version", 2).put("config_revision", 1)
                 .put("default_access_mode", "approval_required")
                 .put("default_provider_id", providerId).put("default_model_id", modelId)
                 .put("default_reasoning_level", "medium");

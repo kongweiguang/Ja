@@ -65,18 +65,18 @@ function turnStatusLabel(status: NonNullable<ThreadProjection["latestTurnStatus"
 
 /**
  * 实时阶段与 cancelled 状态始终可见；completed/failed 只在服务端权威未读时提示。
- * cancelled 的中性图标只说明最近结果，并不进入未读边界；Pin 同样保持独立语义。
+ * 只接收状态原子值，使 Thread revision 等无关投影变化不重建 Spinner 并重播合法的旋转动效。
  */
-function ThreadTurnStatus({
-  thread,
+const ThreadTurnStatus = memo(function ThreadTurnStatus({
+  status,
+  latestTurnSeen,
   active,
 }: {
-  thread: ThreadProjection;
+  status: ThreadProjection["latestTurnStatus"];
+  latestTurnSeen: boolean;
   active: boolean;
 }): ReactElement | null {
-  const status = thread.latestTurnStatus;
-  if (status === null || (["completed", "failed"].includes(status) && thread.latestTurnSeen))
-    return null;
+  if (status === null || (["completed", "failed"].includes(status) && latestTurnSeen)) return null;
   const label = turnStatusLabel(status);
   const Icon = {
     queued: LoaderCircle,
@@ -103,7 +103,7 @@ function ThreadTurnStatus({
       </span>
     </Tooltip>
   );
-}
+});
 
 /** 描述顶层动作；主会话入口显示文字标签，搜索入口保持紧凑，避免混淆主次。 */
 interface NavigationTopAction {
@@ -389,7 +389,11 @@ function HistoryRow({
               </span>
             </Tooltip>
           ) : null}
-          <ThreadTurnStatus thread={thread} active={active} />
+          <ThreadTurnStatus
+            status={thread.latestTurnStatus}
+            latestTurnSeen={thread.latestTurnSeen}
+            active={active}
+          />
         </span>
       </button>
       <div

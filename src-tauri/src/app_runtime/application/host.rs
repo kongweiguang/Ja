@@ -15,11 +15,11 @@ use crate::app_runtime::domain::{
     TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput,
     TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
     TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
-    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, TurnAccepted,
-    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
-    TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate,
-    TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspaceOpenInput, WorkspacePathSearchInput,
-    WorkspacePathSearchResult,
+    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
+    ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
+    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
+    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
+    WorkspaceDto, WorkspaceOpenInput, WorkspacePathSearchInput, WorkspacePathSearchResult,
 };
 use crate::workspace::{WorkspaceHandle, WorkspaceRegistry};
 use ja_runtime::app_server_process::{
@@ -223,6 +223,14 @@ impl RuntimeHost {
     /// 通过当前受 instance/generation fence 保护的 bridge 恢复 Turn；Rust 不读取或缓存执行游标。
     pub fn turn_resume(&self, input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {
         self.ensure_bridge()?.turn_resume(input)
+    }
+
+    /// 恢复裁决经当前 generation 的同一 bridge 转发，Host 不保存 Tool 或文件状态副本。
+    pub fn turn_recovery_respond(
+        &self,
+        input: ToolRecoveryResponseInput,
+    ) -> Result<ToolRecoveryResponse, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_recovery_respond(input)
     }
 
     /// 通过当前 generation 的固定 lane 入队普通消息，RuntimeHost 不缓存队列副本。

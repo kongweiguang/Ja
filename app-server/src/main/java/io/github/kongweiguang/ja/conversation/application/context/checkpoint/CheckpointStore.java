@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -26,6 +27,109 @@ public interface CheckpointStore {
      * 原子提交 Checkpoint、推进 Thread revision 并返回确定性事件身份，禁止半可见压缩事实。
      */
     CommittedCheckpoint commit(CommitRequest request);
+
+    /**
+     * 读取或创建当前稳定投影阶段；默认实现仅服务纯内存测试，生产 Adapter 必须覆盖为持久化读取，
+     * 否则进程重启会丢失选择，不能作为真实运行时的降级路径。
+     */
+    default ProjectionSnapshot prepareProjection(ProjectionRequest request) {
+        return ProjectionSnapshot.ephemeral(request, ProjectionReason.INITIAL);
+    }
+
+    /**
+     * 为摘要提交或唯一 overflow 重试建立显式新阶段；默认只保持单测可运行，生产实现必须按
+     * Thread/source/binding 幂等落库，防止强杀后同一阶段重复分配。
+     */
+    default ProjectionSnapshot advanceProjection(ProjectionRequest request, ProjectionReason reason) {
+        return ProjectionSnapshot.ephemeral(request, reason);
+    }
+
+    /**
+     * 在任何 Provider IO 前写入首次选择并回读获胜映射；默认实现绝不用于生产，避免让测试 stub
+     * 迫使所有纯策略用例引入 SQLite 依赖。
+     */
+    default ProjectionSnapshot persistProjection(ProjectionSnapshot snapshot,
+                                                  Map<String, ContextPolicy.ToolProjection> selections) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        return snapshot.withSelections(selections);
+    }
+
+    /** 投影阶段只能因首次请求、摘要、模型/Tool binding 或唯一 overflow 恢复而变化。 */
+    enum ProjectionReason {
+        /** 首次向模型发送上下文时建立基线阶段，后续普通追加不得替换它。 */
+        INITIAL,
+        /** 已提交摘要改变历史边界，必须在新阶段重新选择投影。 */
+        CHECKPOINT,
+        /** 模型绑定变化可能改变可用上下文窗口，不能复用旧阶段的预算结论。 */
+        MODEL_BINDING,
+        /** Tool schema 变化会改变请求信封，需隔离此前冻结的选择。 */
+        TOOL_BINDING,
+        /** 单次溢出恢复建立唯一替代阶段，避免每次重试持续改写旧前缀。 */
+        OVERFLOW
+    }
+
+    /** 当前发送环境的非敏感绑定摘要；原始 Profile、Tool schema 和提示正文不进入投影表。 */
+    record ProjectionBinding(String modelBinding, String toolBinding) {
+        /** 只接受内容寻址摘要，避免阶段表成为任意配置或 Tool 正文的持久化通道。 */
+        public ProjectionBinding {
+            if (!sha256(modelBinding) || !sha256(toolBinding)) {
+                throw new IllegalArgumentException("invalid projection binding");
+            }
+        }
+
+        /** 兼容纯策略构造器，不可用于生产请求绑定。 */
+        public static ProjectionBinding unbound() {
+            return new ProjectionBinding("0".repeat(64), "0".repeat(64));
+        }
+    }
+
+    /** 一个阶段及其已冻结的 Tool 输出选择；entries 只记录已进入模型请求的结果。 */
+    record ProjectionSnapshot(String stageId, String threadId, long stageNumber, long sourceRevision,
+                              ProjectionReason reason, ProjectionBinding binding,
+                              Map<String, ContextPolicy.ToolProjection> selections) {
+        /** 约束阶段身份与映射，拒绝不透明 ID、负版本或可变 Map 进入持久化边界。 */
+        public ProjectionSnapshot {
+            if (stageId == null || !stageId.startsWith("projection_") || stageId.length() > 128
+                || threadId == null || threadId.isBlank() || stageNumber < 1 || sourceRevision < 0) {
+                throw new IllegalArgumentException("invalid projection snapshot");
+            }
+            reason = Objects.requireNonNull(reason, "reason");
+            binding = Objects.requireNonNull(binding, "binding");
+            selections = Map.copyOf(Objects.requireNonNull(selections, "selections"));
+            if (selections.keySet().stream().anyMatch(key -> key == null || key.isBlank() || key.length() > 256)) {
+                throw new IllegalArgumentException("invalid projection selections");
+            }
+        }
+
+        /** 纯实现使用短生命周期身份，生产 Adapter 不得返回该方法生成的阶段。 */
+        static ProjectionSnapshot ephemeral(ProjectionRequest request, ProjectionReason reason) {
+            Objects.requireNonNull(request, "request");
+            return new ProjectionSnapshot("projection_" + UUID.randomUUID(), request.threadId(), 1,
+                    request.sourceRevision(), reason, request.binding(), Map.of());
+        }
+
+        /** 返回复制后的不可变选择，保持记录阶段本身和 source/binding 不变。 */
+        ProjectionSnapshot withSelections(Map<String, ContextPolicy.ToolProjection> values) {
+            return new ProjectionSnapshot(stageId, threadId, stageNumber, sourceRevision, reason, binding, values);
+        }
+    }
+
+    /** 进入存储前冻结阶段归属和时间；时间由服务端时钟提供，客户端不能回填。 */
+    record ProjectionRequest(String threadId, long sourceRevision, ProjectionBinding binding, Instant occurredAt) {
+        /** 防御 Thread/source/binding 失配，防止普通上下文规划写到另一个会话。 */
+        public ProjectionRequest {
+            if (threadId == null || threadId.isBlank() || sourceRevision < 0) {
+                throw new IllegalArgumentException("invalid projection request");
+            }
+            binding = Objects.requireNonNull(binding, "binding");
+            occurredAt = Objects.requireNonNull(occurredAt, "occurredAt");
+        }
+    }
+
+    /** 统一校验 SHA-256 小写表达，供绑定字段保持与其它内容寻址记录一致。 */
+    private static boolean sha256(String value) {
+        return value != null && value.matches("[0-9a-f]{64}");
+    }
 
     /**
      * 将预期 revision 与其摘要源绑定，防止适配器把 Checkpoint 写入错误 Thread 或源版本。

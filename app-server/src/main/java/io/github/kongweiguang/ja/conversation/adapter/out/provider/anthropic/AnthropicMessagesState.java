@@ -35,8 +35,9 @@ final class AnthropicMessagesState {
     private final Map<Long, ThinkingAccumulator> thinking = new HashMap<>();
     private final Map<Long, ObjectNode> redactedThinking = new HashMap<>();
     private long startInputTokens;
-    private long startCacheCreationTokens;
-    private long startCacheReadTokens;
+    /* 缺失的缓存明细必须保持 null，不能因 Java 基本类型默认值伪造一次零缓存计量。 */
+    private Long startCacheCreationTokens;
+    private Long startCacheReadTokens;
     private boolean startUsageSeen;
     private int nextOrdinal;
     private FinishReason finishReason;
@@ -269,11 +270,19 @@ final class AnthropicMessagesState {
             if (!value.isObject()) throw protocol("Anthropic message_delta usage is invalid");
             long output = requiredNonNegative(value, "output_tokens");
             if (startUsageSeen || value.has("input_tokens")) {
-                long input = checkedAdd(
-                        optionalOr(value, "input_tokens", startInputTokens),
-                        optionalOr(value, "cache_creation_input_tokens", startCacheCreationTokens),
-                        optionalOr(value, "cache_read_input_tokens", startCacheReadTokens));
-                usage = new ModelUsage(input, output, checkedAdd(input, output));
+                long input = optionalOr(value, "input_tokens", startInputTokens);
+                Long cacheWrite = optionalNonNegative(value, "cache_creation_input_tokens");
+                Long cacheRead = optionalNonNegative(value, "cache_read_input_tokens");
+                if (cacheWrite == null) cacheWrite = startCacheCreationTokens;
+                if (cacheRead == null) cacheRead = startCacheReadTokens;
+                long total = checkedAdd(input, output);
+                if (cacheWrite != null) total = checkedAdd(total, cacheWrite);
+                if (cacheRead != null) total = checkedAdd(total, cacheRead);
+                /* Anthropic 将常规 input、缓存创建与缓存读取分别报告；保留原始输入而不把缓存混入。 */
+                usage = cacheRead == null && cacheWrite == null
+                        ? new ModelUsage(input, output, total)
+                        : new ModelUsage(input, output, total, cacheRead, cacheWrite,
+                                ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE);
             }
         }
         messageDeltaSeen = true;
@@ -438,10 +447,10 @@ final class AnthropicMessagesState {
     }
 
     /**
-     * usage 类别缺失时按零处理，存在但畸形时拒绝。
+     * 仅在 Provider 明示字段时返回数值；缺席必须保留未知，避免将不可观测的缓存量计入零消耗。
      */
-    private static long optionalNonNegative(JsonNode root, String field) {
-        return root.has(field) ? requiredNonNegative(root, field) : 0L;
+    private static Long optionalNonNegative(JsonNode root, String field) {
+        return root.has(field) ? requiredNonNegative(root, field) : null;
     }
 
     /**
@@ -460,13 +469,6 @@ final class AnthropicMessagesState {
         } catch (ArithmeticException failure) {
             throw new ProviderProtocolException("USAGE", "Anthropic usage is invalid", false);
         }
-    }
-
-    /**
-     * 在不发生有符号溢出的前提下累加全部 input token 类别。
-     */
-    private static long checkedAdd(long first, long second, long third) {
-        return checkedAdd(checkedAdd(first, second), third);
     }
 
     /**

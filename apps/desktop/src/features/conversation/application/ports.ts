@@ -61,6 +61,38 @@ export interface ConversationCompactionResult {
 }
 
 /**
+ * Thread 用量只保留服务端已归一化的累计值和覆盖范围。前端据此格式化“已确认小计”，但不从
+ * Timeline、模型偏好或缓存值反推缺失字段，避免不同 Provider 的计量语义在展示层被重复计算。
+ */
+export interface ConversationUsageSummary {
+  threadId: string;
+  snapshotRevision: number;
+  requestCount: number;
+  measuredRequestCount: number;
+  newInputRequestCount: number;
+  newInputTokens: number;
+  outputRequestCount: number;
+  outputTokens: number;
+  totalRequestCount: number;
+  totalTokens: number;
+  cacheReadRequestCount: number;
+  cacheReadTokens: number;
+  cacheWriteRequestCount: number;
+  cacheWriteTokens: number;
+  cacheCompleteRequestCount: number;
+  cacheCompleteInputTokens: number;
+  cacheCompleteReadTokens: number;
+}
+
+/**
+ * 用量读取独立于历史分页端口：浮层只能按显式 Thread identity 查询已聚合账本，不能为展示统计
+ * 物化完整 Timeline，也不能拥有写入、过滤或 Provider 配置能力。
+ */
+export interface ConversationUsageReader {
+  read(input: { threadId: string }): Promise<ConversationUsageSummary>;
+}
+
+/**
  * Conversation 端口只包含 Thread catalog、create 和 read；workspace 打开由独立端口负责，
  * 从类型层阻止会话 controller 成为第二个 workspace capability owner。
  */
@@ -367,6 +399,21 @@ export interface ConversationTurnPort {
     turnId: string;
     expectedThreadRevision: number;
   }): Promise<ConversationAcceptedTurn>;
+  /** 原 Tool 详情只提交当前未知调用的明确裁决；模型续跑仍由 App Server 复用既有 resume。 */
+  respondToolRecovery(input: {
+    turnId: string;
+    callId: string;
+    expectedThreadRevision: number;
+    expectedRecoveryRevision: number;
+    decision: "retry" | "skip";
+    idempotencyKey: string;
+  }): Promise<{
+    accepted: true;
+    turnId: string;
+    threadRevision: number;
+    decision: "retry" | "skip";
+    resumed: boolean;
+  }>;
   cancelTurn(input: { turnId: string }): Promise<ConversationCancelResult>;
   enqueueTurnInput(input: {
     turnId: string;

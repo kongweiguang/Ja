@@ -102,6 +102,7 @@ export interface ConversationInteractionController {
   attachmentDraftItems: readonly ConversationAttachmentDraftItem[];
   activeTurn: boolean;
   suspendedTurn: boolean;
+  continuationAvailable: boolean;
   disabled: boolean;
   preferenceBusy: boolean;
   importingAttachments: boolean;
@@ -132,6 +133,7 @@ export interface ConversationInteractionController {
   retryAttachment(itemId: string): Promise<void>;
   removeAttachment(itemId: string): Promise<void>;
   send(request: ConversationSubmit): Promise<void>;
+  continueReply(): Promise<void>;
   enqueue(request: ConversationSubmit): Promise<void>;
   prioritizeQueuedInput(inputId: string, expectedInputRevision: number): Promise<void>;
   updateQueuedInput(
@@ -399,6 +401,14 @@ export function useConversationInteractionController({
   const pendingTurn = threadId === undefined ? undefined : pendingTurns[threadId];
   const suspendedTurn = blockingTurn?.status === "suspended" ? blockingTurn : undefined;
   const executingTurn = blockingTurn?.status === "suspended" ? undefined : blockingTurn;
+  const latestFailedTurn =
+    threadId === undefined
+      ? undefined
+      : (() => {
+          const latestTurnId = currentThreads[threadId]?.latestTurnId;
+          const latestTurn = latestTurnId === undefined ? undefined : currentTurns[latestTurnId];
+          return latestTurn?.status === "failed" ? latestTurn : undefined;
+        })();
   const blockingTurnId = blockingTurn?.turnId ?? pendingTurn?.turnId;
   const executingTurnId = executingTurn?.turnId ?? pendingTurn?.turnId;
   const inputQueue = useTimelineStore((state) =>
@@ -718,10 +728,14 @@ export function useConversationInteractionController({
 
   /**
    * 同一 Thread 的 turn/start 严格 single-flight；提交意图成立后立即形成消息记录并清空输入。
-   * ACK 后由权威 Timeline 接管，失败则把错误固定在原消息旁，不把已发送内容退回 Composer。
+   * `continue` 仍是新的用户 Turn，但跳过 Plan 创建分支，确保失败后的“继续”始终走模型回复而非
+   * 重新申请计划；ACK 后由权威 Timeline 接管，失败则把错误固定在原消息旁。
    */
   const send = useCallback(
-    async ({ text, attachmentIds, contextReferences }: ConversationSubmit): Promise<void> => {
+    async (
+      { text, attachmentIds, contextReferences }: ConversationSubmit,
+      origin: "user" | "continue" = "user",
+    ): Promise<void> => {
       const requestThreadId = threadId;
       const submittedText = text.trim();
       const submittedReferences =
@@ -807,7 +821,7 @@ export function useConversationInteractionController({
         return next;
       });
       try {
-        if (preferences.collaborationMode === "plan") {
+        if (origin === "user" && preferences.collaborationMode === "plan") {
           const expectedThreadRevision = currentThreads[requestThreadId]?.revision;
           if (
             expectedThreadRevision === undefined ||
@@ -960,6 +974,38 @@ export function useConversationInteractionController({
       workspaceId,
     ],
   );
+
+  /**
+   * 失败后的继续必须以独立用户消息进入新的 Turn，避免恢复已经清除的执行游标或重放旧 Tool。
+   * 点击前复核当前 Timeline 的最新 Turn 和草稿实体，防止迟到快照、会话切换或未完成附件误触续答。
+   */
+  const continueReply = useCallback(async (): Promise<void> => {
+    const requestThreadId = threadId;
+    const expectedFailedTurnId = latestFailedTurn?.turnId;
+    const hasDraftIntent =
+      (requestThreadId === undefined ? "" : (draftsByThread[requestThreadId] ?? "")).trim() !==
+        "" ||
+      (requestThreadId === undefined ? [] : (contextDraftsByThread[requestThreadId] ?? [])).length >
+        0 ||
+      (requestThreadId === undefined ? [] : (attachmentDraftsByThread[requestThreadId] ?? []))
+        .length > 0;
+    if (requestThreadId === undefined || expectedFailedTurnId === undefined || hasDraftIntent)
+      return;
+    const timeline = useTimelineStore.getState();
+    if (
+      timeline.threads[requestThreadId]?.latestTurnId !== expectedFailedTurnId ||
+      timeline.turns[expectedFailedTurnId]?.status !== "failed"
+    )
+      return;
+    await send({ text: "继续", attachmentIds: [], contextReferences: [] }, "continue");
+  }, [
+    attachmentDraftsByThread,
+    contextDraftsByThread,
+    draftsByThread,
+    latestFailedTurn,
+    send,
+    threadId,
+  ]);
 
   /**
    * 默认入队立即清空草稿并加入本地 pending 行；每个调用仍进入 Thread lane，因此相同文本连续
@@ -1837,6 +1883,8 @@ export function useConversationInteractionController({
     attachmentDraftItems,
     activeTurn: hasActiveTurn,
     suspendedTurn: suspendedTurn !== undefined,
+    continuationAvailable:
+      latestFailedTurn !== undefined && pendingTurn === undefined && blockingTurn === undefined,
     disabled:
       !ready ||
       (blocked && suspendedTurn === undefined) ||
@@ -1872,6 +1920,7 @@ export function useConversationInteractionController({
     retryAttachment,
     removeAttachment,
     send,
+    continueReply,
     enqueue,
     prioritizeQueuedInput,
     updateQueuedInput,

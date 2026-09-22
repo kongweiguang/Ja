@@ -1045,6 +1045,193 @@ public final class MybatisConversationRepository implements ConversationReposito
     }
 
     /**
+     * 只暴露当前 Tools 游标的首个未知项；读取与启动恢复共用同一 SQL 顺序，防止 UI 跳过前项而让模型
+     * 获得不配对的 Tool 结果。文件正文和绝对路径始终不离开持久化边界。
+     */
+    @Override
+    public Optional<PendingToolRecovery> findPendingToolRecovery(String turnId) {
+        ensureOpen();
+        return transactions.required(mapper -> Optional.ofNullable(
+                        mapper.recovery().selectPendingToolRecovery(turnId))
+                .map(this::pendingToolRecovery));
+    }
+
+    /**
+     * 将核实、跳过或重试作为一次 SQLite 事务结算。核实与跳过写入配对 ToolResult 并前进执行游标；
+     * 重试仅复位同一已冻结 binding 的 Tool 状态，保留原未知边界，绝不按当前目录重新解析工具。
+     */
+    @Override
+    public ToolRecoveryResolution resolveToolRecovery(ToolRecoveryResolutionRequest request) {
+        ensureOpen();
+        Objects.requireNonNull(request, "request");
+        return transactions.required(mapper -> {
+            PersistenceRecords.ToolRecoveryRow recovery = mapper.recovery().selectToolRecovery(request.callId());
+            if (recovery == null || !request.turnId().equals(recovery.turnId())) notFound("Tool recovery");
+            PersistenceRecords.TurnRow current = mapper.agent().selectTurnById(request.turnId());
+            if (current == null) notFound("turn");
+            TurnState currentState = TurnState.valueOf(requiredText(current.state(), "state"));
+            long currentThreadRevision = requiredNumber(current.threadRevision(), "thread_revision");
+            if (sameRecoveryResolution(recovery, request)) {
+                return new ToolRecoveryResolution(requiredText(current.threadId(), "thread_id"), request.turnId(),
+                        currentThreadRevision, current.mutationVersion(), request.disposition(), false);
+            }
+            if (currentState != TurnState.SUSPENDED || currentThreadRevision != request.expectedThreadRevision()) {
+                throw conflict("Tool recovery revision changed");
+            }
+            PersistenceRecords.ToolRecoveryRow pending = mapper.recovery().selectPendingToolRecovery(request.turnId());
+            if (pending == null || !request.callId().equals(pending.callId())
+                    || pending.recoveryRevision() != request.expectedRecoveryRevision()
+                    || !"PENDING".equals(pending.state())) {
+                throw conflict("Tool recovery is no longer pending");
+            }
+            PersistenceRecords.ResumeTurnRow resume = mapper.agent().selectResumeTurn(request.turnId());
+            if (resume == null || resume.threadRevision() != currentThreadRevision
+                    || resume.turnMutationVersion() != current.mutationVersion()) {
+                throw conflict("suspended Tool recovery cursor changed");
+            }
+            TurnExecutionState execution = executions.read(resume.stateJson());
+            if (!(execution instanceof TurnExecutionState.Tools tools)) {
+                throw new StorageException(StorageException.Code.INVALID_STATE,
+                        "Tool recovery cursor is unavailable");
+            }
+            PersistenceRecords.RecoveryToolRow tool = mapper.recovery().selectRecoveryTool(
+                    request.turnId(), tools.nextOrdinal());
+            if (tool == null || !request.callId().equals(tool.callId()) || tool.ordinal() != tools.nextOrdinal()
+                    || !ToolState.RUNNING.name().equals(tool.state())) {
+                throw conflict("Tool recovery is not the active cursor call");
+            }
+            requireChanged(mapper.recovery().resolveToolRecovery(new PersistenceRecords.ToolRecoveryResolve(
+                            recovery.recoveryId(), request.expectedRecoveryRevision(), recoveryState(request.disposition()),
+                            request.idempotencyKey(), instant(request.occurredAt()))),
+                    "Tool recovery changed concurrently");
+            insertRecoveryAttempt(mapper, recovery.recoveryId(), request.disposition().name(),
+                    request.idempotencyKey(), request.occurredAt());
+            if (request.disposition() == ToolRecoveryDisposition.RETRY) {
+                ToolPresentation prepared = recoveryRetryPresentation(presentations.read(tool.presentationJson()));
+                requireChanged(mapper.recovery().retryRecoveredTool(new PersistenceRecords.ToolRecoveryRetry(
+                                request.turnId(), request.callId(), presentations.write(prepared),
+                                instant(request.occurredAt()))),
+                        "Tool recovery retry requires a running Tool");
+                replaceExecution(mapper, request.turnId(), execution);
+                requireChanged(mapper.agent().compareAndSetTurn(new PersistenceRecords.TurnCas(
+                                requiredText(current.threadId(), "thread_id"), request.turnId(), TurnState.SUSPENDED.name(),
+                                current.mutationVersion(), instant(request.occurredAt()), null, null, null, null)),
+                        "Tool recovery retry lost Turn cursor");
+                requireChanged(mapper.history().compareAndSetThread(new PersistenceRecords.ThreadRevisionCas(
+                                requiredText(current.threadId(), "thread_id"), currentThreadRevision,
+                                instant(request.occurredAt()))),
+                        "Tool recovery retry lost Thread revision");
+                return new ToolRecoveryResolution(requiredText(current.threadId(), "thread_id"), request.turnId(),
+                        currentThreadRevision + 1, current.mutationVersion() + 1,
+                        request.disposition(), true);
+            }
+            boolean verified = request.disposition() == ToolRecoveryDisposition.VERIFIED;
+            String content = verified
+                    ? "当前文件符合执行前保存的预期；原始执行回执未保存。"
+                    : "此操作的执行结果未知，用户已跳过这一步。";
+            ToolPresentation presentation = recoveryResultPresentation(presentations.read(tool.presentationJson()),
+                    verified, content);
+            TurnExecutionState next = tools.nextOrdinal() >= tools.lastOrdinal()
+                    ? new TurnExecutionState.Ready(tools.common(), TurnExecutionState.Next.ASSISTANT, null)
+                    : new TurnExecutionState.Tools(tools.common(), tools.batchId(), tools.assistantMessageId(),
+                    tools.firstOrdinal(), tools.lastOrdinal(), tools.nextOrdinal() + 1);
+            List<Fact> facts = List.of(
+                    new ToolResultFact(request.callId(), ToolState.FAILED, content, !verified, presentation, ""),
+                    new ToolResultMessageFact(recoveryMessageId(request.callId()),
+                            new ModelMessage(ModelRole.TOOL,
+                                    List.of(new ToolResultContent(request.callId(), content, !verified)))));
+            CommitRequest commit = new CommitRequest(requiredText(current.threadId(), "thread_id"), request.turnId(),
+                    TurnState.SUSPENDED, facts, current.mutationVersion(), request.occurredAt(), next);
+            long threadRevision = applyCommitFacts(mapper, commit, currentState, false);
+            finishCommit(mapper, commit);
+            return new ToolRecoveryResolution(requiredText(current.threadId(), "thread_id"), request.turnId(),
+                    threadRevision, current.mutationVersion() + 1, request.disposition(), true);
+        });
+    }
+
+    /**
+     * 幂等重放只接受相同处理词和键，防止旧页面借同一 key 把已处理的未知项伪装成另一种裁决。
+     */
+    private static boolean sameRecoveryResolution(PersistenceRecords.ToolRecoveryRow recovery,
+                                                  ToolRecoveryResolutionRequest request) {
+        return request.idempotencyKey().equals(recovery.idempotencyKey())
+                && recoveryState(request.disposition()).equals(recovery.state());
+    }
+
+    /**
+     * API 裁决动词与持久化终态刻意分离：RETRY/SKIP 表示用户动作，RETRIED/SKIPPED 表示原未知
+     * 调用的已处理事实。统一映射同时保证数据库约束和重复提交的幂等重读使用同一语义。
+     */
+    private static String recoveryState(ToolRecoveryDisposition disposition) {
+        return switch (disposition) {
+            case VERIFIED -> "VERIFIED";
+            case RETRY -> "RETRIED";
+            case SKIP -> "SKIPPED";
+        };
+    }
+
+    /**
+     * 审计序号在事务内计算并由唯一约束兜底；重试不能覆盖 STARTUP/VERIFY 的历史，因此每种裁决均追加一行。
+     */
+    private static void insertRecoveryAttempt(PersistenceMappers mapper, String recoveryId, String disposition,
+                                              String idempotencyKey, Instant occurredAt) {
+        // 审计表记录的是观察/裁决动作；VERIFIED 是 recovery 聚合状态，必须归一为 VERIFY 才符合迁移约束。
+        String auditDisposition = switch (disposition) {
+            case "VERIFIED" -> "VERIFY";
+            case "RETRY", "SKIP" -> disposition;
+            default -> throw new StorageException(StorageException.Code.INVALID_STATE,
+                    "Unsupported Tool recovery disposition");
+        };
+        int attemptNumber = mapper.recovery().countToolRecoveryAttempts(recoveryId) + 1;
+        requireChanged(mapper.recovery().insertToolRecoveryAttempt(
+                        new PersistenceRecords.ToolRecoveryAttemptInsert("recovery_attempt_" + UUID.randomUUID(),
+                                recoveryId, attemptNumber, auditDisposition, idempotencyKey, instant(occurredAt))),
+                "Tool recovery attempt could not be recorded");
+    }
+
+    /**
+     * 原详情只切换回等待执行状态并移除恢复动作；标题、目标和脱敏输入继续使用首次冻结的安全投影。
+     */
+    private static ToolPresentation recoveryRetryPresentation(ToolPresentation current) {
+        return new ToolPresentation(current.kind(), current.title(), ToolPresentation.Status.PENDING,
+                current.inputPreview(), current.outputPreview(), "正在等待重新执行。", current.interactionAnswers(),
+                current.relativePaths(), current.command(), current.relativeCwd(), current.stdout(), current.stderr(),
+                current.exitCode(), current.durationMs(), current.truncated(), current.artifactId(), null);
+    }
+
+    /**
+     * 已核实与跳过共享原 Tool 详情，但明确写出结果边界；VERIFIED 的成功展示只代表当前条件满足，
+     * 原始调用是否成功仍由 recovery 状态事实区分，不能伪造崩溃前的执行回执。
+     */
+    private static ToolPresentation recoveryResultPresentation(ToolPresentation current, boolean verified,
+                                                               String summary) {
+        return new ToolPresentation(current.kind(), current.title(),
+                verified ? ToolPresentation.Status.SUCCESS : ToolPresentation.Status.ERROR,
+                current.inputPreview(), current.outputPreview(), summary, current.interactionAnswers(),
+                current.relativePaths(), current.command(), current.relativeCwd(), current.stdout(), current.stderr(),
+                current.exitCode(), current.durationMs(), current.truncated(), current.artifactId(), null);
+    }
+
+    /** 仅由稳定 callId 派生配对消息身份，事务回滚或幂等重放不会制造第二条模型 Tool 结果。 */
+    private static String recoveryMessageId(String callId) {
+        return "item_recovery_" + callId.substring("call_".length());
+    }
+
+    /**
+     * 将 mapper 行严格映射为领域恢复投影。枚举或字段损坏必须失败关闭，避免 UNKNOWN 操作被静默当作无证据。
+     */
+    private PendingToolRecovery pendingToolRecovery(PersistenceRecords.ToolRecoveryRow row) {
+        try {
+            return new PendingToolRecovery(row.recoveryId(), row.threadId(), row.turnId(), row.callId(),
+                    row.recoveryRevision(), EvidenceKind.valueOf(requiredText(row.evidenceKind(), "evidence_kind")),
+                    row.targetRelativePath(), row.expectedAfterSha256(), row.expectedAfterBytes());
+        } catch (IllegalArgumentException failure) {
+            throw new StorageException(StorageException.Code.INVALID_STATE,
+                    "Tool recovery row is invalid", failure);
+        }
+    }
+
+    /**
      * SUSPENDED 没有进程内 owner，取消事务先读取当前双版本并登记 intent，再原子关闭输入、审批和 execution。
      * 重试若已看到 intent 或终态，只返回权威 receipt，不再次推进 Thread revision。
      */
@@ -1557,6 +1744,16 @@ public final class MybatisConversationRepository implements ConversationReposito
                                 "Tool binding must be unique and match its prepared call");
                     }
                 }
+                case ToolRecoveryEvidenceFact evidence -> {
+                    AgentTool.RecoveryEvidence prepared = evidence.evidence();
+                    requireChanged(mapper.agent().insertToolRecoveryEvidence(
+                                    new PersistenceRecords.ToolRecoveryEvidenceInsert(
+                                            "recovery_" + evidence.callId().substring("call_".length()),
+                                            threadId, turnId, evidence.callId(), prepared.relativePath(),
+                                            prepared.expectedAfterBytes(), prepared.expectedAfterSha256(),
+                                            instant(occurredAt))),
+                            "Tool recovery evidence must be inserted once");
+                }
                 case ToolStartedFact started -> requireChanged(mapper.agent().startTool(
                                 new PersistenceRecords.ToolStart(turnId, started.callId(), instant(occurredAt))),
                         "tool start requires PREPARED call");
@@ -1573,6 +1770,7 @@ public final class MybatisConversationRepository implements ConversationReposito
                                             presentations.write(result.presentation()),
                                             result.presentation().artifactId(), instant(occurredAt))),
                             "tool result requires exactly one unfinished call");
+                    mapper.agent().clearPendingToolRecovery(result.callId());
                 }
                 case ApprovalFact approval -> persistApproval(mapper, threadId, turnId, approval, occurredAt);
                 case UsageFact usage -> persistUsage(mapper, threadId, turnId, usage, occurredAt);
@@ -1594,7 +1792,8 @@ public final class MybatisConversationRepository implements ConversationReposito
                             "usage_" + usage.requestId().substring("request_".length()),
                             usage.requestId(), threadId, turnId, usage.modelRound(), usage.requestOrdinal(),
                             usage.purpose().name(), usage.certainty().name(), profileJson,
-                            null, null, null, instant(occurredAt))),
+                            null, null, null, null, null, null,
+                            ModelUsage.InputAccounting.UNKNOWN.name(), instant(occurredAt))),
                     "Provider request usage must be unique by Turn ordinal");
             return;
         }
@@ -1602,7 +1801,8 @@ public final class MybatisConversationRepository implements ConversationReposito
         requireChanged(mapper.agent().settleUsage(new PersistenceRecords.UsageSettlement(
                         usage.requestId(), turnId, usage.requestOrdinal(), usage.purpose().name(),
                         profileJson, measured.inputTokens(), measured.outputTokens(),
-                        measured.totalTokens(), instant(occurredAt))),
+                        measured.totalTokens(), measured.cacheReadTokens(), measured.cacheWriteTokens(),
+                        measured.newInputTokens(), measured.inputAccounting().name(), instant(occurredAt))),
                 "known Provider usage must settle its UNKNOWN request");
     }
 

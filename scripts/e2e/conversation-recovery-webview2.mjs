@@ -37,6 +37,9 @@ async function until(label, predicate) {
 /** 初始化隔离配置通过真实 settings owner 保存，禁止读取或修改用户 profile。 */
 async function prepare(page, workspaceRoot, endpoint) {
   await page.locator('.ja-shell[data-app-ready="true"]').waitFor();
+  // Settings 由 App Server owner 提供，壳完成首帧时 RuntimeHost 仍可能正在启动；与 reload
+  // 使用相同的 authority fence，避免把启动竞态误判为续答链路拒绝。
+  await page.getByRole("status", { name: "本地运行时：已连接", exact: true }).waitFor();
   return page.evaluate(
     async ({ cwd, endpoint }) => {
       const { TauriSettingsAdapter } = await import("/src/api/tauri/settings.ts");
@@ -108,13 +111,33 @@ async function restore(page, threadId) {
   await page.getByRole("textbox", { name: "消息", exact: true }).waitFor();
 }
 
-/** 每次失败以新 Turn 提交同一 Thread，避免重试按钮改变问题的业务语义。 */
+/** 每次普通提交都显式返回正文，供续答验收精确验证历史没有复制原问题。 */
 async function send(page, step, padding = "") {
+  const text = `JA_RECOVERY_TURN_${step} 请回复当前恢复状态。${padding}`;
   await page.getByRole("button", { name: "发送", exact: true }).waitFor();
-  await page
-    .getByRole("textbox", { name: "消息", exact: true })
-    .fill(`JA_RECOVERY_TURN_${step} 请回复当前恢复状态。${padding}`);
+  await page.getByRole("textbox", { name: "消息", exact: true }).fill(text);
   await page.getByRole("button", { name: "发送", exact: true }).click();
+  return text;
+}
+
+/**
+ * 续答只通过真实 Composer 图标触发；首轮使用键盘证明图标按钮仍保留原生可访问性，
+ * 不经由页面内调用绕过焦点、tooltip 或 application single-flight。
+ */
+async function continueReply(page, activation) {
+  const button = page.getByRole("button", { name: "继续回复", exact: true });
+  await button.waitFor();
+  if (activation === "keyboard") {
+    await button.focus();
+    await page.keyboard.press("Enter");
+  } else {
+    await button.click();
+  }
+}
+
+/** 用户消息只以已渲染 Timeline 为准，避免由本地草稿或 Provider 请求倒推历史。 */
+async function userMessages(page) {
+  return page.locator('.ja-chat-message-user[data-role="user"]').allTextContents();
 }
 
 /** 真窗测量实际状态节点与行中心，移除旋转 transform 后读取 SVG intrinsic box。 */
@@ -226,33 +249,83 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
   });
   await debuggerSession.send("Debugger.enable");
   await debuggerSession.send("Debugger.setPauseOnExceptions", { state: "all" });
-  for (let step = 1; step <= 3; step++) {
-    await send(page, step);
-    await until(`failed turn ${step}`, async () => {
-      if (await page.getByText("发送失败，请检查运行时连接后重试。", { exact: true }).count())
-        throw new Error("Composer submission rejected before Provider request");
-      return (await page.locator('[data-response-state="failed"]').count()) === step;
-    });
-    assert.ok(fixture.attempts.some((attempt) => attempt.step === String(step)));
-  }
-  await send(page, 4);
-  await until("fourth actual HTTP request", () =>
-    fixture.attempts.some((attempt) => attempt.step === "4"),
+  const firstPrompt = await send(page, 1);
+  await until("first failed turn", async () => {
+    if (await page.getByText("发送失败，请检查运行时连接后重试。", { exact: true }).count())
+      throw new Error("Composer submission rejected before Provider request");
+    return (await page.locator('[data-response-state="failed"]').count()) === 1;
+  });
+  await page.getByText("模型服务暂时不可用。", { exact: true }).waitFor();
+  assert.equal((await userMessages(page)).filter((text) => text.includes(firstPrompt)).length, 1);
+  await continueReply(page, "keyboard");
+  await until("first continuation HTTP request", () =>
+    fixture.attempts.some(
+      (attempt) => attempt.step === "continue" && attempt.continuationAttempt === 1,
+    ),
   );
+  const firstContinuation = fixture.attempts.find(
+    (attempt) => attempt.step === "continue" && attempt.continuationAttempt === 1,
+  );
+  assert.deepEqual(firstContinuation?.continuationContext, {
+    originalPromptCount: 1,
+    continueMessageCount: 1,
+    replayedToolCallCount: 0,
+  });
+  await page.getByRole("button", { name: "停止生成", exact: true }).waitFor();
+  await page.getByRole("button", { name: "继续回复", exact: true }).waitFor({ state: "hidden" });
+  const messagesWhileContinuing = await userMessages(page);
+  assert.equal(messagesWhileContinuing.filter((text) => text.includes(firstPrompt)).length, 1);
+  assert.equal(messagesWhileContinuing.filter((text) => text.trim() === "继续").length, 1);
   const spinner = await spinnerGeometry(page, created.threadId);
   assert.ok(spinner.rowOffset <= 1 && spinner.svgOffset <= 1, JSON.stringify(spinner));
   assert.ok(
     spinner.insideRow && spinner.insideSidebar && spinner.hitVisible,
     JSON.stringify(spinner),
   );
-  await page.screenshot({ path: join(evidenceDirectory, "recovery-running.png") });
+  await page.screenshot({ path: join(evidenceDirectory, "continuation-running-light.png") });
   fixture.release();
-  await page.getByText("JA_RECOVERY_SUCCESS_4", { exact: true }).waitFor();
+  await page.getByText("JA_RECOVERY_CONTINUE_SUCCESS_1", { exact: true }).waitFor();
   await restore(page, created.threadId);
-  await page.getByText("JA_RECOVERY_SUCCESS_4", { exact: true }).waitFor();
+  await page.getByText("JA_RECOVERY_CONTINUE_SUCCESS_1", { exact: true }).waitFor();
+  assert.equal(await page.locator('[data-response-state="failed"]').count(), 1);
+
+  await send(page, 2);
+  await until("second failed turn", () =>
+    page
+      .locator('[data-response-state="failed"]')
+      .count()
+      .then((count) => count === 2),
+  );
+  await continueReply(page, "pointer");
+  await until("failed continuation", () =>
+    page
+      .locator('[data-response-state="failed"]')
+      .count()
+      .then((count) => count === 3),
+  );
+  const failedContinuation = fixture.attempts.find(
+    (attempt) => attempt.step === "continue" && attempt.continuationAttempt === 2,
+  );
+  assert.equal(failedContinuation?.status, 503);
+  await page.getByRole("button", { name: "继续回复", exact: true }).waitFor();
+  await page.setViewportSize({ width: 720, height: 640 });
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  const narrowLayout = await page.evaluate(() => ({
+    width: globalThis.innerWidth,
+    overflow: document.documentElement.scrollWidth > globalThis.innerWidth + 1,
+  }));
+  assert.equal(narrowLayout.width, 720);
+  assert.equal(narrowLayout.overflow, false);
+  await page.screenshot({ path: join(evidenceDirectory, "continuation-failed-dark-narrow.png") });
+  // 后续压缩场景保留独立基线，不能由续答的窄屏深色验收隐式改变截图或布局断言。
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "no-preference" });
+  await continueReply(page, "pointer");
+  await page.getByText("JA_RECOVERY_CONTINUE_SUCCESS_3", { exact: true }).waitFor();
+  await restore(page, created.threadId);
+  await page.getByText("JA_RECOVERY_CONTINUE_SUCCESS_3", { exact: true }).waitFor();
   assert.equal(await page.locator('[data-response-state="failed"]').count(), 3);
-  await send(page, 5);
-  await page.getByText("JA_RECOVERY_SUCCESS_5", { exact: true }).waitFor();
+  // 上下文圆环只呈现最近模型请求的计量，并以 progressbar 暴露给辅助技术。
   await page.getByRole("progressbar", { name: "上下文使用量", exact: true }).waitFor();
   await page.screenshot({ path: join(evidenceDirectory, "recovery-reloaded.png") });
   const compaction = await verifyCompaction(page, fixture, evidenceDirectory);
@@ -268,7 +341,12 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
     provider: { kind: "deterministic_loopback", externalCalls: 0, attempts: fixture.attempts },
     recovery: {
       failedTurns: 3,
-      fourthSucceeded: true,
+      continuationMessages: 3,
+      firstContinuationSucceeded: true,
+      failedContinuationRestoredEntry: true,
+      repeatedContinuationSucceeded: true,
+      originalPromptWasNotDuplicated: true,
+      oldToolsWereNotReplayed: true,
       reloadSameThread: true,
       continuedAfterReload: true,
     },
@@ -294,6 +372,7 @@ async function verifyCompaction(page, fixture, evidenceDirectory) {
     await page.locator('.ja-chat-message-user[data-role="user"]').allTextContents(),
     original,
   );
+  // 与续答完成态一致，确认压缩前的真实 Provider 计量仍可访问。
   await page.getByRole("progressbar", { name: "上下文使用量", exact: true }).waitFor();
   await page.screenshot({ path: join(evidenceDirectory, "compaction-failed.png") });
   await page.emulateMedia({ colorScheme: "dark" });
@@ -314,9 +393,16 @@ async function verifyCompaction(page, fixture, evidenceDirectory) {
     .locator(".ja-thread-compaction-feedback")
     .getByRole("button", { name: "重试", exact: true })
     .click();
-  await page
-    .getByRole("status", { name: "上下文使用量未知", exact: true })
-    .waitFor({ timeout: 30_000 });
+  const usageIndicator = page.getByRole("img", {
+    name: "上下文使用量待确认",
+    exact: true,
+  });
+  await usageIndicator.waitFor({ timeout: 30_000 });
+  // 压缩刚结算时不复用旧请求的比例；圆环以 unknown tone 表达待下一次 Provider 计量确认。
+  await until(
+    "context usage pending confirmation",
+    async () => (await usageIndicator.getAttribute("data-tone")) === "unknown",
+  );
   assert.ok(
     fixture.attempts.some((attempt) => attempt.step === "summary" && attempt.status === 200),
   );
@@ -331,6 +417,7 @@ async function verifyCompaction(page, fixture, evidenceDirectory) {
     if (await latest.isVisible()) await latest.click();
     return await page.getByText("JA_RECOVERY_SUCCESS_9", { exact: true }).isVisible();
   });
+  // 下一次真实模型响应重新带回计量后，必须重新成为 progressbar，不能保留压缩前的陈旧值。
   await page.getByRole("progressbar", { name: "上下文使用量", exact: true }).waitFor();
   await page.screenshot({ path: join(evidenceDirectory, "compaction-next-response-known.png") });
   return {

@@ -42,6 +42,7 @@ final class SubagentPolicyMigrationTest {
         String v1 = resource("db/migration/V1__kernel.sql");
         String v2 = resource("db/migration/V2__thread_subagent_policies.sql");
         String v3 = resource("db/migration/V3__subagent_reasoning.sql");
+        String v4 = resource("db/migration/V4__conversation_recovery_usage_projection.sql");
         migrate(source, List.of(new StringResource("V1__kernel.sql", v1)));
         try (java.sql.Connection connection = source.getConnection();
              java.sql.PreparedStatement workspace = connection.prepareStatement(
@@ -74,10 +75,12 @@ final class SubagentPolicyMigrationTest {
 
         migrate(source, List.of(new StringResource("V1__kernel.sql", v1),
                 new StringResource("V2__thread_subagent_policies.sql", v2),
-                new StringResource("V3__subagent_reasoning.sql", v3)));
+                new StringResource("V3__subagent_reasoning.sql", v3),
+                new StringResource("V4__conversation_recovery_usage_projection.sql", v4)));
         migrate(source, List.of(new StringResource("V1__kernel.sql", v1),
                 new StringResource("V2__thread_subagent_policies.sql", v2),
-                new StringResource("V3__subagent_reasoning.sql", v3)));
+                new StringResource("V3__subagent_reasoning.sql", v3),
+                new StringResource("V4__conversation_recovery_usage_projection.sql", v4)));
 
         try (java.sql.Connection connection = source.getConnection();
              java.sql.Statement statement = connection.createStatement()) {

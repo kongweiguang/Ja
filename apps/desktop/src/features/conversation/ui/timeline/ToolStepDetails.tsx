@@ -13,7 +13,9 @@ import {
   ListTree,
   LoaderCircle,
   Minus,
+  RotateCcw,
   Search,
+  SkipForward,
 } from "lucide-react";
 import { useMemo, useState, type ReactElement } from "react";
 import {
@@ -45,9 +47,38 @@ export interface ToolStepDetailsProps {
     callId: string;
     artifactId: string;
   }) => Promise<string>;
+  /** 当前 Turn revision 来自权威 Turn 投影；缺失时宁可不显示操作，也不能猜测 CAS。 */
+  recoveryThreadRevision?: number;
+  onResolveRecovery?: (input: {
+    threadId: string;
+    turnId: string;
+    callId: string;
+    expectedThreadRevision: number;
+    expectedRecoveryRevision: number;
+    decision: "retry" | "skip";
+    idempotencyKey: string;
+  }) => Promise<unknown>;
 }
 
 const PREVIEW_LINES = 10;
+
+/**
+ * 同一 call/revision/选择必须在重绘和虚拟卸载后保持同一个幂等身份；散列只缩短 UI 传输键，
+ * 真正的 Tool 归属仍由 Java 以 callId 和双 revision 校验，不能作为授权或事实来源。
+ */
+function recoveryIdempotencyKey(
+  turnId: string,
+  callId: string,
+  recoveryRevision: number,
+  decision: "retry" | "skip",
+): string {
+  let hash = 0x811c9dc5;
+  for (const character of `${turnId}:${callId}:${recoveryRevision}:${decision}`) {
+    hash ^= character.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `recovery-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
 
 /** Tool 状态只用于可访问名称和异常详情，不为正常步骤增加一列视觉噪声。 */
 function presentationStatusLabel(status: ToolPresentation["status"]): string {
@@ -97,6 +128,8 @@ function presentationActionLabel(
       return "写入";
     case "mcp":
       return "调用工具";
+    case "context":
+      return "上下文自动压缩";
   }
 }
 
@@ -278,6 +311,8 @@ export function ToolStepDetails({
   disclosureKey,
   disclosureThreadId,
   onReadArtifact,
+  recoveryThreadRevision,
+  onResolveRecovery,
 }: ToolStepDetailsProps): ReactElement | null {
   const presentation = step.metadata?.presentation;
   const callId = step.metadata?.callId;
@@ -285,9 +320,11 @@ export function ToolStepDetails({
   const [outputExpanded, setOutputExpanded] = useState(false);
   const [loadedOutput, setLoadedOutput] = useState<string>();
   const [loading, setLoading] = useState(false);
+  const [resolvingRecovery, setResolvingRecovery] = useState(false);
   const [error, setError] = useState<string>();
   const toolName = presentationToolName(step);
   const isInteractionTool = toolName === "request_user_input";
+  const isContextCompaction = presentation?.kind === "context";
   const answeredInteractions =
     presentation === undefined ? [] : interactionAnswers(presentation, toolName);
   const rawOutput =
@@ -299,6 +336,11 @@ export function ToolStepDetails({
   if (presentation === undefined) return null;
   const canLoad =
     presentation.artifactId !== undefined && callId !== undefined && onReadArtifact !== undefined;
+  const canResolveRecovery =
+    presentation.recovery !== undefined &&
+    callId !== undefined &&
+    recoveryThreadRevision !== undefined &&
+    onResolveRecovery !== undefined;
   const locallyExpandable = lines.length > PREVIEW_LINES;
   const shownOutput = outputExpanded ? output : lines.slice(0, PREVIEW_LINES).join("\n");
   const hidesSuccessOutput =
@@ -319,6 +361,7 @@ export function ToolStepDetails({
     cachedOpen ??
     manualOpen ??
     (presentation.status === "error" ||
+      presentation.recovery !== undefined ||
       (isInteractionTool && presentation.status === "success" && answeredInteractions.length > 0));
   const actionLabel = presentationActionLabel(presentation, toolName);
   const target = presentationTarget(presentation, toolName);
@@ -373,6 +416,44 @@ export function ToolStepDetails({
     }
   };
 
+  /**
+   * 点击动作冻结当前详情的全部 CAS 身份；切换 Thread、收到新快照或重复点击后，Runtime 和 Java
+   * 分别以 generation、串行 key、revision 与幂等键失败关闭，UI 绝不乐观伪造处理完成。
+   */
+  const resolveRecovery = async (decision: "retry" | "skip"): Promise<void> => {
+    if (
+      !canResolveRecovery ||
+      presentation.recovery === undefined ||
+      callId === undefined ||
+      recoveryThreadRevision === undefined ||
+      onResolveRecovery === undefined ||
+      resolvingRecovery
+    )
+      return;
+    setResolvingRecovery(true);
+    setError(undefined);
+    try {
+      await onResolveRecovery({
+        threadId: step.threadId,
+        turnId: step.turnId,
+        callId,
+        expectedThreadRevision: recoveryThreadRevision,
+        expectedRecoveryRevision: presentation.recovery.revision,
+        decision,
+        idempotencyKey: recoveryIdempotencyKey(
+          step.turnId,
+          callId,
+          presentation.recovery.revision,
+          decision,
+        ),
+      });
+    } catch {
+      setError("无法提交这一步的处理，请刷新会话状态后重试。");
+    } finally {
+      setResolvingRecovery(false);
+    }
+  };
+
   return (
     <div
       className="ja-tool-details"
@@ -420,7 +501,36 @@ export function ToolStepDetails({
           {outputView === undefined ? null : (
             <ToolResultOutput view={outputView} status={presentation.status} />
           )}
-          {isInteractionTool ? null : (
+          {canResolveRecovery ? (
+            <div className="ja-tool-details__recovery" role="group" aria-label="恢复此工具步骤">
+              <p>这条命令已启动，但未保存结果。再次执行可能重复操作。</p>
+              <div className="ja-tool-details__recovery-actions">
+                <button
+                  type="button"
+                  className="ja-tool-details__recovery-action"
+                  disabled={resolvingRecovery}
+                  onClick={() => void resolveRecovery("retry")}
+                >
+                  {resolvingRecovery ? (
+                    <LoaderCircle aria-hidden="true" />
+                  ) : (
+                    <RotateCcw aria-hidden="true" />
+                  )}
+                  重新执行
+                </button>
+                <button
+                  type="button"
+                  className="ja-tool-details__recovery-action"
+                  disabled={resolvingRecovery}
+                  onClick={() => void resolveRecovery("skip")}
+                >
+                  <SkipForward aria-hidden="true" />
+                  跳过这一步
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {isInteractionTool || isContextCompaction ? null : (
             <div className="ja-tool-details__facts">
               <span>状态：{presentationStatusLabel(presentation.status)}</span>
               {presentation.exitCode === undefined ? null : (

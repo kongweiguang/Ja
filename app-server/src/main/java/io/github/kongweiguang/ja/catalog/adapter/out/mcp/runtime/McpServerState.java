@@ -175,6 +175,17 @@ final class McpServerState {
     }
 
     /**
+     * 将已确认无法启动的服务固定为空目录，避免每次 Provider 安全点重新花费整个 MCP 预算。
+     * 仅 Runtime 识别出确定的本地可执行文件缺失时调用；配置变更会创建新目录，Settings 的显式
+     * 探测也会使用新 Runtime，因此不会把瞬态网络失败错误地永久缓存。
+     */
+    void publishUnavailableDirectory() {
+        directoryTools = List.of();
+        resolvedDirectoryRevision = directoryRevision.get();
+        lastDiscoveryFailed = true;
+    }
+
+    /**
      * 返回脱敏健康事实，不暴露底层异常或端点信息。
      */
     boolean discoveryFailed() {

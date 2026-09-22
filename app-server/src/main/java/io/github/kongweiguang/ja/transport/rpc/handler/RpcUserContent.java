@@ -48,7 +48,7 @@ final class RpcUserContent {
                 case "skill_reference" -> {
                     RpcParams.requireExact(object, "type", "skillId");
                     blocks.add(new SkillReferenceContent(
-                            RpcParams.identifier(object, "skillId", "skill_", 128)));
+                            RpcParams.text(object, "skillId", 520, false)));
                 }
                 default -> throw JaRpcException.invalidParams();
             }

@@ -42,7 +42,7 @@ public final class JaDatabase implements AutoCloseable {
     /**
      * 打开唯一数据库并把 schema 准入完全交给 Flyway history/checksum。
      *
-     * <p>空库按顺序执行事务化 V1/V2；非空未知 schema、版本漂移、checksum 冲突和损坏数据库都由
+     * <p>空库按顺序执行事务化 V1 至 V4；非空未知 schema、版本漂移、checksum 冲突和损坏数据库都由
      * Flyway/SQLite 失败关闭。这里不 repair、不删除也不复制数据，避免启动路径演变成第二套
      * 隐式迁移协议。</p>
      */
@@ -77,10 +77,10 @@ public final class JaDatabase implements AutoCloseable {
             flyway.migrate();
             MigrationInfo current = flyway.info().current();
             if (current == null || current.getVersion() == null
-                || !"3".equals(current.getVersion().getVersion())
+                || !"4".equals(current.getVersion().getVersion())
                 || flyway.info().pending().length != 0) {
                 throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
-                        "database schema is not the current Ja V3");
+                        "database schema is not the current Ja V4");
             }
             verifySqliteIntegrity(source);
         } catch (StorageException failure) {

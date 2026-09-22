@@ -150,6 +150,14 @@ function fakeRuntime(initialState: RuntimeStatus = stopped): {
       queued: true,
       threadRevision: input.expectedThreadRevision + 1,
     })),
+    // 测试 adapter 不推断执行结果，只保持 UI controller 所需的裁决 ACK 契约。
+    turnRecoveryRespond: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: input.turnId,
+      threadRevision: input.expectedThreadRevision + 1,
+      decision: input.decision,
+      resumed: false,
+    })),
     turnCancel: vi.fn(async (input) => ({
       accepted: true as const,
       turnId: input.turnId,

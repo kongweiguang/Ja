@@ -8,6 +8,7 @@ import org.apache.ibatis.session.SqlSession;
  * 一个 transaction-scoped Mapper 集合；任何 Mapper 都不得逃逸 SqlSession callback。
  */
 public record PersistenceMappers(HistoryMapper history, AgentMapper agent, CheckpointMapper checkpoint,
+                                 ProjectionMapper projections,
                                  RecoveryMapper recovery, SchemaMapper schema,
                                  InstructionScopeMapper instructionScopes, AttachmentMapper attachments,
                                  TaskMapper tasks, SubagentPolicyMapper subagentPolicies,
@@ -20,6 +21,7 @@ public record PersistenceMappers(HistoryMapper history, AgentMapper agent, Check
     public static PersistenceMappers open(SqlSession session) {
         return new PersistenceMappers(session.getMapper(HistoryMapper.class),
                 session.getMapper(AgentMapper.class), session.getMapper(CheckpointMapper.class),
+                session.getMapper(ProjectionMapper.class),
                 session.getMapper(RecoveryMapper.class),
                 session.getMapper(SchemaMapper.class),
                 session.getMapper(InstructionScopeMapper.class),

@@ -7,6 +7,10 @@ import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.foundation.validation.ContractChecks;
 
 import java.util.Objects;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 
 /**
  * 一次真实 Provider 请求采用的完整非敏感运行事实；相等性就是 continuation 的唯一复用条件。
@@ -53,6 +57,23 @@ public record ProviderRequestProfile(
         return new ProviderRequestProfile(providerId, modelId, api, upstreamModel, requestedReasoning,
                 effectiveReasoning, accessMode, collaborationMode, configGeneration, revision, toolCatalogRevision,
                 contextWindowTokens, maxOutputTokens);
+    }
+
+    /**
+     * 为稳定上下文投影提供模型环境摘要；prompt 与 Tool 修订刻意排除，避免普通消息增长或 Tool
+     * 目录变化错误地重置模型阶段，也避免将配置正文持久化到投影表。
+     */
+    public String modelBindingFingerprint() {
+        String value = String.join("\n", providerId, modelId, api, upstreamModel,
+                String.valueOf(requestedReasoning), String.valueOf(effectiveReasoning),
+                accessMode.name(), collaborationMode.name(), configGeneration,
+                Integer.toString(contextWindowTokens), Integer.toString(maxOutputTokens));
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
     }
 
     /** Provider/Model 使用配置合同的稳定前缀，避免展示名称成为路由身份。 */

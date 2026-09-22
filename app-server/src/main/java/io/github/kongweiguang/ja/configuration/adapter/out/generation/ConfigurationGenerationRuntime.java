@@ -69,11 +69,16 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
                     new ArrayList<>(read.diagnostics());
             String selectedProvider = selectProvider(read.effective());
             if (selectedProvider == null) {
-                diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_PROVIDER", true));
+                /*
+                 * 配置代际本身仍是可读取、可管理的状态。没有默认 Provider 只能阻止选择它的
+                 * Turn，不能把历史、设置或其它随后补充的 Provider 一起关掉。
+                 */
+                diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_PROVIDER", false));
             } else {
                 String credentialId = credentialForProvider(read.effective(), selectedProvider);
                 if (!auth.contains(credentialId)) {
-                    diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_CREDENTIAL", true));
+                    /* 凭据可用性属于该 Provider 的连接前置条件，不是整个 App Server 的启动门禁。 */
+                    diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_CREDENTIAL", false));
                 }
             }
             List<JsonNode> skills = catalogEntries(read.effective(), "skills");

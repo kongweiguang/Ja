@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -45,6 +46,7 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
     /** 在无外部网络与用户凭据的条件下验证真实 MCP SDK 适配边界。 */
 final class McpTransportIntegrationTest {
@@ -111,6 +113,33 @@ final class McpTransportIntegrationTest {
             List<String> observations = Files.readAllLines(report, StandardCharsets.UTF_8);
             assertEquals(1, observations.stream().filter("method=tools/list"::equals).count());
         }
+    }
+
+    /**
+     * Windows 找不到 MCP 命令时必须同步通知 SDK，避免 connect 已失败却让 initialize 消耗完整请求预算。
+     * 这只固定本机可执行文件缺失的确定事实；临时连接和协议故障仍由 Runtime 保持 dirty 后重试。
+     */
+    @Test
+    void missingStdioExecutableIsIsolatedBeforeTheRequestDeadline(@TempDir Path directory) {
+        assumeTrue(System.getProperty("os.name", "").toLowerCase().contains("win"));
+        McpLimits defaults = McpLimits.DEFAULT;
+        McpLimits limits = new McpLimits(
+                defaults.maxPages(), defaults.maxTools(), defaults.maxCursorBytes(), defaults.maxSchemaBytes(),
+                defaults.maxResultBytes(), defaults.maxMessageBytes(), defaults.maxStderrBytes(),
+                defaults.outboundQueueCapacity(), Duration.ofSeconds(3), Duration.ofSeconds(3),
+                defaults.closeTimeout());
+        McpServerDefinition definition = McpServerDefinition.stdio(
+                "missing-stdio-fixture",
+                List.of("ja-mcp-missing-" + UUID.randomUUID()),
+                directory,
+                Map.of(),
+                List.of("2025-06-18"));
+        long started = System.nanoTime();
+        try (McpRuntime runtime = new McpRuntime(List.of(definition), limits, new ObjectMapper())) {
+            assertTrue(runtime.snapshot().tools().isEmpty());
+            assertTrue(runtime.unavailableServerIds().contains("missing-stdio-fixture"));
+        }
+        assertTrue(System.nanoTime() - started < Duration.ofSeconds(2).toNanos());
     }
 
     /** 验证 Streamable HTTP 使用显式 Mapper，且只在创建请求时注入已解析 Header。 */

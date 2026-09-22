@@ -52,7 +52,7 @@ async function writeIsolatedHome(homeRoot) {
   const jaHome = join(homeRoot, ".ja");
   await mkdir(jaHome, { recursive: true });
   const config = [
-    "schema_version = 1",
+    "schema_version = 2",
     "config_revision = 1",
     'default_access_mode = "full_access"',
     'default_provider_id = "provider_side_chat"',

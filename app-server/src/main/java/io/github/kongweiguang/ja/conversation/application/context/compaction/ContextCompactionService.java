@@ -19,6 +19,7 @@ import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
 import java.time.Clock;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -87,11 +88,15 @@ public final class ContextCompactionService {
                 .map(CheckpointStore.ContextCheckpoint::retainedFromOrdinal).orElse(0L);
         Optional<ContextPolicy.RetainedSplit> previousRetainedSplit = snapshot.checkpoint()
                 .flatMap(CheckpointStore.ContextCheckpoint::retainedSplit);
+        CheckpointStore.ProjectionRequest projectionRequest = new CheckpointStore.ProjectionRequest(
+                request.threadId(), request.sourceRevision(), request.projectionBinding(), clock.instant());
+        CheckpointStore.ProjectionSnapshot projection = checkpoints.prepareProjection(projectionRequest);
         ContextPolicy.PlanningInput input = new ContextPolicy.PlanningInput(request.threadId(),
                 request.messages(), previous, request.sourceRevision(), baseThrough, baseRetainedFrom,
                 previousRetainedSplit, request.budget(),
-                request.forceCompaction(), request.continuation(), request.outputLimits());
+                request.forceCompaction(), request.continuation(), request.outputLimits(), projection.selections());
         ContextPolicy.Plan plan = policy.plan(input, request.meter());
+        checkpoints.persistProjection(projection, plan.projectionChoices());
         if (!plan.requiresCompaction()) {
             if (!plan.fullPromptFits()) {
                 throw new ContextException(ContextException.Code.CONTEXT_LIMIT,
@@ -115,6 +120,7 @@ public final class ContextCompactionService {
         if (currentSourceCheckpoint.isPresent()) {
             CheckpointStore.ContextCheckpoint checkpoint = currentSourceCheckpoint.orElseThrow();
             boolean sameSource = checkpoint.sourceRevision() == request.sourceRevision();
+            ensureCheckpointProjection(projectionRequest, plan);
             return reuseCurrentSourceCheckpoint(request, plan, checkpoint, sameSource,
                     Optional.empty());
         }
@@ -168,14 +174,27 @@ public final class ContextCompactionService {
                     "context source changed while summary was generated", failure);
         }
         if (!committed.newlyCommitted()) {
+            ensureCheckpointProjection(projectionRequest, plan);
             return reuseCurrentSourceCheckpoint(request, plan, committed.checkpoint(), false,
                     Optional.of(committed));
         }
+        ensureCheckpointProjection(projectionRequest, plan);
         verifyPersistedFingerprint(request, plan.retainedPrompt(), committed.checkpoint());
         return new CompactionResult(true,
                 new PromptContext(plan.retainedPrompt(), committed.checkpoint().summary(),
                         (int) Math.min(Integer.MAX_VALUE, compactedTokens), Optional.empty(), true),
                 Optional.of(committed.checkpoint()), plan, Optional.of(committed), false);
+    }
+
+    /**
+     * Checkpoint 可能在进程退出后先于阶段写入落库；以 source/binding 幂等地补齐新阶段并在 Provider
+     * IO 前持久选择，不能把已有摘要误当作旧阶段仍然可重投影的许可。
+     */
+    private void ensureCheckpointProjection(CheckpointStore.ProjectionRequest request,
+                                            ContextPolicy.Plan plan) {
+        CheckpointStore.ProjectionSnapshot checkpointProjection = checkpoints.advanceProjection(
+                request, CheckpointStore.ProjectionReason.CHECKPOINT);
+        checkpoints.persistProjection(checkpointProjection, plan.projectionChoices());
     }
 
     /**
@@ -295,8 +314,16 @@ public final class ContextCompactionService {
             || checkpoint.sourceRevision() > request.sourceRevision()) {
             throw new IllegalArgumentException("overflow reprojection source mismatch");
         }
-        ToolOutputProjector projector = new ToolOutputProjector(
-                ToolProjectionLimits.artifactOnlyProjection());
+        CheckpointStore.ProjectionRequest projectionRequest = new CheckpointStore.ProjectionRequest(
+                request.threadId(), request.sourceRevision(), request.projectionBinding(), clock.instant());
+        CheckpointStore.ProjectionSnapshot overflowProjection = checkpoints.advanceProjection(
+                projectionRequest, CheckpointStore.ProjectionReason.OVERFLOW);
+        Map<String, ContextPolicy.ToolProjection> selections = committed.plan().retained().stream()
+                .filter(ContextMessage::hasToolResult)
+                .collect(java.util.stream.Collectors.toUnmodifiableMap(ContextMessage::messageId,
+                        ignored -> ContextPolicy.ToolProjection.ARTIFACT));
+        checkpoints.persistProjection(overflowProjection, selections);
+        ToolOutputProjector projector = new ToolOutputProjector(ToolProjectionLimits.artifactOnlyProjection());
         List<ContextMessage> reprojected = committed.plan().retained().stream()
                 .map(message -> message.project(projector)).toList();
         long tokens = request.meter().measure(
@@ -322,6 +349,7 @@ public final class ContextCompactionService {
             boolean forceCompaction,
             Optional<ModelContinuation> continuation,
             ToolProjectionLimits outputLimits,
+            CheckpointStore.ProjectionBinding projectionBinding,
             ContextTokenMeter meter,
             CancellationToken cancellation) {
         /**
@@ -332,7 +360,16 @@ public final class ContextCompactionService {
                                  Optional<ModelContinuation> continuation, ToolProjectionLimits outputLimits,
                                  ContextTokenMeter meter) {
             this(threadId, sourceRevision, messages, budget, forceCompaction, continuation,
-                    outputLimits, meter, CancellationToken.none());
+                    outputLimits, CheckpointStore.ProjectionBinding.unbound(), meter, CancellationToken.none());
+        }
+
+        /** 纯压缩测试和手动调用保留取消能力；真实模型发送总是提供已解析的请求绑定。 */
+        public CompactionRequest(String threadId, long sourceRevision, List<ContextMessage> messages,
+                                 ContextBudget budget, boolean forceCompaction,
+                                 Optional<ModelContinuation> continuation, ToolProjectionLimits outputLimits,
+                                 ContextTokenMeter meter, CancellationToken cancellation) {
+            this(threadId, sourceRevision, messages, budget, forceCompaction, continuation,
+                    outputLimits, CheckpointStore.ProjectionBinding.unbound(), meter, cancellation);
         }
 
         /**
@@ -346,6 +383,7 @@ public final class ContextCompactionService {
             budget = Objects.requireNonNull(budget, "budget");
             continuation = Objects.requireNonNull(continuation, "continuation");
             outputLimits = Objects.requireNonNull(outputLimits, "outputLimits");
+            projectionBinding = Objects.requireNonNull(projectionBinding, "projectionBinding");
             meter = Objects.requireNonNull(meter, "meter");
             cancellation = Objects.requireNonNull(cancellation, "cancellation");
         }
@@ -355,7 +393,7 @@ public final class ContextCompactionService {
          */
         public CompactionRequest shrinkForOverflow() {
             return new CompactionRequest(threadId, sourceRevision, messages, budget, true, continuation,
-                    ToolProjectionLimits.artifactOnlyProjection(), meter, cancellation);
+                    ToolProjectionLimits.artifactOnlyProjection(), projectionBinding, meter, cancellation);
         }
     }
 

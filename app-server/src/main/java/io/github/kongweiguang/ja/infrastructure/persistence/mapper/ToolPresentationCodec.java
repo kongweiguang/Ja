@@ -50,6 +50,9 @@ public final class ToolPresentationCodec {
         if (value.exitCode() != null) node.put("exitCode", value.exitCode());
         if (value.durationMs() != null) node.put("durationMs", value.durationMs());
         optional(node, "artifactId", value.artifactId());
+        if (value.recovery() != null) {
+            node.putObject("recovery").put("revision", value.recovery().revision());
+        }
         return node.toString();
     }
 
@@ -71,7 +74,7 @@ public final class ToolPresentationCodec {
                     optionalText(node, "command"), optionalText(node, "relativeCwd"),
                     optionalText(node, "stdout"), optionalText(node, "stderr"),
                     optionalInteger(node, "exitCode"), optionalLong(node, "durationMs"),
-                    required(node, "truncated").booleanValue(), optionalText(node, "artifactId"));
+                    required(node, "truncated").booleanValue(), optionalText(node, "artifactId"), recovery(node));
         } catch (RuntimeException | java.io.IOException failure) {
             if (failure instanceof StorageException storage) throw storage;
             throw invalid();
@@ -96,6 +99,16 @@ public final class ToolPresentationCodec {
                     text(required(value, "question")), answers, skipped.booleanValue()));
         }
         return result;
+    }
+
+    /** 恢复动作只保存版本 CAS；缺失保持普通历史，畸形对象不能降级成可点击动作。 */
+    private static ToolPresentation.Recovery recovery(JsonNode node) {
+        JsonNode value = node.get("recovery");
+        if (value == null || value.isNull()) return null;
+        if (!value.isObject() || value.size() != 1) throw invalid();
+        JsonNode revision = required(value, "revision");
+        if (!revision.isIntegralNumber() || revision.longValue() < 1) throw invalid();
+        return new ToolPresentation.Recovery(revision.longValue());
     }
 
     /** 提供持久化测试和迁移内部使用的结构化节点，不把数据库 codec 暴露给 transport。 */

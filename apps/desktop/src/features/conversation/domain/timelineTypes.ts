@@ -26,7 +26,8 @@ export interface ToolInteractionAnswer {
 }
 
 export interface ToolPresentation {
-  kind: "read" | "edit" | "write" | "shell" | "mcp";
+  /** context 是 Reducer 为自动压缩构造的本地展示类型，不属于 App Server Tool wire contract。 */
+  kind: "read" | "edit" | "write" | "shell" | "mcp" | "context";
   title: string;
   status: "pending" | "running" | "waiting_approval" | "success" | "error" | "cancelled";
   inputPreview?: string;
@@ -43,6 +44,8 @@ export interface ToolPresentation {
   durationMs?: number;
   truncated: boolean;
   artifactId?: string;
+  /** 仅结果未知的已启动 Tool 带回 CAS；普通历史、已核实和已裁决记录均不带此字段。 */
+  recovery?: { revision: number };
 }
 
 export interface TurnChangeFile {

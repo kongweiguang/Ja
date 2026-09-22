@@ -1,5 +1,4 @@
 # @author kongweiguang
-# @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Validate the breaking JA RPC v1 schema, golden frames, and Secret boundary."""
 
@@ -121,7 +120,8 @@ PARAM_DEFS = {
     "workspace/path/search": "workspacePathSearchParams",
     "workspace/set-trust": "workspaceTrustParams",
     "workspace/unregister": "workspaceUnregisterParams", "thread/create": "threadCreateParams",
-    "thread/read": "threadReadParams", "thread/seen": "threadMutationParams",
+    "thread/read": "threadReadParams", "thread/usage/read": "threadUsageReadParams",
+    "thread/seen": "threadMutationParams",
     "thread/archive": "threadMutationParams", "thread/restore": "threadMutationParams",
     "thread/delete": "threadMutationParams", "thread/compact": "threadCompactParams",
     "interaction/read": "interactionReadParams", "interaction/observe": "interactionObserveParams",
@@ -143,6 +143,7 @@ PARAM_DEFS = {
     "plan/reject": "planRejectParams",
     "attachment/import": "attachmentImportParams", "attachment/discard": "attachmentDiscardParams",
     "turn/start": "turnStartParams", "turn/resume": "turnResumeParams",
+    "turn/recovery/respond": "turnRecoveryRespondParams",
     "turn/cancel": "turnCancelParams", "turn/input/enqueue": "turnInputEnqueueParams",
     "turn/input/prioritize": "turnInputPrioritizeParams", "turn/input/update": "turnInputUpdateParams",
     "turn/input/delete": "turnInputDeleteParams", "turn/change-set/read": "changeSetArtifactReadParams",
@@ -178,7 +179,7 @@ RESULT_DEFS = {
     "thread/preferences/update": "threadResult", "thread/pin": "threadResult",
     "thread/seen": "threadResult", "thread/archive": "threadResult",
     "thread/restore": "threadResult",
-    "thread/read": "threadReadResult",
+    "thread/read": "threadReadResult", "thread/usage/read": "threadUsageSummary",
     "goal/read": "goalProjectionResult",
     "goal/events/read": "goalEventsResult",
     "goal/observe": "goalObserveResult",
@@ -217,6 +218,7 @@ RESULT_DEFS = {
     "thread/compact": "threadCompactResult",
     "attachment/import": "attachmentResult", "attachment/discard": "attachmentResult",
     "turn/start": "turnAcceptedResult", "turn/resume": "turnResumeResult",
+    "turn/recovery/respond": "turnRecoveryRespondResult",
     "turn/cancel": "turnCancelResult",
     "turn/input/enqueue": "turnInputMutationResult",
     "turn/input/prioritize": "turnInputMutationResult",
@@ -310,7 +312,7 @@ def validate_frame(frame: dict[str, Any], schema: dict[str, Any],
             validate_turn_content(params.get("content"))
         if method in {"turn/input/enqueue", "turn/input/update"}:
             validate_turn_content(params.get("content"), queued=True)
-        if method == "configuration/replace":
+        if method == "configuration/replace" and params.get("scope") == "user":
             validate_config_document(params.get("document"))
         if method == "configuration/changed":
             if "cwd" in params:

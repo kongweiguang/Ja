@@ -108,7 +108,7 @@ final class TurnMcpSessionFactoryTest {
 
     /** 使用凭据引用写入 Java 所有的 Schema，夹具不得包含 MCP Secret 明文。 */
     private static String generationConfig(Path report, Path classes) {
-        return "schema_version = 1\n"
+        return "schema_version = 2\n"
                 + "config_revision = 1\n"
                 + "default_access_mode = \"approval_required\"\n"
                 + "default_provider_id = \"provider_turn_mcp\"\n"

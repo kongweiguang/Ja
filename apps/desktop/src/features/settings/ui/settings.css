@@ -271,32 +271,61 @@
   font-size: var(--ja-text-control-size);
   font-weight: var(--ja-weight-semibold);
 }
-.ja-settings-recovery {
+.ja-settings-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.ja-settings-configuration-notice {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 24px;
-  border-bottom: 1px solid
-    color-mix(in srgb, var(--ja-warning, #bd7a00) 36%, var(--border-settings-subtle));
-  color: var(--text-settings-primary);
-  background: color-mix(in srgb, var(--ja-warning, #bd7a00) 10%, var(--surface-settings-elevated));
+  min-height: 42px;
+  padding: 6px 18px;
+  border-bottom: 1px solid var(--border-settings-subtle);
+  color: var(--text-settings-secondary);
+  background: color-mix(in srgb, var(--ja-warning, #bd7a00) 7%, var(--surface-settings-elevated));
+  font-size: var(--ja-text-caption-size);
 }
-.ja-settings-recovery > div {
-  min-width: 0;
+.ja-settings-issues-list {
+  display: grid;
+  gap: 0;
 }
-.ja-settings-recovery strong {
+.ja-settings-issue {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 56px;
+  padding: 14px 0;
+  border-top: 1px solid var(--ja-border);
+}
+.ja-settings-issue:first-child {
+  border-top: 0;
+}
+.ja-settings-issue strong {
   display: block;
+  margin-bottom: 3px;
+  color: var(--ja-foreground);
   font-size: var(--ja-text-control-size);
   font-weight: var(--ja-weight-semibold);
 }
-.ja-settings-recovery p {
-  margin: 3px 0 0;
+.ja-settings-issue p {
+  min-width: 0;
+  margin: 0;
   color: var(--text-settings-secondary);
   font-size: var(--ja-text-caption-size);
 }
-.ja-settings-recovery > button {
+.ja-settings-issue > div {
+  display: flex;
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.ja-settings-issues-sheet {
+  width: min(520px, calc(100vw - 24px));
 }
 .ja-settings-update-button {
   position: relative;
@@ -1329,14 +1358,19 @@
     flex-basis: 46px;
     padding: 0 16px;
   }
-  .ja-settings-recovery {
-    align-items: stretch;
+  .ja-settings-toolbar-actions {
+    gap: 2px;
+  }
+  .ja-settings-issues {
+    padding: 10px 16px 12px;
+  }
+  .ja-settings-issue {
+    align-items: flex-start;
     flex-direction: column;
     gap: 8px;
-    padding: 10px 16px;
   }
-  .ja-settings-recovery > button {
-    align-self: flex-start;
+  .ja-settings-issue > div {
+    justify-content: flex-start;
   }
   .ja-settings-panel {
     padding: 24px 20px 40px;

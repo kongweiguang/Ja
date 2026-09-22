@@ -57,6 +57,14 @@ public final class ConfigurationApplicationService implements ConfigurationUseCa
         return runtime.reset(scope, workspaceRoot, expectedVersion);
     }
 
+    /**
+     * 恢复没有工作区语义的用户级快照；调用者不能借此把历史项目配置跨工作区复活。
+     */
+    @Override
+    public MutationResult restoreLastKnownGood(String expectedVersion) {
+        return runtime.restoreLastKnownGood(expectedVersion);
+    }
+
     /** Secret 仅穿过该命令边界到达凭据适配器，应用层不缓存输入。 */
     @Override
     public CredentialResult setCredential(String credentialId, String secret, String expectedVersion) {

@@ -2,11 +2,12 @@
 <!-- @author kongweiguang -->
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.RecoveryMapper">
-  <resultMap id="recoveryToolRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolRow">
+  <resultMap id="recoveryToolRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$RecoveryToolRow">
     <constructor>
       <arg column="call_id" javaType="string"/><arg column="state" javaType="string"/>
       <arg column="revision" javaType="_long"/><arg column="ordinal" javaType="_int"/>
       <arg column="tool_name" javaType="string"/><arg column="side_effect" javaType="string"/>
+      <arg column="presentation_json" javaType="string"/>
     </constructor>
   </resultMap>
   <select id="selectRecoveryThreadIds" resultType="string">
@@ -46,7 +47,7 @@
   </update>
   <delete id="deleteExecution">DELETE FROM turn_execution WHERE turn_id=#{turnId}</delete>
   <select id="selectRecoveryTool" resultMap="recoveryToolRow">
-    SELECT call_id,state,revision,ordinal,tool_name,side_effect FROM tools
+    SELECT call_id,state,revision,ordinal,tool_name,side_effect,presentation_json FROM tools
     WHERE turn_id=#{turnId} AND ordinal=#{ordinal}
   </select>
   <select id="hasPendingInteraction" resultType="boolean">
@@ -67,6 +68,57 @@
       json_array(json_object('kind','tool_result','callId',#{callId},'content',#{content},'error',json('true'))),
       #{occurredAt})
   </insert>
+  <insert id="insertUnknownToolRecovery">
+    INSERT INTO tool_recoveries(recovery_id,thread_id,turn_id,call_id,evidence_kind,state,recovery_revision,
+      created_at,updated_at)
+    VALUES(#{recoveryId},#{threadId},#{turnId},#{callId},'NONE','PENDING',1,#{occurredAt},#{occurredAt})
+    ON CONFLICT(call_id) DO NOTHING
+  </insert>
+  <select id="selectToolRecovery"
+      resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolRecoveryRow">
+    SELECT recovery_id AS recoveryId,thread_id AS threadId,turn_id AS turnId,call_id AS callId,
+      evidence_kind AS evidenceKind,state,recovery_revision AS recoveryRevision,
+      target_relative_path AS targetRelativePath,expected_after_sha256 AS expectedAfterSha256,
+      expected_after_bytes AS expectedAfterBytes,idempotency_key AS idempotencyKey
+    FROM tool_recoveries WHERE call_id=#{callId}
+  </select>
+  <update id="markToolRecoveryPending">
+    UPDATE tool_recoveries
+    SET state='PENDING', recovery_revision=CASE WHEN state='PENDING' THEN recovery_revision ELSE recovery_revision+1 END,
+      idempotency_key=NULL, verified_at=NULL, resolved_at=NULL, updated_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND call_id=#{callId}
+  </update>
+  <select id="selectPendingToolRecovery"
+      resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolRecoveryRow">
+    SELECT r.recovery_id AS recoveryId,r.thread_id AS threadId,r.turn_id AS turnId,r.call_id AS callId,
+      r.evidence_kind AS evidenceKind,r.state,r.recovery_revision AS recoveryRevision,
+      r.target_relative_path AS targetRelativePath,r.expected_after_sha256 AS expectedAfterSha256,
+      r.expected_after_bytes AS expectedAfterBytes,r.idempotency_key AS idempotencyKey
+    FROM tool_recoveries r JOIN tools x ON x.call_id=r.call_id JOIN turns t ON t.turn_id=r.turn_id
+    WHERE r.turn_id=#{turnId} AND r.state='PENDING' AND x.state='RUNNING' AND t.state='SUSPENDED'
+    ORDER BY x.ordinal LIMIT 1
+  </select>
+  <update id="resolveToolRecovery">
+    UPDATE tool_recoveries SET state=#{state},recovery_revision=recovery_revision+1,
+      idempotency_key=#{idempotencyKey},resolved_at=#{occurredAt},
+      verified_at=CASE WHEN #{state}='VERIFIED' THEN #{occurredAt} ELSE NULL END,updated_at=#{occurredAt}
+    WHERE recovery_id=#{recoveryId} AND state='PENDING' AND recovery_revision=#{expectedRecoveryRevision}
+  </update>
+  <insert id="insertToolRecoveryAttempt">
+    INSERT INTO tool_recovery_attempts(recovery_attempt_id,recovery_id,attempt_number,disposition,idempotency_key,created_at)
+    VALUES(#{attemptId},#{recoveryId},#{attemptNumber},#{disposition},#{idempotencyKey},#{occurredAt})
+  </insert>
+  <insert id="insertToolRecoveryAttemptIgnore">
+    INSERT OR IGNORE INTO tool_recovery_attempts(recovery_attempt_id,recovery_id,attempt_number,disposition,idempotency_key,created_at)
+    VALUES(#{attemptId},#{recoveryId},#{attemptNumber},#{disposition},#{idempotencyKey},#{occurredAt})
+  </insert>
+  <select id="countToolRecoveryAttempts" resultType="int">
+    SELECT COUNT(*) FROM tool_recovery_attempts WHERE recovery_id=#{recoveryId}
+  </select>
+  <update id="retryRecoveredTool">
+    UPDATE tools SET state='PREPARED',presentation_json=#{presentationJson},revision=revision+1,updated_at=#{occurredAt}
+    WHERE turn_id=#{turnId} AND call_id=#{callId} AND state='RUNNING'
+  </update>
   <update id="denyExpiredApprovals">
     UPDATE approvals SET decision='DENY',resolved_at=#{occurredAt}
     WHERE turn_id=#{turnId} AND decision IS NULL AND expires_at&lt;#{occurredAt}

@@ -33,11 +33,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 验证 Ja 0.1.0 只接受事务化 V1/V2/V3 以及严格的 Flyway/SQLite 启动准入。 */
+/** 验证 Ja 只接受事务化 V1 至 V4 以及严格的 Flyway/SQLite 启动准入。 */
 final class JaDatabaseV1Test {
     private static final Set<String> DOMAIN_TABLES = Set.of(
             "acceptance_criteria", "acceptance_evidence", "approvals", "attachment_blobs", "attachments",
-            "change_set_artifacts", "context_checkpoints", "execution_runs", "goal_acceptance_criteria",
+            "change_set_artifacts", "context_checkpoints", "context_projection_entries",
+            "context_projection_stages", "execution_runs", "goal_acceptance_criteria",
             "goal_continuation_leases", "goal_definition_revisions", "goal_evaluations", "goal_events",
             "goal_plan_links", "goal_tool_attempts", "goals", "message_attachments",
             "messages", "pending_input_attachments", "pending_inputs", "plan_approvals", "plan_drafts",
@@ -47,24 +48,24 @@ final class JaDatabaseV1Test {
             "threads", "temporary_side_chats", "timeline_messages", "tool_artifacts", "tool_bindings", "tools", "turn_change_sets",
             "thread_subagent_policies", "turn_execution", "turn_internal_context", "turns", "usage",
             "workspace_write_claims", "interaction_requests", "interaction_drafts", "interaction_events",
-            "plan_turn_claims", "plan_evaluation_requests",
+            "plan_turn_claims", "plan_evaluation_requests", "tool_recoveries", "tool_recovery_attempts",
             "workspaces");
 
     @TempDir Path temp;
 
-    /** 空库一次创建完整领域结构；再次启动只能验证同一 V3，不会产生第二条 history。 */
+    /** 空库一次创建完整领域结构；再次启动只能验证同一 V4，不会产生第二条 history。 */
     @Test
-    void initializesCompleteV2AndReopensWithoutMigration() throws Exception {
+    void initializesCompleteV4AndReopensWithoutMigration() throws Exception {
         Path databasePath = temp.resolve("fresh").resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
             // 首次 close 同样走生产 WAL checkpoint，确保 lease 在完整生命周期后释放。
         }
 
-        assertCurrentV2(databasePath);
+        assertCurrentV4(databasePath);
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 当前 V2 只做 checksum 和完整性验证。
+            // 当前 V4 只做 checksum 和完整性验证。
         }
-        assertCurrentV2(databasePath);
+        assertCurrentV4(databasePath);
     }
 
     /** 未带 Flyway history 的非空 schema 明确拒绝，原表保留且失败后 lease 可重新获取。 */
@@ -113,8 +114,8 @@ final class JaDatabaseV1Test {
         Path databasePath = initialized("future");
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            statement.executeUpdate("UPDATE flyway_schema_history SET version='4',description='future' "
-                    + "WHERE version='3'");
+            statement.executeUpdate("UPDATE flyway_schema_history SET version='5',description='future' "
+                    + "WHERE version='4'");
         }
 
         StorageException failure = assertThrows(StorageException.class,
@@ -123,8 +124,8 @@ final class JaDatabaseV1Test {
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals("4", text(statement,
-                    "SELECT version FROM flyway_schema_history WHERE version='4' AND success=1"));
+            assertEquals("5", text(statement,
+                    "SELECT version FROM flyway_schema_history WHERE version='5' AND success=1"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -177,7 +178,7 @@ final class JaDatabaseV1Test {
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals(4, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(5, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -286,7 +287,7 @@ final class JaDatabaseV1Test {
         }
     }
 
-    /** V1 中途失败必须回滚全部领域 DDL；同一文件随后可用正式 V3 完成初始化。 */
+    /** V1 中途失败必须回滚全部领域 DDL；同一文件随后可用正式 V4 完成初始化。 */
     @Test
     void rollsBackInterruptedV1AndAllowsRetry() throws Exception {
         Path databasePath = temp.resolve("retry").resolve("ja.db");
@@ -305,12 +306,12 @@ final class JaDatabaseV1Test {
         }
 
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 失败 migration 没有发布领域表或占住 lease，正式 V3 可以原位重试。
+            // 失败 migration 没有发布领域表或占住 lease，正式 V4 可以原位重试。
         }
-        assertCurrentV2(databasePath);
+        assertCurrentV4(databasePath);
     }
 
-    /** 创建并完整关闭一个真实 V3，所有后续漂移测试都从同一生产路径出发。 */
+    /** 创建并完整关闭一个真实 V4，所有后续漂移测试都从同一生产路径出发。 */
     private Path initialized(String name) {
         Path databasePath = temp.resolve(name).resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
@@ -329,8 +330,8 @@ final class JaDatabaseV1Test {
         return database;
     }
 
-    /** 当前 schema 由 V1/V2/V3 成功 history、完整领域表集和格式约束共同定义。 */
-    private static void assertCurrentV2(Path databasePath) throws Exception {
+    /** 当前 schema 由 V1 至 V4 成功 history、完整领域表集和格式约束共同定义。 */
+    private static void assertCurrentV4(Path databasePath) throws Exception {
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
             assertEquals(DOMAIN_TABLES, tableNames(statement));
@@ -340,7 +341,9 @@ final class JaDatabaseV1Test {
                     + "WHERE version='2' AND success=1"));
             assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
                     + "WHERE version='3' AND success=1"));
-            assertEquals(3, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='4' AND success=1"));
+            assertEquals(4, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
             assertEquals("ok", text(statement, "PRAGMA integrity_check"));
             assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
             assertEquals(0, number(statement, "SELECT last_generation FROM task_process_generation "
@@ -350,13 +353,18 @@ final class JaDatabaseV1Test {
             assertRequired(connection, "threads", "access_mode");
             assertRequired(connection, "threads", "title_source");
             assertRequired(connection, "usage", "profile_json");
+            assertRequired(connection, "usage", "input_accounting");
             assertRequired(connection, "interaction_requests", "thread_id");
             assertRequired(connection, "interaction_requests", "tool_call_id");
+            assertTrue(columnNames(connection, "usage").containsAll(Set.of(
+                    "cache_read_tokens", "cache_write_tokens", "new_input_tokens", "input_accounting")));
             assertFalse(columnNames(connection, "usage").contains("profile_origin"));
             Set<String> indexes = indexNames(statement);
             assertFalse(indexes.contains("idx_messages_thread_ordinal"));
             assertFalse(indexes.contains("idx_context_checkpoints_thread_source"));
             assertFalse(indexes.contains("idx_instruction_scopes_thread_directory"));
+            assertTrue(indexes.contains("ix_tool_recoveries_turn_pending"));
+            assertTrue(indexes.contains("ix_context_projection_stages_thread"));
             String checkpoint = schemaSql(statement, "context_checkpoints");
             assertTrue(checkpoint.contains("strategy_version = 'ja-context-v1'"));
             String execution = schemaSql(statement, "turn_execution");

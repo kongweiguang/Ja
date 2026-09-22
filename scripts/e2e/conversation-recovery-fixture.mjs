@@ -49,18 +49,53 @@ export function responseStream(text, id = "recovery") {
     .join("");
 }
 
-/** HTTP 请求记录按最后一个用户标记分类，避免标题请求与历史失败标记污染重试计数。 */
+/**
+ * 只提取 Provider 原生 input 中最后一条 user message 的文本。续答标记会保留在历史中，不能以整段
+ * JSON 搜索判断当前操作；缺少结构化 message 时保留字符串 fallback 给 fixture 的最小 HTTP 用例。
+ */
+function latestUserText(input) {
+  if (!Array.isArray(input)) return typeof input === "string" ? input : undefined;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const message = input[index];
+    if (message === null || typeof message !== "object" || message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) continue;
+    return message.content
+      .filter((block) => block !== null && typeof block === "object" && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("\n");
+  }
+  return undefined;
+}
+
+/** HTTP 请求按当前用户输入分类，历史中的“继续”和旧 Turn 标记绝不能污染下一次操作。 */
 export function requestStep(payload) {
   if (String(payload.instructions ?? "").includes("context compaction model")) return "summary";
   const input = JSON.stringify(payload.input ?? []);
   if (input.includes("<user_request>") && input.includes("<assistant_reply>")) return "title";
-  return [...input.matchAll(/JA_RECOVERY_TURN_(\d+)/gu)].at(-1)?.[1] ?? "other";
+  const currentUserText = latestUserText(payload.input);
+  if (currentUserText?.trim() === "继续") return "continue";
+  return [...(currentUserText ?? input).matchAll(/JA_RECOVERY_TURN_(\d+)/gu)].at(-1)?.[1] ?? "other";
+}
+
+/**
+ * 续答必须带入失败前的对话，但不能克隆原问题或由运行时重新发起旧 Tool；只保存脱敏计数，
+ * 让真窗脚本验证历史语义而不把完整请求正文写进报告。
+ */
+function continuationContext(payload) {
+  const input = JSON.stringify(payload.input ?? []);
+  return {
+    originalPromptCount: [...input.matchAll(/JA_RECOVERY_TURN_1/gu)].length,
+    continueMessageCount: [...input.matchAll(/"继续"/gu)].length,
+    replayedToolCallCount: [...input.matchAll(/"function_call"/gu)].length,
+  };
 }
 
 /** 只启动随机 loopback listener；gate 让真窗在上游完成前测量动画几何，不依赖 sleep。 */
 export async function startRecoveryFixture() {
   const attempts = [];
   let summaryFailure = true;
+  let continuationRequest = 0;
   let release;
   const gate = new Promise((done) => {
     release = done;
@@ -78,9 +113,32 @@ export async function startRecoveryFixture() {
       }
       const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const step = requestStep(payload);
-      const fails = ["1", "2", "3"].includes(step) || (step === "summary" && summaryFailure);
-      attempts.push({ step, status: fails ? 503 : 200 });
-      if (step === "4") await gate;
+      const currentContinuationRequest = step === "continue" ? ++continuationRequest : undefined;
+      // Provider 对同一续答最多重试三次。把第二个用户续答的三条请求归入同一逻辑尝试，避免夹具
+      // 在第一次 503 后给重试错误地返回成功，掩盖失败终态与“继续回复”恢复入口。
+      const currentContinuationAttempt =
+        currentContinuationRequest === undefined
+          ? undefined
+          : currentContinuationRequest === 1
+            ? 1
+            : currentContinuationRequest <= 4
+              ? 2
+              : 3;
+      const fails =
+        ["1", "2", "3"].includes(step) ||
+        (step === "continue" && currentContinuationAttempt === 2) ||
+        (step === "summary" && summaryFailure);
+      attempts.push({
+        step,
+        status: fails ? 503 : 200,
+        ...(currentContinuationAttempt === undefined
+          ? {}
+          : {
+              continuationAttempt: currentContinuationAttempt,
+              continuationContext: continuationContext(payload),
+            }),
+      });
+      if (step === "continue" && currentContinuationAttempt === 1) await gate;
       if (fails) {
         response.writeHead(503, { "content-type": "application/json" });
         response.end(
@@ -98,7 +156,9 @@ export async function startRecoveryFixture() {
             ? summaryDocument(payload)
             : step === "title"
               ? "恢复验收"
-              : `JA_RECOVERY_SUCCESS_${step}`,
+              : step === "continue"
+                ? `JA_RECOVERY_CONTINUE_SUCCESS_${currentContinuationAttempt}`
+                : `JA_RECOVERY_SUCCESS_${step}`,
           `${step}_${attempts.length}`,
         );
         response.writeHead(200, {

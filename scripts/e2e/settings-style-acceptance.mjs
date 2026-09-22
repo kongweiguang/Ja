@@ -11,7 +11,7 @@
 import { createServer } from "vite";
 import { chromium, expect } from "@playwright/test";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -93,6 +93,20 @@ async function createNativeProbeDirectories(frontendPort) {
   return { ...directories, configPath };
 }
 
+/**
+ * 为独立 profile 放入唯一的 Ja Skill，使真窗能验证一次完整的“发现 -> 授权 -> 权威回读”流程，
+ * 又不依赖或写入开发机已有的用户级 Skill。
+ */
+async function seedNativeSkillFixture(userProfile) {
+  const skillDirectory = join(userProfile, ".ja", "skills", "native-probe-skill");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: native-probe-skill\ndescription: 仅供隔离真窗验收的最小 Skill。\n---\n\n# Native probe\n",
+    "utf8",
+  );
+}
+
 /** 等待本轮 WebView2 CDP listener；没有 listener 时保留 launcher 日志并失败关闭。 */
 async function waitForNativeCdp(port, child, stdout, stderr) {
   const deadline = Date.now() + 300_000;
@@ -113,14 +127,136 @@ async function waitForNativeCdp(port, child, stdout, stderr) {
   );
 }
 
-/** 在真实 WebView2 中只读取首屏并尝试进入设置，证明独立 profile/CDP 没有误连用户实例。 */
-async function inspectNativeSettings(cdpPort, evidencePath) {
+/**
+ * 原生 probe 的子进程与诊断缓冲只归本 runner 所有；统一启动路径让预热与正式 CDP 实例保持
+ * 相同的 Tauri、JDK 和隔离目录配置。
+ */
+function launchNativeTauri(pnpm, configPath, environment) {
+  const stdout = [];
+  const stderr = [];
+  const child = spawn(pnpm, ["tauri", "dev", "--no-watch", "--config", configPath], {
+    cwd: repoRoot,
+    env: environment,
+    shell: true,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout?.on("data", (chunk) => stdout.push(String(chunk).slice(-2000)));
+  child.stderr?.on("data", (chunk) => {
+    const message = String(chunk);
+    stderr.push(message.slice(-2000));
+    if (/Compiling ja |Finished |Running |error:/u.test(message)) process.stdout.write(message);
+  });
+  return { child, stdout, stderr };
+}
+
+/** 只回收本函数启动的 launcher PID 树，不能枚举或影响其它 Ja、Edge 或开发进程。 */
+async function stopNativeTauri(child) {
+  if (child.pid === undefined || child.exitCode !== null) return;
+  await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+    windowsHide: true,
+    timeout: 15_000,
+  }).catch(() => undefined);
+}
+
+/**
+ * 新 WebView2 profile 首启可能忽略调试端口；先在完全相同的隔离 profile 中完成持久化初始化，
+ * 再启动正式 CDP 实例，避免把首启平台时序误判成产品连接失败。
+ */
+async function prewarmNativeProfile(pnpm, configPath, environment, profile) {
+  const primeEnvironment = { ...environment };
+  delete primeEnvironment.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
+  const launch = launchNativeTauri(pnpm, configPath, primeEnvironment);
+  const deadline = Date.now() + 120_000;
+  try {
+    while (Date.now() < deadline) {
+      if (launch.child.exitCode !== null) {
+        throw new Error(`native profile prewarm exited: ${launch.stderr.join("").slice(-1500)}`);
+      }
+      try {
+        const [localState, preferences] = await Promise.all([
+          stat(join(profile, "EBWebView", "Local State")),
+          stat(join(profile, "EBWebView", "Default", "Preferences")),
+        ]);
+        if (localState.size > 0 && preferences.size > 0) return;
+      } catch {
+        // profile 首启按多个子目录逐步落盘，只有两份稳定文件都存在才结束预热。
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
+    }
+    throw new Error(`native profile prewarm timed out: ${launch.stderr.join("").slice(-1500)}`);
+  } finally {
+    await stopNativeTauri(launch.child);
+  }
+}
+
+/**
+ * 真窗验收以 native owner 的只读状态与可访问状态同时确认就绪；超时证据只保留稳定状态和
+ * generation，避免将用户内容、路径或 App Server 诊断写入截图/报告。
+ */
+async function waitForNativeRuntimeReady(page, evidencePath) {
+  const deadline = Date.now() + 60_000;
+  const connected = page.getByRole("status", { name: "本地运行时：已连接" });
+  let state = { status: "unavailable" };
+  while (Date.now() < deadline) {
+    state = await page
+      .evaluate(async () => {
+        try {
+          const value = await globalThis.__TAURI_INTERNALS__?.invoke?.("ja_runtime_state");
+          const candidate = value !== null && typeof value === "object" ? value : {};
+          return {
+            status: typeof candidate.status === "string" ? candidate.status : "invalid",
+            generation: Number.isSafeInteger(candidate.generation) ? candidate.generation : undefined,
+          };
+        } catch {
+          return { status: "unavailable" };
+        }
+      })
+      .catch(() => ({ status: "unavailable" }));
+    if (state.status === "ready" && (await connected.isVisible().catch(() => false))) return;
+    if (["crashed", "faulted", "incompatible", "recovery_required"].includes(state.status)) break;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+  }
+  await page.screenshot({
+    path: join(evidencePath, "native-runtime-not-ready.png"),
+    animations: "disabled",
+  });
+  throw new Error(`native runtime did not become ready: ${JSON.stringify(state)}`);
+}
+
+/**
+ * 首次启动可能在“设置”按钮可见后自动转入设置页；因此只在按钮仍稳定可点时触发导航，并持续
+ * 以实际 Settings 根节点为完成事实，避免把路由切换中的瞬态按钮当成失败。
+ */
+async function openNativeSettings(page) {
+  const settings = page.locator(".ja-settings");
+  const settingsButton = page.getByRole("button", { name: "设置", exact: true });
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (await settings.isVisible().catch(() => false)) return;
+    if (await settingsButton.isVisible().catch(() => false)) {
+      await settingsButton.click({ timeout: Math.min(1_000, Math.max(1, deadline - Date.now())) }).catch(
+        () => undefined,
+      );
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  throw new Error("native settings did not become visible");
+}
+
+/**
+ * 在真实 WebView2 中从首屏进入设置并完成一个来源标识的授权回读，证明独立 profile/CDP
+ * 没有误连用户实例，也没有把预览中的本地状态误当成持久化成功。
+ */
+async function inspectNativeSettings(cdpPort, evidencePath, userProfile) {
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
   try {
     const page = browser.contexts().flatMap((context) => context.pages())[0];
     if (page === undefined) throw new Error("native probe found no WebView2 page");
     await page.setViewportSize({ width: 1280, height: 820 });
     await page.waitForLoadState("domcontentloaded");
+    // 设置依赖 App Server 的权威配置快照；不能在“连接中”时把启动竞态误判为设置导航故障。
+    await waitForNativeRuntimeReady(page, evidencePath);
     await expect
       .poll(
         async () =>
@@ -133,13 +269,32 @@ async function inspectNativeSettings(cdpPort, evidencePath) {
       path: join(evidencePath, "native-first-window.png"),
       animations: "disabled",
     });
-    const settingsButton = page.getByRole("button", { name: "设置", exact: true });
-    if (!(await page.locator(".ja-settings").isVisible())) {
-      await settingsButton.click();
-    }
-    await expect(page.locator(".ja-settings")).toBeVisible({ timeout: 30_000 });
+    await openNativeSettings(page);
     await page.screenshot({
       path: join(evidencePath, "native-settings.png"),
+      animations: "disabled",
+    });
+    await page.getByRole("tab", { name: "Skills", exact: true }).click();
+    await expect(page.locator(".ja-skill-scope")).toBeVisible({ timeout: 30_000 });
+    await page.screenshot({
+      path: join(evidencePath, "native-skills.png"),
+      animations: "disabled",
+    });
+    const nativeSkill = page.getByRole("switch", { name: "native-probe-skill：已停用" });
+    await expect(nativeSkill).toBeVisible({ timeout: 30_000 });
+    await nativeSkill.click();
+    await expect(
+      page.getByRole("switch", { name: "native-probe-skill：已启用" }),
+    ).toHaveAttribute("aria-checked", "true", { timeout: 30_000 });
+    const configPath = join(userProfile, ".ja", "config.toml");
+    await expect
+      .poll(async () => readFile(configPath, "utf8").catch(() => ""), { timeout: 30_000 })
+      .toMatch(/schema_version\s*=\s*2[\s\S]*skills\s*=\s*\[[\s\S]*"ja:native-probe-skill"/u);
+    const persistedConfig = await readFile(configPath, "utf8");
+    if (persistedConfig.includes("[[skills]]"))
+      throw new Error("native skill persistence retained legacy [[skills]] entries");
+    await page.screenshot({
+      path: join(evidencePath, "native-skills-enabled.png"),
       animations: "disabled",
     });
     return {
@@ -147,6 +302,8 @@ async function inspectNativeSettings(cdpPort, evidencePath) {
       url: page.url(),
       title: await page.title(),
       settingsVisible: true,
+      skillsVisible: true,
+      skillsPersisted: true,
     };
   } finally {
     await browser.close();
@@ -159,13 +316,12 @@ async function runNativeProbe() {
   const frontendPort = await allocateLoopbackPort();
   const cdpPort = await allocateLoopbackPort();
   const directories = await createNativeProbeDirectories(frontendPort);
+  await seedNativeSkillFixture(directories.userProfile);
   const javaHome = process.env.JA_E2E_JAVA_HOME?.trim() || process.env.JAVA_HOME?.trim();
   if (javaHome === undefined) throw new Error("native settings probe requires JA_E2E_JAVA_HOME");
   const javaExecutable = join(javaHome, "bin", "java.exe");
   const jar = join(repoRoot, "app-server", "target", "ja-app-server.jar");
   const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
-  const stdout = [];
-  const stderr = [];
   const environment = {
     ...process.env,
     // 隔离应用用户目录不应隐藏宿主已安装工具链；只读复用工具缓存，产物仍独立。
@@ -184,6 +340,8 @@ async function runNativeProbe() {
     JA_TEST_JAVA: javaExecutable,
     LOCALAPPDATA: directories.localAppData,
     PATH: `${join(javaHome, "bin")};${process.env.PATH ?? ""}`,
+    // overlay 的 devUrl 固定 IPv4 loopback；Vite 默认 localhost 可能只绑定 ::1，必须同址监听。
+    TAURI_DEV_HOST: "127.0.0.1",
     USERPROFILE: directories.userProfile,
     VITE_JA_E2E_PROJECT_PATH: directories.workspace,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-port=${cdpPort}`,
@@ -201,22 +359,11 @@ async function runNativeProbe() {
     windowsHide: true,
     timeout: 15_000,
   });
-  const child = spawn(pnpm, ["tauri", "dev", "--no-watch", "--config", directories.configPath], {
-    cwd: repoRoot,
-    env: environment,
-    shell: true,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout?.on("data", (chunk) => stdout.push(String(chunk).slice(-2000)));
-  child.stderr?.on("data", (chunk) => {
-    const message = String(chunk);
-    stderr.push(message.slice(-2000));
-    if (/Compiling ja |Finished |Running |error:/u.test(message)) process.stdout.write(message);
-  });
+  await prewarmNativeProfile(pnpm, directories.configPath, environment, directories.profile);
+  const { child, stdout, stderr } = launchNativeTauri(pnpm, directories.configPath, environment);
   try {
     await waitForNativeCdp(cdpPort, child, stdout, stderr);
-    const observation = await inspectNativeSettings(cdpPort, directories.root);
+    const observation = await inspectNativeSettings(cdpPort, directories.root, directories.userProfile);
     await writeFile(
       join(directories.root, "native-report.json"),
       `${JSON.stringify(observation, null, 2)}\n`,
@@ -226,12 +373,7 @@ async function runNativeProbe() {
       `JA_SETTINGS_NATIVE_PROBE_OK root=${directories.root} cdpPort=${cdpPort} pid=${child.pid}\n`,
     );
   } finally {
-    if (child.pid !== undefined && child.exitCode === null) {
-      await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
-        windowsHide: true,
-        timeout: 15_000,
-      }).catch(() => undefined);
-    }
+    await stopNativeTauri(child);
   }
 }
 
@@ -254,7 +396,31 @@ async function startPreviewServer() {
     ],
   });
   await server.listen();
-  return server;
+  const origin = server.resolvedUrls?.local[0];
+  if (origin === undefined) {
+    await server.close();
+    throw new Error("settings style preview server did not publish a local URL");
+  }
+  await waitForPreviewServer(origin);
+  return { server, origin: new URL(origin).origin };
+}
+
+/**
+ * Vite 的项目配置拥有实际端口；首次预构建也可能晚于 listen promise，因此只能从其已解析 URL
+ * 回读并确认入口可用，不能假设测试内联端口会胜出。
+ */
+async function waitForPreviewServer(origin) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(origin);
+      if (response.ok) return;
+    } catch {
+      // 首次优化期间 listener 可能短暂尚未就绪，继续在固定预算内等待。
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  throw new Error("settings style preview server did not become ready");
 }
 
 /** 让 HTML 入口加载真实 Settings fixture，而不是另写一套静态 HTML 假页面。 */
@@ -347,6 +513,21 @@ async function inspectSections(page, metadata, prefix) {
     await expect(page.getByRole("tabpanel", { name: label, exact: true })).toBeVisible();
     await assertLayout(page, `${prefix}/${label}`);
     await capture(page, `${prefix}-${label}`, metadata);
+    if (label === "Skills") {
+      const scope = page.locator(".ja-skill-scope");
+      const global = scope.getByRole("tab", { name: "全局", exact: true });
+      const project = scope.getByRole("tab", { name: "当前项目", exact: true });
+      await expect(global).toBeVisible();
+      await expect(project).toBeVisible();
+      await global.click();
+      await expect(scope.getByRole("switch")).toHaveCount(2);
+      await assertLayout(page, `${prefix}/Skills-global`);
+      await capture(page, `${prefix}-Skills-global`, metadata);
+      await project.click();
+      await expect(scope.getByText("project-rules", { exact: true })).toBeVisible();
+      await assertLayout(page, `${prefix}/Skills-project`);
+      await capture(page, `${prefix}-Skills-project`, metadata);
+    }
   }
 }
 
@@ -396,8 +577,8 @@ async function exerciseWorkflows(page, metadata) {
 }
 
 /** 验证首次进入设置时每个空态只保留一个明确的下一步，避免重复 CTA 造成决策负担。 */
-async function exerciseEmptyStates(page, metadata) {
-  await page.goto(`http://127.0.0.1:${previewPort}/?state=empty`, { waitUntil: "networkidle" });
+async function exerciseEmptyStates(page, metadata, origin) {
+  await page.goto(`${origin}/?state=empty`, { waitUntil: "networkidle" });
   await expect(page.getByRole("tab", { name: "通用", exact: true })).toBeVisible();
 
   await page.getByRole("tab", { name: "Skills", exact: true }).click();
@@ -423,7 +604,7 @@ async function exerciseEmptyStates(page, metadata) {
 async function main() {
   await mkdir(evidenceDirectory, { recursive: true });
   const metadata = { screenshots: [], modes: [], pageErrors: [], requestFailures: [] };
-  const server = await startPreviewServer();
+  const preview = await startPreviewServer();
   const browser = await chromium.launch({ channel: "msedge", headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 820 } });
   page.on("pageerror", (error) => metadata.pageErrors.push(error.message));
@@ -434,13 +615,13 @@ async function main() {
   );
   try {
     await page.route(
-      (url) => url.origin === `http://127.0.0.1:${previewPort}` && url.pathname === "/",
+      (url) => url.origin === preview.origin && url.pathname === "/",
       async (route) => {
         const response = await route.fetch();
         await route.fulfill({ response, body: previewHtml(await response.text()) });
       },
     );
-    await page.goto(`http://127.0.0.1:${previewPort}/`, { waitUntil: "networkidle" });
+    await page.goto(`${preview.origin}/`, { waitUntil: "networkidle" });
     if ((await page.getByRole("tab", { name: "通用", exact: true }).count()) === 0) {
       throw new Error(
         `settings preview did not mount; errors=${metadata.pageErrors.join(" | ")} body=${(await page.locator("body").innerText()).slice(0, 1200)}`,
@@ -533,7 +714,7 @@ async function main() {
       { width: 1280, height: 820 },
     );
     await exerciseWorkflows(page, metadata);
-    await exerciseEmptyStates(page, metadata);
+    await exerciseEmptyStates(page, metadata, preview.origin);
     metadata.pageErrors = [...new Set(metadata.pageErrors)];
     metadata.requestFailures = [...new Set(metadata.requestFailures)];
     await writeFile(
@@ -550,7 +731,7 @@ async function main() {
     );
   } finally {
     await browser.close();
-    await server.close();
+    await preview.server.close();
   }
 }
 

@@ -19,9 +19,23 @@ const PRIMITIVES_FILE = join(
   "primitives.css",
 );
 const APP_STYLES_FILE = join(process.cwd(), "apps", "desktop", "src", "app", "App.css");
+const WORKSPACE_SCOPE_STYLES_FILE = join(
+  process.cwd(),
+  "apps",
+  "desktop",
+  "src",
+  "features",
+  "workspace",
+  "ui",
+  "workspaceScope.css",
+);
 const TOKENS_SOURCE = readFileSync(TOKENS_FILE, "utf8").toLowerCase();
 const PRIMITIVES_SOURCE = readFileSync(PRIMITIVES_FILE, "utf8").toLowerCase();
 const APP_STYLES_SOURCE = readFileSync(APP_STYLES_FILE, "utf8").toLowerCase();
+const WORKSPACE_SCOPE_STYLES_SOURCE = readFileSync(
+  WORKSPACE_SCOPE_STYLES_FILE,
+  "utf8",
+).toLowerCase();
 const PALETTES: readonly Palette[] = ["xcode", "ja", "jetbrains", "obsidian", "claude"];
 const MODES: readonly Mode[] = ["light", "dark"];
 
@@ -208,6 +222,18 @@ describe("five-palette semantic token contract", () => {
         }
       }
     }
+  });
+
+  it("uses the Palette accent for the selected project's normal indicator", () => {
+    expect(WORKSPACE_SCOPE_STYLES_SOURCE).toMatch(
+      /\.ja-workspace-scope-status\.is-ready\s*\{[^}]*background:\s*var\(--ja-accent\);[^}]*\}/u,
+    );
+    expect(WORKSPACE_SCOPE_STYLES_SOURCE).toMatch(
+      /\.ja-workspace-scope-status\.is-busy,[\s\S]*?\.ja-workspace-scope-status\.is-warning\s*\{[^}]*background:\s*var\(--ja-warning\);[^}]*\}/u,
+    );
+    expect(WORKSPACE_SCOPE_STYLES_SOURCE).toMatch(
+      /\.ja-workspace-scope-status\.is-danger\s*\{[^}]*background:\s*var\(--ja-danger\);[^}]*\}/u,
+    );
   });
 
   it("meets 4.5 to 1 for text, focus and primary button in every combination", () => {

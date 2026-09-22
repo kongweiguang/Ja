@@ -1503,8 +1503,38 @@ function applyToolBatchCommitted(
 }
 
 /**
+ * 自动压缩不是模型可调用工具，仍需占据与其发生位置一致的 Timeline 步骤。用本地 context
+ * Presentation 接入既有 Tool 详情组件，可在不扩展 JA-RPC 或持久化模型的前提下保留简短的
+ * 生命周期与安全计量事实；失败只显示稳定错误码，避免把服务端诊断正文泄露到阅读区。
+ */
+function contextCompactionPresentation(
+  phase: ContextCompactionProjection["phase"],
+  inputTokensBefore: number | null,
+  inputTokensAfter: number | null,
+  errorCode: string | undefined,
+): ToolPresentation {
+  const summary =
+    phase === "started"
+      ? "正在整理已完成的对话内容。"
+      : phase === "compacted" && inputTokensBefore !== null && inputTokensAfter !== null
+        ? `上下文已从 ${inputTokensBefore.toLocaleString("zh-CN")} Token 压缩至 ${inputTokensAfter.toLocaleString("zh-CN")} Token。`
+        : phase === "failed"
+          ? `自动压缩未完成：${errorCode ?? "UNKNOWN"}。`
+          : "上下文已压缩。";
+  return {
+    kind: "context",
+    title: "上下文自动压缩",
+    status: phase === "started" ? "running" : phase === "compacted" ? "success" : "error",
+    summary,
+    relativePaths: [],
+    truncated: false,
+  };
+}
+
+/**
  * 投影统一 Context lifecycle。started/failed 不推进 durable revision，只有 compacted receipt
- * 在 Checkpoint CAS 后推进一次；手动事件没有 Turn，因此不会制造虚假 Timeline Turn。
+ * 在 Checkpoint CAS 后推进一次；手动事件没有 Turn，因此不会制造虚假 Timeline Turn。自动事件
+ * 以 compactionId 原位更新为 context Tool Step，确保它留在产生它的回复阅读区而不挤入右侧操作区。
  */
 function applyContextCompactionEvent(
   state: TimelineState,
@@ -1578,17 +1608,20 @@ function applyContextCompactionEvent(
       itemId: `item_compaction_${params.compactionId.slice("cmp_".length)}`,
       threadId: params.threadId,
       turnId: params.turnId,
-      kind: "commentary",
+      kind: "tool_call",
       status: phase === "started" ? "in_progress" : phase === "compacted" ? "completed" : "failed",
-      title:
-        phase === "started"
-          ? "正在压缩上下文"
-          : phase === "compacted"
-            ? "上下文已压缩"
-            : "上下文压缩失败",
+      title: "上下文自动压缩",
       metadata: {
         phase,
         compactionId: params.compactionId,
+        toolName: "context_compaction",
+        toolKind: "context",
+        presentation: contextCompactionPresentation(
+          phase,
+          params.inputTokensBefore,
+          params.inputTokensAfter,
+          errorCode,
+        ),
         inputTokensBefore: params.inputTokensBefore ?? undefined,
         inputTokensAfter: params.inputTokensAfter ?? undefined,
         ...(checkpointId === undefined ? {} : { checkpointId }),

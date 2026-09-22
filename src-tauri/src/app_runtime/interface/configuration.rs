@@ -8,8 +8,9 @@
 
 use crate::app_runtime::{
     ConfigurationPatchParams, ConfigurationReadParams, ConfigurationReplaceParams,
-    ConfigurationRequest, ConfigurationResetParams, ConfigurationResponse, CredentialDeleteParams,
-    CredentialRevealProviderParams, CredentialSetParams, RuntimeCommandError, RuntimeHost,
+    ConfigurationRequest, ConfigurationResetParams, ConfigurationResponse,
+    ConfigurationRestoreParams, CredentialDeleteParams, CredentialRevealProviderParams,
+    CredentialSetParams, RuntimeCommandError, RuntimeHost,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -79,6 +80,13 @@ pub struct ConfigResetInput {
     pub scope: ConfigScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    pub expected_version: String,
+}
+
+/// 从 Java 管理的最近完整用户快照恢复；不携带 scope、路径或配置正文，避免 WebView 扩大恢复范围。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigRestoreInput {
     pub expected_version: String,
 }
 
@@ -246,6 +254,26 @@ pub async fn ja_configuration_reset(
     .map_err(|_| SettingsCommandError::unavailable())?
 }
 
+/// 通过专用恢复命令请求 Java 备份原文并恢复最近完整用户快照。
+#[tauri::command]
+pub async fn ja_configuration_restore(
+    input: ConfigRestoreInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<Value, SettingsCommandError> {
+    validate_restore(&input)?;
+    let host = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let params = serde_json::to_vec(&input).map_err(|_| SettingsCommandError::invalid())?;
+        let request = ConfigurationRequest::Restore(
+            ConfigurationRestoreParams::try_new(params).map_err(SettingsCommandError::from)?,
+        );
+        let value = request_configuration!(&host, request, ConfigurationResponse::Restore)?;
+        validate_write_result(value)
+    })
+    .await
+    .map_err(|_| SettingsCommandError::unavailable())?
+}
+
 /// 转发唯一携带 Secret 的操作；响应进入 WebView 序列化前必须拒绝任何意外 Secret 回显。
 #[tauri::command]
 pub async fn ja_credential_set(
@@ -400,6 +428,11 @@ fn validate_reset(input: &ConfigResetInput) -> Result<(), SettingsCommandError> 
     validate_version(&input.expected_version)
 }
 
+/// 恢复只绑定用户层 CAS；不接受可由 WebView 伪造的配置内容或工作区身份。
+fn validate_restore(input: &ConfigRestoreInput) -> Result<(), SettingsCommandError> {
+    validate_version(&input.expected_version)
+}
+
 /// 凭据只在专用 command 中校验有界、无控制字符的 secret；不解析 provider 语义，也不把 secret 复制到配置文档。
 fn validate_credential(input: &CredentialSetInput) -> Result<(), SettingsCommandError> {
     validate_credential_id(&input.credential_id)?;
@@ -456,6 +489,7 @@ fn validate_redacted_projection(value: Value) -> Result<Value, SettingsCommandEr
         "credentials",
         "cas",
         "diagnostics",
+        "issues",
         "trusted",
         "workspaceId",
     ];
@@ -493,7 +527,81 @@ fn validate_redacted_projection(value: Value) -> Result<Value, SettingsCommandEr
     if object.contains_key("credentialVersion") {
         return Err(SettingsCommandError::unavailable());
     }
+    let issues = object
+        .get("issues")
+        .and_then(Value::as_array)
+        .ok_or_else(SettingsCommandError::unavailable)?;
+    if issues.len() > 64 || issues.iter().any(|issue| !valid_configuration_issue(issue)) {
+        return Err(SettingsCommandError::unavailable());
+    }
     Ok(value)
+}
+
+/// 问题是无原文的 UI 投影；Rust 在转发前固定字段闭集，防止服务端异常对象借配置通道进入 WebView。
+fn valid_configuration_issue(value: &Value) -> bool {
+    let Some(issue) = value.as_object() else {
+        return false;
+    };
+    let expected = [
+        "id", "scope", "field", "entityId", "line", "column", "reason", "impact", "actions",
+    ];
+    if issue.len() != expected.len() || expected.iter().any(|key| !issue.contains_key(*key)) {
+        return false;
+    }
+    let valid_nullable_text = |key: &str, maximum: usize| {
+        matches!(issue.get(key), Some(Value::Null))
+            || issue
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty() && text.len() <= maximum)
+    };
+    let valid_nullable_position = |key: &str| {
+        matches!(issue.get(key), Some(Value::Null))
+            || issue
+                .get(key)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0 && value <= i32::MAX as u64)
+    };
+    let valid_actions = issue
+        .get("actions")
+        .and_then(Value::as_array)
+        .is_some_and(|actions| {
+            actions.len() <= 3
+                && actions
+                    .iter()
+                    .all(|action| matches!(action.as_str(), Some("edit" | "retry" | "restore")))
+        });
+    issue
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("cfg_") && id.len() <= 68)
+        && matches!(
+            issue.get("scope").and_then(Value::as_str),
+            Some("user" | "project" | "credential")
+        )
+        && valid_nullable_text("field", 128)
+        && valid_nullable_text("entityId", 128)
+        && valid_nullable_position("line")
+        && valid_nullable_position("column")
+        && issue
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                reason.len() <= 64
+                    && reason.chars().all(|value| {
+                        value.is_ascii_uppercase() || value.is_ascii_digit() || value == '_'
+                    })
+            })
+        && issue
+            .get("impact")
+            .and_then(Value::as_str)
+            .is_some_and(|impact| {
+                impact.len() <= 64
+                    && impact
+                        .chars()
+                        .all(|value| value.is_ascii_lowercase() || value == '_')
+            })
+        && valid_actions
 }
 
 /// 写入结果只接受稳定的 accepted/scope/version 形状，避免把服务端内部响应透传成新的隐式前端契约。

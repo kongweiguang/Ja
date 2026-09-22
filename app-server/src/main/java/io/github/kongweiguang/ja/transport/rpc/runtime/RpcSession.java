@@ -896,6 +896,17 @@ public final class RpcSession implements AutoCloseable {
         writer.notification("configuration/changed", params);
     }
 
+    /**
+     * 发布配置 Watcher 观察到的变更，但只对已完成握手且仍在运行的连接可见。
+     *
+     * <p>外部编辑可能发生在握手前或 shutdown 后；这些时点没有合法的客户端事件流，静默等待
+     * 随后的权威读取即可。该门禁同时避免 Watcher 线程与连接关闭竞争时向已释放的 Writer 投影。</p>
+     */
+    public void publishObservedConfigurationChange(String scope, String workspaceId, String version) {
+        if (!ready || closing.get()) return;
+        notifyConfigChanged(scope, workspaceId, version);
+    }
+
     /** 发送有界生命周期事件，不包含配置、路径或 Secret。 */
     CompletableFuture<Void> notifyRuntime(String status, String reason) {
         ObjectNode params = mapper.createObjectNode();

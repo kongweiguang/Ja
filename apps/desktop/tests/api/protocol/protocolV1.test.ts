@@ -427,9 +427,9 @@ describe("JA RPC v1 configuration ownership", () => {
       updatedAt: "2026-08-26T00:00:00Z",
     };
     const skill = {
-      skillId: "skill_demo",
+      skillId: "user:demo",
       name: "Demo",
-      scope: "builtin" as const,
+      scope: "user" as const,
       enabled: true,
       status: "healthy" as const,
       description: "demo",

@@ -60,8 +60,14 @@ public interface ConfigurationGenerationSnapshot {
     /** 在指定 Provider 内解析 Model，防止跨 Provider 的同名模型产生歧义。 */
     Model requireModel(String providerId, String modelId);
 
-    /** catalog 可见的 Skill 描述，不携带资源正文。 */
-    record Skill(String skillId, String name, String scope, boolean enabled, String description) {
+    /**
+     * 冻结来源限定的 Skill 授权；描述与正文仍从本 Turn 的发现结果取得，防止配置副本漂移。
+     */
+    record Skill(SkillReference reference) {
+        /** 防御性拒绝空引用，Turn 不得从不完整配置猜测来源。 */
+        public Skill {
+            Objects.requireNonNull(reference, "reference");
+        }
     }
 
     /** Provider 保存稳定连接、凭据引用、网络预算、Agent 默认值和模型目录。 */

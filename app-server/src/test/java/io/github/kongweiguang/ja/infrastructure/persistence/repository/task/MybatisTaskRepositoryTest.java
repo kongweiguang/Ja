@@ -640,7 +640,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             assertEquals(1, afterDetail.mailbox().size());
 
             UserContent skillContent = new UserContent(List.of(
-                    new SkillReferenceContent("skill_cross_workspace"), new TextContent("带 Skill")));
+                    new SkillReferenceContent("user:cross-workspace"), new TextContent("带 Skill")));
             UserContent workspaceContent = new UserContent(List.of(
                     new WorkspaceReferenceContent("ws_task_external", "notes.md",
                             WorkspaceReferenceContent.Kind.FILE), new TextContent("带路径引用")));

@@ -32,7 +32,8 @@ export interface SettingsViewProps {
 
 /**
  * Settings 使用独立 preferences surface，避免全局导航与分类导航竞争；runtime recovery
- * 仍复用唯一确认视图，不能在设置 feature 中复制生命周期决策。
+ * 仍复用唯一确认视图，不能在设置 feature 中复制生命周期决策。切换项目时只有权威快照
+ * 已就绪才开放编辑，避免上一项目的占位投影被提交到新项目。
  */
 export function SettingsView({
   settings,
@@ -58,7 +59,10 @@ export function SettingsView({
       >
         <LazySettings
           snapshot={settings.globalSnapshot}
-          recovery={settings.loaded?.recovery}
+          skillSettings={settings.skillSettings}
+          issues={settings.loaded?.issues ?? []}
+          onIssuesRetry={settings.reload}
+          onIssuesRestore={settings.restoreLastKnownGood}
           interfacePreferences={interfacePreferences}
           executionScope={executionScope}
           ports={settings.ports}
@@ -66,7 +70,7 @@ export function SettingsView({
           onSectionChange={onSectionChange}
           desktopNotifications={desktopNotifications}
           desktop={desktop}
-          disabled={settings.synchronizing}
+          disabled={!settings.scopeReady}
           required={required}
           onReturnToApp={onReturnToApp}
         />

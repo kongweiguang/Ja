@@ -245,7 +245,12 @@ final class OpenAiChatCompletionsState {
             long input = requiredLong(value, "prompt_tokens");
             long output = requiredLong(value, "completion_tokens");
             long total = requiredLong(value, "total_tokens");
-            ModelUsage snapshot = new ModelUsage(input, output, total);
+            JsonNode details = value.get("prompt_tokens_details");
+            Long cacheRead = details == null || details.isNull() ? null : optionalLong(details, "cached_tokens");
+            /* Chat Completions 的 prompt_tokens 包含 cached_tokens；细节缺失时新输入必须保持未知。 */
+            ModelUsage snapshot = cacheRead == null ? new ModelUsage(input, output, total)
+                    : new ModelUsage(input, output, total, cacheRead, null,
+                            ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE);
             if (usage != null && (snapshot.inputTokens() < usage.inputTokens()
                 || snapshot.outputTokens() < usage.outputTokens()
                 || snapshot.totalTokens() < usage.totalTokens())) {
@@ -273,6 +278,17 @@ final class OpenAiChatCompletionsState {
         if (value == null || !value.isIntegralNumber() || !value.canConvertToLong()
             || value.longValue() < 0) {
             throw new IllegalArgumentException("invalid usage field");
+        }
+        return value.longValue();
+    }
+
+    /** 缓存明细为可选供应商字段；存在时仍必须是可表示的非负整数。 */
+    private static Long optionalLong(JsonNode root, String name) {
+        if (root == null || !root.isObject()) throw new IllegalArgumentException("invalid usage details");
+        JsonNode value = root.get(name);
+        if (value == null || value.isNull()) return null;
+        if (!value.isIntegralNumber() || !value.canConvertToLong() || value.longValue() < 0) {
+            throw new IllegalArgumentException("invalid usage detail");
         }
         return value.longValue();
     }

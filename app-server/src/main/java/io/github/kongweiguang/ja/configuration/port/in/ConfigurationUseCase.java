@@ -29,6 +29,9 @@ public interface ConfigurationUseCase extends ConfigurationData {
     /** 把目标层重置为严格空文档，不使用 null 或 mode 哨兵复用其它动作。 */
     MutationResult reset(ConfigurationScope scope, Path workspaceRoot, String expectedVersion);
 
+    /** 从 Java 管理的最近完整用户快照恢复，并在替换前备份当前原始文件。 */
+    MutationResult restoreLastKnownGood(String expectedVersion);
+
     /** 原子设置一个凭据，并且只返回脱敏状态和新的 CAS 版本。 */
     CredentialResult setCredential(String credentialId, String secret, String expectedVersion);
 

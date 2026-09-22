@@ -27,6 +27,14 @@ public interface TurnUseCase extends DeadlineCloseable {
     }
 
     /**
+     * 提交已显示在原 Tool 详情上的恢复裁决。调用方只提供当前 Thread/恢复 revision 与显式选择，
+     * 文件核实、执行游标和 ToolResult 配对仍由 Java Kernel 的存储事务唯一决定。
+     */
+    default ToolRecoveryResponse respondToolRecovery(ToolRecoveryRequest request) {
+        throw new UnsupportedOperationException("tool recovery response is unavailable");
+    }
+
+    /**
      * 仅凭全局唯一 Turn ID 提交最高优先级停止意图；当前版本由持久化 owner 在事务内读取。
      */
     CancelResult cancel(String turnId);
@@ -103,6 +111,38 @@ public interface TurnUseCase extends DeadlineCloseable {
             Objects.requireNonNull(inputId, "inputId");
             Objects.requireNonNull(inputQueue, "inputQueue");
             if (!accepted) throw new IllegalArgumentException("successful input mutation required");
+        }
+    }
+
+    /** 恢复请求不包含路径、哈希、运行时配置或 Tool 参数，避免客户端扩张文件读取或工具路由权限。 */
+    record ToolRecoveryRequest(String turnId, String callId, long expectedThreadRevision,
+                               long expectedRecoveryRevision, ToolRecoveryDisposition disposition,
+                               String idempotencyKey) {
+        /** 将 transport 的闭集选择映射为 domain 意图，并拒绝客户端伪造版本或空幂等身份。 */
+        public ToolRecoveryRequest {
+            if (turnId == null || callId == null || expectedThreadRevision < 0 || expectedRecoveryRevision < 1
+                    || disposition == null || idempotencyKey == null || idempotencyKey.isBlank()) {
+                throw new IllegalArgumentException("invalid Tool recovery request");
+            }
+        }
+    }
+
+    /** 用户只能明确重试或跳过；VERIFIED 是服务端确定性文件比较的内部结论。 */
+    enum ToolRecoveryDisposition {
+        /** 用户接受重复副作用风险，服务端为原未知调用创建新的执行尝试。 */
+        RETRY,
+        /** 用户明确不执行该项，模型随后收到包含未知事实的跳过结果。 */
+        SKIP
+    }
+
+    /** 裁决回执保留新 revision，供 handler 在最后一项后安全复用唯一的 Resume 入口。 */
+    record ToolRecoveryResponse(String threadId, String turnId, long threadRevision,
+                                ToolRecoveryDisposition disposition, boolean changed) {
+        /** response 不携带执行游标，既不让 Rust 缓存也不让前端根据它自行续跑。 */
+        public ToolRecoveryResponse {
+            if (threadId == null || turnId == null || threadRevision < 0 || disposition == null) {
+                throw new IllegalArgumentException("invalid Tool recovery response");
+            }
         }
     }
 
@@ -195,7 +235,9 @@ public interface TurnUseCase extends DeadlineCloseable {
         /** Turn 不存在、不是 SUSPENDED，或持久执行状态已经不可继续。 */
         TURN_NOT_RESUMABLE,
         /** 同一 Thread 更早的非终态 Turn 尚未处理，当前 Turn 不能越过 FIFO 恢复。 */
-        TURN_RESUME_ORDER_CONFLICT
+        TURN_RESUME_ORDER_CONFLICT,
+        /** 当前最早 Tool 结果未知，自动文件核实无法确认，需使用原 Tool 详情中的明确裁决。 */
+        RECOVERY_REQUIRED
     }
 
     /** 无堆栈 Resume 异常避免运行时、路径和持久化细节越过入站边界。 */

@@ -525,6 +525,7 @@ impl RuntimeHostHarness {
             ConfigurationResponse::Patch(value) => value.into_bytes(),
             ConfigurationResponse::Replace(value) => value.into_bytes(),
             ConfigurationResponse::Reset(value) => value.into_bytes(),
+            ConfigurationResponse::Restore(value) => value.into_bytes(),
             ConfigurationResponse::CredentialSet(value) => value.into_bytes(),
             ConfigurationResponse::CredentialDelete(value) => value.into_bytes(),
             ConfigurationResponse::CredentialRevealProvider(value) => value.into_bytes(),

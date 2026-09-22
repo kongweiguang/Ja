@@ -179,7 +179,7 @@
   border-radius: var(--ja-radius-lg);
   color: var(--ja-foreground-tertiary);
   background: transparent;
-  cursor: pointer;
+  cursor: default;
   place-items: center;
   transition:
     color 120ms var(--ja-ease-native),
@@ -1263,31 +1263,38 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   margin-inline-start: auto;
 }
 
-.ja-context-usage {
-  position: relative;
+.ja-context-usage-trigger {
   display: inline-grid;
   width: 28px;
   height: 28px;
   flex: 0 0 28px;
-  place-items: center;
+  padding: 0;
+  border: 0;
   border-radius: 50%;
   color: var(--ja-foreground-tertiary);
-  cursor: help;
-  transition:
-    color 140ms var(--ja-ease-native),
-    background-color 140ms var(--ja-ease-native),
-    transform 140ms var(--ja-ease-native);
+  background: transparent;
+  cursor: pointer;
+  place-items: center;
 }
 
-.ja-context-usage:hover,
-.ja-context-usage:focus-visible {
+.ja-context-usage-trigger:hover,
+.ja-context-usage-trigger[aria-expanded="true"] {
   color: var(--ja-foreground-muted);
   background: var(--ja-control-hover);
 }
 
-.ja-context-usage:focus-visible {
+.ja-context-usage-trigger:focus-visible {
   outline: 2px solid var(--ja-focus);
   outline-offset: 1px;
+}
+
+.ja-context-usage {
+  position: relative;
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  color: inherit;
 }
 
 .ja-context-usage[data-tone="warning"] {
@@ -1336,46 +1343,74 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   transform: translate(-50%, -50%);
 }
 
-.ja-context-usage-tooltip {
-  min-width: 10.5rem;
-  padding: 0.62rem 0.68rem;
+.ja-popover-content.ja-context-usage-popover {
+  width: min(280px, calc(100vw - 24px));
+  min-width: 0;
+  max-width: min(280px, calc(100vw - 24px));
+  padding: 0;
+  overflow: visible;
+  user-select: text;
 }
 
-.ja-context-usage-tooltip__content {
+.ja-context-usage-popover__section {
   display: grid;
-  gap: 0.22rem;
+  gap: 7px;
+  padding: 12px 14px;
 }
 
-.ja-context-usage-tooltip__heading {
-  display: flex;
+.ja-context-usage-popover__section + .ja-context-usage-popover__section {
+  border-top: 1px solid var(--ja-border);
+}
+
+.ja-context-usage-popover__section h2 {
+  margin: 0 0 2px;
+  color: var(--ja-foreground);
+  font-size: 0.8125rem;
+  font-weight: var(--ja-weight-semibold);
+  line-height: 1.25rem;
+}
+
+.ja-context-usage-popover__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
-  color: var(--ja-foreground);
-}
-
-.ja-context-usage-tooltip__heading > span {
-  font-weight: var(--ja-weight-medium);
-}
-
-.ja-context-usage-tooltip__heading > strong {
-  font-variant-numeric: tabular-nums;
-}
-
-.ja-context-usage-tooltip p {
-  margin: 0;
+  gap: 14px;
+  min-height: 1.25rem;
   color: var(--ja-foreground-muted);
-  font-variant-numeric: tabular-nums;
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
 }
 
-.ja-context-usage-tooltip p > strong {
+.ja-context-usage-popover__value {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
   color: var(--ja-foreground);
-  font-weight: var(--ja-weight-medium);
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+  white-space: nowrap;
 }
 
-.ja-context-usage-tooltip small {
+.ja-context-usage-popover__value small {
   color: var(--ja-foreground-tertiary);
-  font-size: inherit;
+  font-size: 0.6875rem;
+  line-height: 1rem;
+}
+
+.ja-context-usage-popover__empty,
+.ja-context-usage-popover__status {
+  margin: 0;
+  padding: 12px 14px;
+  color: var(--ja-foreground-muted);
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+}
+
+.ja-context-usage-popover__status {
+  border-top: 1px solid var(--ja-border);
+  color: var(--ja-foreground-tertiary);
 }
 
 .ja-composer .ja-select-trigger {

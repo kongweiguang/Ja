@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
+import io.github.kongweiguang.ja.conversation.domain.ThreadUsageSummary;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 
@@ -40,6 +41,14 @@ public interface ThreadUseCase {
      * 读取一个事务一致的 Thread 历史页面。
      */
     Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit);
+
+    /**
+     * 读取 Thread 的全量用量汇总而不物化历史页面；默认关闭，避免旧测试实现把缺失的
+     * Provider 计量伪装成空汇总。
+     */
+    default Optional<ThreadUsageSummary> readThreadUsageSummary(String threadId) {
+        throw new UnsupportedOperationException("thread usage summary is unavailable");
+    }
 
     /** 用户显式标题通过 revision CAS 写入，并永久取得 manual 所有权。 */
     ThreadSummary renameThread(String threadId, String title, long expectedThreadRevision);

@@ -34,6 +34,7 @@ import {
   type ConversationArtifactPort,
   type ConversationContextReference,
   type ConversationSummary,
+  type ConversationUsageReader,
   type ComposerSlashCommand,
   type TimelineTurn as Turn,
   type TimelineGoalActivity,
@@ -64,6 +65,8 @@ import { ConversationTimelineSurface } from "./ConversationTimelineSurface";
 export interface ConversationWorkspaceProps {
   readonly workspace: WorkspaceController;
   readonly conversation: ConversationController;
+  /** Composer 只消费 Thread 级只读账本，历史 adapter 与刷新时序仍留在 composition。 */
+  readonly usageReader?: ConversationUsageReader;
   readonly settings: SettingsController;
   readonly inspectorOpen: boolean;
   readonly onToggleInspector: () => void;
@@ -126,6 +129,7 @@ export type WorkspaceReferencePreviewOutcome = "opened" | "failed" | "closed";
 export function ConversationWorkspace({
   workspace,
   conversation,
+  usageReader,
   settings,
   inspectorOpen,
   onToggleInspector,
@@ -417,6 +421,7 @@ export function ConversationWorkspace({
       const usage = state.contextUsageByThread[threadId];
       return {
         usage,
+        invalidatedAt: state.contextUsageInvalidatedAtByThread[threadId],
         compaction: state.contextCompactionByThread[threadId],
       };
     }),
@@ -459,8 +464,19 @@ export function ConversationWorkspace({
   );
   const contextUsage = resolveContextUsage({
     usage: contextFacts.usage,
+    invalidatedAt: contextFacts.invalidatedAt,
     compaction: contextFacts.compaction,
   });
+  /** 只由请求身份或结算/恢复事实变化推进，避免普通渲染与关闭浮层制造后台读取。 */
+  const usageRefreshRevision = [
+    contextFacts.usage?.requestId,
+    contextFacts.usage?.requestOrdinal,
+    contextFacts.usage?.modelRound,
+    contextFacts.usage?.measuredAt,
+    contextFacts.invalidatedAt,
+    contextFacts.compaction?.phase,
+    contextFacts.compaction?.occurredAt,
+  ].join("\u0000");
   // Workspace commit 与配置 Query key 切换可能跨一个 React effect；只有目标 scope 已取得
   // 权威快照才开放 Composer，防止旧项目 Provider 配置进入新项目 Turn。
   const settingsScopeReady =
@@ -473,6 +489,33 @@ export function ConversationWorkspace({
   const reportConversationTransientError = useCallback((message: string): void => {
     toast.error(message, { id: "ja-conversation-cancel-failed" });
   }, []);
+  /**
+   * 原 Tool 详情的裁决在离开当前 Thread、Turn 不再暂停或 revision 已变时失败关闭；真正的幂等、
+   * 调用归属与自动续跑继续由 Runtime/App Server 所有，视图不在 ACK 后伪造任何 Tool 结果。
+   */
+  const resolveToolRecovery = useCallback(
+    async (input: {
+      threadId: string;
+      turnId: string;
+      callId: string;
+      expectedThreadRevision: number;
+      expectedRecoveryRevision: number;
+      decision: "retry" | "skip";
+      idempotencyKey: string;
+    }): Promise<void> => {
+      const matchingTurn = turns.find((turn) => turn.turnId === input.turnId);
+      if (
+        input.threadId !== threadId ||
+        matchingTurn?.threadId !== input.threadId ||
+        matchingTurn.status !== "suspended" ||
+        matchingTurn.threadRevision !== input.expectedThreadRevision
+      ) {
+        throw new Error("tool recovery state is stale");
+      }
+      await turnPort.respondToolRecovery(input);
+    },
+    [threadId, turnPort, turns],
+  );
   const interaction = useConversationInteractionController({
     threadId: conversation.currentThreadId,
     workspaceId: workspace.workspace?.workspaceId,
@@ -601,6 +644,7 @@ export function ConversationWorkspace({
       attachmentDraftItems={interaction.attachmentDraftItems}
       activeTurn={interaction.activeTurn}
       suspendedTurn={interaction.suspendedTurn}
+      continuationAvailable={interaction.continuationAvailable}
       interactionPresentation={
         clarification.request?.status !== "pending"
           ? "none"
@@ -619,6 +663,8 @@ export function ConversationWorkspace({
       queuedInputs={interaction.queuedInputs}
       queueAccepting={interaction.queueAccepting}
       contextUsage={contextUsage}
+      usageReader={usageReader}
+      usageRefreshRevision={usageRefreshRevision}
       placeholder={
         interaction.preferences?.collaborationMode === "plan"
           ? "描述需要制定计划的任务…"
@@ -732,6 +778,7 @@ export function ConversationWorkspace({
       onPrioritizeQueuedInput={interaction.prioritizeQueuedInput}
       onUpdateQueuedInput={interaction.updateQueuedInput}
       onDeleteQueuedInput={interaction.deleteQueuedInput}
+      onContinue={interaction.continueReply}
       onResume={interaction.resume}
       onCancel={interaction.cancel}
     />
@@ -817,7 +864,7 @@ export function ConversationWorkspace({
             onApprovalDecision={(approval, decision) =>
               void interaction.approve(approval, decision)
             }
-            onPrepareRetry={(_turnId, text) => interaction.updateDraft(text)}
+            onResolveToolRecovery={resolveToolRecovery}
             onOpenLink={onOpenLink}
             onCopyText={onCopyText}
             onOpenAttachmentPreview={

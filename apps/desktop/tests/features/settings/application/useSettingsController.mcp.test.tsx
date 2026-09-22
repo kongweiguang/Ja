@@ -16,7 +16,7 @@ import type { SettingsAdapter } from "@/features/settings/application/ports";
 const NO_PROJECT_OVERRIDES = {
   defaultSelection: false,
   accessMode: false,
-  disabledSkillIds: [],
+  disabledSkillReferences: [],
   disabledMcpIds: [],
 };
 
@@ -52,7 +52,7 @@ function QueryWrapper({ children }: PropsWithChildren): React.ReactElement {
 /** 生成只包含设置 controller 所需字段的文档，测试重点保持在 MCP 状态边界。 */
 function documentWithMcp(server: SettingsMcpServer): SettingsDocument {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 1,
     theme: "system",
     defaultAccessMode: "full_access",
@@ -73,6 +73,7 @@ function loadedFrom(document: SettingsDocument): LoadedSettings {
     userDocument: structuredClone(document),
     projectOverrides: structuredClone(NO_PROJECT_OVERRIDES),
     cas: { userVersion: "cfg_user", projectVersion: "cfg_project", credentialVersion: "cfg_auth" },
+    issues: [],
   };
 }
 
@@ -86,8 +87,10 @@ function optionsFor(
     adapter: {
       snapshot,
       save,
+      saveProjectSkills: vi.fn(async () => "cfg_project"),
       patch: vi.fn(async () => ({ version: "cfg_project" })),
       reset: vi.fn(async () => ({ version: "cfg_project" })),
+      restoreLastKnownGood: vi.fn(async () => "cfg_user"),
       setCredential: vi.fn(async () => "cfg_auth"),
       deleteCredential: vi.fn(async () => "cfg_auth"),
       revealProviderCredential: vi.fn(async () => null),

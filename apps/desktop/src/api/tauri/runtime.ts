@@ -40,6 +40,7 @@ export const JA_RUNTIME_COMMANDS = {
   approvalRespond: "ja_approval_respond",
   turnStart: "ja_turn_start",
   turnResume: "ja_turn_resume",
+  turnRecoveryRespond: "ja_turn_recovery_respond",
   turnCancel: "ja_turn_cancel",
   turnInputEnqueue: "ja_turn_input_enqueue",
   turnInputPrioritize: "ja_turn_input_prioritize",
@@ -187,6 +188,28 @@ const TurnResumeInputSchema = z
   })
   .strict();
 
+/** Tool 恢复裁决固定为 retry/skip；Renderer 永远不提交文件证据、执行参数或 verified 状态。 */
+const ToolRecoveryResponseInputSchema = z
+  .object({
+    turnId: z
+      .string()
+      .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(101),
+    callId: z
+      .string()
+      .regex(/^call_[A-Za-z0-9][A-Za-z0-9._-]{0,122}$/)
+      .max(128),
+    expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    expectedRecoveryRevision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    decision: z.enum(["retry", "skip"]),
+    idempotencyKey: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+  })
+  .strict();
+
 const TurnCancelResultSchema = z
   .object({
     accepted: z.literal(true),
@@ -256,6 +279,20 @@ const TurnResumeResultSchema = z
       .max(128),
     queued: z.literal(true),
     threadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/** ACK 不伪造 Tool 成功或 Turn 终态，只说明裁决是否令既有 Resume 重新入队。 */
+const ToolRecoveryResponseSchema = z
+  .object({
+    accepted: z.literal(true),
+    turnId: z
+      .string()
+      .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(101),
+    threadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    decision: z.enum(["retry", "skip"]),
+    resumed: z.boolean(),
   })
   .strict();
 
@@ -357,6 +394,8 @@ export type RuntimeRecoveryState = z.infer<typeof RuntimeRecoveryStateSchema>;
 export type ManualRecoveryConfirmation = z.infer<typeof ManualRecoveryConfirmationSchema>;
 export type TurnStartInput = z.infer<typeof TurnStartInputSchema>;
 export type TurnAccepted = z.infer<typeof TurnAcceptedSchema>;
+export type ToolRecoveryResponseInput = z.infer<typeof ToolRecoveryResponseInputSchema>;
+export type ToolRecoveryResponse = z.infer<typeof ToolRecoveryResponseSchema>;
 export type TurnResumeInput = z.infer<typeof TurnResumeInputSchema>;
 export type TurnResumeResult = z.infer<typeof TurnResumeResultSchema>;
 export type TurnCancelInput = z.infer<typeof TurnCancelInputSchema>;
@@ -812,6 +851,8 @@ export interface RuntimeHostAdapter {
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   /** 显式授权恢复同一持久 Turn；返回值复用原接纳形状但不会创建新 Turn。 */
   turnResume(input: TurnResumeInput): Promise<TurnResumeResult>;
+  /** 仅提交当前未知 Tool 的明确重试或跳过裁决，最终状态继续由 Runtime 事件投影。 */
+  turnRecoveryRespond(input: ToolRecoveryResponseInput): Promise<ToolRecoveryResponse>;
   /** 请求取消，但终态仍以事件为权威，UI 不提前猜测完成。 */
   turnCancel(input: TurnCancelInput): Promise<TurnCancelResult>;
   /** 默认以 follow-up 语义追加一条持久输入。 */
@@ -954,6 +995,20 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
       TurnResumeResultSchema,
     );
     if (result.turnId !== parsed.turnId) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    }
+    return result;
+  }
+
+  /** 裁决与当前 call/revision 精确绑定；ACK 只能回显同一 Turn 与同一决策，避免错位状态进入 UI。 */
+  async turnRecoveryRespond(input: ToolRecoveryResponseInput): Promise<ToolRecoveryResponse> {
+    const parsed = parseRuntimeInput(ToolRecoveryResponseInputSchema, input);
+    const result = await this.invoke(
+      JA_RUNTIME_COMMANDS.turnRecoveryRespond,
+      { input: parsed },
+      ToolRecoveryResponseSchema,
+    );
+    if (result.turnId !== parsed.turnId || result.decision !== parsed.decision) {
       throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
     }
     return result;

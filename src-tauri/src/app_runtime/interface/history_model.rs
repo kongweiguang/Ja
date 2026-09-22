@@ -9,7 +9,7 @@ use crate::app_runtime::{
     ThreadCompactParams, ThreadCreateParams, ThreadDeleteParams, ThreadDiscoverParams,
     ThreadListParams, ThreadPinParams, ThreadPreferencesUpdateParams, ThreadReadParams,
     ThreadRenameParams, ThreadRestoreParams, ThreadSearchParams, ThreadSeenParams,
-    WorkspaceListParams,
+    ThreadUsageReadParams, WorkspaceListParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -29,6 +29,7 @@ pub(crate) enum HistoryMethod {
     ThreadList,
     ThreadSearch,
     ThreadRead,
+    ThreadUsageRead,
     ThreadRename,
     ThreadPin,
     ThreadSeen,
@@ -60,6 +61,9 @@ pub(crate) fn request_history(
             HistoryRequest::ThreadSearch(ThreadSearchParams::try_new(bytes)?)
         }
         HistoryMethod::ThreadRead => HistoryRequest::ThreadRead(ThreadReadParams::try_new(bytes)?),
+        HistoryMethod::ThreadUsageRead => {
+            HistoryRequest::ThreadUsageRead(ThreadUsageReadParams::try_new(bytes)?)
+        }
         HistoryMethod::ThreadRename => {
             HistoryRequest::ThreadRename(ThreadRenameParams::try_new(bytes)?)
         }
@@ -89,6 +93,9 @@ pub(crate) fn request_history(
         (HistoryMethod::ThreadList, HistoryResponse::ThreadList(value)) => value.into_bytes(),
         (HistoryMethod::ThreadSearch, HistoryResponse::ThreadSearch(value)) => value.into_bytes(),
         (HistoryMethod::ThreadRead, HistoryResponse::ThreadRead(value)) => value.into_bytes(),
+        (HistoryMethod::ThreadUsageRead, HistoryResponse::ThreadUsageRead(value)) => {
+            value.into_bytes()
+        }
         (HistoryMethod::ThreadRename, HistoryResponse::ThreadRename(value)) => value.into_bytes(),
         (HistoryMethod::ThreadPin, HistoryResponse::ThreadPin(value)) => value.into_bytes(),
         (HistoryMethod::ThreadSeen, HistoryResponse::ThreadSeen(value)) => value.into_bytes(),
@@ -194,6 +201,13 @@ pub struct ThreadReadInput {
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// Thread 账本不接受分页、范围或费用选项，避免 WebView 通过诊断读取扩大历史物化范围。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadUsageReadInput {
+    pub thread_id: String,
 }
 
 /// 人工标题更新独立于 lifecycle mutation，避免 UI 通过通用 patch 修改服务端拥有的其它元数据。
@@ -335,6 +349,29 @@ pub struct ThreadReadResult {
     pub context_usage: Option<ThreadContextUsageDto>,
     pub input_queue: Option<InputQueueDto>,
     pub next_cursor: Option<String>,
+}
+
+/// SQLite 单快照聚合的最小计量摘要；每个 Token 累计值都有相应的覆盖请求数。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadUsageSummary {
+    pub thread_id: String,
+    pub snapshot_revision: u64,
+    pub request_count: u64,
+    pub measured_request_count: u64,
+    pub new_input_request_count: u64,
+    pub new_input_tokens: u64,
+    pub output_request_count: u64,
+    pub output_tokens: u64,
+    pub total_request_count: u64,
+    pub total_tokens: u64,
+    pub cache_read_request_count: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_request_count: u64,
+    pub cache_write_tokens: u64,
+    pub cache_complete_request_count: u64,
+    pub cache_complete_input_tokens: u64,
+    pub cache_complete_read_tokens: u64,
 }
 
 /// 主 Thread 快照把低频 Activity 与同一时刻的 Task 摘要绑定，避免 UI 再做全树扫描。
@@ -642,6 +679,13 @@ pub(crate) fn validate_thread_read(input: &ThreadReadInput) -> Result<(), Runtim
     })
 }
 
+/// 读取端只接收 Java-issued Thread 身份，聚合边界和计量口径始终由 App Server 固定。
+pub(crate) fn validate_thread_usage_read(
+    input: &ThreadUsageReadInput,
+) -> Result<(), RuntimeCommandError> {
+    validate_prefixed(&input.thread_id, "thr_", 100)
+}
+
 /// 解析并限制严格的 Workspace page，旧列表键会在反序列化前被拒绝。
 pub(crate) fn parse_workspace_page(
     value: Value,
@@ -844,6 +888,77 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
     }
     validate_cursor(&result.next_cursor)
         .map_err(|_| history_response_rejected("thread_read_cursor"))?;
+    Ok(result)
+}
+
+/// 严格解析无正文的计量摘要，确保缺失 Provider Usage 仍以覆盖范围而非零值传入诊断链路。
+pub(crate) fn parse_thread_usage_summary(
+    value: Value,
+) -> Result<ThreadUsageSummary, RuntimeCommandError> {
+    if !value.as_object().is_some_and(|object| {
+        exact_keys(
+            object,
+            &[
+                "threadId",
+                "snapshotRevision",
+                "requestCount",
+                "measuredRequestCount",
+                "newInputRequestCount",
+                "newInputTokens",
+                "outputRequestCount",
+                "outputTokens",
+                "totalRequestCount",
+                "totalTokens",
+                "cacheReadRequestCount",
+                "cacheReadTokens",
+                "cacheWriteRequestCount",
+                "cacheWriteTokens",
+                "cacheCompleteRequestCount",
+                "cacheCompleteInputTokens",
+                "cacheCompleteReadTokens",
+            ],
+        )
+    }) {
+        return Err(history_response_rejected("thread_usage_root"));
+    }
+    let result: ThreadUsageSummary = serde_json::from_value(value)
+        .map_err(|_| history_response_rejected("thread_usage_decode"))?;
+    validate_prefixed(&result.thread_id, "thr_", 100)
+        .map_err(|_| history_response_rejected("thread_usage_identity"))?;
+    let values = [
+        result.snapshot_revision,
+        result.request_count,
+        result.measured_request_count,
+        result.new_input_request_count,
+        result.new_input_tokens,
+        result.output_request_count,
+        result.output_tokens,
+        result.total_request_count,
+        result.total_tokens,
+        result.cache_read_request_count,
+        result.cache_read_tokens,
+        result.cache_write_request_count,
+        result.cache_write_tokens,
+        result.cache_complete_request_count,
+        result.cache_complete_input_tokens,
+        result.cache_complete_read_tokens,
+    ];
+    if values.into_iter().any(|value| value > MAX_SAFE_INTEGER)
+        || result.measured_request_count > result.request_count
+        || [
+            result.new_input_request_count,
+            result.output_request_count,
+            result.total_request_count,
+            result.cache_read_request_count,
+            result.cache_write_request_count,
+            result.cache_complete_request_count,
+        ]
+        .into_iter()
+        .any(|coverage| coverage > result.measured_request_count)
+        || result.cache_complete_read_tokens > result.cache_complete_input_tokens
+    {
+        return Err(history_response_rejected("thread_usage_semantics"));
+    }
     Ok(result)
 }
 

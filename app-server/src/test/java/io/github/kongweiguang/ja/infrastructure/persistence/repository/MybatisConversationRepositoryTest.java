@@ -70,6 +70,7 @@ import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -1139,6 +1140,51 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         }
     }
 
+    /**
+     * 投影阶段与首次 Tool 选择必须跨 SQLite 重开保持不变；相同 binding 复用阶段，Tool 目录变化
+     * 才开启新阶段，overflow 再按 source 幂等地取得其唯一阶段。
+     */
+    @Test
+    void persistsStableProjectionStagesAndSelectionsAcrossRestart() throws Exception {
+        CheckpointStore.ProjectionBinding initialBinding = new CheckpointStore.ProjectionBinding(
+                "a".repeat(64), "b".repeat(64));
+        CheckpointStore.ProjectionBinding changedToolBinding = new CheckpointStore.ProjectionBinding(
+                "a".repeat(64), "c".repeat(64));
+        try (TestDatabase database = database("projection-stage-restart")) {
+            MybatisConversationRepository store = initialized(database);
+            admit(store);
+            MybatisCheckpointStore checkpoints = database.checkpoints();
+            CheckpointStore.ProjectionRequest firstRequest = new CheckpointStore.ProjectionRequest(
+                    "thr_1", 1, initialBinding, START.plusSeconds(1));
+
+            CheckpointStore.ProjectionSnapshot initial = checkpoints.prepareProjection(firstRequest);
+            CheckpointStore.ProjectionSnapshot persisted = checkpoints.persistProjection(initial,
+                    Map.of("item_tool_result", ContextPolicy.ToolProjection.ARTIFACT));
+            CheckpointStore.ProjectionSnapshot reused = checkpoints.prepareProjection(new CheckpointStore
+                    .ProjectionRequest("thr_1", 2, initialBinding, START.plusSeconds(2)));
+            assertEquals(initial.stageId(), reused.stageId());
+            assertEquals(ContextPolicy.ToolProjection.ARTIFACT,
+                    persisted.selections().get("item_tool_result"));
+
+            CheckpointStore.ProjectionRequest changedRequest = new CheckpointStore.ProjectionRequest(
+                    "thr_1", 2, changedToolBinding, START.plusSeconds(3));
+            CheckpointStore.ProjectionSnapshot toolChanged = checkpoints.prepareProjection(changedRequest);
+            assertEquals(CheckpointStore.ProjectionReason.TOOL_BINDING, toolChanged.reason());
+            CheckpointStore.ProjectionSnapshot overflow = checkpoints.advanceProjection(changedRequest,
+                    CheckpointStore.ProjectionReason.OVERFLOW);
+            assertEquals(CheckpointStore.ProjectionReason.OVERFLOW, overflow.reason());
+            assertEquals(overflow.stageId(), checkpoints.advanceProjection(changedRequest,
+                    CheckpointStore.ProjectionReason.OVERFLOW).stageId());
+        }
+
+        try (TestDatabase reopened = database("projection-stage-restart")) {
+            CheckpointStore.ProjectionSnapshot restored = reopened.checkpoints().prepareProjection(
+                    new CheckpointStore.ProjectionRequest("thr_1", 3, changedToolBinding,
+                            START.plusSeconds(4)));
+            assertEquals(CheckpointStore.ProjectionReason.OVERFLOW, restored.reason());
+        }
+    }
+
     /** 自动 Summary checkpoint 必须与 READY(ASSISTANT) 和 Turn mutation 在同一 SQLite 事务提交。 */
     @Test
     void commitsAutomaticSummaryCheckpointAndExecutionAtomically() throws Exception {
@@ -1272,7 +1318,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         }
     }
 
-    /** 启动恢复完整关闭崩溃批次，同时保持已经结算的 Tool 结果和单次 Thread revision。 */
+    /** 启动恢复仅标记已启动无回执的调用为未知，未启动与已结算项保留其真实执行边界。 */
     @Test
     void recoversActiveTurnAndRunningToolAtomically() throws Exception {
         try (TestDatabase database = database("recovery")) {
@@ -1304,7 +1350,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                             "batch_fixture", "item_assistant_recovery", 0, 3, 0)));
             StartupRecoveryService.RecoveryResult result = database.recovery().recover();
             assertEquals(1, result.turns());
-            assertEquals(3, result.tools());
+            assertEquals(1, result.tools());
             assertEquals(0, result.changeSets());
             ConversationRepository.TurnSnapshot turn = store.findTurn("thr_1", "turn_1").orElseThrow();
             assertEquals(TurnState.SUSPENDED, turn.state());
@@ -1312,21 +1358,17 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             assertEquals(running.turnMutationVersion() + 1, turn.turnMutationVersion());
             try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession()) {
                 AgentMapper mapper = session.getMapper(AgentMapper.class);
-                assertEquals("FAILED", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_1")).state());
-                assertEquals("FAILED", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_2")).state());
-                assertEquals("FAILED", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_3")).state());
+                assertEquals("RUNNING", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_1")).state());
+                assertEquals("PREPARED", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_2")).state());
+                assertEquals("PREPARED", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_3")).state());
                 assertEquals("SUCCEEDED", mapper.selectTool(new PersistenceRecords.ToolKey("turn_1", "call_4")).state());
             }
-            TurnExecutionState.Ready recovered = assertInstanceOf(
-                    TurnExecutionState.Ready.class,
+            TurnExecutionState.Tools recovered = assertInstanceOf(
+                    TurnExecutionState.Tools.class,
                     store.findResumeCandidate("turn_1").orElseThrow().execution());
-            assertEquals(TurnExecutionState.Next.ASSISTANT, recovered.next());
+            assertEquals(0, recovered.nextOrdinal());
             List<ToolResultContent> recoveryResults = toolResults(store.readThread("thr_1").orElseThrow());
-            assertEquals(List.of("call_1", "call_2", "call_3"),
-                    recoveryResults.stream().map(ToolResultContent::callId).toList());
-            assertTrue(recoveryResults.stream().allMatch(resultContent -> resultContent.error()
-                    && "TOOL_BINDING_UNAVAILABLE: Tool binding is unavailable."
-                    .equals(resultContent.content())));
+            assertTrue(recoveryResults.isEmpty());
             io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot history =
                     database.history(store).readThread("thr_1", null, 100).orElseThrow();
             assertNull(history.turns().getFirst().changeSet());
@@ -1363,7 +1405,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
 
     /**
      * 首个 Tool 已结算后的强杀必须保留其结果、Active Skill 与 Prompt checkpoint；
-     * 后续未结算项写入失败并结束 batch，Resume 只能继续请求 Assistant。
+     * 后续尚未启动项保留 PREPARED，Resume 继续前重新校验原始 binding。
      */
     @Test
     void preservesSettledToolCursorAndPromptCheckpointAcrossStartupRecovery() throws Exception {
@@ -1400,13 +1442,13 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                     0, START.plusSeconds(2), cursor));
 
             StartupRecoveryService.RecoveryResult recovery = database.recovery().recover();
-            assertEquals(1, recovery.tools());
+            assertEquals(0, recovery.tools());
             ConversationRepository.ResumeCandidate candidate = store.findResumeCandidate("turn_1")
                     .orElseThrow();
-            TurnExecutionState.Ready recovered = assertInstanceOf(
-                    TurnExecutionState.Ready.class, candidate.execution());
+            TurnExecutionState.Tools recovered = assertInstanceOf(
+                    TurnExecutionState.Tools.class, candidate.execution());
 
-            assertEquals(TurnExecutionState.Next.ASSISTANT, recovered.next());
+            assertEquals(1, recovered.nextOrdinal());
             assertEquals(activeSkills, recovered.common().activeSkills());
             assertEquals(checkpoint.summary().toPromptText(), candidate.promptSummary());
             assertEquals("hello", candidate.originalContent().text());
@@ -1415,13 +1457,10 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                 AgentMapper mapper = session.getMapper(AgentMapper.class);
                 assertEquals("SUCCEEDED", mapper.selectTool(
                         new PersistenceRecords.ToolKey("turn_1", "call_1")).state());
-                assertEquals("FAILED", mapper.selectTool(
+                assertEquals("PREPARED", mapper.selectTool(
                         new PersistenceRecords.ToolKey("turn_1", "call_2")).state());
             }
-            assertEquals(List.of(
-                            new ToolResultContent("call_2",
-                                    "TOOL_BINDING_UNAVAILABLE: Tool binding is unavailable.", true)),
-                    toolResults(store.readThread("thr_1").orElseThrow()));
+            assertTrue(toolResults(store.readThread("thr_1").orElseThrow()).isEmpty());
         }
     }
 
@@ -1496,7 +1535,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         }
     }
 
-    /** RUNNING READ_ONLY 也必须写入标准绑定失效结果，避免恢复路径以只读为由重放调用。 */
+    /** RUNNING READ_ONLY 没有回执同样保持未知，不能以只读属性猜测原调用已经完成。 */
     @Test
     void settlesRunningReadOnlyToolWithoutReplay() throws Exception {
         try (TestDatabase database = database("recovery-running-read-only")) {
@@ -1519,22 +1558,120 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             assertEquals(1, recovery.tools());
             assertEquals(TurnState.SUSPENDED,
                     store.findTurn("thr_1", "turn_1").orElseThrow().state());
-            TurnExecutionState.Ready recovered = assertInstanceOf(
-                    TurnExecutionState.Ready.class,
+            TurnExecutionState.Tools recovered = assertInstanceOf(
+                    TurnExecutionState.Tools.class,
                     store.findResumeCandidate("turn_1").orElseThrow().execution());
-            assertEquals(TurnExecutionState.Next.ASSISTANT, recovered.next());
+            assertEquals(0, recovered.nextOrdinal());
             try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession()) {
-                assertEquals("FAILED", session.getMapper(AgentMapper.class).selectTool(
+                assertEquals("RUNNING", session.getMapper(AgentMapper.class).selectTool(
                         new PersistenceRecords.ToolKey("turn_1", "call_read")).state());
             }
-            assertEquals(List.of(new ToolResultContent(
-                            "call_read", "TOOL_BINDING_UNAVAILABLE: Tool binding is unavailable.", true)),
-                    toolResults(store.readThread("thr_1").orElseThrow()));
+            assertTrue(toolResults(store.readThread("thr_1").orElseThrow()).isEmpty());
             assertEquals(0, database.recovery().recover().turns());
         }
     }
 
-    /** 异常旧游标即使越过 RUNNING 项也必须扫描整批并补齐结果，不能留下悬空 Tool message 配对。 */
+    /**
+     * 用户明确重试只重置同一冻结 Tool binding；相同幂等键的重复点击必须回读首个裁决，不能再次
+     * 推进 Thread/Turn revision 或重新排入执行队列。
+     */
+    @Test
+    void retriesUnknownToolOnceAndReusesTheCommittedResolution() throws Exception {
+        try (TestDatabase database = database("recovery-retry-idempotent")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            TurnExecutionState.Tools tools = new TurnExecutionState.Tools(
+                    execution("cfg_1").common(), "batch_fixture", "item_assistant_retry", 0, 0, 0);
+            store.commit(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolPreparedFact(
+                                    "call_retry", "write_file", textArguments("path", "retry.txt"), 0,
+                                    ToolSideEffect.EXTERNAL, presentation(ToolPresentation.Status.PENDING),
+                                    binding("batch_fixture", "call_retry", "write_file")),
+                            new ConversationRepository.ToolStartedFact("call_retry")),
+                    admission.turnMutationVersion(), START.plusSeconds(1), tools));
+            database.recovery().recover();
+            ConversationRepository.TurnSnapshot suspended = store.findTurn("thr_1", "turn_1").orElseThrow();
+            ConversationRepository.PendingToolRecovery pending = store.findPendingToolRecovery("turn_1").orElseThrow();
+            ConversationRepository.ToolRecoveryResolutionRequest request =
+                    new ConversationRepository.ToolRecoveryResolutionRequest("turn_1", "call_retry",
+                            suspended.threadRevision(), pending.recoveryRevision(),
+                            ConversationRepository.ToolRecoveryDisposition.RETRY, "retry-click-1", START.plusSeconds(2));
+
+            ConversationRepository.ToolRecoveryResolution first = store.resolveToolRecovery(request);
+            ConversationRepository.ToolRecoveryResolution repeated = store.resolveToolRecovery(request);
+
+            assertTrue(first.changed());
+            assertFalse(repeated.changed());
+            assertEquals(first.threadRevision(), repeated.threadRevision());
+            assertEquals(first.turnMutationVersion(), repeated.turnMutationVersion());
+            assertEquals(TurnState.SUSPENDED, store.findTurn("thr_1", "turn_1").orElseThrow().state());
+            try (var session = database.sessions().openSession()) {
+                assertEquals("PREPARED", session.getMapper(AgentMapper.class).selectTool(
+                        new PersistenceRecords.ToolKey("turn_1", "call_retry")).state());
+                assertEquals("RETRIED", PersistenceMappers.open(session).recovery()
+                        .selectToolRecovery("call_retry").state());
+                assertEquals(2, PersistenceMappers.open(session).recovery()
+                        .countToolRecoveryAttempts(pending.recoveryId()));
+            }
+        }
+    }
+
+    /**
+     * 跳过不是成功回执：它只结算未知项为错误 ToolResult。旧页面的陈旧 revision 被拒绝，而相同
+     * 幂等重放保留已提交的“跳过”结论，保证关闭前后不重复写入模型历史。
+     */
+    @Test
+    void skipsUnknownToolWithoutFakingSuccessAndRejectsStaleRevision() throws Exception {
+        try (TestDatabase database = database("recovery-skip-cas")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            TurnExecutionState.Tools tools = new TurnExecutionState.Tools(
+                    execution("cfg_1").common(), "batch_fixture", "item_assistant_skip", 0, 0, 0);
+            store.commit(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING,
+                    List.of(new ConversationRepository.ToolPreparedFact(
+                                    "call_skip", "write_file", textArguments("path", "skip.txt"), 0,
+                                    ToolSideEffect.EXTERNAL, presentation(ToolPresentation.Status.PENDING),
+                                    binding("batch_fixture", "call_skip", "write_file")),
+                            new ConversationRepository.ToolStartedFact("call_skip")),
+                    admission.turnMutationVersion(), START.plusSeconds(1), tools));
+            database.recovery().recover();
+            ConversationRepository.TurnSnapshot suspended = store.findTurn("thr_1", "turn_1").orElseThrow();
+            ConversationRepository.PendingToolRecovery pending = store.findPendingToolRecovery("turn_1").orElseThrow();
+            ConversationRepository.ToolRecoveryResolutionRequest stale =
+                    new ConversationRepository.ToolRecoveryResolutionRequest("turn_1", "call_skip",
+                            suspended.threadRevision() - 1, pending.recoveryRevision(),
+                            ConversationRepository.ToolRecoveryDisposition.SKIP, "skip-stale", START.plusSeconds(2));
+            StorageException conflict = assertThrows(StorageException.class, () -> store.resolveToolRecovery(stale));
+            assertEquals(StorageException.Code.CAS_CONFLICT, conflict.code());
+
+            ConversationRepository.ToolRecoveryResolutionRequest request =
+                    new ConversationRepository.ToolRecoveryResolutionRequest("turn_1", "call_skip",
+                            suspended.threadRevision(), pending.recoveryRevision(),
+                            ConversationRepository.ToolRecoveryDisposition.SKIP, "skip-click-1", START.plusSeconds(3));
+            ConversationRepository.ToolRecoveryResolution first = store.resolveToolRecovery(request);
+            ConversationRepository.ToolRecoveryResolution repeated = store.resolveToolRecovery(request);
+
+            assertTrue(first.changed());
+            assertFalse(repeated.changed());
+            List<ToolResultContent> results = toolResults(store.readThread("thr_1").orElseThrow());
+            assertEquals(1, results.size());
+            assertEquals("call_skip", results.getFirst().callId());
+            assertTrue(results.getFirst().error());
+            assertEquals("此操作的执行结果未知，用户已跳过这一步。", results.getFirst().content());
+            try (var session = database.sessions().openSession()) {
+                assertEquals("FAILED", session.getMapper(AgentMapper.class).selectTool(
+                        new PersistenceRecords.ToolKey("turn_1", "call_skip")).state());
+                assertEquals("SKIPPED", PersistenceMappers.open(session).recovery()
+                        .selectToolRecovery("call_skip").state());
+                assertEquals(2, PersistenceMappers.open(session).recovery()
+                        .countToolRecoveryAttempts(pending.recoveryId()));
+            }
+        }
+    }
+
+    /** 游标失配时只保留首个已启动未知项，后续 PREPARED 调用不得被恢复代码臆测结算。 */
     @Test
     void settlesUnfinishedToolsBeforePersistedCursor() throws Exception {
         try (TestDatabase database = database("recovery-tools-ahead-cursor")) {
@@ -1557,13 +1694,10 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
 
             StartupRecoveryService.RecoveryResult recovery = database.recovery().recover();
 
-            assertEquals(2, recovery.tools());
-            assertInstanceOf(TurnExecutionState.Ready.class,
+            assertEquals(1, recovery.tools());
+            assertInstanceOf(TurnExecutionState.Tools.class,
                     store.findResumeCandidate("turn_1").orElseThrow().execution());
-            assertEquals(List.of("call_early", "call_late"),
-                    toolResults(store.readThread("thr_1").orElseThrow()).stream()
-                            .map(ToolResultContent::callId)
-                            .toList());
+            assertTrue(toolResults(store.readThread("thr_1").orElseThrow()).isEmpty());
         }
     }
 
@@ -1981,18 +2115,16 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
 
             StartupRecoveryService.RecoveryResult recovery = database.recovery().recover();
             assertEquals(1, recovery.turns());
-            assertEquals(1, recovery.tools());
+            assertEquals(0, recovery.tools());
             assertEquals(TurnState.SUSPENDED,
                     store.findTurn("thr_1", "turn_1").orElseThrow().state());
             ConversationRepository.ResumeCandidate candidate = store.findResumeCandidate("turn_1").orElseThrow();
-            TurnExecutionState.Ready recovered = assertInstanceOf(
-                    TurnExecutionState.Ready.class, candidate.execution());
-            assertEquals(TurnExecutionState.Next.ASSISTANT, recovered.next());
+            TurnExecutionState.Tools recovered = assertInstanceOf(
+                    TurnExecutionState.Tools.class, candidate.execution());
+            assertEquals(0, recovered.nextOrdinal());
             assertEquals(ApprovalDecision.APPROVE,
                     store.findApproval("turn_1", "call_approval").orElseThrow().decision());
-            assertEquals(List.of(new ToolResultContent(
-                            "call_approval", "TOOL_BINDING_UNAVAILABLE: Tool binding is unavailable.", true)),
-                    toolResults(store.readThread("thr_1").orElseThrow()));
+            assertTrue(toolResults(store.readThread("thr_1").orElseThrow()).isEmpty());
 
             store.resume("turn_1", candidate.threadRevision(), candidate.turnMutationVersion(),
                     START.plusSeconds(4));
@@ -2026,20 +2158,18 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             StartupRecoveryService.RecoveryResult recovery = database.recovery().recover();
 
             assertEquals(1, recovery.turns());
-            assertEquals(1, recovery.tools());
+            assertEquals(0, recovery.tools());
             assertEquals(TurnState.SUSPENDED,
                     store.findTurn("thr_1", "turn_1").orElseThrow().state());
             ConversationRepository.PendingApproval approval =
                     store.findApproval("turn_1", "call_expired").orElseThrow();
             assertEquals("appr_expired", approval.approvalId());
             assertEquals(ApprovalDecision.DENY, approval.decision());
-            TurnExecutionState.Ready recovered = assertInstanceOf(
-                    TurnExecutionState.Ready.class,
+            TurnExecutionState.Tools recovered = assertInstanceOf(
+                    TurnExecutionState.Tools.class,
                     store.findResumeCandidate("turn_1").orElseThrow().execution());
-            assertEquals(TurnExecutionState.Next.ASSISTANT, recovered.next());
-            assertEquals(List.of(new ToolResultContent(
-                            "call_expired", "TOOL_BINDING_UNAVAILABLE: Tool binding is unavailable.", true)),
-                    toolResults(store.readThread("thr_1").orElseThrow()));
+            assertEquals(0, recovered.nextOrdinal());
+            assertTrue(toolResults(store.readThread("thr_1").orElseThrow()).isEmpty());
             assertEquals(0, database.recovery().recover().turns());
         }
     }

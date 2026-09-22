@@ -25,10 +25,14 @@ function ScrollHarness({
   cache,
   threadId,
   latestOffset = 900,
+  revision = threadId,
+  rowStartOffset = 0,
 }: {
   cache: TimelineScrollCache;
   threadId: string;
   latestOffset?: number;
+  revision?: string;
+  rowStartOffset?: number;
 }): ReactElement {
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useMemo<UseTimelineScrollOptions["virtualizer"]>(
@@ -44,12 +48,12 @@ function ScrollHarness({
           lane: 0,
         };
       },
-      getOffsetForIndex: (index) => [index * 100, "start"],
+      getOffsetForIndex: (index) => [index * 100 + rowStartOffset, "start"],
       scrollToOffset: (offset) => {
         if (scrollRef.current !== null) scrollRef.current.scrollTop = offset;
       },
     }),
-    [],
+    [rowStartOffset],
   );
   const scrollToLatest = (): void => {
     if (scrollRef.current !== null) scrollRef.current.scrollTop = latestOffset;
@@ -58,7 +62,7 @@ function ScrollHarness({
     cache,
     threadId,
     rowCount: 10,
-    revision: threadId,
+    revision,
     scrollRef,
     virtualizer,
     indexForKey: (key) =>
@@ -120,6 +124,7 @@ describe("TimelineScrollCache", () => {
         scrollDirection: "backward",
       }),
     ).toBe(false);
+    expect(shouldAdjustTimelineScrollPosition({ end: 180 }, 48, instance, false)).toBe(false);
   });
 
   /** 目标 Thread 有缓存时应按 row anchor+offset 恢复，而不是沿用来源 Thread 的像素位置。 */
@@ -217,5 +222,33 @@ describe("TimelineScrollCache", () => {
       scrollTop: { configurable: true, writable: true, value: 0 },
     });
     await waitFor(() => expect(secondScroll).toHaveProperty("scrollTop", 320));
+  });
+
+  /** 流式测量即使迟到改写虚拟行起点，也必须在 paint 前用用户保存的行锚点恢复阅读位置。 */
+  it("reanchors an up-scrolled reader when a stream revision shifts virtual row geometry", async () => {
+    const cache = new TimelineScrollCache();
+    const rendered = render(
+      <ScrollHarness cache={cache} threadId="thread:reading" revision="before" />,
+    );
+    const scroll = rendered.container.firstElementChild;
+    expect(scroll).not.toBeNull();
+    if (scroll === null) return;
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 1_000 },
+      scrollTop: { configurable: true, writable: true, value: 220 },
+    });
+    fireEvent.scroll(scroll);
+
+    rendered.rerender(
+      <ScrollHarness
+        cache={cache}
+        threadId="thread:reading"
+        revision="stream-delta"
+        rowStartOffset={48}
+      />,
+    );
+
+    await waitFor(() => expect(scroll).toHaveProperty("scrollTop", 268));
   });
 });

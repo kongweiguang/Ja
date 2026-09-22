@@ -1835,6 +1835,98 @@ describe("timeline reducer", () => {
     expect(state.threadRevisionByThread[threadId]).toBe(5);
   });
 
+  /** 自动压缩属于发起它的回复过程，生命周期只更新同一 Tool item，不向右侧操作区另建投影。 */
+  it("projects automatic context compaction as an in-place context tool step", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+
+    state = apply(
+      state,
+      event("context/compaction-started", 1, {
+        eventId: "evt_auto_compaction_started",
+        compactionId: "cmp_auto",
+        trigger: "automatic",
+        sourceRevision: 1,
+        inputTokensBefore: 12_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+      }),
+    );
+    const itemId = "item_compaction_auto";
+    expect(state.itemIdsByThread[threadId]).toEqual([itemId]);
+    expect(state.items[itemId]).toMatchObject({
+      kind: "tool_call",
+      status: "in_progress",
+      title: "上下文自动压缩",
+      metadata: {
+        toolName: "context_compaction",
+        presentation: { kind: "context", status: "running" },
+      },
+    });
+
+    state = apply(
+      state,
+      event("context/compacted", 2, {
+        eventId: "evt_auto_compaction_completed",
+        compactionId: "cmp_auto",
+        checkpointId: "checkpoint_auto",
+        trigger: "automatic",
+        sourceRevision: 1,
+        inputTokensBefore: 12_000,
+        inputTokensAfter: 4_000,
+        strategyVersion: "ja-context-v1",
+      }),
+    );
+    expect(state.itemIdsByThread[threadId]).toEqual([itemId]);
+    expect(state.items[itemId]).toMatchObject({
+      status: "completed",
+      metadata: {
+        presentation: {
+          kind: "context",
+          status: "success",
+          summary: "上下文已从 12,000 Token 压缩至 4,000 Token。",
+        },
+      },
+    });
+
+    state = apply(
+      state,
+      event("context/compaction-started", 2, {
+        eventId: "evt_auto_compaction_failed_started",
+        compactionId: "cmp_auto_failed",
+        trigger: "automatic",
+        sourceRevision: 2,
+        inputTokensBefore: 24_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+      }),
+    );
+    state = apply(
+      state,
+      event("context/compaction-failed", 2, {
+        eventId: "evt_auto_compaction_failed",
+        compactionId: "cmp_auto_failed",
+        trigger: "automatic",
+        sourceRevision: 2,
+        inputTokensBefore: 24_000,
+        inputTokensAfter: null,
+        strategyVersion: "ja-context-v1",
+        errorCode: "SUMMARY_FAILURE",
+      }),
+    );
+    expect(state.itemIdsByThread[threadId]).toEqual([itemId, "item_compaction_auto_failed"]);
+    expect(state.items["item_compaction_auto_failed"]).toMatchObject({
+      status: "failed",
+      metadata: {
+        presentation: {
+          kind: "context",
+          status: "error",
+          summary: "自动压缩未完成：SUMMARY_FAILURE。",
+        },
+      },
+    });
+  });
+
   /** 压缩和恢复期间保留旧 Usage；新的 Provider KNOWN 到达后才更新环。 */
   it("在多次压缩生命周期中保持旧 Usage 并允许新响应更新", () => {
     let state = readyState();

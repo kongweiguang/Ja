@@ -46,6 +46,21 @@ function validReport() {
       finalBodyOutsideProcess: true,
       sequence: ["commentary", "tool:read", "commentary", "commentary", "tool:shell", "commentary"],
     },
+    contextUsage: {
+      // 固定 279px 覆盖 WebView2 非整数 DPI 的真实回报，防止报告合同重新退化为精确像素比较。
+      width: 279,
+      userSelect: "text",
+      metrics: {
+        newInput: "60",
+        output: "36",
+        cacheRead: "0",
+        total: "96",
+        cacheRate: "—",
+        context: "0.0%",
+        used: "20 / 128K",
+      },
+      narrow: { documentOverflows: false },
+    },
     finalVisible: true,
   };
 }
@@ -84,14 +99,18 @@ test("报告必须证明流式正文留在工作过程、terminal 收口与 relo
   assert.throws(() => validateConversationProgressReport(report), /interleave|deep-equal|equal/u);
 });
 
+/** 当前 Agent 提示的公开进展约束必须被 loopback fixture 识别，防止真窗只因验收关键字过时而失败。 */
 test("loopback fixture 按 function_call_output 推进 read、shell、final 三轮", async () => {
   const fixture = await startConversationProgressFixture();
   try {
+    const instructions =
+      "Before the first tool call, briefly explain your intent. " +
+      "Share meaningful findings and changes of direction without narrating every operation.";
     const post = (input) =>
       fetch(`${fixture.baseUrl}/responses`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ input }),
+        body: JSON.stringify({ input, instructions }),
       });
     const firstResponse = post([
       { role: "user", content: [{ type: "input_text", text: "progress" }] },
@@ -130,6 +149,13 @@ test("loopback fixture 按 function_call_output 推进 read、shell、final 三�
         .attempts.filter((attempt) => attempt.kind === "turn")
         .map((attempt) => attempt.step),
       [0, 1, 2],
+    );
+    assert.equal(
+      fixture
+        .snapshot()
+        .attempts.filter((attempt) => attempt.kind === "turn")
+        .every((attempt) => attempt.progressInstruction),
+      true,
     );
   } finally {
     await fixture.close();

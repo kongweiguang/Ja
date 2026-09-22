@@ -116,6 +116,9 @@ public interface HistoryMapper {
     /** 读取 Thread 最近一次已提交 Provider Usage，供重启后恢复上下文指示器。 */
     PersistenceRecords.ContextUsageRow selectLatestContextUsage(@Param("threadId") String threadId);
 
+    /** 聚合当前 Thread 的助手与摘要请求，不扫描 Timeline 或跨 Thread 读取。 */
+    PersistenceRecords.ThreadUsageSummaryRow selectThreadUsageSummary(@Param("threadId") String threadId);
+
     /** 原子插入唯一 Turn change set 及可选 diff artifact。 */
     int insertChangeSet(PersistenceRecords.ChangeSetInsert values);
 

@@ -879,6 +879,14 @@ function isToolInteractionAnswers(value: unknown): boolean {
 function isToolPresentation(value: unknown): value is ToolPresentation {
   if (typeof value !== "object" || value === null) return false;
   const presentation = value as Record<string, unknown>;
+  const recovery = presentation["recovery"];
+  const validRecovery =
+    recovery === undefined ||
+    (typeof recovery === "object" &&
+      recovery !== null &&
+      Object.keys(recovery).length === 1 &&
+      Number.isSafeInteger((recovery as Record<string, unknown>)["revision"]) &&
+      ((recovery as Record<string, unknown>)["revision"] as number) >= 1);
   return (
     ["read", "edit", "write", "shell", "mcp"].includes(String(presentation["kind"])) &&
     typeof presentation["title"] === "string" &&
@@ -888,7 +896,8 @@ function isToolPresentation(value: unknown): value is ToolPresentation {
     Array.isArray(presentation["relativePaths"]) &&
     (presentation["summary"] === undefined || typeof presentation["summary"] === "string") &&
     isToolInteractionAnswers(presentation["interactionAnswers"]) &&
-    typeof presentation["truncated"] === "boolean"
+    typeof presentation["truncated"] === "boolean" &&
+    validRecovery
   );
 }
 

@@ -38,6 +38,8 @@ export type {
   ConversationModelOption,
   ConversationModelSelection,
   ConversationThreadPreferences,
+  ConversationUsageReader,
+  ConversationUsageSummary,
   ReasoningLevel,
   ConversationArtifactPort,
   ConversationAcceptedTurn,

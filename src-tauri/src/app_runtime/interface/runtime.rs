@@ -107,6 +107,16 @@ pub async fn ja_turn_resume(
     run_blocking(move || host.turn_resume(input.into()).map(Into::into)).await
 }
 
+/// 提交原 Tool 详情中的明确重试或跳过选择；自动续接继续由 App Server 的唯一 Resume 入口编排。
+#[tauri::command]
+pub async fn ja_turn_recovery_respond(
+    input: ToolRecoveryResponseInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ToolRecoveryResponseDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.turn_recovery_respond(input.into()).map(Into::into)).await
+}
+
 /// 默认把文本加入普通 follow-up FIFO；kind 与优先序不由 renderer 提交。
 #[tauri::command]
 pub async fn ja_turn_input_enqueue(

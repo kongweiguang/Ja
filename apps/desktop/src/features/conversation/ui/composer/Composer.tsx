@@ -66,6 +66,7 @@ import type {
   ConversationModelOption,
   ConversationSubmit,
   ConversationThreadPreferences,
+  ConversationUsageReader,
   ReasoningLevel,
 } from "../../application/ports";
 import type { ContextUsagePresentation } from "../../domain/contextUsage";
@@ -155,6 +156,8 @@ export interface ComposerProps {
   attachmentDraftItems?: readonly ConversationAttachmentDraftItem[];
   activeTurn?: boolean;
   suspendedTurn?: boolean;
+  /** 仅由权威 Timeline 的最新失败 Turn 决定，防止历史失败误触发新的续答。 */
+  continuationAvailable?: boolean;
   disabled?: boolean;
   preferenceBusy?: boolean;
   importingAttachments?: boolean;
@@ -166,8 +169,12 @@ export interface ComposerProps {
   error?: string;
   queuedInputs?: readonly ComposerQueuedInputView[];
   queueAccepting?: boolean;
-  /** 仅当 application 已证明模型身份并取得真实 Token 计量时提供。 */
+  /** 圆环只投影已核验的最近请求；会话级计量仅留给开发诊断，不进入日常输入器。 */
   contextUsage?: ContextUsagePresentation;
+  /** 仅暴露当前 Thread 的已持久聚合读取，Composer 不拥有历史、Provider 或费用口径。 */
+  usageReader?: ConversationUsageReader;
+  /** 结算、恢复和上下文身份变化才推进；浮层关闭时不会由此触发读取。 */
+  usageRefreshRevision?: string | number;
   onModelChange?: (selectionValue: string) => void;
   onReasoningChange?: (reasoningLevel: ReasoningLevel | null) => void;
   onAccessModeChange?: (accessMode: ConversationAccessMode) => void;
@@ -201,6 +208,7 @@ export interface ComposerProps {
     content: readonly UserContentBlock[],
   ) => void | Promise<void>;
   onDeleteQueuedInput?: (inputId: string, expectedInputRevision: number) => void | Promise<void>;
+  onContinue?: () => void | Promise<void>;
   onResume?: () => void | Promise<void>;
   onCancel?: () => void | Promise<void>;
   className?: string;
@@ -921,6 +929,7 @@ export function Composer({
   attachmentDraftItems,
   activeTurn = false,
   suspendedTurn = false,
+  continuationAvailable = false,
   interactionPresentation = "none",
   disabled = false,
   preferenceBusy = false,
@@ -933,6 +942,8 @@ export function Composer({
   queuedInputs = [],
   queueAccepting = true,
   contextUsage,
+  usageReader,
+  usageRefreshRevision,
   onModelChange,
   onReasoningChange,
   onAccessModeChange,
@@ -952,6 +963,7 @@ export function Composer({
   onPrioritizeQueuedInput,
   onUpdateQueuedInput,
   onDeleteQueuedInput,
+  onContinue,
   onResume,
   onCancel,
   className,
@@ -1277,12 +1289,14 @@ export function Composer({
   );
   const hasUnresolvedAttachments = draftItems.some((item) => item.state !== "ready");
   const blockedTurn = activeTurn || suspendedTurn;
-  const hasDraftContent =
+  const hasDraftIntent =
+    text.trim().length > 0 || contextReferences.length > 0 || draftItems.length > 0;
+  const hasSendableContent =
     text.trim().length > 0 ||
     contextReferences.some((reference) => reference.type === "workspace_reference") ||
     readyAttachments.length > 0;
   const canSend =
-    hasDraftContent &&
+    hasSendableContent &&
     !disabled &&
     !preferenceBusy &&
     !sending &&
@@ -1299,6 +1313,15 @@ export function Composer({
     !cancelling &&
     !resuming &&
     onResume !== undefined;
+  const showContinue = continuationAvailable && !hasDraftIntent && inlineCommand === undefined;
+  const canContinue =
+    showContinue &&
+    !disabled &&
+    !preferenceBusy &&
+    !sending &&
+    !cancelling &&
+    !resuming &&
+    onContinue !== undefined;
   const dropActive =
     (nativeDropEvent?.phase === "enter" || nativeDropEvent?.phase === "over") &&
     !disabled &&
@@ -1339,6 +1362,12 @@ export function Composer({
   const resume = (): void => {
     if (!canResume || onResume === undefined) return;
     void onResume();
+  };
+
+  /** 新轮次续答不复用暂停 Turn；实际 Thread 身份与 single-flight 由 application owner 再次核验。 */
+  const continueReply = (): void => {
+    if (!canContinue || onContinue === undefined) return;
+    void onContinue();
   };
 
   /**
@@ -1689,7 +1718,7 @@ export function Composer({
         : sending
           ? "loading"
           : "ready";
-  const activeTurnHasDraft = activeTurn && hasDraftContent;
+  const activeTurnHasDraft = activeTurn && hasDraftIntent;
 
   return (
     <>
@@ -1901,8 +1930,14 @@ export function Composer({
             {interactionPanelExpanded ? null : modeStatus}
           </div>
           <div className="ja-composer__trailing">
-            {interactionPanelExpanded || contextUsage === undefined ? null : (
-              <ContextUsageIndicator usage={contextUsage} />
+            {interactionPanelExpanded ? null : (
+              <ContextUsageIndicator
+                usage={contextUsage}
+                threadId={threadId}
+                runtimeGeneration={runtimeGeneration}
+                usageReader={usageReader}
+                refreshRevision={usageRefreshRevision}
+              />
             )}
             {interactionPanelExpanded ? null : (
               <Menu modal={false}>
@@ -2041,7 +2076,7 @@ export function Composer({
                     <Square aria-hidden="true" />
                   )}
                 </IconButton>
-                {(!awaitingUserInput || hasDraftContent) && (
+                {(!awaitingUserInput || hasDraftIntent) && (
                   <IconButton
                     type="button"
                     className="ja-composer__action-button is-send"
@@ -2062,7 +2097,8 @@ export function Composer({
             ) : (
               <IconButton
                 type={
-                  inlineCommand === undefined && activeTurn && !activeTurnHasDraft
+                  inlineCommand === undefined &&
+                  ((activeTurn && !activeTurnHasDraft) || showContinue)
                     ? "button"
                     : "submit"
                 }
@@ -2075,16 +2111,20 @@ export function Composer({
                 disabled={
                   inlineCommand === undefined && activeTurn && !activeTurnHasDraft
                     ? !canCancel
-                    : !canSend
+                    : showContinue
+                      ? !canContinue
+                      : !canSend
                 }
                 label={
                   inlineCommand !== undefined
                     ? `创建${inlineCommand.argument?.label ?? inlineCommand.label}`
                     : activeTurn && !activeTurnHasDraft
                       ? "停止生成"
-                      : activeTurn
-                        ? "排队发送"
-                        : "发送"
+                      : showContinue
+                        ? "继续回复"
+                        : activeTurn
+                          ? "排队发送"
+                          : "发送"
                 }
                 aria-busy={(activeTurn && !activeTurnHasDraft ? cancelling : sending) || undefined}
                 tooltip={
@@ -2092,16 +2132,20 @@ export function Composer({
                     ? `创建${inlineCommand.argument?.label ?? inlineCommand.label}`
                     : activeTurn && !activeTurnHasDraft
                       ? "停止当前生成"
-                      : activeTurn
-                        ? `排队发送（${sendShortcutHint}）`
-                        : sendShortcut === "enter"
-                          ? "发送消息（Enter）"
-                          : "发送消息（Ctrl/Cmd + Enter）"
+                      : showContinue
+                        ? "继续回复"
+                        : activeTurn
+                          ? `排队发送（${sendShortcutHint}）`
+                          : sendShortcut === "enter"
+                            ? "发送消息（Enter）"
+                            : "发送消息（Ctrl/Cmd + Enter）"
                 }
                 onClick={
                   inlineCommand === undefined && activeTurn && !activeTurnHasDraft
                     ? cancel
-                    : undefined
+                    : showContinue
+                      ? continueReply
+                      : undefined
                 }
               >
                 {(activeTurn && !activeTurnHasDraft ? cancelling : sending) ? (
@@ -2110,6 +2154,8 @@ export function Composer({
                   <Target aria-hidden="true" />
                 ) : activeTurn && !activeTurnHasDraft ? (
                   <Square aria-hidden="true" />
+                ) : showContinue ? (
+                  <Play aria-hidden="true" />
                 ) : (
                   <ArrowUp aria-hidden="true" />
                 )}

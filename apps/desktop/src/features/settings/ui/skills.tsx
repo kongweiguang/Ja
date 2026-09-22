@@ -1,112 +1,53 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { ChevronDown, CircleAlert, FileCode2 } from "lucide-react";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import * as Tabs from "@radix-ui/react-tabs";
+import { CircleAlert, FileCode2, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import type { SkillProjection, SkillSource } from "../domain/types";
 import type { SettingsPorts } from "../application/ports";
+import type { SkillProjection } from "../domain/types";
 import { SectionHeader, settingsMutationErrorMessage, sourceLabels, SwitchField } from "./shared";
 import "./skills-about.css";
 
-const skillSources: ReadonlyArray<{ source: SkillSource; location: string }> = [
-  { source: "builtin", location: "随 Ja 提供" },
-  { source: "user", location: "~/.agents/skills" },
-  { source: "ja", location: "~/.ja/skills" },
-  { source: "project", location: ".agents/skills" },
-];
-
-/** 只有真实折叠溢出时才显示展开入口，并持续监听布局变化避免无效操作。 */
-function SkillDescription({
-  skillId,
-  description,
-}: {
-  skillId: string;
-  description: string;
-}): React.ReactElement {
-  const [expanded, setExpanded] = useState(false);
-  const [canExpand, setCanExpand] = useState(false);
-  const paragraphRef = useRef<HTMLParagraphElement>(null);
-
-  /** 仅测量折叠态；展开态的高度不能反过来误判为无需收起。 */
-  const measureOverflow = useCallback((): void => {
-    const paragraph = paragraphRef.current;
-    if (paragraph === null || expanded) return;
-    const nextCanExpand = paragraph.scrollHeight > paragraph.clientHeight;
-    setCanExpand((current) => (current === nextCanExpand ? current : nextCanExpand));
-  }, [expanded]);
-
-  useLayoutEffect(() => {
-    measureOverflow();
-    const paragraph = paragraphRef.current;
-    if (paragraph === null || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measureOverflow);
-    observer.observe(paragraph);
-    return () => observer.disconnect();
-  }, [description, measureOverflow]);
-
-  /** 阅读状态留在组件内，收起后的布局提交会重新验证当前宽度是否仍截断。 */
-  const toggleExpanded = (): void => {
-    setExpanded((current) => !current);
-  };
-
-  return (
-    <>
-      <p
-        ref={paragraphRef}
-        id={`skill-description-${skillId}`}
-        className={expanded ? "ja-skill-description is-expanded" : "ja-skill-description"}
-      >
-        {description}
-      </p>
-      {description.trim().length > 0 && (canExpand || expanded) ? (
-        <button
-          type="button"
-          className="ja-skill-description-toggle"
-          aria-expanded={expanded}
-          aria-controls={`skill-description-${skillId}`}
-          onClick={toggleExpanded}
-        >
-          <span>{expanded ? "收起描述" : "查看完整描述"}</span>
-          <ChevronDown
-            size={14}
-            aria-hidden="true"
-            className={expanded ? "is-expanded" : undefined}
-          />
-        </button>
-      ) : null}
-    </>
-  );
-}
+type SkillScope = "user" | "project";
 
 /**
- * Skills 只投影 Ja Kernel Repository，并仅暴露真实 Toggle 能力，不暗示 Installer 或 Marketplace。
+ * Skills 只展示当前选中作用域可实际管理的发现元数据；缺失记录不再伪造成可读资源。
  */
 export function SkillsSection({
-  skills,
+  globalSkills,
+  projectSkills,
+  projectAvailable,
+  disabled = false,
   onToggleSkill,
 }: {
-  skills: SkillProjection[];
+  globalSkills: SkillProjection[];
+  projectSkills?: SkillProjection[];
+  projectAvailable: boolean;
+  disabled?: boolean;
   onToggleSkill: SettingsPorts["onToggleSkill"];
 }): React.ReactElement {
+  const [scope, setScope] = useState<SkillScope>("user");
   const [pending, setPending] = useState<string>();
   const [feedback, setFeedback] = useState<string>();
-  const grouped = useMemo(
-    () =>
-      skillSources.map(({ source, location }) => ({
-        source,
-        location,
-        skills: skills.filter((skill) => skill.source === source),
-      })),
-    [skills],
-  );
+  const skills = scope === "project" ? (projectSkills ?? []) : globalSkills;
+  // 一次写入会覆盖保存与权威回读两个阶段；锁住整个子面可防止用户在两种作用域间误写。
+  const interactionDisabled = disabled || pending !== undefined;
 
-  /** 可见启用状态必须与原生 Toggle 结果一致，不能保留前端乐观漂移。 */
-  const toggle = async (skill: SkillProjection, enabled: boolean): Promise<void> => {
+  /** 工作区失信或切换时立即回退全局页，不能把上一项目的引用提交到新项目。 */
+  useEffect(() => {
+    if (!projectAvailable) setScope("user");
+  }, [projectAvailable]);
+
+  /**
+   * 服务端回读成功前不乐观更新；失败保留旧值并给出同一控制件可再次操作的恢复路径。
+   */
+  const update = async (skill: SkillProjection, enabled: boolean): Promise<void> => {
     setPending(skill.id);
     setFeedback(undefined);
     try {
-      await onToggleSkill(skill.id, enabled);
+      await onToggleSkill(skill.id, enabled, scope);
       toast.success(`${skill.name} 已${enabled ? "启用" : "停用"}`);
     } catch (error) {
       const message = settingsMutationErrorMessage(error, "Skill 状态修改失败。");
@@ -117,78 +58,105 @@ export function SkillsSection({
     }
   };
 
+  /**
+   * 删除记录根据其来源收敛为停用项目引用或撤销项目禁用，避免额外的“清理”持久化通道。
+   */
+  const removeRecord = async (skill: SkillProjection): Promise<void> => {
+    const restoreProjectGlobal = scope === "project" && !skill.id.startsWith("project:");
+    await update(skill, restoreProjectGlobal);
+  };
+
   return (
     <div className="ja-settings-section">
       <SectionHeader title="Skills" />
-      <div className="ja-settings-skill-groups ja-skill-groups">
-        {grouped.map(({ source, location, skills: sourceSkills }) => (
-          <section
-            key={source}
-            className={`ja-settings-subsection ja-skill-group${sourceSkills.length === 0 ? " is-empty" : ""}`}
-            aria-labelledby={`skill-source-${source}`}
-          >
-            <div className="ja-settings-subheading ja-skill-group-heading">
-              <div className="ja-settings-skill-source-title">
-                <h3 id={`skill-source-${source}`}>{sourceLabels[source]}</h3>
-                <span className="ja-skill-source-location">{location}</span>
-              </div>
-              <span
-                className="ja-settings-skill-count"
-                aria-label={`${sourceSkills.length} 个 Skill`}
-              >
-                {sourceSkills.length}
-              </span>
-              {sourceSkills.length === 0 ? (
-                <span className="ja-skill-empty-inline">暂无 Skills</span>
-              ) : null}
+      <Tabs.Root
+        className="ja-skill-scope"
+        value={scope}
+        onValueChange={(value) => setScope(value as SkillScope)}
+      >
+        <Tabs.List className="ja-skill-scope-tabs" aria-label="Skill 作用域">
+          <Tabs.Trigger className="ja-skill-scope-tab" value="user" disabled={interactionDisabled}>
+            全局
+          </Tabs.Trigger>
+          {projectAvailable ? (
+            <Tabs.Trigger
+              className="ja-skill-scope-tab"
+              value="project"
+              disabled={interactionDisabled}
+            >
+              当前项目
+            </Tabs.Trigger>
+          ) : null}
+        </Tabs.List>
+        <Tabs.Content className="ja-skill-scope-content" value={scope} forceMount>
+          {skills.length === 0 ? (
+            <div className="ja-skill-empty" role="status">
+              暂无 Skills
             </div>
-            {sourceSkills.length === 0 ? null : (
-              <div className="ja-settings-skill-list ja-skill-list">
-                {sourceSkills.map((skill) => (
-                  <article
-                    className="ja-settings-skill-card ja-skill-card"
-                    data-setting-id={`skill-${skill.id}`}
-                    data-setting-search={`${skill.name} ${skill.description} ${sourceLabels[skill.source]} skill 技能 ${skill.enabled ? "启用" : "停用"}`}
-                    key={skill.id}
-                  >
-                    <div className="ja-settings-skill-main ja-skill-main">
-                      <span className="ja-settings-file-icon">
-                        <FileCode2 size={16} aria-hidden="true" />
-                      </span>
-                      <div>
-                        <h4>{skill.name}</h4>
-                        <SkillDescription skillId={skill.id} description={skill.description} />
-                        {skill.status === "reloading" || skill.status === "error" ? (
-                          <span className={`ja-settings-status-text is-${skill.status}`}>
-                            {skill.status === "reloading" ? "重新加载中" : "加载失败"}
-                            {skill.lastGood === undefined ? "" : ` · 最近成功 ${skill.lastGood}`}
-                          </span>
-                        ) : null}
-                        {skill.error === undefined ? null : (
-                          <p className="ja-settings-error" role="alert">
-                            <CircleAlert size={14} aria-hidden="true" />
-                            {skill.error}
-                          </p>
-                        )}
-                      </div>
+          ) : (
+            <div
+              className="ja-skill-list"
+              aria-label={scope === "user" ? "全局 Skills" : "当前项目 Skills"}
+            >
+              {skills.map((skill) => (
+                <article
+                  className="ja-skill-row"
+                  data-setting-id={`skill-${scope}-${skill.id}`}
+                  data-setting-search={`${skill.name} ${skill.description} ${sourceLabels[skill.source]} Skill ${skill.missing ? "文件已移除 移除记录" : skill.enabled ? "启用" : "停用"}`}
+                  key={skill.id}
+                >
+                  <span className="ja-skill-row-icon" aria-hidden="true">
+                    <FileCode2 size={16} />
+                  </span>
+                  <div className="ja-skill-row-copy">
+                    <div className="ja-skill-row-title">
+                      <h3>{skill.name}</h3>
+                      <span>{sourceLabels[skill.source]}</span>
                     </div>
-                    <div className="ja-settings-skill-actions ja-skill-actions">
+                    {skill.description.trim().length > 0 ? <p>{skill.description}</p> : null}
+                    {skill.missing ? (
+                      <p className="ja-skill-missing" role="status">
+                        <CircleAlert size={14} aria-hidden="true" />
+                        文件已移除
+                      </p>
+                    ) : null}
+                    {skill.error !== undefined && !skill.missing ? (
+                      <p className="ja-settings-error" role="alert">
+                        <CircleAlert size={14} aria-hidden="true" />
+                        {skill.error}
+                      </p>
+                    ) : null}
+                  </div>
+                  <div className="ja-skill-row-actions">
+                    {skill.missing ? (
+                      <button
+                        type="button"
+                        className="ja-skill-remove"
+                        aria-label={`移除 ${skill.name} 的记录`}
+                        title="移除记录"
+                        onClick={() => void removeRecord(skill)}
+                        disabled={interactionDisabled}
+                      >
+                        <Trash2 size={15} aria-hidden="true" />
+                        <span>移除记录</span>
+                      </button>
+                    ) : (
                       <SwitchField
-                        id={`skill-toggle-${skill.id}`}
+                        id={`skill-toggle-${scope}-${skill.id}`}
                         label={`${skill.name}：${skill.enabled ? "已启用" : "已停用"}`}
                         checked={skill.enabled}
-                        onCheckedChange={(checked) => void toggle(skill, checked)}
-                        disabled={pending === skill.id}
+                        onCheckedChange={(checked) => void update(skill, checked)}
+                        disabled={interactionDisabled}
                         hideLabel
                       />
-                    </div>
-                  </article>
-                ))}
-              </div>
-            )}
-          </section>
-        ))}
-      </div>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </Tabs.Content>
+      </Tabs.Root>
       {feedback === undefined ? null : (
         <p className="ja-settings-feedback" role="status">
           {feedback}

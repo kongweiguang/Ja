@@ -124,11 +124,13 @@ public final class ConfigurationRuntimeState {
         private final Map<String, CredentialStatus> credentials;
         private final String credentialVersion;
         private final List<ConfigGeneration.Diagnostic> diagnostics;
+        private final List<ConfigurationData.Issue> issues;
 
         /** 冻结一次配置读取的合并结果、凭据状态和诊断，不携带任何 Secret。 */
         public ReadResult(boolean trusted, LayerView user, LayerView project,
                    ObjectNode effective, Map<String, CredentialStatus> credentials,
-                   String credentialVersion, List<ConfigGeneration.Diagnostic> diagnostics) {
+                   String credentialVersion, List<ConfigGeneration.Diagnostic> diagnostics,
+                   List<ConfigurationData.Issue> issues) {
             this.trusted = trusted;
             this.user = user;
             this.project = project;
@@ -136,6 +138,7 @@ public final class ConfigurationRuntimeState {
             this.credentials = Collections.unmodifiableMap(new LinkedHashMap<>(credentials));
             this.credentialVersion = credentialVersion;
             this.diagnostics = List.copyOf(diagnostics);
+            this.issues = List.copyOf(issues);
         }
 
         /** 返回项目层是否已获 Java 侧信任。 */
@@ -171,6 +174,13 @@ public final class ConfigurationRuntimeState {
         /** 返回稳定诊断及其阻断属性。 */
         public List<ConfigGeneration.Diagnostic> diagnostics() {
             return diagnostics;
+        }
+
+        /**
+         * 返回按影响范围收敛的问题列表；问题不改变已经可用的有效文档，也不包含读取失败的原文。
+         */
+        public List<ConfigurationData.Issue> issues() {
+            return issues;
         }
     }
 

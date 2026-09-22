@@ -192,6 +192,24 @@ public final class RpcResults {
         return requestUsage(mapper, usage.request(), usage.measuredAt()).put("turnId", usage.turnId());
     }
 
+    /**
+     * 汇总账本只返回计量和覆盖范围，不包含模型配置、请求正文或缓存实现细节；前端通过计数
+     * 判断某项是否为部分样本，而不能把缺失 Provider 字段解释为零。
+     */
+    public static ObjectNode threadUsageSummary(ObjectMapper mapper, String threadId,
+                                                io.github.kongweiguang.ja.conversation.domain.ThreadUsageSummary value) {
+        return mapper.createObjectNode().put("threadId", threadId).put("snapshotRevision", value.snapshotRevision())
+                .put("requestCount", value.requestCount()).put("measuredRequestCount", value.measuredRequestCount())
+                .put("newInputRequestCount", value.newInputRequestCount()).put("newInputTokens", value.newInputTokens())
+                .put("outputRequestCount", value.outputRequestCount()).put("outputTokens", value.outputTokens())
+                .put("totalRequestCount", value.totalRequestCount()).put("totalTokens", value.totalTokens())
+                .put("cacheReadRequestCount", value.cacheReadRequestCount()).put("cacheReadTokens", value.cacheReadTokens())
+                .put("cacheWriteRequestCount", value.cacheWriteRequestCount()).put("cacheWriteTokens", value.cacheWriteTokens())
+                .put("cacheCompleteRequestCount", value.cacheCompleteRequestCount())
+                .put("cacheCompleteInputTokens", value.cacheCompleteInputTokens())
+                .put("cacheCompleteReadTokens", value.cacheCompleteReadTokens());
+    }
+
     /** 请求级 Usage 在事件与 thread/read 中共享唯一判别联合，UNKNOWN 仅保留真实的计量不可得语义。 */
     static ObjectNode requestUsage(ObjectMapper mapper, ProviderRequestUsage value, java.time.Instant measuredAt) {
         ObjectNode result = mapper.createObjectNode().put("requestId", value.requestId())

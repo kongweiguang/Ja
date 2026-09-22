@@ -22,6 +22,7 @@ import {
   type ConversationAttachmentPort,
   type ConversationContextReference,
   type ConversationInteractionController,
+  type ConversationUsageReader,
   type InteractionController,
   type TimelineGoalActivity,
 } from "@/features/conversation";
@@ -49,6 +50,8 @@ export interface TaskComposerSkillSuggestion {
 export interface TaskComposerEnvironment {
   readonly workspaceId: string;
   readonly runtimeGeneration?: number;
+  /** 侧聊必须用自身 Thread 读取同一份服务端账本，不能借用主会话快照。 */
+  readonly usageReader?: ConversationUsageReader;
   readonly nativeDropEvent?: ComposerNativeDropEvent;
   readonly dropZoneRef?: (element: HTMLFormElement | null) => void;
   readonly skills?: readonly TaskComposerSkillSuggestion[];
@@ -79,6 +82,15 @@ export interface TaskTranscriptActions {
     callId: string;
     artifactId: string;
   }) => Promise<string>;
+  readonly onResolveToolRecovery?: (input: {
+    threadId: string;
+    turnId: string;
+    callId: string;
+    expectedThreadRevision: number;
+    expectedRecoveryRevision: number;
+    decision: "retry" | "skip";
+    idempotencyKey: string;
+  }) => Promise<unknown>;
   readonly onOpenAttachmentPreview?: (
     attachment: {
       attachmentId: string;
@@ -195,11 +207,24 @@ export function TaskDetailPanel({
     ];
   }, [goal?.model, persistedGoalActivities, threadId]);
   const usage = useTimelineStore((state) => state.contextUsageByThread[threadId]);
+  const invalidatedAt = useTimelineStore(
+    (state) => state.contextUsageInvalidatedAtByThread[threadId],
+  );
   const compaction = useTimelineStore((state) => state.contextCompactionByThread[threadId]);
   const contextUsage = useMemo(
-    () => resolveContextUsage({ usage, compaction }),
-    [usage, compaction],
+    () => resolveContextUsage({ usage, invalidatedAt, compaction }),
+    [usage, invalidatedAt, compaction],
   );
+  /** 与主 Composer 保持同一刷新语义：仅新的请求身份或恢复事实才能刷新已打开浮层。 */
+  const usageRefreshRevision = [
+    usage?.requestId,
+    usage?.requestOrdinal,
+    usage?.modelRound,
+    usage?.measuredAt,
+    invalidatedAt,
+    compaction?.phase,
+    compaction?.occurredAt,
+  ].join("\u0000");
   const context =
     controller.detail?.task.taskThreadId === threadId ? controller.detail.contextSeed : undefined;
   const closing = controller.closingTaskThreadId === threadId;
@@ -361,14 +386,10 @@ export function TaskDetailPanel({
                   decision,
                 )
           }
-          onPrepareRetry={
-            conversation === undefined
-              ? undefined
-              : (_turnId, text) => conversation.updateDraft(text)
-          }
           onOpenLink={transcriptActions?.onOpenLink}
           onCopyText={transcriptActions?.onCopyText}
           onReadToolArtifact={transcriptActions?.onReadToolArtifact}
+          onResolveToolRecovery={transcriptActions?.onResolveToolRecovery}
           onOpenAttachmentPreview={transcriptActions?.onOpenAttachmentPreview}
           emptyText="随时开始新的任务"
         />
@@ -460,6 +481,8 @@ export function TaskDetailPanel({
             queuedInputs={conversation.queuedInputs}
             queueAccepting={conversation.queueAccepting}
             contextUsage={contextUsage}
+            usageReader={environment?.usageReader}
+            usageRefreshRevision={usageRefreshRevision}
             placeholder={
               conversation.preferences?.collaborationMode === "plan"
                 ? "描述需要制定计划的任务…"

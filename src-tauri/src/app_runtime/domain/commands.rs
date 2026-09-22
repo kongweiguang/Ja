@@ -264,6 +264,43 @@ pub struct TurnResumeInput {
     pub expected_thread_revision: u64,
 }
 
+/// 未知 Tool 的用户裁决只绑定当前 call、Thread/recovery 两层 CAS 与单次幂等键；文件证据不跨越 WebView。
+#[derive(Debug, Clone)]
+pub struct ToolRecoveryResponseInput {
+    pub turn_id: String,
+    pub call_id: String,
+    pub expected_thread_revision: u64,
+    pub expected_recovery_revision: u64,
+    pub decision: String,
+    pub idempotency_key: String,
+}
+
+impl ToolRecoveryResponseInput {
+    /// Rust 仅收窄身份与词汇，当前恢复状态、Tool 绑定和重复提交的真相继续由 Java SQLite 裁决。
+    pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
+        if !valid_frozen_turn_id(&self.turn_id)
+            || !valid_protocol_id(&self.call_id, "call_", 128)
+            || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
+            || !(1..=MAX_SAFE_JSON_INTEGER).contains(&self.expected_recovery_revision)
+            || !matches!(self.decision.as_str(), "retry" | "skip")
+            || !valid_text_id(&self.idempotency_key, 128)
+        {
+            return Err(DomainValidationError);
+        }
+        Ok(())
+    }
+}
+
+/// 只回显公开裁决与新的 Thread revision；最终执行状态仍从既有事件和 Thread 快照取得。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRecoveryResponse {
+    pub accepted: bool,
+    pub turn_id: String,
+    pub thread_revision: u64,
+    pub decision: String,
+    pub resumed: bool,
+}
+
 impl TurnResumeInput {
     /// 在进入 actor 前拒绝非冻结 Turn identity 与 JavaScript 不安全整数，避免恢复请求成为状态隧道。
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {

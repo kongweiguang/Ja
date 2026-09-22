@@ -266,12 +266,14 @@ export async function startConversationProgressFixture() {
       const hasReadOutput = serialized.includes(READ_CALL_ID);
       const step = hasShellOutput ? 2 : hasReadOutput ? 1 : 0;
       const instructions = String(payload.instructions ?? "").replace(/\s+/g, " ");
+      // 只检查当前 Agent 提示中“首个 Tool 前说明意图 + 关键进展更新”的行为约束，避免把已退役的措辞当作协议。
+      const progressInstruction =
+        instructions.includes("Before the first tool call, briefly explain your intent.") &&
+        instructions.includes("Share meaningful findings and changes of direction");
       attempts.push({
         kind: "turn",
         step,
-        progressInstruction: instructions.includes(
-          "public progress update before the first Tool call",
-        ),
+        progressInstruction,
       });
       if (step === 0) {
         await writeDelayedStream(

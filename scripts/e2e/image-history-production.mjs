@@ -367,7 +367,7 @@ async function createRunDirectories() {
 /** 写入仅指向本轮 loopback Provider 的最小合法配置，并收紧 auth 文件 ACL。 */
 async function writeIsolatedSettings(home, baseUrl) {
   const config = [
-    "schema_version = 1",
+    "schema_version = 2",
     "config_revision = 1",
     'default_access_mode = "full_access"',
     'default_provider_id = "provider_e2e"',

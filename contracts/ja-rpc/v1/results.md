@@ -4,13 +4,27 @@
 
 `configuration/read` returns one explicit `cas` object containing exactly `userVersion`,
 `projectVersion`, and `credentialVersion`; layer projections do not repeat these versions.
+It also returns an `issues` array of stable, redacted objects. An issue identifies its scope, optional
+field or entry, reason, actual impact, and currently permitted recovery actions; it never includes a
+file path, TOML source, provider endpoint, header, credential, or parser exception text.
 Configuration and credential mutations require `expectedVersion` and return the newly committed
 `version`. No result echoes Secret material except the strict `{secret:string|null}` response from
 `credential/reveal-provider`, which is limited to the API Key currently bound to an explicitly selected Provider.
+`configuration/replace` is a discriminated strict union: `scope:"user"` accepts the complete v2 user
+document, while `scope:"project"` requires a trusted `workspaceId` and accepts only
+`{schema_version:2,config_revision,skills,disabled_skills?}`. A failed write leaves the last accepted
+projection unchanged; the caller must read back before retrying.
+
+`configuration/restore` accepts only the current user-layer CAS version. Java creates a sibling backup of
+the current readable TOML before atomically restoring its latest fully usable snapshot. It returns the normal
+`{accepted:true,scope:"user",version}` mutation result; missing or invalid snapshots fail without changing the
+raw configuration file.
 List methods return `{items,nextCursor}`. Successful
 `turn/start` and `turn/resume` return the same exact admission receipt field set
 `{accepted:true,queued:boolean,turnId,threadRevision}`. `turn/start` may report `queued:false` when execution starts immediately;
 `turn/resume` always reports `queued:true` because it transitions the existing Operation from `suspended` to `queued` and never creates or returns another Operation identity.
+
+`turn/recovery/respond` returns exactly `{accepted:true,turnId,threadRevision,decision,resumed}`. `resumed:false` means the selected resolution committed but an earlier or later unknown Tool still prevents ordinary continuation; it is not a failed submission. This ACK never represents a Tool success, a file verification, or a terminal Turn state.
 
 `model/discover` returns exactly `{items:string[],truncated:boolean}`. It reads one upstream `/v1/models`
 page using the selected saved Provider configuration, caps `items` at 200, and returns no endpoint, Header,
@@ -25,9 +39,10 @@ durable seen boundary and never suppresses a non-terminal execution status. `thr
 `latestTurnSeen=true` for the latest Turn visible at that CAS commit. Archive results have
 `status="archived"` and `pinned=false`; restore results have `status="active"` and `pinned=false`.
 
-`skill/list` projects only the effective precedence winner for each Skill name. `scope` is exactly one of
-`builtin`, `user`, `ja`, or `project`; unconfigured discoveries are returned disabled until the user
-explicitly enables them. Physical roots, `SKILL.md` bodies, and package revisions do not cross JA-RPC.
+`skill/list` projects only the effective precedence winner for each Skill name. `skillId` is always
+`user:名称`, `ja:名称`, or `project:名称`, and `scope` is exactly `user`, `ja`, or `project`.
+Unconfigured discoveries are returned disabled until explicitly enabled. Physical roots, `SKILL.md` bodies,
+and package revisions do not cross JA-RPC.
 
 `attachment/import` and `attachment/discard` return exactly
 `{attachmentId,workspaceId,displayName,sizeBytes,mediaKind,mediaType,state,createdAt,expiresAt,boundMessageId}`.
@@ -56,6 +71,12 @@ Every Usage carries `requestId`, monotonic `requestOrdinal`, `modelRound`, `purp
 `profile`, all three Token fields, and `measuredAt`. `certainty="unknown"` requires null Token fields. KNOWN requires integer
 Tokens with `totalTokens >= inputTokens + outputTokens`; UNKNOWN never means zero. Snapshot Turns have no `runtime`.
 Clients calculate context capacity only from `usage.profile.contextWindowTokens` and never current preferences.
+
+`thread/usage/read` returns the exact persisted aggregate
+`{threadId,snapshotRevision,requestCount,measuredRequestCount,newInputRequestCount,newInputTokens,outputRequestCount,outputTokens,totalRequestCount,totalTokens,cacheReadRequestCount,cacheReadTokens,cacheWriteRequestCount,cacheWriteTokens,cacheCompleteRequestCount,cacheCompleteInputTokens,cacheCompleteReadTokens}`.
+Every token total has a companion request-coverage field. Missing Provider accounting lowers coverage rather than
+creating a zero-valued measurement; this diagnostic result never contains prompts, responses, credentials, prices,
+or Provider configuration.
 
 `thread/read.turns[].status` is one of `queued`, `running`, `waiting_approval`, `suspended`,
 `completed`, `failed`, or `cancelled`. `suspended` is non-terminal and has null `completedAt`; it is

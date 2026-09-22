@@ -99,6 +99,18 @@ public interface AgentTool {
     }
 
     /**
+     * 在越过执行边界前返回可持久化的恢复证据。默认拒绝猜测：只有内建文件 Tool 能在不暴露正文的
+     * 前提下给出精确目标与预期 postimage 时才参与自动核实，Shell、MCP 和远程 Tool 保持为空。
+     */
+    default Optional<RecoveryEvidence> prepareRecoveryEvidence(
+            Invocation invocation, ExecutionContext context, CancellationToken cancellationToken) {
+        Objects.requireNonNull(invocation, "invocation");
+        Objects.requireNonNull(context, "context");
+        Objects.requireNonNull(cancellationToken, "cancellationToken");
+        return Optional.empty();
+    }
+
+    /**
      * 在给定取消作用域内执行一次调用，并返回可安全持久化的结果。
      */
     CompletionStage<ToolResult> execute(
@@ -229,6 +241,47 @@ public interface AgentTool {
                    + ", mutationReceipt=" + mutationReceipt.isPresent()
                    + ", mutationObservationFailure=" + mutationObservationFailure.isPresent()
                    + ", errorCode=" + errorCode + "]";
+        }
+    }
+
+    /**
+     * 仅保存 Workspace 内文件预期 postimage 的身份、长度与 SHA-256；正文不进入恢复表、日志或
+     * 用户可见投影。验证时只读取这个精确目标，不能凭 Tool 名称或参数重新推导范围。
+     */
+    record RecoveryEvidence(String relativePath, long expectedAfterBytes, String expectedAfterSha256) {
+        /** 将字节级预期冻结为可跨重启重算的最小证据，拒绝绝对路径与父级逃逸。 */
+        public RecoveryEvidence {
+            relativePath = confinedRelative(relativePath);
+            if (expectedAfterBytes < 0 || expectedAfterSha256 == null
+                    || !expectedAfterSha256.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException("invalid recovery evidence");
+            }
+        }
+
+        /** 内建写工具以固定 UTF-8 和 SHA-256 建立预期，不把 postimage 文本保存到恢复状态。 */
+        public static RecoveryEvidence expectedText(String relativePath, String afterText) {
+            String value = Objects.requireNonNull(afterText, "afterText");
+            byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+            return new RecoveryEvidence(relativePath, bytes.length, sha256Bytes(bytes));
+        }
+
+        /** 与 MutationReceipt 使用同一相对路径约束，防止恢复读取越出 Thread 的 Workspace。 */
+        private static String confinedRelative(String value) {
+            if (value == null || value.isBlank() || value.indexOf('\\') >= 0 || value.startsWith("/")
+                    || value.matches("(?i)^[a-z]:.*")
+                    || java.util.Arrays.asList(value.split("/", -1)).contains("..")) {
+                throw new IllegalArgumentException("invalid recovery evidence relative path");
+            }
+            return value;
+        }
+
+        /** 字节摘要避免先解码再重编码把畸形文件错误地判成符合预期。 */
+        private static String sha256Bytes(byte[] value) {
+            try {
+                return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value));
+            } catch (NoSuchAlgorithmException impossible) {
+                throw new IllegalStateException("SHA-256 is unavailable", impossible);
+            }
         }
     }
 

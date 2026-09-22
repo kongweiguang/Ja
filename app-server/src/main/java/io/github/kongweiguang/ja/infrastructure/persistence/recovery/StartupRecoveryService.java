@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.RecoveryMapper;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ToolPresentationCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnExecutionStateCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.TaskRecoveryPersistence;
@@ -24,11 +25,10 @@ import java.util.Objects;
  * 在 RPC admission 开放前，把崩溃遗留 Operation 调和为可验证 SUSPENDED 或稳定终态。
  */
 public final class StartupRecoveryService {
-    private static final String UNAVAILABLE_TOOL_CONTENT =
-            "TOOL_BINDING_UNAVAILABLE: Tool binding is unavailable.";
     private final MybatisUnitOfWork transactions;
     private final Clock clock;
     private final TurnExecutionStateCodec executions;
+    private final ToolPresentationCodec presentations;
     private final ObjectMapper objectMapper;
     private volatile List<QueuedTurn> queuedTurns = List.of();
 
@@ -38,6 +38,7 @@ public final class StartupRecoveryService {
         this.clock = Objects.requireNonNull(clock, "clock");
         objectMapper = new ObjectMapper();
         executions = new TurnExecutionStateCodec(objectMapper);
+        presentations = new ToolPresentationCodec(objectMapper);
     }
 
     /** focused test 可注入真实 SQLite session owner，同时保持与生产完全相同的恢复编排。 */
@@ -47,6 +48,7 @@ public final class StartupRecoveryService {
         this.clock = Objects.requireNonNull(clock, "clock");
         objectMapper = new ObjectMapper();
         executions = new TurnExecutionStateCodec(objectMapper);
+        presentations = new ToolPresentationCodec(objectMapper);
     }
 
     /**
@@ -114,7 +116,7 @@ public final class StartupRecoveryService {
             }
             try {
                 ExecutionRecovery reconciled = reconcileExecution(
-                        mapper, row, execution, occurredAt);
+                        mappers, row, execution, occurredAt);
                 requireChanged(mapper.replaceExecution(new PersistenceRecords.TurnExecutionWrite(
                         row.turnId(), TurnExecutionState.SCHEMA_VERSION,
                         executions.write(reconciled.execution()))),
@@ -136,7 +138,7 @@ public final class StartupRecoveryService {
     }
 
     /** Provider UNKNOWN 已在 dispatch 前与 intent 原子提交；恢复只推进原 READY，绝不能重复插入。 */
-    private ExecutionRecovery reconcileExecution(RecoveryMapper mapper,
+    private ExecutionRecovery reconcileExecution(PersistenceMappers mappers,
                                                   PersistenceRecords.RecoveryTurnRow row,
                                                   TurnExecutionState execution,
                                                   Instant occurredAt) {
@@ -144,52 +146,101 @@ public final class StartupRecoveryService {
             return new ExecutionRecovery(pending.resume().advanceProviderOrdinal(), 0);
         }
         if (execution instanceof TurnExecutionState.Tools tools) {
-            return reconcileTools(mapper, row, tools, occurredAt);
+            return reconcileTools(mappers, row, tools, occurredAt);
         }
         return new ExecutionRecovery(execution, 0);
     }
 
     /**
-     * 启动后不再持有崩溃前的 batch lease，因而完整扫描 batch 并为未结算项写入绑定不可用结果；
-     * 已结算项保持原样，整批推进到 Assistant，异常旧游标也不能遗漏或重放 Tool。
+     * 启动后只把已结算调用向前推进。PREPARED 从未越过副作用边界，可在用户显式继续后通过原 binding
+     * 执行；RUNNING 没有回执时保留未知并暂停，绝不能按名称或日志猜测成功、失败或可安全重放。
      */
-    private ExecutionRecovery reconcileTools(RecoveryMapper mapper,
+    private ExecutionRecovery reconcileTools(PersistenceMappers mappers,
                                               PersistenceRecords.RecoveryTurnRow row,
                                               TurnExecutionState.Tools tools,
                                               Instant occurredAt) {
+        RecoveryMapper mapper = mappers.recovery();
         int next = tools.firstOrdinal();
         int changed = 0;
         while (next <= tools.lastOrdinal()) {
-            PersistenceRecords.ToolRow tool = mapper.selectRecoveryTool(row.turnId(), next);
+            PersistenceRecords.RecoveryToolRow tool = mapper.selectRecoveryTool(row.turnId(), next);
             if (tool == null || tool.ordinal() != next) {
                 throw corrupt("Tool recovery cursor is unavailable");
             }
             switch (tool.state()) {
                 case "SUCCEEDED", "FAILED", "CANCELLED" -> next++;
-                case "PREPARED", "RUNNING" -> {
-                    /* request_user_input 已在同一事务写入 Interaction 后才可保留；未写入的
-                     * RUNNING Tool 仍按未知执行边界失败，避免恢复时凭名称猜测可安全重放。 */
+                case "PREPARED" -> {
+                    /* PREPARED 尚未穿越 ToolStarted 边界。恢复只保留精确 binding/cursor，用户点击继续后
+                     * 会在当前权限下重新校验 binding 并执行，不能在应用启动时自动启动外部副作用。 */
+                    return new ExecutionRecovery(tools, changed);
+                }
+                case "RUNNING" -> {
+                    /* request_user_input 已在同一事务写入 Interaction 后才可保留；其待决请求就是唯一
+                     * 权威裁决来源。其他 RUNNING Tool 只允许创建未知记录并等待 resume 的确定性核验或用户选择。 */
                     if ("request_user_input".equals(tool.toolName())
                             && mapper.hasPendingInteraction(row.turnId(), tool.callId())
                             && next == tools.nextOrdinal()) {
                         return new ExecutionRecovery(tools, changed);
                     }
-                    requireChanged(mapper.failUnsettledTool(
-                            row.turnId(), tool.callId(), occurredAt.toString()),
-                            "startup recovery lost unsettled Tool");
-                    requireChanged(mapper.insertUnavailableToolMessage(
-                            new PersistenceRecords.RecoveryToolMessage(
-                                    recoveryMessageId(tool.callId()), row.threadId(), row.turnId(),
-                                    tool.callId(), UNAVAILABLE_TOOL_CONTENT, occurredAt.toString())),
-                            "startup recovery lost unavailable Tool message");
-                    changed++;
-                    next++;
+                    markPendingRecovery(mappers, row, tool, occurredAt);
+                    return new ExecutionRecovery(tools, changed + 1);
                 }
                 default -> throw corrupt("Tool recovery state is invalid");
             }
         }
         return new ExecutionRecovery(new TurnExecutionState.Ready(
                 tools.common(), TurnExecutionState.Next.ASSISTANT, null), changed);
+    }
+
+    /**
+     * 同一事务创建或重新打开未知记录，并把原 Tool 详情替换为简短、可操作的公开说明。文件证据只留在
+     * 恢复表，Renderer 获得的只有 revision CAS；重复启动不追加第二条记录，也不会丢失原始未知事实。
+     */
+    private void markPendingRecovery(PersistenceMappers mappers, PersistenceRecords.RecoveryTurnRow turn,
+                                     PersistenceRecords.RecoveryToolRow tool, Instant occurredAt) {
+        RecoveryMapper mapper = mappers.recovery();
+        mapper.insertUnknownToolRecovery(new PersistenceRecords.ToolRecoveryUnknownInsert(
+                "recovery_" + tool.callId().substring("call_".length()), turn.threadId(), turn.turnId(),
+                tool.callId(), occurredAt.toString()));
+        requireChanged(mapper.markToolRecoveryPending(new PersistenceRecords.ToolRecoveryPending(
+                        turn.turnId(), tool.callId(), occurredAt.toString())),
+                "startup recovery lost pending Tool record");
+        PersistenceRecords.ToolRecoveryRow recovery = mapper.selectToolRecovery(tool.callId());
+        if (recovery == null || !turn.turnId().equals(recovery.turnId()) || !"PENDING".equals(recovery.state())) {
+            throw corrupt("startup recovery Tool record is unavailable");
+        }
+        recordStartupObservation(mapper, recovery, occurredAt);
+        io.github.kongweiguang.ja.conversation.domain.ToolPresentation current =
+                presentations.read(tool.presentationJson());
+        io.github.kongweiguang.ja.conversation.domain.ToolPresentation pending =
+                new io.github.kongweiguang.ja.conversation.domain.ToolPresentation(
+                        current.kind(), current.title(),
+                        io.github.kongweiguang.ja.conversation.domain.ToolPresentation.Status.ERROR,
+                        current.inputPreview(), current.outputPreview(),
+                        "这条命令已启动，但未保存结果。再次执行可能重复操作。",
+                        current.interactionAnswers(), current.relativePaths(), current.command(),
+                        current.relativeCwd(), current.stdout(), current.stderr(), current.exitCode(),
+                        current.durationMs(), current.truncated(), current.artifactId(),
+                        new io.github.kongweiguang.ja.conversation.domain.ToolPresentation.Recovery(
+                                recovery.recoveryRevision()));
+        requireChanged(mappers.agent().updateToolPresentation(
+                        new PersistenceRecords.ToolPresentationUpdate(turn.turnId(), tool.callId(),
+                                presentations.write(pending), occurredAt.toString())),
+                "startup recovery lost Tool presentation");
+    }
+
+    /**
+     * STARTUP 观察以 recovery revision 派生稳定幂等键。崩溃可能发生在记录与 Tool 详情之间，
+     * 因此允许重试到达，但绝不为同一未知边界追加第二次“启动观察”。
+     */
+    private static void recordStartupObservation(RecoveryMapper mapper,
+                                                 PersistenceRecords.ToolRecoveryRow recovery,
+                                                 Instant occurredAt) {
+        String idempotencyKey = "startup-" + recovery.recoveryId() + "-" + recovery.recoveryRevision();
+        mapper.insertToolRecoveryAttemptIgnore(new PersistenceRecords.ToolRecoveryAttemptInsert(
+                "recovery_attempt_startup_" + recovery.recoveryId(), recovery.recoveryId(),
+                mapper.countToolRecoveryAttempts(recovery.recoveryId()) + 1, "STARTUP", idempotencyKey,
+                occurredAt.toString()));
     }
 
     /** 取消优先终结并清除所有可继续执行的附属状态，重复启动不会再次观察该 Turn。 */
@@ -247,14 +298,6 @@ public final class StartupRecoveryService {
         TurnExecutionState.Common common = ready.common();
         return common.modelRound() == 0 && common.usedToolCalls() == 0 && common.nextProviderOrdinal() == 1
                 && ready.next() == TurnExecutionState.Next.ASSISTANT && ready.summary() == null;
-    }
-
-    /** Tool result message 由 callId 确定，崩溃事务重试保持同一业务身份。 */
-    private static String recoveryMessageId(String callId) {
-        if (callId == null || !callId.startsWith("call_")) {
-            throw corrupt("Tool recovery call identity is invalid");
-        }
-        return "item_recovery_" + callId.substring("call_".length());
     }
 
     /** 所有恢复状态门都必须精确改变一行，否则整批回滚而不是掩盖竞态。 */

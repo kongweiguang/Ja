@@ -29,6 +29,9 @@
         "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/CheckpointMapper\\.xml"
       },
       {
+        "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/ProjectionMapper\\.xml"
+      },
+      {
         "pattern": "io/github/kongweiguang/ja/infrastructure/persistence/mapper/HistoryMapper\\.xml"
       },
       {

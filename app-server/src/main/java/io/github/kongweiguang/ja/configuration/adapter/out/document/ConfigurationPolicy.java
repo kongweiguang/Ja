@@ -8,25 +8,25 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationScope;
+import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 
 import java.net.URI;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
-/** 配置 v1 的唯一严格策略，集中维护 Provider/Model 结构、项目层收紧规则与 Secret 边界。 */
+/** 配置 v2 的唯一严格策略，集中维护 Provider/Model 结构、项目层收紧规则与 Secret 边界。 */
 public final class ConfigurationPolicy {
     private static final int MAX_CREDENTIAL_ID_LENGTH = 100;
     private static final Pattern CREDENTIAL_ID_PATTERN =
             Pattern.compile("cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}");
-    private static final Set<String> ROOT_KEYS = Set.of(
+    private static final Set<String> USER_ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
             "default_model_id", "default_reasoning_level", "interaction", "subagents",
             "providers", "mcp_servers", "skills");
+    private static final Set<String> PROJECT_ROOT_KEYS = Set.of(
+            "schema_version", "config_revision", "skills", "disabled_skills");
     private static final Set<String> USER_REQUIRED_ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
             "default_model_id", "default_reasoning_level", "subagents", "providers", "mcp_servers", "skills");
@@ -50,9 +50,6 @@ public final class ConfigurationPolicy {
             "connect_timeout_ms", "request_timeout_ms");
     private static final Set<String> MCP_KEYS = Set.of(
             "mcp_id", "name", "transport", "endpoint", "args", "env", "headers", "auth", "enabled");
-    private static final Set<String> SKILL_KEYS = Set.of(
-            "skill_id", "name", "scope", "enabled", "description");
-    private static final Set<String> SKILL_SCOPES = Set.of("builtin", "user", "ja", "project");
     private static final Set<String> REASONING_LEVELS = Set.of(
             "off", "minimal", "low", "medium", "high", "xhigh", "max");
     private static final Set<String> SECRET_KEY_PARTS = Set.of(
@@ -71,32 +68,37 @@ public final class ConfigurationPolicy {
         validateDocument(document, ConfigurationScope.USER);
     }
 
-    /** 根据持久化作用域校验完整用户文档或只引用并收紧的项目 overlay。 */
+    /**
+     * 根据持久化作用域校验当前 v2 文档。项目层有意只保存 Skill 引用，防止项目文件成为
+     * Provider、MCP 或执行策略的第二个 owner，且使首次项目写入可保持最小化。
+     */
     public static void validateDocument(ObjectNode document, ConfigurationScope scope) {
         if (document == null || scope == null) {
             throw error(ConfigurationError.Code.INVALID_DOCUMENT, "configuration document is invalid");
         }
-        rejectUnknown(document, ROOT_KEYS);
         requireCurrentSchema(document);
-        if (scope == ConfigurationScope.USER) requireKeys(document, USER_REQUIRED_ROOT_KEYS);
-        else requireKeys(document, Set.of("schema_version", "config_revision"));
+        if (scope == ConfigurationScope.PROJECT) {
+            rejectUnknown(document, PROJECT_ROOT_KEYS);
+            requireKeys(document, Set.of("schema_version", "config_revision", "skills"));
+            validateRevision(document.get("config_revision"));
+            validateSkillReferences(document.get("skills"), scope, false);
+            validateSkillReferences(document.get("disabled_skills"), scope, true);
+            scanForLiteralSecrets(document);
+            return;
+        }
+        rejectUnknown(document, USER_ROOT_KEYS);
+        requireKeys(document, USER_REQUIRED_ROOT_KEYS);
         validateClarification(document, scope);
         validateRevision(document.get("config_revision"));
         validateAccessMode(document.get("default_access_mode"));
         validateArray(document.get("providers"), PROVIDER_KEYS, "provider_id");
         validateArray(document.get("mcp_servers"), MCP_KEYS, "mcp_id");
-        validateArray(document.get("skills"), SKILL_KEYS, "skill_id");
-        if (scope == ConfigurationScope.USER) {
-            validateUserProviders(document);
-            validateUniqueProviderCredentials(document.get("providers"));
-            validateUserMcpServers(document.get("mcp_servers"));
-            validateUserSkills(document.get("skills"));
-        } else {
-            validateProjectProviders(document);
-        }
+        validateSkillReferences(document.get("skills"), scope, false);
+        validateSkillReferences(document.get("disabled_skills"), scope, true);
+        validateUserProviders(document);
+        validateUniqueProviderCredentials(document.get("providers"));
+        validateUserMcpServers(document.get("mcp_servers"));
         validateCatalogEnabled(document.get("mcp_servers"), scope);
-        validateCatalogEnabled(document.get("skills"), scope);
-        validateSkillScopes(document.get("skills"), scope);
         validateDefaultSelection(document, scope == ConfigurationScope.USER);
         validateSubagents(document, scope);
         scanForLiteralSecrets(document);
@@ -124,7 +126,7 @@ public final class ConfigurationPolicy {
         }
     }
 
-    /** 只接受当前 schema v1；其它版本一律失败关闭，不执行迁移或兼容读取。 */
+    /** 只接受当前 schema v2；其它版本一律失败关闭，不执行迁移或兼容读取。 */
     private static void requireCurrentSchema(ObjectNode document) {
         JsonNode schema = document.get("schema_version");
         if (schema == null || !schema.isIntegralNumber()
@@ -133,7 +135,7 @@ public final class ConfigurationPolicy {
         }
     }
 
-    /** revision 是 v1 文档的必填可读顺序，禁止通过缺失字段进入旧的隐式初始状态。 */
+    /** revision 是 v2 文档的必填可读顺序，禁止通过缺失字段进入旧的隐式初始状态。 */
     private static void validateRevision(JsonNode revision) {
         if (revision == null || !revision.isIntegralNumber() || revision.longValue() < 0) {
             throw error(ConfigurationError.Code.INVALID_DOCUMENT, "configuration revision is invalid");
@@ -176,26 +178,6 @@ public final class ConfigurationPolicy {
             if (!credentials.add(credentialId)) {
                 throw error(ConfigurationError.Code.INVALID_DOCUMENT,
                         "provider credential reference is duplicated");
-            }
-        }
-    }
-
-    /** 项目层允许稀疏 Provider/Model overlay，但稳定身份和出现的字段仍须严格合法。 */
-    private static void validateProjectProviders(ObjectNode document) {
-        JsonNode value = document.get("providers");
-        if (!(value instanceof ArrayNode providers)) return;
-        for (JsonNode entry : providers) {
-            ObjectNode provider = (ObjectNode) entry;
-            validateProviderRoute(provider, false);
-            if (provider.get("network_timeouts") instanceof ObjectNode network) {
-                validateNetworkTimeouts(network, false);
-            }
-            if (provider.get("agent_defaults") instanceof ObjectNode defaults) {
-                validateAgentDefaults(defaults, false);
-            }
-            if (provider.has("models")) {
-                validateArray(provider.get("models"), MODEL_KEYS, "model_id");
-                for (JsonNode model : provider.withArray("models")) validateModel((ObjectNode) model, false);
             }
         }
     }
@@ -304,16 +286,44 @@ public final class ConfigurationPolicy {
         }
     }
 
-    /** 用户 Skill 定义必须显式保存全部当前字段，空描述合法但缺失描述不合法。 */
-    private static void validateUserSkills(JsonNode value) {
-        if (!(value instanceof ArrayNode skills)) return;
-        for (JsonNode entry : skills) {
-            ObjectNode skill = (ObjectNode) entry;
-            requireKeys(skill, SKILL_KEYS);
-            requireText(skill, "name", 512, false);
-            requireText(skill, "scope", 64, false);
-            requireText(skill, "description", 8_192, true);
-            requireBoolean(skill, "enabled");
+    /**
+     * 校验只携带来源与名称的 Skill 授权，拒绝旧对象数组以避免描述、路径与开关副本继续进入配置。
+     * 项目层只可登记本项目 Skill，或以 `disabled_skills` 收紧已经存在的全局引用。
+     */
+    private static void validateSkillReferences(
+            JsonNode value, ConfigurationScope scope, boolean disabled) {
+        if (value == null) {
+            if (scope == ConfigurationScope.USER && !disabled) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill references are missing");
+            }
+            return;
+        }
+        if (!(value instanceof ArrayNode references) || references.size() > MAX_ARRAY_ITEMS) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill references are invalid");
+        }
+        if (scope == ConfigurationScope.USER && disabled) {
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "user disabled skills are unsupported");
+        }
+        Set<String> unique = new HashSet<>();
+        for (JsonNode valueNode : references) {
+            if (!valueNode.isTextual()) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill reference is invalid");
+            }
+            SkillReference reference;
+            try {
+                reference = SkillReference.parse(valueNode.textValue());
+            } catch (IllegalArgumentException invalid) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill reference is invalid");
+            }
+            boolean allowed = scope == ConfigurationScope.USER
+                    ? reference.source() == SkillReference.Source.USER || reference.source() == SkillReference.Source.JA
+                    : disabled
+                            ? reference.source() == SkillReference.Source.USER
+                                    || reference.source() == SkillReference.Source.JA
+                            : reference.source() == SkillReference.Source.PROJECT;
+            if (!allowed || !unique.add(reference.identifier())) {
+                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill reference is invalid");
+            }
         }
     }
 
@@ -497,18 +507,6 @@ public final class ConfigurationPolicy {
         }
     }
 
-    /** 用户 Skill 定义只保存当前四类真实来源；项目稀疏覆盖不重复来源事实。 */
-    private static void validateSkillScopes(JsonNode values, ConfigurationScope scope) {
-        if (scope != ConfigurationScope.USER || !(values instanceof ArrayNode array)) return;
-        for (JsonNode value : array) {
-            JsonNode skillScope = value.get("scope");
-            if (skillScope == null || !skillScope.isTextual()
-                || !SKILL_SCOPES.contains(skillScope.textValue())) {
-                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill scope is invalid");
-            }
-        }
-    }
-
     /** reasoning map 使用逻辑七档键和有界上游文本值；缺失键就是不支持。 */
     private static void validateReasoningMap(JsonNode value, boolean required) {
         if (value == null) {
@@ -647,148 +645,32 @@ public final class ConfigurationPolicy {
         return false;
     }
 
-    /** 确保项目层 Provider/Model 只引用用户层稳定身份并收紧权限、能力与预算。 */
+    /**
+     * 项目层唯一可收紧的全局事实是已经显式启用的用户 Skill。项目 Skill 自身由
+     * `project:` 身份隔离，因此无需也不能从用户层继承授权。
+     */
     static void enforceNoEscalation(ObjectNode user, ObjectNode project) {
         if (user == null) return;
         validateDocument(user, ConfigurationScope.USER);
         validateDocument(project, ConfigurationScope.PROJECT);
-        compareRootDefaults(user, project);
-        compareAccess(user.get("default_access_mode"), project.get("default_access_mode"));
-        compareDisabledCatalog(user.get("mcp_servers"), project.get("mcp_servers"), "mcp_id");
-        compareDisabledCatalog(user.get("skills"), project.get("skills"), "skill_id");
-        Map<String, ObjectNode> providers = index(user.get("providers"), "provider_id");
-        JsonNode overlays = project.get("providers");
-        if (!(overlays instanceof ArrayNode array)) return;
-        for (JsonNode value : array) {
-            ObjectNode overlay = (ObjectNode) value;
-            ObjectNode base = providers.get(overlay.path("provider_id").asText());
-            if (base == null) throw escalation("project provider is unavailable");
-            compareProvider(base, overlay);
-        }
+        compareDisabledSkillReferences(user.get("skills"), project.get("disabled_skills"));
     }
 
-    /** 项目默认值只能选择用户层已存在的 Provider/Model，不能通过 overlay 新建路由。 */
-    private static void compareRootDefaults(ObjectNode user, ObjectNode project) {
-        JsonNode provider = project.get("default_provider_id");
-        JsonNode model = project.get("default_model_id");
-        if (provider == null && model == null) return;
-        if (provider == null || model == null || !provider.isTextual() || !model.isTextual()
-            || findModel(user, provider.textValue(), model.textValue()) == null) {
-            throw escalation("project default model is unavailable");
+    /**
+     * 项目禁用引用必须已经在用户层显式启用；否则项目文件会从“收紧”变成可观察的虚假状态。
+     */
+    private static void compareDisabledSkillReferences(JsonNode user, JsonNode disabled) {
+        if (disabled == null) return;
+        if (!(user instanceof ArrayNode userReferences) || !(disabled instanceof ArrayNode disabledReferences)) {
+            throw escalation("project skill references are invalid");
         }
-        JsonNode effort = project.get("default_reasoning_level");
-        if (effort != null && !effort.isNull()) {
-            ObjectNode selected = findModel(user, provider.textValue(), model.textValue());
-            if (!effort.isTextual() || !(selected.get("reasoning_level_map") instanceof ObjectNode levels)
-                || !levels.has(effort.textValue())) {
-                throw escalation("project default reasoning is unavailable");
+        Set<String> enabled = new HashSet<>();
+        userReferences.forEach(value -> enabled.add(value.textValue()));
+        for (JsonNode value : disabledReferences) {
+            if (!enabled.contains(value.textValue())) {
+                throw escalation("project disabled skill is unavailable");
             }
         }
-    }
-
-    /** Provider overlay 不得改写 API、地址或凭据，只能收紧预算和模型能力。 */
-    private static void compareProvider(ObjectNode base, ObjectNode overlay) {
-        for (String key : List.of("api", "base_url", "credential_id")) {
-            if (overlay.has(key) && !java.util.Objects.equals(base.get(key), overlay.get(key))) {
-                throw escalation("project provider route differs from user configuration");
-            }
-        }
-        compareObjectLimits(base.get("network_timeouts"), overlay.get("network_timeouts"));
-        compareAgentDefaults(base.get("agent_defaults"), overlay.get("agent_defaults"));
-        Map<String, ObjectNode> models = index(base.get("models"), "model_id");
-        JsonNode overlays = overlay.get("models");
-        if (!(overlays instanceof ArrayNode array)) return;
-        for (JsonNode value : array) {
-            ObjectNode model = (ObjectNode) value;
-            ObjectNode baseModel = models.get(model.path("model_id").asText());
-            if (baseModel == null) throw escalation("project model is unavailable");
-            compareModel(baseModel, model);
-        }
-    }
-
-    /** Agent 默认值中的数值只能变小，catalog 启停不再由 Provider 默认值承载。 */
-    private static void compareAgentDefaults(JsonNode base, JsonNode overlay) {
-        if (!(base instanceof ObjectNode user) || !(overlay instanceof ObjectNode project)) return;
-        compareObjectLimits(user.get("turn_limits"), project.get("turn_limits"));
-    }
-
-    /** 模型上游标识不可改写，能力预算和思考档位只能收紧。 */
-    private static void compareModel(ObjectNode base, ObjectNode overlay) {
-        if (overlay.has("model") && !java.util.Objects.equals(base.get("model"), overlay.get("model"))) {
-            throw escalation("project upstream model differs from user configuration");
-        }
-        JsonNode baseCapabilities = base.get("capabilities");
-        JsonNode overlayCapabilities = overlay.get("capabilities");
-        compareObjectLimits(baseCapabilities, overlayCapabilities);
-        compareReasoningMap(base.get("reasoning_level_map"), overlay.get("reasoning_level_map"));
-        JsonNode defaultReasoning = overlay.get("default_reasoning_level");
-        JsonNode allowed = overlay.has("reasoning_level_map")
-                ? overlay.get("reasoning_level_map") : base.get("reasoning_level_map");
-        if (defaultReasoning != null && !defaultReasoning.isNull()
-            && (!defaultReasoning.isTextual() || !(allowed instanceof ObjectNode levels)
-                || !levels.has(defaultReasoning.textValue()))) {
-            throw escalation("project model reasoning is unavailable");
-        }
-    }
-
-    /** 项目 reasoning map 只能保留用户已有键且不得改写其上游映射。 */
-    private static void compareReasoningMap(JsonNode base, JsonNode overlay) {
-        if (overlay == null) return;
-        if (!(base instanceof ObjectNode baseMap) || !(overlay instanceof ObjectNode overlayMap)) {
-            throw escalation("project reasoning map exceeds user configuration");
-        }
-        overlayMap.properties().forEach(entry -> {
-            if (!java.util.Objects.equals(baseMap.get(entry.getKey()), entry.getValue())) {
-                throw escalation("project reasoning map exceeds user configuration");
-            }
-        });
-    }
-
-    /** 项目目录项必须引用用户已启用对象并显式关闭，禁止新建或重新启用。 */
-    private static void compareDisabledCatalog(JsonNode base, JsonNode overlay, String idKey) {
-        if (overlay == null) return;
-        Map<String, ObjectNode> available = index(base, idKey);
-        if (!(overlay instanceof ArrayNode entries)) {
-            throw escalation("project catalog is invalid");
-        }
-        for (JsonNode value : entries) {
-            ObjectNode projectEntry = (ObjectNode) value;
-            ObjectNode userEntry = available.get(projectEntry.path(idKey).asText());
-            if (userEntry == null || !userEntry.path("enabled").asBoolean(false)
-                || projectEntry.path("enabled").asBoolean(true)) {
-                throw escalation("project catalog exceeds user configuration");
-            }
-        }
-    }
-
-    /** 根权限值只能保持或降低，不能把审批要求扩大为完整访问。 */
-    private static void compareAccess(JsonNode base, JsonNode overlay) {
-        if (base != null && overlay != null && base.isTextual() && overlay.isTextual()
-            && accessRank(overlay.textValue()) > accessRank(base.textValue())) {
-            throw escalation("project access is broader than user access");
-        }
-    }
-
-    /** 递归比较同名数值预算，项目层任何增大都失败关闭。 */
-    private static void compareObjectLimits(JsonNode user, JsonNode project) {
-        if (!(user instanceof ObjectNode userObject) || !(project instanceof ObjectNode projectObject)) return;
-        projectObject.properties().forEach(entry -> {
-            JsonNode userValue = userObject.get(entry.getKey());
-            JsonNode projectValue = entry.getValue();
-            if (userValue != null && userValue.isNumber() && projectValue.isNumber()
-                && isLimitKey(entry.getKey()) && projectValue.doubleValue() > userValue.doubleValue()) {
-                throw escalation("project limits exceed user limits");
-            }
-            compareObjectLimits(userValue, projectValue);
-        });
-    }
-
-    /** 将对象数组按稳定 ID 建索引，重复身份已在严格校验阶段拒绝。 */
-    private static Map<String, ObjectNode> index(JsonNode values, String idKey) {
-        Map<String, ObjectNode> indexed = new LinkedHashMap<>();
-        if (!(values instanceof ArrayNode array)) return indexed;
-        for (JsonNode value : array) indexed.put(value.path(idKey).asText(), (ObjectNode) value);
-        return indexed;
     }
 
     /** 权限等级只用于判断项目层是否扩大，不承担运行时默认值。 */
@@ -800,15 +682,7 @@ public final class ConfigurationPolicy {
         };
     }
 
-    /** 只把显式预算字段纳入单调收紧比较，普通数字元数据不做安全推断。 */
-    private static boolean isLimitKey(String key) {
-        String normalized = key.toLowerCase(Locale.ROOT);
-        return normalized.contains("limit") || normalized.contains("timeout")
-               || normalized.contains("tokens") || normalized.contains("budget")
-               || normalized.startsWith("max_") || normalized.startsWith("window_");
-    }
-
-    /** 按 RFC 7396 应用对象 Merge Patch，结果仍必须经过 v1 严格策略。 */
+    /** 按 RFC 7396 应用对象 Merge Patch，结果仍必须经过 v2 严格策略。 */
     static ObjectNode applyMergePatch(ObjectNode source, ObjectNode patch) {
         ObjectNode result = source.deepCopy();
         patch.properties().forEach(entry -> {
@@ -830,58 +704,43 @@ public final class ConfigurationPolicy {
         return result;
     }
 
-    /** 深度合并用户文档与已验证项目 overlay，稳定身份数组按 ID 合并。 */
+    /**
+     * 深度合并用户文档与已验证项目 overlay；Skill 引用按来源保持独立，项目禁用只从最终授权集移除。
+     * `disabled_skills` 是项目层控制事实，不得泄漏进 effective 文档或 generation。
+     */
     static ObjectNode mergeDocuments(ObjectNode base, ObjectNode overlay) {
         ObjectNode result = base.deepCopy();
-        overlay.properties().forEach(entry -> mergeValue(result, entry.getKey(), entry.getValue()));
+        appendProjectSkillReferences(result, overlay.get("skills"));
+        removeDisabledSkillReferences(result, overlay.get("disabled_skills"));
+        result.remove("disabled_skills");
         return result;
     }
 
-    /** 对象递归、身份数组逐项合并，其余字段由项目层整体覆盖。 */
-    private static void mergeValue(ObjectNode target, String key, JsonNode overlay) {
-        JsonNode current = target.get(key);
-        if (current instanceof ObjectNode currentObject && overlay instanceof ObjectNode overlayObject) {
-            target.set(key, mergeDocuments(currentObject, overlayObject));
-        } else if (current instanceof ArrayNode currentArray && overlay instanceof ArrayNode overlayArray
-                   && isIdentityArray(currentArray) && isIdentityArray(overlayArray)) {
-            target.set(key, mergeIdentityArrays(currentArray, overlayArray));
-        } else {
-            target.set(key, overlay.deepCopy());
-        }
+    /**
+     * 将项目显式授权追加到用户引用集，不按名称折叠，从而让同名不同来源仍由发现优先级裁决。
+     */
+    private static void appendProjectSkillReferences(ObjectNode target, JsonNode projectReferences) {
+        if (!(projectReferences instanceof ArrayNode references)) return;
+        ArrayNode effective = target.withArray("skills");
+        Set<String> existing = new HashSet<>();
+        effective.forEach(value -> existing.add(value.textValue()));
+        references.forEach(value -> {
+            String reference = value.textValue();
+            if (existing.add(reference)) effective.add(reference);
+        });
     }
 
-    /** 按同类型稳定 ID 更新数组，保持用户层顺序并禁止位置语义。 */
-    private static ArrayNode mergeIdentityArrays(ArrayNode base, ArrayNode overlay) {
-        ArrayNode result = base.deepCopy();
-        for (JsonNode candidate : overlay) {
-            ObjectNode object = (ObjectNode) candidate;
-            String id = identityOf(object);
-            int existing = -1;
-            for (int index = 0; index < result.size(); index++) {
-                if (id.equals(identityOf(result.get(index)))) {
-                    existing = index;
-                    break;
-                }
-            }
-            if (existing < 0) result.add(object.deepCopy());
-            else result.set(existing, mergeDocuments((ObjectNode) result.get(existing), object));
+    /**
+     * 项目停用只能移除已存在的全局授权；项目 Skill 不会因禁用列表而被新增或被其它项目影响。
+     */
+    private static void removeDisabledSkillReferences(ObjectNode target, JsonNode disabledReferences) {
+        if (!(disabledReferences instanceof ArrayNode disabled)) return;
+        Set<String> removed = new HashSet<>();
+        disabled.forEach(value -> removed.add(value.textValue()));
+        ArrayNode effective = target.withArray("skills");
+        for (int index = effective.size() - 1; index >= 0; index--) {
+            if (removed.contains(effective.get(index).textValue())) effective.remove(index);
         }
-        return result;
-    }
-
-    /** 只有所有元素都具备 v1 稳定身份时才启用身份数组合并。 */
-    private static boolean isIdentityArray(ArrayNode array) {
-        for (JsonNode value : array) if (!(value instanceof ObjectNode) || identityOf(value) == null) return false;
-        return true;
-    }
-
-    /** 只识别 v1 的稳定 ID，闭集外身份字段直接失败关闭。 */
-    private static String identityOf(JsonNode value) {
-        if (!(value instanceof ObjectNode object)) return null;
-        for (String key : List.of("provider_id", "model_id", "mcp_id", "skill_id")) {
-            if (object.path(key).isTextual()) return object.path(key).textValue();
-        }
-        return null;
     }
 
     /** 凭据文档只允许有界 credential ID 到文本 Secret 的映射。 */

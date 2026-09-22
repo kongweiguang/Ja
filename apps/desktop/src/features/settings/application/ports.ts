@@ -17,6 +17,7 @@ import type {
   McpStatus,
   AccessMode,
   SettingsDocument,
+  ProjectSkillSettingsDocument,
   SubagentSettings,
   ThemeMode,
   UiPalette,
@@ -57,7 +58,8 @@ export interface SettingsPorts {
   onDeleteMcp: (id: string) => Promise<void>;
   onTestMcp: (id: string) => Promise<McpStatus>;
   onCloseMcp: (id: string) => Promise<void>;
-  onToggleSkill: (id: string, enabled: boolean) => Promise<void>;
+  /** Skill 标识始终携带来源，scope 指向唯一允许写入的用户或当前项目文档。 */
+  onToggleSkill: (id: string, enabled: boolean, scope: "user" | "project") => Promise<void>;
   onAccessModeChange: (mode: AccessMode) => Promise<void>;
   /** 普通模式是否允许模型发起结构化澄清；Plan 不受该开关影响。 */
   onClarificationEnabledChange: (enabled: boolean) => Promise<void>;
@@ -73,7 +75,17 @@ export interface SettingsPorts {
  */
 export interface SettingsAdapter {
   snapshot(input?: { workspaceId?: string }): Promise<LoadedSettings>;
-  save(document: SettingsDocument, expectedVersion: string): Promise<string>;
+  /** 保存时携带读取基线，适配器据此只提交用户实际修改的配置字段。 */
+  save(
+    document: SettingsDocument,
+    expectedVersion: string,
+    baseline?: SettingsDocument,
+  ): Promise<string>;
+  saveProjectSkills(
+    document: ProjectSkillSettingsDocument,
+    workspaceId: string,
+    expectedVersion: string,
+  ): Promise<string>;
   patch(input: {
     scope: "project";
     workspaceId: string;
@@ -85,6 +97,7 @@ export interface SettingsAdapter {
     workspaceId: string;
     expectedVersion: string;
   }): Promise<{ version: string }>;
+  restoreLastKnownGood(expectedVersion: string): Promise<string>;
   setCredential(credentialId: string, secret: string, expectedVersion: string): Promise<string>;
   deleteCredential(credentialId: string, expectedVersion: string): Promise<string>;
   revealProviderCredential(providerId: string): Promise<string | null>;

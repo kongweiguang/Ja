@@ -49,6 +49,14 @@ function createTurnPort(): ConversationTurnPort {
       queued: true,
       threadRevision: expectedThreadRevision + 1,
     })),
+    // 恢复决策仅确认持久裁决；fake 不把 retry/skip 误报成已经完成的 Tool 执行。
+    respondToolRecovery: vi.fn(async ({ turnId, expectedThreadRevision, decision }) => ({
+      accepted: true as const,
+      turnId,
+      threadRevision: expectedThreadRevision + 1,
+      decision,
+      resumed: false,
+    })),
     cancelTurn: vi.fn(
       async ({ turnId }): Promise<ConversationCancelResult> => ({
         accepted: true,
@@ -2080,6 +2088,121 @@ describe("useConversationInteractionController", () => {
       content: [{ type: "text", text: "完成后补充\n\n等待期间的新内容" }],
     });
     expect(result.current.draft).toBe("");
+  });
+
+  it("最新失败轮次以新消息续答，跳过 Plan 创建且失败后允许再次尝试", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed",
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const acknowledgement = deferred<ConversationAcceptedTurn>();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.submitTurn)
+      .mockImplementationOnce(() => acknowledgement.promise)
+      .mockResolvedValueOnce({
+        accepted: true,
+        turnId: "turn_continue",
+        queued: true,
+        threadRevision: 5,
+      });
+    const planCreationPort = { create: vi.fn(async () => true) };
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(
+        options(turnPort, preferencesPort, {
+          preferences: {
+            ...options(turnPort, preferencesPort).preferences!,
+            collaborationMode: "plan",
+          },
+          planCreationPort,
+        }),
+      ),
+    );
+
+    expect(result.current.continuationAvailable).toBe(true);
+    let first!: Promise<void>;
+    let duplicate!: Promise<void>;
+    act(() => {
+      first = result.current.continueReply();
+      duplicate = result.current.continueReply();
+    });
+    expect(turnPort.submitTurn).toHaveBeenCalledTimes(1);
+    expect(turnPort.submitTurn).toHaveBeenCalledWith({
+      threadId: "thr_one",
+      content: [{ type: "text", text: "继续" }],
+    });
+    expect(planCreationPort.create).not.toHaveBeenCalled();
+
+    await act(async () => {
+      acknowledgement.reject(new Error("connection lost"));
+      await Promise.all([first, duplicate]);
+    });
+    expect(result.current.localSubmissions).toEqual([
+      expect.objectContaining({ text: "继续", status: "failed" }),
+    ]);
+    expect(result.current.continuationAvailable).toBe(true);
+
+    await act(async () => result.current.continueReply());
+    expect(turnPort.submitTurn).toHaveBeenCalledTimes(2);
+    expect(result.current.activeTurn).toBe(true);
+    expect(result.current.continuationAvailable).toBe(false);
+  });
+
+  it("草稿、Skill 引用或未完成附件存在时不允许失败轮次续答", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed_draft",
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, preferencesPort)),
+    );
+    act(() => result.current.updateDraft("保留的新问题"));
+    await act(async () => result.current.continueReply());
+    expect(turnPort.submitTurn).not.toHaveBeenCalled();
   });
 
   it("提交失败保留消息级错误且不回填 Composer，并释放 single-flight 允许继续发送", async () => {

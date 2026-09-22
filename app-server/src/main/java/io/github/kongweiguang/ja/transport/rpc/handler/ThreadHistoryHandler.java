@@ -82,7 +82,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     @Override
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.THREAD_CREATE, RpcMethod.THREAD_LIST, RpcMethod.THREAD_SEARCH,
-                RpcMethod.THREAD_READ, RpcMethod.THREAD_RENAME, RpcMethod.THREAD_PREFERENCES_UPDATE,
+                RpcMethod.THREAD_READ, RpcMethod.THREAD_USAGE_READ, RpcMethod.THREAD_RENAME, RpcMethod.THREAD_PREFERENCES_UPDATE,
                 RpcMethod.THREAD_PIN, RpcMethod.THREAD_SEEN, RpcMethod.THREAD_ARCHIVE, RpcMethod.THREAD_RESTORE,
                 RpcMethod.THREAD_DELETE, RpcMethod.TURN_CHANGE_SET_READ, RpcMethod.TOOL_ARTIFACT_READ);
     }
@@ -102,6 +102,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 case THREAD_LIST -> list(command.params());
                 case THREAD_SEARCH -> search(command.params());
                 case THREAD_READ -> read(command.params());
+                case THREAD_USAGE_READ -> readUsageSummary(command.params());
                 case THREAD_RENAME -> rename(command.params());
                 case THREAD_PIN -> pin(command.params());
                 case THREAD_SEEN -> seen(command.params());
@@ -251,6 +252,19 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 .forEach(value -> goalActivities.add(goalWire.terminalActivity(value)));
         RpcResults.cursor(result, snapshot.nextCursor());
         return result;
+    }
+
+    /**
+     * 累计用量独立于 paginated thread/read，防止只为浮层加载正文或被历史页大小截断；不存在的
+     * Thread 保持与 read 相同的公开错误，不泄漏删除状态。
+     */
+    private ObjectNode readUsageSummary(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId");
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
+        return session.threads().readThreadUsageSummary(threadId)
+                .map(value -> RpcResults.threadUsageSummary(session.mapper(), threadId, value))
+                .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND,
+                        "thread is unavailable"));
     }
 
     /** 人工重命名通过 expected revision CAS，返回提交后的完整 Thread 元数据。 */

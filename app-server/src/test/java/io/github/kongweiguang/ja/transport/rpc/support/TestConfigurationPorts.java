@@ -54,6 +54,12 @@ public class TestConfigurationPorts implements ConfigurationUseCase, Configurati
         throw unavailableFailure();
     }
 
+    /** 测试夹具没有 Java 管理的快照，恢复必须显式失败而不能伪造一份空配置。 */
+    @Override
+    public MutationResult restoreLastKnownGood(String expectedVersion) {
+        throw unavailableFailure();
+    }
+
     /** 缺失凭据所有者时拒绝 Secret 写入，夹具不提供任何内存 Secret 存储。 */
     @Override
     public CredentialResult setCredential(String credentialId, String secret, String expectedVersion) {

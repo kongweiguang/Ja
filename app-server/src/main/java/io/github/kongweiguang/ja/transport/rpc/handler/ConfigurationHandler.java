@@ -46,6 +46,7 @@ public final class ConfigurationHandler implements RpcHandler {
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.CONFIGURATION_READ, RpcMethod.CONFIGURATION_PATCH,
                 RpcMethod.CONFIGURATION_REPLACE, RpcMethod.CONFIGURATION_RESET,
+                RpcMethod.CONFIGURATION_RESTORE,
                 RpcMethod.CREDENTIAL_SET, RpcMethod.CREDENTIAL_DELETE,
                 RpcMethod.CREDENTIAL_REVEAL_PROVIDER);
     }
@@ -59,6 +60,7 @@ public final class ConfigurationHandler implements RpcHandler {
             case CONFIGURATION_PATCH -> patch(command.params());
             case CONFIGURATION_REPLACE -> replace(command.params());
             case CONFIGURATION_RESET -> reset(command.params());
+            case CONFIGURATION_RESTORE -> restore(command.params());
             case CREDENTIAL_SET -> setCredential(command.params());
             case CREDENTIAL_DELETE -> deleteCredential(command.params());
             case CREDENTIAL_REVEAL_PROVIDER -> revealProviderCredential(command.params());
@@ -114,6 +116,19 @@ public final class ConfigurationHandler implements RpcHandler {
                 scope, root(workspace), requireVersion(params));
         ObjectNode wire = mutationResult(result, scope);
         publishChanged(workspace, result);
+        return wire;
+    }
+
+    /**
+     * 恢复命令不接受 scope、workspace 或 document，避免一个含糊请求覆盖项目层，或让客户端伪造
+     * 恢复内容。App Server 会在 CAS 通过后备份原始用户文件并从其私有快照发布。
+     */
+    private ObjectNode restore(ObjectNode params) {
+        RpcParams.requireExact(params, "expectedVersion");
+        ConfigurationUseCase.MutationResult result = session.configurationUseCase()
+                .restoreLastKnownGood(requireVersion(params));
+        ObjectNode wire = mutationResult(result, ConfigurationScope.USER);
+        publishChanged(null, result);
         return wire;
     }
 
@@ -289,6 +304,24 @@ public final class ConfigurationHandler implements RpcHandler {
         read.diagnostics().forEach(code -> {
             if (!code.matches("[A-Z][A-Z0-9_]{0,63}")) throw invalidConfigurationResult();
             diagnostics.add(code);
+        });
+        ArrayNode issues = result.putArray("issues");
+        read.issues().forEach(issue -> {
+            if (!issue.id().matches("cfg_[A-Za-z0-9_-]{1,64}")
+                    || !issue.scope().matches("[a-z_]{1,32}")
+                    || !issue.reason().matches("[A-Z][A-Z0-9_]{0,63}")
+                    || !issue.impact().matches("[a-z_]{1,64}")) throw invalidConfigurationResult();
+            ObjectNode value = issues.addObject().put("id", issue.id()).put("scope", issue.scope())
+                    .put("reason", issue.reason()).put("impact", issue.impact());
+            if (issue.field() == null) value.putNull("field"); else value.put("field", issue.field());
+            if (issue.entityId() == null) value.putNull("entityId"); else value.put("entityId", issue.entityId());
+            if (issue.line() == null) value.putNull("line"); else value.put("line", issue.line());
+            if (issue.column() == null) value.putNull("column"); else value.put("column", issue.column());
+            ArrayNode actions = value.putArray("actions");
+            issue.actions().forEach(action -> {
+                if (!action.matches("[a-z_]{1,32}")) throw invalidConfigurationResult();
+                actions.add(action);
+            });
         });
         result.put("trusted", read.trusted());
         return result;
