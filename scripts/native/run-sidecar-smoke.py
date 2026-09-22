@@ -40,7 +40,7 @@ EXPECTED_ENGINE_VERSION = json.loads(
 METHODS = [
     "runtime/initialize", "runtime/health", "runtime/shutdown", "workspace/open", "workspace/open-general", "workspace/list",
     "workspace/path/search", "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list", "thread/search",
-    "thread/read", "thread/rename", "thread/pin", "thread/seen", "thread/preferences/update", "thread/archive",
+    "thread/read", "thread/usage/read", "thread/rename", "thread/pin", "thread/seen", "thread/preferences/update", "thread/archive",
     "thread/restore", "thread/delete", "thread/compact",
     "interaction/read", "interaction/observe", "interaction/unobserve", "interaction/draft/save",
     "interaction/respond", "interaction/cancel",
@@ -52,10 +52,10 @@ METHODS = [
     "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
     "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
     "attachment/import", "attachment/discard", "attachment/preview/open", "attachment/preview/read",
-    "attachment/preview/close", "turn/start", "turn/resume", "turn/cancel", "turn/input/enqueue",
+    "attachment/preview/close", "turn/start", "turn/resume", "turn/recovery/respond", "turn/cancel", "turn/input/enqueue",
     "turn/input/prioritize", "turn/input/update", "turn/input/delete", "turn/change-set/read",
     "approval/respond", "configuration/read", "configuration/patch", "configuration/replace",
-    "configuration/reset", "credential/set", "credential/delete", "credential/reveal-provider",
+    "configuration/reset", "configuration/restore", "credential/set", "credential/delete", "credential/reveal-provider",
     "skill/list", "mcp/list", "mcp/test", "model/test", "model/discover", "mcp/list-tools",
     "tool/artifact/read",
 ]
@@ -322,14 +322,15 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
     """Build the bounded local-loopback document used by runtime probes.
 
     The document contains no credential bytes and points only at servers owned by this smoke
-    process. Keeping Provider and models in the same v1 batch as the MCP descriptor proves that the
+    process. Keeping Provider and models in the same v2 batch as the MCP descriptor proves that the
     executable resolves one immutable generation instead of relying on a test-only provider hook.
     """
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "config_revision": 0,
         "default_access_mode": "approval_required",
+        "interaction": {"clarification_enabled": True},
         "default_provider_id": PROVIDER_ID,
         "default_model_id": MODEL_ID,
         "default_reasoning_level": None,
@@ -371,13 +372,7 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
             "auth": {"kind": "none"},
             "enabled": True,
         }],
-        "skills": [{
-            "skill_id": SKILL_ID,
-            "name": SKILL_NAME,
-            "scope": "project",
-            "enabled": True,
-            "description": SKILL_DESCRIPTION,
-        }],
+        "skills": [],
         "subagents": {"enabled": False, "provider_id": None, "model_id": None, "reasoning_level": None},
     }
 
@@ -407,7 +402,7 @@ def configuration_replace_frame(
     provider_endpoint: str | None = None,
     mcp_endpoint: str | None = None,
 ) -> dict[str, Any]:
-    """通过 v1 replace CAS 构造严格的本地探针配置文档。
+    """通过 v2 replace CAS 构造严格的本地探针配置文档。
 
     无法提供 loopback 探针的调用方使用合同测试所需的空目录；生产 smoke 在发送前必须同时
     提供 Provider 与 MCP endpoint。
@@ -415,9 +410,10 @@ def configuration_replace_frame(
 
     document = configuration_document(provider_endpoint, mcp_endpoint) \
         if provider_endpoint and mcp_endpoint else {
-            "schema_version": 1,
+            "schema_version": 2,
             "config_revision": 0,
             "default_access_mode": "full_access",
+            "interaction": {"clarification_enabled": True},
             "default_provider_id": None,
             "default_model_id": None,
             "default_reasoning_level": None,

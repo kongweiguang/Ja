@@ -210,8 +210,8 @@ class NativeSmokeV1Test(unittest.TestCase):
         frame = SMOKE.turn_cancel_frame("turn_demo")
         self.assertEqual({"turnId": "turn_demo"}, frame["params"])
 
-    def test_loopback_configuration_document_is_exact_v1(self) -> None:
-        """Locks the production smoke fixture to v1 and rejects every removed configuration field."""
+    def test_loopback_configuration_document_is_exact_v2(self) -> None:
+        """Locks the smoke fixture to v2 so user configuration cannot carry project Skill objects."""
 
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         frame = SMOKE.configuration_replace_frame(
@@ -224,7 +224,9 @@ class NativeSmokeV1Test(unittest.TestCase):
         document = frame["params"]["document"]
         provider = document["providers"][0]
         model = provider["models"][0]
-        self.assertEqual(1, document["schema_version"])
+        self.assertEqual(2, document["schema_version"])
+        self.assertEqual({"clarification_enabled": True}, document["interaction"])
+        self.assertEqual([], document["skills"])
         self.assertEqual({"context", "turn_limits"}, set(provider["agent_defaults"]))
         self.assertEqual(
             {"context_window_tokens", "max_output_tokens"},
@@ -250,16 +252,9 @@ class NativeSmokeV1Test(unittest.TestCase):
             workspace.mkdir()
             document = SMOKE.write_workspace_skill(workspace)
             content = document.read_text(encoding="utf-8")
-            configured = SMOKE.configuration_document(
-                "http://127.0.0.1:41001/v1",
-                "http://127.0.0.1:41002/mcp",
-            )["skills"][0]
-
             self.assertEqual(workspace / ".agents" / "skills" / SMOKE.SKILL_NAME / "SKILL.md", document)
             self.assertIn(f"name: {SMOKE.SKILL_NAME}\n", content)
             self.assertIn(f"description: {SMOKE.SKILL_DESCRIPTION}.\n", content)
-            self.assertEqual(SMOKE.SKILL_NAME, configured["name"])
-        self.assertEqual("project", configured["scope"])
 
     def test_loopback_provider_rejects_retired_responses_token_count(self) -> None:
         """Keeps the retired count route absent so a production preflight call breaks the smoke."""
