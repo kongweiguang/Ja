@@ -503,9 +503,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       cacheCompleteInputTokens: 20,
       cacheCompleteReadTokens: 0,
     };
-    let receivedThis: unknown;
     const readUsage = vi.fn(function (this: HistoryAdapter, input: HistoryThreadUsageReadInput) {
-      receivedThis = this;
       return Promise.resolve({ ...usage, threadId: input.threadId });
     });
     historyAdapter.threadUsageRead = readUsage;
@@ -535,7 +533,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     const trigger = await screen.findByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
     await waitFor(() => expect(readUsage).toHaveBeenCalledWith({ threadId: "thr_fixture" }));
-    expect(receivedThis).toBe(historyAdapter);
+    expect(readUsage.mock.contexts[0]).toBe(historyAdapter);
     expect(await screen.findByText("Token · 本会话")).toBeVisible();
   });
 

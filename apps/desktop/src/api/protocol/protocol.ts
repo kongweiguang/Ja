@@ -50,6 +50,12 @@ const noAsciiControlCharacters = (value: string): boolean =>
     return code > 0x1f && code !== 0x7f;
   });
 
+/** Skill 名称保留 Unicode，但拒绝来源分隔符与 C0 控制字符，和配置文档保持同一授权边界。 */
+const isSkillReference = (value: string): boolean =>
+  value.length >= 1 &&
+  value.length <= 512 &&
+  [...value].every((character) => character !== ":" && (character.codePointAt(0) ?? 0) > 0x1f);
+
 /** 在 Java、Rust 与 TypeScript 间保持不透明 id 稳定，同时拒绝主机路径。 */
 function prefixedId(prefix: string, maximum: number): z.ZodString {
   return z
@@ -88,7 +94,8 @@ const McpIdSchema = prefixedId("mcp_", 100);
 /** Skill 身份同时包含发现来源，避免高优先级同名项目包继承低优先级授权。 */
 const SkillIdSchema = z
   .string()
-  .regex(/^(?:user|ja|project):[^:\u0000-\u001F]{1,512}$/)
+  .regex(/^(?:user|ja|project):/)
+  .refine((value) => isSkillReference(value.slice(value.indexOf(":") + 1)))
   .max(520);
 const EventIdSchema = prefixedId("evt_", 100);
 const CompactionIdSchema = prefixedId("cmp_", 100);

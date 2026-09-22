@@ -111,7 +111,7 @@ export function ContextUsageIndicator({
     const summary = usageCache.get(scopeKey);
     return { scopeKey, summary, phase: summary === undefined ? "idle" : "ready" };
   });
-  // Thread 切换 render 到 effect 的间隙禁止沿用旧 open 状态，避免向新 Thread 错发一次查询。
+  // Thread 切换 render 到复位微任务的间隙禁止沿用旧 open 状态，避免向新 Thread 错发一次查询。
   const open = state.scopeKey === scopeKey && (pinned || transientOpen);
   const visibleState =
     state.scopeKey === scopeKey
@@ -148,16 +148,23 @@ export function ContextUsageIndicator({
     }, HOVER_CLOSE_DELAY_MS);
   }, []);
 
-  /** scope 改变立即失效旧 promise 与展开展示，切换会话不会短暂泄露前一账本。 */
+  /** scope 切换先使旧异步请求失格，再在 commit 后复位交互状态，避免 effect 同步级联 render。 */
   useEffect(() => {
     currentScopeRef.current = scopeKey;
     requestSequenceRef.current += 1;
     refreshedRef.current = undefined;
     pinnedRef.current = false;
-    setPinned(false);
-    setTransientOpen(false);
-    const summary = usageCache.get(scopeKey);
-    setState({ scopeKey, summary, phase: summary === undefined ? "idle" : "ready" });
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      setPinned(false);
+      setTransientOpen(false);
+      const summary = usageCache.get(scopeKey);
+      setState({ scopeKey, summary, phase: summary === undefined ? "idle" : "ready" });
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [scopeKey]);
   /** 卸载清除计时和异步资格，重启后的旧 Composer 不可写回状态。 */
   useEffect(
@@ -222,7 +229,14 @@ export function ContextUsageIndicator({
     const key = scopeKey + ":" + (refreshRevision ?? "initial");
     if (refreshedRef.current !== key) {
       refreshedRef.current = key;
-      refresh();
+      let cancelled = false;
+      // 读取在 commit 后的微任务启动，既保留展开时机，又避免 effect 内同步状态级联。
+      void Promise.resolve().then(() => {
+        if (!cancelled) refresh();
+      });
+      return () => {
+        cancelled = true;
+      };
     }
   }, [open, refresh, refreshRevision, scopeKey]);
 

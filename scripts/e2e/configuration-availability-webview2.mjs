@@ -255,7 +255,7 @@ export async function runConfigurationAvailability({
       path: join(evidenceDirectory, "configuration-issues-light-closed.png"),
     });
     await until("issues sheet focus return", () =>
-      issuesTrigger.evaluate((element) => document.activeElement === element),
+      issuesTrigger.evaluate((element) => element.ownerDocument.activeElement === element),
     );
 
     await restartRuntime(page);

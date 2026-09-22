@@ -11,6 +11,12 @@ const MAX_CATALOG_REFERENCES = 128;
 const MAX_MAP_ENTRIES = 64;
 const MAX_MAP_VALUE = 8_192;
 
+/** Skill 引用名允许 Unicode，但不能携带授权来源分隔符或 C0 控制字符。 */
+const isConfigSkillReferenceName = (value: string): boolean =>
+  value.length >= 1 &&
+  value.length <= 512 &&
+  [...value].every((character) => character !== ":" && (character.codePointAt(0) ?? 0) > 0x1f);
+
 /** 配置身份保持不透明，并只接受 schema v2 的稳定命名空间。 */
 export const ConfigCredentialRefSchema = z
   .string()
@@ -33,7 +39,8 @@ const configMcpIdSchema = z
  */
 export const ConfigSkillReferenceSchema = z
   .string()
-  .regex(/^(?:user|ja|project):[^:\u0000-\u001F]{1,512}$/)
+  .regex(/^(?:user|ja|project):/)
+  .refine((value) => isConfigSkillReferenceName(value.slice(value.indexOf(":") + 1)))
   .max(520);
 const ConfigUserSkillReferenceSchema = ConfigSkillReferenceSchema.refine(
   (value) => value.startsWith("user:") || value.startsWith("ja:"),
