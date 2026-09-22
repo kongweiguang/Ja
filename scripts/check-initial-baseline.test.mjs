@@ -60,8 +60,12 @@ test("真实目录检查允许子智能体策略初始化，拒绝额外迁移�
     assert.equal((await checkInitialBaseline(root)).length, 1);
     await writeFile(path.join(migrations, "V2__thread_subagent_policies.sql"), "SELECT 1;");
     await writeFile(path.join(migrations, "V3__subagent_reasoning.sql"), "SELECT 1;");
+    await writeFile(
+      path.join(migrations, "V4__conversation_recovery_usage_projection.sql"),
+      "SELECT 1;",
+    );
     assert.deepEqual(await checkInitialBaseline(root), []);
-    await writeFile(path.join(migrations, "V4__history.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V5__history.sql"), "SELECT 1;");
     await mkdir(path.join(root, "contracts/ja-rpc/v2"));
     assert.equal((await checkInitialBaseline(root)).length, 2);
   } finally {
