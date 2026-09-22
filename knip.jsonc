@@ -40,6 +40,8 @@
     "scripts/e2e/subagent-settings-webview2.mjs",
     // 独立浏览器/真窗 CLI 由维护者直接运行，不由应用模块静态导入。
     "scripts/e2e/provider-settings-acceptance.mjs",
+    // 配置可用性验收由维护者按隔离 JAR 与 WebView2 CLI 直接运行，不由应用模块静态导入。
+    "scripts/e2e/configuration-availability-webview2.mjs",
     "scripts/e2e/review-redesign-browser.mjs",
     "scripts/e2e/workbench-tab-context-webview2.mjs",
     // Vite HTML 以 script 标签加载的验收入口；保留在图中继续检查其内部依赖。
