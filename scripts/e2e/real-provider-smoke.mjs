@@ -50,6 +50,7 @@ const methods = [
   "thread/list",
   "thread/search",
   "thread/read",
+  "thread/usage/read",
   "thread/rename",
   "thread/pin",
   "thread/seen",
@@ -109,6 +110,7 @@ const methods = [
   "attachment/preview/close",
   "turn/start",
   "turn/resume",
+  "turn/recovery/respond",
   "turn/cancel",
   "turn/input/enqueue",
   "turn/input/prioritize",
@@ -120,6 +122,7 @@ const methods = [
   "configuration/patch",
   "configuration/replace",
   "configuration/reset",
+  "configuration/restore",
   "credential/set",
   "credential/delete",
   "credential/reveal-provider",
@@ -795,7 +798,7 @@ export function initializeParams() {
   };
 }
 
-/** 构造完整的无 Secret 自定义供应商配置；名称不参与路由，凭据字节只通过 credential/set 传输。 */
+/** 构造完整的 v2 无 Secret 供应商配置，确保真实验收不靠已移除的 schema 或配置别名启动。 */
 export function providerConfigurationDocument({
   endpoint,
   name = "Authorized loopback provider",
@@ -808,18 +811,20 @@ export function providerConfigurationDocument({
   revision = 0,
 }) {
   if (!new Set(["anthropic_messages", "openai_chat_completions", "openai_responses"]).has(api)) {
-    throw new Error("unsupported API specification for v1 provider document");
+    throw new Error("unsupported API specification for v2 provider document");
   }
   if (!reasoningLevels.has(reasoningLevel)) {
-    throw new Error("unsupported reasoning level for v1 provider document");
+    throw new Error("unsupported reasoning level for v2 provider document");
   }
   return {
-    schema_version: 1,
+    schema_version: 2,
     config_revision: revision,
     default_access_mode: "approval_required",
+    interaction: { clarification_enabled: true },
     default_provider_id: selectedProviderId,
     default_model_id: selectedModelId,
     default_reasoning_level: reasoningLevel,
+    subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [
       {
         provider_id: selectedProviderId,
@@ -853,8 +858,8 @@ export function providerConfigurationDocument({
 }
 
 /**
- * Preserves unrelated real-home providers and catalog entries while replacing
- * only the explicitly selected smoke provider in the authoritative document.
+ * 持久化 smoke 只替换当前选定 Provider，同时强制输出完整 v2 根文档，避免旧 schema 或缺失
+ * subagents 字段被真实用户配置的残留内容重新带回验收路径。
  */
 function persistentConfigurationDocument(current, selected) {
   const base =
@@ -870,13 +875,21 @@ function persistentConfigurationDocument(current, selected) {
     : [];
   return {
     ...base,
-    schema_version: 1,
+    schema_version: 2,
     config_revision: selectedDocument.config_revision,
     default_access_mode:
       base.default_access_mode === "full_access" ? "full_access" : "approval_required",
+    interaction:
+      base.interaction !== null && typeof base.interaction === "object" && !Array.isArray(base.interaction)
+        ? base.interaction
+        : { clarification_enabled: true },
     default_provider_id: selected.selectedProviderId,
     default_model_id: selected.selectedModelId,
     default_reasoning_level: selected.reasoningLevel,
+    subagents:
+      base.subagents !== null && typeof base.subagents === "object" && !Array.isArray(base.subagents)
+        ? base.subagents
+        : { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [...providers, selectedDocument.providers[0]],
     mcp_servers: Array.isArray(base.mcp_servers) ? base.mcp_servers : [],
     skills: Array.isArray(base.skills) ? base.skills : [],

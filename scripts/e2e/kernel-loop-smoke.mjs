@@ -83,15 +83,17 @@ async function cleanupDirectories(root) {
   await rm(target, { recursive: true, force: false });
 }
 
-/** 构造当前唯一严格空配置，不携带 Provider 或旧配置键。 */
+/** 构造当前唯一严格 v2 空配置，使 Kernel 生命周期验收覆盖完整必填根字段。 */
 function emptyConfiguration() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     config_revision: 0,
     default_access_mode: "full_access",
+    interaction: { clarification_enabled: true },
     default_provider_id: null,
     default_model_id: null,
     default_reasoning_level: null,
+    subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [],
     mcp_servers: [],
     skills: [],
@@ -107,7 +109,7 @@ function success(frame, operation) {
   return frame.result;
 }
 
-/** 执行不依赖网络和 fake adapter 的生产 JAR 生命周期。 */
+/** 执行不依赖网络和 fake adapter 的生产 JAR 生命周期，并验证 Skill 分页而不假设已移除的默认包或宿主目录内容。 */
 export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   const directories = await createDirectories();
   const java = command ?? resolveJava();
@@ -183,8 +185,12 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
 
     const skills = success(await session.request("skill/list", {}), "skill/list");
     if (!Array.isArray(skills?.items)
-        || !skills.items.some((skill) => skill?.name === "coding" && skill?.status === "healthy")) {
-      throw new Error("builtin coding Skill is unavailable");
+        || !skills.items.every((skill) => typeof skill?.skillId === "string"
+          && typeof skill?.name === "string" && typeof skill?.scope === "string"
+          && typeof skill?.enabled === "boolean" && typeof skill?.status === "string"
+          && typeof skill?.description === "string")
+        || !(skills?.nextCursor === null || typeof skills?.nextCursor === "string")) {
+      throw new Error("Skill catalog page projection is invalid");
     }
 
     const created = success(await session.request("thread/create", {

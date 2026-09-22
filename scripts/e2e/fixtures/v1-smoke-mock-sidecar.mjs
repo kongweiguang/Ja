@@ -85,15 +85,17 @@ function send(frame) {
   process.stdout.write(`${JSON.stringify(frame)}\n`);
 }
 
-/** 生成当前唯一的严格空配置，避免 fixture 保留已淘汰配置键。 */
+/** 生成当前唯一的严格 v2 空配置，确保 Native smoke fixture 不掩盖生产校验的必填字段。 */
 function emptyConfiguration() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     config_revision: 0,
     default_access_mode: "full_access",
+    interaction: { clarification_enabled: true },
     default_provider_id: null,
     default_model_id: null,
     default_reasoning_level: null,
+    subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [],
     mcp_servers: [],
     skills: [],

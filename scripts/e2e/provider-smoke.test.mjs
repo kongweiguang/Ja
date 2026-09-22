@@ -32,6 +32,9 @@ test("direct capabilities retain only the minimal v1 surface", () => {
   assert.equal(capabilities.methods.includes("plan/current/read"), true);
   assert.equal(capabilities.methods.includes("goal/plan/attach"), true);
   assert.equal(capabilities.methods.includes("task/close"), true);
+  assert.equal(capabilities.methods.includes("thread/usage/read"), true);
+  assert.equal(capabilities.methods.includes("turn/recovery/respond"), true);
+  assert.equal(capabilities.methods.includes("configuration/restore"), true);
 
   assert.throws(
     () => assertDirectProviderCapabilities({ ...capabilities, unexpectedCapability: {} }),
@@ -172,8 +175,8 @@ test("loopback validation preserves the configured provider base path", () => {
   );
 });
 
-/** Provider 文档保留调用方选择的真实推理档位，同时继续禁止 Secret 进入配置正文。 */
-test("provider documents remain v1 and secret-free for every supported API specification", () => {
+/** Provider 文档保留调用方选择的真实推理档位，并固定 v2 必填根字段且继续禁止 Secret 进入正文。 */
+test("provider documents remain v2 and secret-free for every supported API specification", () => {
   for (const api of ["openai_responses", "openai_chat_completions", "anthropic_messages"]) {
     const document = providerConfigurationDocument({
       endpoint: `http://localhost:60842/${api}/v1`,
@@ -182,7 +185,14 @@ test("provider documents remain v1 and secret-free for every supported API speci
       model: "loopback-test-model",
       reasoningLevel: "xhigh",
     });
-    assert.equal(document.schema_version, 1);
+    assert.equal(document.schema_version, 2);
+    assert.deepEqual(document.interaction, { clarification_enabled: true });
+    assert.deepEqual(document.subagents, {
+      enabled: true,
+      provider_id: null,
+      model_id: null,
+      reasoning_level: null,
+    });
     assert.equal(document.providers[0].base_url, `http://localhost:60842/${api}/v1`);
     assert.equal(document.providers[0].name, `Custom ${api}`);
     assert.equal(document.providers[0].api, api);
