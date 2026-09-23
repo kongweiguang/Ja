@@ -734,6 +734,7 @@ export function WorkbenchHost({
               ),
       onOpenWorkspaceReference,
       attachmentPort: taskAttachmentPort,
+      attachmentThumbnailPort: attachmentPreviewPort,
       onSearchWorkspacePaths: searchTaskWorkspacePaths,
       onOpenAttachmentPreview:
         onOpenAttachmentPreview === undefined
@@ -772,6 +773,7 @@ export function WorkbenchHost({
       onOpenAttachmentPreview,
       searchTaskWorkspacePaths,
       taskAttachmentPort,
+      attachmentPreviewPort,
       taskComposerSkills,
       taskUsageReader,
       taskDefaultPreferences,

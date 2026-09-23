@@ -3,6 +3,7 @@
 
 import { ImageIcon, ImageOff } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactElement, type RefObject } from "react";
+import { alternateAttachmentResourceUrl } from "@/features/workbench/preview";
 
 export type HistoryAttachmentAuthorization =
   | { readonly kind: "draft" }
@@ -94,7 +95,15 @@ function useVisibleThumbnailTarget(elementRef: RefObject<HTMLSpanElement | null>
       { root: element.closest(".ja-chat-timeline__scroll"), rootMargin: "0px" },
     );
     observer.observe(element);
-    return () => observer.disconnect();
+    // Virtualizer 先完成 transform、再触发 observer 的窗口可能漏掉首个交叉事件；这一帧
+    // 只检查真实 Timeline viewport，不会把 overscan 行升级为原生附件读取。
+    const frame = globalThis.requestAnimationFrame?.(() => {
+      if (isInsideTimelineViewport(element)) setVisible(true);
+    });
+    return () => {
+      observer.disconnect();
+      if (frame !== undefined) globalThis.cancelAnimationFrame?.(frame);
+    };
   }, [elementRef, visible]);
   return visible;
 }
@@ -220,11 +229,16 @@ export function HistoryAttachmentThumbnail({
   const reportImageFailure = useCallback(
     (target: ThumbnailImageProjection): void => {
       if (!isCurrentImage(target)) return;
+      const fallback = alternateAttachmentResourceUrl(target.url);
+      if (fallback !== undefined) {
+        installImage(fallback, target.owned);
+        return;
+      }
       currentImageRef.current = undefined;
       releaseOwnedSession(target.owned);
       setProjection({ status: "unavailable" });
     },
-    [isCurrentImage, releaseOwnedSession],
+    [installImage, isCurrentImage, releaseOwnedSession],
   );
 
   /** 图片成功事件同样受 target fence 保护，旧 load 不得把新来源提前标记为 ready。 */

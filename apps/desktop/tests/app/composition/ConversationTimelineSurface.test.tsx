@@ -38,6 +38,7 @@ function prepareStreamingTimeline(): void {
         contextUsage: null,
         taskActivities: [],
         goalActivities: [],
+        liveStream: null,
         nextCursor: null,
       },
       "ws_stream_surface",
@@ -235,5 +236,82 @@ describe("ConversationTimelineSurface", () => {
       screen.getByText("保持原位的过程正文").closest('[data-role="commentary"]'),
     ).not.toBeNull();
     expect(screen.getByRole("region", { name: "工作过程" })).toBeDefined();
+  });
+
+  /** thread/read 用持久 user_input 替换 turn/start 的临时条目时，完整 Surface 仍复用响应壳。 */
+  it("keeps the authoritative response node when a healthy read replaces the local user item", async () => {
+    prepareStreamingTimeline();
+    const runningTurn = useTimelineStore.getState().turns[TURN_ID];
+    expect(runningTurn?.status).toBe("running");
+    render(
+      <ConversationTimelineSurface
+        threadId={THREAD_ID}
+        answeredRequest={null}
+        answeredAnswers={{}}
+        turns={runningTurn === undefined ? [] : [runningTurn]}
+      />,
+    );
+
+    const response = screen.getByRole("article", { name: "回复状态" });
+    act(() => {
+      expect(
+        useTimelineStore.getState().applySnapshot(
+          {
+            threadId: THREAD_ID,
+            revision: 2,
+            turns: [
+              {
+                turnId: TURN_ID,
+                status: "running",
+                requestedAt: "2026-09-20T00:00:01Z",
+                updatedAt: "2026-09-20T00:00:02Z",
+                completedAt: null,
+                errorCode: null,
+                changeSet: null,
+              },
+            ],
+            items: [
+              {
+                itemId: "item_persisted_stream_surface",
+                turnId: TURN_ID,
+                kind: "user_input",
+                content: [{ type: "text", text: "测试流式隔离" }],
+                attachments: [],
+                createdAt: "2026-09-20T00:00:01Z",
+              },
+              {
+                itemId: "item_tool_stream_surface",
+                turnId: TURN_ID,
+                kind: "tool_call",
+                callId: "call_stream_surface_read",
+                toolName: "read",
+                ordinal: 0,
+                presentation: {
+                  kind: "read",
+                  title: "读取 fixture",
+                  status: "running",
+                  relativePaths: ["fixture.txt"],
+                  truncated: false,
+                },
+                createdAt: "2026-09-20T00:00:02Z",
+              },
+            ],
+            inputQueue: null,
+            contextUsage: null,
+            taskActivities: [],
+            goalActivities: [],
+            liveStream: null,
+            nextCursor: null,
+          },
+          "ws_stream_surface",
+        ),
+      ).toBe("applied");
+    });
+
+    expect(
+      await screen.findByRole("button", { name: /读取，read，fixture\.txt，进行中/ }),
+    ).toBeDefined();
+    expect(screen.getByRole("article", { name: "回复状态" })).toBe(response);
+    expect(response.textContent).toContain("正在工作");
   });
 });

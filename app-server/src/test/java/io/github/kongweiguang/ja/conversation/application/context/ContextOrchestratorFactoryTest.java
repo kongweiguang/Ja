@@ -96,7 +96,8 @@ final class ContextOrchestratorFactoryTest {
                                 "evt_context", "ws_test", "thr_test", "turn_test", 5, NOW,
                                 "cmp_test", io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.Trigger.AUTOMATIC,
                                 4, 1_000L, (long) checkpoint.estimatedTokens(),
-                                io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.STRATEGY_VERSION),
+                                io.github.kongweiguang.ja.conversation.port.in.ContextCompactionEvent.STRATEGY_VERSION,
+                                0L),
                         checkpoint.checkpointId());
         assertEquals(checkpoint.checkpointId(), event.checkpointId());
         assertEquals(1, store.appended.size());

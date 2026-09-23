@@ -71,6 +71,7 @@ export type { ConversationSummary } from "./ui/summary/ConversationSummaryPopove
 export { ReplyFileOpenMenu } from "./ui/reply-files/ReplyFileOpenMenu";
 export { useReplyFileOpen } from "./application/useReplyFileOpen";
 export { ChatTimeline } from "./ui/timeline/ChatTimeline";
+export type { HistoryAttachmentThumbnailPort } from "./ui/timeline/HistoryAttachmentThumbnail";
 export { TimelineScrollCache } from "./ui/timeline/timelineScroll";
 export { TimelineDisclosureCache } from "./ui/timeline/timelineDisclosure";
 export {

@@ -57,9 +57,14 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
     }
 
     /**
-     * 已提交事件的稳定身份、Turn 关联、Thread revision 与发生时刻。
+     * 已提交事件的稳定身份、Turn 关联、Thread revision、Turn mutation 水位与发生时刻。
+     *
+     * <p>mutation 水位只服务 Java 内部的恢复 fence，不进入 JA-RPC wire。Thread revision 可能被
+     * metadata 或不可见事务跳号，不能单独证明该 Turn 的正文已经提交；把同一 CAS 回执返回的
+     * mutation version 随事件携带，read 才能识别“已持久化但事件尚未送达”的窗口。</p>
      */
-    record Context(String eventId, String threadId, String turnId, long threadRevision, Instant occurredAt) {
+    record Context(String eventId, String threadId, String turnId, long threadRevision,
+                   long turnMutationVersion, Instant occurredAt) {
         /**
          * 固化公开关联链，禁止负 revision 或不符合新基线的标识。
          */
@@ -67,11 +72,12 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
             eventId = identifier(eventId, "eventId", "evt_");
             threadId = identifier(threadId, "threadId", "thr_");
             turnId = identifier(turnId, "turnId", "turn_");
-            if (threadRevision < 0) {
-                throw new IllegalArgumentException("threadRevision must be non-negative");
+            if (threadRevision < 0 || turnMutationVersion < -1) {
+                throw new IllegalArgumentException("event revisions are invalid");
             }
             Objects.requireNonNull(occurredAt, "occurredAt");
         }
+
     }
 
     /**

@@ -7,8 +7,9 @@ package io.github.kongweiguang.ja.conversation.domain;
  * 一个 Thread 已持久化 Provider 用量的只读汇总。
  *
  * <p>每个 Token 数值都与其覆盖的请求数量成对返回：缺少 Provider 计量时，调用方必须展示
- * 未知而不是把它归零。缓存命中率的分子和分母仅覆盖输入、缓存读、缓存写均已报告的请求，
- * 防止不同 Provider 的缓存口径混入同一百分比。</p>
+ * 未知而不是把它归零。缓存命中率的分子和分母只覆盖可还原完整输入口径的请求；对明确把缓存
+ * 读包含在 input 中、且没有独立 cache-write 字段的 Provider，缺失写入字段按零参与分母，
+ * 而 input 不含缓存的 Provider 仍必须报告写入字段。</p>
  */
 public record ThreadUsageSummary(
         long snapshotRevision,

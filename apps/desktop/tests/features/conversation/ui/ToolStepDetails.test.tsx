@@ -64,18 +64,51 @@ function recoveryToolStep(callId = "call_recovery"): WorkStepAdapter {
 describe("ToolStepDetails", () => {
   afterEach(() => cleanup());
 
-  /** 未知 MCP 的可访问身份、首个目标和脱敏诊断正文必须在失败展开态同时可见。 */
-  it("显示动作、真实 Tool 名称、首个目标并自动展开具体失败", () => {
+  /** 未知 MCP 的失败详情默认收起，但用户展开后仍能查看脱敏诊断正文。 */
+  it("显示动作、真实 Tool 名称和首个目标并按需查看失败详情", () => {
     render(<WorkProcess steps={[toolStep()]} />);
 
     const trigger = screen.getByRole("button", { name: /调用工具，custom_mcp/u });
     expect(trigger).toBeVisible();
-    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(trigger).toHaveTextContent("调用工具");
     expect(trigger).toHaveTextContent('{"query":""}');
     expect(trigger.closest(".ja-tool-details")).toHaveAttribute("data-status", "error");
+    fireEvent.click(trigger);
     expect(screen.getByText("query 不能为空")).toBeVisible();
     expect(screen.queryByText("调用工具 .")).not.toBeInTheDocument();
+  });
+
+  /** 失败的 shell 命令仍沿用普通命令的紧凑入口，用户需要时再手动查看诊断输出。 */
+  it("失败的 shell 命令保持收起", () => {
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    render(
+      <WorkProcess
+        steps={[
+          {
+            ...base,
+            metadata: {
+              ...base.metadata,
+              toolName: "shell",
+              presentation: {
+                ...presentation,
+                kind: "shell",
+                title: "执行命令",
+                status: "error",
+                command: "pnpm test",
+                outputPreview: "command failed",
+                stderr: "command failed",
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: /执行命令，shell，pnpm test，失败/u });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
 
   /** 新内建文件工具必须按真实名称呈现明确动作，避免 grep/find/ls 被误认成泛化 MCP 调用。 */
@@ -129,7 +162,7 @@ describe("ToolStepDetails", () => {
     ).toBeVisible();
   });
 
-  /** grep 的固定脱敏行格式应该成为可扫描的命中列表，服务器摘要取代重复的机器发现尾注。 */
+  /** grep 的固定脱敏行格式应该成为可扫描的命中列表，服务器摘要取代重复的机器发现尾注；详情按需展开。 */
   it("将内容搜索结果渲染为紧凑命中列表", () => {
     const step = toolStep();
     const presentation = step.metadata?.presentation;
@@ -155,6 +188,7 @@ describe("ToolStepDetails", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: /搜索内容，grep/u }));
     expect(screen.getByText("找到 2 个匹配项")).toBeVisible();
     expect(screen.getByRole("list", { name: "搜索结果" })).toBeVisible();
     expect(screen.getAllByText("src/App.tsx").length).toBeGreaterThanOrEqual(2);

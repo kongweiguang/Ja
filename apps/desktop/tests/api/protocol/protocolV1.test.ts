@@ -136,6 +136,7 @@ describe("JA RPC v1 configuration ownership", () => {
         totalTokens: 44_000,
         measuredAt: "2026-08-31T00:00:01Z",
       },
+      liveStream: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
@@ -203,6 +204,113 @@ describe("JA RPC v1 configuration ownership", () => {
     ).toThrow();
   });
 
+  /** 活动流恢复必须绑定活动 Turn，非空段连续覆盖 baseline，并按 UTF-8 字节而非字符限制正文。 */
+  it("validates live stream baselines and byte budgets", () => {
+    const snapshot = {
+      threadId: "thr_live_stream",
+      revision: 8,
+      turns: [
+        {
+          turnId: "turn_live_stream",
+          status: "running" as const,
+          requestedAt: "2026-08-31T00:00:00Z",
+          updatedAt: "2026-08-31T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      taskActivities: [],
+      goalActivities: [],
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: {
+        turnId: "turn_live_stream",
+        streamSeq: 2,
+        segments: [
+          {
+            kind: "assistant" as const,
+            segmentStartSeq: 1,
+            streamSeq: 1,
+            text: "draft",
+            occurredAt: "2026-08-31T00:00:00Z",
+          },
+          {
+            kind: "reasoningSummary" as const,
+            segmentStartSeq: 2,
+            streamSeq: 2,
+            text: "thinking",
+            occurredAt: "2026-08-31T00:00:01Z",
+          },
+        ],
+      },
+      nextCursor: null,
+    };
+    expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
+    expect(
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        liveStream: { ...snapshot.liveStream, segments: [] },
+      }),
+    ).toMatchObject({ liveStream: { streamSeq: 2, segments: [] } });
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [{ ...snapshot.liveStream.segments[0], streamSeq: 1 }],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [
+            { ...snapshot.liveStream.segments[0], text: "" },
+            snapshot.liveStream.segments[1],
+          ],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [
+            { ...snapshot.liveStream.segments[0], text: "界".repeat(21_846) },
+            snapshot.liveStream.segments[1],
+          ],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [
+            { ...snapshot.liveStream.segments[0], occurredAt: "2026-02-30T00:00:00Z" },
+            snapshot.liveStream.segments[1],
+          ],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        liveStream: { ...snapshot.liveStream, turnId: "turn_completed" },
+      }),
+    ).toThrow();
+
+    const missingLiveStream = { ...snapshot } as Record<string, unknown>;
+    delete missingLiveStream["liveStream"];
+    expect(() => parseMethodResult("thread/read", missingLiveStream)).toThrow();
+  });
+
   /** 问答展示只接纳可见文案闭集，跳过状态与答案数组必须保持一致。 */
   it("validates structured interaction answers in Tool presentations", () => {
     const turn = {
@@ -246,6 +354,7 @@ describe("JA RPC v1 configuration ownership", () => {
       taskActivities: [],
       goalActivities: [],
       contextUsage: null,
+      liveStream: null,
       nextCursor: null,
     };
 

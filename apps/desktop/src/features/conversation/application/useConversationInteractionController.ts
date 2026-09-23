@@ -35,6 +35,7 @@ const MAX_DRAFT_ATTACHMENTS = 10;
 const MAX_DRAFT_ATTACHMENT_BYTES = 250 * 1024 * 1024;
 const RECONCILIATION_INITIAL_DELAY_MS = 500;
 const RECONCILIATION_MAX_DELAY_MS = 5_000;
+const RECOVERED_RECONCILIATION_SILENCE_MS = 5_000;
 const RECOVERED_RECONCILIATION_TURN_STATES = new Set<TimelineTurn["status"]>(["queued", "running"]);
 
 /**
@@ -370,7 +371,15 @@ export function useConversationInteractionController({
     new Map<string, { threadId: string; delayMs: number; timer: ReturnType<typeof setTimeout> }>(),
   );
   const recoveredTurnReconciliationRef = useRef(
-    new Map<string, { threadId: string; delayMs: number; timer: ReturnType<typeof setTimeout> }>(),
+    new Map<
+      string,
+      {
+        threadId: string;
+        generation: number;
+        delayMs: number;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    >(),
   );
   const recoveredTurnReconciliationKeyRef = useRef<string | undefined>(undefined);
   const resumeGuardsRef = useRef(new Set<string>());
@@ -387,6 +396,12 @@ export function useConversationInteractionController({
   const currentThreads = useTimelineStore((state) => state.threads);
   const recoveredActiveTurnId = useTimelineStore((state) =>
     threadId === undefined ? undefined : state.recoveredActiveTurnByThread?.[threadId],
+  );
+  const recoveredResyncReason = useTimelineStore((state) =>
+    threadId === undefined ? undefined : state.resyncRequired[threadId],
+  );
+  const recoveredRuntimeFence = useTimelineStore(
+    (state) => `${state.handshake.generation}:${state.serverInstanceId ?? ""}`,
   );
   const blockingTurn =
     threadId === undefined
@@ -496,14 +511,14 @@ export function useConversationInteractionController({
 
   /**
    * 对恢复快照中仍为 active 的 Turn 持续做 authoritative read；terminal/消失或 Thread
-   * 切换立即停止，重试只保留一个 timer，并以 0.5s→1s→2s→5s 退避且不在已有 resync
-   * pending 时叠加 read。
+   * 切换立即停止；健康状态只保留一个 5 秒静默 timer，不在已有 resync pending 时叠加
+   * read，异常退避由 Conversation controller 的单一恢复链负责。
    */
   const scheduleRecoveredTurnReconciliation = useCallback(
     (
       requestThreadId: string,
       requestTurnId: string,
-      delayMs = RECONCILIATION_INITIAL_DELAY_MS,
+      delayMs = RECOVERED_RECONCILIATION_SILENCE_MS,
     ): void => {
       if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
       const current = useTimelineStore.getState().turns[requestTurnId];
@@ -515,8 +530,10 @@ export function useConversationInteractionController({
         releaseRecoveredTurnReconciliation(requestTurnId);
         return;
       }
+      const generation = useTimelineStore.getState().handshake.generation;
       const timer = setTimeout(() => {
         recoveredTurnReconciliationRef.current.delete(requestTurnId);
+        recoveredTurnReconciliationKeyRef.current = undefined;
         if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
         const latest = useTimelineStore.getState().turns[requestTurnId];
         if (
@@ -527,16 +544,31 @@ export function useConversationInteractionController({
           releaseRecoveredTurnReconciliation(requestTurnId);
           return;
         }
-        if (useTimelineStore.getState().resyncRequired[requestThreadId] === undefined)
-          useTimelineStore.getState().requestThreadResync(requestThreadId);
-        scheduleRecoveredTurnReconciliation(
-          requestThreadId,
-          requestTurnId,
-          nextReconciliationDelay(delayMs),
-        );
+        const state = useTimelineStore.getState();
+        if (state.handshake.generation !== generation) return;
+        const lastAcceptedLive = state.getLastAcceptedLive(requestThreadId);
+        const silenceElapsed =
+          lastAcceptedLive === undefined
+            ? RECOVERED_RECONCILIATION_SILENCE_MS
+            : Date.now() - lastAcceptedLive.receivedAt;
+        if (silenceElapsed < RECOVERED_RECONCILIATION_SILENCE_MS) {
+          // 不订阅每个 delta，避免 Composer/导航跟随正文高频重渲染；timer 到点时读取本地
+          // 接收时钟即可把健康事件后的剩余静默窗口顺延，正常输出不制造读取请求。
+          scheduleRecoveredTurnReconciliation(
+            requestThreadId,
+            requestTurnId,
+            Math.max(50, RECOVERED_RECONCILIATION_SILENCE_MS - silenceElapsed),
+          );
+          return;
+        }
+        // 当前没有待处理 resync 时，5 秒静默才触发一次健康对账；读失败的异常退避由
+        // Conversation controller 负责，避免这里再叠加第二套 0.5/1/2/5 轮询。
+        if (state.resyncRequired[requestThreadId] === undefined)
+          state.requestThreadResync(requestThreadId);
       }, delayMs);
       recoveredTurnReconciliationRef.current.set(requestTurnId, {
         threadId: requestThreadId,
+        generation,
         delayMs,
         timer,
       });
@@ -640,22 +672,30 @@ export function useConversationInteractionController({
   }, [currentTurns, scheduleCancelReconciliation, threadId]);
 
   /**
-   * 仅对当前可见 Conversation 的 snapshot active Turn 启动恢复对账；generation、Thread、Turn
-   * 组成 key，避免普通 live delta 或隐藏会话触发全局扫描。cancel 自己的对账优先级更高。
+   * 仅对当前可见 Conversation 的 snapshot active Turn 启动 5 秒静默 watchdog；已有 resync
+   * 意图由 Conversation controller 单独消费，避免 interaction 再造第二条 read 链。
    */
   useEffect(() => {
-    let pausedForThreadSwitch = false;
     for (const [turnId, reconciliation] of recoveredTurnReconciliationRef.current) {
-      if (reconciliation.threadId !== threadId) {
+      const turn = currentTurns[turnId];
+      const keepTimer =
+        reconciliation.threadId === threadId &&
+        recoveredActiveTurnId === turnId &&
+        reconciliation.generation === useTimelineStore.getState().handshake.generation &&
+        recoveredResyncReason === undefined &&
+        !cancelGuardsRef.current.has(turnId) &&
+        turn !== undefined &&
+        !TERMINAL_TURN_STATES.has(turn.status) &&
+        shouldReconcileRecoveredTurn(turn.status);
+      if (!keepTimer) {
         releaseRecoveredTurnReconciliation(turnId);
-        pausedForThreadSwitch = true;
       }
     }
-    if (pausedForThreadSwitch) recoveredTurnReconciliationKeyRef.current = undefined;
     if (
       threadId === undefined ||
       recoveredActiveTurnId === undefined ||
-      cancelGuardsRef.current.has(recoveredActiveTurnId)
+      cancelGuardsRef.current.has(recoveredActiveTurnId) ||
+      recoveredResyncReason !== undefined
     ) {
       if (recoveredActiveTurnId === undefined)
         recoveredTurnReconciliationKeyRef.current = undefined;
@@ -676,11 +716,16 @@ export function useConversationInteractionController({
     const key = `${generation}:${threadId}:${recoveredActiveTurnId}`;
     if (recoveredTurnReconciliationKeyRef.current === key) return;
     recoveredTurnReconciliationKeyRef.current = key;
-    useTimelineStore.getState().requestThreadResync(threadId);
-    scheduleRecoveredTurnReconciliation(threadId, recoveredActiveTurnId);
+    scheduleRecoveredTurnReconciliation(
+      threadId,
+      recoveredActiveTurnId,
+      RECOVERED_RECONCILIATION_SILENCE_MS,
+    );
   }, [
     currentTurns,
     recoveredActiveTurnId,
+    recoveredResyncReason,
+    recoveredRuntimeFence,
     releaseRecoveredTurnReconciliation,
     scheduleRecoveredTurnReconciliation,
     threadId,

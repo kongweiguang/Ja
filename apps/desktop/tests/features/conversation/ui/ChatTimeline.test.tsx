@@ -331,6 +331,58 @@ describe("ChatTimeline", () => {
     );
   });
 
+  /** 发送后的多张图片先于问题正文排列，缩略图保留同一消息的可点击边界。 */
+  it("renders multiple sent image thumbnails above the question text", () => {
+    render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_multi_image",
+            threadId: "thr_one",
+            kind: "user_message",
+            text: "请比较这两张图",
+            attachments: [
+              {
+                attachmentId: "att_first",
+                displayName: "第一张.png",
+                sizeBytes: 1024,
+                mediaKind: "image",
+                mediaType: "image/png",
+              },
+              {
+                attachmentId: "att_second",
+                displayName: "第二张.png",
+                sizeBytes: 2048,
+                mediaKind: "image",
+                mediaType: "image/png",
+              },
+            ],
+          }),
+        ]}
+        attachmentThumbnailPort={{
+          open: vi.fn(async ({ attachmentId }) => ({
+            previewSessionId: `preview_${attachmentId}`,
+            attachmentId,
+            mediaKind: "image" as const,
+            thumbnailUrl: `ja-attachment://localhost/thumbnail/${attachmentId}`,
+          })),
+          close: vi.fn(async () => undefined),
+        }}
+      />,
+    );
+
+    const message = screen.getByRole("article", { name: "用户问题" });
+    const attachments = message.querySelector<HTMLElement>(".ja-chat-attachments");
+    const body = message.querySelector<HTMLElement>(".ja-chat-message__body");
+    expect(attachments).toHaveAttribute("aria-label", "附件");
+    expect(attachments?.nextElementSibling).toBe(body);
+    expect(attachments?.querySelectorAll(".ja-chat-attachment--image")).toHaveLength(2);
+    expect(body).toHaveTextContent("请比较这两张图");
+    expect(message.textContent?.indexOf("第一张.png")).toBeLessThan(
+      message.textContent?.indexOf("请比较这两张图") ?? -1,
+    );
+  });
+
   it("按提交时间合并失败本地消息与后续权威消息", () => {
     render(
       <ChatTimeline
@@ -506,6 +558,74 @@ describe("ChatTimeline", () => {
     expect(document.querySelectorAll('[data-role="final"]')).toHaveLength(1);
   });
 
+  /** thread/read 会用持久 user item 替换 turn/start 的临时 item；同一 Turn 的 response 不能因此重建。 */
+  it("保留 thread/read 替换用户条目后的 authoritative response 节点", () => {
+    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const { rerender } = render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_local_turn_one",
+            kind: "user_message",
+            text: "先读取 fixture",
+            createdAt: "2026-09-23T00:00:00.000Z",
+          }),
+          baseItem({
+            itemId: "draft:turn_one:1",
+            kind: "commentary",
+            status: "in_progress",
+            text: "我先检查 fixture 内容。",
+            title: "回复过程",
+            metadata: { phase: "assistant_progress" },
+          }),
+        ]}
+        turns={[runningTurn]}
+      />,
+    );
+    const response = screen.getByRole("article", { name: "回复状态" });
+    const process = screen.getByRole("region", { name: "工作过程" });
+    rerender(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_persisted_turn_one",
+            kind: "user_message",
+            text: "先读取 fixture",
+            createdAt: "2026-09-23T00:00:00.000Z",
+          }),
+          baseItem({
+            itemId: "item_tool_read",
+            kind: "tool_call",
+            status: "in_progress",
+            title: "读取 fixture",
+            metadata: {
+              callId: "call_read",
+              presentation: {
+                kind: "read",
+                title: "读取 fixture",
+                status: "running",
+                relativePaths: ["fixture.txt"],
+                truncated: false,
+              },
+            },
+          }),
+          baseItem({
+            itemId: "draft:turn_one:1",
+            kind: "commentary",
+            status: "in_progress",
+            text: "我先检查 fixture 内容。",
+            title: "回复过程",
+            metadata: { phase: "assistant_progress" },
+          }),
+        ]}
+        turns={[runningTurn]}
+      />,
+    );
+    expect(screen.getByRole("article", { name: "回复状态" })).toBe(response);
+    expect(screen.getByRole("region", { name: "工作过程" })).toBe(process);
+    expect(response).toHaveTextContent("正在工作");
+  });
+
   /** 自动上下文压缩和普通 Tool 一样留在阅读顺序中，只有成功答复到位后才一并归档。 */
   it("keeps automatic context compaction in the reply reading flow before archiving", async () => {
     const user = userEvent.setup();
@@ -617,8 +737,8 @@ describe("ChatTimeline", () => {
     expect(screen.getByText("上下文已从 12,000 Token 压缩至 4,000 Token。")).toBeVisible();
   });
 
-  /** 终态失败没有最终答复可替代过程，归档入口必须默认展开以保留压缩诊断。 */
-  it("keeps failed context compaction expanded until the user collapses it", () => {
+  /** 终态失败保留工作过程入口，但 Tool 详情默认收起，用户可主动查看压缩诊断。 */
+  it("keeps failed context compaction visible while detail opens on demand", () => {
     render(
       <ChatTimeline
         items={[
@@ -653,9 +773,11 @@ describe("ChatTimeline", () => {
 
     const archive = screen.getByRole("button", { name: /收起工作过程/ });
     expect(archive).toHaveAttribute("aria-expanded", "true");
-    expect(
-      screen.getByRole("button", { name: /上下文自动压缩，context_compaction，失败/ }),
-    ).toHaveAttribute("aria-expanded", "true");
+    const contextDetails = screen.getByRole("button", {
+      name: /上下文自动压缩，context_compaction，失败/,
+    });
+    expect(contextDetails).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(contextDetails);
     expect(screen.getByText("自动压缩未完成：SUMMARY_FAILURE。")).toBeVisible();
   });
 
@@ -1404,7 +1526,10 @@ describe("ChatTimeline", () => {
       />,
     );
 
+    const message = screen.getByRole("article", { name: "用户问题" });
     expect(screen.getByText("只读图片.png")).toBeVisible();
+    expect(message).toHaveClass("ja-chat-message-user--attachments-only");
+    expect(message.querySelector(".ja-chat-message__body")).toBeNull();
     expect(screen.queryByRole("button", { name: "预览附件 只读图片.png" })).not.toBeInTheDocument();
   });
 
@@ -1815,8 +1940,9 @@ describe("ChatTimeline", () => {
     expect(output).toHaveTextContent("测试告警");
   });
 
-  /** 错误结果自动展开，确保二级折叠不会把唯一诊断和恢复线索隐藏起来。 */
-  it("命令失败时自动展开结果", () => {
+  /** 失败命令沿用普通命令的收起入口，用户展开后仍能读取唯一诊断和退出事实。 */
+  it("命令失败时默认收起并可按需展开结果", async () => {
+    const user = userEvent.setup();
     render(
       <WorkProcess
         steps={[
@@ -1844,9 +1970,12 @@ describe("ChatTimeline", () => {
       />,
     );
 
-    expect(
-      screen.getByRole("button", { name: /执行命令，shell，pnpm test，失败/ }),
-    ).toHaveAttribute("aria-expanded", "true");
+    const trigger = screen.getByRole("button", { name: /执行命令，shell，pnpm test，失败/ });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/测试失败/)).not.toBeInTheDocument();
+
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText(/测试失败/)).toBeVisible();
   });
 

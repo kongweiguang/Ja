@@ -251,6 +251,11 @@ function buildRows(
   const rows: MutableTurnGroup[] = [];
   const currentByTurn = new Map<string, MutableTurnGroup>();
   const exchangeByCall = new Map<string, MutableTurnGroup>();
+  /**
+   * 同一 Turn 的用户输入序号是跨 thread/read 稳定的；不能把服务端 itemId 当作 exchange
+   * identity，因为 turn/start 的本地 item 会在持久快照中被随机 item_* 替换，从而重建响应壳。
+   */
+  const userExchangeOrdinals = new Map<string, number>();
   /** Tool callId 只在所属 Turn 内定位 exchange，避免异常重复值把审批带到另一条会话。 */
   const callKey = (turnId: string, callId: string): string => `${turnId}:${callId}`;
   /** 没有 USER Message 的运行态仍需要响应壳；真实 USER 到达后会成为新的 exchange。 */
@@ -271,8 +276,10 @@ function buildRows(
   };
   for (const item of items) {
     if (item.kind === "user_message") {
+      const exchangeOrdinal = userExchangeOrdinals.get(item.turnId) ?? 0;
+      userExchangeOrdinals.set(item.turnId, exchangeOrdinal + 1);
       const exchange: MutableTurnGroup = {
-        key: `${item.turnId}:${item.itemId}`,
+        key: `${item.turnId}:exchange:${exchangeOrdinal}`,
         turnId: item.turnId,
         user: item,
         threadMessages: [],
@@ -593,7 +600,14 @@ function AttachmentHistory({
           </>
         );
         return (
-          <li className="ja-chat-attachment" key={attachmentId} data-attachment-id={attachmentId}>
+          <li
+            className={cn(
+              "ja-chat-attachment",
+              mediaKind === "image" && "ja-chat-attachment--image",
+            )}
+            key={attachmentId}
+            data-attachment-id={attachmentId}
+          >
             {previewable ? (
               <button
                 type="button"
@@ -690,6 +704,9 @@ function UserMessage({
   onOpenAttachmentPreview?: ChatTimelineProps["onOpenAttachmentPreview"];
 }): ReactElement {
   const isPending = item.metadata?.phase === "submission_pending";
+  const contextReferences = resolveSkillReferenceMetadata(item.contextReferences ?? [], skills);
+  const messageText = item.text ?? "";
+  const hasMessageBody = contextReferences.length > 0 || messageText.trim() !== "";
   return (
     <article
       aria-label="用户问题"
@@ -698,34 +715,32 @@ function UserMessage({
         `ja-chat-message-${item.kind}`,
         `ja-chat-message-${item.status}`,
         "ja-chat-message-user",
+        !hasMessageBody && "ja-chat-message-user--attachments-only",
         isPending && "ja-chat-message-new",
       )}
       data-item-id={item.itemId}
       data-role="user"
     >
-      <div
-        className={cn(
-          "ja-chat-message__body",
-          (item.attachments?.length ?? 0) > 0 && "ja-chat-message__body--with-attachments",
-        )}
-      >
-        <ComposerContextChips
-          references={resolveSkillReferenceMetadata(item.contextReferences ?? [], skills)}
-          compact
-          label="消息引用"
-        />
-        {item.text?.trim() ? (
-          <MarkdownMessage content={item.text} onOpenLink={onOpenLink} onCopyText={onCopyText} />
-        ) : null}
-        <AttachmentHistory
-          items={item.attachments ?? []}
-          threadId={item.threadId}
-          authorization={attachmentAuthorization ?? { kind: "thread", threadId: item.threadId }}
-          thumbnailUrls={attachmentThumbnailUrls}
-          thumbnailPort={attachmentThumbnailPort}
-          onOpenPreview={onOpenAttachmentPreview}
-        />
-      </div>
+      <AttachmentHistory
+        items={item.attachments ?? []}
+        threadId={item.threadId}
+        authorization={attachmentAuthorization ?? { kind: "thread", threadId: item.threadId }}
+        thumbnailUrls={attachmentThumbnailUrls}
+        thumbnailPort={attachmentThumbnailPort}
+        onOpenPreview={onOpenAttachmentPreview}
+      />
+      {hasMessageBody ? (
+        <div className="ja-chat-message__body">
+          <ComposerContextChips references={contextReferences} compact label="消息引用" />
+          {messageText !== "" ? (
+            <MarkdownMessage
+              content={messageText}
+              onOpenLink={onOpenLink}
+              onCopyText={onCopyText}
+            />
+          ) : null}
+        </div>
+      ) : null}
       {submissionError === undefined ? null : (
         <p className="ja-chat-message__send-error" role="alert">
           {submissionError}

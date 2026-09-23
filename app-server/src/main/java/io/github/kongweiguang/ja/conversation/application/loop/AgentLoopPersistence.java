@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.application.observation.ExecutionO
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
@@ -82,9 +83,12 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = receipt.executionState();
+        sink.observeCommittedTurn(request.threadId(), request.turnId(), state.threadRevision,
+                state.turnMutationVersion, state.execution.common().modelRound(), null, now);
         if (!receipt.messageItems().isEmpty()) {
             TurnEvent.Context context = new TurnEvent.Context("evt_" + UUID.randomUUID(),
-                    request.threadId(), request.turnId(), receipt.threadRevision(), now);
+                    request.threadId(), request.turnId(), receipt.threadRevision(),
+                    receipt.turnMutationVersion(), now);
             publishCommitted(sink, new TurnEvent.MessagesReceived(context, receipt.messageItems()));
         }
         return true;
@@ -115,7 +119,11 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = execution;
-        if (event != null) publishCommitted(sink, rebind(event, receipt.threadRevision()));
+        TurnEvent committed = event == null ? null
+                : rebind(event, receipt.threadRevision(), receipt.turnMutationVersion());
+        sink.observeCommittedTurn(request.threadId(), request.turnId(), state.threadRevision,
+                state.turnMutationVersion, execution.common().modelRound(), committed, clock.instant());
+        if (committed != null) publishCommitted(sink, committed);
     }
 
     /**
@@ -139,7 +147,7 @@ final class AgentLoopPersistence {
             if (event != null) {
                 throw new IllegalArgumentException("STOP queued input settlement must not publish model step");
             }
-            commitAssistantSettlement(request, state, facts, execution);
+            commitAssistantSettlement(request, state, facts, execution, sink);
             pauseRejectedInput(request, state, rejected, sink);
             throw new AssertionError("pauseRejectedInput must stop execution");
         }
@@ -166,7 +174,10 @@ final class AgentLoopPersistence {
         if (event != null) {
             throw new IllegalArgumentException("STOP queued input settlement must use input-consumed event");
         }
-        publishCommitted(sink, inputConsumed(request, receipt, assistantSettlement(facts, settlementUsage)));
+        TurnEvent committed = inputConsumed(request, receipt, assistantSettlement(facts, settlementUsage));
+        sink.observeCommittedTurn(request.threadId(), request.turnId(), state.threadRevision,
+                state.turnMutationVersion, state.execution.common().modelRound(), committed, clock.instant());
+        publishCommitted(sink, committed);
         return true;
     }
 
@@ -178,7 +189,8 @@ final class AgentLoopPersistence {
             TurnExecutionPlan request,
             AgentLoop.RuntimeState state,
             List<ConversationRepository.Fact> facts,
-            TurnExecutionState execution) {
+            TurnExecutionState execution,
+            TurnEventSink sink) {
         ConversationRepository.CommitReceipt receipt = store.commitAssistantSettlement(
                 new ConversationRepository.CommitRequest(
                         request.threadId(), request.turnId(), state.state, facts,
@@ -187,6 +199,8 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = execution;
+        sink.observeCommittedTurn(request.threadId(), request.turnId(), state.threadRevision,
+                state.turnMutationVersion, execution.common().modelRound(), null, clock.instant());
     }
 
     /** Tool 整批完成后的安全点只消费一条 Steering，并发布不含 Assistant 结算的原子迁移事件。 */
@@ -213,7 +227,10 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = prepared.execution();
-        publishCommitted(sink, inputConsumed(request, receipt, null));
+        TurnEvent committed = inputConsumed(request, receipt, null);
+        sink.observeCommittedTurn(request.threadId(), request.turnId(), state.threadRevision,
+                state.turnMutationVersion, state.execution.common().modelRound(), committed, clock.instant());
+        publishCommitted(sink, committed);
         return true;
     }
 
@@ -268,7 +285,7 @@ final class AgentLoopPersistence {
                 request.threadId(), request.turnId(), selected.selection(), selected.issue(), clock.instant());
         if (marked.changed()) {
             TurnEvent.Context context = new TurnEvent.Context("evt_" + UUID.randomUUID(), request.threadId(),
-                    request.turnId(), marked.threadRevision(), clock.instant());
+                    request.turnId(), marked.threadRevision(), marked.turnMutationVersion(), clock.instant());
             publishCommitted(sink, new TurnEvent.InputQueueChanged(context, marked.inputQueue()));
         }
         transition(request, state, TurnState.SUSPENDED, sink);
@@ -322,7 +339,7 @@ final class AgentLoopPersistence {
                                                   ConversationRepository.InputConsumption receipt,
                                                   TurnEvent.AssistantSettlement assistant) {
         TurnEvent.Context context = new TurnEvent.Context("evt_" + UUID.randomUUID(), request.threadId(),
-                request.turnId(), receipt.threadRevision(), receipt.occurredAt());
+                request.turnId(), receipt.threadRevision(), receipt.turnMutationVersion(), receipt.occurredAt());
         TurnEvent.UserItem userItem = new TurnEvent.UserItem(receipt.userItemId(), receipt.occurredAt(),
                 request.turnId(), receipt.input().content(), receipt.input().attachments());
         return new TurnEvent.InputConsumed(context, receipt.input(), userItem, receipt.inputQueue(), assistant);
@@ -361,7 +378,7 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = execution;
-        publishCommitted(sink, rebind(event, receipt.threadRevision()));
+        publishCommitted(sink, rebind(event, receipt.threadRevision(), receipt.turnMutationVersion()));
     }
 
     /**
@@ -422,7 +439,7 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         state.execution = execution;
-        publishCommitted(sink, rebind(event, receipt.threadRevision()));
+        publishCommitted(sink, rebind(event, receipt.threadRevision(), receipt.turnMutationVersion()));
     }
 
     /**
@@ -453,7 +470,7 @@ final class AgentLoopPersistence {
         state.state = target;
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
-        publishCommitted(sink, rebind(draft, receipt.threadRevision()));
+        publishCommitted(sink, rebind(draft, receipt.threadRevision(), receipt.turnMutationVersion()));
     }
 
     /**
@@ -483,7 +500,7 @@ final class AgentLoopPersistence {
         state.threadRevision = receipt.threadRevision();
         state.turnMutationVersion = receipt.turnMutationVersion();
         interactionPublisher.accept(interaction, receipt.interactionEventSequence());
-        publishCommitted(sink, rebind(draft, receipt.threadRevision()));
+        publishCommitted(sink, rebind(draft, receipt.threadRevision(), receipt.turnMutationVersion()));
     }
 
     /**
@@ -509,7 +526,7 @@ final class AgentLoopPersistence {
         state.state = TurnState.SUSPENDED;
         state.threadRevision = current.threadRevision() + 1;
         state.turnMutationVersion = current.turnMutationVersion() + 1;
-        publishCommitted(sink, rebind(suspended, state.threadRevision));
+        publishCommitted(sink, rebind(suspended, state.threadRevision, state.turnMutationVersion));
         return true;
     }
 
@@ -533,7 +550,8 @@ final class AgentLoopPersistence {
             boolean persistUsage,
             ProviderRequestUsage committedUsage,
             String errorCode,
-            String errorMessage) {
+            String errorMessage,
+            String partialText) {
         String text = summary == null ? "" : summary;
         String messageId = finalMessage == null ? null : Objects.requireNonNull(finalMessageId, "finalMessageId");
         List<ConversationRepository.Fact> facts;
@@ -552,6 +570,19 @@ final class AgentLoopPersistence {
         } else {
             // UNKNOWN 已在 Provider dispatch 前落库；失败终态绝不能重复插入或把未知伪装成零。
             facts = List.of();
+        }
+        if (target == TurnState.FAILED && partialText != null && !partialText.isBlank()) {
+            java.util.ArrayList<ConversationRepository.Fact> terminalFacts = new java.util.ArrayList<>(facts);
+            int partialRound = Math.max(1, modelRound);
+            String partialMessageId = new TerminalFailureReplyPolicy()
+                    .partialMessageIdFor(request.turnId(), partialRound);
+            terminalFacts.add(new ConversationRepository.AssistantFact(
+                    partialMessageId,
+                    new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(partialText))),
+                    partialText,
+                    null,
+                    partialRound));
+            facts = List.copyOf(terminalFacts);
         }
         if (reasoningSummary != null && !reasoningSummary.isBlank()) {
             java.util.ArrayList<ConversationRepository.Fact> terminalFacts = new java.util.ArrayList<>(facts);
@@ -593,7 +624,8 @@ final class AgentLoopPersistence {
                         },
                         receipt ->
                                 new TurnEvent.Terminal(
-                                        committedContext(request, receipt.threadRevision()),
+                                        committedContext(request, receipt.threadRevision(),
+                                                receipt.turnMutationVersion()),
                                         target,
                                         text,
                                         errorCode,
@@ -652,7 +684,7 @@ final class AgentLoopPersistence {
         Objects.requireNonNull(state, "state");
         Objects.requireNonNull(event, "event");
         Objects.requireNonNull(sink, "sink");
-        publishCommitted(sink, rebind(event, state.threadRevision));
+        publishCommitted(sink, rebind(event, state.threadRevision, state.turnMutationVersion));
     }
 
     /**
@@ -664,13 +696,14 @@ final class AgentLoopPersistence {
                 request.threadId(),
                 request.turnId(),
                 state.threadRevision,
+                state.turnMutationVersion,
                 clock.instant());
     }
 
     /**
      * 保留事件身份与时间，只用提交收据替换修订号，避免草稿版本对外可见。
      */
-    private TurnEvent rebind(TurnEvent event, long revision) {
+    private TurnEvent rebind(TurnEvent event, long revision, long turnMutationVersion) {
         if (event.context() == null) throw new IllegalArgumentException("durable event context is required");
         return event.withContext(
                 new TurnEvent.Context(
@@ -678,18 +711,21 @@ final class AgentLoopPersistence {
                         event.context().threadId(),
                         event.context().turnId(),
                         revision,
+                        turnMutationVersion,
                         event.context().occurredAt()));
     }
 
     /**
      * 直接为已提交终态构造上下文，使事件从创建起就携带权威修订号。
      */
-    private TurnEvent.Context committedContext(TurnExecutionPlan request, long revision) {
+    private TurnEvent.Context committedContext(TurnExecutionPlan request, long revision,
+                                               long turnMutationVersion) {
         return new TurnEvent.Context(
                 "evt_" + UUID.randomUUID(),
                 request.threadId(),
                 request.turnId(),
                 revision,
+                turnMutationVersion,
                 clock.instant());
     }
 

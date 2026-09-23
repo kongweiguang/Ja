@@ -15,6 +15,7 @@ import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionEven
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.port.in.InternalTurnStartRequest;
+import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
@@ -219,16 +220,29 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
      * 状态行不会在审批或提问卡片已经可操作时仍显示“执行中”。
      */
     private TurnEventSink phaseAwareSink(String goalId, TurnEventSink delegate) {
-        return event -> {
-            if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.ApprovalRequested value) {
-                goalService.projectContinuationPhase(goalId, GoalModels.GoalPhase.WORKING,
-                        GoalModels.GoalPhase.WAITING_APPROVAL, value.context().eventId(),
-                        value.context().occurredAt());
-            } else if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.ApprovalResolved value) {
-                goalService.projectContinuationPhase(goalId, GoalModels.GoalPhase.WAITING_APPROVAL,
-                        GoalModels.GoalPhase.WORKING, value.context().eventId(), value.context().occurredAt());
+        return new TurnEventSink() {
+            /** 审批事件先推进 Goal phase，再沿用下游真实 Turn 发布顺序。 */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {
+                if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.ApprovalRequested value) {
+                    goalService.projectContinuationPhase(goalId, GoalModels.GoalPhase.WORKING,
+                            GoalModels.GoalPhase.WAITING_APPROVAL, value.context().eventId(),
+                            value.context().occurredAt());
+                } else if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.ApprovalResolved value) {
+                    goalService.projectContinuationPhase(goalId, GoalModels.GoalPhase.WAITING_APPROVAL,
+                            GoalModels.GoalPhase.WORKING, value.context().eventId(), value.context().occurredAt());
+                }
+                return delegate.publish(event);
             }
-            return delegate.publish(event);
+
+            /** 内部 commit fence 必须穿过 Goal phase 装饰器，不能因包装而丢失首段恢复边界。 */
+            @Override
+            public void observeCommittedTurn(String threadId, String turnId, long threadRevision,
+                                              long turnMutationVersion, int modelRound, TurnEvent event,
+                                              java.time.Instant occurredAt) {
+                delegate.observeCommittedTurn(threadId, turnId, threadRevision, turnMutationVersion,
+                        modelRound, event, occurredAt);
+            }
         };
     }
 

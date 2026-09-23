@@ -52,6 +52,7 @@ import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import io.github.kongweiguang.ja.task.port.out.TaskRepositoryException;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -75,6 +76,7 @@ public final class RpcSession implements AutoCloseable {
     private final ConfigurationUseCase configurationUseCase;
     private final ApprovalCompletions approvalCompletions;
     private final CancellationSource cancellation = new CancellationSource();
+    private final ActiveStreamRegistry activeStreams;
     private final Map<String, TurnNotificationContext> turnNotificationContexts = new ConcurrentHashMap<>();
     private final Set<String> taskObservationIds = ConcurrentHashMap.newKeySet();
     private final Map<String, String> goalObservations = new ConcurrentHashMap<>();
@@ -130,6 +132,7 @@ public final class RpcSession implements AutoCloseable {
         }
         this.runtimeGeneration = runtimeGeneration;
         this.approvalCompletions = new ApprovalCompletions(clock, 64, 256);
+        this.activeStreams = new ActiveStreamRegistry(runtimeGeneration);
     }
 
     /** 打开空启动代际；配置仅在握手后由 Java 端解析。 */
@@ -248,27 +251,67 @@ public final class RpcSession implements AutoCloseable {
      */
     public void registerTurnNotificationContext(String turnId, String workspaceId, String threadId,
                                                 long initialThreadRevision) {
+        registerTurnNotificationContext(turnId, workspaceId, threadId, initialThreadRevision, 0);
+    }
+
+    /**
+     * 在恢复已有 Turn 时同时冻结持久 mutation 水位；新 admission 的初始水位为零，不能让
+     * Thread revision 代替 Turn CAS 版本，否则迟到 model-step 会被错误地当作已消费。
+     */
+    public void registerTurnNotificationContext(String turnId, String workspaceId, String threadId,
+                                                long initialThreadRevision, long initialTurnMutationVersion) {
+        registerTurnNotificationContext(turnId, workspaceId, threadId, initialThreadRevision,
+                initialTurnMutationVersion, 0);
+    }
+
+    /**
+     * 恢复已有 Turn 时同时恢复已完成模型轮次；新 admission 仍从零开始，避免把尚未公开的
+     * Provider dispatch 当成已经清稿的 Assistant 轮次。
+     */
+    public void registerTurnNotificationContext(String turnId, String workspaceId, String threadId,
+                                                long initialThreadRevision, long initialTurnMutationVersion,
+                                                int initialModelRound) {
         TurnNotificationContext context = new TurnNotificationContext(workspaceId, threadId,
                 initialThreadRevision);
-        if (turnNotificationContexts.putIfAbsent(requireIdentifier(turnId, "turn_"), context) != null) {
+        String validatedTurnId = requireIdentifier(turnId, "turn_");
+        if (turnNotificationContexts.putIfAbsent(validatedTurnId, context) != null) {
             throw JaRpcException.of(JaErrorCatalog.INVALID_STATE, "Turn notification context is duplicated");
         }
+        activeStreams.register(validatedTurnId, context.threadId(), initialThreadRevision,
+                initialTurnMutationVersion, initialModelRound);
     }
 
     /** 放弃尚未产生终态事件的 Turn 通知上下文；运行时租约由 TurnService 独占释放。 */
     public void abandonTurnNotification(String turnId) {
         turnNotificationContexts.remove(turnId);
+        activeStreams.abandon(turnId);
     }
 
     /** 回答重试和重连可复用同一 Turn 路由，但绝不允许身份被别的 Thread 替换。 */
     public void restoreTurnNotificationContext(String turnId, String workspaceId, String threadId, long revision) {
+        restoreTurnNotificationContext(turnId, workspaceId, threadId, revision, 0, 0);
+    }
+
+    /** 交互恢复沿用同一 SQLite Turn mutation fence，避免旧回答上下文覆盖新提交。 */
+    public void restoreTurnNotificationContext(String turnId, String workspaceId, String threadId,
+                                                long revision, long turnMutationVersion) {
+        restoreTurnNotificationContext(turnId, workspaceId, threadId, revision, turnMutationVersion, 0);
+    }
+
+    /** 交互恢复同时冻结持久已完成轮次，使新连接首段读取不依赖旧进程内状态。 */
+    public void restoreTurnNotificationContext(String turnId, String workspaceId, String threadId,
+                                                long revision, long turnMutationVersion, int modelRound) {
         TurnNotificationContext proposed = new TurnNotificationContext(workspaceId, threadId, revision);
         TurnNotificationContext current = turnNotificationContexts.putIfAbsent(requireIdentifier(turnId, "turn_"), proposed);
-        if (current == null) return;
+        if (current == null) {
+            activeStreams.register(turnId, threadId, revision, turnMutationVersion, modelRound);
+            return;
+        }
         if (!current.workspaceId().equals(workspaceId) || !current.threadId().equals(threadId)) {
             throw JaRpcException.of(JaErrorCatalog.INVALID_STATE, "Turn notification identity changed");
         }
         current.observeRevision(revision);
+        activeStreams.register(turnId, threadId, revision, turnMutationVersion, modelRound);
     }
 
     /** 返回配置入站用例，transport 只能通过不可变 JDK 投影读写配置。 */
@@ -319,6 +362,15 @@ public final class RpcSession implements AutoCloseable {
     public ThreadUseCase threads() {
         requireReady();
         return Objects.requireNonNull(threads, "thread use case");
+    }
+
+    /**
+     * 返回当前连接唯一的公开活动流 owner；History Handler 只能用它做精确 revision 关联读取，
+     * 不能自行从 stdout 或数据库正文重建草稿。
+     */
+    public ActiveStreamRegistry activeStreams() {
+        requireReady();
+        return activeStreams;
     }
 
     /** 返回 Turn 入站端口。 */
@@ -653,11 +705,17 @@ public final class RpcSession implements AutoCloseable {
     public CompletableFuture<Void> publish(TurnEvent event) {
         CompletableFuture<Void> published;
         try {
+            Instant occurredAt = clock.instant();
             TurnEventWireMapper.WireEvent wire = new TurnEventWireMapper(mapper, serverInstanceId).map(event);
             /* WireEvent 每次读取都会深拷贝；必须固定本次写出的唯一副本后再补全连接元数据，
              * 否则 sequence、generation 与 workspaceId 会只写进随后被丢弃的临时节点。 */
             ObjectNode wireParams = wire.params();
-            enrichAgentNotification(event, wireParams);
+            enrichAgentNotification(event, wireParams, occurredAt);
+            /*
+             * AgentLoop 只有在 SQLite 提交后才发布 durable event；在此唯一出站边界更新基线，
+             * 使 thread/read 的 revision 检查可以拒绝“已提交但尚未写出”窗口，而无需猜测数据库正文。
+             */
+            activeStreams.observe(event, occurredAt);
             if (event instanceof TurnEvent.ApprovalRequested requested) {
                 approvalCompletions.requested(requested.approvalId(), requested.context().threadId(),
                         requested.context().turnId(), requested.expiresAt());
@@ -717,6 +775,8 @@ public final class RpcSession implements AutoCloseable {
                     new ContextCompactionEventWireMapper(mapper, serverInstanceId).map(event);
             ObjectNode params = wire.params();
             params.put("generation", runtimeGeneration);
+            /* 压缩也是 Thread revision 提交边界，活动流必须随同一版本前进。 */
+            activeStreams.observeCompaction(event.context());
             CompletableFuture<Void> published = writer.notification(wire.method(), params);
             published.whenComplete((ignored, failure) -> {
                 if (failure != null) failProjection(failure);
@@ -735,7 +795,10 @@ public final class RpcSession implements AutoCloseable {
     public CompletableFuture<Void> publish(ThreadMetadataEvent event) {
         try {
             ObjectNode params = new ThreadMetadataEventWireMapper(mapper, serverInstanceId).map(event);
-            addNotificationMetadata(params, "thread_metadata");
+            Instant occurredAt = clock.instant();
+            addNotificationMetadata(params, "thread_metadata", occurredAt);
+            /* 自动标题/偏好 metadata 不带 Turn，但会推进同一个 Thread revision。 */
+            activeStreams.observeThreadRevision(event.threadId(), event.revision());
             CompletableFuture<Void> published = writer.notification("thread/metadata-changed", params);
             published.whenComplete((ignored, failure) -> {
                 if (failure != null) failProjection(failure);
@@ -823,6 +886,15 @@ public final class RpcSession implements AutoCloseable {
                 return RpcSession.this.publish(event);
             }
 
+            /** Provider dispatch 等无公开事件的事务只更新活动流内部 fence，不写 JA-RPC 帧。 */
+            @Override
+            public void observeCommittedTurn(String threadId, String turnId, long threadRevision,
+                                              long turnMutationVersion, int modelRound, TurnEvent event,
+                                              Instant occurredAt) {
+                activeStreams.observeTurnCommit(threadId, turnId, threadRevision, turnMutationVersion,
+                        modelRound, event, occurredAt);
+            }
+
             /** 压缩生命周期沿用 Thread 级发布路径。 */
             @Override
             public java.util.concurrent.CompletionStage<Void> publish(ContextCompactionEvent event) {
@@ -849,6 +921,7 @@ public final class RpcSession implements AutoCloseable {
         writer.poison(failure);
         if (event instanceof TurnEvent.Terminal terminal) {
             turnNotificationContexts.remove(terminal.context().turnId());
+            activeStreams.abandon(terminal.context().turnId());
         }
     }
 
@@ -856,7 +929,7 @@ public final class RpcSession implements AutoCloseable {
      * 在唯一 RPC 出站边界分配进程级单调 sequence，并为流式草稿补齐不可恢复的事件身份。
      * 持久事件保留存储层生成的 eventId、时间和 revision，避免传输层伪造领域顺序。
      */
-    private void enrichAgentNotification(TurnEvent event, ObjectNode params) {
+    private void enrichAgentNotification(TurnEvent event, ObjectNode params, Instant occurredAt) {
         String turnId = event instanceof TurnEvent.TextDelta delta ? delta.turnId()
                 : event instanceof TurnEvent.ReasoningSummaryDelta delta ? delta.turnId()
                 : event.context().turnId();
@@ -868,7 +941,7 @@ public final class RpcSession implements AutoCloseable {
         if (durable != null) turn.observeRevision(durable.threadRevision());
         params.put("serverInstanceId", serverInstanceId);
         if (!params.has("eventId")) params.put("eventId", nextEventId("stream"));
-        if (!params.has("occurredAt")) params.put("occurredAt", clock.instant().toString());
+        if (!params.has("occurredAt")) params.put("occurredAt", occurredAt.toString());
         params.put("generation", runtimeGeneration);
         params.put("workspaceId", turn.workspaceId());
         if (!params.has("threadId")) params.put("threadId", turn.threadId());
@@ -920,9 +993,16 @@ public final class RpcSession implements AutoCloseable {
 
     /** 为非 Turn 语义通知写入同一组公共元数据；物理 sequence 由唯一 stdout owner 分配。 */
     private void addNotificationMetadata(ObjectNode params, String category) {
+        addNotificationMetadata(params, category, clock.instant());
+    }
+
+    /**
+     * 使用调用方已经冻结的发生时间补全 Wire，保证 metadata 事件与活动基线具有同一时间边界。
+     */
+    private void addNotificationMetadata(ObjectNode params, String category, Instant occurredAt) {
         params.put("serverInstanceId", serverInstanceId);
         params.put("eventId", nextEventId(category));
-        params.put("occurredAt", clock.instant().toString());
+        params.put("occurredAt", Objects.requireNonNull(occurredAt, "occurredAt").toString());
         params.put("generation", runtimeGeneration);
     }
 
@@ -1013,6 +1093,7 @@ public final class RpcSession implements AutoCloseable {
     /** 按顺序关闭运行时，并仅在静默等待成功后发布 stopped。 */
     private void closeOwnedRuntime(ShutdownDeadline deadline) {
         closing.set(true);
+        activeStreams.clear();
         CancellationSource.CancelResult cancellationResult = cancellation.cancel("runtime_closed");
         approvalCompletions.close();
         RuntimeException failure = cancellationResult.callbackFailure().orElse(null);

@@ -19,6 +19,7 @@ import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnCancellationListener;
+import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.SubagentPolicyRepository;
@@ -1008,19 +1009,32 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         Objects.requireNonNull(taskThreadId, "taskThreadId");
         Objects.requireNonNull(downstream, "downstream");
         AtomicReference<Boolean> taskProjection = new AtomicReference<>();
-        return event -> {
-            downstream.publish(event).toCompletableFuture().join();
-            Boolean shouldProject = taskProjection.get();
-            if (shouldProject == null) {
-                shouldProject = tasks.findTask(taskThreadId).isPresent();
-                taskProjection.compareAndSet(null, shouldProject);
+        return new TurnEventSink() {
+            /** 下游先接收原始事件，Task 投影随后只消费已确认的同一事件。 */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {
+                downstream.publish(event).toCompletableFuture().join();
+                Boolean shouldProject = taskProjection.get();
+                if (shouldProject == null) {
+                    shouldProject = tasks.findTask(taskThreadId).isPresent();
+                    taskProjection.compareAndSet(null, shouldProject);
+                }
+                if (!shouldProject) return CompletableFuture.completedFuture(null);
+                projectTurnEvent(taskThreadId, event);
+                if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.Terminal) {
+                    tasks.findTask(taskThreadId).ifPresent(TaskCoordinator.this::publishLatest);
+                }
+                return CompletableFuture.completedFuture(null);
             }
-            if (!shouldProject) return CompletableFuture.completedFuture(null);
-            projectTurnEvent(taskThreadId, event);
-            if (event instanceof io.github.kongweiguang.ja.conversation.port.in.TurnEvent.Terminal) {
-                tasks.findTask(taskThreadId).ifPresent(this::publishLatest);
+
+            /** 将非 wire 的内部提交边界透传到真正 RPC sink，避免 Task 包装造成恢复水位断裂。 */
+            @Override
+            public void observeCommittedTurn(String threadId, String turnId, long threadRevision,
+                                              long turnMutationVersion, int modelRound, TurnEvent event,
+                                              java.time.Instant occurredAt) {
+                downstream.observeCommittedTurn(threadId, turnId, threadRevision, turnMutationVersion,
+                        modelRound, event, occurredAt);
             }
-            return CompletableFuture.completedFuture(null);
         };
     }
 

@@ -716,6 +716,7 @@ describe("WorkbenchHost capability activation", () => {
       contextUsage: null,
       taskActivities: [],
       goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     };
     const subagentDetail: TaskReadModel = {
@@ -899,6 +900,7 @@ describe("WorkbenchHost capability activation", () => {
       contextUsage: null,
       taskActivities: [],
       goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     };
     const nestedTask = {

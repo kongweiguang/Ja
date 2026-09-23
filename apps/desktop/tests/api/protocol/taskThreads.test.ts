@@ -297,6 +297,7 @@ describe("JA-RPC v1 Task Threads", () => {
       goalActivities: [],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
@@ -480,6 +481,7 @@ describe("JA-RPC v1 Task Threads", () => {
       goalActivities: [],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);

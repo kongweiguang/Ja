@@ -11,29 +11,59 @@ import {
   createLargePngFixture,
   inspectNativeImageRequest,
   parseArguments,
+  startProviderFixture,
   validateImageHistoryReport,
 } from "./image-history-production.mjs";
 
 /** 构造唯一完整的真窗报告基线，使每个负例只改变一个验收不变量。 */
 function validReport() {
+  const thumbnails = {
+    count: 2,
+    items: [
+      { fileName: "image-history-alpha.png", naturalWidth: 320, scheme: "ja-attachment" },
+      { fileName: "image-history-beta.png", naturalWidth: 320, scheme: "ja-attachment" },
+    ],
+  };
   return {
     schemaVersion: 1,
     status: "passed",
     runtime: { platform: "win32", surface: "tauri_webview2", boundary: "debug_jar" },
     provider: { kind: "deterministic_loopback", externalCalls: 0 },
-    image: { sizeBytes: 409_600, validPng: true },
+    image: {
+      fileNames: ["image-history-alpha.png", "image-history-beta.png"],
+      sizeBytes: 409_600,
+      validPng: true,
+      images: [
+        { fileName: "image-history-alpha.png", sizeBytes: 409_600, validPng: true },
+        { fileName: "image-history-beta.png", sizeBytes: 409_600, validPng: true },
+      ],
+    },
     successTurn: {
       submittedViaUi: true,
       base64Preserved: true,
+      nativeImageCount: 2,
       contextLimitVisible: false,
-      immediateThumbnail: { naturalWidth: 320, scheme: "ja-attachment" },
+      draft: {
+        count: 2,
+        items: [{ naturalWidth: 320 }, { naturalWidth: 320 }],
+      },
+      immediateThumbnails: thumbnails,
+      layout: { imagesAboveText: true, rightAligned: true, noHorizontalOverflow: true },
     },
-    preview: { opened: true, decoded: true },
-    reload: { sameThread: true, thumbnail: { naturalWidth: 320 } },
+    preview: { opened: true, decoded: true, count: 2, returnedBetweenItems: true },
+    reload: {
+      sameThread: true,
+      thumbnail: thumbnails,
+      previewReopened: true,
+      narrow: { noHorizontalOverflow: true, visibleImageCount: 2 },
+    },
     failureTurn: {
       terminalState: "failed",
+      providerAttempts: 3,
       base64Preserved: true,
+      nativeImageCount: 2,
       attachmentRetained: true,
+      continuationVisible: true,
       contextLimitVisible: false,
     },
   };
@@ -95,6 +125,104 @@ test("Provider 请求保持原生 input_image Base64 字节完全一致", () => 
   );
 });
 
+test("Provider 请求逐张保持两张不同图片的顺序、字节与 Base64", () => {
+  const first = createLargePngFixture(0);
+  const second = createLargePngFixture(1);
+  assert.equal(first.bytes.equals(second.bytes), false);
+  const payload = {
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "多图展示验收" },
+          {
+            type: "input_image",
+            image_url: `data:image/png;base64,${first.bytes.toString("base64")}`,
+            detail: "auto",
+          },
+          {
+            type: "input_image",
+            image_url: `data:image/png;base64,${second.bytes.toString("base64")}`,
+            detail: "auto",
+          },
+        ],
+      },
+    ],
+  };
+  const inspection = inspectNativeImageRequest(payload, "多图展示验收", [
+    first.bytes,
+    second.bytes,
+  ]);
+  assert.equal(inspection.kind, "turn");
+  assert.equal(inspection.imageCount, 2);
+  assert.equal(inspection.base64Preserved, true);
+  assert.deepEqual(
+    inspection.images.map(({ byteLength, base64Preserved }) => ({ byteLength, base64Preserved })),
+    [
+      { byteLength: first.bytes.length, base64Preserved: true },
+      { byteLength: second.bytes.length, base64Preserved: true },
+    ],
+  );
+  const missing = structuredClone(payload);
+  missing.input[0].content.pop();
+  assert.throws(
+    () => inspectNativeImageRequest(missing, "多图展示验收", [first.bytes, second.bytes]),
+    /exactly 2 native images/u,
+  );
+});
+
+test("中文失败标记的三次请求均返回畸形协议，绝不误回成功正文", async () => {
+  const fixture = createLargePngFixture();
+  const provider = await startProviderFixture(fixture.bytes);
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await fetch(`${provider.baseUrl}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          input: [
+            {
+              role: "user",
+              content: [
+                { type: "input_text", text: "失败保留验收：请触发受控失败。" },
+                {
+                  type: "input_image",
+                  image_url: `data:image/png;base64,${fixture.bytes.toString("base64")}`,
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      assert.equal(response.status, 200);
+      const stream = await response.text();
+      assert.equal(stream.includes("JA_IMAGE_HISTORY_SUCCESS_REPLY"), false);
+      const data = stream
+        .split("\n")
+        .find((line) => line.startsWith("data: "))
+        .slice(6);
+      assert.throws(() => JSON.parse(data), SyntaxError);
+    }
+    assert.equal(provider.attempts.length, 3);
+    assert.equal(
+      provider.attempts.every(({ marker, kind }) => marker === "失败保留验收" && kind === "turn"),
+      true,
+    );
+  } finally {
+    await provider.close();
+  }
+});
+
+test("报告拒绝未耗尽重试以及隐藏图片的伪窄屏验收", () => {
+  const report = validReport();
+  report.failureTurn.providerAttempts = 1;
+  report.reload.narrow.visibleImageCount = 0;
+  const verdict = validateImageHistoryReport(report);
+  assert.equal(verdict.passed, false);
+  assert.equal(verdict.failures.includes("failed-retry-budget"), true);
+  assert.equal(verdict.failures.includes("narrow-visible-images"), true);
+});
+
 test("启动环境固定隔离目录并移除真实 Provider 开关", () => {
   const previous = process.env.JA_E2E_REAL_PROVIDER;
   process.env.JA_E2E_REAL_PROVIDER = "1";
@@ -135,10 +263,11 @@ test("递归清理仅允许 OS temp 的具体子目录", () => {
   assert.throws(() => assertOwnedTemporaryPath(process.cwd(), "workspace"), /child/u);
 });
 
-test("报告闭集拒绝 blob 缩略图、上下文误判和失败图片丢失", () => {
+test("报告闭集拒绝 blob 缩略图、布局错误、上下文误判和失败图片丢失", () => {
   assert.deepEqual(validateImageHistoryReport(validReport()), { passed: true, failures: [] });
   const report = validReport();
-  report.successTurn.immediateThumbnail.scheme = "blob";
+  report.successTurn.immediateThumbnails.items[0].scheme = "blob";
+  report.successTurn.layout.rightAligned = false;
   report.successTurn.contextLimitVisible = true;
   report.reload.sameThread = false;
   report.failureTurn.attachmentRetained = false;
@@ -148,11 +277,18 @@ test("报告闭集拒绝 blob 缩略图、上下文误判和失败图片丢失",
     verdict.failures.filter((failure) =>
       [
         "immediate-native-scheme",
+        "message-layout",
         "success-context-limit",
         "reload-thread",
         "failed-image-retained",
       ].includes(failure),
     ),
-    ["success-context-limit", "immediate-native-scheme", "reload-thread", "failed-image-retained"],
+    [
+      "success-context-limit",
+      "immediate-native-scheme",
+      "message-layout",
+      "reload-thread",
+      "failed-image-retained",
+    ],
   );
 });

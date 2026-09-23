@@ -425,6 +425,37 @@ final class AgentLoopTest {
         }
     }
 
+    /**
+     * Provider 在已经发送正文后才报告协议错误时，失败终态必须保留这段正文作为过程事实，
+     * 同时继续写入独立的固定失败回复，避免用户只看到错误而无法判断已生成到哪里。
+     */
+    @Test
+    void providerFailureRetainsPartialAssistantText() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        ModelPort model = (request, sink, cancellation) -> {
+            sink.onEvent(new ModelPort.TextDelta("已经生成的一半")).toCompletableFuture().join();
+            return CompletableFuture.failedFuture(
+                    new ProviderProtocolException("TRUNCATED_STREAM", "provider stream ended", false));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+
+            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("MODEL_PROTOCOL_ERROR", result.terminal().errorCode());
+            ConversationRepository.AssistantFact partial = store.facts.stream()
+                    .filter(ConversationRepository.AssistantFact.class::isInstance)
+                    .map(ConversationRepository.AssistantFact.class::cast)
+                    .filter(fact -> fact.publicText().equals("已经生成的一半"))
+                    .findFirst()
+                    .orElseThrow();
+            assertTrue(partial.messageId().startsWith("item_partial_"));
+            assertEquals("模型响应格式有误或不完整。", text(store.terminal.finalMessage()));
+        }
+    }
+
     /** Provider 普通正文夹带 DSML 示例时必须原样完成，且不能因字面内容伪造 Tool 执行。 */
     @Test
     void textualDsmlToolMarkupCompletesAsOrdinaryAnswerWithoutExecutingTool() {
@@ -1423,7 +1454,7 @@ final class AgentLoopTest {
         AtomicInteger attempts = new AtomicInteger();
         ConversationRepository.CommitReceipt receipt = new ConversationRepository.CommitReceipt(2, 2);
         TurnEvent.Terminal event = new TurnEvent.Terminal(
-                new TurnEvent.Context("evt_projection_retry", "thr_test", "turn_test", 2, CLOCK.instant()),
+                new TurnEvent.Context("evt_projection_retry", "thr_test", "turn_test", 2, 0, CLOCK.instant()),
                 TurnState.FAILED, "failed", "INTERNAL_ERROR", "failed",
                 new TurnEvent.FinalMessage("item_failure", "failed"), null);
 
@@ -1454,7 +1485,7 @@ final class AgentLoopTest {
         ConversationRepository.CommitReceipt receipt = new ConversationRepository.CommitReceipt(2, 2);
         TurnEvent.Terminal event = new TurnEvent.Terminal(
                 new TurnEvent.Context("evt_concurrent_terminal", "thr_test", "turn_test", 2,
-                        CLOCK.instant()), TurnState.FAILED, "failed", "INTERNAL_ERROR", "failed",
+                        0, CLOCK.instant()), TurnState.FAILED, "failed", "INTERNAL_ERROR", "failed",
                 new TurnEvent.FinalMessage("item_failure", "failed"), null);
 
         CompletableFuture<TerminalCoordinator.Finish> owner = CompletableFuture.supplyAsync(

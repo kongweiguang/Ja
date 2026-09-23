@@ -125,7 +125,7 @@ final class GoldenCorpusTest {
             Map.entry("credential/delete", "credentialMutationResult"),
             Map.entry("credential/reveal-provider", "credentialRevealProviderResult"));
 
-    /** 遍历全部正向帧，防止协议主版本或配置事件边界在局部测试之外发生漂移。 */
+    /** 遍历全部正向帧并复核活动流语义，防止新增负例校验误拒绝正常快照。 */
     @Test
     void consumesEveryV1PositiveFrame() throws IOException {
         JaRpcCodec codec = new JaRpcCodec();
@@ -152,6 +152,11 @@ final class GoldenCorpusTest {
                 }
                 if (frame instanceof JaRpcCodec.Notification notification
                         && "configuration/changed".equals(notification.method())) sawConfigChanged = true;
+                JsonNode result = mapper.readTree(bytes).path("result");
+                if (result.has("liveStream")) {
+                    assertFalse(rejectsLiveStreamSemantics("thread/read", result),
+                            "positive live stream semantics rejected: " + file + ":" + (index + 1));
+                }
                 frames++;
             }
         }
@@ -295,9 +300,16 @@ final class GoldenCorpusTest {
         Schema resultSchema = method == null ? null : schemas.results().get(method);
         boolean resultRejected = document.has("result") && resultSchema != null
                 && !resultSchema.validate(document.get("result").toString(), InputFormat.JSON).isEmpty();
-        boolean semanticRejected = rejectsChangeSetArtifactSemantics(method, document.path("result"));
+        boolean semanticRejected = rejectsChangeSetArtifactSemantics(method, document.path("result"))
+                || rejectsLiveStreamSemantics(method, document.path("result"));
         assertTrue(envelopeRejected || correlationRejected || resultRejected || semanticRejected,
                 () -> "negative correlated response accepted: " + file + ":" + lineNumber);
+    }
+
+    /** 复用生产端 thread/read 活动流校验，避免 Golden 只用测试专属规则放行残缺恢复基线。 */
+    private static boolean rejectsLiveStreamSemantics(String method, JsonNode result) {
+        if (!"thread/read".equals(method)) return false;
+        return !ThreadReadContract.isValidLiveStream(result);
     }
 
     /**

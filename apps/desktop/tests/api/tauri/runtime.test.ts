@@ -552,6 +552,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       goalActivities: [],
       inputQueue: null,
       contextUsage: { ...knownUsage, turnId: "turn_fixture" },
+      liveStream: null,
       nextCursor: null,
     };
     const invoke = vi

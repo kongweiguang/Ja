@@ -403,6 +403,55 @@ def validate_input_queue(value: Any, expected_turn_id: str | None = None) -> Non
         raise CorpusError("input queue byte budget exceeded")
 
 
+def validate_live_stream(value: Any, turns: Any) -> None:
+    """校验 thread/read 的可恢复公开流，禁止跨 Turn、越过基线或预算溢出的残缺片段。"""
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"turnId", "streamSeq", "segments"}:
+        raise CorpusError("live stream is invalid")
+    turn_id = value.get("turnId")
+    stream_seq = value.get("streamSeq")
+    segments = value.get("segments")
+    if not isinstance(turn_id, str) or re.fullmatch(r"^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", turn_id) is None \
+            or type(stream_seq) is not int or not 0 <= stream_seq <= 9_007_199_254_740_991 \
+            or not isinstance(segments, list) or len(segments) > 256:
+        raise CorpusError("live stream identity or capacity is invalid")
+    active_statuses = {"queued", "running", "waiting_approval", "suspended"}
+    if not isinstance(turns, list) or not any(
+        isinstance(turn, dict)
+        and turn.get("turnId") == turn_id
+        and turn.get("status") in active_statuses
+        for turn in turns
+    ):
+        raise CorpusError("live stream turn is not active")
+    previous_end: int | None = None
+    total_bytes = 0
+    for segment in segments:
+        if not isinstance(segment, dict) \
+                or set(segment) != {"kind", "segmentStartSeq", "streamSeq", "text", "occurredAt"}:
+            raise CorpusError("live stream segment is invalid")
+        kind = segment.get("kind")
+        start = segment.get("segmentStartSeq")
+        end = segment.get("streamSeq")
+        text = segment.get("text")
+        if kind not in {"assistant", "reasoningSummary"} \
+                or type(start) is not int or not 1 <= start <= 9_007_199_254_740_991 \
+                or type(end) is not int or not 1 <= end <= 9_007_199_254_740_991 \
+                or start > end or end > stream_seq \
+                or previous_end is not None and start != previous_end + 1 \
+                or not isinstance(text, str) or not text or "\x00" in text:
+            raise CorpusError("live stream segment sequence or kind is invalid")
+        segment_bytes = len(text.encode("utf-8"))
+        if segment_bytes > 64 * 1024:
+            raise CorpusError("live stream segment byte budget exceeded")
+        total_bytes += segment_bytes
+        previous_end = end
+    if segments and previous_end != stream_seq:
+        raise CorpusError("live stream segments do not reach baseline")
+    if total_bytes > 1024 * 1024:
+        raise CorpusError("live stream byte budget exceeded")
+
+
 def validate_input_event(method: str, params: dict[str, Any]) -> None:
     """校验队列事件中的前后状态与 Timeline 事实共享同一 Turn 和结构化内容。"""
     validate_input_queue(params.get("inputQueue"), params.get("turnId"))
@@ -526,6 +575,7 @@ def validate_result(method: str, result: Any, schema: dict[str, Any]) -> None:
         for item in result.get("items", []):
             if isinstance(item, dict) and item.get("kind") == "user_input":
                 validate_attachment_summaries(item.get("content"), item.get("attachments"))
+        validate_live_stream(result.get("liveStream"), result.get("turns"))
     if method == "thread/seen" and result.get("latestTurnSeen") is not True:
         raise CorpusError("thread/seen did not advance the durable seen boundary")
     if method.startswith("turn/input/"):

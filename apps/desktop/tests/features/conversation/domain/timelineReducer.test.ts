@@ -9,9 +9,11 @@ import {
 import {
   applyEventValue,
   applyRuntimeStatus,
-  applySnapshot,
+  applySnapshot as applyTimelineSnapshot,
   applyTurnAccepted,
   createTimelineState,
+  markThreadResync,
+  type ApplySnapshotOptions,
   type TimelineState,
 } from "@/features/conversation/domain/timelineReducer";
 
@@ -162,6 +164,16 @@ function apply(state: TimelineState, value: unknown): TimelineState {
   return applyEventValue(state, parsed);
 }
 
+/** 通过完整 Wire Snapshot 调用 reducer，避免测试绕过 live baseline 合同。 */
+function applySnapshot(
+  state: TimelineState,
+  value: unknown,
+  workspaceId: string,
+  options?: ApplySnapshotOptions,
+): TimelineState {
+  return applyTimelineSnapshot(state, value, workspaceId, options);
+}
+
 describe("timeline reducer", () => {
   it("按 root 原子替换 taskActivities，并在 runtime generation 变化时清除旧投影", () => {
     const first = applySnapshot(
@@ -173,6 +185,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [taskActivityEntry()],
         goalActivities: [],
         nextCursor: null,
@@ -190,6 +203,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -215,6 +229,7 @@ describe("timeline reducer", () => {
       items: [],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       taskActivities: [entry],
       goalActivities: [],
       nextCursor: null,
@@ -270,6 +285,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -342,6 +358,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -410,6 +427,7 @@ describe("timeline reducer", () => {
       ],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       taskActivities: [],
       goalActivities: [],
       nextCursor: null,
@@ -437,6 +455,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -680,6 +699,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -783,6 +803,32 @@ describe("timeline reducer", () => {
     expect(cancelled.draftByTurn[turnId]).toEqual([
       expect.objectContaining({ kind: "assistant", text: "取消前已经生成的正文" }),
     ]);
+
+    let failed = readyState();
+    failed = apply(failed, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    failed = apply(
+      failed,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_failed_text",
+        sequence: 2,
+        streamSeq: 1,
+        text: "失败前已经生成的正文",
+      }),
+    );
+    failed = apply(
+      failed,
+      event("turn/terminal", 2, {
+        eventId: "evt_terminal_failed",
+        sequence: 3,
+        state: "failed",
+        summary: "模型响应格式有误或不完整。",
+        finalMessage: { messageId: "item_failed_reply", text: "模型响应格式有误或不完整。" },
+        errorCode: "MODEL_PROTOCOL_ERROR",
+      }),
+    );
+    expect(failed.draftByTurn[turnId]).toEqual([
+      expect.objectContaining({ kind: "assistant", text: "失败前已经生成的正文" }),
+    ]);
   });
 
   /** 重启调和后的 Suspended 继续阻塞 Thread，且只能先回到队列再恢复执行。 */
@@ -820,6 +866,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -854,6 +901,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -907,6 +955,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: { turnId, revision: 13, accepting: true, items: [pendingInput] },
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -964,6 +1013,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: { turnId, revision: 13, accepting: true, items: [pendingInput] },
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1453,6 +1503,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1516,6 +1567,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1766,6 +1818,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2041,6 +2094,7 @@ describe("timeline reducer", () => {
         },
         taskActivities: [],
         goalActivities: [],
+        liveStream: null,
         nextCursor: null,
       },
       "ws_one",
@@ -2301,6 +2355,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2381,6 +2436,7 @@ describe("timeline reducer", () => {
         },
         taskActivities: [],
         goalActivities: [],
+        liveStream: null,
         nextCursor: null,
       },
       "ws_one",
@@ -2408,6 +2464,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2443,6 +2500,7 @@ describe("timeline reducer", () => {
         },
         taskActivities: [],
         goalActivities: [],
+        liveStream: null,
         nextCursor: null,
       },
       "ws_one",
@@ -2546,6 +2604,7 @@ describe("timeline reducer", () => {
         },
         taskActivities: [],
         goalActivities: [],
+        liveStream: null,
         nextCursor: null,
       },
       "ws_one",
@@ -2633,6 +2692,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2741,6 +2801,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2770,6 +2831,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2884,6 +2946,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2961,6 +3024,7 @@ describe("timeline reducer", () => {
         ],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -3021,6 +3085,7 @@ describe("timeline reducer", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -3074,5 +3139,645 @@ describe("timeline reducer", () => {
     );
     expect(conflicting.lastOutcome).toBe("resync_required");
     expect(conflicting.items[firstMessage.itemId]?.text).toBe(firstMessage.content);
+  });
+
+  it("保留同 revision 的 live baseline 引用，并继续接纳其后的 delta", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_same_revision_seq_1",
+        sequence: 2,
+        streamSeq: 1,
+        text: "第一段",
+      }),
+    );
+    const draftReference = state.draftByTurn[turnId];
+    const snapshot = {
+      threadId,
+      revision: 1,
+      turns: [
+        {
+          turnId,
+          status: "running" as const,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: {
+        turnId,
+        streamSeq: 1,
+        segments: [
+          {
+            kind: "assistant" as const,
+            segmentStartSeq: 1,
+            streamSeq: 1,
+            text: "第一段",
+            occurredAt: "2026-08-18T00:00:01Z",
+          },
+        ],
+      },
+      nextCursor: null,
+    };
+    const restored = applySnapshot(state, snapshot, "ws_one");
+    expect(restored.lastOutcome).toBe("applied");
+    expect(restored.draftByTurn[turnId]).toBe(draftReference);
+    const continued = apply(
+      restored,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_same_revision_seq_2",
+        sequence: 3,
+        streamSeq: 2,
+        text: "第二段",
+      }),
+    );
+    expect(continued.lastOutcome).toBe("applied");
+    expect(continued.streamSeqByTurn[turnId]).toBe(2);
+    expect(continued.draftByTurn[turnId]?.[0]?.text).toBe("第一段第二段");
+  });
+
+  it("跨越 64KiB 的同类 delta 与 Java baseline 保持分段和 Draft 节点身份", () => {
+    const firstText = "a".repeat(40_000);
+    const secondText = "b".repeat(30_000);
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_segment_boundary_first",
+        sequence: 2,
+        streamSeq: 1,
+        text: firstText,
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_segment_boundary_second",
+        sequence: 3,
+        streamSeq: 2,
+        text: secondText,
+      }),
+    );
+    expect(state.draftByTurn[turnId]).toHaveLength(2);
+    const draftReference = state.draftByTurn[turnId];
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 1,
+        turns: [
+          {
+            turnId,
+            status: "running" as const,
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:01Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        liveStream: {
+          turnId,
+          streamSeq: 2,
+          segments: [
+            {
+              kind: "assistant" as const,
+              segmentStartSeq: 1,
+              streamSeq: 1,
+              text: firstText,
+              occurredAt: "2026-08-18T00:00:01Z",
+            },
+            {
+              kind: "assistant" as const,
+              segmentStartSeq: 2,
+              streamSeq: 2,
+              text: secondText,
+              occurredAt: "2026-08-18T00:00:01Z",
+            },
+          ],
+        },
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.lastOutcome).toBe("applied");
+    expect(restored.draftByTurn[turnId]).toBe(draftReference);
+    expect(restored.draftByTurn[turnId]?.map((segment) => segment.text)).toEqual([
+      firstText,
+      secondText,
+    ]);
+  });
+
+  it("允许从已提交前缀开始的 live baseline，并忽略被 snapshot 覆盖的迟到 committed event", () => {
+    const snapshot = {
+      threadId,
+      revision: 3,
+      turns: [
+        {
+          turnId,
+          status: "running" as const,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:03Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: {
+        turnId,
+        streamSeq: 4,
+        segments: [
+          {
+            kind: "assistant" as const,
+            segmentStartSeq: 3,
+            streamSeq: 4,
+            text: "恢复正文",
+            occurredAt: "2026-08-18T00:00:03Z",
+          },
+        ],
+      },
+      nextCursor: null,
+    };
+    expect(timelineSnapshotValidationReason(snapshot)).toBeUndefined();
+    const state = applySnapshot(readyState(), snapshot, "ws_one");
+    expect(state.lastOutcome).toBe("applied");
+    const late = apply(
+      state,
+      event("turn/state-changed", 3, { from: "queued", to: "running", sequence: 10 }),
+    );
+    expect(late.lastOutcome).toBe("late");
+    expect(late.resyncRequired[threadId]).toBeUndefined();
+    expect(late.draftByTurn[turnId]?.[0]?.text).toBe("恢复正文");
+  });
+
+  it("拒绝空公开片段，避免 live baseline 冒充可恢复正文", () => {
+    const snapshot = {
+      threadId,
+      revision: 1,
+      turns: [
+        {
+          turnId,
+          status: "running" as const,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: {
+        turnId,
+        streamSeq: 1,
+        segments: [
+          {
+            kind: "assistant" as const,
+            segmentStartSeq: 1,
+            streamSeq: 1,
+            text: "",
+            occurredAt: "2026-08-18T00:00:01Z",
+          },
+        ],
+      },
+      nextCursor: null,
+    };
+    expect(timelineSnapshotValidationReason(snapshot)).toBe("live_stream");
+  });
+
+  it("在 domain 边界拒绝 liveStream 的非法时间、NUL 和未知字段", () => {
+    const segment = {
+      kind: "assistant" as const,
+      segmentStartSeq: 1,
+      streamSeq: 1,
+      text: "正文",
+      occurredAt: "2026-08-18T00:00:01Z",
+    };
+    const snapshot = {
+      threadId,
+      revision: 1,
+      turns: [
+        {
+          turnId,
+          status: "running" as const,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: { turnId, streamSeq: 1, segments: [segment] },
+      nextCursor: null,
+    };
+    expect(
+      timelineSnapshotValidationReason({
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [{ ...segment, occurredAt: "2026-02-30T00:00:00Z" }],
+        },
+      }),
+    ).toBe("live_stream");
+    expect(
+      timelineSnapshotValidationReason({
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [{ ...segment, text: "含\u0000NUL" }],
+        },
+      }),
+    ).toBe("live_stream");
+    expect(
+      timelineSnapshotValidationReason({
+        ...snapshot,
+        liveStream: {
+          ...snapshot.liveStream,
+          segments: [{ ...segment, extra: true }],
+        },
+      }),
+    ).toBe("live_stream");
+  });
+
+  it("拒绝错误 generation 或 server identity 的首个 delta，不能把旧流当成新流", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    const stale = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_stale_identity",
+        sequence: 2,
+        generation: 2,
+        streamSeq: 1,
+        text: "旧连接正文",
+      }),
+    );
+    expect(stale.lastOutcome).toBe("resync_required");
+    expect(stale.draftByTurn[turnId]).toBeUndefined();
+  });
+
+  it("新 revision 的空 baseline 不保留已经由 committed item 覆盖的旧 Draft", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_committed_draft_before_snapshot",
+        sequence: 2,
+        streamSeq: 2,
+        text: "不应重复展示",
+      }),
+    );
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 2,
+        turns: [
+          {
+            turnId,
+            status: "running",
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_committed_reply",
+            turnId,
+            kind: "assistant_progress",
+            createdAt: "2026-08-18T00:00:02Z",
+            text: "不应重复展示",
+            modelRound: 1,
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        liveStream: { turnId, streamSeq: 2, segments: [] },
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.lastOutcome).toBe("applied");
+    expect(restored.draftByTurn[turnId]).toBeUndefined();
+    expect(restored.streamSeqByTurn[turnId]).toBe(2);
+  });
+
+  it("同 revision 的 null baseline 保留无 Draft 但已有 cursor 的 active Turn", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = { ...state, streamSeqByTurn: { ...state.streamSeqByTurn, [turnId]: 2 } };
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 1,
+        turns: [
+          {
+            turnId,
+            status: "running",
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:01Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        liveStream: null,
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.streamSeqByTurn[turnId]).toBe(2);
+    expect(restored.draftByTurn[turnId]).toBeUndefined();
+    const next = apply(
+      restored,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_after_null_health_snapshot",
+        sequence: 2,
+        streamSeq: 3,
+        text: "继续",
+      }),
+    );
+    expect(next.lastOutcome).toBe("applied");
+    expect(next.streamSeqByTurn[turnId]).toBe(3);
+  });
+
+  it("后台重读请求不会把真实 gap 降级成普通 health 标记", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_gap_first",
+        sequence: 2,
+        streamSeq: 1,
+        text: "首段",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_gap_third",
+        sequence: 3,
+        streamSeq: 3,
+        text: "缺失第二段",
+      }),
+    );
+    expect(state.resyncRequired[threadId]).toBe("gap");
+    const retried = markThreadResync(state, threadId);
+    expect(retried.resyncRequired[threadId]).toBe("gap");
+    expect(retried.draftByTurn[turnId]).toBeUndefined();
+  });
+
+  it("真实 gap 遇到同 revision 的较旧空 baseline 后仍拒绝缺前缀 delta", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_gap_prefix_one",
+        sequence: 2,
+        streamSeq: 1,
+        text: "前缀一",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_gap_prefix_two",
+        sequence: 3,
+        streamSeq: 2,
+        text: "前缀二",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_gap_prefix_four",
+        sequence: 4,
+        streamSeq: 4,
+        text: "越过缺口",
+      }),
+    );
+    expect(state.resyncRequired[threadId]).toBe("gap");
+    expect(state.streamSeqByTurn[turnId]).toBe(2);
+    expect(state.draftByTurn[turnId]).toBeUndefined();
+
+    const recovered = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 1,
+        turns: [
+          {
+            turnId,
+            status: "running" as const,
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:01Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        liveStream: { turnId, streamSeq: 1, segments: [] },
+        nextCursor: null,
+      },
+      "ws_one",
+      { mode: "recovery" },
+    );
+    expect(recovered.lastOutcome).toBe("applied");
+    expect(recovered.streamSeqByTurn[turnId]).toBe(1);
+    expect(recovered.draftByTurn[turnId]).toBeUndefined();
+
+    const missingPrefix = apply(
+      recovered,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_gap_prefix_three_after_recovery",
+        sequence: 5,
+        streamSeq: 3,
+        text: "缺失段之后",
+      }),
+    );
+    expect(missingPrefix.lastOutcome).toBe("gap");
+    expect(missingPrefix.resyncRequired[threadId]).toBe("gap");
+    expect(missingPrefix.draftByTurn[turnId]).toBeUndefined();
+  });
+
+  it("终态后迟到的已覆盖 delta 幂等忽略，越过终态游标的新 delta 仍触发恢复", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_boundary_delta",
+        sequence: 2,
+        streamSeq: 1,
+        text: "已显示",
+      }),
+    );
+    state = apply(
+      state,
+      event("turn/terminal", 2, {
+        eventId: "evt_terminal_boundary",
+        sequence: 3,
+        state: "completed",
+        summary: "完成",
+        finalMessage: { messageId: "item_terminal_boundary", text: "完成" },
+      }),
+    );
+    expect(state.lastOutcome).toBe("applied");
+    const lateCovered = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_late_covered",
+        sequence: 4,
+        streamSeq: 1,
+        text: "重复",
+      }),
+    );
+    expect(lateCovered.lastOutcome).toBe("duplicate");
+    expect(lateCovered.resyncRequired[threadId]).toBeUndefined();
+    expect(lateCovered.turns[turnId]?.status).toBe("completed");
+
+    const lateUnknown = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_late_unknown",
+        sequence: 5,
+        streamSeq: 2,
+        text: "未知",
+      }),
+    );
+    expect(lateUnknown.lastOutcome).toBe("resync_required");
+    expect(lateUnknown.resyncRequired[threadId]).toBe("invalid_event");
+  });
+
+  it("终态快照保留已知 stream 水位，并按 snapshot revision 忽略旧 delta", () => {
+    const runningWithDelta = apply(
+      apply(readyState(), event("turn/state-changed", 1, { from: "queued", to: "running" })),
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_snapshot_delta",
+        sequence: 2,
+        streamSeq: 1,
+        text: "已显示",
+      }),
+    );
+    const terminalSnapshot = {
+      threadId,
+      revision: 2,
+      turns: [
+        {
+          turnId,
+          status: "completed" as const,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:02Z",
+          completedAt: "2026-08-18T00:00:02Z",
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: null,
+      nextCursor: null,
+    };
+
+    const fromSnapshot = applySnapshot(runningWithDelta, terminalSnapshot, "ws_one");
+    expect(fromSnapshot.lastOutcome).toBe("applied");
+    expect(fromSnapshot.streamSeqByTurn[turnId]).toBe(1);
+    const oldBeforeTerminalEvent = apply(
+      fromSnapshot,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_snapshot_old_delta",
+        sequence: 3,
+        streamSeq: 1,
+        text: "重复",
+      }),
+    );
+    expect(oldBeforeTerminalEvent.lastOutcome).toBe("duplicate");
+    expect(oldBeforeTerminalEvent.resyncRequired[threadId]).toBeUndefined();
+
+    const terminalEventState = apply(
+      runningWithDelta,
+      event("turn/terminal", 2, {
+        eventId: "evt_terminal_before_snapshot",
+        sequence: 3,
+        state: "completed",
+        summary: "完成",
+        finalMessage: { messageId: "item_terminal_before_snapshot", text: "完成" },
+      }),
+    );
+    const afterTerminalSnapshot = applySnapshot(terminalEventState, terminalSnapshot, "ws_one");
+    expect(afterTerminalSnapshot.lastOutcome).toBe("applied");
+    expect(afterTerminalSnapshot.streamSeqByTurn[turnId]).toBe(1);
+    const oldAfterTerminalEvent = apply(
+      afterTerminalSnapshot,
+      event("assistant/text-delta", 2, {
+        eventId: "evt_terminal_after_snapshot_old_delta",
+        sequence: 4,
+        streamSeq: 2,
+        text: "已被终态覆盖",
+      }),
+    );
+    expect(oldAfterTerminalEvent.lastOutcome).toBe("late");
+    expect(oldAfterTerminalEvent.resyncRequired[threadId]).toBeUndefined();
+    const newerAfterTerminalSnapshot = apply(
+      afterTerminalSnapshot,
+      event("assistant/text-delta", 3, {
+        eventId: "evt_terminal_after_snapshot_new_delta",
+        sequence: 5,
+        streamSeq: 2,
+        text: "越过终态边界",
+      }),
+    );
+    expect(newerAfterTerminalSnapshot.lastOutcome).toBe("resync_required");
+    expect(newerAfterTerminalSnapshot.resyncRequired[threadId]).toBe("invalid_event");
   });
 });

@@ -1,0 +1,32 @@
+/* @author kongweiguang */
+
+@import "@/features/conversation/ui/composer/composer.css";
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--ja-background);
+}
+
+.image-ux-fixture-heading {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 620px) {
+  .image-ux-fixture-heading {
+    display: none;
+  }
+}

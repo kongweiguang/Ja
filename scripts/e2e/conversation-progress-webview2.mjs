@@ -10,9 +10,12 @@
  */
 
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
+import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runProduction } from "./review-redesign-production.mjs";
 import {
@@ -26,10 +29,166 @@ const PROMPT = "请先读取隔离 fixture，再执行一次低影响 Shell 回�
 const TITLE = "Conversation Progress E2E";
 const PROGRESS_TURN_WALL_TIMEOUT_MS = 120_000;
 const PROGRESS_INVOKE_LOG_KEY = "__JA_CONVERSATION_PROGRESS_INVOKES__";
+const ACTIVE_STREAM_REGISTRY_SOURCE_PATH =
+  "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java";
+const execFileAsync = promisify(execFile);
+const SOURCE_IDENTITY_FILES = Object.freeze({
+  controller: "apps/desktop/src/features/conversation/application/useConversationController.ts",
+  interaction:
+    "apps/desktop/src/features/conversation/application/useConversationInteractionController.ts",
+  timelineStore: "apps/desktop/src/features/conversation/application/timelineStore.ts",
+  timelineReducer: "apps/desktop/src/features/conversation/domain/timelineReducer.ts",
+  timelineContracts: "apps/desktop/src/features/conversation/domain/timelineContracts.ts",
+  historyApi: "apps/desktop/src/api/tauri/history.ts",
+  chatTimeline: "apps/desktop/src/features/conversation/ui/timeline/ChatTimeline.tsx",
+  workProcess: "apps/desktop/src/features/conversation/ui/timeline/WorkProcess.tsx",
+  activeStreamRegistry: ACTIVE_STREAM_REGISTRY_SOURCE_PATH,
+  rpcSession:
+    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/RpcSession.java",
+  threadHistoryHandler:
+    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/handler/ThreadHistoryHandler.java",
+  rpcResults:
+    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/RpcResults.java",
+  threadReadContract:
+    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/ThreadReadContract.java",
+  rustHistoryModel: "src-tauri/src/app_runtime/interface/history_model.rs",
+  mybatisHistoryService:
+    "app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/MybatisHistoryService.java",
+  agentLoopPersistence:
+    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/application/loop/AgentLoopPersistence.java",
+  turnEventSink:
+    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/port/in/TurnEventSink.java",
+  threadSnapshot:
+    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/ThreadSnapshot.java",
+});
 
 /** 将真窗阶段限制在统一 deadline 内，避免 selector 漂移隐藏真正失败阶段。 */
 function timeout(deadline) {
   return Math.max(1, Math.min(30_000, deadline - Date.now()));
+}
+
+/** 以固定 SHA-256 读取源码身份；失败只记录 unavailable，不把文件内容或配置带入验收报告。 */
+async function sha256File(path) {
+  const digest = createHash("sha256");
+  digest.update(await readFile(path));
+  return digest.digest("hex");
+}
+
+/** 读取 git HEAD 与 dirty 布尔状态，报告不保存文件名列表，避免把工作区路径扩散到证据。 */
+async function readGitIdentity() {
+  try {
+    const [headResult, statusResult] = await Promise.all([
+      execFileAsync("git.exe", ["rev-parse", "HEAD"], {
+        cwd: repoRoot,
+        windowsHide: true,
+        timeout: 15_000,
+        maxBuffer: 64 * 1024,
+      }),
+      execFileAsync("git.exe", ["status", "--porcelain=v1", "--untracked-files=all"], {
+        cwd: repoRoot,
+        windowsHide: true,
+        timeout: 15_000,
+        maxBuffer: 8 * 1024 * 1024,
+      }),
+    ]);
+    const statusLines = statusResult.stdout.split(/\r?\n/u).filter((line) => line.length > 0);
+    return {
+      head: headResult.stdout.trim(),
+      dirty: statusLines.length > 0,
+      dirtyEntryCount: statusLines.length,
+    };
+  } catch (error) {
+    return {
+      head: null,
+      dirty: null,
+      dirtyEntryCount: null,
+      status: "unavailable",
+      errorCategory: error?.code === "ENOENT" ? "git_unavailable" : "git_read_failed",
+    };
+  }
+}
+
+/** 对每个关键跨栈源文件只发布相对路径、大小和哈希，缺失时不伪造源码身份。 */
+async function readSourceFileIdentities() {
+  const entries = {};
+  for (const [name, relativePath] of Object.entries(SOURCE_IDENTITY_FILES)) {
+    const path = resolve(repoRoot, relativePath);
+    try {
+      const metadata = await stat(path);
+      if (!metadata.isFile()) throw new Error("source identity path is not a file");
+      entries[name] = {
+        path: relativePath,
+        size: metadata.size,
+        sha256: await sha256File(path),
+      };
+    } catch {
+      entries[name] = { path: relativePath, status: "unavailable" };
+    }
+  }
+  return entries;
+}
+
+/** 只在隔离 runner 的预期 Cargo 目标存在时记录 Ja 可执行文件哈希，否则明确标记未取得。 */
+async function readRunnerJaExecutableIdentity(cargoTargetDirectory) {
+  if (typeof cargoTargetDirectory !== "string" || cargoTargetDirectory.length === 0)
+    return { status: "unavailable", reason: "cargo_target_directory_missing" };
+  const path = join(cargoTargetDirectory, "debug", "ja.exe");
+  try {
+    const metadata = await stat(path);
+    if (!metadata.isFile()) throw new Error("runner executable path is not a file");
+    return { status: "available", path, size: metadata.size, sha256: await sha256File(path) };
+  } catch {
+    return { status: "unavailable", reason: "runner_executable_not_observed" };
+  }
+}
+
+/** 收集源码、JAR、隔离 runner 可执行文件和当前 WebView 页面身份，不读取配置或凭据。 */
+async function collectRunIdentity(page, jarPath, cargoTargetDirectory, consoleErrors, pageErrors) {
+  const [git, sources, jaExecutable] = await Promise.all([
+    readGitIdentity(),
+    readSourceFileIdentities(),
+    readRunnerJaExecutableIdentity(cargoTargetDirectory),
+  ]);
+  let jar;
+  if (typeof jarPath === "string") {
+    try {
+      const metadata = await stat(jarPath);
+      jar = { path: jarPath, size: metadata.size, sha256: await sha256File(jarPath) };
+    } catch {
+      jar = { status: "unavailable", reason: "jar_not_observed" };
+    }
+  } else {
+    jar = { status: "unavailable", reason: "jar_path_not_supplied" };
+  }
+  const window = await page
+    .evaluate(() => ({
+      title: globalThis.document.title,
+      url: globalThis.location.href,
+      viewport: {
+        width: globalThis.innerWidth,
+        height: globalThis.innerHeight,
+        devicePixelRatio: globalThis.devicePixelRatio,
+      },
+      userAgent: globalThis.navigator.userAgent,
+      webViewVersion:
+        /(?:Edg|WebView2)\/([\d.]+)/u.exec(globalThis.navigator.userAgent)?.[1] ?? null,
+    }))
+    .catch(() => ({
+      title: null,
+      url: null,
+      viewport: null,
+      userAgent: null,
+      webViewVersion: null,
+    }));
+  return {
+    git,
+    sources,
+    jar,
+    jaExecutable,
+    window,
+    consoleErrors: consoleErrors.slice(-16),
+    pageErrors: pageErrors.slice(-16),
+  };
 }
 
 /** 将真窗异常归入固定类别，避免失败报告携带易变的 selector 或路径细节。 */
@@ -50,57 +209,152 @@ function safeFixtureFailureSnapshot(snapshot) {
         kind: attempt?.kind === "title" ? "title" : "turn",
         step: Number.isSafeInteger(attempt?.step) ? attempt.step : null,
         progressInstruction: attempt?.progressInstruction === true,
+        outcome:
+          attempt?.outcome === "failed" || attempt?.outcome === "completed"
+            ? attempt.outcome
+            : undefined,
       }))
     : [];
   return { stage: stages.at(-1) ?? "none", stages, attempts };
 }
 
 /**
- * 在隔离 WebView2 内观测 native command 的生命周期顺序；代理完全透传原调用，且只保存命令名、
- * 阶段和封闭 runtime 状态，避免诊断复制参数、路径、会话身份或 Tool 内容。
+ * 在 E2E composition 的 nativeInvoke delegate 边界观测 command 生命周期；这里不改 Tauri
+ * 内部 bridge，因为生产 adapter 已由 Vite E2E plugin 换成 tests/app/e2e/nativeInvoke.ts，
+ * 该边界才是 controller、history adapter 和 runtime adapter 的共同真实入口。函数由
+ * Playwright 注入到每个新 document，所有输出只保留命令名、阶段和脱敏流摘要。
  */
-async function instrumentRuntimeInvocations(page) {
-  // reload 后 WebView2 的 Tauri bridge 可能晚于 DOMContentLoaded 注入；先等待受信 bridge，
-  // 才能确保本轮诊断覆盖应用自动恢复与 driver 恢复的全部 native 调用。
-  await page.waitForFunction(
-    () => typeof globalThis.__TAURI_INTERNALS__?.invoke === "function",
-    undefined,
-    { timeout: 30_000 },
-  );
-  await page.evaluate((key) => {
-    const internals = globalThis.__TAURI_INTERNALS__;
-    if (internals === undefined || typeof internals.invoke !== "function") return;
-    if (globalThis[key] !== undefined) return;
-    const records = [];
-    const original = internals.invoke.bind(internals);
-    globalThis[key] = records;
-    internals.invoke = async (command, payload) => {
-      const watched = typeof command === "string" && command.startsWith("ja_");
-      if (watched) records.push({ command, phase: "start" });
-      try {
-        const result = await original(command, payload);
-        if (watched) {
-          const state = result !== null && typeof result === "object" ? result : {};
-          records.push({
-            command,
-            phase: "resolved",
-            status: typeof state.status === "string" ? state.status : undefined,
-          });
+export function installConversationProgressInvokeProbe() {
+  const previous = globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__;
+  const records = [];
+  const heldThreadReads = [];
+  let invocationSequence = 0;
+  /** 真窗可能跨多个回合运行；有界记录避免诊断本身改变 renderer 的内存和时序。 */
+  const appendBoundedRecord = (record) => {
+    records.push(record);
+    if (records.length > 512) records.splice(0, records.length - 512);
+  };
+  globalThis.__JA_CONVERSATION_PROGRESS_INVOKES__ = records;
+  globalThis.__JA_CONVERSATION_THREAD_READ_HOLD__ = false;
+  globalThis.__JA_CONVERSATION_THREAD_READ_RELEASE__ = () => {
+    while (heldThreadReads.length > 0) heldThreadReads.shift()();
+  };
+  globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = async (request, delegate) => {
+    const command = request?.command;
+    const watched = typeof command === "string" && command.startsWith("ja_");
+    const invocationId = ++invocationSequence;
+    if (watched)
+      appendBoundedRecord({ invocationId, command, phase: "start", at: performance.now() });
+    try {
+      const result = previous === undefined ? await delegate() : await previous(request, delegate);
+      if (watched) {
+        const state = result !== null && typeof result === "object" ? result : {};
+        const liveStream =
+          command === "ja_thread_read" &&
+          state.liveStream !== null &&
+          typeof state.liveStream === "object"
+            ? {
+                turnId:
+                  typeof state.liveStream.turnId === "string" ? state.liveStream.turnId : undefined,
+                streamSeq: Number.isSafeInteger(state.liveStream.streamSeq)
+                  ? state.liveStream.streamSeq
+                  : undefined,
+                segmentCount: Array.isArray(state.liveStream.segments)
+                  ? state.liveStream.segments.length
+                  : undefined,
+              }
+            : command === "ja_thread_read"
+              ? null
+              : undefined;
+        appendBoundedRecord({
+          invocationId,
+          command,
+          phase: "received",
+          at: performance.now(),
+          ...(command === "ja_thread_read"
+            ? {
+                threadId: typeof state.threadId === "string" ? state.threadId : undefined,
+                revision: Number.isSafeInteger(state.revision) ? state.revision : undefined,
+                liveStream,
+              }
+            : {}),
+        });
+        if (command === "ja_thread_read" && globalThis.__JA_CONVERSATION_THREAD_READ_HOLD__) {
+          await new Promise((resolvePromise) => heldThreadReads.push(resolvePromise));
         }
-        return result;
-      } catch (error) {
-        if (watched) {
-          const value = error !== null && typeof error === "object" ? error : {};
-          records.push({
-            command,
-            phase: "rejected",
-            errorCode: typeof value.code === "string" ? value.code.slice(0, 96) : undefined,
-          });
-        }
-        throw error;
+        appendBoundedRecord({
+          invocationId,
+          command,
+          phase: "resolved",
+          at: performance.now(),
+          status: typeof state.status === "string" ? state.status : undefined,
+        });
       }
+      return result;
+    } catch (error) {
+      if (watched) {
+        const value = error !== null && typeof error === "object" ? error : {};
+        appendBoundedRecord({
+          invocationId,
+          command,
+          phase: "rejected",
+          at: performance.now(),
+          errorCode: typeof value.code === "string" ? value.code.slice(0, 96) : undefined,
+        });
+      }
+      throw error;
+    }
+  };
+}
+
+/**
+ * 注册 delegate probe 一次；必须在 reload 前注册，确保新 document 的首个真实 adapter 调用
+ * 就可观测。重复调用只复用同一 BrowserContext，避免多层 probe 改变 command 时序。
+ */
+const instrumentedContexts = new WeakSet();
+
+async function instrumentRuntimeInvocations(page) {
+  const context = page.context();
+  if (instrumentedContexts.has(context)) return;
+  await context.addInitScript(installConversationProgressInvokeProbe);
+  instrumentedContexts.add(context);
+}
+
+/**
+ * 用生产 RuntimeHost adapter 发起一次无副作用状态读取，确认 probe 真的位于 adapter
+ * delegate 边界，而不是只在页面上挂了一个未被调用的函数；失败立即终止，避免 fixture
+ * 的文本门闩把 Provider 等到 30 秒后才暴露问题。
+ */
+async function assertRuntimeInvocationProbe(page) {
+  const result = await page.evaluate(async (key) => {
+    const records = globalThis[key];
+    const before = Array.isArray(records) ? records.length : 0;
+    const probeInstalled = typeof globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ === "function";
+    const { createRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+    const state = await createRuntimeHostAdapter().state();
+    const entries = Array.isArray(globalThis[key]) ? globalThis[key].slice(before) : [];
+    return {
+      boundary: "e2e_nativeInvoke_delegate",
+      probeInstalled,
+      observedCommand: entries.find((entry) => entry?.command === "ja_runtime_state")?.command,
+      startObserved: entries.some(
+        (entry) => entry?.command === "ja_runtime_state" && entry.phase === "start",
+      ),
+      resolvedObserved: entries.some(
+        (entry) => entry?.command === "ja_runtime_state" && entry.phase === "resolved",
+      ),
+      runtimeStatus: state.status,
     };
   }, PROGRESS_INVOKE_LOG_KEY);
+  assert.equal(result.probeInstalled, true, "E2E nativeInvoke delegate probe was not installed");
+  assert.equal(result.observedCommand, "ja_runtime_state", "probe missed adapter state command");
+  assert.equal(result.startObserved, true, "probe missed adapter command start");
+  assert.equal(result.resolvedObserved, true, "probe missed adapter command resolution");
+  assert.ok(
+    result.runtimeStatus === "ready" || result.runtimeStatus === "busy",
+    `runtime state is not ready for progress E2E: ${result.runtimeStatus}`,
+  );
+  return result;
 }
 
 /** 读取失败时的最小 Tauri 投影，确认 UI 受限是否由 native runtime 状态造成而非 DOM 选择器漂移。 */
@@ -153,6 +407,23 @@ async function readConversationProgressRuntimeDiagnostics(page) {
             revision: Number.isSafeInteger(recovery.revision) ? recovery.revision : undefined,
           };
         }),
+        nativeInvokeProbe: {
+          boundary: "e2e_nativeInvoke_delegate",
+          installed: typeof globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ === "function",
+          recordCount: Array.isArray(globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"])
+            ? globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"].length
+            : 0,
+          commands: Array.isArray(globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"])
+            ? [
+                ...new Set(
+                  globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"]
+                    .map((record) => record?.command)
+                    .filter((command) => typeof command === "string")
+                    .slice(-48),
+                ),
+              ]
+            : [],
+        },
         invocations: Array.isArray(globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"])
           ? globalThis["__JA_CONVERSATION_PROGRESS_INVOKES__"].slice(-48)
           : [],
@@ -205,6 +476,292 @@ async function waitForCondition(label, predicate, deadline) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
   throw new Error(`${label} 超时`);
+}
+
+/**
+ * 安装真实应用 DOM 的窄采样器；只观测后台恢复窗口，不把 Turn 自身的合法 sending/active
+ * 禁用计入闪烁。MutationObserver 记录属性变化，短周期采样补上 WebView2 合并属性提交的边界。
+ * 采样器由 runner 主动关闭，避免 timer 在页面 reload 或失败 cleanup 后继续持有 renderer。
+ */
+async function installConversationFlickerProbe(page) {
+  await page.evaluate(() => {
+    const previous = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+    previous?.stop?.();
+    const evidence = {
+      phase: "idle",
+      samples: [],
+      disabledTransitions: { newConversation: 0, composer: 0 },
+      backgroundReadWindow: {
+        started: false,
+        ended: false,
+        newConversationDisabledTransitions: 0,
+        composerDisabledTransitions: 0,
+        newConversationStates: [],
+        composerStates: [],
+      },
+      responseTextRegressions: 0,
+      progressTextRegressions: 0,
+      spinnerStartTimes: { history: [], response: [] },
+    };
+    let last = undefined;
+    const responseLengths = new WeakMap();
+    /** 统一限制采样窗口，保证 5 秒静默观察和异常重试不会让证据数组无界增长。 */
+    const appendBoundedSample = (samples, value, limit) => {
+      samples.push(value);
+      if (samples.length > limit) samples.shift();
+    };
+    const readState = () => {
+      const newConversation = globalThis.document.querySelector('button[aria-label="新会话"]');
+      const composer = globalThis.document.querySelector('textarea[aria-label="消息"]');
+      const history = globalThis.document.querySelector('[aria-label="最近对话列表"]');
+      const responseNodes = [
+        ...globalThis.document.querySelectorAll('.ja-chat-message-final[data-role="response"]'),
+      ];
+      for (const response of responseNodes) {
+        const length = response.textContent?.length ?? 0;
+        const previousLength = responseLengths.get(response);
+        if (previousLength !== undefined && length < previousLength)
+          evidence.responseTextRegressions += 1;
+        responseLengths.set(response, length);
+      }
+      const progressNodes = [
+        ...globalThis.document.querySelectorAll(
+          ".ja-work-process .ja-work-step--commentary, .ja-work-process .ja-work-step--reasoning",
+        ),
+      ];
+      for (const progress of progressNodes) {
+        const length = progress.textContent?.length ?? 0;
+        const previousLength = responseLengths.get(progress);
+        if (previousLength !== undefined && length < previousLength)
+          evidence.progressTextRegressions += 1;
+        responseLengths.set(progress, length);
+      }
+      return {
+        at: globalThis.performance.now(),
+        newConversationDisabled: newConversation?.hasAttribute("disabled") ?? null,
+        composerDisabled: composer?.hasAttribute("disabled") ?? null,
+        historyBusy: history?.getAttribute("aria-busy") === "true",
+        historyLoadingVisible:
+          globalThis.document.querySelector(".ja-navigation-history-loading") !== null,
+        responseTextLengths: responseNodes.map((response) => response.textContent?.length ?? 0),
+        progressTextLengths: progressNodes.map((progress) => progress.textContent?.length ?? 0),
+      };
+    };
+    const sample = (source) => {
+      const state = readState();
+      state.source = source;
+      if (last !== undefined) {
+        if (
+          state.newConversationDisabled !== null &&
+          last.newConversationDisabled !== null &&
+          state.newConversationDisabled !== last.newConversationDisabled
+        ) {
+          evidence.disabledTransitions.newConversation += 1;
+          if (evidence.phase === "background-resync") {
+            evidence.backgroundReadWindow.newConversationDisabledTransitions += 1;
+          }
+        }
+        if (
+          state.composerDisabled !== null &&
+          last.composerDisabled !== null &&
+          state.composerDisabled !== last.composerDisabled
+        ) {
+          evidence.disabledTransitions.composer += 1;
+          if (evidence.phase === "background-resync") {
+            evidence.backgroundReadWindow.composerDisabledTransitions += 1;
+          }
+        }
+      }
+      if (evidence.phase === "background-resync") {
+        appendBoundedSample(
+          evidence.backgroundReadWindow.newConversationStates,
+          state.newConversationDisabled,
+          128,
+        );
+        appendBoundedSample(
+          evidence.backgroundReadWindow.composerStates,
+          state.composerDisabled,
+          128,
+        );
+      }
+      appendBoundedSample(evidence.samples, state, 256);
+      last = state;
+      return state;
+    };
+    const observer = new globalThis.MutationObserver(() => sample("mutation"));
+    observer.observe(globalThis.document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["disabled", "aria-busy", "class", "data-response-state"],
+    });
+    const interval = globalThis.setInterval(() => sample("interval"), 50);
+    sample("initial");
+    globalThis.__JA_CONVERSATION_FLICKER_PROBE__ = {
+      evidence,
+      beginBackgroundResync() {
+        evidence.phase = "background-resync";
+        evidence.backgroundReadWindow.started = true;
+        sample("background-start");
+      },
+      endBackgroundResync() {
+        sample("background-end");
+        evidence.backgroundReadWindow.ended = true;
+        evidence.phase = "streaming-after-resync";
+      },
+      sample,
+      spinnerStartTimes() {
+        const animationStart = (selector, animationName) => {
+          const target = globalThis.document.querySelector(selector);
+          const animation = target
+            ?.getAnimations()
+            .find((candidate) => candidate.animationName === animationName);
+          return typeof animation?.startTime === "number" ? animation.startTime : null;
+        };
+        const values = {
+          history: animationStart(
+            ".ja-navigation-thread-state.is-running svg",
+            "ja-navigation-thread-spin",
+          ),
+          response: animationStart(".ja-chat-message-draft", "ja-chat-response-enter"),
+        };
+        appendBoundedSample(evidence.spinnerStartTimes.history, values.history, 32);
+        appendBoundedSample(evidence.spinnerStartTimes.response, values.response, 32);
+        return values;
+      },
+      stop() {
+        observer.disconnect();
+        globalThis.clearInterval(interval);
+      },
+    };
+  });
+}
+
+/**
+ * 在 reload 后重新绑定动画生命周期监听；监听器不跨 document 存活，缺失 evidence 必须
+ * 直接报错，不能用零值掩盖新 Turn 的真实动画是否触发。调用方先确保 DOM flicker probe 存在。
+ */
+async function installConversationAnimationReplayProbe(page) {
+  await page.evaluate(() => {
+    const evidence = globalThis.__JA_CONVERSATION_FLICKER_PROBE__?.evidence;
+    if (evidence === undefined)
+      throw new Error("flicker probe is unavailable for animation evidence");
+    globalThis.__JA_CONVERSATION_ANIMATION_LISTENER__?.stop?.();
+    evidence.animationReplays = { response: 0, history: 0 };
+    globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__ = evidence;
+    const listener = (event) => {
+      const target = event.target;
+      if (!(target instanceof globalThis.Element)) return;
+      if (target.matches(".ja-chat-message-draft")) evidence.animationReplays.response += 1;
+      if (target.matches(".ja-navigation-thread-state.is-running svg"))
+        evidence.animationReplays.history += 1;
+    };
+    globalThis.document.addEventListener("animationstart", listener, true);
+    globalThis.__JA_CONVERSATION_ANIMATION_LISTENER__ = {
+      stop() {
+        globalThis.document.removeEventListener("animationstart", listener, true);
+      },
+    };
+  });
+}
+
+/** 读取已安装的响应动画计数；探针未安装或结构不完整时立即失败，不返回 fallback 0。 */
+export async function readResponseAnimationReplayCount(page) {
+  return page.evaluate(() => {
+    const replays = globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__?.animationReplays;
+    if (replays === undefined || !Number.isSafeInteger(replays.response))
+      throw new Error("conversation animation evidence is unavailable");
+    return replays.response;
+  });
+}
+
+/** 由 driver 注入一次可回退的 Timeline resync 请求；controller 仍负责真实 ja_thread_read 和合并。 */
+async function requestTimelineResync(page, threadId) {
+  return page.evaluate(async (expectedThreadId) => {
+    const module = await import("/src/features/conversation/index.ts");
+    const store = module.useTimelineStore;
+    const registryStore = globalThis.__JA_TIMELINE_STORE_V1__;
+    const current = store.getState();
+    if (current.threads[expectedThreadId] === undefined)
+      throw new Error("resync target is not loaded in the live timeline");
+    store.getState().requestThreadResync(expectedThreadId);
+    return {
+      threadId: expectedThreadId,
+      generation: current.handshake.generation,
+      serverInstanceId: current.serverInstanceId ?? null,
+      publicStoreSingleton: registryStore === store,
+    };
+  }, threadId);
+}
+
+/** 读取 driver 记录的 thread/read 收敛证据；正文和参数始终留在 renderer/native 内。 */
+async function readThreadReadEvidence(page) {
+  return page.evaluate((key) => {
+    const records = globalThis[key];
+    if (!Array.isArray(records)) return { starts: 0, startIds: [], received: [], resolved: 0 };
+    const reads = records.filter((record) => record?.command === "ja_thread_read");
+    return {
+      starts: reads.filter((record) => record.phase === "start").length,
+      startIds: reads
+        .filter((record) => record.phase === "start" && Number.isSafeInteger(record.invocationId))
+        .map((record) => record.invocationId),
+      received: reads
+        .filter((record) => record.phase === "received")
+        .map((record) => ({
+          invocationId: record.invocationId,
+          threadId: record.threadId,
+          revision: record.revision,
+          liveStream: record.liveStream,
+        })),
+      resolved: reads.filter((record) => record.phase === "resolved").length,
+    };
+  }, PROGRESS_INVOKE_LOG_KEY);
+}
+
+/** 读取有界 DOM 采样摘要；完整 samples 不写入报告，避免 5 秒监测放大证据文件。 */
+async function readFlickerEvidence(page) {
+  return page.evaluate(() => {
+    const evidence = globalThis.__JA_CONVERSATION_FLICKER_PROBE__?.evidence;
+    if (evidence === undefined) return { status: "unavailable" };
+    return {
+      status: "available",
+      sampleCount: evidence.samples.length,
+      disabledTransitions: { ...evidence.disabledTransitions },
+      backgroundReadWindow: {
+        ...evidence.backgroundReadWindow,
+        newConversationStates: [...evidence.backgroundReadWindow.newConversationStates],
+        composerStates: [...evidence.backgroundReadWindow.composerStates],
+      },
+      responseTextRegressions: evidence.responseTextRegressions,
+      progressTextRegressions: evidence.progressTextRegressions,
+      spinnerStartTimes: {
+        history: [...evidence.spinnerStartTimes.history],
+        response: [...evidence.spinnerStartTimes.response],
+      },
+      animationReplays: { ...evidence.animationReplays },
+      historyLoadingIndicatorMounts: evidence.historyLoadingIndicatorMounts,
+    };
+  });
+}
+
+/**
+ * 只有本次 thread/read 返回完整活动流基线才算恢复证据；空快照必须立即失败，不能在
+ * 同一响应上轮询到 deadline。Turn、revision、序号和段数共同构成可继续重放的最小合同。
+ */
+export function assertLiveStreamEvidence(readEvidence, threadId, invocationId) {
+  const active = readEvidence.received.find(
+    (record) =>
+      record.threadId === threadId &&
+      (invocationId === undefined || record.invocationId === invocationId) &&
+      Number.isSafeInteger(record.revision) &&
+      record.liveStream !== null &&
+      typeof record.liveStream?.turnId === "string" &&
+      record.liveStream.turnId.length > 0 &&
+      record.liveStream?.streamSeq > 0 &&
+      record.liveStream?.segmentCount > 0,
+  );
+  assert.ok(active, "this thread/read response must expose a complete liveStream baseline");
+  return active.liveStream;
 }
 
 /** 校验启动时固定的隔离 Provider，再通过真实 typed adapter 建会话，不在验收中热改配置或密钥。 */
@@ -531,9 +1088,10 @@ async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
     output: "36",
     cacheRead: "0",
     total: "96",
-    cacheRate: "—",
+    // cacheCompleteRequestCount/inputTokens 已覆盖完整样本；读取量为零是已知 0.0%，不是未知横线。
+    cacheRate: "0.0%",
     context: "0.0%",
-    used: "20 / 128K",
+    used: "20 / 128k",
   });
   await page.screenshot({
     path: join(evidenceDirectory, "context-usage-light-wide.png"),
@@ -589,6 +1147,168 @@ async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
   return { ...initialFacts, narrow: narrowFacts };
 }
 
+/**
+ * 在同一真实 Thread 中验证失败终态的唯一恢复入口：失败只显示“继续回复”，点击后创建新的
+ * Turn，旧 Tool 不回放；新 Turn 保留正常入场动画，terminal 后再观察 5 秒确认工作指示与对账
+ * 都停止。该路径复用 loopback fixture，不把失败或继续行为伪造成静态 DOM。
+ */
+async function verifyFailureContinuation(page, fixture, evidenceDirectory, deadline) {
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "no-preference" });
+  const input = page.getByRole("textbox", { name: "消息", exact: true });
+  await input.fill("触发失败后继续验收");
+  await page
+    .getByRole("button", { name: "发送", exact: true })
+    .click({ timeout: timeout(deadline) });
+  await waitForCondition(
+    "controlled failed terminal",
+    () => fixture.stages.includes("failure_terminal"),
+    deadline,
+  );
+  const failedResponse = page
+    .locator('.ja-chat-message-final[data-response-state="failed"]')
+    .last();
+  await failedResponse.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const continueButton = page.getByRole("button", { name: "继续回复", exact: true });
+  await continueButton.waitFor({ state: "visible", timeout: timeout(deadline) });
+  assert.equal(
+    await page.locator(".ja-navigation-thread-state.is-running").count(),
+    0,
+    "a failed terminal must stop the running history indicator",
+  );
+  await page.screenshot({
+    path: join(evidenceDirectory, "conversation-progress-failure.png"),
+    animations: "allow",
+  });
+
+  // reload 后旧 document 的 DOM listener 已失效；重新安装真实 probe，再记录继续前基线，
+  // 这样新 Turn 的 animationstart 只能来自当前 document，缺失探针会立即暴露。
+  await installConversationFlickerProbe(page);
+  await installConversationAnimationReplayProbe(page);
+  const readCountBeforeContinue = (await readThreadReadEvidence(page)).starts;
+  const animationReplaysBeforeContinue = await readResponseAnimationReplayCount(page);
+  await continueButton.click({ timeout: timeout(deadline) });
+  await waitForCondition(
+    "continuation summary stream",
+    () => fixture.stages.includes("summary_continue"),
+    deadline,
+  );
+  fixture.releaseContinuationNarrative();
+  const continuationProcess = page.locator("section.ja-work-process").last();
+  await publicNarrative(
+    continuationProcess,
+    conversationProgressFixtureMarkers.continueCommentary,
+  ).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  const continuationResponse = page.locator('.ja-chat-message-final[data-role="response"]').last();
+  await continuationResponse.getByText("正在工作", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  const continuationAnimationStart = await page.evaluate(() => {
+    const target = globalThis.document.querySelector(".ja-chat-message-draft");
+    const animation = target
+      ?.getAnimations()
+      .find((candidate) => candidate.animationName === "ja-chat-response-enter");
+    return typeof animation?.startTime === "number" ? animation.startTime : null;
+  });
+  assert.equal(
+    typeof continuationAnimationStart,
+    "number",
+    "a normal continued Turn must retain its entry animation",
+  );
+  await waitForCondition(
+    "continuation text stream",
+    () => fixture.stages.includes("text_continue"),
+    deadline,
+  );
+  assert.equal(
+    await continuationResponse
+      .getByText(conversationProgressFixtureMarkers.continueFinal, {
+        exact: false,
+      })
+      .count(),
+    0,
+    "continued text must remain in WorkProcess before terminal",
+  );
+  fixture.releaseContinuationText();
+  const completedContinuation = page
+    .locator('.ja-chat-message-final[data-response-state="completed"]')
+    .last();
+  await completedContinuation
+    .getByText(conversationProgressFixtureMarkers.continueFinal, { exact: false })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  await expandProcess(page, deadline);
+  const continuationItems = await processItems(page, deadline);
+  assert.equal(
+    continuationItems.some((item) => item.kind === "tool"),
+    false,
+    "a continued Turn must not replay the failed Turn's Tool rows",
+  );
+  assert.equal(
+    continuationItems.some(
+      (item) =>
+        item.text.includes(conversationProgressFixtureMarkers.read) ||
+        item.text.includes(conversationProgressFixtureMarkers.shell),
+    ),
+    false,
+    "a continued Turn must not replay old Tool output text",
+  );
+  const animationReplaysAfterContinue = await readResponseAnimationReplayCount(page);
+  assert.equal(
+    animationReplaysAfterContinue > animationReplaysBeforeContinue,
+    true,
+    "a normal continued Turn may start a new response animation",
+  );
+  await page.screenshot({
+    path: join(evidenceDirectory, "conversation-progress-continued.png"),
+    animations: "allow",
+  });
+
+  const terminalReadCountBeforeQuiet = (await readThreadReadEvidence(page)).starts;
+  const quietStart = await page.evaluate(() => performance.now());
+  await waitForCondition(
+    "continued terminal quiet window",
+    () => page.evaluate((startedAt) => performance.now() - startedAt >= 5_000, quietStart),
+    deadline,
+  );
+  const terminalReadCountAfterQuiet = (await readThreadReadEvidence(page)).starts;
+  assert.equal(
+    terminalReadCountAfterQuiet,
+    terminalReadCountBeforeQuiet,
+    "continued terminal must stop reconciliation after five seconds",
+  );
+  assert.equal(
+    await page
+      .locator('.ja-chat-message-final[data-response-state="completed"] .ja-chat-response__status')
+      .count(),
+    0,
+    "continued terminal must stop the response work indicator",
+  );
+  assert.equal(
+    await page.locator(".ja-navigation-thread-state.is-running").count(),
+    0,
+    "continued terminal must stop the running history indicator",
+  );
+  return {
+    failedTerminalVisible: true,
+    continueActionVisible: true,
+    newTurnCompleted: true,
+    oldToolsReplayed: false,
+    continuationAnimationStart,
+    animationReplaysBeforeContinue,
+    animationReplaysAfterContinue,
+    terminalReadCountBeforeQuiet,
+    terminalReadCountAfterQuiet,
+    workIndicatorStopped: true,
+    screenshots: ["conversation-progress-failure.png", "conversation-progress-continued.png"],
+    readCountBeforeContinue,
+  };
+}
+
 /** 对外报告必须同时证明流式正文留在工作过程、持续生命信号、terminal 收口与历史顺序。 */
 export function validateConversationProgressReport(report) {
   assert.equal(report?.schemaVersion, 1);
@@ -597,9 +1317,56 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.runtime?.surface, "tauri_webview2");
   assert.equal(report?.runtime?.boundary, "jvm_jar");
   assert.equal(report?.runtime?.nativeImageVerified, false);
+  assert.equal(report?.runtimeInvocationProbe?.boundary, "e2e_nativeInvoke_delegate");
+  assert.equal(report?.runtimeInvocationProbe?.probeInstalled, true);
+  assert.equal(report?.runtimeInvocationProbe?.observedCommand, "ja_runtime_state");
+  assert.equal(report?.runtimeInvocationProbe?.startObserved, true);
+  assert.equal(report?.runtimeInvocationProbe?.resolvedObserved, true);
+  assert.equal(
+    report?.runtimeInvocationProbe?.runtimeStatus === "ready" ||
+      report?.runtimeInvocationProbe?.runtimeStatus === "busy",
+    true,
+  );
+  assert.equal(report?.runtimeInvocationProbe?.publicTimelineStoreSingleton, true);
   assert.equal(report?.provider?.kind, "deterministic_loopback");
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.provider?.toolCalls, 2);
+  assert.match(report?.identity?.git?.head, /^[0-9a-f]{40}$/u);
+  assert.equal(typeof report?.identity?.git?.dirty, "boolean");
+  assert.equal(report?.identity?.git?.dirtyEntryCount >= 0, true);
+  for (const source of Object.values(report?.identity?.sources ?? {})) {
+    assert.match(source?.sha256, /^[0-9a-f]{64}$/u);
+  }
+  assert.equal(
+    report?.identity?.sources?.activeStreamRegistry?.path,
+    ACTIVE_STREAM_REGISTRY_SOURCE_PATH,
+  );
+  for (const name of [
+    "chatTimeline",
+    "workProcess",
+    "mybatisHistoryService",
+    "agentLoopPersistence",
+    "turnEventSink",
+    "threadSnapshot",
+  ]) {
+    assert.equal(report?.identity?.sources?.[name]?.path, SOURCE_IDENTITY_FILES[name]);
+  }
+  assert.equal(
+    report?.identity?.jar?.status === "available" ||
+      /^[0-9a-f]{64}$/u.test(report?.identity?.jar?.sha256 ?? ""),
+    true,
+  );
+  assert.equal(
+    report?.identity?.jaExecutable?.status === "available" ||
+      report?.identity?.jaExecutable?.status === "unavailable",
+    true,
+  );
+  assert.equal(typeof report?.identity?.window?.title, "string");
+  assert.equal(typeof report?.identity?.window?.url, "string");
+  assert.equal(report?.identity?.window?.viewport?.width > 0, true);
+  assert.equal(report?.identity?.window?.viewport?.height > 0, true);
+  assert.equal(Array.isArray(report?.identity?.consoleErrors), true);
+  assert.equal(Array.isArray(report?.identity?.pageErrors), true);
   assert.equal(report?.live?.progressInsideProcessBeforeFirstTool, true);
   assert.equal(report?.live?.workingStatusWithProcess, true);
   assert.equal(report?.live?.finalDraftInsideProcessBeforeTerminal, true);
@@ -612,6 +1379,33 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.live?.terminalCalibratedExistingResponse, true);
   assert.equal(report?.live?.completedProcessCollapsed, true);
   assert.equal(report?.live?.readSummaryVisible, true);
+  assert.equal(report?.live?.flicker?.resyncReadCount >= 1, true);
+  assert.equal(report?.live?.flicker?.threadReadCount >= 1, true);
+  assert.equal(report?.live?.flicker?.liveStreamBaseline?.streamSeq > 0, true);
+  assert.equal(report?.live?.flicker?.liveStreamBaseline?.segmentCount > 0, true);
+  assert.equal(report?.live?.flicker?.terminalReadCountAfterQuiet >= 1, true);
+  assert.equal(
+    report?.live?.flicker?.terminalReadCountAfterQuiet,
+    report?.live?.flicker?.terminalReadCountBeforeQuiet,
+  );
+  assert.equal(report?.live?.flicker?.responseTextRegressions, 0);
+  assert.equal(report?.live?.flicker?.progressTextRegressions, 0);
+  assert.equal(report?.live?.flicker?.backgroundReadWindow?.started, true);
+  assert.equal(report?.live?.flicker?.backgroundReadWindow?.ended, true);
+  assert.equal(report?.live?.flicker?.backgroundReadWindow?.newConversationDisabledTransitions, 0);
+  assert.equal(report?.live?.flicker?.backgroundReadWindow?.composerDisabledTransitions, 0);
+  assert.equal(
+    report?.live?.flicker?.spinnerStartTimes?.history?.every(
+      (startTime) => typeof startTime === "number",
+    ),
+    true,
+  );
+  assert.equal(
+    report?.live?.flicker?.spinnerStartTimes?.response?.every(
+      (startTime) => typeof startTime === "number",
+    ),
+    true,
+  );
   assert.deepEqual(report?.live?.sequence, [
     "commentary",
     "tool:read",
@@ -644,11 +1438,27 @@ export function validateConversationProgressReport(report) {
     output: "36",
     cacheRead: "0",
     total: "96",
-    cacheRate: "—",
+    cacheRate: "0.0%",
     context: "0.0%",
-    used: "20 / 128K",
+    used: "20 / 128k",
   });
   assert.equal(report?.contextUsage?.narrow?.documentOverflows, false);
+  assert.equal(report?.failureContinuation?.failedTerminalVisible, true);
+  assert.equal(report?.failureContinuation?.continueActionVisible, true);
+  assert.equal(report?.failureContinuation?.newTurnCompleted, true);
+  assert.equal(report?.failureContinuation?.oldToolsReplayed, false);
+  assert.equal(typeof report?.failureContinuation?.continuationAnimationStart, "number");
+  assert.equal(
+    report?.failureContinuation?.animationReplaysAfterContinue >
+      report?.failureContinuation?.animationReplaysBeforeContinue,
+    true,
+  );
+  assert.equal(report?.failureContinuation?.terminalReadCountAfterQuiet >= 1, true);
+  assert.equal(
+    report?.failureContinuation?.terminalReadCountAfterQuiet,
+    report?.failureContinuation?.terminalReadCountBeforeQuiet,
+  );
+  assert.equal(report?.failureContinuation?.workIndicatorStopped, true);
   return report;
 }
 
@@ -663,6 +1473,8 @@ export async function runConversationProgressWebView2({
   workspaceRoot,
   evidenceDirectory,
   fixture,
+  jarPath,
+  cargoTargetDirectory,
 }) {
   assert.ok(page, "page is required");
   assert.ok(workspaceRoot, "workspaceRoot is required");
@@ -685,6 +1497,8 @@ export async function runConversationProgressWebView2({
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await instrumentRuntimeInvocations(page);
   await restoreRuntimeAfterReload(page, deadline);
+  let runtimeInvocationProbe = await assertRuntimeInvocationProbe(page);
+  let publicTimelineStoreSingleton = false;
   await selectProject(page, created.workspaceName, deadline);
   await selectThread(page, created.threadId, deadline);
   const historyRow = page.locator(
@@ -696,13 +1510,13 @@ export async function runConversationProgressWebView2({
     0,
     "an existing history projection must not expose the loading indicator before streaming",
   );
+  await installConversationFlickerProbe(page);
   await page.evaluate(() => {
     const historySection = globalThis.document.querySelector(".ja-navigation-history");
     if (historySection === null) throw new Error("history section is unavailable");
-    const evidence = {
-      historyLoadingIndicatorMounts: 0,
-      animationReplays: { response: 0, history: 0 },
-    };
+    const evidence = globalThis.__JA_CONVERSATION_FLICKER_PROBE__?.evidence;
+    if (evidence === undefined) throw new Error("flicker probe is unavailable");
+    evidence.historyLoadingIndicatorMounts = 0;
     const observer = new globalThis.MutationObserver((records) => {
       for (const record of records) {
         for (const node of record.addedNodes) {
@@ -752,21 +1566,22 @@ export async function runConversationProgressWebView2({
   await runningHistoryState.waitFor({ state: "visible", timeout: timeout(deadline) });
   const runningHistoryStateHandle = await runningHistoryState.elementHandle();
   assert.ok(runningHistoryStateHandle, "the running history state must have a DOM node");
-  await page.evaluate(() => {
-    const evidence = globalThis.__JA_CONVERSATION_FLICKER_EVIDENCE__;
-    if (evidence === undefined) throw new Error("flicker evidence is unavailable");
-    globalThis.document.addEventListener(
-      "animationstart",
-      (event) => {
-        const target = event.target;
-        if (!(target instanceof globalThis.Element)) return;
-        if (target.matches(".ja-chat-message-draft")) evidence.animationReplays.response += 1;
-        if (target.matches(".ja-navigation-thread-state.is-running svg"))
-          evidence.animationReplays.history += 1;
-      },
-      true,
-    );
+  const initialSpinnerStartTimes = await page.evaluate(() => {
+    const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+    if (probe === undefined) throw new Error("flicker probe is unavailable");
+    return probe.spinnerStartTimes();
   });
+  assert.equal(
+    typeof initialSpinnerStartTimes.history,
+    "number",
+    "history spinner must expose a real Web Animations startTime",
+  );
+  assert.equal(
+    typeof initialSpinnerStartTimes.response,
+    "number",
+    "response draft must expose a real Web Animations startTime",
+  );
+  await installConversationAnimationReplayProbe(page);
   assert.equal(
     await responseShell
       .getByText(conversationProgressFixtureMarkers.commentary1, { exact: false })
@@ -789,6 +1604,122 @@ export async function runConversationProgressWebView2({
     false,
     "fixture sent read Tool before text checkpoint",
   );
+
+  // 受控 fault injection 只建立一次真实 controller resync 意图；之后的读取、Live baseline 合并、
+  // React 状态更新和 Provider 流继续都走生产链路。driver 在读取 ACK 前保持 5 秒静默，覆盖
+  // 原先由后台 busy 反复禁用新会话/Composer 的窗口，并分别采样鼠标在侧栏内外的布局状态。
+  const readBeforeResync = await readThreadReadEvidence(page);
+  let liveStreamBaseline;
+  let backgroundReadReleased = false;
+  try {
+    await page.evaluate(() => {
+      const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+      if (probe === undefined) throw new Error("flicker probe is unavailable");
+      probe.beginBackgroundResync();
+      globalThis.__JA_CONVERSATION_THREAD_READ_HOLD__ = true;
+      globalThis.__JA_CONVERSATION_QUIET_WINDOW_START__ = performance.now();
+    });
+    const resyncRequest = await requestTimelineResync(page, created.threadId);
+    publicTimelineStoreSingleton = resyncRequest.publicStoreSingleton;
+    assert.equal(
+      resyncRequest.publicStoreSingleton,
+      true,
+      "resync driver must use the public Timeline store singleton consumed by the controller",
+    );
+    await waitForCondition(
+      "background thread/read start",
+      async () => (await readThreadReadEvidence(page)).starts > readBeforeResync.starts,
+      deadline,
+    );
+    const readEvidenceAfterStart = await readThreadReadEvidence(page);
+    const backgroundReadInvocationId = readEvidenceAfterStart.startIds.at(-1);
+    assert.ok(
+      Number.isSafeInteger(backgroundReadInvocationId),
+      "background thread/read start must expose an invocation identity",
+    );
+    await waitForCondition(
+      "background thread/read received",
+      async () => {
+        const evidence = await readThreadReadEvidence(page);
+        return evidence.received.some(
+          (record) => record.invocationId === backgroundReadInvocationId,
+        );
+      },
+      deadline,
+    );
+    const readEvidenceDuringResync = await readThreadReadEvidence(page);
+    // received 一到达就校验；若 Java 返回 null/残缺基线，assert 立即抛错，finally 会释放
+    // 当前 hold，诊断可保留真实 null，而不会再用同一响应等待 5 分钟掩盖合同缺陷。
+    liveStreamBaseline = assertLiveStreamEvidence(
+      readEvidenceDuringResync,
+      created.threadId,
+      backgroundReadInvocationId,
+    );
+    await page.evaluate(() => {
+      const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+      if (probe === undefined) throw new Error("flicker probe is unavailable");
+      probe.sample("background-read-received");
+      probe.spinnerStartTimes();
+    });
+    const sidebar = page.locator(".ja-navigation-sidebar");
+    const sidebarBounds = await sidebar.boundingBox();
+    assert.ok(sidebarBounds, "navigation sidebar must be measurable in the real WebView2 window");
+    await historyRow.hover({ timeout: timeout(deadline) });
+    const sidebarHoverState = await page.evaluate(() => {
+      const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+      return probe?.sample?.("sidebar-hover");
+    });
+    await page.mouse.move(sidebarBounds.x + sidebarBounds.width + 40, sidebarBounds.y + 40);
+    const outsideSidebarState = await page.evaluate(() => {
+      const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+      return probe?.sample?.("sidebar-outside");
+    });
+    assert.equal(sidebarHoverState?.historyLoadingVisible, false);
+    assert.equal(outsideSidebarState?.historyLoadingVisible, false);
+    await waitForCondition(
+      "five second background quiet window",
+      () =>
+        page.evaluate(
+          () =>
+            performance.now() -
+              Number(globalThis.__JA_CONVERSATION_QUIET_WINDOW_START__ ?? performance.now()) >=
+            5_000,
+        ),
+      deadline,
+    );
+    const quietState = await page.evaluate(() => {
+      const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+      return probe?.sample?.("background-quiet");
+    });
+    assert.equal(quietState?.newConversationDisabled, false);
+    assert.equal(quietState?.composerDisabled, false);
+    await page.evaluate(() => {
+      globalThis.__JA_CONVERSATION_THREAD_READ_HOLD__ = false;
+      globalThis.__JA_CONVERSATION_THREAD_READ_RELEASE__?.();
+    });
+    backgroundReadReleased = true;
+    await waitForCondition(
+      "background thread/read resolve",
+      async () => {
+        const evidence = await readThreadReadEvidence(page);
+        return evidence.resolved > readBeforeResync.resolved;
+      },
+      deadline,
+    );
+    await page.evaluate(() => {
+      const probe = globalThis.__JA_CONVERSATION_FLICKER_PROBE__;
+      if (probe === undefined) throw new Error("flicker probe is unavailable");
+      probe.endBackgroundResync();
+    });
+  } finally {
+    if (!backgroundReadReleased)
+      await page
+        .evaluate(() => {
+          globalThis.__JA_CONVERSATION_THREAD_READ_HOLD__ = false;
+          globalThis.__JA_CONVERSATION_THREAD_READ_RELEASE__?.();
+        })
+        .catch(() => undefined);
+  }
   fixture.releaseFirstText();
 
   await workProcess.locator('.ja-tool-details[data-tool-kind="read"]').waitFor({
@@ -922,7 +1853,7 @@ export async function runConversationProgressWebView2({
   );
   await page.screenshot({
     path: join(evidenceDirectory, "conversation-progress-live.png"),
-    animations: "disabled",
+    animations: "allow",
   });
   const historyLoadingIndicatorMounts = await page.evaluate(() => {
     globalThis.__JA_CONVERSATION_HISTORY_OBSERVER__?.disconnect();
@@ -933,9 +1864,59 @@ export async function runConversationProgressWebView2({
     0,
     "streaming and terminal settlement must not mount the history loading indicator",
   );
+  const terminalObservationStart = await page.evaluate(() => performance.now());
+  await waitForCondition(
+    "terminal reconciliation settle window",
+    () =>
+      page.evaluate(
+        (startedAt) => performance.now() - startedAt >= 1_200,
+        terminalObservationStart,
+      ),
+    deadline,
+  );
+  const terminalReadCountBeforeQuiet = (await readThreadReadEvidence(page)).starts;
+  const terminalQuietStart = await page.evaluate(() => performance.now());
+  await waitForCondition(
+    "terminal timer quiet window",
+    () => page.evaluate((startedAt) => performance.now() - startedAt >= 1_200, terminalQuietStart),
+    deadline,
+  );
+  const terminalReadCountAfterQuiet = (await readThreadReadEvidence(page)).starts;
+  assert.equal(
+    terminalReadCountAfterQuiet,
+    terminalReadCountBeforeQuiet,
+    "terminal settlement must stop reconciliation timers",
+  );
+  const liveThreadReadEvidence = await readThreadReadEvidence(page);
+  const liveFlickerEvidence = await readFlickerEvidence(page);
+  assert.equal(liveFlickerEvidence.status, "available");
+  assert.equal(liveFlickerEvidence.responseTextRegressions, 0);
+  assert.equal(liveFlickerEvidence.progressTextRegressions, 0);
+  assert.deepEqual(liveFlickerEvidence.animationReplays, { response: 0, history: 0 });
+  assert.equal(liveFlickerEvidence.backgroundReadWindow.started, true);
+  assert.equal(liveFlickerEvidence.backgroundReadWindow.ended, true);
+  assert.equal(liveFlickerEvidence.backgroundReadWindow.newConversationDisabledTransitions, 0);
+  assert.equal(liveFlickerEvidence.backgroundReadWindow.composerDisabledTransitions, 0);
+  assert.equal(
+    liveFlickerEvidence.spinnerStartTimes.history.every(
+      (startTime) =>
+        typeof startTime === "number" && startTime === initialSpinnerStartTimes.history,
+    ),
+    true,
+    "history spinner must keep one animation start time across recovery",
+  );
+  assert.equal(
+    liveFlickerEvidence.spinnerStartTimes.response.every(
+      (startTime) =>
+        typeof startTime === "number" && startTime === initialSpinnerStartTimes.response,
+    ),
+    true,
+    "response draft must keep one animation start time across recovery",
+  );
 
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await restoreRuntimeAfterReload(page, deadline);
+  runtimeInvocationProbe = await assertRuntimeInvocationProbe(page);
   await selectProject(page, created.workspaceName, deadline);
   await selectThread(page, created.threadId, deadline);
   await page
@@ -959,7 +1940,7 @@ export async function runConversationProgressWebView2({
   );
   await page.screenshot({
     path: join(evidenceDirectory, "conversation-progress-reload.png"),
-    animations: "disabled",
+    animations: "allow",
   });
   let contextUsage;
   try {
@@ -973,21 +1954,44 @@ export async function runConversationProgressWebView2({
       { cause: error },
     );
   }
+  let failureContinuation;
+  try {
+    failureContinuation = await verifyFailureContinuation(
+      page,
+      fixture,
+      evidenceDirectory,
+      deadline,
+    );
+  } catch (error) {
+    const consoleTail = consoleErrors.slice(-8).join(" | ");
+    throw new Error(
+      consoleTail === ""
+        ? String(error?.message ?? error)
+        : `${String(error?.message ?? error)}; WebView2 console: ${consoleTail}`,
+      { cause: error },
+    );
+  }
+  const identity = await collectRunIdentity(
+    page,
+    jarPath,
+    cargoTargetDirectory,
+    consoleErrors,
+    pageErrors,
+  );
   assert.deepEqual(pageErrors, [], `WebView2 page errors: ${pageErrors.join(" | ")}`);
   const provider = fixture.snapshot();
-  assert.equal(provider.attempts.filter((attempt) => attempt.kind === "turn").length, 3);
+  const turnAttempts = provider.attempts.filter((attempt) => attempt.kind === "turn");
+  assert.equal(turnAttempts.length, 5);
   assert.equal(
-    provider.attempts
-      .filter((attempt) => attempt.kind === "turn")
-      .every((attempt, index) => attempt.step === index),
+    turnAttempts.slice(0, 3).every((attempt, index) => attempt.step === index),
     true,
   );
   assert.equal(
-    provider.attempts
-      .filter((attempt) => attempt.kind === "turn")
-      .every((attempt) => attempt.progressInstruction),
+    turnAttempts.every((attempt) => attempt.progressInstruction),
     true,
   );
+  assert.equal(turnAttempts[3]?.outcome, "failed");
+  assert.equal(turnAttempts[4]?.outcome, "completed");
   return {
     schemaVersion: 1,
     status: "passed",
@@ -996,6 +2000,10 @@ export async function runConversationProgressWebView2({
       surface: "tauri_webview2",
       boundary: "jvm_jar",
       nativeImageVerified: false,
+    },
+    runtimeInvocationProbe: {
+      ...runtimeInvocationProbe,
+      publicTimelineStoreSingleton,
     },
     provider: {
       kind: "deterministic_loopback",
@@ -1018,6 +2026,18 @@ export async function runConversationProgressWebView2({
       readSummaryVisible: liveReadSummary.length > 0,
       sequence: liveSequence,
       noDuplicateTools: liveItems.filter((item) => item.kind === "tool").length === 2,
+      flicker: {
+        resyncReadCount: liveThreadReadEvidence.starts - readBeforeResync.starts,
+        threadReadCount: liveThreadReadEvidence.starts,
+        liveStreamBaseline,
+        terminalReadCountBeforeQuiet,
+        terminalReadCountAfterQuiet,
+        responseTextRegressions: liveFlickerEvidence.responseTextRegressions,
+        progressTextRegressions: liveFlickerEvidence.progressTextRegressions,
+        backgroundReadWindow: liveFlickerEvidence.backgroundReadWindow,
+        disabledTransitions: liveFlickerEvidence.disabledTransitions,
+        spinnerStartTimes: liveFlickerEvidence.spinnerStartTimes,
+      },
     },
     reload: {
       sameThread: true,
@@ -1026,6 +2046,8 @@ export async function runConversationProgressWebView2({
       sequence: restoredSequence,
     },
     finalVisible: true,
+    failureContinuation,
+    identity,
     contextUsage,
     screenshots: [
       "conversation-progress-live.png",
@@ -1033,6 +2055,7 @@ export async function runConversationProgressWebView2({
       "context-usage-light-wide.png",
       "context-usage-light-narrow.png",
       "context-usage-dark-narrow.png",
+      ...failureContinuation.screenshots,
     ],
     pageErrors,
   };
@@ -1085,7 +2108,12 @@ async function main() {
       // 失败截图必须在 runner 回收 WebView2 前保存，使等待超时仍保留可核验的真实界面。
       driver: async (driverOptions) => {
         try {
-          return await runConversationProgressWebView2({ ...driverOptions, fixture });
+          return await runConversationProgressWebView2({
+            ...driverOptions,
+            fixture,
+            jarPath: options.jar,
+            cargoTargetDirectory: options.cargoTargetDirectory,
+          });
         } catch (error) {
           const fixtureDiagnostic = safeFixtureFailureSnapshot(fixture.snapshot());
           const runtimeDiagnostic = await readConversationProgressRuntimeDiagnostics(

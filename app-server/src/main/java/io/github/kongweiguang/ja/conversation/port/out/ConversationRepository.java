@@ -432,13 +432,21 @@ public interface ConversationRepository extends AutoCloseable {
         }
     }
 
-    /** 队列 CRUD 的内部回执额外携带是否真实变化与当前 Thread revision，供事件安全发布。 */
-    record QueueMutation(String inputId, InputQueue inputQueue, long threadRevision, boolean changed) {
+    /** 队列 CRUD 的内部回执额外携带两级版本，供事件与历史恢复共享同一 CAS fence。 */
+    record QueueMutation(String inputId, InputQueue inputQueue, long threadRevision,
+                         long turnMutationVersion, boolean changed) {
         /** 回执必须来自同一提交事务，应用层不得自行拼接 revision。 */
         public QueueMutation {
             inputId = identifier(inputId, "input_", "inputId");
             Objects.requireNonNull(inputQueue, "inputQueue");
-            if (threadRevision < 0) throw new IllegalArgumentException("invalid queue mutation revision");
+            if (threadRevision < 0 || turnMutationVersion < 0) {
+                throw new IllegalArgumentException("invalid queue mutation revision");
+            }
+        }
+
+        /** 非持久化测试夹具的窄构造；生产回执必须传入 SQLite 当前 Turn mutation 水位。 */
+        public QueueMutation(String inputId, InputQueue inputQueue, long threadRevision, boolean changed) {
+            this(inputId, inputQueue, threadRevision, 0, changed);
         }
     }
 

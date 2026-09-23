@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 export { PreviewPanelView } from "./ui/PreviewPanelView";
+export { alternateAttachmentResourceUrl } from "./domain/attachmentPreviewModel";
 export {
   MediaPreviewSessionHintStorage,
   useAttachmentPreviewController,

@@ -69,7 +69,7 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
                                     ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE))),
                     usageSettlement("request_2", 2, 2, ConversationRepository.UsagePurpose.ASSISTANT,
                             profile("provider_other", "model_other", "cfg_other"),
-                            new ModelUsage(180, 30, 210, 80L, 0L,
+                            new ModelUsage(180, 30, 210, 80L, null,
                                     ModelUsage.InputAccounting.INPUT_INCLUDES_CACHE)),
                     usageSettlement("request_summary_3", 3, 3, ConversationRepository.UsagePurpose.SUMMARY,
                             profile("provider_test", "model_test", "cfg_test"),
@@ -361,7 +361,7 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
         assertEquals(425, summary.totalTokens());
         assertEquals(3, summary.cacheReadRequestCount());
         assertEquals(130, summary.cacheReadTokens());
-        assertEquals(3, summary.cacheWriteRequestCount());
+        assertEquals(2, summary.cacheWriteRequestCount());
         assertEquals(10, summary.cacheWriteTokens());
         assertEquals(3, summary.cacheCompleteRequestCount());
         assertEquals(420, summary.cacheCompleteInputTokens());

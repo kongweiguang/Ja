@@ -387,13 +387,13 @@ final class AutomaticThreadTitleServiceTest {
         public synchronized Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
             if (!summary.threadId().equals(threadId)) return Optional.empty();
             ThreadSnapshot.Turn first = new ThreadSnapshot.Turn(
-                    "turn_first", "completed", NOW.minusSeconds(2), NOW, NOW, null, null);
+                    "turn_first", "completed", NOW.minusSeconds(2), NOW, NOW, null, null, 0, 0);
             List<ThreadSnapshot.Turn> turns = new ArrayList<>();
             turns.add(first);
             if (laterTurnPresent) {
                 turns.add(new ThreadSnapshot.Turn(
                         "turn_later", "completed", NOW.plusSeconds(1), NOW.plusSeconds(2),
-                        NOW.plusSeconds(2), null, null));
+                        NOW.plusSeconds(2), null, null, 0, 0));
             }
             return Optional.of(new ThreadSnapshot(summary, turns, List.of(), null, null, null));
         }

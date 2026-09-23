@@ -403,7 +403,7 @@ final class TaskCoordinatorTest {
                 return CompletableFuture.completedFuture(null);
             };
             TurnEventSink bridge = coordinator.projectContinuationEvents("thr_target", downstream);
-            TurnEvent.Context context = new TurnEvent.Context("evt_bridge", "thr_target", "turn_hidden", 1, NOW);
+            TurnEvent.Context context = new TurnEvent.Context("evt_bridge", "thr_target", "turn_hidden", 1, 0, NOW);
 
             bridge.publish(new TurnEvent.StateChanged(context, io.github.kongweiguang.ja.conversation.domain.turn.TurnState.QUEUED,
                     io.github.kongweiguang.ja.conversation.domain.turn.TurnState.RUNNING)).toCompletableFuture().join();
@@ -428,7 +428,7 @@ final class TaskCoordinatorTest {
             detail.set(Optional.of(new TaskModels.Detail(terminal, childThread, seed,
                     List.of(activity), List.of())));
             bridge.publish(new TurnEvent.Terminal(new TurnEvent.Context("evt_terminal", "thr_target", "turn_hidden",
-                    5, NOW), io.github.kongweiguang.ja.conversation.domain.turn.TurnState.COMPLETED, "完成", null,
+                    5, 0, NOW), io.github.kongweiguang.ja.conversation.domain.turn.TurnState.COMPLETED, "完成", null,
                     null, new TurnEvent.FinalMessage("item_done", "完成"), null)).toCompletableFuture().join();
         } catch (Exception failure) {
             throw new AssertionError(failure);
@@ -536,7 +536,8 @@ final class TaskCoordinatorTest {
                             new ThreadSnapshot.Turn(value.turnId(), value.turnId().equals(turnId)
                                     ? "CANCELLED" : value.status(), value.requestedAt(), NOW,
                                     value.turnId().equals(turnId) ? NOW : value.completedAt(),
-                                    value.errorCode(), value.changeSet())).toList();
+                                    value.errorCode(), value.changeSet(), value.mutationVersion(),
+                                    value.modelRound())).toList();
                     snapshot.set(threadWithTurns(nextRevision, turns));
                     cancellations.incrementAndGet();
                     return new TurnUseCase.CancelResult(true, turnId,
@@ -866,7 +867,7 @@ final class TaskCoordinatorTest {
         ThreadSummary thread = new ThreadSummary("thr_side", "ws_test", "Side", PREFERENCES,
                 ThreadSummary.Status.ACTIVE, false, null, true, null, revision, NOW, NOW);
         ThreadSnapshot.Turn turn = new ThreadSnapshot.Turn("turn_side", state, NOW, NOW,
-                state.equals("CANCELLED") ? NOW : null, null, null);
+                state.equals("CANCELLED") ? NOW : null, null, null, 0, 0);
         return new ThreadSnapshot(thread, List.of(turn), List.of(), null, null, null);
     }
 
@@ -891,7 +892,7 @@ final class TaskCoordinatorTest {
 
     /** Turn fixture 只携带取消循环读取的状态和 revision。 */
     private static ThreadSnapshot.Turn turn(String turnId, String state) {
-        return new ThreadSnapshot.Turn(turnId, state, NOW, NOW, null, null, null);
+        return new ThreadSnapshot.Turn(turnId, state, NOW, NOW, null, null, null, 0, 0);
     }
 
     /** 使用生产 ceiling port 创建完整 seed，测试不复制版本化 JSON 字段。 */
@@ -930,7 +931,7 @@ final class TaskCoordinatorTest {
                                             common, TurnExecutionState.Next.ASSISTANT, null)));
                     sink.publish(new io.github.kongweiguang.ja.conversation.port.in.TurnEvent.StateChanged(
                             new io.github.kongweiguang.ja.conversation.port.in.TurnEvent.Context(
-                                    "evt_running", request.threadId(), request.turnId(), 1, NOW),
+                                    "evt_running", request.threadId(), request.turnId(), 1, 0, NOW),
                             io.github.kongweiguang.ja.conversation.domain.turn.TurnState.QUEUED,
                             io.github.kongweiguang.ja.conversation.domain.turn.TurnState.RUNNING))
                             .toCompletableFuture().join();

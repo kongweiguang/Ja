@@ -724,6 +724,79 @@ const ThreadItemSchema = z.discriminatedUnion("kind", [
   }).strict(),
 ]);
 
+const LiveStreamSegmentSchema = z
+  .object({
+    kind: z.enum(["assistant", "reasoningSummary"]),
+    segmentStartSeq: RevisionSchema.refine((value) => value > 0),
+    streamSeq: RevisionSchema.refine((value) => value > 0),
+    text: BoundedTextSchema.min(1),
+    occurredAt: TimestampSchema,
+  })
+  .strict();
+
+type LiveStreamSegment = z.infer<typeof LiveStreamSegmentSchema>;
+
+/**
+ * 活动流只保留可恢复的公开增量；序号连续性和 UTF-8 预算必须在快照边界再次成立，
+ * 否则恢复层会把残缺文本误当成完整基线，重新触发丢包对账并造成状态闪烁。
+ */
+function validateLiveStreamSegments(
+  value: {
+    streamSeq: number;
+    segments: LiveStreamSegment[];
+  },
+  context: z.RefinementCtx,
+): void {
+  let previousEnd = 0;
+  let totalBytes = 0;
+  value.segments.forEach((segment, index) => {
+    const segmentBytes = new TextEncoder().encode(segment.text).byteLength;
+    totalBytes += segmentBytes;
+    if (segmentBytes > 64 * 1024) {
+      context.addIssue({
+        code: "custom",
+        path: ["segments", index, "text"],
+        message: "live stream segment exceeds UTF-8 byte budget",
+      });
+    }
+    if (
+      segment.segmentStartSeq > segment.streamSeq ||
+      segment.streamSeq > value.streamSeq ||
+      (index > 0 && segment.segmentStartSeq !== previousEnd + 1)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["segments", index],
+        message: "live stream segment sequence is not contiguous",
+      });
+    }
+    previousEnd = segment.streamSeq;
+  });
+  if (value.segments.length > 0 && previousEnd !== value.streamSeq) {
+    context.addIssue({
+      code: "custom",
+      path: ["segments"],
+      message: "live stream segments must reach the baseline sequence",
+    });
+  }
+  if (totalBytes > 1024 * 1024) {
+    context.addIssue({
+      code: "custom",
+      path: ["segments"],
+      message: "live stream exceeds UTF-8 byte budget",
+    });
+  }
+}
+
+const LiveStreamSchema = z
+  .object({
+    turnId: TurnIdSchema,
+    streamSeq: RevisionSchema,
+    segments: z.array(LiveStreamSegmentSchema).max(256),
+  })
+  .strict()
+  .superRefine(validateLiveStreamSegments);
+
 /** 队列条目是 App Server 签发的持久事实；inputRevision 只保护单条编辑竞态。 */
 export const QueuedInputSchema = z
   .object({
@@ -2015,6 +2088,7 @@ export const ThreadReadResultSchema = z
     goalActivities: z.array(ThreadGoalActivitySchema).max(128),
     inputQueue: InputQueueSchema.nullable(),
     contextUsage: ThreadRequestUsageSchema.nullable(),
+    liveStream: LiveStreamSchema.nullable(),
     nextCursor: CursorSchema.nullable(),
   })
   .strict()
@@ -2058,6 +2132,19 @@ export const ThreadReadResultSchema = z
         });
       }
       if (entry !== undefined) goalIds.add(entry.goalId);
+    }
+    if (value.liveStream !== null) {
+      const owner = value.turns.find((turn) => turn.turnId === value.liveStream?.turnId);
+      if (
+        owner === undefined ||
+        !["queued", "running", "waiting_approval", "suspended"].includes(owner.status)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["liveStream", "turnId"],
+          message: "live stream must belong to an active Turn",
+        });
+      }
     }
   });
 

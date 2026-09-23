@@ -91,7 +91,7 @@ final class RpcResultsTest {
     void mapsFrozenTurnRuntimeWithoutErrorMessage() {
         ThreadSnapshot.Turn turn = new ThreadSnapshot.Turn(
                 "turn_failed", "failed", Instant.EPOCH, Instant.EPOCH, Instant.EPOCH,
-                "INTERNAL_ERROR", null);
+                "INTERNAL_ERROR", null, 0, 0);
 
         var result = RpcResults.snapshotTurn(new ObjectMapper(), turn);
 

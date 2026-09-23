@@ -138,6 +138,42 @@ describe("useAttachmentPreviewController", () => {
     });
   });
 
+  it("canonical native image 失败时只切换一次 Windows localhost origin", async () => {
+    const port: AttachmentPreviewPort = {
+      open: vi.fn(async () => ({
+        previewSessionId: "preview-session-fallback",
+        attachmentId: "att_image_fallback",
+        displayName: "shot.png",
+        sizeBytes: 1024,
+        mediaKind: "image" as const,
+        mediaType: "image/png",
+        resourceUrl: "ja-attachment://localhost/preview/resource-token-fallback",
+      })),
+      read: vi.fn(),
+      close: vi.fn(async () => undefined),
+    };
+    const target: AttachmentPreviewTarget = {
+      attachmentId: "att_image_fallback",
+      displayName: "shot.png",
+      mediaKind: "image",
+      authorization: { kind: "thread", threadId: "thread-fallback" },
+    };
+    const { result } = renderHook(() => useAttachmentPreviewController({ target, port }));
+    await waitFor(() => expect(result.current.projection?.status).toBe("ready"));
+
+    act(() => result.current.actions.reportImageFailure());
+    expect(result.current.projection).toMatchObject({
+      status: "ready",
+      content: {
+        kind: "image",
+        resourceUrl: "http://ja-attachment.localhost/preview/resource-token-fallback",
+      },
+    });
+
+    act(() => result.current.actions.reportImageFailure());
+    expect(result.current.projection?.status).toBe("error");
+  });
+
   it("预览读取失败只进入右栏错误投影且允许显式重试", async () => {
     const port = textPort();
     vi.mocked(port.read).mockReset().mockRejectedValue(new Error("private path"));

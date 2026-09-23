@@ -68,29 +68,36 @@ on:
         description: "Immutable source commit selected by the release caller"
         required: true
         type: string
+      verified_run_id:
+        description: "Successful main CI run whose verified native artifacts are reused by release"
+        required: true
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 env:
   # Reusable release callers build an explicitly verified SHA; direct CI remains bound to its event SHA.
   JA_SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
 
 concurrency:
-  group: ja-native-app-server-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Ordinary pushes should cancel stale verification, but a release candidate must keep its
+  # signing matrix alive even when another candidate is dispatched while it is running.
+  group: ${{ inputs.release && format('ja-native-release-{0}', inputs.source_commit) || format('ja-native-app-server-{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: ${{ !inputs.release }}
 
 jobs:
-  fast-verification:
-    name: Contracts and workspace verification
+  fast-checks:
+    name: Fast checks
     if: ${{ !inputs.skip_verification }}
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 25
     steps:
       - name: Checkout exact event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_commit || github.sha }}
           fetch-depth: 1
 
       - name: Install pinned pnpm
@@ -116,16 +123,166 @@ jobs:
       - name: Install uv for the contract and Python test runners
         uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
 
-      # Golden protocol and staging tests only require Python. Keep them ahead of heavyweight JVM,
-      # frontend and Rust work so contract drift fails in minutes instead of at the end of CI.
       - name: Run Python script tests
         shell: pwsh
-        run: uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest scripts.version.test_product_version scripts.native.test_collect_bundle_evidence scripts.native.test_run_sidecar_smoke scripts.native.test_stage_sidecar scripts.native.test_stage_search_tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B -m unittest `
+            scripts.version.test_product_version `
+            scripts.native.test_collect_bundle_evidence `
+            scripts.native.test_run_sidecar_smoke `
+            scripts.native.test_stage_sidecar `
+            scripts.native.test_stage_search_tools `
+            scripts.release.test_restore_verified_native
+          if ($LASTEXITCODE -ne 0) { throw "Python script tests failed with exit code $LASTEXITCODE" }
 
       - name: Verify pinned toolchains
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne $env:JA_SOURCE_COMMIT) { throw 'checkout commit differs from event commit' }
+          if ((node --version).Trim() -ne 'v24.10.0') { throw 'Node.js version drifted from the locked project toolchain' }
+          if ((pnpm --version).Trim() -ne '10.33.0') { throw 'pnpm version drifted from the locked project toolchain' }
+          $javaVersion = java -version 2>&1 | Out-String
+          if ($javaVersion -notmatch 'version "25(?:\.|\")') { throw 'Java 25 is required' }
+          $mavenVersion = mvn.cmd -version | Out-String
+          if ($mavenVersion -notmatch 'Java version: 25(?:\.|,)') { throw 'Maven is not using Java 25' }
+          rustc --version
+          cargo --version
+          python --version
+          uv --version
+
+      - name: Install locked frontend dependencies
+        shell: pwsh
+        run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+
+      - name: Verify product version projections
+        shell: pwsh
+        run: uv run --python 3.13 python -B scripts/version/product_version.py check
+
+      - name: Run fast frontend and architecture gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          pnpm typecheck
+          pnpm lint
+          pnpm check:architecture
+          pnpm check:unused
+
+      - name: Run Rust format gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo fmt --all -- --check
+
+      - name: Run Node script tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node --test `
+            scripts/check-initial-baseline.test.mjs `
+            scripts/e2e/provider-smoke.test.mjs `
+            scripts/e2e/file-search-acceptance.test.mjs `
+            scripts/verification/powershell-fail-fast.test.mjs `
+            scripts/release/create-updater-manifest.test.mjs `
+            scripts/release/workflow-contract.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Node script tests failed with exit code $LASTEXITCODE" }
+
+      - name: Run PowerShell script tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $scratch = ".tmp/verification/ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          pwsh -NoProfile -File scripts/verification/test-production-verification.ps1 -ScratchDirectory $scratch
+          if ($LASTEXITCODE -ne 0) { throw "production verification script tests failed with exit code $LASTEXITCODE" }
+          pwsh -NoProfile -File scripts/release/sbom/test-sbom-scripts.ps1
+          if ($LASTEXITCODE -ne 0) { throw "SBOM script tests failed with exit code $LASTEXITCODE" }
+
+  frontend-verification:
+    name: Frontend verification
+    needs: fast-checks
+    if: ${{ !inputs.skip_verification && needs.fast-checks.result == 'success' }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 1
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Install pinned Node.js and restore pnpm cache
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked frontend dependencies
+        shell: pwsh
+        run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+
+      - name: Run frontend tests and Vite build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          # typecheck 已在 fast-checks 完成；直接调用 Vite，避免 pnpm build 再执行一次 tsc。
+          pnpm exec vitest run --maxWorkers=1 --minWorkers=1
+          pnpm exec vite build --config apps/desktop/vite.config.ts
+
+  fast-verification:
+    name: Contracts and workspace verification
+    needs: fast-checks
+    if: ${{ !inputs.skip_verification && needs.fast-checks.result == 'success' }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 1
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Install pinned Node.js and restore pnpm cache
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install JDK 25
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: liberica
+          java-version: "25"
+          cache: maven
+
+      - name: Install uv for the contract and Python test runners
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+
+      - name: Verify pinned toolchains
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           if ((git rev-parse HEAD).Trim() -ne $env:JA_SOURCE_COMMIT) { throw 'checkout commit differs from event commit' }
           if ((node --version).Trim() -ne 'v24.10.0') { throw 'Node.js version drifted from the locked project toolchain' }
           if ((pnpm --version).Trim() -ne '10.33.0') { throw 'pnpm version drifted from the locked project toolchain' }
@@ -148,13 +305,14 @@ jobs:
           workspaces: ". -> src-tauri/target"
           shared-key: ja-windows-verification
 
-      # 功能测试依赖系统 Windows PowerShell；先独立证明 runner 自身可启动它，
-      # 并把 .NET/模块首次初始化与 Ja Job Object 行为区分开。
+      # 功能测试依赖系统 Windows PowerShell；在真正执行 JVM/Git/Shell 测试的 runner 上确认它可启动，
+      # 避免把 runner 初始化问题误判为 Ja Job Object 或业务测试失败。
       - name: Verify system Windows PowerShell readiness
         shell: pwsh
         timeout-minutes: 2
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "Write-Output 'JA_SYSTEM_POWERSHELL_READY'; exit 0"
           if ($LASTEXITCODE -ne 0) { throw "System Windows PowerShell failed: exit=$LASTEXITCODE" }
 
@@ -162,6 +320,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $stage = Join-Path $env:RUNNER_TEMP 'ja-jvm-search-tools'
           python -B scripts/native/stage-search-tools.py --output-dir $stage --platform windows --arch x86_64 --target-triple x86_64-pc-windows-msvc --source-commit $env:JA_SOURCE_COMMIT
           if ($LASTEXITCODE -ne 0) { throw "search-tool staging failed with exit code $LASTEXITCODE" }
@@ -172,10 +331,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'staged fd failed --version' }
           & (Join-Path $tools 'rg.exe') --version
           if ($LASTEXITCODE -ne 0) { throw 'staged rg failed --version' }
-
-      - name: Verify product version projections
-        shell: pwsh
-        run: uv run --python 3.13 python -B scripts/version/product_version.py check
 
       - name: Run the complete cross-language contract gate
         shell: pwsh
@@ -214,26 +369,6 @@ jobs:
           JAZZER_FUZZ: "1"
         run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=ProviderInputFuzzTest#strictSseReaderFailsClosedForArbitraryBytes" test
 
-      - name: Run frontend type, lint, test, and build gates
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # PowerShell otherwise lets native failures continue until a later command overwrites LASTEXITCODE.
-          $PSNativeCommandUseErrorActionPreference = $true
-          pnpm typecheck
-          pnpm lint
-          # 完整 UI suite 含有 jsdom 虚拟列表；单 worker 让每个环境的 debounce 在 teardown 前自然排空，避免跨文件并发销毁 window。
-          pnpm exec vitest run --maxWorkers=1 --minWorkers=1
-          pnpm build
-
-      - name: Run repository architecture, attribution, and unused-code gates
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          pnpm check:architecture
-          pnpm check:unused
-
       - name: Run the Rust workspace gates
         shell: pwsh
         run: |
@@ -242,7 +377,6 @@ jobs:
           $env:JA_TEST_JAVA = (Get-Command java).Source
           $env:JA_TEST_JAR = (Resolve-Path 'app-server/target/ja-app-server.jar').Path
           cargo install cargo-machete --version 0.9.2 --locked
-          cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           # int_internal 含真实 JVM/Git/Shell 进程测试；foundation 自身的 JVM 锁无法隔离其它模块的
           # 并行进程和 CPU 争用。这里只串行测试 worker，不删 workspace/all-targets、不跳过失败测试，
@@ -250,26 +384,20 @@ jobs:
           cargo test --workspace --all-targets --locked -- --test-threads=1
           cargo machete --with-metadata --skip-target-dir
 
-      - name: Run Node script tests
-        shell: pwsh
-        run: node --test scripts/check-initial-baseline.test.mjs scripts/e2e/provider-smoke.test.mjs scripts/e2e/file-search-acceptance.test.mjs scripts/verification/powershell-fail-fast.test.mjs
-
-      - name: Run PowerShell script tests
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $scratch = ".tmp/verification/ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          pwsh -NoProfile -File scripts/verification/test-production-verification.ps1 -ScratchDirectory $scratch
-          pwsh -NoProfile -File scripts/release/sbom/test-sbom-scripts.ps1
-
   native-app-server:
     name: App Server (${{ matrix.platform }} / ${{ matrix.arch }})
-    needs: fast-verification
+    needs: [fast-checks, frontend-verification, fast-verification]
     if: >-
       ${{
-        always() &&
-        (needs.fast-verification.result == 'success' || inputs.skip_verification)
+        !cancelled() &&
+        (
+          inputs.skip_verification ||
+          (
+            needs.fast-checks.result == 'success' &&
+            needs.frontend-verification.result == 'success' &&
+            needs.fast-verification.result == 'success'
+          )
+        )
       }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -318,6 +446,14 @@ jobs:
 
       - name: Install uv for the native verifier
         uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9
+
+      - name: Run verified native restore unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          uv run --python 3.13 python -B -m unittest scripts.release.test_restore_verified_native
+          if ($LASTEXITCODE -ne 0) { throw "verified native restore tests failed with exit code $LASTEXITCODE" }
 
       - name: Cache target-specific Rust build dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -461,6 +597,56 @@ jobs:
           grep -Fq '25.0.3' "$JA_NATIVE_EVIDENCE/java-version.txt"
           grep -Fq '25.0.3' "$JA_NATIVE_EVIDENCE/native-image-version.txt"
 
+      - name: Download verified native reuse artifact
+        if: inputs.release == true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ja-native-reuse-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/ja-verified-native
+          run-id: ${{ inputs.verified_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Restore verified native executable (Windows)
+        if: inputs.release == true && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native'
+          python -B scripts/release/restore-verified-native.py `
+            --input $inputRoot `
+            --artifact 'app-server/target/ja-app-server.exe' `
+            --evidence-dir $env:JA_NATIVE_EVIDENCE `
+            --source-commit $env:JA_SOURCE_COMMIT `
+            --platform windows `
+            --arch '${{ matrix.arch }}' `
+            --nik-version $env:NIK_VERSION `
+            --nik-java-version $env:NIK_JAVA_VERSION `
+            --nik-sha256 $env:NIK_SHA256 `
+            --verified-run-id '${{ inputs.verified_run_id }}'
+          if ($LASTEXITCODE -ne 0) { throw "verified Windows native restore failed with exit code $LASTEXITCODE" }
+
+      - name: Restore verified native executable (macOS)
+        if: inputs.release == true && matrix.platform == 'macos'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native'
+          python3 -B scripts/release/restore-verified-native.py `
+            --input $inputRoot `
+            --artifact 'app-server/target/ja-app-server' `
+            --evidence-dir $env:JA_NATIVE_EVIDENCE `
+            --source-commit $env:JA_SOURCE_COMMIT `
+            --platform macos `
+            --arch '${{ matrix.arch }}' `
+            --nik-version $env:NIK_VERSION `
+            --nik-java-version $env:NIK_JAVA_VERSION `
+            --nik-sha256 $env:NIK_SHA256 `
+            --verified-run-id '${{ inputs.verified_run_id }}'
+          if ($LASTEXITCODE -ne 0) { throw "verified macOS native restore failed with exit code $LASTEXITCODE" }
+
       # fast-verification owns JVM tests and verify-bound quality gates once on Windows.
       # Matrix jobs only build each platform artifact and prove it through the native smoke below.
       - name: Generate CycloneDX SBOM (Windows)
@@ -474,7 +660,7 @@ jobs:
         run: mvn -B -ntp -f app-server/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server -DoutputDirectory="$JA_NATIVE_EVIDENCE"
 
       - name: Build App Server Native Image (Windows)
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
         shell: cmd
         run: |
           @echo on
@@ -486,7 +672,7 @@ jobs:
           dumpbin /headers app-server\target\ja-app-server.exe | findstr /I /C:"machine (x64)"
 
       - name: Build App Server Native Image (macOS)
-        if: matrix.platform == 'macos'
+        if: matrix.platform == 'macos' && env.JA_RELEASE != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -964,6 +1150,43 @@ jobs:
             echo 'Tauri bundle evidence was not produced; the bundle gate was incomplete.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Prepare native reuse artifact (Windows)
+        if: success() && inputs.release != true && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
+          $target = Join-Path $root 'app-server/target'
+          $evidence = Join-Path $root 'native-evidence'
+          New-Item -ItemType Directory -Force -Path $target,$evidence | Out-Null
+          Copy-Item -LiteralPath 'app-server/target/ja-app-server.exe' -Destination (Join-Path $target 'ja-app-server.exe')
+          Copy-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') -Destination (Join-Path $evidence 'build-report.json')
+          Copy-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') -Destination (Join-Path $evidence 'ja-app-server.json')
+
+      - name: Prepare native reuse artifact (macOS)
+        if: success() && inputs.release != true && matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/ja-native-reuse"
+          target="$root/app-server/target"
+          evidence="$root/native-evidence"
+          mkdir -p "$target" "$evidence"
+          cp -- 'app-server/target/ja-app-server' "$target/ja-app-server"
+          cp -- "$JA_NATIVE_EVIDENCE/build-report.json" "$evidence/build-report.json"
+          cp -- "$JA_NATIVE_EVIDENCE/ja-app-server.json" "$evidence/ja-app-server.json"
+
+      - name: Upload native reuse artifact
+        if: success() && inputs.release != true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ja-native-reuse-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/ja-native-reuse
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
       - name: Upload native build evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -983,7 +1206,7 @@ jobs:
 
   updater-draft-release:
     name: Assemble updater draft
-    if: ${{ always() && inputs.release == true && needs.native-app-server.result == 'success' }}
+    if: ${{ !cancelled() && inputs.release == true && needs.native-app-server.result == 'success' }}
     needs: native-app-server
     runs-on: ubuntu-24.04
     timeout-minutes: 15

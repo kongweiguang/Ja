@@ -49,7 +49,7 @@ public sealed interface ContextCompactionEvent permits ContextCompactionEvent.St
     record Context(String eventId, String workspaceId, String threadId, String turnId,
                    long threadRevision, Instant occurredAt, String compactionId, Trigger trigger,
                    long sourceRevision, Long inputTokensBefore, Long inputTokensAfter,
-                   String strategyVersion) {
+                   String strategyVersion, Long turnMutationVersion) {
         /** nullable turnId 只表达手动 Thread 操作，其余身份与安全整数必须完整。 */
         public Context {
             eventId = identifier(eventId, "evt_");
@@ -61,13 +61,16 @@ public sealed interface ContextCompactionEvent permits ContextCompactionEvent.St
             Objects.requireNonNull(occurredAt, "occurredAt");
             if (threadRevision < 0 || sourceRevision < 0
                 || inputTokensBefore != null && inputTokensBefore < 0
-                || inputTokensAfter != null && inputTokensAfter < 0) {
+                || inputTokensAfter != null && inputTokensAfter < 0
+                || turnMutationVersion != null && turnMutationVersion < 0
+                || turnMutationVersion != null && turnId == null) {
                 throw new IllegalArgumentException("invalid context compaction counters");
             }
             if (!STRATEGY_VERSION.equals(strategyVersion)) {
                 throw new IllegalArgumentException("invalid context compaction strategy");
             }
         }
+
     }
 
     /** 公开触发原因不暴露内部重试阶段或 Provider 类型。 */

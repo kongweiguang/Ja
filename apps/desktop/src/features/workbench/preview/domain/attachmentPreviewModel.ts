@@ -11,6 +11,17 @@ export type AttachmentImageZoom =
   | { mode: "fit"; percent: 100 }
   | { mode: "scale"; percent: number };
 
+/**
+ * Windows WebView2 可能把自定义协议资源解析为 localhost origin；只在已签发的 canonical
+ * attachment URL 上提供一次等价 origin fallback，不接受任意 URL 或路径拼接。
+ */
+export function alternateAttachmentResourceUrl(url: string): string | undefined {
+  const prefix = "ja-attachment://localhost/";
+  return url.startsWith(prefix)
+    ? `http://ja-attachment.localhost/${url.slice(prefix.length)}`
+    : undefined;
+}
+
 export type AttachmentPreviewAuthorization =
   | { kind: "draft" }
   | { kind: "thread"; threadId: string };

@@ -148,10 +148,52 @@ describe("HistoryAttachmentThumbnail", () => {
       return value!;
     });
     fireEvent.error(image);
+    const fallback = await waitFor(() => {
+      const value = container.querySelector<HTMLImageElement>("img");
+      expect(value).not.toBeNull();
+      expect(value).not.toBe(image);
+      return value!;
+    });
+    fireEvent.error(fallback);
 
     expect(port.close).toHaveBeenCalledWith("preview_history_1");
     expect(container.querySelector('[data-state="unavailable"]')).toHaveAccessibleName(
       "损坏图.png 缩略图不可用",
+    );
+  });
+
+  /** Windows custom protocol 失败时只重试一次等价 localhost origin，第二次才降级。 */
+  it("falls back from the canonical attachment scheme once", async () => {
+    installIntersectionObserver();
+    const port = createPort();
+    const { container } = render(
+      <HistoryAttachmentThumbnail
+        attachmentId="att_windows"
+        displayName="Windows图.png"
+        authorization={{ kind: "thread", threadId: "thr_one" }}
+        port={port}
+      />,
+    );
+    revealThumbnail(container);
+    const image = await waitFor(() => {
+      const value = container.querySelector<HTMLImageElement>("img");
+      expect(value).not.toBeNull();
+      return value!;
+    });
+    fireEvent.error(image);
+    const fallback = await waitFor(() => {
+      const value = container.querySelector<HTMLImageElement>("img");
+      expect(value).not.toBeNull();
+      expect(value).not.toBe(image);
+      return value!;
+    });
+    expect(fallback).toHaveAttribute(
+      "src",
+      "http://ja-attachment.localhost/thumbnail/thumb_history_1",
+    );
+    fireEvent.error(fallback);
+    expect(container.querySelector('[data-state="unavailable"]')).toHaveAccessibleName(
+      "Windows图.png 缩略图不可用",
     );
   });
 

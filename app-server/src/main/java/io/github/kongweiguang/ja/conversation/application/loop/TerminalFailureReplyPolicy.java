@@ -52,4 +52,20 @@ public final class TerminalFailureReplyPolicy {
             throw new IllegalStateException("SHA-256 is unavailable", impossible);
         }
     }
+
+    /**
+     * 为失败前已经生成的纯文本派生稳定的独立消息 identity；它不能复用固定失败回复的 ID，
+     * 否则重读时会把半截正文误识别为终态答复并覆盖错误投影。
+     */
+    public String partialMessageIdFor(String turnId, int modelRound) {
+        Objects.requireNonNull(turnId, "turnId");
+        if (modelRound < 1) throw new IllegalArgumentException("modelRound must be positive");
+        try {
+            byte[] input = (turnId + ":partial:" + modelRound).getBytes(StandardCharsets.UTF_8);
+            byte[] bytes = MessageDigest.getInstance("SHA-256").digest(input);
+            return "item_partial_" + java.util.HexFormat.of().formatHex(bytes);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
 }

@@ -288,6 +288,7 @@ function history(): HistoryAdapter {
       contextUsage: null,
       taskActivities: [],
       goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     })),
     threadCompact: vi.fn(async (input) => ({
@@ -559,6 +560,257 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(group).toHaveTextContent("/goal");
   });
 
+  /**
+   * 完整 App composition 通过真实 Runtime event 产生 stream gap，再让 controller 发起挂起的
+   * thread/read；后台恢复期间既有历史行、新会话入口和 Composer 都必须保持稳定，且完成快照
+   * 后不得由 recovered-Turn timer 再次读取。该测试不直接改 Navigation props，避免 browser fixture
+   * 用固定 `newConversationDisabled=false` 掩盖 composition 的 busy 投影错误。
+   */
+  it("keeps conversation actions stable while an active stream is resynchronized", async () => {
+    const user = userEvent.setup();
+    const runtimeHarness = runtimeWithEvents();
+    const historyAdapter = history();
+    const storedThread = {
+      ...threadFixture(),
+      preferences: {
+        ...threadFixture().preferences,
+        providerId: "provider_openai",
+        modelId: "model_gpt",
+        reasoningLevel: "high" as const,
+        accessMode: "full_access" as const,
+      },
+    };
+    const emptySnapshot = () => ({
+      threadId: storedThread.threadId,
+      revision: 0,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: null,
+      nextCursor: null,
+    });
+    const completedSnapshot = () => ({
+      ...emptySnapshot(),
+      revision: 4,
+      turns: [
+        {
+          turnId: "turn_fixture",
+          status: "completed" as const,
+          requestedAt: "2026-09-23T00:00:00Z",
+          updatedAt: "2026-09-23T00:00:04Z",
+          completedAt: "2026-09-23T00:00:04Z",
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+    });
+    let holdNextRead = false;
+    let backgroundReadPending = false;
+    let releaseRead: (() => void) | undefined;
+    const backgroundRead = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    historyAdapter.threadList = vi.fn(async () => ({
+      items: [storedThread],
+      nextCursor: null,
+    }));
+    const threadReadMock = vi.fn(async () => {
+      if (holdNextRead) {
+        holdNextRead = false;
+        backgroundReadPending = true;
+        await backgroundRead;
+        return completedSnapshot();
+      }
+      return emptySnapshot();
+    });
+    historyAdapter.threadRead = threadReadMock;
+    render(
+      <App
+        runtime={runtimeHarness.port}
+        settingsAdapter={settings(configuredDocument)}
+        historyAdapter={historyAdapter}
+        projectPicker={{ pick: vi.fn(async () => null) }}
+      />,
+    );
+
+    const input = await screen.findByRole("textbox", { name: "消息" });
+    await waitFor(() => expect(input).toBeEnabled());
+    const newConversation = screen.getByRole("button", { name: "新会话" });
+    await waitFor(() => expect(newConversation).toBeEnabled());
+    expect(screen.queryByLabelText("正在读取会话")).not.toBeInTheDocument();
+
+    await user.type(input, "触发活动流恢复验收");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runtimeHarness.port.turnStart).toHaveBeenCalledTimes(1));
+    const readCountBeforeResync = threadReadMock.mock.calls.length;
+    holdNextRead = true;
+    act(() => {
+      runtimeHarness.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "turn/state-changed",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_active_running",
+            sequence: 1,
+            occurredAt: "2026-09-23T00:00:01Z",
+            generation: 1,
+            workspaceId: generalWorkspace.workspaceId,
+            threadId: storedThread.threadId,
+            turnId: "turn_fixture",
+            threadRevision: 2,
+            from: "queued",
+            to: "running",
+          },
+        },
+      });
+      runtimeHarness.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "assistant/text-delta",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_active_gap",
+            sequence: 2,
+            occurredAt: "2026-09-23T00:00:02Z",
+            generation: 1,
+            workspaceId: generalWorkspace.workspaceId,
+            threadId: storedThread.threadId,
+            turnId: "turn_fixture",
+            threadRevision: 3,
+            streamSeq: 2,
+            text: "活动流恢复前的公开增量",
+          },
+        },
+      });
+    });
+    await waitFor(() => expect(backgroundReadPending).toBe(true));
+    expect(threadReadMock.mock.calls.length).toBeGreaterThan(readCountBeforeResync);
+    expect(newConversation).toBeEnabled();
+    expect(input).toBeEnabled();
+    expect(screen.queryByLabelText("正在读取会话")).not.toBeInTheDocument();
+
+    releaseRead?.();
+    const readCountDuringBackground = threadReadMock.mock.calls.length;
+    await waitFor(() => expect(threadReadMock.mock.calls.length).toBe(readCountDuringBackground));
+    await waitFor(() => expect(newConversation).toBeEnabled());
+    await waitFor(() => expect(input).toBeEnabled());
+    const readCountAfterTerminal = threadReadMock.mock.calls.length;
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(threadReadMock.mock.calls.length).toBe(readCountAfterTerminal);
+  });
+
+  /** 完整 App 接线只在当前对话正文展示后台恢复诊断，历史栏不重复插入第二个 alert。 */
+  it("shows a background recovery error only in the current conversation body", async () => {
+    const user = userEvent.setup();
+    const runtimeHarness = runtimeWithEvents();
+    const historyAdapter = history();
+    const storedThread = {
+      ...threadFixture(),
+      preferences: {
+        ...threadFixture().preferences,
+        providerId: "provider_openai",
+        modelId: "model_gpt",
+        reasoningLevel: "high" as const,
+        accessMode: "full_access" as const,
+      },
+    };
+    const emptySnapshot = {
+      threadId: storedThread.threadId,
+      revision: 0,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: null,
+      nextCursor: null,
+    };
+    historyAdapter.threadList = vi.fn(async () => ({
+      items: [storedThread],
+      nextCursor: null,
+    }));
+    historyAdapter.threadRead = vi
+      .fn<HistoryAdapter["threadRead"]>()
+      .mockResolvedValueOnce(emptySnapshot)
+      .mockRejectedValueOnce(new Error("temporary background read failure"));
+    render(
+      <App
+        runtime={runtimeHarness.port}
+        settingsAdapter={settings(configuredDocument)}
+        historyAdapter={historyAdapter}
+        projectPicker={{ pick: vi.fn(async () => null) }}
+      />,
+    );
+
+    const input = await screen.findByRole("textbox", { name: "消息" });
+    await waitFor(() => expect(input).toBeEnabled());
+    const newConversation = screen.getByRole("button", { name: "新会话" });
+    await waitFor(() => expect(newConversation).toBeEnabled());
+
+    await user.type(input, "触发后台恢复错误");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runtimeHarness.port.turnStart).toHaveBeenCalledTimes(1));
+    act(() => {
+      runtimeHarness.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "turn/state-changed",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_background_running",
+            sequence: 1,
+            occurredAt: "2026-09-23T00:00:01Z",
+            generation: 1,
+            workspaceId: generalWorkspace.workspaceId,
+            threadId: storedThread.threadId,
+            turnId: "turn_fixture",
+            threadRevision: 2,
+            from: "queued",
+            to: "running",
+          },
+        },
+      });
+      runtimeHarness.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "assistant/text-delta",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_background_gap",
+            sequence: 2,
+            occurredAt: "2026-09-23T00:00:02Z",
+            generation: 1,
+            workspaceId: generalWorkspace.workspaceId,
+            threadId: storedThread.threadId,
+            turnId: "turn_fixture",
+            threadRevision: 3,
+            streamSeq: 2,
+            text: "触发后台错误",
+          },
+        },
+      });
+    });
+
+    await waitFor(() => expect(historyAdapter.threadRead).toHaveBeenCalledTimes(2));
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toHaveTextContent("会话状态暂时无法自动恢复");
+    expect(newConversation).toBeEnabled();
+    expect(input).toBeEnabled();
+  });
+
   it("在搜索弹窗打开时将标题元数据事件转为静默刷新 identity", async () => {
     const runtimeHarness = runtimeWithEvents();
     const historyAdapter = history();
@@ -737,6 +989,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       contextUsage: null,
       taskActivities: [],
       goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     }));
     const settingsAdapter = settings(configuredDocument);

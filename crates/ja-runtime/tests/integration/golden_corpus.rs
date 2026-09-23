@@ -2059,6 +2059,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             "goalActivities",
             "inputQueue",
             "contextUsage",
+            "liveStream",
             "nextCursor",
         ],
     )?;
@@ -2123,6 +2124,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
         return Err("thread input queue is invalid");
     }
     validate_thread_context_usage(result.get("contextUsage"))?;
+    validate_thread_live_stream(result.get("liveStream"), &Value::Array(turns.clone()))?;
     let items = result
         .get("items")
         .and_then(Value::as_array)
@@ -2228,6 +2230,99 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             )?,
             _ => return Err("thread item kind is invalid"),
         }
+    }
+    Ok(())
+}
+
+/// 活动流是提交边界之后的公开恢复基线；序号、活动 Turn 与 UTF-8 预算必须在 Rust consumer
+/// 再次闭合，避免 JSON Schema 通过后仍把跨 Turn 或残缺片段交给恢复层。
+fn validate_thread_live_stream(value: Option<&Value>, turns: &Value) -> Result<(), &'static str> {
+    let Some(value) = value else {
+        return Err("thread live stream is missing");
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    ensure_object_keys(value, &["turnId", "streamSeq", "segments"])?;
+    let turn_id = value
+        .get("turnId")
+        .and_then(Value::as_str)
+        .ok_or("live stream turn identity is missing")?;
+    if !valid_prefixed_id(value.get("turnId"), "turn_")
+        || !integer_in_bounds(value.get("streamSeq"), 0, 9_007_199_254_740_991)
+    {
+        return Err("live stream identity or sequence is invalid");
+    }
+    let active_turn = turns.as_array().is_some_and(|turns| {
+        turns.iter().any(|turn| {
+            turn.get("turnId").and_then(Value::as_str) == Some(turn_id)
+                && matches!(
+                    turn.get("status").and_then(Value::as_str),
+                    Some("queued" | "running" | "waiting_approval" | "suspended")
+                )
+        })
+    });
+    if !active_turn {
+        return Err("live stream turn is not active");
+    }
+    let baseline = value
+        .get("streamSeq")
+        .and_then(Value::as_u64)
+        .ok_or("live stream baseline is invalid")?;
+    let segments = value
+        .get("segments")
+        .and_then(Value::as_array)
+        .filter(|segments| segments.len() <= 256)
+        .ok_or("live stream segments are invalid")?;
+    let mut previous_end = None;
+    let mut total_bytes = 0usize;
+    for segment in segments {
+        ensure_object_keys(
+            segment,
+            &["kind", "segmentStartSeq", "streamSeq", "text", "occurredAt"],
+        )?;
+        if !matches!(
+            segment.get("kind").and_then(Value::as_str),
+            Some("assistant" | "reasoningSummary")
+        ) || !valid_protocol_timestamp(
+            segment
+                .get("occurredAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ) {
+            return Err("live stream segment kind or timestamp is invalid");
+        }
+        let start = segment
+            .get("segmentStartSeq")
+            .and_then(Value::as_u64)
+            .filter(|sequence| (1..=9_007_199_254_740_991).contains(sequence))
+            .ok_or("live stream segment start is invalid")?;
+        let end = segment
+            .get("streamSeq")
+            .and_then(Value::as_u64)
+            .filter(|sequence| (1..=9_007_199_254_740_991).contains(sequence))
+            .ok_or("live stream segment end is invalid")?;
+        let text = segment
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or("live stream segment text is invalid")?;
+        if start > end
+            || end > baseline
+            || previous_end.is_some_and(|previous| start != previous + 1)
+            || text.is_empty()
+            || text.contains('\0')
+            || text.len() > 64 * 1024
+        {
+            return Err("live stream segment sequence or byte budget is invalid");
+        }
+        total_bytes = total_bytes.saturating_add(text.len());
+        previous_end = Some(end);
+    }
+    if !segments.is_empty() && previous_end != Some(baseline) {
+        return Err("live stream segments do not reach baseline");
+    }
+    if total_bytes > 1024 * 1024 {
+        return Err("live stream byte budget is invalid");
     }
     Ok(())
 }

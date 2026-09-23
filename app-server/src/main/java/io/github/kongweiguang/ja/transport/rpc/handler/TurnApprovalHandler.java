@@ -92,7 +92,14 @@ public final class TurnApprovalHandler implements RpcHandler {
                     "turn resume order changed");
         }
         Workspace workspace = session.workspaces().requireOpenWorkspace(snapshot.thread().workspaceId());
-        session.registerTurnNotificationContext(turnId, workspace.workspaceId(), turn.threadId(), expected);
+        int modelRound = snapshot.turns().stream()
+                .filter(value -> value.turnId().equals(turnId))
+                .mapToInt(ThreadSnapshot.Turn::modelRound)
+                .findFirst()
+                .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.TURN_NOT_RESUMABLE,
+                        "turn is not resumable"));
+        session.registerTurnNotificationContext(turnId, workspace.workspaceId(), turn.threadId(), expected,
+                turn.turnMutationVersion(), modelRound);
         try {
             TurnUseCase.Accepted accepted = session.turns().resume(turnId, expected, session.eventSink());
             bindNotificationCleanup(turnId, accepted.completion());

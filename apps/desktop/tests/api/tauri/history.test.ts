@@ -103,6 +103,7 @@ function snapshot() {
     inputQueue: null,
     taskActivities: [],
     goalActivities: [],
+    liveStream: null,
     nextCursor: null,
   };
 }

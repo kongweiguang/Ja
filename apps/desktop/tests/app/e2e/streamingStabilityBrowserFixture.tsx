@@ -90,6 +90,7 @@ function prepareTimeline(): void {
       contextUsage: null,
       taskActivities: [],
       goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     },
     WORKSPACE_ID,

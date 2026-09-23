@@ -348,7 +348,29 @@ pub struct ThreadReadResult {
     pub goal_activities: Vec<ThreadGoalActivityDto>,
     pub context_usage: Option<ThreadContextUsageDto>,
     pub input_queue: Option<InputQueueDto>,
+    pub live_stream: Option<LiveStreamDto>,
     pub next_cursor: Option<String>,
+}
+
+/// 连接级公开流只携带可恢复的 assistant/reasoningSummary 文本，不把 Provider 私有推理或
+/// 重试游标暴露到 WebView；nullable 表示当前没有可安全重放的活动基线。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LiveStreamDto {
+    pub turn_id: String,
+    pub stream_seq: u64,
+    pub segments: Vec<LiveStreamSegmentDto>,
+}
+
+/// 单个 segment 的序号范围与文本必须覆盖连续公开 delta，防止恢复层把截断后缀当作完整正文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LiveStreamSegmentDto {
+    pub kind: String,
+    pub segment_start_seq: u64,
+    pub stream_seq: u64,
+    pub text: String,
+    pub occurred_at: String,
 }
 
 /// SQLite 单快照聚合的最小计量摘要；每个 Token 累计值都有相应的覆盖请求数。
@@ -793,6 +815,7 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
                     "goalActivities",
                     "contextUsage",
                     "inputQueue",
+                    "liveStream",
                     "nextCursor",
                 ],
             )
@@ -875,6 +898,10 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
                 "thread_read_input_queue_semantics",
             ));
         }
+    }
+    if let Some(stream) = &result.live_stream {
+        validate_live_stream(stream, &result.turns)
+            .map_err(|_| history_response_rejected("thread_read_live_stream_semantics"))?;
     }
     let encoded = serde_json::to_vec(&result.items)
         .map_err(|_| history_response_rejected("thread_read_encode"))?;
@@ -1599,6 +1626,58 @@ fn validate_context_usage(
     Ok(())
 }
 
+/// 活动流只允许绑定当前快照中的活动 Turn；非空 segment 必须连续覆盖到 baseline，空数组则
+/// 表示此前公开 delta 已提交但当前 Turn 仍可恢复，不能把它误解成 streamSeq=0。
+fn validate_live_stream(
+    stream: &LiveStreamDto,
+    turns: &[ThreadSnapshotTurnDto],
+) -> Result<(), RuntimeCommandError> {
+    validate_prefixed(&stream.turn_id, "turn_", 128)
+        .map_err(|_| RuntimeCommandError::unavailable())?;
+    if stream.stream_seq > MAX_SAFE_INTEGER || stream.segments.len() > 256 {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let owner_is_manageable = turns.iter().any(|turn| {
+        turn.turn_id == stream.turn_id
+            && matches!(
+                turn.status.as_str(),
+                "queued" | "running" | "waiting_approval" | "suspended"
+            )
+    });
+    if !owner_is_manageable {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let mut previous_end = None;
+    let mut total_bytes = 0usize;
+    for segment in &stream.segments {
+        if !matches!(segment.kind.as_str(), "assistant" | "reasoningSummary")
+            || segment.segment_start_seq == 0
+            || segment.stream_seq == 0
+            || segment.segment_start_seq > segment.stream_seq
+            || segment.stream_seq > stream.stream_seq
+            || previous_end.is_some_and(|end| segment.segment_start_seq != end + 1)
+            || segment.text.is_empty()
+            || segment.text.contains('\0')
+            || segment.text.len() > 64 * 1024
+            || !valid_timestamp(&segment.occurred_at)
+        {
+            return Err(RuntimeCommandError::unavailable());
+        }
+        if segment.segment_start_seq > MAX_SAFE_INTEGER || segment.stream_seq > MAX_SAFE_INTEGER {
+            return Err(RuntimeCommandError::unavailable());
+        }
+        total_bytes = total_bytes.saturating_add(segment.text.len());
+        if total_bytes > 1024 * 1024 {
+            return Err(RuntimeCommandError::unavailable());
+        }
+        previous_end = Some(segment.stream_seq);
+    }
+    if !stream.segments.is_empty() && previous_end != Some(stream.stream_seq) {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    Ok(())
+}
+
 /// 对 serde 后的请求画像重复关键语义校验，避免仅依赖预解析 JSON 形状。
 fn validate_provider_request_profile(profile: &ProviderRequestProfileDto) -> bool {
     validate_prefixed(&profile.provider_id, "provider_", 128).is_ok()
@@ -1961,14 +2040,11 @@ fn validate_cursor(cursor: &Option<String>) -> Result<(), RuntimeCommandError> {
     Ok(())
 }
 
-/// 设计原因：该函数集中维护 History DTO 的边界与完整性，避免 command 重复协议判断。
-/// 使用冻结 RFC3339 UTC shape，详细时间解析仍由 Java 负责。
+/// 设计原因：History DTO 与 runtime 事件必须共享同一套 RFC3339 语义，避免 Tauri
+/// 解析器只做外形检查而把不存在的日期或时区交给 WebView；复用 ja-runtime 的
+/// 已验证实现也避免三端各自维护略有差异的时间解析器。Java 仍是时间事实的 owner。
 fn valid_timestamp(value: &str) -> bool {
-    value.len() >= 20
-        && value.len() <= 64
-        && value.ends_with('Z')
-        && value.contains('T')
-        && !value.chars().any(char::is_control)
+    ja_runtime::app_server_process::valid_protocol_timestamp(value)
 }
 
 /// Interface 专用 Workspace DTO；application 使用独立 domain projection。

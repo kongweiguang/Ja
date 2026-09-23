@@ -632,7 +632,7 @@ final class OpenAiResponsesAdapterTest {
                 assertEquals("OPENAI_EVENT",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 
@@ -965,7 +965,7 @@ final class OpenAiResponsesAdapterTest {
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
             assertTrue(events.stream().noneMatch(ModelPort.UsageEvent.class::isInstance));
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 
@@ -1037,7 +1037,7 @@ final class OpenAiResponsesAdapterTest {
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
             assertTrue(events.stream().noneMatch(event -> event.toString().contains("late-terminal-sentinel")));
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 
@@ -1062,7 +1062,7 @@ final class OpenAiResponsesAdapterTest {
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
             assertTrue(events.stream().noneMatch(ModelPort.TextDelta.class::isInstance));
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 

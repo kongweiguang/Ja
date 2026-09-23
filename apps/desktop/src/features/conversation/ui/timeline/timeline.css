@@ -87,6 +87,7 @@
 
 .ja-chat-message-user {
   grid-template-areas:
+    "attachments"
     "body"
     "error"
     "actions";
@@ -96,6 +97,13 @@
   width: min(560px, 78%);
   max-width: min(560px, 78%);
   margin-left: auto;
+}
+
+.ja-chat-message-user--attachments-only {
+  grid-template-areas:
+    "attachments"
+    "error"
+    "actions";
 }
 
 .ja-chat-message-final {
@@ -342,19 +350,18 @@
   margin-top: 0;
 }
 
-/* 附件是用户消息的常驻内容；在同一气泡内使用稳定宽度，避免 attachment-only 消息依赖负边距定位。 */
-.ja-chat-message-user .ja-chat-message__body--with-attachments {
-  width: min(560px, 100%);
-}
-
 .ja-chat-attachments {
-  display: grid;
+  grid-area: attachments;
+  display: flex;
   width: 100%;
   max-width: 100%;
+  flex-wrap: wrap;
   gap: 0.35rem;
   margin: 0.55rem 0 0;
   padding: 0;
   list-style: none;
+  /* flex 没有空轨道，单图、多图和窄窗都稳定贴右；长文件名只在自身卡片内截断。 */
+  justify-content: flex-end;
 }
 
 .ja-chat-message-user .ja-chat-attachments:first-child {
@@ -362,6 +369,8 @@
 }
 
 .ja-chat-attachment {
+  box-sizing: border-box;
+  min-width: 0;
   min-height: 2.25rem;
   border: 1px solid var(--ja-border);
   border-radius: var(--ja-radius-md);
@@ -369,6 +378,16 @@
   background: var(--ja-surface-control);
   font-size: var(--ja-text-control-size);
   line-height: var(--ja-line-control);
+}
+
+.ja-chat-attachment--image {
+  width: min(5.5rem, 100%);
+  flex: 0 1 5.5rem;
+}
+
+.ja-chat-attachment:not(.ja-chat-attachment--image) {
+  width: 100%;
+  flex: 1 0 100%;
 }
 
 .ja-chat-attachment__content {
@@ -429,8 +448,14 @@
   object-fit: cover;
 }
 
-.ja-chat-attachment__thumbnail[data-state="loading"] {
+.ja-chat-attachment__thumbnail[data-state="loading"],
+.ja-chat-attachment__thumbnail[data-state="loading_image"] {
   opacity: 0.72;
+}
+
+.ja-chat-attachment__thumbnail[data-state="unavailable"] {
+  color: var(--ja-danger);
+  background: color-mix(in srgb, var(--ja-danger) 8%, var(--ja-surface-muted));
 }
 
 .ja-chat-attachment__name {
@@ -444,6 +469,43 @@
 .ja-chat-attachment__summary {
   color: var(--ja-foreground-tertiary);
   font-size: var(--ja-text-caption-size);
+  white-space: nowrap;
+}
+
+/* 已解码的历史图片采用紧凑画幅，保留 filename 在未完成/失败时的可读降级。 */
+.ja-chat-attachment--image:has(.ja-chat-attachment__thumbnail[data-state="ready"]) {
+  width: 5.5rem;
+  height: 5.5rem;
+}
+
+.ja-chat-attachment--image:has(.ja-chat-attachment__thumbnail[data-state="ready"])
+  .ja-chat-attachment__content {
+  grid-template-columns: 1fr;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+}
+
+.ja-chat-attachment--image:has(.ja-chat-attachment__thumbnail[data-state="ready"]) {
+  overflow: hidden;
+}
+
+.ja-chat-attachment--image:has(.ja-chat-attachment__thumbnail[data-state="ready"])
+  .ja-chat-attachment__thumbnail {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+.ja-chat-attachment--image:has(.ja-chat-attachment__thumbnail[data-state="ready"])
+  .ja-chat-attachment__name,
+.ja-chat-attachment--image:has(.ja-chat-attachment__thumbnail[data-state="ready"])
+  .ja-chat-attachment__summary {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
   white-space: nowrap;
 }
 

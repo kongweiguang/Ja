@@ -3,6 +3,7 @@
 
 package io.github.kongweiguang.ja.transport.rpc.handler;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog;
@@ -11,7 +12,9 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcParams;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcResults;
+import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcCodec;
 import io.github.kongweiguang.ja.transport.rpc.protocol.GoalWireMapper;
+import io.github.kongweiguang.ja.transport.rpc.protocol.ThreadReadContract;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -22,6 +25,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
+import io.github.kongweiguang.ja.transport.rpc.runtime.ActiveStreamRegistry;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
@@ -32,8 +36,11 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -50,6 +57,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     private static final Duration CHANGE_SET_READ_TIMEOUT = Duration.ofSeconds(5);
+    private static final int LIVE_STREAM_READ_ATTEMPTS = 3;
+    /* StdioWriter 还会补齐外层 envelope 与连接级 sequence；预留固定元数据预算，避免最终 JSONL 超帧。 */
+    private static final int THREAD_READ_FRAME_BUDGET = JaRpcCodec.DEFAULT_MAX_FRAME_BYTES - 64 * 1024;
     private final RpcSession session;
     private final Duration readTimeout;
     private final BoundedVirtualExecutor changeSetReads;
@@ -224,14 +234,24 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     private ObjectNode read(ObjectNode params) {
         RpcParams.requireOnly(params, "threadId", "cursor", "limit");
         String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
-        ThreadSnapshot snapshot = session.threads()
-                .readThread(threadId, RpcParams.optionalText(params, "cursor", 512),
-                        RpcParams.pageLimit(params))
-                .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND,
-                        "thread is unavailable"));
+        String cursor = RpcParams.optionalText(params, "cursor", 512);
+        int limit = RpcParams.pageLimit(params);
+        ConsistentRead consistent = readConsistent(threadId, cursor, limit);
+        ThreadSnapshot snapshot = consistent.snapshot();
         ObjectNode result = session.mapper().createObjectNode()
                 .put("threadId", snapshot.thread().threadId())
                 .put("revision", snapshot.thread().revision());
+        /* nullable 是有意的：revision 窗口未收敛时不能把旧 draft 重置或伪装成完整基线。 */
+        if (consistent.liveStream().isEmpty()) result.putNull("liveStream");
+        else {
+            ActiveStreamRegistry.Snapshot stream = consistent.liveStream().orElseThrow();
+            result.set("liveStream", RpcResults.liveStream(session.mapper(), stream.turnId(),
+                    stream.streamSeq(), stream.segments().stream()
+                            .map(segment -> new RpcResults.LiveStreamSegment(segment.kind().wireName(),
+                                    segment.segmentStartSeq(), segment.streamSeq(), segment.text(),
+                                    segment.occurredAt()))
+                            .toList()));
+        }
         if (snapshot.contextUsage() == null) result.putNull("contextUsage");
         else result.set("contextUsage", RpcResults.contextUsage(session.mapper(), snapshot.contextUsage()));
         if (snapshot.inputQueue() == null) result.putNull("inputQueue");
@@ -251,7 +271,72 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         session.goals().listTerminalActivities(threadId, 128)
                 .forEach(value -> goalActivities.add(goalWire.terminalActivity(value)));
         RpcResults.cursor(result, snapshot.nextCursor());
+        trimLiveStreamForFrameBudget(result);
+        ThreadReadContract.requireValidLiveStream(result);
         return result;
+    }
+
+    /**
+     * Jackson 对控制字符的 JSON 转义可能把公开正文放大到远超内存 UTF-8 预算；完整响应超出
+     * JA-RPC 帧上限时只丢弃可选恢复基线，保留权威历史页，禁止截断 segment 伪造完整文本。
+     */
+    private void trimLiveStreamForFrameBudget(ObjectNode result) {
+        if (result.path("liveStream").isNull() || !result.has("liveStream")) return;
+        try {
+            if (session.mapper().writeValueAsBytes(result).length > THREAD_READ_FRAME_BUDGET) {
+                result.putNull("liveStream");
+            }
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("thread history response could not be serialized", failure);
+        }
+    }
+
+    /**
+     * 在活动 Turn 存在时最多重读三次，等待提交 revision 与出站 registry 收敛；超过预算返回无基线，
+     * 不阻塞 RPC worker，也不把跨 revision 的分页事实拼成一份假的恢复文本。
+     */
+    private ConsistentRead readConsistent(String threadId, String cursor, int limit) {
+        for (int attempt = 0; attempt < LIVE_STREAM_READ_ATTEMPTS; attempt++) {
+            ThreadSnapshot snapshot = session.threads().readThread(threadId, cursor, limit)
+                    .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND,
+                            "thread is unavailable"));
+            ActiveStreamRegistry streams = session.activeStreams();
+            Set<String> activeTurnIds = snapshot.turns().stream()
+                    .filter(turn -> !io.github.kongweiguang.ja.conversation.domain.turn.TurnState
+                            .valueOf(turn.status().toUpperCase(Locale.ROOT)).terminal())
+                    .map(ThreadSnapshot.Turn::turnId).collect(java.util.stream.Collectors.toUnmodifiableSet());
+            if (activeTurnIds.isEmpty()) {
+                /* 持久快照已确认没有活动 Turn；即使终态通知丢失，也必须释放 registry 临时草稿。 */
+                streams.abandonThread(threadId);
+                return new ConsistentRead(snapshot, Optional.empty());
+            }
+            Map<String, Long> persistedMutationVersions = snapshot.turns().stream()
+                    .filter(turn -> activeTurnIds.contains(turn.turnId()))
+                    .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                            ThreadSnapshot.Turn::turnId, ThreadSnapshot.Turn::mutationVersion));
+            Map<String, Integer> persistedModelRounds = snapshot.turns().stream()
+                    .filter(turn -> activeTurnIds.contains(turn.turnId()))
+                    .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                            ThreadSnapshot.Turn::turnId, ThreadSnapshot.Turn::modelRound));
+            Optional<ActiveStreamRegistry.Snapshot> live = streams.snapshot(
+                    threadId, snapshot.thread().revision(), activeTurnIds, persistedMutationVersions,
+                    persistedModelRounds);
+            if (!streams.hasActive(threadId) || live.isPresent() || attempt + 1 == LIVE_STREAM_READ_ATTEMPTS) {
+                return new ConsistentRead(snapshot, live);
+            }
+            Thread.onSpinWait();
+        }
+        throw new IllegalStateException("thread history consistency retry exhausted");
+    }
+
+    /** read 返回的快照与同 revision 活动基线，禁止调用方将两次独立查询重新组合。 */
+    private record ConsistentRead(ThreadSnapshot snapshot,
+                                  Optional<ActiveStreamRegistry.Snapshot> liveStream) {
+        /** 统一非空约束，避免以后新增字段时绕开一致性边界。 */
+        private ConsistentRead {
+            Objects.requireNonNull(snapshot, "snapshot");
+            liveStream = Optional.ofNullable(liveStream).orElseThrow();
+        }
     }
 
     /**
@@ -274,7 +359,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 RpcParams.identifier(params, "threadId", "thr_", 100),
                 RpcParams.text(params, "title", 512, false),
                 RpcParams.revision(params, "expectedThreadRevision"));
-        return RpcResults.thread(session.mapper(), thread);
+        return RpcResults.thread(session.mapper(), observeThreadMutation(thread));
     }
 
     /** 偏好 CAS 接受完整替换，缺失字段不能继承陈旧 renderer 状态。 */
@@ -289,8 +374,9 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 ? ThreadPreferences.TitleSource.MANUAL
                 : current.titleSource();
         ThreadPreferences preferences = preferences(params, titleSource);
-        return RpcResults.thread(session.mapper(), session.threads().updatePreferences(threadId, preferences,
-                RpcParams.revision(params, "expectedThreadRevision")));
+        ThreadSummary thread = session.threads().updatePreferences(threadId, preferences,
+                RpcParams.revision(params, "expectedThreadRevision"));
+        return RpcResults.thread(session.mapper(), observeThreadMutation(thread));
     }
 
     /** 置顶布尔值必须显式给出，返回完整 Thread 让调用方按服务端时间立即重排。 */
@@ -301,7 +387,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         ThreadSummary thread = session.threads().pinThread(
                 RpcParams.identifier(params, "threadId", "thr_", 100), pinned.booleanValue(),
                 RpcParams.revision(params, "expectedThreadRevision"));
-        return RpcResults.thread(session.mapper(), thread);
+        return RpcResults.thread(session.mapper(), observeThreadMutation(thread));
     }
 
     /** 只接受 Thread 身份与 revision，待标记的最新 Turn 必须由 App Server 在事务内权威选取。 */
@@ -310,7 +396,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         ThreadSummary thread = session.threads().markThreadSeen(
                 RpcParams.identifier(params, "threadId", "thr_", 100),
                 RpcParams.revision(params, "expectedThreadRevision"));
-        return RpcResults.thread(session.mapper(), thread);
+        return RpcResults.thread(session.mapper(), observeThreadMutation(thread));
     }
 
     /** 共享创建和更新的封闭偏好解析，reasoning 的显式 null 与缺失均表示模型默认。 */
@@ -342,23 +428,35 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         RpcParams.requireExact(params, "threadId", "expectedThreadRevision");
         String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
         long revision = RpcParams.revision(params, "expectedThreadRevision");
-        return RpcResults.thread(session.mapper(), session.threads().archiveThread(threadId, revision));
+        ThreadSummary thread = session.threads().archiveThread(threadId, revision);
+        return RpcResults.thread(session.mapper(), observeThreadMutation(thread));
     }
 
     /** restore 仅接受归档后的 revision，返回未置顶的完整 active Thread。 */
     private ObjectNode restore(ObjectNode params) {
         RpcParams.requireExact(params, "threadId", "expectedThreadRevision");
-        return RpcResults.thread(session.mapper(), session.threads().restoreThread(
+        ThreadSummary thread = session.threads().restoreThread(
                 RpcParams.identifier(params, "threadId", "thr_", 100),
-                RpcParams.revision(params, "expectedThreadRevision")));
+                RpcParams.revision(params, "expectedThreadRevision"));
+        return RpcResults.thread(session.mapper(), observeThreadMutation(thread));
     }
 
     /** 删除仍返回 accepted envelope；本轮不将删除暴露为会话菜单动作。 */
     private ObjectNode delete(ObjectNode params) {
         RpcParams.requireExact(params, "threadId", "expectedThreadRevision");
-        session.threads().deleteThread(RpcParams.identifier(params, "threadId", "thr_", 100),
-                RpcParams.revision(params, "expectedThreadRevision"));
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
+        session.threads().deleteThread(threadId, RpcParams.revision(params, "expectedThreadRevision"));
+        session.activeStreams().abandonThread(threadId);
         return session.mapper().createObjectNode().put("accepted", true);
+    }
+
+    /**
+     * 同步 Thread metadata CAS 没有独立事件可发布，因此在返回成功响应前推进活动流 revision，
+     * 让下一次 thread/read 仍可精确复用公开 draft，而不会将旧版本与新目录混合。
+     */
+    private ThreadSummary observeThreadMutation(ThreadSummary thread) {
+        session.activeStreams().observeThreadRevision(thread.threadId(), thread.revision());
+        return thread;
     }
 
     /** Tool artifact 通过四元身份和 code point 页读取，找不到时不泄漏哪个身份不匹配。 */

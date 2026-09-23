@@ -118,9 +118,12 @@ public final class InteractionHandler implements RpcHandler {
         var thread = session.threads().readThread(threadId, null, 1)
                 .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND, "会话不存在"));
         if (pending.status() == InteractionStatus.PENDING) {
+            var turn = thread.turns().stream().filter(value -> value.turnId().equals(pending.turnId()))
+                    .findFirst().orElseThrow(() -> JaRpcException.of(JaErrorCatalog.TURN_NOT_RESUMABLE,
+                            "turn is not resumable"));
             // 终态回答重试只回读原结果，不重新注册已经完成的 Turn 路由或复活旧通知上下文。
             session.restoreTurnNotificationContext(pending.turnId(), thread.thread().workspaceId(),
-                    threadId, thread.thread().revision());
+                    threadId, thread.thread().revision(), turn.mutationVersion(), turn.modelRound());
         }
         session.interactions().respond(threadId, requestId, RpcParams.revision(params, "expectedRevision"),
                 answers(params), idempotencyKey(params), session.clock().instant(), session.eventSink());

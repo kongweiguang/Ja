@@ -9,6 +9,7 @@ import {
   type TimelineGoalActivity,
   type TimelineTaskActivityEntry,
   type TimelineSnapshotItem,
+  type TimelineLiveStream,
 } from "./timelineContracts";
 import type {
   ApprovalDecision,
@@ -58,6 +59,7 @@ type MessagesReceivedEvent = Extract<ThreadSemanticEvent, { method: "turn/messag
 type InputQueueChangedEvent = Extract<TimelineEvent, { method: "turn/input-queue-changed" }>;
 
 const EVENT_DEDUP_WINDOW = 1024;
+const MAX_LIVE_SEGMENT_BYTES = 64 * 1024;
 const textEncoder = new TextEncoder();
 
 /**
@@ -175,6 +177,11 @@ export interface TimelineDraftProjection {
   occurredAt?: string;
 }
 
+/** Snapshot 读取分为健康对账与真实恢复；只有真实恢复允许用 baseline 重置瞬态流状态。 */
+export interface ApplySnapshotOptions {
+  mode?: "health" | "recovery";
+}
+
 /** Zustand 只保存这份状态；Draft 与 Stream Cursor 明确属于瞬态。 */
 export interface TimelineState {
   handshake: HostProjection;
@@ -198,6 +205,8 @@ export interface TimelineState {
   goalActivitiesByOwnerThread: Record<string, readonly TimelineGoalActivity[]>;
   inputQueueByTurn: Record<string, InputQueue>;
   threadRevisionByThread: Record<string, number>;
+  /** 最近一次权威 Snapshot 覆盖到的 revision；用于幂等忽略被快照覆盖的迟到 committed event。 */
+  snapshotRevisionByThread: Record<string, number>;
   streamSeqByTurn: Record<string, number>;
   /** 未提交的 Assistant/Reasoning segments；发生重连或 Gap 时必须整体丢弃。 */
   draftByTurn: Record<string, readonly TimelineDraftProjection[]>;
@@ -230,6 +239,7 @@ export function createTimelineState(): TimelineState {
     goalActivitiesByOwnerThread: {},
     inputQueueByTurn: {},
     threadRevisionByThread: {},
+    snapshotRevisionByThread: {},
     streamSeqByTurn: {},
     draftByTurn: {},
     seenEventIds: {},
@@ -262,6 +272,7 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
     goalActivitiesByOwnerThread: {},
     inputQueueByTurn: {},
     threadRevisionByThread: {},
+    snapshotRevisionByThread: {},
     streamSeqByTurn: {},
     draftByTurn: {},
     seenEventIds: {},
@@ -385,6 +396,7 @@ export function pruneInactiveThreads(
         Object.entries(state.inputQueueByTurn).filter(([turnId]) => !turnIds.has(turnId)),
       ),
       threadRevisionByThread: filterThreadRecord(state.threadRevisionByThread),
+      snapshotRevisionByThread: filterThreadRecord(state.snapshotRevisionByThread ?? {}),
       streamSeqByTurn: Object.fromEntries(
         Object.entries(state.streamSeqByTurn).filter(([turnId]) => !turnIds.has(turnId)),
       ),
@@ -491,6 +503,24 @@ function resync(
   return outcome(
     { ...state, draftByTurn, resyncRequired: { ...state.resyncRequired, [threadId]: reason } },
     result,
+  );
+}
+
+/**
+ * 仅登记一次后台权威读取意图，保留屏幕上的 Draft 和 Stream Cursor；真实 Gap 仍由 resync 负责清理。
+ * 该分离避免健康对账把正在显示的正文误判成失效瞬态，从而触发 Composer/WorkProcess 闪烁。
+ */
+export function markThreadResync(state: TimelineState, threadId: string): TimelineState {
+  const existing = state.resyncRequired[threadId];
+  return outcome(
+    {
+      ...state,
+      resyncRequired: {
+        ...state.resyncRequired,
+        [threadId]: existing ?? "invalid_event",
+      },
+    },
+    "resync_required",
   );
 }
 
@@ -713,6 +743,70 @@ function projectSnapshotItem(
   }
 }
 
+/** 将 Wire baseline 映射为 Renderer 的 Draft segment，保持同一段正文的对象身份可复用。 */
+function draftSegmentsFromBaseline(
+  baseline: TimelineLiveStream,
+): readonly TimelineDraftProjection[] {
+  return baseline.segments.map((segment): TimelineDraftProjection => {
+    const kind: TimelineDraftProjection["kind"] =
+      segment.kind === "reasoningSummary" ? "reasoning" : "assistant";
+    return {
+      kind,
+      text: segment.text,
+      streamSeq: segment.streamSeq,
+      segmentStartSeq: segment.segmentStartSeq,
+      occurredAt: segment.occurredAt,
+    };
+  });
+}
+
+/** 只有 baseline 与当前 Draft 完全相同才复用原对象，避免健康读取重新触发正文入场动效。 */
+function matchesLiveStreamBaseline(state: TimelineState, baseline: TimelineLiveStream): boolean {
+  const currentStreamSeq = state.streamSeqByTurn[baseline.turnId] ?? 0;
+  if (currentStreamSeq < baseline.streamSeq) return false;
+  const current = state.draftByTurn[baseline.turnId] ?? [];
+  if (baseline.segments.length === 0) return true;
+  if (current.length < baseline.segments.length) return false;
+  const exact = currentStreamSeq === baseline.streamSeq;
+  if (exact && current.length !== baseline.segments.length) return false;
+  const prefixMatches = baseline.segments.every((segment, index) => {
+    const draft = current[index];
+    return (
+      segment !== undefined &&
+      draft !== undefined &&
+      draft.kind === (segment.kind === "reasoningSummary" ? "reasoning" : "assistant") &&
+      (exact ? draft.text === segment.text : draft.text.startsWith(segment.text)) &&
+      draft.streamSeq >= segment.streamSeq &&
+      draft.segmentStartSeq === segment.segmentStartSeq &&
+      draft.occurredAt === segment.occurredAt
+    );
+  });
+  return prefixMatches && (baseline.streamSeq < currentStreamSeq || exact);
+}
+
+/** same-revision 健康快照不应替换仍在屏幕上的 live Draft；恢复模式则必须由 baseline 接管。 */
+function shouldPreserveLiveDraft(
+  state: TimelineState,
+  threadId: string,
+  snapshotRevision: number,
+  currentRevision: number | undefined,
+  liveStream: TimelineLiveStream | null,
+  mode: ApplySnapshotOptions["mode"],
+): boolean {
+  // Recovery 的 baseline 是新的提交边界；即使内容看似相同也必须重建对象，随后只重放窗口内事件，
+  // 否则 gap 后的旧 Draft/游标会绕过权威边界重新进入 UI。
+  if (mode === "recovery") return false;
+  if (currentRevision !== snapshotRevision) return false;
+  if (liveStream !== null) return matchesLiveStreamBaseline(state, liveStream);
+  return Object.values(state.turns).some(
+    (turn) =>
+      turn.threadId === threadId &&
+      !isTerminalState(turn.status) &&
+      ((state.draftByTurn[turn.turnId]?.length ?? 0) > 0 ||
+        (state.streamSeqByTurn[turn.turnId] ?? 0) > 0),
+  );
+}
+
 /**
  * 应用完整且未分页的 Thread Snapshot，并丢弃无法由快照继续确认的 In-flight 投影。
  * Workspace 由 History 调用方提供，因为 Wire Snapshot 明确省略其所有权；已提交的 live 修改摘要
@@ -722,6 +816,7 @@ export function applySnapshot(
   state: TimelineState,
   value: unknown,
   workspaceId: string,
+  options: ApplySnapshotOptions = {},
 ): TimelineState {
   const parsed = timelineSnapshotFromUnknown(value);
   if (parsed === undefined || parsed.nextCursor !== null || state.handshake.phase !== "ready") {
@@ -731,6 +826,7 @@ export function applySnapshot(
     );
   }
   const snapshot = parsed;
+  const liveStream = snapshot.liveStream;
   const priorThread = state.threads[snapshot.threadId];
   if (
     workspaceId.trim() === "" ||
@@ -743,6 +839,28 @@ export function applySnapshot(
     // thread/read 可能早于随后到达的 committed event 发起；晚到快照不能让 Turn 状态和消息归属倒退。
     return outcome(state, "late");
   }
+  if (liveStream !== null) {
+    const owner = snapshot.turns.find((turn) => turn.turnId === liveStream.turnId);
+    if (owner === undefined || isTerminalState(owner.status)) return outcome(state, "invalid");
+  }
+  const preserveLiveDraft = shouldPreserveLiveDraft(
+    state,
+    snapshot.threadId,
+    snapshot.revision,
+    currentRevision,
+    liveStream,
+    options.mode,
+  );
+  const preservedLiveTurnId = preserveLiveDraft
+    ? (liveStream?.turnId ??
+      Object.values(state.turns).find(
+        (turn) =>
+          turn.threadId === snapshot.threadId &&
+          !isTerminalState(turn.status) &&
+          ((state.draftByTurn[turn.turnId]?.length ?? 0) > 0 ||
+            (state.streamSeqByTurn[turn.turnId] ?? 0) > 0),
+      )?.turnId)
+    : undefined;
   let next = state;
   const threadTurnIds = new Set(
     Object.values(next.turns)
@@ -763,8 +881,18 @@ export function applySnapshot(
   const draftByTurn = { ...next.draftByTurn };
   for (const threadTurnId of threadTurnIds) {
     delete turns[threadTurnId];
-    delete streamSeqByTurn[threadTurnId];
-    delete draftByTurn[threadTurnId];
+    if (threadTurnId !== preservedLiveTurnId) {
+      const snapshotTurn = snapshot.turns.find((turn) => turn.turnId === threadTurnId);
+      // Terminal snapshot 不携带 live baseline，但已有即时流水位仍是迟到 delta 的安全覆盖边界；
+      // 保留它可以在重读后幂等忽略 seq<=watermark，未知更大序号仍按终态非法事实处理。
+      if (
+        snapshotTurn === undefined ||
+        !isTerminalState(snapshotTurn.status) ||
+        (streamSeqByTurn[threadTurnId] ?? 0) <= 0
+      )
+        delete streamSeqByTurn[threadTurnId];
+      delete draftByTurn[threadTurnId];
+    }
   }
   const approvalsById: TimelineState["approvalsById"] = Object.fromEntries(
     Object.entries(next.approvalsById).filter(
@@ -864,6 +992,27 @@ export function applySnapshot(
         ? currentQueue
         : snapshot.inputQueue;
   }
+  const rebuiltStreamSeqByTurn = {
+    ...streamSeqByTurn,
+  };
+  for (const turn of snapshot.turns) {
+    if (
+      turn.turnId !== preservedLiveTurnId &&
+      !(isTerminalState(turn.status) && (rebuiltStreamSeqByTurn[turn.turnId] ?? 0) > 0)
+    )
+      rebuiltStreamSeqByTurn[turn.turnId] = 0;
+  }
+  const rebuiltDraftByTurn = { ...draftByTurn };
+  if (!preserveLiveDraft && liveStream !== null) {
+    rebuiltStreamSeqByTurn[liveStream.turnId] = liveStream.streamSeq;
+    const baselineDraft = draftSegmentsFromBaseline(liveStream);
+    if (baselineDraft.length === 0) delete rebuiltDraftByTurn[liveStream.turnId];
+    else rebuiltDraftByTurn[liveStream.turnId] = baselineDraft;
+  }
+  const recoveryNeedsBaseline =
+    options.mode === "recovery" &&
+    liveStream === null &&
+    snapshot.turns.some((turn) => !isTerminalState(turn.status));
   const snapshotThread: TimelineThreadProjection = {
     ...(priorThread ?? {
       threadId: snapshot.threadId,
@@ -920,15 +1069,18 @@ export function applySnapshot(
       ...next.threadRevisionByThread,
       [snapshot.threadId]: snapshot.revision,
     },
-    streamSeqByTurn: {
-      ...streamSeqByTurn,
-      ...Object.fromEntries(snapshot.turns.map((turn) => [turn.turnId, 0])),
+    snapshotRevisionByThread: {
+      ...(next.snapshotRevisionByThread ?? {}),
+      [snapshot.threadId]: snapshot.revision,
     },
-    // Snapshot 是重连的线性化点：该 Thread 中每个 Turn 的 Draft 都是推测状态，不能跨越 Resync。
-    draftByTurn,
-    resyncRequired: Object.fromEntries(
-      Object.entries(next.resyncRequired).filter(([id]) => id !== snapshot.threadId),
-    ),
+    streamSeqByTurn: rebuiltStreamSeqByTurn,
+    // 健康同 revision 快照保留同一 Draft 引用；真实恢复只接纳权威 baseline，null 不冒充 seq=0。
+    draftByTurn: rebuiltDraftByTurn,
+    resyncRequired: recoveryNeedsBaseline
+      ? { ...next.resyncRequired, [snapshot.threadId]: "gap" }
+      : Object.fromEntries(
+          Object.entries(next.resyncRequired).filter(([id]) => id !== snapshot.threadId),
+        ),
   };
   // 失败 Turn 可能已因队列输入产生过早期 Final；只有终态事务最后追加的 Final 才是安全收口回复。
   const failedTurnIds = new Set(
@@ -945,7 +1097,7 @@ export function applySnapshot(
       next,
       projectSnapshotItem(item, snapshot.threadId, failureReplyItemIds.has(item.itemId)),
     );
-  return outcome(next, "applied");
+  return outcome(next, recoveryNeedsBaseline ? "resync_required" : "applied");
 }
 
 /**
@@ -1758,7 +1910,11 @@ function applyMessagesReceived(
 function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): TimelineState {
   const currentRevision = state.threadRevisionByThread[event.params.threadId] ?? 0;
   if (event.params.threadRevision <= currentRevision) {
-    return resync(state, event.params.threadId, "late_event", "late");
+    // Snapshot 已覆盖该 Revision 时，迟到 committed event 只是幂等旧事实，不能再次清除 live Draft。
+    return event.params.threadRevision <=
+      (state.snapshotRevisionByThread?.[event.params.threadId] ?? -1)
+      ? outcome(state, "late")
+      : resync(state, event.params.threadId, "late_event", "late");
   }
   const admitted = admitThreadEvent(state, event);
   if (admitted === undefined) return resync(state, event.params.threadId, "gap", "gap");
@@ -2002,7 +2158,9 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       const inputQueueByTurn = { ...next.inputQueueByTurn };
       delete inputQueueByTurn[params.turnId];
       // terminal 已在合同层冻结答复、用量和 ChangeSet；只提交一次投影，避免终态后再次 thread/read。
-      next = { ...next, inputQueueByTurn };
+      const resyncRequired = { ...next.resyncRequired };
+      if (resyncRequired[params.threadId] === "gap") delete resyncRequired[params.threadId];
+      next = { ...next, inputQueueByTurn, resyncRequired };
       break;
     }
     default:
@@ -2044,8 +2202,8 @@ function clearDraft(state: TimelineState, turnId: string): TimelineState {
 
 /**
  * Terminal 只清理由权威 finalMessage 替代的 assistant Draft；公开 reasoning 需要留到完整历史快照
- * 接管，取消态还必须保留用户已经看到的半成品正文。失败终态有独立安全收口回复，因此不把未结算
- * Provider 正文冒充失败答复。
+ * 接管，取消/失败态都保留用户已经看到的半成品正文。失败终态的固定安全回复仍单独投影，
+ * 因此半截 Provider 正文只属于 WorkProcess，不会冒充失败答复。
  */
 function settleTerminalDraft(
   state: TimelineState,
@@ -2056,12 +2214,40 @@ function settleTerminalDraft(
   if (current === undefined) return state;
   const retained = current.filter(
     (draft) =>
-      draft.kind === "reasoning" || (terminalState === "cancelled" && draft.kind === "assistant"),
+      draft.kind === "reasoning" ||
+      ((terminalState === "cancelled" || terminalState === "failed") && draft.kind === "assistant"),
   );
   const draftByTurn = { ...state.draftByTurn };
   if (retained.length === 0) delete draftByTurn[turnId];
   else draftByTurn[turnId] = retained;
   return { ...state, draftByTurn };
+}
+
+/**
+ * Delta 没有持久 Revision 可供恢复，必须先验证原生 generation、server identity、Workspace 与 Turn 归属；
+ * 否则旧 WebView/旧 App Server 的首个 delta 会被误当作新流的 seq=1。
+ */
+function validateLiveDeltaIdentity(
+  state: TimelineState,
+  threadId: string,
+  turnId: string,
+  workspaceId: string,
+  generation: number,
+  serverInstanceId: string | undefined,
+): TimelineState | undefined {
+  const turn = state.turns[turnId];
+  const thread = state.threads[threadId];
+  if (
+    turn === undefined ||
+    turn.threadId !== threadId ||
+    thread === undefined ||
+    thread.workspaceId !== workspaceId ||
+    generation !== state.handshake.generation ||
+    serverInstanceId === undefined ||
+    serverInstanceId !== state.serverInstanceId
+  )
+    return resync(state, threadId, "invalid_event");
+  return undefined;
 }
 
 /** 在 Terminal 边界关闭未解决卡片，但不伪造用户 Decision。 */
@@ -2089,22 +2275,44 @@ function closePendingApprovals(
  */
 function applyDelta(
   state: TimelineState,
-  turnId: string,
-  streamSeq: number,
-  text: string,
-  kind: "assistant" | "reasoning",
-  occurredAt: string,
+  event: Extract<
+    TimelineEvent,
+    { method: "assistant/text-delta" | "assistant/reasoning-summary-delta" }
+  >,
 ): TimelineState {
+  const params = event.params;
+  const identityFailure = validateLiveDeltaIdentity(
+    state,
+    params.threadId,
+    params.turnId,
+    params.workspaceId,
+    params.generation,
+    params.serverInstanceId,
+  );
+  if (identityFailure !== undefined) return identityFailure;
+  const { turnId, streamSeq, text, occurredAt } = params;
+  const kind: TimelineDraftProjection["kind"] =
+    event.method === "assistant/text-delta" ? "assistant" : "reasoning";
   const turn = turnForStream(state, turnId);
-  if (turn === undefined || isTerminalState(turn.status))
-    return resync(state, turn?.threadId ?? "runtime", "invalid_event");
+  if (turn === undefined) return resync(state, params.threadId, "invalid_event");
+  if (state.resyncRequired[turn.threadId] === "gap") return outcome(state, "resync_required");
   const previous = state.streamSeqByTurn[turnId] ?? 0;
+  // Terminal 会保留已展示流的最高游标；覆盖边界以内的迟到 delta 是幂等旧事实，不能再次触发恢复。
+  // 边界之后仍到达新 delta 则属于未知事实，继续 fail closed 并等待权威快照。
   if (streamSeq <= previous) return outcome(state, "duplicate");
+  if (isTerminalState(turn.status)) {
+    const coveredRevision = state.snapshotRevisionByThread?.[turn.threadId];
+    if (coveredRevision !== undefined && params.threadRevision <= coveredRevision)
+      return outcome(state, "late");
+    return resync(state, turn.threadId, "invalid_event");
+  }
   if (streamSeq !== previous + 1) return resync(state, turn.threadId, "gap", "gap");
   const priorSegments = state.draftByTurn[turnId] ?? [];
   const prior = priorSegments.at(-1);
   const segments =
-    prior === undefined || prior.kind !== kind
+    prior === undefined ||
+    prior.kind !== kind ||
+    utf8ByteLength(prior.text) + utf8ByteLength(text) > MAX_LIVE_SEGMENT_BYTES
       ? [
           ...priorSegments,
           {
@@ -2143,14 +2351,7 @@ export function applyLiveEvent(state: TimelineState, event: TimelineEvent): Time
     event.method === "assistant/text-delta" ||
     event.method === "assistant/reasoning-summary-delta"
   )
-    return applyDelta(
-      state,
-      event.params.turnId,
-      event.params.streamSeq,
-      event.params.text,
-      event.method === "assistant/text-delta" ? "assistant" : "reasoning",
-      event.params.occurredAt,
-    );
+    return applyDelta(state, event);
   if (state.seenEventIds[event.params.eventId] === true) return outcome(state, "duplicate");
   if (event.method === "turn/input-queue-changed") return applyInputQueueChanged(state, event);
   if (isContextCompactionEvent(event)) return applyContextCompactionEvent(state, event);

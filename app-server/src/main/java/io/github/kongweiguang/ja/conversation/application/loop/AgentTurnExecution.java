@@ -618,7 +618,7 @@ final class AgentTurnExecution {
                     cancellation,
                     terminalCoordinator,
                     TurnState.FAILED,
-                    current == null ? "" : current.terminalText(),
+                    current == null ? "" : current.partialText(),
                     null,
                     draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
@@ -635,7 +635,7 @@ final class AgentTurnExecution {
                     cancellation,
                     terminalCoordinator,
                     TurnState.FAILED,
-                    current == null ? "" : current.terminalText(),
+                    current == null ? "" : current.partialText(),
                     null,
                     draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
@@ -654,7 +654,7 @@ final class AgentTurnExecution {
                     cancellation,
                     terminalCoordinator,
                     TurnState.FAILED,
-                    current == null ? "" : current.terminalText(),
+                    current == null ? "" : current.partialText(),
                     null,
                     draftReasoningSummary(current, currentUsageDurability),
                     current == null ? null : current.usage(),
@@ -1052,6 +1052,7 @@ final class AgentTurnExecution {
             ProviderRequestUsage committedUsage,
             String errorCode,
             String errorMessage) {
+        String partialText = target == TurnState.FAILED && summary != null ? summary.trim() : "";
         /* Provider 最后一次检查 Token 后，已持久化的取消声明仍可取得优先权。 */
         if (cancellation.isCancellationRequested()) {
             target = TurnState.CANCELLED;
@@ -1080,7 +1081,8 @@ final class AgentTurnExecution {
                 persistUsage,
                 committedUsage,
                 errorCode,
-                errorMessage);
+                errorMessage,
+                partialText);
     }
 
     /**

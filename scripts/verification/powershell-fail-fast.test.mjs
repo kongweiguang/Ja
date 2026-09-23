@@ -10,11 +10,19 @@ import test from "node:test";
 const WORKFLOW_PATH = resolve(".github/workflows/native-app-server.yml");
 const RELEASE_WORKFLOW_PATH = resolve(".github/workflows/release.yml");
 const ALL_SUCCESS_POWERSHELL_STEPS = [
-  "Run frontend type, lint, test, and build gates",
-  "Run repository architecture, attribution, and unused-code gates",
+  "Run fast frontend and architecture gates",
+  "Run Rust format gate",
+  "Run Node script tests",
   "Run the Rust workspace gates",
   "Run PowerShell script tests",
+  "Run frontend tests and Vite build",
+  "Restore verified native executable (Windows)",
 ];
+
+/** 统一 Windows CRLF 与仓库 LF，确保静态门禁在两类 checkout 中检查同一 workflow 结构。 */
+function readWorkflowText(path) {
+  return readFileSync(path, "utf8").replace(/\r\n/gu, "\n");
+}
 
 /**
  * Extract one workflow step without parsing arbitrary YAML so the regression stays dependency-free.
@@ -59,9 +67,9 @@ test(
   assertNativeFailureStopsImmediately,
 );
 
-/** Confirm bounded fail-fast gates and preserve the Rust workspace/all-targets coverage contract. */
+/** 确认拆分后的多命令 PowerShell 门禁都显式传播原生命令失败，并保留 Rust 全量覆盖。 */
 function assertAllSuccessGatesUseNativeFailFast() {
-  const source = readFileSync(WORKFLOW_PATH, "utf8");
+  const source = readWorkflowText(WORKFLOW_PATH);
   for (const name of ALL_SUCCESS_POWERSHELL_STEPS) {
     const body = workflowStepBody(source, name);
     assert.match(body, /\$ErrorActionPreference = 'Stop'/u);
@@ -77,15 +85,20 @@ test(
 );
 
 /**
- * 将不依赖 JVM、pnpm 或 Rust 的协议黄金测试固定在耗时验证之前，避免简单合同漂移被整条
- * 串行 CI 掩盖到最后才报告。
+ * 固定快速 job、前端 job 与合同/JVM/Rust job 的依赖顺序，避免脚本错误等到重编译后才暴露。
  */
-function assertProtocolPreflightRunsBeforeHeavyVerification() {
-  const source = readFileSync(WORKFLOW_PATH, "utf8");
+function assertFastChecksPrecedeHeavyVerification() {
+  const source = readWorkflowText(WORKFLOW_PATH);
+  const fastChecksJob = source.indexOf("  fast-checks:\n");
+  const frontendJob = source.indexOf("  frontend-verification:\n");
+  const verificationJob = source.indexOf("  fast-verification:\n");
+  const nativeJob = source.indexOf("  native-app-server:\n");
   const python = source.indexOf("      - name: Run Python script tests");
   const jvm = source.indexOf("      - name: Run JVM verification and build the Rust test fixture");
-  const frontend = source.indexOf("      - name: Run frontend type, lint, test, and build gates");
+  const frontend = source.indexOf("      - name: Run frontend tests and Vite build");
   const rust = source.indexOf("      - name: Run the Rust workspace gates");
+  assert.ok(fastChecksJob >= 0 && frontendJob > fastChecksJob && verificationJob > frontendJob);
+  assert.ok(nativeJob > verificationJob);
   assert.notEqual(python, -1, "Python protocol preflight is missing");
   assert.notEqual(jvm, -1, "JVM verification is missing");
   assert.notEqual(frontend, -1, "frontend verification is missing");
@@ -93,28 +106,45 @@ function assertProtocolPreflightRunsBeforeHeavyVerification() {
   assert.ok(python < jvm, "Python protocol preflight must run before JVM verification");
   assert.ok(python < frontend, "Python protocol preflight must run before frontend verification");
   assert.ok(python < rust, "Python protocol preflight must run before Rust verification");
+  assert.match(source, /needs: \[fast-checks, frontend-verification, fast-verification\]/u);
+  assert.match(
+    source,
+    /needs\.frontend-verification\.result == 'success'[\s\S]*needs\.fast-verification\.result == 'success'/u,
+  );
 }
 
 test(
-  "protocol golden preflight runs before heavyweight verification",
-  assertProtocolPreflightRunsBeforeHeavyVerification,
+  "fast checks run before heavyweight verification",
+  assertFastChecksPrecedeHeavyVerification,
 );
 
-/**
- * 发布只可复用同一 SHA 的完整 main CI 结论；调用方仍把签名、原生矩阵与 Draft 交给原有
- * 工作流，避免复制产物链后在两处维护不同的安全策略。
- */
+/** 发布只能复用同一 SHA 的成功 main CI 精简 artifact，并保留签名矩阵的真实后续门禁。 */
 function assertReleaseReusesOnlyVerifiedMainCandidates() {
-  const nativeWorkflow = readFileSync(WORKFLOW_PATH, "utf8");
-  const releaseWorkflow = readFileSync(RELEASE_WORKFLOW_PATH, "utf8");
+  const nativeWorkflow = readWorkflowText(WORKFLOW_PATH);
+  const releaseWorkflow = readWorkflowText(RELEASE_WORKFLOW_PATH);
   assert.match(nativeWorkflow, /workflow_call:\s+inputs:[\s\S]*?skip_verification:/u);
+  assert.match(nativeWorkflow, /verified_run_id:[\s\S]*?required: true[\s\S]*?type: string/u);
   assert.match(nativeWorkflow, /JA_SOURCE_COMMIT: \$\{\{ inputs\.source_commit \|\| github\.sha \}\}/u);
+  assert.match(nativeWorkflow, /actions\/download-artifact@[\da-f]+[\s\S]*?run-id: \$\{\{ inputs\.verified_run_id \}\}/u);
+  assert.match(nativeWorkflow, /github-token: \$\{\{ github\.token \}\}/u);
+  assert.match(nativeWorkflow, /restore-verified-native\.py[\s\S]*?--verified-run-id/u);
+  assert.match(nativeWorkflow, /name: ja-native-reuse-\$\{\{ matrix\.platform \}\}-\$\{\{ matrix\.arch \}\}/u);
+  assert.match(nativeWorkflow, /Build App Server Native Image \(Windows\)[\s\S]*?env\.JA_RELEASE != 'true'/u);
+  assert.match(nativeWorkflow, /Build App Server Native Image \(macOS\)[\s\S]*?env\.JA_RELEASE != 'true'/u);
   assert.match(releaseWorkflow, /git fetch origin main --depth=1/u);
   assert.match(releaseWorkflow, /actions\/workflows\/native-app-server\.yml\/runs\?event=push/u);
-  assert.match(releaseWorkflow, /select\(\.conclusion == "success"\)/u);
+  assert.match(releaseWorkflow, /select\(\.event == "push"[\s\S]*?\.conclusion == "success"\)/u);
+  assert.match(releaseWorkflow, /verified_run_id:/u);
+  assert.match(releaseWorkflow, /\.expired == false[\s\S]*?\.size_in_bytes/u);
+  assert.match(releaseWorkflow, /scripts\/release\/notes\/[\s\S]*?-s/u);
+  assert.match(releaseWorkflow, /pnpm version:check/u);
+  assert.match(releaseWorkflow, /TAURI_SIGNING_PRIVATE_KEY is missing/u);
+  assert.match(releaseWorkflow, /releases\?per_page=100/u);
+  assert.match(releaseWorkflow, /git ls-remote --refs origin/u);
   assert.match(releaseWorkflow, /uses: \.\/\.github\/workflows\/native-app-server\.yml/u);
   assert.match(releaseWorkflow, /release: true/u);
   assert.match(releaseWorkflow, /skip_verification: true/u);
+  assert.match(releaseWorkflow, /verified_run_id: \$\{\{ needs\.verify-release-candidate\.outputs\.verified_run_id \}\}/u);
 }
 
 test(

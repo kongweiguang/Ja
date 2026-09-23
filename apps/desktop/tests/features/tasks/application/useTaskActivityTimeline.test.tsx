@@ -90,6 +90,7 @@ function prepareSnapshot(
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: activities,
         goalActivities: [],
         nextCursor: null,

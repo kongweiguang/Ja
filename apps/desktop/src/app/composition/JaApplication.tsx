@@ -1757,6 +1757,8 @@ export function JaApplication({
                 // 两者都只投影到“最近对话”标题行，避免旧列表被临时占位替换或因空列表闪现。
                 workspace.busy || conversation.busy
               }
+              // 历史栏只展示前台目录错误；后台恢复诊断留在当前 Conversation 正文，避免双重 alert
+              // 和侧栏布局插入，同时不影响 historyBusy/newConversationDisabled。
               historyError={conversation.error}
               newConversationDisabled={!conversationScopeReady}
               projectBusy={

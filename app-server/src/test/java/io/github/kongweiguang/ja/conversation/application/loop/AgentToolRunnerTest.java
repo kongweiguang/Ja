@@ -301,7 +301,7 @@ final class AgentToolRunnerTest {
             broker.bindDecisionStore((approvalId, decision, resolvedAt) -> true);
             AgentToolRunner.Execution execution = new AgentToolRunner.Execution(
                     plan(tool), Map.of("edit", tool), scope,
-                    () -> new TurnEvent.Context("evt_cancel", "thr_test", "turn_test", 4, NOW),
+                    () -> new TurnEvent.Context("evt_cancel", "thr_test", "turn_test", 4, 0, NOW),
                     () -> cursor,
                     (target, event, facts, nextExecution) -> {
                         committedEvents.add(event);
@@ -359,7 +359,7 @@ final class AgentToolRunnerTest {
             broker.bindDecisionStore((approvalId, decision, resolvedAt) -> true);
             AgentToolRunner.Execution execution = new AgentToolRunner.Execution(
                     plan(tool), Map.of("edit", tool), scope,
-                    () -> new TurnEvent.Context("evt_cancel_cas", "thr_test", "turn_test", 4, NOW),
+                    () -> new TurnEvent.Context("evt_cancel_cas", "thr_test", "turn_test", 4, 0, NOW),
                     () -> cursor,
                     (target, event, facts, nextExecution) -> {
                         if (event instanceof TurnEvent.ApprovalRequested) {
@@ -433,7 +433,7 @@ final class AgentToolRunnerTest {
              AgentToolRunner runner = runner(broker)) {
             AgentToolRunner.Execution execution = new AgentToolRunner.Execution(
                     plan(tool), Map.of("edit", tool), CancellationToken.none(),
-                    () -> new TurnEvent.Context("evt_cas", "thr_test", "turn_test", 4, NOW),
+                    () -> new TurnEvent.Context("evt_cas", "thr_test", "turn_test", 4, 0, NOW),
                     () -> cursor,
                     (target, event, facts, nextExecution) -> {
                         if (event instanceof TurnEvent.ApprovalRequested) {
@@ -481,7 +481,7 @@ final class AgentToolRunnerTest {
             });
             AgentToolRunner.Execution resumed = new AgentToolRunner.Execution(
                     plan(tool), Map.of("edit", tool), CancellationToken.none(),
-                    () -> new TurnEvent.Context("evt_resume", "thr_test", "turn_test", 4, NOW),
+                    () -> new TurnEvent.Context("evt_resume", "thr_test", "turn_test", 4, 0, NOW),
                     () -> cursor,
                     (target, event, facts, nextExecution) -> {
                         durableState.set(target);
@@ -549,7 +549,7 @@ final class AgentToolRunnerTest {
              AgentToolRunner runner = runner(broker)) {
             AgentToolRunner.Execution resumed = new AgentToolRunner.Execution(
                     plan(tool), Map.of("edit", tool), CancellationToken.none(),
-                    () -> new TurnEvent.Context("evt_decided", "thr_test", "turn_test", 5, NOW),
+                    () -> new TurnEvent.Context("evt_decided", "thr_test", "turn_test", 5, 0, NOW),
                     () -> cursor,
                     (target, event, facts, nextExecution) -> {
                         if (target == TurnState.WAITING_APPROVAL) waitingTransitions.incrementAndGet();
@@ -676,7 +676,7 @@ final class AgentToolRunnerTest {
              AgentToolRunner runner = runner(broker, List.of(deny), List.of(observer))) {
             AgentToolRunner.Execution execution = new AgentToolRunner.Execution(
                     plan(tool), Map.of("edit", tool), CancellationToken.none(),
-                    () -> new TurnEvent.Context("evt_policy", "thr_test", "turn_test", 4, NOW),
+                    () -> new TurnEvent.Context("evt_policy", "thr_test", "turn_test", 4, 0, NOW),
                     () -> cursor, (target, event, facts, next) -> commits.add(List.copyOf(facts)),
                     callId -> Optional.empty(),
                     callId -> Optional.of(binding(callId, AccessMode.FULL_ACCESS)),
@@ -863,7 +863,7 @@ final class AgentToolRunnerTest {
         TurnExecutionState.Tools cursor = new TurnExecutionState.Tools(
                 execution("cfg_test").common(), "batch_fixture", "item_assistant", 0, 0, 0);
         return new AgentToolRunner.Execution(plan, catalog, CancellationToken.none(),
-                () -> new TurnEvent.Context("evt_observed", "thr_test", "turn_test", 4, NOW),
+                () -> new TurnEvent.Context("evt_observed", "thr_test", "turn_test", 4, 0, NOW),
                 () -> cursor, writer, callId -> Optional.empty(),
                 callId -> Optional.of(binding(callId, AccessMode.FULL_ACCESS)), () -> { },
                 (approvalId, decision) -> { },
@@ -878,7 +878,7 @@ final class AgentToolRunnerTest {
         TurnExecutionState.Tools cursor = new TurnExecutionState.Tools(
                 execution("cfg_test").common(), "batch_fixture", "item_assistant", 0, 0, 0);
         return new AgentToolRunner.Execution(plan, catalog, CancellationToken.none(),
-                () -> new TurnEvent.Context("evt_discovery_approval", "thr_test", "turn_test", 4, NOW),
+                () -> new TurnEvent.Context("evt_discovery_approval", "thr_test", "turn_test", 4, 0, NOW),
                 () -> cursor, writer, callId -> Optional.empty(),
                 callId -> Optional.ofNullable(bindings.get(callId)), () -> { },
                 (approvalId, decision) -> { });

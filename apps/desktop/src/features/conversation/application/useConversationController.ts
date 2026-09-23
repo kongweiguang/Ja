@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { WorkspaceProjection } from "@/features/workspace";
-import { useTimelineStore } from "./timelineStore";
+import { useTimelineStore, type TimelineRecoveryToken } from "./timelineStore";
 import type {
   ConversationCompactionResult,
   ConversationHistoryPort,
@@ -19,7 +19,68 @@ import type { TimelineEvent, TimelineSnapshot } from "../domain/timelineContract
 const MAX_RECENT_THREADS = 100;
 const MAX_WORKSPACE_HISTORY_CACHES = 8;
 const MAX_THREAD_SNAPSHOT_PAGES = 128;
+const MAX_THREAD_SNAPSHOT_READ_ATTEMPTS = 3;
+const AUTOMATIC_RESYNC_INITIAL_DELAY_MS = 500;
+const AUTOMATIC_RESYNC_MAX_DELAY_MS = 5_000;
 const EMPTY_CONVERSATION_THREADS: ConversationThread[] = [];
+
+/** thread/read 的本地 fence 绑定请求发出时已确认的 workspace、generation 和 server instance。 */
+interface ThreadSnapshotReadFence {
+  workspaceId: string;
+  generation: number;
+  serverInstanceId: string;
+}
+
+/** 后台恢复诊断必须绑定当前可见 scope，避免旧 Thread 的失败提示穿透切换后的会话。 */
+interface BackgroundRecoveryError {
+  scope: string;
+  message: string;
+}
+
+/** 分页 revision 变化属于可重试的取样撕裂，不允许把不同提交边界拼成一份快照。 */
+class SnapshotRevisionChangedError extends Error {
+  /** 用稳定错误类型区分分页取样撕裂，使调用方只重试 revision 变化而不重试协议损坏。 */
+  constructor() {
+    super("thread snapshot revision changed during pagination");
+    this.name = "SnapshotRevisionChangedError";
+  }
+}
+
+/**
+ * 目录响应只在 revision 严格前进时覆盖已有行；同 revision 的迟到响应视为重复取样，保留
+ * 当前对象，避免旧标题、seen 或 preferences 在 ACK 后倒退。该 helper 只合并单行事件，
+ * 不改变服务端列表的排序与 workspace 过滤边界。
+ */
+function mergeThreadProjection(
+  current: readonly ConversationThread[],
+  incoming: ConversationThread,
+): ConversationThread[] {
+  const index = current.findIndex((thread) => thread.threadId === incoming.threadId);
+  if (index < 0) return [...current, incoming];
+  const existing = current[index];
+  if (existing === undefined || incoming.revision <= existing.revision) return [...current];
+  return current.map((thread, threadIndex) => (threadIndex === index ? incoming : thread));
+}
+
+/** 自动恢复只使用 0.5s/1s/2s/5s 阶梯，避免连续失败把 UI 变成不可预测的轮询。 */
+function nextAutomaticResyncDelay(delayMs: number): number {
+  if (delayMs <= AUTOMATIC_RESYNC_INITIAL_DELAY_MS) return 1_000;
+  if (delayMs <= 1_000) return 2_000;
+  return AUTOMATIC_RESYNC_MAX_DELAY_MS;
+}
+
+/** 只有明确缺失 baseline 的 gap/terminal 情况才开启 recovery buffer；健康对账保留 live Draft。 */
+function requiresSnapshotBaseline(reason: string): boolean {
+  return new Set([
+    "gap",
+    "terminal_missing",
+    "projection_fault",
+    "snapshot_invalid",
+    "server_instance_changed",
+    "handshake_required",
+    "handshake_failed",
+  ]).has(reason);
+}
 
 interface WorkspaceHistoryCache {
   threads: ConversationThread[];
@@ -45,6 +106,8 @@ export interface ConversationController {
   currentThreadId: string | undefined;
   busy: boolean;
   error: string | undefined;
+  /** 后台恢复诊断独立于前台加载错误，避免健康对账抢占新建/Composer 的用户反馈。 */
+  backgroundError: string | undefined;
   mutatingThreadIds: readonly string[];
   compaction: ConversationCompactionView;
   canCompact: boolean;
@@ -151,18 +214,32 @@ function mergeThreadListResponse(
   issuedEpoch: number,
   localCreationEpochs: ReadonlyMap<string, { workspaceId: string; epoch: number }>,
 ): ConversationThread[] {
-  const authoritativeIds = new Set(scoped.map((thread) => thread.threadId));
-  const createdAfterRequest = current.filter((thread) => {
-    const creation = localCreationEpochs.get(thread.threadId);
-    return (
-      thread.workspaceId === workspaceId &&
-      thread.status === "active" &&
-      !authoritativeIds.has(thread.threadId) &&
+  const currentById = new Map(
+    current
+      .filter((thread) => thread.workspaceId === workspaceId && thread.status === "active")
+      .map((thread) => [thread.threadId, thread]),
+  );
+  const merged: ConversationThread[] = [];
+  for (const incoming of scoped) {
+    if (incoming.workspaceId !== workspaceId || incoming.status !== "active") continue;
+    const existing = currentById.get(incoming.threadId);
+    // 同 revision 可能只是迟到的 list/page 响应；只接受严格前进，避免元数据倒退。
+    merged.push(
+      existing !== undefined && existing.revision >= incoming.revision ? existing : incoming,
+    );
+    currentById.delete(incoming.threadId);
+  }
+  for (const existing of currentById.values()) {
+    // 只有请求发出后由 create ACK 产生的行可暂时脱离 list；归档/删除等权威目录结果仍可移除旧行。
+    const creation = localCreationEpochs.get(existing.threadId);
+    if (
+      existing.status === "active" &&
       creation?.workspaceId === workspaceId &&
       creation.epoch > issuedEpoch
-    );
-  });
-  return workspaceThreads(workspaceId, [...createdAfterRequest, ...scoped]);
+    )
+      merged.unshift(existing);
+  }
+  return workspaceThreads(workspaceId, merged);
 }
 
 /**
@@ -177,7 +254,7 @@ function mergeSearchThreads(
   const byId = new Map(matches.map((thread) => [thread.threadId, thread]));
   const merged = current.map((thread) => {
     const match = byId.get(thread.threadId);
-    return match !== undefined && match.revision >= thread.revision ? match : thread;
+    return match !== undefined && match.revision > thread.revision ? match : thread;
   });
   const existing = new Set(merged.map((thread) => thread.threadId));
   for (const thread of matches) {
@@ -243,13 +320,15 @@ export function useConversationController({
   const [currentThreadId, setCurrentThreadId] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [backgroundError, setBackgroundError] = useState<BackgroundRecoveryError>();
   const [mutatingThreadIds, setMutatingThreadIds] = useState<readonly string[]>([]);
   const [compaction, setCompaction] = useState<ConversationCompactionView>({
     phase: "idle",
     retryable: false,
   });
   const mountedRef = useRef(false);
-  const requestRef = useRef(0);
+  // 前台加载/选择/创建的 fence 与后台恢复完全分离；后台 read 不能令前台 finally 失效或清除 busy。
+  const foregroundRequestRef = useRef(0);
   const compactionRequestRef = useRef(0);
   const compactionInFlightRef = useRef(false);
   const creationInFlightRef = useRef<Promise<void> | undefined>(undefined);
@@ -269,13 +348,15 @@ export function useConversationController({
   const automaticResyncAttemptRef = useRef<string | undefined>(undefined);
   const automaticResyncInFlightRef = useRef(new Set<string>());
   const automaticResyncRetryTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const automaticResyncRetryDelayRef = useRef(new Map<string, number>());
+  const automaticResyncRequestRef = useRef(0);
+  const automaticResyncRecoveryTokenRef = useRef(new Map<string, TimelineRecoveryToken>());
+  const automaticResyncActiveRequestRef = useRef(new Map<string, number>());
+  const automaticResyncScopeRef = useRef<string | undefined>(undefined);
   const manualWorkspaceTargetRef = useRef<string | undefined>(undefined);
   const manualThreadTargetRef = useRef<string | undefined>(undefined);
   const currentThreadIdRef = useRef(currentThreadId);
   const threadsRef = useRef(threads);
-  const latestTurnProjectionRef = useRef(
-    new Map<string, { turnId: string; status: ConversationThread["latestTurnStatus"] }>(),
-  );
   const seenAttemptKeysRef = useRef(new Set<string>());
   const historyRuntimeAdmission =
     runtimeState !== undefined && ["ready", "busy"].includes(runtimeState.status)
@@ -324,18 +405,63 @@ export function useConversationController({
     const status = state.turns[latestTurnId]?.status;
     return status === "completed" || status === "failed" ? `${latestTurnId}:${status}` : undefined;
   });
+  const currentLatestTurnStatus = useTimelineStore((state) => {
+    if (currentThreadId === undefined) return undefined;
+    const latestTurnId = state.threads[currentThreadId]?.latestTurnId;
+    return latestTurnId === undefined ? undefined : state.turns[latestTurnId]?.status;
+  });
+  const currentTimelineThreadRevision = useTimelineStore((state) => {
+    if (currentThreadId === undefined) return undefined;
+    const latestTurnId = state.threads[currentThreadId]?.latestTurnId;
+    return latestTurnId === undefined ? undefined : state.turns[latestTurnId]?.threadRevision;
+  });
+  // generation/server identity 是自动恢复的生命周期边界；即使 resync reason 不变，代际变化也
+  // 必须立即让旧 read 失效，避免旧 runtime 的 promise 占住新 runtime 的 single-flight。
+  const currentTimelineFence = useTimelineStore(
+    (state) => `${state.handshake.generation}:${state.serverInstanceId ?? ""}`,
+  );
+  // 与自动对账共用同一 scope key；渲染阶段即可隐藏旧错误，effect 再清理其 state，避免切换首帧污染。
+  const backgroundErrorScope = `${workspace?.workspaceId ?? "none"}:${currentTimelineFence}:${currentThreadId ?? "none"}`;
 
   /**
-   * 判断异步历史结果是否仍属于当前 workspace 和最新 request；workspace 切换、卸载或
+   * 判断前台历史结果是否仍属于当前 workspace 和最新 request；workspace 切换、卸载或
    * 后续用户选择都会让旧 continuation 失效。
    */
   const isCurrentRequest = useCallback(
     (request: number, workspaceId: string): boolean =>
       mountedRef.current &&
-      requestRef.current === request &&
+      foregroundRequestRef.current === request &&
       workspaceRef.current?.workspaceId === workspaceId,
     [],
   );
+
+  /** 取消指定 recovery token；epoch 比对保证旧 read finally 不会删除后来建立的同 Thread 窗口。 */
+  const cancelAutomaticRecovery = useCallback((threadId: string, requestEpoch: number): void => {
+    const current = automaticResyncRecoveryTokenRef.current.get(threadId);
+    if (current?.requestEpoch !== requestEpoch) return;
+    useTimelineStore.getState().cancelRecovery(current);
+    automaticResyncRecoveryTokenRef.current.delete(threadId);
+    if (automaticResyncActiveRequestRef.current.get(threadId) === requestEpoch) {
+      automaticResyncActiveRequestRef.current.delete(threadId);
+      automaticResyncInFlightRef.current.delete(threadId);
+    }
+  }, []);
+
+  /** 捕获 thread/read 发起时的 runtime identity；完成前 generation/server instance 变化即丢弃结果。 */
+  const captureSnapshotReadFence = useCallback((workspaceId: string): ThreadSnapshotReadFence => {
+    const state = useTimelineStore.getState();
+    if (
+      state.handshake.phase !== "ready" ||
+      state.handshake.generation <= 0 ||
+      state.serverInstanceId === undefined
+    )
+      throw new Error("thread snapshot runtime is not ready");
+    return {
+      workspaceId,
+      generation: state.handshake.generation,
+      serverInstanceId: state.serverInstanceId,
+    };
+  }, []);
 
   /**
    * snapshot 只有在当前 ready generation 下才进入 timeline reducer；同时校验 threadId，
@@ -363,41 +489,73 @@ export function useConversationController({
   );
 
   /**
-   * 将 thread/read 的 keyset 页面收敛成一个完整快照；恢复路径不能把带 nextCursor 的半页
-   * 当作失败，否则长对话在一次事件丢失后会永久停在“无法自动恢复”。页面数量有界，防止
-   * 服务端游标异常或历史规模失控把恢复请求变成无限 IO；每页的最新 Turn/Usage 元数据
-   * 作为最终投影，正文条目按服务端顺序保留并以 itemId 去重。
+   * 校验 read continuation 仍属于发起时的 runtime；切换 workspace/generation 或 server instance
+   * 后，旧 promise 只能失败退出，不能把同名 Thread 的历史投影写回当前 Timeline。
+   */
+  const assertSnapshotReadFence = useCallback((fence: ThreadSnapshotReadFence): void => {
+    const state = useTimelineStore.getState();
+    if (
+      !mountedRef.current ||
+      workspaceRef.current?.workspaceId !== fence.workspaceId ||
+      state.handshake.phase !== "ready" ||
+      state.handshake.generation !== fence.generation ||
+      state.serverInstanceId !== fence.serverInstanceId
+    )
+      throw new Error("thread snapshot runtime fence changed");
+  }, []);
+
+  /**
+   * 将 thread/read 的 keyset 页面收敛成一个完整快照。所有页面必须属于同一 revision；若服务端
+   * 在分页期间提交了新 revision，则从第一页重新取样，最多三次，绝不把不同提交边界拼接到 UI。
    */
   const readCompleteThreadSnapshot = useCallback(
-    async (threadId: string): Promise<TimelineSnapshot> => {
-      let cursor: string | undefined;
-      const items = new Map<
-        TimelineSnapshot["items"][number]["itemId"],
-        TimelineSnapshot["items"][number]
-      >();
-      const cursors = new Set<string>();
-      for (let page = 0; page < MAX_THREAD_SNAPSHOT_PAGES; page += 1) {
-        const snapshot = await history.threadRead({
-          threadId,
-          ...(cursor === undefined ? {} : { cursor }),
-        });
-        if (snapshot.threadId !== threadId) throw new Error("thread snapshot identity changed");
-        for (const item of snapshot.items) {
-          const previous = items.get(item.itemId);
-          if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(item))
-            throw new Error("thread snapshot contains conflicting items");
-          items.set(item.itemId, item);
+    async (threadId: string, fence?: ThreadSnapshotReadFence): Promise<TimelineSnapshot> => {
+      for (let attempt = 0; attempt < MAX_THREAD_SNAPSHOT_READ_ATTEMPTS; attempt += 1) {
+        try {
+          let cursor: string | undefined;
+          let snapshotRevision: number | undefined;
+          const items = new Map<
+            TimelineSnapshot["items"][number]["itemId"],
+            TimelineSnapshot["items"][number]
+          >();
+          const cursors = new Set<string>();
+          for (let page = 0; page < MAX_THREAD_SNAPSHOT_PAGES; page += 1) {
+            if (fence !== undefined) assertSnapshotReadFence(fence);
+            const snapshot = await history.threadRead({
+              threadId,
+              ...(cursor === undefined ? {} : { cursor }),
+            });
+            if (fence !== undefined) assertSnapshotReadFence(fence);
+            if (snapshot.threadId !== threadId) throw new Error("thread snapshot identity changed");
+            snapshotRevision ??= snapshot.revision;
+            if (snapshot.revision !== snapshotRevision) throw new SnapshotRevisionChangedError();
+            for (const item of snapshot.items) {
+              const previous = items.get(item.itemId);
+              if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(item))
+                throw new Error("thread snapshot contains conflicting items");
+              items.set(item.itemId, item);
+            }
+            if (snapshot.nextCursor === null) {
+              return {
+                ...snapshot,
+                items: [...items.values()],
+                nextCursor: null,
+              };
+            }
+            if (cursors.has(snapshot.nextCursor))
+              throw new Error("thread snapshot cursor repeated");
+            cursors.add(snapshot.nextCursor);
+            cursor = snapshot.nextCursor;
+          }
+          throw new Error("thread snapshot exceeds recovery page budget");
+        } catch (error) {
+          if (!(error instanceof SnapshotRevisionChangedError)) throw error;
+          if (attempt + 1 >= MAX_THREAD_SNAPSHOT_READ_ATTEMPTS) throw error;
         }
-        if (snapshot.nextCursor === null) {
-          return { ...snapshot, items: [...items.values()], nextCursor: null };
-        }
-        if (cursors.has(snapshot.nextCursor)) throw new Error("thread snapshot cursor repeated");
-        cursors.add(snapshot.nextCursor);
-        cursor = snapshot.nextCursor;
       }
-      throw new Error("thread snapshot exceeds recovery page budget");
+      throw new Error("thread snapshot read attempts exhausted");
     },
-    [history],
+    [assertSnapshotReadFence, history],
   );
 
   /**
@@ -474,6 +632,7 @@ export function useConversationController({
       request: number,
     ): Promise<ConversationThread | undefined> => {
       if (selection === undefined) return undefined;
+      const fence = captureSnapshotReadFence(selected.workspaceId);
       const created = await history.threadCreate({
         ...(selected.kind === "project" ? { cwd: selected.rootPath } : {}),
         title: "新对话",
@@ -492,14 +651,20 @@ export function useConversationController({
         created.preferences.modelId !== selection.modelId
       )
         throw new Error("created thread belongs to another model selection");
-      const snapshot = await readCompleteThreadSnapshot(created.threadId);
+      const snapshot = await readCompleteThreadSnapshot(created.threadId, fence);
       if (!isCurrentRequest(request, selected.workspaceId)) return undefined;
       if (!applySnapshot(snapshot, selected.workspaceId, created.threadId)) {
         throw new Error("created thread snapshot was not applied");
       }
       return created;
     },
-    [applySnapshot, history, isCurrentRequest, readCompleteThreadSnapshot],
+    [
+      applySnapshot,
+      captureSnapshotReadFence,
+      history,
+      isCurrentRequest,
+      readCompleteThreadSnapshot,
+    ],
   );
 
   /**
@@ -512,8 +677,8 @@ export function useConversationController({
       selection: ConversationModelSelection | undefined,
       preferredThreadId: string | undefined,
     ): Promise<void> => {
-      const request = requestRef.current + 1;
-      requestRef.current = request;
+      const request = foregroundRequestRef.current + 1;
+      foregroundRequestRef.current = request;
       setBusy(true);
       setError(undefined);
       try {
@@ -541,12 +706,16 @@ export function useConversationController({
             loadedRevision >= first.revision
           )
             return;
-          const snapshot = await readCompleteThreadSnapshot(first.threadId);
+          const snapshot = await readCompleteThreadSnapshot(
+            first.threadId,
+            captureSnapshotReadFence(selected.workspaceId),
+          );
           if (!isCurrentRequest(request, selected.workspaceId)) return;
           if (!applySnapshot(snapshot, selected.workspaceId, first.threadId)) {
             setError("最近的会话无法恢复，请重新选择项目。 ");
             return;
           }
+          setBackgroundError(undefined);
           currentThreadIdRef.current = first.threadId;
           setCurrentThreadId(first.threadId);
           return;
@@ -565,7 +734,14 @@ export function useConversationController({
         if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
       }
     },
-    [applySnapshot, createAndRestore, history, isCurrentRequest, readCompleteThreadSnapshot],
+    [
+      applySnapshot,
+      captureSnapshotReadFence,
+      createAndRestore,
+      history,
+      isCurrentRequest,
+      readCompleteThreadSnapshot,
+    ],
   );
 
   /**
@@ -576,8 +752,8 @@ export function useConversationController({
     async (selection: ConversationModelSelection): Promise<void> => {
       const selected = workspaceRef.current;
       if (selected === undefined) return;
-      const request = requestRef.current + 1;
-      requestRef.current = request;
+      const request = foregroundRequestRef.current + 1;
+      foregroundRequestRef.current = request;
       setBusy(true);
       setError(undefined);
       try {
@@ -655,12 +831,13 @@ export function useConversationController({
           return;
         }
       }
-      const request = requestRef.current + 1;
-      requestRef.current = request;
+      const request = foregroundRequestRef.current + 1;
+      foregroundRequestRef.current = request;
       setError(undefined);
       const requiresSnapshot = !canReuseLoadedThread(threadId, selected.workspaceId);
       if (!requiresSnapshot) {
         setBusy(false);
+        setBackgroundError(undefined);
         if (currentThreadIdRef.current !== threadId) {
           setThreads((current) =>
             workspaceThreads(
@@ -676,12 +853,16 @@ export function useConversationController({
       }
       setBusy(true);
       try {
-        const snapshot = await readCompleteThreadSnapshot(threadId);
+        const snapshot = await readCompleteThreadSnapshot(
+          threadId,
+          captureSnapshotReadFence(selected.workspaceId),
+        );
         if (!isCurrentRequest(request, selected.workspaceId)) return;
         if (!applySnapshot(snapshot, selected.workspaceId, threadId)) {
           setError("会话无法恢复，请重新选择项目。 ");
           return;
         }
+        setBackgroundError(undefined);
         if (!isCurrentRequest(request, selected.workspaceId)) return;
         setThreads((current) =>
           workspaceThreads(
@@ -699,7 +880,13 @@ export function useConversationController({
         if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
       }
     },
-    [activateWorkspace, applySnapshot, isCurrentRequest, readCompleteThreadSnapshot],
+    [
+      activateWorkspace,
+      applySnapshot,
+      captureSnapshotReadFence,
+      isCurrentRequest,
+      readCompleteThreadSnapshot,
+    ],
   );
 
   /**
@@ -753,17 +940,24 @@ export function useConversationController({
     });
   }, []);
 
-  /** CONFLICT 后只重读一次权威 revision；调用者随后最多重放一次同一显式意图。 */
+  /**
+   * CONFLICT 后读取同一提交边界的完整快照；虽然调用者只需要 revision，当前 Thread 仍可能
+   * 应用这次快照，不能用 limit:1 的半快照擦除已经显示的正文或破坏 Timeline key 稳定性。
+   */
   const rereadThreadRevision = useCallback(
     async (threadId: string): Promise<number> => {
-      const snapshot = await history.threadRead({ threadId, limit: 1 });
       const selected = workspaceRef.current;
+      const fence =
+        selected === undefined ? undefined : captureSnapshotReadFence(selected.workspaceId);
+      if (fence !== undefined) assertSnapshotReadFence(fence);
+      const snapshot = await readCompleteThreadSnapshot(threadId, fence);
+      if (fence !== undefined) assertSnapshotReadFence(fence);
       if (selected !== undefined && currentThreadIdRef.current === threadId) {
         applySnapshot(snapshot, selected.workspaceId, threadId);
       }
       return snapshot.revision;
     },
-    [applySnapshot, history],
+    [applySnapshot, assertSnapshotReadFence, captureSnapshotReadFence, readCompleteThreadSnapshot],
   );
 
   /** 目录类 CAS 只允许一次权威重读和有界重试，持续竞争会原样失败给 UI。 */
@@ -799,7 +993,7 @@ export function useConversationController({
         );
         if (mountedRef.current) {
           setThreads((current) => {
-            const next = current.map((thread) => (thread.threadId === threadId ? seen : thread));
+            const next = mergeThreadProjection(current, seen);
             threadsRef.current = next;
             return next;
           });
@@ -912,9 +1106,7 @@ export function useConversationController({
         await refreshActiveThreads();
         if (open) {
           setThreads((current) => {
-            const next = current.some((thread) => thread.threadId === threadId)
-              ? current.map((thread) => (thread.threadId === threadId ? restored : thread))
-              : [restored, ...current];
+            const next = mergeThreadProjection(current, restored);
             threadsRef.current = next;
             return next;
           });
@@ -955,7 +1147,7 @@ export function useConversationController({
         });
         if (!mountedRef.current) return;
         setThreads((current) => {
-          const next = current.map((thread) => (thread.threadId === threadId ? renamed : thread));
+          const next = mergeThreadProjection(current, renamed);
           threadsRef.current = next;
           return next;
         });
@@ -1001,7 +1193,10 @@ export function useConversationController({
           if (compactionErrorCode(failure) !== "CONFLICT") throw failure;
           const selected = workspaceRef.current;
           if (selected === undefined || currentThreadIdRef.current !== threadId) throw failure;
-          const snapshot = await readCompleteThreadSnapshot(threadId);
+          const snapshot = await readCompleteThreadSnapshot(
+            threadId,
+            captureSnapshotReadFence(selected.workspaceId),
+          );
           if (
             !mountedRef.current ||
             currentThreadIdRef.current !== threadId ||
@@ -1016,7 +1211,7 @@ export function useConversationController({
         }
         if (!mountedRef.current || currentThreadIdRef.current !== threadId) return;
         setThreads((current) => {
-          const next = current.map((thread) => (thread.threadId === threadId ? updated : thread));
+          const next = mergeThreadProjection(current, updated);
           threadsRef.current = next;
           return next;
         });
@@ -1024,7 +1219,7 @@ export function useConversationController({
         threadMutationGuardsRef.current.delete(guard);
       }
     },
-    [applySnapshot, history, readCompleteThreadSnapshot, threadRevision],
+    [applySnapshot, captureSnapshotReadFence, history, readCompleteThreadSnapshot, threadRevision],
   );
 
   /**
@@ -1082,7 +1277,10 @@ export function useConversationController({
         const selected = workspaceRef.current;
         if (selected !== undefined) {
           try {
-            const snapshot = await readCompleteThreadSnapshot(threadId);
+            const snapshot = await readCompleteThreadSnapshot(
+              threadId,
+              captureSnapshotReadFence(selected.workspaceId),
+            );
             if (
               mountedRef.current &&
               compactionRequestRef.current === request &&
@@ -1102,6 +1300,7 @@ export function useConversationController({
   }, [
     activeTurnPresent,
     applySnapshot,
+    captureSnapshotReadFence,
     compaction.phase,
     history,
     readCompleteThreadSnapshot,
@@ -1116,22 +1315,30 @@ export function useConversationController({
   /** 挂载 fence 统一阻止晚到 history promise 写入已卸载 controller。 */
   useEffect(() => {
     const threadMutationGuards = threadMutationGuardsRef.current;
-    const latestTurnProjections = latestTurnProjectionRef.current;
     const seenAttemptKeys = seenAttemptKeysRef.current;
     const automaticResyncRetryTimers = automaticResyncRetryTimersRef.current;
     const automaticResyncInFlight = automaticResyncInFlightRef.current;
+    const automaticResyncRetryDelays = automaticResyncRetryDelayRef.current;
+    const automaticResyncRecoveryTokens = automaticResyncRecoveryTokenRef.current;
+    const automaticResyncActiveRequests = automaticResyncActiveRequestRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      requestRef.current += 1;
+      foregroundRequestRef.current += 1;
+      automaticResyncRequestRef.current += 1;
       compactionRequestRef.current += 1;
       compactionInFlightRef.current = false;
       threadMutationGuards.clear();
-      latestTurnProjections.clear();
       seenAttemptKeys.clear();
       for (const timer of automaticResyncRetryTimers.values()) clearTimeout(timer);
       automaticResyncRetryTimers.clear();
+      automaticResyncRetryDelays.clear();
       automaticResyncInFlight.clear();
+      for (const token of automaticResyncRecoveryTokens.values())
+        useTimelineStore.getState().cancelRecovery(token);
+      automaticResyncRecoveryTokens.clear();
+      automaticResyncActiveRequests.clear();
+      automaticResyncScopeRef.current = undefined;
     };
   }, []);
 
@@ -1225,56 +1432,22 @@ export function useConversationController({
   }, [history, metadataEvent]);
 
   /**
-   * 仅在 latest Turn identity/status 转换时覆盖目录状态；selector 的稳定字符串让正文与 Tool
-   * delta 保持同值，不会触发整栏 React 更新。
-   */
-  useEffect(() => {
-    if (timelineStatusSignature === "") return;
-    const timeline = useTimelineStore.getState();
-    setThreads((current) => {
-      let changed = false;
-      const next = current.map((thread) => {
-        const projection = timeline.threads[thread.threadId];
-        if (projection === undefined) return thread;
-        const latestTurnId = projection.latestTurnId;
-        const status =
-          latestTurnId === undefined ? null : (timeline.turns[latestTurnId]?.status ?? null);
-        const previous = latestTurnProjectionRef.current.get(thread.threadId);
-        if (latestTurnId !== undefined) {
-          latestTurnProjectionRef.current.set(thread.threadId, { turnId: latestTurnId, status });
-        }
-        const newlyTerminal =
-          latestTurnId !== undefined &&
-          (status === "completed" || status === "failed") &&
-          (previous === undefined
-            ? thread.latestTurnStatus !== status
-            : previous.turnId !== latestTurnId ||
-              (previous.status !== "completed" && previous.status !== "failed"));
-        if (thread.latestTurnStatus === status && !newlyTerminal) return thread;
-        changed = true;
-        return {
-          ...thread,
-          latestTurnStatus: status,
-          latestTurnSeen: newlyTerminal ? false : thread.latestTurnSeen,
-        };
-      });
-      if (!changed) return current;
-      threadsRef.current = next;
-      return next;
-    });
-  }, [timelineStatusSignature]);
-
-  /**
    * Effect 发生在当前 Timeline 与侧栏终态提醒完成 commit 之后，因此 only-current 会话才会
    * 确认 seen；非活动会话保留未读标记，实时 queued/running/approval/suspended 不受影响。
    */
   useEffect(() => {
     if (currentThreadId === undefined || currentLatestTerminalKey === undefined) return;
     const thread = threads.find((candidate) => candidate.threadId === currentThreadId);
+    const directoryCoversTerminal =
+      thread !== undefined &&
+      thread.latestTurnSeen &&
+      thread.latestTurnStatus === currentLatestTurnStatus &&
+      (currentTimelineThreadRevision === undefined ||
+        currentTimelineThreadRevision <= thread.revision);
     if (
       thread === undefined ||
-      thread.latestTurnSeen ||
-      (thread.latestTurnStatus !== "completed" && thread.latestTurnStatus !== "failed")
+      directoryCoversTerminal ||
+      (currentLatestTurnStatus !== "completed" && currentLatestTurnStatus !== "failed")
     )
       return;
     const attemptKey = `${currentThreadId}:${currentLatestTerminalKey}`;
@@ -1284,7 +1457,14 @@ export function useConversationController({
       // 只释放失败的精确 terminal identity；成功键继续去重，避免无关重渲染重复确认已读。
       if (!succeeded) seenAttemptKeysRef.current.delete(attemptKey);
     });
-  }, [currentLatestTerminalKey, currentThreadId, markLatestTurnSeen, threads]);
+  }, [
+    currentLatestTerminalKey,
+    currentLatestTurnStatus,
+    currentTimelineThreadRevision,
+    currentThreadId,
+    markLatestTurnSeen,
+    threads,
+  ]);
 
   /** 统一消费自动与手动 Context event；命令响应只在 event 尚未到达时提供同口径反馈。 */
   useEffect(() => {
@@ -1372,11 +1552,11 @@ export function useConversationController({
     if (historyRuntimeAdmission !== undefined)
       historyRuntimeAdmissionRef.current = historyRuntimeAdmission;
     historyWorkspaceIdRef.current = nextWorkspaceId;
-    requestRef.current += 1;
+    foregroundRequestRef.current += 1;
     setError(undefined);
+    setBackgroundError(undefined);
     if (workspaceChanged || firstWorkspaceAdmission || runtimeAdmissionChanged) {
       setCompaction({ phase: "idle", retryable: false });
-      latestTurnProjectionRef.current.clear();
       seenAttemptKeysRef.current.clear();
       const cached =
         nextWorkspaceId === undefined || runtimeAdmissionChanged
@@ -1428,13 +1608,40 @@ export function useConversationController({
 
   /**
    * timeline 出现 gap、恢复 active Turn 或 terminal 需要补齐 ChangeSet 时，同一 Thread 同时只
-   * 保留一个 thread/read；失败按固定短退避重新发起，成功仍由 snapshot 清除 resync 标记。
+   * 保留一个 thread/read。该后台对账拥有独立 request epoch，不参与 foreground busy/focus，健康
+   * 快照走普通 applySnapshot，真实 gap 才交给 Timeline recovery buffer 原子提交并重放 live event。
    */
   useEffect(() => {
+    const automaticResyncScope = backgroundErrorScope;
+    if (automaticResyncScopeRef.current !== automaticResyncScope) {
+      // Thread、workspace 或 runtime 代际任一变化都使旧 continuation 失效；清理 health 请求
+      // 的 in-flight 标记同样重要，否则切回同一 Thread 时会被旧 promise 长时间挡住。
+      automaticResyncScopeRef.current = automaticResyncScope;
+      // 错误只属于旧 scope；成功切换 Thread、workspace 或 runtime 代际后立即隐藏它。
+      setBackgroundError(undefined);
+      automaticResyncRequestRef.current += 1;
+      automaticResyncAttemptRef.current = undefined;
+      for (const [threadId, requestEpoch] of automaticResyncActiveRequestRef.current) {
+        const token = automaticResyncRecoveryTokenRef.current.get(threadId);
+        if (token?.requestEpoch === requestEpoch) useTimelineStore.getState().cancelRecovery(token);
+        automaticResyncRecoveryTokenRef.current.delete(threadId);
+        automaticResyncActiveRequestRef.current.delete(threadId);
+        automaticResyncInFlightRef.current.delete(threadId);
+      }
+      for (const timer of automaticResyncRetryTimersRef.current.values()) clearTimeout(timer);
+      automaticResyncRetryTimersRef.current.clear();
+      automaticResyncRetryDelayRef.current.clear();
+    }
     for (const [threadId, timer] of automaticResyncRetryTimersRef.current) {
       if (threadId !== currentThreadId) {
         clearTimeout(timer);
         automaticResyncRetryTimersRef.current.delete(threadId);
+        automaticResyncRetryDelayRef.current.delete(threadId);
+      }
+    }
+    for (const [threadId, token] of automaticResyncRecoveryTokenRef.current) {
+      if (threadId !== currentThreadId || workspace === undefined) {
+        cancelAutomaticRecovery(threadId, token.requestEpoch);
       }
     }
     if (
@@ -1459,70 +1666,114 @@ export function useConversationController({
     if (automaticResyncAttemptRef.current === key) return;
     automaticResyncAttemptRef.current = key;
     automaticResyncInFlightRef.current.add(currentThreadId);
-    const resyncGeneration = timeline.handshake.generation;
     const retryThreadId = currentThreadId;
     const retryWorkspaceId = workspace.workspaceId;
-    const request = requestRef.current + 1;
-    requestRef.current = request;
-    setBusy(true);
-    setError(undefined);
+    const request = automaticResyncRequestRef.current + 1;
+    automaticResyncRequestRef.current = request;
+    automaticResyncActiveRequestRef.current.set(retryThreadId, request);
+    const fence: ThreadSnapshotReadFence = {
+      workspaceId: retryWorkspaceId,
+      generation: timeline.handshake.generation,
+      serverInstanceId: timeline.serverInstanceId ?? "",
+    };
+    const useRecoveryBuffer = requiresSnapshotBaseline(currentResyncReason);
+    const recoveryToken = useRecoveryBuffer
+      ? useTimelineStore.getState().beginRecovery(retryThreadId, request, "recovery")
+      : undefined;
+    const recoveryStarted = recoveryToken !== undefined;
+    if (useRecoveryBuffer && !recoveryStarted) {
+      if (automaticResyncActiveRequestRef.current.get(retryThreadId) === request)
+        automaticResyncActiveRequestRef.current.delete(retryThreadId);
+      automaticResyncInFlightRef.current.delete(currentThreadId);
+      return;
+    }
+    if (recoveryToken !== undefined) {
+      automaticResyncRecoveryTokenRef.current.set(retryThreadId, recoveryToken);
+      automaticResyncActiveRequestRef.current.set(retryThreadId, request);
+    }
     void (async (): Promise<void> => {
+      let recoveryEnded = false;
+      const currentAutomaticRequest = (): boolean => {
+        const state = useTimelineStore.getState();
+        return (
+          mountedRef.current &&
+          automaticResyncRequestRef.current === request &&
+          currentThreadIdRef.current === retryThreadId &&
+          workspaceRef.current?.workspaceId === retryWorkspaceId &&
+          state.handshake.generation === fence.generation &&
+          state.serverInstanceId === fence.serverInstanceId
+        );
+      };
       try {
-        const snapshot = await readCompleteThreadSnapshot(currentThreadId);
-        if (
-          !isCurrentRequest(request, workspace.workspaceId) ||
-          currentThreadIdRef.current !== currentThreadId
-        )
-          return;
-        if (!applySnapshot(snapshot, workspace.workspaceId, currentThreadId)) {
-          setError("会话状态无法自动恢复，请重新选择该会话重试。 ");
-        }
-      } catch {
-        if (
-          isCurrentRequest(request, workspace.workspaceId) &&
-          currentThreadIdRef.current === currentThreadId
-        ) {
-          setError("会话状态暂时无法自动恢复，请重新选择该会话重试。 ");
-          const prior = automaticResyncRetryTimersRef.current.get(currentThreadId);
-          if (prior !== undefined) clearTimeout(prior);
-          if (activeTurnPresent) {
-            const retryTimer = setTimeout(() => {
-              automaticResyncRetryTimersRef.current.delete(currentThreadId);
-              const state = useTimelineStore.getState();
-              const active = Object.values(state.turns).some(
-                (turn) =>
-                  turn.threadId === retryThreadId &&
-                  !["completed", "failed", "cancelled"].includes(turn.status),
-              );
-              if (
-                isCurrentRequest(request, retryWorkspaceId) &&
-                currentThreadIdRef.current === retryThreadId &&
-                workspaceRef.current?.workspaceId === retryWorkspaceId &&
-                state.handshake.generation === resyncGeneration &&
-                active
-              )
-                useTimelineStore.getState().requestThreadResync(retryThreadId);
-            }, 1_000);
-            automaticResyncRetryTimersRef.current.set(currentThreadId, retryTimer);
+        const snapshot = await readCompleteThreadSnapshot(retryThreadId, fence);
+        if (!currentAutomaticRequest()) return;
+        if (recoveryToken !== undefined) {
+          const result = useTimelineStore
+            .getState()
+            .endRecovery(recoveryToken, snapshot, retryWorkspaceId);
+          recoveryEnded = true;
+          // late/needs_baseline/overflow 等均表示本次 snapshot 没有接管当前事实；保留
+          // resync 意图并进入同一条有界退避，不能把“读取成功但过旧”误当作收敛。
+          if (result.status !== "applied") {
+            throw new Error(`thread recovery ${result.status}`);
           }
+        } else {
+          const outcome = useTimelineStore.getState().applySnapshot(snapshot, retryWorkspaceId);
+          if (outcome !== "applied") throw new Error(`thread snapshot ${outcome}`);
+        }
+        if (useTimelineStore.getState().resyncRequired[retryThreadId] !== undefined)
+          throw new Error("thread snapshot recovery remains pending");
+        setBackgroundError(undefined);
+        automaticResyncRetryDelayRef.current.delete(retryThreadId);
+      } catch {
+        if (currentAutomaticRequest()) {
+          setBackgroundError({
+            scope: automaticResyncScope,
+            message: "会话状态暂时无法自动恢复，请重新选择该会话重试。 ",
+          });
+          const prior = automaticResyncRetryTimersRef.current.get(retryThreadId);
+          if (prior !== undefined) clearTimeout(prior);
+          const delay =
+            automaticResyncRetryDelayRef.current.get(retryThreadId) ??
+            AUTOMATIC_RESYNC_INITIAL_DELAY_MS;
+          automaticResyncRetryDelayRef.current.set(retryThreadId, nextAutomaticResyncDelay(delay));
+          const retryTimer = setTimeout(() => {
+            automaticResyncRetryTimersRef.current.delete(retryThreadId);
+            const state = useTimelineStore.getState();
+            if (
+              currentThreadIdRef.current === retryThreadId &&
+              workspaceRef.current?.workspaceId === retryWorkspaceId &&
+              state.handshake.generation === fence.generation &&
+              state.serverInstanceId === fence.serverInstanceId &&
+              state.resyncRequired[retryThreadId] !== undefined
+            )
+              useTimelineStore.getState().requestThreadResync(retryThreadId);
+          }, delay);
+          automaticResyncRetryTimersRef.current.set(retryThreadId, retryTimer);
         }
       } finally {
-        automaticResyncInFlightRef.current.delete(currentThreadId);
+        if (recoveryToken !== undefined && !recoveryEnded)
+          useTimelineStore.getState().cancelRecovery(recoveryToken);
         if (
-          isCurrentRequest(request, workspace.workspaceId) &&
-          currentThreadIdRef.current === currentThreadId
+          recoveryToken !== undefined &&
+          automaticResyncRecoveryTokenRef.current.get(retryThreadId) === recoveryToken
         )
-          setBusy(false);
+          automaticResyncRecoveryTokenRef.current.delete(retryThreadId);
+        // active request 与 in-flight 必须作为同一 epoch 原子清理；旧 read 晚到时不能删除
+        // 切回同一 Thread 后已经建立的新 single-flight 标记。
+        if (automaticResyncActiveRequestRef.current.get(retryThreadId) === request) {
+          automaticResyncActiveRequestRef.current.delete(retryThreadId);
+          automaticResyncInFlightRef.current.delete(retryThreadId);
+        }
       }
     })();
   }, [
-    applySnapshot,
     currentResyncReason,
     currentResyncSequence,
-    activeTurnPresent,
     currentThreadId,
-    history,
-    isCurrentRequest,
+    currentTimelineFence,
+    backgroundErrorScope,
+    cancelAutomaticRecovery,
     readCompleteThreadSnapshot,
     workspace,
   ]);
@@ -1548,21 +1799,48 @@ export function useConversationController({
   const visibleWorkspaceId = workspace?.workspaceId;
   const visibleThreads = useMemo(() => {
     if (visibleWorkspaceId === undefined) return EMPTY_CONVERSATION_THREADS;
-    if (threads.every((thread) => thread.workspaceId === visibleWorkspaceId)) return threads;
-    return threads.filter((thread) => thread.workspaceId === visibleWorkspaceId);
-  }, [threads, visibleWorkspaceId]);
+    const scoped = threads.every((thread) => thread.workspaceId === visibleWorkspaceId)
+      ? threads
+      : threads.filter((thread) => thread.workspaceId === visibleWorkspaceId);
+    // 没有 Timeline projection 时目录对象本身就是完整结果；同时显式消费 primitive
+    // signature，使流状态变化能重新计算派生列表而不订阅高频正文对象。
+    if (timelineStatusSignature === "" || scoped.length === 0) return scoped;
+    const timeline = useTimelineStore.getState();
+    return scoped.map((thread) => {
+      const projection = timeline.threads[thread.threadId];
+      if (projection === undefined) return thread;
+      const latestTurnId = projection.latestTurnId;
+      const status =
+        latestTurnId === undefined ? null : (timeline.turns[latestTurnId]?.status ?? null);
+      const timelineRevision =
+        latestTurnId === undefined ? undefined : timeline.turns[latestTurnId]?.threadRevision;
+      const timelineAdvanced = timelineRevision !== undefined && timelineRevision > thread.revision;
+      if (status === thread.latestTurnStatus && !timelineAdvanced) return thread;
+      return {
+        ...thread,
+        latestTurnStatus: status,
+        latestTurnSeen:
+          status === "completed" || status === "failed" ? false : thread.latestTurnSeen,
+      };
+    });
+  }, [threads, timelineStatusSignature, visibleWorkspaceId]);
   const visibleCurrentThreadId = visibleThreads.some(
     (thread) => thread.threadId === currentThreadId,
   )
     ? currentThreadId
     : undefined;
   const scopeReady = historyWorkspaceIdRef.current === workspace?.workspaceId;
+  const visibleBackgroundError =
+    scopeReady && backgroundError?.scope === backgroundErrorScope
+      ? backgroundError.message
+      : undefined;
 
   return {
     threads: visibleThreads,
     currentThreadId: visibleCurrentThreadId,
     busy,
     error: scopeReady ? error : undefined,
+    backgroundError: visibleBackgroundError,
     mutatingThreadIds,
     compaction:
       visibleCurrentThreadId === undefined ? { phase: "idle", retryable: false } : compaction,

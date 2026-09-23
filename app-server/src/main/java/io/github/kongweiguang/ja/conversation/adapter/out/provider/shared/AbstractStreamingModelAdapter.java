@@ -182,25 +182,30 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 仅在首个语义事件被 sink 接受前重试已分类故障。
+     * 对传输故障和有界 Provider 格式损坏执行最多三次重试；已送达的纯文本只按前缀去重，
+     * 任何 Tool、opaque reasoning、Usage 或 sink 失败都关闭自动回放边界。
      */
     private ModelPort.ModelOutcome executeWithRetry(ModelPort.ModelRequest request,
                                                     ModelEventSink eventSink,
                                                     RequestController controller) {
         controller.bindThread(Thread.currentThread());
         AtomicBoolean semanticAccepted = new AtomicBoolean();
+        ModelAttemptReplay replay = new ModelAttemptReplay();
         Throwable last = null;
         int attempts = request.retryPolicy() == ModelPort.RetryPolicy.SINGLE_ATTEMPT ? 1 : MAX_ATTEMPTS;
         for (int attempt = 1; attempt <= attempts; attempt++) {
             controller.throwIfStopped();
             try {
-                StreamContext context = new StreamContext(eventSink, semanticAccepted, controller, request);
-                return executeProviderAttempt(request, context, controller);
+                StreamContext context = new StreamContext(
+                        eventSink, semanticAccepted, controller, request, replay, attempt > 1);
+                ModelPort.ModelOutcome outcome = executeProviderAttempt(request, context, controller);
+                context.verifyReplayComplete();
+                return outcome;
             } catch (CancellationException cancelled) {
                 throw cancelled;
             } catch (ProviderProtocolException failure) {
                 last = failure;
-                if (!failure.retryable() || semanticAccepted.get() || attempt == attempts) {
+                if (!shouldRetry(failure, semanticAccepted.get(), replay, attempt, attempts)) {
                     /*
                      * 只有已校验机器码进入诊断；Provider 正文、端点、异常消息和 cause 均保持隔离，
                      * 使线上故障可分类且不削弱脱敏边界。
@@ -215,6 +220,29 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             }
         }
         throw new ProviderProtocolException("NETWORK_ERROR", "provider request failed before a response", true, last);
+    }
+
+    /**
+     * 只把可恢复传输故障和明确的流格式/截断错误纳入重试；其它协议拒绝保持 fail-closed。
+     */
+    private static boolean shouldRetry(ProviderProtocolException failure, boolean semanticAccepted,
+                                       ModelAttemptReplay replay, int attempt, int attempts) {
+        if (attempt >= attempts) return false;
+        boolean recoverableShape = recoverableShape(failure);
+        if (!failure.retryable() && !recoverableShape) return false;
+        if (!semanticAccepted) return true;
+        return recoverableShape && replay.canRetryAfterSemantic();
+    }
+
+    /**
+     * Provider 的事件类型错误和 clean-EOF 截断只重试有限次数，显式 error/HTTP/Tool 错误不在此列。
+     */
+    private static boolean recoverableShape(ProviderProtocolException failure) {
+        return switch (failure.code()) {
+            case "STREAM_TRUNCATED", "TRUNCATED_STREAM", "INCOMPLETE_STREAM",
+                    "INCOMPLETE_RESPONSE", "OPENAI_EVENT", "OPENAI_CHAT_EVENT", "ANTHROPIC_EVENT" -> true;
+            default -> false;
+        };
     }
 
     /**

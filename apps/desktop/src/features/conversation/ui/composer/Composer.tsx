@@ -82,6 +82,10 @@ import {
 } from "../../domain/userContent";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { ComposerContextChips } from "./ComposerContextChips";
+import {
+  HistoryAttachmentThumbnail,
+  type HistoryAttachmentThumbnailPort,
+} from "../timeline/HistoryAttachmentThumbnail";
 import { ComposerSuggestionPanel, type ComposerSuggestionItem } from "./ComposerSuggestionPanel";
 import { splitFileName } from "./filePresentation";
 import {
@@ -154,6 +158,8 @@ export interface ComposerProps {
   models?: readonly ConversationModelOption[];
   attachments?: readonly ConversationAttachment[];
   attachmentDraftItems?: readonly ConversationAttachmentDraftItem[];
+  /** ready 图片草稿通过受管 draft Preview session 获取缩略图，卸载时由组件关闭 session。 */
+  attachmentThumbnailPort?: HistoryAttachmentThumbnailPort;
   activeTurn?: boolean;
   suspendedTurn?: boolean;
   /** 仅由权威 Timeline 的最新失败 Turn 决定，防止历史失败误触发新的续答。 */
@@ -286,6 +292,7 @@ function attachmentProgress(
 interface AttachmentDraftCardProps {
   item: ConversationAttachmentDraftItem;
   sending: boolean;
+  thumbnailPort?: HistoryAttachmentThumbnailPort;
   onRetry?: (itemId: string) => void | Promise<void>;
   onRemove?: (itemId: string) => void | Promise<void>;
   onOpenPreview?: (attachment: ConversationAttachment, source: HTMLButtonElement) => void;
@@ -298,6 +305,7 @@ interface AttachmentDraftCardProps {
 function AttachmentDraftCard({
   item,
   sending,
+  thumbnailPort,
   onRetry,
   onRemove,
   onOpenPreview,
@@ -307,15 +315,22 @@ function AttachmentDraftCard({
   const previewable = ready !== undefined && canPreviewAttachment(ready);
   const hasThumbnail = ready?.mediaKind === "image" && ready.thumbnailUrl !== undefined;
   const progress = item.state === "importing" ? attachmentProgress(item) : undefined;
-  const visual = hasThumbnail ? (
-    <img src={ready.thumbnailUrl} alt="" draggable={false} />
-  ) : item.mediaKind === "image" ? (
-    <ImageIcon aria-hidden="true" />
-  ) : item.mediaKind === "text" ? (
-    <FileText aria-hidden="true" />
-  ) : (
-    <File aria-hidden="true" />
-  );
+  const visual =
+    ready?.mediaKind === "image" ? (
+      <HistoryAttachmentThumbnail
+        attachmentId={ready.attachmentId}
+        displayName={ready.fileName}
+        authorization={{ kind: "draft" }}
+        directUrl={ready.thumbnailUrl}
+        port={thumbnailPort}
+      />
+    ) : item.mediaKind === "image" ? (
+      <ImageIcon aria-hidden="true" />
+    ) : item.mediaKind === "text" ? (
+      <FileText aria-hidden="true" />
+    ) : (
+      <File aria-hidden="true" />
+    );
   const content = (
     <>
       <span className="ja-composer-attachment__visual">{visual}</span>
@@ -927,6 +942,7 @@ export function Composer({
   models = [],
   attachments = [],
   attachmentDraftItems,
+  attachmentThumbnailPort,
   activeTurn = false,
   suspendedTurn = false,
   continuationAvailable = false,
@@ -1763,6 +1779,7 @@ export function Composer({
                 key={item.itemId}
                 item={item}
                 sending={sending}
+                thumbnailPort={attachmentThumbnailPort}
                 onRetry={onRetryAttachment}
                 onRemove={onRemoveAttachment}
                 onOpenPreview={onOpenAttachmentPreview}

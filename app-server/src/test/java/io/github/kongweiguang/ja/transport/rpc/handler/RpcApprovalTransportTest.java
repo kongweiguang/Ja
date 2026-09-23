@@ -495,7 +495,7 @@ final class RpcApprovalTransportTest {
 
     /** 创建由审批请求与解决事实共享的不可变 revision 上下文。 */
     private static TurnEvent.Context context(String eventId, long revision) {
-        return new TurnEvent.Context(eventId, "thr_test", "turn_test", revision, NOW);
+        return new TurnEvent.Context(eventId, "thr_test", "turn_test", revision, 0, NOW);
     }
 
     /** 构造已提交恢复裁决后的同一 Thread 快照，确保 resume 预检读取的是新 revision。 */
@@ -503,6 +503,12 @@ final class RpcApprovalTransportTest {
         return new ThreadSummary("thr_start", "ws_start", "启动测试",
                 preferences("provider_start", "model_start"), ThreadSummary.Status.ACTIVE,
                 false, null, true, null, revision, NOW.minusSeconds(60), NOW);
+    }
+
+    /** 恢复夹具必须同时提供权威 Turn 投影，供 transport 读取已完成模型轮次与 mutation fence。 */
+    private static ThreadSnapshot.Turn recoveryTurn() {
+        return new ThreadSnapshot.Turn("turn_resume", TurnState.SUSPENDED.name(),
+                NOW.minusSeconds(60), NOW, null, null, null, 0, 0);
     }
 
     /** 仅提供 approval/respond 使用的应用投影，其余端口均以显式失败关闭。 */
@@ -649,7 +655,8 @@ final class RpcApprovalTransportTest {
         /** 返回启动请求引用的唯一 Thread 快照。 */
         @Override public Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
             return thread.threadId().equals(threadId)
-                    ? Optional.of(new ThreadSnapshot(thread, List.of(), List.of(), null, null, null)) : Optional.empty();
+                    ? Optional.of(new ThreadSnapshot(thread, List.of(recoveryTurn()), List.of(), null, null, null))
+                    : Optional.empty();
         }
         /** 未声明 Thread 重命名能力。 */
         @Override public ThreadSummary renameThread(String threadId, String title, long revision) { throw unsupported(); }

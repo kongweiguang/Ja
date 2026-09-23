@@ -47,7 +47,7 @@ final class TurnEventWireMapperTest {
     void mapsCommittedTerminal() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_test", "thr_test", "turn_test", 3,
-                Instant.parse("2026-08-25T00:00:00Z"));
+                0, Instant.parse("2026-08-25T00:00:00Z"));
         TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.Terminal(
                 context, TurnState.COMPLETED, "done", null, null,
                 new TurnEvent.FinalMessage("item_test", "done"),
@@ -65,7 +65,7 @@ final class TurnEventWireMapperTest {
     void mapsCancelledTerminalWithoutFailureFields() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_cancelled", "thr_test", "turn_test", 4,
-                Instant.parse("2026-08-25T00:00:01Z"));
+                0, Instant.parse("2026-08-25T00:00:01Z"));
         TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.Terminal(
                 context, TurnState.CANCELLED, "", null, null, null, null));
 
@@ -80,7 +80,7 @@ final class TurnEventWireMapperTest {
     void mapsFailedTerminalWithSafeFinalMessage() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_failed", "thr_test", "turn_test", 5,
-                Instant.parse("2026-08-25T00:00:02Z"));
+                0, Instant.parse("2026-08-25T00:00:02Z"));
         TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.Terminal(
                 context, TurnState.FAILED, "safe failure reply", "BUDGET_EXCEEDED", "Model round limit reached",
                 new TurnEvent.FinalMessage("item_failure_reply", "safe failure reply"), null));
@@ -94,7 +94,7 @@ final class TurnEventWireMapperTest {
     @Test
     void rejectsFailedTerminalWithoutSafeFinalMessage() {
         TurnEvent.Context context = new TurnEvent.Context("evt_failed_empty", "thr_test", "turn_test", 5,
-                Instant.parse("2026-08-25T00:00:02Z"));
+                0, Instant.parse("2026-08-25T00:00:02Z"));
 
         assertThrows(IllegalArgumentException.class, () -> new TurnEvent.Terminal(
                 context, TurnState.FAILED, "", "INTERNAL_ERROR", "turn failed", null, null));
@@ -105,7 +105,7 @@ final class TurnEventWireMapperTest {
     void mapsCommittedModelStep() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_model", "thr_test", "turn_test", 4,
-                Instant.parse("2026-08-25T00:00:01Z"));
+                0, Instant.parse("2026-08-25T00:00:01Z"));
         TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.ModelStepCommitted(
                 context, "item_assistant", "read requested", "Checking the file", 2,
                 usage(2, new ModelUsage(10, 4, 14)),
@@ -125,7 +125,7 @@ final class TurnEventWireMapperTest {
     void mapsCommittedToolStartedWithoutSensitivePresentation() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_tool_started", "thr_test", "turn_test", 5,
-                Instant.parse("2026-08-25T00:00:02Z"));
+                0, Instant.parse("2026-08-25T00:00:02Z"));
         TurnEventWireMapper.WireEvent wire = mapper.map(
                 new TurnEvent.ToolStarted(context, "call_test", 7));
 
@@ -141,7 +141,7 @@ final class TurnEventWireMapperTest {
     void mapsCommittedToolBatch() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_tool", "thr_test", "turn_test", 5,
-                Instant.parse("2026-08-25T00:00:02Z"));
+                0, Instant.parse("2026-08-25T00:00:02Z"));
         TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.ToolBatchCommitted(
                 context,
                 List.of(new TurnEvent.ToolBatchResult("call_test", ToolOutcome.SUCCEEDED,
@@ -157,7 +157,7 @@ final class TurnEventWireMapperTest {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         Instant occurredAt = Instant.parse("2026-09-03T00:00:00Z");
         TurnEvent.Context context = new TurnEvent.Context(
-                "evt_consumed", "thr_test", "turn_test", 7, occurredAt);
+                "evt_consumed", "thr_test", "turn_test", 7, 0, occurredAt);
         UserContent content = new UserContent(List.of(new AttachmentContent("att_test")));
         AttachmentSummary summary = new AttachmentSummary(
                 "att_test", "capture.png", 128, "image", "image/png");
@@ -184,7 +184,7 @@ final class TurnEventWireMapperTest {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         Instant occurredAt = Instant.parse("2026-09-03T00:00:00Z");
         TurnEvent.Context context = new TurnEvent.Context(
-                "evt_received", "thr_target", "turn_target", 9, occurredAt);
+                "evt_received", "thr_target", "turn_target", 9, 0, occurredAt);
         ThreadSnapshot.ThreadMessageItem item = new ThreadSnapshot.ThreadMessageItem(
                 "item_message", occurredAt, "turn_target", "thr_sender", "发送方标题", "阶段结果");
 

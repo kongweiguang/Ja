@@ -46,7 +46,7 @@ public final class ContextCompactionLifecycle {
         automaticFallback = false;
         activeTrigger = Objects.requireNonNull(trigger, "trigger");
         before = inputTokensBefore;
-        publish(new ContextCompactionEvent.Started(context(sourceRevision, trigger, before, null)));
+        publish(new ContextCompactionEvent.Started(context(sourceRevision, trigger, before, null, null)));
     }
 
     /** Checkpoint 已提交并可回读后发布完成事实，随后清空 attempt 状态允许 overflow recovery。 */
@@ -54,7 +54,8 @@ public final class ContextCompactionLifecycle {
         Objects.requireNonNull(receipt, "receipt");
         ContextCompactionEvent.Trigger trigger = requireActive();
         publish(new ContextCompactionEvent.Compacted(
-                context(receipt.threadRevision(), trigger, before, inputTokensAfter),
+                context(receipt.threadRevision(), trigger, before, inputTokensAfter,
+                        receipt.turnMutationVersion()),
                 receipt.checkpoint().checkpointId()));
         terminated = true;
         clearAttempt();
@@ -63,7 +64,7 @@ public final class ContextCompactionLifecycle {
     /** 在尚未提交 Checkpoint 的关闭失败上发布稳定错误；计量前失败由 failBeforeStart 表达。 */
     public void failed(ContextException.Code code) {
         ContextCompactionEvent.Trigger trigger = requireActive();
-        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, before, null), wire(code)));
+        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, before, null, null), wire(code)));
         terminated = true;
         clearAttempt();
     }
@@ -73,7 +74,7 @@ public final class ContextCompactionLifecycle {
      */
     public void failedForAutomaticFallback(ContextException.Code code) {
         ContextCompactionEvent.Trigger trigger = requireActive();
-        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, before, null), wire(code)));
+        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, before, null, null), wire(code)));
         terminated = true;
         automaticFallback = true;
         clearAttempt();
@@ -83,7 +84,7 @@ public final class ContextCompactionLifecycle {
     public void failBeforeStart(ContextCompactionEvent.Trigger trigger, ContextException.Code code) {
         if (activeTrigger != null || (terminated && !automaticFallback)) throw new IllegalStateException("context compaction attempt already started");
         automaticFallback = false;
-        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, null, null), wire(code)));
+        publish(new ContextCompactionEvent.Failed(context(sourceRevision, trigger, null, null, null), wire(code)));
         terminated = true;
     }
 
@@ -91,7 +92,7 @@ public final class ContextCompactionLifecycle {
     public void cancelled(ContextCompactionEvent.Trigger trigger) {
         if (terminated) return;
         ContextCompactionEvent.Trigger effective = activeTrigger == null ? trigger : requireActive();
-        publish(new ContextCompactionEvent.Failed(context(sourceRevision, effective, before, null),
+        publish(new ContextCompactionEvent.Failed(context(sourceRevision, effective, before, null, null),
                 ContextCompactionEvent.ErrorCode.CANCELLED));
         terminated = true;
         clearAttempt();
@@ -115,10 +116,12 @@ public final class ContextCompactionLifecycle {
 
     /** 为每条通知分配事件身份，但复用同一操作与源 revision。 */
     private ContextCompactionEvent.Context context(long threadRevision, ContextCompactionEvent.Trigger trigger,
-                                                   Long inputTokensBefore, Long inputTokensAfter) {
+                                                   Long inputTokensBefore, Long inputTokensAfter,
+                                                   Long turnMutationVersion) {
         return new ContextCompactionEvent.Context("evt_" + UUID.randomUUID(), workspaceId, threadId, turnId,
                 threadRevision, clock.instant(), compactionId, trigger, sourceRevision,
-                inputTokensBefore, inputTokensAfter, ContextCompactionEvent.STRATEGY_VERSION);
+                inputTokensBefore, inputTokensAfter, ContextCompactionEvent.STRATEGY_VERSION,
+                turnMutationVersion);
     }
 
     /** 同步等待事件入队，保证 started 先于摘要副作用、compacted 先于后续 Provider send。 */

@@ -20,6 +20,16 @@ public interface TurnEventSink extends ContextCompactionEventSink, ThreadMetadat
      */
     CompletionStage<Void> publish(TurnEvent event);
 
+    /**
+     * 观察同一 SQLite 提交的内部边界；它不生成 wire 帧，用来覆盖 dispatch UNKNOWN 等没有公开
+     * TurnEvent 的 mutation，并把已完成 modelRound 与活动流 registry 保持在同一提交点。
+     */
+    default void observeCommittedTurn(String threadId, String turnId, long threadRevision,
+                                      long turnMutationVersion, int modelRound, TurnEvent event,
+                                      java.time.Instant occurredAt) {
+        /* 进程内测试或非 RPC sink 没有恢复基线，默认不做外部副作用。 */
+    }
+
     /** 测试或非 RPC Sink 可不消费生命周期；生产连接必须显式覆盖以保持通知可见。 */
     @Override
     default CompletionStage<Void> publish(ContextCompactionEvent event) {

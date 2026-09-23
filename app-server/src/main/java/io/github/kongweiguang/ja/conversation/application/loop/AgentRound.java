@@ -243,6 +243,15 @@ final class AgentRound implements ModelEventSink {
         return calls.isEmpty() ? text.toString() : "";
     }
 
+    /**
+     * 返回当前 Provider 轮次已经生成的纯文本，即使后续出现未完成 Tool 或协议错误也保留。
+     * 该投影只用于失败/取消诊断，不作为可恢复的完整 Assistant message，避免把半截 Tool
+     * 调用写成可继续执行的上下文事实。
+     */
+    synchronized String partialText() {
+        return text.toString();
+    }
+
     /** 返回 Provider 明确标注的公开摘要；隐藏 reasoning 从未进入该聚合器。 */
     synchronized String reasoningSummary() {
         return reasoningSummary.isEmpty() ? null : reasoningSummary.toString();

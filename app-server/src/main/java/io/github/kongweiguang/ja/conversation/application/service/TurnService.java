@@ -921,7 +921,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         if (recipient == null) return;
         try {
             TurnEvent.Context context = new TurnEvent.Context("evt_" + UUID.randomUUID(),
-                    key.threadId(), key.turnId(), receipt.threadRevision(), clock.instant());
+                    key.threadId(), key.turnId(), receipt.threadRevision(), receipt.turnMutationVersion(),
+                    clock.instant());
             await(recipient.sink.publish(new TurnEvent.InputQueueChanged(context, receipt.inputQueue())));
         } catch (RuntimeException failure) {
             LOGGER.warn("Input queue publication failed threadId={} turnId={} cause={}",
@@ -1235,7 +1236,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                                             TurnEventSink sink, Instant occurredAt) {
         TurnEvent.StateChanged event = new TurnEvent.StateChanged(new TurnEvent.Context(
                 "evt_" + UUID.randomUUID(), candidate.threadId(), candidate.turnId(),
-                receipt.threadRevision(), occurredAt), TurnState.SUSPENDED, TurnState.QUEUED);
+                receipt.threadRevision(), receipt.turnMutationVersion(), occurredAt),
+                TurnState.SUSPENDED, TurnState.QUEUED);
         try {
             await(Objects.requireNonNull(sink.publish(event), "resume state publication"));
         } catch (RuntimeException failure) {

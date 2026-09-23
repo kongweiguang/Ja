@@ -215,6 +215,7 @@ function prepareSnapshot(threadId: string, overrides: Partial<TimelineSnapshot> 
     items: [],
     inputQueue: null,
     contextUsage: null,
+    liveStream: null,
     taskActivities: [],
     goalActivities: [],
     nextCursor: null,
@@ -728,6 +729,7 @@ describe("Task product panels", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [
           {

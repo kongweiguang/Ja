@@ -55,6 +55,7 @@ function prepareStore(): void {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -87,6 +88,7 @@ describe("timeline Zustand seam", () => {
           items: [],
           inputQueue: null,
           contextUsage: null,
+          liveStream: null,
           taskActivities: [],
           goalActivities: [],
           nextCursor: null,
@@ -153,6 +155,7 @@ describe("timeline Zustand seam", () => {
           items: [],
           inputQueue: null,
           contextUsage: null,
+          liveStream: null,
           taskActivities: [entry],
           goalActivities: [],
           nextCursor: null,
@@ -162,6 +165,49 @@ describe("timeline Zustand seam", () => {
     ).toBe("applied");
     expect(selectTaskActivitiesForRoot("thr_store")(useTimelineStore.getState())).toEqual([entry]);
     expect(selectTaskActivitiesForRoot("thr_unknown")(useTimelineStore.getState())).toEqual([]);
+  });
+
+  it("恢复快照同时包含历史 queued 与当前 running Turn 时选择 running 对账目标", () => {
+    prepareStore();
+    expect(
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId: "thr_store",
+          revision: 1,
+          turns: [
+            {
+              turnId: "turn_queued_history",
+              status: "queued",
+              requestedAt: "2026-08-18T00:00:00Z",
+              updatedAt: "2026-08-18T00:00:01Z",
+              completedAt: null,
+              errorCode: null,
+              changeSet: null,
+            },
+            {
+              turnId: "turn_running_current",
+              status: "running",
+              requestedAt: "2026-08-18T00:00:02Z",
+              updatedAt: "2026-08-18T00:00:03Z",
+              completedAt: null,
+              errorCode: null,
+              changeSet: null,
+            },
+          ],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          taskActivities: [],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_store",
+      ),
+    ).toBe("applied");
+    expect(useTimelineStore.getState().recoveredActiveTurnByThread["thr_store"]).toBe(
+      "turn_running_current",
+    );
   });
 
   it("uses the turn/start revision as the baseline for the independent event stream", () => {
@@ -739,5 +785,213 @@ describe("timeline Zustand seam", () => {
     expect(next.taskActivitiesByRootThread["thr_side"]).toEqual([sideTask]);
     expect(next.threads["thr_resolved"]).toBeUndefined();
     expect(next.threads["thr_goal"]).toBeUndefined();
+  });
+
+  it("在恢复读取期间立即投影 live event，并在 baseline 后只重放新序号", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applyHostEvent({ kind: "timeline", event: event(1, "queued", "running") })).toBe(
+      "applied",
+    );
+    const firstDelta: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/text-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_recovery_first",
+        sequence: 2,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: "2026-08-18T00:00:01Z",
+        streamSeq: 1,
+        text: "基线",
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: firstDelta })).toBe("applied");
+    const token = store.beginRecovery("thr_store", 10, "recovery");
+    expect(token).toEqual({ threadId: "thr_store", requestEpoch: 10, mode: "recovery" });
+    const secondDelta: TimelineEvent = {
+      ...firstDelta,
+      params: {
+        ...firstDelta.params,
+        eventId: "evt_recovery_second",
+        sequence: 3,
+        streamSeq: 2,
+        text: "期间事件",
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: secondDelta })).toBe("applied");
+    expect(useTimelineStore.getState().draftByTurn["turn_store"]?.[0]?.text).toBe("基线期间事件");
+    const snapshot = {
+      threadId: "thr_store",
+      revision: 1,
+      turns: [
+        {
+          turnId: "turn_store",
+          status: "running" as const,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      goalActivities: [],
+      liveStream: {
+        turnId: "turn_store",
+        streamSeq: 1,
+        segments: [
+          {
+            kind: "assistant" as const,
+            segmentStartSeq: 1,
+            streamSeq: 1,
+            text: "基线",
+            occurredAt: "2026-08-18T00:00:01Z",
+          },
+        ],
+      },
+      nextCursor: null,
+    };
+    expect(store.endRecovery(token!, snapshot, "ws_store")).toEqual({
+      status: "applied",
+      replayedEvents: 1,
+    });
+    const recovered = useTimelineStore.getState();
+    expect(recovered.streamSeqByTurn["turn_store"]).toBe(2);
+    expect(recovered.draftByTurn["turn_store"]?.[0]?.text).toBe("基线期间事件");
+    expect(recovered.getLastAcceptedLive("thr_store")?.receivedAt).toEqual(expect.any(Number));
+  });
+
+  it("恢复快照缺少 live baseline 时不重放残缺 delta，并继续要求基线", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applyHostEvent({ kind: "timeline", event: event(1, "queued", "running") })).toBe(
+      "applied",
+    );
+    const token = store.beginRecovery("thr_store", 10, "recovery");
+    expect(token).toBeDefined();
+    const delta: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/text-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_recovery_missing_baseline_delta",
+        sequence: 2,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: "2026-08-18T00:00:01Z",
+        streamSeq: 1,
+        text: "不应冒充完整正文",
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: delta })).toBe("applied");
+
+    const result = store.endRecovery(
+      token!,
+      {
+        threadId: "thr_store",
+        revision: 1,
+        turns: [
+          {
+            turnId: "turn_store",
+            status: "running",
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:01Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_store",
+    );
+    expect(result).toEqual({ status: "needs_baseline", replayedEvents: 0 });
+    const recovered = useTimelineStore.getState();
+    expect(recovered.draftByTurn["turn_store"]).toBeUndefined();
+    expect(recovered.streamSeqByTurn["turn_store"]).toBe(0);
+    expect(recovered.resyncRequired["thr_store"]).toBe("gap");
+  });
+
+  it("恢复取消不会丢失已即时投影的 terminal，并留下非破坏性对账标记", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    store.applyHostEvent({ kind: "timeline", event: event(1, "queued", "running") });
+    const token = store.beginRecovery("thr_store", 11, "recovery");
+    expect(token).toBeDefined();
+    const terminal: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "turn/terminal",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_recovery_terminal",
+        sequence: 2,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 2,
+        occurredAt: "2026-08-18T00:00:02Z",
+        state: "completed",
+        summary: "完成",
+        finalMessage: { messageId: "item_recovery_terminal", text: "完成" },
+        changeSet: {
+          state: "complete",
+          incompleteReasons: [],
+          files: [],
+          stats: { files: 0, additions: 0, deletions: 0, binaryFiles: 0, truncated: false },
+        },
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: terminal })).toBe("applied");
+    store.cancelRecovery(token!);
+    const afterCancel = useTimelineStore.getState();
+    expect(afterCancel.turns["turn_store"]?.status).toBe("completed");
+    expect(afterCancel.resyncRequired["thr_store"]).toBe("invalid_event");
+  });
+
+  it("恢复快照被 runtime 拒绝时不重放缓冲事件冒充 applied", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    const token = store.beginRecovery("thr_store", 12, "recovery");
+    expect(token).toBeDefined();
+    // 保留 server identity，只切换 phase，精确覆盖 applySnapshot 的 rejected 分支。
+    useTimelineStore.setState((state) => ({
+      ...state,
+      handshake: { ...state.handshake, phase: "disconnected" },
+    }));
+    const result = store.endRecovery(
+      token!,
+      {
+        threadId: "thr_store",
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_store",
+    );
+    expect(result).toEqual({ status: "invalid", replayedEvents: 0 });
   });
 });

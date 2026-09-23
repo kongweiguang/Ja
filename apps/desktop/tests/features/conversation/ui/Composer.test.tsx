@@ -64,7 +64,7 @@ const USAGE_SUMMARY: ConversationUsageSummary = {
   cacheWriteRequestCount: 1,
   cacheWriteTokens: 900,
   cacheCompleteRequestCount: 2,
-  cacheCompleteInputTokens: 12_400,
+  cacheCompleteInputTokens: 19_500,
   cacheCompleteReadTokens: 6_200,
 };
 
@@ -623,13 +623,61 @@ describe("Composer", () => {
     expect(openPreview).toHaveBeenCalledTimes(3);
     expect(screen.queryByRole("button", { name: "预览附件 归档.zip" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "移除附件 归档.zip" })).toBeVisible();
-    expect(screen.getByRole("presentation")).toHaveAttribute("src", "ja-attachment://thumb_image");
+    expect(
+      screen
+        .getByRole("list", { name: "待发送附件" })
+        .querySelector<HTMLImageElement>('li[data-media-kind="image"] img'),
+    ).toHaveAttribute("src", "ja-attachment://thumb_image");
     expect(screen.getByText("尚未生成缩略图").closest("li")).not.toHaveAttribute(
       "data-has-thumbnail",
     );
-    expect(screen.getByRole("presentation").closest("li")).toHaveAttribute(
-      "data-has-thumbnail",
-      "true",
+    expect(
+      screen.getByRole("list", { name: "待发送附件" }).querySelector('li[data-media-kind="image"]'),
+    ).toHaveAttribute("data-has-thumbnail", "true");
+  });
+
+  /** 直传缩略图也必须经过同一 origin fallback，失败后停在可访问降级态而不留下空白卡片。 */
+  it("直传图片缩略图失败后只切换一次 Windows origin 并降级", async () => {
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        attachmentDraftItems={[
+          {
+            state: "ready",
+            itemId: "item_direct_image",
+            attachmentId: "att_direct_image",
+            fileName: "直传图片.png",
+            sizeBytes: 256,
+            mediaKind: "image",
+            mediaType: "image/png",
+            thumbnailUrl: "ja-attachment://localhost/thumbnail/direct-image",
+          },
+        ]}
+        onOpenAttachmentPreview={vi.fn()}
+        onRemoveAttachment={vi.fn()}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const first = screen
+      .getByRole("list", { name: "待发送附件" })
+      .querySelector<HTMLElement>('li[data-media-kind="image"] .ja-composer-attachment__visual');
+    expect(first).not.toBeNull();
+    const image = first!.querySelector<HTMLImageElement>("img");
+    expect(image).not.toBeNull();
+    fireEvent.error(image!);
+
+    await waitFor(() => {
+      expect(first!.querySelector("img")).toHaveAttribute(
+        "src",
+        "http://ja-attachment.localhost/thumbnail/direct-image",
+      );
+    });
+    fireEvent.error(first!.querySelector("img")!);
+
+    expect(first!.querySelector('[data-state="unavailable"]')).toHaveAccessibleName(
+      "直传图片.png 缩略图不可用",
     );
   });
 
@@ -1818,22 +1866,65 @@ describe("Composer", () => {
     expect(indicator).toHaveAttribute("aria-valuenow", "20.2");
     expect(indicator).toHaveAttribute(
       "aria-valuetext",
-      "已使用 20.2%，55K / 272K tokens，最近模型请求",
+      "已使用 20.2%，55k / 272k tokens，最近模型请求",
     );
     const trigger = screen.getByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
     await waitFor(() => expect(reader.read).toHaveBeenCalledWith({ threadId: "thr_usage" }));
     expect(await screen.findByText("Token · 本会话")).toBeVisible();
-    expect(screen.getByText("12,400")).toBeVisible();
-    expect(screen.getByText("2,100")).toBeVisible();
-    expect(screen.getByText("6,200")).toBeVisible();
+    expect(screen.getByText("12k")).toBeVisible();
+    expect(screen.getByText("2.1k")).toBeVisible();
+    expect(screen.getByText("6.2k")).toBeVisible();
     expect(screen.getByText("900")).toBeVisible();
-    expect(screen.getByText("14,500")).toBeVisible();
-    expect(screen.getByText("50.0%")).toBeVisible();
+    expect(screen.getByText("15k")).toBeVisible();
+    expect(screen.getByText("31.8%")).toBeVisible();
     expect(screen.getAllByText("部分数据")).toHaveLength(2);
     expect(screen.getByText("上下文 · 最近请求")).toBeVisible();
     expect(screen.getByText("20.2%")).toBeVisible();
-    expect(screen.getByText("55K / 272K")).toBeVisible();
+    expect(screen.getByText("55k / 272k")).toBeVisible();
+  });
+
+  /** OpenAI input 已包含缓存读取且没有独立写入字段时，仍按完整输入分母显示命中率。 */
+  it("按 API 输入与缓存读取计算没有写入字段的命中率", async () => {
+    const user = userEvent.setup();
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        threadId: "thr_openai_usage",
+        snapshotRevision: 8,
+        requestCount: 1,
+        measuredRequestCount: 1,
+        newInputRequestCount: 1,
+        newInputTokens: 227_019,
+        outputRequestCount: 1,
+        outputTokens: 10_778,
+        totalRequestCount: 1,
+        totalTokens: 2_559_205,
+        cacheReadRequestCount: 1,
+        cacheReadTokens: 2_321_408,
+        cacheWriteRequestCount: 0,
+        cacheWriteTokens: 0,
+        cacheCompleteRequestCount: 1,
+        cacheCompleteInputTokens: 2_548_427,
+        cacheCompleteReadTokens: 2_321_408,
+      }),
+    };
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_openai_usage"
+        usageReader={reader}
+        onSend={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+    expect(await screen.findByText("91.1%")).toBeVisible();
+    expect(screen.getByText("227k")).toBeVisible();
+    expect(screen.getByText("11k")).toBeVisible();
+    expect(screen.getByText("2.3M")).toBeVisible();
+    expect(screen.getByText("2.6M")).toBeVisible();
+    expect(screen.queryByText("缓存写入")).toBeNull();
   });
 
   /** Provider 未报告计量时保持未知，账本为空也只引导发送消息，不能伪造成 0 Token。 */
@@ -1895,7 +1986,7 @@ describe("Composer", () => {
     );
     const trigger = screen.getByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
-    expect(await screen.findByText("14,500")).toBeVisible();
+    expect(await screen.findByText("15k")).toBeVisible();
 
     rerender(
       <ControlledComposerHarness
@@ -1908,7 +1999,7 @@ describe("Composer", () => {
       />,
     );
     expect(await screen.findByText("暂未更新")).toBeVisible();
-    expect(screen.getByText("14,500")).toBeVisible();
+    expect(screen.getByText("15k")).toBeVisible();
   });
 
   /** hover 读取后可点击固定；外部点击与 Escape 都关闭，Escape 必须归还圆环焦点。 */
@@ -1980,10 +2071,10 @@ describe("Composer", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
-    expect(await screen.findByText("25,000")).toBeVisible();
+    expect(await screen.findByText("25k")).toBeVisible();
     resolveFirst({ ...USAGE_SUMMARY, threadId: "thr_usage_a" });
-    await waitFor(() => expect(screen.getByText("25,000")).toBeVisible());
-    expect(screen.queryByText("14,500")).toBeNull();
+    await waitFor(() => expect(screen.getByText("25k")).toBeVisible());
+    expect(screen.queryByText("15k")).toBeNull();
   });
 
   /** 临近窗口上限时只改变视觉风险级别，仍不升级为打断输入的弹层。 */

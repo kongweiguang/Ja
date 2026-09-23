@@ -301,9 +301,9 @@ function InteractionAnswerList({
 }
 
 /**
- * Tool 行自身就是唯一 Disclosure：常规步骤保持紧凑，失败步骤自动展开，
- * 且用户的手动选择按 Thread/Turn/Item identity 跨状态和虚拟卸载保留；动作、真实 Tool 名称与首个目标留在同一行，
- * 已脱敏结果留在展开区，避免用展示标题或原始参数猜测身份。
+ * Tool 行自身就是唯一 Disclosure：常规步骤和所有失败详情默认保持紧凑，只有可恢复执行入口或已回答问答
+ * 自动展开；用户的手动选择按 Thread/Turn/Item identity 跨状态和虚拟卸载保留。动作、真实 Tool 名称与首个
+ * 目标留在同一行，已脱敏结果留在展开区，避免用展示标题或原始参数猜测身份。
  */
 export function ToolStepDetails({
   step,
@@ -360,8 +360,7 @@ export function ToolStepDetails({
   const detailsOpen =
     cachedOpen ??
     manualOpen ??
-    (presentation.status === "error" ||
-      presentation.recovery !== undefined ||
+    (presentation.recovery !== undefined ||
       (isInteractionTool && presentation.status === "success" && answeredInteractions.length > 0));
   const actionLabel = presentationActionLabel(presentation, toolName);
   const target = presentationTarget(presentation, toolName);
@@ -376,7 +375,7 @@ export function ToolStepDetails({
     .filter((value): value is string => value !== undefined)
     .join("，");
 
-  /** Tool identity 稳定时保存用户选择；状态变化只影响无人工选择时的失败自动展开策略。 */
+  /** Tool identity 稳定时保存用户选择；状态变化只影响无人工选择时的恢复或问答自动展开策略。 */
   const updateDetailsOpen = (open: boolean): void => {
     if (
       disclosureCache !== undefined &&

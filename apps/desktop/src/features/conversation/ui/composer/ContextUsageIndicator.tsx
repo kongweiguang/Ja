@@ -28,17 +28,18 @@ export interface ContextUsageIndicatorProps {
   refreshRevision?: string | number;
 }
 
-/** 窗口容量以 K/M 控制行宽；累计数字则使用单独的千位分隔，避免混淆两种阅读语义。 */
+/** 窗口容量与累计 Token 使用同一紧凑单位，避免用户在两种口径间切换阅读规则。 */
 function formatContextCapacity(value: number): string {
-  if (value >= 1_000_000) {
-    const digits = value >= 10_000_000 ? 0 : 1;
-    return (value / 1_000_000).toFixed(digits).replace(/\.0$/u, "") + "M";
-  }
-  if (value >= 1_000) {
-    const digits = value >= 100_000 ? 0 : 1;
-    return (value / 1_000).toFixed(digits).replace(/\.0$/u, "") + "K";
-  }
-  return value.toLocaleString("en-US");
+  return formatTokenCount(value);
+}
+
+/** 累计 Token 采用 pi 的稳定阈值，避免大数撑宽浮层，同时保留低数值的可读精度。 */
+function formatTokenCount(value: number): string {
+  if (value < 1_000) return value.toString();
+  if (value < 10_000) return (value / 1_000).toFixed(1).replace(/\.0$/u, "") + "k";
+  if (value < 1_000_000) return Math.round(value / 1_000) + "k";
+  if (value < 10_000_000) return (value / 1_000_000).toFixed(1).replace(/\.0$/u, "") + "M";
+  return Math.round(value / 1_000_000) + "M";
 }
 
 /** LRU 上限防止关闭过的 Thread 摘要把前端诊断状态变成无界缓存。 */
@@ -52,7 +53,7 @@ function rememberUsage(scopeKey: string, summary: ConversationUsageSummary): voi
   }
 }
 
-/** 命中率只用服务端标记为缓存口径完整的请求，缺失和零分母均保持横线。 */
+/** 命中率只用服务端归一化的完整输入样本；缺失和零分母均保持横线。 */
 function cacheHitRate(summary: ConversationUsageSummary): string | undefined {
   if (summary.cacheCompleteRequestCount === 0 || summary.cacheCompleteInputTokens === 0)
     return undefined;
@@ -61,7 +62,7 @@ function cacheHitRate(summary: ConversationUsageSummary): string | undefined {
   );
 }
 
-/** 单行同时携带覆盖范围，缺失计量不因聚合 SQL 的零值误导用户。 */
+/** 单行同时携带覆盖范围；大数使用紧凑单位，缺失计量不因聚合 SQL 的零值误导用户。 */
 function UsageMetricRow({
   label,
   value,
@@ -77,7 +78,7 @@ function UsageMetricRow({
     <div className="ja-context-usage-popover__row">
       <span>{label}</span>
       <span className="ja-context-usage-popover__value">
-        {covered > 0 ? value.toLocaleString("en-US") : "—"}
+        {covered > 0 ? formatTokenCount(value) : "—"}
         {covered > 0 && covered < requestCount ? <small>部分数据</small> : null}
       </span>
     </div>
@@ -256,6 +257,7 @@ export function ContextUsageIndicator({
     summary !== undefined &&
     summary.cacheCompleteRequestCount > 0 &&
     summary.cacheCompleteRequestCount < summary.requestCount;
+  const cacheRate = summary === undefined ? undefined : cacheHitRate(summary);
   const noSummaryMessage =
     visibleState.phase === "idle"
       ? "发送消息后显示用量"
@@ -389,10 +391,13 @@ export function ContextUsageIndicator({
                   covered={summary.totalRequestCount}
                   requestCount={summary.requestCount}
                 />
-                <div className="ja-context-usage-popover__row">
+                <div className="ja-context-usage-popover__row ja-context-usage-popover__row--rate">
                   <span>缓存命中率</span>
-                  <span className="ja-context-usage-popover__value">
-                    {cacheHitRate(summary) ?? "—"}
+                  <span
+                    className="ja-context-usage-popover__value"
+                    data-rate-known={cacheRate !== undefined}
+                  >
+                    {cacheRate ?? "—"}
                     {ratePartial ? <small>基于已报告数据</small> : null}
                   </span>
                 </div>

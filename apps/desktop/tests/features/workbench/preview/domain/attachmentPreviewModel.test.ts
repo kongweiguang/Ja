@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   actualSizeAttachmentZoom,
+  alternateAttachmentResourceUrl,
   attachmentPreviewTargetKey,
   fitAttachmentZoom,
   stepAttachmentZoom,
@@ -43,5 +44,15 @@ describe("attachmentPreviewModel", () => {
         authorization: { kind: "thread", threadId: "thread-1" },
       }),
     ).toBe("thread:thread-1:att_1");
+  });
+
+  it("只为 canonical native attachment URL 派生 Windows localhost fallback", () => {
+    expect(alternateAttachmentResourceUrl("ja-attachment://localhost/preview/token")).toBe(
+      "http://ja-attachment.localhost/preview/token",
+    );
+    expect(alternateAttachmentResourceUrl("http://ja-attachment.localhost/preview/token")).toBe(
+      undefined,
+    );
+    expect(alternateAttachmentResourceUrl("https://example.com/image.png")).toBeUndefined();
   });
 });

@@ -242,6 +242,7 @@ fn thread_read_rejects_private_item_fields() {
         "items": [{"itemId": "item_demo", "metadata": {"secretValue": "hidden"}}],
         "inputQueue": null,
         "contextUsage": null,
+        "liveStream": null,
         "nextCursor": null
     });
     assert!(parse_thread_read(result).is_err());
@@ -267,6 +268,7 @@ fn thread_read_accepts_strict_thread_message_items() {
         "goalActivities": [],
         "contextUsage": null,
         "inputQueue": null,
+        "liveStream": null,
         "nextCursor": null
     });
     let parsed = parse_thread_read(result.clone()).expect("thread message item");
@@ -384,6 +386,7 @@ fn v1_thread_read_fixture() -> serde_json::Value {
             "totalTokens": 120,
             "measuredAt": "2026-08-30T10:00:00Z"
         },
+        "liveStream": null,
         "nextCursor": null
     })
 }
@@ -429,6 +432,78 @@ fn thread_read_accepts_v1_snapshot_and_preserves_required_nulls() {
     assert!(parse_thread_read(absolute_path).is_err());
 }
 
+/// 活动流必须绑定活动 Turn，非空片段连续覆盖到 baseline；空片段仅用于保留已提交后的游标，
+/// 同时用 Unicode 字节预算固定 native parser 与 Java/TypeScript 的恢复边界。
+#[test]
+fn thread_read_validates_live_stream_baseline_and_utf8_budget() {
+    let mut fixture = v1_thread_read_fixture();
+    fixture["turns"][0]["status"] = json!("running");
+    fixture["turns"][0]["completedAt"] = Value::Null;
+    fixture["turns"][0]["changeSet"] = Value::Null;
+    fixture["liveStream"] = json!({
+        "turnId": "turn_demo",
+        "streamSeq": 2,
+        "segments": [
+            {
+                "kind": "assistant",
+                "segmentStartSeq": 1,
+                "streamSeq": 1,
+                "text": "draft",
+                "occurredAt": "2026-08-30T10:00:00Z"
+            },
+            {
+                "kind": "reasoningSummary",
+                "segmentStartSeq": 2,
+                "streamSeq": 2,
+                "text": "thinking",
+                "occurredAt": "2026-08-30T10:00:01Z"
+            }
+        ]
+    });
+    let parsed = parse_thread_read(fixture.clone()).expect("live stream baseline");
+    assert_eq!(parsed.live_stream.as_ref().map(|stream| stream.stream_seq), Some(2));
+
+    let mut tail_gap = fixture.clone();
+    tail_gap["liveStream"]["segments"][1]["streamSeq"] = json!(1);
+    assert!(parse_thread_read(tail_gap).is_err());
+
+    let mut empty_text = fixture.clone();
+    empty_text["liveStream"]["segments"][0]["text"] = json!("");
+    assert!(parse_thread_read(empty_text).is_err());
+
+    let mut wrong_owner = fixture.clone();
+    wrong_owner["liveStream"]["turnId"] = json!("turn_other");
+    assert!(parse_thread_read(wrong_owner).is_err());
+
+    let mut unicode_budget = fixture;
+    unicode_budget["liveStream"]["segments"][0]["text"] = json!("界".repeat(21_846));
+    assert!(parse_thread_read(unicode_budget).is_err());
+
+    let mut invalid_timestamp = v1_thread_read_fixture();
+    invalid_timestamp["turns"][0]["status"] = json!("running");
+    invalid_timestamp["turns"][0]["completedAt"] = Value::Null;
+    invalid_timestamp["turns"][0]["changeSet"] = Value::Null;
+    invalid_timestamp["liveStream"] = json!({
+        "turnId": "turn_demo",
+        "streamSeq": 1,
+        "segments": [{
+            "kind": "assistant",
+            "segmentStartSeq": 1,
+            "streamSeq": 1,
+            "text": "draft",
+            "occurredAt": "2026-02-30T10:00:00Z"
+        }]
+    });
+    assert!(parse_thread_read(invalid_timestamp).is_err());
+
+    let mut missing_live_stream = v1_thread_read_fixture();
+    missing_live_stream
+        .as_object_mut()
+        .expect("thread read object")
+        .remove("liveStream");
+    assert!(parse_thread_read(missing_live_stream).is_err());
+}
+
 /// 新建 Thread 在首条消息前会返回完全空的 Timeline；该合法产品态不能因只测过有内容 fixture
 /// 而被 Rust 严格解析器误判为 runtime unavailable。
 #[test]
@@ -442,6 +517,7 @@ fn thread_read_accepts_a_new_empty_thread_snapshot() {
         "goalActivities": [],
         "contextUsage": null,
         "inputQueue": null,
+        "liveStream": null,
         "nextCursor": null
     }))
     .expect("new empty thread snapshot");

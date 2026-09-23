@@ -12,6 +12,8 @@ const COMMENTARY_3 = "JA_PROGRESS_COMMENTARY_3";
 const READ_MARKER = "JA_PROGRESS_READ_OK";
 const SHELL_MARKER = "JA_PROGRESS_SHELL_OK";
 const FINAL_MARKER = "JA_PROGRESS_FINAL_OK";
+const CONTINUE_COMMENTARY = "JA_PROGRESS_CONTINUE_COMMENTARY";
+const CONTINUE_FINAL = "JA_PROGRESS_CONTINUE_FINAL_OK";
 
 /** 将一个 Responses SSE 事件固定为严格 JSONL-compatible frame，避免 fixture 依赖宽松解析。 */
 function event(type, sequenceNumber, payload) {
@@ -158,6 +160,42 @@ function finalStream() {
   ].join("");
 }
 
+/** 生成失败后“继续回复”的独立新 Turn；它不携带 Tool，专门验证旧执行过程不会被自动重放。 */
+function continuationStream() {
+  const responseId = "resp_progress_continue";
+  const messageId = "message_progress_continue";
+  const text = `失败后的新 Turn 已完成，结果标记为 ${CONTINUE_FINAL}。`;
+  const message = {
+    id: messageId,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [], logprobs: [] }],
+  };
+  return [
+    event("response.created", 0, {
+      response: responseEnvelope(responseId, "in_progress", [], false),
+    }),
+    summaryEvent(`已从失败位置重新开始。${CONTINUE_COMMENTARY}`, 1, "summary_progress_continue"),
+    event("response.output_text.delta", 2, {
+      content_index: 0,
+      delta: text,
+      item_id: messageId,
+      output_index: 0,
+      logprobs: [],
+    }),
+    event("response.output_text.done", 3, {
+      content_index: 0,
+      item_id: messageId,
+      output_index: 0,
+      text,
+    }),
+    event("response.completed", 4, {
+      response: responseEnvelope(responseId, "completed", [message]),
+    }),
+  ].join("");
+}
+
 /** 自动标题请求使用普通文本结束，避免标题后台请求污染本轮 Tool continuation 计数。 */
 function titleStream() {
   const responseId = "resp_progress_title";
@@ -226,7 +264,7 @@ async function writeDelayedStream(response, stream, stages, step, textGate, summ
   response.end();
 }
 
-/** 启动只监听 IPv4 loopback 的 Responses fixture，按真实 function_call_output 推进三轮模型协议。 */
+/** 启动只监听 IPv4 loopback 的 Responses fixture，推进三轮模型协议并提供失败后的独立继续 Turn。 */
 export async function startConversationProgressFixture() {
   const attempts = [];
   const stages = [];
@@ -246,6 +284,15 @@ export async function startConversationProgressFixture() {
   const finalTextGate = new Promise((resolvePromise) => {
     releaseFinalText = resolvePromise;
   });
+  let releaseContinuationNarrative;
+  const continuationNarrativeGate = new Promise((resolvePromise) => {
+    releaseContinuationNarrative = resolvePromise;
+  });
+  let releaseContinuationText;
+  const continuationTextGate = new Promise((resolvePromise) => {
+    releaseContinuationText = resolvePromise;
+  });
+  let failurePhase = "idle";
   const server = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/responses") {
       response.writeHead(404, { "content-type": "application/json" });
@@ -270,6 +317,38 @@ export async function startConversationProgressFixture() {
       const progressInstruction =
         instructions.includes("Before the first tool call, briefly explain your intent.") &&
         instructions.includes("Share meaningful findings and changes of direction");
+      /** 失败分支固定在服务端状态机内，避免 HTTP 失败重试或旧上下文误判为普通首轮。 */
+      if (failurePhase === "armed" || failurePhase === "failed") {
+        if (failurePhase === "armed") {
+          failurePhase = "failed";
+          attempts.push({ kind: "turn", step: 3, progressInstruction, outcome: "failed" });
+          stages.push("failure_terminal");
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify({ error: { code: "FIXTURE_FAILURE", message: "controlled failure" } }),
+          );
+          return;
+        }
+        if (!serialized.includes("继续")) {
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify({ error: { code: "FIXTURE_FAILURE", message: "awaiting continue" } }),
+          );
+          return;
+        }
+        failurePhase = "continuing";
+        attempts.push({ kind: "turn", step: 4, progressInstruction, outcome: "completed" });
+        await writeDelayedStream(
+          response,
+          continuationStream(),
+          stages,
+          "continue",
+          continuationTextGate,
+          continuationNarrativeGate,
+        );
+        failurePhase = "done";
+        return;
+      }
       attempts.push({
         kind: "turn",
         step,
@@ -321,6 +400,7 @@ export async function startConversationProgressFixture() {
           finalTextGate,
           finalNarrativeGate,
         );
+        failurePhase = "armed";
         return;
       }
       throw new Error("unexpected conversation progress continuation");
@@ -355,6 +435,14 @@ export async function startConversationProgressFixture() {
     releaseFinalText() {
       releaseFinalText();
     },
+    /** 失败后的独立新 Turn 先公开摘要，再允许终态正文到达，供真窗观察过程与新动画。 */
+    releaseContinuationNarrative() {
+      releaseContinuationNarrative();
+    },
+    /** 失败后的独立新 Turn 正文已可见后才结算 terminal，避免测试只命中静态历史。 */
+    releaseContinuationText() {
+      releaseContinuationText();
+    },
     /** 仅返回低敏阶段与请求种类，报告不包含 Provider request body。 */
     snapshot() {
       return { attempts: attempts.map((attempt) => ({ ...attempt })), stages: [...stages] };
@@ -365,6 +453,8 @@ export async function startConversationProgressFixture() {
       releaseSecondNarrative();
       releaseFinalNarrative();
       releaseFinalText();
+      releaseContinuationNarrative();
+      releaseContinuationText();
       server.closeAllConnections?.();
       await new Promise((resolvePromise) => server.close(resolvePromise));
     },
@@ -376,6 +466,8 @@ export const conversationProgressFixtureMarkers = Object.freeze({
   commentary2: COMMENTARY_2,
   commentary3: COMMENTARY_3,
   final: FINAL_MARKER,
+  continueCommentary: CONTINUE_COMMENTARY,
+  continueFinal: CONTINUE_FINAL,
   read: READ_MARKER,
   shell: SHELL_MARKER,
 });

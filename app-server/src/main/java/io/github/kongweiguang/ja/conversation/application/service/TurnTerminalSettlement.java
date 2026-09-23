@@ -96,7 +96,7 @@ final class TurnTerminalSettlement {
                 },
                 committed -> new TurnEvent.Terminal(new TurnEvent.Context(
                         "evt_" + UUID.randomUUID(), turn.command().threadId(), turn.command().turnId(),
-                        committed.threadRevision(), clock.instant()), terminalState,
+                        committed.threadRevision(), committed.turnMutationVersion(), clock.instant()), terminalState,
                         failureReply == null ? "" : failureReply,
                         terminalState == TurnState.FAILED ? terminalCode : null,
                         terminalState == TurnState.FAILED ? terminalMessage : null,

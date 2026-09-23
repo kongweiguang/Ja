@@ -157,6 +157,22 @@ export interface TimelineGoalActivity {
   occurredAt: string;
 }
 
+/** thread/read 的可恢复 live 基线；reasoningSummary 是 wire 语义，Renderer 再投影为 reasoning。 */
+export interface TimelineLiveStreamSegment {
+  kind: "assistant" | "reasoningSummary";
+  segmentStartSeq: number;
+  streamSeq: number;
+  text: string;
+  occurredAt: string;
+}
+
+/** 非空 segments 的末段必须等于 streamSeq；仅空 segments 可用正序号表示前序已 committed。 */
+export interface TimelineLiveStream {
+  turnId: string;
+  streamSeq: number;
+  segments: TimelineLiveStreamSegment[];
+}
+
 export interface TimelineSnapshot {
   threadId: string;
   revision: number;
@@ -166,6 +182,7 @@ export interface TimelineSnapshot {
   contextUsage: TimelineThreadContextUsage | null;
   taskActivities: TimelineTaskActivityEntry[];
   goalActivities: TimelineGoalActivity[];
+  liveStream: TimelineLiveStream | null;
   nextCursor: string | null;
 }
 
@@ -554,10 +571,119 @@ export function timelineSnapshotValidationReason(value: unknown): string | undef
   if (!("contextUsage" in root)) return "context_usage_missing";
   if (root["contextUsage"] !== null && !isThreadContextUsage(root["contextUsage"]))
     return "context_usage";
+  if (!("liveStream" in root)) return "live_stream_missing";
+  if (root["liveStream"] !== null) {
+    if (!isTimelineLiveStream(root["liveStream"])) return "live_stream";
+    const liveStream = root["liveStream"] as TimelineLiveStream;
+    const owner = (root["turns"] as TimelineSnapshotTurn[]).find(
+      (turn) => turn.turnId === liveStream.turnId,
+    );
+    if (owner === undefined || ["completed", "failed", "cancelled"].includes(owner.status))
+      return "live_stream_owner";
+  }
   if (root["nextCursor"] !== null && typeof root["nextCursor"] !== "string") return "next_cursor";
   const invalidItem = root["items"].findIndex((item) => !isTimelineSnapshotItem(item));
   if (invalidItem >= 0) return `item:${invalidItem}`;
   return undefined;
+}
+
+const MAX_LIVE_STREAM_SEGMENTS = 256;
+const MAX_LIVE_STREAM_SEGMENT_BYTES = 64 * 1024;
+const MAX_LIVE_STREAM_TOTAL_BYTES = 1024 * 1024;
+const LIVE_STREAM_KEYS = new Set(["turnId", "streamSeq", "segments"]);
+const LIVE_STREAM_SEGMENT_KEYS = new Set([
+  "kind",
+  "segmentStartSeq",
+  "streamSeq",
+  "text",
+  "occurredAt",
+]);
+
+/** 独立复核 TimestampSchema 的 RFC3339 offset 形状与真实日历，避免 domain 绕过 transport 边界。 */
+function isWireTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 64) return false;
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (match === null) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offset = match[7];
+  if (offset === undefined) return false;
+  const offsetHour = offset === "Z" ? 0 : Number(offset.slice(1, 3));
+  const offsetMinute = offset === "Z" ? 0 : Number(offset.slice(4, 6));
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return (
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= daysInMonth &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    offsetHour <= 23 &&
+    offsetMinute <= 59 &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
+/** 保持 liveStream 与其 segment 的 strict wire object 语义，未知键不得进入 Renderer。 */
+function hasOnlyKeys(value: Record<string, unknown>, keys: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => keys.has(key));
+}
+
+/**
+ * 校验 live baseline 的序列连续性和容量边界；首段可从任意正序号开始，因为前序段可能已提交。
+ * 空 segments 与正 streamSeq 合法，表示当前 Turn 的前序 stream 已经落入持久 committed 事实。
+ */
+function isTimelineLiveStream(value: unknown): value is TimelineLiveStream {
+  if (typeof value !== "object" || value === null) return false;
+  const root = value as Record<string, unknown>;
+  const segments = root["segments"];
+  if (
+    !hasOnlyKeys(root, LIVE_STREAM_KEYS) ||
+    typeof root["turnId"] !== "string" ||
+    !/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(root["turnId"] as string) ||
+    !Number.isSafeInteger(root["streamSeq"]) ||
+    (root["streamSeq"] as number) < 0 ||
+    !Array.isArray(segments) ||
+    segments.length > MAX_LIVE_STREAM_SEGMENTS
+  )
+    return false;
+  let totalBytes = 0;
+  let previousStreamSeq: number | undefined;
+  for (const segment of segments) {
+    if (typeof segment !== "object" || segment === null) return false;
+    const candidate = segment as Record<string, unknown>;
+    const segmentStartSeq = candidate["segmentStartSeq"];
+    const streamSeq = candidate["streamSeq"];
+    const text = candidate["text"];
+    if (
+      !hasOnlyKeys(candidate, LIVE_STREAM_SEGMENT_KEYS) ||
+      (candidate["kind"] !== "assistant" && candidate["kind"] !== "reasoningSummary") ||
+      !Number.isSafeInteger(segmentStartSeq) ||
+      (segmentStartSeq as number) < 1 ||
+      !Number.isSafeInteger(streamSeq) ||
+      (streamSeq as number) < (segmentStartSeq as number) ||
+      (previousStreamSeq !== undefined && (streamSeq as number) <= previousStreamSeq) ||
+      typeof text !== "string" ||
+      text.length === 0 ||
+      text.includes("\u0000") ||
+      !isWireTimestamp(candidate["occurredAt"])
+    )
+      return false;
+    const bytes = new TextEncoder().encode(text).byteLength;
+    if (bytes > MAX_LIVE_STREAM_SEGMENT_BYTES) return false;
+    totalBytes += bytes;
+    if (totalBytes > MAX_LIVE_STREAM_TOTAL_BYTES) return false;
+    if (previousStreamSeq !== undefined && (segmentStartSeq as number) !== previousStreamSeq + 1)
+      return false;
+    previousStreamSeq = streamSeq as number;
+  }
+  return previousStreamSeq === undefined || previousStreamSeq === (root["streamSeq"] as number);
 }
 
 /** 只接纳 reducer 投影所需的 snapshot 闭集，避免 domain 依赖 Zod 或 transport module。 */

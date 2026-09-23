@@ -2138,7 +2138,7 @@ public final class MybatisConversationRepository implements ConversationReposito
         PersistenceRecords.ThreadRow thread = mapper.history().selectThread(turn.threadId());
         if (thread == null) throw corrupted("thread_id");
         return new QueueMutation(inputId, inputQueue(mapper, turn.turnId(), turn.inputQueueRevision(),
-                turn.acceptingInputs()), thread.revision(), changed);
+                turn.acceptingInputs()), thread.revision(), turn.mutationVersion(), changed);
     }
 
     /** SQL 已按 Steering 点击序和普通 FIFO 排序；Java 只做严格领域投影。 */

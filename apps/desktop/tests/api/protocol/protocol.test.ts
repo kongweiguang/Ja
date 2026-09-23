@@ -473,6 +473,7 @@ describe("JA RPC v1 protocol", () => {
       contextUsage: null,
       taskActivities: [],
       goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);

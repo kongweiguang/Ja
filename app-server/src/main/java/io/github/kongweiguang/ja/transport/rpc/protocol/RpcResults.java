@@ -31,6 +31,7 @@ import io.github.kongweiguang.ja.task.domain.TaskModels;
 import java.util.ArrayList;
 import java.util.Locale;
 import java.util.List;
+import java.time.Instant;
 
 /**
  * 在不同 Handler 间共享无状态 Wire 投影规则。
@@ -258,6 +259,28 @@ public final class RpcResults {
         else result.set("changeSet", changeSet(mapper, turn.changeSet()));
         return result;
     }
+
+    /**
+     * 将 Java 活动流基线投影为稳定 nullable Wire 结构；segment kind 使用显式 camelCase，
+     * 防止前端把公开 reasoning summary 与私有 Provider reasoning 混为一谈。
+     */
+    public static ObjectNode liveStream(ObjectMapper mapper, String turnId, long streamSeq,
+                                        List<LiveStreamSegment> streamSegments) {
+        ObjectNode result = mapper.createObjectNode().put("turnId", turnId)
+                .put("streamSeq", streamSeq);
+        ArrayNode segmentNodes = result.putArray("segments");
+        streamSegments.forEach(segment -> segmentNodes.addObject()
+                .put("kind", segment.kind())
+                .put("segmentStartSeq", segment.segmentStartSeq())
+                .put("streamSeq", segment.streamSeq())
+                .put("text", segment.text())
+                .put("occurredAt", segment.occurredAt().toString()));
+        return result;
+    }
+
+    /** 协议层只接收已经由 runtime 校验过的公开片段，避免 Wire 反向依赖连接级缓存实现。 */
+    public record LiveStreamSegment(String kind, long segmentStartSeq, long streamSeq,
+                                    String text, Instant occurredAt) { }
 
     /** Task Summary 只投影 lineage 与常量级 projection，不物化 Child Timeline。 */
     public static ObjectNode task(ObjectMapper mapper, TaskModels.Summary value) {

@@ -366,7 +366,7 @@ final class AnthropicMessagesAdapterTest {
         assertTrue(events.stream().noneMatch(ModelPort.ReasoningBlockReady.class::isInstance));
     }
 
-    /** 初始 thinking 已公开即视为语义接纳，后续可重试截断不得重新发送请求。 */
+    /** 初始公开 thinking 在截断后可按摘要前缀去重重试，最终仍只保留一份摘要事件。 */
     @Test
     void acceptsInitialThinkingBeforeRetryableTruncation() throws Exception {
         String stream = """
@@ -391,7 +391,7 @@ final class AnthropicMessagesAdapterTest {
                 assertEquals("STREAM_TRUNCATED",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
         assertEquals("initial semantic output",
                 assertInstanceOf(ModelPort.ReasoningSummaryDelta.class, events.getFirst()).text());
@@ -591,7 +591,7 @@ final class AnthropicMessagesAdapterTest {
                 assertTrue(!protocol.getMessage().contains("private-mismatch-sentinel"));
             }
             assertTrue(events.isEmpty());
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 
@@ -789,7 +789,7 @@ final class AnthropicMessagesAdapterTest {
                 assertEquals("ANTHROPIC_EVENT", protocol.code());
                 assertTrue(!protocol.getMessage().contains("future_private_event"));
             }
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 
@@ -819,7 +819,7 @@ final class AnthropicMessagesAdapterTest {
                     assertEquals("ANTHROPIC_EVENT",
                             assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
                 }
-                assertEquals(1, server.calls());
+                assertEquals(3, server.calls());
             }
         }
     }

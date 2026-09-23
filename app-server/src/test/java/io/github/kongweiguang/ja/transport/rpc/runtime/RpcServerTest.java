@@ -200,7 +200,7 @@ final class RpcServerTest {
                     .toCompletableFuture().join();
             sink.publishTurn("goal_discovery", new TurnEvent.ApprovalRequested(
                     new TurnEvent.Context("evt_goal_approval", "thr_discovery", "turn_goal", 1,
-                            CLOCK.instant()), "appr_goal", "call_goal", "shell", "需要批准",
+                            0, CLOCK.instant()), "appr_goal", "call_goal", "shell", "需要批准",
                     CLOCK.instant().plusSeconds(60))).toCompletableFuture().join();
             String whileObserved = output.toString(StandardCharsets.UTF_8);
             assertTrue(whileObserved.contains("\"method\":\"assistant/text-delta\""));

@@ -26,9 +26,13 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME = "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
 const PNG_MINIMUM_BYTES = 300 * 1024;
-const IMAGE_FILE_NAME = "image-history-e2e.png";
-const SUCCESS_PROMPT = "__JA_IMAGE_HISTORY_SUCCESS__ 请确认收到这张图片。";
-const FAILURE_PROMPT = "__JA_IMAGE_HISTORY_FAILURE__ 请触发受控失败。";
+const IMAGE_FILE_NAME = "image-history-alpha.png";
+const SECOND_IMAGE_FILE_NAME = "image-history-beta.png";
+const IMAGE_FILE_NAMES = Object.freeze([IMAGE_FILE_NAME, SECOND_IMAGE_FILE_NAME]);
+const SUCCESS_PROMPT = "多图展示验收：请确认收到两张图片。";
+const FAILURE_PROMPT = "失败保留验收：请触发受控失败。";
+const SUCCESS_MARKER = "多图展示验收";
+const FAILURE_MARKER = "失败保留验收";
 const SUCCESS_REPLY = "JA_IMAGE_HISTORY_SUCCESS_REPLY";
 const STABLE_PORT_RANGE = Object.freeze({ start: 41_000, size: 8_000 });
 const STEP_TIMEOUT_MS = 30_000;
@@ -111,9 +115,10 @@ function pngChunk(type, data) {
 
 /**
  * 生成 320x320 RGBA PNG，并故意使用无压缩 DEFLATE 让有效图片稳定超过 300 KiB；像素仍是
- * 确定性图案，报告无需保存或泄漏任何用户图片。
+ * 确定性图案；variant 只改变像素颜色，保证两张同尺寸图片内容确实不同，报告无需保存或
+ * 泄漏任何用户图片。
  */
-export function createLargePngFixture() {
+export function createLargePngFixture(variant = 0) {
   const width = 320;
   const height = 320;
   const raw = Buffer.allocUnsafe(height * (1 + width * 4));
@@ -122,9 +127,9 @@ export function createLargePngFixture() {
     raw[row] = 0;
     for (let x = 0; x < width; x += 1) {
       const offset = row + 1 + x * 4;
-      raw[offset] = (x * 17 + y * 31) & 0xff;
-      raw[offset + 1] = (x * 47 + y * 13) & 0xff;
-      raw[offset + 2] = (x * 7 + y * 61) & 0xff;
+      raw[offset] = (x * 17 + y * 31 + variant * 29) & 0xff;
+      raw[offset + 1] = (x * 47 + y * 13 + variant * 43) & 0xff;
+      raw[offset + 2] = (x * 7 + y * 61 + variant * 71) & 0xff;
       raw[offset + 3] = 0xff;
     }
   }
@@ -146,7 +151,7 @@ export function createLargePngFixture() {
   return { bytes, width, height };
 }
 
-/** 从请求中寻找携带目标 prompt 的原生用户项，并严格核对同一项中的 input_image。 */
+/** 从请求中寻找携带目标 prompt 的原生用户项，并按顺序严格核对同一项中的全部 input_image。 */
 export function inspectNativeImageRequest(payload, marker, expectedBytes) {
   if (!Array.isArray(payload?.input)) return { kind: "non_turn" };
   const userItem = payload.input.findLast(
@@ -160,20 +165,46 @@ export function inspectNativeImageRequest(payload, marker, expectedBytes) {
   if (userItem === undefined) return { kind: "unrelated" };
   const imageBlocks = userItem.content.filter((block) => block?.type === "input_image");
   if (imageBlocks.length === 0) return { kind: "title" };
-  assert.equal(imageBlocks.length, 1, "target user item must contain exactly one native image");
-  const imageUrl = imageBlocks[0].image_url;
-  assert.equal(typeof imageUrl, "string", "input_image.image_url must be a string");
-  const match = /^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/u.exec(imageUrl);
-  assert.ok(match, "input_image must use a PNG data URL");
-  const encoded = match[1];
-  const decoded = Buffer.from(encoded, "base64");
-  assert.equal(decoded.equals(expectedBytes), true, "Provider image bytes changed before request");
-  assert.equal(encoded, expectedBytes.toString("base64"), "Provider image Base64 changed");
-  return {
+  const expectedImages = Array.isArray(expectedBytes) ? expectedBytes : [expectedBytes];
+  assert.equal(
+    imageBlocks.length,
+    expectedImages.length,
+    `target user item must contain exactly ${expectedImages.length} native images`,
+  );
+  const images = imageBlocks.map((block, index) => {
+    const imageUrl = block.image_url;
+    assert.equal(typeof imageUrl, "string", `input_image[${index}].image_url must be a string`);
+    const match = /^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/u.exec(imageUrl);
+    assert.ok(match, `input_image[${index}] must use a PNG data URL`);
+    const encoded = match[1];
+    const decoded = Buffer.from(encoded, "base64");
+    assert.equal(
+      decoded.equals(expectedImages[index]),
+      true,
+      `Provider image bytes changed before request at index ${index}`,
+    );
+    assert.equal(
+      encoded,
+      expectedImages[index].toString("base64"),
+      `Provider image Base64 changed at index ${index}`,
+    );
+    return {
+      byteLength: decoded.length,
+      base64Preserved: true,
+      detail: block.detail,
+    };
+  });
+  const result = {
     kind: "turn",
-    byteLength: decoded.length,
-    base64Preserved: true,
-    detail: imageBlocks[0].detail,
+    byteLength: images[0].byteLength,
+    base64Preserved: images.every(({ base64Preserved }) => base64Preserved),
+    detail: images[0].detail,
+  };
+  if (images.length === 1) return result;
+  return {
+    ...result,
+    imageCount: images.length,
+    images,
   };
 }
 
@@ -241,15 +272,9 @@ function successfulTextStream(text, ordinal) {
   ].join("");
 }
 
-/** 生成不可重试的 Provider 失败事件，稳定覆盖失败 Turn 的持久历史而不等待网络重试。 */
+/** 返回明确畸形 JSON，让真实适配器耗尽三次协议重试后才写入失败终态。 */
 function failedStream() {
-  return responseEvent("response.failed", 0, {
-    response: {
-      id: "resp_image_history_failure",
-      error: { code: "image_history_fixture_failure", message: "fixture failure" },
-      status: "failed",
-    },
-  });
+  return 'event: response.output_text.delta\ndata: {"type":\n\n';
 }
 
 /** 有界读取 Provider JSON；上限覆盖两张 300 KiB 图片的完整历史但拒绝无界请求。 */
@@ -265,7 +290,7 @@ async function readBoundedJson(request) {
 }
 
 /** 启动只监听 127.0.0.1 的 Responses fixture，并仅保留图片完整性与请求类别证据。 */
-async function startProviderFixture(expectedBytes) {
+export async function startProviderFixture(expectedBytes) {
   const attempts = [];
   let ordinal = 0;
   const server = createHttpServer(async (request, response) => {
@@ -277,10 +302,10 @@ async function startProviderFixture(expectedBytes) {
       }
       const payload = await readBoundedJson(request);
       const serialized = JSON.stringify(payload?.input ?? []);
-      const marker = serialized.includes("__JA_IMAGE_HISTORY_FAILURE__")
-        ? "__JA_IMAGE_HISTORY_FAILURE__"
-        : serialized.includes("__JA_IMAGE_HISTORY_SUCCESS__")
-          ? "__JA_IMAGE_HISTORY_SUCCESS__"
+      const marker = serialized.includes(FAILURE_MARKER)
+        ? FAILURE_MARKER
+        : serialized.includes(SUCCESS_MARKER)
+          ? SUCCESS_MARKER
           : undefined;
       if (marker === undefined) throw new Error("unclassified Provider request");
       const inspection = inspectNativeImageRequest(payload, marker, expectedBytes);
@@ -290,7 +315,7 @@ async function startProviderFixture(expectedBytes) {
         "cache-control": "no-store",
         "content-type": "text/event-stream; charset=utf-8",
       });
-      if (marker.includes("FAILURE") && inspection.kind === "turn") {
+      if (marker === FAILURE_MARKER && inspection.kind === "turn") {
         response.end(failedStream());
       } else {
         response.end(
@@ -438,7 +463,16 @@ async function writeTauriOverlay(directories, frontendPort) {
     identifier: `io.github.kongweiguang.ja.image${randomUUID().replaceAll("-", "")}`,
     build: { devUrl: origin },
     app: {
-      windows: [{ ...(await readProductionMainWindowConfig()) }],
+      // 真窗仍由 WebView2/CDP 驱动，但不抢用户前台；离屏位置避免 runner 覆盖正在使用的窗口。
+      windows: [
+        {
+          ...(await readProductionMainWindowConfig()),
+          focus: false,
+          center: false,
+          x: -10_000,
+          y: -10_000,
+        },
+      ],
       security: {
         devCsp: `default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ${origin} ${websocket}; img-src 'self' data: blob: ja-attachment: http://ja-attachment.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
       },
@@ -788,22 +822,33 @@ async function pasteImageAttachment(page, imagePath, deadline) {
   }
 }
 
+/**
+ * 连续通过两个真实 paste 事件构造同一 Composer 草稿；剪贴板 broker 每次都恢复用户内容，
+ * 所以验收只短暂占用系统剪贴板，同时覆盖 UI 的多附件归并而不是伪造 DOM 状态。
+ */
+async function pasteImageAttachments(page, imagePaths, deadline) {
+  const previews = [];
+  for (const imagePath of imagePaths) {
+    previews.push(await pasteImageAttachment(page, imagePath, deadline));
+  }
+  return previews;
+}
+
 /** 定位包含指定 prompt 的唯一用户消息，保证附件断言绑定到正确 Turn 而非历史任意图片。 */
 async function userMessageFor(page, prompt, deadline) {
-  const message = page
-    .locator('.ja-chat-message-user[data-role="user"]')
-    .filter({ hasText: prompt });
-  await message.waitFor({ state: "visible", timeout: timeout(deadline) });
-  assert.equal(await message.count(), 1, "prompt must identify exactly one user message");
+  // Markdown 会把成对下划线作为强调标记，真窗正文可能不再保留原始 prompt 的 `_`；
+  // 这里取最新用户消息，再用规范化可见文本确认它仍对应本次发送，避免依赖 DOM 文本节点拆分。
+  const messages = page.locator('.ja-chat-message-user[data-role="user"]');
+  await messages.last().waitFor({ state: "visible", timeout: timeout(deadline) });
+  const message = messages.last();
+  const observed = (await message.innerText()).replaceAll("_", " ").replace(/\s+/gu, " ").trim();
+  const expected = prompt.replaceAll("_", " ").replace(/\s+/gu, " ").trim();
+  assert.equal(observed.includes(expected), true, "latest user message does not match prompt");
   return message;
 }
 
-/**
- * 校验历史缩略图真实解码且只走 Tauri custom protocol；blob/data URL 即使能显示也不能证明
- * Thread scope、session token 和 native image pipeline。
- */
-async function historyThumbnailFacts(message, deadline) {
-  const image = message.locator("[data-attachment-id] img").first();
+/** 等待指定图片真正解码，避免仅凭 img 节点存在就把失败资源算作通过。 */
+async function waitForDecodedImage(image, deadline, label) {
   await image.waitFor({ state: "visible", timeout: timeout(deadline) });
   await image.evaluate(
     (element, maximumWaitMs) =>
@@ -813,7 +858,7 @@ async function historyThumbnailFacts(message, deadline) {
           return;
         }
         const timer = setTimeout(
-          () => rejectPromise(new Error("history thumbnail decode timed out")),
+          () => rejectPromise(new Error("image decode timed out")),
           maximumWaitMs,
         );
         const finish = () => {
@@ -822,7 +867,7 @@ async function historyThumbnailFacts(message, deadline) {
         };
         const fail = () => {
           clearTimeout(timer);
-          rejectPromise(new Error("history thumbnail decode failed"));
+          rejectPromise(new Error("image decode failed"));
         };
         element.addEventListener("load", finish, { once: true });
         element.addEventListener("error", fail, { once: true });
@@ -834,42 +879,148 @@ async function historyThumbnailFacts(message, deadline) {
     naturalHeight: element.naturalHeight,
     currentSrc: element.currentSrc || element.src,
   }));
-  assert.ok(facts.naturalWidth > 0 && facts.naturalHeight > 0, "history thumbnail did not decode");
-  const url = new URL(facts.currentSrc);
-  const nativeProtocol =
-    url.protocol === "ja-attachment:" ||
-    (url.protocol === "http:" && url.hostname === "ja-attachment.localhost");
-  assert.equal(nativeProtocol, true, "history thumbnail must use the native attachment scheme");
+  assert.ok(facts.naturalWidth > 0 && facts.naturalHeight > 0, `${label} image did not decode`);
+  return facts;
+}
+
+/**
+ * 校验草稿中的每个附件缩略图已解码；只看真实 Composer 卡片，避免历史附件误满足断言。
+ */
+async function draftAttachmentFacts(page, fileNames, deadline) {
+  const cards = page.locator(".ja-composer__attachments > .ja-composer-attachment");
+  await cards.first().waitFor({ state: "visible", timeout: timeout(deadline) });
+  assert.equal(await cards.count(), fileNames.length, "Composer draft must contain both images");
+  const items = [];
+  for (const fileName of fileNames) {
+    const card = cards.filter({ hasText: fileName }).first();
+    await card.waitFor({ state: "visible", timeout: timeout(deadline) });
+    const image = card.locator("img").first();
+    const facts = await waitForDecodedImage(image, deadline, `draft ${fileName}`);
+    items.push({ fileName, naturalWidth: facts.naturalWidth, naturalHeight: facts.naturalHeight });
+  }
+  return { count: items.length, items };
+}
+
+/**
+ * 校验历史缩略图真实解码且只走 Tauri custom protocol；blob/data URL 即使能显示也不能证明
+ * Thread scope、session token 和 native image pipeline。
+ */
+async function historyThumbnailFacts(message, fileNames, deadline) {
+  const items = [];
+  for (const fileName of fileNames) {
+    const button = message.getByRole("button", { name: `预览附件 ${fileName}`, exact: true });
+    await button.waitFor({ state: "visible", timeout: timeout(deadline) });
+    const item = button.locator("xpath=ancestor::li[@data-attachment-id][1]");
+    const image = item.locator("img").first();
+    const facts = await waitForDecodedImage(image, deadline, `history ${fileName}`);
+    const url = new URL(facts.currentSrc);
+    const nativeProtocol =
+      url.protocol === "ja-attachment:" ||
+      (url.protocol === "http:" && url.hostname === "ja-attachment.localhost");
+    assert.equal(nativeProtocol, true, "history thumbnail must use the native attachment scheme");
+    items.push({
+      fileName,
+      naturalWidth: facts.naturalWidth,
+      naturalHeight: facts.naturalHeight,
+      scheme: url.protocol === "ja-attachment:" ? "ja-attachment" : "ja-attachment.localhost",
+    });
+  }
   return {
-    naturalWidth: facts.naturalWidth,
-    naturalHeight: facts.naturalHeight,
-    scheme: url.protocol === "ja-attachment:" ? "ja-attachment" : "ja-attachment.localhost",
+    count: items.length,
+    items,
+    naturalWidth: items[0]?.naturalWidth,
+    naturalHeight: items[0]?.naturalHeight,
+    scheme: items[0]?.scheme,
   };
 }
 
-/** 点击历史附件的可见预览动作，并校验 Preview 中的图片也完成自然尺寸解码。 */
-async function openHistoryPreview(page, message, deadline) {
-  const button = message.getByRole("button", { name: `预览附件 ${IMAGE_FILE_NAME}`, exact: true });
+/** 读取用户消息附件与正文几何关系，证明两张图片位于正文上方且消息没有横向溢出。 */
+async function historyAttachmentLayoutFacts(message) {
+  const facts = await message.evaluate((messageElement) => {
+    const attachments = messageElement.querySelector(".ja-chat-attachments");
+    const markdown = messageElement.querySelector(".ja-markdown");
+    const body = messageElement.querySelector(".ja-chat-message__body") ?? messageElement;
+    if (attachments === null || markdown === null) {
+      return {
+        attachmentCount: 0,
+        imageCount: 0,
+        attachmentsBeforeText: false,
+        imagesAboveText: false,
+        rightAligned: false,
+        horizontalOverflow: true,
+      };
+    }
+    const relation = attachments.compareDocumentPosition(markdown);
+    const textRect = markdown.getBoundingClientRect();
+    const imageRects = [...attachments.querySelectorAll(".ja-chat-attachment--image img")].map(
+      (image) => {
+        const rect = image.getBoundingClientRect();
+        return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+      },
+    );
+    const maxImageRight = Math.max(
+      ...imageRects.map(({ right }) => right),
+      Number.NEGATIVE_INFINITY,
+    );
+    const imagesAboveText =
+      imageRects.length > 0 && imageRects.every(({ bottom }) => bottom <= textRect.top + 1);
+    const rightAligned = maxImageRight >= textRect.right - 4;
+    const horizontalOverflow =
+      messageElement.scrollWidth > messageElement.clientWidth + 1 ||
+      body.scrollWidth > body.clientWidth + 1;
+    return {
+      attachmentCount: attachments.querySelectorAll("[data-attachment-id]").length,
+      imageCount: imageRects.length,
+      attachmentsBeforeText: Boolean(relation & globalThis.Node.DOCUMENT_POSITION_FOLLOWING),
+      imagesAboveText,
+      rightAligned,
+      horizontalOverflow,
+      bodyWidth: body.clientWidth,
+      bodyScrollWidth: body.scrollWidth,
+      textTop: textRect.top,
+      maxImageRight,
+      textRight: textRect.right,
+    };
+  });
+  assert.equal(facts.attachmentCount, 2, "history message must render both image attachments");
+  assert.equal(facts.attachmentsBeforeText, true, "attachments must be above message text");
+  assert.equal(facts.imageCount, 2, "history message must render two image thumbnails");
+  assert.equal(facts.imagesAboveText, true, "image thumbnails must be above the text bubble");
+  assert.equal(
+    facts.rightAligned,
+    true,
+    "image thumbnails must align to the text bubble right edge",
+  );
+  assert.equal(facts.horizontalOverflow, false, "message body must not overflow horizontally");
+  return { ...facts, noHorizontalOverflow: !facts.horizontalOverflow };
+}
+
+/** 点击指定历史附件的预览动作，并校验右栏图片由原生附件协议完成解码。 */
+async function openHistoryPreview(page, message, fileName, deadline) {
+  const button = message.getByRole("button", { name: `预览附件 ${fileName}`, exact: true });
   await button.click({ timeout: timeout(deadline) });
   const preview = page.locator(".ja-attachment-preview");
   await preview.waitFor({ state: "visible", timeout: timeout(deadline) });
-  const image = preview.getByRole("img", { name: IMAGE_FILE_NAME, exact: true });
-  await page.waitForFunction(
-    (name) => {
-      const candidate = [...globalThis.document.images].find((value) => value.alt === name);
-      return candidate !== undefined && candidate.naturalWidth > 0 && candidate.naturalHeight > 0;
-    },
-    IMAGE_FILE_NAME,
-    { timeout: timeout(deadline) },
-  );
-  const currentSrc = await image.evaluate((element) => element.currentSrc || element.src);
-  const url = new URL(currentSrc);
+  const image = preview.getByRole("img", { name: fileName, exact: true });
+  const facts = await waitForDecodedImage(image, deadline, `preview ${fileName}`);
+  const url = new URL(facts.currentSrc);
   assert.ok(
     url.protocol === "ja-attachment:" ||
       (url.protocol === "http:" && url.hostname === "ja-attachment.localhost"),
     "preview must use the native attachment scheme",
   );
-  return { opened: true, decoded: true };
+  return { fileName, opened: true, decoded: true };
+}
+
+/** 点击右栏返回动作并等待附件模式卸载，确保下一张图片不会复用旧 Preview session。 */
+async function closeHistoryPreview(page, deadline) {
+  await page.getByRole("button", { name: "返回网页预览", exact: true }).click({
+    timeout: timeout(deadline),
+  });
+  await page.locator(".ja-attachment-preview").waitFor({
+    state: "hidden",
+    timeout: timeout(deadline),
+  });
 }
 
 /** 点击可见发送按钮，并等待目标用户消息 ACK 落入时间线。 */
@@ -896,7 +1047,7 @@ async function waitForSuccessfulTurn(page, message, deadline) {
 }
 
 /** 等待受控 Provider 失败进入 failed 状态，并确认错误没有被错误归因为上下文超限。 */
-async function waitForFailedTurn(message, deadline) {
+async function waitForFailedTurn(page, message, deadline) {
   const row = message.locator("xpath=ancestor::div[@data-turn-id][1]");
   await row.locator('.ja-chat-message-final[data-response-state="failed"]').waitFor({
     state: "visible",
@@ -908,7 +1059,12 @@ async function waitForFailedTurn(message, deadline) {
     false,
     "controlled Provider failure became CONTEXT_LIMIT",
   );
-  return { retained: true, contextLimitVisible: false };
+  const continuation = page.getByRole("button", {
+    name: "继续回复",
+    exact: true,
+  });
+  await continuation.waitFor({ state: "visible", timeout: timeout(deadline) });
+  return { retained: true, contextLimitVisible: false, continuationVisible: true };
 }
 
 /** 等待 fixture 观察到目标 Turn 图片请求，不使用任意 sleep 判断跨进程收敛。 */
@@ -940,22 +1096,49 @@ export function validateImageHistoryReport(report) {
   require(report?.provider?.externalCalls === 0, "external-provider");
   require(report?.image?.sizeBytes >= PNG_MINIMUM_BYTES, "png-size");
   require(report?.image?.validPng === true, "png-valid");
+  require(Array.isArray(report?.image?.fileNames) &&
+    report.image.fileNames.length === 2, "image-file-names");
+  require(Array.isArray(report?.image?.images) &&
+    report.image.images.length === 2, "image-fixtures");
   require(report?.successTurn?.submittedViaUi === true, "success-submit-ui");
   require(report?.successTurn?.base64Preserved === true, "success-base64");
+  require(report?.successTurn?.nativeImageCount === 2, "success-native-image-count");
   require(report?.successTurn?.contextLimitVisible === false, "success-context-limit");
-  require(report?.successTurn?.immediateThumbnail?.naturalWidth > 0, "immediate-thumbnail");
-  require(report?.successTurn?.immediateThumbnail?.scheme !== "blob", "immediate-native-scheme");
-  require(report?.preview?.opened === true && report?.preview?.decoded === true, "preview");
+  require(report?.successTurn?.draft?.count === 2, "draft-image-count");
+  require(report?.successTurn?.draft?.items?.every(({ naturalWidth }) => naturalWidth > 0) ===
+    true, "draft-thumbnails");
+  require(report?.successTurn?.immediateThumbnails?.count === 2, "immediate-thumbnail-count");
+  require(report?.successTurn?.immediateThumbnails?.items?.every(
+    ({ naturalWidth, scheme }) => naturalWidth > 0 && scheme !== "blob",
+  ) === true, "immediate-native-scheme");
+  require(report?.successTurn?.layout?.imagesAboveText === true &&
+    report.successTurn.layout.rightAligned === true &&
+    report.successTurn.layout.noHorizontalOverflow === true, "message-layout");
+  require(report?.preview?.opened === true &&
+    report.preview.decoded === true &&
+    report.preview.count === 2 &&
+    report.preview.returnedBetweenItems === true, "preview");
   require(report?.reload?.sameThread === true, "reload-thread");
-  require(report?.reload?.thumbnail?.naturalWidth > 0, "reload-thumbnail");
+  require(report?.reload?.thumbnail?.count === 2, "reload-thumbnail-count");
+  require(report?.reload?.thumbnail?.items?.every(({ naturalWidth }) => naturalWidth > 0) ===
+    true, "reload-thumbnail");
+  require(report?.reload?.previewReopened === true, "reload-preview");
+  require(report?.reload?.narrow?.noHorizontalOverflow === true, "narrow-overflow");
+  require(report?.reload?.narrow?.visibleImageCount === 2, "narrow-visible-images");
   require(report?.failureTurn?.terminalState === "failed", "failed-terminal");
+  require(report?.failureTurn?.providerAttempts === 3, "failed-retry-budget");
   require(report?.failureTurn?.base64Preserved === true, "failed-base64");
+  require(report?.failureTurn?.nativeImageCount === 2, "failed-native-image-count");
   require(report?.failureTurn?.attachmentRetained === true, "failed-image-retained");
+  require(report?.failureTurn?.continuationVisible === true, "failed-continuation");
   require(report?.failureTurn?.contextLimitVisible === false, "failed-context-limit");
   return { passed: failures.length === 0, failures };
 }
 
-/** 运行完整真窗场景并在外部证据目录发布报告；私有运行目录无论成功失败都会清理。 */
+/**
+ * 运行完整真窗多图场景并在外部证据目录发布报告；私有运行目录无论成功失败都会清理，
+ * 失败 Turn 只验收附件留存和继续入口，不在这里自动点击继续以免改变 Provider 证据。
+ */
 export async function runProduction(options) {
   await mkdir(options.evidenceDirectory, { recursive: true });
   const reportPath = join(options.evidenceDirectory, "image-history-report.json");
@@ -971,10 +1154,12 @@ export async function runProduction(options) {
     stage = "fixture";
     directories = await createRunDirectories();
     assert.ok(!options.evidenceDirectory.startsWith(`${directories.root}\\`));
-    const png = createLargePngFixture();
-    const imagePath = join(directories.workspace, IMAGE_FILE_NAME);
-    await writeFile(imagePath, png.bytes);
-    provider = await startProviderFixture(png.bytes);
+    const imageFixtures = [createLargePngFixture(0), createLargePngFixture(1)];
+    const imagePaths = IMAGE_FILE_NAMES.map((fileName) => join(directories.workspace, fileName));
+    await Promise.all(
+      imagePaths.map((imagePath, index) => writeFile(imagePath, imageFixtures[index].bytes)),
+    );
+    provider = await startProviderFixture(imageFixtures.map(({ bytes }) => bytes));
     await writeIsolatedSettings(directories.home, provider.baseUrl);
     const frontendPort = await reservePort();
     const cdpPort = await reservePort(new Set([frontendPort]));
@@ -1001,48 +1186,95 @@ export async function runProduction(options) {
     const threadId = await currentThreadId(page);
 
     stage = "success_paste";
-    await pasteImageAttachment(page, imagePath, deadline);
+    await pasteImageAttachments(page, imagePaths, deadline);
+    const draft = await draftAttachmentFacts(page, IMAGE_FILE_NAMES, deadline);
+    await page.screenshot({
+      path: join(options.evidenceDirectory, "01-draft-two-images.png"),
+      animations: "disabled",
+    });
     stage = "success_submit";
     const successMessage = await submitWithImage(page, SUCCESS_PROMPT, deadline);
-    const successAttempt = await waitForProviderTurn(
-      provider,
-      "__JA_IMAGE_HISTORY_SUCCESS__",
+    const successAttempt = await waitForProviderTurn(provider, SUCCESS_MARKER, deadline);
+    const immediateThumbnails = await historyThumbnailFacts(
+      successMessage,
+      IMAGE_FILE_NAMES,
       deadline,
     );
-    const immediateThumbnail = await historyThumbnailFacts(successMessage, deadline);
+    const successLayout = await historyAttachmentLayoutFacts(successMessage);
     await waitForSuccessfulTurn(page, successMessage, deadline);
     await page.screenshot({
-      path: join(options.evidenceDirectory, "01-success-history.png"),
+      path: join(options.evidenceDirectory, "02-success-two-image-message.png"),
       animations: "disabled",
     });
     stage = "success_preview";
-    const preview = await openHistoryPreview(page, successMessage, deadline);
-    await page.screenshot({
-      path: join(options.evidenceDirectory, "02-image-preview.png"),
-      animations: "disabled",
-    });
+    const previewItems = [];
+    for (const [index, fileName] of IMAGE_FILE_NAMES.entries()) {
+      previewItems.push(await openHistoryPreview(page, successMessage, fileName, deadline));
+      await page.screenshot({
+        path: join(options.evidenceDirectory, `0${index + 3}-preview-${index + 1}.png`),
+        animations: "disabled",
+      });
+      await closeHistoryPreview(page, deadline);
+    }
 
     stage = "reload_restore";
     await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
     await waitForApplication(page, deadline);
     await selectThread(page, threadId, deadline);
     const restoredMessage = await userMessageFor(page, SUCCESS_PROMPT, deadline);
-    const restoredThumbnail = await historyThumbnailFacts(restoredMessage, deadline);
-    await openHistoryPreview(page, restoredMessage, deadline);
-
-    stage = "failure_paste";
-    await pasteImageAttachment(page, imagePath, deadline);
-    stage = "failure_submit";
-    const failedMessage = await submitWithImage(page, FAILURE_PROMPT, deadline);
-    const failureAttempt = await waitForProviderTurn(
-      provider,
-      "__JA_IMAGE_HISTORY_FAILURE__",
+    const restoredThumbnail = await historyThumbnailFacts(
+      restoredMessage,
+      IMAGE_FILE_NAMES,
       deadline,
     );
-    const failureState = await waitForFailedTurn(failedMessage, deadline);
-    const failureThumbnail = await historyThumbnailFacts(failedMessage, deadline);
+    for (const fileName of IMAGE_FILE_NAMES) {
+      await openHistoryPreview(page, restoredMessage, fileName, deadline);
+      await closeHistoryPreview(page, deadline);
+    }
+    const collapseWorkbench = page.getByRole("button", { name: "收起右侧栏", exact: true });
+    if (await collapseWorkbench.isVisible()) await collapseWorkbench.click();
+    await page.setViewportSize({ width: 720, height: 640 });
+    if (await collapseWorkbench.isVisible()) await collapseWorkbench.click();
+    await restoredMessage.scrollIntoViewIfNeeded({ timeout: timeout(deadline) });
+    const narrowVisibleImages = await restoredMessage.evaluate(
+      (element) =>
+        [...element.querySelectorAll(".ja-chat-attachment--image img")].filter((image) => {
+          const box = image.getBoundingClientRect();
+          const centerX = (box.left + box.right) / 2;
+          const centerY = (box.top + box.bottom) / 2;
+          return (
+            image.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }) &&
+            box.width > 0 &&
+            box.height > 0 &&
+            box.left >= 0 &&
+            box.top >= 0 &&
+            box.right <= globalThis.innerWidth &&
+            box.bottom <= globalThis.innerHeight &&
+            image === globalThis.document.elementFromPoint(centerX, centerY)
+          );
+        }).length,
+    );
+    assert.equal(narrowVisibleImages, 2, "narrow screenshot must show both unobscured images");
+    const narrowLayout = await historyAttachmentLayoutFacts(restoredMessage);
     await page.screenshot({
-      path: join(options.evidenceDirectory, "03-failed-history-retained.png"),
+      path: join(options.evidenceDirectory, "05-reload-two-image-narrow.png"),
+      animations: "disabled",
+    });
+    await page.setViewportSize({ width: 1280, height: 820 });
+
+    stage = "failure_paste";
+    await pasteImageAttachments(page, imagePaths, deadline);
+    stage = "failure_submit";
+    const failedMessage = await submitWithImage(page, FAILURE_PROMPT, deadline);
+    const failureAttempt = await waitForProviderTurn(provider, FAILURE_MARKER, deadline);
+    const failureState = await waitForFailedTurn(page, failedMessage, deadline);
+    const failureAttempts = provider.attempts.filter(
+      ({ marker, kind }) => marker === FAILURE_MARKER && kind === "turn",
+    ).length;
+    assert.equal(failureAttempts, 3, "protocol failure must exhaust exactly three attempts");
+    const failureThumbnail = await historyThumbnailFacts(failedMessage, IMAGE_FILE_NAMES, deadline);
+    await page.screenshot({
+      path: join(options.evidenceDirectory, "06-failed-two-image-history-retained.png"),
       animations: "disabled",
     });
     assert.deepEqual(pageErrors, [], `WebView2 page errors: ${pageErrors.join(" | ")}`);
@@ -1065,26 +1297,48 @@ export async function runProduction(options) {
       },
       image: {
         fileName: IMAGE_FILE_NAME,
-        sizeBytes: png.bytes.length,
-        validPng: png.bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
-        dimensions: { width: png.width, height: png.height },
+        fileNames: IMAGE_FILE_NAMES,
+        sizeBytes: imageFixtures[0].bytes.length,
+        validPng: imageFixtures.every(({ bytes }) =>
+          bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
+        ),
+        dimensions: { width: imageFixtures[0].width, height: imageFixtures[0].height },
+        images: imageFixtures.map((fixture, index) => ({
+          fileName: IMAGE_FILE_NAMES[index],
+          sizeBytes: fixture.bytes.length,
+          validPng: fixture.bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
+          dimensions: { width: fixture.width, height: fixture.height },
+        })),
       },
       successTurn: {
         submittedViaUi: true,
         base64Preserved: successAttempt.base64Preserved === true,
+        nativeImageCount: successAttempt.imageCount,
         contextLimitVisible: false,
-        immediateThumbnail,
+        draft,
+        immediateThumbnails,
+        layout: successLayout,
       },
-      preview,
+      preview: {
+        opened: previewItems.every(({ opened }) => opened),
+        decoded: previewItems.every(({ decoded }) => decoded),
+        count: previewItems.length,
+        items: previewItems,
+        returnedBetweenItems: true,
+      },
       reload: {
         sameThread: (await currentThreadId(page)) === threadId,
         thumbnail: restoredThumbnail,
         previewReopened: true,
+        narrow: { ...narrowLayout, visibleImageCount: narrowVisibleImages },
       },
       failureTurn: {
         terminalState: "failed",
+        providerAttempts: failureAttempts,
         base64Preserved: failureAttempt.base64Preserved === true,
-        attachmentRetained: failureState.retained && failureThumbnail.naturalWidth > 0,
+        nativeImageCount: failureAttempt.imageCount,
+        attachmentRetained: failureState.retained && failureThumbnail.count === 2,
+        continuationVisible: failureState.continuationVisible,
         contextLimitVisible: failureState.contextLimitVisible,
         thumbnail: failureThumbnail,
       },
@@ -1113,7 +1367,12 @@ export async function runProduction(options) {
           status: "failed",
           stage,
           error: safeError,
-          diagnostics: { pageErrors },
+          diagnostics: {
+            pageErrors,
+            runRoot: directories?.root,
+            launcherStdout: launch?.output.stdout?.slice(-2_000),
+            launcherStderr: launch?.output.stderr?.slice(-2_000),
+          },
         },
         null,
         2,
@@ -1125,7 +1384,7 @@ export async function runProduction(options) {
     await browser?.close().catch(() => undefined);
     await terminateOwnedLauncher(launch);
     await provider?.close().catch(() => undefined);
-    if (directories?.root !== undefined) {
+    if (directories?.root !== undefined && process.env.JA_E2E_KEEP_RUN !== "1") {
       await removeOwnedRunRoot(directories.root).catch(() => undefined);
     }
   }

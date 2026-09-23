@@ -23,6 +23,7 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMa
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.ToolPresentationCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnChangeSetCodec;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnExecutionStateCodec;
 import io.github.kongweiguang.ja.infrastructure.persistence.transaction.MybatisUnitOfWork;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.out.WorkspaceRepository;
@@ -59,6 +60,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     private final MybatisConversationRepository agentStore;
     private final ToolPresentationCodec presentations;
     private final TurnChangeSetCodec changeSets;
+    private final TurnExecutionStateCodec executions;
     private final PersistenceCodec codec;
     private final Clock clock;
 
@@ -72,6 +74,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         Objects.requireNonNull(objectMapper, "objectMapper");
         presentations = new ToolPresentationCodec(objectMapper);
         changeSets = new TurnChangeSetCodec(objectMapper);
+        executions = new TurnExecutionStateCodec(objectMapper);
         codec = new PersistenceCodec(objectMapper);
         this.clock = Objects.requireNonNull(clock, "clock");
     }
@@ -87,6 +90,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         Objects.requireNonNull(objectMapper, "objectMapper");
         presentations = new ToolPresentationCodec(objectMapper);
         changeSets = new TurnChangeSetCodec(objectMapper);
+        executions = new TurnExecutionStateCodec(objectMapper);
         codec = new PersistenceCodec(objectMapper);
         this.clock = Objects.requireNonNull(clock, "clock");
     }
@@ -260,7 +264,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
             }
             List<PersistenceRecords.TurnRow> turnRows = mapper.agent().selectTurns(threadId);
             List<ThreadSnapshot.Turn> turns = turnRows.stream()
-                    .map(this::snapshotTurn).toList();
+                    .map(rowValue -> snapshotTurn(mapper, rowValue)).toList();
             List<ThreadSnapshot.Item> items = rows.stream().map(this::snapshotItem).toList();
             PersistenceRecords.ContextUsageRow usageRow = mapper.history().selectLatestContextUsage(threadId);
             ThreadSnapshot.ContextUsage contextUsage = usageRow == null ? null
@@ -439,6 +443,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
         return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectTurnById(turnId)).map(row ->
                 new TurnSummary(requiredText(row.threadId(), "thread_id"), requiredText(row.turnId(), "turn_id"),
                         requiredText(row.state(), "state"), requiredNumber(row.threadRevision(), "thread_revision"),
+                        requiredNumber(row.mutationVersion(), "mutation_version"),
                         row.cancelRequestedAt() != null)));
     }
 
@@ -781,13 +786,50 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /** 历史 Turn 只投影 Operation 生命周期；请求级模型事实由 Context Usage 提供。 */
-    private ThreadSnapshot.Turn snapshotTurn(PersistenceRecords.TurnRow row) {
+    /**
+     * 将 Turn 行与同一事务中的 execution common.modelRound 一起投影；dispatch UNKNOWN 只改变
+     * mutation，不改变已完成模型轮次，因此 read 可以识别迟到 ModelStep 而不误伤首段 draft。
+     */
+    private ThreadSnapshot.Turn snapshotTurn(PersistenceMappers mapper, PersistenceRecords.TurnRow row) {
+        String state = requiredText(row.state(), "state").toLowerCase(Locale.ROOT);
+        TurnState lifecycle = parseTurnState(state);
         return new ThreadSnapshot.Turn(requiredText(row.turnId(), "turn_id"),
-                requiredText(row.state(), "state").toLowerCase(Locale.ROOT),
+                state,
                 Instant.parse(requiredText(row.requestedAt(), "requested_at")),
                 Instant.parse(requiredText(row.updatedAt(), "updated_at")),
                 row.completedAt() == null ? null : Instant.parse(row.completedAt()), row.errorCode(),
-                row.changeSetJson() == null ? null : changeSets.read(row.changeSetJson()));
+                row.changeSetJson() == null ? null : changeSets.read(row.changeSetJson()),
+                requiredNumber(row.mutationVersion(), "mutation_version"),
+                lifecycle.terminal() ? 0 : executionModelRound(mapper, row.turnId(), state));
+    }
+
+    /** 将数据库状态一次解析为领域闭集；终态不再查询已按生命周期删除的 execution 行。 */
+    private static TurnState parseTurnState(String state) {
+        try {
+            return TurnState.valueOf(state.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException failure) {
+            throw new StorageException(StorageException.Code.INVALID_STATE, "invalid turn state", failure);
+        }
+    }
+
+    /**
+     * execution JSON 是活动 Turn 恢复事实的唯一 owner；已终态、排队初始态和已挂起态按领域
+     * 生命周期允许清理 execution 行，只映射为零轮次，不能把缺失行伪造成活动运行基线。
+     */
+    private int executionModelRound(PersistenceMappers mapper, String turnId, String stateText) {
+        PersistenceRecords.TurnExecutionRow row = mapper.agent().selectTurnExecution(turnId);
+        if (row == null) {
+            TurnState state = parseTurnState(stateText);
+            if (state == TurnState.QUEUED || state == TurnState.SUSPENDED || state.terminal()) return 0;
+            throw new StorageException(StorageException.Code.INVALID_STATE,
+                    "turn execution is missing for active state");
+        }
+        try {
+            return executions.read(requiredText(row.stateJson(), "state_json")).common().modelRound();
+        } catch (RuntimeException failure) {
+            throw new StorageException(StorageException.Code.INVALID_STATE,
+                    "turn execution cannot provide model round", failure);
+        }
     }
 
     /**

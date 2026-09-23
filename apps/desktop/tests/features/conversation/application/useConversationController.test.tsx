@@ -119,6 +119,7 @@ function emptySnapshot(threadId: string, revision = 0) {
     items: [],
     inputQueue: null,
     contextUsage: null,
+    liveStream: null,
     taskActivities: [],
     goalActivities: [],
     nextCursor: null,
@@ -159,6 +160,7 @@ function contentSnapshot(
     ],
     inputQueue: null,
     contextUsage: null,
+    liveStream: null,
     taskActivities: [],
     goalActivities: [],
     nextCursor: null,
@@ -172,7 +174,7 @@ function stateChangedEvent(input: {
   turnId: string;
   threadRevision: number;
   from: "queued" | "running";
-  to: "running" | "completed";
+  to: "running" | "waiting_approval" | "suspended" | "completed";
 }): Extract<TimelineEvent, { method: "turn/state-changed" }> {
   return {
     jsonrpc: "2.0",
@@ -225,6 +227,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -319,6 +322,64 @@ describe("useConversationController", () => {
     expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
   });
 
+  /** 分页提交边界连续变化时只从第一页重取三次，不能把混合 revision 发布成历史正文。 */
+  it("分页 revision 变化最多重取三次并保留 resync 意图", async () => {
+    const existing = thread("thr_paginated_revision_race");
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(emptySnapshot(existing.threadId, 0))
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 1), nextCursor: "cursor_1" })
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 2), nextCursor: null })
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 3), nextCursor: "cursor_2" })
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 4), nextCursor: null })
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 5), nextCursor: "cursor_3" })
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 6), nextCursor: null });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result, unmount } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    vi.useFakeTimers();
+    try {
+      act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(threadRead).toHaveBeenCalledTimes(7);
+      expect(threadRead).toHaveBeenNthCalledWith(2, { threadId: existing.threadId });
+      expect(threadRead).toHaveBeenNthCalledWith(4, { threadId: existing.threadId });
+      expect(threadRead).toHaveBeenNthCalledWith(6, { threadId: existing.threadId });
+      expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeDefined();
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
   /**
    * active snapshot 没有 terminal event 时仍由可见 Thread controller 消费 resync；首次 read
    * 失败后按 retry timer 重试，第二次权威 terminal snapshot 到达即可解除 active projection。
@@ -369,6 +430,7 @@ describe("useConversationController", () => {
         await Promise.resolve();
       });
       expect(threadRead).toHaveBeenCalledTimes(2);
+      expect(result.current.backgroundError).toContain("会话状态暂时无法自动恢复");
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1_000);
@@ -380,9 +442,333 @@ describe("useConversationController", () => {
         "completed",
       );
       expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+      expect(result.current.backgroundError).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /** 过旧 recovery snapshot 不是成功；迟到读取必须保留 resync 并沿有界退避继续取样。 */
+  it("late recovery snapshot 不清除 resync，并在退避后接纳新终态", async () => {
+    const existing = thread("thr_late_recovery");
+    const active = contentSnapshot(existing.threadId, "running", 4);
+    const terminal = contentSnapshot(existing.threadId, "completed", 6);
+    let releaseLate!: (snapshot: TimelineSnapshot) => void;
+    const lateRead = new Promise<TimelineSnapshot>((resolve) => {
+      releaseLate = resolve;
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(active)
+      .mockImplementationOnce(async () => lateRead)
+      .mockResolvedValueOnce(terminal);
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    vi.useFakeTimers();
+    try {
+      act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(threadRead).toHaveBeenCalledTimes(2);
+      let deltaOutcome: ReturnType<typeof useTimelineStore.getState>["lastOutcome"];
+      let stateChangeOutcome: ReturnType<typeof useTimelineStore.getState>["lastOutcome"];
+      act(() => {
+        deltaOutcome = useTimelineStore.getState().applyHostEvent({
+          kind: "timeline",
+          event: {
+            jsonrpc: "2.0",
+            method: "assistant/text-delta",
+            params: {
+              serverInstanceId: "srv_1",
+              eventId: "evt_late_recovery_delta",
+              sequence: 5,
+              occurredAt: "2026-09-01T00:00:01Z",
+              generation: 1,
+              workspaceId: WORKSPACE.workspaceId,
+              threadId: existing.threadId,
+              turnId: `${existing.threadId}:turn`,
+              threadRevision: 5,
+              streamSeq: 1,
+              text: "仍在输出",
+            },
+          },
+        });
+        stateChangeOutcome = useTimelineStore.getState().applyHostEvent({
+          kind: "timeline",
+          event: stateChangedEvent({
+            workspaceId: WORKSPACE.workspaceId,
+            threadId: existing.threadId,
+            turnId: `${existing.threadId}:turn`,
+            threadRevision: 5,
+            from: "running",
+            to: "waiting_approval",
+          }),
+        });
+        releaseLate(active);
+      });
+      expect(deltaOutcome).toBe("applied");
+      expect(stateChangeOutcome).toBe("applied");
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeDefined();
+      expect(threadRead).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(499);
+      });
+      expect(threadRead).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(threadRead).toHaveBeenCalledTimes(3);
+      expect(useTimelineStore.getState().turns[`${existing.threadId}:turn`]?.status).toBe(
+        "completed",
+      );
+      expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** 健康对账只保留当前 Thread 的请求；切换后旧 read 的 finally 不能占住切回后的 single-flight。 */
+  it("健康 resync 切换 Thread 后丢弃迟到 snapshot，并允许切回重新读取", async () => {
+    const first = thread("thr_health_first");
+    const second = thread("thr_health_second");
+    let releaseHealth!: (snapshot: TimelineSnapshot) => void;
+    const healthRead = new Promise<TimelineSnapshot>((resolve) => {
+      releaseHealth = resolve;
+    });
+    let releaseNextHealth!: (snapshot: TimelineSnapshot) => void;
+    const nextHealthRead = new Promise<TimelineSnapshot>((resolve) => {
+      releaseNextHealth = resolve;
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(emptySnapshot(first.threadId, 1))
+      .mockImplementationOnce(async () => healthRead)
+      .mockResolvedValueOnce(emptySnapshot(first.threadId, 3))
+      .mockImplementationOnce(async () => nextHealthRead);
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
+      threadCreate: vi.fn(async () => first),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(first.threadId));
+    act(() => {
+      expect(
+        useTimelineStore
+          .getState()
+          .applySnapshot(emptySnapshot(second.threadId), WORKSPACE.workspaceId),
+      ).toBe("applied");
+      useTimelineStore.getState().requestThreadResync(first.threadId);
+    });
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(2));
+
+    await act(async () => result.current.select(second.threadId));
+    await act(async () => result.current.select(first.threadId));
+    expect(threadRead).toHaveBeenCalledTimes(3);
+    act(() => useTimelineStore.getState().requestThreadResync(first.threadId));
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(4));
+
+    // 旧 health read 此时晚到；它不能清理 call 4 的 in-flight 标记或再开 call 5。
+    releaseHealth(contentSnapshot(first.threadId, "running", 2));
+    await act(async () => {
+      await healthRead;
+      await Promise.resolve();
+    });
+    act(() => useTimelineStore.getState().requestThreadResync(first.threadId));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(threadRead).toHaveBeenCalledTimes(4);
+    expect(useTimelineStore.getState().turns[`${first.threadId}:turn`]).toBeUndefined();
+
+    releaseNextHealth(emptySnapshot(first.threadId, 4));
+    await act(async () => {
+      await nextHealthRead;
+      await Promise.resolve();
+    });
+    expect(result.current.currentThreadId).toBe(first.threadId);
+    expect(useTimelineStore.getState().resyncRequired[first.threadId]).toBeUndefined();
+  });
+
+  /** generation/server 变化会取消 health read；旧 snapshot 不能污染新 runtime 的同名 Thread。 */
+  it("健康 resync 遇到 runtime 代际切换会清理在途请求", async () => {
+    const existing = thread("thr_health_generation");
+    let releaseHealth!: (snapshot: TimelineSnapshot) => void;
+    const healthRead = new Promise<TimelineSnapshot>((resolve) => {
+      releaseHealth = resolve;
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(emptySnapshot(existing.threadId, 1))
+      .mockImplementationOnce(async () => healthRead)
+      .mockResolvedValueOnce(emptySnapshot(existing.threadId, 0));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result, rerender } = renderHook(
+      ({ generation }: { generation: number }) =>
+        useConversationController({
+          history,
+          workspace: WORKSPACE,
+          workspaceRevision: generation,
+          modelSelection: MODEL_SELECTION,
+          accessMode: "approval_required",
+          runtimeState: { status: "ready", generation, serverInstanceId: `srv_${generation}` },
+          activateWorkspace: async () => undefined,
+        }),
+      { initialProps: { generation: 1 } },
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(2));
+
+    rerender({ generation: 2 });
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(3));
+    releaseHealth(contentSnapshot(existing.threadId, "running", 2));
+    await act(async () => {
+      await healthRead;
+      await Promise.resolve();
+    });
+
+    expect(result.current.currentThreadId).toBe(existing.threadId);
+    expect(useTimelineStore.getState().turns[`${existing.threadId}:turn`]).toBeUndefined();
+    expect(useTimelineStore.getState().handshake.generation).toBe(2);
+  });
+
+  /** 后台失败提示与当前 scope 绑定；切到其它会话或成功前台读取后都不能继续显示旧错误。 */
+  it("后台恢复错误不会从旧 Thread 污染新 Thread，并在重新读取成功后清除", async () => {
+    const first = thread("thr_background_error_first");
+    const second = thread("thr_background_error_second");
+    let rejectHealth!: (reason?: unknown) => void;
+    const healthRead = new Promise<TimelineSnapshot>((_resolve, reject) => {
+      rejectHealth = reject;
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(emptySnapshot(first.threadId, 1))
+      .mockImplementationOnce(async () => healthRead)
+      .mockResolvedValueOnce(emptySnapshot(first.threadId, 2));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
+      threadCreate: vi.fn(async () => first),
+      threadRead,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(first.threadId));
+    act(() => {
+      expect(
+        useTimelineStore
+          .getState()
+          .applySnapshot(emptySnapshot(second.threadId), WORKSPACE.workspaceId),
+      ).toBe("applied");
+      useTimelineStore.getState().requestThreadResync(first.threadId);
+    });
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      rejectHealth(new Error("health read failed"));
+      try {
+        await healthRead;
+      } catch {
+        // Controller owns the failure projection; the test only releases the deferred read.
+      }
+      await Promise.resolve();
+    });
+    expect(result.current.backgroundError).toContain("会话状态暂时无法自动恢复");
+
+    await act(async () => result.current.select(second.threadId));
+    expect(result.current.currentThreadId).toBe(second.threadId);
+    expect(result.current.backgroundError).toBeUndefined();
+
+    await act(async () => result.current.select(first.threadId));
+    expect(threadRead).toHaveBeenCalledTimes(3);
+    expect(result.current.currentThreadId).toBe(first.threadId);
+    expect(result.current.backgroundError).toBeUndefined();
   });
 
   /** 同 Workspace 切换期间，旧 Thread 的在途 read 返回后不能写入 recovered 标记或 Timeline。 */
@@ -457,6 +843,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -520,6 +907,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -954,6 +1342,7 @@ describe("useConversationController", () => {
       ],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       taskActivities: [],
       goalActivities: [],
       nextCursor: null,
@@ -1010,6 +1399,179 @@ describe("useConversationController", () => {
     );
   });
 
+  /**
+   * CAS 重读即使只为取得 revision 也必须消费完整分页；否则应用首个半快照会擦掉第二页正文，
+   * 并让 ChatTimeline 的 turn + exchangeOrdinal 行身份在一次正常重试中发生漂移。
+   */
+  it("CAS 冲突重读使用完整同 revision 快照而不擦除分页正文", async () => {
+    const existing = {
+      ...thread("thr_unseen_paginated_reread"),
+      latestTurnStatus: "failed" as const,
+      latestTurnSeen: false,
+      revision: 3,
+    };
+    const firstItem: TimelineSnapshot["items"][number] = {
+      itemId: "item_failed_summary",
+      turnId: "turn_failed",
+      kind: "final_answer",
+      createdAt: "2026-09-01T00:00:01Z",
+      text: "完整正文前半段",
+    };
+    const secondItem: TimelineSnapshot["items"][number] = {
+      itemId: "item_failed_details",
+      turnId: "turn_failed",
+      kind: "assistant_progress",
+      createdAt: "2026-09-01T00:00:02Z",
+      text: "完整正文后半段",
+      modelRound: 1,
+    };
+    const snapshot = (
+      revision: number,
+      items: TimelineSnapshot["items"],
+      nextCursor: string | null,
+    ): TimelineSnapshot => ({
+      threadId: existing.threadId,
+      revision,
+      turns: [
+        {
+          turnId: "turn_failed",
+          status: "failed",
+          requestedAt: "2026-09-01T00:00:00Z",
+          updatedAt: "2026-09-01T00:00:02Z",
+          completedAt: "2026-09-01T00:00:02Z",
+          errorCode: "MODEL_FAILED",
+          changeSet: null,
+        },
+      ],
+      items,
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor,
+    });
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce(snapshot(3, [firstItem, secondItem], null))
+      .mockResolvedValueOnce(snapshot(4, [firstItem], "cas_page_2"))
+      .mockResolvedValueOnce(snapshot(4, [secondItem], null));
+    const threadSeen = vi
+      .fn<ConversationHistoryPort["threadSeen"]>()
+      .mockRejectedValueOnce({ code: "CONFLICT" })
+      .mockResolvedValueOnce({ ...existing, latestTurnSeen: true, revision: 5 });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadSeen,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    await waitFor(() => expect(threadSeen).toHaveBeenCalledTimes(2));
+
+    expect(threadRead).toHaveBeenNthCalledWith(2, { threadId: existing.threadId });
+    expect(threadRead).toHaveBeenNthCalledWith(3, {
+      threadId: existing.threadId,
+      cursor: "cas_page_2",
+    });
+    expect(useTimelineStore.getState().items[firstItem.itemId]?.text).toBe("完整正文前半段");
+    expect(useTimelineStore.getState().items[secondItem.itemId]?.text).toBe("完整正文后半段");
+    expect(threadSeen).toHaveBeenNthCalledWith(2, {
+      threadId: existing.threadId,
+      expectedThreadRevision: 4,
+    });
+  });
+
+  /** 新一轮与上一轮同为 completed 时，Timeline revision 仍能触发一次新的已读确认。 */
+  it("上一轮已读后新终态仍按 Timeline revision 确认未读", async () => {
+    const existing = {
+      ...thread("thr_seen_then_new_terminal"),
+      latestTurnStatus: "completed" as const,
+      latestTurnSeen: true,
+      revision: 2,
+    };
+    const threadSeen = vi.fn(async () => ({ ...existing, latestTurnSeen: true, revision: 5 }));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead: vi.fn(async () => contentSnapshot(existing.threadId, "completed", 2)),
+      threadSeen,
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    expect(threadSeen).not.toHaveBeenCalled();
+
+    let acceptedOutcome: ReturnType<typeof useTimelineStore.getState>["lastOutcome"];
+    let eventOutcome: ReturnType<typeof useTimelineStore.getState>["lastOutcome"];
+    act(() => {
+      acceptedOutcome = useTimelineStore.getState().applyTurnAccepted({
+        threadId: existing.threadId,
+        turnId: "turn_new_terminal",
+        threadRevision: 3,
+        submittedText: "新一轮",
+        submittedAt: "2026-09-01T00:00:00Z",
+      });
+      eventOutcome = useTimelineStore.getState().applyHostEvent({
+        kind: "timeline",
+        event: stateChangedEvent({
+          workspaceId: WORKSPACE.workspaceId,
+          threadId: existing.threadId,
+          turnId: "turn_new_terminal",
+          threadRevision: 4,
+          from: "queued",
+          to: "completed",
+        }),
+      });
+    });
+    expect(acceptedOutcome).toBe("applied");
+    expect(eventOutcome).toBe("applied");
+    await waitFor(() => expect(threadSeen).toHaveBeenCalledOnce());
+    expect(threadSeen).toHaveBeenCalledWith({
+      threadId: existing.threadId,
+      expectedThreadRevision: 4,
+    });
+  });
+
   /** seen 失败必须释放精确终态去重键；提醒保持未读，切离再打开才能发起下一次有界确认。 */
   it("retries the unread confirmation after reopening when the first seen mutation fails", async () => {
     const existing = {
@@ -1058,6 +1620,7 @@ describe("useConversationController", () => {
             : [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1123,6 +1686,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1190,6 +1754,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1248,6 +1813,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1328,6 +1894,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1410,6 +1977,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1482,6 +2050,8 @@ describe("useConversationController", () => {
     const switched = {
       ...thread("thr_switched"),
       threadId: "thr_initial",
+      // 成功的 CAS 响应必须携带前进 revision；同 revision 的迟到 list 不能覆盖它。
+      revision: 1,
       preferences: {
         ...MODEL_SELECTION,
         modelId: "model_2",
@@ -1501,6 +2071,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1577,6 +2148,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1648,6 +2220,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1659,6 +2232,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1734,6 +2308,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1864,6 +2439,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1916,6 +2492,7 @@ describe("useConversationController", () => {
       items: [],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       taskActivities: [],
       goalActivities: [],
       nextCursor: null,
@@ -1958,6 +2535,7 @@ describe("useConversationController", () => {
             items: [],
             inputQueue: null,
             contextUsage: null,
+            liveStream: null,
             taskActivities: [],
             goalActivities: [],
             nextCursor: null,
@@ -1987,6 +2565,7 @@ describe("useConversationController", () => {
       items: [],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       taskActivities: [],
       goalActivities: [],
       nextCursor: null,
@@ -2124,6 +2703,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2167,6 +2747,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2243,6 +2824,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2284,6 +2866,196 @@ describe("useConversationController", () => {
     }
   });
 
+  /** 迟到目录、seen 与 rename 都只能按 revision 合并；Timeline 新一轮运行事实必须继续可见。 */
+  it("迟到 list、seen、rename 不覆盖新 metadata 与 Timeline 运行状态", async () => {
+    const existing = {
+      ...thread("thr_metadata_interleave"),
+      title: "旧标题",
+      revision: 1,
+    };
+    let releaseLateList!: () => void;
+    const lateList = new Promise<void>((resolve) => {
+      releaseLateList = resolve;
+    });
+    let releaseRename!: (value: ConversationThread) => void;
+    const renameResponse = new Promise<ConversationThread>((resolve) => {
+      releaseRename = resolve;
+    });
+    let releaseSeen!: (value: ConversationThread) => void;
+    const seenResponse = new Promise<ConversationThread>((resolve) => {
+      releaseSeen = resolve;
+    });
+    const threadList = vi
+      .fn<ConversationHistoryPort["threadList"]>()
+      .mockResolvedValueOnce({ items: [existing], nextCursor: null })
+      .mockImplementationOnce(async () => {
+        await lateList;
+        return {
+          items: [
+            {
+              ...existing,
+              title: "迟到列表标题",
+              revision: 4,
+              latestTurnStatus: "completed",
+              latestTurnSeen: true,
+            },
+          ],
+          nextCursor: null,
+        };
+      });
+    const threadRename = vi.fn(async () => renameResponse);
+    const threadSeen = vi.fn(async () => seenResponse);
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList,
+      threadCreate: vi.fn(async () => existing),
+      threadRead: vi.fn(async ({ threadId }) => contentSnapshot(threadId, "running", 1)),
+      threadRename,
+      threadSeen,
+      threadPin: vi.fn(async ({ threadId, pinned }) => ({
+        ...existing,
+        threadId,
+        pinned,
+        revision: 6,
+      })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result, rerender } = renderHook(
+      ({ event }: { event?: TimelineEvent }) =>
+        useConversationController({
+          history,
+          workspace: WORKSPACE,
+          workspaceRevision: 1,
+          modelSelection: MODEL_SELECTION,
+          accessMode: "approval_required",
+          runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+          metadataEvent: event,
+          activateWorkspace: async () => undefined,
+        }),
+      { initialProps: { event: undefined as TimelineEvent | undefined } },
+    );
+
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    rerender({
+      event: metadataEvent({
+        threadId: existing.threadId,
+        revision: 2,
+        title: "新元数据标题",
+        titleSource: "auto",
+      }),
+    });
+    await waitFor(() => expect(result.current.threads[0]?.title).toBe("新元数据标题"));
+
+    let renameRequest!: Promise<void>;
+    act(() => {
+      renameRequest = result.current.rename(existing.threadId, "人工标题");
+    });
+    await waitFor(() =>
+      expect(threadRename).toHaveBeenCalledWith({
+        threadId: existing.threadId,
+        title: "人工标题",
+        expectedThreadRevision: 2,
+      }),
+    );
+
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyHostEvent({
+          kind: "timeline",
+          event: stateChangedEvent({
+            workspaceId: WORKSPACE.workspaceId,
+            threadId: existing.threadId,
+            turnId: `${existing.threadId}:turn`,
+            threadRevision: 3,
+            from: "running",
+            to: "completed",
+          }),
+        }),
+      ).toBe("applied");
+    });
+    await waitFor(() =>
+      expect(threadSeen).toHaveBeenCalledWith({
+        threadId: existing.threadId,
+        expectedThreadRevision: 3,
+      }),
+    );
+
+    rerender({
+      event: metadataEvent({
+        eventId: "evt_metadata_interleave_4",
+        sequence: 4,
+        threadId: existing.threadId,
+        revision: 4,
+        title: "最新元数据标题",
+        titleSource: "manual",
+      }),
+    });
+    await waitFor(() => expect(result.current.threads[0]?.title).toBe("最新元数据标题"));
+
+    act(() => {
+      expect(
+        useTimelineStore.getState().applyTurnAccepted({
+          threadId: existing.threadId,
+          turnId: "turn_new_interleave",
+          threadRevision: 5,
+          submittedText: "新一轮",
+          submittedAt: "2026-09-01T00:00:01Z",
+        }),
+      ).toBe("applied");
+      expect(
+        useTimelineStore.getState().applyHostEvent({
+          kind: "timeline",
+          event: stateChangedEvent({
+            workspaceId: WORKSPACE.workspaceId,
+            threadId: existing.threadId,
+            turnId: "turn_new_interleave",
+            threadRevision: 6,
+            from: "queued",
+            to: "running",
+          }),
+        }),
+      ).toBe("applied");
+    });
+    await waitFor(() => expect(result.current.threads[0]?.latestTurnStatus).toBe("running"));
+
+    let pinRequest!: Promise<void>;
+    act(() => {
+      pinRequest = result.current.pin(existing.threadId, true);
+    });
+    await waitFor(() => expect(threadList).toHaveBeenCalledTimes(2));
+    releaseLateList();
+    releaseRename({
+      ...existing,
+      title: "迟到重命名",
+      revision: 2,
+    });
+    releaseSeen({
+      ...existing,
+      title: "迟到已读",
+      latestTurnStatus: "completed",
+      latestTurnSeen: true,
+      revision: 3,
+    });
+    await act(async () => {
+      await Promise.all([renameRequest, pinRequest]);
+      await Promise.resolve();
+    });
+
+    expect(result.current.threads[0]).toMatchObject({
+      title: "最新元数据标题",
+      revision: 4,
+      latestTurnStatus: "running",
+    });
+    expect(useTimelineStore.getState().turns["turn_new_interleave"]?.status).toBe("running");
+  });
+
   it("目录未缓存事件目标时回读权威列表，不从 metadata 补造 Thread", async () => {
     const existing = thread("thr_existing");
     const discovered = {
@@ -2310,6 +3082,7 @@ describe("useConversationController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,

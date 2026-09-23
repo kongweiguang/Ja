@@ -23,6 +23,7 @@ import {
   type ConversationContextReference,
   type ConversationInteractionController,
   type ConversationUsageReader,
+  type HistoryAttachmentThumbnailPort,
   type InteractionController,
   type TimelineGoalActivity,
 } from "@/features/conversation";
@@ -56,6 +57,7 @@ export interface TaskComposerEnvironment {
   readonly dropZoneRef?: (element: HTMLFormElement | null) => void;
   readonly skills?: readonly TaskComposerSkillSuggestion[];
   readonly attachmentPort?: ConversationAttachmentPort;
+  readonly attachmentThumbnailPort?: HistoryAttachmentThumbnailPort;
   readonly slashCommands?: readonly ComposerSlashCommand[];
   readonly onSearchWorkspacePaths?: (query: string) => Promise<ComposerWorkspaceSearchResult>;
   readonly onOpenAttachmentPreview?: (
@@ -461,6 +463,7 @@ export function TaskDetailPanel({
             onSearchWorkspacePaths={environment?.onSearchWorkspacePaths}
             attachments={conversation.attachments}
             attachmentDraftItems={conversation.attachmentDraftItems}
+            attachmentThumbnailPort={environment?.attachmentThumbnailPort}
             activeTurn={conversation.activeTurn}
             suspendedTurn={conversation.suspendedTurn}
             interactionPresentation={

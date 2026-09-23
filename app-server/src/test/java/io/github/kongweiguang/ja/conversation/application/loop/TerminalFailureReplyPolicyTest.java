@@ -68,4 +68,13 @@ final class TerminalFailureReplyPolicyTest {
         assertEquals(first, policy.messageIdFor("turn_failure", execution));
         assertTrue(first.matches("item_failure_[0-9a-f]{64}"));
     }
+
+    /** 半截正文使用不同 namespace，避免与固定失败回复发生历史 item identity 冲突。 */
+    @Test
+    void derivesStablePartialMessageIdentity() {
+        String first = policy.partialMessageIdFor("turn_failure", 2);
+        assertEquals(first, policy.partialMessageIdFor("turn_failure", 2));
+        assertTrue(first.matches("item_partial_[0-9a-f]{64}"));
+        assertFalse(first.equals(policy.partialMessageIdFor("turn_failure", 3)));
+    }
 }

@@ -160,6 +160,8 @@ export function ConversationWorkspace({
   const { boot, turnAdmissionReady, runtimeState } = useRuntimeState();
   const { queryRuntime } = useRuntimeLifecycle();
   const turnPort = useRuntimeTurns();
+  // 后台对账提示沿用现有 inline error 展示，不新增常驻控件或改变 Composer 的发送准入。
+  const visibleConversationError = conversation.error ?? conversation.backgroundError;
   const threadId = conversation.currentThreadId ?? "";
   const timelineScrollCache = useMemo(() => new TimelineScrollCache(), []);
   const timelineDisclosureCache = useMemo(() => new TimelineDisclosureCache(), []);
@@ -642,6 +644,7 @@ export function ConversationWorkspace({
       models={interaction.models}
       attachments={interaction.attachments}
       attachmentDraftItems={interaction.attachmentDraftItems}
+      attachmentThumbnailPort={attachmentPreviewPort}
       activeTurn={interaction.activeTurn}
       suspendedTurn={interaction.suspendedTurn}
       continuationAvailable={interaction.continuationAvailable}
@@ -820,9 +823,9 @@ export function ConversationWorkspace({
           {scopeError}
         </p>
       )}
-      {conversation.error === undefined ? null : (
+      {visibleConversationError === undefined ? null : (
         <p className="ja-inline-error" role="alert">
-          {conversation.error}
+          {visibleConversationError}
         </p>
       )}
       <div

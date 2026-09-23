@@ -5,6 +5,7 @@ import { create, type StoreApi, type UseBoundStore } from "zustand";
 import type { ConversationHostEvent } from "./ports";
 import type { TimelineSnapshot, TimelineTaskActivityEntry } from "../domain/timelineContracts";
 import type { InputQueue } from "../domain/timelineContracts";
+import type { TimelineEvent } from "../domain/timelineContracts";
 import type { TimelineItemAdapter } from "../domain/timelineTypes";
 import {
   applyLiveEvent,
@@ -13,12 +14,36 @@ import {
   applyTurnAccepted,
   applyRuntimeStatus,
   createTimelineState,
+  markThreadResync,
   pruneInactiveThreads as pruneInactiveThreadProjection,
   requireActiveTurnResync,
-  requireThreadResync,
   type AcceptedTurnProjection,
   type TimelineState,
 } from "../domain/timelineReducer";
+
+/** 最近一次已由 Reducer 接纳的 live 事实；receivedAt 使用本地接收时钟，不使用 Provider occurredAt。 */
+export interface TimelineLiveActivity {
+  threadId: string;
+  turnId?: string;
+  generation: number;
+  serverInstanceId?: string;
+  streamSeq?: number;
+  receivedAt: number;
+}
+
+/** Controller 自己的请求 epoch 与 Store 的有界事件缓冲绑定，旧请求不能提交新恢复结果。 */
+export interface TimelineRecoveryToken {
+  threadId: string;
+  requestEpoch: number;
+  mode: "health" | "recovery";
+}
+
+export type TimelineRecoveryResult =
+  | { status: "applied"; replayedEvents: number }
+  | {
+      status: "stale" | "overflow" | "invalid" | "late" | "needs_baseline";
+      replayedEvents: number;
+    };
 
 export interface TimelineStore extends TimelineState {
   /** 只标记由权威 snapshot 恢复出的 active Turn，供可见 Conversation 做有限对账。 */
@@ -34,6 +59,18 @@ export interface TimelineStore extends TimelineState {
   ) => TimelineState["lastOutcome"];
   recordThreadMetadataRevision: (threadId: string, revision: number) => void;
   requestThreadResync: (threadId: string) => void;
+  beginRecovery: (
+    threadId: string,
+    requestEpoch: number,
+    mode?: "health" | "recovery",
+  ) => TimelineRecoveryToken | undefined;
+  endRecovery: (
+    token: TimelineRecoveryToken,
+    snapshot: TimelineSnapshot,
+    workspaceId: string,
+  ) => TimelineRecoveryResult;
+  cancelRecovery: (token: TimelineRecoveryToken) => void;
+  getLastAcceptedLive: (threadId: string) => TimelineLiveActivity | undefined;
   pruneInactiveThreads: (threadIds: readonly string[]) => void;
   reset: () => void;
 }
@@ -49,6 +86,90 @@ const draftItemByProjection = new WeakMap<
   TimelineItemAdapter
 >();
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
+const MAX_RECOVERY_EVENTS = 256;
+const MAX_RECOVERY_BYTES = 1024 * 1024;
+
+/**
+ * 选择恢复后的唯一对账目标；liveStream 的 Turn 是最强证据，否则优先最新 running/queued。
+ * 快照可能同时带有历史 queued Turn 和当前 running Turn，按数组首项会把 watchdog 绑到旧 Turn，
+ * 造成恢复链路看似工作却永远不收敛，因此等待态只作为最后的可恢复兜底。
+ */
+function selectRecoveredActiveTurnId(
+  turns: readonly { turnId: string; status: string }[],
+  preferredTurnId?: string,
+): string | undefined {
+  const terminalStates = new Set(["completed", "failed", "cancelled"]);
+  const preferred =
+    preferredTurnId === undefined
+      ? undefined
+      : turns.find((turn) => turn.turnId === preferredTurnId && !terminalStates.has(turn.status));
+  if (preferred !== undefined) return preferred.turnId;
+  for (const status of ["running", "queued", "waiting_approval", "suspended"]) {
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      const turn = turns[index];
+      if (turn?.status === status) return turn.turnId;
+    }
+  }
+  return undefined;
+}
+
+interface BufferedLiveEvent {
+  event: TimelineEvent;
+  receivedAt: number;
+}
+
+interface RecoveryBuffer {
+  requestEpoch: number;
+  mode: "health" | "recovery";
+  generation: number;
+  serverInstanceId: string | undefined;
+  events: BufferedLiveEvent[];
+  bytes: number;
+  overflow: boolean;
+}
+
+/** 只从已校验 Host Event 提取 Thread identity，Recovery buffer 不接受跨 Thread 事件。 */
+function hostEventThreadId(event: ConversationHostEvent): string | undefined {
+  if (event.kind !== "timeline" || !("threadId" in event.event.params)) return undefined;
+  return event.event.params.threadId;
+}
+
+/** 提取 live event 的 Turn 与序号，用于静默监测和恢复后的 activity 水位。 */
+function liveActivityFromEvent(
+  event: TimelineEvent,
+  state: TimelineState,
+  receivedAt: number,
+): TimelineLiveActivity | undefined {
+  if (!("threadId" in event.params)) return undefined;
+  const params = event.params;
+  return {
+    threadId: params.threadId,
+    ...("turnId" in params && typeof params.turnId === "string" ? { turnId: params.turnId } : {}),
+    generation: params.generation,
+    ...(state.serverInstanceId === undefined ? {} : { serverInstanceId: state.serverInstanceId }),
+    ...("streamSeq" in params && typeof params.streamSeq === "number"
+      ? { streamSeq: params.streamSeq }
+      : {}),
+    receivedAt,
+  };
+}
+
+/** 为有界恢复队列估算正文负载，超限即要求重新读取而不接纳残缺事件。 */
+function liveEventBytes(event: TimelineEvent): number {
+  return new TextEncoder().encode(JSON.stringify(event)).byteLength;
+}
+
+/** Stream delta 没有独立持久事实；baseline 为空时只能丢弃这类残缺事件。 */
+function isStreamDelta(event: TimelineEvent): boolean {
+  return (
+    event.method === "assistant/text-delta" || event.method === "assistant/reasoning-summary-delta"
+  );
+}
+
+/** 终态、Tool 和队列事件有完整持久语义，即使 live baseline 暂不可恢复也必须继续吸收。 */
+function isDurableRecoveryEvent(event: TimelineEvent): boolean {
+  return !isStreamDelta(event);
+}
 
 /**
  * 将暂态 Draft 插入同一 Turn 的已提交步骤之间。已提交列表的原始顺序仍是历史恢复的基线；只在双方都
@@ -118,7 +239,9 @@ function draftItemForTurn(
  * Runtime 与 Java/SQLite 恢复，只有 Vite HMR 的模块重求值需要复用原实例。
  */
 function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
-  return create<TimelineStore>((set) => ({
+  const recoveryBuffers = new Map<string, RecoveryBuffer>();
+  const lastAcceptedLiveByThread = new Map<string, TimelineLiveActivity>();
+  return create<TimelineStore>((set, get) => ({
     ...createTimelineState(),
     recoveredActiveTurnByThread: {},
     resyncRequestSequenceByThread: {},
@@ -132,9 +255,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
             ...next,
             recoveredActiveTurnByThread: state.recoveredActiveTurnByThread ?? {},
           };
-        const recoveredActiveTurn = snapshot.turns.find(
-          (turn) => !["completed", "failed", "cancelled"].includes(turn.status),
-        )?.turnId;
+        const recoveredActiveTurn = selectRecoveredActiveTurnId(
+          snapshot.turns,
+          snapshot.liveStream?.turnId,
+        );
         const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
         if (recoveredActiveTurn === undefined)
           delete recoveredActiveTurnByThread[snapshot.threadId];
@@ -148,6 +272,50 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
      * 不得泄漏到 Store，也不能让 Active Turn 永久停留在 Busy。
      */
     applyHostEvent: (event) => {
+      const threadId = hostEventThreadId(event);
+      if (threadId !== undefined && event.kind === "timeline") {
+        const recovery = recoveryBuffers.get(threadId);
+        if (recovery !== undefined) {
+          const receivedAt = Date.now();
+          if (!recovery.overflow) {
+            const bytes = liveEventBytes(event.event);
+            if (
+              recovery.events.length >= MAX_RECOVERY_EVENTS ||
+              recovery.bytes + bytes > MAX_RECOVERY_BYTES
+            ) {
+              recovery.overflow = true;
+              recovery.events = [];
+              recovery.bytes = 0;
+            } else {
+              recovery.events.push({ event: event.event, receivedAt });
+              recovery.bytes += bytes;
+            }
+          }
+          // Recovery keeps a replay copy but applies the live event immediately. Terminal and
+          // committed facts therefore remain visible while the authoritative read is in flight.
+          let nextOutcome: TimelineState["lastOutcome"] = "rejected";
+          set((state) => {
+            const next = applyLiveEvent(state, event.event);
+            nextOutcome = next.lastOutcome;
+            if (next.lastOutcome === "applied") {
+              const activity = liveActivityFromEvent(event.event, next, receivedAt);
+              if (activity !== undefined) lastAcceptedLiveByThread.set(threadId, activity);
+            }
+            const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
+            const recoveredTurnId = recoveredActiveTurnByThread[threadId];
+            const projectedTurn =
+              recoveredTurnId === undefined ? undefined : next.turns[recoveredTurnId];
+            if (
+              recoveredTurnId !== undefined &&
+              (projectedTurn === undefined ||
+                ["completed", "failed", "cancelled"].includes(projectedTurn.status))
+            )
+              delete recoveredActiveTurnByThread[threadId];
+            return { ...next, recoveredActiveTurnByThread };
+          });
+          return nextOutcome;
+        }
+      }
       let nextOutcome: TimelineState["lastOutcome"] = "rejected";
       set((state) => {
         const next =
@@ -157,6 +325,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
               ? applyLiveEvent(state, event.event)
               : requireActiveTurnResync(state, "projection_fault");
         nextOutcome = next.lastOutcome;
+        if (event.kind === "timeline" && next.lastOutcome === "applied") {
+          const activity = liveActivityFromEvent(event.event, next, Date.now());
+          if (activity !== undefined) lastAcceptedLiveByThread.set(activity.threadId, activity);
+        }
         if (event.kind === "timeline") {
           const threadId =
             "threadId" in event.event.params ? event.event.params.threadId : undefined;
@@ -173,12 +345,15 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
             delete recoveredActiveTurnByThread[threadId];
           return { ...next, recoveredActiveTurnByThread };
         }
-        if (event.kind === "status" && next.handshake.generation !== state.handshake.generation)
+        if (event.kind === "status" && next.handshake.generation !== state.handshake.generation) {
+          recoveryBuffers.clear();
+          lastAcceptedLiveByThread.clear();
           return {
             ...next,
             recoveredActiveTurnByThread: {},
             resyncRequestSequenceByThread: {},
           };
+        }
         return next;
       });
       return nextOutcome;
@@ -211,12 +386,15 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       set((state) => {
         const next = applyRuntimeStatus(state, status);
         nextOutcome = next.lastOutcome;
-        if (next.handshake.generation !== state.handshake.generation)
+        if (next.handshake.generation !== state.handshake.generation) {
+          recoveryBuffers.clear();
+          lastAcceptedLiveByThread.clear();
           return {
             ...next,
             recoveredActiveTurnByThread: {},
             resyncRequestSequenceByThread: {},
           };
+        }
         return next;
       });
       return nextOutcome;
@@ -239,14 +417,142 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
     /** 队列 CAS 冲突只建立一次 authoritative read 意图，不在 Renderer 猜测条目现状。 */
     requestThreadResync: (threadId) =>
       set((state) => ({
-        ...requireThreadResync(state, threadId),
+        ...markThreadResync(state, threadId),
         resyncRequestSequenceByThread: {
           ...(state.resyncRequestSequenceByThread ?? {}),
           [threadId]: ((state.resyncRequestSequenceByThread ?? {})[threadId] ?? 0) + 1,
         },
       })),
+    /** 开始一次有界恢复窗口；窗口内 live event 暂存，避免快照提交时产生半帧 Gap。 */
+    beginRecovery: (threadId, requestEpoch, mode = "recovery") => {
+      const current = recoveryBuffers.get(threadId);
+      if (current !== undefined && current.requestEpoch >= requestEpoch) return undefined;
+      const state = get();
+      recoveryBuffers.set(threadId, {
+        requestEpoch,
+        mode,
+        generation: state.handshake.generation,
+        serverInstanceId: state.serverInstanceId,
+        events: [],
+        bytes: 0,
+        overflow: false,
+      });
+      return { threadId, requestEpoch, mode };
+    },
+    /**
+     * 以单个 Zustand commit 应用 authoritative baseline 并重放读取期间的 live event；溢出、空 baseline
+     * 或 replay gap 都只返回需重读结果，不把队列中的残缺正文发布到 UI。
+     */
+    endRecovery: (token, snapshot, workspaceId) => {
+      const recovery = recoveryBuffers.get(token.threadId);
+      if (
+        recovery === undefined ||
+        recovery.requestEpoch !== token.requestEpoch ||
+        recovery.mode !== token.mode
+      ) {
+        return { status: "stale", replayedEvents: 0 };
+      }
+      const current = get();
+      if (
+        current.handshake.generation !== recovery.generation ||
+        current.serverInstanceId !== recovery.serverInstanceId
+      ) {
+        recoveryBuffers.delete(token.threadId);
+        set((state) => markThreadResync(state, token.threadId));
+        return { status: "stale", replayedEvents: 0 };
+      }
+      recoveryBuffers.delete(token.threadId);
+      if (recovery.overflow) {
+        set((state) => markThreadResync(state, token.threadId));
+        return { status: "overflow", replayedEvents: 0 };
+      }
+      let result: TimelineRecoveryResult = { status: "invalid", replayedEvents: 0 };
+      set((state) => {
+        let next = applySnapshot(state, snapshot, workspaceId, { mode: recovery.mode });
+        const snapshotNeedsBaseline =
+          recovery.mode === "recovery" &&
+          snapshot.liveStream === null &&
+          snapshot.turns.some(
+            (turn) => !["completed", "failed", "cancelled"].includes(turn.status),
+          ) &&
+          next.lastOutcome === "resync_required";
+        if (next.lastOutcome === "late") {
+          result = { status: "late", replayedEvents: 0 };
+          return next;
+        }
+        if (next.lastOutcome !== "applied") {
+          // rejected/其它 resync_required 也必须停止本轮重放；只有明确缺少 live baseline
+          // 才返回 needs_baseline，避免无效快照被缓冲事件伪装成 applied。
+          result = {
+            status: snapshotNeedsBaseline ? "needs_baseline" : "invalid",
+            replayedEvents: 0,
+          };
+          return next;
+        }
+        const hasBaseline = snapshot.liveStream !== null;
+        let replayedEvents = 0;
+        for (const buffered of recovery.events) {
+          if (!hasBaseline && !isDurableRecoveryEvent(buffered.event)) continue;
+          next = applyLiveEvent(next, buffered.event);
+          replayedEvents += 1;
+          if (
+            next.lastOutcome === "gap" ||
+            next.lastOutcome === "resync_required" ||
+            next.lastOutcome === "invalid" ||
+            next.lastOutcome === "rejected"
+          ) {
+            result = { status: "needs_baseline", replayedEvents };
+            return next;
+          }
+          if (next.lastOutcome === "applied") {
+            const activity = liveActivityFromEvent(buffered.event, next, buffered.receivedAt);
+            if (activity !== undefined) lastAcceptedLiveByThread.set(token.threadId, activity);
+          }
+        }
+        const hasActiveTurn = Object.values(next.turns).some(
+          (turn) =>
+            turn.threadId === token.threadId &&
+            !["completed", "failed", "cancelled"].includes(turn.status),
+        );
+        const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
+        if (hasActiveTurn) {
+          const activeTurn = selectRecoveredActiveTurnId(
+            Object.values(next.turns).filter((turn) => turn.threadId === token.threadId),
+            snapshot.liveStream?.turnId,
+          );
+          if (activeTurn !== undefined) recoveredActiveTurnByThread[token.threadId] = activeTurn;
+        } else {
+          delete recoveredActiveTurnByThread[token.threadId];
+          if (snapshotNeedsBaseline) {
+            const resyncRequired = { ...next.resyncRequired };
+            delete resyncRequired[token.threadId];
+            next = { ...next, resyncRequired };
+          }
+        }
+        result =
+          snapshotNeedsBaseline && hasActiveTurn
+            ? { status: "needs_baseline", replayedEvents }
+            : { status: "applied", replayedEvents };
+        return { ...next, recoveredActiveTurnByThread };
+      });
+      return result;
+    },
+    /** 取消读取时保留当前即时投影，并标记一次非破坏性对账，避免已展示 terminal 静默丢失。 */
+    cancelRecovery: (token) => {
+      const current = recoveryBuffers.get(token.threadId);
+      if (current?.requestEpoch === token.requestEpoch) {
+        recoveryBuffers.delete(token.threadId);
+        set((state) => markThreadResync(state, token.threadId));
+      }
+    },
+    /** 供 Controller 静默监测读取，不建立 Zustand subscription，也不把 delta 扩散到 Shell。 */
+    getLastAcceptedLive: (threadId) => lastAcceptedLiveByThread.get(threadId),
     /** 仅清理控制器淘汰的非活动缓存 Thread；Reducer 会再次保护实时任务与审批投影。 */
-    pruneInactiveThreads: (threadIds) =>
+    pruneInactiveThreads: (threadIds) => {
+      for (const threadId of threadIds) {
+        recoveryBuffers.delete(threadId);
+        lastAcceptedLiveByThread.delete(threadId);
+      }
       set((state) => {
         const next = pruneInactiveThreadProjection(state, threadIds);
         const removed = new Set(threadIds);
@@ -263,13 +569,17 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
             ),
           ),
         };
-      }),
-    reset: () =>
+      });
+    },
+    reset: () => {
+      recoveryBuffers.clear();
+      lastAcceptedLiveByThread.clear();
       set({
         ...createTimelineState(),
         recoveredActiveTurnByThread: {},
         resyncRequestSequenceByThread: {},
-      }),
+      });
+    },
   }));
 }
 

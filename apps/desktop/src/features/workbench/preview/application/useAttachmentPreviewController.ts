@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   actualSizeAttachmentZoom,
+  alternateAttachmentResourceUrl,
   attachmentPreviewTargetKey,
   ATTACHMENT_TEXT_CHUNK_BYTES,
   ATTACHMENT_TEXT_PREVIEW_LIMIT_BYTES,
@@ -98,6 +99,7 @@ export function useAttachmentPreviewController({
   const [retryVersion, setRetryVersion] = useState(0);
   const generationRef = useRef(0);
   const sessionRef = useRef<string | undefined>(undefined);
+  const imageFallbackAttemptsRef = useRef(new Set<string>());
   const targetRef = useRef(target);
   const portRef = useRef(port);
   targetRef.current = target;
@@ -210,7 +212,12 @@ export function useAttachmentPreviewController({
   }, [onDismiss, port]);
 
   /** 重试只推进本地版本，effect 负责关闭旧 session 后重新授权。 */
-  const retry = useCallback((): void => setRetryVersion((current) => current + 1), []);
+  const retry = useCallback((): void => {
+    const currentTarget = targetRef.current;
+    if (currentTarget !== undefined)
+      imageFallbackAttemptsRef.current.delete(attachmentPreviewTargetKey(currentTarget));
+    setRetryVersion((current) => current + 1);
+  }, []);
 
   /** 图片缩放转换集中更新 ready/image 分支，文本与错误投影保持不变。 */
   const updateZoom = useCallback(
@@ -249,16 +256,24 @@ export function useAttachmentPreviewController({
 
   /** 图片协议请求失败只替换右栏投影，不影响附件自身可发送状态。 */
   const reportImageFailure = useCallback((): void => {
-    setProjection((current) =>
-      current?.status === "ready"
-        ? {
-            status: "error",
-            target: current.target,
-            message: ATTACHMENT_PREVIEW_ERROR,
-            retryable: true,
-          }
-        : current,
-    );
+    setProjection((current) => {
+      if (current?.status !== "ready" || current.content.kind !== "image") return current;
+      const targetKey = attachmentPreviewTargetKey(current.target);
+      const fallback = alternateAttachmentResourceUrl(current.content.resourceUrl);
+      if (fallback !== undefined && !imageFallbackAttemptsRef.current.has(targetKey)) {
+        imageFallbackAttemptsRef.current.add(targetKey);
+        return {
+          ...current,
+          content: { ...current.content, resourceUrl: fallback },
+        };
+      }
+      return {
+        status: "error",
+        target: current.target,
+        message: ATTACHMENT_PREVIEW_ERROR,
+        retryable: true,
+      };
+    });
   }, []);
 
   const actions = useMemo<AttachmentPreviewActions>(

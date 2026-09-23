@@ -82,7 +82,7 @@ final class ContextCompactionLifecycleTest {
         ContextCompactionEvent.Context context = new ContextCompactionEvent.Context(
                 "evt_failed", "ws_test", "thr_test", "turn_test", 4, CLOCK.instant(),
                 "cmp_test", ContextCompactionEvent.Trigger.AUTOMATIC, 4,
-                1_048_576L, 512L, ContextCompactionEvent.STRATEGY_VERSION);
+                1_048_576L, 512L, ContextCompactionEvent.STRATEGY_VERSION, null);
 
         assertThrows(IllegalArgumentException.class,
                 () -> new ContextCompactionEvent.Failed(
@@ -97,7 +97,7 @@ final class ContextCompactionLifecycleTest {
                 () -> new ContextCompactionEvent.Context(
                         "evt_version", "ws_test", "thr_test", "turn_test", 4, CLOCK.instant(),
                         "cmp_test", ContextCompactionEvent.Trigger.AUTOMATIC, 4,
-                        1_048_576L, null, "ja-context-v3"));
+                        1_048_576L, null, "ja-context-v3", null));
     }
 
     /** 构造固定身份与同步 Sink，使测试只观察 phase 合同而不引入 transport 调度。 */

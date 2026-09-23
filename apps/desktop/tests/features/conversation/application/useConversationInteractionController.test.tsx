@@ -127,6 +127,7 @@ function prepareThread(threadId = "thr_one", workspaceId = "ws_one"): void {
       items: [],
       inputQueue: null,
       contextUsage: null,
+      liveStream: null,
       taskActivities: [],
       goalActivities: [],
       nextCursor: null,
@@ -1094,6 +1095,7 @@ describe("useConversationInteractionController", () => {
           items: [],
           inputQueue: null,
           contextUsage: null,
+          liveStream: null,
           taskActivities: [],
           goalActivities: [],
           nextCursor: null,
@@ -1105,8 +1107,8 @@ describe("useConversationInteractionController", () => {
     expect(useTimelineStore.getState().turns["turn_cancel_guard"]?.status).toBe("cancelled");
   });
 
-  /** 恢复 active Turn 超过 2 秒仍不猜测终态，权威 terminal snapshot 到达后才解锁视图。 */
-  it("恢复 active Turn 持续对账，迟到 terminal 仍能解锁", async () => {
+  /** 恢复 active Turn 先保持稳定；5 秒静默后才发起一次权威对账，终态到达后解锁视图。 */
+  it("恢复 active Turn 经过 5 秒静默后对账，迟到 terminal 仍能解锁", async () => {
     vi.useFakeTimers();
     try {
       prepareThread();
@@ -1128,6 +1130,7 @@ describe("useConversationInteractionController", () => {
           items: [],
           inputQueue: null,
           contextUsage: null,
+          liveStream: null,
           taskActivities: [],
           goalActivities: [],
           nextCursor: null,
@@ -1140,10 +1143,16 @@ describe("useConversationInteractionController", () => {
         useConversationInteractionController(options(turnPort, modelPort)),
       );
 
-      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBe("invalid_event");
+      const requestResync = vi.spyOn(useTimelineStore.getState(), "requestThreadResync");
+      expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(2_500);
+        await vi.advanceTimersByTimeAsync(4_999);
       });
+      expect(requestResync).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(requestResync).toHaveBeenCalledOnce();
       expect(result.current.activeTurn).toBe(true);
 
       act(() => {
@@ -1165,6 +1174,7 @@ describe("useConversationInteractionController", () => {
             items: [],
             inputQueue: null,
             contextUsage: null,
+            liveStream: null,
             taskActivities: [],
             goalActivities: [],
             nextCursor: null,
@@ -1177,13 +1187,14 @@ describe("useConversationInteractionController", () => {
       });
       expect(result.current.activeTurn).toBe(false);
       expect(useTimelineStore.getState().resyncRequired["thr_one"]).toBeUndefined();
+      requestResync.mockRestore();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  /** recovered active Turn 取消失败后必须清除旧 key 并恢复唯一 reconciliation 链。 */
-  it("恢复 active Turn 取消失败后可恢复对账并收敛 terminal", async () => {
+  /** recovered active Turn 取消失败后必须清除旧 key，并从新的 5 秒静默窗口恢复对账。 */
+  it("恢复 active Turn 取消失败后可恢复 5 秒静默对账并收敛 terminal", async () => {
     vi.useFakeTimers();
     try {
       prepareThread();
@@ -1204,6 +1215,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1217,7 +1229,7 @@ describe("useConversationInteractionController", () => {
         useConversationInteractionController(options(turnPort, modelPort)),
       );
 
-      expect(requestResync).toHaveBeenCalledTimes(1);
+      expect(requestResync).not.toHaveBeenCalled();
       await act(async () => result.current.cancel());
       expect(result.current.cancelling).toBe(false);
 
@@ -1225,9 +1237,13 @@ describe("useConversationInteractionController", () => {
         useTimelineStore.getState().applySnapshot({ ...activeSnapshot, revision: 2 }, "ws_one");
       });
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(500);
+        await vi.advanceTimersByTimeAsync(4_999);
       });
-      expect(requestResync.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(requestResync).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(requestResync).toHaveBeenCalledOnce();
 
       act(() => {
         useTimelineStore.getState().applySnapshot(
@@ -1282,6 +1298,7 @@ describe("useConversationInteractionController", () => {
             items: [],
             inputQueue: null,
             contextUsage: null,
+            liveStream: null,
             taskActivities: [],
             goalActivities: [],
             nextCursor: null,
@@ -1306,8 +1323,8 @@ describe("useConversationInteractionController", () => {
     }
   });
 
-  /** 持续 reconciliation 只使用约定的 500ms、1s、2s、5s 退避阶梯，不出现 4s 间隔。 */
-  it("恢复 active Turn 使用精确退避阶梯", async () => {
+  /** 健康 live event 会延期静默 watchdog，避免正常输出期间反复读取历史。 */
+  it("恢复 active Turn 的健康 live event 会延期 5 秒 watchdog", async () => {
     vi.useFakeTimers();
     try {
       prepareThread();
@@ -1328,6 +1345,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1337,48 +1355,124 @@ describe("useConversationInteractionController", () => {
       const turnPort = createTurnPort();
       const modelPort = { updatePreferences: vi.fn(async () => undefined) };
       renderHook(() => useConversationInteractionController(options(turnPort, modelPort)));
-      expect(requestResync).toHaveBeenCalledTimes(1);
-
-      const clearResync = (revision: number): void => {
-        act(() => useTimelineStore.getState().applySnapshot({ ...snapshot, revision }, "ws_one"));
-      };
-      clearResync(2);
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(499);
+        await vi.advanceTimersByTimeAsync(4_000);
       });
-      expect(requestResync).toHaveBeenCalledTimes(1);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1);
+      expect(requestResync).not.toHaveBeenCalled();
+      act(() => {
+        useTimelineStore.getState().applyHostEvent({
+          kind: "timeline",
+          event: {
+            jsonrpc: "2.0",
+            method: "assistant/text-delta",
+            params: {
+              serverInstanceId: "srv_test",
+              eventId: "evt_recovered_live",
+              sequence: 1,
+              occurredAt: "2026-08-28T00:00:04Z",
+              generation: 1,
+              workspaceId: "ws_one",
+              threadId: "thr_one",
+              turnId: "turn_backoff",
+              threadRevision: 1,
+              streamSeq: 1,
+              text: "继续输出",
+            },
+          },
+        });
       });
-      expect(requestResync).toHaveBeenCalledTimes(2);
-      clearResync(3);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(999);
-      });
-      expect(requestResync).toHaveBeenCalledTimes(2);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1);
-      });
-      expect(requestResync).toHaveBeenCalledTimes(3);
-      clearResync(4);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_999);
-      });
-      expect(requestResync).toHaveBeenCalledTimes(3);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1);
-      });
-      expect(requestResync).toHaveBeenCalledTimes(4);
-      clearResync(5);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4_999);
       });
-      expect(requestResync).toHaveBeenCalledTimes(4);
+      expect(requestResync).not.toHaveBeenCalled();
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1);
       });
-      expect(requestResync).toHaveBeenCalledTimes(5);
+      expect(requestResync).toHaveBeenCalledOnce();
       requestResync.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** terminal 与 runtime 代际都是 watchdog 生命周期边界；必须同步释放 timer，不能等下一次静默到期。 */
+  it("恢复 watchdog 在 terminal 或 generation 切换后立即清理 timer", async () => {
+    vi.useFakeTimers();
+    try {
+      prepareThread();
+      const activeSnapshot = {
+        threadId: "thr_one",
+        revision: 1,
+        turns: [
+          {
+            turnId: "turn_watchdog_cleanup",
+            status: "running" as const,
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      };
+      const activeTurn = activeSnapshot.turns[0];
+      if (activeTurn === undefined) throw new Error("watchdog cleanup turn missing");
+      useTimelineStore.getState().applySnapshot(activeSnapshot, "ws_one");
+      const turnPort = createTurnPort();
+      const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+      const firstTimerBaseline = vi.getTimerCount();
+      const first = renderHook(() =>
+        useConversationInteractionController(options(turnPort, modelPort)),
+      );
+      await act(async () => Promise.resolve());
+      expect(vi.getTimerCount()).toBe(firstTimerBaseline + 1);
+
+      act(() => {
+        useTimelineStore.getState().applySnapshot(
+          {
+            ...activeSnapshot,
+            revision: 2,
+            turns: [
+              {
+                ...activeTurn,
+                status: "completed" as const,
+                completedAt: "2026-08-28T00:00:03Z",
+              },
+            ],
+          },
+          "ws_one",
+        );
+      });
+      await act(async () => Promise.resolve());
+      expect(vi.getTimerCount()).toBe(firstTimerBaseline);
+      first.unmount();
+
+      prepareThread();
+      useTimelineStore.getState().applySnapshot(activeSnapshot, "ws_one");
+      const secondTimerBaseline = vi.getTimerCount();
+      const second = renderHook(() =>
+        useConversationInteractionController(options(turnPort, modelPort)),
+      );
+      await act(async () => Promise.resolve());
+      expect(vi.getTimerCount()).toBe(secondTimerBaseline + 1);
+      act(() => {
+        useTimelineStore.getState().applyHostEvent({
+          kind: "status",
+          status: { status: "ready", generation: 2, serverInstanceId: "srv_generation_2" },
+          eventId: "evt_generation_2",
+          occurredAt: "2026-08-28T00:00:04Z",
+        });
+      });
+      await act(async () => Promise.resolve());
+      expect(vi.getTimerCount()).toBe(secondTimerBaseline);
+      second.unmount();
     } finally {
       vi.useRealTimers();
     }
@@ -1437,6 +1531,7 @@ describe("useConversationInteractionController", () => {
             items: [],
             inputQueue: null,
             contextUsage: null,
+            liveStream: null,
             taskActivities: [],
             goalActivities: [],
             nextCursor: null,
@@ -1475,6 +1570,7 @@ describe("useConversationInteractionController", () => {
             items: [],
             inputQueue: null,
             contextUsage: null,
+            liveStream: null,
             taskActivities: [],
             goalActivities: [],
             nextCursor: null,
@@ -1512,6 +1608,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1559,6 +1656,7 @@ describe("useConversationInteractionController", () => {
           items: [],
           inputQueue: null,
           contextUsage: null,
+          liveStream: null,
           taskActivities: [],
           goalActivities: [],
           nextCursor: null,
@@ -1591,6 +1689,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1647,6 +1746,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1692,6 +1792,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1735,6 +1836,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -1834,6 +1936,7 @@ describe("useConversationInteractionController", () => {
           ],
         },
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2110,6 +2213,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,
@@ -2189,6 +2293,7 @@ describe("useConversationInteractionController", () => {
         items: [],
         inputQueue: null,
         contextUsage: null,
+        liveStream: null,
         taskActivities: [],
         goalActivities: [],
         nextCursor: null,

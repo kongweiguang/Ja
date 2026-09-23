@@ -286,9 +286,15 @@
       COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0) AS cache_read_tokens,
       COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_write_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS cache_write_request_count,
       COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_write_tokens IS NOT NULL THEN cache_write_tokens ELSE 0 END), 0) AS cache_write_tokens,
-      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS cache_complete_request_count,
-      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN new_input_tokens + cache_read_tokens + cache_write_tokens ELSE 0 END), 0) AS cache_complete_input_tokens,
-      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0) AS cache_complete_read_tokens
+      <!-- OpenAI 的 input 已包含缓存读，API 不单独报告缓存写；此时缺失写入字段按 0 参与命中率分母。
+           Anthropic 的 input 不含缓存，仍要求 cache_write_tokens 真实存在，避免把未知写入误当成零。 -->
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+        AND (cache_write_tokens IS NOT NULL OR input_accounting='INPUT_INCLUDES_CACHE') THEN 1 ELSE 0 END), 0) AS cache_complete_request_count,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+        AND (cache_write_tokens IS NOT NULL OR input_accounting='INPUT_INCLUDES_CACHE')
+        THEN new_input_tokens + cache_read_tokens + COALESCE(cache_write_tokens, 0) ELSE 0 END), 0) AS cache_complete_input_tokens,
+      COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+        AND (cache_write_tokens IS NOT NULL OR input_accounting='INPUT_INCLUDES_CACHE') THEN cache_read_tokens ELSE 0 END), 0) AS cache_complete_read_tokens
     FROM usage
     WHERE thread_id=#{threadId} AND purpose IN ('ASSISTANT','SUMMARY')
   </select>

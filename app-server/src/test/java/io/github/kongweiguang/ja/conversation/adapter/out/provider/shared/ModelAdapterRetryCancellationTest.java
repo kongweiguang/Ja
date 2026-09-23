@@ -42,7 +42,7 @@ import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
 
-/** 传输 Policy 测试证明重试会在语义提交后停止，且活动交换遵守取消与 Deadline。 */
+/** 传输 Policy 测试证明格式恢复有界且不重复正文，活动交换仍遵守取消与 Deadline。 */
 final class ModelAdapterRetryCancellationTest {
     private static final String COMPLETE = """
             event: response.created
@@ -219,9 +219,9 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 文本被接纳后即使剩余流被截断，也拒绝重放请求。 */
+    /** 文本被接纳后流被截断时自动恢复，并且重试返回的已接纳前缀只发布一次。 */
     @Test
-    void doesNotRetryAfterFirstSemanticEventIsAccepted() throws Exception {
+    void retriesTruncatedStreamAfterSemanticEventWithoutDuplicatingText() throws Exception {
         String committedThenTruncated = """
                 event: response.created
                 data: {"type":"response.created","sequence_number":0,"response":%s}
@@ -230,24 +230,98 @@ final class ModelAdapterRetryCancellationTest {
                 data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
 
                 """.formatted(ModelAdapterTestSupport.openAiResponse(
-                        "resp_partial", "in_progress"));
+                "resp_partial", "in_progress"));
+        String completedAfterRetry = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":" repaired","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":2}
+
+                event: response.output_text.done
+                data: {"type":"response.output_text.done","content_index":0,"item_id":"message_1","output_index":0,"sequence_number":3,"text":"persisted repaired"}
+
+                event: response.completed
+                data: {"type":"response.completed","sequence_number":4,"response":%s}
+
+                """.formatted(
+                ModelAdapterTestSupport.openAiResponse("resp_retry", "in_progress"),
+                ModelAdapterTestSupport.openAiResponse("resp_retry", "completed", new ModelUsage(1, 1, 2),
+                        "[{\"id\":\"message_1\",\"type\":\"message\",\"role\":\"assistant\","
+                                + "\"status\":\"completed\",\"content\":[{\"type\":\"output_text\","
+                                + "\"text\":\"persisted repaired\",\"annotations\":[],\"logprobs\":[]}]}]"));
         AtomicInteger textEvents = new AtomicInteger();
+        StringBuilder text = new StringBuilder();
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
-                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, committedThenTruncated, 5))) {
+                (call, exchange) -> ModelAdapterTestSupport.sse(
+                        exchange, call == 1 ? committedThenTruncated : completedAfterRetry, 5))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
+                            if (event instanceof ModelPort.TextDelta delta) {
+                                textEvents.incrementAndGet();
+                                text.append(delta.text());
+                            }
+                            return java.util.concurrent.CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+            assertEquals(2, textEvents.get());
+            assertEquals("persisted repaired", text.toString());
+            assertEquals(2, server.calls());
+        }
+    }
+
+    /** 重试流只返回已接纳正文的短前缀时，即使上游正常 STOP 也必须拒绝旧尾巴残留。 */
+    @Test
+    void rejectsShortReplayPrefixAtNormalStop() throws Exception {
+        String committedThenTruncated = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                """.formatted(ModelAdapterTestSupport.openAiResponse(
+                "resp_short_partial", "in_progress"));
+        String shortCompleted = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"persis","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                event: response.output_text.done
+                data: {"type":"response.output_text.done","content_index":0,"item_id":"message_1","output_index":0,"sequence_number":2,"text":"persis"}
+
+                event: response.completed
+                data: {"type":"response.completed","sequence_number":3,"response":%s}
+
+                """.formatted(
+                ModelAdapterTestSupport.openAiResponse("resp_short_retry", "in_progress"),
+                ModelAdapterTestSupport.openAiResponse("resp_short_retry", "completed", new ModelUsage(1, 1, 2),
+                        "[{\"id\":\"message_1\",\"type\":\"message\",\"role\":\"assistant\","
+                                + "\"status\":\"completed\",\"content\":[{\"type\":\"output_text\","
+                                + "\"text\":\"persis\",\"annotations\":[],\"logprobs\":[]}]}]"));
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(
+                        exchange, call == 1 ? committedThenTruncated : shortCompleted, 5))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
-                                    if (event instanceof ModelPort.TextDelta) textEvents.incrementAndGet();
-                                    return java.util.concurrent.CompletableFuture.completedFuture(null);
-                                }, CancellationToken.none())
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
                                 .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("STREAM_TRUNCATED",
+                assertEquals("STREAM_REPLAY_MISMATCH",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
-            assertEquals(1, textEvents.get());
-            assertEquals(1, server.calls());
+            assertEquals(2, server.calls());
         }
     }
 
@@ -289,7 +363,7 @@ final class ModelAdapterRetryCancellationTest {
                 assertEquals("OPENAI_EVENT",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
-            assertEquals(1, server.calls());
+            assertEquals(3, server.calls());
         }
     }
 
