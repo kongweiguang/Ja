@@ -539,11 +539,6 @@ export function requireActiveTurnResync(
   return activeThreadIds.size === 0 ? outcome(state, "applied") : next;
 }
 
-/** mutation CAS 失败后触发一次权威 thread/read，避免组件在陈旧队列上继续猜测。 */
-export function requireThreadResync(state: TimelineState, threadId: string): TimelineState {
-  return resync(state, threadId, "invalid_event");
-}
-
 /** Context lifecycle 拥有可空 Turn identity，必须先于普通 Turn Event 单独分派。 */
 function isContextCompactionEvent(event: TimelineEvent): event is ContextCompactionEvent {
   return (
