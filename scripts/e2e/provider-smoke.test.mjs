@@ -28,11 +28,15 @@ test("direct capabilities retain only the minimal v1 surface", () => {
   assert.deepEqual(capabilities.collaborationModes, ["default", "plan"]);
   assert.deepEqual(capabilities.features, ["task_threads_v1", "plan_goal_v1", "interaction_v1"]);
   assert.equal(capabilities.events.includes("tool/started"), true);
+  assert.equal(capabilities.events.includes("turn/retry-started"), true);
   assert.equal(capabilities.events.includes("turn/messages_received"), true);
   assert.equal(capabilities.methods.includes("plan/current/read"), true);
   assert.equal(capabilities.methods.includes("goal/plan/attach"), true);
   assert.equal(capabilities.methods.includes("task/close"), true);
   assert.equal(capabilities.methods.includes("thread/usage/read"), true);
+  assert.equal(capabilities.methods.includes("thread/mcp/read"), true);
+  assert.equal(capabilities.methods.includes("turn/continue"), true);
+  assert.equal(capabilities.methods.includes("turn/reask"), true);
   assert.equal(capabilities.methods.includes("turn/recovery/respond"), true);
   assert.equal(capabilities.methods.includes("configuration/restore"), true);
 
