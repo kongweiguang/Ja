@@ -43,6 +43,8 @@ import org.junit.jupiter.api.io.TempDir;
 final class WindowsJobObjectTest {
     /** 文件和进程状态轮询间隔，在测试速度与系统调用压力之间取平衡。 */
     private static final Duration POLL_INTERVAL = Duration.ofMillis(25);
+    /** 冷启动的托管 Windows runner 需要给受限 PowerShell 留出额外的 ready 标记时间。 */
+    private static final Duration PROCESS_READY_TIMEOUT = Duration.ofSeconds(10);
 
     /** 显式限定本地测试平台，避免其它平台静默跳过后被误报为通过。 */
     @BeforeEach
@@ -54,7 +56,7 @@ final class WindowsJobObjectTest {
     @Test
     void closeKillsRootAndDescendantAndReleasesHandle(@TempDir Path temp) throws Exception {
         try (ProcessFixture fixture = ProcessFixture.start(temp)) {
-            awaitFile(fixture.ready(), Duration.ofSeconds(5));
+            awaitFile(fixture.ready(), PROCESS_READY_TIMEOUT);
             long handlesBefore = HandleCounter.current();
             WindowsJobObject job = WindowsJobObject.create();
             try {
@@ -76,7 +78,7 @@ final class WindowsJobObjectTest {
     @Test
     void explicitTerminateKillsRootAndDescendant(@TempDir Path temp) throws Exception {
         try (ProcessFixture fixture = ProcessFixture.start(temp)) {
-            awaitFile(fixture.ready(), Duration.ofSeconds(5));
+            awaitFile(fixture.ready(), PROCESS_READY_TIMEOUT);
             try (WindowsJobObject job = WindowsJobObject.create()) {
                 job.assign(fixture.root());
                 Files.writeString(fixture.release(), "go", StandardCharsets.UTF_8);
@@ -93,7 +95,7 @@ final class WindowsJobObjectTest {
     @Test
     void closeIsIdempotentAndRejectsAssignAfterClosed(@TempDir Path temp) throws Exception {
         try (ProcessFixture fixture = ProcessFixture.start(temp)) {
-            awaitFile(fixture.ready(), Duration.ofSeconds(5));
+            awaitFile(fixture.ready(), PROCESS_READY_TIMEOUT);
             WindowsJobObject job = WindowsJobObject.create();
             job.close();
             assertDoesNotThrow(job::close);

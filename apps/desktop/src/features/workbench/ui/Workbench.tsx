@@ -535,6 +535,13 @@ export function Workbench({
     setTabContextMenu({ id: tabContextMenuSequenceRef.current, tabKey: tab.key, x, y });
   };
 
+  /** 仅恢复仍属于当前会话的焦点，避免关闭菜单排队的 RAF 抢走新菜单焦点并将其关闭。 */
+  const restoreTabContextMenuFocus = (sessionId: number): void => {
+    if (tabContextMenuSequenceRef.current !== sessionId) return;
+    const trigger = tabContextMenuTriggerRef.current;
+    if (trigger?.isConnected) trigger.focus();
+  };
+
   /** 右键只建立菜单上下文，不选择 Tab；文本输入保留 WebView2 的原生编辑菜单。 */
   const openTabContextMenu = (event: MouseEvent<HTMLDivElement>, tab: WorkbenchTab): void => {
     const target = event.target instanceof Element ? event.target : undefined;
@@ -759,10 +766,7 @@ export function Workbench({
                       current?.id === tabContextMenu.id ? undefined : current,
                     );
                 }}
-                onRestoreFocus={() => {
-                  const trigger = tabContextMenuTriggerRef.current;
-                  if (trigger?.isConnected) trigger.focus();
-                }}
+                onRestoreFocus={() => restoreTabContextMenuFocus(tabContextMenu.id)}
                 onRename={() => {
                   if (contextTab.kind === "task") beginTaskTabRename(contextTab);
                 }}
