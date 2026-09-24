@@ -559,29 +559,34 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** 有效配置代际冻结 MCP/Skill；外部文件失效后仅复用已严格校验的最近快照，并保留恢复诊断。 */
+    /** 代际获取必须与租约原子完成，避免 Watcher 在无租约快照返回后关闭它；同时验证刷新不破坏旧租约。 */
     @Test
     void generationCatalogIsFrozenAndInvalidConfigurationUsesLastKnownGood() throws Exception {
         Files.writeString(homeDirectory().resolve("config.toml"), catalogConfig("http://127.0.0.1:1"));
         try (ConfigurationRuntimeAdapter service = service()) {
             service.setCredential("cred_model", "catalog-secret", "cfg_missing");
-            ConfigGeneration first = service.resolveGeneration(null);
-            assertTrue(first.ready());
-            assertEquals(1, first.skills().size());
-            assertEquals(1, first.mcpServers().size());
-            String digest = first.catalogDigest();
-            try (ConfigGeneration.Lease lease = first.acquire()) {
+            try (ConfigGeneration.Lease firstLease = service.acquireGeneration(null)) {
+                ConfigGeneration first = firstLease.generation();
+                assertTrue(first.ready());
+                assertEquals(1, first.skills().size());
+                assertEquals(1, first.mcpServers().size());
+                String digest = first.catalogDigest();
                 Files.writeString(homeDirectory().resolve("config.toml"), catalogConfig("http://127.0.0.1:2"));
-                ConfigGeneration second = service.resolveGeneration(null);
-                assertNotEquals(digest, second.catalogDigest());
-                assertEquals("http://127.0.0.1:1", lease.generation().mcpServers().get(0).path("endpoint").textValue());
+                try (ConfigGeneration.Lease secondLease = service.acquireGeneration(null)) {
+                    ConfigGeneration second = secondLease.generation();
+                    assertNotEquals(digest, second.catalogDigest());
+                    assertEquals("http://127.0.0.1:1",
+                            firstLease.generation().mcpServers().get(0).path("endpoint").textValue());
+                }
+                Files.writeString(homeDirectory().resolve("config.toml"), catalogConfigWithMissingMcpEnabled());
+                try (ConfigGeneration.Lease missingLease = service.acquireGeneration(null)) {
+                    ConfigGeneration missing = missingLease.generation();
+                    assertTrue(missing.ready());
+                    assertTrue(missing.mcpServers().isEmpty());
+                    assertTrue(missing.diagnostics().stream()
+                            .noneMatch(diagnostic -> "CORRUPT_CONFIG".equals(diagnostic.code())));
+                }
             }
-            Files.writeString(homeDirectory().resolve("config.toml"), catalogConfigWithMissingMcpEnabled());
-            ConfigGeneration missing = service.resolveGeneration(null);
-            assertTrue(missing.ready());
-            assertTrue(missing.mcpServers().isEmpty());
-            assertTrue(missing.diagnostics().stream()
-                    .noneMatch(diagnostic -> "CORRUPT_CONFIG".equals(diagnostic.code())));
         }
     }
 
