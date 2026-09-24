@@ -121,8 +121,10 @@ final class LegacySessionWorkspaceMigrationTest {
             try (JaDatabase database = openDatabase(databasePath, home)) {
                 String sessionA = workspaceId(database, "thr_main_a");
                 String sessionB = workspaceId(database, "thr_main_b");
-                assertEquals(new WorkspacePolicy().workspaceId(home.resolve("workspaces/thr_main_a")), sessionA);
-                assertEquals(new WorkspacePolicy().workspaceId(home.resolve("workspaces/thr_main_b")), sessionB);
+                assertEquals(new WorkspacePolicy().workspaceId(
+                        home.resolve("workspaces/thr_main_a").toRealPath()), sessionA);
+                assertEquals(new WorkspacePolicy().workspaceId(
+                        home.resolve("workspaces/thr_main_b").toRealPath()), sessionB);
                 assertFalse(sessionA.equals(sessionB));
                 assertSessionTree(database, "thr_main_a", "thr_side_a", sessionA);
                 assertSessionTree(database, "thr_main_b", "thr_side_b", sessionB);
