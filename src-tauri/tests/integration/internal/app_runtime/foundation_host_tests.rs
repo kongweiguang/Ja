@@ -997,12 +997,14 @@ fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
 /// 两个 Thread 串行启动用于锁定 accepted 提交边界：先经生产 general workspace 入口绑定
 /// App Server identity 与原生 capability，后续 Turn 才能捕获不混入既有 dirty 状态的基线；
 /// 前一个 Turn 完成后，后一个 Turn 也不能因生命周期投影而误报失败并诱发 UI 重试。
+/// 总预算覆盖真实 JVM 冷启动、配置与 workspace 写入以及两个连续 Turn，为 hosted CI 负载留出余量；
+/// 生产配置仍分别限制每个 Turn 的 wall timeout，不随测试等待上限变化。
 #[test]
 fn real_java_turn_and_shutdown_close_without_token_leak() {
     let _jvm_guard = jvm_runtime_test_guard();
     let run_dir = TempRunDir::create("turn");
     let marker = format!("ja-marker-{}", std::process::id());
-    let total_deadline = Instant::now() + Duration::from_secs(30);
+    let total_deadline = Instant::now() + Duration::from_secs(60);
     let (sink, receiver) = event_sink();
     let harness = RuntimeHostHarness::new(marked_fixture_config(&run_dir, &marker), sink);
     let host = harness.host();
