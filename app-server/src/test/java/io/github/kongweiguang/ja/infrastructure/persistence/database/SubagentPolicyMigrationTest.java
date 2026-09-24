@@ -91,7 +91,7 @@ final class SubagentPolicyMigrationTest {
                     + "WHERE thread_id='thr_existing' AND (provider_id IS NOT NULL OR model_id IS NOT NULL)"));
         }
 
-        try (JaDatabase database = JaDatabase.open(DatabaseConfig.of(databasePath))) {
+        try (JaDatabase database = JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent()))) {
             org.apache.ibatis.session.Configuration configuration = new org.apache.ibatis.session.Configuration(
                     new Environment("migration-test", new JdbcTransactionFactory(), database.dataSource()));
             configuration.addMapper(SchemaMapper.class);

@@ -50,11 +50,25 @@ pub(crate) struct LaunchPlan {
 struct NativeProcessLauncher;
 
 impl ProcessLauncher for NativeProcessLauncher {
-    /// 启动已解析的闭集程序后立即释放 child handle，使桌面 UI 不绑定 IDE 生命周期或输出流。
+    /// Explorer 的 /select, 语法要求只给路径加引号；普通 arg 会把整个含空格参数加引号，
+    /// 导致 Explorer 打开默认目录。其余闭集目标仍使用结构化参数，并立即释放 child handle。
     fn launch(&self, plan: &LaunchPlan) -> Result<(), ()> {
         let mut command = Command::new(&plan.program);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            if plan.target == OpenWithTarget::FileExplorer && plan.entry_kind == EntryKind::File {
+                let [argument] = plan.args.as_slice() else {
+                    return Err(());
+                };
+                command.raw_arg(argument);
+            } else {
+                command.args(&plan.args);
+            }
+        }
+        #[cfg(not(windows))]
+        command.args(&plan.args);
         command
-            .args(&plan.args)
             .current_dir(&plan.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -68,6 +82,14 @@ impl ProcessLauncher for NativeProcessLauncher {
         }
         command.spawn().map(|_| ()).map_err(|_| ())
     }
+}
+
+/// Windows 文件名不允许双引号；把已核验路径放在 /select, 后的引号内，保留空格和中文。
+fn explorer_file_argument(path: &Path) -> OsString {
+    let mut argument = OsString::from("/select,\"");
+    argument.push(path.as_os_str());
+    argument.push("\"");
+    argument
 }
 
 /// resolver 只从 PATH/PATHEXT 与有界 Windows 常见安装根选择闭集候选，不向 UI 暴露命中路径。
@@ -131,7 +153,7 @@ fn build_launch_plan<R: ExecutableResolver>(
         OpenWithTarget::FileExplorer => {
             #[cfg(windows)]
             let args = if entry_kind == EntryKind::File {
-                vec![OsString::from(format!("/select,{}", path.display()))]
+                vec![explorer_file_argument(path)]
             } else {
                 vec![path.as_os_str().to_os_string()]
             };
@@ -270,6 +292,36 @@ pub(crate) fn open_with<R: ExecutableResolver, L: ProcessLauncher>(
         relative_path: relative_path.to_owned(),
         entry_kind,
     })
+}
+
+/// 点击已由 Preview 核验的本机文件时沿用闭集 Explorer resolver 和结构化 launcher；
+/// 不把工作区外路径塞进仅接受相对路径的 Workspace open 用例。
+pub(crate) fn reveal_absolute_file_with<R: ExecutableResolver, L: ProcessLauncher>(
+    resolver: &R,
+    launcher: &L,
+    path: &Path,
+) -> Result<(), OpenError> {
+    if !path.is_absolute() {
+        return Err(OpenError::InvalidInput);
+    }
+    let program = resolver
+        .resolve(OpenWithTarget::FileExplorer)
+        .map_err(|_| OpenError::TargetUnavailable)?;
+    let parent = path.parent().ok_or(OpenError::InvalidInput)?;
+    let plan = LaunchPlan {
+        target: OpenWithTarget::FileExplorer,
+        program,
+        args: vec![explorer_file_argument(path)],
+        cwd: parent.to_path_buf(),
+        relative_path: String::new(),
+        entry_kind: EntryKind::File,
+    };
+    launcher.launch(&plan).map_err(|_| OpenError::LaunchFailed)
+}
+
+/// 原生入口固定 Explorer 程序和文件选择参数，拒绝 renderer 提供 executable 或 shell 文本。
+pub(crate) fn reveal_absolute_file(path: &Path) -> Result<(), OpenError> {
+    reveal_absolute_file_with(&NativeExecutableResolver, &NativeProcessLauncher, path)
 }
 
 /// 原生 Open port 固定绑定一个 Workspace handle，不暴露 resolver 或 process launcher。

@@ -250,7 +250,6 @@ function createPreviewPorts(): SettingsPorts {
     onSaveMcp: async () => undefined,
     onDeleteMcp: async () => undefined,
     onTestMcp: async () => "error",
-    onCloseMcp: async () => undefined,
     onToggleSkill: async () => undefined,
     onAccessModeChange: async () => undefined,
     onClarificationEnabledChange: async () => undefined,

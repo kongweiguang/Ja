@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -20,15 +21,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFactory {
     private final GenerationCatalog catalog;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+    private final ConfigurationGenerationPort configurations;
 
     /**
      * 绑定代际目录与传输上限，但不保留可变快照。
      */
     public GenerationTurnMcpSessionFactory(com.fasterxml.jackson.databind.ObjectMapper objectMapper,
                                            McpLimits limits, GenerationCatalog catalog) {
+        this(objectMapper, limits, catalog, null);
+    }
+
+    /** 生产路径额外绑定当前信任事实；旧租约只负责目录冻结，不授权撤信后的新调用。 */
+    public GenerationTurnMcpSessionFactory(com.fasterxml.jackson.databind.ObjectMapper objectMapper,
+                                           McpLimits limits, GenerationCatalog catalog,
+                                           ConfigurationGenerationPort configurations) {
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper").copy();
         Objects.requireNonNull(limits, "limits");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
+        this.configurations = configurations;
     }
 
     /**
@@ -48,7 +58,9 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         Objects.requireNonNull(catalogSnapshot, "catalogSnapshot");
         Objects.requireNonNull(cancellation, "cancellation");
         SharedMcpGateway gateway = new SharedMcpGateway(
-                catalogSnapshot.snapshot(), catalogSnapshot.services(), objectMapper);
+                catalogSnapshot.snapshot(), catalogSnapshot.services(),
+                catalogSnapshot.serverStatuses(), objectMapper,
+                catalogSnapshot.projectServerIds, () -> projectTrusted(catalogSnapshot.workspaceRoot));
         CancellationToken.Registration registration = cancellation.onCancellation(gateway::close);
         try {
             cancellation.throwIfCancellationRequested();
@@ -76,7 +88,22 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         lease.snapshot().requireModel(context.providerId(), context.modelId());
         GenerationCatalog.TurnCatalog captured = catalog.capture(
                 lease, provider.agentDefaults(), context.workspaceRoot());
-        return new CatalogSnapshot(captured.snapshot(), captured.routeIdentities(), captured.services());
+        return new CatalogSnapshot(captured.snapshot(), captured.routeIdentities(), captured.services(),
+                captured.serverStatuses(), context.workspaceRoot(),
+                lease.snapshot().mcpDefinitions().stream()
+                        .filter(server -> server.scope() == ConfigurationGenerationSnapshot.Scope.PROJECT)
+                        .map(ConfigurationGenerationSnapshot.McpServer::mcpId)
+                        .collect(java.util.stream.Collectors.toUnmodifiableSet()));
+    }
+
+    /** 每次项目远端调用前读取最新代际；信任读取失败时拒绝调用，避免旧 Turn pin 绕过撤信。 */
+    private boolean projectTrusted(java.nio.file.Path workspaceRoot) {
+        if (configurations == null || workspaceRoot == null) return false;
+        try (ConfigurationGenerationPort.Lease current = configurations.acquire(workspaceRoot)) {
+            return current.snapshot().trusted();
+        } catch (RuntimeException unavailable) {
+            return false;
+        }
     }
 
     /**
@@ -86,6 +113,9 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         private final McpGateway.McpSnapshot snapshot;
         private final Map<String, McpGateway.RouteIdentity> routeIdentities;
         private final Map<String, McpServiceDirectory> services;
+        private final java.util.List<McpGateway.McpServerStatus> serverStatuses;
+        private final java.nio.file.Path workspaceRoot;
+        private final Set<String> projectServerIds;
 
         /**
          * 防御性复制同源投影与不对外暴露的目录 owner，避免请求组装后被并发刷新替换。
@@ -93,10 +123,15 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         private CatalogSnapshot(
                 McpGateway.McpSnapshot snapshot,
                 Map<String, McpGateway.RouteIdentity> routeIdentities,
-                Map<String, McpServiceDirectory> services) {
+                Map<String, McpServiceDirectory> services,
+                java.util.List<McpGateway.McpServerStatus> serverStatuses,
+                java.nio.file.Path workspaceRoot, Set<String> projectServerIds) {
             this.snapshot = Objects.requireNonNull(snapshot, "snapshot");
             this.routeIdentities = Map.copyOf(routeIdentities);
             this.services = Map.copyOf(services);
+            this.serverStatuses = java.util.List.copyOf(serverStatuses);
+            this.workspaceRoot = workspaceRoot;
+            this.projectServerIds = Set.copyOf(projectServerIds);
         }
 
         /**
@@ -106,7 +141,7 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         public static CatalogSnapshot planningEmpty() {
             return new CatalogSnapshot(
                     new McpGateway.McpSnapshot("mcp_plan_disabled", java.util.List.of(),
-                            java.time.Instant.EPOCH), Map.of(), Map.of());
+                            java.time.Instant.EPOCH), Map.of(), Map.of(), java.util.List.of(), null, Set.of());
         }
 
         /** 返回当前 Provider 请求看到的不可变 Tool 目录。 */
@@ -117,6 +152,11 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         /** 返回与目录同源的精确路由证明，供 batch 持久化。 */
         public Map<String, McpGateway.RouteIdentity> routeIdentities() {
             return routeIdentities;
+        }
+
+        /** 返回与冻结 Tool snapshot 同源的脱敏服务状态，含健康零工具服务。 */
+        public java.util.List<McpGateway.McpServerStatus> serverStatuses() {
+            return serverStatuses;
         }
 
         /** 仅允许本 Factory pin 包内 owner，防止上层绕过 Gateway 生命周期。 */

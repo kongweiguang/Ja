@@ -29,7 +29,7 @@ import java.util.Set;
  */
 public final class WorkspaceService implements WorkspaceUseCase {
     private static final int DEFAULT_MAX_OPEN_WORKSPACES = 128;
-    private static final String GENERAL_DISPLAY_NAME = "无项目";
+    private static final String SESSION_DISPLAY_NAME = "无项目对话";
     private final WorkspaceRepository repository;
     private final WorkspaceDirectoryPort directories;
     private final WorkspacePreparationPort preparation;
@@ -90,13 +90,56 @@ public final class WorkspaceService implements WorkspaceUseCase {
         return value;
     }
 
+    /** Java 生成 Thread identity 后创建独立目录；创建失败必须反馈，不回退到旧共享根。 */
+    @Override
+    public Workspace createSessionWorkspace(String threadId) {
+        WorkspaceDirectory directory = directories.createSessionDirectory(threadId);
+        Workspace.Kind kind = Workspace.Kind.SESSION;
+        String workspaceId = policy.workspaceId(directory.root());
+        Workspace persisted = repository.findByRoot(directory.root()).orElseGet(() -> repository.register(
+                new Workspace.Registration(workspaceId, directory.root(), SESSION_DISPLAY_NAME,
+                        policy.initialTrust(directory.kind()), kind, null, clock.instant())));
+        verifyIdentity(persisted, directory);
+        if (persisted.legacySharedWorkspaceId() != null) throw identityConflict();
+        return persisted;
+    }
+
     /**
-     * 通用目录、展示名与信任均由 Java 固定，避免客户端伪造无项目身份。
+     * 补偿 thread/create 的持久化失败只撤销无引用注册行；空目录保留，避免清理路径扩大目录删除权限。
      */
     @Override
-    public Workspace openGeneralWorkspace() {
-        WorkspaceDirectory directory = directories.ensureGeneralDirectory();
-        return open(directory, GENERAL_DISPLAY_NAME);
+    public void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision) {
+        Workspace workspace = repository.findById(Objects.requireNonNull(workspaceId, "workspaceId"))
+                .orElseThrow(() -> unavailable("workspace is unavailable"));
+        if (workspace.kind() != Workspace.Kind.SESSION || workspace.revision() != expectedRevision) {
+            throw identityConflict();
+        }
+        repository.unregister(workspaceId, expectedRevision);
+    }
+
+    /** 数据库 identity 是重开 session/legacy 根的唯一入口；轻型目录投影不留在进程绑定缓存。 */
+    @Override
+    public Workspace openRegisteredWorkspace(String workspaceId) {
+        Workspace persisted = repository.findById(Objects.requireNonNull(workspaceId, "workspaceId"))
+                .orElseThrow(() -> unavailable("workspace is unavailable"));
+        return verifyRegisteredDirectory(persisted);
+    }
+
+    /**
+     * session 与旧共享目录不持有 OS 句柄；每次按持久 ID 做物理路径校验，避免会话切换积累无界绑定。
+     */
+    private Workspace verifyRegisteredDirectory(Workspace persisted) {
+        WorkspaceDirectory directory = switch (persisted.kind()) {
+            case SESSION -> {
+                Path threadDirectoryName = persisted.root().getFileName();
+                if (threadDirectoryName == null) throw identityConflict();
+                yield directories.verifySessionDirectory(threadDirectoryName.toString(), persisted.root());
+            }
+            case LEGACY_SHARED -> directories.verifyLegacySharedDirectory(persisted.root());
+            case PROJECT -> throw identityConflict();
+        };
+        verifyIdentity(persisted, directory);
+        return persisted;
     }
 
     /**
@@ -105,6 +148,12 @@ public final class WorkspaceService implements WorkspaceUseCase {
     @Override
     public CursorPage<Workspace> listWorkspaces(String cursor, int limit) {
         return repository.list(cursor, limit);
+    }
+
+    /** 将可选类型过滤留在 SQLite keyset 查询中，避免超出首屏的其它类型遮蔽结果。 */
+    @Override
+    public CursorPage<Workspace> listWorkspaces(String cursor, int limit, Workspace.Kind kind) {
+        return repository.list(cursor, limit, kind);
     }
 
     /**
@@ -116,18 +165,20 @@ public final class WorkspaceService implements WorkspaceUseCase {
     }
 
     /**
-     * 只返回本进程已经验证并绑定的物理目录能力，重启后必须重新打开。
+     * PROJECT 必须在进程中显式打开；SESSION/LEGACY 则按持久 ID 每次重验固定目录，避免切换后累积缓存。
      */
     @Override
     public Workspace requireOpenWorkspace(String workspaceId) {
         synchronized (stateLock) {
             OpenWorkspaceState state = openWorkspaces.get(workspaceId);
-            if (state == null) {
-                throw new WorkspaceFailure(WorkspaceFailure.Code.WORKSPACE_NOT_OPEN,
-                        "workspace is not open");
-            }
-            return state.workspace();
+            if (state != null) return state.workspace();
         }
+        Workspace persisted = repository.findById(Objects.requireNonNull(workspaceId, "workspaceId"))
+                .orElseThrow(() -> unavailable("workspace is unavailable"));
+        if (persisted.kind() == Workspace.Kind.PROJECT) {
+            throw new WorkspaceFailure(WorkspaceFailure.Code.WORKSPACE_NOT_OPEN, "workspace is not open");
+        }
+        return verifyRegisteredDirectory(persisted);
     }
 
     /**
@@ -137,10 +188,9 @@ public final class WorkspaceService implements WorkspaceUseCase {
     public Workspace setWorkspaceTrust(String workspaceId, Workspace.Trust trust) {
         Objects.requireNonNull(trust, "trust");
         OpenWorkspaceState prior = requireOpenState(workspaceId);
-        if (prior.directory().kind() == WorkspaceDirectory.Kind.GENERAL
-            && trust != Workspace.Trust.TRUSTED) {
-            throw new WorkspaceFailure(WorkspaceFailure.Code.TRUST_CONFLICT,
-                    "general workspace trust is fixed");
+        if (prior.directory().kind() != WorkspaceDirectory.Kind.PROJECT
+                && trust != Workspace.Trust.TRUSTED) {
+            throw new WorkspaceFailure(WorkspaceFailure.Code.TRUST_CONFLICT, "non-project workspace trust is fixed");
         }
         Workspace updated = repository.updateTrust(workspaceId, trust);
         verifyIdentity(updated, prior.directory());
@@ -183,8 +233,8 @@ public final class WorkspaceService implements WorkspaceUseCase {
      * 委派无副作用的规范路径比较，路由判断不会意外创建通用目录。
      */
     @Override
-    public boolean isGeneralWorkspace(Path root) {
-        return directories.isGeneralDirectory(root);
+    public boolean isLegacySharedWorkspace(Path root) {
+        return directories.isLegacySharedDirectory(root);
     }
 
     /**
@@ -194,15 +244,18 @@ public final class WorkspaceService implements WorkspaceUseCase {
         String workspaceId = policy.workspaceId(directory.root());
         boolean reserved = reserve(directory.root(), workspaceId);
         try {
+            Workspace.Kind kind = Workspace.Kind.valueOf(directory.kind().name());
             Workspace value = repository.findByRoot(directory.root())
                     .orElseGet(() -> repository.register(new Workspace.Registration(
                             workspaceId,
                             directory.root(),
                             displayName,
                             policy.initialTrust(directory.kind()),
+                            kind,
+                            null,
                             clock.instant())));
             verifyIdentity(value, directory);
-            if (directory.kind() == WorkspaceDirectory.Kind.GENERAL
+            if (directory.kind() != WorkspaceDirectory.Kind.PROJECT
                 && value.trust() != Workspace.Trust.TRUSTED) {
                 value = repository.updateTrust(value.workspaceId(), Workspace.Trust.TRUSTED);
                 verifyIdentity(value, directory);
@@ -283,7 +336,8 @@ public final class WorkspaceService implements WorkspaceUseCase {
      */
     private void verifyIdentity(Workspace workspace, WorkspaceDirectory directory) {
         String derivedId = policy.workspaceId(directory.root());
-        if (!derivedId.equals(workspace.workspaceId()) || !directory.root().equals(workspace.root())) {
+        if (!derivedId.equals(workspace.workspaceId()) || !directory.root().equals(workspace.root())
+                || !Workspace.Kind.valueOf(directory.kind().name()).equals(workspace.kind())) {
             throw identityConflict();
         }
     }
@@ -330,6 +384,11 @@ public final class WorkspaceService implements WorkspaceUseCase {
     private static WorkspaceFailure identityConflict() {
         return new WorkspaceFailure(WorkspaceFailure.Code.IDENTITY_CONFLICT,
                 "workspace identity changed");
+    }
+
+    /** 持久目录缺失统一映射为不可用，避免把注册表中残留的路径当作可信能力。 */
+    private static WorkspaceFailure unavailable(String message) {
+        return new WorkspaceFailure(WorkspaceFailure.Code.DIRECTORY_UNAVAILABLE, message);
     }
 
     /**

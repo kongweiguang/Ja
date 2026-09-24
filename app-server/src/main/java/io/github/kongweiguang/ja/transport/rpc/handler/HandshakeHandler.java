@@ -26,9 +26,10 @@ import java.util.concurrent.CompletionStage;
 public final class HandshakeHandler implements RpcHandler {
     static final List<String> METHODS = List.of(
             "runtime/initialize", "runtime/health", "runtime/shutdown",
-            "workspace/open", "workspace/open-general", "workspace/list", "workspace/path/search",
+            "workspace/open", "workspace/list", "workspace/path/search",
             "workspace/set-trust", "workspace/unregister",
-            "thread/create", "thread/list", "thread/search", "thread/read", "thread/usage/read", "thread/rename", "thread/pin", "thread/seen",
+            "thread/create", "thread/list", "thread/search", "thread/read", "thread/usage/read",
+            "thread/mcp/read", "thread/rename", "thread/pin", "thread/seen",
             "thread/preferences/update", "thread/archive", "thread/restore", "thread/delete", "thread/compact",
             "interaction/read", "interaction/observe", "interaction/unobserve",
             "interaction/draft/save", "interaction/respond", "interaction/cancel",
@@ -42,7 +43,7 @@ public final class HandshakeHandler implements RpcHandler {
             "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
             "attachment/import", "attachment/discard", "attachment/preview/open",
             "attachment/preview/read", "attachment/preview/close",
-            "turn/start", "turn/resume", "turn/recovery/respond", "turn/cancel", "turn/input/enqueue", "turn/input/prioritize",
+            "turn/start", "turn/continue", "turn/reask", "turn/resume", "turn/recovery/respond", "turn/cancel", "turn/input/enqueue", "turn/input/prioritize",
             "turn/input/update", "turn/input/delete",
             "turn/change-set/read",
             "approval/respond", "configuration/read", "configuration/patch",
@@ -50,8 +51,11 @@ public final class HandshakeHandler implements RpcHandler {
             "credential/reveal-provider",
             "skill/list", "mcp/list", "mcp/test", "model/test", "model/discover",
             "mcp/list-tools", "tool/artifact/read");
+    // Capability order mirrors the client event stream; retry-started follows input-consumed in the event sequence.
     static final List<String> EVENTS = List.of(
-            "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",
+            "runtime/status-changed", "turn/state-changed",
+            "turn/input-queue-changed", "turn/input-consumed",
+            "turn/retry-started",
             "turn/messages_received",
             "assistant/model-step-committed",
             "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",

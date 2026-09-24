@@ -102,6 +102,43 @@ fn semantic_projection_requires_thread_revision() {
     );
 }
 
+/// 重试状态只公开固定尝试计数；语义 base 仍使用完整事件 fence，其他诊断或响应内容被拒绝。
+#[test]
+fn retry_started_projection_accepts_only_the_bounded_retry_shape() {
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "turn/retry-started",
+        "params": {
+            "serverInstanceId": "srv_1",
+            "eventId": "evt_retry_1",
+            "sequence": 2,
+            "occurredAt": "2026-09-23T00:00:00Z",
+            "generation": 1,
+            "workspaceId": "ws_1",
+            "threadId": "thr_1",
+            "turnId": "turn_1",
+            "threadRevision": 2,
+            "attempt": 2,
+            "maxAttempts": 6
+        }
+    });
+    assert!(sanitize_webview_value(value.clone()).is_ok());
+
+    for (field, invalid) in [
+        ("attempt", json!(1)),
+        ("attempt", json!(7)),
+        ("maxAttempts", json!(5)),
+    ] {
+        let mut malformed = value.clone();
+        malformed["params"][field] = invalid;
+        assert!(sanitize_webview_value(malformed).is_err());
+    }
+
+    let mut leaked_diagnostic = value;
+    leaked_diagnostic["params"]["error"] = json!("provider body");
+    assert!(sanitize_webview_value(leaked_diagnostic).is_err());
+}
+
 /// 队列 revision 与 Thread revision 分流：changed 不携带 threadRevision，consumed 则原子携带
 /// 用户消息、剩余队列和可选 Assistant 结算。
 #[test]

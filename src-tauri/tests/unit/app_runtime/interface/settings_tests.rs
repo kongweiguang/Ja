@@ -141,14 +141,14 @@ fn validates_mcp_projection_and_test_result() {
     assert!(validate_result(
         SettingsQueryMethod::McpList,
         json!({
-            "items": [{"mcpId": "mcp_demo", "name": "Demo", "transport": "stdio", "status": "configured", "toolCount": 0}],
+            "items": [{"mcpId": "mcp_demo", "name": "Demo", "scope": "global", "transport": "stdio", "status": "configured", "toolCount": 0}],
             "nextCursor": null
         })
     )
     .is_ok());
     assert!(validate_result(
         SettingsQueryMethod::McpTest,
-        json!({"mcpId": "mcp_demo", "name": "Demo", "transport": "stdio", "status": "available", "toolCount": 1})
+        json!({"mcpId": "mcp_demo", "name": "Demo", "scope": "global", "transport": "stdio", "status": "available", "toolCount": 1})
     )
     .is_ok());
     assert!(
@@ -170,7 +170,7 @@ fn preserves_mcp_identity_contract_boundaries() {
     ] {
         let result = validate_result(
             SettingsQueryMethod::McpTest,
-            json!({"mcpId": id, "name": "Demo", "transport": "stdio", "status": "available", "toolCount": 1}),
+            json!({"mcpId": id, "name": "Demo", "scope": "global", "transport": "stdio", "status": "available", "toolCount": 1}),
         );
         assert_eq!(result.is_ok(), expected);
     }

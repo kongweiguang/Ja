@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * conversation 的领域持久化端口；调用成功返回即代表对应事务已经提交。
@@ -47,6 +48,12 @@ public interface ConversationRepository extends AutoCloseable {
     default AdmissionReceipt admitContinuation(ContinuationAdmission admission) {
         throw new UnsupportedOperationException("Goal continuation admission is unavailable");
     }
+
+    /** 找到当前有效路径最后一个未答问题；准入事务仍须重新验证该问题和 Thread revision。 */
+    Optional<String> findLastUnansweredQuestionMessageId(String threadId, long expectedThreadRevision);
+
+    /** 以 CAS 原子切走问题所在 Turn 及其后缀，再把编辑后的 USER Turn 接入当前路径。 */
+    AdmissionReceipt admitReask(ReaskAdmission admission);
 
     /**
      * 用 Thread revision CAS 原子提交非终态及其全部事实。
@@ -638,7 +645,7 @@ public interface ConversationRepository extends AutoCloseable {
     /** continuation admission 保留普通 Thread CAS，但明确没有消息、附件和标题副作用。 */
     record ContinuationAdmission(String threadId, String turnId, long expectedThreadRevision,
                                  Instant requestedAt, TurnExecutionState initialExecution,
-                                 String hiddenContext) {
+                                 String hiddenContext, String sourceMessageId) {
         /** 内部 Turn 仍使用公开稳定身份和非负版本，并在 admission 事务内冻结结构化上下文。 */
         public ContinuationAdmission {
             threadId = identifier(threadId, "thr_", "threadId");
@@ -650,6 +657,21 @@ public interface ConversationRepository extends AutoCloseable {
                 throw new IllegalArgumentException("continuation requires an internal Turn origin");
             }
             hiddenContext = text(hiddenContext, "hiddenContext", 1_000_000, false);
+            sourceMessageId = sourceMessageId == null ? null : identifier(sourceMessageId, "item_", "sourceMessageId");
+            if ((initialExecution.common().origin() == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER_CONTINUATION)
+                    != (sourceMessageId != null)) {
+                throw new IllegalArgumentException("user continuation source does not match origin");
+            }
+        }
+
+    }
+
+    /** reask 把 source identity 与新 USER admission 绑定，避免依据客户端正文猜测要切换的历史路径。 */
+    record ReaskAdmission(TurnAdmission turn, String sourceMessageId) {
+        /** source id 由当前 Thread 快照取得，真正使用前仍在 SQLite admission 事务内校验。 */
+        public ReaskAdmission {
+            Objects.requireNonNull(turn, "turn");
+            sourceMessageId = identifier(sourceMessageId, "item_", "sourceMessageId");
         }
     }
 
@@ -892,7 +914,8 @@ public interface ConversationRepository extends AutoCloseable {
      */
     record TurnSnapshot(String threadId, String turnId, TurnState state,
                         Instant requestedAt, Instant updatedAt, Instant completedAt,
-                        long threadRevision, long turnMutationVersion) {
+                        long threadRevision, long turnMutationVersion,
+                        boolean currentPath, String sourceMessageId, String terminalMessageId) {
         /**
          * 快照同时携带外部可观察 revision 与当前 Turn CAS token，禁止混用。
          */
@@ -900,7 +923,11 @@ public interface ConversationRepository extends AutoCloseable {
             if (threadRevision < 0 || turnMutationVersion < 0) {
                 throw new IllegalArgumentException("invalid turn snapshot revision");
             }
+            sourceMessageId = sourceMessageId == null ? null : identifier(sourceMessageId, "item_", "sourceMessageId");
+            terminalMessageId = terminalMessageId == null ? null
+                    : identifier(terminalMessageId, "item_", "terminalMessageId");
         }
+
     }
 
     /**
@@ -923,6 +950,12 @@ public interface ConversationRepository extends AutoCloseable {
             Objects.requireNonNull(preferences, "preferences");
             turns = List.copyOf(turns);
             messages = List.copyOf(messages);
+        }
+
+        /** 当前模型上下文按该不可变有效路径筛选，未选历史仍保存在 turns/messages 中供审计。 */
+        public Set<String> currentPathTurnIds() {
+            return turns.stream().filter(TurnSnapshot::currentPath).map(TurnSnapshot::turnId)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
         }
     }
 

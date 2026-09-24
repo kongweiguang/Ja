@@ -328,7 +328,8 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
     private MybatisConversationRepository initialized(TestDatabase database) {
         MybatisConversationRepository store = database.agentStore();
         database.history(store).register(new Workspace.Registration(
-                "ws_agent", temp.toAbsolutePath(), "workspace", Workspace.Trust.TRUSTED, START));
+                "ws_agent", temp.toAbsolutePath(), "workspace", Workspace.Trust.TRUSTED,
+                Workspace.Kind.PROJECT, null, START));
         store.createThread(new ConversationRepository.ThreadDefinition(
                 "thr_agent", "ws_agent", "thread", preferences("provider_agent", "model_agent"), START));
         return store;

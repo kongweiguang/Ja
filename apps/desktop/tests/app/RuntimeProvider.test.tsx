@@ -33,11 +33,13 @@ const stopped: RuntimeStatus = {
   serverInstanceId: null,
   features: [],
 };
-const generalWorkspace = {
+const sessionWorkspace = {
   workspaceId: "ws_runtime_a" as const,
-  displayName: "无项目" as const,
+  kind: "session" as const,
+  legacySharedWorkspaceId: null,
+  displayName: "会话 A" as const,
   trust: "trusted" as const,
-  rootPath: "C:\\data\\ja\\general-workspace",
+  rootPath: "C:\\data\\ja\\workspaces\\thr_runtime_a",
 };
 
 interface FakeProjection {
@@ -138,7 +140,10 @@ function fakeRuntime(initialState: RuntimeStatus = stopped): {
       cachePath: null,
       lastBackup: null,
     })),
-    generalWorkspace: vi.fn(async () => generalWorkspace),
+    activateWorkspace: vi.fn(async (workspaceId: string) => ({
+      ...sessionWorkspace,
+      workspaceId,
+    })),
     turnStart: vi.fn(async (input) => {
       calls.push("turnStart");
       turnInputs.push(input);
@@ -148,6 +153,18 @@ function fakeRuntime(initialState: RuntimeStatus = stopped): {
       accepted: true as const,
       turnId: input.turnId,
       queued: true,
+      threadRevision: input.expectedThreadRevision + 1,
+    })),
+    turnContinue: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: "turn_continue_fixture",
+      queued: false,
+      threadRevision: input.expectedThreadRevision + 1,
+    })),
+    turnReask: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: "turn_reask_fixture",
+      queued: false,
       threadRevision: input.expectedThreadRevision + 1,
     })),
     // 测试 adapter 不推断执行结果，只保持 UI controller 所需的裁决 ACK 契约。

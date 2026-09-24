@@ -33,13 +33,13 @@ impl Display for PreviewId {
 /// generation 用于拒绝已完成 navigation 页面的陈旧 callback。
 pub type PreviewGeneration = u64;
 
-/// 只有 `PreviewPolicy` 校验 HTTP(S) 输入后才构造 URL。
+/// 只有 PreviewPolicy 或本地文件 resolver 校验后才构造 HTTP(S)/file/about:blank 页面 URL。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct PreviewUrl(String);
 
 impl PreviewUrl {
-    /// 构造入口保持在 policy 私有边界，调用方不能绕过校验。
+    /// HTTP(S)/file 由 policy 校验后构造，唯一直接值由 Rust 固定为 about:blank。
     pub(crate) fn from_normalized(value: String) -> Self {
         Self(value)
     }
@@ -57,14 +57,14 @@ impl Display for PreviewUrl {
 }
 
 impl<'de> Deserialize<'de> for PreviewUrl {
-    /// 反序列化复用同一 policy，使 JSON 无法绕过 scheme 检查。
+    /// UI-safe snapshot/event 还会回读本地页面和空白页；反序列化只接受这三类受限 URL。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
         super::policy::PreviewPolicy::new()
-            .and_then(|policy| policy.validate_url(&raw))
+            .and_then(|policy| policy.validate_wire_url(&raw))
             .map_err(serde::de::Error::custom)
     }
 }
@@ -92,6 +92,14 @@ pub enum PreviewLoadStatus {
 pub enum NavigationSource {
     User,
     Redirect,
+}
+
+/// 只向主 renderer 暴露被原生策略拒绝的两类浏览器动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewBlockedAction {
+    Popup,
+    Download,
 }
 
 /// Tauri 子窗口描述；window label 不具有主窗口 capability。
@@ -141,6 +149,13 @@ pub enum PreviewEventKind {
     LoadFinished {
         url: PreviewUrl,
     },
+    HistoryChanged {
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
+    ActionBlocked {
+        action: PreviewBlockedAction,
+    },
     Closed,
 }
 
@@ -171,6 +186,8 @@ pub struct PreviewSessionSnapshot {
     pub title: String,
     pub window: PreviewWindowSpec,
     pub dropped_events: u64,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
 }
 
 /// 脱敏 shutdown 计数证明哪些原生 close request 已得到 ACK。
@@ -196,10 +213,9 @@ pub struct PreviewNavigationRequest {
     pub(crate) url: PreviewUrl,
 }
 
-/// 有界 registry 预算防止远程页面填满 host 资源。
+/// 单页事件和字符串预算避免页面事件填满 host；标签数由用户按浏览器习惯管理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreviewLimits {
-    pub max_sessions: usize,
     pub max_url_bytes: usize,
     pub max_title_bytes: usize,
     pub max_error_bytes: usize,
@@ -212,7 +228,6 @@ impl Default for PreviewLimits {
     /// 这些限制覆盖普通文档页面，同时不创建无界状态。
     fn default() -> Self {
         Self {
-            max_sessions: 8,
             max_url_bytes: 8 * 1024,
             max_title_bytes: 1024,
             max_error_bytes: 4 * 1024,
@@ -226,9 +241,7 @@ impl Default for PreviewLimits {
 impl PreviewLimits {
     /// registry 开始接收页面前校验各预算关系。
     pub(crate) fn validate(self) -> Result<Self, super::error::PreviewError> {
-        let valid = self.max_sessions > 0
-            && self.max_sessions <= 64
-            && self.max_url_bytes >= 64
+        let valid = self.max_url_bytes >= 64
             && self.max_url_bytes <= 64 * 1024
             && self.max_title_bytes > 0
             && self.max_title_bytes <= 64 * 1024

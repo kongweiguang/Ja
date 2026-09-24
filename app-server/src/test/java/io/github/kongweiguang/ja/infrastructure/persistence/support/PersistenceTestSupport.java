@@ -84,7 +84,8 @@ public abstract class PersistenceTestSupport {
 
     /** busy 测试可缩短锁等待，但仍使用与生产相同的 datasource pragma。 */
     protected TestDatabase database(String name, Duration busyTimeout) throws Exception {
-        JaDatabase database = JaDatabase.open(new DatabaseConfig(temp.resolve(name + ".sqlite3"), busyTimeout));
+        JaDatabase database = JaDatabase.open(new DatabaseConfig(
+                temp.resolve(name + ".sqlite3"), busyTimeout, temp.resolve("ja-home")));
         Configuration configuration = new Configuration(new Environment("test",
                 new JdbcTransactionFactory(), database.dataSource()));
         configuration.setMapUnderscoreToCamelCase(false);

@@ -57,7 +57,7 @@ final class EmbeddedSolonPersistenceTest {
             probe.requireWalCheckpointBinding(Solon.context().getBean(JaDatabase.class));
             Instant now = Instant.parse("2026-08-25T12:00:00Z");
             workspaces.register(new Workspace.Registration("ws_embedded", data,
-                    "embedded", Workspace.Trust.TRUSTED, now));
+                    "embedded", Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, now));
             store.createThread(new ConversationRepository.ThreadDefinition("thr_embedded", "ws_embedded",
                     "embedded", preferences("provider_embedded", "model_embedded"), now));
             ConversationRepository.AdmissionReceipt admission = store.admit(new ConversationRepository.TurnAdmission(

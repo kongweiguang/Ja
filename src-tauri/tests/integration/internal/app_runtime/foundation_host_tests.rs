@@ -1023,8 +1023,6 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
             == Some("ready")
     }));
 
-    host.general_workspace()
-        .expect("Java-owned general workspace bound to native capability");
     configure_isolated_profile(&harness);
     let thread_id = harness
         .create_thread("Rust host integration", "provider_host", "model_host")

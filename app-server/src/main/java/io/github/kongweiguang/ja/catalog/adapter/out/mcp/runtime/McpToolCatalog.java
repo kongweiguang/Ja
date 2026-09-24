@@ -10,6 +10,7 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefini
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidator;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ToolSchemaException;
 import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
+import io.github.kongweiguang.ja.conversation.port.out.McpGateway.McpTool;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonValue;
 
@@ -24,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.LinkedHashMap;
 import java.util.Set;
+import java.util.Optional;
 
 /**
  * 负责确定性 MCP Tool 命名、路由编码、Schema 上限与请求级版本校验。
@@ -213,6 +215,21 @@ public final class McpToolCatalog {
                     objectMapper.writeValueAsString(McpJsonValues.toNode(objectMapper, schema)));
         } catch (ToolSchemaException | com.fasterxml.jackson.core.JsonProcessingException failure) {
             throw new IllegalStateException("mcp_tool_schema_invalid", failure);
+        }
+    }
+
+    /** Tool Runner 只校验固定外层网关；此处用被冻结远端 Schema 二次校验 argumentsJson。 */
+    static Optional<String> invalidArguments(ObjectMapper objectMapper, McpTool tool, JsonObject arguments) {
+        try {
+            String schema = objectMapper.writeValueAsString(
+                    McpJsonValues.toNode(objectMapper, tool.spec().inputSchema()));
+            String value = objectMapper.writeValueAsString(McpJsonValues.toNode(objectMapper, arguments));
+            new NetworkntToolArgumentValidator(schema).validate(value);
+            return Optional.empty();
+        } catch (ToolSchemaException invalid) {
+            return Optional.of(invalid.getMessage());
+        } catch (com.fasterxml.jackson.core.JsonProcessingException | RuntimeException failure) {
+            return Optional.of("MCP arguments could not be validated against the frozen tool schema.");
         }
     }
 

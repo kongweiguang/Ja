@@ -130,6 +130,8 @@ const TURN: TimelineTurn = {
 /** 截图 fixture 只提供展示用 typed port，禁止触发网络、Tauri 或真实 Provider。 */
 export function ReadmeBrowserFixture() {
   const [draft, setDraft] = useState("");
+  /** 静态截图 fixture 不调用原生 Explorer，避免视觉验收产生桌面副作用。 */
+  const openProjectFolderFixture = async (): Promise<void> => undefined;
   const windowFrame: WindowFrameState = { maximized: false, fullscreen: false };
   const thread: ThreadProjection = {
     threadId: THREAD_ID,
@@ -158,7 +160,7 @@ export function ReadmeBrowserFixture() {
             projects={[{ workspaceId: "workspace_demo", displayName: "网站改版" }]}
             projectCatalogLoading={false}
             currentWorkspaceId="workspace_demo"
-            generalWorkspaceSelected={false}
+            noProjectSelected={false}
             projectSectionCollapsed={false}
             historySectionCollapsed={false}
             runtimeLabel="已连接"
@@ -174,19 +176,22 @@ export function ReadmeBrowserFixture() {
             conversationSearchOpen={false}
             onNewConversation={() => undefined}
             onSelectConversation={() => undefined}
+            onOpenProjectFolder={openProjectFolderFixture}
             onOpenConversationSearch={() => undefined}
             onRenameConversation={async () => undefined}
             onPinConversation={async () => undefined}
             onArchiveConversation={async () => undefined}
             mutatingThreadIds={[]}
             onChooseProject={() => undefined}
-            onSelectGeneral={() => undefined}
+            onSelectNoProject={() => undefined}
             onSelectProject={() => undefined}
             onProjectSectionCollapsedChange={() => undefined}
             onHistorySectionCollapsedChange={() => undefined}
             onRetryProjects={() => undefined}
             onOpenSettings={() => undefined}
             onRequestClose={() => undefined}
+            onOpenWorkspaceFolder={async () => undefined}
+            onOpenLegacySharedFolder={async () => undefined}
           />
         </div>
         <div className="ja-workspace-stage">

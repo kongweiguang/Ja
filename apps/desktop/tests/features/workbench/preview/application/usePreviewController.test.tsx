@@ -11,7 +11,14 @@ afterEach(() => cleanup());
 /** 构造稳定 fake port，使 hook 重渲染不会因测试对象抖动产生额外 effect。 */
 function createPort(): PreviewPort {
   return {
+    openTarget: vi.fn(async () => undefined),
+    newPage: vi.fn(async () => undefined),
+    selectPage: vi.fn(),
+    closePage: vi.fn(async () => undefined),
     navigate: vi.fn(),
+    navigateFile: vi.fn(),
+    goBack: vi.fn(),
+    goForward: vi.fn(),
     reload: vi.fn(),
     retryRecovery: vi.fn(),
     changeViewport: vi.fn(),
@@ -28,7 +35,7 @@ describe("usePreviewController", () => {
     act(() => result.current.actions.changeDraft("javascript:alert(1)"));
     act(() => result.current.actions.submit());
 
-    expect(result.current.viewModel.validationError).toContain("只支持 http:// 或 https://");
+    expect(result.current.viewModel.validationError).toContain("本机文件路径");
     expect(port.navigate).not.toHaveBeenCalled();
     expect(port.reload).not.toHaveBeenCalled();
   });
@@ -41,6 +48,8 @@ describe("usePreviewController", () => {
         loading: false,
         recovering: false,
         active: true,
+        activePageId: "preview-page-1",
+        pages: [],
         port,
       }),
     );
@@ -57,7 +66,15 @@ describe("usePreviewController", () => {
     const port = createPort();
     const { result, rerender } = renderHook(
       ({ url }) =>
-        usePreviewController({ url, loading: false, recovering: false, active: true, port }),
+        usePreviewController({
+          url,
+          loading: false,
+          recovering: false,
+          active: true,
+          activePageId: "preview-page-1",
+          pages: [],
+          port,
+        }),
       { initialProps: { url: "https://example.com" } },
     );
     act(() => result.current.actions.changeDraft("https://draft.local"));
@@ -66,6 +83,34 @@ describe("usePreviewController", () => {
 
     expect(result.current.viewModel.draft).toBe("https://openai.com/docs");
     expect(result.current.viewModel.projection?.origin).toBe("https://openai.com");
+  });
+
+  /** 消息文件链接的打开 action 必须等待 lifecycle ack，并对非法目标返回失败 Promise。 */
+  it("rejects invalid open targets and propagates the lifecycle failure receipt", async () => {
+    const port = createPort();
+    const { result } = renderHook(() =>
+      usePreviewController({
+        url: "",
+        loading: false,
+        recovering: false,
+        active: true,
+        port,
+      }),
+    );
+
+    await expect(
+      result.current.actions.openTarget({ kind: "url", url: "javascript:alert(1)" }),
+    ).rejects.toThrow("浏览器地址无效或暂不支持此协议。");
+    expect(port.openTarget).not.toHaveBeenCalled();
+
+    vi.mocked(port.openTarget!).mockRejectedValueOnce(new Error("文件不存在或已被移动。"));
+    await expect(
+      result.current.actions.openTarget({ kind: "file", path: "C:\\dev\\ja\\缺失.html" }),
+    ).rejects.toThrow("文件不存在或已被移动。");
+    expect(port.openTarget).toHaveBeenCalledWith({
+      kind: "file",
+      path: "C:\\dev\\ja\\缺失.html",
+    });
   });
 
   it("附件投影切入和返回时保留网页 URL 草稿与导航 port", () => {
@@ -88,6 +133,8 @@ describe("usePreviewController", () => {
           loading: false,
           recovering: false,
           active: true,
+          activePageId: "preview-page-1",
+          pages: [],
           port,
           attachmentTarget: target,
           attachmentPort,

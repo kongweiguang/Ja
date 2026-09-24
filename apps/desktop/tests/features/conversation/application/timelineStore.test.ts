@@ -110,6 +110,73 @@ describe("timeline Zustand seam", () => {
     expect(useTimelineStore.getState().threadRevisionByThread["thr_store"]).toBe(1);
   });
 
+  it("重试仅投影一条轻量状态并清除旧草稿，首个新 Delta 关闭状态提示", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applyHostEvent({ kind: "timeline", event: event(1, "queued", "running") })).toBe(
+      "applied",
+    );
+    const priorDelta: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/text-delta",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_retry_old_delta",
+        sequence: 2,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        occurredAt: "2026-08-18T00:00:01Z",
+        streamSeq: 1,
+        text: "失败请求半截正文",
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: priorDelta })).toBe("applied");
+    const retryStarted: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "turn/retry-started",
+      params: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_retry_started",
+        sequence: 3,
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 2,
+        occurredAt: "2026-08-18T00:00:02Z",
+        attempt: 2,
+        maxAttempts: 6,
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: retryStarted })).toBe("applied");
+    const duringRetry = selectItemsForThread("thr_store")(useTimelineStore.getState());
+    const retryStatuses = duringRetry.filter((item) => item.metadata?.phase === "assistant_retry");
+    expect(retryStatuses).toHaveLength(1);
+    expect(retryStatuses[0]?.text).toBe("重试 2/6");
+    expect(duringRetry.some((item) => item.text === "失败请求半截正文")).toBe(false);
+
+    const newDelta: TimelineEvent = {
+      ...priorDelta,
+      params: {
+        ...priorDelta.params,
+        eventId: "evt_retry_new_delta",
+        sequence: 4,
+        threadRevision: 2,
+        occurredAt: "2026-08-18T00:00:03Z",
+        streamSeq: 2,
+        text: "新请求正文",
+      },
+    };
+    expect(store.applyHostEvent({ kind: "timeline", event: newDelta })).toBe("applied");
+    const afterFirstDelta = selectItemsForThread("thr_store")(useTimelineStore.getState());
+    expect(afterFirstDelta.some((item) => item.metadata?.phase === "assistant_retry")).toBe(false);
+    expect(afterFirstDelta.map((item) => item.text).filter(Boolean)).toEqual(["新请求正文"]);
+    expect(useTimelineStore.getState().streamSeqByTurn["turn_store"]).toBe(2);
+  });
+
   it("exposes the current root task activity snapshot without materializing task detail", () => {
     prepareStore();
     const entry = {
@@ -238,6 +305,7 @@ describe("timeline Zustand seam", () => {
   it("projects the first user message when provisional title metadata arrives before the ACK", () => {
     prepareStore();
     useTimelineStore.getState().recordThreadMetadataRevision("thr_store", 1);
+    expect(useTimelineStore.getState().threadRevisionByThread["thr_store"]).toBe(1);
 
     expect(
       useTimelineStore.getState().applyTurnAccepted({

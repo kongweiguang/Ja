@@ -3,9 +3,11 @@
 
 .ja-conversation-summary-popover {
   z-index: 90;
-  width: min(19.5rem, calc(100vw - 1.5rem));
-  max-height: min(31rem, calc(100vh - 4.75rem));
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  width: min(27rem, calc(100vw - 1.5rem));
+  max-height: min(37rem, calc(100vh - 6rem));
+  overflow: hidden;
   padding: 0.68rem;
   border: 1px solid var(--ja-border-strong);
   border-radius: var(--ja-radius-lg);
@@ -17,13 +19,19 @@
   animation: ja-conversation-summary-enter 140ms var(--ja-ease-native);
 }
 
+.ja-conversation-summary-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .ja-conversation-summary-header {
   display: flex;
   min-width: 0;
   align-items: flex-start;
   justify-content: space-between;
   gap: 0.75rem;
-  padding: 0.15rem 0.16rem 0.48rem;
+  padding: 0.28rem 0.38rem 0.62rem;
 }
 
 .ja-conversation-summary-header div {
@@ -41,19 +49,106 @@
 }
 .ja-conversation-summary-header h2 {
   margin-top: 0.12rem;
-  font-size: var(--ja-text-control-size);
+  font-size: 0.94rem;
   font-weight: var(--ja-weight-bold);
   line-height: var(--ja-line-control);
 }
-.ja-conversation-summary-header > span {
-  max-width: 7.5rem;
+.ja-conversation-summary-thread-title {
+  display: block;
+  max-width: 19rem;
   overflow: hidden;
-  padding-top: 0.14rem;
+  margin-top: 0.24rem;
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.ja-conversation-summary-status {
+  flex: 0 0 auto;
+  max-width: 7.5rem;
+  overflow: hidden;
+  padding: 0.18rem 0.48rem;
+  border: 1px solid var(--ja-border);
+  border-radius: 999px;
+  color: var(--ja-foreground-muted);
+  background: var(--ja-window-surface-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ja-conversation-summary-overview {
+  padding: 0.18rem 0.28rem 0.4rem;
+}
+.ja-conversation-summary-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(5.4rem, 1fr));
+  gap: 0.38rem;
+}
+.ja-conversation-summary-stats > div {
+  display: grid;
+  min-width: 0;
+  gap: 0.14rem;
+  padding: 0.52rem 0.58rem;
+  border: 1px solid var(--ja-border);
+  border-radius: 0.62rem;
+  background: color-mix(in srgb, var(--ja-control-hover) 34%, transparent);
+}
+.ja-conversation-summary-stats strong {
+  overflow: hidden;
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--ja-line-control);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-conversation-summary-stats span,
+.ja-conversation-summary-breakdown {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-conversation-summary-breakdown {
+  margin: 0.42rem 0.2rem 0;
+}
+
+.ja-conversation-summary-identity-list {
+  display: grid;
+  gap: 0.16rem;
+  margin: 0;
+}
+.ja-conversation-summary-identity-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 5.4rem minmax(0, 1fr) 1.75rem;
+  align-items: start;
+  gap: 0.4rem;
+  padding: 0.32rem;
+  border-radius: 0.48rem;
+}
+.ja-conversation-summary-identity-row.is-simple {
+  grid-template-columns: 5.4rem minmax(0, 1fr);
+}
+.ja-conversation-summary-identity-row:hover {
+  background: color-mix(in srgb, var(--ja-control-hover) 72%, transparent);
+}
+.ja-conversation-summary-identity-row dt {
+  padding-top: 0.24rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-caption);
+}
+.ja-conversation-summary-identity-row dd {
+  min-width: 0;
+  margin: 0;
+  padding-top: 0.24rem;
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .ja-conversation-summary-list {
@@ -123,20 +218,160 @@
 }
 
 .ja-conversation-summary-section {
-  margin-top: 0.48rem;
-  padding-top: 0.5rem;
+  margin-top: 0.34rem;
+  padding-top: 0.62rem;
   border-top: 1px solid var(--ja-border);
 }
+.ja-conversation-summary-mcp {
+  flex: 0 0 auto;
+}
 .ja-conversation-summary-section h3 {
-  margin: 0 0 0.2rem;
+  margin: 0 0 0.28rem;
   padding: 0 0.32rem;
   color: var(--ja-foreground-tertiary);
   font-size: var(--ja-text-caption-size);
   font-weight: var(--ja-weight-semibold);
   line-height: var(--ja-line-caption);
 }
+.ja-conversation-summary-section-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.28rem;
+}
+.ja-conversation-summary-section-heading h3 {
+  margin: 0;
+}
+.ja-conversation-summary-mcp-list {
+  display: grid;
+  max-height: min(15rem, 38vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ja-conversation-summary-mcp-server {
+  display: grid;
+  min-width: 0;
+  min-height: 2.45rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.32rem 0.38rem;
+  border-top: 1px solid color-mix(in srgb, var(--ja-border) 58%, transparent);
+  border-radius: 0.35rem;
+}
+.ja-conversation-summary-mcp-server:hover {
+  background: color-mix(in srgb, var(--ja-control-hover) 48%, transparent);
+}
+.ja-conversation-summary-mcp-copy {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 0.42rem;
+}
+.ja-conversation-summary-mcp-copy strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ja-foreground);
+  font-size: 0.82rem;
+  font-weight: var(--ja-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ja-conversation-summary-mcp-copy small {
+  flex: 0 0 auto;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  white-space: nowrap;
+}
+.ja-conversation-summary-mcp-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  white-space: nowrap;
+}
+.ja-conversation-summary-mcp-state-dot {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+.ja-conversation-summary-mcp-server.is-available .ja-conversation-summary-mcp-state {
+  color: var(--ja-success);
+}
+.ja-conversation-summary-mcp-server.is-unavailable .ja-conversation-summary-mcp-state {
+  color: var(--ja-danger);
+}
+.ja-conversation-summary-mcp-message,
+.ja-conversation-summary-mcp-error p,
+.ja-conversation-summary-mcp-notice {
+  margin: 0;
+  padding: 0.42rem 0.38rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: 1.45;
+}
+.ja-conversation-summary-mcp-notice {
+  margin-bottom: 0.3rem;
+  border-radius: 0.42rem;
+  background: color-mix(in srgb, var(--ja-warning) 8%, transparent);
+}
+.ja-conversation-summary-mcp-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+}
+.ja-conversation-summary-mcp-error p {
+  color: var(--ja-danger);
+}
+.ja-conversation-summary-mcp-error button svg {
+  width: 0.86rem;
+  height: 0.86rem;
+}
+.ja-conversation-summary-mcp-manage {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.2rem 0.3rem;
+  border: 0;
+  border-radius: 0.35rem;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  cursor: pointer;
+}
+.ja-conversation-summary-mcp-manage:hover {
+  color: var(--ja-foreground);
+  background: color-mix(in srgb, var(--ja-control-hover) 72%, transparent);
+}
+.ja-conversation-summary-mcp-manage:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+.ja-conversation-summary-mcp-manage svg {
+  width: 0.72rem;
+  height: 0.72rem;
+}
 .ja-conversation-summary-arrow {
   fill: var(--ja-window-surface-muted);
+}
+
+@media (max-width: 27rem) {
+  .ja-conversation-summary-popover {
+    width: calc(100vw - 1.25rem);
+  }
+  .ja-conversation-summary-mcp-server {
+    gap: 0.32rem;
+  }
 }
 
 @keyframes ja-conversation-summary-enter {

@@ -66,7 +66,6 @@ function renderModels(
     onSaveMcp: vi.fn(async () => undefined),
     onDeleteMcp: vi.fn(async () => undefined),
     onTestMcp: vi.fn(async () => "connected" as const),
-    onCloseMcp: vi.fn(async () => undefined),
     onToggleSkill: vi.fn(async () => undefined),
     onAccessModeChange: vi.fn(async () => undefined),
     onClarificationEnabledChange: vi.fn(async () => undefined),

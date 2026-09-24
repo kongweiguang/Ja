@@ -126,25 +126,66 @@ fn turn_input_identity_validation_is_method_specific() {
     );
 }
 
+/// client admission 独立锁定新增 wire envelope，避免 Rust 调用绕过 Tauri DTO 将受管请求通道变成任意 payload tunnel。
+#[test]
+fn continue_and_reask_identity_validation_is_method_specific() {
+    assert!(
+        validate_turn_identity(
+            "turn/continue",
+            &json!({"threadId":"thr_demo","expectedThreadRevision":7}),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/continue",
+            &json!({"threadId":"thr_demo","expectedThreadRevision":7,"content":[]}),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/reask",
+            &json!({
+                "threadId":"thr_demo",
+                "expectedThreadRevision":7,
+                "sourceMessageId":"item_user_demo",
+                "content":[{"type":"text","text":"replacement"}]
+            }),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/reask",
+            &json!({
+                "threadId":"thr_demo",
+                "expectedThreadRevision":7,
+                "sourceMessageId":"turn_wrong_domain",
+                "content":[{"type":"text","text":"replacement"}]
+            }),
+        )
+        .is_err()
+    );
+}
+
 /// turn/cancel 只接受不可变 Turn identity；Thread revision 属于结果投影，不能阻断停止请求。
 #[test]
 fn turn_cancel_identity_is_revision_free() {
     let max_turn_id = format!("turn_{}", "a".repeat(96));
     let oversized_turn_id = format!("turn_{}", "a".repeat(97));
-    assert!(
-        validate_turn_identity("turn/cancel", &json!({"turnId": "turn_demo"})).is_ok()
-    );
+    assert!(validate_turn_identity("turn/cancel", &json!({"turnId": "turn_demo"})).is_ok());
     assert_eq!(max_turn_id.len(), 101);
     assert!(validate_turn_identity("turn/cancel", &json!({"turnId": max_turn_id})).is_ok());
     assert_eq!(oversized_turn_id.len(), 102);
+    assert!(validate_turn_identity("turn/cancel", &json!({"turnId": oversized_turn_id})).is_err());
     assert!(
-        validate_turn_identity("turn/cancel", &json!({"turnId": oversized_turn_id})).is_err()
+        validate_turn_identity(
+            "turn/cancel",
+            &json!({"turnId": "turn_demo", "expectedThreadRevision": 7}),
+        )
+        .is_err()
     );
-    assert!(validate_turn_identity(
-        "turn/cancel",
-        &json!({"turnId": "turn_demo", "expectedThreadRevision": 7}),
-    )
-    .is_err());
 }
 
 /// stopping gate 中毒后 client 准入必须返回稳定 Faulted 并终结 lifecycle，不能从
@@ -155,7 +196,7 @@ fn poisoned_stopping_gate_faults_supervisor() {
     poison_mutex(&supervisor.stopping);
 
     assert!(matches!(
-        supervisor.request("workspace/open-general", json!({}), Duration::from_secs(1)),
+        supervisor.request("runtime/health", json!({}), Duration::from_secs(1)),
         Err(AppServerProcessError::Faulted)
     ));
     assert_eq!(supervisor.lifecycle.state(), LifecycleState::Faulted);
@@ -507,7 +548,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         Write-Lf $ready
         continue
     }
-    if ($line -match '"method":"workspace/open-general"') {
+    if ($line -match '"method":"runtime/health"') {
         if ($line -match '"id":"(?<id>c:[^"]+)"') {
             Write-Lf ('{"jsonrpc":"2.0","id":"' + $Matches['id'] + '","result":{"ok":true}}')
         }
@@ -551,12 +592,12 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     assert_eq!(supervisor.state(), LifecycleState::Ready);
     assert!(
         supervisor
-            .request("workspace/open-general", json!({}), Duration::from_secs(2))
+            .request("runtime/health", json!({}), Duration::from_secs(2))
             .is_ok()
     );
     assert!(
         supervisor
-            .request("workspace/open-general", json!({}), Duration::from_secs(2))
+            .request("runtime/health", json!({}), Duration::from_secs(2))
             .is_ok()
     );
 
@@ -565,7 +606,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     assert!(process_exists(grandchild_pid, &system_root));
     assert!(
         supervisor
-            .request("workspace/open-general", json!({}), Duration::from_secs(2))
+            .request("runtime/health", json!({}), Duration::from_secs(2))
             .is_ok()
     );
     let mut events = supervisor.take_event_pump().unwrap();
@@ -594,7 +635,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         .shutdown_until(Instant::now() + Duration::from_secs(1))
         .unwrap();
     assert_eq!(
-        supervisor.request("workspace/open-general", json!({}), Duration::from_secs(1)),
+        supervisor.request("runtime/health", json!({}), Duration::from_secs(1)),
         Err(app_server_process::AppServerProcessError::ShuttingDown)
     );
 }
@@ -637,7 +678,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         Write-Lf $ready
         continue
     }
-    if ($line -match '"method":"workspace/open-general"') {
+    if ($line -match '"method":"runtime/health"') {
         $stdout = [Console]::OpenStandardOutput()
         $stdout.SafeFileHandle.Close()
         $stdout.Dispose()
@@ -684,7 +725,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 
     // 不消费 supervisor event；即使 UI idle，EOF 本身也必须调用 terminal callback 并
     // 关闭完整 Job。
-    let result = supervisor.request("workspace/open-general", json!({}), Duration::from_secs(2));
+    let result = supervisor.request("runtime/health", json!({}), Duration::from_secs(2));
     assert_eq!(
         result,
         Err(app_server_process::AppServerProcessError::SessionClosed)

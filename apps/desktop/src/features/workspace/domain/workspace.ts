@@ -1,54 +1,50 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-interface HistoryWorkspaceInput {
+export type WorkspaceKind = "project" | "session" | "legacy_shared";
+
+interface WorkspaceProjectionInput {
   workspaceId: string;
+  kind: WorkspaceKind;
+  legacySharedWorkspaceId: string | null;
   root: string;
   displayName: string;
   trust: "trusted" | "untrusted";
 }
 
-interface GeneralWorkspaceInput {
-  workspaceId: string;
-  rootPath: string;
-  displayName: string;
-  trust: "trusted" | "untrusted";
-}
-
 /**
- * 表示 React 侧可见的 workspace 投影；这里只保留服务端身份和展示所需字段，
- * 避免把 Rust capability 或 Java 配置事实复制进前端领域对象。
+ * 表示 React 侧可见的 Java/Rust 权威 workspace 投影；目录和关联身份只能来自服务端，
+ * renderer 不会根据 thread id 或路径名推导工作目录。
  */
 export interface WorkspaceProjection {
-  kind: "general" | "project";
+  kind: WorkspaceKind;
   workspaceId: string;
+  legacySharedWorkspaceId: string | null;
   rootPath: string;
   displayName: string;
   trust: "trusted" | "untrusted";
 }
 
-/**
- * 将 Java 历史目录投影为 workspace 值对象；转换位于 domain，是因为它不执行 IO，
- * 并统一保证 workspaceId 始终来自服务端而不是由 React 推导。
- */
-export function workspaceFromHistory(workspace: HistoryWorkspaceInput): WorkspaceProjection {
+/** 将持久 workspace projection 映射到值对象，同时完整保留服务端发出的 kind 与关联字段。 */
+export function workspaceFromHistory(workspace: WorkspaceProjectionInput): WorkspaceProjection {
   return {
-    kind: "project",
+    kind: workspace.kind,
     workspaceId: workspace.workspaceId,
+    legacySharedWorkspaceId: workspace.legacySharedWorkspaceId,
     rootPath: workspace.root,
     displayName: workspace.displayName,
     trust: workspace.trust,
   };
 }
 
-/**
- * 将原生 general workspace 映射到同一投影；保留单独入口是为了让调用方显式区分
- * 固定范围与持久项目，禁止通过路径或名称猜测 general 身份。
- */
-export function workspaceFromGeneral(workspace: GeneralWorkspaceInput): WorkspaceProjection {
+/** 将 Rust activation 的 canonical root 转成 WorkspaceProjection，不复制或合成目录身份。 */
+export function workspaceFromActivation(
+  workspace: Omit<WorkspaceProjectionInput, "root"> & { rootPath: string },
+): WorkspaceProjection {
   return {
-    kind: "general",
+    kind: workspace.kind,
     workspaceId: workspace.workspaceId,
+    legacySharedWorkspaceId: workspace.legacySharedWorkspaceId,
     rootPath: workspace.rootPath,
     displayName: workspace.displayName,
     trust: workspace.trust,

@@ -38,12 +38,11 @@ public final class WorkspaceHandler implements RpcHandler {
     }
 
     /**
-     * 返回冻结的五个工作区方法，不暴露旧 activation alias。
+     * 返回冻结的四个工作区方法，不暴露旧 activation alias。
      */
     @Override
     public Set<RpcMethod> methods() {
-        return Set.of(RpcMethod.WORKSPACE_OPEN, RpcMethod.WORKSPACE_OPEN_GENERAL,
-                RpcMethod.WORKSPACE_LIST, RpcMethod.WORKSPACE_SET_TRUST,
+        return Set.of(RpcMethod.WORKSPACE_OPEN, RpcMethod.WORKSPACE_LIST, RpcMethod.WORKSPACE_SET_TRUST,
                 RpcMethod.WORKSPACE_UNREGISTER);
     }
 
@@ -56,7 +55,6 @@ public final class WorkspaceHandler implements RpcHandler {
         try {
             return CompletableFuture.completedFuture(switch (command.method()) {
                 case WORKSPACE_OPEN -> open(command.params());
-                case WORKSPACE_OPEN_GENERAL -> general(command.params());
                 case WORKSPACE_LIST -> list(command.params());
                 case WORKSPACE_SET_TRUST -> trust(command.params());
                 case WORKSPACE_UNREGISTER -> unregister(command.params());
@@ -68,19 +66,16 @@ public final class WorkspaceHandler implements RpcHandler {
     }
 
     /**
-     * 通用工作区不接受客户端路径或身份，Java 用例直接返回唯一权威投影。
-     */
-    private ObjectNode general(ObjectNode params) {
-        RpcParams.requireExact(params);
-        return RpcResults.workspace(session.mapper(),
-                session.workspaces().openGeneralWorkspace());
-    }
-
-    /**
-     * 只解析严格 Wire 字段，目录真实性、stable ID、容量与预热均由应用用例负责。
+     * 目录身份来自互斥的受控 ID 重开或显式项目路径；浏览器不能把 SESSION/旧共享路径冒充项目。
      */
     private ObjectNode open(ObjectNode params) {
-        RpcParams.requireOnly(params, "cwd", "displayName");
+        RpcParams.requireOnly(params, "workspaceId", "cwd", "displayName");
+        if (params.has("workspaceId")) {
+            if (params.has("cwd") || params.has("displayName")) throw JaRpcException.invalidParams();
+            return RpcResults.workspace(session.mapper(), session.workspaces().openRegisteredWorkspace(
+                    RpcParams.identifier(params, "workspaceId", "ws_", 100)));
+        }
+        if (!params.has("cwd")) throw JaRpcException.invalidParams();
         Path root = path(RpcParams.text(params, "cwd", 4_096, false));
         String displayName = RpcParams.optionalText(params, "displayName", 1_024);
         Workspace value = session.workspaces().openWorkspace(
@@ -89,12 +84,13 @@ public final class WorkspaceHandler implements RpcHandler {
     }
 
     /**
-     * 返回统一 items/nextCursor 页面，不保留 workspace 专用列表字段。
+     * kind 在 keyset 分页前交给 SQLite 过滤，避免大量会话目录挤掉项目列表首屏。
      */
     private ObjectNode list(ObjectNode params) {
-        RpcParams.requireOnly(params, "cursor", "limit");
+        RpcParams.requireOnly(params, "cursor", "limit", "kind");
+        Workspace.Kind kind = kind(RpcParams.optionalText(params, "kind", 32));
         CursorPage<Workspace> page = session.workspaces()
-                .listWorkspaces(RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params));
+                .listWorkspaces(RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params), kind);
         ObjectNode result = session.mapper().createObjectNode();
         ArrayNode values = result.putArray("items");
         page.items().forEach(value -> values.add(RpcResults.workspace(session.mapper(), value)));
@@ -135,6 +131,17 @@ public final class WorkspaceHandler implements RpcHandler {
         };
     }
 
+    /** 只允许持久 Workspace 类型闭集，避免未知筛选值被解释为未过滤全量查询。 */
+    private static Workspace.Kind kind(String value) {
+        if (value == null) return null;
+        return switch (value) {
+            case "project" -> Workspace.Kind.PROJECT;
+            case "session" -> Workspace.Kind.SESSION;
+            case "legacy_shared" -> Workspace.Kind.LEGACY_SHARED;
+            default -> throw JaRpcException.invalidParams();
+        };
+    }
+
     /**
      * 将有界 cwd 转为 Path；平台语法错误仍属于严格参数错误而不是服务端故障。
      */
@@ -153,7 +160,6 @@ public final class WorkspaceHandler implements RpcHandler {
         JaErrorCatalog error = switch (failure.code()) {
             case DIRECTORY_UNAVAILABLE, WORKSPACE_NOT_OPEN -> JaErrorCatalog.WORKSPACE_NOT_FOUND;
             case DIRECTORY_CONFINEMENT, IDENTITY_CONFLICT -> JaErrorCatalog.WORKSPACE_CONFINEMENT;
-            case GENERAL_WORKSPACE_UNAVAILABLE -> JaErrorCatalog.STORAGE_UNAVAILABLE;
             case CAPACITY_EXHAUSTED -> JaErrorCatalog.QUEUE_FULL;
             case TRUST_CONFLICT -> JaErrorCatalog.WORKSPACE_TRUST_REQUIRED;
         };

@@ -7,19 +7,21 @@ use super::{
     ConfigurationRequest, ConfigurationResponse, HistoryRequest, HistoryResponse,
     RuntimeBridgePort, RuntimeCommandError, RuntimePlatformPort, SettingsRequest, SettingsResponse,
 };
+use crate::app_runtime::domain::valid_protocol_id;
 use crate::app_runtime::domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
-    GeneralWorkspace, GoalRequest, GoalResponse, ManualRecoveryConfirmation,
-    RuntimeConfigurationStatus, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind,
-    RuntimeStorageInfo, TaskCloseInput, TaskCloseResult, TaskCreateInput, TaskCreateResult,
-    TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput,
-    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
-    TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
-    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
-    ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
-    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
-    WorkspaceDto, WorkspaceOpenInput, WorkspacePathSearchInput, WorkspacePathSearchResult,
+    GoalRequest, GoalResponse, ManualRecoveryConfirmation, RuntimeConfigurationStatus,
+    RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo, TaskCloseInput,
+    TaskCloseResult, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
+    TaskListInput, TaskListResult, TaskMessageInput, TaskMessageResult, TaskMutationInput,
+    TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
+    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput,
+    ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted,
+    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
+    TurnContinueInput, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult,
+    TurnInputUpdate, TurnReaskInput, TurnResumeInput, TurnStartInput, WorkspaceActivation,
+    WorkspaceDto, WorkspaceKind, WorkspaceOpenInput, WorkspacePathSearchInput,
+    WorkspacePathSearchResult,
 };
 use crate::workspace::{WorkspaceHandle, WorkspaceRegistry};
 use ja_runtime::app_server_process::{
@@ -28,30 +30,49 @@ use ja_runtime::app_server_process::{
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
+use std::{collections::HashMap, path::Path};
 
 /// 持有受信任启动配置，并只在恢复门禁清除后惰性创建唯一 bridge；因此 setup 可先呈现恢复 UI，而不会在未知旧进程上启动新 sidecar。
 #[derive(Clone)]
 pub struct RuntimeHost {
     platform: Arc<dyn RuntimePlatformPort>,
     pub(crate) bridge: Arc<Mutex<Option<Arc<dyn RuntimeBridgePort>>>>,
-    pub(crate) workspace: Arc<Mutex<Option<ConfiguredWorkspace>>>,
+    pub(crate) workspace: Arc<Mutex<WorkspaceBindings>>,
 }
 
 /// 将协议 workspace id 绑定到 Runtime host 准入的规范 handle；内部 registry UUID 永远不跨越该边界。
 #[derive(Clone)]
 pub(crate) struct ConfiguredWorkspace {
-    workspace_id: Option<String>,
+    workspace_id: String,
     projection_root: Option<String>,
     display_name: String,
     trust: String,
     revision: Option<u64>,
+    kind: WorkspaceKind,
+    legacy_shared_workspace_id: Option<String>,
+    handle: WorkspaceHandle,
+}
+
+/// The pending slot exists only for a project selected before Java starts; every Java-issued
+/// workspace thereafter lives by identity so quick thread switches cannot discard live handles.
+#[derive(Default)]
+pub(crate) struct WorkspaceBindings {
+    pub(crate) pending_project: Option<PendingProjectWorkspace>,
+    pub(crate) active_workspace_id: Option<String>,
+    pub(crate) by_id: HashMap<String, ConfiguredWorkspace>,
+    runtime_generation: Option<u64>,
+}
+
+/// Preserve a native project root until the lazy Java owner can assign its durable workspace id.
+pub(crate) struct PendingProjectWorkspace {
+    display_name: String,
+    trust: String,
     handle: WorkspaceHandle,
 }
 
 /// 描述强类型 workspace command 无法准入的稳定原因，既不暴露 root 路径，也不允许调用方选择任意 handle。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceLookup {
-    Unconfigured,
     Unknown,
 }
 
@@ -61,7 +82,7 @@ impl RuntimeHost {
         Self {
             platform,
             bridge: Arc::new(Mutex::new(None)),
-            workspace: Arc::new(Mutex::new(None)),
+            workspace: Arc::new(Mutex::new(WorkspaceBindings::default())),
         }
     }
 
@@ -76,9 +97,7 @@ impl RuntimeHost {
     }
 
     /// Workspace binding 同时承载 identity、trust 与 capability handle；中毒后任一字段都不再可作为授权事实。
-    fn workspace_guard(
-        &self,
-    ) -> Result<MutexGuard<'_, Option<ConfiguredWorkspace>>, RuntimeCommandError> {
+    fn workspace_guard(&self) -> Result<MutexGuard<'_, WorkspaceBindings>, RuntimeCommandError> {
         self.workspace
             .lock()
             .map_err(|_| RuntimeCommandError::unavailable())
@@ -118,6 +137,7 @@ impl RuntimeHost {
             self.clear_workspace()?;
             return Err(RuntimeCommandError::unavailable());
         }
+        self.synchronize_workspace_generation(status.generation)?;
         let result = self
             .open_configured_workspace_if_present(&bridge)
             .and_then(|_| bridge.health());
@@ -152,7 +172,24 @@ impl RuntimeHost {
     pub fn state(&self) -> Result<RuntimeStatus, RuntimeCommandError> {
         let bridge = self.bridge_guard()?.clone();
         match bridge {
-            Some(bridge) => bridge.state(),
+            Some(bridge) => {
+                let status = match bridge.state() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        self.clear_registered_workspaces()?;
+                        return Err(error);
+                    }
+                };
+                if matches!(
+                    status.status,
+                    RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
+                ) {
+                    self.synchronize_workspace_generation(status.generation)?;
+                } else {
+                    self.clear_registered_workspaces()?;
+                }
+                Ok(status)
+            }
             None if self.platform.recovery_state().required => Ok(RuntimeStatus {
                 status: RuntimeStatusKind::RecoveryRequired,
                 generation: 0,
@@ -171,45 +208,23 @@ impl RuntimeHost {
         self.platform.storage_info()
     }
 
-    /// 仅从已 Ready generation 读取 Java-owned general workspace，再把 server identity 绑定到原生 capability handle；禁止创建本地 fallback 目录或 ID。
-    pub fn general_workspace(&self) -> Result<GeneralWorkspace, RuntimeCommandError> {
-        self.clear_workspace()?;
-        let bridge = self.ready_bridge()?;
-        let projection = bridge.general_workspace()?;
-        let registry = WorkspaceRegistry::default();
-        let workspace_info = registry
-            .register(std::path::Path::new(&projection.root))
-            .map_err(|_| RuntimeCommandError::unavailable())?;
-        let workspace_handle = registry
-            .get(workspace_info.id)
-            .map_err(|_| RuntimeCommandError::unavailable())?;
-        let root_path = workspace_handle
-            .root_path()
-            .to_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(RuntimeCommandError::unavailable)?
-            .to_owned();
-        let public = GeneralWorkspace {
-            workspace_id: projection.workspace_id.clone(),
-            display_name: projection.display_name.clone(),
-            trust: projection.trust.clone(),
-            root_path,
-        };
-        *self.workspace_guard()? = Some(ConfiguredWorkspace {
-            workspace_id: Some(projection.workspace_id),
-            projection_root: Some(projection.root),
-            display_name: projection.display_name,
-            trust: projection.trust,
-            revision: Some(projection.revision),
-            handle: workspace_handle,
-        });
-        Ok(public)
-    }
-
     /// 仅通过已通过恢复与受信任配置检查的 bridge 路由强类型 Turn；修改归属完全由 Java tracker
     /// 持有，启动路径不得触发 Git、tree、watcher 或 snapshot。
     pub fn turn_start(&self, input: TurnStartInput) -> Result<TurnAccepted, RuntimeCommandError> {
         self.ensure_bridge()?.turn_start(input)
+    }
+
+    /// 通过当前 Java owner 准入隐藏 continuation；协议要求保留原问题，因此 Host 不生成可见 follow-up 消息。
+    pub fn turn_continue(
+        &self,
+        input: TurnContinueInput,
+    ) -> Result<TurnAccepted, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_continue(input)
+    }
+
+    /// 通过 Java 源消息 CAS 原子切换当前路径并准入；native Host 不重建历史，也不在本地回滚持久记录。
+    pub fn turn_reask(&self, input: TurnReaskInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_reask(input)
     }
 
     /// 通过当前 bridge 路由取消而不替换或停止 sidecar；完成事实仍只能从事件通道到达。
@@ -422,13 +437,10 @@ impl RuntimeHost {
     /// 只比较 App Server 分配的 opaque workspace identity；调用方不能通过 reader 选择路径。
     fn authorize_workspace_identity(&self, workspace_id: &str) -> Result<(), RuntimeCommandError> {
         self.with_configured_workspace(workspace_id, |_| ())
-            .map_err(|lookup| match lookup {
-                WorkspaceLookup::Unconfigured => RuntimeCommandError::unavailable(),
-                WorkspaceLookup::Unknown => RuntimeCommandError::invalid_params(),
-            })
+            .map_err(|_| RuntimeCommandError::invalid_params())
     }
 
-    /// 仅通过已配置且 Ready 的 generation 路由白名单 history request，防止查询启动或重配置 sidecar。
+    /// 仅通过已配置且 Ready/Busy 的 generation 路由白名单 history request，防止查询启动或重配置 sidecar。
     pub(crate) fn history_request(
         &self,
         request: HistoryRequest,
@@ -439,14 +451,25 @@ impl RuntimeHost {
             message: "runtime is not ready",
             retryable: true,
         })?;
-        let status = bridge.state()?;
-        if status.status != RuntimeStatusKind::Ready {
+        let status = match bridge.state() {
+            Ok(status) => status,
+            Err(error) => {
+                self.clear_registered_workspaces()?;
+                return Err(error);
+            }
+        };
+        if !matches!(
+            status.status,
+            RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
+        ) {
+            self.clear_registered_workspaces()?;
             return Err(RuntimeCommandError {
                 code: "RUNTIME_NOT_READY",
                 message: "runtime is not ready",
                 retryable: true,
             });
         }
+        self.synchronize_workspace_generation(status.generation)?;
         bridge.history(request)
     }
 
@@ -463,20 +486,32 @@ impl RuntimeHost {
         bridge.goal(request)
     }
 
-    /// general-workspace 读取跨越 stdio 前要求 sidecar 完成当前握手；该命令绝不隐式启动 Java，也不回退到 Rust-owned 存储。
+    /// 已登记 workspace 的读取只允许 Ready/Busy generation；当前 Thread 切换不隐式启动 Java，也不回退到 Rust-owned 存储。
     fn ready_bridge(&self) -> Result<Arc<dyn RuntimeBridgePort>, RuntimeCommandError> {
         let bridge = self.bridge_guard()?.clone().ok_or(RuntimeCommandError {
             code: "RUNTIME_NOT_READY",
             message: "runtime is not ready",
             retryable: true,
         })?;
-        if bridge.state()?.status != RuntimeStatusKind::Ready {
+        let status = match bridge.state() {
+            Ok(status) => status,
+            Err(error) => {
+                self.clear_registered_workspaces()?;
+                return Err(error);
+            }
+        };
+        if !matches!(
+            status.status,
+            RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
+        ) {
+            self.clear_registered_workspaces()?;
             return Err(RuntimeCommandError {
                 code: "RUNTIME_NOT_READY",
                 message: "runtime is not ready",
                 retryable: true,
             });
         }
+        self.synchronize_workspace_generation(status.generation)?;
         Ok(bridge)
     }
 
@@ -490,13 +525,18 @@ impl RuntimeHost {
                 return Err(error);
             }
         };
-        if bridge.state().is_ok_and(|status| {
-            matches!(
-                status.status,
-                RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
-            )
-        }) {
-            return Ok(bridge);
+        match bridge.state() {
+            Ok(status)
+                if matches!(
+                    status.status,
+                    RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
+                ) =>
+            {
+                self.synchronize_workspace_generation(status.generation)?;
+                return Ok(bridge);
+            }
+            Ok(_) => self.clear_registered_workspaces()?,
+            Err(_) => self.clear_registered_workspaces()?,
         }
         self.start()?;
         Ok(bridge)
@@ -562,37 +602,75 @@ impl RuntimeHost {
             source.display_name.clone()
         };
         let existing = self.bridge_guard()?.clone();
-        let mut workspace_id = None;
-        let mut projection_root = None;
-        let mut workspace_revision = None;
+        let mut projection = None;
         let mut effective_trust = source.trust.clone();
-        if let Some(bridge) = existing
-            && bridge.state()?.status == RuntimeStatusKind::Ready
-        {
-            let projection = bridge.workspace_open(
-                workspace_handle.root_path().to_path_buf(),
-                display_name.clone(),
-                source.trust.clone(),
-            )?;
-            bridge.health()?;
-            workspace_id = Some(projection.workspace_id);
-            projection_root = Some(projection.root);
-            display_name = projection.display_name;
-            effective_trust = projection.trust;
-            workspace_revision = Some(projection.revision);
+        if let Some(bridge) = existing {
+            let status = match bridge.state() {
+                Ok(status) => status,
+                Err(error) => {
+                    self.clear_registered_workspaces()?;
+                    return Err(error);
+                }
+            };
+            if matches!(
+                status.status,
+                RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
+            ) {
+                self.synchronize_workspace_generation(status.generation)?;
+                let opened_projection = bridge.workspace_open(
+                    workspace_handle.root_path().to_path_buf(),
+                    display_name.clone(),
+                    source.trust.clone(),
+                )?;
+                bridge.health()?;
+                // 用 Workspace registry 的物理 identity 比较 Java 根，避免 Windows 路径前缀、大小写与短名差异拒绝合法绑定。
+                let opened_info = registry
+                    .register(Path::new(&opened_projection.root))
+                    .map_err(|_| RuntimeCommandError::configuration())?;
+                let opened_handle = registry
+                    .get(opened_info.id)
+                    .map_err(|_| RuntimeCommandError::configuration())?;
+                if !workspace_handle.same_physical_root(&opened_handle) {
+                    return Err(RuntimeCommandError::configuration());
+                }
+                display_name = opened_projection.display_name.clone();
+                effective_trust = opened_projection.trust.clone();
+                // Keep the complete Java projection until the canonical handle is inserted by ID.
+                projection = Some(opened_projection);
+            } else {
+                self.clear_registered_workspaces()?;
+            }
         }
-        let result_workspace_id = workspace_id.clone();
+        let result_workspace_id = projection
+            .as_ref()
+            .map(|projection| projection.workspace_id.clone());
         let result_cwd = workspace_handle.root_path().to_string_lossy().into_owned();
         let result_display_name = display_name.clone();
         let result_trust = effective_trust.clone();
-        *self.workspace_guard()? = Some(ConfiguredWorkspace {
-            workspace_id,
-            projection_root,
-            display_name,
-            trust: effective_trust,
-            revision: workspace_revision,
-            handle: workspace_handle,
-        });
+        let mut bindings = self.workspace_guard()?;
+        if let Some(projection) = projection {
+            let binding = ConfiguredWorkspace {
+                workspace_id: projection.workspace_id.clone(),
+                projection_root: Some(projection.root),
+                display_name,
+                trust: effective_trust,
+                revision: Some(projection.revision),
+                kind: WorkspaceKind::Project,
+                legacy_shared_workspace_id: projection.legacy_shared_workspace_id,
+                handle: workspace_handle,
+            };
+            bindings.active_workspace_id = Some(binding.workspace_id.clone());
+            bindings.pending_project = None;
+            bindings.by_id.insert(binding.workspace_id.clone(), binding);
+        } else {
+            // Keep pre-start configuration separate from Java-issued identities; activation remains unavailable until `workspace/open` succeeds.
+            bindings.active_workspace_id = None;
+            bindings.pending_project = Some(PendingProjectWorkspace {
+                display_name,
+                trust: effective_trust,
+                handle: workspace_handle,
+            });
+        }
         Ok(RuntimeConfigurationStatus {
             accepted: true,
             workspace_id: result_workspace_id,
@@ -607,16 +685,17 @@ impl RuntimeHost {
         &self,
         input: WorkspaceOpenInput,
     ) -> Result<WorkspaceDto, RuntimeCommandError> {
-        self.open_workspace(input)?;
+        let result = self.open_workspace(input)?;
+        let workspace_id = result
+            .workspace_id
+            .ok_or_else(RuntimeCommandError::unavailable)?;
         let workspace = self.workspace_guard()?;
         let binding = workspace
-            .as_ref()
+            .by_id
+            .get(&workspace_id)
             .ok_or_else(RuntimeCommandError::unavailable)?;
         Ok(WorkspaceDto {
-            workspace_id: binding
-                .workspace_id
-                .clone()
-                .ok_or_else(RuntimeCommandError::unavailable)?,
+            workspace_id: binding.workspace_id.clone(),
             root: binding
                 .projection_root
                 .clone()
@@ -626,6 +705,8 @@ impl RuntimeHost {
             revision: binding
                 .revision
                 .ok_or_else(RuntimeCommandError::unavailable)?,
+            kind: binding.kind,
+            legacy_shared_workspace_id: binding.legacy_shared_workspace_id.clone(),
         })
     }
 
@@ -642,6 +723,105 @@ impl RuntimeHost {
         self.open_workspace_projection(input)
     }
 
+    /// 只更新当前 Thread 的 active workspace；保留其它已登记 handle，确保快速切换不会丢掉对应 Files/终端资源。
+    pub fn activate_workspace(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorkspaceActivation, RuntimeCommandError> {
+        if !valid_protocol_id(&workspace_id, "ws_", 99) {
+            return Err(RuntimeCommandError::invalid_params());
+        }
+        self.ready_bridge()?;
+        let cached = self.workspace_guard()?.by_id.get(&workspace_id).cloned();
+        let projection = match cached {
+            Some(binding) if binding.kind == WorkspaceKind::Project => {
+                // Project roots are opened through the path-selection lane; Java ID-only reopen intentionally covers sessions only.
+                return self.activate_cached_workspace(binding);
+            }
+            _ => self
+                .ready_bridge()?
+                .workspace_open_by_id(workspace_id.clone())?,
+        };
+        if projection.workspace_id != workspace_id
+            || !matches!(
+                projection.kind,
+                WorkspaceKind::Session | WorkspaceKind::LegacyShared
+            )
+        {
+            return Err(RuntimeCommandError::unavailable());
+        }
+        let binding = self.register_workspace_projection(projection)?;
+        self.activate_cached_workspace(binding)
+    }
+
+    /// Admit Java's root into the existing physical-identity registry before making it addressable by protocol ID.
+    fn register_workspace_projection(
+        &self,
+        projection: WorkspaceDto,
+    ) -> Result<ConfiguredWorkspace, RuntimeCommandError> {
+        let registry = WorkspaceRegistry::default();
+        let info = registry
+            .register(Path::new(&projection.root))
+            .map_err(|_| RuntimeCommandError::configuration())?;
+        let handle = registry
+            .get(info.id)
+            .map_err(|_| RuntimeCommandError::configuration())?;
+        let mut binding = ConfiguredWorkspace {
+            workspace_id: projection.workspace_id.clone(),
+            projection_root: Some(projection.root),
+            display_name: projection.display_name,
+            trust: projection.trust,
+            revision: Some(projection.revision),
+            kind: projection.kind,
+            legacy_shared_workspace_id: projection.legacy_shared_workspace_id,
+            handle,
+        };
+        let mut workspaces = self.workspace_guard()?;
+        if let Some(existing) = workspaces.by_id.get(&binding.workspace_id) {
+            if existing.kind != binding.kind
+                || existing.legacy_shared_workspace_id != binding.legacy_shared_workspace_id
+                || !existing.handle.same_physical_root(&binding.handle)
+            {
+                return Err(RuntimeCommandError::configuration());
+            }
+            // Reuse the admitted handle so repeated Java projections cannot replace caches or
+            // mutation-recovery state for a stable workspace identity.
+            binding.handle = existing.handle.clone();
+        }
+        workspaces
+            .by_id
+            .insert(binding.workspace_id.clone(), binding.clone());
+        Ok(binding)
+    }
+
+    /// Publish only the canonical path already held by WorkspaceHandle; renderer never supplies or chooses that root.
+    fn activate_cached_workspace(
+        &self,
+        binding: ConfiguredWorkspace,
+    ) -> Result<WorkspaceActivation, RuntimeCommandError> {
+        let root_path = binding
+            .handle
+            .root_path()
+            .to_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(RuntimeCommandError::unavailable)?
+            .to_owned();
+        let activation = WorkspaceActivation {
+            workspace_id: binding.workspace_id.clone(),
+            root_path,
+            display_name: binding.display_name.clone(),
+            trust: binding.trust.clone(),
+            kind: binding.kind,
+            legacy_shared_workspace_id: binding.legacy_shared_workspace_id.clone(),
+        };
+        let mut workspaces = self.workspace_guard()?;
+        workspaces
+            .by_id
+            .insert(binding.workspace_id.clone(), binding.clone());
+        workspaces.active_workspace_id = Some(binding.workspace_id);
+        Ok(activation)
+    }
+
     /// 先在不持有 Workspace 锁时确认 Runtime generation 仍 Ready，再持有 binding lock
     /// 执行只读操作。该固定顺序避免 Runtime actor 的 Turn 回调反向等待 Workspace 锁，
     /// 同时仍让 Workspace 切换与 handle 使用在线性化临界区内互斥。
@@ -655,18 +835,47 @@ impl RuntimeHost {
         if !self.workspace_access_ready() {
             return Err(WorkspaceLookup::Unknown);
         }
+        if self
+            .workspace
+            .lock()
+            .map_err(|_| WorkspaceLookup::Unknown)?
+            .by_id
+            .contains_key(workspace_id)
+        {
+            let workspace = self
+                .workspace
+                .lock()
+                .map_err(|_| WorkspaceLookup::Unknown)?;
+            let binding = workspace
+                .by_id
+                .get(workspace_id)
+                .ok_or(WorkspaceLookup::Unknown)?;
+            return Ok(operation(&binding.handle));
+        }
+
+        // Old-session folder actions and restored sessions may arrive before a view activation; ID-only Java lookup supplies the only permitted root source.
+        let bridge = self.ready_bridge().map_err(|_| WorkspaceLookup::Unknown)?;
+        let projection = bridge
+            .workspace_open_by_id(workspace_id.to_owned())
+            .map_err(|_| WorkspaceLookup::Unknown)?;
+        if projection.workspace_id != workspace_id
+            || !matches!(
+                projection.kind,
+                WorkspaceKind::Session | WorkspaceKind::LegacyShared
+            )
+        {
+            return Err(WorkspaceLookup::Unknown);
+        }
+        self.register_workspace_projection(projection)
+            .map_err(|_| WorkspaceLookup::Unknown)?;
         let workspace = self
             .workspace
             .lock()
             .map_err(|_| WorkspaceLookup::Unknown)?;
-        let Some(binding) = workspace.as_ref() else {
-            return Err(WorkspaceLookup::Unconfigured);
-        };
-        // Ready 检查之后仍按当前 binding 的 Java identity 做二次归属校验；并发切换即使
-        // 发生在两个阶段之间，也不能让旧调用方取得新 Workspace 的 capability handle。
-        if binding.workspace_id.as_deref() != Some(workspace_id) {
-            return Err(WorkspaceLookup::Unknown);
-        }
+        let binding = workspace
+            .by_id
+            .get(workspace_id)
+            .ok_or(WorkspaceLookup::Unknown)?;
         Ok(operation(&binding.handle))
     }
 
@@ -679,19 +888,71 @@ impl RuntimeHost {
             Err(_) => return false,
         };
         match bridge {
-            // configure 成功只会冻结 binding 而不会启动 generation；在权威 Ready 投影出现前，命令始终保持关闭。
+            // configure 成功只会冻结 binding 而不会启动 generation；在权威 Ready/Busy 投影出现前，命令始终保持关闭。
             None => false,
-            Some(bridge) => bridge
-                .state()
-                .map(|status| status.status == RuntimeStatusKind::Ready)
-                .unwrap_or(false),
+            Some(bridge) => match bridge.state() {
+                Ok(status)
+                    if matches!(
+                        status.status,
+                        RuntimeStatusKind::Ready | RuntimeStatusKind::Busy
+                    ) =>
+                {
+                    self.synchronize_workspace_generation(status.generation)
+                        .is_ok()
+                }
+                Ok(_) => {
+                    let _ = self.clear_registered_workspaces();
+                    false
+                }
+                Err(_) => {
+                    let _ = self.clear_registered_workspaces();
+                    false
+                }
+            },
         }
     }
 
     /// 当配置本身不再权威（例如应用 shutdown）时删除完整原生 binding，避免旧 capability 延续到下一生命周期。
     fn clear_workspace(&self) -> Result<(), RuntimeCommandError> {
-        self.workspace_guard()?.take();
+        *self.workspace_guard()? = WorkspaceBindings::default();
         Ok(())
+    }
+
+    /// Runtime generation 改变后清除旧 session capability；pending project 属于新生命周期的显式用户选择，因此保留。
+    fn synchronize_workspace_generation(&self, generation: u64) -> Result<(), RuntimeCommandError> {
+        let mut workspaces = self.workspace_guard()?;
+        if workspaces
+            .runtime_generation
+            .is_some_and(|previous| previous != generation)
+        {
+            workspaces.by_id.clear();
+            workspaces.active_workspace_id = None;
+        }
+        workspaces.runtime_generation = Some(generation);
+        Ok(())
+    }
+
+    /// 非 Ready generation 的旧 session handle 不能继续授权；新生命周期的 pending project 保持可重放。
+    fn clear_registered_workspaces(&self) -> Result<(), RuntimeCommandError> {
+        let mut workspaces = self.workspace_guard()?;
+        workspaces.by_id.clear();
+        workspaces.active_workspace_id = None;
+        workspaces.runtime_generation = None;
+        Ok(())
+    }
+
+    /// Draft-only attachment operations follow the selected workspace; explicit Thread reads keep their supplied Java identity.
+    fn active_workspace_id(&self) -> Result<String, RuntimeCommandError> {
+        let workspaces = self.workspace_guard()?;
+        let workspace_id = workspaces
+            .active_workspace_id
+            .as_ref()
+            .ok_or_else(RuntimeCommandError::unavailable)?;
+        workspaces
+            .by_id
+            .get(workspace_id)
+            .map(|binding| binding.workspace_id.clone())
+            .ok_or_else(RuntimeCommandError::unavailable)
     }
 
     /// 在当前 Java generation 打开已配置规范 root，并在准入任何 history 或 Turn request
@@ -705,7 +966,7 @@ impl RuntimeHost {
         // 跨越 Workspace 锁，否则 Turn admission callback 会与启动重放形成锁顺序反转。
         let Some((expected_handle_id, root, display_name, trust)) = ({
             let workspace = self.workspace_guard()?;
-            workspace.as_ref().map(|binding| {
+            workspace.pending_project.as_ref().map(|binding| {
                 (
                     binding.handle.id(),
                     binding.handle.root_path().to_path_buf(),
@@ -720,25 +981,42 @@ impl RuntimeHost {
         // 第二阶段由 actor 串行执行 Java workspace/open；此时 Workspace 锁为空闲，事件回调
         // 可以读取当前 binding，且跨进程等待不会阻塞本地 Files/Review capability 查询。
         let projection = bridge.workspace_open(root, display_name, trust)?;
+        let result_workspace_id = projection.workspace_id.clone();
 
         // 第三阶段重新取得 binding 并做 handle CAS。若并发配置已经提交，它对应的 actor
         // 请求必然位于本请求之后；保留较新的 Java identity，禁止旧结果回写。
-        let mut workspace = self.workspace_guard()?;
-        let Some(binding) = workspace.as_mut() else {
+        if projection.kind != WorkspaceKind::Project {
             return Err(RuntimeCommandError::unavailable());
+        }
+        let mut workspace = self.workspace_guard()?;
+        let Some(binding) = workspace.pending_project.take() else {
+            return workspace
+                .active_workspace_id
+                .clone()
+                .ok_or_else(RuntimeCommandError::unavailable);
         };
         if binding.handle.id() != expected_handle_id {
-            return binding
-                .workspace_id
+            workspace.pending_project = Some(binding);
+            return workspace
+                .active_workspace_id
                 .clone()
                 .ok_or_else(RuntimeCommandError::unavailable);
         }
-        binding.workspace_id = Some(projection.workspace_id.clone());
-        binding.projection_root = Some(projection.root);
-        binding.display_name = projection.display_name;
-        binding.trust = projection.trust;
-        binding.revision = Some(projection.revision);
-        Ok(projection.workspace_id)
+        let configured = ConfiguredWorkspace {
+            workspace_id: projection.workspace_id.clone(),
+            projection_root: Some(projection.root),
+            display_name: projection.display_name,
+            trust: projection.trust,
+            revision: Some(projection.revision),
+            kind: WorkspaceKind::Project,
+            legacy_shared_workspace_id: projection.legacy_shared_workspace_id,
+            handle: binding.handle,
+        };
+        workspace.active_workspace_id = Some(configured.workspace_id.clone());
+        workspace
+            .by_id
+            .insert(configured.workspace_id.clone(), configured);
+        Ok(result_workspace_id)
     }
 
     /// 仅将用户审批路由到当前持有的 sidecar session；该命令不像通用 RPC 那样能指定任意 method 或 response ID，从而保持 WebView 投影强类型。
@@ -765,11 +1043,7 @@ impl RuntimeHost {
             .validate()
             .map_err(|_| RuntimeCommandError::invalid_params())?;
         let bridge = self.ready_bridge()?;
-        let workspace_id = self
-            .workspace_guard()?
-            .as_ref()
-            .and_then(|workspace| workspace.workspace_id.clone())
-            .ok_or_else(RuntimeCommandError::unavailable)?;
+        let workspace_id = self.active_workspace_id()?;
         bridge.attachment_import(workspace_id, input)
     }
 
@@ -791,11 +1065,7 @@ impl RuntimeHost {
         attachment_id: String,
         authorization: crate::attachment_preview::AttachmentPreviewAuthorizationInput,
     ) -> Result<(AttachmentPreviewOpenResult, String), RuntimeCommandError> {
-        let workspace_id = self
-            .workspace_guard()?
-            .as_ref()
-            .and_then(|workspace| workspace.workspace_id.clone())
-            .ok_or_else(RuntimeCommandError::unavailable)?;
+        let workspace_id = self.active_workspace_id()?;
         let input = match authorization {
             crate::attachment_preview::AttachmentPreviewAuthorizationInput::Draft => {
                 AttachmentPreviewOpenParams::draft(attachment_id, workspace_id.clone())

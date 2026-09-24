@@ -192,7 +192,7 @@ public final class ConfigurationHandler implements RpcHandler {
                 workspace == null ? null : workspace.workspaceId(), result.version());
     }
 
-    /** 项目操作只能解析已打开且受信任的 workspaceId；用户作用域禁止夹带工作区身份。 */
+    /** 项目配置只允许 PROJECT 根，防止 SESSION 被显式注入项目 overlay；用户作用域禁止夹带身份。 */
     private Workspace requireWorkspace(ConfigurationScope scope, ObjectNode params) {
         if (scope == ConfigurationScope.USER) {
             if (params.has("workspaceId")) throw JaRpcException.invalidParams();
@@ -200,6 +200,7 @@ public final class ConfigurationHandler implements RpcHandler {
         }
         String workspaceId = RpcParams.text(params, "workspaceId", 100, false);
         Workspace workspace = session.workspaces().requireOpenWorkspace(workspaceId);
+        if (workspace.kind() != Workspace.Kind.PROJECT) throw JaRpcException.invalidParams();
         if (workspace.trust() != Workspace.Trust.TRUSTED) {
             throw JaRpcException.of(JaErrorCatalog.WORKSPACE_TRUST_REQUIRED,
                     "workspace trust is required");
@@ -207,11 +208,13 @@ public final class ConfigurationHandler implements RpcHandler {
         return workspace;
     }
 
-    /** 读取允许省略 workspaceId 表示通用投影；显式字段仍必须解析为已打开工作区。 */
+    /** 读取允许省略 workspaceId 表示用户层投影；显式身份必须是已打开的 PROJECT。 */
     private Workspace optionalWorkspace(ObjectNode params) {
         if (!params.has("workspaceId")) return null;
-        return session.workspaces().requireOpenWorkspace(
+        Workspace workspace = session.workspaces().requireOpenWorkspace(
                 RpcParams.text(params, "workspaceId", 100, false));
+        if (workspace.kind() != Workspace.Kind.PROJECT) throw JaRpcException.invalidParams();
+        return workspace;
     }
 
     /** 把工作区领域能力转换为配置域内部 Path；用户作用域和通用读取保留 null。 */

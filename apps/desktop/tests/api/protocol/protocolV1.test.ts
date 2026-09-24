@@ -24,8 +24,9 @@ const REQUEST_PROFILE = {
 describe("JA RPC v1 configuration ownership", () => {
   it("accepts cwd/thread/turn intent without client-owned identity or generation", () => {
     expect(parseMethodParams("workspace/open", { cwd: "C:\\demo" })).toEqual({ cwd: "C:\\demo" });
-    expect(parseMethodParams("workspace/open-general", {})).toEqual({});
-    expect(() => parseMethodParams("workspace/open-general", { cwd: "C:\\demo" })).toThrow();
+    expect(parseMethodParams("workspace/open", { workspaceId: "ws_session" })).toEqual({
+      workspaceId: "ws_session",
+    });
     expect(
       parseMethodParams("thread/seen", {
         threadId: "thr_seen",
@@ -51,6 +52,17 @@ describe("JA RPC v1 configuration ownership", () => {
       accessMode: "approval_required",
       collaborationMode: "default",
     });
+    expect(() =>
+      parseMethodParams("thread/create", {
+        cwd: null,
+        title: "Chat",
+        providerId: "provider_demo",
+        modelId: "model_demo",
+        reasoningLevel: null,
+        accessMode: "approval_required",
+        collaborationMode: "default",
+      }),
+    ).toThrow();
     expect(
       parseMethodParams("turn/start", {
         threadId: "thr_demo",
@@ -59,20 +71,69 @@ describe("JA RPC v1 configuration ownership", () => {
     ).toEqual({ threadId: "thr_demo", content: [{ type: "text", text: "hello" }] });
   });
 
-  it("validates the server-owned general workspace as a standard workspace projection", () => {
+  it("validates hidden continuation/reask requests and the bounded retry notification", () => {
+    const continueParams = { threadId: "thr_demo", expectedThreadRevision: 4 };
+    expect(parseMethodParams("turn/continue", continueParams)).toEqual(continueParams);
+    const reaskParams = {
+      ...continueParams,
+      sourceMessageId: "item_question",
+      content: [
+        { type: "attachment" as const, attachmentId: "att_question" },
+        { type: "text" as const, text: "修订后的问题" },
+      ],
+    };
+    expect(parseMethodParams("turn/reask", reaskParams)).toEqual(reaskParams);
+    expect(() => parseMethodParams("turn/continue", { ...continueParams, content: [] })).toThrow();
+    expect(
+      parseMethodResult("turn/continue", {
+        accepted: true,
+        queued: true,
+        turnId: "turn_continue",
+        threadRevision: 5,
+      }),
+    ).toMatchObject({ turnId: "turn_continue", threadRevision: 5 });
+
+    const retryBase = {
+      serverInstanceId: "srv_retry",
+      eventId: "evt_retry_two",
+      sequence: 10,
+      occurredAt: "2026-09-23T00:00:00Z",
+      generation: 1,
+      workspaceId: "ws_retry",
+      threadId: "thr_demo",
+      turnId: "turn_continue",
+      threadRevision: 8,
+    };
+    expect(
+      parseNotification({
+        jsonrpc: "2.0",
+        method: "turn/retry-started",
+        params: { ...retryBase, attempt: 2, maxAttempts: 6 },
+      }),
+    ).toMatchObject({ method: "turn/retry-started", params: { attempt: 2, maxAttempts: 6 } });
+    expect(() =>
+      parseNotification({
+        jsonrpc: "2.0",
+        method: "turn/retry-started",
+        params: { ...retryBase, attempt: 7, maxAttempts: 6 },
+      }),
+    ).toThrow();
+  });
+
+  it("validates workspace kind and the explicit old-shared association", () => {
     const projection = {
       workspaceId: "ws_runtime_a",
       root: "C:\\data\\ja\\general-workspace",
       displayName: "无项目",
+      kind: "session" as const,
+      legacySharedWorkspaceId: "ws_legacy_shared",
       trust: "trusted" as const,
       revision: 4,
     };
-    expect(parseMethodResult("workspace/open-general", projection)).toEqual(projection);
+    expect(parseMethodResult("workspace/open", projection)).toEqual(projection);
+    expect(() => parseMethodResult("workspace/open", { ...projection, extra: true })).toThrow();
     expect(() =>
-      parseMethodResult("workspace/open-general", { ...projection, extra: true }),
-    ).toThrow();
-    expect(() =>
-      parseMethodResult("workspace/open-general", { ...projection, workspaceId: "general" }),
+      parseMethodResult("workspace/open", { ...projection, workspaceId: "general" }),
     ).toThrow();
   });
 
@@ -80,6 +141,8 @@ describe("JA RPC v1 configuration ownership", () => {
     const projection = {
       threadId: "thr_runtime_a",
       workspaceId: "ws_runtime_a",
+      workspaceKind: "session" as const,
+      legacySharedWorkspaceId: null,
       preferences: {
         providerId: "provider_demo",
         modelId: "model_demo",
@@ -108,6 +171,7 @@ describe("JA RPC v1 configuration ownership", () => {
   it("validates required context Usage in Thread snapshots", () => {
     const turn = {
       turnId: "turn_runtime_a",
+      sourceMessageId: null,
       status: "completed" as const,
       requestedAt: "2026-08-31T00:00:00Z",
       updatedAt: "2026-08-31T00:00:01Z",
@@ -140,6 +204,11 @@ describe("JA RPC v1 configuration ownership", () => {
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
+    const { sourceMessageId: _sourceMessageId, ...turnWithoutSource } = turn;
+    void _sourceMessageId;
+    expect(() =>
+      parseMethodResult("thread/read", { ...snapshot, turns: [turnWithoutSource] }),
+    ).toThrow();
     const terminalGoal = {
       goalId: "goal_done",
       objective: "完成生产验收",
@@ -212,6 +281,7 @@ describe("JA RPC v1 configuration ownership", () => {
       turns: [
         {
           turnId: "turn_live_stream",
+          sourceMessageId: null,
           status: "running" as const,
           requestedAt: "2026-08-31T00:00:00Z",
           updatedAt: "2026-08-31T00:00:01Z",
@@ -315,6 +385,7 @@ describe("JA RPC v1 configuration ownership", () => {
   it("validates structured interaction answers in Tool presentations", () => {
     const turn = {
       turnId: "turn_interaction_answer",
+      sourceMessageId: null,
       status: "completed" as const,
       requestedAt: "2026-09-21T00:00:00Z",
       updatedAt: "2026-09-21T00:00:01Z",
@@ -511,12 +582,16 @@ describe("JA RPC v1 configuration ownership", () => {
       workspaceId: "ws_demo",
       root: "C:\\demo",
       displayName: "Demo",
+      kind: "project" as const,
+      legacySharedWorkspaceId: null,
       trust: "trusted" as const,
       revision: 1,
     };
     const thread = {
       threadId: "thr_demo",
       workspaceId: "ws_demo",
+      workspaceKind: "project" as const,
+      legacySharedWorkspaceId: null,
       preferences: {
         providerId: "provider_demo",
         modelId: "model_demo",
@@ -546,6 +621,7 @@ describe("JA RPC v1 configuration ownership", () => {
     const server = {
       mcpId: "mcp_demo",
       name: "Demo",
+      scope: "global" as const,
       transport: "stdio" as const,
       status: "configured" as const,
       toolCount: 1,
@@ -554,9 +630,26 @@ describe("JA RPC v1 configuration ownership", () => {
     expect(
       parseMethodResult("workspace/list", { items: [workspace], nextCursor: null }),
     ).toMatchObject({ items: [workspace] });
+    expect(() =>
+      parseMethodResult("workspace/list", {
+        items: [{ ...workspace, legacySharedWorkspaceId: "ws_legacy_shared" }],
+        nextCursor: null,
+      }),
+    ).toThrow();
+    expect(parseMethodParams("workspace/list", { kind: "project", limit: 200 })).toEqual({
+      kind: "project",
+      limit: 200,
+    });
+    expect(() => parseMethodParams("workspace/list", { kind: "unknown" })).toThrow();
     expect(parseMethodResult("thread/list", { items: [thread], nextCursor: null })).toMatchObject({
       items: [thread],
     });
+    expect(() =>
+      parseMethodResult("thread/list", {
+        items: [{ ...thread, legacySharedWorkspaceId: "ws_legacy_shared" }],
+        nextCursor: null,
+      }),
+    ).toThrow();
     expect(parseMethodResult("skill/list", { items: [skill], nextCursor: null })).toMatchObject({
       items: [skill],
     });
@@ -567,6 +660,7 @@ describe("JA RPC v1 configuration ownership", () => {
       parseMethodResult("mcp/test", {
         mcpId: "mcp_demo",
         name: "Demo",
+        scope: "global",
         transport: "stdio",
         status: "available",
         toolCount: 1,
@@ -588,26 +682,42 @@ describe("JA RPC v1 configuration ownership", () => {
     ).toThrow();
   });
 
-  it("accepts the minimal cross-workspace thread discovery projection", () => {
-    const params = { scope: "all" as const, query: "侧聊", limit: 20 };
+  it("paginates session history and search by server workspace kind", () => {
+    const sessionParams = { workspaceKind: "session" as const, limit: 20 };
+    const sessionSearch = { workspaceKind: "session" as const, query: "侧聊", limit: 20 };
     const result = {
       items: [
         {
-          threadId: "thr_discovered",
+          threadId: "thr_session",
+          workspaceId: "ws_session",
+          workspaceKind: "session" as const,
+          legacySharedWorkspaceId: "ws_legacy_shared",
+          preferences: null,
           title: "临时侧聊",
-          kind: "side_chat" as const,
-          workspaceId: "ws_other",
-          status: "idle" as const,
+          status: "active" as const,
+          pinned: false,
+          latestTurnStatus: null,
+          latestTurnSeen: true,
+          activeGoalId: null,
+          revision: 1,
+          createdAt: "2026-08-26T00:00:00Z",
+          updatedAt: "2026-08-26T00:00:00Z",
         },
       ],
       nextCursor: null,
     };
 
-    expect(parseMethodParams("thread/list", params)).toEqual(params);
+    expect(parseMethodParams("thread/list", sessionParams)).toEqual(sessionParams);
+    expect(parseMethodParams("thread/search", sessionSearch)).toEqual(sessionSearch);
     expect(parseMethodResult("thread/list", result)).toEqual(result);
-    expect(() => parseMethodParams("thread/list", { ...params, scope: "workspace" })).toThrow();
+    expect(parseMethodResult("thread/search", result)).toEqual(result);
+    expect(() => parseMethodParams("thread/list", { scope: "all", limit: 20 })).toThrow();
     expect(() =>
-      parseMethodResult("thread/list", { ...result, items: [{ ...result.items[0], revision: 1 }] }),
+      parseMethodParams("thread/search", {
+        workspaceKind: "session",
+        workspaceId: "ws_project",
+        query: "x",
+      }),
     ).toThrow();
   });
 

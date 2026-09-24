@@ -17,6 +17,7 @@ import type {
   McpStatus,
   AccessMode,
   SettingsDocument,
+  SettingsMcpServer,
   ProjectSkillSettingsDocument,
   SubagentSettings,
   ThemeMode,
@@ -54,10 +55,9 @@ export interface SettingsPorts {
   onClearCredential: (credentialId: string) => Promise<void>;
   /** Provider 编辑框短时读取其绑定 API Key，调用方关闭编辑框后不得保留返回值。 */
   onRevealProviderCredential: (providerId: string) => Promise<string | null>;
-  onSaveMcp: (server: McpServerSave) => Promise<void>;
-  onDeleteMcp: (id: string) => Promise<void>;
-  onTestMcp: (id: string) => Promise<McpStatus>;
-  onCloseMcp: (id: string) => Promise<void>;
+  onSaveMcp: (server: McpServerSave, scope: "user" | "project") => Promise<void>;
+  onDeleteMcp: (id: string, scope: "user" | "project") => Promise<void>;
+  onTestMcp: (id: string, scope: "user" | "project") => Promise<McpStatus>;
   /** Skill 标识始终携带来源，scope 指向唯一允许写入的用户或当前项目文档。 */
   onToggleSkill: (id: string, enabled: boolean, scope: "user" | "project") => Promise<void>;
   onAccessModeChange: (mode: AccessMode) => Promise<void>;
@@ -83,6 +83,11 @@ export interface SettingsAdapter {
   ): Promise<string>;
   saveProjectSkills(
     document: ProjectSkillSettingsDocument,
+    workspaceId: string,
+    expectedVersion: string,
+  ): Promise<string>;
+  saveProjectMcpServers(
+    servers: SettingsMcpServer[],
     workspaceId: string,
     expectedVersion: string,
   ): Promise<string>;
@@ -182,6 +187,7 @@ export interface McpListResult {
   items: Array<{
     mcpId: string;
     name: string;
+    scope: "global" | "project";
     transport: McpTransport;
     status: "healthy" | "available" | "degraded" | "unavailable" | "disabled" | "configured";
     toolCount: number;
@@ -191,6 +197,7 @@ export interface McpListResult {
 
 interface McpTestResult {
   mcpId: string;
+  scope: "global" | "project";
   status: "healthy" | "available" | "degraded" | "unavailable";
   toolCount: number;
 }
@@ -214,9 +221,9 @@ export interface ModelDiscoveryResult {
 /** Settings runtime 端口只暴露领域能力，JA-RPC method 与 params envelope 留在 composition/infrastructure。 */
 export interface SettingsRuntimePort {
   listSkills(input?: { workspaceId?: string }): Promise<SkillListResult>;
-  listMcpServers(): Promise<McpListResult>;
-  testMcp(mcpRevision: string): Promise<McpTestResult>;
-  listMcpTools(mcpRevision: string): Promise<McpToolsResult>;
+  listMcpServers(input?: { workspaceId?: string }): Promise<McpListResult>;
+  testMcp(mcpRevision: string, input?: { workspaceId?: string }): Promise<McpTestResult>;
+  listMcpTools(mcpRevision: string, input?: { workspaceId?: string }): Promise<McpToolsResult>;
   testModel(providerId: string, modelId: string): Promise<ModelTestResult>;
   /** 目录读取走单独的受限 JA-RPC 方法，Provider endpoint 和 API Key 始终由 App Server 解析。 */
   discoverModels(providerId: string): Promise<ModelDiscoveryResult>;

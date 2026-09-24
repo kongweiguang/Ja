@@ -43,7 +43,7 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
             WorkspaceRepository repository = database.history(database.agentStore());
             Path root = temp.resolve("project").toAbsolutePath().normalize();
             Workspace.Registration registration = new Workspace.Registration(
-                    "ws_project", root, "项目", Workspace.Trust.UNTRUSTED, START);
+                    "ws_project", root, "项目", Workspace.Trust.UNTRUSTED, Workspace.Kind.PROJECT, null, START);
 
             Workspace registered = repository.register(registration);
 
@@ -70,18 +70,19 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
             WorkspaceRepository repository = database.history(database.agentStore());
             Path root = temp.resolve("same-project").toAbsolutePath().normalize();
             Workspace.Registration registration = new Workspace.Registration(
-                    "ws_stable", root, "首次名称", Workspace.Trust.UNTRUSTED, START);
+                    "ws_stable", root, "首次名称", Workspace.Trust.UNTRUSTED, Workspace.Kind.PROJECT, null, START);
             Workspace first = repository.register(registration);
 
             Workspace retry = repository.register(new Workspace.Registration(
-                    "ws_stable", root, "重试名称", Workspace.Trust.TRUSTED, START.plusSeconds(1)));
+                    "ws_stable", root, "重试名称", Workspace.Trust.TRUSTED,
+                    Workspace.Kind.PROJECT, null, START.plusSeconds(1)));
 
             assertEquals(first, retry);
             assertEquals(0, retry.revision());
             StorageException conflict = assertThrows(StorageException.class,
                     () -> repository.register(new Workspace.Registration(
                             "ws_conflict", root, "冲突", Workspace.Trust.UNTRUSTED,
-                            START.plusSeconds(2))));
+                            Workspace.Kind.PROJECT, null, START.plusSeconds(2))));
             assertEquals(StorageException.Code.STORAGE_CONFLICT, conflict.code());
             assertTrue(repository.findById("ws_conflict").isEmpty());
             assertEquals(first, repository.findByRoot(root).orElseThrow());
@@ -96,7 +97,8 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
             MybatisHistoryService history = database.history(store);
             Path root = temp.resolve("tool-result-project").toAbsolutePath().normalize();
             history.register(new Workspace.Registration(
-                    "ws_tool", root, "工具结果", Workspace.Trust.TRUSTED, START));
+                    "ws_tool", root, "工具结果", Workspace.Trust.TRUSTED,
+                    Workspace.Kind.PROJECT, null, START));
             store.createThread(new ConversationRepository.ThreadDefinition(
                     "thr_tool", "ws_tool", "工具结果",
                     preferences("provider_tool", "model_tool"), START));
@@ -147,7 +149,8 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
             MybatisHistoryService history = database.history(store);
             Path root = temp.resolve("automatic-title-project").toAbsolutePath().normalize();
             history.register(new Workspace.Registration(
-                    "ws_title", root, "标题竞争", Workspace.Trust.TRUSTED, START));
+                    "ws_title", root, "标题竞争", Workspace.Trust.TRUSTED,
+                    Workspace.Kind.PROJECT, null, START));
             ThreadPreferences initial = preferences("provider_title", "model_title");
             store.createThread(new ConversationRepository.ThreadDefinition(
                     "thr_auto", "ws_title", "新会话", initial, START));

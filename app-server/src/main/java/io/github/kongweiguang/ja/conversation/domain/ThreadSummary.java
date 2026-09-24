@@ -11,6 +11,7 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
  * 表示一个 Thread 的权威元数据投影。
  */
 public record ThreadSummary(String threadId, String workspaceId, String title,
+                            String workspaceKind, String legacySharedWorkspaceId,
                             ThreadPreferences preferences, Status status, boolean pinned,
                             TurnState latestTurnStatus, boolean latestTurnSeen, String activeGoalId, long revision,
                             Instant createdAt, Instant updatedAt) {
@@ -21,6 +22,15 @@ public record ThreadSummary(String threadId, String workspaceId, String title,
         threadId = identifier(threadId, "thr_", 96);
         workspaceId = identifier(workspaceId, "ws_", 96);
         title = title(title);
+        if (!java.util.Set.of("project", "session", "legacy_shared").contains(workspaceKind)) {
+            throw new IllegalArgumentException("invalid workspace kind");
+        }
+        if (legacySharedWorkspaceId != null) {
+            legacySharedWorkspaceId = identifier(legacySharedWorkspaceId, "ws_", 96);
+            if (!"session".equals(workspaceKind)) {
+                throw new IllegalArgumentException("only session threads can retain a legacy workspace");
+            }
+        }
         Objects.requireNonNull(preferences, "preferences");
         Objects.requireNonNull(status, "status");
         if (latestTurnStatus == null && !latestTurnSeen) {

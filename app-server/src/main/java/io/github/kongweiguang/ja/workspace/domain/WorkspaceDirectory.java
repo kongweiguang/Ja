@@ -19,16 +19,16 @@ public record WorkspaceDirectory(Path root, Kind kind) {
     }
 
     /**
-     * 区分有项目配置覆盖层的目录与 Java 自建通用目录。
+     * 区分项目目录、会话私有目录和只用于找回旧文件的共享目录。
      */
     public enum Kind {
         /**
          * 用户明确打开的项目目录，可启用项目配置、Skill 与 MCP。
          */
         PROJECT,
-        /**
-         * Java 数据目录内的无项目工作区，不读取项目配置、Skill 或 MCP。
-         */
-        GENERAL
+        /** Java 按 Thread identity 在 Ja Home 下创建的独立目录。 */
+        SESSION,
+        /** 升级前的共享目录，只由显式 workspaceId 重开。 */
+        LEGACY_SHARED
     }
 }

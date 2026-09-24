@@ -99,6 +99,19 @@
 .ja-floating-surface[data-state="closed"] {
   animation: ja-floating-exit var(--ja-duration-fast) var(--ja-ease-native);
 }
+.ja-pointer-context-anchor {
+  position: fixed;
+  z-index: -1;
+  width: 0;
+  height: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.ja-pointer-context-menu {
+  max-width: min(22rem, calc(100vw - 1rem));
+}
 @keyframes ja-floating-enter {
   from {
     opacity: 0;
@@ -256,6 +269,12 @@
 .ja-menu-item[data-highlighted] {
   background: var(--ja-control-hover);
 }
+.ja-menu-item.is-danger {
+  color: var(--ja-danger);
+}
+.ja-menu-item.is-danger[data-highlighted] {
+  background: color-mix(in srgb, var(--ja-danger) 12%, var(--ja-menu));
+}
 .ja-menu-item[data-disabled] {
   cursor: not-allowed;
   opacity: 0.45;
@@ -328,6 +347,12 @@
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
   overflow-wrap: anywhere;
+  /* Tooltip 是说明层，不应拦截其下方按钮的点击或拖拽。 */
+  pointer-events: none;
+}
+[data-radix-popper-content-wrapper]:has(> [data-ja-tooltip-content]) {
+  /* Radix 的定位 wrapper 即使内容透明仍占有盒子，必须一并让出命中区。 */
+  pointer-events: none;
 }
 .ja-tooltip-arrow {
   fill: var(--ja-glass-strong);

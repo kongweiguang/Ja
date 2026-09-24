@@ -176,33 +176,41 @@ public final class CatalogService implements CatalogUseCase {
     }
 
     /**
-     * 通用工作区与省略身份都关闭项目来源；项目路径只能来自已打开工作区，客户端不能注入本地路径。
+     * 只有 PROJECT 可读取项目 overlay；SESSION 即使使用 trusted 也不能继承项目级配置。
      */
     private Workspace skillWorkspace(String workspaceId) {
         if (workspaceId == null) return null;
         Workspace workspace = workspaces.requireOpenWorkspace(workspaceId);
-        return workspaces.isGeneralWorkspace(workspace.root()) ? null : workspace;
+        return workspace.kind() == Workspace.Kind.PROJECT ? workspace : null;
     }
 
     /**
      * 在同一短租约内完成 MCP 状态投影，避免脱敏查询延长 Secret 生命周期。
      */
     @Override
-    public CursorPage<McpServerDescriptor> listMcp(String cursor, int limit) {
-        try (ConfigurationGenerationPort.Lease generation = generations.acquire(null)) {
+    public CursorPage<McpServerDescriptor> listMcp(String workspaceId, String cursor, int limit) {
+        Path workspaceRoot = mcpWorkspaceRoot(workspaceId);
+        try (ConfigurationGenerationPort.Lease generation = generations.acquire(workspaceRoot)) {
             return queryPort.listMcp(generation, cursor, limit);
         }
+    }
+
+    /** MCP 管理只接受已打开的项目身份，路径仍由 Java Workspace Owner 解析。 */
+    private Path mcpWorkspaceRoot(String workspaceId) {
+        Workspace workspace = skillWorkspace(workspaceId);
+        return workspace == null ? null : workspace.root();
     }
 
     /**
      * 让异步探测独占租约直到完成，并在同步抛错与异步完成两条路径都精确释放。
      */
     @Override
-    public CompletionStage<McpServerDescriptor> testMcp(String mcpId) {
-        ConfigurationGenerationPort.Lease generation = generations.acquire(null);
+    public CompletionStage<McpServerDescriptor> testMcp(String workspaceId, String mcpId) {
+        Path workspaceRoot = mcpWorkspaceRoot(workspaceId);
+        ConfigurationGenerationPort.Lease generation = generations.acquire(workspaceRoot);
         try {
             generation.snapshot().requireMcp(mcpId);
-            return queryPort.testMcp(generation, mcpId)
+            return queryPort.testMcp(generation, workspaceRoot, mcpId)
                     .whenComplete((ignored, failure) -> generation.close());
         } catch (RuntimeException | Error failure) {
             generation.close();
@@ -214,10 +222,12 @@ public final class CatalogService implements CatalogUseCase {
      * 在同一短租约内校验 MCP 身份并读取 Tool Schema，拒绝 TOCTOU 代际漂移。
      */
     @Override
-    public CursorPage<McpToolDescriptor> readMcpTools(String mcpId, String cursor, int limit) {
-        try (ConfigurationGenerationPort.Lease generation = generations.acquire(null)) {
+    public CursorPage<McpToolDescriptor> readMcpTools(
+            String workspaceId, String mcpId, String cursor, int limit) {
+        Path workspaceRoot = mcpWorkspaceRoot(workspaceId);
+        try (ConfigurationGenerationPort.Lease generation = generations.acquire(workspaceRoot)) {
             generation.snapshot().requireMcp(mcpId);
-            return queryPort.readMcpTools(generation, mcpId, cursor, limit);
+            return queryPort.readMcpTools(generation, workspaceRoot, mcpId, cursor, limit);
         }
     }
 }

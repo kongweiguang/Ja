@@ -18,6 +18,7 @@ import io.github.kongweiguang.ja.transport.rpc.RpcServicesFactory;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationUseCase;
@@ -43,14 +44,12 @@ import io.github.kongweiguang.ja.goal.port.in.GoalEvent;
 import io.github.kongweiguang.ja.goal.port.in.PlanEvent;
 import io.github.kongweiguang.ja.goal.port.in.GoalEventSink;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
-import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase;
 import io.github.kongweiguang.ja.task.port.in.TaskEvent;
 import io.github.kongweiguang.ja.task.port.in.TaskEventSink;
 import io.github.kongweiguang.ja.task.port.in.TaskUseCase;
 import io.github.kongweiguang.ja.task.port.out.TaskRepositoryException;
-import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Locale;
@@ -90,6 +89,7 @@ public final class RpcSession implements AutoCloseable {
     private volatile WorkspaceUseCase workspaces;
     private volatile WorkspacePathSearchUseCase workspacePathSearch;
     private volatile ThreadUseCase threads;
+    private volatile ThreadMcpUseCase threadMcp;
     private volatile TurnUseCase turns;
     private volatile ContextCompactionUseCase compactions;
     private volatile ApprovalUseCase approvalUseCase;
@@ -135,7 +135,7 @@ public final class RpcSession implements AutoCloseable {
         this.activeStreams = new ActiveStreamRegistry(runtimeGeneration);
     }
 
-    /** 打开空启动代际；配置仅在握手后由 Java 端解析。 */
+    /** 打开空启动代际并冻结所有会话用例；配置仍仅由握手后的 Java owner 解析。 */
     public synchronized void initialize() {
         if (initialized) throw JaRpcException.of(JaErrorCatalog.ALREADY_INITIALIZED,
                 "runtime is already initialized");
@@ -150,6 +150,7 @@ public final class RpcSession implements AutoCloseable {
         workspaces = opened.workspaces();
         workspacePathSearch = opened.workspacePathSearch();
         threads = opened.threads();
+        threadMcp = opened.threadMcp();
         turns = opened.turns();
         compactions = opened.compactions();
         approvalUseCase = opened.approvals();
@@ -319,20 +320,9 @@ public final class RpcSession implements AutoCloseable {
         return configurationUseCase;
     }
 
-    /** 返回宿主发布的进程根目录，仅用于 Java 所有的通用工作区。 */
+    /** 返回宿主发布的进程根目录，供运行时域使用。 */
     SidecarConfiguration processConfiguration() {
         return configuration;
-    }
-
-    /** 创建或重开 Java 数据目录内的唯一通用工作区。 */
-    synchronized Workspace ensureGeneralWorkspace() {
-        requireReady();
-        return workspaces().openGeneralWorkspace();
-    }
-
-    /** 判断规范工作区根目录是否为 Java 所有的通用根目录。 */
-    boolean isGeneralWorkspace(Path root) {
-        return workspaces().isGeneralWorkspace(root);
     }
 
     /** 在配置或信任变更提交后重建所有已注册工作区的 Catalog。 */
@@ -362,6 +352,12 @@ public final class RpcSession implements AutoCloseable {
     public ThreadUseCase threads() {
         requireReady();
         return Objects.requireNonNull(threads, "thread use case");
+    }
+
+    /** 返回 Thread 作用域的 MCP 观测端口，Handler 不得从设置目录推测会话运行状态。 */
+    public ThreadMcpUseCase threadMcp() {
+        requireReady();
+        return Objects.requireNonNull(threadMcp, "thread MCP use case");
     }
 
     /**

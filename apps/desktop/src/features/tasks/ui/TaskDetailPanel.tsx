@@ -377,6 +377,8 @@ export function TaskDetailPanel({
           approvalDecisions={approvalDecisions}
           approvalClosedAt={approvalClosedAt}
           localSubmissions={conversation?.localSubmissions}
+          editableSourceMessageId={conversation?.editableSourceMessageId}
+          onEditQuestion={conversation?.editQuestion}
           externalRows={externalRows}
           onApprovalDecision={(approval, decision) =>
             conversation !== undefined
@@ -466,6 +468,9 @@ export function TaskDetailPanel({
             attachmentThumbnailPort={environment?.attachmentThumbnailPort}
             activeTurn={conversation.activeTurn}
             suspendedTurn={conversation.suspendedTurn}
+            continuationAvailable={conversation.continuationAvailable}
+            editingQuestion={conversation.editingQuestion}
+            onCancelEdit={conversation.cancelEditQuestion}
             interactionPresentation={
               clarification?.request?.status !== "pending"
                 ? "none"
@@ -548,6 +553,7 @@ export function TaskDetailPanel({
             onOpenQueuedAttachmentPreview={environment?.onOpenQueuedAttachmentPreview}
             onOpenWorkspaceReference={environment?.onOpenWorkspaceReference}
             onSend={conversation.send}
+            onContinue={conversation.continueReply}
             onEnqueue={conversation.enqueue}
             onPrioritizeQueuedInput={conversation.prioritizeQueuedInput}
             onUpdateQueuedInput={conversation.updateQueuedInput}

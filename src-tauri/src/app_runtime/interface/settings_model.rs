@@ -66,12 +66,18 @@ impl SettingsQueryInput {
             .ok_or_else(RuntimeCommandError::invalid_params)?;
         match method {
             SettingsQueryMethod::SkillList => validate_page(object, Some(("workspaceId", "ws_")))?,
-            SettingsQueryMethod::McpList => validate_page(object, None)?,
+            SettingsQueryMethod::McpList => validate_page(object, Some(("workspaceId", "ws_")))?,
             SettingsQueryMethod::McpTest => {
-                if object.len() != 1 {
+                if object
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "mcpId" | "workspaceId"))
+                {
                     return Err(RuntimeCommandError::invalid_params());
                 }
                 required_id(object, "mcpId", "mcp_")?;
+                if object.contains_key("workspaceId") {
+                    required_id(object, "workspaceId", "ws_")?;
+                }
             }
             SettingsQueryMethod::ModelTest => {
                 if object.len() != 2 {
@@ -87,14 +93,21 @@ impl SettingsQueryInput {
                 required_id(object, "providerId", "provider_")?;
             }
             SettingsQueryMethod::McpToolsRead => {
-                if object
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "mcpId" | "cursor" | "limit"))
-                {
+                if object.keys().any(|key| {
+                    !matches!(key.as_str(), "mcpId" | "workspaceId" | "cursor" | "limit")
+                }) {
                     return Err(RuntimeCommandError::invalid_params());
                 }
                 required_id(object, "mcpId", "mcp_")?;
-                validate_page(object, Some(("mcpId", "mcp_")))?;
+                if object.contains_key("workspaceId") {
+                    required_id(object, "workspaceId", "ws_")?;
+                }
+                let page = object
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "workspaceId")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                validate_page(&page, Some(("mcpId", "mcp_")))?;
             }
         }
         Ok((method, Value::Object(object.clone())))
@@ -226,6 +239,10 @@ fn validate_mcp_projection(value: &Value) -> Result<(), &'static str> {
     ensure_mcp_result_keys(value)?;
     if !valid_mcp_id(value.get("mcpId"))
         || !valid_safe_name(value.get("name"))
+        || !matches!(
+            value.get("scope").and_then(Value::as_str),
+            Some("global" | "project")
+        )
         || !valid_mcp_transport(value.get("transport"))
         || !matches!(
             value.get("status").and_then(Value::as_str),
@@ -243,6 +260,10 @@ fn validate_mcp_test_result(value: &Map<String, Value>) -> Result<(), &'static s
     ensure_mcp_result_keys(&Value::Object(value.clone()))?;
     if !valid_mcp_id(value.get("mcpId"))
         || !valid_safe_name(value.get("name"))
+        || !matches!(
+            value.get("scope").and_then(Value::as_str),
+            Some("global" | "project")
+        )
         || !valid_mcp_transport(value.get("transport"))
         || !matches!(
             value.get("status").and_then(Value::as_str),
@@ -258,11 +279,11 @@ fn validate_mcp_test_result(value: &Map<String, Value>) -> Result<(), &'static s
 /// MCP list/test 共用严格字段闭集，防止 endpoint、参数或认证信息穿过 Native boundary。
 fn ensure_mcp_result_keys(value: &Value) -> Result<(), &'static str> {
     let object = value.as_object().ok_or("MCP result is not an object")?;
-    if object.len() != 5
+    if object.len() != 6
         || object.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "mcpId" | "name" | "transport" | "status" | "toolCount"
+                "mcpId" | "name" | "scope" | "transport" | "status" | "toolCount"
             )
         })
     {

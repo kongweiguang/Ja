@@ -19,15 +19,25 @@ public interface WorkspaceUseCase {
      */
     Workspace openWorkspace(OpenWorkspace command);
 
-    /**
-     * 由 Java 数据目录创建或重开唯一通用工作区，不接受客户端路径或身份。
-     */
-    Workspace openGeneralWorkspace();
+    /** Java 为新主 Thread 创建并登记唯一会话目录；同 Thread 重试只允许复用空目录。 */
+    Workspace createSessionWorkspace(String threadId);
+
+    /** Thread 持久化失败时只注销刚建且仍无引用的 SESSION 记录，不删除其空目录。 */
+    void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision);
+
+    /** 只按数据库登记身份重开 SESSION 或 LEGACY_SHARED，不允许客户端路径升级为身份。 */
+    Workspace openRegisteredWorkspace(String workspaceId);
 
     /**
      * 使用稳定键集游标列出持久化工作区。
      */
     CursorPage<Workspace> listWorkspaces(String cursor, int limit);
+
+    /** 可选 kind 由持久层先过滤再分页，避免大批 SESSION 抢占项目目录的首屏窗口。 */
+    default CursorPage<Workspace> listWorkspaces(String cursor, int limit, Workspace.Kind kind) {
+        if (kind != null) throw new UnsupportedOperationException("typed workspace listing is unavailable");
+        return listWorkspaces(cursor, limit);
+    }
 
     /**
      * 按持久化身份读取工作区，不隐式绑定文件能力。
@@ -57,7 +67,7 @@ public interface WorkspaceUseCase {
     /**
      * 只比较规范化路径，用于路由判断且不得产生文件系统副作用。
      */
-    boolean isGeneralWorkspace(Path root);
+    boolean isLegacySharedWorkspace(Path root);
 
     /**
      * 入站打开命令只承载业务输入，不携带 JSON、传输别名或宿主生成的 workspaceId。

@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Search } from "lucide-react";
+import { ExternalLink, MessageSquarePlus, Search } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type ReactElement,
-} from "react";
-import { EmptyState, ErrorState, LoadingState } from "@/shared/ui/primitives";
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  MenuItem,
+  MenuSeparator,
+  PointerContextMenu,
+} from "@/shared/ui/primitives";
 import type { FilesSearchResult } from "../application/types";
 import type { SearchPanelProps } from "./types";
 import "./SearchPanel.css";
@@ -34,59 +34,58 @@ export function SearchPanel({
 }: SearchPanelProps): ReactElement {
   const [localQuery, setLocalQuery] = useState(query ?? "");
   const [contextResult, setContextResult] = useState<{
-    result: FilesSearchResult;
+    resultId: string;
     x: number;
     y: number;
+    key: number;
   }>();
-  const contextMenuRef = useRef<HTMLDivElement>(null);
   const contextTriggerRef = useRef<HTMLButtonElement | undefined>(undefined);
+  const contextMenuSessionRef = useRef(0);
   useEffect(() => {
     if (query !== undefined) setLocalQuery(query);
   }, [query]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const effectiveQuery = query ?? localQuery;
+  const contextMenuResult =
+    contextResult === undefined
+      ? undefined
+      : results.find((result) => result.id === contextResult.resultId);
 
-  /** 搜索结果菜单只保存相对路径投影；关闭时不读取文件，也不改变当前编辑文档。 */
+  /** 搜索结果菜单只保存稳定结果 id；选中前从最新投影复核结果仍然存在。 */
   const closeContextMenu = useCallback((restoreFocus: boolean): void => {
     setContextResult(undefined);
     if (!restoreFocus) return;
-    window.requestAnimationFrame(() => contextTriggerRef.current?.focus());
+    window.requestAnimationFrame(() => {
+      if (contextTriggerRef.current?.isConnected) contextTriggerRef.current.focus();
+    });
   }, []);
+
+  /** 键盘与鼠标共享同一定位入口，每次开启都换 key 让 Radix 重新测量指针锚点。 */
+  const openResultContextMenu = useCallback(
+    (result: FilesSearchResult, x: number, y: number, trigger: HTMLButtonElement): void => {
+      if (onOpenResult === undefined && onAddToConversation === undefined) return;
+      contextTriggerRef.current = trigger;
+      contextMenuSessionRef.current += 1;
+      setContextResult({ resultId: result.id, x, y, key: contextMenuSessionRef.current });
+    },
+    [onAddToConversation, onOpenResult],
+  );
 
   useEffect(() => {
     if (contextResult === undefined) return undefined;
+    /** 窗口失焦后关闭临时菜单，避免恢复时把旧结果作为当前操作目标。 */
     const close = (): void => closeContextMenu(false);
-    document.addEventListener("pointerdown", close);
     window.addEventListener("blur", close);
     return () => {
-      document.removeEventListener("pointerdown", close);
       window.removeEventListener("blur", close);
     };
   }, [closeContextMenu, contextResult]);
 
-  /** 菜单进入视图后立即聚焦唯一命令，让鼠标右键与 Shift+F10 拥有同一键盘终点。 */
-  useLayoutEffect(() => {
-    if (contextResult === undefined) return;
-    const menu = contextMenuRef.current;
-    if (menu === null) return;
-    const bounds = menu.getBoundingClientRect();
-    const margin = 8;
-    const nextX = Math.max(
-      margin,
-      Math.min(contextResult.x, window.innerWidth - bounds.width - margin),
-    );
-    const nextY = Math.max(
-      margin,
-      Math.min(contextResult.y, window.innerHeight - bounds.height - margin),
-    );
-    if (nextX !== contextResult.x || nextY !== contextResult.y) {
-      setContextResult((current) =>
-        current === undefined ? current : { ...current, x: nextX, y: nextY },
-      );
-      return;
-    }
-    menu.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
-  }, [contextResult]);
+  useEffect(() => {
+    if (contextResult === undefined || contextMenuResult !== undefined) return;
+    /** 列表刷新移除了右键目标时关闭菜单，避免把操作应用到相似路径的新结果。 */
+    closeContextMenu(false);
+  }, [closeContextMenu, contextMenuResult, contextResult]);
   // TanStack Virtual 持有 Measurement 与 Scroll Math；其 API 明确暴露 React Compiler
   // 无法安全 Memoize 的命令式函数。
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -172,21 +171,30 @@ export function SearchPanel({
                     className="ja-search-result"
                     onClick={() => onOpenResult?.(result)}
                     onContextMenu={(event) => {
-                      if (onAddToConversation === undefined) return;
+                      if (onOpenResult === undefined && onAddToConversation === undefined) return;
                       event.preventDefault();
-                      contextTriggerRef.current = event.currentTarget;
-                      setContextResult({ result, x: event.clientX, y: event.clientY });
+                      event.stopPropagation();
+                      openResultContextMenu(
+                        result,
+                        event.clientX,
+                        event.clientY,
+                        event.currentTarget,
+                      );
                     }}
                     onKeyDown={(event) => {
                       if (
-                        onAddToConversation === undefined ||
+                        (onOpenResult === undefined && onAddToConversation === undefined) ||
                         (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10"))
                       )
                         return;
                       event.preventDefault();
                       const bounds = event.currentTarget.getBoundingClientRect();
-                      contextTriggerRef.current = event.currentTarget;
-                      setContextResult({ result, x: bounds.left + 24, y: bounds.bottom });
+                      openResultContextMenu(
+                        result,
+                        bounds.left + 24,
+                        bounds.bottom,
+                        event.currentTarget,
+                      );
                     }}
                   >
                     <span className="ja-search-result-path">{result.path}</span>
@@ -202,32 +210,47 @@ export function SearchPanel({
           </div>
         </div>
       ) : null}
-      {contextResult === undefined ? null : (
-        <div
-          ref={contextMenuRef}
-          className="ja-file-tree-context-menu"
-          role="menu"
-          aria-label={`${contextResult.result.path} 文件操作`}
-          style={{ left: contextResult.x, top: contextResult.y }}
-          onPointerDown={(event) => event.stopPropagation()}
-          onKeyDown={(event) => {
-            if (event.key !== "Escape") return;
-            event.preventDefault();
-            closeContextMenu(true);
+      {contextResult === undefined || contextMenuResult === undefined ? null : (
+        <PointerContextMenu
+          key={contextResult.key}
+          x={contextResult.x}
+          y={contextResult.y}
+          label={`${contextMenuResult.path} 文件操作`}
+          onOpenChange={(open) => {
+            if (!open) closeContextMenu(false);
           }}
+          onRestoreFocus={() => closeContextMenu(true)}
         >
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              const result = contextResult.result;
-              closeContextMenu(false);
-              onAddToConversation?.(result);
-            }}
-          >
-            添加到对话
-          </button>
-        </div>
+          {onOpenResult === undefined ? null : (
+            <MenuItem
+              onSelect={() => {
+                const result = contextMenuResult;
+                if (result === undefined) return;
+                closeContextMenu(false);
+                onOpenResult(result);
+              }}
+            >
+              <ExternalLink aria-hidden="true" />
+              <span>打开</span>
+            </MenuItem>
+          )}
+          {onOpenResult !== undefined && onAddToConversation !== undefined ? (
+            <MenuSeparator />
+          ) : null}
+          {onAddToConversation === undefined ? null : (
+            <MenuItem
+              onSelect={() => {
+                const result = contextMenuResult;
+                if (result === undefined) return;
+                closeContextMenu(false);
+                onAddToConversation(result);
+              }}
+            >
+              <MessageSquarePlus aria-hidden="true" />
+              <span>添加到对话</span>
+            </MenuItem>
+          )}
+        </PointerContextMenu>
       )}
     </div>
   );

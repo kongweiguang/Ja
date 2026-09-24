@@ -35,7 +35,7 @@ final class WorkspacePathServiceTest {
     @BeforeEach
     void setUp() {
         workspace = new Workspace("ws_test", temporaryDirectory, "Test",
-                Workspace.Trust.TRUSTED, 0);
+                Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, 0);
         workspaces = new RecordingWorkspaceUseCase(workspace);
         paths = new RecordingPathPort();
         service = new WorkspacePathService(workspaces, paths);
@@ -102,9 +102,21 @@ final class WorkspacePathServiceTest {
             throw new UnsupportedOperationException();
         }
 
-        /** 本测试不允许创建通用 Workspace。 */
+        /** 本测试不创建会话目录。 */
         @Override
-        public Workspace openGeneralWorkspace() {
+        public Workspace createSessionWorkspace(String threadId) {
+            throw new UnsupportedOperationException();
+        }
+
+        /** 本测试不执行 Thread 创建补偿。 */
+        @Override
+        public void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision) {
+            throw new UnsupportedOperationException();
+        }
+
+        /** 本测试不重开持久 session 或 legacy 根。 */
+        @Override
+        public Workspace openRegisteredWorkspace(String workspaceId) {
             throw new UnsupportedOperationException();
         }
 
@@ -147,9 +159,9 @@ final class WorkspacePathServiceTest {
             throw new UnsupportedOperationException();
         }
 
-        /** 本测试不判断通用目录。 */
+        /** 本测试不判断旧共享目录。 */
         @Override
-        public boolean isGeneralWorkspace(Path root) {
+        public boolean isLegacySharedWorkspace(Path root) {
             throw new UnsupportedOperationException();
         }
     }

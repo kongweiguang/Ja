@@ -21,7 +21,7 @@ import java.util.Objects;
  * 除一次性流式草稿外，每个持久化事务至多发布一个 Provider 中立的 Turn 事件。
  */
 public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.ModelStepCommitted,
-        TurnEvent.TextDelta, TurnEvent.ReasoningSummaryDelta, TurnEvent.ToolStarted,
+        TurnEvent.TextDelta, TurnEvent.ReasoningSummaryDelta, TurnEvent.RetryStarted, TurnEvent.ToolStarted,
         TurnEvent.ToolBatchCommitted,
         TurnEvent.ApprovalRequested, TurnEvent.ApprovalResolved, TurnEvent.InputQueueChanged,
         TurnEvent.InputConsumed, TurnEvent.MessagesReceived, TurnEvent.Terminal {
@@ -41,6 +41,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
                     value.text(), value.reasoningSummary(), value.modelRound(), value.usage(), value.toolCalls());
             case TextDelta value -> value;
             case ReasoningSummaryDelta value -> value;
+            case RetryStarted value -> new RetryStarted(replacement, value.attempt(), value.maxAttempts());
             case ToolStarted value -> new ToolStarted(replacement, value.callId(), value.ordinal());
             case ToolBatchCommitted value -> new ToolBatchCommitted(replacement,
                     value.results());
@@ -201,6 +202,17 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
             toolCalls = List.copyOf(Objects.requireNonNull(toolCalls, "toolCalls"));
             if (toolCalls.isEmpty()) {
                 throw new IllegalArgumentException("model step requires Tool calls");
+            }
+        }
+    }
+
+    /** 流失败后清空未提交草稿，并在下一次 Provider dispatch 前展示一次轻量重试状态。 */
+    record RetryStarted(Context context, int attempt, int maxAttempts) implements TurnEvent {
+        /** 只允许 session retry 的第二至第六次尝试，避免把取消或终态失败伪装成重试。 */
+        public RetryStarted {
+            Objects.requireNonNull(context, "context");
+            if (attempt < 2 || attempt > 6 || maxAttempts != 6) {
+                throw new IllegalArgumentException("invalid retry attempt");
             }
         }
     }

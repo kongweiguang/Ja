@@ -111,7 +111,8 @@ final class MybatisInstructionScopeRepositoryTest extends PersistenceTestSupport
         MybatisHistoryService history = database.history(store);
         Path root = temp.resolve(threadId).toAbsolutePath().normalize();
         history.register(new Workspace.Registration(
-                "ws_" + threadId, root, threadId, Workspace.Trust.TRUSTED, START));
+                "ws_" + threadId, root, threadId, Workspace.Trust.TRUSTED,
+                Workspace.Kind.PROJECT, null, START));
         store.createThread(new ConversationRepository.ThreadDefinition(
                 threadId, "ws_" + threadId, threadId, preferences(), START));
         assertTrue(history.readThread(threadId, null, 10).isPresent());

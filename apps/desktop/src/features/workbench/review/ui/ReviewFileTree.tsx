@@ -29,11 +29,16 @@ import {
   IconButton,
   Menu,
   MenuContent,
+  MenuItem,
   MenuItemIndicator,
   MenuRadioGroup,
   MenuRadioItem,
   MenuTrigger,
+  MenuSeparator,
+  PointerContextMenu,
 } from "@/shared/ui/primitives";
+import type { ReviewAction } from "../domain/types";
+import { actionLabel } from "../domain/model";
 import {
   buildReviewTreeRows,
   defaultExpandedReviewTree,
@@ -60,8 +65,19 @@ export interface ReviewFileTreeProps {
   readonly loading?: boolean;
   readonly emptyMessage?: string;
   readonly fileAriaLabel?: (file: ReviewTreeFile) => string;
+  readonly fileContextActions?: (file: ReviewTreeFile) => readonly ReviewAction[];
+  readonly onFileContextAction?: (file: ReviewTreeFile, action: ReviewAction) => void;
   readonly navigationState?: ReviewTreeNavigationState;
   readonly onNavigationStateChange?: (state: ReviewTreeNavigationState) => void;
+}
+
+interface FileContextMenuSession {
+  readonly sequence: number;
+  readonly fileId: string;
+  readonly layer: ReviewTreeFile["layer"];
+  readonly x: number;
+  readonly y: number;
+  readonly restoreFocus: () => void;
 }
 
 export interface ReviewTreeNavigationState {
@@ -91,7 +107,7 @@ function TreeFileIcon({ file }: { file: ReviewTreeFile }): ReactElement {
   return <Icon aria-hidden="true" />;
 }
 
-/** 文件行保持 32px 稳定节奏，并用原生 file id/layer 暴露跨层唯一测试合同。 */
+/** 文件行保持稳定节奏；右键只发出被点中文件意图，不改变当前 Diff 选择。 */
 function FileRow({
   row,
   selected,
@@ -100,6 +116,8 @@ function FileRow({
   fileAriaLabel,
   focusable,
   onFocus,
+  fallbackFocus,
+  onRequestContextMenu,
 }: {
   row: Extract<ReviewTreeRow, { kind: "file" }>;
   selected: boolean;
@@ -108,6 +126,13 @@ function FileRow({
   fileAriaLabel?: (file: ReviewTreeFile) => string;
   focusable: boolean;
   onFocus: () => void;
+  fallbackFocus: () => void;
+  onRequestContextMenu?: (
+    file: ReviewTreeFile,
+    x: number,
+    y: number,
+    restoreFocus: () => void,
+  ) => boolean;
 }): ReactElement {
   const layerLabel =
     row.file.layer === "staged"
@@ -143,6 +168,30 @@ function FileRow({
       style={{ "--ja-review-tree-depth": row.depth } as CSSProperties}
       onClick={() => onSelect(row.file)}
       onFocus={onFocus}
+      onContextMenu={(event) => {
+        const rowButton = event.currentTarget;
+        if (
+          onRequestContextMenu?.(row.file, event.clientX, event.clientY, () => {
+            if (rowButton.isConnected) rowButton.focus();
+            else fallbackFocus();
+          })
+        )
+          event.preventDefault();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+        const rowButton = event.currentTarget;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        if (
+          onRequestContextMenu?.(row.file, bounds.left, bounds.bottom, () => {
+            if (rowButton.isConnected) rowButton.focus();
+            else fallbackFocus();
+          })
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      }}
     >
       <span className="ja-review-tree-file-icon" data-status={row.file.status}>
         <TreeFileIcon file={row.file} />
@@ -222,6 +271,8 @@ export function ReviewFileTree({
   loading = false,
   emptyMessage = "当前范围没有变更。",
   fileAriaLabel,
+  fileContextActions,
+  onFileContextAction,
   navigationState,
   onNavigationStateChange,
 }: ReviewFileTreeProps): ReactElement {
@@ -247,6 +298,11 @@ export function ReviewFileTree({
   );
   const selectedRowId = rows.find((row) => row.kind === "file" && row.file.id === selectedId)?.id;
   const [focusedId, setFocusedId] = useState<string | undefined>(selectedRowId ?? rows[0]?.id);
+  const [contextMenuSession, setContextMenuSession] = useState<
+    FileContextMenuSession | undefined
+  >();
+  const contextMenuSessionRef = useRef<FileContextMenuSession | undefined>(undefined);
+  const contextMenuSequenceRef = useRef(0);
   const effectiveFocusedId = rows.some((row) => row.id === focusedId)
     ? focusedId
     : (selectedRowId ?? rows[0]?.id);
@@ -273,6 +329,82 @@ export function ReviewFileTree({
           lane: 0,
         }));
   const restoredScrollTop = navigationState?.scrollTop;
+  const contextMenuFile =
+    contextMenuSession === undefined
+      ? undefined
+      : files.find(
+          (file) =>
+            file.id === contextMenuSession.fileId && file.layer === contextMenuSession.layer,
+        );
+  const contextMenuActions =
+    contextMenuFile === undefined || fileContextActions === undefined
+      ? []
+      : fileContextActions(contextMenuFile);
+
+  /** 目标从最新投影中消失或失去权限时立即收起菜单，防止旧操作在后来复活。 */
+  useEffect(() => {
+    if (
+      contextMenuSession === undefined ||
+      (contextMenuFile !== undefined && contextMenuActions.length > 0)
+    )
+      return;
+    if (contextMenuSessionRef.current?.sequence === contextMenuSession.sequence) {
+      window.requestAnimationFrame(() => {
+        if (contextMenuSessionRef.current?.sequence !== contextMenuSession.sequence) return;
+        contextMenuSessionRef.current = undefined;
+        setContextMenuSession(undefined);
+      });
+    }
+  }, [contextMenuActions.length, contextMenuFile, contextMenuSession]);
+
+  /** 右键与键盘入口都冻结 file id/layer；真正执行前仍重查当前文件和可用 action。 */
+  const requestFileContextMenu = (
+    file: ReviewTreeFile,
+    x: number,
+    y: number,
+    restoreFocus: () => void,
+  ): boolean => {
+    if (fileContextActions === undefined || onFileContextAction === undefined) return false;
+    const currentFile = files.find(
+      (candidate) => candidate.id === file.id && candidate.layer === file.layer,
+    );
+    if (currentFile === undefined || fileContextActions(currentFile).length === 0) return false;
+    contextMenuSequenceRef.current += 1;
+    const nextSession: FileContextMenuSession = {
+      sequence: contextMenuSequenceRef.current,
+      fileId: currentFile.id,
+      layer: currentFile.layer,
+      x,
+      y,
+      restoreFocus,
+    };
+    contextMenuSessionRef.current = nextSession;
+    setContextMenuSession(nextSession);
+    return true;
+  };
+
+  /** 关闭只撤销对应菜单 generation，旧 portal 的 close 事件不能关闭新目标菜单。 */
+  const closeFileContextMenu = (session: FileContextMenuSession): void => {
+    if (contextMenuSessionRef.current?.sequence !== session.sequence) return;
+    contextMenuSessionRef.current = undefined;
+    setContextMenuSession(undefined);
+  };
+
+  /** 菜单项选择时按最新文件投影与 capability 复核，避免快照刷新后作用到旧行。 */
+  const applyFileContextAction = (action: ReviewAction): void => {
+    if (
+      contextMenuSession === undefined ||
+      fileContextActions === undefined ||
+      onFileContextAction === undefined
+    )
+      return;
+    const currentFile = files.find(
+      (candidate) =>
+        candidate.id === contextMenuSession.fileId && candidate.layer === contextMenuSession.layer,
+    );
+    if (currentFile === undefined || !fileContextActions(currentFile).includes(action)) return;
+    onFileContextAction(currentFile, action);
+  };
 
   /** 仅在外部恢复的滚动位置改变时同步 DOM，避免 ref 回调在每次渲染时抢回用户滚动。 */
   useEffect(() => {
@@ -441,6 +573,7 @@ export function ReviewFileTree({
         className="ja-review-tree-scroll"
         role="tree"
         aria-label="审查文件"
+        tabIndex={-1}
         onKeyDown={navigateTree}
         onScroll={(event) =>
           onNavigationStateChange?.({
@@ -484,6 +617,12 @@ export function ReviewFileTree({
                       fileAriaLabel={fileAriaLabel}
                       focusable={effectiveFocusedId === row.id}
                       onFocus={() => setFocusedId(row.id)}
+                      fallbackFocus={() => scrollRef.current?.focus()}
+                      onRequestContextMenu={
+                        fileContextActions === undefined || onFileContextAction === undefined
+                          ? undefined
+                          : requestFileContextMenu
+                      }
                     />
                   ) : (
                     <BranchRow
@@ -500,6 +639,31 @@ export function ReviewFileTree({
           </div>
         )}
       </div>
+      {contextMenuSession === undefined || contextMenuFile === undefined ? null : (
+        <PointerContextMenu
+          key={contextMenuSession.sequence}
+          x={contextMenuSession.x}
+          y={contextMenuSession.y}
+          label={`${contextMenuFile.path} 文件操作`}
+          onOpenChange={(open) => {
+            if (!open) closeFileContextMenu(contextMenuSession);
+          }}
+          onRestoreFocus={contextMenuSession.restoreFocus}
+        >
+          {contextMenuActions.flatMap((action, index) => [
+            ...(action === "revert" && index > 0
+              ? [<MenuSeparator key={`separator:${contextMenuSession.sequence}:${action}`} />]
+              : []),
+            <MenuItem
+              key={`${contextMenuSession.sequence}:${action}`}
+              style={action === "revert" ? { color: "var(--ja-danger)" } : undefined}
+              onSelect={() => applyFileContextAction(action)}
+            >
+              {actionLabel(action, { kind: "file", fileId: contextMenuFile.id })}
+            </MenuItem>,
+          ])}
+        </PointerContextMenu>
+      )}
     </section>
   );
 }

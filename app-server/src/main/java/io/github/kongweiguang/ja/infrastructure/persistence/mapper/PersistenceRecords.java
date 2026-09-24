@@ -64,10 +64,11 @@ public final class PersistenceRecords {
 
     /** Workspace 查询的固定列集合。 */
     public record WorkspaceRow(String workspaceId, String rootPath, String displayName, String trust,
-                        long revision, String updatedAt) { }
+                        long revision, String updatedAt, String kind, String legacySharedWorkspaceId) { }
 
     /** Thread 查询的固定列集合；首版 schema 强制模型偏好与标题来源完整。 */
-    public record ThreadRow(String threadId, String workspaceId, String title, String providerId,
+    public record ThreadRow(String threadId, String workspaceId, String title, String workspaceKind,
+                     String legacySharedWorkspaceId, String providerId,
                      String modelId, String reasoningLevel, String accessMode, String collaborationMode,
                      String titleSource,
                      long revision, String createdAt, String updatedAt, String pinnedAt, String archivedAt,
@@ -83,7 +84,9 @@ public final class PersistenceRecords {
                    String terminalSummary, String errorCode, String errorMessage, String cancelRequestedAt,
                    String cancelReason, Long cancelThreadRevision, Long cancelTurnMutationVersion,
                    long inputQueueRevision, boolean acceptingInputs,
-                   Long threadRevision, String changeSetJson) { }
+                   Long threadRevision, String changeSetJson, boolean currentPath,
+                   String sourceMessageId, String terminalMessageId) {
+    }
 
     /** Message 查询行保留数据库分配的稳定 ordinal。 */
     public record MessageRow(String messageId, String turnId, long ordinal, String role,
@@ -177,7 +180,7 @@ public final class PersistenceRecords {
     /** Turn/Tool/Approval 的复合身份参数。 */
     public record TurnKey(String threadId, String turnId) { }
     /** 新 Turn 只接纳 Operation 身份与时间，禁止把可热更新环境固化到 Turn。 */
-    public record TurnInsert(String turnId, String threadId, String occurredAt) { }
+    public record TurnInsert(String turnId, String threadId, String occurredAt, String sourceMessageId) { }
     /** 取消声明同时冻结当前 Thread/Turn 两级 CAS 事实。 */
     public record CancellationClaim(String threadId, String turnId, long expectedTurnMutationVersion,
                              String occurredAt, String reason, long cancelThreadRevision,
@@ -294,9 +297,9 @@ public final class PersistenceRecords {
 
     /** Workspace 注册插入参数。 */
     public record WorkspaceInsert(String workspaceId, String rootPath, String displayName, String trust,
-                           String occurredAt) { }
+                           String kind, String legacySharedWorkspaceId, String occurredAt) { }
     /** Workspace keyset 分页参数，首屏 cursor 字段允许 null。 */
-    public record WorkspacePage(String cursorTime, String cursorId, int limit) { }
+    public record WorkspacePage(String cursorTime, String cursorId, int limit, String kind) { }
     /** Workspace trust CAS 参数。 */
     public record WorkspaceTrustCas(String workspaceId, String trust, long expectedRevision,
                              String occurredAt) { }
@@ -314,9 +317,14 @@ public final class PersistenceRecords {
     /** Thread keyset 分页参数固定 Workspace，首屏 cursor 字段允许 null。 */
     public record ThreadPage(String workspaceId, Integer cursorPinned, String cursorSortTime,
                              String cursorUpdatedAt, String cursorId, int limit) { }
+    /** Session 主会话跨 Workspace 分页仍使用原 pinned/update keyset。 */
+    public record SessionThreadPage(Integer cursorPinned, String cursorSortTime, String cursorUpdatedAt,
+                                    String cursorId, int limit) { }
     /** Thread 标题搜索沿用更新时间 keyset，并把查询词固定为服务层归一化小写。 */
     public record ThreadSearch(String workspaceId, String normalizedQuery,
                                String cursorTime, String cursorId, int limit) { }
+    /** Session 聚合搜索独立于单 Workspace 项目查询，保留同一 updatedAt keyset。 */
+    public record SessionThreadSearch(String normalizedQuery, String cursorTime, String cursorId, int limit) { }
     /** 全局发现使用统一更新时间/身份 keyset，可选 Workspace 与标题 contains 过滤。 */
     public record ThreadDiscoveryPage(String workspaceId, String normalizedQuery,
                                       String cursorTime, String cursorId, int limit) { }

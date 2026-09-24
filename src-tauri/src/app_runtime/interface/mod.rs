@@ -19,12 +19,13 @@ pub use configuration::*;
 pub use dto::{
     RuntimeRecoveryStateDto, RuntimeStatusDto, ToolArtifactReadInputDto, ToolArtifactReadResultDto,
     ToolRecoveryResponseDto, TurnAcceptedDto, TurnCancelResultDto, TurnChangeSetReadInputDto,
-    TurnChangeSetReadResultDto, WorkspacePathSearchInputDto, WorkspacePathSearchResultDto,
+    TurnChangeSetReadResultDto, WorkspaceActivationDto, WorkspaceActivationInputDto,
+    WorkspaceKindDto, WorkspacePathSearchInputDto, WorkspacePathSearchResultDto,
 };
 pub use event_projection::RPC_FRAME_EVENT;
 pub use goal::*;
 pub use history::*;
-pub use history_model::WorkspaceWireDto;
+pub use history_model::{ThreadMcpReadInput, ThreadMcpStatusResult, WorkspaceWireDto};
 pub use runtime::*;
 pub use settings::*;
 pub use task::*;

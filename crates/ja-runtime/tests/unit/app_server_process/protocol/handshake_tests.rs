@@ -19,6 +19,7 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             "turn/state-changed",
             "turn/input-queue-changed",
             "turn/input-consumed",
+            "turn/retry-started",
             "turn/messages_received",
             "assistant/model-step-committed",
             "assistant/text-delta",
@@ -51,6 +52,21 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             .and_then(Value::as_array)
             .is_some_and(|methods| methods.iter().any(|method| method == "turn/start"))
     );
+    for expected_method in ["turn/continue", "turn/reask"] {
+        assert!(
+            capabilities
+                .get("methods")
+                .and_then(Value::as_array)
+                .is_some_and(|methods| methods.iter().any(|method| method == expected_method))
+        );
+    }
+    let expected_method = "thread/mcp/read";
+    assert!(
+        capabilities
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|method| method == expected_method))
+    );
     assert!(
         capabilities
             .get("methods")
@@ -61,11 +77,7 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
         capabilities
             .get("methods")
             .and_then(Value::as_array)
-            .is_some_and(|methods| {
-                methods
-                    .iter()
-                    .any(|method| method == "workspace/open-general")
-            })
+            .is_some_and(|methods| { methods.iter().any(|method| method == "workspace/open") })
     );
     assert!(
         capabilities
@@ -92,7 +104,11 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
     );
     assert_eq!(
         capabilities.get("features"),
-        Some(&serde_json::json!(["task_threads_v1", "plan_goal_v1", "interaction_v1"]))
+        Some(&serde_json::json!([
+            "task_threads_v1",
+            "plan_goal_v1",
+            "interaction_v1"
+        ]))
     );
     assert_eq!(
         capabilities.get("collaborationModes"),

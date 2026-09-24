@@ -49,6 +49,18 @@ function createTurnPort(): ConversationTurnPort {
       queued: true,
       threadRevision: expectedThreadRevision + 1,
     })),
+    continueTurn: vi.fn(async ({ threadId, expectedThreadRevision }) => ({
+      accepted: true as const,
+      turnId: `turn_continue_${threadId}`,
+      queued: true,
+      threadRevision: expectedThreadRevision + 1,
+    })),
+    reaskTurn: vi.fn(async ({ expectedThreadRevision }) => ({
+      accepted: true as const,
+      turnId: "turn_reask",
+      queued: true,
+      threadRevision: expectedThreadRevision + 1,
+    })),
     // 恢复决策仅确认持久裁决；fake 不把 retry/skip 误报成已经完成的 Tool 执行。
     respondToolRecovery: vi.fn(async ({ turnId, expectedThreadRevision, decision }) => ({
       accepted: true as const,
@@ -180,6 +192,10 @@ function options(
     ready: true,
     blocked: false,
     turnPort,
+    readThreadRevision: vi.fn(async (threadId: string) => {
+      const state = useTimelineStore.getState();
+      return state.threadRevisionByThread[threadId] ?? state.threads[threadId]?.revision ?? 0;
+    }),
     preferencesPort,
     ...overrides,
   };
@@ -2193,7 +2209,7 @@ describe("useConversationInteractionController", () => {
     expect(result.current.draft).toBe("");
   });
 
-  it("最新失败轮次以新消息续答，跳过 Plan 创建且失败后允许再次尝试", async () => {
+  it("最新失败问题通过隐藏 continuation 续答，不新增 USER 消息且失败后可再次尝试", async () => {
     prepareThread();
     useTimelineStore.getState().applySnapshot(
       {
@@ -2210,7 +2226,16 @@ describe("useConversationInteractionController", () => {
             changeSet: null,
           },
         ],
-        items: [],
+        items: [
+          {
+            itemId: "item_failed_question",
+            turnId: "turn_failed",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [{ type: "text", text: "原始问题" }],
+            attachments: [],
+          },
+        ],
         inputQueue: null,
         contextUsage: null,
         liveStream: null,
@@ -2222,7 +2247,7 @@ describe("useConversationInteractionController", () => {
     );
     const acknowledgement = deferred<ConversationAcceptedTurn>();
     const turnPort = createTurnPort();
-    vi.mocked(turnPort.submitTurn)
+    vi.mocked(turnPort.continueTurn)
       .mockImplementationOnce(() => acknowledgement.promise)
       .mockResolvedValueOnce({
         accepted: true,
@@ -2251,26 +2276,578 @@ describe("useConversationInteractionController", () => {
       first = result.current.continueReply();
       duplicate = result.current.continueReply();
     });
-    expect(turnPort.submitTurn).toHaveBeenCalledTimes(1);
-    expect(turnPort.submitTurn).toHaveBeenCalledWith({
+    await waitFor(() => expect(turnPort.continueTurn).toHaveBeenCalledTimes(1));
+    expect(turnPort.continueTurn).toHaveBeenCalledTimes(1);
+    expect(turnPort.continueTurn).toHaveBeenCalledWith({
       threadId: "thr_one",
-      content: [{ type: "text", text: "继续" }],
+      expectedThreadRevision: 4,
+      sourceMessageId: "item_failed_question",
     });
+    expect(turnPort.submitTurn).not.toHaveBeenCalled();
     expect(planCreationPort.create).not.toHaveBeenCalled();
 
     await act(async () => {
       acknowledgement.reject(new Error("connection lost"));
       await Promise.all([first, duplicate]);
     });
-    expect(result.current.localSubmissions).toEqual([
-      expect.objectContaining({ text: "继续", status: "failed" }),
-    ]);
+    expect(result.current.localSubmissions).toEqual([]);
     expect(result.current.continuationAvailable).toBe(true);
 
     await act(async () => result.current.continueReply());
-    expect(turnPort.submitTurn).toHaveBeenCalledTimes(2);
+    expect(turnPort.continueTurn).toHaveBeenCalledTimes(2);
     expect(result.current.activeTurn).toBe(true);
     expect(result.current.continuationAvailable).toBe(false);
+  });
+
+  /** 没有原始用户问题时不提供无效的继续动作，也不制造一条“继续”消息。 */
+  it("失败的内部 Turn 缺少用户问题时不显示继续", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_internal_failed",
+            sourceMessageId: null,
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, preferencesPort)),
+    );
+
+    expect(result.current.continuationAvailable).toBe(false);
+    await act(async () => result.current.continueReply());
+    expect(turnPort.continueTurn).not.toHaveBeenCalled();
+    expect(turnPort.submitTurn).not.toHaveBeenCalled();
+  });
+
+  /** 权威快照可能重编码 USER item，续答用稳定 Turn 校验并更新来源 ID。 */
+  it("继续前权威重读 revision 和来源 ID，不复用事件投影中的旧身份", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed",
+            sourceMessageId: null,
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_failed_question",
+            turnId: "turn_failed",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [{ type: "text", text: "原始问题" }],
+            attachments: [],
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const readThreadRevision = vi.fn(async (threadId: string) => {
+      // Event 与完整 thread/read 可给同一问题不同公开 ID；续答应采用重读后的来源。
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId,
+          revision: 5,
+          turns: [
+            {
+              turnId: "turn_failed",
+              sourceMessageId: null,
+              status: "failed",
+              requestedAt: "2026-08-28T00:00:01Z",
+              updatedAt: "2026-08-28T00:00:02Z",
+              completedAt: "2026-08-28T00:00:02Z",
+              errorCode: "MODEL_UNAVAILABLE",
+              changeSet: null,
+            },
+          ],
+          items: [
+            {
+              itemId: "item_authoritative_question",
+              turnId: "turn_failed",
+              kind: "user_input",
+              createdAt: "2026-08-28T00:00:01Z",
+              content: [{ type: "text", text: "原始问题" }],
+              attachments: [],
+            },
+          ],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          taskActivities: [],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+      return 5;
+    });
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(
+        options(turnPort, preferencesPort, { readThreadRevision }),
+      ),
+    );
+
+    await act(async () => result.current.continueReply());
+
+    expect(readThreadRevision).toHaveBeenCalledWith("thr_one");
+    expect(turnPort.continueTurn).toHaveBeenCalledWith({
+      threadId: "thr_one",
+      expectedThreadRevision: 5,
+      sourceMessageId: "item_authoritative_question",
+    });
+  });
+
+  it("权威重读发现最新问题已改变时不继续旧问题", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed",
+            sourceMessageId: null,
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_failed_question",
+            turnId: "turn_failed",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [{ type: "text", text: "旧问题" }],
+            attachments: [],
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const readThreadRevision = vi.fn(async (threadId: string) => {
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId,
+          revision: 5,
+          turns: [
+            {
+              turnId: "turn_failed",
+              sourceMessageId: null,
+              status: "failed",
+              requestedAt: "2026-08-28T00:00:01Z",
+              updatedAt: "2026-08-28T00:00:02Z",
+              completedAt: "2026-08-28T00:00:02Z",
+              errorCode: "MODEL_UNAVAILABLE",
+              changeSet: null,
+            },
+            {
+              turnId: "turn_newer",
+              sourceMessageId: null,
+              status: "failed",
+              requestedAt: "2026-08-28T00:00:03Z",
+              updatedAt: "2026-08-28T00:00:04Z",
+              completedAt: "2026-08-28T00:00:04Z",
+              errorCode: "MODEL_UNAVAILABLE",
+              changeSet: null,
+            },
+          ],
+          items: [
+            {
+              itemId: "item_failed_question",
+              turnId: "turn_failed",
+              kind: "user_input",
+              createdAt: "2026-08-28T00:00:01Z",
+              content: [{ type: "text", text: "旧问题" }],
+              attachments: [],
+            },
+            {
+              itemId: "item_newer_question",
+              turnId: "turn_newer",
+              kind: "user_input",
+              createdAt: "2026-08-28T00:00:03Z",
+              content: [{ type: "text", text: "新问题" }],
+              attachments: [],
+            },
+          ],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          taskActivities: [],
+          goalActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+      return 5;
+    });
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(
+        options(turnPort, preferencesPort, { readThreadRevision }),
+      ),
+    );
+
+    await act(async () => result.current.continueReply());
+
+    expect(readThreadRevision).toHaveBeenCalledOnce();
+    expect(turnPort.continueTurn).not.toHaveBeenCalled();
+    expect(result.current.error).toContain("无法继续");
+  });
+
+  it("取消的问题可继续；同一 Turn 多个 USER_INPUT 时仍不提供编辑", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_cancelled",
+            sourceMessageId: null,
+            status: "cancelled",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_cancelled_first",
+            turnId: "turn_cancelled",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [{ type: "text", text: "第一个问题" }],
+            attachments: [],
+          },
+          {
+            itemId: "item_cancelled_last",
+            turnId: "turn_cancelled",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01.500Z",
+            content: [{ type: "text", text: "最后一个问题" }],
+            attachments: [],
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, preferencesPort)),
+    );
+
+    expect(result.current.continuationAvailable).toBe(true);
+    expect(result.current.editableSourceMessageId).toBeUndefined();
+    await act(async () => result.current.continueReply());
+    expect(turnPort.continueTurn).toHaveBeenCalledWith({
+      threadId: "thr_one",
+      expectedThreadRevision: 4,
+      sourceMessageId: "item_cancelled_last",
+    });
+  });
+
+  it("重问复用原问题附件，CAS 冲突后安全重试并恢复先前草稿和焦点", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed_edit",
+            sourceMessageId: null,
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_failed_edit_question",
+            turnId: "turn_failed_edit",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [
+              { type: "attachment", attachmentId: "att_history" },
+              { type: "text", text: "原问题" },
+            ],
+            attachments: [
+              {
+                attachmentId: "att_history",
+                displayName: "原始截图.png",
+                sizeBytes: 2048,
+                mediaKind: "image",
+                mediaType: "image/png",
+              },
+            ],
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(useTimelineStore.getState().lastOutcome).toBe("applied");
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.reaskTurn).mockRejectedValueOnce({ code: "CONFLICT" });
+    const readThreadRevision = vi
+      .fn<(threadId: string) => Promise<number>>()
+      .mockResolvedValueOnce(4)
+      .mockImplementationOnce(async (threadId) => {
+        useTimelineStore.getState().recordThreadMetadataRevision(threadId, 5);
+        return 5;
+      });
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(
+        options(turnPort, preferencesPort, { readThreadRevision }),
+      ),
+    );
+    act(() => result.current.updateDraft("发送后恢复的草稿"));
+    expect(result.current.editableSourceMessageId).toBe("item_failed_edit_question");
+    act(() =>
+      result.current.editQuestion(useTimelineStore.getState().items["item_failed_edit_question"]!),
+    );
+
+    expect(result.current.editingQuestion).toBe(true);
+    expect(result.current.draft).toBe("原问题");
+    expect(result.current.draftRecoveryRevision).toBe(1);
+    expect(result.current.attachmentDraftItems).toEqual([
+      expect.objectContaining({
+        attachmentId: "att_history",
+        fileName: "原始截图.png",
+        historyBound: true,
+        state: "ready",
+      }),
+    ]);
+
+    await act(async () => result.current.send({ text: "重问的问题" }));
+
+    expect(readThreadRevision).toHaveBeenCalledTimes(2);
+    const reaskInput = {
+      threadId: "thr_one",
+      sourceMessageId: "item_failed_edit_question",
+      content: [
+        { type: "attachment", attachmentId: "att_history" },
+        { type: "text", text: "重问的问题" },
+      ],
+      projectionAttachments: [
+        {
+          attachmentId: "att_history",
+          displayName: "原始截图.png",
+          sizeBytes: 2048,
+          mediaKind: "image" as const,
+          mediaType: "image/png",
+        },
+      ],
+    };
+    expect(turnPort.reaskTurn).toHaveBeenNthCalledWith(1, {
+      ...reaskInput,
+      expectedThreadRevision: 4,
+    });
+    expect(turnPort.reaskTurn).toHaveBeenNthCalledWith(2, {
+      ...reaskInput,
+      expectedThreadRevision: 5,
+    });
+    expect(result.current.editingQuestion).toBe(false);
+    expect(result.current.draft).toBe("发送后恢复的草稿");
+    expect(result.current.attachmentDraftItems).toEqual([]);
+    expect(result.current.draftRecoveryRevision).toBe(2);
+  });
+
+  it("重问 CAS 冲突后只在完整重读仍指向同一问题时重试一次", async () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed_edit",
+            sourceMessageId: null,
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_failed_edit_question",
+            turnId: "turn_failed_edit",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [{ type: "text", text: "原问题" }],
+            attachments: [],
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const readThreadRevision = vi
+      .fn<(threadId: string) => Promise<number>>()
+      .mockResolvedValueOnce(4)
+      .mockImplementationOnce(async (threadId) => {
+        useTimelineStore.getState().recordThreadMetadataRevision(threadId, 5);
+        return 5;
+      });
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.reaskTurn).mockRejectedValueOnce({ code: "CONFLICT" });
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(
+        options(turnPort, preferencesPort, { readThreadRevision }),
+      ),
+    );
+    act(() =>
+      result.current.editQuestion(useTimelineStore.getState().items["item_failed_edit_question"]!),
+    );
+
+    await act(async () => result.current.send({ text: "修改后的问题" }));
+
+    expect(readThreadRevision).toHaveBeenCalledTimes(2);
+    expect(turnPort.reaskTurn).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        expectedThreadRevision: 4,
+        sourceMessageId: "item_failed_edit_question",
+      }),
+    );
+    expect(turnPort.reaskTurn).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        expectedThreadRevision: 5,
+        sourceMessageId: "item_failed_edit_question",
+      }),
+    );
+    expect(result.current.editingQuestion).toBe(false);
+  });
+
+  it("取消重问编辑恢复 Composer 原草稿并重新聚焦", () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_one",
+        revision: 4,
+        turns: [
+          {
+            turnId: "turn_failed_cancel_edit",
+            sourceMessageId: null,
+            status: "failed",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: "2026-08-28T00:00:02Z",
+            errorCode: "MODEL_UNAVAILABLE",
+            changeSet: null,
+          },
+        ],
+        items: [
+          {
+            itemId: "item_failed_cancel_edit",
+            turnId: "turn_failed_cancel_edit",
+            kind: "user_input",
+            createdAt: "2026-08-28T00:00:01Z",
+            content: [{ type: "text", text: "历史问题" }],
+            attachments: [],
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, preferencesPort)),
+    );
+    act(() => result.current.updateDraft("已有输入"));
+    act(() =>
+      result.current.editQuestion(useTimelineStore.getState().items["item_failed_cancel_edit"]!),
+    );
+    act(() => result.current.cancelEditQuestion());
+
+    expect(result.current.editingQuestion).toBe(false);
+    expect(result.current.draft).toBe("已有输入");
+    expect(result.current.editableSourceMessageId).toBe("item_failed_cancel_edit");
+    expect(result.current.draftRecoveryRevision).toBe(2);
   });
 
   it("草稿、Skill 引用或未完成附件存在时不允许失败轮次续答", async () => {
@@ -2307,7 +2884,7 @@ describe("useConversationInteractionController", () => {
     );
     act(() => result.current.updateDraft("保留的新问题"));
     await act(async () => result.current.continueReply());
-    expect(turnPort.submitTurn).not.toHaveBeenCalled();
+    expect(turnPort.continueTurn).not.toHaveBeenCalled();
   });
 
   it("提交失败保留消息级错误且不回填 Composer，并释放 single-flight 允许继续发送", async () => {

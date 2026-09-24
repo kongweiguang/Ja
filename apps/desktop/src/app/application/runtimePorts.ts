@@ -52,11 +52,13 @@ export interface RuntimeStorageInfo {
   lastBackup: string | null;
 }
 
-/** 无项目会话只消费 Java 签发的固定 workspace identity，不允许 renderer 合成。 */
-export interface GeneralWorkspace {
+/** Activation 只接受 Java workspace identity；rootPath 是 native canonical 输出，不是输入。 */
+export interface RuntimeWorkspaceActivation {
   workspaceId: string;
+  kind: "project" | "session" | "legacy_shared";
+  legacySharedWorkspaceId: string | null;
   displayName: string;
-  trust: "trusted";
+  trust: "trusted" | "untrusted";
   rootPath: string;
 }
 
@@ -82,6 +84,18 @@ export interface TurnAccepted {
 export interface TurnResumeInput {
   turnId: string;
   expectedThreadRevision: number;
+}
+
+/** 隐藏 continuation 只携带 CAS；问题关联仅用于本地即刻投影，wire 不接收 source id。 */
+export interface TurnContinueInput {
+  threadId: string;
+  expectedThreadRevision: number;
+}
+
+/** 修改只适用于当前路径的最后一个未答问题，由后端再次校验 source 与 revision。 */
+export interface TurnReaskInput extends TurnContinueInput {
+  sourceMessageId: string;
+  content: UserContentBlock[];
 }
 
 /** 未知 Tool 只允许用户明确重试或跳过；双 revision 与幂等键防止旧详情和重复点击改变新状态。 */
@@ -190,6 +204,7 @@ interface RuntimeMcpListResult {
   items: Array<{
     mcpId: string;
     name: string;
+    scope: "global" | "project";
     transport: "stdio" | "streamable_http";
     status: "healthy" | "available" | "degraded" | "unavailable" | "disabled" | "configured";
     toolCount: number;
@@ -200,6 +215,7 @@ interface RuntimeMcpListResult {
 interface RuntimeMcpTestResult {
   mcpId: string;
   name: string;
+  scope: "global" | "project";
   transport: "stdio" | "streamable_http";
   status: "healthy" | "available" | "degraded" | "unavailable";
   toolCount: number;
@@ -237,8 +253,11 @@ interface RuntimeSettingsOperations {
     params: { workspaceId?: string; cursor?: string; limit?: number };
     result: RuntimeSkillListResult;
   };
-  "mcp/list": { params: { cursor?: string; limit?: number }; result: RuntimeMcpListResult };
-  "mcp/test": { params: { mcpId: string }; result: RuntimeMcpTestResult };
+  "mcp/list": {
+    params: { workspaceId?: string; cursor?: string; limit?: number };
+    result: RuntimeMcpListResult;
+  };
+  "mcp/test": { params: { mcpId: string; workspaceId?: string }; result: RuntimeMcpTestResult };
   "model/test": {
     params: { providerId: string; modelId: string };
     result: RuntimeModelTestResult;
@@ -248,7 +267,7 @@ interface RuntimeSettingsOperations {
     result: RuntimeModelDiscoveryResult;
   };
   "mcp/list-tools": {
-    params: { mcpId: string; cursor?: string; limit?: number };
+    params: { mcpId: string; workspaceId?: string; cursor?: string; limit?: number };
     result: RuntimeMcpToolsResult;
   };
 }
@@ -290,6 +309,8 @@ interface RuntimeAcceptedTurnProjection {
   readonly turnId: string;
   readonly threadRevision: number;
   readonly submittedText: string;
+  /** 仅隐藏 continuation 设置此关联；普通/reask USER Turn 在服务端 projection 中为 null。 */
+  readonly sourceMessageId?: string;
   readonly submittedAttachments?: readonly AttachmentSummary[];
   readonly submittedAt: string;
 }
@@ -315,12 +336,14 @@ export interface RuntimeHostPort {
   stop(): Promise<RuntimeStatus>;
   state(): Promise<RuntimeStatus>;
   storageInfo(): Promise<RuntimeStorageInfo>;
-  generalWorkspace(): Promise<GeneralWorkspace>;
+  activateWorkspace(workspaceId: string): Promise<RuntimeWorkspaceActivation>;
   recoveryState(): Promise<RuntimeRecoveryState>;
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   turnResume(input: TurnResumeInput): Promise<TurnAccepted>;
+  turnContinue(input: TurnContinueInput): Promise<TurnAccepted>;
+  turnReask(input: TurnReaskInput): Promise<TurnAccepted>;
   turnRecoveryRespond(input: ToolRecoveryResponseInput): Promise<ToolRecoveryResponse>;
   turnCancel(input: TurnCancelInput): Promise<TurnCancelResult>;
   turnInputEnqueue(input: TurnInputEnqueue): Promise<InputQueueMutationResult>;

@@ -5,8 +5,10 @@ package io.github.kongweiguang.ja.platform.windows;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -18,7 +20,9 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -237,6 +241,158 @@ final class WindowsJobObjectTest {
                 () -> WindowsProcessLaunchPolicy.resolveExecutable(
                         "payload.txt", Map.of("PATH", temp.toString())));
         assertEquals(2, failure.error());
+    }
+
+    /** PATH 解析支持 Windows 的 PATHEXT 顺序，并将标准 npx shim 映射为不经 shell 的 Node argv。 */
+    @Test
+    @Timeout(value = 12, unit = TimeUnit.SECONDS)
+    void resolvesNodeAndStandardNpxFromHostPath(@TempDir Path temp) throws Exception {
+        Map<String, String> environment = System.getenv();
+        String node = WindowsProcessLaunchPolicy.resolveExecutable("node", environment);
+        assertTrue(node.toLowerCase(java.util.Locale.ROOT).endsWith("node.exe"));
+        Path firstNodeOnPath = firstPathRegularFile("node.exe", environment);
+        assertTrue(firstNodeOnPath.toString().equalsIgnoreCase(node),
+                "the first PATH Node must win after resolving its parent junction");
+
+        WindowsProcessLaunchPolicy.LaunchSpec npxSpec = WindowsProcessLaunchPolicy.validate(
+                List.of("npx", "--version"), temp, environment);
+        assertTrue(Path.of(npxSpec.command().getFirst()).toString().equalsIgnoreCase(firstNodeOnPath.toString()),
+                "standard npx shim should map to the PATH-selected sibling Node; argv=" + npxSpec.command());
+        assertTrue(npxSpec.command().get(1).toLowerCase(java.util.Locale.ROOT).endsWith("npx-cli.js"));
+        assertFalse(npxSpec.toString().contains("--version"), "launch diagnostics must not echo argv");
+        WindowsProcessLauncher.verifyExecutableAvailable(List.of("node", "--version"), temp, environment);
+        WindowsProcessLauncher.verifyExecutableAvailable(List.of("npx", "--version"), temp, environment);
+
+        String diagnostics = WindowsProcessLaunchPolicy.validate(
+                List.of("node"), temp, Map.of("MCP_TOKEN", "credential-value-fixture")).toString();
+        assertFalse(diagnostics.contains("credential-value-fixture"), "launch diagnostics must not expose Secrets");
+        assertFalse(diagnostics.contains("MCP_TOKEN"), "launch diagnostics must not expose environment names");
+
+        String nodeVersion = runVersion(List.of("node", "--version"), temp, environment);
+        assertTrue(nodeVersion.matches("v[0-9]+\\.[0-9]+\\.[0-9]+.*"),
+                "node should report a version from the inherited PATH");
+        String npxVersion = runVersion(List.of("npx", "--version"), temp, environment);
+        assertTrue(npxVersion.matches("[0-9]+\\.[0-9]+\\.[0-9]+.*"),
+                "standard npx CLI should run from the inherited PATH");
+    }
+
+    /** NVM active junction 只作为 PATH 目录别名解析，运行时继续使用物理目录中的首个 Node exe。 */
+    @Test
+    void resolvesNodeThroughNvmParentJunction(@TempDir Path temp) throws Exception {
+        Map<String, String> environment = System.getenv();
+        String nvmLinkValue = environment.entrySet().stream()
+                .filter(entry -> entry.getKey().equalsIgnoreCase("NVM_SYMLINK"))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(null);
+        assumeTrue(nvmLinkValue != null && !nvmLinkValue.isBlank());
+        Path nvmLink = Path.of(nvmLinkValue);
+        Path logicalNode = nvmLink.resolve("node.exe");
+        assumeTrue(Files.isRegularFile(logicalNode));
+        Path physicalDirectory = nvmLink.toRealPath();
+        assumeTrue(!nvmLink.toAbsolutePath().normalize().toString().equalsIgnoreCase(physicalDirectory.toString()));
+        Path physicalNode = physicalDirectory.resolve("node.exe").toRealPath();
+        assumeTrue(firstPathRegularFile("node.exe", environment).toString().equalsIgnoreCase(physicalNode.toString()));
+
+        String resolved = WindowsProcessLaunchPolicy.resolveExecutable("node", environment);
+
+        assertTrue(physicalNode.toString().equalsIgnoreCase(resolved),
+                "PATH resolution should return the NVM junction target, not a later Node installation");
+    }
+
+    /** PATHEXT 限制扩展名搜索；其它批处理脚本不能绕过只执行 exe 的边界。 */
+    @Test
+    void pathExtAndNonstandardCommandShimsFailClosed(@TempDir Path temp) throws Exception {
+        Path bin = temp.resolve("bin");
+        Files.createDirectories(bin);
+        Files.writeString(bin.resolve("node.exe"), "fixture", StandardCharsets.UTF_8);
+        Files.writeString(bin.resolve("npx.cmd"), "@echo off\r\necho not standard\r\n", StandardCharsets.UTF_8);
+        Files.writeString(bin.resolve("other.cmd"), "@echo off\r\n", StandardCharsets.UTF_8);
+        Map<String, String> environment = Map.of("Path", bin.toString(), "PATHEXT", ".CMD;.EXE");
+
+        IOException npxFailure = assertThrows(IOException.class,
+                () -> WindowsProcessLaunchPolicy.validate(List.of("npx", "--version"), temp, environment));
+        assertEquals("windows_process_npx_layout_invalid", npxFailure.getMessage());
+        WindowsProcessNativeApi.WindowsFailure commandFileFailure = assertThrows(
+                WindowsProcessNativeApi.WindowsFailure.class,
+                () -> WindowsProcessLaunchPolicy.resolveExecutable("other", environment));
+        assertEquals(2, commandFileFailure.error());
+
+        WindowsProcessNativeApi.WindowsFailure pathextFailure = assertThrows(
+                WindowsProcessNativeApi.WindowsFailure.class,
+                () -> WindowsProcessLaunchPolicy.resolveExecutable(
+                        "node", Map.of("PATH", bin.toString(), "PATHEXT", ".CMD")));
+        assertEquals(2, pathextFailure.error());
+    }
+
+    /** 标准 npx shim 仅经大小写不敏感 PATH/PATHEXT 精确发现，并映射为同目录 Node/npm CLI 字面 argv。 */
+    @Test
+    void mapsStandardNpxShimUsingCaseInsensitivePathAndPathExt(@TempDir Path temp) throws Exception {
+        Path bin = temp.resolve("bin");
+        Path node = bin.resolve("node.exe");
+        Path cli = bin.resolve("node_modules").resolve("npm").resolve("bin").resolve("npx-cli.js");
+        Files.createDirectories(cli.getParent());
+        Files.writeString(node, "fixture-node", StandardCharsets.UTF_8);
+        Files.writeString(cli, "fixture-cli", StandardCharsets.UTF_8);
+        Files.writeString(bin.resolve("npx.cmd"),
+                "@echo off\r\n\"%~dp0\\node.exe\" \"%~dp0\\node_modules\\npm\\bin\\npx-cli.js\" %*\r\n",
+                StandardCharsets.UTF_8);
+        Map<String, String> environment = Map.of("pAtH", bin.toString(), "pAtHeXt", ".CMD;.EXE");
+
+        WindowsProcessLaunchPolicy.LaunchSpec spec = WindowsProcessLaunchPolicy.validate(
+                List.of("npx", "--version"), temp, environment);
+
+        assertEquals(node.toRealPath().toString(), spec.command().get(0));
+        assertEquals(cli.toRealPath().toString(), spec.command().get(1));
+        assertEquals("--version", spec.command().get(2));
+    }
+
+    /** 环境变量大小写冲突不依赖 Map 遍历次序选择值，避免 PATH 被重复定义时预检查与启动漂移。 */
+    @Test
+    void launchPolicyRejectsCaseInsensitiveEnvironmentConflicts(@TempDir Path temp) {
+        Map<String, String> environment = Map.of("PATH", "C:\\first", "Path", "C:\\second");
+
+        IOException failure = assertThrows(IOException.class,
+                () -> WindowsProcessLaunchPolicy.validate(List.of("node"), temp, environment));
+
+        assertEquals("windows_process_environment_invalid", failure.getMessage());
+    }
+
+    /** 使用正式受控启动与 Job 清理验证命令预检查之后的实际 argv 执行结果。 */
+    @SuppressWarnings("PMD.CloseResource")
+    private static String runVersion(List<String> command, Path temp, Map<String, String> environment)
+            throws Exception {
+        try (WindowsJobObject job = WindowsJobObject.create()) {
+            Process process = WindowsProcessLauncher.launch(command, temp, environment, job);
+            try {
+                process.getOutputStream().close();
+                assertTrue(process.waitFor(5, TimeUnit.SECONDS), "version command must settle");
+                String stdout = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                String stderr = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+                assertEquals(0, process.exitValue(), "version command failed; stderrEmpty=" + stderr.isEmpty());
+                return stdout;
+            } finally {
+                WindowsProcessLauncher.close(process);
+            }
+        }
+    }
+
+    /** 按 PATH 顺序解析第一个普通文件的物理路径，固定父目录 junction 不改变命令优先级。 */
+    private static Path firstPathRegularFile(String fileName, Map<String, String> environment) throws IOException {
+        String path = environment.entrySet().stream()
+                .filter(entry -> entry.getKey().equalsIgnoreCase("PATH"))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse("");
+        for (String directory : path.split(";", -1)) {
+            if (directory.isBlank()) continue;
+            Path candidate = Path.of(directory).resolve(fileName);
+            if (!Files.exists(candidate, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(candidate)) continue;
+            BasicFileAttributes attributes = Files.readAttributes(
+                    candidate, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (attributes.isRegularFile() && !attributes.isOther()) return candidate.toRealPath();
+        }
+        throw new IOException("test_path_executable_unavailable");
     }
 
     /** 挂起创建前拒绝 junction 工作目录，确保物理路径固定不可绕过。 */

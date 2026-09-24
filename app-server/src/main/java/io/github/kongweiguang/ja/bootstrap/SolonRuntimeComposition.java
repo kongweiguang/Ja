@@ -35,7 +35,9 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationCa
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationTurnMcpSessionFactory;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.application.CatalogService;
+import io.github.kongweiguang.ja.catalog.application.ThreadMcpService;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.configuration.adapter.out.ConfigurationRuntimeAdapter;
 import io.github.kongweiguang.ja.configuration.application.ConfigurationApplicationService;
@@ -175,7 +177,7 @@ public final class SolonRuntimeComposition {
     public JaDatabase database() {
         if (AotSideEffectGuard.processing()) return null;
         AotSideEffectGuard.requireRuntimeIo();
-        return lifecycle.own(JaDatabase.open(DatabaseConfig.of(resolveDatabasePath())));
+        return lifecycle.own(JaDatabase.open(DatabaseConfig.of(resolveDatabasePath(), resolveHomePath())));
     }
 
     /** 发布供官方 MyBatis-Solon 适配器使用的具名数据源，AOT 阶段仅提供内存占位。 */
@@ -250,8 +252,9 @@ public final class SolonRuntimeComposition {
      */
     @Bean(value = "jaTurnMcpSessionFactory", typed = true)
     public GenerationTurnMcpSessionFactory turnMcpSessionFactory(ObjectMapper mapper,
-                                                                 GenerationCatalog catalog) {
-        return new GenerationTurnMcpSessionFactory(mapper, McpLimits.DEFAULT, catalog);
+                                                                 GenerationCatalog catalog,
+                                                                 ConfigurationGenerationPort configurations) {
+        return new GenerationTurnMcpSessionFactory(mapper, McpLimits.DEFAULT, catalog, configurations);
     }
 
     /** 发布只含 catalog 用例的应用边界，RPC 不直接持有 MCP 或 Skill adapter。 */
@@ -261,6 +264,17 @@ public final class SolonRuntimeComposition {
                                          ModelPort models,
                                          WorkspaceUseCase workspaces) {
         return new CatalogService(catalog, configurations, models, workspaces);
+    }
+
+    /** 复用唯一 Task ceiling owner 判定观测是否过期，读取路径不创建 MCP 连接。 */
+    @Bean(value = "jaThreadMcpUseCase", typed = true)
+    public ThreadMcpUseCase threadMcpUseCase(
+            MybatisHistoryService threads,
+            WorkspaceUseCase workspaces,
+            ConfigurationGenerationPort configurations,
+            GenerationCatalog catalog,
+            TaskAgentToolGateway taskTools) {
+        return new ThreadMcpService(threads, workspaces, configurations, catalog, taskTools);
     }
 
     /** Shell 只影响 Tool 集；预检失败时保留可用的配置、历史与 RPC 恢复面。 */
@@ -302,6 +316,7 @@ public final class SolonRuntimeComposition {
             ShellCapability shellCapability,
             GenerationCatalog catalog,
             GenerationTurnMcpSessionFactory turnMcpSessions,
+            JsonValueCodec argumentsCodec,
             AgentPromptSessionFactory promptSessions,
             @Inject(value = "jaAttachmentUseCase", required = true)
             io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase attachments,
@@ -309,7 +324,8 @@ public final class SolonRuntimeComposition {
             AgentCapabilityCatalog capabilities) {
         ConfigurationTurnRuntimeResolver resolver = new ConfigurationTurnRuntimeResolver(configurations, skills,
                 Path.of(System.getProperty("user.home"), ".agents", "skills"),
-                resolveHomePath().resolve("skills"), shellCapability, catalog, turnMcpSessions, promptSessions,
+                resolveHomePath().resolve("skills"), shellCapability, catalog, turnMcpSessions,
+                argumentsCodec, promptSessions,
                 attachmentReader(attachments), capabilities, taskTools);
         deferredRuntimeResolver.bind(resolver);
         return resolver;
@@ -344,10 +360,10 @@ public final class SolonRuntimeComposition {
         return new WorkspacePolicy();
     }
 
-    /** 冻结 Host 发布的数据目录，但直到 workspace/open-general 才执行目录 IO。 */
+    /** 冻结 Host 发布的数据目录和 Ja Home，session workspace 的根属于 Home 而非 data。 */
     @Bean(value = "jaWorkspaceDirectoryPort", typed = true)
     public WorkspaceDirectoryPort workspaceDirectoryPort() {
-        return new NioWorkspaceDirectoryAdapter(resolveDataPath());
+        return new NioWorkspaceDirectoryAdapter(resolveDataPath(), resolveHomePath());
     }
 
     /** 用窄端口把工作区预热委派给 Turn Resolver，不暴露配置租约或 MCP adapter。 */
@@ -728,12 +744,13 @@ public final class SolonRuntimeComposition {
         return modelFactory;
     }
 
-    /** 基于 Solon 持有的精确运行时 Bean 身份发布握手后视图工厂，避免复制服务对象图。 */
+    /** 基于 Solon 持有的精确运行时 Bean 身份发布 RPC 工厂，并绑定 Thread MCP 的会话级观测用例。 */
     @Bean(value = "jaRuntimeServicesFactory", typed = true)
     public RuntimeServicesFactory runtimeServicesFactory(
             WorkspaceUseCase workspaces,
             WorkspacePathSearchUseCase workspacePathSearch,
             MybatisHistoryService threads,
+            ThreadMcpUseCase threadMcp,
             TurnService turns,
             io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase compactions,
             InMemoryApprovalBroker approvals,
@@ -747,7 +764,8 @@ public final class SolonRuntimeComposition {
             io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase interactions) {
         if (AotSideEffectGuard.processing()) return null;
         return new RuntimeServicesFactory(
-                workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog, attachments,
+                workspaces, workspacePathSearch, threads, threadMcp, turns, compactions, approvals, catalog,
+                attachments,
                 attachmentPreviews, tasks, goals, interactions, lifecycle::close);
     }
 

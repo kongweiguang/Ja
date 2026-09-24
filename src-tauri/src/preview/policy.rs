@@ -7,13 +7,13 @@ use super::error::{PreviewError, PreviewErrorCode};
 use super::model::{NavigationSource, PreviewLimits, PreviewUrl};
 use url::Url;
 
-/// 首个 Preview 版本所需的唯一 navigation decision。
+/// 子 WebView 允许的 navigation decision。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewNavigationDecision {
     Allow { url: PreviewUrl },
 }
 
-/// 校验外部 HTTP(S) URL，不引入 browser automation policy。
+/// 校验外部 HTTP(S) 地址与受控本地文档地址，不引入 browser automation policy。
 #[derive(Debug, Clone)]
 pub struct PreviewPolicy {
     limits: PreviewLimits,
@@ -101,15 +101,71 @@ impl PreviewPolicy {
         Ok(PreviewUrl::from_normalized(normalized))
     }
 
+    /// 只为被点击的本地文件创建 child WebView；路径真实性与权限由 local-file resolver 再核实。
+    pub(crate) fn validate_file_url(&self, raw: &str) -> Result<PreviewUrl, PreviewError> {
+        self.validate_url_shape(raw)?;
+        let parsed =
+            Url::parse(raw).map_err(|_| PreviewError::new(PreviewErrorCode::UrlInvalid))?;
+        if parsed.scheme() != "file" || parsed.to_file_path().is_err() {
+            return Err(PreviewError::new(PreviewErrorCode::SchemeNotAllowed));
+        }
+        let normalized = parsed.to_string();
+        if normalized.len() > self.limits.max_url_bytes {
+            return Err(PreviewError::new(PreviewErrorCode::UrlTooLong));
+        }
+        Ok(PreviewUrl::from_normalized(normalized))
+    }
+
+    /// Snapshot/event 回读允许 HTTP(S)、已规整 file URL 和唯一空白页，但 command input 仍单独校验。
+    pub(crate) fn validate_wire_url(&self, raw: &str) -> Result<PreviewUrl, PreviewError> {
+        if raw == "about:blank" {
+            return Ok(PreviewUrl::from_normalized(raw.to_owned()));
+        }
+        if Url::parse(raw).is_ok_and(|url| url.scheme() == "file") {
+            return self.validate_file_url(raw);
+        }
+        self.validate_url(raw)
+    }
+
     /// 使用同一个 URL parser 重新校验用户或 redirect callback。
     pub fn navigation(
         &self,
         _source: NavigationSource,
         raw_url: &str,
+        allow_file: bool,
+        allow_blank: bool,
     ) -> Result<PreviewNavigationDecision, PreviewError> {
+        if raw_url == "about:blank" && allow_blank {
+            return Ok(PreviewNavigationDecision::Allow {
+                url: PreviewUrl::from_normalized(raw_url.to_owned()),
+            });
+        }
+        if allow_file && Url::parse(raw_url).is_ok_and(|url| url.scheme() == "file") {
+            return Ok(PreviewNavigationDecision::Allow {
+                url: self.validate_file_url(raw_url)?,
+            });
+        }
         Ok(PreviewNavigationDecision::Allow {
             url: self.validate_url(raw_url)?,
         })
+    }
+
+    /// 把控制字符与长度限制复用到 file URL，避免平台 URL parser 对异常字符作宽松修复。
+    fn validate_url_shape(&self, raw: &str) -> Result<(), PreviewError> {
+        if raw.len() > self.limits.max_url_bytes {
+            return Err(PreviewError::new(PreviewErrorCode::UrlTooLong));
+        }
+        if raw.is_empty() {
+            return Err(PreviewError::new(PreviewErrorCode::UrlInvalid));
+        }
+        if raw
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+            || raw.contains('\\')
+        {
+            return Err(PreviewError::new(PreviewErrorCode::UrlControlCharacter));
+        }
+        Ok(())
     }
 }
 

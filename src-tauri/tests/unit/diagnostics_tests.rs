@@ -82,3 +82,49 @@ fn formatter_omits_native_payloads_and_keeps_only_allowlisted_ui_codes() {
     assert!(!rendered.contains("sensitive payload"));
     assert!(!rendered.contains("prompt content"));
 }
+
+/// 验证启动诊断只保留安全的阶段、错误类别和数值代际，异常字段不会穿过 formatter。
+#[test]
+fn formatter_keeps_allowlisted_runtime_startup_diagnostics_only() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .event_format(RedactedEventFormat::default())
+        .with_writer(move || SharedWriter(Arc::clone(&writer_output)));
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(subscriber), || {
+        tracing::warn!(
+            target: "ja.diagnostics.runtime_startup",
+            phase = "supervisor_start",
+            variant = "codec_invalid_envelope",
+            generation = 41_u64,
+            path = %r"C:\private\prompt.txt",
+            ready_token = %"0123456789abcdef0123456789abcdef",
+            command = %"java --secret argument",
+            environment = %"API_KEY=private",
+            "runtime startup failed"
+        );
+        tracing::warn!(
+            target: "ja.diagnostics.runtime_startup",
+            phase = "unlisted_stage",
+            variant = "unlisted_variant",
+            generation = 42_u64,
+            path = %r"C:\private\unknown.txt",
+            "unknown startup classification"
+        );
+    });
+    let rendered = String::from_utf8(output.lock().expect("test log sink poisoned").clone())
+        .expect("formatter must emit UTF-8");
+
+    assert!(
+        rendered.contains("phase=supervisor_start variant=codec_invalid_envelope generation=41")
+    );
+    assert!(rendered.contains("generation=42"));
+    assert!(!rendered.contains("unlisted_stage"));
+    assert!(!rendered.contains("unlisted_variant"));
+    assert!(!rendered.contains("private"));
+    assert!(!rendered.contains("0123456789abcdef"));
+    assert!(!rendered.contains("java --secret"));
+    assert!(!rendered.contains("API_KEY"));
+    assert!(!rendered.contains("runtime startup failed"));
+}

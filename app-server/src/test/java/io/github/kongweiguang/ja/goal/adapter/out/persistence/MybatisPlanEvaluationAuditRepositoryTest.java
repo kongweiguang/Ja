@@ -187,7 +187,7 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
     /** 允许 SQLite fixture 显式写入缺失预算，验证严格执行策略而非测试默认值。 */
     private Fixture fixture(String name, Integer maxModelRounds, Long wallBudgetMillis,
                             String runStatus, int pauseRequested) throws Exception {
-        JaDatabase database = JaDatabase.open(DatabaseConfig.of(temp.resolve(name + ".sqlite3")));
+        JaDatabase database = JaDatabase.open(DatabaseConfig.of(temp.resolve(name + ".sqlite3"), temp));
         Configuration configuration = new Configuration(new Environment("plan-evaluation-test",
                 new JdbcTransactionFactory(), database.dataSource()));
         configuration.setMapUnderscoreToCamelCase(false);

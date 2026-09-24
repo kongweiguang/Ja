@@ -4,7 +4,6 @@
 package io.github.kongweiguang.ja.conversation.application.loop;
 
 import io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker;
-import io.github.kongweiguang.ja.conversation.application.discovery.McpToolSearch;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.application.cancellation.CancellationCoordinator;
 import io.github.kongweiguang.ja.conversation.application.cancellation.DefaultCancellationCoordinator;
@@ -36,13 +35,16 @@ import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
 import io.github.kongweiguang.ja.conversation.port.out.GoalToolExecutionPort;
+import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
 import io.github.kongweiguang.ja.conversation.port.out.ToolPolicy;
 import io.github.kongweiguang.ja.conversation.port.out.TurnToolSessionFactory;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
-import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.foundation.json.JsonArray;
+import io.github.kongweiguang.ja.foundation.json.JsonNull;
+import io.github.kongweiguang.ja.foundation.json.JsonObject;
+import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.foundation.json.JsonText;
 import io.github.kongweiguang.ja.support.FixedAgentPromptSession;
 import io.github.kongweiguang.ja.support.TestJsonValueCodec;
@@ -118,11 +120,15 @@ final class AgentToolRunnerTest {
         }
     }
 
-    /** 可信内核搜索在审批模式下直接执行，但同批真实 MCP 调用仍必须进入用户审批。 */
+    /** 固定 mcp 入口按 action 应用权限：本地状态无审批，真实调用仍进入用户审批。 */
     @Test
-    void trustedSearchSkipsApprovalButMcpStillWaits() throws Exception {
-        SearchMcpTool mcpTool = new SearchMcpTool("mcp_action");
-        McpToolSearch search = new McpToolSearch(List.of(mcpTool), new TestJsonValueCodec());
+    void mcpGatewayStatusSkipsApprovalButCallWaits() throws Exception {
+        McpGatewayFixture fixture = mcpGatewayFixture();
+        McpAgentTool gateway = fixture.tool();
+        AgentTool.Invocation status = new AgentTool.Invocation("call_status", "mcp",
+                mcpAction("status", null, null, null, null), 0);
+        AgentTool.Invocation call = new AgentTool.Invocation("call_remote", "mcp",
+                mcpAction("call", "server_files", "read_file", "{\"value\":\"ok\"}", null), 1);
         List<List<ConversationRepository.Fact>> commits = new ArrayList<>();
 
         try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
@@ -130,58 +136,63 @@ final class AgentToolRunnerTest {
              AgentToolRunner runner = runner(broker)) {
             // Broker 只在拒绝已持久化后唤醒等待者，测试不能用未绑定存储的取消冒充审批结果。
             broker.bindDecisionStore((approvalId, decision, resolvedAt) -> decision == ApprovalDecision.DENY);
-            AgentToolRunner.Execution execution = runnerExecutionWithBindings(plan(search),
-                    Map.of(McpToolSearch.NAME, search, "mcp_action", mcpTool),
-                    Map.of("call_search", toolBinding("call_search", search),
-                            "call_mcp", toolBinding("call_mcp", mcpTool)),
+            AgentToolRunner.Execution execution = runnerExecutionWithBindings(plan(gateway),
+                    Map.of("mcp", gateway),
+                    Map.of("call_status", toolBinding(status.callId(), gateway, status),
+                            "call_remote", toolBinding(call.callId(), gateway, call)),
                     (target, event, facts, next) -> commits.add(List.copyOf(facts)));
             CompletableFuture<List<AgentTool.ToolResult>> result = CompletableFuture.supplyAsync(() ->
-                    runner.execute(execution, List.of(
-                            new AgentTool.Invocation("call_search", McpToolSearch.NAME,
-                                    JsonObjects.builder().putText("query", "").build(), 0),
-                            new AgentTool.Invocation("call_mcp", "mcp_action",
-                                    JsonObjects.builder().build(), 1))));
+                    runner.execute(execution, List.of(status, call)));
 
             awaitPendingRegistration(broker);
-            assertEquals(0, mcpTool.executions.get());
+            assertEquals(0, fixture.gateway().callExecutions.get());
             broker.cancelTurn("thr_test", "turn_test", "deny MCP fixture");
             List<AgentTool.ToolResult> results = result.get(1, TimeUnit.SECONDS);
 
             assertEquals(ToolOutcome.SUCCEEDED, results.get(0).outcome());
+            assertTrue(results.get(0).content().contains("server_files"));
             assertEquals(ToolOutcome.FAILED, results.get(1).outcome());
             assertEquals("TOOL_DENIED", results.get(1).errorCode());
+            assertEquals(0, fixture.gateway().callExecutions.get());
             assertTrue(commits.size() >= 2);
+            assertEquals("server_files", gateway.bindingDescriptor(call).serverId());
+            assertEquals("read_file", gateway.bindingDescriptor(call).remoteName());
         }
     }
 
-    /** 同名但非可信实现不能借用 tool_search 名称绕过审批，权限判断必须依赖真实类型。 */
-    @Test
-    void mcpToolNamedToolSearchStillRequiresApproval() throws Exception {
-        SearchMcpTool spoof = new SearchMcpTool(McpToolSearch.NAME);
-        List<List<ConversationRepository.Fact>> commits = new ArrayList<>();
+    /** 以固定非空 MCP 目录构造生产适配器，让审批回归真实覆盖可信实例判定。 */
+    private static McpGatewayFixture mcpGatewayFixture() {
+        TestJsonValueCodec codec = new TestJsonValueCodec();
+        JsonObject remoteSchema = JsonObjects.builder().putText("type", "object")
+                .put("properties", JsonObjects.builder().put("value", JsonObjects.builder()
+                        .putText("type", "string").build()).build())
+                .put("required", new JsonArray(List.of(new JsonText("value"))))
+                .putBoolean("additionalProperties", false).build();
+        ToolSpec remoteSpec = new ToolSpec("mcp:server_files:read_file", "Read a file", remoteSchema);
+        McpGateway.McpSnapshot snapshot = new McpGateway.McpSnapshot("catalog_fixture",
+                List.of(new McpGateway.McpTool("server_files", "read_file", remoteSpec)), NOW);
+        McpGateway.RouteIdentity route = new McpGateway.RouteIdentity(remoteSpec.name(), "server_files",
+                "read_file", "definition_server_files", "a".repeat(64), "b".repeat(64), snapshot.revision());
+        RecordingMcpGateway gateway = new RecordingMcpGateway(snapshot);
+        McpAgentTool tool = (McpAgentTool) McpAgentTool.adapt(gateway, snapshot,
+                Map.of(remoteSpec.name(), route), codec, new NetworkntToolArgumentValidation(codec)).getFirst();
+        return new McpGatewayFixture(gateway, tool);
+    }
 
-        try (InMemoryApprovalBroker broker = new InMemoryApprovalBroker(
-                CLOCK, 8, 32, Duration.ofMinutes(10));
-             AgentToolRunner runner = runner(broker)) {
-            // 保留 persist-before-wake 语义，确保下面观察到的是明确拒绝而非等待超时。
-            broker.bindDecisionStore((approvalId, decision, resolvedAt) -> decision == ApprovalDecision.DENY);
-            AgentToolRunner.Execution execution = runnerExecutionWithBindings(plan(spoof),
-                    Map.of(McpToolSearch.NAME, spoof),
-                    Map.of("call_spoof", toolBinding("call_spoof", spoof)),
-                    (target, event, facts, next) -> commits.add(List.copyOf(facts)));
-            CompletableFuture<List<AgentTool.ToolResult>> result = CompletableFuture.supplyAsync(() ->
-                    runner.execute(execution, List.of(new AgentTool.Invocation(
-                            "call_spoof", McpToolSearch.NAME, JsonObjects.builder().build(), 0))));
+    /** 构造固定必填网关 Schema 形状，供状态与远端调用共用。 */
+    private static JsonObject mcpAction(String action, String serverId, String toolName,
+                                        String argumentsJson, Integer offset) {
+        return JsonObjects.builder().putText("action", action)
+                .put("serverId", nullableText(serverId)).put("toolName", nullableText(toolName))
+                .put("query", JsonNull.INSTANCE)
+                .put("offset", offset == null ? JsonNull.INSTANCE
+                        : new io.github.kongweiguang.ja.foundation.json.JsonNumber(offset))
+                .put("argumentsJson", nullableText(argumentsJson)).build();
+    }
 
-            awaitPendingRegistration(broker);
-            assertEquals(0, spoof.executions.get());
-            broker.cancelTurn("thr_test", "turn_test", "deny spoof fixture");
-            AgentTool.ToolResult denied = result.get(1, TimeUnit.SECONDS).getFirst();
-
-            assertEquals(ToolOutcome.FAILED, denied.outcome());
-            assertEquals("TOOL_DENIED", denied.errorCode());
-            assertTrue(commits.size() >= 1);
-        }
+    /** 显式保留可空必填字段，使测试输入与真实 Provider 调用一致。 */
+    private static io.github.kongweiguang.ja.foundation.json.JsonValue nullableText(String value) {
+        return value == null ? JsonNull.INSTANCE : new JsonText(value);
     }
 
     /** Schema 参数错误只生成可操作 ToolResult，不得触达需要副作用的 Tool 实现。 */
@@ -893,6 +904,16 @@ final class AgentToolRunnerTest {
                 AccessMode.APPROVAL_REQUIRED);
     }
 
+    /** 冻结单次 action 真实路由，验证网关工具名不会替代持久服务与远端身份。 */
+    private static ConversationRepository.ToolBinding toolBinding(
+            String callId, AgentTool tool, AgentTool.Invocation invocation) {
+        AgentTool.ToolBindingDescriptor descriptor = tool.bindingDescriptor(invocation);
+        return new ConversationRepository.ToolBinding("batch_fixture", callId,
+                descriptor.routeKind(), descriptor.localName(), descriptor.serverId(), descriptor.remoteName(),
+                descriptor.schemaHash(), descriptor.routeHash(), "c".repeat(64),
+                AccessMode.APPROVAL_REQUIRED);
+    }
+
     /** 构造需要逐次审批的冻结 Turn 计划，审批只能由 Runner 内核处理。 */
     private static TurnExecutionPlan plan(AgentTool tool) {
         return plan(tool, Path.of("C:/workspace"));
@@ -1004,40 +1025,44 @@ final class AgentToolRunnerTest {
         }
     }
 
-    /** MCP 搜索审批回归使用的最小远端 Tool，名称可切换为伪装的 tool_search。 */
-    private static final class SearchMcpTool implements AgentTool {
-        private final ToolSpec spec;
-        private final ToolBindingDescriptor binding;
-        private final AtomicInteger executions = new AtomicInteger();
+    /** 将真实生产 Adapter 与确定性传输夹具成对保存，便于精确断言。 */
+    private record McpGatewayFixture(RecordingMcpGateway gateway, McpAgentTool tool) { }
 
-        /** 只提供空对象参数，测试重点是路由类型和审批边界而不是业务 Schema。 */
-        private SearchMcpTool(String name) {
-            this.spec = new ToolSpec(name, "MCP fixture tool",
-                    JsonObjects.builder().putText("type", "object")
-                            .putBoolean("additionalProperties", false).build());
-            this.binding = new ToolBindingDescriptor(RouteKind.MCP, name, "fixture_mcp", name,
-                    "a".repeat(64), "b".repeat(64));
+    /** 只记录远端调用；本地状态动作必须留在 Adapter 冻结快照内。 */
+    private static final class RecordingMcpGateway implements McpGateway {
+        private final McpSnapshot snapshot;
+        private final AtomicInteger callExecutions = new AtomicInteger();
+
+        /** 冻结生成生产 Adapter 路由描述时使用的同一个快照。 */
+        private RecordingMcpGateway(McpSnapshot snapshot) {
+            this.snapshot = snapshot;
         }
 
-        /** 返回固定 MCP Tool 描述，避免测试通过 Builtin 默认路由误判。 */
+        /** 返回本地调用共用的不可变请求目录。 */
         @Override
-        public ToolSpec spec() {
-            return spec;
+        public McpSnapshot snapshot() {
+            return snapshot;
         }
 
-        /** 显式声明远端 MCP 路由，覆盖按类型而非名称的审批豁免。 */
+        /** 只计数真实远端调用，用于证明审批拒绝未越过传输边界。 */
         @Override
-        public ToolBindingDescriptor bindingDescriptor() {
-            return binding;
+        public CompletionStage<McpResult> invoke(McpSnapshot requested, McpInvocation invocation,
+                                                  CancellationToken cancellationToken) {
+            if (requested != snapshot) throw new AssertionError("MCP request snapshot changed");
+            callExecutions.incrementAndGet();
+            return CompletableFuture.completedFuture(new McpResult(false, "remote fixture result",
+                    Optional.empty(), ToolOutcome.SUCCEEDED));
         }
 
-        /** 记录真正越过审批边界的调用；拒绝路径必须保持零执行。 */
+        /** 提供真实 Adapter 从内存读取的固定服务状态。 */
         @Override
-        public CompletionStage<ToolResult> execute(Invocation invocation, ExecutionContext context,
-                                                    CancellationToken cancellationToken) {
-            executions.incrementAndGet();
-            return CompletableFuture.completedFuture(ToolResult.success("mcp-fixture"));
+        public List<McpServerStatus> serverStatuses() {
+            return List.of(new McpServerStatus("server_files", "Files", "available", 1, null));
         }
+
+        /** 夹具不持有 Session 或进程资源，关闭保持无副作用。 */
+        @Override
+        public void close() { }
     }
 
     /** 记录真正执行次数，证明审批未提交前不会越过外部副作用边界。 */

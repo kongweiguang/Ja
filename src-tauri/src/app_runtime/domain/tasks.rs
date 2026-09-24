@@ -7,6 +7,7 @@
 //! Mailbox 或 observation 的第二份权威状态。
 
 use super::commands::{DomainValidationError, TurnContentPart, validate_turn_content};
+use super::projections::WorkspaceKind;
 use super::{valid_frozen_turn_id, valid_protocol_id};
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -350,6 +351,8 @@ pub struct TaskContextPreviewItem {
 pub struct TaskThreadSummary {
     pub thread_id: String,
     pub workspace_id: String,
+    pub workspace_kind: WorkspaceKind,
+    pub legacy_shared_workspace_id: Option<String>,
     pub active_goal_id: Option<String>,
     pub preferences: Option<TaskThreadPreferences>,
     pub title: String,

@@ -84,7 +84,6 @@ final class TurnAccessModeCompositionTest {
             assertEquals(ConfigurationUseCase.LayerStatus.VALID, configuration.read(null).user().status());
             configuration.setCredential("cred_mode", "isolated-test-key", configuration.read(null).credentialVersion());
             WorkspaceUseCase workspaces = Solon.context().getBean(WorkspaceUseCase.class);
-            var workspace = workspaces.openGeneralWorkspace();
             ThreadUseCase threads = Solon.context().getBean(ThreadUseCase.class);
             int calls = 0;
             for (AccessMode requested : AccessMode.values()) {
@@ -95,10 +94,13 @@ final class TurnAccessModeCompositionTest {
                         configuration.read(null).effective().properties().get("default_access_mode"));
                 String suffix = requested.name().toLowerCase(Locale.ROOT);
                 String turnId = "turn_mode_" + suffix;
+                String threadId = "thr_mode_" + suffix;
+                var workspace = workspaces.createSessionWorkspace(threadId);
+                assertEquals(workspace, workspaces.requireOpenWorkspace(workspace.workspaceId()));
                 var preferences = new ThreadPreferences("provider_mode", "model_mode", null, requested,
                         CollaborationMode.DEFAULT, ThreadPreferences.TitleSource.PLACEHOLDER);
                 var thread = threads.createThread(new ThreadSummary.Creation(
-                        "thr_mode_" + suffix, workspace.workspaceId(), "New thread", preferences, Instant.now()));
+                        threadId, workspace.workspaceId(), "New thread", preferences, Instant.now()));
                 TurnRuntimeResolver resolver = Solon.context().getBean(TurnRuntimeResolver.class);
                 try (var lease = resolver.resolve(new TurnRuntimeRequest(thread.threadId(), turnId, workspace.root(),
                         workspace.workspaceId(), "provider_mode", "model_mode", null, requested,

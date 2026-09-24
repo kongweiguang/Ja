@@ -80,31 +80,75 @@ impl From<TurnStartInputDto> for domain::TurnStartInput {
     fn from(value: TurnStartInputDto) -> Self {
         Self {
             thread_id: value.thread_id,
-            content: value
-                .content
-                .into_iter()
-                .map(|part| match part {
-                    TurnContentPartDto::Text { text } => domain::TurnContentPart::Text { text },
-                    TurnContentPartDto::Attachment { attachment_id } => {
-                        domain::TurnContentPart::Attachment { attachment_id }
-                    }
-                    TurnContentPartDto::WorkspaceReference {
-                        workspace_id,
-                        relative_path,
-                        kind,
-                    } => domain::TurnContentPart::WorkspaceReference {
-                        workspace_id,
-                        relative_path,
-                        kind,
-                    },
-                    TurnContentPartDto::SkillReference { skill_id } => {
-                        domain::TurnContentPart::SkillReference { skill_id }
-                    }
-                })
-                .collect(),
+            content: map_turn_content(value.content),
             deadline_ms: value.deadline_ms,
         }
     }
+}
+
+/// Continue DTO 只接受 revision fence；源问题由服务端选择，renderer 不能改写隐藏 continuation 的历史锚点。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TurnContinueInputDto {
+    pub thread_id: String,
+    pub expected_thread_revision: u64,
+}
+
+impl From<TurnContinueInputDto> for domain::TurnContinueInput {
+    /// 保持 command 映射为字段搬运；当前路径资格仍由 Java CAS 判定。
+    fn from(value: TurnContinueInputDto) -> Self {
+        Self {
+            thread_id: value.thread_id,
+            expected_thread_revision: value.expected_thread_revision,
+        }
+    }
+}
+
+/// Reask 携带精确源 USER item 和替换内容；拒绝未知字段，避免 renderer 注入分支、执行状态或文件控制数据。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TurnReaskInputDto {
+    pub thread_id: String,
+    pub expected_thread_revision: u64,
+    pub source_message_id: String,
+    pub content: Vec<TurnContentPartDto>,
+}
+
+impl From<TurnReaskInputDto> for domain::TurnReaskInput {
+    /// 内容复用冻结的 Turn 联合类型；源 item 是否仍为最后一个未答问题只由 Java 判定。
+    fn from(value: TurnReaskInputDto) -> Self {
+        Self {
+            thread_id: value.thread_id,
+            expected_thread_revision: value.expected_thread_revision,
+            source_message_id: value.source_message_id,
+            content: map_turn_content(value.content),
+        }
+    }
+}
+
+/// Start 与 Reask 共用一个闭集映射，防止附件与引用语义出现分叉。
+fn map_turn_content(content: Vec<TurnContentPartDto>) -> Vec<domain::TurnContentPart> {
+    content
+        .into_iter()
+        .map(|part| match part {
+            TurnContentPartDto::Text { text } => domain::TurnContentPart::Text { text },
+            TurnContentPartDto::Attachment { attachment_id } => {
+                domain::TurnContentPart::Attachment { attachment_id }
+            }
+            TurnContentPartDto::WorkspaceReference {
+                workspace_id,
+                relative_path,
+                kind,
+            } => domain::TurnContentPart::WorkspaceReference {
+                workspace_id,
+                relative_path,
+                kind,
+            },
+            TurnContentPartDto::SkillReference { skill_id } => {
+                domain::TurnContentPart::SkillReference { skill_id }
+            }
+        })
+        .collect()
 }
 
 impl From<domain::TurnContentPart> for TurnContentPartDto {
@@ -436,24 +480,55 @@ impl From<domain::RuntimeStorageInfo> for RuntimeStorageInfoDto {
     }
 }
 
-/// Java-owned 通用 Workspace 的 Tauri 投影；路径仅用于展示，不是原生 capability。
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GeneralWorkspaceDto {
+/// Renderer may request activation by Java ID only; physical roots never cross into native input.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceActivationInputDto {
     pub workspace_id: String,
-    pub display_name: String,
-    pub trust: String,
-    pub root_path: String,
 }
 
-impl From<domain::GeneralWorkspace> for GeneralWorkspaceDto {
-    /// 逐字段投影 Java 权威结果，不在 interface 重建 Workspace identity 或 trust 规则。
-    fn from(value: domain::GeneralWorkspace) -> Self {
+/// Closed workspace classification shared with the Java workspace projection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKindDto {
+    Project,
+    Session,
+    LegacyShared,
+}
+
+impl From<domain::WorkspaceKind> for WorkspaceKindDto {
+    /// Preserve Java's closed kind wire spelling instead of leaking Rust enum naming conventions.
+    fn from(value: domain::WorkspaceKind) -> Self {
+        match value {
+            domain::WorkspaceKind::Project => Self::Project,
+            domain::WorkspaceKind::Session => Self::Session,
+            domain::WorkspaceKind::LegacyShared => Self::LegacyShared,
+        }
+    }
+}
+
+/// Renderer receives the canonical Java-issued directory solely to label the active workbench.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceActivationDto {
+    pub workspace_id: String,
+    pub root_path: String,
+    pub display_name: String,
+    pub trust: String,
+    pub kind: WorkspaceKindDto,
+    pub legacy_shared_workspace_id: Option<String>,
+}
+
+impl From<domain::WorkspaceActivation> for WorkspaceActivationDto {
+    /// Expose only the already-registered canonical root and Java identity needed by the workbench.
+    fn from(value: domain::WorkspaceActivation) -> Self {
         Self {
             workspace_id: value.workspace_id,
+            root_path: value.root_path,
             display_name: value.display_name,
             trust: value.trust,
-            root_path: value.root_path,
+            kind: value.kind.into(),
+            legacy_shared_workspace_id: value.legacy_shared_workspace_id,
         }
     }
 }
@@ -1336,6 +1411,8 @@ impl From<domain::TaskThreadSummary> for ThreadDto {
         Self {
             thread_id: value.thread_id,
             workspace_id: value.workspace_id,
+            workspace_kind: value.workspace_kind.into(),
+            legacy_shared_workspace_id: value.legacy_shared_workspace_id,
             preferences: value.preferences.map(Into::into),
             title: value.title,
             status: value.status,

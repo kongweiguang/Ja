@@ -195,6 +195,7 @@ final class ThreadHistoryLiveStreamTest {
             threads = new RecordingThreads(turns);
             RpcServiceBindings bindings = new RpcServiceBindings(
                     unsupported(WorkspaceUseCase.class), unsupported(WorkspacePathSearchUseCase.class), threads.proxy,
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.unsupportedThreadMcp(),
                     unsupported(TurnUseCase.class), unsupported(ContextCompactionUseCase.class),
                     unsupported(ApprovalUseCase.class), unsupported(CatalogUseCase.class),
                     unsupported(AttachmentUseCase.class), unsupported(AttachmentPreviewUseCase.class),
@@ -268,7 +269,7 @@ final class ThreadHistoryLiveStreamTest {
         private static ThreadSnapshot snapshot(long revision, List<ThreadSnapshot.Turn> turns) {
             TurnState latest = turns.stream().anyMatch(turn -> "running".equals(turn.status()))
                     ? TurnState.RUNNING : TurnState.QUEUED;
-            ThreadSummary thread = new ThreadSummary("thr_live", "ws_live", "Live stream", preferences(),
+            ThreadSummary thread = new ThreadSummary("thr_live", "ws_live", "Live stream", "project", null, preferences(),
                     ThreadSummary.Status.ACTIVE, false, latest, false, null, revision, NOW, NOW);
             return new ThreadSnapshot(thread, turns, List.of(), null, null, null);
         }
@@ -304,7 +305,7 @@ final class ThreadHistoryLiveStreamTest {
     private static ThreadSnapshot.Turn turn(String turnId, String status,
                                              long mutationVersion, int modelRound) {
         return new ThreadSnapshot.Turn(turnId, status, NOW, NOW, null, null, null,
-                mutationVersion, modelRound);
+                mutationVersion, modelRound, null);
     }
 
     /** Task/Goal 只允许连接订阅与 thread/read 所需的空活动列表。 */

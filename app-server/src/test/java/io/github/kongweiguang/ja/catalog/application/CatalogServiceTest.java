@@ -55,9 +55,9 @@ final class CatalogServiceTest {
                 queries, generations, unsupportedModel(), unsupportedWorkspaces());
 
         service.listSkills(null, null, 10);
-        service.listMcp(null, 10);
-        service.testMcp(MCP_ID).toCompletableFuture().join();
-        service.readMcpTools(MCP_ID, null, 10);
+        service.listMcp(null, null, 10);
+        service.testMcp(null, MCP_ID).toCompletableFuture().join();
+        service.readMcpTools(null, MCP_ID, null, 10);
 
         assertEquals(4, generations.leases.size());
         assertTrue(generations.leases.stream().allMatch(RecordingLease::closed));
@@ -220,12 +220,12 @@ final class CatalogServiceTest {
                 .toAbsolutePath().normalize();
         RecordingGenerationPort generations = new RecordingGenerationPort(root);
         RecordingQueryPort queries = new RecordingQueryPort();
-        Workspace workspace = new Workspace("ws_fixture", root, "Fixture", Workspace.Trust.TRUSTED, 0);
+        Workspace workspace = new Workspace("ws_fixture", root, "Fixture", Workspace.Trust.TRUSTED,
+                Workspace.Kind.PROJECT, null, 0);
         WorkspaceUseCase workspaces = (WorkspaceUseCase) Proxy.newProxyInstance(
                 CatalogServiceTest.class.getClassLoader(), new Class<?>[]{WorkspaceUseCase.class},
                 (proxy, method, arguments) -> switch (method.getName()) {
                     case "requireOpenWorkspace" -> workspace;
-                    case "isGeneralWorkspace" -> false;
                     default -> throw new AssertionError("unexpected workspace call: " + method.getName());
                 });
         CatalogService service = new CatalogService(
@@ -258,7 +258,7 @@ final class CatalogServiceTest {
     /** 构造无凭据 MCP 描述，避免生命周期测试引入 Secret 或真实传输副作用。 */
     private static ConfigurationGenerationSnapshot.McpServer mcpServer() {
         return new ConfigurationGenerationSnapshot.McpServer(
-                MCP_ID, "Fixture", ConfigurationGenerationSnapshot.Transport.STDIO,
+                MCP_ID, "Fixture", ConfigurationGenerationSnapshot.Scope.GLOBAL, ConfigurationGenerationSnapshot.Transport.STDIO,
                 "fixture", List.of(), java.util.Map.of(), java.util.Map.of(),
                 new ConfigurationGenerationSnapshot.Auth(
                         ConfigurationGenerationSnapshot.AuthKind.NONE, null, null), true);
@@ -425,16 +425,16 @@ final class CatalogServiceTest {
         /** 验证异步探测创建阶段仍持有租约，并返回已完成夹具结果。 */
         @Override
         public CompletionStage<McpServerDescriptor> testMcp(
-                ConfigurationGenerationPort.Lease generation, String mcpId) {
+                ConfigurationGenerationPort.Lease generation, Path workspaceRoot, String mcpId) {
             admit(generation);
             return CompletableFuture.completedFuture(new McpServerDescriptor(
-                    MCP_ID, "Fixture", "stdio", "available", 0));
+                    MCP_ID, "Fixture", "global", "stdio", "available", 0));
         }
 
         /** 验证 Tool Schema 查询发生在租约关闭前。 */
         @Override
         public CursorPage<McpToolDescriptor> readMcpTools(
-                ConfigurationGenerationPort.Lease generation, String mcpId,
+                ConfigurationGenerationPort.Lease generation, Path workspaceRoot, String mcpId,
                 String cursor, int limit) {
             admit(generation);
             return new CursorPage<>(List.of(), null);

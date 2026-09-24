@@ -164,6 +164,8 @@
 }
 
 .ja-chat-message-user .ja-chat-message__actions {
+  width: auto;
+  gap: 0.2rem;
   justify-self: end;
   margin-top: 0.08rem;
 }
@@ -577,6 +579,30 @@
   color: var(--ja-accent);
   text-decoration: underline;
   text-underline-offset: 0.12em;
+}
+.ja-markdown__file-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  border-radius: 0.24rem;
+  background: transparent;
+  color: var(--ja-accent);
+  font: inherit;
+  text-align: start;
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.ja-markdown__inline-file-link {
+  padding: 0.02rem 0.18rem;
+  background: var(--ja-surface-muted);
+  font: var(--ja-code-font-size) / 1.5 var(--ja-font-mono);
+  text-decoration: none;
+}
+.ja-markdown__file-link:focus {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
 }
 .ja-markdown__plain-link,
 .ja-markdown__plain-image {

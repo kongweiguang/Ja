@@ -43,11 +43,23 @@ public interface AgentTool {
         return ToolSideEffect.EXTERNAL;
     }
 
+    /** 动态网关可按单次调用收窄副作用；静态 Tool 沿用原有声明。 */
+    default ToolSideEffect sideEffect(Invocation invocation) {
+        Objects.requireNonNull(invocation, "invocation");
+        return sideEffect();
+    }
+
     /**
      * 默认把 Tool 视为无法观察的工作区写入者；只有实现能够证明只读或返回精确文本收据时才能收窄。
      */
     default WorkspaceMutationMode workspaceMutationMode() {
         return WorkspaceMutationMode.UNOBSERVABLE;
+    }
+
+    /** 动态路由按单次调用声明工作区影响，避免只读网关动作降级工作区完整性。 */
+    default WorkspaceMutationMode workspaceMutationMode(Invocation invocation) {
+        Objects.requireNonNull(invocation, "invocation");
+        return workspaceMutationMode();
     }
 
     /**
@@ -67,12 +79,30 @@ public interface AgentTool {
         return ApprovalRequirement.USER_REQUIRED;
     }
 
+    /** 动态网关仅能为自身识别出的本地只读动作变更审批元数据。 */
+    default ApprovalRequirement approvalRequirement(Invocation invocation) {
+        Objects.requireNonNull(invocation, "invocation");
+        return approvalRequirement();
+    }
+
     /**
      * 返回持久 Tool batch 使用的不可变路由身份；Builtin 默认由规范化 schema 派生稳定哨兵，
      * MCP 适配器必须覆盖并提供真实服务与远端名称。
      */
     default ToolBindingDescriptor bindingDescriptor() {
         return builtinBindingDescriptor(spec(), sideEffect(), workspaceMutationMode());
+    }
+
+    /** 在持久化 PREPARED 前解析单次调用的真实路由；普通 Tool 使用固定目录身份。 */
+    default ToolBindingDescriptor bindingDescriptor(Invocation invocation) {
+        Objects.requireNonNull(invocation, "invocation");
+        return bindingDescriptor();
+    }
+
+    /** 固定入口在准备事实前执行纯本地校验，使无效 action 不经过审批或外部执行边界。 */
+    default Optional<InvocationValidationFailure> validationFailure(Invocation invocation) {
+        Objects.requireNonNull(invocation, "invocation");
+        return Optional.empty();
     }
 
     /** 能力 prepare 与真实 Builtin Tool 共用身份算法，安全声明变化会使恢复绑定失效。 */
@@ -447,6 +477,17 @@ public interface AgentTool {
                 throw new IllegalArgumentException("invalid " + field);
             }
             return value;
+        }
+    }
+
+    /** 将拒绝编码为可回给模型的稳定错误，不包含原始参数或远端异常正文。 */
+    record InvocationValidationFailure(String code, String message) {
+        /** 错误码和诊断有界且为文本，避免预检入口泄漏 Secret 或异常对象。 */
+        public InvocationValidationFailure {
+            if (code == null || !code.matches("[A-Z][A-Z0-9_]{1,63}")) {
+                throw new IllegalArgumentException("invalid invocation failure code");
+            }
+            message = ContractChecks.text(message, "message", 1024, false);
         }
     }
 

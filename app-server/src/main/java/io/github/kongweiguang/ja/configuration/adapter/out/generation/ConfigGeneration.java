@@ -17,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 
 /**
@@ -47,6 +48,7 @@ public final class ConfigGeneration implements AutoCloseable {
     private final Map<String, SecretValue> secrets;
     private final List<JsonNode> skills;
     private final List<JsonNode> mcpServers;
+    private final Set<String> projectMcpIds;
     private final Map<String, ProviderDefinition> providers;
     private final Map<String, Skill> skillDefinitions;
     private final Map<String, McpServer> mcpDefinitions;
@@ -68,6 +70,7 @@ public final class ConfigGeneration implements AutoCloseable {
                      Map<String, SecretValue> secrets,
                      List<JsonNode> skills,
                      List<JsonNode> mcpServers,
+                     Set<String> projectMcpIds,
                      String catalogDigest,
                      Consumer<ConfigGeneration> onFullyReleased) {
         this.generationId = generationId;
@@ -82,6 +85,7 @@ public final class ConfigGeneration implements AutoCloseable {
         this.secrets = new LinkedHashMap<>(secrets);
         this.skills = copyNodes(skills);
         this.mcpServers = copyNodes(mcpServers);
+        this.projectMcpIds = Set.copyOf(projectMcpIds);
         ConfigGenerationDocumentCatalog catalog = ConfigGenerationDocumentCatalog.parse(this.effectiveConfig);
         this.providers = catalog.providers();
         this.skillDefinitions = catalog.skillDefinitions();
@@ -774,7 +778,8 @@ public final class ConfigGeneration implements AutoCloseable {
          */
         @Override
         public List<ConfigurationGenerationSnapshot.McpServer> mcpDefinitions() {
-            return source.mcpDefinitions().stream().map(GenerationView::projectMcp).toList();
+            return source.mcpDefinitions().stream()
+                    .map(server -> projectMcp(server, source.projectMcpIds.contains(server.mcpId()))).toList();
         }
 
         /** 把根级执行模式投影到 conversation 稳定端口，禁止从单个模型反向推导。 */
@@ -790,6 +795,13 @@ public final class ConfigGeneration implements AutoCloseable {
         @Override
         public boolean trusted() {
             return source.trusted();
+        }
+
+        /** 将项目 MCP 错误压缩成一位展示事实，路径和原始配置仍留在 Owner 内。 */
+        @Override
+        public boolean projectMcpIssue() {
+            return source.diagnostics().stream()
+                    .anyMatch(diagnostic -> "PROJECT_MCP_ISSUE".equals(diagnostic.code()));
         }
 
         /** 透传用户级澄清策略；Plan 仍由其自身阶段策略强制启用。 */
@@ -827,7 +839,7 @@ public final class ConfigGeneration implements AutoCloseable {
          */
         @Override
         public ConfigurationGenerationSnapshot.McpServer requireMcp(String mcpId) {
-            return projectMcp(source.requireMcp(mcpId));
+            return projectMcp(source.requireMcp(mcpId), source.projectMcpIds.contains(mcpId));
         }
 
         /** 投影 Provider 的连接、Agent 默认值和完整模型目录，不产生扁平兼容索引。 */
@@ -908,7 +920,8 @@ public final class ConfigGeneration implements AutoCloseable {
         /**
          * 将内部 MCP 枚举逐项映射到稳定端口，禁止名称字符串 fallback。
          */
-        private static ConfigurationGenerationSnapshot.McpServer projectMcp(ConfigGeneration.McpServer server) {
+        private static ConfigurationGenerationSnapshot.McpServer projectMcp(
+                ConfigGeneration.McpServer server, boolean project) {
             ConfigurationGenerationSnapshot.Transport transport = switch (server.transport()) {
                 case STDIO -> ConfigurationGenerationSnapshot.Transport.STDIO;
                 case STREAMABLE_HTTP -> ConfigurationGenerationSnapshot.Transport.STREAMABLE_HTTP;
@@ -921,7 +934,9 @@ public final class ConfigGeneration implements AutoCloseable {
             };
             ConfigurationGenerationSnapshot.Auth auth = new ConfigurationGenerationSnapshot.Auth(
                     authKind, server.auth().name(), server.auth().credentialId());
-            return new ConfigurationGenerationSnapshot.McpServer(server.mcpId(), server.name(), transport,
+            return new ConfigurationGenerationSnapshot.McpServer(server.mcpId(), server.name(),
+                    project ? ConfigurationGenerationSnapshot.Scope.PROJECT
+                            : ConfigurationGenerationSnapshot.Scope.GLOBAL, transport,
                     server.endpoint(), server.args(), server.env(), server.headers(), auth, server.enabled());
         }
     }

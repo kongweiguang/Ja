@@ -7,6 +7,7 @@ export * from "./Dialog";
 export * from "./Feedback";
 export * from "./IconButton";
 export * from "./Menu";
+export * from "./PointerContextMenu";
 export * from "./Popover";
 export * from "./ScrollArea";
 export * from "./Select";

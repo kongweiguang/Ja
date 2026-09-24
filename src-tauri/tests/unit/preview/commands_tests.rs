@@ -49,36 +49,36 @@ fn wait_for_shutdown_started_until(
     Ok(true)
 }
 
-/// 确认打开预览要求有限且可见的有效矩形，隐藏布局仍允许零尺寸用于收口。
+/// 确认 tab 可先以隐藏状态创建，但任何原生 WebView 都先取得非零有限 bounds。
 #[test]
-fn preview_viewport_requires_finite_visible_open_bounds() {
+fn preview_viewport_accepts_hidden_open_with_nonzero_bounds() {
     assert!(visible_viewport().validate_open().is_ok());
-    assert!(
-        PreviewViewportInput {
-            width: 0.0,
-            ..visible_viewport()
-        }
-        .validate_open()
-        .is_err()
-    );
-    assert!(
-        PreviewViewportInput {
-            x: f64::NAN,
-            ..visible_viewport()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        PreviewViewportInput {
-            visible: false,
-            width: 0.0,
-            height: 0.0,
-            ..visible_viewport()
-        }
-        .validate()
-        .is_ok()
-    );
+    assert!(PreviewViewportInput {
+        visible: false,
+        ..visible_viewport()
+    }
+    .validate_open()
+    .is_ok());
+    assert!(PreviewViewportInput {
+        width: 0.0,
+        ..visible_viewport()
+    }
+    .validate_open()
+    .is_err());
+    assert!(PreviewViewportInput {
+        x: f64::NAN,
+        ..visible_viewport()
+    }
+    .validate()
+    .is_err());
+    assert!(PreviewViewportInput {
+        visible: false,
+        width: 0.0,
+        height: 0.0,
+        ..visible_viewport()
+    }
+    .validate()
+    .is_ok());
 }
 
 /// 旧页面 completion 不能领取新导航的 generation；初始导航只保留一次无 Starting 的受控路径。

@@ -135,7 +135,8 @@ fn decoded_method_roles_use_the_frozen_v1_closures() {
             "jsonrpc":"2.0", "id":"c:health", "method":"runtime/health", "params":{}
         }),
         serde_json::json!({
-            "jsonrpc":"2.0", "id":"c:general", "method":"workspace/open-general", "params":{}
+            "jsonrpc":"2.0", "id":"c:workspace-open", "method":"workspace/open",
+            "params":{"workspaceId":"ws_session"}
         }),
         serde_json::json!({
             "jsonrpc":"2.0", "method":"assistant/model-step-committed", "params":{}

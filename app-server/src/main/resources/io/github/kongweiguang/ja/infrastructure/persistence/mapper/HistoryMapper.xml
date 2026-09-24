@@ -7,12 +7,15 @@
       <arg column="workspace_id" javaType="string"/><arg column="root_path" javaType="string"/>
       <arg column="display_name" javaType="string"/><arg column="trust" javaType="string"/>
       <arg column="revision" javaType="_long"/><arg column="updated_at" javaType="string"/>
+      <arg column="kind" javaType="string"/><arg column="legacy_shared_workspace_id" javaType="string"/>
     </constructor>
   </resultMap>
   <resultMap id="threadRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadRow">
     <constructor>
       <arg column="thread_id" javaType="string"/><arg column="workspace_id" javaType="string"/>
-      <arg column="title" javaType="string"/><arg column="provider_id" javaType="string"/>
+      <arg column="title" javaType="string"/><arg column="workspace_kind" javaType="string"/>
+      <arg column="legacy_shared_workspace_id" javaType="string"/>
+      <arg column="provider_id" javaType="string"/>
       <arg column="model_id" javaType="string"/><arg column="reasoning_level" javaType="string"/>
       <arg column="access_mode" javaType="string"/><arg column="collaboration_mode" javaType="string"/>
       <arg column="title_source" javaType="string"/>
@@ -71,18 +74,23 @@
       <arg column="byte_length" javaType="_long"/></constructor>
   </resultMap>
   <select id="selectWorkspace" resultMap="workspaceRow">
-    SELECT workspace_id,root_path,display_name,trust,revision,updated_at FROM workspaces WHERE workspace_id=#{workspaceId}
+    SELECT workspace_id,root_path,display_name,trust,revision,updated_at,kind,legacy_shared_workspace_id
+    FROM workspaces WHERE workspace_id=#{workspaceId}
   </select>
   <select id="selectWorkspaceByRoot" resultMap="workspaceRow">
-    SELECT workspace_id,root_path,display_name,trust,revision,updated_at FROM workspaces WHERE root_path=#{rootPath}
+    SELECT workspace_id,root_path,display_name,trust,revision,updated_at,kind,legacy_shared_workspace_id
+    FROM workspaces WHERE root_path=#{rootPath}
   </select>
   <insert id="insertWorkspace">
-    INSERT INTO workspaces(workspace_id,root_path,display_name,trust,created_at,updated_at)
-    VALUES(#{workspaceId},#{rootPath},#{displayName},#{trust},#{occurredAt},#{occurredAt})
+    INSERT INTO workspaces(workspace_id,root_path,display_name,trust,created_at,updated_at,kind,legacy_shared_workspace_id)
+    VALUES(#{workspaceId},#{rootPath},#{displayName},#{trust},#{occurredAt},#{occurredAt},#{kind},#{legacySharedWorkspaceId})
   </insert>
   <select id="selectWorkspacePage" resultMap="workspaceRow">
-    SELECT workspace_id,root_path,display_name,trust,revision,updated_at FROM workspaces
-    <if test="cursorTime != null">WHERE updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND workspace_id&lt;#{cursorId})</if>
+    SELECT workspace_id,root_path,display_name,trust,revision,updated_at,kind,legacy_shared_workspace_id FROM workspaces
+    <where>
+      <if test="kind != null">kind=#{kind}</if>
+      <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND workspace_id&lt;#{cursorId}))</if>
+    </where>
     ORDER BY updated_at DESC,workspace_id DESC LIMIT #{limit}
   </select>
   <update id="compareAndSetWorkspaceTrust">
@@ -94,11 +102,18 @@
       AND NOT EXISTS(SELECT 1 FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL)
   </delete>
   <select id="selectThread" resultMap="threadRow">
-    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+    SELECT thread_id,workspace_id,title,
+      (SELECT kind FROM workspaces w WHERE w.workspace_id=threads.workspace_id) AS workspace_kind,
+      CASE WHEN NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=threads.thread_id)
+        THEN (SELECT legacy_shared_workspace_id FROM workspaces w WHERE w.workspace_id=threads.workspace_id)
+        ELSE NULL END AS legacy_shared_workspace_id,
+      provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
       revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
-      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id AND current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
       COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
-        WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+        WHERE turns.thread_id=threads.thread_id AND current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
       (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
         AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
     FROM threads WHERE thread_id=#{threadId} AND deleted_at IS NULL
@@ -122,7 +137,12 @@
     UPDATE threads SET revision=revision+1,updated_at=#{occurredAt} WHERE thread_id=#{threadId} AND deleted_at IS NULL
   </update>
   <select id="selectThreadPage" resultMap="threadRow">
-    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+    SELECT thread_id,workspace_id,title,
+      (SELECT kind FROM workspaces w WHERE w.workspace_id=threads.workspace_id) AS workspace_kind,
+      CASE WHEN NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=threads.thread_id)
+        THEN (SELECT legacy_shared_workspace_id FROM workspaces w WHERE w.workspace_id=threads.workspace_id)
+        ELSE NULL END AS legacy_shared_workspace_id,
+      provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
       revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
       (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
       COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
@@ -142,8 +162,40 @@
     ORDER BY CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END DESC,
       COALESCE(pinned_at,updated_at) DESC,updated_at DESC,thread_id DESC LIMIT #{limit}
   </select>
+  <select id="selectSessionThreadPage" resultMap="threadRow">
+    SELECT thread_id,workspace_id,title,
+      (SELECT kind FROM workspaces w WHERE w.workspace_id=threads.workspace_id) AS workspace_kind,
+      CASE WHEN NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=threads.thread_id)
+        THEN (SELECT legacy_shared_workspace_id FROM workspaces w WHERE w.workspace_id=threads.workspace_id)
+        ELSE NULL END AS legacy_shared_workspace_id,
+      provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+      revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
+      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+      COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
+        WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+      (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
+        AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
+    FROM threads WHERE workspace_id IN (SELECT workspace_id FROM workspaces WHERE kind='SESSION')
+      AND archived_at IS NULL AND deleted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM thread_lineage WHERE child_thread_id=threads.thread_id)
+    <if test="cursorPinned != null">AND (
+      (CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END)&lt;#{cursorPinned}
+      OR ((CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END)=#{cursorPinned} AND (
+        COALESCE(pinned_at,updated_at)&lt;#{cursorSortTime}
+        OR (COALESCE(pinned_at,updated_at)=#{cursorSortTime} AND updated_at&lt;#{cursorUpdatedAt})
+        OR (COALESCE(pinned_at,updated_at)=#{cursorSortTime} AND updated_at=#{cursorUpdatedAt} AND thread_id&lt;#{cursorId})
+      ))
+    )</if>
+    ORDER BY CASE WHEN pinned_at IS NULL THEN 0 ELSE 1 END DESC,
+      COALESCE(pinned_at,updated_at) DESC,updated_at DESC,thread_id DESC LIMIT #{limit}
+  </select>
   <select id="searchThreadPage" resultMap="threadRow">
-    SELECT thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+    SELECT thread_id,workspace_id,title,
+      (SELECT kind FROM workspaces w WHERE w.workspace_id=threads.workspace_id) AS workspace_kind,
+      CASE WHEN NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=threads.thread_id)
+        THEN (SELECT legacy_shared_workspace_id FROM workspaces w WHERE w.workspace_id=threads.workspace_id)
+        ELSE NULL END AS legacy_shared_workspace_id,
+      provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
       revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
       (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
       COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
@@ -151,6 +203,26 @@
       (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
         AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
     FROM threads WHERE workspace_id=#{workspaceId} AND deleted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM thread_lineage WHERE child_thread_id=threads.thread_id)
+    <if test="normalizedQuery != ''">AND instr(lower(title),#{normalizedQuery})&gt;0</if>
+    <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND thread_id&lt;#{cursorId}))</if>
+    ORDER BY updated_at DESC,thread_id DESC LIMIT #{limit}
+  </select>
+  <select id="searchSessionThreadPage" resultMap="threadRow">
+    SELECT thread_id,workspace_id,title,
+      (SELECT kind FROM workspaces w WHERE w.workspace_id=threads.workspace_id) AS workspace_kind,
+      CASE WHEN NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=threads.thread_id)
+        THEN (SELECT legacy_shared_workspace_id FROM workspaces w WHERE w.workspace_id=threads.workspace_id)
+        ELSE NULL END AS legacy_shared_workspace_id,
+      provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+      revision,created_at,updated_at,pinned_at,archived_at,deleted_at,
+      (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+      COALESCE((SELECT turn_sequence&lt;=COALESCE(threads.last_seen_turn_sequence,0) FROM turns
+        WHERE turns.thread_id=threads.thread_id ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+      (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
+        AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
+    FROM threads WHERE workspace_id IN (SELECT workspace_id FROM workspaces WHERE kind='SESSION')
+      AND deleted_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM thread_lineage WHERE child_thread_id=threads.thread_id)
     <if test="normalizedQuery != ''">AND instr(lower(title),#{normalizedQuery})&gt;0</if>
     <if test="cursorTime != null">AND (updated_at&lt;#{cursorTime} OR (updated_at=#{cursorTime} AND thread_id&lt;#{cursorId}))</if>
@@ -181,6 +253,205 @@
     WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
     <if test="provisionalTitle != null">AND title_source='PLACEHOLDER'</if>
   </update>
+  <select id="selectLastCurrentPathQuestionMessageId" resultType="string">
+    SELECT tm.item_id
+    FROM timeline_messages tm
+    JOIN messages m ON m.message_id=tm.item_id AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+    JOIN turns t ON t.turn_id=tm.turn_id AND t.thread_id=tm.thread_id AND t.current_path=1
+    WHERE tm.thread_id=#{threadId} AND tm.message_kind='USER_INPUT' AND m.role='USER'
+    ORDER BY m.ordinal DESC LIMIT 1
+  </select>
+  <!-- 旧版按钮没有来源标记；候选只识别完整的四 Turn 尾形状，后续 strict gate 再验证状态和副作用闭集。 -->
+  <select id="selectLegacyContinueCandidateSource" resultType="string">
+    WITH chain AS (
+      SELECT turn_id,turn_sequence,current_path,source_message_id,
+        ROW_NUMBER() OVER(ORDER BY turn_sequence) AS slot,
+        COUNT(*) OVER() AS turn_count
+      FROM turns WHERE thread_id=#{threadId}
+    ),
+    user_shape AS (
+      SELECT c.turn_id,
+        (SELECT COUNT(*) FROM messages m WHERE m.thread_id=#{threadId}
+          AND m.turn_id=c.turn_id AND m.role='USER') AS user_count,
+        (SELECT COUNT(*) FROM timeline_messages tm
+          JOIN messages m ON m.message_id=tm.item_id AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+          WHERE tm.thread_id=#{threadId} AND tm.turn_id=c.turn_id
+            AND tm.message_kind='USER_INPUT' AND m.role='USER') AS timeline_user_count,
+        (SELECT COUNT(*) FROM timeline_messages tm
+          JOIN messages m ON m.message_id=tm.item_id AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+          WHERE tm.thread_id=#{threadId} AND tm.turn_id=c.turn_id
+            AND tm.message_kind='USER_INPUT' AND m.role='USER'
+            AND json_array_length(m.blocks_json)=1
+            AND json_type(m.blocks_json,'$[0].kind')='text'
+            AND json_extract(m.blocks_json,'$[0].kind')='text'
+            AND json_type(m.blocks_json,'$[0].text')='text'
+            AND instr(json_extract(m.blocks_json,'$[0].text'),'继续')&gt;0
+            AND (SELECT COUNT(*) FROM json_each(m.blocks_json,'$[0]'))=2
+            AND instr(tm.public_text,'继续')&gt;0) AS continue_like_count
+      FROM chain c
+    )
+    SELECT (
+      SELECT COALESCE((SELECT m.message_id FROM messages m
+        WHERE m.thread_id=#{threadId} AND m.turn_id=root.turn_id AND m.role='USER'
+        ORDER BY m.ordinal LIMIT 1), '')
+      FROM chain root
+      WHERE root.slot=1
+        AND (SELECT COUNT(*) FROM chain)=4
+        AND (SELECT COUNT(*) FROM chain WHERE current_path=1 AND source_message_id IS NULL)=4
+        AND (SELECT user_count FROM user_shape WHERE turn_id=root.turn_id)&gt;0
+        AND NOT EXISTS (
+          SELECT 1 FROM chain tail JOIN user_shape shape ON shape.turn_id=tail.turn_id
+          WHERE tail.slot BETWEEN 2 AND 4 AND shape.continue_like_count&lt;1
+        )
+        AND EXISTS (
+          SELECT 1 FROM chain latest JOIN messages candidate
+            ON candidate.thread_id=#{threadId} AND candidate.turn_id=latest.turn_id
+          JOIN timeline_messages candidate_item ON candidate_item.item_id=candidate.message_id
+            AND candidate_item.thread_id=candidate.thread_id AND candidate_item.turn_id=candidate.turn_id
+          WHERE latest.slot=4 AND candidate.message_id=#{candidateMessageId}
+            AND candidate.role='USER' AND candidate_item.message_kind='USER_INPUT'
+        )
+      LIMIT 1
+    )
+  </select>
+  <!-- 两处复用同一严格谓词：先给清晰的准入判定，UPDATE 自身再重验以封闭并发窗口。 -->
+  <sql id="legacyContinueStrictGate">
+    chain AS (
+      SELECT turn_id,turn_sequence,state,current_path,source_message_id,parent_turn_id,root_turn_id,
+        ROW_NUMBER() OVER(ORDER BY turn_sequence) AS slot,
+        COUNT(*) OVER() AS turn_count
+      FROM turns WHERE thread_id=#{threadId}
+    ),
+    user_shape AS (
+      SELECT c.turn_id,
+        (SELECT COUNT(*) FROM messages m WHERE m.thread_id=#{threadId}
+          AND m.turn_id=c.turn_id AND m.role='USER') AS user_count,
+        (SELECT COUNT(*) FROM timeline_messages tm
+          JOIN messages m ON m.message_id=tm.item_id AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+          WHERE tm.thread_id=#{threadId} AND tm.turn_id=c.turn_id
+            AND tm.message_kind='USER_INPUT' AND m.role='USER') AS timeline_user_count,
+        (SELECT COUNT(*) FROM timeline_messages tm
+          JOIN messages m ON m.message_id=tm.item_id AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+          WHERE tm.thread_id=#{threadId} AND tm.turn_id=c.turn_id
+            AND tm.message_kind='USER_INPUT' AND m.role='USER'
+            AND json_array_length(m.blocks_json)=1
+            AND json_type(m.blocks_json,'$[0].kind')='text'
+            AND json_extract(m.blocks_json,'$[0].kind')='text'
+            AND json_type(m.blocks_json,'$[0].text')='text'
+            AND json_extract(m.blocks_json,'$[0].text')='继续'
+            AND (SELECT COUNT(*) FROM json_each(m.blocks_json,'$[0]'))=2
+            AND tm.public_text='继续') AS exact_continue_count
+      FROM chain c
+    ),
+    gate AS (
+      SELECT CASE WHEN
+        (SELECT COUNT(*) FROM chain)=4
+        AND (SELECT COUNT(*) FROM chain WHERE current_path=1 AND source_message_id IS NULL
+          AND parent_turn_id IS NULL AND root_turn_id IS NULL)=4
+        AND (SELECT state FROM chain WHERE slot=1)='FAILED'
+        AND (SELECT state FROM chain WHERE slot=2)='FAILED'
+        AND (SELECT state FROM chain WHERE slot=3)='CANCELLED'
+        AND (SELECT state FROM chain WHERE slot=4)='FAILED'
+        AND (SELECT user_count FROM user_shape WHERE turn_id=(SELECT turn_id FROM chain WHERE slot=1))=1
+        AND (SELECT timeline_user_count FROM user_shape WHERE turn_id=(SELECT turn_id FROM chain WHERE slot=1))=1
+        AND EXISTS (
+          SELECT 1 FROM messages source JOIN chain root ON root.turn_id=source.turn_id
+          WHERE root.slot=1 AND source.thread_id=#{threadId} AND source.message_id=#{sourceMessageId}
+            AND source.role='USER' AND json_array_length(source.blocks_json)=1
+            AND json_type(source.blocks_json,'$[0].kind')='text'
+            AND json_extract(source.blocks_json,'$[0].kind')='text'
+            AND json_type(source.blocks_json,'$[0].text')='text'
+            AND (SELECT COUNT(*) FROM json_each(source.blocks_json,'$[0]'))=2
+            AND EXISTS (SELECT 1 FROM timeline_messages source_item
+              WHERE source_item.item_id=source.message_id AND source_item.thread_id=source.thread_id
+                AND source_item.turn_id=source.turn_id AND source_item.message_kind='USER_INPUT')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM chain tail JOIN user_shape shape ON shape.turn_id=tail.turn_id
+          WHERE tail.slot BETWEEN 2 AND 4
+            AND (shape.user_count!=1 OR shape.timeline_user_count!=1 OR shape.exact_continue_count!=1)
+        )
+        AND EXISTS (
+          SELECT 1 FROM chain latest JOIN messages candidate
+            ON candidate.thread_id=#{threadId} AND candidate.turn_id=latest.turn_id
+          JOIN timeline_messages candidate_item ON candidate_item.item_id=candidate.message_id
+            AND candidate_item.thread_id=candidate.thread_id AND candidate_item.turn_id=candidate.turn_id
+          WHERE latest.slot=4 AND candidate.message_id=#{candidateMessageId}
+            AND candidate.role='USER' AND candidate_item.message_kind='USER_INPUT'
+        )
+        AND (SELECT COUNT(*) FROM tools tool
+          WHERE tool.thread_id=#{threadId} AND tool.turn_id=(SELECT turn_id FROM chain WHERE slot=1))=3
+        AND NOT EXISTS (SELECT 1 FROM tools tool JOIN chain owner ON owner.turn_id=tool.turn_id
+          WHERE tool.thread_id=#{threadId} AND owner.slot=1
+            AND (tool.side_effect!='READ_ONLY' OR tool.state!='SUCCEEDED'))
+        AND NOT EXISTS (SELECT 1 FROM tools tool JOIN chain owner ON owner.turn_id=tool.turn_id
+          WHERE tool.thread_id=#{threadId} AND owner.slot BETWEEN 2 AND 4)
+        AND NOT EXISTS (SELECT 1 FROM approvals approval JOIN chain owner ON owner.turn_id=approval.turn_id
+          WHERE approval.thread_id=#{threadId})
+        AND NOT EXISTS (SELECT 1 FROM messages message JOIN chain owner ON owner.turn_id=message.turn_id
+          JOIN message_attachments attachment ON attachment.message_id=message.message_id
+          WHERE message.thread_id=#{threadId})
+        AND NOT EXISTS (SELECT 1 FROM pending_inputs input JOIN chain owner ON owner.turn_id=input.turn_id
+          WHERE input.thread_id=#{threadId})
+        AND NOT EXISTS (SELECT 1 FROM turn_internal_context context JOIN chain owner ON owner.turn_id=context.turn_id)
+        AND NOT EXISTS (SELECT 1 FROM turn_execution execution JOIN chain owner ON owner.turn_id=execution.turn_id
+          WHERE COALESCE(json_extract(execution.state_json,'$.common.origin'),'')!='USER')
+        AND NOT EXISTS (SELECT 1 FROM task_context_seeds seed JOIN chain owner
+          ON owner.turn_id=seed.parent_turn_id)
+        THEN 1 ELSE 0 END AS matches
+    )
+  </sql>
+  <select id="isStrictLegacyContinueChain" resultType="boolean">
+    WITH <include refid="legacyContinueStrictGate"/>
+    SELECT matches FROM gate
+  </select>
+  <update id="normalizeLegacyContinuePath">
+    WITH <include refid="legacyContinueStrictGate"/>
+    UPDATE turns SET current_path=0,source_message_id=#{sourceMessageId}
+    WHERE thread_id=#{threadId} AND current_path=1
+      AND turn_id IN (SELECT turn_id FROM chain WHERE slot BETWEEN 2 AND 4)
+      AND (SELECT matches FROM gate)=1
+  </update>
+  <select id="isReaskableQuestion" resultType="boolean">
+    SELECT EXISTS(
+      SELECT 1 FROM messages source
+      JOIN timeline_messages source_item ON source_item.item_id=source.message_id
+        AND source_item.thread_id=source.thread_id AND source_item.turn_id=source.turn_id
+        AND source_item.message_kind='USER_INPUT'
+      JOIN turns owner ON owner.turn_id=source.turn_id AND owner.thread_id=source.thread_id
+        AND owner.current_path=1
+      WHERE source.thread_id=#{threadId} AND source.message_id=#{sourceMessageId} AND source.role='USER'
+        AND source.message_id=(
+          SELECT latest.item_id FROM timeline_messages latest
+          JOIN messages latest_message ON latest_message.message_id=latest.item_id
+            AND latest_message.thread_id=latest.thread_id AND latest_message.turn_id=latest.turn_id
+          JOIN turns latest_turn ON latest_turn.turn_id=latest.turn_id
+            AND latest_turn.thread_id=latest.thread_id AND latest_turn.current_path=1
+          WHERE latest.thread_id=#{threadId} AND latest.message_kind='USER_INPUT'
+            AND latest_message.role='USER'
+          ORDER BY latest_message.ordinal DESC LIMIT 1)
+        AND NOT EXISTS(SELECT 1 FROM timeline_messages earlier
+          JOIN messages earlier_message ON earlier_message.message_id=earlier.item_id
+          WHERE earlier.thread_id=source.thread_id AND earlier.turn_id=owner.turn_id
+            AND earlier.message_kind='USER_INPUT' AND earlier_message.role='USER'
+            AND earlier_message.ordinal&lt;source.ordinal)
+        AND (SELECT latest_attempt.state FROM turns latest_attempt
+          WHERE latest_attempt.thread_id=source.thread_id AND latest_attempt.current_path=1
+            AND (latest_attempt.turn_id=owner.turn_id OR latest_attempt.source_message_id=source.message_id)
+          ORDER BY latest_attempt.turn_sequence DESC LIMIT 1) IN ('FAILED','CANCELLED')
+        AND NOT EXISTS(SELECT 1 FROM turns successful
+          WHERE successful.thread_id=source.thread_id AND successful.current_path=1
+            AND successful.state='COMPLETED'
+            AND (successful.turn_id=owner.turn_id OR successful.source_message_id=source.message_id))
+    )
+  </select>
+  <update id="cutCurrentPathFromQuestion">
+    UPDATE turns SET current_path=0
+    WHERE thread_id=#{threadId} AND current_path=1 AND turn_sequence&gt;=(
+      SELECT owner.turn_sequence FROM messages source
+      JOIN turns owner ON owner.turn_id=source.turn_id AND owner.thread_id=source.thread_id
+      WHERE source.thread_id=#{threadId} AND source.message_id=#{sourceMessageId})
+  </update>
   <update id="compareAndSetThreadPin">
     UPDATE threads SET pinned_at=#{pinnedAt},revision=revision+1,updated_at=#{occurredAt}
     WHERE thread_id=#{threadId} AND revision=#{expectedRevision}
@@ -192,7 +463,7 @@
         ORDER BY turn_sequence DESC LIMIT 1),
       revision=revision+1,updated_at=#{occurredAt}
     WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at IS NULL
-      AND (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id
+      AND (SELECT state FROM turns WHERE turns.thread_id=threads.thread_id AND current_path=1
         ORDER BY turn_sequence DESC LIMIT 1) IN ('COMPLETED','FAILED')
       AND COALESCE(last_seen_turn_sequence,0)&lt;(
         SELECT turn_sequence FROM turns WHERE turns.thread_id=threads.thread_id
@@ -235,14 +506,21 @@
                 WHERE ma.message_id=tm.item_id ORDER BY ma.ordinal) ordered
         ),json_array()) ELSE NULL END AS attachments_json,
         tm.source_thread_id,tm.source_title
-      FROM timeline_messages tm LEFT JOIN messages m ON m.message_id=tm.item_id
+      FROM timeline_messages tm JOIN turns path_turn ON path_turn.turn_id=tm.turn_id
+        AND path_turn.thread_id=tm.thread_id AND path_turn.current_path=1
+        LEFT JOIN messages m ON m.message_id=tm.item_id
       WHERE tm.thread_id=#{threadId}
+        AND tm.item_id NOT GLOB 'item_partial_*'
+        AND NOT (tm.message_kind='FINAL_ANSWER' AND path_turn.state='FAILED')
       UNION ALL SELECT call_id||'_call','tool_call',created_at,turn_id,call_id,tool_name,ordinal,state,
-        NULL,NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL,NULL,NULL FROM tools WHERE thread_id=#{threadId}
+        NULL,NULL,NULL,NULL,presentation_json,NULL,NULL,NULL,NULL,NULL,NULL FROM tools
+        WHERE thread_id=#{threadId} AND EXISTS(SELECT 1 FROM turns path_turn
+          WHERE path_turn.turn_id=tools.turn_id AND path_turn.thread_id=tools.thread_id AND path_turn.current_path=1)
       UNION ALL SELECT a.approval_id,'approval',a.requested_at,a.turn_id,a.call_id,t.tool_name,NULL,NULL,
         NULL,NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at,NULL,NULL,NULL
         FROM approvals a JOIN tools t ON t.turn_id=a.turn_id AND t.call_id=a.call_id
-        WHERE a.thread_id=#{threadId}
+        WHERE a.thread_id=#{threadId} AND EXISTS(SELECT 1 FROM turns path_turn
+          WHERE path_turn.turn_id=a.turn_id AND path_turn.thread_id=a.thread_id AND path_turn.current_path=1)
     ), ordered_items AS (
       SELECT items.*, CASE
         WHEN message_kind='USER_INPUT' THEN 0
@@ -269,7 +547,7 @@
       u.profile_json,u.input_tokens,u.output_tokens,u.total_tokens,u.cache_read_tokens,u.cache_write_tokens,
       u.new_input_tokens,u.input_accounting,u.created_at AS occurred_at
     FROM usage u JOIN turns x ON x.turn_id=u.turn_id
-    WHERE u.thread_id=#{threadId}
+    WHERE u.thread_id=#{threadId} AND x.current_path=1
     ORDER BY x.turn_sequence DESC,u.request_ordinal DESC,u.usage_id DESC LIMIT 1
   </select>
   <select id="selectThreadUsageSummary" resultMap="threadUsageSummaryRow">

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-use crate::app_runtime::{RuntimeHost, WorkspaceLookup};
+use crate::app_runtime::RuntimeHost;
 use crate::workspace::application::WorkspaceOpenService;
 use crate::workspace::domain::{OpenError, OpenResult, OpenTargetAvailability};
 use crate::workspace::infrastructure::NativeWorkspaceOpenPort;
@@ -149,11 +149,8 @@ fn with_open_workspace<T>(
         return Err(WorkspaceOpenCommandError::invalid_input());
     }
     host.with_configured_workspace(workspace_id, operation)
-        .map_err(|lookup| WorkspaceOpenCommandError {
-            code: match lookup {
-                WorkspaceLookup::Unconfigured => WorkspaceOpenCommandErrorCode::NotConfigured,
-                WorkspaceLookup::Unknown => WorkspaceOpenCommandErrorCode::UnknownWorkspace,
-            },
+        .map_err(|_| WorkspaceOpenCommandError {
+            code: WorkspaceOpenCommandErrorCode::UnknownWorkspace,
         })?
         .map_err(WorkspaceOpenCommandError::from_open)
 }

@@ -162,6 +162,29 @@ fn exact_turn_terminal_uses_control_routing() {
     );
 }
 
+/// Retry-started 是临时工作状态提示而非终态事实；它进入 v1 event catalog，但沿用普通 Turn data lane，不占 control reserve。
+#[test]
+fn retry_started_uses_the_turn_data_lane() {
+    let retry_started = RpcFrame::notification(
+        "turn/retry-started",
+        serde_json::json!({
+            "serverInstanceId": "srv_one",
+            "eventId": "evt_retry_one",
+            "threadId": "thr_one",
+            "turnId": "turn_one",
+            "threadRevision": 2,
+            "occurredAt": "2026-09-23T00:00:00Z",
+            "attempt": 2,
+            "maxAttempts": 6
+        }),
+    )
+    .expect("retry notification");
+    assert_eq!(
+        notification_routing(&retry_started),
+        (EventPriority::Data, QueueKind::Data)
+    );
+}
+
 /// 上下文压缩终态不能因普通 delta 背压丢失，三类生命周期统一占用 control reserve。
 #[test]
 fn context_compaction_notifications_use_control_lane() {

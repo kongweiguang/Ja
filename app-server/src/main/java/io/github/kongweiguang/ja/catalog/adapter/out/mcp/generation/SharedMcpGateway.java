@@ -12,6 +12,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -21,8 +23,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class SharedMcpGateway implements McpGateway {
     private final McpSnapshot snapshot;
     private final Map<String, McpServiceDirectory> services;
+    private final List<McpServerStatus> serverStatuses;
     private final ObjectMapper objectMapper;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final Set<String> projectServerIds;
+    private final BooleanSupplier projectTrusted;
 
     /**
      * 构造时 pin 当前目录中的全部服务，使配置退休不能破坏已生成 batch 的精确路由。
@@ -30,10 +35,16 @@ final class SharedMcpGateway implements McpGateway {
     SharedMcpGateway(
             McpSnapshot snapshot,
             Map<String, McpServiceDirectory> services,
-            ObjectMapper objectMapper) {
+            List<McpServerStatus> serverStatuses,
+            ObjectMapper objectMapper,
+            Set<String> projectServerIds,
+            BooleanSupplier projectTrusted) {
         this.snapshot = Objects.requireNonNull(snapshot, "snapshot");
         this.services = Map.copyOf(services);
+        this.serverStatuses = List.copyOf(serverStatuses);
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper").copy();
+        this.projectServerIds = Set.copyOf(projectServerIds);
+        this.projectTrusted = Objects.requireNonNull(projectTrusted, "projectTrusted");
         pinServices(this.services);
     }
 
@@ -91,6 +102,13 @@ final class SharedMcpGateway implements McpGateway {
         return snapshot;
     }
 
+    /** 返回同一 Provider 安全点生成的脱敏服务状态，不能触发目录刷新。 */
+    @Override
+    public List<McpServerStatus> serverStatuses() {
+        requireOpen();
+        return serverStatuses;
+    }
+
     /**
      * 仅按快照中精确 serverId 路由到已 pin owner，再由 Runtime 执行 dirty 重拉与 hash 校验。
      */
@@ -104,6 +122,9 @@ final class SharedMcpGateway implements McpGateway {
         McpTool expected = snapshot.tools().stream()
                 .filter(tool -> tool.spec().name().equals(invocation.localToolName()))
                 .findFirst().orElseThrow(() -> new IllegalArgumentException("mcp_snapshot_tool_missing"));
+        if (projectServerIds.contains(expected.serverId()) && !projectTrusted.getAsBoolean()) {
+            throw new IllegalStateException("project_mcp_trust_revoked");
+        }
         McpServiceDirectory service = services.get(expected.serverId());
         if (service == null) {
             throw new IllegalArgumentException("mcp_snapshot_server_missing");

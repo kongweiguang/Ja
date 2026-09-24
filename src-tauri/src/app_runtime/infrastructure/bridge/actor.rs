@@ -28,8 +28,9 @@ pub(crate) enum BridgeCommand {
         trust: String,
         reply: Reply<WorkspaceDto>,
     },
-    GeneralWorkspaceRead {
-        reply: Reply<Value>,
+    WorkspaceOpenById {
+        workspace_id: String,
+        reply: Reply<WorkspaceDto>,
     },
     WorkspacePathSearch {
         input: WorkspacePathSearchInput,
@@ -39,6 +40,14 @@ pub(crate) enum BridgeCommand {
         reply: Reply<()>,
     },
     TurnStart {
+        params: Value,
+        reply: Reply<TurnAccepted>,
+    },
+    TurnContinue {
+        params: Value,
+        reply: Reply<TurnAccepted>,
+    },
+    TurnReask {
         params: Value,
         reply: Reply<TurnAccepted>,
     },
@@ -763,10 +772,14 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
-            Ok(BridgeCommand::GeneralWorkspaceRead { reply }) => {
-                let _ = reply.send(general_workspace_read_runtime(
+            Ok(BridgeCommand::WorkspaceOpenById {
+                workspace_id,
+                reply,
+            }) => {
+                let _ = reply.send(workspace_open_by_id_runtime(
                     &context.config,
                     &mut runtime,
+                    workspace_id,
                     &context.exit_control,
                 ));
             }
@@ -787,6 +800,22 @@ pub(super) fn actor_loop(
             }
             Ok(BridgeCommand::TurnStart { params, reply }) => {
                 let _ = reply.send(turn_runtime(
+                    &context.config,
+                    &mut runtime,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TurnContinue { params, reply }) => {
+                let _ = reply.send(turn_continue_runtime(
+                    &context.config,
+                    &mut runtime,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TurnReask { params, reply }) => {
+                let _ = reply.send(turn_reask_runtime(
                     &context.config,
                     &mut runtime,
                     params,

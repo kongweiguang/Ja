@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -110,6 +110,23 @@ describe("TurnReviewPanelView", () => {
       "src/b.ts",
       "src/a.ts",
     ]);
+  });
+
+  /** 冻结回合只读，不应提供可修改 Git 状态的右键入口。 */
+  it("冻结的本轮文件不显示变更操作菜单", async () => {
+    render(
+      <TurnReviewPanelView target={target} port={port()} active onShowWorkspaceReview={vi.fn()} />,
+    );
+    const fileRow = await screen.findByRole("treeitem", {
+      name: "查看 src/a.ts 的本轮修改",
+    });
+    fireEvent.contextMenu(fileRow, { clientX: 28, clientY: 36 });
+
+    expect(screen.queryByRole("menuitem")).not.toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: "查看 src/a.ts 的本轮修改" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("新标题立即替换旧正文，旧请求迟到也不能覆盖当前文件", async () => {

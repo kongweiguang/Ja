@@ -98,7 +98,8 @@ public final class ActiveStreamRegistry {
 
     /**
      * 在唯一 Turn 出站边界吸收事件；流式 delta 不改变数据库 revision，持久事件只推进 revision。
-     * ModelStepCommitted 清空已落库正文但保留 streamSeq，保证下一段不会从零开始。
+     * ModelStepCommitted 清空已落库正文，RetryStarted 清空失败草稿；二者均保留 Turn 全局 streamSeq，
+     * 保证下一段持续流和 liveStream 恢复保持连续。
      */
     public synchronized void observe(TurnEvent event, Instant occurredAt) {
         Objects.requireNonNull(event, "event");
@@ -126,6 +127,15 @@ public final class ActiveStreamRegistry {
             return;
         }
         State state = owned;
+        if (event instanceof TurnEvent.RetryStarted) {
+            /* Retry notification is transient but fenced to the committed attempt settlement; duplicate or
+             * stale notifications cannot erase text accepted from the next attempt. */
+            if (context.turnMutationVersion() == state.mutationVersion
+                    && state.rememberEvent(context.eventId())) {
+                state.clearSegments();
+            }
+            return;
+        }
         if (event instanceof TurnEvent.ModelStepCommitted modelStep) {
             /* ModelStep 的 modelRound 是持久提交语义；即使其 Thread revision 较晚到，也要先
              * 收敛这个 Turn 的语义 fence，再清理已经落库的 draft。 */

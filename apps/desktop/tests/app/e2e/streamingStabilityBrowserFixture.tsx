@@ -127,6 +127,8 @@ function prepareTimeline(): void {
 /** fixture 复用生产组件和全局样式，只把 native 端口替换为无副作用的展示回调。 */
 export function StreamingStabilityBrowserFixture() {
   const [draft, setDraft] = useState("");
+  /** 浏览器稳定性 fixture 不触发原生 Explorer，仅满足隔离视图的可选目录入口。 */
+  const openProjectFolderFixture = async (): Promise<void> => undefined;
   const [historyMode, setHistoryMode] = useState<HistoryMode>("ready");
   const turn = useTimelineStore((state) => state.turns[TURN_ID] ?? RUNNING_TURN);
   const thread: ThreadProjection = {
@@ -154,7 +156,7 @@ export function StreamingStabilityBrowserFixture() {
             projects={[{ workspaceId: WORKSPACE_ID, displayName: "稳定性验收" }]}
             projectCatalogLoading={false}
             currentWorkspaceId={WORKSPACE_ID}
-            generalWorkspaceSelected={false}
+            noProjectSelected={false}
             projectSectionCollapsed={false}
             historySectionCollapsed={false}
             runtimeLabel="工作中"
@@ -170,19 +172,22 @@ export function StreamingStabilityBrowserFixture() {
             conversationSearchOpen={false}
             onNewConversation={() => undefined}
             onSelectConversation={() => undefined}
+            onOpenProjectFolder={openProjectFolderFixture}
             onOpenConversationSearch={() => undefined}
             onRenameConversation={async () => undefined}
             onPinConversation={async () => undefined}
             onArchiveConversation={async () => undefined}
             mutatingThreadIds={[]}
             onChooseProject={() => undefined}
-            onSelectGeneral={() => undefined}
+            onSelectNoProject={() => undefined}
             onSelectProject={() => undefined}
             onProjectSectionCollapsedChange={() => undefined}
             onHistorySectionCollapsedChange={() => undefined}
             onRetryProjects={() => undefined}
             onOpenSettings={() => undefined}
             onRequestClose={() => undefined}
+            onOpenWorkspaceFolder={async () => undefined}
+            onOpenLegacySharedFolder={async () => undefined}
           />
         </div>
         <div className="ja-workspace-stage">

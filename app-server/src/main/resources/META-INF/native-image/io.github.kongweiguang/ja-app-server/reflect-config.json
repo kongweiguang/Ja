@@ -509,6 +509,11 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SessionThreadPage",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadLifecycle",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -635,6 +640,11 @@
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadSearch",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SessionThreadSearch",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },

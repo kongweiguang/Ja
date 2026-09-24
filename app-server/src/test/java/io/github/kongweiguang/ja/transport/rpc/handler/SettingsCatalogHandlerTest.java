@@ -90,7 +90,7 @@ final class SettingsCatalogHandlerTest {
 
             ObjectNode tested = invoke(handler, RpcMethod.MCP_TEST,
                     mapper.createObjectNode().put("mcpId", MCP_ID));
-            assertEquals(Set.of("mcpId", "name", "transport", "status", "toolCount"),
+            assertEquals(Set.of("mcpId", "name", "scope", "transport", "status", "toolCount"),
                     fields(tested));
             assertEquals("available", tested.path("status").asText());
 
@@ -149,6 +149,7 @@ final class SettingsCatalogHandlerTest {
                 unsupported(WorkspaceUseCase.class),
                 unsupported(io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase.class),
                 unsupported(ThreadUseCase.class),
+                unsupported(io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase.class),
                 unsupported(TurnUseCase.class),
                 (command, events, cancellation) -> { throw new UnsupportedOperationException("context compaction is unavailable"); },
                 unsupported(ApprovalUseCase.class), catalog,
@@ -186,20 +187,20 @@ final class SettingsCatalogHandlerTest {
 
         /** 返回一页脱敏 MCP 描述，并记录唯一应用入口调用。 */
         @Override
-        public CursorPage<McpServerDescriptor> listMcp(String cursor, int limit) {
+        public CursorPage<McpServerDescriptor> listMcp(String workspaceId, String cursor, int limit) {
             admit();
             assertEquals(1, limit);
             return new CursorPage<>(List.of(new McpServerDescriptor(
-                    MCP_ID, "Fixture", "streamable_http", "configured", 1)), null);
+                    MCP_ID, "Fixture", "global", "streamable_http", "configured", 1)), null);
         }
 
         /** 返回已完成的有界探测，Handler 只映射结果而不管理下游租约。 */
         @Override
-        public CompletionStage<McpServerDescriptor> testMcp(String mcpId) {
+        public CompletionStage<McpServerDescriptor> testMcp(String workspaceId, String mcpId) {
             admit();
             assertEquals(MCP_ID, mcpId);
             return CompletableFuture.completedFuture(new McpServerDescriptor(
-                    MCP_ID, "Fixture", "streamable_http", "available", 1));
+                    MCP_ID, "Fixture", "global", "streamable_http", "available", 1));
         }
 
         /** 返回不含回答的模型验证摘要，并确认请求只携带保存身份与连接取消令牌。 */
@@ -224,7 +225,7 @@ final class SettingsCatalogHandlerTest {
         /** 返回规范 JSON Schema 文本，Jackson 解析只允许发生在 Wire 边界。 */
         @Override
         public CursorPage<McpToolDescriptor> readMcpTools(
-                String mcpId, String cursor, int limit) {
+                String workspaceId, String mcpId, String cursor, int limit) {
             admit();
             assertEquals(MCP_ID, mcpId);
             assertEquals(1, limit);

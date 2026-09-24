@@ -105,8 +105,10 @@ final class AgentToolRunner implements AutoCloseable {
             long duration = 0;
             boolean started = false;
             RuntimeException promptRefreshFailure = null;
-            Optional<String> argumentError = tool == null
+            Optional<String> argumentError = tool == null || tool instanceof McpAgentTool
                     ? Optional.empty() : argumentValidator.invalidReason(tool.spec().inputSchema(), call.arguments());
+            Optional<AgentTool.InvocationValidationFailure> invocationFailure = tool == null
+                    ? Optional.empty() : tool.validationFailure(call);
             if (tool == null) {
                 result = failed("TOOL_BINDING_UNAVAILABLE",
                         "Tool '" + call.toolName()
@@ -119,9 +121,12 @@ final class AgentToolRunner implements AutoCloseable {
                 }
                 result = failed("TOOL_ARGUMENTS_INVALID",
                         diagnostic + ". Correct the arguments and retry this Tool.");
+            } else if (invocationFailure.isPresent()) {
+                AgentTool.InvocationValidationFailure failure = invocationFailure.orElseThrow();
+                result = failed(failure.code(), failure.message());
             } else {
                 AgentTool.ExecutionContext toolExecution = executionContext(execution, call);
-                ToolSideEffect sideEffect = tool.sideEffect();
+                ToolSideEffect sideEffect = tool.sideEffect(call);
                 AgentPromptSession.ToolGuard promptGuard = execution.command().promptSession().beforeTool(
                         call, sideEffect, execution.command().promptSession().currentRevision());
                 if (!promptGuard.proceed()) {
@@ -137,7 +142,7 @@ final class AgentToolRunner implements AutoCloseable {
                     if (result == null && !Objects.requireNonNull(decision, "Tool policy decision").proceed()) {
                         result = failed(decision.code(), decision.message());
                     } else if (result == null) {
-                        ToolPolicy.Decision planDecision = PlanToolPolicy.validate(tool,
+                        ToolPolicy.Decision planDecision = PlanToolPolicy.validate(tool, call,
                                 execution.command().origin(), execution.collaborationMode());
                         if (!planDecision.proceed()) {
                             result = failed(planDecision.code(), planDecision.message());
@@ -148,7 +153,7 @@ final class AgentToolRunner implements AutoCloseable {
                             if (toolExecution.accessMode()
                                     == io.github.kongweiguang.ja.conversation.domain.permission.AccessMode
                                     .APPROVAL_REQUIRED
-                                    && requiresExternalApproval(tool)
+                                    && requiresExternalApproval(tool, call)
                                     && !awaitApproval(execution, call)) {
                                 result = failed("TOOL_DENIED", "Tool denied by user");
                             }
@@ -164,7 +169,7 @@ final class AgentToolRunner implements AutoCloseable {
                                 tool.prepareRecoveryEvidence(call, toolExecution, execution.cancellation());
                         /* 可信内建 Tool 只改变 Ja 的控制面；跳过 Goal attempt，避免 request_user_input
                          * 抛出挂起信号时留下 STARTED 的伪执行记录。真正的 Plan/Goal 工作 Tool 仍走 ledger。 */
-                        Optional<GoalToolExecutionPort.Attempt> goalAttempt = isTrustedInternal(tool)
+                        Optional<GoalToolExecutionPort.Attempt> goalAttempt = isTrustedInternal(tool, call)
                                 ? Optional.empty()
                                 : execution.goalTools().prepare(
                                         new GoalToolExecutionPort.Prepare(execution.command().threadId(),
@@ -180,7 +185,7 @@ final class AgentToolRunner implements AutoCloseable {
                                         call.callId(), call.ordinal()),
                                 List.copyOf(startedFacts),
                                 execution.cursor().get());
-                        if (tool.workspaceMutationMode() == AgentTool.WorkspaceMutationMode.UNOBSERVABLE) {
+                        if (tool.workspaceMutationMode(call) == AgentTool.WorkspaceMutationMode.UNOBSERVABLE) {
                             execution.command().changeTracker()
                                     .markIncomplete(io.github.kongweiguang.ja.conversation.domain.TurnChangeSet
                                             .IncompleteReason.UNKNOWN_MUTATOR);
@@ -218,14 +223,20 @@ final class AgentToolRunner implements AutoCloseable {
     /**
      * 审批豁免必须同时满足内建路由和显式内核标记；路由检查防止 MCP 适配器伪造内部审批语义。
      */
-    private static boolean requiresExternalApproval(AgentTool tool) {
-        return !isTrustedInternal(tool);
+    private static boolean requiresExternalApproval(AgentTool tool, AgentTool.Invocation call) {
+        return !isTrustedInternal(tool, call);
     }
 
-    /** 可信控制面身份必须同时来自内建路由与审批元数据，外部 Tool 不能借标记逃避 Goal 记录。 */
+    /** 信任只来自真实内建控制面或经完整预检的 MCP 本地只读 action，避免外部 Tool 自述豁免。 */
     private static boolean isTrustedInternal(AgentTool tool) {
         return tool.bindingDescriptor().routeKind() == AgentTool.RouteKind.BUILTIN
                 && tool.approvalRequirement() == AgentTool.ApprovalRequirement.TRUSTED_INTERNAL;
+    }
+
+    /** 动态信任限定于固定 MCP 网关的本地 status/search/describe，且目标与 Schema 已校验通过。 */
+    private static boolean isTrustedInternal(AgentTool tool, AgentTool.Invocation invocation) {
+        return isTrustedInternal(tool)
+                || tool instanceof McpAgentTool gateway && gateway.isTrustedLocalReadAction(invocation);
     }
 
     /** 仅为真实 Builtin grep 的空 query 增加下一步提示；该判断不改变 MCP 路由或任何权限边界。 */
@@ -365,7 +376,7 @@ final class AgentToolRunner implements AutoCloseable {
         try {
             execution.cancellation().throwIfCancellationRequested();
             AgentTool.ExecutionContext context = executionContext(execution, call);
-            if (tool.sideEffect() == ToolSideEffect.READ_ONLY) {
+            if (tool.sideEffect(call) == ToolSideEffect.READ_ONLY) {
                 return await(tool.execute(call, context, execution.cancellation()));
             }
             return executeWithWriteLease(execution, call, tool, context);
@@ -381,7 +392,7 @@ final class AgentToolRunner implements AutoCloseable {
             /* 请求已先落 SQLite；向 Turn 状态机透传，不能把用户等待伪装成 Tool 失败。 */
             throw suspended;
         } catch (RuntimeException failure) {
-            boolean external = tool.sideEffect() == ToolSideEffect.EXTERNAL;
+            boolean external = tool.sideEffect(call) == ToolSideEffect.EXTERNAL;
             return new AgentTool.ToolResult(ToolOutcome.FAILED,
                     external
                             ? "Tool execution did not return a confirmed result. "

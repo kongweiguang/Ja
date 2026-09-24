@@ -568,8 +568,7 @@ final class McpRuntimeTest {
                         new ToolSpec(
                                 localName,
                                 "turn-wide fixture",
-                                JsonObjects.builder().putText("type", "object")
-                                        .putBoolean("additionalProperties", false).build()))),
+                                fixtureInputSchema(null)))),
                 List.of(definition("turn-wide")), mapper,
                 Instant.EPOCH);
         McpSessionFactory factory = (ignored, admittedDeadline) -> {
@@ -650,15 +649,23 @@ final class McpRuntimeTest {
 
     /** 创建小型合法远端 Tool，用于隔离目录资源边界测试。 */
     private static McpSession.RemoteTool tool(String name) {
-        return new McpSession.RemoteTool(name, "fixture tool", JsonObjects.builder()
-                .putText("type", "object").putBoolean("additionalProperties", false).build());
+        return new McpSession.RemoteTool(name, "fixture tool", fixtureInputSchema(null));
     }
 
     /** 创建带显式 schema 标记的 Tool，用于证明同名路由变化也会失败关闭。 */
     private static McpSession.RemoteTool tool(String name, String marker) {
-        return new McpSession.RemoteTool(name, "fixture tool", JsonObjects.builder()
-                .putText("type", "object").putText("title", marker)
-                .putBoolean("additionalProperties", false).build());
+        return new McpSession.RemoteTool(name, "fixture tool", fixtureInputSchema(marker));
+    }
+
+    /** 夹具调用带有 value 字段，远端 Schema 必须覆盖合法参数校验路径。 */
+    private static JsonObject fixtureInputSchema(String marker) {
+        var schema = JsonObjects.builder().putText("type", "object");
+        if (marker != null) schema.putText("title", marker);
+        return schema
+                .put("properties", JsonObjects.builder().put("value", JsonObjects.builder()
+                        .putText("type", "string").build()).build())
+                .put("required", new JsonArray(List.of(new JsonText("value"))))
+                .putBoolean("additionalProperties", false).build();
     }
 
     /** 捕获稳定的 Runtime 关闭结果，以便确定性断言并发调用方。 */

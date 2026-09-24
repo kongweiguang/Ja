@@ -212,6 +212,41 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                 admission -> admissionReceipt(store.admit(repositoryAdmission(admission))), "");
     }
 
+    /** 继续请求不创建 USER 消息；来源从当前 Thread 最后一个失败问题解析并由 admission 事务重验。 */
+    @Override
+    @SuppressWarnings("PMD.CloseResource")
+    public TurnUseCase.Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) {
+        if (request.origin() != TurnOrigin.USER_CONTINUATION) {
+            throw new IllegalArgumentException("question continuation origin is required");
+        }
+        String sourceMessageId = store.findLastUnansweredQuestionMessageId(
+                request.threadId(), request.expectedThreadRevision()).orElseThrow(() ->
+                TurnUseCase.QuestionRecoveryException.of(TurnUseCase.QuestionRecoveryFailure.NOT_REASKABLE));
+        String continuationContext = "继续回答当前路径最后一个尚未成功答复的问题，并结合已经提交的工具结果。";
+        return startWithAdmission(StartCommand.internal(request), sink,
+                admission -> admissionReceipt(store.admitContinuation(
+                        new ConversationRepository.ContinuationAdmission(admission.threadId(), admission.turnId(),
+                                admission.expectedThreadRevision(), admission.requestedAt(),
+                                admission.initialExecution(), continuationContext, sourceMessageId))),
+                continuationContext);
+    }
+
+    /** 重答沿普通 USER 生命周期运行，但只在持久 CAS 切旧路径成功时才进入队列。 */
+    @Override
+    @SuppressWarnings("PMD.CloseResource")
+    public TurnUseCase.Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink) {
+        try {
+            return startWithAdmission(StartCommand.user(request, TurnOrigin.USER), sink,
+                    admission -> admissionReceipt(store.admitReask(new ConversationRepository.ReaskAdmission(
+                            repositoryAdmission(admission), sourceMessageId))), "");
+        } catch (StorageException failure) {
+            if (failure.code() == StorageException.Code.INVALID_STATE) {
+                throw TurnUseCase.QuestionRecoveryException.of(TurnUseCase.QuestionRecoveryFailure.NOT_REASKABLE);
+            }
+            throw failure;
+        }
+    }
+
     /** Goal/Plan 内部 Turn 复用完整生命周期，但类型和 admission 都不提供 USER message。 */
     public TurnUseCase.Accepted startContinuation(InternalTurnStartRequest request, String hiddenSummary,
                                                   TurnEventSink sink) {
@@ -231,7 +266,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                 admission -> admissionReceipt(store.admitContinuation(
                 new ConversationRepository.ContinuationAdmission(admission.threadId(), admission.turnId(),
                         admission.expectedThreadRevision(), admission.requestedAt(), admission.initialExecution(),
-                        hiddenSummary))),
+                        hiddenSummary, null))),
                 hiddenSummary, ceiling);
     }
 

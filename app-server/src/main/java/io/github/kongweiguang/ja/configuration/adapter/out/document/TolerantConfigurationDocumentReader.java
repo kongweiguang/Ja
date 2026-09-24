@@ -26,7 +26,7 @@ import java.util.Set;
 final class TolerantConfigurationDocumentReader {
     private static final int CURRENT_SCHEMA_VERSION = ConfigurationDocumentFactory.CURRENT_SCHEMA_VERSION;
     private static final long DEFAULT_CONNECT_TIMEOUT_MILLIS = 10_000L;
-    private static final long DEFAULT_REQUEST_TIMEOUT_MILLIS = 120_000L;
+    private static final long DEFAULT_REQUEST_TIMEOUT_MILLIS = 300_000L;
     private static final long DEFAULT_WALL_TIMEOUT_MILLIS = 3_600_000L;
     private static final long DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000L;
     private static final long DEFAULT_MAX_OUTPUT_TOKENS = 8_192L;
@@ -39,7 +39,7 @@ final class TolerantConfigurationDocumentReader {
             "default_model_id", "default_reasoning_level", "interaction", "subagents",
             "providers", "mcp_servers", "skills");
     private static final Set<String> PROJECT_ROOT_KEYS = Set.of(
-            "schema_version", "config_revision", "skills", "disabled_skills");
+            "schema_version", "config_revision", "skills", "disabled_skills", "mcp_servers");
     private static final Set<String> PROVIDER_KEYS = Set.of(
             "provider_id", "name", "api", "base_url", "credential_id", "network_timeouts",
             "agent_defaults", "models");
@@ -112,7 +112,7 @@ final class TolerantConfigurationDocumentReader {
                     issue(issues, "user", "mcp_servers", null, "INVALID_ENTRY", "entry_skipped", "edit");
                     continue;
                 }
-                ObjectNode server = normalizeMcpServer(entry, mcpIds, issues);
+                ObjectNode server = normalizeMcpServer(entry, mcpIds, issues, "user");
                 if (server != null) servers.add(server);
             }
         } else if (sourceServers != null) {
@@ -124,7 +124,7 @@ final class TolerantConfigurationDocumentReader {
         return result;
     }
 
-    /** 项目层只能生成 Skill 的安全收紧投影，任何其它字段都不进入有效配置。 */
+    /** 项目层仅保留可证明安全的 Skill 和 MCP 条目，坏服务不能拖垮其它项目能力。 */
     private static ObjectNode normalizeProject(ObjectNode source, List<ConfigurationData.Issue> issues) {
         ObjectNode result = source.objectNode();
         result.put("schema_version", CURRENT_SCHEMA_VERSION);
@@ -138,6 +138,21 @@ final class TolerantConfigurationDocumentReader {
         ArrayNode disabled = normalizeSkillReferences(source.get("disabled_skills"), ConfigurationScope.PROJECT,
                 true, issues);
         if (!disabled.isEmpty()) result.set("disabled_skills", disabled);
+        ArrayNode servers = result.putArray("mcp_servers");
+        Set<String> mcpIds = new HashSet<>();
+        JsonNode sourceServers = source.get("mcp_servers");
+        if (sourceServers instanceof ArrayNode entries) {
+            for (JsonNode entry : entries) {
+                if (entry instanceof ObjectNode object) {
+                    ObjectNode server = normalizeMcpServer(object, mcpIds, issues, "project");
+                    if (server != null) servers.add(server);
+                } else {
+                    issue(issues, "project", "mcp_servers", null, "INVALID_ENTRY", "entry_skipped", "edit");
+                }
+            }
+        } else if (sourceServers != null) {
+            issue(issues, "project", "mcp_servers", null, "INVALID_FIELD", "default_in_use", "edit");
+        }
         return result;
     }
 
@@ -225,29 +240,29 @@ final class TolerantConfigurationDocumentReader {
 
     /** MCP 参数异常会使该工具条目停用，不允许宽容读取把不确定鉴权降级成无鉴权执行。 */
     private static ObjectNode normalizeMcpServer(ObjectNode source, Set<String> identities,
-                                                 List<ConfigurationData.Issue> issues) {
+                                                 List<ConfigurationData.Issue> issues, String scope) {
         String id = typedId(source.get("mcp_id"), "mcp_");
         String transport = text(source.get("transport"));
         String endpoint = text(source.get("endpoint"));
         if (id == null || !identities.add(id) || !("stdio".equals(transport) || "streamable_http".equals(transport))
                 || endpoint == null || endpoint.isBlank() || endpoint.length() > 4_096) {
-            issue(issues, "user", "mcp_servers", id, "INVALID_MCP", "entry_skipped", "edit");
+            issue(issues, scope, "mcp_servers", id, "INVALID_MCP", "entry_skipped", "edit");
             return null;
         }
         ObjectNode auth = normalizeMcpAuth(source.get("auth"));
         if (auth == null) {
-            issue(issues, "user", "mcp_servers", id, "INVALID_MCP_AUTH", "entry_skipped", "edit");
+            issue(issues, scope, "mcp_servers", id, "INVALID_MCP_AUTH", "entry_skipped", "edit");
             return null;
         }
-        copyUnknownFields(source, MCP_KEYS, "user", id, issues);
+        copyUnknownFields(source, MCP_KEYS, scope, id, issues);
         ObjectNode result = source.objectNode();
         result.put("mcp_id", id);
-        result.put("name", boundedText(source.get("name"), id, 512, issues, "mcp_servers", id));
+        result.put("name", boundedText(source.get("name"), id, 512, issues, "mcp_servers", id, scope));
         result.put("transport", transport);
         result.put("endpoint", endpoint);
         JsonNode enabled = source.get("enabled");
         if (enabled == null || !enabled.isBoolean()) {
-            issue(issues, "user", "enabled", id, "INVALID_FIELD", "entry_skipped", "edit");
+            issue(issues, scope, "enabled", id, "INVALID_FIELD", "entry_skipped", "edit");
             return null;
         }
         result.set("args", safeStrings(source.get("args"), 128, 4_096));
@@ -258,7 +273,7 @@ final class TolerantConfigurationDocumentReader {
         return result;
     }
 
-    /** 聚合连接超时字段时逐项回退，避免一个错误预算把整个 Provider 丢弃。 */
+    /** 逐项回退连接与流空闲上限；Turn 的绝对截止由执行生命周期单独管理。 */
     private static ObjectNode normalizeNetworkTimeouts(JsonNode value, String entityId,
                                                         List<ConfigurationData.Issue> issues) {
         ObjectNode result = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
@@ -553,9 +568,16 @@ final class TolerantConfigurationDocumentReader {
     /** 文本字段错误回退到同条目的稳定 ID，UI 仍可展示并让用户就地修复。 */
     private static String boundedText(JsonNode value, String fallback, int maxLength,
                                       List<ConfigurationData.Issue> issues, String field, String entityId) {
+        return boundedText(value, fallback, maxLength, issues, field, entityId, "user");
+    }
+
+    /** 项目 MCP 的文本修复必须保留项目来源，否则设置页会把问题指向全局服务。 */
+    private static String boundedText(JsonNode value, String fallback, int maxLength,
+                                      List<ConfigurationData.Issue> issues, String field, String entityId,
+                                      String scope) {
         String text = text(value);
         if (text != null && !text.isBlank() && text.length() <= maxLength) return text;
-        if (value != null) issue(issues, "user", field, entityId, "INVALID_FIELD", "default_in_use", "edit");
+        if (value != null) issue(issues, scope, field, entityId, "INVALID_FIELD", "default_in_use", "edit");
         return fallback;
     }
 

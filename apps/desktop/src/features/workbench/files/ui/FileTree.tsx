@@ -6,17 +6,21 @@ import {
   ChevronRight,
   ExternalLink,
   File as FileIcon,
+  FilePlus2,
   FileQuestion,
   Folder,
   FolderOpen,
+  FolderPlus,
   Link2,
   LoaderCircle,
+  MessageSquarePlus,
+  Pencil,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -26,7 +30,18 @@ import {
   type ReactElement,
 } from "react";
 import { Tree, type NodeApi, type NodeRendererProps } from "react-arborist";
-import { EmptyState, ErrorState, IconButton, LoadingState } from "@/shared/ui/primitives";
+import {
+  EmptyState,
+  ErrorState,
+  IconButton,
+  LoadingState,
+  MenuItem,
+  MenuSeparator,
+  MenuSub,
+  MenuSubContent,
+  MenuSubTrigger,
+  PointerContextMenu,
+} from "@/shared/ui/primitives";
 import type { WorkspaceFileNode } from "../domain/types";
 import { canMoveEntry, findTreeNode, findTreeNodeById, parentPath } from "../domain/filesModel";
 import type { FileTreeProps } from "./types";
@@ -44,10 +59,10 @@ type FileTreeNodeProps = NodeRendererProps<WorkspaceFileNode> & {
 };
 
 interface ContextMenuState {
-  node?: WorkspaceFileNode;
-  parentPath: string;
+  nodeId?: string;
   x: number;
   y: number;
+  key: number;
 }
 
 interface ElementSize {
@@ -324,8 +339,8 @@ export function FileTree({
   const dragCleanupRef = useRef<(() => void) | undefined>(undefined);
   const renameCommitRef = useRef<string | undefined>(undefined);
   const createCommitRef = useRef(false);
+  const contextMenuSessionRef = useRef(0);
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const contextMenuTriggerRef = useRef<HTMLElement | null>(null);
   const mutationMenuAvailable =
     onCreateFile !== undefined ||
@@ -342,22 +357,51 @@ export function FileTree({
   const toolbarAvailable =
     mutationMenuAvailable || onRefresh !== undefined || onMove !== undefined || openMenuAvailable;
   const fileExplorerTarget = openTargets.find((target) => target.target === "file_explorer");
+  const primaryOpenTarget =
+    fileExplorerTarget ?? (openTargets.length === 1 ? openTargets[0] : undefined);
+  const secondaryOpenTargets = openTargets.filter((target) => target !== primaryOpenTarget);
+  const contextMenuNode =
+    contextMenu?.nodeId === undefined ? undefined : findTreeNodeById(nodes, contextMenu.nodeId);
+  const contextMenuTargetAvailable =
+    contextMenu?.nodeId === undefined || contextMenuNode !== undefined;
+  const contextMenuParentPath =
+    contextMenu === undefined
+      ? undefined
+      : contextMenuNode === undefined
+        ? contextMenu.nodeId === undefined
+          ? ""
+          : undefined
+        : contextMenuNode.kind === "directory"
+          ? contextMenuNode.path
+          : parentPath(contextMenuNode.path);
+  const contextMenuParentAvailable =
+    contextMenuParentPath !== undefined &&
+    (contextMenuParentPath === "" ||
+      findTreeNode(nodes, contextMenuParentPath)?.kind === "directory");
 
-  /** 特殊节点不继承普通文件动作；只有确实能渲染至少一个条目时才接管系统右键菜单。 */
+  /** 仅当目标或其当前父目录仍存在可执行动作时接管原生菜单，避免空菜单与陈旧路径。 */
   const rowMenuAvailableFor = useCallback(
-    (node: WorkspaceFileNode): boolean =>
-      onCreateFile !== undefined ||
-      onCreateDirectory !== undefined ||
-      onRefresh !== undefined ||
-      (isManagedEntry(node) &&
-        (onAddToConversation !== undefined ||
-          onRename !== undefined ||
-          onTrash !== undefined ||
-          openMenuAvailable)),
+    (node: WorkspaceFileNode): boolean => {
+      const targetDirectory = node.kind === "directory" ? node.path : parentPath(node.path);
+      const directoryExists =
+        targetDirectory === "" || findTreeNode(nodes, targetDirectory)?.kind === "directory";
+      const hasParentAction =
+        directoryExists &&
+        (onRefresh !== undefined || onCreateFile !== undefined || onCreateDirectory !== undefined);
+      return (
+        hasParentAction ||
+        (isManagedEntry(node) &&
+          (onAddToConversation !== undefined ||
+            onRename !== undefined ||
+            onTrash !== undefined ||
+            openMenuAvailable))
+      );
+    },
     [
       onAddToConversation,
       onCreateDirectory,
       onCreateFile,
+      nodes,
       onRefresh,
       onRename,
       onTrash,
@@ -382,59 +426,32 @@ export function FileTree({
     });
   }, []);
 
-  /** 统一保存菜单目标、父目录和焦点来源，根目录与行菜单不会复制定位或恢复规则。 */
+  /** 打开方式统一使用菜单快照对应的当前节点路径，动作失败仍交由原控制器显示错误。 */
+  const openTargetFromMenu = (target: (typeof openTargets)[number]): void => {
+    const relativePath = contextMenuNode?.path ?? "";
+    closeContextMenu(false);
+    void Promise.resolve(onOpenTarget?.(target.target, relativePath)).catch(() => undefined);
+  };
+
+  /** 保存目标稳定 id 与本次定位代际，执行前会从最新树投影重新解析目标。 */
   const openContextMenu = useCallback(
-    (
-      node: WorkspaceFileNode | undefined,
-      parent: string,
-      x: number,
-      y: number,
-      trigger: HTMLElement,
-    ): void => {
+    (node: WorkspaceFileNode | undefined, x: number, y: number, trigger: HTMLElement): void => {
       contextMenuTriggerRef.current = trigger;
-      setContextMenu({ node, parentPath: parent, x, y });
+      contextMenuSessionRef.current += 1;
+      setContextMenu({ nodeId: node?.id, x, y, key: contextMenuSessionRef.current });
     },
     [],
   );
 
   useEffect(() => {
     if (contextMenu === undefined) return undefined;
-    /** 指针移到菜单外代表用户已经转移上下文，此时关闭但不抢回焦点。 */
+    /** 应用失焦会使原指针与键盘上下文失效，关闭后不抢回窗口外的焦点。 */
     const close = (): void => closeContextMenu(false);
-    document.addEventListener("pointerdown", close);
     window.addEventListener("blur", close);
-    window.addEventListener("resize", close);
-    window.addEventListener("scroll", close, true);
     return () => {
-      document.removeEventListener("pointerdown", close);
       window.removeEventListener("blur", close);
-      window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", close, true);
     };
   }, [closeContextMenu, contextMenu]);
-
-  useLayoutEffect(() => {
-    if (contextMenu === undefined) return;
-    const menu = contextMenuRef.current;
-    if (menu === null) return;
-    const bounds = menu.getBoundingClientRect();
-    const margin = 8;
-    const nextX = Math.max(
-      margin,
-      Math.min(contextMenu.x, window.innerWidth - bounds.width - margin),
-    );
-    const nextY = Math.max(
-      margin,
-      Math.min(contextMenu.y, window.innerHeight - bounds.height - margin),
-    );
-    if (nextX !== contextMenu.x || nextY !== contextMenu.y) {
-      setContextMenu((current) =>
-        current === undefined ? current : { ...current, x: nextX, y: nextY },
-      );
-      return;
-    }
-    menu.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
-  }, [contextMenu]);
 
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
@@ -651,13 +668,7 @@ export function FileTree({
       event.stopPropagation();
       const trigger =
         event.currentTarget.closest<HTMLElement>('[role="treeitem"]') ?? event.currentTarget;
-      openContextMenu(
-        node,
-        node.kind === "directory" ? node.path : parentPath(node.path),
-        event.clientX,
-        event.clientY,
-        trigger,
-      );
+      openContextMenu(node, event.clientX, event.clientY, trigger);
     },
     [onContextMenu, openContextMenu, rowMenuAvailableFor],
   );
@@ -666,58 +677,13 @@ export function FileTree({
   const onHostContextMenu = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>): void => {
       const target = event.target instanceof Element ? event.target : undefined;
-      if (
-        !rootMenuAvailable ||
-        target?.closest("[data-path]") !== null ||
-        target?.closest(".ja-file-tree-context-menu") !== null
-      )
-        return;
+      if (!rootMenuAvailable || target?.closest("[data-path]") !== null) return;
       event.preventDefault();
       event.stopPropagation();
       const tree = event.currentTarget.querySelector<HTMLElement>('[role="tree"]');
-      openContextMenu(undefined, "", event.clientX, event.clientY, tree ?? event.currentTarget);
+      openContextMenu(undefined, event.clientX, event.clientY, tree ?? event.currentTarget);
     },
     [openContextMenu, rootMenuAvailable],
-  );
-
-  /** 菜单使用 roving focus；方向键循环，Escape 返回来源，Tab 则尊重用户离开菜单的意图。 */
-  const onContextMenuKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
-      const items = [
-        ...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
-      ];
-      if (items.length === 0) return;
-      const activeIndex = items.findIndex((item) => item === document.activeElement);
-      let nextIndex: number | undefined;
-      switch (event.key) {
-        case "ArrowDown":
-          nextIndex = (activeIndex + 1 + items.length) % items.length;
-          break;
-        case "ArrowUp":
-          nextIndex = (activeIndex - 1 + items.length) % items.length;
-          break;
-        case "Home":
-          nextIndex = 0;
-          break;
-        case "End":
-          nextIndex = items.length - 1;
-          break;
-        case "Escape":
-          event.preventDefault();
-          event.stopPropagation();
-          closeContextMenu(true);
-          return;
-        case "Tab":
-          closeContextMenu(false);
-          return;
-        default:
-          return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      items[nextIndex]?.focus();
-    },
-    [closeContextMenu],
   );
 
   /** 从键盘锚定当前选择；没有选择时 Context Menu 键落到根目录，保持鼠标与键盘同权。 */
@@ -726,7 +692,7 @@ export function FileTree({
       const target = event.target instanceof Element ? event.target : undefined;
       if (
         target?.closest(
-          "button, input, textarea, [contenteditable='true'], .ja-file-tree-context-menu",
+          "button, input, textarea, [contenteditable='true'], .ja-pointer-context-menu",
         ) !== null
       )
         return;
@@ -755,7 +721,6 @@ export function FileTree({
         const bounds = (renderedNode ?? trigger).getBoundingClientRect();
         openContextMenu(
           node,
-          node === undefined ? "" : node.kind === "directory" ? node.path : parentPath(node.path),
           bounds.left + Math.min(24, Math.max(0, bounds.width)),
           bounds.bottom,
           trigger,
@@ -1003,137 +968,142 @@ export function FileTree({
           </Tree>
         )}
       </div>
-      {contextMenu === undefined ? null : (
-        <div
-          ref={contextMenuRef}
-          className="ja-file-tree-context-menu"
-          role="menu"
-          aria-label={
-            contextMenu.node === undefined
-              ? "工作区根目录操作"
-              : `${contextMenu.node.name} 文件操作`
+      {contextMenu === undefined || !contextMenuTargetAvailable ? null : (
+        <PointerContextMenu
+          key={contextMenu.key}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={
+            contextMenuNode === undefined ? "工作区根目录操作" : `${contextMenuNode.name} 文件操作`
           }
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onPointerDown={(event) => event.stopPropagation()}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
+          onOpenChange={(open) => {
+            if (!open) closeContextMenu(false);
           }}
-          onKeyDown={onContextMenuKeyDown}
+          onRestoreFocus={() => closeContextMenu(true)}
         >
           {onAddToConversation === undefined ||
-          contextMenu.node === undefined ||
-          !isManagedEntry(contextMenu.node) ? null : (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                const node = contextMenu.node;
-                if (node === undefined) return;
+          contextMenuNode === undefined ||
+          !isManagedEntry(contextMenuNode) ? null : (
+            <MenuItem
+              onSelect={() => {
                 closeContextMenu(false);
-                onAddToConversation(node);
+                onAddToConversation(contextMenuNode);
               }}
             >
+              <MessageSquarePlus aria-hidden="true" />
               <span>添加到对话</span>
-            </button>
+            </MenuItem>
           )}
-          {onCreateFile === undefined ? null : (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => startCreate("file", contextMenu.parentPath)}
+          {onCreateFile === undefined || !contextMenuParentAvailable ? null : (
+            <MenuItem
+              onSelect={() => {
+                if (contextMenuParentPath !== undefined) startCreate("file", contextMenuParentPath);
+              }}
             >
+              <FilePlus2 aria-hidden="true" />
               <span>新建文件</span>
-            </button>
+            </MenuItem>
           )}
-          {onCreateDirectory === undefined ? null : (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => startCreate("directory", contextMenu.parentPath)}
+          {onCreateDirectory === undefined || !contextMenuParentAvailable ? null : (
+            <MenuItem
+              onSelect={() => {
+                if (contextMenuParentPath !== undefined)
+                  startCreate("directory", contextMenuParentPath);
+              }}
             >
+              <FolderPlus aria-hidden="true" />
               <span>新建目录</span>
-            </button>
+            </MenuItem>
           )}
           {onRename === undefined ||
-          contextMenu.node === undefined ||
-          !isManagedEntry(contextMenu.node) ? null : (
-            <button
-              type="button"
-              role="menuitem"
-              aria-keyshortcuts="F2"
-              onClick={() => {
-                const node = contextMenu.node;
-                if (node !== undefined) startRename(node);
-              }}
-            >
+          contextMenuNode === undefined ||
+          !isManagedEntry(contextMenuNode) ? null : (
+            <MenuItem aria-keyshortcuts="F2" onSelect={() => startRename(contextMenuNode)}>
+              <Pencil aria-hidden="true" />
               <span>重命名</span>
               <kbd aria-hidden="true">F2</kbd>
-            </button>
+            </MenuItem>
           )}
           {onTrash === undefined ||
-          contextMenu.node === undefined ||
-          !isManagedEntry(contextMenu.node) ? null : (
-            <button
-              type="button"
-              role="menuitem"
-              aria-keyshortcuts="Delete"
-              className="is-danger"
-              onClick={() => {
-                const node = contextMenu.node;
-                if (node === undefined) return;
-                closeContextMenu(false);
-                void Promise.resolve(onTrash(node)).catch(() => undefined);
-              }}
-            >
-              <span>移入回收站</span>
-              <kbd aria-hidden="true">Delete</kbd>
-            </button>
-          )}
-          {!openMenuAvailable ||
-          (contextMenu.node !== undefined && !isManagedEntry(contextMenu.node)) ? null : (
+          contextMenuNode === undefined ||
+          !isManagedEntry(contextMenuNode) ? null : (
             <>
-              <div className="ja-file-tree-context-separator" role="separator" />
-              {openTargets.map((target) => (
-                <button
-                  type="button"
-                  role="menuitem"
-                  key={target.target}
-                  onClick={() => {
-                    const relativePath = contextMenu.node?.path ?? "";
-                    closeContextMenu(false);
-                    void Promise.resolve(onOpenTarget?.(target.target, relativePath)).catch(
-                      () => undefined,
-                    );
-                  }}
-                >
-                  <span>
-                    {openTargetLabel(
-                      target.displayName,
-                      target.target,
-                      contextMenu.node !== undefined,
-                    )}
-                  </span>
-                </button>
-              ))}
+              {onAddToConversation !== undefined ||
+              onRename !== undefined ||
+              (contextMenuParentAvailable &&
+                (onCreateFile !== undefined || onCreateDirectory !== undefined)) ? (
+                <MenuSeparator />
+              ) : null}
+              <MenuItem
+                aria-keyshortcuts="Delete"
+                className="is-danger"
+                onSelect={() => {
+                  closeContextMenu(false);
+                  void Promise.resolve(onTrash(contextMenuNode)).catch(() => undefined);
+                }}
+              >
+                <Trash2 aria-hidden="true" />
+                <span>移入回收站</span>
+                <kbd aria-hidden="true">Delete</kbd>
+              </MenuItem>
             </>
           )}
-          {onRefresh === undefined ? null : (
-            <button
-              type="button"
-              role="menuitem"
+          {!openMenuAvailable ||
+          (contextMenuNode !== undefined && !isManagedEntry(contextMenuNode)) ? null : (
+            <>
+              <MenuSeparator />
+              {primaryOpenTarget === undefined ? null : (
+                <MenuItem onSelect={() => openTargetFromMenu(primaryOpenTarget)}>
+                  <ExternalLink aria-hidden="true" />
+                  <span>
+                    {openTargetLabel(
+                      primaryOpenTarget.displayName,
+                      primaryOpenTarget.target,
+                      contextMenuNode !== undefined,
+                    )}
+                  </span>
+                </MenuItem>
+              )}
+              {secondaryOpenTargets.length === 0 ? null : (
+                <MenuSub>
+                  <MenuSubTrigger>
+                    <ExternalLink aria-hidden="true" />
+                    <span>{primaryOpenTarget === undefined ? "打开方式" : "使用其他应用打开"}</span>
+                    <ChevronRight aria-hidden="true" style={{ marginInlineStart: "auto" }} />
+                  </MenuSubTrigger>
+                  <MenuSubContent>
+                    {secondaryOpenTargets.map((target) => (
+                      <MenuItem key={target.target} onSelect={() => openTargetFromMenu(target)}>
+                        <ExternalLink aria-hidden="true" />
+                        <span>
+                          {openTargetLabel(
+                            target.displayName,
+                            target.target,
+                            contextMenuNode !== undefined,
+                          )}
+                        </span>
+                      </MenuItem>
+                    ))}
+                  </MenuSubContent>
+                </MenuSub>
+              )}
+            </>
+          )}
+          {onRefresh === undefined || !contextMenuParentAvailable ? null : (
+            <MenuItem
               aria-keyshortcuts="F5"
-              onClick={() => {
-                const path = contextMenu.parentPath;
+              onSelect={() => {
+                if (contextMenuParentPath === undefined) return;
                 closeContextMenu(true);
-                void Promise.resolve(onRefresh(path)).catch(() => undefined);
+                void Promise.resolve(onRefresh(contextMenuParentPath)).catch(() => undefined);
               }}
             >
-              <span>{contextMenu.node === undefined ? "刷新工作区" : "刷新此目录"}</span>
+              <RefreshCw aria-hidden="true" />
+              <span>{contextMenuNode === undefined ? "刷新工作区" : "刷新此目录"}</span>
               <kbd aria-hidden="true">F5</kbd>
-            </button>
+            </MenuItem>
           )}
-        </div>
+        </PointerContextMenu>
       )}
     </div>
   );

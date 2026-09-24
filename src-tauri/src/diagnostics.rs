@@ -34,6 +34,48 @@ const SAFE_EVENT_QUEUE_METRICS: &[&str] = &[
     "runtime_event_queue_totals",
 ];
 const SAFE_EVENT_QUEUE_LANES: &[&str] = &["control", "data"];
+const RUNTIME_STARTUP_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.runtime_startup";
+const SAFE_RUNTIME_STARTUP_PHASES: &[&str] =
+    &["supervisor_start", "ready_token_echo", "event_pump_take"];
+const SAFE_RUNTIME_STARTUP_VARIANTS: &[&str] = &[
+    "invalid_config",
+    "invalid_timeout",
+    "codec_unexpected_eof",
+    "codec_partial_frame",
+    "codec_empty_frame",
+    "codec_invalid_utf8",
+    "codec_invalid_json",
+    "codec_duplicate_key",
+    "codec_non_object",
+    "codec_invalid_envelope",
+    "codec_handshake_failed",
+    "codec_invalid_error_catalog",
+    "codec_invalid_id",
+    "codec_invalid_limit",
+    "codec_frame_too_large",
+    "codec_io",
+    "queue_full",
+    "queue_closed",
+    "pending_limit",
+    "request_ledger_exhausted",
+    "duplicate_request",
+    "deadline_exceeded",
+    "cancelled",
+    "session_closed",
+    "not_ready",
+    "incompatible",
+    "invalid_state",
+    "spawn",
+    "process_tree",
+    "process_exited",
+    "shutting_down",
+    "handshake_failed",
+    "protocol_fault",
+    "invalid_error_catalog",
+    "shutdown_timeout",
+    "backoff",
+    "faulted",
+];
 
 /// 在整个 Tauri 生命周期内持有非阻塞写入器，确保正常退出时能刷新缓冲记录。
 #[derive(Debug)]
@@ -72,7 +114,7 @@ pub(crate) fn initialize_native_tracing(
     })
 }
 
-/// 只格式化时间、级别、编译期 target，以及固定白名单中的 WebView 故障码和运行时计数。
+/// 只格式化时间、级别、编译期 target，以及固定白名单中的 WebView 故障码、运行时计数和启动类别。
 /// 原生消息可能合法包含路径或工具输出，因此绝不序列化自由文本字段。
 #[derive(Default)]
 pub(crate) struct RedactedEventFormat {
@@ -107,6 +149,10 @@ where
             }
         } else if metadata.target() == EVENT_QUEUE_METRIC_TARGET {
             let mut visitor = SafeEventQueueMetricVisitor::default();
+            event.record(&mut visitor);
+            visitor.write_to(&mut writer)?;
+        } else if metadata.target() == RUNTIME_STARTUP_DIAGNOSTIC_TARGET {
+            let mut visitor = SafeRuntimeStartupVisitor::default();
             event.record(&mut visitor);
             visitor.write_to(&mut writer)?;
         }
@@ -193,6 +239,61 @@ impl Visit for SafeEventQueueMetricVisitor {
     }
 
     /// formatter 不接受 Debug 字段，防止非 typed tracing 调用绕过数值与白名单约束。
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+}
+
+/// 握手失败诊断仅承载阶段、枚举分类和 generation；其它调用者字段一律丢弃。
+#[derive(Default)]
+struct SafeRuntimeStartupVisitor {
+    phase: Option<&'static str>,
+    variant: Option<&'static str>,
+    generation: Option<u64>,
+}
+
+impl SafeRuntimeStartupVisitor {
+    /// 固定字段顺序输出已通过闭集校验的分类，确保错误载荷不会借 formatter 回流。
+    fn write_to(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        if let Some(phase) = self.phase {
+            write!(writer, " phase={phase}")?;
+        }
+        if let Some(variant) = self.variant {
+            write!(writer, " variant={variant}")?;
+        }
+        if let Some(generation) = self.generation {
+            write!(writer, " generation={generation}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Visit for SafeRuntimeStartupVisitor {
+    /// 阶段和类别只接受编译期白名单，避免自由字符串把错误字段变成日志通道。
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "phase" => {
+                self.phase = SAFE_RUNTIME_STARTUP_PHASES
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            "variant" => {
+                self.variant = SAFE_RUNTIME_STARTUP_VARIANTS
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            _ => {}
+        }
+    }
+
+    /// 只输出 typed u64 generation，避免错误文本或任意 Debug 值伪装成生命周期标识。
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "generation" {
+            self.generation = Some(value);
+        }
+    }
+
+    /// 不接受 Debug 字段，使 path、token、message 和命令不可能通过非 typed 值绕过白名单。
     fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
 }
 

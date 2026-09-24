@@ -30,10 +30,6 @@ public enum RpcMethod {
      */
     WORKSPACE_OPEN("workspace/open"),
     /**
-     * 打开 Java 所有的通用工作区。
-     */
-    WORKSPACE_OPEN_GENERAL("workspace/open-general"),
-    /**
      * 分页列出工作区。
      */
     WORKSPACE_LIST("workspace/list"),
@@ -65,6 +61,8 @@ public enum RpcMethod {
     THREAD_READ("thread/read"),
     /** 读取一个 Thread 的累计 Token 计量，不物化历史页。 */
     THREAD_USAGE_READ("thread/usage/read"),
+    /** 读取当前 Thread 最近一次观测到的 MCP 目录，只返回脱敏状态。 */
+    THREAD_MCP_READ("thread/mcp/read"),
     /** 通过 CAS 设置人工标题。 */
     THREAD_RENAME("thread/rename"),
     /** 通过 revision CAS 更新 Thread 的置顶事实。 */
@@ -193,6 +191,10 @@ public enum RpcMethod {
      * 启动一次 Turn。
      */
     TURN_START("turn/start"),
+    /** 在同一问题下创建隐藏 continuation Turn，不发送额外 USER message。 */
+    TURN_CONTINUE("turn/continue"),
+    /** 编辑当前路径最后一个未答问题，并原子切换至新 USER Turn。 */
+    TURN_REASK("turn/reask"),
     /**
      * 显式恢复一次已挂起 Turn，不在进程启动时自动继续外部副作用。
      */

@@ -16,13 +16,17 @@ public interface WorkspaceDirectoryPort {
      */
     WorkspaceDirectory verifyProjectDirectory(Path requestedRoot);
 
-    /**
-     * 在 Java 数据边界内创建或验证固定通用工作区目录。
-     */
-    WorkspaceDirectory ensureGeneralDirectory();
+    /** 按 Thread identity 创建全新的空目录，重试时只接受仍为空的失败残留。 */
+    WorkspaceDirectory createSessionDirectory(String threadId);
+
+    /** 按登记的 Thread identity 重验已有会话目录，不接受任意客户端路径。 */
+    WorkspaceDirectory verifySessionDirectory(String threadId, Path registeredRoot);
+
+    /** 按固定旧数据目录重验 legacy root，不创建或改变其中内容。 */
+    WorkspaceDirectory verifyLegacySharedDirectory(Path registeredRoot);
 
     /**
      * 仅比较规范路径，不能创建目录或触发磁盘读取。
      */
-    boolean isGeneralDirectory(Path root);
+    boolean isLegacySharedDirectory(Path root);
 }

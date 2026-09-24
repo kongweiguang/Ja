@@ -25,12 +25,12 @@ public interface CatalogUseCase {
     /**
      * 从当前通用配置代际列出已脱敏 MCP 状态。
      */
-    CursorPage<McpServerDescriptor> listMcp(String cursor, int limit);
+    CursorPage<McpServerDescriptor> listMcp(String workspaceId, String cursor, int limit);
 
     /**
      * 在有限资源边界内测试一个 MCP 服务。
      */
-    CompletionStage<McpServerDescriptor> testMcp(String mcpId);
+    CompletionStage<McpServerDescriptor> testMcp(String workspaceId, String mcpId);
 
     /** 对已保存模型执行一次无历史、无 Tool、无附件的严格限额真实请求。 */
     CompletionStage<ModelTestResult> testModel(
@@ -45,7 +45,7 @@ public interface CatalogUseCase {
     /**
      * 从当前通用配置代际读取 MCP Tool Schema 页面。
      */
-    CursorPage<McpToolDescriptor> readMcpTools(String mcpId, String cursor, int limit);
+    CursorPage<McpToolDescriptor> readMcpTools(String workspaceId, String mcpId, String cursor, int limit);
 
     /** 只公开非敏感响应模型标识和单调耗时，不返回测试提示或模型回答。 */
     record ModelTestResult(String responseModel, long latencyMs) {

@@ -8,7 +8,7 @@ import java.util.Objects;
 /**
  * 表示已脱敏的 MCP 服务健康投影。
  */
-public record McpServerDescriptor(String mcpId, String name, String transport, String status,
+public record McpServerDescriptor(String mcpId, String name, String scope, String transport, String status,
                                   int toolCount) {
     /**
      * 禁止 endpoint、认证和启动参数进入公开目录值。
@@ -16,6 +16,9 @@ public record McpServerDescriptor(String mcpId, String name, String transport, S
     public McpServerDescriptor {
         Objects.requireNonNull(mcpId, "mcpId");
         Objects.requireNonNull(name, "name");
+        if (!"global".equals(scope) && !"project".equals(scope)) {
+            throw new IllegalArgumentException("invalid MCP scope");
+        }
         Objects.requireNonNull(transport, "transport");
         Objects.requireNonNull(status, "status");
         if (toolCount < 0) throw new IllegalArgumentException("invalid MCP tool count");

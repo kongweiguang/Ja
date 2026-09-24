@@ -14,6 +14,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 配置文件适配器内部的 Jackson 状态载体；集中隔离文档运行时、Watcher 与代际缓存的共享数据。
@@ -125,12 +126,13 @@ public final class ConfigurationRuntimeState {
         private final String credentialVersion;
         private final List<ConfigGeneration.Diagnostic> diagnostics;
         private final List<ConfigurationData.Issue> issues;
+        private final Set<String> projectMcpIds;
 
         /** 冻结一次配置读取的合并结果、凭据状态和诊断，不携带任何 Secret。 */
         public ReadResult(boolean trusted, LayerView user, LayerView project,
                    ObjectNode effective, Map<String, CredentialStatus> credentials,
                    String credentialVersion, List<ConfigGeneration.Diagnostic> diagnostics,
-                   List<ConfigurationData.Issue> issues) {
+                   List<ConfigurationData.Issue> issues, Set<String> projectMcpIds) {
             this.trusted = trusted;
             this.user = user;
             this.project = project;
@@ -139,6 +141,7 @@ public final class ConfigurationRuntimeState {
             this.credentialVersion = credentialVersion;
             this.diagnostics = List.copyOf(diagnostics);
             this.issues = List.copyOf(issues);
+            this.projectMcpIds = Set.copyOf(projectMcpIds);
         }
 
         /** 返回项目层是否已获 Java 侧信任。 */
@@ -181,6 +184,11 @@ public final class ConfigurationRuntimeState {
          */
         public List<ConfigurationData.Issue> issues() {
             return issues;
+        }
+
+        /** 来源由配置 Owner 冻结，消费者不得通过名称或端点推断项目归属。 */
+        public Set<String> projectMcpIds() {
+            return projectMcpIds;
         }
     }
 

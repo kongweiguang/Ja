@@ -15,6 +15,8 @@ import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 
+import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
+
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
@@ -26,6 +28,7 @@ import io.github.kongweiguang.ja.conversation.domain.tool.ToolState;
 
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
@@ -88,7 +91,8 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
         try (TestDatabase database = database("thread-subagent-snapshot")) {
             MybatisConversationRepository first = database.agentStore(current::get);
             database.history(first).register(new Workspace.Registration("ws_policy",
-                    database.path().getParent(), "policy", Workspace.Trust.TRUSTED, START));
+                    database.path().getParent(), "policy", Workspace.Trust.TRUSTED,
+                    Workspace.Kind.PROJECT, null, START));
             first.createThread(new ConversationRepository.ThreadDefinition(
                     "thr_policy_old", "ws_policy", "old", preferences("provider_1", "model_1"), START));
 
@@ -1010,7 +1014,11 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                     List.of(new ConversationRepository.ToolPreparedFact(
                             "call_pending", "shell", textArguments("command", "echo pending"), 0,
                             ToolSideEffect.EXTERNAL, presentation(ToolPresentation.Status.PENDING),
-                            binding("batch_fixture", "call_pending", "shell"))),
+                            binding("batch_fixture", "call_pending", "shell")),
+                            new ConversationRepository.AssistantFact("item_model_echo",
+                                    new ModelMessage(ModelRole.ASSISTANT,
+                                            List.of(new TextContent("模型服务暂时不可用。"))),
+                                    "模型服务暂时不可用。", null, 1)),
                     admission.turnMutationVersion(), START.plusSeconds(1)));
 
             ConversationRepository.TerminalCommit completed = new ConversationRepository.TerminalCommit(
@@ -1041,16 +1049,21 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                     .filter(item -> item.callId().equals("call_pending"))
                     .findFirst().orElseThrow();
             assertEquals(ToolPresentation.Status.ERROR, tool.presentation().status());
-            io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextItem failureReply =
+            assertEquals("MODEL_FAILURE", history.turns().getFirst().errorCode());
+            assertEquals(0, history.items().stream()
+                    .filter(io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextItem.class::isInstance)
+                    .map(io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextItem.class::cast)
+                    .filter(item -> item.kind()
+                            == io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextKind.FINAL_ANSWER)
+                    .count());
+            io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextItem echoedModelText =
                     history.items().stream()
                             .filter(io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextItem.class::isInstance)
                             .map(io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextItem.class::cast)
                             .filter(item -> item.kind()
-                                    == io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextKind.FINAL_ANSWER)
+                                    == io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextKind.ASSISTANT_PROGRESS)
                             .findFirst().orElseThrow();
-            assertEquals(io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot.TextKind.FINAL_ANSWER,
-                    failureReply.kind());
-            assertEquals("safe failure reply", failureReply.text());
+            assertEquals("模型服务暂时不可用。", echoedModelText.text());
         }
     }
 
@@ -2286,7 +2299,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             MybatisHistoryService history = database.history(store);
             history.register(new Workspace.Registration("ws_2",
                     database.path().getParent().resolve("workspace-2"), "workspace-2",
-                    Workspace.Trust.TRUSTED, START.plusSeconds(1)));
+                    Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, START.plusSeconds(1)));
             store.createThread(new ConversationRepository.ThreadDefinition(
                     "thr_2", "ws_2", "thread-2", preferences("provider_1", "model_1"), START.plusSeconds(1)));
 
@@ -2438,6 +2451,434 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         }
     }
 
+    /** 继续链沿用原 USER source，失败审计与计费保留但只把最新原因和当前可见项投影给界面。 */
+    @Test
+    void continuesOriginalQuestionAndHidesSupersededFailuresAfterRestart() throws Exception {
+        String databaseName = "question-continuation-path";
+        try (TestDatabase database = database(databaseName)) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.CommitReceipt questionFailure = failUserTurn(
+                    store, "turn_question", "item_question", "请检查恢复", 0, 1, START, List.of());
+            assertEquals("item_question", store.findLastUnansweredQuestionMessageId(
+                    "thr_1", questionFailure.threadRevision()).orElseThrow());
+
+            ConversationRepository.AdmissionReceipt first = store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_continue_one",
+                            questionFailure.threadRevision(), START.plusSeconds(3), continuationExecution(),
+                            "继续回答原问题", "item_question"));
+            ConversationRepository.CommitReceipt firstFailure = failContinuation(store, first, 2,
+                    START.plusSeconds(3), List.of(new ConversationRepository.AssistantFact(
+                            "item_partial_retry_one", new ModelMessage(ModelRole.ASSISTANT,
+                            List.of(new TextContent("半截草稿"))), "半截草稿", "公开 reasoning 摘要", 1)));
+
+            ConversationRepository.AdmissionReceipt second = store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_continue_two",
+                            firstFailure.threadRevision(), START.plusSeconds(6), continuationExecution(),
+                            "继续回答原问题", "item_question"));
+            ConversationRepository.CommitReceipt secondFailure = failContinuation(
+                    store, second, 3, START.plusSeconds(6), List.of());
+            assertEquals("item_question", store.findLastUnansweredQuestionMessageId(
+                    "thr_1", secondFailure.threadRevision()).orElseThrow());
+
+            ConversationRepository.ThreadSnapshot raw = store.readThread("thr_1").orElseThrow();
+            assertEquals(3, raw.turns().size());
+            assertTrue(raw.turns().stream().allMatch(ConversationRepository.TurnSnapshot::currentPath));
+            assertNull(raw.turns().stream().filter(turn -> turn.turnId().equals("turn_question"))
+                    .findFirst().orElseThrow().sourceMessageId());
+            assertEquals("item_question", raw.turns().stream()
+                    .filter(turn -> turn.turnId().equals("turn_continue_two"))
+                    .findFirst().orElseThrow().sourceMessageId());
+            assertEquals(1, raw.messages().stream()
+                    .filter(message -> message.message().role() == ModelRole.USER).count());
+            assertTrue(raw.messages().stream().anyMatch(message ->
+                    message.messageId().equals("item_partial_retry_one")));
+        }
+
+        try (TestDatabase reopened = database(databaseName)) {
+            MybatisConversationRepository store = reopened.agentStore();
+            ThreadSnapshot history = reopened.history(store).readThread("thr_1", null, 100).orElseThrow();
+            String hashedSource = SnapshotItemIdentity.of("message", "item_question");
+            assertEquals(List.of("turn_question", "turn_continue_one", "turn_continue_two"),
+                    history.turns().stream().map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals(java.util.Arrays.asList(null, hashedSource, hashedSource), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::sourceMessageId).toList());
+            assertEquals(List.of("turn_continue_two"), history.turns().stream()
+                    .filter(turn -> turn.errorCode() != null).map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals(1, history.items().stream().filter(ThreadSnapshot.UserInputItem.class::isInstance).count());
+            assertTrue(history.items().stream().noneMatch(item -> item.itemId().equals(
+                    SnapshotItemIdentity.of("message", "item_partial_retry_one"))));
+            assertTrue(history.items().stream().filter(ThreadSnapshot.TextItem.class::isInstance)
+                    .map(ThreadSnapshot.TextItem.class::cast)
+                    .noneMatch(item -> item.kind() == ThreadSnapshot.TextKind.FINAL_ANSWER));
+            assertEquals("turn_continue_two", history.contextUsage().turnId());
+            assertEquals("request_3", history.contextUsage().request().requestId());
+            var usage = reopened.history(store).readThreadUsageSummary("thr_1").orElseThrow();
+            assertEquals(3, usage.requestCount());
+            assertEquals(66, usage.totalTokens());
+        }
+    }
+
+    /** 编辑只切最后一个已停止问题所属 Turn；脱离当前路径的重试计费仍保留在 Thread 账本。 */
+    @Test
+    void reasksLastFailedQuestionAndKeepsOffPathUsageForReload() throws Exception {
+        String databaseName = "question-reask-path";
+        try (TestDatabase database = database(databaseName)) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.CommitReceipt firstFailure = failUserTurn(
+                    store, "turn_question_one", "item_question_one", "早先问题", 0, 1, START, List.of());
+            ConversationRepository.CommitReceipt secondFailure = failUserTurn(
+                    store, "turn_question_two", "item_question_two", "最后问题",
+                    firstFailure.threadRevision(), 2, START.plusSeconds(10), List.of());
+            String sourceHash = SnapshotItemIdentity.of("message", "item_question_two");
+            assertEquals("item_question_two", store.findLastUnansweredQuestionMessageId(
+                    "thr_1", secondFailure.threadRevision()).orElseThrow());
+
+            ConversationRepository.AdmissionReceipt reask = store.admitReask(
+                    new ConversationRepository.ReaskAdmission(new ConversationRepository.TurnAdmission(
+                            "thr_1", "turn_reask", "item_reask",
+                            new ModelMessage(ModelRole.USER, List.of(new TextContent("修订后的问题"))), List.of(),
+                            secondFailure.threadRevision(), START.plusSeconds(20), execution("cfg_1")), sourceHash));
+
+            ConversationRepository.ThreadSnapshot raw = store.readThread("thr_1").orElseThrow();
+            assertTrue(raw.turns().stream().filter(turn -> turn.turnId().equals("turn_question_two"))
+                    .noneMatch(ConversationRepository.TurnSnapshot::currentPath));
+            assertTrue(raw.turns().stream().filter(turn -> turn.turnId().equals("turn_reask"))
+                    .allMatch(ConversationRepository.TurnSnapshot::currentPath));
+            assertEquals(reask.threadRevision(), raw.revision());
+            ThreadSnapshot history = database.history(store).readThread("thr_1", null, 100).orElseThrow();
+            assertEquals(List.of("turn_question_one", "turn_reask"), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals(List.of("turn_question_one"), history.turns().stream()
+                    .filter(turn -> turn.errorCode() != null).map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals(2, history.items().stream().filter(ThreadSnapshot.UserInputItem.class::isInstance).count());
+            assertTrue(history.items().stream().filter(ThreadSnapshot.UserInputItem.class::isInstance)
+                    .map(ThreadSnapshot.UserInputItem.class::cast)
+                    .noneMatch(item -> item.itemId().equals(sourceHash)));
+            assertEquals("turn_question_one", history.contextUsage().turnId());
+            assertEquals("request_1", history.contextUsage().request().requestId());
+            assertTrue(store.findLastUnansweredQuestionMessageId("thr_1", reask.threadRevision()).isEmpty());
+        }
+
+        try (TestDatabase reopened = database(databaseName)) {
+            MybatisConversationRepository store = reopened.agentStore();
+            ThreadSnapshot history = reopened.history(store).readThread("thr_1", null, 100).orElseThrow();
+            assertEquals(List.of("turn_question_one", "turn_reask"), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals("request_1", history.contextUsage().request().requestId());
+            var usage = reopened.history(store).readThreadUsageSummary("thr_1").orElseThrow();
+            assertEquals(2, usage.requestCount());
+            assertEquals(34, usage.totalTokens());
+        }
+    }
+
+    /** 同一 Turn 消费了较早 USER 后，不能按 Turn 粒度编辑较晚输入并静默移除前一个问题。 */
+    @Test
+    void refusesReaskWhenEarlierUserMessageSharesTheQuestionTurn() throws Exception {
+        try (TestDatabase database = database("question-reask-same-turn-boundary")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            ConversationRepository.CommitReceipt running = store.commit(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING, List.of(), admission.turnMutationVersion(),
+                    START.plusSeconds(1)));
+            store.enqueueInput(pending("input_later_question", ConversationRepository.InputKind.FOLLOW_UP,
+                    "较晚的问题", START.plusSeconds(2)));
+            ConversationRepository.InputConsumption consumed = store.commitWithNextInput(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING, List.of(new ConversationRepository.AssistantFact(
+                            "item_first_response", new ModelMessage(ModelRole.ASSISTANT,
+                            List.of(new TextContent("第一问答复"))), "第一问答复", null, 1)),
+                    running.turnMutationVersion(), START.plusSeconds(3), execution("cfg_1")),
+                    ConversationRepository.InputSelection.from(store.peekInput("turn_1", null).orElseThrow()))
+                    .orElseThrow();
+            ConversationRepository.CommitReceipt failed = store.commitTerminal(
+                    new ConversationRepository.TerminalCommit("thr_1", "turn_1", TurnState.FAILED,
+                            "failed", "MODEL_FAILURE", "provider failed", null, null, List.of(),
+                            consumed.turnMutationVersion(), START.plusSeconds(4)));
+
+            assertTrue(store.findLastUnansweredQuestionMessageId("thr_1", failed.threadRevision()).isEmpty());
+            long messageCount = store.readThread("thr_1").orElseThrow().messages().size();
+            StorageException rejection = assertThrows(StorageException.class, () -> store.admitReask(
+                    new ConversationRepository.ReaskAdmission(new ConversationRepository.TurnAdmission(
+                            "thr_1", "turn_reask_forbidden", "item_reask_forbidden",
+                            new ModelMessage(ModelRole.USER, List.of(new TextContent("不会提交"))), List.of(),
+                            failed.threadRevision(), START.plusSeconds(5), execution("cfg_1")),
+                            SnapshotItemIdentity.of("message", consumed.userItemId()))));
+
+            assertEquals(StorageException.Code.INVALID_STATE, rejection.code());
+            ConversationRepository.ThreadSnapshot unchanged = store.readThread("thr_1").orElseThrow();
+            assertEquals(failed.threadRevision(), unchanged.revision());
+            assertEquals(messageCount, unchanged.messages().size());
+            assertEquals(List.of("turn_1"), unchanged.turns().stream()
+                    .filter(ConversationRepository.TurnSnapshot::currentPath)
+                    .map(ConversationRepository.TurnSnapshot::turnId).toList());
+            assertTrue(unchanged.turns().stream().noneMatch(turn -> turn.turnId().equals("turn_reask_forbidden")));
+        }
+    }
+
+    /** 仅完整旧按钮尾链可在继续准入事务中移出当前路径；原问题的 READ_ONLY Tool 和全部 Usage 保留。 */
+    @Test
+    void normalizesVerifiedLegacyContinueChainAtomicallyAndReloadsPathUsageAndAttachments() throws Exception {
+        String databaseName = "legacy-continue-normalization";
+        try (TestDatabase database = database(databaseName)) {
+            MybatisConversationRepository store = initialized(database);
+            LegacyContinueChain chain = seedLegacyContinueChain(store, ToolSideEffect.READ_ONLY, "继续");
+            assertEquals(chain.candidateMessageId(), store.findLastUnansweredQuestionMessageId(
+                    "thr_1", chain.threadRevision()).orElseThrow());
+
+            ConversationRepository.AdmissionReceipt accepted = store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_new_continue",
+                            chain.threadRevision(), START.plusSeconds(60), continuationExecution(),
+                            "继续回答原问题", chain.candidateMessageId()));
+
+            ConversationRepository.ThreadSnapshot raw = store.readThread("thr_1").orElseThrow();
+            assertEquals(5, raw.turns().size());
+            assertEquals(List.of("turn_legacy_question", "turn_new_continue"), raw.turns().stream()
+                    .filter(ConversationRepository.TurnSnapshot::currentPath)
+                    .map(ConversationRepository.TurnSnapshot::turnId).toList());
+            assertEquals(List.of("turn_legacy_continue_1", "turn_legacy_continue_2", "turn_legacy_continue_3"),
+                    raw.turns().stream().filter(turn -> !turn.currentPath())
+                            .map(ConversationRepository.TurnSnapshot::turnId).toList());
+            assertTrue(raw.turns().stream().filter(turn -> !turn.currentPath())
+                    .allMatch(turn -> chain.sourceMessageId().equals(turn.sourceMessageId())));
+            assertEquals(chain.sourceMessageId(), raw.turns().stream()
+                    .filter(turn -> turn.turnId().equals("turn_new_continue"))
+                    .findFirst().orElseThrow().sourceMessageId());
+            assertEquals(3, toolResults(raw).size());
+            assertEquals(accepted.threadRevision(), raw.revision());
+
+            ThreadSnapshot history = database.history(store).readThread("thr_1", null, 100).orElseThrow();
+            String sourceHash = SnapshotItemIdentity.of("message", chain.sourceMessageId());
+            assertEquals(List.of("turn_legacy_question", "turn_new_continue"), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals(java.util.Arrays.asList(null, sourceHash), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::sourceMessageId).toList());
+            assertEquals(1, history.items().stream().filter(ThreadSnapshot.UserInputItem.class::isInstance).count());
+            assertEquals(3, history.items().stream().filter(ThreadSnapshot.ToolItem.class::isInstance).count());
+            assertTrue(history.items().stream().filter(ThreadSnapshot.UserInputItem.class::isInstance)
+                    .map(ThreadSnapshot.UserInputItem.class::cast)
+                    .allMatch(item -> item.attachments().isEmpty()));
+            assertTrue(history.items().stream().noneMatch(item -> item instanceof ThreadSnapshot.TextItem textItem
+                    && textItem.kind() == ThreadSnapshot.TextKind.FINAL_ANSWER));
+        }
+
+        try (TestDatabase reopened = database(databaseName)) {
+            MybatisConversationRepository store = reopened.agentStore();
+            ThreadSnapshot history = reopened.history(store).readThread("thr_1", null, 100).orElseThrow();
+            String sourceHash = SnapshotItemIdentity.of("message", "item_legacy_question");
+            assertEquals(List.of("turn_legacy_question", "turn_new_continue"), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            assertEquals(java.util.Arrays.asList(null, sourceHash), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::sourceMessageId).toList());
+            assertEquals(3, history.items().stream().filter(ThreadSnapshot.ToolItem.class::isInstance).count());
+            assertTrue(history.items().stream().filter(ThreadSnapshot.UserInputItem.class::isInstance)
+                    .map(ThreadSnapshot.UserInputItem.class::cast)
+                    .allMatch(item -> item.attachments().isEmpty()));
+            var usage = reopened.history(store).readThreadUsageSummary("thr_1").orElseThrow();
+            assertEquals(4, usage.requestCount());
+            assertEquals(108, usage.totalTokens());
+        }
+    }
+
+    /** continue-like 文本若偏离单块“继续”，候选链必须拒绝并保持原路径及消息事实不变。 */
+    @Test
+    void rejectsNearLegacyContinueTextWithoutChangingAnyPathFacts() throws Exception {
+        try (TestDatabase database = database("legacy-continue-near-match")) {
+            MybatisConversationRepository store = initialized(database);
+            LegacyContinueChain chain = seedLegacyContinueChain(store, ToolSideEffect.READ_ONLY,
+                    "继续，请接着回答");
+            ConversationRepository.ThreadSnapshot before = store.readThread("thr_1").orElseThrow();
+
+            StorageException rejected = assertThrows(StorageException.class, () -> store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_near_continue",
+                            chain.threadRevision(), START.plusSeconds(60), continuationExecution(),
+                            "继续回答", chain.candidateMessageId())));
+
+            assertEquals(StorageException.Code.INVALID_STATE, rejected.code());
+            assertLegacyChainUnchanged(store, before);
+        }
+    }
+
+    /** 任何 EXTERNAL Tool 都使旧链无法证明可安全隐藏，归一化不得丢失其副作用事实。 */
+    @Test
+    void rejectsLegacyContinueChainWhenOriginalQuestionHasSideEffectTool() throws Exception {
+        try (TestDatabase database = database("legacy-continue-side-effect")) {
+            MybatisConversationRepository store = initialized(database);
+            LegacyContinueChain chain = seedLegacyContinueChain(store, ToolSideEffect.EXTERNAL, "继续");
+            ConversationRepository.ThreadSnapshot before = store.readThread("thr_1").orElseThrow();
+
+            StorageException rejected = assertThrows(StorageException.class, () -> store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_side_effect_continue",
+                            chain.threadRevision(), START.plusSeconds(60), continuationExecution(),
+                            "继续回答原问题", chain.candidateMessageId())));
+
+            assertEquals(StorageException.Code.INVALID_STATE, rejected.code());
+            assertLegacyChainUnchanged(store, before);
+            assertEquals(3, toolResults(store.readThread("thr_1").orElseThrow()).size());
+        }
+    }
+
+    /** strict path update 与 admission CAS 属于同一事务，过期 revision 必须回滚此前暂存的路径变更。 */
+    @Test
+    void rollsBackLegacyContinueNormalizationWhenAdmissionCasIsStale() throws Exception {
+        try (TestDatabase database = database("legacy-continue-cas-rollback")) {
+            MybatisConversationRepository store = initialized(database);
+            LegacyContinueChain chain = seedLegacyContinueChain(store, ToolSideEffect.READ_ONLY, "继续");
+            ConversationRepository.ThreadSnapshot before = store.readThread("thr_1").orElseThrow();
+
+            StorageException rejected = assertThrows(StorageException.class, () -> store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_stale_continue",
+                            chain.threadRevision() - 1, START.plusSeconds(60), continuationExecution(),
+                            "继续回答原问题", chain.candidateMessageId())));
+
+            assertEquals(StorageException.Code.CAS_CONFLICT, rejected.code());
+            assertLegacyChainUnchanged(store, before);
+        }
+    }
+
+    /** 比较旧链整个 Thread 的结构化身份，证明拒绝或回滚没有留下部分 current_path/source 写入。 */
+    private static void assertLegacyChainUnchanged(MybatisConversationRepository store,
+                                                   ConversationRepository.ThreadSnapshot before) {
+        ConversationRepository.ThreadSnapshot after = store.readThread("thr_1").orElseThrow();
+        assertEquals(before.revision(), after.revision());
+        assertEquals(before.messages(), after.messages());
+        assertEquals(before.turns(), after.turns());
+        assertTrue(after.turns().stream().allMatch(ConversationRepository.TurnSnapshot::currentPath));
+        assertTrue(after.turns().stream().allMatch(turn -> turn.sourceMessageId() == null));
+    }
+
+    /** 构造已核实的四 Turn 旧链；参数只改变严格 gate 应拒绝的文本或 Tool 副作用事实。 */
+    private static LegacyContinueChain seedLegacyContinueChain(
+            MybatisConversationRepository store, ToolSideEffect originalToolEffect, String secondContinueText) {
+        ConversationRepository.AdmissionReceipt question = store.admit(new ConversationRepository.TurnAdmission(
+                "thr_1", "turn_legacy_question", "item_legacy_question",
+                new ModelMessage(ModelRole.USER, List.of(new TextContent("请检查旧问题"))), List.of(),
+                0, START, execution("cfg_1")));
+        List<ToolCallContent> callBlocks = new java.util.ArrayList<>();
+        List<ConversationRepository.Fact> callFacts = new java.util.ArrayList<>();
+        List<ModelContent> resultBlocks = new java.util.ArrayList<>();
+        List<ConversationRepository.Fact> resultFacts = new java.util.ArrayList<>();
+        for (int index = 1; index <= 3; index++) {
+            String callId = "call_legacy_" + index;
+            JsonObject arguments = textArguments("path", "legacy-" + index + ".txt");
+            callBlocks.add(new ToolCallContent(callId, "read_file", arguments));
+            callFacts.add(new ConversationRepository.ToolPreparedFact(callId, "read_file", arguments,
+                    index - 1, originalToolEffect, presentation(ToolPresentation.Status.PENDING),
+                    binding("batch_legacy", callId, "read_file")));
+            resultBlocks.add(new ToolResultContent(callId, "读取结果 " + index, false));
+            resultFacts.add(new ConversationRepository.ToolResultFact(callId, ToolState.SUCCEEDED,
+                    "读取结果 " + index, false, presentation(ToolPresentation.Status.SUCCESS), ""));
+        }
+        callFacts.add(0, new ConversationRepository.AssistantFact("item_legacy_tool_calls",
+                new ModelMessage(ModelRole.ASSISTANT, prependText("读取问题相关文件", callBlocks)),
+                "读取问题相关文件", null, 1));
+        callFacts.add(usageFact(1, 1, null));
+        ConversationRepository.CommitReceipt calls = store.commit(commitRequest(
+                "thr_1", question.turnId(), TurnState.RUNNING, callFacts,
+                question.turnMutationVersion(), START.plusSeconds(1), execution("cfg_1")));
+        resultFacts.add(new ConversationRepository.ToolResultMessageFact("item_legacy_tool_results",
+                new ModelMessage(ModelRole.TOOL, resultBlocks)));
+        ConversationRepository.CommitReceipt tools = store.commit(commitRequest(
+                "thr_1", question.turnId(), TurnState.RUNNING, resultFacts,
+                calls.turnMutationVersion(), START.plusSeconds(2), execution("cfg_1")));
+        ConversationRepository.CommitReceipt rootFailure = store.commitTerminal(
+                new ConversationRepository.TerminalCommit("thr_1", question.turnId(), TurnState.FAILED,
+                        "failed", "MODEL_FAILURE", "legacy provider failure", "item_legacy_root_failure",
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("自动失败收口"))),
+                        List.of(usageFact(1, 1, legacyUsage(1))), tools.turnMutationVersion(), START.plusSeconds(3)));
+
+        long threadRevision = rootFailure.threadRevision();
+        String candidateMessageId = null;
+        for (int index = 1; index <= 3; index++) {
+            String turnId = "turn_legacy_continue_" + index;
+            String messageId = "item_legacy_continue_" + index;
+            String prompt = index == 2 ? secondContinueText : "继续";
+            candidateMessageId = messageId;
+            ConversationRepository.AdmissionReceipt attempt = store.admit(new ConversationRepository.TurnAdmission(
+                    "thr_1", turnId, messageId,
+                    new ModelMessage(ModelRole.USER, List.of(new TextContent(prompt))), List.of(),
+                    threadRevision, START.plusSeconds(10L * index), execution("cfg_1")));
+            ConversationRepository.CommitReceipt running = store.commit(commitRequest(
+                    "thr_1", turnId, TurnState.RUNNING, List.of(usageFact(index + 1, 1, null)),
+                    attempt.turnMutationVersion(), START.plusSeconds(10L * index + 1), execution("cfg_1")));
+            boolean cancelled = index == 2;
+            ConversationRepository.CommitReceipt terminal = store.commitTerminal(
+                    new ConversationRepository.TerminalCommit("thr_1", turnId,
+                            cancelled ? TurnState.CANCELLED : TurnState.FAILED,
+                            cancelled ? "cancelled" : "failed", cancelled ? "CANCELLED" : "MODEL_FAILURE",
+                            cancelled ? "turn cancelled" : "upstream failed",
+                            cancelled ? null : "item_legacy_failure_" + index,
+                            cancelled ? null : new ModelMessage(ModelRole.ASSISTANT,
+                                    List.of(new TextContent("自动失败收口"))),
+                            List.of(usageFact(index + 1, 1, legacyUsage(index + 1))),
+                            running.turnMutationVersion(), START.plusSeconds(10L * index + 2)));
+            threadRevision = terminal.threadRevision();
+        }
+        return new LegacyContinueChain("item_legacy_question", candidateMessageId, threadRevision);
+    }
+
+    /** Tool-call 文本放在同一消息，保持测试真实执行序列的完整模型 block 结构。 */
+    private static List<ModelContent> prependText(String text, List<ToolCallContent> calls) {
+        List<ModelContent> content = new java.util.ArrayList<>();
+        content.add(new TextContent(text));
+        content.addAll(calls);
+        return List.copyOf(content);
+    }
+
+    /** 将已知 Usage 固定为输入/输出完整相加，供旧链的全会话账本重载断言使用。 */
+    private static ModelUsage legacyUsage(int requestOrdinal) {
+        return new ModelUsage(requestOrdinal * 10L, 2, requestOrdinal * 10L + 2,
+                null, null, ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE);
+    }
+
+    /** 旧链 Fixture 暴露原始数据库身份，避免把 wire hash 带入 continuation admission。 */
+    private record LegacyContinueChain(String sourceMessageId, String candidateMessageId, long threadRevision) { }
+
+    /** 普通失败问题必须先写入真实 USER facts，重试 admission 才能按同一事务校验源身份。 */
+    private static ConversationRepository.CommitReceipt failUserTurn(
+            MybatisConversationRepository store, String turnId, String messageId, String prompt,
+            long expectedThreadRevision, int requestOrdinal, Instant requestedAt, List<ConversationRepository.Fact> runningFacts) {
+        TurnExecutionState.Ready executionState = execution("cfg_1");
+        ConversationRepository.AdmissionReceipt admission = store.admit(
+                new ConversationRepository.TurnAdmission("thr_1", turnId, messageId,
+                        new ModelMessage(ModelRole.USER, List.of(new TextContent(prompt))), List.of(),
+                        expectedThreadRevision, requestedAt, executionState));
+        return failAdmittedTurn(store, admission, executionState, requestOrdinal, requestedAt, runningFacts);
+    }
+
+    /** 隐藏 continuation 只在持久 turn/execution 有效路径上推进，不为每次尝试制造 USER 消息。 */
+    private static ConversationRepository.CommitReceipt failContinuation(
+            MybatisConversationRepository store, ConversationRepository.AdmissionReceipt admission,
+            int requestOrdinal, Instant requestedAt, List<ConversationRepository.Fact> runningFacts) {
+        return failAdmittedTurn(store, admission, continuationExecution(), requestOrdinal, requestedAt, runningFacts);
+    }
+
+    /** 每个失败尝试先持久 UNKNOWN 请求，再以相同 requestId 结算真实 Usage，模拟 Provider dispatch 的计费事实。 */
+    private static ConversationRepository.CommitReceipt failAdmittedTurn(
+            MybatisConversationRepository store, ConversationRepository.AdmissionReceipt admission,
+            TurnExecutionState executionState, int requestOrdinal, Instant requestedAt,
+            List<ConversationRepository.Fact> runningFacts) {
+        List<ConversationRepository.Fact> dispatchFacts = new java.util.ArrayList<>(runningFacts);
+        dispatchFacts.add(usageFact(requestOrdinal, 1, null));
+        ConversationRepository.CommitReceipt running = store.commit(commitRequest(
+                admission.threadId(), admission.turnId(), TurnState.RUNNING, dispatchFacts,
+                admission.turnMutationVersion(), requestedAt.plusSeconds(1), executionState));
+        String turnSuffix = admission.turnId().substring("turn_".length());
+        ConversationRepository.UsageFact usage = usageFact(requestOrdinal, 1,
+                new ModelUsage(requestOrdinal * 10L, 2, requestOrdinal * 10L + 2,
+                        null, null, ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE));
+        return store.commitTerminal(new ConversationRepository.TerminalCommit(
+                admission.threadId(), admission.turnId(), TurnState.FAILED, "failed",
+                "MODEL_FAILURE", "upstream failed", "item_failure_" + turnSuffix,
+                new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("自动失败收口"))),
+                List.of(usage), running.turnMutationVersion(), requestedAt.plusSeconds(2)));
+    }
+
+    /** 用户 continuation 的固定游标让恢复测试验证 source/history 约束，不依赖进程时钟默认值。 */
+    private static TurnExecutionState.Ready continuationExecution() {
+        TurnExecutionState.Common common = new TurnExecutionState.Common(0, 0, 1, null, List.of(),
+                Instant.parse("2099-01-01T00:00:00Z"), TurnOrigin.USER_CONTINUATION, Duration.ofMinutes(5));
+        return new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null);
+    }
+
     /**
      * 统一构造取消后的 Tool batch 请求，使正反向用例只改变事实闭集或 CAS token。
      */
@@ -2481,7 +2922,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
     private static MybatisConversationRepository initialized(TestDatabase database) {
         MybatisConversationRepository store = database.agentStore();
         database.history(store).register(new Workspace.Registration("ws_1", database.path().getParent(),
-                "workspace", Workspace.Trust.TRUSTED, START));
+                "workspace", Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, START));
         store.createThread(new ConversationRepository.ThreadDefinition(
                 "thr_1", "ws_1", "thread", preferences("provider_1", "model_1"), START));
         return store;

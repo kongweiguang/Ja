@@ -106,7 +106,6 @@ function ports(overrides: Partial<SettingsPorts> = {}): SettingsPorts {
     onSaveMcp: vi.fn(async () => undefined),
     onDeleteMcp: vi.fn(async () => undefined),
     onTestMcp: vi.fn(async () => "connected" as const),
-    onCloseMcp: vi.fn(async () => undefined),
     onToggleSkill: vi.fn(async () => undefined),
     onAccessModeChange: vi.fn(async () => undefined),
     onClarificationEnabledChange: vi.fn(async () => undefined),
@@ -147,6 +146,14 @@ function renderSettings(
 }
 
 describe("Settings v1 UI", () => {
+  /** 页面从外部路由进入时，焦点落在当前分类标签，键盘用户可直接继续操作设置导航。 */
+  it("focuses the selected category tab when entering Settings", async () => {
+    renderSettings("mcp");
+
+    const selectedTab = screen.getByRole("tab", { name: "MCP" });
+    await waitFor(() => expect(selectedTab).toHaveFocus());
+  });
+
   /** 历史快照只显示紧凑提示，问题在 Sheet 中处理并在关闭后还原入口焦点。 */
   it("shows a non-blocking snapshot notice and returns focus from the issues sheet", async () => {
     const user = userEvent.setup();
@@ -579,10 +586,10 @@ describe("Settings v1 UI", () => {
     });
 
     await user.click(screen.getByRole("button", { name: "测试" }));
-    await waitFor(() => expect(onTestMcp).toHaveBeenCalledWith("mcp_local"));
+    await waitFor(() => expect(onTestMcp).toHaveBeenCalledWith("mcp_local", "user"));
     await user.click(screen.getByRole("switch", { name: "Local Tools：已启用" }));
     await waitFor(() =>
-      expect(onSaveMcp).toHaveBeenCalledWith(expect.objectContaining({ enabled: false })),
+      expect(onSaveMcp).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }), "user"),
     );
 
     await user.click(screen.getByRole("button", { name: "Local Tools 更多操作" }));
@@ -594,13 +601,14 @@ describe("Settings v1 UI", () => {
     await waitFor(() =>
       expect(onSaveMcp).toHaveBeenLastCalledWith(
         expect.objectContaining({ mcpRevision: "mcp_local", name: "Local Tools 2" }),
+        "user",
       ),
     );
 
     await user.click(screen.getByRole("button", { name: "Local Tools 更多操作" }));
     await user.click(screen.getByRole("menuitem", { name: "删除" }));
     await user.click(screen.getByRole("button", { name: "删除" }));
-    await waitFor(() => expect(onDeleteMcp).toHaveBeenCalledWith("mcp_local"));
+    await waitFor(() => expect(onDeleteMcp).toHaveBeenCalledWith("mcp_local", "user"));
   });
 
   it("saves multiple models, custom budgets, and provider fields as one aggregate", async () => {

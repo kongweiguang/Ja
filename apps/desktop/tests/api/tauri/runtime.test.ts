@@ -19,11 +19,13 @@ const readyStatus: RuntimeStatus = {
   serverInstanceId: "srv_fixture",
   features: ["task_threads_v1", "plan_goal_v1"],
 };
-const generalWorkspace = {
+const sessionWorkspace = {
   workspaceId: "ws_runtime_a" as const,
-  displayName: "无项目" as const,
+  kind: "session" as const,
+  legacySharedWorkspaceId: null,
+  displayName: "会话 A" as const,
   trust: "trusted" as const,
-  rootPath: "C:\\data\\ja\\data\\general-workspace",
+  rootPath: "C:\\data\\ja\\workspaces\\thr_runtime_a",
 };
 const requestProfile = {
   providerId: "provider_fixture",
@@ -95,7 +97,7 @@ const queueResult = (inputId: string, kind: "follow_up" | "steering" = "follow_u
 function createBridge(overrides: Partial<RuntimeNativeBridge> = {}): RuntimeNativeBridge {
   return {
     invoke: vi.fn(async (command: string): Promise<unknown> => {
-      if (command === JA_RUNTIME_COMMANDS.generalWorkspace) return generalWorkspace;
+      if (command === JA_RUNTIME_COMMANDS.workspaceActivate) return sessionWorkspace;
       if (command === JA_RUNTIME_COMMANDS.storageInfo)
         return {
           nativeImage: false,
@@ -106,6 +108,8 @@ function createBridge(overrides: Partial<RuntimeNativeBridge> = {}): RuntimeNati
         };
       if (command === JA_RUNTIME_COMMANDS.turnStart)
         return { accepted: true, turnId: "turn_fixture", queued: false, threadRevision: 1 };
+      if (command === JA_RUNTIME_COMMANDS.turnContinue || command === JA_RUNTIME_COMMANDS.turnReask)
+        return { accepted: true, turnId: "turn_fixture", queued: true, threadRevision: 3 };
       if (command === JA_RUNTIME_COMMANDS.turnResume)
         return { accepted: true, turnId: "turn_fixture", queued: true, threadRevision: 2 };
       if (command === JA_RUNTIME_COMMANDS.turnCancel)
@@ -138,9 +142,11 @@ describe("RuntimeHost v1 typed adapter", () => {
           cachePath: null,
           lastBackup: null,
         };
-      if (command === JA_RUNTIME_COMMANDS.generalWorkspace) return generalWorkspace;
+      if (command === JA_RUNTIME_COMMANDS.workspaceActivate) return sessionWorkspace;
       if (command === JA_RUNTIME_COMMANDS.turnStart)
         return { accepted: true, turnId: "turn_fixture", queued: false, threadRevision: 1 };
+      if (command === JA_RUNTIME_COMMANDS.turnContinue || command === JA_RUNTIME_COMMANDS.turnReask)
+        return { accepted: true, turnId: "turn_fixture", queued: true, threadRevision: 3 };
       if (command === JA_RUNTIME_COMMANDS.turnResume)
         return { accepted: true, turnId: "turn_fixture", queued: true, threadRevision: 2 };
       if (command === JA_RUNTIME_COMMANDS.turnCancel)
@@ -161,10 +167,28 @@ describe("RuntimeHost v1 typed adapter", () => {
     await expect(adapter.stop()).resolves.toEqual(readyStatus);
     await expect(adapter.state()).resolves.toEqual(readyStatus);
     await expect(adapter.storageInfo()).resolves.toMatchObject({ dataPath: "C:\\data\\ja" });
-    await expect(adapter.generalWorkspace()).resolves.toEqual(generalWorkspace);
+    await expect(adapter.activateWorkspace(sessionWorkspace.workspaceId)).resolves.toEqual(
+      sessionWorkspace,
+    );
     await expect(
       adapter.turnStart({ threadId: "thr_fixture", content: [{ type: "text", text: "hello" }] }),
     ).resolves.toMatchObject({ accepted: true });
+    await expect(
+      adapter.turnContinue({ threadId: "thr_fixture", expectedThreadRevision: 2 }),
+    ).resolves.toEqual({
+      accepted: true,
+      turnId: "turn_fixture",
+      queued: true,
+      threadRevision: 3,
+    });
+    await expect(
+      adapter.turnReask({
+        threadId: "thr_fixture",
+        expectedThreadRevision: 2,
+        sourceMessageId: "item_question",
+        content: [{ type: "text", text: "edited" }],
+      }),
+    ).resolves.toMatchObject({ accepted: true, queued: true });
     await expect(adapter.turnCancel({ turnId: "turn_fixture" })).resolves.toMatchObject({
       status: "cancelled",
     });
@@ -209,6 +233,17 @@ describe("RuntimeHost v1 typed adapter", () => {
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.start, {});
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnStart, {
       input: { threadId: "thr_fixture", content: [{ type: "text", text: "hello" }] },
+    });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnContinue, {
+      input: { threadId: "thr_fixture", expectedThreadRevision: 2 },
+    });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnReask, {
+      input: {
+        threadId: "thr_fixture",
+        expectedThreadRevision: 2,
+        sourceMessageId: "item_question",
+        content: [{ type: "text", text: "edited" }],
+      },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnInputEnqueue, {
       input: {
@@ -539,6 +574,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       turns: [
         {
           turnId: "turn_fixture",
+          sourceMessageId: null,
           status: "completed" as const,
           requestedAt: "2026-09-07T00:00:00Z",
           updatedAt: "2026-09-07T00:00:02Z",
@@ -856,21 +892,21 @@ describe("RuntimeHost v1 typed adapter", () => {
     const malformed = new TauriRuntimeHostAdapter(
       createBridge({
         invoke: vi.fn(
-          async (): Promise<unknown> => ({ ...generalWorkspace, unexpected: true }),
+          async (): Promise<unknown> => ({ ...sessionWorkspace, unexpected: true }),
         ) as RuntimeNativeBridge["invoke"],
       }),
     );
-    await expect(malformed.generalWorkspace()).rejects.toMatchObject({
+    await expect(malformed.activateWorkspace(sessionWorkspace.workspaceId)).rejects.toMatchObject({
       code: "RUNTIME_UNAVAILABLE",
     });
     const unsafeRoot = new TauriRuntimeHostAdapter(
       createBridge({
         invoke: vi.fn(
-          async (): Promise<unknown> => ({ ...generalWorkspace, rootPath: "C:\\private\n" }),
+          async (): Promise<unknown> => ({ ...sessionWorkspace, rootPath: "C:\\private\n" }),
         ) as RuntimeNativeBridge["invoke"],
       }),
     );
-    await expect(unsafeRoot.generalWorkspace()).rejects.toMatchObject({
+    await expect(unsafeRoot.activateWorkspace(sessionWorkspace.workspaceId)).rejects.toMatchObject({
       code: "RUNTIME_UNAVAILABLE",
     });
     const rejected = new TauriRuntimeHostAdapter(
@@ -886,30 +922,36 @@ describe("RuntimeHost v1 typed adapter", () => {
     });
   });
 
-  it("keeps one Java general identity stable per response while allowing restart identity changes", async () => {
-    const first = { ...generalWorkspace, workspaceId: "ws_runtime_a" };
-    const second = { ...generalWorkspace, workspaceId: "ws_runtime_b" };
+  it("activates only the requested Java workspace identity without sending a root path", async () => {
+    const first = { ...sessionWorkspace, workspaceId: "ws_runtime_a" };
+    const second = {
+      ...sessionWorkspace,
+      workspaceId: "ws_runtime_b",
+      rootPath: "C:\\data\\ja\\workspaces\\thr_runtime_b",
+    };
+    const firstInvoke = vi.fn(
+      async (command: string): Promise<unknown> =>
+        command === JA_RUNTIME_COMMANDS.workspaceActivate ? first : readyStatus,
+    );
     const firstAdapter = new TauriRuntimeHostAdapter(
       createBridge({
-        invoke: vi.fn(
-          async (command: string): Promise<unknown> =>
-            command === JA_RUNTIME_COMMANDS.generalWorkspace ? first : readyStatus,
-        ) as RuntimeNativeBridge["invoke"],
+        invoke: firstInvoke as RuntimeNativeBridge["invoke"],
       }),
     );
     const secondAdapter = new TauriRuntimeHostAdapter(
       createBridge({
         invoke: vi.fn(
           async (command: string): Promise<unknown> =>
-            command === JA_RUNTIME_COMMANDS.generalWorkspace ? second : readyStatus,
+            command === JA_RUNTIME_COMMANDS.workspaceActivate ? second : readyStatus,
         ) as RuntimeNativeBridge["invoke"],
       }),
     );
 
-    await expect(firstAdapter.generalWorkspace()).resolves.toEqual(first);
-    await expect(firstAdapter.generalWorkspace()).resolves.toEqual(first);
-    await expect(secondAdapter.generalWorkspace()).resolves.toEqual(second);
-    expect(first.workspaceId).not.toBe(second.workspaceId);
+    await expect(firstAdapter.activateWorkspace(first.workspaceId)).resolves.toEqual(first);
+    expect(firstInvoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.workspaceActivate, {
+      input: { workspaceId: first.workspaceId },
+    });
+    await expect(secondAdapter.activateWorkspace(second.workspaceId)).resolves.toEqual(second);
   });
 
   it("accepts the fixed settings query allowlist", async () => {
@@ -932,6 +974,7 @@ describe("RuntimeHost v1 typed adapter", () => {
           return {
             mcpId: "mcp_fixture",
             name: "Fixture",
+            scope: "global",
             transport: "stdio",
             status: "healthy",
             toolCount: 0,

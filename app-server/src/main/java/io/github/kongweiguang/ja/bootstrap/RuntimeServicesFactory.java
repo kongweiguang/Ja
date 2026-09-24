@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
@@ -30,6 +31,7 @@ public final class RuntimeServicesFactory {
     private final WorkspaceUseCase workspaces;
     private final WorkspacePathSearchUseCase workspacePathSearch;
     private final ThreadUseCase threads;
+    private final ThreadMcpUseCase threadMcp;
     private final TurnUseCase turns;
     private final ContextCompactionUseCase compactions;
     private final ApprovalBroker approvals;
@@ -46,7 +48,7 @@ public final class RuntimeServicesFactory {
      * 仅保存明确端口与一次性连接绑定，不延迟创建 Repository、配置或业务服务。
      */
     public RuntimeServicesFactory(WorkspaceUseCase workspaces, WorkspacePathSearchUseCase workspacePathSearch,
-                                  ThreadUseCase threads,
+                                  ThreadUseCase threads, ThreadMcpUseCase threadMcp,
                                   TurnUseCase turns, ContextCompactionUseCase compactions,
                                   ApprovalBroker approvals,
                                   CatalogUseCase catalog,
@@ -58,6 +60,7 @@ public final class RuntimeServicesFactory {
         this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
         this.workspacePathSearch = Objects.requireNonNull(workspacePathSearch, "workspacePathSearch");
         this.threads = Objects.requireNonNull(threads, "threads");
+        this.threadMcp = Objects.requireNonNull(threadMcp, "threadMcp");
         this.turns = Objects.requireNonNull(turns, "turns");
         this.compactions = Objects.requireNonNull(compactions, "compactions");
         this.approvals = Objects.requireNonNull(approvals, "approvals");
@@ -74,8 +77,8 @@ public final class RuntimeServicesFactory {
     }
 
     /**
-     * 校验握手模式并一次性发布服务图；实例所有权转移到字段并由应用关闭链回收，
-     * 因此不能在本方法局部关闭。
+     * 校验握手模式并一次性发布服务图；MCP 状态端口与 Thread 查询端口在同一连接代际冻结，
+     * 实例所有权转移到字段并由应用关闭链回收，因此不能在本方法局部关闭。
      */
     @SuppressWarnings("PMD.CloseResource")
     public synchronized RpcServiceBindings open(ObjectMapper mapper) {
@@ -84,7 +87,8 @@ public final class RuntimeServicesFactory {
             throw new IllegalStateException("runtime services were already opened");
         }
         RuntimeServices services = new RuntimeServices(
-                workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog, attachments,
+                workspaces, workspacePathSearch, threads, threadMcp, turns, compactions, approvals, catalog,
+                attachments,
                 attachmentPreviews, tasks, goals, interactions, closeAction);
         opened.set(services);
         return services.bindings();

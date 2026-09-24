@@ -14,6 +14,7 @@ import io.github.kongweiguang.ja.transport.rpc.handler.SettingsCatalogHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.TaskHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.ThreadHistoryHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.ThreadCompactionHandler;
+import io.github.kongweiguang.ja.transport.rpc.handler.ThreadMcpHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.TurnApprovalHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.WorkspaceHandler;
 import io.github.kongweiguang.ja.transport.rpc.handler.WorkspacePathSearchHandler;
@@ -152,7 +153,7 @@ public final class RpcServer implements AutoCloseable {
     }
 
     /**
-     * 在构造阶段固定 session 与外部订阅，避免运行中替换绑定使 Watcher 事件落入另一代连接。
+     * 在构造阶段固定 session、Thread MCP 查询入口与外部订阅，避免运行中替换绑定跨越连接代际。
      */
     RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
               RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
@@ -168,7 +169,7 @@ public final class RpcServer implements AutoCloseable {
         this.threadHistory = new ThreadHistoryHandler(session);
         this.router = new RpcRouter(List.of(new HandshakeHandler(session), new WorkspaceHandler(session),
                 new WorkspacePathSearchHandler(session),
-                threadHistory, new ThreadCompactionHandler(session),
+                threadHistory, new ThreadMcpHandler(session), new ThreadCompactionHandler(session),
                 new AttachmentHandler(session), new AttachmentPreviewHandler(session),
                 new TurnApprovalHandler(session), new TaskHandler(session), new GoalHandler(session),
                 new InteractionHandler(session),
@@ -342,6 +343,12 @@ public final class RpcServer implements AutoCloseable {
                         "an earlier turn must be resolved first");
                 case RECOVERY_REQUIRED -> JaRpcException.of(JaErrorCatalog.RECOVERY_REQUIRED,
                         "tool recovery requires an explicit decision");
+            };
+        }
+        if (failure instanceof TurnUseCase.QuestionRecoveryException recovery) {
+            return switch (recovery.failure()) {
+                case NOT_REASKABLE -> JaRpcException.of(JaErrorCatalog.TURN_NOT_REASKABLE,
+                        "该问题当前不可重新回答。");
             };
         }
         if (failure instanceof TurnUseCase.TurnCancellationException cancellation) {

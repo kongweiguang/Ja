@@ -42,6 +42,20 @@ final class TurnEventWireMapperTest {
         assertFalse(wire.params().has("threadRevision"));
     }
 
+    /** retry 通知在新 Provider 请求前发布，保留持久事件 identity 并暴露闭集的六次预算。 */
+    @Test
+    void mapsRetryStartedWithAttemptBudget() {
+        TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
+        TurnEvent.Context context = new TurnEvent.Context("evt_retry", "thr_test", "turn_test", 8,
+                0, Instant.parse("2026-09-23T00:00:00Z"));
+        TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.RetryStarted(context, 3, 6));
+
+        assertEquals("turn/retry-started", wire.method());
+        assertEquals(3, wire.params().path("attempt").intValue());
+        assertEquals(6, wire.params().path("maxAttempts").intValue());
+        assertEquals("evt_retry", wire.params().path("eventId").textValue());
+    }
+
     /** 持久终态保留 revision 和事件身份，sequence 由连接出站边界分配。 */
     @Test
     void mapsCommittedTerminal() {

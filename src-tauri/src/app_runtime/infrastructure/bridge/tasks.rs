@@ -6,8 +6,10 @@
 use super::*;
 use crate::app_runtime::domain::tasks::valid_task_cursor;
 use crate::app_runtime::domain::{
-    TaskContextPreviewItem, TaskThreadPreferences, TaskThreadSummary, valid_protocol_id,
+    TaskContextPreviewItem, TaskThreadPreferences, TaskThreadSummary, WorkspaceKind,
+    valid_protocol_id,
 };
+use crate::app_runtime::interface::dto::WorkspaceKindDto;
 use crate::app_runtime::interface::history_model::{ThreadDto, parse_thread};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -984,6 +986,12 @@ fn task_thread_from_history(thread: ThreadDto) -> TaskThreadSummary {
     TaskThreadSummary {
         thread_id: thread.thread_id,
         workspace_id: thread.workspace_id,
+        workspace_kind: match thread.workspace_kind {
+            WorkspaceKindDto::Project => WorkspaceKind::Project,
+            WorkspaceKindDto::Session => WorkspaceKind::Session,
+            WorkspaceKindDto::LegacyShared => WorkspaceKind::LegacyShared,
+        },
+        legacy_shared_workspace_id: thread.legacy_shared_workspace_id,
         active_goal_id: thread.active_goal_id,
         preferences: thread.preferences.map(|preferences| TaskThreadPreferences {
             provider_id: preferences.provider_id,

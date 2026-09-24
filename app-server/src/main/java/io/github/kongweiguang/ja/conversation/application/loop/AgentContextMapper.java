@@ -44,6 +44,7 @@ import java.util.Set;
 final class AgentContextMapper {
     private static final int MAX_CROSS_PROVIDER_REASONING = 1_048_576;
     private final JsonValueCodec argumentsCodec;
+    private final TerminalFailureReplyPolicy failureReplies = new TerminalFailureReplyPolicy();
 
     /**
      * 固定结构化参数编解码协议，保证 Tool 调用写入历史后仍能按同一语义回放。
@@ -53,13 +54,17 @@ final class AgentContextMapper {
     }
 
     /**
-     * 只投影当前 Turn 及其之前的稳定历史，并重建 Tool call/result 的名称关联与提示顺序。
+     * 只投影当前有效路径中当前 Turn 及之前的事实；重试半截草稿与失败收口是审计投影，不是模型上下文。
      */
     List<ContextMessage> fromSnapshot(ConversationRepository.ThreadSnapshot snapshot, String currentTurnId) {
         Objects.requireNonNull(snapshot, "snapshot");
+        Set<String> currentPath = snapshot.currentPathTurnIds();
+        Map<String, ConversationRepository.TurnSnapshot> turnsById = new java.util.HashMap<>();
+        snapshot.turns().forEach(turn -> turnsById.put(turn.turnId(), turn));
         LinkedHashSet<String> allowedTurns = new LinkedHashSet<>();
         boolean found = false;
         for (ConversationRepository.TurnSnapshot turn : snapshot.turns()) {
+            if (!currentPath.contains(turn.turnId())) continue;
             allowedTurns.add(turn.turnId());
             if (turn.turnId().equals(currentTurnId)) {
                 found = true;
@@ -74,6 +79,7 @@ final class AgentContextMapper {
             List<ConversationRepository.StoredMessage> turnMessages = snapshot.messages().stream()
                     .filter(message -> message.turnId().equals(turnId))
                     .sorted(java.util.Comparator.comparingLong(ConversationRepository.StoredMessage::ordinal))
+                    .filter(message -> isEffectiveModelMessage(message, turnsById.get(turnId)))
                     .toList();
             for (ConversationRepository.StoredMessage message : turnMessages) {
                 result.add(fromStoredMessage(message, promptOrdinal++, toolNames));
@@ -83,26 +89,45 @@ final class AgentContextMapper {
     }
 
     /**
-     * 手动压缩只在全部 Turn 终态后调用，因此投影完整永久历史而不伪造一个“当前 Turn”。
+     * 手动压缩只在有效路径的 Turn 终态后调用，因此不会把被 reask 替代的分支或自动失败收口压入摘要。
      */
     List<ContextMessage> fromCompleteSnapshot(ConversationRepository.ThreadSnapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
-        if (snapshot.turns().stream().anyMatch(turn -> !turn.state().terminal())) {
+        Set<String> currentPath = snapshot.currentPathTurnIds();
+        if (snapshot.turns().stream().anyMatch(turn -> currentPath.contains(turn.turnId())
+                && !turn.state().terminal())) {
             throw new AgentLoop.LoopFailure("THREAD_BUSY", "Thread has an active Turn");
         }
+        Map<String, ConversationRepository.TurnSnapshot> turnsById = new java.util.HashMap<>();
+        snapshot.turns().forEach(turn -> turnsById.put(turn.turnId(), turn));
         List<ContextMessage> result = new ArrayList<>();
         Map<String, String> toolNames = new java.util.HashMap<>();
         long promptOrdinal = 1;
         for (ConversationRepository.TurnSnapshot turn : snapshot.turns()) {
+            if (!currentPath.contains(turn.turnId())) continue;
             List<ConversationRepository.StoredMessage> turnMessages = snapshot.messages().stream()
                     .filter(message -> message.turnId().equals(turn.turnId()))
                     .sorted(java.util.Comparator.comparingLong(ConversationRepository.StoredMessage::ordinal))
+                    .filter(message -> isEffectiveModelMessage(message, turn))
                     .toList();
             for (ConversationRepository.StoredMessage message : turnMessages) {
                 result.add(fromStoredMessage(message, promptOrdinal++, toolNames));
             }
         }
         return List.copyOf(result);
+    }
+
+    /**
+     * 过滤审计型 partial 与自动收口身份，同时保留真实失败 Turn 中先前已提交的 Tool steps/results。
+     */
+    private boolean isEffectiveModelMessage(ConversationRepository.StoredMessage message,
+                                            ConversationRepository.TurnSnapshot turn) {
+        if (message.messageId().startsWith("item_partial_")) return false;
+        if (turn == null || turn.state() != io.github.kongweiguang.ja.conversation.domain.turn.TurnState.FAILED) {
+            return true;
+        }
+        return !message.messageId().equals(failureReplies.failureMessageIdFor(turn.turnId()))
+                && !message.messageId().equals(turn.terminalMessageId());
     }
 
     /**
@@ -128,14 +153,14 @@ final class AgentContextMapper {
                 prompt.messages().stream().map(message -> toModelMessage(message, configuration,
                         threadId, attachments, nativeSupport, nativeBudget))
                         .filter(Objects::nonNull).toList(),
-                McpToolExposure.modelTools(tools, prompt.messages(), argumentsCodec),
+                McpToolExposure.modelTools(tools, prompt.messages()),
                 continuation,
                 round);
     }
 
-    /** 本地搜索与完整执行目录一起建立，模型暴露筛选不能移除真实调用的权限与路由检查。 */
+    /** 执行目录保留当前 Provider 请求的完整声明，MCP 内部网关自行管理远端发现。 */
     List<AgentTool> toolCatalog(List<AgentTool> tools) {
-        return McpToolExposure.catalog(tools, argumentsCodec);
+        return McpToolExposure.catalog(tools);
     }
 
     /**

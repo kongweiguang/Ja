@@ -1148,7 +1148,7 @@ async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
 }
 
 /**
- * 在同一真实 Thread 中验证失败终态的唯一恢复入口：失败只显示“继续回复”，点击后创建新的
+ * 在同一真实 Thread 中验证失败终态的唯一恢复入口：失败只显示可访问的继续图标，点击后创建新的
  * Turn，旧 Tool 不回放；新 Turn 保留正常入场动画，terminal 后再观察 5 秒确认工作指示与对账
  * 都停止。该路径复用 loopback fixture，不把失败或继续行为伪造成静态 DOM。
  */

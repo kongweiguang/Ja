@@ -18,7 +18,8 @@ final class TerminalFailureReplyPolicyTest {
     @Test
     void coversKnownTerminalFailureCategories() {
         List<String> codes = List.of(
-                "MODEL_UNAVAILABLE", "MODEL_PROTOCOL_ERROR", "BUDGET_EXCEEDED",
+                "MODEL_UNAVAILABLE", "MODEL_PROTOCOL_ERROR", "MODEL_UPSTREAM_REJECTED",
+                "MODEL_STREAM_INVALID", "MODEL_IDLE_TIMEOUT", "BUDGET_EXCEEDED",
                 "REQUEST_DEADLINE_EXCEEDED", "CONTEXT_LIMIT", "SUMMARY_FAILURE", "CONFLICT", "INVALID_STATE",
                 "THREAD_BUSY", "APPROVAL_EXPIRED", "MCP_SERVER_UNAVAILABLE", "INTERNAL_ERROR");
 
@@ -52,20 +53,11 @@ final class TerminalFailureReplyPolicyTest {
         assertFalse(fallback.contains("provider_payload"));
     }
 
-    /** 无 Provider intent 的应急路径必须得到稳定消息 ID，避免恢复或重复结算制造多条失败回复。 */
+    /** 不依赖 Provider intent 的失败收口使用独立稳定 ID，避免与模型回答碰撞。 */
     @Test
-    void derivesStableMessageIdentityWithoutProviderIntent() {
-        io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState.Ready execution =
-                new io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState.Ready(
-                        new io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState.Common(
-                                0, 0, 1, null, List.of(),
-                                java.time.Instant.parse("2026-09-01T00:01:00Z"),
-                                io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER),
-                        io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState.Next.ASSISTANT,
-                        null);
-
-        String first = policy.messageIdFor("turn_failure", execution);
-        assertEquals(first, policy.messageIdFor("turn_failure", execution));
+    void derivesStableFailureMessageIdentityFromTurn() {
+        String first = policy.failureMessageIdFor("turn_failure");
+        assertEquals(first, policy.failureMessageIdFor("turn_failure"));
         assertTrue(first.matches("item_failure_[0-9a-f]{64}"));
     }
 
@@ -76,5 +68,17 @@ final class TerminalFailureReplyPolicyTest {
         assertEquals(first, policy.partialMessageIdFor("turn_failure", 2));
         assertTrue(first.matches("item_partial_[0-9a-f]{64}"));
         assertFalse(first.equals(policy.partialMessageIdFor("turn_failure", 3)));
+    }
+
+    /** 同轮不同 Provider request 的失败草稿都可审计且身份互异，重放同一 request 保持幂等。 */
+    @Test
+    void derivesDistinctPartialAuditIdentityPerProviderRequest() {
+        String first = policy.partialMessageIdForRequest("turn_failure", "request_first");
+        String second = policy.partialMessageIdForRequest("turn_failure", "request_second");
+
+        assertEquals(first, policy.partialMessageIdForRequest("turn_failure", "request_first"));
+        assertTrue(first.matches("item_partial_[0-9a-f]{64}"));
+        assertTrue(second.matches("item_partial_[0-9a-f]{64}"));
+        assertFalse(first.equals(second));
     }
 }

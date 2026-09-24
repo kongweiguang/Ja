@@ -38,7 +38,7 @@ public final class GoalToolExecutionLedger implements GoalToolExecutionPort {
 
     /**
      * 只有内部执行 origin 才进入 Goal ledger；按 owner 猜测优先级会在 Goal 与 standalone Plan 并存时
-     * 串账，普通 USER/CHILD_TASK Turn 即使同 Thread 有活动聚合也不能生成验收证据。
+     * 串账，普通 USER/CHILD_TASK 及用户显式续答 Turn 即使同 Thread 有活动聚合也不能生成验收证据。
      */
     @Override
     public Optional<Attempt> prepare(Prepare request) {
@@ -49,7 +49,7 @@ public final class GoalToolExecutionLedger implements GoalToolExecutionPort {
             case PLAN_EXECUTION -> goals.findInternalTurnBinding(request.turnId())
                     .filter(binding -> "PLAN_EXECUTION".equals(binding.origin()))
                     .flatMap(binding -> preparePlan(request, binding));
-            case USER, CHILD_TASK -> Optional.empty();
+            case USER, USER_CONTINUATION, CHILD_TASK -> Optional.empty();
         };
     }
 

@@ -26,7 +26,7 @@ public final class ConfigurationPolicy {
             "default_model_id", "default_reasoning_level", "interaction", "subagents",
             "providers", "mcp_servers", "skills");
     private static final Set<String> PROJECT_ROOT_KEYS = Set.of(
-            "schema_version", "config_revision", "skills", "disabled_skills");
+            "schema_version", "config_revision", "skills", "disabled_skills", "mcp_servers");
     private static final Set<String> USER_REQUIRED_ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
             "default_model_id", "default_reasoning_level", "subagents", "providers", "mcp_servers", "skills");
@@ -69,8 +69,8 @@ public final class ConfigurationPolicy {
     }
 
     /**
-     * 根据持久化作用域校验当前 v2 文档。项目层有意只保存 Skill 引用，防止项目文件成为
-     * Provider、MCP 或执行策略的第二个 owner，且使首次项目写入可保持最小化。
+     * 项目 MCP 与 Skill 一样受已登记工作区信任约束；完整 MCP 定义仍使用用户层同一安全规则，
+     * 而 Provider 和执行策略继续只由用户层持有。
      */
     public static void validateDocument(ObjectNode document, ConfigurationScope scope) {
         if (document == null || scope == null) {
@@ -83,6 +83,8 @@ public final class ConfigurationPolicy {
             validateRevision(document.get("config_revision"));
             validateSkillReferences(document.get("skills"), scope, false);
             validateSkillReferences(document.get("disabled_skills"), scope, true);
+            validateArray(document.get("mcp_servers"), MCP_KEYS, "mcp_id");
+            validateUserMcpServers(document.get("mcp_servers"));
             scanForLiteralSecrets(document);
             return;
         }
@@ -646,14 +648,24 @@ public final class ConfigurationPolicy {
     }
 
     /**
-     * 项目层唯一可收紧的全局事实是已经显式启用的用户 Skill。项目 Skill 自身由
-     * `project:` 身份隔离，因此无需也不能从用户层继承授权。
+     * 项目定义使用独立 MCP 身份；相同 ID 不得覆盖用户服务，否则模型精确路由会产生歧义。
      */
     static void enforceNoEscalation(ObjectNode user, ObjectNode project) {
         if (user == null) return;
         validateDocument(user, ConfigurationScope.USER);
         validateDocument(project, ConfigurationScope.PROJECT);
         compareDisabledSkillReferences(user.get("skills"), project.get("disabled_skills"));
+        Set<String> userMcpIds = new HashSet<>();
+        if (user.get("mcp_servers") instanceof ArrayNode userServers) {
+            userServers.forEach(server -> userMcpIds.add(server.path("mcp_id").asText()));
+        }
+        if (project.get("mcp_servers") instanceof ArrayNode projectServers) {
+            for (JsonNode server : projectServers) {
+                if (userMcpIds.contains(server.path("mcp_id").asText())) {
+                    throw escalation("project MCP identity conflicts with user MCP");
+                }
+            }
+        }
     }
 
     /**
@@ -705,13 +717,17 @@ public final class ConfigurationPolicy {
     }
 
     /**
-     * 深度合并用户文档与已验证项目 overlay；Skill 引用按来源保持独立，项目禁用只从最终授权集移除。
+     * 深度合并已验证项目定义；MCP 身份在合并前已校验，不能覆盖全局路由。
      * `disabled_skills` 是项目层控制事实，不得泄漏进 effective 文档或 generation。
      */
     static ObjectNode mergeDocuments(ObjectNode base, ObjectNode overlay) {
         ObjectNode result = base.deepCopy();
         appendProjectSkillReferences(result, overlay.get("skills"));
         removeDisabledSkillReferences(result, overlay.get("disabled_skills"));
+        if (overlay.get("mcp_servers") instanceof ArrayNode projectServers) {
+            ArrayNode effectiveServers = result.withArray("mcp_servers");
+            projectServers.forEach(server -> effectiveServers.add(server.deepCopy()));
+        }
         result.remove("disabled_skills");
         return result;
     }

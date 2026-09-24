@@ -201,7 +201,8 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         requireSubagentsEnabled(command.parentThreadId());
         ThreadSummary parent = requireParent(command.parentThreadId(), null);
         parent = new ThreadSummary(parent.threadId(), parent.workspaceId(), parent.title(),
-                command.frozenPreferences(), parent.status(), parent.pinned(), parent.latestTurnStatus(),
+                parent.workspaceKind(), parent.legacySharedWorkspaceId(), command.frozenPreferences(),
+                parent.status(), parent.pinned(), parent.latestTurnStatus(),
                 parent.latestTurnSeen(), parent.activeGoalId(), parent.revision(), parent.createdAt(),
                 parent.updatedAt());
         return startNew(command.parentThreadId(), command.parentTurnId(), command.taskName(), command.brief(),

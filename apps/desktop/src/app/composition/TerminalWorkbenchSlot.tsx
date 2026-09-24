@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useCallback, useEffect, useRef, type ReactElement } from "react";
+import { readClipboardText } from "@/api/tauri/clipboard";
 import {
   useTerminalWorkspaceController,
   type TerminalLayoutV1,
@@ -54,6 +55,7 @@ export function TerminalWorkbenchSlot({
     onLayoutChange,
     onOpenExternalUrl,
     onCopy,
+    onPaste: readClipboardText,
     resolveNativeDropPane,
   });
 

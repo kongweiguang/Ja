@@ -1382,6 +1382,7 @@ describe("Composer", () => {
     expect(cancel).toHaveBeenCalledOnce();
   });
 
+  /** 空草稿续答与有内容发送共用一个位置，但动作语义必须明确切换。 */
   it("最新失败轮次在空草稿时显示继续，输入或附件草稿后恢复发送语义", async () => {
     const user = userEvent.setup();
     const continueReply = vi.fn();
@@ -1398,6 +1399,7 @@ describe("Composer", () => {
 
     const continueButton = screen.getByRole("button", { name: "继续回复" });
     expect(continueButton).toBeEnabled();
+    expect(continueButton.textContent).toBe("");
     await user.click(continueButton);
     expect(continueReply).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
@@ -2100,5 +2102,202 @@ describe("Composer", () => {
     const indicator = screen.getByRole("progressbar", { name: "上下文使用量" });
     expect(indicator).toHaveAttribute("data-tone", "danger");
     expect(indicator).toHaveAttribute("aria-valuenow", "92");
+  });
+
+  /** 右键队列项复用 revision CAS 回调，且嵌套附件只获得自己的预览与移除动作。 */
+  it("为排队消息和其中的附件提供对象级右键菜单", async () => {
+    const user = userEvent.setup();
+    const prioritize = vi.fn();
+    const update = vi.fn();
+    const remove = vi.fn();
+    const openPreview = vi.fn();
+    render(
+      <ControlledComposerHarness
+        activeTurn
+        preferences={PREFERENCES}
+        models={MODELS}
+        queuedInputs={[
+          {
+            inputId: "input_context_menu",
+            content: [
+              { type: "attachment", attachmentId: "att_context_menu" },
+              { type: "text", text: "排队中的文本" },
+            ],
+            attachments: [
+              {
+                attachmentId: "att_context_menu",
+                displayName: "排队说明.txt",
+                sizeBytes: 64,
+                mediaKind: "text",
+                mediaType: "text/plain",
+              },
+            ],
+            kind: "follow_up",
+            status: "pending",
+            issue: null,
+            inputRevision: 8,
+            createdAt: "2026-09-23T00:00:00Z",
+          },
+        ]}
+        onPrioritizeQueuedInput={prioritize}
+        onUpdateQueuedInput={update}
+        onDeleteQueuedInput={remove}
+        onOpenQueuedAttachmentPreview={openPreview}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const queue = screen.getByRole("list", { name: "排队消息" });
+    const row = queue.querySelector<HTMLElement>(".ja-composer-queue__item");
+    expect(row).not.toBeNull();
+    if (row === null) return;
+    const attachment = queue.querySelector<HTMLElement>(".ja-composer-queue-attachments > li");
+    expect(attachment).not.toBeNull();
+    if (attachment === null) return;
+
+    fireEvent.contextMenu(attachment, { clientX: 20, clientY: 30 });
+    const attachmentMenu = await screen.findByRole("menu", {
+      name: "队列附件操作：排队说明.txt",
+    });
+    expect(within(attachmentMenu).getByRole("menuitem", { name: "预览附件" })).toBeVisible();
+    expect(within(attachmentMenu).getByRole("menuitem", { name: "移除附件" })).toHaveClass(
+      "is-danger",
+    );
+    expect(within(attachmentMenu).queryByRole("menuitem", { name: "调整方向" })).toBeNull();
+    await user.click(within(attachmentMenu).getByRole("menuitem", { name: "预览附件" }));
+    expect(openPreview).toHaveBeenCalledWith(
+      {
+        attachmentId: "att_context_menu",
+        fileName: "排队说明.txt",
+        sizeBytes: 64,
+        mediaKind: "text",
+        mediaType: "text/plain",
+      },
+      expect.any(HTMLButtonElement),
+    );
+
+    fireEvent.contextMenu(row, { clientX: 35, clientY: 45 });
+    const queueMenu = await screen.findByRole("menu", { name: /排队消息操作/ });
+    expect(within(queueMenu).getByRole("menuitem", { name: "调整方向" })).toBeVisible();
+    expect(within(queueMenu).getByRole("menuitem", { name: "编辑消息" })).toBeVisible();
+    expect(within(queueMenu).getByRole("menuitem", { name: "删除消息" })).toHaveClass("is-danger");
+    await user.click(within(queueMenu).getByRole("menuitem", { name: "调整方向" }));
+    expect(prioritize).toHaveBeenCalledWith("input_context_menu", 8);
+
+    fireEvent.contextMenu(row, { clientX: 40, clientY: 55 });
+    await user.click(await screen.findByRole("menuitem", { name: "编辑消息" }));
+    expect(screen.getByRole("textbox", { name: /编辑第 1 条消息/ })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(update).not.toHaveBeenCalled();
+
+    fireEvent.contextMenu(row, { clientX: 45, clientY: 65 });
+    await user.click(await screen.findByRole("menuitem", { name: "删除消息" }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("input_context_menu", 8));
+  });
+
+  /** 待发送附件按真实媒体能力显示预览，忙碌与不可预览附件不会暴露伪操作。 */
+  it("为待发送附件显示可用预览与移除菜单并支持键盘焦点回归", async () => {
+    const user = userEvent.setup();
+    const openPreview = vi.fn();
+    const remove = vi.fn();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        attachmentDraftItems={[
+          {
+            state: "ready",
+            itemId: "item_menu_image",
+            attachmentId: "att_menu_image",
+            fileName: "菜单图片.png",
+            sizeBytes: 128,
+            mediaKind: "image",
+            mediaType: "image/png",
+          },
+          {
+            state: "ready",
+            itemId: "item_menu_binary",
+            attachmentId: "att_menu_binary",
+            fileName: "菜单归档.zip",
+            sizeBytes: 256,
+            mediaKind: "binary",
+          },
+        ]}
+        onOpenAttachmentPreview={openPreview}
+        onRemoveAttachment={remove}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const list = screen.getByRole("list", { name: "待发送附件" });
+    const image = list.querySelector<HTMLElement>('li[data-media-kind="image"]');
+    const binary = list.querySelector<HTMLElement>('li[data-media-kind="binary"]');
+    expect(image).not.toBeNull();
+    expect(binary).not.toBeNull();
+    if (image === null || binary === null) return;
+    fireEvent.contextMenu(image, { clientX: 25, clientY: 35 });
+    const imageMenu = await screen.findByRole("menu", { name: "附件操作：菜单图片.png" });
+    expect(within(imageMenu).getByRole("menuitem", { name: "预览附件" })).toBeVisible();
+    await user.click(within(imageMenu).getByRole("menuitem", { name: "预览附件" }));
+    expect(openPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ attachmentId: "att_menu_image", fileName: "菜单图片.png" }),
+      expect.any(HTMLButtonElement),
+    );
+
+    const binaryRemoveButton = screen.getByRole("button", {
+      name: "移除附件 菜单归档.zip",
+    });
+    binaryRemoveButton.focus();
+    fireEvent.keyDown(binaryRemoveButton, { key: "ContextMenu" });
+    const binaryMenu = await screen.findByRole("menu", { name: "附件操作：菜单归档.zip" });
+    expect(within(binaryMenu).queryByRole("menuitem", { name: "预览附件" })).toBeNull();
+    const removeItem = within(binaryMenu).getByRole("menuitem", { name: "移除附件" });
+    expect(removeItem).toBeEnabled();
+    expect(removeItem).toHaveClass("is-danger");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(binaryRemoveButton).toHaveFocus());
+
+    fireEvent.contextMenu(binary, { clientX: 30, clientY: 45 });
+    await user.click(await screen.findByRole("menuitem", { name: "移除附件" }));
+    expect(remove).toHaveBeenCalledWith("item_menu_binary");
+  });
+
+  /** 引用菜单只通过已注入的打开/移除回调行动，且 Preview 焦点来源是当前可见按钮。 */
+  it("为可打开的 Composer 引用提供打开与移除菜单", async () => {
+    const user = userEvent.setup();
+    const openReference = vi.fn();
+    const removeReference = vi.fn();
+    const reference: ConversationContextReference = {
+      type: "workspace_reference",
+      workspaceId: "ws_context_menu",
+      relativePath: "src/App.tsx",
+      kind: "file",
+    };
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        contextReferences={[reference]}
+        onOpenWorkspaceReference={openReference}
+        onContextReferencesChange={removeReference}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const chip = screen
+      .getByRole("list", { name: "消息上下文" })
+      .querySelector<HTMLElement>(".ja-composer-context__chip");
+    expect(chip).not.toBeNull();
+    if (chip === null) return;
+    fireEvent.contextMenu(chip, { clientX: 20, clientY: 30 });
+    const menu = await screen.findByRole("menu", { name: "引用操作" });
+    expect(within(menu).getByRole("menuitem", { name: "打开文件" })).toBeVisible();
+    expect(within(menu).getByRole("menuitem", { name: "移除引用" })).toBeVisible();
+    await user.click(within(menu).getByRole("menuitem", { name: "打开文件" }));
+    expect(openReference).toHaveBeenCalledWith(reference, expect.any(HTMLButtonElement));
+
+    fireEvent.contextMenu(chip, { clientX: 25, clientY: 35 });
+    await user.click(await screen.findByRole("menuitem", { name: "移除引用" }));
+    expect(removeReference).toHaveBeenCalledWith([]);
   });
 });

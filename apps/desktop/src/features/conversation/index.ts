@@ -63,11 +63,18 @@ export type {
   ComposerWorkspaceSearchResult,
 } from "./ui/composer/composerSuggestions";
 export { resolveContextUsage } from "./domain/contextUsage";
+export { countCommittedConversationActivity } from "./domain/conversationActivity";
+export type { ConversationActivityCounts } from "./domain/conversationActivity";
 export { projectAnsweredInteractionResult } from "./application/interactionTimeline";
 export type { ConversationContextReference, UserContentBlock } from "./domain/userContent";
 export { ConversationSummaryPopover } from "./ui/summary/ConversationSummaryPopover";
 export { ThreadOperationsMenu } from "./ui/thread-actions/ThreadOperationsMenu";
-export type { ConversationSummary } from "./ui/summary/ConversationSummaryPopover";
+export type {
+  ConversationMcpReader,
+  ConversationMcpServerStatus,
+  ConversationMcpStatusSnapshot,
+  ConversationSummary,
+} from "./ui/summary/ConversationSummaryPopover";
 export { ReplyFileOpenMenu } from "./ui/reply-files/ReplyFileOpenMenu";
 export { useReplyFileOpen } from "./application/useReplyFileOpen";
 export { ChatTimeline } from "./ui/timeline/ChatTimeline";

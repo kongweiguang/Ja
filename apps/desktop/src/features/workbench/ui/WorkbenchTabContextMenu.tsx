@@ -3,7 +3,7 @@
 
 import { CopyX, ListX, PanelRightClose, Pencil, X } from "lucide-react";
 import type { ReactElement } from "react";
-import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "@/shared/ui/primitives";
+import { MenuItem, MenuSeparator, PointerContextMenu } from "@/shared/ui/primitives";
 
 export interface WorkbenchTabContextMenuProps {
   readonly label: string;
@@ -23,8 +23,8 @@ export interface WorkbenchTabContextMenuProps {
 }
 
 /**
- * 右键菜单用固定的零尺寸 Radix Trigger 锚定指针坐标，使鼠标和键盘入口共用
- * Radix 的视口碰撞、焦点漫游与 Portal 语义，而不让普通左击 Tab 意外打开菜单。
+ * 标签专用动作仍由 Workbench owner 提供；共享定位容器统一视口碰撞、键盘漫游和
+ * Escape 焦点恢复，避免顶层菜单与文件功能出现两套右键行为。
  */
 export function WorkbenchTabContextMenu({
   label,
@@ -43,66 +43,48 @@ export function WorkbenchTabContextMenu({
   onCloseAll,
 }: WorkbenchTabContextMenuProps): ReactElement {
   return (
-    <Menu open onOpenChange={onOpenChange} modal={false}>
-      <MenuTrigger asChild>
-        <button
-          type="button"
-          tabIndex={-1}
-          aria-hidden="true"
-          className="ja-workbench-tab-context-anchor"
-          style={{ left: x, top: y }}
-        />
-      </MenuTrigger>
-      <MenuContent
-        className="ja-workbench-tab-context-menu"
-        align="start"
-        side="bottom"
-        sideOffset={2}
-        aria-label={`${label} 标签页操作`}
-        aria-labelledby={undefined}
-        onEscapeKeyDown={() => {
-          window.requestAnimationFrame(onRestoreFocus);
-        }}
-        onCloseAutoFocus={(event) => {
-          event.preventDefault();
-        }}
+    <PointerContextMenu
+      x={x}
+      y={y}
+      label={`${label} 标签页操作`}
+      onOpenChange={onOpenChange}
+      onRestoreFocus={onRestoreFocus}
+    >
+      {canRename ? (
+        <>
+          <MenuItem className="ja-workbench-tab-context-item" disabled={busy} onSelect={onRename}>
+            <Pencil aria-hidden="true" />
+            <span>重命名</span>
+            <kbd aria-hidden="true">F2</kbd>
+          </MenuItem>
+          <MenuSeparator className="ja-workbench-add-menu-separator" />
+        </>
+      ) : null}
+      <MenuItem className="ja-workbench-tab-context-item" disabled={busy} onSelect={onClose}>
+        <X aria-hidden="true" />
+        <span>关闭</span>
+      </MenuItem>
+      <MenuItem
+        className="ja-workbench-tab-context-item"
+        disabled={busy || !canCloseOthers}
+        onSelect={onCloseOthers}
       >
-        {canRename ? (
-          <>
-            <MenuItem className="ja-workbench-tab-context-item" disabled={busy} onSelect={onRename}>
-              <Pencil aria-hidden="true" />
-              <span>重命名</span>
-              <kbd aria-hidden="true">F2</kbd>
-            </MenuItem>
-            <MenuSeparator className="ja-workbench-add-menu-separator" />
-          </>
-        ) : null}
-        <MenuItem className="ja-workbench-tab-context-item" disabled={busy} onSelect={onClose}>
-          <X aria-hidden="true" />
-          <span>关闭</span>
-        </MenuItem>
-        <MenuItem
-          className="ja-workbench-tab-context-item"
-          disabled={busy || !canCloseOthers}
-          onSelect={onCloseOthers}
-        >
-          <CopyX aria-hidden="true" />
-          <span>关闭其他标签页</span>
-        </MenuItem>
-        <MenuItem
-          className="ja-workbench-tab-context-item"
-          disabled={busy || !canCloseRight}
-          onSelect={onCloseRight}
-        >
-          <PanelRightClose aria-hidden="true" />
-          <span>关闭右侧标签页</span>
-        </MenuItem>
-        <MenuSeparator className="ja-workbench-add-menu-separator" />
-        <MenuItem className="ja-workbench-tab-context-item" disabled={busy} onSelect={onCloseAll}>
-          <ListX aria-hidden="true" />
-          <span>关闭全部标签页</span>
-        </MenuItem>
-      </MenuContent>
-    </Menu>
+        <CopyX aria-hidden="true" />
+        <span>关闭其他标签页</span>
+      </MenuItem>
+      <MenuItem
+        className="ja-workbench-tab-context-item"
+        disabled={busy || !canCloseRight}
+        onSelect={onCloseRight}
+      >
+        <PanelRightClose aria-hidden="true" />
+        <span>关闭右侧标签页</span>
+      </MenuItem>
+      <MenuSeparator className="ja-workbench-add-menu-separator" />
+      <MenuItem className="ja-workbench-tab-context-item" disabled={busy} onSelect={onCloseAll}>
+        <ListX aria-hidden="true" />
+        <span>关闭全部标签页</span>
+      </MenuItem>
+    </PointerContextMenu>
   );
 }

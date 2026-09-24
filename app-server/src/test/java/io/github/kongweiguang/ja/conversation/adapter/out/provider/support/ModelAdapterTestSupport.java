@@ -159,6 +159,14 @@ public final class ModelAdapterTestSupport {
                 .body(new StallingBody(responseStarted));
     }
 
+    /** 延迟首个 SSE 正文字节，验证 OkHttp 的逐次读取空闲上限会主动结束请求。 */
+    public static void delayedSse(Exchange exchange, long delay, java.util.concurrent.TimeUnit unit) {
+        exchange.responseBuilder.code(200)
+                .setHeader("Content-Type", "text/event-stream; charset=utf-8")
+                .bodyDelay(delay, unit)
+                .body(": delayed\r\n");
+    }
+
     /** 记录请求次数，并将每次真实 loopback 交换交给测试持有的 Responder。 */
     public static final class Loopback implements AutoCloseable {
         private final MockWebServer server;

@@ -89,17 +89,16 @@ async function waitForApplication(page, deadline) {
 }
 
 /**
- * 在隔离配置内通过 typed Settings/Runtime/History adapter 配置 loopback Provider 并创建真实
- * Thread；cwd 必须来自当前 App 的 general workspace，避免 runner 注入项目路径或依赖项目 picker。
+ * 在隔离配置内通过 typed Settings/History adapter 配置 loopback Provider 并创建真实 session
+ * Thread；省略 cwd 让 Java 分配独立目录，随后由真实侧栏切换触发 activation。
  */
 async function configureFixtureAndCreateThread(page, baseUrl) {
   return page.evaluate(
     async ({ endpoint, title }) => {
-      const [{ TauriSettingsAdapter }, { createHistoryAdapter }, { createRuntimeHostAdapter }] =
+      const [{ TauriSettingsAdapter }, { createHistoryAdapter }] =
         await Promise.all([
           import("/src/api/tauri/settings.ts"),
           import("/src/api/tauri/history.ts"),
-          import("/src/api/tauri/runtime.ts"),
         ]);
       const settings = new TauriSettingsAdapter();
       const loaded = await settings.snapshot();
@@ -117,9 +116,7 @@ async function configureFixtureAndCreateThread(page, baseUrl) {
       if (current?.baseUrl !== endpoint) throw new Error("fixture Provider endpoint was not staged");
       const modelId = current.models[0]?.modelId;
       if (modelId === undefined) throw new Error("isolated provider_e2e model is missing");
-      const workspace = await createRuntimeHostAdapter().generalWorkspace();
       const created = await createHistoryAdapter().threadCreate({
-        cwd: workspace.rootPath,
         title,
         providerId: "provider_e2e",
         modelId,
@@ -127,6 +124,8 @@ async function configureFixtureAndCreateThread(page, baseUrl) {
         accessMode: "full_access",
         collaborationMode: "default",
       });
+      if (created.workspaceKind !== "session")
+        throw new Error("thread/create did not return a Java-owned session workspace");
       return { threadId: created.threadId, modelId };
     },
     { endpoint: baseUrl, title: TITLE },
@@ -311,8 +310,7 @@ export function validateShellEnvironmentReport(report) {
 }
 
 /**
- * 驱动一轮隐藏真窗：Agent Shell、ConPTY、取消都绑定当前隔离 Thread 与 Provider；Thread
- * 直接使用 App-owned general workspace，不要求项目 picker 先建立 UI selection。
+ * 驱动一轮隐藏真窗：Agent Shell、ConPTY、取消都绑定当前隔离 session Thread 与 Provider。
  */
 export async function runShellEnvironmentWebView2({ page, evidenceDirectory, fixture }) {
   assert.ok(page, "page is required");

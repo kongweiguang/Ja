@@ -54,11 +54,11 @@ public final class WorkspacePolicy {
     }
 
     /**
-     * 通用工作区固定为受信任状态，因为它从不加载项目覆盖层。
+     * 非项目目录固定为受信任状态，因为它们从不加载项目覆盖层。
      */
     public Workspace.Trust initialTrust(WorkspaceDirectory.Kind kind) {
         Objects.requireNonNull(kind, "kind");
-        return kind == WorkspaceDirectory.Kind.GENERAL
+        return kind != WorkspaceDirectory.Kind.PROJECT
                 ? Workspace.Trust.TRUSTED : Workspace.Trust.UNTRUSTED;
     }
 }

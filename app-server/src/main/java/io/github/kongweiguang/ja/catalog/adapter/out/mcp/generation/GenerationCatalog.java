@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
 import io.github.kongweiguang.ja.catalog.port.out.CatalogQueryPort;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
+import io.github.kongweiguang.ja.catalog.port.out.ThreadMcpCatalogPort;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 import io.github.kongweiguang.ja.conversation.port.out.SkillCatalog;
@@ -33,6 +34,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -48,9 +50,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>每次 Settings 调用都从传入的不可变代际重建 Descriptor 投影。
  * 工作区发现只按代际标识与规范 cwd 缓存非 Secret MCP Schema；启动定义在捕获时从活动 Turn 租约重建。</p>
  */
-public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable {
+public final class GenerationCatalog implements CatalogQueryPort, ThreadMcpCatalogPort, AutoCloseable {
     private static final int MAXIMUM_PAGE = 200;
     private static final int MAXIMUM_WORKSPACE_CATALOGS = 32;
+    private static final int MAXIMUM_THREAD_MCP_OBSERVATIONS = 512;
 
     private final ObjectMapper objectMapper;
     private final McpLimits limits;
@@ -62,6 +65,8 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
     private final ConcurrentHashMap<Path, WorkspaceRegistration> workspaces = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ServiceKey, McpServiceDirectory> serviceDirectories =
             new ConcurrentHashMap<>();
+    private final Map<String, StoredObservation> threadObservations =
+            new LinkedHashMap<>(16, 0.75f, true);
     private final ExecutorService probes = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("ja-generation-mcp-", 0).factory());
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -121,22 +126,18 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
                 .toAbsolutePath().normalize();
     }
 
-    /**
-     * 纯登记工作区与定义修订并失效旧目录，不启动进程、联网或调用 initialize/tools/list。
-     */
+    /** Workspace prepare 只登记非 Secret 配置代际，实际定义与凭据延迟到 Provider 安全点解析。 */
     public void prepareWorkspace(Path workspaceRoot, ConfigurationGenerationPort.Lease lease) {
         Objects.requireNonNull(lease, "lease");
         ConfigurationGenerationSnapshot generation = lease.snapshot();
         Path workspace = new WorkspaceBoundary(workspaceRoot).root();
-        List<McpServerDefinition> definitions = definitions(generation, lease, workspace);
-        Map<String, String> revisions = definitions.stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
-                McpServerDefinition::id, McpServerDefinition::definitionRevision));
-        workspaces.put(workspace, new WorkspaceRegistration(generation.generationId(), revisions));
-        serviceDirectories.forEach((key, directory) -> {
-            if (key.workspaceRoot().equals(workspace)
-                && !Objects.equals(revisions.get(key.serverId()), key.definitionRevision())) {
-                directory.retire(false);
-            }
+        String generationId = generation.generationId();
+        workspaces.compute(workspace, (ignored, previous) -> {
+            if (previous != null && previous.generationId().equals(generationId)) return previous;
+            serviceDirectories.forEach((key, directory) -> {
+                if (key.workspaceRoot().equals(workspace)) directory.retire(false);
+            });
+            return new WorkspaceRegistration(generationId, Map.of());
         });
         if (workspaces.size() > MAXIMUM_WORKSPACE_CATALOGS) {
             workspaces.keySet().stream().sorted(Comparator.comparing(Path::toString))
@@ -159,11 +160,26 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
             retireUnselected(workspace, Map.of());
             workspaces.put(workspace, new WorkspaceRegistration(generation.generationId(), Map.of()));
             McpGateway.McpSnapshot empty = McpRuntime.catalogSnapshot(List.of(), List.of(), objectMapper, Instant.EPOCH);
-            return new TurnCatalog(empty, Map.of(), Map.of());
+            List<McpGateway.McpServerStatus> disabled = generation.mcpDefinitions().stream()
+                    .sorted(Comparator.comparing(ConfigurationGenerationSnapshot.McpServer::mcpId))
+                    .map(server -> new McpGateway.McpServerStatus(
+                            server.mcpId(), server.name(), "disabled", null, null)).toList();
+            return new TurnCatalog(empty, Map.of(), Map.of(), disabled);
         }
+        Map<String, McpGateway.McpServerStatus> serverStatuses = new LinkedHashMap<>();
+        generation.mcpDefinitions().stream().filter(server -> !server.enabled())
+                .sorted(Comparator.comparing(ConfigurationGenerationSnapshot.McpServer::mcpId))
+                .forEach(server -> serverStatuses.put(server.mcpId(), new McpGateway.McpServerStatus(
+                        server.mcpId(), server.name(), "disabled", null, null)));
         List<McpServerDefinition> selected = new ArrayList<>();
         for (ConfigurationGenerationSnapshot.McpServer server : enabled) {
-            selected.add(GenerationMcpDefinitionFactory.create(server, workspace, lease));
+            try {
+                selected.add(GenerationMcpDefinitionFactory.create(server, workspace, lease));
+            } catch (RuntimeException invalidDefinition) {
+                /* 一份服务定义或凭据损坏只隔离该服务，其他 MCP 服务仍进入同一 Provider 目录。 */
+                serverStatuses.put(server.mcpId(), new McpGateway.McpServerStatus(
+                        server.mcpId(), server.name(), "unavailable", null, "CONFIGURATION_INVALID"));
+            }
         }
         Map<String, String> selectedRevisions = selected.stream().collect(
                 java.util.stream.Collectors.toUnmodifiableMap(
@@ -172,12 +188,26 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
         Map<String, McpServiceDirectory> capturedServices = new LinkedHashMap<>();
         List<McpGateway.McpTool> tools = new ArrayList<>();
         for (McpServerDefinition definition : selected) {
-            retireSuperseded(workspace, definition, true);
-            ServiceKey key = new ServiceKey(workspace, definition.id(), definition.definitionRevision());
-            McpServiceDirectory directory = serviceDirectories.computeIfAbsent(key,
-                    ignored -> new McpServiceDirectory(definition, limits, objectMapper, sessionFactory));
-            capturedServices.put(definition.id(), directory);
-            tools.addAll(directory.snapshot().tools());
+            ConfigurationGenerationSnapshot.McpServer configured = enabled.stream()
+                    .filter(server -> server.mcpId().equals(definition.id())).findFirst().orElseThrow();
+            try {
+                retireSuperseded(workspace, definition, true);
+                ServiceKey key = new ServiceKey(workspace, definition.id(), definition.definitionRevision());
+                McpServiceDirectory directory = serviceDirectories.computeIfAbsent(key,
+                        ignored -> new McpServiceDirectory(definition, limits, objectMapper, sessionFactory));
+                capturedServices.put(definition.id(), directory);
+                List<McpGateway.McpTool> serverTools = directory.snapshot().tools();
+                boolean failed = directory.runtime().unavailableServerIds().contains(definition.id());
+                serverStatuses.put(definition.id(), new McpGateway.McpServerStatus(
+                        definition.id(), configured.name(), failed ? "unavailable" : "available",
+                        failed ? null : serverTools.size(), failed ? "DISCOVERY_FAILED" : null));
+                tools.addAll(serverTools);
+            } catch (RuntimeException isolatedFailure) {
+                /* Session owner 或并发退休故障与远端发现同样只让本服务不可用，不吞掉其他目录。 */
+                tools.removeIf(tool -> tool.serverId().equals(definition.id()));
+                serverStatuses.put(definition.id(), new McpGateway.McpServerStatus(
+                        definition.id(), configured.name(), "unavailable", null, "DISCOVERY_FAILED"));
+            }
         }
         workspaces.put(workspace, new WorkspaceRegistration(generation.generationId(), selectedRevisions));
         McpGateway.McpSnapshot snapshot = McpRuntime.catalogSnapshot(tools, selected, objectMapper, Instant.now());
@@ -185,7 +215,84 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
                 McpToolCatalog.routeIdentities(snapshot, selected.stream().collect(
                         java.util.stream.Collectors.toUnmodifiableMap(
                                 McpServerDefinition::id, java.util.function.Function.identity())), objectMapper);
-        return new TurnCatalog(snapshot, identities, capturedServices);
+        List<McpGateway.McpServerStatus> orderedStatuses = generation.mcpDefinitions().stream()
+                .sorted(Comparator.comparing(ConfigurationGenerationSnapshot.McpServer::mcpId))
+                .map(server -> serverStatuses.get(server.mcpId())).toList();
+        return new TurnCatalog(snapshot, identities, capturedServices, orderedStatuses);
+    }
+
+    /** 只读取最近发布的内存会话目录，不初始化或刷新服务。 */
+    @Override
+    public Optional<ThreadMcpCatalogPort.Observation> observation(String threadId) {
+        Objects.requireNonNull(threadId, "threadId");
+        synchronized (threadObservations) {
+            return Optional.ofNullable(threadObservations.get(threadId)).map(StoredObservation::observation);
+        }
+    }
+
+    /** 每个会话只保留最近一次有界且脱敏的派发快照，避免观测缓存无限增长。 */
+    @Override
+    public void observe(ThreadMcpCatalogPort.Observation observation) {
+        Objects.requireNonNull(observation, "observation");
+        if (closed.get()) return;
+        Map<String, McpServiceDirectory.DirectoryVersion> versions = captureServiceVersions(observation);
+        synchronized (threadObservations) {
+            threadObservations.put(observation.threadId(), new StoredObservation(observation, versions));
+            while (threadObservations.size() > MAXIMUM_THREAD_MCP_OBSERVATIONS) {
+                String eldest = threadObservations.keySet().iterator().next();
+                threadObservations.remove(eldest);
+            }
+        }
+    }
+
+    /** 同代际服务收到目录变更或更新的探测结果后，使旧观测失效。 */
+    @Override
+    public boolean current(ThreadMcpCatalogPort.Observation observation) {
+        Objects.requireNonNull(observation, "observation");
+        StoredObservation stored;
+        synchronized (threadObservations) {
+            stored = threadObservations.get(observation.threadId());
+        }
+        if (stored == null || !stored.observation().equals(observation)) return false;
+        WorkspaceRegistration registration = workspaces.get(observation.workspaceRoot());
+        if (registration == null) return stored.serviceVersions().isEmpty();
+        if (!registration.generationId().equals(observation.generationId())) return false;
+        for (Map.Entry<String, McpServiceDirectory.DirectoryVersion> entry
+                : stored.serviceVersions().entrySet()) {
+            String definitionRevision = registration.definitionRevisions().get(entry.getKey());
+            if (definitionRevision == null) return false;
+            ServiceKey key = new ServiceKey(observation.workspaceRoot(), entry.getKey(), definitionRevision);
+            McpServiceDirectory.DirectoryVersion current = Optional.ofNullable(serviceDirectories.get(key))
+                    .map(McpServiceDirectory::version)
+                    .orElse(null);
+            if (current == null) return false;
+            if ((current.dirty() && !current.lastDiscoveryFailed())
+                    || current.lastDiscoveryFailed() != entry.getValue().lastDiscoveryFailed()
+                    || !Objects.equals(current.revision(), entry.getValue().revision())) return false;
+        }
+        return true;
+    }
+
+    /** 仅捕获缓存中的服务修订，让读取操作无需连接 MCP 也能识别变化。 */
+    private Map<String, McpServiceDirectory.DirectoryVersion> captureServiceVersions(
+            ThreadMcpCatalogPort.Observation observation) {
+        WorkspaceRegistration registration = workspaces.get(observation.workspaceRoot());
+        if (registration == null || !registration.generationId().equals(observation.generationId())) {
+            return Map.of();
+        }
+        Set<String> observedServices = observation.servers().stream()
+                .filter(server -> !Set.of("disabled", "not_exposed").contains(server.state()))
+                .map(McpGateway.McpServerStatus::serverId)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Map<String, McpServiceDirectory.DirectoryVersion> versions = new LinkedHashMap<>();
+        registration.definitionRevisions().forEach((serverId, revision) -> {
+            if (!observedServices.contains(serverId)) return;
+            ServiceKey key = new ServiceKey(observation.workspaceRoot(), serverId, revision);
+            Optional.ofNullable(serviceDirectories.get(key))
+                    .map(McpServiceDirectory::version)
+                    .ifPresent(version -> versions.put(serverId, version));
+        });
+        return Map.copyOf(versions);
     }
 
     /**
@@ -280,6 +387,7 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
         List<McpServerDescriptor> values = generation.mcpDefinitions().stream()
                 .sorted(Comparator.comparing(ConfigurationGenerationSnapshot.McpServer::mcpId))
                 .map(server -> new McpServerDescriptor(server.mcpId(), server.name(),
+                        scope(server),
                         server.transport() == ConfigurationGenerationSnapshot.Transport.STDIO
                                 ? "stdio" : "streamable_http",
                         server.enabled() ? "configured" : "disabled", 0)).toList();
@@ -291,27 +399,27 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
      */
     @Override
     public CompletionStage<McpServerDescriptor> testMcp(
-            ConfigurationGenerationPort.Lease lease, String mcpId) {
+            ConfigurationGenerationPort.Lease lease, Path workspaceRoot, String mcpId) {
         ConfigurationGenerationSnapshot.McpServer server = lease.snapshot().requireMcp(mcpId);
         if (!server.enabled()) {
             return CompletableFuture.completedFuture(new McpServerDescriptor(server.mcpId(), server.name(),
-                    transport(server), "disabled", 0));
+                    scope(server), transport(server), "disabled", 0));
         }
         return CompletableFuture.supplyAsync(() -> {
             List<McpServerDefinition> definitions = List.of(GenerationMcpDefinitionFactory.create(
-                    server, stdioWorkingDirectory, lease));
+                    server, workspaceRoot == null ? stdioWorkingDirectory : workspaceRoot, lease));
             try (McpRuntime runtime = new McpRuntime(definitions, limits, objectMapper, sessionFactory)) {
                 McpGateway.McpSnapshot snapshot = runtime.snapshot();
                 if (runtime.unavailableServerIds().contains(mcpId)) {
-                    return new McpServerDescriptor(server.mcpId(), server.name(), transport(server),
+                    return new McpServerDescriptor(server.mcpId(), server.name(), scope(server), transport(server),
                             "unavailable", 0);
                 }
                 int tools = (int) snapshot.tools().stream()
                         .filter(tool -> tool.serverId().equals(mcpId)).count();
-                return new McpServerDescriptor(server.mcpId(), server.name(), transport(server),
+                return new McpServerDescriptor(server.mcpId(), server.name(), scope(server), transport(server),
                         "available", tools);
             } catch (RuntimeException failure) {
-                return new McpServerDescriptor(server.mcpId(), server.name(), transport(server),
+                return new McpServerDescriptor(server.mcpId(), server.name(), scope(server), transport(server),
                         "unavailable", 0);
             }
         }, probes);
@@ -322,11 +430,11 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
      */
     @Override
     public CursorPage<McpToolDescriptor> readMcpTools(
-            ConfigurationGenerationPort.Lease lease, String mcpId, String cursor, int limit) {
+            ConfigurationGenerationPort.Lease lease, Path workspaceRoot, String mcpId, String cursor, int limit) {
         ConfigurationGenerationSnapshot.McpServer server = lease.snapshot().requireMcp(mcpId);
         if (!server.enabled()) return new CursorPage<>(List.of(), null);
         List<McpServerDefinition> definitions = List.of(GenerationMcpDefinitionFactory.create(server,
-                stdioWorkingDirectory, lease));
+                workspaceRoot == null ? stdioWorkingDirectory : workspaceRoot, lease));
         try (McpRuntime runtime = new McpRuntime(definitions, limits, objectMapper, sessionFactory)) {
             McpGateway.McpSnapshot snapshot = runtime.snapshot();
             if (runtime.unavailableServerIds().contains(mcpId)) {
@@ -347,6 +455,9 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
         workspaces.clear();
+        synchronized (threadObservations) {
+            threadObservations.clear();
+        }
         List<RuntimeException> failures = new ArrayList<>();
         serviceDirectories.values().forEach(directory -> {
             try {
@@ -369,20 +480,12 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
         }
     }
 
-    /**
-     * 从一个代际及其租约构建定义，不保留已解析 Secret。
-     */
-    private static List<McpServerDefinition> definitions(ConfigurationGenerationSnapshot generation,
-                                                         ConfigurationGenerationPort.Lease lease,
-                                                         Path workspace) {
-        return generation.mcpDefinitions().stream()
-                .filter(ConfigurationGenerationSnapshot.McpServer::enabled)
-                .map(server -> GenerationMcpDefinitionFactory.create(server, workspace, lease)).toList();
+    /** 设置页来源和会话来源复用同一冻结配置事实。 */
+    private static String scope(ConfigurationGenerationSnapshot.McpServer server) {
+        return server.scope() == ConfigurationGenerationSnapshot.Scope.PROJECT ? "project" : "global";
     }
 
-    /**
-     * 返回脱敏 Settings 投影使用的封闭传输词汇。
-     */
+    /** 返回脱敏 Settings 投影使用的封闭传输词汇。 */
     private static String transport(ConfigurationGenerationSnapshot.McpServer server) {
         return server.transport() == ConfigurationGenerationSnapshot.Transport.STDIO
                 ? "stdio" : "streamable_http";
@@ -443,13 +546,24 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
     private record ServiceKey(Path workspaceRoot, String serverId, String definitionRevision) {
     }
 
+    /** 观测仅保留不透明身份和不含密钥的服务修订，限制缓存内容。 */
+    private record StoredObservation(ThreadMcpCatalogPort.Observation observation,
+                                     Map<String, McpServiceDirectory.DirectoryVersion> serviceVersions) {
+        /** 防御性复制使共享服务目录推进时不会改变已保存的观测。 */
+        private StoredObservation {
+            Objects.requireNonNull(observation, "observation");
+            serviceVersions = Map.copyOf(serviceVersions);
+        }
+    }
+
     /**
      * 仅供租约绑定 MCP Session Factory 消费的包内交接值。
      */
     record TurnCatalog(
             McpGateway.McpSnapshot snapshot,
             Map<String, McpGateway.RouteIdentity> routeIdentities,
-            Map<String, McpServiceDirectory> services) {
+            Map<String, McpServiceDirectory> services,
+            List<McpGateway.McpServerStatus> serverStatuses) {
         /**
          * 防御性复制单次 Provider 请求安全点选中的路由与 Schema 投影。
          */
@@ -457,6 +571,7 @@ public final class GenerationCatalog implements CatalogQueryPort, AutoCloseable 
             Objects.requireNonNull(snapshot, "snapshot");
             routeIdentities = Map.copyOf(routeIdentities);
             services = Map.copyOf(services);
+            serverStatuses = List.copyOf(serverStatuses);
         }
     }
 }

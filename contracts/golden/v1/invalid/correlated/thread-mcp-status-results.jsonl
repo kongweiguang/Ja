@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:mcp-private","method":"thread/mcp/read","params":{"threadId":"thr_mcp_demo"}}
+{"jsonrpc":"2.0","id":"c:mcp-private","result":{"threadId":"thr_mcp_demo","source":"active","servers":[{"serverId":"mcp_private","name":"Private endpoint","state":"available","endpoint":"https://mcp.example.test"}]}}

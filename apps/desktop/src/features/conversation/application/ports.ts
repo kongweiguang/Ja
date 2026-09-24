@@ -14,6 +14,8 @@ import type { ConversationContextReference, UserContentBlock } from "../domain/u
 export interface ConversationThread {
   threadId: string;
   workspaceId: string;
+  workspaceKind: "project" | "session" | "legacy_shared";
+  legacySharedWorkspaceId: string | null;
   activeGoalId: string | null;
   preferences: ConversationThreadPreferences | null;
   title: string;
@@ -106,16 +108,19 @@ export interface ConversationHistoryPort {
     accessMode: "approval_required" | "full_access";
     collaborationMode: ConversationCollaborationMode;
   }): Promise<ConversationThread>;
-  threadList(input: { workspaceId: string; cursor?: string; limit?: number }): Promise<{
+  threadList(
+    input:
+      | { workspaceId: string; cursor?: string; limit?: number }
+      | { workspaceKind: "session"; cursor?: string; limit?: number },
+  ): Promise<{
     items: ConversationThread[];
     nextCursor?: string | null;
   }>;
-  threadSearch(input: {
-    workspaceId: string;
-    query: string;
-    cursor?: string;
-    limit?: number;
-  }): Promise<{ items: ConversationThread[]; nextCursor?: string | null }>;
+  threadSearch(
+    input:
+      | { workspaceId: string; query: string; cursor?: string; limit?: number }
+      | { workspaceKind: "session"; query: string; cursor?: string; limit?: number },
+  ): Promise<{ items: ConversationThread[]; nextCursor?: string | null }>;
   threadRename(input: {
     threadId: string;
     title: string;
@@ -308,7 +313,7 @@ export type ConversationAttachmentDraftItem =
       totalBytes?: number;
       cancelRequested?: boolean;
     }
-  | ({ state: "ready"; itemId: string } & ConversationAttachment)
+  | ({ state: "ready"; itemId: string; historyBound?: true } & ConversationAttachment)
   | {
       state: "failed";
       operationId: string;
@@ -398,6 +403,20 @@ export interface ConversationTurnPort {
   resumeTurn(input: {
     turnId: string;
     expectedThreadRevision: number;
+  }): Promise<ConversationAcceptedTurn>;
+  /** 无可见 USER 的继续请求仅将 sourceMessageId 用于本地实时归组，wire 不传此字段。 */
+  continueTurn(input: {
+    threadId: string;
+    expectedThreadRevision: number;
+    sourceMessageId: string;
+  }): Promise<ConversationAcceptedTurn>;
+  /** 重问会创建新的 USER Turn；附件摘要只用于 ACK 前本地显示，不能替代服务端绑定事实。 */
+  reaskTurn(input: {
+    threadId: string;
+    expectedThreadRevision: number;
+    sourceMessageId: string;
+    content: UserContentBlock[];
+    projectionAttachments?: readonly AttachmentSummary[];
   }): Promise<ConversationAcceptedTurn>;
   /** 原 Tool 详情只提交当前未知调用的明确裁决；模型续跑仍由 App Server 复用既有 resume。 */
   respondToolRecovery(input: {

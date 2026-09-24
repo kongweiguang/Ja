@@ -8,6 +8,7 @@ import type {
   CloseDocumentRequest,
   FilesController,
   FilesControllerProps,
+  FilesExternalDocumentInput,
   FilesSearchResult,
   FilesSearchSummary,
   FilesWorkspaceCloseLease,
@@ -29,6 +30,7 @@ import { createSearchUseCases } from "./internal/searchUseCases";
 import { createTreeUseCases } from "./internal/treeUseCases";
 import { isWorkspaceRecoveryRequiredError } from "./internal/nativeErrorPolicy";
 import type { FileRevision, WorkspaceFileNode } from "../domain/types";
+import { detectNewlineStyle } from "../domain/filesModel";
 
 type WorkspaceWatchSubscription = { stop: () => Promise<void> };
 
@@ -305,6 +307,43 @@ export function useFilesController({
       getDocumentUseCases().openDocument(path, reveal),
     [getDocumentUseCases],
   );
+  /** 将显式点击后由 Rust 有界读取的文本快照装入独立只读 Tab，不借用 workspace CAS 写入能力。 */
+  const openExternalDocument = useCallback(
+    (input: FilesExternalDocumentInput): boolean => {
+      const path = input.path.trim();
+      if (path === "" || lifecycleFenceRef.current) return false;
+      const content = input.content;
+      const existing = documentsRef.current[path];
+      const document: OpenDocument = {
+        path,
+        content,
+        savedContent: content,
+        revision: {
+          kind: "file",
+          size: new TextEncoder().encode(content).byteLength,
+          modifiedUnixMillis: null,
+          sha256: null,
+        },
+        encoding: "utf8",
+        newline: detectNewlineStyle(content),
+        kind: "text",
+        readOnly: true,
+        readOnlyReason:
+          input.readOnlyReason ?? (input.truncated ? "只读快照，内容已截断" : "工作区外文件，只读"),
+        externalFile: true,
+        truncated: input.truncated,
+        status: "clean",
+        draftGeneration: existing?.draftGeneration ?? 0,
+        reveal: input.line === undefined ? undefined : { line: input.line, column: input.column },
+      };
+      commitDocuments((current) => ({ ...current, [path]: document }));
+      setDocumentOrder((current) => (current.includes(path) ? current : [...current, path]));
+      setSelectedPath(path);
+      setActivePath(path);
+      return true;
+    },
+    [commitDocuments],
+  );
   /** 单次 CAS 保存通过稳定 callback 注入唯一 single-flight coordinator。 */
   const saveDocumentOnce = useCallback(
     (path: string) => getDocumentUseCases().saveDocumentOnce(path),
@@ -479,7 +518,9 @@ export function useFilesController({
         operations: mutationOperations,
         saveCoordinator,
         loadDirectory,
-        openDocument,
+        openDocument: async (path) => {
+          await openDocument(path);
+        },
         commitDocuments,
         documents: documentsRef,
         inFlight: inFlightRef,
@@ -822,6 +863,8 @@ export function useFilesController({
       openSearchResult: (result) => {
         void openDocument(result.path, { line: result.line, column: result.column });
       },
+      openPath: (path, reveal) => openDocument(path, reveal),
+      openExternalDocument,
       selectDocument: (path) => {
         setActivePath(path);
         setSelectedPath(path);

@@ -9,7 +9,7 @@ import {
   ConfigMcpServerSchema,
   ConfigModelIdSchema,
   ConfigModelSchema,
-  ConfigProjectSkillDocumentSchema,
+  ConfigProjectDocumentSchema,
   ConfigProviderIdSchema,
   ConfigProviderSchema,
   ConfigSkillReferenceSchema,
@@ -104,7 +104,7 @@ const ConfigPatchInputSchema = z.discriminatedUnion("scope", [
 ]);
 const ConfigReplaceInputSchema = z.discriminatedUnion("scope", [
   z.object({ ...userConfigTarget, document: ConfigDocumentSchema }).strict(),
-  z.object({ ...projectConfigTarget, document: ConfigProjectSkillDocumentSchema }).strict(),
+  z.object({ ...projectConfigTarget, document: ConfigProjectDocumentSchema }).strict(),
 ]);
 const ConfigResetInputSchema = z.discriminatedUnion("scope", [
   z.object(userConfigTarget).strict(),
@@ -268,11 +268,11 @@ export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
   projectSkillDocument?: ProjectSkillSettingsDocument;
+  projectMcpServers?: SettingsMcpServer[];
   projectOverrides: {
     defaultSelection: boolean;
     accessMode: boolean;
     disabledSkillReferences: string[];
-    disabledMcpIds: string[];
   };
   cas: ConfigReadResult["cas"];
   /** App Server 返回的脱敏问题只用于就地引导，不能作为任何写入配置的基线。 */
@@ -287,17 +287,6 @@ function projectOverrides(layer: ConfigReadResult["project"]): LoadedSettings["p
     layer.present && layer.trusted && layer.status === "valid" && layer.document !== null
       ? layer.document
       : {};
-  const disabledMcpIds = (): string[] => {
-    const value = document["mcp_servers"];
-    if (!Array.isArray(value)) return [];
-    return value.flatMap((item) => {
-      if (item === null || typeof item !== "object" || Array.isArray(item)) return [];
-      const entry = item as Record<string, unknown>;
-      return entry["enabled"] === false && typeof entry["mcp_id"] === "string"
-        ? [entry["mcp_id"]]
-        : [];
-    });
-  };
   const disabledSkills = Array.isArray(document["disabled_skills"])
     ? document["disabled_skills"].filter((value): value is string => typeof value === "string")
     : [];
@@ -308,7 +297,6 @@ function projectOverrides(layer: ConfigReadResult["project"]): LoadedSettings["p
       Object.hasOwn(document, "default_reasoning_level"),
     accessMode: Object.hasOwn(document, "default_access_mode"),
     disabledSkillReferences: disabledSkills,
-    disabledMcpIds: disabledMcpIds(),
   };
 }
 
@@ -318,11 +306,11 @@ function projectOverrides(layer: ConfigReadResult["project"]): LoadedSettings["p
 function projectSkillDocumentFrom(
   layer: ConfigReadResult["project"],
 ): ProjectSkillSettingsDocument | undefined {
-  if (!layer.present) {
+  if (!layer.present && layer.trusted) {
     return { schemaVersion: 2, revision: 0, skills: [], disabledSkills: [] };
   }
   if (!layer.trusted || layer.status !== "valid" || layer.document === null) return undefined;
-  const parsed = ConfigProjectSkillDocumentSchema.safeParse(layer.document);
+  const parsed = ConfigProjectDocumentSchema.safeParse(layer.document);
   if (!parsed.success) return undefined;
   return {
     schemaVersion: 2,
@@ -330,6 +318,16 @@ function projectSkillDocumentFrom(
     skills: [...parsed.data.skills],
     disabledSkills: [...parsed.data.disabled_skills],
   };
+}
+
+/** 仅可信项目的完整 MCP 条目可进入编辑基线；坏文档不借默认值被写回。 */
+function projectMcpServersFrom(
+  layer: ConfigReadResult["project"],
+): SettingsMcpServer[] | undefined {
+  if (!layer.present && layer.trusted) return [];
+  if (!layer.trusted || layer.status !== "valid" || layer.document === null) return undefined;
+  const parsed = ConfigProjectDocumentSchema.safeParse(layer.document);
+  return parsed.success ? parsed.data.mcp_servers.map(toUiMcp) : undefined;
 }
 export type ConfigPatchInput = z.infer<typeof ConfigPatchInputSchema>;
 export type ConfigReplaceInput = z.infer<typeof ConfigReplaceInputSchema>;
@@ -469,6 +467,22 @@ function authFromNative(server: z.infer<typeof ConfigMcpServerSchema>): Settings
   };
 }
 
+/** 项目与用户层使用同一完整 MCP 形状，避免项目表单产生另一套启动默认值。 */
+function toUiMcp(server: z.infer<typeof ConfigMcpServerSchema>): SettingsMcpServer {
+  return {
+    mcpRevision: server.mcp_id,
+    name: server.name,
+    transport: server.transport,
+    endpoint: server.endpoint,
+    protocolVersion: "2025-06-18",
+    args: [...server.args],
+    env: { ...server.env },
+    headers: { ...server.headers },
+    auth: authFromNative(server),
+    enabled: server.enabled,
+  };
+}
+
 /** 根默认档位未指定时沿用默认模型的 medium，避免新 Thread 需要重复手动选择。 */
 function defaultSelectionReasoning(
   config: z.infer<typeof ConfigDocumentSchema>,
@@ -546,18 +560,7 @@ function toUiDocument(
       reasoningLevel: config.subagents.reasoning_level,
     },
     providers: config.providers.map((provider) => toUiProvider(provider, credentials)),
-    mcpServers: config.mcp_servers.map((server) => ({
-      mcpRevision: server.mcp_id,
-      name: server.name,
-      transport: server.transport,
-      endpoint: server.endpoint,
-      protocolVersion: "2025-06-18",
-      args: [...server.args],
-      env: { ...server.env },
-      headers: { ...server.headers },
-      auth: authFromNative(server),
-      enabled: server.enabled,
-    })),
+    mcpServers: config.mcp_servers.map(toUiMcp),
     skills: [...config.skills],
     window: { width: 1280, height: 800, maximized: false },
   };
@@ -696,22 +699,6 @@ export function settingsDocumentPatch(
   return patch;
 }
 
-/**
- * 项目写入只构造 v2 Skill 层；该文件由首次项目操作创建，避免全局保存触碰项目工作区。
- */
-function projectSkillDocumentValue(
-  document: ProjectSkillSettingsDocument,
-): z.infer<typeof ConfigProjectSkillDocumentSchema> {
-  return ConfigProjectSkillDocumentSchema.parse({
-    schema_version: 2,
-    config_revision: document.revision,
-    skills: [...document.skills],
-    ...(document.disabledSkills.length === 0
-      ? {}
-      : { disabled_skills: [...document.disabledSkills] }),
-  });
-}
-
 interface SettingsWireAdapter {
   read(input?: ConfigReadInput): Promise<ConfigReadResult>;
   patch(input: ConfigPatchInput): Promise<ConfigWriteResult>;
@@ -724,6 +711,11 @@ interface SettingsWireAdapter {
   snapshot(input?: ConfigReadInput): Promise<LoadedSettings>;
   saveProjectSkills(
     document: ProjectSkillSettingsDocument,
+    workspaceId: string,
+    expectedVersion: string,
+  ): Promise<string>;
+  saveProjectMcpServers(
+    servers: SettingsMcpServer[],
     workspaceId: string,
     expectedVersion: string,
   ): Promise<string>;
@@ -795,10 +787,12 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
         ? toUiDocument(effective, read.credentials)
         : toUiDocument(parseConfigResponse(read.user.document), read.credentials);
     const projectSkillDocument = projectSkillDocumentFrom(read.project);
+    const projectMcpServers = projectMcpServersFrom(read.project);
     return {
       document: toUiDocument(effective, read.credentials),
       userDocument,
       ...(projectSkillDocument === undefined ? {} : { projectSkillDocument }),
+      ...(projectMcpServers === undefined ? {} : { projectMcpServers }),
       projectOverrides: projectOverrides(read.project),
       cas: read.cas,
       issues: read.issues,
@@ -831,25 +825,46 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
     return (await this.restore({ expectedVersion })).version;
   }
   /**
-   * 项目 Skills 复用配置 replace 的 CAS 语义；失败后不修改内存快照，由 controller 权威重读。
+   * 项目 Skill 仅 patch 自身字段；并发 MCP 编辑由相同 CAS 保护而不会被整文替换清除。
    */
   async saveProjectSkills(
     document: ProjectSkillSettingsDocument,
     workspaceId: string,
     expectedVersion: string,
   ): Promise<string> {
-    let nativeDocument: z.infer<typeof ConfigProjectSkillDocumentSchema>;
-    try {
-      nativeDocument = projectSkillDocumentValue(document);
-    } catch {
-      throw new SettingsAdapterError("invalid_input");
-    }
     return (
-      await this.replace({
+      await this.patch({
         scope: "project",
         workspaceId,
         expectedVersion,
-        document: nativeDocument,
+        patch: {
+          skills: [...document.skills],
+          disabled_skills:
+            document.disabledSkills.length === 0 ? null : [...document.disabledSkills],
+        },
+      })
+    ).version;
+  }
+
+  /** 项目 MCP 只 patch 其目录字段，服务端仍以 CAS、信任和严格策略决定是否接受。 */
+  async saveProjectMcpServers(
+    servers: SettingsMcpServer[],
+    workspaceId: string,
+    expectedVersion: string,
+  ): Promise<string> {
+    const values = servers.map(toNativeMcp);
+    const validated = ConfigProjectDocumentSchema.parse({
+      schema_version: 2,
+      config_revision: 0,
+      skills: [],
+      mcp_servers: values,
+    }).mcp_servers;
+    return (
+      await this.patch({
+        scope: "project",
+        workspaceId,
+        expectedVersion,
+        patch: { mcp_servers: validated },
       })
     ).version;
   }

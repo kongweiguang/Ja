@@ -313,7 +313,7 @@ final class MybatisGoalRepositoryCompletionGateTest {
     /** 创建 fresh SQLite、V1 schema 和显式 commit/rollback owner，不接触用户数据库。 */
     private Fixture fixture(String name) throws Exception {
         JaDatabase database = JaDatabase.open(new DatabaseConfig(temp.resolve(name + ".sqlite3"),
-                DatabaseConfig.DEFAULT_BUSY_TIMEOUT));
+                DatabaseConfig.DEFAULT_BUSY_TIMEOUT, temp));
         Configuration configuration = new Configuration(new Environment("completion-gate-test",
                 new JdbcTransactionFactory(), database.dataSource()));
         configuration.setMapUnderscoreToCamelCase(false);

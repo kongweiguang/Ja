@@ -21,17 +21,22 @@ describe("previewModel", () => {
     expect(synced).toEqual({ draft: "https://ja.local" });
   });
 
-  it.each([
-    "javascript:alert(1)",
-    "file:///tmp/index.html",
-    "data:text/html,hello",
-    "tauri://localhost",
-  ])("拒绝非 HTTP(S) 地址 %s", (unsafeUrl) => {
-    expect(resolvePreviewNavigation(unsafeUrl, "")).toEqual({
-      kind: "invalid",
-      message: "Preview 只支持 http:// 或 https:// 地址。",
-    });
-  });
+  it.each(["javascript:alert(1)", "data:text/html,hello", "tauri://localhost"])(
+    "拒绝不支持的协议 %s",
+    (unsafeUrl) => {
+      expect(resolvePreviewNavigation(unsafeUrl, "")).toEqual({
+        kind: "invalid",
+        message: "请输入有效的 http(s) 地址或本机文件路径。",
+      });
+    },
+  );
+
+  it.each(["index.html", "src/pages/演示 文件.html", "file:///C:/workspace/index.html"])(
+    "将本机文件目标 %s 交给 Rust 按 workspace 与权限解析",
+    (path) => {
+      expect(resolvePreviewNavigation(path, "")).toEqual({ kind: "open_file", path });
+    },
+  );
 
   it("区分同地址刷新与新地址导航", () => {
     expect(
@@ -44,7 +49,10 @@ describe("previewModel", () => {
   });
 
   it("只为安全地址生成 DOM 投影", () => {
-    expect(projectPreviewUrl("file:///tmp/demo")).toBeUndefined();
+    expect(projectPreviewUrl("file:///tmp/demo")).toEqual({
+      href: "file:///tmp/demo",
+      origin: "本机文件",
+    });
     expect(projectPreviewUrl("https://example.com/path")).toEqual({
       href: "https://example.com/path",
       origin: "https://example.com",

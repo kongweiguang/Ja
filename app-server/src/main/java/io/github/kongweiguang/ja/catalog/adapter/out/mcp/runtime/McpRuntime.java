@@ -196,7 +196,7 @@ public final class McpRuntime implements McpGateway {
                 if (missingStdioExecutable(isolatedFailure)) {
                     holder.publishUnavailableDirectory();
                 } else {
-                    holder.markDirectoryDirty();
+                    holder.markDirectoryDirtyAfterFailure();
                 }
                 tools.removeIf(tool -> tool.serverId().equals(definition.id()));
             }
@@ -266,6 +266,12 @@ public final class McpRuntime implements McpGateway {
         if (holder == null) {
             throw new IllegalArgumentException("mcp_snapshot_server_missing");
         }
+        if (McpToolCatalog.invalidArguments(objectMapper, tool, invocation.arguments()).isPresent()) {
+            return CompletableFuture.completedFuture(new McpResult(true,
+                    "MCP call arguments do not match the selected tool schema.",
+                    java.util.Optional.of(JsonObjects.builder().putText("category", "mcp_arguments_invalid").build()),
+                    ToolOutcome.FAILED));
+        }
         if (!refreshAndValidateBinding(holder, tool)) {
             return CompletableFuture.completedFuture(bindingUnavailableResult());
         }
@@ -317,6 +323,12 @@ public final class McpRuntime implements McpGateway {
                 .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
 
+    /** 仅检查缓存中的通知修订，会话读取侧不会因此刷新或连接服务。 */
+    public boolean directoryDirty() {
+        requireOpen();
+        return catalogSnapshot == null && servers.values().stream().anyMatch(McpServerState::directoryDirty);
+    }
+
     /**
      * dirty 服务在调用前先走同一套有界分页，并与原 batch 的 schema/route hash 精确比较。
      */
@@ -347,7 +359,7 @@ public final class McpRuntime implements McpGateway {
                     .equals(McpToolCatalog.routeHash(holder.definition(), current, currentSchema));
         } catch (RuntimeException failure) {
             holder.markDiscoveryFailed();
-            holder.markDirectoryDirty();
+            holder.markDirectoryDirtyAfterFailure();
             return false;
         }
     }

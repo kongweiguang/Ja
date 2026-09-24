@@ -75,6 +75,7 @@ export const JA_ERROR_CATALOG = {
   ATTACHMENT_UNAVAILABLE: { code: -32064, category: "unavailable", retryable: true },
   TURN_NOT_RESUMABLE: { code: -32065, category: "conflict", retryable: false },
   TURN_RESUME_ORDER_CONFLICT: { code: -32066, category: "conflict", retryable: true },
+  TURN_NOT_REASKABLE: { code: -32067, category: "validation", retryable: false },
   TURN_INPUT_QUEUE_FULL: { code: -32068, category: "capacity", retryable: true },
   QUEUED_INPUT_NOT_FOUND: { code: -32069, category: "not_found", retryable: false },
   WORKSPACE_REFERENCE_INVALID: { code: -32070, category: "validation", retryable: false },

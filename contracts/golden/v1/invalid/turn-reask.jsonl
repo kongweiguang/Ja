@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":"c:reask-missing-source","method":"turn/reask","params":{"threadId":"thr_demo","expectedThreadRevision":9,"content":[{"type":"text","text":"重新回答"}]}}

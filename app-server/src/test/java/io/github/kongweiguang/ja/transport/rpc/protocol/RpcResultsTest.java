@@ -91,7 +91,7 @@ final class RpcResultsTest {
     void mapsFrozenTurnRuntimeWithoutErrorMessage() {
         ThreadSnapshot.Turn turn = new ThreadSnapshot.Turn(
                 "turn_failed", "failed", Instant.EPOCH, Instant.EPOCH, Instant.EPOCH,
-                "INTERNAL_ERROR", null, 0, 0);
+                "INTERNAL_ERROR", null, 0, 0, null);
 
         var result = RpcResults.snapshotTurn(new ObjectMapper(), turn);
 
@@ -105,7 +105,7 @@ final class RpcResultsTest {
     void mapsCollaborationModeIndependentlyFromAccessMode() {
         ThreadPreferences preferences = new ThreadPreferences("provider_test", "model_test", null,
                 AccessMode.FULL_ACCESS, CollaborationMode.PLAN, ThreadPreferences.TitleSource.PLACEHOLDER);
-        ThreadSummary thread = new ThreadSummary("thr_test", "ws_test", "Test", preferences,
+        ThreadSummary thread = new ThreadSummary("thr_test", "ws_test", "Test", "project", null, preferences,
                 ThreadSummary.Status.ACTIVE, false, null, true, null, 0, Instant.EPOCH, Instant.EPOCH);
 
         var result = RpcResults.thread(new ObjectMapper(), thread).path("preferences");

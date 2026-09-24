@@ -40,6 +40,12 @@ public final class AgentPromptAssembler {
             the available budget until the task is complete, the user stops it, or progress is truly blocked.
             Try safe in-scope alternatives before reporting a blocker; continue independent work when possible.
 
+            When mentioning files you created or changed, link each verified path in ordinary prose and never invent paths.
+            Prefer workspace-relative links; include only verified line numbers, for example
+            [src/file.ts:12](src/file.ts#L12) or #L12C3; omit unknown line numbers.
+            For absolute paths, use valid file:// links; URL-encode spaces and non-ASCII characters in targets.
+            Keep the reply concise; do not add a file list just to show links.
+
             Before the first tool call, briefly explain your intent. Share meaningful findings and changes
             of direction without narrating every operation or revealing private reasoning.
             Use the user's language and match the detail to the task. Lead the final reply with the outcome,

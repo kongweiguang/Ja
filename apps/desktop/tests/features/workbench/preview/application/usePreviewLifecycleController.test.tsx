@@ -30,6 +30,7 @@ const RECOVERY_CLEAR = { observed: 0, recovered: 0, failed: 0, pending: 0 } as c
 const project: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_fixture",
+  legacySharedWorkspaceId: null,
   rootPath: "C:\\dev\\ja",
   displayName: "ja",
   trust: "trusted",
@@ -38,6 +39,7 @@ const project: WorkspaceProjection = {
 const otherProject: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_other",
+  legacySharedWorkspaceId: null,
   rootPath: "C:\\dev\\other",
   displayName: "other",
   trust: "trusted",
@@ -89,7 +91,7 @@ function useJaWorkbench(
 function createAdapters(): JaWorkbenchAdapters & {
   previewEvents: (event: PreviewEvent) => void;
 } {
-  const hints = new Map<string, string>();
+  const hints = new Map<string, string[]>();
   const snapshot: PreviewSessionSnapshot = {
     id: "00000000-0000-4000-8000-000000000002",
     generation: 0,
@@ -97,6 +99,8 @@ function createAdapters(): JaWorkbenchAdapters & {
     load_status: "loading",
     url: "https://example.com/",
     title: "Example",
+    can_go_back: false,
+    can_go_forward: false,
     window: { label: "ja-preview", url: "https://example.com/" },
     dropped_events: 0,
   };
@@ -111,12 +115,67 @@ function createAdapters(): JaWorkbenchAdapters & {
       },
       window: { ...snapshot.window, url },
     })),
+    openBlank: vi.fn(async () => ({
+      snapshot: {
+        ...snapshot,
+        url: "about:blank",
+        title: "",
+        window: { ...snapshot.window, url: "about:blank" },
+      },
+      window: { ...snapshot.window, url: "about:blank" },
+    })),
+    resolveFile: vi.fn(async (target) => ({
+      canonicalPath: target,
+      displayName: target.split(/[\\/]/u).at(-1) ?? target,
+      workspaceId: project.workspaceId,
+      workspaceRelativePath: target,
+      withinWorkspace: true,
+      kind: "browser" as const,
+      mimeType: "text/html",
+      fileUrl: "file:///C:/dev/ja/index.html",
+      content: null,
+      truncated: false,
+      line: null,
+      column: null,
+      readOnly: true,
+    })),
+    revealFile: vi.fn(async () => undefined),
+    openFile: vi.fn(async (target) => ({
+      snapshot: {
+        ...snapshot,
+        url: target.startsWith("file:") ? target : "file:///C:/dev/ja/index.html",
+        window: {
+          ...snapshot.window,
+          url: target.startsWith("file:") ? target : "file:///C:/dev/ja/index.html",
+        },
+      },
+      window: { ...snapshot.window, url: "file:///C:/dev/ja/index.html" },
+    })),
     navigate: vi.fn(async (_id, generation, url) => ({
       ...snapshot,
       generation,
       url,
       window: { ...snapshot.window, url },
     })),
+    navigateFile: vi.fn(async (_id, generation, target) => ({
+      ...snapshot,
+      generation,
+      url: target.startsWith("file:") ? target : "file:///C:/dev/ja/index.html",
+      window: { ...snapshot.window, url: "file:///C:/dev/ja/index.html" },
+    })),
+    goBack: vi.fn(async (_id, generation) => ({
+      ...snapshot,
+      generation,
+      can_go_back: false,
+      can_go_forward: true,
+    })),
+    goForward: vi.fn(async (_id, generation) => ({
+      ...snapshot,
+      generation,
+      can_go_back: true,
+      can_go_forward: false,
+    })),
+    reload: vi.fn(async (_id, generation) => ({ ...snapshot, generation })),
     layout: vi.fn(async (_id, viewport) => ({
       ...snapshot,
       window: {
@@ -135,11 +194,18 @@ function createAdapters(): JaWorkbenchAdapters & {
   return {
     preview,
     sessionHints: {
-      read: (workspaceId) => hints.get(workspaceId),
-      remember: (workspaceId, sessionId) => hints.set(workspaceId, sessionId),
-      forget: (workspaceId, expectedSessionId) => {
-        if (expectedSessionId === undefined || hints.get(workspaceId) === expectedSessionId)
-          hints.delete(workspaceId);
+      read: (workspaceId) => hints.get(workspaceId) ?? [],
+      remember: (workspaceId, pageId) =>
+        hints.set(workspaceId, [...new Set([...(hints.get(workspaceId) ?? []), pageId])]),
+      forget: (workspaceId, expectedPageId) => {
+        if (expectedPageId === undefined) hints.delete(workspaceId);
+        else {
+          const remaining = (hints.get(workspaceId) ?? []).filter(
+            (pageId) => pageId !== expectedPageId,
+          );
+          if (remaining.length > 0) hints.set(workspaceId, remaining);
+          else hints.delete(workspaceId);
+        }
       },
     },
     previewEvents: (event) => previewListener(event),
@@ -157,7 +223,7 @@ describe("usePreviewLifecycleController", () => {
     await waitFor(() => expect(result.current.preview.url).toBe("https://example.com/"));
     expect(adapters.preview.state).toHaveBeenCalledWith(sessionId);
     expect(adapters.preview.events).toHaveBeenCalledWith(sessionId, 512);
-    expect(adapters.preview.recoverPending).not.toHaveBeenCalled();
+    expect(adapters.preview.recoverPending).toHaveBeenCalledOnce();
   });
 
   it("waits for initial orphan recovery before admitting the first native open", async () => {
@@ -198,8 +264,7 @@ describe("usePreviewLifecycleController", () => {
     const adapters = createAdapters();
     vi.mocked(adapters.preview.recoverPending)
       .mockResolvedValueOnce(RECOVERY_CLEAR)
-      .mockResolvedValueOnce(RECOVERY_CLEAR)
-      .mockResolvedValueOnce({ observed: 1, recovered: 0, failed: 1, pending: 1 });
+      .mockResolvedValue({ observed: 1, recovered: 0, failed: 1, pending: 1 });
     adapters.preview.open = vi.fn(async () => {
       throw new Error("native child rollback failed at C:\\private");
     });
@@ -210,7 +275,7 @@ describe("usePreviewLifecycleController", () => {
 
     await waitFor(() => expect(result.current.preview.error).toBe("浏览器恢复未完成，请重试。"));
     expect(adapters.preview.open).toHaveBeenCalledOnce();
-    expect(adapters.preview.recoverPending).toHaveBeenCalledTimes(3);
+    expect(adapters.preview.recoverPending).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(result.current.preview)).not.toContain("private");
   });
 
@@ -222,9 +287,18 @@ describe("usePreviewLifecycleController", () => {
     act(() => result.current.preview.onViewportChange!(PREVIEW_VIEWPORT));
     act(() => result.current.preview.onNavigate!("https://example.com/"));
     await waitFor(() =>
-      expect(adapters.preview.open).toHaveBeenCalledWith("https://example.com/", PREVIEW_VIEWPORT),
+      expect(adapters.preview.open).toHaveBeenCalledWith("https://example.com/", {
+        ...PREVIEW_VIEWPORT,
+        visible: false,
+      }),
     );
     await waitFor(() => expect(result.current.preview.url).toBe("https://example.com/"));
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenCalledWith(
+        "00000000-0000-4000-8000-000000000002",
+        PREVIEW_VIEWPORT,
+      ),
+    );
 
     act(() => result.current.preview.onNavigate!("https://example.org/"));
     await waitFor(() =>
@@ -332,6 +406,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "finished",
       url: "https://redirect.example/",
       title: "Redirected",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview", url: "https://redirect.example/" },
       dropped_events: 0,
     };
@@ -358,6 +434,8 @@ describe("usePreviewLifecycleController", () => {
         load_status: "loading",
         url: "https://example.com/",
         title: "",
+        can_go_back: false,
+        can_go_forward: false,
         window: { ...authoritative.window, url: "https://example.com/" },
       },
       window: { ...authoritative.window, url: "https://example.com/" },
@@ -426,6 +504,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "loading",
       url: "https://unavailable.example/",
       title: "Unavailable",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview", url: "https://unavailable.example/" },
       dropped_events: 0,
     };
@@ -454,6 +534,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "loading",
       url: "https://stalled.example/",
       title: "Stalled",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview", url: "https://stalled.example/" },
       dropped_events: 0,
     };
@@ -487,6 +569,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "loading",
       url: "https://stalled.example/",
       title: "Stalled",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview", url: "https://stalled.example/" },
       dropped_events: 0,
     };
@@ -526,6 +610,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "loading",
       url: "https://stalled.example/",
       title: "Stalled",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview", url: "https://stalled.example/" },
       dropped_events: 0,
     };
@@ -584,6 +670,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "finished",
       url: "https://example.com/",
       title: "Example",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview", url: "https://example.com/" },
       dropped_events: 0,
     };
@@ -652,6 +740,8 @@ describe("usePreviewLifecycleController", () => {
         load_status: "loading",
         url: "https://switch.example/",
         title: "Switch",
+        can_go_back: false,
+        can_go_forward: false,
         window: { label: "ja-preview-switch", url: "https://switch.example/" },
         dropped_events: 0,
       },
@@ -669,6 +759,8 @@ describe("usePreviewLifecycleController", () => {
       load_status: "loading",
       url: "https://switch.example/",
       title: "Switch",
+      can_go_back: false,
+      can_go_forward: false,
       window: { label: "ja-preview-switch", url: "https://switch.example/" },
       dropped_events: 0,
     });
@@ -692,6 +784,8 @@ describe("usePreviewLifecycleController", () => {
         load_status: "finished" as const,
         url: "https://example.com/",
         title: "Example",
+        can_go_back: false,
+        can_go_forward: false,
         window: { label: "ja-preview", url: "https://example.com/" },
         dropped_events: 0,
       });
@@ -736,6 +830,8 @@ describe("usePreviewLifecycleController", () => {
         load_status: "loading",
         url: "https://late.example/",
         title: "Late",
+        can_go_back: false,
+        can_go_forward: false,
         window: { label: "ja-preview", url: "https://late.example/" },
         dropped_events: 0,
       },
@@ -769,6 +865,8 @@ describe("usePreviewLifecycleController", () => {
         load_status: "loading",
         url: "https://late.example/",
         title: "Late",
+        can_go_back: false,
+        can_go_forward: false,
         window: { label: "ja-preview-late", url: "https://late.example/" },
         dropped_events: 0,
       },
@@ -800,15 +898,193 @@ describe("usePreviewLifecycleController", () => {
     );
   });
 
-  it("reports a redacted error when Preview has no measured viewport", async () => {
+  it("creates an unmeasured page hidden and waits for its first real viewport", async () => {
     const adapters = createAdapters();
     const { result } = renderHook(() => useJaWorkbench(project, adapters));
     await waitFor(() => expect(adapters.preview.subscribe).toHaveBeenCalledTimes(1));
 
     act(() => result.current.preview.onNavigate!("https://example.com/"));
 
-    await waitFor(() => expect(result.current.preview.error).toBe("预览加载失败，请重试。"));
-    expect(adapters.preview.open).not.toHaveBeenCalled();
+    await waitFor(() => expect(adapters.preview.open).toHaveBeenCalledOnce());
+    expect(adapters.preview.open).toHaveBeenCalledWith("https://example.com/", {
+      x: 0,
+      y: 0,
+      width: 1024,
+      height: 768,
+      visible: false,
+    });
+    await waitFor(() => expect(result.current.preview.url).toBe("https://example.com/"));
+  });
+
+  /** 多页 session 用 native ID 隔离，切换时严格 hide 旧页后 show 新页。 */
+  it("creates independent hidden tabs and shows only the selected page", async () => {
+    const adapters = createAdapters();
+    const secondPageId = "00000000-0000-4000-8000-000000000003";
+    const blank: PreviewSessionSnapshot = {
+      ...(await adapters.preview.state("00000000-0000-4000-8000-000000000002")),
+      id: secondPageId,
+      url: "about:blank",
+      title: "",
+      window: { label: "ja-preview-second", url: "about:blank" },
+    };
+    vi.mocked(adapters.preview.openBlank).mockResolvedValue({
+      snapshot: blank,
+      window: blank.window,
+    });
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    act(() => result.current.preview.onNavigate("https://example.com/"));
+    await waitFor(() =>
+      expect(result.current.preview.activePageId).toBe("00000000-0000-4000-8000-000000000002"),
+    );
+
+    await act(async () => result.current.preview.onNewPage());
+    await waitFor(() => expect(result.current.preview.pages).toHaveLength(2));
+    expect(adapters.preview.openBlank).toHaveBeenCalledWith({
+      ...PREVIEW_VIEWPORT,
+      visible: false,
+    });
+    expect(result.current.preview.activePageId).toBe(secondPageId);
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenCalledWith("00000000-0000-4000-8000-000000000002", {
+        ...PREVIEW_VIEWPORT,
+        visible: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenCalledWith(secondPageId, PREVIEW_VIEWPORT),
+    );
+
+    act(() => result.current.preview.onSelectPage("00000000-0000-4000-8000-000000000002"));
+    await waitFor(() =>
+      expect(result.current.preview.activePageId).toBe("00000000-0000-4000-8000-000000000002"),
+    );
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenCalledWith(secondPageId, {
+        ...PREVIEW_VIEWPORT,
+        visible: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenLastCalledWith(
+        "00000000-0000-4000-8000-000000000002",
+        PREVIEW_VIEWPORT,
+      ),
+    );
+  });
+
+  /** 附件 / inactive Thread 的 false viewport 必须隐藏全部保留的原生页面。 */
+  it("hides every retained native page when the preview surface becomes inactive", async () => {
+    const adapters = createAdapters();
+    const secondPageId = "00000000-0000-4000-8000-000000000003";
+    const blank: PreviewSessionSnapshot = {
+      ...(await adapters.preview.state("00000000-0000-4000-8000-000000000002")),
+      id: secondPageId,
+      url: "about:blank",
+      title: "",
+      window: { label: "ja-preview-second", url: "about:blank" },
+    };
+    vi.mocked(adapters.preview.openBlank).mockResolvedValue({
+      snapshot: blank,
+      window: blank.window,
+    });
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    act(() => result.current.preview.onNavigate("https://example.com/"));
+    await waitFor(() => expect(result.current.preview.pages).toHaveLength(1));
+    await act(async () => result.current.preview.onNewPage());
+
+    act(() => result.current.preview.onViewportChange({ ...PREVIEW_VIEWPORT, visible: false }));
+
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenCalledWith("00000000-0000-4000-8000-000000000002", {
+        ...PREVIEW_VIEWPORT,
+        visible: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(adapters.preview.layout).toHaveBeenCalledWith(secondPageId, {
+        ...PREVIEW_VIEWPORT,
+        visible: false,
+      }),
+    );
+  });
+
+  /** 文件目标打开失败时调用方收到脱敏 rejection，且 ACK 前不会出现空标签。 */
+  it("opens local browser targets in a new hidden page and leaves no tab on failure", async () => {
+    const adapters = createAdapters();
+    const fileUrl = "file:///C:/dev/ja/%E9%A1%B5%E9%9D%A2/index.html";
+    const fileSnapshot: PreviewSessionSnapshot = {
+      ...(await adapters.preview.state("00000000-0000-4000-8000-000000000002")),
+      url: fileUrl,
+      window: { label: "ja-preview-file", url: fileUrl },
+    };
+    vi.mocked(adapters.preview.openFile).mockResolvedValue({
+      snapshot: fileSnapshot,
+      window: fileSnapshot.window,
+    });
+    adapters.preview.state = vi.fn(async () => fileSnapshot);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+
+    await act(async () =>
+      result.current.preview.onOpenTarget({
+        kind: "file",
+        path: "C:\\dev\\ja\\页面\\index.html",
+        line: 3,
+      }),
+    );
+    expect(adapters.preview.openFile).toHaveBeenCalledWith(
+      "C:\\dev\\ja\\页面\\index.html",
+      project.workspaceId,
+      { x: 0, y: 0, width: 1024, height: 768, visible: false },
+    );
+    expect(result.current.preview.url).toBe(fileUrl);
+    expect(result.current.preview.pages).toHaveLength(1);
+
+    adapters.preview.openFile = vi.fn(async () => {
+      throw new Error("native failure at C:\\private\\secret.html");
+    });
+    await expect(
+      result.current.preview.onOpenTarget({ kind: "file", path: "missing.html" }),
+    ).rejects.toThrow("无法打开此页面，请重试。");
+    expect(result.current.preview.pages).toHaveLength(1);
+    expect(JSON.stringify(result.current.preview)).not.toContain("private");
+  });
+
+  /** 历史 capability 来自 native snapshot/event，并将后退请求发送到原生引擎。 */
+  it("uses native history state and navigates a local path within the active tab", async () => {
+    const adapters = createAdapters();
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+    act(() => result.current.preview.onNavigate("https://example.com/"));
+    await waitFor(() => expect(result.current.preview.pages).toHaveLength(1));
+    const pageId = result.current.preview.activePageId!;
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: 0,
+        sequence: 1,
+        kind: { type: "history_changed", can_go_back: true, can_go_forward: false },
+      }),
+    );
+    expect(result.current.preview.canGoBack).toBe(true);
+    act(() => result.current.preview.onGoBack());
+    await waitFor(() => expect(adapters.preview.goBack).toHaveBeenCalledWith(pageId, 0));
+
+    act(() => result.current.preview.onNavigateFile("src/页面.html"));
+    await waitFor(() =>
+      expect(adapters.preview.navigateFile).toHaveBeenCalledWith(
+        pageId,
+        0,
+        "src/页面.html",
+        project.workspaceId,
+      ),
+    );
   });
 
   it("does not subscribe or open Preview without a project", async () => {

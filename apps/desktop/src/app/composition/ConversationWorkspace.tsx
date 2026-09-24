@@ -13,7 +13,7 @@ import {
   useInteractionController,
   type InteractionPort,
   ConversationSummaryPopover,
-  isWorkItem,
+  countCommittedConversationActivity,
   itemChangedFiles,
   itemDiffStat,
   ReplyFileOpenMenu,
@@ -34,13 +34,18 @@ import {
   type ConversationArtifactPort,
   type ConversationContextReference,
   type ConversationSummary,
+  type ConversationMcpReader,
   type ConversationUsageReader,
   type ComposerSlashCommand,
   type TimelineTurn as Turn,
   type TimelineGoalActivity,
 } from "@/features/conversation";
 import type { SettingsController } from "@/features/settings";
-import type { AttachmentPreviewPort, AttachmentPreviewTarget } from "@/features/workbench/preview";
+import type {
+  AttachmentPreviewPort,
+  AttachmentPreviewTarget,
+  PreviewTarget,
+} from "@/features/workbench/preview";
 import type { TurnReviewTarget } from "@/features/workbench/review";
 import type { WorkspaceController } from "@/features/workspace";
 import type { NativeDropEvent } from "@/api/tauri/nativeDrop";
@@ -70,9 +75,16 @@ export interface ConversationWorkspaceProps {
   readonly settings: SettingsController;
   readonly inspectorOpen: boolean;
   readonly onToggleInspector: () => void;
-  readonly summaryContext: Pick<ConversationSummary, "scope" | "gitBranch" | "model" | "runtime">;
+  readonly summaryContext: Pick<ConversationSummary, "scope" | "gitBranch" | "runtime">;
+  readonly mcpReader?: ConversationMcpReader;
+  readonly onOpenMcpSettings?: () => void;
   readonly workspaceAdapter: JaWorkbenchAdapters["workspace"];
-  readonly onOpenLink: (url: string) => Promise<void>;
+  readonly onOpenLink: (url: string, source?: HTMLElement) => void | Promise<void>;
+  readonly onOpenFile: (
+    target: { path: string; line?: number; column?: number },
+    source: HTMLElement,
+    mode?: "explorer",
+  ) => void | Promise<void>;
   readonly onCopyText: (text: string) => Promise<void>;
   readonly onConversationFocusAvailabilityChange: (available: boolean) => void;
   readonly onRegisterWorkspaceReferenceTarget: (
@@ -118,6 +130,17 @@ export interface WorkspaceReferencePreviewRequest {
   readonly reference: ComposerWorkspaceReferenceTarget;
 }
 
+/** 文件链接的单次 intent 同时携带 Thread/Workspace identity，Explorer 不占用右栏页面。 */
+export interface ConversationOpenTargetRequest {
+  readonly requestId: number;
+  readonly workspaceId: string;
+  readonly threadId: string;
+  readonly target: PreviewTarget | { kind: "explorer"; path: string };
+}
+
+/** Host 仅结算实际打开结果；失败由来源消息保留并恢复键盘焦点。 */
+export type ConversationOpenTargetOutcome = "opened" | "failed";
+
 /** Workbench 只回传稳定结果，原生读取错误细节继续由 Files 的脱敏通知边界拥有。 */
 export type WorkspaceReferencePreviewOutcome = "opened" | "failed" | "closed";
 
@@ -134,8 +157,11 @@ export function ConversationWorkspace({
   inspectorOpen,
   onToggleInspector,
   summaryContext,
+  mcpReader,
+  onOpenMcpSettings,
   workspaceAdapter,
   onOpenLink,
+  onOpenFile,
   onCopyText,
   onConversationFocusAvailabilityChange,
   onRegisterWorkspaceReferenceTarget,
@@ -379,6 +405,9 @@ export function ConversationWorkspace({
     target: latestTurnReview,
     publish: onLatestTurnReviewChange,
   });
+  const currentThread = conversation.threads.find(
+    (candidate) => candidate.threadId === conversation.currentThreadId,
+  );
   /**
    * 摘要只归约已提交的 Timeline 事实；缺失指标继续缺失，不能用零伪造证据，也不能让
    * 逐段 Draft 为了头部 Popover 重新渲染 Composer 与 Navigation 的共同布局。
@@ -398,11 +427,15 @@ export function ConversationWorkspace({
     const activeStatus = turns.find(
       (turn) => !["completed", "failed", "cancelled"].includes(turn.status),
     )?.status;
+    const selectedModel = settings.snapshot.providers
+      .find((provider) => provider.providerId === currentThread?.preferences?.providerId)
+      ?.models.find((model) => model.modelId === currentThread?.preferences?.modelId);
     return {
       ...summaryContext,
+      model: selectedModel?.model,
       status: activeStatus === undefined ? undefined : turnStatusLabel(activeStatus),
       turnCount: turns.length,
-      stepCount: committedItems.filter(isWorkItem).length,
+      activity: countCommittedConversationActivity(committedItems),
       changedFiles:
         changedFileMetrics.length === 0
           ? undefined
@@ -416,7 +449,13 @@ export function ConversationWorkspace({
       durationMs:
         durations.length === 0 ? undefined : durations.reduce((total, value) => total + value, 0),
     };
-  }, [committedItems, summaryContext, turns]);
+  }, [
+    committedItems,
+    currentThread?.preferences,
+    settings.snapshot.providers,
+    summaryContext,
+    turns,
+  ]);
   const contextFacts = useTimelineStore(
     useShallow((state) => {
       if (threadId === "") return { usage: undefined, compaction: undefined };
@@ -437,9 +476,6 @@ export function ConversationWorkspace({
   );
   const approvalDecisions = useTimelineStore(useShallow((state) => selectApprovalDecisions(state)));
   const approvalClosedAt = useTimelineStore(useShallow((state) => selectApprovalClosedAt(state)));
-  const currentThread = conversation.threads.find(
-    (candidate) => candidate.threadId === conversation.currentThreadId,
-  );
   const isProjectScope = workspace.workspace?.kind === "project";
   const replyFileOpen = useReplyFileOpen(
     isProjectScope ? workspace.workspace?.workspaceId : undefined,
@@ -526,6 +562,7 @@ export function ConversationWorkspace({
     ready,
     blocked: workspace.busy || conversation.busy,
     turnPort,
+    readThreadRevision: conversation.readThreadRevision,
     planCreationPort: planGoalAvailable
       ? {
           // 模式切换 ACK 可能先于 Timeline 快照；采用同 Thread 已确认的最高 revision 创建计划。
@@ -613,8 +650,7 @@ export function ConversationWorkspace({
   const scopeName = isProjectScope
     ? (workspace.workspace?.displayName ?? "未命名项目")
     : "无项目对话";
-  const threadTitle =
-    conversation.threads.find((thread) => thread.threadId === threadId)?.title.trim() || scopeName;
+  const threadTitle = currentThread?.title.trim() || scopeName;
   // 生命周期故障统一在侧栏解释，避免同一原因再次占据对话正文。
   const scopeError =
     boot.status === "ready" || boot.status === "busy" ? workspace.error : undefined;
@@ -648,6 +684,8 @@ export function ConversationWorkspace({
       activeTurn={interaction.activeTurn}
       suspendedTurn={interaction.suspendedTurn}
       continuationAvailable={interaction.continuationAvailable}
+      editingQuestion={interaction.editingQuestion}
+      onCancelEdit={interaction.cancelEditQuestion}
       interactionPresentation={
         clarification.request?.status !== "pending"
           ? "none"
@@ -800,7 +838,16 @@ export function ConversationWorkspace({
         </div>
         <div className="ja-conversation-header-actions">
           <ReplyFileOpenMenu {...replyFileOpen} />
-          <ConversationSummaryPopover summary={summary} />
+          <ConversationSummaryPopover
+            summary={summary}
+            threadId={threadId}
+            threadTitle={threadTitle}
+            createdAt={currentThread?.createdAt}
+            rootPath={workspace.workspace?.rootPath}
+            onCopyText={onCopyText}
+            mcpReader={mcpReader}
+            onOpenMcpSettings={onOpenMcpSettings}
+          />
           <ThreadOperationsMenu
             showCompactAction={conversation.canCompact}
             compaction={conversation.compaction}
@@ -868,7 +915,10 @@ export function ConversationWorkspace({
               void interaction.approve(approval, decision)
             }
             onResolveToolRecovery={resolveToolRecovery}
+            editableSourceMessageId={interaction.editableSourceMessageId}
+            onEditQuestion={interaction.editQuestion}
             onOpenLink={onOpenLink}
+            onOpenFile={onOpenFile}
             onCopyText={onCopyText}
             onOpenAttachmentPreview={
               onOpenAttachmentPreview === undefined

@@ -59,6 +59,8 @@ describe("JA-RPC v1 Task Threads", () => {
           thread: {
             threadId: "thr_side_1",
             workspaceId: "ws_root",
+            workspaceKind: "session",
+            legacySharedWorkspaceId: null,
             activeGoalId: null,
             preferences: {
               providerId: "provider_side",
@@ -223,6 +225,8 @@ describe("JA-RPC v1 Task Threads", () => {
       thread: {
         threadId: "thr_other",
         workspaceId: "ws_root",
+        workspaceKind: "session",
+        legacySharedWorkspaceId: null,
         activeGoalId: null,
         preferences: null,
         title: "Other thread",
@@ -468,6 +472,7 @@ describe("JA-RPC v1 Task Threads", () => {
       turns: [
         {
           turnId: threadMessage.turnId,
+          sourceMessageId: null,
           status: "running" as const,
           requestedAt: "2026-09-03T08:00:00Z",
           updatedAt: threadMessage.createdAt,

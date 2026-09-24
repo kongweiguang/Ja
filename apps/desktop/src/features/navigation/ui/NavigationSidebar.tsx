@@ -8,6 +8,7 @@ import {
   CircleMinus,
   CirclePause,
   CircleX,
+  FolderOpen,
   LoaderCircle,
   MoreHorizontal,
   Pencil,
@@ -19,7 +20,16 @@ import {
   SquarePen,
   type LucideIcon,
 } from "lucide-react";
-import { memo, useState, type ReactElement, type ReactNode, type SyntheticEvent } from "react";
+import {
+  memo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactElement,
+  type ReactNode,
+  type SyntheticEvent,
+} from "react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -29,6 +39,7 @@ import {
   MenuContent,
   MenuItem,
   MenuTrigger,
+  PointerContextMenu,
   Popover,
   PopoverContent,
   PopoverTrigger,
@@ -48,6 +59,12 @@ import { ConversationRenameDialog } from "./ConversationRenameDialog";
 interface NavigationProject {
   workspaceId: string;
   displayName: string;
+}
+
+interface NavigationPointerMenu {
+  x: number;
+  y: number;
+  session: number;
 }
 
 /** 实时状态与未读提醒使用同一无障碍命名入口，但终态成功不冒充持续运行状态。 */
@@ -124,7 +141,7 @@ export interface NavigationSidebarProps {
   projectCatalogLoading: boolean;
   projectCatalogError?: string;
   currentWorkspaceId?: string;
-  generalWorkspaceSelected: boolean;
+  noProjectSelected: boolean;
   projectSectionCollapsed: boolean;
   historySectionCollapsed: boolean;
   runtimeLabel: string;
@@ -143,13 +160,16 @@ export interface NavigationSidebarProps {
   conversationSearchOpen: boolean;
   onNewConversation: () => void | Promise<void>;
   onSelectConversation: (threadId: string) => void | Promise<void>;
+  onOpenProjectFolder: (workspaceId: string) => Promise<void>;
+  onOpenWorkspaceFolder: (threadId: string) => Promise<void>;
+  onOpenLegacySharedFolder: (threadId: string) => Promise<void>;
   onOpenConversationSearch: () => void;
   onRenameConversation: (threadId: string, title: string) => Promise<void>;
   onPinConversation: (threadId: string, pinned: boolean) => Promise<void>;
   onArchiveConversation: (threadId: string) => Promise<void>;
   mutatingThreadIds: readonly string[];
   onChooseProject: () => void | Promise<void>;
-  onSelectGeneral: () => void | Promise<void>;
+  onSelectNoProject: () => void | Promise<void>;
   onSelectProject: (workspaceId: string) => void | Promise<void>;
   onProjectSectionCollapsedChange: (collapsed: boolean) => void;
   onHistorySectionCollapsedChange: (collapsed: boolean) => void;
@@ -162,6 +182,11 @@ export interface NavigationSidebarProps {
 /** 将原生/平台快捷键转换为紧凑标题，同时为鼠标用户保留键盘提示。 */
 function actionTitle(label: string, shortcut?: NavigationShortcut): string {
   return shortcut === undefined ? `${label}（Enter）` : `${label}（${shortcut.display}）`;
+}
+
+/** 仅把系统菜单键与 Shift+F10 解释为对象右键，避免截获其它行级快捷键。 */
+function isContextMenuKey(event: KeyboardEvent): boolean {
+  return event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey);
 }
 
 /** 构建主工具栏，让对话搜索紧邻新建入口且不冒充 Workspace 搜索。 */
@@ -272,6 +297,7 @@ function ProjectRow({
   compact,
   disabled,
   onSelect,
+  onOpenProjectFolder,
   onRequestClose,
 }: {
   project: NavigationProject;
@@ -280,31 +306,89 @@ function ProjectRow({
   compact: boolean;
   disabled: boolean;
   onSelect: (workspaceId: string) => void | Promise<void>;
+  onOpenProjectFolder: (workspaceId: string) => Promise<void>;
   onRequestClose: () => void;
 }): ReactElement {
   const displayName = project.displayName.trim() || "未命名项目";
   const title = selected ? `当前项目：${displayName}` : `切换到项目：${displayName}`;
+  const rowRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const menuSessionRef = useRef(0);
+  const [contextMenu, setContextMenu] = useState<NavigationPointerMenu>();
+  /** 菜单保留目标项目的稳定 ID；打开目录不会经由项目选择器切换 Workspace。 */
+  const openContextMenu = (x: number, y: number): void => {
+    setContextMenu({ x, y, session: ++menuSessionRef.current });
+  };
+  /** 项目行自身拥有 Explorer 快捷动作，因此只在这里屏蔽 WebView 原生菜单。 */
+  const handleContextMenu = (event: MouseEvent<HTMLDivElement>): void => {
+    event.preventDefault();
+    restoreFocusRef.current =
+      event.target instanceof Element ? event.target.closest<HTMLElement>("button") : null;
+    openContextMenu(event.clientX, event.clientY);
+  };
+  /** 无障碍菜单键把菜单放在行尾，并保存键盘来源以便 Escape 后返回焦点。 */
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (!isContextMenuKey(event)) return;
+    event.preventDefault();
+    restoreFocusRef.current =
+      event.target instanceof Element ? event.target.closest<HTMLElement>("button") : null;
+    const bounds = rowRef.current?.getBoundingClientRect();
+    if (bounds !== undefined) openContextMenu(bounds.left, bounds.bottom);
+  };
+  /** 返回焦点到触发按钮；虚拟行消失时改回该项目行的当前按钮。 */
+  const restoreContextMenuFocus = (): void => {
+    const source = restoreFocusRef.current;
+    if (source?.isConnected && !source.hasAttribute("disabled")) source.focus();
+    else rowRef.current?.querySelector<HTMLElement>("button")?.focus();
+  };
   return (
-    <WorkspaceScopeRow
-      kind="project"
-      label={displayName}
-      selected={selected}
-      disabled={disabled}
-      accessibleLabel={title}
-      title={actionTitle(title)}
-      statusTone={selected ? runtimeTone : undefined}
-      onSelect={() =>
-        runNavigationAction(() => onSelect(project.workspaceId), compact, onRequestClose)
-      }
-    />
+    <div ref={rowRef} onContextMenu={handleContextMenu} onKeyDown={handleKeyDown}>
+      <WorkspaceScopeRow
+        kind="project"
+        label={displayName}
+        selected={selected}
+        disabled={disabled}
+        accessibleLabel={title}
+        title={actionTitle(title)}
+        statusTone={selected ? runtimeTone : undefined}
+        onSelect={() =>
+          runNavigationAction(() => onSelect(project.workspaceId), compact, onRequestClose)
+        }
+      />
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          key={`${project.workspaceId}:${contextMenu.session}`}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={`项目操作：${displayName}`}
+          onOpenChange={(open) => {
+            if (!open) setContextMenu(undefined);
+          }}
+          onRestoreFocus={restoreContextMenuFocus}
+        >
+          <MenuItem
+            disabled={disabled}
+            onSelect={() =>
+              runNavigationAction(
+                () => onOpenProjectFolder(project.workspaceId),
+                compact,
+                onRequestClose,
+              )
+            }
+          >
+            <FolderOpen aria-hidden="true" />
+            在资源管理器中打开项目目录
+          </MenuItem>
+        </PointerContextMenu>
+      )}
+    </div>
   );
 }
 
 /**
- * 将受管的 general workspace 作为项目范围列表中的稳定首项；显式入口比清除按钮更易发现，
- * 也让“项目 → 无项目对话”的返回路径拥有与项目切换相同的状态和忙碌约束。
+ * 将“无项目对话”作为项目列表中的稳定入口，保留现有侧栏位置与忙碌约束而不绑定共享目录。
  */
-function GeneralWorkspaceRow({
+function NoProjectWorkspaceRow({
   selected,
   runtimeTone,
   compact,
@@ -334,12 +418,89 @@ function GeneralWorkspaceRow({
   );
 }
 
-/** 历史行同时呈现持久状态文案和 active thread 标记，供键盘与屏幕阅读器导航共享。 */
+/** 更多菜单与右键菜单共用同一份动作集合，使条件可用性和归档规则不会随入口漂移。 */
+function ThreadRowMenuItems({
+  thread,
+  pending,
+  canArchive,
+  archiveLabel,
+  compact,
+  onRequestClose,
+  onRequestRename,
+  onPin,
+  onOpenWorkspaceFolder,
+  onOpenLegacySharedFolder,
+  onArchive,
+}: {
+  thread: ThreadProjection;
+  pending: boolean;
+  canArchive: boolean;
+  archiveLabel: string;
+  compact: boolean;
+  onRequestClose: () => void;
+  onRequestRename: (thread: ThreadProjection) => void;
+  onPin: (threadId: string, pinned: boolean) => Promise<void>;
+  onOpenWorkspaceFolder: (threadId: string) => Promise<void>;
+  onOpenLegacySharedFolder: (threadId: string) => Promise<void>;
+  onArchive: (threadId: string) => Promise<void>;
+}): ReactElement {
+  return (
+    <>
+      <MenuItem disabled={pending} onSelect={() => void onPin(thread.threadId, !thread.pinned)}>
+        {thread.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
+        {thread.pinned ? "取消置顶" : "置顶"}
+      </MenuItem>
+      <MenuItem disabled={pending} onSelect={() => onRequestRename(thread)}>
+        <Pencil aria-hidden="true" />
+        重命名
+      </MenuItem>
+      <MenuItem
+        disabled={pending}
+        onSelect={() =>
+          runNavigationAction(() => onOpenWorkspaceFolder(thread.threadId), compact, onRequestClose)
+        }
+      >
+        <FolderOpen aria-hidden="true" />
+        打开工作文件夹
+      </MenuItem>
+      {thread.legacySharedWorkspaceId == null ? null : (
+        <MenuItem
+          disabled={pending}
+          onSelect={() =>
+            runNavigationAction(
+              () => onOpenLegacySharedFolder(thread.threadId),
+              compact,
+              onRequestClose,
+            )
+          }
+        >
+          <FolderOpen aria-hidden="true" />
+          打开旧共享文件夹
+        </MenuItem>
+      )}
+      <MenuItem
+        disabled={pending || !canArchive}
+        title={canArchive ? undefined : archiveLabel}
+        onSelect={() => void onArchive(thread.threadId)}
+      >
+        <Archive aria-hidden="true" />
+        归档
+      </MenuItem>
+    </>
+  );
+}
+
+/**
+ * 历史行同时呈现持久状态文案和 active thread 标记；菜单触发器绕过 Tooltip clone，保证 Radix
+ * pointer/key handlers 到达原生 button，并让文件夹动作只依赖 Thread identity 而不改变选中项。
+ */
 function HistoryRow({
   thread,
   active,
   compact,
   onSelect,
+  onOpenWorkspaceFolder,
+  onOpenLegacySharedFolder,
   onRequestRename,
   onPin,
   onArchive,
@@ -350,6 +511,8 @@ function HistoryRow({
   active: boolean;
   compact: boolean;
   onSelect: (threadId: string) => void | Promise<void>;
+  onOpenWorkspaceFolder: (threadId: string) => Promise<void>;
+  onOpenLegacySharedFolder: (threadId: string) => Promise<void>;
   onRequestRename: (thread: ThreadProjection) => void;
   onPin: (threadId: string, pinned: boolean) => Promise<void>;
   onArchive: (threadId: string) => Promise<void>;
@@ -361,12 +524,45 @@ function HistoryRow({
     thread.latestTurnStatus === null ||
     ["completed", "failed", "cancelled"].includes(thread.latestTurnStatus);
   const archiveLabel = canArchive ? "归档" : "回复结束后可归档";
+  const rowRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const menuSessionRef = useRef(0);
+  const [contextMenu, setContextMenu] = useState<NavigationPointerMenu>();
   const stopRowAction = (event: SyntheticEvent): void => event.stopPropagation();
+  /** 当前 Thread ID 与菜单内容保持绑定，不使用活动 Thread 来推断右键目标。 */
+  const openContextMenu = (x: number, y: number): void => {
+    setContextMenu({ x, y, session: ++menuSessionRef.current });
+  };
+  /** 对话区域有独立右键语义；右击只拦截当前行，不触发选择或更改焦点 owner。 */
+  const handleContextMenu = (event: MouseEvent<HTMLDivElement>): void => {
+    event.preventDefault();
+    restoreFocusRef.current =
+      event.target instanceof Element ? event.target.closest<HTMLElement>("button") : null;
+    openContextMenu(event.clientX, event.clientY);
+  };
+  /** 支持标准 ContextMenu 键和 Shift+F10，并把 Escape 恢复到原操作按钮。 */
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (!isContextMenuKey(event)) return;
+    event.preventDefault();
+    restoreFocusRef.current =
+      event.target instanceof Element ? event.target.closest<HTMLElement>("button") : null;
+    const bounds = rowRef.current?.getBoundingClientRect();
+    if (bounds !== undefined) openContextMenu(bounds.left, bounds.bottom);
+  };
+  /** 如果行在菜单开启期间卸载，焦点退回当前 Thread 主按钮而不落到 document.body。 */
+  const restoreContextMenuFocus = (): void => {
+    const source = restoreFocusRef.current;
+    if (source?.isConnected && !source.hasAttribute("disabled")) source.focus();
+    else rowRef.current?.querySelector<HTMLElement>(".ja-navigation-thread")?.focus();
+  };
   return (
     <div
+      ref={rowRef}
       className="ja-navigation-thread-row"
       data-active={active || undefined}
       data-pending={pending || undefined}
+      onContextMenu={handleContextMenu}
+      onKeyDown={handleKeyDown}
     >
       <button
         type="button"
@@ -428,35 +624,55 @@ function HistoryRow({
             <IconButton
               className="ja-navigation-thread-action ja-navigation-thread-menu"
               label={`对话菜单：${title}`}
-              tooltip="对话菜单"
+              tooltip={false}
               aria-disabled={pending || undefined}
             >
               <MoreHorizontal aria-hidden="true" />
             </IconButton>
           </MenuTrigger>
           <MenuContent align="end" onCloseAutoFocus={(event) => event.preventDefault()}>
-            <MenuItem
-              disabled={pending}
-              onSelect={() => void onPin(thread.threadId, !thread.pinned)}
-            >
-              {thread.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
-              {thread.pinned ? "取消置顶" : "置顶"}
-            </MenuItem>
-            <MenuItem disabled={pending} onSelect={() => onRequestRename(thread)}>
-              <Pencil aria-hidden="true" />
-              重命名
-            </MenuItem>
-            <MenuItem
-              disabled={pending || !canArchive}
-              title={canArchive ? undefined : archiveLabel}
-              onSelect={() => void onArchive(thread.threadId)}
-            >
-              <Archive aria-hidden="true" />
-              归档
-            </MenuItem>
+            <ThreadRowMenuItems
+              thread={thread}
+              pending={pending}
+              canArchive={canArchive}
+              archiveLabel={archiveLabel}
+              compact={compact}
+              onRequestClose={onRequestClose}
+              onRequestRename={onRequestRename}
+              onPin={onPin}
+              onOpenWorkspaceFolder={onOpenWorkspaceFolder}
+              onOpenLegacySharedFolder={onOpenLegacySharedFolder}
+              onArchive={onArchive}
+            />
           </MenuContent>
         </Menu>
       </div>
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          key={`${thread.threadId}:${contextMenu.session}`}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={`对话操作：${title}`}
+          onOpenChange={(open) => {
+            if (!open) setContextMenu(undefined);
+          }}
+          onRestoreFocus={restoreContextMenuFocus}
+        >
+          <ThreadRowMenuItems
+            thread={thread}
+            pending={pending}
+            canArchive={canArchive}
+            archiveLabel={archiveLabel}
+            compact={compact}
+            onRequestClose={onRequestClose}
+            onRequestRename={onRequestRename}
+            onPin={onPin}
+            onOpenWorkspaceFolder={onOpenWorkspaceFolder}
+            onOpenLegacySharedFolder={onOpenLegacySharedFolder}
+            onArchive={onArchive}
+          />
+        </PointerContextMenu>
+      )}
     </div>
   );
 }
@@ -551,12 +767,12 @@ export const NavigationSidebar = memo(function NavigationSidebar(
             <CollapsibleContent className="ja-navigation-section-content">
               <div className="ja-navigation-project-list" role="list" aria-label="项目列表">
                 <div role="listitem">
-                  <GeneralWorkspaceRow
-                    selected={props.generalWorkspaceSelected}
+                  <NoProjectWorkspaceRow
+                    selected={props.noProjectSelected}
                     runtimeTone={props.runtimeTone}
                     compact={props.compact}
                     disabled={props.projectBusy}
-                    onSelect={props.onSelectGeneral}
+                    onSelect={props.onSelectNoProject}
                     onRequestClose={props.onRequestClose}
                   />
                 </div>
@@ -569,6 +785,7 @@ export const NavigationSidebar = memo(function NavigationSidebar(
                       compact={props.compact}
                       disabled={props.projectBusy}
                       onSelect={props.onSelectProject}
+                      onOpenProjectFolder={props.onOpenProjectFolder}
                       onRequestClose={props.onRequestClose}
                     />
                   </div>
@@ -645,6 +862,8 @@ export const NavigationSidebar = memo(function NavigationSidebar(
                       active={props.currentThreadId === thread.threadId}
                       compact={props.compact}
                       onSelect={props.onSelectConversation}
+                      onOpenWorkspaceFolder={props.onOpenWorkspaceFolder}
+                      onOpenLegacySharedFolder={props.onOpenLegacySharedFolder}
                       onRequestRename={setRenameThread}
                       onPin={props.onPinConversation}
                       onArchive={props.onArchiveConversation}

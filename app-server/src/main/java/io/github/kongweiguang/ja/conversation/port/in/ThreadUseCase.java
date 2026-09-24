@@ -27,6 +27,11 @@ public interface ThreadUseCase {
      */
     CursorPage<ThreadSummary> listThreads(String workspaceId, String cursor, int limit);
 
+    /** 无项目主会话跨多个 SESSION workspace 聚合读取，仍返回完整可导航摘要。 */
+    default CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) {
+        throw new UnsupportedOperationException("session thread listing is unavailable");
+    }
+
     /**
      * 读取全局 Thread 发现投影；默认失败保持窄测试夹具显式声明未提供该能力。
      */
@@ -36,6 +41,11 @@ public interface ThreadUseCase {
 
     /** 在一个 Workspace 内按归一化标题包含关系搜索，并保持最近更新时间 keyset 顺序。 */
     CursorPage<ThreadSummary> searchThreads(String workspaceId, String query, String cursor, int limit);
+
+    /** 在所有 SESSION workspace 内搜索主会话标题，不把 project 或 legacy recovery root 混入结果。 */
+    default CursorPage<ThreadSummary> searchSessionThreads(String query, String cursor, int limit) {
+        throw new UnsupportedOperationException("session thread search is unavailable");
+    }
 
     /**
      * 读取一个事务一致的 Thread 历史页面。

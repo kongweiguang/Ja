@@ -32,11 +32,13 @@ final class WorkspacePolicyTest {
         assertEquals(root.toString(), policy.displayName(root, null));
     }
 
-    /** 通用工作区固定受信任，项目工作区默认不加载项目配置。 */
+    /** 会话与旧共享目录不加载项目覆盖层，因此信任语义与项目目录明确分开。 */
     @Test
     void assignsTrustByDirectoryKind() {
         assertEquals(Workspace.Trust.TRUSTED,
-                policy.initialTrust(WorkspaceDirectory.Kind.GENERAL));
+                policy.initialTrust(WorkspaceDirectory.Kind.SESSION));
+        assertEquals(Workspace.Trust.TRUSTED,
+                policy.initialTrust(WorkspaceDirectory.Kind.LEGACY_SHARED));
         assertEquals(Workspace.Trust.UNTRUSTED,
                 policy.initialTrust(WorkspaceDirectory.Kind.PROJECT));
     }

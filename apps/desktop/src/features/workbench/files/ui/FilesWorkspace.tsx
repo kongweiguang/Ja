@@ -2,9 +2,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
-import { Files, X } from "lucide-react";
-import { lazy, Suspense, useCallback, useLayoutEffect, useRef, type ReactElement } from "react";
-import { EmptyState, IconButton, LoadingState } from "@/shared/ui/primitives";
+import { Files, FilePlus2, Save, X } from "lucide-react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactElement,
+} from "react";
+import {
+  EmptyState,
+  IconButton,
+  LoadingState,
+  MenuItem,
+  MenuSeparator,
+  PointerContextMenu,
+} from "@/shared/ui/primitives";
 import { FileTree } from "./FileTree";
 import { SaveAsDialog } from "./SaveAsDialog";
 import { SearchPanel } from "./SearchPanel";
@@ -14,6 +32,16 @@ import type { OpenDocument } from "../application/types";
 import { entryName } from "../domain/filesModel";
 import type { FileRevision } from "../domain/types";
 import "./files.css";
+
+interface FileTabContextMenuSession {
+  readonly sequence: number;
+  readonly path: string;
+  readonly x: number;
+  readonly y: number;
+  readonly trigger?: HTMLElement;
+}
+
+type FileTabContextAction = "save" | "retry-save" | "save-as" | "close";
 
 const CodeEditor = lazy(() =>
   import("@/features/workbench/editor").then((module) => ({ default: module.CodeEditor })),
@@ -59,8 +87,9 @@ function loadedFileCount(nodes: FilesWorkspaceViewProps["viewModel"]["nodes"]): 
 }
 
 /**
- * 纯视图只消费 view model/actions；资源读取、保存、Watcher、Move、Trash 与 Drop 的
- * generation/事务规则全部留在唯一 controller，避免 JSX 形成第二个状态 owner。
+ * 纯视图只消费 view model/actions；标签右键也只路由到同一 controller，避免 JSX 形成
+ * 第二个状态 owner 或让右键误选当前文件。每次 Trash 请求重建 Dialog 实例，确保上一轮
+ * Radix 关闭层不会吞掉用户紧接着打开的文件菜单。
  */
 export function FilesWorkspace({
   viewModel,
@@ -92,8 +121,155 @@ export function FilesWorkspace({
     openTargets,
   } = viewModel;
   const editorTabsRef = useRef<HTMLDivElement>(null);
+  const [tabContextMenu, setTabContextMenu] = useState<FileTabContextMenuSession | undefined>();
+  const tabContextMenuRef = useRef<FileTabContextMenuSession | undefined>(undefined);
+  const tabContextMenuSequenceRef = useRef(0);
+  const latestTabContextStateRef = useRef({
+    documents,
+    openPaths,
+    lifecycleClosing,
+    mutationRecoveryRequired,
+    closeDocumentRequest,
+    saveAsRequest,
+    conflictAction,
+    actions,
+  });
+  /** 事件动作复核提交后的 view model，避免在 render 阶段读写 ref。 */
+  useLayoutEffect(() => {
+    latestTabContextStateRef.current = {
+      documents,
+      openPaths,
+      lifecycleClosing,
+      mutationRecoveryRequired,
+      closeDocumentRequest,
+      saveAsRequest,
+      conflictAction,
+      actions,
+    };
+  }, [
+    actions,
+    closeDocumentRequest,
+    conflictAction,
+    documents,
+    lifecycleClosing,
+    mutationRecoveryRequired,
+    openPaths,
+    saveAsRequest,
+  ]);
   const openPathsKey = openPaths.join("\u0000");
   const fileCount = loadedFileCount(nodes);
+
+  /** 关闭后优先回到原控件；标签已移除时落到同标签或最近的剩余标签。 */
+  const restoreFileTabFocus = useCallback((path: string, trigger?: HTMLElement): void => {
+    if (trigger?.isConnected) {
+      trigger.focus();
+      return;
+    }
+    const tabNodes = [
+      ...(editorTabsRef.current?.querySelectorAll<HTMLElement>("[data-file-tab-path]") ?? []),
+    ];
+    const sameTab = tabNodes.find((node) => node.dataset["fileTabPath"] === path);
+    const target =
+      sameTab?.querySelector<HTMLElement>('[role="tab"]') ??
+      tabNodes[0]?.querySelector<HTMLElement>('[role="tab"]');
+    target?.focus();
+  }, []);
+
+  /** 只用当前打开的 path 建立菜单会话，重复右键通过递增身份替换旧 Portal。 */
+  const requestFileTabContextMenu = (
+    path: string,
+    x: number,
+    y: number,
+    trigger?: HTMLElement,
+  ): boolean => {
+    const current = latestTabContextStateRef.current;
+    if (!current.openPaths.includes(path) || current.documents[path] === undefined) return false;
+    tabContextMenuSequenceRef.current += 1;
+    const nextSession = {
+      sequence: tabContextMenuSequenceRef.current,
+      path,
+      x,
+      y,
+      trigger,
+    };
+    tabContextMenuRef.current = nextSession;
+    setTabContextMenu(nextSession);
+    return true;
+  };
+
+  /** 鼠右键只打开确实存在的文件标签菜单，并将原生浏览器菜单留给其它区域。 */
+  const handleFileTabContextMenu = (event: ReactMouseEvent<HTMLDivElement>, path: string): void => {
+    const eventTarget = event.target;
+    const trigger = eventTarget instanceof HTMLElement ? eventTarget.closest("button") : null;
+    if (requestFileTabContextMenu(path, event.clientX, event.clientY, trigger ?? undefined))
+      event.preventDefault();
+  };
+
+  /** 标准菜单键和 Shift+F10 与鼠标共用定位、目标和焦点恢复路径。 */
+  const handleFileTabKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>, path: string): void => {
+    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    const target = event.target instanceof HTMLElement ? event.target : event.currentTarget;
+    const bounds = target.getBoundingClientRect();
+    const trigger = target.closest("button");
+    if (requestFileTabContextMenu(path, bounds.left, bounds.bottom, trigger ?? undefined)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+
+  /** 菜单动作先重查打开态、文档状态和写入门禁，再调用现有语义 action。 */
+  const runFileTabContextAction = (path: string, action: FileTabContextAction): void => {
+    const current = latestTabContextStateRef.current;
+    const document = current.documents[path];
+    if (document === undefined || !current.openPaths.includes(path) || current.lifecycleClosing)
+      return;
+    if (action === "close") {
+      if (current.closeDocumentRequest === undefined) current.actions.closeDocument(path);
+      return;
+    }
+    if (document.readOnly || current.mutationRecoveryRequired) return;
+    if (action === "save" && document.status === "dirty") {
+      void current.actions.saveDocument(path);
+    } else if (action === "retry-save" && document.status === "saveError") {
+      current.actions.retrySave(path);
+    } else if (
+      action === "save-as" &&
+      document.status === "conflict" &&
+      current.actions.beginSaveAs !== undefined &&
+      current.conflictAction?.path !== path &&
+      current.saveAsRequest?.pending !== true
+    ) {
+      current.actions.beginSaveAs(path);
+    }
+  };
+
+  /** 只关闭对应 generation，旧菜单的延迟 close 不得关闭新右键目标。 */
+  const closeFileTabContextMenu = (session: FileTabContextMenuSession): void => {
+    if (tabContextMenuRef.current?.sequence !== session.sequence) return;
+    tabContextMenuRef.current = undefined;
+    setTabContextMenu(undefined);
+  };
+
+  /** 文件标签关闭或重载后清理悬空菜单；焦点退回仍存在的标签。 */
+  useEffect(() => {
+    if (tabContextMenu === undefined) return;
+    const current = latestTabContextStateRef.current;
+    if (current.openPaths.includes(tabContextMenu.path) && current.documents[tabContextMenu.path])
+      return;
+    if (tabContextMenuRef.current?.sequence !== tabContextMenu.sequence) return;
+    window.requestAnimationFrame(() => {
+      if (tabContextMenuRef.current?.sequence !== tabContextMenu.sequence) return;
+      tabContextMenuRef.current = undefined;
+      setTabContextMenu(undefined);
+    });
+  }, [documents, openPaths, tabContextMenu]);
+
+  const tabContextDocument =
+    tabContextMenu === undefined ? undefined : documents[tabContextMenu.path];
+  const canShowTabContextMenu =
+    tabContextMenu !== undefined &&
+    tabContextDocument !== undefined &&
+    openPaths.includes(tabContextMenu.path);
 
   /** 让程序恢复的 Tab 保持可见，但不抢走编辑器键盘焦点。 */
   useLayoutEffect(() => {
@@ -202,8 +378,11 @@ export function FilesWorkspace({
                     <div
                       className={`ja-files-editor-tab${path === activePath ? " is-active" : ""}`}
                       data-file-tab-path={path}
+                      data-external-file={openDocument.externalFile === true ? "true" : undefined}
                       key={path}
                       role="presentation"
+                      onContextMenu={(event) => handleFileTabContextMenu(event, path)}
+                      onKeyDown={(event) => handleFileTabKeyDown(event, path)}
                     >
                       <button
                         type="button"
@@ -236,7 +415,9 @@ export function FilesWorkspace({
               ) : (
                 <div
                   className="ja-files-editor-content"
+                  data-document-path={activeDocument.path}
                   data-document-read-only={activeDocument.readOnly}
+                  data-document-truncated={activeDocument.truncated ?? false}
                   data-lifecycle-closing={lifecycleClosing}
                   data-mutation-recovery-required={mutationRecoveryRequired}
                 >
@@ -353,6 +534,72 @@ export function FilesWorkspace({
         onCancel={actions.cancelSaveAs}
         onSubmit={actions.submitSaveAs}
       />
+      {canShowTabContextMenu && tabContextMenu !== undefined && tabContextDocument !== undefined ? (
+        <PointerContextMenu
+          key={tabContextMenu.sequence}
+          x={tabContextMenu.x}
+          y={tabContextMenu.y}
+          label={`${entryName(tabContextMenu.path)} 标签操作`}
+          className="ja-files-tab-context-menu"
+          onOpenChange={(open) => {
+            if (!open) closeFileTabContextMenu(tabContextMenu);
+          }}
+          onRestoreFocus={() => restoreFileTabFocus(tabContextMenu.path, tabContextMenu.trigger)}
+        >
+          {!tabContextDocument.readOnly &&
+          (tabContextDocument.status === "dirty" || tabContextDocument.status === "saving") ? (
+            <MenuItem
+              disabled={
+                tabContextDocument.status === "saving" ||
+                lifecycleClosing ||
+                mutationRecoveryRequired
+              }
+              onSelect={() => runFileTabContextAction(tabContextMenu.path, "save")}
+            >
+              <Save aria-hidden="true" />
+              <span>{tabContextDocument.status === "saving" ? "保存中…" : "保存"}</span>
+            </MenuItem>
+          ) : null}
+          {!tabContextDocument.readOnly && tabContextDocument.status === "saveError" ? (
+            <MenuItem
+              disabled={lifecycleClosing || mutationRecoveryRequired}
+              onSelect={() => runFileTabContextAction(tabContextMenu.path, "retry-save")}
+            >
+              <Save aria-hidden="true" />
+              <span>重试保存</span>
+            </MenuItem>
+          ) : null}
+          {!tabContextDocument.readOnly &&
+          tabContextDocument.status === "conflict" &&
+          actions.beginSaveAs !== undefined ? (
+            <MenuItem
+              disabled={
+                lifecycleClosing ||
+                mutationRecoveryRequired ||
+                saveAsRequest?.pending === true ||
+                conflictAction?.path === tabContextMenu.path
+              }
+              onSelect={() => runFileTabContextAction(tabContextMenu.path, "save-as")}
+            >
+              <FilePlus2 aria-hidden="true" />
+              <span>另存为</span>
+            </MenuItem>
+          ) : null}
+          {tabContextDocument.status === "dirty" ||
+          tabContextDocument.status === "saving" ||
+          tabContextDocument.status === "saveError" ||
+          (tabContextDocument.status === "conflict" && actions.beginSaveAs !== undefined) ? (
+            <MenuSeparator />
+          ) : null}
+          <MenuItem
+            disabled={lifecycleClosing || closeDocumentRequest !== undefined}
+            onSelect={() => runFileTabContextAction(tabContextMenu.path, "close")}
+          >
+            <X aria-hidden="true" />
+            <span>关闭</span>
+          </MenuItem>
+        </PointerContextMenu>
+      ) : null}
       <AlertDialog.Root
         open={closeDocumentRequest !== undefined}
         onOpenChange={(open) => {
@@ -406,6 +653,7 @@ export function FilesWorkspace({
         </AlertDialog.Portal>
       </AlertDialog.Root>
       <TrashConfirmDialog
+        key={trashRequest?.requestId ?? "closed"}
         open={trashRequest !== undefined}
         relativePath={trashRequest?.relativePath ?? ""}
         phase={trashRequest?.phase ?? "preparing"}

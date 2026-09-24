@@ -34,7 +34,8 @@ final class GenerationMcpDefinitionFactory {
     }
 
     /**
-     * 只解析选中服务的凭据，其余代际数据始终保持不可变。
+     * 只解析选中服务的凭据；stdio 仅保存配置与代际凭据覆盖，宿主环境会在 Session 创建时合并，
+     * 以免配置代际长期持有一份可能含 Secret 的宿主环境副本。
      */
     static McpServerDefinition create(ConfigurationGenerationSnapshot.McpServer server,
                                       Path workingDirectory, ConfigurationGenerationPort.Lease lease) {

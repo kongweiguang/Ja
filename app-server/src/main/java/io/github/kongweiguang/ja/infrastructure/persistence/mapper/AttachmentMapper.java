@@ -27,6 +27,11 @@ public interface AttachmentMapper {
     /** 原绑定或同 Workspace 冻结 Side Task 祖先链授权读取；排队草稿只允许当前 Thread。 */
     AttachmentRecords.AttachmentRow selectThreadAttachment(@Param("attachmentId") String attachmentId,
                                                            @Param("threadId") String threadId);
+    /** 在 reask 准入事务内验证既有 BOUND ID 确实属于被替换的源 USER 消息。 */
+    boolean isMessageAttachmentBoundTo(@Param("attachmentId") String attachmentId,
+                                       @Param("messageId") String messageId,
+                                       @Param("threadId") String threadId,
+                                       @Param("workspaceId") String workspaceId);
     /** DRAFT 单向丢弃。 */
     int discardDraft(AttachmentRecords.AttachmentDiscard values);
     /** Turn admission 内把同 Workspace 未过期草稿转为 BOUND。 */

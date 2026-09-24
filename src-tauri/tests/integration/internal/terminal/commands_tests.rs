@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn active_owner_count(host: &TerminalCommandHost) -> usize {
     match host.lifecycle.lock() {
         Ok(lifecycle) => lifecycle
-            .supervisor
-            .as_ref()
-            .map_or(0, |configured| configured.supervisor.active_count()),
+            .supervisors
+            .values()
+            .map(|configured| configured.supervisor.active_count())
+            .sum(),
         Err(_) => usize::MAX,
     }
 }
@@ -163,9 +164,56 @@ fn command_host_reuses_workspace_until_session_budget() {
     fs::remove_dir_all(root).expect("remove terminal root");
 }
 
-/// close-all 清理 process owner 与 stale workspace identity 前，其它 workspace 不能替换 binding。
+/// A per-thread supervisor must not multiply the host-wide PTY budget after workspace switching.
 #[test]
-fn command_host_requires_close_before_workspace_replacement() {
+fn command_host_enforces_session_budget_across_workspaces() {
+    let first_root = std::env::temp_dir().join(format!(
+        "ja-terminal-command-total-first-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let second_root = std::env::temp_dir().join(format!(
+        "ja-terminal-command-total-second-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&first_root).expect("first terminal root");
+    fs::create_dir_all(&second_root).expect("second terminal root");
+    let host = TerminalCommandHost::new();
+    for _ in 0..4 {
+        host.open(
+            "ws_total_first",
+            first_root.clone(),
+            LaunchRequest::default(),
+        )
+        .expect("first workspace session within shared budget");
+        host.open(
+            "ws_total_second",
+            second_root.clone(),
+            LaunchRequest::default(),
+        )
+        .expect("second workspace session within shared budget");
+    }
+
+    let error = match host.open(
+        "ws_total_second",
+        second_root.clone(),
+        LaunchRequest::default(),
+    ) {
+        Ok(_) => panic!("all workspaces share the original total session budget"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), TerminalErrorCode::SessionLimit);
+    host.close_all("ws_total_first", Instant::now() + Duration::from_secs(15))
+        .expect("close first workspace sessions");
+    host.close_all("ws_total_second", Instant::now() + Duration::from_secs(15))
+        .expect("close second workspace sessions");
+    assert!(host.is_empty());
+    fs::remove_dir_all(first_root).expect("remove first terminal root");
+    fs::remove_dir_all(second_root).expect("remove second terminal root");
+}
+
+/// 打开 workspace B 后，workspace A 的 sessionId 仍能 poll/input；关闭 A 不影响 B 的会话归属。
+#[test]
+fn command_host_keeps_workspace_terminals_independent() {
     let first_root = std::env::temp_dir().join(format!(
         "ja-terminal-command-first-{}",
         uuid::Uuid::new_v4()
@@ -177,23 +225,69 @@ fn command_host_requires_close_before_workspace_replacement() {
     fs::create_dir_all(&first_root).expect("first terminal root");
     fs::create_dir_all(&second_root).expect("second terminal root");
     let host = TerminalCommandHost::new();
+    let first_request = LaunchRequest {
+        #[cfg(windows)]
+        profile: ShellProfile::Cmd,
+        #[cfg(unix)]
+        profile: ShellProfile::Bash,
+        ..LaunchRequest::default()
+    };
     let session = host
-        .open("ws_first", first_root.clone(), LaunchRequest::default())
+        .open("ws_first", first_root.clone(), first_request)
         .expect("first workspace pane");
 
-    let error = host
-        .configure(String::from("ws_second"), second_root.clone())
-        .expect_err("live workspace replacement");
-    assert_eq!(error.code(), TerminalErrorCode::InvalidConfig);
-    assert_eq!(session.generation(), 1);
-    host.close_all("ws_first", Instant::now() + Duration::from_secs(15))
-        .expect("close first workspace");
-    let replacement = host
+    host.configure(String::from("ws_second"), second_root.clone())
+        .expect("second workspace has a separate supervisor");
+    let second_session = host
         .open("ws_second", second_root.clone(), LaunchRequest::default())
-        .expect("open after workspace close-all");
-    assert_eq!(replacement.generation(), 1);
+        .expect("second workspace pane");
+    assert_eq!(
+        host.session_owner(session.id(), session.generation())
+            .unwrap()
+            .id(),
+        session.id()
+    );
+    assert_eq!(
+        host.session_owner(second_session.id(), second_session.generation())
+            .unwrap()
+            .id(),
+        second_session.id()
+    );
+    assert_eq!(session.generation(), 1);
+    let routed_first = host
+        .session_owner(session.id(), session.generation())
+        .expect("session A remains addressable after opening workspace B");
+    routed_first
+        .send_input(b"echo JA_SESSION_A_STILL_LIVE\r\n", Duration::from_secs(1))
+        .expect("input still routes to session A after workspace switch");
+    assert!(
+        routed_first
+            .recv_until(Instant::now() + Duration::from_millis(100))
+            .is_ok(),
+        "session A poll remains routed while workspace B is active"
+    );
+    host.close_all("ws_first", Instant::now() + Duration::from_secs(15))
+        .expect("close only first workspace");
+    assert!(
+        !host.is_empty(),
+        "second workspace process must remain alive"
+    );
+    assert!(
+        host.session_owner(second_session.id(), second_session.generation())
+            .is_ok()
+    );
+    let closed_owner_error = match host.session_owner(session.id(), session.generation()) {
+        Ok(_) => panic!("closed first workspace must be removed"),
+        Err(error) => error,
+    };
+    assert_eq!(closed_owner_error.code(), TerminalErrorCode::SessionNotFound);
+    host.session_owner(second_session.id(), second_session.generation())
+        .unwrap()
+        .send_input(b"\r", Duration::from_secs(1))
+        .expect("second workspace input remains routed");
     host.close_all("ws_second", Instant::now() + Duration::from_secs(15))
-        .expect("clear replacement binding");
+        .expect("close second workspace");
+    assert!(host.is_empty());
     fs::remove_dir_all(first_root).expect("remove first root");
     fs::remove_dir_all(second_root).expect("remove second root");
 }
@@ -267,8 +361,7 @@ fn command_host_shutdown_fences_concurrent_and_late_open() {
     fs::remove_dir_all(root).expect("remove shutdown race root");
 }
 
-/// 存活 session 同时固定不透明 workspace id 与 canonical root；同一 root 的 alias 可复用，
-/// 新物理 root 必须拒绝。
+/// 同一 workspace id 固定 canonical root；别名可复用，同 id 的新物理 root 必须拒绝。
 #[test]
 fn command_host_rejects_live_workspace_or_root_identity_change() {
     let first_root = std::env::temp_dir().join(format!(
@@ -293,21 +386,21 @@ fn command_host_rejects_live_workspace_or_root_identity_change() {
         Err(error) => error,
     };
     assert_eq!(changed_root.code(), TerminalErrorCode::InvalidConfig);
-    let changed_workspace =
-        match host.open("ws_other", first_root.clone(), LaunchRequest::default()) {
-            Ok(_) => panic!("live workspace replacement must fail"),
-            Err(error) => error,
-        };
-    assert_eq!(changed_workspace.code(), TerminalErrorCode::InvalidConfig);
+    let independent_workspace = host
+        .open("ws_other", first_root.clone(), LaunchRequest::default())
+        .expect("another id may use its own independent supervisor");
 
     host.close_all("ws_fixture", Instant::now() + Duration::from_secs(15))
         .expect("close identity fixtures");
+    host.close_all("ws_other", Instant::now() + Duration::from_secs(15))
+        .expect("close independent workspace");
+    assert_eq!(independent_workspace.generation(), 1);
     fs::remove_dir_all(first_root).expect("remove first root");
     fs::remove_dir_all(second_root).expect("remove second root");
 }
 
-/// 捕获的 close owner 在不固定 host mutex 的前提下保留 generation authority，从而覆盖
-/// admission 后、single-close worker 运行前 close-all 先完成回收的确定性交错。
+/// 捕获的 close owner 在不固定 host mutex 的前提下保留 generation authority，并锁定跨 workspace 查找的 stale 分类；
+/// 同时覆盖 admission 后、single-close worker 运行前 close-all 先完成回收的确定性交错。
 #[test]
 fn captured_close_owner_is_idempotent_after_close_all_wins() {
     let root = std::env::temp_dir().join(format!(
@@ -324,6 +417,11 @@ fn captured_close_owner_is_idempotent_after_close_all_wins() {
         Err(error) => error,
     };
     assert_eq!(stale.code(), TerminalErrorCode::StaleGeneration);
+    let stale_session = match host.session_owner(session.id(), session.generation() + 1) {
+        Ok(_) => panic!("stale session owner must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(stale_session.code(), TerminalErrorCode::StaleGeneration);
 
     let owner = host
         .close_owner(session.id(), session.generation())
@@ -414,7 +512,7 @@ async fn bounded_open_worker_does_not_block_async_executor() {
     assert_eq!(workers.available_permits(), 1);
 }
 
-/// 伪造 session 不能消耗共享 native token，合法 Files 或 Terminal target 之后仍可使用它。
+/// 未打开的 session 必须保持 SessionNotFound，且不能消耗共享 native token；有效 Files/Terminal target 之后仍可使用它。
 #[test]
 fn wrong_session_is_rejected_before_drop_token_consumption() {
     let root =
@@ -436,6 +534,14 @@ fn wrong_session_is_rejected_before_drop_token_consumption() {
     )
     .expect_err("forged session");
     assert_eq!(error.code(), TerminalErrorCode::SessionNotFound);
+    let missing_close_owner = match host.close_owner(TerminalId::new(), 1) {
+        Ok(_) => panic!("missing close owner must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        missing_close_owner.code(),
+        TerminalErrorCode::SessionNotFound
+    );
     assert!(consume_native_drop(&token).is_ok());
     fs::remove_dir_all(root).expect("remove fixture");
 }

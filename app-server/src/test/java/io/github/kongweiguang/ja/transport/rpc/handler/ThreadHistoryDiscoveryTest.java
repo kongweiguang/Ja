@@ -110,6 +110,7 @@ final class ThreadHistoryDiscoveryTest {
         private Harness() {
             RpcServiceBindings bindings = new RpcServiceBindings(
                     unsupported(WorkspaceUseCase.class), unsupported(WorkspacePathSearchUseCase.class), threads.proxy(),
+                    io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.unsupportedThreadMcp(),
                     unsupported(TurnUseCase.class), unsupported(ContextCompactionUseCase.class),
                     unsupported(ApprovalUseCase.class), unsupported(CatalogUseCase.class),
                     unsupported(AttachmentUseCase.class), unsupported(AttachmentPreviewUseCase.class),
@@ -194,7 +195,7 @@ final class ThreadHistoryDiscoveryTest {
 
         /** 构造普通导航使用的完整 Thread metadata，确保 Handler 未误用 discovery 投影。 */
         private static ThreadSummary thread() {
-            return new ThreadSummary("thr_main", "ws_project", "Main thread", preferences(),
+            return new ThreadSummary("thr_main", "ws_project", "Main thread", "project", null, preferences(),
                     ThreadSummary.Status.ACTIVE, false, TurnState.COMPLETED, true, null, 1, NOW, NOW);
         }
     }

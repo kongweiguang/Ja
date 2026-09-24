@@ -18,6 +18,36 @@ fn thread_seen_is_a_canonical_client_method() {
     );
 }
 
+/// Hidden continuation and source-bound reask are distinct fixed methods and must each appear once
+/// in both handshake capabilities and decoder admission.
+#[test]
+fn recovery_admission_methods_are_canonical() {
+    for method in ["turn/continue", "turn/reask"] {
+        assert_eq!(
+            V1_CLIENT_METHODS
+                .iter()
+                .filter(|candidate| **candidate == method)
+                .count(),
+            1,
+            "recovery method must appear exactly once: {method}"
+        );
+    }
+}
+
+/// Thread MCP status is a fixed method in the decoder/handshake closure.
+#[test]
+fn thread_mcp_status_methods_are_canonical() {
+    let method = "thread/mcp/read";
+    assert_eq!(
+        V1_CLIENT_METHODS
+            .iter()
+            .filter(|candidate| **candidate == method)
+            .count(),
+        1,
+        "thread MCP method must appear exactly once: {method}"
+    );
+}
+
 /// 锁定已删除错误和旧 Host CANCELLED 数值码，防止目录重新引入兼容别名。
 #[test]
 fn retired_errors_are_not_catalogued() {
@@ -62,6 +92,15 @@ fn turn_resume_errors_are_catalogued() {
     assert_eq!(
         catalog_entry(-32_067, "UNASSIGNED", "conflict", false),
         None
+    );
+}
+
+/// Reask 资格失败是确定性业务拒绝，不允许客户端把它当作可自动重试的网络或 CAS 错误。
+#[test]
+fn turn_reask_eligibility_error_is_catalogued() {
+    assert_eq!(
+        catalog_entry(-32_067, "TURN_NOT_REASKABLE", "validation", false),
+        Some(("TURN_NOT_REASKABLE", "该问题当前不可重新回答。"))
     );
 }
 

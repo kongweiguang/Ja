@@ -10,6 +10,8 @@ The next normal Provider request consumes pending messages and receives their ex
 
 Runtime, Turn, Tool, approval, context, workspace, and configuration notifications are transactional and redacted. `assistant/model-step-committed` publishes durable progress text, optional public reasoning summary, model round, usage, and ordered Tool calls. Each Tool call contains only a strict `ToolPresentation`; raw arguments and byte-count placeholders are invalid.
 
+`turn/retry-started` uses the normal Turn event envelope and carries `attempt` 2 through 6 with `maxAttempts=6`. It follows settlement of the failed request's independent Usage fact. Clients clear that attempt's temporary Assistant and reasoning draft, retain the monotonic stream sequence, and keep the Turn in the working state; only the final terminal event presents an error.
+
 Request-level Usage has one shape across `assistant/model-step-committed`, `assistantSettlement`, `turn/terminal`,
 and `thread/read.contextUsage`. A current record includes the complete `ProviderRequestProfile`; a migrated record
 always carries the complete request profile. `certainty="unknown"` keeps all Token values null when the Provider

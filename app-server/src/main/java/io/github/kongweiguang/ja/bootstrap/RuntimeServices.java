@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.bootstrap;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.conversation.application.approval.ApprovalBroker;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
@@ -32,10 +33,10 @@ public final class RuntimeServices implements DeadlineCloseable {
     private final DeadlineCloseCoordinator closeCoordinator = new DeadlineCloseCoordinator();
 
     /**
-     * 固定一次连接需要的明确入站端口，避免 transport 取得 Solon 容器或 Service Locator。
+     * 固定一次连接需要的明确入站端口，MCP 会话投影也通过应用用例进入，避免 transport 取得容器。
      */
     public RuntimeServices(WorkspaceUseCase workspaces, WorkspacePathSearchUseCase workspacePathSearch,
-                           ThreadUseCase threads, TurnUseCase turns,
+                           ThreadUseCase threads, ThreadMcpUseCase threadMcp, TurnUseCase turns,
                            ContextCompactionUseCase compactions, ApprovalBroker approvals, CatalogUseCase catalog,
                            AttachmentUseCase attachments, AttachmentPreviewUseCase attachmentPreviews,
                            TaskUseCase tasks,
@@ -44,7 +45,7 @@ public final class RuntimeServices implements DeadlineCloseable {
                            Consumer<ShutdownDeadline> closeAction) {
         this.closeAction = Objects.requireNonNull(closeAction, "closeAction");
         this.bindings = new RpcServiceBindings(
-                workspaces, workspacePathSearch, threads, turns, compactions, approvals, catalog,
+                workspaces, workspacePathSearch, threads, threadMcp, turns, compactions, approvals, catalog,
                 attachments, attachmentPreviews, tasks, goals, interactions, this);
     }
 

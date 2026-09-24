@@ -21,6 +21,8 @@ interface SnapshotItemBase {
 /** 与平坦 items 并列的权威 Turn 元数据，失败码不包含服务端错误正文。 */
 interface TimelineSnapshotTurn {
   turnId: string;
+  /** 隐藏 continuation 在 reload 时回到原问题 exchange；普通与 reask Turn 显式为 null。 */
+  sourceMessageId?: string | null;
   status: TimelineTurnState;
   requestedAt: string;
   updatedAt: string;
@@ -250,6 +252,7 @@ export type TimelineEvent =
       "turn/state-changed",
       SemanticBase & { from: TimelineTurnState; to: TimelineTurnState }
     >
+  | EventEnvelope<"turn/retry-started", SemanticBase & { attempt: number; maxAttempts: 6 }>
   | EventEnvelope<
       "assistant/model-step-committed",
       SemanticBase & {
@@ -391,6 +394,7 @@ const TIMELINE_METHODS = new Set<TimelineEvent["method"]>([
   "turn/input-consumed",
   "turn/messages_received",
   "turn/state-changed",
+  "turn/retry-started",
   "assistant/model-step-committed",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",
@@ -412,6 +416,7 @@ const WORKSPACE_SCOPED_METHODS = new Set<TimelineEvent["method"]>([
   "turn/input-consumed",
   "turn/messages_received",
   "turn/state-changed",
+  "turn/retry-started",
   "assistant/model-step-committed",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",

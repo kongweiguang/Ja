@@ -6,7 +6,7 @@ package io.github.kongweiguang.ja.workspace.adapter.out.filesystem;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.github.kongweiguang.ja.workspace.domain.WorkspaceDirectory;
@@ -19,7 +19,7 @@ import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
-/** 验证 NIO 文件适配器的目录真实性、通用目录和链接拒绝语义。 */
+/** 验证 NIO 文件适配器的项目、独立会话目录真实性和链接拒绝语义。 */
 final class NioWorkspaceDirectoryAdapterTest {
     @TempDir
     private Path temporaryDirectory;
@@ -29,13 +29,14 @@ final class NioWorkspaceDirectoryAdapterTest {
     void verifiesExistingProjectDirectory() throws IOException {
         Path data = Files.createDirectory(temporaryDirectory.resolve("data"));
         Path project = Files.createDirectory(temporaryDirectory.resolve("project"));
-        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data);
+        Path home = Files.createDirectory(temporaryDirectory.resolve("home"));
+        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data, home);
 
         WorkspaceDirectory verified = adapter.verifyProjectDirectory(project);
 
         assertEquals(project.toRealPath(), verified.root());
         assertEquals(WorkspaceDirectory.Kind.PROJECT, verified.kind());
-        assertFalse(adapter.isGeneralDirectory(verified.root()));
+        assertFalse(adapter.isLegacySharedDirectory(verified.root()));
     }
 
     /** Windows 命名空间路径可能同时携带 8.3 别名；允许词法别名但仍返回唯一物理根。 */
@@ -44,31 +45,40 @@ final class NioWorkspaceDirectoryAdapterTest {
     void acceptsWindowsPathAliasForExistingProjectDirectory() throws IOException {
         Path data = Files.createDirectory(temporaryDirectory.resolve("alias-data"));
         Path project = Files.createDirectory(temporaryDirectory.resolve("alias-project"));
+        Path home = Files.createDirectory(temporaryDirectory.resolve("alias-home"));
         Path namespaced = Path.of("\\\\?\\" + project.toAbsolutePath());
-        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data);
+        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data, home);
 
         WorkspaceDirectory verified = adapter.verifyProjectDirectory(namespaced);
 
         assertEquals(project.toRealPath(), verified.root());
     }
 
-    /** 通用目录只能由 Java 在固定 data/general-workspace 位置创建并标记。 */
+    /** 主 Thread ID 决定空会话目录，重复创建只接受仍为空的残留目录。 */
     @Test
-    void createsGeneralDirectoryInsideDataBoundary() throws IOException {
-        Path data = temporaryDirectory.resolve("data");
-        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data);
+    void createsDistinctEmptySessionDirectoriesInsideJaHome() throws IOException {
+        Path data = Files.createDirectory(temporaryDirectory.resolve("data"));
+        Path home = Files.createDirectory(temporaryDirectory.resolve("home"));
+        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data, home);
 
-        WorkspaceDirectory general = adapter.ensureGeneralDirectory();
+        WorkspaceDirectory first = adapter.createSessionDirectory("thr_first");
+        WorkspaceDirectory second = adapter.createSessionDirectory("thr_second");
 
-        assertEquals(data.resolve("general-workspace").toRealPath(), general.root());
-        assertEquals(WorkspaceDirectory.Kind.GENERAL, general.kind());
-        assertTrue(adapter.isGeneralDirectory(general.root()));
+        assertEquals(home.resolve("workspaces/thr_first").toRealPath(), first.root());
+        assertEquals(home.resolve("workspaces/thr_second").toRealPath(), second.root());
+        assertEquals(WorkspaceDirectory.Kind.SESSION, first.kind());
+        assertNotEquals(first.root(), second.root());
+        assertEquals(first, adapter.verifySessionDirectory("thr_first", first.root()));
+        assertFalse(Files.exists(data.resolve("general-workspace")));
+        assertThrows(IllegalArgumentException.class,
+                () -> adapter.createSessionDirectory("thr_first/../other"));
     }
 
     /** symlink 能力不可用时跳过环境门禁；一旦创建成功就必须以约束错误拒绝。 */
     @Test
     void rejectsSymbolicLinkWorkspaceRoot() throws IOException {
         Path data = Files.createDirectory(temporaryDirectory.resolve("data"));
+        Path home = Files.createDirectory(temporaryDirectory.resolve("home"));
         Path target = Files.createDirectory(temporaryDirectory.resolve("target"));
         Path link = temporaryDirectory.resolve("link");
         try {
@@ -77,7 +87,7 @@ final class NioWorkspaceDirectoryAdapterTest {
             assumeTrue(false, "当前文件系统不允许创建 symlink: " + unavailable.getClass().getSimpleName());
             return;
         }
-        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data);
+        NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(data, home);
 
         WorkspaceFailure failure = assertThrows(
                 WorkspaceFailure.class, () -> adapter.verifyProjectDirectory(link));
@@ -89,7 +99,7 @@ final class NioWorkspaceDirectoryAdapterTest {
     @Test
     void rejectsMissingDirectory() {
         NioWorkspaceDirectoryAdapter adapter = new NioWorkspaceDirectoryAdapter(
-                temporaryDirectory.resolve("data"));
+                temporaryDirectory.resolve("data"), temporaryDirectory.resolve("home"));
 
         WorkspaceFailure failure = assertThrows(WorkspaceFailure.class,
                 () -> adapter.verifyProjectDirectory(temporaryDirectory.resolve("missing")));

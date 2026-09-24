@@ -36,7 +36,8 @@ public final class JaRpcCodec {
             "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",
             "approval/requested", "approval/resolved", "context/compaction-started", "context/compacted",
             "context/compaction-failed",
-            "workspace/dirty", "turn/input-queue-changed", "turn/input-consumed", "turn/messages_received", "turn/terminal",
+            "workspace/dirty", "turn/input-queue-changed", "turn/input-consumed", "turn/retry-started",
+            "turn/messages_received", "turn/terminal",
             "thread/metadata-changed", "configuration/changed",
             "task/activity", "task/progress", "task/mailbox-changed",
             "goal/changed", "goal/activity", "interaction/changed", "plan/changed");

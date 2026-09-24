@@ -12,7 +12,7 @@ Configuration and credential mutations require `expectedVersion` and return the 
 `credential/reveal-provider`, which is limited to the API Key currently bound to an explicitly selected Provider.
 `configuration/replace` is a discriminated strict union: `scope:"user"` accepts the complete v2 user
 document, while `scope:"project"` requires a trusted `workspaceId` and accepts only
-`{schema_version:2,config_revision,skills,disabled_skills?}`. A failed write leaves the last accepted
+`{schema_version:2,config_revision,skills,disabled_skills?,mcp_servers?}`. A failed write leaves the last accepted
 projection unchanged; the caller must read back before retrying.
 
 `configuration/restore` accepts only the current user-layer CAS version. Java creates a sibling backup of
@@ -20,9 +20,22 @@ the current readable TOML before atomically restoring its latest fully usable sn
 `{accepted:true,scope:"user",version}` mutation result; missing or invalid snapshots fail without changing the
 raw configuration file.
 List methods return `{items,nextCursor}`. Successful
-`turn/start` and `turn/resume` return the same exact admission receipt field set
-`{accepted:true,queued:boolean,turnId,threadRevision}`. `turn/start` may report `queued:false` when execution starts immediately;
+`turn/start`, `turn/continue`, `turn/reask`, and `turn/resume` return the same exact admission receipt field set
+`{accepted:true,queued:boolean,turnId,threadRevision}`. A new Turn may report `queued:false` when execution starts immediately;
 `turn/resume` always reports `queued:true` because it transitions the existing Operation from `suspended` to `queued` and never creates or returns another Operation identity.
+
+`thread/mcp/read` returns exactly
+`{threadId,source,notices,catalogRevision?,observedAt?,servers:[{serverId,name,scope,state,toolCount?,reasonCode?}]}`.
+Unknown optional values are omitted rather than serialized as null; in particular an unknown tool count is
+not reported as zero. The result contains no endpoint, environment, header, credential, or full tool schema.
+Server names follow the configured 1..512 text bound (NUL is rejected; CR/LF are preserved as JSON text),
+known tool counts are integers from 0 through 10,000, and reason codes use the bounded uppercase identifier form.
+`thread/mcp/read` projects the Thread's current observation without connecting to a service. Its `scope`
+identifies global or project ownership. A running Turn retains its frozen catalog; a changed configuration
+adds `configuration_changed` until the next request. Project trust and configuration errors use short notice codes.
+Connection testing remains under `mcp/test` in Settings and accepts an optional `workspaceId`.
+
+`thread/read.turns[].sourceMessageId` is required and nullable. It identifies the original USER item only for a hidden `turn/continue` Turn; ordinary and replacement USER Turns carry null. `thread/read` selects the current path while preserving displaced Turn, Tool, attachment, and Usage records for audit. Context Usage comes from the current path; `thread/usage/read` still accounts for every actual request.
 
 `turn/recovery/respond` returns exactly `{accepted:true,turnId,threadRevision,decision,resumed}`. `resumed:false` means the selected resolution committed but an earlier or later unknown Tool still prevents ordinary continuation; it is not a failed submission. This ACK never represents a Tool success, a file verification, or a terminal Turn state.
 

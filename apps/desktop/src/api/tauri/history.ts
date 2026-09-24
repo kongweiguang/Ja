@@ -7,8 +7,11 @@ import {
   ThreadIdSchema,
   ThreadReadResultSchema,
   ThreadUsageSummarySchema,
+  ThreadMcpStatusResultSchema,
+  ParamsSchemaByMethod,
   ThreadSchema,
   WorkspaceIdSchema,
+  WorkspaceKindSchema,
   WorkspaceSchema,
   ProviderIdSchema,
   ModelIdSchema,
@@ -40,6 +43,7 @@ export const JA_HISTORY_COMMANDS = {
   threadSearch: "ja_thread_search",
   threadRead: "ja_thread_read",
   threadUsageRead: "ja_thread_usage_read",
+  threadMcpRead: "ja_thread_mcp_read",
   threadRename: "ja_thread_rename",
   threadPin: "ja_thread_pin",
   threadSeen: "ja_thread_seen",
@@ -56,6 +60,9 @@ const PageInputSchema = z
     limit: z.number().int().min(1).max(200).optional(),
   })
   .strict();
+const WorkspaceListInputSchema = PageInputSchema.extend({
+  kind: WorkspaceKindSchema.optional(),
+}).strict();
 const WorkspaceOpenInputSchema = z
   .object({
     cwd: z
@@ -68,7 +75,7 @@ const WorkspaceOpenInputSchema = z
   .strict();
 const ThreadCreateInputSchema = z
   .object({
-    cwd: z.string().min(1).max(4_096).nullable().optional(),
+    cwd: z.string().min(1).max(4_096).optional(),
     title: z.string().min(1).max(512),
     providerId: ProviderIdSchema,
     modelId: ModelIdSchema,
@@ -77,13 +84,19 @@ const ThreadCreateInputSchema = z
     collaborationMode: CollaborationModeSchema,
   })
   .strict();
-const ThreadListInputSchema = PageInputSchema.extend({ workspaceId: WorkspaceIdSchema }).strict();
+const ThreadListInputSchema = z.union([
+  PageInputSchema.extend({ workspaceId: WorkspaceIdSchema }).strict(),
+  PageInputSchema.extend({ workspaceKind: z.literal("session") }).strict(),
+]);
 /** 全局会话发现保持独立输入形状；scope 是与普通 Workspace 列表互斥的语义判别字段。 */
 const ThreadDiscoverInputSchema = ThreadDiscoveryParamsSchema;
-const ThreadSearchInputSchema = PageInputSchema.extend({
-  workspaceId: WorkspaceIdSchema,
-  query: z.string().max(256),
-}).strict();
+const ThreadSearchInputSchema = z.union([
+  PageInputSchema.extend({ workspaceId: WorkspaceIdSchema, query: z.string().max(256) }).strict(),
+  PageInputSchema.extend({
+    workspaceKind: z.literal("session"),
+    query: z.string().max(256),
+  }).strict(),
+]);
 const ThreadReadInputSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -93,6 +106,7 @@ const ThreadReadInputSchema = z
   .strict();
 /** 累计账本只按 Thread 身份读取；React 不提交范围、过滤器或计价参数。 */
 const ThreadUsageReadInputSchema = z.object({ threadId: ThreadIdSchema }).strict();
+const ThreadMcpReadInputSchema = ParamsSchemaByMethod["thread/mcp/read"];
 const ThreadMutationInputSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -164,13 +178,14 @@ const ThreadListResultSchema = z
 export type HistoryWorkspace = z.infer<typeof WorkspaceSchema>;
 export type HistoryWorkspaceOpenInput = z.infer<typeof WorkspaceOpenInputSchema>;
 export type HistoryThread = Thread;
-export type HistoryWorkspaceListInput = z.infer<typeof PageInputSchema>;
+export type HistoryWorkspaceListInput = z.infer<typeof WorkspaceListInputSchema>;
 export type HistoryThreadCreateInput = z.infer<typeof ThreadCreateInputSchema>;
 export type HistoryThreadListInput = z.infer<typeof ThreadListInputSchema>;
 export type HistoryThreadDiscoverInput = z.infer<typeof ThreadDiscoverInputSchema>;
 export type HistoryThreadSearchInput = z.infer<typeof ThreadSearchInputSchema>;
 export type HistoryThreadReadInput = z.infer<typeof ThreadReadInputSchema>;
 export type HistoryThreadUsageReadInput = z.infer<typeof ThreadUsageReadInputSchema>;
+export type HistoryThreadMcpReadInput = z.infer<typeof ThreadMcpReadInputSchema>;
 export type HistoryThreadRenameInput = z.infer<typeof ThreadRenameInputSchema>;
 export type HistoryThreadPreferencesUpdateInput = z.infer<
   typeof ThreadPreferencesUpdateInputSchema
@@ -189,6 +204,7 @@ export interface HistoryThreadDiscoverResult {
 }
 export type HistoryThreadReadResult = ThreadReadResult;
 export type HistoryThreadUsageSummary = ThreadUsageSummary;
+export type HistoryThreadMcpStatusResult = z.infer<typeof ThreadMcpStatusResultSchema>;
 
 export interface HistoryWorkspaceListResult {
   items: HistoryWorkspace[];
@@ -210,6 +226,8 @@ export interface HistoryAdapter {
   threadRead(input: HistoryThreadReadInput): Promise<HistoryThreadReadResult>;
   /** 用量在旧注入式测试 adapter 中可缺席；生产 adapter 固定提供此只读能力。 */
   threadUsageRead?: (input: HistoryThreadUsageReadInput) => Promise<HistoryThreadUsageSummary>;
+  /** MCP status is queried only while the header popover is open. */
+  threadMcpRead?: (input: HistoryThreadMcpReadInput) => Promise<HistoryThreadMcpStatusResult>;
   threadRename(input: HistoryThreadRenameInput): Promise<HistoryThread>;
   threadPreferencesUpdate(input: HistoryThreadPreferencesUpdateInput): Promise<HistoryThread>;
   threadPin(input: HistoryThreadPinInput): Promise<HistoryThread>;
@@ -267,13 +285,13 @@ export class TauriHistoryAdapter implements HistoryAdapter {
     );
   }
 
-  /** 通过冻结的 cursor page 形状列出持久 workspace，避免分页契约漂移。 */
+  /** 按服务端 kind 过滤后分页列目录，避免 session 根目录挤占项目目录首屏。 */
   async workspaceList(input: HistoryWorkspaceListInput = {}): Promise<HistoryWorkspaceListResult> {
     return invokeHistory(
       this.bridge,
       JA_HISTORY_COMMANDS.workspaceList,
       input,
-      PageInputSchema,
+      WorkspaceListInputSchema,
       WorkspaceListResultSchema,
     );
   }
@@ -341,6 +359,17 @@ export class TauriHistoryAdapter implements HistoryAdapter {
       input,
       ThreadUsageReadInputSchema,
       ThreadUsageSummarySchema,
+    );
+  }
+
+  /** Read the real thread-scoped MCP projection; the renderer cannot enumerate configuration secrets. */
+  threadMcpRead(input: HistoryThreadMcpReadInput): Promise<HistoryThreadMcpStatusResult> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadMcpRead,
+      input,
+      ThreadMcpReadInputSchema,
+      ThreadMcpStatusResultSchema,
     );
   }
 

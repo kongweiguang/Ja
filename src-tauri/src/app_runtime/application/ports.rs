@@ -13,9 +13,10 @@ use crate::app_runtime::domain::{
     TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
     TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
     ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
-    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
-    WorkspaceDto, WorkspacePathSearchInput, WorkspacePathSearchResult,
+    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnContinueInput, TurnInputDelete,
+    TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnReaskInput,
+    TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspacePathSearchInput,
+    WorkspacePathSearchResult,
 };
 use ja_runtime::app_server_process::{
     AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
@@ -90,6 +91,8 @@ define_operation_payload!(
     ThreadReadResultData,
     ThreadUsageReadParams,
     ThreadUsageReadResultData,
+    ThreadMcpReadParams,
+    ThreadMcpReadResultData,
     ThreadRenameParams,
     ThreadRenameResultData,
     ThreadPinParams,
@@ -154,6 +157,7 @@ pub(crate) enum HistoryRequest {
     ThreadSearch(ThreadSearchParams),
     ThreadRead(ThreadReadParams),
     ThreadUsageRead(ThreadUsageReadParams),
+    ThreadMcpRead(ThreadMcpReadParams),
     ThreadRename(ThreadRenameParams),
     ThreadPin(ThreadPinParams),
     ThreadSeen(ThreadSeenParams),
@@ -173,6 +177,7 @@ pub(crate) enum HistoryResponse {
     ThreadSearch(ThreadSearchResultData),
     ThreadRead(ThreadReadResultData),
     ThreadUsageRead(ThreadUsageReadResultData),
+    ThreadMcpRead(ThreadMcpReadResultData),
     ThreadRename(ThreadRenameResultData),
     ThreadPin(ThreadPinResultData),
     ThreadSeen(ThreadSeenResultData),
@@ -218,7 +223,13 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
         display_name: String,
         trust: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError>;
-    fn general_workspace(&self) -> Result<WorkspaceDto, RuntimeCommandError>;
+    /// 只用 Java workspace identity 重开已登记会话或旧共享根，绝不接受 WebView 路径。
+    fn workspace_open_by_id(
+        &self,
+        _workspace_id: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     /// 路径搜索默认失败关闭，只有生产 Java owner 或明确 fixture 可返回当前 generation 结果。
     fn workspace_path_search(
         &self,
@@ -228,6 +239,17 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
     }
     fn health(&self) -> Result<(), RuntimeCommandError>;
     fn turn_start(&self, input: TurnStartInput) -> Result<TurnAccepted, RuntimeCommandError>;
+    /// 隐藏 continuation 是不含可见 USER 消息的新 Turn，源问题由 Java owner 解析。
+    fn turn_continue(
+        &self,
+        _input: TurnContinueInput,
+    ) -> Result<TurnAccepted, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 只有 Java 校验未答源问题并通过 revision CAS 后，Reask 才能切换当前路径。
+    fn turn_reask(&self, _input: TurnReaskInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     fn turn_cancel(&self, input: TurnCancelInput) -> Result<TurnCancelResult, RuntimeCommandError>;
     /// 既有 fake 默认不声称支持持久恢复；生产 bridge 必须显式覆盖并路由到 Java owner。
     fn turn_resume(&self, _input: TurnResumeInput) -> Result<TurnAccepted, RuntimeCommandError> {

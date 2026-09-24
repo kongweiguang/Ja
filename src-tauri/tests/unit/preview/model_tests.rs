@@ -86,6 +86,50 @@ fn open_emits_snapshot_and_event() {
     assert!(matches!(events[0].kind, PreviewEventKind::Opened { .. }));
 }
 
+/// 空白页仍走相同加载完成闭环；匹配 completion 后 watchdog 不会再把它视作 Loading。
+#[test]
+fn blank_page_finishes_when_engine_reports_about_blank() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager.open_blank().expect("open blank");
+    assert_eq!(opened.snapshot.url.as_str(), "about:blank");
+    assert_eq!(opened.snapshot.load_status, PreviewLoadStatus::Loading);
+    assert_eq!(
+        crate::preview::commands::current_loading_generation(&manager, opened.snapshot.id),
+        Some(opened.snapshot.generation)
+    );
+
+    let event = manager
+        .callback_load_finished(
+            opened.snapshot.id,
+            opened.snapshot.generation,
+            "about:blank",
+        )
+        .expect("about:blank completion")
+        .expect("finished event");
+    assert!(matches!(event.kind, PreviewEventKind::LoadFinished { .. }));
+    assert_eq!(
+        manager
+            .snapshot(opened.snapshot.id)
+            .expect("finished snapshot")
+            .load_status,
+        PreviewLoadStatus::Finished
+    );
+    assert!(
+        crate::preview::commands::current_loading_generation(&manager, opened.snapshot.id)
+            .is_none()
+    );
+    assert!(
+        manager
+            .callback_load_finished(
+                opened.snapshot.id,
+                opened.snapshot.generation,
+                "about:blank",
+            )
+            .expect("duplicate completion")
+            .is_none()
+    );
+}
+
 /// 原生可见性只在平台操作成功后推进，重复 resize 可据此跳过 WebView2 show。
 #[test]
 fn native_visibility_is_internal_and_explicitly_committed() {
@@ -308,14 +352,9 @@ fn native_close_failure_retains_identity_and_ack_finalize_removes_it() {
 }
 
 #[test]
-/// 确认重复打开与 ACK-close 始终受单会话预算约束，不保留已关闭的重放队列或 tombstone。
+/// 确认重复 ACK-close 不保留已关闭的重放队列或 tombstone。
 fn repeated_acknowledged_closes_do_not_accumulate_sessions_or_events() {
-    let policy = PreviewPolicy::with_limits(PreviewLimits {
-        max_sessions: 1,
-        ..PreviewLimits::default()
-    })
-    .expect("policy");
-    let manager = PreviewManager::new(policy).expect("manager");
+    let manager = PreviewManager::default_manager().expect("manager");
     for index in 0..128 {
         let opened = manager
             .open(&format!("https://example.test/{index}"))
@@ -383,18 +422,202 @@ fn event_queue_is_bounded_and_drops_old_history() {
     );
 }
 
-/// 确认会话注册表严格执行容量上限，避免远端页面耗尽 native WebView 资源。
+/// 确认 tab 数量不再受原生 adapter 的旧八页产品上限约束。
 #[test]
-fn session_limit_is_enforced() {
-    let policy = PreviewPolicy::with_limits(PreviewLimits {
-        max_sessions: 1,
-        ..PreviewLimits::default()
-    })
-    .expect("policy");
-    let manager = PreviewManager::new(policy).expect("manager");
-    manager.open("https://example.test/").expect("open");
+fn preview_manager_has_no_eight_session_product_cap() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = (0..16)
+        .map(|index| {
+            manager
+                .open(&format!("https://example.test/{index}"))
+                .expect("open without product cap")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(manager.active_count().expect("active count"), 16);
+    for page in opened {
+        let ticket = manager
+            .prepare_close(page.snapshot.id)
+            .expect("prepare close");
+        manager.finalize_close(ticket).expect("close ACK");
+    }
+    assert_eq!(manager.active_count().expect("empty after close"), 0);
+}
+
+/// 远程页面只有在主 UI 显式签发精确文件目标后才能导航到 file://。
+#[test]
+fn local_navigation_requires_an_explicit_exact_file_grant() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager.open("https://example.test/").expect("remote page");
+    let target = url::Url::parse("file:///C:/work/说明%20文件.html").expect("file URL");
     assert_eq!(
-        manager.open("https://example.test/2").unwrap_err().code(),
-        PreviewErrorCode::SessionLimit
+        manager
+            .navigation_request(
+                opened.snapshot.id,
+                opened.snapshot.generation,
+                NavigationSource::User,
+                target.as_str(),
+            )
+            .expect_err("remote page cannot self-navigate to files")
+            .code(),
+        PreviewErrorCode::SchemeNotAllowed
+    );
+    manager
+        .local_file_navigation_request(
+            opened.snapshot.id,
+            opened.snapshot.generation,
+            target.as_str(),
+        )
+        .expect("explicit user grant");
+    let event = manager
+        .callback_navigation(
+            opened.snapshot.id,
+            opened.snapshot.generation,
+            target.as_str(),
+        )
+        .expect("matching WebView callback");
+    assert!(matches!(
+        event.kind,
+        PreviewEventKind::NavigationCommitted { ref url, .. } if url.as_str() == target.as_str()
+    ));
+    assert_eq!(
+        manager
+            .snapshot(opened.snapshot.id)
+            .expect("snapshot")
+            .generation,
+        2
+    );
+}
+
+/// 受控 Back/Forward 只能给下一次 history callback 一次文件通行权，未匹配来源或过期许可不能放宽远程页面。
+#[test]
+fn file_history_navigation_uses_one_shot_ui_grant() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager
+        .open("https://example.test/start")
+        .expect("remote page");
+    let id = opened.snapshot.id;
+    let file_url = "file:///C:/work/preview.html";
+
+    manager
+        .local_file_navigation_request(id, opened.snapshot.generation, file_url)
+        .expect("explicit local file open");
+    let file_event = manager
+        .callback_navigation(id, opened.snapshot.generation, file_url)
+        .expect("file open callback");
+    let file_generation = file_event.generation;
+
+    let back_token = manager
+        .prepare_history_navigation(id, file_generation)
+        .expect("controlled Back grant");
+    let back_event = manager
+        .callback_navigation(id, file_generation, "https://example.test/start")
+        .expect("Back to remote history item");
+    assert_eq!(back_event.generation, file_generation + 1);
+
+    let forward_token = manager
+        .prepare_history_navigation(id, back_event.generation)
+        .expect("controlled Forward grant");
+    let forward_event = manager
+        .callback_navigation(id, back_event.generation, file_url)
+        .expect("Forward to prior local history item");
+    assert_eq!(forward_event.generation, back_event.generation + 1);
+    assert_eq!(
+        manager.snapshot(id).expect("snapshot").url.as_str(),
+        file_url
+    );
+
+    // 后续远程导航离开本地页后，已消费的 grant 不能重复使用。
+    manager
+        .callback_navigation(id, forward_event.generation, "https://example.test/again")
+        .expect("remote history item");
+    let remote_generation = manager.snapshot(id).expect("remote snapshot").generation;
+    assert_eq!(
+        manager
+            .callback_navigation(id, remote_generation, file_url)
+            .expect_err("remote page cannot repeat history file access")
+            .code(),
+        PreviewErrorCode::SchemeNotAllowed
+    );
+
+    // 较早 timer 只清除自己的 token，不能撤销较新的 Back/Forward 操作。
+    let expired = manager
+        .prepare_history_navigation(id, remote_generation)
+        .expect("old grant");
+    manager
+        .clear_pending_history_navigation(id, expired)
+        .expect("expire old grant");
+    let active = manager
+        .prepare_history_navigation(id, remote_generation)
+        .expect("new grant");
+    manager
+        .clear_pending_history_navigation(id, expired)
+        .expect("old timer cleanup");
+    let allowed = manager
+        .callback_navigation(id, remote_generation, file_url)
+        .expect("new grant remains active");
+    assert_eq!(allowed.generation, remote_generation + 1);
+    manager
+        .clear_pending_history_navigation(id, active)
+        .expect("consumed grant cleanup is idempotent");
+    assert_eq!(back_token + 1, forward_token);
+}
+
+/// 未触发 history callback 的 timer 到期后撤销一次性 grant，不允许任意远程 redirect 借用许可。
+#[test]
+fn expired_file_history_grant_cannot_authorize_remote_redirect() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager
+        .open("https://example.test/start")
+        .expect("remote page");
+    let token = manager
+        .prepare_history_navigation(opened.snapshot.id, opened.snapshot.generation)
+        .expect("controlled history grant");
+    manager
+        .clear_pending_history_navigation(opened.snapshot.id, token)
+        .expect("timeout cleanup");
+
+    assert_eq!(
+        manager
+            .callback_navigation(
+                opened.snapshot.id,
+                opened.snapshot.generation,
+                "file:///C:/work/redirected.html",
+            )
+            .expect_err("expired grant cannot authorize file redirect")
+            .code(),
+        PreviewErrorCode::SchemeNotAllowed
+    );
+}
+
+/// 仅 WebView2 HistoryChanged 更新前进/后退状态，陈旧 generation 必须被拒绝。
+#[test]
+fn history_snapshot_tracks_native_capabilities_and_rejects_stale_events() {
+    let manager = PreviewManager::default_manager().expect("manager");
+    let opened = manager.open("https://example.test/").expect("open");
+    let event = manager
+        .callback_history_changed(opened.snapshot.id, opened.snapshot.generation, true, false)
+        .expect("history event")
+        .expect("state changed");
+    assert!(matches!(
+        event.kind,
+        PreviewEventKind::HistoryChanged {
+            can_go_back: true,
+            can_go_forward: false
+        }
+    ));
+    let snapshot = manager.snapshot(opened.snapshot.id).expect("snapshot");
+    assert!(snapshot.can_go_back);
+    assert!(!snapshot.can_go_forward);
+    assert_eq!(
+        manager
+            .callback_history_changed(
+                opened.snapshot.id,
+                opened.snapshot.generation + 1,
+                false,
+                true
+            )
+            .expect_err("stale generation")
+            .code(),
+        PreviewErrorCode::StaleGeneration
     );
 }

@@ -282,13 +282,13 @@ public final class PlanGoalAgentCapability implements AgentCapability {
         }
 
         /**
-         * Tool 闭集由持久 origin 与 Plan 状态共同决定；普通 Default Turn 永远不获得内部 Goal Tool。
+         * Tool 闭集由持久 origin 与 Plan 状态共同决定；用户续答保留原 PLAN 资格但不取得 Goal 身份。
          * 提案只能从 DRAFT 冻结，草稿编辑则复用仓储允许的非执行状态，避免把一个“能调用但必然失败”的
          * 内部 Tool 送入模型目录，也避免旧 prompt 在执行中或终态重新获得编辑入口。
          */
         private boolean allows(String toolName) {
             return switch (origin) {
-                case USER, CHILD_TASK -> collaborationMode == CollaborationMode.PLAN
+                case USER, USER_CONTINUATION, CHILD_TASK -> collaborationMode == CollaborationMode.PLAN
                         && allowsPlanMutation(planContext, toolName);
                 case GOAL_CONTINUATION -> goalContext.status() == GoalModels.GoalStatus.ACTIVE
                         && goalContext.phase() == GoalModels.GoalPhase.WORKING

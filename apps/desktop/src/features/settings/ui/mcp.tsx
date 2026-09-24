@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
+import * as Tabs from "@radix-ui/react-tabs";
 import {
   ChevronDown,
   CircleAlert,
@@ -68,14 +69,24 @@ function createMcpCredentialRef(): string {
 /** 把 runtime 状态收敛为短中文状态，列表保持可扫描且不把 unknown 误报为已连接。 */
 function mcpStatusLabel(status: McpServerProjection["status"]): string {
   return status === "connected"
-    ? "已连接"
+    ? "服务已连接"
     : status === "disabled"
       ? "已停用"
       : status === "testing"
         ? "检查中"
         : status === "unknown"
           ? "未检查"
-          : "连接错误";
+          : "不可用";
+}
+
+/** 未探测、失败或停用时不把空投影冒充为真实的零工具目录。 */
+function mcpToolCountLabel(server: McpServerProjection): string {
+  if (!server.enabled || server.status === "disabled") return "已停用";
+  if (server.status === "unknown") return "工具未检查";
+  if (server.status === "testing") return "正在检查工具";
+  if (server.status === "error") return "工具不可用";
+  if (server.lastError !== undefined) return "工具目录读取失败";
+  return `${server.tools.length} 个工具`;
 }
 
 /**
@@ -84,6 +95,9 @@ function mcpStatusLabel(status: McpServerProjection["status"]): string {
  */
 export function McpSection({
   servers,
+  projectServers,
+  projectAvailable = false,
+  projectWorkspaceId,
   snapshotRevision = 0,
   onSaveMcp,
   onDeleteMcp,
@@ -92,14 +106,18 @@ export function McpSection({
   onClearCredential,
 }: {
   servers: McpServerProjection[];
+  projectServers?: McpServerProjection[];
+  projectAvailable?: boolean;
+  projectWorkspaceId?: string;
   snapshotRevision?: number;
   onSaveMcp: SettingsPorts["onSaveMcp"];
   onDeleteMcp: SettingsPorts["onDeleteMcp"];
   onTestMcp: SettingsPorts["onTestMcp"];
-  onCloseMcp: SettingsPorts["onCloseMcp"];
   onReplaceCredential: SettingsPorts["onReplaceCredential"];
   onClearCredential: SettingsPorts["onClearCredential"];
 }): ReactElement {
+  const [scope, setScope] = useState<"user" | "project">(projectAvailable ? "project" : "user");
+  const visibleServers = scope === "project" ? (projectServers ?? []) : servers;
   const [feedback, setFeedback] = useState<string>();
   const [pending, setPending] = useState<string>();
   // 默认先展示列表；创建服务必须由用户显式发起，避免进入页面就产生草稿状态。
@@ -124,6 +142,14 @@ export function McpSection({
   const authKind = watch("authKind");
   const credentialRef = watch("credentialRef");
   const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  /** 工作区切换时撤销旧项目表单，避免保存到新的项目身份。 */
+  useEffect(() => {
+    setScope(projectAvailable ? "project" : "user");
+    setEditorOpen(false);
+    setDeleteTarget(undefined);
+    setFeedback(undefined);
+  }, [projectAvailable, projectWorkspaceId]);
   const firstErrorField = Object.keys(formState.errors)[0] as
     | keyof McpServerDraft
     | "root"
@@ -210,7 +236,7 @@ export function McpSection({
     if (!validateMcpDraft(values, setError)) return;
     const payload = toMcpSavePayload(values);
     try {
-      await onSaveMcp(payload);
+      await onSaveMcp(payload, scope);
       reset(EMPTY_MCP_DRAFT);
       setEditingServer(undefined);
       setEditorOpen(false);
@@ -231,17 +257,20 @@ export function McpSection({
     setFeedback(undefined);
     setPending(server.id);
     try {
-      await onSaveMcp({
-        mcpRevision: server.mcpRevision,
-        name: server.name,
-        transport: server.transport,
-        endpoint: server.endpoint,
-        args: [...server.args],
-        env: { ...server.env },
-        headers: { ...server.headers },
-        auth: { ...server.auth },
-        enabled,
-      });
+      await onSaveMcp(
+        {
+          mcpRevision: server.mcpRevision,
+          name: server.name,
+          transport: server.transport,
+          endpoint: server.endpoint,
+          args: [...server.args],
+          env: { ...server.env },
+          headers: { ...server.headers },
+          auth: { ...server.auth },
+          enabled,
+        },
+        scope,
+      );
     } catch (error) {
       toast.error(
         settingsMutationErrorMessage(error, `${server.name}${enabled ? "启用" : "停用"}失败`),
@@ -256,7 +285,7 @@ export function McpSection({
     if (deleteTarget === undefined) return;
     setPending(deleteTarget.id);
     try {
-      await onDeleteMcp(deleteTarget.id);
+      await onDeleteMcp(deleteTarget.id, scope);
       toast.success(`${deleteTarget.name} 已删除`);
       setDeleteTarget(undefined);
     } catch (error) {
@@ -266,22 +295,22 @@ export function McpSection({
     }
   };
 
-  /** 只能通过 Host 回调执行测试；未连接界面不得自行宣称健康状态。 */
+  /** 只能通过 Host 回调执行测试；Host 错误由 controller 投影，UI 不保留旧健康反馈。 */
   const testServer = async (server: McpServerProjection): Promise<void> => {
     setPending(server.id);
     setFeedback(undefined);
     try {
-      const status = await onTestMcp(server.id);
+      const status = await onTestMcp(server.id, scope);
       setFeedback(
         status === "connected"
-          ? `${server.name} 已连接。`
+          ? `${server.name} 服务已连接，工具目录已读取。`
           : `${server.name}：${mcpStatusLabel(status)}。`,
       );
-      if (status === "connected") toast.success(`${server.name} 已连接`);
+      if (status === "connected") toast.success(`${server.name} 服务已连接`);
       else toast.error(`${server.name}：${mcpStatusLabel(status)}`);
     } catch {
-      setFeedback(`${server.name} 测试失败。`);
-      toast.error(`${server.name} 测试失败`);
+      setFeedback(`${server.name} 检查请求未完成，请检查 sidecar 状态。`);
+      toast.error(`${server.name} 检查请求未完成`);
     } finally {
       setPending(undefined);
     }
@@ -291,7 +320,7 @@ export function McpSection({
     <div className="ja-settings-section ja-mcp-section">
       <SectionHeader
         title="MCP 工具"
-        description="连接外部工具，并按需启用。"
+        description="连接外部工具，并按需启用。此处检查服务目录，不代表当前会话已加载这些工具。"
         action={
           <Button
             type="button"
@@ -308,8 +337,23 @@ export function McpSection({
           </Button>
         }
       />
-      <div className="ja-mcp-list" aria-label="MCP 服务列表">
-        {servers.length === 0 ? (
+      <Tabs.Root value={scope} onValueChange={(value) => setScope(value as "user" | "project")}>
+        <Tabs.List className="ja-mcp-scope-tabs" aria-label="MCP 作用域">
+          <Tabs.Trigger value="user" disabled={pending !== undefined || editorOpen}>
+            全局
+          </Tabs.Trigger>
+          {projectAvailable ? (
+            <Tabs.Trigger value="project" disabled={pending !== undefined || editorOpen}>
+              当前项目
+            </Tabs.Trigger>
+          ) : null}
+        </Tabs.List>
+      </Tabs.Root>
+      <div
+        className="ja-mcp-list"
+        aria-label={scope === "project" ? "当前项目 MCP 服务" : "全局 MCP 服务"}
+      >
+        {visibleServers.length === 0 ? (
           <div className="ja-mcp-empty">
             <span className="ja-mcp-empty-icon" aria-hidden="true">
               <Server size={19} />
@@ -320,7 +364,7 @@ export function McpSection({
             </div>
           </div>
         ) : (
-          servers.map((server) => (
+          visibleServers.map((server) => (
             <article
               className={`ja-mcp-row ${server.enabled ? "is-enabled" : "is-disabled"}`}
               data-setting-id={`mcp-${server.id}`}
@@ -342,7 +386,7 @@ export function McpSection({
                   <div className="ja-mcp-row-details">
                     <span>{server.transport === "stdio" ? "本地进程" : "Streamable HTTP"}</span>
                     <code title={server.endpoint}>{server.endpoint}</code>
-                    <span>{server.tools.length} 个工具</span>
+                    <span>{mcpToolCountLabel(server)}</span>
                   </div>
                 </div>
                 <div className="ja-mcp-row-toggle">

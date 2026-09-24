@@ -13,6 +13,7 @@ import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSession;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
+import io.github.kongweiguang.ja.conversation.port.out.RuntimeLease;
 import io.github.kongweiguang.ja.conversation.port.out.TurnToolSessionFactory;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
@@ -177,10 +178,17 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
             Objects.requireNonNull(release, "release");
         }
 
+        /** 延迟会话观测，只有派发方真正跨过 Provider 边界后才发布。 */
+        public void observeProviderDispatch(boolean mcpGatewayExposed) {
+            if (release instanceof RuntimeLease) {
+                ((RuntimeLease) release).observeProviderDispatch(mcpGatewayExposed);
+            }
+        }
+
         /** 统一包装 checked close，避免资源释放异常逃逸成无法归类的类型。 */
         @Override public void close() {
-            try {
-                release.close();
+            try (release) {
+                // RequestRuntime owns this single release action and delegates its suppression behavior to TWR.
             } catch (Exception failure) {
                 throw new IllegalStateException("request runtime release failed", failure);
             }

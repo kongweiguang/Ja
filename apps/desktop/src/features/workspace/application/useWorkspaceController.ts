@@ -3,11 +3,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  workspaceFromGeneral,
+  workspaceFromActivation,
   workspaceFromHistory,
+  type WorkspaceKind,
   type WorkspaceProjection,
 } from "../domain/workspace";
-import type { GeneralWorkspaceRecord, WorkspaceHistoryPort, WorkspaceRuntimeState } from "./ports";
+import type {
+  WorkspaceActivationRecord,
+  WorkspaceHistoryPort,
+  WorkspaceRuntimeState,
+} from "./ports";
 
 /** 目录选择端口由 App composition 注入，application 不直接创建 Tauri adapter。 */
 export interface WorkspacePickerPort {
@@ -18,8 +23,8 @@ export interface WorkspacePickerPort {
 type WorkspaceChangeRelease = () => void;
 
 /**
- * 在替换 native workspace capability 前冻结特权资源；拒绝代表旧范围未安全关闭，
- * controller 必须中止切换而不能暴露半完成的新投影。
+ * 项目与会话目录之间的切换需要回收 workspace 级资源；两个 session 之间只切 active id，
+ * 否则会误关后台 Thread 自己拥有的终端与预览。
  */
 type BeforeWorkspaceChange = (
   previousWorkspaceId: string,
@@ -29,7 +34,7 @@ type BeforeWorkspaceChange = (
 interface WorkspaceControllerOptions {
   history: WorkspaceHistoryPort;
   picker: WorkspacePickerPort;
-  generalWorkspace: () => Promise<GeneralWorkspaceRecord>;
+  activateWorkspace: (workspaceId: string) => Promise<WorkspaceActivationRecord>;
   runtimeState: WorkspaceRuntimeState | undefined;
   configurationReady: boolean;
   beforeWorkspaceChange: BeforeWorkspaceChange;
@@ -46,7 +51,7 @@ export interface WorkspaceController {
   error: string | undefined;
   revision: number;
   choose(): Promise<void>;
-  selectGeneral(): Promise<void>;
+  selectNoProject(): Promise<void>;
   select(workspaceId: string): Promise<void>;
   retryCatalog(): Promise<void>;
   activateForConversation(workspaceId: string): Promise<WorkspaceProjection | undefined>;
@@ -57,13 +62,13 @@ interface WorkspacePreparation {
 }
 
 /**
- * 独占 workspace 目录、活动身份和 native capability 切换；会话和设置只把当前身份作为输入，
- * 不在本 controller 保存 Thread 或配置文档，从而避免一次切换产生多个事实 owner。
+ * 独占项目选择、active Host activation 与设置 scope 切换；无项目入口只清空当前选择，
+ * 新建会话后再由 Java-issued id 激活专属目录，不为 blank state 绑定共享 cwd。
  */
 export function useWorkspaceController({
   history,
   picker,
-  generalWorkspace,
+  activateWorkspace,
   runtimeState,
   configurationReady,
   beforeWorkspaceChange,
@@ -77,32 +82,25 @@ export function useWorkspaceController({
   const [error, setError] = useState<string>();
   const [revision, setRevision] = useState(0);
   const workspaceRef = useRef<WorkspaceProjection | undefined>(undefined);
-  const generalWorkspaceIdRef = useRef<string | undefined>(undefined);
+  const retainedSessionWorkspaceRef = useRef<WorkspaceProjection | undefined>(undefined);
   const intentRef = useRef(0);
   const catalogRequestRef = useRef(0);
   const mountedRef = useRef(false);
-  const automaticGeneralKeyRef = useRef<string | undefined>(undefined);
 
-  /**
-   * 推进 workspace intent，同时取消旧目录请求；数值只用于 renderer 竞态栅栏，
-   * 不冒充 Java workspace revision。
-   */
+  /** 推进 workspace intent，同时取消旧目录请求；数值只用于 renderer 竞态栅栏。 */
   const beginIntent = useCallback((): number => {
     intentRef.current += 1;
     catalogRequestRef.current += 1;
     return intentRef.current;
   }, []);
 
-  /** 仅允许仍挂载且属于最新用户意图的异步 continuation 写入 workspace 状态。 */
+  /** 只允许仍挂载且属于最新用户意图的异步 continuation 写入 workspace 状态。 */
   const isCurrentIntent = useCallback(
     (intent: number): boolean => mountedRef.current && intentRef.current === intent,
     [],
   );
 
-  /**
-   * 刷新独立目录投影；活动 project 时禁止调用 generalWorkspace，因为该 native 命令会
-   * 重绑 Host，目录读取不能暗中改变 workspace capability。
-   */
+  /** 只把明确标记为 project 的 Java rows 放进项目区，session 根目录由 Thread kind 聚合。 */
   const refreshCatalog = useCallback(
     async (intent: number, retryOnce: boolean): Promise<void> => {
       const request = catalogRequestRef.current + 1;
@@ -114,21 +112,21 @@ export function useWorkspaceController({
       try {
         for (let attempt = 0; attempt < (retryOnce ? 2 : 1); attempt += 1) {
           try {
-            let generalId = generalWorkspaceIdRef.current;
-            if (generalId === undefined) {
-              if (workspaceRef.current?.kind === "project")
-                throw new Error("general workspace identity unavailable");
-              const general = await generalWorkspace();
-              generalId = general.workspaceId;
-              generalWorkspaceIdRef.current = generalId;
-            }
-            const listed = await history.workspaceList({ limit: 200 });
+            const items = [];
+            let cursor: string | undefined;
+            const visitedCursors = new Set<string>();
+            do {
+              const listed = await history.workspaceList({ kind: "project", limit: 200, cursor });
+              if (!current()) return;
+              items.push(...listed.items);
+              const nextCursor = listed.nextCursor ?? undefined;
+              if (nextCursor !== undefined && visitedCursors.has(nextCursor))
+                throw new Error("workspace/list repeated a cursor");
+              if (nextCursor !== undefined) visitedCursors.add(nextCursor);
+              cursor = nextCursor;
+            } while (cursor !== undefined);
             if (!current()) return;
-            setProjects(
-              listed.items
-                .filter((candidate) => candidate.workspaceId !== generalId)
-                .map(workspaceFromHistory),
-            );
+            setProjects(items.map(workspaceFromHistory));
             return;
           } catch {
             if (attempt + 1 >= (retryOnce ? 2 : 1)) break;
@@ -141,17 +139,23 @@ export function useWorkspaceController({
         if (current()) setCatalogLoading(false);
       }
     },
-    [generalWorkspace, history, isCurrentIntent],
+    [history, isCurrentIntent],
   );
 
   /**
-   * 在 native 替换前获取资源 fence；返回 lease 而不在这里提前释放，确保所有失败路径
-   * 都由同一 openWorkspace finally 收口。
+   * Session→session 与 session→blank 都不申请资源 fence，保证隐藏会话的 PTY 继续存活；
+   * 离开无项目分类进入项目时，仍以当前或保留的 session identity 汇总清理此前资源。
    */
   const prepareChange = useCallback(
-    async (nextWorkspaceId?: string): Promise<WorkspacePreparation> => {
-      const previous = workspaceRef.current;
+    async (
+      nextKind: WorkspaceKind | undefined,
+      nextWorkspaceId?: string,
+    ): Promise<WorkspacePreparation> => {
+      const previous = workspaceRef.current ?? retainedSessionWorkspaceRef.current;
       if (previous === undefined) return {};
+      if (previous.kind === "session" && (nextKind === "session" || nextKind === undefined))
+        return {};
+      if (workspaceRef.current === undefined && nextKind !== "project") return {};
       const release =
         (await beforeWorkspaceChange(previous.workspaceId, nextWorkspaceId)) ?? undefined;
       return { release };
@@ -160,8 +164,8 @@ export function useWorkspaceController({
   );
 
   /**
-   * 提交已经通过 native 校验的 workspace 投影；先关闭旧资源再替换投影，失败时 fail closed，
-   * revision 只在 commit 后递增，让 conversation controller 用它建立切换 fence。
+   * 提交已由 native 校验的 workspace projection；同一 session family 内不释放资源，
+   * 项目边界则先完成 fence，并只向 Settings 投影 project scope。
    */
   const commitWorkspace = useCallback(
     async (
@@ -175,21 +179,30 @@ export function useWorkspaceController({
       setError(undefined);
       try {
         if (workspaceRef.current !== undefined && preparation === undefined) {
-          release =
-            (await beforeWorkspaceChange(workspaceRef.current.workspaceId, selected.workspaceId)) ??
-            undefined;
-          if (!isCurrentIntent(intent)) return undefined;
+          const previous = workspaceRef.current;
+          if (!(previous.kind === "session" && selected.kind === "session")) {
+            release =
+              (await beforeWorkspaceChange(previous.workspaceId, selected.workspaceId)) ??
+              undefined;
+            if (!isCurrentIntent(intent)) return undefined;
+          }
+        } else if (workspaceRef.current === undefined && preparation === undefined) {
+          const retained = retainedSessionWorkspaceRef.current;
+          if (retained !== undefined && selected.kind === "project") {
+            release =
+              (await beforeWorkspaceChange(retained.workspaceId, selected.workspaceId)) ??
+              undefined;
+            if (!isCurrentIntent(intent)) return undefined;
+          }
         }
         replacementStarted = true;
         workspaceRef.current = undefined;
         setWorkspace(undefined);
         workspaceRef.current = selected;
-        // 与活动 Workspace 在同一 React batch 发布 Settings scope，下一帧绝不能出现
-        // “新 Workspace + 旧配置已就绪”的可交互组合。
-        onWorkspaceCommitted(selected);
+        if (selected.kind === "session") retainedSessionWorkspaceRef.current = selected;
+        else if (selected.kind === "project") retainedSessionWorkspaceRef.current = undefined;
+        onWorkspaceCommitted(selected.kind === "project" ? selected : undefined);
         setWorkspace(selected);
-        // workspace/open 已经返回 Java 签发的 durable identity；先投影到目录让刚添加的项目
-        // 立即可见，随后 list 结果仍是排序和完整目录的唯一校正来源。
         if (selected.kind === "project") {
           setProjects((current) => {
             const index = current.findIndex(
@@ -209,11 +222,7 @@ export function useWorkspaceController({
           workspaceRef.current = undefined;
           onWorkspaceCommitted(undefined);
           setWorkspace(undefined);
-          setError(
-            selected.kind === "general"
-              ? "默认对话未能打开，请检查设置和运行时状态后重试。 "
-              : "项目未能打开，请检查目录和运行时状态后重试。 ",
-          );
+          setError("工作目录未能激活，请检查运行时状态后重试。 ");
         }
         return undefined;
       } finally {
@@ -224,37 +233,41 @@ export function useWorkspaceController({
     [beforeWorkspaceChange, isCurrentIntent, onWorkspaceCommitted, refreshCatalog],
   );
 
-  /**
-   * 通过服务端 workspace/open 重新建立持久项目的 Rust capability；目录元数据本身不具备
-   * 文件访问权限，因此绝不能直接把 catalog 行设为活动 workspace。
-   */
+  /** 项目目录需要通过 cwd 创建/重开；持久 session 必须走 ID-only native activation。 */
   const openPersisted = useCallback(
     async (
       selected: WorkspaceProjection,
       intent: number,
     ): Promise<WorkspaceProjection | undefined> => {
-      if (history.workspaceOpen === undefined)
-        throw new Error("workspace open capability unavailable");
-      const preparation = await prepareChange(selected.workspaceId);
-      let transferred = false;
-      try {
-        if (!isCurrentIntent(intent)) return undefined;
-        const opened = await history.workspaceOpen({
-          cwd: selected.rootPath,
-          displayName: selected.displayName,
-        });
-        if (!isCurrentIntent(intent) || opened.workspaceId !== selected.workspaceId)
-          return undefined;
-        transferred = true;
-        return await commitWorkspace(workspaceFromHistory(opened), intent, preparation);
-      } finally {
-        if (!transferred) preparation.release?.();
+      if (selected.kind === "project") {
+        if (history.workspaceOpen === undefined)
+          throw new Error("project workspace open capability unavailable");
+        const preparation = await prepareChange(selected.kind, selected.workspaceId);
+        let transferred = false;
+        try {
+          if (!isCurrentIntent(intent)) return undefined;
+          const opened = await history.workspaceOpen({
+            cwd: selected.rootPath,
+            displayName: selected.displayName,
+          });
+          if (!isCurrentIntent(intent) || opened.workspaceId !== selected.workspaceId)
+            return undefined;
+          transferred = true;
+          return await commitWorkspace(workspaceFromHistory(opened), intent, preparation);
+        } finally {
+          if (!transferred) preparation.release?.();
+        }
       }
+
+      const activation = await activateWorkspace(selected.workspaceId);
+      if (!isCurrentIntent(intent) || activation.workspaceId !== selected.workspaceId)
+        return undefined;
+      return commitWorkspace(workspaceFromActivation(activation), intent);
     },
-    [commitWorkspace, history, isCurrentIntent, prepareChange],
+    [activateWorkspace, commitWorkspace, history, isCurrentIntent, prepareChange],
   );
 
-  /** 目录选择取消时保留原 workspace；只有 server-issued identity 返回后才提交新投影。 */
+  /** 目录选择取消时保留原范围；Java 返回项目 identity 后才允许切换并提交。 */
   const choose = useCallback(async (): Promise<void> => {
     if (!configurationReady || history.workspaceOpen === undefined) return;
     const intent = beginIntent();
@@ -269,7 +282,7 @@ export function useWorkspaceController({
         setError("请选择一个项目目录。 ");
         return;
       }
-      preparation = await prepareChange();
+      preparation = await prepareChange("project");
       if (!isCurrentIntent(intent)) return;
       const opened = await history.workspaceOpen({ cwd: rootPath });
       if (!isCurrentIntent(intent)) return;
@@ -291,7 +304,7 @@ export function useWorkspaceController({
     prepareChange,
   ]);
 
-  /** 从当前 catalog 选择项目；同一 identity 为幂等 no-op，不重复关闭资源。 */
+  /** 从服务端项目目录选择项目；同一 identity 为幂等 no-op。 */
   const select = useCallback(
     async (workspaceId: string): Promise<void> => {
       if (!configurationReady || workspaceRef.current?.workspaceId === workspaceId) return;
@@ -314,75 +327,73 @@ export function useWorkspaceController({
   );
 
   /**
-   * 从项目返回受管 general workspace；资源 fence 必须先于 generalWorkspace 调用，因为后者
-   * 会在 native Host 重绑 capability。当前已是 general 时保持幂等，不制造无意义 revision。
+   * 无项目入口只展示 session 聚合分类，不建立或激活共享 workspace；离开项目时仍先完成
+   * 项目/保留会话资源的安全清理，已选 session 之间则保持各自 Host 与 PTY。
    */
-  const selectGeneral = useCallback(async (): Promise<void> => {
-    if (!configurationReady || workspaceRef.current?.kind === "general") return;
+  const selectNoProject = useCallback(async (): Promise<void> => {
+    if (!configurationReady || workspaceRef.current === undefined) return;
     const intent = beginIntent();
+    const previous = workspaceRef.current;
     setBusy(true);
     setError(undefined);
     let preparation: WorkspacePreparation | undefined;
-    let transferred = false;
     try {
-      preparation = await prepareChange();
+      if (previous.kind === "project") preparation = await prepareChange(undefined);
       if (!isCurrentIntent(intent)) return;
-      const general = await generalWorkspace();
-      generalWorkspaceIdRef.current = general.workspaceId;
-      if (!isCurrentIntent(intent)) return;
-      transferred = true;
-      const committed = await commitWorkspace(workspaceFromGeneral(general), intent, preparation);
-      if (committed === undefined && isCurrentIntent(intent))
-        setError("默认对话未能打开，请检查设置和运行时状态后重试。 ");
+      workspaceRef.current = undefined;
+      setWorkspace(undefined);
+      if (previous.kind === "project") retainedSessionWorkspaceRef.current = undefined;
+      onWorkspaceCommitted(undefined);
+      setRevision((current) => current + 1);
     } catch {
-      if (isCurrentIntent(intent)) setError("默认对话未能打开，请检查设置和运行时状态后重试。 ");
+      if (isCurrentIntent(intent)) setError("无法切换到无项目对话，请重试。 ");
     } finally {
-      if (!transferred) preparation?.release?.();
+      preparation?.release?.();
       if (isCurrentIntent(intent)) setBusy(false);
     }
-  }, [
-    beginIntent,
-    commitWorkspace,
-    configurationReady,
-    generalWorkspace,
-    isCurrentIntent,
-    prepareChange,
-  ]);
+  }, [beginIntent, configurationReady, isCurrentIntent, onWorkspaceCommitted, prepareChange]);
 
   /**
-   * 为跨项目会话激活所属 workspace；此方法只返回 workspace 结果，Thread 恢复仍由
-   * conversation controller 完成，避免 workspace 成为第二个会话 owner。
+   * Thread navigation activates the Java-owned SESSION by id or reopens a known project by cwd;
+   * LEGACY_SHARED remains outside the default list and is opened only from its explicit folder action.
    */
   const activateForConversation = useCallback(
     async (workspaceId: string): Promise<WorkspaceProjection | undefined> => {
       if (workspaceRef.current?.workspaceId === workspaceId) return workspaceRef.current;
       const intent = beginIntent();
       try {
-        const general = await generalWorkspace();
-        generalWorkspaceIdRef.current = general.workspaceId;
-        if (!isCurrentIntent(intent)) return undefined;
-        if (general.workspaceId === workspaceId)
-          return await commitWorkspace(workspaceFromGeneral(general), intent);
         let target = projects.find((candidate) => candidate.workspaceId === workspaceId);
         if (target === undefined) {
-          const listed = await history.workspaceList({ limit: 200 });
-          target =
-            listed.items.find((candidate) => candidate.workspaceId === workspaceId) === undefined
-              ? undefined
-              : workspaceFromHistory(
-                  listed.items.find((candidate) => candidate.workspaceId === workspaceId)!,
-                );
+          let cursor: string | undefined;
+          const visitedCursors = new Set<string>();
+          do {
+            const listed = await history.workspaceList({ kind: "project", limit: 200, cursor });
+            if (!isCurrentIntent(intent)) return undefined;
+            const record = listed.items.find((candidate) => candidate.workspaceId === workspaceId);
+            if (record !== undefined) {
+              target = workspaceFromHistory(record);
+              break;
+            }
+            const nextCursor = listed.nextCursor ?? undefined;
+            if (nextCursor !== undefined && visitedCursors.has(nextCursor))
+              throw new Error("workspace/list repeated a cursor");
+            if (nextCursor !== undefined) visitedCursors.add(nextCursor);
+            cursor = nextCursor;
+          } while (cursor !== undefined);
         }
-        return target === undefined ? undefined : await openPersisted(target, intent);
+        if (target !== undefined) return await openPersisted(target, intent);
+        const activation = await activateWorkspace(workspaceId);
+        if (!isCurrentIntent(intent) || activation.workspaceId !== workspaceId) return undefined;
+        return await commitWorkspace(workspaceFromActivation(activation), intent);
       } catch {
-        if (isCurrentIntent(intent)) setError("会话所属工作区暂时无法打开。 ");
+        if (isCurrentIntent(intent)) setError("会话所属工作目录暂时无法打开。 ");
         return undefined;
       }
     },
     [
+      activateWorkspace,
       beginIntent,
       commitWorkspace,
-      generalWorkspace,
       history,
       isCurrentIntent,
       openPersisted,
@@ -400,54 +411,16 @@ export function useWorkspaceController({
     };
   }, []);
 
-  /**
-   * 首个有效 v1 配置自动打开 general workspace；key 只包含 runtime generation 与 ready，
-   * StrictMode 或失败重渲染不会重复创建 durable Thread；若 effect 在 commit 前被清理，
-   * 必须撤销本轮去重标记，让下一次挂载重新建立必要的默认 scope 与目录刷新。
-   */
+  /** 首次 Runtime ready 只刷新项目 catalog；空白无项目状态不绑定任何 workspace root。 */
   useEffect(() => {
     if (
       !configurationReady ||
       runtimeState === undefined ||
       !["ready", "busy"].includes(runtimeState.status)
-    ) {
-      automaticGeneralKeyRef.current = undefined;
+    )
       return;
-    }
-    if (workspaceRef.current !== undefined || busy) return;
-    const key = `${runtimeState.generation}:ready`;
-    if (automaticGeneralKeyRef.current === key) return;
-    automaticGeneralKeyRef.current = key;
-    const intent = beginIntent();
-    let committed = false;
-    void (async (): Promise<void> => {
-      try {
-        const general = await generalWorkspace();
-        generalWorkspaceIdRef.current = general.workspaceId;
-        if (isCurrentIntent(intent)) {
-          committed = (await commitWorkspace(workspaceFromGeneral(general), intent)) !== undefined;
-        }
-      } catch {
-        if (isCurrentIntent(intent)) setError("默认对话未能打开，请检查设置和运行时状态后重试。 ");
-      }
-    })();
-    return () => {
-      if (
-        !committed &&
-        automaticGeneralKeyRef.current === key &&
-        workspaceRef.current === undefined
-      )
-        automaticGeneralKeyRef.current = undefined;
-    };
-  }, [
-    configurationReady,
-    beginIntent,
-    busy,
-    commitWorkspace,
-    generalWorkspace,
-    isCurrentIntent,
-    runtimeState,
-  ]);
+    void refreshCatalog(intentRef.current, true);
+  }, [configurationReady, refreshCatalog, runtimeState]);
 
   /** 只重试目录查询，不重新绑定 workspace 或触发资源 fence。 */
   const retryCatalog = useCallback(async (): Promise<void> => {
@@ -463,7 +436,7 @@ export function useWorkspaceController({
     error,
     revision,
     choose,
-    selectGeneral,
+    selectNoProject,
     select,
     retryCatalog,
     activateForConversation,

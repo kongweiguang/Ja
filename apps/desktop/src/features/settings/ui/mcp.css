@@ -13,6 +13,36 @@
   gap: 20px;
 }
 
+.ja-mcp-scope-tabs {
+  display: inline-flex;
+  width: fit-content;
+  padding: 3px;
+  border: 1px solid var(--ja-border);
+  border-radius: 7px;
+  background: var(--ja-control);
+}
+.ja-mcp-scope-tabs [role="tab"] {
+  min-width: 76px;
+  min-height: 28px;
+  padding: 3px 10px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  cursor: pointer;
+}
+.ja-mcp-scope-tabs [role="tab"][data-state="active"] {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-raised);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ja-foreground) 14%, transparent);
+}
+.ja-mcp-scope-tabs [role="tab"]:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
 .ja-mcp-list {
   display: grid;
   min-width: 0;

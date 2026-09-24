@@ -15,6 +15,7 @@ import {
   ServerInstanceIdSchema,
   RevisionSchema as RuntimeGenerationSchema,
   WorkspaceIdSchema,
+  WorkspaceKindSchema,
   type JaEvent,
   type InputQueue,
   type InputQueueMutationResult,
@@ -34,12 +35,14 @@ export const JA_RUNTIME_COMMANDS = {
   stop: "ja_runtime_stop",
   state: "ja_runtime_state",
   storageInfo: "ja_runtime_storage_info",
-  generalWorkspace: "ja_runtime_general_workspace",
+  workspaceActivate: "ja_runtime_workspace_activate",
   recoveryState: "ja_runtime_recovery_state",
   acknowledgeRecovery: "ja_runtime_acknowledge_recovery",
   approvalRespond: "ja_approval_respond",
   turnStart: "ja_turn_start",
   turnResume: "ja_turn_resume",
+  turnContinue: "ja_turn_continue",
+  turnReask: "ja_turn_reask",
   turnRecoveryRespond: "ja_turn_recovery_respond",
   turnCancel: "ja_turn_cancel",
   turnInputEnqueue: "ja_turn_input_enqueue",
@@ -185,6 +188,33 @@ const TurnResumeInputSchema = z
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(101),
     expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/** continue 只传当前 Thread revision，源问题关联留在本地 projection 与服务端 Turn 来源字段中。 */
+const TurnContinueInputSchema = z
+  .object({
+    threadId: z
+      .string()
+      .regex(/^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(128),
+    expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/** reask 受源问题 identity 与 revision CAS 约束，正文仍遵循 turn/start 的结构化内容闭集。 */
+const TurnReaskInputSchema = z
+  .object({
+    threadId: z
+      .string()
+      .regex(/^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(128),
+    expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    sourceMessageId: z
+      .string()
+      .regex(/^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+      .max(128),
+    content: TurnContentSchema,
   })
   .strict();
 
@@ -355,11 +385,13 @@ const RuntimeStorageInfoSchema = z
  * 校验 Java 签发的通用 workspace 投影，同时保留现有 Tauri rootPath 映射；
  * 服务端身份不得合成，也不能收窄为客户端选择的字面量。
  */
-const GeneralWorkspaceSchema = z
+const WorkspaceActivationSchema = z
   .object({
     workspaceId: WorkspaceIdSchema,
+    kind: WorkspaceKindSchema,
+    legacySharedWorkspaceId: WorkspaceIdSchema.nullable(),
     displayName: SafeNameSchema,
-    trust: z.literal("trusted"),
+    trust: z.enum(["trusted", "untrusted"]),
     rootPath: z
       .string()
       .min(1)
@@ -373,7 +405,17 @@ const GeneralWorkspaceSchema = z
         "workspace path contains control characters",
       ),
   })
-  .strict();
+  .strict()
+  // 旧共享目录的关联只可能挂在 session；错误 kind 不得露出菜单或绑定到项目 Host。
+  .superRefine((value, context) => {
+    if (value.kind !== "session" && value.legacySharedWorkspaceId !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["legacySharedWorkspaceId"],
+        message: "only session workspaces may reference the legacy shared workspace",
+      });
+    }
+  });
 
 const RuntimeStatusEventSchema = z
   .object({
@@ -389,7 +431,7 @@ const RuntimeStatusEventSchema = z
 type RuntimeStatusKind = z.infer<typeof RuntimeStatusKindSchema>;
 export type RuntimeStatus = z.infer<typeof RuntimeStatusSchema>;
 export type RuntimeStorageInfo = z.infer<typeof RuntimeStorageInfoSchema>;
-export type GeneralWorkspace = z.infer<typeof GeneralWorkspaceSchema>;
+export type WorkspaceActivation = z.infer<typeof WorkspaceActivationSchema>;
 export type RuntimeRecoveryState = z.infer<typeof RuntimeRecoveryStateSchema>;
 export type ManualRecoveryConfirmation = z.infer<typeof ManualRecoveryConfirmationSchema>;
 export type TurnStartInput = z.infer<typeof TurnStartInputSchema>;
@@ -839,8 +881,8 @@ export interface RuntimeHostAdapter {
   state(): Promise<RuntimeStatus>;
   /** 读取原生层拥有的 storage 投影，不暴露进程细节。 */
   storageInfo(): Promise<RuntimeStorageInfo>;
-  /** 返回原生层拥有且供无项目 thread 使用的固定 workspace。 */
-  generalWorkspace(): Promise<GeneralWorkspace>;
+  /** 按 Java 签发的 workspace id 切换 active Host，并返回 canonical native root 投影。 */
+  activateWorkspace(workspaceId: string): Promise<WorkspaceActivation>;
   /** 读取恢复门状态；未确认时其他启动操作必须继续 fail closed。 */
   recoveryState(): Promise<RuntimeRecoveryState>;
   /** 使用 recovery identity 与 revision CAS 确认人工恢复，拒绝陈旧点击。 */
@@ -851,6 +893,10 @@ export interface RuntimeHostAdapter {
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   /** 显式授权恢复同一持久 Turn；返回值复用原接纳形状但不会创建新 Turn。 */
   turnResume(input: TurnResumeInput): Promise<TurnResumeResult>;
+  /** 隐藏 USER 的新 Turn 从有效历史继续原问题，不制造可见提交气泡。 */
+  turnContinue(input: z.infer<typeof TurnContinueInputSchema>): Promise<TurnAccepted>;
+  /** 以 Thread revision 与原 USER item CAS 重问，成功 ACK 使用普通 TurnAccepted。 */
+  turnReask(input: z.infer<typeof TurnReaskInputSchema>): Promise<TurnAccepted>;
   /** 仅提交当前未知 Tool 的明确重试或跳过裁决，最终状态继续由 Runtime 事件投影。 */
   turnRecoveryRespond(input: ToolRecoveryResponseInput): Promise<ToolRecoveryResponse>;
   /** 请求取消，但终态仍以事件为权威，UI 不提前猜测完成。 */
@@ -917,13 +963,15 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   /**
-   * 请求固定通用 workspace 且不接受 WebView 路径；显式 Schema 只允许预期的
-   * 原生层拥有 root 投影。
+   * 请求 Rust 用 Java 权威 identity 校验并激活 workspace；renderer 只提交 id，
+   * rootPath 仅能作为 canonical 返回值消费，不能由 UI 构造后再回传。
    */
-  async generalWorkspace(): Promise<GeneralWorkspace> {
+  async activateWorkspace(workspaceId: string): Promise<WorkspaceActivation> {
     try {
-      const result = await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.generalWorkspace, {});
-      return GeneralWorkspaceSchema.parse(result);
+      const result = await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.workspaceActivate, {
+        input: { workspaceId: WorkspaceIdSchema.parse(workspaceId) },
+      });
+      return WorkspaceActivationSchema.parse(result);
     } catch (error) {
       if (error instanceof z.ZodError) {
         throw new RuntimeHostError(
@@ -998,6 +1046,18 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
       throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
     }
     return result;
+  }
+
+  /** continue 与 start 共用严格 ACK 校验，但保留独立 command 以防 UI 再造用户消息。 */
+  async turnContinue(input: z.infer<typeof TurnContinueInputSchema>): Promise<TurnAccepted> {
+    const parsed = parseRuntimeInput(TurnContinueInputSchema, input);
+    return this.invoke(JA_RUNTIME_COMMANDS.turnContinue, { input: parsed }, TurnAcceptedSchema);
+  }
+
+  /** reask 的 sourceMessageId 由历史项取得，结构化 content 在 Renderer 与 Tauri 边界各校验一次。 */
+  async turnReask(input: z.infer<typeof TurnReaskInputSchema>): Promise<TurnAccepted> {
+    const parsed = parseRuntimeInput(TurnReaskInputSchema, input);
+    return this.invoke(JA_RUNTIME_COMMANDS.turnReask, { input: parsed }, TurnAcceptedSchema);
   }
 
   /** 裁决与当前 call/revision 精确绑定；ACK 只能回显同一 Turn 与同一决策，避免错位状态进入 UI。 */

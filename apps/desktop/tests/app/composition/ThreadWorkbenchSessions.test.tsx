@@ -10,6 +10,7 @@ import type { WorkbenchHost } from "@/app/composition/WorkbenchHost";
 import type { TerminalWorkspaceLifecycle } from "@/app/application/workbenchLifecyclePorts";
 import type { FilesWorkspaceLifecycle } from "@/features/workbench/files";
 import type { PreviewWorkspaceLifecycle } from "@/features/workbench/preview";
+import type { ConversationOpenTargetRequest } from "@/app/composition/ConversationWorkspace";
 
 const mocks = vi.hoisted(() => ({
   hosts: vi.fn(),
@@ -145,6 +146,44 @@ function deferred<T>(): {
 }
 
 describe("ThreadWorkbenchSessions", () => {
+  it("delivers open-target requests only to the active thread host", () => {
+    const firstRequest: ConversationOpenTargetRequest = {
+      requestId: 1,
+      workspaceId: "workspace-1",
+      threadId: "thread-a",
+      target: { kind: "file", path: "src/a.ts", line: 4 },
+    };
+    const secondRequest: ConversationOpenTargetRequest = {
+      requestId: 2,
+      workspaceId: "workspace-1",
+      threadId: "thread-b",
+      target: { kind: "url", url: "https://example.test" },
+    };
+    const settled = vi.fn();
+    const view = render(
+      <ThreadWorkbenchSessions
+        {...makeProps("thread-a", {
+          openTargetRequest: firstRequest,
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+    expect(latestHostProps("thread-a").openTargetRequest).toEqual(firstRequest);
+
+    view.rerender(
+      <ThreadWorkbenchSessions
+        {...makeProps("thread-b", {
+          openTargetRequest: secondRequest,
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+    expect(latestHostProps("thread-a").openTargetRequest).toBeUndefined();
+    expect(latestHostProps("thread-a").onOpenTargetSettled).toBeUndefined();
+    expect(latestHostProps("thread-b").openTargetRequest).toEqual(secondRequest);
+    expect(latestHostProps("thread-b").onOpenTargetSettled).toBe(settled);
+  });
+
   it("Java 重连只更新代际投影，不卸载同一 Thread 的原生工作面", () => {
     const props = makeProps("thread-a");
     const view = render(<ThreadWorkbenchSessions {...props} />);
@@ -156,7 +195,20 @@ describe("ThreadWorkbenchSessions", () => {
     expect(latestHostProps("thread-a").generation).toBe(8);
   });
 
+  /** 同类 session 切换只改前台 Host，任何已缓存 Terminal 都不得收到 workspace close。 */
   it("在 A/B 会话切换后保留两个 Host 实例，并为每个会话只创建一次 adapter", async () => {
+    const closeA = vi.fn(async () => undefined);
+    const closeB = vi.fn(async () => undefined);
+    mocks.terminalByThread.set("thread-a", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closeA,
+      resumeAfterWorkspaceChange: vi.fn(),
+    });
+    mocks.terminalByThread.set("thread-b", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closeB,
+      resumeAfterWorkspaceChange: vi.fn(),
+    });
     const view = render(<ThreadWorkbenchSessions {...makeProps("thread-a")} />);
     const firstA = view.getByTestId("host-thread-a").dataset["instance"];
 
@@ -170,6 +222,8 @@ describe("ThreadWorkbenchSessions", () => {
     expect(view.getByTestId("host-thread-a").dataset["instance"]).toBe(firstA);
     expect(view.getByTestId("host-thread-b")).toBeInTheDocument();
     expect(mocks.createThreadWorkbenchAdapters).toHaveBeenCalledTimes(2);
+    expect(closeA).not.toHaveBeenCalled();
+    expect(closeB).not.toHaveBeenCalled();
   });
 
   it("只让当前 Host active，后台 Host 保留原 Thread props 且不可见", async () => {
@@ -262,20 +316,40 @@ describe("ThreadWorkbenchSessions", () => {
     expect(releaseA).toHaveBeenCalledOnce();
   });
 
-  it("当前 Thread 暂时未定义时保留并隐藏已访问 Host", () => {
+  it("A→blank→B 隐藏 A 且不激活 Files、不关闭 Terminal，真实卸载时才聚合清理", async () => {
+    const closeTerminal = vi.fn(async () => undefined);
+    mocks.terminalByThread.set("thread-a", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closeTerminal,
+      resumeAfterWorkspaceChange: vi.fn(),
+    });
     const view = render(<ThreadWorkbenchSessions {...makeProps("thread-a")} />);
     const instance = view.getByTestId("host-thread-a").dataset["instance"];
 
     view.rerender(
-      <ThreadWorkbenchSessions {...makeProps("", { scopeKey: "", rootThreadId: undefined })} />,
+      <ThreadWorkbenchSessions
+        {...makeProps("", { scopeKey: "", rootThreadId: undefined, active: false })}
+      />,
     );
     expect(view.getByTestId("host-thread-a").dataset["instance"]).toBe(instance);
     expect(
       view.getByTestId("host-thread-a").closest(".ja-thread-workbench-session"),
     ).toHaveAttribute("hidden");
+    expect(latestHostProps("thread-a").active).toBe(false);
+    expect(
+      view.container.querySelectorAll(".ja-thread-workbench-session:not([hidden])"),
+    ).toHaveLength(0);
+    expect(closeTerminal).not.toHaveBeenCalled();
 
-    view.rerender(<ThreadWorkbenchSessions {...makeProps("thread-a")} />);
+    view.rerender(<ThreadWorkbenchSessions {...makeProps("thread-b")} />);
+    await waitFor(() => expect(view.getByTestId("host-thread-b")).toBeInTheDocument());
     expect(view.getByTestId("host-thread-a").dataset["instance"]).toBe(instance);
+    expect(latestHostProps("thread-a").active).toBe(false);
+    expect(latestHostProps("thread-b").active).toBe(true);
+    expect(closeTerminal).not.toHaveBeenCalled();
+
+    view.unmount();
+    await waitFor(() => expect(closeTerminal).toHaveBeenCalledOnce());
   });
 
   it("后台 A 的迟到 Files flush 只调用 A 缓存的完成通知", async () => {

@@ -421,7 +421,7 @@ final class TaskCoordinatorTest {
                     TaskModels.InheritanceMode.BRIEF_ONLY, new UserContent(List.of(new TextContent("brief"))), null,
                     new JsonArray(List.of()), JsonObjects.builder().putText("version", "task_access_v1").build(),
                     "a".repeat(64), NOW);
-            ThreadSummary childThread = new ThreadSummary("thr_target", "ws_test", "Target",
+            ThreadSummary childThread = new ThreadSummary("thr_target", "ws_test", "Target", "project", null,
                     PREFERENCES, ThreadSummary.Status.ACTIVE, false,
                     io.github.kongweiguang.ja.conversation.domain.turn.TurnState.COMPLETED,
                     true, null, 5, NOW, NOW);
@@ -537,7 +537,7 @@ final class TaskCoordinatorTest {
                                     ? "CANCELLED" : value.status(), value.requestedAt(), NOW,
                                     value.turnId().equals(turnId) ? NOW : value.completedAt(),
                                     value.errorCode(), value.changeSet(), value.mutationVersion(),
-                                    value.modelRound())).toList();
+                                    value.modelRound(), value.sourceMessageId())).toList();
                     snapshot.set(threadWithTurns(nextRevision, turns));
                     cancellations.incrementAndGet();
                     return new TurnUseCase.CancelResult(true, turnId,
@@ -762,7 +762,7 @@ final class TaskCoordinatorTest {
 
     /** Thread fake 返回创建 Subagent 所需的父元数据，不提供历史正文。 */
     private static ThreadUseCase threads() {
-        ThreadSummary parent = new ThreadSummary("thr_parent", "ws_test", "Parent", PREFERENCES,
+        ThreadSummary parent = new ThreadSummary("thr_parent", "ws_test", "Parent", "project", null, PREFERENCES,
                 ThreadSummary.Status.ACTIVE, false, null, true, null, 7, NOW, NOW);
         ThreadSnapshot snapshot = new ThreadSnapshot(parent, List.of(), List.of(), null, null, null);
         return proxy(ThreadUseCase.class, (method, args) -> {
@@ -803,7 +803,7 @@ final class TaskCoordinatorTest {
     /** Workspace fake 只返回已绑定路径，确保测试不触碰真实文件系统。 */
     private static WorkspaceUseCase workspaces() {
         Workspace workspace = new Workspace("ws_test", Path.of("C:\\ja-task-coordinator"),
-                "Fixture", Workspace.Trust.TRUSTED, 1);
+                "Fixture", Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, 1);
         return proxy(WorkspaceUseCase.class, (method, args) -> {
             if ("requireOpenWorkspace".equals(method.getName())) return workspace;
             throw new UnsupportedOperationException(method.getName());
@@ -831,6 +831,7 @@ final class TaskCoordinatorTest {
                 draft.effectiveContext(), draft.references(), draft.permissionCeiling(), "a".repeat(64),
                 draft.createdAt());
         ThreadSummary threadSummary = new ThreadSummary(thread.threadId(), thread.workspaceId(), thread.title(),
+                "project", null,
                 thread.preferences(), ThreadSummary.Status.ACTIVE, false, null, true, null,
                 task.projection().revision(), thread.createdAt(), thread.createdAt());
         TaskModels.Activity activity = new TaskModels.Activity(
@@ -864,10 +865,10 @@ final class TaskCoordinatorTest {
 
     /** 关闭测试使用独立 Thread identity，取消回执必须推动同一快照进入终态。 */
     private static ThreadSnapshot sideThreadWithTurn(String state, long revision) {
-        ThreadSummary thread = new ThreadSummary("thr_side", "ws_test", "Side", PREFERENCES,
+        ThreadSummary thread = new ThreadSummary("thr_side", "ws_test", "Side", "project", null, PREFERENCES,
                 ThreadSummary.Status.ACTIVE, false, null, true, null, revision, NOW, NOW);
         ThreadSnapshot.Turn turn = new ThreadSnapshot.Turn("turn_side", state, NOW, NOW,
-                state.equals("CANCELLED") ? NOW : null, null, null, 0, 0);
+                state.equals("CANCELLED") ? NOW : null, null, null, 0, 0, null);
         return new ThreadSnapshot(thread, List.of(turn), List.of(), null, null, null);
     }
 
@@ -885,14 +886,14 @@ final class TaskCoordinatorTest {
 
     /** 构造包含完整 Turn metadata 的 Child Thread 快照，消息正文保持为空。 */
     private static ThreadSnapshot threadWithTurns(long revision, List<ThreadSnapshot.Turn> turns) {
-        ThreadSummary thread = new ThreadSummary("thr_target", "ws_test", "Target", PREFERENCES,
+        ThreadSummary thread = new ThreadSummary("thr_target", "ws_test", "Target", "project", null, PREFERENCES,
                 ThreadSummary.Status.ACTIVE, false, null, true, null, revision, NOW, NOW);
         return new ThreadSnapshot(thread, List.copyOf(turns), List.of(), null, null, null);
     }
 
     /** Turn fixture 只携带取消循环读取的状态和 revision。 */
     private static ThreadSnapshot.Turn turn(String turnId, String state) {
-        return new ThreadSnapshot.Turn(turnId, state, NOW, NOW, null, null, null, 0, 0);
+        return new ThreadSnapshot.Turn(turnId, state, NOW, NOW, null, null, null, 0, 0, null);
     }
 
     /** 使用生产 ceiling port 创建完整 seed，测试不复制版本化 JSON 字段。 */

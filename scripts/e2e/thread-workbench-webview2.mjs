@@ -159,7 +159,7 @@ async function workbenchSnapshot(page) {
       ),
       hasFiles: current.querySelector('[aria-label="文件工作区"]') !== null,
       hasTerminal: current.querySelector('[aria-label="终端工作区"]') !== null,
-      hasPreview: current.querySelector('[aria-label="Preview 地址"]') !== null,
+      hasPreview: current.querySelector('[aria-label="浏览器地址"]') !== null,
       terminalSessionCount: current.querySelectorAll("[data-terminal-session-id]").length,
     }),
     visible,
@@ -229,32 +229,45 @@ function traceCount(trace, command, phase, visible) {
 }
 
 /**
- * 在当前会话通过真实创建器打开 PowerShell PTY，并读取原生签发 identity；调用方只把 identity
- * 摘要写入报告，原值不会进入证据文件。
+ * Workbench 首次打开 Terminal 时已有一个休眠的默认 Pane；只等待它在当前会话的可见 Tab
+ * 中绑定 native PTY，避免额外创建第二个会话后把布局计数误判为隔离失败。
  */
-async function openNativeTerminal(page, workbench, deadline) {
+async function openNativeTerminal(page, workbench, deadline, evidenceDirectory) {
   await openCapability(page, workbench, "terminal", "终端", deadline);
   const terminal = workbench.getByRole("region", { name: "终端工作区", exact: true });
   await terminal.waitFor({ state: "visible", timeout: timeout(deadline) });
-  const trigger = terminal.getByRole("button", { name: /新建终端(?:标签页)?/u }).first();
-  await trigger.click({ timeout: timeout(deadline) });
-  const creator = terminal.getByRole("dialog", { name: "新建终端", exact: true });
-  await creator.waitFor({ state: "visible", timeout: timeout(deadline) });
-  await creator.getByRole("combobox", { name: "Shell profile", exact: true }).click({
-    timeout: timeout(deadline),
-  });
-  await page.getByRole("option", { name: "PowerShell", exact: true }).click({
-    timeout: timeout(deadline),
-  });
-  await creator.getByRole("button", { name: "创建终端", exact: true }).click({
-    timeout: timeout(deadline),
-  });
-  await creator.waitFor({ state: "detached", timeout: timeout(deadline) });
-  const pane = terminal.locator("[data-terminal-session-id]").first();
-  await pane
-    .locator(".ja-terminal-pane-state")
-    .getByText("运行中", { exact: true })
-    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  const activePanel = terminal.locator('[role="tabpanel"]:not([hidden])');
+  const pane = activePanel.locator(".ja-terminal-pane:visible").first();
+  try {
+    await activePanel.waitFor({ state: "visible", timeout: timeout(deadline) });
+    await pane.waitFor({ state: "visible", timeout: timeout(deadline) });
+    await pane
+      .locator(".ja-terminal-pane-state")
+      .getByText("运行中", { exact: true })
+      .waitFor({ state: "visible", timeout: timeout(deadline) });
+  } catch (error) {
+    const paneStates = await terminal
+      .locator(".ja-terminal-pane")
+      .evaluateAll((panes) =>
+        panes.map((element) => ({
+          hidden: element.closest('[role="tabpanel"][hidden]') !== null,
+          visible: element.getClientRects().length > 0,
+          lifecycle: element.querySelector(".ja-terminal-pane-state")?.textContent?.trim() ?? null,
+          hasSession: element.hasAttribute("data-terminal-session-id"),
+        })),
+      )
+      .catch(() => []);
+    await page
+      .screenshot({
+        path: join(evidenceDirectory, "terminal-open-failure.png"),
+        animations: "disabled",
+      })
+      .catch(() => undefined);
+    throw new Error(
+      `active Terminal pane did not reach running state; pane states=${JSON.stringify(paneStates)}; ${String(error?.message ?? error)}`,
+      { cause: error },
+    );
+  }
   const sessionId = await pane.getAttribute("data-terminal-session-id");
   const generation = await pane.getAttribute("data-terminal-session-generation");
   assert.ok(sessionId, "运行中终端缺少 native session identity");
@@ -272,11 +285,11 @@ function sessionFingerprint(session) {
 /** 在 B 会话打开真实 native Preview 并等待 child WebView 完成同源静态资源加载。 */
 async function openNativePreview(page, workbench, deadline) {
   await openCapability(page, workbench, "preview", "浏览器", deadline);
-  const address = workbench.getByRole("textbox", { name: "Preview 地址", exact: true });
+  const address = workbench.getByRole("textbox", { name: "浏览器地址", exact: true });
   const target = new URL("/favicon.png?thread-workbench=B", page.url()).href;
   const before = traceCount(await commandTrace(page), "ja_preview_open", "resolved");
   await address.fill(target);
-  await workbench.getByRole("button", { name: "刷新或访问", exact: true }).click({
+  await workbench.getByRole("button", { name: "访问地址", exact: true }).click({
     timeout: timeout(deadline),
   });
   await waitForCondition(
@@ -344,7 +357,7 @@ export async function runThreadWorkbenchWebView2({ page, workspaceRoot, evidence
 
   await selectThread(page, threadA.threadId, deadline);
   let workbench = await ensureWorkbenchVisible(page, deadline);
-  const sessionA = await openNativeTerminal(page, workbench, deadline);
+  const sessionA = await openNativeTerminal(page, workbench, deadline, evidenceDirectory);
   const sessionAFingerprint = sessionFingerprint(sessionA);
   const aInitial = await assertBoundState(page, { tab: "terminal" });
   assert.equal(aInitial.terminalSessionCount, 1);
@@ -363,7 +376,7 @@ export async function runThreadWorkbenchWebView2({ page, workspaceRoot, evidence
   const bDefault = await workbenchSnapshot(page);
   workbench = await ensureWorkbenchVisible(page, deadline);
   const previewTarget = await openNativePreview(page, workbench, deadline);
-  const sessionB = await openNativeTerminal(page, workbench, deadline);
+  const sessionB = await openNativeTerminal(page, workbench, deadline, evidenceDirectory);
   const sessionBFingerprint = sessionFingerprint(sessionB);
   assert.notEqual(sessionAFingerprint, sessionBFingerprint);
   assert.equal((await workbenchSnapshot(page)).terminalSessionCount, 1);
@@ -380,7 +393,7 @@ export async function runThreadWorkbenchWebView2({ page, workspaceRoot, evidence
   const bInitial = await assertBoundState(page, { tab: "preview" });
   assert.equal(bInitial.terminalSessionCount, 0);
   assert.equal(
-    await workbench.getByRole("textbox", { name: "Preview 地址", exact: true }).inputValue(),
+    await workbench.getByRole("textbox", { name: "浏览器地址", exact: true }).inputValue(),
     previewTarget,
   );
   const bScreenshot = join(evidenceDirectory, "thread-b-preview.png");
@@ -416,7 +429,7 @@ export async function runThreadWorkbenchWebView2({ page, workspaceRoot, evidence
   workbench = currentInspector(page).locator(".ja-workbench:visible");
   const bRestored = await assertBoundState(page, { tab: "preview" });
   assert.equal(
-    await workbench.getByRole("textbox", { name: "Preview 地址", exact: true }).inputValue(),
+    await workbench.getByRole("textbox", { name: "浏览器地址", exact: true }).inputValue(),
     previewTarget,
   );
 
@@ -426,7 +439,7 @@ export async function runThreadWorkbenchWebView2({ page, workspaceRoot, evidence
   await selectThread(page, threadB.threadId, deadline);
   const bSecondRestore = await assertBoundState(page, { tab: "preview" });
   assert.equal(
-    await workbench.getByRole("textbox", { name: "Preview 地址", exact: true }).inputValue(),
+    await workbench.getByRole("textbox", { name: "浏览器地址", exact: true }).inputValue(),
     previewTarget,
   );
 
@@ -517,7 +530,7 @@ export function validateThreadWorkbenchReport(report) {
   return report;
 }
 
-/** 解析本 runner 的窄 CLI，并固定独立 Cargo target，避免与用户构建竞争产物。 */
+/** 解析窄 CLI、固定独立 Cargo target，并可为真实窗口启动故障保留隔离诊断现场。 */
 export function parseArguments(argv) {
   const options = {
     evidenceDirectory: undefined,
@@ -525,9 +538,15 @@ export function parseArguments(argv) {
     javaHome: DEFAULT_JAVA_HOME,
     cargoTargetDirectory: join(repoRoot, "target", "codex-thread-workbench"),
     edgeDriver: undefined,
+    preserveFailedProfile: false,
   };
-  for (let index = 0; index < argv.length; index += 2) {
+  for (let index = 0; index < argv.length; ) {
     const argument = argv[index];
+    if (argument === "--preserve-failed-profile") {
+      options.preserveFailedProfile = true;
+      index += 1;
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--"))
       throw new Error(`missing value for ${argument}`);
@@ -537,6 +556,7 @@ export function parseArguments(argv) {
     else if (argument === "--cargo-target-directory") options.cargoTargetDirectory = resolve(value);
     else if (argument === "--edge-driver") options.edgeDriver = resolve(value);
     else throw new Error(`unknown argument: ${argument}`);
+    index += 2;
   }
   if (options.evidenceDirectory === undefined) throw new Error("--evidence-directory is required");
   if (options.jar === undefined) throw new Error("--jar is required");
@@ -555,6 +575,8 @@ async function main() {
     driver: runThreadWorkbenchWebView2,
     validateReport: validateThreadWorkbenchReport,
     reportFileName: "thread-workbench-report.json",
+    preserveFailedProfile: options.preserveFailedProfile,
+    prewarmWebview: true,
   });
   console.log(`JA_THREAD_WORKBENCH_PASS ${JSON.stringify({ verdict: report.verdict })}`);
 }

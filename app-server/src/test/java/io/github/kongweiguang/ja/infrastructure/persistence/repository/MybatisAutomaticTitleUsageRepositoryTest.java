@@ -73,7 +73,7 @@ final class MybatisAutomaticTitleUsageRepositoryTest extends PersistenceTestSupp
         MybatisConversationRepository conversations = database.agentStore();
         MybatisHistoryService history = database.history(conversations);
         history.register(new Workspace.Registration("ws_title", temp.resolve("title-project"),
-                "Title", Workspace.Trust.TRUSTED, START));
+                "Title", Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, START));
         conversations.createThread(new ConversationRepository.ThreadDefinition(
                 "thr_title", "ws_title", "Title",
                 preferences("provider_title", "model_title"), START));

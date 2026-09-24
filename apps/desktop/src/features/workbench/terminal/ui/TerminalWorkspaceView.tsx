@@ -33,7 +33,13 @@ import {
   type TerminalTabCreateOptions,
   type TerminalTabLayout,
 } from "../domain";
-import { IconButton, Select } from "@/shared/ui/primitives";
+import {
+  IconButton,
+  MenuItem,
+  MenuSeparator,
+  PointerContextMenu,
+  Select,
+} from "@/shared/ui/primitives";
 import "./TerminalWorkspace.css";
 
 const TERMINAL_CREATOR_ID = "ja-terminal-tab-creator";
@@ -47,6 +53,29 @@ const TERMINAL_PROFILE_LABELS: Readonly<Record<TerminalProfile, string>> = {
   zsh: "Zsh",
   fish: "Fish",
 };
+
+interface TerminalContextMenuPosition {
+  x: number;
+  y: number;
+}
+
+/** 键盘 ContextMenu 没有指针坐标时锚定目标中心，避免菜单固定出现在屏幕角落。 */
+function terminalContextMenuPosition(
+  event: ReactMouseEvent<HTMLElement>,
+): TerminalContextMenuPosition {
+  if (event.clientX !== 0 || event.clientY !== 0) return { x: event.clientX, y: event.clientY };
+  const rect = event.currentTarget.getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+/** 对象关闭后聚焦当前标签或仍可用的工作区控件，避免焦点留在已卸载菜单目标。 */
+function restoreTerminalWorkspaceFocus(root: HTMLElement | null): void {
+  const activeTab = root?.querySelector<HTMLButtonElement>(
+    '[role="tab"][aria-selected="true"]:not(:disabled)',
+  );
+  const fallback = root?.querySelector<HTMLButtonElement>("button:not(:disabled)");
+  (activeTab ?? fallback)?.focus();
+}
 export interface TerminalWorkspaceViewProps {
   className?: string;
   active: boolean;
@@ -111,6 +140,7 @@ export function TerminalWorkspaceView({
               tab={tab}
               active={tab.tabId === activeTabId}
               controller={controller}
+              rootRef={rootRef}
             />
           ))}
         </div>
@@ -291,24 +321,58 @@ function TerminalTabCreator({
   );
 }
 
-/** 分离标签标题与关闭命中区，使键盘焦点行为保持可预测。 */
+/** 保留现有关闭按钮，并让右键只关闭命中的标签且在菜单关闭后恢复工作区焦点。 */
 function TerminalTab({
   tab,
   active,
   controller,
+  rootRef,
 }: {
   tab: TerminalTabLayout;
   active: boolean;
   controller: TerminalWorkspaceController;
+  rootRef: RefObject<HTMLElement | null>;
 }): ReactElement {
+  const tabTriggerRef = useRef<HTMLButtonElement>(null);
+  const [contextMenu, setContextMenu] = useState<TerminalContextMenuPosition>();
   const closing =
     controller.closeAllPending ||
     terminalNodeHasLifecycle(tab.root, controller.runtimes, "closing");
+  /** 菜单动作移除当前标签时回退到新的活动标签，正常关闭则回到原触发器。 */
+  const restoreFocus = (): void => {
+    const trigger = tabTriggerRef.current;
+    if (trigger !== null && trigger.isConnected && !trigger.disabled) {
+      trigger.focus();
+      return;
+    }
+    restoreTerminalWorkspaceFocus(rootRef.current);
+  };
+  /** 关闭只捕获命中行的 tabId，不激活标签，键盘调用则以标签行为定位点。 */
+  const openContextMenu = (event: ReactMouseEvent<HTMLDivElement>): void => {
+    event.preventDefault();
+    setContextMenu(terminalContextMenuPosition(event));
+  };
+  /** 通过现有 controller 完成 PTY 清理和布局删除，最终恢复仍有效的工作区焦点。 */
+  const closeFromContextMenu = (): void => {
+    if (closing) return;
+    void controller
+      .closeTab(tab.tabId)
+      .catch(() => {
+        // controller 将原生关闭失败投影到对应窗格的 runtime 错误状态。
+      })
+      .finally(() => window.requestAnimationFrame(restoreFocus));
+  };
   return (
-    <div className={`ja-terminal-tab${active ? " is-active" : ""}`} role="presentation">
+    <div
+      className={`ja-terminal-tab${active ? " is-active" : ""}`}
+      data-tab-id={tab.tabId}
+      role="presentation"
+      onContextMenu={openContextMenu}
+    >
       <button
         type="button"
         role="tab"
+        ref={tabTriggerRef}
         aria-selected={active}
         aria-controls={`ja-terminal-panel-${tab.tabId}`}
         disabled={controller.closeAllPending}
@@ -328,6 +392,24 @@ function TerminalTab({
       >
         <X aria-hidden="true" size={13} />
       </IconButton>
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label="终端标签页操作"
+          onOpenChange={(open) => {
+            if (open) return;
+            setContextMenu(undefined);
+            window.requestAnimationFrame(restoreFocus);
+          }}
+          onRestoreFocus={restoreFocus}
+        >
+          <MenuItem disabled={closing} onSelect={closeFromContextMenu}>
+            <X aria-hidden="true" size={14} />
+            <span>关闭终端标签页</span>
+          </MenuItem>
+        </PointerContextMenu>
+      )}
     </div>
   );
 }
@@ -604,7 +686,7 @@ function SplitHandle({
   );
 }
 
-/** 每个窗格只持有一个 xterm 实例，并在同一终端表面投影生命周期动作与可关闭的局部拖放失败。 */
+/** 每个窗格只持有一个 xterm 实例，右键动作复用 controller 并在异步收口后恢复焦点。 */
 function TerminalPaneView({
   pane,
   tab,
@@ -632,6 +714,11 @@ function TerminalPaneView({
   const visibleLifecycle = controller.closeAllPending ? "closing" : lifecycle;
   const splitAvailable = controller.canSplitPane(tab.tabId, pane.paneId);
   const closing = visibleLifecycle === "closing";
+  const canRestart = !closing && (lifecycle === "exited" || lifecycle === "failed");
+  const toolbarRef = useRef<HTMLElement>(null);
+  const [contextMenu, setContextMenu] = useState<
+    (TerminalContextMenuPosition & { workspaceRoot: HTMLElement | null }) | undefined
+  >(undefined);
   const droppedBytes = runtime?.droppedBytes ?? 0;
   const outputWarningTitleId = `ja-terminal-output-warning-${pane.paneId}`;
   const outputWarningHintId = `ja-terminal-output-warning-hint-${pane.paneId}`;
@@ -641,6 +728,45 @@ function TerminalPaneView({
       ? undefined
       : "已达到每标签 4 个或工作区 8 个终端窗格上限";
   const splitDisabled = splitBlockedReason !== undefined;
+  /** 窗格仍存在时优先返回工具栏；移除后回到当前工作区的活动标签。 */
+  const restorePaneFocus = (): void => {
+    const toolbarAction =
+      toolbarRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)");
+    if (toolbarAction?.isConnected) {
+      toolbarAction.focus();
+      return;
+    }
+    const root = contextMenu?.workspaceRoot ?? null;
+    restoreTerminalWorkspaceFocus(root);
+  };
+  /** 菜单绑定当前窗格 ID 和所属工作区，键盘入口按标题区域中心定位。 */
+  const openContextMenu = (event: ReactMouseEvent<HTMLElement>): void => {
+    event.preventDefault();
+    setContextMenu({
+      ...terminalContextMenuPosition(event),
+      workspaceRoot: event.currentTarget.closest<HTMLElement>(".ja-terminal-workspace"),
+    });
+  };
+  /** 异步关闭完成后再次校正焦点，避免被卸载的最后一个 pane 留在 document.activeElement。 */
+  const removePaneFromContextMenu = (): void => {
+    if (closing || controller.closeAllPending) return;
+    void controller
+      .removePane(tab.tabId, pane.paneId)
+      .catch(() => {
+        // controller 会在关闭失败时保留窗格并投影 runtime 错误。
+      })
+      .finally(() => window.requestAnimationFrame(restorePaneFocus));
+  };
+  /** 仅对当前失败或退出的 generation 开放重启，防止旧菜单重启活跃 PTY。 */
+  const restartPaneFromContextMenu = (): void => {
+    if (!canRestart || controller.closeAllPending) return;
+    void controller
+      .restartPane(pane.paneId)
+      .catch(() => {
+        // controller 将重启失败保留为可见的 pane runtime 错误。
+      })
+      .finally(() => window.requestAnimationFrame(restorePaneFocus));
+  };
   return (
     <div
       className={`ja-terminal-pane is-${visibleLifecycle}`}
@@ -651,7 +777,7 @@ function TerminalPaneView({
       aria-busy={closing || undefined}
       onPointerDown={() => controller.activatePane(tab.tabId, pane.paneId)}
     >
-      <header className="ja-terminal-pane-toolbar">
+      <header className="ja-terminal-pane-toolbar" ref={toolbarRef} onContextMenu={openContextMenu}>
         <span className="ja-terminal-pane-label">{terminalProfileLabel(tab.profile)}</span>
         <span className="ja-terminal-pane-cwd" title={tab.relativeCwd ?? "工作区根目录"}>
           {tab.relativeCwd ?? "."}
@@ -705,6 +831,53 @@ function TerminalPaneView({
             <X aria-hidden="true" size={14} />
           </IconButton>
         </div>
+        {contextMenu === undefined ? null : (
+          <PointerContextMenu
+            x={contextMenu.x}
+            y={contextMenu.y}
+            label="终端窗格操作"
+            onOpenChange={(open) => {
+              if (open) return;
+              setContextMenu(undefined);
+              window.requestAnimationFrame(restorePaneFocus);
+            }}
+            onRestoreFocus={restorePaneFocus}
+          >
+            <MenuItem
+              disabled={splitDisabled}
+              onSelect={() => {
+                if (!closing && controller.canSplitPane(tab.tabId, pane.paneId)) {
+                  controller.splitPane(tab.tabId, pane.paneId, "horizontal");
+                }
+              }}
+            >
+              <Rows2 aria-hidden="true" size={14} />
+              <span>横向分屏</span>
+            </MenuItem>
+            <MenuItem
+              disabled={splitDisabled}
+              onSelect={() => {
+                if (!closing && controller.canSplitPane(tab.tabId, pane.paneId)) {
+                  controller.splitPane(tab.tabId, pane.paneId, "vertical");
+                }
+              }}
+            >
+              <Columns2 aria-hidden="true" size={14} />
+              <span>纵向分屏</span>
+            </MenuItem>
+            {canRestart ? (
+              <MenuItem onSelect={restartPaneFromContextMenu}>
+                <RotateCcw aria-hidden="true" size={14} />
+                <span>重启终端</span>
+              </MenuItem>
+            ) : null}
+            <MenuSeparator />
+            <MenuItem disabled={closing} onSelect={removePaneFromContextMenu}>
+              <X aria-hidden="true" size={14} />
+              <span>关闭终端窗格</span>
+            </MenuItem>
+          </PointerContextMenu>
+        )}
       </header>
       {droppedBytes > 0 ? (
         <div

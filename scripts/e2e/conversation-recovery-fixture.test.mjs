@@ -3,28 +3,56 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  RECOVERY_MAX_ATTEMPTS,
   requestStep,
   startRecoveryFixture,
   summaryDocument,
 } from "./conversation-recovery-fixture.mjs";
 
-/** 混有历史续答与用户标记的请求只能按最新结构化用户输入分类。 */
-test("request classifier excludes historical continuation and title", () => {
-  assert.equal(requestStep({ input: ["JA_RECOVERY_TURN_1", "JA_RECOVERY_TURN_4"] }), "4");
+/** 分类始终只看最新用户项，让历史里的 marker/答案不会改写当前恢复操作。 */
+test("request classifier uses the last user marker and recognizes summary/title", () => {
+  assert.equal(RECOVERY_MAX_ATTEMPTS, 6);
+  assert.equal(
+    requestStep({ input: ["JA_RECOVERY_TURN_1", "JA_RECOVERY_TURN_4"] }),
+    "4",
+  );
   assert.equal(
     requestStep({
       input: [
-        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_TURN_1" }] },
-        { role: "user", content: [{ type: "input_text", text: "继续" }] },
-        { role: "assistant", content: "JA_RECOVERY_CONTINUE_SUCCESS_1" },
-        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_TURN_2" }] },
+        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_RETRY_SUCCESS" }] },
+        { role: "assistant", content: "JA_RECOVERY_CONTINUE_SUCCESS" },
       ],
     }),
-    "2",
+    "JA_RECOVERY_RETRY_SUCCESS",
+  );
+  assert.equal(
+    requestStep({
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_CONTINUE" }] },
+        { role: "assistant", content: "failed attempt" },
+      ],
+    }),
+    "JA_RECOVERY_CONTINUE",
+    "continue must reuse the source prompt without a visible continuation user item",
+  );
+  assert.equal(
+    requestStep({
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_REASK_ORIGINAL" }] },
+        { role: "assistant", content: "failed attempt" },
+        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_REASK_EDITED" }] },
+      ],
+    }),
+    "JA_RECOVERY_REASK_EDITED",
+    "reask fixture follows the replacement question rather than the failed source",
   );
   assert.equal(
     requestStep({ input: "<user_request>JA_RECOVERY_TURN_4<assistant_reply>" }),
     "title",
+  );
+  assert.equal(
+    requestStep({ instructions: "context compaction model", input: "JA_RECOVERY_TURN_4" }),
+    "summary",
   );
 });
 
@@ -42,68 +70,184 @@ test("summary preserves real source ordinals and bypasses turn classification", 
   ]);
 });
 
-/** 通过真实 HTTP 验证前三次失败与恢复，避免 fixture 自身为离线模拟计数。 */
-test("loopback performs three failures then a gated successful SSE", async () => {
+/** 同一个恢复 marker 的前五个 Provider 请求失败，第六个必须返回成功流。 */
+test("loopback permits five failures and success on retry six", async () => {
   const fixture = await startRecoveryFixture();
   try {
-    for (let step = 1; step <= 3; step++) {
+    const statuses = [];
+    for (let requestNumber = 1; requestNumber <= RECOVERY_MAX_ATTEMPTS; requestNumber += 1) {
       const response = await fetch(`${fixture.baseUrl}/responses`, {
         method: "POST",
-        body: JSON.stringify({ input: `JA_RECOVERY_TURN_${step}` }),
+        body: JSON.stringify({ input: "JA_RECOVERY_RETRY_SUCCESS" }),
+      });
+      statuses.push(response.status);
+      if (requestNumber === RECOVERY_MAX_ATTEMPTS) {
+        assert.match(await response.text(), /JA_RECOVERY_RETRY_SUCCESS_AFTER_FIVE/u);
+      }
+    }
+    assert.deepEqual(statuses, [503, 503, 503, 503, 503, 200]);
+    assert.deepEqual(
+      fixture.attempts.map((attempt) => attempt.retryAttempt),
+      [1, 2, 3, 4, 5, 6],
+    );
+    assert.equal(fixture.attempts[5].logicalTurn, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+/** 六次仍失败时保留失败终态，不为第七次 Provider 请求预留隐式额度。 */
+test("loopback exhausts exactly six requests when the sixth one still fails", async () => {
+  const fixture = await startRecoveryFixture();
+  try {
+    for (let requestNumber = 1; requestNumber <= RECOVERY_MAX_ATTEMPTS; requestNumber += 1) {
+      const response = await fetch(`${fixture.baseUrl}/responses`, {
+        method: "POST",
+        body: JSON.stringify({ input: "JA_RECOVERY_RETRY_EXHAUSTED" }),
       });
       assert.equal(response.status, 503);
     }
-    fixture.release();
-    const response = await fetch(`${fixture.baseUrl}/responses`, {
-      method: "POST",
-      body: JSON.stringify({ input: "JA_RECOVERY_TURN_4" }),
-    });
-    assert.equal(response.status, 200);
-    const stream = await response.text();
-    assert.match(stream, /JA_RECOVERY_SUCCESS_4/u);
-    assert.match(stream, /"input_tokens":300/u);
+    assert.equal(fixture.attempts.length, RECOVERY_MAX_ATTEMPTS);
     assert.deepEqual(
-      fixture.attempts.map((attempt) => attempt.step),
-      ["1", "2", "3", "4"],
+      fixture.attempts.map((attempt) => attempt.requestNumber),
+      [1, 2, 3, 4, 5, 6],
     );
   } finally {
     await fixture.close();
   }
 });
 
-/** Provider 重试属于同一用户续答；三条 503 后下一次显式继续才可以进入新的成功尝试。 */
-test("loopback keeps a failed continuation unavailable across provider retries", async () => {
+/** 真窗释放前，手动 continue 的成功响应必须保持挂起以便采样真实运行状态。 */
+test("loopback gates a manual continuation after its prior six failures", async () => {
   const fixture = await startRecoveryFixture();
-  fixture.release();
+  try {
+    for (let requestNumber = 1; requestNumber <= RECOVERY_MAX_ATTEMPTS; requestNumber += 1) {
+      const response = await fetch(`${fixture.baseUrl}/responses`, {
+        method: "POST",
+        body: JSON.stringify({ input: "JA_RECOVERY_CONTINUE" }),
+      });
+      assert.equal(response.status, 503);
+    }
+    let settled = false;
+    const gated = fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify({
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_CONTINUE" }] },
+          { role: "assistant", content: "failed attempt" },
+        ],
+      }),
+    }).then((response) => {
+      settled = true;
+      return response;
+    });
+    await new Promise((done) => setTimeout(done, 25));
+    assert.equal(settled, false);
+    fixture.release();
+    const recovered = await gated;
+    assert.equal(recovered.status, 200);
+    assert.match(await recovered.text(), /JA_RECOVERY_CONTINUE_SUCCESS/u);
+    assert.equal(fixture.attempts.at(-1)?.continuationContext?.continueMessageCount, 0);
+  } finally {
+    await fixture.close();
+  }
+});
+
+/** 半截 delta 后的请求保留独立 usage 响应，并由第二个请求完整结束而不是拼接文本。 */
+test("loopback emits an incomplete text delta followed by a clean successful response", async () => {
+  const fixture = await startRecoveryFixture();
+  try {
+    const partial = await fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify({ input: "JA_RECOVERY_PARTIAL" }),
+    });
+    assert.equal(partial.status, 200);
+    const brokenStream = await partial.text();
+    assert.match(brokenStream, /JA_RECOVERY_PARTIAL_DRAFT_MUST_NOT_REPEAT/u);
+    assert.doesNotMatch(brokenStream, /response\.completed/u);
+
+    const recovered = await fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify({ input: "JA_RECOVERY_PARTIAL" }),
+    });
+    assert.equal(recovered.status, 200);
+    assert.match(await recovered.text(), /JA_RECOVERY_PARTIAL_RETRY_SUCCESS/u);
+    assert.deepEqual(
+      fixture.attempts.filter((attempt) => attempt.step === "JA_RECOVERY_PARTIAL").map((attempt) => attempt.mode),
+      ["truncated-after-delta", "success"],
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
+/** 确定性 400 不被 loopback fixture 转成可重试 5xx 或悄悄增加交换次数。 */
+test("loopback deterministic rejection is a single HTTP 400", async () => {
+  const fixture = await startRecoveryFixture();
+  try {
+    const response = await fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify({ input: "JA_RECOVERY_BAD_REQUEST" }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: {
+        type: "invalid_request_error",
+        code: "fixture_invalid_value",
+        param: "fixture.input",
+        message: "JA_FIXTURE_DETERMINISTIC_REJECTION",
+      },
+    });
+    assert.equal(fixture.attempts.length, 1);
+    assert.equal(fixture.attempts[0].mode, "deterministic-rejection");
+  } finally {
+    await fixture.close();
+  }
+});
+
+/** Tool continuation 重试必须带回唯一真实 ToolResult，不能重新发起第二次 shell 调用。 */
+test("loopback tool call receives one output across a failed continuation retry", async () => {
+  const fixture = await startRecoveryFixture();
   try {
     const first = await fetch(`${fixture.baseUrl}/responses`, {
       method: "POST",
-      body: JSON.stringify({ input: "继续" }),
+      body: JSON.stringify({ input: "JA_RECOVERY_TOOL_ONCE" }),
     });
     assert.equal(first.status, 200);
-    for (let retry = 0; retry < 3; retry += 1) {
-      const failed = await fetch(`${fixture.baseUrl}/responses`, {
-        method: "POST",
-        body: JSON.stringify({ input: "继续" }),
-      });
-      assert.equal(failed.status, 503);
-    }
-    const recovered = await fetch(`${fixture.baseUrl}/responses`, {
+    assert.match(await first.text(), /call_recovery_once/u);
+
+    const continuation = {
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_TOOL_ONCE" }] },
+        { type: "function_call", call_id: "call_recovery_once", name: "shell", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_recovery_once", output: "JA_RECOVERY_TOOL_ONCE_EXECUTED" },
+      ],
+    };
+    const failedFollowUp = await fetch(`${fixture.baseUrl}/responses`, {
       method: "POST",
-      body: JSON.stringify({ input: "继续" }),
+      body: JSON.stringify(continuation),
     });
-    assert.equal(recovered.status, 200);
-    assert.match(await recovered.text(), /JA_RECOVERY_CONTINUE_SUCCESS_3/u);
+    assert.equal(failedFollowUp.status, 503);
+    const final = await fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify(continuation),
+    });
+    assert.equal(final.status, 200);
+    assert.match(await final.text(), /JA_RECOVERY_TOOL_ONCE_SUCCESS/u);
     assert.deepEqual(
-      fixture.attempts.map((attempt) => attempt.continuationAttempt).filter(Boolean),
-      [1, 2, 2, 2, 3],
+      fixture.attempts.map((attempt) => attempt.functionCallOutputCount),
+      [0, 1, 1],
+    );
+    assert.deepEqual(
+      fixture.attempts.map((attempt) => attempt.mode),
+      ["single-tool-call", "tool-result-retry", "success"],
     );
   } finally {
     await fixture.close();
   }
 });
 
-/** 原生摘要string输入走真实HTTP；畸形摘要也必须正常400，不能重复写headers崩溃并遗留真窗进程。 */
+/** 摘要 HTTP 接受原生 JSON string，非法摘要走 400 并保持 fixture 清理可收口。 */
 test("summary HTTP accepts native JSON input and contains fixture failures", async () => {
   const fixture = await startRecoveryFixture();
   fixture.recoverSummary();

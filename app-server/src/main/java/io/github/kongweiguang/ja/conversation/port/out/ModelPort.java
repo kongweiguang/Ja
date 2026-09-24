@@ -122,13 +122,14 @@ public interface ModelPort {
         }
 
         /**
-         * 允许 Provider adapter 在不泄漏 wire 细节的前提下区分瞬时不可用与确定性协议拒绝；
-         * Agent Loop 仍只消费稳定的 Provider 中立终态码。
+         * 允许 Provider adapter 在不泄漏 wire 细节的前提下区分瞬时不可用、响应损坏、空闲超时与
+         * 上游拒绝；Agent Loop 只消费这些稳定的 Provider 中立终态码来决定有界重试和最终文案。
          */
         protected ModelUnavailableException(String message, Throwable cause, String terminalErrorCode) {
             super(message, cause, false, false);
-            if (!"MODEL_UNAVAILABLE".equals(terminalErrorCode)
-                && !"MODEL_PROTOCOL_ERROR".equals(terminalErrorCode)) {
+            if (terminalErrorCode == null || !java.util.Set.of("MODEL_UNAVAILABLE", "MODEL_PROTOCOL_ERROR",
+                    "MODEL_UPSTREAM_REJECTED",
+                    "MODEL_STREAM_INVALID", "MODEL_IDLE_TIMEOUT").contains(terminalErrorCode)) {
                 throw new IllegalArgumentException("invalid model terminal error code");
             }
             this.terminalErrorCode = terminalErrorCode;
@@ -381,6 +382,17 @@ public interface ModelPort {
     }
 
     /**
+     * Provider 传输的 Deadline 所有权；长时 Agent Turn 使用持久化绝对截止时间，
+     * 有界目录和评估调用继续使用逐请求硬超时。
+     */
+    enum RequestDeadlinePolicy {
+        /** Adapter 将 requestTimeout 用作调用绝对上限。 */
+        CALL_BOUNDED,
+        /** 调用方持有绝对 Deadline，Adapter 只执行响应空闲超时。 */
+        TURN_MANAGED
+    }
+
+    /**
      * 一次模型轮次的冻结配置、提示信封、持久上下文、Tool 目录、续传状态与重试策略。
      */
     record ModelRequest(
@@ -390,7 +402,8 @@ public interface ModelPort {
             List<ToolSpec> tools,
             Continuation continuation,
             int round,
-            RetryPolicy retryPolicy) {
+            RetryPolicy retryPolicy,
+            RequestDeadlinePolicy deadlinePolicy) {
         /**
          * 普通 Agent、摘要和模型测试沿用首个语义事件前的瞬时重试；需要单次尝试的内部任务
          * 必须使用完整构造器显式声明，避免靠 Prompt revision 等隐式约定分流。
@@ -399,7 +412,15 @@ public interface ModelPort {
                             List<ModelMessage> messages, List<ToolSpec> tools,
                             Continuation continuation, int round) {
             this(configuration, prompt, messages, tools, continuation, round,
-                    RetryPolicy.TRANSIENT_BEFORE_OUTPUT);
+                    RetryPolicy.TRANSIENT_BEFORE_OUTPUT, RequestDeadlinePolicy.CALL_BOUNDED);
+        }
+
+        /** 非 Turn 内部调用仍采用请求硬上限，避免重试脱离时间预算。 */
+        public ModelRequest(ModelConfiguration configuration, PromptPayload prompt,
+                            List<ModelMessage> messages, List<ToolSpec> tools,
+                            Continuation continuation, int round, RetryPolicy retryPolicy) {
+            this(configuration, prompt, messages, tools, continuation, round,
+                    retryPolicy, RequestDeadlinePolicy.CALL_BOUNDED);
         }
 
         /**
@@ -414,6 +435,7 @@ public interface ModelPort {
                 throw new IllegalArgumentException("round must be in [1,128]");
             }
             Objects.requireNonNull(retryPolicy, "retryPolicy");
+            Objects.requireNonNull(deadlinePolicy, "deadlinePolicy");
         }
     }
 

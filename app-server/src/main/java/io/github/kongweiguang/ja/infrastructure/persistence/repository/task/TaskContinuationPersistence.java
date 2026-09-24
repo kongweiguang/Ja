@@ -34,7 +34,8 @@ public final class TaskContinuationPersistence {
         String summary = switch (origin) {
             case GOAL_CONTINUATION -> "目标续跑已排队";
             case PLAN_EXECUTION -> "计划执行已排队";
-            case USER, CHILD_TASK -> throw new IllegalArgumentException("Task continuation requires an internal origin");
+            case USER, USER_CONTINUATION, CHILD_TASK -> throw new IllegalArgumentException(
+                    "Task continuation requires a Goal or Plan origin");
         };
         Long sequence = mapper.tasks().insertActivity(new TaskRecords.ActivityInsert(
                 "activity_task_resumed_" + TaskTerminalPersistence.stableSuffix(turnId),

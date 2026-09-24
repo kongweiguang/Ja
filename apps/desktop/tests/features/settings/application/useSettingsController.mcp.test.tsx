@@ -17,7 +17,6 @@ const NO_PROJECT_OVERRIDES = {
   defaultSelection: false,
   accessMode: false,
   disabledSkillReferences: [],
-  disabledMcpIds: [],
 };
 
 const MCP: SettingsMcpServer = {
@@ -77,6 +76,15 @@ function loadedFrom(document: SettingsDocument): LoadedSettings {
   };
 }
 
+/** 等待首屏并行读取落稳，确保每项测试只观察它主动触发的 MCP 结果。 */
+async function waitForSettingsQueriesIdle(): Promise<void> {
+  await waitFor(() => {
+    const queries = activeClient?.getQueryCache().getAll() ?? [];
+    expect(queries.length).toBeGreaterThan(0);
+    expect(queries.every((query) => query.state.fetchStatus === "idle")).toBe(true);
+  });
+}
+
 /** 构造真实 hook 端口；测试通过 runtime list/test 结果控制观测状态而非直接改 Query cache。 */
 function optionsFor(
   snapshot: SettingsAdapter["snapshot"],
@@ -88,6 +96,7 @@ function optionsFor(
       snapshot,
       save,
       saveProjectSkills: vi.fn(async () => "cfg_project"),
+      saveProjectMcpServers: vi.fn(async () => "cfg_project"),
       patch: vi.fn(async () => ({ version: "cfg_project" })),
       reset: vi.fn(async () => ({ version: "cfg_project" })),
       restoreLastKnownGood: vi.fn(async () => "cfg_user"),
@@ -116,6 +125,7 @@ function optionsFor(
       listMcpServers: vi.fn(async () => ({ items: [], nextCursor: null })),
       testMcp: vi.fn(async () => ({
         mcpId: MCP.mcpRevision,
+        scope: "global" as const,
         status: "healthy" as const,
         toolCount: 1,
       })),
@@ -133,7 +143,8 @@ afterEach(() => {
 });
 
 describe("useSettingsController MCP state", () => {
-  it("停用后以配置事实覆盖旧 connected/tools/error 观测", async () => {
+  /** 不健康 probe 不应再请求目录；它必须立即替换旧的 unknown/工具数投影。 */
+  it("unavailable probe 跳过工具目录读取并写入错误状态", async () => {
     let document = documentWithMcp(MCP);
     const snapshot = vi.fn(async () => loadedFrom(document));
     const save = vi.fn(async (next: SettingsDocument) => {
@@ -144,6 +155,7 @@ describe("useSettingsController MCP state", () => {
       items: [
         {
           mcpId: MCP.mcpRevision,
+          scope: "global" as const,
           name: MCP.name,
           transport: MCP.transport,
           status: "healthy" as const,
@@ -152,17 +164,19 @@ describe("useSettingsController MCP state", () => {
       ],
       nextCursor: null,
     }));
+    const listMcpTools = vi.fn(async () => ({
+      items: [{ name: "stale_tool", description: "stale" }],
+      nextCursor: null,
+    }));
     const options = optionsFor(snapshot, save, {
       listMcpServers,
       testMcp: vi.fn(async () => ({
         mcpId: MCP.mcpRevision,
+        scope: "global" as const,
         status: "unavailable" as const,
         toolCount: 0,
       })),
-      listMcpTools: vi.fn(async () => ({
-        items: [{ name: "stale_tool", description: "stale" }],
-        nextCursor: null,
-      })),
+      listMcpTools,
     });
     const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
 
@@ -171,17 +185,84 @@ describe("useSettingsController MCP state", () => {
     await waitFor(() =>
       expect(activeClient?.getQueryCache().getAll().at(-1)?.state.fetchStatus).toBe("idle"),
     );
-    await act(async () => result.current.ports.onTestMcp(MCP.mcpRevision));
+    await act(async () => result.current.ports.onTestMcp(MCP.mcpRevision, "user"));
     await waitFor(() => expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("error"));
-    expect(result.current.globalSnapshot.mcpServers[0]?.tools).toHaveLength(1);
+    expect(listMcpTools).not.toHaveBeenCalled();
+    expect(result.current.globalSnapshot.mcpServers[0]?.tools).toEqual([]);
+    expect(result.current.globalSnapshot.mcpServers[0]?.lastError).toBe(
+      "MCP 服务不可用；请检查服务状态和连接配置。",
+    );
 
-    await act(async () => result.current.ports.onCloseMcp(MCP.mcpRevision));
+    await act(async () => result.current.ports.onSaveMcp({ ...MCP, enabled: false }, "user"));
     await waitFor(() => expect(result.current.globalSnapshot.mcpServers[0]?.enabled).toBe(false));
     const server = result.current.globalSnapshot.mcpServers[0];
     expect(server?.enabled).toBe(false);
     expect(server?.status).toBe("disabled");
     expect(server?.tools).toEqual([]);
     expect(server?.lastError).toBeUndefined();
+  });
+
+  /** RPC rejection also becomes an authoritative card error instead of leaving the prior unknown state. */
+  it("MCP probe RPC 异常写入错误状态且不读取工具目录", async () => {
+    const document = documentWithMcp(MCP);
+    const listMcpTools = vi.fn(async () => ({ items: [], nextCursor: null }));
+    const options = optionsFor(
+      vi.fn(async () => loadedFrom(document)),
+      vi.fn(async () => "cfg_next"),
+      {
+        testMcp: vi.fn(async () => {
+          throw new Error("RPC transport failed");
+        }),
+        listMcpTools,
+      },
+    );
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    await waitForSettingsQueriesIdle();
+    await act(async () => {
+      await expect(result.current.ports.onTestMcp(MCP.mcpRevision, "user")).resolves.toBe("error");
+    });
+
+    await waitFor(() => expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("error"));
+    const server = result.current.globalSnapshot.mcpServers[0];
+    expect(server?.status).toBe("error");
+    expect(server?.tools).toEqual([]);
+    expect(server?.lastError).toBe("MCP 检查请求未完成；请检查 Ja 本地运行时后重试。");
+    expect(listMcpTools).not.toHaveBeenCalled();
+  });
+
+  /** 健康检查与工具发现是两项观测；目录 RPC 失败要清除数量并给卡片明确错误。 */
+  it("工具目录 RPC 异常写入可见错误而不显示零工具", async () => {
+    const document = documentWithMcp(MCP);
+    const options = optionsFor(
+      vi.fn(async () => loadedFrom(document)),
+      vi.fn(async () => "cfg_next"),
+      {
+        testMcp: vi.fn(async () => ({
+          mcpId: MCP.mcpRevision,
+          scope: "global" as const,
+          status: "available" as const,
+          toolCount: 68,
+        })),
+        listMcpTools: vi.fn(async () => {
+          throw new Error("MCP tool catalog RPC failed");
+        }),
+      },
+    );
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    await waitForSettingsQueriesIdle();
+    await act(async () => {
+      await expect(result.current.ports.onTestMcp(MCP.mcpRevision, "user")).resolves.toBe("error");
+    });
+
+    await waitFor(() => expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("error"));
+    const server = result.current.globalSnapshot.mcpServers[0];
+    expect(server?.status).toBe("error");
+    expect(server?.tools).toEqual([]);
+    expect(server?.lastError).toBe("MCP 工具目录读取失败；请重试或检查 MCP 服务兼容性。");
   });
 
   it("probe 新保存但尚未出现在 catalog 的 Server 时补齐 runtime projection", async () => {
@@ -195,6 +276,7 @@ describe("useSettingsController MCP state", () => {
         listMcpServers,
         testMcp: vi.fn(async () => ({
           mcpId: MCP.mcpRevision,
+          scope: "global" as const,
           status: "healthy" as const,
           toolCount: 1,
         })),
@@ -211,7 +293,7 @@ describe("useSettingsController MCP state", () => {
     await waitFor(() =>
       expect(activeClient?.getQueryCache().getAll().at(-1)?.state.fetchStatus).toBe("idle"),
     );
-    await act(async () => result.current.ports.onTestMcp(MCP.mcpRevision));
+    await act(async () => result.current.ports.onTestMcp(MCP.mcpRevision, "user"));
 
     await waitFor(() =>
       expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("connected"),
@@ -220,6 +302,51 @@ describe("useSettingsController MCP state", () => {
     expect(server?.id).toBe(MCP.mcpRevision);
     expect(server?.status).toBe("connected");
     expect(server?.tools).toEqual([{ name: "fresh_tool", policy: "ask" }]);
+  });
+
+  /** 真实 Kerminal 数量在 200 项协议页上限内，应完整保留 68 个安全工具摘要。 */
+  it("available probe projects all 68 tools from one catalog page", async () => {
+    const document = documentWithMcp(MCP);
+    const listMcpTools = vi.fn(async () => ({
+      items: Array.from({ length: 68 }, (_, index) => ({
+        name: `tool_${index}`,
+        description: `Tool ${index}`,
+        inputSchema: { type: "object", properties: {} },
+      })),
+      nextCursor: null,
+    }));
+    const options = optionsFor(
+      vi.fn(async () => loadedFrom(document)),
+      vi.fn(async () => "cfg_next"),
+      {
+        testMcp: vi.fn(async () => ({
+          mcpId: MCP.mcpRevision,
+          scope: "global" as const,
+          status: "available" as const,
+          toolCount: 68,
+        })),
+        listMcpTools,
+      },
+    );
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    await waitForSettingsQueriesIdle();
+
+    await act(async () => {
+      await expect(result.current.ports.onTestMcp(MCP.mcpRevision, "user")).resolves.toBe(
+        "connected",
+      );
+    });
+
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("connected"),
+    );
+    const server = result.current.globalSnapshot.mcpServers[0];
+    expect(listMcpTools).toHaveBeenCalledTimes(1);
+    expect(server?.status).toBe("connected");
+    expect(server?.tools).toHaveLength(68);
+    expect(server?.tools[0]).toEqual({ name: "tool_0", policy: "ask" });
+    expect(server?.lastError).toBeUndefined();
   });
 
   it("编辑重新启用时失效同一 generation 的旧 disabled 健康 cache", async () => {
@@ -233,6 +360,7 @@ describe("useSettingsController MCP state", () => {
       items: [
         {
           mcpId: MCP.mcpRevision,
+          scope: "global" as const,
           name: MCP.name,
           transport: MCP.transport,
           status: document.mcpServers[0]?.enabled ? ("healthy" as const) : ("disabled" as const),
@@ -247,7 +375,7 @@ describe("useSettingsController MCP state", () => {
     await waitFor(() =>
       expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("disabled"),
     );
-    await act(async () => result.current.ports.onSaveMcp({ ...MCP, enabled: true }));
+    await act(async () => result.current.ports.onSaveMcp({ ...MCP, enabled: true }, "user"));
 
     await waitFor(() =>
       expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("connected"),
@@ -262,12 +390,20 @@ describe("useSettingsController MCP state", () => {
       document = structuredClone(next);
       return "cfg_next";
     });
-    let resolveProbe!: (value: { mcpId: string; status: "healthy"; toolCount: number }) => void;
-    const probe = new Promise<{ mcpId: string; status: "healthy"; toolCount: number }>(
-      (resolve) => {
-        resolveProbe = resolve;
-      },
-    );
+    let resolveProbe!: (value: {
+      mcpId: string;
+      scope: "global";
+      status: "healthy";
+      toolCount: number;
+    }) => void;
+    const probe = new Promise<{
+      mcpId: string;
+      scope: "global";
+      status: "healthy";
+      toolCount: number;
+    }>((resolve) => {
+      resolveProbe = resolve;
+    });
     const options = optionsFor(snapshot, save, {
       listMcpServers: vi.fn(async () => ({ items: [], nextCursor: null })),
       testMcp: vi.fn(() => probe),
@@ -277,10 +413,10 @@ describe("useSettingsController MCP state", () => {
 
     let pendingProbe: Promise<unknown>;
     await act(async () => {
-      pendingProbe = result.current.ports.onTestMcp(MCP.mcpRevision);
+      pendingProbe = result.current.ports.onTestMcp(MCP.mcpRevision, "user");
     });
-    await act(async () => result.current.ports.onCloseMcp(MCP.mcpRevision));
-    resolveProbe({ mcpId: MCP.mcpRevision, status: "healthy", toolCount: 1 });
+    await act(async () => result.current.ports.onSaveMcp({ ...MCP, enabled: false }, "user"));
+    resolveProbe({ mcpId: MCP.mcpRevision, scope: "global", status: "healthy", toolCount: 1 });
     await act(async () => pendingProbe);
 
     await waitFor(() => expect(result.current.globalSnapshot.mcpServers[0]?.enabled).toBe(false));
@@ -288,5 +424,107 @@ describe("useSettingsController MCP state", () => {
     expect(server?.enabled).toBe(false);
     expect(server?.status).toBe("disabled");
     expect(server?.tools).toEqual([]);
+  });
+
+  /** 新探测推进身份序号，旧 probe 晚到时不能覆盖最新健康状态或重读目录。 */
+  it("忽略较新测试之后返回的旧 probe", async () => {
+    const document = documentWithMcp(MCP);
+    type ProbeResult = {
+      mcpId: string;
+      scope: "global";
+      status: "unavailable" | "available";
+      toolCount: number;
+    };
+    let resolveOldProbe!: (result: ProbeResult) => void;
+    const oldProbe = new Promise<ProbeResult>((resolve) => {
+      resolveOldProbe = resolve;
+    });
+    const testMcp = vi
+      .fn()
+      .mockReturnValueOnce(oldProbe)
+      .mockResolvedValueOnce({
+        mcpId: MCP.mcpRevision,
+        scope: "global" as const,
+        status: "available" as const,
+        toolCount: 1,
+      });
+    const listMcpTools = vi.fn(async () => ({
+      items: [{ name: "fresh_tool", description: "fresh" }],
+      nextCursor: null,
+    }));
+    const options = optionsFor(
+      vi.fn(async () => loadedFrom(document)),
+      vi.fn(async () => "cfg_next"),
+      { testMcp, listMcpTools },
+    );
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() => expect(result.current.loaded).toBeDefined());
+    await waitForSettingsQueriesIdle();
+
+    let oldRequest!: Promise<unknown>;
+    await act(async () => {
+      oldRequest = result.current.ports.onTestMcp(MCP.mcpRevision, "user");
+    });
+    await waitFor(() => expect(testMcp).toHaveBeenCalledTimes(1));
+    let latestRequest!: Promise<unknown>;
+    await act(async () => {
+      latestRequest = result.current.ports.onTestMcp(MCP.mcpRevision, "user");
+    });
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("connected"),
+    );
+    await act(async () => latestRequest);
+
+    resolveOldProbe({
+      mcpId: MCP.mcpRevision,
+      scope: "global",
+      status: "unavailable",
+      toolCount: 0,
+    });
+    await act(async () => oldRequest);
+
+    expect(listMcpTools).toHaveBeenCalledTimes(1);
+    expect(result.current.globalSnapshot.mcpServers[0]?.status).toBe("connected");
+    expect(result.current.globalSnapshot.mcpServers[0]?.tools).toEqual([
+      { name: "fresh_tool", policy: "ask" },
+    ]);
+  });
+
+  /** 项目 MCP 只提交项目字段 CAS patch，保存和删除均不重写全局文档。 */
+  it("saves and deletes project MCP through the project adapter", async () => {
+    const global = documentWithMcp(MCP);
+    const projectServer: SettingsMcpServer = {
+      ...MCP,
+      mcpRevision: "mcp_project",
+      name: "Project Tools",
+    };
+    let projectServers = [projectServer];
+    const saveUser = vi.fn(async () => "cfg_user_next");
+    const snapshot = vi.fn(
+      async (): Promise<LoadedSettings> => ({
+        ...loadedFrom(global),
+        projectMcpServers: structuredClone(projectServers),
+      }),
+    );
+    const options = optionsFor(snapshot, saveUser);
+    const saveProject = vi.fn(async (servers: SettingsMcpServer[], workspaceId: string) => {
+      expect(workspaceId).toBe("ws_project");
+      projectServers = structuredClone(servers);
+      return "cfg_project_next";
+    });
+    options.adapter.saveProjectMcpServers = saveProject;
+    options.workspaceScope = { kind: "project", workspaceId: "ws_project" };
+    const { result } = renderHook(() => useSettingsController(options), { wrapper: QueryWrapper });
+    await waitFor(() =>
+      expect(result.current.mcpSettings.project?.[0]?.name).toBe("Project Tools"),
+    );
+    await act(async () =>
+      result.current.ports.onSaveMcp({ ...projectServer, enabled: false }, "project"),
+    );
+    await waitFor(() => expect(result.current.mcpSettings.project?.[0]?.enabled).toBe(false));
+    await act(async () => result.current.ports.onDeleteMcp("mcp_project", "project"));
+    await waitFor(() => expect(result.current.mcpSettings.project).toEqual([]));
+    expect(saveProject).toHaveBeenCalledTimes(2);
+    expect(saveUser).not.toHaveBeenCalled();
   });
 });

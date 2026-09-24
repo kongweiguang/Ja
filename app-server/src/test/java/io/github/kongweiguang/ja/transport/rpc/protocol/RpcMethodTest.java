@@ -26,6 +26,14 @@ final class RpcMethodTest {
         assertSame(RpcMethod.TASK_CLOSE, RpcMethod.fromWireName("task/close"));
     }
 
+    /** MCP 会话只读查询需和 Rust/TypeScript 保持同名且可双向解码。 */
+    @Test
+    void mapsThreadMcpMethodsToCurrentWireNames() {
+        assertEquals("thread/mcp/read", RpcMethod.THREAD_MCP_READ.wireName());
+        assertSame(RpcMethod.THREAD_MCP_READ, RpcMethod.fromWireName("thread/mcp/read"));
+
+    }
+
     /**
      * 拒绝已淘汰的 task/message/send，避免旧客户端名称因白名单遗漏而重新进入公共协议。
      */

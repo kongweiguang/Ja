@@ -39,14 +39,19 @@ import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,6 +60,9 @@ import org.slf4j.LoggerFactory;
  * 编排一个 Turn 的上下文准备、Provider 轮次、Tool batch 与唯一终态提交，是 Agent Loop 的状态机执行器。
  */
 final class AgentTurnExecution {
+    private static final int MAX_ASSISTANT_ATTEMPTS = 6;
+    private static final Duration ASSISTANT_RETRY_BASE_DELAY = Duration.ofMillis(250);
+    private static final Duration ASSISTANT_RETRY_MAX_DELAY = Duration.ofSeconds(5);
     private static final Logger LOGGER = LoggerFactory.getLogger(AgentTurnExecution.class);
     private final ModelPort model;
     private final ConversationRepository store;
@@ -135,8 +143,9 @@ final class AgentTurnExecution {
         ModelPort.Continuation continuation = null;
         ProviderRequestProfile continuationProfile = null;
         String lastSummary = request.initialSummary();
-        AgentRound current = null;
-        UsageDurability currentUsageDurability = UsageDurability.NOT_COMMITTED;
+        AtomicReference<AgentRound> current = new AtomicReference<>();
+        AtomicReference<UsageDurability> currentUsageDurability =
+                new AtomicReference<>(UsageDurability.NOT_COMMITTED);
         UsageCursor usageCursor = new UsageCursor();
         try {
             persistence.transition(request, state, TurnState.RUNNING, sink);
@@ -199,17 +208,8 @@ final class AgentTurnExecution {
                     throw new AgentLoop.LoopFailure("REQUEST_DEADLINE_EXCEEDED", "turn deadline exceeded");
                 }
                 /* 新 round 真正取得 current 身份时才重置，避免轮次间取消误用上一轮的持久化状态。 */
-                currentUsageDurability = UsageDurability.NOT_COMMITTED;
-                AgentRound collector =
-                        current =
-                                new AgentRound(
-                                        planningCommand.turnId(),
-                                        cancellation,
-                                        sink,
-                                        loopClosed,
-                                        state,
-                                        round,
-                                        deltaTimers.openTimer(planningCommand.turnId(), round));
+                current.set(null);
+                currentUsageDurability.set(UsageDurability.NOT_COMMITTED);
                 ConversationRepository.ThreadSnapshot snapshot =
                         store
                                 .readThread(planningCommand.threadId())
@@ -305,8 +305,7 @@ final class AgentTurnExecution {
                         planningCommand.workspaceId(), planningCommand.threadId(),
                         planningCommand.turnId(), contextRevision,
                         "cmp_" + java.util.UUID.randomUUID().toString().replace("-", ""), sink, clock);
-                try {
-                    ContextOrchestrator.Execution<ModelPort.ModelOutcome> contextExecution =
+                ContextOrchestrator.Execution<ModelPort.ModelOutcome> contextExecution =
                             contexts.execute(
                                     contextRequest,
                                     receipt -> persistence.observeCommittedCheckpoint(request, state, receipt),
@@ -362,38 +361,79 @@ final class AgentTurnExecution {
                                             ensureLatestContextFits(dispatchEstimate, dispatchPrompt.budget());
                                             promptCall[0] = new PromptCallState(
                                                     plannedSummary, dispatchPrompt.snapshot().revision());
-                                            TurnExecutionState.Ready ready = ready(state.execution);
-                                            String requestId = "request_" + compactUuid();
-                                            TurnExecutionState.ProviderPending pending =
-                                                    new TurnExecutionState.ProviderPending(
-                                                            ready.common(), requestId, "item_" + compactUuid(),
-                                                            TurnExecutionState.ProviderPurpose.ASSISTANT,
-                                                            dispatchProfile, dispatchEstimate.fingerprint(), ready);
-                                            persistence.emit(request, state, null, List.of(
-                                                    new ConversationRepository.UsageFact(
-                                                            requestId, null, modelRound,
-                                                            ready.common().nextProviderOrdinal(),
-                                                            ConversationRepository.UsagePurpose.ASSISTANT,
-                                                            ConversationRepository.UsageCertainty.UNKNOWN,
-                                                            dispatchProfile)), pending, sink);
-                                            observers.observe(new ExecutionObserver.ModelStarted(
-                                                    dispatchCommand.threadId(), dispatchCommand.turnId(),
-                                                    requestId, modelRound));
-                                            ModelPort.ModelOutcome modelOutcome;
-                                            try {
-                                                modelOutcome = await(model.start(
-                                                        modelRequest, collector, cancellation));
-                                                observers.observe(new ExecutionObserver.ModelCompleted(
+                                            ModelPort.ModelRequest singleAttemptRequest = withRetryPolicy(
+                                                    modelRequest, ModelPort.RetryPolicy.SINGLE_ATTEMPT,
+                                                    ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
+                                            ModelPort.ModelOutcome modelOutcome = null;
+                                            for (int attempt = 1; attempt <= MAX_ASSISTANT_ATTEMPTS; attempt++) {
+                                                ensureAssistantAttemptActive(cancellation,
+                                                        state.execution.common().deadlineAt());
+                                                AgentRound attemptCollector = new AgentRound(
+                                                        dispatchCommand.turnId(), cancellation, sink, loopClosed,
+                                                        state, modelRound,
+                                                        deltaTimers.openTimer(dispatchCommand.turnId(), modelRound));
+                                                current.set(attemptCollector);
+                                                currentUsageDurability.set(UsageDurability.NOT_COMMITTED);
+                                                TurnExecutionState.Ready ready = ready(state.execution);
+                                                String requestId = "request_" + compactUuid();
+                                                TurnExecutionState.ProviderPending pending =
+                                                        new TurnExecutionState.ProviderPending(
+                                                                ready.common(), requestId, "item_" + compactUuid(),
+                                                                TurnExecutionState.ProviderPurpose.ASSISTANT,
+                                                                dispatchProfile, dispatchEstimate.fingerprint(), ready);
+                                                persistence.emit(request, state, null, List.of(
+                                                        new ConversationRepository.UsageFact(
+                                                                requestId, null, modelRound,
+                                                                ready.common().nextProviderOrdinal(),
+                                                                ConversationRepository.UsagePurpose.ASSISTANT,
+                                                                ConversationRepository.UsageCertainty.UNKNOWN,
+                                                                dispatchProfile)), pending, sink);
+                                                observers.observe(new ExecutionObserver.ModelStarted(
                                                         dispatchCommand.threadId(), dispatchCommand.turnId(),
-                                                        requestId, modelRound,
-                                                        ExecutionObserver.CompletionStatus.SUCCEEDED,
-                                                        modelOutcome.finishReason(), modelOutcome.usage(), null));
-                                            } catch (RuntimeException failure) {
-                                                observers.observe(new ExecutionObserver.ModelCompleted(
-                                                        dispatchCommand.threadId(), dispatchCommand.turnId(),
-                                                        requestId, modelRound, failureStatus(failure), null, null,
-                                                        failureCode(failure)));
-                                                throw failure;
+                                                        requestId, modelRound));
+                                                try {
+                                                    /* 规划/估算租约不能覆盖状态；仅真实 Provider dispatch 发布这份目录。 */
+                                                    dispatchRuntime.observeProviderDispatch(
+                                                            dispatchCatalog.stream()
+                                                                    .anyMatch(McpAgentTool.class::isInstance));
+                                                    modelOutcome = await(model.start(
+                                                            singleAttemptRequest, attemptCollector, cancellation));
+                                                    attemptCollector.recordOutcomeUsage(modelOutcome.usage());
+                                                    observers.observe(new ExecutionObserver.ModelCompleted(
+                                                            dispatchCommand.threadId(), dispatchCommand.turnId(),
+                                                            requestId, modelRound,
+                                                            ExecutionObserver.CompletionStatus.SUCCEEDED,
+                                                            modelOutcome.finishReason(), modelOutcome.usage(), null));
+                                                    attemptCollector.close();
+                                                    break;
+                                                } catch (RuntimeException failure) {
+                                                    observers.observe(new ExecutionObserver.ModelCompleted(
+                                                            dispatchCommand.threadId(), dispatchCommand.turnId(),
+                                                            requestId, modelRound, failureStatus(failure), null, null,
+                                                            failureCode(failure)));
+                                                    attemptCollector.close();
+                                                    if (!retryableAssistantFailure(failure)
+                                                            || attempt == MAX_ASSISTANT_ATTEMPTS) {
+                                                        throw failure;
+                                                    }
+                                                    ensureActive(cancellation);
+                                                    ModelUsage failedUsage = attemptCollector.usage();
+                                                    TurnExecutionState.ProviderPending failedPending =
+                                                            pending(state.execution);
+                                                    persistence.settleAssistantRetry(request, state, failedPending,
+                                                            modelRound, failedUsage, attemptCollector.partialText(),
+                                                            attemptCollector.reasoningSummary(), sink);
+                                                    usageCursor.latest = requestUsage(
+                                                            failedPending, failedUsage, modelRound);
+                                                    currentUsageDurability.set(UsageDurability.COMMITTED);
+                                                    publishRetryStarted(request, state, attempt + 1, sink);
+                                                    awaitAssistantRetryDelay(retryDelay(attempt),
+                                                            failedPending.common().deadlineAt(), cancellation);
+                                                }
+                                            }
+                                            if (modelOutcome == null) {
+                                                throw new AgentLoop.LoopFailure(
+                                                        "INVALID_STATE", "assistant retry loop had no outcome");
                                             }
                                             assistantRequest[0] = new AssistantRequestResources(
                                                     dispatchRuntime, dispatchMcp, dispatchToolCatalog,
@@ -422,12 +462,10 @@ final class AgentTurnExecution {
                     outcome = contextExecution.result();
                     promptCheckpointId = contextExecution.checkpoint()
                             .map(CheckpointStore.ContextCheckpoint::checkpointId).orElse(null);
-                } finally {
-                    collector.close();
-                }
                 planningMcp.close();
                 planningRuntimeClosed = true;
                 planningRuntime.close();
+                AgentRound collector = current.get();
                 if (promptCall[0] == null) {
                     throw new AgentLoop.LoopFailure("INVALID_STATE", "Prompt call state is unavailable");
                 }
@@ -441,7 +479,6 @@ final class AgentTurnExecution {
                 lastSummary = promptCall[0].summary();
                 String batchPromptRevision = promptCall[0].revision();
                 ensureActive(cancellation);
-                collector.recordOutcomeUsage(outcome.usage());
                 if (outcome.finishReason() == ModelPort.FinishReason.MAX_OUTPUT_TOKENS) {
                     throw new AgentLoop.LoopFailure("BUDGET_EXCEEDED", "model output limit reached");
                 }
@@ -459,7 +496,7 @@ final class AgentTurnExecution {
                         /* emitWithNextInput 可能先提交 AssistantFact、再在事件投影或队首挂起处失败；
                          * 只看异常会把已持久化的 reasoning 摘要误判为草稿，终态随后重复写入。 */
                         if (state.turnMutationVersion > mutationVersionBeforeModelStep) {
-                            currentUsageDurability = UsageDurability.COMMITTED;
+                            currentUsageDurability.set(UsageDurability.COMMITTED);
                         }
                     }
                     if (continued) {
@@ -522,7 +559,7 @@ final class AgentTurnExecution {
                      * 已推进，本轮 Usage 就是既有事实，终态事务不得再次插入同一唯一键。
                      */
                     if (state.turnMutationVersion > mutationVersionBeforeModelStep) {
-                        currentUsageDurability = UsageDurability.COMMITTED;
+                        currentUsageDurability.set(UsageDurability.COMMITTED);
                     }
                 }
                 /* Provider 与配置租约到此已经结算；MCP owner 继续 pin 住生成本 batch 的精确路由，
@@ -586,22 +623,8 @@ final class AgentTurnExecution {
                     && persistence.suspendAfterPlanPause(request, state, sink)) {
                 throw new AgentLoop.PlanPauseSuspendedException();
             }
-            return terminal(
-                    request,
-                    sink,
-                    state,
-                    cancellation,
-                    terminalCoordinator,
-                    TurnState.CANCELLED,
-                    current == null ? "" : current.terminalText(),
-                    null,
-                    draftReasoningSummary(current, currentUsageDurability),
-                    current == null ? null : current.usage(),
-                    current == null ? 0 : current.round(),
-                    currentUsageDurability == UsageDurability.NOT_COMMITTED,
-                    usageCursor.latest,
-                    null,
-                    null);
+            return terminalForLatestRound(request, sink, state, cancellation, terminalCoordinator,
+                    TurnState.CANCELLED, current, currentUsageDurability, usageCursor.latest, null, null);
         } catch (TerminalCoordinator.CommitFailure failure) {
             /* 数据库尚未进入终态，应用紧急 Owner 继续持有终态提交权。 */
             throw failure;
@@ -611,60 +634,19 @@ final class AgentTurnExecution {
         } catch (ContextException failure) {
             String code =
                     contextFailureCode(failure);
-            return terminal(
-                    request,
-                    sink,
-                    state,
-                    cancellation,
-                    terminalCoordinator,
-                    TurnState.FAILED,
-                    current == null ? "" : current.partialText(),
-                    null,
-                    draftReasoningSummary(current, currentUsageDurability),
-                    current == null ? null : current.usage(),
-                    current == null ? 0 : current.round(),
-                    currentUsageDurability == UsageDurability.NOT_COMMITTED,
-                    usageCursor.latest,
-                    code,
-                    contextFailureMessage(code));
+            return terminalForLatestRound(request, sink, state, cancellation, terminalCoordinator,
+                    TurnState.FAILED, current, currentUsageDurability, usageCursor.latest,
+                    code, contextFailureMessage(code));
         } catch (AgentLoop.LoopFailure failure) {
-            return terminal(
-                    request,
-                    sink,
-                    state,
-                    cancellation,
-                    terminalCoordinator,
-                    TurnState.FAILED,
-                    current == null ? "" : current.partialText(),
-                    null,
-                    draftReasoningSummary(current, currentUsageDurability),
-                    current == null ? null : current.usage(),
-                    current == null ? 0 : current.round(),
-                    currentUsageDurability == UsageDurability.NOT_COMMITTED,
-                    usageCursor.latest,
-                    failure.code(),
-                    failure.getMessage());
+            return terminalForLatestRound(request, sink, state, cancellation, terminalCoordinator,
+                    TurnState.FAILED, current, currentUsageDurability, usageCursor.latest,
+                    failure.code(), failure.getMessage());
         } catch (ModelPort.ModelUnavailableException failure) {
             logModelUnavailable(failure);
             String errorCode = failure.terminalErrorCode();
-            return terminal(
-                    request,
-                    sink,
-                    state,
-                    cancellation,
-                    terminalCoordinator,
-                    TurnState.FAILED,
-                    current == null ? "" : current.partialText(),
-                    null,
-                    draftReasoningSummary(current, currentUsageDurability),
-                    current == null ? null : current.usage(),
-                    current == null ? 0 : current.round(),
-                    currentUsageDurability == UsageDurability.NOT_COMMITTED,
-                    usageCursor.latest,
-                    errorCode,
-                    "MODEL_PROTOCOL_ERROR".equals(errorCode)
-                            ? "model provider rejected the request"
-                            : "model provider is unavailable");
+            return terminalForLatestRound(request, sink, state, cancellation, terminalCoordinator,
+                    TurnState.FAILED, current, currentUsageDurability, usageCursor.latest,
+                    errorCode, providerFailureMessage(errorCode));
         } catch (AgentLoop.InputNeedsAttentionException attention) {
             /* 队首问题与 SUSPENDED 已先持久化；继续交给 TurnService 清理 Scope，禁止二次提交 FAILED。 */
             throw attention;
@@ -674,22 +656,9 @@ final class AgentTurnExecution {
             throw suspended;
         } catch (RuntimeException failure) {
             logInternalFailure(failure);
-            return terminal(
-                    request,
-                    sink,
-                    state,
-                    cancellation,
-                    terminalCoordinator,
-                    TurnState.FAILED,
-                    current == null ? "" : current.terminalText(),
-                    null,
-                    draftReasoningSummary(current, currentUsageDurability),
-                    current == null ? null : current.usage(),
-                    current == null ? 0 : current.round(),
-                    currentUsageDurability == UsageDurability.NOT_COMMITTED,
-                    usageCursor.latest,
-                    "INTERNAL_ERROR",
-                    "agent loop failed");
+            return terminalForLatestRound(request, sink, state, cancellation, terminalCoordinator,
+                    TurnState.FAILED, current, currentUsageDurability, usageCursor.latest,
+                    "INTERNAL_ERROR", "agent loop failed");
         }
     }
 
@@ -706,6 +675,89 @@ final class AgentTurnExecution {
             current = cause;
         }
         return null;
+    }
+
+    /**
+     * 普通 Agent Assistant 调用由 Session 持有重试与 Turn deadline，Adapter 仅负责一次网络尝试和 idle cap。
+     */
+    private static ModelPort.ModelRequest withRetryPolicy(ModelPort.ModelRequest request,
+                                                          ModelPort.RetryPolicy retryPolicy,
+                                                          ModelPort.RequestDeadlinePolicy deadlinePolicy) {
+        Objects.requireNonNull(request, "request");
+        return new ModelPort.ModelRequest(request.configuration(), request.prompt(), request.messages(),
+                request.tools(), request.continuation(), request.round(),
+                Objects.requireNonNull(retryPolicy, "retryPolicy"),
+                Objects.requireNonNull(deadlinePolicy, "deadlinePolicy"));
+    }
+
+    /**
+     * 只有 Provider 明确给出的可恢复瞬时分类进入 Session 预算；确定性拒绝和本地协议错误立即停止。
+     */
+    private static boolean retryableAssistantFailure(Throwable failure) {
+        ModelPort.ModelUnavailableException providerFailure = modelUnavailableCause(failure);
+        if (providerFailure == null) return false;
+        return switch (providerFailure.terminalErrorCode()) {
+            case "MODEL_UNAVAILABLE", "MODEL_STREAM_INVALID", "MODEL_IDLE_TIMEOUT" -> true;
+            case "MODEL_UPSTREAM_REJECTED", "MODEL_PROTOCOL_ERROR" -> false;
+            default -> false;
+        };
+    }
+
+    /**
+     * 每个请求前检查取消、Loop 关闭和 Turn 绝对截止，避免 idle 活跃流或 backoff 延长 Operation。
+     */
+    private void ensureAssistantAttemptActive(CancellationToken cancellation, Instant deadlineAt) {
+        ensureActive(cancellation);
+        if (!clock.instant().isBefore(Objects.requireNonNull(deadlineAt, "deadlineAt"))) {
+            throw new AgentLoop.LoopFailure("REQUEST_DEADLINE_EXCEEDED", "turn deadline exceeded");
+        }
+    }
+
+    /**
+     * 使用确定性指数退避并封顶，累计等待上限有限且保留足够时间交给后续 Provider 尝试。
+     */
+    private static Duration retryDelay(int failedAttempt) {
+        if (failedAttempt < 1 || failedAttempt >= MAX_ASSISTANT_ATTEMPTS) {
+            throw new IllegalArgumentException("invalid failed attempt");
+        }
+        long multiplier = 1L << Math.min(failedAttempt - 1, 20);
+        Duration delay = ASSISTANT_RETRY_BASE_DELAY.multipliedBy(multiplier);
+        return delay.compareTo(ASSISTANT_RETRY_MAX_DELAY) > 0 ? ASSISTANT_RETRY_MAX_DELAY : delay;
+    }
+
+    /**
+     * 用已提交 retry settlement 的 mutation fence 发布轻量状态，不把原始异常或半截正文送入事件。
+     */
+    private void publishRetryStarted(TurnExecutionPlan request, AgentLoop.RuntimeState state,
+                                     int attempt, TurnEventSink sink) {
+        TurnEvent.Context context = new TurnEvent.Context("evt_" + compactUuid(), request.threadId(),
+                request.turnId(), state.threadRevision, state.turnMutationVersion, clock.instant());
+        await(sink.publish(new TurnEvent.RetryStarted(context, attempt, MAX_ASSISTANT_ATTEMPTS)));
+    }
+
+    /**
+     * 退避等待注册一次取消唤醒并裁到绝对 deadline；用等待结果区分取消与到期，阻止越过期限的网络请求。
+     */
+    private void awaitAssistantRetryDelay(Duration delay, Instant deadlineAt, CancellationToken cancellation) {
+        ensureAssistantAttemptActive(cancellation, deadlineAt);
+        Duration remaining = Duration.between(clock.instant(), deadlineAt);
+        if (remaining.isZero() || remaining.isNegative()) {
+            throw new AgentLoop.LoopFailure("REQUEST_DEADLINE_EXCEEDED", "turn deadline exceeded");
+        }
+        Duration boundedDelay = delay.compareTo(remaining) < 0 ? delay : remaining;
+        CountDownLatch wakeup = new CountDownLatch(1);
+        try (CancellationToken.Registration ignored = cancellation.onCancellation(wakeup::countDown)) {
+            try {
+                boolean cancellationWakeup = wakeup.await(boundedDelay.toNanos(), TimeUnit.NANOSECONDS);
+                if (!cancellationWakeup && boundedDelay.equals(remaining)) {
+                    throw new AgentLoop.LoopFailure("REQUEST_DEADLINE_EXCEEDED", "turn deadline exceeded");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new CancellationException("assistant retry wait interrupted");
+            }
+        }
+        ensureAssistantAttemptActive(cancellation, deadlineAt);
     }
 
     /**
@@ -886,8 +938,10 @@ final class AgentTurnExecution {
         for (AgentTool.Invocation call : calls) {
             AgentTool tool = catalog.get(call.toolName());
             String batchId = "batch_" + pending.requestId().substring("request_".length());
+            java.util.Optional<AgentTool.InvocationValidationFailure> validationFailure = tool == null
+                    ? java.util.Optional.empty() : tool.validationFailure(call);
             ConversationRepository.ToolBinding binding = tool == null ? null
-                    : binding(batchId, call, tool.bindingDescriptor(), pending.profile());
+                    : binding(batchId, call, tool.bindingDescriptor(call), pending.profile());
             facts.add(
                     new ConversationRepository.ToolPreparedFact(
                             call.callId(),
@@ -897,7 +951,9 @@ final class AgentTurnExecution {
                             /* 未知名称没有可信能力声明，审计按潜在外部副作用保守记录；无 binding 仍保证零执行。 */
                             tool == null
                                     ? io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect.EXTERNAL
-                                    : tool.sideEffect(),
+                                    : validationFailure.isPresent()
+                                            ? io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect.EXTERNAL
+                                            : tool.sideEffect(call),
                             ToolPresentationProjector.prepared(call, requestRuntime.workspaceRoot(),
                                     requestRuntime.presentationSecrets()),
                             binding));
@@ -979,7 +1035,8 @@ final class AgentTurnExecution {
                     .filter(value -> value.batchId().equals(tools.batchId()))
                     .orElse(null);
             AgentTool current = catalog.get(call.toolName());
-            if (binding != null && current != null && binding.descriptor().equals(current.bindingDescriptor())) {
+            if (binding != null && current != null
+                    && binding.descriptor().equals(current.bindingDescriptor(call))) {
                 exactCatalog.put(call.toolName(), current);
             }
         }
@@ -1032,6 +1089,29 @@ final class AgentTurnExecution {
         }
     }
 
+    /** 失败与取消共享最近轮次的终态投影；只在取消状态下使用已闭合文本，其余失败保存部分文本。 */
+    private TurnResult terminalForLatestRound(
+            TurnExecutionPlan request,
+            TurnEventSink sink,
+            AgentLoop.RuntimeState state,
+            CancellationToken cancellation,
+            TerminalCoordinator terminalCoordinator,
+            TurnState target,
+            AtomicReference<AgentRound> current,
+            AtomicReference<UsageDurability> currentUsageDurability,
+            ProviderRequestUsage committedUsage,
+            String errorCode,
+            String errorMessage) {
+        AgentRound latest = current.get();
+        UsageDurability usageDurability = currentUsageDurability.get();
+        String summary = latest == null ? ""
+                : target == TurnState.CANCELLED ? latest.terminalText() : latest.partialText();
+        return terminal(request, sink, state, cancellation, terminalCoordinator, target, summary, null,
+                draftReasoningSummary(latest, usageDurability), latest == null ? null : latest.usage(),
+                latest == null ? 0 : latest.round(), usageDurability == UsageDurability.NOT_COMMITTED,
+                committedUsage, errorCode, errorMessage);
+    }
+
     /**
      * 先关闭 Turn 级 MCP 会话，再让最新取消声明覆盖候选结果，最后竞争唯一终态提交；已公开的
      * reasoning 摘要随终态事实保留，未闭合的原生 reasoning 不在此路径进入持久化。
@@ -1072,7 +1152,9 @@ final class AgentTurnExecution {
                 terminalCoordinator,
                 target,
                 summary,
-                finalMessage == null ? null : failureReplyPolicy.messageIdFor(request.turnId(), state.execution),
+                finalMessage == null ? null : target == TurnState.FAILED
+                        ? failureReplyPolicy.failureMessageIdFor(request.turnId())
+                        : failureReplyPolicy.messageIdFor(request.turnId(), state.execution),
                 finalMessage,
                 reasoningSummary,
                 usage,
@@ -1451,9 +1533,21 @@ final class AgentTurnExecution {
     private static String contextFailureMessage(String code) {
         return switch (code) {
             case "MODEL_UNAVAILABLE" -> "model provider is unavailable";
-            case "MODEL_PROTOCOL_ERROR" -> "model provider rejected the request";
+            case "MODEL_UPSTREAM_REJECTED", "MODEL_PROTOCOL_ERROR" -> "model provider rejected the request";
+            case "MODEL_STREAM_INVALID" -> "model response stream was invalid or incomplete";
+            case "MODEL_IDLE_TIMEOUT" -> "model response timed out while idle";
             case "SUMMARY_FAILURE" -> "context summary generation failed";
             default -> "context preparation failed";
+        };
+    }
+
+    /** 稳定区分上游拒绝、坏流、空闲超时与其它 Provider 不可用，避免最终提示混成同一原因。 */
+    private static String providerFailureMessage(String code) {
+        return switch (code) {
+            case "MODEL_UPSTREAM_REJECTED", "MODEL_PROTOCOL_ERROR" -> "model provider rejected the request";
+            case "MODEL_STREAM_INVALID" -> "model response stream was invalid or incomplete";
+            case "MODEL_IDLE_TIMEOUT" -> "model response timed out while idle";
+            default -> "model provider is unavailable";
         };
     }
 

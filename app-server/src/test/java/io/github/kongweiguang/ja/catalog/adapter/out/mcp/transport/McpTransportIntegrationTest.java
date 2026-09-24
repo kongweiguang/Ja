@@ -52,9 +52,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 final class McpTransportIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** 验证 stdio 清空继承环境、只解析显式引用、完成调用并回收子进程。 */
+    /** 验证 stdio 继承宿主环境并覆盖显式配置，完成调用后回收子进程且不回显凭据值。 */
     @Test
-    void stdioIsEnvironmentConfinedAndLeavesNoOrphan(@TempDir Path directory) throws Exception {
+    void stdioInheritsHostEnvironmentAndLeavesNoOrphan(@TempDir Path directory) throws Exception {
         Path report = directory.resolve("report.txt");
         Path classes = Path.of(McpStdioFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         List<String> command = List.of(
@@ -83,7 +83,7 @@ final class McpTransportIntegrationTest {
             assertTrue(awaitFile(report));
             List<String> observations = Files.readAllLines(report, StandardCharsets.UTF_8);
             pid = Long.parseLong(observations.getFirst());
-            assertTrue(observations.contains("parent=false"));
+            assertTrue(observations.contains("parent=true"));
             assertTrue(observations.contains("allowed=true"));
             assertTrue(observations.contains("secret=true"));
             assertFalse(String.join("\n", observations).contains("resolved"));

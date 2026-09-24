@@ -31,6 +31,11 @@ public interface ConfigurationGenerationSnapshot {
     /** 返回本代际创建时的工作区信任结果；后续请求通过新代际观察变更。 */
     boolean trusted();
 
+    /** 项目 MCP 错误只供会话显示脱敏提示，不允许从错误反推配置正文。 */
+    default boolean projectMcpIssue() {
+        return false;
+    }
+
     /**
      * 返回用户级交互澄清开关；该值只控制普通模式是否主动提问，Plan 与权限审批不受影响。
      * 缺失配置按 true 处理，保证旧的 v1 文档安全地获得可发现的澄清能力。
@@ -209,7 +214,7 @@ public interface ConfigurationGenerationSnapshot {
     }
 
     /** MCP 启动描述；凭据仅以 credentialId 引用。 */
-    record McpServer(String mcpId, String name, Transport transport, String endpoint,
+    record McpServer(String mcpId, String name, Scope scope, Transport transport, String endpoint,
                      List<String> args, Map<String, String> env, Map<String, String> headers,
                      Auth auth, boolean enabled) {
         /** 冻结集合字段，防止适配器在连接期间观察到调用方修改。 */
@@ -217,8 +222,15 @@ public interface ConfigurationGenerationSnapshot {
             args = List.copyOf(args);
             env = Map.copyOf(env);
             headers = Map.copyOf(headers);
+            Objects.requireNonNull(scope, "scope");
             Objects.requireNonNull(auth, "auth");
         }
+    }
+
+    /** MCP 来源是配置 Owner 冻结的身份事实，不由显示名或服务地址推断。 */
+    enum Scope {
+        /** 用户级服务在所有适用会话中共享。 */ GLOBAL,
+        /** 项目服务仅在受信项目中适用。 */ PROJECT
     }
 
     /** MCP 凭据注入目标，不包含真实 secret。 */

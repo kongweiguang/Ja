@@ -152,6 +152,43 @@ fn turn_start_dto_accepts_content_union_and_rejects_legacy_or_mixed_parts() {
     );
 }
 
+/// Continue 与 Reask DTO 分别镜像 JA-RPC envelope；缺少 CAS/源消息字段或夹带跨方法字段时必须在 bridge 前拒绝。
+#[test]
+fn continuation_dtos_are_exact_and_reask_reuses_content_union() {
+    assert!(
+        serde_json::from_value::<TurnContinueInputDto>(serde_json::json!({
+            "threadId": "thr_fixture",
+            "expectedThreadRevision": 7
+        }))
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<TurnContinueInputDto>(serde_json::json!({
+            "threadId": "thr_fixture",
+            "expectedThreadRevision": 7,
+            "sourceMessageId": "item_user_fixture"
+        }))
+        .is_err()
+    );
+
+    let reask = serde_json::json!({
+        "threadId": "thr_fixture",
+        "expectedThreadRevision": 7,
+        "sourceMessageId": "item_user_fixture",
+        "content": [{"type":"text", "text":"replacement"}]
+    });
+    assert!(serde_json::from_value::<TurnReaskInputDto>(reask.clone()).is_ok());
+    let mut missing_source = reask.clone();
+    missing_source
+        .as_object_mut()
+        .expect("reask object")
+        .remove("sourceMessageId");
+    assert!(serde_json::from_value::<TurnReaskInputDto>(missing_source).is_err());
+    let mut injected_state = reask;
+    injected_state["executionCursor"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<TurnReaskInputDto>(injected_state).is_err());
+}
+
 /// Task DTO 要求 create 的 parentTurnId 显式 nullable，并拒绝 kind/lifecycle 等服务端字段注入。
 #[test]
 fn task_create_dto_is_exact_and_requires_nullable_parent_turn() {

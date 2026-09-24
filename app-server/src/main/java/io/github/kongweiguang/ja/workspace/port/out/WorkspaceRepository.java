@@ -23,6 +23,12 @@ public interface WorkspaceRepository {
      */
     CursorPage<Workspace> list(String cursor, int limit);
 
+    /** kind 在 SQL 查询阶段约束 keyset page，避免应用层过滤造成遗漏或无界扫描。 */
+    default CursorPage<Workspace> list(String cursor, int limit, Workspace.Kind kind) {
+        if (kind != null) throw new UnsupportedOperationException("typed workspace listing is unavailable");
+        return list(cursor, limit);
+    }
+
     /**
      * 按 opaque 身份读取工作区，不产生注册副作用。
      */

@@ -71,12 +71,9 @@ impl ReviewCommandError {
     }
 
     /// 将 workspace lookup failure 投影到同一封闭 error vocabulary。
-    pub(super) fn from_lookup(error: WorkspaceLookup) -> Self {
+    pub(super) fn from_lookup(_error: WorkspaceLookup) -> Self {
         Self {
-            code: match error {
-                WorkspaceLookup::Unconfigured => ReviewErrorCodeDto::NotConfigured,
-                WorkspaceLookup::Unknown => ReviewErrorCodeDto::UnknownWorkspace,
-            },
+            code: ReviewErrorCodeDto::UnknownWorkspace,
         }
     }
 

@@ -14,10 +14,13 @@ import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
+import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
+import io.github.kongweiguang.ja.conversation.port.in.InternalTurnStartRequest;
+import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
@@ -48,7 +51,8 @@ public final class TurnApprovalHandler implements RpcHandler {
      */
     @Override
     public Set<RpcMethod> methods() {
-        return Set.of(RpcMethod.TURN_START, RpcMethod.TURN_RESUME, RpcMethod.TURN_RECOVERY_RESPOND, RpcMethod.TURN_CANCEL,
+        return Set.of(RpcMethod.TURN_START, RpcMethod.TURN_CONTINUE, RpcMethod.TURN_REASK,
+                RpcMethod.TURN_RESUME, RpcMethod.TURN_RECOVERY_RESPOND, RpcMethod.TURN_CANCEL,
                 RpcMethod.TURN_INPUT_ENQUEUE, RpcMethod.TURN_INPUT_PRIORITIZE,
                 RpcMethod.TURN_INPUT_UPDATE, RpcMethod.TURN_INPUT_DELETE, RpcMethod.APPROVAL_RESPOND);
     }
@@ -61,6 +65,8 @@ public final class TurnApprovalHandler implements RpcHandler {
         session.requireReady();
         return switch (command.method()) {
             case TURN_START -> CompletableFuture.completedFuture(start(command.params()));
+            case TURN_CONTINUE -> CompletableFuture.completedFuture(continueQuestion(command.params()));
+            case TURN_REASK -> CompletableFuture.completedFuture(reask(command.params()));
             case TURN_RESUME -> CompletableFuture.completedFuture(resume(command.params()));
             case TURN_RECOVERY_RESPOND -> CompletableFuture.completedFuture(respondToolRecovery(command.params()));
             case TURN_CANCEL -> cancel(command.params());
@@ -177,6 +183,87 @@ public final class TurnApprovalHandler implements RpcHandler {
         } catch (TurnUseCase.ContentValidationException failure) {
             throw contentFailure(failure.failure());
         }
+    }
+
+    /** 继续不携带用户正文；Java 从最后失败问题读取完整原历史并关联隐藏 Turn。 */
+    private ObjectNode continueQuestion(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId", "expectedThreadRevision");
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
+        long expectedRevision = RpcParams.revision(params, "expectedThreadRevision");
+        RecoveryContext recovery = prepareRecoveryContext(threadId, expectedRevision);
+        Workspace workspace = recovery.workspace();
+        var preferences = recovery.preferences();
+        String turnId = recovery.turnId();
+        try {
+            InternalTurnStartRequest request = new InternalTurnStartRequest(threadId, turnId,
+                    workspace.workspaceId(), workspace.root(), preferences.providerId(), preferences.modelId(),
+                    preferences.reasoningLevel(), preferences.accessMode(), preferences.collaborationMode(),
+                    Duration.ofHours(24), expectedRevision, 0, session.clock().instant(), TurnOrigin.USER_CONTINUATION);
+            TurnUseCase.Accepted accepted = session.turns().continueQuestion(request, session.eventSink());
+            bindNotificationCleanup(turnId, accepted.completion());
+            return acceptedResult(accepted);
+        } catch (RuntimeException failure) {
+            session.abandonTurnNotification(turnId);
+            throw failure;
+        }
+    }
+
+    /** 编辑只接受当前 revision 与最后源消息身份；切路径和新消息由一个 repository 事务负责。 */
+    private ObjectNode reask(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId", "expectedThreadRevision", "sourceMessageId", "content");
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
+        long expectedRevision = RpcParams.revision(params, "expectedThreadRevision");
+        String sourceMessageId = RpcParams.identifier(params, "sourceMessageId", "item_", 128);
+        UserContent userContent = content(params.get("content"));
+        RecoveryContext recovery = prepareRecoveryContext(threadId, expectedRevision);
+        Workspace workspace = recovery.workspace();
+        var preferences = recovery.preferences();
+        String turnId = recovery.turnId();
+        try {
+            TurnStartRequest request = new TurnStartRequest(threadId, turnId, workspace.workspaceId(),
+                    workspace.root(), userContent, preferences.providerId(), preferences.modelId(),
+                    preferences.reasoningLevel(), preferences.accessMode(), preferences.collaborationMode(),
+                    Duration.ofHours(24), expectedRevision, 0, session.clock().instant());
+            TurnUseCase.Accepted accepted = session.turns().reask(request, sourceMessageId, session.eventSink());
+            bindNotificationCleanup(turnId, accepted.completion());
+            return acceptedResult(accepted);
+        } catch (TurnUseCase.ContentValidationException failure) {
+            session.abandonTurnNotification(turnId);
+            throw contentFailure(failure.failure());
+        } catch (RuntimeException failure) {
+            session.abandonTurnNotification(turnId);
+            throw failure;
+        }
+    }
+
+    /** 为继续或重答登记同一套冻结 Thread/Workspace 身份，确保通知上下文先于异步 Turn 准入。 */
+    private RecoveryContext prepareRecoveryContext(String threadId, long expectedRevision) {
+        ThreadSnapshot snapshot = requireThreadAtRevision(threadId, expectedRevision);
+        Workspace workspace = session.workspaces().requireOpenWorkspace(snapshot.thread().workspaceId());
+        String turnId = "turn_" + UUID.randomUUID().toString().replace("-", "");
+        session.registerTurnNotificationContext(turnId, workspace.workspaceId(), threadId, expectedRevision);
+        return new RecoveryContext(turnId, workspace, snapshot.thread().preferences());
+    }
+
+    /** 冻结一次恢复准入所需的 Workspace 与模型偏好，避免两个入口自行组合上下文。 */
+    private record RecoveryContext(String turnId, Workspace workspace,
+                                   ThreadPreferences preferences) { }
+
+    /** recovery 操作使用客户端确认的 Thread revision，过期请求不得自动重读并改写另一段历史。 */
+    private ThreadSnapshot requireThreadAtRevision(String threadId, long expectedRevision) {
+        ThreadSnapshot snapshot = session.threads().readThread(threadId, null, 1)
+                .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND, "thread is unavailable"));
+        if (snapshot.thread().revision() != expectedRevision) {
+            throw JaRpcException.of(JaErrorCatalog.CONFLICT, "thread revision changed");
+        }
+        return snapshot;
+    }
+
+    /** 两个恢复方法沿用 turn/start 的同一 admission receipt 字段。 */
+    private ObjectNode acceptedResult(TurnUseCase.Accepted accepted) {
+        return session.mapper().createObjectNode().put("accepted", true)
+                .put("queued", accepted.queued()).put("turnId", accepted.turnId())
+                .put("threadRevision", accepted.threadRevision());
     }
 
     /**

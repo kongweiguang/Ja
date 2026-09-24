@@ -19,6 +19,10 @@ export interface OpenDocument {
   kind: FileReadDto["kind"];
   readOnly: boolean;
   readOnlyReason?: string;
+  /** 仅由显式引用加载的外部快照；不进入 workspace watcher 或 CAS 保存路径。 */
+  externalFile?: boolean;
+  /** 有界原生读取截断标记，仅用于让只读快照的显示边界可见。 */
+  truncated?: boolean;
   status: DocumentStatus;
   error?: string;
   externalContent?: string;
@@ -50,6 +54,16 @@ export interface TrashRequest {
 /** 关闭确认只携带文档身份，具体草稿状态从同一 view model 读取。 */
 export interface CloseDocumentRequest {
   path: string;
+}
+
+/** 外部文本正文只能在用户明确点击文件引用后注入，始终以只读快照展示。 */
+export interface FilesExternalDocumentInput {
+  path: string;
+  content: string;
+  line?: number;
+  column?: number;
+  truncated: boolean;
+  readOnlyReason?: string;
 }
 
 /** 工作区切换成功前持有编辑冻结；调用方失败时必须 release，让旧 UI 可继续恢复编辑。 */
@@ -150,6 +164,9 @@ export interface FilesActions {
   openTarget?: (target: FilesOpenTarget["target"], relativePath: string) => void;
   changeSearchQuery: (query: string) => void;
   openSearchResult: (result: FilesSearchResult) => void;
+  /** 显式读取相对工作区文本并返回结果，调用方可在原文打开失败时恢复焦点。 */
+  openPath: (path: string, reveal?: { line: number; column?: number }) => Promise<boolean>;
+  openExternalDocument: (input: FilesExternalDocumentInput) => boolean;
   selectDocument: (path: string) => void;
   closeDocument: (path: string) => void;
   compareConflict: (path: string) => void;

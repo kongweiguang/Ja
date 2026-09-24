@@ -681,6 +681,7 @@ final class AnthropicMessagesAdapterTest {
                 ProviderProtocolException protocol =
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause());
                 assertEquals("HTTP_STATUS", protocol.code());
+                assertEquals("MODEL_UPSTREAM_REJECTED", protocol.terminalErrorCode());
                 assertTrue(protocol.getMessage().contains("HTTP status 400"));
                 assertTrue(protocol.getMessage().contains("type invalid_request_error"));
                 assertTrue(!protocol.getMessage().contains("private-context-message-sentinel"));

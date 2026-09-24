@@ -40,6 +40,7 @@ import {
   type ReviewNavigationState,
   type ReviewTreeNavigationState,
 } from "./ReviewFileTree";
+import type { ReviewTreeFile } from "../domain/reviewTree";
 import { ReviewShell } from "./ReviewShell";
 import { ReviewUnifiedDiff, type ReviewUnifiedDiffHunk } from "./ReviewUnifiedDiff";
 
@@ -266,7 +267,7 @@ function revertConfirmationCopy(target: ReviewTarget): { title: string; descript
       : { title: "撤销文件变更？", description: "这个文件的未提交变更将被移除。" };
 }
 
-/** 布局偏好只改变当前快照的投影，不为双栏额外物化全文或触发原生读取。 */
+/** 右键动作绑定被点中的当前文件并复用确认路径；它不改变 Diff 选择或导航。 */
 export function ReviewPanelView({
   viewModel,
   actions,
@@ -311,6 +312,26 @@ export function ReviewPanelView({
       return;
     }
     void actions.applyAction(action, target);
+  };
+
+  /** 从最新 capability 和文件层派生菜单项；操作进行中时不开放并发 mutation。 */
+  const fileContextActions = (file: ReviewTreeFile): readonly ReviewAction[] =>
+    state.pendingOperationIds.size > 0
+      ? []
+      : availableActions(capabilities, state.source, file.layer);
+
+  /** 在执行前重新确认 clicked file id/layer 仍属于当前快照和当前来源。 */
+  const applyFileContextAction = (file: ReviewTreeFile, action: ReviewAction): void => {
+    if (state.pendingOperationIds.size > 0) return;
+    const currentFile = viewModel.visibleFiles.find(
+      (candidate) => candidate.fileId === file.id && candidate.layer === file.layer,
+    );
+    if (
+      currentFile === undefined ||
+      !availableActions(capabilities, state.source, currentFile.layer).includes(action)
+    )
+      return;
+    onAction(action, { kind: "file", fileId: currentFile.fileId });
   };
 
   /** 只消费当前冻结的 target 一次；先关闭 Dialog，再把真实 mutation 交回 controller。 */
@@ -406,6 +427,8 @@ export function ReviewPanelView({
         setDetailOpen(true);
         onNavigationStateChange?.({ detailOpen: true, query: state.query, tree: treeNavigation });
       }}
+      fileContextActions={fileContextActions}
+      onFileContextAction={applyFileContextAction}
       navigationState={treeNavigation}
       onNavigationStateChange={(next) => {
         setTreeNavigation(next);

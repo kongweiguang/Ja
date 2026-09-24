@@ -129,28 +129,64 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     }
 
     /**
-     * 从 cwd/title/v3 偏好创建 Thread，workspace 用例负责解析并持久化目录身份。
+     * 省略 cwd 表示创建独立 SESSION，显式 cwd 表示打开 PROJECT；拒绝 null 别名以保持合同形状唯一。
      */
     private ObjectNode create(ObjectNode params) {
         RpcParams.requireOnly(params, "cwd", "title", "providerId", "modelId", "reasoningLevel", "accessMode",
                 "collaborationMode");
-        String cwd = RpcParams.optionalText(params, "cwd", 4_096);
-        Workspace workspace = ensureWorkspace(cwd);
+        String cwd = params.has("cwd") ? RpcParams.text(params, "cwd", 4_096, false) : null;
+        String title = RpcParams.text(params, "title", 512, false);
         ThreadPreferences preferences = preferences(params, ThreadPreferences.TitleSource.PLACEHOLDER);
-        ThreadSummary thread = session.threads().createThread(
-                new ThreadSummary.Creation(
-                        "thr_" + UUID.randomUUID().toString().replace("-", ""), workspace.workspaceId(),
-                        RpcParams.text(params, "title", 512, false), preferences,
-                        session.clock().instant()));
+        String threadId = "thr_" + UUID.randomUUID().toString().replace("-", "");
+        Workspace workspace = ensureWorkspace(cwd, threadId);
+        ThreadSummary thread;
+        if (cwd == null) {
+            try (UnlinkedSessionWorkspaceRollback rollback =
+                         new UnlinkedSessionWorkspaceRollback(session, workspace)) {
+                thread = Objects.requireNonNull(session.threads().createThread(new ThreadSummary.Creation(
+                        threadId, workspace.workspaceId(), title, preferences, session.clock().instant())),
+                        "created thread");
+                rollback.commit();
+            }
+        } else {
+            thread = session.threads().createThread(new ThreadSummary.Creation(
+                    threadId, workspace.workspaceId(), title, preferences, session.clock().instant()));
+        }
         return RpcResults.thread(session.mapper(), thread);
     }
 
+    /** 仅在线程创建提交失败时回收新空 SESSION；try-with-resources 会把清理异常附加到原失败。 */
+    private static final class UnlinkedSessionWorkspaceRollback implements AutoCloseable {
+        private final RpcSession session;
+        private final Workspace workspace;
+        private boolean committed;
+
+        /** 固定本次创建的工作区身份，禁止回滚逻辑重新解析调用方输入。 */
+        private UnlinkedSessionWorkspaceRollback(RpcSession session, Workspace workspace) {
+            this.session = session;
+            this.workspace = workspace;
+        }
+
+        /** 创建成功后保留目录，由 Thread 持久记录接管其所有权。 */
+        private void commit() {
+            committed = true;
+        }
+
+        /** 失败时只清理未链接 SESSION，让 JVM 保留主异常并自动挂载清理异常。 */
+        @Override
+        public void close() {
+            if (!committed) {
+                session.workspaces().discardUnlinkedSessionWorkspace(workspace.workspaceId(), workspace.revision());
+            }
+        }
+    }
+
     /**
-     * 缺失 cwd 使用通用工作区，否则显式打开项目且不在 transport 派生身份。
+     * 先冻结主 Thread ID 再建其专属空目录；cwd 仅代表用户显式选择的项目目录。
      */
-    private Workspace ensureWorkspace(String cwd) {
+    private Workspace ensureWorkspace(String cwd, String threadId) {
         if (cwd == null) {
-            return session.workspaces().openGeneralWorkspace();
+            return session.workspaces().createSessionWorkspace(threadId);
         }
         try {
             return session.workspaces().openWorkspace(
@@ -166,6 +202,14 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
      */
     private ObjectNode list(ObjectNode params) {
         if (params.has("scope")) return discover(params);
+        if (params.has("workspaceKind")) {
+            RpcParams.requireOnly(params, "workspaceKind", "cursor", "limit");
+            if (!"session".equals(RpcParams.text(params, "workspaceKind", 16, false))) {
+                throw JaRpcException.invalidParams();
+            }
+            return threadPage(session.threads().listSessionThreads(
+                    RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params)));
+        }
         RpcParams.requireOnly(params, "workspaceId", "cursor", "limit");
         String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
         CursorPage<ThreadSummary> page = session.threads()
@@ -192,6 +236,15 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
 
     /** 空查询返回最近 Thread；非空查询仅做当前 Workspace 标题 contains。 */
     private ObjectNode search(ObjectNode params) {
+        if (params.has("workspaceKind")) {
+            RpcParams.requireOnly(params, "workspaceKind", "query", "cursor", "limit");
+            if (!"session".equals(RpcParams.text(params, "workspaceKind", 16, false))) {
+                throw JaRpcException.invalidParams();
+            }
+            String sessionQuery = params.has("query") ? RpcParams.text(params, "query", 256, true) : "";
+            return threadPage(session.threads().searchSessionThreads(sessionQuery,
+                    RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params)));
+        }
         RpcParams.requireOnly(params, "workspaceId", "query", "cursor", "limit");
         String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
         String query = params.has("query") ? RpcParams.text(params, "query", 256, true) : "";

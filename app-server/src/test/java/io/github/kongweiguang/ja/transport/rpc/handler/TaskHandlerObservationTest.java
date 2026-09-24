@@ -22,6 +22,7 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 import io.github.kongweiguang.ja.transport.rpc.runtime.StdioWriter;
 import io.github.kongweiguang.ja.transport.rpc.support.TestConfigurationPorts;
+import io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 import org.junit.jupiter.api.Test;
@@ -110,7 +111,8 @@ final class TaskHandlerObservationTest {
         private Harness() {
             RpcServiceBindings bindings = new RpcServiceBindings(
                     unsupported(WorkspaceUseCase.class), unsupported(WorkspacePathSearchUseCase.class),
-                    unsupported(ThreadUseCase.class), unsupported(TurnUseCase.class),
+                    unsupported(ThreadUseCase.class), RpcTestBindings.unsupportedThreadMcp(),
+                    unsupported(TurnUseCase.class),
                     unsupported(ContextCompactionUseCase.class), unsupported(ApprovalUseCase.class),
                     unsupported(CatalogUseCase.class), unsupported(AttachmentUseCase.class),
                     unsupported(AttachmentPreviewUseCase.class), tasks.proxy(),

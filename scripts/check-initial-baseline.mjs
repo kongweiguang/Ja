@@ -30,7 +30,7 @@ async function sourceFiles(directory) {
   return files;
 }
 
-/** 只允许当前建库与已确认的会话策略初始化资源，禁止引入未审定的历史转换或备用协议。 */
+/** 只允许逐项审定的初始化、对话恢复和 Workspace 身份迁移，禁止把额外历史转换混入首版。 */
 export async function checkInitialBaseline(root) {
   const violations = [];
   const migrationRoot = path.join(root, "app-server/src/main/resources/db/migration");
@@ -40,12 +40,14 @@ export async function checkInitialBaseline(root) {
     "V2__thread_subagent_policies.sql",
     "V3__subagent_reasoning.sql",
     "V4__conversation_recovery_usage_projection.sql",
+    "V6__conversation_current_path_reask.sql",
+    "V7__session_workspace_identity.sql",
   ];
   if (
     migrations.length !== expectedMigrations.length ||
     expectedMigrations.some((name) => !migrations.includes(name))
   ) {
-    violations.push("数据库只允许 V1 建库、V2 子智能体会话策略、V3 思考等级与 V4 对话恢复资源");
+    violations.push("数据库只允许 V1 建库、V2/V3 会话策略、V4 对话恢复资源、V6 当前路径重答与 V7 Workspace 身份迁移");
   }
   const protocolEntries = await readdir(path.join(root, "contracts/ja-rpc"), {
     withFileTypes: true,

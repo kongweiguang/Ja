@@ -72,8 +72,14 @@ public interface HistoryMapper {
      */
     List<PersistenceRecords.ThreadRow> selectThreadPage(PersistenceRecords.ThreadPage values);
 
+    /** 按 Workspace kind 聚合主会话列表；SQL 仍执行完整摘要映射与稳定 keyset。 */
+    List<PersistenceRecords.ThreadRow> selectSessionThreadPage(PersistenceRecords.SessionThreadPage values);
+
     /** 在一个 Workspace 内执行 bounded normalized contains 搜索，排序与普通列表一致。 */
     List<PersistenceRecords.ThreadRow> searchThreadPage(PersistenceRecords.ThreadSearch values);
+
+    /** 只在 SESSION Workspace 上执行标题 contains 搜索。 */
+    List<PersistenceRecords.ThreadRow> searchSessionThreadPage(PersistenceRecords.SessionThreadSearch values);
 
     /**
      * 人工标题使用精确 revision CAS；自动标题只要求 revision 未回退且来源仍为 placeholder，
@@ -86,6 +92,31 @@ public interface HistoryMapper {
 
     /** admission 以单次 CAS 推进 revision，并在首次占有 PLACEHOLDER 时原子写入临时标题。 */
     int compareAndSetThreadAdmission(PersistenceRecords.ThreadAdmissionCas values);
+
+    /** 读取当前路径最后一个直接 USER 输入，续答准入仍在事务中重验失败终态。 */
+    String selectLastCurrentPathQuestionMessageId(@Param("threadId") String threadId);
+
+    /** 识别旧按钮连续创建的 USER“继续”尾链；仅返回候选，完整迁移门仍由同一 admission 事务验证。 */
+    String selectLegacyContinueCandidateSource(@Param("threadId") String threadId,
+                                               @Param("candidateMessageId") String candidateMessageId);
+
+    /** 对完整四 Turn 只读 Tool 旧链执行 strict gate，其他相似文本或含副作用事实一律不匹配。 */
+    boolean isStrictLegacyContinueChain(@Param("threadId") String threadId,
+                                       @Param("candidateMessageId") String candidateMessageId,
+                                       @Param("sourceMessageId") String sourceMessageId);
+
+    /** 在准入事务内把三条旧 USER 尝试原子移出路径并绑定原问题，返回实际变更行数。 */
+    int normalizeLegacyContinuePath(@Param("threadId") String threadId,
+                                    @Param("candidateMessageId") String candidateMessageId,
+                                    @Param("sourceMessageId") String sourceMessageId);
+
+    /** 仅接受 current path 最后一个 USER 输入，且其最近一次关联尝试失败/取消、没有成功答复。 */
+    boolean isReaskableQuestion(@Param("threadId") String threadId,
+                                @Param("sourceMessageId") String sourceMessageId);
+
+    /** reask 以 source 所属 Turn 为切点，将该 Turn 与全部后缀原子移出当前路径。 */
+    int cutCurrentPathFromQuestion(@Param("threadId") String threadId,
+                                   @Param("sourceMessageId") String sourceMessageId);
 
     /** 以 revision CAS 更新 active Thread 的 pinned_at。 */
     int compareAndSetThreadPin(PersistenceRecords.ThreadPinCas values);

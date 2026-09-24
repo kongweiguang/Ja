@@ -13,7 +13,9 @@ pub(crate) mod tasks;
 
 pub(crate) use goal::{GoalMethod, GoalPayload, GoalPayloadError, GoalRequest, GoalResponse};
 pub(crate) use identity::{valid_frozen_turn_id, valid_protocol_id, valid_text_id};
-pub use projections::{AttachmentMetadata, GeneralWorkspace, RuntimeStorageInfo, WorkspaceDto};
+pub use projections::{
+    AttachmentMetadata, RuntimeStorageInfo, WorkspaceActivation, WorkspaceDto, WorkspaceKind,
+};
 pub use recovery::{ManualRecoveryConfirmation, ManualRecoveryReason, RuntimeRecoveryState};
 pub use runtime::{RuntimeStatus, RuntimeStatusKind};
 
@@ -22,9 +24,10 @@ pub use commands::{
     InputQueue, QueuedInput, QueuedInputIssue, RuntimeConfigurationStatus, ToolArtifactReadInput,
     ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted,
     TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
-    TurnContentPart, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult,
-    TurnInputUpdate, TurnResumeInput, TurnStartInput, WorkspaceOpenInput, WorkspacePathSearchInput,
-    WorkspacePathSearchItem, WorkspacePathSearchResult,
+    TurnContentPart, TurnContinueInput, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize,
+    TurnInputResult, TurnInputUpdate, TurnReaskInput, TurnResumeInput, TurnStartInput,
+    WorkspaceOpenInput, WorkspacePathSearchInput, WorkspacePathSearchItem,
+    WorkspacePathSearchResult,
 };
 pub use tasks::{
     TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextPreviewItem, TaskContextSeed,

@@ -12,8 +12,11 @@ import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.NativeAttachmentContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
 import io.github.kongweiguang.ja.conversation.domain.prompt.AgentPromptSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
+import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
@@ -180,6 +183,82 @@ final class AgentContextMapperTest {
                 .map(content -> assertInstanceOf(TextContent.class, content).text()).toList());
     }
 
+    /**
+     * Reask/off-path facts never enter the next prompt; committed Tool call/results stay paired, while only
+     * partial and terminal-identified failure items are removed even when a real answer has identical text.
+     * 该测试按持久化身份筛选失败回复，避免正文相同的用户或模型内容被误删。
+     */
+    @Test
+    void projectsOnlyCurrentPathAndFiltersFailureByIdentityNotText() {
+        Instant now = Instant.parse("2026-09-23T12:00:00Z");
+        String failureReply = new TerminalFailureReplyPolicy().replyFor("MODEL_UNAVAILABLE");
+        String retryPartialId = new TerminalFailureReplyPolicy()
+                .partialMessageIdForRequest("turn_failed", "request_previous_attempt");
+        List<ConversationRepository.TurnSnapshot> turns = List.of(
+                new ConversationRepository.TurnSnapshot("thr_test", "turn_failed", TurnState.FAILED,
+                        now, now, now, 4, 3, true, null, "item_legacy_closure"),
+                new ConversationRepository.TurnSnapshot("thr_test", "turn_old", TurnState.COMPLETED,
+                        now, now, now, 4, 2, false, null, null),
+                new ConversationRepository.TurnSnapshot("thr_test", "turn_current", TurnState.RUNNING,
+                        now, now, null, 4, 1, true, null, null));
+        List<ConversationRepository.StoredMessage> messages = List.of(
+                new ConversationRepository.StoredMessage("item_tool_call", "turn_failed", 1,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("checking"),
+                                new ToolCallContent("call_kept", "read_file",
+                                        JsonObjects.builder().putText("path", "README.md").build()))), now),
+                new ConversationRepository.StoredMessage("item_tool_result", "turn_failed", 2,
+                        new ModelMessage(ModelRole.TOOL, List.of(
+                                new ToolResultContent("call_kept", "contents", false))), now),
+                new ConversationRepository.StoredMessage("item_real_text", "turn_failed", 3,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(failureReply))), now),
+                new ConversationRepository.StoredMessage(retryPartialId, "turn_failed", 4,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("unfinished"))), now),
+                new ConversationRepository.StoredMessage("item_legacy_closure", "turn_failed", 5,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(failureReply))), now),
+                new ConversationRepository.StoredMessage("item_old_branch", "turn_old", 1,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("replaced branch"))), now),
+                new ConversationRepository.StoredMessage("item_current_answer", "turn_current", 1,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(failureReply))), now));
+        ConversationRepository.ThreadSnapshot snapshot = new ConversationRepository.ThreadSnapshot(
+                "thr_test", "ws_test", "test", preferences(), 4, turns, messages, now, now);
+
+        List<ContextMessage> context = new AgentContextMapper(new TestJsonValueCodec())
+                .fromSnapshot(snapshot, "turn_current");
+
+        assertEquals(List.of("item_tool_call", "item_tool_result", "item_real_text", "item_current_answer"),
+                context.stream().map(ContextMessage::messageId).toList());
+        assertEquals(1, context.get(0).blocks().stream()
+                .filter(ContextMessage.ToolCallBlock.class::isInstance).count());
+        assertEquals(1, context.get(1).blocks().stream()
+                .filter(ContextMessage.ToolResultBlock.class::isInstance).count());
+        assertEquals(failureReply, assertInstanceOf(ContextMessage.TextBlock.class,
+                context.get(2).blocks().getFirst()).value());
+        assertEquals(failureReply, assertInstanceOf(ContextMessage.TextBlock.class,
+                context.getLast().blocks().getFirst()).value());
+    }
+
+    /** 新版持久 terminalMessageId 直接标识自动收口，即使不是 Turn 派生 ID 也不靠正文做判断。 */
+    @Test
+    void filtersTerminalMessageByPersistedIdentity() {
+        Instant now = Instant.parse("2026-09-23T12:00:00Z");
+        String terminalMessageId = "item_terminal_persisted";
+        ConversationRepository.TurnSnapshot failedTurn = new ConversationRepository.TurnSnapshot(
+                "thr_test", "turn_failed_identity", TurnState.FAILED, now, now, now,
+                2, 2, true, null, terminalMessageId);
+        ConversationRepository.ThreadSnapshot snapshot = new ConversationRepository.ThreadSnapshot(
+                "thr_test", "ws_test", "test", preferences(), 2, List.of(failedTurn), List.of(
+                new ConversationRepository.StoredMessage("item_prior_answer", "turn_failed_identity", 1,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("prior answer"))), now),
+                new ConversationRepository.StoredMessage(terminalMessageId, "turn_failed_identity", 2,
+                        new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("automatic close"))), now)),
+                now, now);
+
+        List<ContextMessage> context = new AgentContextMapper(new TestJsonValueCodec())
+                .fromSnapshot(snapshot, "turn_failed_identity");
+
+        assertEquals(List.of("item_prior_answer"), context.stream().map(ContextMessage::messageId).toList());
+    }
+
     /** 构造一条仅含附件 identity 的上下文，并通过真实 Mapper 双门生成冻结请求。 */
     private static ModelPort.ModelRequest request(
             Set<ModelPort.InputModality> modalities,
@@ -200,7 +279,7 @@ final class AgentContextMapperTest {
         Instant now = Instant.parse("2026-08-25T12:00:00Z");
         return new ConversationRepository.ThreadSnapshot("thr_test", "ws_test", "title", preferences(), 1,
                 List.of(new ConversationRepository.TurnSnapshot("thr_test", "turn_test", TurnState.COMPLETED,
-                        now, now, now, 1, 1)), List.of(messages), now, now);
+                        now, now, now, 1, 1, true, null, null)), List.of(messages), now, now);
     }
 
     /** 通过 Mapper 入口生成 Provider 请求，确保过滤后的 reasoning-only 消息不会落成空 message。 */

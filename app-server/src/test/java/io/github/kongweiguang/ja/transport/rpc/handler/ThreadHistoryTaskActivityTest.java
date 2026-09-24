@@ -94,7 +94,8 @@ final class ThreadHistoryTaskActivityTest {
         private Harness() {
             RpcServiceBindings bindings = new RpcServiceBindings(
                     unsupported(WorkspaceUseCase.class), unsupported(WorkspacePathSearchUseCase.class),
-                    threads(), unsupported(TurnUseCase.class), unsupported(ContextCompactionUseCase.class),
+                    threads(), io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.unsupportedThreadMcp(),
+                    unsupported(TurnUseCase.class), unsupported(ContextCompactionUseCase.class),
                     unsupported(ApprovalUseCase.class), unsupported(CatalogUseCase.class),
                     unsupported(AttachmentUseCase.class), unsupported(AttachmentPreviewUseCase.class),
                     tasks.proxy(), goals.proxy(),
@@ -182,7 +183,8 @@ final class ThreadHistoryTaskActivityTest {
 
     /** 根和 Child Thread 使用相同稳定元数据，测试只关注 taskActivities 附加投影。 */
     private static ThreadSummary thread(String threadId) {
-        return new ThreadSummary(threadId, "ws_test", threadId, ConversationTestFixtures.preferences(),
+        return new ThreadSummary(threadId, "ws_test", threadId, "project", null,
+                ConversationTestFixtures.preferences(),
                 ThreadSummary.Status.ACTIVE, false, TurnState.COMPLETED, false, null, 3, NOW, NOW);
     }
 

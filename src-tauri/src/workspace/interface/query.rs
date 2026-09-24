@@ -349,12 +349,9 @@ pub(crate) fn validate_relative_path(value: &str) -> bool {
 }
 
 /// 将 host workspace lookup 投影到 command 稳定错误空间，不泄露 capability 状态。
-fn map_lookup(error: WorkspaceLookup) -> WorkspaceCommandError {
+fn map_lookup(_error: WorkspaceLookup) -> WorkspaceCommandError {
     WorkspaceCommandError {
-        code: match error {
-            WorkspaceLookup::Unconfigured => WorkspaceCommandErrorCode::NotConfigured,
-            WorkspaceLookup::Unknown => WorkspaceCommandErrorCode::UnknownWorkspace,
-        },
+        code: WorkspaceCommandErrorCode::UnknownWorkspace,
     }
 }
 

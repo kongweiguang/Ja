@@ -18,6 +18,9 @@ public final class TerminalFailureReplyPolicy {
     private static final Map<String, String> REPLIES = Map.ofEntries(
             Map.entry("MODEL_UNAVAILABLE", "模型服务暂时不可用。"),
             Map.entry("MODEL_PROTOCOL_ERROR", "模型响应格式有误或不完整。"),
+            Map.entry("MODEL_UPSTREAM_REJECTED", "模型服务拒绝了本次请求。"),
+            Map.entry("MODEL_STREAM_INVALID", "模型响应流损坏或不完整。"),
+            Map.entry("MODEL_IDLE_TIMEOUT", "等待模型响应超时。"),
             Map.entry("BUDGET_EXCEEDED", "已达到本轮资源上限。"),
             Map.entry("REQUEST_DEADLINE_EXCEEDED", "本次执行超时。"),
             Map.entry("CONTEXT_LIMIT", "当前对话上下文过长。"),
@@ -37,6 +40,20 @@ public final class TerminalFailureReplyPolicy {
         return REPLIES.getOrDefault(errorCode, FALLBACK_REPLY);
     }
 
+
+    /**
+     * 使用 Turn 派生的专用身份标记自动失败收口，使历史过滤不依赖回复正文相等或 Provider intent。
+     */
+    public String failureMessageIdFor(String turnId) {
+        Objects.requireNonNull(turnId, "turnId");
+        try {
+            byte[] bytes = MessageDigest.getInstance("SHA-256").digest(turnId.getBytes(StandardCharsets.UTF_8));
+            return "item_failure_" + java.util.HexFormat.of().formatHex(bytes);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
     /**
      * 优先复用已提交 Provider intent 的消息身份；应急路径没有 intent 时从 Turn 身份派生稳定 ID，
      * 让常规 Loop 与外层服务兜底共享同一幂等边界。
@@ -45,12 +62,7 @@ public final class TerminalFailureReplyPolicy {
         Objects.requireNonNull(turnId, "turnId");
         Objects.requireNonNull(execution, "execution");
         if (execution instanceof TurnExecutionState.ProviderPending pending) return pending.messageId();
-        try {
-            byte[] bytes = MessageDigest.getInstance("SHA-256").digest(turnId.getBytes(StandardCharsets.UTF_8));
-            return "item_failure_" + java.util.HexFormat.of().formatHex(bytes);
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 is unavailable", impossible);
-        }
+        return failureMessageIdFor(turnId);
     }
 
     /**
@@ -62,6 +74,21 @@ public final class TerminalFailureReplyPolicy {
         if (modelRound < 1) throw new IllegalArgumentException("modelRound must be positive");
         try {
             byte[] input = (turnId + ":partial:" + modelRound).getBytes(StandardCharsets.UTF_8);
+            byte[] bytes = MessageDigest.getInstance("SHA-256").digest(input);
+            return "item_partial_" + java.util.HexFormat.of().formatHex(bytes);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
+    /**
+     * 用 Turn 与唯一 Provider request identity 派生 partial 审计 item，避免同一 modelRound 的重试碰撞。
+     */
+    public String partialMessageIdForRequest(String turnId, String requestId) {
+        Objects.requireNonNull(turnId, "turnId");
+        Objects.requireNonNull(requestId, "requestId");
+        try {
+            byte[] input = (turnId + ":request-partial:" + requestId).getBytes(StandardCharsets.UTF_8);
             byte[] bytes = MessageDigest.getInstance("SHA-256").digest(input);
             return "item_partial_" + java.util.HexFormat.of().formatHex(bytes);
         } catch (NoSuchAlgorithmException impossible) {

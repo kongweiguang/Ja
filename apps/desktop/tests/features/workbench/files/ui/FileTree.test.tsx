@@ -310,7 +310,9 @@ describe("FileTree production explorer interactions", () => {
     expect(onOpenTarget).not.toHaveBeenCalled();
   });
 
+  /** 空白区仍沿用 Radix 菜单的焦点漫游，再调用 root controller 的新建动作。 */
   it("opens a real workspace-root menu from blank space and creates in the root", async () => {
+    const user = userEvent.setup();
     const onCreateDirectory = vi.fn();
     const onRename = vi.fn();
     const onTrash = vi.fn();
@@ -328,6 +330,8 @@ describe("FileTree production explorer interactions", () => {
       clientY: 24,
     });
     const menu = await screen.findByRole("menu", { name: "工作区根目录操作" });
+    expect(menu).toHaveFocus();
+    await user.keyboard("{ArrowDown}");
     expect(within(menu).getByRole("menuitem", { name: "新建目录" })).toHaveFocus();
     expect(within(menu).queryByRole("menuitem", { name: /重命名/ })).not.toBeInTheDocument();
     expect(within(menu).queryByRole("menuitem", { name: /移入回收站/ })).not.toBeInTheDocument();
@@ -339,6 +343,48 @@ describe("FileTree production explorer interactions", () => {
 
     expect(onCreateDirectory).toHaveBeenCalledOnce();
     expect(onCreateDirectory).toHaveBeenCalledWith("", "docs");
+  });
+
+  /** 常用资源管理器保持一步可达；其余已发现应用集中展示并保持原目标路径。 */
+  it("groups additional open targets without hiding the direct explorer action", async () => {
+    const user = userEvent.setup();
+    const onOpenTarget = vi.fn();
+    render(
+      <FileTree
+        nodes={[file("main.ts")]}
+        openTargets={[
+          { target: "vscode", displayName: "VS Code" },
+          { target: "file_explorer", displayName: "文件资源管理器" },
+          { target: "zed", displayName: "Zed" },
+        ]}
+        onOpenTarget={onOpenTarget}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByText("main.ts"));
+    const menu = await screen.findByRole("menu", { name: "main.ts 文件操作" });
+    expect(within(menu).getAllByRole("menuitem")).toHaveLength(2);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: /文件资源管理器/ }));
+    expect(onOpenTarget).toHaveBeenCalledWith("file_explorer", "main.ts");
+    await waitFor(() => expect(menu).not.toBeInTheDocument());
+
+    fireEvent.contextMenu(screen.getByText("main.ts"));
+    const reopened = await screen.findByRole("menu", { name: "main.ts 文件操作" });
+    await user.click(within(reopened).getByRole("menuitem", { name: "使用其他应用打开" }));
+    const submenu = await screen.findByRole("menu", { name: "使用其他应用打开" });
+    expect(within(submenu).getAllByRole("menuitem")).toHaveLength(2);
+    fireEvent.click(within(submenu).getByRole("menuitem", { name: /VS Code/ }));
+    expect(onOpenTarget).toHaveBeenLastCalledWith("vscode", "main.ts");
+  });
+
+  /** 仅有回收站能力时不显示孤立分隔线，能力裁剪后菜单仍保持紧凑。 */
+  it("omits a leading separator when trash is the only file action", async () => {
+    render(<FileTree nodes={[file("main.ts")]} onTrash={vi.fn()} />);
+
+    fireEvent.contextMenu(screen.getByText("main.ts"));
+    const menu = await screen.findByRole("menu", { name: "main.ts 文件操作" });
+    expect(within(menu).getAllByRole("menuitem")).toHaveLength(1);
+    expect(within(menu).queryByRole("separator")).not.toBeInTheDocument();
   });
 
   it("keeps Escape zero-write for create and rename even when blur follows unmount", () => {
@@ -392,10 +438,12 @@ describe("FileTree production explorer interactions", () => {
     fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
     const menu = await screen.findByRole("menu", { name: "main.ts 文件操作" });
     const firstItem = within(menu).getByRole("menuitem", { name: /重命名/ });
+    expect(menu).toHaveFocus();
+    await user.keyboard("{ArrowDown}");
     expect(firstItem).toHaveFocus();
-    fireEvent.keyDown(firstItem, { key: "End" });
-    expect(within(menu).getByRole("menuitem", { name: /刷新此目录/ })).toHaveFocus();
-    fireEvent.keyDown(document.activeElement ?? menu, { key: "Escape" });
+    await user.keyboard("{ArrowDown}");
+    expect(within(menu).getByRole("menuitem", { name: /移入回收站/ })).toHaveFocus();
+    await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.getByRole("treeitem", { name: "main.ts" })).toHaveFocus());
 
     fireEvent.keyDown(tree, { key: "Delete" });
@@ -429,5 +477,56 @@ describe("FileTree production explorer interactions", () => {
     fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
     await user.click(screen.getByRole("menuitem", { name: "添加到对话" }));
     expect(onAddToConversation).toHaveBeenCalledWith(node);
+  });
+
+  /** 列表刷新可能替换节点对象；菜单动作按 id 解析后应使用最新路径与名称。 */
+  it("resolves a FileTree context target from the current stable node id", async () => {
+    const user = userEvent.setup();
+    const original = file("main.ts");
+    const current = { ...file("renamed.ts"), id: original.id };
+    const { rerender } = render(<FileTree nodes={[original]} onRename={vi.fn()} />);
+
+    fireEvent.contextMenu(screen.getByText("main.ts"), { clientX: 24, clientY: 32 });
+    expect(await screen.findByRole("menu", { name: "main.ts 文件操作" })).toBeVisible();
+    rerender(<FileTree nodes={[current]} onRename={vi.fn()} />);
+    expect(await screen.findByRole("menu", { name: "renamed.ts 文件操作" })).toBeVisible();
+
+    await user.click(screen.getByRole("menuitem", { name: /重命名/ }));
+    expect(screen.getByRole("textbox", { name: "重命名 renamed.ts" })).toBeInTheDocument();
+  });
+
+  /** 若刷新删除目标节点，菜单必须关闭，不能对失效 projection 执行副作用。 */
+  it("closes the FileTree context menu when its stable node id disappears", async () => {
+    const node = file("main.ts");
+    const onTrash = vi.fn();
+    const { rerender } = render(<FileTree nodes={[node]} onTrash={onTrash} />);
+
+    fireEvent.contextMenu(screen.getByText("main.ts"), { clientX: 24, clientY: 32 });
+    expect(await screen.findByRole("menu", { name: "main.ts 文件操作" })).toBeVisible();
+    rerender(<FileTree nodes={[]} onTrash={onTrash} />);
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(onTrash).not.toHaveBeenCalled();
+  });
+
+  /** 快速切换目标会重新锚定菜单，并让动作落到最后一次右击的文件。 */
+  it("retargets an open FileTree menu to the latest right-clicked node", async () => {
+    const user = userEvent.setup();
+    const first = file("first.ts");
+    const second = file("second.ts");
+    const onTrash = vi.fn();
+    render(<FileTree nodes={[first, second]} onTrash={onTrash} />);
+
+    fireEvent.contextMenu(screen.getByText("first.ts"), { clientX: 18, clientY: 22 });
+    expect(await screen.findByRole("menu", { name: "first.ts 文件操作" })).toBeVisible();
+    fireEvent.contextMenu(screen.getByText("second.ts"), { clientX: 42, clientY: 58 });
+    expect(await screen.findByRole("menu", { name: "second.ts 文件操作" })).toBeVisible();
+    expect(document.querySelector(".ja-pointer-context-anchor")).toHaveStyle({
+      left: "42px",
+      top: "58px",
+    });
+
+    await user.click(screen.getByRole("menuitem", { name: /移入回收站/ }));
+    expect(onTrash).toHaveBeenCalledWith(second);
   });
 });

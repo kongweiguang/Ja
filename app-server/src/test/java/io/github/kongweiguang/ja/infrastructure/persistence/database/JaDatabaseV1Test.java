@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 验证 Ja 只接受事务化 V1 至 V4 以及严格的 Flyway/SQLite 启动准入。 */
+/** 验证 Ja 只接受固定 Flyway 迁移闭集以及严格的 SQLite 启动准入。 */
 final class JaDatabaseV1Test {
     private static final Set<String> DOMAIN_TABLES = Set.of(
             "acceptance_criteria", "acceptance_evidence", "approvals", "attachment_blobs", "attachments",
@@ -53,19 +53,19 @@ final class JaDatabaseV1Test {
 
     @TempDir Path temp;
 
-    /** 空库一次创建完整领域结构；再次启动只能验证同一 V4，不会产生第二条 history。 */
+    /** 空库一次创建完整领域结构；再次启动只能验证同一 V7，不会产生第二条 history。 */
     @Test
-    void initializesCompleteV4AndReopensWithoutMigration() throws Exception {
+    void initializesCompleteV7AndReopensWithoutMigration() throws Exception {
         Path databasePath = temp.resolve("fresh").resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
             // 首次 close 同样走生产 WAL checkpoint，确保 lease 在完整生命周期后释放。
         }
 
-        assertCurrentV4(databasePath);
+        assertCurrentV7(databasePath);
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 当前 V4 只做 checksum 和完整性验证。
+            // 当前 V7 只做 checksum、数据迁移幂等性和完整性验证。
         }
-        assertCurrentV4(databasePath);
+        assertCurrentV7(databasePath);
     }
 
     /** 未带 Flyway history 的非空 schema 明确拒绝，原表保留且失败后 lease 可重新获取。 */
@@ -80,7 +80,7 @@ final class JaDatabaseV1Test {
         }
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
@@ -101,7 +101,7 @@ final class JaDatabaseV1Test {
         Files.write(databasePath, corrupt);
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         assertArrayEquals(corrupt, Files.readAllBytes(databasePath));
@@ -114,18 +114,18 @@ final class JaDatabaseV1Test {
         Path databasePath = initialized("future");
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            statement.executeUpdate("UPDATE flyway_schema_history SET version='5',description='future' "
-                    + "WHERE version='4'");
+            statement.executeUpdate("UPDATE flyway_schema_history SET version='8',description='future' "
+                    + "WHERE version='7'");
         }
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals("5", text(statement,
-                    "SELECT version FROM flyway_schema_history WHERE version='5' AND success=1"));
+            assertEquals("8", text(statement,
+                    "SELECT version FROM flyway_schema_history WHERE version='8' AND success=1"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -143,7 +143,7 @@ final class JaDatabaseV1Test {
         }
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
@@ -173,12 +173,12 @@ final class JaDatabaseV1Test {
         }
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals(5, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(7, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -202,7 +202,7 @@ final class JaDatabaseV1Test {
         }
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
@@ -231,7 +231,7 @@ final class JaDatabaseV1Test {
         }
 
         StorageException failure = assertThrows(StorageException.class,
-                () -> JaDatabase.open(DatabaseConfig.of(databasePath)));
+                () -> JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent())));
 
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
@@ -287,7 +287,7 @@ final class JaDatabaseV1Test {
         }
     }
 
-    /** V1 中途失败必须回滚全部领域 DDL；同一文件随后可用正式 V4 完成初始化。 */
+    /** V1 中途失败必须回滚全部领域 DDL；同一文件随后可用正式 migration 闭集完成初始化。 */
     @Test
     void rollsBackInterruptedV1AndAllowsRetry() throws Exception {
         Path databasePath = temp.resolve("retry").resolve("ja.db");
@@ -306,12 +306,12 @@ final class JaDatabaseV1Test {
         }
 
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 失败 migration 没有发布领域表或占住 lease，正式 V4 可以原位重试。
+            // 失败 migration 没有发布领域表或占住 lease，正式迁移链可以原位重试。
         }
-        assertCurrentV4(databasePath);
+        assertCurrentV7(databasePath);
     }
 
-    /** 创建并完整关闭一个真实 V4，所有后续漂移测试都从同一生产路径出发。 */
+    /** 创建并完整关闭一个真实 V7，所有后续漂移测试都从同一生产路径出发。 */
     private Path initialized(String name) {
         Path databasePath = temp.resolve(name).resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
@@ -321,7 +321,7 @@ final class JaDatabaseV1Test {
 
     /** 生产 close 需要 named mapper factory；测试只注册 WAL checkpoint 所需的窄 mapper。 */
     private static JaDatabase openForTest(Path databasePath) {
-        JaDatabase database = JaDatabase.open(DatabaseConfig.of(databasePath));
+        JaDatabase database = JaDatabase.open(DatabaseConfig.of(databasePath, databasePath.getParent()));
         org.apache.ibatis.session.Configuration configuration = new org.apache.ibatis.session.Configuration(
                 new org.apache.ibatis.mapping.Environment("v1-test",
                         new org.apache.ibatis.transaction.jdbc.JdbcTransactionFactory(), database.dataSource()));
@@ -330,8 +330,8 @@ final class JaDatabaseV1Test {
         return database;
     }
 
-    /** 当前 schema 由 V1 至 V4 成功 history、完整领域表集和格式约束共同定义。 */
-    private static void assertCurrentV4(Path databasePath) throws Exception {
+    /** 当前 schema 由成功 history、完整领域表集和格式约束共同定义；V5 是并发迁移保留的版本空档。 */
+    private static void assertCurrentV7(Path databasePath) throws Exception {
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
             assertEquals(DOMAIN_TABLES, tableNames(statement));
@@ -343,7 +343,11 @@ final class JaDatabaseV1Test {
                     + "WHERE version='3' AND success=1"));
             assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
                     + "WHERE version='4' AND success=1"));
-            assertEquals(4, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='6' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='7' AND success=1"));
+            assertEquals(6, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
             assertEquals("ok", text(statement, "PRAGMA integrity_check"));
             assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
             assertEquals(0, number(statement, "SELECT last_generation FROM task_process_generation "
@@ -352,6 +356,8 @@ final class JaDatabaseV1Test {
             assertRequired(connection, "threads", "model_id");
             assertRequired(connection, "threads", "access_mode");
             assertRequired(connection, "threads", "title_source");
+            assertRequired(connection, "workspaces", "kind");
+            assertTrue(columnNames(connection, "workspaces").contains("legacy_shared_workspace_id"));
             assertRequired(connection, "usage", "profile_json");
             assertRequired(connection, "usage", "input_accounting");
             assertRequired(connection, "interaction_requests", "thread_id");

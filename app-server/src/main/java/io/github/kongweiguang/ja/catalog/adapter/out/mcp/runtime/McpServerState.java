@@ -126,9 +126,15 @@ final class McpServerState {
     }
 
     /**
-     * 通知回调只执行原子递增，不持锁、不落库也不触发 tools/list，避免阻塞传输与 SDK 线程。
+     * list_changed 与显式检查只执行原子递增，不持锁、不落库也不触发 tools/list，避免阻塞 SDK 线程。
      */
     void markDirectoryDirty() {
+        directoryRevision.incrementAndGet();
+        lastDiscoveryFailed = false;
+    }
+
+    /** 有界发现失败后标记可重试，同时保留本次不可用事实。 */
+    void markDirectoryDirtyAfterFailure() {
         directoryRevision.incrementAndGet();
     }
 

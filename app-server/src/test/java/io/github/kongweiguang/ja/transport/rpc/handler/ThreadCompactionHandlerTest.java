@@ -115,7 +115,8 @@ final class ThreadCompactionHandlerTest {
         private Harness(ContextCompactionUseCase compactions) {
             RpcServiceBindings bindings = new RpcServiceBindings(unsupported(io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase.class),
                     unsupported(io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase.class),
-                    unsupported(ThreadUseCase.class), unsupported(TurnUseCase.class), compactions,
+                    unsupported(ThreadUseCase.class), io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.unsupportedThreadMcp(),
+                    unsupported(TurnUseCase.class), compactions,
                     unsupported(ApprovalUseCase.class), unsupported(CatalogUseCase.class),
                     unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.class),
                     unsupported(io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase.class),

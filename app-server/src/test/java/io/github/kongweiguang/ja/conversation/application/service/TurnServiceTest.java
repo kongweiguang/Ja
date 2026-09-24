@@ -1610,6 +1610,15 @@ final class TurnServiceTest {
         @Override public TaskMailboxConsumption consumeTaskMailbox(TaskMailboxCommit request) {
             throw new UnsupportedOperationException("task mailbox is not configured by this test");
         }
+        /** 常规服务生命周期夹具不参与问题继续资格判断，误调用必须明确失败。 */
+        @Override public Optional<String> findLastUnansweredQuestionMessageId(
+                String threadId, long expectedThreadRevision) {
+            throw new UnsupportedOperationException("question recovery is not configured by this test");
+        }
+        /** 常规服务生命周期夹具不执行路径切换，误调用必须明确失败。 */
+        @Override public AdmissionReceipt admitReask(ReaskAdmission admission) {
+            throw new UnsupportedOperationException("question reask is not configured by this test");
+        }
         private long revision;
         private long turnMutationVersion;
         private TurnState state = TurnState.QUEUED;
@@ -1797,7 +1806,8 @@ final class TurnServiceTest {
         @Override public synchronized Optional<TurnSnapshot> findTurn(String turnId) {
             String threadId = resumeCandidate == null ? "thr_test" : resumeCandidate.threadId();
             return Optional.of(new TurnSnapshot(threadId, turnId, state, CLOCK.instant(), CLOCK.instant(),
-                    state.terminal() ? CLOCK.instant() : null, revision, turnMutationVersion));
+                    state.terminal() ? CLOCK.instant() : null, revision, turnMutationVersion,
+                    true, null, null));
         }
         /** SUSPENDED fallback 只模拟明确状态竞争/存储故障，不把所有异常折叠成 NOT_FOUND。 */
         @Override public synchronized ConversationRepository.CancelResult cancelSuspended(
@@ -1971,7 +1981,7 @@ final class TurnServiceTest {
         @Override public synchronized Optional<TurnSnapshot> findTurn(String threadId, String turnId) {
             return Optional.of(new TurnSnapshot(threadId, turnId, state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, revision,
-                    turnMutationVersion));
+                    turnMutationVersion, true, null, null));
         }
         /** 返回包含当前准入 Turn 与消息的 Thread 快照，避免夹具硬编码身份把后续 Turn 误判为缺失。 */
         @Override public synchronized Optional<ThreadSnapshot> readThread(String threadId) {
@@ -1979,7 +1989,7 @@ final class TurnServiceTest {
                     : resumeCandidate == null ? "turn_test" : resumeCandidate.turnId();
             TurnSnapshot turn = new TurnSnapshot("thr_test", admittedTurnId, state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, revision,
-                    turnMutationVersion);
+                    turnMutationVersion, true, null, null);
             return Optional.of(new ThreadSnapshot("thr_test", "ws_test", "test", preferences(), revision,
                     List.of(turn), messages, CLOCK.instant(), CLOCK.instant()));
         }

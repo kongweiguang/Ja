@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PreviewTarget } from "../domain/previewModel";
+import { containsControlCharacters } from "@/shared/validation/previewUrl";
 import type {
   NativePreviewPort,
   PreviewEvent,
+  PreviewPageProjection,
   PreviewSessionSnapshot,
   PreviewUnsubscribe,
   PreviewViewport,
@@ -15,11 +18,28 @@ const MAX_EARLY_PREVIEW_EVENTS = 512;
 const PREVIEW_LOADING_RECONCILE_INTERVAL_MS = 500;
 const PREVIEW_RENDERER_LOAD_DEADLINE_MS = 31_000;
 const PREVIEW_LOAD_ERROR = "预览加载失败，请重试。";
+const PREVIEW_OPEN_ERROR = "无法打开此页面，请重试。";
 const PREVIEW_CLOSE_ERROR = "浏览器关闭失败，请重试。";
 const PREVIEW_RECOVERY_ERROR = "浏览器恢复未完成，请重试。";
+const PREVIEW_POPUP_BLOCKED = "网页弹窗已被拦截。";
+const PREVIEW_DOWNLOAD_BLOCKED = "网页下载已被拦截。";
+const HIDDEN_LAYOUT_FALLBACK: PreviewViewport = {
+  x: 0,
+  y: 0,
+  width: 1024,
+  height: 768,
+  visible: false,
+};
+
+interface ManagedPreviewPage {
+  snapshot: PreviewSessionSnapshot;
+  error?: string;
+  navigationIntent: number;
+  failedNavigationIntent?: number;
+}
+
 interface PendingPreviewOpen {
   projectGeneration: number;
-  events: PreviewEvent[];
   cancelRequested: boolean;
   completion: Promise<void>;
 }
@@ -27,11 +47,6 @@ interface PendingPreviewOpen {
 interface PendingPreviewRecovery {
   projectGeneration: number;
   promise: Promise<void>;
-}
-
-interface PreviewLoadDeadline {
-  navigationIntent: number;
-  startedAt: number;
 }
 
 interface PendingPreviewLayout {
@@ -46,12 +61,23 @@ export interface PreviewWorkspaceLifecycle {
 }
 
 export interface PreviewLifecycleProjection {
+  pages: readonly PreviewPageProjection[];
+  activePageId?: string;
   url?: string;
   loading: boolean;
   recovering: boolean;
   error?: string;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  onOpenTarget: (target: PreviewTarget) => Promise<void>;
+  onNewPage: () => Promise<void>;
+  onSelectPage: (pageId: string) => void;
+  onClosePage: (pageId: string) => Promise<void>;
   onNavigate: (url: string) => void;
-  onReload?: () => void;
+  onNavigateFile: (path: string) => void;
+  onGoBack: () => void;
+  onGoForward: () => void;
+  onReload: () => void;
   onRetryRecovery?: () => void;
   onViewportChange: (viewport: PreviewViewport) => void;
 }
@@ -62,26 +88,24 @@ export interface PreviewLifecycleController {
   workspaceLifecycle: PreviewWorkspaceLifecycle | undefined;
 }
 
-/** 同一 generation 的终态加载事实优先于迟到的 loading 快照，避免 UI 状态倒退。 */
+/** 同一 WebView generation 的终态优先于迟到 loading 快照，同时保留最新历史与标题字段。 */
 function mergePreviewSnapshot(
-  current: PreviewSessionSnapshot | undefined,
+  current: PreviewSessionSnapshot,
   next: PreviewSessionSnapshot,
 ): PreviewSessionSnapshot {
   if (
-    current === undefined ||
     current.id !== next.id ||
     current.generation !== next.generation ||
     next.status === "closed" ||
     current.status === "closed" ||
     current.load_status === "loading" ||
     next.load_status !== "loading"
-  ) {
+  )
     return next;
-  }
   return { ...next, load_status: current.load_status };
 }
 
-/** 比较完整 viewport，避免 React/ResizeObserver 重复测量把相同矩形送入原生队列。 */
+/** 比较完整矩形，让重复的 ResizeObserver 通知不重排原生 child WebView。 */
 function previewViewportEquals(left: PreviewViewport | undefined, right: PreviewViewport): boolean {
   return (
     left !== undefined &&
@@ -93,117 +117,271 @@ function previewViewportEquals(left: PreviewViewport | undefined, right: Preview
   );
 }
 
+/** 隐藏态仍须携带有效尺寸，首次打开可以先创建隐藏 child，再等待布局显示。 */
+function hiddenViewport(viewport: PreviewViewport | undefined): PreviewViewport {
+  return viewport === undefined
+    ? HIDDEN_LAYOUT_FALLBACK
+    : {
+        ...viewport,
+        width: Math.max(1, viewport.width),
+        height: Math.max(1, viewport.height),
+        visible: false,
+      };
+}
+
+/** 仅允许已知的 adapter 文案穿过生命周期边界，其它错误一律收敛到固定提示。 */
+function safePreviewError(error: unknown, fallback: string): string {
+  if (!(error instanceof Error)) return fallback;
+  const allowed = new Set([
+    "预览请求参数无效",
+    "预览返回数据无效",
+    "预览操作失败",
+    "文件路径无效。",
+    "文件不存在或已被移动。",
+    "当前没有读取此文件的权限。",
+    "这是一个文件夹，无法在浏览器中打开。",
+    "相对路径需要先打开工作区。",
+    "当前工作区已关闭，请重新打开后重试。",
+    "此文件类型暂不支持在浏览器中打开。",
+  ]);
+  return allowed.has(error.message) ? error.message : fallback;
+}
+
 /**
- * Preview application controller 是 child WebView 生命周期的唯一前端 owner。
- * 它以 workspace generation、session generation 与 intent sequence 三重栅栏拒绝迟到结果，
- * 并把原生异常收口为固定文本，避免 URL、路径或内部诊断进入 renderer 状态。
+ * Preview lifecycle 以 Rust 签发的每页 session ID 为唯一身份；跨页状态只保存 UI 投影，
+ * 历史由各自原生 WebView 管理，布局队列则保持 latest-wins 并串行隐藏旧页再显示当前页。
  */
 export function usePreviewLifecycleController(
   workspaceId: string | undefined,
   adapter: NativePreviewPort,
   sessionHints: PreviewSessionHintStorage,
 ): PreviewLifecycleController {
-  const [snapshot, setSnapshot] = useState<PreviewSessionSnapshot>();
-  const [loading, setLoading] = useState(false);
+  const [pages, setPages] = useState<ManagedPreviewPage[]>([]);
+  const [activePageId, setActivePageId] = useState<string | undefined>(undefined);
   const [recovering, setRecovering] = useState(false);
-  const [error, setError] = useState<string>();
+  const [globalError, setGlobalError] = useState<string>();
   const projectGenerationRef = useRef(0);
-  const sessionRef = useRef<PreviewSessionSnapshot | undefined>(undefined);
+  const pagesRef = useRef(new Map<string, ManagedPreviewPage>());
+  const activePageIdRef = useRef<string | undefined>(undefined);
   const viewportRef = useRef<PreviewViewport | undefined>(undefined);
-  const pendingLayoutRef = useRef<PendingPreviewLayout | undefined>(undefined);
+  const pendingLayoutsRef = useRef(new Map<string, PendingPreviewLayout>());
+  const lastRequestedLayoutRef = useRef(new Map<string, PreviewViewport>());
+  const lastAppliedLayoutRef = useRef(new Map<string, PreviewViewport>());
   const layoutTaskRef = useRef<Promise<void> | undefined>(undefined);
   const cleanupTaskRef = useRef<Promise<void> | undefined>(undefined);
-  const closingSessionIdRef = useRef<string | undefined>(undefined);
-  const openingRef = useRef<PendingPreviewOpen | undefined>(undefined);
+  const pendingOpensRef = useRef(new Set<PendingPreviewOpen>());
+  const closeTasksRef = useRef(new Map<string, Promise<void>>());
+  const closingSessionIdsRef = useRef(new Set<string>());
+  const earlyEventsRef = useRef<PreviewEvent[]>([]);
+  const eventCursorRef = useRef(new Map<string, number>());
+  const loadTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const recoveryTaskRef = useRef<PendingPreviewRecovery | undefined>(undefined);
   const recoveryBlockedRef = useRef(false);
-  const eventCursorRef = useRef<{ sessionId: string; sequence: number } | undefined>(undefined);
   const navigationIntentRef = useRef(0);
-  const failedNavigationRef = useRef<{ sessionId: string; navigationIntent: number } | undefined>(
+  const initializationRef = useRef<{ generation: number; promise: Promise<void> } | undefined>(
     undefined,
   );
-  const [loadDeadline, setLoadDeadline] = useState<PreviewLoadDeadline>();
 
-  /**
-   * 提交权威快照前核对 workspace 与 session identity，并统一派生加载状态。本次用户导航一旦
-   * 被判定失败，迟到的 WebView2 内部导航事实只能更新诊断快照，不能覆盖恢复面板。
-   */
-  const commitSnapshot = useCallback(
-    (next: PreviewSessionSnapshot, generation: number, expectedSessionId?: string): boolean => {
-      if (
-        projectGenerationRef.current !== generation ||
-        (expectedSessionId !== undefined && next.id !== expectedSessionId)
-      )
-        return false;
-      const current = sessionRef.current;
-      if (current !== undefined && (current.id !== next.id || next.generation < current.generation))
-        return false;
-      const committed = mergePreviewSnapshot(current, next);
-      sessionRef.current = committed;
-      setSnapshot(committed);
-      const navigationFailed =
-        failedNavigationRef.current?.sessionId === committed.id &&
-        failedNavigationRef.current.navigationIntent === navigationIntentRef.current;
-      if (committed.status === "closed") {
-        failedNavigationRef.current = undefined;
-        setLoadDeadline(undefined);
-        setLoading(false);
-      } else if (navigationFailed) {
-        setLoadDeadline(undefined);
-        setLoading(false);
-        setError(PREVIEW_LOAD_ERROR);
-      } else if (committed.load_status === "loading") {
-        setLoading(true);
-        setError(undefined);
-      } else if (committed.load_status === "finished") {
-        failedNavigationRef.current = undefined;
-        setLoadDeadline(undefined);
-        setLoading(false);
-        setError(undefined);
-      } else {
-        failedNavigationRef.current = {
-          sessionId: committed.id,
-          navigationIntent: navigationIntentRef.current,
-        };
-        setLoadDeadline(undefined);
-        setLoading(false);
-        setError((message) => message ?? PREVIEW_LOAD_ERROR);
-      }
-      return true;
+  /** 发布有序 page map；Map 自身只作为同步的 lifecycle authority，不直接暴露给 React。 */
+  const publishPages = useCallback((): void => {
+    setPages([...pagesRef.current.values()]);
+  }, []);
+
+  /** 修改单页快照时复制 entry，避免后台标签的更新触发状态倒退或共享对象突变。 */
+  const updatePage = useCallback(
+    (pageId: string, update: (current: ManagedPreviewPage) => ManagedPreviewPage): void => {
+      const current = pagesRef.current.get(pageId);
+      if (current === undefined) return;
+      const next = update(current);
+      pagesRef.current.set(pageId, next);
+      publishPages();
     },
-    [],
+    [publishPages],
   );
 
-  /**
-   * 事件只允许单调推进当前 session；open ACK 前使用有界缓冲承接同步事件，
-   * 从而不因跨进程回调先于命令结果到达而丢失状态。
-   */
+  /** 清理单页 renderer deadline；隐藏页面不做轮询，但其超时仍由该 timer 有界收口。 */
+  const clearLoadDeadline = useCallback((pageId: string): void => {
+    const timer = loadTimersRef.current.get(pageId);
+    if (timer !== undefined) clearTimeout(timer);
+    loadTimersRef.current.delete(pageId);
+  }, []);
+
+  /** 页面保持 loading 超过 native watchdog 预算时展示静态恢复错误，不读取后台页面内容。 */
+  const startLoadDeadline = useCallback(
+    (pageId: string, navigationIntent: number): void => {
+      clearLoadDeadline(pageId);
+      const timer = setTimeout(() => {
+        const current = pagesRef.current.get(pageId);
+        if (
+          current === undefined ||
+          current.navigationIntent !== navigationIntent ||
+          current.snapshot.status !== "open" ||
+          current.snapshot.load_status !== "loading"
+        )
+          return;
+        updatePage(pageId, (page) => ({
+          ...page,
+          error: PREVIEW_LOAD_ERROR,
+          failedNavigationIntent: navigationIntent,
+        }));
+      }, PREVIEW_RENDERER_LOAD_DEADLINE_MS);
+      loadTimersRef.current.set(pageId, timer);
+    },
+    [clearLoadDeadline, updatePage],
+  );
+
+  /** 页面启动新的用户导航时先投影 loading，再设置每页独立的失败预算。 */
+  const beginPageNavigation = useCallback(
+    (pageId: string): number | undefined => {
+      const current = pagesRef.current.get(pageId);
+      if (current === undefined || current.snapshot.status !== "open") return undefined;
+      const navigationIntent = ++navigationIntentRef.current;
+      updatePage(pageId, (page) => ({
+        ...page,
+        navigationIntent,
+        failedNavigationIntent: undefined,
+        error: undefined,
+        snapshot: { ...page.snapshot, load_status: "loading" },
+      }));
+      startLoadDeadline(pageId, navigationIntent);
+      return navigationIntent;
+    },
+    [startLoadDeadline, updatePage],
+  );
+
+  /** 事件或命令快照成为终态后撤销对应的 renderer 超时。 */
+  const finishPageNavigation = useCallback(
+    (pageId: string): void => {
+      clearLoadDeadline(pageId);
+    },
+    [clearLoadDeadline],
+  );
+
+  /** 排空全局原生布局队列；每个 session 只保留最新 viewport，任何时候都不并发 show。 */
+  const drainPendingLayouts = useCallback((): void => {
+    if (layoutTaskRef.current !== undefined) return;
+    const task = (async (): Promise<void> => {
+      while (pendingLayoutsRef.current.size > 0) {
+        const first = pendingLayoutsRef.current.entries().next().value as
+          | [string, PendingPreviewLayout]
+          | undefined;
+        if (first === undefined) break;
+        const [pageId, pending] = first;
+        pendingLayoutsRef.current.delete(pageId);
+        try {
+          await adapter.layout(pending.sessionId, pending.viewport);
+          lastAppliedLayoutRef.current.set(pageId, pending.viewport);
+        } catch {
+          const hasNewerRequest = pendingLayoutsRef.current.has(pageId);
+          if (!hasNewerRequest) lastRequestedLayoutRef.current.delete(pageId);
+          if (
+            !hasNewerRequest &&
+            projectGenerationRef.current === pending.projectGeneration &&
+            pagesRef.current.has(pageId)
+          )
+            updatePage(pageId, (page) => ({ ...page, error: PREVIEW_LOAD_ERROR }));
+        }
+      }
+    })().finally(() => {
+      if (layoutTaskRef.current === task) layoutTaskRef.current = undefined;
+      if (pendingLayoutsRef.current.size > 0) drainPendingLayouts();
+    });
+    layoutTaskRef.current = task;
+  }, [adapter, updatePage]);
+
+  /** 布局请求按 page ID 去重；inactive WebView 收到 false 后保持隐藏直至再次选中。 */
+  const requestLayout = useCallback(
+    (
+      pageId: string,
+      viewport: PreviewViewport,
+      generation = projectGenerationRef.current,
+    ): void => {
+      if (!pagesRef.current.has(pageId) || generation !== projectGenerationRef.current) return;
+      const previousRequest = lastRequestedLayoutRef.current.get(pageId);
+      if (previewViewportEquals(previousRequest, viewport)) return;
+      if (
+        !pendingLayoutsRef.current.has(pageId) &&
+        previewViewportEquals(lastAppliedLayoutRef.current.get(pageId), viewport)
+      ) {
+        lastRequestedLayoutRef.current.set(pageId, viewport);
+        return;
+      }
+      lastRequestedLayoutRef.current.set(pageId, viewport);
+      pendingLayoutsRef.current.set(pageId, {
+        projectGeneration: generation,
+        sessionId: pageId,
+        viewport,
+      });
+      drainPendingLayouts();
+    },
+    [drainPendingLayouts],
+  );
+
+  /** 原生快照只能更新现存或刚 ACK 的 page，陈旧 workspace/session generation 会被丢弃。 */
+  const commitSnapshot = useCallback(
+    (next: PreviewSessionSnapshot, generation: number): boolean => {
+      if (projectGenerationRef.current !== generation) return false;
+      const current = pagesRef.current.get(next.id);
+      if (current === undefined || next.generation < current.snapshot.generation) return false;
+      const snapshot = mergePreviewSnapshot(current.snapshot, next);
+      let error = current.error;
+      let failedNavigationIntent = current.failedNavigationIntent;
+      if (snapshot.status === "closed") {
+        error = PREVIEW_CLOSE_ERROR;
+        finishPageNavigation(next.id);
+      } else if (snapshot.load_status === "finished") {
+        if (current.failedNavigationIntent !== current.navigationIntent) {
+          error = undefined;
+          failedNavigationIntent = undefined;
+        }
+        finishPageNavigation(next.id);
+      } else if (snapshot.load_status === "failed") {
+        error ??= PREVIEW_LOAD_ERROR;
+        failedNavigationIntent = current.navigationIntent;
+        finishPageNavigation(next.id);
+      }
+      pagesRef.current.set(next.id, {
+        ...current,
+        snapshot,
+        error,
+        failedNavigationIntent,
+      });
+      publishPages();
+      return true;
+    },
+    [finishPageNavigation, publishPages],
+  );
+
+  /** 对单页事件按 sequence 单调应用；打开 ACK 前的少量事件先进入有界缓冲。 */
   const applyEvent = useCallback(
     (event: PreviewEvent, generation: number): void => {
       if (projectGenerationRef.current !== generation) return;
-      const current = sessionRef.current;
+      const current = pagesRef.current.get(event.session_id);
       if (current === undefined) {
-        const opening = openingRef.current;
         if (
-          opening?.projectGeneration === generation &&
-          opening.events.length < MAX_EARLY_PREVIEW_EVENTS &&
-          !opening.events.some(
+          pendingOpensRef.current.size > 0 &&
+          event.kind.type !== "closed" &&
+          earlyEventsRef.current.length < MAX_EARLY_PREVIEW_EVENTS &&
+          !earlyEventsRef.current.some(
             (candidate) =>
               candidate.session_id === event.session_id && candidate.sequence === event.sequence,
           )
-        ) {
-          opening.events.push(event);
-        }
+        )
+          earlyEventsRef.current.push(event);
         return;
       }
-      if (current.id !== event.session_id || event.generation < current.generation) return;
-      const cursor = eventCursorRef.current;
-      if (cursor?.sessionId === event.session_id && event.sequence <= cursor.sequence) return;
-      eventCursorRef.current = { sessionId: event.session_id, sequence: event.sequence };
+      if (
+        closingSessionIdsRef.current.has(event.session_id) ||
+        event.generation < current.snapshot.generation
+      )
+        return;
+      const previousSequence = eventCursorRef.current.get(event.session_id);
+      if (previousSequence !== undefined && event.sequence <= previousSequence) return;
+      eventCursorRef.current.set(event.session_id, event.sequence);
       const base =
-        event.generation === current.generation
-          ? current
-          : { ...current, generation: event.generation };
+        event.generation === current.snapshot.generation
+          ? current.snapshot
+          : { ...current.snapshot, generation: event.generation };
       switch (event.kind.type) {
         case "opened":
         case "navigation_committed":
@@ -216,20 +394,22 @@ export function usePreviewLifecycleController(
               window: { ...base.window, url: event.kind.url },
             },
             generation,
-            event.session_id,
           );
           break;
         case "title_changed":
-          commitSnapshot({ ...base, title: event.kind.title }, generation, event.session_id);
+          commitSnapshot({ ...base, title: event.kind.title }, generation);
           break;
-        case "load_failed":
-          failedNavigationRef.current = {
-            sessionId: event.session_id,
-            navigationIntent: navigationIntentRef.current,
-          };
-          commitSnapshot({ ...base, load_status: "failed" }, generation, event.session_id);
-          setError(event.kind.message);
+        case "load_failed": {
+          const message = event.kind.message;
+          updatePage(event.session_id, (page) => ({
+            ...page,
+            error: message,
+            failedNavigationIntent: page.navigationIntent,
+            snapshot: { ...page.snapshot, ...base, load_status: "failed" },
+          }));
+          finishPageNavigation(event.session_id);
           break;
+        }
         case "load_finished":
           commitSnapshot(
             {
@@ -239,50 +419,65 @@ export function usePreviewLifecycleController(
               window: { ...base.window, url: event.kind.url },
             },
             generation,
-            event.session_id,
           );
           break;
+        case "history_changed":
+          commitSnapshot(
+            {
+              ...base,
+              can_go_back: event.kind.can_go_back,
+              can_go_forward: event.kind.can_go_forward,
+            },
+            generation,
+          );
+          break;
+        case "action_blocked": {
+          const message =
+            event.kind.action === "popup" ? PREVIEW_POPUP_BLOCKED : PREVIEW_DOWNLOAD_BLOCKED;
+          updatePage(event.session_id, (page) => ({
+            ...page,
+            error: message,
+            snapshot: base,
+          }));
+          break;
+        }
         case "closed":
-          // close ACK 返回前保留 identity，失败时才能让同一 session 显式重试。
-          if (
-            cleanupTaskRef.current !== undefined &&
-            (closingSessionIdRef.current === undefined ||
-              closingSessionIdRef.current === event.session_id)
-          )
-            return;
-          sessionRef.current = undefined;
-          setSnapshot({ ...base, status: "closed" });
-          setLoadDeadline(undefined);
-          setLoading(false);
-          setError(undefined);
+          // 原生 close 事件只报告事实；UI 与 hint 必须等显式 close command ACK 才删除页面。
+          updatePage(event.session_id, (page) => ({
+            ...page,
+            error: PREVIEW_CLOSE_ERROR,
+            snapshot: { ...base, status: "closed" },
+          }));
+          finishPageNavigation(event.session_id);
           break;
       }
     },
-    [commitSnapshot],
+    [commitSnapshot, finishPageNavigation, updatePage],
   );
 
-  /** 先按序排空事件，再用权威 state 覆盖队列截断或重放造成的中间态。 */
+  /** 先排空有界事件，再用 Rust 的权威 snapshot 更新指定 page 的 URL 与原生历史状态。 */
   const reconcileSession = useCallback(
-    async (sessionId: string, generation: number, minimumGeneration: number): Promise<void> => {
+    async (pageId: string, generation: number, minimumGeneration: number): Promise<void> => {
+      if (projectGenerationRef.current !== generation || !pagesRef.current.has(pageId)) return;
       let events: PreviewEvent[] = [];
       try {
-        events = await adapter.events(sessionId, MAX_EARLY_PREVIEW_EVENTS);
+        events = await adapter.events(pageId, MAX_EARLY_PREVIEW_EVENTS);
       } catch {
-        // subscription 与权威 state 仍能提供安全降级路径。
+        // live subscription 与 state 命令仍能提供降级路径。
       }
-      if (projectGenerationRef.current !== generation || sessionRef.current?.id !== sessionId)
-        return;
+      if (projectGenerationRef.current !== generation || !pagesRef.current.has(pageId)) return;
       for (const event of [...events].sort((left, right) => left.sequence - right.sequence))
         applyEvent(event, generation);
       let authoritative: PreviewSessionSnapshot;
       try {
-        authoritative = await adapter.state(sessionId);
+        authoritative = await adapter.state(pageId);
       } catch {
         return;
       }
       if (
+        authoritative.id !== pageId ||
         authoritative.generation < minimumGeneration ||
-        !commitSnapshot(authoritative, generation, sessionId)
+        !commitSnapshot(authoritative, generation)
       )
         return;
       if (authoritative.load_status === "failed") {
@@ -290,17 +485,20 @@ export function usePreviewLifecycleController(
           .reverse()
           .find(
             (event) =>
-              event.session_id === sessionId &&
+              event.session_id === pageId &&
               event.generation === authoritative.generation &&
               event.kind.type === "load_failed",
           );
-        if (failure?.kind.type === "load_failed") setError(failure.kind.message);
+        if (failure?.kind.type === "load_failed") {
+          const message = failure.kind.message;
+          updatePage(pageId, (page) => ({ ...page, error: message }));
+        }
       }
     },
-    [adapter, applyEvent, commitSnapshot],
+    [adapter, applyEvent, commitSnapshot, updatePage],
   );
 
-  /** 每个 workspace generation 串行执行一次 orphan recovery，pending 不清零就保持阻塞。 */
+  /** 每个 workspace generation 合并 orphan recovery；pending 不清零时拒绝创建新 WebView。 */
   const recoverPending = useCallback(
     (generation: number): Promise<void> => {
       const existing = recoveryTaskRef.current;
@@ -314,12 +512,12 @@ export function usePreviewLifecycleController(
           if (report.pending > 0) throw new Error(PREVIEW_RECOVERY_ERROR);
           if (projectGenerationRef.current === generation) {
             recoveryBlockedRef.current = false;
-            setError((current) => (current === PREVIEW_RECOVERY_ERROR ? undefined : current));
+            setGlobalError((current) => (current === PREVIEW_RECOVERY_ERROR ? undefined : current));
           }
         } catch {
           if (projectGenerationRef.current === generation) {
             recoveryBlockedRef.current = true;
-            setError(PREVIEW_RECOVERY_ERROR);
+            setGlobalError(PREVIEW_RECOVERY_ERROR);
           }
           throw new Error(PREVIEW_RECOVERY_ERROR);
         }
@@ -333,54 +531,418 @@ export function usePreviewLifecycleController(
     [adapter],
   );
 
-  /** 显式恢复重试复用当前 generation，不创建第二个 session identity。 */
-  const retryRecovery = useCallback((): void => {
-    void recoverPending(projectGenerationRef.current).catch(() => undefined);
-  }, [recoverPending]);
+  /** 切换 active page 时先排入旧页 hide，再排入新页 show，避免两个原生窗口重叠。 */
+  const selectPage = useCallback(
+    (pageId: string): void => {
+      if (!pagesRef.current.has(pageId) || activePageIdRef.current === pageId) return;
+      const generation = projectGenerationRef.current;
+      const viewport = viewportRef.current;
+      const previousPageId = activePageIdRef.current;
+      if (previousPageId !== undefined)
+        requestLayout(previousPageId, hiddenViewport(viewport), generation);
+      activePageIdRef.current = pageId;
+      setActivePageId(pageId);
+      if (viewport?.visible === true) requestLayout(pageId, viewport, generation);
+      else requestLayout(pageId, hiddenViewport(viewport), generation);
+      setGlobalError(undefined);
+    },
+    [requestLayout],
+  );
 
-  /**
-   * teardown 先加入 pending open，再执行 ACK-first close，最后排空 orphan queue；
-   * 已知 session 关闭失败时保留 identity，禁止用全局恢复伪装关闭成功。
-   */
+  /** native close ACK 后才移除页面、hint 与布局缓存；失败时标签仍留在原位供重试。 */
+  const closePage = useCallback(
+    (pageId: string): Promise<void> => {
+      const inFlight = closeTasksRef.current.get(pageId);
+      if (inFlight !== undefined) return inFlight;
+      const page = pagesRef.current.get(pageId);
+      if (page === undefined) return Promise.resolve();
+      const generation = projectGenerationRef.current;
+      closingSessionIdsRef.current.add(pageId);
+      const task = (async (): Promise<void> => {
+        try {
+          const acknowledged = await adapter.close(pageId);
+          if (acknowledged.id !== pageId || acknowledged.status !== "closed")
+            throw new Error(PREVIEW_CLOSE_ERROR);
+          if (projectGenerationRef.current !== generation) return;
+          const orderedPageIds = [...pagesRef.current.keys()];
+          const wasActive = activePageIdRef.current === pageId;
+          const index = orderedPageIds.indexOf(pageId);
+          const nextActivePageId = orderedPageIds[index - 1] ?? orderedPageIds[index + 1];
+          pagesRef.current.delete(pageId);
+          eventCursorRef.current.delete(pageId);
+          clearLoadDeadline(pageId);
+          pendingLayoutsRef.current.delete(pageId);
+          lastRequestedLayoutRef.current.delete(pageId);
+          lastAppliedLayoutRef.current.delete(pageId);
+          if (workspaceId !== undefined) sessionHints.forget(workspaceId, pageId);
+          publishPages();
+          if (wasActive) {
+            const closingAllPages = cleanupTaskRef.current !== undefined;
+            const selectedPageId = closingAllPages ? undefined : nextActivePageId;
+            activePageIdRef.current = selectedPageId;
+            setActivePageId(selectedPageId);
+            const viewport = viewportRef.current;
+            if (selectedPageId !== undefined) {
+              requestLayout(
+                selectedPageId,
+                viewport?.visible === true ? viewport : hiddenViewport(viewport),
+                generation,
+              );
+            }
+          }
+          setGlobalError(undefined);
+        } catch {
+          if (projectGenerationRef.current === generation) {
+            updatePage(pageId, (current) => ({ ...current, error: PREVIEW_CLOSE_ERROR }));
+            setGlobalError(PREVIEW_CLOSE_ERROR);
+          }
+          throw new Error(PREVIEW_CLOSE_ERROR);
+        } finally {
+          closingSessionIdsRef.current.delete(pageId);
+          closeTasksRef.current.delete(pageId);
+        }
+      })();
+      closeTasksRef.current.set(pageId, task);
+      return task;
+    },
+    [
+      adapter,
+      clearLoadDeadline,
+      publishPages,
+      requestLayout,
+      sessionHints,
+      updatePage,
+      workspaceId,
+    ],
+  );
+
+  /** 等待 native close ACK；迟到或陈旧 open 也走同一 close 边界，不发布空白 tab。 */
+  const createPage = useCallback(
+    (
+      openNative: (viewport: PreviewViewport) => ReturnType<NativePreviewPort["open"]>,
+    ): Promise<void> => {
+      if (workspaceId === undefined) return Promise.reject(new Error("当前没有打开工作区。"));
+      if (cleanupTaskRef.current !== undefined)
+        return Promise.reject(new Error("浏览器正在关闭，请稍后重试。"));
+      const generation = projectGenerationRef.current;
+      const pending: PendingPreviewOpen = {
+        projectGeneration: generation,
+        cancelRequested: false,
+        completion: Promise.resolve(),
+      };
+      pendingOpensRef.current.add(pending);
+      const operation = (async (): Promise<void> => {
+        let nativeOpenStarted = false;
+        try {
+          const initialization = initializationRef.current;
+          if (initialization?.generation === generation) await initialization.promise;
+          else await recoverPending(generation);
+          if (projectGenerationRef.current !== generation || pending.cancelRequested) return;
+          if (recoveryBlockedRef.current) throw new Error(PREVIEW_RECOVERY_ERROR);
+          const creationViewport = hiddenViewport(viewportRef.current);
+          nativeOpenStarted = true;
+          const result = await openNative(creationViewport);
+          if (
+            result.snapshot.status !== "open" ||
+            projectGenerationRef.current !== generation ||
+            pending.cancelRequested
+          ) {
+            const closed = await adapter.close(result.snapshot.id);
+            if (closed.id !== result.snapshot.id || closed.status !== "closed")
+              throw new Error(PREVIEW_CLOSE_ERROR);
+            return;
+          }
+          const previousPageId = activePageIdRef.current;
+          if (previousPageId !== undefined)
+            requestLayout(previousPageId, hiddenViewport(viewportRef.current), generation);
+          const entry: ManagedPreviewPage = {
+            snapshot: result.snapshot,
+            navigationIntent: ++navigationIntentRef.current,
+          };
+          pagesRef.current.set(result.snapshot.id, entry);
+          eventCursorRef.current.delete(result.snapshot.id);
+          if (workspaceId !== undefined) sessionHints.remember(workspaceId, result.snapshot.id);
+          activePageIdRef.current = result.snapshot.id;
+          setActivePageId(result.snapshot.id);
+          publishPages();
+          const currentViewport = viewportRef.current;
+          if (currentViewport?.visible === true) {
+            requestLayout(result.snapshot.id, currentViewport, generation);
+          } else {
+            // Native open contract guarantees hidden children start native_visible=false.
+            lastRequestedLayoutRef.current.set(result.snapshot.id, creationViewport);
+            lastAppliedLayoutRef.current.set(result.snapshot.id, creationViewport);
+          }
+          setGlobalError(undefined);
+          if (result.snapshot.load_status === "loading")
+            startLoadDeadline(result.snapshot.id, entry.navigationIntent);
+          const early = earlyEventsRef.current.filter(
+            (event) => event.session_id === result.snapshot.id,
+          );
+          earlyEventsRef.current = earlyEventsRef.current.filter(
+            (event) => event.session_id !== result.snapshot.id,
+          );
+          for (const event of [...early].sort((left, right) => left.sequence - right.sequence))
+            applyEvent(event, generation);
+          await reconcileSession(result.snapshot.id, generation, result.snapshot.generation);
+        } catch (error) {
+          if (nativeOpenStarted) await recoverPending(generation).catch(() => undefined);
+          const message = recoveryBlockedRef.current
+            ? PREVIEW_RECOVERY_ERROR
+            : safePreviewError(error, PREVIEW_OPEN_ERROR);
+          if (projectGenerationRef.current === generation) setGlobalError(message);
+          throw new Error(message);
+        } finally {
+          pendingOpensRef.current.delete(pending);
+        }
+      })();
+      pending.completion = operation;
+      return operation;
+    },
+    [
+      adapter,
+      applyEvent,
+      publishPages,
+      recoverPending,
+      reconcileSession,
+      requestLayout,
+      sessionHints,
+      startLoadDeadline,
+      workspaceId,
+    ],
+  );
+
+  /** 每次显式 URL/file 目标创建独立 hidden WebView session，ACK 后才公开 page identity。 */
+  const openTarget = useCallback(
+    (target: PreviewTarget): Promise<void> => {
+      if (target.kind === "url") {
+        const url = target.url.trim();
+        if (!/^https?:\/\//iu.test(url) || containsControlCharacters(url))
+          return Promise.reject(new Error("浏览器地址无效或暂不支持此协议。"));
+        return createPage((viewport) => adapter.open(url, viewport)).catch((error: unknown) => {
+          throw new Error(safePreviewError(error, PREVIEW_OPEN_ERROR));
+        });
+      }
+      const path = target.path.trim();
+      if (
+        path.length === 0 ||
+        path.length > 4_096 ||
+        [...path].some((character) => {
+          const codePoint = character.codePointAt(0) ?? 0;
+          return codePoint <= 31 || codePoint === 127;
+        }) ||
+        (target.line !== undefined && (!Number.isSafeInteger(target.line) || target.line < 1)) ||
+        (target.column !== undefined && (!Number.isSafeInteger(target.column) || target.column < 1))
+      )
+        return Promise.reject(new Error("文件路径无效。"));
+      return createPage((viewport) => adapter.openFile(path, workspaceId, viewport)).catch(
+        (error: unknown) => {
+          throw new Error(safePreviewError(error, PREVIEW_OPEN_ERROR));
+        },
+      );
+    },
+    [adapter, createPage, workspaceId],
+  );
+
+  /** 创建空白页也由 Rust 签发 page ID，初始子 WebView 隐藏且不获得 Ja capability。 */
+  const newPage = useCallback(
+    (): Promise<void> => createPage((viewport) => adapter.openBlank(viewport)),
+    [adapter, createPage],
+  );
+
+  /** 在当前 page 内导航时保留原生历史；没有选中页才创建一个新的原生页面。 */
+  const navigateExisting = useCallback(
+    (target: { kind: "url"; url: string } | { kind: "file"; path: string }): void => {
+      if (workspaceId === undefined || cleanupTaskRef.current !== undefined) {
+        setGlobalError("当前没有可用的工作区浏览器。");
+        return;
+      }
+      const pageId = activePageIdRef.current;
+      if (pageId === undefined) {
+        void openTarget(target.kind === "url" ? target : { kind: "file", path: target.path }).catch(
+          () => undefined,
+        );
+        return;
+      }
+      const current = pagesRef.current.get(pageId);
+      if (current === undefined) return;
+      const navigationIntent = beginPageNavigation(pageId);
+      if (navigationIntent === undefined) return;
+      const generation = projectGenerationRef.current;
+      const operation = (async (): Promise<void> => {
+        try {
+          const next =
+            target.kind === "url"
+              ? await adapter.navigate(
+                  current.snapshot.id,
+                  current.snapshot.generation,
+                  target.url,
+                  "user",
+                )
+              : await adapter.navigateFile(
+                  current.snapshot.id,
+                  current.snapshot.generation,
+                  target.path,
+                  workspaceId,
+                );
+          const latest = pagesRef.current.get(pageId);
+          if (
+            projectGenerationRef.current !== generation ||
+            latest === undefined ||
+            latest.navigationIntent !== navigationIntent ||
+            next.id !== pageId ||
+            next.generation < latest.snapshot.generation
+          )
+            return;
+          commitSnapshot(next, generation);
+          await reconcileSession(pageId, generation, next.generation);
+        } catch (error) {
+          if (
+            projectGenerationRef.current === generation &&
+            pagesRef.current.get(pageId)?.navigationIntent === navigationIntent
+          ) {
+            const message = safePreviewError(error, PREVIEW_LOAD_ERROR);
+            updatePage(pageId, (page) => ({ ...page, error: message }));
+            finishPageNavigation(pageId);
+          }
+        }
+      })();
+      void operation;
+    },
+    [
+      adapter,
+      beginPageNavigation,
+      commitSnapshot,
+      finishPageNavigation,
+      openTarget,
+      reconcileSession,
+      updatePage,
+      workspaceId,
+    ],
+  );
+
+  /** URL 导航入口是 void UI action；请求错误只写入当前页静态状态，不回显原生诊断。 */
+  const navigate = useCallback(
+    (url: string): void => {
+      navigateExisting({ kind: "url", url });
+    },
+    [navigateExisting],
+  );
+
+  /** 地址栏本机路径留给 Rust 按当前 workspace 解析，并在当前 tab 使用原生 history 导航。 */
+  const navigateFile = useCallback(
+    (path: string): void => {
+      navigateExisting({ kind: "file", path });
+    },
+    [navigateExisting],
+  );
+
+  /** 使用当前原生 history flags 执行回退，不在 renderer 里模拟页面历史栈。 */
+  const navigateHistory = useCallback(
+    (action: "back" | "forward" | "reload"): void => {
+      const pageId = activePageIdRef.current;
+      if (pageId === undefined) return;
+      const current = pagesRef.current.get(pageId);
+      if (current === undefined || current.snapshot.status !== "open") return;
+      if (action === "back" && !current.snapshot.can_go_back) return;
+      if (action === "forward" && !current.snapshot.can_go_forward) return;
+      const navigationIntent = beginPageNavigation(pageId);
+      if (navigationIntent === undefined) return;
+      const generation = projectGenerationRef.current;
+      void (async (): Promise<void> => {
+        try {
+          const next =
+            action === "back"
+              ? await adapter.goBack(pageId, current.snapshot.generation)
+              : action === "forward"
+                ? await adapter.goForward(pageId, current.snapshot.generation)
+                : await adapter.reload(pageId, current.snapshot.generation);
+          if (
+            projectGenerationRef.current !== generation ||
+            pagesRef.current.get(pageId)?.navigationIntent !== navigationIntent ||
+            next.id !== pageId
+          )
+            return;
+          commitSnapshot(next, generation);
+          await reconcileSession(pageId, generation, next.generation);
+        } catch (error) {
+          if (
+            projectGenerationRef.current === generation &&
+            pagesRef.current.get(pageId)?.navigationIntent === navigationIntent
+          ) {
+            updatePage(pageId, (page) => ({
+              ...page,
+              error: safePreviewError(error, PREVIEW_LOAD_ERROR),
+            }));
+            finishPageNavigation(pageId);
+          }
+        }
+      })();
+    },
+    [
+      adapter,
+      beginPageNavigation,
+      commitSnapshot,
+      finishPageNavigation,
+      reconcileSession,
+      updatePage,
+    ],
+  );
+
+  /** DOM 几何变化只显示选中页；附件卸载或 Thread 隐藏时一次性隐藏该会话全部 child WebView。 */
+  const updateViewport = useCallback(
+    (viewport: PreviewViewport): void => {
+      if (previewViewportEquals(viewportRef.current, viewport)) return;
+      viewportRef.current = viewport;
+      const generation = projectGenerationRef.current;
+      if (!viewport.visible) {
+        for (const pageId of pagesRef.current.keys())
+          requestLayout(pageId, hiddenViewport(viewport), generation);
+        return;
+      }
+      const active = activePageIdRef.current;
+      if (active !== undefined) requestLayout(active, viewport, generation);
+    },
+    [requestLayout],
+  );
+
+  /** 关闭全部已确认 page 与 pending open；任一 close ACK 失败都会保留该页面并阻止 workspace 切换。 */
   const cleanupNativePreview = useCallback(
     (showFailure: boolean): Promise<void> => {
-      navigationIntentRef.current += 1;
       if (cleanupTaskRef.current !== undefined) return cleanupTaskRef.current;
       const generation = projectGenerationRef.current;
-      const opening =
-        openingRef.current?.projectGeneration === generation ? openingRef.current : undefined;
-      if (opening !== undefined) opening.cancelRequested = true;
+      const pending = [...pendingOpensRef.current].filter(
+        (item) => item.projectGeneration === generation,
+      );
+      for (const opening of pending) opening.cancelRequested = true;
       const task = (async (): Promise<void> => {
-        if (opening !== undefined) await opening.completion;
-        const current = sessionRef.current;
-        if (current !== undefined) {
-          closingSessionIdRef.current = current.id;
+        await Promise.all(pending.map((opening) => opening.completion.catch(() => undefined)));
+        await layoutTaskRef.current?.catch(() => undefined);
+        const pageIds = [...pagesRef.current.keys()];
+        let closeFailed = false;
+        for (const pageId of pageIds) {
           try {
-            const acknowledged = await adapter.close(current.id);
-            if (acknowledged.id !== current.id || acknowledged.status !== "closed")
-              throw new Error(PREVIEW_CLOSE_ERROR);
+            await closePage(pageId);
           } catch {
-            if (
-              showFailure &&
-              projectGenerationRef.current === generation &&
-              sessionRef.current?.id === current.id
-            )
-              setError(PREVIEW_CLOSE_ERROR);
-            throw new Error(PREVIEW_CLOSE_ERROR);
-          } finally {
-            if (closingSessionIdRef.current === current.id) closingSessionIdRef.current = undefined;
+            closeFailed = true;
           }
-          if (sessionRef.current?.id === current.id) {
-            sessionRef.current = undefined;
-            eventCursorRef.current = undefined;
-          }
-          if (workspaceId !== undefined) sessionHints.forget(workspaceId, current.id);
         }
-        await recoverPending(generation);
+        if (closeFailed || pagesRef.current.size > 0) {
+          if (showFailure && projectGenerationRef.current === generation)
+            setGlobalError(PREVIEW_CLOSE_ERROR);
+          throw new Error(PREVIEW_CLOSE_ERROR);
+        }
+        try {
+          await recoverPending(generation);
+        } catch {
+          if (showFailure && projectGenerationRef.current === generation)
+            setGlobalError(PREVIEW_RECOVERY_ERROR);
+          throw new Error(PREVIEW_RECOVERY_ERROR);
+        }
         if (projectGenerationRef.current === generation) {
-          setSnapshot(undefined);
-          setLoading(false);
-          setError(undefined);
+          activePageIdRef.current = undefined;
+          setActivePageId(undefined);
+          setGlobalError(undefined);
         }
       })().finally(() => {
         if (cleanupTaskRef.current === task) cleanupTaskRef.current = undefined;
@@ -388,230 +950,96 @@ export function usePreviewLifecycleController(
       cleanupTaskRef.current = task;
       return task;
     },
-    [adapter, recoverPending, sessionHints, workspaceId],
+    [closePage, recoverPending],
   );
 
-  /** 首次导航创建 session，后续导航携带 generation；每次 await 后都重验意图栅栏。 */
-  const navigate = useCallback(
-    (url: string): void => {
-      if (workspaceId === undefined || cleanupTaskRef.current !== undefined) return;
-      const generation = projectGenerationRef.current;
-      const current = sessionRef.current;
-      if (current === undefined && openingRef.current?.projectGeneration === generation) return;
-      const navigationIntent = ++navigationIntentRef.current;
-      failedNavigationRef.current = undefined;
-      setLoadDeadline({ navigationIntent, startedAt: Date.now() });
-      setLoading(true);
-      setError(undefined);
-      const opening: PendingPreviewOpen | undefined =
-        current === undefined || current.status === "closed"
-          ? {
-              projectGeneration: generation,
-              events: [],
-              cancelRequested: false,
-              completion: Promise.resolve(),
-            }
-          : undefined;
-      let nativeOpenStarted = false;
-      if (opening !== undefined) openingRef.current = opening;
-      const operation = (async (): Promise<void> => {
-        try {
-          if (opening !== undefined) {
-            await recoverPending(generation);
-            if (
-              projectGenerationRef.current !== generation ||
-              navigationIntentRef.current !== navigationIntent
-            )
-              return;
-            const viewport = viewportRef.current;
-            if (
-              viewport === undefined ||
-              !viewport.visible ||
-              viewport.width < 1 ||
-              viewport.height < 1
-            )
-              throw new Error(PREVIEW_LOAD_ERROR);
-            nativeOpenStarted = true;
-            const result = await adapter.open(url, viewport);
-            if (opening.cancelRequested) {
-              if (projectGenerationRef.current === generation) sessionRef.current = result.snapshot;
-              else await adapter.close(result.snapshot.id).catch(() => undefined);
-              return;
-            }
-            if (
-              projectGenerationRef.current !== generation ||
-              navigationIntentRef.current !== navigationIntent
-            ) {
-              await adapter.close(result.snapshot.id).catch(() => undefined);
-              return;
-            }
-            if (sessionRef.current !== undefined && sessionRef.current.id !== result.snapshot.id) {
-              await adapter.close(result.snapshot.id);
-              return;
-            }
-            sessionRef.current = undefined;
-            eventCursorRef.current = undefined;
-            commitSnapshot(result.snapshot, generation, result.snapshot.id);
-            if (openingRef.current === opening) openingRef.current = undefined;
-            for (const event of [...opening.events]
-              .filter((candidate) => candidate.session_id === result.snapshot.id)
-              .sort((left, right) => left.sequence - right.sequence))
-              applyEvent(event, generation);
-            await reconcileSession(result.snapshot.id, generation, result.snapshot.generation);
-          } else if (current !== undefined) {
-            const minimumGeneration = current.generation + 1;
-            const next = await adapter.navigate(current.id, current.generation, url, "user");
-            if (
-              projectGenerationRef.current !== generation ||
-              navigationIntentRef.current !== navigationIntent
-            )
-              return;
-            const active = sessionRef.current;
-            if (
-              active === undefined ||
-              active.id !== next.id ||
-              next.generation < active.generation
-            )
-              return;
-            if (next.generation >= minimumGeneration) commitSnapshot(next, generation, current.id);
-            await reconcileSession(current.id, generation, minimumGeneration);
-          }
-        } catch {
-          if (opening !== undefined && nativeOpenStarted)
-            await recoverPending(generation).catch(() => undefined);
-          if (
-            projectGenerationRef.current === generation &&
-            navigationIntentRef.current === navigationIntent
-          ) {
-            setLoadDeadline(undefined);
-            setLoading(false);
-            setError(recoveryBlockedRef.current ? PREVIEW_RECOVERY_ERROR : PREVIEW_LOAD_ERROR);
-          }
-        } finally {
-          if (opening !== undefined && openingRef.current === opening)
-            openingRef.current = undefined;
-        }
-      })();
-      if (opening !== undefined) opening.completion = operation;
-      void operation;
-    },
-    [adapter, applyEvent, commitSnapshot, reconcileSession, recoverPending, workspaceId],
-  );
+  /** 显式重试只重跑 orphan recovery，不创建新页或重放之前失败的浏览器操作。 */
+  const retryRecovery = useCallback((): void => {
+    void recoverPending(projectGenerationRef.current).catch(() => undefined);
+  }, [recoverPending]);
 
-  /**
-   * 串行排空原生 layout，并在一个调用未完成时只保留最新矩形；WebView2 resize burst
-   * 因此不会积压并回放过期 bounds，也不会让旧 session 的失败污染当前 Workspace。
-   */
-  const drainPendingLayout = useCallback((): void => {
-    if (layoutTaskRef.current !== undefined) return;
-    const task = (async (): Promise<void> => {
-      while (pendingLayoutRef.current !== undefined) {
-        const pending = pendingLayoutRef.current;
-        pendingLayoutRef.current = undefined;
-        try {
-          await adapter.layout(pending.sessionId, pending.viewport);
-        } catch {
-          const newerLayoutPending = pendingLayoutRef.current !== undefined;
-          if (
-            !newerLayoutPending &&
-            projectGenerationRef.current === pending.projectGeneration &&
-            sessionRef.current?.id === pending.sessionId
-          )
-            setError(PREVIEW_LOAD_ERROR);
-        }
-      }
-    })().finally(() => {
-      if (layoutTaskRef.current === task) layoutTaskRef.current = undefined;
-    });
-    layoutTaskRef.current = task;
-  }, [adapter]);
-
-  /** DOM 几何只影响当前已打开 session；相同矩形去重，变化矩形进入 latest-wins 通道。 */
-  const updateViewport = useCallback(
-    (viewport: PreviewViewport): void => {
-      if (previewViewportEquals(viewportRef.current, viewport)) return;
-      viewportRef.current = viewport;
-      const current = sessionRef.current;
-      if (current === undefined || current.status !== "open") return;
-      pendingLayoutRef.current = {
-        projectGeneration: projectGenerationRef.current,
-        sessionId: current.id,
-        viewport,
-      };
-      drainPendingLayout();
-    },
-    [drainPendingLayout],
-  );
-
-  /** workspace identity 变化时先使全部 continuation 失效；真正切换由外层 ACK 生命周期保护。 */
-  const deadlineSessionId = snapshot?.id;
-  const deadlineSessionGeneration = snapshot?.generation;
-  const deadlineSessionStatus = snapshot?.status;
-  const deadlineLoadStatus = snapshot?.load_status;
+  /** workspace identity 改变时先废弃旧 continuation，再恢复该 workspace 的 page ID 列表。 */
   useEffect(() => {
-    projectGenerationRef.current += 1;
+    const generation = ++projectGenerationRef.current;
     navigationIntentRef.current += 1;
-    recoveryBlockedRef.current = workspaceId !== undefined;
-    sessionRef.current = undefined;
+    pagesRef.current.clear();
+    activePageIdRef.current = undefined;
     viewportRef.current = undefined;
-    pendingLayoutRef.current = undefined;
-    openingRef.current = undefined;
-    eventCursorRef.current = undefined;
-    failedNavigationRef.current = undefined;
-    setSnapshot(undefined);
-    setLoadDeadline(undefined);
-    setLoading(false);
+    pendingLayoutsRef.current.clear();
+    lastRequestedLayoutRef.current.clear();
+    lastAppliedLayoutRef.current.clear();
+    earlyEventsRef.current = [];
+    eventCursorRef.current.clear();
+    for (const timer of loadTimersRef.current.values()) clearTimeout(timer);
+    loadTimersRef.current.clear();
+    setPages([]);
+    setActivePageId(undefined);
+    setGlobalError(undefined);
     setRecovering(false);
-    setError(undefined);
-    return () => {
-      projectGenerationRef.current += 1;
-      navigationIntentRef.current += 1;
-      openingRef.current = undefined;
-    };
-  }, [workspaceId]);
-
-  /** open 快照提交后保存 opaque hint；closed 事件会同步撤销，undefined 初态不得擦掉 reload 线索。 */
-  useEffect(() => {
-    if (workspaceId === undefined || snapshot === undefined) return;
-    if (snapshot.status === "open") sessionHints.remember(workspaceId, snapshot.id);
-    else sessionHints.forget(workspaceId, snapshot.id);
-  }, [sessionHints, snapshot, workspaceId]);
-
-  /**
-   * workspace 挂载后优先用 Rust state 复核 reload 前的 session；不存在或已关闭时清除 hint，
-   * 再执行既有 orphan recovery。hint 介质从不单独恢复 URL、状态或授权事实。
-   */
-  useEffect(() => {
-    if (workspaceId === undefined) return undefined;
-    const generation = projectGenerationRef.current;
+    recoveryBlockedRef.current = workspaceId !== undefined;
+    if (workspaceId === undefined) {
+      initializationRef.current = { generation, promise: Promise.resolve() };
+      return () => {
+        projectGenerationRef.current += 1;
+      };
+    }
     let disposed = false;
-    void (async (): Promise<void> => {
-      const hintedSessionId = sessionHints.read(workspaceId);
-      if (hintedSessionId !== undefined) {
-        try {
-          const restored = await adapter.state(hintedSessionId);
-          if (disposed || projectGenerationRef.current !== generation) return;
-          if (restored.id === hintedSessionId && restored.status === "open") {
-            sessionRef.current = restored;
-            eventCursorRef.current = undefined;
-            recoveryBlockedRef.current = false;
-            commitSnapshot(restored, generation, hintedSessionId);
-            await reconcileSession(hintedSessionId, generation, restored.generation);
-            return;
+    const initialization = (async (): Promise<void> => {
+      const pageIds = sessionHints.read(workspaceId);
+      const restored = await Promise.all(
+        pageIds.map(async (pageId) => {
+          try {
+            const snapshot = await adapter.state(pageId);
+            return snapshot.id === pageId && snapshot.status === "open" ? snapshot : undefined;
+          } catch {
+            return undefined;
           }
-        } catch {
-          // 无效、过期或不属于当前 native owner 的 hint 与不存在使用同一恢复路径。
+        }),
+      );
+      if (disposed || projectGenerationRef.current !== generation) return;
+      const validPages = restored.filter(
+        (snapshot): snapshot is PreviewSessionSnapshot => snapshot !== undefined,
+      );
+      for (const pageId of pageIds)
+        if (!validPages.some((snapshot) => snapshot.id === pageId))
+          sessionHints.forget(workspaceId, pageId);
+      for (const snapshot of validPages) {
+        pagesRef.current.set(snapshot.id, {
+          snapshot,
+          navigationIntent: ++navigationIntentRef.current,
+          error: snapshot.load_status === "failed" ? PREVIEW_LOAD_ERROR : undefined,
+        });
+        sessionHints.remember(workspaceId, snapshot.id);
+      }
+      if (validPages.length > 0) {
+        const hidden = hiddenViewport(HIDDEN_LAYOUT_FALLBACK);
+        await Promise.all(
+          validPages.map((snapshot) => adapter.layout(snapshot.id, hidden).catch(() => undefined)),
+        );
+        if (disposed || projectGenerationRef.current !== generation) return;
+        publishPages();
+        const latestPageId = validPages.at(-1)?.id;
+        activePageIdRef.current = latestPageId;
+        setActivePageId(latestPageId);
+        if (latestPageId !== undefined) {
+          const activeSnapshot = validPages.find((snapshot) => snapshot.id === latestPageId);
+          if (activeSnapshot !== undefined)
+            await reconcileSession(latestPageId, generation, activeSnapshot.generation);
         }
-        sessionHints.forget(workspaceId, hintedSessionId);
       }
       await recoverPending(generation).catch(() => undefined);
     })();
+    initializationRef.current = { generation, promise: initialization };
+    const pendingOpens = pendingOpensRef.current;
     return () => {
       disposed = true;
+      for (const opening of pendingOpens)
+        if (opening.projectGeneration === generation) opening.cancelRequested = true;
+      if (projectGenerationRef.current === generation) projectGenerationRef.current += 1;
     };
-  }, [adapter, commitSnapshot, reconcileSession, recoverPending, sessionHints, workspaceId]);
+  }, [adapter, publishPages, reconcileSession, recoverPending, sessionHints, workspaceId]);
 
-  /** 每个 workspace 只保留一个原生订阅，异步返回的迟到 handle 立即释放。 */
+  /** 每个 workspace 只保留一份原生事件订阅，迟到 handle 在注册后立即释放。 */
   useEffect(() => {
     if (workspaceId === undefined) return undefined;
     const generation = projectGenerationRef.current;
@@ -630,105 +1058,87 @@ export function usePreviewLifecycleController(
     };
   }, [adapter, applyEvent, workspaceId]);
 
-  /**
-   * loading 期间周期性回读有界事件与权威快照，补偿 WebView2 completion 和 Tauri live event
-   * 之间的时序窗口；终态、identity 变化或 renderer 截止后立即停止，避免后台 Preview
-   * 产生持续 IPC。
-   */
+  /** 只轮询当前且仍 loading 的 page；inactive tabs 依靠原生事件，不产生后台 IPC。 */
+  const activePage = pages.find((page) => page.snapshot.id === activePageId);
+  const activeSnapshot = activePage?.snapshot;
+  const activeSnapshotId = activeSnapshot?.id;
+  const activeSnapshotGeneration = activeSnapshot?.generation;
+  const activeSnapshotStatus = activeSnapshot?.status;
+  const activeSnapshotLoadStatus = activeSnapshot?.load_status;
   useEffect(() => {
     if (
       workspaceId === undefined ||
-      deadlineSessionId === undefined ||
-      deadlineSessionGeneration === undefined ||
-      deadlineSessionStatus !== "open" ||
-      deadlineLoadStatus !== "loading"
+      activeSnapshotId === undefined ||
+      activeSnapshotStatus !== "open" ||
+      activeSnapshotLoadStatus !== "loading"
     )
       return undefined;
-    const projectGeneration = projectGenerationRef.current;
-    const sessionId = deadlineSessionId;
-    const minimumGeneration = deadlineSessionGeneration;
+    const generation = projectGenerationRef.current;
+    const pageId = activeSnapshotId;
+    const minimumGeneration = activeSnapshotGeneration ?? 0;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-
-    /** 单次回读结束后仅为仍处于同一 loading identity 的 session 安排下一轮。 */
+    /** 单轮同步结束后仅为仍 active 且 loading 的原生 page 安排下一次有界回读。 */
     const reconcileWhileLoading = async (): Promise<void> => {
-      await reconcileSession(sessionId, projectGeneration, minimumGeneration);
-      const current = sessionRef.current;
-      const deadlineReached =
-        failedNavigationRef.current?.sessionId === sessionId &&
-        failedNavigationRef.current.navigationIntent === navigationIntentRef.current;
+      await reconcileSession(pageId, generation, minimumGeneration);
+      const current = pagesRef.current.get(pageId);
       if (
         disposed ||
-        deadlineReached ||
-        projectGenerationRef.current !== projectGeneration ||
-        current?.id !== sessionId ||
-        current.status !== "open" ||
-        current.load_status !== "loading"
+        projectGenerationRef.current !== generation ||
+        activePageIdRef.current !== pageId ||
+        current?.snapshot.status !== "open" ||
+        current.snapshot.load_status !== "loading" ||
+        current.error !== undefined
       )
         return;
       timer = setTimeout(() => void reconcileWhileLoading(), PREVIEW_LOADING_RECONCILE_INTERVAL_MS);
     };
-
     timer = setTimeout(() => void reconcileWhileLoading(), PREVIEW_LOADING_RECONCILE_INTERVAL_MS);
     return () => {
       disposed = true;
       if (timer !== undefined) clearTimeout(timer);
     };
   }, [
-    deadlineLoadStatus,
-    deadlineSessionGeneration,
-    deadlineSessionId,
-    deadlineSessionStatus,
+    activeSnapshotGeneration,
+    activeSnapshotId,
+    activeSnapshotLoadStatus,
+    activeSnapshotStatus,
     reconcileSession,
     workspaceId,
   ]);
 
-  /**
-   * Rust 的 30 秒 watchdog 是权威终态；renderer 多保留 1 秒传播余量后提供脱敏故障保险。
-   * 预算绑定用户导航 intent 的首次开始时间，而不是 WebView2 内部 generation；重定向或错误页
-   * 重试可以推进 generation，但不能无限延长同一次用户操作。新导航、终态或 workspace 切换会
-   * 更换该 intent，旧 timer 因此不能污染恢复后的页面。
-   */
-  useEffect(() => {
-    if (
-      workspaceId === undefined ||
-      deadlineSessionId === undefined ||
-      deadlineSessionGeneration === undefined ||
-      deadlineSessionStatus !== "open" ||
-      deadlineLoadStatus !== "loading" ||
-      loadDeadline === undefined
-    )
-      return undefined;
-    const projectGeneration = projectGenerationRef.current;
-    const sessionId = deadlineSessionId;
-    const navigationIntent = loadDeadline.navigationIntent;
-    const elapsed = Math.max(0, Date.now() - loadDeadline.startedAt);
-    const remaining = Math.max(0, PREVIEW_RENDERER_LOAD_DEADLINE_MS - elapsed);
-    const timer = setTimeout(() => {
-      const current = sessionRef.current;
-      if (
-        projectGenerationRef.current !== projectGeneration ||
-        navigationIntentRef.current !== navigationIntent ||
-        current?.id !== sessionId ||
-        current.status !== "open" ||
-        current.load_status !== "loading"
-      )
-        return;
-      failedNavigationRef.current = { sessionId, navigationIntent };
-      setLoading(false);
-      setError(PREVIEW_LOAD_ERROR);
-    }, remaining);
-    return () => clearTimeout(timer);
-  }, [
-    deadlineLoadStatus,
-    deadlineSessionGeneration,
-    deadlineSessionId,
-    deadlineSessionStatus,
-    loadDeadline,
-    workspaceId,
-  ]);
+  /** 卸载时释放每页 renderer timer；native sessions 的关闭由 ACK-first workspace owner 管理。 */
+  useEffect(
+    () => () => {
+      for (const timer of loadTimersRef.current.values()) clearTimeout(timer);
+      loadTimersRef.current.clear();
+    },
+    [],
+  );
 
-  /** 外层只获得 ACK-first close port，不获得 session identity 或 native handle。 */
+  const pageProjections = useMemo<readonly PreviewPageProjection[]>(
+    () =>
+      pages.map((page) => ({
+        pageId: page.snapshot.id,
+        url: page.snapshot.url,
+        title: page.snapshot.title,
+        loading:
+          page.snapshot.status === "open" &&
+          page.snapshot.load_status === "loading" &&
+          page.error === undefined,
+        error: page.error,
+        canGoBack: page.snapshot.can_go_back,
+        canGoForward: page.snapshot.can_go_forward,
+      })),
+    [pages],
+  );
+  const activeError = activePage?.error ?? globalError;
+  const loading =
+    activeSnapshot?.status === "open" &&
+    activeSnapshot.load_status === "loading" &&
+    activePage?.error === undefined;
+
+  /** 外层关闭能力与 workspace 切换共用完整 page ACK 清理，不触碰同 workspace 的其它会话。 */
   const workspaceLifecycle = useMemo<PreviewWorkspaceLifecycle | undefined>(
     () =>
       workspaceId === undefined
@@ -741,12 +1151,23 @@ export function usePreviewLifecycleController(
     closePreview: () => cleanupNativePreview(false),
     workspaceLifecycle,
     preview: {
-      url: snapshot?.url,
+      pages: pageProjections,
+      activePageId,
+      url: activeSnapshot?.url,
       loading,
       recovering,
-      error,
+      error: activeError,
+      canGoBack: activeSnapshot?.can_go_back ?? false,
+      canGoForward: activeSnapshot?.can_go_forward ?? false,
+      onOpenTarget: openTarget,
+      onNewPage: newPage,
+      onSelectPage: selectPage,
+      onClosePage: closePage,
       onNavigate: navigate,
-      onReload: snapshot?.status === "open" ? () => navigate(snapshot.url) : undefined,
+      onNavigateFile: navigateFile,
+      onGoBack: () => navigateHistory("back"),
+      onGoForward: () => navigateHistory("forward"),
+      onReload: () => navigateHistory("reload"),
       onRetryRecovery: recoveryBlockedRef.current ? retryRecovery : undefined,
       onViewportChange: updateViewport,
     },

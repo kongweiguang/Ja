@@ -44,6 +44,8 @@
     "scripts/e2e/configuration-availability-webview2.mjs",
     "scripts/e2e/review-redesign-browser.mjs",
     "scripts/e2e/workbench-tab-context-webview2.mjs",
+    // V6 共享会话迁移的真窗入口由维护者使用隔离 Java/JAR/evidence 参数单独启动。
+    "scripts/e2e/legacy-workspace-menu-webview2.mjs",
     // 流式恢复与图片附件的独立浏览器验收由维护者通过 CLI 启动，fixture 由 Vite HTML 加载。
     "scripts/e2e/conversation-progress-webview2.mjs",
     "scripts/e2e/image-ux-browser.mjs",
@@ -82,12 +84,14 @@
     "/src/features/conversation/application/timelineStore.ts",
     "/src/features/conversation/domain/timelineContracts.ts",
     "/src/features/conversation/index.ts",
+    "/src/api/tauri/tasks.ts",
   ],
   "ignoreBinaries": [
     // Windows 真窗 runner 只在清理自己启动的进程树时调用系统 taskkill；删除条件是统一改用 Node 原生进程树终止。
     "taskkill.exe",
     // Fail-fast 回归直接启动系统 PowerShell 7；它不是 npm 依赖，删除条件是改用 Node 原生 shell runner。
     "pwsh",
+    "pwsh.exe",
   ],
   // Zod schema 与领域类型常在声明文件内部组合成公开根 schema；内部有真实引用时不按未使用出口处理。
   "ignoreExportsUsedInFile": true,

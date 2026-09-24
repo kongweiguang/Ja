@@ -32,11 +32,12 @@ public interface CatalogQueryPort {
      * 在有限生命周期内探测单个 MCP 服务，并返回脱敏状态。
      */
     CompletionStage<McpServerDescriptor> testMcp(ConfigurationGenerationPort.Lease generation,
-                                                 String mcpId);
+                                                 Path workspaceRoot, String mcpId);
 
     /**
      * 从同一配置租约读取一个 MCP 的 Tool Schema 页面。
      */
     CursorPage<McpToolDescriptor> readMcpTools(
-            ConfigurationGenerationPort.Lease generation, String mcpId, String cursor, int limit);
+            ConfigurationGenerationPort.Lease generation, Path workspaceRoot,
+            String mcpId, String cursor, int limit);
 }

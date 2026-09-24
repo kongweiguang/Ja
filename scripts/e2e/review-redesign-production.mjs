@@ -710,7 +710,8 @@ function safeFailure(error, runRoot) {
 
 /**
  * 执行 attach 或自主 launch 模式，并原子发布 JSON 报告。非 CLI 调用可注入窄场景 driver，
- * 以复用相同的 profile、进程与清理所有权；未注入时保持 Review 的驱动和校验合同不变。
+ * 以复用相同的 profile、进程与清理所有权；启动前夹具钩子只拿本轮随机 Temp 目录，
+ * 旧数据库等特殊验收必须在 Java sidecar 首次启动前写完。
  */
 export async function runProduction(options) {
   await mkdir(options.evidenceDirectory, { recursive: true });
@@ -751,6 +752,14 @@ export async function runProduction(options) {
           options.wallTimeoutMs,
         ),
       ]);
+      if (options.prepareIsolatedHome !== undefined) {
+        await options.prepareIsolatedHome({
+          root: directories.root,
+          home: directories.home,
+          runtime: directories.runtime,
+          java: toolchain.java,
+        });
+      }
       frontendPort = await reservePort();
       const automationPort = await reservePort(new Set([frontendPort]));
       const edgeDriverSessionPath = join(directories.runtime, "edgedriver-session.json");

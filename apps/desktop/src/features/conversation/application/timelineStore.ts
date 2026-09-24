@@ -85,6 +85,8 @@ const draftItemByProjection = new WeakMap<
   NonNullable<TimelineState["draftByTurn"][string]>[number],
   TimelineItemAdapter
 >();
+type RetryStatusProjection = NonNullable<TimelineState["retryingByTurn"][string]>;
+const retryStatusItemByProjection = new WeakMap<RetryStatusProjection, TimelineItemAdapter>();
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 const MAX_RECOVERY_EVENTS = 256;
 const MAX_RECOVERY_BYTES = 1024 * 1024;
@@ -231,6 +233,32 @@ function draftItemForTurn(
     createdAt: draft.occurredAt,
   };
   draftItemByProjection.set(draft, item);
+  return item;
+}
+
+/**
+ * useSyncExternalStore 要求同一 Retry Descriptor 重复选取时返回相同 Item identity；弱缓存避免每次
+ * render 都生成新快照，触发浅比较失效与 React 更新循环，同时由 immutable descriptor 自然失效。
+ */
+function retryStatusItemForTurn(
+  threadId: string,
+  turnId: string,
+  retry: RetryStatusProjection,
+): TimelineItemAdapter {
+  const cached = retryStatusItemByProjection.get(retry);
+  if (cached !== undefined) return cached;
+  const item: TimelineItemAdapter = {
+    itemId: `retry:${turnId}:${retry.attempt}`,
+    threadId,
+    turnId,
+    kind: "commentary",
+    status: "in_progress",
+    text: `重试 ${retry.attempt}/${retry.maxAttempts}`,
+    title: "重试",
+    metadata: { phase: "assistant_retry" },
+    createdAt: retry.occurredAt,
+  };
+  retryStatusItemByProjection.set(retry, item);
   return item;
 }
 
@@ -610,6 +638,7 @@ export const selectCommittedItemsForThread = (threadId: string) => (state: Timel
 /**
  * 按同一 Turn 的权威发生时间交错暂态正文与持久步骤。不能简单把 Draft 追加到所有 Tool 后面，
  * 否则自动上下文压缩等中途步骤会越过此前正文；无时间的恢复记录继续保留原有稳定顺序。
+ * 重试提示作为单一瞬态步骤投影，失败尝试正文已由 reducer 清除，避免和新一轮输出叠加。
  */
 export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {
   const committed = selectCommittedItemsForThread(threadId)(state);
@@ -620,7 +649,12 @@ export const selectItemsForThread = (threadId: string) => (state: TimelineStore)
       .filter((draft) => draft.text.trim() !== "")
       .map((draft) => draftItemForTurn(threadId, turn.turnId, draft));
   });
-  return interleaveDraftsWithCommittedItems(committed, drafts);
+  const retryStatuses = Object.entries(state.retryingByTurn).flatMap(([turnId, retry]) => {
+    const turn = state.turns[turnId];
+    if (turn?.threadId !== threadId || turn.status !== "running") return [];
+    return [retryStatusItemForTurn(threadId, turnId, retry)];
+  });
+  return interleaveDraftsWithCommittedItems(committed, [...drafts, ...retryStatuses]);
 };
 
 /** 主 Timeline 只读取当前 root 的持久活动切片；稳定空数组避免隐藏视图产生无效重渲染。 */

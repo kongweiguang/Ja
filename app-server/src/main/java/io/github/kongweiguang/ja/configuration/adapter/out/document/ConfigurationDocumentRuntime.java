@@ -89,7 +89,9 @@ public final class ConfigurationDocumentRuntime {
         return ConfigurationMutationCoordinator.execute(target, () -> {
             LayerLoad current = loadWritableLayer(scope, canonical);
             checkExpectedVersion(current.version, expectedVersion);
-            ObjectNode currentDocument = current.document == null ? documentFactory.createEmpty() : current.document;
+            ObjectNode currentDocument = current.document == null
+                    ? scope == ConfigurationScope.PROJECT ? documentFactory.createProjectEmpty()
+                            : documentFactory.createEmpty() : current.document;
             ObjectNode next = applyMergePatch(currentDocument, patch);
             return publish(scope, target, current.document, next);
         });
@@ -126,7 +128,8 @@ public final class ConfigurationDocumentRuntime {
         return ConfigurationMutationCoordinator.execute(target, () -> {
             LayerLoad current = loadReplaceableLayer(scope, canonical);
             checkExpectedVersion(current.version, expectedVersion);
-            return publish(scope, target, current.document, documentFactory.createEmpty());
+            return publish(scope, target, current.document, scope == ConfigurationScope.PROJECT
+                    ? documentFactory.createProjectEmpty() : documentFactory.createEmpty());
         });
     }
 
@@ -325,19 +328,63 @@ public final class ConfigurationDocumentRuntime {
                         "snapshot_in_use", List.of("edit", "restore")));
             }
         }
+        java.util.Set<String> globalMcpIds = mcpIds(effective);
         if (project.document != null && project.status == ConfigurationData.LayerStatus.VALID && trusted) {
             try {
-                enforceNoEscalation(user.document, project.document);
-                effective = mergeDocuments(effective, project.document);
+                ObjectNode applicableProject = project.document.deepCopy();
+                filterConflictingProjectMcp(effective, applicableProject, issues);
+                enforceNoEscalation(user.document, applicableProject);
+                effective = mergeDocuments(effective, applicableProject);
             } catch (ConfigurationError escalation) {
                 diagnostics.add(new ConfigGeneration.Diagnostic("LIMIT_ESCALATION", false));
                 issues.add(issue("project_limits", "project", null, null, "LIMIT_ESCALATION",
                         "project_ignored", List.of("edit")));
             }
         }
+        if (!issues.isEmpty() && diagnostics.stream().noneMatch(
+                diagnostic -> "CONFIGURATION_ISSUES".equals(diagnostic.code()))) {
+            diagnostics.add(new ConfigGeneration.Diagnostic("CONFIGURATION_ISSUES", false));
+        }
+        java.util.Set<String> projectMcpIds = new java.util.HashSet<>();
+        if (project.document != null && project.status == ConfigurationData.LayerStatus.VALID && trusted) {
+            projectMcpIds.addAll(mcpIds(effective));
+            projectMcpIds.removeAll(globalMcpIds);
+        }
         return new ConfigurationRuntimeState.ReadResult(trusted, user.view(), project.view(), effective,
                 credentialStatuses(auth.secretIds()),
-                auth.version(), diagnostics, issues);
+                auth.version(), diagnostics, issues, projectMcpIds);
+    }
+
+    /** 只比较已验证目录的稳定身份，避免通过同名或端点推测配置来源。 */
+    private static java.util.Set<String> mcpIds(ObjectNode document) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        if (document.get("mcp_servers") instanceof ArrayNode servers) {
+            servers.forEach(server -> ids.add(server.path("mcp_id").asText()));
+        }
+        return ids;
+    }
+
+    /** 项目与全局 ID 冲突时只隔离项目条目，保留其它项目服务和 Skill。 */
+    private static void filterConflictingProjectMcp(ObjectNode base, ObjectNode project,
+                                                     List<ConfigurationData.Issue> issues) {
+        if (!(project.get("mcp_servers") instanceof com.fasterxml.jackson.databind.node.ArrayNode projectServers)) {
+            return;
+        }
+        java.util.Set<String> globalIds = new java.util.HashSet<>();
+        if (base.get("mcp_servers") instanceof com.fasterxml.jackson.databind.node.ArrayNode globalServers) {
+            globalServers.forEach(server -> globalIds.add(server.path("mcp_id").asText()));
+        }
+        com.fasterxml.jackson.databind.node.ArrayNode accepted = project.arrayNode();
+        for (JsonNode server : projectServers) {
+            String id = server.path("mcp_id").asText();
+            if (globalIds.contains(id)) {
+                issues.add(issue("project_mcp_conflict_" + id, "project", "mcp_servers", id,
+                        "MCP_ID_CONFLICT", "entry_skipped", List.of("edit")));
+            } else {
+                accepted.add(server.deepCopy());
+            }
+        }
+        project.set("mcp_servers", accepted);
     }
 
     /**

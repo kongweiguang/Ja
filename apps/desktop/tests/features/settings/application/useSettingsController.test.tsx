@@ -14,7 +14,6 @@ const NO_PROJECT_OVERRIDES = {
   defaultSelection: false,
   accessMode: false,
   disabledSkillReferences: [],
-  disabledMcpIds: [],
 };
 
 const DOCUMENT: SettingsDocument = {
@@ -76,6 +75,7 @@ function controllerOptions(
       snapshot,
       save,
       saveProjectSkills: vi.fn(async () => "cfg_project"),
+      saveProjectMcpServers: vi.fn(async () => "cfg_project"),
       patch: vi.fn(async () => ({ version: "cfg_project" })),
       reset: vi.fn(async () => ({ version: "cfg_project" })),
       restoreLastKnownGood: vi.fn(async () => "cfg_user"),
@@ -104,6 +104,7 @@ function controllerOptions(
       listMcpServers: vi.fn(async () => ({ items: [], nextCursor: null })),
       testMcp: vi.fn(async () => ({
         mcpId: "mcp",
+        scope: "global" as const,
         status: "healthy" as const,
         toolCount: 0,
       })),
@@ -655,6 +656,7 @@ describe("useSettingsController v1", () => {
             snapshot,
             save,
             saveProjectSkills: vi.fn(async () => "cfg_project"),
+            saveProjectMcpServers: vi.fn(async () => "cfg_project"),
             patch: vi.fn(async () => ({ version: "cfg_project" })),
             reset: vi.fn(async () => ({ version: "cfg_project" })),
             restoreLastKnownGood: vi.fn(async () => "cfg_user"),
@@ -683,6 +685,7 @@ describe("useSettingsController v1", () => {
             listMcpServers: vi.fn(async () => ({ items: [], nextCursor: null })),
             testMcp: vi.fn(async () => ({
               mcpId: "mcp",
+              scope: "global" as const,
               status: "healthy" as const,
               toolCount: 0,
             })),
@@ -877,6 +880,7 @@ describe("useSettingsController v1", () => {
             })),
             save,
             saveProjectSkills: vi.fn(async () => "cfg_project"),
+            saveProjectMcpServers: vi.fn(async () => "cfg_project"),
             patch: vi.fn(async () => ({ version: "cfg_project" })),
             reset: vi.fn(async () => ({ version: "cfg_project" })),
             restoreLastKnownGood: vi.fn(async () => "cfg_user"),

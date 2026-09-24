@@ -25,6 +25,7 @@ import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -124,6 +125,43 @@ final class AgentLoopPersistence {
         sink.observeCommittedTurn(request.threadId(), request.turnId(), state.threadRevision,
                 state.turnMutationVersion, execution.common().modelRound(), committed, clock.instant());
         if (committed != null) publishCommitted(sink, committed);
+    }
+
+    /**
+     * 一次普通 Assistant 请求失败后，在同一 CAS 中保留其纯文本 partial 与公开 reasoning 审计事实、
+     * 结算该 request 的 Usage，再推进 ordinal 回 READY；partial 身份被历史与 Timeline 投影过滤，
+     * 因而不会把未完成 Assistant 或 Tool 结构当作下一次请求上下文。
+     */
+    void settleAssistantRetry(TurnExecutionPlan request, AgentLoop.RuntimeState state,
+                              TurnExecutionState.ProviderPending pending, int modelRound,
+                              ModelUsage usage, String partialText, String reasoningSummary,
+                              TurnEventSink sink) {
+        Objects.requireNonNull(pending, "pending");
+        Objects.requireNonNull(sink, "sink");
+        if (state.execution != pending
+                || pending.purpose() != TurnExecutionState.ProviderPurpose.ASSISTANT
+                || modelRound < 1) {
+            throw new AgentLoop.LoopFailure("INVALID_STATE", "Assistant retry settlement changed");
+        }
+        List<ConversationRepository.Fact> facts = new ArrayList<>(3);
+        if (usage != null) {
+            facts.add(new ConversationRepository.UsageFact(
+                    pending.requestId(), usage, modelRound, pending.common().nextProviderOrdinal(),
+                    ConversationRepository.UsagePurpose.ASSISTANT,
+                    ConversationRepository.UsageCertainty.KNOWN, pending.profile()));
+        }
+        String partialMessageId = new TerminalFailureReplyPolicy()
+                .partialMessageIdForRequest(request.turnId(), pending.requestId());
+        if (partialText != null && !partialText.isBlank()) {
+            facts.add(new ConversationRepository.AssistantFact(partialMessageId,
+                    new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(partialText))),
+                    partialText, null, modelRound));
+        }
+        if (reasoningSummary != null && !reasoningSummary.isBlank()) {
+            facts.add(new ConversationRepository.ReasoningSummaryFact(
+                    partialMessageId, reasoningSummary, modelRound));
+        }
+        emit(request, state, null, facts, pending.resume().advanceProviderOrdinal(), sink);
     }
 
     /**

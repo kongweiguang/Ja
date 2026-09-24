@@ -11444,8 +11444,8 @@ async function waitForRuntimeReady(page, deadline, signal) {
 }
 
 /**
- * 用三个只读原生命令区分“通用 Workspace 不可用”“Thread list/read 被 Rust 拒绝”和
- * “Thread 已创建但 renderer 严格解码失败”。证据只保留状态、数量、错误码和字段名。
+ * 按 session kind 直接检查无项目历史，避免用旧共享 Workspace 初始化空白会话的 Host；
+ * Thread list/read 的证据只保留状态、数量、错误码和字段名。
  */
 async function captureInitialHistoryState(page) {
   return page
@@ -11456,23 +11456,10 @@ async function captureInitialHistoryState(page) {
         const candidate = error !== null && typeof error === "object" ? error : {};
         return typeof candidate.code === "string" ? candidate.code : "unknown";
       };
-      let workspaceId;
-      let workspace = { status: "unavailable" };
-      try {
-        const value = await invoke("ja_runtime_general_workspace", {});
-        const candidate = value !== null && typeof value === "object" ? value : {};
-        workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId : undefined;
-        workspace = {
-          status: workspaceId === undefined ? "invalid" : "resolved",
-          revision: Number.isSafeInteger(candidate.revision) ? candidate.revision : undefined,
-        };
-      } catch (error) {
-        workspace = { status: "rejected", errorCode: errorCode(error) };
-      }
-      if (workspaceId === undefined) return { workspace, threadList: { status: "skipped" } };
+      const workspace = { status: "unbound-until-session-selected" };
       try {
         const value = await invoke("ja_thread_list", {
-          input: { workspaceId, limit: 5 },
+          input: { workspaceKind: "session", limit: 5 },
         });
         const candidate = value !== null && typeof value === "object" ? value : {};
         const items = Array.isArray(candidate.items) ? candidate.items : [];

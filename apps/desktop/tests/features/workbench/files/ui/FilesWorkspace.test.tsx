@@ -2,9 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FilesWorkspace, type FilesActions, type FilesViewModel } from "@/features/workbench/files";
+import {
+  FilesWorkspace,
+  type FilesActions,
+  type FilesViewModel,
+  type OpenDocument,
+} from "@/features/workbench/files";
 
 afterEach(cleanup);
 
@@ -40,8 +46,11 @@ function createActions(): FilesActions {
     refreshTree: vi.fn(),
     changeSearchQuery: vi.fn(),
     openSearchResult: vi.fn(),
+    openPath: vi.fn(async () => true),
+    openExternalDocument: vi.fn(() => true),
     selectDocument: vi.fn(),
     closeDocument: vi.fn(),
+    beginSaveAs: vi.fn(),
     compareConflict: vi.fn(),
     reloadConflict: vi.fn(),
     retrySave: vi.fn(),
@@ -120,5 +129,269 @@ describe("FilesWorkspaceView", () => {
     );
 
     expect(screen.getByText("2 个文件")).toBeVisible();
+  });
+
+  it("marks an explicitly opened external snapshot as a read-only Files tab", () => {
+    const path = String.raw`C:\Users\person\notes.txt`;
+    const externalDocument: OpenDocument = {
+      path,
+      content: "external snapshot",
+      savedContent: "external snapshot",
+      revision: {
+        kind: "file",
+        size: 17,
+        modifiedUnixMillis: null,
+        sha256: null,
+      },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: true,
+      readOnlyReason: "工作区外文件，只读",
+      externalFile: true,
+      truncated: true,
+      status: "clean",
+      draftGeneration: 0,
+    };
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          documents: { [path]: externalDocument },
+          openPaths: [path],
+          activePath: path,
+          activeDocument: externalDocument,
+        })}
+        actions={createActions()}
+      />,
+    );
+
+    const externalTab = document.querySelector<HTMLElement>('[data-external-file="true"]');
+    const editor = document.querySelector<HTMLElement>(".ja-files-editor-content");
+    expect(externalTab).toHaveAttribute("data-file-tab-path", path);
+    expect(editor).toHaveAttribute("data-document-path", path);
+    expect(editor).toHaveAttribute("data-document-read-only", "true");
+    expect(editor).toHaveAttribute("data-document-truncated", "true");
+    expect(screen.getByText("工作区外文件，只读")).toBeVisible();
+  });
+
+  /** 右键保存必须绑定非活动的被点中文档，而不能通过选择标签改变当前编辑目标。 */
+  it("从非活动文件标签右键保存对应路径", async () => {
+    const path = "src/draft.ts";
+    const activePath = "README.md";
+    const dirtyDocument: OpenDocument = {
+      path,
+      content: "draft",
+      savedContent: "old",
+      revision: { kind: "file", size: 3, modifiedUnixMillis: null, sha256: null },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: false,
+      status: "dirty",
+      draftGeneration: 1,
+    };
+    const activeDocument: OpenDocument = {
+      ...dirtyDocument,
+      path: activePath,
+      content: "readme",
+      savedContent: "readme",
+      status: "clean",
+      draftGeneration: 0,
+    };
+    const actions = createActions();
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          documents: { [path]: dirtyDocument, [activePath]: activeDocument },
+          openPaths: [path, activePath],
+          activePath,
+          activeDocument,
+        })}
+        actions={actions}
+      />,
+    );
+
+    const tab = [...document.querySelectorAll<HTMLElement>("[data-file-tab-path]")].find(
+      (element) => element.dataset["fileTabPath"] === path,
+    );
+    expect(tab).toBeDefined();
+    fireEvent.contextMenu(tab!, { clientX: 40, clientY: 60 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "保存" }));
+
+    expect(actions.saveDocument).toHaveBeenCalledWith(path);
+    expect(actions.selectDocument).not.toHaveBeenCalled();
+  });
+
+  /** 冲突标签只暴露 controller 已实现的另存为入口，并使用右键目标路径。 */
+  it("冲突文件标签右键另存为当前目标", async () => {
+    const path = "src/conflict.ts";
+    const conflictDocument: OpenDocument = {
+      path,
+      content: "local",
+      savedContent: "old",
+      revision: { kind: "file", size: 3, modifiedUnixMillis: null, sha256: null },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: false,
+      status: "conflict",
+      draftGeneration: 1,
+    };
+    const actions = createActions();
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          documents: { [path]: conflictDocument },
+          openPaths: [path],
+          activePath: path,
+          activeDocument: conflictDocument,
+        })}
+        actions={actions}
+      />,
+    );
+
+    const tab = screen.getByRole("tab", { name: /conflict\.ts/ });
+    fireEvent.contextMenu(tab, { clientX: 40, clientY: 60 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "另存为" }));
+
+    expect(actions.beginSaveAs).toHaveBeenCalledWith(path);
+    expect(actions.selectDocument).not.toHaveBeenCalled();
+  });
+
+  /** 菜单关闭仍经过 closeDocument，控制器投影出的未保存确认 Dialog 保持原流程。 */
+  it("右键关闭未保存标签继续显示草稿确认", async () => {
+    const path = "src/draft.ts";
+    const dirtyDocument: OpenDocument = {
+      path,
+      content: "draft",
+      savedContent: "old",
+      revision: { kind: "file", size: 3, modifiedUnixMillis: null, sha256: null },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: false,
+      status: "dirty",
+      draftGeneration: 1,
+    };
+    const actions = createActions();
+    const viewModel = createViewModel({
+      documents: { [path]: dirtyDocument },
+      openPaths: [path],
+      activePath: path,
+      activeDocument: dirtyDocument,
+    });
+    const view = render(<FilesWorkspace viewModel={viewModel} actions={actions} />);
+
+    const tab = screen.getByRole("tab", { name: /draft\.ts/ });
+    fireEvent.contextMenu(tab, { clientX: 40, clientY: 60 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "关闭" }));
+    expect(actions.closeDocument).toHaveBeenCalledWith(path);
+
+    view.rerender(
+      <FilesWorkspace
+        viewModel={{
+          ...viewModel,
+          closeDocumentRequest: { path },
+          closeRequestedDocument: dirtyDocument,
+        }}
+        actions={actions}
+      />,
+    );
+    expect(screen.getByRole("alertdialog", { name: "关闭未保存文件" })).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("button", { name: "取消" })).toHaveFocus());
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(actions.dismissCloseDocument).toHaveBeenCalledOnce();
+  });
+
+  /** 连续右键另一个标签必须替换菜单 generation，旧菜单项不能作用到旧路径。 */
+  it("右键另一个文件标签会按新目标重新定位菜单", async () => {
+    const firstPath = "src/draft.ts";
+    const secondPath = "README.md";
+    const firstDocument: OpenDocument = {
+      path: firstPath,
+      content: "draft",
+      savedContent: "old",
+      revision: { kind: "file", size: 3, modifiedUnixMillis: null, sha256: null },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: false,
+      status: "dirty",
+      draftGeneration: 1,
+    };
+    const secondDocument: OpenDocument = {
+      ...firstDocument,
+      path: secondPath,
+      content: "readme",
+      savedContent: "readme",
+      status: "clean",
+      draftGeneration: 0,
+    };
+    const actions = createActions();
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          documents: { [firstPath]: firstDocument, [secondPath]: secondDocument },
+          openPaths: [firstPath, secondPath],
+          activePath: firstPath,
+          activeDocument: firstDocument,
+        })}
+        actions={actions}
+      />,
+    );
+
+    const tabNodes = [...document.querySelectorAll<HTMLElement>("[data-file-tab-path]")];
+    const firstTab = tabNodes.find((element) => element.dataset["fileTabPath"] === firstPath);
+    const secondTab = tabNodes.find((element) => element.dataset["fileTabPath"] === secondPath);
+    expect(firstTab).toBeDefined();
+    expect(secondTab).toBeDefined();
+    fireEvent.contextMenu(firstTab!, { clientX: 40, clientY: 60 });
+    expect(await screen.findByRole("menuitem", { name: "保存" })).toBeVisible();
+    fireEvent.contextMenu(secondTab!, { clientX: 72, clientY: 92 });
+    expect(await screen.findByRole("menuitem", { name: "关闭" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "保存" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "关闭" }));
+
+    expect(actions.closeDocument).toHaveBeenCalledWith(secondPath);
+    expect(actions.closeDocument).not.toHaveBeenCalledWith(firstPath);
+    expect(actions.saveDocument).not.toHaveBeenCalled();
+  });
+
+  /** 键盘菜单键打开文件标签菜单，Escape 将焦点恢复到原标签而不切换文档。 */
+  it("支持文件标签 ContextMenu 键并恢复焦点", async () => {
+    const user = userEvent.setup();
+    const path = "README.md";
+    const documentModel: OpenDocument = {
+      path,
+      content: "readme",
+      savedContent: "readme",
+      revision: { kind: "file", size: 3, modifiedUnixMillis: null, sha256: null },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: false,
+      status: "clean",
+      draftGeneration: 0,
+    };
+    const actions = createActions();
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          documents: { [path]: documentModel },
+          openPaths: [path],
+          activePath: path,
+          activeDocument: documentModel,
+        })}
+        actions={actions}
+      />,
+    );
+    const tab = screen.getByRole("tab", { name: /README\.md/ });
+    tab.focus();
+    fireEvent.keyDown(tab, { key: "ContextMenu" });
+    expect(await screen.findByRole("menuitem", { name: "关闭" })).toBeVisible();
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(tab).toHaveFocus());
+    expect(actions.selectDocument).not.toHaveBeenCalled();
   });
 });

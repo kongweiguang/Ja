@@ -67,6 +67,12 @@ export interface SettingsController {
     project?: SkillProjection[];
     projectAvailable: boolean;
   };
+  mcpSettings: {
+    global: McpServerProjection[];
+    project?: McpServerProjection[];
+    projectAvailable: boolean;
+    projectWorkspaceId?: string;
+  };
   loading: boolean;
   synchronizing: boolean;
   scopeReady: boolean;
@@ -179,6 +185,30 @@ function projectMcpTools(result: McpToolsResult): McpToolProjection[] {
   return result.items.map((tool) => ({ name: tool.name, policy: "ask" as const }));
 }
 
+/** 设置页健康投影按配置来源合成；测试结果不得反向写入用户或项目定义。 */
+function mcpSettingsProjection(
+  configured: SettingsMcpServer[],
+  observed: McpServerProjection[],
+): McpServerProjection[] {
+  return configured.map((server) => {
+    const match = observed.find((item) => item.id === server.mcpRevision);
+    const enabledObservation = server.enabled ? match : undefined;
+    return {
+      id: server.mcpRevision,
+      ...server,
+      args: [...server.args],
+      env: { ...server.env },
+      headers: { ...server.headers },
+      auth: { ...server.auth },
+      status: enabledObservation?.status ?? (server.enabled ? "unknown" : "disabled"),
+      tools: enabledObservation?.tools ?? [],
+      ...(enabledObservation?.lastError === undefined
+        ? {}
+        : { lastError: enabledObservation.lastError }),
+    };
+  });
+}
+
 /**
  * 把严格设置文档与 runtime 观测合并为 UI 投影；配置事实和健康事实保持分离，
  * enabled 的 MCP 在没有探测证据时只能显示 unknown。
@@ -211,30 +241,7 @@ function toSettingsSnapshot(
         reasoningLevelMap: { ...model.reasoningLevelMap },
       })),
     })),
-    mcpServers: document.mcpServers.map((server) => {
-      const observed = runtimeMcpServers.find((item) => item.id === server.mcpRevision);
-      const enabledObservation = server.enabled ? observed : undefined;
-      return {
-        id: server.mcpRevision,
-        mcpRevision: server.mcpRevision,
-        name: server.name,
-        transport: server.transport,
-        endpoint: server.endpoint,
-        protocolVersion: server.protocolVersion,
-        args: [...server.args],
-        env: { ...server.env },
-        headers: { ...server.headers },
-        auth: { ...server.auth },
-        enabled: server.enabled,
-        status:
-          enabledObservation?.status ??
-          (server.enabled ? ("unknown" as const) : ("disabled" as const)),
-        tools: enabledObservation?.tools ?? [],
-        ...(enabledObservation?.lastError === undefined
-          ? {}
-          : { lastError: enabledObservation.lastError }),
-      };
-    }),
+    mcpServers: mcpSettingsProjection(document.mcpServers, runtimeMcpServers),
     skills: skillSettingsProjection(runtimeSkills, document.skills, document.skills, () => true),
     defaultAccessMode: document.defaultAccessMode,
     clarificationEnabled: document.clarificationEnabled,
@@ -408,8 +415,8 @@ function settingsErrorCode(error: unknown): string | undefined {
 
 /**
  * 独占设置文档、Provider、Skill/MCP 健康投影和 CAS 保存；当前 workspace 决定 effective
- * snapshot 与 Turn admission；设置动作固定写 userDocument，项目覆盖继续由 App Server
- * 从可信 Workspace 的 .ja/config.toml 合并，controller 不提供项目编辑入口。
+ * snapshot 与 Turn admission；全局写 userDocument，项目 MCP/Skill 分字段 CAS patch，
+ * 由 App Server 在可信 Workspace 的 .ja/config.toml 上合并。
  * controller 不保存或切换 workspace，也不拥有会话状态。
  */
 export function useSettingsController({
@@ -477,7 +484,17 @@ export function useSettingsController({
     [runtimeGeneration, runtimeServerInstanceId],
   );
   const mcpKey = useMemo(
-    () => runtimeProjectionKey("mcp", runtimeServerInstanceId, runtimeGeneration),
+    () =>
+      runtimeProjectionKey(
+        "mcp",
+        runtimeServerInstanceId,
+        runtimeGeneration,
+        queryWorkspaceId ?? "global",
+      ),
+    [queryWorkspaceId, runtimeGeneration, runtimeServerInstanceId],
+  );
+  const globalMcpKey = useMemo(
+    () => runtimeProjectionKey("mcp", runtimeServerInstanceId, runtimeGeneration, "global"),
     [runtimeGeneration, runtimeServerInstanceId],
   );
 
@@ -537,6 +554,16 @@ export function useSettingsController({
   /** MCP catalog 与流式 timeline 分离；仅保存有界、脱敏的一次性查询投影。 */
   const mcpQuery = useQuery({
     queryKey: mcpKey,
+    queryFn: async () =>
+      projectMcpServers(
+        await runtimePort.listMcpServers(
+          queryWorkspaceId === undefined ? undefined : { workspaceId: queryWorkspaceId },
+        ),
+      ),
+    enabled: runtimeReady,
+  });
+  const globalMcpQuery = useQuery({
+    queryKey: globalMcpKey,
     queryFn: async () => projectMcpServers(await runtimePort.listMcpServers()),
     enabled: runtimeReady,
   });
@@ -544,6 +571,7 @@ export function useSettingsController({
   const runtimeSkills = useMemo(() => skillsQuery.data ?? [], [skillsQuery.data]);
   const globalRuntimeSkills = useMemo(() => globalSkillsQuery.data ?? [], [globalSkillsQuery.data]);
   const runtimeMcpServers = useMemo(() => mcpQuery.data ?? [], [mcpQuery.data]);
+  const globalRuntimeMcpServers = useMemo(() => globalMcpQuery.data ?? [], [globalMcpQuery.data]);
 
   /** 从 Query cache 读取当前 workspace 的最新 CAS 快照，避免另建可变版本 owner。 */
   const currentLoaded = useCallback(
@@ -599,11 +627,34 @@ export function useSettingsController({
       }),
       queryClient.fetchQuery({
         queryKey: mcpKey,
-        queryFn: async () => projectMcpServers(await runtimePort.listMcpServers()),
+        queryFn: async () =>
+          projectMcpServers(
+            await runtimePort.listMcpServers(
+              queryWorkspaceId === undefined ? undefined : { workspaceId: queryWorkspaceId },
+            ),
+          ),
         staleTime: 0,
       }),
+      ...(queryWorkspaceId === undefined
+        ? []
+        : [
+            queryClient.fetchQuery({
+              queryKey: globalMcpKey,
+              queryFn: async () => projectMcpServers(await runtimePort.listMcpServers()),
+              staleTime: 0,
+            }),
+          ]),
     ]);
-  }, [globalSkillsKey, mcpKey, queryClient, runtimePort, skillWorkspaceId, skillsKey]);
+  }, [
+    globalMcpKey,
+    globalSkillsKey,
+    mcpKey,
+    queryClient,
+    queryWorkspaceId,
+    runtimePort,
+    skillWorkspaceId,
+    skillsKey,
+  ]);
 
   /**
    * 用户配置写入始终以读取到的 userDocument 为基线。不同条目发生的并发写入自动重放一次；同一
@@ -1032,128 +1083,213 @@ export function useSettingsController({
   );
 
   /**
-   * 保存 MCP 定义时保留高级非敏感 map，并通过同一 CAS replace 路径提交；成功后失效当前
+   * 保存 MCP 定义时保留高级非敏感 map；全局用用户 CAS，项目只 patch MCP 字段；成功后失效当前
    * generation 的观测 cache，因为 endpoint、认证引用和 enabled 都可能已改变，而旧观测
    * 不能代表新定义。序号同时为在途 probe 提供晚到结果屏障，不改变后端 Turn 的 lease 语义。
    */
   const saveMcp = useCallback(
-    async (server: McpServerSave): Promise<void> => {
+    async (server: McpServerSave, scope: "user" | "project"): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      const existing = current.userDocument.mcpServers.find(
-        (item) => item.mcpRevision === server.mcpRevision,
-      );
+      const project = scope === "project";
+      const source = project ? current.projectMcpServers : current.userDocument.mcpServers;
+      if (source === undefined || (project && queryWorkspaceId === undefined))
+        throw new Error("project settings unavailable");
+      const existing = source.find((item) => item.mcpRevision === server.mcpRevision);
       const merged: SettingsMcpServer = {
         ...(existing ?? { protocolVersion: "2025-06-18" as const }),
         ...server,
       };
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        mcpServers:
-          existing === undefined
-            ? [...current.userDocument.mcpServers, merged]
-            : current.userDocument.mcpServers.map((item) =>
-                item.mcpRevision === server.mcpRevision ? merged : item,
-              ),
-      });
+      const mcpServers =
+        existing === undefined
+          ? [...source, merged]
+          : source.map((item) => (item.mcpRevision === server.mcpRevision ? merged : item));
+      if (project) {
+        try {
+          await adapter.saveProjectMcpServers(
+            mcpServers,
+            queryWorkspaceId!,
+            current.cas.projectVersion,
+          );
+        } catch (error) {
+          if (settingsErrorCode(error) === "revision_conflict") await reload();
+          throw error;
+        }
+        await reload();
+      } else {
+        await saveDocument({
+          ...current.userDocument,
+          revision: current.userDocument.revision + 1,
+          mcpServers,
+        });
+      }
       mcpObservationEpochRef.current.set(
-        server.mcpRevision,
-        (mcpObservationEpochRef.current.get(server.mcpRevision) ?? 0) + 1,
+        `${scope}:${server.mcpRevision}`,
+        (mcpObservationEpochRef.current.get(`${scope}:${server.mcpRevision}`) ?? 0) + 1,
       );
       await queryClient.invalidateQueries({ queryKey: mcpKey, exact: true });
+      if (!project && queryWorkspaceId !== undefined)
+        await queryClient.invalidateQueries({ queryKey: globalMcpKey, exact: true });
     },
-    [currentLoaded, mcpKey, queryClient, saveDocument],
+    [
+      adapter,
+      currentLoaded,
+      globalMcpKey,
+      mcpKey,
+      queryClient,
+      queryWorkspaceId,
+      reload,
+      saveDocument,
+    ],
   );
 
   /**
-   * 运行一次真实 MCP probe 并只更新对应 server 的健康投影；probe 可能早于 catalog 列表
-   * 看见新保存的 Server，因此按配置定义补齐 cache；写入前取消仍在途的旧 catalog 读取，
-   * 避免其晚到空结果覆盖 probe。保存边界后的晚到结果会被 epoch 丢弃。
+   * 运行一次真实 MCP probe 并只更新对应 server 的健康投影；只有健康 probe 才读取工具目录。
+   * 每次探测推进观测序号，使并发旧结果和配置保存后的晚到结果都不能覆盖最新状态；
+   * probe/目录 RPC 失败也先落成可见错误，避免卡片保留“未检查”或旧工具。
    */
   const testMcp = useCallback(
     async (
       mcpRevision: string,
+      scope: "user" | "project",
     ): Promise<"unknown" | "connected" | "disabled" | "testing" | "error"> => {
-      const server = currentLoaded()?.userDocument.mcpServers.find(
-        (item) => item.mcpRevision === mcpRevision,
-      );
+      const current = currentLoaded();
+      const server = (
+        scope === "project" ? current?.projectMcpServers : current?.userDocument.mcpServers
+      )?.find((item) => item.mcpRevision === mcpRevision);
       if (server === undefined || !server.enabled) return "disabled";
-      const observationEpoch = mcpObservationEpochRef.current.get(mcpRevision) ?? 0;
-      const result = await runtimePort.testMcp(mcpRevision);
-      const tools = projectMcpTools(await runtimePort.listMcpTools(mcpRevision));
-      if ((mcpObservationEpochRef.current.get(mcpRevision) ?? 0) !== observationEpoch) {
-        return mcpProbeHealthy(result.status) ? "connected" : "error";
+      const workspaceId = scope === "project" ? queryWorkspaceId : undefined;
+      if (scope === "project" && workspaceId === undefined)
+        throw new Error("project settings unavailable");
+      const observationKey = `${scope}:${mcpRevision}`;
+      const targetKey = scope === "project" ? mcpKey : globalMcpKey;
+      const observationEpoch = (mcpObservationEpochRef.current.get(observationKey) ?? 0) + 1;
+      mcpObservationEpochRef.current.set(observationKey, observationEpoch);
+
+      /** 同一处提交 pending/终态，并再次校验序号，避免取消旧 Query 后被并发保存越过。 */
+      const commitObservation = async (
+        status: McpServerProjection["status"],
+        tools: McpToolProjection[],
+        lastError?: string,
+      ): Promise<boolean> => {
+        if ((mcpObservationEpochRef.current.get(observationKey) ?? 0) !== observationEpoch)
+          return false;
+        await queryClient.cancelQueries({ queryKey: targetKey, exact: true });
+        if ((mcpObservationEpochRef.current.get(observationKey) ?? 0) !== observationEpoch)
+          return false;
+        queryClient.setQueryData<McpServerProjection[]>(targetKey, (items = []) => {
+          return items.some((item) => item.id === mcpRevision)
+            ? items.map((item) => {
+                if (item.id !== mcpRevision) return item;
+                const observed = { ...item, status, tools };
+                if (lastError === undefined) delete observed.lastError;
+                else observed.lastError = lastError;
+                return observed;
+              })
+            : [
+                ...items,
+                {
+                  ...server,
+                  id: server.mcpRevision,
+                  status,
+                  tools,
+                  ...(lastError === undefined ? {} : { lastError }),
+                },
+              ];
+        });
+        return true;
+      };
+
+      /** 晚到操作向 UI 返回当前投影，不能把旧 probe 结果重新说成当前状态。 */
+      const latestStatus = (): McpServerProjection["status"] =>
+        queryClient
+          .getQueryData<McpServerProjection[]>(targetKey)
+          ?.find((item) => item.id === mcpRevision)?.status ?? "unknown";
+
+      if (!(await commitObservation("testing", []))) return latestStatus();
+
+      let result: Awaited<ReturnType<SettingsRuntimePort["testMcp"]>>;
+      try {
+        result = await runtimePort.testMcp(
+          mcpRevision,
+          workspaceId === undefined ? undefined : { workspaceId },
+        );
+      } catch {
+        return (await commitObservation(
+          "error",
+          [],
+          "MCP 检查请求未完成；请检查 Ja 本地运行时后重试。",
+        ))
+          ? "error"
+          : latestStatus();
       }
-      const status = mcpProbeHealthy(result.status) ? "connected" : "error";
-      await queryClient.cancelQueries({ queryKey: mcpKey, exact: true });
-      queryClient.setQueryData<McpServerProjection[]>(mcpKey, (items = []) =>
-        items.some((item) => item.id === mcpRevision)
-          ? items.map((item) =>
-              item.id === mcpRevision
-                ? {
-                    ...item,
-                    status,
-                    tools,
-                    lastError: mcpProbeHealthy(result.status) ? undefined : "MCP Server 不可用。",
-                  }
-                : item,
-            )
-          : [
-              ...items,
-              {
-                ...server,
-                id: server.mcpRevision,
-                status,
-                tools,
-                lastError: mcpProbeHealthy(result.status) ? undefined : "MCP Server 不可用。",
-              },
-            ],
-      );
-      return mcpProbeHealthy(result.status) ? "connected" : "error";
+
+      if ((mcpObservationEpochRef.current.get(observationKey) ?? 0) !== observationEpoch)
+        return latestStatus();
+      if (!mcpProbeHealthy(result.status)) {
+        return (await commitObservation("error", [], "MCP 服务不可用；请检查服务状态和连接配置。"))
+          ? "error"
+          : latestStatus();
+      }
+
+      let tools: McpToolProjection[];
+      try {
+        tools = projectMcpTools(
+          await runtimePort.listMcpTools(
+            mcpRevision,
+            workspaceId === undefined ? undefined : { workspaceId },
+          ),
+        );
+      } catch {
+        return (await commitObservation(
+          "error",
+          [],
+          "MCP 工具目录读取失败；请重试或检查 MCP 服务兼容性。",
+        ))
+          ? "error"
+          : latestStatus();
+      }
+
+      if ((mcpObservationEpochRef.current.get(observationKey) ?? 0) !== observationEpoch)
+        return latestStatus();
+      return (await commitObservation("connected", tools)) ? "connected" : latestStatus();
     },
-    [currentLoaded, mcpKey, queryClient, runtimePort],
+    [currentLoaded, globalMcpKey, mcpKey, queryClient, queryWorkspaceId, runtimePort],
   );
 
-  /** 删除 MCP 只移除全局目录定义；Credential 引用保持独立，避免配置删除产生隐式 Secret 级联。 */
+  /** 删除 MCP 只移除所选来源的目录定义；Credential 引用保持独立，避免隐式 Secret 级联。 */
   const deleteMcp = useCallback(
-    async (mcpRevision: string): Promise<void> => {
+    async (mcpRevision: string, scope: "user" | "project"): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      const mcpServers = current.userDocument.mcpServers.filter(
-        (server) => server.mcpRevision !== mcpRevision,
-      );
-      if (mcpServers.length === current.userDocument.mcpServers.length)
-        throw new Error("MCP server unavailable");
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        mcpServers,
-      });
+      const source =
+        scope === "project" ? current.projectMcpServers : current.userDocument.mcpServers;
+      if (source === undefined) throw new Error("project settings unavailable");
+      const mcpServers = source.filter((server) => server.mcpRevision !== mcpRevision);
+      if (mcpServers.length === source.length) throw new Error("MCP server unavailable");
+      if (scope === "project") {
+        if (queryWorkspaceId === undefined) throw new Error("project settings unavailable");
+        try {
+          await adapter.saveProjectMcpServers(
+            mcpServers,
+            queryWorkspaceId,
+            current.cas.projectVersion,
+          );
+        } catch (error) {
+          if (settingsErrorCode(error) === "revision_conflict") await reload();
+          throw error;
+        }
+        await reload();
+      } else {
+        await saveDocument({
+          ...current.userDocument,
+          revision: current.userDocument.revision + 1,
+          mcpServers,
+        });
+      }
+      await refreshRuntimeSettings();
     },
-    [currentLoaded, saveDocument],
-  );
-
-  /** 通过现有 CAS/reconfigure 路径禁用 MCP，不在 UI 伪造关闭状态。 */
-  const closeMcp = useCallback(
-    async (mcpRevision: string): Promise<void> => {
-      const server = currentLoaded()?.userDocument.mcpServers.find(
-        (item) => item.mcpRevision === mcpRevision,
-      );
-      if (server === undefined) throw new Error("MCP server unavailable");
-      await saveMcp({
-        mcpRevision: server.mcpRevision,
-        name: server.name,
-        transport: server.transport,
-        endpoint: server.endpoint,
-        args: [...server.args],
-        env: { ...server.env },
-        headers: { ...server.headers },
-        auth: { ...server.auth },
-        enabled: false,
-      });
-    },
-    [currentLoaded, saveMcp],
+    [adapter, currentLoaded, queryWorkspaceId, refreshRuntimeSettings, reload, saveDocument],
   );
 
   /**
@@ -1327,7 +1463,7 @@ export function useSettingsController({
             reducedTransparency,
             highContrast,
           })
-        : toSettingsSnapshot(loaded.userDocument, globalRuntimeSkills, runtimeMcpServers, {
+        : toSettingsSnapshot(loaded.userDocument, globalRuntimeSkills, globalRuntimeMcpServers, {
             theme: themeMode,
             palette,
             reducedMotion,
@@ -1340,7 +1476,7 @@ export function useSettingsController({
       palette,
       reducedMotion,
       reducedTransparency,
-      runtimeMcpServers,
+      globalRuntimeMcpServers,
       globalRuntimeSkills,
       themeMode,
     ],
@@ -1378,6 +1514,23 @@ export function useSettingsController({
     return { global, project, projectAvailable: true };
   }, [globalRuntimeSkills, loaded, queryWorkspaceId, runtimeSkills]);
 
+  /** 全局与项目 MCP 分别以各自配置文档为编辑事实，健康度只叠加同作用域测试结果。 */
+  const mcpSettings = useMemo<SettingsController["mcpSettings"]>(() => {
+    if (loaded === undefined) return { global: [], projectAvailable: false };
+    const global = mcpSettingsProjection(loaded.userDocument.mcpServers, globalRuntimeMcpServers);
+    const projectAvailable =
+      queryWorkspaceId !== undefined && loaded.projectMcpServers !== undefined;
+    if (!projectAvailable || loaded.projectMcpServers === undefined) {
+      return { global, projectAvailable: false };
+    }
+    return {
+      global,
+      project: mcpSettingsProjection(loaded.projectMcpServers, runtimeMcpServers),
+      projectAvailable: true,
+      projectWorkspaceId: queryWorkspaceId,
+    };
+  }, [globalRuntimeMcpServers, loaded, queryWorkspaceId, runtimeMcpServers]);
+
   /** 以稳定 action 集合作为 UI 边界，避免视图接触 adapter 或 CAS 文档。 */
   const ports = useMemo<SettingsPorts>(
     () => ({
@@ -1398,14 +1551,12 @@ export function useSettingsController({
       onSaveMcp: saveMcp,
       onDeleteMcp: deleteMcp,
       onTestMcp: testMcp,
-      onCloseMcp: closeMcp,
       onToggleSkill: toggleSkill,
       onAccessModeChange: saveAccessMode,
       onClarificationEnabledChange: saveClarificationEnabled,
       onAppearanceChange: saveAppearance,
     }),
     [
-      closeMcp,
       createProvider,
       deleteModel,
       deleteMcp,
@@ -1451,6 +1602,7 @@ export function useSettingsController({
     snapshot,
     globalSnapshot,
     skillSettings,
+    mcpSettings,
     loading,
     synchronizing,
     scopeReady,

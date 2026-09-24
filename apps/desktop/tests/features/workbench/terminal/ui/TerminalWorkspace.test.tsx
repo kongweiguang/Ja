@@ -27,9 +27,11 @@ vi.mock("@/features/workbench/terminal/ui/TerminalPanel", () => ({
   TerminalPanel: ({
     ariaLabel,
     onData,
+    onPaste,
   }: {
     ariaLabel?: string;
     onData?: (data: string) => void;
+    onPaste?: () => string | Promise<string>;
   }): ReactElement => (
     <div aria-label={ariaLabel} data-testid="terminal-panel">
       <button
@@ -38,6 +40,17 @@ vi.mock("@/features/workbench/terminal/ui/TerminalPanel", () => ({
         onClick={() => onData?.("echo hello\r")}
       >
         输入
+      </button>
+      <button
+        type="button"
+        aria-label={`${ariaLabel ?? "终端"}粘贴测试输入`}
+        onClick={async () => {
+          /** 集成边界只投影显式 paste 端口与 xterm 输入回调，验证 native 写入错误归属 pane。 */
+          const data = await onPaste?.();
+          if (typeof data === "string") onData?.(data);
+        }}
+      >
+        粘贴
       </button>
     </div>
   ),
@@ -319,31 +332,38 @@ describe("TerminalWorkspace", () => {
   });
 
   /** 被拒绝的原生写入变成脱敏窗格提示，而不是未处理的 xterm callback Promise。 */
-  it("renders a stable input error with a restart action", async () => {
+  it("renders a stable input error after paste input is rejected", async () => {
     const bridge = fakeAdapter({
       input: vi.fn(async () => {
         throw new Error("C:\\private\\workspace");
       }),
     });
     const initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const onPaste = vi.fn(async () => "pasted command\r");
     const rendered = render(
       <TerminalWorkspace
         workspaceId="ws_fixture"
         adapter={bridge.adapter}
         initialLayout={initialLayout}
         active
+        onPaste={onPaste}
       />,
     );
     await waitFor(() => expect(bridge.adapter.open).toHaveBeenCalledOnce());
 
     fireEvent.click(
       rendered.getByRole("button", {
-        name: `终端窗格 ${initialLayout.tabs[0]!.title}发送测试输入`,
+        name: `终端窗格 ${initialLayout.tabs[0]!.title}粘贴测试输入`,
       }),
     );
 
     expect(await rendered.findByRole("alert")).toHaveTextContent("终端输入失败，请重启后重试");
     expect(rendered.getByRole("button", { name: "重启终端" })).toBeInTheDocument();
+    expect(onPaste).toHaveBeenCalledOnce();
+    expect(bridge.adapter.input).toHaveBeenCalledWith(
+      SESSION,
+      new TextEncoder().encode("pasted command\r"),
+    );
     expect(document.body.textContent).not.toContain("private\\workspace");
   });
 
@@ -597,6 +617,100 @@ describe("TerminalWorkspace", () => {
         .getAllByRole("button", { name: /分屏不可用/u })
         .every((button) => button.hasAttribute("disabled")),
     ).toBe(true);
+  });
+
+  /** 标签右键定位稳定 tabId，关闭非活动标签时不先激活或误删当前标签。 */
+  it("closes the tab under the pointer without switching the active terminal tab", async () => {
+    let initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const targetTabId = initialLayout.tabs[0]!.tabId;
+    initialLayout = addTerminalTab(initialLayout);
+    const activeTabId = initialLayout.activeTabId;
+    const bridge = fakeAdapter();
+    const onLayoutChange =
+      vi.fn<(layout: ReturnType<typeof createDefaultTerminalLayout>) => void>();
+    const rendered = render(
+      <TerminalWorkspace
+        workspaceId="ws_fixture"
+        adapter={bridge.adapter}
+        initialLayout={initialLayout}
+        onLayoutChange={onLayoutChange}
+        active={false}
+      />,
+    );
+    await rendered.findByRole("button", { name: "新建终端标签页" });
+    onLayoutChange.mockClear();
+    const targetRow = rendered.container.querySelector<HTMLElement>(
+      `[data-tab-id="${targetTabId}"]`,
+    );
+
+    fireEvent.contextMenu(targetRow!, { button: 2, clientX: 18, clientY: 24 });
+    fireEvent.click(await rendered.findByRole("menuitem", { name: "关闭终端标签页" }));
+
+    await waitFor(() => expect(onLayoutChange).toHaveBeenCalled());
+    const committed = onLayoutChange.mock.calls.at(-1)?.[0];
+    expect(committed?.tabs.map((tab) => tab.tabId)).not.toContain(targetTabId);
+    expect(committed?.activeTabId).toBe(activeTabId);
+    expect(bridge.adapter.close).not.toHaveBeenCalled();
+  });
+
+  /** 窗格菜单调用同一实时 controller 准入，允许分屏时只更新命中的标签布局。 */
+  it("splits the pane targeted by the terminal toolbar context menu", async () => {
+    const bridge = fakeAdapter();
+    const initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const onLayoutChange =
+      vi.fn<(layout: ReturnType<typeof createDefaultTerminalLayout>) => void>();
+    const rendered = render(
+      <TerminalWorkspace
+        workspaceId="ws_fixture"
+        adapter={bridge.adapter}
+        initialLayout={initialLayout}
+        onLayoutChange={onLayoutChange}
+        active={false}
+      />,
+    );
+    await rendered.findByRole("button", { name: "新建终端标签页" });
+    onLayoutChange.mockClear();
+    const toolbar = rendered.container.querySelector<HTMLElement>(".ja-terminal-pane-toolbar")!;
+    fireEvent.contextMenu(toolbar, { button: 2, clientX: 42, clientY: 52 });
+    fireEvent.click(await rendered.findByRole("menuitem", { name: "横向分屏" }));
+
+    await waitFor(() => expect(onLayoutChange).toHaveBeenCalled());
+    expect(onLayoutChange.mock.calls.at(-1)?.[0].tabs[0]?.root.kind).toBe("split");
+    expect(bridge.adapter.open).toHaveBeenCalledOnce();
+  });
+
+  /** 达到预算后菜单保留现有能力说明并禁用动作，防止陈旧上下文绕过 controller 限制。 */
+  it("disables context-menu split actions at the live pane budget", async () => {
+    let initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const tabId = initialLayout.activeTabId as string;
+    for (let index = 1; index < 4; index += 1) {
+      initialLayout = splitTerminalPane(
+        initialLayout,
+        tabId,
+        initialLayout.tabs[0]!.activePaneId,
+        "horizontal",
+      );
+    }
+    const rendered = render(
+      <TerminalWorkspace
+        workspaceId="ws_fixture"
+        adapter={fakeAdapter().adapter}
+        initialLayout={initialLayout}
+        active={false}
+      />,
+    );
+    await rendered.findByRole("button", { name: "新建终端标签页" });
+    const toolbar = rendered.container.querySelector<HTMLElement>(".ja-terminal-pane-toolbar")!;
+    fireEvent.contextMenu(toolbar, { button: 2, clientX: 42, clientY: 52 });
+
+    expect(await rendered.findByRole("menuitem", { name: "横向分屏" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(rendered.getByRole("menuitem", { name: "纵向分屏" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
   });
 
   it("previews split dragging locally and persists once on release while keyboard changes remain immediate", async () => {

@@ -8,6 +8,7 @@ import {
   ChevronRight,
   CornerUpRight,
   Ellipsis,
+  Eye,
   File,
   FileText,
   LoaderCircle,
@@ -53,6 +54,7 @@ import {
   MenuSubContent,
   MenuSubTrigger,
   MenuTrigger,
+  PointerContextMenu,
   Select,
   Tooltip,
 } from "@/shared/ui/primitives";
@@ -103,6 +105,43 @@ import {
 import "./composer.css";
 
 export type ComposerSubmit = ConversationSubmit;
+
+interface ComposerContextMenuSession {
+  readonly key: number;
+  readonly x: number;
+  readonly y: number;
+  readonly opener: HTMLElement;
+}
+
+/** 选区和编辑控件保留原始菜单语义，避免自定义菜单破坏文本复制与草稿编辑。 */
+function shouldPreserveComposerContextMenu(target: EventTarget | null): boolean {
+  if (window.getSelection()?.isCollapsed === false) return true;
+  if (!(target instanceof Element)) return false;
+  return (
+    target.closest(
+      "input, textarea, select, [contenteditable='true'], a, [data-file-reference]",
+    ) !== null
+  );
+}
+
+/** 键盘上下文菜单使用标准消息键和 Shift+F10，鼠标菜单仍从实际指针坐标定位。 */
+function isComposerContextMenuKey(event: KeyboardEvent<HTMLElement>): boolean {
+  return event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey);
+}
+
+/** 菜单关闭时优先恢复到原交互控件；纯文本目标使用可程序聚焦的对象行。 */
+function composerContextMenuOpener(
+  container: HTMLElement,
+  target: EventTarget | null,
+): HTMLElement {
+  if (target instanceof Element) {
+    const control = target.closest<HTMLElement>("button, [role='button']");
+    if (control !== null && container.contains(control)) return control;
+  }
+  return (
+    container.querySelector<HTMLElement>("button:not([disabled]), [role='button']") ?? container
+  );
+}
 
 export type ComposerQueuedInputKind = "follow_up" | "steering";
 export type ComposerQueuedInputBusyAction = "prioritize" | "update" | "delete";
@@ -164,6 +203,9 @@ export interface ComposerProps {
   suspendedTurn?: boolean;
   /** 仅由权威 Timeline 的最新失败 Turn 决定，防止历史失败误触发新的续答。 */
   continuationAvailable?: boolean;
+  /** 编辑态仍提交为新 USER Turn，并保留取消后恢复原输入草稿的状态。 */
+  editingQuestion?: boolean;
+  onCancelEdit?: () => void;
   disabled?: boolean;
   preferenceBusy?: boolean;
   importingAttachments?: boolean;
@@ -313,6 +355,56 @@ function AttachmentDraftCard({
   const fileName = splitFileName(item.fileName);
   const ready = item.state === "ready" ? item : undefined;
   const previewable = ready !== undefined && canPreviewAttachment(ready);
+  const removeDisabled =
+    sending ||
+    item.state === "removing" ||
+    (item.state === "importing" && item.cancelRequested) ||
+    onRemove === undefined;
+  const [contextMenu, setContextMenu] = useState<ComposerContextMenuSession>();
+  const contextMenuKey = useRef(0);
+  const previewButtonRef = useRef<HTMLButtonElement>(null);
+  const hasContextActions = (previewable && onOpenPreview !== undefined) || onRemove !== undefined;
+
+  /** 指针和键盘入口共用稳定目标，重复右击递增 key 以刷新共享 Radix 锚点。 */
+  const openContextMenu = (opener: HTMLElement, x: number, y: number): void => {
+    contextMenuKey.current += 1;
+    setContextMenu({ key: contextMenuKey.current, x, y, opener });
+  };
+
+  /** 忙碌的附件仍可查看状态，但只在有选区外的对象区域接管右键。 */
+  const handleContextMenu = (event: MouseEvent<HTMLLIElement>): void => {
+    if (shouldPreserveComposerContextMenu(event.target) || !hasContextActions) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openContextMenu(
+      composerContextMenuOpener(event.currentTarget, event.target),
+      event.clientX,
+      event.clientY,
+    );
+  };
+
+  /** 标准键盘菜单键以附件卡片边缘定位，并依赖共享菜单处理漫游与 Escape。 */
+  const handleContextMenuKeyDown = (event: KeyboardEvent<HTMLLIElement>): void => {
+    if (!isComposerContextMenuKey(event) || !hasContextActions) return;
+    event.preventDefault();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    openContextMenu(
+      composerContextMenuOpener(event.currentTarget, event.target),
+      bounds.left,
+      bounds.bottom,
+    );
+  };
+
+  /** 右键移除沿用同一 callback，并吞掉已由调用方处理的异步失败以避免未处理 Promise。 */
+  const removeFromContextMenu = async (): Promise<void> => {
+    if (onRemove === undefined || removeDisabled) return;
+    try {
+      await onRemove(item.itemId);
+    } catch {
+      // Visible remove control uses the same controller path; failures are reflected by its owner.
+    }
+  };
+
   const hasThumbnail = ready?.mediaKind === "image" && ready.thumbnailUrl !== undefined;
   const progress = item.state === "importing" ? attachmentProgress(item) : undefined;
   const visual =
@@ -362,6 +454,8 @@ function AttachmentDraftCard({
       data-media-kind={item.mediaKind}
       data-has-thumbnail={hasThumbnail || undefined}
       data-error-code={item.state === "failed" ? item.code : undefined}
+      onContextMenu={hasContextActions ? handleContextMenu : undefined}
+      onKeyDown={hasContextActions ? handleContextMenuKeyDown : undefined}
     >
       <Tooltip content={item.fileName}>
         {previewable && ready !== undefined && onOpenPreview !== undefined ? (
@@ -369,6 +463,7 @@ function AttachmentDraftCard({
             type="button"
             className="ja-composer-attachment__content is-previewable"
             aria-label={`预览附件 ${item.fileName}`}
+            ref={previewButtonRef}
             onClick={(event: MouseEvent<HTMLButtonElement>) =>
               onOpenPreview(ready, event.currentTarget)
             }
@@ -423,6 +518,50 @@ function AttachmentDraftCard({
           className="ja-composer-attachment__spinner ja-composer__spin"
         />
       ) : null}
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          key={contextMenu.key}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={`附件操作：${item.fileName}`}
+          onOpenChange={(open) => {
+            if (!open) {
+              setContextMenu((current) => (current?.key === contextMenu.key ? undefined : current));
+            }
+          }}
+          onRestoreFocus={() => {
+            if (contextMenu.opener.isConnected) contextMenu.opener.focus();
+          }}
+        >
+          {previewable && ready !== undefined && onOpenPreview !== undefined ? (
+            <MenuItem
+              onSelect={() => {
+                const source = previewButtonRef.current;
+                if (source !== null) onOpenPreview(ready, source);
+              }}
+            >
+              <Eye aria-hidden="true" />
+              <span>预览附件</span>
+            </MenuItem>
+          ) : null}
+          {previewable &&
+          ready !== undefined &&
+          onOpenPreview !== undefined &&
+          onRemove !== undefined ? (
+            <MenuSeparator />
+          ) : null}
+          {onRemove === undefined ? null : (
+            <MenuItem
+              className="is-danger"
+              disabled={removeDisabled}
+              onSelect={() => void removeFromContextMenu()}
+            >
+              <Trash2 aria-hidden="true" />
+              <span>移除附件</span>
+            </MenuItem>
+          )}
+        </PointerContextMenu>
+      )}
     </li>
   );
 }
@@ -516,6 +655,179 @@ interface QueuedAttachmentListProps {
   onOpenPreview?: ComposerProps["onOpenAttachmentPreview"];
 }
 
+interface QueuedAttachmentRowProps {
+  attachment: AttachmentSummary;
+  label: string;
+  disabled: boolean;
+  onRemove?: (attachmentId: string) => void;
+  onOpenPreview?: ComposerProps["onOpenAttachmentPreview"];
+}
+
+/** 队列附件菜单只复用可见预览与移除回调，并把焦点恢复到同一附件对象。 */
+function QueuedAttachmentRow({
+  attachment,
+  label,
+  disabled,
+  onRemove,
+  onOpenPreview,
+}: QueuedAttachmentRowProps): ReactElement {
+  const [contextMenu, setContextMenu] = useState<ComposerContextMenuSession>();
+  const contextMenuKey = useRef(0);
+  const previewButtonRef = useRef<HTMLButtonElement>(null);
+  const previewable = canPreviewAttachment(attachment) && onOpenPreview !== undefined;
+  const hasContextActions = previewable || onRemove !== undefined;
+  const content = (
+    <>
+      {attachment.mediaKind === "image" ? (
+        <ImageIcon aria-hidden="true" />
+      ) : attachment.mediaKind === "text" ? (
+        <FileText aria-hidden="true" />
+      ) : (
+        <File aria-hidden="true" />
+      )}
+      <span>{attachment.displayName}</span>
+    </>
+  );
+
+  /** 指针和 ContextMenu 键以附件 ID 所属行定位，共用稳定 Radix 菜单语义。 */
+  const openContextMenu = (opener: HTMLElement, x: number, y: number): void => {
+    contextMenuKey.current += 1;
+    setContextMenu({ key: contextMenuKey.current, x, y, opener });
+  };
+
+  /** 附件对象优先处理自己的右键，避免事件冒泡后误执行整条排队消息动作。 */
+  const handleContextMenu = (event: MouseEvent<HTMLLIElement>): void => {
+    if (shouldPreserveComposerContextMenu(event.target) || !hasContextActions) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openContextMenu(
+      composerContextMenuOpener(event.currentTarget, event.target),
+      event.clientX,
+      event.clientY,
+    );
+  };
+
+  /** 键盘入口对齐附件行边缘，复用共享菜单的方向键、Escape 和焦点恢复。 */
+  const handleContextMenuKeyDown = (event: KeyboardEvent<HTMLLIElement>): void => {
+    if (!isComposerContextMenuKey(event) || !hasContextActions) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    openContextMenu(
+      composerContextMenuOpener(event.currentTarget, event.target),
+      bounds.left,
+      bounds.bottom,
+    );
+  };
+
+  return (
+    <li
+      title={attachment.displayName}
+      onContextMenu={hasContextActions ? handleContextMenu : undefined}
+      onKeyDown={hasContextActions ? handleContextMenuKeyDown : undefined}
+    >
+      {previewable ? (
+        <button
+          type="button"
+          className="ja-composer-queue-attachment__preview"
+          aria-label={`预览附件 ${attachment.displayName}`}
+          title={`预览 ${attachment.displayName}`}
+          disabled={disabled}
+          ref={previewButtonRef}
+          onClick={(event) =>
+            onOpenPreview?.(
+              {
+                attachmentId: attachment.attachmentId,
+                fileName: attachment.displayName,
+                sizeBytes: attachment.sizeBytes,
+                mediaKind: attachment.mediaKind,
+                mediaType: attachment.mediaType,
+              },
+              event.currentTarget,
+            )
+          }
+        >
+          {content}
+        </button>
+      ) : (
+        <span className="ja-composer-queue-attachment__preview" data-previewable="false">
+          {content}
+        </span>
+      )}
+      <small>{formatFileSize(attachment.sizeBytes)}</small>
+      {onRemove === undefined ? null : (
+        <button
+          type="button"
+          aria-label={`从${label}移除附件 ${attachment.displayName}`}
+          title="移除附件"
+          disabled={disabled}
+          onClick={() => onRemove(attachment.attachmentId)}
+        >
+          <X aria-hidden="true" />
+        </button>
+      )}
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          key={contextMenu.key}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={`队列附件操作：${attachment.displayName}`}
+          onOpenChange={(open) => {
+            if (!open) {
+              setContextMenu((current) => (current?.key === contextMenu.key ? undefined : current));
+            }
+          }}
+          onRestoreFocus={() => {
+            if (contextMenu.opener.isConnected) contextMenu.opener.focus();
+          }}
+        >
+          {previewable && onOpenPreview !== undefined ? (
+            <MenuItem
+              disabled={disabled}
+              onSelect={() => {
+                const source = previewButtonRef.current;
+                if (source === null) return;
+                onOpenPreview(
+                  {
+                    attachmentId: attachment.attachmentId,
+                    fileName: attachment.displayName,
+                    sizeBytes: attachment.sizeBytes,
+                    mediaKind: attachment.mediaKind,
+                    mediaType: attachment.mediaType,
+                  },
+                  source,
+                );
+              }}
+            >
+              <Eye aria-hidden="true" />
+              <span>预览附件</span>
+            </MenuItem>
+          ) : null}
+          {previewable && onOpenPreview !== undefined && onRemove !== undefined ? (
+            <MenuSeparator />
+          ) : null}
+          {onRemove === undefined ? null : (
+            <MenuItem
+              className="is-danger"
+              disabled={disabled}
+              onSelect={() => {
+                try {
+                  onRemove(attachment.attachmentId);
+                } catch {
+                  // The visible remove action uses the same owner callback and error path.
+                }
+              }}
+            >
+              <Trash2 aria-hidden="true" />
+              <span>移除附件</span>
+            </MenuItem>
+          )}
+        </PointerContextMenu>
+      )}
+    </li>
+  );
+}
+
 /**
  * 队列附件只展示服务端摘要，并把移除动作贴附到具体对象；renderer 不尝试读取已预留内容，
  * 避免绕过 Thread 授权边界。
@@ -530,64 +842,16 @@ function QueuedAttachmentList({
   if (attachments.length === 0) return null;
   return (
     <ul className="ja-composer-queue-attachments" aria-label={`${label}的附件`}>
-      {attachments.map((attachment) => {
-        const content = (
-          <>
-            {attachment.mediaKind === "image" ? (
-              <ImageIcon aria-hidden="true" />
-            ) : attachment.mediaKind === "text" ? (
-              <FileText aria-hidden="true" />
-            ) : (
-              <File aria-hidden="true" />
-            )}
-            <span>{attachment.displayName}</span>
-          </>
-        );
-        const previewable = canPreviewAttachment(attachment) && onOpenPreview !== undefined;
-        return (
-          <li key={attachment.attachmentId} title={attachment.displayName}>
-            {previewable ? (
-              <button
-                type="button"
-                className="ja-composer-queue-attachment__preview"
-                aria-label={`预览附件 ${attachment.displayName}`}
-                title={`预览 ${attachment.displayName}`}
-                disabled={disabled}
-                onClick={(event) =>
-                  onOpenPreview(
-                    {
-                      attachmentId: attachment.attachmentId,
-                      fileName: attachment.displayName,
-                      sizeBytes: attachment.sizeBytes,
-                      mediaKind: attachment.mediaKind,
-                      mediaType: attachment.mediaType,
-                    },
-                    event.currentTarget,
-                  )
-                }
-              >
-                {content}
-              </button>
-            ) : (
-              <span className="ja-composer-queue-attachment__preview" data-previewable="false">
-                {content}
-              </span>
-            )}
-            <small>{formatFileSize(attachment.sizeBytes)}</small>
-            {onRemove === undefined ? null : (
-              <button
-                type="button"
-                aria-label={`从${label}移除附件 ${attachment.displayName}`}
-                title="移除附件"
-                disabled={disabled}
-                onClick={() => onRemove(attachment.attachmentId)}
-              >
-                <X aria-hidden="true" />
-              </button>
-            )}
-          </li>
-        );
-      })}
+      {attachments.map((attachment) => (
+        <QueuedAttachmentRow
+          key={attachment.attachmentId}
+          attachment={attachment}
+          label={label}
+          disabled={disabled}
+          onRemove={onRemove}
+          onOpenPreview={onOpenPreview}
+        />
+      ))}
     </ul>
   );
 }
@@ -619,12 +883,18 @@ function QueuedInputRow({
   ]);
   const [localBusy, setLocalBusy] = useState<ComposerQueuedInputBusyAction>();
   const [localError, setLocalError] = useState<string>();
+  const [contextMenu, setContextMenu] = useState<ComposerContextMenuSession>();
+  const contextMenuKey = useRef(0);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const errorId = useId();
   const label = queuedInputLabel(itemText, position, item.attachments);
   const busyAction = item.busyAction ?? localBusy;
   const busy = item.pending === true || busyAction !== undefined;
   const rowError = item.error ?? item.issue?.message ?? localError;
+  const canPrioritize = item.kind !== "steering" && onPrioritize !== undefined;
+  const canEdit = onUpdate !== undefined;
+  const canDelete = onDelete !== undefined;
+  const hasContextActions = canPrioritize || canEdit || canDelete;
 
   /** 菜单关闭后再聚焦内联编辑器，避免 Portal 的焦点归还覆盖编辑起点。 */
   useEffect(() => {
@@ -680,6 +950,16 @@ function QueuedInputRow({
     if (completed) setEditing(false);
   };
 
+  /** 直接菜单和既有“更多”入口共享同一份编辑快照，防止两条路径产生不同草稿。 */
+  const beginEditing = (): void => {
+    if (busy || onUpdate === undefined) return;
+    setEditText(itemText);
+    setEditReferences(itemReferences);
+    setEditAttachments([...item.attachments]);
+    setLocalError(undefined);
+    setEditing(true);
+  };
+
   /** 编辑器沿用 Composer 的 Enter 约定，并让 Escape 始终无损返回原消息。 */
   const handleEditKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     if (event.key === "Escape") {
@@ -723,9 +1003,59 @@ function QueuedInputRow({
     void runAction("delete", () => onDelete?.(item.inputId, item.inputRevision));
   };
 
+  /** 将菜单锚定到队列行，并递增 key 以确保快速切换目标时旧定位会卸载。 */
+  const openContextMenu = (opener: HTMLElement, x: number, y: number): void => {
+    contextMenuKey.current += 1;
+    setContextMenu({ key: contextMenuKey.current, x, y, opener });
+  };
+
+  /** 嵌套附件与引用有各自的对象菜单，队列级事件不得覆盖其目标。 */
+  const handleContextMenu = (event: MouseEvent<HTMLLIElement>): void => {
+    const target = event.target instanceof Element ? event.target : undefined;
+    if (
+      shouldPreserveComposerContextMenu(event.target) ||
+      (target !== undefined &&
+        target.closest(".ja-composer-queue-attachments > li, .ja-composer-context__chip") !==
+          null) ||
+      !hasContextActions
+    )
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    openContextMenu(
+      composerContextMenuOpener(event.currentTarget, event.target),
+      event.clientX,
+      event.clientY,
+    );
+  };
+
+  /** 键盘上下文菜单忽略正在编辑的输入控件，并定位到队列项的可见边缘。 */
+  const handleContextMenuKeyDown = (event: KeyboardEvent<HTMLLIElement>): void => {
+    const target = event.target instanceof Element ? event.target : undefined;
+    if (
+      !isComposerContextMenuKey(event) ||
+      shouldPreserveComposerContextMenu(event.target) ||
+      (target !== undefined &&
+        target.closest(".ja-composer-queue-attachments > li, .ja-composer-context__chip") !==
+          null) ||
+      !hasContextActions
+    )
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    openContextMenu(
+      composerContextMenuOpener(event.currentTarget, event.target),
+      bounds.left,
+      bounds.bottom,
+    );
+  };
+
   return (
     <li
       className="ja-composer-queue__item"
+      onContextMenu={hasContextActions ? handleContextMenu : undefined}
+      onKeyDown={hasContextActions ? handleContextMenuKeyDown : undefined}
       data-kind={item.kind}
       data-state={
         item.pending
@@ -899,11 +1229,7 @@ function QueuedInputRow({
               <MenuItem
                 disabled={busy || onUpdate === undefined}
                 onSelect={() => {
-                  setEditText(itemText);
-                  setEditReferences(itemReferences);
-                  setEditAttachments([...item.attachments]);
-                  setLocalError(undefined);
-                  setEditing(true);
+                  beginEditing();
                 }}
               >
                 <Pencil aria-hidden="true" />
@@ -913,13 +1239,63 @@ function QueuedInputRow({
           </Menu>
         </div>
       )}
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          key={contextMenu.key}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={`排队消息操作：${label}`}
+          onOpenChange={(open) => {
+            if (!open) {
+              setContextMenu((current) => (current?.key === contextMenu.key ? undefined : current));
+            }
+          }}
+          onRestoreFocus={() => {
+            if (contextMenu.opener.isConnected) contextMenu.opener.focus();
+          }}
+        >
+          {canPrioritize ? (
+            <MenuItem
+              disabled={busy}
+              onSelect={() =>
+                void runAction("prioritize", () => onPrioritize?.(item.inputId, item.inputRevision))
+              }
+            >
+              <CornerUpRight aria-hidden="true" />
+              <span>调整方向</span>
+            </MenuItem>
+          ) : null}
+          {canPrioritize && (canEdit || canDelete) ? <MenuSeparator /> : null}
+          {canEdit ? (
+            <MenuItem disabled={busy} onSelect={beginEditing}>
+              <Pencil aria-hidden="true" />
+              <span>编辑消息</span>
+            </MenuItem>
+          ) : null}
+          {canDelete && (canPrioritize || canEdit) ? <MenuSeparator /> : null}
+          {canDelete ? (
+            <MenuItem
+              className="is-danger"
+              disabled={busy}
+              onSelect={() =>
+                void runAction("delete", () => onDelete?.(item.inputId, item.inputRevision))
+              }
+            >
+              <Trash2 aria-hidden="true" />
+              <span>删除消息</span>
+            </MenuItem>
+          ) : null}
+        </PointerContextMenu>
+      )}
     </li>
   );
 }
 
 /**
  * 渲染同一内容轨道上的生产输入器；Thread 偏好通过 CAS 回调更新，发送只提交文本与 App Server
- * 签发的 attachmentId。项目上下文由组合层放在表单上方，避免输入器承担非表单信息。
+ * 签发的 attachmentId。项目上下文由组合层放在表单上方，避免输入器承担非表单信息。编辑历史问题时
+ * 临时替换草稿并显式保留取消入口，避免修改中的附件或原草稿丢失。失败续答复用紧凑图标动作位，
+ * 语义留给 aria-label 与 tooltip，避免在窄屏 Composer 中额外挤占输入空间。
  */
 export function Composer({
   sendShortcut: sendShortcutProp,
@@ -946,6 +1322,8 @@ export function Composer({
   activeTurn = false,
   suspendedTurn = false,
   continuationAvailable = false,
+  editingQuestion = false,
+  onCancelEdit,
   interactionPresentation = "none",
   disabled = false,
   preferenceBusy = false,
@@ -1746,11 +2124,28 @@ export function Composer({
         aria-label="发送消息"
         data-state={composerState}
         data-interaction-presentation={interactionPresentation}
+        data-editing-question={editingQuestion || undefined}
         data-has-queue={queuedInputs.length > 0 || undefined}
         data-drop-active={dropActive || undefined}
         aria-busy={activeTurn || sending || cancelling || resuming || undefined}
       >
         {interactionPanelExpanded ? null : goalStatus}
+        {editingQuestion ? (
+          <div className="ja-composer__inline-command ja-composer__editing-question" role="status">
+            <Pencil aria-hidden="true" />
+            <span>正在编辑问题</span>
+            {onCancelEdit === undefined ? null : (
+              <button
+                type="button"
+                aria-label="取消编辑问题"
+                title="取消编辑"
+                onClick={onCancelEdit}
+              >
+                <X aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        ) : null}
         {dropActive ? (
           <span className="ja-composer__drop-indicator" aria-hidden="true">
             <Plus />
@@ -2150,7 +2545,7 @@ export function Composer({
                     : activeTurn && !activeTurnHasDraft
                       ? "停止当前生成"
                       : showContinue
-                        ? "继续回复"
+                        ? "继续回答原问题"
                         : activeTurn
                           ? `排队发送（${sendShortcutHint}）`
                           : sendShortcut === "enter"

@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class McpServiceDirectory implements AutoCloseable {
     private final McpServerDefinition definition;
     private final McpRuntime runtime;
+    private volatile McpGateway.McpSnapshot latestSnapshot;
     private final AtomicInteger pins = new AtomicInteger();
     private final AtomicBoolean retired = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -43,7 +44,17 @@ final class McpServiceDirectory implements AutoCloseable {
      */
     McpGateway.McpSnapshot snapshot() {
         requireOpen();
-        return runtime.snapshot();
+        McpGateway.McpSnapshot snapshot = runtime.snapshot();
+        latestSnapshot = snapshot;
+        return snapshot;
+    }
+
+    /** 只读取已知修订和脏标记，不发起发现或访问传输层。 */
+    DirectoryVersion version() {
+        requireOpen();
+        McpGateway.McpSnapshot snapshot = latestSnapshot;
+        return new DirectoryVersion(snapshot == null ? null : snapshot.revision(), runtime.directoryDirty(),
+                !runtime.unavailableServerIds().isEmpty());
     }
 
     /**
@@ -114,4 +125,7 @@ final class McpServiceDirectory implements AutoCloseable {
             throw new IllegalStateException("mcp_service_directory_closed");
         }
     }
+
+    /** 内部不可变健康投影只用于使会话观测失效，不执行 MCP IO。 */
+    record DirectoryVersion(String revision, boolean dirty, boolean lastDiscoveryFailed) { }
 }

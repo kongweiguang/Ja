@@ -8,7 +8,7 @@ import {
   forEachReadyTokenCandidate,
   READY_TOKEN_PATTERN,
 } from "./readyToken";
-import { ConfigDocumentSchema, ConfigProjectSkillDocumentSchema } from "./configDocument";
+import { ConfigDocumentSchema, ConfigProjectDocumentSchema } from "./configDocument";
 import {
   CollaborationModeSchema,
   GoalIdSchema,
@@ -71,6 +71,7 @@ const ClientRequestIdSchema = z
 /** JA-RPC v1 只允许客户端发起请求；Java 不反向发起 Tool 请求。 */
 const RpcRequestIdSchema = ClientRequestIdSchema;
 export const WorkspaceIdSchema = prefixedId("ws_", 99);
+export const WorkspaceKindSchema = z.enum(["project", "session", "legacy_shared"]);
 export const ThreadIdSchema = prefixedId("thr_", 100);
 const TurnIdSchema = prefixedId("turn_", 101);
 const AttachmentIdSchema = prefixedId("att_", 128);
@@ -160,7 +161,6 @@ export const ClientMethodSchema = z.enum([
   "runtime/health",
   "runtime/shutdown",
   "workspace/open",
-  "workspace/open-general",
   "workspace/list",
   "workspace/path/search",
   "workspace/set-trust",
@@ -170,6 +170,7 @@ export const ClientMethodSchema = z.enum([
   "thread/search",
   "thread/read",
   "thread/usage/read",
+  "thread/mcp/read",
   "thread/rename",
   "thread/pin",
   "thread/seen",
@@ -228,6 +229,8 @@ export const ClientMethodSchema = z.enum([
   "attachment/preview/read",
   "attachment/preview/close",
   "turn/start",
+  "turn/continue",
+  "turn/reask",
   "turn/resume",
   "turn/recovery/respond",
   "turn/cancel",
@@ -260,6 +263,7 @@ const EventMethodSchema = z.enum([
   "turn/input-consumed",
   "turn/messages_received",
   "turn/state-changed",
+  "turn/retry-started",
   "assistant/model-step-committed",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",
@@ -418,17 +422,31 @@ export const LimitsSchema = z
 export const WorkspaceSchema = z
   .object({
     workspaceId: WorkspaceIdSchema,
+    kind: WorkspaceKindSchema,
+    legacySharedWorkspaceId: WorkspaceIdSchema.nullable(),
     root: z.string().min(1).max(4_096),
     displayName: SafeNameSchema,
     trust: z.enum(["untrusted", "trusted"]),
     revision: RevisionSchema,
   })
-  .strict();
+  .strict()
+  // 旧共享根只通过迁移后的 session 关联；project 与 legacy_shared 自身不得伪装关联。
+  .superRefine((value, context) => {
+    if (value.kind !== "session" && value.legacySharedWorkspaceId !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["legacySharedWorkspaceId"],
+        message: "only session workspaces may reference the legacy shared workspace",
+      });
+    }
+  });
 
 export const ThreadSchema = z
   .object({
     threadId: ThreadIdSchema,
     workspaceId: WorkspaceIdSchema,
+    workspaceKind: WorkspaceKindSchema,
+    legacySharedWorkspaceId: WorkspaceIdSchema.nullable(),
     activeGoalId: GoalIdSchema.nullable(),
     preferences: z
       .object({
@@ -458,6 +476,13 @@ export const ThreadSchema = z
         code: "custom",
         path: ["latestTurnSeen"],
         message: "thread without a latest turn must be seen",
+      });
+    }
+    if (value.workspaceKind !== "session" && value.legacySharedWorkspaceId !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["legacySharedWorkspaceId"],
+        message: "only session threads may reference the legacy shared workspace",
       });
     }
   });
@@ -622,6 +647,8 @@ const ProviderRequestProfileSchema = z
 const ThreadSnapshotTurnSchema = z
   .object({
     turnId: TurnIdSchema,
+    /** 当前路径中的隐藏续答通过源 USER item 关联回问题；普通或重问 Turn 显式为 null。 */
+    sourceMessageId: ItemIdSchema.nullable(),
     status: TurnStateSchema,
     requestedAt: TimestampSchema,
     updatedAt: TimestampSchema,
@@ -938,8 +965,6 @@ const pageParams = {
   limit: z.number().int().min(1).max(200).optional(),
 };
 const emptyParams = z.object({}).strict();
-/** 通用 workspace 查询不接受客户端拥有的 cwd；其身份只能由 Java 提供。 */
-const WorkspaceGeneralReadParamsSchema = emptyParams;
 const workspaceMutationParams = z
   .object({ workspaceId: WorkspaceIdSchema, expectedRevision: RevisionSchema })
   .strict();
@@ -1049,10 +1074,13 @@ const CredentialDeleteResultSchema = z
 const CredentialRevealProviderResultSchema = z
   .object({ secret: SecretValueSchema.nullable() })
   .strict();
-const WorkspaceOpenParamsSchema = z
-  .object({ cwd: CwdSchema, displayName: SafeNameSchema.optional() })
+const WorkspaceOpenParamsSchema = z.union([
+  z.object({ cwd: CwdSchema, displayName: SafeNameSchema.optional() }).strict(),
+  z.object({ workspaceId: WorkspaceIdSchema }).strict(),
+]);
+const WorkspaceListParamsSchema = z
+  .object({ ...pageParams, kind: WorkspaceKindSchema.optional() })
   .strict();
-const WorkspaceListParamsSchema = z.object(pageParams).strict();
 const WorkspacePathSearchParamsSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -1067,7 +1095,7 @@ const WorkspaceTrustParamsSchema = z
 const WorkspaceUnregisterParamsSchema = workspaceMutationParams;
 const ThreadCreateParamsSchema = z
   .object({
-    cwd: CwdSchema.nullable().optional(),
+    cwd: CwdSchema.optional(),
     title: SafeNameSchema,
     providerId: ProviderIdSchema,
     modelId: ModelIdSchema,
@@ -1079,7 +1107,10 @@ const ThreadCreateParamsSchema = z
 const ThreadListWorkspaceParamsSchema = z
   .object({ workspaceId: WorkspaceIdSchema, ...pageParams })
   .strict();
-/** 全局 Thread 发现与 Workspace 列表共用 `thread/list` wire lane，但以 scope 明确区分语义。 */
+const ThreadListSessionParamsSchema = z
+  .object({ workspaceKind: z.literal("session"), ...pageParams })
+  .strict();
+/** 通用跨范围发现保留独立语义；无项目最近对话按 session workspace kind 分页。 */
 export const ThreadDiscoveryParamsSchema = z
   .object({
     scope: z.literal("all"),
@@ -1090,14 +1121,18 @@ export const ThreadDiscoveryParamsSchema = z
   .strict();
 const ThreadListParamsSchema = z.union([
   ThreadListWorkspaceParamsSchema,
-  ThreadDiscoveryParamsSchema,
+  ThreadListSessionParamsSchema,
 ]);
-const ThreadSearchParamsSchema = z
-  .object({ workspaceId: WorkspaceIdSchema, query: z.string().max(256), ...pageParams })
-  .strict();
+const ThreadSearchParamsSchema = z.union([
+  z.object({ workspaceId: WorkspaceIdSchema, query: z.string().max(256), ...pageParams }).strict(),
+  z
+    .object({ workspaceKind: z.literal("session"), query: z.string().max(256), ...pageParams })
+    .strict(),
+]);
 const ThreadReadParamsSchema = z.object({ threadId: ThreadIdSchema, ...pageParams }).strict();
 /** 用量汇总只读当前 Thread，不接受分页、时间范围或客户端聚合参数。 */
 const ThreadUsageReadParamsSchema = z.object({ threadId: ThreadIdSchema }).strict();
+const ThreadMcpReadParamsSchema = z.object({ threadId: ThreadIdSchema }).strict();
 const ThreadRenameParamsSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -1121,6 +1156,19 @@ const TurnStartParamsSchema = z
     threadId: ThreadIdSchema,
     content: TurnContentSchema,
     deadlineMs: z.number().int().min(1_000).max(86_400_000).optional(),
+  })
+  .strict();
+/** Continue 不携带可见用户内容；后端以当前路径最后未完成的问题和 Thread CAS 决定续答来源。 */
+const TurnContinueParamsSchema = z
+  .object({ threadId: ThreadIdSchema, expectedThreadRevision: RevisionSchema })
+  .strict();
+/** Reask 只允许当前路径最后一个未答复问题，sourceMessageId 由 Timeline 原样回传以执行 CAS。 */
+const TurnReaskParamsSchema = z
+  .object({
+    threadId: ThreadIdSchema,
+    expectedThreadRevision: RevisionSchema,
+    sourceMessageId: ItemIdSchema,
+    content: TurnContentSchema,
   })
   .strict();
 const AttachmentImportParamsSchema = z
@@ -1268,14 +1316,20 @@ const ApprovalRespondParamsSchema = z
 const SkillListParamsSchema = z
   .object({ workspaceId: WorkspaceIdSchema.optional(), ...pageParams })
   .strict();
-const McpListParamsSchema = z.object(pageParams).strict();
-const McpTestParamsSchema = z.object({ mcpId: McpIdSchema }).strict();
+const McpListParamsSchema = z
+  .object({ workspaceId: WorkspaceIdSchema.optional(), ...pageParams })
+  .strict();
+const McpTestParamsSchema = z
+  .object({ workspaceId: WorkspaceIdSchema.optional(), mcpId: McpIdSchema })
+  .strict();
 const ModelTestParamsSchema = z
   .object({ providerId: ProviderIdSchema, modelId: ModelIdSchema })
   .strict();
 /** 模型目录只按已保存 Provider 身份查询，Base URL、协议和 API Key 不能从 WebView 透传。 */
 const ModelDiscoverParamsSchema = z.object({ providerId: ProviderIdSchema }).strict();
-const McpToolsReadParamsSchema = z.object({ mcpId: McpIdSchema, ...pageParams }).strict();
+const McpToolsReadParamsSchema = z
+  .object({ workspaceId: WorkspaceIdSchema.optional(), mcpId: McpIdSchema, ...pageParams })
+  .strict();
 const ToolArtifactReadParamsSchema = z
   .object({
     threadId: ThreadIdSchema,
@@ -1311,7 +1365,7 @@ const ConfigurationPatchParamsSchema = z.discriminatedUnion("scope", [
 /** replace 按作用域接收完整严格文档，项目层不得借用户文档扩大 Provider 或 MCP 权限。 */
 const ConfigurationReplaceParamsSchema = z.discriminatedUnion("scope", [
   z.object({ ...userConfigurationTarget, document: ConfigDocumentSchema }).strict(),
-  z.object({ ...projectConfigurationTarget, document: ConfigProjectSkillDocumentSchema }).strict(),
+  z.object({ ...projectConfigurationTarget, document: ConfigProjectDocumentSchema }).strict(),
 ]);
 /** reset 是独立命令，因此不存在旧 mode/document 组合分支。 */
 const ConfigurationResetParamsSchema = z.discriminatedUnion("scope", [
@@ -1342,7 +1396,6 @@ export const ParamsSchemaByMethod = {
   "workspace/open": WorkspaceOpenParamsSchema,
   "workspace/list": WorkspaceListParamsSchema,
   "workspace/path/search": WorkspacePathSearchParamsSchema,
-  "workspace/open-general": WorkspaceGeneralReadParamsSchema,
   "workspace/set-trust": WorkspaceTrustParamsSchema,
   "workspace/unregister": WorkspaceUnregisterParamsSchema,
   "thread/create": ThreadCreateParamsSchema,
@@ -1350,6 +1403,7 @@ export const ParamsSchemaByMethod = {
   "thread/search": ThreadSearchParamsSchema,
   "thread/read": ThreadReadParamsSchema,
   "thread/usage/read": ThreadUsageReadParamsSchema,
+  "thread/mcp/read": ThreadMcpReadParamsSchema,
   "thread/rename": ThreadRenameParamsSchema,
   "thread/pin": ThreadPinParamsSchema,
   "thread/seen": threadMutationParams,
@@ -1377,6 +1431,8 @@ export const ParamsSchemaByMethod = {
   "attachment/preview/read": AttachmentPreviewReadParamsSchema,
   "attachment/preview/close": AttachmentPreviewCloseParamsSchema,
   "turn/start": TurnStartParamsSchema,
+  "turn/continue": TurnContinueParamsSchema,
+  "turn/reask": TurnReaskParamsSchema,
   "turn/resume": TurnResumeParamsSchema,
   "turn/recovery/respond": TurnRecoveryRespondParamsSchema,
   "turn/cancel": TurnCancelParamsSchema,
@@ -1612,6 +1668,7 @@ const mcpProjectionSchema = z
   .object({
     mcpId: McpIdSchema,
     name: SafeNameSchema,
+    scope: z.enum(["global", "project"]),
     transport: z.enum(["stdio", "streamable_http"]),
     // Java catalog 用 configured 表示尚未探测，必须与 healthy 保持区分。
     status: z.enum(["healthy", "degraded", "unavailable", "disabled", "configured"]),
@@ -1625,6 +1682,7 @@ const mcpTestResultSchema = z
   .object({
     mcpId: McpIdSchema,
     name: SafeNameSchema,
+    scope: z.enum(["global", "project"]),
     transport: z.enum(["stdio", "streamable_http"]),
     // MCP probe 在 initialize/tools 成功后返回 available，界面再映射为 connected。
     status: z.enum(["healthy", "available", "degraded", "unavailable"]),
@@ -1658,6 +1716,41 @@ const mcpToolSchema = z
   .strict();
 const mcpToolsResultSchema = z
   .object({ items: z.array(mcpToolSchema).max(200), nextCursor: CursorSchema.nullable() })
+  .strict();
+export const ThreadMcpStatusResultSchema = z
+  .object({
+    threadId: ThreadIdSchema,
+    source: z.enum(["active", "last_observed", "unchecked", "stale"]),
+    notices: z
+      .array(z.enum(["configuration_changed", "project_untrusted", "project_config_error"]))
+      .max(3),
+    catalogRevision: SafeIdentifierSchema.optional(),
+    observedAt: TimestampSchema.optional(),
+    servers: z
+      .array(
+        z
+          .object({
+            serverId: McpIdSchema,
+            name: z.string().min(1).max(512).refine(noNulCharacters, "name contains NUL"),
+            scope: z.enum(["global", "project"]),
+            state: z.enum([
+              "available",
+              "unavailable",
+              "disabled",
+              "not_discovered",
+              "not_exposed",
+              "stale",
+            ]),
+            toolCount: z.number().int().min(0).max(10_000).optional(),
+            reasonCode: z
+              .string()
+              .regex(/^[A-Z][A-Z0-9_]{1,63}$/)
+              .optional(),
+          })
+          .strict(),
+      )
+      .max(200),
+  })
   .strict();
 const toolArtifactReadResultSchema = z
   .object({
@@ -2208,7 +2301,6 @@ export const ResultSchemaByMethod = {
   "workspace/open": workspaceResultSchema,
   "workspace/list": workspacePageResultSchema,
   "workspace/path/search": workspacePathSearchResultSchema,
-  "workspace/open-general": workspaceResultSchema,
   "workspace/set-trust": acceptedResultSchema,
   "workspace/unregister": acceptedResultSchema,
   "thread/create": threadResultSchema,
@@ -2216,6 +2308,7 @@ export const ResultSchemaByMethod = {
   "thread/search": threadPageResultSchema,
   "thread/read": ThreadReadResultSchema,
   "thread/usage/read": ThreadUsageSummarySchema,
+  "thread/mcp/read": ThreadMcpStatusResultSchema,
   "thread/rename": threadResultSchema,
   "thread/pin": threadResultSchema,
   "thread/seen": threadResultSchema,
@@ -2243,6 +2336,8 @@ export const ResultSchemaByMethod = {
   "attachment/preview/read": AttachmentPreviewReadResultSchema,
   "attachment/preview/close": AttachmentPreviewCloseResultSchema,
   "turn/start": turnAcceptedResultSchema,
+  "turn/continue": turnAcceptedResultSchema,
+  "turn/reask": turnAcceptedResultSchema,
   "turn/resume": turnResumeResultSchema,
   "turn/recovery/respond": turnRecoveryRespondResultSchema,
   "turn/cancel": turnCancelResultSchema,
@@ -2400,6 +2495,10 @@ const stateChangedParamsSchema = semanticBaseSchema
   })
   .strict()
   .refine((value) => isLegalTurnTransition(value.from, value.to), "illegal turn state transition");
+/** 每次会话层重试先撤销前次未提交 Draft；序号固定在首次请求之后的 2..6。 */
+const turnRetryStartedParamsSchema = semanticBaseSchema
+  .extend({ attempt: z.number().int().min(2).max(6), maxAttempts: z.literal(6) })
+  .strict();
 const modelUsageSchema = RequestUsageSchema;
 
 /** 队列变化独立于执行 CAS，只携带全量队列 revision，不能伪造 Thread revision 推进。 */
@@ -2848,6 +2947,7 @@ export const JaEventSchema = z.discriminatedUnion("method", [
   notification("turn/input-consumed", inputConsumedParamsSchema),
   notification("turn/messages_received", messagesReceivedParamsSchema),
   notification("turn/state-changed", stateChangedParamsSchema),
+  notification("turn/retry-started", turnRetryStartedParamsSchema),
   notification("assistant/model-step-committed", modelStepCommittedParamsSchema),
   notification("assistant/text-delta", deltaParamsSchema),
   notification("assistant/reasoning-summary-delta", deltaParamsSchema),

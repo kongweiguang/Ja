@@ -63,7 +63,7 @@ wire_enum!(TextEncoding, {
 
 wire_enum!(LineEnding, {
     LineEnding::Lf => "lf",
-    LineEnding::CrLf => "cr_lf",
+    LineEnding::CrLf => "crlf",
     LineEnding::Cr => "cr",
     LineEnding::Mixed => "mixed",
 });

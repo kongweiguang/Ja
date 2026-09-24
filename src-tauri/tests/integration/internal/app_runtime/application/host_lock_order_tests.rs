@@ -7,10 +7,11 @@ use super::*;
 use crate::app_runtime::{
     ApprovalResponseInput, ConfigurationReadParams, ConfigurationRequest, ConfigurationResponse,
     HistoryRequest, HistoryResponse, ManualRecoveryConfirmation, RuntimeBridgePort,
-    RuntimePlatformPort, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo,
-    SettingsRequest, SettingsResponse, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnStartInput, WorkspaceDto, WorkspaceRuntimeSource,
+    RuntimePlatformPort, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind,
+    RuntimeStorageInfo, SettingsRequest, SettingsResponse, TurnAccepted, TurnCancelInput,
+    TurnCancelResult, TurnStartInput, WorkspaceDto, WorkspaceRuntimeSource,
 };
+use crate::terminal::TerminalWorkspaceResolver;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -100,6 +101,7 @@ struct LockOrderBridge {
     configuration_calls: AtomicUsize,
     workspace_open_calls: AtomicUsize,
     health_calls: AtomicUsize,
+    runtime_generation: AtomicUsize,
 }
 
 impl LockOrderBridge {
@@ -113,15 +115,16 @@ impl LockOrderBridge {
             configuration_calls: AtomicUsize::new(0),
             workspace_open_calls: AtomicUsize::new(0),
             health_calls: AtomicUsize::new(0),
+            runtime_generation: AtomicUsize::new(1),
         }
     }
 }
 
 /// 构造所有成功生命周期调用共享的 Ready 投影，避免 fake 自己产生状态分支。
-fn ready_status() -> RuntimeStatus {
+fn ready_status(generation: usize) -> RuntimeStatus {
     RuntimeStatus {
         status: RuntimeStatusKind::Ready,
-        generation: 1,
+        generation: generation as u64,
         server_instance_id: Some("srv_lock_order".to_owned()),
     }
 }
@@ -130,7 +133,9 @@ impl RuntimeBridgePort for LockOrderBridge {
     /// 启动直接进入 Ready；本测试只验证 application 锁顺序，不模拟进程生命周期。
     fn start(&self) -> Result<RuntimeStatus, RuntimeCommandError> {
         self.start_calls.fetch_add(1, Ordering::AcqRel);
-        Ok(ready_status())
+        Ok(ready_status(
+            self.runtime_generation.load(Ordering::Acquire),
+        ))
     }
 
     /// 停止返回稳定终态，使测试结束时可以走正常 Host 清理入口。
@@ -145,7 +150,9 @@ impl RuntimeBridgePort for LockOrderBridge {
     /// 状态查询在栅栏处模拟 actor 等待；外层不得同时持有 Workspace binding 锁。
     fn state(&self) -> Result<RuntimeStatus, RuntimeCommandError> {
         self.state_gate.pause_if_armed();
-        Ok(ready_status())
+        Ok(ready_status(
+            self.runtime_generation.load(Ordering::Acquire),
+        ))
     }
 
     /// 配置不属于本回归场景，显式拒绝可防止测试误用 fake 扩大证明范围。
@@ -175,17 +182,46 @@ impl RuntimeBridgePort for LockOrderBridge {
             display_name,
             trust,
             revision: 1,
+            kind: crate::app_runtime::WorkspaceKind::Project,
+            legacy_shared_workspace_id: None,
         })
     }
 
-    /// 通用 Workspace 复用同一固定投影，但当前测试不会从该入口建立 binding。
-    fn general_workspace(&self) -> Result<WorkspaceDto, RuntimeCommandError> {
+    /// ID-only fake reopens only precreated test roots and never accepts caller-provided paths.
+    fn workspace_open_by_id(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        let (directory, kind, legacy_shared_workspace_id) = match workspace_id.as_str() {
+            "ws_session_a" => (
+                "session_a",
+                crate::app_runtime::WorkspaceKind::Session,
+                Some("ws_legacy_old".to_owned()),
+            ),
+            "ws_session_b" => (
+                "session_b",
+                crate::app_runtime::WorkspaceKind::Session,
+                None,
+            ),
+            "ws_legacy_old" => (
+                "legacy_old",
+                crate::app_runtime::WorkspaceKind::LegacyShared,
+                None,
+            ),
+            _ => return Err(RuntimeCommandError::invalid_params()),
+        };
+        let root = self.root.join(directory);
+        if !root.is_dir() {
+            return Err(RuntimeCommandError::invalid_params());
+        }
         Ok(WorkspaceDto {
-            workspace_id: "ws_lock_order".to_owned(),
-            root: self.root.to_string_lossy().into_owned(),
-            display_name: "Lock order".to_owned(),
+            workspace_id,
+            root: root.to_string_lossy().into_owned(),
+            display_name: directory.to_owned(),
             trust: "trusted".to_owned(),
-            revision: 1,
+            revision: 2,
+            kind,
+            legacy_shared_workspace_id,
         })
     }
 
@@ -437,4 +473,101 @@ fn configured_workspace_query_checks_runtime_before_binding_lock() {
     result.expect("current workspace remains authorized");
     host.shutdown().expect("fake host shutdown");
     std::fs::remove_dir_all(root).expect("remove lock-order fixture");
+}
+
+/// Activating another Thread retains prior native handles, binds exact Java roots, and lazy legacy lookup does not steal active session scope.
+#[test]
+fn activation_keeps_java_workspace_roots_independent() {
+    let root = std::env::temp_dir().join(format!(
+        "ja-runtime-workspace-activation-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    for directory in ["session_a", "session_b", "legacy_old"] {
+        std::fs::create_dir_all(root.join(directory)).expect("create registered workspace root");
+    }
+    std::fs::create_dir_all(&root).expect("create activation parent root");
+    let (host, bridge) = fixture_host(root.clone());
+    host.start().expect("start fake runtime");
+
+    let first = host
+        .activate_workspace("ws_session_a".to_owned())
+        .expect("activate first Java session");
+    let first_root = std::fs::canonicalize(root.join("session_a")).unwrap();
+    assert_eq!(first.root_path, first_root.to_string_lossy());
+    assert_eq!(
+        first.legacy_shared_workspace_id.as_deref(),
+        Some("ws_legacy_old")
+    );
+    let second = host
+        .activate_workspace("ws_session_b".to_owned())
+        .expect("activate second Java session");
+    assert_eq!(
+        second.root_path,
+        std::fs::canonicalize(root.join("session_b"))
+            .unwrap()
+            .to_string_lossy()
+    );
+    assert_eq!(
+        host.with_configured_workspace("ws_session_a", |workspace| workspace
+            .root_path()
+            .to_path_buf())
+            .expect("first session remains registered"),
+        first_root
+    );
+    assert_eq!(
+        host.resolve_terminal_workspace("ws_session_a")
+            .expect("terminal resolver keeps session A root bound"),
+        first_root
+    );
+    assert_eq!(
+        host.resolve_terminal_workspace("ws_session_b")
+            .expect("terminal resolver follows session B activation"),
+        std::fs::canonicalize(root.join("session_b")).unwrap()
+    );
+
+    let legacy_root = host
+        .with_configured_workspace("ws_legacy_old", |workspace| {
+            workspace.root_path().to_path_buf()
+        })
+        .expect("explicit legacy lookup opens its Java-registered root");
+    assert_eq!(
+        legacy_root,
+        std::fs::canonicalize(root.join("legacy_old")).unwrap()
+    );
+    let bindings = host.workspace.lock().unwrap();
+    assert_eq!(
+        bindings.active_workspace_id.as_deref(),
+        Some("ws_session_b")
+    );
+    assert!(bindings.by_id.contains_key("ws_session_a"));
+    assert!(bindings.by_id.contains_key("ws_legacy_old"));
+    drop(bindings);
+
+    bridge.runtime_generation.store(2, Ordering::Release);
+    assert_eq!(host.state().expect("new generation status").generation, 2);
+    let bindings = host.workspace.lock().unwrap();
+    assert!(
+        bindings.by_id.is_empty(),
+        "old generation handles are revoked"
+    );
+    assert_eq!(bindings.active_workspace_id, None);
+    drop(bindings);
+
+    let renewed = host
+        .activate_workspace("ws_session_a".to_owned())
+        .expect("session can be rebound from the new Java generation");
+    assert_eq!(renewed.root_path, first_root.to_string_lossy());
+    let bindings = host.workspace.lock().unwrap();
+    assert_eq!(
+        bindings.active_workspace_id.as_deref(),
+        Some("ws_session_a")
+    );
+    assert_eq!(bindings.by_id.len(), 1);
+    assert!(bindings.by_id.contains_key("ws_session_a"));
+    drop(bindings);
+
+    host.shutdown().expect("shutdown fake runtime");
+    assert!(host.workspace.lock().unwrap().by_id.is_empty());
+    std::fs::remove_dir_all(root).expect("remove activation fixture");
 }

@@ -5,8 +5,9 @@
  * Settings 真实组件的浏览器验收矩阵。
  *
  * 默认启动隔离的 Vite + headless Edge 页面，fixture 端口为本地替身，仅验证布局、焦点与反馈。
- * 显式 JA_SETTINGS_NATIVE_ONLY=1 才启动独立 Tauri/JDK25 环境；两种模式均不访问用户配置
- * 或真实计费 Provider。原生探针与浏览器证据分别报告，不以模拟端口证明配置持久化。
+ * 显式 JA_SETTINGS_NATIVE_ONLY=1 才启动独立 Tauri/JDK25 环境。会话 MCP 验收只读本机
+ * Kerminal 的公开连接地址并复制到隔离 profile，不读取凭据或调用计费 Provider。原生探针
+ * 与浏览器证据分别报告，不以模拟端口证明配置持久化。
  */
 import { createServer } from "vite";
 import { chromium, expect } from "@playwright/test";
@@ -17,6 +18,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  runMcpConversationHeaderAcceptance,
+  runMcpSettingsAcceptance,
+} from "./mcp-settings-webview2.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const previewPath = join(repoRoot, "apps/desktop/tests/app/e2e/settingsStyle.preview.tsx");
@@ -107,6 +112,52 @@ async function seedNativeSkillFixture(userProfile) {
   );
 }
 
+/** 预置仅供 Thread 创建的 loopback Provider；没有 credential 值且该验收不会发起模型请求。 */
+async function seedNativeConversationProvider(userProfile) {
+  const home = join(userProfile, ".ja");
+  await mkdir(home, { recursive: true });
+  const configuration = [
+    "schema_version = 2",
+    "config_revision = 1",
+    'default_access_mode = "full_access"',
+    'default_provider_id = "provider_e2e"',
+    'default_model_id = "model_e2e"',
+    'default_reasoning_level = "high"',
+    "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
+    "interaction = { clarification_enabled = true }",
+    "mcp_servers = []",
+    "skills = []",
+    "",
+    "[[providers]]",
+    'provider_id = "provider_e2e"',
+    'name = "Isolated MCP header fixture"',
+    'api = "openai_responses"',
+    'base_url = "http://127.0.0.1:9/v1"',
+    'credential_id = "cred_e2e"',
+    "[providers.network_timeouts]",
+    "connect_timeout_ms = 5000",
+    "request_timeout_ms = 120000",
+    "[providers.agent_defaults]",
+    "[providers.agent_defaults.context]",
+    "auto_compact = true",
+    "[providers.agent_defaults.turn_limits]",
+    "max_model_rounds = 8",
+    "max_tool_calls = 8",
+    "wall_timeout_ms = 120000",
+    "[[providers.models]]",
+    'model_id = "model_e2e"',
+    'name = "Isolated MCP header model"',
+    'model = "no-billing-fixture"',
+    'reasoning_level_map = { high = "high" }',
+    'default_reasoning_level = "high"',
+    "[providers.models.capabilities]",
+    "context_window_tokens = 128000",
+    "max_output_tokens = 8192",
+    "",
+  ].join("\n");
+  await writeFile(join(home, "config.toml"), configuration, "utf8");
+}
+
 /** 等待本轮 WebView2 CDP listener；没有 listener 时保留 launcher 日志并失败关闭。 */
 async function waitForNativeCdp(port, child, stdout, stderr) {
   const deadline = Date.now() + 300_000;
@@ -167,7 +218,7 @@ async function prewarmNativeProfile(pnpm, configPath, environment, profile) {
   const primeEnvironment = { ...environment };
   delete primeEnvironment.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
   const launch = launchNativeTauri(pnpm, configPath, primeEnvironment);
-  const deadline = Date.now() + 120_000;
+  const deadline = Date.now() + 300_000;
   try {
     while (Date.now() < deadline) {
       if (launch.child.exitCode !== null) {
@@ -206,7 +257,9 @@ async function waitForNativeRuntimeReady(page, evidencePath) {
           const candidate = value !== null && typeof value === "object" ? value : {};
           return {
             status: typeof candidate.status === "string" ? candidate.status : "invalid",
-            generation: Number.isSafeInteger(candidate.generation) ? candidate.generation : undefined,
+            generation: Number.isSafeInteger(candidate.generation)
+              ? candidate.generation
+              : undefined,
           };
         } catch {
           return { status: "unavailable" };
@@ -235,9 +288,9 @@ async function openNativeSettings(page) {
   while (Date.now() < deadline) {
     if (await settings.isVisible().catch(() => false)) return;
     if (await settingsButton.isVisible().catch(() => false)) {
-      await settingsButton.click({ timeout: Math.min(1_000, Math.max(1, deadline - Date.now())) }).catch(
-        () => undefined,
-      );
+      await settingsButton
+        .click({ timeout: Math.min(1_000, Math.max(1, deadline - Date.now())) })
+        .catch(() => undefined);
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
@@ -245,10 +298,10 @@ async function openNativeSettings(page) {
 }
 
 /**
- * 在真实 WebView2 中从首屏进入设置并完成一个来源标识的授权回读，证明独立 profile/CDP
- * 没有误连用户实例，也没有把预览中的本地状态误当成持久化成功。
+ * 在真实 WebView2 中先运行隔离 MCP 与 Skill 设置验收，再用同一隔离 profile 创建会话并验证
+ * 顶栏全局／项目 MCP 清单、跨会话状态隔离和 Settings 往返焦点。
  */
-async function inspectNativeSettings(cdpPort, evidencePath, userProfile) {
+async function inspectNativeSettings(cdpPort, evidencePath, userProfile, projectPath) {
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
   try {
     const page = browser.contexts().flatMap((context) => context.pages())[0];
@@ -274,6 +327,24 @@ async function inspectNativeSettings(cdpPort, evidencePath, userProfile) {
       path: join(evidencePath, "native-settings.png"),
       animations: "disabled",
     });
+    if (process.env.JA_SETTINGS_NATIVE_HEADER_ONLY === "1") {
+      const mcpHeader = await runMcpConversationHeaderAcceptance({
+        page,
+        evidenceDirectory: join(evidencePath, "mcp-header"),
+        projectPath,
+      });
+      return {
+        pages: browser.contexts().flatMap((context) => context.pages()).length,
+        url: page.url(),
+        title: await page.title(),
+        settingsVisible: true,
+        mcpHeader,
+      };
+    }
+    const mcpSettings = await runMcpSettingsAcceptance({
+      page,
+      evidenceDirectory: join(evidencePath, "mcp-settings"),
+    });
     await page.getByRole("tab", { name: "Skills", exact: true }).click();
     await expect(page.locator(".ja-skill-scope")).toBeVisible({ timeout: 30_000 });
     await page.screenshot({
@@ -283,9 +354,11 @@ async function inspectNativeSettings(cdpPort, evidencePath, userProfile) {
     const nativeSkill = page.getByRole("switch", { name: "native-probe-skill：已停用" });
     await expect(nativeSkill).toBeVisible({ timeout: 30_000 });
     await nativeSkill.click();
-    await expect(
-      page.getByRole("switch", { name: "native-probe-skill：已启用" }),
-    ).toHaveAttribute("aria-checked", "true", { timeout: 30_000 });
+    await expect(page.getByRole("switch", { name: "native-probe-skill：已启用" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+      { timeout: 30_000 },
+    );
     const configPath = join(userProfile, ".ja", "config.toml");
     await expect
       .poll(async () => readFile(configPath, "utf8").catch(() => ""), { timeout: 30_000 })
@@ -297,26 +370,33 @@ async function inspectNativeSettings(cdpPort, evidencePath, userProfile) {
       path: join(evidencePath, "native-skills-enabled.png"),
       animations: "disabled",
     });
+    const mcpHeader = await runMcpConversationHeaderAcceptance({
+      page,
+      evidenceDirectory: join(evidencePath, "mcp-header"),
+    });
     return {
       pages: browser.contexts().flatMap((context) => context.pages()).length,
       url: page.url(),
       title: await page.title(),
       settingsVisible: true,
+      mcpSettings,
       skillsVisible: true,
       skillsPersisted: true,
+      mcpHeader,
     };
   } finally {
     await browser.close();
   }
 }
 
-/** 仅在显式 native-only 模式运行独立 Tauri；清理范围严格限定为本轮 child PID 树。 */
+/** 仅在显式 native-only 模式启动独立 Tauri/WebView2 和 JDK25 sidecar，并回收本轮 PID 树。 */
 async function runNativeProbe() {
   if (process.platform !== "win32") throw new Error("native settings probe requires Windows");
   const frontendPort = await allocateLoopbackPort();
   const cdpPort = await allocateLoopbackPort();
   const directories = await createNativeProbeDirectories(frontendPort);
   await seedNativeSkillFixture(directories.userProfile);
+  await seedNativeConversationProvider(directories.userProfile);
   const javaHome = process.env.JA_E2E_JAVA_HOME?.trim() || process.env.JAVA_HOME?.trim();
   if (javaHome === undefined) throw new Error("native settings probe requires JA_E2E_JAVA_HOME");
   const javaExecutable = join(javaHome, "bin", "java.exe");
@@ -347,23 +427,40 @@ async function runNativeProbe() {
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-port=${cdpPort}`,
     WEBVIEW2_USER_DATA_FOLDER: directories.profile,
   };
-  await execFileAsync(javaExecutable, ["-version"], {
+  const javaVersion = await execFileAsync(javaExecutable, ["-version"], {
     env: environment,
     windowsHide: true,
     timeout: 15_000,
   });
-  await execFileAsync("mvn.cmd", ["-version"], {
+  const javaVersionText = `${javaVersion.stdout}\n${javaVersion.stderr}`;
+  if (!/\b25(?:\.\d+)?\b/u.test(javaVersionText)) {
+    throw new Error(
+      `native settings probe requires JDK 25; java -version reported ${javaVersionText}`,
+    );
+  }
+  const mavenVersion = await execFileAsync("mvn.cmd", ["-version"], {
     cwd: repoRoot,
     env: environment,
     shell: true,
     windowsHide: true,
     timeout: 15_000,
   });
+  const mavenVersionText = `${mavenVersion.stdout}\n${mavenVersion.stderr}`;
+  if (!/Java version:\s*25(?:\.|\s|$)/u.test(mavenVersionText)) {
+    throw new Error(
+      `native settings probe requires Maven on JDK 25; mvn -version reported ${mavenVersionText}`,
+    );
+  }
   await prewarmNativeProfile(pnpm, directories.configPath, environment, directories.profile);
   const { child, stdout, stderr } = launchNativeTauri(pnpm, directories.configPath, environment);
   try {
     await waitForNativeCdp(cdpPort, child, stdout, stderr);
-    const observation = await inspectNativeSettings(cdpPort, directories.root, directories.userProfile);
+    const observation = await inspectNativeSettings(
+      cdpPort,
+      directories.root,
+      directories.userProfile,
+      directories.workspace,
+    );
     await writeFile(
       join(directories.root, "native-report.json"),
       `${JSON.stringify(observation, null, 2)}\n`,

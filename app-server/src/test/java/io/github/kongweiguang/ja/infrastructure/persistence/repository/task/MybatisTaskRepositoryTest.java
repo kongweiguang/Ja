@@ -132,7 +132,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
                 } else {
                     TurnOrigin origin = mode.equals("goal") ? TurnOrigin.GOAL_CONTINUATION : TurnOrigin.PLAN_EXECUTION;
                     conversation.admitContinuation(new ConversationRepository.ContinuationAdmission(childId, firstTurn,
-                            2, START.plusSeconds(4), internalExecution(origin), "{\"kind\":\"" + origin.name() + "\"}"));
+                            2, START.plusSeconds(4), internalExecution(origin), "{\"kind\":\"" + origin.name() + "\"}", null));
                 }
                 String modelHistory = conversation.readThread(childId).orElseThrow().messages().toString();
                 assertTrue(modelHistory.contains("PARENT_FROZEN_MARKER"), mode);
@@ -159,7 +159,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             idleChild(tasks, "thr_attachment_child", tasks.freezeEffectiveContext(ROOT, revision));
             attachParentMessage(database, conversation, "two", revision, START.plusSeconds(2));
             conversation.admitContinuation(new ConversationRepository.ContinuationAdmission("thr_attachment_child",
-                    "turn_attachment_child", 0, START.plusSeconds(4), internalExecution(TurnOrigin.GOAL_CONTINUATION), "{}"));
+                    "turn_attachment_child", 0, START.plusSeconds(4), internalExecution(TurnOrigin.GOAL_CONTINUATION), "{}", null));
             var child = conversation.readThread("thr_attachment_child").orElseThrow();
             assertTrue(child.messages().toString().contains("att_one"));
             idleChild(tasks, "thr_attachment_nested", tasks.freezeEffectiveContext("thr_attachment_child", child.revision()));
@@ -1149,7 +1149,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
                 String continuationTurnId = "turn_hidden_continuation_" + suffix;
                 conversation.admitContinuation(new ConversationRepository.ContinuationAdmission(
                         taskThreadId, continuationTurnId, threadRevision, START.plusSeconds(10),
-                        internalExecution(origin), "{\"kind\":\"" + origin.name() + "\"}"));
+                        internalExecution(origin), "{\"kind\":\"" + origin.name() + "\"}", null));
 
                 TaskModels.Detail running = tasks.readTask(taskThreadId, 0, 0, 20).orElseThrow();
                 assertEquals(TaskModels.State.QUEUED, running.task().projection().state());
@@ -1269,7 +1269,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
         try (SqlSession session = sessions.openSession()) {
             PersistenceMappers mapper = PersistenceMappers.open(session);
             mapper.history().insertWorkspace(new PersistenceRecords.WorkspaceInsert(WORKSPACE,
-                    "C:/dev/task-test", "Task test", "TRUSTED", START.toString()));
+                    "C:/dev/task-test", "Task test", "TRUSTED", "PROJECT", null, START.toString()));
             ThreadPreferences preferences = ConversationTestFixtures.preferences();
             mapper.history().insertThread(new PersistenceRecords.ThreadInsert(ROOT, WORKSPACE, "Root",
                     preferences.providerId(), preferences.modelId(), preferences.reasoningLevel(),
@@ -1288,7 +1288,8 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             String workspaceId = "ws_task_external";
             String threadId = "thr_task_external_root";
             mapper.history().insertWorkspace(new PersistenceRecords.WorkspaceInsert(workspaceId,
-                    "C:/dev/task-test-external", "External task test", "TRUSTED", START.toString()));
+                    "C:/dev/task-test-external", "External task test", "TRUSTED", "PROJECT", null,
+                    START.toString()));
             ThreadPreferences preferences = ConversationTestFixtures.preferences();
             mapper.history().insertThread(new PersistenceRecords.ThreadInsert(threadId, workspaceId, "External",
                     preferences.providerId(), preferences.modelId(), preferences.reasoningLevel(),

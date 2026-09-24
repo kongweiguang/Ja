@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-
 use super::*;
 use crate::app_runtime::EventSink;
 use crate::runtime_test_support::RuntimeHostHarness;
@@ -67,8 +66,8 @@ fn constructor_preserves_four_directory_production_policy() {
 
     let info = host.storage_info();
     let canonical_run_dir = fs::canonicalize(&run_dir).expect("canonical runtime directory");
-    let reported_run_dir = fs::canonicalize(Path::new(&info.data_path))
-        .expect("canonical reported runtime directory");
+    let reported_run_dir =
+        fs::canonicalize(Path::new(&info.data_path)).expect("canonical reported runtime directory");
     assert_eq!(reported_run_dir, canonical_run_dir);
     assert!(info.native_image);
     fs::remove_dir_all(root).expect("remove constructor fixture");
@@ -137,8 +136,8 @@ fn bridge_poison_fails_all_runtime_lifecycle_paths_closed() {
     assert!(!host.exit_ready());
 }
 
-/// Workspace binding 锁中毒后 identity、trust 与 capability handle 都不再可信；查询与通用
-/// Workspace 切换必须在接触 sidecar 前关闭失败。
+/// Workspace binding 锁中毒后 identity、trust 与 capability handle 都不再可信；查询与项目
+/// 配置必须在接触 sidecar 前关闭失败。
 #[test]
 fn workspace_poison_rejects_capability_lookup_and_reconfiguration() {
     let sink: EventSink = Arc::new(|_| Ok(()));
@@ -158,9 +157,13 @@ fn workspace_poison_rejects_capability_lookup_and_reconfiguration() {
         WorkspaceLookup::Unknown
     );
     assert_eq!(
-        host.general_workspace()
-            .expect_err("poisoned binding must block replacement")
-            .code,
+        host.open_workspace(crate::app_runtime::WorkspaceOpenInput {
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            display_name: None,
+            trust: "trusted".to_owned(),
+        })
+        .expect_err("poisoned binding must block project configuration")
+        .code,
         "RUNTIME_UNAVAILABLE"
     );
 }

@@ -15,9 +15,12 @@ final class PersistenceRecordsTest {
     @Test
     void preservesNullableColumnsExplicitly() {
         PersistenceRecords.ThreadRow row = new PersistenceRecords.ThreadRow(
-                "thr", "ws", "title", "provider", "model", null, "approval_required",
-                "plan", "placeholder", 0, "created", "updated", null, null, null, null, true, null);
+                "thr", "ws", "title", "project", null, "provider", "model", null,
+                "approval_required", "plan", "placeholder", 0, "created", "updated",
+                null, null, null, null, true, null);
 
+        assertEquals("project", row.workspaceKind());
+        assertNull(row.legacySharedWorkspaceId());
         assertNull(row.reasoningLevel());
         assertNull(row.archivedAt());
         assertTrue(row.latestTurnSeen());

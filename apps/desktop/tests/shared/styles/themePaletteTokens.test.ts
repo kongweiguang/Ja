@@ -187,6 +187,14 @@ function contrastRatio(first: string, second: string): number {
 }
 
 describe("five-palette semantic token contract", () => {
+  /** Tooltip 只提供说明，不得覆盖 Portal 下方控件的真实鼠标命中区。 */
+  it("keeps tooltip surfaces transparent to pointer input", () => {
+    expect(PRIMITIVES_SOURCE).toMatch(/\.ja-tooltip-content\s*\{[^}]*pointer-events:\s*none;/u);
+    expect(PRIMITIVES_SOURCE).toMatch(
+      /\[data-radix-popper-content-wrapper\]:has\(> \[data-ja-tooltip-content\]\)\s*\{[^}]*pointer-events:\s*none;/u,
+    );
+  });
+
   it("resolves every required role for all eight palette and mode combinations", () => {
     for (const palette of PALETTES) {
       for (const mode of MODES) {

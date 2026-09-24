@@ -826,9 +826,8 @@ describe("timeline reducer", () => {
         errorCode: "MODEL_PROTOCOL_ERROR",
       }),
     );
-    expect(failed.draftByTurn[turnId]).toEqual([
-      expect.objectContaining({ kind: "assistant", text: "失败前已经生成的正文" }),
-    ]);
+    // 失败终态只呈现稳定的一句原因；本次模型尝试的临时半截正文不并入用户可见答复。
+    expect(failed.draftByTurn[turnId]).toBeUndefined();
   });
 
   /** 重启调和后的 Suspended 继续阻塞 Thread，且只能先回到队列再恢复执行。 */
@@ -3539,6 +3538,140 @@ describe("timeline reducer", () => {
     );
     expect(next.lastOutcome).toBe("applied");
     expect(next.streamSeqByTurn[turnId]).toBe(3);
+  });
+
+  /** 重试只清理失败请求的公开草稿；Turn 级序号和健康快照中的已知尝试号仍保持单调。 */
+  it("清除半截草稿后以连续 streamSeq 接受新尝试，并在健康重读中保留 attempt", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_retry_old_partial",
+        sequence: 2,
+        streamSeq: 1,
+        text: "失败请求的半截正文",
+      }),
+    );
+    state = apply(
+      state,
+      event("turn/retry-started", 2, {
+        eventId: "evt_retry_attempt_two",
+        sequence: 3,
+        attempt: 2,
+        maxAttempts: 6,
+      }),
+    );
+    expect(state.lastOutcome).toBe("applied");
+    expect(state.draftByTurn[turnId]).toBeUndefined();
+    expect(state.streamSeqByTurn[turnId]).toBe(1);
+    expect(state.retryingByTurn[turnId]).toMatchObject({ attempt: 2, maxAttempts: 6 });
+
+    state = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 2,
+        turns: [
+          {
+            turnId,
+            status: "running",
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        liveStream: null,
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(state.retryAttemptByTurn[turnId]).toEqual({ attempt: 2, maxAttempts: 6 });
+    expect(state.retryingByTurn[turnId]?.attempt).toBe(2);
+    expect(state.streamSeqByTurn[turnId]).toBe(1);
+
+    state = apply(
+      state,
+      event("turn/retry-started", 3, {
+        eventId: "evt_retry_attempt_three",
+        sequence: 4,
+        attempt: 3,
+        maxAttempts: 6,
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 3, {
+        eventId: "evt_retry_new_delta",
+        sequence: 5,
+        streamSeq: 2,
+        text: "新请求的正文",
+      }),
+    );
+    expect(state.lastOutcome).toBe("applied");
+    expect(state.streamSeqByTurn[turnId]).toBe(2);
+    expect(state.draftByTurn[turnId]?.map((draft) => draft.text)).toEqual(["新请求的正文"]);
+    expect(state.retryingByTurn[turnId]).toBeUndefined();
+  });
+
+  it("恢复快照清除瞬时 retry 基线，并允许下一条合法的有界 attempt", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("turn/retry-started", 2, {
+        eventId: "evt_retry_before_recovery",
+        sequence: 2,
+        attempt: 2,
+        maxAttempts: 6,
+      }),
+    );
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 2,
+        turns: [
+          {
+            turnId,
+            status: "running",
+            requestedAt: "2026-08-18T00:00:00Z",
+            updatedAt: "2026-08-18T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        liveStream: null,
+        nextCursor: null,
+      },
+      "ws_one",
+      { mode: "recovery" },
+    );
+    expect(restored.retryAttemptByTurn[turnId]).toBeUndefined();
+    expect(restored.retryingByTurn[turnId]).toBeUndefined();
+
+    const nextAttempt = apply(
+      restored,
+      event("turn/retry-started", 3, {
+        eventId: "evt_retry_after_recovery",
+        sequence: 3,
+        attempt: 4,
+        maxAttempts: 6,
+      }),
+    );
+    expect(nextAttempt.lastOutcome).toBe("applied");
+    expect(nextAttempt.retryingByTurn[turnId]).toMatchObject({ attempt: 4, maxAttempts: 6 });
   });
 
   it("后台重读请求不会把真实 gap 降级成普通 health 标记", () => {

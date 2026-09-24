@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:mcp-count-bound","method":"thread/mcp/read","params":{"threadId":"thr_mcp_demo"}}
+{"jsonrpc":"2.0","id":"c:mcp-count-bound","result":{"threadId":"thr_mcp_demo","source":"last_observed","servers":[{"serverId":"mcp_local","name":"Local","state":"available","toolCount":10001}]}}

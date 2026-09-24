@@ -18,7 +18,6 @@ pub enum PreviewErrorCode {
     HostMissing = 6,
     UserInfoNotAllowed = 7,
     PercentEscapeInvalid = 8,
-    SessionLimit = 9,
     SessionNotFound = 10,
     SessionClosed = 11,
     StaleGeneration = 12,
@@ -36,6 +35,14 @@ pub enum PreviewErrorCode {
     SessionClosing = 24,
     ShutdownDeadline = 25,
     NativeClosePending = 26,
+    FileTargetInvalid = 27,
+    FileNotFound = 28,
+    FileUnreadable = 29,
+    FileIsDirectory = 30,
+    WorkspaceRequired = 31,
+    WorkspaceUnavailable = 32,
+    LocalFileUnsupported = 33,
+    FileRevealFailed = 34,
 }
 
 /// Error 只携带稳定类别，不携带调用方输入。
@@ -68,7 +75,6 @@ impl Display for PreviewError {
             PreviewErrorCode::HostMissing => "preview URL host is missing",
             PreviewErrorCode::UserInfoNotAllowed => "preview URL user info is not allowed",
             PreviewErrorCode::PercentEscapeInvalid => "preview URL percent escape is invalid",
-            PreviewErrorCode::SessionLimit => "preview session limit reached",
             PreviewErrorCode::SessionNotFound => "preview session was not found",
             PreviewErrorCode::SessionClosed => "preview session is closed",
             PreviewErrorCode::StaleGeneration => "preview callback generation is stale",
@@ -86,6 +92,14 @@ impl Display for PreviewError {
             PreviewErrorCode::SessionClosing => "preview session close is already in progress",
             PreviewErrorCode::ShutdownDeadline => "preview shutdown deadline was reached",
             PreviewErrorCode::NativeClosePending => "preview native close is still pending",
+            PreviewErrorCode::FileTargetInvalid => "local file target is invalid",
+            PreviewErrorCode::FileNotFound => "local file was not found",
+            PreviewErrorCode::FileUnreadable => "local file is not readable",
+            PreviewErrorCode::FileIsDirectory => "local file target is a directory",
+            PreviewErrorCode::WorkspaceRequired => "workspace is required for a relative file path",
+            PreviewErrorCode::WorkspaceUnavailable => "workspace is not available",
+            PreviewErrorCode::LocalFileUnsupported => "local file type is not supported",
+            PreviewErrorCode::FileRevealFailed => "file explorer could not show the file",
         })
     }
 }

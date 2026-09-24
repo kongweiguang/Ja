@@ -133,7 +133,7 @@ public final class MybatisConversationRepository implements ConversationReposito
         return transactions.required(mapper -> {
             ThreadAdmissionContext context = prepareAdmission(mapper, admission.threadId(),
                     admission.expectedThreadRevision(), admission.turnId(), admission.initialExecution(),
-                    admission.requestedAt(), "");
+                    admission.requestedAt(), null, "");
             PersistenceRecords.ThreadRow thread = context.thread();
             long ordinal = mapper.agent().selectNextMessageOrdinal(admission.threadId());
             ordinal = TaskContextInheritancePersistence.injectSeedIfFirstTurn(mapper, objectMapper,
@@ -143,44 +143,64 @@ public final class MybatisConversationRepository implements ConversationReposito
                     admission.userMessage().role().name(), codec.writeMessage(admission.userMessage()),
                     instant(admission.requestedAt()))), "user message insert lost");
             List<String> attachmentNames = bindAttachments(mapper, thread.workspaceId(), admission);
-            String visibleUserInput = visibleText(admission.userMessage());
-            insertTimelineMessage(mapper, admission.messageId(), admission.threadId(), admission.turnId(),
-                    "USER_INPUT", visibleUserInput, null, null, null, admission.requestedAt());
-            String provisionalTitle = null;
-            if (ordinal == 1 && "PLACEHOLDER".equals(thread.titleSource())) {
-                String candidate = ThreadTitlePolicy.provisionalTitle(visibleUserInput, attachmentNames);
-                if (!candidate.isBlank()) provisionalTitle = candidate;
-            }
-            requireChanged(mapper.history().compareAndSetThreadAdmission(
-                    new PersistenceRecords.ThreadAdmissionCas(admission.threadId(), thread.providerId(),
-                            thread.modelId(), thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(),
-                            provisionalTitle,
-                            admission.expectedThreadRevision(), instant(admission.requestedAt()))),
-                    "thread admission revision lost");
+            String provisionalTitle = persistUserTimelineAndAdmissionTitle(
+                    mapper, admission, thread, attachmentNames, ordinal, "thread admission ");
             return new AdmissionReceipt(admission.threadId(), admission.turnId(),
                     admission.expectedThreadRevision() + 1, 0, provisionalTitle);
         });
     }
 
-    /** continuation 也初始化首轮冻结上下文；只写已有父消息作为模型历史，不伪造可见用户输入。 */
+    /**
+     * continuation 共用 Turn admission；旧版“继续”没有来源身份，因此仅在精确结构匹配时于同一事务
+     * 归一化其三条尾链，避免把按钮文案误当原问题或静默丢失已执行 Tool 的上下文。
+     */
     @Override
     public AdmissionReceipt admitContinuation(ContinuationAdmission admission) {
         ensureOpen();
         Objects.requireNonNull(admission, "admission");
         return transactions.required(mapper -> {
+            String sourceMessageId = admission.sourceMessageId();
+            if (sourceMessageId != null
+                    && admission.initialExecution().common().origin()
+                    == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER_CONTINUATION) {
+                String legacyQuestion = mapper.history().selectLegacyContinueCandidateSource(
+                        admission.threadId(), sourceMessageId);
+                if (legacyQuestion != null) {
+                    if (!mapper.history().isStrictLegacyContinueChain(
+                            admission.threadId(), sourceMessageId, legacyQuestion)) {
+                        throw new StorageException(StorageException.Code.INVALID_STATE,
+                                "legacy continuation chain is ambiguous");
+                    }
+                    int normalized = mapper.history().normalizeLegacyContinuePath(
+                            admission.threadId(), sourceMessageId, legacyQuestion);
+                    if (normalized != 3) {
+                        throw new StorageException(StorageException.Code.INVALID_STATE,
+                                "legacy continuation path changed during admission");
+                    }
+                    sourceMessageId = legacyQuestion;
+                }
+            }
+            if (sourceMessageId != null
+                    && !mapper.history().isReaskableQuestion(admission.threadId(), sourceMessageId)) {
+                throw new StorageException(StorageException.Code.INVALID_STATE,
+                        "question is not eligible for continuation");
+            }
             ThreadAdmissionContext context = prepareAdmission(mapper, admission.threadId(),
                     admission.expectedThreadRevision(), admission.turnId(), admission.initialExecution(),
-                    admission.requestedAt(), "continuation ");
+                    admission.requestedAt(), sourceMessageId, "continuation ");
             PersistenceRecords.ThreadRow thread = context.thread();
             TaskContextInheritancePersistence.injectSeedIfFirstTurn(mapper, objectMapper,
                     admission.threadId(), admission.turnId(), admission.requestedAt(),
                     mapper.agent().selectNextMessageOrdinal(admission.threadId()));
-            requireChanged(mapper.agent().insertInternalTurnContext(
-                    new PersistenceRecords.InternalTurnContextInsert(admission.turnId(),
-                            admission.initialExecution().common().origin().name(), admission.hiddenContext(),
-                            instant(admission.requestedAt()))), "continuation context insert lost");
-            TaskContinuationPersistence.activate(mapper, objectMapper, admission.turnId(),
-                    admission.initialExecution().common().origin(), admission.requestedAt());
+            if (admission.initialExecution().common().origin()
+                    != io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER_CONTINUATION) {
+                requireChanged(mapper.agent().insertInternalTurnContext(
+                        new PersistenceRecords.InternalTurnContextInsert(admission.turnId(),
+                                admission.initialExecution().common().origin().name(), admission.hiddenContext(),
+                                instant(admission.requestedAt()))), "continuation context insert lost");
+                TaskContinuationPersistence.activate(mapper, objectMapper, admission.turnId(),
+                        admission.initialExecution().common().origin(), admission.requestedAt());
+            }
             requireChanged(mapper.history().compareAndSetThreadAdmission(
                     new PersistenceRecords.ThreadAdmissionCas(admission.threadId(), thread.providerId(),
                             thread.modelId(), thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(),
@@ -191,12 +211,89 @@ public final class MybatisConversationRepository implements ConversationReposito
         });
     }
 
+    /** 重试与重答都先从持久路径解析来源，返回值只作为候选，准入时再在同一写事务中验证。 */
+    @Override
+    public Optional<String> findLastUnansweredQuestionMessageId(String threadId, long expectedThreadRevision) {
+        ensureOpen();
+        return transactions.required(mapper -> {
+            PersistenceRecords.ThreadRow thread = requireThread(mapper, threadId);
+            requireRevision(thread, expectedThreadRevision);
+            String messageId = mapper.history().selectLastCurrentPathQuestionMessageId(threadId);
+            return messageId != null && mapper.history().isReaskableQuestion(threadId, messageId)
+                    ? Optional.of(messageId) : Optional.empty();
+        });
+    }
+
+    /** 编辑重答必须先验证源问题仍是当前路径末尾，再原子切旧后缀并接入带新身份的 USER Turn。 */
+    @Override
+    public AdmissionReceipt admitReask(ReaskAdmission reask) {
+        ensureOpen();
+        Objects.requireNonNull(reask, "reask");
+        TurnAdmission admission = reask.turn();
+        return transactions.required(mapper -> {
+            io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence
+                    .requireConversationAdmissionOpen(mapper, admission.threadId());
+            PersistenceRecords.ThreadRow thread = requireThread(mapper, admission.threadId());
+            requireRevision(thread, admission.expectedThreadRevision());
+            String sourceMessageId = mapper.history().selectLastCurrentPathQuestionMessageId(admission.threadId());
+            if (sourceMessageId == null
+                    || !SnapshotItemIdentity.of("message", sourceMessageId).equals(reask.sourceMessageId())
+                    || !mapper.history().isReaskableQuestion(admission.threadId(), sourceMessageId)) {
+                throw new StorageException(StorageException.Code.INVALID_STATE,
+                        "question is not eligible for reask");
+            }
+            requireChanged(mapper.history().cutCurrentPathFromQuestion(
+                    admission.threadId(), sourceMessageId), "question path changed during reask");
+            long ordinal = mapper.agent().selectNextMessageOrdinal(admission.threadId());
+            requireChanged(mapper.agent().insertTurn(new PersistenceRecords.TurnInsert(
+                    admission.turnId(), admission.threadId(), instant(admission.requestedAt()), null)),
+                    "reask turn insert lost");
+            requireChanged(mapper.agent().insertTurnExecution(executionWrite(
+                    admission.turnId(), admission.initialExecution())), "reask execution insert lost");
+            requireChanged(mapper.agent().insertMessage(new PersistenceRecords.MessageInsert(
+                    admission.messageId(), admission.threadId(), admission.turnId(), ordinal,
+                    admission.userMessage().role().name(), codec.writeMessage(admission.userMessage()),
+                    instant(admission.requestedAt()))), "reask user message insert lost");
+            List<String> attachmentNames = bindReaskAttachments(mapper, thread.workspaceId(), admission,
+                    sourceMessageId);
+            String provisionalTitle = persistUserTimelineAndAdmissionTitle(
+                    mapper, admission, thread, attachmentNames, ordinal, "reask admission ");
+            return new AdmissionReceipt(admission.threadId(), admission.turnId(),
+                    admission.expectedThreadRevision() + 1, 0, provisionalTitle);
+        });
+    }
+
+    /** 用户可见投影、首条标题与 revision CAS 共用事务实现，避免新增普通准入和重答的提交语义分叉。 */
+    private String persistUserTimelineAndAdmissionTitle(
+            PersistenceMappers mapper,
+            TurnAdmission admission,
+            PersistenceRecords.ThreadRow thread,
+            List<String> attachmentNames,
+            long ordinal,
+            String failureLabel) {
+        String visibleUserInput = visibleText(admission.userMessage());
+        insertTimelineMessage(mapper, admission.messageId(), admission.threadId(), admission.turnId(),
+                "USER_INPUT", visibleUserInput, null, null, null, admission.requestedAt());
+        String provisionalTitle = null;
+        if (ordinal == 1 && "PLACEHOLDER".equals(thread.titleSource())) {
+            String candidate = ThreadTitlePolicy.provisionalTitle(visibleUserInput, attachmentNames);
+            if (!candidate.isBlank()) provisionalTitle = candidate;
+        }
+        requireChanged(mapper.history().compareAndSetThreadAdmission(
+                new PersistenceRecords.ThreadAdmissionCas(admission.threadId(), thread.providerId(),
+                        thread.modelId(), thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(),
+                        provisionalTitle, admission.expectedThreadRevision(), instant(admission.requestedAt()))),
+                failureLabel + "revision lost");
+        return provisionalTitle;
+    }
+
     /** Turn 与执行游标必须在同一事务共同出现；label 仅区分故障诊断，不改变持久状态。 */
     private void insertTurnExecution(PersistenceMappers mapper, String turnId, String threadId,
                                       TurnExecutionState initialExecution, Instant requestedAt,
+                                      String sourceMessageId,
                                       String label) {
         requireChanged(mapper.agent().insertTurn(new PersistenceRecords.TurnInsert(
-                turnId, threadId, instant(requestedAt))), label + "turn insert lost");
+                turnId, threadId, instant(requestedAt), sourceMessageId)), label + "turn insert lost");
         requireChanged(mapper.agent().insertTurnExecution(executionWrite(
                 turnId, initialExecution)), label + "initial execution state insert lost");
     }
@@ -207,12 +304,13 @@ public final class MybatisConversationRepository implements ConversationReposito
     private ThreadAdmissionContext prepareAdmission(PersistenceMappers mapper, String threadId,
                                                     long expectedRevision, String turnId,
                                                     TurnExecutionState initialExecution, Instant requestedAt,
+                                                    String sourceMessageId,
                                                     String label) {
         io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence
                 .requireConversationAdmissionOpen(mapper, threadId);
         PersistenceRecords.ThreadRow thread = requireThread(mapper, threadId);
         requireRevision(thread, expectedRevision);
-        insertTurnExecution(mapper, turnId, threadId, initialExecution, requestedAt, label);
+        insertTurnExecution(mapper, turnId, threadId, initialExecution, requestedAt, sourceMessageId, label);
         return new ThreadAdmissionContext(thread);
     }
 
@@ -256,6 +354,48 @@ public final class MybatisConversationRepository implements ConversationReposito
                     "attachment changed during turn admission");
             requireChanged(mapper.attachments().insertMessageAttachment(binding),
                     "message attachment relation insert lost");
+        }
+        return List.copyOf(displayNames);
+    }
+
+    /** Reask 仅允许复用当前源消息已绑定的不可变附件；DRAFT 仍走单向绑定，审计关系绝不迁移。 */
+    private static List<String> bindReaskAttachments(PersistenceMappers mapper, String workspaceId,
+                                                     TurnAdmission admission, String sourceMessageId) {
+        long totalBytes = 0;
+        List<Boolean> reuseBound = new java.util.ArrayList<>(admission.attachmentIds().size());
+        List<String> displayNames = new java.util.ArrayList<>(admission.attachmentIds().size());
+        for (String attachmentId : admission.attachmentIds()) {
+            AttachmentRecords.AttachmentRow row = mapper.attachments().selectAttachment(attachmentId);
+            String reservationOwner = mapper.attachments().selectReservationInputId(attachmentId);
+            if (row == null || !workspaceId.equals(row.workspaceId()) || row.blobSha256() == null
+                    || reservationOwner != null) {
+                throw conflict("attachment is not available to reask");
+            }
+            boolean reuse = "BOUND".equals(row.status())
+                    && mapper.attachments().isMessageAttachmentBoundTo(
+                    attachmentId, sourceMessageId, admission.threadId(), workspaceId);
+            boolean draft = "DRAFT".equals(row.status())
+                    && Instant.parse(row.expiresAt()).isAfter(admission.requestedAt());
+            if (!reuse && !draft) throw conflict("attachment is not available to reask");
+            try {
+                totalBytes = Math.addExact(totalBytes, row.sizeBytes());
+            } catch (ArithmeticException overflow) {
+                throw conflict("turn attachment quota exceeded");
+            }
+            if (totalBytes > MAX_TURN_ATTACHMENT_BYTES) throw conflict("turn attachment quota exceeded");
+            reuseBound.add(reuse);
+            displayNames.add(row.displayName());
+        }
+        for (int ordinal = 0; ordinal < admission.attachmentIds().size(); ordinal++) {
+            String attachmentId = admission.attachmentIds().get(ordinal);
+            AttachmentRecords.AttachmentBind binding = new AttachmentRecords.AttachmentBind(
+                    attachmentId, workspaceId, admission.messageId(), ordinal, instant(admission.requestedAt()));
+            if (!reuseBound.get(ordinal)) {
+                requireChanged(mapper.attachments().bindDraft(binding),
+                        "attachment changed during reask admission");
+            }
+            requireChanged(mapper.attachments().insertMessageAttachment(binding),
+                    "reask attachment relation insert lost");
         }
         return List.copyOf(displayNames);
     }
@@ -2019,7 +2159,7 @@ public final class MybatisConversationRepository implements ConversationReposito
                 Instant.parse(requiredText(row.requestedAt(), "requested_at")),
                 Instant.parse(requiredText(row.updatedAt(), "updated_at")),
                 row.completedAt() == null ? null : Instant.parse(row.completedAt()), threadRevision,
-                row.mutationVersion());
+                row.mutationVersion(), row.currentPath(), row.sourceMessageId(), row.terminalMessageId());
     }
 
     /**

@@ -80,7 +80,8 @@ final class OpenAiResponsesCodec {
     }
 
     /**
-     * 在文本、函数调用和函数结果条目之间保持消息及内容顺序。
+     * 在文本、函数调用和函数结果条目之间保持消息顺序；失败结果只编码真实错误正文，避免发送 Responses
+     * 仅用于输出条目的 status 元数据而触发输入校验拒绝。
      */
     private static ArrayNode input(
             ModelPort.ModelConfiguration configuration, List<ModelMessage> messages) {
@@ -108,7 +109,6 @@ final class OpenAiResponsesCodec {
                         item.put("type", "function_call_output");
                         item.put("call_id", output.callId());
                         item.put("output", output.content());
-                        if (output.error()) item.put("status", "incomplete");
                     }
                 }
             }

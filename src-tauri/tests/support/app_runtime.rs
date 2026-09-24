@@ -399,12 +399,11 @@ impl RuntimeHostHarness {
         self.host.clone()
     }
 
-    /// 只读检查测试 Host 的 Workspace binding 是否存在；该探针留在外置 Harness，生产
-    /// API 继续只暴露 fail-closed 的 WorkspaceLookup，锁中毒也不会被恢复成可信状态。
+    /// 只读检查测试 Host 是否持有待开的项目或 Java identity binding；该探针留在 Harness。
     pub(crate) fn workspace_binding_present(host: &RuntimeHost) -> Result<bool, &'static str> {
         host.workspace
             .lock()
-            .map(|binding| binding.is_some())
+            .map(|bindings| bindings.pending_project.is_some() || !bindings.by_id.is_empty())
             .map_err(|_| "runtime workspace binding lock poisoned")
     }
 

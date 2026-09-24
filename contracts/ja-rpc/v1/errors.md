@@ -17,6 +17,14 @@ derived from `retryable`, emitted as null, or emitted as zero.
 Tool failures use bounded, redacted Tool results. Protocol errors never expose absolute paths,
 command bodies, patch bodies, configuration values, or Secret material.
 
+`thread/mcp/read` reuses `THREAD_NOT_FOUND` and `WORKSPACE_NOT_FOUND`
+for missing Thread or Workspace authority. An unknown server, unavailable configuration or failed
+manual probe maps to the existing retryable `MCP_SERVER_UNAVAILABLE` (`-32057`); no endpoint,
+credential, header, environment or remote exception detail appears in the error. A service that
+was checked but failed discovery can instead be returned as a sanitized `unavailable` server state.
+Model-side `mcp` action and remote-argument failures are paired Tool results so the model can
+correct its next call; uncertain remote execution is never automatically replayed.
+
 Context compaction adds two stable catalog entries: `THREAD_BUSY` (`-32030`, conflict, retryable) and `SUMMARY_FAILURE` (`-32049`, unavailable, retryable). The `thread/compact` public failure closure also reuses `THREAD_NOT_FOUND`, `CONFLICT`, `CONTEXT_LIMIT`, `CANCELLED`, and `INVALID_STATE`; lifecycle failure notifications expose only one of these stable `errorCode` values and never include Provider diagnostics. Local token budgeting is a pure preflight calculation and therefore has no remote token-count availability error. Session shutdown cancels an active manual compaction before runtime resources are released.
 
 Attachment operations add `ATTACHMENT_NOT_FOUND` (`-32061`, not found, non-retryable),
@@ -28,8 +36,7 @@ specific integrity check that failed.
 Turn resume adds two distinct failures: `TURN_NOT_RESUMABLE` (`-32065`, conflict,
 non-retryable) when the target has no valid suspended execution state;
 `TURN_RESUME_ORDER_CONFLICT` (`-32066`, conflict, retryable) when an earlier non-terminal Turn must
-be resolved first. Code `-32067` remains intentionally unassigned and later codes are not
-renumbered; resume re-enters the normal next-request safe point instead of restoring a Turn-wide runtime.
+be resolved first. `TURN_NOT_REASKABLE` (`-32067`, validation, non-retryable) rejects a question that is not the latest stopped unanswered question on the current path. Later codes are not renumbered; resume re-enters the normal next-request safe point instead of restoring a Turn-wide runtime.
 
 Turn input mutations add `TURN_INPUT_QUEUE_FULL` (`-32068`, capacity, retryable) when the active
 Turn already has eight pending inputs or their combined UTF-8 text would exceed 524,288 bytes, and

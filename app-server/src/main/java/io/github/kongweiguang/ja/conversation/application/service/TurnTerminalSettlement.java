@@ -61,7 +61,8 @@ final class TurnTerminalSettlement {
     }
 
     /**
-     * 读取最新 mutation version 后经终态协调器提交一次 CAS，并仅由提交者发布事件。
+     * 读取最新 mutation version 后经终态协调器提交一次 CAS，并仅由提交者发布事件；失败回复使用
+     * 独立稳定 item identity，供后续有效历史准确排除自动收口。
      */
     TerminalCoordinator.Outcome commitUnexpectedTerminal(TurnOwnership turn, TurnState state,
                                                          String code, String message) {
@@ -76,7 +77,7 @@ final class TurnTerminalSettlement {
         String failureReply = terminalState == TurnState.FAILED
                 ? failureReplies.replyFor(terminalCode) : null;
         String finalMessageId = failureReply == null ? null
-                : failureReplies.messageIdFor(turn.command().turnId(), turn.execution);
+                : failureReplies.failureMessageIdFor(turn.command().turnId());
         ModelMessage finalMessage = failureReply == null ? null
                 : new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(failureReply)));
         java.util.concurrent.atomic.AtomicReference<io.github.kongweiguang.ja.conversation.application.change

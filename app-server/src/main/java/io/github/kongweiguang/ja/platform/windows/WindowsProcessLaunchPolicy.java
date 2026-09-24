@@ -11,6 +11,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -38,7 +39,8 @@ final class WindowsProcessLaunchPolicy {
     }
 
     /**
-     * 在分配 Kernel32 句柄前复制并校验全部调用方字段，使路径、argv、环境策略不依赖 FFM 生命周期。
+     * 在分配 Kernel32 句柄前复制并校验全部调用方字段；仅将标准 npx.cmd 映射为同目录 Node/npm CLI，
+     * 使 PATH/PATHEXT 预检查与实际启动共享完全相同的字面 argv 和环境快照。
      */
     static LaunchSpec validate(
             List<String> command,
@@ -47,10 +49,206 @@ final class WindowsProcessLaunchPolicy {
         Objects.requireNonNull(command, "command");
         Objects.requireNonNull(workingDirectory, "workingDirectory");
         Objects.requireNonNull(environment, "environment");
+        List<String> safeCommand = validatedCommand(command);
+        Path safeWorkingDirectory = canonicalDirectory(workingDirectory);
+        Map<String, String> validated = validatedEnvironment(environment);
         return new LaunchSpec(
-                validatedCommand(command),
-                canonicalDirectory(workingDirectory),
-                validatedEnvironment(environment));
+                validatedCommand(normalizeNpxCommand(safeCommand, validated)), safeWorkingDirectory, validated);
+    }
+
+    /**
+     * 把唯一允许的 npm npx.cmd shim 展开为同目录 node.exe 与 npm CLI 文件；绝不把任意批处理交给命令解释器。
+     */
+    private static List<String> normalizeNpxCommand(List<String> command, Map<String, String> environment)
+            throws IOException {
+        String executable = command.getFirst();
+        if (executable == null) throw new IOException("windows_process_executable_invalid");
+        if (!isNpxCommand(executable)) {
+            return command;
+        }
+        Path candidate = findExecutableCandidate(executable, environment);
+        if (candidate == null) {
+            return command;
+        }
+        Path candidateName = candidate.getFileName();
+        if (candidateName == null) throw new IOException("windows_process_npx_layout_invalid");
+        if (!candidateName.toString().toLowerCase(Locale.ROOT).endsWith(".cmd")) return command;
+        Path shim = checkedRegularFile(candidate, "windows_process_npx_layout_invalid");
+        String shimText = Files.readString(shim, java.nio.charset.StandardCharsets.UTF_8)
+                .toLowerCase(Locale.ROOT).replace('/', '\\');
+        if (!shimText.contains("%~dp0\\node.exe")
+            || !shimText.contains("%~dp0\\node_modules\\npm\\bin\\npx-cli.js")) {
+            throw new IOException("windows_process_npx_layout_invalid");
+        }
+        Path directory = shim.getParent();
+        if (directory == null) {
+            throw new IOException("windows_process_npx_layout_invalid");
+        }
+        Path node = checkedRegularFile(directory.resolve("node.exe"), "windows_process_npx_layout_invalid");
+        Path cli = checkedRegularFile(
+                directory.resolve("node_modules").resolve("npm").resolve("bin").resolve("npx-cli.js"),
+                "windows_process_npx_layout_invalid");
+        List<String> mapped = new ArrayList<>(command.size() + 1);
+        mapped.add(node.toString());
+        mapped.add(cli.toString());
+        mapped.addAll(command.subList(1, command.size()));
+        return List.copyOf(mapped);
+    }
+
+    /**
+     * 按 Windows PATH 与 PATHEXT 顺序查找 exe；仅为 npx 额外返回 `.cmd`，供调用方验证标准 shim 后映射。
+     */
+    private static Path findExecutableCandidate(String executable, Map<String, String> environment)
+            throws IOException {
+        Path requested = Path.of(executable);
+        Path name = requested.getFileName();
+        if (name == null) {
+            return null;
+        }
+        String fileName = name.toString();
+        String extension = extension(fileName);
+        List<String> extensions = pathExtensions(environment);
+        boolean explicitPath = requested.isAbsolute();
+        if (!explicitPath && (requested.getNameCount() != 1 || executable.indexOf(':') >= 0
+                || executable.contains("/") || executable.contains("\\"))) {
+            return null;
+        }
+        if (explicitPath) {
+            Path parent = requested.toAbsolutePath().normalize().getParent();
+            if (parent == null) {
+                return null;
+            }
+            if (!extension.isEmpty()) {
+                return allowedCandidate(parent.resolve(fileName), extension, fileName, extensions, true, false);
+            }
+            for (String suffix : extensions) {
+                Path candidate = allowedCandidate(
+                        parent.resolve(fileName + suffix), suffix, fileName, extensions, false, false);
+                if (candidate != null) {
+                    return candidate;
+                }
+            }
+            return null;
+        }
+        String path = environment.entrySet().stream()
+                .filter(entry -> entry.getKey().equalsIgnoreCase("PATH"))
+                .map(Map.Entry::getValue)
+                .findFirst().orElse("");
+        if (!extension.isEmpty()) {
+            for (String directory : path.split(";", -1)) {
+                if (directory.isBlank()) continue;
+                Path candidate = allowedCandidate(Path.of(directory).resolve(fileName), extension,
+                        fileName, extensions, true, true);
+                if (candidate != null) return candidate;
+            }
+            return null;
+        }
+        for (String directory : path.split(";", -1)) {
+            if (directory.isBlank()) continue;
+            for (String suffix : extensions) {
+                Path candidate = allowedCandidate(Path.of(directory).resolve(fileName + suffix), suffix,
+                        fileName, extensions, false, true);
+                if (candidate != null) return candidate;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * PATH 查询按输入顺序解析 `.exe` 并规范化父目录 junction；仅允许标准 npx `.cmd` 作为待映射候选。
+     * 显式路径仍拒绝链接别名，其它脚本格式保持不可执行。
+     */
+    private static Path allowedCandidate(Path candidate, String extension, String fileName,
+                                         List<String> pathExtensions, boolean exactExtension, boolean pathSearch)
+            throws IOException {
+        String normalizedExtension = extension.toLowerCase(Locale.ROOT);
+        if (!exactExtension && !pathExtensions.contains(normalizedExtension)) {
+            return null;
+        }
+        if (normalizedExtension.equals(".exe")) {
+            try {
+                Path executable = pathSearch
+                        ? regularPhysicalFileCandidate(candidate, "windows_process_executable_invalid")
+                        : checkedRegularFile(candidate, "windows_process_executable_invalid");
+                return isWindowsExecutable(executable) ? executable : null;
+            } catch (IOException ignored) {
+                return null;
+            }
+        }
+        if (pathSearch && normalizedExtension.equals(".cmd") && isNpxCommand(fileName)) {
+            if (!pathExtensions.contains(normalizedExtension)) return null;
+            try {
+                return regularPhysicalFileCandidate(candidate, "windows_process_npx_layout_invalid");
+            } catch (IOException ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * PATH 搜索可跨父目录 junction 解析到物理文件，但拒绝候选文件自身的链接或重解析点。
+     */
+    private static Path regularPhysicalFileCandidate(Path candidate, String errorCode) throws IOException {
+        Path absolute = candidate.toAbsolutePath().normalize();
+        if (!Files.exists(absolute, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(absolute)) {
+            throw new IOException(errorCode);
+        }
+        BasicFileAttributes attributes = Files.readAttributes(
+                absolute, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isRegularFile() || attributes.isOther()) {
+            throw new IOException(errorCode);
+        }
+        Path physical = absolute.toRealPath();
+        rejectLinkOrReparse(physical, errorCode);
+        return physical;
+    }
+
+    /**
+     * 校验 PATHEXT 中可见的扩展名顺序；缺失时采用 Windows 通用命令扩展名集合。
+     */
+    private static List<String> pathExtensions(Map<String, String> environment) {
+        String value = environment.entrySet().stream()
+                .filter(entry -> entry.getKey().equalsIgnoreCase("PATHEXT"))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(".COM;.EXE;.BAT;.CMD");
+        return java.util.Arrays.stream(value.split(";", -1))
+                .map(String::trim)
+                .filter(extension -> extension.matches("(?i)\\.[A-Z0-9]{1,16}"))
+                .map(extension -> extension.toLowerCase(Locale.ROOT))
+                .distinct()
+                .toList();
+    }
+
+    /**
+     * 按文件名判断是否为唯一允许的 npx shim，防止把任意 `.cmd` 扩大为可执行入口。
+     */
+    private static boolean isNpxCommand(String executable) {
+        Path fileName = Path.of(executable).getFileName();
+        if (fileName == null) return false;
+        String value = fileName.toString();
+        return value.equalsIgnoreCase("npx") || value.equalsIgnoreCase("npx.cmd");
+    }
+
+    /**
+     * 在使用 npx shim 引用的 Node/npm 文件前拒绝链接别名与非普通文件，避免 shim 映射绕过路径边界。
+     */
+    private static Path checkedRegularFile(Path path, String errorCode) throws IOException {
+        Path absolute = path.toAbsolutePath().normalize();
+        rejectLinkOrReparse(absolute, errorCode);
+        if (!Files.isRegularFile(absolute, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException(errorCode);
+        }
+        return absolute.toRealPath();
+    }
+
+    /**
+     * 读取可执行名称的最后扩展名；点号开头的命令名仍视为无扩展名。
+     */
+    private static String extension(String fileName) {
+        int dot = fileName.lastIndexOf('.');
+        return dot <= 0 ? "" : fileName.substring(dot).toLowerCase(Locale.ROOT);
     }
 
     /**
@@ -105,6 +303,9 @@ final class WindowsProcessLaunchPolicy {
             String name = entry.getKey();
             String value = entry.getValue();
             if (!isEnvironmentName(name) || value == null || value.indexOf('\0') >= 0) {
+                throw new IOException("windows_process_environment_invalid");
+            }
+            if (copy.containsKey(name)) {
                 throw new IOException("windows_process_environment_invalid");
             }
             copy.put(name, value);
@@ -203,45 +404,28 @@ final class WindowsProcessLaunchPolicy {
     }
 
     /**
-     * 只解析显式可执行文件或调用方提供的 PATH 白名单，不回退系统搜索。
+     * 只解析显式 `.exe` 或调用方环境中的 PATH/PATHEXT `.exe`，不回退系统搜索。
      */
     static String resolveExecutable(String executable, Map<String, String> environment)
             throws WindowsProcessNativeApi.WindowsFailure {
-        Path requested = Path.of(executable);
-        if (requested.isAbsolute()) {
-            try {
-                Path absolute = requested.toAbsolutePath().normalize();
-                rejectLinkOrReparse(absolute, "windows_process_executable_invalid");
-                if (isWindowsExecutable(absolute)) {
-                    return absolute.toRealPath().toString();
-                }
-            } catch (IOException ignored) {
-                throw new WindowsProcessNativeApi.WindowsFailure("executable_not_found", 2);
-            }
+        Path candidate;
+        try {
+            candidate = findExecutableCandidate(executable, environment);
+        } catch (IOException invalid) {
             throw new WindowsProcessNativeApi.WindowsFailure("executable_not_found", 2);
         }
-        if (requested.getNameCount() != 1 || executable.indexOf(':') >= 0
-            || executable.contains("/") || executable.contains("\\")) {
+        if (candidate == null) {
             throw new WindowsProcessNativeApi.WindowsFailure("executable_not_found", 2);
         }
-        String pathValue = environment.entrySet().stream()
-                .filter(entry -> entry.getKey().equalsIgnoreCase("PATH"))
-                .map(Map.Entry::getValue)
-                .findFirst()
-                .orElse("");
-        for (String directory : pathValue.split(";", -1)) {
-            if (directory.isBlank()) {
-                continue;
-            }
-            Path candidate = Path.of(directory).resolve(requested).toAbsolutePath().normalize();
-            try {
-                rejectLinkOrReparse(candidate, "windows_process_executable_invalid");
-                if (isWindowsExecutable(candidate)) {
-                    return candidate.toRealPath().toString();
-                }
-            } catch (IOException ignored) {
-                // 仅在显式 PATH 白名单中继续查找，不启用任何备用解析路径。
-            }
+        Path candidateName = candidate.getFileName();
+        if (candidateName == null || !candidateName.toString().toLowerCase(Locale.ROOT).endsWith(".exe")) {
+            throw new WindowsProcessNativeApi.WindowsFailure("executable_not_found", 2);
+        }
+        try {
+            rejectLinkOrReparse(candidate, "windows_process_executable_invalid");
+            if (isWindowsExecutable(candidate)) return candidate.toRealPath().toString();
+        } catch (IOException ignored) {
+            // 仅在显式 PATH/PATHEXT 中继续查找，不启用任何备用解析路径。
         }
         throw new WindowsProcessNativeApi.WindowsFailure("executable_not_found", 2);
     }
@@ -268,6 +452,13 @@ final class WindowsProcessLaunchPolicy {
             command = List.copyOf(command);
             workingDirectory = Objects.requireNonNull(workingDirectory, "workingDirectory");
             environment = Map.copyOf(environment);
+        }
+
+        /** 诊断不暴露 argv、cwd 或环境，避免宿主路径与 MCP 凭据进入普通日志。 */
+        @Override
+        public String toString() {
+            return "LaunchSpec[argumentCount=" + command.size()
+                    + ", environmentVariableCount=" + environment.size() + "]";
         }
     }
 }

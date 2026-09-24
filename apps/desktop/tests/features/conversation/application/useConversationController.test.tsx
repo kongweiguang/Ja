@@ -19,6 +19,7 @@ import type {
 const WORKSPACE: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_project",
+  legacySharedWorkspaceId: null,
   rootPath: "C:\\demo",
   displayName: "demo",
   trust: "trusted",
@@ -41,6 +42,8 @@ function thread(threadId: string): ConversationThread {
   return {
     threadId,
     workspaceId: WORKSPACE.workspaceId,
+    workspaceKind: "project",
+    legacySharedWorkspaceId: null,
     activeGoalId: null,
     preferences: {
       ...MODEL_SELECTION,
@@ -879,39 +882,44 @@ describe("useConversationController", () => {
     expect(result.current.threads).toHaveLength(1);
   });
 
-  /** 当前范围切换后不得保留其它 Workspace 的同名 Thread，避免点击“新对话”隐式切回旧范围。 */
-  it("切换 workspace 后最近对话只保留当前范围", async () => {
-    const generalWorkspace: WorkspaceProjection = {
-      kind: "general",
-      workspaceId: "ws_general",
-      rootPath: "C:\\data\\general",
-      displayName: "无项目",
+  /** 无项目空白展示全体 SESSION，但不能暗选旧 Thread；显式点击后才激活对应目录。 */
+  it("aggregates session history in blank scope and activates only after selection", async () => {
+    const sessionWorkspace: WorkspaceProjection = {
+      kind: "session",
+      workspaceId: "ws_session",
+      legacySharedWorkspaceId: "ws_legacy_shared",
+      rootPath: "C:\\data\\workspaces\\thr_session",
+      displayName: "会话目录",
       trust: "trusted",
     };
     const projectThread = thread("thr_project");
-    const generalThread = {
-      ...thread("thr_general"),
-      workspaceId: generalWorkspace.workspaceId,
+    const sessionThread: ConversationThread = {
+      ...thread("thr_session"),
+      workspaceId: sessionWorkspace.workspaceId,
+      workspaceKind: "session",
+      legacySharedWorkspaceId: sessionWorkspace.legacySharedWorkspaceId,
     };
+    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async (input) => ({
+      items: "workspaceKind" in input ? [sessionThread] : [projectThread],
+      nextCursor: null,
+    }));
+    const threadRead = vi.fn(async ({ threadId }: { threadId: string }) => ({
+      threadId,
+      revision: 0,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    }));
     const history: ConversationHistoryPort = {
       ...historyExtensions(),
-      threadList: vi.fn(async ({ workspaceId }) => ({
-        items: workspaceId === WORKSPACE.workspaceId ? [projectThread] : [generalThread],
-        nextCursor: null,
-      })),
+      threadList,
       threadCreate: vi.fn(async () => projectThread),
-      threadRead: vi.fn(async ({ threadId }) => ({
-        threadId,
-        revision: 0,
-        turns: [],
-        items: [],
-        inputQueue: null,
-        contextUsage: null,
-        liveStream: null,
-        taskActivities: [],
-        goalActivities: [],
-        nextCursor: null,
-      })),
+      threadRead,
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -921,8 +929,9 @@ describe("useConversationController", () => {
         inputTokensAfter: 0,
       })),
     };
+    const activateWorkspace = vi.fn(async () => sessionWorkspace);
     const { result, rerender } = renderHook(
-      ({ workspace, revision }: { workspace: WorkspaceProjection; revision: number }) =>
+      ({ workspace, revision }: { workspace: WorkspaceProjection | undefined; revision: number }) =>
         useConversationController({
           history,
           workspace,
@@ -930,16 +939,29 @@ describe("useConversationController", () => {
           modelSelection: MODEL_SELECTION,
           accessMode: "approval_required",
           runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
-          activateWorkspace: async () => undefined,
+          activateWorkspace,
         }),
-      { initialProps: { workspace: WORKSPACE, revision: 1 } },
+      { initialProps: { workspace: WORKSPACE as WorkspaceProjection | undefined, revision: 1 } },
     );
     await waitFor(() => expect(result.current.currentThreadId).toBe(projectThread.threadId));
 
-    rerender({ workspace: generalWorkspace, revision: 2 });
+    rerender({ workspace: undefined, revision: 2 });
 
-    await waitFor(() => expect(result.current.currentThreadId).toBe(generalThread.threadId));
-    expect(result.current.threads).toEqual([generalThread]);
+    await waitFor(() => expect(result.current.threads).toEqual([sessionThread]));
+    expect(result.current.currentThreadId).toBeUndefined();
+    expect(threadRead).toHaveBeenCalledTimes(1);
+    expect(threadList).toHaveBeenLastCalledWith({ workspaceKind: "session", limit: 200 });
+
+    await act(async () => result.current.select(sessionThread.threadId));
+
+    expect(activateWorkspace).toHaveBeenCalledExactlyOnceWith(sessionWorkspace.workspaceId);
+    expect(result.current.currentThreadId).toBe(sessionThread.threadId);
+
+    rerender({ workspace: sessionWorkspace, revision: 3 });
+    await waitFor(() => expect(result.current.currentThreadId).toBe(sessionThread.threadId));
+    rerender({ workspace: undefined, revision: 4 });
+    await waitFor(() => expect(result.current.currentThreadId).toBeUndefined());
+    expect(result.current.threads).toEqual([sessionThread]);
   });
 
   /** 热切只替换目录投影；正文和旧 workspace 的实时 Turn 必须留在共享 Timeline 中。 */
@@ -947,6 +969,7 @@ describe("useConversationController", () => {
     const otherWorkspace: WorkspaceProjection = {
       kind: "project",
       workspaceId: "ws_other_project",
+      legacySharedWorkspaceId: null,
       rootPath: "C:\\other",
       displayName: "other",
       trust: "trusted",
@@ -962,7 +985,8 @@ describe("useConversationController", () => {
     const otherRefresh = new Promise<void>((resolve) => {
       releaseOtherRefresh = resolve;
     });
-    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async ({ workspaceId }) => {
+    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async (input) => {
+      const workspaceId = "workspaceId" in input ? input.workspaceId : undefined;
       if (workspaceId === otherWorkspace.workspaceId) {
         otherListCalls += 1;
         if (otherListCalls === 2) await otherRefresh;
@@ -989,7 +1013,7 @@ describe("useConversationController", () => {
     };
     const runtimeState = { status: "ready" as const, generation: 1, serverInstanceId: "srv_1" };
     const { result, rerender } = renderHook(
-      ({ workspace, revision }: { workspace: WorkspaceProjection; revision: number }) =>
+      ({ workspace, revision }: { workspace: WorkspaceProjection | undefined; revision: number }) =>
         useConversationController({
           history,
           workspace,
@@ -1045,6 +1069,7 @@ describe("useConversationController", () => {
     const otherWorkspace: WorkspaceProjection = {
       kind: "project",
       workspaceId: "ws_race_other",
+      legacySharedWorkspaceId: null,
       rootPath: "C:\\race-other",
       displayName: "race-other",
       trust: "trusted",
@@ -1058,7 +1083,8 @@ describe("useConversationController", () => {
     const oldList = new Promise<void>((resolve) => {
       releaseOldList = resolve;
     });
-    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async ({ workspaceId }) => {
+    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async (input) => {
+      const workspaceId = "workspaceId" in input ? input.workspaceId : undefined;
       if (workspaceId === WORKSPACE.workspaceId) await oldList;
       return {
         items: workspaceId === WORKSPACE.workspaceId ? [oldThread] : [newThread],
@@ -1257,7 +1283,8 @@ describe("useConversationController", () => {
     const threadByWorkspace = new Map(
       threads.map((candidate) => [candidate.workspaceId, candidate]),
     );
-    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async ({ workspaceId }) => {
+    const threadList = vi.fn<ConversationHistoryPort["threadList"]>(async (input) => {
+      const workspaceId = "workspaceId" in input ? input.workspaceId : "session";
       const listed = threadByWorkspace.get(workspaceId);
       if (listed === undefined) throw new Error(`missing fixture for ${workspaceId}`);
       return { items: [listed], nextCursor: null };
@@ -1397,6 +1424,7 @@ describe("useConversationController", () => {
         result.current.threads.find((value) => value.threadId === existing.threadId),
       ).toMatchObject({ latestTurnStatus: "failed", latestTurnSeen: true, revision: 5 }),
     );
+    expect(useTimelineStore.getState().threadRevisionByThread[existing.threadId]).toBe(5);
   });
 
   /**

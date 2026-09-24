@@ -473,36 +473,6 @@ pub(crate) fn parse_workspace_path_search_result(
 }
 
 /// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
-/// 通过当前 Java session 发送无参数 general-workspace read，只返回对象结果供 Host 严格投影。
-pub(super) fn general_workspace_read_runtime(
-    config: &LaunchConfig,
-    runtime: &mut Option<RunningRuntime>,
-    exit_control: &ExitControl,
-) -> Result<Value, RuntimeCommandError> {
-    let current = runtime
-        .as_mut()
-        .ok_or_else(RuntimeCommandError::unavailable)?;
-    if let Some(session) = current.supervisor.session_for_cancellation() {
-        exit_control.attach_session(session);
-    }
-    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
-    let timeout = operation_timeout(config.request_timeout, exit_control)?;
-    let response = current
-        .supervisor
-        .request("workspace/open-general", json!({}), timeout)
-        .map_err(|error| RuntimeCommandError::from_process(&error))?;
-    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
-    if let Some(error) = value.get("error") {
-        return Err(command_error_from_rpc(error));
-    }
-    value
-        .get("result")
-        .cloned()
-        .filter(Value::is_object)
-        .ok_or_else(RuntimeCommandError::unavailable)
-}
-
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
 /// 通过普通 client request lane 发送 allowlist 内的 Skills/MCP 请求；已解析私有 snapshot
 /// 始终由 Java 持有。
 pub(super) fn settings_query_runtime(
@@ -614,6 +584,62 @@ pub(super) fn workspace_open_runtime(
     Ok(projection)
 }
 
+/// 通过 App Server 持久化 ID 重开目录；Rust 不接受 Renderer 传来的 root 或 workspace kind。
+pub(super) fn workspace_open_by_id_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    workspace_id: String,
+    exit_control: &ExitControl,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
+    if !workspace_id.starts_with("ws_") || !valid_id(&workspace_id, 99) {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    let current = runtime
+        .as_mut()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    if let Some(session) = current.supervisor.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let response = current
+        .supervisor
+        .request(
+            "workspace/open",
+            json!({"workspaceId": workspace_id}),
+            timeout,
+        )
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    let result = value
+        .get("result")
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    validate_workspace_open_by_id_result(result, &workspace_id)
+}
+
+/// 验证 ID-only 重开只能返回同一 Java identity 下的会话或旧共享目录。
+pub(crate) fn validate_workspace_open_by_id_result(
+    result: &Value,
+    expected_workspace_id: &str,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
+    let projection = super::parse_workspace_projection(result.clone())?;
+    if projection.workspace_id != expected_workspace_id
+        || !matches!(
+            projection.kind,
+            WorkspaceKind::Session | WorkspaceKind::LegacyShared
+        )
+    {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    // Do not compare Java's toRealPath spelling with Rust PathBuf spelling: Windows may represent
+    // one physical root with an extended prefix, case variation, or 8.3 alias. WorkspaceRegistry
+    // performs canonicalization plus reparse/physical-identity checks before any capability use.
+    Ok(projection)
+}
+
 /// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
 /// 验证 Java 权威 Workspace 投影，但不要求重复打开回显 caller 的 display-name 建议；Java 会保留
 /// 首次注册名称，而 root identity 是必须匹配的 native capability 边界。
@@ -621,56 +647,17 @@ pub(crate) fn validate_workspace_open_result(
     result: &Value,
     expected_root: &std::path::Path,
 ) -> Result<WorkspaceDto, RuntimeCommandError> {
-    let result = result
-        .as_object()
-        .filter(|result| {
-            result.len() == 5
-                && ["workspaceId", "root", "displayName", "trust", "revision"]
-                    .iter()
-                    .all(|key| result.contains_key(*key))
-        })
-        .ok_or_else(RuntimeCommandError::unavailable)?;
-    let display_name = result
-        .get("displayName")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty() && value.len() <= 1_024 && !value.contains('\0'))
-        .ok_or_else(RuntimeCommandError::unavailable)?
-        .to_owned();
-    let returned_trust = result
-        .get("trust")
-        .and_then(Value::as_str)
-        .filter(|value| matches!(*value, "trusted" | "untrusted"))
-        .ok_or_else(RuntimeCommandError::unavailable)?
-        .to_owned();
-    let revision = result
-        .get("revision")
-        .and_then(Value::as_u64)
-        .filter(|revision| *revision <= 9_007_199_254_740_991)
-        .ok_or_else(RuntimeCommandError::unavailable)?;
-    let workspace_id = result
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .filter(|value| value.starts_with("ws_") && valid_id(value, 99))
-        .ok_or_else(RuntimeCommandError::unavailable)?
-        .to_owned();
-    let returned_root_value = result
-        .get("root")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 4_096)
-        .ok_or_else(RuntimeCommandError::unavailable)?;
-    let returned_root = std::fs::canonicalize(PathBuf::from(returned_root_value))
+    let projection = super::parse_workspace_projection(result.clone())?;
+    if projection.kind != WorkspaceKind::Project {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let returned_root = std::fs::canonicalize(PathBuf::from(&projection.root))
         .ok()
         .ok_or_else(RuntimeCommandError::unavailable)?;
     if returned_root != expected_root {
         return Err(RuntimeCommandError::configuration());
     }
-    Ok(WorkspaceDto {
-        workspace_id,
-        root: returned_root_value.to_owned(),
-        display_name,
-        trust: returned_trust,
-        revision,
-    })
+    Ok(projection)
 }
 
 /// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
@@ -856,6 +843,65 @@ pub(super) fn turn_runtime(
         return Err(command_error_from_rpc(error));
     }
     parse_turn_accepted_result(&value, None, false)
+}
+
+/// Continue 与 Reask 共用 accepted 回执但仍是独立固定 command；请求进入受管 session 前拒绝闭集外方法。
+fn turn_admission_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    method: &'static str,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<TurnAccepted, RuntimeCommandError> {
+    if !matches!(method, "turn/continue" | "turn/reask") {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    let Some(current) = runtime.as_mut() else {
+        return Err(RuntimeCommandError {
+            code: "RUNTIME_NOT_READY",
+            message: "runtime is not ready",
+            retryable: true,
+        });
+    };
+    if let Some(session) = current.supervisor.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    let _ = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .filter(|value| valid_id(value, 100))
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let response = current
+        .supervisor
+        .request(method, params, timeout)
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    parse_turn_accepted_result(&value, None, false)
+}
+
+/// `turn/continue` 在最后一个未答问题下准入隐藏 Turn；当前路径查询归 Java，Rust 不发送合成消息或源选择器。
+pub(super) fn turn_continue_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<TurnAccepted, RuntimeCommandError> {
+    turn_admission_runtime(config, runtime, "turn/continue", params, exit_control)
+}
+
+/// `turn/reask` 将当前路径切换交给 Java 源 item CAS；native 只校验并传输替换提问，不回滚外部文件操作。
+pub(super) fn turn_reask_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<TurnAccepted, RuntimeCommandError> {
+    turn_admission_runtime(config, runtime, "turn/reask", params, exit_control)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1659,6 +1705,11 @@ pub(crate) fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
         Some("TURN_NOT_FOUND") => RuntimeCommandError {
             code: "TURN_NOT_FOUND",
             message: "turn was not found",
+            retryable: false,
+        },
+        Some("TURN_NOT_REASKABLE") => RuntimeCommandError {
+            code: "TURN_NOT_REASKABLE",
+            message: "turn cannot be edited",
             retryable: false,
         },
         Some("THREAD_READ_ONLY") => RuntimeCommandError {

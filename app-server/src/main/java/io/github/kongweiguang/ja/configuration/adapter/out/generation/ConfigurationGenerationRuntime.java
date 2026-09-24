@@ -67,6 +67,10 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
             ConfigurationRuntimeState.ReadResult read = reader.apply(canonical, auth);
             List<ConfigGeneration.Diagnostic> diagnostics =
                     new ArrayList<>(read.diagnostics());
+            if (read.issues().stream().anyMatch(issue -> "project".equals(issue.scope())
+                    && ("mcp_servers".equals(issue.field()) || "cfg_project_file".equals(issue.id())))) {
+                diagnostics.add(new ConfigGeneration.Diagnostic("PROJECT_MCP_ISSUE", false));
+            }
             String selectedProvider = selectProvider(read.effective());
             if (selectedProvider == null) {
                 /*
@@ -100,7 +104,7 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
                     canonical == null ? null : canonical.toString(), read.user().version(),
                     read.project().version(), (ObjectNode) read.effective(),
                     credentialStatusFlags(auth.secretIds()), diagnostics, read.trusted(), secrets,
-                    skills, mcpServers, catalogDigest, this::forgetGeneration);
+                    skills, mcpServers, read.projectMcpIds(), catalogDigest, this::forgetGeneration);
             generationCreated = true;
             generations.add(generation);
             ConfigGeneration previous = currentGenerations.put(generationKey, generation);

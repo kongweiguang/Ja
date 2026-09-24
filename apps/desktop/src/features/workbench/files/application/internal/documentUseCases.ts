@@ -13,7 +13,7 @@ import type { ControllerRef, StateWriter } from "./controllerPorts";
 export type ExternalRefreshMode = "auto" | "conflict" | "force";
 
 export interface DocumentUseCases {
-  openDocument: (path: string, reveal?: { line: number; column?: number }) => Promise<void>;
+  openDocument: (path: string, reveal?: { line: number; column?: number }) => Promise<boolean>;
   saveDocumentOnce: (path: string) => Promise<boolean>;
   flushDocument: (path: string) => Promise<void>;
   scheduleSave: (path: string) => void;
@@ -72,7 +72,7 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
   async function openDocument(
     path: string,
     reveal?: { line: number; column?: number },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const existing = context.documents.current[path];
     if (existing !== undefined) {
       context.setActivePath(path);
@@ -82,7 +82,7 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
           const document = current[path];
           return document === undefined ? current : { ...current, [path]: { ...document, reveal } };
         });
-      return;
+      return true;
     }
     context.setSelectedPath(path);
     const generation = context.workspaceGeneration.current;
@@ -91,7 +91,7 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
         workspaceId: context.workspaceId,
         relativePath: path,
       });
-      if (generation !== context.workspaceGeneration.current) return;
+      if (generation !== context.workspaceGeneration.current) return false;
       const document = documentFromRead(result, reveal);
       context.revisions.current.set(path, document.revision);
       context.commitDocuments((current) =>
@@ -101,8 +101,10 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
         current.includes(path) ? current : [...current, path],
       );
       context.setActivePath(path);
+      return true;
     } catch {
       context.onNotice?.("文件读取失败，请重试。");
+      return false;
     }
   }
 

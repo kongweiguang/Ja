@@ -3,13 +3,13 @@
 
 // 冻结 JA-RPC v1 history 方法的 typed、有界 Tauri adapter。
 
-use super::dto::{InputQueueDto, TaskActivityDto, TaskSummaryDto};
+use super::dto::{InputQueueDto, TaskActivityDto, TaskSummaryDto, WorkspaceKindDto};
 use crate::app_runtime::{
     HistoryRequest, HistoryResponse, RuntimeCommandError, RuntimeHost, ThreadArchiveParams,
     ThreadCompactParams, ThreadCreateParams, ThreadDeleteParams, ThreadDiscoverParams,
-    ThreadListParams, ThreadPinParams, ThreadPreferencesUpdateParams, ThreadReadParams,
-    ThreadRenameParams, ThreadRestoreParams, ThreadSearchParams, ThreadSeenParams,
-    ThreadUsageReadParams, WorkspaceListParams,
+    ThreadListParams, ThreadMcpReadParams, ThreadPinParams, ThreadPreferencesUpdateParams,
+    ThreadReadParams, ThreadRenameParams, ThreadRestoreParams, ThreadSearchParams,
+    ThreadSeenParams, ThreadUsageReadParams, WorkspaceListParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -30,6 +30,7 @@ pub(crate) enum HistoryMethod {
     ThreadSearch,
     ThreadRead,
     ThreadUsageRead,
+    ThreadMcpRead,
     ThreadRename,
     ThreadPin,
     ThreadSeen,
@@ -64,6 +65,9 @@ pub(crate) fn request_history(
         HistoryMethod::ThreadUsageRead => {
             HistoryRequest::ThreadUsageRead(ThreadUsageReadParams::try_new(bytes)?)
         }
+        HistoryMethod::ThreadMcpRead => {
+            HistoryRequest::ThreadMcpRead(ThreadMcpReadParams::try_new(bytes)?)
+        }
         HistoryMethod::ThreadRename => {
             HistoryRequest::ThreadRename(ThreadRenameParams::try_new(bytes)?)
         }
@@ -96,6 +100,7 @@ pub(crate) fn request_history(
         (HistoryMethod::ThreadUsageRead, HistoryResponse::ThreadUsageRead(value)) => {
             value.into_bytes()
         }
+        (HistoryMethod::ThreadMcpRead, HistoryResponse::ThreadMcpRead(value)) => value.into_bytes(),
         (HistoryMethod::ThreadRename, HistoryResponse::ThreadRename(value)) => value.into_bytes(),
         (HistoryMethod::ThreadPin, HistoryResponse::ThreadPin(value)) => value.into_bytes(),
         (HistoryMethod::ThreadSeen, HistoryResponse::ThreadSeen(value)) => value.into_bytes(),
@@ -138,12 +143,26 @@ pub struct PageInput {
     pub limit: Option<u32>,
 }
 
-/// Thread page 始终限定到一个 Java-issued Workspace identity；其它 Workspace 消耗有界首页后，
-/// global page 无法再提供完整的逐项目 history。
+/// Workspace discovery accepts only a closed server-side kind filter so pagination cannot hide later roots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceListInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<WorkspaceKindDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Project 与无项目 Session page 使用互斥 Java filters，保证完整历史只按权威目录归属分页。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadListInput {
-    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,11 +184,14 @@ pub struct ThreadDiscoverInput {
     pub workspace_id: Option<String>,
 }
 
-/// 搜索只限定当前 Workspace 的标题；空 query 由 Java 解释为最近会话，Rust 不扩展到正文或文件。
+/// 搜索只限定项目或 session-kind 的标题；空 query 由 Java 解释为最近会话，Rust 不扩展到正文或文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadSearchInput {
-    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_kind: Option<String>,
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
@@ -181,7 +203,11 @@ pub struct ThreadSearchInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadCreateInput {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_null_string"
+    )]
     pub cwd: Option<String>,
     pub title: String,
     pub provider_id: String,
@@ -190,6 +216,14 @@ pub struct ThreadCreateInput {
     pub reasoning_level: Option<String>,
     pub access_mode: String,
     pub collaboration_mode: String,
+}
+
+/// Distinguish an omitted session cwd from explicit null so only omission selects Java's session creation path.
+fn deserialize_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 /// 读取一页权威 Thread snapshot，不重放 event journal。
@@ -207,6 +241,13 @@ pub struct ThreadReadInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadUsageReadInput {
+    pub thread_id: String,
+}
+
+/// Read-only MCP status is scoped to a Java-issued Thread identity; it cannot choose config or workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadMcpReadInput {
     pub thread_id: String,
 }
 
@@ -272,6 +313,9 @@ pub struct WorkspaceListResult {
 pub struct ThreadDto {
     pub thread_id: String,
     pub workspace_id: String,
+    pub workspace_kind: WorkspaceKindDto,
+    #[serde(deserialize_with = "required_nullable")]
+    pub legacy_shared_workspace_id: Option<String>,
     #[serde(deserialize_with = "required_nullable")]
     pub preferences: Option<ThreadPreferencesDto>,
     pub title: String,
@@ -396,6 +440,34 @@ pub struct ThreadUsageSummary {
     pub cache_complete_read_tokens: u64,
 }
 
+/// Thread-scoped MCP observation excludes endpoints, configuration material, and full tool schemas.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadMcpStatusResult {
+    pub thread_id: String,
+    pub source: String,
+    pub notices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    pub servers: Vec<ThreadMcpServerDto>,
+}
+
+/// One redacted MCP row carries only identity, user-visible state, an optional known count, and a stable code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadMcpServerDto {
+    pub server_id: String,
+    pub name: String,
+    pub scope: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
 /// 主 Thread 快照把低频 Activity 与同一时刻的 Task 摘要绑定，避免 UI 再做全树扫描。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -457,6 +529,9 @@ pub struct ProviderRequestProfileDto {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadSnapshotTurnDto {
     pub turn_id: String,
+    /// 普通问题与重新提问保持 null；只有隐藏 continuation 指向原 USER item，避免重复投影可见问题。
+    #[serde(deserialize_with = "required_nullable")]
+    pub source_message_id: Option<String>,
     pub status: String,
     pub requested_at: String,
     pub updated_at: String,
@@ -596,10 +671,24 @@ pub(super) fn validate_page(input: &PageInput) -> Result<(), RuntimeCommandError
     validate_pagination(&input.cursor, input.limit)
 }
 
+/// Workspace kind 由闭集 DTO 约束；此处只校验分页，避免无界查询隐藏后续目录。
+pub(crate) fn validate_workspace_list(
+    input: &WorkspaceListInput,
+) -> Result<(), RuntimeCommandError> {
+    validate_pagination(&input.cursor, input.limit)
+}
+
 /// 设计原因：该函数集中维护 History DTO 的边界与完整性，避免 command 重复协议判断。
 /// Thread metadata 到达 actor 前校验 Workspace identity 与共享分页上限。
 pub(crate) fn validate_thread_list(input: &ThreadListInput) -> Result<(), RuntimeCommandError> {
-    validate_prefixed(&input.workspace_id, "ws_", 100)?;
+    match (
+        input.workspace_id.as_deref(),
+        input.workspace_kind.as_deref(),
+    ) {
+        (Some(workspace_id), None) => validate_prefixed(workspace_id, "ws_", 100)?,
+        (None, Some("session")) => {}
+        _ => return Err(RuntimeCommandError::invalid_params()),
+    }
     validate_pagination(&input.cursor, input.limit)
 }
 
@@ -625,9 +714,16 @@ pub(crate) fn validate_thread_discover(
     Ok(())
 }
 
-/// 搜索沿用 Thread page 的 Workspace/cursor 约束，并把 query 限制为有界单行标题片段。
+/// 搜索沿用 Thread page 的 Workspace/cursor 约束；session 分支只允许 Java 固定 kind，避免路径身份由 renderer 提交。
 pub(crate) fn validate_thread_search(input: &ThreadSearchInput) -> Result<(), RuntimeCommandError> {
-    validate_prefixed(&input.workspace_id, "ws_", 100)?;
+    match (
+        input.workspace_id.as_deref(),
+        input.workspace_kind.as_deref(),
+    ) {
+        (Some(workspace_id), None) => validate_prefixed(workspace_id, "ws_", 100)?,
+        (None, Some("session")) => {}
+        _ => return Err(RuntimeCommandError::invalid_params()),
+    }
     validate_pagination(&input.cursor, input.limit)?;
     if input.query.len() > 256 || input.query.chars().any(char::is_control) {
         return Err(RuntimeCommandError::invalid_params());
@@ -708,6 +804,13 @@ pub(crate) fn validate_thread_usage_read(
     validate_prefixed(&input.thread_id, "thr_", 100)
 }
 
+/// MCP 状态读取限定在真实 Thread 身份内，保持读取无连接副作用并避免跨会话状态串用。
+pub(crate) fn validate_thread_mcp_read(
+    input: &ThreadMcpReadInput,
+) -> Result<(), RuntimeCommandError> {
+    validate_prefixed(&input.thread_id, "thr_", 100)
+}
+
 /// 解析并限制严格的 Workspace page，旧列表键会在反序列化前被拒绝。
 pub(crate) fn parse_workspace_page(
     value: Value,
@@ -722,6 +825,8 @@ pub(crate) fn parse_workspace_page(
                 || workspace.display_name.len() > MAX_TITLE
                 || !matches!(workspace.trust.as_str(), "trusted" | "untrusted")
                 || workspace.revision > MAX_SAFE_INTEGER
+                || workspace.legacy_shared_workspace_id.is_some()
+                    && workspace.kind != WorkspaceKindDto::Session
         })
     {
         return Err(RuntimeCommandError::unavailable());
@@ -738,6 +843,8 @@ pub(crate) fn parse_thread(value: Value) -> Result<ThreadDto, RuntimeCommandErro
         &[
             "threadId",
             "workspaceId",
+            "workspaceKind",
+            "legacySharedWorkspaceId",
             "preferences",
             "title",
             "status",
@@ -989,6 +1096,115 @@ pub(crate) fn parse_thread_usage_summary(
     Ok(result)
 }
 
+/// 只解析脱敏状态合同并核对请求 Thread identity，防止错误会话结果串入当前面板。
+pub(crate) fn parse_thread_mcp_status(
+    value: Value,
+    expected_thread_id: &str,
+) -> Result<ThreadMcpStatusResult, RuntimeCommandError> {
+    let object = value
+        .as_object()
+        .filter(|object| {
+            exact_keys_allowing(
+                object,
+                &["threadId", "source", "notices", "servers"],
+                &["catalogRevision", "observedAt"],
+            )
+        })
+        .ok_or_else(|| history_response_rejected("thread_mcp_root"))?;
+    if !optional_value(object.get("catalogRevision"), valid_identifier_value)
+        || !optional_value(object.get("observedAt"), valid_timestamp_value)
+    {
+        return Err(history_response_rejected("thread_mcp_metadata"));
+    }
+    let rows = object
+        .get("servers")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() <= 200)
+        .ok_or_else(|| history_response_rejected("thread_mcp_servers"))?;
+    let mut server_ids = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let server = row
+            .as_object()
+            .filter(|server| {
+                exact_keys_allowing(
+                    server,
+                    &["serverId", "name", "scope", "state"],
+                    &["toolCount", "reasonCode"],
+                )
+            })
+            .ok_or_else(|| history_response_rejected("thread_mcp_server_shape"))?;
+        let valid_count = optional_value(server.get("toolCount"), |count| {
+            count.as_u64().is_some_and(|count| count <= 10_000)
+        });
+        let valid_reason = optional_value(server.get("reasonCode"), |reason| {
+            reason.as_str().is_some_and(valid_error_code)
+        });
+        let server_id = server.get("serverId").and_then(Value::as_str);
+        let state = server.get("state").and_then(Value::as_str);
+        if !server_id.is_some_and(|server_id| validate_prefixed(server_id, "mcp_", 100).is_ok())
+            || !server.get("name").is_some_and(valid_mcp_server_name)
+            || !matches!(
+                server.get("scope").and_then(Value::as_str),
+                Some("global" | "project")
+            )
+            || !state.is_some_and(|state| {
+                matches!(
+                    state,
+                    "available"
+                        | "unavailable"
+                        | "disabled"
+                        | "not_discovered"
+                        | "not_exposed"
+                        | "stale"
+                )
+            })
+            || !valid_count
+            || !valid_reason
+            || !server_ids.insert(server_id.unwrap_or_default().to_owned())
+        {
+            return Err(history_response_rejected("thread_mcp_server_semantics"));
+        }
+    }
+    let result: ThreadMcpStatusResult = serde_json::from_value(value)
+        .map_err(|_| history_response_rejected("thread_mcp_decode"))?;
+    if validate_prefixed(&result.thread_id, "thr_", 100).is_err()
+        || result.thread_id != expected_thread_id
+        || !matches!(
+            result.source.as_str(),
+            "active" | "last_observed" | "unchecked" | "stale"
+        )
+        || result.catalog_revision.as_deref().is_some_and(|revision| {
+            revision.is_empty()
+                || revision.len() > 256
+                || !revision.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+                })
+        })
+        || result
+            .observed_at
+            .as_deref()
+            .is_some_and(|observed_at| !valid_timestamp(observed_at))
+        || result.servers.len() > 200
+        || result.notices.len() > 3
+        || result.notices.iter().any(|notice| {
+            !matches!(
+                notice.as_str(),
+                "configuration_changed" | "project_untrusted" | "project_config_error"
+            )
+        })
+        || result.servers.iter().any(|server| {
+            server.tool_count.is_some_and(|count| count > 10_000)
+                || server
+                    .reason_code
+                    .as_deref()
+                    .is_some_and(|reason| !valid_error_code(reason))
+        })
+    {
+        return Err(history_response_rejected("thread_mcp_semantics"));
+    }
+    Ok(result)
+}
+
 /// Goal 终态按 SQLite 全局 event sequence 升序且 identity 唯一，避免重载后卡片重排或重复。
 fn validate_thread_goal_activities(value: Option<&Value>) -> Result<(), RuntimeCommandError> {
     let entries = value
@@ -1071,6 +1287,7 @@ fn valid_snapshot_turn_wire(value: &Value) -> bool {
             turn,
             &[
                 "turnId",
+                "sourceMessageId",
                 "status",
                 "requestedAt",
                 "updatedAt",
@@ -1078,7 +1295,9 @@ fn valid_snapshot_turn_wire(value: &Value) -> bool {
                 "changeSet",
                 "errorCode",
             ],
-        ) && turn
+        ) && turn.get("sourceMessageId").is_some_and(|source| {
+            source.is_null() || validate_prefixed_value(Some(source), "item_", 101)
+        }) && turn
             .get("completedAt")
             .is_some_and(|completed| completed.is_null() || valid_timestamp_value(completed))
             && turn.get("errorCode").is_some_and(|error| {
@@ -1570,6 +1789,10 @@ fn validate_snapshot_turn(turn: &ThreadSnapshotTurnDto) -> Result<(), RuntimeCom
     ) || !valid_timestamp(&turn.requested_at)
         || !valid_timestamp(&turn.updated_at)
         || turn
+            .source_message_id
+            .as_ref()
+            .is_some_and(|value| validate_prefixed(value, "item_", 101).is_err())
+        || turn
             .completed_at
             .as_ref()
             .is_some_and(|value| !valid_timestamp(value))
@@ -1741,6 +1964,13 @@ fn valid_error_code(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_digit() || ch.is_ascii_uppercase())
 }
 
+/// MCP server names follow the configuration's 512 UTF-16 unit budget; CR/LF remain ordinary escaped JSON text.
+fn valid_mcp_server_name(value: &Value) -> bool {
+    value.as_str().is_some_and(|name| {
+        (1..=512).contains(&name.encode_utf16().count()) && !name.contains('\0')
+    })
+}
+
 /// 严格解析手动压缩结果并绑定 outcome 与 nullable identity/token 关系，拒绝半成功投影。
 pub(crate) fn parse_thread_compact(
     value: Value,
@@ -1809,6 +2039,19 @@ fn validate_thread(thread: &ThreadDto) -> Result<(), RuntimeCommandError> {
         .map_err(|_| RuntimeCommandError::unavailable())?;
     validate_prefixed(&thread.workspace_id, "ws_", 99)
         .map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(workspace_id) = thread.legacy_shared_workspace_id.as_deref() {
+        validate_prefixed(workspace_id, "ws_", 99)
+            .map_err(|_| RuntimeCommandError::unavailable())?;
+        if thread.workspace_kind != WorkspaceKindDto::Session {
+            return Err(RuntimeCommandError::unavailable());
+        }
+    }
+    if !matches!(
+        thread.workspace_kind,
+        WorkspaceKindDto::Project | WorkspaceKindDto::Session | WorkspaceKindDto::LegacyShared
+    ) {
+        return Err(RuntimeCommandError::unavailable());
+    }
     if let Some(preferences) = &thread.preferences {
         validate_runtime_preferences(
             &preferences.provider_id,
@@ -2056,6 +2299,9 @@ pub struct WorkspaceWireDto {
     pub display_name: String,
     pub trust: String,
     pub revision: u64,
+    pub kind: super::dto::WorkspaceKindDto,
+    #[serde(deserialize_with = "required_nullable")]
+    pub legacy_shared_workspace_id: Option<String>,
 }
 
 impl From<crate::app_runtime::domain::WorkspaceDto> for WorkspaceWireDto {
@@ -2067,6 +2313,8 @@ impl From<crate::app_runtime::domain::WorkspaceDto> for WorkspaceWireDto {
             display_name: value.display_name,
             trust: value.trust,
             revision: value.revision,
+            kind: value.kind.into(),
+            legacy_shared_workspace_id: value.legacy_shared_workspace_id,
         }
     }
 }

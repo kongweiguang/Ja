@@ -19,6 +19,8 @@ const BASE_SNAPSHOT = {
   load_status: "loading",
   url: "https://example.com/",
   title: "Example",
+  can_go_back: false,
+  can_go_forward: false,
   window: { label: "preview_22222222222222222222222222222222", url: "https://example.com/" },
   dropped_events: 0,
 };
@@ -182,5 +184,181 @@ describe("TauriPreviewAdapter", () => {
       code: "invalid_response",
       message: "预览返回数据无效",
     });
+  });
+
+  /** 隐藏创建与本机目标只通过专用 typed commands 传递，裸本机路径不进入 navigate。 */
+  it("maps blank/local page commands and canonical file resolution DTOs", async () => {
+    const blankSnapshot = {
+      ...BASE_SNAPSHOT,
+      url: "about:blank",
+      title: "",
+      window: { label: "preview_blank", url: "about:blank" },
+    };
+    const fileUrl = "file:///C:/workspace/%E9%A1%B5%E9%9D%A2.html";
+    const localSnapshot = {
+      ...BASE_SNAPSHOT,
+      url: fileUrl,
+      window: { label: "preview_local", url: fileUrl },
+    };
+    const resolution = {
+      canonicalPath: "C:\\workspace\\页面.html",
+      displayName: "页面.html",
+      workspaceId: "ws_fixture",
+      workspaceRelativePath: "页面.html",
+      withinWorkspace: true,
+      kind: "browser",
+      mimeType: "text/html",
+      fileUrl,
+      content: null,
+      truncated: false,
+      line: 2,
+      column: 4,
+      readOnly: true,
+    };
+    const { bridge, calls } = bridgeWith({
+      [JA_PREVIEW_COMMANDS.openBlank]: {
+        snapshot: blankSnapshot,
+        window: blankSnapshot.window,
+      },
+      [JA_PREVIEW_COMMANDS.resolveFile]: resolution,
+      [JA_PREVIEW_COMMANDS.openFile]: { snapshot: localSnapshot, window: localSnapshot.window },
+      [JA_PREVIEW_COMMANDS.navigateFile]: { ...localSnapshot, generation: 2 },
+      [JA_PREVIEW_COMMANDS.goBack]: {
+        ...localSnapshot,
+        generation: 3,
+        can_go_back: false,
+        can_go_forward: true,
+      },
+      [JA_PREVIEW_COMMANDS.goForward]: {
+        ...localSnapshot,
+        generation: 4,
+        can_go_back: true,
+        can_go_forward: false,
+      },
+      [JA_PREVIEW_COMMANDS.reload]: { ...localSnapshot, generation: 5 },
+    });
+    const adapter = new TauriPreviewAdapter(bridge);
+    const hiddenViewport = { ...VIEWPORT, visible: false };
+
+    await expect(adapter.openBlank(hiddenViewport)).resolves.toMatchObject({
+      snapshot: { url: "about:blank" },
+    });
+    await expect(adapter.resolveFile("页面.html", "ws_fixture", 2, 4)).resolves.toEqual(resolution);
+    await expect(
+      adapter.openFile("页面.html", "ws_fixture", hiddenViewport),
+    ).resolves.toMatchObject({
+      snapshot: { url: fileUrl },
+    });
+    await adapter.navigateFile(SESSION_ID, 1, "页面.html", "ws_fixture");
+    await adapter.goBack(SESSION_ID, 2);
+    await adapter.goForward(SESSION_ID, 3);
+    await adapter.reload(SESSION_ID, 4);
+
+    expect(calls.map((call) => call.command)).toEqual([
+      JA_PREVIEW_COMMANDS.openBlank,
+      JA_PREVIEW_COMMANDS.resolveFile,
+      JA_PREVIEW_COMMANDS.openFile,
+      JA_PREVIEW_COMMANDS.navigateFile,
+      JA_PREVIEW_COMMANDS.goBack,
+      JA_PREVIEW_COMMANDS.goForward,
+      JA_PREVIEW_COMMANDS.reload,
+    ]);
+    expect(calls[0]?.args).toEqual({ input: { viewport: hiddenViewport } });
+    expect(calls[1]?.args).toEqual({
+      input: { target: "页面.html", workspaceId: "ws_fixture", line: 2, column: 4 },
+    });
+    expect(calls[2]?.args).toEqual({
+      input: { target: "页面.html", workspaceId: "ws_fixture", viewport: hiddenViewport },
+    });
+    expect(calls[3]?.args).toEqual({
+      input: {
+        sessionId: SESSION_ID,
+        generation: 1,
+        target: "页面.html",
+        workspaceId: "ws_fixture",
+      },
+    });
+  });
+
+  /** Ctrl+点击只发送固定 reveal command，异常不回显本机路径。 */
+  it("reveals a file through the typed native command", async () => {
+    const { bridge, calls } = bridgeWith({ [JA_PREVIEW_COMMANDS.revealFile]: null });
+    const adapter = new TauriPreviewAdapter(bridge);
+    await adapter.revealFile("C:\\资料 空间\\图.svg", "ws_fixture");
+    expect(calls).toEqual([
+      {
+        command: JA_PREVIEW_COMMANDS.revealFile,
+        args: { input: { target: "C:\\资料 空间\\图.svg", workspaceId: "ws_fixture" } },
+      },
+    ]);
+    await expect(adapter.revealFile("")).rejects.toMatchObject({ code: "invalid_input" });
+    expect(calls).toHaveLength(1);
+  });
+
+  /** history/action-blocked event DTO 与 Rust snake_case wire shape 保持严格一致。 */
+  it("accepts native history and blocked-popup/download events", async () => {
+    let eventHandler: ((payload: unknown) => void) | undefined;
+    const bridge: PreviewNativeBridge = {
+      invoke: async () => [],
+      listen: async (_event, handler) => {
+        eventHandler = handler;
+        return () => undefined;
+      },
+    };
+    const events: unknown[] = [];
+    await new TauriPreviewAdapter(bridge).subscribe((event) => events.push(event));
+    eventHandler?.({
+      session_id: SESSION_ID,
+      generation: 1,
+      sequence: 1,
+      kind: { type: "history_changed", can_go_back: true, can_go_forward: false },
+    });
+    eventHandler?.({
+      session_id: SESSION_ID,
+      generation: 1,
+      sequence: 2,
+      kind: { type: "action_blocked", action: "popup" },
+    });
+    eventHandler?.({
+      session_id: SESSION_ID,
+      generation: 1,
+      sequence: 3,
+      kind: { type: "action_blocked", action: "download" },
+    });
+
+    expect(events).toEqual([
+      {
+        session_id: SESSION_ID,
+        generation: 1,
+        sequence: 1,
+        kind: { type: "history_changed", can_go_back: true, can_go_forward: false },
+      },
+      {
+        session_id: SESSION_ID,
+        generation: 1,
+        sequence: 2,
+        kind: { type: "action_blocked", action: "popup" },
+      },
+      {
+        session_id: SESSION_ID,
+        generation: 1,
+        sequence: 3,
+        kind: { type: "action_blocked", action: "download" },
+      },
+    ]);
+  });
+
+  /** 本机目标稳定错误码转为固定中文，不允许 command rejection 回显敏感路径。 */
+  it("maps native file errors to static redacted messages", async () => {
+    const bridge: PreviewNativeBridge = {
+      invoke: async () => {
+        throw { code: "FileNotFound", path: "C:\\private\\secret.html" };
+      },
+      listen: async () => () => undefined,
+    };
+
+    await expect(
+      new TauriPreviewAdapter(bridge).resolveFile("missing.html", "ws_fixture"),
+    ).rejects.toMatchObject({ code: "file_not_found", message: "文件不存在或已被移动。" });
   });
 });

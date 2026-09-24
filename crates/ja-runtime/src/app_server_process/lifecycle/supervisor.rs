@@ -696,6 +696,22 @@ pub(crate) fn validate_turn_identity(
                         .is_some_and(|millis| (1_000..=86_400_000).contains(&millis))
                 })
         }
+        "turn/continue" => {
+            exact_keys(&["threadId", "expectedThreadRevision"])
+                && valid_id("threadId", "thr_", 100)
+                && valid_revision("expectedThreadRevision")
+        }
+        "turn/reask" => {
+            exact_keys(&[
+                "threadId",
+                "expectedThreadRevision",
+                "sourceMessageId",
+                "content",
+            ]) && valid_id("threadId", "thr_", 100)
+                && valid_revision("expectedThreadRevision")
+                && valid_id("sourceMessageId", "item_", 101)
+                && valid_turn_content(object.get("content"))
+        }
         "turn/cancel" => exact_keys(&["turnId"]) && valid_id("turnId", "turn_", 101),
         "turn/input/enqueue" => {
             exact_keys(&["turnId", "content"])
@@ -746,9 +762,29 @@ pub(crate) fn validate_turn_identity(
                 )
                 && valid_revision("expectedThreadRevision")
         }
-        // General Workspace identity 由 Java 读取并持有；这里固定 params 为空对象，
-        // 防止调用方借共享 request lane 夹带 cwd 或 ID。
-        "workspace/open-general" => object.is_empty(),
+        // Java 只允许按 ID 重开已登记的会话/旧共享目录；项目仍由 native 校验过的 cwd 注册。
+        // 互斥的精确字段集防止调用方混用绝对路径、kind 或伪造 workspace identity。
+        "workspace/open" => {
+            (exact_keys(&["workspaceId"]) && valid_id("workspaceId", "ws_", 100))
+                || (exact_keys(&["cwd", "displayName"])
+                    && object
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .is_some_and(|cwd| {
+                            !cwd.is_empty()
+                                && cwd.len() <= 4_096
+                                && !cwd.chars().any(char::is_control)
+                                && std::path::Path::new(cwd).is_absolute()
+                        })
+                    && object
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| {
+                            !name.trim().is_empty()
+                                && name.len() <= 512
+                                && !name.chars().any(char::is_control)
+                        }))
+        }
         "workspace/path/search" => {
             exact_keys(&["threadId", "workspaceId", "query", "limit"])
                 && valid_id("threadId", "thr_", 100)

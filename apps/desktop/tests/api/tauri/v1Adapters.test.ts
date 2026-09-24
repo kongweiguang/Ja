@@ -8,12 +8,15 @@ import { TauriSettingsAdapter, JA_SETTINGS_COMMANDS } from "@/api/tauri/settings
 
 /** 让 v1 wrapper 测试聚焦 wire envelope，不依赖活动 sidecar。 */
 describe("Ja v1 desktop adapters", () => {
-  it("sends only cwd intent when opening a workspace and creating a thread", async () => {
+  /** 项目 Thread 的 cwd 仍是明确项目意图，返回对象必须由服务端标成 project。 */
+  it("sends project cwd intent when opening a workspace and creating its thread", async () => {
     const invoke = vi.fn(
       async (command: string): Promise<unknown> =>
         command === JA_HISTORY_COMMANDS.workspaceOpen
           ? {
               workspaceId: "ws_server",
+              kind: "project",
+              legacySharedWorkspaceId: null,
               root: "C:\\demo",
               displayName: "demo",
               trust: "trusted",
@@ -22,6 +25,8 @@ describe("Ja v1 desktop adapters", () => {
           : {
               threadId: "thr_server",
               workspaceId: "ws_server",
+              workspaceKind: "project",
+              legacySharedWorkspaceId: null,
               preferences: {
                 providerId: "provider_demo",
                 modelId: "model_demo",
@@ -69,6 +74,58 @@ describe("Ja v1 desktop adapters", () => {
       },
     });
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("configRevision");
+  });
+
+  /** 新无项目会话省略 cwd，由 Java 创建并签发独立 SESSION workspace identity。 */
+  it("omits cwd when creating a new session thread", async () => {
+    const invoke = vi.fn(
+      async (): Promise<unknown> => ({
+        threadId: "thr_session",
+        workspaceId: "ws_session",
+        workspaceKind: "session",
+        legacySharedWorkspaceId: null,
+        preferences: {
+          providerId: "provider_demo",
+          modelId: "model_demo",
+          reasoningLevel: "medium",
+          accessMode: "approval_required",
+          collaborationMode: "default",
+          titleSource: "placeholder",
+        },
+        title: "Session",
+        status: "active",
+        pinned: false,
+        latestTurnStatus: null,
+        latestTurnSeen: true,
+        activeGoalId: null,
+        revision: 0,
+        createdAt: "2026-08-25T00:00:00Z",
+        updatedAt: "2026-08-25T00:00:00Z",
+      }),
+    );
+    const adapter = new TauriHistoryAdapter({ invoke: invoke as never });
+
+    const thread = await adapter.threadCreate({
+      title: "Session",
+      providerId: "provider_demo",
+      modelId: "model_demo",
+      reasoningLevel: "medium",
+      accessMode: "approval_required",
+      collaborationMode: "default",
+    });
+
+    expect(thread.workspaceKind).toBe("session");
+    expect(thread.legacySharedWorkspaceId).toBeNull();
+    expect(invoke).toHaveBeenCalledWith(JA_HISTORY_COMMANDS.threadCreate, {
+      input: {
+        title: "Session",
+        providerId: "provider_demo",
+        modelId: "model_demo",
+        reasoningLevel: "medium",
+        accessMode: "approval_required",
+        collaborationMode: "default",
+      },
+    });
   });
 
   it("sends a turn intent without cwd, profile, or config revision", async () => {

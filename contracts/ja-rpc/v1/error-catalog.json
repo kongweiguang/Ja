@@ -58,6 +58,7 @@
     { "code": -32064, "errorCode": "ATTACHMENT_UNAVAILABLE", "category": "unavailable", "retryable": true },
     { "code": -32065, "errorCode": "TURN_NOT_RESUMABLE", "category": "conflict", "retryable": false },
     { "code": -32066, "errorCode": "TURN_RESUME_ORDER_CONFLICT", "category": "conflict", "retryable": true },
+    { "code": -32067, "errorCode": "TURN_NOT_REASKABLE", "category": "validation", "retryable": false },
     { "code": -32068, "errorCode": "TURN_INPUT_QUEUE_FULL", "category": "capacity", "retryable": true },
     { "code": -32069, "errorCode": "QUEUED_INPUT_NOT_FOUND", "category": "not_found", "retryable": false },
     { "code": -32070, "errorCode": "WORKSPACE_REFERENCE_INVALID", "category": "validation", "retryable": false },

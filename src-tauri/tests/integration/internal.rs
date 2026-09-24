@@ -295,6 +295,11 @@ integration_scope!(
     crate::terminal::session,
     "/tests/integration/internal/terminal/session_tests.rs"
 );
+integration_scope!(
+    preview_local_file_scope,
+    crate::preview::local_file,
+    "/tests/integration/internal/preview/local_file_tests.rs"
+);
 
 mod workspace_root_scope {
     pub(crate) use crate::test_prelude::*;

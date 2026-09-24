@@ -60,6 +60,7 @@ export function SettingsView({
         <LazySettings
           snapshot={settings.globalSnapshot}
           skillSettings={settings.skillSettings}
+          mcpSettings={settings.mcpSettings}
           issues={settings.loaded?.issues ?? []}
           onIssuesRetry={settings.reload}
           onIssuesRestore={settings.restoreLastKnownGood}

@@ -371,7 +371,8 @@ final class AgentCapabilityIntegrationTest extends PersistenceTestSupport {
     private static void initializeWorkspace(
             TestDatabase database, MybatisConversationRepository store, Path workspace) {
         database.history(store).register(new Workspace.Registration(
-                "ws_capability", workspace, "workspace", Workspace.Trust.TRUSTED, START));
+                "ws_capability", workspace, "workspace", Workspace.Trust.TRUSTED,
+                Workspace.Kind.PROJECT, null, START));
     }
 
     /** 在已注册 Workspace 内创建独立 Thread，避免路径身份唯一约束干扰重复运行。 */

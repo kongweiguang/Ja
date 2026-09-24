@@ -31,6 +31,7 @@ import {
   useConversationController,
   type ConversationArtifactPort,
   type ConversationAttachmentPort,
+  type ConversationMcpReader,
   type ComposerSlashCommand,
   type ConversationSummary,
 } from "@/features/conversation";
@@ -107,6 +108,8 @@ import {
   type ComposerWorkspaceReferenceTarget,
   type WorkspaceReferencePreviewOutcome,
   type WorkspaceReferencePreviewRequest,
+  type ConversationOpenTargetOutcome,
+  type ConversationOpenTargetRequest,
 } from "./ConversationWorkspace";
 import {
   DEFAULT_DESKTOP_INTEGRATIONS,
@@ -188,7 +191,7 @@ function focusConversationComposerAfterNavigation(): void {
 }
 
 /** 从 Workbench 返回时优先恢复对象来源；对象已卸载则回到当前 Composer，避免焦点丢进 body。 */
-function restoreConversationObjectFocus(source: HTMLButtonElement | null): void {
+function restoreConversationObjectFocus(source: HTMLElement | null): void {
   const restoreFocus = (): void => {
     if (source?.isConnected) {
       source.focus();
@@ -268,7 +271,7 @@ export function JaApplication({
     lastConfigurationEvent,
     lastThreadMetadataEvent,
   } = useRuntimeState();
-  const { startRuntime, generalWorkspace, queryRuntime } = useRuntimeLifecycle();
+  const { startRuntime, activateWorkspace, queryRuntime } = useRuntimeLifecycle();
   const resolvedWorkbenchAdapters = workbenchAdapters ?? DEFAULT_WORKBENCH_ADAPTERS;
   const resolvedHistoryAdapter = historyAdapter ?? DEFAULT_HISTORY_ADAPTER;
   /**
@@ -279,6 +282,14 @@ export function JaApplication({
   const conversationUsageReader = useMemo<ConversationUsageReader | undefined>(() => {
     const read = resolvedHistoryAdapter.threadUsageRead;
     return read === undefined ? undefined : { read: read.bind(resolvedHistoryAdapter) };
+  }, [resolvedHistoryAdapter]);
+  /** MCP status reader is thread-scoped and memoized so streaming renders cannot retrigger a visible popover read. */
+  const conversationMcpReader = useMemo<ConversationMcpReader | undefined>(() => {
+    const read = resolvedHistoryAdapter.threadMcpRead;
+    if (read === undefined) return undefined;
+    /** Bind through the owning adapter because production history methods use its native bridge. */
+    const readThreadMcp = (threadId: string) => read.call(resolvedHistoryAdapter, { threadId });
+    return { read: readThreadMcp };
   }, [resolvedHistoryAdapter]);
   /** Files 与当前 Composer 通过一次性 target port 连接，不把 Thread 草稿复制到壳层。 */
   const registerWorkspaceReferenceTarget = useCallback(
@@ -329,8 +340,26 @@ export function JaApplication({
       }
     | undefined
   >(undefined);
+  const openTargetRequestSequenceRef = useRef(0);
+  const openTargetSourceRef = useRef<
+    | { requestId: number; workspaceId: string; threadId: string; source: HTMLElement | null }
+    | undefined
+  >(undefined);
   const attachmentPreviewSourceRef = useRef<HTMLButtonElement | null>(null);
-  const [settingsWorkspaceScope, setSettingsWorkspaceScope] = useState<WorkspaceProjection>();
+  const [settingsWorkspaceScope, setSettingsWorkspaceScope] = useState<
+    { workspaceId: string; kind: "project" } | undefined
+  >();
+  /** Settings v3 接收的 workspace scope 只表示项目覆盖；session 目录不携带项目配置。 */
+  const publishSettingsWorkspaceScope = useCallback(
+    (selected: WorkspaceProjection | undefined): void => {
+      setSettingsWorkspaceScope(
+        selected?.kind === "project"
+          ? { workspaceId: selected.workspaceId, kind: "project" }
+          : undefined,
+      );
+    },
+    [setSettingsWorkspaceScope],
+  );
   const [gitBranchProjection, setGitBranchProjection] = useState<{
     workspaceId: string;
     branch: string;
@@ -407,11 +436,12 @@ export function JaApplication({
   const settingsRuntimePort = useMemo<SettingsRuntimePort>(
     () => ({
       listSkills: (input) => queryRuntime("skill/list", input ?? {}),
-      listMcpServers: () => queryRuntime("mcp/list", {}),
-      testMcp: (mcpRevision) => queryRuntime("mcp/test", { mcpId: mcpRevision }),
+      listMcpServers: (input) => queryRuntime("mcp/list", input ?? {}),
+      testMcp: (mcpRevision, input) => queryRuntime("mcp/test", { ...input, mcpId: mcpRevision }),
       testModel: (providerId, modelId) => queryRuntime("model/test", { providerId, modelId }),
       discoverModels: (providerId) => queryRuntime("model/discover", { providerId }),
-      listMcpTools: (mcpRevision) => queryRuntime("mcp/list-tools", { mcpId: mcpRevision }),
+      listMcpTools: (mcpRevision, input) =>
+        queryRuntime("mcp/list-tools", { ...input, mcpId: mcpRevision }),
     }),
     [queryRuntime],
   );
@@ -454,12 +484,29 @@ export function JaApplication({
   const workspace = useWorkspaceController({
     history: resolvedHistoryAdapter,
     picker: projectPicker ?? DEFAULT_WORKSPACE_PICKER,
-    generalWorkspace,
+    activateWorkspace,
     runtimeState,
     configurationReady: activeModel !== undefined && settings.scopeReady,
     beforeWorkspaceChange: workspaceChange.beforeChange,
-    onWorkspaceCommitted: setSettingsWorkspaceScope,
+    onWorkspaceCommitted: publishSettingsWorkspaceScope,
   });
+  /** 暂时清空活动 Workspace 时保留最后一份服务端投影，供隐藏 Thread Host 完成资源清理。 */
+  const [retainedWorkbenchWorkspace, setRetainedWorkbenchWorkspace] =
+    useState<WorkspaceProjection>();
+  const nextWorkbenchWorkspace = workspace.workspace;
+  if (
+    nextWorkbenchWorkspace !== undefined &&
+    (retainedWorkbenchWorkspace?.workspaceId !== nextWorkbenchWorkspace.workspaceId ||
+      retainedWorkbenchWorkspace.rootPath !== nextWorkbenchWorkspace.rootPath ||
+      retainedWorkbenchWorkspace.kind !== nextWorkbenchWorkspace.kind ||
+      retainedWorkbenchWorkspace.displayName !== nextWorkbenchWorkspace.displayName ||
+      retainedWorkbenchWorkspace.trust !== nextWorkbenchWorkspace.trust ||
+      retainedWorkbenchWorkspace.legacySharedWorkspaceId !==
+        nextWorkbenchWorkspace.legacySharedWorkspaceId)
+  ) {
+    setRetainedWorkbenchWorkspace(nextWorkbenchWorkspace);
+  }
+  const workbenchHostWorkspace = nextWorkbenchWorkspace ?? retainedWorkbenchWorkspace;
   const activeWorkspaceId = workspace.workspace?.workspaceId;
   const currentGitBranch =
     gitBranchProjection !== undefined &&
@@ -476,6 +523,43 @@ export function JaApplication({
     metadataEvent: lastThreadMetadataEvent,
     activateWorkspace: workspace.activateForConversation,
   });
+  /** 项目行只把已选中的稳定 Workspace ID 交给原生 Explorer adapter，不切换当前项目。 */
+  const openProjectFolder = useCallback(
+    async (workspaceId: string): Promise<void> => {
+      await resolvedWorkbenchAdapters.workspace.open({
+        workspaceId,
+        target: "file_explorer",
+        relativePath: "",
+      });
+    },
+    [resolvedWorkbenchAdapters.workspace],
+  );
+  /** 文件夹菜单按 Thread 的服务端 workspace identity 打开 Explorer，不更改当前选中会话。 */
+  const openThreadWorkspaceFolder = useCallback(
+    async (threadId: string): Promise<void> => {
+      const thread = conversation.threads.find((candidate) => candidate.threadId === threadId);
+      if (thread === undefined) return;
+      await resolvedWorkbenchAdapters.workspace.open({
+        workspaceId: thread.workspaceId,
+        target: "file_explorer",
+        relativePath: "",
+      });
+    },
+    [conversation.threads, resolvedWorkbenchAdapters.workspace],
+  );
+  /** 旧共享根只从服务端关联字段读取并通过 ID-only Explorer IPC 打开，不绑定 active Host。 */
+  const openLegacySharedFolder = useCallback(
+    async (threadId: string): Promise<void> => {
+      const thread = conversation.threads.find((candidate) => candidate.threadId === threadId);
+      if (thread?.legacySharedWorkspaceId == null) return;
+      await resolvedWorkbenchAdapters.workspace.open({
+        workspaceId: thread.legacySharedWorkspaceId,
+        target: "file_explorer",
+        relativePath: "",
+      });
+    },
+    [conversation.threads, resolvedWorkbenchAdapters.workspace],
+  );
   /**
    * Controller 会返回稳定的 action callbacks；先拆出具体函数，避免导航/命令回调把整个
    * Conversation view model 当成依赖，从而让流式 Timeline 更新重建左侧导航入口。
@@ -508,6 +592,26 @@ export function JaApplication({
       turnReviewScopeIdentity,
       undefined,
     );
+  const openTargetScopeToken = useMemo(
+    () => ({ scope: turnReviewScopeIdentity }),
+    [turnReviewScopeIdentity],
+  );
+  const [openTargetRequestRecord, setOpenTargetRequestRecord] = useState<
+    { scopeToken: object; request: ConversationOpenTargetRequest } | undefined
+  >();
+  const openTargetRequest =
+    openTargetRequestRecord?.scopeToken === openTargetScopeToken
+      ? openTargetRequestRecord.request
+      : undefined;
+  /** Scope token 每次切换都会更换，即便稍后回到同一 Thread 也不会重放旧点击请求。 */
+  const setOpenTargetRequest = useCallback(
+    (request: ConversationOpenTargetRequest | undefined): void => {
+      setOpenTargetRequestRecord(
+        request === undefined ? undefined : { scopeToken: openTargetScopeToken, request },
+      );
+    },
+    [openTargetScopeToken],
+  );
   const [latestTurnReview, setLatestTurnReview] = useThreadWorkbenchState<
     TurnReviewTarget | undefined
   >(turnReviewScopeIdentity, undefined);
@@ -535,10 +639,11 @@ export function JaApplication({
       ? attachmentPreviewState?.target
       : undefined;
   const activeWorkbenchScopeRef = useRef(turnReviewScopeIdentity);
-  /** commit 即撤销旧来源；隐藏会话迟到完成只改其投影，不得清空新来源或抢焦点。 */
+  /** commit 撤销旧来源和一次性打开请求；隐藏会话的迟到完成不得清空新请求或抢焦点。 */
   useLayoutEffect(() => {
     activeWorkbenchScopeRef.current = turnReviewScopeIdentity;
     workspaceReferencePreviewSourceRef.current = undefined;
+    openTargetSourceRef.current = undefined;
     attachmentPreviewSourceRef.current = null;
   }, [turnReviewScopeIdentity]);
   const planGoalAvailable =
@@ -612,7 +717,6 @@ export function JaApplication({
     settings.scopeWorkspaceId ===
       (workspace.workspace?.kind === "project" ? workspace.workspace.workspaceId : undefined);
   const conversationScopeReady =
-    workspace.workspace !== undefined &&
     settingsScopeReady &&
     turnAdmissionReady &&
     (boot.status === "ready" || boot.status === "busy") &&
@@ -656,6 +760,86 @@ export function JaApplication({
   const composerNativeDrop = useComposerNativeDropRouter(
     nativeDropPort,
     !settingsVisible && conversationScopeReady,
+  );
+
+  /** 将 Markdown 目标冻结为当前 Thread 的一次性 intent；Explorer 可在右栏隐藏时处理。 */
+  const requestConversationOpenTarget = useCallback(
+    (target: ConversationOpenTargetRequest["target"], source?: HTMLElement): void => {
+      const workspaceId = workspace.workspace?.workspaceId;
+      const threadId = workbenchThreadId;
+      if (workspaceId === undefined || threadId === undefined) {
+        toast.error("当前会话没有可用的工作区，请先打开工作区后重试。", {
+          id: "ja-open-target:workspace-unavailable",
+        });
+        restoreConversationObjectFocus(source ?? null);
+        return;
+      }
+      const requestId = ++openTargetRequestSequenceRef.current;
+      openTargetSourceRef.current = { requestId, workspaceId, threadId, source: source ?? null };
+      setOpenTargetRequest({ requestId, workspaceId, threadId, target });
+      if (target.kind !== "explorer") {
+        if (!workbenchTabs.includes("preview")) setWorkbenchTabs([...workbenchTabs, "preview"]);
+        setWorkbenchTab("preview");
+        setInspectorOpen(true);
+      }
+    },
+    [
+      setInspectorOpen,
+      setOpenTargetRequest,
+      setWorkbenchTab,
+      setWorkbenchTabs,
+      workbenchTabs,
+      workbenchThreadId,
+      workspace.workspace?.workspaceId,
+    ],
+  );
+
+  /** 点击 HTTP(S) 同样只创建 Ja Preview intent，绝不把模型给出的 href 交给主 WebView。 */
+  const openConversationWebLink = useCallback(
+    (url: string, source?: HTMLElement): void => {
+      requestConversationOpenTarget({ kind: "url", url }, source);
+    },
+    [requestConversationOpenTarget],
+  );
+
+  /** 普通点击进右栏，Ctrl+点击沿用同一 Thread intent 但不改变当前工作面。 */
+  const openConversationFileLink = useCallback(
+    (
+      target: { path: string; line?: number; column?: number },
+      source: HTMLElement,
+      mode?: "explorer",
+    ): void => {
+      requestConversationOpenTarget(
+        mode === "explorer" ? { kind: "explorer", path: target.path } : { kind: "file", ...target },
+        source,
+      );
+    },
+    [requestConversationOpenTarget],
+  );
+
+  /** 只结算仍属于当前 Thread 的 ACK；失败来源保持可见并归还焦点，迟到后台 ACK 不切换 UI。 */
+  const settleConversationOpenTarget = useCallback(
+    (requestId: number, outcome: ConversationOpenTargetOutcome): void => {
+      if (openTargetRequest?.requestId !== requestId) return;
+      setOpenTargetRequest(undefined);
+      const source = openTargetSourceRef.current;
+      openTargetSourceRef.current = undefined;
+      if (
+        outcome === "failed" &&
+        activeWorkbenchScopeRef.current === turnReviewScopeIdentity &&
+        source?.requestId === requestId &&
+        source.workspaceId === workspace.workspace?.workspaceId &&
+        source.threadId === workbenchThreadId
+      )
+        restoreConversationObjectFocus(source.source);
+    },
+    [
+      openTargetRequest?.requestId,
+      setOpenTargetRequest,
+      turnReviewScopeIdentity,
+      workbenchThreadId,
+      workspace.workspace?.workspaceId,
+    ],
   );
 
   /**
@@ -916,18 +1100,14 @@ export function JaApplication({
     focusConversationComposerAfterNavigation();
   }, [conversationShortcutFocusEnabled]);
   const conversationSummaryContext = useMemo<
-    Pick<ConversationSummary, "scope" | "gitBranch" | "model" | "runtime">
+    Pick<ConversationSummary, "scope" | "gitBranch" | "runtime">
   >(
     () => ({
       scope: isProjectScope ? (workspace.workspace?.displayName ?? "当前项目") : "无项目对话",
       gitBranch: isProjectScope ? currentGitBranch : undefined,
-      model:
-        activeModel === undefined
-          ? undefined
-          : `${activeModel.provider.name} · ${activeModel.model.name}`,
       runtime: runtimeLabel(boot.status),
     }),
-    [boot.status, currentGitBranch, isProjectScope, activeModel, workspace.workspace?.displayName],
+    [boot.status, currentGitBranch, isProjectScope, workspace.workspace?.displayName],
   );
 
   /**
@@ -1110,9 +1290,9 @@ export function JaApplication({
     [workspace],
   );
 
-  /** 显式返回受管 general workspace，补全项目范围的退出路径而不清除任何历史项目。 */
-  const selectGeneral = useCallback(async (): Promise<void> => {
-    await workspace.selectGeneral();
+  /** 切换到无项目会话聚合列表；目录留空以等待用户选择或创建一个具体 Thread。 */
+  const selectNoProject = useCallback(async (): Promise<void> => {
+    await workspace.selectNoProject();
   }, [workspace]);
 
   /** 恢复持久 Thread 后再转交输入焦点，避免侧栏或搜索结果继续持有键盘落点。 */
@@ -1190,6 +1370,11 @@ export function JaApplication({
   const openSettings = useCallback((): void => {
     navigate("settings");
   }, [navigate]);
+  /** Header management enters Settings on the MCP category without changing the active conversation. */
+  const openMcpSettings = useCallback((): void => {
+    setSettingsSection("mcp");
+    navigate("settings");
+  }, [navigate, setSettingsSection]);
   /** 设置层关闭后复用统一会话焦点终点，避免键盘用户返回到已卸载的设置按钮。 */
   const returnFromSettings = useCallback((): void => {
     pendingSettingsReturnFocusRef.current = true;
@@ -1581,7 +1766,7 @@ export function JaApplication({
         scopedDefault: settings.snapshot.defaultAccessMode,
         projectOverride: settings.loaded?.projectOverrides.accessMode ?? false,
         scopeReady: settingsScopeReady,
-        workspaceKind: workspace.workspace?.kind,
+        workspaceKind: workspace.workspace?.kind === "project" ? "project" : "general",
         threadAccessMode:
           currentThread?.workspaceId === workspace.workspace?.workspaceId
             ? currentThread?.preferences?.accessMode
@@ -1601,12 +1786,15 @@ export function JaApplication({
       workspace={workspace}
       conversation={conversation}
       usageReader={conversationUsageReader}
+      mcpReader={conversationMcpReader}
+      onOpenMcpSettings={openMcpSettings}
       settings={settings}
       inspectorOpen={inspectorOpen}
       onToggleInspector={toggleInspector}
       summaryContext={conversationSummaryContext}
       workspaceAdapter={resolvedWorkbenchAdapters.workspace}
-      onOpenLink={desktopAdapters.openExternalUrl}
+      onOpenLink={openConversationWebLink}
+      onOpenFile={openConversationFileLink}
       onCopyText={desktopAdapters.writeText}
       onConversationFocusAvailabilityChange={setConversationFocusAvailable}
       onRegisterWorkspaceReferenceTarget={registerWorkspaceReferenceTarget}
@@ -1629,14 +1817,13 @@ export function JaApplication({
     />
   );
   const inspectorContent =
-    workspace.workspace === undefined ? null : (
+    workbenchHostWorkspace === undefined ? null : (
       <ThreadWorkbenchSessions
-        key={workspace.workspace.workspaceId}
         scopeKey={workbenchScopeIdentity}
-        workspace={workspace.workspace}
+        workspace={workbenchHostWorkspace}
         generation={runtimeState?.generation}
         adapters={resolvedWorkbenchAdapters}
-        active={workbenchVisible}
+        active={workbenchVisible && workbenchThreadId !== undefined}
         rootThreadId={workbenchThreadId}
         parentThreadRevision={currentParentThreadRevision}
         onRegisterSideChatLauncher={registerSideChatLauncher}
@@ -1677,6 +1864,8 @@ export function JaApplication({
         onCloseFilesCapability={closeFilesCapability}
         onFilesCapabilityClosed={closeFilesCapability}
         onAddWorkspaceReference={addWorkspaceReference}
+        openTargetRequest={openTargetRequest}
+        onOpenTargetSettled={settleConversationOpenTarget}
         onOpenWorkspaceReference={openWorkspaceReferencePreview}
         workspaceReferencePreviewRequest={workspaceReferencePreviewRequest}
         onWorkspaceReferencePreviewSettled={settleWorkspaceReferencePreview}
@@ -1743,7 +1932,7 @@ export function JaApplication({
               projectCatalogLoading={workspace.catalogLoading}
               projectCatalogError={workspace.catalogError}
               currentWorkspaceId={isProjectScope ? workspace.workspace?.workspaceId : undefined}
-              generalWorkspaceSelected={workspace.workspace?.kind === "general"}
+              noProjectSelected={workspace.workspace?.kind !== "project"}
               projectSectionCollapsed={projectSectionCollapsed}
               historySectionCollapsed={historySectionCollapsed}
               runtimeLabel={runtimeLabel(boot.status)}
@@ -1770,13 +1959,16 @@ export function JaApplication({
               conversationSearchOpen={conversationSearchOpen}
               onNewConversation={createConversation}
               onSelectConversation={selectConversation}
+              onOpenProjectFolder={openProjectFolder}
+              onOpenWorkspaceFolder={openThreadWorkspaceFolder}
+              onOpenLegacySharedFolder={openLegacySharedFolder}
               onOpenConversationSearch={openConversationSearch}
               onRenameConversation={conversationRename}
               onPinConversation={pinConversation}
               onArchiveConversation={archiveConversation}
               mutatingThreadIds={conversation.mutatingThreadIds}
               onChooseProject={chooseProject}
-              onSelectGeneral={selectGeneral}
+              onSelectNoProject={selectNoProject}
               onSelectProject={selectProject}
               onProjectSectionCollapsedChange={setProjectSectionCollapsed}
               onHistorySectionCollapsedChange={setHistorySectionCollapsed}

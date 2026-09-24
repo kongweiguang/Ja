@@ -158,6 +158,7 @@ export interface LoadedSettings {
   document: SettingsDocument;
   userDocument: SettingsDocument;
   projectSkillDocument?: ProjectSkillSettingsDocument;
+  projectMcpServers?: SettingsMcpServer[];
   projectOverrides: ProjectSettingsOverrides;
   cas: { userVersion: string; projectVersion: string; credentialVersion: string };
   /** 问题不改变可编辑 userDocument；保存路径必须只提交用户明确的变化。 */
@@ -169,7 +170,6 @@ interface ProjectSettingsOverrides {
   defaultSelection: boolean;
   accessMode: boolean;
   disabledSkillReferences: string[];
-  disabledMcpIds: string[];
 }
 export interface SettingsConfigurationChange {
   serverInstanceId: string;

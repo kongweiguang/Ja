@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.conversation.application.policy;
 import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
+import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ToolPolicy;
 import java.util.Objects;
@@ -41,15 +42,39 @@ public final class PlanToolPolicy {
         return ToolPolicy.Decision.allow();
     }
 
+    /** 对动态网关使用本次解析后的副作用与路由证明，不能把工具级静态声明借给任意 action。 */
+    public static ToolPolicy.Decision validate(
+            AgentTool tool, AgentTool.Invocation invocation, TurnOrigin origin, CollaborationMode mode) {
+        Objects.requireNonNull(tool, "tool");
+        Objects.requireNonNull(invocation, "invocation");
+        Objects.requireNonNull(origin, "origin");
+        Objects.requireNonNull(mode, "mode");
+        if (!isReadOnlyPlanning(origin, mode)) return ToolPolicy.Decision.allow();
+        AgentTool.RouteKind routeKind = tool.bindingDescriptor(invocation).routeKind();
+        boolean builtIn = routeKind == AgentTool.RouteKind.BUILTIN;
+        boolean readOnly = tool.sideEffect(invocation) == ToolSideEffect.READ_ONLY
+                && tool.workspaceMutationMode(invocation) == AgentTool.WorkspaceMutationMode.NONE;
+        boolean trustedGatewayRead = tool instanceof McpAgentTool gateway
+                && gateway.isTrustedLocalReadAction(invocation);
+        if (!(builtIn && (readOnly || tool.planAccess() == AgentTool.PlanAccess.INTERNAL_MUTATION))
+                && !trustedGatewayRead) {
+            return ToolPolicy.Decision.deny(
+                    "PLAN_READ_ONLY_REQUIRED",
+                    "Plan 阶段只允许本地只读能力和受控内建写入；请先形成计划，再由用户执行。");
+        }
+        return ToolPolicy.Decision.allow();
+    }
+
     /**
-     * 集中定义 Planner 的来源边界，避免 Goal continuation 因复用 Thread 的 PLAN 偏好被误判为只读。
-     * 新的内部执行来源必须显式加入此规则，不能通过“不是 PLAN_EXECUTION”获得规划身份。
+     * 集中定义 Planner 的来源边界；用户显式继续未答问题仍处于原 PLAN 阶段，必须保留只读门。
+     * Goal continuation 和 Plan execution 已有独立执行来源，不能通过“不是 PLAN_EXECUTION”获得规划身份。
      */
     public static boolean isReadOnlyPlanning(TurnOrigin origin, CollaborationMode mode) {
         Objects.requireNonNull(origin, "origin");
         Objects.requireNonNull(mode, "mode");
         return mode == CollaborationMode.PLAN
-                && (origin == TurnOrigin.USER || origin == TurnOrigin.CHILD_TASK);
+                && (origin == TurnOrigin.USER || origin == TurnOrigin.USER_CONTINUATION
+                || origin == TurnOrigin.CHILD_TASK);
     }
 
     /** 安全证明来自编译期内建实现，外部工具自述或同名标签不能获得规划写入豁免。 */

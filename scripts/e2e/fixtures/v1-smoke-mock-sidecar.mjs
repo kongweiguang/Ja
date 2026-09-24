@@ -21,7 +21,7 @@ const serverInstanceId = "srv_native_fixture";
 const workspaceId = "ws_native_fixture";
 const threadId = "thr_native_fixture";
 const methods = [
-  "runtime/initialize", "runtime/health", "runtime/shutdown", "workspace/open", "workspace/open-general",
+  "runtime/initialize", "runtime/health", "runtime/shutdown", "workspace/open",
   "workspace/list", "workspace/path/search", "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list",
   "thread/search", "thread/read", "thread/rename", "thread/pin", "thread/seen",
   "thread/preferences/update", "thread/archive", "thread/restore", "thread/delete", "thread/compact",
@@ -192,6 +192,8 @@ function handleRequest(frame) {
         id: frame.id,
         result: {
           workspaceId,
+          kind: "project",
+          legacySharedWorkspaceId: null,
           root: workspaceRoot,
           displayName: frame.params.displayName,
           trust: "trusted",
@@ -240,6 +242,8 @@ function handleRequest(frame) {
         result: {
           threadId,
           workspaceId,
+          workspaceKind: "project",
+          legacySharedWorkspaceId: null,
           preferences: null,
           title: frame.params.title,
           status: "active",

@@ -43,6 +43,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -114,7 +115,8 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
             }
             requireInserted(mapper.history().insertWorkspace(new PersistenceRecords.WorkspaceInsert(
                             request.workspaceId(), request.root().toString(), request.displayName(),
-                            request.trust().name(), request.occurredAt().toString())),
+                            request.trust().name(), request.kind().name(), request.legacySharedWorkspaceId(),
+                            request.occurredAt().toString())),
                     "workspace insert lost");
             return workspace(mapper.history().selectWorkspace(request.workspaceId()));
         });
@@ -125,11 +127,18 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      */
     @Override
     public CursorPage<Workspace> list(String cursor, int limit) {
+        return list(cursor, limit, null);
+    }
+
+    /** 可选 kind 写入 SQL 条件后再按更新时间分页，避免混合类别的首屏过滤丢失目录。 */
+    @Override
+    public CursorPage<Workspace> list(String cursor, int limit, Workspace.Kind kind) {
         checkLimit(limit);
         Cursor key = decode(cursor);
         return transactions.required(mapper -> workspacePage(mapper.history().selectWorkspacePage(
                 new PersistenceRecords.WorkspacePage(
-                        key == null ? null : key.time(), key == null ? null : key.id(), limit + 1)), limit));
+                        key == null ? null : key.time(), key == null ? null : key.id(), limit + 1,
+                        kind == null ? null : kind.name())), limit));
     }
 
     /**
@@ -143,8 +152,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * 直接按 canonical root 查询 SQLite，使 Java owner 无需扫描分页或改写 trust 即可重开
-     * 通用工作区（general workspace）。
+     * 按规范根查询已登记项目或会话目录的通用身份，避免调用方扫描列表或把路径重新解释为新目录。
      */
     @Override
     public Optional<Workspace> findByRoot(Path canonicalRoot) {
@@ -212,6 +220,17 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                         key == null ? null : key.id(), limit + 1)), limit));
     }
 
+    /** 无项目导航跨多个 SESSION workspace 聚合，同时保留 pinned/update keyset 和完整 Thread 摘要。 */
+    @Override
+    public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) {
+        checkLimit(limit);
+        ThreadCursor key = decodeThreadCursor(cursor);
+        return transactions.required(mapper -> activeThreadPage(mapper.history().selectSessionThreadPage(
+                new PersistenceRecords.SessionThreadPage(key == null ? null : key.pinned(),
+                        key == null ? null : key.sortTime(), key == null ? null : key.updatedAt(),
+                        key == null ? null : key.id(), limit + 1)), limit));
+    }
+
     /**
      * 全局发现由一次 SQL 合并主 Thread 与两种 Child，使用同一更新时间/身份游标避免内存拼接漂移。
      */
@@ -241,6 +260,20 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                         key == null ? null : key.time(), key == null ? null : key.id(), limit + 1)), limit));
     }
 
+    /** 在所有 SESSION workspace 中搜索主会话标题，不按共享 ID 或创建时间猜测目录类型。 */
+    @Override
+    public CursorPage<ThreadSummary> searchSessionThreads(String query, String cursor, int limit) {
+        String normalized = Objects.requireNonNull(query, "query").strip().toLowerCase(Locale.ROOT);
+        if (normalized.length() > 256 || normalized.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("invalid thread search query");
+        }
+        checkLimit(limit);
+        Cursor key = decode(cursor);
+        return transactions.required(mapper -> searchThreadPage(mapper.history().searchSessionThreadPage(
+                new PersistenceRecords.SessionThreadSearch(normalized,
+                        key == null ? null : key.time(), key == null ? null : key.id(), limit + 1)), limit));
+    }
+
     /**
      * 混合页面按提交时间、语义和 Tool ordinal 排序，随机 identity 只用于最终去重；
      * Mapper 从游标指向的持久条目还原完整排序键，保证正文先于同批工具且跨页不丢不重。
@@ -263,8 +296,29 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                         requiredText(last.itemId(), "item_id"));
             }
             List<PersistenceRecords.TurnRow> turnRows = mapper.agent().selectTurns(threadId);
-            List<ThreadSnapshot.Turn> turns = turnRows.stream()
-                    .map(rowValue -> snapshotTurn(mapper, rowValue)).toList();
+            List<PersistenceRecords.TurnRow> currentPathRows = turnRows.stream()
+                    .filter(PersistenceRecords.TurnRow::currentPath).toList();
+            Map<String, String> latestAttemptBySource = new java.util.HashMap<>();
+            currentPathRows.stream().filter(value -> value.sourceMessageId() != null)
+                    .forEach(value -> latestAttemptBySource.put(value.sourceMessageId(), value.turnId()));
+            Map<String, String> ownerTurnByMessage = mapper.agent().selectMessages(threadId).stream()
+                    .filter(value -> "USER".equals(value.role()))
+                    .collect(java.util.stream.Collectors.toMap(PersistenceRecords.MessageRow::messageId,
+                            PersistenceRecords.MessageRow::turnId, (first, ignored) -> first));
+            Set<String> supersededErrorTurns = new java.util.HashSet<>();
+            latestAttemptBySource.forEach((sourceId, latestTurnId) -> {
+                String ownerTurnId = ownerTurnByMessage.get(sourceId);
+                if (ownerTurnId != null) supersededErrorTurns.add(ownerTurnId);
+                for (PersistenceRecords.TurnRow candidate : currentPathRows) {
+                    if (sourceId.equals(candidate.sourceMessageId())
+                            && !latestTurnId.equals(candidate.turnId())) {
+                        supersededErrorTurns.add(candidate.turnId());
+                    }
+                }
+            });
+            List<ThreadSnapshot.Turn> turns = currentPathRows.stream()
+                    .map(rowValue -> snapshotTurn(mapper, rowValue, supersededErrorTurns.contains(rowValue.turnId())))
+                    .toList();
             List<ThreadSnapshot.Item> items = rows.stream().map(this::snapshotItem).toList();
             PersistenceRecords.ContextUsageRow usageRow = mapper.history().selectLatestContextUsage(threadId);
             ThreadSnapshot.ContextUsage contextUsage = usageRow == null ? null
@@ -758,15 +812,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      * 既有 keyset 分页语义，也不要求迁移用户数据库。
      */
     private static String snapshotItemId(String sourceKind, String sourceId) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            digest.update(sourceKind.getBytes(StandardCharsets.UTF_8));
-            digest.update((byte) 0);
-            byte[] hash = digest.digest(sourceId.getBytes(StandardCharsets.UTF_8));
-            return "item_" + java.util.HexFormat.of().formatHex(hash);
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 is unavailable", impossible);
-        }
+        return SnapshotItemIdentity.of(sourceKind, sourceId);
     }
 
     /**
@@ -775,7 +821,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     private static Workspace workspace(PersistenceRecords.WorkspaceRow row) {
         return new Workspace(requiredText(row.workspaceId(), "workspace_id"),
                 Path.of(requiredText(row.rootPath(), "root_path")), requiredText(row.displayName(), "display_name"),
-                Workspace.Trust.valueOf(requiredText(row.trust(), "trust").toUpperCase(Locale.ROOT)), row.revision());
+                Workspace.Trust.valueOf(requiredText(row.trust(), "trust").toUpperCase(Locale.ROOT)),
+                Workspace.Kind.valueOf(requiredText(row.kind(), "kind").toUpperCase(Locale.ROOT)),
+                row.legacySharedWorkspaceId(), row.revision());
     }
 
     /**
@@ -790,17 +838,20 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      * 将 Turn 行与同一事务中的 execution common.modelRound 一起投影；dispatch UNKNOWN 只改变
      * mutation，不改变已完成模型轮次，因此 read 可以识别迟到 ModelStep 而不误伤首段 draft。
      */
-    private ThreadSnapshot.Turn snapshotTurn(PersistenceMappers mapper, PersistenceRecords.TurnRow row) {
+    private ThreadSnapshot.Turn snapshotTurn(PersistenceMappers mapper, PersistenceRecords.TurnRow row,
+                                             boolean suppressError) {
         String state = requiredText(row.state(), "state").toLowerCase(Locale.ROOT);
         TurnState lifecycle = parseTurnState(state);
         return new ThreadSnapshot.Turn(requiredText(row.turnId(), "turn_id"),
                 state,
                 Instant.parse(requiredText(row.requestedAt(), "requested_at")),
                 Instant.parse(requiredText(row.updatedAt(), "updated_at")),
-                row.completedAt() == null ? null : Instant.parse(row.completedAt()), row.errorCode(),
+                row.completedAt() == null ? null : Instant.parse(row.completedAt()),
+                suppressError ? null : row.errorCode(),
                 row.changeSetJson() == null ? null : changeSets.read(row.changeSetJson()),
                 requiredNumber(row.mutationVersion(), "mutation_version"),
-                lifecycle.terminal() ? 0 : executionModelRound(mapper, row.turnId(), state));
+                lifecycle.terminal() ? 0 : executionModelRound(mapper, row.turnId(), state),
+                row.sourceMessageId() == null ? null : SnapshotItemIdentity.of("message", row.sourceMessageId()));
     }
 
     /** 将数据库状态一次解析为领域闭集；终态不再查询已按生命周期删除的 execution 行。 */

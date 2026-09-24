@@ -56,7 +56,7 @@ class InteractionObservationTest {
                 });
         RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, null);
         RpcServiceBindings services = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
-                base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
+                base.threads(), base.threadMcp(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
                 base.attachments(), base.attachmentPreviews(), base.tasks(), base.goals(), interactions, base.lifecycle());
         Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-observation-test").toAbsolutePath();
         try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);

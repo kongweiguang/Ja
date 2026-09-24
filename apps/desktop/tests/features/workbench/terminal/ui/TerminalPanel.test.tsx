@@ -117,8 +117,10 @@ interface TerminalMock {
   emitKey: (event: KeyboardEvent) => boolean;
   getLineCalls: number[];
   linksForLine: (lineNumber: number) => MockTerminalLink[] | undefined;
+  getSelection: () => string;
   options: { theme?: unknown };
   selection?: { column: number; row: number; length: number };
+  selectionText?: string;
   select: (column: number, row: number, length: number) => void;
   selectCalls: Array<{ column: number; row: number; length: number }>;
   setBufferLines: (lines: readonly { text: string; isWrapped: boolean }[], cols: number) => void;
@@ -150,6 +152,7 @@ const mocks = vi.hoisted(() => {
     rows = 24;
     options: { theme?: unknown } = {};
     selection: { column: number; row: number; length: number } | undefined;
+    selectionText: string | undefined;
     selectCalls: Array<{ column: number; row: number; length: number }> = [];
     scrollToLineCalls: number[] = [];
     writes: Array<string | Uint8Array> = [];
@@ -282,6 +285,10 @@ const mocks = vi.hoisted(() => {
     /** 不在 JSDOM 重建 xterm 隐藏 textarea，仅记录表面驱动焦点。 */
     focus(): void {
       this.focusCount += 1;
+    }
+    /** ContextMenu 只消费 xterm 当前公开选区，不模拟私有 textarea 或浏览器剪贴板。 */
+    getSelection(): string {
+      return this.selectionText ?? "";
     }
     /** 搜索关闭同步清空测试 selection 投影，保持与 xterm 公共合同一致。 */
     clearSelection(): void {
@@ -579,33 +586,29 @@ describe("TerminalPanel", () => {
     ).toEqual([...escapePrefix, ...escapeSuffix]);
   });
 
-  /** 没有可信 paste hook 时 Ctrl+V 留给 xterm/WebView，不能触发程序化 clipboard 读取能力。 */
-  it("leaves standard paste handling to xterm when no paste hook is provided", () => {
+  /** 剪贴板读取权限仅由右键菜单项触发，Ctrl+V 即使有菜单端口仍由 xterm/WebView 处理。 */
+  it("leaves Ctrl+V to xterm when the context-menu paste hook is provided", () => {
     const readText = vi.fn(async () => "private clipboard");
+    const onPaste = vi.fn(async () => "menu-only paste");
+    const onData = vi.fn();
     vi.stubGlobal("navigator", { clipboard: { readText } });
-    render(<TerminalPanel />);
+    render(<TerminalPanel onPaste={onPaste} onData={onData} />);
 
     const allowed = mocks.terminals[0]?.emitKey(
       new KeyboardEvent("keydown", { key: "v", ctrlKey: true }),
     );
 
     expect(allowed).toBe(true);
+    expect(onPaste).not.toHaveBeenCalled();
+    expect(onData).not.toHaveBeenCalled();
     expect(readText).not.toHaveBeenCalled();
   });
 
-  /** 显式 host hook 拥有 paste 文本并阻止快捷键两次进入 xterm，组件仍不读取 navigator.clipboard。 */
-  it("uses only the explicit paste hook and renders the search close icon", async () => {
+  /** 搜索仍拦截快捷键，而程序化剪贴板读取专属于菜单动作。 */
+  it("opens terminal search and renders the close icon", async () => {
     const readText = vi.fn(async () => "untrusted");
-    const onPaste = vi.fn(async () => "trusted paste");
-    const onData = vi.fn();
     vi.stubGlobal("navigator", { clipboard: { readText } });
-    const rendered = render(<TerminalPanel onPaste={onPaste} onData={onData} />);
-
-    expect(
-      mocks.terminals[0]?.emitKey(new KeyboardEvent("keydown", { key: "v", ctrlKey: true })),
-    ).toBe(false);
-    await waitFor(() => expect(onData).toHaveBeenCalledWith("trusted paste"));
-    expect(readText).not.toHaveBeenCalled();
+    const rendered = render(<TerminalPanel />);
 
     expect(
       mocks.terminals[0]?.emitKey(new KeyboardEvent("keydown", { key: "f", ctrlKey: true })),
@@ -764,5 +767,112 @@ describe("TerminalPanel", () => {
       text: "https://example.com/docs",
       range: { start: { x: 3, y: 1 }, end: { x: 6, y: 3 } },
     });
+  });
+
+  /** 菜单只在终端表面打开，定位于最近右键点，并在用户选择后才调用复制或读取端口。 */
+  it("offers selected text copy and explicit paste from the terminal context menu", async () => {
+    const onCopy = vi.fn(async () => undefined);
+    const onPaste = vi.fn(async () => "pasted command");
+    const onData = vi.fn();
+    const rendered = render(<TerminalPanel onCopy={onCopy} onPaste={onPaste} onData={onData} />);
+    const terminal = mocks.terminals[0]!;
+    terminal.selectionText = "selected output";
+    const screen = rendered.container.querySelector(".xterm-screen")!;
+
+    fireEvent.contextMenu(screen, { button: 2, clientX: 32, clientY: 44 });
+    await rendered.findByRole("menu", { name: "终端操作" });
+    const anchor = rendered.container.querySelector<HTMLElement>(".ja-pointer-context-anchor");
+    expect(anchor?.style.left).toBe("32px");
+    expect(anchor?.style.top).toBe("44px");
+    expect(onPaste).not.toHaveBeenCalled();
+
+    fireEvent.click(rendered.getByRole("menuitem", { name: "复制选中内容" }));
+    await waitFor(() => expect(onCopy).toHaveBeenCalledWith("selected output"));
+
+    fireEvent.contextMenu(screen, { button: 2, clientX: 120, clientY: 90 });
+    await rendered.findByRole("menu", { name: "终端操作" });
+    expect(
+      rendered.container.querySelector<HTMLElement>(".ja-pointer-context-anchor")?.style.left,
+    ).toBe("120px");
+    expect(onPaste).not.toHaveBeenCalled();
+    fireEvent.click(rendered.getByRole("menuitem", { name: "粘贴到终端" }));
+
+    await waitFor(() => expect(onData).toHaveBeenCalledWith("pasted command"));
+    expect(onPaste).toHaveBeenCalledOnce();
+  });
+
+  /** 终端输入对单块 UTF-8 字节有 64 KiB 上限，超限菜单操作必须给出错误且不发送。 */
+  it("shows a visible error and sends nothing for oversized terminal paste text", async () => {
+    const onPaste = vi.fn(async () => "🙂".repeat(16_385));
+    const onData = vi.fn();
+    const rendered = render(<TerminalPanel onPaste={onPaste} onData={onData} />);
+    const screen = rendered.container.querySelector(".xterm-screen")!;
+
+    fireEvent.contextMenu(screen, { button: 2, clientX: 20, clientY: 20 });
+    fireEvent.click(await rendered.findByRole("menuitem", { name: "粘贴到终端" }));
+
+    expect(await rendered.findByRole("alert")).toHaveTextContent(
+      "剪贴板内容超过 64 KiB，未发送到终端。",
+    );
+    expect(onPaste).toHaveBeenCalledOnce();
+    expect(onData).not.toHaveBeenCalled();
+  });
+
+  /** 复制端口失败同样反馈在终端面板，避免自定义菜单吞掉 WebView2 剪贴板异常。 */
+  it("shows a visible error when copying the selected terminal text fails", async () => {
+    const onCopy = vi.fn(async () => {
+      throw new Error("native clipboard failure");
+    });
+    const rendered = render(<TerminalPanel onCopy={onCopy} />);
+    const terminal = mocks.terminals[0]!;
+    terminal.selectionText = "selected output";
+    const screen = rendered.container.querySelector(".xterm-screen")!;
+
+    fireEvent.contextMenu(screen, { button: 2, clientX: 20, clientY: 20 });
+    fireEvent.click(await rendered.findByRole("menuitem", { name: "复制选中内容" }));
+
+    expect(await rendered.findByRole("alert")).toHaveTextContent(
+      "无法复制终端选区，请检查剪贴板权限后重试。",
+    );
+    expect(rendered.queryByText("native clipboard failure")).not.toBeInTheDocument();
+  });
+
+  /** 系统剪贴板拒绝时只展示安全错误，不产生未处理 rejection 或终端输入。 */
+  it("shows a visible error when clipboard paste fails", async () => {
+    const onPaste = vi.fn(async () => {
+      throw new Error("native details are not shown");
+    });
+    const onData = vi.fn();
+    const rendered = render(<TerminalPanel onPaste={onPaste} onData={onData} />);
+    const screen = rendered.container.querySelector(".xterm-screen")!;
+
+    fireEvent.contextMenu(screen, { button: 2, clientX: 20, clientY: 20 });
+    fireEvent.click(await rendered.findByRole("menuitem", { name: "粘贴到终端" }));
+
+    expect(await rendered.findByRole("alert")).toHaveTextContent(
+      "无法读取剪贴板，未向终端发送内容。",
+    );
+    expect(rendered.queryByText("native details are not shown")).not.toBeInTheDocument();
+    expect(onData).not.toHaveBeenCalled();
+  });
+
+  /** 搜索输入和链接沿用各自右键目标，不显示终端的复制粘贴菜单。 */
+  it("does not take over context menus for terminal search inputs or links", async () => {
+    const rendered = render(
+      <TerminalPanel onPaste={vi.fn(async () => "paste")} onData={vi.fn()} />,
+    );
+    const terminal = mocks.terminals[0]!;
+    const screen = rendered.container.querySelector(".xterm-screen")!;
+    terminal.emitKey(new KeyboardEvent("keydown", { key: "f", ctrlKey: true }));
+    const input = await rendered.findByRole("textbox", { name: "终端搜索" });
+
+    fireEvent.contextMenu(input, { button: 2, clientX: 12, clientY: 12 });
+    expect(rendered.queryByRole("menu", { name: "终端操作" })).not.toBeInTheDocument();
+
+    const link = document.createElement("a");
+    link.href = "https://example.com";
+    screen.append(link);
+    fireEvent.contextMenu(link, { button: 2, clientX: 24, clientY: 18 });
+    expect(rendered.queryByRole("menu", { name: "终端操作" })).not.toBeInTheDocument();
   });
 });

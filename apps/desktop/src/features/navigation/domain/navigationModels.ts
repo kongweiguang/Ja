@@ -16,6 +16,7 @@ export interface WindowFrameState {
 /** 历史导航只消费可展示字段，不复用 History adapter 的持久化 DTO。 */
 export interface ThreadProjection {
   readonly threadId: string;
+  readonly legacySharedWorkspaceId?: string | null;
   readonly title: string;
   readonly status: "active" | "archived" | "deleted";
   readonly pinned: boolean;

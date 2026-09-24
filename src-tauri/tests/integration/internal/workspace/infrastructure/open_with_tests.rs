@@ -152,9 +152,36 @@ fn fake_launcher_receives_safe_file_reveal_and_repeat_clicks() {
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].target, OpenWithTarget::FileExplorer);
     assert_eq!(plans[0].relative_path, "main.rs");
-    assert!(plans[0].args[0].to_string_lossy().starts_with("/select,"));
+    assert!(plans[0].args[0].to_string_lossy().starts_with("/select,\""));
+    assert!(plans[0].args[0].to_string_lossy().ends_with('"'));
     assert_eq!(plans[0].args, plans[1].args);
     assert_eq!(plans[0].cwd, plans[1].cwd);
+}
+
+/// 工作区外文件使用同一闭集 Explorer launcher，保留空格与中文且不经过 shell。
+#[test]
+fn external_file_reveal_uses_fixed_explorer_plan() {
+    let root = tempfile_like::TempDir::create();
+    let path = root.path.join("资料 空间.txt");
+    fs::write(&path, "fixture").expect("external fixture");
+    let resolver = FakeResolver {
+        program: PathBuf::from("C:\\Windows\\explorer.exe"),
+    };
+    let launcher = RecordingLauncher::default();
+
+    reveal_absolute_file_with(&resolver, &launcher, &path).expect("reveal plan");
+    assert!(matches!(
+        reveal_absolute_file_with(&resolver, &launcher, Path::new("relative.txt")),
+        Err(OpenError::InvalidInput)
+    ));
+    let plans = launcher.plans.lock().expect("recording launcher lock");
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].target, OpenWithTarget::FileExplorer);
+    assert_eq!(plans[0].cwd, root.path);
+    assert_eq!(
+        plans[0].args,
+        vec![OsString::from(format!("/select,\"{}\"", path.display()))]
+    );
 }
 
 /// Visual Studio 目录打开保持确定性：仅准入唯一直接 solution/project，歧义目录失败关闭。

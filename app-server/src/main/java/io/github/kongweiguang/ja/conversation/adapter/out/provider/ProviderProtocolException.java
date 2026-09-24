@@ -22,7 +22,7 @@ public final class ProviderProtocolException extends ModelPort.ModelUnavailableE
      * 保持诊断稳定且脱敏，同时保留提交前重试门禁所需标记。
      */
     public ProviderProtocolException(String code, String message, boolean retryable) {
-        this(code, message, retryable, null, null);
+        this(code, message, retryable, (Throwable) null, (Duration) null);
     }
 
     /**
@@ -40,11 +40,31 @@ public final class ProviderProtocolException extends ModelPort.ModelUnavailableE
     }
 
     /**
+     * 保留 Provider 内部码用于诊断，同时由调用方投影 Provider 中立的终态类别供 Agent 恢复策略使用。
+     */
+    public ProviderProtocolException(String code, String message, boolean retryable, String terminalErrorCode) {
+        this(code, message, retryable, null, null, terminalErrorCode);
+    }
+
+    /** 在携带有界 Retry-After 时仍显式固定跨 Provider 终态类别。 */
+    public ProviderProtocolException(String code, String message, boolean retryable,
+                                     Duration retryAfter, String terminalErrorCode) {
+        this(code, message, retryable, null, retryAfter, terminalErrorCode);
+    }
+
+    /**
      * 为传输 cause 和服务端退避提示初始化脱敏故障状态。
      */
     private ProviderProtocolException(String code, String message, boolean retryable,
                                       Throwable cause, Duration retryAfter) {
-        super(message, cause, retryable ? "MODEL_UNAVAILABLE" : "MODEL_PROTOCOL_ERROR");
+        this(code, message, retryable, cause, retryAfter,
+                retryable ? "MODEL_UNAVAILABLE" : "MODEL_PROTOCOL_ERROR");
+    }
+
+    /** 统一校验 Provider 私有 code、跨 Provider 终态类别与有界退避提示。 */
+    private ProviderProtocolException(String code, String message, boolean retryable,
+                                      Throwable cause, Duration retryAfter, String terminalErrorCode) {
+        super(message, cause, terminalErrorCode);
         this.code = requireSafeCode(code);
         this.retryable = retryable;
         if (retryAfter != null && (retryAfter.isNegative() || retryAfter.compareTo(Duration.ofSeconds(60)) > 0)) {

@@ -174,7 +174,7 @@ final class RpcServerTest {
                 });
         RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, () -> { });
         RpcServiceBindings bindings = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
-                base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
+                base.threads(), base.threadMcp(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
                 base.attachments(), base.attachmentPreviews(), base.tasks(), goalOwner, base.interactions(), base.lifecycle());
 
         try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024);
@@ -253,7 +253,7 @@ final class RpcServerTest {
         };
         RpcServiceBindings base = RpcTestBindings.create(null, null, null, null, null, () -> { });
         RpcServiceBindings bindings = new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(),
-                base.threads(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
+                base.threads(), base.threadMcp(), base.turns(), base.compactions(), base.approvals(), base.catalog(),
                 base.attachments(), base.attachmentPreviews(), taskOwner, base.goals(), base.interactions(), lifecycle);
         try (StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024)) {
             RpcSession session = new RpcSession(testConfiguration(), mapper, CLOCK, writer,
@@ -643,9 +643,21 @@ final class RpcServerTest {
                 throw new UnsupportedOperationException();
             }
 
-            /** 阻塞夹具不创建通用工作区。 */
+            /** 阻塞夹具不创建会话目录。 */
             @Override
-            public Workspace openGeneralWorkspace() {
+            public Workspace createSessionWorkspace(String threadId) {
+                throw new UnsupportedOperationException();
+            }
+
+            /** 阻塞夹具不执行创建补偿。 */
+            @Override
+            public void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision) {
+                throw new UnsupportedOperationException();
+            }
+
+            /** 阻塞夹具不重开登记目录。 */
+            @Override
+            public Workspace openRegisteredWorkspace(String workspaceId) {
                 throw new UnsupportedOperationException();
             }
 
@@ -687,9 +699,9 @@ final class RpcServerTest {
                 throw new UnsupportedOperationException();
             }
 
-            /** 阻塞夹具不声明通用目录。 */
+            /** 阻塞夹具不声明旧共享目录。 */
             @Override
-            public boolean isGeneralWorkspace(Path root) {
+            public boolean isLegacySharedWorkspace(Path root) {
                 return false;
             }
 

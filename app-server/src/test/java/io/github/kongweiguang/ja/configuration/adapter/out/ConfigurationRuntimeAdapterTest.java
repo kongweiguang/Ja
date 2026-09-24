@@ -71,11 +71,12 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
-    /** 缺失普通字段和旧 schema 只回退受影响字段，保留可调用的 Provider/Model 目录。 */
+    /** 缺失普通字段和旧 schema 只回退受影响字段，且默认流空闲上限为 300 秒。 */
     @Test
     void missingFieldsAndLegacySchemaKeepUsableProviderProjection() throws Exception {
         String omittedNulls = profileConfig("nullable-model")
                 .replace("schema_version = 2", "schema_version = 1")
+                .replace("[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n", "")
                 .replace("default_reasoning_level = \"medium\"\n", "")
                 .replace("reasoning_level_map = { medium = \"medium\" }", "reasoning_level_map = {}");
         Files.writeString(homeDirectory().resolve("config.toml"), omittedNulls);
@@ -85,6 +86,8 @@ final class ConfigurationRuntimeAdapterTest {
             assertEquals(ConfigurationUseCase.LayerStatus.VALID, read.user().status());
             assertEquals(1, node(read.effective()).withArray("providers").size());
             assertEquals(1, node(read.effective()).withArray("providers").get(0).withArray("models").size());
+            assertEquals(300_000, node(read.effective()).path("providers").path(0)
+                    .path("network_timeouts").path("request_timeout_ms").intValue());
             assertEquals(omittedNulls, Files.readString(homeDirectory().resolve("config.toml")));
         }
     }

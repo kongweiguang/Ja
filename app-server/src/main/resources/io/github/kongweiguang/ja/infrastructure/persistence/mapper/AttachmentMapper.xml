@@ -36,8 +36,10 @@
   </insert>
   <select id="selectAttachment" resultMap="attachmentRow">
     SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
-      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ma.message_id AS bound_message_id
-    FROM attachments a LEFT JOIN message_attachments ma ON ma.attachment_id=a.attachment_id
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,
+      (SELECT ma.message_id FROM message_attachments ma WHERE ma.attachment_id=a.attachment_id
+        ORDER BY ma.created_at,ma.message_id LIMIT 1) AS bound_message_id
+    FROM attachments a
     WHERE a.attachment_id=#{attachmentId}
   </select>
   <select id="selectUnreservedDraft" resultMap="attachmentRow">
@@ -66,16 +68,30 @@
             AND json_extract(ref.value,'$.attachmentId')=#{attachmentId})
     )
     SELECT a.attachment_id,a.workspace_id,a.blob_sha256,a.content_sha256,a.display_name,a.size_bytes,
-      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,ma.message_id AS bound_message_id
+      a.media_kind,a.media_type,a.status,a.created_at,a.expires_at,
+      (SELECT ma.message_id FROM message_attachments ma JOIN messages owner ON owner.message_id=ma.message_id
+        WHERE ma.attachment_id=a.attachment_id AND owner.thread_id IN
+          (SELECT thread_id FROM readable_threads) ORDER BY ma.created_at,ma.message_id LIMIT 1) AS bound_message_id
     FROM attachments a
-    LEFT JOIN message_attachments ma ON ma.attachment_id=a.attachment_id
-    LEFT JOIN messages m ON m.message_id=ma.message_id
-    LEFT JOIN pending_input_attachments pia ON pia.attachment_id=a.attachment_id
-    LEFT JOIN pending_inputs pi ON pi.input_id=pia.input_id AND pi.state='PENDING'
     WHERE a.attachment_id=#{attachmentId}
       AND a.workspace_id IN (SELECT workspace_id FROM readable_threads WHERE thread_id=#{threadId})
-      AND ((a.status='BOUND' AND m.thread_id IN (SELECT thread_id FROM readable_threads))
-        OR (a.status='DRAFT' AND pi.thread_id=#{threadId}))
+      AND ((a.status='BOUND' AND EXISTS(SELECT 1 FROM message_attachments ma
+            JOIN messages m ON m.message_id=ma.message_id
+            WHERE ma.attachment_id=a.attachment_id AND m.thread_id IN
+              (SELECT thread_id FROM readable_threads)))
+        OR (a.status='DRAFT' AND EXISTS(SELECT 1 FROM pending_input_attachments pia
+            JOIN pending_inputs pi ON pi.input_id=pia.input_id AND pi.state='PENDING'
+            WHERE pia.attachment_id=a.attachment_id AND pi.thread_id=#{threadId})))
+  </select>
+  <select id="isMessageAttachmentBoundTo" resultType="boolean">
+    SELECT EXISTS(SELECT 1 FROM message_attachments ma
+      JOIN messages m ON m.message_id=ma.message_id
+      JOIN threads t ON t.thread_id=m.thread_id
+      JOIN attachments a ON a.attachment_id=ma.attachment_id
+      WHERE ma.attachment_id=#{attachmentId} AND ma.message_id=#{messageId}
+        AND m.thread_id=#{threadId} AND t.workspace_id=#{workspaceId}
+        AND a.workspace_id=#{workspaceId} AND a.status='BOUND'
+        AND a.blob_sha256 IS NOT NULL)
   </select>
   <update id="discardDraft">
     UPDATE attachments SET status='DISCARDED',discarded_at=#{discardedAt},blob_sha256=NULL

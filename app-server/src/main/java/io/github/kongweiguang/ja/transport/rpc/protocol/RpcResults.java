@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.transport.rpc.protocol;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestProfile;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
@@ -29,8 +30,9 @@ import io.github.kongweiguang.ja.foundation.json.JsonValue;
 import io.github.kongweiguang.ja.task.domain.TaskModels;
 
 import java.util.ArrayList;
-import java.util.Locale;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 import java.time.Instant;
 
 /**
@@ -53,7 +55,10 @@ public final class RpcResults {
     public static ObjectNode workspace(ObjectMapper mapper, Workspace value) {
         return mapper.createObjectNode().put("workspaceId", value.workspaceId())
                 .put("root", value.root().toString()).put("displayName", value.displayName())
-                .put("trust", value.trust().name().toLowerCase(Locale.ROOT)).put("revision", value.revision());
+                .put("trust", value.trust().name().toLowerCase(Locale.ROOT))
+                .put("kind", value.kind().name().toLowerCase(Locale.ROOT))
+                .put("revision", value.revision())
+                .put("legacySharedWorkspaceId", value.legacySharedWorkspaceId());
     }
 
     /**
@@ -62,10 +67,12 @@ public final class RpcResults {
     public static ObjectNode thread(ObjectMapper mapper, ThreadSummary value) {
         ObjectNode result = mapper.createObjectNode().put("threadId", value.threadId())
                 .put("workspaceId", value.workspaceId()).put("title", value.title())
+                .put("workspaceKind", value.workspaceKind())
                 .put("status", value.status().name().toLowerCase(Locale.ROOT)).put("pinned", value.pinned())
                 .put("latestTurnSeen", value.latestTurnSeen())
                 .put("revision", value.revision())
                 .put("createdAt", value.createdAt().toString()).put("updatedAt", value.updatedAt().toString());
+        result.put("legacySharedWorkspaceId", value.legacySharedWorkspaceId());
         if (value.latestTurnStatus() == null) result.putNull("latestTurnStatus");
         else result.put("latestTurnStatus", value.latestTurnStatus().name().toLowerCase(Locale.ROOT));
         if (value.activeGoalId() == null) result.putNull("activeGoalId");
@@ -79,6 +86,85 @@ public final class RpcResults {
         if (value.preferences().reasoningLevel() == null) preferences.putNull("reasoningLevel");
         else preferences.put("reasoningLevel", value.preferences().reasoningLevel());
         return result;
+    }
+
+    /** 映射闭集 MCP 状态，只输出会话观测字段并省略未知值以维持真实零工具语义。 */
+    public static ObjectNode threadMcp(ObjectMapper mapper, ThreadMcpUseCase.ReadResult value) {
+        Objects.requireNonNull(mapper, "mapper");
+        Objects.requireNonNull(value, "value");
+        if (value.servers().size() > 200 || (value.catalogRevision() != null
+                && !value.catalogRevision().matches("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) {
+            throw new IllegalStateException("invalid sanitized Thread MCP status");
+        }
+        ObjectNode result = mapper.createObjectNode()
+                .put("threadId", value.threadId())
+                .put("source", mcpSource(value.source()));
+        ArrayNode notices = result.putArray("notices");
+        value.notices().forEach(notice -> notices.add(mcpNotice(notice)));
+        if (value.catalogRevision() != null) result.put("catalogRevision", value.catalogRevision());
+        if (value.observedAt() != null) result.put("observedAt", value.observedAt().toString());
+        ArrayNode servers = result.putArray("servers");
+        value.servers().forEach(server -> {
+            requireMcpServerWireFields(server);
+            ObjectNode projected = servers.addObject()
+                    .put("serverId", server.serverId())
+                    .put("name", server.name())
+                    .put("scope", mcpScope(server.scope()))
+                    .put("state", mcpState(server.state()));
+            if (server.toolCount() != null) projected.put("toolCount", server.toolCount());
+            if (server.reasonCode() != null) projected.put("reasonCode", server.reasonCode());
+        });
+        return result;
+    }
+
+    /** 在 Java 生产端执行 TypeScript 响应上限，避免异常运行时状态越过 JA-RPC。 */
+    private static void requireMcpServerWireFields(ThreadMcpUseCase.Server server) {
+        String name = server.name();
+        if (!server.serverId().matches("mcp_[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+                || name.isBlank() || name.length() > 512
+                || name.indexOf('\0') >= 0 || name.indexOf('\n') >= 0 || name.indexOf('\r') >= 0
+                || (server.toolCount() != null && server.toolCount() > 2_000)) {
+            throw new IllegalStateException("invalid sanitized Thread MCP server");
+        }
+    }
+
+    /** 固定来源词汇与 TypeScript schema 同步，新增领域枚举需先完成跨端合同变更。 */
+    private static String mcpSource(ThreadMcpUseCase.Source source) {
+        return switch (source) {
+            case ACTIVE -> "active";
+            case LAST_OBSERVED -> "last_observed";
+            case UNCHECKED -> "unchecked";
+            case STALE -> "stale";
+        };
+    }
+
+    /** 来源与提示均以显式闭集输出，避免未来内部错误码无意进入 UI。 */
+    private static String mcpScope(ThreadMcpUseCase.Scope scope) {
+        return switch (scope) {
+            case GLOBAL -> "global";
+            case PROJECT -> "project";
+        };
+    }
+
+    /** 多条提示可并存，但每条只能来自受控枚举，不能把原始配置诊断透传。 */
+    private static String mcpNotice(ThreadMcpUseCase.Notice notice) {
+        return switch (notice) {
+            case CONFIGURATION_CHANGED -> "configuration_changed";
+            case PROJECT_UNTRUSTED -> "project_untrusted";
+            case PROJECT_CONFIG_ERROR -> "project_config_error";
+        };
+    }
+
+    /** 固定服务状态词汇，避免把未知状态或设置页状态直接映射为会话可用性。 */
+    private static String mcpState(ThreadMcpUseCase.State state) {
+        return switch (state) {
+            case AVAILABLE -> "available";
+            case UNAVAILABLE -> "unavailable";
+            case DISABLED -> "disabled";
+            case NOT_DISCOVERED -> "not_discovered";
+            case NOT_EXPOSED -> "not_exposed";
+            case STALE -> "stale";
+        };
     }
 
     /** 投影附件公开元数据；内容 hash、ingress token 与物理路径永不进入 Wire。 */
@@ -257,6 +343,8 @@ public final class RpcResults {
         else result.put("errorCode", turn.errorCode());
         if (turn.changeSet() == null) result.putNull("changeSet");
         else result.set("changeSet", changeSet(mapper, turn.changeSet()));
+        if (turn.sourceMessageId() == null) result.putNull("sourceMessageId");
+        else result.put("sourceMessageId", turn.sourceMessageId());
         return result;
     }
 

@@ -277,30 +277,6 @@
   line-height: var(--ja-line-caption);
 }
 
-/* 固定锚点只向 Radix 提供右键坐标，不进入键盘顺序或截获 Tab 条指针。 */
-.ja-workbench-tab-context-anchor {
-  position: fixed;
-  z-index: -1;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  border: 0;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.ja-workbench-tab-context-menu {
-  z-index: 42;
-  display: grid;
-  min-width: 13.5rem;
-  gap: 0.12rem;
-  padding: 0.34rem;
-  border: 1px solid var(--ja-border-strong);
-  border-radius: var(--ja-radius-lg);
-  background: var(--ja-surface-elevated, var(--ja-surface));
-  box-shadow: var(--ja-shadow-floating);
-}
-
 .ja-workbench-tab-context-item {
   display: grid;
   min-height: 2rem;

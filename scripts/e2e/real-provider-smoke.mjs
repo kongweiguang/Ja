@@ -41,7 +41,6 @@ const methods = [
   "runtime/health",
   "runtime/shutdown",
   "workspace/open",
-  "workspace/open-general",
   "workspace/list",
   "workspace/path/search",
   "workspace/set-trust",
@@ -1369,7 +1368,12 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       }),
       "workspace/open",
     );
-    if (typeof workspace?.workspaceId !== "string" || !workspace.workspaceId.startsWith("ws_")) {
+    if (
+      typeof workspace?.workspaceId !== "string" ||
+      !workspace.workspaceId.startsWith("ws_") ||
+      workspace.kind !== "project" ||
+      workspace.legacySharedWorkspaceId !== null
+    ) {
       throw new Error("workspace/open returned an invalid workspace identity");
     }
 
@@ -1389,7 +1393,11 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     if (typeof threadId !== "string" || !threadId.startsWith("thr_")) {
       throw new Error("thread/create returned an invalid thread identity");
     }
-    if (created.workspaceId !== workspace.workspaceId) {
+    if (
+      created.workspaceId !== workspace.workspaceId ||
+      created.workspaceKind !== "project" ||
+      created.legacySharedWorkspaceId !== null
+    ) {
       throw new Error("thread/create did not retain Java's workspace identity");
     }
     const textMarker = `JA_REAL_PROVIDER_TEXT_${Date.now().toString(36)}`;

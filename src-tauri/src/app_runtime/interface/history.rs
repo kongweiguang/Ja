@@ -4,26 +4,28 @@
 // Workspace/Thread 历史命令的 Tauri DTO 适配。
 
 use super::history_model::{
-    AcceptedResult, HistoryMethod, PageInput, ThreadCompactInput, ThreadCompactResult,
-    ThreadCreateInput, ThreadDiscoverInput, ThreadDiscoverResult, ThreadDto, ThreadListInput,
-    ThreadListResult, ThreadMutationInput, ThreadPinInput, ThreadPreferencesUpdateInput,
-    ThreadReadInput, ThreadReadResult, ThreadRenameInput, ThreadSearchInput, ThreadUsageReadInput,
-    ThreadUsageSummary, WorkspaceListResult, dispatch_compaction, dispatch_mutation, dispatch_pin,
-    dispatch_thread_lifecycle, parse_thread, parse_thread_discovery, parse_thread_page,
-    parse_thread_read, parse_thread_usage_summary, parse_workspace_page, request_history,
-    request_thread_discover, validate_page, validate_thread_create, validate_thread_discover,
-    validate_thread_list, validate_thread_preferences_update, validate_thread_read,
-    validate_thread_rename, validate_thread_search, validate_thread_usage_read,
+    AcceptedResult, HistoryMethod, ThreadCompactInput, ThreadCompactResult, ThreadCreateInput,
+    ThreadDiscoverInput, ThreadDiscoverResult, ThreadDto, ThreadListInput, ThreadListResult,
+    ThreadMcpReadInput, ThreadMcpStatusResult, ThreadMutationInput, ThreadPinInput,
+    ThreadPreferencesUpdateInput, ThreadReadInput, ThreadReadResult, ThreadRenameInput,
+    ThreadSearchInput, ThreadUsageReadInput, ThreadUsageSummary, WorkspaceListInput,
+    WorkspaceListResult, dispatch_compaction, dispatch_mutation, dispatch_pin,
+    dispatch_thread_lifecycle, parse_thread, parse_thread_discovery, parse_thread_mcp_status,
+    parse_thread_page, parse_thread_read, parse_thread_usage_summary, parse_workspace_page,
+    request_history, request_thread_discover, validate_thread_create, validate_thread_discover,
+    validate_thread_list, validate_thread_mcp_read, validate_thread_preferences_update,
+    validate_thread_read, validate_thread_rename, validate_thread_search,
+    validate_thread_usage_read, validate_workspace_list,
 };
 use crate::app_runtime::{RuntimeCommandError, RuntimeHost};
 
 /// 列出 Java-owned Workspace；分页输入先在 native 边界完成约束校验。
 #[tauri::command]
 pub fn ja_workspace_list(
-    input: PageInput,
+    input: WorkspaceListInput,
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<WorkspaceListResult, RuntimeCommandError> {
-    validate_page(&input)?;
+    validate_workspace_list(&input)?;
     let result = request_history(
         &state,
         HistoryMethod::WorkspaceList,
@@ -119,6 +121,21 @@ pub fn ja_thread_usage_read(
         serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
     )?;
     parse_thread_usage_summary(result)
+}
+
+/// 读取指定 Thread 的脱敏 MCP 状态，不连接或探测服务器，避免旁路读取改变会话运行状态。
+#[tauri::command]
+pub fn ja_thread_mcp_read(
+    input: ThreadMcpReadInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<ThreadMcpStatusResult, RuntimeCommandError> {
+    validate_thread_mcp_read(&input)?;
+    let result = request_history(
+        &state,
+        HistoryMethod::ThreadMcpRead,
+        serde_json::to_value(&input).map_err(|_| RuntimeCommandError::invalid_params())?,
+    )?;
+    parse_thread_mcp_status(result, &input.thread_id)
 }
 
 /// 通过 revision CAS 设置人工标题；Java 同一事务内维护 titleSource，Rust 不推导竞争结果。

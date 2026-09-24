@@ -146,6 +146,33 @@ final class ActiveStreamRegistryTest {
         assertEquals("第二段", afterDuplicate.segments().getFirst().text());
     }
 
+    /**
+     * 重试只清除失败请求的临时草稿；Turn 的 streamSeq 保持单调，重复通知不得清掉下一次请求已接纳的正文。
+     */
+    @Test
+    void clearsRetryDraftWithoutResettingSequenceOrClearingNextAttempt() {
+        ActiveStreamRegistry registry = new ActiveStreamRegistry(18);
+        registry.register("turn_retry", "thr_retry", 1, 1, 0);
+        registry.observe(new TurnEvent.TextDelta("turn_retry", 1, "failed partial"), T0);
+        registry.observeTurnCommit("thr_retry", "turn_retry", 2, 2, 0, null, T0.plusSeconds(1));
+        TurnEvent.RetryStarted retry = new TurnEvent.RetryStarted(
+                new TurnEvent.Context("evt_retry", "thr_retry", "turn_retry", 2, 2, T0.plusSeconds(1)),
+                2, 6);
+
+        registry.observe(retry, T0.plusSeconds(1));
+        ActiveStreamRegistry.Snapshot cleared = registry.snapshot("thr_retry", 2,
+                Set.of("turn_retry"), Map.of("turn_retry", 2L), Map.of("turn_retry", 0)).orElseThrow();
+        assertEquals(1, cleared.streamSeq());
+        assertTrue(cleared.segments().isEmpty());
+
+        registry.observe(new TurnEvent.TextDelta("turn_retry", 2, "next attempt"), T0.plusSeconds(2));
+        registry.observe(retry, T0.plusSeconds(3));
+        ActiveStreamRegistry.Snapshot nextAttempt = registry.snapshot("thr_retry", 2,
+                Set.of("turn_retry"), Map.of("turn_retry", 2L), Map.of("turn_retry", 0)).orElseThrow();
+        assertEquals(2, nextAttempt.streamSeq());
+        assertEquals("next attempt", nextAttempt.segments().getFirst().text());
+    }
+
     /** STOP 结算旧 Assistant 并消费队列输入时，新的 execution modelRound 必须绑定到清稿 fence。 */
     @Test
     void assistantSettlementAdvancesClearedRoundBeforeNextDelta() {

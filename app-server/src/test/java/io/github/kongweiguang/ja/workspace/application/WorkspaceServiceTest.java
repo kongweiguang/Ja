@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.workspace.application;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -46,8 +47,9 @@ final class WorkspaceServiceTest {
     void setUp() {
         Path project = temporaryDirectory.resolve("project").toAbsolutePath().normalize();
         Path general = temporaryDirectory.resolve("data/general-workspace").toAbsolutePath().normalize();
+        Path sessions = temporaryDirectory.resolve("home/workspaces").toAbsolutePath().normalize();
         repository = new FakeWorkspaceRepository();
-        directories = new FakeDirectories(project, general);
+        directories = new FakeDirectories(project, general, sessions);
         prepared = new ArrayList<>();
         synchronizedTrust = new ArrayList<>();
         service = new WorkspaceService(
@@ -98,18 +100,22 @@ final class WorkspaceServiceTest {
         assertEquals(2, prepared.size());
     }
 
-    /** 通用工作区固定使用 Java 身份、中文展示名和受信任状态，且不触发项目预热。 */
+    /** 新主会话按 thread 身份获得独立目录，重开和 turn 准入都重验持久目录。 */
     @Test
-    void opensGeneralWorkspaceWithoutProjectPreparation() {
-        Workspace general = service.openGeneralWorkspace();
+    void createsAndRevalidatesIndependentSessionWorkspace() {
+        Workspace first = service.createSessionWorkspace("thr_session_a");
+        Workspace second = service.createSessionWorkspace("thr_session_b");
 
-        assertEquals("无项目", general.displayName());
-        assertEquals(Workspace.Trust.TRUSTED, general.trust());
-        assertTrue(service.isGeneralWorkspace(general.root()));
+        assertEquals("无项目对话", first.displayName());
+        assertEquals(Workspace.Kind.SESSION, first.kind());
+        assertNotEquals(first.workspaceId(), second.workspaceId());
+        assertNotEquals(first.root(), second.root());
+        assertEquals(first, service.requireOpenWorkspace(first.workspaceId()));
+        assertEquals(first, service.openRegisteredWorkspace(first.workspaceId()));
         assertTrue(prepared.isEmpty());
-        WorkspaceFailure failure = assertThrows(WorkspaceFailure.class,
-                () -> service.setWorkspaceTrust(general.workspaceId(), Workspace.Trust.UNTRUSTED));
-        assertEquals(WorkspaceFailure.Code.TRUST_CONFLICT, failure.code());
+        assertEquals(2, repository.byId.size());
+        assertEquals(2, service.listWorkspaces(null, 20, Workspace.Kind.SESSION).items().size());
+        assertTrue(service.listWorkspaces(null, 20, Workspace.Kind.PROJECT).items().isEmpty());
     }
 
     /** 注销只有在 Repository CAS 成功后才移除进程目录绑定。 */
@@ -157,7 +163,7 @@ final class WorkspaceServiceTest {
 
         assertEquals(List.of(opened), page.items());
         assertEquals(Optional.of(opened), service.readWorkspace(opened.workspaceId()));
-        assertFalse(service.isGeneralWorkspace(opened.root()));
+        assertFalse(service.isLegacySharedWorkspace(opened.root()));
     }
 
     /** 内存仓储模拟新基线的幂等注册、revision 更新和 CAS 注销。 */
@@ -172,6 +178,8 @@ final class WorkspaceServiceTest {
                     registration.root(),
                     registration.displayName(),
                     registration.trust(),
+                    registration.kind(),
+                    registration.legacySharedWorkspaceId(),
                     0);
             return byId.computeIfAbsent(candidate.workspaceId(), ignored -> candidate);
         }
@@ -180,6 +188,15 @@ final class WorkspaceServiceTest {
         @Override
         public CursorPage<Workspace> list(String cursor, int limit) {
             return new CursorPage<>(List.copyOf(byId.values()), null);
+        }
+
+        /** 按持久类型先过滤再分页，模拟生产仓储的服务端 kind 条件。 */
+        @Override
+        public CursorPage<Workspace> list(String cursor, int limit, Workspace.Kind kind) {
+            List<Workspace> values = byId.values().stream()
+                    .filter(workspace -> kind == null || workspace.kind() == kind)
+                    .toList();
+            return new CursorPage<>(values, null);
         }
 
         /** 按身份读取内存权威记录。 */
@@ -201,7 +218,8 @@ final class WorkspaceServiceTest {
         public Workspace updateTrust(String workspaceId, Workspace.Trust trust) {
             Workspace prior = byId.get(workspaceId);
             Workspace updated = new Workspace(
-                    prior.workspaceId(), prior.root(), prior.displayName(), trust, prior.revision() + 1);
+                    prior.workspaceId(), prior.root(), prior.displayName(), trust, prior.kind(),
+                    prior.legacySharedWorkspaceId(), prior.revision() + 1);
             byId.put(workspaceId, updated);
             return updated;
         }
@@ -217,15 +235,17 @@ final class WorkspaceServiceTest {
         }
     }
 
-    /** 目录 fake 返回已经规范化的 project/general 状态，不执行真实文件 IO。 */
+    /** 目录 fake 返回 project、session 与 legacy 的规范身份，不执行真实文件 IO。 */
     private static final class FakeDirectories implements WorkspaceDirectoryPort {
         private Path project;
         private final Path general;
+        private final Path sessions;
 
         /** 固定两类目录，便于断言 application 不会自行重写根路径。 */
-        private FakeDirectories(Path project, Path general) {
+        private FakeDirectories(Path project, Path general, Path sessions) {
             this.project = project;
             this.general = general;
+            this.sessions = sessions;
         }
 
         /** 将当前测试项目根标记为已验证项目目录。 */
@@ -235,15 +255,34 @@ final class WorkspaceServiceTest {
                     WorkspaceDirectory.Kind.PROJECT);
         }
 
-        /** 返回固定的 Java 通用工作区目录。 */
+        /** 依据主 Thread ID 返回独立会话目录。 */
         @Override
-        public WorkspaceDirectory ensureGeneralDirectory() {
-            return new WorkspaceDirectory(general, WorkspaceDirectory.Kind.GENERAL);
+        public WorkspaceDirectory createSessionDirectory(String threadId) {
+            return new WorkspaceDirectory(sessions.resolve(threadId), WorkspaceDirectory.Kind.SESSION);
         }
 
-        /** 仅做规范路径比较，保持与生产适配器相同的无副作用语义。 */
+        /** 只接受固定 thread leaf 的已登记会话根。 */
         @Override
-        public boolean isGeneralDirectory(Path root) {
+        public WorkspaceDirectory verifySessionDirectory(String threadId, Path registeredRoot) {
+            Path expected = sessions.resolve(threadId).toAbsolutePath().normalize();
+            if (!expected.equals(registeredRoot.toAbsolutePath().normalize())) {
+                throw new WorkspaceFailure(WorkspaceFailure.Code.IDENTITY_CONFLICT, "session identity changed");
+            }
+            return new WorkspaceDirectory(expected, WorkspaceDirectory.Kind.SESSION);
+        }
+
+        /** 旧共享目录仅由显式 ID 恢复，普通 session 不能继承它。 */
+        @Override
+        public WorkspaceDirectory verifyLegacySharedDirectory(Path registeredRoot) {
+            if (!general.equals(registeredRoot.toAbsolutePath().normalize())) {
+                throw new WorkspaceFailure(WorkspaceFailure.Code.IDENTITY_CONFLICT, "legacy identity changed");
+            }
+            return new WorkspaceDirectory(general, WorkspaceDirectory.Kind.LEGACY_SHARED);
+        }
+
+        /** 仅比较规范路径，保持与生产适配器相同的无副作用语义。 */
+        @Override
+        public boolean isLegacySharedDirectory(Path root) {
             return root.toAbsolutePath().normalize().equals(general);
         }
     }

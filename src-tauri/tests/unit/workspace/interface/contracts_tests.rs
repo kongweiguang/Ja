@@ -2,7 +2,18 @@
 // @author kongweiguang
 
 use super::*;
-use crate::workspace::{EntryKind, OpenWithTarget};
+use crate::workspace::{EntryKind, LineEnding, OpenWithTarget};
+
+/// CRLF 必须与桌面 Workspace schema 共用 `crlf`，否则 Windows 文件虽读取成功却无法打开或保存。
+#[test]
+fn crlf_uses_desktop_workspace_wire_value() {
+    assert_eq!(serde_json::to_value(LineEnding::CrLf).unwrap(), "crlf");
+    assert_eq!(
+        serde_json::from_value::<LineEnding>(serde_json::json!("crlf")).unwrap(),
+        LineEnding::CrLf
+    );
+    assert!(serde_json::from_value::<LineEnding>(serde_json::json!("cr_lf")).is_err());
+}
 
 /// Mutation DTO 必须拒绝未知字段，避免前端误以为未实现选项已经生效。
 #[test]

@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings;
 import io.github.kongweiguang.ja.transport.rpc.support.TestConfigurationPorts;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.transport.rpc.runtime.RpcRuntimeTestAccess.server;
@@ -47,49 +48,101 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** 通过真实 JSONL 验证 WorkspaceUseCase 是工作区 RPC 的唯一业务 owner。 */
-final class WorkspaceGeneralRpcTest {
+final class WorkspaceSessionRpcTest {
     private static final Instant NOW = Instant.parse("2026-08-26T00:00:00Z");
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
 
-    /** 首次创建、重复调用、进程重启和缺失 cwd 的 Thread 必须复用同一通用身份。 */
+    /** 两个无项目 Thread 获得不同会话根；重启后只能按登记 ID 重开。 */
     @Test
-    void generalWorkspaceIsDurableAndCannotAcceptClientIdentity(@TempDir Path temporaryRoot)
+    void noProjectThreadsUseDistinctDurableSessionDirectories(@TempDir Path temporaryRoot)
             throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         SidecarConfiguration configuration = configuration(temporaryRoot);
         WorkspaceHistory history = new WorkspaceHistory();
         RunResult first = run(configuration, history, mapper,
-                request(mapper, "c:general-first", "workspace/open-general", mapper.createObjectNode()),
-                request(mapper, "c:thread-general", "thread/create", mapper.createObjectNode()
-                        .putNull("cwd").put("title", "无项目测试")
+                request(mapper, "c:thread-first", "thread/create", mapper.createObjectNode()
+                        .put("title", "无项目测试")
                         .put("providerId", "provider_test").put("modelId", "model_test")
                         .put("reasoningLevel", "medium").put("accessMode", "approval_required")
                         .put("collaborationMode", "default")),
-                request(mapper, "c:general-cwd", "workspace/open-general", mapper.createObjectNode()
-                        .put("cwd", temporaryRoot.toString())),
-                request(mapper, "c:general-extra", "workspace/open-general", mapper.createObjectNode()
-                        .put("workspaceId", "ws_client")));
+                request(mapper, "c:thread-second", "thread/create", mapper.createObjectNode()
+                        .put("title", "第二个无项目测试")
+                        .put("providerId", "provider_test").put("modelId", "model_test")
+                        .put("reasoningLevel", "medium").put("accessMode", "approval_required")
+                        .put("collaborationMode", "default")),
+                request(mapper, "c:thread-explicit-null-cwd", "thread/create", mapper.createObjectNode()
+                        .putNull("cwd").put("title", "null cwd must fail")
+                        .put("providerId", "provider_test").put("modelId", "model_test")
+                        .put("reasoningLevel", "medium").put("accessMode", "approval_required")
+                        .put("collaborationMode", "default")));
+        RunResult sessionThreads = run(configuration, history, mapper,
+                request(mapper, "c:session-thread-list", "thread/list", mapper.createObjectNode()
+                        .put("workspaceKind", "session")),
+                request(mapper, "c:session-thread-search", "thread/search", mapper.createObjectNode()
+                        .put("workspaceKind", "session").put("query", "第二")),
+                request(mapper, "c:session-workspace-list", "workspace/list", mapper.createObjectNode()
+                        .put("kind", "session")));
 
-        ObjectNode workspace = result(first.frames(), "c:general-first");
-        assertExactKeys(workspace, "workspaceId", "root", "displayName", "trust", "revision");
-        String workspaceId = workspace.path("workspaceId").textValue();
-        String root = workspace.path("root").textValue();
-        assertTrue(workspaceId.startsWith("ws_"));
-        assertNotEquals("ws_general", workspaceId);
-        assertEquals(configuration.dataDirectory().resolve("general-workspace").toRealPath().toString(), root);
-        assertEquals("无项目", workspace.path("displayName").textValue());
-        assertEquals("trusted", workspace.path("trust").textValue());
-        assertEquals(workspaceId, result(first.frames(), "c:thread-general")
-                .path("workspaceId").textValue());
+        ObjectNode firstThread = result(first.frames(), "c:thread-first");
+        ObjectNode secondThread = result(first.frames(), "c:thread-second");
+        String firstWorkspaceId = firstThread.path("workspaceId").textValue();
+        String secondWorkspaceId = secondThread.path("workspaceId").textValue();
+        assertTrue(firstWorkspaceId.startsWith("ws_"));
+        assertNotEquals(firstWorkspaceId, secondWorkspaceId);
+        assertEquals("session", firstThread.path("workspaceKind").textValue());
+        assertEquals("session", secondThread.path("workspaceKind").textValue());
+        assertTrue(firstThread.path("legacySharedWorkspaceId").isNull());
+        assertTrue(secondThread.path("legacySharedWorkspaceId").isNull());
+        Workspace firstWorkspace = history.findById(firstWorkspaceId).orElseThrow();
+        Workspace secondWorkspace = history.findById(secondWorkspaceId).orElseThrow();
+        assertEquals(configuration.homeDirectory().resolve("workspaces").resolve(firstThread.path("threadId").textValue())
+                .toRealPath(), firstWorkspace.root());
+        assertEquals(configuration.homeDirectory().resolve("workspaces").resolve(secondThread.path("threadId").textValue())
+                .toRealPath(), secondWorkspace.root());
+        assertNotEquals(firstWorkspace.root(), secondWorkspace.root());
         assertEquals(0, first.prepareCalls());
-        assertEquals("INVALID_PARAMS", errorCode(first.frames(), "c:general-cwd"));
-        assertEquals("INVALID_PARAMS", errorCode(first.frames(), "c:general-extra"));
+        assertEquals("INVALID_PARAMS", errorCode(first.frames(), "c:thread-explicit-null-cwd"));
+        assertEquals(2, history.threads.size(), "explicit null cannot create a third session alias");
+        ObjectNode listedThreads = result(sessionThreads.frames(), "c:session-thread-list");
+        ObjectNode searchedThreads = result(sessionThreads.frames(), "c:session-thread-search");
+        ObjectNode listedWorkspaces = result(sessionThreads.frames(), "c:session-workspace-list");
+        assertEquals(2, listedThreads.path("items").size());
+        assertEquals("session", listedThreads.path("items").get(0).path("workspaceKind").textValue());
+        assertEquals(1, searchedThreads.path("items").size());
+        assertEquals("第二个无项目测试", searchedThreads.path("items").get(0).path("title").textValue());
+        assertEquals(2, listedWorkspaces.path("items").size());
+        assertEquals("session", listedWorkspaces.path("items").get(0).path("kind").textValue());
 
         RunResult restarted = run(configuration, history, mapper,
-                request(mapper, "c:general-restarted", "workspace/open-general", mapper.createObjectNode()));
-        assertEquals(workspaceId, result(restarted.frames(), "c:general-restarted")
-                .path("workspaceId").textValue());
-        assertEquals(root, result(restarted.frames(), "c:general-restarted").path("root").textValue());
+                request(mapper, "c:session-reopened", "workspace/open", mapper.createObjectNode()
+                        .put("workspaceId", firstWorkspaceId)));
+        ObjectNode reopened = result(restarted.frames(), "c:session-reopened");
+        assertExactKeys(reopened, "workspaceId", "root", "displayName", "trust", "kind",
+                "legacySharedWorkspaceId", "revision");
+        assertEquals(firstWorkspaceId, reopened.path("workspaceId").textValue());
+        assertEquals(firstWorkspace.root().toString(), reopened.path("root").textValue());
+        assertEquals("session", reopened.path("kind").textValue());
+        assertTrue(reopened.path("legacySharedWorkspaceId").isNull());
+    }
+
+    /** 会话目录创建失败必须阻止 thread/create，不得登记空会话或退回旧共享路径。 */
+    @Test
+    void sessionDirectoryCreationFailureDoesNotFallbackOrCreateThread(@TempDir Path temporaryRoot)
+            throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        SidecarConfiguration configuration = configuration(temporaryRoot);
+        Files.writeString(configuration.homeDirectory().resolve("workspaces"), "not a directory");
+        WorkspaceHistory history = new WorkspaceHistory();
+        RunResult failed = run(configuration, history, mapper,
+                request(mapper, "c:thread-directory-failure", "thread/create", mapper.createObjectNode()
+                        .put("title", "创建失败")
+                        .put("providerId", "provider_test").put("modelId", "model_test")
+                        .put("accessMode", "approval_required").put("collaborationMode", "default")));
+
+        assertEquals("WORKSPACE_NOT_FOUND", errorCode(failed.frames(), "c:thread-directory-failure"));
+        assertTrue(history.byId.isEmpty());
+        assertTrue(history.threads.isEmpty());
+        assertFalse(Files.exists(configuration.dataDirectory().resolve("general-workspace")));
     }
 
     /** 项目打开、Thread 创建、信任、统一分页和注销必须通过同一应用 owner 闭环。 */
@@ -115,7 +168,8 @@ final class WorkspaceGeneralRpcTest {
                 request(mapper, "c:trust", "workspace/set-trust", mapper.createObjectNode()
                         .put("workspaceId", workspaceId).put("trust", "trusted")));
         RunResult listRun = run(configuration, history, mapper,
-                request(mapper, "c:list", "workspace/list", mapper.createObjectNode().put("limit", 20)));
+                request(mapper, "c:list", "workspace/list", mapper.createObjectNode()
+                        .put("limit", 20).put("kind", "project")));
         RunResult unregisterRun = run(configuration, history, mapper,
                 workspaces -> workspaces.openWorkspace(
                         new WorkspaceUseCase.OpenWorkspace(project, null)),
@@ -129,6 +183,8 @@ final class WorkspaceGeneralRpcTest {
         ObjectNode page = result(listRun.frames(), "c:list");
         assertExactKeys(page, "items", "nextCursor");
         assertEquals("trusted", page.path("items").get(0).path("trust").textValue());
+        assertEquals("project", page.path("items").get(0).path("kind").textValue());
+        assertEquals(1, page.path("items").size());
         assertTrue(result(unregisterRun.frames(), "c:unregister").path("accepted").booleanValue());
         assertEquals(1, openedRun.prepareCalls());
         assertEquals(1, threadRun.prepareCalls());
@@ -145,7 +201,7 @@ final class WorkspaceGeneralRpcTest {
         WorkspaceHistory history = new WorkspaceHistory();
         RunResult created = run(configuration, history, mapper,
                 request(mapper, "c:create-seen", "thread/create", mapper.createObjectNode()
-                        .putNull("cwd").put("title", "已读测试")
+                        .put("title", "已读测试")
                         .put("providerId", "provider_test").put("modelId", "model_test")
                         .putNull("reasoningLevel").put("accessMode", "approval_required")
                         .put("collaborationMode", "default")));
@@ -158,7 +214,8 @@ final class WorkspaceGeneralRpcTest {
                         .put("threadId", threadId).put("expectedThreadRevision", 0).put("turnId", "turn_client")));
 
         ObjectNode projection = result(seen.frames(), "c:seen");
-        assertExactKeys(projection, "threadId", "workspaceId", "title", "preferences", "status", "pinned",
+        assertExactKeys(projection, "threadId", "workspaceId", "workspaceKind", "legacySharedWorkspaceId",
+                "title", "preferences", "status", "pinned",
                 "latestTurnStatus", "latestTurnSeen", "activeGoalId", "revision", "createdAt", "updatedAt");
         assertTrue(projection.path("latestTurnSeen").booleanValue());
         assertTrue(projection.path("latestTurnStatus").isNull());
@@ -167,16 +224,19 @@ final class WorkspaceGeneralRpcTest {
 
     /** 仓储返回不同物理根时必须在 transport 绑定前映射为脱敏约束错误。 */
     @Test
-    void generalWorkspaceRejectsPersistedRootMismatch(@TempDir Path temporaryRoot) throws Exception {
+    void sessionWorkspaceRejectsPersistedRootMismatch(@TempDir Path temporaryRoot) throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         Path wrongRoot = Files.createDirectory(temporaryRoot.resolve("wrong-root"));
         RunResult run = run(configuration(temporaryRoot), new WorkspaceHistory(wrongRoot), mapper,
-                request(mapper, "c:general-root", "workspace/open-general", mapper.createObjectNode()));
+                request(mapper, "c:thread-root", "thread/create", mapper.createObjectNode()
+                        .put("title", "隔离会话")
+                        .put("providerId", "provider_test").put("modelId", "model_test")
+                        .put("accessMode", "approval_required").put("collaborationMode", "default")));
 
-        assertEquals("WORKSPACE_CONFINEMENT", errorCode(run.frames(), "c:general-root"));
+        assertEquals("WORKSPACE_CONFINEMENT", errorCode(run.frames(), "c:thread-root"));
     }
 
-    /** 构造不启动 Solon 的生产形状目录，确保通用工作区使用真实 data 边界。 */
+    /** 构造不启动 Solon 的生产布局，确保会话根落在独立 Ja Home 而不是数据库 data 目录。 */
     private static SidecarConfiguration configuration(Path temporaryRoot) throws Exception {
         Path home = Files.createDirectory(temporaryRoot.resolve("home"));
         Path data = Files.createDirectory(temporaryRoot.resolve("data"));
@@ -213,7 +273,7 @@ final class WorkspaceGeneralRpcTest {
         AtomicInteger prepareCalls = new AtomicInteger();
         WorkspaceUseCase workspaces = new WorkspaceService(
                 history,
-                new NioWorkspaceDirectoryAdapter(configuration.dataDirectory()),
+                new NioWorkspaceDirectoryAdapter(configuration.dataDirectory(), configuration.homeDirectory()),
                 ignored -> prepareCalls.incrementAndGet(),
                 (ignored, trust) -> { },
                 new WorkspacePolicy(),
@@ -314,7 +374,8 @@ final class WorkspaceGeneralRpcTest {
             }
             Path persistedRoot = forcedRoot == null ? registration.root() : forcedRoot;
             Workspace value = new Workspace(registration.workspaceId(), persistedRoot,
-                    registration.displayName(), registration.trust(), 0);
+                    registration.displayName(), registration.trust(), registration.kind(),
+                    registration.legacySharedWorkspaceId(), 0);
             byRoot.put(persistedRoot.toString(), value);
             byId.put(value.workspaceId(), value);
             return value;
@@ -324,6 +385,14 @@ final class WorkspaceGeneralRpcTest {
         @Override
         public synchronized CursorPage<Workspace> list(String cursor, int limit) {
             return new CursorPage<>(List.copyOf(byRoot.values()), null);
+        }
+
+        /** 伺服器側 kind 篩選先於 keyset 結果頁，測試不依賴前端本地丟棄混合類型。 */
+        @Override
+        public synchronized CursorPage<Workspace> list(String cursor, int limit, Workspace.Kind kind) {
+            return new CursorPage<>(byRoot.values().stream()
+                    .filter(workspace -> kind == null || workspace.kind() == kind)
+                    .toList(), null);
         }
 
         /** 按身份读取权威事实。 */
@@ -343,7 +412,8 @@ final class WorkspaceGeneralRpcTest {
         public synchronized Workspace updateTrust(String workspaceId, Workspace.Trust trust) {
             Workspace current = byId.get(workspaceId);
             Workspace updated = new Workspace(current.workspaceId(), current.root(),
-                    current.displayName(), trust, current.revision() + 1);
+                    current.displayName(), trust, current.kind(), current.legacySharedWorkspaceId(),
+                    current.revision() + 1);
             byId.put(workspaceId, updated);
             byRoot.put(current.root().toString(), updated);
             return updated;
@@ -367,7 +437,9 @@ final class WorkspaceGeneralRpcTest {
                 throw new IllegalStateException("workspace is missing");
             }
             ThreadSummary value = new ThreadSummary(
-                    request.threadId(), request.workspaceId(), request.title(), request.preferences(),
+                    request.threadId(), request.workspaceId(), request.title(),
+                    byId.get(request.workspaceId()).kind().name().toLowerCase(java.util.Locale.ROOT),
+                    byId.get(request.workspaceId()).legacySharedWorkspaceId(), request.preferences(),
                     ThreadSummary.Status.ACTIVE, false, null, true, null, 0,
                     request.occurredAt(), request.occurredAt());
             threads.put(value.threadId(), value);
@@ -380,11 +452,26 @@ final class WorkspaceGeneralRpcTest {
             return new CursorPage<>(List.copyOf(threads.values()), null);
         }
 
+        /** session 导航只返回拥有独立会话目录的主 Thread，不把项目 workspaceId 当作分组键。 */
+        @Override
+        public synchronized CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) {
+            return new CursorPage<>(threads.values().stream()
+                    .filter(thread -> "session".equals(thread.workspaceKind())).toList(), null);
+        }
+
         /** 本用例搜索路径未启用，避免把列表夹具误当搜索语义。 */
         @Override
         public CursorPage<ThreadSummary> searchThreads(
                 String workspaceId, String query, String cursor, int limit) {
             throw new UnsupportedOperationException();
+        }
+
+        /** session 搜索与 session 列表共用类型判定，避免标题相似的项目 Thread 混入无项目导航。 */
+        @Override
+        public synchronized CursorPage<ThreadSummary> searchSessionThreads(String query, String cursor, int limit) {
+            return new CursorPage<>(threads.values().stream()
+                    .filter(thread -> "session".equals(thread.workspaceKind()))
+                    .filter(thread -> thread.title().contains(query)).toList(), null);
         }
 
         /** 本测试不构造 Thread 快照。 */

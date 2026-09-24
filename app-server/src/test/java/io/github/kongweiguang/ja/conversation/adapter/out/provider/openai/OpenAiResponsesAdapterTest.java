@@ -719,6 +719,36 @@ final class OpenAiResponsesAdapterTest {
         }
     }
 
+    /** 400 分类仅保留固定安全码和闭集参数路径，便于修正请求字段且不泄漏正文、端点或凭据。 */
+    @Test
+    void includesAllowlistedBadRequestCodeAndCanonicalParameter() throws Exception {
+        String error = "{\"error\":{\"message\":\"private-rejection-body\","
+                + "\"type\":\"invalid_request_error\",\"param\":\"input[12].status\","
+                + "\"code\":\"invalid_value\"}}";
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.json(exchange, 400, error))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                java.util.concurrent.ExecutionException failure = assertThrows(
+                        java.util.concurrent.ExecutionException.class, () ->
+                                adapter.start(ModelAdapterTestSupport.request(configuration),
+                                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                                CancellationToken.none())
+                                        .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                ProviderProtocolException protocol = assertInstanceOf(
+                        ProviderProtocolException.class, failure.getCause());
+                assertEquals("provider returned HTTP status 400 code invalid_value "
+                        + "type invalid_request_error param input[].status", protocol.getMessage());
+                assertEquals("MODEL_UPSTREAM_REJECTED", protocol.terminalErrorCode());
+                assertFalse(protocol.toString().contains("private-rejection-body"));
+                assertFalse(protocol.toString().contains("test-secret"));
+                assertFalse(protocol.toString().contains(server.baseUri().toString()));
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
     /** Tool 后续轮发送完整原生条目，网关无需保存 previous response 或重建 call-id 关联。 */
     @Test
     void encodesStatelessToolContinuationWithCompleteNativeHistory() throws Exception {
@@ -770,7 +800,7 @@ final class OpenAiResponsesAdapterTest {
         assertEquals("REMOTE_CONTINUATION_UNSUPPORTED", failure.code());
     }
 
-    /** 通过强类型输入条目映射此前 Tool 历史，并保留显式代理前缀。 */
+    /** 映射此前成功与失败 Tool 历史而不把输出专用状态写回请求，并保留显式代理前缀。 */
     @Test
     void mapsToolHistoryAndProxyBasePath() throws Exception {
         AtomicReference<String> requestBody = new AtomicReference<>();
@@ -809,7 +839,7 @@ final class OpenAiResponsesAdapterTest {
             input.addObject().put("type", "function_call").put("call_id", "old_call")
                     .put("name", "read_file").put("arguments", "{\"path\":\"old.txt\"}");
             input.addObject().put("type", "function_call_output").put("call_id", "old_call")
-                    .put("output", "old contents").put("status", "incomplete");
+                    .put("output", "old contents");
             assertEquals(expected, AbstractStreamingModelAdapter.JSON.readTree(requestBody.get()));
         }
     }

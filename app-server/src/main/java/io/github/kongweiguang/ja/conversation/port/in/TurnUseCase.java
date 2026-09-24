@@ -21,6 +21,12 @@ public interface TurnUseCase extends DeadlineCloseable {
      */
     Accepted start(TurnStartRequest request, TurnEventSink sink);
 
+    /** 在已有问题下创建隐藏 Turn；source 由存储重新解析并在准入事务中校验。 */
+    Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink);
+
+    /** 仅重答当前路径最后一个失败问题，并在新 USER Turn 准入时切换旧后缀。 */
+    Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink);
+
     /** 显式恢复一个 SUSPENDED Turn；成功保持原 turnId 并重新进入同 Thread FIFO。 */
     default Accepted resume(String turnId, long expectedThreadRevision, TurnEventSink sink) {
         throw new UnsupportedOperationException("turn resume is unavailable");
@@ -238,6 +244,32 @@ public interface TurnUseCase extends DeadlineCloseable {
         TURN_RESUME_ORDER_CONFLICT,
         /** 当前最早 Tool 结果未知，自动文件核实无法确认，需使用原 Tool 详情中的明确裁决。 */
         RECOVERY_REQUIRED
+    }
+
+    /** 继续/编辑问题不满足路径状态门时使用的稳定错误类别。 */
+    enum QuestionRecoveryFailure {
+        /** 当前消息已失去重答资格，避免覆盖已变化的历史后缀。 */
+        NOT_REASKABLE
+    }
+
+    /** 无堆栈错误避免把 SQL 与路径校验细节泄漏到 JA-RPC。 */
+    final class QuestionRecoveryException extends RuntimeException {
+        @java.io.Serial private static final long serialVersionUID = 1L;
+        private final QuestionRecoveryFailure failure;
+
+        /** 仅保存协议映射需要的闭集失败类型。 */
+        private QuestionRecoveryException(QuestionRecoveryFailure failure) {
+            super("question recovery failed", null, false, false);
+            this.failure = Objects.requireNonNull(failure, "failure");
+        }
+
+        /** 由应用服务将持久化资格门失败转换为 transport 可穷举异常。 */
+        public static QuestionRecoveryException of(QuestionRecoveryFailure failure) {
+            return new QuestionRecoveryException(failure);
+        }
+
+        /** 返回稳定失败类别。 */
+        public QuestionRecoveryFailure failure() { return failure; }
     }
 
     /** 无堆栈 Resume 异常避免运行时、路径和持久化细节越过入站边界。 */

@@ -9,9 +9,12 @@ import {
 } from "@/api/tauri/history";
 import { RuntimeHostError } from "@/api/tauri/runtime";
 
+/** 构造权威 project Workspace shape，避免共享协议新增的所有权分类被旧夹具省略。 */
 function workspace() {
   return {
     workspaceId: "ws_server",
+    kind: "project" as const,
+    legacySharedWorkspaceId: null,
     root: "C:\\demo",
     displayName: "demo",
     trust: "untrusted" as const,
@@ -19,10 +22,13 @@ function workspace() {
   };
 }
 
+/** 固定完整 Thread identity；测试只覆盖 adapter 路由，不用省略字段弱化服务端 DTO。 */
 function thread(threadId = "thr_fixture") {
   return {
     threadId,
     workspaceId: "ws_server",
+    workspaceKind: "project" as const,
+    legacySharedWorkspaceId: null,
     activeGoalId: null,
     preferences: {
       providerId: "provider_fixture",
@@ -43,7 +49,7 @@ function thread(threadId = "thr_fixture") {
   };
 }
 
-/** 构造完整 Java thread/read 词汇，使 adapter 测试能够捕获 wire drift。 */
+/** 构造完整 Java thread/read 词汇，包括隐藏续答来源的 nullable identity，捕获 wire drift。 */
 function snapshot() {
   return {
     threadId: "thr_fixture",
@@ -51,6 +57,7 @@ function snapshot() {
     turns: [
       {
         turnId: "turn_fixture",
+        sourceMessageId: null,
         status: "completed",
         requestedAt: "2026-08-18T00:00:00Z",
         updatedAt: "2026-08-18T00:00:04Z",
@@ -176,6 +183,7 @@ describe("TauriHistoryAdapter v1", () => {
       workspace(),
     );
     await adapter.workspaceList();
+    await adapter.workspaceList({ kind: "project", limit: 200 });
     await adapter.threadCreate({
       cwd: "C:\\demo",
       title: "Fixture conversation",
@@ -185,6 +193,17 @@ describe("TauriHistoryAdapter v1", () => {
       accessMode: "approval_required",
       collaborationMode: "default",
     });
+    await expect(
+      adapter.threadCreate({
+        cwd: null,
+        title: "Invalid explicit null",
+        providerId: "provider_fixture",
+        modelId: "model_fixture",
+        reasoningLevel: null,
+        accessMode: "approval_required",
+        collaborationMode: "default",
+      } as never),
+    ).rejects.toThrow();
     await adapter.threadList({ workspaceId: "ws_demo", limit: 200 });
     await expect(
       adapter.threadSearch({ workspaceId: "ws_demo", query: "legacy", limit: 20 }),
@@ -217,6 +236,7 @@ describe("TauriHistoryAdapter v1", () => {
         { input: { cwd: "C:\\demo", displayName: "demo", trust: "trusted" } },
       ],
       [JA_HISTORY_COMMANDS.workspaceList, { input: {} }],
+      [JA_HISTORY_COMMANDS.workspaceList, { input: { kind: "project", limit: 200 } }],
       [
         JA_HISTORY_COMMANDS.threadCreate,
         {
@@ -435,5 +455,66 @@ describe("TauriHistoryAdapter v1", () => {
     await expect(invalid.threadRead({ threadId: "thr_fixture" })).rejects.toMatchObject({
       code: "RUNTIME_UNAVAILABLE",
     });
+  });
+
+  /** MCP header reads are explicit thread-scoped IPC calls and keep unknown counts absent. */
+  it("maps the thread MCP read to its strict native command", async () => {
+    const status = {
+      threadId: "thr_fixture",
+      source: "last_observed",
+      notices: [],
+      observedAt: "2026-09-23T12:30:00Z",
+      servers: [
+        {
+          serverId: "mcp_local",
+          name: "Local MCP",
+          scope: "global",
+          state: "available",
+          toolCount: 68,
+        },
+        { serverId: "mcp_pending", name: "Pending", scope: "project", state: "not_discovered" },
+      ],
+    } as const;
+    const invoke = vi.fn(async (): Promise<unknown> => status);
+    const adapter = new TauriHistoryAdapter({
+      invoke: invoke as unknown as HistoryNativeBridge["invoke"],
+    });
+
+    await expect(adapter.threadMcpRead({ threadId: "thr_fixture" })).resolves.toEqual(status);
+    expect(invoke).toHaveBeenLastCalledWith(JA_HISTORY_COMMANDS.threadMcpRead, {
+      input: { threadId: "thr_fixture" },
+    });
+  });
+
+  /** Optional unknown status fields must be omitted, and redacted projections cannot carry endpoint data. */
+  it("rejects null optional MCP fields and sensitive status data", async () => {
+    const adapterFor = (result: unknown) =>
+      new TauriHistoryAdapter({
+        invoke: vi.fn(async () => result) as unknown as HistoryNativeBridge["invoke"],
+      });
+    const input = { threadId: "thr_fixture" };
+
+    await expect(
+      adapterFor({
+        threadId: "thr_fixture",
+        source: "unchecked",
+        catalogRevision: null,
+        servers: [],
+      }).threadMcpRead(input),
+    ).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE" });
+    await expect(
+      adapterFor({
+        threadId: "thr_fixture",
+        source: "unchecked",
+        servers: [
+          {
+            serverId: "mcp_local",
+            name: "Local MCP",
+            state: "available",
+            endpoint: "http://localhost",
+          },
+        ],
+      }).threadMcpRead(input),
+    ).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE" });
   });
 });

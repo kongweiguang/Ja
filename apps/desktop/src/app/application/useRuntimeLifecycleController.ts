@@ -10,7 +10,7 @@ import {
   type RuntimeHostPort,
   type RuntimeHostEvent,
   type RuntimeProjectionPort,
-  type GeneralWorkspace,
+  type RuntimeWorkspaceActivation,
   type RuntimeRecoveryState,
   type RuntimeStatus,
   type RuntimeQuery,
@@ -49,8 +49,8 @@ export interface RuntimeStateController {
 export interface RuntimeLifecycleController {
   /** 启动 sidecar 时不接收配置 snapshot；配置错误属于 server state，不能由 React 判定。 */
   readonly startRuntime: () => Promise<RuntimeStatus>;
-  /** 读取 native 拥有的固定 scope，供无项目会话使用，React 不生成 workspace identity。 */
-  readonly generalWorkspace: () => Promise<GeneralWorkspace>;
+  /** 通过 Java-issued workspace id 激活 native Host；renderer 不提交 root path。 */
+  readonly activateWorkspace: (workspaceId: string) => Promise<RuntimeWorkspaceActivation>;
   readonly stop: () => Promise<RuntimeStatus>;
   /** 通过当前 Ready generation 读取固定 Skills/MCP 设置面，防止绕过 Runtime owner。 */
   readonly queryRuntime: RuntimeQuery;
@@ -470,15 +470,20 @@ export function useRuntimeLifecycleController(
   ]);
 
   /**
-   * 只暴露 typed native general-workspace projection。它复用 Provider 串行 lane，
-   * StrictMode 或并发 settings refresh 无法在 lifecycle owner 外发出第二次 raw native call。
+   * Activation 复用 Provider 串行 lane，避免快速切换时两个 native identity 操作交错，
+   * 并确保 UI 只传 Java 签发的 workspace id。
    */
-  const generalWorkspace = useCallback((): Promise<GeneralWorkspace> => {
-    const pending = enqueueOperation("generalWorkspace", () => runtime.generalWorkspace());
-    return pending.promise.catch((error: unknown) => {
-      throw safeError(error);
-    });
-  }, [enqueueOperation, runtime]);
+  const activateWorkspace = useCallback(
+    (workspaceId: string): Promise<RuntimeWorkspaceActivation> => {
+      const pending = enqueueOperation("activateWorkspace", () =>
+        runtime.activateWorkspace(workspaceId),
+      );
+      return pending.promise.catch((error: unknown) => {
+        throw safeError(error);
+      });
+    },
+    [enqueueOperation, runtime],
+  );
 
   /** 通过 start 共用的串行 lane 停止当前 sidecar，避免 start/stop 交错。 */
   const stop = useCallback((): Promise<RuntimeStatus> => {
@@ -794,7 +799,7 @@ export function useRuntimeLifecycleController(
     },
     lifecycle: {
       startRuntime,
-      generalWorkspace,
+      activateWorkspace,
       stop,
       queryRuntime,
       readRuntimeStorage,

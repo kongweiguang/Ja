@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { InputQueue, QueuedInput } from "../domain/timelineContracts";
 import type { AttachmentSummary } from "../domain/timelineContracts";
-import type { TimelineApproval, TimelineTurn } from "../domain/timelineTypes";
+import type { TimelineApproval, TimelineItemAdapter, TimelineTurn } from "../domain/timelineTypes";
 import {
   contextReferenceIdentity,
   referenceToUserContent,
@@ -63,6 +63,8 @@ export interface ConversationInteractionOptions {
   ready: boolean;
   blocked: boolean;
   turnPort: ConversationTurnPort;
+  /** 每次恢复 admission 都先从完整权威 thread/read 取得 revision 并收敛 Timeline。 */
+  readThreadRevision: (threadId: string) => Promise<number>;
   planCreationPort?: ConversationPlanCreationPort;
   preferencesPort: ConversationPreferencesPort;
   attachmentPort?: ConversationAttachmentPort;
@@ -104,6 +106,8 @@ export interface ConversationInteractionController {
   activeTurn: boolean;
   suspendedTurn: boolean;
   continuationAvailable: boolean;
+  editingQuestion: boolean;
+  editableSourceMessageId: string | undefined;
   disabled: boolean;
   preferenceBusy: boolean;
   importingAttachments: boolean;
@@ -135,6 +139,8 @@ export interface ConversationInteractionController {
   removeAttachment(itemId: string): Promise<void>;
   send(request: ConversationSubmit): Promise<void>;
   continueReply(): Promise<void>;
+  editQuestion(item: TimelineItemAdapter): void;
+  cancelEditQuestion(): void;
   enqueue(request: ConversationSubmit): Promise<void>;
   prioritizeQueuedInput(inputId: string, expectedInputRevision: number): Promise<void>;
   updateQueuedInput(
@@ -148,6 +154,29 @@ export interface ConversationInteractionController {
   approve(approval: TimelineApproval, decision: "approve" | "deny"): Promise<void>;
 }
 
+interface ComposerDraftSnapshot {
+  text: string;
+  references: readonly ConversationContextReference[];
+  attachments: readonly ConversationAttachmentDraftItem[];
+}
+
+interface EditingQuestionState {
+  stoppedTurnId: string;
+  previousDraft: ComposerDraftSnapshot;
+}
+
+/** 恢复准入在当前问题失效时拒绝 admission；稳定 code 驱动单行提示与草稿恢复。 */
+class QuestionAdmissionError extends Error {
+  readonly code: string;
+
+  /** 错误只携带可本地化的分类，不泄漏 thread/read 或 Runtime 的内部消息。 */
+  constructor(code: "INVALID_STATE" | "TURN_NOT_REASKABLE" | "CONFLICT") {
+    super(code);
+    this.name = "QuestionAdmissionError";
+    this.code = code;
+  }
+}
+
 /**
  * 判断接纳结果是否已经被 Timeline 终态超越；late ACK 只能补足 pending，不得重新打开
  * 已完成 Turn，也不得用旧 revision 覆盖服务端的新事实。
@@ -158,6 +187,105 @@ function isAcceptedTurnTerminal(threadId: string, accepted: ConversationAccepted
   if (acceptedTurn !== undefined) return TERMINAL_TURN_STATES.has(acceptedTurn.status);
   const thread = timeline.threads[threadId];
   return thread?.activeTurnId === undefined && (thread?.revision ?? 0) > accepted.threadRevision;
+}
+
+/**
+ * 只允许对当前路径最后一个已停止且从未形成成功最终答复的问题继续或重问；按钮渲染不是权限，
+ * 因此每次动作都重新从唯一 Timeline Store 校验来源、最新 Turn 和成功答复事实。
+ */
+function reaskableQuestionSource(
+  threadId: string,
+  stoppedTurn: TimelineTurn | undefined,
+  requireSingleUserInput = true,
+): TimelineItemAdapter | undefined {
+  if (stoppedTurn === undefined || !["failed", "cancelled"].includes(stoppedTurn.status))
+    return undefined;
+  const timeline = useTimelineStore.getState();
+  if (timeline.threads[threadId]?.latestTurnId !== stoppedTurn.turnId) return undefined;
+  const currentItems = (timeline.itemIdsByThread[threadId] ?? [])
+    .map((itemId) => timeline.items[itemId])
+    .filter((item): item is TimelineItemAdapter => item !== undefined);
+  const source =
+    (stoppedTurn.sourceMessageId == null
+      ? undefined
+      : timeline.items[stoppedTurn.sourceMessageId]) ??
+    currentItems
+      .filter((item) => item.kind === "user_message" && item.turnId === stoppedTurn.turnId)
+      .at(-1);
+  if (source?.kind !== "user_message") return undefined;
+  // 同一 Turn 含多个队列问题时重问会截断整条 Turn，界面应隐藏入口并由服务端再次复验。
+  if (
+    requireSingleUserInput &&
+    currentItems.filter((item) => item.kind === "user_message" && item.turnId === source.turnId)
+      .length > 1
+  )
+    return undefined;
+  const relatedTurnIds = new Set(
+    Object.values(timeline.turns)
+      .filter(
+        (turn) =>
+          turn.threadId === threadId &&
+          (turn.turnId === source.turnId || turn.sourceMessageId === source.itemId),
+      )
+      .map((turn) => turn.turnId),
+  );
+  return currentItems.some(
+    (item) =>
+      item.kind === "agent_message" &&
+      item.final === true &&
+      item.metadata?.failureReply !== true &&
+      relatedTurnIds.has(item.turnId),
+  )
+    ? undefined
+    : source;
+}
+
+/** 只读取稳定 command code；本地错误对象与 Rust 消息都不进入用户可见状态判断。 */
+function interactionErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = (error as { code: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/** 最新 stopped Turn 与其可恢复问题必须来自同一份同步 Timeline Store。 */
+function currentStoppedQuestionSource(
+  threadId: string,
+  requireSingleUserInput: boolean,
+): { turn: TimelineTurn; source: TimelineItemAdapter } | undefined {
+  const timeline = useTimelineStore.getState();
+  const latestTurnId = timeline.threads[threadId]?.latestTurnId;
+  const turn = latestTurnId === undefined ? undefined : timeline.turns[latestTurnId];
+  if (turn === undefined) return undefined;
+  const source = reaskableQuestionSource(threadId, turn, requireSingleUserInput);
+  return source === undefined ? undefined : { turn, source };
+}
+
+/**
+ * continue/reask 的 Thread revision 可能被 threadSeen 等非 Timeline event mutation 推进；完整
+ * thread/read 后以稳定 Turn 身份确认仍是同一次失败，再使用快照中的公开 source item ID。
+ * Event 与 Snapshot 对同一消息可能使用不同公开 ID，旧 ID 不能阻断合法续答或传给 reask。
+ */
+async function withAuthoritativeQuestionRevision<T>(input: {
+  threadId: string;
+  stoppedTurnId: string;
+  requireSingleUserInput: boolean;
+  readThreadRevision: (threadId: string) => Promise<number>;
+  invoke: (expectedThreadRevision: number, sourceMessageId: string) => Promise<T>;
+}): Promise<T> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const revision = await input.readThreadRevision(input.threadId);
+    if (!Number.isSafeInteger(revision) || revision < 0)
+      throw new QuestionAdmissionError("INVALID_STATE");
+    const current = currentStoppedQuestionSource(input.threadId, input.requireSingleUserInput);
+    if (current?.turn.turnId !== input.stoppedTurnId)
+      throw new QuestionAdmissionError("TURN_NOT_REASKABLE");
+    try {
+      return await input.invoke(revision, current.source.itemId);
+    } catch (error) {
+      if (attempt !== 0 || interactionErrorCode(error) !== "CONFLICT") throw error;
+    }
+  }
+  throw new QuestionAdmissionError("CONFLICT");
 }
 
 /** operation identity 只关联当前进程中的 Channel，不承担服务端资源身份。 */
@@ -322,6 +450,7 @@ export function useConversationInteractionController({
   ready,
   blocked,
   turnPort,
+  readThreadRevision,
   planCreationPort,
   preferencesPort,
   attachmentPort,
@@ -335,6 +464,9 @@ export function useConversationInteractionController({
   >({});
   const [attachmentDraftsByThread, setAttachmentDraftsByThread] = useState<
     Record<string, readonly ConversationAttachmentDraftItem[]>
+  >({});
+  const [editingQuestionByThread, setEditingQuestionByThread] = useState<
+    Record<string, EditingQuestionState>
   >({});
   const [pendingTurns, setPendingTurns] = useState<Record<string, ConversationAcceptedTurn>>({});
   const [localSubmissionsByThread, setLocalSubmissionsByThread] = useState<
@@ -416,14 +548,23 @@ export function useConversationInteractionController({
   const pendingTurn = threadId === undefined ? undefined : pendingTurns[threadId];
   const suspendedTurn = blockingTurn?.status === "suspended" ? blockingTurn : undefined;
   const executingTurn = blockingTurn?.status === "suspended" ? undefined : blockingTurn;
-  const latestFailedTurn =
+  const latestStoppedTurn =
     threadId === undefined
       ? undefined
       : (() => {
           const latestTurnId = currentThreads[threadId]?.latestTurnId;
           const latestTurn = latestTurnId === undefined ? undefined : currentTurns[latestTurnId];
-          return latestTurn?.status === "failed" ? latestTurn : undefined;
+          return latestTurn !== undefined && ["failed", "cancelled"].includes(latestTurn.status)
+            ? latestTurn
+            : undefined;
         })();
+  const reaskableSource =
+    threadId === undefined ? undefined : reaskableQuestionSource(threadId, latestStoppedTurn);
+  const continuationSource =
+    threadId === undefined
+      ? undefined
+      : reaskableQuestionSource(threadId, latestStoppedTurn, false);
+  const editingQuestion = threadId !== undefined && editingQuestionByThread[threadId] !== undefined;
   const blockingTurnId = blockingTurn?.turnId ?? pendingTurn?.turnId;
   const executingTurnId = executingTurn?.turnId ?? pendingTurn?.turnId;
   const inputQueue = useTimelineStore((state) =>
@@ -771,17 +912,116 @@ export function useConversationInteractionController({
     [threadId],
   );
 
+  /** 编辑从历史 USER 恢复结构化引用与附件；先保存原草稿快照，取消或提交后再还给 Composer。 */
+  const editQuestion = useCallback(
+    (item: TimelineItemAdapter): void => {
+      const requestThreadId = threadId;
+      const source = reaskableQuestionSource(requestThreadId ?? "", latestStoppedTurn);
+      if (
+        requestThreadId === undefined ||
+        latestStoppedTurn === undefined ||
+        source === undefined ||
+        source.itemId !== item.itemId ||
+        item.threadId !== requestThreadId ||
+        sendingThreadIds[requestThreadId] === true ||
+        (attachmentDraftsByThread[requestThreadId] ?? []).some(
+          (draft) => draft.state === "importing",
+        ) ||
+        editingQuestionByThread[requestThreadId] !== undefined
+      )
+        return;
+      const sourceAttachments: ConversationAttachmentDraftItem[] = (item.attachments ?? []).map(
+        (attachment) => ({
+          state: "ready",
+          historyBound: true,
+          itemId: `history:${attachment.attachmentId}`,
+          attachmentId: attachment.attachmentId,
+          fileName: attachment.displayName,
+          sizeBytes: attachment.sizeBytes,
+          mediaKind: attachment.mediaKind,
+          mediaType: attachment.mediaType,
+        }),
+      );
+      setEditingQuestionByThread((current) => ({
+        ...current,
+        [requestThreadId]: {
+          stoppedTurnId: latestStoppedTurn.turnId,
+          previousDraft: {
+            text: draftsByThread[requestThreadId] ?? "",
+            references: contextDraftsByThread[requestThreadId] ?? [],
+            attachments: attachmentDraftsByThread[requestThreadId] ?? [],
+          },
+        },
+      }));
+      setDraftsByThread((current) => ({ ...current, [requestThreadId]: item.text ?? "" }));
+      setContextDraftsByThread((current) => ({
+        ...current,
+        [requestThreadId]: item.contextReferences ?? [],
+      }));
+      setAttachmentDraftsByThread((current) => ({
+        ...current,
+        [requestThreadId]: sourceAttachments,
+      }));
+      setErrorsByThread((current) => {
+        const next = { ...current };
+        delete next[requestThreadId];
+        return next;
+      });
+      setDraftRecoveryRevisionsByThread((current) => ({
+        ...current,
+        [requestThreadId]: (current[requestThreadId] ?? 0) + 1,
+      }));
+    },
+    [
+      attachmentDraftsByThread,
+      contextDraftsByThread,
+      draftsByThread,
+      editingQuestionByThread,
+      latestStoppedTurn,
+      sendingThreadIds,
+      threadId,
+    ],
+  );
+
+  /** 取消只撤销 Composer 的编辑态；原始问题、历史附件绑定与当前输入草稿均保持不变。 */
+  const cancelEditQuestion = useCallback((): void => {
+    if (threadId === undefined) return;
+    const editing = editingQuestionByThread[threadId];
+    if (editing === undefined) return;
+    setDraftsByThread((current) => ({ ...current, [threadId]: editing.previousDraft.text }));
+    setContextDraftsByThread((current) => ({
+      ...current,
+      [threadId]: editing.previousDraft.references,
+    }));
+    setAttachmentDraftsByThread((current) => ({
+      ...current,
+      [threadId]: editing.previousDraft.attachments,
+    }));
+    setEditingQuestionByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setErrorsByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setDraftRecoveryRevisionsByThread((current) => ({
+      ...current,
+      [threadId]: (current[threadId] ?? 0) + 1,
+    }));
+  }, [editingQuestionByThread, threadId]);
+
   /**
-   * 同一 Thread 的 turn/start 严格 single-flight；提交意图成立后立即形成消息记录并清空输入。
-   * `continue` 仍是新的用户 Turn，但跳过 Plan 创建分支，确保失败后的“继续”始终走模型回复而非
-   * 重新申请计划；ACK 后由权威 Timeline 接管，失败则把错误固定在原消息旁。
+   * 普通发送创建新问题，编辑态则以源消息和 Thread revision 走 turn/reask；两种入口共享
+   * 草稿恢复与 single-flight，但隐藏 continue 由独立 action 执行，避免生成伪 USER 气泡。
    */
   const send = useCallback(
-    async (
-      { text, attachmentIds, contextReferences }: ConversationSubmit,
-      origin: "user" | "continue" = "user",
-    ): Promise<void> => {
+    async ({ text, attachmentIds, contextReferences }: ConversationSubmit): Promise<void> => {
       const requestThreadId = threadId;
+      const editing =
+        requestThreadId === undefined ? undefined : editingQuestionByThread[requestThreadId];
       const submittedText = text.trim();
       const submittedReferences =
         contextReferences ??
@@ -794,6 +1034,10 @@ export function useConversationInteractionController({
       );
       const submittedAttachments =
         attachmentIds ?? availableAttachments.map((attachment) => attachment.attachmentId);
+      const sourceStillReaskable =
+        requestThreadId === undefined || editing === undefined
+          ? undefined
+          : reaskableQuestionSource(requestThreadId, latestStoppedTurn);
       if (
         requestThreadId === undefined ||
         workspaceId === undefined ||
@@ -806,6 +1050,9 @@ export function useConversationInteractionController({
         blockingTurn !== undefined ||
         preferenceBusy ||
         attachmentDraftItems.some((item) => item.state !== "ready") ||
+        (editing !== undefined &&
+          (latestStoppedTurn?.turnId !== editing.stoppedTurnId ||
+            sourceStillReaskable === undefined)) ||
         submitGuardsRef.current.has(requestThreadId) ||
         pendingTurnsRef.current[requestThreadId] !== undefined
       )
@@ -866,7 +1113,7 @@ export function useConversationInteractionController({
         return next;
       });
       try {
-        if (origin === "user" && preferences.collaborationMode === "plan") {
+        if (editing === undefined && preferences.collaborationMode === "plan") {
           const expectedThreadRevision = currentThreads[requestThreadId]?.revision;
           if (
             expectedThreadRevision === undefined ||
@@ -884,23 +1131,47 @@ export function useConversationInteractionController({
           mediaKind: attachment.mediaKind,
           mediaType: attachment.mediaType ?? "application/octet-stream",
         }));
-        const accepted = await turnPort.submitTurn({
-          threadId: requestThreadId,
-          content: [
-            ...submittedReferences.map(referenceToUserContent),
-            ...submittedAttachments.map((attachmentId) => ({
-              type: "attachment" as const,
-              attachmentId,
-            })),
-            ...(submittedText === "" ? [] : [{ type: "text" as const, text: submittedText }]),
-          ],
-          ...(projectionAttachments.length === 0 ? {} : { projectionAttachments }),
-        });
+        const content: UserContentBlock[] = [
+          ...submittedReferences.map(referenceToUserContent),
+          ...submittedAttachments.map((attachmentId) => ({
+            type: "attachment" as const,
+            attachmentId,
+          })),
+          ...(submittedText === "" ? [] : [{ type: "text" as const, text: submittedText }]),
+        ];
+        const accepted =
+          editing === undefined
+            ? await turnPort.submitTurn({
+                threadId: requestThreadId,
+                content,
+                ...(projectionAttachments.length === 0 ? {} : { projectionAttachments }),
+              })
+            : await withAuthoritativeQuestionRevision({
+                threadId: requestThreadId,
+                stoppedTurnId: editing.stoppedTurnId,
+                requireSingleUserInput: true,
+                readThreadRevision,
+                invoke: (expectedThreadRevision, sourceMessageId) =>
+                  turnPort.reaskTurn({
+                    threadId: requestThreadId,
+                    expectedThreadRevision,
+                    sourceMessageId,
+                    content,
+                    ...(projectionAttachments.length === 0 ? {} : { projectionAttachments }),
+                  }),
+              });
         if (!mountedRef.current) return;
-        if (submittedAttachments.length > 0) {
+        const newlyBoundAttachments = submittedAttachmentItems.filter(
+          (attachment) => attachment.historyBound !== true,
+        );
+        if (newlyBoundAttachments.length > 0) {
           const readySizes = readyAttachmentSizesRef.current[requestThreadId];
-          for (const attachmentId of submittedAttachments) readySizes?.delete(attachmentId);
-          onAttachmentsBound?.(requestThreadId, submittedAttachments);
+          for (const attachment of newlyBoundAttachments)
+            readySizes?.delete(attachment.attachmentId);
+          onAttachmentsBound?.(
+            requestThreadId,
+            newlyBoundAttachments.map((attachment) => attachment.attachmentId),
+          );
         }
         // 阶段二：独立事件流可能早于 ACK 到达，先核对终态再决定是否建立 pending 投影。
         if (!isAcceptedTurnTerminal(requestThreadId, accepted)) {
@@ -914,18 +1185,44 @@ export function useConversationInteractionController({
             (submission) => submission.submissionId !== submissionId,
           ),
         }));
+        if (editing !== undefined) {
+          setDraftsByThread((current) => ({
+            ...current,
+            [requestThreadId]: editing.previousDraft.text,
+          }));
+          setContextDraftsByThread((current) => ({
+            ...current,
+            [requestThreadId]: editing.previousDraft.references,
+          }));
+          setAttachmentDraftsByThread((current) => ({
+            ...current,
+            [requestThreadId]: editing.previousDraft.attachments,
+          }));
+          setEditingQuestionByThread((current) => {
+            const next = { ...current };
+            delete next[requestThreadId];
+            return next;
+          });
+          setDraftRecoveryRevisionsByThread((current) => ({
+            ...current,
+            [requestThreadId]: (current[requestThreadId] ?? 0) + 1,
+          }));
+          useTimelineStore.getState().requestThreadResync(requestThreadId);
+        }
       } catch (error) {
         if (mountedRef.current) {
           const code =
             typeof error === "object" && error !== null && "code" in error
               ? String((error as { code: unknown }).code)
               : undefined;
-          const preserveDraft = new Set([
-            "WORKSPACE_REFERENCE_INVALID",
-            "SKILL_UNAVAILABLE",
-            "SKILL_LOAD_FAILED",
-            "CONTENT_TOO_LARGE",
-          ]).has(code ?? "");
+          const preserveDraft =
+            editing !== undefined ||
+            new Set([
+              "WORKSPACE_REFERENCE_INVALID",
+              "SKILL_UNAVAILABLE",
+              "SKILL_LOAD_FAILED",
+              "CONTENT_TOO_LARGE",
+            ]).has(code ?? "");
           if (preserveDraft) {
             setDraftsByThread((current) => ({
               ...current,
@@ -982,9 +1279,15 @@ export function useConversationInteractionController({
             setErrorsByThread((current) => ({
               ...current,
               [requestThreadId]:
-                code === "CONTENT_TOO_LARGE"
-                  ? "消息内容过大，请精简后重试。"
-                  : "引用已变化，请调整后重试。",
+                code === "TURN_NOT_REASKABLE"
+                  ? "当前问题已无法编辑，请刷新对话。"
+                  : code === "CONFLICT"
+                    ? "对话已更新，请刷新后重试。"
+                    : code === "CONTENT_TOO_LARGE"
+                      ? "消息内容过大，请精简后重试。"
+                      : editing !== undefined
+                        ? "编辑后的问题未能提交，请重试。"
+                        : "引用已变化，请调整后重试。",
             }));
             setDraftRecoveryRevisionsByThread((current) => ({
               ...current,
@@ -1009,24 +1312,23 @@ export function useConversationInteractionController({
       blockingTurn,
       contextDraftsByThread,
       currentThreads,
+      editingQuestionByThread,
+      latestStoppedTurn,
       planCreationPort,
       onAttachmentsBound,
       preferenceBusy,
       preferences,
       ready,
+      readThreadRevision,
       threadId,
       turnPort,
       workspaceId,
     ],
   );
 
-  /**
-   * 失败后的继续必须以独立用户消息进入新的 Turn，避免恢复已经清除的执行游标或重放旧 Tool。
-   * 点击前复核当前 Timeline 的最新 Turn 和草稿实体，防止迟到快照、会话切换或未完成附件误触续答。
-   */
+  /** 无可见 USER 的继续使用当前 Thread CAS；后台会从有效历史重试，不重放已提交 Tool。 */
   const continueReply = useCallback(async (): Promise<void> => {
     const requestThreadId = threadId;
-    const expectedFailedTurnId = latestFailedTurn?.turnId;
     const hasDraftIntent =
       (requestThreadId === undefined ? "" : (draftsByThread[requestThreadId] ?? "")).trim() !==
         "" ||
@@ -1034,22 +1336,88 @@ export function useConversationInteractionController({
         0 ||
       (requestThreadId === undefined ? [] : (attachmentDraftsByThread[requestThreadId] ?? []))
         .length > 0;
-    if (requestThreadId === undefined || expectedFailedTurnId === undefined || hasDraftIntent)
+    if (
+      requestThreadId === undefined ||
+      latestStoppedTurn === undefined ||
+      continuationSource === undefined ||
+      hasDraftIntent ||
+      editingQuestionByThread[requestThreadId] !== undefined ||
+      submitGuardsRef.current.has(requestThreadId) ||
+      pendingTurnsRef.current[requestThreadId] !== undefined ||
+      blockingTurn !== undefined ||
+      !ready ||
+      blocked
+    )
       return;
     const timeline = useTimelineStore.getState();
     if (
-      timeline.threads[requestThreadId]?.latestTurnId !== expectedFailedTurnId ||
-      timeline.turns[expectedFailedTurnId]?.status !== "failed"
+      timeline.threads[requestThreadId]?.latestTurnId !== latestStoppedTurn.turnId ||
+      !["failed", "cancelled"].includes(timeline.turns[latestStoppedTurn.turnId]?.status ?? "") ||
+      reaskableQuestionSource(requestThreadId, timeline.turns[latestStoppedTurn.turnId], false)
+        ?.itemId !== continuationSource.itemId
     )
       return;
-    await send({ text: "继续", attachmentIds: [], contextReferences: [] }, "continue");
+    submitGuardsRef.current.add(requestThreadId);
+    setSendingThreadIds((current) => ({ ...current, [requestThreadId]: true }));
+    setErrorsByThread((current) => {
+      const next = { ...current };
+      delete next[requestThreadId];
+      return next;
+    });
+    try {
+      const accepted = await withAuthoritativeQuestionRevision({
+        threadId: requestThreadId,
+        stoppedTurnId: latestStoppedTurn.turnId,
+        requireSingleUserInput: false,
+        readThreadRevision,
+        invoke: (expectedThreadRevision, sourceMessageId) =>
+          turnPort.continueTurn({
+            threadId: requestThreadId,
+            expectedThreadRevision,
+            sourceMessageId,
+          }),
+      });
+      if (!mountedRef.current) return;
+      if (!isAcceptedTurnTerminal(requestThreadId, accepted)) {
+        const nextPending = { ...pendingTurnsRef.current, [requestThreadId]: accepted };
+        pendingTurnsRef.current = nextPending;
+        setPendingTurns(nextPending);
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        const code = interactionErrorCode(error);
+        setErrorsByThread((current) => ({
+          ...current,
+          [requestThreadId]:
+            code === "TURN_NOT_REASKABLE"
+              ? "当前问题已无法继续，请刷新对话。"
+              : code === "CONFLICT"
+                ? "对话已更新，请刷新后重试。"
+                : "无法继续回复，请重试。",
+        }));
+      }
+    } finally {
+      submitGuardsRef.current.delete(requestThreadId);
+      if (mountedRef.current)
+        setSendingThreadIds((current) => {
+          const next = { ...current };
+          delete next[requestThreadId];
+          return next;
+        });
+    }
   }, [
     attachmentDraftsByThread,
+    blocked,
+    blockingTurn,
     contextDraftsByThread,
     draftsByThread,
-    latestFailedTurn,
-    send,
+    editingQuestionByThread,
+    latestStoppedTurn,
+    ready,
+    readThreadRevision,
+    continuationSource,
     threadId,
+    turnPort,
   ]);
 
   /**
@@ -1835,7 +2203,7 @@ export function useConversationInteractionController({
         }
         if (item.state === "failed") {
           await attachmentPort.discardAttempt({ attemptId: item.attemptId });
-        } else {
+        } else if (item.historyBound !== true) {
           const ready = item;
           setAttachmentDraftsByThread((current) => ({
             ...current,
@@ -1929,7 +2297,9 @@ export function useConversationInteractionController({
     activeTurn: hasActiveTurn,
     suspendedTurn: suspendedTurn !== undefined,
     continuationAvailable:
-      latestFailedTurn !== undefined && pendingTurn === undefined && blockingTurn === undefined,
+      continuationSource !== undefined && pendingTurn === undefined && blockingTurn === undefined,
+    editingQuestion,
+    editableSourceMessageId: editingQuestion ? undefined : reaskableSource?.itemId,
     disabled:
       !ready ||
       (blocked && suspendedTurn === undefined) ||
@@ -1966,6 +2336,8 @@ export function useConversationInteractionController({
     removeAttachment,
     send,
     continueReply,
+    editQuestion,
+    cancelEditQuestion,
     enqueue,
     prioritizeQueuedInput,
     updateQueuedInput,

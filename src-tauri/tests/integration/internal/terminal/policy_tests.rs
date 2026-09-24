@@ -35,8 +35,14 @@ fn limits_reserve_terminal_event_bytes() {
 fn environment_override_preserves_normal_cli_values() {
     let environment = build_environment(&BTreeMap::from([
         (String::from("OPENAI_API_KEY"), String::from("hidden")),
-        (String::from("ProgramFiles(x86)"), String::from(r"C:\Program Files (x86)")),
-        (String::from("CERTIFICATE_DATA"), String::from("line one\nline two")),
+        (
+            String::from("ProgramFiles(x86)"),
+            String::from(r"C:\Program Files (x86)"),
+        ),
+        (
+            String::from("CERTIFICATE_DATA"),
+            String::from("line one\nline two"),
+        ),
     ]))
     .expect("normal environment overrides");
     assert_eq!(
@@ -117,5 +123,18 @@ fn policy_accepts_child_directory() {
         })
         .unwrap();
     assert!(prepared.cwd.ends_with("child"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// 缺省 cwd 必须与 native binding 指向同一目录；比较 canonical root 可容纳 Windows Shell 所需的路径前缀规范化。
+#[test]
+fn policy_defaults_to_workspace_root() {
+    let root =
+        std::env::temp_dir().join(format!("ja-terminal-default-cwd-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let canonical_root = fs::canonicalize(&root).unwrap();
+    let policy = TerminalPolicy::new(&root).unwrap();
+    let prepared = policy.prepare(&LaunchRequest::default()).unwrap();
+    assert_eq!(fs::canonicalize(&prepared.cwd).unwrap(), canonical_root);
     fs::remove_dir_all(root).unwrap();
 }

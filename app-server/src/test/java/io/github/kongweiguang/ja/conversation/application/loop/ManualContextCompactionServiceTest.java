@@ -38,7 +38,7 @@ final class ManualContextCompactionServiceTest {
     void rejectsBusyThreadBeforeExternalWork() {
         ConversationRepository.TurnSnapshot turn = new ConversationRepository.TurnSnapshot(
                 "thr_test", "turn_test", TurnState.RUNNING,
-                CLOCK.instant(), CLOCK.instant(), null, 7, 1);
+                CLOCK.instant(), CLOCK.instant(), null, 7, 1, true, null, null);
         ManualContextCompactionService service = service(snapshot(7, List.of(turn)));
         ContextCompactionUseCase.Failure failure = assertThrows(ContextCompactionUseCase.Failure.class,
                 () -> service.compact(new ContextCompactionUseCase.Command("thr_test", 7), event -> {
@@ -121,6 +121,11 @@ final class ManualContextCompactionServiceTest {
 
     /** 只允许 readThread 的存储夹具，所有 mutation 与关闭都保持显式可见。 */
     private static final class EarlyRepository implements ConversationRepository {
+        /** 早期压缩门禁不会判断失败问题是否可重答。 */
+        @Override public Optional<String> findLastUnansweredQuestionMessageId(
+                String threadId, long expectedThreadRevision) { throw unsupported(); }
+        /** 早期压缩门禁不会切换会话历史路径。 */
+        @Override public AdmissionReceipt admitReask(ReaskAdmission admission) { throw unsupported(); }
         /** 手动压缩早期门禁不得触达 Child mailbox。 */
         @Override public TaskMailboxConsumption consumeTaskMailbox(TaskMailboxCommit request) {
             throw new UnsupportedOperationException("manual compaction must not consume task mailbox");

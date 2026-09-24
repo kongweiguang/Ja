@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/app/App";
+import { useTimelineStore } from "@/features/conversation";
 import type { SettingsAdapter } from "@/features/settings";
 import type { LoadedSettings, SettingsDocument } from "@/api/tauri/settings";
 import type {
@@ -75,11 +76,13 @@ const configuredDocument: SettingsDocument = {
     },
   ],
 };
-const generalWorkspace = {
+const sessionWorkspace = {
   workspaceId: "ws_runtime_a" as const,
-  displayName: "无项目" as const,
+  kind: "session" as const,
+  legacySharedWorkspaceId: null,
+  displayName: "会话测试目录" as const,
   trust: "trusted" as const,
-  rootPath: "C:\\data\\ja\\general-workspace",
+  rootPath: "C:\\data\\ja\\workspaces\\thr_fixture",
 };
 
 /** 构造前 N 次启动失败的 lifecycle adapter，用于验证真实 ready generation 发布前的恢复路径。 */
@@ -127,7 +130,11 @@ function runtime(
       cachePath: null,
       lastBackup: null,
     })),
-    generalWorkspace: vi.fn(async () => generalWorkspace),
+    activateWorkspace: vi.fn(async (workspaceId: string) => ({
+      ...sessionWorkspace,
+      workspaceId,
+      rootPath: `C:\\data\\ja\\workspaces\\${workspaceId.slice("ws_".length)}`,
+    })),
     turnStart: vi.fn(async () => ({
       accepted: true as const,
       turnId: "turn_fixture",
@@ -138,6 +145,18 @@ function runtime(
       accepted: true as const,
       turnId: input.turnId,
       queued: true,
+      threadRevision: input.expectedThreadRevision + 1,
+    })),
+    turnContinue: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: "turn_continue_fixture",
+      queued: false,
+      threadRevision: input.expectedThreadRevision + 1,
+    })),
+    turnReask: vi.fn(async (input) => ({
+      accepted: true as const,
+      turnId: "turn_reask_fixture",
+      queued: false,
       threadRevision: input.expectedThreadRevision + 1,
     })),
     // 恢复裁决 mock 只回显 caller 已绑定的 Turn/选择，避免测试替身虚构 Tool 执行事实。
@@ -219,7 +238,6 @@ function settings(
       defaultSelection: false,
       accessMode: false,
       disabledSkillReferences: [],
-      disabledMcpIds: [],
     },
     cas: {
       userVersion: "cfg_user_1",
@@ -232,6 +250,7 @@ function settings(
     snapshot: vi.fn(async () => loaded),
     save: vi.fn(async () => "cfg_user_2"),
     saveProjectSkills: vi.fn(async () => "cfg_project_2"),
+    saveProjectMcpServers: vi.fn(async () => "cfg_project_2"),
     patch: vi.fn(async () => ({ version: "cfg_project_2" })),
     reset: vi.fn(async () => ({ version: "cfg_project_2" })),
     restoreLastKnownGood: vi.fn(async () => "cfg_user_2"),
@@ -245,7 +264,9 @@ function settings(
 function threadFixture() {
   return {
     threadId: "thr_fixture",
-    workspaceId: generalWorkspace.workspaceId,
+    workspaceId: sessionWorkspace.workspaceId,
+    workspaceKind: "session" as const,
+    legacySharedWorkspaceId: null,
     activeGoalId: null,
     preferences: {
       providerId: "provider_fixture",
@@ -264,6 +285,25 @@ function threadFixture() {
     createdAt: "2026-08-26T00:00:00Z",
     updatedAt: "2026-08-26T00:00:00Z",
   };
+}
+
+/** 无项目 Thread 只出现在聚合导航中；App 交互测试显式选择目标会话以验证其真实 owner。 */
+async function selectSessionThread(
+  title = "新对话",
+  runtimePort?: RuntimeHostPort,
+): Promise<HTMLButtonElement> {
+  const row = await screen.findByRole("button", { name: title });
+  expect(row).toHaveClass("ja-navigation-thread");
+  fireEvent.click(row);
+  if (runtimePort !== undefined)
+    await waitFor(() =>
+      expect(runtimePort.activateWorkspace).toHaveBeenCalledWith(sessionWorkspace.workspaceId),
+    );
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: title })).toHaveAttribute("data-active", "true"),
+  );
+  await waitFor(() => expect(screen.getByRole("textbox", { name: "消息" })).toBeEnabled());
+  return screen.getByRole("button", { name: title }) as HTMLButtonElement;
 }
 
 /** 组合测试只模拟 App Server 权威查询，不在 Renderer 内派生会话状态。 */
@@ -322,6 +362,7 @@ function history(): HistoryAdapter {
 describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   beforeEach(() => {
     localStorage.clear();
+    useTimelineStore.getState().reset();
     useUiPreferencesStore.setState({
       projectSectionCollapsed: false,
       historySectionCollapsed: false,
@@ -441,6 +482,69 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(screen.getByRole("textbox", { name: "消息" })).toBeDisabled();
   });
 
+  /** 空白 session catalog 保持无 owner；“新会话”必须先创建再激活目录，之后才开放 Composer。 */
+  it("creates and activates a session before enabling the first Composer", async () => {
+    const user = userEvent.setup();
+    const events: string[] = [];
+    const runtimeAdapter = runtime();
+    runtimeAdapter.activateWorkspace = vi.fn(async (workspaceId: string) => {
+      events.push("activate");
+      return { ...sessionWorkspace, workspaceId };
+    });
+    const historyAdapter = history();
+    historyAdapter.threadCreate = vi.fn(async () => {
+      events.push("create");
+      return {
+        ...threadFixture(),
+        preferences: {
+          ...threadFixture().preferences,
+          providerId: "provider_openai",
+          modelId: "model_gpt",
+          reasoningLevel: "high" as const,
+          accessMode: "full_access" as const,
+        },
+      };
+    });
+    const createThread = historyAdapter.threadCreate as ReturnType<typeof vi.fn>;
+    historyAdapter.threadRead = vi.fn(async () => {
+      events.push("read");
+      return {
+        threadId: "thr_fixture",
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        taskActivities: [],
+        goalActivities: [],
+        liveStream: null,
+        nextCursor: null,
+      };
+    });
+    render(
+      <App
+        runtime={runtimeAdapter}
+        settingsAdapter={settings(configuredDocument)}
+        historyAdapter={historyAdapter}
+        projectPicker={{ pick: vi.fn(async () => null) }}
+      />,
+    );
+
+    const input = await screen.findByRole("textbox", { name: "消息" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "新会话" })).toBeEnabled());
+    expect(input).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "新会话" }));
+
+    await waitFor(() => expect(events.slice(0, 3)).toEqual(["create", "activate", "read"]));
+    await waitFor(() => expect(input).toBeEnabled());
+    expect(historyAdapter.threadCreate).toHaveBeenCalledOnce();
+    expect(createThread.mock.calls[0]?.[0]).not.toHaveProperty("cwd");
+    expect(runtimeAdapter.activateWorkspace).toHaveBeenCalledExactlyOnceWith(
+      sessionWorkspace.workspaceId,
+    );
+  });
+
   /** 人工恢复只在用户打开状态详情后出现，首屏直达不能自动确认恢复。 */
   it("keeps manual recovery behind the sidebar warning", async () => {
     const runtimeAdapter = runtime();
@@ -484,6 +588,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
    */
   it("binds the History usage reader before handing it to the Composer", async () => {
     const user = userEvent.setup();
+    const runtimePort = runtime();
     const historyAdapter = history();
     const usage: HistoryThreadUsageSummary = {
       threadId: "thr_fixture",
@@ -524,13 +629,17 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     }));
     render(
       <App
-        runtime={runtime()}
+        runtime={runtimePort}
         settingsAdapter={settings(configuredDocument)}
         historyAdapter={historyAdapter}
         projectPicker={{ pick: vi.fn(async () => null) }}
       />,
     );
 
+    await selectSessionThread("新对话", runtimePort);
+    await waitFor(() =>
+      expect(historyAdapter.threadRead).toHaveBeenCalledWith({ threadId: "thr_fixture" }),
+    );
     const trigger = await screen.findByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
     await waitFor(() => expect(readUsage).toHaveBeenCalledWith({ threadId: "thr_fixture" }));
@@ -550,6 +659,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
         projectPicker={{ pick: vi.fn(async () => null) }}
       />,
     );
+    await selectSessionThread("新对话");
     await screen.findByRole("combobox", { name: "访问模式" });
     const input = screen.getByRole("textbox", { name: "消息" });
     fireEvent.change(input, { target: { value: "/" } });
@@ -598,6 +708,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       turns: [
         {
           turnId: "turn_fixture",
+          sourceMessageId: null,
           status: "completed" as const,
           requestedAt: "2026-09-23T00:00:00Z",
           updatedAt: "2026-09-23T00:00:04Z",
@@ -637,7 +748,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     );
 
     const input = await screen.findByRole("textbox", { name: "消息" });
-    await waitFor(() => expect(input).toBeEnabled());
+    await selectSessionThread();
     const newConversation = screen.getByRole("button", { name: "新会话" });
     await waitFor(() => expect(newConversation).toBeEnabled());
     expect(screen.queryByLabelText("正在读取会话")).not.toBeInTheDocument();
@@ -659,7 +770,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
             sequence: 1,
             occurredAt: "2026-09-23T00:00:01Z",
             generation: 1,
-            workspaceId: generalWorkspace.workspaceId,
+            workspaceId: sessionWorkspace.workspaceId,
             threadId: storedThread.threadId,
             turnId: "turn_fixture",
             threadRevision: 2,
@@ -679,7 +790,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
             sequence: 2,
             occurredAt: "2026-09-23T00:00:02Z",
             generation: 1,
-            workspaceId: generalWorkspace.workspaceId,
+            workspaceId: sessionWorkspace.workspaceId,
             threadId: storedThread.threadId,
             turnId: "turn_fixture",
             threadRevision: 3,
@@ -753,7 +864,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     );
 
     const input = await screen.findByRole("textbox", { name: "消息" });
-    await waitFor(() => expect(input).toBeEnabled());
+    await selectSessionThread();
     const newConversation = screen.getByRole("button", { name: "新会话" });
     await waitFor(() => expect(newConversation).toBeEnabled());
 
@@ -772,7 +883,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
             sequence: 1,
             occurredAt: "2026-09-23T00:00:01Z",
             generation: 1,
-            workspaceId: generalWorkspace.workspaceId,
+            workspaceId: sessionWorkspace.workspaceId,
             threadId: storedThread.threadId,
             turnId: "turn_fixture",
             threadRevision: 2,
@@ -792,7 +903,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
             sequence: 2,
             occurredAt: "2026-09-23T00:00:02Z",
             generation: 1,
-            workspaceId: generalWorkspace.workspaceId,
+            workspaceId: sessionWorkspace.workspaceId,
             threadId: storedThread.threadId,
             turnId: "turn_fixture",
             threadRevision: 3,
@@ -817,7 +928,9 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     let searchTitle = "首问短标题";
     const storedThread = {
       threadId: "thr_fixture",
-      workspaceId: generalWorkspace.workspaceId,
+      workspaceId: sessionWorkspace.workspaceId,
+      workspaceKind: "session" as const,
+      legacySharedWorkspaceId: null,
       activeGoalId: null,
       preferences: {
         providerId: "provider_openai",
@@ -853,7 +966,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     );
 
     const searchButton = await screen.findByRole("button", { name: "搜索对话" });
-    await waitFor(() => expect(screen.getByRole("textbox", { name: "消息" })).toBeEnabled());
+    await selectSessionThread("首问短标题");
     searchButton.click();
     expect(await screen.findByRole("option", { name: "打开：首问短标题" })).toBeVisible();
     expect(historyAdapter.threadSearch).toHaveBeenCalledTimes(1);
@@ -875,7 +988,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
             sequence: 1,
             occurredAt: "2026-08-31T00:00:01Z",
             generation: 1,
-            workspaceId: generalWorkspace.workspaceId,
+            workspaceId: sessionWorkspace.workspaceId,
             threadId: storedThread.threadId,
             revision: 2,
             title: searchTitle,
@@ -895,7 +1008,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
             sequence: 2,
             occurredAt: "2026-08-31T00:00:02Z",
             generation: 1,
-            workspaceId: generalWorkspace.workspaceId,
+            workspaceId: sessionWorkspace.workspaceId,
             threadId: storedThread.threadId,
             turnId: "turn_fixture",
             threadRevision: 2,
@@ -922,6 +1035,8 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   it("selects a persisted project and reuses its current empty conversation", async () => {
     const projectWorkspace = {
       workspaceId: "ws_project_a",
+      kind: "project" as const,
+      legacySharedWorkspaceId: null,
       root: "C:\\dev\\rust\\ja",
       displayName: "ja",
       trust: "trusted" as const,
@@ -937,7 +1052,9 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     };
     const generalThread = {
       threadId: "thr_general_existing",
-      workspaceId: generalWorkspace.workspaceId,
+      workspaceId: sessionWorkspace.workspaceId,
+      workspaceKind: "session" as const,
+      legacySharedWorkspaceId: null,
       activeGoalId: null,
       preferences: threadPreferences,
       title: "无项目会话",
@@ -953,6 +1070,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       ...generalThread,
       threadId: "thr_project_existing",
       workspaceId: projectWorkspace.workspaceId,
+      workspaceKind: "project" as const,
       title: "项目已有会话",
     };
     const secondaryProjectThread = {
@@ -972,9 +1090,9 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       return result;
     });
     historyAdapter.workspaceOpen = vi.fn(async () => projectWorkspace);
-    historyAdapter.threadList = vi.fn(async ({ workspaceId }) => ({
+    historyAdapter.threadList = vi.fn(async (input) => ({
       items:
-        workspaceId === projectWorkspace.workspaceId
+        "workspaceId" in input && input.workspaceId === projectWorkspace.workspaceId
           ? [projectThread, secondaryProjectThread]
           : [generalThread],
       nextCursor: null,
@@ -1080,12 +1198,12 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   });
 
   /**
-   * 普通对话打开真实 Workbench 并提交可持久宽度；进入设置时只隐藏同一 DOM 子树，
+   * Session 对话打开真实 Workbench 并提交可持久宽度；进入设置时只隐藏同一 DOM 子树，
    * 返回后仍复用原节点，避免主题切换通过卸载重建 Editor、xterm 或 PTY owner；能力入口
    * 采用真实 Radix 菜单交互，不再依赖已退出主流程的整页启动器。Windows CI 中该完整交互约
    * 需 6 秒，因此使用局部 10 秒预算，不改变全局测试 deadline。
    */
-  it("joins general conversation with a resizable workbench", async () => {
+  it("opens a session conversation with a resizable workbench", async () => {
     const user = userEvent.setup();
     const historyAdapter = history();
     historyAdapter.threadList = vi.fn(async () => ({
@@ -1101,6 +1219,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       />,
     );
 
+    await selectSessionThread();
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "显示工作区面板" })).toBeInTheDocument(),
     );
@@ -1156,7 +1275,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       if (method === "workspace/path/search")
         return {
           threadId: "thr_fixture",
-          workspaceId: generalWorkspace.workspaceId,
+          workspaceId: sessionWorkspace.workspaceId,
           generation: 1,
           query: (params as { query: string }).query,
           items: [{ relativePath: "src/main.ts", kind: "file" as const }],
@@ -1229,16 +1348,27 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       />,
     );
 
+    await selectSessionThread("新对话", runtimePort);
     await screen.findByRole("combobox", { name: "访问模式" });
     const composer = screen.getByRole("textbox", { name: "消息" });
     await user.click(composer);
     await user.type(composer, "@src");
+    await waitFor(() =>
+      expect(runtimePort.query).toHaveBeenCalledWith(
+        "workspace/path/search",
+        expect.objectContaining({
+          threadId: "thr_fixture",
+          workspaceId: sessionWorkspace.workspaceId,
+          query: "src",
+        }),
+      ),
+    );
     await user.click(await screen.findByRole("option", { name: /main\.ts/u }));
     const source = screen.getByRole("button", { name: "在文件中预览 main.ts" });
     fireEvent.click(source);
     await waitFor(() =>
       expect(readFile).toHaveBeenCalledWith({
-        workspaceId: generalWorkspace.workspaceId,
+        workspaceId: sessionWorkspace.workspaceId,
         relativePath: "src/main.ts",
       }),
     );

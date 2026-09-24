@@ -12,6 +12,7 @@ use super::model::{
 use super::policy::{PreviewNavigationDecision, PreviewPolicy};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use url::Url;
 
 /// 拥有单个 Tauri 应用的全部内存 Preview session。
 #[derive(Clone)]
@@ -39,6 +40,11 @@ struct SessionState {
     dropped_events: u64,
     close_token: Option<u64>,
     native_visible: bool,
+    can_go_back: bool,
+    can_go_forward: bool,
+    pending_local_navigation: Option<String>,
+    next_history_navigation_token: u64,
+    pending_history_navigation_token: Option<u64>,
 }
 
 /// 不透明 claim 保证原生 close 与模型 finalization 成对执行。
@@ -70,24 +76,37 @@ impl PreviewManager {
         })
     }
 
-    /// 使用产品默认且仅 HTTP(S) 的 policy。
+    /// 使用产品默认 URL 与事件预算创建独立 session registry。
     pub fn default_manager() -> Result<Self, PreviewError> {
         Self::new(PreviewPolicy::new()?)
     }
 
-    /// 打开有界 session 并发送其首个事件。
+    /// 打开一个经过 HTTP(S) policy 校验的 session，并发送首个事件。
     pub fn open(&self, raw_url: &str) -> Result<PreviewOpenResult, PreviewError> {
         let url = self.policy.validate_url(raw_url)?;
+        self.open_validated(url)
+    }
+
+    /// 本机文件只能由显式文件解析入口校验后进入隔离 child WebView。
+    pub(crate) fn open_local_file(&self, raw_url: &str) -> Result<PreviewOpenResult, PreviewError> {
+        let url = self.policy.validate_file_url(raw_url)?;
+        self.open_validated(url)
+    }
+
+    /// 空白标签由本机创建，使用 opaque child label 保持与浏览页面相同的 ACK 生命周期。
+    pub(crate) fn open_blank(&self) -> Result<PreviewOpenResult, PreviewError> {
+        self.open_validated(super::model::PreviewUrl::from_normalized(
+            "about:blank".to_owned(),
+        ))
+    }
+
+    /// 统一分配 Preview identity，避免为本地页或空白页创建第二套 session 生命周期。
+    fn open_validated(
+        &self,
+        url: super::model::PreviewUrl,
+    ) -> Result<PreviewOpenResult, PreviewError> {
         let mut state = self.lock_state()?;
         Self::ensure_accepting(&state)?;
-        let active = state
-            .sessions
-            .values()
-            .filter(|session| session.status == PreviewSessionStatus::Open)
-            .count();
-        if active >= self.policy.limits().max_sessions {
-            return Err(PreviewError::new(PreviewErrorCode::SessionLimit));
-        }
         let id = PreviewId::new();
         let window = PreviewWindowSpec::new(id, url.clone());
         let mut session = SessionState {
@@ -103,6 +122,11 @@ impl PreviewManager {
             dropped_events: 0,
             close_token: None,
             native_visible: false,
+            can_go_back: false,
+            can_go_forward: false,
+            pending_local_navigation: None,
+            next_history_navigation_token: 0,
+            pending_history_navigation_token: None,
         };
         Self::push_event(
             &mut session,
@@ -132,16 +156,119 @@ impl PreviewManager {
         source: NavigationSource,
         raw_url: &str,
     ) -> Result<PreviewNavigationRequest, PreviewError> {
-        let PreviewNavigationDecision::Allow { url } = self.policy.navigation(source, raw_url)?;
+        self.navigation_request_with_history(id, generation, source, raw_url, false)
+    }
+
+    /// 仅由原生历史回调附带一次性许可；普通 renderer 地址导航永远不能消费此授权。
+    fn navigation_request_with_history(
+        &self,
+        id: PreviewId,
+        generation: PreviewGeneration,
+        source: NavigationSource,
+        raw_url: &str,
+        allow_history_file: bool,
+    ) -> Result<PreviewNavigationRequest, PreviewError> {
         let state = self.lock_state()?;
         Self::ensure_accepting(&state)?;
-        self.ensure_open_generation(&state, id, generation)?;
+        let session = self.session_for_generation(&state, id, generation)?;
+        let current_is_file =
+            Url::parse(session.url.as_str()).is_ok_and(|url| url.scheme() == "file");
+        let allow_file = current_is_file
+            || session.pending_local_navigation.as_deref() == Some(raw_url)
+            || allow_history_file;
+        let allow_blank = session.url.as_str() == "about:blank";
+        let PreviewNavigationDecision::Allow { url } =
+            self.policy
+                .navigation(source, raw_url, allow_file, allow_blank)?;
         Ok(PreviewNavigationRequest {
             session_id: id,
             generation,
             source,
             url,
         })
+    }
+
+    /// 为一次受控 Back/Forward 预先授权最多一个 file history callback，超时由 command 清理。
+    pub(crate) fn prepare_history_navigation(
+        &self,
+        id: PreviewId,
+        generation: PreviewGeneration,
+    ) -> Result<u64, PreviewError> {
+        let mut state = self.lock_state()?;
+        Self::ensure_accepting(&state)?;
+        let session = self.session_mut(&mut state, id, generation)?;
+        let token = session
+            .next_history_navigation_token
+            .checked_add(1)
+            .ok_or(PreviewError::new(PreviewErrorCode::SequenceExhausted))?;
+        session.next_history_navigation_token = token;
+        session.pending_history_navigation_token = Some(token);
+        Ok(token)
+    }
+
+    /// 超时、dispatch 失败或无历史可走时按 token 撤销授权，旧 timer 不会清除新操作。
+    pub(crate) fn clear_pending_history_navigation(
+        &self,
+        id: PreviewId,
+        token: u64,
+    ) -> Result<(), PreviewError> {
+        let mut state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get_mut(&id)
+            .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+        if session.pending_history_navigation_token == Some(token) {
+            session.pending_history_navigation_token = None;
+        }
+        Ok(())
+    }
+
+    /// 从主 renderer 的显式文件命令导航现有页；WebView 后续 callback 仍受 generation 栅栏约束。
+    pub(crate) fn local_file_navigation_request(
+        &self,
+        id: PreviewId,
+        generation: PreviewGeneration,
+        raw_file_url: &str,
+    ) -> Result<PreviewNavigationRequest, PreviewError> {
+        let url = self.policy.validate_file_url(raw_file_url)?;
+        let mut state = self.lock_state()?;
+        Self::ensure_accepting(&state)?;
+        let session = self.session_mut(&mut state, id, generation)?;
+        session.pending_local_navigation = Some(url.as_str().to_owned());
+        Ok(PreviewNavigationRequest {
+            session_id: id,
+            generation,
+            source: NavigationSource::User,
+            url,
+        })
+    }
+
+    /// 原生导航在 callback 提交前失败时撤销一次性文件导航许可。
+    pub(crate) fn clear_pending_local_navigation(
+        &self,
+        id: PreviewId,
+        raw_file_url: &str,
+    ) -> Result<(), PreviewError> {
+        let mut state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get_mut(&id)
+            .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+        if session.pending_local_navigation.as_deref() == Some(raw_file_url) {
+            session.pending_local_navigation = None;
+        }
+        Ok(())
+    }
+
+    /// 原生分发前使用当前 generation 和 close claim 校验浏览器动作。
+    pub(crate) fn validate_session_generation(
+        &self,
+        id: PreviewId,
+        generation: PreviewGeneration,
+    ) -> Result<(), PreviewError> {
+        let state = self.lock_state()?;
+        Self::ensure_accepting(&state)?;
+        self.ensure_open_generation(&state, id, generation)
     }
 
     /// 提交用户或 redirect navigation，并推进其 callback generation。
@@ -163,8 +290,19 @@ impl PreviewManager {
         generation: PreviewGeneration,
         raw_url: &str,
     ) -> Result<PreviewEvent, PreviewError> {
-        let request =
-            self.navigation_request(id, generation, NavigationSource::Redirect, raw_url)?;
+        let allow_history_file = {
+            let mut state = self.lock_state()?;
+            Self::ensure_accepting(&state)?;
+            let session = self.session_mut(&mut state, id, generation)?;
+            session.pending_history_navigation_token.take().is_some()
+        };
+        let request = self.navigation_request_with_history(
+            id,
+            generation,
+            NavigationSource::Redirect,
+            raw_url,
+            allow_history_file,
+        )?;
         self.commit_navigation_event(request)
     }
 
@@ -205,6 +343,50 @@ impl PreviewManager {
         )?;
         session.load_status = PreviewLoadStatus::Failed;
         Ok(event)
+    }
+
+    /// 同步 WebView2 HistoryChanged 的原生能力，避免 React 自行推演页面历史栈。
+    pub(crate) fn callback_history_changed(
+        &self,
+        id: PreviewId,
+        generation: PreviewGeneration,
+        can_go_back: bool,
+        can_go_forward: bool,
+    ) -> Result<Option<PreviewEvent>, PreviewError> {
+        let mut state = self.lock_state()?;
+        Self::ensure_accepting(&state)?;
+        let session = self.session_mut(&mut state, id, generation)?;
+        if session.can_go_back == can_go_back && session.can_go_forward == can_go_forward {
+            return Ok(None);
+        }
+        session.can_go_back = can_go_back;
+        session.can_go_forward = can_go_forward;
+        Self::push_event(
+            session,
+            PreviewEventKind::HistoryChanged {
+                can_go_back,
+                can_go_forward,
+            },
+            self.policy.limits(),
+        )
+        .map(Some)
+    }
+
+    /// 只投影被浏览器宿主拒绝的新窗口或下载动作，不携带来源 URL 与文件名。
+    pub(crate) fn callback_action_blocked(
+        &self,
+        id: PreviewId,
+        generation: PreviewGeneration,
+        action: super::model::PreviewBlockedAction,
+    ) -> Result<PreviewEvent, PreviewError> {
+        let mut state = self.lock_state()?;
+        Self::ensure_accepting(&state)?;
+        let session = self.session_mut(&mut state, id, generation)?;
+        Self::push_event(
+            session,
+            PreviewEventKind::ActionBlocked { action },
+            self.policy.limits(),
+        )
     }
 
     /// 记录匹配的 engine `Finished` callback；navigation commitment 或不匹配的内部
@@ -410,6 +592,8 @@ impl PreviewManager {
         let mut state = self.lock_state()?;
         Self::ensure_accepting(&state)?;
         let session = self.session_mut(&mut state, request.session_id, request.generation)?;
+        session.pending_local_navigation = None;
+        session.pending_history_navigation_token = None;
         session.generation = next_generation(session.generation)?;
         session.url = request.url.clone();
         session.title.clear();
@@ -434,6 +618,29 @@ impl PreviewManager {
         let session = state
             .sessions
             .get_mut(&id)
+            .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+        if session.status == PreviewSessionStatus::Closed {
+            return Err(PreviewError::new(PreviewErrorCode::SessionClosed));
+        }
+        if session.close_token.is_some() {
+            return Err(PreviewError::new(PreviewErrorCode::SessionClosing));
+        }
+        if session.generation != generation {
+            return Err(PreviewError::new(PreviewErrorCode::StaleGeneration));
+        }
+        Ok(session)
+    }
+
+    /// 读取指定 generation 的不可变 session view，供 navigation policy 使用而不重复解释 identity。
+    fn session_for_generation<'a>(
+        &self,
+        state: &'a RegistryState,
+        id: PreviewId,
+        generation: PreviewGeneration,
+    ) -> Result<&'a SessionState, PreviewError> {
+        let session = state
+            .sessions
+            .get(&id)
             .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
         if session.status == PreviewSessionStatus::Closed {
             return Err(PreviewError::new(PreviewErrorCode::SessionClosed));
@@ -534,6 +741,8 @@ impl PreviewManager {
             title: session.title.clone(),
             window: PreviewWindowSpec::new(session.id, session.url.clone()),
             dropped_events: session.dropped_events,
+            can_go_back: session.can_go_back,
+            can_go_forward: session.can_go_forward,
         }
     }
 }

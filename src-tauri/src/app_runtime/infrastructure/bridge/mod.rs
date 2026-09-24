@@ -22,13 +22,14 @@ use crate::app_runtime::{
     TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput,
     TaskTreeDeleteResult, TaskUnobserveInput, ThreadArchiveResultData, ThreadCompactResultData,
     ThreadCreateResultData, ThreadDeleteResultData, ThreadDiscoverResultData, ThreadListResultData,
-    ThreadPinResultData, ThreadPreferencesUpdateResultData, ThreadReadResultData,
-    ThreadRenameResultData, ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData,
-    ThreadUsageReadResultData, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
-    ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnInputDelete, TurnInputEnqueue,
-    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnResumeInput, TurnStartInput,
-    WorkspaceDto, WorkspaceListResultData, WorkspacePathSearchInput, WorkspacePathSearchItem,
+    ThreadMcpReadResultData, ThreadPinResultData, ThreadPreferencesUpdateResultData,
+    ThreadReadResultData, ThreadRenameResultData, ThreadRestoreResultData, ThreadSearchResultData,
+    ThreadSeenResultData, ThreadUsageReadResultData, ToolArtifactReadInput, ToolArtifactReadResult,
+    ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput,
+    TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult, TurnContinueInput,
+    TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate,
+    TurnReaskInput, TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspaceKind,
+    WorkspaceListResultData, WorkspacePathSearchInput, WorkspacePathSearchItem,
     WorkspacePathSearchResult, clear_recovery_record, emit_frame, emit_status,
     ensure_recovery_clear, frame_to_value, persist_recovery_record, recovery_marker_path,
     valid_frozen_turn_id,
@@ -72,6 +73,7 @@ pub(crate) enum HistoryMethod {
     ThreadSearch,
     ThreadRead,
     ThreadUsageRead,
+    ThreadMcpRead,
     ThreadRename,
     ThreadPin,
     ThreadSeen,
@@ -93,6 +95,7 @@ impl HistoryMethod {
             Self::ThreadSearch => "thread/search",
             Self::ThreadRead => "thread/read",
             Self::ThreadUsageRead => "thread/usage/read",
+            Self::ThreadMcpRead => "thread/mcp/read",
             Self::ThreadRename => "thread/rename",
             Self::ThreadPin => "thread/pin",
             Self::ThreadSeen => "thread/seen",
@@ -388,10 +391,15 @@ impl RuntimeBridge {
         })
     }
 
-    /// 通过专用 typed lane 读取 Java-owned general Workspace，native 调用方不能替换方法名
-    /// 或请求参数。
-    pub(crate) fn general_workspace_read(&self) -> Result<Value, RuntimeCommandError> {
-        self.call(|reply| BridgeCommand::GeneralWorkspaceRead { reply })
+    /// 通过 Java 持久化 identity 重开 SESSION/LEGACY_SHARED，调用方无法提交根目录或类型。
+    pub(crate) fn workspace_open_by_id(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::WorkspaceOpenById {
+            workspace_id,
+            reply,
+        })
     }
 
     /// `@` 路径建议通过固定 actor command 转发，避免把 method 字符串或扫描预算暴露给 WebView。
@@ -443,6 +451,21 @@ impl RuntimeBridge {
     pub fn turn_start(&self, input: TurnStartInput) -> Result<TurnAccepted, RuntimeCommandError> {
         let params = turn_start_params(&input)?;
         self.call(|reply| BridgeCommand::TurnStart { params, reply })
+    }
+
+    /// 隐藏 continuation 使用独立准入方法，native 不插入合成可见消息，也不让 renderer 选择历史源。
+    pub fn turn_continue(
+        &self,
+        input: TurnContinueInput,
+    ) -> Result<TurnAccepted, RuntimeCommandError> {
+        let params = turn_continue_params(&input)?;
+        self.call(|reply| BridgeCommand::TurnContinue { params, reply })
+    }
+
+    /// Reask 使用独立固定准入方法，源 item 与路径切换由 Java 原子校验；bridge 只转发有界替换内容。
+    pub fn turn_reask(&self, input: TurnReaskInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        let params = turn_reask_params(&input)?;
+        self.call(|reply| BridgeCommand::TurnReask { params, reply })
     }
 
     /// 通过现有 bridge actor 准入取消；sidecar 保持存活，最终完成事件仍是权威事实。
@@ -838,9 +861,12 @@ impl RuntimeBridgePort for RuntimeBridge {
         RuntimeBridge::workspace_open(self, root, display_name, trust)
     }
 
-    /// 通用 Workspace 在 infrastructure 内解析为固定投影，不把动态 JSON 交给 application。
-    fn general_workspace(&self) -> Result<WorkspaceDto, RuntimeCommandError> {
-        parse_general_workspace(self.general_workspace_read()?)
+    /// ID-only lane asks Java to revalidate persisted identity before a session capability is cached.
+    fn workspace_open_by_id(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        RuntimeBridge::workspace_open_by_id(self, workspace_id)
     }
 
     /// 路径搜索沿用同一 supervised generation，并对返回栅栏做严格解析。
@@ -859,6 +885,16 @@ impl RuntimeBridgePort for RuntimeBridge {
     /// Turn Start 已是强类型 command，不经过动态 payload。
     fn turn_start(&self, input: TurnStartInput) -> Result<TurnAccepted, RuntimeCommandError> {
         RuntimeBridge::turn_start(self, input)
+    }
+
+    /// RuntimeHost 只通过此类型化 port 准入隐藏 continuation。
+    fn turn_continue(&self, input: TurnContinueInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        RuntimeBridge::turn_continue(self, input)
+    }
+
+    /// RuntimeHost 只通过此类型化 port 替换已停止且未答复的问题。
+    fn turn_reask(&self, input: TurnReaskInput) -> Result<TurnAccepted, RuntimeCommandError> {
+        RuntimeBridge::turn_reask(self, input)
     }
 
     /// Turn Cancel 已是强类型 command，不经过动态 payload。
@@ -1104,6 +1140,12 @@ impl RuntimeBridgePort for RuntimeBridge {
                 HistoryResponse::ThreadUsageRead,
                 ThreadUsageReadResultData
             ),
+            HistoryRequest::ThreadMcpRead(params) => dispatch_history!(
+                params,
+                HistoryMethod::ThreadMcpRead,
+                HistoryResponse::ThreadMcpRead,
+                ThreadMcpReadResultData
+            ),
             HistoryRequest::ThreadRename(params) => dispatch_history!(
                 params,
                 HistoryMethod::ThreadRename,
@@ -1224,8 +1266,10 @@ impl RuntimeBridgePort for RuntimeBridge {
     }
 }
 
-/// 严格解析 Java-owned 通用 Workspace；路径仍需由 application 注册到原生 capability registry。
-pub(crate) fn parse_general_workspace(value: Value) -> Result<WorkspaceDto, RuntimeCommandError> {
+/// 严格解析 Java-owned Workspace projection；路径仍需由 application 注册到原生 capability registry。
+pub(crate) fn parse_workspace_projection(
+    value: Value,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct WorkspaceWire {
@@ -1234,6 +1278,9 @@ pub(crate) fn parse_general_workspace(value: Value) -> Result<WorkspaceDto, Runt
         display_name: String,
         trust: String,
         revision: u64,
+        kind: String,
+        #[serde(deserialize_with = "required_nullable_workspace_id")]
+        legacy_shared_workspace_id: Option<String>,
     }
     let projection: WorkspaceWire =
         serde_json::from_value(value).map_err(|_| RuntimeCommandError::unavailable())?;
@@ -1251,13 +1298,35 @@ pub(crate) fn parse_general_workspace(value: Value) -> Result<WorkspaceDto, Runt
     {
         return Err(RuntimeCommandError::unavailable());
     }
+    let kind =
+        WorkspaceKind::parse(&projection.kind).ok_or_else(RuntimeCommandError::unavailable)?;
+    if projection
+        .legacy_shared_workspace_id
+        .as_ref()
+        .is_some_and(|workspace_id| !workspace_id.starts_with("ws_") || !valid_id(workspace_id, 99))
+    {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    if projection.legacy_shared_workspace_id.is_some() && kind != WorkspaceKind::Session {
+        return Err(RuntimeCommandError::unavailable());
+    }
     Ok(WorkspaceDto {
         workspace_id: projection.workspace_id,
         root: projection.root,
         display_name: projection.display_name,
         trust: projection.trust,
         revision: projection.revision,
+        kind,
+        legacy_shared_workspace_id: projection.legacy_shared_workspace_id,
     })
+}
+
+/// A null legacy association is meaningful and must be present; missing projection fields are protocol drift.
+fn required_nullable_workspace_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 /// infrastructure 只在固定 operation 分支解码参数；payload 必须是有界 JSON object，且从不写日志。
@@ -1291,6 +1360,32 @@ fn turn_start_params(input: &TurnStartInput) -> Result<Value, RuntimeCommandErro
         params["deadlineMs"] = json!(deadline_ms);
     }
     Ok(params)
+}
+
+/// 构造隐藏 continuation 的最小 CAS envelope；源问题由 Java 从当前有效路径解析，Rust 不发送合成消息或历史分支选择。
+pub(crate) fn turn_continue_params(
+    input: &TurnContinueInput,
+) -> Result<Value, RuntimeCommandError> {
+    input
+        .validate()
+        .map_err(|_| RuntimeCommandError::invalid_params())?;
+    Ok(json!({
+        "threadId": input.thread_id,
+        "expectedThreadRevision": input.expected_thread_revision,
+    }))
+}
+
+/// 构造 Reask CAS envelope 并复用已校验的封闭内容联合类型；源 item 仅选择待编辑问题，不撤销旧尝试的工具或文件副作用。
+pub(crate) fn turn_reask_params(input: &TurnReaskInput) -> Result<Value, RuntimeCommandError> {
+    input
+        .validate()
+        .map_err(|_| RuntimeCommandError::invalid_params())?;
+    Ok(json!({
+        "threadId": input.thread_id,
+        "expectedThreadRevision": input.expected_thread_revision,
+        "sourceMessageId": input.source_message_id,
+        "content": turn_content_value(&input.content),
+    }))
 }
 
 /// infrastructure 构造固定取消 envelope，domain 已排除非法 Turn identity；取消不携带

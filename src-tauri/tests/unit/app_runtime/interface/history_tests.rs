@@ -15,11 +15,28 @@ fn page_input_contains_only_cursor_and_limit() {
     assert_eq!(value, json!({"cursor": "cursor_1", "limit": 200}));
 }
 
+/// Workspace kind filtering is closed and optional; omitting it retains complete discovery behavior.
+#[test]
+fn workspace_list_input_accepts_only_known_kind_filters() {
+    let input: WorkspaceListInput =
+        serde_json::from_value(json!({"kind":"session","limit":50})).expect("kind filter");
+    assert!(validate_workspace_list(&input).is_ok());
+    assert_eq!(
+        serde_json::to_value(input).expect("serialize filter"),
+        json!({"kind":"session","limit":50})
+    );
+    let all: WorkspaceListInput = serde_json::from_value(json!({"cursor":null,"limit":50}))
+        .expect("unfiltered workspace list");
+    assert!(validate_workspace_list(&all).is_ok());
+    assert!(serde_json::from_value::<WorkspaceListInput>(json!({"kind":"future"})).is_err());
+}
+
 /// Thread page 进入 bridge 前必须携带 Java-issued Workspace identity。
 #[test]
 fn thread_list_input_is_workspace_scoped() {
     let input = ThreadListInput {
-        workspace_id: "ws_demo".to_owned(),
+        workspace_id: Some("ws_demo".to_owned()),
+        workspace_kind: None,
         cursor: None,
         limit: Some(200),
     };
@@ -92,6 +109,14 @@ fn thread_create_input_requires_collaboration_mode() {
     let input: ThreadCreateInput =
         serde_json::from_value(valid.clone()).expect("valid thread create");
     assert!(validate_thread_create(&input).is_ok());
+    assert_eq!(
+        serde_json::to_value(&input).expect("serialize session creation"),
+        valid
+    );
+
+    let mut explicit_null_cwd = valid.clone();
+    explicit_null_cwd["cwd"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<ThreadCreateInput>(explicit_null_cwd).is_err());
 
     let mut missing_mode = valid.clone();
     missing_mode
@@ -114,6 +139,8 @@ fn thread_create_result_is_direct() {
     let direct = json!({
         "threadId": "thr_demo",
         "workspaceId": "ws_demo",
+        "workspaceKind": "project",
+        "legacySharedWorkspaceId": null,
         "preferences": {
             "providerId": "provider_demo",
             "modelId": "model_demo",
@@ -153,11 +180,28 @@ fn workspace_page_uses_root_projection() {
             "root": "C:\\demo",
             "displayName": "Demo",
             "trust": "trusted",
-            "revision": 1
+            "revision": 1,
+            "kind": "project",
+            "legacySharedWorkspaceId": null
         }],
         "nextCursor": null
     });
     assert!(parse_workspace_page(page.clone()).is_ok());
+
+    let mut project_with_legacy = page.clone();
+    project_with_legacy["items"][0]["legacySharedWorkspaceId"] = json!("ws_legacy");
+    assert!(parse_workspace_page(project_with_legacy).is_err());
+
+    let mut legacy_with_legacy = page.clone();
+    legacy_with_legacy["items"][0]["kind"] = json!("legacy_shared");
+    legacy_with_legacy["items"][0]["legacySharedWorkspaceId"] = json!("ws_legacy");
+    assert!(parse_workspace_page(legacy_with_legacy).is_err());
+
+    let mut session_with_legacy = page.clone();
+    session_with_legacy["items"][0]["kind"] = json!("session");
+    session_with_legacy["items"][0]["legacySharedWorkspaceId"] = json!("ws_legacy");
+    assert!(parse_workspace_page(session_with_legacy).is_ok());
+
     assert!(
         parse_workspace_page(json!({"workspaces": page["items"], "nextCursor": null})).is_err()
     );
@@ -168,6 +212,7 @@ fn workspace_page_uses_root_projection() {
 fn thread_page_rejects_old_list_key() {
     let items = json!([{
         "threadId": "thr_demo", "workspaceId": "ws_demo",
+        "workspaceKind": "project", "legacySharedWorkspaceId": null,
         "preferences": {
             "providerId": "provider_demo", "modelId": "model_demo",
             "reasoningLevel": null, "accessMode": "approval_required",
@@ -181,11 +226,53 @@ fn thread_page_rejects_old_list_key() {
     assert!(parse_thread_page(json!({"threads": items, "nextCursor": null})).is_err());
 }
 
+/// Project pages use their workspace ID while the no-project sidebar uses Java's session-kind filter.
+#[test]
+fn thread_list_filters_are_project_or_session_only() {
+    let project: ThreadListInput =
+        serde_json::from_value(json!({"workspaceId":"ws_project","limit":50}))
+            .expect("project list filter");
+    assert!(validate_thread_list(&project).is_ok());
+    let session: ThreadListInput =
+        serde_json::from_value(json!({"workspaceKind":"session","cursor":null,"limit":50}))
+            .expect("session list filter");
+    assert!(validate_thread_list(&session).is_ok());
+    for invalid in [
+        json!({"workspaceId":"ws_project","workspaceKind":"session"}),
+        json!({"workspaceKind":"legacy_shared"}),
+        json!({}),
+    ] {
+        let parsed: ThreadListInput = serde_json::from_value(invalid).expect("shape fields");
+        assert!(validate_thread_list(&parsed).is_err());
+    }
+}
+
+/// 搜索的 session-kind 分支与项目 Workspace ID 互斥，避免 renderer 传入路径身份。
+#[test]
+fn thread_search_filters_are_project_or_session_only() {
+    for value in [
+        json!({"workspaceId":"ws_project","query":"hello"}),
+        json!({"workspaceKind":"session","query":"hello"}),
+    ] {
+        let input: ThreadSearchInput = serde_json::from_value(value).expect("search filter");
+        assert!(validate_thread_search(&input).is_ok());
+    }
+    for value in [
+        json!({"workspaceId":"ws_project","workspaceKind":"session","query":"x"}),
+        json!({"workspaceKind":"legacy_shared","query":"x"}),
+        json!({"query":"x"}),
+    ] {
+        let input: ThreadSearchInput = serde_json::from_value(value).expect("search shape");
+        assert!(validate_thread_search(&input).is_err());
+    }
+}
+
 /// 已读投影必须由 Java 完整返回；缺失字段或无 Turn 却声称未读都属于损坏响应。
 #[test]
 fn thread_seen_projection_is_required_and_consistent() {
     let valid = json!({
-        "threadId": "thr_demo", "workspaceId": "ws_demo", "preferences": null,
+        "threadId": "thr_demo", "workspaceId": "ws_demo", "workspaceKind": "project",
+        "legacySharedWorkspaceId": null, "preferences": null,
         "title": "Demo", "status": "active", "pinned": false,
         "latestTurnStatus": "completed", "latestTurnSeen": true,
         "activeGoalId": "goal_demo", "revision": 2,
@@ -206,6 +293,21 @@ fn thread_seen_projection_is_required_and_consistent() {
         .expect("thread object")
         .remove("activeGoalId");
     assert!(parse_thread(missing_goal).is_err());
+
+    let mut missing_legacy_association = valid.clone();
+    missing_legacy_association
+        .as_object_mut()
+        .expect("thread object")
+        .remove("legacySharedWorkspaceId");
+    assert!(parse_thread(missing_legacy_association).is_err());
+
+    let mut project_with_legacy_association = valid.clone();
+    project_with_legacy_association["legacySharedWorkspaceId"] = json!("ws_legacy");
+    assert!(parse_thread(project_with_legacy_association).is_err());
+
+    let mut project_with_legacy_association = valid.clone();
+    project_with_legacy_association["legacySharedWorkspaceId"] = json!("ws_legacy");
+    assert!(parse_thread(project_with_legacy_association).is_err());
 
     let mut impossible = valid;
     impossible["latestTurnStatus"] = serde_json::Value::Null;
@@ -292,6 +394,7 @@ fn v1_thread_read_fixture() -> serde_json::Value {
         "revision": 11,
         "turns": [{
             "turnId": "turn_demo",
+            "sourceMessageId": null,
             "status": "completed",
             "requestedAt": "2026-08-30T10:00:00Z",
             "updatedAt": "2026-08-30T10:00:02Z",
@@ -404,6 +507,11 @@ fn thread_read_accepts_v1_snapshot_and_preserves_required_nulls() {
             .and_then(|change_set| change_set.artifact_id.as_deref()),
         Some("artifact_change_demo")
     );
+    assert_eq!(parsed.turns[0].source_message_id, None);
+    assert_eq!(
+        serde_json::to_value(&parsed.turns[0]).expect("turn projection")["sourceMessageId"],
+        Value::Null
+    );
     assert_eq!(
         parsed.context_usage.as_ref().map(|usage| (
             usage.input_tokens,
@@ -426,6 +534,25 @@ fn thread_read_accepts_v1_snapshot_and_preserves_required_nulls() {
         .expect("turn object")
         .remove("changeSet");
     assert!(parse_thread_read(missing_change_set).is_err());
+
+    let mut missing_source_message_id = fixture.clone();
+    missing_source_message_id["turns"][0]
+        .as_object_mut()
+        .expect("turn object")
+        .remove("sourceMessageId");
+    assert!(parse_thread_read(missing_source_message_id).is_err());
+
+    let mut invalid_source_message_id = fixture.clone();
+    invalid_source_message_id["turns"][0]["sourceMessageId"] = json!("turn_wrong_domain");
+    assert!(parse_thread_read(invalid_source_message_id).is_err());
+
+    let mut continuation = fixture.clone();
+    continuation["turns"][0]["sourceMessageId"] = json!("item_user_demo");
+    let projected = parse_thread_read(continuation).expect("hidden continuation source");
+    assert_eq!(
+        projected.turns[0].source_message_id.as_deref(),
+        Some("item_user_demo")
+    );
 
     let mut absolute_path = fixture;
     absolute_path["turns"][0]["changeSet"]["files"][0]["path"] = json!("C:/private/main.rs");
@@ -461,7 +588,10 @@ fn thread_read_validates_live_stream_baseline_and_utf8_budget() {
         ]
     });
     let parsed = parse_thread_read(fixture.clone()).expect("live stream baseline");
-    assert_eq!(parsed.live_stream.as_ref().map(|stream| stream.stream_seq), Some(2));
+    assert_eq!(
+        parsed.live_stream.as_ref().map(|stream| stream.stream_seq),
+        Some(2)
+    );
 
     let mut tail_gap = fixture.clone();
     tail_gap["liveStream"]["segments"][1]["streamSeq"] = json!(1);
@@ -766,4 +896,36 @@ fn thread_compact_result_enforces_outcome_invariants() {
     let mut non_reducing = compacted;
     non_reducing["inputTokensAfter"] = json!(100);
     assert!(parse_thread_compact(non_reducing).is_err());
+}
+
+/// MCP 概览读取只接受脱敏名称、来源和状态；未知工具数保持缺省。
+#[test]
+fn thread_mcp_status_keeps_scopes_and_unknown_counts() {
+    let result = parse_thread_mcp_status(json!({
+        "threadId": "thr_demo", "source": "last_observed", "notices": [],
+        "catalogRevision": "catalog_42", "observedAt": "2026-09-23T12:30:00Z",
+        "servers": [
+            {"serverId": "mcp_kerminal", "name": "Kerminal", "scope": "global", "state": "available", "toolCount": 68},
+            {"serverId": "mcp_project", "name": "Kerminal", "scope": "project", "state": "not_discovered"}
+        ]
+    }), "thr_demo").expect("redacted thread MCP status");
+    let wire = serde_json::to_value(result).expect("MCP status wire projection");
+    assert_eq!(wire["servers"][0]["toolCount"], json!(68));
+    assert!(wire["servers"][1].get("toolCount").is_none());
+    assert!(wire["servers"][0].get("endpoint").is_none());
+}
+
+/// 结果必须绑定请求 Thread，且不能夹带凭据、传输地址或旧 probe 来源。
+#[test]
+fn thread_mcp_status_rejects_private_and_stale_shapes() {
+    let valid = json!({"threadId":"thr_demo", "source":"active", "notices":["configuration_changed"],
+        "servers":[{"serverId":"mcp_local", "name":"Local", "scope":"project", "state":"available"}]});
+    assert!(parse_thread_mcp_status(valid.clone(), "thr_demo").is_ok());
+    assert!(parse_thread_mcp_status(valid.clone(), "thr_other").is_err());
+    let mut private = valid.clone();
+    private["servers"][0]["endpoint"] = json!("http://127.0.0.1");
+    assert!(parse_thread_mcp_status(private, "thr_demo").is_err());
+    let mut probe = valid;
+    probe["source"] = json!("probe");
+    assert!(parse_thread_mcp_status(probe, "thr_demo").is_err());
 }

@@ -58,13 +58,14 @@ pub fn ja_runtime_storage_info(state: tauri::State<'_, RuntimeHost>) -> RuntimeS
     state.storage_info().into()
 }
 
-/// 返回 Java-owned 通用 Workspace；无路径输入，避免 WebView 绕过 native capability。
+/// 按 Java workspace identity 激活已登记 session；调用方不能提供或派生 root 路径。
 #[tauri::command]
-pub async fn ja_runtime_general_workspace(
+pub async fn ja_runtime_workspace_activate(
+    input: WorkspaceActivationInputDto,
     state: tauri::State<'_, RuntimeHost>,
-) -> Result<GeneralWorkspaceDto, RuntimeCommandError> {
+) -> Result<WorkspaceActivationDto, RuntimeCommandError> {
     let host = state.inner().clone();
-    run_blocking(move || host.general_workspace().map(Into::into)).await
+    run_blocking(move || host.activate_workspace(input.workspace_id).map(Into::into)).await
 }
 
 /// 查询当前 Thread Workspace 的有界相对路径候选，不读取正文或触发 Files/Review 状态。
@@ -85,6 +86,26 @@ pub async fn ja_turn_start(
 ) -> Result<TurnAcceptedDto, RuntimeCommandError> {
     let host = state.inner().clone();
     run_blocking(move || host.turn_start(input.into()).map(Into::into)).await
+}
+
+/// 准入隐藏 continuation 且不创建可见用户消息；源问题仍由服务端选择，native 只转发类型化 CAS 请求。
+#[tauri::command]
+pub async fn ja_turn_continue(
+    input: TurnContinueInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TurnAcceptedDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.turn_continue(input.into()).map(Into::into)).await
+}
+
+/// Reask 通过 Java 源 item CAS 切换当前路径；command 不在本地改历史，也不撤销旧尝试产生的文件变化。
+#[tauri::command]
+pub async fn ja_turn_reask(
+    input: TurnReaskInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TurnAcceptedDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.turn_reask(input.into()).map(Into::into)).await
 }
 
 /// 请求取消活动 Turn，但不停止 sidecar；最终完成事实仍来自 Java 事件。

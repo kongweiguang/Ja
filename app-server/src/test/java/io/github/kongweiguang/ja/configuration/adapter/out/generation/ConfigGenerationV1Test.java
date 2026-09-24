@@ -25,7 +25,7 @@ final class ConfigGenerationV1Test {
     void providerModelAndReasoningProjectionRemainNested() {
         ConfigGeneration generation = new ConfigGeneration("generation_fixture", null,
                 "cfg_user", "cfg_missing", document(), Map.of(), List.of(), false,
-                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
 
         try (ConfigGeneration.Lease lease = generation.acquire()) {
             ConfigurationGenerationSnapshot snapshot = lease.snapshot();
@@ -68,7 +68,7 @@ final class ConfigGenerationV1Test {
             providerNode.put("api", wireApi);
             ConfigGeneration generation = new ConfigGeneration("generation_" + wireApi, null,
                     "cfg_user", "cfg_missing", source, Map.of(), List.of(), false,
-                    new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                    new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
             try (ConfigGeneration.Lease lease = generation.acquire()) {
                 ConfigurationGenerationSnapshot.Provider provider =
                         lease.snapshot().requireProvider("provider_fixture");
@@ -87,7 +87,7 @@ final class ConfigGenerationV1Test {
                 .put("base_url", "http://198.51.100.22:8080/v1");
         ConfigGeneration generation = new ConfigGeneration("generation_remote_http", null,
                 "cfg_user", "cfg_missing", source, Map.of(), List.of(), false,
-                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
 
         try (ConfigGeneration.Lease lease = generation.acquire()) {
             assertEquals("http://198.51.100.22:8080/v1",
@@ -105,7 +105,7 @@ final class ConfigGenerationV1Test {
                 .put("reasoning_level", "medium");
         ConfigGeneration generation = new ConfigGeneration("generation_subagent", null,
                 "cfg_user", "cfg_missing", source, Map.of(), List.of(), false,
-                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
         try (ConfigGeneration.Lease lease = generation.acquire()) {
             assertEquals("provider_fixture", lease.snapshot().subagentPolicy().providerId().orElseThrow());
             assertEquals("model_second", lease.snapshot().subagentPolicy().modelId().orElseThrow());
@@ -121,7 +121,7 @@ final class ConfigGenerationV1Test {
     void unavailableSubagentModelFailsWithoutFallback() {
         ConfigGeneration generation = new ConfigGeneration("generation_missing_subagent_model", null,
                 "cfg_user", "cfg_missing", document(), Map.of(), List.of(), false,
-                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
         try (ConfigGeneration.Lease lease = generation.acquire()) {
             ConfigurationError failure = assertThrows(ConfigurationError.class,
                     () -> lease.snapshot().requireModel("provider_fixture", "model_missing"));
@@ -137,7 +137,7 @@ final class ConfigGenerationV1Test {
     void clarificationPolicyDefaultsOnAndFreezesFalse() {
         ConfigGeneration enabledGeneration = new ConfigGeneration("generation_clarification_default", null,
                 "cfg_user", "cfg_missing", document(), Map.of(), List.of(), false,
-                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
         try (ConfigGeneration.Lease lease = enabledGeneration.acquire()) {
             assertTrue(lease.snapshot().clarificationEnabled());
         } finally {
@@ -148,7 +148,7 @@ final class ConfigGenerationV1Test {
         disabledDocument.putObject("interaction").put("clarification_enabled", false);
         ConfigGeneration disabledGeneration = new ConfigGeneration("generation_clarification_disabled", null,
                 "cfg_user", "cfg_missing", disabledDocument, Map.of(), List.of(), false,
-                new java.util.LinkedHashMap<>(), List.of(), List.of(), "catalog_fixture", ignored -> { });
+                new java.util.LinkedHashMap<>(), List.of(), List.of(), java.util.Set.of(), "catalog_fixture", ignored -> { });
         try (ConfigGeneration.Lease lease = disabledGeneration.acquire()) {
             assertTrue(!lease.snapshot().clarificationEnabled());
         } finally {

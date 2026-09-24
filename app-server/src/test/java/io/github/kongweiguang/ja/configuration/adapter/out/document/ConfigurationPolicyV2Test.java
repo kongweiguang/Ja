@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-/** 配置 v2 的来源限定 Skill 授权与最小项目文件策略测试。 */
+/** 配置 v2 的来源限定 Skill 授权与可信项目 MCP 策略测试。 */
 final class ConfigurationPolicyV2Test {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -33,7 +33,7 @@ final class ConfigurationPolicyV2Test {
 
     /** 项目层只表达本项目授权与对已有全局授权的收紧，不能承载其它配置所有权。 */
     @Test
-    void projectDocumentIsLimitedToSkillReferences() {
+    void projectDocumentCannotOwnUserDefaults() {
         ObjectNode project = projectDocument("project:review", "user:review");
 
         ConfigurationPolicy.validateDocument(project, ConfigurationScope.PROJECT);
@@ -42,6 +42,37 @@ final class ConfigurationPolicyV2Test {
         ConfigurationError failure = assertThrows(ConfigurationError.class,
                 () -> ConfigurationPolicy.validateDocument(project, ConfigurationScope.PROJECT));
         assertEquals(ConfigurationError.Code.INVALID_DOCUMENT, failure.code());
+    }
+
+    /** 项目 MCP 保留完整服务定义；同名服务按 ID 区分，跨层 ID 冲突则必须显式报错。 */
+    @Test
+    void projectMcpMergesByIdentityAndRejectsGlobalIdCollision() {
+        ObjectNode user = userDocument();
+        ObjectNode project = projectDocument("project:review");
+        mcp(user, "mcp_global", "Kerminal");
+        mcp(project, "mcp_project", "Kerminal");
+
+        ConfigurationPolicy.validateDocument(project, ConfigurationScope.PROJECT);
+        ConfigurationPolicy.enforceNoEscalation(user, project);
+        ObjectNode effective = ConfigurationPolicy.mergeDocuments(user, project);
+        assertEquals(2, effective.withArray("mcp_servers").size());
+        assertEquals("mcp_project", effective.withArray("mcp_servers").get(1).path("mcp_id").textValue());
+
+        ((ObjectNode) project.withArray("mcp_servers").get(0)).put("mcp_id", "mcp_global");
+        ConfigurationError collision = assertThrows(ConfigurationError.class,
+                () -> ConfigurationPolicy.enforceNoEscalation(user, project));
+        assertEquals(ConfigurationError.Code.LIMIT_ESCALATION, collision.code());
+    }
+
+    /** 测试服务使用规范完整定义，避免策略测试靠缺字段误报冲突。 */
+    private static void mcp(ObjectNode document, String id, String name) {
+        ObjectNode server = document.withArray("mcp_servers").addObject();
+        server.put("mcp_id", id).put("name", name).put("transport", "stdio")
+                .put("endpoint", "node").put("enabled", true);
+        server.putArray("args");
+        server.putObject("env");
+        server.putObject("headers");
+        server.putObject("auth").put("kind", "none");
     }
 
     /** 项目禁用项只能收紧已显式启用的全局引用，不能成为跨项目启用通道。 */

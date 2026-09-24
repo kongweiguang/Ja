@@ -31,17 +31,11 @@ const SERVER: McpServerProjection = {
 function renderMcp(overrides: Partial<SettingsPorts> = {}, servers = [SERVER]): void {
   const ports: Pick<
     SettingsPorts,
-    | "onSaveMcp"
-    | "onDeleteMcp"
-    | "onTestMcp"
-    | "onCloseMcp"
-    | "onReplaceCredential"
-    | "onClearCredential"
+    "onSaveMcp" | "onDeleteMcp" | "onTestMcp" | "onReplaceCredential" | "onClearCredential"
   > = {
     onSaveMcp: vi.fn(async () => undefined),
     onDeleteMcp: vi.fn(async () => undefined),
     onTestMcp: vi.fn(async () => "connected" as const),
-    onCloseMcp: vi.fn(async () => undefined),
     onReplaceCredential: vi.fn(async () => undefined),
     onClearCredential: vi.fn(async () => undefined),
   };
@@ -49,11 +43,110 @@ function renderMcp(overrides: Partial<SettingsPorts> = {}, servers = [SERVER]): 
 }
 
 describe("McpSection", () => {
+  /** 作用域切换只显示目标层条目，项目保存须携带项目作用域。 */
+  it("switches between global and project MCP without merging same names", async () => {
+    const user = userEvent.setup();
+    const onSaveMcp = vi.fn(async () => undefined);
+    render(
+      <McpSection
+        servers={[SERVER]}
+        projectServers={[{ ...SERVER, id: "mcp_project", mcpRevision: "mcp_project" }]}
+        projectAvailable
+        projectWorkspaceId="ws_fixture"
+        onSaveMcp={onSaveMcp}
+        onDeleteMcp={vi.fn(async () => undefined)}
+        onTestMcp={vi.fn(async () => "connected" as const)}
+        onReplaceCredential={vi.fn(async () => undefined)}
+        onClearCredential={vi.fn(async () => undefined)}
+      />,
+    );
+    await user.click(screen.getByRole("tab", { name: "当前项目" }));
+    expect(screen.getByLabelText("当前项目 MCP 服务")).toHaveTextContent("文件工具");
+    expect(screen.getByLabelText("当前项目 MCP 服务")).not.toHaveTextContent("mcp-files");
+    await user.click(screen.getByRole("switch", { name: "文件工具：已启用" }));
+    await waitFor(() =>
+      expect(onSaveMcp).toHaveBeenCalledWith(
+        expect.objectContaining({ mcpRevision: "mcp_project", enabled: false }),
+        "project",
+      ),
+    );
+  });
+
   it("keeps the empty state quiet with one primary add action", () => {
     renderMcp({}, []);
 
     expect(screen.getAllByRole("button", { name: "新增服务" })).toHaveLength(1);
     expect(screen.queryByRole("button", { name: "添加服务" })).toBeNull();
+  });
+
+  /** 空 tools 投影在首次探测前代表未知，不应伪装成服务已返回零个工具。 */
+  it("does not report zero tools before the catalog has been checked", () => {
+    renderMcp();
+
+    expect(screen.getByText("工具未检查")).toBeInTheDocument();
+    expect(screen.queryByText("0 个工具")).toBeNull();
+  });
+
+  /** 失败投影通过状态和错误文案呈现，避免把失败目录压成零工具。 */
+  it("shows unavailable catalog state without a zero tool count", () => {
+    renderMcp({}, [
+      {
+        ...SERVER,
+        status: "error",
+        tools: [],
+        lastError: "MCP 工具目录读取失败；请检查服务连接后重试。",
+      },
+    ]);
+
+    expect(screen.getByText("工具不可用")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("MCP 工具目录读取失败");
+    expect(screen.queryByText("0 个工具")).toBeNull();
+  });
+
+  /** 只有真正读取到目录后才展示其数量，包含 Kerminal 的 68 工具规模。 */
+  it("shows the exact number of tools after a successful catalog read", () => {
+    const tools = Array.from({ length: 68 }, (_, index) => ({
+      name: `tool_${index}`,
+      policy: "ask" as const,
+    }));
+    renderMcp({}, [{ ...SERVER, status: "connected", tools }]);
+
+    expect(screen.getByText("68 个工具")).toBeInTheDocument();
+    expect(screen.getByText("服务已连接")).toBeInTheDocument();
+    expect(screen.getByText(/不代表当前会话已加载/)).toBeInTheDocument();
+  });
+
+  /** 健康服务确实返回空工具目录时，零才是可见的真实数量。 */
+  it("shows zero only for a successful empty catalog", () => {
+    renderMcp({}, [{ ...SERVER, status: "connected", tools: [] }]);
+
+    expect(screen.getByText("0 个工具")).toBeInTheDocument();
+    expect(screen.getByText("服务已连接")).toBeInTheDocument();
+  });
+
+  /** controller 返回 unavailable 时使用状态文案，不把 RPC 失败包装成通用“测试失败”。 */
+  it("renders the unavailable result from the controller", async () => {
+    const user = userEvent.setup();
+    const onTestMcp = vi.fn(async () => "error" as const);
+    renderMcp({ onTestMcp });
+
+    await user.click(screen.getByRole("button", { name: "测试" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("文件工具：不可用。");
+    expect(screen.queryByText("文件工具 测试失败")).toBeNull();
+  });
+
+  /** 独立设置探测反馈明确描述服务目录，不声称当前会话已使用该服务。 */
+  it("describes a successful Settings probe as a service check", async () => {
+    const user = userEvent.setup();
+    renderMcp({ onTestMcp: vi.fn(async () => "connected" as const) });
+
+    await user.click(screen.getByRole("button", { name: "测试" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "文件工具 服务已连接，工具目录已读取。",
+    );
+    expect(screen.getByText(/不代表当前会话已加载/)).toBeInTheDocument();
   });
 
   it("keeps the enable switch beside the server name and saves the real state", async () => {
@@ -69,6 +162,7 @@ describe("McpSection", () => {
           mcpRevision: "mcp-files",
           enabled: false,
         }),
+        "user",
       ),
     );
   });
@@ -203,7 +297,7 @@ describe("McpSection", () => {
     const dialog = screen.getByRole("alertdialog", { name: "删除 MCP 服务？" });
     await user.click(within(dialog).getByRole("button", { name: "删除" }));
 
-    await waitFor(() => expect(onDeleteMcp).toHaveBeenCalledWith("mcp-files"));
+    await waitFor(() => expect(onDeleteMcp).toHaveBeenCalledWith("mcp-files", "user"));
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
   });
 

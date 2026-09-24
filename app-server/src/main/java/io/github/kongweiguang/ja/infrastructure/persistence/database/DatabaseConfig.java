@@ -16,7 +16,7 @@ import java.util.Objects;
  * <p>runtime 只接受一个明确 SQLite 文件，不接受目录或旧位置；文件选择集中在此边界，
  * 防止持久化代码探测旧应用数据树。</p>
  */
-public record DatabaseConfig(Path databasePath, Duration busyTimeout) {
+public record DatabaseConfig(Path databasePath, Duration busyTimeout, Path homeDirectory) {
     /**
      * SQLite 锁等待保持有界，避免停滞 peer 永久占住 Turn。
      */
@@ -38,19 +38,20 @@ public record DatabaseConfig(Path databasePath, Duration busyTimeout) {
             throw new StorageException(StorageException.Code.INVALID_CONFIGURATION,
                     "busyTimeout is outside the safe bound");
         }
+        Objects.requireNonNull(homeDirectory, "homeDirectory");
+        homeDirectory = homeDirectory.toAbsolutePath().normalize();
     }
 
-    /**
-     * 使用生产锁预算，不引入第二条默认路径。
-     */
-    public static DatabaseConfig of(Path databasePath) {
-        return new DatabaseConfig(databasePath, DEFAULT_BUSY_TIMEOUT);
+    /** 生产创建明确使用 Host 发布的 homeDirectory，不从可自定义 dataDirectory 反推。 */
+    public static DatabaseConfig of(Path databasePath, Path homeDirectory) {
+        return new DatabaseConfig(databasePath, DEFAULT_BUSY_TIMEOUT, homeDirectory);
     }
 
     /**
      * 保持同一个显式文件，仅允许测试调整锁压力预算。
      */
     public DatabaseConfig withBusyTimeout(Duration timeout) {
-        return new DatabaseConfig(databasePath, timeout);
+        return new DatabaseConfig(databasePath, timeout, homeDirectory);
     }
+
 }

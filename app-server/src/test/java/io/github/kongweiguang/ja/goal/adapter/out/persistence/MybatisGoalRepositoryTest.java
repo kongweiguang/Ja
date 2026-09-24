@@ -1106,7 +1106,7 @@ final class MybatisGoalRepositoryTest {
     /** fixture 创建 fresh V1 数据库，并让 JDBC 聚合仓储显式 commit/rollback。 */
     private Fixture fixture(String name) throws Exception {
         JaDatabase database = JaDatabase.open(new DatabaseConfig(temp.resolve(name + ".sqlite3"),
-                DatabaseConfig.DEFAULT_BUSY_TIMEOUT));
+                DatabaseConfig.DEFAULT_BUSY_TIMEOUT, temp));
         Configuration configuration = new Configuration(new Environment("goal-test",
                 new JdbcTransactionFactory(), database.dataSource()));
         configuration.setMapUnderscoreToCamelCase(false);

@@ -24,7 +24,8 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
     /** Turn 元数据只表达 Operation 生命周期；模型事实必须从请求级 Usage Profile 读取。 */
     public record Turn(String turnId, String status,
                        Instant requestedAt, Instant updatedAt, Instant completedAt, String errorCode,
-                       TurnChangeSet changeSet, long mutationVersion, int modelRound) {
+                       TurnChangeSet changeSet, long mutationVersion, int modelRound,
+                       String sourceMessageId) {
         /** 历史只公开稳定错误码，错误正文和 Provider 私有续传状态仍留在服务端。 */
         public Turn {
             if (turnId == null || !turnId.matches("turn_[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -38,6 +39,7 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
             }
             if (mutationVersion < 0) throw new IllegalArgumentException("invalid mutationVersion");
             if (modelRound < 0 || modelRound > 128) throw new IllegalArgumentException("invalid modelRound");
+            if (sourceMessageId != null) requireIdentifier(sourceMessageId, "item_", "sourceMessageId");
         }
 
     }

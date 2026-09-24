@@ -11,7 +11,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 
-/** 内部 Goal/Plan Turn 的准入意图；类型上不提供 UserContent，避免调用方伪造 USER message。 */
+/** 内部 continuation 的准入意图；类型上不提供 UserContent，避免重复或伪造 USER message。 */
 public record InternalTurnStartRequest(
         String threadId,
         String turnId,
@@ -28,7 +28,7 @@ public record InternalTurnStartRequest(
         Instant requestedAt,
         TurnOrigin origin) {
 
-    /** 内部请求沿用公开 Turn 的稳定身份和预算约束，但只接受两个隐藏来源。 */
+    /** 内部请求沿用公开 Turn 的稳定身份和预算约束，只接受会话内三种隐藏来源。 */
     public InternalTurnStartRequest {
         threadId = TurnStartRequestValidation.identifier(threadId, "thr_", "threadId");
         turnId = TurnStartRequestValidation.identifier(turnId, "turn_", "turnId");

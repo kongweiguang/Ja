@@ -21,12 +21,15 @@ SCHEMA_PATH = ROOT / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schem
 VALID = GOLDEN / "v1" / "valid" / "agent-process.jsonl"
 INVALID = GOLDEN / "v1" / "invalid" / "agent-presentation.jsonl"
 CHANGE_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "change-set-results.jsonl"
+WORKSPACE_IDENTITY_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "workspace-identities.jsonl"
 QUEUE_VALID = GOLDEN / "v1" / "valid" / "input-queue.jsonl"
 PATH_SEARCH_VALID = GOLDEN / "v1" / "valid" / "workspace-path-search.jsonl"
 PATH_SEARCH_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "workspace-path-search-results.jsonl"
 THREAD_VALID = GOLDEN / "v1" / "valid" / "lists.jsonl"
 THREAD_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "thread-seen-results.jsonl"
 USAGE_VALID = GOLDEN / "v1" / "valid" / "thread-usage-summary.jsonl"
+MCP_STATUS_VALID = GOLDEN / "v1" / "valid" / "thread-mcp-status.jsonl"
+MCP_STATUS_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "thread-mcp-status-results.jsonl"
 TASK_VALID = GOLDEN / "v1" / "valid" / "task-threads.jsonl"
 TASK_INVALID = GOLDEN / "v1" / "invalid" / "task-threads.jsonl"
 TASK_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "task-thread-results.jsonl"
@@ -34,6 +37,9 @@ GOAL_VALID = GOLDEN / "v1" / "valid" / "plan-goals.jsonl"
 GOAL_INVALID = GOLDEN / "v1" / "invalid" / "plan-goals.jsonl"
 GOAL_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "plan-goal-results.jsonl"
 RESULT_DEFS = {
+    "workspace/open": "workspaceResult",
+    "workspace/list": "workspacePageResult",
+    "thread/create": "threadResult",
     "thread/list": "threadListResult",
     "thread/search": "threadPageResult",
     "thread/rename": "threadResult",
@@ -44,6 +50,7 @@ RESULT_DEFS = {
     "thread/restore": "threadResult",
     "thread/read": "threadReadResult",
     "thread/usage/read": "threadUsageSummary",
+    "thread/mcp/read": "threadMcpStatusResult",
     "tool/artifact/read": "toolArtifactReadResult",
     "turn/change-set/read": "changeSetArtifactReadResult",
     "turn/input/enqueue": "turnInputMutationResult",
@@ -331,6 +338,29 @@ def validate_thread_seen_contract(schema: dict[str, Any], root: Draft202012Valid
     return len(frames) + len(invalid_frames)
 
 
+def validate_workspace_identity_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
+    """PROJECT 与 LEGACY_SHARED 投影不得携带只属于 SESSION 的旧共享恢复 ID。"""
+    pending: dict[str, str] = {}
+    requests: set[str] = set()
+    results: set[str] = set()
+    frames = documents(WORKSPACE_IDENTITY_INVALID)
+    for frame in frames:
+        require_valid(root, frame, str(frame.get("method", frame.get("id", "response"))))
+        method = frame.get("method")
+        if isinstance(method, str) and "id" in frame:
+            pending[frame["id"]] = method
+            requests.add(method)
+        elif "result" in frame:
+            method = pending.pop(frame["id"])
+            definition = RESULT_DEFS[method]
+            require_invalid(definition_validator(schema, definition), frame["result"], method)
+            results.add(method)
+    expected = {"workspace/open", "thread/seen"}
+    if pending or requests != expected or results != expected:
+        raise RuntimeError("workspace identity negative transcript is incomplete")
+    return len(frames)
+
+
 def validate_thread_usage_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
     """独立消费计量汇总，冻结部分 Provider 报告的覆盖边界，缺失绝不伪装为零。"""
     frames = documents(USAGE_VALID)
@@ -364,6 +394,50 @@ def validate_thread_usage_contract(schema: dict[str, Any], root: Draft202012Vali
     if result["measuredRequestCount"] >= request_count:
         raise RuntimeError("thread usage fixture no longer covers partially reported Provider usage")
     return len(frames)
+
+
+def validate_thread_mcp_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
+    """Cross-check MCP status requests, thread/server identity, and omission semantics independently."""
+    frames = documents(MCP_STATUS_VALID)
+    pending: dict[str, tuple[str, dict[str, Any]]] = {}
+    observed: set[str] = set()
+    for frame in frames:
+        require_valid(root, frame, str(frame.get("method", frame.get("id", "response"))))
+        method = frame.get("method")
+        if isinstance(method, str) and "id" in frame:
+            pending[frame["id"]] = (method, frame["params"])
+            observed.add(method)
+            continue
+        if "result" not in frame:
+            continue
+        method, params = pending.pop(frame["id"])
+        result = frame["result"]
+        require_valid(definition_validator(schema, "threadMcpStatusResult"), result, method)
+        if result["threadId"] != params["threadId"]:
+            raise RuntimeError("thread MCP result identity mismatch")
+    if observed != {"thread/mcp/read"} or pending:
+        raise RuntimeError("thread MCP corpus lacks a correlated read")
+    read_result = documents(MCP_STATUS_VALID)[1]["result"]
+    if any(
+        "toolCount" in server
+        for server in read_result["servers"]
+        if server["state"] in {"disabled", "not_discovered"}
+    ):
+        raise RuntimeError("unknown MCP tool count was fabricated as a numeric value")
+
+    invalid = documents(MCP_STATUS_INVALID)
+    if len(invalid) != 2:
+        raise RuntimeError("thread MCP negative transcript is incomplete")
+    request, response = invalid
+    require_valid(root, request, "thread/mcp/read invalid-result precondition")
+    if request.get("id") != response.get("id") or "result" not in response:
+        raise RuntimeError("thread MCP invalid result lost correlation")
+    require_invalid(
+        definition_validator(schema, "threadMcpStatusResult"),
+        response["result"],
+        "thread/mcp/read",
+    )
+    return len(frames) + len(invalid)
 
 
 def validate_task_threads_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
@@ -566,13 +640,17 @@ def main() -> int:
             require_invalid(definition_validator(schema, definition), frame["result"], definition)
     queue_frames = validate_queue_contract(schema, root)
     thread_frames = validate_thread_seen_contract(schema, root)
+    identity_frames = validate_workspace_identity_contract(schema, root)
     usage_frames = validate_thread_usage_contract(schema, root)
+    mcp_status_frames = validate_thread_mcp_contract(schema, root)
     path_search_frames = validate_workspace_path_search_contract(schema, root)
     task_frames = validate_task_threads_contract(schema, root)
     goal_frames = validate_plan_goal_contract(schema, root)
     change_set_cases = validate_change_set_file_boundaries(schema)
     print(f"PYTHON_CONSUMER_OK positiveFrames={len(positive)} invalidFrames={len(negative)} "
-          f"queueFrames={queue_frames} threadFrames={thread_frames} usageFrames={usage_frames} "
+                f"queueFrames={queue_frames} threadFrames={thread_frames} workspaceIdentityFrames={identity_frames} "
+                f"usageFrames={usage_frames} "
+          f"mcpStatusFrames={mcp_status_frames} "
           f"pathSearchFrames={path_search_frames} "
           f"taskFrames={task_frames} goalFrames={goal_frames} changeSetCases={change_set_cases}")
     return 0

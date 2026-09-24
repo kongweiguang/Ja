@@ -140,6 +140,47 @@ impl TurnStartInput {
     }
 }
 
+/// Continue 是挂到最后一个未答问题的新准入；隐藏 Turn 不携带用户内容，历史与模型上下文继续保留原提问。
+#[derive(Debug, Clone)]
+pub struct TurnContinueInput {
+    pub thread_id: String,
+    pub expected_thread_revision: u64,
+}
+
+impl TurnContinueInput {
+    /// 在进入 actor 队列前拒绝非法 identity 与 revision；当前路径资格和 revision CAS 由 Java 原子裁决。
+    pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
+        if !valid_protocol_id(&self.thread_id, "thr_", 100)
+            || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
+        {
+            return Err(DomainValidationError);
+        }
+        Ok(())
+    }
+}
+
+/// Reask 只替换当前路径最后一个未答问题；旧尝试保留为审计事实，路径选择与历史 CAS 由 Java 持有。
+#[derive(Debug, Clone)]
+pub struct TurnReaskInput {
+    pub thread_id: String,
+    pub expected_thread_revision: u64,
+    pub source_message_id: String,
+    pub content: Vec<TurnContentPart>,
+}
+
+impl TurnReaskInput {
+    /// 复用普通内容联合类型与预算，防止编辑绕过附件/引用上限；源问题资格和当前路径由 Java 判定。
+    pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
+        if !valid_protocol_id(&self.thread_id, "thr_", 100)
+            || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
+            || !valid_protocol_id(&self.source_message_id, "item_", 101)
+        {
+            return Err(DomainValidationError);
+        }
+        validate_turn_content(&self.content, 4_000_000)
+    }
+}
+
 /// 三个消息入口共用同一内容不变量，保证首轮、队列与恢复不会因 Rust 路径不同而分叉。
 pub(super) fn validate_turn_content(
     content: &[TurnContentPart],
@@ -493,7 +534,7 @@ pub struct WorkspacePathSearchResult {
     pub truncated: bool,
 }
 
-/// `ja_turn_start` 与 `ja_turn_resume` 共用的 accepted 响应；后续事实只能通过固定事件到达。
+/// Start、Continue、Reask 与 Resume 共用的 accepted 响应；后续事实只能通过固定事件到达。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnAccepted {
     pub accepted: bool,

@@ -11,6 +11,7 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -32,6 +33,7 @@ public final class RuntimeLease implements AutoCloseable {
     private final String promptRevision;
     private final String requestedReasoning;
     private final AutoCloseable release;
+    private final Consumer<Boolean> providerDispatchObservation;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     /**
@@ -48,6 +50,24 @@ public final class RuntimeLease implements AutoCloseable {
                         String promptRevision,
                         String requestedReasoning,
                         AutoCloseable release) {
+        this(generationId, model, accessMode, collaborationMode, limits, tools, toolSessions, outputLimits,
+                promptSession, attachments, presentationSecrets, toolCatalogDigest, promptRevision,
+                requestedReasoning, release, ignored -> { });
+    }
+
+    /** 延迟目录观测发布，规划运行时不能在真实 Provider 派发前冒充已发现。 */
+    public RuntimeLease(String generationId, ModelPort.ModelConfiguration model,
+                        AccessMode accessMode, CollaborationMode collaborationMode,
+                        TurnLimits limits, List<AgentTool> tools,
+                        TurnToolSessionFactory toolSessions, ToolProjectionLimits outputLimits,
+                        AgentPromptSession promptSession,
+                        ManagedAttachmentReader attachments,
+                        List<String> presentationSecrets,
+                        String toolCatalogDigest,
+                        String promptRevision,
+                        String requestedReasoning,
+                        AutoCloseable release,
+                        Consumer<Boolean> providerDispatchObservation) {
         if (generationId == null || !generationId.startsWith("cfg_")) {
             throw new IllegalArgumentException("invalid generationId");
         }
@@ -73,6 +93,8 @@ public final class RuntimeLease implements AutoCloseable {
         }
         this.requestedReasoning = requestedReasoning;
         this.release = Objects.requireNonNull(release, "release");
+        this.providerDispatchObservation = Objects.requireNonNull(
+                providerDispatchObservation, "providerDispatchObservation");
     }
 
     /**
@@ -174,6 +196,12 @@ public final class RuntimeLease implements AutoCloseable {
                 generationId,
                 requiredRevision(effectivePromptRevision, "effectivePromptRevision"), toolCatalogDigest,
                 contextWindow, limits.maxOutputTokens());
+    }
+
+    /** 仅在即将发送 Provider 请求时发布当前精确目录。 */
+    public void observeProviderDispatch(boolean mcpGatewayExposed) {
+        if (closed.get()) throw new IllegalStateException("runtime lease is closed");
+        providerDispatchObservation.accept(mcpGatewayExposed);
     }
 
     /** Prompt 修订只允许有界非空标识，避免恢复状态成为任意文本通道。 */

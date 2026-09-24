@@ -4,6 +4,7 @@
 import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowLeft, CircleAlert, Search, X } from "lucide-react";
 import {
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -266,6 +267,12 @@ export interface SettingsProps {
     project?: SettingsSnapshot["skills"];
     projectAvailable: boolean;
   };
+  mcpSettings?: {
+    global: SettingsSnapshot["mcpServers"];
+    project?: SettingsSnapshot["mcpServers"];
+    projectAvailable: boolean;
+    projectWorkspaceId?: string;
+  };
   /** 问题由 App Server 产生；页面只展示实际影响与允许操作，不从诊断代码猜配置内容。 */
   issues?: readonly ConfigurationIssue[];
   onIssuesRetry?: () => Promise<void>;
@@ -288,6 +295,7 @@ export interface SettingsProps {
 export function Settings({
   snapshot,
   skillSettings = { global: snapshot.skills, projectAvailable: false },
+  mcpSettings = { global: snapshot.mcpServers, projectAvailable: false },
   issues = [],
   onIssuesRetry,
   onIssuesRestore,
@@ -332,6 +340,16 @@ export function Settings({
           ),
     [indexedResults, query],
   );
+
+  /** Settings 页面由 Shell 路由进入时接管已卸载来源的焦点；当前焦点仍在页内则保留用户位置。 */
+  useEffect(() => {
+    if (disabled) return;
+    const root = rootRef.current;
+    if (root === null || root.contains(document.activeElement)) return;
+    root
+      .querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+      ?.focus({ preventScroll: true });
+  }, [disabled, section]);
 
   /** 分类各自保留阅读位置；切换在布局阶段恢复，避免先闪现上一页的深滚动位置。 */
   useLayoutEffect(() => {
@@ -721,12 +739,14 @@ export function Settings({
             </Tabs.Content>
             <Tabs.Content forceMount value="mcp" className="ja-settings-panel">
               <McpSection
-                servers={snapshot.mcpServers}
+                servers={mcpSettings.global}
+                projectServers={mcpSettings.project}
+                projectAvailable={mcpSettings.projectAvailable}
+                projectWorkspaceId={mcpSettings.projectWorkspaceId}
                 snapshotRevision={snapshot.revision}
                 onSaveMcp={ports.onSaveMcp}
                 onDeleteMcp={ports.onDeleteMcp}
                 onTestMcp={ports.onTestMcp}
-                onCloseMcp={ports.onCloseMcp}
                 onReplaceCredential={ports.onReplaceCredential}
                 onClearCredential={ports.onClearCredential}
               />

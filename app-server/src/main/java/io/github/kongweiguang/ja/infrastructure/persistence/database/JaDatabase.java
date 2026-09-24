@@ -12,10 +12,13 @@ import org.apache.ibatis.session.SqlSession;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationInfo;
 import org.flywaydb.core.api.FlywayException;
+import org.flywaydb.core.api.MigrationVersion;
 import org.sqlite.SQLiteConfig;
 import org.sqlite.SQLiteDataSource;
 
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.Objects;
 
@@ -42,9 +45,9 @@ public final class JaDatabase implements AutoCloseable {
     /**
      * 打开唯一数据库并把 schema 准入完全交给 Flyway history/checksum。
      *
-     * <p>空库按顺序执行事务化 V1 至 V4；非空未知 schema、版本漂移、checksum 冲突和损坏数据库都由
-     * Flyway/SQLite 失败关闭。这里不 repair、不删除也不复制数据，避免启动路径演变成第二套
-     * 隐式迁移协议。</p>
+     * <p>空库按固定 Flyway 迁移闭集初始化；升级到 V7 前先在 lease 内做 WAL 一致快照，再执行
+     * 会话归属事务。非空未知 schema、版本漂移、checksum 冲突和损坏数据库都失败关闭，不 repair
+     * 或删除数据库内容。</p>
      */
     public static JaDatabase open(DatabaseConfig config) {
         Objects.requireNonNull(config, "config");
@@ -57,11 +60,16 @@ public final class JaDatabase implements AutoCloseable {
                     .resourceProvider(JaFlywayResources.provider()).baselineOnMigrate(false)
                     .ignoreMigrationPatterns(new String[0])
                     .validateMigrationNaming(true).load();
-            migrateAndVerify(flyway, source);
+            backupBeforeV7UpgradeIfNeeded(flyway, source, config.databasePath());
+            migrateAndVerify(flyway, source, config);
             return new JaDatabase(config.databasePath(), source, lease);
         } catch (StorageException failure) {
             if (lease != null) lease.close();
             throw failure;
+        } catch (FlywayException | SQLException invalidDatabase) {
+            if (lease != null) lease.close();
+            throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
+                    "database schema or integrity check failed", invalidDatabase);
         } catch (Exception failure) {
             if (lease != null) lease.close();
             throw new StorageException(StorageException.Code.IO, "cannot open Ja database", failure);
@@ -72,16 +80,17 @@ public final class JaDatabase implements AutoCloseable {
      * Flyway 执行和 SQLite 完整性回读都在进程 lease 内完成；任何 schema 漂移、future history、
      * checksum 冲突或损坏都归类为稳定的存储冲突，调用方不能把它当作可 repair 的普通 I/O。
      */
-    private static void migrateAndVerify(Flyway flyway, SQLiteDataSource source) {
+    private static void migrateAndVerify(Flyway flyway, SQLiteDataSource source, DatabaseConfig config) {
         try {
             flyway.migrate();
             MigrationInfo current = flyway.info().current();
             if (current == null || current.getVersion() == null
-                || !"4".equals(current.getVersion().getVersion())
+                || !"7".equals(current.getVersion().getVersion())
                 || flyway.info().pending().length != 0) {
                 throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
-                        "database schema is not the current Ja V4");
+                        "database schema is not the current Ja V7");
             }
+            LegacySessionWorkspaceMigration.migrate(source, config);
             verifySqliteIntegrity(source);
         } catch (StorageException failure) {
             throw failure;
@@ -89,6 +98,42 @@ public final class JaDatabase implements AutoCloseable {
             throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
                     "database schema or integrity check failed", failure);
         }
+    }
+
+    /**
+     * V7 会重属旧会话历史，因此迁移前必须在独占 lease 内保留 SQLite 一致快照。
+     *
+     * V7 reassigns existing session history, so retain a SQLite-consistent snapshot under the exclusive lease
+     * before Flyway starts; VACUUM INTO includes committed WAL pages, unlike copying the main database file.
+     */
+    private static void backupBeforeV7UpgradeIfNeeded(Flyway flyway, SQLiteDataSource source, Path databasePath)
+            throws SQLException, java.io.IOException {
+        MigrationInfo current = flyway.info().current();
+        boolean upgradingExistingSchemaToV7 = current != null && current.getVersion() != null
+                && current.getVersion().getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("7")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "7".equals(migration.getVersion().getVersion()));
+        if (!upgradingExistingSchemaToV7) return;
+        Path parent = databasePath.getParent();
+        Path databaseName = databasePath.getFileName();
+        if (parent == null || databaseName == null) {
+            throw new SQLException("database backup location is unavailable");
+        }
+        String backupName = databaseName + ".pre-v7-" + java.util.UUID.randomUUID() + ".bak";
+        Path backup = parent.resolve(backupName);
+        try (Connection connection = source.getConnection();
+             PreparedStatement statement = connection.prepareStatement("VACUUM INTO ?")) {
+            statement.setString(1, backup.toString());
+            statement.execute();
+        }
+        if (!java.nio.file.Files.isRegularFile(backup) || java.nio.file.Files.size(backup) == 0) {
+            throw new SQLException("database backup was not created");
+        }
+        SQLiteDataSource snapshot = new SQLiteDataSource();
+        snapshot.setUrl("jdbc:sqlite:" + backup);
+        verifySqliteIntegrity(snapshot);
     }
 
     /**

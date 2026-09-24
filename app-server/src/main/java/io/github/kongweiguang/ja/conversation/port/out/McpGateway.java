@@ -33,6 +33,11 @@ public interface McpGateway extends AutoCloseable {
             McpInvocation invocation,
             CancellationToken cancellationToken);
 
+    /** 返回与冻结目录同源的脱敏服务状态，零工具的健康服务也必须保留。 */
+    default List<McpServerStatus> serverStatuses() {
+        return List.of();
+    }
+
     /**
      * 释放 MCP 会话及其子进程或传输资源；实现必须幂等。
      */
@@ -64,6 +69,24 @@ public interface McpGateway extends AutoCloseable {
             serverId = ContractChecks.identifier(serverId, "serverId");
             remoteName = ContractChecks.identifier(remoteName, "remoteName");
             Objects.requireNonNull(spec, "spec");
+        }
+    }
+
+    /** 单个 Provider 目录安全点的服务状态，不含端点、认证或传输参数。 */
+    record McpServerStatus(String serverId, String name, String state, Integer toolCount, String reasonCode) {
+        /** 状态使用闭集，服务名遵守配置的 512 字符边界，零工具仍表示健康发现。 */
+        public McpServerStatus {
+            serverId = ContractChecks.identifier(serverId, "serverId");
+            name = ContractChecks.text(name, "name", 512, false);
+            if (!List.of("available", "unavailable", "disabled", "not_discovered", "not_exposed").contains(state)) {
+                throw new IllegalArgumentException("invalid MCP server state");
+            }
+            if (toolCount != null && (toolCount < 0 || toolCount > 10_000)) {
+                throw new IllegalArgumentException("invalid MCP tool count");
+            }
+            if (reasonCode != null && !reasonCode.matches("[A-Z][A-Z0-9_]{1,63}")) {
+                throw new IllegalArgumentException("invalid MCP server reason");
+            }
         }
     }
 

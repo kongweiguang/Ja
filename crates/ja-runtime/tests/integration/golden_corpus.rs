@@ -24,7 +24,6 @@ const REQUEST_METHODS: &[&str] = &[
     "runtime/health",
     "runtime/shutdown",
     "workspace/open",
-    "workspace/open-general",
     "workspace/list",
     "workspace/path/search",
     "workspace/set-trust",
@@ -34,6 +33,7 @@ const REQUEST_METHODS: &[&str] = &[
     "thread/search",
     "thread/read",
     "thread/usage/read",
+    "thread/mcp/read",
     "thread/rename",
     "thread/pin",
     "thread/seen",
@@ -92,6 +92,8 @@ const REQUEST_METHODS: &[&str] = &[
     "attachment/preview/read",
     "attachment/preview/close",
     "turn/start",
+    "turn/continue",
+    "turn/reask",
     "turn/resume",
     "turn/recovery/respond",
     "turn/cancel",
@@ -123,6 +125,7 @@ const EVENT_METHODS: &[&str] = &[
     "turn/state-changed",
     "turn/input-queue-changed",
     "turn/input-consumed",
+    "turn/retry-started",
     "turn/messages_received",
     "assistant/model-step-committed",
     "assistant/text-delta",
@@ -151,6 +154,7 @@ const CAPABILITY_EVENT_METHODS: &[&str] = &[
     "turn/state-changed",
     "turn/input-queue-changed",
     "turn/input-consumed",
+    "turn/retry-started",
     "turn/messages_received",
     "assistant/model-step-committed",
     "assistant/text-delta",
@@ -557,6 +561,7 @@ fn validate_correlated_contract(
                 }
             }
             "workspace/path/search" => validate_workspace_path_search_result(result)?,
+            "thread/mcp/read" => validate_thread_mcp_status_result(result)?,
             "mcp/list" => validate_mcp_page_result(result)?,
             "mcp/test" => validate_mcp_test_result(result)?,
             "task/create"
@@ -617,14 +622,132 @@ fn validate_mcp_test_result(result: &Value) -> Result<(), &'static str> {
     validate_mcp_descriptor(result, &["healthy", "available", "degraded", "unavailable"])
 }
 
+/// Golden Consumer allows only the thread-safe, redacted MCP summary fields and its frozen state vocabulary.
+fn validate_thread_mcp_status_result(result: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        result,
+        &[
+            "threadId",
+            "source",
+            "notices",
+            "catalogRevision",
+            "observedAt",
+            "servers",
+        ],
+    )?;
+    if !valid_prefixed_id(result.get("threadId"), "thr_")
+        || !matches!(
+            result.get("source").and_then(Value::as_str),
+            Some("active" | "last_observed" | "unchecked" | "stale")
+        )
+        || result.get("catalogRevision").is_some_and(|revision| {
+            !revision.as_str().is_some_and(|value| {
+                (1..=256).contains(&value.len())
+                    && value.chars().all(|character| {
+                        character.is_ascii_alphanumeric()
+                            || matches!(character, '_' | '-' | '.' | ':')
+                    })
+            })
+        })
+        || result
+            .get("observedAt")
+            .is_some_and(|timestamp| !timestamp.as_str().is_some_and(valid_protocol_timestamp))
+    {
+        return Err("thread MCP status metadata is invalid");
+    }
+    let servers = result
+        .get("servers")
+        .and_then(Value::as_array)
+        .filter(|servers| servers.len() <= 200)
+        .ok_or("thread MCP server list is invalid")?;
+    let notices = result
+        .get("notices")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 3)
+        .ok_or("thread MCP notices are invalid")?;
+    if notices.iter().any(|notice| {
+        !matches!(
+            notice.as_str(),
+            Some("configuration_changed" | "project_untrusted" | "project_config_error")
+        )
+    }) {
+        return Err("thread MCP notice is invalid");
+    }
+    let mut server_ids = HashSet::with_capacity(servers.len());
+    for server in servers {
+        ensure_object_keys(
+            server,
+            &[
+                "serverId",
+                "name",
+                "scope",
+                "state",
+                "toolCount",
+                "reasonCode",
+            ],
+        )?;
+        let server_id = server
+            .get("serverId")
+            .and_then(Value::as_str)
+            .filter(|_| valid_prefixed_id(server.get("serverId"), "mcp_"))
+            .ok_or("thread MCP server identity is invalid")?;
+        if !server_ids.insert(server_id)
+            || !bounded_string(server.get("name"), 1, 512)
+            || !matches!(
+                server.get("scope").and_then(Value::as_str),
+                Some("global" | "project")
+            )
+            || server
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.chars().any(char::is_control))
+            || !matches!(
+                server.get("state").and_then(Value::as_str),
+                Some(
+                    "available"
+                        | "unavailable"
+                        | "disabled"
+                        | "not_discovered"
+                        | "not_exposed"
+                        | "stale"
+                )
+            )
+            || server
+                .get("toolCount")
+                .is_some_and(|count| !integer_in_bounds(Some(count), 0, 2_000))
+            || server.get("reasonCode").is_some_and(|reason| {
+                !reason.as_str().is_some_and(|value| {
+                    (2..=64).contains(&value.len())
+                        && value
+                            .chars()
+                            .next()
+                            .is_some_and(|character| character.is_ascii_uppercase())
+                        && value.chars().all(|character| {
+                            character.is_ascii_uppercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        })
+                })
+            })
+        {
+            return Err("thread MCP server summary is invalid");
+        }
+    }
+    Ok(())
+}
+
 /// MCP list/test 共享 descriptor 字段，但各自的状态闭集保持显式，避免启用事实冒充 probe 事实。
 fn validate_mcp_descriptor(result: &Value, statuses: &[&str]) -> Result<(), &'static str> {
     ensure_object_keys(
         result,
-        &["mcpId", "name", "transport", "status", "toolCount"],
+        &["mcpId", "name", "scope", "transport", "status", "toolCount"],
     )?;
     if !valid_prefixed_id(result.get("mcpId"), "mcp_")
         || !bounded_string(result.get("name"), 1, 512)
+        || !matches!(
+            result.get("scope").and_then(Value::as_str),
+            Some("global" | "project")
+        )
         || result
             .get("name")
             .and_then(Value::as_str)
@@ -1238,6 +1361,8 @@ fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
         &[
             "threadId",
             "workspaceId",
+            "workspaceKind",
+            "legacySharedWorkspaceId",
             "preferences",
             "title",
             "status",
@@ -1251,8 +1376,17 @@ fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
         ],
     )?;
     let latest_status = result.get("latestTurnStatus");
+    let workspace_kind = result.get("workspaceKind").and_then(Value::as_str);
+    let legacy_workspace_id = result.get("legacySharedWorkspaceId");
     if !valid_prefixed_id(result.get("threadId"), "thr_")
         || !valid_prefixed_id(result.get("workspaceId"), "ws_")
+        || !matches!(
+            workspace_kind,
+            Some("project" | "session" | "legacy_shared")
+        )
+        || !legacy_workspace_id
+            .is_some_and(|value| value.is_null() || valid_prefixed_id(Some(value), "ws_"))
+        || workspace_kind != Some("session") && !legacy_workspace_id.is_some_and(Value::is_null)
         || !bounded_string(result.get("title"), 1, 512)
         || !matches!(
             result.get("status").and_then(Value::as_str),
@@ -2046,7 +2180,7 @@ fn validate_attachment_result(result: &Value) -> Result<(), &'static str> {
     }
 }
 
-/// 校验平坦历史必须携带真实 Turn 归属，并锁定附件不泄露 workspace/hash/path。
+/// 校验平坦历史必须携带真实 Turn 归属与来源身份，并锁定附件不泄露 workspace/hash/path。
 fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
     ensure_object_keys(
         result,
@@ -2078,6 +2212,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             turn,
             &[
                 "turnId",
+                "sourceMessageId",
                 "status",
                 "requestedAt",
                 "updatedAt",
@@ -2086,7 +2221,11 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                 "changeSet",
             ],
         )?;
-        if !valid_prefixed_id(turn.get("turnId"), "turn_") {
+        if !valid_prefixed_id(turn.get("turnId"), "turn_")
+            || !turn
+                .get("sourceMessageId")
+                .is_some_and(|source| source.is_null() || valid_prefixed_id(Some(source), "item_"))
+        {
             return Err("thread turn identity is invalid");
         }
         if !matches!(
@@ -2701,13 +2840,21 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         ]
         .as_slice(),
         "runtime/health" | "runtime/shutdown" => [].as_slice(),
-        "workspace/open" => ["cwd", "displayName"].as_slice(),
-        "workspace/open-general" => [].as_slice(),
-        "workspace/list" | "mcp/list" => ["cursor", "limit"].as_slice(),
+        "workspace/open" => ["workspaceId", "cwd", "displayName"].as_slice(),
+        "workspace/list" => ["kind", "cursor", "limit"].as_slice(),
+        "mcp/list" => ["workspaceId", "cursor", "limit"].as_slice(),
         "workspace/path/search" => ["threadId", "workspaceId", "query", "limit"].as_slice(),
         "skill/list" => ["workspaceId", "cursor", "limit"].as_slice(),
-        "thread/list" => ["workspaceId", "scope", "query", "cursor", "limit"].as_slice(),
-        "thread/search" => ["workspaceId", "query", "cursor", "limit"].as_slice(),
+        "thread/list" => [
+            "workspaceId",
+            "workspaceKind",
+            "scope",
+            "query",
+            "cursor",
+            "limit",
+        ]
+        .as_slice(),
+        "thread/search" => ["workspaceId", "workspaceKind", "query", "cursor", "limit"].as_slice(),
         "workspace/set-trust" => ["workspaceId", "trust"].as_slice(),
         "workspace/unregister" => ["workspaceId", "expectedRevision"].as_slice(),
         "thread/create" => [
@@ -2722,6 +2869,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         .as_slice(),
         "thread/read" => ["threadId", "cursor", "limit"].as_slice(),
         "thread/usage/read" => ["threadId"].as_slice(),
+        "thread/mcp/read" => ["threadId"].as_slice(),
         "thread/rename" => ["threadId", "title", "expectedThreadRevision"].as_slice(),
         "thread/pin" => ["threadId", "pinned", "expectedThreadRevision"].as_slice(),
         "thread/preferences/update" => [
@@ -2913,6 +3061,14 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "attachment/preview/read" => ["previewSessionId", "offsetBytes", "limitBytes"].as_slice(),
         "attachment/preview/close" => ["previewSessionId"].as_slice(),
         "turn/start" => ["threadId", "content", "deadlineMs"].as_slice(),
+        "turn/continue" => ["threadId", "expectedThreadRevision"].as_slice(),
+        "turn/reask" => [
+            "threadId",
+            "expectedThreadRevision",
+            "sourceMessageId",
+            "content",
+        ]
+        .as_slice(),
         "turn/resume" => ["turnId", "expectedThreadRevision"].as_slice(),
         "turn/recovery/respond" => [
             "turnId",
@@ -2952,10 +3108,10 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "credential/set" => ["credentialId", "secret", "expectedVersion"].as_slice(),
         "credential/delete" => ["credentialId", "expectedVersion"].as_slice(),
         "credential/reveal-provider" => ["providerId"].as_slice(),
-        "mcp/test" => ["mcpId"].as_slice(),
+        "mcp/test" => ["mcpId", "workspaceId"].as_slice(),
         "model/test" => ["providerId", "modelId"].as_slice(),
         "model/discover" => ["providerId"].as_slice(),
-        "mcp/list-tools" => ["mcpId", "cursor", "limit"].as_slice(),
+        "mcp/list-tools" => ["mcpId", "workspaceId", "cursor", "limit"].as_slice(),
         _ => return Err("request method is unknown"),
     };
     ensure_object_keys(params, allowed)?;
@@ -3008,11 +3164,35 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             }
         }
         "workspace/open" => {
-            validate_cwd(params.get("cwd"))?;
-            if let Some(display_name) = params.get("displayName")
-                && (!display_name.is_string() || display_name.as_str().is_none_or(str::is_empty))
+            if let Some(workspace_id) = params.get("workspaceId") {
+                if params.as_object().is_none_or(|object| object.len() != 1)
+                    || !valid_prefixed_id(Some(workspace_id), "ws_")
+                {
+                    return Err("workspace identity is invalid");
+                }
+            } else {
+                validate_cwd(params.get("cwd"))?;
+                let display_name_is_invalid =
+                    params.get("displayName").is_some_and(|display_name| {
+                        !display_name.is_string() || display_name.as_str().is_none_or(str::is_empty)
+                    });
+                if params
+                    .as_object()
+                    .is_none_or(|object| object.len() != 1 && object.len() != 2)
+                    || display_name_is_invalid
+                {
+                    return Err("workspace project params are invalid");
+                }
+            }
+        }
+        "workspace/list" => {
+            if params.get("kind").is_some_and(|kind| {
+                !matches!(kind.as_str(), Some("project" | "session" | "legacy_shared"))
+            }) || params
+                .get("cursor")
+                .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
             {
-                return Err("workspace display name is invalid");
+                return Err("workspace list params are invalid");
             }
         }
         "workspace/path/search"
@@ -3031,10 +3211,8 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "thread/create" => {
             require_text(params, "title")?;
-            if let Some(cwd) = params.get("cwd")
-                && !cwd.is_null()
-            {
-                validate_cwd(Some(cwd))?;
+            if params.get("cwd").is_some() {
+                validate_cwd(params.get("cwd"))?;
             }
             if !valid_prefixed_id(params.get("providerId"), "provider_")
                 || !valid_prefixed_id(params.get("modelId"), "model_")
@@ -3071,6 +3249,16 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 {
                     return Err("thread discovery params are invalid");
                 }
+            } else if params.get("workspaceKind").is_some() {
+                if params.get("workspaceKind").and_then(Value::as_str) != Some("session")
+                    || params.get("workspaceId").is_some()
+                    || params.get("query").is_some()
+                    || params
+                        .get("cursor")
+                        .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
+                {
+                    return Err("thread session list params are invalid");
+                }
             } else if params.get("query").is_some()
                 || !valid_prefixed_id(params.get("workspaceId"), "ws_")
                 || params
@@ -3079,6 +3267,32 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             {
                 return Err("thread workspace list params are invalid");
             }
+        }
+        "thread/search" => {
+            let has_project_workspace = params.get("workspaceId").is_some();
+            let has_session_kind = params.get("workspaceKind").is_some();
+            let valid_scope = if has_project_workspace && !has_session_kind {
+                valid_prefixed_id(params.get("workspaceId"), "ws_")
+            } else if !has_project_workspace && has_session_kind {
+                params.get("workspaceKind").and_then(Value::as_str) == Some("session")
+            } else {
+                false
+            };
+            if !valid_scope
+                || !bounded_string(params.get("query"), 0, 256)
+                || params
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .is_some_and(|query| query.chars().any(char::is_control))
+                || params
+                    .get("cursor")
+                    .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
+            {
+                return Err("thread search params are invalid");
+            }
+        }
+        "thread/mcp/read" if !valid_prefixed_id(params.get("threadId"), "thr_") => {
+            return Err("thread MCP read identity is invalid");
         }
         "goal/read" | "goal/observe" | "goal/events/read"
             if !valid_prefixed_id(params.get("goalId"), "goal_") =>
@@ -3240,6 +3454,30 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             {
                 return Err("turn deadline is invalid");
             }
+        }
+        "turn/continue" => {
+            if !valid_prefixed_id(params.get("threadId"), "thr_")
+                || !integer_in_bounds(
+                    params.get("expectedThreadRevision"),
+                    0,
+                    9_007_199_254_740_991,
+                )
+            {
+                return Err("turn continuation identity is invalid");
+            }
+        }
+        "turn/reask" => {
+            if !valid_prefixed_id(params.get("threadId"), "thr_")
+                || !integer_in_bounds(
+                    params.get("expectedThreadRevision"),
+                    0,
+                    9_007_199_254_740_991,
+                )
+                || !valid_prefixed_id(params.get("sourceMessageId"), "item_")
+            {
+                return Err("turn reask identity is invalid");
+            }
+            validate_turn_content(params.get("content"))?;
         }
         "task/create" => {
             if !valid_prefixed_id(params.get("parentThreadId"), "thr_")
@@ -5239,6 +5477,7 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
     ];
     match method {
         "turn/state-changed" => allowed.extend(["from", "to"]),
+        "turn/retry-started" => allowed.extend(["attempt", "maxAttempts"]),
         "assistant/model-step-committed" => allowed.extend([
             "messageId",
             "text",
@@ -5274,6 +5513,16 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
     }
     ensure_object_keys(params, &allowed)?;
     validate_turn_event_metadata(params)?;
+    if method == "turn/retry-started" {
+        let attempt = params.get("attempt").and_then(Value::as_u64);
+        let max_attempts = params.get("maxAttempts").and_then(Value::as_u64);
+        if !attempt.is_some_and(|value| (2..=6).contains(&value))
+            || !max_attempts.is_some_and(|value| (2..=6).contains(&value))
+            || attempt > max_attempts
+        {
+            return Err("turn retry attempt boundary is invalid");
+        }
+    }
     if method == "turn/input-consumed"
         && (!valid_queued_input(params.get("input"), params.get("turnId"))
             || !valid_input_queue(params.get("inputQueue"), params.get("turnId"))
@@ -6138,4 +6387,69 @@ fn contains_unsupported_vocabulary(source: &[u8]) -> bool {
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
+}
+
+/// ID-only reopen and project open are disjoint; displayName stays optional for Java-owned project identity.
+#[test]
+fn workspace_open_accepts_registered_and_project_forms() {
+    assert!(
+        validate_request(
+            "workspace/open",
+            &serde_json::json!({
+                "workspaceId": "ws_session"
+            })
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_request(
+            "workspace/open",
+            &serde_json::json!({
+                "cwd": "C:\\project"
+            })
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_request(
+            "workspace/open",
+            &serde_json::json!({
+                "cwd": "C:\\project",
+                "displayName": "Project"
+            })
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_request(
+            "workspace/open",
+            &serde_json::json!({
+                "workspaceId": "ws_session",
+                "cwd": "C:\\project"
+            })
+        )
+        .is_err()
+    );
+}
+
+/// 缺省 cwd 才代表 SESSION 创建；明确 null 不能被消费者折叠成字段缺省。
+#[test]
+fn thread_create_cwd_is_omitted_or_text() {
+    let base = serde_json::json!({
+        "title": "Session",
+        "providerId": "provider_test",
+        "modelId": "model_test",
+        "reasoningLevel": null,
+        "accessMode": "approval_required",
+        "collaborationMode": "default"
+    });
+    assert!(validate_request("thread/create", &base).is_ok());
+
+    let mut explicit_null = base.clone();
+    explicit_null["cwd"] = Value::Null;
+    assert!(validate_request("thread/create", &explicit_null).is_err());
+
+    let mut project = base;
+    project["cwd"] = serde_json::json!("C:\\project");
+    assert!(validate_request("thread/create", &project).is_ok());
 }

@@ -4,6 +4,69 @@
 // lifecycle 只负责 generation、启动状态转换和原生 Runtime owner 交接。
 
 use super::*;
+use ja_runtime::app_server_process::AppServerProcessError;
+
+/// 设计原因：启动错误最终会被压成稳定 UI 错误码，因此原生日志只需保留闭集类别。
+/// 不读取错误文本或携带数据，避免路径、协议载荷、challenge 和子进程参数进入诊断。
+fn runtime_startup_error_variant(error: &AppServerProcessError) -> &'static str {
+    match error {
+        AppServerProcessError::InvalidConfig => "invalid_config",
+        AppServerProcessError::InvalidTimeout => "invalid_timeout",
+        AppServerProcessError::Codec(codec_error) => match codec_error {
+            CodecError::UnexpectedEof => "codec_unexpected_eof",
+            CodecError::PartialFrame => "codec_partial_frame",
+            CodecError::EmptyFrame => "codec_empty_frame",
+            CodecError::InvalidUtf8 => "codec_invalid_utf8",
+            CodecError::InvalidJson => "codec_invalid_json",
+            CodecError::DuplicateKey => "codec_duplicate_key",
+            CodecError::NonObject => "codec_non_object",
+            CodecError::InvalidEnvelope => "codec_invalid_envelope",
+            CodecError::HandshakeFailed => "codec_handshake_failed",
+            CodecError::InvalidErrorCatalog => "codec_invalid_error_catalog",
+            CodecError::InvalidId => "codec_invalid_id",
+            CodecError::InvalidLimit => "codec_invalid_limit",
+            CodecError::FrameTooLarge { .. } => "codec_frame_too_large",
+            CodecError::Io => "codec_io",
+        },
+        AppServerProcessError::QueueFull(_) => "queue_full",
+        AppServerProcessError::QueueClosed(_) => "queue_closed",
+        AppServerProcessError::PendingLimit => "pending_limit",
+        AppServerProcessError::RequestLedgerExhausted => "request_ledger_exhausted",
+        AppServerProcessError::DuplicateRequest => "duplicate_request",
+        AppServerProcessError::DeadlineExceeded => "deadline_exceeded",
+        AppServerProcessError::Cancelled => "cancelled",
+        AppServerProcessError::SessionClosed => "session_closed",
+        AppServerProcessError::NotReady => "not_ready",
+        AppServerProcessError::Incompatible => "incompatible",
+        AppServerProcessError::InvalidState => "invalid_state",
+        AppServerProcessError::Spawn => "spawn",
+        AppServerProcessError::ProcessTree => "process_tree",
+        AppServerProcessError::ProcessExited => "process_exited",
+        AppServerProcessError::ShuttingDown => "shutting_down",
+        AppServerProcessError::HandshakeFailed => "handshake_failed",
+        AppServerProcessError::ProtocolFault => "protocol_fault",
+        AppServerProcessError::InvalidErrorCatalog => "invalid_error_catalog",
+        AppServerProcessError::ShutdownTimeout => "shutdown_timeout",
+        AppServerProcessError::Backoff { .. } => "backoff",
+        AppServerProcessError::Faulted => "faulted",
+    }
+}
+
+/// 设计原因：握手排障需要区分生命周期阶段，但记录原始错误会暴露协议或宿主数据。
+/// phase 由调用点固定，variant 由枚举映射固定，generation 只用于定位本次启动尝试。
+fn log_runtime_startup_failure(
+    phase: &'static str,
+    error: &AppServerProcessError,
+    generation: u64,
+) {
+    tracing::warn!(
+        target: "ja.diagnostics.runtime_startup",
+        phase,
+        variant = runtime_startup_error_variant(error),
+        generation,
+        "runtime startup failed"
+    );
+}
 
 pub(super) struct EventDrain {
     pub(super) cancel: SyncSender<()>,
@@ -279,6 +342,7 @@ pub(super) struct StartRuntimeContext<'a> {
 /// 最多启动一个 Ja App Server sidecar generation；此边界返回不含 token 的 Host 状态前，
 /// handshake 必须已消费 ready-token echo。WebView 在重载窗口内暂时不可达时，状态投影可由
 /// 后续 `state` snapshot 补回，因此不能将投递失败升级为 sidecar 启动失败并销毁用户会话。
+/// 启动错误日志只投影固定阶段、枚举类别和 generation，不记录 wire 内容或原始错误文本。
 pub(super) fn start_runtime(
     context: StartRuntimeContext<'_>,
 ) -> Result<RuntimeStatus, RuntimeCommandError> {
@@ -331,6 +395,7 @@ pub(super) fn start_runtime(
         supervisor.start_with_session_hook(Some(&attach_session))
     };
     if let Err(error) = start_result {
+        log_runtime_startup_failure("supervisor_start", &error, supervisor.generation());
         let status = RuntimeStatusKind::from_lifecycle(supervisor.state());
         if let Err(emit_error) = emit_status(
             sink,
@@ -367,6 +432,7 @@ pub(super) fn start_runtime(
     let ready_token = match supervisor.ready_token_echo() {
         Ok(token) => token,
         Err(error) => {
+            log_runtime_startup_failure("ready_token_echo", &error, supervisor.generation());
             retain_failed_supervisor(
                 supervisor,
                 pending_cleanup,
@@ -385,6 +451,7 @@ pub(super) fn start_runtime(
     let events = match supervisor.take_event_pump() {
         Ok(events) => events,
         Err(error) => {
+            log_runtime_startup_failure("event_pump_take", &error, supervisor.generation());
             retain_failed_supervisor(
                 supervisor,
                 pending_cleanup,

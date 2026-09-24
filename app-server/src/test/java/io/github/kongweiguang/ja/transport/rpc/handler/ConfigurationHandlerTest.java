@@ -208,7 +208,8 @@ final class ConfigurationHandlerTest {
     private static Workspace workspace(Workspace.Trust trust) {
         Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-configuration-handler")
                 .toAbsolutePath().normalize();
-        return new Workspace("ws_configuration", root, "Configuration", trust, 1);
+        return new Workspace("ws_configuration", root, "Configuration", trust,
+                Workspace.Kind.PROJECT, null, 1);
     }
 
     /** 校验响应字段闭集，防止适配器私有字段或路径重新进入 Wire。 */
@@ -232,7 +233,9 @@ final class ConfigurationHandlerTest {
             workspaces = new RecordingWorkspaces(workspace);
             RpcServiceBindings services = new RpcServiceBindings(workspaces,
                     unusedPort(io.github.kongweiguang.ja.workspace.port.in.WorkspacePathSearchUseCase.class),
-                    unusedPort(ThreadUseCase.class), unusedPort(TurnUseCase.class),
+                    unusedPort(ThreadUseCase.class),
+                    unusedPort(io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase.class),
+                    unusedPort(TurnUseCase.class),
                     (command, events, cancellation) -> { throw new UnsupportedOperationException("context compaction is unavailable"); },
                     unusedPort(ApprovalUseCase.class), unusedPort(CatalogUseCase.class),
                     unusedPort(io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase.class),
@@ -281,11 +284,16 @@ final class ConfigurationHandlerTest {
             throw unsupported();
         }
 
-        /** 本测试不覆盖通用工作区创建，调用即表示 handler 越界。 */
+        /** 本测试不覆盖 session 工作区创建，调用即表示 handler 越界。 */
         @Override
-        public Workspace openGeneralWorkspace() {
+        public Workspace createSessionWorkspace(String threadId) {
             throw unsupported();
         }
+
+        /** 本测试不覆盖 thread/create 补偿。 */
+        @Override public void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision) { throw unsupported(); }
+        /** 本测试不覆盖持久 session 或 legacy 重开。 */
+        @Override public Workspace openRegisteredWorkspace(String workspaceId) { throw unsupported(); }
 
         /** 本测试不覆盖工作区列表，调用即表示 handler 越界。 */
         @Override
@@ -325,9 +333,9 @@ final class ConfigurationHandlerTest {
             refreshCount++;
         }
 
-        /** 配置 handler 不应按路径反查通用工作区，调用即表示旧路径语义回流。 */
+        /** 配置 handler 不应按路径反查旧共享工作区，调用即表示旧路径语义回流。 */
         @Override
-        public boolean isGeneralWorkspace(Path root) {
+        public boolean isLegacySharedWorkspace(Path root) {
             throw unsupported();
         }
     }

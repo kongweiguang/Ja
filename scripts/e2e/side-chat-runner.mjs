@@ -107,7 +107,10 @@ async function writeIsolatedHome(homeRoot) {
   });
 }
 
-/** 为 Tauri 继承生产窗口事实，只替换 devUrl、隔离 identifier 与本轮 CSP。 */
+/**
+ * 为 Tauri 继承生产窗口事实，只替换 devUrl、隔离 identifier 与本轮 CSP；隐藏且不聚焦窗口，
+ * 让 CDP 真窗验收不抢占操作者桌面，同时保留真实 Tauri/WebView2 渲染和原生 IPC。
+ */
 async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const [base, windows] = await Promise.all([
     readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
@@ -116,6 +119,9 @@ async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const window = {
     ...base.app.windows.find((candidate) => candidate.label === "main"),
     ...(windows.app?.windows?.find((candidate) => candidate.label === "main") ?? {}),
+    visible: false,
+    focus: false,
+    skipTaskbar: true,
   };
   const origin = `http://127.0.0.1:${frontendPort}`;
   const config = {

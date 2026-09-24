@@ -49,16 +49,15 @@ export function createReconciliationUseCases(
 ): ReconciliationUseCases {
   /**
    * 合并同一 generation 的全量对账；面板重新激活时 Watcher 尚未完成启动，调用方可跳过
-   * rescan 并直接读取权威 Tree/Read，避免把正常启动时序误报成扫描失败。
+   * rescan 并直接读取权威 Tree/Read；工作区外快照没有 workspace 读取权限，不能送入对账。
    */
   function reconcileAuthoritativeWorkspace(options?: ReconciliationOptions): void {
     if (context.reconciliationTask.current !== undefined) return;
     const generation = context.workspaceGeneration.current;
     const rescanWatcher = (options?.rescanWatcher ?? true) && context.watcherReady.current;
-    const baselines = Object.entries(context.documents.current).map(([path, document]) => ({
-      path,
-      revision: document.revision,
-    }));
+    const baselines = Object.entries(context.documents.current)
+      .filter(([, document]) => document.externalFile !== true)
+      .map(([path, document]) => ({ path, revision: document.revision }));
     const task = (async (): Promise<void> => {
       if (rescanWatcher) {
         try {
@@ -95,7 +94,7 @@ export function createReconciliationUseCases(
 
   /**
    * 有界 Watcher event 只刷新父 page 和可选已打开文件；保存事务中的 hint 延迟到
-   * ACK 后判断回声，overflow 则转全量权威对账。
+   * ACK 后判断回声，overflow 则转全量权威对账；外部快照只由显式打开入口更新。
    */
   function handleWorkspaceChanged(event: WorkspaceChangedEvent): void {
     if (event.requiresRescan) {
@@ -104,7 +103,7 @@ export function createReconciliationUseCases(
     }
     void context.loadDirectory(parentPath(event.relativePath));
     const document = context.documents.current[event.relativePath];
-    if (document === undefined) return;
+    if (document === undefined || document.externalFile === true) return;
     if (
       context.inFlight.current.has(event.relativePath) ||
       context.pendingMutations.current.has(event.relativePath)

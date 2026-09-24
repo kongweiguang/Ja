@@ -8,9 +8,12 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationTu
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.TurnMcpSessionFactory;
 import io.github.kongweiguang.ja.catalog.adapter.out.skills.JaSkillSources;
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
+import io.github.kongweiguang.ja.catalog.port.out.ThreadMcpCatalogPort;
+import io.github.kongweiguang.ja.catalog.application.ThreadMcpIdentity;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.configuration.domain.SkillReference;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.BuiltInTools;
+import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.PlanReadOnlyToolCatalog;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
 import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
@@ -25,6 +28,8 @@ import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 import io.github.kongweiguang.ja.conversation.port.out.AgentCapability;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
+import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
+import io.github.kongweiguang.ja.conversation.port.out.ToolArgumentValidator;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSession;
 import io.github.kongweiguang.ja.conversation.port.out.AgentPromptSessionFactory;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
@@ -73,6 +78,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     private final ShellCapability shellCapability;
     private final GenerationCatalog generationCatalog;
     private final GenerationTurnMcpSessionFactory mcpSessions;
+    private final JsonValueCodec argumentsCodec;
+    private final ToolArgumentValidator toolArgumentValidator;
     private final AgentPromptSessionFactory promptSessions;
     private final ManagedAttachmentReader attachments;
     private final AgentCapabilityCatalog capabilities;
@@ -89,6 +96,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             ShellCapability shellCapability,
             GenerationCatalog generationCatalog,
             GenerationTurnMcpSessionFactory mcpSessions,
+            JsonValueCodec argumentsCodec,
             AgentPromptSessionFactory promptSessions,
             ManagedAttachmentReader attachments,
             AgentCapabilityCatalog capabilities,
@@ -103,6 +111,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         this.shellCapability = Objects.requireNonNull(shellCapability, "shellCapability");
         this.generationCatalog = Objects.requireNonNull(generationCatalog, "generationCatalog");
         this.mcpSessions = Objects.requireNonNull(mcpSessions, "mcpSessions");
+        this.argumentsCodec = Objects.requireNonNull(argumentsCodec, "argumentsCodec");
+        this.toolArgumentValidator = new NetworkntToolArgumentValidation(this.argumentsCodec);
         this.promptSessions = Objects.requireNonNull(promptSessions, "promptSessions");
         this.attachments = Objects.requireNonNull(attachments, "attachments");
         this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
@@ -181,12 +191,34 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             requestTools.addAll(capabilityTools);
             TurnToolSessionFactory toolSessions = toolSessions(mcpCatalog, planning);
             ToolProjectionLimits outputLimits = new ToolProjectionLimits(20_000, 20_000);
+            List<McpGateway.McpServerStatus> dispatchStatuses = planning
+                    ? notExposedStatuses(lease.snapshot()) : mcpCatalog.serverStatuses();
+            String dispatchCatalogRevision = mcpCatalog.snapshot().revision();
+            String dispatchGenerationId = lease.generationId();
+            String preferenceFingerprint = ThreadMcpIdentity.preferenceFingerprint(requestPreferences);
+            String ceilingFingerprint = ThreadMcpIdentity.ceilingFingerprint(inheritedCeiling.orElse(null));
+            Map<String, ConfigurationGenerationSnapshot.Scope> dispatchScopes = lease.snapshot().mcpDefinitions().stream()
+                    .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                            ConfigurationGenerationSnapshot.McpServer::mcpId,
+                            ConfigurationGenerationSnapshot.McpServer::scope));
+            java.util.function.Consumer<Boolean> observeDispatch = gatewayExposed -> {
+                if (request.turnId() == null) return;
+                List<McpGateway.McpServerStatus> observedStatuses = gatewayExposed ? dispatchStatuses
+                        : dispatchStatuses.stream().map(server -> "disabled".equals(server.state())
+                                ? server : new McpGateway.McpServerStatus(server.serverId(), server.name(),
+                                        "not_exposed", null, null)).toList();
+                generationCatalog.observe(new ThreadMcpCatalogPort.Observation(
+                        request.threadId(), request.workspaceId(), request.workspaceRoot(),
+                        dispatchGenerationId, preferenceFingerprint, ceilingFingerprint,
+                        request.collaborationMode(), request.turnId(),
+                        dispatchCatalogRevision, Instant.now(), observedStatuses, dispatchScopes));
+            };
             RuntimeLease runtimeLease = new RuntimeLease(lease.generationId(), model,
                     resolvedAccessMode, request.collaborationMode(), limits,
                     List.copyOf(requestTools), toolSessions, outputLimits, promptSession, attachments,
                     presentationSecrets(lease.snapshot(), lease, model.apiKey()),
                     catalogDigest, promptSession.currentRevision(),
-                    request.reasoningLevel(), lease);
+                    request.reasoningLevel(), lease, observeDispatch);
             transferred = true;
             return runtimeLease;
         } finally {
@@ -205,6 +237,16 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
         return request.origin() == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.PLAN_EXECUTION
                 || PlanToolPolicy.isReadOnlyPlanning(request.origin(), request.collaborationMode())
                 || configured;
+    }
+
+    /** 规划模式隐藏已启用服务，但不连接服务即可保留名称和停用状态。 */
+    private static List<McpGateway.McpServerStatus> notExposedStatuses(
+            ConfigurationGenerationSnapshot generation) {
+        return generation.mcpDefinitions().stream()
+                .sorted(Comparator.comparing(ConfigurationGenerationSnapshot.McpServer::mcpId))
+                .map(server -> new McpGateway.McpServerStatus(server.mcpId(), server.name(),
+                        server.enabled() ? "not_exposed" : "disabled", null, null))
+                .toList();
     }
 
     /**
@@ -728,7 +770,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             TurnMcpSessionFactory.Session opened = mcpSessions.open(catalogSnapshot, cancellation);
             try {
                 List<AgentTool> adapted = McpAgentTool.adapt(
-                        opened.gateway(), opened.snapshot(), catalogSnapshot.routeIdentities());
+                        opened.gateway(), opened.snapshot(), catalogSnapshot.routeIdentities(),
+                        argumentsCodec, toolArgumentValidator);
                 return new TurnToolSessionFactory.Session() {
                     private boolean closed;
 

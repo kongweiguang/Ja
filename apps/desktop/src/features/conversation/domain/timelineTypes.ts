@@ -203,6 +203,8 @@ export type TimelineThreadContextUsage = TimelineContextUsage & { turnId: string
 export interface TimelineTurn {
   turnId: string;
   threadId: string;
+  /** 隐藏续答指向原始 USER item，使当前路径和 thread/read 重载都归到同一问题 exchange。 */
+  sourceMessageId?: string | null;
   status: TimelineTurnState;
   threadRevision?: number;
   startedAt?: string;

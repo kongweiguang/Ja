@@ -45,6 +45,57 @@ fn resume_input_is_strict_and_bounded() {
     }
 }
 
+/// Continue 只接受服务端解析源问题所需的 thread CAS；Reask 额外绑定源 item 并复用普通内容预算，路径资格仍由 Java 判定。
+#[test]
+fn continue_and_reask_inputs_are_identity_and_budget_bounded() {
+    assert!(
+        TurnContinueInput {
+            thread_id: "thr_fixture".to_owned(),
+            expected_thread_revision: 7,
+        }
+        .validate()
+        .is_ok()
+    );
+    for input in [
+        TurnContinueInput {
+            thread_id: "turn_fixture".to_owned(),
+            expected_thread_revision: 7,
+        },
+        TurnContinueInput {
+            thread_id: "thr_fixture".to_owned(),
+            expected_thread_revision: 9_007_199_254_740_992,
+        },
+    ] {
+        assert!(input.validate().is_err());
+    }
+
+    let valid_reask = TurnReaskInput {
+        thread_id: "thr_fixture".to_owned(),
+        expected_thread_revision: 7,
+        source_message_id: "item_user_fixture".to_owned(),
+        content: vec![TurnContentPart::Text {
+            text: "replacement question".to_owned(),
+        }],
+    };
+    assert!(valid_reask.validate().is_ok());
+    for input in [
+        TurnReaskInput {
+            source_message_id: "turn_fixture".to_owned(),
+            ..valid_reask.clone()
+        },
+        TurnReaskInput {
+            content: vec![],
+            ..valid_reask.clone()
+        },
+        TurnReaskInput {
+            expected_thread_revision: 9_007_199_254_740_992,
+            ..valid_reask.clone()
+        },
+    ] {
+        assert!(input.validate().is_err());
+    }
+}
+
 /// enqueue 只接受冻结 Turn identity 与单条队列预算；kind、排序和 NUL 不得进入 bridge actor。
 #[test]
 fn turn_input_enqueue_is_strict_and_bounded() {
@@ -58,7 +109,9 @@ fn turn_input_enqueue_is_strict_and_bounded() {
     assert!(
         TurnInputEnqueue {
             turn_id: "turn_fixture".to_owned(),
-            content: vec![TurnContentPart::Text { text: "".to_owned() }]
+            content: vec![TurnContentPart::Text {
+                text: "".to_owned()
+            }]
         }
         .validate()
         .is_err()
@@ -66,7 +119,9 @@ fn turn_input_enqueue_is_strict_and_bounded() {
     assert!(
         TurnInputEnqueue {
             turn_id: "turn_fixture".to_owned(),
-            content: vec![TurnContentPart::Text { text: "bad\0text".to_owned() }]
+            content: vec![TurnContentPart::Text {
+                text: "bad\0text".to_owned()
+            }]
         }
         .validate()
         .is_err()
@@ -99,7 +154,9 @@ fn turn_input_mutations_are_identity_and_revision_bounded() {
             turn_id: "turn_fixture".to_owned(),
             input_id: "input_fixture".to_owned(),
             expected_input_revision: 9_007_199_254_740_992,
-            content: vec![TurnContentPart::Text { text: "updated".to_owned() }],
+            content: vec![TurnContentPart::Text {
+                text: "updated".to_owned()
+            }],
         }
         .validate()
         .is_err()
@@ -202,7 +259,13 @@ fn turn_change_set_read_is_bound_to_a_safe_file_path() {
     };
     assert!(valid.validate().is_ok());
 
-    for invalid_path in ["", "/src/main.rs", "C:/src/main.rs", "../main.rs", "src\\main.rs"] {
+    for invalid_path in [
+        "",
+        "/src/main.rs",
+        "C:/src/main.rs",
+        "../main.rs",
+        "src\\main.rs",
+    ] {
         assert!(
             TurnChangeSetReadInput {
                 file_path: invalid_path.to_owned(),

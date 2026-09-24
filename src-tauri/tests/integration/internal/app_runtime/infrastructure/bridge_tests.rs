@@ -4,7 +4,10 @@
 // 原生 bridge 单元测试与生产实现分文件，仍验证同一私有状态机。
 
 use super::*;
-use crate::app_runtime::{TurnCancelInput, WorkspacePathSearchInput};
+use crate::app_runtime::{
+    TurnCancelInput, TurnContentPart, TurnContinueInput, TurnReaskInput, WorkspaceKind,
+    WorkspacePathSearchInput,
+};
 use ja_runtime::app_server_process::TurnChangeSetReadResult as WireTurnChangeSetReadResult;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -22,36 +25,40 @@ fn poison_mutex<T>(mutex: &std::sync::Mutex<T>) {
     assert!(result.is_err(), "poison fixture must unwind");
 }
 
-/// 构造标准 Java 通用 Workspace 投影；parser 只验证协议，不创建 root。
-fn general_workspace_projection(root: &std::path::Path) -> serde_json::Value {
+/// 构造标准 Java Workspace 投影；parser 只验证协议，不创建 root。
+fn workspace_projection(root: &std::path::Path) -> serde_json::Value {
     json!({
         "workspaceId": "ws_java_general",
         "root": root.to_string_lossy(),
         "displayName": "无项目",
         "trust": "trusted",
         "revision": 7,
+        "kind": "session",
+        "legacySharedWorkspaceId": null,
     })
 }
 
 /// Java identity、root、trust 与 revision 必须由 infrastructure 在进入 capability registry 前
 /// 一次性严格解析，且解析本身不能创建 Rust-owned fallback 目录。
 #[test]
-fn parses_general_workspace_without_creating_local_storage() {
+fn parses_workspace_projection_without_creating_local_storage() {
     let root = std::env::temp_dir().join("ja-java-general-root-that-is-not-created");
     let parsed =
-        parse_general_workspace(general_workspace_projection(&root)).expect("server projection");
+        parse_workspace_projection(workspace_projection(&root)).expect("server projection");
 
     assert_eq!(parsed.workspace_id, "ws_java_general");
     assert_eq!(parsed.root, root.to_string_lossy());
     assert_eq!(parsed.display_name, "无项目");
     assert_eq!(parsed.trust, "trusted");
     assert_eq!(parsed.revision, 7);
+    assert_eq!(parsed.kind, WorkspaceKind::Session);
+    assert_eq!(parsed.legacy_shared_workspace_id, None);
     assert!(!root.exists(), "parser must not create Java storage");
 }
 
 /// unknown field、错误 identity prefix 与畸形 revision 必须在 native Workspace binding 前关闭失败。
 #[test]
-fn rejects_malformed_general_workspace_projection() {
+fn rejects_malformed_workspace_projection() {
     let root = std::env::temp_dir().join("ja-java-general-invalid-root");
     for invalid in [
         json!({
@@ -60,6 +67,8 @@ fn rejects_malformed_general_workspace_projection() {
             "displayName": "无项目",
             "trust": "trusted",
             "revision": 1,
+            "kind": "session",
+            "legacySharedWorkspaceId": null,
             "extra": true,
         }),
         json!({
@@ -68,6 +77,8 @@ fn rejects_malformed_general_workspace_projection() {
             "displayName": "无项目",
             "trust": "trusted",
             "revision": 1,
+            "kind": "session",
+            "legacySharedWorkspaceId": null,
         }),
         json!({
             "workspaceId": "ws_java_general",
@@ -75,10 +86,56 @@ fn rejects_malformed_general_workspace_projection() {
             "displayName": "无项目",
             "trust": "trusted",
             "revision": 9_007_199_254_740_992_u64,
+            "kind": "session",
+            "legacySharedWorkspaceId": null,
+        }),
+        json!({
+            "workspaceId": "ws_java_general",
+            "root": root,
+            "displayName": "无项目",
+            "trust": "trusted",
+            "revision": 1,
+            "kind": "future",
+            "legacySharedWorkspaceId": null,
+        }),
+        json!({
+            "workspaceId": "ws_java_general",
+            "root": root,
+            "displayName": "无项目",
+            "trust": "trusted",
+            "revision": 1,
+            "kind": "session",
+            "legacySharedWorkspaceId": "not-a-workspace",
+        }),
+        json!({
+            "workspaceId": "ws_java_general",
+            "root": root,
+            "displayName": "无项目",
+            "trust": "trusted",
+            "revision": 1,
+            "kind": "session",
+        }),
+        json!({
+            "workspaceId": "ws_java_general",
+            "root": root,
+            "displayName": "Project",
+            "trust": "trusted",
+            "revision": 1,
+            "kind": "project",
+            "legacySharedWorkspaceId": "ws_legacy",
+        }),
+        json!({
+            "workspaceId": "ws_java_general",
+            "root": root,
+            "displayName": "Legacy",
+            "trust": "trusted",
+            "revision": 1,
+            "kind": "legacy_shared",
+            "legacySharedWorkspaceId": "ws_legacy",
         }),
     ] {
         assert_eq!(
-            parse_general_workspace(invalid)
+            parse_workspace_projection(invalid)
                 .expect_err("malformed projection must fail closed")
                 .code,
             "RUNTIME_UNAVAILABLE"
@@ -88,27 +145,31 @@ fn rejects_malformed_general_workspace_projection() {
 
 /// 非绝对或过长 root 必须在 registry IO 前被拒绝，避免恢复本地 fallback 路径。
 #[test]
-fn rejects_unusable_general_workspace_root() {
+fn rejects_unusable_workspace_root() {
     let relative = json!({
         "workspaceId": "ws_java_general",
-        "root": "general-workspace",
+        "root": "sessions/thr_java_general",
         "displayName": "无项目",
         "trust": "trusted",
         "revision": 1,
+        "kind": "session",
+        "legacySharedWorkspaceId": null,
     });
-    assert!(parse_general_workspace(relative).is_err());
+    assert!(parse_workspace_projection(relative).is_err());
 
     let long_root = std::env::temp_dir()
         .join("x".repeat(4_096))
         .to_string_lossy()
         .into_owned();
     assert!(
-        parse_general_workspace(json!({
+        parse_workspace_projection(json!({
             "workspaceId": "ws_java_general",
             "root": long_root,
             "displayName": "无项目",
             "trust": "trusted",
             "revision": 1,
+            "kind": "legacy_shared",
+            "legacySharedWorkspaceId": null,
         }))
         .is_err()
     );
@@ -187,7 +248,9 @@ fn workspace_open_accepts_authoritative_persisted_display_name() {
         "root": root.to_string_lossy(),
         "displayName": "persisted-name",
         "trust": "trusted",
-        "revision": 1
+        "revision": 1,
+        "kind": "project",
+        "legacySharedWorkspaceId": null
     });
 
     let projection = validate_workspace_open_result(&result, &canonical)
@@ -199,6 +262,47 @@ fn workspace_open_accepts_authoritative_persisted_display_name() {
     assert_eq!(projection.display_name, "persisted-name");
     assert_eq!(projection.trust, "trusted");
     assert_eq!(projection.revision, 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// ID-only Java reopen accepts registered session/legacy kinds and defers Windows physical identity spelling to WorkspaceRegistry.
+#[test]
+fn workspace_open_by_id_accepts_registered_kinds_without_lexical_path_equality() {
+    let root = std::env::temp_dir().join(format!("ja-session-workspace-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("session root");
+    let alias = root.join(".");
+    for (workspace_id, kind) in [
+        ("ws_0123456789abcdef0123456789abcdef", "session"),
+        ("ws_abcdef0123456789abcdef0123456789", "legacy_shared"),
+    ] {
+        let projection = json!({
+            "workspaceId": workspace_id,
+            "root": alias.to_string_lossy(),
+            "displayName": "Session",
+            "trust": "trusted",
+            "revision": 3,
+            "kind": kind,
+            "legacySharedWorkspaceId": null,
+        });
+        let parsed = validate_workspace_open_by_id_result(&projection, workspace_id)
+            .expect("registered Java projection");
+        assert_eq!(parsed.kind.wire_name(), kind);
+        assert!(std::fs::canonicalize(&parsed.root).is_ok());
+    }
+
+    let wrong_kind = json!({
+        "workspaceId": "ws_0123456789abcdef0123456789abcdef",
+        "root": root.to_string_lossy(),
+        "displayName": "Project",
+        "trust": "trusted",
+        "revision": 3,
+        "kind": "project",
+        "legacySharedWorkspaceId": null,
+    });
+    assert!(
+        validate_workspace_open_by_id_result(&wrong_kind, "ws_0123456789abcdef0123456789abcdef")
+            .is_err()
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -490,6 +594,52 @@ fn resume_result_parser_is_identity_bound_and_exact() {
     let mut extra = accepted;
     extra["result"]["executionState"] = json!("ready");
     assert!(parse_turn_resume_result("turn_resume_fixture", &extra).is_err());
+}
+
+/// Continue omits synthetic content, while reask binds the replacement to one source USER item;
+/// exact builders prove the Rust client cannot send UI-only branches or hidden execution fields.
+#[test]
+fn continue_and_reask_params_match_the_fixed_wire_envelopes() {
+    let continue_params = turn_continue_params(&TurnContinueInput {
+        thread_id: "thr_fixture".to_owned(),
+        expected_thread_revision: 7,
+    })
+    .expect("continue params");
+    assert_eq!(
+        continue_params,
+        json!({"threadId":"thr_fixture","expectedThreadRevision":7})
+    );
+
+    let reask_params = turn_reask_params(&TurnReaskInput {
+        thread_id: "thr_fixture".to_owned(),
+        expected_thread_revision: 8,
+        source_message_id: "item_user_fixture".to_owned(),
+        content: vec![TurnContentPart::Text {
+            text: "replacement".to_owned(),
+        }],
+    })
+    .expect("reask params");
+    assert_eq!(
+        reask_params,
+        json!({
+            "threadId":"thr_fixture",
+            "expectedThreadRevision":8,
+            "sourceMessageId":"item_user_fixture",
+            "content":[{"type":"text","text":"replacement"}]
+        })
+    );
+}
+
+/// `turn_not_reaskable` becomes a stable public error without forwarding provider or repository details.
+#[test]
+fn reask_eligibility_error_maps_to_a_safe_non_retryable_command_error() {
+    let error = command_error_from_rpc(&json!({
+        "message": "private current-path details",
+        "data": {"errorCode":"TURN_NOT_REASKABLE"}
+    }));
+    assert_eq!(error.code, "TURN_NOT_REASKABLE");
+    assert!(!error.retryable);
+    assert_ne!(error.message, "private current-path details");
 }
 
 /// 队列 mutation ACK 必须返回完整权威队列，保持 Java 顺序并拒绝重复 identity、超额或额外字段。

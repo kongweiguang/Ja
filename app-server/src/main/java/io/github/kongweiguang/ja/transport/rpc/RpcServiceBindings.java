@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.transport.rpc;
 
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.ApprovalUseCase;
@@ -22,10 +23,10 @@ import java.util.Objects;
 /**
  * 汇集一次 RPC 连接需要的明确入站端口。
  *
- * <p>该值只负责组合，不定义业务 DTO、校验或实现方法，因此各域 adapter 不会反向依赖 transport。</p>
+ * <p>该值只负责组合明确入站端口，不定义业务 DTO 或实现方法，因此各域 adapter 不会反向依赖 transport。</p>
  */
 public record RpcServiceBindings(WorkspaceUseCase workspaces, WorkspacePathSearchUseCase workspacePathSearch,
-                                 ThreadUseCase threads,
+                                 ThreadUseCase threads, ThreadMcpUseCase threadMcp,
                                  TurnUseCase turns, ContextCompactionUseCase compactions,
                                  ApprovalUseCase approvals,
                                  CatalogUseCase catalog, AttachmentUseCase attachments,
@@ -35,12 +36,13 @@ public record RpcServiceBindings(WorkspaceUseCase workspaces, WorkspacePathSearc
                                  InteractionUseCase interactions,
                                  DeadlineCloseable lifecycle) {
     /**
-     * 在握手发布服务图前一次性验证所有必需端口，禁止运行中降级为空实现。
+     * 在握手发布服务图前一次性验证所有必需端口，Thread MCP 状态也必须来自显式会话级用例。
      */
     public RpcServiceBindings {
         Objects.requireNonNull(workspaces, "workspaces");
         Objects.requireNonNull(workspacePathSearch, "workspacePathSearch");
         Objects.requireNonNull(threads, "threads");
+        Objects.requireNonNull(threadMcp, "threadMcp");
         Objects.requireNonNull(turns, "turns");
         Objects.requireNonNull(compactions, "compactions");
         Objects.requireNonNull(approvals, "approvals");

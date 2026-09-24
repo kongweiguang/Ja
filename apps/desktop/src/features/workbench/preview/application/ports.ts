@@ -5,6 +5,7 @@ import type {
   AttachmentPreviewAuthorization,
   AttachmentPreviewSession,
 } from "../domain/attachmentPreviewModel";
+import type { PreviewFileResolution, PreviewTarget } from "../domain/previewModel";
 export type {
   AttachmentPreviewAuthorization,
   AttachmentPreviewTarget,
@@ -28,6 +29,8 @@ export interface PreviewSessionSnapshot {
   load_status: PreviewLoadStatus;
   url: string;
   title: string;
+  can_go_back: boolean;
+  can_go_forward: boolean;
   window: { label: string; url: string };
   dropped_events: number;
 }
@@ -54,6 +57,8 @@ export type PreviewEvent = {
     | { type: "title_changed"; title: string }
     | { type: "load_failed"; message: string }
     | { type: "load_finished"; url: string }
+    | { type: "history_changed"; can_go_back: boolean; can_go_forward: boolean }
+    | { type: "action_blocked"; action: "popup" | "download" }
     | { type: "closed" };
 };
 
@@ -66,12 +71,34 @@ export type PreviewUnsubscribe = () => void | Promise<void>;
 export interface NativePreviewPort {
   recoverPending(): Promise<PreviewRecoveryReport>;
   open(url: string, viewport: PreviewViewport): Promise<PreviewOpenResult>;
+  openBlank(viewport: PreviewViewport): Promise<PreviewOpenResult>;
+  resolveFile(
+    target: string,
+    workspaceId?: string,
+    line?: number,
+    column?: number,
+  ): Promise<PreviewFileResolution>;
+  revealFile(target: string, workspaceId?: string): Promise<void>;
+  openFile(
+    target: string,
+    workspaceId: string | undefined,
+    viewport: PreviewViewport,
+  ): Promise<PreviewOpenResult>;
   navigate(
     sessionId: string,
     generation: number,
     url: string,
     source: "user" | "redirect",
   ): Promise<PreviewSessionSnapshot>;
+  navigateFile(
+    sessionId: string,
+    generation: number,
+    target: string,
+    workspaceId?: string,
+  ): Promise<PreviewSessionSnapshot>;
+  goBack(sessionId: string, generation: number): Promise<PreviewSessionSnapshot>;
+  goForward(sessionId: string, generation: number): Promise<PreviewSessionSnapshot>;
+  reload(sessionId: string, generation: number): Promise<PreviewSessionSnapshot>;
   layout(sessionId: string, viewport: PreviewViewport): Promise<PreviewSessionSnapshot>;
   close(sessionId: string): Promise<PreviewSessionSnapshot>;
   events(sessionId: string, maxEvents: number): Promise<PreviewEvent[]>;
@@ -81,10 +108,28 @@ export interface NativePreviewPort {
 
 /** Preview port 只表达用户意图与 DOM 几何，不暴露 Tauri command 或 WebView 句柄。 */
 export interface PreviewPort {
+  openTarget?: (target: PreviewTarget) => Promise<void>;
+  newPage?: () => Promise<void>;
+  selectPage?: (pageId: string) => void;
+  closePage?: (pageId: string) => Promise<void>;
   navigate?: (url: string) => void;
+  navigateFile?: (path: string) => void;
+  goBack?: () => void;
+  goForward?: () => void;
   reload?: () => void;
   retryRecovery?: () => void;
   changeViewport?: (viewport: PreviewViewport) => void;
+}
+
+/** 每个可见浏览器 tab 以原生 session ID 为身份，不建立 renderer 第二套会话事实。 */
+export interface PreviewPageProjection {
+  pageId: string;
+  url: string;
+  title: string;
+  loading: boolean;
+  error?: string;
+  canGoBack: boolean;
+  canGoForward: boolean;
 }
 
 /** application open result 复用 domain session 投影，port 只补充异步能力而不复制业务形状。 */

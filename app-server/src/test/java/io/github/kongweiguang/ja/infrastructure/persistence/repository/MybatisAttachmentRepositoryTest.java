@@ -193,6 +193,65 @@ final class MybatisAttachmentRepositoryTest extends PersistenceTestSupport {
         }
     }
 
+    /** Reask 复用已绑定附件的同一不可变 blob，但保留原消息关系供审计、Preview 授权和 GC 判断。 */
+    @Test
+    void reusesSourceBoundAttachmentWithoutMovingItsAuditRelation() throws Exception {
+        try (TestDatabase database = database("attachment-reask-shared-reference")) {
+            MybatisConversationRepository conversations = prepareThread(database);
+            MybatisAttachmentRepository attachments = database.attachments();
+            attachments.createDraft(draft("att_shared", "9".repeat(64), 16));
+            ConversationRepository.AdmissionReceipt original = conversations.admit(
+                    new ConversationRepository.TurnAdmission("thr_attachment", "turn_attachment",
+                            "item_attachment", new ModelMessage(ModelRole.USER,
+                            List.of(new AttachmentContent("att_shared"), new TextContent("检查附件"))),
+                            List.of("att_shared"), 0, START.plusSeconds(1), execution("cfg_attachment")));
+            ConversationRepository.CommitReceipt running = conversations.commit(
+                    new ConversationRepository.CommitRequest("thr_attachment", "turn_attachment",
+                            io.github.kongweiguang.ja.conversation.domain.turn.TurnState.RUNNING, List.of(),
+                            original.turnMutationVersion(), START.plusSeconds(2), execution("cfg_attachment")));
+            ConversationRepository.CommitReceipt failed = conversations.commitTerminal(
+                    new ConversationRepository.TerminalCommit("thr_attachment", "turn_attachment",
+                            io.github.kongweiguang.ja.conversation.domain.turn.TurnState.FAILED,
+                            "failed", "MODEL_FAILURE", "provider failed", null, null, List.of(),
+                            running.turnMutationVersion(), START.plusSeconds(3)));
+
+            ConversationRepository.AdmissionReceipt reask = conversations.admitReask(
+                    new ConversationRepository.ReaskAdmission(new ConversationRepository.TurnAdmission(
+                            "thr_attachment", "turn_reask", "item_reask",
+                            new ModelMessage(ModelRole.USER,
+                                    List.of(new AttachmentContent("att_shared"), new TextContent("改后重新检查"))),
+                            List.of("att_shared"), failed.threadRevision(), START.plusSeconds(4),
+                            execution("cfg_attachment")), SnapshotItemIdentity.of("message", "item_attachment")));
+
+            assertEquals(failed.threadRevision() + 1, reask.threadRevision());
+            assertEquals(AttachmentMetadata.Status.BOUND,
+                    attachments.findThread("att_shared", "thr_attachment").orElseThrow().status());
+            ThreadSnapshot history = database.history(conversations)
+                    .readThread("thr_attachment", null, 20).orElseThrow();
+            assertEquals(List.of("turn_reask"), history.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            ThreadSnapshot.UserInputItem visible = history.items().stream()
+                    .filter(ThreadSnapshot.UserInputItem.class::isInstance)
+                    .map(ThreadSnapshot.UserInputItem.class::cast).findFirst().orElseThrow();
+            assertEquals("改后重新检查", visible.content().text());
+            assertEquals(List.of("att_shared"), visible.attachments().stream()
+                    .map(io.github.kongweiguang.ja.conversation.domain.AttachmentSummary::attachmentId).toList());
+            assertTrue(history.items().stream().noneMatch(item ->
+                    item.itemId().equals(SnapshotItemIdentity.of("message", "item_attachment"))));
+
+            try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession()) {
+                var mapper = PersistenceMappers.open(session).attachments();
+                assertTrue(mapper.isMessageAttachmentBoundTo(
+                        "att_shared", "item_attachment", "thr_attachment", "ws_attachment"));
+                assertTrue(mapper.isMessageAttachmentBoundTo(
+                        "att_shared", "item_reask", "thr_attachment", "ws_attachment"));
+                assertEquals("BOUND", mapper.selectThreadAttachment("att_shared", "thr_attachment").status());
+            }
+            assertTrue(attachments.findUnreferencedBlobs(10).isEmpty());
+            assertTrue(attachments.findAllBlobs().contains("9".repeat(64)));
+        }
+    }
+
     /** SUSPENDED 直接取消也必须和普通终态一样立即丢弃附件并删除预留关系。 */
     @Test
     void cancelSuspendedReleasesQueuedAttachments() throws Exception {
@@ -223,7 +282,7 @@ final class MybatisAttachmentRepositoryTest extends PersistenceTestSupport {
         MybatisConversationRepository conversations = database.agentStore();
         MybatisHistoryService history = database.history(conversations);
         history.register(new Workspace.Registration("ws_attachment", temp.resolve("attachment-project"),
-                "Attachment", Workspace.Trust.TRUSTED, START));
+                "Attachment", Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, START));
         conversations.createThread(new ConversationRepository.ThreadDefinition(
                 "thr_attachment", "ws_attachment", "Attachment",
                 preferences("provider_attachment", "model_attachment"), START));

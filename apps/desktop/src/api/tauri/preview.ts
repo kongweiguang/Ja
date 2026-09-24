@@ -4,14 +4,22 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { z } from "zod";
-import { normalizePreviewUrl } from "@/shared/validation/previewUrl";
+import { normalizePreviewUrl, normalizePreviewWebUrl } from "@/shared/validation/previewUrl";
 import { invokeNativeCommand } from "./nativeInvoke";
 
 /** 封闭 command/event surface，防止 Preview 页面选择任意 Tauri capability。 */
 export const JA_PREVIEW_COMMANDS = {
   recoverPending: "ja_preview_recover_pending",
   open: "ja_preview_open",
+  openBlank: "ja_preview_open_blank",
+  resolveFile: "ja_preview_resolve_file",
+  revealFile: "ja_preview_reveal_file",
+  openFile: "ja_preview_open_file",
   navigate: "ja_preview_navigate",
+  navigateFile: "ja_preview_navigate_file",
+  goBack: "ja_preview_go_back",
+  goForward: "ja_preview_go_forward",
+  reload: "ja_preview_reload",
   layout: "ja_preview_layout",
   close: "ja_preview_close",
   events: "ja_preview_events",
@@ -39,20 +47,22 @@ const PreviewViewportSchema = z
   })
   .strict();
 
-/** 复用现有 URL 标准库边界，只有 HTTP(S) 能到达 Rust/WebView。 */
-const PreviewUrlSchema = z
+/** native page snapshot 允许 open_file 的规范 file URI，但拒绝裸路径和任意协议。 */
+const PreviewPageUrlSchema = z
   .string()
   .min(1)
   .max(8_192)
   .refine(
-    (value) => normalizePreviewUrl(value) !== undefined,
-    "preview URL must use http or https",
+    (value) =>
+      value === "about:blank" ||
+      (/^(?:https?|file):/iu.test(value) && normalizePreviewUrl(value) !== undefined),
+    "preview page URL must use http, https, file, or about:blank",
   );
 
 const PreviewWindowSchema = z
   .object({
     label: z.string().min(1).max(128),
-    url: PreviewUrlSchema,
+    url: PreviewPageUrlSchema,
   })
   .strict();
 
@@ -62,25 +72,35 @@ const PreviewSessionSnapshotSchema = z
     generation: GenerationSchema,
     status: z.enum(["open", "closed"]),
     load_status: z.enum(["loading", "finished", "failed"]),
-    url: PreviewUrlSchema,
+    url: PreviewPageUrlSchema,
     title: z.string().max(1_024),
+    can_go_back: z.boolean(),
+    can_go_forward: z.boolean(),
     window: PreviewWindowSchema,
     dropped_events: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
 
 const PreviewEventKindSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("opened"), url: PreviewUrlSchema }).strict(),
+  z.object({ type: z.literal("opened"), url: PreviewPageUrlSchema }).strict(),
   z
     .object({
       type: z.literal("navigation_committed"),
       source: z.enum(["user", "redirect"]),
-      url: PreviewUrlSchema,
+      url: PreviewPageUrlSchema,
     })
     .strict(),
   z.object({ type: z.literal("title_changed"), title: z.string().max(1_024) }).strict(),
   z.object({ type: z.literal("load_failed"), message: z.string().max(4_096) }).strict(),
-  z.object({ type: z.literal("load_finished"), url: PreviewUrlSchema }).strict(),
+  z.object({ type: z.literal("load_finished"), url: PreviewPageUrlSchema }).strict(),
+  z
+    .object({
+      type: z.literal("history_changed"),
+      can_go_back: z.boolean(),
+      can_go_forward: z.boolean(),
+    })
+    .strict(),
+  z.object({ type: z.literal("action_blocked"), action: z.enum(["popup", "download"]) }).strict(),
   z.object({ type: z.literal("closed") }).strict(),
 ]);
 
@@ -121,6 +141,23 @@ const PreviewRecoveryReportSchema = z
     pending: RecoveryCountSchema,
   })
   .strict();
+const PreviewFileResolutionSchema = z
+  .object({
+    canonicalPath: z.string().min(1).max(4_096),
+    displayName: z.string().min(1).max(1_024),
+    workspaceId: z.string().min(1).max(128).nullable(),
+    workspaceRelativePath: z.string().min(1).max(4_096).nullable(),
+    withinWorkspace: z.boolean(),
+    kind: z.enum(["text", "browser", "unsupported"]),
+    mimeType: z.string().min(1).max(256).nullable(),
+    fileUrl: PreviewPageUrlSchema,
+    content: z.string().max(1_048_576).nullable(),
+    truncated: z.boolean(),
+    line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).nullable(),
+    column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).nullable(),
+    readOnly: z.boolean(),
+  })
+  .strict();
 
 const PreviewEventSchema = PreviewEventSchemaRaw.transform((value) =>
   value.kind.type === "load_failed"
@@ -131,6 +168,7 @@ const PreviewEventSchema = PreviewEventSchemaRaw.transform((value) =>
 export type PreviewSessionSnapshot = z.infer<typeof PreviewSessionSnapshotSchema>;
 export type PreviewOpenResult = z.infer<typeof PreviewOpenResultSchema>;
 export type PreviewRecoveryReport = z.infer<typeof PreviewRecoveryReportSchema>;
+export type PreviewFileResolution = z.infer<typeof PreviewFileResolutionSchema>;
 export type PreviewEvent = z.infer<typeof PreviewEventSchema>;
 export type PreviewViewport = z.infer<typeof PreviewViewportSchema>;
 export type PreviewEventListener = (event: PreviewEvent) => void;
@@ -160,7 +198,18 @@ const defaultNativeBridge: PreviewNativeBridge = {
   },
 };
 
-export type PreviewAdapterErrorCode = "invalid_input" | "invalid_response" | "command_failed";
+export type PreviewAdapterErrorCode =
+  | "invalid_input"
+  | "invalid_response"
+  | "command_failed"
+  | "file_target_invalid"
+  | "file_not_found"
+  | "file_unreadable"
+  | "file_is_directory"
+  | "workspace_required"
+  | "workspace_unavailable"
+  | "file_unsupported"
+  | "file_reveal_failed";
 
 /** Preview 错误保持稳定且已脱敏，失败的 WebView command 不能回显 URL 或路径数据。 */
 export class PreviewAdapterError extends Error {
@@ -171,7 +220,23 @@ export class PreviewAdapterError extends Error {
         ? "预览请求参数无效"
         : code === "invalid_response"
           ? "预览返回数据无效"
-          : "预览操作失败",
+          : code === "file_target_invalid"
+            ? "文件路径无效。"
+            : code === "file_not_found"
+              ? "文件不存在或已被移动。"
+              : code === "file_unreadable"
+                ? "当前没有读取此文件的权限。"
+                : code === "file_is_directory"
+                  ? "这是一个文件夹，无法在浏览器中打开。"
+                  : code === "workspace_required"
+                    ? "相对路径需要先打开工作区。"
+                    : code === "workspace_unavailable"
+                      ? "当前工作区已关闭，请重新打开后重试。"
+                      : code === "file_unsupported"
+                        ? "此文件类型暂不支持在浏览器中打开。"
+                        : code === "file_reveal_failed"
+                          ? "无法启动文件资源管理器，请稍后重试。"
+                          : "预览操作失败",
     );
     this.name = "PreviewAdapterError";
   }
@@ -198,7 +263,21 @@ function parseResult<T>(schema: z.ZodType<T>, value: unknown): T {
 /** 将原生 rejection 转换为静态文本，避免 WebView 诊断进入 React 状态。 */
 function commandFailed(error: unknown): PreviewAdapterError {
   if (error instanceof PreviewAdapterError) return error;
-  void error;
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    const mapped: Readonly<Record<string, PreviewAdapterErrorCode>> = {
+      FileTargetInvalid: "file_target_invalid",
+      FileNotFound: "file_not_found",
+      FileUnreadable: "file_unreadable",
+      FileIsDirectory: "file_is_directory",
+      WorkspaceRequired: "workspace_required",
+      WorkspaceUnavailable: "workspace_unavailable",
+      LocalFileUnsupported: "file_unsupported",
+      FileRevealFailed: "file_reveal_failed",
+    };
+    if (typeof code === "string" && mapped[code] !== undefined)
+      return new PreviewAdapterError(mapped[code]);
+  }
   return new PreviewAdapterError("command_failed");
 }
 
@@ -230,14 +309,83 @@ export class TauriPreviewAdapter {
 
   /** 打开 HTTP(S) Preview 并返回权威 session identity。 */
   async open(url: string, viewport: PreviewViewport): Promise<PreviewOpenResult> {
-    const normalized = normalizePreviewUrl(url);
+    const normalized = normalizePreviewWebUrl(url);
     if (normalized === undefined) throw new PreviewAdapterError("invalid_input");
     const parsedViewport = parseInput(PreviewViewportSchema, viewport);
-    if (!parsedViewport.visible || parsedViewport.width < 1 || parsedViewport.height < 1)
+    if (parsedViewport.width < 1 || parsedViewport.height < 1)
       throw new PreviewAdapterError("invalid_input");
     const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.open, {
       input: { url: normalized, viewport: parsedViewport },
     });
+    return parseResult(PreviewOpenResultSchema, result);
+  }
+
+  /** 新建 about:blank session，使 tab identity 仍由 Rust 签发且没有 Ja capability。 */
+  async openBlank(viewport: PreviewViewport): Promise<PreviewOpenResult> {
+    const parsedViewport = parseInput(PreviewViewportSchema, viewport);
+    if (parsedViewport.width < 1 || parsedViewport.height < 1)
+      throw new PreviewAdapterError("invalid_input");
+    const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.openBlank, {
+      input: { viewport: parsedViewport },
+    });
+    return parseResult(PreviewOpenResultSchema, result);
+  }
+
+  /** 显式点击文件目标后才请求 Rust 解析；renderer 不自行 stat、读取或授权本机路径。 */
+  async resolveFile(
+    target: string,
+    workspaceId?: string,
+    line?: number,
+    column?: number,
+  ): Promise<PreviewFileResolution> {
+    const input = parseInput(
+      z
+        .object({
+          target: z.string().trim().min(1).max(4_096),
+          workspaceId: z.string().min(1).max(128).optional(),
+          line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+          column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+        })
+        .strict(),
+      { target, workspaceId, line, column },
+    );
+    const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.resolveFile, { input });
+    return parseResult(PreviewFileResolutionSchema, result);
+  }
+
+  /** 仅在显式 Ctrl+点击后请求原生定位，路径不会成为 renderer 可选择的进程参数。 */
+  async revealFile(target: string, workspaceId?: string): Promise<void> {
+    const input = parseInput(
+      z
+        .object({
+          target: z.string().trim().min(1).max(4_096),
+          workspaceId: z.string().min(1).max(128).optional(),
+        })
+        .strict(),
+      { target, workspaceId },
+    );
+    await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.revealFile, { input });
+  }
+
+  /** 再次将文件路径交给 Rust 解析并在隔离子 WebView 中打开，不采用 renderer 的 file_url。 */
+  async openFile(
+    target: string,
+    workspaceId: string | undefined,
+    viewport: PreviewViewport,
+  ): Promise<PreviewOpenResult> {
+    const input = parseInput(
+      z
+        .object({
+          target: z.string().trim().min(1).max(4_096),
+          workspaceId: z.string().min(1).max(128).optional(),
+          viewport: PreviewViewportSchema,
+        })
+        .strict(),
+      { target, workspaceId, viewport },
+    );
+    if (input.viewport.width < 1 || input.viewport.height < 1)
+      throw new PreviewAdapterError("invalid_input");
+    const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.openFile, { input });
     return parseResult(PreviewOpenResultSchema, result);
   }
 
@@ -249,10 +397,61 @@ export class TauriPreviewAdapter {
     source: "user" | "redirect" = "user",
   ): Promise<PreviewSessionSnapshot> {
     const identity = parseInput(PreviewIdentitySchema, { sessionId, generation });
-    const normalized = normalizePreviewUrl(url);
+    const normalized = normalizePreviewWebUrl(url);
     if (normalized === undefined) throw new PreviewAdapterError("invalid_input");
     const input = { ...identity, source, url: normalized };
     const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.navigate, { input });
+    return parseResult(PreviewSessionSnapshotSchema, result);
+  }
+
+  /** 在现有 tab 中显式打开本机文件；Rust 会重新解析路径并执行 workspace/权限校验。 */
+  async navigateFile(
+    sessionId: string,
+    generation: number,
+    target: string,
+    workspaceId?: string,
+  ): Promise<PreviewSessionSnapshot> {
+    const input = parseInput(
+      z
+        .object({
+          sessionId: PreviewIdSchema,
+          generation: GenerationSchema,
+          target: z.string().trim().min(1).max(4_096),
+          workspaceId: z.string().min(1).max(128).optional(),
+        })
+        .strict(),
+      { sessionId, generation, target, workspaceId },
+    );
+    const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.navigateFile, { input });
+    return parseResult(PreviewSessionSnapshotSchema, result);
+  }
+
+  /** 原生 WebView 决定真实回退能力；React 不维护与地址栏不同步的历史栈。 */
+  async goBack(sessionId: string, generation: number): Promise<PreviewSessionSnapshot> {
+    return this.navigateHistory(JA_PREVIEW_COMMANDS.goBack, sessionId, generation);
+  }
+
+  /** 前进能力由对应原生 WebView 的历史栈提供。 */
+  async goForward(sessionId: string, generation: number): Promise<PreviewSessionSnapshot> {
+    return this.navigateHistory(JA_PREVIEW_COMMANDS.goForward, sessionId, generation);
+  }
+
+  /** reload 只刷新当前页面，不制造一条 React 侧历史记录。 */
+  async reload(sessionId: string, generation: number): Promise<PreviewSessionSnapshot> {
+    return this.navigateHistory(JA_PREVIEW_COMMANDS.reload, sessionId, generation);
+  }
+
+  /** 将三个原生历史动作收敛到一份固定 identity DTO 与 snapshot 校验。 */
+  private async navigateHistory(
+    command:
+      | typeof JA_PREVIEW_COMMANDS.goBack
+      | typeof JA_PREVIEW_COMMANDS.goForward
+      | typeof JA_PREVIEW_COMMANDS.reload,
+    sessionId: string,
+    generation: number,
+  ): Promise<PreviewSessionSnapshot> {
+    const identity = parseInput(PreviewIdentitySchema, { sessionId, generation });
+    const result = await invokePreview(this.bridge, command, { input: identity });
     return parseResult(PreviewSessionSnapshotSchema, result);
   }
 

@@ -43,6 +43,8 @@ public final class PersistenceRowProjections {
                 ? ThreadSummary.Status.ACTIVE : ThreadSummary.Status.ARCHIVED;
         return new ThreadSummary(requiredText(row.threadId(), "thread_id"),
                 requiredText(row.workspaceId(), "workspace_id"), requiredText(row.title(), "title"),
+                requiredText(row.workspaceKind(), "workspace_kind").toLowerCase(java.util.Locale.ROOT),
+                row.legacySharedWorkspaceId(),
                 threadPreferences(row), status, row.pinnedAt() != null,
                 row.latestTurnStatus() == null ? null
                         : TurnState.valueOf(requiredText(row.latestTurnStatus(), "latest_turn_status")),

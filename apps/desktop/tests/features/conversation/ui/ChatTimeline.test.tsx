@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -1607,6 +1607,135 @@ describe("ChatTimeline", () => {
     expect(screen.queryByRole("button", { name: "重新编辑" })).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["MODEL_UPSTREAM_REJECTED", "请求被上游拒绝。"],
+    ["MODEL_STREAM_INVALID", "模型响应流损坏或不完整。"],
+    ["MODEL_IDLE_TIMEOUT", "等待模型响应超时。"],
+  ])("按稳定错误码显示准确的一行原因：%s", (code, expectedReason) => {
+    render(
+      <ChatTimeline
+        turns={[
+          { turnId, threadId: "thr_one", status: "failed", error: { code, retryable: true } },
+        ]}
+        items={[
+          baseItem({ itemId: "item_terminal_failure", kind: "user_message", text: "原始问题" }),
+        ]}
+      />,
+    );
+
+    const reason = screen.getByRole("alert");
+    expect(reason).toHaveTextContent(expectedReason);
+    expect(reason.textContent).toBe(expectedReason);
+  });
+
+  /** 重试次数只修饰正在工作状态；不增加过程行，旧半截正文也不会回到时间线。 */
+  it("重试期间只展示一处轻状态并保持正在工作", () => {
+    render(
+      <ChatTimeline
+        turns={[{ turnId, threadId: "thr_one", status: "running" }]}
+        items={[
+          baseItem({ itemId: "item_retry_question", kind: "user_message", text: "原始问题" }),
+          baseItem({
+            itemId: "item_retry_status",
+            kind: "commentary",
+            status: "in_progress",
+            text: "重试 2/6",
+            metadata: { phase: "assistant_retry" },
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("article", { name: "回复状态" })).toHaveAttribute(
+      "data-response-state",
+      "working",
+    );
+    expect(screen.getByText("正在工作 · 重试 2/6")).toBeVisible();
+    expect(document.querySelectorAll('[data-retry-status="true"]')).toHaveLength(1);
+    expect(screen.queryByRole("listitem", { name: "助手进展" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/失败请求的半截正文/u)).not.toBeInTheDocument();
+  });
+
+  /** 成功 continuation 归回原问题后必须采用最新 Turn 状态，阻止旧失败再次显示编辑入口。 */
+  it("把隐藏 continuation 的成功回答归回原问题并移除旧编辑入口", () => {
+    const onEditQuestion = vi.fn();
+    render(
+      <ChatTimeline
+        editableSourceMessageId="item_original_question"
+        onEditQuestion={onEditQuestion}
+        turns={[
+          {
+            turnId: "turn_original",
+            threadId: "thr_one",
+            status: "failed",
+            threadRevision: 4,
+            error: { code: "MODEL_UNAVAILABLE", retryable: true },
+          },
+          {
+            turnId: "turn_continue",
+            threadId: "thr_one",
+            sourceMessageId: "item_original_question",
+            status: "completed",
+            threadRevision: 5,
+          },
+        ]}
+        items={[
+          baseItem({
+            itemId: "item_original_question",
+            turnId: "turn_original",
+            kind: "user_message",
+            text: "原始问题",
+          }),
+          baseItem({
+            itemId: "item_old_failure",
+            turnId: "turn_original",
+            kind: "agent_message",
+            final: true,
+            text: "旧失败收口",
+            status: "failed",
+            metadata: { failureReply: true },
+          }),
+          baseItem({
+            itemId: "item_continue_answer",
+            turnId: "turn_continue",
+            kind: "agent_message",
+            final: true,
+            text: "继续后完成",
+          }),
+        ]}
+      />,
+    );
+
+    const rows = document.querySelectorAll(".ja-chat-timeline__row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("data-source-message-id", "item_original_question");
+    expect(screen.getByRole("article", { name: "最终答复" })).toHaveTextContent("继续后完成");
+    expect(screen.queryByText("旧失败收口")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "编辑问题" })).not.toBeInTheDocument();
+    expect(onEditQuestion).not.toHaveBeenCalled();
+  });
+
+  it("取消停止的问题仍可编辑", async () => {
+    const user = userEvent.setup();
+    render(
+      <ChatTimeline
+        editableSourceMessageId="item_cancelled_question"
+        onEditQuestion={vi.fn()}
+        turns={[{ turnId, threadId: "thr_one", status: "cancelled" }]}
+        items={[
+          baseItem({
+            itemId: "item_cancelled_question",
+            kind: "user_message",
+            text: "被取消的问题",
+          }),
+        ]}
+      />,
+    );
+
+    await user.hover(screen.getByRole("article", { name: "用户问题" }));
+    expect(screen.getByRole("button", { name: "编辑问题" })).toBeVisible();
+  });
+
   it("模型协议故障不武断归因且不重复展示恢复说明", () => {
     render(
       <ChatTimeline
@@ -2502,13 +2631,19 @@ describe("ChatTimeline", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
   });
 
+  /** 网页引用是应用内浏览器动作按钮；验证回调仍由类型化入口接管。 */
   it("opens safe https links only through the typed callback", async () => {
     const user = userEvent.setup();
     const onOpenLink = vi.fn();
     const locationBefore = window.location.href;
     render(<MarkdownMessage content="[文档](https://example.com/docs)" onOpenLink={onOpenLink} />);
-    await user.click(screen.getByRole("link", { name: "文档" }));
-    expect(onOpenLink).toHaveBeenCalledWith("https://example.com/docs");
+    await user.click(
+      screen.getByRole("button", { name: "在 Ja 浏览器中打开 https://example.com/docs" }),
+    );
+    expect(onOpenLink).toHaveBeenCalledWith(
+      "https://example.com/docs",
+      expect.any(HTMLButtonElement),
+    );
     expect(window.location.href).toBe(locationBefore);
   });
 
@@ -2649,5 +2784,95 @@ describe("ChatTimeline", () => {
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.queryByText("收到消息")).not.toBeInTheDocument();
+  });
+
+  /** 右键复制复用当前消息正文；编辑仅由当前失败路径的 stable source message 获得。 */
+  it("为消息提供复制与当前问题编辑菜单", async () => {
+    const user = userEvent.setup();
+    const onCopyText = vi.fn().mockResolvedValue(undefined);
+    const onEditQuestion = vi.fn();
+    const question = baseItem({
+      itemId: "item_context_question",
+      kind: "user_message",
+      text: "检查当前实现",
+    });
+    render(
+      <ChatTimeline
+        editableSourceMessageId={question.itemId}
+        onEditQuestion={onEditQuestion}
+        onCopyText={onCopyText}
+        turns={[{ turnId, threadId: "thr_one", status: "failed" }]}
+        items={[question]}
+      />,
+    );
+
+    const article = screen.getByRole("article", { name: "用户问题" });
+    fireEvent.contextMenu(article, { clientX: 30, clientY: 40 });
+    const firstMenu = await screen.findByRole("menu", { name: "消息操作" });
+    expect(within(firstMenu).getByRole("menuitem", { name: "复制正文" })).toBeVisible();
+    expect(within(firstMenu).getByRole("menuitem", { name: "编辑问题" })).toBeVisible();
+    await user.click(within(firstMenu).getByRole("menuitem", { name: "复制正文" }));
+    await waitFor(() => expect(onCopyText).toHaveBeenCalledWith("检查当前实现"));
+
+    fireEvent.contextMenu(article, { clientX: 55, clientY: 65 });
+    await user.click(await screen.findByRole("menuitem", { name: "编辑问题" }));
+    expect(onEditQuestion).toHaveBeenCalledWith(question);
+  });
+
+  /** WebView 没有默认右键菜单时仍不能吞选区与 Markdown 链接/本地文件按钮事件。 */
+  it("保留消息选区和 Markdown 文件链接的原生右键路径", () => {
+    render(
+      <ChatTimeline
+        onCopyText={vi.fn().mockResolvedValue(undefined)}
+        onOpenFile={vi.fn()}
+        items={[
+          baseItem({
+            itemId: "item_context_markdown",
+            kind: "user_message",
+            text: "请看 [src/App.tsx](src/App.tsx)",
+          }),
+        ]}
+      />,
+    );
+    const article = screen.getByRole("article", { name: "用户问题" });
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(article);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    fireEvent.contextMenu(article, { clientX: 30, clientY: 40 });
+    expect(screen.queryByRole("menu", { name: "消息操作" })).not.toBeInTheDocument();
+    selection?.removeAllRanges();
+
+    const fileLink = article.querySelector<HTMLElement>("[data-file-reference]");
+    expect(fileLink).not.toBeNull();
+    if (fileLink === null) return;
+    fireEvent.contextMenu(fileLink, { clientX: 30, clientY: 40 });
+    expect(screen.queryByRole("menu", { name: "消息操作" })).not.toBeInTheDocument();
+  });
+
+  /** 键盘打开与 Escape 必须回焦到原消息；移除虚拟行后菜单立即失去可执行目标。 */
+  it("支持键盘上下文菜单、Escape 焦点恢复和虚拟目标卸载", async () => {
+    const user = userEvent.setup();
+    const question = baseItem({
+      itemId: "item_context_keyboard",
+      kind: "user_message",
+      text: "键盘操作",
+    });
+    const props = {
+      onCopyText: vi.fn().mockResolvedValue(undefined),
+    };
+    const { rerender } = render(<ChatTimeline {...props} items={[question]} />);
+    const article = screen.getByRole("article", { name: "用户问题" });
+    article.focus();
+    await user.keyboard("{Shift>}{F10}{/Shift}");
+    expect(await screen.findByRole("menu", { name: "消息操作" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(article).toHaveFocus());
+
+    fireEvent.contextMenu(article, { clientX: 40, clientY: 50 });
+    expect(screen.getByRole("menu", { name: "消息操作" })).toBeVisible();
+    rerender(<ChatTimeline {...props} items={[]} />);
+    expect(screen.queryByRole("menu", { name: "消息操作" })).not.toBeInTheDocument();
   });
 });

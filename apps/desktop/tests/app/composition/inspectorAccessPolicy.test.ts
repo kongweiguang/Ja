@@ -29,10 +29,11 @@ function explicitInspectorOpeners(source: string): string[] {
 }
 
 describe("inspector access policy", () => {
-  /** 对象入口覆盖文件引用与指定 Turn；白名单与真实组合根保持一致，不恢复 latest-only 入口。 */
+  /** 对象入口覆盖 Markdown 引用、文件和指定 Turn；白名单与真实组合根保持一致。 */
   it("only opens the inspector from approved object actions and explicit Composer commands", () => {
     const source = applicationSource();
     expect(explicitInspectorOpeners(source)).toEqual([
+      "requestConversationOpenTarget",
       "openWorkspaceReferencePreview",
       "openAttachmentPreview",
       "openTurnReview",
@@ -54,7 +55,7 @@ describe("inspector access policy", () => {
     expect(source).not.toContain('id: "toggle-workbench"');
     expect(source).not.toContain("onFocusConversation={returnToConversation}");
     expect(source).toContain("!workspaceShortcutCapabilitiesEnabled || !inspectorOpen");
-    expect(source).toContain('workspace.workspace?.kind === "general"');
+    expect(source).toContain("workspace.workspace !== undefined && !settingsVisible");
     expect(source).toContain("<WorkbenchResizeHandle");
     expect(source).toContain("hidden={!workbenchVisible}");
     expect(source).toContain("aria-hidden={!workbenchVisible || undefined}");

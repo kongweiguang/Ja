@@ -2,6 +2,7 @@
 // @author kongweiguang
 
 use super::*;
+use crate::app_runtime::WorkspaceKind;
 use crate::app_runtime::infrastructure::bridge::event_projection::task_progress_is_observed;
 
 /// 复用完整 TaskSummary fixture，使关联性测试只改变目标 identity，不弱化 wire 闭集。
@@ -176,7 +177,8 @@ fn task_read_result_rejects_cross_task_detail_rows() {
     let result = json!({
         "task": task_summary("thr_child", "thr_root"),
         "thread": {
-            "threadId": "thr_child", "workspaceId": "ws_root", "activeGoalId": "goal_child",
+            "threadId": "thr_child", "workspaceId": "ws_root", "workspaceKind": "session",
+            "legacySharedWorkspaceId": null, "activeGoalId": "goal_child",
             "preferences": {
                 "providerId": "provider_side", "modelId": "model_side", "reasoningLevel": "high",
                 "accessMode": "full_access", "collaborationMode": "plan", "titleSource": "manual"
@@ -214,6 +216,8 @@ fn task_read_result_rejects_cross_task_detail_rows() {
     let parsed = parse_task_read_result(result.clone(), "thr_child").expect("task read result");
     assert_eq!(parsed.thread.thread_id, "thr_child");
     assert_eq!(parsed.thread.workspace_id, "ws_root");
+    assert_eq!(parsed.thread.workspace_kind, WorkspaceKind::Session);
+    assert_eq!(parsed.thread.legacy_shared_workspace_id, None);
     assert_eq!(parsed.thread.active_goal_id.as_deref(), Some("goal_child"));
     assert_eq!(parsed.thread.title, "检查测试");
     assert_eq!(parsed.thread.status, "active");
@@ -254,7 +258,8 @@ fn task_read_rejects_invalid_cursor_and_non_monotonic_sequences() {
     let mut result = json!({
         "task": task_summary("thr_child", "thr_root"),
         "thread": {
-            "threadId": "thr_child", "workspaceId": "ws_root", "activeGoalId": null,
+            "threadId": "thr_child", "workspaceId": "ws_root", "workspaceKind": "session",
+            "legacySharedWorkspaceId": null, "activeGoalId": null,
             "preferences": null, "title": "检查测试", "status": "active", "pinned": false,
             "latestTurnStatus": "running", "latestTurnSeen": true, "revision": 2,
             "createdAt": "2026-09-03T08:00:00Z", "updatedAt": "2026-09-03T08:00:01Z"
@@ -301,9 +306,7 @@ fn task_close_result_requires_strict_positive_ack() {
     );
     assert!(parse_task_close_result(json!({})).is_err());
     assert!(parse_task_close_result(json!({"closed": false})).is_err());
-    assert!(
-        parse_task_close_result(json!({"closed": true, "taskThreadId": "thr_side"})).is_err()
-    );
+    assert!(parse_task_close_result(json!({"closed": true, "taskThreadId": "thr_side"})).is_err());
 }
 
 /// Registry 同时绑定 owner 与 sidecar generation；reload drain 后迟到 progress 立即失效。

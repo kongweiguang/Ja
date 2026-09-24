@@ -1,21 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/** application 只需要 Host 已校验过的 workspace 目录字段，不依赖具体 Tauri DTO。 */
+/** application 只需要 Host 已校验过的 workspace 事实，不依赖具体 Tauri DTO。 */
 interface WorkspaceCatalogRecord {
   workspaceId: string;
+  kind: "project" | "session" | "legacy_shared";
+  legacySharedWorkspaceId: string | null;
   root: string;
   displayName: string;
   trust: "trusted" | "untrusted";
   revision: number;
-}
-
-/** general workspace 由 Ja App Server 签发身份，React 不通过路径推导它。 */
-export interface GeneralWorkspaceRecord {
-  workspaceId: string;
-  rootPath: string;
-  displayName: string;
-  trust: "trusted";
 }
 
 /** Runtime 投影只携带 workspace 自动打开所需的生命周期栅栏。 */
@@ -40,8 +34,22 @@ export interface WorkspaceRuntimeState {
  */
 export interface WorkspaceHistoryPort {
   workspaceOpen?: (input: { cwd: string; displayName?: string }) => Promise<WorkspaceCatalogRecord>;
-  workspaceList(input?: { cursor?: string; limit?: number }): Promise<{
+  workspaceList(input?: {
+    kind?: WorkspaceCatalogRecord["kind"];
+    cursor?: string;
+    limit?: number;
+  }): Promise<{
     items: WorkspaceCatalogRecord[];
     nextCursor?: string | null;
   }>;
+}
+
+/** Rust activation 投影包含 canonical root；renderer 只消费此值，不把路径传回 native。 */
+export interface WorkspaceActivationRecord {
+  workspaceId: string;
+  kind: "project" | "session" | "legacy_shared";
+  legacySharedWorkspaceId: string | null;
+  rootPath: string;
+  displayName: string;
+  trust: "trusted" | "untrusted";
 }

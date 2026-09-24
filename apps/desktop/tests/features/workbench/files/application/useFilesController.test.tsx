@@ -2,11 +2,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FilesWorkspaceLifecycle } from "@/features/workbench/files";
 import type {
+  FilesControllerPorts,
   FileReadDto,
   FileRevision,
   FileSaveResult,
@@ -17,6 +27,7 @@ import type {
   WorkspaceNativeDropEvent,
   WorkspaceTreePageDto,
 } from "@/features/workbench/files";
+import { useFilesController } from "@/features/workbench/files";
 import { FilesWorkspaceHarness as FilesWorkspace } from "./FilesWorkspaceHarness";
 
 vi.mock("@/features/workbench/editor", async (importOriginal) => {
@@ -229,6 +240,53 @@ function createOperations(): {
 }
 
 describe("FilesWorkspace", () => {
+  it("keeps explicitly opened external snapshots read-only and outside workspace save operations", async () => {
+    const { operations } = createOperations();
+    const controllerPorts: FilesControllerPorts = {
+      timer: {
+        set: (delayMillis, callback) => window.setTimeout(callback, delayMillis),
+        clear: (handle) => window.clearTimeout(handle as number),
+      },
+      resolveNativeDropTarget: () => undefined,
+      subscribeBrowserReconciliation: () => () => undefined,
+    };
+    const { result } = renderHook(() =>
+      useFilesController({
+        workspaceId: "ws_test",
+        operations,
+        activityEnabled: false,
+        ...controllerPorts,
+      }),
+    );
+    const input = {
+      path: String.raw`C:\Users\person\notes.txt`,
+      content: "read-only snapshot",
+      line: 2,
+      column: 4,
+      truncated: true,
+    };
+
+    let accepted = false;
+    act(() => {
+      accepted = result.current.actions.openExternalDocument(input);
+    });
+    expect(accepted).toBe(true);
+    expect(result.current.viewModel.activePath).toBe(input.path);
+    expect(result.current.viewModel.activeDocument).toMatchObject({
+      path: input.path,
+      content: input.content,
+      readOnly: true,
+      externalFile: true,
+      truncated: true,
+      reveal: { line: 2, column: 4 },
+    });
+
+    act(() => result.current.actions.editDocument(input.path, "changed"));
+    await act(async () => result.current.actions.saveDocument(input.path));
+    expect(result.current.viewModel.activeDocument?.content).toBe(input.content);
+    expect(operations.saveFile).not.toHaveBeenCalled();
+  });
+
   it("keeps the Explorer selection aligned when an existing editor tab becomes active", async () => {
     const { operations } = createOperations();
     const user = userEvent.setup();
@@ -559,6 +617,43 @@ describe("FilesWorkspace", () => {
       vi.mocked(operations.tree).mock.calls.filter(([input]) => input.relativePath === "").length,
     ).toBeGreaterThanOrEqual(3);
     expect(operations.readFile).toHaveBeenCalledTimes(3);
+  });
+
+  /** 外部只读快照不得进入 workspace Read，否则焦点对账会伪造文件删除冲突。 */
+  it("keeps workspace-external read-only snapshots out of workspace reconciliation", async () => {
+    const { operations, emitFocus } = createOperations();
+    const controllerPorts: FilesControllerPorts = {
+      timer: {
+        set: (delayMillis, callback) => window.setTimeout(callback, delayMillis),
+        clear: (handle) => window.clearTimeout(handle as number),
+      },
+      resolveNativeDropTarget: () => undefined,
+      subscribeBrowserReconciliation: () => () => undefined,
+    };
+    const { result } = renderHook(() =>
+      useFilesController({ workspaceId: "ws_test", operations, ...controllerPorts }),
+    );
+    await waitFor(() => expect(operations.watchStart).toHaveBeenCalledTimes(1));
+    const path = String.raw`C:\Users\person\outside notes.txt`;
+    act(() => {
+      result.current.actions.openExternalDocument({
+        path,
+        content: "external snapshot",
+        truncated: false,
+      });
+    });
+
+    act(() => emitFocus(true));
+    await waitFor(() => expect(operations.watchRescan).toHaveBeenCalled());
+    await waitFor(() => expect(operations.tree).toHaveBeenCalledTimes(2));
+    expect(operations.readFile).not.toHaveBeenCalled();
+    expect(result.current.viewModel.activeDocument).toMatchObject({
+      path,
+      content: "external snapshot",
+      readOnly: true,
+      externalFile: true,
+      status: "clean",
+    });
   });
 
   it("reconciles from a native focus gain when the DOM focus event is absent", async () => {
@@ -1391,6 +1486,7 @@ describe("FilesWorkspace", () => {
       within(screen.getByRole("treeitem", { name: "main.ts" })).getByText("main.ts"),
     );
     await user.click(screen.getByRole("menuitem", { name: "移入回收站" }));
+    await waitFor(() => expect(operations.trashPrepare).toHaveBeenCalledTimes(2));
     trashDialog = await screen.findByRole("alertdialog", { name: "移入回收站" });
     await within(trashDialog).findByText("10 字节");
     await user.click(within(trashDialog).getByRole("button", { name: "移入回收站" }));
@@ -1497,6 +1593,7 @@ describe("FilesWorkspace", () => {
       within(screen.getByRole("treeitem", { name: "main.ts" })).getByText("main.ts"),
     );
     await user.click(screen.getByRole("menuitem", { name: "移入回收站" }));
+    await waitFor(() => expect(operations.trashPrepare).toHaveBeenCalledTimes(2));
     trashDialog = await screen.findByRole("alertdialog", { name: "移入回收站" });
     expect(within(trashDialog).getByRole("status")).toHaveTextContent("正在核对");
 

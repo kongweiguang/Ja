@@ -321,14 +321,15 @@ export const ConfigDocumentSchema = z
   });
 
 /**
- * 项目文档只开放当前设置页实际写入的 Skill 覆盖，避免 Renderer 承担 Provider/MCP 稀疏 overlay 的所有权。
+ * 项目文档只开放已信任项目的 Skill 与完整 MCP 定义；Provider 和执行策略仍属用户层。
  */
-export const ConfigProjectSkillDocumentSchema = z
+export const ConfigProjectDocumentSchema = z
   .object({
     schema_version: z.literal(2),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
     skills: z.array(ConfigProjectSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
     disabled_skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
+    mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS).default([]),
   })
   .strict()
   .superRefine((document, context) => {
@@ -341,5 +342,11 @@ export const ConfigProjectSkillDocumentSchema = z
         path: ["disabled_skills"],
         message: "duplicate skill reference",
       });
+    }
+    if (
+      new Set(document.mcp_servers.map((server) => server.mcp_id)).size !==
+      document.mcp_servers.length
+    ) {
+      context.addIssue({ code: "custom", path: ["mcp_servers"], message: "duplicate MCP id" });
     }
   });

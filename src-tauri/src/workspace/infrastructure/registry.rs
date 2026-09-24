@@ -80,6 +80,11 @@ impl WorkspaceHandle {
         self.id
     }
 
+    /// 用准入时捕获的文件系统身份比较 Java Workspace，避免 Windows 大小写、扩展前缀或短名别名改变合法绑定判断。
+    pub(crate) fn same_physical_root(&self, other: &Self) -> bool {
+        self.root_identity == other.root_identity
+    }
+
     /// 不跟随 symlink/reparse 解析常规文件并复核 canonical containment，别名路径失败关闭。
     pub fn resolve_file(&self, relative_path: &str) -> Result<PathBuf, WorkspaceError> {
         Ok(self.resolve_guard(relative_path, Some(false))?.path)

@@ -9,6 +9,13 @@ const DESKTOP_SOURCE = join(process.cwd(), "apps", "desktop", "src");
 const COMPOSER_STYLE = join("features", "conversation", "ui", "composer", "composer.css");
 const TASKS_STYLE = join("features", "tasks", "ui", "tasks.css");
 const TIMELINE_STYLE = join("features", "conversation", "ui", "timeline", "timeline.css");
+const SUMMARY_STYLE = join(
+  "features",
+  "conversation",
+  "ui",
+  "summary",
+  "ConversationSummaryPopover.css",
+);
 const NAVIGATION_STYLE = join("features", "navigation", "ui", "navigation.css");
 const MCP_STYLE = join("features", "settings", "ui", "mcp.css");
 const MODELS_STYLE = join("features", "settings", "ui", "models-overview.css");
@@ -179,6 +186,24 @@ function approvedNavigationPopoverRadius(
   return selector === ".ja-popover-content.ja-navigation-runtime-popover";
 }
 
+/** 摘要浮层的状态胶囊与统计卡保留精确几何，其余工作台仍受紧凑半径约束。 */
+function approvedConversationSummaryRadius(
+  file: string,
+  source: string,
+  valueOffset: number,
+  value: string,
+): boolean {
+  if (relative(DESKTOP_SOURCE, file) !== SUMMARY_STYLE) return false;
+  const selector = radiusSelector(source, valueOffset);
+  return (
+    ((selector === ".ja-conversation-summary-status" ||
+      selector === ".ja-conversation-summary-mcp-source" ||
+      selector === ".ja-conversation-summary-mcp-preview") &&
+      value === "999px") ||
+    (selector === ".ja-conversation-summary-stats > div" && value === "0.62rem")
+  );
+}
+
 describe("shared desktop radius policy", () => {
   it("keeps the workbench compact while allowing explicit Apple input and message geometry", () => {
     const composerSource = readFileSync(join(DESKTOP_SOURCE, COMPOSER_STYLE), "utf8");
@@ -203,7 +228,8 @@ describe("shared desktop radius policy", () => {
           !approvedSettingsRadius(file, source, offset, pixels) &&
           !approvedComposerRadius(file, source, offset, pixels) &&
           !approvedUserMessageRadius(file, source, offset, value) &&
-          !approvedNavigationPopoverRadius(file, source, offset, pixels)
+          !approvedNavigationPopoverRadius(file, source, offset, pixels) &&
+          !approvedConversationSummaryRadius(file, source, offset, value)
         ) {
           violations.push(`${relative(DESKTOP_SOURCE, file)}: ${value}`);
         }

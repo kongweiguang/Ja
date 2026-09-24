@@ -19,7 +19,7 @@ function createMedia(): PreviewSessionHintMedia & { values: Map<string, string> 
 }
 
 describe("MediaPreviewSessionHintStorage", () => {
-  it("只恢复当前 UUID hint，并以 compare-before-delete 保护较新的 session", () => {
+  it("按 page ID 保留多个 hint，单页删除不会清除其它标签", () => {
     const media = createMedia();
     const storage = new MediaPreviewSessionHintStorage(() => media);
     const workspaceId = "ws_fixture";
@@ -27,26 +27,35 @@ describe("MediaPreviewSessionHintStorage", () => {
     const second = "00000000-0000-4000-8000-000000000003";
 
     storage.remember(workspaceId, first);
-    expect(storage.read(workspaceId)).toBe(first);
+    expect(storage.read(workspaceId)).toEqual([first]);
     storage.remember(workspaceId, second);
     storage.forget(workspaceId, first);
-    expect(storage.read(workspaceId)).toBe(second);
+    expect(storage.read(workspaceId)).toEqual([second]);
     storage.forget(workspaceId, second);
-    expect(storage.read(workspaceId)).toBeUndefined();
+    expect(storage.read(workspaceId)).toEqual([]);
   });
 
   it("介质异常与损坏值均降级为无 hint，不改变 Rust 权威 session", () => {
     const throwing = new MediaPreviewSessionHintStorage(() => {
       throw new Error("storage unavailable");
     });
-    expect(throwing.read("ws_fixture")).toBeUndefined();
+    expect(throwing.read("ws_fixture")).toEqual([]);
     expect(() =>
       throwing.remember("ws_fixture", "00000000-0000-4000-8000-000000000002"),
     ).not.toThrow();
 
     const media = createMedia();
-    media.values.set("ja-preview-session-v1:ws_fixture", "not-a-session");
+    media.values.set("ja-preview-pages-v2:ws_fixture", '["not-a-session"]');
     const storage = new MediaPreviewSessionHintStorage(() => media);
-    expect(storage.read("ws_fixture")).toBeUndefined();
+    expect(storage.read("ws_fixture")).toEqual([]);
+  });
+
+  it("旧 v1 单 session 键不参与读取或迁移", () => {
+    const media = createMedia();
+    media.values.set("ja-preview-session-v1:ws_fixture", "00000000-0000-4000-8000-000000000002");
+    const storage = new MediaPreviewSessionHintStorage(() => media);
+
+    expect(storage.read("ws_fixture")).toEqual([]);
+    expect(media.values.has("ja-preview-session-v1:ws_fixture")).toBe(true);
   });
 });

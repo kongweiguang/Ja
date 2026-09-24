@@ -305,6 +305,14 @@ fn validate_kernel_event(
         exact_keys_with_common(params, &TURN_COMMON_FIELDS, required, optional)
     };
     match method {
+        "turn/retry-started" => {
+            if !exact(&["attempt", "maxAttempts"], &[])
+                || !integer_in_range(params.get("attempt"), 2, 6)
+                || params.get("maxAttempts").and_then(Value::as_u64) != Some(6)
+            {
+                return Err(invalid_projection());
+            }
+        }
         "turn/state-changed" => {
             if !exact(&["from", "to"], &[])
                 || !valid_turn_state(params.get("from"))

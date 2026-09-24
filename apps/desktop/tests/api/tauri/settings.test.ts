@@ -196,7 +196,6 @@ describe("TauriSettingsAdapter v1", () => {
       defaultSelection: false,
       accessMode: false,
       disabledSkillReferences: ["user:one"],
-      disabledMcpIds: [],
     });
     expect(loaded.projectSkillDocument).toEqual({
       schemaVersion: 2,

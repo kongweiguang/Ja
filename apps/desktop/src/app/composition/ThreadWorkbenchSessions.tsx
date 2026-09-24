@@ -1,7 +1,14 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactElement,
+} from "react";
 import { toast } from "sonner";
 import type { FilesWorkspaceCloseLease, FilesWorkspaceLifecycle } from "@/features/workbench/files";
 import type { PreviewWorkspaceLifecycle } from "../useJaWorkbench";
@@ -18,6 +25,7 @@ export interface ThreadWorkbenchSessionsProps extends WorkbenchHostProps {
 }
 
 interface ThreadLifecycleRegistry {
+  readonly setWorkspaceId: (workspaceId: string) => void;
   readonly filesLifecycle: FilesWorkspaceLifecycle;
   readonly terminalLifecycle: TerminalWorkspaceLifecycle;
   readonly previewLifecycle: PreviewWorkspaceLifecycle;
@@ -76,15 +84,13 @@ function releaseFilesLeases(leases: readonly FilesWorkspaceCloseLease[]): void {
   if (firstError !== undefined) throw firstError;
 }
 
-/** 聚合当前项目所有会话的 Files fence；任一 flush 失败时立即释放其它已取得的 lease。 */
+/** 聚合所有保留 Thread 的 Files fence；任一 flush 失败时立即释放其它已取得的 lease。 */
 async function flushAllFiles(
-  workspaceId: string,
+  _workspaceId: string,
   lifecycles: ReadonlyMap<string, FilesWorkspaceLifecycle>,
 ): Promise<FilesWorkspaceCloseLease> {
   const results = await Promise.allSettled(
-    [...lifecycles.values()]
-      .filter((lifecycle) => lifecycle.workspaceId === workspaceId)
-      .map((lifecycle) => lifecycle.flushForWorkspaceChange()),
+    [...lifecycles.values()].map((lifecycle) => lifecycle.flushForWorkspaceChange()),
   );
   const leases = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
   const failure = results.find((result) => result.status === "rejected");
@@ -104,16 +110,14 @@ async function flushAllFiles(
 }
 
 /**
- * 关闭所有会话的 PTY；部分失败时恢复全部会话 controller，避免已经关闭的 Host 永久停在
+ * 关闭所有保留 Thread 的 PTY；部分失败时恢复全部 controller，避免已经关闭的 Host 永久停在
  * workspace-change 状态，成功后的恢复则由父协调器在事务最终结算时统一调用。
  */
 async function closeAllTerminals(
-  workspaceId: string,
+  _workspaceId: string,
   lifecycles: ReadonlyMap<string, TerminalWorkspaceLifecycle>,
 ): Promise<void> {
-  const targets = [...lifecycles.values()].filter(
-    (lifecycle) => lifecycle.workspaceId === workspaceId,
-  );
+  const targets = [...lifecycles.values()];
   const results = await Promise.allSettled(
     targets.map((lifecycle) => lifecycle.closeForWorkspaceChange()),
   );
@@ -123,42 +127,40 @@ async function closeAllTerminals(
   throw failure.reason;
 }
 
-/** Preview 原生子窗口均需得到关闭 ACK；聚合后仍保留首个失败供 workspace 事务回滚。 */
+/** 每个保留 Thread 的 Preview 子窗口都需得到关闭 ACK；首个失败交由 workspace 事务回滚。 */
 async function closeAllPreviews(
-  workspaceId: string,
+  _workspaceId: string,
   lifecycles: ReadonlyMap<string, PreviewWorkspaceLifecycle>,
 ): Promise<void> {
   const results = await Promise.allSettled(
-    [...lifecycles.values()]
-      .filter((lifecycle) => lifecycle.workspaceId === workspaceId)
-      .map((lifecycle) => lifecycle.closeForWorkspaceChange()),
+    [...lifecycles.values()].map((lifecycle) => lifecycle.closeForWorkspaceChange()),
   );
   const failure = results.find((result) => result.status === "rejected");
   if (failure?.status === "rejected") throw failure.reason;
 }
 
 /**
- * React 已决定卸载后无法以 flush 失败阻止视图销毁，因此仍按 Files、Terminal、Preview 顺序
+ * App 壳卸载后无法以 flush 失败阻止视图销毁，因此仍按 Files、Terminal、Preview 顺序
  * 尽最大努力完成全部回收；成功取得的 Files lease 覆盖原生清理事务并在最终阶段释放。
  */
 async function cleanupRetainedResources(
-  workspaceId: string,
+  _workspaceId: string,
   snapshot: ThreadLifecycleSnapshot,
 ): Promise<void> {
   const failures: unknown[] = [];
   let filesLease: FilesWorkspaceCloseLease | undefined;
   try {
-    filesLease = await flushAllFiles(workspaceId, snapshot.files);
+    filesLease = await flushAllFiles("", snapshot.files);
   } catch (error: unknown) {
     failures.push(error);
   }
   try {
-    await closeAllTerminals(workspaceId, snapshot.terminal);
+    await closeAllTerminals("", snapshot.terminal);
   } catch (error: unknown) {
     failures.push(error);
   }
   try {
-    await closeAllPreviews(workspaceId, snapshot.preview);
+    await closeAllPreviews("", snapshot.preview);
   } catch (error: unknown) {
     failures.push(error);
   }
@@ -176,7 +178,8 @@ async function cleanupRetainedResources(
  * 可变的各会话端口封装在事件型 registry 闭包内，React 只持有稳定窄方法与聚合 lifecycle，
  * 避免渲染期读取 Map 或因注册动作触发无意义重渲染。
  */
-function createThreadLifecycleRegistry(workspaceId: string): ThreadLifecycleRegistry {
+function createThreadLifecycleRegistry(initialWorkspaceId: string): ThreadLifecycleRegistry {
+  let activeWorkspaceId = initialWorkspaceId;
   const files = new Map<string, FilesWorkspaceLifecycle>();
   const terminal = new Map<string, TerminalWorkspaceLifecycle>();
   const preview = new Map<string, PreviewWorkspaceLifecycle>();
@@ -225,27 +228,38 @@ function createThreadLifecycleRegistry(workspaceId: string): ThreadLifecycleRegi
       queueMicrotask(() => {
         if (mountRevision !== revision) return;
         // React cleanup 不能等待 Promise；以稳定反馈消费 rejection，同时不泄漏原生诊断。
-        void cleanupRetainedResources(workspaceId, snapshot).catch(reportRetainedCleanupFailure);
+        void cleanupRetainedResources(activeWorkspaceId, snapshot).catch(
+          reportRetainedCleanupFailure,
+        );
       });
     };
   };
 
   return {
+    /** Commit 时同步 owner identity，异步 teardown 不读取 React render 中可变 Ref。 */
+    setWorkspaceId: (workspaceId) => {
+      activeWorkspaceId = workspaceId;
+    },
     filesLifecycle: {
-      workspaceId,
-      flushForWorkspaceChange: () => flushAllFiles(workspaceId, files),
+      get workspaceId() {
+        return activeWorkspaceId;
+      },
+      flushForWorkspaceChange: () => flushAllFiles(activeWorkspaceId, files),
     },
     terminalLifecycle: {
-      workspaceId,
-      closeForWorkspaceChange: () => closeAllTerminals(workspaceId, terminal),
+      get workspaceId() {
+        return activeWorkspaceId;
+      },
+      closeForWorkspaceChange: () => closeAllTerminals(activeWorkspaceId, terminal),
       resumeAfterWorkspaceChange: () => {
-        for (const lifecycle of terminal.values())
-          if (lifecycle.workspaceId === workspaceId) lifecycle.resumeAfterWorkspaceChange();
+        for (const lifecycle of terminal.values()) lifecycle.resumeAfterWorkspaceChange();
       },
     },
     previewLifecycle: {
-      workspaceId,
-      closeForWorkspaceChange: () => closeAllPreviews(workspaceId, preview),
+      get workspaceId() {
+        return activeWorkspaceId;
+      },
+      closeForWorkspaceChange: () => closeAllPreviews(activeWorkspaceId, preview),
     },
     registerFiles,
     registerTerminal,
@@ -346,6 +360,8 @@ function ThreadSessionHost({
         {...hostProps}
         adapters={adapters}
         active={current && hostProps.active}
+        openTargetRequest={current ? hostProps.openTargetRequest : undefined}
+        onOpenTargetSettled={current ? hostProps.onOpenTargetSettled : undefined}
         onRegisterFilesLifecycle={registerFiles}
         onRegisterTerminalLifecycle={registerTerminal}
         onRegisterPreviewLifecycle={registerPreview}
@@ -357,8 +373,8 @@ function ThreadSessionHost({
 }
 
 /**
- * 在同一个 workspace 宿主内保留所有已访问 Thread 的 WorkbenchHost；当前会话直接消费
- * 最新 props，后台会话只消费最后一次已提交快照，从而不把 Task、Review 或附件 target 串线。
+ * 在 app 级宿主内保留所有已访问 Thread 的 WorkbenchHost；session 切换不卸载其它会话，
+ * 只有项目边界/退出才通过聚合 lifecycle 清理所有保留 owner。
  */
 export function ThreadWorkbenchSessions({
   scopeKey,
@@ -375,6 +391,7 @@ export function ThreadWorkbenchSessions({
   );
   const workspaceId = hostProps.workspace.workspaceId;
   const [registry] = useState(() => createThreadLifecycleRegistry(workspaceId));
+  useLayoutEffect(() => registry.setWorkspaceId(workspaceId), [registry, workspaceId]);
   if (validScope && !scopeKeys.includes(scopeKey)) setScopeKeys([...scopeKeys, scopeKey]);
 
   useEffect(() => {

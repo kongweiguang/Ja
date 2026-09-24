@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
 
 /**
  * 显式接线 Jackson 2 的 MCP Java SDK 适配器，不依赖 Runtime ServiceLoader 默认实现。
@@ -62,16 +63,18 @@ public final class SdkMcpSessionFactory implements McpSessionFactory {
         Objects.requireNonNull(toolsChanged, "toolsChanged");
         McpClientTransport transport;
         if (definition.transport() == McpServerDefinition.Transport.STDIO) {
+            Map<String, String> processEnvironment = inheritedEnvironment(
+                    System.getenv(), definition.environment());
             try {
                 WindowsProcessLauncher.verifyExecutableAvailable(
-                        definition.command(), definition.workingDirectory(), definition.environment());
+                        definition.command(), definition.workingDirectory(), processEnvironment);
             } catch (IOException failure) {
                 throw new IllegalStateException("mcp_stdio_start_failed", failure);
             }
             transport = new JaBoundedStdioTransport(
                     definition.command(),
                     definition.workingDirectory(),
-                    definition.environment(),
+                    processEnvironment,
                     definition.protocolVersions(),
                     jsonMapper,
                     limits,
@@ -90,6 +93,30 @@ public final class SdkMcpSessionFactory implements McpSessionFactory {
                 .enableCallToolSchemaCaching(false)
                 .build();
         return new SdkSession(client, objectMapper);
+    }
+
+    /**
+     * 在 Windows 环境名不区分大小写的前提下冻结宿主基线与 MCP 配置覆盖；同一份快照同时供预检查和启动，
+     * 让两条路径解析出相同的 PATH，并避免把完整宿主环境存进配置代际。
+     */
+    static Map<String, String> inheritedEnvironment(
+            Map<String, String> hostEnvironment, Map<String, String> configuredEnvironment) {
+        Objects.requireNonNull(hostEnvironment, "hostEnvironment");
+        Objects.requireNonNull(configuredEnvironment, "configuredEnvironment");
+        TreeMap<String, String> merged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        merged.putAll(hostEnvironment);
+        TreeMap<String, String> overlay = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        configuredEnvironment.forEach((name, value) -> {
+            if (overlay.containsKey(name)) {
+                throw new IllegalArgumentException("mcp_stdio_environment_conflict");
+            }
+            overlay.put(name, value);
+        });
+        overlay.forEach((name, value) -> {
+            merged.remove(name);
+            merged.put(name, value);
+        });
+        return Map.copyOf(merged);
     }
 
     /**

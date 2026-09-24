@@ -26,6 +26,7 @@ import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
+import io.github.kongweiguang.ja.conversation.port.in.InternalTurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
@@ -266,10 +267,12 @@ final class RpcApprovalTransportTest {
         ObjectMapper mapper = new ObjectMapper();
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         ThreadSummary first = new ThreadSummary(
-                "thr_start", "ws_start", "占位标题", preferences("provider_start", "model_start"),
+                "thr_start", "ws_start", "占位标题", "project", null,
+                preferences("provider_start", "model_start"),
                 ThreadSummary.Status.ACTIVE, false, null, true, null, 7, NOW.minusSeconds(60), NOW);
         ThreadSummary refreshed = new ThreadSummary(
-                "thr_start", "ws_start", "自动标题", preferences("provider_latest", "model_latest"),
+                "thr_start", "ws_start", "自动标题", "project", null,
+                preferences("provider_latest", "model_latest"),
                 ThreadSummary.Status.ACTIVE, false, null, true, null, 8, NOW.minusSeconds(60), NOW);
         RetryingTurns turns = new RetryingTurns();
         StartServices services = new StartServices(new SequencedStartThreads(first, refreshed), turns);
@@ -501,14 +504,14 @@ final class RpcApprovalTransportTest {
     /** 构造已提交恢复裁决后的同一 Thread 快照，确保 resume 预检读取的是新 revision。 */
     private static ThreadSummary recoveryThread(long revision) {
         return new ThreadSummary("thr_start", "ws_start", "启动测试",
-                preferences("provider_start", "model_start"), ThreadSummary.Status.ACTIVE,
+                "project", null, preferences("provider_start", "model_start"), ThreadSummary.Status.ACTIVE,
                 false, null, true, null, revision, NOW.minusSeconds(60), NOW);
     }
 
     /** 恢复夹具必须同时提供权威 Turn 投影，供 transport 读取已完成模型轮次与 mutation fence。 */
     private static ThreadSnapshot.Turn recoveryTurn() {
         return new ThreadSnapshot.Turn("turn_resume", TurnState.SUSPENDED.name(),
-                NOW.minusSeconds(60), NOW, null, null, null, 0, 0);
+                NOW.minusSeconds(60), NOW, null, null, null, 0, 0, null);
     }
 
     /** 仅提供 approval/respond 使用的应用投影，其余端口均以显式失败关闭。 */
@@ -565,9 +568,10 @@ final class RpcApprovalTransportTest {
         private final Path workspaceRoot = Path.of(System.getProperty("java.io.tmpdir"), "ja-rpc-start-workspace")
                 .toAbsolutePath().normalize();
         private final Workspace workspace = new Workspace(
-                "ws_start", workspaceRoot, "启动测试", Workspace.Trust.TRUSTED, 4);
+                "ws_start", workspaceRoot, "启动测试", Workspace.Trust.TRUSTED,
+                Workspace.Kind.PROJECT, null, 4);
         private final ThreadSummary thread = new ThreadSummary(
-                "thr_start", "ws_start", "启动测试",
+                "thr_start", "ws_start", "启动测试", "project", null,
                 preferences("provider_start", "model_start"),
                 ThreadSummary.Status.ACTIVE, false, null, true, null, 7, NOW.minusSeconds(60), NOW);
         private final ThreadUseCase threads;
@@ -609,8 +613,12 @@ final class RpcApprovalTransportTest {
 
         /** 未声明工作区打开能力。 */
         @Override public Workspace openWorkspace(OpenWorkspace command) { throw unsupported(); }
-        /** 未声明通用工作区打开能力。 */
-        @Override public Workspace openGeneralWorkspace() { throw unsupported(); }
+        /** 未声明 session 创建能力。 */
+        @Override public Workspace createSessionWorkspace(String threadId) { throw unsupported(); }
+        /** 未声明 thread 创建补偿能力。 */
+        @Override public void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision) { throw unsupported(); }
+        /** 未声明持久目录重开能力。 */
+        @Override public Workspace openRegisteredWorkspace(String workspaceId) { throw unsupported(); }
         /** 未声明工作区列表能力。 */
         @Override public CursorPage<Workspace> listWorkspaces(String cursor, int limit) { throw unsupported(); }
         /** 未声明可选工作区读取能力。 */
@@ -626,8 +634,8 @@ final class RpcApprovalTransportTest {
         @Override public void unregisterWorkspace(String workspaceId, long expectedRevision) { throw unsupported(); }
         /** 未声明预热刷新能力。 */
         @Override public void refreshPreparedWorkspaces() { throw unsupported(); }
-        /** 未声明通用工作区判定能力。 */
-        @Override public boolean isGeneralWorkspace(Path root) { throw unsupported(); }
+        /** 未声明旧共享目录判定能力。 */
+        @Override public boolean isLegacySharedWorkspace(Path root) { throw unsupported(); }
     }
 
     /** 仅发布 turn/start 所需的固定 Thread 快照。 */
@@ -700,6 +708,16 @@ final class RpcApprovalTransportTest {
             if (!this.request.compareAndSet(null, request)) throw unsupported();
             return new Accepted(request.threadId(), request.turnId(),
                     request.expectedThreadRevision() + 1, true, new CompletableFuture<>());
+        }
+
+        /** 当前 transport 启动夹具不模拟失败问题恢复。 */
+        @Override public Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) {
+            throw unsupported();
+        }
+
+        /** 当前 transport 启动夹具不模拟问题编辑与路径切换。 */
+        @Override public Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink) {
+            throw unsupported();
         }
 
         /** 捕获原 Turn identity 与 CAS，证明 transport 没有生成新 Operation 或传递配置快照。 */
@@ -816,6 +834,10 @@ final class RpcApprovalTransportTest {
 
         /** 边界测试不接纳新 Turn。 */
         @Override public Accepted start(TurnStartRequest request, TurnEventSink sink) { throw unsupported(); }
+        /** 边界测试不触发隐藏继续。 */
+        @Override public Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) { throw unsupported(); }
+        /** 边界测试不编辑历史问题。 */
+        @Override public Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink) { throw unsupported(); }
         /** 记录 transport 已验证的唯一 Turn identity，并返回稳定终态 ACK。 */
         @Override public CancelResult cancel(String turnId) {
             attempts.incrementAndGet();
@@ -845,6 +867,14 @@ final class RpcApprovalTransportTest {
             request.set(candidate);
             return new Accepted(candidate.threadId(), candidate.turnId(),
                     candidate.expectedThreadRevision() + 1, true, new CompletableFuture<>());
+        }
+        /** 竞态夹具不模拟无用户消息的继续请求。 */
+        @Override public Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) {
+            throw unsupported();
+        }
+        /** 竞态夹具不模拟历史路径切换。 */
+        @Override public Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink) {
+            throw unsupported();
         }
         /** 竞态夹具不取消 Turn。 */
         @Override public CancelResult cancel(String turnId) { throw unsupported(); }

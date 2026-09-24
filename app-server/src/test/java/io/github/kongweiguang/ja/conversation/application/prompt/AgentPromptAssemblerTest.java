@@ -18,12 +18,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 极简 Ja Persona、动态 System 唯一性与 catalog 整条预算的纯行为测试。 */
 final class AgentPromptAssemblerTest {
-    /** 固定精简核心的字节指纹，避免把整段正文复制进测试并形成第二份维护来源。 */
+    /** 固定精简核心的字节指纹，避免重复维护整段 Persona，也能及时暴露任何模型可见改动。 */
     @Test
     void freezesMinimalPersonaGolden() {
         assertFalse(AgentPromptAssembler.SYSTEM_PROMPT.endsWith("\n"));
-        assertEquals("d414622963e6af2c0152ee575dc103f785092ec5bbf5775ff3b11b0b5cf0ae9f",
+        assertEquals("266e7291095f1cb66410a3c9e9ea5627224cc4ddac061df42d38bdc74b2ae554",
                 sha256(AgentPromptAssembler.SYSTEM_PROMPT));
+    }
+
+    /** 主聊和侧聊共用此 Persona；固定简短链接约束，避免各入口分叉或要求每次列出文件。 */
+    @Test
+    void guidesKnownFileLinksWithoutAddingRoutineInventories() {
+        String prompt = AgentPromptAssembler.SYSTEM_PROMPT;
+
+        assertTrue(prompt.contains("link each verified path in ordinary prose and never invent paths"));
+        assertTrue(prompt.contains("Prefer workspace-relative links; include only verified line numbers"));
+        assertTrue(prompt.contains("[src/file.ts:12](src/file.ts#L12) or #L12C3"));
+        assertTrue(prompt.contains("For absolute paths, use valid file:// links"));
+        assertTrue(prompt.contains("URL-encode spaces and non-ASCII characters in targets"));
+        assertTrue(prompt.contains("do not add a file list just to show links"));
     }
 
     /** 每个非空章节只在动态 System 渲染一次，并保持确定性装配顺序。 */

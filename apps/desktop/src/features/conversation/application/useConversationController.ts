@@ -22,7 +22,11 @@ const MAX_THREAD_SNAPSHOT_PAGES = 128;
 const MAX_THREAD_SNAPSHOT_READ_ATTEMPTS = 3;
 const AUTOMATIC_RESYNC_INITIAL_DELAY_MS = 500;
 const AUTOMATIC_RESYNC_MAX_DELAY_MS = 5_000;
-const EMPTY_CONVERSATION_THREADS: ConversationThread[] = [];
+
+/** 项目按 id 隔离目录，所有 session thread 共用一个服务端 kind-filtered 列表 scope。 */
+function catalogScopeKey(workspace: WorkspaceProjection | undefined): string {
+  return workspace?.kind === "project" ? workspace.workspaceId : "session";
+}
 
 /** thread/read 的本地 fence 绑定请求发出时已确认的 workspace、generation 和 server instance。 */
 interface ThreadSnapshotReadFence {
@@ -114,6 +118,8 @@ export interface ConversationController {
   create(): Promise<void>;
   select(threadId: string): Promise<void>;
   search(query: string): Promise<ConversationThread[]>;
+  /** 完整重读当前 Thread，并把同 revision 权威快照收敛到 Timeline 后返回 CAS revision。 */
+  readThreadRevision(threadId: string): Promise<number>;
   rename(threadId: string, title: string): Promise<void>;
   pin(threadId: string, pinned: boolean): Promise<void>;
   archive(threadId: string): Promise<ConversationArchiveUndo | undefined>;
@@ -184,14 +190,16 @@ function compactedMessage(
  * Thread 会让用户误点后发生隐式项目切换，因此切换范围时必须整体替换目录投影。
  */
 function workspaceThreads(
-  workspaceId: string,
+  scopeKey: string,
   scoped: readonly ConversationThread[],
 ): ConversationThread[] {
   const seen = new Set<string>();
   const merged: ConversationThread[] = [];
   for (const thread of scoped) {
     if (
-      thread.workspaceId !== workspaceId ||
+      (scopeKey === "session"
+        ? thread.workspaceKind !== "session"
+        : thread.workspaceId !== scopeKey) ||
       thread.status === "archived" ||
       seen.has(thread.threadId)
     )
@@ -209,19 +217,30 @@ function workspaceThreads(
  */
 function mergeThreadListResponse(
   current: ConversationThread[],
-  workspaceId: string,
+  scopeKey: string,
   scoped: ConversationThread[],
   issuedEpoch: number,
-  localCreationEpochs: ReadonlyMap<string, { workspaceId: string; epoch: number }>,
+  localCreationEpochs: ReadonlyMap<string, { scopeKey: string; epoch: number }>,
 ): ConversationThread[] {
   const currentById = new Map(
     current
-      .filter((thread) => thread.workspaceId === workspaceId && thread.status === "active")
+      .filter(
+        (thread) =>
+          (scopeKey === "session"
+            ? thread.workspaceKind === "session"
+            : thread.workspaceId === scopeKey) && thread.status === "active",
+      )
       .map((thread) => [thread.threadId, thread]),
   );
   const merged: ConversationThread[] = [];
   for (const incoming of scoped) {
-    if (incoming.workspaceId !== workspaceId || incoming.status !== "active") continue;
+    if (
+      (scopeKey === "session"
+        ? incoming.workspaceKind !== "session"
+        : incoming.workspaceId !== scopeKey) ||
+      incoming.status !== "active"
+    )
+      continue;
     const existing = currentById.get(incoming.threadId);
     // 同 revision 可能只是迟到的 list/page 响应；只接受严格前进，避免元数据倒退。
     merged.push(
@@ -234,12 +253,12 @@ function mergeThreadListResponse(
     const creation = localCreationEpochs.get(existing.threadId);
     if (
       existing.status === "active" &&
-      creation?.workspaceId === workspaceId &&
+      creation?.scopeKey === scopeKey &&
       creation.epoch > issuedEpoch
     )
       merged.unshift(existing);
   }
-  return workspaceThreads(workspaceId, merged);
+  return workspaceThreads(scopeKey, merged);
 }
 
 /**
@@ -248,7 +267,7 @@ function mergeThreadListResponse(
  */
 function mergeSearchThreads(
   current: ConversationThread[],
-  workspaceId: string,
+  scopeKey: string,
   matches: readonly ConversationThread[],
 ): ConversationThread[] {
   const byId = new Map(matches.map((thread) => [thread.threadId, thread]));
@@ -259,7 +278,9 @@ function mergeSearchThreads(
   const existing = new Set(merged.map((thread) => thread.threadId));
   for (const thread of matches) {
     if (
-      thread.workspaceId !== workspaceId ||
+      (scopeKey === "session"
+        ? thread.workspaceKind !== "session"
+        : thread.workspaceId !== scopeKey) ||
       thread.status !== "active" ||
       existing.has(thread.threadId)
     )
@@ -333,12 +354,13 @@ export function useConversationController({
   const compactionInFlightRef = useRef(false);
   const creationInFlightRef = useRef<Promise<void> | undefined>(undefined);
   const directoryMutationEpochRef = useRef(0);
-  const localCreationEpochsRef = useRef(new Map<string, { workspaceId: string; epoch: number }>());
+  const localCreationEpochsRef = useRef(new Map<string, { scopeKey: string; epoch: number }>());
   const threadMutationGuardsRef = useRef(new Set<string>());
   const workspaceHistoryCacheRef = useRef(new Map<string, WorkspaceHistoryCache>());
   const workspaceHistoryCacheClockRef = useRef(0);
   const workspaceRef = useRef(workspace);
   const historyWorkspaceIdRef = useRef<string | undefined>(undefined);
+  const historyScopeKeyRef = useRef<string | undefined>(undefined);
   const historyWorkspaceRevisionRef = useRef<number | undefined>(undefined);
   const historyModelAvailableRef = useRef(false);
   const historyRuntimeAdmissionRef = useRef<string | undefined>(undefined);
@@ -354,6 +376,10 @@ export function useConversationController({
   const automaticResyncActiveRequestRef = useRef(new Map<string, number>());
   const automaticResyncScopeRef = useRef<string | undefined>(undefined);
   const manualWorkspaceTargetRef = useRef<string | undefined>(undefined);
+  // React may commit an activated workspace after the native call and snapshot read finish; keep the
+  // view transition intent independently from the request fence until the matching layout effect consumes it.
+  const pendingWorkspaceActivationRef = useRef<string | undefined>(undefined);
+  const pendingThreadActivationRef = useRef<string | undefined>(undefined);
   const manualThreadTargetRef = useRef<string | undefined>(undefined);
   const currentThreadIdRef = useRef(currentThreadId);
   const threadsRef = useRef(threads);
@@ -424,14 +450,25 @@ export function useConversationController({
   const backgroundErrorScope = `${workspace?.workspaceId ?? "none"}:${currentTimelineFence}:${currentThreadId ?? "none"}`;
 
   /**
-   * 判断前台历史结果是否仍属于当前 workspace 和最新 request；workspace 切换、卸载或
-   * 后续用户选择都会让旧 continuation 失效。
+   * 判断 snapshot 操作是否仍属于 active workspace 和最新 request；新建/跨 workspace 激活
+   * 已由 native 确认但 React 尚未 commit 时，精确 manual target 临时承担同一 fence。
    */
-  const isCurrentRequest = useCallback(
-    (request: number, workspaceId: string): boolean =>
+  const isCurrentRequest = useCallback((request: number, workspaceId: string): boolean => {
+    return (
       mountedRef.current &&
       foregroundRequestRef.current === request &&
-      workspaceRef.current?.workspaceId === workspaceId,
+      (workspaceRef.current?.workspaceId === workspaceId ||
+        manualWorkspaceTargetRef.current === workspaceId ||
+        pendingWorkspaceActivationRef.current === workspaceId)
+    );
+  }, []);
+
+  /** session catalog 不依赖当前激活的是哪个 session workspace，只受列表 scope 与 request 栅栏约束。 */
+  const isCurrentCatalogRequest = useCallback(
+    (request: number, scopeKey: string): boolean =>
+      mountedRef.current &&
+      foregroundRequestRef.current === request &&
+      catalogScopeKey(workspaceRef.current) === scopeKey,
     [],
   );
 
@@ -496,7 +533,9 @@ export function useConversationController({
     const state = useTimelineStore.getState();
     if (
       !mountedRef.current ||
-      workspaceRef.current?.workspaceId !== fence.workspaceId ||
+      (workspaceRef.current?.workspaceId !== fence.workspaceId &&
+        manualWorkspaceTargetRef.current !== fence.workspaceId &&
+        pendingWorkspaceActivationRef.current !== fence.workspaceId) ||
       state.handshake.phase !== "ready" ||
       state.handshake.generation !== fence.generation ||
       state.serverInstanceId !== fence.serverInstanceId
@@ -559,23 +598,23 @@ export function useConversationController({
   );
 
   /**
-   * 保存当前 workspace 的目录和选择；条目带 runtime admission，服务端重启后不会复用旧快照。
+   * 保存当前列表 scope 的目录和选择；session cache 按 kind 聚合，重启后仍需权威 list/read。
    * 淘汰目录缓存时只把本控制器曾持有的 Thread 候选交给 Timeline 的安全清理入口。
    */
   const rememberWorkspaceHistory = useCallback(
     (
-      workspaceId: string | undefined,
+      scopeKey: string | undefined,
       sourceThreads: readonly ConversationThread[],
       selectedThreadId: string | undefined,
     ): void => {
       const admission = historyRuntimeAdmissionRef.current;
-      if (workspaceId === undefined || admission === undefined) return;
-      const scopedThreads = workspaceThreads(workspaceId, sourceThreads);
+      if (scopeKey === undefined || admission === undefined) return;
+      const scopedThreads = workspaceThreads(scopeKey, sourceThreads);
       const currentThreadId = scopedThreads.some((thread) => thread.threadId === selectedThreadId)
         ? selectedThreadId
         : undefined;
       const cache = workspaceHistoryCacheRef.current;
-      cache.set(workspaceId, {
+      cache.set(scopeKey, {
         threads: scopedThreads,
         currentThreadId,
         admission,
@@ -584,7 +623,7 @@ export function useConversationController({
       while (cache.size > MAX_WORKSPACE_HISTORY_CACHES) {
         const oldest = [...cache.entries()].reduce<[string, WorkspaceHistoryCache] | undefined>(
           (candidate, entry) => {
-            if (entry[0] === workspaceId) return candidate;
+            if (entry[0] === scopeKey) return candidate;
             return candidate === undefined || entry[1].lastUsed < candidate[1].lastUsed
               ? entry
               : candidate;
@@ -606,13 +645,13 @@ export function useConversationController({
    * 让恢复路径回到权威 thread/list 与 thread/read，而不是展示旧 server 的正文。
    */
   const cachedWorkspaceHistory = useCallback(
-    (workspaceId: string): WorkspaceHistoryCache | undefined => {
+    (scopeKey: string): WorkspaceHistoryCache | undefined => {
       const cache = workspaceHistoryCacheRef.current;
-      const entry = cache.get(workspaceId);
+      const entry = cache.get(scopeKey);
       const admission = historyRuntimeAdmissionRef.current;
       if (entry === undefined) return undefined;
       if (admission === undefined || entry.admission !== admission) {
-        cache.delete(workspaceId);
+        cache.delete(scopeKey);
         return undefined;
       }
       entry.lastUsed = ++workspaceHistoryCacheClockRef.current;
@@ -623,18 +662,20 @@ export function useConversationController({
 
   /**
    * 创建 durable Thread 后立即读取 authoritative snapshot；只有 snapshot 通过 generation
-   * gate 才向 UI 暴露 threadId，避免出现目录有行但 timeline 不可用的半状态。
+   * gate 才向 UI 暴露 threadId；session create 不携带当前 cwd，ACK 后先激活新 workspace id。
    */
   const createAndRestore = useCallback(
     async (
-      selected: WorkspaceProjection,
+      selected: WorkspaceProjection | undefined,
       selection: ConversationModelSelection | undefined,
       request: number,
+      scopeKey: string,
     ): Promise<ConversationThread | undefined> => {
       if (selection === undefined) return undefined;
-      const fence = captureSnapshotReadFence(selected.workspaceId);
+      const isProject = selected?.kind === "project";
+      const fence = isProject ? captureSnapshotReadFence(selected.workspaceId) : undefined;
       const created = await history.threadCreate({
-        ...(selected.kind === "project" ? { cwd: selected.rootPath } : {}),
+        ...(isProject ? { cwd: selected.rootPath } : {}),
         title: "新对话",
         providerId: selection.providerId,
         modelId: selection.modelId,
@@ -642,96 +683,146 @@ export function useConversationController({
         accessMode: accessModeRef.current,
         collaborationMode: "default",
       });
-      if (!isCurrentRequest(request, selected.workspaceId)) return undefined;
-      if (created.workspaceId !== selected.workspaceId)
-        throw new Error("created thread belongs to another workspace");
+      if (!isCurrentCatalogRequest(request, scopeKey)) return undefined;
+      if (isProject) {
+        if (created.workspaceId !== selected.workspaceId || created.workspaceKind !== "project")
+          throw new Error("created thread belongs to another workspace");
+      } else {
+        if (created.workspaceKind !== "session")
+          throw new Error("session create returned a non-session thread");
+        manualWorkspaceTargetRef.current = created.workspaceId;
+        pendingWorkspaceActivationRef.current = created.workspaceId;
+        manualThreadTargetRef.current = created.threadId;
+        pendingThreadActivationRef.current = created.threadId;
+        const activated = await activateWorkspace(created.workspaceId);
+        if (
+          !isCurrentCatalogRequest(request, scopeKey) ||
+          activated?.workspaceId !== created.workspaceId ||
+          activated.kind !== "session"
+        ) {
+          if (pendingWorkspaceActivationRef.current === created.workspaceId)
+            pendingWorkspaceActivationRef.current = undefined;
+          if (pendingThreadActivationRef.current === created.threadId)
+            pendingThreadActivationRef.current = undefined;
+          return undefined;
+        }
+      }
       if (
         created.preferences === null ||
         created.preferences.providerId !== selection.providerId ||
         created.preferences.modelId !== selection.modelId
       )
         throw new Error("created thread belongs to another model selection");
-      const snapshot = await readCompleteThreadSnapshot(created.threadId, fence);
-      if (!isCurrentRequest(request, selected.workspaceId)) return undefined;
-      if (!applySnapshot(snapshot, selected.workspaceId, created.threadId)) {
+      const workspaceId = created.workspaceId;
+      const snapshotFence = fence ?? captureSnapshotReadFence(workspaceId);
+      const snapshot = await readCompleteThreadSnapshot(created.threadId, snapshotFence);
+      if (!isCurrentRequest(request, workspaceId)) return undefined;
+      if (!applySnapshot(snapshot, workspaceId, created.threadId)) {
         throw new Error("created thread snapshot was not applied");
       }
       return created;
     },
     [
       applySnapshot,
+      activateWorkspace,
       captureSnapshotReadFence,
       history,
+      isCurrentCatalogRequest,
       isCurrentRequest,
       readCompleteThreadSnapshot,
     ],
   );
 
   /**
-   * 恢复 workspace 的服务端排序历史；list/read/create 共用一个 request token，快速切换
-   * 不会让旧 promise 覆盖新 workspace 的 sidebar 或 timeline。
+   * 项目列表维持原有自动恢复；session kind 列表只聚合目录，不在空白类别自动选中或创建会话。
    */
   const loadWorkspaceHistory = useCallback(
     async (
-      selected: WorkspaceProjection,
+      selected: WorkspaceProjection | undefined,
       selection: ConversationModelSelection | undefined,
       preferredThreadId: string | undefined,
+      scopeKey: string,
     ): Promise<void> => {
       const request = foregroundRequestRef.current + 1;
       foregroundRequestRef.current = request;
       setBusy(true);
       setError(undefined);
       try {
-        const listed = await history.threadList({ workspaceId: selected.workspaceId, limit: 200 });
-        if (!isCurrentRequest(request, selected.workspaceId)) return;
-        if (listed.items.some((thread) => thread.workspaceId !== selected.workspaceId)) {
-          setError("历史会话数据无法恢复，请重新选择项目。 ");
+        const listed = await history.threadList(
+          scopeKey === "session"
+            ? { workspaceKind: "session", limit: 200 }
+            : { workspaceId: scopeKey, limit: 200 },
+        );
+        if (!isCurrentCatalogRequest(request, scopeKey)) return;
+        if (
+          listed.items.some((thread) =>
+            scopeKey === "session"
+              ? thread.workspaceKind !== "session"
+              : thread.workspaceId !== scopeKey,
+          )
+        ) {
+          setError("历史会话数据无法恢复，请重新选择工作范围。 ");
           return;
         }
-        const scopedThreads = workspaceThreads(selected.workspaceId, listed.items);
+        const scopedThreads = workspaceThreads(scopeKey, listed.items);
         threadsRef.current = scopedThreads;
         setThreads(scopedThreads);
         const currentThread = preferredThreadId ?? currentThreadIdRef.current;
-        const first =
-          scopedThreads.find((thread) => thread.threadId === currentThread) ?? scopedThreads[0];
-        if (first !== undefined) {
-          if (currentThreadIdRef.current !== first.threadId) {
-            currentThreadIdRef.current = first.threadId;
-            setCurrentThreadId(first.threadId);
+        const first = scopedThreads.find((thread) => thread.threadId === currentThread);
+        if (scopeKey === "session") {
+          if (selected === undefined) {
+            // 分类空白时只展示聚合历史；隐藏 A 的 Timeline/Composer owner，避免无 workspace 仍可操作。
+            currentThreadIdRef.current = undefined;
+            setCurrentThreadId(undefined);
+            return;
+          }
+          if (first === undefined) {
+            currentThreadIdRef.current = undefined;
+            setCurrentThreadId(undefined);
+            return;
+          }
+          if (first.workspaceId !== selected.workspaceId) return;
+        }
+        const target = first ?? (scopeKey === "session" ? undefined : scopedThreads[0]);
+        if (target !== undefined) {
+          if (currentThreadIdRef.current !== target.threadId) {
+            currentThreadIdRef.current = target.threadId;
+            setCurrentThreadId(target.threadId);
           }
           const loadedRevision =
-            useTimelineStore.getState().threadRevisionByThread[first.threadId] ?? -1;
+            useTimelineStore.getState().threadRevisionByThread[target.threadId] ?? -1;
           if (
-            canReuseLoadedThread(first.threadId, selected.workspaceId) &&
-            loadedRevision >= first.revision
+            canReuseLoadedThread(target.threadId, target.workspaceId) &&
+            loadedRevision >= target.revision
           )
             return;
           const snapshot = await readCompleteThreadSnapshot(
-            first.threadId,
-            captureSnapshotReadFence(selected.workspaceId),
+            target.threadId,
+            captureSnapshotReadFence(target.workspaceId),
           );
-          if (!isCurrentRequest(request, selected.workspaceId)) return;
-          if (!applySnapshot(snapshot, selected.workspaceId, first.threadId)) {
-            setError("最近的会话无法恢复，请重新选择项目。 ");
+          if (!isCurrentRequest(request, target.workspaceId)) return;
+          if (!applySnapshot(snapshot, target.workspaceId, target.threadId)) {
+            setError("最近的会话无法恢复，请重新选择工作范围。 ");
             return;
           }
           setBackgroundError(undefined);
-          currentThreadIdRef.current = first.threadId;
-          setCurrentThreadId(first.threadId);
+          currentThreadIdRef.current = target.threadId;
+          setCurrentThreadId(target.threadId);
           return;
         }
+        if (scopeKey === "session") return;
+        if (selected === undefined) return;
         currentThreadIdRef.current = undefined;
         setCurrentThreadId(undefined);
-        const created = await createAndRestore(selected, selection, request);
-        if (!isCurrentRequest(request, selected.workspaceId) || created === undefined) return;
-        setThreads(workspaceThreads(selected.workspaceId, [created]));
+        const created = await createAndRestore(selected, selection, request, scopeKey);
+        if (!isCurrentRequest(request, created?.workspaceId ?? "") || created === undefined) return;
+        setThreads(workspaceThreads(scopeKey, [created]));
         currentThreadIdRef.current = created.threadId;
         setCurrentThreadId(created.threadId);
       } catch {
-        if (isCurrentRequest(request, selected.workspaceId))
-          setError("历史会话暂时不可用，请重试。 ");
+        if (isCurrentCatalogRequest(request, scopeKey)) setError("历史会话暂时不可用，请重试。 ");
       } finally {
-        if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
+        if (isCurrentCatalogRequest(request, scopeKey)) setBusy(false);
       }
     },
     [
@@ -739,6 +830,7 @@ export function useConversationController({
       captureSnapshotReadFence,
       createAndRestore,
       history,
+      isCurrentCatalogRequest,
       isCurrentRequest,
       readCompleteThreadSnapshot,
     ],
@@ -751,39 +843,54 @@ export function useConversationController({
   const createWithSelection = useCallback(
     async (selection: ConversationModelSelection): Promise<void> => {
       const selected = workspaceRef.current;
-      if (selected === undefined) return;
+      const scopeKey = catalogScopeKey(selected);
       const request = foregroundRequestRef.current + 1;
       foregroundRequestRef.current = request;
       setBusy(true);
       setError(undefined);
       try {
-        const created = await createAndRestore(selected, selection, request);
-        if (!isCurrentRequest(request, selected.workspaceId) || created === undefined) return;
+        const created = await createAndRestore(selected, selection, request, scopeKey);
+        if (
+          created === undefined ||
+          !isCurrentRequest(request, created.workspaceId) ||
+          !isCurrentCatalogRequest(request, scopeKey)
+        )
+          return;
         const creationEpoch = directoryMutationEpochRef.current + 1;
         directoryMutationEpochRef.current = creationEpoch;
         localCreationEpochsRef.current.set(created.threadId, {
-          workspaceId: selected.workspaceId,
+          scopeKey,
           epoch: creationEpoch,
         });
         setThreads((current) =>
-          workspaceThreads(selected.workspaceId, [
+          workspaceThreads(scopeKey, [
             created,
             ...current.filter(
               (thread) =>
-                thread.workspaceId === selected.workspaceId && thread.threadId !== created.threadId,
+                (scopeKey === "session"
+                  ? thread.workspaceKind === "session"
+                  : thread.workspaceId === scopeKey) && thread.threadId !== created.threadId,
             ),
           ]),
         );
         currentThreadIdRef.current = created.threadId;
         setCurrentThreadId(created.threadId);
       } catch {
-        if (isCurrentRequest(request, selected.workspaceId))
-          setError("新会话暂时无法创建，请重试。 ");
+        if (
+          pendingWorkspaceActivationRef.current !== undefined &&
+          workspaceRef.current?.workspaceId !== pendingWorkspaceActivationRef.current
+        ) {
+          pendingWorkspaceActivationRef.current = undefined;
+          pendingThreadActivationRef.current = undefined;
+        }
+        if (isCurrentCatalogRequest(request, scopeKey)) setError("新会话暂时无法创建，请重试。 ");
       } finally {
-        if (isCurrentRequest(request, selected.workspaceId)) setBusy(false);
+        manualWorkspaceTargetRef.current = undefined;
+        manualThreadTargetRef.current = undefined;
+        if (isCurrentCatalogRequest(request, scopeKey)) setBusy(false);
       }
     },
-    [createAndRestore, isCurrentRequest],
+    [createAndRestore, isCurrentCatalogRequest, isCurrentRequest],
   );
 
   /**
@@ -818,19 +925,24 @@ export function useConversationController({
     async (threadId: string): Promise<void> => {
       const target = threadsRef.current.find((thread) => thread.threadId === threadId);
       let selected = workspaceRef.current;
-      if (target === undefined || selected === undefined) return;
-      const workspaceChanged = target.workspaceId !== selected.workspaceId;
+      if (target === undefined) return;
+      const workspaceChanged = target.workspaceId !== selected?.workspaceId;
       if (workspaceChanged) {
         manualWorkspaceTargetRef.current = target.workspaceId;
+        pendingWorkspaceActivationRef.current = target.workspaceId;
         manualThreadTargetRef.current = threadId;
+        pendingThreadActivationRef.current = threadId;
         selected = await activateWorkspace(target.workspaceId);
         if (selected === undefined) {
           manualWorkspaceTargetRef.current = undefined;
+          pendingWorkspaceActivationRef.current = undefined;
           manualThreadTargetRef.current = undefined;
+          pendingThreadActivationRef.current = undefined;
           setError("会话所属项目已不可用。 ");
           return;
         }
       }
+      if (selected === undefined) return;
       const request = foregroundRequestRef.current + 1;
       foregroundRequestRef.current = request;
       setError(undefined);
@@ -839,12 +951,20 @@ export function useConversationController({
         setBusy(false);
         setBackgroundError(undefined);
         if (currentThreadIdRef.current !== threadId) {
-          setThreads((current) =>
-            workspaceThreads(
-              selected.workspaceId,
-              current.filter((thread) => thread.workspaceId === selected.workspaceId),
-            ),
-          );
+          setThreads((current) => {
+            const scopeKey = catalogScopeKey(selected);
+            const scoped = workspaceThreads(
+              scopeKey,
+              current.filter((thread) =>
+                selected.kind === "project"
+                  ? thread.workspaceId === selected.workspaceId
+                  : thread.workspaceKind === "session",
+              ),
+            );
+            return scoped.some((thread) => thread.threadId === threadId)
+              ? scoped
+              : workspaceThreads(scopeKey, [target, ...scoped]);
+          });
           setCurrentThreadId(threadId);
         }
         manualWorkspaceTargetRef.current = undefined;
@@ -864,12 +984,20 @@ export function useConversationController({
         }
         setBackgroundError(undefined);
         if (!isCurrentRequest(request, selected.workspaceId)) return;
-        setThreads((current) =>
-          workspaceThreads(
-            selected.workspaceId,
-            current.filter((thread) => thread.workspaceId === selected.workspaceId),
-          ),
-        );
+        setThreads((current) => {
+          const scopeKey = catalogScopeKey(selected);
+          const scoped = workspaceThreads(
+            scopeKey,
+            current.filter((thread) =>
+              selected.kind === "project"
+                ? thread.workspaceId === selected.workspaceId
+                : thread.workspaceKind === "session",
+            ),
+          );
+          return scoped.some((thread) => thread.threadId === threadId)
+            ? scoped
+            : workspaceThreads(scopeKey, [target, ...scoped]);
+        });
         setCurrentThreadId(threadId);
       } catch {
         if (isCurrentRequest(request, selected.workspaceId))
@@ -896,18 +1024,26 @@ export function useConversationController({
   const search = useCallback(
     async (query: string): Promise<ConversationThread[]> => {
       const selected = workspaceRef.current;
-      if (selected === undefined) return [];
+      const scopeKey = catalogScopeKey(selected);
       const result = await history.threadSearch({
-        workspaceId: selected.workspaceId,
+        ...(scopeKey === "session"
+          ? { workspaceKind: "session" as const }
+          : { workspaceId: scopeKey }),
         query: query.trim(),
         limit: 100,
       });
-      if (workspaceRef.current?.workspaceId !== selected.workspaceId) return [];
-      if (result.items.some((thread) => thread.workspaceId !== selected.workspaceId)) {
-        throw new Error("thread search crossed workspace boundary");
+      if (catalogScopeKey(workspaceRef.current) !== scopeKey) return [];
+      if (
+        result.items.some((thread) =>
+          scopeKey === "session"
+            ? thread.workspaceKind !== "session"
+            : thread.workspaceId !== scopeKey,
+        )
+      ) {
+        throw new Error("thread search crossed catalog scope boundary");
       }
       setThreads((current) => {
-        const next = mergeSearchThreads(current, selected.workspaceId, result.items);
+        const next = mergeSearchThreads(current, scopeKey, result.items);
         threadsRef.current = next;
         return next;
       });
@@ -960,6 +1096,23 @@ export function useConversationController({
     [applySnapshot, assertSnapshotReadFence, captureSnapshotReadFence, readCompleteThreadSnapshot],
   );
 
+  /** 恢复入口只允许读取并应用仍在前台的 Thread，避免用旧页面的无效快照发起 CAS。 */
+  const readCurrentThreadRevision = useCallback(
+    async (threadId: string): Promise<number> => {
+      if (currentThreadIdRef.current !== threadId)
+        throw new Error("current conversation changed before thread revision read");
+      const revision = await rereadThreadRevision(threadId);
+      const timeline = useTimelineStore.getState();
+      if (
+        currentThreadIdRef.current !== threadId ||
+        (timeline.threadRevisionByThread[threadId] ?? -1) < revision
+      )
+        throw new Error("current conversation revision did not converge");
+      return revision;
+    },
+    [rereadThreadRevision],
+  );
+
   /** 目录类 CAS 只允许一次权威重读和有界重试，持续竞争会原样失败给 UI。 */
   const retryThreadMutation = useCallback(
     async <T>(
@@ -997,6 +1150,9 @@ export function useConversationController({
             threadsRef.current = next;
             return next;
           });
+          // threadSeen 是 Thread CAS mutation；它的 ACK 可能在终态事件后再推进一版 revision，
+          // 因此要同步 Timeline 的 revision fence，避免下一次恢复操作继续使用旧终态版本。
+          useTimelineStore.getState().recordThreadMetadataRevision(threadId, seen.revision);
         }
         return true;
       } catch {
@@ -1014,14 +1170,18 @@ export function useConversationController({
   /** 重新读取当前 Workspace 的 active 列表，确保 Pin 排序完全服从服务端 pinned_at 规则。 */
   const refreshActiveThreads = useCallback(async (): Promise<void> => {
     const selected = workspaceRef.current;
-    if (selected === undefined) return;
+    const scopeKey = catalogScopeKey(selected);
     const issuedEpoch = directoryMutationEpochRef.current;
-    const listed = await history.threadList({ workspaceId: selected.workspaceId, limit: 200 });
-    if (!mountedRef.current || workspaceRef.current?.workspaceId !== selected.workspaceId) return;
+    const listed = await history.threadList(
+      scopeKey === "session"
+        ? { workspaceKind: "session", limit: 200 }
+        : { workspaceId: scopeKey, limit: 200 },
+    );
+    if (!mountedRef.current || catalogScopeKey(workspaceRef.current) !== scopeKey) return;
     setThreads((current) => {
       const next = mergeThreadListResponse(
         current,
-        selected.workspaceId,
+        scopeKey,
         listed.items,
         issuedEpoch,
         localCreationEpochsRef.current,
@@ -1030,7 +1190,7 @@ export function useConversationController({
       return next;
     });
     for (const [threadId, creation] of localCreationEpochsRef.current) {
-      if (creation.workspaceId === selected.workspaceId && creation.epoch <= issuedEpoch)
+      if (creation.scopeKey === scopeKey && creation.epoch <= issuedEpoch)
         localCreationEpochsRef.current.delete(threadId);
     }
   }, [history]);
@@ -1343,25 +1503,31 @@ export function useConversationController({
   }, []);
 
   /**
-   * 自动/人工标题事件只有同时匹配 runtime generation、server instance、当前 Workspace 且
-   * revision 单调前进时才更新目录；缺失目录项或缺失 v3 偏好时回读权威列表，不凭事件补造实体。
+   * 标题事件按当前目录 scope 校验；session 分类接受任一 session root 的事件并回读聚合列表，
+   * 项目分类仍严格限制 workspaceId，绝不从 event 单独补造 Thread。
    */
   useEffect(() => {
     if (metadataEvent?.method !== "thread/metadata-changed") return undefined;
     const params = metadataEvent.params;
     const selected = workspaceRef.current;
+    const scopeKey = catalogScopeKey(selected);
     const runtime = runtimeStateRef.current;
     if (
-      selected === undefined ||
       runtime === undefined ||
       !["ready", "busy"].includes(runtime.status) ||
       params.generation !== runtime.generation ||
       params.serverInstanceId !== runtime.serverInstanceId ||
-      params.workspaceId !== selected.workspaceId
+      (scopeKey !== "session" && params.workspaceId !== scopeKey)
     )
       return undefined;
 
     const existing = threadsRef.current.find((thread) => thread.threadId === params.threadId);
+    if (
+      existing !== undefined &&
+      (existing.workspaceId !== params.workspaceId ||
+        (scopeKey === "session" && existing.workspaceKind !== "session"))
+    )
+      return undefined;
     if (existing !== undefined && params.revision <= existing.revision) return undefined;
     if (existing !== undefined && existing.preferences !== null) {
       setThreads((current) => {
@@ -1392,16 +1558,24 @@ export function useConversationController({
     let active = true;
     const issuedEpoch = directoryMutationEpochRef.current;
     void history
-      .threadList({ workspaceId: selected.workspaceId, limit: 200 })
+      .threadList(
+        scopeKey === "session"
+          ? { workspaceKind: "session", limit: 200 }
+          : { workspaceId: scopeKey, limit: 200 },
+      )
       .then((listed) => {
         const currentRuntime = runtimeStateRef.current;
         if (
           !active ||
           !mountedRef.current ||
-          workspaceRef.current?.workspaceId !== selected.workspaceId ||
+          catalogScopeKey(workspaceRef.current) !== scopeKey ||
           currentRuntime?.generation !== params.generation ||
           currentRuntime.serverInstanceId !== params.serverInstanceId ||
-          listed.items.some((thread) => thread.workspaceId !== selected.workspaceId)
+          listed.items.some((thread) =>
+            scopeKey === "session"
+              ? thread.workspaceKind !== "session"
+              : thread.workspaceId !== scopeKey,
+          )
         )
           return;
         const authoritative = listed.items.find((thread) => thread.threadId === params.threadId);
@@ -1409,7 +1583,7 @@ export function useConversationController({
         setThreads((current) => {
           const next = mergeThreadListResponse(
             current,
-            selected.workspaceId,
+            scopeKey,
             listed.items,
             issuedEpoch,
             localCreationEpochsRef.current,
@@ -1418,7 +1592,7 @@ export function useConversationController({
           return next;
         });
         for (const [threadId, creation] of localCreationEpochsRef.current) {
-          if (creation.workspaceId === selected.workspaceId && creation.epoch <= issuedEpoch)
+          if (creation.scopeKey === scopeKey && creation.epoch <= issuedEpoch)
             localCreationEpochsRef.current.delete(threadId);
         }
         useTimelineStore
@@ -1499,31 +1673,35 @@ export function useConversationController({
     setCompaction({ phase: "error", ...feedback });
   }, [observedCompaction]);
 
-  /** 每次目录或选择提交后更新 workspace 缓存，保证切回项目时可直接恢复最后可见投影。 */
+  /** 每次目录或选择提交后更新当前列表 scope 缓存；session cache 保留所有会话行。 */
   useEffect(() => {
-    const currentWorkspaceId = workspaceRef.current?.workspaceId;
-    if (currentWorkspaceId === undefined || historyWorkspaceIdRef.current !== currentWorkspaceId)
-      return;
-    rememberWorkspaceHistory(currentWorkspaceId, threads, currentThreadId);
+    const currentScopeKey = catalogScopeKey(workspaceRef.current);
+    if (historyScopeKeyRef.current !== currentScopeKey) return;
+    rememberWorkspaceHistory(currentScopeKey, threads, currentThreadId);
   }, [currentThreadId, rememberWorkspaceHistory, threads]);
 
   /**
-   * workspace commit、首次模型选择或新的 ready generation 到达后恢复历史；workspace 切换先在
-   * layout 阶段投影缓存，避免新 workspace 首帧暂时挂着旧 Thread，目录校验则在后台完成。
-   * admission key 不含 ready/busy 状态，避免 Turn 运行导致目录反复重载；手动跨项目 Thread 选择
-   * 复用同一缓存投影并自行恢复目标 snapshot，因此跳过默认 first-thread 加载。
+   * workspace/scope commit、首次模型选择或 ready generation 到达后恢复列表；空白与活动 session
+   * 都读取 kind-filtered session catalog，只有项目首次进入才自动创建会话。
    */
   useLayoutEffect(() => {
     const nextWorkspaceId = workspace?.workspaceId;
+    const nextScopeKey = catalogScopeKey(workspace);
     if (
       creationInFlightRef.current !== undefined &&
       historyWorkspaceIdRef.current === nextWorkspaceId
-    )
+    ) {
+      // 创建与首份 snapshot 已覆盖同一 workspace 的目录变更；消费 revision 可避免创建收尾后
+      // 因被暂缓的壳层投影更新重复读取 session/project 列表，runtime 与模型变化仍由各自 fence 处理。
+      historyWorkspaceRevisionRef.current = workspaceRevision;
       return;
+    }
 
     const previousWorkspaceId = historyWorkspaceIdRef.current;
+    const previousScopeKey = historyScopeKeyRef.current;
     const workspaceChanged = previousWorkspaceId !== nextWorkspaceId;
-    const firstWorkspaceAdmission = previousWorkspaceId === undefined;
+    const scopeChanged = previousScopeKey !== nextScopeKey;
+    const firstWorkspaceAdmission = previousScopeKey === undefined;
     const runtimeAdmissionChanged =
       historyRuntimeAdmission !== undefined &&
       historyRuntimeAdmissionRef.current !== undefined &&
@@ -1531,9 +1709,12 @@ export function useConversationController({
     const runtimeBecameAvailable =
       historyRuntimeAdmission !== undefined && historyRuntimeAdmissionRef.current === undefined;
     const workspaceRevisionChanged = historyWorkspaceRevisionRef.current !== workspaceRevision;
+    const manualWorkspaceActivation =
+      workspace !== undefined && pendingWorkspaceActivationRef.current === workspace.workspaceId;
     const modelBecameAvailable = modelSelectionAvailable && !historyModelAvailableRef.current;
     const shouldRefresh =
       firstWorkspaceAdmission ||
+      scopeChanged ||
       workspaceChanged ||
       runtimeAdmissionChanged ||
       runtimeBecameAvailable ||
@@ -1546,33 +1727,45 @@ export function useConversationController({
     if (runtimeAdmissionChanged) {
       workspaceHistoryCacheRef.current.clear();
       useTimelineStore.getState().reset();
-    } else if (workspaceChanged && previousWorkspaceId !== undefined) {
-      rememberWorkspaceHistory(previousWorkspaceId, threadsRef.current, currentThreadIdRef.current);
+    } else if (scopeChanged && previousScopeKey !== undefined) {
+      rememberWorkspaceHistory(previousScopeKey, threadsRef.current, currentThreadIdRef.current);
     }
     if (historyRuntimeAdmission !== undefined)
       historyRuntimeAdmissionRef.current = historyRuntimeAdmission;
     historyWorkspaceIdRef.current = nextWorkspaceId;
-    foregroundRequestRef.current += 1;
+    historyScopeKeyRef.current = nextScopeKey;
+    // 新 Thread 的 session activation 是当前 create/select 的一部分，不能用 Workspace 投影
+    // 刷新抢占其 snapshot request token；普通导航仍推进 fence 以取消旧读取。
+    if (!manualWorkspaceActivation) foregroundRequestRef.current += 1;
     setError(undefined);
     setBackgroundError(undefined);
-    if (workspaceChanged || firstWorkspaceAdmission || runtimeAdmissionChanged) {
+    if (scopeChanged || workspaceChanged || firstWorkspaceAdmission || runtimeAdmissionChanged) {
       setCompaction({ phase: "idle", retryable: false });
       seenAttemptKeysRef.current.clear();
-      const cached =
-        nextWorkspaceId === undefined || runtimeAdmissionChanged
-          ? undefined
-          : cachedWorkspaceHistory(nextWorkspaceId);
-      const cachedThreads = cached?.threads ?? [];
-      const manualThreadId = manualThreadTargetRef.current;
+      const cached = runtimeAdmissionChanged ? undefined : cachedWorkspaceHistory(nextScopeKey);
+      const liveSessionThreads =
+        manualWorkspaceActivation && nextScopeKey === "session"
+          ? workspaceThreads(nextScopeKey, threadsRef.current)
+          : undefined;
+      const cachedThreads = liveSessionThreads ?? cached?.threads ?? [];
+      const manualThreadId = pendingThreadActivationRef.current;
+      // “无项目对话”是聚合列表而不是已选 Thread；空白分类必须清空 composer owner，
+      // 防止上次打开的 session 被误当作当前会话继续写入。
       const preferredThreadId =
-        manualThreadId !== undefined &&
-        cachedThreads.some((thread) => thread.threadId === manualThreadId)
-          ? manualThreadId
-          : cached?.currentThreadId;
+        workspace === undefined
+          ? undefined
+          : manualThreadId !== undefined &&
+              cachedThreads.some((thread) => thread.threadId === manualThreadId)
+            ? manualThreadId
+            : cached?.currentThreadId;
       threadsRef.current = cachedThreads;
       currentThreadIdRef.current = preferredThreadId;
       setThreads(cachedThreads);
       setCurrentThreadId(preferredThreadId);
+      if (manualWorkspaceActivation) {
+        pendingWorkspaceActivationRef.current = undefined;
+        pendingThreadActivationRef.current = undefined;
+      }
     }
     const admittedRuntime = runtimeStateRef.current;
     if (
@@ -1583,19 +1776,17 @@ export function useConversationController({
       useTimelineStore.getState().applyRuntimeStatus(admittedRuntime);
     }
     const admittedSelection = modelSelectionRef.current;
-    if (
-      workspace === undefined ||
-      admittedSelection === undefined ||
-      historyRuntimeAdmission === undefined
-    ) {
+    if (admittedSelection === undefined || historyRuntimeAdmission === undefined) {
       setBusy(false);
       return;
     }
-    if (manualWorkspaceTargetRef.current === workspace.workspaceId) {
-      setBusy(false);
-      return;
-    }
-    void loadWorkspaceHistory(workspace, admittedSelection, currentThreadIdRef.current);
+    if (manualWorkspaceActivation) return;
+    void loadWorkspaceHistory(
+      workspace,
+      admittedSelection,
+      currentThreadIdRef.current,
+      nextScopeKey,
+    );
   }, [
     cachedWorkspaceHistory,
     historyRuntimeAdmission,
@@ -1796,12 +1987,19 @@ export function useConversationController({
    * workspace prop 变化到 layout effect 之间仍可能保留上一轮 React state；返回值先按当前
    * scope 派生，避免子组件在新项目首帧看到旧 Thread 或沿用旧会话的操作能力。
    */
-  const visibleWorkspaceId = workspace?.workspaceId;
+  const visibleScopeKey = catalogScopeKey(workspace);
   const visibleThreads = useMemo(() => {
-    if (visibleWorkspaceId === undefined) return EMPTY_CONVERSATION_THREADS;
-    const scoped = threads.every((thread) => thread.workspaceId === visibleWorkspaceId)
+    const scoped = threads.every((thread) =>
+      visibleScopeKey === "session"
+        ? thread.workspaceKind === "session"
+        : thread.workspaceId === visibleScopeKey,
+    )
       ? threads
-      : threads.filter((thread) => thread.workspaceId === visibleWorkspaceId);
+      : threads.filter((thread) =>
+          visibleScopeKey === "session"
+            ? thread.workspaceKind === "session"
+            : thread.workspaceId === visibleScopeKey,
+        );
     // 没有 Timeline projection 时目录对象本身就是完整结果；同时显式消费 primitive
     // signature，使流状态变化能重新计算派生列表而不订阅高频正文对象。
     if (timelineStatusSignature === "" || scoped.length === 0) return scoped;
@@ -1823,13 +2021,13 @@ export function useConversationController({
           status === "completed" || status === "failed" ? false : thread.latestTurnSeen,
       };
     });
-  }, [threads, timelineStatusSignature, visibleWorkspaceId]);
+  }, [threads, timelineStatusSignature, visibleScopeKey]);
   const visibleCurrentThreadId = visibleThreads.some(
     (thread) => thread.threadId === currentThreadId,
   )
     ? currentThreadId
     : undefined;
-  const scopeReady = historyWorkspaceIdRef.current === workspace?.workspaceId;
+  const scopeReady = historyScopeKeyRef.current === visibleScopeKey;
   const visibleBackgroundError =
     scopeReady && backgroundError?.scope === backgroundErrorScope
       ? backgroundError.message
@@ -1848,6 +2046,7 @@ export function useConversationController({
     create,
     select,
     search,
+    readThreadRevision: readCurrentThreadRevision,
     rename,
     pin,
     archive,

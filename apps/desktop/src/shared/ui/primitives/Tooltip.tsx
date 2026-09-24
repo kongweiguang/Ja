@@ -15,7 +15,8 @@ export interface TooltipProps {
 
 /**
  * Radix 负责键盘焦点、Escape、hover 与 Portal 生命周期；Provider 留在 primitive 内，
- * 使独立 feature 与测试无需依赖 App 壳，同时仍不接受领域状态或原生回调。
+ * 使独立 feature 与测试无需依赖 App 壳，同时仍不接受领域状态或原生回调；专属标记让
+ * Popper 定位 wrapper 也不参与鼠标命中，避免说明层挡住相邻交互控件。
  */
 export function Tooltip({
   content,
@@ -31,6 +32,7 @@ export function Tooltip({
         <TooltipPrimitive.Portal>
           <TooltipPrimitive.Content
             className={cn("ja-floating-surface ja-tooltip-content", className)}
+            data-ja-tooltip-content=""
             sideOffset={sideOffset}
             collisionPadding={8}
           >

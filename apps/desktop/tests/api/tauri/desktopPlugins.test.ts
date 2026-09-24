@@ -137,6 +137,7 @@ describe("desktop capability manifest", () => {
         "notification:allow-request-permission",
         "notification:allow-notify",
         "clipboard-manager:allow-write-text",
+        "clipboard-manager:allow-read-text",
         "log:allow-log",
         "opener:allow-open-url",
         "updater:default",
@@ -147,7 +148,6 @@ describe("desktop capability manifest", () => {
       expect.arrayContaining([
         "notification:default",
         "clipboard-manager:default",
-        "clipboard-manager:allow-read-text",
         "clipboard-manager:allow-read-image",
         "opener:default",
         "opener:allow-open-path",

@@ -17,10 +17,13 @@ export type {
   AttachmentPreviewTarget,
   NativePreviewPort,
   PreviewEvent,
+  PreviewPageProjection,
   PreviewPort,
   PreviewSessionSnapshot,
   PreviewViewport,
 } from "./ports";
+export type { PreviewFileResolution, PreviewTarget } from "../domain/previewModel";
+export type { PreviewActions } from "./usePreviewController";
 export type {
   AttachmentPreviewActions,
   AttachmentPreviewController,

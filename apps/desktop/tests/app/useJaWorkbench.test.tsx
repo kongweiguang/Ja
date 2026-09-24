@@ -15,6 +15,7 @@ import { capabilityWorkbenchTab } from "@/features/workbench";
 const project: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_fixture",
+  legacySharedWorkspaceId: null,
   rootPath: "C:\\dev\\ja",
   displayName: "ja",
   trust: "trusted",
@@ -31,13 +32,37 @@ function createAdapters(): JaWorkbenchAdapters {
     load_status: "finished",
     url: "https://example.com/",
     title: "Example",
+    can_go_back: false,
+    can_go_forward: false,
     window: { label: "ja-preview", url: "https://example.com/" },
     dropped_events: 0,
   };
   const preview: NativePreviewPort = {
     recoverPending: vi.fn(async () => ({ observed: 0, recovered: 0, failed: 0, pending: 0 })),
     open: vi.fn(async () => ({ snapshot, window: snapshot.window })),
+    openBlank: vi.fn(async () => ({ snapshot, window: snapshot.window })),
+    resolveFile: vi.fn(async () => ({
+      canonicalPath: "C:\\dev\\ja\\index.html",
+      displayName: "index.html",
+      workspaceId: project.workspaceId,
+      workspaceRelativePath: "index.html",
+      withinWorkspace: true,
+      kind: "browser" as const,
+      mimeType: "text/html",
+      fileUrl: "file:///C:/dev/ja/index.html",
+      content: null,
+      truncated: false,
+      line: null,
+      column: null,
+      readOnly: true,
+    })),
+    revealFile: vi.fn(async () => undefined),
+    openFile: vi.fn(async () => ({ snapshot, window: snapshot.window })),
     navigate: vi.fn(async () => snapshot),
+    navigateFile: vi.fn(async () => snapshot),
+    goBack: vi.fn(async () => snapshot),
+    goForward: vi.fn(async () => snapshot),
+    reload: vi.fn(async () => snapshot),
     layout: vi.fn(async () => snapshot),
     close: vi.fn(async () => snapshot),
     events: vi.fn(async () => []),
@@ -57,7 +82,7 @@ describe("useJaWorkbench composition", () => {
     const adapters = createAdapters();
     const onSelectedTabChange = vi.fn();
     const previewSessionHints: PreviewSessionHintStorage = {
-      read: () => undefined,
+      read: () => [],
       remember: () => undefined,
       forget: () => undefined,
     };

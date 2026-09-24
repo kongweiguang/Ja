@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.catalog.domain.McpServerDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.McpToolDescriptor;
 import io.github.kongweiguang.ja.catalog.domain.SkillDescriptor;
 import io.github.kongweiguang.ja.catalog.port.in.CatalogUseCase;
+import io.github.kongweiguang.ja.catalog.port.in.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.attachment.domain.AttachmentMetadata;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentUseCase;
 import io.github.kongweiguang.ja.attachment.port.in.AttachmentPreviewUseCase;
@@ -20,6 +21,7 @@ import io.github.kongweiguang.ja.conversation.port.in.InteractionUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
+import io.github.kongweiguang.ja.conversation.port.in.InternalTurnStartRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
@@ -42,6 +44,7 @@ public final class RpcTestBindings {
     private static final WorkspacePathSearchUseCase NO_WORKSPACE_PATH_SEARCH =
             request -> { throw new UnsupportedOperationException("workspace path search is unavailable"); };
     private static final ThreadUseCase NO_THREADS = new UnsupportedThreads();
+    private static final ThreadMcpUseCase NO_THREAD_MCP = unsupportedThreadMcp();
     private static final TurnUseCase NO_TURNS = new UnsupportedTurns();
     private static final ApprovalUseCase NO_APPROVALS = new UnsupportedApprovals();
     private static final CatalogUseCase NO_CATALOG = new UnsupportedCatalog();
@@ -84,7 +87,7 @@ public final class RpcTestBindings {
         };
         return new RpcServiceBindings(workspaces == null ? NO_WORKSPACES : workspaces,
                 NO_WORKSPACE_PATH_SEARCH,
-                threads == null ? NO_THREADS : threads, turns == null ? NO_TURNS : turns,
+                threads == null ? NO_THREADS : threads, NO_THREAD_MCP, turns == null ? NO_TURNS : turns,
                 (command, events, cancellation) -> { throw new UnsupportedOperationException("context compaction is unavailable"); },
                 approvals == null ? NO_APPROVALS : approvals,
                 catalog == null ? NO_CATALOG : catalog,
@@ -134,6 +137,14 @@ public final class RpcTestBindings {
                 });
     }
 
+    /** 无关 RPC 夹具误查会话 MCP 状态时必须失败，避免测试暗中依赖它。 */
+    public static ThreadMcpUseCase unsupportedThreadMcp() {
+        return (ThreadMcpUseCase) Proxy.newProxyInstance(RpcTestBindings.class.getClassLoader(),
+                new Class<?>[]{ThreadMcpUseCase.class}, (proxy, method, arguments) -> {
+                    throw unsupported();
+                });
+    }
+
     /** 未声明的附件能力必须失败，避免普通 transport 测试意外接触文件系统。 */
     private static final class UnsupportedAttachments implements AttachmentUseCase, AttachmentPreviewUseCase {
         /** 未声明的导入能力失败。 */
@@ -156,8 +167,12 @@ public final class RpcTestBindings {
     private static final class UnsupportedWorkspaces implements WorkspaceUseCase {
         /** 未声明的注册能力失败。 */
         @Override public Workspace openWorkspace(OpenWorkspace request) { throw unsupported(); }
-        /** 未声明的通用工作区能力失败。 */
-        @Override public Workspace openGeneralWorkspace() { throw unsupported(); }
+        /** 未声明的 session 创建能力失败。 */
+        @Override public Workspace createSessionWorkspace(String threadId) { throw unsupported(); }
+        /** 未声明的创建补偿能力失败。 */
+        @Override public void discardUnlinkedSessionWorkspace(String workspaceId, long expectedRevision) { throw unsupported(); }
+        /** 未声明的持久目录重开能力失败。 */
+        @Override public Workspace openRegisteredWorkspace(String workspaceId) { throw unsupported(); }
         /** 未声明的列表能力失败。 */
         @Override public CursorPage<Workspace> listWorkspaces(String cursor, int limit) { throw unsupported(); }
         /** 未声明的读取能力失败。 */
@@ -170,8 +185,8 @@ public final class RpcTestBindings {
         @Override public void unregisterWorkspace(String workspaceId, long expectedRevision) { throw unsupported(); }
         /** 未声明的工作区预热能力失败。 */
         @Override public void refreshPreparedWorkspaces() { throw unsupported(); }
-        /** 未声明的通用工作区判断能力失败。 */
-        @Override public boolean isGeneralWorkspace(Path root) { throw unsupported(); }
+        /** 未声明的旧共享目录判断能力失败。 */
+        @Override public boolean isLegacySharedWorkspace(Path root) { throw unsupported(); }
     }
 
     /** 未声明的 Thread 能力必须失败。 */
@@ -202,6 +217,14 @@ public final class RpcTestBindings {
     private static final class UnsupportedTurns implements TurnUseCase {
         /** 未声明的接纳能力失败。 */
         @Override public Accepted start(TurnStartRequest request, TurnEventSink sink) { throw unsupported(); }
+        /** 未声明的隐藏继续能力失败。 */
+        @Override public Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) {
+            throw unsupported();
+        }
+        /** 未声明的问题编辑能力失败。 */
+        @Override public Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink) {
+            throw unsupported();
+        }
         /** 未声明的取消能力失败。 */
         @Override public CancelResult cancel(String turnId) { throw unsupported(); }
         /** 未声明的接纳关闭能力失败。 */
@@ -227,9 +250,9 @@ public final class RpcTestBindings {
         @Override public CursorPage<SkillDescriptor> listSkills(
                 String workspaceId, String cursor, int limit) { throw unsupported(); }
         /** 未声明的 MCP 列表能力失败。 */
-        @Override public CursorPage<McpServerDescriptor> listMcp(String cursor, int limit) { throw unsupported(); }
+        @Override public CursorPage<McpServerDescriptor> listMcp(String workspaceId, String cursor, int limit) { throw unsupported(); }
         /** 未声明的 MCP 测试能力失败。 */
-        @Override public CompletionStage<McpServerDescriptor> testMcp(String mcpId) { throw unsupported(); }
+        @Override public CompletionStage<McpServerDescriptor> testMcp(String workspaceId, String mcpId) { throw unsupported(); }
         /** 未声明的模型测试能力失败，避免 transport 夹具触发真实 Provider。 */
         @Override public CompletionStage<ModelTestResult> testModel(
                 String providerId, String modelId, CancellationToken cancellationToken) { throw unsupported(); }
@@ -237,7 +260,7 @@ public final class RpcTestBindings {
         @Override public CompletionStage<ModelDiscoveryResult> discoverModels(
                 String providerId, CancellationToken cancellationToken) { throw unsupported(); }
         /** 未声明的 MCP Tool 列表能力失败。 */
-        @Override public CursorPage<McpToolDescriptor> readMcpTools(String mcpId, String cursor, int limit) { throw unsupported(); }
+        @Override public CursorPage<McpToolDescriptor> readMcpTools(String workspaceId, String mcpId, String cursor, int limit) { throw unsupported(); }
     }
 
     /** 为所有未声明能力生成相同的显式失败，不泄露调用参数。 */

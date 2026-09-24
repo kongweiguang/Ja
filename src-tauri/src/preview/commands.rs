@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-// 仅 URL Preview 模型的 Tauri/WebView adapter。
+// Preview 模型的 Tauri/WebView adapter；本地文件能力仅从 main renderer 的显式命令进入。
 //
 // Preview window 使用主 capability 文件中不存在的 label，因此不会获得任何 Tauri command。
 // URL/generation 校验仍以模型为权威；Wry callback 只报告已收紧的事件。
 
 use super::error::{PreviewError, PreviewErrorCode};
 use super::load_watchdog::{LoadTimeoutRuntime, LoadTimeoutTask, PreviewLoadWatchdog};
+use super::local_file::{
+    PreviewFileResolution, PreviewResolveFileInput, resolve_browser_target, resolve_file,
+    resolve_reveal_file_path,
+};
 use super::model::{
-    NavigationSource, PreviewEvent, PreviewId, PreviewLimits, PreviewLoadStatus,
-    PreviewSessionSnapshot, PreviewSessionStatus, PreviewShutdownReport,
+    NavigationSource, PreviewBlockedAction, PreviewEvent, PreviewId, PreviewLoadStatus,
+    PreviewOpenResult, PreviewSessionSnapshot, PreviewSessionStatus, PreviewShutdownReport,
 };
 use super::session::{PreviewCloseTicket, PreviewManager};
+use crate::app_runtime::RuntimeHost;
 #[cfg(windows)]
 use crate::native_shortcuts::{NativeShortcutHost, install_preview_webview};
+use crate::workspace::infrastructure::open_with::reveal_absolute_file;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,8 +33,8 @@ use tauri::{
 use url::Url;
 #[cfg(windows)]
 use webview2_com::{
-    Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler,
+    HistoryChangedEventHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
 };
 #[cfg(windows)]
 use windows_core::BOOL;
@@ -39,6 +45,10 @@ pub const PREVIEW_EVENT: &str = "ja://preview";
 /// Wry 0.55 只公开 start/finish，不公开 WebView2 navigation error status；
 /// 因此超过有界时间仍无终态 callback 时必须报告失败。
 const PREVIEW_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Back/Forward 的 file history 许可只覆盖紧随受控原生动作的一次 engine callback。
+const PREVIEW_HISTORY_FILE_GRANT_TIMEOUT: Duration = Duration::from_secs(2);
+/// 未归属的回滚记录独立设限，不限制用户管理的打开页数。
+const PREVIEW_RECOVERY_IDENTITY_LIMIT: usize = 128;
 
 #[cfg(windows)]
 /// 原生 handler 安装与页面加载分别设定边界，避免卡住的 UI thread 留下
@@ -366,12 +376,11 @@ impl PreviewCommandHost {
     /// 通过可失败构造校验产品默认预算，使配置错误在 Tauri setup 阶段可诊断退出，
     /// 而不是把本应可恢复的初始化故障升级为进程 panic。
     pub fn new() -> Result<Self, PreviewError> {
-        let recovery_limit = PreviewLimits::default().max_sessions;
         Ok(Self {
             manager: PreviewManager::default_manager()?,
             load_watchdog: PreviewLoadWatchdog::new(Arc::new(TauriLoadTimeoutRuntime)),
             operation_fence: PreviewOperationFence::default(),
-            unowned_recovery: PreviewUnownedRecoveryRegistry::new(recovery_limit),
+            unowned_recovery: PreviewUnownedRecoveryRegistry::new(PREVIEW_RECOVERY_IDENTITY_LIMIT),
         })
     }
 
@@ -616,6 +625,16 @@ pub async fn ja_preview_open(
     let _operation = state.enter_operation()?;
     input.viewport.validate_open()?;
     let opened = state.manager.open(&input.url)?;
+    open_native_preview(opened, input.viewport, app, &state).await
+}
+
+/// 所有 Preview 初始目标共用同一套 callback、watchdog、原生 ACK 回滚与焦点可见性生命周期。
+async fn open_native_preview(
+    opened: PreviewOpenResult,
+    viewport: PreviewViewportInput,
+    app: tauri::AppHandle,
+    state: &PreviewCommandHost,
+) -> Result<PreviewOpenResult, PreviewError> {
     let parsed = match Url::parse(opened.window.url().as_str()) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -638,7 +657,7 @@ pub async fn ja_preview_open(
     let load_generation = generation.clone();
     let load_watchdog = state.load_watchdog.clone();
     let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed))
-        // Preview 是外部页面，因此 navigation 只能通过校验初始地址的同一 URL policy 准入。
+        // 当前 HTTP 页面只接受 HTTP(S)；file/blank 页面仅接受其隔离的本地导航策略。
         .on_navigation(move |url| {
             let current = callback_generation.load(Ordering::Acquire);
             match callback_manager.callback_navigation(id, current, url.as_str()) {
@@ -675,10 +694,38 @@ pub async fn ja_preview_open(
                 }
             }
         })
-        // popup 不得继承 opener 或静默创建特权窗口；用户只能通过显式 Preview command 打开其他 URL。
-        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-        // Preview 永不将下载写入用户文件系统。
-        .on_download(|_, _| false)
+        // popup 不得继承 opener 或静默创建特权窗口；拒绝后发出固定 action_blocked 反馈。
+        .on_new_window({
+            let blocked_manager = state.manager.clone();
+            let blocked_app = app.clone();
+            let blocked_generation = generation.clone();
+            move |_, _| {
+                if let Ok(event) = blocked_manager.callback_action_blocked(
+                    id,
+                    blocked_generation.load(Ordering::Acquire),
+                    PreviewBlockedAction::Popup,
+                ) {
+                    emit_preview_event(&blocked_app, event);
+                }
+                tauri::webview::NewWindowResponse::Deny
+            }
+        })
+        // Preview 永不将下载写入用户文件系统；事件只描述被拦截动作，不回显文件名或 URL。
+        .on_download({
+            let blocked_manager = state.manager.clone();
+            let blocked_app = app.clone();
+            let blocked_generation = generation.clone();
+            move |_, _| {
+                if let Ok(event) = blocked_manager.callback_action_blocked(
+                    id,
+                    blocked_generation.load(Ordering::Acquire),
+                    PreviewBlockedAction::Download,
+                ) {
+                    emit_preview_event(&blocked_app, event);
+                }
+                false
+            }
+        })
         .on_document_title_changed(move |_window, title| {
             let current = title_generation.load(Ordering::Acquire);
             if let Ok(event) = title_manager.callback_title(id, current, &title) {
@@ -757,11 +804,10 @@ pub async fn ja_preview_open(
     }
     let webview_result = parent.add_child(
         webview_builder,
-        input.viewport.logical_position(),
-        input.viewport.logical_size(),
+        viewport.logical_position(),
+        viewport.logical_size(),
     );
-    // 原生 build 失败不得留下没有窗口 owner 的模型 session；在此关闭可保证
-    // active-session limit 反映真实资源。
+    // 原生 build 失败不得留下没有窗口 owner 的模型 session，避免失败操作留下空 tab。
     let webview = match webview_result {
         Ok(webview) => webview,
         Err(_) => {
@@ -770,6 +816,12 @@ pub async fn ja_preview_open(
             return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
         }
     };
+
+    // 非活动页先隐藏，再安装 callback 和开始加载，避免盖住当前活动页。
+    if !viewport.visible && webview.hide().is_err() {
+        state.rollback_created_webview(&app, id)?;
+        return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
+    }
 
     #[cfg(windows)]
     {
@@ -802,11 +854,20 @@ pub async fn ja_preview_open(
 
     // React owner 在 project/unmount cleanup 时显式关闭子窗口；应用 shutdown
     // 则原子销毁 parent 与全部 children。
-    if webview.show().is_err() {
+    let visibility_result = if viewport.visible {
+        webview.show()
+    } else {
+        Ok(())
+    };
+    if visibility_result.is_err() {
         state.rollback_created_webview(&app, id)?;
         return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
     }
-    if state.manager.commit_native_visibility(id, true).is_err() {
+    if state
+        .manager
+        .commit_native_visibility(id, viewport.visible)
+        .is_err()
+    {
         state.rollback_created_webview(&app, id)?;
         return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
     }
@@ -818,6 +879,301 @@ pub async fn ja_preview_open(
             state.rollback_created_webview(&app, id)?;
             Err(error)
         }
+    }
+}
+
+/// Rust 签发空白 child identity，避免 renderer 自行创建不受 close ACK 管理的 tab。
+#[tauri::command]
+pub async fn ja_preview_open_blank(
+    input: PreviewOpenBlankInput,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, PreviewCommandHost>,
+) -> Result<PreviewOpenResult, PreviewError> {
+    let _operation = state.enter_operation()?;
+    input.viewport.validate_open()?;
+    let opened = state.manager.open_blank()?;
+    open_native_preview(opened, input.viewport, app, &state).await
+}
+
+/// 仅由主 UI 发起显式路径解析；子 WebView 标签没有 Tauri capability。
+#[tauri::command]
+pub async fn ja_preview_resolve_file(
+    webview: tauri::Webview,
+    input: PreviewResolveFileInput,
+    runtime: tauri::State<'_, RuntimeHost>,
+) -> Result<PreviewFileResolution, PreviewError> {
+    ensure_main_webview(webview.label())?;
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || resolve_file(&runtime, &input))
+        .await
+        .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?
+}
+
+/// 主 UI 的显式 Ctrl+点击先按现有路径规则核验，再以固定 Explorer 目标定位文件。
+#[tauri::command]
+pub async fn ja_preview_reveal_file(
+    webview: tauri::Webview,
+    input: PreviewResolveFileInput,
+    runtime: tauri::State<'_, RuntimeHost>,
+) -> Result<(), PreviewError> {
+    ensure_main_webview(webview.label())?;
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = resolve_reveal_file_path(&runtime, &input)?;
+        reveal_absolute_file(&path)
+            .map_err(|_| PreviewError::new(PreviewErrorCode::FileRevealFailed))
+    })
+    .await
+    .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?
+}
+
+/// 重新解析文件目标后才创建隔离 file:// child；renderer 不能用过期 file URL 授权打开。
+#[tauri::command]
+pub async fn ja_preview_open_file(
+    webview: tauri::Webview,
+    input: PreviewOpenFileInput,
+    app: tauri::AppHandle,
+    runtime: tauri::State<'_, RuntimeHost>,
+    state: tauri::State<'_, PreviewCommandHost>,
+) -> Result<PreviewOpenResult, PreviewError> {
+    let _operation = state.enter_operation()?;
+    ensure_main_webview(webview.label())?;
+    input.viewport.validate_open()?;
+    let runtime = runtime.inner().clone();
+    let target = input.target;
+    let workspace_id = input.workspace_id;
+    let resolved = tauri::async_runtime::spawn_blocking(move || {
+        resolve_browser_target(&runtime, &target, workspace_id.as_deref())
+    })
+    .await
+    .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))??;
+    let opened = state.manager.open_local_file(&resolved.file_url)?;
+    open_native_preview(opened, input.viewport, app, &state).await
+}
+
+/// 地址栏显式输入本地目标时重验权限与路径，再让浏览器自身推进真实 history。
+#[tauri::command]
+pub async fn ja_preview_navigate_file(
+    webview: tauri::Webview,
+    input: PreviewNavigateFileInput,
+    app: tauri::AppHandle,
+    runtime: tauri::State<'_, RuntimeHost>,
+    state: tauri::State<'_, PreviewCommandHost>,
+) -> Result<PreviewSessionSnapshot, PreviewError> {
+    let _operation = state.enter_operation()?;
+    ensure_main_webview(webview.label())?;
+    let runtime = runtime.inner().clone();
+    let target = input.target;
+    let workspace_id = input.workspace_id;
+    let resolved = tauri::async_runtime::spawn_blocking(move || {
+        resolve_browser_target(&runtime, &target, workspace_id.as_deref())
+    })
+    .await
+    .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))??;
+    let request = state.manager.local_file_navigation_request(
+        input.session_id,
+        input.generation,
+        &resolved.file_url,
+    )?;
+    let result: Result<PreviewSessionSnapshot, PreviewError> = (|| {
+        let snapshot = state.manager.snapshot(input.session_id)?;
+        let webview = app
+            .get_webview(snapshot.window.label())
+            .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+        arm_preview_load_timeout(
+            &state.load_watchdog,
+            &state.manager,
+            &app,
+            input.session_id,
+            input.generation,
+        )?;
+        let url = Url::parse(request.url.as_str())
+            .map_err(|_| PreviewError::new(PreviewErrorCode::FileTargetInvalid))?;
+        if webview.navigate(url).is_err() {
+            emit_preview_load_failure(
+                &state.manager,
+                &state.load_watchdog,
+                &app,
+                input.session_id,
+                input.generation,
+                PREVIEW_NAVIGATION_FAILED_MESSAGE,
+            );
+            return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));
+        }
+        state.manager.snapshot(input.session_id)
+    })();
+    if result.is_err() {
+        let _ = state
+            .manager
+            .clear_pending_local_navigation(input.session_id, request.url.as_str());
+        let _ = state.load_watchdog.cancel(input.session_id);
+    }
+    result
+}
+
+/// WebView2 原生历史动作闭集，不暴露任意 script 注入作为浏览器控制 API。
+#[derive(Debug, Clone, Copy)]
+enum PreviewHistoryAction {
+    Back,
+    Forward,
+    Reload,
+}
+
+/// 分发前校验原生 session generation；真实历史状态由浏览器自身决定。
+async fn run_preview_history_action(
+    input: PreviewHistoryInput,
+    action: PreviewHistoryAction,
+    app: tauri::AppHandle,
+    state: &PreviewCommandHost,
+) -> Result<PreviewSessionSnapshot, PreviewError> {
+    let _operation = state.enter_operation()?;
+    state
+        .manager
+        .validate_session_generation(input.session_id, input.generation)?;
+    let snapshot = state.manager.snapshot(input.session_id)?;
+    let webview = app
+        .get_webview(snapshot.window.label())
+        .ok_or(PreviewError::new(PreviewErrorCode::SessionNotFound))?;
+    let history_grant = match action {
+        PreviewHistoryAction::Back | PreviewHistoryAction::Forward => Some(
+            state
+                .manager
+                .prepare_history_navigation(input.session_id, input.generation)?,
+        ),
+        PreviewHistoryAction::Reload => None,
+    };
+    match dispatch_preview_history_action(webview, action).await {
+        Ok(true) => {
+            if let Some(token) = history_grant {
+                let manager = state.manager.clone();
+                let session_id = input.session_id;
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(PREVIEW_HISTORY_FILE_GRANT_TIMEOUT).await;
+                    let _ = manager.clear_pending_history_navigation(session_id, token);
+                });
+            }
+        }
+        Ok(false) => {
+            if let Some(token) = history_grant {
+                state
+                    .manager
+                    .clear_pending_history_navigation(input.session_id, token)?;
+            }
+        }
+        Err(error) => {
+            if let Some(token) = history_grant {
+                let _ = state
+                    .manager
+                    .clear_pending_history_navigation(input.session_id, token);
+            }
+            return Err(error);
+        }
+    }
+    state.manager.snapshot(input.session_id)
+}
+
+/// Windows 调用 WebView2 历史 API，其他平台调用浏览器引擎对应的历史动作；返回值说明动作确实派发。
+async fn dispatch_preview_history_action(
+    webview: tauri::Webview,
+    action: PreviewHistoryAction,
+) -> Result<bool, PreviewError> {
+    #[cfg(windows)]
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        webview
+            .with_webview(move |platform_webview| {
+                let result = (|| {
+                    let controller = platform_webview.controller();
+                    let native_webview: ICoreWebView2 = unsafe { controller.CoreWebView2() }
+                        .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+                    match action {
+                        PreviewHistoryAction::Back => {
+                            let mut can_go_back = BOOL::default();
+                            unsafe { native_webview.CanGoBack(&mut can_go_back) }.map_err(
+                                |_| PreviewError::new(PreviewErrorCode::DependencyRequest),
+                            )?;
+                            if !can_go_back.as_bool() {
+                                return Ok(false);
+                            }
+                            unsafe { native_webview.GoBack() }.map_err(|_| {
+                                PreviewError::new(PreviewErrorCode::DependencyRequest)
+                            })?;
+                        }
+                        PreviewHistoryAction::Forward => {
+                            let mut can_go_forward = BOOL::default();
+                            unsafe { native_webview.CanGoForward(&mut can_go_forward) }.map_err(
+                                |_| PreviewError::new(PreviewErrorCode::DependencyRequest),
+                            )?;
+                            if !can_go_forward.as_bool() {
+                                return Ok(false);
+                            }
+                            unsafe { native_webview.GoForward() }.map_err(|_| {
+                                PreviewError::new(PreviewErrorCode::DependencyRequest)
+                            })?;
+                        }
+                        PreviewHistoryAction::Reload => unsafe { native_webview.Reload() }
+                            .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?,
+                    }
+                    Ok(true)
+                })();
+                let _ = sender.send(result);
+            })
+            .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+        let dispatched = receiver
+            .await
+            .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))??;
+        Ok(dispatched)
+    }
+    #[cfg(not(windows))]
+    {
+        let script = match action {
+            PreviewHistoryAction::Back => "history.back()",
+            PreviewHistoryAction::Forward => "history.forward()",
+            PreviewHistoryAction::Reload => "location.reload()",
+        };
+        webview
+            .eval(script)
+            .map(|_| true)
+            .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))
+    }
+}
+
+/// 使用子 WebView 的真实历史栈，并保留既有原生关闭生命周期。
+#[tauri::command]
+pub async fn ja_preview_go_back(
+    input: PreviewHistoryInput,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, PreviewCommandHost>,
+) -> Result<PreviewSessionSnapshot, PreviewError> {
+    run_preview_history_action(input, PreviewHistoryAction::Back, app, &state).await
+}
+
+/// 使用子 WebView 的真实历史栈；Rust 不接收 renderer 模拟的历史列表。
+#[tauri::command]
+pub async fn ja_preview_go_forward(
+    input: PreviewHistoryInput,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, PreviewCommandHost>,
+) -> Result<PreviewSessionSnapshot, PreviewError> {
+    run_preview_history_action(input, PreviewHistoryAction::Forward, app, &state).await
+}
+
+/// 通过浏览器引擎刷新活动子页面，不重建 Preview session。
+#[tauri::command]
+pub async fn ja_preview_reload(
+    input: PreviewHistoryInput,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, PreviewCommandHost>,
+) -> Result<PreviewSessionSnapshot, PreviewError> {
+    run_preview_history_action(input, PreviewHistoryAction::Reload, app, &state).await
+}
+
+/// 拒绝非主 WebView 调用，避免未来 capability 变化时外部页面获得文件读取入口。
+fn ensure_main_webview(label: &str) -> Result<(), PreviewError> {
+    if label == "main" {
+        Ok(())
+    } else {
+        Err(PreviewError::new(PreviewErrorCode::NavigationBlocked))
     }
 }
 
@@ -989,11 +1345,10 @@ impl PreviewViewportInput {
         Ok(())
     }
 
-    /// 已打开或可见 WebView 需要非零 viewport；hidden layout 可从 inactive Tab
-    /// 合法报告零尺寸。
+    /// 子 WebView 即使先隐藏创建，也先拿到有效 bounds，防止尺寸无效时原生资源已部分建立。
     pub(crate) fn validate_open(self) -> Result<(), PreviewError> {
         self.validate()?;
-        if !self.visible || self.width < 1.0 || self.height < 1.0 {
+        if self.width < 1.0 || self.height < 1.0 {
             return Err(PreviewError::new(PreviewErrorCode::ViewportInvalid));
         }
         Ok(())
@@ -1017,6 +1372,40 @@ impl PreviewViewportInput {
             size: self.logical_size().into(),
         }
     }
+}
+
+/// 创建 Rust-owned 空白 browser tab 时只需携带首帧布局。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewOpenBlankInput {
+    pub viewport: PreviewViewportInput,
+}
+
+/// 只允许 renderer 提交目标路径与绑定 workspace identity，不接受 file URL 快照作为授权。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewOpenFileInput {
+    pub target: String,
+    pub workspace_id: Option<String>,
+    pub viewport: PreviewViewportInput,
+}
+
+/// 地址栏的显式 file 导航仍要携带 Rust 签发 page identity 与 generation。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewNavigateFileInput {
+    pub session_id: PreviewId,
+    pub generation: u64,
+    pub target: String,
+    pub workspace_id: Option<String>,
+}
+
+/// 浏览器历史命令绑定到精确的页面 generation。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewHistoryInput {
+    pub session_id: PreviewId,
+    pub generation: u64,
 }
 
 /// 标识子 WebView 及其最近测得的 inspector rectangle。
@@ -1186,6 +1575,9 @@ async fn install_preview_navigation_completed(
                 }
                 .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
                 let completed_tracker = completion_tracker;
+                let completion_manager = manager.clone();
+                let completion_app = app.clone();
+                let completion_generation = generation.clone();
                 let handler = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
                     let Some(args) = args else {
                         return Ok(());
@@ -1200,7 +1592,8 @@ async fn install_preview_navigation_completed(
                             tracing::debug!("preview navigation identity tracker was unavailable");
                             return Ok(());
                         };
-                        tracker.completed(navigation_id, generation.load(Ordering::Acquire))
+                        tracker
+                            .completed(navigation_id, completion_generation.load(Ordering::Acquire))
                     };
                     let Some(completion_generation) = completion_generation else {
                         return Ok(());
@@ -1211,9 +1604,9 @@ async fn install_preview_navigation_completed(
                         return Ok(());
                     }
                     handle_preview_navigation_completed(
-                        &manager,
+                        &completion_manager,
                         &watchdog,
-                        &app,
+                        &completion_app,
                         session_id,
                         completion_generation,
                         succeeded.as_bool(),
@@ -1223,6 +1616,34 @@ async fn install_preview_navigation_completed(
                 let mut _token = 0i64;
                 unsafe { native_webview.add_NavigationCompleted(&handler, &mut _token) }
                     .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+                let history_manager = manager.clone();
+                let history_app = app.clone();
+                let history_generation = generation.clone();
+                let history_handler =
+                    HistoryChangedEventHandler::create(Box::new(move |sender, _| {
+                        let Some(sender) = sender else {
+                            return Ok(());
+                        };
+                        let current = history_generation.load(Ordering::Acquire);
+                        emit_preview_history_state(
+                            &history_manager,
+                            &history_app,
+                            session_id,
+                            current,
+                            &sender,
+                        );
+                        Ok(())
+                    }));
+                let mut _history_token = 0i64;
+                unsafe { native_webview.add_HistoryChanged(&history_handler, &mut _history_token) }
+                    .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?;
+                emit_preview_history_state(
+                    &manager,
+                    &app,
+                    session_id,
+                    generation.load(Ordering::Acquire),
+                    &native_webview,
+                );
                 Ok(())
             })();
             let _ = sender.send(result);
@@ -1231,6 +1652,38 @@ async fn install_preview_navigation_completed(
     match tokio::time::timeout(PREVIEW_NATIVE_HANDLER_INSTALL_TIMEOUT, receiver).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) | Err(_) => Err(PreviewError::new(PreviewErrorCode::DependencyRequest)),
+    }
+}
+
+#[cfg(windows)]
+/// Read the actual WebView2 history stack and publish changes without retaining a COM controller reference.
+fn emit_preview_history_state(
+    manager: &PreviewManager,
+    app: &tauri::AppHandle,
+    session_id: PreviewId,
+    generation: u64,
+    webview: &ICoreWebView2,
+) {
+    let mut can_go_back = BOOL::default();
+    let mut can_go_forward = BOOL::default();
+    if unsafe { webview.CanGoBack(&mut can_go_back) }.is_err()
+        || unsafe { webview.CanGoForward(&mut can_go_forward) }.is_err()
+    {
+        tracing::debug!("preview history capability was unavailable");
+        return;
+    }
+    match manager.callback_history_changed(
+        session_id,
+        generation,
+        can_go_back.as_bool(),
+        can_go_forward.as_bool(),
+    ) {
+        Ok(Some(event)) => emit_preview_event(app, event),
+        Ok(None) => {}
+        Err(error) => tracing::debug!(
+            code = ?error.code(),
+            "preview history state was stale or unavailable"
+        ),
     }
 }
 

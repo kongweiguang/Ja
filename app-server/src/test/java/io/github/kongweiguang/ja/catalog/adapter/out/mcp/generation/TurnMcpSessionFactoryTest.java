@@ -13,6 +13,10 @@ import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.TurnMcpSessionFactory;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.testsupport.McpStdioFixture;
+import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
+import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
+import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import io.github.kongweiguang.ja.configuration.adapter.out.ConfigurationRuntimeAdapter;
@@ -20,6 +24,11 @@ import io.github.kongweiguang.ja.configuration.application.ConfigurationApplicat
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationGenerationLease;
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationUseCase;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.foundation.json.JsonObjects;
+import io.github.kongweiguang.ja.foundation.json.JsonNull;
+import io.github.kongweiguang.ja.foundation.json.JsonText;
+import io.github.kongweiguang.ja.support.TestJsonValueCodec;
+import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -104,6 +113,89 @@ final class TurnMcpSessionFactoryTest {
             catalog.close();
             assertTrue(awaitExit(observedPid[0]));
         }
+    }
+
+    /** 项目服务使用真实配置和 stdio 进入冻结模型目录；撤信后旧 batch 的新调用也必须被拒绝。 */
+    @Test
+    void trustedProjectToolCallsAndTrustRevocationBlocksNewCalls(@TempDir Path workspace) throws Exception {
+        Path report = workspace.resolve("project-mcp-report.txt");
+        Path classes = Path.of(McpStdioFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        Path home = Files.createDirectories(workspace.resolve("home"));
+        Path data = Files.createDirectories(workspace.resolve("data"));
+        Path run = Files.createDirectories(workspace.resolve("run"));
+        Path logs = Files.createDirectories(workspace.resolve("logs"));
+        String configurationText = generationConfig(report, classes);
+        int projectBlock = configurationText.indexOf("[[mcp_servers]]");
+        Files.writeString(home.resolve("config.toml"), configurationText.substring(0, projectBlock));
+        Files.writeString(Files.createDirectories(workspace.resolve(".ja")).resolve("config.toml"),
+                "schema_version = 2\nconfig_revision = 1\n" + configurationText.substring(projectBlock));
+        SidecarConfiguration configuration = new SidecarConfiguration(home, data, run, logs);
+        long[] observedPid = {-1L};
+        try (ConfigurationRuntimeAdapter adapter = new ConfigurationRuntimeAdapter(configuration, JSON);
+             GenerationCatalog catalog = new GenerationCatalog(workspace, JSON, McpLimits.DEFAULT)) {
+            ConfigurationApplicationService owner = new ConfigurationApplicationService(adapter);
+            ConfigurationUseCase.CredentialResult model = owner.setCredential(
+                    "cred_model", "model-secret", "cfg_missing");
+            owner.setCredential("cred_mcp", "project-secret", model.version());
+            assertTrue(adapter.synchronizeWorkspaceTrust(workspace, true));
+            ConfigurationGenerationPort generation = path -> new TestGenerationLease(owner.acquire(path));
+            try (ConfigurationGenerationPort.Lease lease = generation.acquire(workspace)) {
+                assertTrue(lease.snapshot().trusted());
+                assertEquals(ConfigurationGenerationSnapshot.Scope.PROJECT,
+                        lease.snapshot().mcpDefinitions().getFirst().scope());
+                GenerationTurnMcpSessionFactory factory = new GenerationTurnMcpSessionFactory(
+                        JSON, McpLimits.DEFAULT, catalog, generation);
+                TurnMcpSessionFactory.Context context = new TurnMcpSessionFactory.Context(
+                        "provider_turn_mcp", "model_turn_mcp", workspace,
+                        Instant.now().plus(Duration.ofSeconds(20)));
+                catalog.prepareWorkspace(workspace, lease);
+                GenerationTurnMcpSessionFactory.CatalogSnapshot discovered = factory.catalog(context, lease);
+                assertEquals(1, discovered.snapshot().tools().size());
+                try (TurnMcpSessionFactory.Session session = factory.open(discovered, CancellationToken.none())) {
+                    McpGateway.McpSnapshot snapshot = session.snapshot();
+                    TestJsonValueCodec codec = new TestJsonValueCodec();
+                    AgentTool modelTool = McpAgentTool.adapt(session.gateway(), snapshot,
+                            session.routeIdentities(), codec, new NetworkntToolArgumentValidation(codec)).getFirst();
+                    AgentTool.ExecutionContext execution = new AgentTool.ExecutionContext(
+                            "thr_project", "turn_project", workspace, AccessMode.APPROVAL_REQUIRED,
+                            lease.generationId(), Instant.now().plus(Duration.ofSeconds(20)), "ws_project");
+                    AgentTool.ToolResult search = modelTool.execute(new AgentTool.Invocation(
+                            "call_project_search", "mcp", modelAction("search", null, null, "echo", null), 0),
+                            execution, CancellationToken.none()).toCompletableFuture().get(3, TimeUnit.SECONDS);
+                    assertEquals("SUCCEEDED", search.outcome().name());
+                    assertTrue(search.content().contains("mcp_turn_fixture"));
+                    assertTrue(search.content().contains("echo"));
+                    AgentTool.Invocation invocation = new AgentTool.Invocation(
+                            "call_project_tool", "mcp",
+                            modelAction("call", "mcp_turn_fixture", "echo", null, "{}"), 1);
+                    AgentTool.ToolResult result = modelTool.execute(invocation, execution, CancellationToken.none())
+                            .toCompletableFuture().get(3, TimeUnit.SECONDS);
+                    assertEquals("SUCCEEDED", result.outcome().name());
+                    assertTrue(awaitObservation(report, "method=tools/call"));
+                    observedPid[0] = Long.parseLong(Files.readAllLines(report, StandardCharsets.UTF_8).getFirst());
+                    assertTrue(adapter.synchronizeWorkspaceTrust(workspace, false));
+                    AgentTool.ToolResult revoked = modelTool.execute(invocation, execution, CancellationToken.none())
+                            .toCompletableFuture().get(3, TimeUnit.SECONDS);
+                    assertEquals("MCP_TOOL_FAILED", revoked.errorCode());
+                    assertEquals(1, Files.readAllLines(report, StandardCharsets.UTF_8).stream()
+                            .filter("method=tools/call"::equals).count());
+                }
+            }
+            catalog.close();
+            assertTrue(awaitExit(observedPid[0]));
+        }
+    }
+
+    /** 用固定字段构造模型可见的 MCP 动作，确保项目测试覆盖真实 Adapter 而非直连 Runtime。 */
+    private static io.github.kongweiguang.ja.foundation.json.JsonObject modelAction(
+            String action, String serverId, String toolName, String query, String argumentsJson) {
+        return JsonObjects.builder().putText("action", action)
+                .put("serverId", serverId == null ? JsonNull.INSTANCE : new JsonText(serverId))
+                .put("toolName", toolName == null ? JsonNull.INSTANCE : new JsonText(toolName))
+                .put("query", query == null ? JsonNull.INSTANCE : new JsonText(query))
+                .put("offset", JsonNull.INSTANCE)
+                .put("argumentsJson", argumentsJson == null ? JsonNull.INSTANCE : new JsonText(argumentsJson))
+                .build();
     }
 
     /** 使用凭据引用写入 Java 所有的 Schema，夹具不得包含 MCP Secret 明文。 */

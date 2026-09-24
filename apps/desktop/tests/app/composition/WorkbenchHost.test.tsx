@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
 import { Profiler, type ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkbenchHost } from "@/app/composition/WorkbenchHost";
+import { PreviewAdapterError } from "@/api/tauri/preview";
 import type { GoalController } from "@/features/goals";
 import { useTimelineStore, type TimelineSnapshot } from "@/features/conversation";
 import type { TaskReadModel, TaskSummary } from "@/features/tasks";
 
 const mocks = vi.hoisted(() => ({
+  queryRuntime: vi.fn(),
+  previewOpenTarget: vi.fn(),
   useReviewController: vi.fn(),
   usePreviewController: vi.fn(),
   useFilesController: vi.fn(),
@@ -32,7 +36,7 @@ const mocks = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), dismiss: vi.fn() } }));
 vi.mock("@/features/workbench", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/features/workbench")>()),
   Workbench: mocks.Workbench,
@@ -43,9 +47,14 @@ vi.mock("@/features/tasks", () => ({
   useTaskController: mocks.useTaskController,
 }));
 vi.mock("@/app/RuntimeProvider", () => ({
-  useRuntimeLifecycle: () => ({ queryRuntime: vi.fn() }),
+  useRuntimeLifecycle: () => ({ queryRuntime: mocks.queryRuntime }),
   useRuntimeState: () => ({ boot: { status: "ready" }, turnAdmissionReady: true }),
-  useRuntimeTurns: () => ({ approvalRespond: vi.fn(), resumeTurn: vi.fn() }),
+  useRuntimeTurns: () => ({
+    approvalRespond: vi.fn(),
+    resumeTurn: vi.fn(),
+    continueTurn: vi.fn(),
+    reaskTurn: vi.fn(),
+  }),
 }));
 vi.mock("@/features/workbench/files", () => ({
   FilesWorkspace: mocks.FilesWorkspace,
@@ -95,11 +104,18 @@ beforeEach(() => {
   });
   mocks.usePreviewController.mockReturnValue({
     viewModel: {},
-    actions: { attachment: { dismiss: vi.fn() } },
+    actions: { attachment: { dismiss: vi.fn() }, openTarget: mocks.previewOpenTarget },
   });
+  mocks.previewOpenTarget.mockResolvedValue(undefined);
+  mocks.queryRuntime.mockResolvedValue({ items: [], truncated: false });
   mocks.useFilesController.mockReturnValue({
     viewModel: { documents: {}, openPaths: [] },
-    actions: { selectNode: vi.fn(), toggleDirectory: vi.fn() },
+    actions: {
+      selectNode: vi.fn(),
+      toggleDirectory: vi.fn(),
+      openPath: vi.fn(async () => true),
+      openExternalDocument: vi.fn(() => true),
+    },
   });
   mocks.useTerminalWorkspaceLifecycle.mockReturnValue({
     activated: false,
@@ -251,6 +267,369 @@ function makeGoalController(overrides: Partial<GoalController> = {}): GoalContro
 }
 
 describe("WorkbenchHost capability activation", () => {
+  /** Preview 复制能力必须接收 Host 的统一 clipboard action，确保 Browser 菜单不会缺失入口。 */
+  it("passes the host copy action into the Preview view", () => {
+    const onCopyText = vi.fn(async () => undefined);
+    render(<WorkbenchHost {...makeProps({ active: true, onCopyText })} />);
+
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.[0] as
+      | { views: { preview: { props: Record<string, unknown> } } }
+      | undefined;
+    expect(workbenchProps?.views.preview.props["onCopyText"]).toBe(onCopyText);
+  });
+
+  it("routes an explicitly clicked web destination through the Preview controller", async () => {
+    const settled = vi.fn();
+    const request = {
+      requestId: 301,
+      workspaceId: "ws_demo",
+      threadId: "thr_one",
+      target: { kind: "url" as const, url: "https://example.test/" },
+    };
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          openTargetRequest: request,
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(mocks.previewOpenTarget).toHaveBeenCalledWith({
+        kind: "url",
+        url: "https://example.test/",
+      }),
+    );
+    expect(settled).toHaveBeenCalledWith(301, "opened");
+  });
+
+  it("resolves clicked external text only on demand and opens it in a read-only Files tab", async () => {
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\outside\\notes.txt",
+      displayName: "notes.txt",
+      workspaceId: null,
+      workspaceRelativePath: null,
+      withinWorkspace: false,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: "file:///C:/outside/notes.txt",
+      content: "external text",
+      truncated: false,
+      line: 7,
+      column: 2,
+      readOnly: true,
+    }));
+    const openExternalDocument = vi.fn(() => true);
+    const settled = vi.fn();
+    const request = {
+      requestId: 302,
+      workspaceId: "ws_demo",
+      threadId: "thr_one",
+      target: { kind: "file" as const, path: "C:\\outside\\notes.txt", line: 7, column: 2 },
+    };
+
+    mocks.useFilesController.mockReturnValue({
+      viewModel: { documents: {}, openPaths: [] },
+      actions: {
+        selectNode: vi.fn(),
+        toggleDirectory: vi.fn(),
+        openPath: vi.fn(async () => true),
+        openExternalDocument,
+      },
+    });
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          adapters: { preview: { resolveFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: request,
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(openExternalDocument).toHaveBeenCalledOnce());
+    expect(resolveFile).toHaveBeenCalledWith("C:\\outside\\notes.txt", "ws_demo", 7, 2);
+    expect(openExternalDocument).toHaveBeenCalledWith({
+      path: "C:\\outside\\notes.txt",
+      content: "external text",
+      line: 7,
+      column: 2,
+      truncated: false,
+      readOnlyReason: "工作区外文件，只读",
+    });
+    expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
+    expect(settled).toHaveBeenCalledWith(302, "opened");
+  });
+
+  /** 右栏隐藏时仅允许显式 Explorer intent 运行，避免无关 Preview/Files 激活。 */
+  it("reveals an external file without opening a Workbench tab or decoding text", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn();
+    const settled = vi.fn();
+    const onTabChange = vi.fn();
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: false,
+          rootThreadId: "thr_one",
+          onTabChange,
+          adapters: { preview: { revealFile, resolveFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId: 306,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "explorer", path: "C:\\outside\\资料 空间\\图.svg" },
+          },
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(revealFile).toHaveBeenCalledWith("C:\\outside\\资料 空间\\图.svg", "ws_demo"),
+    );
+    expect(resolveFile).not.toHaveBeenCalled();
+    expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
+    expect(onTabChange).not.toHaveBeenCalled();
+    expect(settled).toHaveBeenCalledWith(306, "opened");
+  });
+
+  it("passes a canonical browser file path and reveal position to the current Preview page", async () => {
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\repo\\assets\\map.svg",
+      displayName: "map.svg",
+      workspaceId: "ws_demo",
+      workspaceRelativePath: "assets/map.svg",
+      withinWorkspace: true,
+      kind: "browser" as const,
+      mimeType: "image/svg+xml",
+      fileUrl: "file:///C:/repo/assets/map.svg",
+      content: null,
+      truncated: false,
+      line: 12,
+      column: 3,
+      readOnly: true,
+    }));
+    const request = {
+      requestId: 304,
+      workspaceId: "ws_demo",
+      threadId: "thr_one",
+      target: { kind: "file" as const, path: "assets/map.svg", line: 12, column: 3 },
+    };
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          adapters: { preview: { resolveFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: request,
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(mocks.previewOpenTarget).toHaveBeenCalledWith({
+        kind: "file",
+        path: "C:\\repo\\assets\\map.svg",
+        line: 12,
+        column: 3,
+      }),
+    );
+    expect(resolveFile).toHaveBeenCalledWith("assets/map.svg", "ws_demo", 12, 3);
+  });
+
+  it("opens a resolved workspace text file in its writable relative Files tab", async () => {
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\repo\\src\\main.ts",
+      displayName: "main.ts",
+      workspaceId: "ws_demo",
+      workspaceRelativePath: "src/main.ts",
+      withinWorkspace: true,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: "file:///C:/repo/src/main.ts",
+      content: null,
+      truncated: false,
+      line: 7,
+      column: 2,
+      readOnly: false,
+    }));
+    const openPath = vi.fn(async () => true);
+    const request = {
+      requestId: 305,
+      workspaceId: "ws_demo",
+      threadId: "thr_one",
+      target: { kind: "file" as const, path: "src/main.ts", line: 7, column: 2 },
+    };
+    mocks.useFilesController.mockReturnValue({
+      viewModel: { documents: {}, openPaths: [] },
+      actions: {
+        selectNode: vi.fn(),
+        toggleDirectory: vi.fn(),
+        openPath,
+        openExternalDocument: vi.fn(() => true),
+      },
+    });
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          adapters: { preview: { resolveFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: request,
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(openPath).toHaveBeenCalledWith("src/main.ts", { line: 7, column: 2 }),
+    );
+    expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
+  });
+
+  it("basename 冲突只在选择候选后调用 resolver", async () => {
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\repo\\b\\notes.txt",
+      displayName: "notes.txt",
+      workspaceId: "ws_demo",
+      workspaceRelativePath: "b/notes.txt",
+      withinWorkspace: true,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: "file:///C:/repo/b/notes.txt",
+      content: null,
+      truncated: false,
+      line: null,
+      column: null,
+      readOnly: false,
+    }));
+    const request = {
+      requestId: 303,
+      workspaceId: "ws_demo",
+      threadId: "thr_one",
+      target: { kind: "file" as const, path: "notes.txt" },
+    };
+    mocks.queryRuntime.mockResolvedValue({
+      items: [
+        { relativePath: "a/notes.txt", kind: "file" },
+        { relativePath: "b/notes.txt", kind: "file" },
+      ],
+      truncated: false,
+    });
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          adapters: { preview: { resolveFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: request,
+        })}
+      />,
+    );
+
+    expect(await screen.findByRole("dialog", { name: "选择要打开的文件" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "b/notes.txt" })).toHaveAttribute(
+      "data-file-candidate",
+      "b/notes.txt",
+    );
+    expect(resolveFile).not.toHaveBeenCalled();
+    await act(async () => {
+      screen.getByRole("button", { name: "b/notes.txt" }).click();
+    });
+    await waitFor(() =>
+      expect(resolveFile).toHaveBeenCalledWith("b/notes.txt", "ws_demo", undefined, undefined),
+    );
+  });
+
+  /** 重名选择器保持可见，选定后才触达原生 reveal command。 */
+  it("chooses a duplicate Explorer target while the right panel stays hidden", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const settled = vi.fn();
+    mocks.queryRuntime.mockResolvedValue({
+      items: [
+        { relativePath: "a/notes.txt", kind: "file" },
+        { relativePath: "b/notes.txt", kind: "file" },
+      ],
+      truncated: false,
+    });
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: false,
+          rootThreadId: "thr_one",
+          adapters: { preview: { revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId: 307,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "explorer", path: "notes.txt" },
+          },
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("dialog", { name: "选择要在文件夹中定位的文件" }),
+    ).toBeInTheDocument();
+    expect(revealFile).not.toHaveBeenCalled();
+    await act(async () => screen.getByRole("button", { name: "b/notes.txt" }).click());
+    await waitFor(() => expect(revealFile).toHaveBeenCalledWith("b/notes.txt", "ws_demo"));
+    expect(settled).toHaveBeenCalledWith(307, "opened");
+  });
+
+  /** 原生拒绝必须结束当前 intent，供应用层把焦点还给回复中的路径。 */
+  it("settles an Explorer reveal error without activating the right panel", async () => {
+    const settled = vi.fn();
+    const onTabChange = vi.fn();
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: false,
+          rootThreadId: "thr_one",
+          onTabChange,
+          adapters: {
+            preview: {
+              revealFile: vi.fn(async () => {
+                throw new PreviewAdapterError("file_not_found");
+              }),
+            },
+          } as unknown as ComponentProps<typeof WorkbenchHost>["adapters"],
+          openTargetRequest: {
+            requestId: 308,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "explorer", path: "C:\\outside\\missing.txt" },
+          },
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+    await waitFor(() => expect(settled).toHaveBeenCalledWith(308, "failed"));
+    expect(onTabChange).not.toHaveBeenCalled();
+  });
+
   /** 菜单仅遮挡 child WebView；取消菜单恢复可见性，不得销毁网页或改变活动页签。 */
   it("temporarily hides the native preview while the tab context menu is open", () => {
     const props = makeProps({ active: true, selectedTab: "preview", openTabs: ["preview"] });

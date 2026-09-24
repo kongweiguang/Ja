@@ -43,6 +43,16 @@ final class ConfigurationDocumentFactory {
         return root;
     }
 
+    /** 项目首次写入只创建其获准字段，CAS patch 不得借用户空文档引入 Provider。 */
+    ObjectNode createProjectEmpty() {
+        ObjectNode root = mapper.createObjectNode();
+        root.put("schema_version", CURRENT_SCHEMA_VERSION);
+        root.put("config_revision", 0);
+        root.putArray("skills");
+        root.putArray("mcp_servers");
+        return root;
+    }
+
     /**
      * 在发布前只推进 revision；schema 与其它当前字段必须由调用方显式提供并通过严格校验。
      *

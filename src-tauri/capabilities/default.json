@@ -24,6 +24,7 @@
     "notification:allow-request-permission",
     "notification:allow-notify",
     "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     "allow-ja-desktop-commands",
     "allow-ja-thread-seen",
     "log:allow-log",

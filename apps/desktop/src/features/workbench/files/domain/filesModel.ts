@@ -9,9 +9,9 @@ export function parentPath(path: string): string {
   return separator < 0 ? "" : path.slice(0, separator);
 }
 
-/** 只从受控相对路径派生叶子名，展示层不自行解释平台分隔符。 */
+/** 显示 workspace 相对路径或原生规范绝对路径的叶名，路径身份仍由调用方原样保留。 */
 export function entryName(path: string): string {
-  const separator = path.lastIndexOf("/");
+  const separator = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return separator < 0 ? path : path.slice(separator + 1);
 }
 

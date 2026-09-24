@@ -18,7 +18,8 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
- * 仅从已校验 ConfigGeneration Lease 创建的内存 MCP 服务配置。
+ * 仅从已校验 ConfigGeneration Lease 创建的内存 MCP 服务配置；stdio 环境只保存显式覆盖项，
+ * 宿主基线在建立 Session 时短暂合并，避免配置对象持有完整宿主环境。
  */
 public record McpServerDefinition(
         String id,
@@ -39,7 +40,7 @@ public record McpServerDefinition(
             "(?i)^--?(api.?key|secret|token|password|passwd|authorization|credential)(=|$).*");
 
     /**
-     * 在凭据解析后校验 stdio 与 HTTP 互斥结构，禁止混合传输字段。
+     * 在凭据解析后校验 stdio 与 HTTP 互斥结构；stdio 环境是配置覆盖与代际凭据的集合，不含宿主基线。
      */
     public McpServerDefinition {
         if (id == null || !IDENTIFIER.matcher(id).matches()) {
@@ -65,7 +66,7 @@ public record McpServerDefinition(
     }
 
     /**
-     * 创建 stdio 定义，子进程只接收此处显式列出的环境变量。
+     * 创建 stdio 定义；Session 启动时会把这里的配置覆盖叠加到宿主环境快照上。
      */
     public static McpServerDefinition stdio(
             String id,
@@ -106,14 +107,14 @@ public record McpServerDefinition(
     }
 
     /**
-     * 仅输出环境变量名与 Header 名，避免诊断意外泄露已解析认证材料。
+     * 仅输出计数与传输类型，不暴露环境变量名、值或命令参数，避免诊断投影运行环境及认证材料。
      */
     @Override
     public String toString() {
         return "McpServerDefinition[id=" + id
                + ", transport=" + transport
                + ", commandCount=" + command.size()
-               + ", environmentNames=" + environment.keySet()
+               + ", environmentCount=" + environment.size()
                + ", endpointPresent=" + (endpoint != null)
                + ", headerNames=" + headers.keySet()
                + ", bearerHeaders=" + bearerHeaders

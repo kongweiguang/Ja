@@ -50,10 +50,13 @@ impl TerminalSupervisor {
         }
     }
 
-    /// 返回 owner session 数量，使 workspace reconfiguration 与 shutdown 能拒绝遗弃存活 PTY tree。
+    /// 回收已完全结束的 generation 再返回 owner 数量，维持跨 workspace 汇总预算准确且不遗弃活跃 PTY。
     pub fn active_count(&self) -> usize {
         match self.lock_sessions() {
-            Ok(sessions) => sessions.len(),
+            Ok(mut sessions) => {
+                sessions.retain(|_, runtime| !runtime.is_reclaimable());
+                sessions.len()
+            }
             Err(_) => self.inner.policy.limits().max_sessions.max(1),
         }
     }

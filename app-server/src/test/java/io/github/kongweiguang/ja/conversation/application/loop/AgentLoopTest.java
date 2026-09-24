@@ -41,12 +41,15 @@ import io.github.kongweiguang.ja.foundation.json.JsonArray;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.foundation.json.JsonText;
+import io.github.kongweiguang.ja.foundation.json.JsonValue;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.ManagedAttachmentReader;
 import io.github.kongweiguang.ja.conversation.port.out.ModelEventSink;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSpec;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolSideEffect;
+import io.github.kongweiguang.ja.conversation.domain.tool.ToolOutcome;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
+import io.github.kongweiguang.ja.foundation.concurrent.CancellationSource;
 import io.github.kongweiguang.ja.conversation.port.out.JsonValueCodec;
 import io.github.kongweiguang.ja.conversation.port.out.ToolArgumentValidator;
 import io.github.kongweiguang.ja.support.TestJsonValueCodec;
@@ -62,7 +65,6 @@ import io.github.kongweiguang.ja.conversation.application.context.ContextOrchest
 import io.github.kongweiguang.ja.conversation.application.approval.InMemoryApprovalBroker;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryDocument;
 import io.github.kongweiguang.ja.conversation.application.context.summary.SummaryGenerator;
-import io.github.kongweiguang.ja.conversation.application.discovery.McpToolSearch;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -392,8 +394,14 @@ final class AgentLoopTest {
     void providerFailureMapsToModelUnavailableTerminal() {
         RecordingStore store = new RecordingStore();
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
-        ModelPort model = (request, sink, cancellation) -> CompletableFuture.failedFuture(
-                new ModelPort.ModelUnavailableException("provider request failed", null));
+        AtomicInteger attempts = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int attempt = attempts.incrementAndGet();
+            sink.onEvent(new ModelPort.UsageEvent(new ModelUsage(attempt, 1, attempt + 1)))
+                    .toCompletableFuture().join();
+            return CompletableFuture.failedFuture(
+                    new ModelPort.ModelUnavailableException("provider request failed", null));
+        };
 
         try (AgentLoop loop = loop(model, store, mcp)) {
             TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
@@ -403,6 +411,235 @@ final class AgentLoopTest {
             assertEquals("MODEL_UNAVAILABLE", result.terminal().errorCode());
             assertEquals("model provider is unavailable", result.terminal().errorMessage());
             assertEquals(1, store.terminalCommits);
+            assertEquals(6, attempts.get());
+            List<ConversationRepository.UsageFact> usageFacts = store.facts.stream()
+                    .filter(ConversationRepository.UsageFact.class::isInstance)
+                    .map(ConversationRepository.UsageFact.class::cast).toList();
+            assertEquals(6, usageFacts.stream().map(ConversationRepository.UsageFact::requestId).distinct().count());
+            assertEquals(List.of(1, 2, 3, 4, 5, 6), usageFacts.stream()
+                    .filter(fact -> fact.certainty() == ConversationRepository.UsageCertainty.KNOWN)
+                    .map(ConversationRepository.UsageFact::requestOrdinal).distinct().sorted().toList());
+        }
+    }
+
+    /** 五次可恢复失败后第六次成功；每次请求独立计量，半截正文不会进入重试 Prompt。 */
+    @Test
+    void retriesFiveTimesWithIndependentUsageThenSucceedsOnSixthAttempt() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger attempts = new AtomicInteger();
+        List<ModelPort.ModelRequest> requests = new CopyOnWriteArrayList<>();
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        ModelPort model = (request, sink, cancellation) -> {
+            requests.add(request);
+            int attempt = attempts.incrementAndGet();
+            assertEquals(ModelPort.RetryPolicy.SINGLE_ATTEMPT, request.retryPolicy());
+            assertEquals(ModelPort.RequestDeadlinePolicy.TURN_MANAGED, request.deadlinePolicy());
+            assertTrue(request.messages().stream().noneMatch(message -> message.content().stream()
+                    .anyMatch(content -> content instanceof TextContent text
+                            && (text.text().contains("discarded attempt")
+                                    || text.text().contains("discarded reasoning")))));
+            if (attempt < 6) {
+                sink.onEvent(new ModelPort.TextDelta("discarded attempt " + attempt))
+                        .toCompletableFuture().join();
+                sink.onEvent(new ModelPort.ReasoningSummaryDelta("discarded reasoning " + attempt))
+                        .toCompletableFuture().join();
+                sink.onEvent(new ModelPort.UsageEvent(new ModelUsage(attempt, 1, attempt + 1)))
+                        .toCompletableFuture().join();
+                return CompletableFuture.failedFuture(new ProviderProtocolException(
+                        "TRUNCATED_STREAM", "response ended early", true, "MODEL_STREAM_INVALID"));
+            }
+            sink.onEvent(new ModelPort.TextDelta("answer after retry")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(6, 1, 7)));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(), event -> {
+                events.add(event);
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(6, attempts.get());
+            assertEquals(6, requests.size());
+            List<TurnEvent.RetryStarted> retries = events.stream()
+                    .filter(TurnEvent.RetryStarted.class::isInstance)
+                    .map(TurnEvent.RetryStarted.class::cast).toList();
+            assertEquals(List.of(2, 3, 4, 5, 6), retries.stream().map(TurnEvent.RetryStarted::attempt).toList());
+            assertTrue(retries.stream().allMatch(event -> event.maxAttempts() == 6));
+            assertEquals("answer after retry", text(store.terminal.finalMessage()));
+            List<ConversationRepository.StoredMessage> partialAudits = store.messages.stream()
+                    .filter(message -> message.messageId().startsWith("item_partial_")).toList();
+            assertEquals(5, partialAudits.size());
+            assertEquals(5, partialAudits.stream().map(ConversationRepository.StoredMessage::messageId)
+                    .distinct().count());
+            assertTrue(partialAudits.stream().allMatch(message -> message.message().content().stream()
+                    .allMatch(TextContent.class::isInstance)
+                    && message.message().content().getFirst() instanceof TextContent text
+                    && text.text().startsWith("discarded attempt ")));
+            List<ConversationRepository.ReasoningSummaryFact> reasoningAudits = store.facts.stream()
+                    .filter(ConversationRepository.ReasoningSummaryFact.class::isInstance)
+                    .map(ConversationRepository.ReasoningSummaryFact.class::cast).toList();
+            assertEquals(5, reasoningAudits.size());
+            assertTrue(reasoningAudits.stream().allMatch(fact -> fact.messageId().startsWith("item_partial_")));
+            assertEquals(5, reasoningAudits.stream().map(ConversationRepository.ReasoningSummaryFact::text)
+                    .distinct().count());
+            List<List<ConversationRepository.Fact>> partialAuditCommits = store.commits.stream()
+                    .filter(commit -> commit.stream().anyMatch(fact -> fact instanceof ConversationRepository.AssistantFact
+                            assistant && assistant.messageId().startsWith("item_partial_")))
+                    .toList();
+            assertEquals(5, partialAuditCommits.size());
+            assertTrue(partialAuditCommits.stream().allMatch(commit ->
+                    commit.stream().anyMatch(fact -> fact instanceof ConversationRepository.UsageFact usage
+                            && usage.certainty() == ConversationRepository.UsageCertainty.KNOWN)
+                            && commit.stream().anyMatch(fact -> fact instanceof ConversationRepository.ReasoningSummaryFact
+                                    reasoning && commit.stream().anyMatch(candidate ->
+                                            candidate instanceof ConversationRepository.AssistantFact assistant
+                                                    && assistant.messageId().equals(reasoning.messageId())))));
+            List<ConversationRepository.UsageFact> usageFacts = store.facts.stream()
+                    .filter(ConversationRepository.UsageFact.class::isInstance)
+                    .map(ConversationRepository.UsageFact.class::cast).toList();
+            assertEquals(6, usageFacts.stream().map(ConversationRepository.UsageFact::requestId).distinct().count());
+            assertEquals(6, usageFacts.stream()
+                    .filter(fact -> fact.certainty() == ConversationRepository.UsageCertainty.KNOWN)
+                    .map(ConversationRepository.UsageFact::requestId).distinct().count());
+            assertEquals(List.of(1, 2, 3, 4, 5, 6), usageFacts.stream()
+                    .filter(fact -> fact.certainty() == ConversationRepository.UsageCertainty.KNOWN)
+                    .map(ConversationRepository.UsageFact::requestOrdinal).distinct().sorted().toList());
+        }
+    }
+
+    /** 400 类上游拒绝使用稳定分类并立即结束，不占用重试预算或发布 RetryStarted。 */
+    @Test
+    void upstreamRejectionStopsWithoutRetry() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger attempts = new AtomicInteger();
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        ModelPort model = (request, sink, cancellation) -> {
+            attempts.incrementAndGet();
+            return CompletableFuture.failedFuture(new ProviderProtocolException(
+                    "HTTP_STATUS", "request rejected", false, "MODEL_UPSTREAM_REJECTED"));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(), event -> {
+                events.add(event);
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+
+            assertEquals(TurnState.FAILED, result.state());
+            assertEquals("MODEL_UPSTREAM_REJECTED", result.terminal().errorCode());
+            assertEquals("model provider rejected the request", result.terminal().errorMessage());
+            assertEquals(1, attempts.get());
+            assertTrue(events.stream().noneMatch(TurnEvent.RetryStarted.class::isInstance));
+        }
+    }
+
+    /** Tool 调用只能来自完整重试响应并恰好执行一次；前一尝试的文本与摘要都不得进入上下文。 */
+    @Test
+    void retryCanCommitOneToolAndContinueToFinalAnswer() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicInteger toolExecutions = new AtomicInteger();
+        AgentTool tool = new EchoTool() {
+            /** 记录真实 Runner 调用次数，证明失败流中的内容从未触发 Tool 副作用。 */
+            @Override public CompletionStage<AgentTool.ToolResult> execute(AgentTool.Invocation invocation,
+                    AgentTool.ExecutionContext context, CancellationToken cancellationToken) {
+                toolExecutions.incrementAndGet();
+                return CompletableFuture.completedFuture(AgentTool.ToolResult.success("tool result"));
+            }
+        };
+        ModelPort model = (request, sink, cancellation) -> {
+            if (request.round() == 1) {
+                int attempt = attempts.incrementAndGet();
+                assertTrue(request.messages().stream().noneMatch(message -> message.content().stream()
+                        .anyMatch(content -> content instanceof TextContent text
+                                && (text.text().contains("discard this") || text.text().contains("reasoning draft")))));
+                if (attempt == 1) {
+                    sink.onEvent(new ModelPort.TextDelta("discard this partial"))
+                            .toCompletableFuture().join();
+                    sink.onEvent(new ModelPort.ReasoningSummaryDelta("reasoning draft"))
+                            .toCompletableFuture().join();
+                    sink.onEvent(new ModelPort.ToolCallReady("call_abandoned_retry", "echo",
+                            JsonObjects.builder().putText("value", "must not execute").build(), 0))
+                            .toCompletableFuture().join();
+                    return CompletableFuture.failedFuture(new ProviderProtocolException(
+                            "TRUNCATED_STREAM", "response ended early", true, "MODEL_STREAM_INVALID"));
+                }
+                sink.onEvent(new ModelPort.ToolCallReady("call_retry_tool", "echo",
+                        JsonObjects.builder().putText("value", "once").build(), 0)).toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(3, 1, 4)));
+            }
+            assertEquals(2, request.round());
+            assertTrue(request.messages().stream().anyMatch(message -> message.content().stream()
+                    .anyMatch(ToolCallContent.class::isInstance)));
+            assertTrue(request.messages().stream().anyMatch(message -> message.content().stream()
+                    .anyMatch(ToolResultContent.class::isInstance)));
+            sink.onEvent(new ModelPort.TextDelta("tool complete; final answer"))
+                    .toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(4, 2, 6)));
+        };
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(), event -> {
+                events.add(event);
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(2, attempts.get());
+            assertEquals(1, toolExecutions.get());
+            assertTrue(store.facts.stream().anyMatch(ConversationRepository.ToolResultFact.class::isInstance));
+            List<ConversationRepository.ToolPreparedFact> preparedTools = store.facts.stream()
+                    .filter(ConversationRepository.ToolPreparedFact.class::isInstance)
+                    .map(ConversationRepository.ToolPreparedFact.class::cast).toList();
+            assertEquals(1, preparedTools.size());
+            assertEquals("call_retry_tool", preparedTools.getFirst().callId());
+            assertTrue(store.messages.stream().anyMatch(message ->
+                    message.messageId().startsWith("item_partial_")
+                            && message.message().content().stream().anyMatch(content -> content instanceof TextContent text
+                                    && text.text().equals("discard this partial"))));
+            assertTrue(store.facts.stream().filter(ConversationRepository.ReasoningSummaryFact.class::isInstance)
+                    .map(ConversationRepository.ReasoningSummaryFact.class::cast)
+                    .anyMatch(fact -> fact.messageId().startsWith("item_partial_")
+                            && fact.text().equals("reasoning draft")));
+            assertEquals("tool complete; final answer", text(store.terminal.finalMessage()));
+            assertEquals(1, events.stream().filter(TurnEvent.RetryStarted.class::isInstance).count());
+        }
+    }
+
+    /** 取消退避会唤醒等待线程，并确保下一个网络尝试在取消到达后不会启动。 */
+    @Test
+    void cancellationInterruptsAssistantRetryBackoff() throws Exception {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger attempts = new AtomicInteger();
+        CountDownLatch retryPublished = new CountDownLatch(1);
+        CancellationSource cancellation = new CancellationSource();
+        ModelPort model = (request, sink, token) -> {
+            attempts.incrementAndGet();
+            return CompletableFuture.failedFuture(new ProviderProtocolException(
+                    "CONNECTION_RESET", "connection reset", true, "MODEL_UNAVAILABLE"));
+        };
+
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            CompletableFuture<TurnResult> future = CompletableFuture.supplyAsync(() ->
+                    run(loop, request(List.of(), mcp), cancellation, event -> {
+                        if (event instanceof TurnEvent.RetryStarted) retryPublished.countDown();
+                        return CompletableFuture.completedFuture(null);
+                    }).toCompletableFuture().join());
+            assertTrue(retryPublished.await(3, TimeUnit.SECONDS));
+            cancellation.cancel("user stop");
+
+            TurnResult result = future.get(3, TimeUnit.SECONDS);
+            assertEquals(TurnState.CANCELLED, result.state());
+            assertEquals(1, attempts.get());
         }
     }
 
@@ -435,6 +672,8 @@ final class AgentLoopTest {
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         ModelPort model = (request, sink, cancellation) -> {
             sink.onEvent(new ModelPort.TextDelta("已经生成的一半")).toCompletableFuture().join();
+            sink.onEvent(new ModelPort.ReasoningSummaryDelta("公开推理摘要的一半"))
+                    .toCompletableFuture().join();
             return CompletableFuture.failedFuture(
                     new ProviderProtocolException("TRUNCATED_STREAM", "provider stream ended", false));
         };
@@ -452,6 +691,9 @@ final class AgentLoopTest {
                     .findFirst()
                     .orElseThrow();
             assertTrue(partial.messageId().startsWith("item_partial_"));
+            assertTrue(store.facts.stream().filter(ConversationRepository.ReasoningSummaryFact.class::isInstance)
+                    .map(ConversationRepository.ReasoningSummaryFact.class::cast)
+                    .anyMatch(fact -> fact.text().equals("公开推理摘要的一半")));
             assertEquals("模型响应格式有误或不完整。", text(store.terminal.finalMessage()));
         }
     }
@@ -1590,21 +1832,19 @@ final class AgentLoopTest {
         assertEquals(store.committedRevision, terminal.context().threadRevision());
     }
 
-    /**
-     * 真实 Agent Loop 必须把大型 MCP 目录分成发现、恢复和执行三轮：首轮只暴露搜索入口，
-     * 搜索结果经 ToolOutputProjector 尾注后仍能恢复精确绑定，下一轮只暴露命中的定义并执行真实假 Tool。
-     */
+    /** Provider 每轮始终只收到固定 MCP 入口，远端目录搜索与精确调用留在网关内部。 */
     @Test
-    void discoversLargeMcpCatalogThenExecutesOnlyMatchedTool() {
+    void largeMcpCatalogUsesOneFixedGatewayAcrossProviderRounds() {
         RecordingStore store = new RecordingStore();
         AtomicReference<JsonObject> executedArguments = new AtomicReference<>();
-        List<AgentTool> mcpTools = new ArrayList<>();
-        mcpTools.add(new DiscoveryMcpTool("target_tool", "target tool", true, executedArguments));
+        List<ToolSpec> mcpTools = new ArrayList<>();
+        mcpTools.add(new ToolSpec("target_tool", "target tool", JsonObjects.builder().putText("type", "object").build()));
         for (int index = 0; index < 19; index++) {
-            mcpTools.add(new DiscoveryMcpTool("decoy_tool_" + index, "unrelated tool " + index,
-                    false, executedArguments));
+            mcpTools.add(new ToolSpec("decoy_tool_" + index, "unrelated tool " + index,
+                    JsonObjects.builder().putText("type", "object").build()));
         }
-        DiscoveryMcpFactory mcp = new DiscoveryMcpFactory(mcpTools);
+        DiscoveryMcpTool gateway = new DiscoveryMcpTool(mcpTools, executedArguments);
+        DiscoveryMcpFactory mcp = new DiscoveryMcpFactory(gateway);
         DiscoveryLoopModel model = new DiscoveryLoopModel();
 
         try (AgentLoop loop = loop(model, store, mcp)) {
@@ -1616,12 +1856,11 @@ final class AgentLoopTest {
 
         assertEquals(3, model.requests.size());
         assertEquals("payload", ((JsonText) executedArguments.get().get("value")).value());
-        assertEquals(1, mcpTools.stream().filter(tool -> tool instanceof DiscoveryMcpTool discovery
-                && discovery.executions.get() > 0).count());
-        long fullCatalogBytes = mcpTools.stream().mapToLong(tool -> tool.spec().name()
+        assertEquals(1, gateway.executions.get());
+        long fullCatalogBytes = mcpTools.stream().mapToLong(tool -> tool.name()
                 .getBytes(StandardCharsets.UTF_8).length
-                + tool.spec().description().getBytes(StandardCharsets.UTF_8).length
-                + AgentTool.canonicalSchema(tool.spec().inputSchema())
+                + tool.description().getBytes(StandardCharsets.UTF_8).length
+                + AgentTool.canonicalSchema(tool.inputSchema())
                 .getBytes(StandardCharsets.UTF_8).length).sum();
         long firstRequestBytes = model.requests.getFirst().tools().stream().mapToLong(spec -> spec.name()
                 .getBytes(StandardCharsets.UTF_8).length
@@ -1630,7 +1869,9 @@ final class AgentLoopTest {
         assertTrue(firstRequestBytes * 2 < fullCatalogBytes,
                 "first request must materially reduce the MCP schema envelope");
         assertTrue(model.searchResultHadProjectionFooter,
-                "the search result must pass through the normal bounded Tool output projector");
+                "the directory result must pass through the normal bounded Tool output projector");
+        assertTrue(model.requests.stream().allMatch(request -> request.tools().stream()
+                .map(ToolSpec::name).toList().equals(List.of("mcp"))));
     }
 
     /** 组合真实 Agent Loop 与隔离端口假实现，保持用例集中验证编排顺序。 */
@@ -2119,120 +2360,193 @@ final class AgentLoopTest {
         }
     }
 
-    /** 逐轮核对真实模型请求的可见工具集合，并以搜索、目标调用、终态文本驱动 Agent Loop。 */
+    /** 逐轮核对固定 Provider 工具名；目录搜索结果始终由同一网关继续处理。 */
     private static final class DiscoveryLoopModel implements ModelPort {
         private final List<ModelRequest> requests = new ArrayList<>();
         private boolean searchResultHadProjectionFooter;
 
-        /** 搜索结果必须先经过正常 Tool 消息投影，再由下一轮请求恢复命中的 MCP 定义。 */
+        /** 搜索结果经正常 Tool 投影后仍可指导同一 mcp 入口调用精确远端目标。 */
         @Override
         public CompletionStage<ModelOutcome> start(ModelRequest request, ModelEventSink sink,
                                                    CancellationToken cancellationToken) {
             requests.add(request);
             List<String> names = request.tools().stream().map(ToolSpec::name).toList();
             if (request.round() == 1) {
-                assertEquals(List.of(McpToolSearch.NAME), names);
+                assertEquals(List.of("mcp"), names);
                 sink.onEvent(new TextDelta("discover"));
-                sink.onEvent(new ToolCallReady("call_search", McpToolSearch.NAME,
-                        JsonObjects.builder().putText("query", "target_tool").build(), 0));
+                sink.onEvent(new ToolCallReady("call_search", "mcp",
+                        mcpArguments("search", null, null, "target_tool", 0, null), 0));
                 return CompletableFuture.completedFuture(new ModelOutcome(FinishReason.TOOL_CALLS,
-                        new Continuation("test", "target"), new ModelUsage(1, 1, 2)));
+                        new Continuation("test", "search"), new ModelUsage(1, 1, 2)));
             }
             if (request.round() == 2) {
                 ToolResultContent searchResult = latestToolResult(request);
                 searchResultHadProjectionFooter = searchResult.content().contains("\n[characters=");
-                assertTrue(names.contains(McpToolSearch.NAME));
-                assertTrue(names.contains("target_tool"));
-                assertTrue(names.stream().noneMatch(name -> name.startsWith("decoy_tool_")));
+                assertEquals(List.of("mcp"), names);
+                assertTrue(searchResult.content().contains("target_tool"));
+                assertFalse(searchResult.content().contains("decoy_tool_"));
                 sink.onEvent(new TextDelta("execute"));
-                sink.onEvent(new ToolCallReady("call_target", "target_tool",
-                        JsonObjects.builder().putText("value", "payload").build(), 0));
+                sink.onEvent(new ToolCallReady("call_target", "mcp",
+                        mcpArguments("call", "test_mcp", "target_tool", null, null,
+                                "{\"value\":\"payload\"}"), 0));
                 return CompletableFuture.completedFuture(new ModelOutcome(FinishReason.TOOL_CALLS,
-                        new Continuation("test", "done"), new ModelUsage(1, 1, 2)));
+                        new Continuation("test", "call"), new ModelUsage(1, 1, 2)));
             }
             assertEquals(3, request.round());
-            assertTrue(names.contains("target_tool"));
+            assertEquals(List.of("mcp"), names);
+            assertTrue(latestToolResult(request).content().contains("target-result"));
             sink.onEvent(new TextDelta("complete"));
             return CompletableFuture.completedFuture(new ModelOutcome(FinishReason.STOP, null,
                     new ModelUsage(1, 1, 2)));
         }
     }
 
-    /** 将冻结 MCP 假工具作为每轮独占会话返回，覆盖真实 Loop 的发现与执行资源生命周期。 */
+    /** 将唯一固定 MCP 网关作为每轮独占会话返回，覆盖 Provider 目录声明与结果配对。 */
     private static final class DiscoveryMcpFactory implements TurnToolSessionFactory {
-        private final List<AgentTool> tools;
+        private final AgentTool gateway;
 
-        /** 保留不可变 Tool 快照，使测试不会因会话重开而隐式改变目录。 */
-        private DiscoveryMcpFactory(List<AgentTool> tools) {
-            this.tools = List.copyOf(tools);
+        /** 每轮返回同一固定网关；目录条目只在网关内存中保留。 */
+        private DiscoveryMcpFactory(AgentTool gateway) {
+            this.gateway = gateway;
         }
 
-        /** 每轮都返回同一代 MCP 目录，保证搜索摘要可与执行路由精确配对。 */
+        /** 每轮都返回唯一 mcp 入口，避免远端工具名称进入 Provider Schema。 */
         @Override
         public Session open(CancellationToken cancellationToken) {
             return new Session() {
-                /** 返回固定 MCP 快照，保证每轮发现与执行使用同一组路由身份。 */
+                /** 返回固定入口，不向 Provider 暴露 fixture 中的远端目录。 */
                 @Override
                 public List<AgentTool> tools() {
-                    return tools;
+                    return List.of(gateway);
                 }
 
-                /** 测试快照没有外部句柄，但保留真实 Session 的关闭边界。 */
+                /** 测试网关没有外部句柄，仍保持真实 Session 的幂等关闭边界。 */
                 @Override
                 public void close() {
-                    // 测试快照无外部资源，保留空关闭实现以覆盖 Session 生命周期。
+                    // 固定测试目录无外部资源。
                 }
             };
         }
     }
 
-    /** 具备严格必填参数 Schema 的 MCP 假工具，记录唯一真实目标调用以防止误执行未命中工具。 */
+    /** Provider fixture 只实现固定 action 入口，模拟较大目录的本地搜索和精确调用。 */
     private static final class DiscoveryMcpTool implements AgentTool {
         private final ToolSpec spec;
-        private final boolean target;
+        private final Map<String, ToolSpec> remoteTools;
         private final AtomicReference<JsonObject> executedArguments;
         private final AtomicInteger executions = new AtomicInteger();
-        private final ToolBindingDescriptor binding;
+        private final ToolBindingDescriptor gatewayBinding;
 
-        /** 目标工具要求 value 字符串，借此让 AgentToolRunner 的生产参数校验参与集成测试。 */
-        private DiscoveryMcpTool(String name, String description, boolean target,
-                                 AtomicReference<JsonObject> executedArguments) {
-            this.spec = new ToolSpec(name, description,
-                    JsonObjects.builder().putText("type", "object")
-                            .put("properties", JsonObjects.builder()
-                                    .put("value", JsonObjects.builder().putText("type", "string").build())
-                                    .build())
-                            .put("required", new JsonArray(List.of(new JsonText("value"))))
-                            .putBoolean("additionalProperties", false).build());
-            this.target = target;
+        /** 冻结远端目录并声明 Ja 固定 MCP action 入口，避免测试依赖生产类的私有 Schema。 */
+        private DiscoveryMcpTool(List<ToolSpec> remoteTools, AtomicReference<JsonObject> executedArguments) {
+            this.spec = new ToolSpec(McpAgentTool.NAME, "Inspect and use the MCP tools available to this request.",
+                    JsonObjects.builder().putText("type", "object").build());
+            this.remoteTools = remoteTools.stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
+                    ToolSpec::name, tool -> tool));
             this.executedArguments = executedArguments;
-            this.binding = new ToolBindingDescriptor(RouteKind.MCP, name, "test_mcp", name,
-                    "a".repeat(64), "b".repeat(64));
+            this.gatewayBinding = new ToolBindingDescriptor(RouteKind.MCP, "mcp", "mcp-gateway", "mcp",
+                    "c".repeat(64), "d".repeat(64));
         }
 
-        /** 暴露与搜索摘要相同的不可变 MCP 定义。 */
+        /** 返回唯一固定 Provider 声明。 */
         @Override
         public ToolSpec spec() {
             return spec;
         }
 
-        /** 固定 MCP 路由身份，确保搜索恢复不是仅凭工具名称的宽松匹配。 */
+        /** 基础绑定只代表网关；真实 route 身份按每次精确 call 动态生成。 */
         @Override
         public ToolBindingDescriptor bindingDescriptor() {
-            return binding;
+            return gatewayBinding;
         }
 
-        /** 记录通过生产参数校验的目标调用，未命中的扩展工具不应产生执行事实。 */
+        /** 在 Loop 中保留与生产网关相同的 action 风险分类。 */
+        @Override
+        public ToolSideEffect sideEffect(Invocation invocation) {
+            return action(invocation).equals("call") ? ToolSideEffect.EXTERNAL : ToolSideEffect.READ_ONLY;
+        }
+
+        /** 远端 call 的工作区写入无法观察，本地目录动作不改变 Workspace。 */
+        @Override
+        public WorkspaceMutationMode workspaceMutationMode(Invocation invocation) {
+            return action(invocation).equals("call") ? WorkspaceMutationMode.UNOBSERVABLE
+                    : WorkspaceMutationMode.NONE;
+        }
+
+        /** 搜索只读 action 可以在 Plan 阶段执行；call 仍保留用户审批。 */
+        @Override
+        public ApprovalRequirement approvalRequirement(Invocation invocation) {
+            return action(invocation).equals("call") ? ApprovalRequirement.USER_REQUIRED
+                    : ApprovalRequirement.TRUSTED_INTERNAL;
+        }
+
+        /** 精确 call 在 ToolPreparedFact 前绑定远端名称和服务 ID。 */
+        @Override
+        public ToolBindingDescriptor bindingDescriptor(Invocation invocation) {
+            String remoteName = text(invocation.arguments(), "toolName");
+            return action(invocation).equals("call") && remoteTools.containsKey(remoteName)
+                    ? new ToolBindingDescriptor(RouteKind.MCP, "mcp", "test_mcp", remoteName,
+                            "a".repeat(64), "b".repeat(64)) : gatewayBinding;
+        }
+
+        /** 在真实 AgentLoop 内提供本地 search 与精确 call，错误结果仍与原 callId 配对。 */
         @Override
         public CompletionStage<ToolResult> execute(Invocation invocation, ExecutionContext context,
                                                     CancellationToken cancellationToken) {
-            executions.incrementAndGet();
-            if (target) {
-                executedArguments.set(invocation.arguments());
-                return CompletableFuture.completedFuture(ToolResult.success("target-result"));
+            String action = action(invocation);
+            if (action.equals("search")) {
+                String query = text(invocation.arguments(), "query");
+                List<JsonValue> matches = remoteTools.values().stream()
+                        .filter(tool -> tool.name().contains(query) || tool.description().contains(query))
+                        .sorted(java.util.Comparator.comparing(ToolSpec::name))
+                        .map(tool -> (JsonValue) JsonObjects.builder().putText("serverId", "test_mcp")
+                                .putText("toolName", tool.name()).putText("description", tool.description()).build())
+                        .toList();
+                return CompletableFuture.completedFuture(ToolResult.success(argumentsCodec().encode(
+                        JsonObjects.builder().put("tools", new JsonArray(matches))
+                                .putNumber("totalMatches", matches.size()).build())));
             }
-            return CompletableFuture.completedFuture(ToolResult.success("decoy-result"));
+            if (!action.equals("call") || !"test_mcp".equals(text(invocation.arguments(), "serverId"))) {
+                return CompletableFuture.completedFuture(new ToolResult(ToolOutcome.FAILED,
+                        "MCP tool target is unavailable.", java.util.Optional.empty(), "MCP_TOOL_NOT_FOUND"));
+            }
+            String remoteName = text(invocation.arguments(), "toolName");
+            if (!remoteTools.containsKey(remoteName)) {
+                return CompletableFuture.completedFuture(new ToolResult(ToolOutcome.FAILED,
+                        "MCP tool target is unavailable.", java.util.Optional.empty(), "MCP_TOOL_NOT_FOUND"));
+            }
+            executions.incrementAndGet();
+            executedArguments.set(argumentsCodec().decodeObject(text(invocation.arguments(), "argumentsJson")));
+            return CompletableFuture.completedFuture(ToolResult.success("target-result"));
         }
+
+        /** 读取固定网关字符串字段；输入由生产外层 Schema 校验器先验证。 */
+        private static String text(JsonObject arguments, String key) {
+            return arguments.get(key) instanceof JsonText value ? value.value() : "";
+        }
+
+        /** action 空值按未知外部动作处理，fixture 只将明确枚举视作只读。 */
+        private static String action(Invocation invocation) {
+            return text(invocation.arguments(), "action");
+        }
+    }
+
+    /** 构造完整 strict-compatible mcp 参数对象，所有辅助字段保持必填可空。 */
+    private static JsonObject mcpArguments(String action, String serverId, String toolName,
+                                           String query, Integer offset, String argumentsJson) {
+        return JsonObjects.builder()
+                .putText("action", action)
+                .put("serverId", serverId == null ? io.github.kongweiguang.ja.foundation.json.JsonNull.INSTANCE
+                        : new JsonText(serverId))
+                .put("toolName", toolName == null ? io.github.kongweiguang.ja.foundation.json.JsonNull.INSTANCE
+                        : new JsonText(toolName))
+                .put("query", query == null ? io.github.kongweiguang.ja.foundation.json.JsonNull.INSTANCE
+                        : new JsonText(query))
+                .put("offset", offset == null ? io.github.kongweiguang.ja.foundation.json.JsonNull.INSTANCE
+                        : new io.github.kongweiguang.ja.foundation.json.JsonNumber(offset))
+                .put("argumentsJson", argumentsJson == null
+                        ? io.github.kongweiguang.ja.foundation.json.JsonNull.INSTANCE : new JsonText(argumentsJson))
+                .build();
     }
 
     /** 在模型执行中触发后续准入的假实现，用于复现同 Thread revision 竞争。 */
@@ -2538,6 +2852,15 @@ final class AgentLoopTest {
 
     /** 记录提交事实、revision 与消息的存储假实现，用于断言 Agent Loop 原子顺序。 */
     private static final class RecordingStore implements ConversationRepository {
+        /** Agent Loop 夹具不参与人工恢复资格判断，误调用必须明确失败。 */
+        @Override public Optional<String> findLastUnansweredQuestionMessageId(
+                String threadId, long expectedThreadRevision) {
+            throw new UnsupportedOperationException("question recovery is not configured by this test");
+        }
+        /** Agent Loop 夹具不执行历史路径切换，误调用必须明确失败。 */
+        @Override public AdmissionReceipt admitReask(ReaskAdmission admission) {
+            throw new UnsupportedOperationException("question reask is not configured by this test");
+        }
         private List<TaskMailboxPort.ClaimedMessage> mailbox = List.of();
         private boolean mailboxConsumed;
 
@@ -2713,7 +3036,7 @@ final class AgentLoopTest {
         @Override public Optional<TurnSnapshot> findTurn(String threadId, String turnId) {
             return Optional.of(new TurnSnapshot(threadId, turnId, state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, committedRevision,
-                    turnMutationVersion));
+                    turnMutationVersion, true, null, null));
         }
         /** 只回读已经随 ToolPreparedFact 提交的冻结 binding，禁止 fake 从当前 Tool 目录补造路由。 */
         @Override public Optional<ToolBinding> findToolBinding(String turnId, String callId) {
@@ -2735,12 +3058,12 @@ final class AgentLoopTest {
         @Override public Optional<ThreadSnapshot> readThread(String threadId) {
             TurnSnapshot turn = new TurnSnapshot("thr_test", "turn_test", state,
                     CLOCK.instant(), CLOCK.instant(), state.terminal() ? CLOCK.instant() : null, committedRevision,
-                    turnMutationVersion);
+                    turnMutationVersion, true, null, null);
             List<TurnSnapshot> turns = new ArrayList<>(List.of(turn));
             if (laterAdmitted) {
                 turns.add(new TurnSnapshot("thr_test", "turn_later", TurnState.QUEUED,
                         CLOCK.instant().plusSeconds(1), CLOCK.instant().plusSeconds(1), null,
-                        committedRevision, 0));
+                        committedRevision, 0, true, null, null));
             }
             return Optional.of(new ThreadSnapshot("thr_test", "ws_test", "test", preferences(),
                     committedRevision, turns, messages, CLOCK.instant(), CLOCK.instant()));

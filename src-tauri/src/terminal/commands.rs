@@ -11,11 +11,12 @@ use super::model::{
     CloseReason, LaunchRequest, ShellProfile, TerminalEvent, TerminalId, TerminalSize,
 };
 use super::native_drop::quote_native_paths;
-use super::policy::{TerminalPolicy, available_shell_profiles};
+use super::policy::{TerminalLimits, TerminalPolicy, available_shell_profiles};
 use super::session::{SessionHandle, TerminalSupervisor};
 use crate::app_runtime::RuntimeHost;
 use crate::workspace::{WorkspaceError, consume_native_drop};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -47,7 +48,7 @@ impl TerminalWorkspaceResolver for RuntimeHost {
     }
 }
 
-/// 受管终端状态；共享 lifecycle 锁围绕唯一 PTY owner 串行化 open、workspace close 与应用退出。
+/// 受管终端状态；每个 Java workspace identity 独立持有 supervisor，PTY 可跨会话切换存活。
 #[derive(Clone)]
 pub struct TerminalCommandHost {
     pub(crate) lifecycle: Arc<Mutex<TerminalHostLifecycle>>,
@@ -61,7 +62,7 @@ pub struct TerminalCommandHost {
 /// 必须继续处理同一批 owner。
 #[derive(Default)]
 pub(crate) struct TerminalHostLifecycle {
-    pub(crate) supervisor: Option<ConfiguredSupervisor>,
+    pub(crate) supervisors: HashMap<String, ConfiguredSupervisor>,
     pub(crate) shutdown_started: bool,
 }
 
@@ -90,10 +91,7 @@ impl TerminalCommandHost {
         Self::default()
     }
 
-    /// 配置一个原生解析的 workspace，并在 binding 完全一致时复用现有实例。
-    ///
-    /// 切换 workspace 必须显式经过 `close_all`；相同 id 也只有在旧 supervisor 为空后才能
-    /// 绑定新 canonical root，避免 stale renderer 搬动仍存活的 PTY。
+    /// 配置独立 workspace supervisor；切换当前 UI 不触发其他 workspace 的 terminal cleanup。
     pub fn configure(
         &self,
         workspace_id: String,
@@ -106,7 +104,7 @@ impl TerminalCommandHost {
             return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
         }
         Self::bind_supervisor(
-            &mut lifecycle.supervisor,
+            &mut lifecycle.supervisors,
             workspace_id,
             workspace_root,
             policy,
@@ -114,37 +112,38 @@ impl TerminalCommandHost {
         .map(|_| ())
     }
 
-    /// 为 canonical workspace binding 选择唯一原生 supervisor。
+    /// 为 Java identity 绑定 canonical workspace root 与唯一原生 supervisor。
     ///
-    /// 调用方必须持有 host mutex；一致 binding 复用 supervisor 以支持多 pane，拒绝存活期间
-    /// 的 root 变化则保证每个 pane 始终留在最初安全边界内。
+    /// 调用方必须持有 host mutex；相同 binding 复用 supervisor，Java identity 的 root 不可变，
+    /// 因而同 ID 的路径变化始终拒绝，即使此前 PTY 已关闭。
     fn bind_supervisor(
-        slot: &mut Option<ConfiguredSupervisor>,
+        supervisors: &mut HashMap<String, ConfiguredSupervisor>,
         workspace_id: String,
         workspace_root: PathBuf,
         policy: TerminalPolicy,
     ) -> Result<TerminalSupervisor, TerminalError> {
-        if let Some(current) = slot.as_ref() {
-            if current.workspace_id == workspace_id && current.workspace_root == workspace_root {
+        if let Some(current) = supervisors.get(&workspace_id) {
+            if current.workspace_root == workspace_root {
                 return Ok(current.supervisor.clone());
             }
-            if current.workspace_id != workspace_id || current.supervisor.active_count() != 0 {
-                return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
-            }
+            return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
         }
         let supervisor = TerminalSupervisor::new(policy);
-        *slot = Some(ConfiguredSupervisor {
-            workspace_id,
-            workspace_root,
-            supervisor: supervisor.clone(),
-        });
+        supervisors.insert(
+            workspace_id.clone(),
+            ConfiguredSupervisor {
+                workspace_id,
+                workspace_root,
+                supervisor: supervisor.clone(),
+            },
+        );
         Ok(supervisor)
     }
 
     /// 只有原子选择原生 workspace binding 后才创建 session。
     ///
-    /// `supervisor.open` 期间刻意保持 host mutex；否则 root 重绑定可能插入一个脱离 command
-    /// host 的 PTY，使后续 close/input 无法可靠定位 owner。
+    /// `supervisor.open` 期间刻意保持 host mutex；否则 lifecycle shutdown 可能在 map 插入
+    /// 前错过新 PTY，使其脱离 host 的有界回收路径。
     pub fn open(
         &self,
         workspace_id: &str,
@@ -157,8 +156,18 @@ impl TerminalCommandHost {
         if lifecycle.shutdown_started {
             return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
         }
+        // The former single supervisor enforced one host-wide eight-session ceiling; retaining it
+        // here avoids multiplying PTY and worker budgets by the number of open Threads.
+        let total_sessions = lifecycle
+            .supervisors
+            .values()
+            .map(|configured| configured.supervisor.active_count())
+            .sum::<usize>();
+        if total_sessions >= TerminalLimits::default().max_sessions {
+            return Err(TerminalError::new(TerminalErrorCode::SessionLimit));
+        }
         let supervisor = Self::bind_supervisor(
-            &mut lifecycle.supervisor,
+            &mut lifecycle.supervisors,
             workspace_id.to_owned(),
             workspace_root,
             policy,
@@ -166,23 +175,19 @@ impl TerminalCommandHost {
         supervisor.open(request)
     }
 
-    /// workspace 切换前关闭其全部 PTY；只有进程树与 worker 都确认退出后才清空 supervisor，
-    /// 因此失败 owner 始终可观察并可重试。
+    /// 仅关闭指定 workspace 的 PTY；失败时保留对应 supervisor，以便精确重试且不影响其他会话。
     pub fn close_all(&self, workspace_id: &str, deadline: Instant) -> Result<(), TerminalError> {
         validate_workspace_id(workspace_id)?;
         let mut lifecycle = self.lock_lifecycle(deadline)?;
         if lifecycle.shutdown_started {
             return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
         }
-        let Some(current) = lifecycle.supervisor.as_ref() else {
+        let Some(current) = lifecycle.supervisors.get(workspace_id) else {
             return Ok(());
         };
-        if current.workspace_id != workspace_id {
-            return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
-        }
         // shutdown 完成前持续锁定 binding，防止并发 open 在 supervisor 快照后插入孤儿 PTY。
         current.supervisor.shutdown_until(deadline)?;
-        lifecycle.supervisor = None;
+        lifecycle.supervisors.remove(workspace_id);
         Ok(())
     }
 
@@ -192,23 +197,33 @@ impl TerminalCommandHost {
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), TerminalError> {
         let mut lifecycle = self.lock_lifecycle(deadline)?;
         lifecycle.shutdown_started = true;
-        let result = lifecycle
-            .supervisor
-            .as_ref()
-            .map_or(Ok(()), |value| value.supervisor.shutdown_until(deadline));
-        if result.is_ok() {
-            lifecycle.supervisor = None;
+        let workspace_ids = lifecycle.supervisors.keys().cloned().collect::<Vec<_>>();
+        let mut first_error = None;
+        for workspace_id in workspace_ids {
+            let Some(configured) = lifecycle.supervisors.get(&workspace_id) else {
+                continue;
+            };
+            match configured.supervisor.shutdown_until(deadline) {
+                Ok(()) => {
+                    lifecycle.supervisors.remove(&workspace_id);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
-        result
+        first_error.map_or(Ok(()), Err)
     }
 
     /// 只报告 host 是否已不再持有终端进程，不暴露内部 session 集合。
     pub fn is_empty(&self) -> bool {
         match self.lock_lifecycle(Self::poison_cleanup_deadline()) {
             Ok(lifecycle) => lifecycle
-                .supervisor
-                .as_ref()
-                .is_none_or(|configured| configured.supervisor.active_count() == 0),
+                .supervisors
+                .values()
+                .all(|configured| configured.supervisor.active_count() == 0),
             Err(_) => false,
         }
     }
@@ -222,7 +237,7 @@ impl TerminalCommandHost {
     }
 
     /// 仅在检查 shutdown fence 与查找 owner 时持有 host mutex，并捕获已准入 generation；
-    /// 返回的 clone 不携带 lifecycle guard，PTY 回收不会阻塞 workspace close 或应用退出。
+    /// 扫描多个 workspace 时只折叠真实 miss，保留 stale 与内部错误分类，且重复 identity 失败关闭。
     pub(crate) fn close_owner(
         &self,
         session_id: TerminalId,
@@ -232,16 +247,79 @@ impl TerminalCommandHost {
         if lifecycle.shutdown_started {
             return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
         }
-        let supervisor = lifecycle
-            .supervisor
-            .as_ref()
-            .map(|configured| configured.supervisor.clone())
-            .ok_or(TerminalError::new(TerminalErrorCode::InvalidConfig))?;
-        let session = supervisor.get(session_id, generation)?;
-        Ok(TerminalCloseOwner {
-            supervisor,
-            session,
-        })
+        let mut owner = None;
+        let mut stale_generation = false;
+        for configured in lifecycle.supervisors.values() {
+            validate_workspace_id(&configured.workspace_id)?;
+            match configured.supervisor.get(session_id, generation) {
+                Ok(session) => {
+                    if owner.is_some() || stale_generation {
+                        return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
+                    }
+                    owner = Some(TerminalCloseOwner {
+                        supervisor: configured.supervisor.clone(),
+                        session,
+                    });
+                }
+                Err(error) => match error.code() {
+                    TerminalErrorCode::SessionNotFound => {}
+                    TerminalErrorCode::StaleGeneration if !stale_generation && owner.is_none() => {
+                        stale_generation = true;
+                    }
+                    TerminalErrorCode::StaleGeneration => {
+                        return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
+                    }
+                    _ => return Err(error),
+                },
+            }
+        }
+        match owner {
+            Some(owner) if !stale_generation => Ok(owner),
+            Some(_) => Err(TerminalError::new(TerminalErrorCode::InvalidConfig)),
+            None if stale_generation => Err(TerminalError::new(TerminalErrorCode::StaleGeneration)),
+            None => Err(TerminalError::new(TerminalErrorCode::SessionNotFound)),
+        }
+    }
+
+    /// 按 opaque session generation 在所有保留的 workspace owner 中定位唯一终端；真实 miss 与 stale 分开，重复 identity 失败关闭。
+    pub(crate) fn session_owner(
+        &self,
+        session_id: TerminalId,
+        generation: u64,
+    ) -> Result<SessionHandle, TerminalError> {
+        let lifecycle = self.lock_lifecycle(Self::poison_cleanup_deadline())?;
+        if lifecycle.shutdown_started {
+            return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
+        }
+        let mut owner = None;
+        let mut stale_generation = false;
+        for configured in lifecycle.supervisors.values() {
+            validate_workspace_id(&configured.workspace_id)?;
+            match configured.supervisor.get(session_id, generation) {
+                Ok(session) => {
+                    if owner.is_some() || stale_generation {
+                        return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
+                    }
+                    owner = Some(session);
+                }
+                Err(error) => match error.code() {
+                    TerminalErrorCode::SessionNotFound => {}
+                    TerminalErrorCode::StaleGeneration if !stale_generation && owner.is_none() => {
+                        stale_generation = true;
+                    }
+                    TerminalErrorCode::StaleGeneration => {
+                        return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
+                    }
+                    _ => return Err(error),
+                },
+            }
+        }
+        match owner {
+            Some(owner) if !stale_generation => Ok(owner),
+            Some(_) => Err(TerminalError::new(TerminalErrorCode::InvalidConfig)),
+            None if stale_generation => Err(TerminalError::new(TerminalErrorCode::StaleGeneration)),
+            None => Err(TerminalError::new(TerminalErrorCode::SessionNotFound)),
+        }
     }
 
     /// host lifecycle poison 会使 workspace binding 与 shutdown fence 的线性化点失效；
@@ -263,27 +341,30 @@ impl TerminalCommandHost {
         }
     }
 
-    /// 重建只保留“shutdown 已开始”不变量：取出 supervisor 后有界关闭，
-    /// 失败 owner 放回关闭态 lifecycle，禁止资源因局部重建而丢失。
+    /// 重建只保留“shutdown 已开始”不变量：有界关闭全部 workspace supervisors，失败 owner
+    /// 留在关闭态 lifecycle，禁止资源因局部重建而丢失。
     fn fail_closed_lifecycle(&self, deadline: Instant) {
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
         self.lifecycle.clear_poison();
-        let configured = match self.lifecycle.lock() {
+        let supervisors = match self.lifecycle.lock() {
             Ok(mut lifecycle) => {
                 lifecycle.shutdown_started = true;
-                lifecycle.supervisor.take()
+                std::mem::take(&mut lifecycle.supervisors)
             }
-            Err(_) => None,
+            Err(_) => HashMap::new(),
         };
-        let Some(configured) = configured else {
-            return;
-        };
-        if configured.supervisor.shutdown_until(deadline).is_err()
+        let mut failed = HashMap::new();
+        for (workspace_id, configured) in supervisors {
+            if configured.supervisor.shutdown_until(deadline).is_err() {
+                failed.insert(workspace_id, configured);
+            }
+        }
+        if !failed.is_empty()
             && let Ok(mut lifecycle) = self.lifecycle.lock()
         {
-            lifecycle.supervisor = Some(configured);
+            lifecycle.supervisors = failed;
         }
     }
 
@@ -333,7 +414,7 @@ pub struct TerminalOpenInput {
     pub size: TerminalSize,
 }
 
-/// 在替换原生 binding 前关闭一个 workspace 的全部 PTY。
+/// 关闭指定 workspace 的全部 PTY，其它 Thread 的 terminal owners 保持存活。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalCloseAllInput {
@@ -500,11 +581,9 @@ pub fn ja_terminal_input(
     input: TerminalInput,
     state: tauri::State<'_, TerminalCommandHost>,
 ) -> Result<(), TerminalError> {
-    state.with_any_supervisor(|supervisor| {
-        supervisor
-            .get(input.session_id, input.generation)?
-            .send_input(&input.data, Duration::from_secs(5))
-    })
+    state
+        .session_owner(input.session_id, input.generation)?
+        .send_input(&input.data, Duration::from_secs(5))
 }
 
 /// 把安全引用的原生路径插入存活 PTY，但不追加命令终止符；消费 token 前必须先验证 session owner。
@@ -553,11 +632,9 @@ pub fn ja_terminal_resize(
     input: TerminalResizeInput,
     state: tauri::State<'_, TerminalCommandHost>,
 ) -> Result<(), TerminalError> {
-    state.with_any_supervisor(|supervisor| {
-        supervisor
-            .get(input.session_id, input.generation)?
-            .resize(input.size)
-    })
+    state
+        .session_owner(input.session_id, input.generation)?
+        .resize(input.size)
 }
 
 /// 每次只轮询一条 output/control event，避免把 Tauri command queue 变成无界 stream；
@@ -572,8 +649,7 @@ pub async fn ja_terminal_poll(
         .checked_add(timeout)
         .ok_or(TerminalError::new(TerminalErrorCode::DeadlineExceeded))?;
     let permit = state.try_poll_permit()?;
-    let handle = state
-        .with_any_supervisor(|supervisor| supervisor.get(input.session_id, input.generation))?;
+    let handle = state.session_owner(input.session_id, input.generation)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         handle.recv_until(deadline)
@@ -588,11 +664,9 @@ pub fn ja_terminal_scrollback(
     input: TerminalPollInput,
     state: tauri::State<'_, TerminalCommandHost>,
 ) -> Result<Vec<u8>, TerminalError> {
-    state.with_any_supervisor(|supervisor| {
-        supervisor
-            .get(input.session_id, input.generation)
-            .and_then(|handle| handle.scrollback())
-    })
+    state
+        .session_owner(input.session_id, input.generation)?
+        .scrollback()
 }
 
 /// 在有界 blocking worker 中关闭 session；先在 host mutex 下捕获已准入 generation，释放锁后
@@ -629,47 +703,13 @@ pub(crate) async fn run_bounded_terminal_close(
 }
 
 impl TerminalCommandHost {
-    /// 只从当前原生 workspace 绑定的 supervisor 解析 generation；伪造或 stale identity
-    /// 必须在消费 drop token 前失败。
+    /// 从所有原生 workspace bindings 解析确切 generation；伪造或 stale identity 必须在消费 drop token 前失败。
     fn owned_session(
         &self,
         session_id: TerminalId,
         generation: u64,
     ) -> Result<SessionHandle, TerminalError> {
-        let lifecycle = self.lock_lifecycle(Self::poison_cleanup_deadline())?;
-        if lifecycle.shutdown_started {
-            return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
-        }
-        let (workspace_id, supervisor) = lifecycle
-            .supervisor
-            .as_ref()
-            .map(|configured| {
-                (
-                    configured.workspace_id.clone(),
-                    configured.supervisor.clone(),
-                )
-            })
-            .ok_or(TerminalError::new(TerminalErrorCode::InvalidConfig))?;
-        validate_workspace_id(&workspace_id)?;
-        supervisor.get(session_id, generation)
-    }
-
-    /// session identity command 只使用已配置的原生 supervisor；workspace 切换会先执行
-    /// close-all，因此这里不接受路径参数。
-    fn with_any_supervisor<T>(
-        &self,
-        operation: impl FnOnce(&TerminalSupervisor) -> Result<T, TerminalError>,
-    ) -> Result<T, TerminalError> {
-        let lifecycle = self.lock_lifecycle(Self::poison_cleanup_deadline())?;
-        if lifecycle.shutdown_started {
-            return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
-        }
-        let supervisor = lifecycle
-            .supervisor
-            .as_ref()
-            .map(|configured| configured.supervisor.clone())
-            .ok_or(TerminalError::new(TerminalErrorCode::InvalidConfig))?;
-        operation(&supervisor)
+        self.session_owner(session_id, generation)
     }
 }
 

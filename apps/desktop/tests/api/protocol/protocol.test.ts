@@ -434,6 +434,7 @@ describe("JA RPC v1 protocol", () => {
     };
     const turn = {
       turnId: "turn_demo",
+      sourceMessageId: null,
       status: "running" as const,
       requestedAt: "2026-09-03T01:00:00Z",
       updatedAt: "2026-09-03T01:00:00Z",
@@ -582,6 +583,8 @@ describe("JA RPC v1 protocol", () => {
     const historicalThread = {
       threadId: "thr_legacy",
       workspaceId: "ws_demo",
+      workspaceKind: "project",
+      legacySharedWorkspaceId: null,
       preferences: null,
       title: "Historical thread",
       status: "archived",
@@ -774,5 +777,30 @@ describe("JA RPC v1 protocol", () => {
         byteLength: 2_097_153,
       }),
     ).toThrow();
+  });
+
+  /** MCP status metadata mirrors the configuration name budget and known tool-count ceiling. */
+  it("accepts MCP status values through their configured bounds", () => {
+    const server = {
+      serverId: "mcp_bounded",
+      name: `${"n".repeat(511)}\n`,
+      scope: "global",
+      state: "available",
+      toolCount: 10_000,
+    };
+    const valid = {
+      threadId: "thr_demo",
+      source: "active",
+      notices: [],
+      servers: [server],
+    };
+    expect(parseMethodResult("thread/mcp/read", valid)).toEqual(valid);
+    for (const invalid of [
+      { ...valid, servers: [{ ...server, name: `${"n".repeat(512)}x` }] },
+      { ...valid, servers: [{ ...server, name: "invalid\u0000name" }] },
+      { ...valid, servers: [{ ...server, toolCount: 10_001 }] },
+    ]) {
+      expect(() => parseMethodResult("thread/mcp/read", invalid)).toThrow();
+    }
   });
 });

@@ -27,6 +27,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.Objects;
@@ -139,7 +140,8 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 统一请求接纳、Deadline、取消注册与完成清理；泛型只承载结果，不允许两类调用复制生命周期。
+     * 依据显式 deadline policy 统一请求接纳与清理：短内部调用保留 Adapter 总时长上限，普通 Turn
+     * 只受逐次读取空闲上限和调用方的绝对取消控制，避免把单次 Provider 请求时限当成整轮截止。
      */
     @SuppressWarnings("PMD.CloseResource")
     private <T> CompletionStage<T> submit(
@@ -153,7 +155,7 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         }
         RequestController controller = new RequestController(cancellationToken);
         CompletableFuture<T> result;
-        ScheduledFuture<?> timeout;
+        ScheduledFuture<?> timeout = null;
         CancellationToken.Registration registration;
         synchronized (lifecycle) {
             if (closed.get()) throw new IllegalStateException("model adapter is closed");
@@ -162,8 +164,10 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             try {
                 result = CompletableFuture.supplyAsync(() -> operation.apply(controller),
                         transport.requestExecutor());
-                timeout = transport.deadlineExecutor().schedule(controller::timeout,
-                        configuration.requestTimeout().toNanos(), TimeUnit.NANOSECONDS);
+                if (request.deadlinePolicy() == ModelPort.RequestDeadlinePolicy.CALL_BOUNDED) {
+                    timeout = transport.deadlineExecutor().schedule(controller::timeout,
+                            configuration.requestTimeout().toNanos(), TimeUnit.NANOSECONDS);
+                }
                 registration = cancellationToken.onCancellation(controller::cancel);
             } catch (RuntimeException failure) {
                 activeControllers.remove(controller);
@@ -172,8 +176,9 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
                 throw failure;
             }
         }
+        ScheduledFuture<?> deadline = timeout;
         return result.whenComplete((ignored, failure) -> {
-            timeout.cancel(false);
+            if (deadline != null) deadline.cancel(false);
             registration.close();
             controller.complete();
             activeControllers.remove(controller);
@@ -206,15 +211,17 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             } catch (ProviderProtocolException failure) {
                 last = failure;
                 if (!shouldRetry(failure, semanticAccepted.get(), replay, attempt, attempts)) {
+                    ProviderProtocolException terminalFailure = terminalFailure(failure);
                     /*
                      * 只有已校验机器码进入诊断；Provider 正文、端点、异常消息和 cause 均保持隔离，
                      * 使线上故障可分类且不削弱脱敏边界。
                      */
                     LOGGER.warn(
                             "Provider request stopped provider_failure_code={} provider_failure_detail={} "
-                            + "semantic_accepted={} attempt={}",
-                            failure.code(), failure.getMessage(), semanticAccepted.get(), attempt);
-                    throw failure;
+                            + "terminal_error_code={} semantic_accepted={} attempt={}",
+                            failure.code(), failure.getMessage(), terminalFailure.terminalErrorCode(),
+                            semanticAccepted.get(), attempt);
+                    throw terminalFailure;
                 }
                 awaitBackoff(attempt, failure.retryAfter().orElse(null), controller);
             }
@@ -243,6 +250,13 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
                     "INCOMPLETE_RESPONSE", "OPENAI_EVENT", "OPENAI_CHAT_EVENT", "ANTHROPIC_EVENT" -> true;
             default -> false;
         };
+    }
+
+    /** 将 Adapter 已耗尽的可恢复流错误标为外层 Agent 重试可识别的 Provider 中立类别。 */
+    private static ProviderProtocolException terminalFailure(ProviderProtocolException failure) {
+        if (!recoverableShape(failure)) return failure;
+        return new ProviderProtocolException(failure.code(), failure.getMessage(), true,
+                failure.retryAfter().orElse(null), "MODEL_STREAM_INVALID");
     }
 
     /**
@@ -307,7 +321,10 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         });
     }
 
-    /** 单一 HTTP exchange owner 统一 Call/Response 注册、错误映射、取消复核和确定性释放。 */
+    /**
+     * 单一 HTTP exchange owner 统一 Call/Response 注册、错误映射和资源释放，并把响应读取超时映射为
+     * 可重试的空闲超时，避免将它和服务端拒绝或结构损坏混为一类。
+     */
     private static <T> T executeHttp(
             OkHttpClient client, Request request, RequestController controller,
             ProviderErrorMapper errorMapper, String networkFailureMessage,
@@ -329,13 +346,26 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             streamBound = true;
             if (!response.isSuccessful()) {
                 JsonNode error = readErrorBody(response);
-                throw errorMapper.map(response.code(), response.headers(), error);
+                throw classifyHttpFailure(response.code(),
+                        errorMapper.map(response.code(), response.headers(), error));
             }
-            T value = bodyConsumer.consume(response);
+            T value;
+            try {
+                value = bodyConsumer.consume(response);
+            } catch (SocketTimeoutException idleTimeout) {
+                controller.throwIfStopped();
+                throw new ProviderProtocolException(
+                        "REQUEST_IDLE_TIMEOUT", "provider response stream exceeded its idle timeout", true,
+                        "MODEL_IDLE_TIMEOUT");
+            }
             controller.throwIfStopped();
             return value;
         } catch (IOException failure) {
             controller.throwIfStopped();
+            if (failure instanceof SocketTimeoutException) {
+                throw new ProviderProtocolException(
+                        "NETWORK_TIMEOUT", "provider request exceeded a network timeout", true);
+            }
             throw new ProviderProtocolException(
                     "NETWORK_ERROR", networkFailureMessage, true, failure);
         } finally {
@@ -343,6 +373,17 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             if (response != null) response.close();
             controller.clearCall(call);
         }
+    }
+
+    /** 非限流 4xx 均属确定性上游拒绝；保留 Provider 已识别的专用容量溢出类型。 */
+    private static RuntimeException classifyHttpFailure(int status, RuntimeException mappedFailure) {
+        if (status < 400 || status > 499 || status == 429
+                || !(mappedFailure instanceof ProviderProtocolException failure)
+                || "MODEL_UPSTREAM_REJECTED".equals(failure.terminalErrorCode())) {
+            return mappedFailure;
+        }
+        return new ProviderProtocolException(failure.code(), failure.getMessage(), false,
+                failure.retryAfter().orElse(null), "MODEL_UPSTREAM_REJECTED");
     }
 
     /** 允许协议 Reader 抛出 IO 截断，同时禁止共享交换层了解事件类型。 */

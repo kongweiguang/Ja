@@ -48,10 +48,6 @@ public final class WorkspaceFailure extends RuntimeException {
          */
         DIRECTORY_CONFINEMENT,
         /**
-         * Java 数据目录无法安全创建通用工作区。
-         */
-        GENERAL_WORKSPACE_UNAVAILABLE,
-        /**
          * 当前进程已达到可绑定目录数量上限。
          */
         CAPACITY_EXHAUSTED,

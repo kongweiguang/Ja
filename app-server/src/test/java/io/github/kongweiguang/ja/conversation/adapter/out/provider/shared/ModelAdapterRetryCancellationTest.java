@@ -182,7 +182,7 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 连接、读取和写入分别遵守对应预算，防止流式请求用连接超时提前截断。 */
+    /** 流式请求逐次读取遵守配置空闲上限且不启动短于 Turn 的绝对 Call 超时。 */
     @Test
     void requestClientUsesRequestTimeoutForBodyIo() throws Exception {
         ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
@@ -193,6 +193,7 @@ final class ModelAdapterRetryCancellationTest {
                     ? Duration.ZERO : Duration.ofMillis(client.connectTimeoutMillis()));
             assertEquals(configuration.requestTimeout(), Duration.ofMillis(client.readTimeoutMillis()));
             assertEquals(configuration.requestTimeout(), Duration.ofMillis(client.writeTimeoutMillis()));
+            assertEquals(0, client.callTimeoutMillis());
         }
     }
 
@@ -516,23 +517,26 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 取消阻塞的正文读取，并证明活动 OkHttp Call 在一秒内关闭。 */
+    /** 持续收到流字节时允许单个模型调用超过空闲预算，最终仍服从 Turn 取消。 */
     @Test
     void cancellationClosesActiveStreamAndStopsRetries() throws Exception {
         CountDownLatch headersSent = new CountDownLatch(1);
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
             ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
             try (ModelTransport transport = new ModelTransport();
                  OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration, transport)) {
                 OkHttpClient client = transport.clientFor(configuration);
                 CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
-                                ModelAdapterTestSupport.request(configuration),
+                                withDeadlinePolicy(ModelAdapterTestSupport.request(configuration),
+                                        ModelPort.RequestDeadlinePolicy.TURN_MANAGED),
                                 event -> java.util.concurrent.CompletableFuture.completedFuture(null), cancellation)
                         .toCompletableFuture();
                 assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                Thread.sleep(350);
+                assertFalse(future.isDone());
                 cancellation.cancel();
                 ExecutionException failure = assertThrows(ExecutionException.class,
                         () -> future.get(1, TimeUnit.SECONDS));
@@ -612,25 +616,97 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 将整体 Deadline 转换为有界超时失败，并关闭活动响应流。 */
+    /** 响应读取空闲超过配置上限后关闭当前流，并保留可供外层 Turn 重试识别的超时类别。 */
     @Test
-    void timeoutClosesActiveStream() throws Exception {
+    void idleTimeoutClosesActiveStream() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.delayedSse(exchange, 1, TimeUnit.SECONDS))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            ModelPort.ModelRequest singleAttempt = new ModelPort.ModelRequest(
+                    base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
+                    base.round(), ModelPort.RetryPolicy.SINGLE_ATTEMPT,
+                    ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(singleAttempt,
+                                        event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                        CancellationToken.none())
+                                .toCompletableFuture().get(2, TimeUnit.SECONDS));
+                ProviderProtocolException timeout = assertInstanceOf(
+                        ProviderProtocolException.class, failure.getCause());
+                assertEquals("REQUEST_IDLE_TIMEOUT", timeout.code());
+                assertEquals("MODEL_IDLE_TIMEOUT", timeout.terminalErrorCode());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** TURN_MANAGED 不受逐请求总时长限制，但仍由调用方的 Turn Deadline 取消活动心跳流。 */
+    @Test
+    void turnManagedRequestUsesCallerDeadlineDespiteContinuousHeartbeats() throws Exception {
         CountDownLatch headersSent = new CountDownLatch(1);
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            ModelPort.ModelRequest turnManaged = withDeadlinePolicy(base,
+                    ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
+            ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(ModelAdapterTestSupport.request(configuration),
-                                        event -> java.util.concurrent.CompletableFuture.completedFuture(null),
-                                        CancellationToken.none())
-                                .toCompletableFuture().get(2, TimeUnit.SECONDS));
-                assertEquals("REQUEST_TIMEOUT",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(turnManaged,
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null), cancellation)
+                        .toCompletableFuture();
+                assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                Thread.sleep(500);
+                assertFalse(future.isDone(), "continuous heartbeats must not trip the per-read idle limit");
+
+                cancellation.cancel();
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(2, TimeUnit.SECONDS));
+                assertInstanceOf(CancellationException.class, failure.getCause());
             }
-            assertTrue(headersSent.await(1, TimeUnit.SECONDS));
             assertEquals(1, server.calls());
         }
+    }
+
+    /** CALL_BOUNDED 保留整次请求绝对上限，即便服务器持续发送字节而未触发逐次读取空闲超时。 */
+    @Test
+    void callBoundedRequestStopsContinuousStreamAtAbsoluteLimit() throws Exception {
+        CountDownLatch headersSent = new CountDownLatch(1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(2));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            ModelPort.ModelRequest bounded = new ModelPort.ModelRequest(
+                    base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
+                    base.round(), ModelPort.RetryPolicy.SINGLE_ATTEMPT,
+                    ModelPort.RequestDeadlinePolicy.CALL_BOUNDED);
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(bounded,
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none())
+                        .toCompletableFuture();
+                assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                Thread.sleep(500);
+                assertFalse(future.isDone());
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(3, TimeUnit.SECONDS));
+                ProviderProtocolException timeout = assertInstanceOf(
+                        ProviderProtocolException.class, failure.getCause());
+                assertEquals("REQUEST_TIMEOUT", timeout.code());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 显式选择生命周期策略，避免测试从配置值或请求内容推断绝对截止的所有者。 */
+    private static ModelPort.ModelRequest withDeadlinePolicy(
+            ModelPort.ModelRequest request, ModelPort.RequestDeadlinePolicy deadlinePolicy) {
+        return new ModelPort.ModelRequest(request.configuration(), request.prompt(), request.messages(),
+                request.tools(), request.continuation(), request.round(), request.retryPolicy(), deadlinePolicy);
     }
 }

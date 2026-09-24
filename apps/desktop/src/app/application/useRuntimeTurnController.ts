@@ -18,6 +18,8 @@ import {
   type TurnCancelResult,
   type InputQueueMutationResult,
   type TurnResumeInput,
+  type TurnContinueInput,
+  type TurnReaskInput,
   type TurnInputEnqueue,
   type TurnInputMutation,
   type TurnInputUpdate,
@@ -34,6 +36,14 @@ export interface RuntimePendingOperation<T> {
 export interface RuntimeTurnController {
   readonly submitTurn: (input: RuntimeTurnSubmissionInput) => Promise<TurnAccepted>;
   readonly resumeTurn: (input: TurnResumeInput) => Promise<TurnAccepted>;
+  readonly continueTurn: (
+    input: TurnContinueInput & { sourceMessageId: string },
+  ) => Promise<TurnAccepted>;
+  readonly reaskTurn: (
+    input: TurnReaskInput & {
+      projectionAttachments?: RuntimeTurnSubmissionInput["projectionAttachments"];
+    },
+  ) => Promise<TurnAccepted>;
   readonly respondToolRecovery: (input: ToolRecoveryResponseInput) => Promise<ToolRecoveryResponse>;
   readonly cancelTurn: (input: TurnCancelInput) => Promise<TurnCancelResult>;
   readonly enqueueTurnInput: (input: TurnInputEnqueue) => Promise<InputQueueMutationResult>;
@@ -181,6 +191,141 @@ export function useRuntimeTurnController({
           if (buffer !== undefined) {
             for (const event of buffer.events) projection.applyHostEvent(event);
           }
+          throw normalizeRuntimeError(error);
+        });
+    },
+    [
+      enqueueOperation,
+      isTurnGateCurrent,
+      isTurnGenerationCurrent,
+      lifecycleEpochRef,
+      projection,
+      runtime,
+      runtimeStateRef,
+    ],
+  );
+
+  /** continue 复用 admission 的 early-event fence，但以空文本投影，避免隐藏请求变成可见 USER。 */
+  const continueTurn = useCallback(
+    (input: TurnContinueInput & { sourceMessageId: string }): Promise<TurnAccepted> => {
+      const lifecycleEpoch = lifecycleEpochRef.current;
+      const generation = runtimeStateRef.current?.generation;
+      if (generation === undefined || !isTurnGateCurrent(lifecycleEpoch, generation))
+        return Promise.reject(
+          new RuntimeHostError("RUNTIME_NOT_READY", "运行时尚未完成配置", true),
+        );
+      if (!pendingEventsRef.current.has(input.threadId))
+        pendingEventsRef.current.set(input.threadId, {
+          events: [],
+          turnIds: new Set(),
+          submittedAt: new Date().toISOString(),
+          submittedText: "",
+          submittedAttachments: [],
+        });
+      const pending = enqueueOperation(`turnStart:${input.threadId}`, () => {
+        if (!isTurnGateCurrent(lifecycleEpoch, generation))
+          throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+        return runtime.turnContinue({
+          threadId: input.threadId,
+          expectedThreadRevision: input.expectedThreadRevision,
+        });
+      });
+      return pending.promise
+        .then((accepted) => {
+          if (!isTurnGenerationCurrent(lifecycleEpoch, generation))
+            throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+          const buffer = pendingEventsRef.current.get(input.threadId);
+          if (buffer !== undefined) {
+            buffer.turnIds.add(accepted.turnId);
+            projection.applyTurnAccepted({
+              threadId: input.threadId,
+              turnId: accepted.turnId,
+              threadRevision: accepted.threadRevision,
+              submittedText: "",
+              sourceMessageId: input.sourceMessageId,
+              submittedAt: buffer.submittedAt,
+            });
+            pendingEventsRef.current.delete(input.threadId);
+            for (const event of buffer.events) projection.applyHostEvent(event);
+          }
+          return accepted;
+        })
+        .catch((error: unknown) => {
+          const buffer = pendingEventsRef.current.get(input.threadId);
+          pendingEventsRef.current.delete(input.threadId);
+          if (buffer !== undefined)
+            for (const event of buffer.events) projection.applyHostEvent(event);
+          throw normalizeRuntimeError(error);
+        });
+    },
+    [
+      enqueueOperation,
+      isTurnGateCurrent,
+      isTurnGenerationCurrent,
+      lifecycleEpochRef,
+      projection,
+      runtime,
+      runtimeStateRef,
+    ],
+  );
+
+  /** reask 同样缓存早到事件，并让原问题与新 USER Turn 由服务端当前路径投影确认。 */
+  const reaskTurn = useCallback(
+    (
+      input: TurnReaskInput & {
+        projectionAttachments?: RuntimeTurnSubmissionInput["projectionAttachments"];
+      },
+    ): Promise<TurnAccepted> => {
+      const lifecycleEpoch = lifecycleEpochRef.current;
+      const generation = runtimeStateRef.current?.generation;
+      if (generation === undefined || !isTurnGateCurrent(lifecycleEpoch, generation))
+        return Promise.reject(
+          new RuntimeHostError("RUNTIME_NOT_READY", "运行时尚未完成配置", true),
+        );
+      if (!pendingEventsRef.current.has(input.threadId))
+        pendingEventsRef.current.set(input.threadId, {
+          events: [],
+          turnIds: new Set(),
+          submittedAt: new Date().toISOString(),
+          submittedText: submittedTurnText({ threadId: input.threadId, content: input.content }),
+          submittedAttachments: input.projectionAttachments ?? [],
+        });
+      const pending = enqueueOperation(`turnStart:${input.threadId}`, () => {
+        if (!isTurnGateCurrent(lifecycleEpoch, generation))
+          throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+        // 投影附件只用于本地乐观显示；显式列出 wire 字段以防 UI 元数据进入严格 RPC Schema。
+        return runtime.turnReask({
+          threadId: input.threadId,
+          expectedThreadRevision: input.expectedThreadRevision,
+          sourceMessageId: input.sourceMessageId,
+          content: input.content,
+        });
+      });
+      return pending.promise
+        .then((accepted) => {
+          if (!isTurnGenerationCurrent(lifecycleEpoch, generation))
+            throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+          const buffer = pendingEventsRef.current.get(input.threadId);
+          if (buffer !== undefined) {
+            buffer.turnIds.add(accepted.turnId);
+            projection.applyTurnAccepted({
+              threadId: input.threadId,
+              turnId: accepted.turnId,
+              threadRevision: accepted.threadRevision,
+              submittedText: buffer.submittedText,
+              submittedAttachments: buffer.submittedAttachments,
+              submittedAt: buffer.submittedAt,
+            });
+            pendingEventsRef.current.delete(input.threadId);
+            for (const event of buffer.events) projection.applyHostEvent(event);
+          }
+          return accepted;
+        })
+        .catch((error: unknown) => {
+          const buffer = pendingEventsRef.current.get(input.threadId);
+          pendingEventsRef.current.delete(input.threadId);
+          if (buffer !== undefined)
+            for (const event of buffer.events) projection.applyHostEvent(event);
           throw normalizeRuntimeError(error);
         });
     },
@@ -429,6 +574,8 @@ export function useRuntimeTurnController({
 
   return {
     submitTurn,
+    continueTurn,
+    reaskTurn,
     resumeTurn,
     respondToolRecovery,
     cancelTurn,

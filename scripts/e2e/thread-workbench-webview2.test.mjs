@@ -65,7 +65,7 @@ function validReport() {
   };
 }
 
-test("参数固定 JDK 25 默认值、独立 Cargo target 并接受显式 EdgeDriver", () => {
+test("参数固定 JDK 25、隔离 Cargo target、EdgeDriver 与失败现场诊断", () => {
   const edgeDriver = join(tmpdir(), "msedgedriver.exe");
   const parsed = parseArguments([
     "--evidence-directory",
@@ -74,10 +74,12 @@ test("参数固定 JDK 25 默认值、独立 Cargo target 并接受显式 EdgeDr
     join(tmpdir(), "ja-app-server.jar"),
     "--edge-driver",
     edgeDriver,
+    "--preserve-failed-profile",
   ]);
   assert.equal(parsed.javaHome, "C:\\Users\\24052\\.jdks\\liberica-25.0.2");
   assert.match(parsed.cargoTargetDirectory, /target[\\/]codex-thread-workbench$/u);
   assert.equal(parsed.edgeDriver, edgeDriver);
+  assert.equal(parsed.preserveFailedProfile, true);
 });
 
 test("完整双会话绑定与 native Preview 报告通过", () => {

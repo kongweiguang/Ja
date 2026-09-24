@@ -133,7 +133,7 @@ final class WorkspacePathSearchHandlerTest {
                 "provider_test", "model_test", "medium", AccessMode.APPROVAL_REQUIRED,
                 CollaborationMode.DEFAULT, ThreadPreferences.TitleSource.PLACEHOLDER);
         ThreadSummary thread = new ThreadSummary(
-                "thr_test", workspaceId, "Test", preferences, ThreadSummary.Status.ACTIVE,
+                "thr_test", workspaceId, "Test", "project", null, preferences, ThreadSummary.Status.ACTIVE,
                 false, null, true, null, 0, now, now);
         return new ThreadSnapshot(thread, List.of(), List.of(), null, null, null);
     }

@@ -6,12 +6,16 @@ import {
   useLayoutEffect,
   useMemo,
   useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
   type ReactElement,
   type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, Paperclip } from "lucide-react";
+import { ArrowDown, Copy, Paperclip, Pencil } from "lucide-react";
 import { cn } from "@/shared/ui/primitives/cn";
+import { MenuItem, MenuSeparator, PointerContextMenu } from "@/shared/ui/primitives";
 import type { UserApprovalDecision } from "../approval/ApprovalCard";
 import type {
   ApprovalDecision,
@@ -20,7 +24,7 @@ import type {
 } from "../../domain/timelineTypes";
 import { itemRevision, type TimelineItemAdapter } from "../../domain/timelineTypes";
 import type { AttachmentSummary } from "../../domain/timelineContracts";
-import { MarkdownMessage } from "./MarkdownMessage";
+import { MarkdownMessage, type MarkdownFileTarget } from "./MarkdownMessage";
 import { WorkProcess, type WorkProcessDisplayMode } from "./WorkProcess";
 import { TurnChangesCard } from "./TurnChangesCard";
 import { CopyTextButton } from "@/shared/ui/CopyTextButton";
@@ -87,7 +91,12 @@ export interface ChatTimelineProps {
     approval: ApprovalSummary,
     decision: UserApprovalDecision,
   ) => void | Promise<void>;
-  onOpenLink?: (url: string) => void | Promise<void>;
+  onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
+  onOpenFile?: (
+    target: MarkdownFileTarget,
+    source: HTMLElement,
+    mode?: "explorer",
+  ) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
   onReadToolArtifact?: (input: {
     threadId: string;
@@ -120,6 +129,9 @@ export interface ChatTimelineProps {
     },
     source: HTMLButtonElement,
   ) => void;
+  /** 仅当前路径最后一个失败且没有成功答复的问题接收编辑意图。 */
+  editableSourceMessageId?: string;
+  onEditQuestion?: (item: TimelineItemAdapter) => void;
   /** 历史缩略图仅通过受管 Preview session 读取，不接触路径或任意 URL。 */
   attachmentThumbnailPort?: HistoryAttachmentThumbnailPort;
   /** Task 等低频持久事实进入同一虚拟 Timeline，但不写入 Conversation reducer。 */
@@ -143,6 +155,65 @@ type TimelineRow = {
   final?: TimelineItemAdapter;
   approvals: ApprovalSummary[];
 };
+
+type MessageMenuRole = "user" | "thread-message" | "final" | "response" | "failure";
+
+interface MessageContextMenuSession {
+  readonly key: number;
+  readonly x: number;
+  readonly y: number;
+  readonly itemId: string;
+  readonly role: MessageMenuRole;
+  readonly opener: HTMLElement;
+}
+
+/** DOM role is used only to route a menu event back into the current typed Timeline projection. */
+function isMessageMenuRole(role: string | undefined): role is MessageMenuRole {
+  return (
+    role === "user" ||
+    role === "thread-message" ||
+    role === "final" ||
+    role === "response" ||
+    role === "failure"
+  );
+}
+
+/** 菜单目标保持在实际问题或答复上，避免选区、Markdown 目标和嵌套控件被误劫持。 */
+function shouldPreserveNativeMessageContextMenu(target: EventTarget | null): boolean {
+  if (window.getSelection()?.isCollapsed === false) return true;
+  if (!(target instanceof Element)) return false;
+  return (
+    target.closest(
+      "a, [data-file-reference], button, input, textarea, select, [contenteditable='true']",
+    ) !== null
+  );
+}
+
+/** 只依据当前规范化 Timeline 投影暴露复制与编辑，菜单存活期间目标失效时不会执行旧对象。 */
+function messageMenuActions(
+  item: TimelineItemAdapter | undefined,
+  row: TimelineRow | undefined,
+  role: MessageMenuRole,
+  editableSourceMessageId: string | undefined,
+  onCopyText: ChatTimelineProps["onCopyText"],
+  onEditQuestion: ChatTimelineProps["onEditQuestion"],
+): { copyText?: string; canEdit: boolean } | undefined {
+  if (item === undefined) return undefined;
+  const failedReplyIsHidden =
+    item.metadata?.failureReply === true &&
+    (row?.turn?.status === "failed" || item.status === "failed");
+  const copyText =
+    onCopyText !== undefined && !failedReplyIsHidden && item.text?.trim() ? item.text : undefined;
+  const canEdit =
+    role === "user" &&
+    row !== undefined &&
+    editableSourceMessageId !== undefined &&
+    onEditQuestion !== undefined &&
+    row.user?.itemId === editableSourceMessageId &&
+    (row.turn?.status === "failed" || row.turn?.status === "cancelled") &&
+    (row.final === undefined || row.final.metadata?.failureReply === true);
+  return copyText === undefined && !canEdit ? undefined : { copyText, canEdit };
+}
 
 type OrderedTimelineRow =
   | {
@@ -198,6 +269,12 @@ function turnFailurePresentation(error: TimelineTurn["error"] | undefined): stri
       return "已达到本轮资源上限。";
     case "MODEL_UNAVAILABLE":
       return "模型服务暂时不可用。";
+    case "MODEL_UPSTREAM_REJECTED":
+      return "请求被上游拒绝。";
+    case "MODEL_STREAM_INVALID":
+      return "模型响应流损坏或不完整。";
+    case "MODEL_IDLE_TIMEOUT":
+      return "等待模型响应超时。";
     case "SUMMARY_FAILURE":
       return "对话摘要生成失败。";
     case "MODEL_PROTOCOL_ERROR":
@@ -235,12 +312,18 @@ function isPersistedFinalProgressDuplicate(
   );
 }
 
+/** 重试是当前工作状态的修饰信息，不作为单独过程步骤占一行。 */
+function isAssistantRetryStatus(item: TimelineItemAdapter): boolean {
+  return item.kind === "commentary" && item.metadata?.phase === "assistant_retry";
+}
+
 /**
  * 将规范化投影按 USER Message 切为 exchange；同一 Turn 消费下一条队列输入时立即开始新行，
  * 后续工作与最终答复归入新 exchange，避免把多次用户意图压进同一气泡。
  *
  * Reasoning、assistant Draft 与已经提交的 Tool 模型步正文都归入工作过程；只有 terminal
- * 产生的 agent_message 能进入最终答复，避免运行中的模型正文提前越出 WorkProcess。
+ * 产生的 agent_message 能进入最终答复，避免运行中的模型正文提前越出 WorkProcess。隐藏 continuation
+ * 通过 sourceMessageId 并回原问题，使恢复后的结果沿用同一 exchange，而不伪造可见 USER 消息。
  */
 function buildRows(
   items: readonly TimelineItemAdapter[],
@@ -326,6 +409,31 @@ function buildRows(
     currentFor(turn.turnId);
     const current = currentByTurn.get(turn.turnId);
     if (current !== undefined) current.turn = turn;
+  }
+  // 隐藏 continuation 不创建新的 USER exchange；按 sourceMessageId 把它的运行态和结果归回原问题。
+  for (const continuation of turns) {
+    if (continuation.sourceMessageId == null) continue;
+    const source = rows.find(
+      (candidate) => candidate.user?.itemId === continuation.sourceMessageId,
+    );
+    const continuationGroup = currentByTurn.get(continuation.turnId);
+    if (source === undefined || continuationGroup === undefined || source === continuationGroup)
+      continue;
+    source.threadMessages.push(...continuationGroup.threadMessages);
+    source.work.push(...continuationGroup.work);
+    source.final.push(...continuationGroup.final);
+    source.approvals.push(...continuationGroup.approvals);
+    if (
+      source.turn === undefined ||
+      (continuation.threadRevision ?? -1) >= (source.turn.threadRevision ?? -1)
+    )
+      source.turn = continuation;
+    // 当前路径只呈现最新尝试的失败收口；较早的固定失败正文仍留在持久审计中。
+    source.final = source.final.filter(
+      (item) => item.metadata?.failureReply !== true || item.turnId === source.turn?.turnId,
+    );
+    rows.splice(rows.indexOf(continuationGroup), 1);
+    currentByTurn.set(continuation.turnId, source);
   }
   for (const submission of localSubmissions ?? []) {
     if (
@@ -480,7 +588,8 @@ function orderConversationBlocks(
   const turnNeedsStatus = row.turn !== undefined && row.turn.status !== "completed";
   const assistantVisible =
     row.submissionStatus === "pending" || row.final !== undefined || turnNeedsStatus;
-  const workTime = row.work[0]?.createdAt ?? row.turn?.startedAt ?? row.user?.createdAt;
+  const workSteps = row.work.filter((item) => !isAssistantRetryStatus(item));
+  const workTime = workSteps[0]?.createdAt ?? row.turn?.startedAt ?? row.user?.createdAt;
   const assistantTime =
     row.final?.createdAt ?? row.turn?.completedAt ?? workTime ?? row.user?.createdAt;
   return projectTimelineChronology<ConversationRenderBlock>([
@@ -503,7 +612,7 @@ function orderConversationBlocks(
         item,
       },
     })),
-    ...(row.work.length === 0 && row.approvals.length === 0
+    ...(workSteps.length === 0 && row.approvals.length === 0
       ? []
       : [
           {
@@ -680,7 +789,8 @@ function ActivityDots(): ReactElement {
 /**
  * 渲染单个 Role Block；消息操作位于正文之后的同级操作层，让复制在视觉上落到对应消息下方，
  * 同时不进入用户气泡或 Assistant 阅读内容。ACK 前只保留轻量入场标识，运行反馈统一交给工作响应壳，
- * 避免用户消息旁出现一套短暂且重复的发送状态。
+ * 避免用户消息旁出现一套短暂且重复的发送状态。编辑动作只由当前可重问问题的来源 ID 驱动，
+ * 这样较早的失败提问不会绕过服务端当前路径资格；可复制消息才接收右键与键盘上下文菜单。
  */
 function UserMessage({
   item,
@@ -690,8 +800,13 @@ function UserMessage({
   attachmentThumbnailUrls,
   attachmentThumbnailPort,
   onOpenLink,
+  onOpenFile,
   onCopyText,
   onOpenAttachmentPreview,
+  canEdit,
+  onEditQuestion,
+  onContextMenu,
+  onContextMenuKeyDown,
 }: {
   item: TimelineItemAdapter;
   skills: readonly ConversationSkillMetadata[];
@@ -699,14 +814,20 @@ function UserMessage({
   attachmentAuthorization?: HistoryAttachmentAuthorization;
   attachmentThumbnailUrls?: Readonly<Record<string, string | undefined>>;
   attachmentThumbnailPort?: HistoryAttachmentThumbnailPort;
-  onOpenLink?: (url: string) => void | Promise<void>;
+  onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
+  onOpenFile?: (target: MarkdownFileTarget, source: HTMLElement) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
   onOpenAttachmentPreview?: ChatTimelineProps["onOpenAttachmentPreview"];
+  canEdit: boolean;
+  onEditQuestion?: ChatTimelineProps["onEditQuestion"];
+  onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
+  onContextMenuKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }): ReactElement {
   const isPending = item.metadata?.phase === "submission_pending";
   const contextReferences = resolveSkillReferenceMetadata(item.contextReferences ?? [], skills);
   const messageText = item.text ?? "";
   const hasMessageBody = contextReferences.length > 0 || messageText.trim() !== "";
+  const hasContextActions = (messageText.trim() !== "" && onCopyText !== undefined) || canEdit;
   return (
     <article
       aria-label="用户问题"
@@ -720,6 +841,10 @@ function UserMessage({
       )}
       data-item-id={item.itemId}
       data-role="user"
+      tabIndex={hasContextActions ? -1 : undefined}
+      aria-keyshortcuts={hasContextActions ? "ContextMenu Shift+F10" : undefined}
+      onContextMenu={hasContextActions ? onContextMenu : undefined}
+      onKeyDown={hasContextActions ? onContextMenuKeyDown : undefined}
     >
       <AttachmentHistory
         items={item.attachments ?? []}
@@ -736,6 +861,7 @@ function UserMessage({
             <MarkdownMessage
               content={messageText}
               onOpenLink={onOpenLink}
+              onOpenFile={onOpenFile}
               onCopyText={onCopyText}
             />
           ) : null}
@@ -746,9 +872,25 @@ function UserMessage({
           {submissionError}
         </p>
       )}
-      {item.text?.trim() && onCopyText !== undefined ? (
+      {(item.text?.trim() && onCopyText !== undefined) || canEdit ? (
         <div className="ja-chat-message__actions" role="group" aria-label="用户消息操作">
-          <CopyTextButton text={item.text} label="复制消息" onCopyText={onCopyText} />
+          {item.text?.trim() && onCopyText !== undefined ? (
+            <CopyTextButton text={item.text} label="复制消息" onCopyText={onCopyText} />
+          ) : null}
+          {canEdit && onEditQuestion !== undefined ? (
+            <button
+              type="button"
+              className="ja-copy-text-button"
+              aria-label="编辑问题"
+              title="编辑问题"
+              onClick={(event) => {
+                event.stopPropagation();
+                onEditQuestion(item);
+              }}
+            >
+              <Pencil aria-hidden="true" />
+            </button>
+          ) : null}
         </div>
       ) : null}
     </article>
@@ -757,14 +899,18 @@ function UserMessage({
 
 /**
  * 渲染跨会话投递的纯文本事实；来源标题与 Thread ID 始终同时可见，且不使用用户气泡、Markdown
- * 或工作状态语义，避免消息在视觉和语义上冒充当前用户或当前 Agent 的发言。
+ * 或工作状态语义，避免消息在视觉和语义上冒充当前用户或当前 Agent 的发言；右键复制沿用其规范化正文。
  */
 function ThreadMessage({
   item,
   onCopyText,
+  onContextMenu,
+  onContextMenuKeyDown,
 }: {
   item: TimelineItemAdapter;
   onCopyText?: (text: string) => Promise<void>;
+  onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
+  onContextMenuKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }): ReactElement {
   const sourceTitle = item.sourceTitle ?? "未知会话";
   const sourceThreadId = item.sourceThreadId ?? "未知 Thread";
@@ -776,6 +922,12 @@ function ThreadMessage({
       data-item-id={item.itemId}
       data-role="thread-message"
       data-source-thread-id={sourceThreadId}
+      tabIndex={content.trim() !== "" && onCopyText !== undefined ? -1 : undefined}
+      aria-keyshortcuts={
+        content.trim() !== "" && onCopyText !== undefined ? "ContextMenu Shift+F10" : undefined
+      }
+      onContextMenu={content.trim() !== "" ? onContextMenu : undefined}
+      onKeyDown={content.trim() !== "" ? onContextMenuKeyDown : undefined}
     >
       <div className="ja-thread-message__body">
         <header className="ja-thread-message__source">
@@ -839,31 +991,42 @@ function workProcessDisplayMode(row: TimelineRow): WorkProcessDisplayMode | unde
 /**
  * 从 Turn 接纳到终态始终复用同一个 Article；阶段提示与 Markdown 分层，使屏幕阅读器只播报阶段变化。
  * 失败时隐藏持久化的系统收口正文，只留下由稳定错误码派生的一条原因；真实已生成内容仍照常保留。
+ * 临时重试次数并入正在工作状态，减少一条独立过程行，同时保持原有工作动效与停止入口。
+ * 正文可复制时暴露同一上下文菜单；只把文章当前呈现的最终文本用于复制。
  */
 function AssistantResponse({
   turn,
   item,
+  retryStatus,
   onOpenLink,
+  onOpenFile,
   onCopyText,
+  onContextMenu,
+  onContextMenuKeyDown,
 }: {
   turn?: TimelineTurn;
   item?: TimelineItemAdapter;
-  onOpenLink?: (url: string) => void | Promise<void>;
+  retryStatus?: string;
+  onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
+  onOpenFile?: (target: MarkdownFileTarget, source: HTMLElement) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
+  onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
+  onContextMenuKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }): ReactElement {
   const state = assistantResponseState(turn, item);
   const isActive = state === "working" || state === "waiting" || state === "streaming";
   const isFailed = state === "failed";
   const isCancelled = state === "cancelled";
+  const workingStatus = retryStatus === undefined ? "正在工作" : `正在工作 · ${retryStatus}`;
   const statusText =
     state === "working"
-      ? "正在工作"
+      ? workingStatus
       : state === "waiting"
         ? "等待你的确认"
         : state === "suspended"
           ? "已暂停"
           : state === "streaming"
-            ? "正在工作"
+            ? workingStatus
             : state === "cancelled"
               ? "已取消"
               : undefined;
@@ -893,11 +1056,22 @@ function AssistantResponse({
       data-item-id={item?.itemId ?? `response:${turn?.turnId ?? "unknown"}`}
       data-response-state={state}
       data-role={isFinalAnswer ? "final" : isFailed ? "failure" : "response"}
+      tabIndex={text !== undefined && onCopyText !== undefined ? -1 : undefined}
+      aria-keyshortcuts={
+        text !== undefined && onCopyText !== undefined ? "ContextMenu Shift+F10" : undefined
+      }
+      onContextMenu={text !== undefined ? onContextMenu : undefined}
+      onKeyDown={text !== undefined ? onContextMenuKeyDown : undefined}
     >
       <div className="ja-chat-message__body">
         {text === undefined ? null : (
           <div className="ja-chat-response__content" aria-live="off">
-            <MarkdownMessage content={text} onOpenLink={onOpenLink} onCopyText={onCopyText} />
+            <MarkdownMessage
+              content={text}
+              onOpenLink={onOpenLink}
+              onOpenFile={onOpenFile}
+              onCopyText={onCopyText}
+            />
           </div>
         )}
         {failure === undefined ? null : (
@@ -906,7 +1080,12 @@ function AssistantResponse({
           </p>
         )}
         {failure !== undefined || statusText === undefined ? null : (
-          <div className="ja-chat-response__status" aria-live="polite" aria-atomic="true">
+          <div
+            className="ja-chat-response__status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-retry-status={retryStatus === undefined ? undefined : "true"}
+          >
             <span>{statusText}</span>
             {state === "working" || state === "streaming" ? <ActivityDots /> : null}
           </div>
@@ -931,7 +1110,7 @@ function AssistantResponse({
 
 /**
  * 对长对话做 Virtualization，同时保留 Turn 级分组、本地 Stream 更新以及桌面端共用的
- * Disclosure/Approval 组件。
+ * Disclosure/Approval 组件。隐藏 continuation 先归并到源问题，避免恢复流程增加一条无意义的用户气泡。
  */
 export function ChatTimeline({
   threadId,
@@ -946,11 +1125,14 @@ export function ChatTimeline({
   localSubmissions = [],
   onApprovalDecision,
   onOpenLink,
+  onOpenFile,
   onCopyText,
   onReadToolArtifact,
   onResolveToolRecovery,
   onReviewTurn,
   onOpenAttachmentPreview,
+  editableSourceMessageId,
+  onEditQuestion,
   attachmentThumbnailPort,
   externalRows = [],
   className,
@@ -961,6 +1143,83 @@ export function ChatTimeline({
     [approvals, items, localSubmissions, turns],
   );
   const orderedRows = useMemo(() => orderTimelineRows(rows, externalRows), [externalRows, rows]);
+  const [messageContextMenu, setMessageContextMenu] = useState<MessageContextMenuSession>();
+  const messageContextMenuKey = useRef(0);
+  /** 重新从当前投影解析菜单目标，避免虚拟化或异步更新后对旧 Item 执行操作。 */
+  const resolveMessageContextTarget = useCallback(
+    (itemId: string, role: MessageMenuRole) => {
+      const item = items.find((candidate) => candidate.itemId === itemId);
+      if (item === undefined) return undefined;
+      const row = rows.find(
+        (candidate) =>
+          candidate.user?.itemId === itemId ||
+          candidate.threadMessages.some((message) => message.itemId === itemId) ||
+          candidate.final?.itemId === itemId,
+      );
+      const actions = messageMenuActions(
+        item,
+        row,
+        role,
+        editableSourceMessageId,
+        onCopyText,
+        onEditQuestion,
+      );
+      return actions === undefined ? undefined : { item, actions };
+    },
+    [editableSourceMessageId, items, onCopyText, onEditQuestion, rows],
+  );
+  /** 坐标与稳定 Item ID 共同构成一次菜单会话，重复右击会重建 Radix 定位锚点。 */
+  const openMessageContextMenu = useCallback(
+    (
+      messageElement: HTMLElement,
+      x: number,
+      y: number,
+      focusTarget: HTMLElement = messageElement,
+    ): boolean => {
+      const itemId = messageElement.getAttribute("data-item-id") ?? undefined;
+      const role = messageElement.getAttribute("data-role") ?? undefined;
+      if (itemId === undefined || !isMessageMenuRole(role)) return false;
+      if (resolveMessageContextTarget(itemId, role) === undefined) return false;
+      messageContextMenuKey.current += 1;
+      setMessageContextMenu({
+        key: messageContextMenuKey.current,
+        x,
+        y,
+        itemId,
+        role,
+        opener: focusTarget,
+      });
+      return true;
+    },
+    [resolveMessageContextTarget],
+  );
+  /** 选区、Markdown 目标及已有按钮保留浏览器/WebView 的原始目标语义。 */
+  const handleMessageContextMenu = useCallback(
+    (event: MouseEvent<HTMLElement>): void => {
+      if (shouldPreserveNativeMessageContextMenu(event.target)) return;
+      if (openMessageContextMenu(event.currentTarget, event.clientX, event.clientY)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    [openMessageContextMenu],
+  );
+  /** ContextMenu 与 Shift+F10 以当前消息边缘定位，避免键盘用户依赖鼠标坐标。 */
+  const handleMessageContextMenuKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLElement>): void => {
+      if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey)) return;
+      const bounds = event.currentTarget.getBoundingClientRect();
+      const focusTarget =
+        event.target instanceof HTMLElement && event.currentTarget.contains(event.target)
+          ? event.target
+          : event.currentTarget;
+      if (openMessageContextMenu(event.currentTarget, bounds.left, bounds.bottom, focusTarget)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    [openMessageContextMenu],
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const revision = useMemo(
     () =>
@@ -1079,6 +1338,17 @@ export function ChatTimeline({
           end: (index + 1) * 280,
           lane: 0,
         }));
+  /** 虚拟行离开 overscan 后立即丢弃菜单，避免焦点恢复或操作落到已卸载的消息节点。 */
+  useLayoutEffect(() => {
+    if (messageContextMenu === undefined || messageContextMenu.opener.isConnected) return;
+    setMessageContextMenu((current) =>
+      current?.key === messageContextMenu.key ? undefined : current,
+    );
+  }, [messageContextMenu, visibleRows]);
+  const activeMessageMenuTarget =
+    messageContextMenu === undefined
+      ? undefined
+      : resolveMessageContextTarget(messageContextMenu.itemId, messageContextMenu.role);
 
   /** 将用户带回 Live Tail，但不修改规范化 Timeline 投影。 */
   const handleScrollToLatest = (): void => {
@@ -1137,6 +1407,8 @@ export function ChatTimeline({
                 key={virtualRow.key}
                 data-index={virtualRow.index}
                 data-turn-id={row.turnId}
+                data-response-turn-id={row.turn?.turnId}
+                data-source-message-id={row.user?.itemId ?? row.turn?.sourceMessageId ?? undefined}
                 ref={virtualizer.measureElement}
                 style={{ transform: `translateY(${virtualRow.start}px)` }}
               >
@@ -1153,13 +1425,33 @@ export function ChatTimeline({
                           attachmentThumbnailUrls={row.attachmentThumbnailUrls}
                           attachmentThumbnailPort={attachmentThumbnailPort}
                           onOpenLink={onOpenLink}
+                          onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
                           onOpenAttachmentPreview={onOpenAttachmentPreview}
+                          canEdit={
+                            messageMenuActions(
+                              row.user,
+                              row,
+                              "user",
+                              editableSourceMessageId,
+                              onCopyText,
+                              onEditQuestion,
+                            )?.canEdit ?? false
+                          }
+                          onEditQuestion={onEditQuestion}
+                          onContextMenu={handleMessageContextMenu}
+                          onContextMenuKeyDown={handleMessageContextMenuKeyDown}
                         />
                       );
                     case "thread_message":
                       return (
-                        <ThreadMessage key={block.key} item={block.item} onCopyText={onCopyText} />
+                        <ThreadMessage
+                          key={block.key}
+                          item={block.item}
+                          onCopyText={onCopyText}
+                          onContextMenu={handleMessageContextMenu}
+                          onContextMenuKeyDown={handleMessageContextMenuKeyDown}
+                        />
                       );
                     case "work":
                       return (
@@ -1173,7 +1465,7 @@ export function ChatTimeline({
                             row.user?.threadId ??
                             row.work[0]?.threadId
                           }
-                          steps={row.work}
+                          steps={row.work.filter((item) => !isAssistantRetryStatus(item))}
                           turn={row.turn}
                           displayMode={workDisplayMode}
                           autoCollapse={followingLatest}
@@ -1182,6 +1474,7 @@ export function ChatTimeline({
                           approvalClosedAt={approvalClosedAt}
                           onApprovalDecision={onApprovalDecision}
                           onOpenLink={onOpenLink}
+                          onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
                           onReadToolArtifact={onReadToolArtifact}
                           onResolveToolRecovery={onResolveToolRecovery}
@@ -1193,8 +1486,12 @@ export function ChatTimeline({
                           key={block.key}
                           turn={row.turn}
                           item={row.final}
+                          retryStatus={row.work.find(isAssistantRetryStatus)?.text}
                           onOpenLink={onOpenLink}
+                          onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
+                          onContextMenu={handleMessageContextMenu}
+                          onContextMenuKeyDown={handleMessageContextMenuKeyDown}
                         />
                       );
                     case "changes":
@@ -1238,6 +1535,62 @@ export function ChatTimeline({
           <span>回到最新</span>
         </button>
       ) : null}
+      {messageContextMenu === undefined || activeMessageMenuTarget === undefined ? null : (
+        <PointerContextMenu
+          key={messageContextMenu.key}
+          x={messageContextMenu.x}
+          y={messageContextMenu.y}
+          label="消息操作"
+          onOpenChange={(open) => {
+            if (!open) {
+              setMessageContextMenu((current) =>
+                current?.key === messageContextMenu.key ? undefined : current,
+              );
+            }
+          }}
+          onRestoreFocus={() => {
+            if (messageContextMenu.opener.isConnected) messageContextMenu.opener.focus();
+          }}
+          className="ja-chat-message-context-menu"
+        >
+          {activeMessageMenuTarget.actions.copyText === undefined ? null : (
+            <MenuItem
+              onSelect={() => {
+                const current = resolveMessageContextTarget(
+                  messageContextMenu.itemId,
+                  messageContextMenu.role,
+                );
+                const copyText = current?.actions.copyText;
+                if (copyText === undefined || onCopyText === undefined) return;
+                void Promise.resolve()
+                  .then(() => onCopyText(copyText))
+                  .catch(() => {});
+              }}
+            >
+              <Copy aria-hidden="true" />
+              <span>复制正文</span>
+            </MenuItem>
+          )}
+          {activeMessageMenuTarget.actions.copyText !== undefined &&
+          activeMessageMenuTarget.actions.canEdit ? (
+            <MenuSeparator />
+          ) : null}
+          {!activeMessageMenuTarget.actions.canEdit || onEditQuestion === undefined ? null : (
+            <MenuItem
+              onSelect={() => {
+                const current = resolveMessageContextTarget(
+                  messageContextMenu.itemId,
+                  messageContextMenu.role,
+                );
+                if (current?.actions.canEdit) onEditQuestion(current.item);
+              }}
+            >
+              <Pencil aria-hidden="true" />
+              <span>编辑问题</span>
+            </MenuItem>
+          )}
+        </PointerContextMenu>
+      )}
     </section>
   );
 }

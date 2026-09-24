@@ -387,13 +387,13 @@ final class AutomaticThreadTitleServiceTest {
         public synchronized Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
             if (!summary.threadId().equals(threadId)) return Optional.empty();
             ThreadSnapshot.Turn first = new ThreadSnapshot.Turn(
-                    "turn_first", "completed", NOW.minusSeconds(2), NOW, NOW, null, null, 0, 0);
+                    "turn_first", "completed", NOW.minusSeconds(2), NOW, NOW, null, null, 0, 0, null);
             List<ThreadSnapshot.Turn> turns = new ArrayList<>();
             turns.add(first);
             if (laterTurnPresent) {
                 turns.add(new ThreadSnapshot.Turn(
                         "turn_later", "completed", NOW.plusSeconds(1), NOW.plusSeconds(2),
-                        NOW.plusSeconds(2), null, null, 0, 0));
+                        NOW.plusSeconds(2), null, null, 0, 0, null));
             }
             return Optional.of(new ThreadSnapshot(summary, turns, List.of(), null, null, null));
         }
@@ -436,7 +436,7 @@ final class AutomaticThreadTitleServiceTest {
 
         /** 创建保持固定 Workspace 和时间的 Thread 投影，只改变标题、偏好与 revision。 */
         private static ThreadSummary summary(String title, ThreadPreferences value, long revision) {
-            return new ThreadSummary("thr_test", "ws_test", title, value,
+            return new ThreadSummary("thr_test", "ws_test", title, "project", null, value,
                     ThreadSummary.Status.ACTIVE, false, null, true, null, revision, NOW.minusSeconds(60), NOW);
         }
     }

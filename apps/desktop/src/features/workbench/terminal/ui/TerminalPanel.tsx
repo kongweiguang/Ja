@@ -4,7 +4,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Terminal, type ILink, type ITheme } from "@xterm/xterm";
-import { X } from "lucide-react";
+import { ClipboardPaste, Copy, X } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -15,7 +15,7 @@ import {
 } from "react";
 import { useResolvedTheme, useUiPalette } from "@/shared/hooks/useResolvedTheme";
 import { useCodeFontSize } from "@/shared/hooks/useInterfacePreferencesValue";
-import { IconButton } from "@/shared/ui/primitives";
+import { IconButton, MenuItem, PointerContextMenu } from "@/shared/ui/primitives";
 import type { TerminalOutputChunk } from "../application";
 import "@xterm/xterm/css/xterm.css";
 import "./TerminalPanel.css";
@@ -98,6 +98,30 @@ function readTerminalTheme(): ITheme {
 
 const MAX_LINK_PHYSICAL_LINES = 64;
 const MAX_LINK_CHARACTERS = 8_192;
+const MAX_TERMINAL_PASTE_BYTES = 64 * 1024;
+
+interface TerminalPointerMenu {
+  x: number;
+  y: number;
+  selection: string;
+}
+
+/** 键盘 ContextMenu 没有指针坐标时锚定到目标中心，保证菜单贴近当前操作对象。 */
+function terminalPointerMenuPosition(event: ReactMouseEvent<HTMLElement>): {
+  x: number;
+  y: number;
+} {
+  if (event.clientX !== 0 || event.clientY !== 0) return { x: event.clientX, y: event.clientY };
+  const rect = event.currentTarget.getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+/** 只提示可采取的下一步，不把原生 clipboard plugin 异常细节投影到终端内容中。 */
+function terminalPasteFailureMessage(cause: unknown): string {
+  return cause instanceof RangeError
+    ? "剪贴板内容超过 64 KiB，未发送到终端。"
+    : "无法读取剪贴板，未向终端发送内容。";
+}
 
 interface TerminalLinkCell {
   start: { x: number; y: number };
@@ -339,6 +363,10 @@ export function TerminalPanel({
   const initialCodeFontSizeRef = useRef(codeFontSize);
   const consumedOutputSequencesRef = useRef(new Set<string>());
   const restoreFocusAfterSearchRef = useRef(false);
+  const pastePendingRef = useRef(false);
+  const pasteAttemptRef = useRef(0);
+  const copySelectionRef = useRef<((selection: string) => Promise<void>) | undefined>(undefined);
+  const pasteSelectionRef = useRef<(() => void) | undefined>(undefined);
   const callbacks = useRef({
     onAttach,
     onDetach,
@@ -352,6 +380,9 @@ export function TerminalPanel({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMatch, setSearchMatch] = useState<string>();
+  const [clipboardError, setClipboardError] = useState<string>();
+  const [pastePending, setPastePending] = useState(false);
+  const [contextMenu, setContextMenu] = useState<TerminalPointerMenu>();
   useEffect(() => {
     callbacks.current = {
       onAttach,
@@ -412,21 +443,58 @@ export function TerminalPanel({
     callbacks.current.onAttach?.();
     const dataSubscription = terminal.onData((data) => callbacks.current.onData?.(data));
     const resizeSubscription = terminal.onResize((size) => callbacks.current.onResize?.(size));
-    /** 复制当前选择时不转换终端字节，也不改变选择语义。 */
-    const copySelection = async (): Promise<void> => {
-      const selection = terminal.getSelection();
+    /** 复制快照选区而不改变 xterm 选择，并把 clipboard 失败作为可见反馈处理。 */
+    const copySelection = async (selectedText: string = terminal.getSelection()): Promise<void> => {
+      const selection = selectedText;
       if (selection.length === 0) return;
-      if (callbacks.current.onCopy !== undefined) {
-        await callbacks.current.onCopy(selection);
-        return;
+      setClipboardError(undefined);
+      try {
+        if (callbacks.current.onCopy !== undefined) {
+          await callbacks.current.onCopy(selection);
+          return;
+        }
+        const clipboard = globalThis.navigator?.clipboard;
+        if (clipboard === undefined) throw new Error("Clipboard write is unavailable");
+        await clipboard.writeText(selection);
+      } catch {
+        setClipboardError("无法复制终端选区，请检查剪贴板权限后重试。");
       }
-      await globalThis.navigator?.clipboard?.writeText(selection);
     };
-    /** 只使用显式注入的可信 paste hook；否则普通 paste 事件与隐藏 textarea 仍由 xterm 拥有。 */
+    copySelectionRef.current = copySelection;
+    /** 只有菜单动作调用该显式读取路径，并在字节限额及终端代次复核后才发送。 */
     const pasteSelection = async (readPaste: () => string | Promise<string>): Promise<void> => {
-      const data = await readPaste();
-      if (data !== undefined && data.length > 0) callbacks.current.onData?.(data);
+      if (pastePendingRef.current) return;
+      pastePendingRef.current = true;
+      const attempt = ++pasteAttemptRef.current;
+      setPastePending(true);
+      setClipboardError(undefined);
+      try {
+        const data = await readPaste();
+        if (attempt !== pasteAttemptRef.current || terminalRef.current !== terminal) return;
+        if (typeof data !== "string") throw new Error("Clipboard text is unavailable");
+        if (new TextEncoder().encode(data).byteLength > MAX_TERMINAL_PASTE_BYTES) {
+          throw new RangeError("Clipboard text exceeds the terminal paste limit");
+        }
+        if (data.length > 0) callbacks.current.onData?.(data);
+      } catch (cause) {
+        if (attempt === pasteAttemptRef.current && terminalRef.current === terminal) {
+          setClipboardError(terminalPasteFailureMessage(cause));
+        }
+      } finally {
+        if (attempt === pasteAttemptRef.current) {
+          pastePendingRef.current = false;
+          setPastePending(false);
+        }
+      }
     };
+    /** 菜单执行时才读取最新注入端口，防止打开菜单本身访问系统剪贴板。 */
+    const pasteFromClipboard = (): void => {
+      const readPaste = callbacks.current.onPaste;
+      if (readPaste !== undefined && callbacks.current.onData !== undefined) {
+        void pasteSelection(readPaste);
+      }
+    };
+    pasteSelectionRef.current = pasteFromClipboard;
     /** Ctrl/Command 快捷键留在终端 UX 内，同时保留 Ctrl+C 中断行为。 */
     const keyHandler = (event: KeyboardEvent): boolean => {
       const modifier = event.ctrlKey || event.metaKey;
@@ -451,10 +519,8 @@ export function TerminalPanel({
         return false;
       }
       if (modifier && !event.shiftKey && event.key.toLowerCase() === "v") {
-        const readPaste = callbacks.current.onPaste;
-        if (readPaste === undefined) return true;
-        void pasteSelection(readPaste);
-        return false;
+        /** 新的剪贴板读取权限只由菜单选择触发，快捷键继续交给 xterm 原生粘贴处理。 */
+        return true;
       }
       return true;
     };
@@ -487,6 +553,10 @@ export function TerminalPanel({
     observer?.observe(host);
     if (observer === undefined) fit();
     return () => {
+      pasteAttemptRef.current += 1;
+      pastePendingRef.current = false;
+      if (copySelectionRef.current === copySelection) copySelectionRef.current = undefined;
+      if (pasteSelectionRef.current === pasteFromClipboard) pasteSelectionRef.current = undefined;
       if (frame !== undefined && typeof cancelAnimationFrame !== "undefined")
         cancelAnimationFrame(frame);
       observer?.disconnect();
@@ -580,6 +650,52 @@ export function TerminalPanel({
     link?.activate(event.nativeEvent, link.text);
   };
 
+  /** 搜索输入和链接保留自身右键语义；仅在终端存在可用操作时接管浏览器菜单。 */
+  const openTerminalContextMenu = (event: ReactMouseEvent<HTMLDivElement>): void => {
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      target.closest(
+        ".ja-terminal-search, input, textarea, button, a, [contenteditable='true'], .xterm-link",
+      ) !== null
+    )
+      return;
+    const terminal = terminalRef.current;
+    const screen = hostRef.current?.querySelector(".xterm-screen");
+    if (terminal === null) return;
+    if (
+      screen !== null &&
+      screen !== undefined &&
+      terminalLinkAtViewportPoint(
+        terminal,
+        screen,
+        event.clientX,
+        event.clientY,
+        openExternalUrlOnce,
+      ) !== undefined
+    )
+      return;
+    const selection = terminal.getSelection();
+    const canPaste =
+      callbacks.current.onPaste !== undefined && callbacks.current.onData !== undefined;
+    if (selection.length === 0 && !canPaste) return;
+    event.preventDefault();
+    setClipboardError(undefined);
+    setContextMenu({ ...terminalPointerMenuPosition(event), selection });
+  };
+
+  /** 关闭终端指针菜单后恢复 xterm 输入焦点，避免菜单导航截断下一次命令输入。 */
+  const restoreTerminalContextFocus = (): void => {
+    terminalRef.current?.focus();
+  };
+
+  /** 关闭时释放选区快照，并在 Radix 清理菜单节点后恢复输入焦点。 */
+  const changeTerminalContextMenu = (open: boolean): void => {
+    if (open) return;
+    setContextMenu(undefined);
+    window.requestAnimationFrame(restoreTerminalContextFocus);
+  };
+
   /**
    * 等 React 删除搜索输入后再恢复 xterm 焦点；仅在 click handler 聚焦不足以避免即将消失的
    * 按钮或输入在 handler 返回后重新取得或清除 WebView2 焦点。
@@ -622,7 +738,19 @@ export function TerminalPanel({
       aria-label={ariaLabel}
       onPointerDownCapture={focusTerminal}
       onClickCapture={openTerminalLink}
+      onContextMenu={openTerminalContextMenu}
     >
+      {clipboardError === undefined ? null : (
+        <div
+          className="ja-terminal-output-warning"
+          role="alert"
+          aria-live="polite"
+          style={{ position: "absolute", zIndex: 3, inset: "0 0 auto" }}
+        >
+          <strong>剪贴板操作未完成</strong>
+          <span>{clipboardError}</span>
+        </div>
+      )}
       {searchOpen ? (
         <div className="ja-terminal-search" role="search">
           <input
@@ -648,6 +776,29 @@ export function TerminalPanel({
           </IconButton>
         </div>
       ) : null}
+      {contextMenu === undefined ? null : (
+        <PointerContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label="终端操作"
+          onOpenChange={changeTerminalContextMenu}
+          onRestoreFocus={restoreTerminalContextFocus}
+        >
+          {contextMenu.selection.length === 0 ? null : (
+            <MenuItem onSelect={() => void copySelectionRef.current?.(contextMenu.selection)}>
+              <Copy aria-hidden="true" size={14} />
+              <span>复制选中内容</span>
+            </MenuItem>
+          )}
+          {callbacks.current.onPaste === undefined ||
+          callbacks.current.onData === undefined ? null : (
+            <MenuItem disabled={pastePending} onSelect={() => pasteSelectionRef.current?.()}>
+              <ClipboardPaste aria-hidden="true" size={14} />
+              <span>粘贴到终端</span>
+            </MenuItem>
+          )}
+        </PointerContextMenu>
+      )}
     </div>
   );
 }

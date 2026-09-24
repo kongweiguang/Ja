@@ -118,7 +118,7 @@ final class AttachmentHandlerTest {
             Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-attachment-handler-test").toAbsolutePath();
             writer = new StdioWriter(new ByteArrayOutputStream(), MAPPER, 16_384);
             Workspace workspace = new Workspace("ws_demo", root.resolve("workspace"), "Demo",
-                    Workspace.Trust.TRUSTED, 1);
+                    Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, null, 1);
             WorkspaceUseCase workspaces = (WorkspaceUseCase) Proxy.newProxyInstance(
                     AttachmentHandlerTest.class.getClassLoader(), new Class<?>[]{WorkspaceUseCase.class},
                     (proxy, method, arguments) -> {

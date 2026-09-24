@@ -165,7 +165,11 @@ unit_scope!(
     crate::preview::model,
     "/tests/unit/preview/model_tests.rs"
 );
-
+unit_scope!(
+    preview_local_file_scope,
+    crate::preview::local_file,
+    "/tests/unit/preview/local_file_tests.rs"
+);
 unit_scope!(
     review_domain_scope,
     crate::review::domain::model,

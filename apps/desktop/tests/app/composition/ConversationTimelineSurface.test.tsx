@@ -238,6 +238,92 @@ describe("ConversationTimelineSurface", () => {
     expect(screen.getByRole("region", { name: "工作过程" })).toBeDefined();
   });
 
+  /** 贯通真实 Host Event、Zustand selector 与 Surface，防止自动重试只在 reducer 单测中可见。 */
+  it("renders retry status from the live event and replaces it on the next delta", async () => {
+    prepareStreamingTimeline();
+    const runningTurn = useTimelineStore.getState().turns[TURN_ID];
+    expect(runningTurn?.status).toBe("running");
+    render(
+      <ConversationTimelineSurface
+        threadId={THREAD_ID}
+        answeredRequest={null}
+        answeredAnswers={{}}
+        turns={runningTurn === undefined ? [] : [runningTurn]}
+      />,
+    );
+
+    /** 所有帧都经同一个 Host adapter 入口，以覆盖同步 store 通知与 React selector 重渲染。 */
+    const applyEvent = (event: TimelineEvent): void => {
+      expect(useTimelineStore.getState().applyHostEvent({ kind: "timeline", event })).toBe(
+        "applied",
+      );
+    };
+    act(() => {
+      applyEvent({
+        jsonrpc: "2.0",
+        method: "assistant/text-delta",
+        params: {
+          serverInstanceId: "srv_stream_surface",
+          eventId: "evt_retry_surface_old_delta",
+          sequence: 2,
+          generation: 1,
+          workspaceId: "ws_stream_surface",
+          threadId: THREAD_ID,
+          turnId: TURN_ID,
+          threadRevision: 2,
+          occurredAt: "2026-09-20T00:00:03Z",
+          streamSeq: 1,
+          text: "旧请求半截正文",
+        },
+      });
+      applyEvent({
+        jsonrpc: "2.0",
+        method: "turn/retry-started",
+        params: {
+          serverInstanceId: "srv_stream_surface",
+          eventId: "evt_retry_surface_started",
+          sequence: 3,
+          generation: 1,
+          workspaceId: "ws_stream_surface",
+          threadId: THREAD_ID,
+          turnId: TURN_ID,
+          threadRevision: 3,
+          occurredAt: "2026-09-20T00:00:04Z",
+          attempt: 2,
+          maxAttempts: 6,
+        },
+      });
+    });
+
+    expect(await screen.findByText("正在工作 · 重试 2/6")).toBeDefined();
+    expect(document.querySelector('[data-retry-status="true"]')).not.toBeNull();
+    expect(screen.queryByText("旧请求半截正文")).toBeNull();
+    expect(screen.getByRole("article", { name: "回复状态" }).textContent).toContain("正在工作");
+
+    act(() => {
+      applyEvent({
+        jsonrpc: "2.0",
+        method: "assistant/text-delta",
+        params: {
+          serverInstanceId: "srv_stream_surface",
+          eventId: "evt_retry_surface_new_delta",
+          sequence: 4,
+          generation: 1,
+          workspaceId: "ws_stream_surface",
+          threadId: THREAD_ID,
+          turnId: TURN_ID,
+          threadRevision: 3,
+          occurredAt: "2026-09-20T00:00:05Z",
+          streamSeq: 2,
+          text: "新请求正文",
+        },
+      });
+    });
+    expect(await screen.findByText("新请求正文")).toBeDefined();
+    expect(document.querySelector('[data-retry-status="true"]')).toBeNull();
+    expect(screen.queryByText("旧请求半截正文")).toBeNull();
+  });
+
   /** thread/read 用持久 user_input 替换 turn/start 的临时条目时，完整 Surface 仍复用响应壳。 */
   it("keeps the authoritative response node when a healthy read replaces the local user item", async () => {
     prepareStreamingTimeline();

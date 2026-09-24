@@ -159,6 +159,8 @@ export interface AcceptedTurnProjection {
   turnId: string;
   threadRevision: number;
   submittedText: string;
+  /** 隐藏 continue 的本地来源关联，仅用于在当前响应投影前把新 Turn 归到既有问题。 */
+  sourceMessageId?: string;
   /** ACK 的临时用户消息必须保留附件摘要；后续 Snapshot 会用服务端权威事实整体替换。 */
   submittedAttachments?: readonly import("./timelineContracts").AttachmentSummary[];
   submittedAt: string;
@@ -210,6 +212,10 @@ export interface TimelineState {
   streamSeqByTurn: Record<string, number>;
   /** 未提交的 Assistant/Reasoning segments；发生重连或 Gap 时必须整体丢弃。 */
   draftByTurn: Record<string, readonly TimelineDraftProjection[]>;
+  /** 同一模型请求的尝试计数在首次新 Delta 后仍保留，直到成功提交/终态。 */
+  retryAttemptByTurn: Record<string, { attempt: number; maxAttempts: 6 }>;
+  /** 仅在 retry-started 到新请求首个 Delta 之间显示；重试事实不进入 thread/read。 */
+  retryingByTurn: Record<string, { attempt: number; maxAttempts: 6; occurredAt: string }>;
   seenEventIds: Record<string, true>;
   seenEventOrder: string[];
   resyncRequired: Record<string, ResyncReason>;
@@ -242,6 +248,8 @@ export function createTimelineState(): TimelineState {
     snapshotRevisionByThread: {},
     streamSeqByTurn: {},
     draftByTurn: {},
+    retryAttemptByTurn: {},
+    retryingByTurn: {},
     seenEventIds: {},
     seenEventOrder: [],
     resyncRequired: {},
@@ -806,6 +814,7 @@ function shouldPreserveLiveDraft(
  * 应用完整且未分页的 Thread Snapshot，并丢弃无法由快照继续确认的 In-flight 投影。
  * Workspace 由 History 调用方提供，因为 Wire Snapshot 明确省略其所有权；已提交的 live 修改摘要
  * 只有在同一 runtime 身份且 Turn 仍可持有 tracker 时保留，避免恢复读取让摘要在 Tool 间歇消失。
+ * 健康快照还保留同一 active Turn 已知重试次数，避免瞬时通知因对账丢失后产生 attempt gap。
  */
 export function applySnapshot(
   state: TimelineState,
@@ -874,8 +883,16 @@ export function applySnapshot(
   const turns = { ...next.turns };
   const streamSeqByTurn = { ...next.streamSeqByTurn };
   const draftByTurn = { ...next.draftByTurn };
+  const retryAttemptByTurn = { ...next.retryAttemptByTurn };
+  const retryingByTurn = { ...next.retryingByTurn };
   for (const threadTurnId of threadTurnIds) {
     delete turns[threadTurnId];
+    const incomingTurn = snapshot.turns.find((turn) => turn.turnId === threadTurnId);
+    const keepObservedRetry = options.mode !== "recovery" && incomingTurn?.status === "running";
+    if (!keepObservedRetry) {
+      delete retryAttemptByTurn[threadTurnId];
+      delete retryingByTurn[threadTurnId];
+    }
     if (threadTurnId !== preservedLiveTurnId) {
       const snapshotTurn = snapshot.turns.find((turn) => turn.turnId === threadTurnId);
       // Terminal snapshot 不携带 live baseline，但已有即时流水位仍是迟到 delta 的安全覆盖边界；
@@ -1034,6 +1051,7 @@ export function applySnapshot(
           {
             turnId: turn.turnId,
             threadId: snapshot.threadId,
+            sourceMessageId: turn.sourceMessageId,
             status: turn.status,
             startedAt: turn.requestedAt,
             ...(turn.completedAt === null ? {} : { completedAt: turn.completedAt }),
@@ -1071,6 +1089,8 @@ export function applySnapshot(
     streamSeqByTurn: rebuiltStreamSeqByTurn,
     // 健康同 revision 快照保留同一 Draft 引用；真实恢复只接纳权威 baseline，null 不冒充 seq=0。
     draftByTurn: rebuiltDraftByTurn,
+    retryAttemptByTurn,
+    retryingByTurn,
     resyncRequired: recoveryNeedsBaseline
       ? { ...next.resyncRequired, [snapshot.threadId]: "gap" }
       : Object.fromEntries(
@@ -1135,6 +1155,7 @@ export function applyTurnAccepted(
   const turn: TimelineTurn = {
     turnId: accepted.turnId,
     threadId: accepted.threadId,
+    sourceMessageId: accepted.sourceMessageId ?? null,
     status: "queued",
     startedAt: accepted.submittedAt,
     threadRevision: accepted.threadRevision,
@@ -1900,7 +1921,8 @@ function applyMessagesReceived(
  * 应用持久事件；终态通知已携带冻结的最终答复、Usage 与 ChangeSet，因此在同一投影事务内收口。
  *
  * 只有 gap、缺失关联或非法事实才请求权威快照；每轮终态后再读历史会造成第二次可见重投影，
- * 却不能补充 v1 terminal 合同之外的信息。
+ * 却不能补充 v1 terminal 合同之外的信息。重试事件只替换临时草稿并沿用 Turn 全局 stream 序号，
+ * 使半截输出不会进入下一次尝试的视图或有效历史。
  */
 function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): TimelineState {
   const currentRevision = state.threadRevisionByThread[event.params.threadId] ?? 0;
@@ -1922,7 +1944,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       if (previous !== params.from || !isLegalTransition(previous, params.to))
         return resync(state, params.threadId, "invalid_event");
       const nextTurn: TimelineTurn = {
-        ...(turn ?? { turnId: params.turnId, threadId: params.threadId }),
+        ...(turn ?? { turnId: params.turnId, threadId: params.threadId, sourceMessageId: null }),
         turnId: params.turnId,
         threadId: params.threadId,
         status: params.to,
@@ -1943,6 +1965,38 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
             },
           },
         };
+      break;
+    }
+    case "turn/retry-started": {
+      const params = event.params;
+      const previousAttempt = next.retryAttemptByTurn[params.turnId]?.attempt;
+      if (
+        turn === undefined ||
+        turn.status !== "running" ||
+        params.attempt < 2 ||
+        params.attempt > 6 ||
+        params.maxAttempts !== 6 ||
+        (previousAttempt !== undefined && params.attempt !== previousAttempt + 1)
+      )
+        return resync(state, params.threadId, "invalid_event");
+      const draftByTurn = { ...next.draftByTurn };
+      delete draftByTurn[params.turnId];
+      next = {
+        ...next,
+        draftByTurn,
+        retryAttemptByTurn: {
+          ...next.retryAttemptByTurn,
+          [params.turnId]: { attempt: params.attempt, maxAttempts: params.maxAttempts },
+        },
+        retryingByTurn: {
+          ...next.retryingByTurn,
+          [params.turnId]: {
+            attempt: params.attempt,
+            maxAttempts: params.maxAttempts,
+            occurredAt: params.occurredAt,
+          },
+        },
+      };
       break;
     }
     case "assistant/model-step-committed": {
@@ -2188,17 +2242,34 @@ function projectItem(
   };
 }
 
-/** Tool 模型步已持久化全部公开片段，因此清理对应瞬态 Draft，防止同一正文重复出现。 */
+/** Tool 模型步已持久化全部公开片段，因此清理对应瞬态 Draft 与重试状态，避免重复正文或过时提示。 */
 function clearDraft(state: TimelineState, turnId: string): TimelineState {
   const draftByTurn = { ...state.draftByTurn };
   delete draftByTurn[turnId];
-  return { ...state, draftByTurn };
+  const retryAttemptByTurn = { ...state.retryAttemptByTurn };
+  delete retryAttemptByTurn[turnId];
+  return {
+    ...state,
+    draftByTurn,
+    retryAttemptByTurn,
+    retryingByTurn: clearRetryingTurn(state.retryingByTurn, turnId),
+  };
+}
+
+/** 首个新请求 Delta 关闭轻量重试提示，但保留序号直到该模型步成功提交或 Turn 收口。 */
+function clearRetryingTurn(
+  retryingByTurn: TimelineState["retryingByTurn"],
+  turnId: string,
+): TimelineState["retryingByTurn"] {
+  if (retryingByTurn[turnId] === undefined) return retryingByTurn;
+  const next = { ...retryingByTurn };
+  delete next[turnId];
+  return next;
 }
 
 /**
- * Terminal 只清理由权威 finalMessage 替代的 assistant Draft；公开 reasoning 需要留到完整历史快照
- * 接管，取消/失败态都保留用户已经看到的半成品正文。失败终态的固定安全回复仍单独投影，
- * 因此半截 Provider 正文只属于 WorkProcess，不会冒充失败答复。
+ * 成功终态由权威 finalMessage 替换 assistant Draft；取消可以保留用户已看见的片段，失败则清空
+ * assistant 与 reasoning 草稿，只留下单一稳定原因，避免损坏输出和错误收口并列成两份答复。
  */
 function settleTerminalDraft(
   state: TimelineState,
@@ -2206,16 +2277,26 @@ function settleTerminalDraft(
   terminalState: TimelineTurnState,
 ): TimelineState {
   const current = state.draftByTurn[turnId];
-  if (current === undefined) return state;
-  const retained = current.filter(
-    (draft) =>
-      draft.kind === "reasoning" ||
-      ((terminalState === "cancelled" || terminalState === "failed") && draft.kind === "assistant"),
-  );
+  // 失败态显示稳定的一句原因；不让供应商半截正文与收口错误同时冒充最终答复。
+  const retained =
+    terminalState === "failed"
+      ? []
+      : (current ?? []).filter(
+          (draft) =>
+            draft.kind === "reasoning" ||
+            (terminalState === "cancelled" && draft.kind === "assistant"),
+        );
   const draftByTurn = { ...state.draftByTurn };
   if (retained.length === 0) delete draftByTurn[turnId];
   else draftByTurn[turnId] = retained;
-  return { ...state, draftByTurn };
+  const retryAttemptByTurn = { ...state.retryAttemptByTurn };
+  delete retryAttemptByTurn[turnId];
+  return {
+    ...state,
+    draftByTurn,
+    retryAttemptByTurn,
+    retryingByTurn: clearRetryingTurn(state.retryingByTurn, turnId),
+  };
 }
 
 /**
@@ -2332,6 +2413,7 @@ function applyDelta(
       ...state,
       streamSeqByTurn: { ...state.streamSeqByTurn, [turnId]: streamSeq },
       draftByTurn: { ...state.draftByTurn, [turnId]: segments },
+      retryingByTurn: clearRetryingTurn(state.retryingByTurn, turnId),
     },
     "applied",
   );

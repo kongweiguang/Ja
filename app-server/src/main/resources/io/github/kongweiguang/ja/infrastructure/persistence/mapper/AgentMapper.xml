@@ -16,6 +16,9 @@
       <arg column="accepting_inputs" javaType="_boolean"/>
       <arg column="thread_revision" javaType="java.lang.Long"/>
       <arg column="change_set_json" javaType="string"/>
+      <arg column="current_path" javaType="_boolean"/>
+      <arg column="source_message_id" javaType="string"/>
+      <arg column="terminal_message_id" javaType="string"/>
     </constructor>
   </resultMap>
   <resultMap id="messageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$MessageRow">
@@ -97,7 +100,10 @@
       x.completed_at,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at,x.cancel_reason,
        x.cancel_thread_revision,x.cancel_turn_mutation_version,
        x.input_queue_revision,x.accepting_inputs,
-      NULL AS thread_revision,c.change_set_json
+      NULL AS thread_revision,c.change_set_json,x.current_path,x.source_message_id,
+      (SELECT tm.item_id FROM timeline_messages tm JOIN messages m ON m.message_id=tm.item_id
+        WHERE tm.turn_id=x.turn_id AND tm.thread_id=x.thread_id AND tm.message_kind='FINAL_ANSWER'
+        ORDER BY m.ordinal DESC LIMIT 1) AS terminal_message_id
     FROM turns x LEFT JOIN turn_change_sets c ON c.turn_id=x.turn_id
     WHERE x.thread_id=#{threadId} AND x.turn_id=#{turnId}
   </select>
@@ -106,7 +112,10 @@
       x.completed_at,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at,x.cancel_reason,
        x.cancel_thread_revision,x.cancel_turn_mutation_version,
        x.input_queue_revision,x.accepting_inputs,
-      NULL AS thread_revision,c.change_set_json
+      NULL AS thread_revision,c.change_set_json,x.current_path,x.source_message_id,
+      (SELECT tm.item_id FROM timeline_messages tm JOIN messages m ON m.message_id=tm.item_id
+        WHERE tm.turn_id=x.turn_id AND tm.thread_id=x.thread_id AND tm.message_kind='FINAL_ANSWER'
+        ORDER BY m.ordinal DESC LIMIT 1) AS terminal_message_id
     FROM turns x LEFT JOIN turn_change_sets c ON c.turn_id=x.turn_id
     WHERE x.thread_id=#{threadId} ORDER BY x.turn_sequence
   </select>
@@ -115,13 +124,17 @@
       x.completed_at,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at,x.cancel_reason,
        x.cancel_thread_revision,x.cancel_turn_mutation_version,
        x.input_queue_revision,x.accepting_inputs,
-      t.revision AS thread_revision,c.change_set_json FROM turns x JOIN threads t ON t.thread_id=x.thread_id
+      t.revision AS thread_revision,c.change_set_json,x.current_path,x.source_message_id,
+      (SELECT tm.item_id FROM timeline_messages tm JOIN messages m ON m.message_id=tm.item_id
+        WHERE tm.turn_id=x.turn_id AND tm.thread_id=x.thread_id AND tm.message_kind='FINAL_ANSWER'
+        ORDER BY m.ordinal DESC LIMIT 1) AS terminal_message_id
+      FROM turns x JOIN threads t ON t.thread_id=x.thread_id
       LEFT JOIN turn_change_sets c ON c.turn_id=x.turn_id
     WHERE x.turn_id=#{turnId} AND t.deleted_at IS NULL
   </select>
   <insert id="insertTurn">
-    INSERT INTO turns(turn_id,thread_id,state,requested_at,updated_at)
-    VALUES(#{turnId},#{threadId},'QUEUED',#{occurredAt},#{occurredAt})
+    INSERT INTO turns(turn_id,thread_id,state,requested_at,updated_at,source_message_id)
+    VALUES(#{turnId},#{threadId},'QUEUED',#{occurredAt},#{occurredAt},#{sourceMessageId})
   </insert>
   <select id="hasOtherTurns" resultType="boolean">
     SELECT EXISTS(SELECT 1 FROM turns WHERE thread_id=#{threadId} AND turn_id&lt;&gt;#{turnId} LIMIT 1)

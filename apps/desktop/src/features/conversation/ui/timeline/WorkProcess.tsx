@@ -23,7 +23,7 @@ import {
   type WorkStepAdapter,
   type TimelineTurn,
 } from "../../domain/timelineTypes";
-import { MarkdownMessage } from "./MarkdownMessage";
+import { MarkdownMessage, type MarkdownFileTarget } from "./MarkdownMessage";
 import { ToolStepDetails } from "./ToolStepDetails";
 import type { TimelineDisclosureCache } from "./timelineDisclosure";
 import "./timeline.css";
@@ -50,7 +50,12 @@ export interface WorkProcessProps {
     approval: ApprovalSummary,
     decision: UserApprovalDecision,
   ) => void | Promise<void>;
-  onOpenLink?: (url: string) => void | Promise<void>;
+  onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
+  onOpenFile?: (
+    target: MarkdownFileTarget,
+    source: HTMLElement,
+    mode?: "explorer",
+  ) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
   onReadToolArtifact?: (input: {
     threadId: string;
@@ -272,12 +277,9 @@ function processReadingIsActive(element: HTMLElement | null): boolean {
 }
 
 /**
- * 将相邻 Tool Work 保持在同一语义容器中：流式阶段直出正文和工具，只有权威最终答复已到位后才
- * 自动归档为单个 Disclosure。失败与取消的归档默认展开，阻塞场景继续直出可操作内容；未传入
- * displayMode 的独立复用场景沿用既有折叠策略。
- * 未决审批是继续执行的阻塞点，即使关联 command 已完成也必须保持展开，
- * 否则用户会看不到唯一可解除阻塞的审批按钮。
- * 归档入口只保留处理概览，运行态不增加总标题、状态或步骤统计，避免与底部唯一的“正在工作”重复。
+ * 流式、失败、取消与未决审批保持可操作内容展开，只有权威最终答复到达后才归档；
+ * 自动归档尊重已聚焦或选中的过程内容，独立复用且未传 displayMode 时沿用原折叠策略。
+ * 归档入口只保留处理概览，重试只替换轻状态，避免重复标题和失败正文干扰统一工作状态。
  */
 export function WorkProcess({
   steps,
@@ -292,6 +294,7 @@ export function WorkProcess({
   approvalClosedAt = {},
   onApprovalDecision,
   onOpenLink,
+  onOpenFile,
   onCopyText,
   onReadToolArtifact,
   onResolveToolRecovery,
@@ -506,6 +509,7 @@ export function WorkProcess({
                   <MarkdownMessage
                     content={detail}
                     onOpenLink={onOpenLink}
+                    onOpenFile={onOpenFile}
                     onCopyText={onCopyText}
                   />
                 </li>
@@ -517,11 +521,15 @@ export function WorkProcess({
                   key={visibleStepKey(step, index)}
                   className="ja-work-step--commentary"
                   data-role="commentary"
+                  data-retry-status={
+                    step.metadata?.phase === "assistant_retry" ? "true" : undefined
+                  }
                   aria-label="助手进展"
                 >
                   <MarkdownMessage
                     content={detail}
                     onOpenLink={onOpenLink}
+                    onOpenFile={onOpenFile}
                     onCopyText={onCopyText}
                   />
                 </li>
@@ -550,6 +558,7 @@ export function WorkProcess({
                       content={stepDetail(step) ?? ""}
                       className="ja-work-step__detail"
                       onOpenLink={onOpenLink}
+                      onOpenFile={onOpenFile}
                       onCopyText={onCopyText}
                     />
                   ) : null}

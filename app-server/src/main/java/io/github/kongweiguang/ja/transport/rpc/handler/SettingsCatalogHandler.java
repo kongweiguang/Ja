@@ -82,9 +82,11 @@ public final class SettingsCatalogHandler implements RpcHandler {
      * 映射统一的 items 页面，并禁止 endpoint、参数、环境、Header、认证或 Secret 字段。
      */
     private ObjectNode mcp(ObjectNode params) {
-        RpcParams.requireOnly(params, "cursor", "limit");
+        RpcParams.requireOnly(params, "workspaceId", "cursor", "limit");
+        String workspaceId = RpcParams.optionalText(params, "workspaceId", 100);
+        if (workspaceId != null) workspaceId = RpcParams.identifier(workspaceId, "ws_", 100);
         CursorPage<McpServerDescriptor> page = session.catalog().listMcp(
-                RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params));
+                workspaceId, RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params));
         ObjectNode result = session.mapper().createObjectNode();
         ArrayNode values = result.putArray("items");
         page.items().forEach(value -> values.add(mcpView(value)));
@@ -96,9 +98,11 @@ public final class SettingsCatalogHandler implements RpcHandler {
      * 在同一租约内先确认 MCP 身份再执行有界探测，结果只包含健康与 Tool 数量。
      */
     private CompletionStage<ObjectNode> test(ObjectNode params) {
-        RpcParams.requireExact(params, "mcpId");
+        RpcParams.requireOnly(params, "workspaceId", "mcpId");
+        String workspaceId = RpcParams.optionalText(params, "workspaceId", 100);
+        if (workspaceId != null) workspaceId = RpcParams.identifier(workspaceId, "ws_", 100);
         String mcpId = RpcParams.identifier(params, "mcpId", "mcp_", 100);
-        return session.catalog().testMcp(mcpId).thenApply(this::mcpView);
+        return session.catalog().testMcp(workspaceId, mcpId).thenApply(this::mcpView);
     }
 
     /** 模型验证结果只返回脱敏模型名和耗时；Provider 失败统一收敛为稳定可重试错误。 */
@@ -155,9 +159,11 @@ public final class SettingsCatalogHandler implements RpcHandler {
      * 从显式 MCP 身份读取一页有界 Tool Schema；响应只保留统一列表字段，不回显请求身份。
      */
     private ObjectNode tools(ObjectNode params) {
-        RpcParams.requireOnly(params, "mcpId", "cursor", "limit");
+        RpcParams.requireOnly(params, "workspaceId", "mcpId", "cursor", "limit");
+        String workspaceId = RpcParams.optionalText(params, "workspaceId", 100);
+        if (workspaceId != null) workspaceId = RpcParams.identifier(workspaceId, "ws_", 100);
         String mcpId = RpcParams.identifier(params, "mcpId", "mcp_", 100);
-        CursorPage<McpToolDescriptor> page = session.catalog().readMcpTools(mcpId,
+        CursorPage<McpToolDescriptor> page = session.catalog().readMcpTools(workspaceId, mcpId,
                 RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params));
         ObjectNode result = session.mapper().createObjectNode();
         ArrayNode values = result.putArray("items");
@@ -172,7 +178,7 @@ public final class SettingsCatalogHandler implements RpcHandler {
      */
     private ObjectNode mcpView(McpServerDescriptor value) {
         return session.mapper().createObjectNode().put("mcpId", value.mcpId())
-                .put("name", value.name()).put("transport", value.transport())
+                .put("name", value.name()).put("scope", value.scope()).put("transport", value.transport())
                 .put("status", value.status()).put("toolCount", value.toolCount());
     }
 

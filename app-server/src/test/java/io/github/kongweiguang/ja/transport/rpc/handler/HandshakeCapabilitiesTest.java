@@ -33,6 +33,8 @@ final class HandshakeCapabilitiesTest {
         assertEquals(MAPPER.valueToTree(List.of("task_threads_v1", "plan_goal_v1", "interaction_v1")),
                 capabilities.path("features"));
         assertTrue(methods.contains("goal/read"));
+        assertTrue(methods.contains("thread/mcp/read"));
+        assertTrue(!methods.contains("thread/mcp/check"));
         assertTrue(methods.contains("plan/draft/discard"));
         assertTrue(methods.contains("plan/reject"));
         assertTrue(methods.contains("plan/execute"));

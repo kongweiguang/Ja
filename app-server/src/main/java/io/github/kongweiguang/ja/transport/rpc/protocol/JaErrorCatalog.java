@@ -132,6 +132,8 @@ public enum JaErrorCatalog {
      * 同一 Thread 存在更早的非终态 Turn，必须先按 admission 顺序处理。
      */
     TURN_RESUME_ORDER_CONFLICT(-32066, ErrorCategory.CONFLICT, true),
+    /** 当前有效路径最后一个问题已有成功答复，或其 Turn 状态不允许编辑/继续。 */
+    TURN_NOT_REASKABLE(-32067, ErrorCategory.VALIDATION, false),
     /** 单 Turn 的回复中输入队列达到数量或 UTF-8 字节上限。 */
     TURN_INPUT_QUEUE_FULL(-32068, ErrorCategory.CAPACITY, true),
     /** 请求引用的待处理输入不存在、已消费或已删除。 */
