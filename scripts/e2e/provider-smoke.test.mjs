@@ -16,6 +16,7 @@ import {
   committedTerminalReply,
   createClientOperationId,
   initializeParams,
+  JsonlSession,
   providerConfigurationDocument,
   providerFailingToolTurnInput,
   providerToolTurnInput,
@@ -105,6 +106,44 @@ test("client operation identities use the frozen v1 format", () => {
   assert.match(first, /^op_[0-9a-f]{32}$/u);
   assert.match(second, /^op_[0-9a-f]{32}$/u);
   assert.notEqual(first, second);
+});
+
+/** A normal shutdown may retry the server's side-effect-free busy refusal, but never other errors. */
+test("graceful shutdown waits for pending Turn work within its bounded drain", async () => {
+  const session = Object.create(JsonlSession.prototype);
+  const responses = [
+    {
+      error: {
+        code: -32034,
+        message: "runtime has pending work",
+        data: {
+          category: "conflict",
+          errorCode: "INVALID_STATE",
+          errorId: `err_${"1".repeat(32)}`,
+          retryable: false,
+        },
+      },
+    },
+    { result: { accepted: true, status: "shutting_down" } },
+  ];
+  const requests = [];
+  let stdinClosed = false;
+  session.request = async (...args) => {
+    requests.push(args);
+    return responses.shift();
+  };
+  session.child = { stdin: { end: () => (stdinClosed = true) } };
+  session.exitPromise = Promise.resolve({ code: 0, signal: null });
+
+  const exit = await session.shutdown();
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map(([method, params]) => [method, params]), [
+    ["runtime/shutdown", {}],
+    ["runtime/shutdown", {}],
+  ]);
+  assert.equal(stdinClosed, true);
+  assert.deepEqual(exit, { code: 0, signal: null });
 });
 
 /** 终答只从 terminal 的完整持久消息读取，流式 delta 如何切分或模型如何措辞都不得影响验收。 */

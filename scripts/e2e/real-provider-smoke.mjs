@@ -734,10 +734,37 @@ export class JsonlSession {
     this.waiters = [];
   }
 
-  /** Requests the normal drain, closes stdin, and returns the real process exit identity. */
+  /**
+   * Retries only the side-effect-free INVALID_STATE refusal while a just-completed Turn finishes
+   * releasing its coordinator; all retries share the existing bounded shutdown budget.
+   */
   async shutdown() {
-    const response = await this.request("runtime/shutdown", {}, exitTimeoutMs);
-    const result = assertRpcSuccess(response, "runtime/shutdown");
+    const deadline = Date.now() + exitTimeoutMs;
+    let retryDelayMs = 25;
+    let lastBusyResponse;
+    let result;
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        if (lastBusyResponse !== undefined) {
+          assertRpcSuccess(lastBusyResponse, "runtime/shutdown");
+        }
+        throw new Error("runtime/shutdown exceeded its bounded drain budget");
+      }
+      const response = await this.request("runtime/shutdown", {}, remainingMs);
+      if (response?.error !== undefined) {
+        const code = requireRpcErrorCode(response.error);
+        if (code !== "INVALID_STATE") assertRpcSuccess(response, "runtime/shutdown");
+        lastBusyResponse = response;
+        await new Promise((resolveDelay) =>
+          setTimeout(resolveDelay, Math.min(retryDelayMs, remainingMs)),
+        );
+        retryDelayMs = Math.min(retryDelayMs * 2, 250);
+        continue;
+      }
+      result = assertRpcSuccess(response, "runtime/shutdown");
+      break;
+    }
     if (result?.status !== "shutting_down") {
       throw new Error("shutdown returned an unexpected status");
     }
